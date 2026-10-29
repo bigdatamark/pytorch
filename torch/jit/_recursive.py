@@ -1,4 +1,13 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Recursive scripting machinery for TorchScript: converts an eager nn.Module (or
+# plain class/function) into a ScriptModule/script class by inferring a concrete
+# type (parameters, buffers, submodules, constants, attributes, overloads,
+# hooks), building method/property/hook stubs, and compiling them via the C++
+# frontend. Main contents: infer_concrete_type_builder, ConcreteTypeStore (type
+# sharing cache), create_script_module(_impl), stub-making helpers, and wrappers
+# around C++ modules/classes. Import-time side effects: creates the global
+# concrete_type_store cache and the stub namedtuple types.
 import collections
 import functools
 import inspect
@@ -51,6 +60,10 @@ ignored_attributes = [
 
 
 def _compile_and_register_class(obj, rcb, qualified_name):
+    # [FUNCTION DOC] HELPER: Returns the compiled script class for Python class
+    # obj. If none is registered yet, parses the class definition and default
+    # arguments, compiles it in C++ under qualified_name with resolution callback
+    # rcb, and registers it in the global script-class table (side effect).
     script_class = _get_script_class(obj)
 
     if not script_class:
@@ -65,12 +78,19 @@ def _compile_and_register_class(obj, rcb, qualified_name):
 
 
 def make_stub(func, name):
+    # [FUNCTION DOC] Builds a ScriptMethodStub for func: a resolution callback
+    # created from its closure, the parsed JIT definition renamed to name (with
+    # self type name RecursiveScriptModule), and the original function.
     rcb = _jit_internal.createResolutionCallbackFromClosure(func)
     ast = get_jit_def(func, name, self_name="RecursiveScriptModule")
     return ScriptMethodStub(rcb, ast, func)
 
 
 def make_stub_from_method(nn_module, method_name):
+    # [FUNCTION DOC] Returns a stub for the attribute method_name of nn_module. If
+    # the attribute already is a ScriptMethodStub it is returned as is; otherwise
+    # a new stub is made using method_name as the AST name, so the compiled name
+    # matches the requested one even if the function object has another name.
     func = getattr(nn_module, method_name)
     if isinstance(func, ScriptMethodStub):
         return func
@@ -86,6 +106,8 @@ def make_stub_from_method(nn_module, method_name):
 
 
 def make_stubs_from_exported_methods(mod):
+    # [FUNCTION DOC] Returns a list of stubs for every attribute of mod whose
+    # TorchScript modifier marks it as exported.
     stubs = []
     for name in dir(mod):
         item = getattr(mod, name, None)
@@ -99,11 +121,16 @@ def make_stubs_from_exported_methods(mod):
 
 
 def jit_ignored_properties(module):
+    # [FUNCTION DOC] Returns the set of names that are both listed in the
+    # module's ignored-attributes list (default empty) and defined as properties
+    # directly on the module's class (not inherited ones).
     user_annotated_ignored_attributes = getattr(
         module, "__jit_ignored_attributes__", []
     )
 
     def get_properties_names(module):
+        # [FUNCTION DOC] HELPER: Returns the set of names in the class namespace
+        # whose values are property objects.
         return {k for k, v in vars(module).items() if isinstance(v, property)}
 
     properties = get_properties_names(type(module))
@@ -133,6 +160,10 @@ _constant_types = (
 
 
 def _get_valid_constant(attr, v, owner_type):
+    # [FUNCTION DOC] HELPER: Validates that v can be a TorchScript constant: base
+    # constant types are returned unchanged; lists and tuples are converted
+    # recursively into tuples. Raises TypeError describing the allowed constant
+    # kinds, naming owner_type and attr, for anything else.
     if isinstance(v, _constant_types):
         return v
     elif isinstance(v, (tuple, list)):
@@ -152,10 +183,17 @@ def _get_valid_constant(attr, v, owner_type):
 
 
 class SourceContext(torch._C._jit_tree_views.SourceRangeFactory):
+    # [CLASS DOC] HELPER: Thin subclass of the C++ source range factory with no
+    # extra state or behavior.
     pass
 
 
 def get_annotations(obj):
+    # [FUNCTION DOC] Returns the annotation mapping for obj. Uses obj's own
+    # annotations if non-empty; otherwise takes those of its class (or itself if
+    # a class), searching base classes depth-first for the first non-empty
+    # mapping, so annotations are inherited by unannotated subclasses. Returns an
+    # empty mapping if none exist.
     # In Python-3.10+ it is recommended to use inspect.get_annotations
     # See https://docs.python.org/3.10/howto/annotations.html
     # But also, in 3.10 annotations from base class are not inherited
@@ -165,6 +203,8 @@ def get_annotations(obj):
         return annotations
 
     def get_cls_annotations(cls):
+        # [FUNCTION DOC] HELPER: Returns the first non-empty annotation mapping
+        # found on cls or, recursively, on its bases in order; else empty mapping.
         cls_annotations = inspect.get_annotations(cls)
         if cls_annotations:
             return cls_annotations
@@ -179,6 +219,20 @@ def get_annotations(obj):
 
 
 def infer_concrete_type_builder(nn_module, share_types=True):
+    # [FUNCTION DOC] Builds a C++ ConcreteModuleTypeBuilder describing nn_module:
+    # container kind flags, ignored attributes and properties, parameters and
+    # buffers (must be tensors or None), submodules (recursively via
+    # get_module_concrete_type, with share_types passed on; None as a NoneType
+    # attribute), constants from the constants list or Final annotations (with
+    # warnings for constants that are really parameters/buffers/submodules or
+    # missing), overloads, function/builtin/script-function attributes, and
+    # other data attributes (failures are recorded as failed attributes with a
+    # hint), and finally forward hooks and pre-hooks. Raises AssertionError on
+    # invalid parameter/buffer types and RuntimeError when type inference fails.
+    # Returns the builder; the caller must still build the type.
+    # KNOWN ISSUE: the overloads mapping is read from the module's own
+    # overloads attribute (default new mapping) and updated in place, so it
+    # mutates the module's attribute as a side effect.
     """
     Build a ConcreteModuleTypeBuilder from an nn.Module.
 
@@ -208,6 +262,12 @@ def infer_concrete_type_builder(nn_module, share_types=True):
 
     # try to infer the type from type annotation or from the object itself
     def infer_type(name, item):
+        # [FUNCTION DOC] HELPER: Infers the TorchScript type of attribute name
+        # with value item, preferring the class annotation (except the generic
+        # forward annotation), then an explicit Attribute wrapper's type, then
+        # inference from the value. Returns a pair of (InferredType, flag telling
+        # whether it was inferred from the value). Raises RuntimeError with the
+        # attribute name if annotation conversion fails.
         # The forward function from Module is special; never use this annotations; we
         # need to infer type directly using JIT.  I originally wanted to write
         # this test as isinstance(class_annotations[name], Callable) but
@@ -428,16 +488,26 @@ def infer_concrete_type_builder(nn_module, share_types=True):
 
 
 class ConcreteTypeStore:
+    # [CLASS DOC] Cache that lets modules of the same Python class share JIT
+    # types. State: type_store, a mapping from module class to a list of built
+    # ConcreteModuleTypes, and methods_compiled, the set of concrete types whose
+    # methods were already compiled. Key method: get_or_create_concrete_type.
     type_store: dict[type[Module], list[torch._C.ConcreteModuleType]]
     methods_compiled: set[torch._C.ConcreteModuleType]
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Initializes an empty type store and an empty
+        # compiled-methods set.
         # Python module type => List[ConcreteModuleType)]
         self.type_store = {}
         # ConcreteTypes that have had their methods already compiled
         self.methods_compiled = set()
 
     def get_or_create_concrete_type(self, nn_module):
+        # [FUNCTION DOC] Builds a concrete type builder for nn_module and returns
+        # an already stored concrete type of the same Python class that equals
+        # it; otherwise builds a new concrete type, stores it and returns it.
+        # Side effect: mutates type_store. Always uses type sharing for children.
         """Infer a ConcreteType from this `nn.Module` instance. Underlying JIT types are reused if possible."""
         concrete_type_builder = infer_concrete_type_builder(nn_module)
 
@@ -463,6 +533,9 @@ concrete_type_store = ConcreteTypeStore()
 def create_methods_and_properties_from_stubs(
     concrete_type, method_stubs, property_stubs
 ) -> None:
+    # [FUNCTION DOC] Compiles the given method and property stubs onto
+    # concrete_type by extracting definitions, resolution callbacks and default
+    # arguments and passing them to the C++ creation call. Mutates the type.
     method_defs = [m.def_ for m in method_stubs]
     method_rcbs = [m.resolution_callback for m in method_stubs]
     method_defaults = [get_default_args(m.original_method) for m in method_stubs]
@@ -476,6 +549,8 @@ def create_methods_and_properties_from_stubs(
 
 
 def create_hooks_from_stubs(concrete_type, hook_stubs, pre_hook_stubs) -> None:
+    # [FUNCTION DOC] Compiles forward hook and pre-hook stubs onto concrete_type
+    # through the C++ hook creation call. Mutates the type.
     hook_defs = [h.def_ for h in hook_stubs]
     hook_rcbs = [h.resolution_callback for h in hook_stubs]
 
@@ -486,6 +561,10 @@ def create_hooks_from_stubs(concrete_type, hook_stubs, pre_hook_stubs) -> None:
 
 
 def get_module_concrete_type(nn_module, share_types=True):
+    # [FUNCTION DOC] Returns the concrete type for nn_module. Raises
+    # AssertionError if it is not a Module. A ScriptModule that already has a
+    # concrete type returns it. With share_types, uses the global store; without,
+    # builds a fresh type from the builder marked poisoned so it is never shared.
     """
     Get a concrete type for nn_modules.
 
@@ -520,6 +599,9 @@ def get_module_concrete_type(nn_module, share_types=True):
 
 
 def create_script_class(obj):
+    # [FUNCTION DOC] Converts a Python object to a RecursiveScriptClass instance.
+    # Compiles and registers its class if needed, creates an empty C++ object of
+    # the scripted type, copies every instance attribute onto it, and wraps it.
     """
     Create and return a RecursiveScriptClass instance from a Python object.
 
@@ -542,6 +624,11 @@ def create_script_class(obj):
 
 
 def create_script_module(nn_module, stubs_fn, share_types=True, is_tracing=False):
+    # [FUNCTION DOC] Entry point to script an nn.Module. Raises AssertionError if
+    # it is already a RecursiveScriptModule, and checks the module is initialized.
+    # Gets its concrete type, runs the attribute-annotation checker (skipped when
+    # tracing), then builds the script module with stubs_fn supplying the method
+    # stubs. Returns the new RecursiveScriptModule.
     """
     Create a new ScriptModule from an nn.Module.
 
@@ -567,6 +654,16 @@ def create_script_module(nn_module, stubs_fn, share_types=True, is_tracing=False
 
 
 def create_script_module_impl(nn_module, concrete_type, stubs_fn):
+    # [FUNCTION DOC] Builds a RecursiveScriptModule for nn_module from a ready
+    # concrete type. Creates the C++ module, gathers method, property and hook
+    # stubs, and constructs the Python wrapper with an init function that copies
+    # attributes, recursively scripts submodules, and copies ignored methods and
+    # attributes. Compiles methods, properties and hooks once per concrete type,
+    # mirrors hooks into the Python module, defines length and containment
+    # helpers for container modules, exposes compiled methods and properties on
+    # the wrapper, and copies methods marked for copying. Returns the wrapper.
+    # KNOWN ISSUE: for ModuleDict the generated contains method embeds the keys
+    # present at scripting time as a literal, so it goes stale if keys change.
     """
     Convert an nn.Module to a RecursiveScriptModule.
 
@@ -582,6 +679,12 @@ def create_script_module_impl(nn_module, concrete_type, stubs_fn):
     ignored_properties = jit_ignored_properties(nn_module)
 
     def init_fn(script_module) -> None:
+        # [FUNCTION DOC] HELPER: Populates a freshly constructed script module
+        # from the original nn_module: copies attributes, parameters and buffers
+        # into the C++ module (unwrapping Attribute), scripts or reuses each
+        # submodule and registers it in both the C++ and Python module, copies
+        # ignored methods (rebinding them) and ignored attributes, and attaches the
+        # concrete type. Raises AssertionError if a submodule is not a Module.
         # Initialize the ScriptModule:
         # 1. Copy the attributes/parameters/buffers from the original `nn_module` to the new ScriptModule.
         for name in concrete_type.get_attributes():
@@ -725,6 +828,9 @@ def create_script_module_impl(nn_module, concrete_type, stubs_fn):
 # magic methods. To check if a script model defines an attribute we need
 # to also check that the attribute is not the shim
 def script_model_defines_attr(script_model, attr):
+    # [FUNCTION DOC] Returns True if script_model has attribute attr and it
+    # differs from the shim of the same name on RecursiveScriptModule (False if
+    # either is missing or they are equal).
     script_attr = getattr(script_model, attr, None)
     if script_attr is None:
         return False
@@ -735,11 +841,20 @@ def script_model_defines_attr(script_model, attr):
 
 
 def add_python_attr_to_scripted_model(script_model, orig, attr) -> None:
+    # [FUNCTION DOC] Copies attribute attr from the original module to the
+    # script model when the original has it and the script model defines its own
+    # non-shim version of it. Mutates script_model.
     if hasattr(orig, attr) and script_model_defines_attr(script_model, attr):
         setattr(script_model, attr, getattr(orig, attr))
 
 
 def get_overload_annotations(mod, jit_ignored_properties):
+    # [FUNCTION DOC] Finds overloaded methods on the class of mod. Skips names in
+    # jit_ignored_properties and non-callables. For each callable with overload
+    # information, returns a mapping from the method to a list of pairs
+    # (mangled name made of name, two underscores and the index; overload
+    # function). Raises RuntimeError if an overloaded method has no
+    # implementation.
     # original function => [(mangled overload name, overload function)]
     overloads = {}
 
@@ -773,6 +888,9 @@ def get_overload_annotations(mod, jit_ignored_properties):
 
 
 def get_overload_name_mapping(overload_info):
+    # [FUNCTION DOC] Converts the mapping produced by get_overload_annotations
+    # into a mapping from original function name to the list of mangled overload
+    # names, preserving order.
     # Same format as __overloads__
     # original function => [overload names]
     overload_name_mappings: dict[str, list[str]] = {}
@@ -787,6 +905,8 @@ def get_overload_name_mapping(overload_info):
 
 
 def _check_no_signature(func) -> None:
+    # [FUNCTION DOC] HELPER: Raises RuntimeError naming the function if no type
+    # signature can be obtained for the overload func; returns None otherwise.
     signature = torch.jit.annotations.get_signature(
         func, None, fake_range(), inspect.ismethod(func)
     )
@@ -798,6 +918,11 @@ def _check_no_signature(func) -> None:
 
 
 def make_stubs_for_overloads(overload_info):
+    # [FUNCTION DOC] Builds a stub for each overload: parses the original and
+    # overload definitions, checks the overload has a signature, replaces the
+    # original declaration with the overload's under the mangled name via C++,
+    # and pairs it with a resolution callback from the original's closure.
+    # Returns the list of stubs.
     overload_stubs = []
     for orig_fn, overloads in overload_info.items():
         orig_ast = get_jit_def(
@@ -817,6 +942,10 @@ def make_stubs_for_overloads(overload_info):
 
 
 def check_module_initialized(mod) -> None:
+    # [FUNCTION DOC] Validates a module before scripting. Raises AssertionError
+    # if mod is not a Module, and RuntimeError if the base class init was not
+    # called (no parameters mapping) or, unless it is a distributed remote module,
+    # if any parameter or buffer is lazy and uninitialized.
     if not isinstance(mod, torch.nn.Module):
         raise AssertionError(f"Expected torch.nn.Module, got {type(mod)}")
     if not hasattr(mod, "_parameters"):
@@ -839,6 +968,12 @@ def check_module_initialized(mod) -> None:
 
 
 def infer_methods_to_compile(nn_module):
+    # [FUNCTION DOC] Default rule for choosing compilation entry points. Returns
+    # overload stubs followed by stubs for forward (if defined, not ignored and
+    # not the base class version) and all exported methods, in order, without
+    # duplicates and without methods that have overloads. Side effect: stores the
+    # merged overload-name mapping on nn_module as its overloads attribute.
+    # Raises if the module is not initialized.
     """Implement the default rules for which methods should act as starting points for compilation.
 
     (TODO add a link when the rules are published).
@@ -877,6 +1012,8 @@ def infer_methods_to_compile(nn_module):
 
     # we shouldn't directly compile overloaded methods, just its overloads
     def ignore_overloaded(method_name):
+        # [FUNCTION DOC] HELPER: Returns True when method_name is not in the
+        # overload mapping, so it is kept for compilation.
         return method_name not in overload_name_mappings
 
     filtered_methods = filter(ignore_overloaded, methods)
@@ -896,6 +1033,10 @@ def infer_methods_to_compile(nn_module):
 
 
 def get_hook_stubs(nn_module):
+    # [FUNCTION DOC] Returns a pair (hook stubs, pre-hook stubs) for the forward
+    # hooks and forward pre-hooks of nn_module, stubs being named after the hook
+    # function. Raises RuntimeError if two different hook objects share a name
+    # (names are shared across hooks and pre-hooks).
     """Return forward hook and pre_hook ScriptModuleStubs."""
     check_module_initialized(nn_module)
     hook_map: dict = {}
@@ -930,6 +1071,12 @@ def get_hook_stubs(nn_module):
 
 
 def get_property_stubs(nn_module):
+    # [FUNCTION DOC] Returns a PropertyStub for each property parsed from the
+    # module's class, pairing the parsed definition with a resolution callback
+    # from the getter's closure. Raises RuntimeError if a property has no getter.
+    # KNOWN ISSUE: the error message reads the name attribute of the module
+    # instance, which instances normally do not have, so an AttributeError would
+    # mask the intended error.
     """Create property stubs for the properties of the module by creating method stubs for the getter and setter."""
     module_ty = type(nn_module)
     properties_asts = get_class_properties(module_ty, self_name="RecursiveScriptModule")
@@ -950,6 +1097,10 @@ def get_property_stubs(nn_module):
 
 
 def interface_script(mod_interface, nn_module):
+    # [FUNCTION DOC] Scripts nn_module using the methods named by the module
+    # interface type as entry points. A ScriptModule is returned unchanged.
+    # Otherwise checks initialization and returns create_script_module with that
+    # rule.
     """
     Make a ScriptModule from an nn.Module, using the interface methods rule for determining which methods to compile.
 
@@ -963,6 +1114,8 @@ def interface_script(mod_interface, nn_module):
     check_module_initialized(nn_module)
 
     def infer_interface_methods_to_compile(nn_module):
+        # [FUNCTION DOC] HELPER: Returns stubs for each method name of the
+        # captured interface type.
         """Rule to infer the methods from the interface type.
 
         It is used to know which methods need to act as starting points for compilation.
@@ -977,6 +1130,12 @@ def interface_script(mod_interface, nn_module):
 
 
 def try_compile_fn(fn, loc):
+    # [FUNCTION DOC] Compiles a Python function or method called from script
+    # code. Returns None for ignored functions and for Module instances. Raises
+    # RuntimeError (suggesting manual annotation) if fn is not a function or
+    # method. Resolves a prepare-scriptable replacement if present, builds a
+    # resolution callback from the closure and returns the result of scripting it.
+    # The loc argument is unused.
     if _jit_internal.is_ignored_fn(fn):
         # Don't do anything for @ignore'd functions
         return None
@@ -1005,14 +1164,22 @@ def try_compile_fn(fn, loc):
 
 
 def wrap_cpp_class(cpp_class):
+    # [FUNCTION DOC] Wraps a C++ object in a RecursiveScriptClass and returns it.
     """Wrap this torch._C.Object in a Python RecursiveScriptClass."""
     return torch.jit.RecursiveScriptClass(cpp_class)
 
 
 def wrap_cpp_module(cpp_module):
+    # [FUNCTION DOC] Wraps a C++ script module in a Python RecursiveScriptModule,
+    # recursively wrapping all submodules, attaching the concrete type derived
+    # from its JIT type, and mirroring hooks. Returns the wrapper.
     """Wrap this torch._C.ScriptModule in a Python ScriptModule, recursively for all submodules."""
 
     def init_fn(script_module) -> None:
+        # [FUNCTION DOC] HELPER: Wraps each C++ submodule recursively and sets it
+        # on script_module, attaches the concrete type taken from the C++ type,
+        # and copies the C++ forward hooks and pre-hooks into the Python hook
+        # mappings.
         for name, cpp_module in torch._C.ModuleDict(script_module._c).items():
             setattr(script_module, name, wrap_cpp_module(cpp_module))
         script_module._concrete_type = torch._C.ConcreteModuleType.from_jit_type(
@@ -1028,6 +1195,9 @@ def wrap_cpp_module(cpp_module):
 
 
 def compile_unbound_method(concrete_type, fn):
+    # [FUNCTION DOC] Compiles fn as a method on concrete_type with emit hooks
+    # disabled (the calling graph is incomplete). Returns None for ignored
+    # functions, otherwise the created stub. Mutates the type.
     if _jit_internal.is_ignored_fn(fn):
         return None
     stub = make_stub(fn, fn.__name__)
@@ -1039,6 +1209,11 @@ def compile_unbound_method(concrete_type, fn):
 
 
 def lazy_bind(concrete_type, unbound_method):
+    # [FUNCTION DOC] Returns a function that, when called with a C++ module and
+    # arguments, binds unbound_method to a freshly wrapped script module and
+    # calls it. The returned function copies the name, original-function
+    # reference and TorchScript modifier of the method. Used to postpone binding
+    # to avoid type-sharing poisoning at compile time.
     """
     Return a function that lazily binds `unbound_method` to a provided Module IValue, then invokes the method.
 
@@ -1047,7 +1222,13 @@ def lazy_bind(concrete_type, unbound_method):
     """
 
     def lazy_binding_method(cpp_module, *args):
+        # [FUNCTION DOC] HELPER: Wraps cpp_module as a script module with ignored
+        # methods and constants copied from the original class, binds the method
+        # to it and returns the result of calling it with args.
         def init_fn(script_module) -> None:
+            # [FUNCTION DOC] HELPER: Copies ignored methods from the original
+            # Python class and the constants from the concrete type onto
+            # script_module so they exist at run time.
             orig_class = concrete_type.py_class
 
             # Copy @ignored/@unused methods from the original module to the new one.

@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Static checker that parses the source of an nn.Module's __init__ and warns
+# about instance-level attribute annotations on empty list, dict or Optional
+# values that TorchScript cannot type. Main content: the
+# AttributeTypeIsSupportedChecker AST visitor. No import-time side effects.
 import ast
 import inspect
 import sys
@@ -9,6 +14,13 @@ import torch
 
 
 class AttributeTypeIsSupportedChecker(ast.NodeVisitor):
+    # [CLASS DOC] AST visitor that inspects the source of a Module class's
+    # __init__ and emits warnings for self attributes annotated as list, dict or
+    # optional (via annotation syntax or a torch.jit.annotate call) but assigned
+    # an empty/None value, unless the attribute is also annotated in the class
+    # body. State set by check: the list of class-level annotated names and a flag
+    # marking that a call inside a class-annotated assignment is being visited.
+    # Key methods: check (entry point), visit_Assign, visit_AnnAssign, visit_Call.
     """Check the ``__init__`` method of a given ``nn.Module``.
 
     It ensures that all instance-level attributes can be properly initialized.
@@ -60,10 +72,19 @@ class AttributeTypeIsSupportedChecker(ast.NodeVisitor):
     """
 
     def check(self, nn_module: torch.nn.Module) -> None:
+        # [FUNCTION DOC] Entry point. Gets the source of the module class's
+        # __init__, drops comment lines (except type comments), dedents and parses
+        # it, records the class-level annotation names (via annotationlib on
+        # Python 3.14+, else the annotations mapping), resets the visiting flag,
+        # and visits the tree, which may emit warnings. Raises OSError/TypeError if
+        # the source is unavailable and AttributeError if the class has no
+        # annotations mapping on older Pythons. Returns None.
         source_lines = inspect.getsource(nn_module.__class__.__init__)
 
         # Ignore comments no matter the indentation
         def is_useless_comment(line):
+            # [FUNCTION DOC] HELPER: Returns True if the stripped line is a comment
+            # that is not a type comment, so it can be removed from the source.
             line = line.strip()
             return line.startswith("#") and not line.startswith("# type:")
 
@@ -92,6 +113,12 @@ class AttributeTypeIsSupportedChecker(ast.NodeVisitor):
         self.visit(init_ast)
 
     def _is_empty_container(self, node: ast.AST, ann_type: str) -> bool:
+        # [FUNCTION DOC] HELPER: Returns True when the AST node is an empty value
+        # for the annotation kind: an empty list literal for List, an empty dict
+        # literal for Dict, or a falsy constant for Optional. Any other
+        # annotation kind returns True unconditionally.
+        # KNOWN ISSUE: for Optional any falsy constant (0, empty string, False)
+        # counts as empty, not only None; and unknown kinds return True.
         if ann_type == "List":
             # Assigning `[]` to a `List` type gives you a Node where
             # value=List(elts=[], ctx=Load())
@@ -117,6 +144,13 @@ class AttributeTypeIsSupportedChecker(ast.NodeVisitor):
         return True
 
     def visit_Assign(self, node) -> None:
+        # [FUNCTION DOC] Handles a plain assignment. If the value is a call and
+        # the first target's attribute name is annotated at class level, sets the
+        # visiting flag while visiting children, then clears it. If the target
+        # has no attribute name, returns without visiting children.
+        # KNOWN ISSUE: that early return skips visiting the value, so calls in
+        # assignments to simple names are never checked; the flag is also not
+        # cleared if visiting raises.
         """Store assignment state when assigning to a Call Node.
 
         If we're visiting a Call Node (the right-hand side of an
@@ -140,6 +174,10 @@ class AttributeTypeIsSupportedChecker(ast.NodeVisitor):
         self.visiting_class_level_ann = False
 
     def visit_AnnAssign(self, node) -> None:
+        # [FUNCTION DOC] Handles an annotated assignment. Ignores targets that are
+        # not attributes of self and attributes annotated at class level. If the
+        # annotation is List, list, Dict, dict or Optional and the assigned value
+        # is empty, emits a UserWarning explaining the TorchScript limitation.
         """Visit an AnnAssign node in an ``nn.Module``'s ``__init__`` method.
 
         It checks if it conforms to our attribute annotation rules."""
@@ -195,6 +233,15 @@ class AttributeTypeIsSupportedChecker(ast.NodeVisitor):
         )
 
     def visit_Call(self, node) -> None:
+        # [FUNCTION DOC] Handles a call node. Skips when inside a class-annotated
+        # assignment. Otherwise continues into children for calls not shaped like
+        # torch.jit.annotate, then, for a call with exactly two arguments whose
+        # first is a subscript of List, Dict or Optional and whose second is an
+        # empty value, emits the same UserWarning as for annotated assignments.
+        # KNOWN ISSUE: the checks for torch.jit.annotate are not exclusive; the
+        # final warning logic runs for any two-argument call with a subscript
+        # first argument, and the second condition (jit.annotate) can never
+        # correctly match as written.
         """Determine if a Call node is 'torch.jit.annotate' in __init__.
 
         Visit a Call node in an ``nn.Module``'s ``__init__``

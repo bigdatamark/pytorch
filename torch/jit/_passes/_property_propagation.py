@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Utility for propagating tensor properties (types) onto TorchScript graph
+# inputs from example inputs. Not meant to be imported directly. No import-time
+# side effects.
 """
 Tools to help with tensor property propagation.
 
@@ -13,6 +17,12 @@ from torch._C import Graph
 
 
 def apply_input_props_using_example(graph: Graph, example_input: list[Any]) -> None:
+    # [FUNCTION DOC] Sets tensor types on a graph's inputs from example values.
+    # Drops a leading input named self of class type (method graphs), then
+    # requires the remaining input count to equal len(example_input). None
+    # examples are skipped; otherwise tensor-ness of example and input type must
+    # agree, and tensor inputs get their type created from the example tensor.
+    # Raises RuntimeError on count or type mismatch. Mutates the graph; returns None.
     """
     Applies properties for each tensor in the graph inputs
     using the example supplied.

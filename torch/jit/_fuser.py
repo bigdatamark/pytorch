@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Context managers and helpers controlling the TorchScript executor and fusion
+# backends: optimized_execution, fuser (select legacy, NNC, nvFuser, oneDNN Graph
+# or no fuser), set_fusion_strategy, and utilities to fetch the optimized graph a
+# script method last executed. Import-time side effect: binds the alias
+# last_executed_optimized_graph to the C++ function.
 import contextlib
 import warnings
 
@@ -7,6 +13,9 @@ import torch
 
 @contextlib.contextmanager
 def optimized_execution(should_optimize):
+    # [FUNCTION DOC] Context manager that sets the global graph-executor
+    # optimization flag to should_optimize for the duration of the block and
+    # restores the previous value on exit, even on error. Mutates global C++ state.
     """Context manager that controls whether the JIT's executor will run optimizations before executing a function."""
     stored_flag = torch._C._get_graph_executor_optimize()
     torch._C._set_graph_executor_optimize(should_optimize)
@@ -18,6 +27,15 @@ def optimized_execution(should_optimize):
 
 @contextlib.contextmanager
 def fuser(name):
+    # [FUNCTION DOC] Context manager selecting a fusion backend by name: fuser0
+    # (legacy), fuser1 (NNC), fuser2 (nvFuser), fuser3 (oneDNN Graph) or none.
+    # Saves the current CPU/GPU fusion, tensor-expression fuser, nvFuser and
+    # oneDNN Graph flags, sets the flags for the chosen backend (fuser1 and fuser3
+    # also enable the profiling executor and set the optimize flag), yields, and
+    # restores all saved state on exit. Raises a plain Exception for an unknown
+    # name, before yielding.
+    # KNOWN ISSUE: the optimize-mode save and restore use the getter binding
+    # with an argument as if it were a setter, which is surprising naming.
     """Context manager that facilitates switching between backend fusers.
 
     Valid names:
@@ -85,6 +103,9 @@ last_executed_optimized_graph = torch._C._last_executed_optimized_graph
 
 
 def _get_differentiable_graph_node(node, diff_node) -> None:
+    # [FUNCTION DOC] HELPER: Recursively walks node and nested block nodes,
+    # appending every node of kind prim::DifferentiableGraph to the list diff_node
+    # (not descending into a matching node). Mutates diff_node; returns None.
     if node.kind() == "prim::DifferentiableGraph":
         diff_node.append(node)
     else:
@@ -94,10 +115,19 @@ def _get_differentiable_graph_node(node, diff_node) -> None:
 
 
 def _graph_for(self, *args, **kwargs):
+    # [FUNCTION DOC] HELPER: Returns the optimized graph for a script object's
+    # last run with the given arguments by calling the method helper with the
+    # object as its own parent.
     return _script_method_graph_for(self, self, *args, **kwargs)
 
 
 def _script_method_graph_for(self, parent, *args, **kwargs):
+    # [FUNCTION DOC] HELPER: Returns a copy of the single execution plan graph from
+    # the parent's debug state, with each differentiable-graph node's subgraph
+    # replaced by the optimized graph of its unique forward execution plan (nodes
+    # with several plans are skipped). On any exception (including a mismatch in
+    # counts or plan numbers), falls back to running self with the arguments and
+    # returning the last executed optimized graph. Runs the model in fallback.
     try:
         dbs = parent.get_debug_state()
         eps = list(dbs.execution_plans.values())
@@ -134,6 +164,10 @@ def _script_method_graph_for(self, parent, *args, **kwargs):
 
 
 def set_fusion_strategy(strategy: list[tuple[str, int]]):
+    # [FUNCTION DOC] Sets the global fusion strategy from a list of (type, depth)
+    # pairs, where type is STATIC or DYNAMIC and depth is the allowed number of
+    # specializations. Emits a DeprecationWarning, then forwards to the C++
+    # setter and returns its result (the previous strategy). Mutates global state.
     """Set the type and number of specializations that can occur during fusion.
 
     .. deprecated:: 2.5

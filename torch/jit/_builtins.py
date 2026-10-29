@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Registry mapping Python callables (by object identity) to TorchScript builtin
+# operator names such as aten::sqrt. Holds the static list of (function, op name)
+# pairs, plus a lazily built identity-keyed table filled by scanning torch and
+# its C++ submodules. Public helpers: _register_builtin and _find_builtin.
+# Import-time side effects: computes the set of functional ops registered as
+# Python implementations; the table itself is built on first use.
 import cmath
 import math
 import warnings
@@ -131,6 +138,10 @@ _builtin_ops = [
 
 
 def _gen_torch_functional_registered_ops():
+    # [FUNCTION DOC] HELPER: Returns a set of the torch.functional functions
+    # (stft, istft, lu, cdist, norm, unique, unique_consecutive, tensordot) that
+    # must be compiled from their Python implementation instead of being mapped
+    # to an aten builtin. Raises AttributeError if a name is missing.
     # eventually ops should encompass all of torch/functional.py, (torch.functional.__all__)
     # but we are currently only able to compile some of the functions. additionally,
     # some functions directly map to their aten:: implementations.
@@ -152,11 +163,22 @@ _functional_registered_ops = _gen_torch_functional_registered_ops()
 
 
 def _is_special_functional_bound_op(fn):
+    # [FUNCTION DOC] HELPER: Returns True if fn is one of the functions in the
+    # registered torch.functional set (compared by equality/hash), else False.
     return fn in _functional_registered_ops
 
 
 # lazily built to ensure the correct initialization order
 def _get_builtin_table():
+    # [FUNCTION DOC] HELPER: Returns the global builtin table, a mapping from
+    # id of a callable to an op name, building it on first call. Building scans
+    # every module in the builtin-containing list and appends every callable
+    # (except special functional ops, no_grad and autocast) to the pair list as
+    # aten::<name> (leading underscore dropped for _segment_reduce); adds gcd,
+    # isfinite, remainder and, if available, distributed autograd functions; then
+    # fills the table. Side effects: mutates the global pair list and table.
+    # KNOWN ISSUE: the table is assigned an empty mapping before it is filled,
+    # so a re-entrant or concurrent call may see an incomplete table.
     global _builtin_table
     if _builtin_table is not None:
         return _builtin_table
@@ -197,8 +219,13 @@ def _get_builtin_table():
 
 
 def _register_builtin(fn, op) -> None:
+    # [FUNCTION DOC] HELPER: Maps the identity of callable fn to op name op in
+    # the global builtin table (building it first if needed). Overwrites any
+    # existing entry. Returns None.
     _get_builtin_table()[id(fn)] = op
 
 
 def _find_builtin(fn):
+    # [FUNCTION DOC] HELPER: Returns the op name registered for callable fn by
+    # identity, or None if it is not a known builtin. Builds the table if needed.
     return _get_builtin_table().get(id(fn))

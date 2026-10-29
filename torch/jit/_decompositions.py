@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Registry of TorchScript decompositions: Python implementations of ATen ops
+# that are scripted, optimized and stored in a table keyed by operator schema
+# string. Contents: decomposition_table, the register_decomposition decorator,
+# signature-check helpers, and decompositions for var. Import-time side effects:
+# scripts and registers the var decompositions (running JIT passes) and adds
+# their names to the global used-name set.
 import torch
 from torch import Tensor
 
@@ -21,6 +28,11 @@ _P = ParamSpec("_P")
 
 
 def check_decomposition_has_type_annotations(f) -> None:
+    # [FUNCTION DOC] Verifies function f has an annotation on every parameter and
+    # on its return. Raises AssertionError naming the first missing one.
+    # KNOWN ISSUE: error messages read the name attribute of f, but plain
+    # functions only have the dunder name attribute, so an AttributeError would
+    # be raised instead of the intended AssertionError.
     inspect_empty = inspect._empty  # type: ignore[attr-defined]
     sig = inspect.signature(f)
     for param in sig.parameters.values():
@@ -34,6 +46,11 @@ def check_decomposition_has_type_annotations(f) -> None:
 
 
 def signatures_match(decomposition_sig, torch_op_sig):
+    # [FUNCTION DOC] Compares two inspect signatures. Returns True only if they
+    # have the same number of parameters, each pair has equal name and annotation,
+    # defaults are equal wherever both are specified, and return annotations are
+    # equal. Emits a warning when a decomposition parameter is named self (public
+    # API uses input). Kind is not compared. No mutation.
     decomp_params = decomposition_sig.parameters
     op_params = torch_op_sig.parameters
 
@@ -70,7 +87,16 @@ def register_decomposition(
     aten_op: torch._ops.OpOverload,
     registry: dict[str, torch.jit.ScriptFunction] | None = None,
 ) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
+    # [FUNCTION DOC] Returns a decorator that registers a function as the
+    # decomposition of the given ATen overload in registry (default: the global
+    # decomposition table). Args: aten_op, an OpOverload; registry, optional
+    # mapping from schema string to scripted function.
     def decomposition_decorator(f: Callable[_P, _T]) -> Callable[_P, _T]:
+        # [FUNCTION DOC] HELPER: Validates aten_op is an OpOverload and that the
+        # function name is unique (AssertionError otherwise), records the name in
+        # the global name set, scripts f, inlines it, runs peephole and constant
+        # propagation twice, stores it in the registry under the schema string,
+        # and returns the original unscripted f. Mutates global state.
         nonlocal registry
         if registry is None:
             registry = decomposition_table
@@ -108,6 +134,13 @@ def var_decomposition(
     correction: Number | None = None,
     keepdim: bool = False,
 ) -> Tensor:
+    # [FUNCTION DOC] Decomposition of variance with correction. Treats a missing
+    # dim as all dimensions, computes the element count n (total elements, or the
+    # product of the sizes of the listed dims), then the sum of squared
+    # deviations from the mean divided by n minus correction (default 1). Raises
+    # RuntimeError if correction is neither int nor float. Returns a Tensor.
+    # KNOWN ISSUE: the divisor is clamped at 0 via the max builtin, so n not
+    # exceeding correction divides by zero rather than yielding a clean error.
     if dim is None:
         dim_i: list[int] = []
         dim = dim_i
@@ -140,4 +173,6 @@ def var_decomposition(
 
 @register_decomposition(aten.var.default)
 def var(input: Tensor, unbiased: bool = True) -> Tensor:
+    # [FUNCTION DOC] Decomposition of variance with the unbiased flag; delegates
+    # to var_decomposition with correction 1 if unbiased else 0 and all dims.
     return var_decomposition(input, correction=(1 if unbiased else 0))

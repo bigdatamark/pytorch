@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# TorchScript parallelism API: fork (start an asynchronous task returning a
+# Future) and wait (force completion and get the result). Not imported
+# directly; exposed via torch.jit. Import-time side effects: sets the public
+# module of Future to torch.jit and registers wait as the aten::wait builtin.
 """Async API.
 
 This module contains the API for parallelism in TorchScript, notably:
@@ -21,6 +26,13 @@ set_module(Future, "torch.jit")
 
 
 def fork(func, *args, **kwargs):
+    # [FUNCTION DOC] Starts func (a callable or Module) with the given positional
+    # and keyword arguments as an asynchronous task and returns a Future by
+    # delegating to the C++ fork. Emits a FutureWarning saying it is deprecated
+    # in favor of torch.compile. Real parallelism happens only in TorchScript;
+    # in plain Python or during tracing it does not run in parallel.
+    # KNOWN ISSUE: the docstring's module example calls super with self as the
+    # argument and uses an undefined name a inside forward, so it would fail.
     r"""
     Create an asynchronous task executing `func` and a reference to the value of the result of this execution.
 
@@ -109,6 +121,9 @@ def fork(func, *args, **kwargs):
 
 
 def wait(future):
+    # [FUNCTION DOC] Forces completion of a Future produced by fork and returns
+    # its result via the C++ wait. Emits a FutureWarning about deprecation in
+    # favor of torch.compile. Propagates any error raised by the task.
     r"""
     Force completion of a `torch.jit.Future[T]` asynchronous task, returning the result of the task.
 

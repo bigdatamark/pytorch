@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Python aliases for the TorchScript runtime logging API: stat-value and
+# timing ops from torch.ops.prim and logger classes/functions from torch._C.
+# Import-time side effect: looks up these ops and C++ bindings by attribute.
 import torch
 
 

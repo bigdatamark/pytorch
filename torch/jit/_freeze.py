@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# TorchScript freezing API: freeze (inline parameters, attributes and submodules
+# of an eval-mode ScriptModule as graph constants), run_frozen_optimizations
+# (pattern-based optimization of a frozen module) and optimize_for_inference.
+# Not imported directly; exposed via torch.jit. No import-time side effects.
 """Freezing.
 
 This is not intended to be imported directly; please use the exposed
@@ -14,6 +19,12 @@ from torch.jit._script import RecursiveScriptModule, ScriptModule
 def freeze(
     mod, preserved_attrs: list[str] | None = None, optimize_numerics: bool = True
 ):
+    # [FUNCTION DOC] Returns a frozen clone of a ScriptModule. Emits a
+    # FutureWarning (deprecated). Raises RuntimeError if mod is not a
+    # ScriptModule or is in training mode. Calls the C++ freeze with the preserved
+    # attribute names (default empty), wraps the result in a RecursiveScriptModule
+    # and finalizes it, then runs frozen-graph optimizations on forward and on
+    # preserved attributes that are methods of mod. The input is not modified.
     r"""Freeze ScriptModule, inline submodules, and attributes as constants.
 
     .. deprecated:: 2.5
@@ -133,6 +144,12 @@ def freeze(
 def run_frozen_optimizations(
     mod, optimize_numerics: bool = True, preserved_methods: list[str] | None = None
 ) -> None:
+    # [FUNCTION DOC] Runs the C++ frozen-graph optimization pass in place on the
+    # forward graph (if the module has forward) and on the graph of each method
+    # named in preserved_methods (default none). optimize_numerics permits
+    # passes that may alter numerics. Returns None.
+    # KNOWN ISSUE: the docstring example passes a keyword named optimize to
+    # freeze, but the parameter is called optimize_numerics.
     r"""
     Run a series of optimizations looking for patterns that occur in frozen graphs.
 
@@ -192,6 +209,15 @@ def run_frozen_optimizations(
 def optimize_for_inference(
     mod: ScriptModule, other_methods: list[str] | None = None
 ) -> ScriptModule:
+    # [FUNCTION DOC] Optimizes a ScriptModule for inference. Emits a FutureWarning
+    # (deprecated). Raises RuntimeError if mod is not a ScriptModule. If mod has a
+    # training attribute, freezes an eval-mode version with other_methods
+    # preserved, then applies the C++ inference optimization pass (which may bake
+    # in MKLDNN/cuDNN settings) to the module and returns it.
+    # KNOWN ISSUE: the docstring says freezing happens only if the module is not
+    # already frozen, but the code freezes whenever the training attribute exists
+    # (always true for ScriptModules); also a non-eval input is switched to eval
+    # mode in place before freezing.
     """
     Perform a set of optimization passes to optimize a model for the purposes of inference.
 
