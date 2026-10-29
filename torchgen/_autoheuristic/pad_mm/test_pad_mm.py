@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Golden-output test for the generated pad_mm learned heuristic (A100). It runs shell scripts
+# that download the dataset and regenerate the heuristic, then compares the generated artifact
+# source against the expected text. Appends the parent directory to sys.path at import time.
 import sys
 import unittest
 from pathlib import Path
@@ -11,7 +15,11 @@ from test_utils import read_file_to_string, run_bash  # type: ignore[import-not-
 
 
 class TestPadMM(TestCase):
+    # [CLASS DOC] Test case holding the A100 pad_mm heuristic regeneration test.
     def test_padmm_a100(self) -> None:
+        # [FUNCTION DOC] Runs the dataset download and A100 heuristic generation scripts, reads
+        # the generated _PadMMA100 artifact file and asserts it equals the expected source.
+        # Depends on relative paths and external scripts; writes the artifact file.
         run_bash("get_padmm_dataset.sh")
         run_bash("gen_pad_mm_a100.sh")
         file_path = "../../../torch/_inductor/autoheuristic/artifacts/_PadMMA100.py"

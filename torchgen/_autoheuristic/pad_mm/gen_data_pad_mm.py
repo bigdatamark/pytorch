@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Data collection script for the pad_mm AutoHeuristic: defines a benchmark runner that first
+# replays shapes from CSV files and known real-world shapes (only unaligned ones that fit in
+# memory), then generates random unaligned shapes forever, compiling a matmul for each so
+# pad_mm results get logged. Appends the parent directory to sys.path at import time; running
+# it as a script executes the runner (needs CUDA).
 import csv
 import random
 import sys
@@ -28,11 +34,18 @@ from torch._inductor.utils import fresh_cache
 
 
 class BenchmarkRunnerPadMM(BenchmarkRunner):  # type: ignore[misc, no-any-unimported]
+    # [CLASS DOC] Runner named "pad_mm". State: additional_shape_collections (lists of
+    # (m, k, n, dtype1, dtype2) tuples from CSV files and the known-shape collector) and
+    # shape_generator (None until setup_shape_collections runs; create_input requires it).
+    # Overrides run to configure inductor autoheuristic flags directly.
     """
     BenchmarkRunner for pad_mm. Used to generate collect training data with AutoHeuristic to learn a heuristic.
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Initializes the base runner with the name "pad_mm", adds the
+        # --additional-shape-csv option (list of CSV paths), and initializes empty shape
+        # collections and an unset shape generator.
         super().__init__("pad_mm")
 
         # Add CLI argument for additional shape CSV files
@@ -54,6 +67,10 @@ class BenchmarkRunnerPadMM(BenchmarkRunner):  # type: ignore[misc, no-any-unimpo
     def load_shapes_from_csv(
         self, csv_file: str
     ) -> list[tuple[int, int, int, torch.dtype, torch.dtype]]:
+        # [FUNCTION DOC] Reads a CSV with columns M,K,N,dtype and returns tuples
+        # (m, k, n, dtype, dtype) using the same dtype twice. Rows with an unknown dtype are
+        # skipped with a warning. Any exception (including a missing file) is caught, reported
+        # by printing, and whatever was read so far is returned.
         """Load matrix multiplication shapes from a CSV file in M,K,N,dtype format."""
         shapes = []
         dtype_map = {
@@ -87,6 +104,9 @@ class BenchmarkRunnerPadMM(BenchmarkRunner):  # type: ignore[misc, no-any-unimpo
         return shapes
 
     def setup_shape_collections(self, csv_files: list[str]) -> None:
+        # [FUNCTION DOC] Resets the additional shape collections, appends one collection per CSV
+        # file that yielded shapes, then appends the known real-world shapes and creates the
+        # shape generator. Mutates self.
         """Setup additional shape collections from CSV files and built-in collection."""
         self.additional_shape_collections = []
 
@@ -100,6 +120,10 @@ class BenchmarkRunnerPadMM(BenchmarkRunner):  # type: ignore[misc, no-any-unimpo
         self.shape_generator = self.generate_mm_shapes()
 
     def generate_mm_shapes(self) -> Generator[tuple[int, int, int, Any], None, None]:
+        # [FUNCTION DOC] Generator yielding (m, k, n, dtype). Phase one yields each unaligned,
+        # memory-fitting shape from the additional collections. Phase two never ends: picks a
+        # random dtype and either uniform dimensions up to 65536 or dimensions from
+        # get_random_dim, and yields the first unaligned shape that fits in memory.
         """Generator that yields (m, k, n, dtype) tuples for matrix multiplication.
 
         First exhausts all shapes from additional_shape_collections, then generates random shapes.
@@ -147,6 +171,9 @@ class BenchmarkRunnerPadMM(BenchmarkRunner):  # type: ignore[misc, no-any-unimpo
                     break
 
     def create_input(self) -> tuple[Any, ...]:
+        # [FUNCTION DOC] Takes the next shape from the generator (fails if setup was not done),
+        # sets the float32 matmul precision for its dtype, and returns (m, k, n, transpose_left,
+        # transpose_right, dtype, prepadded_left, prepadded_right) with random flags.
         # Get the next shape from the generator
         m, k, n, dtype = next(self.shape_generator)
         set_precision(dtype)
@@ -176,6 +203,9 @@ class BenchmarkRunnerPadMM(BenchmarkRunner):  # type: ignore[misc, no-any-unimpo
         prepadded_left: bool,
         prepadded_right: bool,
     ) -> None:
+        # [FUNCTION DOC] Builds operands, prints the configuration, then inside a fresh inductor
+        # cache compiles a matmul (adding one to the left and/or right operand when prepadded
+        # flags are set), runs it once and resets the compiler so pad_mm decisions get logged.
         a, b = get_mm_tensors(
             m,
             k,
@@ -194,15 +224,19 @@ class BenchmarkRunnerPadMM(BenchmarkRunner):  # type: ignore[misc, no-any-unimpo
         with fresh_cache():
 
             def mm(a: Any, b: Any) -> Any:
+                # [FUNCTION DOC] HELPER: Plain matmul.
                 return torch.mm(a, b)
 
             def mm_mat1_prepadded(a: Any, b: Any) -> Any:
+                # [FUNCTION DOC] HELPER: Matmul after adding one to the left operand.
                 return torch.mm(a + 1, b)
 
             def mm_mat2_prepadded(a: Any, b: Any) -> Any:
+                # [FUNCTION DOC] HELPER: Matmul after adding one to the right operand.
                 return torch.mm(a, b + 1)
 
             def mm_mat1_mat2_prepadded(a: Any, b: Any) -> Any:
+                # [FUNCTION DOC] HELPER: Matmul after adding one to both operands.
                 return torch.mm(a + 1, b + 1)
 
             if prepadded_left and prepadded_right:
@@ -219,6 +253,9 @@ class BenchmarkRunnerPadMM(BenchmarkRunner):  # type: ignore[misc, no-any-unimpo
     def get_random_dim(
         self, min_power2: int = 1, max_power2: int = 16, p_unaligned: float = 0.25
     ) -> int:
+        # [FUNCTION DOC] HELPER: With probability 1 - p_unaligned returns a power of two with
+        # exponent in the inclusive range; otherwise a random number strictly between two
+        # consecutive powers of two in that range (hence usually unaligned).
         aligned = random.choices([True, False], [1 - p_unaligned, p_unaligned])[0]
         if aligned:
             return 2 ** random.randint(min_power2, max_power2)  # type: ignore[no-any-return]
@@ -227,13 +264,21 @@ class BenchmarkRunnerPadMM(BenchmarkRunner):  # type: ignore[misc, no-any-unimpo
             return get_random_between_pow2(min_power2, max_power2)  # type: ignore[no-any-return]
 
     def is_aligned(self, dim: int, align_size: int) -> bool:
+        # [FUNCTION DOC] HELPER: True when dim is a multiple of align_size.
         return dim % align_size == 0
 
     def prepadded(self, p_prepadded: float = 0.2) -> bool:
+        # [FUNCTION DOC] HELPER: Returns true with probability p_prepadded.
         # p_prepadded: probability that a tensor is "prepadded", i.e. pad_mm excludes time it takes to pad from benchmarking
         return random.choices([True, False], [p_prepadded, 1 - p_prepadded])[0]
 
     def run(self) -> None:
+        # [FUNCTION DOC] Entry point override. Sets the default device to cuda, parses args,
+        # sets up shape collections from --additional-shape-csv, sets the inductor
+        # autoheuristic use / collect flags for pad_mm (use when --use-heuristic, otherwise
+        # collect), sets the log path, selects the device if given, seeds random from time, then
+        # loops num-samples times creating an input and benchmarking it num-reps times.
+        # Side effects: global torch and inductor config, RNG seed, log file output.
         """Override run to setup shape collections before running."""
         import time
 

@@ -1,7 +1,16 @@
+# [MODULE DOC]
+# Command line utility that merges several AutoHeuristic data files into one. Every file has
+# two metadata lines followed by data lines; all inputs must share identical metadata.
+# Usage: output file first, then input files. No import-time side effects.
 import sys
 
 
 def merge_txt_files(file_list: list[str], output_file: str) -> None:
+    # [FUNCTION DOC] Reads each input file, takes the first two lines as metadata and the rest
+    # as content, and writes the metadata once followed by all content to output_file.
+    # Prints a message and returns without writing when the list is empty, a file has fewer
+    # than two lines, metadata differs between files, or reading fails (OSError is caught).
+    # A write failure is also caught and reported. Overwrites output_file.
     if not file_list:
         print("No input files provided.")
         return

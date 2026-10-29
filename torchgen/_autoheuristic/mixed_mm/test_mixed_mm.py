@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Golden-output tests for the generated mixed_mm learned heuristics (A100 and H100). Each test
+# runs shell scripts that download the dataset and regenerate the heuristic, then compares the
+# generated artifact source against the expected text. Appends the parent directory to
+# sys.path at import time.
 import sys
 import unittest
 from pathlib import Path
@@ -11,7 +16,11 @@ from test_utils import read_file_to_string, run_bash  # type: ignore[import-not-
 
 
 class TestMixedMM(TestCase):
+    # [CLASS DOC] Test case holding the A100 and H100 mixed_mm heuristic regeneration tests.
     def test_mixedmm_a100(self) -> None:
+        # [FUNCTION DOC] Runs the dataset download and A100 heuristic generation scripts, reads
+        # the generated _MixedMMA100 artifact file and asserts it equals the expected source.
+        # Depends on relative paths and external scripts; writes the artifact file.
         run_bash("get_mixedmm_dataset.sh")
         run_bash("gen_mixedmm_heuristic_a100.sh")
         file_path = "../../../torch/_inductor/autoheuristic/artifacts/_MixedMMA100.py"
@@ -174,6 +183,8 @@ class MixedMMA100(LearnedHeuristicDecision):
         )
 
     def test_mixedmm_h100(self) -> None:
+        # [FUNCTION DOC] Same as the A100 test but for the H100 script and the _MixedMMH100
+        # artifact file.
         run_bash("get_mixedmm_dataset.sh")
         run_bash("gen_mixedmm_heuristic_h100.sh")
         file_path = "../../../torch/_inductor/autoheuristic/artifacts/_MixedMMH100.py"

@@ -1,4 +1,11 @@
 # mypy: ignore-errors
+# [MODULE DOC]
+# Trains a scikit-learn decision tree classifier on AutoHeuristic data and generates the
+# source of a learned heuristic from it. Contains the trainer class AHTrainDecisionTree, small
+# dataclasses holding evaluation metrics, and DecisionEvaluator which scores a tree (accuracy,
+# unsure rate, speedups, top-k ranking quality, comparison with a default choice). Import-time
+# side effects: a global pandas warning filter and a module logger with a debug-level stream
+# handler attached (DEBUG constant is true).
 
 import itertools
 import json
@@ -36,10 +43,18 @@ if DEBUG:
 
 
 class AHTrainDecisionTree(AHTrain):
+    # [CLASS DOC] Trainer that fits decision trees (grid search over depth, leaf size and
+    # criterion), picks the best model whose wrong prediction rate on validation stays within
+    # the allowed limit, marks unsafe leaves, and generates the heuristic source. Subclasses
+    # override hooks such as add_new_features, get_default_config, is_unsafe_leaf and the
+    # grid. Sets dummy_col_2_col_val dynamically in main.
     def __init__(self):
+        # [FUNCTION DOC] Calls the base class initializer.
         super().__init__()
 
     def debug_time(self, row, top_k_choices):
+        # [FUNCTION DOC] HELPER: Debug aid. Prints each choice with its measured time for the
+        # row, sorted fastest first, appending a marker for choices in top_k_choices.
         choices_feedback = json.loads(row["choice2time"])
         timings = sorted(choices_feedback.items(), key=lambda x: x[1])
         for choice, time in timings:
@@ -49,6 +64,9 @@ class AHTrainDecisionTree(AHTrain):
             print(result)
 
     def is_unsafe_leaf(self, row, predicted_config, choice2time):
+        # [FUNCTION DOC] Hook: decides whether a leaf containing the given sample is unsafe,
+        # given the leaf's predicted choice and a mapping of choice to measured time. Default
+        # never marks a leaf unsafe (returns false).
         """
         Can be overridden by subclasses to define their own logic for deciding when a leaf is unsafe. Returns a sample
         that landed in the leaf, the choice predicted by the tree, and a dictionary that maps each choice to the
@@ -60,6 +78,9 @@ class AHTrainDecisionTree(AHTrain):
         return False
 
     def get_unsafe_leaves(self, model, df, feature_columns):
+        # [FUNCTION DOC] For every leaf reached by the data, takes the leaf's predicted choice
+        # (from its first sample) and asks is_unsafe_leaf for each sample in it; a leaf is unsafe
+        # as soon as one sample says so. Returns the list of unsafe leaf ids.
         """
         Given a trained decision tree, and a dataframe containing the training data, returns a list of unsafe leaves.
         """
@@ -85,6 +106,8 @@ class AHTrainDecisionTree(AHTrain):
         return unsafe_leaves
 
     def get_allowed_wrong_prediction_pct(self):
+        # [FUNCTION DOC] Hook: returns the largest tolerated fraction of wrong predictions on the
+        # validation set; default 0.01.
         """
         This is used to determine a threshold for when a learned heuristic returns 'unsure'.
         If this function returns 0.01, we will set the probability required for the decision tree to return a decision
@@ -93,6 +116,8 @@ class AHTrainDecisionTree(AHTrain):
         return 0.01
 
     def get_grid_search_values(self):
+        # [FUNCTION DOC] Hook: returns the default grid as a mapping with lists for max_depth
+        # (5, 6, 7), min_samples_leaf and criterion (gini, entropy).
         """
         Standard values for grid search. Can be overridden.
         """
@@ -103,6 +128,8 @@ class AHTrainDecisionTree(AHTrain):
         }
 
     def predict(self, model, df, feature_columns):
+        # [FUNCTION DOC] Runs the model on the feature columns of df and returns a tuple of
+        # predicted classes, class probabilities and leaf ids.
         """
         Returns the predictions, probabilities, and leaf ids for a given dataframe.
         """
@@ -112,6 +139,8 @@ class AHTrainDecisionTree(AHTrain):
         return predictions, proba, leaf_ids
 
     def ranking_num_choices(self):
+        # [FUNCTION DOC] Returns how many ranked choices the heuristic provides: the --ranking
+        # argument, or 5 if it was not given. Requires args to be set (parsed).
         # if the heuristic is used for ranking, this function returns the number
         # of choices that the heuristic will return
         if self.args.ranking is None:
@@ -127,6 +156,13 @@ class AHTrainDecisionTree(AHTrain):
         feature_columns,
         ranking=False,
     ):
+        # [FUNCTION DOC] Grid search over every combination of depth, leaf size and criterion.
+        # Each model is fit on the train set (weighted by relative performance when ranking),
+        # wrapped, pruned to the ranking size if ranking, scored on validation to find unsafe
+        # leaves and a safe probability threshold, then evaluated on every dataset. A model
+        # becomes best if validation wrong count is within the allowed fraction and it has more
+        # correct predictions than the best so far. Returns (table of metrics per dataset and
+        # setting, best model or None, its safe probability, its unsafe leaves). Prints progress.
         """
         Does a grid search over max_depths, min_samples_leafs, and criterion_list and returns the best model.
         """
@@ -186,6 +222,10 @@ class AHTrainDecisionTree(AHTrain):
             print(f"safe_proba={safe_proba}")
 
             def eval(name, df):
+                # [FUNCTION DOC] HELPER: Evaluates the current model on df using the safe
+                # probability threshold. When ranking, first drops the duplicated near-best rows
+                # (keeping rows whose winner equals the actual winner). Returns EvalResults.
+                # The name argument is unused.
                 if ranking:
                     # when ranking is enabled, we duplicate each input for each choice that
                     # is almost as good as the best choice
@@ -239,12 +279,16 @@ class AHTrainDecisionTree(AHTrain):
         )
 
     def get_test_and_val_size(self):
+        # [FUNCTION DOC] Hook: returns the (test, validation) fractions; default (0.15, 0.15).
         """
         Returns the size of the test and validation sets.
         """
         return (0.15, 0.15)
 
     def prepare_datasets(self, df, other_datasets, cat_feature2cats, ranking=False):
+        # [FUNCTION DOC] Splits df with a fixed seed into train, validation and test tables
+        # (test first, then validation from the rest), stores them in a mapping under train,
+        # val and test, then adds the user supplied datasets by name. Returns the mapping.
         """
         Splits the dataframe into train, val, and test sets.
         Also adds other datasets, specified by the user, to the train set.
@@ -265,6 +309,8 @@ class AHTrainDecisionTree(AHTrain):
         return datasets
 
     def export_to_dot(self, best_model, df, feature_columns):
+        # [FUNCTION DOC] Writes the model's graphviz dot text to the file best_model.dot in the
+        # current directory (overwrites). df and feature_columns are unused.
         """
         Export a learned decision tree to a dot file.
         """
@@ -273,6 +319,9 @@ class AHTrainDecisionTree(AHTrain):
             f.write(dot_str)
 
     def get_feature_columns(self, df):
+        # [FUNCTION DOC] Returns the column names of df that are model features, i.e. all
+        # columns except the fixed list of bookkeeping columns (speedup, winner, target,
+        # avail_choices, choice2time, index, actual_winner, relative_performance).
         """
         The dataframe contains columns that are not features, such as 'winner', 'speedup' that are only used for
         debugging purposes. This function returns the columns that are actually features.
@@ -291,6 +340,8 @@ class AHTrainDecisionTree(AHTrain):
         return feature_columns
 
     def add_training_data(self, df_train, datasets):
+        # [FUNCTION DOC] Hook to extend the training table; default returns the "train" table
+        # from datasets (df_train is ignored).
         return datasets["train"]
 
     def main(
@@ -302,6 +353,11 @@ class AHTrainDecisionTree(AHTrain):
         save_dot=False,
         ranking=False,
     ):
+        # [FUNCTION DOC] Full pipeline. Loads and featurizes the data, stores the dummy column
+        # mapping on self, builds datasets, extends the training set, runs the grid search,
+        # prints result tables (restricted to ranking columns when ranking), optionally exports
+        # a dot file and, if a valid best model exists, generates and writes the heuristic;
+        # otherwise prints that no heuristic was generated. Side effects: stdout, files.
         """
         Main function that trains a decision tree and generates a heuristic.
         """
@@ -382,6 +438,14 @@ class AHTrainDecisionTree(AHTrain):
         apply_filters=False,
         add_near_best=False,
     ):
+        # [FUNCTION DOC] Parses the log, then groups measurements by input features and choice
+        # to compute count, relative standard deviation and median time (logging high variance
+        # at debug level). Optionally keeps only inputs with at least 3 measurements and low
+        # variance (apply_filters). For each input with at least 2 choices computes winner,
+        # speedup over second best, available choices and a JSON map of choice to time. When
+        # add_near_best, duplicates each row per choice within 2 percent of the best, with a
+        # relative performance weight. Then adds subclass features and one-hot encodes
+        # categoricals. Returns (table, choices, category mapping, dummy column mapping, metadata).
         """
         Parses the log file and processes the data into a dataframe that can be used for training.
         """
@@ -390,6 +454,9 @@ class AHTrainDecisionTree(AHTrain):
         )
 
         def calculate_stats(group):
+            # [FUNCTION DOC] HELPER: For a group of measurements returns a series with the
+            # count, relative standard deviation (percent of the mean; infinite if any
+            # measurement is infinite or the mean is zero) and median time.
             count = len(group)
             has_inf = np.isinf(group["feedback"]).any()
             if has_inf:
@@ -433,6 +500,10 @@ class AHTrainDecisionTree(AHTrain):
 
         # Compute the winner and speedup for each valid input
         def get_winner_and_speedup(group):
+            # [FUNCTION DOC] HELPER: For the rows of one input (one per choice) returns a series
+            # with the fastest choice (winner), speedup of winner over second best, the unique
+            # choices and a JSON string mapping choice to median time. Raises AssertionError if
+            # fewer than 2 rows or duplicate choices exist.
             if len(group) < 2:
                 raise AssertionError("Need at least 2 choices")
 
@@ -471,6 +542,12 @@ class AHTrainDecisionTree(AHTrain):
         )
 
         def add_near_best_configs(df):
+            # [FUNCTION DOC] HELPER: Expands each row into one row per choice whose time is
+            # within 2 percent of the best (relative performance at least 0.98), setting the
+            # winner column to that choice, remembering the true winner in actual_winner and
+            # storing relative_performance. Returns the new table with a fresh index.
+            # KNOWN ISSUE: the checks against none and infinity use identity comparison, which
+            # does not reliably detect a numpy infinity, and a debugger breakpoint is called.
             new_rows = []
 
             for index, row in df.iterrows():
@@ -505,9 +582,13 @@ class AHTrainDecisionTree(AHTrain):
         return (results, choices, cat_feature2cats, dummy_col_2_col_val, metadata)
 
     def ranking_always_included_choices(self):
+        # [FUNCTION DOC] Hook: returns choices always appended to the top-k list when ranking;
+        # default is an empty list.
         return []
 
     def gen_classes(self, classes, num_spaces):
+        # [FUNCTION DOC] Returns source text: one append statement per class name, each indented
+        # by num_spaces spaces and separated by newlines, for the generated choices filler.
         """
         If classes=['choice1', 'choice2', 'choice3'], then this function returns
         the following string:
@@ -520,6 +601,8 @@ class AHTrainDecisionTree(AHTrain):
         return "\n".join([f"{indent}self.choices.append('{c}')" for c in classes])
 
     def get_default_config(self, row):
+        # [FUNCTION DOC] Hook: returns the default choice for a sample (for example what a
+        # handwritten heuristic picks); default none, which disables default comparison.
         """
         Returns the default config for a given sample. The default config could for example be the config that is
         the chosen by a current handwritten heuristic. This can for example be used in get_unsafe_leaf to
@@ -528,6 +611,7 @@ class AHTrainDecisionTree(AHTrain):
         return None
 
     def gen_predict_fn_def(self):
+        # [FUNCTION DOC] Returns the definition line text of the generated best-choices method.
         """
         Generates the definition of the predict function.
         """
@@ -536,6 +620,9 @@ class AHTrainDecisionTree(AHTrain):
     def codegen_boilerplate(
         self, heuristic_name, opt_name, threshold, shared_memory, device_capa, classes
     ):
+        # [FUNCTION DOC] Returns the source text of the generated decision heuristic class
+        # header: file header comments, imports, class with choices filling, precondition,
+        # confidence threshold, choice lookup and name getter. The tree body is appended later.
         """
         Generates the boilerplate code for the generated heuristic. This includes things like imports, class definition,
         etc.
@@ -583,6 +670,9 @@ class {heuristic_name}(LearnedHeuristicDecision):
     def add_real_datasets(
         self, datasets, other_datasets, cat_feature2cats, ranking=False
     ):
+        # [FUNCTION DOC] For each (name, path) pair in other_datasets (may be none) loads the
+        # table via get_df (no filters, near-best expansion when ranking) and stores it in the
+        # datasets mapping under name. Mutates datasets.
         """
         Adds datasets specified by the user to the datasets dictionary.
         """
@@ -605,6 +695,10 @@ class {heuristic_name}(LearnedHeuristicDecision):
         dummy_col_2_col_val,
         unsafe_leaves,
     ):
+        # [FUNCTION DOC] Generates the heuristic source from a trained tree: reads device
+        # capability, name and shared memory from metadata, builds the boilerplate and the
+        # predict method definition, lets the tree emit its body (with unsafe leaves returning
+        # unsure), then writes the lines to the artifact file. Side effect: file written.
         lines = []
         device_capa = metadata["device_capa"]
         device_capa_str = f"({device_capa[0]}, {device_capa[1]})"
@@ -627,6 +721,7 @@ class {heuristic_name}(LearnedHeuristicDecision):
 
 @dataclass
 class AccuracyMetrics:
+    # [CLASS DOC] Record of prediction counts: correct, wrong, unsure and total.
     # Number of correct predictions
     num_correct: int
     # Number of wrong predictions
@@ -637,6 +732,7 @@ class AccuracyMetrics:
     total: int
 
     def to_map(self):
+        # [FUNCTION DOC] Returns a mapping with keys correct, wrong, unsure and total.
         return {
             "correct": self.num_correct,
             "wrong": self.num_wrong,
@@ -647,12 +743,15 @@ class AccuracyMetrics:
 
 @dataclass
 class WrongSpeedupMetrics:
+    # [CLASS DOC] Record of how costly wrong predictions were: maximum and geometric mean
+    # ratio of the predicted choice's time to the best choice's time.
     # If the model predicted the wrong choice, this is the maximum speedup of the best choice over the predicted choice
     max_speedup: float
     # For all wrong predictions, this is the geometric mean of the speedups of the best choices over the predicted choices
     gmean_speedup: float
 
     def to_map(self):
+        # [FUNCTION DOC] Returns a mapping with keys wrong_max_speedup and wrong_gmean_speedup.
         return {
             "wrong_max_speedup": self.max_speedup,
             "wrong_gmean_speedup": self.gmean_speedup,
@@ -661,6 +760,8 @@ class WrongSpeedupMetrics:
 
 @dataclass
 class RankingMetrics:
+    # [CLASS DOC] Record of top-k ranking quality: counts of hits, misses and unsure cases and
+    # the speedups lost when the best choice is missing from the top k.
     # Number of predictions where best choice is in top k choices
     num_correct: int
     # Number of predictions where best choice is not in top k choices
@@ -674,6 +775,8 @@ class RankingMetrics:
     unsure: int
 
     def to_map(self):
+        # [FUNCTION DOC] Returns a mapping with keys top_k_correct, top_k_wrong,
+        # wrong_max_speedup_k, wrong_gmean_speedup_k and top_k_unsure.
         return {
             "top_k_correct": self.num_correct,
             "top_k_wrong": self.num_wrong,
@@ -685,6 +788,10 @@ class RankingMetrics:
 
 @dataclass
 class DefaultComparisonMetrics:
+    # [CLASS DOC] Record comparing predictions with the default choice: speedup statistics,
+    # number of non-default predictions and how often the default was better.
+    # KNOWN ISSUE: default_better is annotated as a boolean but holds a count, and max_slowdown
+    # is filled with the minimum speedup over default (a ratio below one), not a slowdown factor.
     # Maximum speedup of predicted choice over default choice
     max_speedup: float
     # Geometric mean of speedups of predicted choices over default choices
@@ -697,6 +804,9 @@ class DefaultComparisonMetrics:
     default_better: bool
 
     def to_map(self):
+        # [FUNCTION DOC] Returns a mapping with keys max_speedup_over_default,
+        # gmean_speedup_over_default, max_speedup_default_over_heuristic,
+        # non_default_predictions and default_better.
         return {
             "max_speedup_over_default": self.max_speedup,
             "gmean_speedup_over_default": self.gmean_speedup,
@@ -708,12 +818,15 @@ class DefaultComparisonMetrics:
 
 @dataclass
 class EvalResults:
+    # [CLASS DOC] Bundle of the four metric records (accuracy, speedup, ranking and default
+    # comparison) produced by one evaluation.
     accuracy: AccuracyMetrics
     speedup: WrongSpeedupMetrics
     ranking: RankingMetrics
     default_comparison: DefaultComparisonMetrics
 
     def to_map(self):
+        # [FUNCTION DOC] Returns one flat mapping merging the maps of all four records.
         return {
             **self.accuracy.to_map(),
             **self.speedup.to_map(),
@@ -723,6 +836,11 @@ class EvalResults:
 
 
 class DecisionEvaluator:
+    # [CLASS DOC] Scores a trained decision tree on a table. Inputs: trainer, model, predictions,
+    # table, class probabilities, allowed wrong fraction, probability threshold, top-k size,
+    # unsafe leaves, leaf ids and ranking flag. Accumulates counters and lists (correct, wrong,
+    # unsure, wrong probabilities and speedups, top-k stats, default comparison) during
+    # get_results, so one instance should be used for a single evaluation.
     def __init__(
         self,
         train,
@@ -737,6 +855,7 @@ class DecisionEvaluator:
         leaf_ids=None,
         ranking=False,
     ) -> None:
+        # [FUNCTION DOC] Stores the arguments and zero-initializes all accumulators.
         self.train = train
         self.model = model
         self.predictions = predictions
@@ -763,6 +882,11 @@ class DecisionEvaluator:
         self.num_default_better = 0
 
     def compute_speedup_over_default(self, default_config, pred, i, predicted_time):
+        # [FUNCTION DOC] HELPER: If a default choice exists, counts a non-default prediction,
+        # looks up the default's time for row i and, when finite, records default time divided
+        # by predicted_time (counting cases below one as default better). Otherwise logs a debug
+        # message. Mutates accumulators.
+        # KNOWN ISSUE: the debug log formats a possibly absent time with an integer format.
         if default_config is not None:
             if pred != default_config:
                 self.num_non_default_predictions += 1
@@ -780,10 +904,15 @@ class DecisionEvaluator:
                 )
 
     def get_time(self, row, choice):
+        # [FUNCTION DOC] HELPER: Returns the measured time of the choice from the row's JSON
+        # choice-to-time map, or none if the choice is not present.
         choices_feedback = json.loads(row["choice2time"])
         return choices_feedback.get(choice, None)
 
     def top_k_classes(self, model, probas, k, avail_choices):
+        # [FUNCTION DOC] Returns up to k classes with the highest nonzero probability that are
+        # available, then appends the trainer's always-included choices and removes duplicates
+        # keeping order. Note always-included choices are added even if unavailable.
         # Get classes and their corresponding probabilities
         classes = model.classes_
 
@@ -803,6 +932,10 @@ class DecisionEvaluator:
     def eval_prediction(
         self, avail_choices, leaf_id, pred, true, prob, threshold, default_config, i
     ):
+        # [FUNCTION DOC] Classifies the prediction for row i as unsure (unsafe leaf, predicted
+        # choice unavailable, or top probability not above the threshold unless it is exactly
+        # one), correct (equals true) or wrong. Correct and wrong update the default comparison;
+        # wrong also records the probability and predicted-to-best time ratio. Mutates counters.
         predicted_time = self.get_time(self.df.iloc[i], pred)
         max_prob = max(prob)
         if (
@@ -824,6 +957,9 @@ class DecisionEvaluator:
             self.speedups_wrong.append(wrong_speedup)
 
     def eval_ranking_prediction(self, true, top_k_choices, i):
+        # [FUNCTION DOC] Counts a top-k hit if the true best choice is among top_k_choices.
+        # Otherwise finds the fastest available time among them: if any exists, records the ratio
+        # of that time to the best time and counts a miss; if none, counts an unsure case.
         if true in top_k_choices:
             self.num_correct_top_k += 1
         else:
@@ -846,9 +982,14 @@ class DecisionEvaluator:
                 )
 
     def get_safe_proba(self):
+        # [FUNCTION DOC] Runs the evaluation and returns the probability threshold above which
+        # the allowed wrong fraction is respected.
         return self.get_results(return_safe_proba=True)
 
     def compute_safe_proba(self, num_predictions, wrong_probas, wrong_pct):
+        # [FUNCTION DOC] Sorts wrong_probas in place. If the number of wrong predictions is within
+        # the allowance (predictions times wrong_pct, truncated) returns 0.0; otherwise returns
+        # the sorted probability at the index equal to the excess count, capped at the last one.
         wrong_probas.sort()
         num_wrong = len(wrong_probas)
         allowed_wrong = int(num_predictions * wrong_pct)
@@ -859,6 +1000,11 @@ class DecisionEvaluator:
         return wrong_probas[idx]
 
     def get_results(self, return_safe_proba=False) -> EvalResults:
+        # [FUNCTION DOC] Evaluates every row (true label is the actual winner when ranking, else
+        # the winner), computing top-k choices, the default config, the prediction outcome and
+        # the ranking outcome. Raises AssertionError if the true best choice is unavailable.
+        # With return_safe_proba returns the safe probability number instead; otherwise returns
+        # EvalResults with accuracy, wrong-speedup, ranking and default-comparison metrics.
         """
         Custom evaluation function that evaluates a learned decision tree.
         """
@@ -893,6 +1039,7 @@ class DecisionEvaluator:
             return self.compute_safe_proba(total, self.wrong_probas, self.wrong_pct)
 
         def safe_gmean(x):
+            # [FUNCTION DOC] HELPER: Geometric mean of a list, or 0 for an empty list.
             return gmean(x) if x else 0
 
         max_speedup = max(self.speedups_wrong, default=0)

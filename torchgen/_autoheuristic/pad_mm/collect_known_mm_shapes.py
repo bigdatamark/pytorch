@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Script and helpers that gather real-world matmul shapes (mm, addmm, bmm) from the
+# HuggingFace, TIMM and TorchBench operator input datasets, keep those that are not fully
+# aligned (so padding matters) and write them to a CSV with columns M,K,N,dtype. Import-time
+# side effect: appends the parent directory and the dynamo microbenchmarks directory to
+# sys.path.
 import argparse
 import csv
 import sys
@@ -28,6 +34,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 
 
 def is_aligned(dim: int, align_size: int) -> bool:
+    # [FUNCTION DOC] HELPER: Returns true when dim is a multiple of align_size.
     """Check if dimension is aligned to the given alignment size."""
     return dim % align_size == 0
 
@@ -35,6 +42,11 @@ def is_aligned(dim: int, align_size: int) -> bool:
 def extract_mm_shapes_from_loader(
     loader: OperatorInputsLoader,
 ) -> list[tuple[int, int, int, torch.dtype, torch.dtype]]:
+    # [FUNCTION DOC] Walks the recorded inputs of the mm, addmm and bmm operators in the
+    # loader, deserializes each under fake tensor mode, and keeps (m, k, n, dtype_a, dtype_b)
+    # for well-formed two-dimensional (three-dimensional for bmm, with equal batch size)
+    # operands whose inner dimensions match. Entries that fail to parse are silently skipped
+    # (all exceptions swallowed). Prints a per-operator count. Returns the list, with duplicates.
     """Extract matrix multiplication shapes from an OperatorInputsLoader using deserialize_args with FakeTensorMode."""
     shapes = []
 
@@ -118,6 +130,9 @@ def extract_mm_shapes_from_loader(
 def filter_unaligned_shapes(
     shapes: list[tuple[int, int, int, torch.dtype, torch.dtype]],
 ) -> list[tuple[int, int, int, torch.dtype, torch.dtype]]:
+    # [FUNCTION DOC] Keeps only shapes where at least one of m, k, n is not a multiple of the
+    # alignment size for the first dtype. Shapes whose alignment lookup fails are dropped.
+    # Returns the filtered list.
     """Filter shapes to keep only those that are not completely aligned (so padding is relevant)."""
     filtered_shapes = []
 
@@ -139,6 +154,9 @@ def filter_unaligned_shapes(
 
 
 def collect_known_mm_shapes() -> list[tuple[int, int, int, torch.dtype, torch.dtype]]:
+    # [FUNCTION DOC] Loads the HuggingFace, TIMM and TorchBench loaders (a failed load only
+    # prints a warning), extracts shapes from each, removes duplicates, filters to unaligned
+    # shapes and returns them. Prints progress. Order of the result is arbitrary (set based).
     """
     Collect known matrix multiplication shapes from HuggingFace, TIMM, and TorchBench datasets.
 
@@ -189,6 +207,9 @@ def collect_known_mm_shapes() -> list[tuple[int, int, int, torch.dtype, torch.dt
 
 
 def main(output_file="mm_shapes.csv"):
+    # [FUNCTION DOC] Collects the known unaligned shapes and writes a CSV (header M,K,N,dtype)
+    # to output_file, using only the first dtype of each shape and dropping shapes whose dtype
+    # is not float16, bfloat16 or float32. Overwrites the file and prints progress.
     shapes = collect_known_mm_shapes()
 
     print(f"\nCollected {len(shapes)} real-world matrix multiplication shapes")

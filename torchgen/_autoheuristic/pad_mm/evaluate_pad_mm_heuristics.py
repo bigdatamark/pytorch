@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# [MODULE DOC]
+# Command line tool that evaluates the learned pad_mm AutoHeuristic against measurements. For
+# each matmul shape in an input CSV (columns M,K,N,dtype) that passes the pad_mm precondition,
+# is unaligned and fits in memory, it asks the heuristic for a choice, benchmarks the original
+# and padded matmul, and reports accuracy, speedups and the share of confident decisions.
+# Requires CUDA. No import-time side effects beyond imports.
 
 import argparse
 import csv
@@ -12,16 +18,26 @@ from torch._inductor.utils import get_gpu_shared_memory
 
 
 def fits_in_memory(dtype, m: int, k: int, n: int) -> bool:
+    # [FUNCTION DOC] HELPER: True when the operands (m by k, k by n, m by n) of dtype use less
+    # than a quarter of total memory of CUDA device 0.
     threshold_memory = torch.cuda.get_device_properties(0).total_memory / 4
     return dtype.itemsize * (m * k + k * n + m * n) < threshold_memory
 
 
 def set_precision(dtype, float32_precision: str = "highest") -> None:
+    # [FUNCTION DOC] HELPER: Sets the global float32 matmul precision to float32_precision for
+    # float32 and to "high" for every other dtype.
     precision = float32_precision if dtype == torch.float32 else "high"
     torch.set_float32_matmul_precision(precision)
 
 
 def get_heuristic_decision(m: int, k: int, n: int, dtype: torch.dtype) -> str | None:
+    # [FUNCTION DOC] Queries the pad_mm AutoHeuristic for one shape. Enables the use flag for
+    # pad_mm in the inductor config (global side effect); returns None if autoheuristic is not
+    # enabled for pad_mm. Otherwise builds random operands on cuda, computes padded lengths
+    # and the context, and creates an AutoHeuristic with choices orig and pad, a dummy feedback
+    # and a fallback returning "no_decision". Returns the chosen string (possibly
+    # "no_decision" when the learned heuristic is unsure).
     from torch._inductor.autoheuristic.autoheuristic import AutoHeuristic, LocalFeedback
     from torch._inductor.fx_passes.pad_mm import (
         get_alignment_size,
@@ -54,9 +70,12 @@ def get_heuristic_decision(m: int, k: int, n: int, dtype: torch.dtype) -> str | 
     )
 
     def dummy_feedback(choice: str) -> float:
+        # [FUNCTION DOC] HELPER: Placeholder feedback; returns a constant 1.0 for any choice.
         return 1.0
 
     def fallback() -> str:
+        # [FUNCTION DOC] HELPER: Fallback used when the heuristic is unsure; returns the string
+        # "no_decision".
         return "no_decision"
 
     autoheuristic = AutoHeuristic(
@@ -81,6 +100,10 @@ def benchmark_both_choices(
     num_reps: int = 3,
     float32_precision: str = "highest",
 ) -> tuple[float, float]:
+    # [FUNCTION DOC] Benchmarks torch.mm and the padded matmul on random cuda operands, with
+    # the given float32 precision, and returns (original_seconds, padded_seconds). If no
+    # padding is needed on any dimension, returns the original time twice. Sets global matmul
+    # precision as a side effect.
     set_precision(dtype, float32_precision)
     a = torch.randn(m, k, dtype=dtype, device="cuda")
     b = torch.randn(k, n, dtype=dtype, device="cuda")
@@ -117,6 +140,9 @@ def benchmark_both_choices(
 
 
 def load_shapes_from_csv(csv_file: str) -> list:
+    # [FUNCTION DOC] Reads a CSV with columns M,K,N,dtype and returns a list of
+    # (m, k, n, torch dtype) tuples; rows with a dtype other than float16, bfloat16 or float32
+    # are skipped. Prints the count. Raises OSError if the file cannot be opened.
     shapes = []
     with open(csv_file) as f:
         reader = csv.DictReader(f)
@@ -141,10 +167,14 @@ def load_shapes_from_csv(csv_file: str) -> list:
 
 @functools.cache
 def get_shared_mem_size():
+    # [FUNCTION DOC] HELPER: Cached (computed once) shared memory size of the GPU.
     return get_gpu_shared_memory()
 
 
 def check_shape_passes_precondition(m: int, k: int, n: int, dtype: torch.dtype) -> bool:
+    # [FUNCTION DOC] Builds heuristic metadata from the GPU shared memory and capability and a
+    # context holding m, k, n, then returns the result of the library pad_mm precondition.
+    # The dtype argument is unused.
     """
     Check if a shape passes the same precondition used by the actual pad_mm AutoHeuristics.
 
@@ -174,6 +204,9 @@ def check_shape_passes_precondition(m: int, k: int, n: int, dtype: torch.dtype) 
 
 
 def filter_shapes(shapes: list) -> list:
+    # [FUNCTION DOC] Drops shapes that are fully aligned, fail the pad_mm precondition or do
+    # not fit in memory (checked in that order); returns the remaining (m, k, n, dtype) tuples
+    # and prints counts for each reason.
     filtered = []
     aligned_count = 0
     precondition_failed_count = 0
@@ -211,6 +244,13 @@ def filter_shapes(shapes: list) -> list:
 
 
 def main():
+    # [FUNCTION DOC] Entry point. Parses arguments (csv_file, --num-reps, --device, --max-shapes,
+    # --float32_matmul_precision), sets the default device to cuda, loads and filters shapes
+    # (truncating to max-shapes) and returns early with a message if none remain. For each
+    # shape compares the heuristic choice to the measured faster option (pad if padded time is
+    # strictly smaller), counting true/false positives and negatives and shapes where the
+    # heuristic returned "no_decision" (excluded from accuracy), and prints running and final
+    # statistics, lists of non-confident shapes and confident decisions per dtype.
     parser = argparse.ArgumentParser(
         description="Evaluate trained AutoHeuristics for pad_mm optimization"
     )

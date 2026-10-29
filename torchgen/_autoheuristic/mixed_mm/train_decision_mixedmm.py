@@ -1,4 +1,9 @@
 # mypy: ignore-errors
+# [MODULE DOC]
+# Decision tree training script for the mixed_mm heuristic. Subclasses AHTrainDecisionTree with
+# mixed_mm specific features, fallback choice, leaf safety rule and hyperparameters. Appends
+# the parent directory to sys.path at import time; running it as a script trains and
+# generates the heuristic.
 import sys
 from pathlib import Path
 
@@ -11,10 +16,16 @@ from torch._inductor.autoheuristic.autoheuristic_utils import mixed_mm_operation
 
 
 class AHTrainDecisionTreeMixedMM(AHTrainDecisionTree):
+    # [CLASS DOC] Decision tree trainer for mixed_mm; customizes feature engineering, the
+    # default (fallback) choice, accepted error rate, split sizes, unsafe leaf rule and grid.
     def __init__(self):
+        # [FUNCTION DOC] Calls the base class initializer.
         super().__init__()
 
     def add_new_features(self, results):
+        # [FUNCTION DOC] Adds one column per mixed_mm feature operation by applying its function
+        # to each row of the results table. Returns the table and the names of the added
+        # columns that are categorical. Mutates the given table.
         ops = mixed_mm_operations()
         added_categorical_features = []
         for op in ops:
@@ -24,17 +35,24 @@ class AHTrainDecisionTreeMixedMM(AHTrainDecisionTree):
         return (results, added_categorical_features)
 
     def get_default_config(self, row):
+        # [FUNCTION DOC] Returns the fallback choice name, always the extern mixed_mm fallback.
         return "extern_fallback_mixed_mm"
 
     def get_allowed_wrong_prediction_pct(self):
+        # [FUNCTION DOC] Returns 1.0, i.e. any fraction of wrong predictions is tolerated.
         # it is okay to have wrong predictions
         # we introduce uncertainty by marking leaves as unsafe instead
         return 1.0
 
     def get_test_and_val_size(self):
+        # [FUNCTION DOC] Returns the (test, validation) split fractions: (0.01, 0.19).
         return (0.01, 0.19)
 
     def is_unsafe_leaf(self, row, predicted_config, choice2time):
+        # [FUNCTION DOC] Decides whether a leaf is unsafe. Returns false if the predicted
+        # choice has no measured time; otherwise true when the fallback time scaled by 1.05 is
+        # smaller than the predicted choice time (prediction more than 5 percent slower).
+        # Raises a key error if the fallback has no measured time.
         if predicted_config not in choice2time:
             # heuristic always returns "unsure" in such a case
             return False
@@ -46,6 +64,8 @@ class AHTrainDecisionTreeMixedMM(AHTrainDecisionTree):
         return 1.05 * fallback_time < predicted_time
 
     def get_grid_search_values(self):
+        # [FUNCTION DOC] Returns a single-point hyperparameter grid: max_depth 5,
+        # min_samples_leaf 0.01, entropy criterion.
         # A lot of different hyperparameters perform very similar on mixed_mm
         # it is kind of hard to automatically pick one so I just manually picked one with a small max_depth
         return {"max_depth": [5], "min_samples_leaf": [0.01], "criterion": ["entropy"]}
