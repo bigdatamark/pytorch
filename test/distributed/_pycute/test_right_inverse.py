@@ -1,6 +1,10 @@
 # ruff: noqa: PGH004, G004, F403
 # flake8: noqa
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Unit tests for the pycute right_inverse function. One TestCase with a
+# round-trip helper and one test over several layouts. Star-imports the pycute package.
+# KNOWN ISSUE: the module docstring says it tests left_inverse (copy-paste); it tests
+# right_inverse.
 #################################################################################################
 #
 # Copyright (c) 2023 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
@@ -47,7 +51,11 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class TestRightInverse(TestCase):
+    # [CLASS DOC] Test case for right_inverse; stateless, one helper and one test.
     def helper_test_right_inverse(self, layout):
+        # [FUNCTION DOC] HELPER: Computes the right inverse of the layout and asserts that
+        # for every index in the inverse's size, applying the layout to the inverse's output
+        # gives back that index. Logs the pair at debug level.
         inv_layout = right_inverse(layout)
 
         _LOGGER.debug(f"{layout}  =>  {inv_layout}")
@@ -56,6 +64,8 @@ class TestRightInverse(TestCase):
             self.assertEqual(layout(inv_layout(i)), i)
 
     def test_right_inverse(self):
+        # [FUNCTION DOC] Runs the check on size-1, zero-stride (broadcast), flat strided and
+        # multi-mode layouts with column-major, row-major and gapped strides.
         test = Layout(1, 0)
         self.helper_test_right_inverse(test)
 

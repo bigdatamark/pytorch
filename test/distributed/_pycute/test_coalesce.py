@@ -1,6 +1,10 @@
 # ruff: noqa: PGH004, G004, F403
 # flake8: noqa
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Unit tests for the pycute coalesce function, which merges adjacent compatible
+# modes of a Layout and drops size-1 modes. Contains one TestCase with a checking helper and
+# one test enumerating layouts. Star-imports the pycute package; creates a module logger.
+# No import-time side effects beyond that.
 #################################################################################################
 #
 # Copyright (c) 2023 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
@@ -47,7 +51,12 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class TestCoalesce(TestCase):
+    # [CLASS DOC] Test case holding the coalesce checks; stateless, one helper and one test.
     def helper_test_coalesce(self, layout, expected_coalesced_layout):
+        # [FUNCTION DOC] HELPER: Coalesces the given layout and asserts the result has the
+        # expected shape and stride, the same total size as the input, and maps every index
+        # in the input's size range to the same offset as the original layout.
+        # Raises an assertion failure on any mismatch; logs the before/after at debug level.
         layoutR = coalesce(layout)
 
         _LOGGER.debug(f"{layout}  =>  {layoutR}")
@@ -60,6 +69,9 @@ class TestCoalesce(TestCase):
             self.assertEqual(layoutR(i), layout(i))
 
     def test_coalesce(self):
+        # [FUNCTION DOC] Runs the helper over a table of layouts: size-1 modes, flat and
+        # nested shapes with default and explicit strides, contiguous modes that merge into
+        # one, and non-mergeable strides that must stay unchanged.
         layout = Layout(1, 0)
         expected_coalesced_layout = Layout(1, 0)
         self.helper_test_coalesce(layout, expected_coalesced_layout)

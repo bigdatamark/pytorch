@@ -1,4 +1,8 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Multi-GPU tests for ShardedOptimizer, which applies a regular optimizer to
+# modules holding ShardedTensor parameters. Defines two small models and a test case needing
+# four accelerators. At import it computes the module-level device_type (current accelerator
+# type or cpu) and the default distributed backend for it.
 
 from copy import deepcopy
 
@@ -25,7 +29,14 @@ backend = torch.distributed.get_default_backend_for_device(device_type)
 
 
 class MyShardedModel(torch.nn.Module):
+    # [CLASS DOC] HELPER: Tiny module with a regular 5x10 parameter and a second parameter
+    # named sharded_param. With a sharding spec the latter is a 20x10 ShardedTensor
+    # parameter; without one it is a plain 5x10 random parameter. Forward adds the inputs
+    # elementwise to both parameters (using the first local shard when sharded).
     def __init__(self, spec=None, group=None):
+        # [FUNCTION DOC] HELPER: Seeds the global RNG with 0 so every rank/model gets the
+        # same values, then creates the parameters. spec is an optional sharding spec and
+        # group the process group used to build the sharded tensor. Mutates global RNG state.
         super().__init__()
         # Use same seed.
         torch.manual_seed(0)
@@ -40,6 +51,9 @@ class MyShardedModel(torch.nn.Module):
             self.sharded_param = torch.nn.Parameter(torch.rand(5, 10))
 
     def forward(self, input):
+        # [FUNCTION DOC] HELPER: Returns the sum of the regular parameter, the sharded
+        # parameter (its first local shard tensor if it is a ShardedTensor, else the plain
+        # tensor) and the input. Shapes must broadcast with each other.
         if isinstance(self.sharded_param, sharded_tensor.ShardedTensor):
             return self.param + self.sharded_param.local_shards()[0].tensor + input
         else:
@@ -47,7 +61,13 @@ class MyShardedModel(torch.nn.Module):
 
 
 class MyShardedLinear(torch.nn.Module):
+    # [CLASS DOC] HELPER: Two-layer MLP (17 -> 12 -> 29 linear layers with GELU between)
+    # whose weights can be sharded across four ranks: first layer row-wise, second layer
+    # column-wise, via shard_parameter.
     def __init__(self, rank=None):
+        # [FUNCTION DOC] HELPER: Seeds the global RNG with 0, builds the layers and, if rank
+        # is truthy, moves both linear layers to that device (rank 0 is falsy, so it is not
+        # moved). Mutates global RNG state.
         super().__init__()
         # Use same seed.
         torch.manual_seed(0)
@@ -60,6 +80,9 @@ class MyShardedLinear(torch.nn.Module):
             self.linear2.to(rank)
 
     def shard_parameter(self):
+        # [FUNCTION DOC] HELPER: Replaces linear1.weight by a tensor sharded along dim 0
+        # and linear2.weight by one sharded along dim 1, each over ranks 0-3 placed on the
+        # matching device index. Modifies the module in place; needs an initialized group.
         rowwise_sharding_spec = ChunkShardingSpec(
             dim=0,
             placements=[
@@ -84,14 +107,22 @@ class MyShardedLinear(torch.nn.Module):
         shard_parameter(self.linear2, "weight", colwise_sharding_spec)
 
     def forward(self, inp):
+        # [FUNCTION DOC] HELPER: Applies linear1, GELU, then linear2 to the input.
         return self.linear2(self.gelu(self.linear1(inp)))
 
 
 class TestShardedOptimizer(ShardedTensorTestBase):
+    # [CLASS DOC] Multi-process test case (4 ranks, accelerator backend) for
+    # ShardedOptimizer; process group setup is done by the with_comms decorator.
     @with_comms(init_rpc=False, backend=backend)
     @skip_if_lt_x_gpu(4)
     @requires_accelerator_dist_backend(["nccl", "xccl", "privateuse1"])
     def test_sharded_optim(self):
+        # [FUNCTION DOC] Builds a plain model and an identically seeded model whose second
+        # parameter is row-sharded over 4 ranks, copies the plain values into the local
+        # shard, and trains both with SGD (lr 0.1; ShardedOptimizer for the sharded one) for
+        # one forward/backward/step. Asserts each parameter changed and that the updated
+        # sharded shard and regular parameter equal the local model's updated parameters.
         rowwise_spec = ChunkShardingSpec(
             dim=0,
             placements=[
@@ -153,6 +184,9 @@ class TestShardedOptimizer(ShardedTensorTestBase):
     @skip_if_lt_x_gpu(4)
     @requires_accelerator_dist_backend(["nccl", "xccl", "privateuse1"])
     def test_named_params_with_sharded_tensor(self):
+        # [FUNCTION DOC] Checks named_parameters of a model with a sharded parameter lists
+        # the expected names (param, sharded_param), and likewise for the sharded two-layer
+        # MLP (both layers' weights and biases, no bare bias).
         rowwise_spec = ChunkShardingSpec(
             dim=0,
             placements=[

@@ -1,4 +1,7 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Four-rank tests of torch.equal and torch.allclose on ShardedTensor operands.
+# Import-time side effects: computes device_type and the default backend, and if the dev-asan
+# flag is set it prints a message to stderr and exits the process with status 0.
 
 import sys
 
@@ -32,6 +35,9 @@ if TEST_WITH_DEV_DBG_ASAN:
 
 
 class TestShardedTensorBinaryOps(ShardedTensorTestBase):
+    # [CLASS DOC] Multi-process test case for binary comparison ops on ShardedTensor. The
+    # class attribute seed (starts at 42) is shared state, bumped on every call to
+    # get_random_tensors so each test pair gets fresh random data.
     """Test base for binary comparison functions such as torch.equal, torch.allclose etc. for ShardedTensor"""
 
     seed = 42
@@ -39,6 +45,10 @@ class TestShardedTensorBinaryOps(ShardedTensorTestBase):
     def get_random_tensors(
         self, spec1, spec2, *sizes, pg1=None, pg2=None, seed_offset=0
     ):
+        # [FUNCTION DOC] HELPER: Creates two random ShardedTensors of the given sizes using
+        # spec1/pg1 and spec2/pg2 (default group if None). The RNG is seeded with the class
+        # seed for the first and class seed plus seed_offset for the second, so with offset
+        # 0 the values match. Increments the class seed afterwards; returns (st1, st2).
         pg1 = _get_default_group() if pg1 is None else pg1
         pg2 = _get_default_group() if pg2 is None else pg2
         torch.manual_seed(TestShardedTensorBinaryOps.seed)
@@ -50,6 +60,9 @@ class TestShardedTensorBinaryOps(ShardedTensorTestBase):
         return st1, st2
 
     def get_gpu_specs(self):
+        # [FUNCTION DOC] HELPER: Returns two dim-0 chunk sharding specs over four ranks on
+        # the accelerator: the identity placement and one with ranks swapped pairwise
+        # (1,0,3,2), which yields a different placement order.
         spec = ChunkShardingSpec(
             dim=0,
             placements=[
@@ -72,6 +85,11 @@ class TestShardedTensorBinaryOps(ShardedTensorTestBase):
         return spec, alt_spec
 
     def _test_common_failures(self, cmp_op):
+        # [FUNCTION DOC] HELPER: Asserts that comparison function cmp_op returns False for
+        # pairs differing in one local shard's values, size, placement order, values
+        # (ones vs zeros), dtype, requires_grad, or pin_memory (cpu specs). Also asserts it
+        # raises RuntimeError about needing the same ProcessGroup when the two tensors use
+        # different (even equal-rank) groups. Creates new process groups (collective).
         spec, alt_spec = self.get_gpu_specs()
 
         st1, st2 = self.get_random_tensors(spec, spec, 10, 10)
@@ -129,12 +147,15 @@ class TestShardedTensorBinaryOps(ShardedTensorTestBase):
     @skip_if_lt_x_gpu(4)
     @requires_accelerator_dist_backend(["nccl", "xccl"])
     def test_torch_equal_tensor_specs(self):
+        # [FUNCTION DOC] Runs the shared failure cases against torch.equal.
         self._test_common_failures(torch.equal)
 
     @with_comms(backend=backend)
     @skip_if_lt_x_gpu(4)
     @requires_accelerator_dist_backend(["nccl", "xccl"])
     def test_torch_equal(self):
+        # [FUNCTION DOC] Checks torch.equal is True for two identically seeded sharded
+        # tensors with the same spec.
         """Test torch.equal(ShardedTensor, ShardedTensor)"""
 
         spec, _ = self.get_gpu_specs()
@@ -145,12 +166,16 @@ class TestShardedTensorBinaryOps(ShardedTensorTestBase):
     @skip_if_lt_x_gpu(4)
     @requires_accelerator_dist_backend(["nccl", "xccl"])
     def test_torch_allclose_tensor_specs(self):
+        # [FUNCTION DOC] Runs the shared failure cases against torch.allclose.
         self._test_common_failures(torch.allclose)
 
     @with_comms(backend=backend)
     @skip_if_lt_x_gpu(4)
     @requires_accelerator_dist_backend(["nccl", "xccl"])
     def test_torch_allclose(self):
+        # [FUNCTION DOC] Checks torch.allclose is True for identical sharded tensors (also
+        # with zero atol), False for differently seeded ones with default tolerances, and
+        # True for those with atol 1 since random values lie in the unit interval.
         """Test torch.allclose(ShardedTensor, ShardedTensor)"""
 
         spec, _ = self.get_gpu_specs()

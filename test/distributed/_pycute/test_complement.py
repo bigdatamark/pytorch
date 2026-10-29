@@ -1,6 +1,9 @@
 # ruff: noqa: PGH004, G004, F403
 # flake8: noqa
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Unit tests for the pycute complement function, which builds a layout covering
+# the offsets a given layout does not. Contains one TestCase with a post-condition helper and
+# one test over several layouts. Star-imports the pycute package; creates a module logger.
 #################################################################################################
 #
 # Copyright (c) 2023 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
@@ -47,7 +50,12 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class TestComplement(TestCase):
+    # [CLASS DOC] Test case for complement; stateless, one helper and one test.
     def helper_test_complement(self, layout):
+        # [FUNCTION DOC] HELPER: Computes the complement of the layout and checks, for every
+        # pair of indices (one into the layout, one into the complement), that the two
+        # offsets differ unless both are zero. Raises an assertion error naming the violating
+        # pair otherwise. Logs the result at debug level.
         layoutR = complement(layout)
 
         _LOGGER.debug(f"{layout}  =>  {layoutR}")
@@ -63,6 +71,8 @@ class TestComplement(TestCase):
                     )
 
     def test_complement(self):
+        # [FUNCTION DOC] Runs the disjointness check on flat and nested layouts, including
+        # trivial size-1 layouts, a zero-stride layout and strided/gapped layouts.
         test = Layout(1, 0)
         self.helper_test_complement(test)
 

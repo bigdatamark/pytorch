@@ -1,4 +1,10 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests of the composable replicate API combined with torch.compile and compiled
+# autograd: result parity against eager DDP and replicate (with no_sync, activation
+# checkpointing, bf16/fp16 comm hooks, backward-only compilation), DDP graph splitting and
+# gradient bucketing with fused all-reduce passes checked via generated code, and a
+# (disabled) DDP plus tensor-parallel case. Defines a 4-layer Net and helper test bases.
+# Import-time: computes device_type and DIM (2000).
 
 import contextlib
 import functools
@@ -44,7 +50,12 @@ DIM = 2000
 
 
 class Net(nn.Module):
+    # [CLASS DOC] HELPER: Four stacked DIM x DIM linear layers (fc1 to fc4) without
+    # activations. The use_checkpoint flag makes forward run fc1 under non-reentrant
+    # activation checkpointing.
     def __init__(self, checkpoint=False):
+        # [FUNCTION DOC] HELPER: Creates the four linear layers and stores the checkpoint
+        # flag as use_checkpoint.
         super().__init__()
         self.fc1 = nn.Linear(DIM, DIM)
         self.fc2 = nn.Linear(DIM, DIM)
@@ -53,6 +64,8 @@ class Net(nn.Module):
         self.use_checkpoint = checkpoint
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Runs fc1 (via non-reentrant checkpoint if enabled), then
+        # fc2, fc3, fc4, and returns the output.
         if self.use_checkpoint:
             _fc1 = checkpoint(self.fc1, x, use_reentrant=False)
         else:
@@ -61,8 +74,16 @@ class Net(nn.Module):
 
 
 def compiler_fn(no_inductor=False):
+    # [FUNCTION DOC] HELPER: Returns a compiler callback for compiled autograd. The callback
+    # takes a graph module and returns it wrapped with a full-graph torch.compile whose
+    # backend returns the graph unchanged when no_inductor is true, else compiles it with
+    # Inductor.
     def _compiler_fn(gm):
+        # [FUNCTION DOC] HELPER: Wraps gm with full-graph torch.compile using the inner
+        # backend and returns the compiled callable.
         def inner_compiler(gm_, example_inputs_):
+            # [FUNCTION DOC] HELPER: Backend: returns gm_ itself if no_inductor was set,
+            # otherwise the result of Inductor compiling gm_ with the example inputs.
             if no_inductor:
                 return gm_
             else:
@@ -75,6 +96,9 @@ def compiler_fn(no_inductor=False):
 
 
 class MultiProcessInductorTestCase(DistributedTestBase, InductorTestCase):
+    # [CLASS DOC] HELPER: Combines the distributed multi-process test base with the
+    # Inductor test case so each process isolates its Inductor cache directory. No added
+    # behavior.
     """
     A version of MultiProcessTestCase that derives from the Inductor TestCase
     to handle isolation of the inductor cache dir.
@@ -82,8 +106,12 @@ class MultiProcessInductorTestCase(DistributedTestBase, InductorTestCase):
 
 
 class ReplicateTest(MultiProcessInductorTestCase):
+    # [CLASS DOC] Multi-process test case (up to 2 ranks) checking replicate plus torch.compile
+    # and compiled autograd against eager DDP and uncompiled replicate, and DDP bucketing.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns the smaller of 2 and the number of devices of the
+        # current device type.
         return min(2, torch.get_device_module(device_type).device_count())
 
     def _test_compile(
@@ -96,6 +124,17 @@ class ReplicateTest(MultiProcessInductorTestCase):
         checkpoint: bool = False,
         device: str | torch.device,
     ):
+        # [FUNCTION DOC] HELPER: Core parity test. Creates the process group, sets the
+        # global dynamo optimize_ddp option to python_reducer (side effect), and builds
+        # three copies of a Net: eager replicate, a compiled replicate (compiled forward
+        # unless no_compile_forward) and compiled DDP, each with Adam. Optional setup_func
+        # may register hooks on all three. For 2 iterations with rank-dependent inputs it
+        # runs forward/backward (backward of the compiled ones under compiled autograd,
+        # using no_inductor to pick the backend) toggling gradient sync when no_sync is set,
+        # and on sync iterations asserts gradients equal across all three and steps and
+        # zeroes optimizers. Finally asserts parameters match, and destroys the group.
+        # KNOWN ISSUE: the sync context chosen in the loop is unconditionally overwritten by
+        # a null context before use, so the DDP no_sync context is never actually entered.
         self.create_pg(device)
         torch._dynamo.config.optimize_ddp = "python_reducer"
         torch.manual_seed(123)
@@ -181,6 +220,10 @@ class ReplicateTest(MultiProcessInductorTestCase):
 
     @unittest.skipIf(IS_LINUX, "https://github.com/pytorch/pytorch/issues/160597")
     def test_compile_cpu(self):
+        # [FUNCTION DOC] Sets the global Inductor DDP fusion passes to the coalesced-op
+        # fusion and comm-wait scheduling (side effect, not restored), then runs the parity
+        # test on CPU with gradient sync. Skipped on Linux (the skip decorator is tied to a
+        # tracked issue), so it effectively never runs there.
         # Test the coalesced_op with CPU.
         torch._inductor.config._fuse_ddp_communication_passes = [
             "fuse_ddp_with_coalesced_op",
@@ -189,6 +232,8 @@ class ReplicateTest(MultiProcessInductorTestCase):
         self._test_compile(no_sync=False, device="cpu")
 
     def test_compile_cpu_no_sync(self):
+        # [FUNCTION DOC] Same as the CPU test (also sets the global fusion passes, not
+        # restored) but alternates gradient sync off and on across iterations.
         # Test the coalesced_op with CPU.
         torch._inductor.config._fuse_ddp_communication_passes = [
             "fuse_ddp_with_coalesced_op",
@@ -203,6 +248,8 @@ class ReplicateTest(MultiProcessInductorTestCase):
         reorder_for_locality=False, reorder_for_peak_memory=False
     )
     def test_compile_gpu(self):
+        # [FUNCTION DOC] Runs the parity test on the accelerator without checkpointing, with
+        # Inductor locality and peak-memory reordering disabled by the decorator.
         self._test_compile(no_sync=False, checkpoint=False, device=device_type)
 
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
@@ -211,11 +258,17 @@ class ReplicateTest(MultiProcessInductorTestCase):
         reorder_for_locality=False, reorder_for_peak_memory=False
     )
     def test_compile_gpu_ac(self):
+        # [FUNCTION DOC] Runs the parity test on the accelerator with activation
+        # checkpointing enabled in the model, reorderings disabled by the decorator.
         self._test_compile(no_sync=False, checkpoint=True, device=device_type)
 
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @skip_if_lt_x_gpu(2)
     def test_compile_bf16(self):
+        # [FUNCTION DOC] Skips unless the device has compute capability 8.0 or higher (or is
+        # HIP). Runs the parity test with a setup that registers the bf16 compression
+        # communication hook on the eager model, the original module under the compiled
+        # replicate model, and the compiled DDP model.
         # Check device capability wrt bf16
         if (
             not sm_is_or_higher_than(torch.device(device_type), 8, 0)
@@ -224,6 +277,9 @@ class ReplicateTest(MultiProcessInductorTestCase):
             self.skipTest("bf16 requires sm >= 8.0")
 
         def setup(model, compiled_replicate_model, compiled_ddp_model) -> None:
+            # [FUNCTION DOC] HELPER: Registers the bf16 compress hook (no state) on each of
+            # the three models; for the compiled replicate model it uses the wrapped
+            # original module.
             model.register_comm_hook(None, ddp_default_hooks.bf16_compress_hook)
             compiled_m = compiled_replicate_model._orig_mod
             compiled_m.register_comm_hook(None, ddp_default_hooks.bf16_compress_hook)
@@ -237,7 +293,13 @@ class ReplicateTest(MultiProcessInductorTestCase):
     @skip_if_lt_x_gpu(2)
     @skip_if_rocm_ver_atleast_multiprocess([7, 14])
     def test_compile_fp16(self):
+        # [FUNCTION DOC] Runs the parity test with the fp16 compression hook registered on
+        # all three models, with Inductor disabled for compiled autograd (a TODO notes the
+        # cause is unknown).
         def setup(model, compiled_replicate_model, compiled_ddp_model) -> None:
+            # [FUNCTION DOC] HELPER: Registers the fp16 compress hook (no state) on each of
+            # the three models; for the compiled replicate model it uses the wrapped
+            # original module.
             model.register_comm_hook(None, ddp_default_hooks.fp16_compress_hook)
             compiled_m = compiled_replicate_model._orig_mod
             compiled_m.register_comm_hook(None, ddp_default_hooks.fp16_compress_hook)
@@ -253,9 +315,15 @@ class ReplicateTest(MultiProcessInductorTestCase):
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @skip_if_lt_x_gpu(2)
     def test_compile_backward_only(self):
+        # [FUNCTION DOC] Runs the parity test without compiling the forward pass, so only
+        # backward goes through compiled autograd.
         self._test_compile(no_sync=False, no_compile_forward=True, device=device_type)
 
     def test_ddp_optimizer_splits_graph(self):
+        # [FUNCTION DOC] Skips if world size is below 2. Initializes a gloo group from a
+        # file store, sets optimize_ddp to python_reducer, compiles a replicated Net, runs
+        # forward and a compiled-autograd backward, and asserts the Inductor ddp_buckets
+        # counter is positive. Destroys the group.
         if self.world_size < 2:
             self.skipTest("DDP bucketing requires world_size >= 2")
         dist.init_process_group(
@@ -280,6 +348,11 @@ class ReplicateTest(MultiProcessInductorTestCase):
         dist.destroy_process_group()
 
     def _test_bucketing(self, init_process_group=True, loop=1):
+        # [FUNCTION DOC] HELPER: Optionally initializes a gloo group, compiles a replicated
+        # Net, and runs forward loop times, running backward under compiled autograd for all
+        # but the last iteration. The last backward is run through the helper that captures
+        # the generated Triton/C++ code. Asserts the ddp_buckets counter equals 3 and
+        # returns the captured code string. The group is not destroyed here.
         if init_process_group:
             dist.init_process_group(
                 backend="gloo",
@@ -295,6 +368,7 @@ class ReplicateTest(MultiProcessInductorTestCase):
         )
 
         def bwd(loss):
+            # [FUNCTION DOC] HELPER: Runs backward on loss under compiled autograd.
             with compiled_autograd._enable(compiler_fn()):
                 loss.backward()
 
@@ -325,6 +399,10 @@ class ReplicateTest(MultiProcessInductorTestCase):
         pattern_matcher=False,
     )
     def test_bucketing_coalesced_op(self):
+        # [FUNCTION DOC] With the coalesced-op fusion pass, checks generated code twice
+        # (fresh run, then two iterations): three fused CPU kernels each followed by a
+        # coalesced all-reduce, then three wait ops. Skips below world size 2.
+        # The second block's comment says gradient is None though it uses a second iteration.
         if self.world_size < 2:
             self.skipTest("DDP bucketing requires world_size >= 2")
         # Gradient is None
@@ -369,6 +447,9 @@ class ReplicateTest(MultiProcessInductorTestCase):
         pattern_matcher=False,
     )
     def test_bucketing_concat_op(self):
+        # [FUNCTION DOC] With the concat-op fusion pass, checks generated code twice (fresh
+        # run, then two iterations): three groups of flatten, fused kernel and plain
+        # all-reduce, then three wait ops. Skips below world size 2.
         if self.world_size < 2:
             self.skipTest("DDP bucketing requires world_size >= 2")
         # Gradient is None
@@ -397,7 +478,11 @@ class ReplicateTest(MultiProcessInductorTestCase):
 
 
 class DDP_TP_Test(InductorTestCase):
+    # [CLASS DOC] Single-process test case that fakes a 4-rank world with the fake backend
+    # to test replicate over a data-parallel mesh combined with tensor parallelism.
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Sets rank 0, world size 4, selects device 0 of the current
+        # device type, and initializes a fake-backend process group with a fake store.
         super().setUp()
         self.rank = 0
         self.world_size = 4
@@ -412,6 +497,8 @@ class DDP_TP_Test(InductorTestCase):
         )
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Destroys the process group (does not call the parent
+        # tearDown).
         dist.destroy_process_group()
 
     @unittest.skip(
@@ -419,6 +506,11 @@ class DDP_TP_Test(InductorTestCase):
     )
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     def test_ddp_tp(self):
+        # [FUNCTION DOC] Currently skipped (SymInt hashing error). Builds a 2x2 dp/tp mesh,
+        # applies column/row parallel plans to two Net copies, replicates both on the dp
+        # mesh, compiles one, and expects compiled-autograd backward to raise an
+        # AssertionError about getting a DTensor instead of a ProxyTensor (known
+        # limitation; the eager reference comparison is commented out).
         ref_model = Net()
         compiled_replicate_model = deepcopy(ref_model)
         mesh_2d = init_device_mesh(

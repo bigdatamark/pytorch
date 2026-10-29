@@ -1,4 +1,8 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Multi-GPU tests that a torch.nn.Embedding (and the functional embedding) with
+# a sharded weight matches an unsharded one, for column-wise and row-wise chunk sharding,
+# with optional padding_idx and max_norm. Import-time: computes device_type and backend;
+# if the dev-asan flag is set, prints to stderr and exits the process with status 0.
 
 import sys
 
@@ -36,6 +40,8 @@ if TEST_WITH_DEV_DBG_ASAN:
 
 
 class TestShardedEmbedding(ShardedTensorTestBase):
+    # [CLASS DOC] Multi-process test case (TEST_GPU_NUM ranks) comparing sharded and local
+    # embeddings; all state lives in the helper's locals.
     def _run_sharded_embedding(
         self,
         spec,
@@ -46,6 +52,13 @@ class TestShardedEmbedding(ShardedTensorTestBase):
         norm_type=2.0,
         padding_idx=None,
     ):
+        # [FUNCTION DOC] HELPER: Builds a local embedding on this rank's device and a second
+        # with the same weights, shards the second's weight with spec, and feeds random
+        # indices of shape input_size (different per rank, seeded by rank). Asserts equal
+        # outputs. With max_norm it first gathers all ranks' inputs and applies the local
+        # embedding to their unique values so renorm matches, then asserts this rank's
+        # weight shard equals the matching slice of the local weight. Finally repeats the
+        # comparison through the functional embedding. Uses collectives; seeds the RNG.
         # Use same seed.
         torch.manual_seed(0)
         local_embedding = torch.nn.Embedding(
@@ -124,6 +137,9 @@ class TestShardedEmbedding(ShardedTensorTestBase):
     @skip_if_lt_x_gpu(TEST_GPU_NUM)
     @requires_accelerator_dist_backend(["nccl", "xccl"])
     def test_sharded_embedding_colwise(self):
+        # [FUNCTION DOC] For each chunk sharding spec along dim 1 (embedding dimension), runs
+        # the helper over several input ranks and sizes, with padding_idx and with max_norm
+        # (including norm_type 1.0) variants.
         for spec in generate_chunk_sharding_specs_for_test(1):
             self._run_sharded_embedding(spec, [5, 4], 17, 12)
             self._run_sharded_embedding(spec, [6, 7, 6], 21, 11)
@@ -160,6 +176,9 @@ class TestShardedEmbedding(ShardedTensorTestBase):
     @skip_if_lt_x_gpu(TEST_GPU_NUM)
     @requires_accelerator_dist_backend(["nccl", "xccl"])
     def test_sharded_embedding_rowwise(self):
+        # [FUNCTION DOC] For each chunk sharding spec along dim 0 (vocabulary rows), runs the
+        # helper with evenly and unevenly divisible embedding counts, plus padding_idx and
+        # max_norm variants.
         for spec in generate_chunk_sharding_specs_for_test(0):
             # Test even split.
             self._run_sharded_embedding(spec, [5, 12], 16, 22)

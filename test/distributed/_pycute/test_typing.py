@@ -1,6 +1,9 @@
 # flake8: noqa
 # ruff: noqa: PGH004
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Unit tests for the pycute Integer typing helper (an abstract type usable with
+# isinstance and issubclass). One TestCase with a helper and one test. Star-imports the
+# pycute package; creates a module logger.
 #################################################################################################
 #
 # Copyright (c) 2023 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
@@ -47,7 +50,10 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class TestTyping(TestCase):
+    # [CLASS DOC] Test case for the Integer type check; stateless.
     def helper_test_typing(self, _cls, _obj, cls, expected: bool):
+        # [FUNCTION DOC] HELPER: Asserts that the subclass check of _cls and the instance
+        # check of _obj against cls both equal the expected boolean. Logs both checks.
         _LOGGER.debug(f"issubclass({_cls}, {cls})")
         _LOGGER.debug(f"isinstance({_obj}, {cls})")
 
@@ -55,6 +61,8 @@ class TestTyping(TestCase):
         self.assertEqual(expected, isinstance(_obj, cls))
 
     def test_typing(self):
+        # [FUNCTION DOC] Checks Integer accepts int but rejects float, str and bool.
+        # Bool is rejected even though it is an int subclass in Python.
         self.helper_test_typing(int, 1, Integer, True)
         self.helper_test_typing(float, 1.0, Integer, False)
         self.helper_test_typing(str, "hi", Integer, False)

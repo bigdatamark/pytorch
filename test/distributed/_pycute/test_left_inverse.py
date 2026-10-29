@@ -1,6 +1,8 @@
 # ruff: noqa: PGH004, G004, F403
 # flake8: noqa
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Unit tests for the pycute left_inverse function. One TestCase with a round-trip
+# helper and one test over several layouts. Star-imports the pycute package; creates a logger.
 #################################################################################################
 #
 # Copyright (c) 2023 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
@@ -47,7 +49,11 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class TestLeftInverse(TestCase):
+    # [CLASS DOC] Test case for left_inverse; stateless, one helper and one test.
     def helper_test_left_inverse(self, layout):
+        # [FUNCTION DOC] HELPER: Computes the left inverse of the layout and asserts that
+        # applying the inverse to the layout's output for every index in the layout's size
+        # recovers that index. Logs the pair at debug level.
         inv_layout = left_inverse(layout)
 
         _LOGGER.debug(f"{layout}  =>  {inv_layout}")
@@ -56,6 +62,8 @@ class TestLeftInverse(TestCase):
             self.assertEqual(inv_layout(layout(i)), i)
 
     def test_left_inverse(self):
+        # [FUNCTION DOC] Runs the round-trip check on size-1, flat strided, and multi-mode
+        # layouts with column-major, row-major and gapped strides.
         test = Layout(1, 0)
         self.helper_test_left_inverse(test)
 

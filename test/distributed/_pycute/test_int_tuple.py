@@ -1,6 +1,9 @@
 # ruff: noqa: PGH004, G004, F403
 # flake8: noqa
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Unit tests for the pycute int-tuple utilities: product, inner_product,
+# shape_div, suffix_product, crd2idx and idx2crd, including nested tuples, None coordinates
+# and round trips between coordinates and indices. Star-imports the pycute package.
 #################################################################################################
 #
 # Copyright (c) 2023 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
@@ -42,7 +45,10 @@ from torch.testing._internal.common_utils import run_tests, TestCase
 
 
 class TestIntTuple(TestCase):
+    # [CLASS DOC] Test case with one test method per int-tuple utility; stateless.
     def test_product(self):
+        # [FUNCTION DOC] Checks product of an int, a flat tuple and a nested tuple (after
+        # applying product twice) gives the multiplied total.
         self.assertEqual(product(2), 2)
 
         self.assertEqual(product((3, 2)), 6)
@@ -50,6 +56,8 @@ class TestIntTuple(TestCase):
         self.assertEqual(product(product(((2, 3), 4))), 24)
 
     def test_inner_product(self):
+        # [FUNCTION DOC] Checks inner_product (sum of elementwise products) for ints,
+        # flat tuples and congruent nested tuples.
         self.assertEqual(inner_product(2, 3), 6)
 
         self.assertEqual(inner_product((1, 2), (3, 2)), 7)
@@ -57,6 +65,8 @@ class TestIntTuple(TestCase):
         self.assertEqual(inner_product(((2, 3), 4), ((2, 1), 2)), 15)
 
     def test_shape_div(self):
+        # [FUNCTION DOC] Checks shape_div divides a (possibly nested) shape by an integer
+        # left to right, consuming the divisor across modes and clamping at 1.
         self.assertEqual(shape_div((3, 4), 6), (1, 2))
 
         self.assertEqual(shape_div((3, 4), 12), (1, 1))
@@ -68,6 +78,8 @@ class TestIntTuple(TestCase):
         self.assertEqual(shape_div((6, (3, 4)), 36), (1, (1, 2)))
 
     def test_suffix_product(self):
+        # [FUNCTION DOC] Checks suffix_product yields compact row-major strides, preserving
+        # the nesting of the input shape (an int gives 1).
         self.assertEqual(suffix_product(2), 1)
 
         self.assertEqual(suffix_product((3, 2)), (2, 1))
@@ -82,6 +94,8 @@ class TestIntTuple(TestCase):
         )
 
     def test_crd2idx_basic(self):
+        # [FUNCTION DOC] Checks crd2idx for integer coordinate, shape and stride: the index
+        # is coordinate times stride, with stride defaulting to 1.
         # Test basic int/int case
         self.assertEqual(crd2idx(2, 5, 1), 2)
         self.assertEqual(crd2idx(0, 5, 1), 0)
@@ -92,6 +106,8 @@ class TestIntTuple(TestCase):
         self.assertEqual(crd2idx(1, 5, 3), 3)
 
     def test_crd2idx_tuple(self):
+        # [FUNCTION DOC] Checks crd2idx for tuple coordinates in 2D and 3D, with default
+        # row-major strides derived from the shape and with explicit strides.
         # Test tuple coordinates with default stride
         self.assertEqual(crd2idx((1, 2), (3, 4)), 6)  # 1*4 + 2*1 = 6
         self.assertEqual(crd2idx((0, 0), (3, 4)), 0)
@@ -104,11 +120,16 @@ class TestIntTuple(TestCase):
         self.assertEqual(crd2idx((1, 0, 2), (2, 3, 4)), 14)  # 1*12 + 0*4 + 2*1 = 14
 
     def test_crd2idx_none(self):
+        # [FUNCTION DOC] Checks a None coordinate is treated as zero for int and tuple shapes.
         # Test None coordinate (should default to 0)
         self.assertEqual(crd2idx(None, 5), 0)
         self.assertEqual(crd2idx(None, (3, 4)), 0)
 
     def test_crd2idx_int_with_tuple_shape(self):
+        # [FUNCTION DOC] Checks that an integer coordinate with a tuple shape is first
+        # expanded to a multi-dimensional coordinate (last mode fastest) and then dotted
+        # with the strides. Covers 2D and 3D shapes, nested shape and strides, and the empty
+        # shape (result 0).
         # Test single integer coordinate with multi-dimensional shape and stride
         # When crd is int and shape is tuple, it converts the int to multi-dim coordinate first
         self.assertEqual(crd2idx(0, (2, 2), (2, 1)), 0)  # 0 -> (0,0) -> 0*2 + 0*1 = 0
@@ -168,6 +189,8 @@ class TestIntTuple(TestCase):
         self.assertEqual(crd2idx(0, (), ()), 0)  # 0 -> () -> sum([]) = 0
 
     def test_idx2crd_basic(self):
+        # [FUNCTION DOC] Checks idx2crd for integer shape: the coordinate is the index
+        # divided by the stride, modulo the shape.
         # Test basic int/int case
         self.assertEqual(idx2crd(2, 5, 1), 2)
         self.assertEqual(idx2crd(0, 5, 1), 0)
@@ -178,6 +201,8 @@ class TestIntTuple(TestCase):
         self.assertEqual(idx2crd(3, 5, 3), 1)  # (3 // 3) % 5 = 1
 
     def test_idx2crd_tuple(self):
+        # [FUNCTION DOC] Checks idx2crd for 2D and 3D tuple shapes with default strides,
+        # returning a coordinate tuple.
         # Test tuple shape with default stride
         self.assertEqual(idx2crd(6, (3, 4)), (1, 2))  # 6 -> (1, 2)
         self.assertEqual(idx2crd(0, (3, 4)), (0, 0))
@@ -187,6 +212,9 @@ class TestIntTuple(TestCase):
         self.assertEqual(idx2crd(14, (2, 3, 4)), (1, 0, 2))
 
     def test_crd2idx_idx2crd_roundtrip(self):
+        # [FUNCTION DOC] For several shapes, converts every index in range to a coordinate
+        # and back, asserting the original index is recovered. The local variable named size
+        # shadows the imported size function inside this test only.
         # Test that crd2idx and idx2crd are inverse operations
         shapes = [
             5,
@@ -207,6 +235,8 @@ class TestIntTuple(TestCase):
                 )
 
     def test_idx2crd_crd2idx_roundtrip(self):
+        # [FUNCTION DOC] For listed (coordinate, shape) pairs, converts the coordinate to an
+        # index and back, asserting the original coordinate is recovered.
         # Test roundtrip starting from coordinates
         test_cases = [
             (0, 5),

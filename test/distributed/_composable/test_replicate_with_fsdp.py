@@ -1,4 +1,8 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] 4-GPU tests mixing the replicate API (replicate_with_fsdp) with fully_shard:
+# per-layer mixing in a Transformer, managed-module counting, passing a device mesh, and
+# training parity against plain models. Defines a tiny Net model and one
+# MultiProcContinuousTest class. No import-time side effects beyond imports.
 
 import copy
 import functools
@@ -33,29 +37,41 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 
 
 class Net(nn.Module):
+    # [CLASS DOC] HELPER: Three stacked 2x2 linear layers (fc1, fc2, fc3) with no
+    # activations, used as a minimal model for replicate tests.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates the three 2-in 2-out linear layers.
         super().__init__()
         self.fc1 = nn.Linear(2, 2)
         self.fc2 = nn.Linear(2, 2)
         self.fc3 = nn.Linear(2, 2)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies fc1, fc2, fc3 in order and returns the result.
         return self.fc3(self.fc2(self.fc1(x)))
 
 
 class ReplicateTest(MultiProcContinuousTest):
+    # [CLASS DOC] Continuous multi-process test case with 4 ranks on the nccl backend and
+    # cuda devices; the process group persists across the tests of the class.
     world_size = 4
 
     @classmethod
     def backend_str(cls) -> str:
+        # [FUNCTION DOC] HELPER: Returns the backend name nccl.
         return "nccl"
 
     @classmethod
     def device_type(cls) -> str:
+        # [FUNCTION DOC] HELPER: Returns the device type cuda.
         return "cuda"
 
     @classmethod
     def _init_pg(cls, rank, world_size, rdvz_file):
+        # [FUNCTION DOC] HELPER: Per-process setup. If an accelerator is available and fewer
+        # devices exist than world_size, exits the process with the multi-GPU skip exit
+        # code; otherwise selects device index rank, then runs the parent initialization of
+        # the process group using the rendezvous file.
         if torch.accelerator.is_available():
             if torch.accelerator.device_count() < world_size:
                 sys.exit(TEST_SKIPS[f"multi-gpu-{world_size}"].exit_code)
@@ -63,6 +79,8 @@ class ReplicateTest(MultiProcContinuousTest):
         super()._init_pg(rank, world_size, rdvz_file)
 
     def init_replicate_tp_mesh(self) -> DeviceMesh:
+        # [FUNCTION DOC] HELPER: Builds a 3D cuda device mesh with dimensions replicate (2),
+        # shard (1) and tp (world size divided by 2), named accordingly. Collective call.
         # Prefer to test with >=4 GPUs, but for 2 GPUs, use 2-way TP
         replicate_size = 2
         return init_device_mesh(
@@ -73,6 +91,8 @@ class ReplicateTest(MultiProcContinuousTest):
 
     @skip_if_lt_x_gpu(4)
     def test_replicate_transformer(self):
+        # [FUNCTION DOC] Runs the transformer check as subtests over the top-level
+        # strategies replicate and fully_shard.
         """
         This tests that replicate works on a transformer model with fully_shard and replicate layers
         """
@@ -85,12 +105,19 @@ class ReplicateTest(MultiProcContinuousTest):
         )
 
     def _composable_api_module_check(self, module, sharding_strategy):
+        # [FUNCTION DOC] HELPER: Asserts the module's composable-API registry contains the
+        # name replicate when the strategy is replicate, else fully_shard.
         if sharding_strategy == "replicate":
             self.assertTrue("replicate" in _get_registry(module))
         else:
             self.assertTrue("fully_shard" in _get_registry(module))
 
     def _test_replicate_transformer(self, sharding_strategy):
+        # [FUNCTION DOC] HELPER: Copies a default Transformer, applies replicate to
+        # even-index layers and fully_shard to odd-index ones, then wraps the whole model
+        # with replicate or fully_shard per sharding_strategy. Asserts the root registry
+        # entry, that even layers are registered as replicate with Replicate placement on
+        # all parameters, and odd layers as fully_shard with Shard on dim 0.
         model_args = ModelArgs()
 
         model = Transformer(model_args)
@@ -122,6 +149,10 @@ class ReplicateTest(MultiProcContinuousTest):
 
     @skip_if_lt_x_gpu(4)
     def test_replicate_transformer_managed_modules(self):
+        # [FUNCTION DOC] Builds a 3-layer Transformer and asserts the managed-module count
+        # for replicate is 49 before wrapping. Applies replicate to layer 0 and fully_shard
+        # to layer 1, replicates the root, and asserts the root now manages 21 modules (the
+        # two wrapped layers' submodules are excluded).
         """
         This tests that replicate managed modules works properly. In this test we use a Transformer Module with 3 layers,
         which means there are 49 submodules. We apply replicate on the first layer and fully shard on the second layer,
@@ -191,6 +222,9 @@ class ReplicateTest(MultiProcContinuousTest):
 
     @skip_if_lt_x_gpu(4)
     def test_replicate_tp_device_mesh(self):
+        # [FUNCTION DOC] Applies replicate to each linear layer of Net with the replicate
+        # submesh of the 3D mesh, and asserts every parameter has a device mesh of shape (2,)
+        # and Replicate placement.
         """
         This tests that a user can pass in a device mesh to replicate a module
         """
@@ -217,6 +251,9 @@ class ReplicateTest(MultiProcContinuousTest):
 
     @skip_if_lt_x_gpu(4)
     def test_train_replicate_fsdp(self):
+        # [FUNCTION DOC] Trains a plain Net (gradients manually summed with all-reduce) and
+        # a replicated copy (per-layer and root replicate) with Adam for 10 steps on rank
+        # dependent input, asserting equal losses and sharded parity of parameters each step.
         """
         Tests that replicate_model has the same behavior as original model when training
         """
@@ -263,6 +300,8 @@ class ReplicateTest(MultiProcContinuousTest):
 
     @skip_if_lt_x_gpu(4)
     def test_train_parity_2d_mlp(self):
+        # [FUNCTION DOC] Builds the 3D mesh and runs the 2D MLP parity check as subtests over
+        # activation checkpointing on/off and MLP dimensions 3, 16 and 17.
         """
         Verifies when a device mesh is passed in, the model has the same behavior as the original model when training
         """
@@ -282,6 +321,11 @@ class ReplicateTest(MultiProcContinuousTest):
         use_activation_checkpointing: bool,
         mlp_dim: int,
     ):
+        # [FUNCTION DOC] HELPER: Reference model is an MLPStack replicated on the replicate
+        # submesh; the test model is the same stack parallelized with tensor parallel and
+        # replicate/shard meshes (optionally activation checkpointed). Both train with Adam
+        # (foreach off) for 10 iterations on seed-dependent inputs, alternating
+        # set-to-none zeroing of grads, and the losses must be equal each iteration.
         replicate_shard_mesh, tp_mesh = (
             global_mesh["replicate", "shard"],
             global_mesh["tp"],

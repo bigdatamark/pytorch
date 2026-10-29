@@ -1,6 +1,9 @@
 # ruff: noqa: PGH004, G004, F403
 # flake8: noqa
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Unit tests for the pycute composition function (functional composition of two
+# layouts). One TestCase with a post-condition helper and one large table-driven test.
+# Star-imports the pycute package; creates a module logger.
 #################################################################################################
 #
 # Copyright (c) 2023 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
@@ -47,7 +50,13 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class TestComposition(TestCase):
+    # [CLASS DOC] Test case for composition; stateless, one helper and one test.
     def helper_test_composition(self, layoutA, layoutB):
+        # [FUNCTION DOC] HELPER: Composes layoutA with layoutB and asserts that for every
+        # index below the size of the result, the result maps it to the same offset as
+        # applying layoutB first and then layoutA. Logs the composition at debug level.
+        # Errors from composition itself (for example a failed divisibility assertion)
+        # propagate to the caller.
         layoutR = composition(layoutA, layoutB)
 
         _LOGGER.debug(f"{layoutA} o {layoutB}  =>  {layoutR}")
@@ -59,6 +68,10 @@ class TestComposition(TestCase):
             self.assertEqual(layoutR(i), layoutA(layoutB(i)))
 
     def test_composition(self):
+        # [FUNCTION DOC] Runs the helper over many layout pairs: trivial size-1 layouts,
+        # strided and zero-stride flat layouts, nested shapes, and pre-coalesced operands.
+        # Also expects an AssertionError when the stride divisibility condition fails, and
+        # checks mid-layout truncation cases succeed.
         layoutA = Layout(1, 0)
         layoutB = Layout(1, 0)
         self.helper_test_composition(layoutA, layoutB)
