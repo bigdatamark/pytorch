@@ -1,3 +1,8 @@
+# [MODULE DOC] Helpers to fetch attributes of known leaf nn.Module types for
+# lowering. Contains module_fetch_book (mapping from module class to a version,
+# a list of attribute names, and a name-matching function), default_matching,
+# extract_attrs_for_lowering and lift_lowering_attrs_to_nodes. No import-time
+# side effects besides building the book.
 from collections.abc import Callable
 from typing import Any
 
@@ -18,6 +23,8 @@ __all__ = [
 @compatibility(is_backward_compatible=False)
 def default_matching(name: str, target_version: int) -> str:
     """Default matching method"""
+    # [FUNCTION DOC] Identity name matcher: returns the attribute name unchanged;
+    # the target version is ignored.
     return name
 
 
@@ -60,6 +67,12 @@ def extract_attrs_for_lowering(mod: nn.Module) -> dict[str, Any]:
     """If `mod` is in `module_fetch_book`, fetch the mod's attributes that in the `module_fetch_book`
     after checking module's version is compatible with the `module_fetch_book`.
     """
+    # [FUNCTION DOC] Build a mapping of attribute name to value for a supported
+    # module. Always includes the key name holding the module's qualified type
+    # name. Looks up the module's exact type in the fetch book, then reads each
+    # listed attribute (after mapping its name for the module's version).
+    # Raises RuntimeError if the book version is older than the module's version
+    # or if the module type is not in the book. No mutation.
     attrs_for_lowering: dict[str, Any] = {}
     attrs_for_lowering["name"] = torch.typename(mod)
 
@@ -85,6 +98,10 @@ def extract_attrs_for_lowering(mod: nn.Module) -> dict[str, Any]:
 @compatibility(is_backward_compatible=False)
 def lift_lowering_attrs_to_nodes(fx_module: GraphModule) -> None:
     """Recursively traverse all `fx_module` nodes and fetch the module's attributes if the node is a leaf module."""
+    # [FUNCTION DOC] Walk the graph's nodes; for each call_module node, recurse into
+    # nested GraphModules, otherwise set an attribute on the node holding the
+    # extracted lowering attributes of the target submodule. Mutates node objects.
+    # Raises RuntimeError for unsupported leaf module types.
     submodules = dict(fx_module.named_modules())
 
     for node in fx_module.graph.nodes:

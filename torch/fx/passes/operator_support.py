@@ -1,3 +1,8 @@
+# [MODULE DOC] Operator support predicates used to decide whether a backend can
+# handle an FX node (for example when partitioning a graph). Contains the
+# abstract OperatorSupportBase, the dtype-table based OperatorSupport, combinators
+# (create_op_support, chain, any_chain), and OpSupports with common atomic
+# predicates. No import-time side effects.
 import abc
 import typing as t
 
@@ -36,11 +41,15 @@ SupportDict = t.Mapping[TargetTypeName, SupportedArgumentDTypes]
 @compatibility(is_backward_compatible=False)
 class OperatorSupportBase(abc.ABC):
     """Interface for determining if a fx.Node is supported by a backend"""
+    # [CLASS DOC] Abstract interface with a single method telling whether a node
+    # is supported by some backend. Stateless; subclasses implement the method.
 
     @abc.abstractmethod
     def is_node_supported(
         self, submodules: t.Mapping[str, torch.nn.Module], node: torch.fx.Node
     ) -> bool:
+        # [FUNCTION DOC] Abstract: given the submodule mapping and a node, return
+        # whether the node is supported. Base version raises NotImplementedError.
         raise NotImplementedError
 
 
@@ -63,10 +72,15 @@ class OperatorSupport(OperatorSupportBase):
     the first input in args. And for inputs in kwargs, if not listed, will not
     be checked.
     """
+    # [CLASS DOC] Table-driven support check. State: _support_dict mapping the
+    # node target type name (from get_node_target) to either None (any dtype
+    # accepted) or a pair of positional dtype lists and keyword dtype lists.
+    # A target missing from the table is unsupported.
 
     _support_dict: SupportDict
 
     def __init__(self, support_dict: SupportDict | None = None) -> None:
+        # [FUNCTION DOC] Store the support table (empty mapping if not given).
         self._support_dict = support_dict or {}
 
     def is_node_supported(
@@ -82,6 +96,14 @@ class OperatorSupport(OperatorSupportBase):
         Returns:
             `is_supported`: whether the arg `node` is supported.
         """
+        # [FUNCTION DOC] Decide support for a node. Nodes whose op is not a callable
+        # kind (placeholder, output, get_attr) are always supported. Otherwise the
+        # target name is looked up in the table: missing means unsupported, None
+        # means supported. Then each positional tensor-node argument's dtype must
+        # be in the allowed list for its position (None entries and non-node args
+        # are skipped, extra table entries beyond actual args are ignored), and
+        # each listed keyword argument present as a node must have an allowed dtype.
+        # Returns True only if all checks pass. Reads node metadata; no mutation.
         if node.op not in CALLABLE_NODE_OPS:
             return True
 
@@ -145,11 +167,15 @@ def create_op_support(is_node_supported: IsNodeSupported) -> OperatorSupportBase
     `IsNodeSupported` has the same call signature as
     `OperatorSupportBase.is_node_supported`
     """
+    # [FUNCTION DOC] Adapt a plain predicate function with the support signature
+    # into an OperatorSupportBase object that delegates to it. Returns the object.
 
     class FunctionalOperatorSupport(OperatorSupportBase):
+        # [CLASS DOC] HELPER: Support object delegating to the captured predicate.
         def is_node_supported(
             self, submodules: t.Mapping[str, torch.nn.Module], node: torch.fx.Node
         ) -> bool:
+            # [FUNCTION DOC] HELPER: Call the captured predicate and return its result.
             return is_node_supported(submodules, node)
 
     return FunctionalOperatorSupport()
@@ -161,8 +187,12 @@ def chain(*op_support: OperatorSupportBase) -> OperatorSupportBase:
     instance by evaluating each input `OperatorSupportBase` instance, and returns False if
     any of it reports False.
     """
+    # [FUNCTION DOC] Build a support object that is true only if every given
+    # support object accepts the node (logical AND, short-circuits; true when
+    # given none).
 
     def _chain(submods: t.Mapping[str, torch.nn.Module], node: torch.fx.Node) -> bool:
+        # [FUNCTION DOC] HELPER: True if all wrapped supports accept the node.
         return all(x.is_node_supported(submods, node) for x in op_support)
 
     return create_op_support(_chain)
@@ -174,10 +204,14 @@ def any_chain(*op_support: OperatorSupportBase) -> OperatorSupportBase:
     instance by evaluating each input `OperatorSupportBase` instance, and returns True if
     any of it reports True.
     """
+    # [FUNCTION DOC] Build a support object that is true if at least one given
+    # support object accepts the node (logical OR, short-circuits; false when
+    # given none).
 
     def _any_chain(
         submods: t.Mapping[str, torch.nn.Module], node: torch.fx.Node
     ) -> bool:
+        # [FUNCTION DOC] HELPER: True if any wrapped support accepts the node.
         return any(x.is_node_supported(submods, node) for x in op_support)
 
     return create_op_support(_any_chain)
@@ -188,15 +222,21 @@ class OpSupports:
     """A set of atomic `OperatorSupportBase` instances that can be combined together
     to form more complex operator support logic.
     """
+    # [CLASS DOC] Namespace of class-method factories for atomic support objects
+    # (decline_if_input_dtype, decline_if_node_in_names). Holds no state.
 
     @classmethod
     def decline_if_input_dtype(cls, dtype: torch.dtype) -> OperatorSupportBase:
         """Report a node as non-supported, if any of its arguments is of dtype"""
+        # [FUNCTION DOC] Build a support object rejecting any node that has an
+        # input node of the given dtype. Returns the support object.
 
         def _decline_if_input_dtype(
             submodules: t.Mapping[str, torch.nn.Module],
             node: torch.fx.Node,
         ) -> bool:
+            # [FUNCTION DOC] HELPER: False if any input node has the dtype, else
+            # True. Raises if an input node lacks dtype metadata.
             for arg in node.all_input_nodes:
                 arg_dtype = _get_arg_dtype(arg)
                 if arg_dtype == dtype:
@@ -210,17 +250,24 @@ class OpSupports:
         """
         If a node has a name that is in the disallow set, reported it as non-supported.
         """
+        # [FUNCTION DOC] Build a support object rejecting nodes whose name is in the
+        # given set of names. Returns the support object.
 
         def _decline_if_node_in_names(
             submodules: t.Mapping[str, torch.nn.Module],
             node: torch.fx.Node,
         ) -> bool:
+            # [FUNCTION DOC] HELPER: True if the node name is not in the disallow set.
             return node.name not in disallow_set
 
         return create_op_support(_decline_if_node_in_names)
 
 
 def _get_arg_dtype(arg: torch.fx.Node) -> torch.dtype:
+    # [FUNCTION DOC] HELPER: Return the dtype of a node: from the tensor_meta entry
+    # of its metadata when it is a TensorMetadata, else the type entry of the
+    # metadata. Raises AssertionError if arg is not a Node; raises KeyError if
+    # neither metadata entry exists.
     if not isinstance(arg, torch.fx.Node):
         raise AssertionError(f"Expected torch.fx.Node, got {type(arg)}")
     tensor_meta = arg.meta.get("tensor_meta")  # type: ignore[union-attr]

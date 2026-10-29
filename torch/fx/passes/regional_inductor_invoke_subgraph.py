@@ -1,3 +1,9 @@
+# [MODULE DOC] Pass that compiles invoke_subgraph higher-order-op regions with
+# user-specified Inductor compilers. Nodes carry nested_region_config in their
+# custom metadata (forward or backward compiler). Each referenced subgraph is
+# compiled to an ahead-of-time artifact and the invoke_subgraph call nodes are
+# replaced with direct calls to it. Public entry: regional_inductor_invoke_subgraph.
+# Import-time side effects: creates a module logger.
 import copy
 import logging
 from collections import defaultdict
@@ -24,6 +30,15 @@ def _compile_submod(
     Compiles subgraph submodule in gm. subgraph is used by subgraph_users.
     subgraph_users must all be  torch.ops.higher_order.invoke_subgraph HOP.
     """
+    # [FUNCTION DOC] HELPER: Compile one subgraph submodule of gm and rewrite its
+    # users. The first user supplies the compile config and picks the forward or
+    # backward compiler (by partitioner tag) and the fake example inputs (the
+    # inputs after the subgraph reference; raises RuntimeError if one lacks a fake
+    # value). The submodule is deep-copied and compiled inside a fresh tracing
+    # context, fresh cache manager, bundled autograd cache config and remat-disabled
+    # scope; the result must be an AOTCompiledArtifact (AssertionError otherwise).
+    # Each user node is replaced with a call to the compiled artifact on the
+    # remaining args, copying metadata, and gm is recompiled. Mutates and returns gm.
 
     submod = getattr(gm, subgraph)
 
@@ -58,6 +73,9 @@ def _compile_submod(
     )
 
     def get_compiled_fn() -> AOTCompiledArtifact:
+        # [FUNCTION DOC] HELPER: Run the selected compiler on a deep copy of the
+        # submodule under a new tracing context built from the current fake mode.
+        # Raises AssertionError if the current context has no fake mode.
         context = torch._guards.TracingContext.get()
         if context.fake_mode is None:
             raise AssertionError("context.fake_mode is None")
@@ -100,6 +118,10 @@ def _compile_submod(
 
 
 def _needs_inductor_compile(node: torch.fx.Node) -> bool:
+    # [FUNCTION DOC] HELPER: True if the node is not a placeholder or output, has
+    # a nested_region_config in custom metadata, and that config has a forward
+    # compiler (when the partitioner tag is not backward) or a backward compiler
+    # (when the tag is backward). Pure read of metadata.
     # TODO: maybe we could change to check
     # node.meta.get("partitioner_tag") != "is_forward"
     # if the tag is relibable
@@ -126,6 +148,10 @@ def _needs_inductor_compile(node: torch.fx.Node) -> bool:
 def _compile_invoke_subgraph_nodes_with_inductor(
     gm: torch.fx.GraphModule,
 ) -> torch.fx.GraphModule:
+    # [FUNCTION DOC] HELPER: Find invoke_subgraph call nodes needing compile, group
+    # them by the name of the referenced get_attr subgraph (AssertionError if the
+    # first arg is not a get_attr of a string name), and compile each distinct
+    # subgraph once for all its users. Returns the updated graph module.
     map_subgraph_to_nodes = defaultdict(list)
     subgraphs: set[str] = set()
 
@@ -151,6 +177,10 @@ def _compile_invoke_subgraph_nodes_with_inductor(
 def _recursive_compile_invoke_subgraph_nodes(
     gm: torch.fx.GraphModule,
 ) -> torch.fx.GraphModule:
+    # [FUNCTION DOC] HELPER: Depth-first handling of nested graph modules: first
+    # recurse into get_attr submodules that are graph modules (skipping get_attr
+    # nodes that are themselves marked for compile, to avoid nested regional
+    # compiles), then compile this module's own invoke_subgraph nodes. Returns gm.
     for node in gm.graph.find_nodes(op="get_attr"):
         if _needs_inductor_compile(node):
             # If the get_attr itself is marked for compile, the outer graph will
@@ -172,6 +202,11 @@ def regional_inductor_invoke_subgraph(
     Compile invoke_subgraph nodes if they have custom compiler specified
     in node.meta["nested_region_config"].bw_compiler or fw_compiler
     """
+    # [FUNCTION DOC] Pass entry point: compile every invoke_subgraph node that has a
+    # forward or backward compiler configured, recursively through nested graph
+    # modules, with node metadata preservation disabled while transforming. The
+    # example args are unused. Returns the result of wrapping the compiled graph
+    # module with the debugging boxed no-op backend (empty example inputs).
     # fuser utils create new nodes using create_proxy which retains the seq_nr
     # metadata and cause issues
     with torch.fx.traceback.preserve_node_meta(enable=False):

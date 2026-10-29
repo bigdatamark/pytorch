@@ -1,3 +1,10 @@
+# [MODULE DOC] Regional Inductor pass. Finds FX nodes annotated in their custom
+# metadata with a compile_with_inductor entry (optionally naming an inductor
+# region and inductor config overrides), groups them into partitions that are
+# fused into submodules (prefix __marked_inductor_submod), compiles each such
+# submodule ahead of time with standalone Inductor, and swaps the submodule call
+# for a call to the compiled artifact. Public entry: regional_inductor.
+# Import-time side effects: creates a module logger.
 import contextlib
 import functools
 import logging
@@ -21,8 +28,11 @@ __all__ = ["regional_inductor"]
 # with Fx graph node op call_function which expects a function. So this is just
 # a wrapper function to make Fx graph codegen happy.
 def _dummy_wrapper(fn: Callable[_P, _R]) -> Callable[_P, _R]:
+    # [FUNCTION DOC] HELPER: Wrap a callable object in a plain function (keeping its
+    # metadata) so graph call_function nodes accept it. Returns the wrapper.
     @functools.wraps(fn)
     def inner(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        # [FUNCTION DOC] HELPER: Forward all arguments to the wrapped callable.
         return fn(*args, **kwargs)
 
     return inner
@@ -30,6 +40,9 @@ def _dummy_wrapper(fn: Callable[_P, _R]) -> Callable[_P, _R]:
 
 @contextlib.contextmanager
 def _disable_remat_for_regional_subcompile() -> Iterator[None]:
+    # [FUNCTION DOC] HELPER: Context manager that temporarily turns off the
+    # functorch tag-based remat config option for the duration of a nested
+    # subcompile, restoring it afterwards. Yields nothing.
     # In torch.compile, regional_inductor subcompiles run after the enclosing
     # non-strict full graph has already been partitioned, so any graph-SAC
     # remat pass has already run before we reach this nested compile.
@@ -40,6 +53,14 @@ def _disable_remat_for_regional_subcompile() -> Iterator[None]:
 
 
 def _compile_submod(gm: torch.fx.GraphModule, prefix: str) -> torch.fx.GraphModule:
+    # [FUNCTION DOC] HELPER: For each call_module node whose target starts with the
+    # prefix, gather fake example values from its input nodes (RuntimeError if an
+    # input has none), read inductor config overrides from the first annotated node
+    # in the submodule, and validate keys against the inductor config (ValueError
+    # for an unknown key). Compile the submodule ahead of time under patched config
+    # with remat disabled (AssertionError if the result is not an AOT artifact),
+    # insert a call to the artifact after the node, copy node metadata, replace
+    # uses, erase the node and delete the submodule. Recompiles and returns gm.
     from torch._inductor.standalone_compile import AOTCompiledArtifact
 
     for node in gm.graph.nodes:
@@ -121,6 +142,8 @@ def _compile_submod(gm: torch.fx.GraphModule, prefix: str) -> torch.fx.GraphModu
 
 
 def _needs_inductor_compile(node: torch.fx.Node) -> bool:
+    # [FUNCTION DOC] HELPER: True if the node is not a placeholder or output and its
+    # custom metadata contains a compile_with_inductor entry.
     return bool(
         node.op not in ("placeholder", "output")
         and hasattr(node, "meta")
@@ -133,9 +156,19 @@ class _RegionScooper:
     """
     Scoops out the inductor marked regions. It does NOT compile them.
     """
+    # [CLASS DOC] HELPER: Stateless pass object that fuses annotated nodes into
+    # submodules. Static methods do the work; calling an instance runs the
+    # recursive version with node metadata preservation disabled.
 
     @staticmethod
     def scoop_regions(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
+        # [FUNCTION DOC] HELPER: Group annotated nodes by region id (the optional
+        # inductor_region value; all unnamed ones share one default region). If none
+        # are found, log and return gm unchanged. Otherwise run the capability-based
+        # partitioner separately per region (single-node partitions allowed) so
+        # partitions never span regions, then fuse all partitions into submodules
+        # named with the marked-submodule prefix, always returning tuples. Returns
+        # the fused graph module (mutates the graph).
         from torch.fx.passes.infra.partitioner import CapabilityBasedPartitioner
         from torch.fx.passes.operator_support import create_op_support
         from torch.fx.passes.utils.fuser_utils import fuse_by_partitions
@@ -166,9 +199,12 @@ class _RegionScooper:
         def _is_in_region(
             region_nodes: set[torch.fx.Node],
         ) -> Callable[[Mapping[str, torch.nn.Module], torch.fx.Node], bool]:
+            # [FUNCTION DOC] HELPER: Build a support predicate that accepts exactly
+            # the nodes in the given set.
             def is_node_supported(
                 _submodules: Mapping[str, torch.nn.Module], node: torch.fx.Node
             ) -> bool:
+                # [FUNCTION DOC] HELPER: True if the node belongs to the region set.
                 return node in region_nodes
 
             return is_node_supported
@@ -193,6 +229,10 @@ class _RegionScooper:
     def recursively_scoop_regions(
         gm: torch.fx.GraphModule, _processed: set[int] | None = None
     ) -> torch.fx.GraphModule:
+        # [FUNCTION DOC] HELPER: Recurse into graph-module attributes (each
+        # distinct module once, tracked by identity in the processed set; skipping
+        # get_attr nodes themselves marked for compile), scooping their regions
+        # first, then scoop this module. Returns the resulting graph module.
         if _processed is None:
             _processed = set()
         for node in gm.graph.find_nodes(op="get_attr"):
@@ -213,6 +253,8 @@ class _RegionScooper:
         return _RegionScooper.scoop_regions(gm)
 
     def __call__(self, gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
+        # [FUNCTION DOC] HELPER: Recursively scoop regions with node metadata
+        # preservation disabled; returns the graph module.
         with torch.fx.traceback.preserve_node_meta(enable=False):
             return _RegionScooper.recursively_scoop_regions(gm)
 
@@ -221,9 +263,15 @@ class _RegionCompiler:
     """
     Compiles the scooped out regions.
     """
+    # [CLASS DOC] HELPER: Stateless pass object that compiles the fused marked
+    # submodules produced by the scooper. Static methods do the work; calling an
+    # instance runs the recursive version with node metadata preservation disabled.
 
     @staticmethod
     def compile_region(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
+        # [FUNCTION DOC] HELPER: Compile the marked submodules of this graph module,
+        # switch its graph to boxed-calling-convention codegen, and recompile.
+        # Returns the module.
         from torch.fx.graph import _BoxedCodeGen
 
         gm = _compile_submod(gm, "__marked_inductor_submod")
@@ -233,6 +281,9 @@ class _RegionCompiler:
 
     @staticmethod
     def recursively_compile_regions(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
+        # [FUNCTION DOC] HELPER: Detect whether this module directly calls a marked
+        # submodule, recurse into all graph-module attributes, then compile this
+        # module's regions if any were found. Returns the module.
         # Find if the graph module has a scooped out region
         found_region = False
         for node in gm.graph.find_nodes(op="call_module"):
@@ -252,16 +303,20 @@ class _RegionCompiler:
         return gm
 
     def __call__(self, gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
+        # [FUNCTION DOC] HELPER: Recursively compile regions with node metadata
+        # preservation disabled; returns the module.
         with torch.fx.traceback.preserve_node_meta(enable=False):
             return _RegionCompiler.recursively_compile_regions(gm)
 
 
 def _create_inductor_marked_regions(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
+    # [FUNCTION DOC] HELPER: Run the region scooper on gm; returns the result.
     with torch.fx.traceback.preserve_node_meta(enable=False):
         return _RegionScooper()(gm)
 
 
 def _compile_inductor_marked_regions(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
+    # [FUNCTION DOC] HELPER: Run the region compiler on gm; returns the result.
     with torch.fx.traceback.preserve_node_meta(enable=False):
         return _RegionCompiler()(gm)
 
@@ -287,6 +342,12 @@ def regional_inductor(
         ):
             ...
     """
+    # [FUNCTION DOC] Pass entry point: first fuse annotated nodes into marked
+    # submodules, then compile them with Inductor, all with node metadata
+    # preservation disabled. Example args are unused. Returns the compiled graph
+    # module, or, when the functorch force_autograd_cache option is on, a
+    # RegionalOutputCode wrapping it. Mutates the graph; may raise ValueError or
+    # RuntimeError for invalid configs or missing fake values.
 
     # fuser utils create new nodes using create_proxy which retains the seq_nr
     # metadata and cause issues

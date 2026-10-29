@@ -1,3 +1,10 @@
+# [MODULE DOC] Base machinery for the FX network minimizer, which locates the
+# nodes of a GraphModule that cause run failures or numerical mismatches between
+# two execution functions (run_a and run_b). Defines three exception types, a
+# settings dataclass, and the _MinimizerBase class implementing several graph
+# traversal strategies (sequential, binary, accumulate, skip, defined, block) that
+# split the module into submodules, run both functions, and compare results.
+# Import-time side effect: creates a module logger.
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -35,6 +42,8 @@ class FxNetMinimizerBadModuleError(Exception):
     """
     Raised if failed to split out a minimize module
     """
+    # [CLASS DOC] Error raised when splitting yields zero or several minimize
+    # submodules instead of exactly one. No extra state.
 
 
 @compatibility(is_backward_compatible=False)
@@ -42,6 +51,8 @@ class FxNetMinimizerRunFuncError(Exception):
     """
     Raised if error occurs during run_a or run_b functions
     """
+    # [CLASS DOC] Error raised when running either execution function (or storing
+    # their outputs) throws; wraps the original message. No extra state.
 
 
 @compatibility(is_backward_compatible=False)
@@ -49,6 +60,8 @@ class FxNetMinimizerResultMismatchError(Exception):
     """
     Raised if comparing function thinks the results are mismatching.
     """
+    # [CLASS DOC] Error raised when the comparison function reports that the two
+    # results do not match. No extra state.
 
 
 @dataclass
@@ -70,6 +83,11 @@ class _MinimizerSettingBase:
     `all_outputs`: If true, when using `_run_and_compare()` function,
     all the output nodes in the subgraph will be used for comparison.
     """
+    # [CLASS DOC] HELPER: Dataclass of minimizer options: accumulate_error,
+    # traverse_method (default sequential), find_all, return_intermediate and
+    # all_outputs, all defaulting to off. Its string form lists each field.
+    # KNOWN ISSUE: the docstring lists only sequential, binary and accumulate as
+    # traverse methods, but the minimizer also accepts skip, defined and block.
 
     accumulate_error: bool = False
     traverse_method: str = "sequential"
@@ -78,6 +96,8 @@ class _MinimizerSettingBase:
     all_outputs: bool = False
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] HELPER: Return a header line followed by one tab-indented
+        # line per field name and value.
         settings_str = "FX Minimizer Settings:\n"
 
         for k, v in vars(self).items():
@@ -100,6 +120,13 @@ class _MinimizerBase:
 
     For internal Users, a guide can be found here https://fb.quip.com/HDtuAgiKGfkP.
     """
+    # [CLASS DOC] HELPER: Abstract-ish base for finding culprit nodes. Subclasses
+    # implement run_a and run_b (the base versions raise). State: the module, sample
+    # inputs, comparison function, settings, optional module exporter and exclusion
+    # function, dictionaries of stored a and b outputs keyed by node name, a results
+    # mapping, a list of text reports, an iteration counter, and the detected
+    # fusion groups. Key methods: minimize (dispatches on the traverse method),
+    # run_nodes, the private traversal methods and submodule building helpers.
 
     def __init__(
         self,
@@ -113,6 +140,12 @@ class _MinimizerBase:
         | None = None,
         exclusion_fn: Callable[[NodeList, int, int], None] | None = None,
     ) -> None:
+        # [FUNCTION DOC] Store the module, inputs, compare function, settings,
+        # exporter and exclusion function; init output stores, results, reports and
+        # iteration counter. Runs shape propagation, finds fusion groups among
+        # callable nodes, and seeds both output stores with sample inputs keyed by
+        # placeholder name. Raises AssertionError if the module is not a GraphModule
+        # or the number of placeholders differs from the number of sample inputs.
         if not isinstance(module, torch.fx.GraphModule):
             raise AssertionError(f"Expected GraphModule, got {type(module)}")
 
@@ -164,6 +197,8 @@ class _MinimizerBase:
         Helper function to run shape propagation on module. Can be overridden by
         subclasses for custom shape propagation logic.
         """
+        # [FUNCTION DOC] HELPER: Run shape propagation of the module on the sample
+        # inputs, annotating node metadata.
         ShapeProp(self.module).propagate(*self.sample_input)
 
     def run_a(
@@ -173,6 +208,8 @@ class _MinimizerBase:
         Run `mod` with `inputs` and generate output. The output will be compared with
         output of run_b().
         """
+        # [FUNCTION DOC] Hook for subclasses: run a submodule on inputs and return the
+        # output(s). Base version always raises RuntimeError.
         raise RuntimeError("run_a() is not implemented.")
 
     def run_b(
@@ -182,6 +219,8 @@ class _MinimizerBase:
         Run `mod` with `inputs` and generate output. The output will be compared with
         output of run_a().
         """
+        # [FUNCTION DOC] Hook for subclasses: run a submodule on inputs and return the
+        # output(s). Base version always raises RuntimeError.
         raise RuntimeError("run_b() is not implemented.")
 
     def _store_outputs(
@@ -200,6 +239,10 @@ class _MinimizerBase:
             b_result: Output of self.run_b(). Could be a tensor or tensors.
             submodule: The module that generates a_result and b_result.
         """
+        # [FUNCTION DOC] HELPER: Record the two results in the output stores under the
+        # names of the submodule's output node arguments (a single node, or element
+        # by element for several). Mutates the stores. Raises StopIteration if the
+        # submodule has no output node.
         output_node = next(
             node for node in submodule.graph.nodes if node.op == "output"
         )
@@ -232,6 +275,14 @@ class _MinimizerBase:
             a_input: List of tensor(s) that will be used by run_a() as submodule inputs.
             b_input: List of tensor(s) that will be used by run_b() as submodule inputs.
         """
+        # [FUNCTION DOC] HELPER: Obtain the submodule's inputs. If every placeholder
+        # name is in the stored a outputs, read inputs from the a and b stores.
+        # Otherwise print a notice when accumulating errors, then run the main
+        # module on the sample input with a temporary forward pre-hook to capture
+        # the submodule's inputs (same for both sides). Returns the a input twice
+        # unless accumulate_error is set, in which case the separate b input.
+        # KNOWN ISSUE: the docstring mentions torch_glow.get_submod_inputs, which is
+        # not used; a forward pre-hook is used instead.
         a_input = []
         b_input = []
         submodule = getattr(main_module, submod_path)
@@ -251,6 +302,8 @@ class _MinimizerBase:
                 print(f"Can't find previous stored outputs named {placeholders}!")
 
             def get_inputs(self: torch.nn.Module, inputs: tuple[Any, ...]) -> None:
+                # [FUNCTION DOC] HELPER: Forward pre-hook that stores the module's
+                # positional inputs in the enclosing variable.
                 nonlocal a_input
                 a_input = inputs
 
@@ -276,6 +329,10 @@ class _MinimizerBase:
                 with "minimize", all preceding nodes with "main_0" and all following
                 nodes with "main_1".
         """
+        # [FUNCTION DOC] HELPER: Assign a tag attribute to each callable node in the
+        # module: minimize for selected nodes, main_1 for unselected nodes that
+        # depend on an earlier minimize or main_1 node, and main_0 otherwise.
+        # Mutates the nodes.
         for node in self.module.graph.nodes:
             if node.op not in CALLABLE_NODE_OPS:
                 continue
@@ -302,6 +359,10 @@ class _MinimizerBase:
             split_module (torch.fx.GraphModule): the module after split.
             submodule_name (str): the name of the submodule that consists of `nodes`.
         """
+        # [FUNCTION DOC] HELPER: Tag the nodes, split the module by the three tags,
+        # and locate the single child module whose name contains minimize. Returns
+        # the split module and that child's name. Raises FxNetMinimizerBadModuleError
+        # if zero or more than one such child exists.
         # Color provided nodes
         self._tag_nodes(nodes)
 
@@ -346,6 +407,19 @@ class _MinimizerBase:
             output_names: Names of the node we want to output. If None, we
                 will use the original output.
         """
+        # [FUNCTION DOC] HELPER: Run the named submodule with both execution
+        # functions and compare. Gets the inputs, opens or selects a report, and if
+        # output names are given (and all_outputs is off) rewrites the submodule's
+        # output node to return just those nodes (mutating and recompiling it).
+        # Runs run_a and run_b, stores outputs (any failure becomes
+        # FxNetMinimizerRunFuncError), compares with the compare function, saves the
+        # numeric result keyed by the output node names and appends to the report.
+        # On mismatch, optionally exports the submodule with both inputs (names with
+        # suffixes for cpu and acc) and raises FxNetMinimizerResultMismatchError.
+        # KNOWN ISSUE: the docstring says None output names mean the original output,
+        # but an empty list is handled the same; the output-node erase happens
+        # while iterating the graph nodes; the result key is undefined (unbound) if
+        # the submodule has no output node.
         submodule = getattr(split_module, submod_name)
         a_input, b_input = self._get_submod_inputs(split_module, submod_name)
 
@@ -428,6 +502,12 @@ class _MinimizerBase:
         """
         Recursive binary search implementation.
         """
+        # [FUNCTION DOC] HELPER: Examine the slice of nodes from start to end. Applies
+        # the exclusion function if set (returns empty if everything is excluded),
+        # builds and tests the submodule for the whole slice. No discrepancy yields
+        # an empty set. On a failure, a single node is returned as the culprit;
+        # otherwise recurse on the first half, then the second half unless a culprit
+        # was found and find_all is off. Appends to reports and prints them.
         culprits: NodeSet = set()
         nodes: NodeList = all_nodes[start_idx:end_idx]
 
@@ -494,12 +574,19 @@ class _MinimizerBase:
         """
         Binary search on `nodes` for culprit.
         """
+        # [FUNCTION DOC] HELPER: Binary search over the whole node list; returns the
+        # culprit set.
         return self._binary_search_impl(nodes, 0, len(nodes))
 
     def _sequential_traverse(self, nodes: NodeList) -> NodeSet:
         """
         Traverse `nodes` one by one and determine if any of them is a culprit.
         """
+        # [FUNCTION DOC] HELPER: For each node (expanded to its fusion group if any,
+        # after the exclusion function), build and test a single-group submodule.
+        # A numeric mismatch adds the node to the culprits; a run error adds the
+        # whole group. Stops at the first culprit unless find_all is set. Appends
+        # to reports and prints them. Returns the culprit set.
         culprits: NodeSet = set()
 
         for node in nodes:
@@ -553,6 +640,13 @@ class _MinimizerBase:
         find_last_node: If True, search for the last node which result in numerics difference
         if False: find first node in sorted node list
         """
+        # [FUNCTION DOC] HELPER: One recursive step of block search. Takes the prefix
+        # of the node list up to the midpoint (when finding the last culprit) or the
+        # suffix from it (otherwise), applies exclusion, and tests the resulting
+        # submodule. A failure narrows towards the lower half (last) or the upper
+        # half (first); a pass narrows the opposite way. Returns the converged
+        # index, or None when no culprit exists at the end boundary. Appends to
+        # reports and prints them.
         report: list[str] = []
 
         mid = (start_idx + end_idx) // 2
@@ -661,6 +755,14 @@ class _MinimizerBase:
         where Numerical accuracy (start_idx, end_idx) < threshold
         Form minimum block by (start_idx - 1, end_idx)
         """
+        # [FUNCTION DOC] HELPER: Find the smallest contiguous block of nodes
+        # containing the culprit. Pass 1 (when find_last_node is true or unset)
+        # finds the end index; pass 2 (when false or unset) finds the start index.
+        # Returns an empty set if either pass finds nothing, else the nodes between
+        # the two indices inclusive. Appends to reports and prints them.
+        # KNOWN ISSUE: pass 2 slices the node list with the initial last index
+        # rather than the found end index, and uses a falsy test on the found end
+        # index, so an end index of zero falls back to the initial one.
         culprits: NodeSet = set()
         first_node_name = nodes[0].name
         last_node_name = nodes[-1].name
@@ -732,6 +834,10 @@ class _MinimizerBase:
         """
         run user defined `nodes` and determine if it is a culprit.
         """
+        # [FUNCTION DOC] HELPER: Test the given node list as one submodule, after the
+        # exclusion function. Prints a report either way.
+        # KNOWN ISSUE: the returned culprit set is always empty, even when the test
+        # fails and a culprit is reported.
         culprits: NodeSet = set()
         if self.exclusion_fn is not None:
             self.exclusion_fn(nodes, -1, -1)
@@ -756,6 +862,11 @@ class _MinimizerBase:
         return culprits
 
     def _accumulate_traverse(self, nodes: NodeList) -> NodeSet:
+        # [FUNCTION DOC] HELPER: Add nodes one at a time to a growing set, testing the
+        # cumulative submodule against the newest node's output; the first node
+        # whose test fails (mismatch or run error) is returned as the only culprit.
+        # If find_all is set, prints a message and returns an empty set. Raises
+        # AssertionError if a node name is unusable. Appends to reports and prints.
         culprits: NodeSet = set()
         nodes_to_run: NodeSet = set()
 
@@ -799,6 +910,10 @@ class _MinimizerBase:
         """
         Skip certain nodes in graph based on settings
         """
+        # [FUNCTION DOC] HELPER: Test the slice of nodes from start to end as one
+        # submodule (all outputs; expanded with fusion groups when no exclusion
+        # function). A mismatch or run error returns all tested nodes as culprits;
+        # otherwise an empty set. Appends to reports and prints them.
         culprits: NodeSet = set()
         nodes: NodeList = all_nodes[start_idx:end_idx]
         cur_nodes: NodeSet = set(nodes)
@@ -840,6 +955,10 @@ class _MinimizerBase:
         """
         Skip certain nodes in graph based on settings
         """
+        # [FUNCTION DOC] HELPER: Split the node list into maximal runs separated by
+        # nodes named in skip_nodes and test each run with the skip implementation.
+        # KNOWN ISSUE: the culprit result is overwritten by every run, so only the
+        # last tested run's culprits are returned.
         start_idx = 0
         num_nodes = len(all_nodes)
         idx = 0
@@ -861,6 +980,9 @@ class _MinimizerBase:
         Collect nodes in the model that between nodes with name of `start` and `end`.
         These two nodes are also included.
         """
+        # [FUNCTION DOC] HELPER: Return callable nodes of the module in graph order
+        # from the node named start (or the beginning if None) through the node named
+        # end (or the end if None), both inclusive.
         nodes: NodeList = []
         add_node = start is None
 
@@ -893,6 +1015,10 @@ class _MinimizerBase:
                 want to run. If set to None, we'll end with the last node of the
                 model.
         """
+        # [FUNCTION DOC] Run the range of nodes between start and end (expanded with
+        # fusion groups) as one submodule through both execution functions. With
+        # return_intermediate on, every node in the range is an output. Errors of
+        # the run or mismatch kinds are printed, not raised.
         nodes = self._collect_nodes(start, end)
         cur_nodes = set(nodes)
 
@@ -914,6 +1040,8 @@ class _MinimizerBase:
             print(e)
 
     def print_report(self, report: list[str]) -> None:
+        # [FUNCTION DOC] Print the first line of the report as is and following lines
+        # prefixed with a dot marker, to standard output.
         for i in range(len(report)):
             if i > 0:
                 print(" . " + report[i])
@@ -921,6 +1049,7 @@ class _MinimizerBase:
                 print(report[i])
 
     def print_reports(self) -> None:
+        # [FUNCTION DOC] Print every stored report using the report printer.
         for report in self.reports:
             self.print_report(report)
 
@@ -952,6 +1081,12 @@ class _MinimizerBase:
             nodes: A list of nodes that causes FxNetMinimizerRunFuncError or
                 FxNetMinimizerResultMismatchError errors during minimizing.
         """
+        # [FUNCTION DOC] Entry point: print the settings and graph, collect the node
+        # range, then dispatch on the traverse method (sequential, binary,
+        # accumulate, skip, defined, block). Returns the culprit set. Raises
+        # RuntimeError if skip is chosen without skip_nodes or the method is unknown.
+        # KNOWN ISSUE: the return annotation and docstring say list of nodes, but a
+        # set is returned.
 
         print(self.settings)
         print(self.module.graph)

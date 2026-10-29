@@ -1,3 +1,9 @@
+# [MODULE DOC] Pass management infrastructure for FX/nn.Module transformations.
+# Provides pass_result_wrapper (adapts legacy passes to return PassResult),
+# this_before_that_pass_constraint (builds ordering constraints), and the
+# PassManager class that orders passes by constraints, runs them repeatedly
+# up to a step limit, and optionally runs checks after each pass.
+# Import-time side effect: sets this module's logger level to WARNING.
 import inspect
 import logging
 from collections.abc import Callable
@@ -30,12 +36,19 @@ def pass_result_wrapper(fn: Callable[..., Any]) -> Callable[..., PassResult | No
     Returns:
         wrapped_fn (Callable[Module, PassResult])
     """
+    # [FUNCTION DOC] Wrap a pass so it returns a PassResult. Returns None if fn is
+    # None. The wrapper calls fn on the module: a None result becomes a PassResult
+    # of the input module flagged modified, a PassResult is passed through, and a
+    # returned module is wrapped as modified. Any other result type yields None.
+    # For non-function callables the wrapper name is set to the type name of fn.
     if fn is None:
         # pyrefly: ignore [bad-return]
         return None
 
     @wraps(fn)
     def wrapped_fn(gm: nn.Module) -> PassResult | None:
+        # [FUNCTION DOC] HELPER: Run the wrapped pass and normalize its result to a
+        # PassResult (see pass_result_wrapper); returns None for unsupported types.
         res = fn(gm)
         if res is None:
             return PassResult(gm, True)
@@ -54,6 +67,11 @@ def _validate_pass_schedule_constraint(
     constraint: Callable[[Callable[..., Any], Callable[..., Any]], bool],
     passes: list[Callable[..., Any]],
 ) -> None:
+    # [FUNCTION DOC] HELPER: Check every ordered pair (earlier, later) in the pass
+    # list against the constraint. Raises RuntimeError naming the offending pair
+    # on the first violation. No mutation.
+    # KNOWN ISSUE: the index reported for the second pass is relative to the slice
+    # after the first pass, not its absolute position in the list.
     for i, a in enumerate(passes):
         for j, b in enumerate(passes[i + 1 :]):
             if constraint(a, b):
@@ -77,6 +95,13 @@ def _topological_sort_passes(
         A sorted list of callables and a boolean of if a circular dependency
         existed
     """
+    # [FUNCTION DOC] HELPER: Order passes using a queue-based topological sort
+    # (Kahn style). For each ordered pair where a constraint returns False, the
+    # first pass gets an edge from the second and its in-degree is incremented.
+    # Returns the input list unchanged if there are no constraints. Raises
+    # RuntimeError listing passes left over if a circular dependency exists.
+    # KNOWN ISSUE: the docstring says a boolean about cycles is returned, but only
+    # the sorted list is returned.
     if len(constraints) == 0:
         return passes
 
@@ -143,8 +168,13 @@ def this_before_that_pass_constraint(
     Returns:
         depends_on (Callable[[Object, Object], bool])
     """
+    # [FUNCTION DOC] Build a constraint callable enforcing that pass this precedes
+    # pass that. The returned callable takes two passes and returns False only
+    # when the first is that and the second is this, True otherwise.
 
     def depends_on(a: Callable[..., Any], b: Callable[..., Any]) -> bool:
+        # [FUNCTION DOC] HELPER: Constraint predicate; False only for the pair
+        # (that, this), meaning that-before-this is a violation.
         return a != that or b != this
 
     return depends_on
@@ -152,6 +182,12 @@ def this_before_that_pass_constraint(
 
 @compatibility(is_backward_compatible=False)
 class PassManager:
+    # [CLASS DOC] Callable that holds an ordered list of passes plus ordering
+    # constraints, and applies the passes to a module. State: passes, constraints,
+    # steps (max repetitions, default 1), run_checks_after_each_pass,
+    # suppress_check_failures (stored but never consulted), and a _validated flag
+    # reset whenever passes or constraints change. Key methods: add_pass,
+    # add_constraint, validate_constraints, solve_constraints, add_checks, __call__.
     """
     Construct a PassManager.
 
@@ -186,6 +222,9 @@ class PassManager:
         run_checks_after_each_pass: bool = False,
         suppress_check_failures: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Initialize with optional passes and constraints (default to
+        # empty lists; the given lists are stored, not copied). A falsy steps keeps
+        # the class default of 1. Stores the check-related flags.
         self.passes = passes or []
         self.constraints = constraints or []
         if steps:
@@ -198,6 +237,7 @@ class PassManager:
         """
         Adds a pass into the current list of passes.
         """
+        # [FUNCTION DOC] Append a pass to the list and mark the schedule unvalidated.
         self.passes.append(_pass)
         self._validated = False
 
@@ -207,6 +247,7 @@ class PassManager:
         """
         Adds a constraint into the current list of constraints.
         """
+        # [FUNCTION DOC] Append a constraint and mark the schedule unvalidated.
         self.constraints.append(constraint)
         self._validated = False
 
@@ -215,6 +256,9 @@ class PassManager:
         Validates that current pass schedule defined by `self.passes` is valid
         according to all constraints in `self.constraints`
         """
+        # [FUNCTION DOC] Verify the current pass order against every constraint.
+        # Skips work if already validated. Raises RuntimeError on a violation.
+        # Sets the validated flag on success.
         if self._validated:
             return
         for constraint in self.constraints:
@@ -230,6 +274,11 @@ class PassManager:
         then we will raise an error because if steps != 1 this means that we
         will re-run the passes, allowing for circular dependencies.
         """
+        # [FUNCTION DOC] Reorder the passes by topological sort over the constraints
+        # and mark the schedule validated. Raises RuntimeError on circular
+        # dependencies.
+        # KNOWN ISSUE: the docstring says a cycle is only an error when steps is 1,
+        # but the sort raises on a cycle regardless of steps.
         self.passes = _topological_sort_passes(self.passes, self.constraints)
         self._validated = True
 
@@ -239,6 +288,12 @@ class PassManager:
         This function is run before and after each pass if the
         `run_checks_after_each_pass` flag is enabled.
         """
+        # [FUNCTION DOC] Install a check callable as this instance's check method.
+        # Raises TypeError unless the callable takes exactly one parameter.
+        # Side effect: sets an instance attribute shadowing the default no-op check.
+        # KNOWN ISSUE: the docstring says checks run before and after each pass, but
+        # the call method runs them once up front and after each pass only when
+        # run_checks_after_each_pass is set.
         sig = inspect.signature(check)
 
         if len(list(sig.parameters.values())) != 1:
@@ -249,6 +304,7 @@ class PassManager:
         setattr(self, "check", check)  # noqa: B010
 
     def check(self, module: nn.Module) -> None:
+        # [FUNCTION DOC] Default no-op check hook; replaced per instance by add_checks.
         pass
 
     def __call__(self, module: nn.Module) -> PassResult:
@@ -260,6 +316,14 @@ class PassManager:
         If the module is a graph module, we will run the list of passes until
         the graph stops changing, or until `steps` number of times.
         """
+        # [FUNCTION DOC] Run all passes on the module. Solves constraints first if
+        # not yet validated, runs check once, then loops up to steps times, applying
+        # each pass in order, taking the result's module, recompiling GraphModules
+        # and optionally checking after each pass. Stops early when a full round
+        # reports no modification. Returns a PassResult with the final module and
+        # whether anything changed. Raises TypeError (wrapped) if a pass returns a
+        # non-PassResult; any pass failure is re-raised as a generic Exception that
+        # names the failing pass and the preceding passes.
         # Order the passes based on the constraints
         if not self._validated:
             self.solve_constraints()

@@ -1,3 +1,10 @@
+# [MODULE DOC] Reinplacing pass for functional ATen FX graphs. Converts
+# out-of-place op calls into their in-place variants (and removes view-scatter
+# ops by replacing them with a view plus copy) when the input is not used later
+# and does not alias a program input. Contains a metadata-propagating interpreter
+# (fake results, node indices, view-of links), helpers for schema matching,
+# in-place op lookup and later-usage analysis, and the public reinplace function.
+# Import-time side effect: builds a table mapping view-scatter ops to their views.
 import _operator
 import itertools
 from collections import defaultdict
@@ -17,12 +24,18 @@ __all__ = ["reinplace"]
 
 
 class _ViewType(Enum):
+    # [CLASS DOC] HELPER: Classification of an operator by aliasing of its first
+    # argument: not a view, a view with a single output, or a view with multiple
+    # outputs.
     NonView = 0
     SingleOutputView = 1
     MultiOutputView = 2
 
 
 def _is_view_op(tgt: object) -> bool | None:
+    # [FUNCTION DOC] HELPER: For an operator overload with at least one argument,
+    # return whether its first argument has alias info that is read-only (a view).
+    # Returns None (not False) for non-overloads or ops without arguments.
     if tgt is not None and isinstance(tgt, torch._ops.OpOverload):
         schema = tgt._schema
         if len(schema.arguments) > 0:
@@ -34,6 +47,9 @@ def _is_view_op(tgt: object) -> bool | None:
 
 
 def _get_view_type(tgt: object) -> _ViewType:
+    # [FUNCTION DOC] HELPER: Classify an operator. A view is an overload whose first
+    # argument has read-only alias info; it is multi-output if the alias set after
+    # the call contains a wildcard, else single-output. Everything else is NonView.
     if tgt is not None and isinstance(tgt, torch._ops.OpOverload):
         schema = tgt._schema
         if len(schema.arguments) > 0:
@@ -59,7 +75,19 @@ def _get_view_type(tgt: object) -> _ViewType:
 #   to sanity check that our aliasing information is correct.
 @compatibility(is_backward_compatible=False)
 class _FunctionalizationMetadataProp(torch.fx.Interpreter):
+    # [CLASS DOC] HELPER: Interpreter that runs a graph on fake tensors and records
+    # per-node metadata: the fake result, a running node index, and for view nodes
+    # the node they are a view of. State: a node counter and a mapping from
+    # multi-output-view nodes to their base node, both reset by propagate.
     def run_node(self, node: Node) -> Any:
+        # [FUNCTION DOC] HELPER: Execute one node, then store the fake result and
+        # increment node index in node metadata. For single-output view ops, record
+        # the first argument as the view-of base; for multi-output view ops, remember
+        # the base; for getitem on such an output, record the base as view-of. For
+        # nodes with a view-of link, raises AssertionError unless both fake results
+        # are fake tensors sharing storage. Returns the node result.
+        # KNOWN ISSUE: the computed node_args (copy_ first argument skipped) is
+        # never used afterwards.
         self.node_counter += 1
         result = super().run_node(node)
         node.meta["fake_result"] = result
@@ -121,6 +149,9 @@ class _FunctionalizationMetadataProp(torch.fx.Interpreter):
         return result
 
     def propagate(self, *args: object) -> Any:
+        # [FUNCTION DOC] Reset the counter and view mapping, convert tensor arguments
+        # to fake tensors under a new fake tensor mode, and run the graph, filling
+        # node metadata. Returns the run result (fake outputs).
         self.multi_output_view_nodes = {}
         self.node_counter = -1
 
@@ -134,6 +165,11 @@ class _FunctionalizationMetadataProp(torch.fx.Interpreter):
 def _schemas_match(
     functional_schema: torch._C.FunctionSchema, inplace_schema: torch._C.FunctionSchema
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Check that an in-place schema is the counterpart of a
+    # functional schema: in-place name is the functional name plus a trailing
+    # underscore, and argument counts and types are equal. Raises AssertionError if
+    # the in-place schema's first argument is not mutable or any other argument
+    # is mutable. Returns whether names and argument types match.
     names_match = (
         inplace_schema.name.endswith("_")
         and inplace_schema.name[:-1] == functional_schema.name
@@ -161,6 +197,10 @@ def _schemas_match(
 # - out= ops (e.g. angle -> angle.out)
 # TODO: we should also figure this info out using torchgen.
 def _maybe_get_inplace_op(op: object) -> torch._ops.OpOverload | None:
+    # [FUNCTION DOC] HELPER: Find the in-place overload matching a functional op.
+    # Returns None for non-overloads, view ops, ops with no underscore-suffixed
+    # packet, or when no in-place overload has a matching schema. Raises
+    # AssertionError if more than one overload matches.
     # __module__ seems broken; it returns torch._ops.aten which doesn't exist
     if not isinstance(op, torch._ops.OpOverload):
         return None
@@ -211,7 +251,13 @@ _VIEW_INVERSE_MAP: dict[torch._ops.OpOverload, torch._ops.OpOverload] = {
 # Returns any nodes in the graph that *use* any of the aliases, that occur *after* op_index
 # in the node ordering.
 def _get_all_later_node_usages(tensor_aliases: set[Node], op_index: int) -> set[Node]:
+    # [FUNCTION DOC] HELPER: Collect users of any alias node whose node index is
+    # after op_index, excluding users that are themselves aliases and are plain
+    # operator calls or getitem (intermediate views). Returns the set of nodes.
     def _add_if_tensor(x: object, set_: set[StorageWeakRef]) -> None:
+        # [FUNCTION DOC] HELPER: Add the storage reference of a fake tensor to the
+        # given set; ignores other values.
+        # KNOWN ISSUE: never called anywhere.
         if is_fake_tensor(x):
             set_.add(StorageWeakRef(x._typed_storage()))
 
@@ -246,7 +292,15 @@ def _get_all_later_node_usages(tensor_aliases: set[Node], op_index: int) -> set[
 def _get_view_inverse_node_usages(
     later_node_usages: set[Node], self_aliases: set[Node]
 ) -> set[Node]:
+    # [FUNCTION DOC] HELPER: From the later usages, pick the view-scatter nodes that
+    # invert a view among the self aliases: iterating in node order, for each
+    # scatter node, replay the corresponding view op on an alias's base using the
+    # scatter's extra arguments, and accept if the base matches the scatter base in
+    # size, stride and offset and the replayed view matches the alias metadata.
+    # Replay failures are ignored. Raises AssertionError on malformed metadata.
     def matching_view_metadata(a: FakeTensor, b: FakeTensor) -> bool:
+        # [FUNCTION DOC] HELPER: True if two fake tensors have equal size, stride and
+        # storage offset.
         return (
             a.size() == b.size()  # type: ignore[bad-return]
             and a.stride() == b.stride()
@@ -527,6 +581,17 @@ def reinplace(gm: torch.fx.GraphModule, *sample_args: Any) -> torch.fx.GraphModu
     to do this, but we can no longer run FX's DCE pass now that we have mutable
     ops in the graph.
     """
+    # [FUNCTION DOC] Public pass: propagate fake-tensor metadata using the sample
+    # args, record storages of placeholder inputs and a map from storage to the
+    # nodes using it, then visit call nodes in order. A node is skipped unless its
+    # first argument is a tensor with compatible numel, dtype and no internal
+    # overlap (resize excepted), is not an input alias, is not repeated in the
+    # args, and has no later uses other than removable view-scatter nodes.
+    # View-scatter nodes are rewritten into a view plus copy; other ops are retargeted
+    # to their in-place overload. Later users are rewired to the original input
+    # and the storage map updated. Finally the obsolete scatter nodes are erased and
+    # the module is recompiled. Mutates and returns gm; raises AssertionError on
+    # inconsistent metadata.
     _FunctionalizationMetadataProp(gm).propagate(*sample_args)
 
     # Useful debug printing
@@ -563,6 +628,8 @@ def reinplace(gm: torch.fx.GraphModule, *sample_args: Any) -> torch.fx.GraphModu
         if "fake_result" in n.meta:
             # Tree-mapping because some ops can return lists of tensors.
             def _add_to_map(x: object) -> None:
+                # [FUNCTION DOC] HELPER: If x is a fake tensor, record the current
+                # node under its storage in the storage-to-nodes map.
                 if is_fake_tensor(x):
                     storage_to_nodes[StorageWeakRef(x._typed_storage())].add(n)
 
@@ -728,6 +795,8 @@ def reinplace(gm: torch.fx.GraphModule, *sample_args: Any) -> torch.fx.GraphModu
                 for node_to_update in nodes_to_update:
 
                     def replace_arg(a: Node) -> Node:
+                        # [FUNCTION DOC] HELPER: Map the old node to its replacement;
+                        # other nodes unchanged.
                         if a == old:
                             return new
                         return a
