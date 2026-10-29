@@ -1,4 +1,8 @@
 # Owner(s): ["module: functorch"]
+# [MODULE DOC] Unit tests for the activation checkpointing logging helpers in
+# the functorch activation checkpointing logging utilities module. Uses mocked graph and
+# node objects to check node information, edge lists, the payload dictionary and the
+# structured-trace emission. No import-time side effects beyond imports.
 from unittest.mock import MagicMock, patch
 
 from torch._functorch._activation_checkpointing.ac_logging_utils import (
@@ -12,7 +16,13 @@ from torch.testing._internal.common_utils import run_tests, TestCase
 
 
 class TestAcLogging(TestCase):
+    # [CLASS DOC] Test case holding mock graph and node fixtures (two mock nodes, the second
+    # consuming the first) plus sample min-cut and knapsack inputs, shared by four tests of the
+    # logging helper functions.
     def setUp(self) -> None:
+        # [FUNCTION DOC] HELPER: Fixture setup. Builds a mock graph with two mock nodes (node1 with
+        # tensor shape metadata and no inputs, node2 with no tensor metadata and node1 as input),
+        # and stores sample knapsack, memory, runtime, budget and ratio values as attributes.
         super().setUp()
         self.graph: MagicMock = MagicMock(spec=Graph)
         self.node1: MagicMock = MagicMock(spec=Node)
@@ -49,6 +59,9 @@ class TestAcLogging(TestCase):
         self.aggressive_recomputation_saved_values_mem_ratio: float = 0.8
 
     def test_create_joint_graph_node_information(self) -> None:
+        # [FUNCTION DOC] Checks that the node information builder returns, per node name, the expected
+        # description dict: node1 flagged as a recomputable candidate with its index, node2 not a
+        # candidate and with an empty shape string and node1 as its input.
         recomputable_node_info: dict[str, int] = {"node1": 0}
         expected_output: dict[str, dict] = {
             "node1": {
@@ -75,11 +88,15 @@ class TestAcLogging(TestCase):
         self.assertEqual(result, expected_output)
 
     def test_create_joint_graph_edges(self) -> None:
+        # [FUNCTION DOC] Checks that the edge builder returns the single pair of node1 feeding node2.
         expected_edges: list[tuple[str, str]] = [("node1", "node2")]
         result = create_joint_graph_edges(self.graph)
         self.assertEqual(result, expected_edges)
 
     def test_create_activation_checkpointing_logging_structure_payload(self) -> None:
+        # [FUNCTION DOC] Checks that the payload builder returns a dictionary with the expected labeled
+        # fields (graph size 2, edge total, node information, banned node names, knapsack inputs,
+        # min-cut saved names, budget, sizes and ratios) built from the fixture values.
         input_joint_graph_node_information: dict[str, dict] = {
             "node1": {
                 "index": 0,
@@ -140,6 +157,11 @@ class TestAcLogging(TestCase):
     def test_create_structured_trace_for_min_cut_info(
         self, mock_json_dumps: MagicMock, mock_trace_structured: MagicMock
     ) -> None:
+        # [FUNCTION DOC] Checks that the min-cut trace function emits exactly one structured trace
+        # call whose metadata callback yields the name min_cut_information with json encoding and
+        # whose payload callback yields the mocked serialized string, and that JSON serialization
+        # happens once. The structured-trace function and JSON dumping are patched out. The mock
+        # arguments are injected by the patch decorators.
         create_structured_trace_for_min_cut_info(
             joint_graph=self.graph,
             all_recomputable_banned_nodes=self.all_recomputable_banned_nodes,

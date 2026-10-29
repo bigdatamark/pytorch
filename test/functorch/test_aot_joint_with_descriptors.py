@@ -1,4 +1,11 @@
 # Owner(s): ["oncall: pt2"]
+# [MODULE DOC] Tests for exporting a module to a joint forward/backward graph with descriptors
+# (the export entry point and its compile counterpart), the graph utility helpers that look up
+# parameter, buffer, input, output, gradient and tangent nodes by descriptor, and the preservation
+# of annotation metadata and stack traces on joint graph nodes (annotate context manager, annotate
+# function decorator, flex attention, custom ops, invoke subgraph). Contains a shared graph
+# capture helper and one test class. Several tests compare printed graphs against inline expected
+# text. No import-time side effects beyond imports.
 
 # Copyright (c) Facebook, Inc. and its affiliates.
 # All rights reserved.
@@ -48,6 +55,11 @@ from torch.testing._internal.common_utils import (
 
 
 def graph_capture(model, inputs, with_export):
+    # [FUNCTION DOC] HELPER: Captures a joint graph for a model. When with_export is true, first
+    # runs the dynamo export graph capture on the model with node metadata preservation enabled
+    # and takes the tracing context from the captured graph metadata; otherwise uses the model as
+    # is. Then, under that tracing context and an exit stack, exports the joint graph with
+    # descriptors and returns its graph module. Raises whatever capture or export raises.
     gm = model
     tracing_context = None
     if with_export:
@@ -66,15 +78,27 @@ def graph_capture(model, inputs, with_export):
 
 
 class TestAOTJointWithDescriptors(TestCase):
+    # [CLASS DOC] Test case for the joint-with-descriptors export. Stateless; each test builds its
+    # own small module and input, exports the joint graph, and checks printed graph text,
+    # parameter and buffer specs, graph utility lookups, annotation metadata, or numerical
+    # agreement of the compiled function with the eager model.
     def test_simple_linear_module(self):
+        # [FUNCTION DOC] Exports a linear module (with a decomposition table), compares the
+        # normalized printed joint graph against the expected text, then compiles it and checks
+        # that the compiled function called with parameters then inputs matches the eager output.
         """Test basic linear module with aot_export_joint_with_descriptors"""
 
         class SimpleLinear(nn.Module):
+            # [CLASS DOC] HELPER: Single linear layer module (3 inputs to 2 outputs) used as test
+            # model.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the linear submodule.
                 super().__init__()
                 self.linear = nn.Linear(3, 2)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer to the input and returns the
+                # result.
                 return self.linear(x)
 
         model = SimpleLinear()
@@ -140,15 +164,26 @@ class inner_f(torch.nn.Module):
         self.assertEqual(expected_output, actual_output)
 
     def test_conv_bn_module(self):
+        # [FUNCTION DOC] Exports a convolution plus batch norm module in training mode, checks
+        # that parameter and buffer specs contain the expected names, compares the printed joint
+        # graph with the expected text (including buffer mutation outputs), then compiles and
+        # checks the result matches eager within 1e-4 tolerance when passing parameters, buffers
+        # and inputs.
         """Test convolutional + batch norm module"""
 
         class ConvBN(nn.Module):
+            # [CLASS DOC] HELPER: Module with a convolution followed by batch norm and a relu,
+            # test model.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates a 2D convolution with padding and a 2D batch norm
+                # layer.
                 super().__init__()
                 self.conv = nn.Conv2d(1, 3, 3, padding=1)
                 self.bn = nn.BatchNorm2d(3)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Runs convolution, then batch norm, then relu and returns
+                # the result.
                 x = self.conv(x)
                 x = self.bn(x)
                 return torch.relu(x)
@@ -308,14 +343,24 @@ class inner_f(torch.nn.Module):
         torch.testing.assert_close(expected_output, actual_output, rtol=1e-4, atol=1e-4)
 
     def test_module_with_kwargs(self):
+        # [FUNCTION DOC] Captures a module taking a keyword-only scale argument through dynamo
+        # export, exports the joint graph passing the keyword arguments, drops blank lines from
+        # the normalized printed graph (cross-reference mode adds extra spaces) and compares with
+        # the expected text, then compiles and checks the output matches eager when called with
+        # the same keyword argument.
         """Test module with keyword arguments"""
 
         class ModuleWithKwargs(nn.Module):
+            # [CLASS DOC] HELPER: Linear module whose forward multiplies the result by a keyword-
+            # only scale.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the linear submodule.
                 super().__init__()
                 self.linear = nn.Linear(3, 2)
 
             def forward(self, x, *, scale):
+                # [FUNCTION DOC] HELPER: Applies the linear layer and multiplies by the scale
+                # keyword argument.
                 return self.linear(x) * scale
 
         model = ModuleWithKwargs()
@@ -396,15 +441,24 @@ class inner_f(torch.nn.Module):
         self.assertEqual(expected_output, actual_output)
 
     def test_multiple_outputs_module(self):
+        # [FUNCTION DOC] Exports a module with two outputs, compares the printed joint graph with
+        # the expected text (two tangents, gradients for both layers), compiles it, and checks
+        # each output of the compiled function equals the corresponding eager output.
         """Test module with multiple outputs"""
 
         class MultiOutputModule(nn.Module):
+            # [CLASS DOC] HELPER: Module with two independent linear layers returning both outputs
+            # as a tuple.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the two linear layers with different output
+                # sizes.
                 super().__init__()
                 self.linear1 = nn.Linear(3, 2)
                 self.linear2 = nn.Linear(3, 4)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies both linear layers to the input and returns the
+                # pair of results.
                 out1 = self.linear1(x)
                 out2 = self.linear2(x)
                 return out1, out2
@@ -496,14 +550,22 @@ class inner_f(torch.nn.Module):
             self.assertEqual(exp, act)
 
     def test_in_out_specs(self):
+        # [FUNCTION DOC] Checks that the exported joint object has its input, output, parameter
+        # and buffer specs set, that flattening inputs gives a nonempty list, that parameter spec
+        # holds the linear weight and bias names and the buffer spec is empty, and that compiling
+        # and running matches the eager output.
         """Test that in_spec and out_spec are properly set"""
 
         class SimpleModule(nn.Module):
+            # [CLASS DOC] HELPER: Module wrapping a single linear layer, used as test model.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the linear submodule.
                 super().__init__()
                 self.linear = nn.Linear(3, 2)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer to the input and returns the
+                # result.
                 return self.linear(x)
 
         model = SimpleModule()
@@ -545,14 +607,22 @@ class inner_f(torch.nn.Module):
         self.assertEqual(expected_output, actual_output)
 
     def test_fx_utils_simple_linear(self):
+        # [FUNCTION DOC] Exercises each graph utility on the exported linear module joint graph:
+        # named and unnamed parameter and buffer node lookups (two parameters, no buffers), all
+        # input and gradient nodes (four), parameter and gradient pairs, plain inputs (no
+        # gradient), and all outputs and tangents (three, with plain output having a tangent).
         """Test FX utilities on a simple linear module"""
 
         class SimpleLinear(nn.Module):
+            # [CLASS DOC] HELPER: Module wrapping a single linear layer, used as test model.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the linear submodule.
                 super().__init__()
                 self.linear = nn.Linear(3, 2)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer to the input and returns the
+                # result.
                 return self.linear(x)
 
         model = SimpleLinear()
@@ -618,15 +688,25 @@ class inner_f(torch.nn.Module):
                 )  # Should have tangents for backward pass
 
     def test_fx_utils_conv_bn_module(self):
+        # [FUNCTION DOC] Exercises the graph utilities on a convolution plus batch norm module in
+        # training mode: four named parameters, three named buffers, nine total inputs and
+        # gradients (parameters, buffers, one input, one tangent), and counts the buffer
+        # descriptors found.
         """Test FX utilities on a conv+batchnorm module with buffers"""
 
         class ConvBN(nn.Module):
+            # [CLASS DOC] HELPER: Module with a convolution followed by batch norm and a relu,
+            # test model.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates a 2D convolution with padding and a 2D batch norm
+                # layer.
                 super().__init__()
                 self.conv = nn.Conv2d(1, 3, 3, padding=1)
                 self.bn = nn.BatchNorm2d(3)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Runs convolution, then batch norm, then relu and returns
+                # the result.
                 x = self.conv(x)
                 x = self.bn(x)
                 return torch.relu(x)
@@ -681,15 +761,25 @@ class inner_f(torch.nn.Module):
             self.assertEqual(buffer_count, 3)
 
     def test_fx_utils_multiple_outputs(self):
+        # [FUNCTION DOC] Exercises output and tangent utilities on a two-output module: six
+        # outputs in total (two plain, four gradients), two plain output and tangent pairs each
+        # with a tangent, and four parameter and gradient pairs where every parameter has a
+        # gradient.
         """Test FX utilities on a module with multiple outputs"""
 
         class MultiOutputModule(nn.Module):
+            # [CLASS DOC] HELPER: Module with two independent linear layers returning both outputs
+            # as a tuple.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the two linear layers with different output
+                # sizes.
                 super().__init__()
                 self.linear1 = nn.Linear(3, 2)
                 self.linear2 = nn.Linear(3, 4)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies both linear layers to the input and returns the
+                # pair of results.
                 out1 = self.linear1(x)
                 out2 = self.linear2(x)
                 return out1, out2
@@ -729,14 +819,22 @@ class inner_f(torch.nn.Module):
                 self.assertIsNotNone(grad_node)
 
     def test_fx_utils_node_consistency(self):
+        # [FUNCTION DOC] Checks that the different node lookup utilities agree: the unnamed
+        # parameter node list matches the values of the named mapping, parameter and gradient
+        # pairs refer to the same nodes found by target name, and the parameter entries among all
+        # inputs match too.
         """Test that FX utilities return consistent node references"""
 
         class SimpleModule(nn.Module):
+            # [CLASS DOC] HELPER: Module wrapping a single linear layer, used as test model.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the linear submodule.
                 super().__init__()
                 self.linear = nn.Linear(3, 2)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer to the input and returns the
+                # result.
                 return self.linear(x)
 
         model = SimpleModule()
@@ -776,12 +874,20 @@ class inner_f(torch.nn.Module):
             self.assertEqual(param_count, len(param_nodes))
 
     def test_export_and_compile(self):
+        # [FUNCTION DOC] Exports a linear module without a decomposition table, compiles the joint
+        # result, wraps the compiled function with full graph torch compile, runs it with the
+        # parameters and the input tuple, runs backward on the summed output, and checks the
+        # weight gradient was populated.
         class SimpleModule(nn.Module):
+            # [CLASS DOC] HELPER: Module wrapping a single linear layer, used as test model.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the linear submodule.
                 super().__init__()
                 self.linear = nn.Linear(3, 2)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer to the input and returns the
+                # result.
                 return self.linear(x)
 
         model = SimpleModule()
@@ -798,14 +904,25 @@ class inner_f(torch.nn.Module):
         self.assertIsNotNone(model.linear.weight.grad)
 
     def test_preserve_annotate_simple(self):
+        # [FUNCTION DOC] For both export and non-export capture, captures a module whose linear
+        # layer runs under an annotation context with a pipeline stage value of zero, then checks
+        # the custom metadata listing of the joint graph: forward and backward nodes from the
+        # linear layer carry the annotation while the subtraction after it does not appear in the
+        # listing.
         """Test basic linear module with aot_export_joint_with_descriptors"""
 
         class SimpleLinear(nn.Module):
+            # [CLASS DOC] HELPER: Module applying a linear layer inside an annotation context,
+            # then subtracting one.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the linear submodule.
                 super().__init__()
                 self.linear = nn.Linear(3, 2)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Runs the linear layer under the annotation context with
+                # stage zero and returns the result minus one (the subtraction is outside the
+                # context).
                 with fx_traceback.annotate({"pp_stage": 0}):
                     y = self.linear(x)
                 return y - 1
@@ -831,11 +948,25 @@ class inner_f(torch.nn.Module):
 
     @requires_cuda
     def test_preserve_annotate_flex_attention(self):
+        # [FUNCTION DOC] Requires CUDA. Builds a block causal mask from a per-batch document id
+        # tensor, wraps flex attention in an annotation context, captures the joint graph with
+        # export, and checks that the custom metadata listing contains the annotation on the
+        # score, mask, forward, joint and mask subgraph attributes and on the flex attention
+        # forward and backward calls. Membership is tested instead of exact text because the
+        # number of detach nodes varies across CI runs.
         def score_mod(score, b, h, m, n):
+            # [FUNCTION DOC] HELPER: Identity score modification; returns the score unchanged and
+            # ignores the batch, head, query and key indices.
             return score
 
         def _get_block_causal_mask_mod(seq_idx):
+            # [FUNCTION DOC] HELPER: Given a document id tensor, returns a mask function allowing
+            # attention only within the same document and causally (query index not before key
+            # index).
             def block_causal_mask(b, h, q_idx, kv_idx):
+                # [FUNCTION DOC] HELPER: Mask function: true where query and key positions belong
+                # to the same document and the query index is at least the key index. The index
+                # tensors are used so autograd sequence numbers advance.
                 # must use this more complicated mask_mod so autograd seq_nr increases
                 return (seq_idx[b, q_idx] == seq_idx[b, kv_idx]) & (q_idx >= kv_idx)
 
@@ -861,9 +992,14 @@ class inner_f(torch.nn.Module):
         block_mask = create_block_mask(mask_mod, None, None, seqlen, seqlen)
 
         class FlexAttentionModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward applies flex attention under an annotation
+            # context, using the block mask and score function from the enclosing test.
             """Flex attention submodule similar to the sdpa in Llama3 Attention"""
 
             def forward(self, xq, xk, xv):
+                # [FUNCTION DOC] HELPER: Runs flex attention on query, key and value tensors with
+                # the enclosing block mask and score function inside an annotation context naming
+                # flex attention for inductor, and returns the output tensor.
                 """
                 Args:
                     xq: Query tensor (bs, n_heads, seqlen, head_dim)
@@ -935,18 +1071,29 @@ class inner_f(torch.nn.Module):
         )
 
     def test_preserve_annotate_function(self):
+        # [FUNCTION DOC] For both capture modes, checks custom metadata when part of the forward
+        # is inside an annotation context (stage zero, the linear) and part goes through an
+        # annotation decorated function (stage one, the squaring): the nodes of each carry their
+        # own stage and the final subtraction carries none.
         """Test basic annotate_fn usage"""
 
         @fx_traceback.annotate_fn({"pp_stage": 1})
         def example_function(x):
+            # [FUNCTION DOC] HELPER: Multiplies the input by itself; decorated so its nodes are
+            # annotated with stage one.
             return x * x
 
         class SimpleLinear(nn.Module):
+            # [CLASS DOC] HELPER: Module with a linear layer under an annotation context, then the
+            # annotated squaring function, then subtracting one.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the linear submodule.
                 super().__init__()
                 self.linear = nn.Linear(3, 2)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer under annotation stage zero,
+                # then the stage one squaring function, and returns the result minus one.
                 with fx_traceback.annotate({"pp_stage": 0}):
                     y = self.linear(x)
                 y = example_function(y)
@@ -975,14 +1122,21 @@ class inner_f(torch.nn.Module):
             )
 
     def test_annotate_fn_anchors_nested_functional_call(self):
+        # [FUNCTION DOC] Traces a function decorated with an annotation (which calls cross
+        # entropy) using the proxy tensor tracer with stack trace recording, then checks that the
+        # nodes produced by decomposing log softmax and negative log likelihood loss have stack
+        # traces that mention the decorated function name, and that at least one such node exists.
         import torch.nn.functional as F
         from torch.fx.experimental.proxy_tensor import make_fx
 
         @fx_traceback.annotate_fn({"module_fqn": "loss"})
         def compute_loss(pred, labels):
+            # [FUNCTION DOC] HELPER: Returns cross entropy loss of predictions and labels;
+            # annotated.
             return F.cross_entropy(pred, labels)
 
         def fwd(pred, labels):
+            # [FUNCTION DOC] HELPER: Calls the annotated loss function; the traced entry point.
             return compute_loss(pred, labels)
 
         gm = make_fx(fwd, record_stack_traces=True)(
@@ -999,13 +1153,21 @@ class inner_f(torch.nn.Module):
             self.assertIn("compute_loss", st)
 
     def test_annotate_fn_anchors_pure_tensor_ops(self):
+        # [FUNCTION DOC] Traces two identical functions (scale, sum, divide), one decorated with
+        # an annotation and one plain, with stack trace recording. Checks the decorated one has at
+        # least three call nodes whose stack trace mentions its name, and that the plain one has
+        # none that mention its own name.
         from torch.fx.experimental.proxy_tensor import make_fx
 
         @fx_traceback.annotate_fn({"module_fqn": "decorated"})
         def user_fn(x, y):
+            # [FUNCTION DOC] HELPER: Decorated function; multiplies the input by two, sums,
+            # divides by y.
             return (x * 2.0).sum() / y
 
         def control_fn(x, y):
+            # [FUNCTION DOC] HELPER: Undecorated control with the same computation as the
+            # decorated function.
             return (x * 2.0).sum() / y
 
         x, y = torch.randn(4), torch.tensor(2.0)
@@ -1029,20 +1191,28 @@ class inner_f(torch.nn.Module):
         self.assertEqual(len(anchored_ctl), 0)
 
     def test_annotate_fn_nested_with_module_forward(self):
+        # [FUNCTION DOC] Traces an annotated function that calls a bias-free linear module and
+        # checks that the matrix multiply node in the traced graph has a non-empty stack trace
+        # recorded.
         from torch.fx.experimental.proxy_tensor import make_fx
 
         class Inner(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a single bias-free linear layer of size four.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the bias-free linear layer.
                 super().__init__()
                 self.lin = torch.nn.Linear(4, 4, bias=False)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer to the input and returns the
+                # result.
                 return self.lin(x)
 
         inner = Inner()
 
         @fx_traceback.annotate_fn({"module_fqn": "outer"})
         def outer_user_fn(x):
+            # [FUNCTION DOC] HELPER: Annotated wrapper that calls the inner module on the input.
             return inner(x)
 
         gm = make_fx(lambda a: outer_user_fn(a), record_stack_traces=True)(
@@ -1059,24 +1229,35 @@ class inner_f(torch.nn.Module):
 
     @skipIfCrossRef
     def test_custom_op_stack_trace(self):
+        # [FUNCTION DOC] Skipped in cross-reference mode. Registers a custom op that adds two
+        # tensors with fake implementation and autograd, wraps it in a module, captures the joint
+        # graph with export, finds the call node for the op, and checks the node stack trace and
+        # the printed graph mention the user call line but not the internal op overload attribute.
         @torch.library.custom_op("my_lib::foo", mutates_args={})
         def foo(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Custom op implementation; returns the sum of the two tensors.
             return x + y
 
         @foo.register_fake
         def foo_fake_impl(x, y):
+            # [FUNCTION DOC] HELPER: Fake implementation; returns an empty tensor shaped like the
+            # first input.
             return torch.empty_like(x)
 
         def foo_setup_context(ctx, inputs, output):
+            # [FUNCTION DOC] HELPER: Autograd setup hook; intentionally does nothing.
             pass
 
         def foo_backward(ctx, grad_output):
+            # [FUNCTION DOC] HELPER: Backward rule; returns the incoming gradient for both inputs.
             return grad_output, grad_output
 
         foo.register_autograd(foo_backward, setup_context=foo_setup_context)
 
         class CustomOpModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward calls the custom op on its two inputs.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the custom op applied to the two inputs.
                 return foo(x, y)
 
         model = CustomOpModule()
@@ -1097,9 +1278,19 @@ class inner_f(torch.nn.Module):
         self.assertFalse("self._opoverload" in gm.print_readable(print_output=False))
 
     def test_preserve_annotate_replay_view(self):
+        # [FUNCTION DOC] Captures a joint graph for a module that calls a permutation-undoing
+        # helper (allocate, scatter by index, slice off the last row) under an annotation,
+        # followed by a cosine. Checks there is exactly one slice node and one slice backward
+        # node, that they share the same sequence number, that the slice node stack trace contains
+        # the original slice source line text, and that the custom metadata listing matches the
+        # expected text. Verifies nodes regenerated during functionalization keep annotations and
+        # traces.
         """Test stack trace and annotation are correct on nodes regenerated in functionalization"""
 
         def _unpermute(out, input_shape, permuted_indices):
+            # [FUNCTION DOC] HELPER: Allocates an empty tensor of the given shape like the input,
+            # writes the input rows to the positions given by the permuted indices, drops the last
+            # row, and returns it.
             """
             Unpermute operation from torchtitan MoE utils.
             """
@@ -1109,12 +1300,18 @@ class inner_f(torch.nn.Module):
             return out
 
         class Module(nn.Module):
+            # [CLASS DOC] HELPER: Module holding a fixed input shape and permutation indices;
+            # forward applies the unpermute helper under an annotation and then a cosine.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Stores the shape five by three and a fixed index tensor
+                # of four entries.
                 super().__init__()
                 self.input_shape = (5, 3)
                 self.permuted_indices = torch.tensor([2, 0, 3, 1])
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the unpermute helper under the stage zero
+                # annotation and returns the cosine of the result.
                 with fx_traceback.annotate({"pp_stage": 0}):
                     routed_output = _unpermute(
                         x, self.input_shape, self.permuted_indices
@@ -1152,14 +1349,21 @@ class inner_f(torch.nn.Module):
         )
 
     def test_static_input_indices(self):
+        # [FUNCTION DOC] Captures a linear module with dynamo export, exports the joint graph
+        # under a tracing context built from the captured fake mode, and checks the forward
+        # metadata records static input indices zero and one (the weight and bias).
         """Test basic linear module with aot_export_joint_with_descriptors"""
 
         class SimpleLinear(nn.Module):
+            # [CLASS DOC] HELPER: Module wrapping a single linear layer, used as test model.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the linear submodule.
                 super().__init__()
                 self.linear = nn.Linear(3, 2)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer to the input and returns the
+                # result.
                 return self.linear(x)
 
         model = SimpleLinear()
@@ -1178,15 +1382,24 @@ class inner_f(torch.nn.Module):
 
     @skipIfTorchDynamo(msg="https://github.com/pytorch/pytorch/issues/182599")
     def test_no_annotation_on_gradient_acc_nodes(self):
+        # [FUNCTION DOC] Skipped under dynamo. Captures a joint graph of two annotated linear
+        # layers whose outputs are subtracted, finds the single add node, and checks it is marked
+        # as a gradient accumulation node and has no custom annotation, then compares the custom
+        # metadata listing with the expected text.
         """Test basic linear module with aot_export_joint_with_descriptors"""
 
         class SimpleLinear(nn.Module):
+            # [CLASS DOC] HELPER: Module with two linear layers whose outputs are subtracted under
+            # an annotation.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the two linear layers.
                 super().__init__()
                 self.linear = nn.Linear(3, 2)
                 self.linear2 = nn.Linear(3, 2)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Under an annotation context, returns the first layer
+                # output minus the second layer output.
                 with fx_traceback.annotate({"test": 1}):
                     return self.linear(x) - self.linear2(x)
 
@@ -1230,19 +1443,36 @@ class inner_f(torch.nn.Module):
 
     @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
     def test_annotate_invoke_subgraph_simple(self):
+        # [FUNCTION DOC] With the single-use invoke subgraph inlining config disabled, captures a
+        # model with a compiled nested region annotated inside an annotated parent, using export
+        # (the non-export path creates no subgraph). Checks the ordered groups of nodes sharing
+        # sequence numbers for the top-level graph and both subgraphs, compares the printed graph
+        # with comments ignored, and compares the custom metadata listing.
+        # KNOWN ISSUE: the expected graph text embeds source file line numbers and sequence
+        # numbers in comment lines; line numbers there are already stale and are ignored only
+        # because comments are ignored in the comparison, so inserted comment lines do not change
+        # the result.
         class Bar(nn.Module):
+            # [CLASS DOC] HELPER: Inner module whose forward is a nested compile region, annotated
+            # with the name bar.
             @torch.compiler.nested_compile_region
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Under the bar annotation, takes the sine of the input and
+                # multiplies by one.
                 with fx_traceback.annotate({"mod_name": "bar"}):
                     y = x.sin()
                     return y * 1
 
         class MyMod(nn.Module):
+            # [CLASS DOC] HELPER: Outer module holding the inner annotated module.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the inner module.
                 super().__init__()
                 self.bar = Bar()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Calls the inner module under the my_mod annotation and
+                # returns the result minus one.
                 with fx_traceback.annotate({"mod_name": "my_mod"}):
                     z = self.bar(x)
                 return z - 1
