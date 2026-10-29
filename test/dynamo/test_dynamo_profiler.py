@@ -1,4 +1,7 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests for the dynamo_profiler config option: compiling a function with the option
+# set to a file path must write a pstats-format profile of Dynamo's inlined-function tracing.
+# Defines one TestCase class with two tests; no import-time side effects beyond imports.
 """
 Tests for the Dynamo Profiler functionality.
 
@@ -16,16 +19,25 @@ import torch._dynamo.testing
 
 
 class DynamoProfilerTests(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Dynamo TestCase holding tests that compile small functions under a temporary
+    # dynamo_profiler output path and inspect the resulting pstats file. Stateless.
     def test_function_trace_timing(self):
+        # [FUNCTION DOC] Resets Dynamo, compiles a function that calls nested helpers with the
+        # eager backend while dynamo_profiler points at a temp file, then loads the file with
+        # pstats. Asserts the total call count is positive and that the function names of the
+        # root compiled function and all inlined helpers appear in the stats.
         """Test that inline function timing data is captured during compilation."""
 
         def helper_fn(x):
+            # [FUNCTION DOC] HELPER: Leaf function; doubles the input and adds one.
             return x * 2 + 1
 
         def nested_helper(x):
+            # [FUNCTION DOC] HELPER: Calls the leaf helper twice (second on a doubled input), sums.
             return helper_fn(x) + helper_fn(x * 2)
 
         def main_fn(x):
+            # [FUNCTION DOC] HELPER: Thin wrapper that delegates to the nested helper.
             return nested_helper(x)
 
         torch._dynamo.reset()
@@ -37,6 +49,7 @@ class DynamoProfilerTests(torch._dynamo.test_case.TestCase):
 
                 @torch.compile(backend="eager")
                 def test_fn(x):
+                    # [FUNCTION DOC] HELPER: Compiled root function; returns main_fn applied.
                     return main_fn(x)
 
                 x = torch.randn(10)
@@ -56,12 +69,17 @@ class DynamoProfilerTests(torch._dynamo.test_case.TestCase):
             self.assertIn("test_fn", func_names)  # Root function
 
     def test_pstats_file_loadable(self):
+        # [FUNCTION DOC] Compiles a function that calls one helper with dynamo_profiler set to
+        # a temp file, then checks the file loads in pstats with a positive call count and
+        # that sorting by cumulative time and printing the top five rows works without error.
         """Test that the generated pstats file can be loaded and analyzed."""
 
         def helper_fn(x):
+            # [FUNCTION DOC] HELPER: Leaf function; doubles the input.
             return x * 2
 
         def main_fn(x):
+            # [FUNCTION DOC] HELPER: Thin wrapper that delegates to the leaf helper.
             return helper_fn(x)
 
         torch._dynamo.reset()
@@ -73,6 +91,7 @@ class DynamoProfilerTests(torch._dynamo.test_case.TestCase):
 
                 @torch.compile(backend="eager")
                 def compiled_fn(x):
+                    # [FUNCTION DOC] HELPER: Compiled root function; returns main_fn applied.
                     return main_fn(x)
 
                 x = torch.randn(10)

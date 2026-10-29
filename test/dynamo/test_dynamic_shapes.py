@@ -1,4 +1,10 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Re-runs a fixed list of existing Dynamo test classes (ctx manager, functions, misc,
+# repros, nn modules, export, subgraphs, higher-order ops, aot autograd fallback, sdpa) with
+# dynamic shapes enabled. Import-time side effects: builds one derived class per source class
+# with patched configs, registers each in this module's globals so the runner finds it, wraps
+# three very slow export retracibility tests with slowTest, and stores classes in test_classes.
+# Imports the sibling test modules relatively, falling back to plain imports when run as a script.
 import warnings
 
 from torch._dynamo import config
@@ -38,6 +44,13 @@ test_classes = {}
 
 
 def make_dynamic_cls(cls):
+    # [FUNCTION DOC] Builds a dynamic-shapes variant of the given test class via
+    # make_test_cls_with_patches, named with a DynamicShapes prefix and _dynamic_shapes suffix.
+    # Patches: assume_static_by_default off, specialize_int off, specialize_float on (to keep
+    # op counts stable), and fx translation_validation (only when Z3 is available),
+    # shape-env event recording and version-key validation on. Tests listed in the class's
+    # _expected_failure_dynamic set are marked as expected failures. Registers the new class in
+    # test_classes and in module globals, sets its __module__ to this module, and returns it.
     suffix = "_dynamic_shapes"
 
     cls_prefix = "DynamicShapes"

@@ -1,4 +1,9 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests for the Dynamo config flag enable_dynamo_decompositions. Part one compiles
+# small optimizer-style in-place ops (addcmul_, add_ with alpha, addcdiv_, foreach lerp, foreach
+# pow) with the flag on or off and compares the captured FX graph to expected text. Part two is a
+# device-generic numerics suite comparing compiled results and gradients with eager. Instantiates
+# the device-type test classes into this module's globals at import time.
 
 import unittest
 
@@ -16,6 +21,11 @@ from torch.testing._internal.common_utils import (
 
 
 class TestDynamoDecompositions(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Graph-structure tests: each test compiles a tiny function with the eager
+    # recording backend and fullgraph, under a patched flag value, then asserts the printed graph
+    # matches an expected string. Enabled means decomposed into mul/div, fma prim and copy_ (or
+    # where-based lerp); disabled means the original op is kept. Tests are skipped under cross-ref
+    # mode. Stateless.
     """Tests for enable_dynamo_decompositions config flag.
 
     When enable_dynamo_decompositions=True, certain optimizer ops are decomposed
@@ -25,9 +35,13 @@ class TestDynamoDecompositions(torch._dynamo.test_case.TestCase):
 
     @skipIfCrossRef
     def test_addcmul_inplace_decomposition_enabled(self):
+        # [FUNCTION DOC] With the flag on and a tensor value, checks the graph for in-place
+        # addcmul holds a mul, the fma prim, and a copy_ back into the input, and no addcmul node.
         """With decompositions enabled, addcmul_ should decompose into mul, fma, and copy_."""
 
         def fn(x, tensor1, tensor2, value):
+            # [FUNCTION DOC] HELPER: Compiled body; calls in-place addcmul on x with the given
+            # value.
             return x.addcmul_(tensor1, tensor2, value=value)
 
         eager = EagerAndRecordGraphs()
@@ -60,6 +74,8 @@ class GraphModule(torch.nn.Module):
 
     @skipIfCrossRef
     def test_addcmul_inplace_decomposition_disabled(self):
+        # [FUNCTION DOC] With the flag off and a Python float value, checks the graph keeps the
+        # single original in-place addcmul node.
         """With decompositions disabled, addcmul_ should remain as the original op.
 
         Note: When using a tensor value and decompositions are disabled, there can be
@@ -67,6 +83,7 @@ class GraphModule(torch.nn.Module):
         """
 
         def fn(x, tensor1, tensor2):
+            # [FUNCTION DOC] HELPER: Compiled body; in-place addcmul on x with constant value 0.5.
             return x.addcmul_(tensor1, tensor2, value=0.5)
 
         eager = EagerAndRecordGraphs()
@@ -95,11 +112,14 @@ class GraphModule(torch.nn.Module):
 
     @skipIfCrossRef
     def test_addcmul_inplace_decomposition_disabled_capture_scalar(self):
+        # [FUNCTION DOC] Same as the disabled test but also sets capture_scalar_outputs; checks
+        # the graph still keeps the single original in-place addcmul node with the scalar value.
         """With decompositions disabled and capture_scalar_outputs=True, addcmul_ with
         scalar value should work without graph breaks.
         """
 
         def fn(x, tensor1, tensor2):
+            # [FUNCTION DOC] HELPER: Compiled body; in-place addcmul on x with constant value 0.5.
             return x.addcmul_(tensor1, tensor2, value=0.5)
 
         eager = EagerAndRecordGraphs()
@@ -130,9 +150,12 @@ class GraphModule(torch.nn.Module):
 
     @skipIfCrossRef
     def test_add_inplace_with_alpha_decomposition_enabled(self):
+        # [FUNCTION DOC] With the flag on and a tensor alpha, checks the graph for in-place add
+        # contains the fma prim and a copy_ into x, with no add_ node.
         """With decompositions enabled, add_ with tensor alpha should decompose into fma and copy_."""
 
         def fn(x, other, alpha):
+            # [FUNCTION DOC] HELPER: Compiled body; in-place add of other into x scaled by alpha.
             return x.add_(other, alpha=alpha)
 
         eager = EagerAndRecordGraphs()
@@ -162,6 +185,8 @@ class GraphModule(torch.nn.Module):
 
     @skipIfCrossRef
     def test_add_inplace_with_alpha_decomposition_disabled(self):
+        # [FUNCTION DOC] With the flag off and a Python float alpha, checks the graph keeps the
+        # original in-place add node with the alpha keyword.
         """With decompositions disabled, add_ with alpha should remain as the original op.
 
         Note: When using a tensor alpha and decompositions are disabled, there can be
@@ -169,6 +194,8 @@ class GraphModule(torch.nn.Module):
         """
 
         def fn(x, other):
+            # [FUNCTION DOC] HELPER: Compiled body; in-place add of other into x with constant
+            # alpha 2.0.
             return x.add_(other, alpha=2.0)
 
         eager = EagerAndRecordGraphs()
@@ -195,11 +222,15 @@ class GraphModule(torch.nn.Module):
 
     @skipIfCrossRef
     def test_add_inplace_with_alpha_decomposition_disabled_capture_scalar(self):
+        # [FUNCTION DOC] Flag off plus capture_scalar_outputs on; checks the graph keeps the
+        # original in-place add node with the float alpha.
         """With decompositions disabled and capture_scalar_outputs=True, add_ with
         scalar alpha should work without graph breaks.
         """
 
         def fn(x, other):
+            # [FUNCTION DOC] HELPER: Compiled body; in-place add of other into x with constant
+            # alpha 2.0.
             return x.add_(other, alpha=2.0)
 
         eager = EagerAndRecordGraphs()
@@ -228,12 +259,17 @@ class GraphModule(torch.nn.Module):
 
     @skipIfCrossRef
     def test_addcdiv_inplace_decomposition_enabled(self):
+        # [FUNCTION DOC] With the flag on and a tensor value, checks the graph for in-place
+        # addcdiv has a div, the fma prim, and a copy_ into x. The divisor is shifted by 0.1 to
+        # avoid zeros.
         """With decompositions enabled, addcdiv_ should decompose into div, fma, and copy_.
 
         ATen computes self + value * (t1/t2), nvcc fuses to fma(value, quotient, self).
         """
 
         def fn(x, tensor1, tensor2, value):
+            # [FUNCTION DOC] HELPER: Compiled body; calls in-place addcdiv on x with the given
+            # value.
             return x.addcdiv_(tensor1, tensor2, value=value)
 
         eager = EagerAndRecordGraphs()
@@ -266,6 +302,8 @@ class GraphModule(torch.nn.Module):
 
     @skipIfCrossRef
     def test_addcdiv_inplace_decomposition_disabled(self):
+        # [FUNCTION DOC] With the flag off and a Python float value, checks the graph keeps the
+        # single original in-place addcdiv node.
         """With decompositions disabled, addcdiv_ should remain as the original op.
 
         Note: When using a tensor value and decompositions are disabled, there can be
@@ -273,6 +311,7 @@ class GraphModule(torch.nn.Module):
         """
 
         def fn(x, tensor1, tensor2):
+            # [FUNCTION DOC] HELPER: Compiled body; in-place addcdiv on x with constant value 0.5.
             return x.addcdiv_(tensor1, tensor2, value=0.5)
 
         eager = EagerAndRecordGraphs()
@@ -301,11 +340,14 @@ class GraphModule(torch.nn.Module):
 
     @skipIfCrossRef
     def test_addcdiv_inplace_decomposition_disabled_capture_scalar(self):
+        # [FUNCTION DOC] Flag off plus capture_scalar_outputs on; checks the graph keeps the
+        # original in-place addcdiv node with the float value.
         """With decompositions disabled and capture_scalar_outputs=True, addcdiv_ with
         scalar value should work without graph breaks.
         """
 
         def fn(x, tensor1, tensor2):
+            # [FUNCTION DOC] HELPER: Compiled body; in-place addcdiv on x with constant value 0.5.
             return x.addcdiv_(tensor1, tensor2, value=0.5)
 
         eager = EagerAndRecordGraphs()
@@ -336,9 +378,15 @@ class GraphModule(torch.nn.Module):
 
     @skipIfCrossRef
     def test_foreach_lerp_inplace_decomposition_enabled(self):
+        # [FUNCTION DOC] With the flag on and a tensor weight, checks the foreach lerp graph is
+        # rewritten: foreach sub, an absolute-value threshold mask at 0.5, where selections,
+        # foreach addcmul, and copy_ into each input tensor. The test renames a node called ge to
+        # mask so output is the same on all Python versions.
         """With decompositions enabled, foreach_lerp_ with tensor weight should decompose."""
 
         def fn(tensors, end_tensors, weight):
+            # [FUNCTION DOC] HELPER: Compiled body; in-place foreach lerp with a tensor weight;
+            # returns tensors.
             torch._foreach_lerp_(tensors, end_tensors, weight)
             return tensors
 
@@ -390,9 +438,13 @@ class GraphModule(torch.nn.Module):
 
     @skipIfCrossRef
     def test_foreach_lerp_inplace_python_scalar_preserves_op(self):
+        # [FUNCTION DOC] With the flag on but a Python float weight, checks the graph keeps the
+        # native in-place foreach lerp op unchanged.
         """Python scalar weights should use the native foreach_lerp_ op."""
 
         def fn(tensors, end_tensors):
+            # [FUNCTION DOC] HELPER: Compiled body; in-place foreach lerp with constant weight
+            # 0.1.
             torch._foreach_lerp_(tensors, end_tensors, 0.1)
             return tensors
 
@@ -422,6 +474,8 @@ class GraphModule(torch.nn.Module):
 
     @skipIfCrossRef
     def test_foreach_lerp_inplace_decomposition_disabled(self):
+        # [FUNCTION DOC] With the flag off and a float weight, checks the graph keeps the native
+        # in-place foreach lerp op.
         """With decompositions disabled, foreach_lerp_ should remain as the original op.
 
         Note: When using a tensor weight and decompositions are disabled, there can be
@@ -429,6 +483,8 @@ class GraphModule(torch.nn.Module):
         """
 
         def fn(tensors, end_tensors):
+            # [FUNCTION DOC] HELPER: Compiled body; in-place foreach lerp with constant weight
+            # 0.5.
             torch._foreach_lerp_(tensors, end_tensors, 0.5)
             return tensors
 
@@ -458,11 +514,15 @@ class GraphModule(torch.nn.Module):
 
     @skipIfCrossRef
     def test_foreach_lerp_inplace_decomposition_disabled_capture_scalar(self):
+        # [FUNCTION DOC] Flag off plus capture_scalar_outputs on; checks the graph keeps the
+        # native in-place foreach lerp op with the float weight.
         """With decompositions disabled and capture_scalar_outputs=True, foreach_lerp_
         with scalar weight should work without graph breaks.
         """
 
         def fn(tensors, end_tensors):
+            # [FUNCTION DOC] HELPER: Compiled body; in-place foreach lerp with constant weight
+            # 0.5.
             torch._foreach_lerp_(tensors, end_tensors, 0.5)
             return tensors
 
@@ -493,9 +553,14 @@ class GraphModule(torch.nn.Module):
         )
 
     def test_foreach_pow_scalar_decomposition_enabled(self):
+        # [FUNCTION DOC] With the flag on and a 0-dim tensor base, checks foreach pow is compiled
+        # with the scalar tensor repeated once per exponent tensor, and the results are returned
+        # as items.
         """With decompositions enabled, foreach_pow with scalar base should decompose."""
 
         def fn(scalar, exps):
+            # [FUNCTION DOC] HELPER: Compiled body; foreach pow of a scalar base over a list of
+            # exponents.
             return torch._foreach_pow(scalar, exps)
 
         eager = EagerAndRecordGraphs()
@@ -524,6 +589,8 @@ class GraphModule(torch.nn.Module):
         )
 
     def test_foreach_pow_scalar_decomposition_disabled(self):
+        # [FUNCTION DOC] With the flag off and a Python float base, checks the graph keeps the
+        # foreach pow op taking the float directly with the exponent list.
         """With decompositions disabled, foreach_pow with scalar base should remain.
 
         Note: When using a tensor scalar and decompositions are disabled, there can be
@@ -531,6 +598,8 @@ class GraphModule(torch.nn.Module):
         """
 
         def fn(exps):
+            # [FUNCTION DOC] HELPER: Compiled body; foreach pow with constant base 2.0 over the
+            # exponents.
             return torch._foreach_pow(2.0, exps)
 
         eager = EagerAndRecordGraphs()
@@ -557,11 +626,15 @@ class GraphModule(torch.nn.Module):
         )
 
     def test_foreach_pow_scalar_decomposition_disabled_capture_scalar(self):
+        # [FUNCTION DOC] Flag off plus capture_scalar_outputs on; checks the graph keeps the
+        # foreach pow op with the float base.
         """With decompositions disabled and capture_scalar_outputs=True, foreach_pow
         with scalar base should work without graph breaks.
         """
 
         def fn(exps):
+            # [FUNCTION DOC] HELPER: Compiled body; foreach pow with constant base 2.0 over the
+            # exponents.
             return torch._foreach_pow(2.0, exps)
 
         eager = EagerAndRecordGraphs()
@@ -592,11 +665,17 @@ class GraphModule(torch.nn.Module):
 
 @xfailIfNoAcceleratorTriton
 class TestDynamoDecompositionsNumerics(TestCase):
+    # [CLASS DOC] Device-generic numerics tests, marked expected-failure when no accelerator with
+    # Triton exists. Each test enables decompositions, compiles a function (default backend or
+    # several backends) and compares output or gradients against eager. Stateless.
     """Numerics tests for dynamo decompositions across devices."""
 
     @skipIfCrossRef
     @torch._dynamo.config.patch(enable_dynamo_decompositions=True)
     def test_addcmul_tensor_value_numerics(self, device):
+        # [FUNCTION DOC] Compiles in-place addcmul with a tensor value using the default backend
+        # and checks the result equals eager. Tolerance is the default, not bitwise (CPU inductor
+        # may split fma).
         """Compiled addcmul_ with tensor value matches eager.
 
         Not bitwise on CPU: inductor may decompose fma to mul+add rather
@@ -604,6 +683,7 @@ class TestDynamoDecompositionsNumerics(TestCase):
         """
 
         def fn(x, tensor1, tensor2, value):
+            # [FUNCTION DOC] HELPER: Compiled body; in-place addcmul on x with the given value.
             return x.addcmul_(tensor1, tensor2, value=value)
 
         x = torch.randn(4, device=device)
@@ -618,14 +698,21 @@ class TestDynamoDecompositionsNumerics(TestCase):
     @skipIfCrossRef
     @torch._dynamo.config.patch(enable_dynamo_decompositions=True)
     def test_addcmul__backward(self, device):
+        # [FUNCTION DOC] Compares gradients of x, tensor1, tensor2 from eager against compiled
+        # runs under the aot_eager, eager and inductor backends (Dynamo reset before each) for a
+        # clone-then-addcmul function with scalar value 0.5, summed to a scalar.
         """Compiled addcmul_ backward matches eager backward."""
 
         def fn(x, tensor1, tensor2):
+            # [FUNCTION DOC] HELPER: Clones x, applies in-place addcmul with value 0.5, returns
+            # the sum.
             y = x.clone()
             y.addcmul_(tensor1, tensor2, value=0.5)
             return y.sum()
 
         def make_inputs():
+            # [FUNCTION DOC] HELPER: Seeds the RNG with 42 and returns three random 4x4 tensors
+            # that require grad.
             torch.manual_seed(42)
             x = torch.randn(4, 4, device=device, requires_grad=True)
             tensor1 = torch.randn(4, 4, device=device, requires_grad=True)
@@ -647,14 +734,21 @@ class TestDynamoDecompositionsNumerics(TestCase):
     @skipIfCrossRef
     @torch._dynamo.config.patch(enable_dynamo_decompositions=True)
     def test_addcmul__tensor_value_backward(self, device):
+        # [FUNCTION DOC] Same gradient comparison as the scalar-value backward test but the value
+        # is a 0-dim tensor that does not require grad; gradients of the three tensors are
+        # compared.
         """Compiled addcmul_ backward with tensor value matches eager backward."""
 
         def fn(x, tensor1, tensor2, value):
+            # [FUNCTION DOC] HELPER: Clones x, applies in-place addcmul with the tensor value,
+            # returns the sum.
             y = x.clone()
             y.addcmul_(tensor1, tensor2, value=value)
             return y.sum()
 
         def make_inputs():
+            # [FUNCTION DOC] HELPER: Seeds the RNG with 42 and returns three grad-requiring 4x4
+            # tensors and value.
             torch.manual_seed(42)
             x = torch.randn(4, 4, device=device, requires_grad=True)
             tensor1 = torch.randn(4, 4, device=device, requires_grad=True)
@@ -679,9 +773,12 @@ class TestDynamoDecompositionsNumerics(TestCase):
     @skipIfCrossRef
     @torch._dynamo.config.patch(enable_dynamo_decompositions=True)
     def test_addcdiv_tensor_value_numerics(self, device):
+        # [FUNCTION DOC] Compiles in-place addcdiv with a tensor value (divisor shifted by 0.1)
+        # and checks the result equals eager with the default tolerance.
         """Compiled addcdiv_ with tensor value matches eager."""
 
         def fn(x, tensor1, tensor2, value):
+            # [FUNCTION DOC] HELPER: Compiled body; in-place addcdiv on x with the given value.
             return x.addcdiv_(tensor1, tensor2, value=value)
 
         x = torch.randn(4, device=device)
@@ -696,14 +793,20 @@ class TestDynamoDecompositionsNumerics(TestCase):
     @skipIfCrossRef
     @torch._dynamo.config.patch(enable_dynamo_decompositions=True)
     def test_addcdiv__backward(self, device):
+        # [FUNCTION DOC] Gradient comparison of eager versus aot_eager, eager and inductor
+        # compiled runs for a clone-then-addcdiv function with scalar value 0.5.
         """Compiled addcdiv_ backward matches eager backward."""
 
         def fn(x, tensor1, tensor2):
+            # [FUNCTION DOC] HELPER: Clones x, applies in-place addcdiv with value 0.5, returns
+            # the sum.
             y = x.clone()
             y.addcdiv_(tensor1, tensor2, value=0.5)
             return y.sum()
 
         def make_inputs():
+            # [FUNCTION DOC] HELPER: Seeds the RNG with 42 and returns three random 4x4 tensors
+            # that require grad.
             torch.manual_seed(42)
             x = torch.randn(4, 4, device=device, requires_grad=True)
             tensor1 = torch.randn(4, 4, device=device, requires_grad=True)
@@ -725,14 +828,19 @@ class TestDynamoDecompositionsNumerics(TestCase):
     @skipIfCrossRef
     @torch._dynamo.config.patch(enable_dynamo_decompositions=True)
     def test_addcdiv__tensor_value_backward(self, device):
+        # [FUNCTION DOC] Same gradient comparison for addcdiv but with a 0-dim tensor value.
         """Compiled addcdiv_ backward with tensor value matches eager backward."""
 
         def fn(x, tensor1, tensor2, value):
+            # [FUNCTION DOC] HELPER: Clones x, applies in-place addcdiv with the tensor value,
+            # returns the sum.
             y = x.clone()
             y.addcdiv_(tensor1, tensor2, value=value)
             return y.sum()
 
         def make_inputs():
+            # [FUNCTION DOC] HELPER: Seeds the RNG with 42 and returns three grad-requiring 4x4
+            # tensors and value.
             torch.manual_seed(42)
             x = torch.randn(4, 4, device=device, requires_grad=True)
             tensor1 = torch.randn(4, 4, device=device, requires_grad=True)
@@ -757,9 +865,12 @@ class TestDynamoDecompositionsNumerics(TestCase):
     @skipIfCrossRef
     @torch._dynamo.config.patch(enable_dynamo_decompositions=True)
     def test_add_tensor_alpha_numerics(self, device):
+        # [FUNCTION DOC] Compiles in-place add with a tensor alpha and requires the result to
+        # equal eager exactly (zero absolute and relative tolerance).
         """Compiled add_ with tensor alpha matches eager."""
 
         def fn(x, other, alpha):
+            # [FUNCTION DOC] HELPER: Compiled body; in-place add of other into x scaled by alpha.
             return x.add_(other, alpha=alpha)
 
         x = torch.randn(4, device=device)
@@ -773,6 +884,9 @@ class TestDynamoDecompositionsNumerics(TestCase):
     @skipIfCrossRef
     @torch._dynamo.config.patch(enable_dynamo_decompositions=True)
     def test_add_tensor_alpha_fma_matches_aten(self, device):
+        # [FUNCTION DOC] Seeds the RNG, uses 64x64 inputs and a tensor alpha of 2.3; requires the
+        # compiled in-place add to match eager exactly, i.e. the decomposition must use fma as
+        # ATen does.
         """ATen add_ with tensor alpha extracts the scalar and uses
         fma(other, alpha, self). Our decomposition must use fma to match."""
         torch.manual_seed(42)
@@ -781,6 +895,7 @@ class TestDynamoDecompositionsNumerics(TestCase):
         alpha = torch.tensor(2.3, device=device)
 
         def fn(x, other, alpha):
+            # [FUNCTION DOC] HELPER: Compiled body; in-place add of other into x scaled by alpha.
             return x.add_(other, alpha=alpha)
 
         expected = fn(x.clone(), other, alpha)
@@ -790,6 +905,9 @@ class TestDynamoDecompositionsNumerics(TestCase):
     @skipIfCrossRef
     @torch._dynamo.config.patch(enable_dynamo_decompositions=True)
     def test_addcmul_value_1_fma_matches_aten(self, device):
+        # [FUNCTION DOC] Seeds the RNG; requires compiled in-place addcmul with constant value 1
+        # to match eager with the default tolerance, since the decomposition uses a fused
+        # multiply-add.
         """ATen addcmul_ with value=1 uses hardware fma(t1, t2, self).
 
         Our decomposition uses inductor_prims.fma for this case. Without fma,
@@ -801,6 +919,8 @@ class TestDynamoDecompositionsNumerics(TestCase):
         t1 = torch.randn(64, 64, device=device)
 
         def fn(x, t1):
+            # [FUNCTION DOC] HELPER: Compiled body; in-place addcmul of t1 with itself into x,
+            # value 1.
             # value=1 is a constant, triggers fma path in decomposition
             return x.addcmul_(t1, t1, value=1)
 
@@ -811,6 +931,8 @@ class TestDynamoDecompositionsNumerics(TestCase):
     @skipIfCrossRef
     @torch._dynamo.config.patch(enable_dynamo_decompositions=True)
     def test_addcmul_scalar_value(self, device):
+        # [FUNCTION DOC] Seeds the RNG; compiled in-place addcmul with constant value 0.5 on 64x64
+        # inputs must match eager with default tolerance.
         """Compiled addcmul_ with scalar value matches eager."""
         torch.manual_seed(42)
         x = torch.randn(64, 64, device=device)
@@ -818,6 +940,7 @@ class TestDynamoDecompositionsNumerics(TestCase):
         t2 = torch.randn(64, 64, device=device)
 
         def fn(x, t1, t2):
+            # [FUNCTION DOC] HELPER: Compiled body; in-place addcmul with constant value 0.5.
             return x.addcmul_(t1, t2, value=0.5)
 
         expected = fn(x.clone(), t1, t2)
@@ -827,6 +950,8 @@ class TestDynamoDecompositionsNumerics(TestCase):
     @skipIfCrossRef
     @torch._dynamo.config.patch(enable_dynamo_decompositions=True)
     def test_addcmul_tensor_value(self, device):
+        # [FUNCTION DOC] Seeds the RNG; compiled in-place addcmul with a 0-dim tensor value on
+        # 64x64 inputs must match eager with default tolerance.
         """Compiled addcmul_ with tensor value matches eager."""
         torch.manual_seed(42)
         x = torch.randn(64, 64, device=device)
@@ -835,6 +960,8 @@ class TestDynamoDecompositionsNumerics(TestCase):
         value = torch.tensor(0.5, device=device)
 
         def fn(x, t1, t2, value):
+            # [FUNCTION DOC] HELPER: Compiled body; in-place addcmul on x with the given tensor
+            # value.
             return x.addcmul_(t1, t2, value=value)
 
         expected = fn(x.clone(), t1, t2, value)
@@ -845,6 +972,8 @@ class TestDynamoDecompositionsNumerics(TestCase):
     @torch._dynamo.config.patch(enable_dynamo_decompositions=True)
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_addcdiv_scalar_value_cuda(self, device):
+        # [FUNCTION DOC] Skipped unless CUDA is available. Seeds the RNG; compiled in-place
+        # addcdiv with constant value -0.01 must match eager with default tolerance (not bitwise).
         """Compiled addcdiv_ with scalar value matches eager on CUDA.
 
         Not bitwise: ATen inlines the division into fma(alpha, t1/t2, input)
@@ -856,6 +985,7 @@ class TestDynamoDecompositionsNumerics(TestCase):
         t2 = torch.randn(64, 64, device=device) + 0.1
 
         def fn(x, t1, t2):
+            # [FUNCTION DOC] HELPER: Compiled body; in-place addcdiv with constant value -0.01.
             return x.addcdiv_(t1, t2, value=-0.01)
 
         expected = fn(x.clone(), t1, t2)
@@ -866,6 +996,9 @@ class TestDynamoDecompositionsNumerics(TestCase):
     @torch._dynamo.config.patch(enable_dynamo_decompositions=True)
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_addcdiv_tensor_value_cuda(self, device):
+        # [FUNCTION DOC] Skipped unless CUDA is available. Seeds the RNG; compiled in-place
+        # addcdiv with a 0-dim tensor value of -0.01 must match eager with default tolerance (not
+        # bitwise).
         """Compiled addcdiv_ with tensor value matches eager on CUDA.
 
         Not bitwise: ATen inlines the division into fma(alpha, t1/t2, input)
@@ -878,6 +1011,7 @@ class TestDynamoDecompositionsNumerics(TestCase):
         value = torch.tensor(-0.01, device=device)
 
         def fn(x, t1, t2, value):
+            # [FUNCTION DOC] HELPER: Compiled body; in-place addcdiv on x with the tensor value.
             return x.addcdiv_(t1, t2, value=value)
 
         expected = fn(x.clone(), t1, t2, value)
@@ -887,12 +1021,15 @@ class TestDynamoDecompositionsNumerics(TestCase):
     @skipIfCrossRef
     @torch._dynamo.config.patch(enable_dynamo_decompositions=True)
     def test_add_scalar_alpha(self, device):
+        # [FUNCTION DOC] Seeds the RNG; compiled in-place add with constant alpha 2.3 on 64x64
+        # inputs must match eager with default tolerance.
         """Compiled add_ with scalar alpha matches eager."""
         torch.manual_seed(42)
         x = torch.randn(64, 64, device=device)
         other = torch.randn(64, 64, device=device)
 
         def fn(x, other):
+            # [FUNCTION DOC] HELPER: Compiled body; in-place add with constant alpha 2.3.
             return x.add_(other, alpha=2.3)
 
         expected = fn(x.clone(), other)

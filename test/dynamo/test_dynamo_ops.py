@@ -1,4 +1,8 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Device-generic OpInfo-driven tests of operator behavior under Dynamo tracing.
+# Currently checks that in-place op variants propagate requires_grad metadata the same way in
+# eager and compiled runs. Defines a set of op names to skip for that test and, at import time,
+# instantiates per-device test classes into this module's globals.
 
 """
 Tests for operator behavior during Dynamo tracing.
@@ -51,6 +55,8 @@ test_inplace_ops_propagate_requires_grad_metadata_skips = {
 
 
 class TestTensorMetaProp(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Dynamo TestCase (made device-generic by instantiate_device_type_tests) that
+    # checks tensor metadata propagation of in-place ops during tracing. Stateless.
     """
     Test that inplace operations correctly propagate tensor metadata during Dynamo tracing.
     """
@@ -58,6 +64,14 @@ class TestTensorMetaProp(torch._dynamo.test_case.TestCase):
     @ops([op for op in op_db if op.get_inplace() is not None])
     @skipOps(test_inplace_ops_propagate_requires_grad_metadata_skips)
     def test_inplace_ops_propagate_requires_grad_metadata(self, device, dtype, op):
+        # [FUNCTION DOC] For each sample input of an op with an in-place variant (skipping
+        # broadcast or empty inputs, scatter with a reduce kwarg, and samples without a
+        # floating-point tensor arg), applies the in-place op to a no-grad tensor with a
+        # requires-grad argument, then feeds the result to a custom autograd function whose
+        # backward returns a constant. Runs eagerly and compiled (eager backend, fullgraph).
+        # Compares requires_grad of the mutated tensor and the gradient of the arg; a comptime
+        # hook also checks fake-tensor and variable requires_grad, grad_fn presence and dtype.
+        # Resets Dynamo between samples. Skips the test if no in-place variant exists.
         """
         Test that inplace ops from OpInfo propagate requires_grad correctly.
 
@@ -77,11 +91,15 @@ class TestTensorMetaProp(torch._dynamo.test_case.TestCase):
         class CustomAutograd(torch.autograd.Function):
             @staticmethod
             def forward(ctx, x):
+                # [FUNCTION DOC] HELPER: Saves the input for backward and returns it doubled.
                 ctx.save_for_backward(x)
                 return x * 2
 
             @staticmethod
             def backward(ctx, grad_out):
+                # [FUNCTION DOC] HELPER: Ignores the incoming gradient and returns a tensor
+                # filled with 123 shaped like the saved input, so any use of a different
+                # (composite) autograd path is detectable.
                 # Return an obviously wrong gradient (fixed value) to detect
                 # when composite implicit autograd is used vs custom backward
                 (x,) = ctx.saved_tensors
@@ -134,6 +152,9 @@ class TestTensorMetaProp(torch._dynamo.test_case.TestCase):
 
             # Test 1: Verify that the metadata is propagated after the inplace op in compile time
             def compile_time_check(ctx: ComptimeContext) -> None:
+                # [FUNCTION DOC] HELPER: Comptime callback run during tracing. Reads local x,
+                # asserts its fake tensor and tracked variable both require grad, the variable
+                # has a grad_fn, and both keep the dtype under test.
                 x = ctx.get_local("x")
                 x_fake = x.as_fake()
                 # Check requires_grad is propagated
@@ -146,6 +167,9 @@ class TestTensorMetaProp(torch._dynamo.test_case.TestCase):
                 self.assertEqual(x._ComptimeVar__variable.dtype, dtype)
 
             def fn(x, *args):
+                # [FUNCTION DOC] HELPER: Compiled body; applies the in-place op with the
+                # sample kwargs, runs the comptime check, and returns the custom autograd
+                # function applied to the mutated tensor.
                 inplace_op(x, *args, **sample.kwargs)
                 comptime(compile_time_check)
                 r = CustomAutograd.apply(x)
