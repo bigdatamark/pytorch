@@ -1,4 +1,16 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Shared distributed test suite for torch.distributed backends (gloo, nccl, mpi, ucc
+# and plugins). Defines small fixture models (Net, LargeNet, BatchNormNet, ...), helper decorators
+# and tensor builders, a file based inter-process Barrier, the TestDistBackend multi-process base
+# class, the large DistributedTest._DistTestBase mixin that holds the actual collective,
+# point-to-point, profiler, DDP, hook and model-averaging tests, and some single-process unit
+# tests for the DDP bucket capacity configuration (TestBucketCapacityConfig and related classes).
+# Import-time side effects: reads the required BACKEND environment variable (raises KeyError when
+# unset) and the optional INIT_METHOD (default env://); probes for torchvision; imports msvcrt on
+# Windows or fcntl elsewhere; creates a default instance f of Foo with an extra attribute; at the
+# end of the module registers the parametrized tests of the mixin class.
+# The multi-process mixin is not run directly; backend specific test files subclass it together
+# with TestDistBackend and are launched with WORLD_SIZE, TEMP_DIR and BACKEND set.
 
 import copy
 import itertools
@@ -115,24 +127,43 @@ else:
 
 
 class NetWithBuffers(nn.Module):
+    # [CLASS DOC] HELPER: Tiny test model with two bias-free linear layers (10 to 10, then 10 to
+    # 1) and a registered buffer of shape 1 by 2, used to check DDP buffer broadcasting.
+    # The forward pass mutates the buffer in place (adds one) on every call.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Builds the two linear layers and registers a random 1 by 2 float
+        # buffer named buffer.
         super().__init__()
         self.a = nn.Linear(10, 10, bias=False)
         self.b = nn.Linear(10, 1, bias=False)
         self.register_buffer("buffer", torch.randn(1, 2))
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Adds one to the buffer in place (side effect), then returns the
+        # output of the second linear layer applied to the first layer's output for input x.
         self.buffer.add_(1)
         return self.b(self.a(x))
 
 
 class Foo:
+    # [CLASS DOC] HELPER: Plain picklable object with a single attribute x (a tensor or int), used
+    # as an element of object-collective test payloads. Defines value-based equality over all
+    # instance attributes.
     def __init__(self, x):
+        # [FUNCTION DOC] HELPER: Stores x (a tensor or an int) as the attribute x.
         # Can be tensor or int
         self.x = x
 
     def __eq__(self, other):
+        # [FUNCTION DOC] HELPER: Value equality. Compares every attribute of this object with the
+        # same-named attribute of other (tensors via an exact equality check, others via normal
+        # equality) and returns True only if all match.
+        # KNOWN ISSUE: assumes other has the same attributes and has a dict of attributes; a
+        # missing attribute raises KeyError and a non-Foo other raises AttributeError instead of
+        # returning False. Attributes present only on other are ignored.
         def eq(value, other):
+            # [FUNCTION DOC] HELPER: Returns exact tensor equality when value is a tensor,
+            # otherwise ordinary equality with other.
             if isinstance(value, torch.Tensor):
                 return torch.equal(value, other)
             return value == other
@@ -151,6 +182,10 @@ f.bar = 1
 # Defer instantiation until the seed is set so that randn() returns the same
 # values in all processes.
 def create_collectives_object_test_list():
+    # [FUNCTION DOC] HELPER: Returns a fresh list of picklable heterogeneous objects (nested dict,
+    # the module-level Foo instance f, a Foo wrapping a random 3 by 3 tensor, a string, a nested
+    # list) for object collective tests.
+    # Must be called after the seed is set so the random tensor is identical in all processes.
     return [
         {"key1": 3, "key2": 4, "key3": {"nested": True}},
         f,
@@ -194,6 +229,10 @@ TestNamedTupleInput_0 = namedtuple("NamedTuple", EXPECTED_FIELDS)
 
 
 class TestNamedTupleInput_1(NamedTuple):
+    # [CLASS DOC] HELPER: NamedTuple with tensor fields a and b, used to test DDP handling of
+    # NamedTuple inputs and outputs.
+    # KNOWN ISSUE: the annotations use the torch.tensor factory function rather than the Tensor
+    # type; harmless at runtime.
     a: torch.tensor
     b: torch.tensor
 
@@ -207,6 +246,10 @@ INIT_METHOD = os.getenv("INIT_METHOD", "env://")
 
 
 def get_profiling_event(event_name, profiler, dedup_gpu_user_annotation=False):
+    # [FUNCTION DOC] HELPER: Returns the list of profiler events whose name starts or ends with
+    # event_name. Takes events from a torch profiler (events()) or from an autograd profiler
+    # (function_events), depending on profiler type. When dedup_gpu_user_annotation is true,
+    # events whose device type is CUDA or XPU are excluded.
     event_list = (
         profiler.events()
         if isinstance(profiler, torch.profiler.profile)
@@ -226,6 +269,9 @@ def get_profiling_event(event_name, profiler, dedup_gpu_user_annotation=False):
 
 
 def get_profiler_nccl_meta(prof):
+    # [FUNCTION DOC] HELPER: Exports the profiler's chrome trace to a temporary json file, prints
+    # the file path, loads the trace and returns the list of events named record_param_comms (the
+    # operator that carries collective metadata). Side effects: file I/O and stdout.
     """Torch profiler includes nccl metadata in an inserted operator called "record_param_comms"
     We will need to test metadata obtained from profiler here"""
     with TemporaryFileName(mode="w+t", suffix=".json") as trace_file:
@@ -259,6 +305,9 @@ ddp_suggest_debug_mode_str = (
 
 
 class DDPUnevenTestInput(NamedTuple):
+    # [CLASS DOC] HELPER: Immutable record describing one uneven-inputs DDP scenario: a name, the
+    # model, input tensor (or tuple), sync_interval, whether to throw on early termination, an
+    # optional communication hook and its state.
     name: str
     model: nn.Module
     inp: torch.Tensor | tuple
@@ -269,18 +318,26 @@ class DDPUnevenTestInput(NamedTuple):
 
 
 class _FC2(nn.Module):
+    # [CLASS DOC] HELPER: Small submodule containing one linear layer (10 to 50) whose bias does
+    # not require grad.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates the linear layer and disables gradient for its bias.
         super().__init__()
         self.fc = nn.Linear(10, 50, bias=True)
         self.fc.bias.requires_grad = False
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies the linear layer to x and returns the result.
         x = self.fc(x)
         return x
 
 
 class Net(nn.Module):
+    # [CLASS DOC] HELPER: Fixture model for DDP tests: three bias-free linears (2 to 10, 10 to 50
+    # via _FC2, 50 to 4), a ReLU, and a frozen long-integer parameter no_grad_param. Forward
+    # returns a softmax over dim 1.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Builds the layers, ReLU, and the non-trainable integer parameter.
         super().__init__()
         self.fc1 = nn.Linear(2, 10, bias=False)
         self.fc2 = _FC2()
@@ -291,6 +348,8 @@ class Net(nn.Module):
         )
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Runs relu(fc1), relu(fc2), then fc3 and returns the softmax over
+        # dimension 1. The frozen parameter is not used.
         x = self.relu(self.fc1(x))
         x = self.relu(self.fc2(x))
         x = self.fc3(x)
@@ -298,34 +357,49 @@ class Net(nn.Module):
 
 
 class LargeNet(nn.Module):
+    # [CLASS DOC] HELPER: Large fixture model with two bias-free linears (1000 to 2000 and 2000 to
+    # 500), used to exercise multi-bucket DDP.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Builds the two linear layers.
         super().__init__()
         self.fc1 = nn.Linear(1000, 2000, bias=False)
         self.fc2 = nn.Linear(2000, 500, bias=False)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies fc1 then fc2 to x and returns the result.
         x = self.fc1(x)
         x = self.fc2(x)
         return x
 
 
 class Task(nn.Module):
+    # [CLASS DOC] HELPER: Minimal module holding a 2 by 2 parameter p initialized to ones; forward
+    # adds x to it.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates the ones parameter p.
         super().__init__()
         self.p = nn.Parameter(torch.ones(2, 2))
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Returns the parameter plus x.
         return self.p + x
 
 
 class BatchNormNet(nn.Module):
+    # [CLASS DOC] HELPER: Fixture model with a linear layer, a BatchNorm1d over 4 channels
+    # (optionally affine) and a second linear layer, to test DDP with buffers and sync batch norm.
+    # Forward reshapes activations to batch by 4 by 10 for the norm and returns a softmax.
     def __init__(self, affine=True):
+        # [FUNCTION DOC] HELPER: Builds the layers; affine controls whether batch norm has
+        # learnable scale and shift.
         super().__init__()
         self.fc1 = nn.Linear(2, 40, bias=False)
         self.bn = nn.BatchNorm1d(4, affine=affine)
         self.fc2 = nn.Linear(40, 4, bias=False)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Linear, reshape to (batch, 4, 10), batch norm, reshape to (batch,
+        # 40), linear, then softmax over dim 1. Returns the probabilities.
         x = torch.reshape(self.fc1(x), (-1, 4, 10))
         x = self.bn(x)
         x = torch.reshape(x, (-1, 40))
@@ -334,24 +408,36 @@ class BatchNormNet(nn.Module):
 
 
 class UnusedParamTwoLinLayerNet(nn.Module):
+    # [CLASS DOC] HELPER: Fixture with three bias-free linears of which only a and b are used in
+    # forward; c is deliberately unused so that DDP sees an unused parameter.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Builds linears a (10 to 10), b (10 to 10) and the never-used c (5
+        # to 5).
         super().__init__()
         self.a = nn.Linear(10, 10, bias=False)
         self.b = nn.Linear(10, 10, bias=False)
         self.c = nn.Linear(5, 5, bias=False)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Returns the pair of outputs of a and b applied to x; c is
+        # not touched.
         a = self.a(x)
         b = self.b(x)
         return (a, b)
 
 
 class DictOutputModule(nn.Module):
+    # [CLASS DOC] HELPER: Wraps UnusedParamTwoLinLayerNet and returns a dictionary output
+    # with predictions (the pair of outputs) and loss (sum of both outputs), to test DDP
+    # with dict outputs.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates the wrapped inner module.
         super().__init__()
         self.module = UnusedParamTwoLinLayerNet()
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Runs the inner module, computes the loss as the sum of both
+        # outputs and returns a dictionary with keys predictions and loss.
         predictions = self.module(x)
         loss = (predictions[0] + predictions[1]).sum()
         return {
@@ -361,24 +447,34 @@ class DictOutputModule(nn.Module):
 
 
 class TwoLinLayerNet(nn.Module):
+    # [CLASS DOC] HELPER: Fixture with two bias-free linears (10 to 10 and 10 to 1) that both are
+    # used; forward returns both outputs as a tuple.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Builds linears a and b.
         super().__init__()
         self.a = nn.Linear(10, 10, bias=False)
         self.b = nn.Linear(10, 1, bias=False)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Returns the tuple of a(x) and b(x).
         a = self.a(x)
         b = self.b(x)
         return (a, b)
 
 
 class EmbeddingNetDifferentParams(nn.Module):
+    # [CLASS DOC] HELPER: Embedding followed by a linear layer whose sizes depend on rank:
+    # embedding dimension is 500 if diff_num_params is set or rank is 0, else 50. When
+    # diff_num_params is set, an extra linear lin2 is added, so parameter counts differ. Used to
+    # test DDP shape and parameter verification errors across ranks.
     """
     A module containing an embedding with different dimension or different # of
     parameters depending on the rank.
     """
 
     def __init__(self, rank, diff_num_params=False):
+        # [FUNCTION DOC] HELPER: Builds the embedding (10 entries), the linear layer on the
+        # embedding dimension, and optionally lin2.
         super().__init__()
         embedding_dim = 500 if diff_num_params or rank == 0 else 50
         self.embedding = nn.Embedding(num_embeddings=10, embedding_dim=embedding_dim)
@@ -387,17 +483,24 @@ class EmbeddingNetDifferentParams(nn.Module):
             self.lin2 = nn.Linear(1, 1, bias=False)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Embeds x and returns the linear layer's output on it. lin2 is
+        # never used.
         x = self.embedding(x)
         return self.lin(x)
 
 
 class ControlFlowToyModel(nn.Module):
+    # [CLASS DOC] HELPER: Fixture model with data-dependent control flow: the second linear layer
+    # is used only when the input exactly equals a 20 by 10 tensor of ones.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Builds the two bias-free linears.
         super().__init__()
         self.lin1 = nn.Linear(10, 10, bias=False)
         self.lin2 = nn.Linear(10, 10, bias=False)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: If x equals a 20 by 10 ones tensor on its device, returns
+        # lin2(relu(lin1(x))), otherwise relu(lin1(x)).
         # Second layer is used dependent on input x.
         use_second_layer = torch.equal(x, torch.ones(20, 10, device=x.device))
         if use_second_layer:
@@ -422,7 +525,13 @@ CUSTOM_PG_TIMEOUT = {
 
 
 def require_backend_is_available(backends):
+    # [FUNCTION DOC] HELPER: Decorator factory. Returns a skip decorator (pass in sandcastle) if
+    # the module-level BACKEND is not in the given backends or that backend is not available;
+    # otherwise returns an identity decorator. Reads BACKEND from module state; no raising.
     def check(backend):
+        # [FUNCTION DOC] HELPER: Maps a backend to its availability check (gloo, nccl, mpi, ucc
+        # via dist.is_*_available; plugin backends registered in DistTestCases are assumed
+        # available; anything else is unavailable). Returns a bool.
         if backend == dist.Backend.GLOO:
             return dist.is_gloo_available()
         if backend == dist.Backend.NCCL:
@@ -448,6 +557,9 @@ def require_backend_is_available(backends):
 
 
 def require_world_size(world_size):
+    # [FUNCTION DOC] HELPER: Decorator factory. Reads WORLD_SIZE from the environment
+    # (KeyError if unset) and returns a skip decorator if it is smaller than world_size, else
+    # an identity decorator.
     if int(os.environ["WORLD_SIZE"]) < world_size:
         return skip_but_pass_in_sandcastle(
             f"Test requires world size of {world_size:d}"
@@ -456,6 +568,8 @@ def require_world_size(world_size):
 
 
 def require_exact_world_size(world_size):
+    # [FUNCTION DOC] HELPER: Like require_world_size but skips unless WORLD_SIZE equals
+    # world_size exactly.
     if int(os.environ["WORLD_SIZE"]) != world_size:
         return skip_but_pass_in_sandcastle(
             f"Test requires an exact world size of {world_size:d}"
@@ -465,6 +579,9 @@ def require_exact_world_size(world_size):
 
 @contextmanager
 def _lock():
+    # [FUNCTION DOC] HELPER: Context manager that holds an exclusive cross-process lock on a file
+    # named lockfile in TEMP_DIR (flock on POSIX, msvcrt locking on Windows) for the duration of
+    # the with block, and releases and closes it afterwards. Raises KeyError if TEMP_DIR is unset.
     TEMP_DIR = os.environ["TEMP_DIR"]
     lockfile = os.path.join(TEMP_DIR, "lockfile")
     with open(lockfile, "w") as lf:
@@ -485,6 +602,11 @@ def _lock():
 
 @contextmanager
 def _rank_temp_file():
+    # [FUNCTION DOC] HELPER: Context manager that yields the path of a temporary file shared by
+    # all ranks. Rank 0 creates the file and broadcasts the name through an object broadcast;
+    # after the block rank 0 deletes the file. Requires an initialized process group.
+    # KNOWN ISSUE: other ranks do not synchronize before rank 0 deletes the file, so a slow rank
+    # may still be using it.
     if dist.get_rank() == 0:
         fd, name = tempfile.mkstemp()
         os.close(fd)
@@ -501,6 +623,9 @@ def _rank_temp_file():
 
 
 def _build_tensor(size, value=None, dtype=torch.float, device_id=None):
+    # [FUNCTION DOC] HELPER: Builds a size by size by size tensor filled with value (default:
+    # size), of the given dtype; if device_id is given it is moved to that CUDA device. Returns
+    # the tensor.
     if value is None:
         value = size
     if device_id is None:
@@ -510,16 +635,22 @@ def _build_tensor(size, value=None, dtype=torch.float, device_id=None):
 
 
 def _build_multidim_tensor(dim, dim_size, value=None, dtype=torch.float):
+    # [FUNCTION DOC] HELPER: Builds a tensor with dim dimensions each of length dim_size, filled
+    # with value (default: dim) in the given dtype, and returns it on CPU.
     if value is None:
         value = dim
     return torch.empty(size=[dim_size for _ in range(dim)], dtype=dtype).fill_(value)
 
 
 def _create_autograd_profiler():
+    # [FUNCTION DOC] HELPER: Returns a new autograd profiler (profile with shape
+    # recording enabled).
     return torch.autograd.profiler.profile(record_shapes=True)
 
 
 def _create_torch_profiler():
+    # [FUNCTION DOC] HELPER: Returns a new torch.profiler profile that records CPU activity with
+    # shape recording enabled.
     return torch.profiler.profile(
         activities=[
             torch.profiler.ProfilerActivity.CPU,
@@ -529,10 +660,17 @@ def _create_torch_profiler():
 
 
 class Barrier:
+    # [CLASS DOC] HELPER: File based cross-process barrier used by the tests that must not depend
+    # on the process group under test. Class attribute barrier_id counts barrier calls in this
+    # process; each process writes its id into a file named after its pid in the barrier directory
+    # under TEMP_DIR.
     barrier_id = 0
 
     @classmethod
     def init(cls):
+        # [FUNCTION DOC] HELPER: Resets barrier_id to zero and deletes every file in the barrier
+        # directory under TEMP_DIR. Side effect: file deletion; raises if TEMP_DIR is unset or the
+        # directory is missing.
         cls.barrier_id = 0
         barrier_dir = os.path.join(os.environ["TEMP_DIR"], "barrier")
         for f_name in os.listdir(barrier_dir):
@@ -540,6 +678,12 @@ class Barrier:
 
     @classmethod
     def sync(cls, wait_for=None, timeout=10):
+        # [FUNCTION DOC] HELPER: Increments barrier_id, writes it to this process's file under a
+        # lock, then polls the barrier directory until wait_for processes (default: world size)
+        # have a file with an id at least as large. Sleeps 0.1 seconds between polls. Raises
+        # RuntimeError with message barrier timeout after timeout seconds.
+        # KNOWN ISSUE: counts every file in the directory, so stale files from other pids would be
+        # counted; relies on init clearing them.
         if wait_for is None:
             wait_for = dist.get_world_size()
         cls.barrier_id += 1
@@ -568,13 +712,25 @@ class Barrier:
 
 
 class TestDistBackend(MultiProcessTestCase):
+    # [CLASS DOC] Base class for the backend tests: a MultiProcessTestCase that spawns
+    # WORLD_SIZE processes, each of which initializes the default process group for BACKEND via
+    # a file store, runs the chosen test and tears the group down. Per-test process group
+    # timeouts come from CUSTOM_PG_TIMEOUT; the group is not destroyed automatically on exit
+    # because tests do it explicitly.
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] HELPER: Class-level setup that sets MASTER_ADDR from the internal test
+        # config in the environment (leaving MASTER_PORT unset so a free port is chosen), then
+        # runs the parent setup.
         os.environ["MASTER_ADDR"] = str(MASTER_ADDR)
         # Not setting MASTER_PORT and get a random free port
         super().setUpClass()
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Per-test setup. Runs the parent setup, creates the temp
+        # directories, resets the Barrier, and registers test_ddp_has_finalized as a test
+        # whose return code is not checked (it is expected to crash a process through NCCL
+        # async error handling).
         super().setUp()
         # initialize temp directories
         initialize_temp_directories()
@@ -585,20 +741,34 @@ class TestDistBackend(MultiProcessTestCase):
         self.skip_return_code_checks = [self.test_ddp_has_finalized.__wrapped__]
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Per-test teardown. Removes the temp directories, then runs the
+        # parent teardown.
         cleanup_temp_dir()
         super().tearDown()
 
     @property
     def init_method(self):
+        # [FUNCTION DOC] HELPER: Property returning the file:// init method string built from
+        # FILE_SCHEMA and the per-test file name.
         return f"{FILE_SCHEMA}{self.file_name}"
 
     @property
     def destroy_pg_upon_exit(self) -> bool:
+        # [FUNCTION DOC] HELPER: Property overriding the base class: always False, so the process
+        # group is not destroyed automatically at process exit.
         # Overriding base test class: do not auto destroy PG upon exit.
         return False
 
     @classmethod
     def _run(cls, rank, test_name, file_name, pipe, **kwargs):
+        # [FUNCTION DOC] HELPER: Entry point executed in each spawned process. Exits with skip
+        # codes if the backend is nccl without CUDA, or if fewer GPUs than the world size
+        # exist; initializes the default process group with the per-test timeout (a
+        # RuntimeError mentioning recompile maps to a backend unavailable skip, other errors
+        # are re-raised); barriers, runs the test body, barriers again, destroys the group and
+        # exits with status 0.
+        # KNOWN ISSUE: the GPU count check is applied for every backend whenever CUDA is
+        # available, so even gloo tests are skipped on hosts with fewer GPUs than ranks.
         if BACKEND == "nccl" and not torch.cuda.is_available():
             sys.exit(TEST_SKIPS["no_cuda"].exit_code)
         self = cls(test_name)
@@ -639,15 +809,29 @@ class TestDistBackend(MultiProcessTestCase):
     # run these tests under other various world_sizes.
     @property
     def world_size(self):
+        # [FUNCTION DOC] HELPER: Property returning the WORLD_SIZE environment variable as a
+        # string (callers convert it to int).
+        # KNOWN ISSUE: the base class expects an integer, but a string is returned.
         return os.environ["WORLD_SIZE"]
 
 
 class DistributedTest:
+    # [CLASS DOC] Namespace container: its only member _DistTestBase holds all backend-independent
+    # distributed test cases; concrete backend test modules mix it in with TestDistBackend.
     class _DistTestBase:
+        # [CLASS DOC] The mixin of distributed tests. It assumes the host class provides rank, a
+        # process group initialized for the module-level BACKEND, and the Barrier helper; it
+        # covers rank and group management, point-to-point and collective ops, profiling,
+        # subgroups, DDP behavior, communication hooks and model averaging.
         def _barrier(self, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Synchronizes all processes with the file based Barrier,
+            # forwarding arguments such as wait_for and timeout.
             Barrier.sync(*args, **kwargs)
 
         def _init_group_test(self, **kwargs):
+            # [FUNCTION DOC] HELPER: Creates a new group of ranks 1 and 2 (with extra keyword
+            # arguments passed to group creation). Returns a tuple of (member list, group handle,
+            # rank); non-members get an empty list and no group.
             group = [1, 2]
             group_id = dist.new_group(group, **kwargs)
             rank = dist.get_rank()
@@ -657,18 +841,27 @@ class DistributedTest:
             return (group, group_id, rank)
 
         def _init_full_group_test(self, **kwargs):
+            # [FUNCTION DOC] HELPER: Creates a group that spans all ranks, passing keyword
+            # arguments to group creation. Returns the tuple of (list of all ranks, group handle,
+            # own rank).
             group = list(range(dist.get_world_size()))
             group_id = dist.new_group(**kwargs)
             rank = dist.get_rank()
             return (group, group_id, rank)
 
         def _init_global_test(self):
+            # [FUNCTION DOC] HELPER: Returns the tuple of (list of all ranks, the default world
+            # group, own rank) without creating a new group.
             group = list(range(dist.get_world_size()))
             group_id = dist.group.WORLD
             rank = dist.get_rank()
             return (group, group_id, rank)
 
         def _verify_buffers_equal(self, m1, m2):
+            # [FUNCTION DOC] HELPER: Asserts that buffers of two DDP-wrapped models are
+            # equal by name, and then that, for every buffer pair, all ranks hold identical
+            # values (using all-gather on each buffer). Raises assertion errors on mismatch;
+            # performs collectives.
             # verify buffers across models
             m1_buf_dict = dict(m1.module.named_buffers())
             for name, buf in m2.module.named_buffers():
@@ -692,6 +885,11 @@ class DistributedTest:
                     self.assertEqual(b, buf2)
 
         def _sanity_check_profiler_nccl_meta(self, nccl_meta_events):
+            # [FUNCTION DOC] HELPER: Checks the profiler records that carry collective metadata:
+            # each needs a collective name and dtype; for every record except waits it also checks
+            # that the process group description is default_pg, the ranks are non-empty, and
+            # message sizes, group size and rank start and stride are non-negative. Returns a
+            # mapping from collective name to the list of argument dictionaries.
             """Torch profiler includes nccl metadata in an inserted operator called "record_param_comms"
             We test for basic fields in this profiler event that correspond to the nccl communication
             collectives"""
@@ -719,11 +917,16 @@ class DistributedTest:
             return per_coll_meta
 
         def test_dump_DDP_relevant_env_vars(self):
+            # [FUNCTION DOC] Checks that the DDP environment variable dump prints env lines for
+            # relevant variables (master address and port, world size, NCCL variables) and none
+            # for unrelated ones.
             with captured_output() as (out, _):
                 _dump_DDP_relevant_env_vars()
                 lines = out.getvalue().splitlines()
 
             def format_line(var):
+                # [FUNCTION DOC] HELPER: Formats the expected environment dump line for a variable
+                # as name equals its value, or N/A when unset.
                 return f"env:{var}={os.environ.get(var, 'N/A')}"
 
             # Check relevant env vars
@@ -749,6 +952,9 @@ class DistributedTest:
 
         # GET RANK
         def test_get_rank(self):
+            # [FUNCTION DOC] Each process writes its rank into its own file in a shared test
+            # directory; after a barrier, every process verifies that the number of distinct ranks
+            # equals the world size, and rank 0 removes the files.
             test_dir = os.path.join(os.environ["TEMP_DIR"], "test_dir")
             pid = str(os.getpid())
             num_processes = dist.get_world_size()
@@ -772,6 +978,9 @@ class DistributedTest:
             self._barrier()
 
         def test_get_backend(self):
+            # [FUNCTION DOC] Checks that get_backend returns the lower-case backend name for the
+            # default group and for a subgroup the rank belongs to, and raises ValueError (Invalid
+            # process group specified) for a subgroup the rank is not part of.
             if dist.get_world_size() > 2:
                 group = [1, 2]
             else:
@@ -788,6 +997,8 @@ class DistributedTest:
                     dist.get_backend(group_id)
 
         def test_Backend_enum_class(self):
+            # [FUNCTION DOC] Checks that constructing the Backend enum accepts upper or lower case
+            # names and raises ValueError for None, an integer, or a list.
             # test parsing
             backend = BACKEND.lower()
             self.assertEqual(dist.Backend(BACKEND.upper()), backend)
@@ -801,6 +1012,8 @@ class DistributedTest:
 
         # Test destroy
         def test_destroy_group(self):
+            # [FUNCTION DOC] Creates a two-rank subgroup, synchronizes, and destroys it (should
+            # not raise).
             if dist.get_world_size() > 2:
                 group = [1, 2]
             else:
@@ -811,6 +1024,8 @@ class DistributedTest:
 
         # Test get rank and size of group
         def test_get_rank_size_group(self):
+            # [FUNCTION DOC] Checks world size and rank for a subgroup: members see size 2 and a
+            # rank in the range; non-members see -1 for both.
             if dist.get_world_size() > 2:
                 group = [1, 2]
             else:
@@ -825,17 +1040,23 @@ class DistributedTest:
 
         # Test destroy full groups
         def test_destroy_full_group(self):
+            # [FUNCTION DOC] Creates a full-world group, synchronizes and destroys it.
             _, group_id, _ = self._init_full_group_test()
             self._barrier()
             dist.destroy_process_group(group_id)
 
         # Test get rank and size of full group
         def test_get_rank_size_full_group(self):
+            # [FUNCTION DOC] Checks that a full-world group reports the same world size and rank
+            # as the default group.
             _, group_id, _ = self._init_full_group_test()
             self.assertEqual(dist.get_world_size(group_id), dist.get_world_size())
             self.assertEqual(dist.get_rank(group_id), dist.get_rank())
 
         def _test_barrier_timeout(self, group_id, timeout):
+            # [FUNCTION DOC] HELPER: Verifies barrier timeout behavior. Only local rank 0 calls
+            # the barrier, which must raise (a monitored barrier failure in detail debug mode,
+            # otherwise a timed out or closed error) no earlier than the timeout.
             local_rank = dist.get_rank(group_id)
 
             # Only execute barrier on rank == 0, causing it to timeout
@@ -865,6 +1086,9 @@ class DistributedTest:
             "reinitialization has proven racy.",
         )
         def test_barrier_timeout_global(self):
+            # [FUNCTION DOC] Gloo only, file:// init only. Destroys the default group,
+            # re-initializes it with a one second timeout, and checks that a barrier called only
+            # on rank 0 times out as expected.
             dist.destroy_process_group()
 
             # Explicitly pass world size to the barrier because we've
@@ -888,6 +1112,8 @@ class DistributedTest:
             BACKEND != "gloo", "Only gloo backend supports timeouts"
         )
         def test_barrier_timeout_group(self):
+            # [FUNCTION DOC] Gloo only, skipped on macOS and small worlds. Creates a subgroup with
+            # a five second timeout and checks that a barrier timeout occurs for members.
             timeout = timedelta(seconds=5)
             _, group_id, _ = self._init_group_test(timeout=timeout)
             if group_id is not None:
@@ -897,6 +1123,8 @@ class DistributedTest:
             BACKEND != "gloo", "Only gloo backend supports timeouts"
         )
         def test_barrier_timeout_full_group(self):
+            # [FUNCTION DOC] Gloo only. Creates a full group with a one second timeout and checks
+            # barrier timeout behavior on it.
             timeout = timedelta(seconds=1)
             _, group_id, _ = self._init_full_group_test(timeout=timeout)
             if group_id is not None:
@@ -907,6 +1135,10 @@ class DistributedTest:
             BACKEND != "gloo", "Only gloo backend supports timeouts"
         )
         def test_barrier_timeout_arg(self):
+            # [FUNCTION DOC] Gloo only, skipped on Linux (tracked issue). Creates a group with a
+            # 300 second default timeout; rank 0 calls barrier with a 1 millisecond per-call
+            # timeout and expects a RuntimeError saying it timed out waiting 1ms, then the group
+            # is destroyed.
             """Test that the timeout argument to barrier() overrides PG default.
 
             Create a PG with a large default timeout, then have only rank 0
@@ -929,6 +1161,10 @@ class DistributedTest:
         @require_world_size(4)
         @skip_if_lt_x_gpu(2)
         def test_new_subgroups(self):
+            # [FUNCTION DOC] Needs 4 ranks and 2 GPUs, subgroup-capable backend, skipped on Linux
+            # (tracked issue). Splits the world into subgroups of size 2 and checks the current
+            # subgroup has size 2, there are world_size over 2 subgroups, and this rank is in its
+            # subgroup; then destroys all subgroups.
             subgroup_size = 2
             cur_subgroup, subgroups = dist.new_subgroups(subgroup_size)
 
@@ -946,6 +1182,10 @@ class DistributedTest:
         )
         @require_exact_world_size(4)
         def test_new_subgroups_with_group_param(self):
+            # [FUNCTION DOC] Needs exactly 4 ranks. Builds subgroups [0,2] and [1,3] by
+            # enumeration, then splits the current subgroup into groups of size 1 and checks
+            # there are 2 sub-subgroups, the current one has size 1 and contains this rank;
+            # destroys everything.
             # Initialize global test environment
             self._init_global_test()
             # Set up GPU devices for each rank
@@ -979,6 +1219,8 @@ class DistributedTest:
         )
         @skip_if_no_gpu
         def test_new_subgroups_group_size_exceeds_world_size(self):
+            # [FUNCTION DOC] Needs a GPU. Checks that requesting subgroups of size 100 raises
+            # ValueError mentioning the size must not exceed the world size.
             with self.assertRaisesRegex(ValueError, "must not exceed"):
                 dist.new_subgroups(100)
 
@@ -989,6 +1231,8 @@ class DistributedTest:
         @require_world_size(4)
         @skip_if_lt_x_gpu(4)
         def test_new_subgroups_world_size_not_divisible_by_group_size(self):
+            # [FUNCTION DOC] Needs 4 ranks and 4 GPUs. Checks that a group size of 3 raises
+            # ValueError stating the world size must be divisible by the group size.
             expected_msg = f"The world size ({dist.get_world_size()}) must be divisible by 'group_size=3'"
             with self.assertRaisesRegex(
                 ValueError,
@@ -1004,6 +1248,12 @@ class DistributedTest:
         @require_world_size(4)
         @skip_if_lt_x_gpu(4)
         def test_new_subgroups_by_enumeration(self):
+            # [FUNCTION DOC] Needs 4 ranks and 4 GPUs, skipped on Linux (tracked issue). Creates
+            # subgroups [0,2] and [1,3] by enumeration; ranks whose device index is 4 or more must
+            # get no current subgroup, others must get a size 2 subgroup equal to the matching
+            # entry in the returned list. Destroys the subgroups.
+            # KNOWN ISSUE: the branch tests the GPU device index rather than the rank, which only
+            # works because ranks map to GPUs in order.
             _group, _group_id, rank = self._init_global_test()
             rank_to_GPU = init_multigpu_helper(dist.get_world_size(), BACKEND)
             device_id = rank_to_GPU[rank][0]
@@ -1030,6 +1280,9 @@ class DistributedTest:
         @require_world_size(4)
         @skip_if_lt_x_gpu(4)
         def test_new_subgroups_by_enumeration_input_rank_exceeds_world_size(self):
+            # [FUNCTION DOC] Needs 4 ranks and 4 GPUs. Checks that enumerating a subgroup
+            # containing a rank equal to the world size raises ValueError (Rank N is out
+            # of range).
             _group, group_id, _rank = self._init_global_test()
             init_multigpu_helper(dist.get_world_size(), BACKEND)
             world_size = get_world_size(group_id)
@@ -1048,6 +1301,8 @@ class DistributedTest:
         )
         @skip_if_no_gpu
         def test_new_subgroups_by_enumeration_negative_input_rank(self):
+            # [FUNCTION DOC] Needs a GPU. Checks that negative ranks in the enumeration raise
+            # ValueError (Rank -N is out of range).
             self._init_global_test()
 
             with self.assertRaisesRegex(
@@ -1065,6 +1320,8 @@ class DistributedTest:
         @require_world_size(4)
         @skip_if_lt_x_gpu(4)
         def test_new_subgroups_overlap_not_allowed(self):
+            # [FUNCTION DOC] Needs 4 ranks and 4 GPUs. Checks that a rank listed in two subgroups
+            # raises ValueError (Rank 1 has appeared in both subgroups).
             with self.assertRaisesRegex(
                 ValueError, "Rank 1 has appeared in both subgroup"
             ):
@@ -1078,6 +1335,10 @@ class DistributedTest:
         )
         @skip_if_lt_x_gpu(2)
         def test_average_parameters(self):
+            # [FUNCTION DOC] Needs 2 GPUs. Builds a small CUDA model and checks that
+            # average_parameters with the default group leaves all-ones parameters unchanged, then
+            # with an nccl subgroup of ranks 0 and 1 sets members' parameters to the mean (0.5)
+            # while non-members keep their rank value.
             rank = dist.get_rank()
             rank_to_GPU = init_multigpu_helper(dist.get_world_size(), BACKEND)
             device_id = rank_to_GPU[rank][0]
@@ -1119,6 +1380,11 @@ class DistributedTest:
         )
         @skip_if_lt_x_gpu(2)
         def test_periodic_model_averager(self):
+            # [FUNCTION DOC] Needs 2 GPUs. For several warmup values (12 to 15) and a period of 4,
+            # runs 20 steps of PeriodicModelAverager on a one-parameter CUDA model whose values
+            # equal the rank; after each step resets parameters, and checks that averaging (to the
+            # mean of ranks) happens only at steps at or after warmup that are multiples of the
+            # period past warmup, and otherwise values stay unchanged.
             rank = dist.get_rank()
             world_size = dist.get_world_size()
             rank_to_GPU = init_multigpu_helper(world_size, BACKEND)
@@ -1150,6 +1416,12 @@ class DistributedTest:
 
         @skip_if_lt_x_gpu(2)
         def test_periodic_model_averager_param_group(self):
+            # [FUNCTION DOC] Needs 2 GPUs. Same schedule check as the periodic averager test, but
+            # the averager is given optimizer parameter groups instead of a parameter iterator and
+            # gradients are set to the rank.
+            # KNOWN ISSUE: assertions compare the single parameter captured before the loop
+            # rather than the loop variable, which is equivalent only because the model has
+            # one parameter.
             rank = dist.get_rank()
             world_size = dist.get_world_size()
             rank_to_GPU = init_multigpu_helper(world_size, BACKEND)
@@ -1201,6 +1473,11 @@ class DistributedTest:
         def test_1_level_hierarchical_model_averager_equivalent_to_periodic_model_averager(
             self,
         ):
+            # [FUNCTION DOC] Needs 2 GPUs. Intended to show a one-level hierarchical averager
+            # behaves like the periodic averager.
+            # KNOWN ISSUE: the hierarchical averager is created and then immediately overwritten
+            # by a PeriodicModelAverager, so the hierarchical code path is never exercised; the
+            # test only re-runs the periodic check.
             rank = dist.get_rank()
             world_size = dist.get_world_size()
             rank_to_GPU = init_multigpu_helper(world_size, BACKEND)
@@ -1244,6 +1521,13 @@ class DistributedTest:
         @require_exact_world_size(4)
         @skip_if_lt_x_gpu(4)
         def test_3_level_hierarchical_model_averager(self):
+            # [FUNCTION DOC] Needs exactly 4 ranks and 4 GPUs. Builds a hierarchical averager
+            # with warmup 10, periods 2 (groups of 2), 4 (groups of 4) and 8 (global). Checks
+            # the process group count and the subgroup ranks, then over 25 steps checks the
+            # expected averaging (global at steps 16 and 24, subgroup of 4 at steps 12 and 20,
+            # subgroup of 2 at steps 10, 14, 18, 22, none otherwise), with only the highest
+            # level applied on conflicts.
+            # KNOWN ISSUE: comments describe a subgroup of size 3 whereas the code uses size 4.
             rank = dist.get_rank()
             world_size = dist.get_world_size()
             rank_to_GPU = init_multigpu_helper(world_size, BACKEND)
@@ -1332,6 +1616,10 @@ class DistributedTest:
             "Coalescing manager currently tests with NCCL only; internal test flaky",
         )
         def test_coalescing_manager(self):
+            # [FUNCTION DOC] NCCL only, needs a GPU, skipped in fbcode and sandcastle. Under the
+            # coalescing manager (synchronous), all-reduces two small CUDA tensors; compares the
+            # results with one all-reduce on a tensor of the combined size. Synchronizes before
+            # and after.
             self._barrier()
             rank = dist.get_rank()
             world_size = dist.get_world_size()
@@ -1366,6 +1654,9 @@ class DistributedTest:
             "Coalescing manager currently tests with NCCL only; internal test flaky",
         )
         def test_coalescing_manager_async(self):
+            # [FUNCTION DOC] NCCL only, needs a GPU. Same as the synchronous coalescing test
+            # but with the manager in async mode, waiting on the returned handle before
+            # comparing results.
             self._barrier()
             rank = dist.get_rank()
             world_size = dist.get_world_size()
@@ -1399,6 +1690,12 @@ class DistributedTest:
         @skip_but_pass_in_sandcastle_if(BACKEND != "nccl", "NCCL Batch Send Recv Only")
         @requires_nccl_version((2, 7, 0), "Need NCCL 2.7+ for send/recv")
         def test_batch_isend_irecv_nccl(self):
+            # [FUNCTION DOC] NCCL with version 2.7 or newer. Under both blocking wait settings,
+            # each rank builds a batch of irecv and isend operations with every rank (including
+            # itself) and runs them with batch_isend_irecv; waits for all requests and checks that
+            # received tensors hold the sender's rank values.
+            # KNOWN ISSUE: the operation list is not cleared between the two blocking wait
+            # iterations, so the second iteration re-submits the first iteration's operations too.
             self._barrier()
             rank = dist.get_rank()
             world_size = dist.get_world_size()
@@ -1439,6 +1736,9 @@ class DistributedTest:
         @skip_but_pass_in_sandcastle_if(BACKEND != "nccl", "NCCL Batch Send Recv Only")
         @requires_nccl_version((2, 7, 0), "Need NCCL 2.7+ for send/recv")
         def test_batch_isend_irecv_ring_exchange_nccl(self):
+            # [FUNCTION DOC] NCCL 2.7 or newer. Each rank sends to the next rank and receives from
+            # the previous rank in a ring using one batch call and waits for completion.
+            # KNOWN ISSUE: the received tensor is never checked.
             self._barrier()
             rank = dist.get_rank()
             world_size = dist.get_world_size()
@@ -1462,6 +1762,8 @@ class DistributedTest:
         @skip_but_pass_in_sandcastle_if(BACKEND != "nccl", "NCCL Batch Send Recv Only")
         @requires_nccl_version((2, 7, 0), "Need NCCL 2.7+ for send/recv")
         def test_batch_isend_irecv_self_nccl(self):
+            # [FUNCTION DOC] NCCL 2.7 or newer. Rank 0 sends a tensor to itself in a batch with a
+            # matching receive and waits; other ranks only take part in barriers.
             self._barrier()
             # Ensure the process group has been fully initialized (needed by
             # the first sub-group batch_isend_irecv call)
@@ -1490,6 +1792,9 @@ class DistributedTest:
         @skip_but_pass_in_sandcastle_if(BACKEND != "nccl", "NCCL Batch Send Recv Only")
         @requires_nccl_version((2, 7, 0), "Need NCCL 2.7+ for send/recv")
         def test_batch_isend_irecv_no_rank_zero_nccl(self):
+            # [FUNCTION DOC] NCCL 2.7 or newer, needs a bigger world. Ranks 1 and 2
+            # exchange tensors with each other through a batch call that excludes rank 0;
+            # others only barrier.
             self._barrier()
             # Ensure the process group has been fully initialized (needed by
             # the first sub-group batch_isend_irecv call)
@@ -1522,6 +1827,8 @@ class DistributedTest:
         # GLOO Batch SEND RECV CPU
         @skip_but_pass_in_sandcastle_if(BACKEND != "gloo", "GLOO Batch Send Recv CPU")
         def test_batch_isend_irecv_gloo(self):
+            # [FUNCTION DOC] Gloo only. Every rank batches a receive from and a send to every
+            # other rank on CPU tensors, waits for all requests, and synchronizes.
             self._barrier()
             rank = dist.get_rank()
             p2p_op_list = []
@@ -1545,6 +1852,8 @@ class DistributedTest:
         # GLOO Batch SEND RECV CPU with provided tags
         @skip_but_pass_in_sandcastle_if(BACKEND != "gloo", "GLOO Batch Send Recv CPU")
         def test_batch_isend_irecv_gloo_tags(self):
+            # [FUNCTION DOC] Gloo only. Same as the plain gloo batch test but each operation
+            # carries a tag (receive tag is the source rank, send tag is own rank).
             self._barrier()
             rank = dist.get_rank()
             p2p_op_list = []
@@ -1569,6 +1878,9 @@ class DistributedTest:
         @skip_but_pass_in_sandcastle_if(BACKEND != "nccl", "NCCL Batch Send Recv Only")
         @requires_nccl_version((2, 7, 0), "Need NCCL 2.7+ for send/recv")
         def test_batch_isend_irecv_op_err(self):
+            # [FUNCTION DOC] NCCL 2.7 or newer. On rank 0 checks that creating a P2POp with
+            # an operator other than send or receive and submitting it raises ValueError
+            # (Invalid op).
             self._barrier()
             rank = dist.get_rank()
             if rank == 0:
@@ -1583,6 +1895,8 @@ class DistributedTest:
         @skip_but_pass_in_sandcastle_if(BACKEND != "nccl", "NCCL Batch Send Recv Only")
         @requires_nccl_version((2, 7, 0), "Need NCCL 2.7+ for send/recv")
         def test_batch_isend_irecv_op_list_err(self):
+            # [FUNCTION DOC] NCCL 2.7 or newer. On rank 0 checks that submitting a list of
+            # non-P2POp items raises ValueError (Invalid p2p_op_list).
             self._barrier()
             rank = dist.get_rank()
             if rank == 0:
@@ -1593,6 +1907,9 @@ class DistributedTest:
         @skip_but_pass_in_sandcastle_if(BACKEND != "nccl", "NCCL Batch Send Recv Only")
         @requires_nccl_version((2, 7, 0), "Need NCCL 2.7+ for send/recv")
         def test_batch_isend_irecv_mixed_backend_err(self):
+            # [FUNCTION DOC] NCCL 2.7 or newer. On rank 0 checks that operations bound to a gloo
+            # group and an nccl group in one batch raise ValueError (All ops need to use the
+            # same group).
             self._barrier()
             rank = dist.get_rank()
             init_multigpu_helper(dist.get_world_size(), BACKEND)
@@ -1612,6 +1929,12 @@ class DistributedTest:
         @skip_but_pass_in_sandcastle_if(BACKEND != "nccl", "NCCL Send Recv Only")
         @requires_nccl_version((2, 7, 0), "Need NCCL 2.7+ for send/recv")
         def _test_send_recv_nccl(self, profiler_ctx=None):
+            # [FUNCTION DOC] HELPER: Send/receive check for nccl. Every rank in turn sends its
+            # tensor (size rank+1) to all others, which receive and compare with the expected
+            # values; optionally wrapped in the given profiler context, in which case it checks
+            # that send and recv profiler events exist with the expected shapes.
+            # KNOWN ISSUE: skip decorators on this non-test helper do nothing useful; the expected
+            # tensor is on CPU while the received one is on GPU.
             # TODO: now that nccl send/recv is supported, there does not seem to
             # be a need to have nccl send/recv be tested separately.
             rank = dist.get_rank()
@@ -1661,12 +1984,15 @@ class DistributedTest:
         @skip_but_pass_in_sandcastle_if(BACKEND != "nccl", "NCCL Send Recv Only")
         @requires_nccl_version((2, 7, 0), "Need NCCL 2.7+ for send/recv")
         def test_send_recv_nccl(self):
+            # [FUNCTION DOC] NCCL 2.7 or newer. Runs the nccl send/recv check without profiling.
             self._test_send_recv_nccl()
 
         @skip_if_no_gpu
         @skip_but_pass_in_sandcastle_if(BACKEND != "nccl", "NCCL Send Recv Only")
         @requires_nccl_version((2, 7, 0), "Need NCCL 2.7+ for send/recv")
         def test_send_recv_nccl_autograd_profiler(self):
+            # [FUNCTION DOC] NCCL 2.7 or newer. Runs the nccl send/recv check under an autograd
+            # profiler with shape recording.
             profiler_ctx = torch.autograd.profiler.profile(record_shapes=True)
             self._test_send_recv_nccl(profiler_ctx)
 
@@ -1679,6 +2005,8 @@ class DistributedTest:
             "torch.profiler not enabled for mac/windows: https://github.com/pytorch/pytorch/pull/56124",
         )
         def test_send_recv_nccl_torch_profiler(self):
+            # [FUNCTION DOC] NCCL 2.7 or newer, skipped in fbcode, Mac and Windows. Runs the nccl
+            # send/recv check under a torch profiler with CPU and CUDA activities.
             profiler_ctx = torch.profiler.profile(
                 activities=[
                     torch.profiler.ProfilerActivity.CPU,
@@ -1690,6 +2018,10 @@ class DistributedTest:
 
         # SEND RECV
         def _test_send_recv(self, profiler_ctx):
+            # [FUNCTION DOC] HELPER: Send/receive check for non-nccl backends on CPU. Each rank
+            # sends its tensor to all others and receives from all others, comparing contents;
+            # under a profiler it checks the send and recv events have the counts (world size
+            # minus one), are async, and have expected shapes.
             rank = dist.get_rank()
             send_size = rank + 1
             tensor = _build_tensor(send_size)
@@ -1732,12 +2064,14 @@ class DistributedTest:
             BACKEND == "nccl", "Nccl send/recv tested by test_send_recv_nccl"
         )
         def test_send_recv(self):
+            # [FUNCTION DOC] Not for nccl. Runs the send/recv check without a profiler.
             self._test_send_recv(profiler_ctx=None)
 
         @skip_but_pass_in_sandcastle_if(
             BACKEND == "nccl", "NCCL send/recv tested by test_send_recv_nccl"
         )
         def test_send_recv_autograd_profiler(self):
+            # [FUNCTION DOC] Not for nccl. Runs the send/recv check under the autograd profiler.
             autograd_profiler_ctx = _create_autograd_profiler()
             self._test_send_recv(profiler_ctx=autograd_profiler_ctx)
 
@@ -1750,11 +2084,21 @@ class DistributedTest:
             "torch.profiler not enabled for mac/windows: https://github.com/pytorch/pytorch/pull/56124",
         )
         def test_send_recv_torch_profiler(self):
+            # [FUNCTION DOC] Not for nccl, skipped in fbcode, Mac and Windows. Runs the send/recv
+            # check under the torch profiler and returns the helper's result.
             torch_profiler_ctx = _create_torch_profiler()
             return self._test_send_recv(profiler_ctx=torch_profiler_ctx)
 
         # SEND RECV ANY SOURCE
         def _test_send_recv_any_source(self, profiler_ctx):
+            # [FUNCTION DOC] HELPER: Send/receive from any source check. Each rank receives from
+            # any source twice per other rank (blocking recv and non-blocking irecv, which reports
+            # the source) and verifies the tensor values equal the sender's rank; other ranks
+            # send. Under a profiler it also checks event counts and shapes, and gathers the
+            # observed sender ranks from all processes to verify each rank was received from the
+            # expected number of times.
+            # KNOWN ISSUE: the global sender-frequency check and trailing barrier are inside the
+            # profiler branch, so they only run when profiling.
             rank = dist.get_rank()
             send_recv_size = 10
             tensor = _build_tensor(send_recv_size, value=rank)
@@ -1836,6 +2180,8 @@ class DistributedTest:
             f"{BACKEND} does not support send/recv from any source",
         )
         def test_send_recv_any_source(self):
+            # [FUNCTION DOC] Skipped for backends without any-source receive. Runs the any-source
+            # check without a profiler.
             self._test_send_recv_any_source(profiler_ctx=None)
 
         @skip_but_pass_in_sandcastle_if(
@@ -1843,6 +2189,8 @@ class DistributedTest:
             f"{BACKEND} does not support send/recv from any source",
         )
         def test_send_recv_any_source_autograd_profiler(self):
+            # [FUNCTION DOC] Skipped for backends without any-source receive. Runs the any-source
+            # check under the autograd profiler.
             autograd_profiler_ctx = _create_autograd_profiler()
             self._test_send_recv_any_source(profiler_ctx=autograd_profiler_ctx)
 
@@ -1856,11 +2204,17 @@ class DistributedTest:
             "torch.profiler not enabled for mac/windows: https://github.com/pytorch/pytorch/pull/56124",
         )
         def test_send_recv_any_source_torch_profiler(self):
+            # [FUNCTION DOC] Skipped for backends without any-source receive, in fbcode, Mac and
+            # Windows. Runs the any-source check under the torch profiler and returns its result.
             torch_profiler_ctx = _create_torch_profiler()
             return self._test_send_recv_any_source(profiler_ctx=torch_profiler_ctx)
 
         # SEND RECV WITH TAG
         def _test_send_recv_with_tag(self, profiler_ctx):
+            # [FUNCTION DOC] HELPER: Send/receive with tag check. Each rank sends its rank-valued
+            # tensor to every other rank using its own rank as tag; receivers receive from each
+            # source using the source as tag and check values. Under a profiler it checks the
+            # event counts, async flag, name and shapes.
             rank = dist.get_rank()
             world_size = dist.get_world_size()
             send_recv_size = 10
@@ -1898,12 +2252,15 @@ class DistributedTest:
             BACKEND == "nccl", "NCCL send/recv tested by test_send_recv_nccl"
         )
         def test_send_recv_with_tag(self):
+            # [FUNCTION DOC] Not for nccl. Runs the tagged send/recv check without a profiler.
             self._test_send_recv_with_tag(profiler_ctx=None)
 
         @skip_but_pass_in_sandcastle_if(
             BACKEND == "nccl", "NCCL send/recv tested by test_send_recv_nccl"
         )
         def test_send_recv_with_tag_autograd_profiler(self):
+            # [FUNCTION DOC] Not for nccl. Runs the tagged send/recv check under the autograd
+            # profiler and returns the helper's result.
             autograd_profiler_ctx = _create_autograd_profiler()
             return self._test_send_recv_with_tag(profiler_ctx=autograd_profiler_ctx)
 
@@ -1916,11 +2273,18 @@ class DistributedTest:
             "torch.profiler not enabled for mac/windows: https://github.com/pytorch/pytorch/pull/56124",
         )
         def test_send_recv_with_tag_torch_profiler(self):
+            # [FUNCTION DOC] Not for nccl, skipped in fbcode, Mac and Windows. Runs the tagged
+            # send/recv check under the torch profiler.
             torch_profiler_ctx = _create_torch_profiler()
             return self._test_send_recv_with_tag(profiler_ctx=torch_profiler_ctx)
 
         # ISEND
         def _test_isend(self, profiler_ctx):
+            # [FUNCTION DOC] HELPER: Non-blocking send check. Rank 0 posts an isend of a tensor of
+            # size equal to the destination rank (filled with 10) to every other rank, waits and
+            # checks completion; other ranks receive and compare. Under a profiler, checks send
+            # events on rank 0 (world size minus one) or one recv event elsewhere, with async
+            # flag, name and expected shapes.
             rank = dist.get_rank()
             world_size = dist.get_world_size()
             ctx = profiler_ctx if profiler_ctx is not None else nullcontext()
@@ -1969,12 +2333,14 @@ class DistributedTest:
             BACKEND == "nccl", "Nccl does not support isend"
         )
         def test_isend(self):
+            # [FUNCTION DOC] Not for nccl. Runs the isend check without a profiler.
             self._test_isend(profiler_ctx=None)
 
         @skip_but_pass_in_sandcastle_if(
             BACKEND == "nccl", "Nccl does not support isend"
         )
         def test_isend_autograd_profiler(self):
+            # [FUNCTION DOC] Not for nccl. Runs the isend check under the autograd profiler.
             autograd_profiler_ctx = _create_autograd_profiler()
             self._test_isend(profiler_ctx=autograd_profiler_ctx)
 
@@ -1987,6 +2353,8 @@ class DistributedTest:
             "torch.profiler not enabled for mac/windows: https://github.com/pytorch/pytorch/pull/56124",
         )
         def test_isend_torch_profiler(self):
+            # [FUNCTION DOC] Not for nccl, skipped in fbcode, Mac and Windows. Runs the isend
+            # check under the torch profiler.
             torch_profiler_ctx = _create_torch_profiler()
             self._test_isend(profiler_ctx=torch_profiler_ctx)
 
@@ -1995,6 +2363,9 @@ class DistributedTest:
             BACKEND == "nccl", "Nccl does not support irecv"
         )
         def test_irecv(self):
+            # [FUNCTION DOC] Not for nccl. Rank 0 posts an irecv for each other rank, waits for
+            # each, checks completion and that the data equals the value 10 sent by that rank;
+            # other ranks send. Ends with a barrier.
             rank = dist.get_rank()
             world_size = dist.get_world_size()
 
@@ -2027,6 +2398,13 @@ class DistributedTest:
             rank_to_GPU=None,
             with_options=False,
         ):
+            # [FUNCTION DOC] HELPER: Broadcast check over several dtypes (float, double, int8,
+            # uint8, int, long, and half only when cuda is set). For every source rank in group,
+            # the source broadcasts a tensor holding a distinct value and the other ranks receive
+            # into a tensor of size src+1 and compare it to the expected one. With with_options
+            # the group object's broadcast method is used with explicit options (root rank set to
+            # src, root tensor 0). Moves tensors to the rank's GPU when cuda is set. Calls go
+            # through call_dist_op for profiling checks, and ends with a barrier.
             for dtype, value, requires_cuda in [
                 (torch.float, -1e-10, False),
                 (torch.double, -1e-100, False),
@@ -2094,6 +2472,7 @@ class DistributedTest:
             BACKEND == "nccl", "Nccl does not support CPU tensors"
         )
         def test_broadcast(self):
+            # [FUNCTION DOC] Not for nccl. Broadcast check on the default group with CPU tensors.
             group, group_id, rank = self._init_global_test()
             self._test_broadcast_helper(group, group_id, rank)
 
@@ -2103,6 +2482,8 @@ class DistributedTest:
         )
         @skip_if_no_gpu
         def test_broadcast_cuda(self):
+            # [FUNCTION DOC] Gloo or nccl, needs a GPU. Broadcast check on the default group with
+            # CUDA tensors on the rank's device.
             group, group_id, rank = self._init_global_test()
             rank_to_GPU = init_multigpu_helper(dist.get_world_size(), BACKEND)
             device_id = rank_to_GPU[rank][0]
@@ -2114,6 +2495,8 @@ class DistributedTest:
             BACKEND == "nccl", "Nccl does not support CPU tensors"
         )
         def test_broadcast_group(self):
+            # [FUNCTION DOC] Not for nccl, needs a larger world. Broadcast check on the
+            # two-rank subgroup.
             group, group_id, rank = self._init_group_test()
             self._test_broadcast_helper(group, group_id, rank)
 
@@ -2121,6 +2504,7 @@ class DistributedTest:
             BACKEND == "nccl", "Nccl does not support CPU tensors"
         )
         def test_broadcast_full_group(self):
+            # [FUNCTION DOC] Not for nccl. Broadcast check on a group spanning all ranks.
             group, group_id, rank = self._init_full_group_test()
             self._test_broadcast_helper(group, group_id, rank)
 
@@ -2130,6 +2514,11 @@ class DistributedTest:
         )
         @skip_if_no_gpu
         def test_nccl_high_priority_stream(self):
+            # [FUNCTION DOC] NCCL only, needs a GPU. Creates a second NCCL process group through
+            # env rendezvous on the next port, with options where the high-priority stream flag is
+            # turned off, and runs the broadcast check with options on it.
+            # KNOWN ISSUE: despite the test name, the high priority flag is set to False, so the
+            # high-priority stream path is not what is exercised.
             group, _, rank = self._init_global_test()
             rank_to_GPU = init_multigpu_helper(dist.get_world_size(), BACKEND)
             device_id = rank_to_GPU[rank][0]
@@ -2160,6 +2549,10 @@ class DistributedTest:
             cuda=False,
             rank_to_GPU=None,
         ):
+            # [FUNCTION DOC] HELPER: Reduce check. For each source rank in group, every rank
+            # builds a tensor of size src+1 with the master value on the source and the worker
+            # value elsewhere, calls reduce to the source with the given op (optionally on CUDA),
+            # and the source checks the result equals expected_value. Ends with a barrier.
             for src in group:
                 tensor = _build_tensor(src + 1).fill_(
                     master_value if rank == src else worker_value
@@ -2189,6 +2582,8 @@ class DistributedTest:
             f"{BACKEND} does not support reduce",
         )
         def test_reduce_sum(self):
+            # [FUNCTION DOC] Not for nccl or backends lacking reduce. Reduce with sum on the
+            # default group (expected master plus worker values times the other ranks).
             group, group_id, rank = self._init_global_test()
             self._test_reduce_helper(
                 group,
@@ -2209,6 +2604,8 @@ class DistributedTest:
         )
         @skip_if_no_gpu
         def test_reduce_sum_cuda(self):
+            # [FUNCTION DOC] NCCL only, needs a GPU. Reduce with sum on CUDA tensors on the
+            # default group.
             group, group_id, rank = self._init_global_test()
             rank_to_GPU = init_multigpu_helper(dist.get_world_size(), BACKEND)
             device_id = rank_to_GPU[rank][0]
@@ -2233,6 +2630,8 @@ class DistributedTest:
             f"{BACKEND} does not support reduce",
         )
         def test_reduce_product(self):
+            # [FUNCTION DOC] Not for nccl or backends lacking reduce. Reduce with product on the
+            # default group.
             group, group_id, rank = self._init_global_test()
             self._test_reduce_helper(
                 group,
@@ -2252,6 +2651,8 @@ class DistributedTest:
             f"{BACKEND} does not support reduce",
         )
         def test_reduce_min(self):
+            # [FUNCTION DOC] Not for nccl or backends lacking reduce. Reduce with min on the
+            # default group.
             group, group_id, rank = self._init_global_test()
             self._test_reduce_helper(
                 group, group_id, rank, dist.ReduceOp.MIN, 1010, 1, 1
@@ -2265,6 +2666,8 @@ class DistributedTest:
             f"{BACKEND} does not support reduce",
         )
         def test_reduce_max(self):
+            # [FUNCTION DOC] Not for nccl or backends lacking reduce. Reduce with max on the
+            # default group.
             group, group_id, rank = self._init_global_test()
             self._test_reduce_helper(
                 group, group_id, rank, dist.ReduceOp.MAX, -1, 10, 10
@@ -2279,6 +2682,8 @@ class DistributedTest:
         )
         @skip_if_small_worldsize
         def test_reduce_group_sum(self):
+            # [FUNCTION DOC] Reduce with sum on the two-rank subgroup (needs a larger world; not
+            # for nccl).
             group, group_id, rank = self._init_group_test()
             self._test_reduce_helper(
                 group,
@@ -2299,6 +2704,8 @@ class DistributedTest:
         )
         @skip_if_small_worldsize
         def test_reduce_group_product(self):
+            # [FUNCTION DOC] Reduce with product on the two-rank subgroup (needs a larger world;
+            # not for nccl).
             group, group_id, rank = self._init_group_test()
             self._test_reduce_helper(
                 group,
@@ -2319,6 +2726,8 @@ class DistributedTest:
         )
         @skip_if_small_worldsize
         def test_reduce_group_min(self):
+            # [FUNCTION DOC] Reduce with min on the two-rank subgroup (needs a larger world; not
+            # for nccl).
             group, group_id, rank = self._init_group_test()
             self._test_reduce_helper(
                 group, group_id, rank, dist.ReduceOp.MIN, 1010, 1, 1
@@ -2333,6 +2742,8 @@ class DistributedTest:
         )
         @skip_if_small_worldsize
         def test_reduce_group_max(self):
+            # [FUNCTION DOC] Reduce with max on the two-rank subgroup (needs a larger world; not
+            # for nccl).
             group, group_id, rank = self._init_group_test()
             self._test_reduce_helper(
                 group, group_id, rank, dist.ReduceOp.MAX, -1, 10, 10
@@ -2346,6 +2757,7 @@ class DistributedTest:
             f"{BACKEND} does not support reduce",
         )
         def test_reduce_full_group_sum(self):
+            # [FUNCTION DOC] Reduce with sum on a group spanning all ranks (not for nccl).
             group, group_id, rank = self._init_full_group_test()
             self._test_reduce_helper(
                 group,
@@ -2365,6 +2777,7 @@ class DistributedTest:
             f"{BACKEND} does not support reduce",
         )
         def test_reduce_full_group_product(self):
+            # [FUNCTION DOC] Reduce with product on a group spanning all ranks (not for nccl).
             group, group_id, rank = self._init_full_group_test()
             self._test_reduce_helper(
                 group,
@@ -2384,6 +2797,7 @@ class DistributedTest:
             f"{BACKEND} does not support reduce",
         )
         def test_reduce_full_group_min(self):
+            # [FUNCTION DOC] Reduce with min on a group spanning all ranks (not for nccl).
             group, group_id, rank = self._init_full_group_test()
             self._test_reduce_helper(
                 group, group_id, rank, dist.ReduceOp.MIN, 1010, 1, 1
@@ -2398,6 +2812,8 @@ class DistributedTest:
             f"{BACKEND} does not support reduce",
         )
         def test_reduce_full_group_max(self):
+            # [FUNCTION DOC] Reduce with max on a group spanning all ranks (not for nccl, skipped
+            # on macOS due to a tracked issue).
             group, group_id, rank = self._init_full_group_test()
             self._test_reduce_helper(
                 group, group_id, rank, dist.ReduceOp.MAX, -1, 10, 10
@@ -2416,6 +2832,9 @@ class DistributedTest:
             cuda=False,
             rank_to_GPU=None,
         ):
+            # [FUNCTION DOC] HELPER: Same as the reduce check but issues two reduce calls back to
+            # back (the second through a secondary callback on a second tensor) and checks that
+            # the source rank sees the expected value in both tensors.
             for src in group:
                 tensors = [
                     _build_tensor(src + 1).fill_(
@@ -2453,6 +2872,7 @@ class DistributedTest:
             f"{BACKEND} does not support reduce",
         )
         def test_reduce_sum_twice(self):
+            # [FUNCTION DOC] Not for nccl. Two consecutive reduce-sum calls on the default group.
             group, group_id, rank = self._init_global_test()
             self._test_reduce_twice_helper(
                 group,
@@ -2473,6 +2893,8 @@ class DistributedTest:
         )
         @skip_if_no_gpu
         def test_reduce_sum_cuda_twice(self):
+            # [FUNCTION DOC] NCCL only, needs a GPU. Two consecutive reduce-sum calls on CUDA
+            # tensors on the default group.
             group, group_id, rank = self._init_global_test()
             rank_to_GPU = init_multigpu_helper(dist.get_world_size(), BACKEND)
             device_id = rank_to_GPU[rank][0]
@@ -2498,6 +2920,13 @@ class DistributedTest:
         )
         @skip_if_no_gpu
         def test_reduce_scatter_v_cuda(self):
+            # [FUNCTION DOC] NCCL only, needs a GPU. Variable-size reduce_scatter: each rank's
+            # output has first dimension rank+1; every rank contributes a tensor split into uneven
+            # chunks, with master value in its own chunk and worker values elsewhere. Runs async
+            # and sync, and checks the output equals the sum across ranks.2544|HELPER: Runs a
+            # single-tensor reduce_scatter (sum) of tensor_in into tensor_out through call_dist_op
+            # without expecting a profiler event, moving both tensors to the rank's GPU when cuda
+            # is set, and returns tensor_out.
             self._barrier()
             group, group_id, rank = self._init_global_test()
             rank_to_GPU = init_multigpu_helper(dist.get_world_size(), BACKEND)
@@ -2544,6 +2973,9 @@ class DistributedTest:
         def _reduce_scatter_tensor_helper(
             self, tensor_out, tensor_in, group_id, rank, cuda=True, rank_to_GPU=None
         ):
+            # [FUNCTION DOC] HELPER: Runs a single-tensor reduce_scatter (sum) of tensor_in into
+            # tensor_out through call_dist_op without expecting a profiler event, moving both
+            # tensors to the rank's GPU when cuda is set, and returns tensor_out.
             if cuda:
                 tensor_in = tensor_in.cuda(rank_to_GPU[rank][0])
                 tensor_out = tensor_out.cuda(rank_to_GPU[rank][0])
@@ -2567,6 +2999,9 @@ class DistributedTest:
         )
         @skip_if_no_gpu
         def test_reduce_scatter_tensor_cuda(self):
+            # [FUNCTION DOC] NCCL only, needs a GPU. Checks reduce_scatter_tensor with a
+            # concatenated 1-D input and then with the same data stacked as a 2-D input: each rank
+            # must obtain its chunk multiplied by the world size.
             group, group_id, rank = self._init_global_test()
             rank_to_GPU = init_multigpu_helper(dist.get_world_size(), BACKEND)
             size = 2
@@ -2604,6 +3039,13 @@ class DistributedTest:
             tensor_shapes=None,
             **kwargs,
         ):
+            # [FUNCTION DOC] HELPER: Runs a distributed op under an autograd profiler (optionally
+            # with CUDA timing and shape recording). Calls op with the given args and keyword
+            # arguments (plus an optional second callback), and waits on the returned handles if
+            # is_async. If expect_event is true and the backend supports profiling, finds events
+            # named with the backend name plus the title postfix and checks: event count equals
+            # the number of calls (skipped in detail debug mode), events are async, counted once,
+            # have non-negative CPU time, and match tensor_shapes if given.
             op_calls = [lambda: op(*args, **kwargs)]
             if secondary_op_call is not None:
                 op_calls.append(secondary_op_call)
@@ -2661,6 +3103,14 @@ class DistributedTest:
             dtype=torch.float,
             async_op=False,
         ):
+            # [FUNCTION DOC] HELPER: All-reduce check. For each source rank, builds tensors
+            # (optionally CUDA, any dtype including complex) of size src+1 filled with the master
+            # value on that rank and the worker value elsewhere; all-reduces through call_dist_op
+            # (sync or async) with the op, and checks shape of profiler events (complex tensors
+            # are measured as real views). For source 0 with CUDA on supported backends, repeats
+            # the call with CUDA profiling. Ends with a barrier.
+            # KNOWN ISSUE: despite the name, the helper never compares the reduced tensor with
+            # expected_value; only profiler events are checked.
             for src in group:
                 curr_value = master_value if rank == src else worker_value
 
@@ -2708,6 +3158,7 @@ class DistributedTest:
             BACKEND == "nccl", "Nccl does not support CPU tensors"
         )
         def test_all_reduce_sum(self):
+            # [FUNCTION DOC] Not for nccl. All-reduce sum on the default group.
             group, group_id, rank = self._init_global_test()
             self._test_all_reduce_helper(
                 group,
@@ -2723,6 +3174,7 @@ class DistributedTest:
             BACKEND == "nccl", "Nccl does not support CPU tensors"
         )
         def test_all_reduce_sum_async(self):
+            # [FUNCTION DOC] Not for nccl. All-reduce sum, asynchronous.
             group, group_id, rank = self._init_global_test()
             self._test_all_reduce_helper(
                 group,
@@ -2741,6 +3193,8 @@ class DistributedTest:
         )
         @skip_if_no_gpu
         def test_all_reduce_sum_cuda(self):
+            # [FUNCTION DOC] Gloo or nccl, needs a GPU. All-reduce sum on CUDA tensors (sets the
+            # CUDA device to the rank).
             torch.cuda.set_device(self.rank)
             group, group_id, rank = self._init_global_test()
             rank_to_GPU = init_multigpu_helper(dist.get_world_size(), BACKEND)
@@ -2762,6 +3216,8 @@ class DistributedTest:
         )
         @skip_if_no_gpu
         def test_all_reduce_sum_cuda_async(self):
+            # [FUNCTION DOC] Gloo or nccl, needs a GPU. Asynchronous all-reduce sum on
+            # CUDA tensors.
             torch.cuda.set_device(self.rank)
             group, group_id, rank = self._init_global_test()
             rank_to_GPU = init_multigpu_helper(dist.get_world_size(), BACKEND)
@@ -2782,6 +3238,7 @@ class DistributedTest:
             BACKEND == "nccl", "Nccl does not support CPU tensors"
         )
         def test_all_reduce_sum_complex(self):
+            # [FUNCTION DOC] Not for nccl. All-reduce sum with complex float tensors.
             group, group_id, rank = self._init_global_test()
             self._test_all_reduce_helper(
                 group,
@@ -2798,6 +3255,8 @@ class DistributedTest:
             BACKEND == "nccl", "Nccl does not support CPU tensors"
         )
         def test_all_reduce_complex_unsupported_ops(self):
+            # [FUNCTION DOC] Not for nccl. Checks that all-reduce on complex tensors with max,
+            # min, product, band, bor or bxor raises ValueError (all_reduce does not support).
             unsupported_ops = [
                 dist.ReduceOp.MAX,
                 dist.ReduceOp.MIN,
@@ -2819,6 +3278,7 @@ class DistributedTest:
         )
         @skip_if_no_gpu
         def test_all_reduce_sum_cuda_complex(self):
+            # [FUNCTION DOC] Gloo or nccl, needs a GPU. All-reduce sum on CUDA complex tensors.
             torch.cuda.set_device(self.rank)
             group, group_id, rank = self._init_global_test()
             rank_to_GPU = init_multigpu_helper(dist.get_world_size(), BACKEND)
@@ -2839,6 +3299,7 @@ class DistributedTest:
             BACKEND == "nccl", "Nccl does not support CPU tensors"
         )
         def test_all_reduce_product(self):
+            # [FUNCTION DOC] Not for nccl. All-reduce product on the default group.
             group, group_id, rank = self._init_global_test()
             self._test_all_reduce_helper(
                 group,
@@ -2854,6 +3315,7 @@ class DistributedTest:
             BACKEND == "nccl", "Nccl does not support CPU tensors"
         )
         def test_all_reduce_min(self):
+            # [FUNCTION DOC] Not for nccl. All-reduce min on the default group.
             group, group_id, rank = self._init_global_test()
             self._test_all_reduce_helper(
                 group, group_id, rank, dist.ReduceOp.MIN, 1010, 1, 1
@@ -2863,6 +3325,7 @@ class DistributedTest:
             BACKEND == "nccl", "Nccl does not support CPU tensors"
         )
         def test_all_reduce_max(self):
+            # [FUNCTION DOC] Not for nccl. All-reduce max on the default group.
             group, group_id, rank = self._init_global_test()
             self._test_all_reduce_helper(
                 group, group_id, rank, dist.ReduceOp.MAX, -1, 10, 10
@@ -2873,6 +3336,8 @@ class DistributedTest:
             BACKEND == "nccl", "Nccl does not support CPU tensors"
         )
         def test_all_reduce_group_sum(self):
+            # [FUNCTION DOC] All-reduce sum on the two-rank subgroup (larger world needed, not
+            # for nccl).
             group, group_id, rank = self._init_group_test()
             self._test_all_reduce_helper(
                 group,
@@ -2889,6 +3354,8 @@ class DistributedTest:
             BACKEND == "nccl", "Nccl does not support CPU tensors"
         )
         def test_all_reduce_group_product(self):
+            # [FUNCTION DOC] All-reduce product on the two-rank subgroup (larger world needed, not
+            # for nccl).
             group, group_id, rank = self._init_group_test()
             self._test_all_reduce_helper(
                 group,
@@ -2905,6 +3372,8 @@ class DistributedTest:
             BACKEND == "nccl", "Nccl does not support CPU tensors"
         )
         def test_all_reduce_group_min(self):
+            # [FUNCTION DOC] All-reduce min on the two-rank subgroup (larger world needed, not
+            # for nccl).
             group, group_id, rank = self._init_group_test()
             self._test_all_reduce_helper(
                 group, group_id, rank, dist.ReduceOp.MIN, 1010, 1, 1
@@ -2915,6 +3384,8 @@ class DistributedTest:
             BACKEND == "nccl", "Nccl does not support CPU tensors"
         )
         def test_all_reduce_group_max(self):
+            # [FUNCTION DOC] All-reduce max on the two-rank subgroup (larger world needed, not
+            # for nccl).
             group, group_id, rank = self._init_group_test()
             self._test_all_reduce_helper(
                 group, group_id, rank, dist.ReduceOp.MAX, -1, 10, 10
@@ -2924,6 +3395,7 @@ class DistributedTest:
             BACKEND == "nccl", "Nccl does not support CPU tensors"
         )
         def test_all_reduce_full_group_sum(self):
+            # [FUNCTION DOC] All-reduce sum on a group spanning all ranks (not for nccl).
             group, group_id, rank = self._init_full_group_test()
             self._test_all_reduce_helper(
                 group,
@@ -2939,6 +3411,7 @@ class DistributedTest:
             BACKEND == "nccl", "Nccl does not support CPU tensors"
         )
         def test_all_reduce_full_group_product(self):
+            # [FUNCTION DOC] All-reduce product on a group spanning all ranks (not for nccl).
             group, group_id, rank = self._init_full_group_test()
             self._test_all_reduce_helper(
                 group,
@@ -2954,6 +3427,7 @@ class DistributedTest:
             BACKEND == "nccl", "Nccl does not support CPU tensors"
         )
         def test_all_reduce_full_group_min(self):
+            # [FUNCTION DOC] All-reduce min on a group spanning all ranks (not for nccl).
             group, group_id, rank = self._init_full_group_test()
             self._test_all_reduce_helper(
                 group, group_id, rank, dist.ReduceOp.MIN, 1010, 1, 1
@@ -2963,6 +3437,7 @@ class DistributedTest:
             BACKEND == "nccl", "Nccl does not support CPU tensors"
         )
         def test_all_reduce_full_group_max(self):
+            # [FUNCTION DOC] All-reduce max on a group spanning all ranks (not for nccl).
             group, group_id, rank = self._init_full_group_test()
             self._test_all_reduce_helper(
                 group, group_id, rank, dist.ReduceOp.MAX, -1, 10, 10
@@ -2970,6 +3445,9 @@ class DistributedTest:
 
         # SPARSE ALL REDUCE
         def _test_sparse_all_reduce_sum(self, fn):
+            # [FUNCTION DOC] HELPER: Sparse all-reduce check. Gets sparse test inputs and expected
+            # outputs for this rank and world size, converts the input with fn, all-reduces with
+            # sum on the default group and compares with the expected output.
             _group, group_id, rank = self._init_global_test()
 
             tests = simple_sparse_reduce_tests(
@@ -2984,6 +3462,7 @@ class DistributedTest:
             BACKEND != "gloo", "Only Gloo backend supports sparse all reduce"
         )
         def test_sparse_all_reduce_sum(self):
+            # [FUNCTION DOC] Gloo only. Sparse all-reduce sum with CPU sparse tensors.
             self._test_sparse_all_reduce_sum(lambda t: t)
 
         @skip_but_pass_in_sandcastle_if(
@@ -2991,11 +3470,16 @@ class DistributedTest:
         )
         @skip_if_no_gpu
         def test_sparse_all_reduce_sum_cuda(self):
+            # [FUNCTION DOC] Gloo only, needs a GPU. Sparse all-reduce sum with sparse tensors
+            # cloned to CUDA.
             self._test_sparse_all_reduce_sum(lambda t: t.clone().cuda())
 
         # ALL REDUCE - COALESCED
         @staticmethod
         def _all_reduce_coalesced_sum_test_cases(group_size):
+            # [FUNCTION DOC] HELPER: Static factory of the sum test case for coalesced all-reduce.
+            # Returns four lists: master values, worker values, expected values (master plus
+            # worker times group_size minus one) and dtypes (float, float, complex float).
             return (
                 [2, 3, complex(2, 3)],
                 [10, 11, complex(10, 11)],
@@ -3009,6 +3493,9 @@ class DistributedTest:
 
         @staticmethod
         def _all_reduce_coalesced_product_test_cases(group_size):
+            # [FUNCTION DOC] HELPER: Static factory of the product test case for coalesced
+            # all-reduce. Returns master values, worker values, expected products for the given
+            # group_size, and dtypes (floats).
             return (
                 [1, 2],
                 [3, 4],
@@ -3018,6 +3505,9 @@ class DistributedTest:
 
         @staticmethod
         def _all_reduce_coalesced_min_test_cases(group_size):
+            # [FUNCTION DOC] HELPER: Static factory of the min test case for coalesced
+            # all-reduce. Returns master values, worker values, expected minima and dtypes;
+            # group_size is unused.
             return (
                 [1, 4],
                 [2, 3],
@@ -3027,6 +3517,9 @@ class DistributedTest:
 
         @staticmethod
         def _all_reduce_coalesced_max_test_cases(group_size):
+            # [FUNCTION DOC] HELPER: Static factory of the max test case for coalesced
+            # all-reduce. Returns master values, worker values, expected maxima and dtypes;
+            # group_size is unused.
             return (
                 [1, 4],
                 [2, 3],
@@ -3038,6 +3531,8 @@ class DistributedTest:
             BACKEND == "nccl", "Nccl does not support CPU tensors"
         )
         def test_all_reduce_coalesced_max_complex_unsupported(self):
+            # [FUNCTION DOC] Not for nccl. Checks that coalesced all-reduce with max on a complex
+            # tensor raises ValueError (all_reduce does not support).
             _group, group_id, _rank = self._init_global_test()
             with self.assertRaisesRegex(ValueError, "all_reduce does not support"):
                 dist.all_reduce_coalesced(
@@ -3053,6 +3548,11 @@ class DistributedTest:
             cuda=False,
             rank_to_GPU=None,
         ):
+            # [FUNCTION DOC] HELPER: Coalesced all-reduce check. Picks the test case for the op,
+            # then for every source rank builds a list of tensors (master values on the source,
+            # worker values elsewhere), optionally moved to the GPU, calls all_reduce_coalesced
+            # through call_dist_op, and compares the whole list with the expected tensors. Ends
+            # with a barrier.
             test_case_func = {
                 dist.ReduceOp.SUM: self._all_reduce_coalesced_sum_test_cases,
                 dist.ReduceOp.PRODUCT: self._all_reduce_coalesced_product_test_cases,
@@ -3099,6 +3599,7 @@ class DistributedTest:
 
         @require_backend_is_available({"gloo"})
         def test_all_reduce_coalesced_sum(self):
+            # [FUNCTION DOC] Requires gloo. Coalesced all-reduce with sum on the default group.
             group, group_id, rank = self._init_global_test()
             self._test_all_reduce_coalesced_helper(
                 group,
@@ -3111,6 +3612,8 @@ class DistributedTest:
 
         @require_backend_is_available({"gloo"})
         def test_all_reduce_coalesced_product(self):
+            # [FUNCTION DOC] Requires gloo. Coalesced all-reduce with product on the
+            # default group.
             group, group_id, rank = self._init_global_test()
             self._test_all_reduce_coalesced_helper(
                 group,
@@ -3123,6 +3626,7 @@ class DistributedTest:
 
         @require_backend_is_available({"gloo"})
         def test_all_reduce_coalesced_min(self):
+            # [FUNCTION DOC] Requires gloo. Coalesced all-reduce with min on the default group.
             group, group_id, rank = self._init_global_test()
             self._test_all_reduce_coalesced_helper(
                 group,
@@ -3135,6 +3639,7 @@ class DistributedTest:
 
         @require_backend_is_available({"gloo"})
         def test_all_reduce_coalesced_max(self):
+            # [FUNCTION DOC] Requires gloo. Coalesced all-reduce with max on the default group.
             group, group_id, rank = self._init_global_test()
             self._test_all_reduce_coalesced_helper(
                 group, group_id, rank, dist.ReduceOp.MAX, cuda=False, rank_to_GPU=None
@@ -3143,6 +3648,8 @@ class DistributedTest:
         @skip_if_small_worldsize
         @require_backend_is_available({"gloo"})
         def test_all_reduce_coalesced_group_sum(self):
+            # [FUNCTION DOC] Requires gloo, larger world. Coalesced all-reduce with sum on
+            # the subgroup.
             group, group_id, rank = self._init_group_test()
             self._test_all_reduce_coalesced_helper(
                 group, group_id, rank, dist.ReduceOp.SUM, cuda=False, rank_to_GPU=None
@@ -3151,6 +3658,8 @@ class DistributedTest:
         @skip_if_small_worldsize
         @require_backend_is_available({"gloo"})
         def test_all_reduce_coalesced_group_product(self):
+            # [FUNCTION DOC] Requires gloo, larger world. Coalesced all-reduce with product on
+            # the subgroup.
             group, group_id, rank = self._init_group_test()
             self._test_all_reduce_coalesced_helper(
                 group,
@@ -3165,6 +3674,8 @@ class DistributedTest:
         @skip_if_small_worldsize
         @require_backend_is_available({"gloo"})
         def test_all_reduce_coalesced_group_min(self):
+            # [FUNCTION DOC] Requires gloo, larger world, skipped on macOS. Coalesced all-reduce
+            # with min on the subgroup.
             group, group_id, rank = self._init_group_test()
             self._test_all_reduce_coalesced_helper(
                 group, group_id, rank, dist.ReduceOp.MIN, cuda=False, rank_to_GPU=None
@@ -3173,6 +3684,8 @@ class DistributedTest:
         @skip_if_small_worldsize
         @require_backend_is_available({"gloo"})
         def test_all_reduce_coalesced_group_max(self):
+            # [FUNCTION DOC] Requires gloo, larger world. Coalesced all-reduce with max on
+            # the subgroup.
             group, group_id, rank = self._init_group_test()
             self._test_all_reduce_coalesced_helper(
                 group, group_id, rank, dist.ReduceOp.MAX, cuda=False, rank_to_GPU=None
@@ -3180,6 +3693,8 @@ class DistributedTest:
 
         @require_backend_is_available({"gloo"})
         def test_all_reduce_coalesced_full_group_sum(self):
+            # [FUNCTION DOC] Requires gloo. Coalesced all-reduce with sum on a group spanning
+            # all ranks.
             group, group_id, rank = self._init_full_group_test()
             self._test_all_reduce_coalesced_helper(
                 group, group_id, rank, dist.ReduceOp.SUM, cuda=False, rank_to_GPU=None
@@ -3187,6 +3702,8 @@ class DistributedTest:
 
         @require_backend_is_available({"gloo"})
         def test_all_reduce_coalesced_full_group_product(self):
+            # [FUNCTION DOC] Requires gloo. Coalesced all-reduce with product on a group spanning
+            # all ranks.
             group, group_id, rank = self._init_full_group_test()
             self._test_all_reduce_coalesced_helper(
                 group,
@@ -3199,6 +3716,8 @@ class DistributedTest:
 
         @require_backend_is_available({"gloo"})
         def test_all_reduce_coalesced_full_group_min(self):
+            # [FUNCTION DOC] Requires gloo. Coalesced all-reduce with min on a group spanning
+            # all ranks.
             group, group_id, rank = self._init_full_group_test()
             self._test_all_reduce_coalesced_helper(
                 group,
@@ -3211,6 +3730,8 @@ class DistributedTest:
 
         @require_backend_is_available({"gloo"})
         def test_all_reduce_coalesced_full_group_max(self):
+            # [FUNCTION DOC] Requires gloo. Coalesced all-reduce with max on a group spanning
+            # all ranks.
             group, group_id, rank = self._init_full_group_test()
             self._test_all_reduce_coalesced_helper(
                 group, group_id, rank, dist.ReduceOp.MAX, cuda=False, rank_to_GPU=None
@@ -3220,6 +3741,10 @@ class DistributedTest:
         def _test_scatter_helper(
             self, group, group_id, rank, cuda=False, rank_to_GPU=None, dtype=torch.float
         ):
+            # [FUNCTION DOC] HELPER: Scatter check. For every destination rank acting as source,
+            # the source builds a list of tensors (one per rank, filled with the target rank),
+            # each rank scatters into a tensor of size dest+1 and checks it holds its own rank
+            # value. Supports CUDA and complex dtype. Ends with a barrier.
             for dest in group:
                 tensor = _build_tensor(dest + 1, -1, dtype=dtype)
                 expected_tensor = _build_tensor(dest + 1, rank, dtype=dtype)
@@ -3257,6 +3782,9 @@ class DistributedTest:
             BACKEND == "ucc", "CPU tensor ops not supported by UCP TL"
         )
         def test_scatter_checks(self):
+            # [FUNCTION DOC] Not for nccl or ucc. Checks scatter with the scatter list given only
+            # on the source rank, and with the src argument omitted (default source rank 0); each
+            # rank must receive its rank value.
             group, _group_id, rank = self._init_global_test()
             one = torch.ones([1])
 
@@ -3285,6 +3813,7 @@ class DistributedTest:
             BACKEND == "ucc", "CPU tensor ops not supported by UCP TL"
         )
         def test_scatter(self):
+            # [FUNCTION DOC] Not for nccl or ucc. Scatter check on the default group.
             group, group_id, rank = self._init_global_test()
             self._test_scatter_helper(group, group_id, rank)
 
@@ -3293,6 +3822,7 @@ class DistributedTest:
         )
         @skip_if_no_gpu
         def test_scatter_cuda(self):
+            # [FUNCTION DOC] NCCL only, needs a GPU. Scatter check with CUDA tensors.
             group, group_id, rank = self._init_global_test()
             rank_to_GPU = init_multigpu_helper(dist.get_world_size(), BACKEND)
             self._test_scatter_helper(group, group_id, rank, True, rank_to_GPU)
@@ -3304,6 +3834,7 @@ class DistributedTest:
             BACKEND == "ucc", "CPU tensor ops not supported by UCP TL"
         )
         def test_scatter_complex(self):
+            # [FUNCTION DOC] Not for nccl or ucc. Scatter check with complex tensors.
             group, group_id, rank = self._init_global_test()
             self._test_scatter_helper(group, group_id, rank, dtype=torch.cfloat)
 
@@ -3312,6 +3843,7 @@ class DistributedTest:
         )
         @skip_if_no_gpu
         def test_scatter_cuda_complex(self):
+            # [FUNCTION DOC] NCCL only, needs a GPU. Scatter check with CUDA complex tensors.
             group, group_id, rank = self._init_global_test()
             rank_to_GPU = init_multigpu_helper(dist.get_world_size(), BACKEND)
             self._test_scatter_helper(
@@ -3326,6 +3858,8 @@ class DistributedTest:
         )
         @skip_if_small_worldsize
         def test_scatter_group(self):
+            # [FUNCTION DOC] Not for nccl or ucc, larger world. Scatter check on the
+            # two-rank subgroup.
             group, group_id, rank = self._init_group_test()
             self._test_scatter_helper(group, group_id, rank)
 
@@ -3336,6 +3870,7 @@ class DistributedTest:
             BACKEND == "ucc", "CPU tensor ops not supported by UCP TL"
         )
         def test_scatter_full_group(self):
+            # [FUNCTION DOC] Not for nccl or ucc. Scatter check on a group spanning all ranks.
             group, group_id, rank = self._init_full_group_test()
             self._test_scatter_helper(group, group_id, rank)
 
@@ -3343,6 +3878,10 @@ class DistributedTest:
         def _test_gather_helper(
             self, group, group_id, rank, cuda=False, rank_to_GPU=None
         ):
+            # [FUNCTION DOC] HELPER: Gather check. For each destination rank, every rank
+            # contributes a tensor filled with its rank value and the destination gathers into a
+            # list of tensors, then compares each entry with the expected rank value. Supports
+            # CUDA. Ends with a barrier.
             for dest in group:
                 tensor = _build_tensor(dest + 1, rank)
                 tensors = (
@@ -3376,6 +3915,9 @@ class DistributedTest:
             BACKEND == "ucc", "CPU tensor ops not supported by UCP TL"
         )
         def test_gather_checks(self):
+            # [FUNCTION DOC] Not for nccl or ucc. Checks gather with the gather list given only on
+            # the destination rank and with the dst argument omitted (default rank 0); rank 0
+            # verifies each gathered entry.
             group, _group_id, rank = self._init_global_test()
             one = torch.ones([1])
 
@@ -3404,6 +3946,7 @@ class DistributedTest:
             BACKEND == "ucc", "CPU tensor ops not supported by UCP TL"
         )
         def test_gather(self):
+            # [FUNCTION DOC] Not for nccl or ucc. Gather check on the default group.
             group, group_id, rank = self._init_global_test()
             self._test_gather_helper(group, group_id, rank)
 
@@ -3412,6 +3955,7 @@ class DistributedTest:
         )
         @skip_if_no_gpu
         def test_gather_cuda(self):
+            # [FUNCTION DOC] NCCL only, needs a GPU. Gather check with CUDA tensors.
             group, group_id, rank = self._init_global_test()
             rank_to_GPU = init_multigpu_helper(dist.get_world_size(), BACKEND)
             self._test_gather_helper(group, group_id, rank, True, rank_to_GPU)
@@ -3424,6 +3968,8 @@ class DistributedTest:
         )
         @skip_if_small_worldsize
         def test_gather_group(self):
+            # [FUNCTION DOC] Not for nccl or ucc, larger world. Gather check on the
+            # two-rank subgroup.
             group, group_id, rank = self._init_group_test()
             self._test_gather_helper(group, group_id, rank)
 
@@ -3434,6 +3980,7 @@ class DistributedTest:
             BACKEND == "ucc", "CPU tensor ops not supported by UCP TL"
         )
         def test_gather_full_group(self):
+            # [FUNCTION DOC] Not for nccl or ucc. Gather check on a group spanning all ranks.
             group, group_id, rank = self._init_full_group_test()
             self._test_gather_helper(group, group_id, rank)
 
@@ -3441,6 +3988,10 @@ class DistributedTest:
         def _test_all_gather_helper(
             self, group, group_id, rank, cuda=False, rank_to_GPU=None, dtype=torch.float
         ):
+            # [FUNCTION DOC] HELPER: All-gather check. For each destination index, every rank
+            # contributes a tensor of size dest+1 filled with its rank; all_gather via
+            # call_dist_op fills a list of tensors, which is compared to the expected per-rank
+            # values. Supports CUDA and complex dtype. Ends with a barrier.
             for dest in group:
                 tensor = _build_tensor(dest + 1, rank, dtype=dtype)
                 tensors = [_build_tensor(dest + 1, -1, dtype=dtype) for i in group]
@@ -3475,6 +4026,7 @@ class DistributedTest:
             BACKEND == "nccl", "Nccl does not support CPU tensors"
         )
         def test_all_gather(self):
+            # [FUNCTION DOC] Not for nccl. All-gather check on the default group.
             group, group_id, rank = self._init_global_test()
             self._test_all_gather_helper(group, group_id, rank)
 
@@ -3483,6 +4035,7 @@ class DistributedTest:
         )
         @skip_if_no_gpu
         def test_all_gather_cuda(self):
+            # [FUNCTION DOC] NCCL only, needs a GPU. All-gather check with CUDA tensors.
             group, group_id, rank = self._init_global_test()
             rank_to_GPU = init_multigpu_helper(dist.get_world_size(), BACKEND)
             self._test_all_gather_helper(group, group_id, rank, True, rank_to_GPU)
@@ -3491,6 +4044,7 @@ class DistributedTest:
             BACKEND == "nccl", "Nccl does not support CPU tensors"
         )
         def test_all_gather_complex(self):
+            # [FUNCTION DOC] Not for nccl. All-gather check with complex tensors.
             group, group_id, rank = self._init_global_test()
             self._test_all_gather_helper(group, group_id, rank, dtype=torch.cfloat)
 
@@ -3499,6 +4053,7 @@ class DistributedTest:
         )
         @skip_if_no_gpu
         def test_all_gather_cuda_complex(self):
+            # [FUNCTION DOC] NCCL only, needs a GPU. All-gather check with CUDA complex tensors.
             group, group_id, rank = self._init_global_test()
             rank_to_GPU = init_multigpu_helper(dist.get_world_size(), BACKEND)
             self._test_all_gather_helper(
@@ -3510,6 +4065,8 @@ class DistributedTest:
             BACKEND == "nccl", "Nccl does not support CPU tensors"
         )
         def test_all_gather_group(self):
+            # [FUNCTION DOC] Not for nccl, larger world. All-gather check on the
+            # two-rank subgroup.
             group, group_id, rank = self._init_group_test()
             self._test_all_gather_helper(group, group_id, rank)
 
@@ -3517,6 +4074,7 @@ class DistributedTest:
             BACKEND == "nccl", "Nccl does not support CPU tensors"
         )
         def test_all_gather_full_group(self):
+            # [FUNCTION DOC] Not for nccl. All-gather check on a group spanning all ranks.
             group, group_id, rank = self._init_full_group_test()
             self._test_all_gather_helper(group, group_id, rank)
 
@@ -3525,6 +4083,10 @@ class DistributedTest:
         )
         @skip_if_no_gpu
         def test_all_gather_v_cuda(self):
+            # [FUNCTION DOC] NCCL only, needs a GPU. Variable-size all_gather: each rank
+            # contributes a tensor whose first dimension is rank+1 filled with 2; the outputs are
+            # splits of one big tensor along the first dimension. Runs async and sync and checks
+            # the output is all 2s.
             self._barrier()
             group, group_id, rank = self._init_global_test()
             rank_to_GPU = init_multigpu_helper(dist.get_world_size(), BACKEND)
@@ -3565,6 +4127,9 @@ class DistributedTest:
         def _all_gather_into_tensor_helper(
             self, tensor_out, tensor_in, group_id, rank, cuda=True, rank_to_GPU=None
         ):
+            # [FUNCTION DOC] HELPER: Runs all_gather_into_tensor (single output tensor) with
+            # tensor_in into tensor_out through call_dist_op without expecting a profiler event,
+            # moving tensors to the rank's GPU when cuda is set, and returns tensor_out.
             if cuda:
                 tensor_in = tensor_in.cuda(rank_to_GPU[rank][0])
                 tensor_out = tensor_out.cuda(rank_to_GPU[rank][0])
@@ -3590,6 +4155,8 @@ class DistributedTest:
         )
         @skip_if_no_gpu
         def test_all_gather_into_cat_tensor_cuda(self):
+            # [FUNCTION DOC] NCCL only, needs a GPU. All-gather into a single tensor with
+            # concatenated layout; compares with concatenation of per-rank blocks.
             group, group_id, rank = self._init_global_test()
             rank_to_GPU = init_multigpu_helper(dist.get_world_size(), BACKEND)
             size = 2
@@ -3611,6 +4178,8 @@ class DistributedTest:
         )
         @skip_if_no_gpu
         def test_all_gather_into_stack_tensor_cuda(self):
+            # [FUNCTION DOC] NCCL only, needs a GPU. All-gather into a single tensor with stacked
+            # layout; compares with the stack of per-rank blocks.
             group, group_id, rank = self._init_global_test()
             rank_to_GPU = init_multigpu_helper(dist.get_world_size(), BACKEND)
             size = 2
@@ -3630,6 +4199,9 @@ class DistributedTest:
         def _run_all_gather_coalesced_and_verify(
             self, output_tensor_lists, input_tensors, expected_tensors, group_id
         ):
+            # [FUNCTION DOC] HELPER: Runs all_gather_coalesced through call_dist_op (computing
+            # shapes, with complex tensors measured as real views) and returns False if any output
+            # tensor differs from expected, else True.
             """
             Helper that runs all_gather_coalesced and returns true if output
             matches expectations.
@@ -3659,6 +4231,10 @@ class DistributedTest:
         def _test_all_gather_coalesced_helper(
             self, group, group_id, rank, dtype=torch.float
         ):
+            # [FUNCTION DOC] HELPER: Coalesced all-gather check. When the rank has a group, for
+            # batches of 1 to 3 tensors of different dimensionality (1-D, 2x2, 3x3x3), gathers
+            # them and raises AssertionError if the outputs differ from the expected per-rank
+            # values. Ends with a barrier.
             # TODO: Instead we should probably go through _rank_not_in_group
             # mechanism to disable sending tensors
             if group_id is not None:
@@ -3703,6 +4279,8 @@ class DistributedTest:
             f"{BACKEND} does not support all_gather_coalesced",
         )
         def test_all_gather_coalesced_simple(self):
+            # [FUNCTION DOC] Skipped on backends without coalesced all-gather. Runs the coalesced
+            # all-gather check on the default group.
             group, group_id, rank = self._init_global_test()
             self._test_all_gather_coalesced_helper(group, group_id, rank)
 
@@ -3711,6 +4289,8 @@ class DistributedTest:
             f"{BACKEND} does not support all_gather_coalesced",
         )
         def test_all_gather_coalesced_complex(self):
+            # [FUNCTION DOC] Skipped on backends without coalesced all-gather. Same check with
+            # complex tensors.
             group, group_id, rank = self._init_global_test()
             self._test_all_gather_coalesced_helper(
                 group, group_id, rank, dtype=torch.cfloat
@@ -3722,6 +4302,8 @@ class DistributedTest:
             f"{BACKEND} does not support all_gather_coalesced",
         )
         def test_all_gather_coalesced_group(self):
+            # [FUNCTION DOC] Skipped on backends without coalesced all-gather, larger world. Same
+            # check on the two-rank subgroup.
             group, group_id, rank = self._init_group_test()
             self._test_all_gather_coalesced_helper(group, group_id, rank)
 
@@ -3730,6 +4312,8 @@ class DistributedTest:
             f"{BACKEND} does not support all_gather_coalesced",
         )
         def test_all_gather_coalesced_full_group(self):
+            # [FUNCTION DOC] Skipped on backends without coalesced all-gather. Same check on a
+            # group spanning all ranks.
             group, group_id, rank = self._init_full_group_test()
             self._test_all_gather_coalesced_helper(group, group_id, rank)
 
@@ -3738,6 +4322,9 @@ class DistributedTest:
             f"{BACKEND} does not support all_gather_coalesced",
         )
         def test_all_gather_coalesced_with_empty(self):
+            # [FUNCTION DOC] Skipped on backends without coalesced all-gather. Coalesced
+            # all-gather with a mix of normal tensors and zero-element tensors; raises
+            # AssertionError if the results differ from expected.
             group, group_id, rank = self._init_global_test()
             input_tensors = [
                 rank * torch.ones([2, 2]),
@@ -3776,6 +4363,9 @@ class DistributedTest:
         def _test_all_to_all_single_equal_split_helper(
             self, group, group_id, rank, cuda=False, rank_to_GPU=None, dtype=torch.float
         ):
+            # [FUNCTION DOC] HELPER: All-to-all single with equal splits. Each rank sends a row of
+            # its rank value to every rank; the result must be one row per source rank. Does
+            # nothing but barrier when the rank has no group. Supports CUDA and complex.
             if group_id is not None:
                 size = len(group)
                 in_tensor = torch.ones([size, size], dtype=dtype) * rank
@@ -3806,6 +4396,10 @@ class DistributedTest:
         def _test_all_to_all_single_unequal_split_helper(
             self, group, group_id, rank, cuda=False, rank_to_GPU=None, dtype=torch.float
         ):
+            # [FUNCTION DOC] HELPER: All-to-all single with unequal splits. Input split sizes are
+            # i+1 for destination i and output splits are rank+1 for every source; the result must
+            # be blocks of rank-value rows from each source. Does nothing but barrier when the
+            # rank has no group. Supports CUDA and complex.
             if group_id is not None:
                 size = len(group)
                 in_splits = [i + 1 for i in group]
@@ -3834,6 +4428,10 @@ class DistributedTest:
             rank_to_GPU=None,
             dtype=torch.float,
         ):
+            # [FUNCTION DOC] HELPER: All-to-all with a list of tensors of unequal sizes per
+            # destination; each rank receives rank+1 rows from every source and the received
+            # tensors must match the source rank value. Does nothing but barrier when the rank has
+            # no group. Supports CUDA and complex.
             if group_id is not None:
                 size = len(group)
                 in_splits = [i + 1 for i in group]
@@ -3862,6 +4460,7 @@ class DistributedTest:
             BACKEND != "mpi", "Only MPI supports CPU all_to_all_single"
         )
         def test_all_to_all_single_equal_split(self):
+            # [FUNCTION DOC] MPI only. All-to-all single with equal splits on CPU.
             group, group_id, rank = self._init_global_test()
             self._test_all_to_all_single_equal_split_helper(group, group_id, rank)
 
@@ -3870,6 +4469,7 @@ class DistributedTest:
         )
         @skip_if_no_gpu
         def test_all_to_all_single_equal_split_cuda(self):
+            # [FUNCTION DOC] NCCL only, needs a GPU. All-to-all single with equal splits on CUDA.
             group, group_id, rank = self._init_global_test()
             rank_to_GPU = init_multigpu_helper(dist.get_world_size(), BACKEND)
             self._test_all_to_all_single_equal_split_helper(
@@ -3884,6 +4484,7 @@ class DistributedTest:
             BACKEND != "mpi", "Only MPI supports CPU all_to_all_single"
         )
         def test_all_to_all_single_equal_split_complex(self):
+            # [FUNCTION DOC] MPI only. All-to-all single with equal splits, complex dtype.
             group, group_id, rank = self._init_global_test()
             self._test_all_to_all_single_equal_split_helper(
                 group, group_id, rank, dtype=torch.cfloat
@@ -3894,6 +4495,8 @@ class DistributedTest:
         )
         @skip_if_no_gpu
         def test_all_to_all_single_equal_split_cuda_complex(self):
+            # [FUNCTION DOC] NCCL only, needs a GPU. All-to-all single with equal splits on CUDA,
+            # complex dtype.
             group, group_id, rank = self._init_global_test()
             rank_to_GPU = init_multigpu_helper(dist.get_world_size(), BACKEND)
             self._test_all_to_all_single_equal_split_helper(
@@ -3904,6 +4507,7 @@ class DistributedTest:
             BACKEND != "mpi", "Only MPI supports CPU all_to_all_single"
         )
         def test_all_to_all_single_unequal_split(self):
+            # [FUNCTION DOC] MPI only. All-to-all single with unequal splits on CPU.
             group, group_id, rank = self._init_global_test()
             self._test_all_to_all_single_unequal_split_helper(group, group_id, rank)
 
@@ -3912,6 +4516,8 @@ class DistributedTest:
         )
         @skip_if_no_gpu
         def test_all_to_all_single_unequal_split_cuda(self):
+            # [FUNCTION DOC] NCCL only, needs a GPU. All-to-all single with unequal splits
+            # on CUDA.
             group, group_id, rank = self._init_global_test()
             rank_to_GPU = init_multigpu_helper(dist.get_world_size(), BACKEND)
             self._test_all_to_all_single_unequal_split_helper(
@@ -3926,6 +4532,7 @@ class DistributedTest:
             BACKEND != "mpi", "Only MPI supports CPU all_to_all_single"
         )
         def test_all_to_all_single_unequal_split_complex(self):
+            # [FUNCTION DOC] MPI only. All-to-all single with unequal splits, complex dtype.
             group, group_id, rank = self._init_global_test()
             self._test_all_to_all_single_unequal_split_helper(
                 group, group_id, rank, dtype=torch.cfloat
@@ -3936,6 +4543,8 @@ class DistributedTest:
         )
         @skip_if_no_gpu
         def test_all_to_all_single_unequal_split_cuda_complex(self):
+            # [FUNCTION DOC] NCCL only, needs a GPU. All-to-all single with unequal splits on
+            # CUDA, complex dtype.
             group, group_id, rank = self._init_global_test()
             rank_to_GPU = init_multigpu_helper(dist.get_world_size(), BACKEND)
             self._test_all_to_all_single_unequal_split_helper(
@@ -3951,6 +4560,7 @@ class DistributedTest:
             BACKEND != "mpi", "Only MPI supports all_to_all"
         )
         def test_all_to_all(self):
+            # [FUNCTION DOC] MPI only. All-to-all with tensor lists on CPU.
             group, group_id, rank = self._init_global_test()
             self._test_all_to_all_helper(group, group_id, rank)
 
@@ -3959,6 +4569,7 @@ class DistributedTest:
         )
         @skip_if_rocm_multiprocess
         def test_all_to_all_cuda(self):
+            # [FUNCTION DOC] NCCL only, skipped on ROCm. All-to-all with tensor lists on CUDA.
             group, group_id, rank = self._init_global_test()
             rank_to_GPU = init_multigpu_helper(dist.get_world_size(), BACKEND)
             self._test_all_to_all_helper(group, group_id, rank, True, rank_to_GPU)
@@ -3967,6 +4578,7 @@ class DistributedTest:
             BACKEND != "mpi", "Only MPI supports all_to_all"
         )
         def test_all_to_all_complex(self):
+            # [FUNCTION DOC] MPI only. All-to-all with tensor lists, complex dtype.
             group, group_id, rank = self._init_global_test()
             self._test_all_to_all_helper(group, group_id, rank, dtype=torch.cfloat)
 
@@ -3975,6 +4587,8 @@ class DistributedTest:
         )
         @skip_if_rocm_multiprocess
         def test_all_to_all_cuda_complex(self):
+            # [FUNCTION DOC] NCCL only, skipped on ROCm. All-to-all with tensor lists on CUDA,
+            # complex dtype.
             group, group_id, rank = self._init_global_test()
             rank_to_GPU = init_multigpu_helper(dist.get_world_size(), BACKEND)
             self._test_all_to_all_helper(
@@ -3986,6 +4600,8 @@ class DistributedTest:
         )
         @skip_if_small_worldsize
         def test_all_to_all_single_equal_split_group(self):
+            # [FUNCTION DOC] MPI only, larger world. All-to-all single with equal splits on the
+            # two-rank subgroup.
             group, group_id, rank = self._init_group_test()
             self._test_all_to_all_single_equal_split_helper(group, group_id, rank)
 
@@ -3995,6 +4611,8 @@ class DistributedTest:
         @skip_if_no_gpu
         @skip_if_small_worldsize
         def test_all_to_all_single_equal_split_group_cuda(self):
+            # [FUNCTION DOC] NCCL only, needs a GPU and larger world. All-to-all single with equal
+            # splits on CUDA on the two-rank subgroup.
             group, group_id, rank = self._init_group_test()
             rank_to_GPU = init_multigpu_helper(dist.get_world_size(), BACKEND)
             self._test_all_to_all_single_equal_split_helper(
@@ -4010,6 +4628,8 @@ class DistributedTest:
         )
         @skip_if_small_worldsize
         def test_all_to_all_single_unequal_split_group(self):
+            # [FUNCTION DOC] MPI only, larger world. All-to-all single with unequal splits on CPU
+            # on the two-rank subgroup.
             group, group_id, rank = self._init_group_test()
             self._test_all_to_all_single_unequal_split_helper(group, group_id, rank)
 
@@ -4019,6 +4639,10 @@ class DistributedTest:
         @skip_if_no_gpu
         @skip_if_small_worldsize
         def test_all_to_all_single_unequal_split_group_cuda(self):
+            # [FUNCTION DOC] NCCL only, needs a GPU and larger world. All-to-all single with
+            # unequal splits on CUDA.
+            # KNOWN ISSUE: the name says group but the test uses the global default group, not
+            # a subgroup.
             group, group_id, rank = self._init_global_test()
             rank_to_GPU = init_multigpu_helper(dist.get_world_size(), BACKEND)
             self._test_all_to_all_single_unequal_split_helper(
@@ -4034,6 +4658,8 @@ class DistributedTest:
         )
         @skip_if_small_worldsize
         def test_all_to_all_group(self):
+            # [FUNCTION DOC] MPI only, larger world. All-to-all with tensor lists on the
+            # two-rank subgroup.
             group, group_id, rank = self._init_group_test()
             self._test_all_to_all_helper(group, group_id, rank)
 
@@ -4043,6 +4669,8 @@ class DistributedTest:
         @skip_if_small_worldsize
         @skip_if_rocm_multiprocess
         def test_all_to_all_group_cuda(self):
+            # [FUNCTION DOC] NCCL only, larger world, skipped on ROCm. All-to-all with tensor
+            # lists on CUDA on the two-rank subgroup.
             group, group_id, rank = self._init_group_test()
             rank_to_GPU = init_multigpu_helper(dist.get_world_size(), BACKEND)
             self._test_all_to_all_helper(group, group_id, rank, True, rank_to_GPU)
@@ -4051,6 +4679,8 @@ class DistributedTest:
             BACKEND != "mpi", "Only MPI supports CPU all_to_all_single"
         )
         def test_all_to_all_single_equal_split_full_group(self):
+            # [FUNCTION DOC] MPI only. All-to-all single with equal splits on CPU on a group
+            # spanning all ranks.
             group, group_id, rank = self._init_full_group_test()
             self._test_all_to_all_single_equal_split_helper(group, group_id, rank)
 
@@ -4059,6 +4689,8 @@ class DistributedTest:
         )
         @skip_if_no_gpu
         def test_all_to_all_single_equal_split_full_group_cuda(self):
+            # [FUNCTION DOC] NCCL only, needs a GPU. All-to-all single with equal splits on CUDA
+            # on a group spanning all ranks.
             group, group_id, rank = self._init_full_group_test()
             rank_to_GPU = init_multigpu_helper(dist.get_world_size(), BACKEND)
             self._test_all_to_all_single_equal_split_helper(
@@ -4073,6 +4705,8 @@ class DistributedTest:
             BACKEND != "mpi", "Only MPI supports CPU all_to_all_single"
         )
         def test_all_to_all_single_unequal_split_full_group(self):
+            # [FUNCTION DOC] MPI only. All-to-all single with unequal splits on CPU on a group
+            # spanning all ranks.
             group, group_id, rank = self._init_full_group_test()
             self._test_all_to_all_single_unequal_split_helper(group, group_id, rank)
 
@@ -4081,6 +4715,8 @@ class DistributedTest:
         )
         @skip_if_no_gpu
         def test_all_to_all_single_unequal_split_full_group_cuda(self):
+            # [FUNCTION DOC] NCCL only, needs a GPU. All-to-all single with unequal splits on CUDA
+            # on a group spanning all ranks.
             group, group_id, rank = self._init_full_group_test()
             rank_to_GPU = init_multigpu_helper(dist.get_world_size(), BACKEND)
             self._test_all_to_all_single_unequal_split_helper(
@@ -4095,6 +4731,7 @@ class DistributedTest:
             BACKEND != "mpi", "Only MPI supports all_to_all"
         )
         def test_all_to_all_full_group(self):
+            # [FUNCTION DOC] MPI only. All-to-all with tensor lists on a group spanning all ranks.
             group, group_id, rank = self._init_full_group_test()
             self._test_all_to_all_helper(group, group_id, rank)
 
@@ -4103,6 +4740,8 @@ class DistributedTest:
         )
         @skip_if_rocm_multiprocess
         def test_all_to_all_full_group_cuda(self):
+            # [FUNCTION DOC] NCCL only, skipped on ROCm. All-to-all with tensor lists on CUDA on a
+            # group spanning all ranks.
             group, group_id, rank = self._init_full_group_test()
             rank_to_GPU = init_multigpu_helper(dist.get_world_size(), BACKEND)
             self._test_all_to_all_helper(group, group_id, rank, True, rank_to_GPU)
@@ -4111,6 +4750,12 @@ class DistributedTest:
         def _test_barrier_helper(
             self, group, group_id, rank, cuda=False, rank_to_GPU=None
         ):
+            # [FUNCTION DOC] HELPER: Barrier timing check. For each rank acting as the leader, it
+            # broadcasts the time at which it will arrive at the barrier (about 0.3 seconds
+            # ahead), sleeps a little longer, then enters the barrier; the others enter
+            # immediately and must leave the barrier no earlier than the broadcast time.
+            # Optionally uses CUDA tensors. Ends with the file barrier using a 20 second timeout
+            # (CUDA initialization can be slow).
             WAIT_TIME = 0.3  # seconds
 
             for dest in group:
@@ -4147,6 +4792,8 @@ class DistributedTest:
             BACKEND == "ucc" and IS_SANDCASTLE, "Skipped internally"
         )
         def test_barrier_cuda(self):
+            # [FUNCTION DOC] Needs a GPU; not for MPI. Barrier timing check on the default group
+            # with CUDA tensors.
             group, group_id, rank = self._init_global_test()
             rank_to_GPU = init_multigpu_helper(dist.get_world_size(), BACKEND)
             self._test_barrier_helper(group, group_id, rank, True, rank_to_GPU)
@@ -4157,6 +4804,8 @@ class DistributedTest:
             BACKEND == "mpi", "MPI doesn't support GPU barrier"
         )
         def test_barrier_group_cuda(self):
+            # [FUNCTION DOC] Needs a GPU and larger world; not for MPI. Barrier timing check on
+            # the two-rank subgroup with CUDA tensors.
             group, group_id, rank = self._init_group_test()
             rank_to_GPU = init_multigpu_helper(dist.get_world_size(), BACKEND)
             self._test_barrier_helper(group, group_id, rank, True, rank_to_GPU)
@@ -4167,6 +4816,8 @@ class DistributedTest:
             BACKEND == "mpi", "MPI doesn't support GPU barrier"
         )
         def test_barrier_full_group_cuda(self):
+            # [FUNCTION DOC] Needs a GPU and larger world; not for MPI. Barrier timing check on a
+            # group spanning all ranks with CUDA tensors.
             group, group_id, rank = self._init_full_group_test()
             rank_to_GPU = init_multigpu_helper(dist.get_world_size(), BACKEND)
             self._test_barrier_helper(group, group_id, rank, True, rank_to_GPU)
@@ -4176,6 +4827,8 @@ class DistributedTest:
             f"{BACKEND} does not support CPU barrier",
         )
         def test_barrier(self):
+            # [FUNCTION DOC] Skipped on backends without CPU barrier. Barrier timing check on the
+            # default group with CPU tensors.
             group, group_id, rank = self._init_global_test()
             self._test_barrier_helper(group, group_id, rank)
 
@@ -4185,6 +4838,8 @@ class DistributedTest:
             f"{BACKEND} does not support CPU barrier",
         )
         def test_barrier_group(self):
+            # [FUNCTION DOC] Larger world; skipped on backends without CPU barrier. Barrier timing
+            # check on the two-rank subgroup.
             group, group_id, rank = self._init_group_test()
             self._test_barrier_helper(group, group_id, rank)
 
@@ -4193,10 +4848,15 @@ class DistributedTest:
             f"{BACKEND} does not support CPU barrier",
         )
         def test_barrier_full_group(self):
+            # [FUNCTION DOC] Skipped on backends without CPU barrier. Barrier timing check on a
+            # group spanning all ranks.
             group, group_id, rank = self._init_full_group_test()
             self._test_barrier_helper(group, group_id, rank)
 
         def _model_step(self, model):
+            # [FUNCTION DOC] HELPER: Manual SGD-like step with unit learning rate: for each
+            # parameter that has a gradient, adds the gradient to the parameter in place without
+            # autograd tracking and then drops the gradient (sets it to nothing).
             for param in model.parameters():
                 if param.grad is not None:
                     with torch.no_grad():
@@ -4204,6 +4864,9 @@ class DistributedTest:
                     param.grad = None
 
         def _model_step_with_zero_grad(self, model):
+            # [FUNCTION DOC] HELPER: Same update as the plain model step but keeps the gradient
+            # tensor and zeroes it in place (after turning off its grad tracking) instead of
+            # dropping it.
             for param in model.parameters():
                 if param.grad is not None:
                     with torch.no_grad():
@@ -4212,6 +4875,10 @@ class DistributedTest:
                     param.grad.zero_()
 
         def _prepare_dummy_data(self, local_bs):
+            # [FUNCTION DOC] HELPER: Builds dummy data for DDP tests. Reads WORLD_SIZE from the
+            # environment, and returns (global batch size = world size times local_bs, random
+            # input of shape global batch by 2, random target of shape global batch by 4, an MSE
+            # loss module).
             # global_bs for DDP should be divisible by WORLD_SIZE
             world_size = int(os.environ["WORLD_SIZE"])
             global_bs = world_size * local_bs
@@ -4224,6 +4891,9 @@ class DistributedTest:
         def _test_DDP_helper(
             self, model, input_var, target, loss, scale_factor=1.0, memory_format=None
         ):
+            # [FUNCTION DOC] HELPER: Runs one training step on a model in training mode: forward
+            # on input_var, loss times scale_factor against target, backward. If memory_format is
+            # given, asserts the output is contiguous in that format.
             model.train()
             output = model(input_var)
             l = loss(output, target) * scale_factor
@@ -4232,6 +4902,8 @@ class DistributedTest:
                 self.assertTrue(output.is_contiguous(memory_format=memory_format))
 
         def _assert_equal_param(self, param_gpu, param_DDP):
+            # [FUNCTION DOC] HELPER: Asserts two parameter lists have the same length and are
+            # element-wise equal.
             self.assertEqual(len(param_gpu), len(param_DDP))
             for p_gpu, p_DDP in zip(param_gpu, param_DDP, strict=True):
                 self.assertEqual(p_gpu, p_DDP)
@@ -4253,6 +4925,14 @@ class DistributedTest:
             memory_format=None,
             n_iter=5,
         ):
+            # [FUNCTION DOC] HELPER: Core DDP equivalence loop. For n_iter iterations: trains the
+            # base (local) model on the full input and the DDP model on this rank's slice (offset
+            # defaults to rank times local_bs; the loss is scaled by world_size times local_bs
+            # over batch_size when world_size is non-zero), applies manual update steps
+            # (optionally keeping and zeroing grads), asserts parameters of both models are equal,
+            # and shuffles the input. In the middle iteration, if test_save is set and the init
+            # method is file based, the DDP model is saved and reloaded. At the end it saves and
+            # reloads the DDP model through a temporary file and asserts the state dicts match.
             for idx in range(n_iter):
                 # single cpu/gpu training
                 self._test_DDP_helper(
@@ -4316,6 +4996,11 @@ class DistributedTest:
             static_graph=False,
             set_static_graph_twice=False,
         ):
+            # [FUNCTION DOC] HELPER: End to end DDP on GPUs. Builds the Net model, a single-GPU
+            # copy and a DDP copy (on the first device of gpu_subset with the given bucket view
+            # and static graph options, optionally calling the static graph setter a second time),
+            # round-trips the DDP model through serialization, then runs the equivalence loop with
+            # CUDA data and ends with a barrier.
             # Run a simple end to end DDP model, use result of single node model
             # as baseline
 
@@ -4370,6 +5055,9 @@ class DistributedTest:
             self._barrier()
 
         def _test_DistributedDataParallelCPU(self, gradient_as_bucket_view=False):
+            # [FUNCTION DOC] HELPER: End to end DDP on CPU. Builds Net, a DDP-wrapped copy
+            # (optionally with gradient as bucket view), runs the equivalence loop with local
+            # batch size 2 and gradient zeroing, then a barrier. Returns the DDP model.
             # Run a simple end to end DDP-CPU model, use result of single node
             # model as baseline
             _group, _group_id, rank = self._init_global_test()
@@ -4408,12 +5096,15 @@ class DistributedTest:
             BACKEND == "nccl", "nccl does not support DDP on CPU models"
         )
         def test_DistributedDataParallelCPU(self):
+            # [FUNCTION DOC] Not for nccl. Runs the CPU DDP equivalence check.
             self._test_DistributedDataParallelCPU()
 
         @skip_but_pass_in_sandcastle_if(
             BACKEND == "nccl", "nccl does not support DDP on CPU models"
         )
         def test_DistributedDataParallelCPU_grad_is_view(self):
+            # [FUNCTION DOC] Not for nccl. Runs the CPU DDP equivalence check with gradients as
+            # views of the communication buckets.
             self._test_DistributedDataParallelCPU(gradient_as_bucket_view=True)
 
         @skip_but_pass_in_sandcastle_if(
@@ -4421,6 +5112,8 @@ class DistributedTest:
             f"The {BACKEND} backend does not support DistributedDataParallel",
         )
         def test_DistributedDataParallel_requires_grad(self):
+            # [FUNCTION DOC] Checks that wrapping a module that has no parameters requiring grad
+            # in DDP raises RuntimeError.
             # a module without gradients shouldn't be accepted
             self.assertRaises(
                 RuntimeError, lambda: nn.parallel.DistributedDataParallel(nn.Module())
@@ -4433,8 +5126,15 @@ class DistributedTest:
         )
         @skip_if_lt_x_gpu(int(os.environ["WORLD_SIZE"]))
         def test_ddp_zero_output_features(self):
+            # [FUNCTION DOC] Needs one GPU per rank. Checks that DDP can wrap a model containing a
+            # linear layer with zero output features (construction only).
+            # KNOWN ISSUE: the local ToyModel has no forward method; only construction is tested.
             class ToyModel(nn.Module):
+                # [CLASS DOC] HELPER: Local model with two linears and a ReLU, the second linear
+                # having zero output features. It defines no forward.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Builds the first linear, the ReLU and a linear with
+                    # zero output features.
                     super().__init__()
                     self.net1 = nn.Linear(10, 10)
                     self.relu = nn.ReLU()
@@ -4445,12 +5145,19 @@ class DistributedTest:
 
         @skip_but_pass_in_sandcastle_if(BACKEND == "nccl", "Gloo-only test")
         def test_ddp_create_graph(self):
+            # [FUNCTION DOC] Gloo only. Checks that DDP training does not raise when backward is
+            # run with graph creation enabled, for six iterations, and that parameters still
+            # require grad.
             class Model(nn.Module):
+                # [CLASS DOC] HELPER: Local model with a single scalar parameter p equal to one;
+                # forward returns its square.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Creates the scalar parameter.
                     super().__init__()
                     self.p = nn.Parameter(torch.tensor(1.0))
 
                 def forward(self):
+                    # [FUNCTION DOC] HELPER: Returns the parameter squared.
                     return self.p.pow(2)
 
             model = Model()
@@ -4475,6 +5182,10 @@ class DistributedTest:
         )
         @skip_if_lt_x_gpu(int(os.environ["WORLD_SIZE"]))
         def test_DistributedDataParallel_non_default_stream(self):
+            # [FUNCTION DOC] Needs one GPU per rank; skipped on Linux and ROCm (tracked issue).
+            # Runs a thousand training steps under a non-default CUDA stream and checks, by
+            # all-reducing the gradient, that each rank's gradient equals the average of rank
+            # values (i.e., DDP wrote the averaged gradient back before use).
             stream = torch.cuda.Stream(self.rank)
             rank = self.rank
             with torch.cuda.stream(stream):
@@ -4513,6 +5224,10 @@ class DistributedTest:
         )
         @skip_if_lt_x_gpu(int(os.environ["WORLD_SIZE"]))
         def test_ddp_comm_hook_logging(self):
+            # [FUNCTION DOC] Needs one GPU per rank. Checks DDP logging data: for python hooks
+            # (allreduce, fp16 compress, PowerSGD, batched PowerSGD, quantization hooks) and for
+            # builtin C++ hooks, the comm_hook entry is absent before registering and holds the
+            # hook name afterwards; without any hook it stays empty after two training steps.
             hooks = [
                 default.allreduce_hook,
                 default.fp16_compress_hook,
@@ -4580,6 +5295,15 @@ class DistributedTest:
             *functional_optim_args,
             **functional_optim_kwargs,
         ):
+            # [FUNCTION DOC] HELPER: Fused optimizer parity check (only used by disabled tests,
+            # see KNOWN ISSUE). For a large linear net (and resnet50 if torchvision exists) with
+            # deterministic cudnn, builds two DDP models, registers the optimizer fused into the
+            # communication hook on one (optionally on the first parameter only) and runs a normal
+            # optimizer step after backward on the other, trains six iterations each, and asserts
+            # parameters match, that the fused optimizer changed the targeted parameters, and
+            # untouched parameters stayed equal.
+            # KNOWN ISSUE: the tests calling this helper are inside a disabled string literal, so
+            # it is currently unreachable.
             rank = self.rank
             torch.cuda.set_device(rank)
             torch.manual_seed(rank)
@@ -4786,6 +5510,9 @@ class DistributedTest:
 
         @skip_if_lt_x_gpu(2)
         def test_get_data_parallel_params(self):
+            # [FUNCTION DOC] Needs 2 GPUs. Marks parameter a.weight as ignored in DDP, wraps the
+            # model, and checks that the data-parallel parameter helper omits it by name, and that
+            # the count without names equals the total parameter count minus one.
             torch.cuda.set_device(self.rank)
             model = TwoLinLayerNet().cuda()
             # Parameters to ignore are in the format {module_name}.{param_name}
@@ -4822,6 +5549,13 @@ class DistributedTest:
             init_before,
             gradient_as_bucket_view=True,
         ):
+            # [FUNCTION DOC] HELPER: Checks applying an optimizer in the backward pass. Seeds per
+            # rank, builds several models (small linear stacks, a large stack to hit stream races,
+            # resnet50 if torchvision exists), wraps a plain copy and an optimizer-in-backward
+            # copy in DDP (optimizer applied before or after DDP wrapping per init_before),
+            # asserts equal initial parameters, then for 8 iterations compares parameters after a
+            # regular optimizer step against the in-backward version and asserts the in-backward
+            # gradients are cleared.
             # Need to seed to ensure inputs are unique across rank. Otherwise,
             # allreduce won't have any effect.
             torch.manual_seed(self.rank)
@@ -4904,6 +5638,8 @@ class DistributedTest:
 
         @skip_if_lt_x_gpu(2)
         def test_ddp_apply_optim_in_backward(self):
+            # [FUNCTION DOC] Needs 2 GPUs. Runs the optimizer in backward check for SGD and Adam
+            # with the optimizer applied before and after DDP wrapping.
             for optim_cls, init_before in itertools.product(
                 [torch.optim.SGD, torch.optim.Adam], [True, False]
             ):
@@ -4916,6 +5652,8 @@ class DistributedTest:
 
         @skip_if_lt_x_gpu(2)
         def test_ddp_apply_optim_in_backward_grad_as_bucket_view_false(self):
+            # [FUNCTION DOC] Needs 2 GPUs. Runs the optimizer in backward check for SGD with
+            # gradients not viewed as bucket memory, applied both before and after wrapping.
             for init_before in [True, False]:
                 self._test_ddp_apply_optim_in_backward(
                     optim_cls=torch.optim.SGD,
@@ -4926,6 +5664,10 @@ class DistributedTest:
 
         @skip_if_lt_x_gpu(2)
         def test_ddp_apply_optim_in_backward_ignored_params(self):
+            # [FUNCTION DOC] Needs 2 GPUs. Applies SGD in backward with a.weight ignored by DDP.
+            # After one step, gathers the models from all ranks and checks that a.weight differs
+            # across ranks (it did not go through all-reduce) while a.bias and the b parameters
+            # are equal across ranks.
             torch.cuda.set_device(self.rank)
             for init_before in [True, False]:
                 with self.subTest(init_before=init_before):
@@ -4970,6 +5712,8 @@ class DistributedTest:
                         self.assertEqual(rank0_model.a.bias, m.a.bias)
 
         def _get_fp16_config(self) -> _MixedPrecision:
+            # [FUNCTION DOC] HELPER: Returns a mixed precision config with half precision
+            # parameters, reduction and buffers.
             return _MixedPrecision(
                 param_dtype=torch.float16,
                 reduce_dtype=torch.float16,
@@ -4978,6 +5722,10 @@ class DistributedTest:
 
         @skip_if_lt_x_gpu(2)
         def test_ddp_native_mixed_precision_ignored_params(self):
+            # [FUNCTION DOC] Needs 2 GPUs. Checks that DDP with native mixed precision does
+            # not attach the low and full precision shadow fields to ignored parameters or
+            # buffers (a.weight and buffer) but does for all others, with the expected dtypes
+            # (half and float32).
             rank = self.rank
             torch.manual_seed(rank)
             torch.cuda.manual_seed(rank)
@@ -5015,6 +5763,12 @@ class DistributedTest:
         def _test_ddp_native_mixed_precision(
             self, gradient_as_bucket_view, set_grad_to_none
         ):
+            # [FUNCTION DOC] HELPER: Native mixed precision check. Wraps a model (linear, buffer,
+            # frozen parameter) in DDP with half precision config; the forward asserts parameters,
+            # buffer and input are half precision. Checks buffers were cast at construction, each
+            # parameter has half and float32 shadow copies, and over six steps that parameters and
+            # gradients stay float32 and that gradients are identical across ranks; zeroes grads
+            # (optionally to none).
             rank = self.rank
             torch.manual_seed(rank)
             torch.cuda.manual_seed(rank)
@@ -5023,13 +5777,22 @@ class DistributedTest:
             mp_config = self._get_fp16_config()
 
             class MyModel(torch.nn.Module):
+                # [CLASS DOC] HELPER: Local model with a linear layer, a buffer, and a frozen
+                # parameter; its forward asserts mixed precision dtypes of parameters, buffer and
+                # input and returns linear output plus the frozen parameter.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Builds the linear (1 to 5), a random 1 by 2 buffer
+                    # and a frozen random 10 by 5 parameter.
                     super().__init__()
                     self.m = torch.nn.Linear(1, 5)
                     self.register_buffer("buffer", torch.randn(1, 2))
                     self.p = torch.nn.Parameter(torch.randn(10, 5), requires_grad=False)
 
                 def forward(self_, x):
+                    # [FUNCTION DOC] HELPER: Asserts (using the enclosing test case) that the
+                    # linear's parameters, the buffer and the input have the mixed precision
+                    # dtypes, then returns the linear applied to x plus the frozen parameter. The
+                    # first argument is the model itself.
                     params = self_.m.parameters()
                     for p in params:
                         self.assertEqual(mp_config.param_dtype, p.dtype)
@@ -5082,6 +5845,8 @@ class DistributedTest:
         def test_ddp_native_mixed_precision_no_grad_as_bucket_view_no_set_grad_none(
             self,
         ):
+            # [FUNCTION DOC] Needs 2 GPUs. Native mixed precision check without bucket views and
+            # without setting gradients to none.
             self._test_ddp_native_mixed_precision(
                 gradient_as_bucket_view=False,
                 set_grad_to_none=False,
@@ -5089,6 +5854,8 @@ class DistributedTest:
 
         @skip_if_lt_x_gpu(2)
         def test_ddp_native_mixed_precision_grad_as_bucket_view_no_set_grad_none(self):
+            # [FUNCTION DOC] Needs 2 GPUs. Native mixed precision check with gradients as bucket
+            # views and without setting gradients to none.
             self._test_ddp_native_mixed_precision(
                 gradient_as_bucket_view=True,
                 set_grad_to_none=False,
@@ -5096,6 +5863,8 @@ class DistributedTest:
 
         @skip_if_lt_x_gpu(2)
         def test_ddp_native_mixed_precision_grad_as_bucket_view_set_grad_to_none(self):
+            # [FUNCTION DOC] Needs 2 GPUs. Native mixed precision check with gradients as bucket
+            # views and gradients set to none.
             self._test_ddp_native_mixed_precision(
                 gradient_as_bucket_view=True, set_grad_to_none=True
             )
@@ -5104,11 +5873,21 @@ class DistributedTest:
         def test_ddp_native_mixed_precision_no_grad_as_bucket_view_set_grad_to_none(
             self,
         ):
+            # [FUNCTION DOC] Needs 2 GPUs. Native mixed precision check.
+            # KNOWN ISSUE: the name says no grad as bucket view, but the call passes
+            # gradient_as_bucket_view true, making it a duplicate of the grad-as-view plus
+            # set-to-none test.
             self._test_ddp_native_mixed_precision(
                 gradient_as_bucket_view=True, set_grad_to_none=True
             )
 
         def _test_ddp_hook_parity(self, state, hook, num_validated_iters=100):
+            # [FUNCTION DOC] HELPER: Communication hook parity check. Wraps a linear layer in two
+            # DDP models (one with the given hook and state registered, one default), using the
+            # state's process group (or the state itself if it has none). For 100 iterations,
+            # zeroes gradients, runs forward/backward on a rank-valued batch on both and, for the
+            # first num_validated_iters, asserts the hook gradient equals the mean of rank values
+            # and equals the default all-reduce gradient.
             rank = self.rank
             m = torch.nn.Linear(1, 5)
             try:
@@ -5171,6 +5950,8 @@ class DistributedTest:
         )
         @skip_if_lt_x_gpu(int(os.environ["WORLD_SIZE"]))
         def test_ddp_hook_parity_allreduce(self):
+            # [FUNCTION DOC] Needs one GPU per rank and CUDA-capable hooks. Hook parity check with
+            # the built-in all-reduce hook.
             self._test_ddp_hook_parity(state=None, hook=default.allreduce_hook)
 
         @skip_but_pass_in_sandcastle_if(
@@ -5179,6 +5960,8 @@ class DistributedTest:
         )
         @skip_if_lt_x_gpu(int(os.environ["WORLD_SIZE"]))
         def test_ddp_hook_parity_allreduce_process_group(self):
+            # [FUNCTION DOC] Needs one GPU per rank. Hook parity check with the all-reduce hook
+            # where a process group over all ranks is passed both to DDP and as the hook state.
             # process_group is passed in to both DDP and comm. hook
             world_size = dist.get_world_size()
             rank_to_GPU = init_multigpu_helper(world_size, BACKEND)
@@ -5192,6 +5975,8 @@ class DistributedTest:
         )
         @skip_if_lt_x_gpu(int(os.environ["WORLD_SIZE"]))
         def test_ddp_hook_parity_powerSGD(self):
+            # [FUNCTION DOC] Needs one GPU per rank. Hook parity check with the PowerSGD hook
+            # (rank 1 approximation, starting at iteration 2) with and without warm start.
             for warm_start in [True, False]:
                 powersgd_state = powerSGD.PowerSGDState(
                     process_group=None,
@@ -5209,6 +5994,13 @@ class DistributedTest:
         )
         @skip_if_lt_x_gpu(int(os.environ["WORLD_SIZE"]))
         def test_ddp_hook_parity_post_localSGD(self):
+            # [FUNCTION DOC] Needs one GPU per rank. Hook parity check for the post-local-SGD hook
+            # in several configurations: start iteration 10 on the world group, without post-local
+            # gradient all-reduce (validating only the first 10 iterations), with no subgroup
+            # (only when the world size matches; see KNOWN ISSUE), and with start iteration 1000
+            # (never switching).
+            # KNOWN ISSUE: the condition compares self.world_size, which is a string from the
+            # environment, with an integer, so the no-subgroup case is never run.
             # Although we start run local SGD at iteration 10, since we still use the global process group to run it,
             # the post-LocalSGD actually still allreduces gradients globally for the remaining iterations.
             state = post_localSGD.PostLocalSGDState(
@@ -5263,6 +6055,10 @@ class DistributedTest:
             global_batch_size,
             gradient_as_bucket_view=False,
         ):
+            # [FUNCTION DOC] HELPER: Builds a Net model, a DDP copy on a single device (given
+            # devices or the CUDA device of the rank) with tiny buckets (0.001 MB) and optional
+            # gradient-as-bucket-view, and random input and target of the global batch size.
+            # Returns (model, ddp_model, input, target).
             model = Net()
             device = devices[0] if devices else torch.device(f"cuda:{rank:d}")
             ddp_model = DistributedDataParallel(
@@ -5286,6 +6082,9 @@ class DistributedTest:
             global_batch_size,
             gradient_as_bucket_view=False,
         ):
+            # [FUNCTION DOC] HELPER: CPU counterpart: builds a Net model, a DDP copy with tiny
+            # buckets and optional bucket views, and random CPU input and target. Returns (model,
+            # ddp_model, input, target).
             model = Net()
             ddp_model = DistributedDataParallel(
                 copy.deepcopy(model),
@@ -5300,6 +6099,15 @@ class DistributedTest:
         def _test_accumulate_gradients_no_sync(
             self, num_iters=2, ddp_comm_hook=None, gradient_as_bucket_view=False
         ):
+            # [FUNCTION DOC] HELPER: Gradient accumulation with no_sync check. Builds CPU models
+            # (mpi, gloo) or single-GPU models (nccl), optionally registers a communication hook,
+            # checks that a forward under no_grad inside no_sync accumulates nothing, then over
+            # num_iters iterations compares gradients of the local model (trained on all data)
+            # with those of the DDP model fed its slice: on even iterations inside no_sync the
+            # gradients must differ, on odd iterations (synchronizing) they must be equal.
+            # Shuffles the input each iteration with a fixed seed.
+            # KNOWN ISSUE: for other backends the model variables would be undefined; the callers'
+            # skip decorators prevent this.
             """
             This is the recommended way to implement accumulate grads.
             If ``ddp_comm_hook`` input was specified, it will also register that hook
@@ -5336,6 +6144,9 @@ class DistributedTest:
                 ddp_model.register_comm_hook(group_id, ddp_comm_hook)
 
             def step_model(model, input, target):
+                # [FUNCTION DOC] HELPER: Puts the model in training mode, runs forward, computes
+                # the mean squared error against the target (moved to the output device) and
+                # runs backward.
                 model.train()
                 output = model(input)
                 loss = F.mse_loss(output, target.to(output.device))
@@ -5386,6 +6197,8 @@ class DistributedTest:
         )
         @nccl_skip_if_lt_x_gpu(BACKEND, 2)
         def test_accumulate_gradients_no_sync(self):
+            # [FUNCTION DOC] Runs the gradient accumulation with no_sync check with default
+            # arguments (mpi, nccl or gloo).
             """
             Runs _test_accumulate_gradients_no_sync using default inputs
             """
@@ -5397,6 +6210,8 @@ class DistributedTest:
         )
         @nccl_skip_if_lt_x_gpu(BACKEND, 2)
         def test_accumulate_gradients_no_sync_grad_is_view(self):
+            # [FUNCTION DOC] Runs the gradient accumulation with no_sync check with gradients as
+            # bucket views.
             """
             Runs _test_accumulate_gradients_no_sync using default inputs
             """
@@ -5408,6 +6223,10 @@ class DistributedTest:
         )
         @nccl_skip_if_lt_x_gpu(BACKEND, 2)
         def test_accumulate_gradients_no_sync_allreduce_hook(self):
+            # [FUNCTION DOC] Runs four iterations of the no_sync accumulation check with an
+            # all-reduce communication hook (divides the bucket by world size, all-reduces through
+            # the group, returns a future of the first result) to verify the future result is used
+            # as gradients.
             """
             Runs multiple iterations on _test_accumulate_gradients_no_sync
             using allreduce hook and validates whether future result was properly
@@ -5419,6 +6238,9 @@ class DistributedTest:
             def allreduce_hook(
                 group_id: object, bucket: dist.GradBucket
             ) -> torch.futures.Future[torch.Tensor]:
+                # [FUNCTION DOC] HELPER: Communication hook: divides the bucket buffer by the
+                # world size, all-reduces it through the process group and returns a future that
+                # resolves to the reduced tensor.
                 tensors = [bucket.buffer() / world_size]
                 return (
                     group_id.allreduce(tensors)
@@ -5436,6 +6258,9 @@ class DistributedTest:
         )
         @nccl_skip_if_lt_x_gpu(BACKEND, 2)
         def test_accumulate_gradients_no_sync_allreduce_with_then_hook(self):
+            # [FUNCTION DOC] Runs four iterations of the no_sync accumulation check with a hook
+            # that chains callbacks (multiply by 2, then divide by twice the world size) to verify
+            # the final future value is used as gradients.
             """
             Runs multiple iterations on _test_accumulate_gradients_no_sync using allreduce
             hook that also uses then callbacks. In first then callback result is multiplied
@@ -5448,13 +6273,20 @@ class DistributedTest:
             def allreduce_with_then_hook(
                 group_id: object, bucket: dist.GradBucket
             ) -> torch.futures.Future[torch.Tensor]:
+                # [FUNCTION DOC] HELPER: Communication hook: all-reduces the bucket buffer and
+                # returns a future chained with a multiply-by-two callback and a
+                # divide-by-two-times-world-size callback, so that the net result is the mean.
                 fut = group_id.allreduce([bucket.buffer()]).get_future()
 
                 def mult(fut):
+                    # [FUNCTION DOC] HELPER: Callback returning twice the first element of the
+                    # completed future's value.
                     # Multiply the result by 2.
                     return 2 * fut.wait()[0]
 
                 def div(fut):
+                    # [FUNCTION DOC] HELPER: Callback returning the completed future's value
+                    # divided by twice the world size.
                     # Divide the result by 2 * world_size.
                     return fut.wait() / (2 * world_size)
 
@@ -5470,10 +6302,17 @@ class DistributedTest:
         )
         @nccl_skip_if_lt_x_gpu(BACKEND, 2)
         def test_get_future(self):
+            # [FUNCTION DOC] Checks the future returned by an asynchronous all-reduce: chains a
+            # multiply by 3 and an add of 1 callback and checks the result equals the sum over
+            # ranks times 3 plus 1.
             def mult(fut):
+                # [FUNCTION DOC] HELPER: Callback returning each tensor of the completed future
+                # multiplied by 3, as a list.
                 return [t * 3 for t in fut.wait()]
 
             def add(fut):
+                # [FUNCTION DOC] HELPER: Callback returning each tensor of the completed future
+                # plus 1, as a list.
                 return [t + 1 for t in fut.wait()]
 
             group, group_id, rank = self._init_global_test()
@@ -5495,6 +6334,11 @@ class DistributedTest:
         )
         @skip_if_no_gpu
         def test_DistributedDataParallel(self):
+            # [FUNCTION DOC] Skipped on Linux (tracked issue); needs a GPU. Runs the GPU DDP
+            # equivalence check for every combination of bucket-view and static-graph flags,
+            # additionally with the static graph setter called twice, with an output device, and
+            # with device objects instead of indices.
+            # KNOWN ISSUE: the output_device argument is passed but the helper ignores it.
             _group, _group_id, rank = self._init_global_test()
             rank_to_GPU = init_multigpu_helper(dist.get_world_size(), BACKEND)
             gpus = list(rank_to_GPU[rank])
@@ -5538,6 +6382,10 @@ class DistributedTest:
                 )
 
         def _test_DistributedDataParallel_with_amp(self, grad_is_view=False):
+            # [FUNCTION DOC] HELPER: Runs 20 iterations of AMP (autocast plus gradient scaler)
+            # training with SGD on a DDP-wrapped Net on the rank's GPU, verifying gradients are
+            # initially none and during training finite for parameters requiring grad; shuffles
+            # the input each step. Returns the DDP model.
             torch.manual_seed(31415)
             # Creates model and optimizer in default precision
             model = Net().cuda()
@@ -5598,6 +6446,8 @@ class DistributedTest:
         )
         @skip_if_no_gpu
         def test_DistributedDataParallel_with_amp_and_grad_is_view(self):
+            # [FUNCTION DOC] Needs a GPU. Trains with AMP once with gradients not as views and
+            # once as views, then asserts the final parameters of both models are equal.
             torch.cuda.set_device(self.rank)
             ddp_model_grad_not_view = self._test_DistributedDataParallel_with_amp(
                 grad_is_view=False
@@ -5622,6 +6472,13 @@ class DistributedTest:
             output_device=None,
             affine=True,
         ):
+            # [FUNCTION DOC] HELPER: Sync batch norm DDP check. Builds BatchNormNet (optionally
+            # without affine), a single-GPU copy and a DDP copy converted to SyncBatchNorm,
+            # round-trips the DDP model through serialization, then runs the equivalence loop on
+            # CUDA data with the given offset and local/global batch sizes.
+            # KNOWN ISSUE: the last positional argument (5 for affine, 2 otherwise) is intended as
+            # the iteration count but is bound to the zero_grad parameter of the loop helper, so
+            # it only turns on gradient zeroing; output_device is also unused.
             # Run a simple end to end DDP model, use result of single node model
             # as baseline
 
@@ -5674,6 +6531,12 @@ class DistributedTest:
             self._barrier()
 
         def _test_post_localSGD_optimizer_parity(self, create_averager, grad_is_view):
+            # [FUNCTION DOC] HELPER: Checks that the post-local-SGD optimizer matches manual
+            # averaging. Two identical DDP models: one trained with SGD plus a separately
+            # applied averager, the other with the post-local-SGD optimizer wrapping SGD and
+            # its own averager (averagers are created separately because process groups may
+            # not be copyable). Over 20 steps asserts equal parameters and finally equal
+            # averager step counters.
             learning_rate = 0.03
 
             DDP_NET = Net()
@@ -5724,15 +6587,21 @@ class DistributedTest:
             self.assertEqual(averager.step, averager2.step)
 
         def _create_periodic_model_averager(self):
+            # [FUNCTION DOC] HELPER: Returns a periodic model averager with period 4 and 10
+            # warmup steps.
             return averagers.PeriodicModelAverager(period=4, warmup_steps=10)
 
         def _create_post_localSGD_optimizer(self, net, learning_rate, averager):
+            # [FUNCTION DOC] HELPER: Returns a post-local-SGD optimizer wrapping SGD with the
+            # given learning rate over the net's parameters and the given averager.
             return post_localSGD_optimizer.PostLocalSGDOptimizer(
                 optim=torch.optim.SGD(net.parameters(), lr=learning_rate),
                 averager=averager,
             )
 
         def _perform_a_train_step(self, optimizer, net, loss_fn, input, target):
+            # [FUNCTION DOC] HELPER: One training step: zero gradients, forward, loss, backward,
+            # optimizer step.
             optimizer.zero_grad()
             output = net(input)
             loss = loss_fn(output, target)
@@ -5742,6 +6611,11 @@ class DistributedTest:
         def _test_post_localSGD_optimizer_step_reload(
             self, create_averager, chkpt_file
         ):
+            # [FUNCTION DOC] HELPER: Checks save and reload of the post-local-SGD optimizer state.
+            # Trains 20 steps, rank 0 saves the state to chkpt_file, all ranks load it into a
+            # second optimizer and the averager step counters must match and be non-zero. Then
+            # removes the step entry from the checkpoint and asserts that loading emits a
+            # UserWarning about a missing step counter and resets the step to 0.
             learning_rate = 0.03
 
             net_using_post_localSGD_opt = torch.nn.parallel.DistributedDataParallel(
@@ -5809,6 +6683,8 @@ class DistributedTest:
             f"The {BACKEND} backend does not support DistributedDataParallel",
         )
         def test_post_localSGD_optimizer_parity(self):
+            # [FUNCTION DOC] Needs 2 GPUs. Post-local-SGD optimizer parity with a periodic
+            # model averager.
             torch.cuda.set_device(self.rank)
             self._test_post_localSGD_optimizer_parity(
                 self._create_periodic_model_averager,
@@ -5821,6 +6697,8 @@ class DistributedTest:
             f"The {BACKEND} backend does not support DistributedDataParallel",
         )
         def test_post_localSGD_optimizer_parity_grad_is_view(self):
+            # [FUNCTION DOC] Needs 2 GPUs. Post-local-SGD optimizer parity with a periodic
+            # averager and gradients as bucket views.
             torch.cuda.set_device(self.rank)
             self._test_post_localSGD_optimizer_parity(
                 self._create_periodic_model_averager,
@@ -5828,6 +6706,8 @@ class DistributedTest:
             )
 
         def _create_hierarchical_model_averager(self):
+            # [FUNCTION DOC] HELPER: Returns a hierarchical model averager with groups of size 2
+            # every 2 steps and the world size every 4 steps, with 4 warmup steps.
             period_group_size_dict = OrderedDict([(2, 2), (4, dist.get_world_size())])
             return hierarchicalSGD.HierarchicalModelAverager(
                 period_group_size_dict=period_group_size_dict, warmup_steps=4
@@ -5840,6 +6720,8 @@ class DistributedTest:
             f"The {BACKEND} backend does not support DistributedDataParallel",
         )
         def test_post_localSGD_optimizer_parity_with_hierarchical_sgd(self):
+            # [FUNCTION DOC] Needs 4 GPUs and an even world size. Post-local-SGD optimizer parity
+            # with a hierarchical averager.
             torch.cuda.set_device(self.rank)
             self._test_post_localSGD_optimizer_parity(
                 self._create_hierarchical_model_averager,
@@ -5855,6 +6737,8 @@ class DistributedTest:
         def test_post_localSGD_optimizer_parity_with_hierarchical_sgd_grad_is_view(
             self,
         ):
+            # [FUNCTION DOC] Needs 4 GPUs and an even world size. Same as above with gradients as
+            # bucket views.
             torch.cuda.set_device(self.rank)
             self._test_post_localSGD_optimizer_parity(
                 self._create_hierarchical_model_averager,
@@ -5867,6 +6751,8 @@ class DistributedTest:
             f"The {BACKEND} backend does not support DistributedDataParallel",
         )
         def test_post_localSGD_optimizer_step_reload(self):
+            # [FUNCTION DOC] Needs 2 GPUs. Post-local-SGD optimizer state save and reload check
+            # using a shared temporary file and a periodic averager.
             torch.cuda.set_device(self.rank)
             with _rank_temp_file() as tmp_file:
                 self._test_post_localSGD_optimizer_step_reload(
@@ -5879,6 +6765,8 @@ class DistributedTest:
         )
         @skip_if_no_gpu
         def test_DistributedDataParallel_SyncBatchNorm_Channels_Last(self):
+            # [FUNCTION DOC] Needs a GPU. Runs the sync batch norm memory format check for
+            # channels_last and channels_last_3d.
             self._test_DistributedDataParallel_SyncBatchNorm_with_memory_format(
                 torch.channels_last
             )
@@ -5889,6 +6777,11 @@ class DistributedTest:
         def _test_DistributedDataParallel_SyncBatchNorm_with_memory_format(
             self, memory_format
         ):
+            # [FUNCTION DOC] HELPER: Sync batch norm check with a memory format. Builds a
+            # SyncBatchNorm module with 2 channels, a DDP copy, and random 4-D (channels_last) or
+            # 5-D (channels_last_3d) CUDA inputs and targets in the requested memory format; runs
+            # the equivalence loop, which also asserts outputs are contiguous in that format, and
+            # ends with a barrier.
             _group, _group_id, rank = self._init_global_test()
             num_processes = dist.get_world_size()
             local_bs = 2
@@ -5940,6 +6833,8 @@ class DistributedTest:
         )
         @skip_if_no_gpu
         def test_DistributedDataParallel_SyncBatchNorm(self):
+            # [FUNCTION DOC] Needs a GPU. Sync batch norm DDP check with one GPU per process:
+            # plain, with an output device, and with device objects.
             _group, _group_id, rank = self._init_global_test()
             world_size = dist.get_world_size()
             # DDP does not support replicating BN layers within a process, hence
@@ -5985,6 +6880,7 @@ class DistributedTest:
         )
         @skip_if_no_gpu
         def test_DistributedDataParallel_SyncBatchNorm_No_Affine(self):
+            # [FUNCTION DOC] Needs a GPU. Sync batch norm DDP check without affine parameters.
             _group, _group_id, rank = self._init_global_test()
             world_size = dist.get_world_size()
             # DDP does not support replicating BN layers within a process, hence
@@ -6010,6 +6906,9 @@ class DistributedTest:
         )
         @skip_if_no_gpu
         def test_DistributedDataParallel_SyncBatchNorm_2D_Input(self):
+            # [FUNCTION DOC] Needs a GPU. Sync batch norm check on 2-D input (BatchNorm1d
+            # converted to sync batch norm), with cudnn disabled to avoid numerical divergence of
+            # the kernels, and a final barrier.
             _group, _group_id, rank = self._init_global_test()
             # DDP does not support replicating BN layers within a process, hence
             # testing with one module replica per process
@@ -6057,6 +6956,8 @@ class DistributedTest:
         @skip_if_no_gpu
         @require_world_size(2)
         def test_DistributedDataParallel_SyncBatchNorm_Single_Input_Per_Process(self):
+            # [FUNCTION DOC] Needs a GPU and exactly 2 ranks at least. Sync batch norm check with
+            # a single sample per process, with cudnn disabled.
             _group, _group_id, rank = self._init_global_test()
             # DDP does not support replicating BN layers within a process, hence
             # testing with one module replica per process
@@ -6105,6 +7006,9 @@ class DistributedTest:
         def test_DistributedDataParallel_SyncBatchNorm_Diff_Input_Sizes_Running_Value(
             self,
         ):
+            # [FUNCTION DOC] Needs a GPU. Checks that sync batch norm running mean and variance
+            # after 100 training steps equal the statistics of the concatenation of all ranks'
+            # inputs, where each rank's input has a different size.
             ONLY_SBN_NET = nn.SyncBatchNorm(2, momentum=0.99)
             _group, _group_id, rank = self._init_global_test()
             model = nn.parallel.DistributedDataParallel(
@@ -6147,6 +7051,8 @@ class DistributedTest:
         )
         @skip_if_no_gpu
         def test_DistributedDataParallel_SyncBatchNorm_Diff_Input_Sizes_gradient(self):
+            # [FUNCTION DOC] Needs a GPU. Sync batch norm gradient check where each rank has a
+            # different local batch size (rank+2).
             _group, _group_id, rank = self._init_global_test()
             # only do single GPU per process
             gpus = [rank]
@@ -6171,6 +7077,9 @@ class DistributedTest:
         )
         @skip_if_no_gpu
         def test_DistributedDataParallel_SyncBatchNorm_half(self):
+            # [FUNCTION DOC] Needs a GPU. Checks that a half precision model with sync batch norm
+            # in DDP runs forward and backward without dtype errors and that outputs and gradients
+            # are half precision.
             _group, _group_id, rank = self._init_global_test()
 
             model = BatchNormNet()
@@ -6188,6 +7097,12 @@ class DistributedTest:
                 self.assertEqual(param.grad.dtype, torch.float16)
 
         def _test_ddp_logging_data(self, is_gpu):
+            # [FUNCTION DOC] HELPER: DDP logging data check. Wraps Net in DDP (on GPU or CPU),
+            # sets the runtime logging sample rate to 2, and trains 20 iterations. After each step
+            # from iteration 1 on, asserts that sampled iterations (all before 10, then every even
+            # one) have positive forward, backward compute and communication times, with overlap
+            # not exceeding either and the logged iteration equal to the current one, and that
+            # unsampled iterations leave the logged iteration unchanged. Returns the DDP model.
             rank = dist.get_rank()
             model_DDP = Net()
             if is_gpu:
@@ -6260,7 +7175,18 @@ class DistributedTest:
             BACKEND == "nccl", "nccl does not support DDP on CPU models"
         )
         def test_ddp_logging_data_cpu(self):
+            # [FUNCTION DOC] Not for nccl. Sets the debug level to INFO (global state change),
+            # then runs the logging data scenario on CPU and checks many static and runtime
+            # logging fields: world size, rank, module name, empty device ids, output device of
+            # minus one, bucket cap of 25 MB, backend, final iteration 18, dtypes, parameter sizes
+            # and counts, bucket sizes, environment variables, gloo thread settings, absent nccl
+            # settings, rebuilt bucket info, gradient ready order, positive average timings and
+            # ordering of host-side timestamps. Finally checks the logging of a mixed double and
+            # float large net with a 1.5 MB bucket cap yields two bucket sizes and dtypes double
+            # then float.
             def parse_env(var):
+                # [FUNCTION DOC] HELPER: Returns the environment variable value or the string N/A
+                # when unset.
                 return os.environ.get(var, "N/A")
 
             dist.set_debug_level(dist.DebugLevel.INFO)
@@ -6411,6 +7337,10 @@ class DistributedTest:
         )
         @skip_if_no_gpu
         def test_ddp_logging_data_gpu(self):
+            # [FUNCTION DOC] Needs a GPU. Runs the logging data scenario on GPU and checks device
+            # ids and output device equal the rank, the gradient ready order and rebuilt bucket
+            # indices, positive average forward time and overlap time, overlap not exceeding
+            # compute or communication time, and ordering of host-side timestamps.
             _group, _group_id, rank = self._init_global_test()
             model_DDP = self._test_ddp_logging_data(is_gpu=True)
             ddp_logging_data = model_DDP._get_ddp_logging_data()
@@ -6464,6 +7394,9 @@ class DistributedTest:
         @require_backend_is_available(DistTestCases.backend_feature["gpu"])
         @skip_if_lt_x_gpu(2)
         def test_ddp_bucket_cap_mb_list(self):
+            # [FUNCTION DOC] Needs 2 GPUs. Checks DDP's bucket capacity list option: with a list
+            # of [1, 2] MB the stored bucket byte cap list equals the sizes in bytes after two
+            # training steps (no rebuild needed); with a plain bucket cap the list stays empty.
             """
             Test that bucket_cap_mb_list parameter is properly used for bucket rebuilding.
             When bucket_cap_mb_list is provided, it should be used to rebuild buckets.
@@ -6528,6 +7461,9 @@ class DistributedTest:
             BACKEND == "nccl", "nccl does not support DDP on CPU models"
         )
         def test_static_graph_api_cpu(self):
+            # [FUNCTION DOC] Not for nccl. Checks that setting a static graph after a training
+            # iteration raises RuntimeError (should be called before training loop starts) and
+            # that the error is recorded in DDP logging data.
             model_DDP = nn.parallel.DistributedDataParallel(Net())
             expected_err = "should be called before training loop starts"
             with self.assertRaisesRegex(RuntimeError, expected_err):
@@ -6550,6 +7486,8 @@ class DistributedTest:
 
         @skipIfNoTorchVision
         def test_SyncBatchNorm_process_group(self):
+            # [FUNCTION DOC] Requires torchvision. Checks that converting resnet50 to sync batch
+            # norm with a given process group propagates that group to nested batch norm layers.
             # When adopting `convert_sync_batchnorm` to convert a `nn.modules`,
             # it needs to recursively pass the `process_group` in the module when the `SyncBatchNorm`
             # is nested in a sub-module or sub-sub-module (e.g. resnet50 in torchvision.models).
@@ -6566,6 +7504,10 @@ class DistributedTest:
         def _run_reduction_test(
             self, tensor, expected_tensor, op, reduction_fn=dist.all_reduce, dst=None
         ):
+            # [FUNCTION DOC] HELPER: Runs a reduction (all-reduce by default, or another function
+            # that needs a destination rank, otherwise raises ValueError) on tensor with op; for
+            # destination-based functions only the destination rank checks that the tensor equals
+            # expected_tensor, otherwise every rank checks.
             if reduction_fn is not dist.all_reduce and dst is None:
                 raise ValueError(f"Reduction fn {reduction_fn} must specify dst!")
             if dst is not None:
@@ -6580,6 +7522,9 @@ class DistributedTest:
         @require_backend_is_available({"nccl"})
         @skip_if_lt_x_gpu(2)
         def test_nccl_backend_bool_allreduce(self):
+            # [FUNCTION DOC] NCCL only, needs 2 GPUs. Checks boolean tensor all-reduce: product
+            # and min of mixed values give all False, all True stays True; sum and max of mixed
+            # values give all True.
             torch.cuda.set_device(self.rank)
             # Run all_reduce with PRODUCT
             element = self.rank % 2 == 0
@@ -6607,6 +7552,9 @@ class DistributedTest:
         @require_backend_is_available({"nccl"})
         @skip_if_lt_x_gpu(2)
         def test_nccl_backend_bool_allgather(self):
+            # [FUNCTION DOC] NCCL only, needs 2 GPUs. Checks all-gather of boolean tensors: each
+            # rank receives the tensors of all ranks (alternating by rank parity) and its own
+            # input is not modified.
             torch.cuda.set_device(self.rank)
             inp = {0: [True, True], 1: [False, True]}
             input_tensor = torch.tensor(inp[self.rank % 2]).to(self.rank)
@@ -6629,6 +7577,8 @@ class DistributedTest:
         @require_backend_is_available({"nccl"})
         @skip_if_lt_x_gpu(int(os.environ["WORLD_SIZE"]))
         def test_nccl_backend_bool_reduce(self):
+            # [FUNCTION DOC] NCCL only, needs one GPU per rank. Checks boolean reduce to rank 0
+            # for product, min, sum and max, with expectations for mixed and all-True inputs.
             torch.cuda.set_device(self.rank)
             inp = {0: [True, True], 1: [False, False]}
             # Run reduce() with product op
@@ -6657,6 +7607,8 @@ class DistributedTest:
         @require_backend_is_available({"nccl"})
         @skip_if_lt_x_gpu(2)
         def test_nccl_backend_bool_broadcast(self):
+            # [FUNCTION DOC] NCCL only, needs 2 GPUs. Rank 0 broadcasts a random boolean tensor;
+            # then all ranks all-gather it and verify they all hold the same values.
             tensor_size = 10
             bcast_tensor = torch.tensor(
                 [
@@ -6681,6 +7633,14 @@ class DistributedTest:
         )
         @skip_if_lt_x_gpu(int(os.environ["WORLD_SIZE"]))
         def test_DistributedSampler_padding(self):
+            # [FUNCTION DOC] Needs one GPU per rank. Checks DistributedSampler sizing: with
+            # drop_last the sample count is the largest multiple of the world size not above the
+            # dataset size (divided by world size), without drop_last it is the rounded-up share,
+            # and a tiny dataset is padded; in each case total size equals samples times world
+            # size, the iterator length matches, and all ranks agree on the sample count.
+            # KNOWN ISSUE: the expected size for the drop_last case uses a ceiling of a
+            # difference, which is not the floor formula described in the comment; it only matches
+            # for the sizes used here.
             # Tests padding of distributed sampler.
             world_size = dist.get_world_size()
 
@@ -6714,6 +7674,8 @@ class DistributedTest:
             self.assertEqual(len(indices_list), local_num_samples)
 
             def validate_global_samples(local_num_samples):
+                # [FUNCTION DOC] HELPER: All-gathers the local sample count from every rank and
+                # asserts all ranks report the same count.
                 # Ensure that each rank processes the same number of samples.
                 world_samples = [
                     torch.LongTensor([0]).to(self.rank) for _ in range(world_size)
@@ -6759,6 +7721,12 @@ class DistributedTest:
             validate_global_samples(local_num_samples)
 
         def _test_allgather_object(self, subgroup=None):
+            # [FUNCTION DOC] HELPER: Checks object all-gather. Each rank contributes one object
+            # from the shared test list (selected by rank; for nccl, the device is set to a
+            # different rank's index and an object holding a GPU tensor is added), gathers into
+            # a list, and asserts every entry equals the expected object. An optional subgroup
+            # is used.
+            # KNOWN ISSUE: the GPU object is always created on device 0 regardless of the rank.
             # Only set device for NCCL backend since it must use GPUs.
 
             gather_objects = create_collectives_object_test_list()
@@ -6790,6 +7758,8 @@ class DistributedTest:
         )
         @with_dist_debug_levels(levels=["OFF", "INFO", "DETAIL"])
         def test_all_gather_object_default_pg(self):
+            # [FUNCTION DOC] Requires a GPU backend and enough GPUs for nccl; runs with debug
+            # levels OFF, INFO and DETAIL. Object all-gather check on the default group.
             return self._test_allgather_object()
 
         @require_backend_is_available(DistTestCases.backend_feature["gpu"])
@@ -6798,12 +7768,22 @@ class DistributedTest:
         )
         @with_dist_debug_levels(levels=["DETAIL", "OFF", "INFO"])
         def test_all_gather_object_subgroup(self):
+            # [FUNCTION DOC] Requires a GPU backend and enough GPUs for nccl; runs under several
+            # debug levels. Object all-gather check on a new subgroup that spans all ranks.
             default = _get_default_group()
             backend = dist.get_backend(default)
             subgroup = dist.new_group(backend=backend)
             return self._test_allgather_object(subgroup=subgroup)
 
         def _test_gather_object(self, pg=None):
+            # [FUNCTION DOC] HELPER: Checks object gather. Gathers objects to rank 0 of the
+            # group (list only provided there) and verifies the other ranks' list stays
+            # untouched while rank 0 sees the expected objects (for nccl, adds a GPU-tensor
+            # object). Then verifies that gathering an object of a locally defined class (not
+            # picklable) raises AttributeError.
+            # KNOWN ISSUE: the unpicklable-object check calls the all-gather object function, not
+            # the gather function under test, and the untouched-list check sizes the list by the
+            # world size rather than the group size.
             # Ensure stateful objects can be gathered
             gather_objects = create_collectives_object_test_list()
             my_rank = dist.get_rank(pg)
@@ -6839,6 +7819,8 @@ class DistributedTest:
 
             # Validate errors when objects can't be pickled.
             class Bar:
+                # [CLASS DOC] HELPER: Empty local class whose instances cannot be pickled because
+                # the class is defined inside a function.
                 pass
 
             b = Bar()
@@ -6857,6 +7839,8 @@ class DistributedTest:
         @with_dist_debug_levels(levels=["DETAIL", "OFF", "INFO"])
         @require_exact_world_size(4)
         def test_gather_object(self):
+            # [FUNCTION DOC] Requires GPU backend, skipped on ucc, exactly 4 ranks, runs under
+            # several debug levels. Object gather check on the default group.
             return self._test_gather_object()
 
         @skip_but_pass_in_sandcastle_if(
@@ -6866,12 +7850,16 @@ class DistributedTest:
         @with_dist_debug_levels(levels=["DETAIL", "OFF", "INFO"])
         @require_exact_world_size(4)
         def test_gather_object_subgroup(self):
+            # [FUNCTION DOC] Requires GPU backend, skipped on ucc, exactly 4 ranks, runs under
+            # several debug levels. Object gather check on a new subgroup.
             default = _get_default_group()
             backend = dist.get_backend(default)
             subgroup = dist.new_group(backend=backend)
             return self._test_gather_object(subgroup)
 
         def validate_net_equivalence(self, net):
+            # [FUNCTION DOC] HELPER: Asserts that every tensor in the module state of the given
+            # DDP model is identical on all ranks, using all-gather.
             # Helper to validate synchronization of nets across ranks.
             net_module_states = list(net.module.state_dict().values())
             # Check that all tensors in module's state_dict() are equal.
@@ -6889,6 +7877,10 @@ class DistributedTest:
             f"The {BACKEND} backend does not support DistributedDataParallel",
         )
         def test_ddp_sync_module_states(self):
+            # [FUNCTION DOC] Needs 2 GPUs. Gives each rank a different model, replaces the DDP
+            # module with a fresh copy, asserts parameters differ across ranks, then calls the
+            # module state synchronization utility with rank 1 as source and asserts all ranks now
+            # agree and that rank 1's values equal its own new model.
             # Test that after calling _sync_module_states, models across ranks
             # are the same and are equal to the model on the input rank.
             dim = 2
@@ -6938,6 +7930,11 @@ class DistributedTest:
             f"The {BACKEND} backend does not support DistributedDataParallel",
         )
         def test_ddp_grad_div_uneven_inputs(self):
+            # [FUNCTION DOC] Needs 2 GPUs. Uses the join context manager with uneven iteration
+            # counts (rank 0 has three, others five) to check gradient scaling: with
+            # divide_by_initial_world_size false the gradient always equals the unscaled value;
+            # with true it is scaled down by the effective number of active processes over the
+            # initial world size.
             # Test gradient division during training with join() API. If
             # divide_by_initial_world_size=False, we scale by the effective world
             # size when allreducing grads.
@@ -6990,6 +7987,13 @@ class DistributedTest:
                     torch.cuda.synchronize(device=self.rank)
 
         def _test_ddp_profiling(self, profiler_ctx, profiler_ctx2=None):
+            # [FUNCTION DOC] HELPER: Runs DDP training twice under profiler contexts and returns
+            # the profiler of the first pass. First pass: six iterations; asserts the all-reduce
+            # event count equals the iteration count (async, correctly named) and at least one
+            # broadcast event. Second pass: a fresh DDP with unused parameter search, three
+            # unprofiled iterations, then one profiled iteration; asserts all-reduce events exist
+            # and exactly one search_unused_parameters event. The second context defaults to a
+            # deep copy of the first.
             """Runs DDP based model training and captures profiles.
             This test will do two profiler runs.
             1. An initial basic run to check if profiler events are correctly captured.
@@ -7076,6 +8080,8 @@ class DistributedTest:
         @skip_if_lt_x_gpu(2)
         @skip_but_pass_in_sandcastle("Currently failing in NVIDIA internal CI")
         def test_ddp_profiling_autograd_profiler(self):
+            # [FUNCTION DOC] Needs 2 GPUs and a GPU backend; skipped on Linux (tracked issue) and
+            # in sandcastle. Runs the DDP profiling check with the autograd profiler.
             autograd_profiler_ctx = torch.autograd.profiler.profile()
             return self._test_ddp_profiling(profiler_ctx=autograd_profiler_ctx)
 
@@ -7087,6 +8093,13 @@ class DistributedTest:
             "torch.profiler not enabled for mac/windows: https://github.com/pytorch/pytorch/pull/56124",
         )
         def test_ddp_profiling_torch_profiler(self):
+            # [FUNCTION DOC] Needs 2 GPUs; skipped in fbcode, Mac and Windows. Runs the DDP
+            # profiling check with the torch profiler (CPU and CUDA). For nccl, also extracts the
+            # collective metadata events and checks there are two all-reduce events (first with
+            # 100 float elements, second with 1 integer element) and one wait event, after the
+            # common metadata sanity check.
+            # KNOWN ISSUE: a comment refers to removing a file in the profiler metadata helper,
+            # but that helper has no such removal.
             cpu_act = torch.profiler.ProfilerActivity.CPU
             cuda_act = torch.profiler.ProfilerActivity.CUDA
             torch_profiler_ctx = torch.profiler.profile(activities=[cpu_act, cuda_act])
@@ -7115,6 +8128,12 @@ class DistributedTest:
             self.assertEqual(a1["dtype"], "Int", msg=f"{a1}")
 
         def _validate_execution_trace_nccl(self, et_file: str) -> None:
+            # [FUNCTION DOC] HELPER: Validates an execution trace JSON file: loads it, expects at
+            # least one process group init node and exactly three record_param_comms nodes, checks
+            # each has attributes with collective name and dtype and (except waits) process group
+            # name 0, description default_pg, size 2, non-negative message sizes, split size
+            # fields and rank start 0 and stride 1; expects two all-reduce nodes (100 floats, 1
+            # int) and one wait node.
             """Torch profiler includes nccl metadata in an inserted operator called "record_param_comms"
             We test for basic fields in these nodes in the Execution Trace.
             """
@@ -7177,6 +8196,11 @@ class DistributedTest:
         )
         @unittest.skipIf(BACKEND != "nccl", "Tests nccl metadata primarily.")
         def test_ddp_profiling_execution_trace(self):
+            # [FUNCTION DOC] NCCL only, needs 2 GPUs, skipped in fbcode, Mac and Windows.
+            # KNOWN ISSUE: the test is unconditionally skipped by an unconditional skip decorator
+            # (tracked issue). Intended behavior: runs the DDP profiling check with a second
+            # profiler pass that records an execution trace to a temporary file and then validates
+            # the trace.
             self.assertEqual(dist.get_backend(), "nccl")
             # Create a temp file to save execution trace data
             with TemporaryFileName("w+t", suffix=".et.json") as et_file:
@@ -7205,6 +8229,10 @@ class DistributedTest:
             f"The {BACKEND} backend does not support DistributedDataParallel",
         )
         def test_ddp_join_model_equivalence(self):
+            # [FUNCTION DOC] Needs 2 GPUs. Checks that training with the join context manager and
+            # uneven iteration counts (2 times rank+1) produces the same weights as a local model
+            # trained for the total number of iterations, with the DDP learning rate scaled by
+            # world size.
             # Verifies equivalence with model training locally and with DDP under
             # the join context manager.
             batch = 3
@@ -7258,6 +8286,21 @@ class DistributedTest:
             iteration_mapping,
             find_unused_params,
         ):
+            # [FUNCTION DOC] HELPER: Runs one uneven-inputs scenario from a test case on the
+            # rank's GPU. Wraps the model in DDP with a 1 MB bucket cap and the given find unused
+            # parameters flag, optionally registers the case's hook and state, takes this rank's
+            # iteration count from the mapping and computes the global minimum by all-reduce.
+            # Inside the join context (optionally throwing on early termination) it trains that
+            # many iterations, using no_sync except every sync_interval-th iteration,
+            # synchronizing the GPU each step. When throwing on early termination, the rank(s)
+            # with the minimum count expect a RuntimeError saying the rank exhausted all inputs,
+            # the others expect an error about at least one rank having exhausted inputs, and the
+            # number of completed iterations must equal the minimum; otherwise it must be at least
+            # the minimum. Without throwing, it also checks that all ranks agreed on the highest
+            # rank as authoritative, models are identical across ranks and join of uneven inputs
+            # was logged.
+            # KNOWN ISSUE: the authoritative rank check asserts a truthy value, which would fail
+            # if the authoritative rank were 0.
             model = test_case.model
             inp = test_case.inp
             rank = self.rank
@@ -7365,15 +8408,25 @@ class DistributedTest:
             f"The {BACKEND} backend does not support DistributedDataParallel",
         )
         def test_ddp_uneven_inputs_stop_iteration_sync_bn(self):
+            # [FUNCTION DOC] Needs 2 GPUs. For a sync batch norm model and a model that calls
+            # all-reduce in forward, checks that with throw on early termination rank 0 (which has
+            # twice as many iterations) gets the error about another rank exhausting inputs while
+            # other ranks get an exhausted-all-inputs error, that exactly the minimum number of
+            # iterations ran, and that models match across ranks.
             # Tests that uneven inputs join handler correctly throws StopIteration
             # for models with SyncBN or general collective comm when
             # throw_on_early_termination=True.
             class ModelWithComm(torch.nn.Module):
+                # [CLASS DOC] HELPER: Local model with a bias-free linear layer (2 to 40) whose
+                # forward also all-reduces the output across ranks.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Builds the linear layer.
                     super().__init__()
                     self.lin = nn.Linear(2, 40, bias=False)
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Applies the linear layer, all-reduces the result in
+                    # place across the default group and returns it.
                     x = self.lin(x)
                     dist.all_reduce(x)
                     return x
@@ -7424,6 +8477,13 @@ class DistributedTest:
             f"The {BACKEND} backend does not support DistributedDataParallel",
         )
         def test_ddp_uneven_inputs(self):
+            # [FUNCTION DOC] Needs 2 GPUs. Builds many uneven-input scenarios: models (batch norm
+            # net, large convolution net, small linear, two models with unused parameters on
+            # different ranks, small model with all-reduce and PowerSGD hooks, resnet50 if
+            # torchvision exists), repeated with various sync intervals and with throw on early
+            # termination; and many mappings from rank to iteration count (rank 0 or the first one
+            # or two ranks finishing early, with zero or five baseline iterations and offsets 2, 3
+            # and 10). Runs every combination through the uneven inputs helper.
             dim = 1000
             batch = 1
             # Create a variety of models to run uneven input tests on.
@@ -7439,16 +8499,25 @@ class DistributedTest:
             bn_net = BatchNormNet()
 
             class UnusedParamModule(nn.Module):
+                # [CLASS DOC] HELPER: Local model with two Task submodules where one specific rank
+                # skips the first task, leaving its parameters unused; task_parameters returns
+                # both task parameters.
                 def __init__(self, unused_params_rank):
+                    # [FUNCTION DOC] HELPER: Builds the two tasks and remembers the rank that has
+                    # unused parameters.
                     super().__init__()
                     self.t0 = Task()
                     self.t1 = Task()
                     self.unused_params_rank = unused_params_rank
 
                 def task_parameters(self):
+                    # [FUNCTION DOC] HELPER: Returns the pair of parameters of the two tasks.
                     return (self.t0.p, self.t1.p)
 
                 def forward(self, x, rank):
+                    # [FUNCTION DOC] HELPER: Forward taking an input and a rank: applies both
+                    # tasks in sequence, except on the designated rank where only the second task
+                    # is applied.
                     return (
                         self.t1(self.t0(x))
                         if rank != self.unused_params_rank
@@ -7617,6 +8686,9 @@ class DistributedTest:
             f"The {BACKEND} backend does not support DistributedDataParallel",
         )
         def test_ddp_uneven_input_join_disable(self):
+            # [FUNCTION DOC] Needs 2 GPUs. Checks that with join disabled DDP behaves normally for
+            # even inputs: gradients equal the mean of rank values, the join configuration reports
+            # disabled, and models stay in sync.
             # tests that if net.join() with enable=False is specified, DDP works as
             # expected with even inputs.
             torch.manual_seed(self.rank)
@@ -7651,16 +8723,23 @@ class DistributedTest:
             f"The {BACKEND} backend does not support DistributedDataParallel",
         )
         def test_ddp_uneven_input_exception(self):
+            # [FUNCTION DOC] Needs 2 GPUs. Checks that an exception raised inside the model
+            # forward within the join context is propagated to the caller (ValueError with the
+            # given message).
             # Tests that exceptions during training are correctly propagated by the
             # context manager.
             error_str = "Intentional error"
 
             class ExceptionModule(nn.Module):
+                # [CLASS DOC] HELPER: Local model with one parameter whose forward always raises
+                # ValueError with a fixed message.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Creates the single parameter.
                     super().__init__()
                     self.param = nn.Parameter(torch.ones(1, requires_grad=True))
 
                 def forward(self, _):
+                    # [FUNCTION DOC] HELPER: Always raises ValueError, ignoring its input.
                     raise ValueError(error_str)
 
             exception_module = ExceptionModule()
@@ -7675,6 +8754,12 @@ class DistributedTest:
                     loss.backward()
 
         def _test_broadcast_object_list(self, group=None):
+            # [FUNCTION DOC] HELPER: Checks object broadcast. Rank 0 holds the test objects (plus
+            # a GPU-tensor object for nccl, and a very large one in fbcode) and other ranks hold
+            # placeholders. Verifies broadcast of a single object with a CPU device (non-nccl),
+            # with the next rank's GPU device when GPU count equals world size, and with no
+            # device, and then of the whole list; each time non-source ranks first differ from and
+            # afterwards equal the source values.
             gather_objects = create_collectives_object_test_list()
 
             # Only set device for NCCL backend since it must use GPUs.
@@ -7753,6 +8838,8 @@ class DistributedTest:
             "Test is failing, see https://github.com/pytorch/pytorch/pull/113620"
         )
         def test_broadcast_object_list(self):
+            # [FUNCTION DOC] Skipped unconditionally (tracked failing). Intended: runs the object
+            # broadcast check on the default group under detail debug level.
             return self._test_broadcast_object_list()
 
         @require_backend_is_available(DistTestCases.backend_feature["gpu"])
@@ -7761,14 +8848,28 @@ class DistributedTest:
         )
         @with_dist_debug_levels(levels=["DETAIL"])
         def _test_broadcast_object_list_subgroup(self):
+            # [FUNCTION DOC] HELPER: Intended to run the object broadcast check on a new subgroup.
+            # KNOWN ISSUE: the name starts with an underscore, so the test runner never collects
+            # it; it is dead code.
             default = _get_default_group()
             backend = dist.get_backend(default)
             subgroup = dist.new_group(backend=backend)
             return self._test_broadcast_object_list(subgroup)
 
         def _test_ddp_ignore_params_arg(self, static_graph=False):
+            # [FUNCTION DOC] HELPER: Checks DDP's ignore-parameters option. For each combination
+            # of find unused parameters and broadcast buffers, builds a model whose second layer
+            # (and an extra buffer) has rank-dependent shapes and is marked as ignored, wraps it
+            # in DDP, then replaces the second layer with a new materialized layer. Over six
+            # iterations checks that the new layer's gradients match a local copy (DDP does not
+            # touch them), the synchronized first layer's gradients differ from the local ones
+            # (because they were reduced), and the ignored proxy parameters never got gradients.
             class TestModel(nn.Module):
+                # [CLASS DOC] HELPER: Local model with a first linear layer and a second linear
+                # layer whose shape depends on rank (1 to 10 on rank 0, 10 to 10 otherwise).
                 def __init__(self, rank):
+                    # [FUNCTION DOC] HELPER: Stores the rank, builds the first layer and the
+                    # rank-dependent second layer.
                     self.rank = rank
                     super().__init__()
                     self.fc1 = nn.Linear(1, 1, bias=False)
@@ -7780,6 +8881,7 @@ class DistributedTest:
                         self.fc2 = nn.Linear(10, 10, bias=False)
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Applies the first linear then the second linear to x.
                     x = self.fc1(x)
                     x = self.fc2(x)
                     return x
@@ -7861,6 +8963,8 @@ class DistributedTest:
         @require_backend_is_available(DistTestCases.backend_feature["gpu"])
         @skip_if_lt_x_gpu(2)
         def test_ddp_ignore_params_arg(self):
+            # [FUNCTION DOC] Needs a GPU backend and 2 GPUs. Runs the ignore-parameters check
+            # without and with static graph.
             self._test_ddp_ignore_params_arg(static_graph=False)
             self._test_ddp_ignore_params_arg(static_graph=True)
 
@@ -7868,13 +8972,24 @@ class DistributedTest:
         @require_backend_is_available(DistTestCases.backend_feature["gpu"])
         @skip_if_lt_x_gpu(2)
         def test_ddp_unused_params_rebuild_buckets_exception(self):
+            # [FUNCTION DOC] Needs a GPU backend and 2 GPUs; runs under several debug levels.
+            # Checks that when a parameter is unused with find unused parameters off, the second
+            # iteration raises RuntimeError whose message (and logged DDP error) mentions the
+            # unfinished reduction, the suggestion to enable unused parameter search, outputs not
+            # participating in the loss, and either the debug mode suggestion or the list of
+            # parameters without gradient (net2.weight) depending on debug level, and does not say
+            # unused search is enabled.
             class ToyModel(nn.Module):
+                # [CLASS DOC] HELPER: Local model with two bias-free linear layers where only the
+                # first is used in forward.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Builds the two linear layers.
                     super().__init__()
                     self.net1 = nn.Linear(10, 10, bias=False)
                     self.net2 = nn.Linear(10, 10, bias=False)
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Applies only the first linear layer to x.
                     return self.net1(x)
 
             ddp = torch.nn.parallel.DistributedDataParallel(
@@ -7920,10 +9035,19 @@ class DistributedTest:
         @require_backend_is_available(DistTestCases.backend_feature["gpu"])
         @skip_if_lt_x_gpu(2)
         def test_ddp_shared_grad_acc_unused_params(self):
+            # [FUNCTION DOC] Needs 2 GPUs. Checks that DDP with find unused parameters (static
+            # graph on and off) works when two parameter names share one underlying parameter that
+            # is unused, for six iterations with a scaled loss.
             # When find_unused_parameters=True, ensure we mark unused parameters
             # even if they share gradient accumulators.
             class ToyModel(nn.Module):
+                # [CLASS DOC] HELPER: Local model whose first linear layer shares its bias with a
+                # separate parameter object; only the second linear is used in forward, so the
+                # shared bias parameter is unused.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Builds the first linear without bias, a standalone
+                    # bias parameter, assigns it as the first layer's bias (two names, one
+                    # parameter) and a second linear.
                     super().__init__()
                     # net1, bias, and net1.bias are all unused params.
                     self.net1 = nn.Linear(10, 5, bias=False)
@@ -7935,6 +9059,7 @@ class DistributedTest:
                     self.net2 = nn.Linear(10, 5)
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Returns the sum of the second linear applied to x.
                     return self.net2(x).sum()
 
             torch.cuda.set_device(self.rank)
@@ -7956,12 +9081,21 @@ class DistributedTest:
         @require_backend_is_available(DistTestCases.backend_feature["gpu"])
         @skip_if_lt_x_gpu(2)
         def test_ddp_device(self):
+            # [FUNCTION DOC] Needs 2 GPUs. Checks how DDP moves different input types to the
+            # rank's device in forward: tuples, lists, a custom wrapper type (type kept, tensor
+            # not moved by DDP), two named tuple types and dictionaries, each trained for four
+            # iterations with a validator per type.
+            # KNOWN ISSUE: the tuple and list validator uses a truth assertion with the length and
+            # expected length, which passes for any non-empty input instead of comparing them.
             expected_len = 2
 
             class TensorWrapper:
+                # [CLASS DOC] HELPER: Simple slot-based wrapper holding a tensor t and a flag
+                # moved_to_gpu, used as a custom input type.
                 __slots__ = ["t", "moved_to_gpu"]
 
                 def __init__(self, t):
+                    # [FUNCTION DOC] HELPER: Stores the tensor and sets the moved flag to false.
                     self.t = t
                     self.moved_to_gpu = False
 
@@ -7969,24 +9103,34 @@ class DistributedTest:
             # the input type.
 
             def tuple_and_list_validator(x):
+                # [FUNCTION DOC] HELPER: Validator for tuple and list inputs: checks all
+                # tensors are on one device that is the rank's device and returns the sum of
+                # the first two.
                 self.assertTrue(len(x), expected_len)
                 self.assertEqual(1, len({t.device for t in x}))
                 self.assertEqual(x[0].device.index, self.rank)
                 return x[0] + x[1]
 
             def namedtuple_validator(x):
+                # [FUNCTION DOC] HELPER: Validator for named tuple inputs: checks field names,
+                # both tensors on the rank's device, and returns their sum.
                 self.assertEqual(x._fields, EXPECTED_FIELDS)
                 self.assertEqual(x.a.device.index, x.b.device.index)
                 self.assertEqual(x.a.device.index, self.rank)
                 return x.a + x.b
 
             def custom_type_validator(x):
+                # [FUNCTION DOC] HELPER: Validator for the custom wrapper: checks it either is
+                # already marked moved or still on CPU, moves its tensor to the rank's device,
+                # marks it moved and returns the tensor.
                 self.assertTrue(x.moved_to_gpu or (str(x.t.device) == "cpu"))
                 x.t = x.t.to(self.rank)
                 x.moved_to_gpu = True
                 return x.t
 
             def dict_validator(x):
+                # [FUNCTION DOC] HELPER: Validator for dictionary inputs: checks the expected keys
+                # exist, values share the rank's device and returns the sum of the two values.
                 self.assertTrue(EXPECTED_FIELDS[0] in x)
                 self.assertTrue(EXPECTED_FIELDS[1] in x)
                 self.assertEqual(1, len({t.device for t in x.values()}))
@@ -8003,11 +9147,19 @@ class DistributedTest:
             }
 
             class ToyModel(torch.nn.Module):
+                # [CLASS DOC] HELPER: Local model with a bias-free linear layer (10 to 10) whose
+                # forward validates the input type with a type specific validator and applies the
+                # linear layer to the validated tensor. Its self argument names are shadowed by
+                # the enclosing test case.
                 def __init__(self_):
+                    # [FUNCTION DOC] HELPER: Builds the linear layer.
                     super().__init__()
                     self_.lin = nn.Linear(10, 10, bias=False)
 
                 def forward(self_, x, expected_type):
+                    # [FUNCTION DOC] HELPER: Asserts the input has the expected type, converts it
+                    # into a tensor with the validator for that type and returns the linear
+                    # layer's output.
                     # Similar to scatter, the recursive to in the single-device
                     # case does not move tensors if they are in a custom type.
                     self.assertTrue(isinstance(x, expected_type))
@@ -8019,6 +9171,8 @@ class DistributedTest:
             )
 
             def train_iter(inp, input_type):
+                # [FUNCTION DOC] HELPER: Runs four forward/backward iterations of the DDP model on
+                # the given input and expected type.
                 for _ in range(4):
                     out = model(inp, input_type)
                     out.sum().backward()
@@ -8059,6 +9213,9 @@ class DistributedTest:
         @require_backend_is_available(DistTestCases.backend_feature["gpu"])
         @skip_if_lt_x_gpu(2)
         def test_ddp_namedtuple(self):
+            # [FUNCTION DOC] Needs 2 GPUs. Checks that DDP preserves named tuple types (both
+            # namedtuple and NamedTuple styles) when passing inputs to forward, with the fields
+            # and values intact.
             batch = 5
             dim = 10
 
@@ -8066,11 +9223,18 @@ class DistributedTest:
             b = torch.rand(batch, dim, device=self.rank)
 
             class NamedTupleModule(torch.nn.Module):
+                # [CLASS DOC] HELPER: Local model whose forward asserts the input has the expected
+                # named tuple type, the expected field names and values equal to the test tensors,
+                # and returns a linear layer applied to the product of the two fields.
                 def __init__(self_):
+                    # [FUNCTION DOC] HELPER: Builds a linear layer (10 to 1).
                     super().__init__()
                     self_.lin = nn.Linear(10, 1)
 
                 def forward(self_, input, expected_type):
+                    # [FUNCTION DOC] HELPER: Verifies the named tuple type and values, then
+                    # returns the linear layer applied to the elementwise product of fields a
+                    # and b.
                     # Without NamedTuple support, this would be of type tuple.
                     self.assertTrue(
                         isinstance(input, expected_type),
@@ -8093,16 +9257,25 @@ class DistributedTest:
 
         @require_backend_is_available({"gloo"})
         def test_grads_same_across_ranks_with_no_sync(self):
+            # [FUNCTION DOC] Gloo only, needs at least 2 ranks. Trains a conditional model
+            # (different layers per rank and per call) under DDP with find unused parameters and
+            # one no_sync microbatch followed by a synchronizing one; asserts no parameter
+            # gradient is none and, by gathering to rank 0, that gradients are equal on all ranks.
             _group, _group_id, rank = self._init_global_test()
             world_size = dist.get_world_size()
             if world_size < 2:
                 self.skipTest("This test requires at least two ranks.")
 
             class SimpleConditionalModel(nn.Module):
+                # [CLASS DOC] HELPER: Local model with four linear layers that alternates between
+                # calls: rank 0 uses the first layer then the second, other ranks use the third
+                # then the fourth.
                 # if rank is 0, uses nn1 on the first pass and nn2 on the second pass.
                 # else, uses nn3 on the first pass and nn4 on the second pass.
 
                 def __init__(self, rank):
+                    # [FUNCTION DOC] HELPER: Stores the rank, builds the four linear layers and
+                    # sets the call-state counter to zero.
                     super().__init__()
 
                     self.rank = rank
@@ -8113,6 +9286,8 @@ class DistributedTest:
                     self.state = 0
 
                 def forward(self, input):
+                    # [FUNCTION DOC] HELPER: Toggles the call state and applies the layer chosen
+                    # by rank and previous state to the input.
                     if self.state == 0:
                         self.state = 1
                         if self.rank == 0:
@@ -8170,6 +9345,13 @@ class DistributedTest:
         @require_backend_is_available(DistTestCases.backend_feature["gpu"])
         @skip_if_lt_x_gpu(2)
         def test_ddp_control_flow_same_across_ranks(self):
+            # [FUNCTION DOC] Needs a GPU backend and 2 GPUs; runs under several debug levels.
+            # Control flow identical on all ranks: alternates random and ones inputs for six
+            # iterations and checks the reducer's local used-parameter map (second layer used only
+            # on ones input, counts equal to world size). Then with find unused parameters off,
+            # checks the second iteration raises RuntimeError with the expected
+            # unfinished-reduction message, hints and the unused parameter index and (in debug
+            # modes) name lin2.weight, and that it is logged.
             # Control flow that is the same across ranks.
             batch = 20
             dim = 10
@@ -8252,6 +9434,10 @@ class DistributedTest:
         @require_backend_is_available(DistTestCases.backend_feature["gpu"])
         @skip_if_lt_x_gpu(2)
         def test_invalid_static_graph(self):
+            # [FUNCTION DOC] Needs a GPU backend and 2 GPUs. Checks static graph validation: a
+            # parameter unused in the first iteration but used in the second raises RuntimeError
+            # about the training graph having changed; and the reverse case raises the unfinished
+            # reduction error; both errors are logged.
             torch.cuda.set_device(self.rank)
             model = torch.nn.parallel.DistributedDataParallel(
                 ControlFlowToyModel().cuda(self.rank),
@@ -8300,18 +9486,29 @@ class DistributedTest:
         @require_backend_is_available(DistTestCases.backend_feature["gpu"])
         @skip_if_lt_x_gpu(2)
         def test_ddp_control_flow_different_across_ranks(self):
+            # [FUNCTION DOC] Needs a GPU backend and 2 GPUs; runs under several debug levels.
+            # Control flow that differs across ranks (second layer used only on rank 1 for ones
+            # input): checks the reducer's local used-parameter map counts (one for the second
+            # layer on odd iterations) and, with find unused parameters off, the error message
+            # content for the second iteration.
             # Control flow that is different across ranks.
             batch = 20
             dim = 10
 
             class ToyModel(nn.Module):
+                # [CLASS DOC] HELPER: Local model with two bias-free linears where the second is
+                # used only on rank 1 and only for an all-ones input.
                 def __init__(self, rank):
+                    # [FUNCTION DOC] HELPER: Builds the two linears and stores the rank.
                     super().__init__()
                     self.lin1 = nn.Linear(10, 10, bias=False)
                     self.lin2 = nn.Linear(10, 10, bias=False)
                     self.rank = rank
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: If the input equals a ones tensor and the rank is 1,
+                    # returns the second layer applied to relu of the first; otherwise relu of the
+                    # first layer.
                     # Control-flow that is rank and input dependent for the
                     # model.
                     use_second_layer = (
@@ -8402,6 +9599,9 @@ class DistributedTest:
 
         @require_backend_is_available({"gloo"})
         def test_scatter_object_list(self):
+            # [FUNCTION DOC] Gloo only. Rank 0 scatters a list of test objects (padded or
+            # truncated to the world size) to all ranks with scatter_object_list; each rank must
+            # receive the object for its rank, and an empty output list must raise ValueError.
             src_rank = 0
             collectives_object_test_list = create_collectives_object_test_list()
             scatter_list = (
@@ -8432,6 +9632,8 @@ class DistributedTest:
                 dist.scatter_object_list([], scatter_list, src=src_rank)
 
         def _generate_sparse_tensors_for_bucket_assignment_test(self):
+            # [FUNCTION DOC] HELPER: Returns six sparse tensors converted from dense empties
+            # (alternating 50 floats and 25 doubles).
             tensors = [
                 torch.empty([50], dtype=torch.float),
                 torch.empty([25], dtype=torch.double),
@@ -8445,6 +9647,12 @@ class DistributedTest:
             return tensors_sparse
 
         def _test_compute_bucket_assignment_by_size(self, use_logger):
+            # [FUNCTION DOC] HELPER: Checks bucket assignment rejects sparse tensors. Creates a
+            # gloo group, sets the NCCL blocking wait environment variable (global side effect)
+            # and a new group for the current backend, wraps a model in DDP to obtain a logger,
+            # then calls the bucket assignment function with sparse tensors (with or without
+            # passing the logger) and expects RuntimeError (No support for sparse tensors). With a
+            # logger, checks the error was logged. Ends with a gloo barrier.
             group_gloo = dist.new_group(
                 timeout=timedelta(seconds=60), backend=dist.Backend.GLOO
             )
@@ -8487,6 +9695,8 @@ class DistributedTest:
         @require_backend_is_available(DistTestCases.backend_feature["gpu"])
         @skip_if_lt_x_gpu(2)
         def test_compute_bucket_assignment_by_size_sparse_error_without_logger(self):
+            # [FUNCTION DOC] Needs a GPU backend and 2 GPUs. Sparse bucket assignment error check
+            # without a logger.
             self._test_compute_bucket_assignment_by_size(use_logger=False)
 
         @unittest.skipIf(
@@ -8496,9 +9706,16 @@ class DistributedTest:
         @require_backend_is_available(DistTestCases.backend_feature["gpu"])
         @skip_if_lt_x_gpu(2)
         def test_compute_bucket_assignment_by_size_sparse_error_with_logger(self):
+            # [FUNCTION DOC] Needs a GPU backend and 2 GPUs; skipped on Linux and ROCm (tracked
+            # issue). Sparse bucket assignment error check with a logger.
             self._test_compute_bucket_assignment_by_size(use_logger=True)
 
         def _test_verify_model_across_rank(self, use_logger):
+            # [FUNCTION DOC] HELPER: Checks parameter shape verification across ranks. Wraps a
+            # model in DDP, replaces its linear layer with one whose input size differs on rank 0,
+            # calls the shape verification utility (with or without logger) and records whether an
+            # exception occurred; an all-reduce over a gloo group asserts at least one rank caught
+            # an error.
             group_gloo = dist.new_group(
                 timeout=timedelta(seconds=60), backend=dist.Backend.GLOO
             )
@@ -8547,6 +9764,8 @@ class DistributedTest:
         )
         @skip_if_lt_x_gpu(2)
         def test_verify_model_across_rank_with_logger(self):
+            # [FUNCTION DOC] Needs a GPU backend and 2 GPUs. Model verification across ranks check
+            # with a logger.
             self._test_verify_model_across_rank(use_logger=True)
 
         @require_backend_is_available(DistTestCases.backend_feature["gpu"])
@@ -8555,9 +9774,14 @@ class DistributedTest:
         )
         @skip_if_lt_x_gpu(2)
         def test_verify_model_across_rank_without_logger(self):
+            # [FUNCTION DOC] Needs a GPU backend and 2 GPUs. Model verification across ranks check
+            # without a logger.
             self._test_verify_model_across_rank(use_logger=False)
 
         def _run_test_ddp_model_with_diff_params(self, net, ddp_group, group_gloo):
+            # [FUNCTION DOC] HELPER: Tries to wrap the net in DDP on the given group and records
+            # whether construction raised; an all-reduce over a gloo group asserts at least one
+            # rank saw an error.
             caught = 0
             try:
                 net = torch.nn.parallel.DistributedDataParallel(
@@ -8578,6 +9802,9 @@ class DistributedTest:
         )
         @skip_if_lt_x_gpu(2)
         def test_ddp_model_diff_shape_across_ranks(self):
+            # [FUNCTION DOC] Needs a GPU backend and 2 GPUs; skipped on Linux (tracked issue).
+            # Creates a model with rank-dependent embedding size and checks that DDP construction
+            # fails on at least one rank.
             group_gloo = dist.new_group(
                 timeout=timedelta(seconds=60), backend=dist.Backend.GLOO
             )
@@ -8596,6 +9823,9 @@ class DistributedTest:
         )
         @skip_if_lt_x_gpu(2)
         def test_ddp_model_diff_num_params_across_ranks(self):
+            # [FUNCTION DOC] Needs a GPU backend and 2 GPUs. Creates a model with an extra layer
+            # on rank 1 (different parameter count) and checks that DDP construction fails on at
+            # least one rank.
             group_gloo = dist.new_group(
                 timeout=timedelta(seconds=60), backend=dist.Backend.GLOO
             )
@@ -8617,6 +9847,13 @@ class DistributedTest:
             )
 
         def _test_output_unused_in_loss(self, module_cls, gradient_as_bucket_view):
+            # [FUNCTION DOC] HELPER: Checks gradients when one model output is unused in the loss.
+            # Builds a local copy and a DDP copy (find unused parameters on) of the given module
+            # class, verifies that for an output unused in the loss the first layer's weight
+            # gradient stays none in both, then over six iterations (two using both outputs, then
+            # only the second) checks that gradients of all parameters are equal between the
+            # models and that the first layer's gradient does not change once unused.
+            # KNOWN ISSUE: the gradient_as_bucket_view argument is accepted but never used.
             model = module_cls()
             local_net = copy.deepcopy(model)
             net = torch.nn.parallel.DistributedDataParallel(
@@ -8718,6 +9955,8 @@ class DistributedTest:
         )
         @skip_if_lt_x_gpu(2)
         def test_output_unused_in_loss_tuple_module(self):
+            # [FUNCTION DOC] Needs a GPU backend and 2 GPUs. Runs the unused output check for the
+            # tuple-output module for both bucket view settings.
             module_cls = UnusedParamTwoLinLayerNet
             for grad_as_bucket_view in [True, False]:
                 self._test_output_unused_in_loss(module_cls, grad_as_bucket_view)
@@ -8728,6 +9967,8 @@ class DistributedTest:
         )
         @skip_if_lt_x_gpu(2)
         def test_output_unused_in_loss_dict_module(self):
+            # [FUNCTION DOC] Needs a GPU backend and 2 GPUs. Runs the unused output check for the
+            # dictionary-output module for both bucket view settings.
             module_cls = DictOutputModule
             for grad_as_bucket_view in [True, False]:
                 self._test_output_unused_in_loss(module_cls, grad_as_bucket_view)
@@ -8738,6 +9979,9 @@ class DistributedTest:
         )
         @skip_if_lt_x_gpu(2)
         def test_undefined_grad_parity_unused_parameters(self):
+            # [FUNCTION DOC] Needs a GPU backend and 2 GPUs. Backpropagates through an
+            # undefined-gradient function on both a DDP model (find unused parameters on) and a
+            # local copy and asserts all parameter gradients match.
             # TODO: enable this for general training use cases:
             # https://github.com/pytorch/pytorch/issues/58511.
             x = torch.ones(1, 2).to(self.rank)
@@ -8769,14 +10013,22 @@ class DistributedTest:
         def _test_different_graph_across_ranks(
             self, find_unused_parameters=False, static_graph=False
         ):
+            # [FUNCTION DOC] HELPER: Trains a model whose forward differs between ranks (rank 0
+            # uses a second layer, others do not) for ten iterations in DDP with the given unused
+            # parameter and static graph options, using bucket views, and returns the DDP model.
             class ToyModel(nn.Module):
+                # [CLASS DOC] HELPER: Local model with two bias-free linears where rank 0 applies
+                # both (with relu) and other ranks apply only the first.
                 def __init__(self, rank):
+                    # [FUNCTION DOC] HELPER: Builds the two linears and stores the rank.
                     super().__init__()
                     self.lin1 = nn.Linear(10, 10, bias=False)
                     self.lin2 = nn.Linear(10, 10, bias=False)
                     self.rank = rank
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Rank 0 returns the second layer on relu of the first;
+                    # other ranks return relu of the first.
                     if self.rank == 0:
                         return self.lin2(F.relu(self.lin1(x)))
                     else:
@@ -8802,6 +10054,10 @@ class DistributedTest:
         @require_backend_is_available(DistTestCases.backend_feature["gpu"])
         @skip_if_lt_x_gpu(2)
         def test_different_graph_across_ranks(self):
+            # [FUNCTION DOC] Needs a GPU backend and 2 GPUs. Compares training with the unused
+            # parameter search (buckets should not be rebuilt) against static graph (buckets are
+            # rebuilt) on a rank-dependent graph, and asserts the final parameters of both models
+            # are equal.
             base_model = self._test_different_graph_across_ranks(
                 find_unused_parameters=True
             )
@@ -8823,6 +10079,10 @@ class DistributedTest:
             "MacOS uses uv transport which does not have as robust error handling as tcp transport",
         )
         def test_monitored_barrier_gloo(self):
+            # [FUNCTION DOC] Gloo only; skipped on Mac and Windows. Checks monitored barrier:
+            # passes after collectives, passes with wait_all_ranks, and when rank 1 skips it, rank
+            # 0 raises an error naming rank 1 and other ranks raise an error about failing to
+            # receive from rank 0; ends with a file barrier.
             tensors = [torch.ones(10) * self.rank]
             # Kick off some allreduce work on all ranks
             for _ in range(10):
@@ -8859,6 +10119,11 @@ class DistributedTest:
 
         @require_backend_is_available({"gloo"})
         def test_monitored_barrier_gloo_subgroup(self):
+            # [FUNCTION DOC] Gloo only. Checks that monitored barrier works on a subgroup of ranks
+            # 0 and 1: rank 1 does not participate, rank 0 gets an error naming rank 1, and ranks
+            # outside the subgroup return without error.
+            # KNOWN ISSUE: the timeout is passed as a plain float 0.1 rather than a time
+            # interval object.
             # Tests that monitored_barrier works as expected on non-default
             # process groups.
             failed_rank = 1
@@ -8880,6 +10145,12 @@ class DistributedTest:
                 dist.monitored_barrier(subgroup, timeout)
 
         def _test_monitored_barrier_allreduce_hang(self, wait_all_ranks):
+            # [FUNCTION DOC] HELPER: Checks monitored barrier when a rank hangs in a collective.
+            # Creates an NCCL and a gloo group over all ranks, warms up with an all-reduce, then
+            # ranks other than 0 run a second all-reduce that must time out (error text depends on
+            # detail debug level), while rank 0 calls monitored barrier on the gloo group and
+            # expects an error naming the first failing rank 1, or all ranks 1 and up when
+            # wait_all_ranks is set. Ends with a file barrier.
             # tests expected behavior when nonzero rank hangs.
             nccl_pg = dist.new_group(
                 ranks=list(range(int(self.world_size))),
@@ -8936,6 +10207,8 @@ class DistributedTest:
         @require_backend_is_available(DistTestCases.backend_feature["gpu"])
         @skip_if_lt_x_gpu(int(os.environ["WORLD_SIZE"]))
         def test_monitored_barrier_allreduce_hang(self):
+            # [FUNCTION DOC] Decorated for NCCL blocking wait; needs a GPU backend and one GPU per
+            # rank. Monitored barrier hang check reporting only the first failing rank.
             # tests expected behavior when nonzero rank hangs and we want to
             # report first timed out rank.
             self._test_monitored_barrier_allreduce_hang(wait_all_ranks=False)
@@ -8944,6 +10217,9 @@ class DistributedTest:
         @require_backend_is_available(DistTestCases.backend_feature["gpu"])
         @skip_if_lt_x_gpu(int(os.environ["WORLD_SIZE"]))
         def test_monitored_barrier_allreduce_hang_wait_all_ranks(self):
+            # [FUNCTION DOC] Decorated for NCCL blocking wait; needs a GPU backend and one GPU per
+            # rank. Disables the NCCL dump on timeout (environment variable side effect), then
+            # runs the monitored barrier hang check reporting all failing ranks.
             # Need to disable TORCH_NCCL_DUMP_ON_TIMEOUT otherwise this test times out
             os.environ["TORCH_NCCL_DUMP_ON_TIMEOUT"] = "0"
             # tests expected behavior when nonzero rank hangs and we want to
@@ -8952,6 +10228,8 @@ class DistributedTest:
 
         @require_backend_is_available({"gloo"})
         def test_monitored_barrier_gloo_rank_0_timeout(self):
+            # [FUNCTION DOC] Gloo only. Rank 0 calls monitored barrier on a world group with a
+            # zero timeout and expects an error that rank 0 timed out.
             # tests error when rank 0 exhausts its given timeout.
             process_group = dist.new_group(ranks=list(range(int(self.world_size))))
             timeout = timedelta(seconds=0)
@@ -8968,6 +10246,9 @@ class DistributedTest:
             "MacOS uses uv transport which does not have as robust error handling as tcp transport",
         )
         def test_monitored_barrier_failure_order(self):
+            # [FUNCTION DOC] Gloo only; needs a bigger world; skipped on Mac and Windows. When
+            # several ranks skip the monitored barrier, rank 0 reports the lowest failing rank (2)
+            # and rank 1 gets an error about waiting on rank 0.
             # Ensure that the first (in sorted order) rank is reported when
             # multiple ranks fail to pass the monitored_barrier.
             # TODO(#54879): Provide ability to wait and report all failed ranks
@@ -8991,6 +10272,9 @@ class DistributedTest:
         @require_backend_is_available({"gloo"})
         @skip_if_small_worldsize
         def test_monitored_barrier_wait_all_ranks(self):
+            # [FUNCTION DOC] Gloo only; needs a bigger world. Rank 0 calls monitored barrier with
+            # wait_all_ranks and a short timeout while others do not, and expects an error listing
+            # all ranks from 1 to world size minus one.
             # Tests simple case where > 1 rank does not call into monitored
             # barrier and verifies all ranks are reported by rank 0.
             if self.rank == 0:
@@ -9004,6 +10288,12 @@ class DistributedTest:
         @with_dist_debug_levels(levels=["INFO"])
         @skip_if_lt_x_gpu(2)
         def test_ddp_build_debug_param_to_name_mapping(self):
+            # [FUNCTION DOC] Needs a GPU backend and 2 GPUs; runs at INFO debug level. Checks the
+            # parameter index to name mapping built by DDP: weights a and b, only b when a is
+            # ignored, and that ValueError is raised for mismatched numbers of parameters
+            # (Expected param to name mapping) and for unknown parameter names (Param with name).
+            # KNOWN ISSUE: the final statement extends the parameter list again and has no effect;
+            # it also prints a parameter type on rank 0.
             model = TwoLinLayerNet()
             net = torch.nn.parallel.DistributedDataParallel(
                 model.cuda(self.rank),
@@ -9070,8 +10360,14 @@ class DistributedTest:
         @with_dist_debug_levels(levels=["INFO"])
         @skip_if_lt_x_gpu(2)
         def test_ddp_build_debug_param_to_name_mapping_requires_grad(self):
+            # [FUNCTION DOC] Needs 2 GPUs; runs at INFO debug level. Checks that a parameter
+            # that does not require grad (the bias) does not appear in the DDP parameter to
+            # name mapping.
             class Net(nn.Module):
+                # [CLASS DOC] HELPER: Local model with one linear layer whose bias does not
+                # require grad.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Builds the linear layer and disables bias gradient.
                     super().__init__()
                     self.lin = nn.Linear(10, 10)
                     # Is not tracked by DDP and should not show up in param to
@@ -9079,6 +10375,7 @@ class DistributedTest:
                     self.lin.bias.requires_grad_(False)
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Returns the linear layer applied to x.
                     return self.lin(x)
 
             model = Net()
@@ -9093,10 +10390,21 @@ class DistributedTest:
             self.assertEqual(param_to_name_mapping, expected_mapping)
 
         def _test_ddp_multiple_nested_unused_params_error(self, ignore_sparse):
+            # [FUNCTION DOC] HELPER: Checks the unused parameters error message with a nested
+            # model that has several unused submodules (part of a two-layer net and an entire
+            # embedding net), optionally ignoring the sparse embedding in DDP. On the second
+            # iteration it expects RuntimeError and verifies that each unused parameter's index
+            # (and name unless debug is off) appears in the part of the message after the phrase
+            # did not receive grad, that used and ignored parameters do not appear, and raises a
+            # failure if no error occurs.
             debug_mode_off = dist.get_debug_level() == dist.DebugLevel.OFF
 
             class SubModule(nn.Module):
+                # [CLASS DOC] HELPER: Local model combining a rank-0-shaped embedding net, a
+                # two-linear net, a batch norm net and a linear layer; only the batch norm net,
+                # the linear layer and one linear of the two-linear net are used in forward.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Builds the four submodules.
                     super().__init__()
                     self.embedding_net = EmbeddingNetDifferentParams(0)
                     self.lin = TwoLinLayerNet()
@@ -9104,6 +10412,8 @@ class DistributedTest:
                     self.lin_layer = nn.Linear(4, 10, bias=False)
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Applies the batch norm net, the linear layer and then
+                    # the first linear of the two-linear net; everything else is unused.
                     x = self.bn(x)
                     x = self.lin_layer(x)
                     x = self.lin.a(x)  # self.lin.b param unused
@@ -9112,11 +10422,15 @@ class DistributedTest:
                     return x
 
             class MyModel(nn.Module):
+                # [CLASS DOC] HELPER: Wrapper model holding a SubModule and delegating forward
+                # to it.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Builds the submodule.
                     super().__init__()
                     self.sub_module = SubModule()
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Returns the submodule's output for x.
                     return self.sub_module(x)
 
             model = MyModel()
@@ -9212,12 +10526,17 @@ class DistributedTest:
         @require_backend_is_available(DistTestCases.backend_feature["gpu"])
         @skip_if_lt_x_gpu(2)
         def test_ddp_multiple_nested_unused_params_error(self):
+            # [FUNCTION DOC] Needs a GPU backend and 2 GPUs; runs under several debug levels.
+            # Nested unused parameters error check without ignored parameters.
             self._test_ddp_multiple_nested_unused_params_error(ignore_sparse=False)
 
         @with_dist_debug_levels(levels=["OFF", "INFO", "DETAIL"])
         @require_backend_is_available(DistTestCases.backend_feature["gpu"])
         @skip_if_lt_x_gpu(2)
         def test_ddp_multiple_nested_unused_params_err_ignore_params(self):
+            # [FUNCTION DOC] Needs a GPU backend and 2 GPUs; runs under several debug levels.
+            # Nested unused parameters error check with the sparse embedding parameters ignored
+            # by DDP.
             # Tests unused parameter reporting when DDP is configured to ignore
             # certain parameters.
             self._test_ddp_multiple_nested_unused_params_error(ignore_sparse=True)
@@ -9228,6 +10547,9 @@ class DistributedTest:
         )
         @skip_if_lt_x_gpu(2)
         def test_ddp_inference(self):
+            # [FUNCTION DOC] Needs 2 GPUs. Checks that DDP-wrapped models (a normal net and a sync
+            # batch norm without running stats) can run inference in eval mode on rank 0 only
+            # without hanging and produce the same outputs as local copies, followed by a barrier.
             # tests that DDP module can be run on a single node with no_grad
             # or eval setting and there is no hang.
             rank = self.rank
@@ -9274,6 +10596,10 @@ class DistributedTest:
             "Test is failing, see https://github.com/pytorch/pytorch/pull/113620"
         )
         def test_ddp_sync_bn_training_vs_eval(self):
+            # [FUNCTION DOC] Needs 2 GPUs.
+            # KNOWN ISSUE: skipped unconditionally (tracked failing). Intended: checks sync batch
+            # norm gathers statistics in training but not in eval mode, using the profiler to look
+            # for all-gather calls.
             rank = self.rank
             torch.cuda.set_device(rank)
             # Need to set track_running_stats=False, when track_running_stats=True,
@@ -9323,6 +10649,9 @@ class DistributedTest:
             f"The {BACKEND} backend does not support DistributedDataParallel",
         )
         def test_ddp_python_error_logged(self):
+            # [FUNCTION DOC] Needs 2 GPUs. Checks that a Python error raised after DDP
+            # construction (registering a non-callable communication hook raises TypeError) is
+            # recorded in the DDP error logs.
             # Most python exceptions in DDP are raised during init before
             # reducer is constructed, so we don't have a logger in those cases.
             # However, the below is one example where a python error is thrown
@@ -9344,17 +10673,30 @@ class DistributedTest:
             f"The {BACKEND} backend does not support DistributedDataParallel",
         )
         def test_ddp_static_graph_nested_types(self):
+            # [FUNCTION DOC] Needs 2 GPUs. Checks static graph DDP with module outputs that are
+            # nested tuples, lists and dictionaries: trains a regular and a static graph DDP model
+            # for six iterations per output type, checks the output type and parameter equality.
+            # KNOWN ISSUE: the static graph model wraps the already DDP-wrapped model instead
+            # of the deep copy, so the two models share parameters and the comparison is
+            # trivially true.
             # Tests for static graph training when outputs are not just tensors
             # but can be (nested) tuple, list, dict, etc.
             rank = self.rank
             torch.cuda.set_device(rank)
 
             class NestedOutputModule(torch.nn.Module):
+                # [CLASS DOC] HELPER: Local model with a bias-free linear layer (100 to 1) whose
+                # forward returns the layer applied three times in a nested tuple, list or
+                # dictionary structure depending on the output type.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Builds the linear layer.
                     super().__init__()
                     self.lin = nn.Linear(100, 1, bias=False)
 
                 def forward(self, inp, output_type):
+                    # [FUNCTION DOC] HELPER: Returns the nested structure of three identical
+                    # linear outputs as a tuple, list or dict according to output_type; returns
+                    # nothing for other values.
                     if output_type == "tuple":
                         return (
                             self.lin(inp),
@@ -9380,6 +10722,9 @@ class DistributedTest:
                         }
 
             def get_loss(model_output):
+                # [FUNCTION DOC] HELPER: Recursively sums a tensor, or the values of a dict, or
+                # the items of a tuple or list, returning a scalar loss; raises ValueError for
+                # other types.
                 loss = 0.0
                 if isinstance(model_output, torch.Tensor):
                     return model_output.sum()
@@ -9432,16 +10777,26 @@ class DistributedTest:
             f"The {BACKEND} backend does not support DistributedDataParallel",
         )
         def test_ddp_returns_tensor_with_no_grad(self):
+            # [FUNCTION DOC] Needs 2 GPUs. Checks DDP with a module that returns a detached
+            # tensor and a tensor with grad, for all combinations of find unused parameters and
+            # static graph: the first output must not require grad and backward through the sum
+            # must succeed.
             # Tests case where module returns tensor that does not require grad.
             torch.cuda.set_device(self.rank)
 
             class MyModel(nn.Module):
+                # [CLASS DOC] HELPER: Local model with two bias-free linears whose forward returns
+                # the pair of a detached output and a normal clone, and raises AssertionError if
+                # the detached output requires grad.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Builds the two linears.
                     super().__init__()
                     self.fc1 = nn.Linear(10, 10, bias=False)
                     self.fc2 = nn.Linear(10, 10, bias=False)
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Computes relu of the first layer then the second;
+                    # returns the tuple of a detached copy and the clone of the output.
                     x = self.fc2(F.relu(self.fc1(x)))
                     y = x.clone()
                     x = x.detach()
@@ -9473,13 +10828,23 @@ class DistributedTest:
             f"The {BACKEND} backend does not support DistributedDataParallel",
         )
         def test_detect_ddp_is_actually_static(self):
+            # [FUNCTION DOC] Needs 2 GPUs. Checks the reducer's detection of a static graph: when
+            # the set of unused parameters is the same every iteration (both with find unused
+            # parameters on and off) the reducer reports a static graph after six iterations; when
+            # the unused set alternates between iterations it reports not static.
             class ToyModel(nn.Module):
+                # [CLASS DOC] HELPER: Local model with two linears whose use depends on flags
+                # (find_unused, dynamic) so the training graph can be static or dynamic.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Builds a bias-free linear and a linear with bias.
                     super().__init__()
                     self.net1 = nn.Linear(10, 10, bias=False)
                     self.net2 = nn.Linear(10, 10)
 
                 def forward(self, x, find_unused, dynamic):
+                    # [FUNCTION DOC] HELPER: Forward taking flags: with find_unused and dynamic
+                    # both set, uses both layers; with find_unused set and dynamic off, only the
+                    # second layer (the first is unused); with find_unused off, both layers.
                     if find_unused:
                         if dynamic:
                             return self.net2(self.net1(x))
@@ -9518,19 +10883,37 @@ class DistributedTest:
             self.assertFalse(ddp.reducer._ddp_graph_static())
 
         def _test_ddp_new_tensor_in_fwd(self, static_graph):
+            # [FUNCTION DOC] HELPER: Checks that tensors created inside forward and returned
+            # (single, repeated and nested in a dictionary) pass through DDP without a grad
+            # history. For each find unused parameters setting, runs two iterations feeding
+            # outputs back as inputs, asserts the returned optional tensors have no grad
+            # function, then backpropagates the mean of the main output. See the linked upstream
+            # issue for background.
             # Test from https://github.com/pytorch/pytorch/issues/60733
             class MyModel(nn.Module):
+                # [CLASS DOC] HELPER: Local model with two bias-free linears that returns its
+                # output plus optional extra tensors, creating random ones when the corresponding
+                # inputs are missing (or not tensors for the nested one), returned as a tuple that
+                # includes a dictionary.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Builds the two linears and remembers the device of
+                    # the first weight.
                     super().__init__()
                     self.fc1 = nn.Linear(10, 10, bias=False)
                     self.fc2 = nn.Linear(10, 10, bias=False)
                     self.device = self.fc1.weight.device
 
                 def __init_opt(self):
+                    # [FUNCTION DOC] HELPER: Creates and returns a random 1 by 10 tensor on the
+                    # model's device.
                     opt = torch.randn(1, 10, device=self.device)
                     return opt
 
                 def forward(self, x, opt_1, opt_2, opt_nested):
+                    # [FUNCTION DOC] HELPER: Applies relu of the first layer and then the second
+                    # layer; fills in missing optional tensors with new random ones; returns the
+                    # tuple of the output, the two optional tensors, and a dictionary holding the
+                    # nested tensor.
                     x = F.relu(self.fc1(x))
                     x = self.fc2(x)
                     if opt_1 is None:
@@ -9574,6 +10957,8 @@ class DistributedTest:
             f"The {BACKEND} backend does not support DistributedDataParallel",
         )
         def test_ddp_new_tensor_in_fwd(self):
+            # [FUNCTION DOC] Needs 2 GPUs. Runs the new-tensor-in-forward check without
+            # static graph.
             return self._test_ddp_new_tensor_in_fwd(static_graph=False)
 
         @skip_if_lt_x_gpu(2)
@@ -9582,15 +10967,26 @@ class DistributedTest:
             f"The {BACKEND} backend does not support DistributedDataParallel",
         )
         def test_ddp_new_tensor_in_fwd_static_graph(self):
+            # [FUNCTION DOC] Needs 2 GPUs. Runs the new-tensor-in-forward check with static graph.
             return self._test_ddp_new_tensor_in_fwd(static_graph=True)
 
         def _test_ddp_buffer_hook_allreduce(self, return_futures):
+            # [FUNCTION DOC] HELPER: Checks custom buffer communication hooks. For hooks run
+            # pre-forward and post-forward, wraps the buffer net in DDP with a hook that
+            # all-reduces each buffer (the hook either returns the list of futures or waits for
+            # them), and compares against a DDP copy without broadcast whose buffers are
+            # all-reduced manually at the matching point. Asserts buffers are equal across models
+            # after each step, except that for future-returning hooks run pre-forward the check is
+            # skipped because of unsynchronized async communication.
             rank = self.rank
             torch.cuda.set_device(rank)
             torch.manual_seed(rank)
             torch.cuda.manual_seed(rank)
 
             def buffer_comm_hook(ddp, named_buffers):
+                # [FUNCTION DOC] HELPER: Buffer communication hook: starts an asynchronous
+                # all-reduce on every buffer in the given mapping over the DDP process group;
+                # returns the futures if configured to, otherwise waits for all of them.
                 buffers = list(named_buffers.values())
                 futs = [
                     dist.all_reduce(
@@ -9667,6 +11063,8 @@ class DistributedTest:
             f"The {BACKEND} backend does not support DistributedDataParallel",
         )
         def test_ddp_buffer_hook_allreduce_return_future(self):
+            # [FUNCTION DOC] Needs 2 GPUs. Buffer hook all-reduce check where the hook
+            # returns futures.
             self._test_ddp_buffer_hook_allreduce(return_futures=True)
 
         @skip_if_lt_x_gpu(2)
@@ -9675,6 +11073,8 @@ class DistributedTest:
             f"The {BACKEND} backend does not support DistributedDataParallel",
         )
         def test_ddp_buffer_hook_allreduce(self):
+            # [FUNCTION DOC] Needs 2 GPUs. Buffer hook all-reduce check where the hook waits
+            # for completion.
             self._test_ddp_buffer_hook_allreduce(return_futures=False)
 
         @skip_if_lt_x_gpu(2)
@@ -9683,6 +11083,9 @@ class DistributedTest:
             f"The {BACKEND} backend does not support DistributedDataParallel",
         )
         def test_ddp_broadcast_buffer_via_hook(self):
+            # [FUNCTION DOC] Needs 2 GPUs. Checks that a buffer communication hook calling the
+            # default coalesced broadcast gives the same buffers as DDP's built in buffer
+            # broadcast, over two iterations.
             # test that _distributed_broadcast_coalesced via registered hook is
             # equivalent to DDP's default broadcast coalesced.
             rank = self.rank
@@ -9691,6 +11094,8 @@ class DistributedTest:
             torch.cuda.manual_seed(rank)
 
             def buffer_comm_hook(ddp, named_buffers):
+                # [FUNCTION DOC] HELPER: Buffer communication hook that gathers the buffers from
+                # the mapping and calls DDP's default coalesced broadcast on them.
                 # named_buffers is a Dict[str, Tensor] representing a mapping
                 # from buffer name to buffer.
                 buffers = list(named_buffers.values())
@@ -9720,22 +11125,37 @@ class DistributedTest:
             f"The {BACKEND} backend does not support DistributedDataParallel",
         )
         def test_ddp_remove_autograd_hooks(self):
+            # [FUNCTION DOC] Needs 2 GPUs. Checks removal of autograd hooks: a first DDP wrapper
+            # whose backward raises RuntimeError (through a custom function) has its autograd
+            # hooks removed, after which a second DDP wrapper over the same model with errors
+            # disabled can train normally.
             class SimulateError(torch.autograd.Function):
+                # [CLASS DOC] HELPER: Autograd function that is identity in forward and raises
+                # RuntimeError in backward, used to simulate a failure.
                 @staticmethod
                 def forward(ctx, input):
+                    # [FUNCTION DOC] HELPER: Static method; returns the input unchanged.
                     return input
 
                 @staticmethod
                 def backward(ctx, grad_output):
+                    # [FUNCTION DOC] HELPER: Static method; always raises RuntimeError (the
+                    # gradient argument is ignored).
                     raise RuntimeError
 
             class MyModel(nn.Module):
+                # [CLASS DOC] HELPER: Local model with one linear layer on a given device and an
+                # error flag; when set, the input passes through the failing autograd function.
                 def __init__(self, device):
+                    # [FUNCTION DOC] HELPER: Sets the error flag to true and builds the linear
+                    # layer on the given device.
                     super().__init__()
                     self.error = True
                     self.fc1 = nn.Linear(10, 10).cuda(device)
 
                 def forward(self, inp):
+                    # [FUNCTION DOC] HELPER: Applies the linear layer, to the failing function's
+                    # output if the error flag is set, otherwise directly to the input.
                     if self.error:
                         return self.fc1(SimulateError.apply(inp))
                     else:
@@ -9778,18 +11198,32 @@ class DistributedTest:
             "Test is failing, tracking issue at https://github.com/pytorch/pytorch/issues/102751"
         )
         def test_ddp_has_finalized(self):
+            # [FUNCTION DOC] Needs 2 GPUs.
+            # KNOWN ISSUE: skipped unconditionally and on Linux or ROCm (tracked issue); the test
+            # setup also references this test to ignore its exit code since it is meant to crash a
+            # process. Intended behavior: rank 0 returns a non-tensor wrapper from forward so its
+            # second output is unused; checks the finalization checks raise an error about an
+            # unfinished reduction on rank 0 and pass on other ranks.
             @dataclass
             class MyClass:
+                # [CLASS DOC] HELPER: Dataclass wrapping a single tensor, used to hide a tensor in
+                # a model output.
                 obj: torch.Tensor
 
             class MyModel(nn.Module):
+                # [CLASS DOC] HELPER: Local model with two linear layers; rank 0 returns the
+                # second output wrapped in a dataclass, other ranks return a plain tuple.
                 def __init__(self, rank):
+                    # [FUNCTION DOC] HELPER: Stores the rank and builds two linears on that
+                    # rank's device.
                     super().__init__()
                     self.rank = rank
                     self.fc1 = nn.Linear(1024, 1024).cuda(rank)
                     self.fc2 = nn.Linear(1024, 2 * 1024).cuda(rank)
 
                 def forward(self, inp):
+                    # [FUNCTION DOC] HELPER: Returns the first linear output and the second linear
+                    # output, wrapped in the dataclass on rank 0.
                     if self.rank == 0:
                         return self.fc1(inp), MyClass(self.fc2(inp))
                     else:
@@ -10025,19 +11459,28 @@ class DistributedTest:
             f"The {BACKEND} backend does not support DistributedDataParallel",
         )
         def test_ddp_broadcast_buffer(self):
+            # [FUNCTION DOC] Needs 2 GPUs. Rank 0 modifies its model buffer each iteration; checks
+            # that after DDP forward and backward the buffer is identical on all ranks (buffer
+            # broadcasting). Uses a local model class with a buffer.
             rank = self.rank
             torch.cuda.set_device(rank)
             torch.manual_seed(rank)
             torch.cuda.manual_seed(rank)
 
             class NetWithBuffers(nn.Module):
+                # [CLASS DOC] HELPER: Local model (shadowing the module level class) with two
+                # bias-free linears and a random buffer.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Builds the linears and registers a random 1 by
+                    # 2 buffer.
                     super().__init__()
                     self.a = nn.Linear(10, 10, bias=False)
                     self.b = nn.Linear(10, 1, bias=False)
                     self.register_buffer("buffer", torch.randn(1, 2))
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Returns the second linear applied to the first
+                    # linear's output.
                     return self.b(self.a(x))
 
             model = NetWithBuffers().cuda(rank)
@@ -10067,18 +11510,26 @@ class DistributedTest:
             f"The {BACKEND} backend does not support DistributedDataParallel",
         )
         def test_ddp_join_respects_forward_sync_buffers_false(self):
+            # [FUNCTION DOC] Needs 2 GPUs. Checks that, with forward buffer syncing disabled, the
+            # final model synchronization performed when leaving the join context does not change
+            # a rank-local buffer, with uneven iteration counts.
             rank = self.rank
             torch.cuda.set_device(rank)
             torch.manual_seed(rank + 42)
             torch.cuda.manual_seed(rank + 42)
 
             class NetWithBuffers(nn.Module):
+                # [CLASS DOC] HELPER: Local model with a bias-free linear and a rank-local random
+                # buffer that is added to the output.
                 def __init__(self):
+                    # [FUNCTION DOC] HELPER: Builds the linear and registers a random buffer of
+                    # length 10.
                     super().__init__()
                     self.fc = nn.Linear(10, 10, bias=False)
                     self.register_buffer("rank_local", torch.randn(10))
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Returns the linear output plus the buffer.
                     return self.fc(x) + self.rank_local
 
             model = NetWithBuffers().cuda(rank)
@@ -10107,18 +11558,26 @@ class DistributedTest:
             f"The {BACKEND} backend does not support DistributedDataParallel",
         )
         def test_ddp_init_sync_buffers_with_forward_sync_buffers_false(self):
+            # [FUNCTION DOC] Needs 2 GPUs. Checks that with forward sync of buffers disabled,
+            # buffers are synchronized once at construction (identical across ranks) but a later
+            # change on rank 0 is not propagated after a forward and backward step.
             rank = self.rank
             torch.cuda.set_device(rank)
             torch.manual_seed(rank)
             torch.cuda.manual_seed(rank)
 
             class NetWithBuffers(nn.Module):
+                # [CLASS DOC] HELPER: Local model with a bias-free linear and a random buffer
+                # added to the output.
                 def __init__(self):
+                    # [FUNCTION DOC] HELPER: Builds the linear and registers a random buffer of
+                    # length 10.
                     super().__init__()
                     self.a = nn.Linear(10, 10, bias=False)
                     self.register_buffer("frozen_coeff", torch.randn(10))
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Returns the linear output plus the buffer.
                     return self.a(x) + self.frozen_coeff
 
             model = NetWithBuffers().cuda(rank)
@@ -10156,10 +11615,16 @@ class DistributedTest:
             f"The {BACKEND} backend does not support DistributedDataParallel",
         )
         def test_ddp_broadcast_buffers_deprecation_warning(self):
+            # [FUNCTION DOC] Needs 2 GPUs. Checks the FutureWarning behavior for the broadcast
+            # buffers argument: passing it (true or false) warns; passing it together with the
+            # forward sync buffers argument warns and the latter wins; passing nothing or only the
+            # new argument gives no such warning.
             rank = self.rank
             torch.cuda.set_device(rank)
 
             def _count_broadcast_buffers_warnings(caught):
+                # [FUNCTION DOC] HELPER: Counts the recorded warnings that are FutureWarnings
+                # mentioning broadcast_buffers.
                 return len(
                     [
                         w
@@ -10213,13 +11678,19 @@ class DistributedTest:
             "Only Nccl & Gloo backend support DistributedDataParallel",
         )
         def test_static_graph_multi_forward(self):
+            # [FUNCTION DOC] Needs 2 GPUs; nccl or gloo only. Checks static graph DDP with the
+            # module called twice before backward: the gradients must equal a local model that ran
+            # the input once per rank and averaged the gradients.
             class Net(nn.Module):
+                # [CLASS DOC] HELPER: Local model with a linear layer followed by relu.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Builds the linear and the activation.
                     super().__init__()
                     self.lin = nn.Linear(10, 10)
                     self.relu = nn.ReLU()
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Returns relu of the linear applied to x.
                     return self.relu(self.lin(x))
 
             torch.cuda.set_device(self.rank)
@@ -10267,6 +11738,9 @@ class DistributedTest:
             "Only Nccl & Gloo backend support DistributedDataParallel",
         )
         def test_sync_bn_logged(self):
+            # [FUNCTION DOC] Needs 2 GPUs; nccl or gloo only. Checks that the DDP logging data
+            # reports whether a model contains sync batch norm: false for a regular copy and true
+            # after conversion.
             model = BatchNormNet()
             rank = self.rank
             # single gpu training setup
@@ -10293,14 +11767,22 @@ class DistributedTest:
             f"The {BACKEND} backend does not support DistributedDataParallel",
         )
         def test_stateless_api_with_ddp(self):
+            # [FUNCTION DOC] Needs 2 GPUs. Checks functional_call with explicit parameters
+            # and buffers on a DDP model: the output follows the supplied values, the
+            # module's own parameters and buffers stay unchanged, gradients flow to the
+            # supplied parameters only.
             class MockModule(torch.nn.Module):
+                # [CLASS DOC] HELPER: Local model with a 1 by 1 linear and a buffer of ones whose
+                # forward adds the buffer to the linear output.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Builds the linear and registers the buffer.
                     super().__init__()
                     self.l1 = torch.nn.Linear(1, 1)
                     buffer = torch.ones(1)
                     self.register_buffer("buffer", buffer)
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Returns the linear output plus the buffer.
                     return self.l1(x) + self.buffer
 
             device = self.rank
@@ -10340,22 +11822,34 @@ class DistributedTest:
         @require_backend_is_available(DistTestCases.backend_feature["gpu"])
         @skip_if_lt_x_gpu(2)
         def test_ddp_forward_backward_hook(self):
+            # [FUNCTION DOC] Needs 2 GPUs. Checks that module forward pre hooks, forward hooks and
+            # backward hooks registered on a submodule behave the same inside DDP as in a local
+            # model: equal outputs and equal gradients.
             class DummyTestModel(nn.Module):
+                # [CLASS DOC] HELPER: Local model with a seeded 2 by 2 linear layer.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Seeds the random generator with zero and builds the
+                    # linear layer.
                     super().__init__()
                     torch.manual_seed(0)
                     self.fc = nn.Linear(2, 2)
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Returns the linear layer applied to x.
                     return self.fc(x)
 
             def relu_hook(module, input):
+                # [FUNCTION DOC] HELPER: Forward pre hook that returns the relu of the
+                # first input.
                 return nn.functional.relu(input[0])
 
             def gelu_hook(module, _input, output):
+                # [FUNCTION DOC] HELPER: Forward hook that returns gelu of the output.
                 return nn.functional.gelu(output)
 
             def celu_hook(module, _input, output):
+                # [FUNCTION DOC] HELPER: Backward hook that returns a tuple containing celu of the
+                # first element of the output gradient.
                 return (nn.functional.celu(output[0]),)
 
             local_model = DummyTestModel()
@@ -10380,6 +11874,16 @@ class DistributedTest:
             self.assertEqual(ddp_grads[1], local_model.fc.bias.grad)
 
         def _test_hook_pickling(self, hook, hook_state):
+            # [FUNCTION DOC] HELPER: Communication hook pickling check. Trains a DDP linear model
+            # for ten steps with the given hook and state, saves a checkpoint (model state, hook
+            # and hook state) to a temp file from rank 0 and asserts exactly one expected log note
+            # about the non-serializable process group; loads it, asserts one log note about the
+            # default group, restores a second DDP model, and checks the hook name, state slots
+            # (except process group and random generator), default process group and random state
+            # equality; then trains both models ten more steps and compares gradients. Rank 0
+            # deletes the file.
+            # KNOWN ISSUE: the checkpoint path is a fixed name in the shared temp directory, so
+            # concurrent runs can collide.
             torch.manual_seed(0)
             learning_rate = 0.01
             chkpt_file = tempfile.gettempdir() + "/checkpoint.pt"
@@ -10507,6 +12011,9 @@ class DistributedTest:
         @skip_if_lt_x_gpu(int(os.environ["WORLD_SIZE"]))
         @skip_but_pass_in_sandcastle_if(True, "Skipped due to flakiness")
         def test_ddp_hook_pickling_powerSGD(self):
+            # [FUNCTION DOC] Needs one GPU per rank.
+            # KNOWN ISSUE: always skipped because of an unconditional skip decorator (flaky).
+            # Intended: runs the hook pickling check with the PowerSGD hook and state.
             hook = powerSGD.powerSGD_hook
             powersgd_state = powerSGD.PowerSGDState(
                 process_group=None,
@@ -10518,6 +12025,9 @@ class DistributedTest:
         @require_backend_is_available(DistTestCases.backend_feature["gpu"])
         @skip_if_lt_x_gpu(2)
         def test_ddp_device_mesh_initialization(self):
+            # [FUNCTION DOC] Needs a GPU backend and 2 GPUs. Checks DDP constructed with a one
+            # dimensional device mesh stores it, and raises RuntimeError when both a process group
+            # and a device mesh are passed or when the mesh is not one dimensional.
             """
             Test DDP with device_mesh initialization.
             """
@@ -10559,6 +12069,8 @@ class DistributedTest:
             f"The {BACKEND} backend does not support DistributedDataParallel",
         )
         def test_ddp_compile_static_graph(self):
+            # [FUNCTION DOC] Needs exactly 2 GPUs. Checks that DDP works with torch compile and
+            # static graph.
             "Tests that DDP works with torch compile when static_graph=True"
             model = torch.nn.Linear(10, 10).cuda(self.rank)
             model_clone = copy.deepcopy(model)
@@ -10591,10 +12103,18 @@ class DistributedTest:
             f"The {BACKEND} backend does not support DistributedDataParallel",
         )
         def test_ddp_sink_noclone(self):
+            # [FUNCTION DOC] Needs exactly 2 GPUs. Checks that after turning off the clone of the
+            # DDP sink, forward and backward with a dispatch mode that raises RuntimeError on any
+            # clone operation completes without raising.
             "Tests that we can configure DDP to avoid clone"
 
             class OpPatcher(TorchDispatchMode):
+                # [CLASS DOC] HELPER: Dispatch mode that raises RuntimeError when a clone
+                # operation is dispatched and otherwise forwards the call unchanged.
                 def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                    # [FUNCTION DOC] HELPER: Intercepts every operator call: raises RuntimeError
+                    # (clone encountered) if the operator is clone, otherwise runs the operator
+                    # with the given arguments and returns its result.
                     func_packet = func._overloadpacket
                     if func_packet == torch.ops.aten.clone:
                         raise RuntimeError("clone encountered!")
@@ -10602,11 +12122,14 @@ class DistributedTest:
                     return func(*args, **kwargs)
 
             class MyModel(torch.nn.Module):
+                # [CLASS DOC] HELPER: Local model wrapping one 10 to 10 linear layer.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Builds the linear layer.
                     super().__init__()
                     self.fc = torch.nn.Linear(10, 10)
 
                 def forward(self, input):
+                    # [FUNCTION DOC] HELPER: Returns the linear layer applied to the input.
                     return self.fc(input)
 
             model = MyModel().cuda(self.rank)
@@ -10627,14 +12150,21 @@ class DistributedTest:
             static_graph=False,
             skip_all_reduce_unused_params=False,
         ):
+            # [FUNCTION DOC] HELPER: Trains a model with an unused layer for ten iterations in DDP
+            # with the given unused-parameter search, static graph and
+            # skip-reduce-of-unused-parameters flags (1.5 MB buckets) and returns the DDP model.
             class LargeNet(nn.Module):
+                # [CLASS DOC] HELPER: Local model with a large layer (100 to 5000) used in forward
+                # and a small unused layer (100 to 100).
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Builds the used and unused linear layers.
                     super().__init__()
                     self.fc1 = nn.Linear(100, 5000, bias=False)
                     # fc2 is unused
                     self.fc2 = nn.Linear(100, 100, bias=False)
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Returns only the first linear layer applied to x.
                     y = self.fc1(x)
                     return y
 
@@ -10658,6 +12188,10 @@ class DistributedTest:
         @require_backend_is_available(DistTestCases.backend_feature["gpu"])
         @skip_if_lt_x_gpu(2)
         def test_skip_all_reduce_unused_parameters(self):
+            # [FUNCTION DOC] Needs a GPU backend and 2 GPUs. Compares a baseline with unused
+            # parameter search against a model that skips all-reduce of unused parameters: the
+            # logged number of reduced buckets must be 2 for the baseline and 1 for the optimized
+            # one, and final parameters must be equal.
             base_model = self._test_skip_all_reduce_unused_parameters(
                 find_unused_parameters=True, static_graph=False
             )
@@ -10685,9 +12219,15 @@ class DistributedTest:
 # These tests verify pure Python logic without requiring multi-process setup.
 # =============================================================================
 class TestBucketCapacityConfig(unittest.TestCase):
+    # [CLASS DOC] Single-process unit tests for the bucket capacity configuration dataclass:
+    # construction from bucket_cap_mb or bucket_cap_mb_list, derived byte limits, default values,
+    # precedence rules, error for the Python reducer with a list, and immutability.
     """Unit tests for _BucketCapacityConfig dataclass."""
 
     def test_create_with_default_bucket_cap(self):
+        # [FUNCTION DOC] Checks that with no capacity given, the byte cap is the default MB value
+        # converted to bytes, there are no per-bucket caps, the first bucket cap equals the
+        # default first bucket size, and the MB value is the default.
         """Test _BucketCapacityConfig.create() with default bucket_cap_mb (None)."""
         config = _BucketCapacityConfig.create(
             bucket_cap_mb=None,
@@ -10704,6 +12244,8 @@ class TestBucketCapacityConfig(unittest.TestCase):
         self.assertEqual(config.bucket_cap_mb, _DEFAULT_BUCKET_CAP_MB)
 
     def test_create_with_custom_bucket_cap_mb(self):
+        # [FUNCTION DOC] Checks that a custom MB capacity gives that many bytes for both the main
+        # cap and the first bucket cap, with no per-bucket caps.
         """Test _BucketCapacityConfig.create() with custom bucket_cap_mb."""
         custom_cap_mb = 100
         config = _BucketCapacityConfig.create(
@@ -10719,6 +12261,8 @@ class TestBucketCapacityConfig(unittest.TestCase):
         self.assertEqual(config.bucket_cap_mb, custom_cap_mb)
 
     def test_create_with_bucket_cap_mb_list(self):
+        # [FUNCTION DOC] Checks that a list of capacities gives per-bucket caps in bytes, a main
+        # and first cap equal to the largest entry, and the flag for custom per-bucket caps set.
         """Test _BucketCapacityConfig.create() with bucket_cap_mb_list."""
         cap_list = [10, 25, 50]
         config = _BucketCapacityConfig.create(
@@ -10735,6 +12279,8 @@ class TestBucketCapacityConfig(unittest.TestCase):
         self.assertTrue(config.has_custom_per_bucket_caps)
 
     def test_create_with_bucket_cap_mb_list_overrides_bucket_cap_mb(self):
+        # [FUNCTION DOC] Checks that the capacity list takes precedence over a single
+        # capacity value.
         """Test that bucket_cap_mb_list takes precedence over bucket_cap_mb."""
         cap_list = [10, 25, 50]
         config = _BucketCapacityConfig.create(
@@ -10747,6 +12293,8 @@ class TestBucketCapacityConfig(unittest.TestCase):
         self.assertEqual(config.bucket_bytes_cap, expected_max_bytes)
 
     def test_create_raises_for_python_reducer_with_list(self):
+        # [FUNCTION DOC] Checks that using the capacity list together with the Python reducer
+        # raises AssertionError whose message says the python reducer is not supported.
         """Test that AssertionError is raised when using bucket_cap_mb_list with Python reducer."""
         with self.assertRaises(AssertionError) as context:
             _BucketCapacityConfig.create(
@@ -10758,6 +12306,8 @@ class TestBucketCapacityConfig(unittest.TestCase):
         self.assertIn("python reducer is not supported", str(context.exception))
 
     def test_has_custom_per_bucket_caps_property(self):
+        # [FUNCTION DOC] Checks the custom-per-bucket-caps flag is false without a list and true
+        # with a list.
         """Test has_custom_per_bucket_caps property."""
         config_no_list = _BucketCapacityConfig.create(
             bucket_cap_mb=25,
@@ -10774,6 +12324,8 @@ class TestBucketCapacityConfig(unittest.TestCase):
         self.assertTrue(config_with_list.has_custom_per_bucket_caps)
 
     def test_bucket_cap_mb_property(self):
+        # [FUNCTION DOC] Checks the MB capacity property converts back from bytes for a custom
+        # value and for the default.
         """Test bucket_cap_mb property correctly derives MiB from bytes."""
         config = _BucketCapacityConfig.create(
             bucket_cap_mb=100,
@@ -10790,6 +12342,8 @@ class TestBucketCapacityConfig(unittest.TestCase):
         self.assertEqual(config_default.bucket_cap_mb, _DEFAULT_BUCKET_CAP_MB)
 
     def test_immutability(self):
+        # [FUNCTION DOC] Checks the configuration is frozen: assigning to the byte cap or the
+        # per-bucket caps raises AttributeError.
         """Test that _BucketCapacityConfig is immutable (frozen dataclass)."""
         config = _BucketCapacityConfig.create(
             bucket_cap_mb=25,
@@ -10805,9 +12359,13 @@ class TestBucketCapacityConfig(unittest.TestCase):
 
 
 class TestBucketCapacityConfigComputeLimits(unittest.TestCase):
+    # [CLASS DOC] Single-process unit tests for computing the bucket size limits (initial limits
+    # and rebuild limits) of the capacity configuration under different graph modes.
     """Unit tests for _BucketCapacityConfig.compute_bucket_size_limits()."""
 
     def test_compute_limits_with_custom_per_bucket_caps(self):
+        # [FUNCTION DOC] Checks that with a custom capacity list the limits and the rebuild limits
+        # both equal the list in bytes.
         """Test compute_bucket_size_limits returns custom caps when provided."""
         cap_list = [10, 25, 50]
         config = _BucketCapacityConfig.create(
@@ -10826,6 +12384,8 @@ class TestBucketCapacityConfigComputeLimits(unittest.TestCase):
         self.assertEqual(rebuild_limits, expected_limits)
 
     def test_compute_limits_static_graph_uses_maxsize(self):
+        # [FUNCTION DOC] Checks that with static graph on, the initial limits are one maximal
+        # integer and the rebuild limits are empty.
         """Test that static_graph=True uses sys.maxsize for initial bucketing."""
         config = _BucketCapacityConfig.create(
             bucket_cap_mb=25,
@@ -10842,6 +12402,8 @@ class TestBucketCapacityConfigComputeLimits(unittest.TestCase):
         self.assertEqual(rebuild_limits, [])
 
     def test_compute_limits_find_unused_false_uses_maxsize(self):
+        # [FUNCTION DOC] Checks that with unused parameter search off, the initial limits are one
+        # maximal integer and the rebuild limits are empty.
         """Test that find_unused_parameters=False uses sys.maxsize."""
         config = _BucketCapacityConfig.create(
             bucket_cap_mb=25,
@@ -10858,6 +12420,9 @@ class TestBucketCapacityConfigComputeLimits(unittest.TestCase):
         self.assertEqual(rebuild_limits, [])
 
     def test_compute_limits_default_with_find_unused_true(self):
+        # [FUNCTION DOC] Checks that with default capacity and unused parameter search on, the
+        # initial limits are the smaller first bucket size and the default capacity, and the
+        # rebuild limits are empty.
         """Test default config with find_unused_parameters=True uses smaller first bucket."""
         config = _BucketCapacityConfig.create(
             bucket_cap_mb=None,
@@ -10876,6 +12441,8 @@ class TestBucketCapacityConfigComputeLimits(unittest.TestCase):
         self.assertEqual(rebuild_limits, [])
 
     def test_compute_limits_custom_cap_with_find_unused_true(self):
+        # [FUNCTION DOC] Checks that with a custom MB capacity and unused parameter search on, the
+        # limits are a single bucket of that size and the rebuild limits are empty.
         """Test custom bucket_cap_mb with find_unused_parameters=True uses uniform bucket."""
         config = _BucketCapacityConfig.create(
             bucket_cap_mb=100,
@@ -10893,6 +12460,7 @@ class TestBucketCapacityConfigComputeLimits(unittest.TestCase):
         self.assertEqual(rebuild_limits, [])
 
     def test_compute_limits_empty_rebuild_for_non_list_config(self):
+        # [FUNCTION DOC] Checks that the rebuild limits are empty when no capacity list is used.
         """Test that rebuild_limits is empty when not using bucket_cap_mb_list."""
         config = _BucketCapacityConfig.create(
             bucket_cap_mb=50,
@@ -10909,9 +12477,13 @@ class TestBucketCapacityConfigComputeLimits(unittest.TestCase):
 
 
 class TestBucketCapacityConfigEdgeCases(unittest.TestCase):
+    # [CLASS DOC] Single-process edge case tests for the bucket capacity configuration:
+    # single-element, large, small, empty, duplicate, ascending and descending lists.
     """Edge case tests for _BucketCapacityConfig."""
 
     def test_single_element_bucket_cap_mb_list(self):
+        # [FUNCTION DOC] Checks a one-element list gives one per-bucket cap, the main cap equal to
+        # it, and the custom flag set.
         """Test bucket_cap_mb_list with a single element."""
         config = _BucketCapacityConfig.create(
             bucket_cap_mb=None,
@@ -10924,6 +12496,8 @@ class TestBucketCapacityConfigEdgeCases(unittest.TestCase):
         self.assertTrue(config.has_custom_per_bucket_caps)
 
     def test_large_bucket_cap_mb(self):
+        # [FUNCTION DOC] Checks a large MB capacity (1000) gives the expected byte caps for both
+        # main and first bucket.
         """Test with large bucket_cap_mb value."""
         large_cap = 1000
         config = _BucketCapacityConfig.create(
@@ -10937,6 +12511,7 @@ class TestBucketCapacityConfigEdgeCases(unittest.TestCase):
         self.assertEqual(config.first_bucket_bytes_cap, expected_bytes)
 
     def test_small_bucket_cap_mb(self):
+        # [FUNCTION DOC] Checks a small MB capacity (1) gives the expected byte cap.
         """Test with small bucket_cap_mb value."""
         small_cap = 1
         config = _BucketCapacityConfig.create(
@@ -10949,6 +12524,8 @@ class TestBucketCapacityConfigEdgeCases(unittest.TestCase):
         self.assertEqual(config.bucket_bytes_cap, expected_bytes)
 
     def test_empty_bucket_cap_mb_list(self):
+        # [FUNCTION DOC] Checks that an empty list falls back to the default capacity, with no
+        # per-bucket caps and the custom flag unset.
         """Test with empty bucket_cap_mb_list (should use default)."""
         config = _BucketCapacityConfig.create(
             bucket_cap_mb=None,
@@ -10962,6 +12539,8 @@ class TestBucketCapacityConfigEdgeCases(unittest.TestCase):
         self.assertFalse(config.has_custom_per_bucket_caps)
 
     def test_bucket_cap_mb_list_with_duplicates(self):
+        # [FUNCTION DOC] Checks duplicate list entries are kept and the main cap equals the
+        # repeated value.
         """Test bucket_cap_mb_list with duplicate values."""
         cap_list = [25, 25, 25]
         config = _BucketCapacityConfig.create(
@@ -10975,6 +12554,8 @@ class TestBucketCapacityConfigEdgeCases(unittest.TestCase):
         self.assertEqual(config.bucket_bytes_cap, 25 * _MB_TO_BYTES)
 
     def test_bucket_cap_mb_list_ascending_order(self):
+        # [FUNCTION DOC] Checks that an ascending list gives a main cap equal to the last
+        # (largest) entry.
         """Test bucket_cap_mb_list in ascending order."""
         cap_list = [5, 10, 15, 20]
         config = _BucketCapacityConfig.create(
@@ -10986,6 +12567,8 @@ class TestBucketCapacityConfigEdgeCases(unittest.TestCase):
         self.assertEqual(config.bucket_bytes_cap, 20 * _MB_TO_BYTES)
 
     def test_bucket_cap_mb_list_descending_order(self):
+        # [FUNCTION DOC] Checks that a descending list gives a main cap equal to the first
+        # (largest) entry.
         """Test bucket_cap_mb_list in descending order."""
         cap_list = [100, 50, 25, 10]
         config = _BucketCapacityConfig.create(
@@ -10998,13 +12581,17 @@ class TestBucketCapacityConfigEdgeCases(unittest.TestCase):
 
 
 class TestBucketCapacityConfigConstants(unittest.TestCase):
+    # [CLASS DOC] Single-process tests for the values of the module-level bucket
+    # capacity constants.
     """Tests for module-level constants."""
 
     def test_default_bucket_cap_mb_value(self):
+        # [FUNCTION DOC] Checks the default bucket capacity constant equals 25.
         """Test that _DEFAULT_BUCKET_CAP_MB is 25."""
         self.assertEqual(_DEFAULT_BUCKET_CAP_MB, 25)
 
     def test_mb_to_bytes_value(self):
+        # [FUNCTION DOC] Checks the megabyte to bytes constant equals 1024 times 1024.
         """Test that _MB_TO_BYTES is 1024 * 1024."""
         self.assertEqual(_MB_TO_BYTES, 1024 * 1024)
 
