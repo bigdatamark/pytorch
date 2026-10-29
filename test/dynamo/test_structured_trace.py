@@ -1,4 +1,12 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests for the structured trace (torch.__trace logger) output of torch.compile.
+# Defines sample functions, a logging filter and formatter that stabilize trace records
+# (stubbing stacks, hashes, metrics, remapping tensor and storage ids), and
+# StructuredTraceTest, which compiles functions and compares the captured JSON metadata lines
+# against expected inline strings, then validates the raw log with the external tlparse tool
+# when installed. Import time: reads the current accelerator type, optionally imports
+# FakeStore when distributed is available, and checks whether tlparse is on the path. Runs
+# under the dynamo run_tests entry point.
 import copy
 import functools
 import io
@@ -41,12 +49,19 @@ requires_distributed = functools.partial(
 
 
 def example_fn(a):
+    # [FUNCTION DOC] HELPER: Sample compile target. Multiplies the input by a 1000x1000 tensor
+    # of ones, adds another such tensor, returns the result. No graph breaks.
     output = a.mul(torch.ones(1000, 1000))
     output = output.add(torch.ones(1000, 1000))
     return output
 
 
 def example_training_fn(a):
+    # [FUNCTION DOC] HELPER: Sample training target. Multiplies the input by a ones tensor
+    # that requires grad, adds a ones tensor, calls backward on the sum (causing a graph
+    # break), and returns the output.
+    # KNOWN ISSUE: expected output embeds source line numbers in resume function names;
+    # inserted doc comments shift them, so the test will fail until the numbers are updated.
     output = a.mul(torch.ones(1000, 1000, requires_grad=True))
     output = output.add(torch.ones(1000, 1000))
     output.sum().backward()
@@ -54,17 +69,23 @@ def example_training_fn(a):
 
 
 def dynamo_error_fn(a):
+    # [FUNCTION DOC] HELPER: Sample target that fails during dynamo tracing: adds a 1000x1000
+    # tensor and a 10x10 tensor, whose shapes cannot broadcast.
     output = a.mul(torch.ones(1000, 1000))
     output = output.add(torch.ones(10, 10))
     return output
 
 
 def inductor_error_fn(a):
+    # [FUNCTION DOC] HELPER: Sample target applying round to the input; the inductor error
+    # test replaces the round lowering with a failing one.
     output = torch.round(a)
     return output
 
 
 def inductor_schedule_fn(a):
+    # [FUNCTION DOC] HELPER: Sample target for GPU tests. Adds a 1000x1000 ones tensor created
+    # on the current accelerator device type to the input and returns it.
     output = a.add(torch.ones(1000, 1000, device=device_type))
     return output
 
@@ -73,14 +94,27 @@ ARGS = (torch.ones(1000, 1000, requires_grad=True),)
 
 
 def replace_dynamic(buffer, key):
+    # [FUNCTION DOC] HELPER: Replaces the floating point value of the given JSON key in the
+    # buffer text with the placeholder dynamic marker, using a regular expression. Returns the
+    # new string; used for timing fields that vary per run.
     return re.sub(r'("' + key + r'":\s*)(\d+\.\d+)', r"\1<dynamic>", buffer)
 
 
 class StructuredTraceTestingFilter(logging.Filter):
+    # [CLASS DOC] HELPER: Logging filter for the trace handler that drops records whose
+    # metadata carries a str entry and the global torch_version artifact (which depends on
+    # test ordering). If match_name was given, only passes artifact records with exactly that
+    # artifact name, or non-artifact records whose metadata has a key equal to match_name.
+    # Attribute: match_name.
     def __init__(self, match_name=None):
+        # [FUNCTION DOC] HELPER: Stores the optional match_name used to restrict which records
+        # pass the filter.
         self.match_name = match_name
 
     def filter(self, record):
+        # [FUNCTION DOC] HELPER: Returns False to drop a record if its metadata has a str
+        # entry or is the torch_version artifact, or if match_name is set and the record does
+        # not match it; otherwise True. Reads record.metadata only.
         if "str" in record.metadata:
             return False
         # torch_version is a global artifact emitted once per process the first
@@ -102,23 +136,41 @@ class StructuredTraceTestingFilter(logging.Filter):
 
 
 class ChromiumEventFilter(logging.Filter):
+    # [CLASS DOC] HELPER: Logging filter that rejects records carrying chromium_event metadata
+    # so tests normally do not see chrome trace events.
     def filter(self, record):
+        # [FUNCTION DOC] HELPER: Returns True when the record metadata has no chromium_event
+        # key, False otherwise.
         return "chromium_event" not in record.metadata
 
 
 class StructuredTracePayloadFormatter(logging.Formatter):
+    # [CLASS DOC] HELPER: Formatter that emits only the payload text of a structured trace
+    # record, stripped of surrounding whitespace; used to capture artifact payloads.
     def format(self, record):
+        # [FUNCTION DOC] HELPER: Returns the record payload with leading and trailing
+        # whitespace removed.
         return record.payload.strip()
 
 
 class _DescribeIdNormalizer:
+    # [CLASS DOC] HELPER: Renumbers describe_storage, describe_tensor and describe_source ids
+    # in trace metadata to small deterministic integers in order of first appearance, and
+    # replaces describer_id with a fixed marker. State: two mappings from original to new id
+    # (tensor and storage) and two next-id counters, all starting at zero.
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Creates empty tensor and storage id mappings and sets both
+        # next-id counters to zero.
         self._tensor_id_remap = {}
         self._storage_id_remap = {}
         self._next_tensor_id = 0
         self._next_storage_id = 0
 
     def normalize(self, metadata):
+        # [FUNCTION DOC] HELPER: Mutates the given metadata mapping in place and returns it.
+        # Remaps storage ids, tensor ids and the storage reference of tensors, source ids
+        # (which share the tensor id mapping), sets describer_id to a fixed marker, and
+        # replaces a view_func value with a fixed marker. Missing sections are left alone.
         if "describe_storage" in metadata:
             storage_meta = metadata["describe_storage"]
             if (storage_id := storage_meta.get("id")) is not None:
@@ -141,12 +193,16 @@ class _DescribeIdNormalizer:
         return metadata
 
     def _normalize_tensor_id(self, original_id):
+        # [FUNCTION DOC] HELPER: Returns the stable id for an original tensor id, assigning
+        # the next counter value on first sight and recording it.
         if original_id not in self._tensor_id_remap:
             self._tensor_id_remap[original_id] = self._next_tensor_id
             self._next_tensor_id += 1
         return self._tensor_id_remap[original_id]
 
     def _normalize_storage_id(self, original_id):
+        # [FUNCTION DOC] HELPER: Returns the stable id for an original storage id, assigning
+        # the next counter value on first sight and recording it.
         if original_id not in self._storage_id_remap:
             self._storage_id_remap[original_id] = self._next_storage_id
             self._next_storage_id += 1
@@ -154,11 +210,24 @@ class _DescribeIdNormalizer:
 
 
 class StructuredTraceTestingFormatter(logging.Formatter):
+    # [CLASS DOC] HELPER: Formatter used by the test handler. Deep-copies record metadata and
+    # replaces unstable values (payload hash, stacks, filenames, compilation metrics) with
+    # fixed markers, normalizes describe ids, and serializes to JSON. State: a private id
+    # normalizer instance.
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Initializes the base formatter and creates a fresh id
+        # normalizer so remapping restarts per formatter.
         super().__init__()
         self._id_normalizer = _DescribeIdNormalizer()
 
     def format(self, record):
+        # [FUNCTION DOC] HELPER: Formats one record as a JSON string of its stabilized
+        # metadata. Stubs has_payload, dynamo_start stack, inductor_output_code filename and
+        # file_path, stack, and the four compilation metrics keys; normalizes describe ids;
+        # stubs user_stack and stack of create_symbol, guard_added_fast or
+        # create_unbacked_symbol entries. For dump_file records the name is replaced by a
+        # fixed marker and the right-stripped payload lines are appended after the JSON on
+        # following lines. Does not mutate the record.
         metadata = copy.deepcopy(record.metadata)
 
         # Stub out values that are not stable across runs
@@ -209,12 +278,18 @@ chrome_event_filter = ChromiumEventFilter()
 
 
 def show_chrome_events(fn):
+    # [FUNCTION DOC] HELPER: Decorator for tests that need chromium events. The wrapped test
+    # first removes the module level chromium event filter from the test's handler, then runs
+    # the test and returns its result.
     """
     Don't hide chrome events for this test
     """
 
     @functools.wraps(fn)
     def wrapper(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Wrapper produced by the decorator. Removes the chromium event
+        # filter from self.handler, then calls the original test with the same arguments and
+        # returns its result.
         self.handler.removeFilter(chrome_event_filter)
         return fn(self, *args, **kwargs)
 
@@ -222,7 +297,16 @@ def show_chrome_events(fn):
 
 
 class StructuredTraceTest(TestCase):
+    # [CLASS DOC] Test case for structured tracing. Each test attaches a handler to the
+    # torch.__trace logger that captures stabilized JSON lines into a string buffer, plus a
+    # raw handler writing the real trace format to a temporary file that tlparse can parse.
+    # Attributes set in setUp: buffer, old_level, handler, raw_file, raw_handler. Tests
+    # compile functions and compare the buffer against expected inline text.
     def setUp(self):
+        # [FUNCTION DOC] Resets dynamo and the structured logging intern table, creates the
+        # capture buffer, sets the trace logger to debug level (remembering the old level),
+        # and installs the formatted handler (with test filter and chromium filter) and the
+        # raw file handler on the trace logger.
         super().setUp()
         torch._dynamo.reset()
         torch._logging.structured.INTERN_TABLE.clear()
@@ -244,6 +328,8 @@ class StructuredTraceTest(TestCase):
         trace_log.addHandler(self.raw_handler)
 
     def tearDown(self):
+        # [FUNCTION DOC] Removes both handlers from the trace logger, closes the raw temporary
+        # file, restores the logger level, and calls the base teardown.
         trace_log.removeHandler(self.handler)
         trace_log.removeHandler(self.raw_handler)
         self.raw_file.close()
@@ -251,6 +337,9 @@ class StructuredTraceTest(TestCase):
         super().tearDown()
 
     def assertExpectedInline(self, actual, expected, skip=0):
+        # [FUNCTION DOC] Overrides the expected-inline assertion: normalizes rank fields and
+        # describe ids in both actual and expected text before delegating to the base
+        # assertion, with the skip count raised by one so failures point at the test caller.
         super().assertExpectedInline(
             self._normalize_rank_field(self._normalize_describe_ids(actual)),
             self._normalize_rank_field(self._normalize_describe_ids(expected)),
@@ -259,6 +348,9 @@ class StructuredTraceTest(TestCase):
 
     @staticmethod
     def _normalize_rank_field(text):
+        # [FUNCTION DOC] HELPER: Static. Removes the rank zero field from JSON trace text in
+        # the three positions it may appear (middle, start, only), so expected text is the
+        # same with or without a rank. Non-string input is returned unchanged.
         if not isinstance(text, str):
             return text
         text = text.replace(', "rank": 0', "")
@@ -268,6 +360,10 @@ class StructuredTraceTest(TestCase):
 
     @staticmethod
     def _normalize_describe_ids(text):
+        # [FUNCTION DOC] HELPER: Static. For string input, parses each non-empty line as JSON,
+        # normalizes describe ids with a fresh normalizer, and re-serializes; lines that are
+        # empty or not valid JSON are kept as is. Preserves a trailing newline. Non-string
+        # input is returned unchanged.
         if not isinstance(text, str):
             return text
         normalizer = _DescribeIdNormalizer()
@@ -289,6 +385,9 @@ class StructuredTraceTest(TestCase):
         return result
 
     def assertParses(self):
+        # [FUNCTION DOC] Skips the test if tlparse is not installed. Otherwise runs tlparse on
+        # the raw trace file in strict mode with overwrite and no browser into a temporary
+        # directory, raising on a nonzero exit, and always removes the directory afterwards.
         if not HAS_TLPARSE:
             self.skipTest("requires tlparse")
         out = tempfile.mkdtemp()
@@ -308,6 +407,10 @@ class StructuredTraceTest(TestCase):
             shutil.rmtree(out, ignore_errors=True)
 
     def test_compile_id_serialization_deserialization(self):
+        # [FUNCTION DOC] Checks that CompileId survives a string round trip for ids with and
+        # without a compiled autograd id, and with missing frame fields; raises AssertionError
+        # on mismatch. Also checks that several malformed id strings make the parser raise
+        # ValueError.
         cid = torch._guards.CompileId(
             frame_id=1,
             frame_compile_id=2,
@@ -337,6 +440,10 @@ class StructuredTraceTest(TestCase):
 
     @requires_gpu_and_triton
     def test_schedule(self):
+        # [FUNCTION DOC] GPU and triton test. Compiles the schedule sample function with
+        # inductor, runs it on a device tensor, and compares the captured trace lines
+        # (including triton kernel info) against the expected text, then checks tlparse can
+        # parse the raw log.
         fn_opt = torch.compile(inductor_schedule_fn, backend="inductor")
         fn_opt(torch.ones(1000, 1000, device=device_type))
         self.assertExpectedInline(
@@ -372,6 +479,9 @@ class StructuredTraceTest(TestCase):
 
     @requires_gpu_and_triton
     def test_gpugraphs(self):
+        # [FUNCTION DOC] GPU and triton test. Compiles the schedule sample function in reduce-
+        # overhead mode (GPU graphs), runs it, compares the trace lines against the expected
+        # text, then checks tlparse parsing.
         fn_opt = torch.compile(mode="reduce-overhead")(inductor_schedule_fn)  # noqa: UNSPECIFIED_BACKEND
         fn_opt(torch.ones(1000, 1000, device=device_type))
         self.assertExpectedInline(
@@ -407,7 +517,12 @@ class StructuredTraceTest(TestCase):
 
     @requires_tlparse
     def test_recompiles(self):
+        # [FUNCTION DOC] Compiles a tensor add with inductor, calls it with two tensors and
+        # then with a tensor and an int to force a recompile, and compares the trace (second
+        # frame compile id, recompile_reasons artifact, create_symbol) against the expected
+        # text, then checks tlparse parsing.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Compile target returning the sum of its two arguments.
             return torch.add(x, y)
 
         fn_opt = torch.compile(fn, backend="inductor")
@@ -471,7 +586,14 @@ class StructuredTraceTest(TestCase):
 
     @requires_tlparse
     def test_recompile_backend_match(self):
+        # [FUNCTION DOC] Compiles a function with eager backend dynamic then static, capturing
+        # the recompile_reasons payload on a separate handler during the second compile, and
+        # asserts the payload mentions the backend match reason, cached and new backend text,
+        # the wrapper class name and both dynamic settings. Handler is removed in a finally
+        # block. Then checks tlparse parsing.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compile target returning the sine plus cosine of the
+            # input.
             return x.sin() + x.cos()
 
         x = torch.ones(10)
@@ -501,6 +623,8 @@ class StructuredTraceTest(TestCase):
 
     @requires_tlparse
     def test_example_fn(self):
+        # [FUNCTION DOC] Compiles the example function with inductor, runs it on a CPU tensor,
+        # compares the full trace against the expected text, and checks tlparse parsing.
         fn_opt = torch.compile(example_fn, backend="inductor")
         fn_opt(torch.ones(1000, 1000))
         self.assertExpectedInline(
@@ -534,6 +658,13 @@ class StructuredTraceTest(TestCase):
 
     @requires_tlparse
     def test_example_training_fn(self):
+        # [FUNCTION DOC] Compiles the training sample function with inductor and runs it,
+        # replaces timing fields (inductor compile time, code generation time, logging
+        # overhead) with a placeholder, compares the trace (graph breaks, resume frames, joint
+        # graphs, backward metrics) against the expected text, then checks tlparse parsing.
+        # KNOWN ISSUE: expected output embeds source line numbers in resume function names;
+        # inserted doc comments shift them, so the test will fail until the numbers are
+        # updated.
         fn_opt = torch.compile(example_training_fn, backend="inductor")
         fn_opt(torch.ones(1000, 1000, requires_grad=True))
         buffer = self.buffer.getvalue()
@@ -613,6 +744,9 @@ class StructuredTraceTest(TestCase):
 
     @requires_tlparse
     def test_dynamo_error(self):
+        # [FUNCTION DOC] Compiles the dynamo error sample with inductor and runs it,
+        # swallowing the exception, then compares the trace (ending with a dynamo_error
+        # artifact and metrics) against the expected text and checks tlparse parsing.
         try:
             fn_opt = torch.compile(dynamo_error_fn, backend="inductor")
             fn_opt(*ARGS)
@@ -634,9 +768,16 @@ class StructuredTraceTest(TestCase):
 
     @requires_tlparse
     def test_inductor_error(self):
+        # [FUNCTION DOC] Injects a failure into inductor lowering: every registered lowering
+        # whose name contains round is replaced (via a patched dictionary) by a function
+        # raising AssertionError. Compiles and runs the inductor error sample, swallowing the
+        # exception, then compares the trace against the expected text and checks tlparse
+        # parsing.
         import torch._inductor.lowering
 
         def throw(x):
+            # [FUNCTION DOC] HELPER: Replacement lowering that ignores its argument and always
+            # raises AssertionError.
             raise AssertionError
 
         # inject an error in the lowerings
@@ -683,13 +824,26 @@ class StructuredTraceTest(TestCase):
     @requires_gpu_and_triton
     @unittest.skip("https://github.com/pytorch/pytorch/issues/176188")
     def test_ddp_graphs(self):
+        # [FUNCTION DOC] Currently skipped (linked issue) and conditionally skipped for XPU,
+        # without distributed, or without GPU and triton. Resets frame counters, initializes a
+        # single process gloo group, wraps a toy model in DDP, compiles and runs it, destroys
+        # the group, and compares the trace against the expected text including rank fields.
+        # Side effects: sets MASTER_ADDR and MASTER_PORT environment variables and does not
+        # restore them.
+        # KNOWN ISSUE: expected output embeds source line numbers in resume function names;
+        # inserted doc comments shift them, so the test will fail until the numbers are
+        # updated.
         import torch._dynamo.convert_frame as convert_frame
 
         convert_frame.FRAME_COUNTER = 0
         convert_frame.FRAME_COMPILE_COUNTER.clear()
 
         class ToyModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Toy module with a sequential stack of two 1024x1024 linear
+            # layers, used by the DDP trace test.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Initializes the module and builds the sequential
+                # container of two linear layers.
                 super().__init__()
                 self.layers = torch.nn.Sequential(
                     torch.nn.Linear(1024, 1024),
@@ -697,6 +851,8 @@ class StructuredTraceTest(TestCase):
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the sequential layers to the input and
+                # returns the result.
                 return self.layers(x)
 
         # TODO: this isn't safely bracketed, will leak
@@ -803,8 +959,16 @@ class StructuredTraceTest(TestCase):
     @requires_tlparse
     @unittest.skip("https://github.com/pytorch/pytorch/issues/176188")
     def test_graph_breaks(self):
+        # [FUNCTION DOC] Currently skipped (linked issue). Compiles a function containing an
+        # explicit graph break with inductor, runs it, compares the trace against the expected
+        # text, and checks tlparse parsing.
+        # KNOWN ISSUE: expected output embeds source line numbers in resume function names;
+        # inserted doc comments shift them, so the test will fail until the numbers are
+        # updated.
         @torch.compile(backend="inductor")
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compile target that triggers a dynamo graph break and
+            # then returns the input plus one.
             torch._dynamo.graph_break()
             return x + 1
 
@@ -848,7 +1012,12 @@ class StructuredTraceTest(TestCase):
 
     @requires_tlparse
     def test_graph_sizes_dynamic(self):
+        # [FUNCTION DOC] Compiles a matrix multiply function with eager backend, first static
+        # and then dynamic, runs each with different shapes, compares the trace
+        # (dynamo_output_graph sizes) against the expected text, and checks tlparse parsing.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Compile target returning the matrix product of its two
+            # arguments.
             return a @ b
 
         fn_opt = torch.compile(fn, backend="eager", dynamic=False)
@@ -893,10 +1062,17 @@ class StructuredTraceTest(TestCase):
 
     @requires_tlparse
     def test_guards_recompiles(self):
+        # [FUNCTION DOC] Compiles a function that loops over two sequences with eager backend,
+        # calls it with sequences of different lengths to force a recompile, compares the
+        # trace (guard and recompile records) against the expected text, and checks tlparse
+        # parsing.
         def fn(x, ys, zs):
+            # [FUNCTION DOC] HELPER: Compile target that delegates to the inner function.
             return inner(x, ys, zs)
 
         def inner(x, ys, zs):
+            # [FUNCTION DOC] HELPER: Loops over paired items of two sequences, adding each
+            # product into the first argument in place, and returns it.
             for y, z in zip(ys, zs):
                 x += y * z
             return x
@@ -933,7 +1109,13 @@ class StructuredTraceTest(TestCase):
         self.assertParses()
 
     def test_dump_file(self):
+        # [FUNCTION DOC] Symbolically traces an add function with fx, compiles the resulting
+        # graph module with eager backend, and compares the trace including the dump_file
+        # record, whose generated forward source is appended after the JSON line, against the
+        # expected text.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Function traced by fx; returns the first argument added
+            # to the second.
             return x.add(y)
 
         gm = fx.symbolic_trace(f)
@@ -966,7 +1148,12 @@ def forward(self, x, y):
     @requires_tlparse
     @torch._inductor.config.patch("fx_graph_cache", True)
     def test_codecache(self):
+        # [FUNCTION DOC] With the fx graph cache enabled, compiles a sine function with
+        # inductor, runs it, resets dynamo and runs it again to hit the cache, then compares
+        # the trace (which should show output code twice) against the expected text and checks
+        # tlparse parsing.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Compile target returning the sine of the input.
             return a.sin()
 
         x = torch.tensor([1.0])
@@ -1024,6 +1211,11 @@ def forward(self, x, y):
 
     @requires_tlparse
     def test_make_fx_fail_partial(self):
+        # [FUNCTION DOC] Runs make_fx on a function that raises RuntimeError after one add,
+        # swallowing the error, while a second handler captures the make_fx_fail_partial
+        # payload. Compares the main trace and the partial graph payload text (the add node)
+        # against expected text. The extra handler is never removed from the logger (leaks
+        # into later tests in the process).
         from torch.fx.experimental.proxy_tensor import make_fx
 
         payload_buffer = io.StringIO()
@@ -1033,6 +1225,8 @@ def forward(self, x, y):
         trace_log.addHandler(payload_handler)
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Function traced by make_fx; computes an unused add and
+            # then raises RuntimeError.
             y = x + 1  # noqa: F841
             raise RuntimeError("boo")
 
@@ -1061,7 +1255,12 @@ def forward(self, x_1: "f32[2][1]cpu"):
     @torch._inductor.config.patch("fx_graph_cache", True)
     @show_chrome_events
     def test_chromium_event(self):
+        # [FUNCTION DOC] With chrome events shown and the fx graph cache enabled, compiles and
+        # runs a sine function twice (resetting dynamo between to hit the cache), checks
+        # tlparse parsing, and asserts the captured buffer contains a specific chromium_event
+        # record line.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Compile target returning the sine of the input.
             return a.sin()
 
         x = torch.tensor([1.0])
@@ -1083,7 +1282,15 @@ def forward(self, x_1: "f32[2][1]cpu"):
     @torch._inductor.config.patch("fx_graph_cache", True)
     @show_chrome_events
     def test_compiled_autograd_id(self):
+        # [FUNCTION DOC] With compiled autograd, chrome events and fx graph cache enabled,
+        # runs a function that calls backward through the dynamo optimize inductor wrapper,
+        # resets dynamo, swaps the raw log handler for a fresh temporary file (so tlparse sees
+        # only the cache hit run), runs again and checks tlparse parsing. Asserts the buffer
+        # has chromium_event records with frame ids and a compiled_autograd_graph record, then
+        # that a chromium event carrying that graph's compiled autograd id exists.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Compile target that computes the sine sum of the input
+            # and runs backward on it.
             return a.sin().sum().backward()
 
         x = torch.tensor([1.0], requires_grad=True)
@@ -1124,16 +1331,31 @@ def forward(self, x_1: "f32[2][1]cpu"):
     @requires_tlparse
     @torch._dynamo.config.patch("compiled_autograd", True)
     def test_compiled_autograd_attribution(self):
+        # [FUNCTION DOC] With compiled autograd enabled, compiles a function running a custom
+        # autograd function (with print graph breaks in backward) over six input sizes. Parses
+        # the dynamo_start records, groups frame ids by compiled autograd id, and asserts
+        # exactly two ids exist, the first with at least three frames and the second with at
+        # least one. Also checks tlparse parsing.
         # multiple dynamo recompiles should still be attributed to the parent compiled autograd id
         def fn():
+            # [FUNCTION DOC] HELPER: Defines the custom sine autograd function and loops over
+            # six sizes, applying it, running backward on the sum, and collecting the
+            # gradients; returns the list.
             class MySin(torch.autograd.Function):
+                # [CLASS DOC] HELPER: Custom autograd function computing sine; its backward
+                # prints twice (forcing graph breaks) and multiplies the incoming gradient by
+                # cosine of the saved input.
                 @staticmethod
                 def forward(ctx, x):
+                    # [FUNCTION DOC] HELPER: Saves the input for backward and returns its
+                    # sine.
                     ctx.save_for_backward(x)
                     return torch.sin(x)
 
                 @staticmethod
                 def backward(ctx, gO):
+                    # [FUNCTION DOC] HELPER: Prints a message, loads the saved input, prints
+                    # again, and returns the incoming gradient times the cosine of the input.
                     print("graph break")
                     (x,) = ctx.saved_tensors
                     print("graph break")
@@ -1170,6 +1392,10 @@ def forward(self, x_1: "f32[2][1]cpu"):
     @requires_tlparse
     @show_chrome_events
     def test_compiled_autograd_chromium(self):
+        # [FUNCTION DOC] With chrome events shown, enables compiled autograd with
+        # torch.compile and runs backward for six input sizes, checks tlparse parsing, and
+        # asserts the buffer contains three expected chromium_event lines (for the autograd
+        # graph and its two frame compiles).
         with torch._dynamo.compiled_autograd._enable(torch.compile):
             for i in [10, 100, 10, 15, 20, 25]:
                 x = torch.arange(0.0, i, requires_grad=True)
@@ -1188,15 +1414,22 @@ def forward(self, x_1: "f32[2][1]cpu"):
         self.assertTrue(all(event in logs for event in expected))
 
     def test_recompile_user_contexts(self):
+        # [FUNCTION DOC] Registers a recompile user context hook that counts its calls,
+        # compiles an add function, runs it with repeated shapes then varied sizes, and
+        # asserts the hook ran once after the first compile and twice after the one recompile.
         # test that user_context is called only once per recompile
         num_calls = 0
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Function that is compiled by the test; returns the input
+            # plus one.
             return x + 1
 
         f = torch.compile(f)  # noqa: UNSPECIFIED_BACKEND
 
         def user_context() -> str:
+            # [FUNCTION DOC] HELPER: Hook that increments the enclosing call counter and
+            # returns a string containing the new count.
             nonlocal num_calls
             num_calls += 1
             return "user_context: " + str(num_calls)
@@ -1216,21 +1449,32 @@ def forward(self, x_1: "f32[2][1]cpu"):
         self.assertEqual(num_calls, 2)
 
     def test_recompile_user_contexts_iteration(self):
+        # [FUNCTION DOC] Registers a recompile user context hook that reports the current step
+        # of a Step object, compiles an add function, and runs it ten times with changing
+        # sizes while advancing the step each time. Only exercises the path; no assertions.
         class Step:
+            # [CLASS DOC] HELPER: Simple counter holder with a step attribute starting at zero
+            # and a method that increments it.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Sets the step counter to zero.
                 self.step = 0
 
             def next_step(self):
+                # [FUNCTION DOC] HELPER: Increments the step counter by one.
                 self.step += 1
 
         step = Step()
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Function that is compiled by the test; returns the input
+            # plus one.
             return x + 1
 
         f = torch.compile(f)  # noqa: UNSPECIFIED_BACKEND
 
         def user_context() -> str:
+            # [FUNCTION DOC] HELPER: Hook returning a string containing the current step
+            # value.
             return "user_context: " + str(step.step)
 
         torch._dynamo.register_hook_for_recompile_user_context(user_context)
@@ -1241,6 +1485,9 @@ def forward(self, x_1: "f32[2][1]cpu"):
 
     @contextmanager
     def _setup_collective_schedule_capture(self):
+        # [FUNCTION DOC] HELPER: Context manager that adds a handler capturing only
+        # inductor_collective_schedule payloads into a string buffer, yields that buffer, and
+        # removes the handler in a finally block.
         """Helper to turn on and capture the 'inductor_collective_schedule' structured trace."""
         payload_buffer = io.StringIO()
         payload_handler = logging.StreamHandler(payload_buffer)
@@ -1257,6 +1504,9 @@ def forward(self, x_1: "f32[2][1]cpu"):
 
     @requires_tlparse
     def test_collective_schedule_empty(self):
+        # [FUNCTION DOC] Calls the inductor debug collective schedule logger with an empty
+        # list and asserts that no collective schedule artifact appears in the main buffer and
+        # the captured payload is empty.
         """Verify logging when no collective kernels are present (empty schedule)."""
         with self._setup_collective_schedule_capture() as payload_buffer:
             from torch._inductor.debug import log_collective_schedule
@@ -1271,6 +1521,10 @@ def forward(self, x_1: "f32[2][1]cpu"):
     @requires_distributed()
     @torch._inductor.config.patch("fx_graph_cache", False)
     def test_collective_schedule_real(self):
+        # [FUNCTION DOC] Initializes a fake process group of two ranks with a fake store,
+        # compiles a module using functional all_reduce and wait_tensor with inductor with the
+        # capture context, and asserts the logged schedule is a list matching the expected
+        # collective op names. Checks tlparse parsing and always destroys the process group.
         """Test collective schedule with _c10d_functional ops that work with FakeStore."""
         import torch.distributed as dist
 
@@ -1278,7 +1532,11 @@ def forward(self, x_1: "f32[2][1]cpu"):
         dist.init_process_group(backend="fake", rank=0, world_size=2, store=store)
 
         class CollectiveModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward applies functional all_reduce,
+            # wait_tensor and multiplies by two.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Runs functional all_reduce with sum, waits on the
+                # tensor, and returns the result doubled.
                 # Use _c10d_functional ops that actually trigger collective kernels
                 y = torch.ops._c10d_functional.all_reduce.default(x, "sum", "0")
                 y = torch.ops._c10d_functional.wait_tensor.default(y)
@@ -1313,6 +1571,9 @@ def forward(self, x_1: "f32[2][1]cpu"):
 
     @contextmanager
     def _setup_runtime_estimates_capture(self):
+        # [FUNCTION DOC] HELPER: Context manager that adds a handler capturing only
+        # inductor_runtime_and_tensor_meta payloads into a string buffer, yields that buffer,
+        # and removes the handler in a finally block.
         """Helper to turn on and capture the combined 'inductor_runtime_and_tensor_meta' structured trace."""
         payload_buffer = io.StringIO()
         payload_handler = logging.StreamHandler(payload_buffer)
@@ -1333,6 +1594,11 @@ def forward(self, x_1: "f32[2][1]cpu"):
     @torch._inductor.config.patch("fx_graph_cache", False)
     @torch._inductor.config.patch("log_tlparse", True)
     def test_runtime_estimates_simple(self):
+        # [FUNCTION DOC] Initializes a fake two rank process group, compiles a linear plus
+        # relu plus all_reduce module on the accelerator with inductor, and asserts the
+        # runtime and tensor meta artifact was logged. If a payload was captured, checks there
+        # is at least one compute or collective op and every op has a non-null estimated
+        # runtime. Checks tlparse parsing; destroys the process group in a finally block.
         """Test runtime estimates logging with simple compute and collective ops."""
         import torch.distributed as dist
 
@@ -1340,11 +1606,16 @@ def forward(self, x_1: "f32[2][1]cpu"):
         dist.init_process_group(backend="fake", rank=0, world_size=2, store=store)
 
         class SimpleModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with one 4x4 linear layer; forward applies linear,
+            # relu, all_reduce and wait_tensor.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Initializes the module with a 4x4 linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(4, 4)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies linear and relu, then functional all_reduce
+                # with sum and wait_tensor, and returns the result.
                 h = self.linear(x)
                 h = torch.relu(h)
 
@@ -1392,6 +1663,11 @@ def forward(self, x_1: "f32[2][1]cpu"):
     @torch._inductor.config.patch("fx_graph_cache", False)
     @torch._inductor.config.patch("log_tlparse", True)
     def test_runtime_estimates_mixed(self):
+        # [FUNCTION DOC] Initializes a fake two rank process group, compiles a module mixing
+        # layer norm, gelu, all_reduce, scaling, all_gather and a sum with inductor, and
+        # asserts the runtime artifact was logged. If a payload was captured, asserts both
+        # compute and collective op types appear and every op has a non-null estimated
+        # runtime. Checks tlparse parsing; destroys the process group in a finally block.
         """Test runtime estimates logging with mixed compute and collective sequence."""
         import torch.distributed as dist
 
@@ -1399,11 +1675,18 @@ def forward(self, x_1: "f32[2][1]cpu"):
         dist.init_process_group(backend="fake", rank=0, world_size=2, store=store)
 
         class MixedModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module mixing compute and collective ops: layer norm, gelu,
+            # all_reduce, scale by half, all_gather and a sum over the first dimension.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Initializes the module with a layer norm over four
+                # features.
                 super().__init__()
                 self.norm = torch.nn.LayerNorm(4)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies layer norm and gelu, all_reduce and wait,
+                # scales by 0.5, all_gather into tensor and wait, then returns the sum over
+                # dimension zero.
                 h = self.norm(x)
                 h = torch.nn.functional.gelu(h)
 
@@ -1458,17 +1741,26 @@ def forward(self, x_1: "f32[2][1]cpu"):
     @torch._inductor.config.patch("fx_graph_cache", False)
     @torch._inductor.config.patch("log_tlparse", True)
     def test_tensor_metadata_logging_multiple_ops(self):
+        # [FUNCTION DOC] Initializes a fake two rank process group, compiles a linear relu
+        # all_reduce plus one module, and if a runtime payload was captured asserts the sorted
+        # set of op types equals collective and compute. Checks tlparse parsing; destroys the
+        # process group in a finally block.
         import torch.distributed as dist
 
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=0, world_size=2, store=store)
 
         class Mixed(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a linear layer whose forward applies linear,
+            # relu, all_reduce, wait_tensor and adds one.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Initializes the module with a 4x4 linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(4, 4)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies linear and relu, functional all_reduce with
+                # sum and wait_tensor, and returns the result plus one.
                 y = torch.relu(self.linear(x))
                 y = torch.ops._c10d_functional.all_reduce.default(y, "sum", "0")
                 y = torch.ops._c10d_functional.wait_tensor.default(y)
@@ -1494,10 +1786,17 @@ def forward(self, x_1: "f32[2][1]cpu"):
     @requires_tlparse
     @torch._inductor.config.patch("log_tlparse", True)
     def test_tensor_metadata_logging(self):
+        # [FUNCTION DOC] With tlparse logging on, compiles a transpose, mean and half
+        # precision cast function with fullgraph inductor, asserts the runtime artifact was
+        # logged, simplifies the captured ops to type and output shape, stride and dtype, and
+        # compares the last such op against the expected compute op with float16 output.
+        # Checks tlparse parsing.
         """Emit unified runtime+tensor-metadata artifact and assert a stable simplified JSON inline."""
         with self._setup_runtime_estimates_capture() as payload_buffer:
 
             def f(x):
+                # [FUNCTION DOC] HELPER: Transposes the input, takes the mean over dimension
+                # zero, casts to float16 and returns it.
                 y = x.transpose(0, 1)
                 z = y.mean(dim=0)
                 w = z.to(torch.float16)
@@ -1542,10 +1841,15 @@ def forward(self, x_1: "f32[2][1]cpu"):
     @requires_tlparse
     @torch._inductor.config.patch("log_tlparse", True)
     def test_tensor_metadata_logging_dynamic_shapes(self):
+        # [FUNCTION DOC] Same as the metadata logging test but compiles with dynamic shapes;
+        # compares the last simplified op against an expected compute op with float32 and
+        # float16 outputs. Checks tlparse parsing.
         """Same as test_tensor_metadata_logging, but with dynamic shapes enabled to cover to_size_hints."""
         with self._setup_runtime_estimates_capture() as payload_buffer:
 
             def f(x):
+                # [FUNCTION DOC] HELPER: Transposes the input, takes the mean over dimension
+                # zero, casts to float16 and returns it.
                 y = x.transpose(0, 1)
                 z = y.mean(dim=0)
                 w = z.to(torch.float16)
@@ -1593,6 +1897,9 @@ def forward(self, x_1: "f32[2][1]cpu"):
 
     @contextmanager
     def _setup_graph_execution_capture(self):
+        # [FUNCTION DOC] HELPER: Context manager that adds a handler capturing only
+        # graph_execution payloads into a string buffer, yields that buffer, and removes the
+        # handler in a finally block.
         """Helper to capture the 'graph_execution' structured trace."""
         payload_buffer = io.StringIO()
         payload_handler = logging.StreamHandler(payload_buffer)
@@ -1608,11 +1915,18 @@ def forward(self, x_1: "f32[2][1]cpu"):
     @requires_tlparse
     @torch._inductor.config.patch(force_disable_caches=True)
     def test_graph_execution_order(self):
+        # [FUNCTION DOC] With caches disabled, compiles a function with a graph break using
+        # inductor and runs it inside the inductor debug context that records and logs graph
+        # execution order. Parses the captured payload, asserts each compile_id entry is a
+        # string, compares the JSON to the expected order of compile ids zero slash zero and
+        # one slash zero, and checks tlparse parsing.
         """Verify graph execution order is aggregated into a single artifact."""
         torch._dynamo.reset()
         with self._setup_graph_execution_capture() as payload_buffer:
 
             def fn(x):
+                # [FUNCTION DOC] HELPER: Compile target that adds one, triggers a graph break,
+                # then adds two.
                 y = x + 1
                 torch._dynamo.graph_break()
                 return y + 2
