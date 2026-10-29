@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Small helpers for comparing and normalizing pytree specs used by export.
+# Provides reorder_kwargs (put user kwargs into the order recorded in an exported
+# program's in_spec) and is_equivalent (recursive TreeSpec comparison with a
+# caller-supplied type/context equivalence predicate). No import-time side effects.
 from collections.abc import Callable
 from typing import Any
 
@@ -5,6 +10,11 @@ from torch.utils._pytree import Context, TreeSpec
 
 
 def reorder_kwargs(user_kwargs: dict[str, Any], spec: TreeSpec) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Returns a new mapping holding user_kwargs reordered to follow the key order
+    # stored in the kwargs child of spec (an in_spec shaped like (args, kwargs)).
+    # Raises AssertionError if spec is not a 2-child tuple or its second child is
+    # not a mapping; raises ValueError if the key sets differ. No side effects.
     """Reorder user-provided kwargs to match the order in `spec`. `spec` is
     expected to be the in_spec of an exported program, i.e. the spec that
     results from flattening `(args, kwargs)`.
@@ -43,6 +53,10 @@ def is_equivalent(
     spec2: TreeSpec,
     equivalence_fn: Callable[[type | None, Context, type | None, Context], bool],
 ) -> bool:
+    # [FUNCTION DOC]
+    # Recursively checks two TreeSpecs: applies equivalence_fn to each node's type
+    # and context pair, requires equal child counts, then compares children
+    # pairwise. Returns True only if every node pair passes, else False. Pure.
     """Customizable equivalence check for two TreeSpecs.
 
     Arguments:
