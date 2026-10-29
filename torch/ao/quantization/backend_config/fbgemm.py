@@ -1,3 +1,6 @@
+# [MODULE DOC] BackendConfig for PyTorch's FBGEMM backend. Defines fbgemm dtype configs at import time (weighted
+# quint8, default quint8, fp16, dynamic int8/fp16, weight-only quint8/quint4x2) and get_fbgemm_backend_config,
+# which assembles shared pattern config builders. Exports only that getter.
 import torch
 
 from ._common_operator_config_utils import (
@@ -83,6 +86,9 @@ fbgemm_weight_only_quint4x2_dtype_config = DTypeConfig(
 
 
 def get_fbgemm_backend_config() -> BackendConfig:
+    # [FUNCTION DOC] Returns the BackendConfig named fbgemm built from the common builders for conv, linear (static plus
+    # dynamic int8/fp16), binary ops, cat, default ops, fixed-qparams, share-qparams, tensor-info, batchnorm, RNN and
+    # embedding ops, each with its dtype config list. Unlike the native config it has no layer norm configs.
     """
     Return the `BackendConfig` for PyTorch's native FBGEMM backend.
     """

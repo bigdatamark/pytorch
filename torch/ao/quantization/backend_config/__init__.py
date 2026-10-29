@@ -1,3 +1,6 @@
+# [PACKAGE DOC] Backend configuration package: exports BackendConfig, BackendPatternConfig, DTypeConfig,
+# DTypeWithConstraints, ObservationType and getters for the fbgemm, native, qnnpack, tensorrt, executorch
+# and onednn backend configs (describing which patterns each backend can quantize).
 from .backend_config import (
     BackendConfig,
     BackendPatternConfig,

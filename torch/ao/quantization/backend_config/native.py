@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] BackendConfig for PyTorch's native backend (fbgemm/qnnpack). Defines the shared public dtype
+# configs at import time (weighted quint8, default quint8/fp16, dynamic int8/fp16, input-output-only
+# quint8 for layer norm, weight-only quint8/quint4x2) and getters for the native and test-only legacy
+# (with fp16 ops) configs plus their dict forms.
 import torch
 
 from ._common_operator_config_utils import (
@@ -106,6 +110,8 @@ weight_only_quint4x2_dtype_config = DTypeConfig(
 
 
 def get_test_only_legacy_native_backend_config() -> BackendConfig:
+    # [FUNCTION DOC] Returns the BackendConfig named _native_and_fp16, used only in tests: like the native config but
+    # linear, binary, fixed-qparams and share-qparams ops additionally accept fp16 dtype configs.
     """
     Return the `BackendConfig` for PyTorch Native backend (fbgemm/qnnpack) with various additional fp16 ops.
     """
@@ -167,6 +173,8 @@ def get_test_only_legacy_native_backend_config() -> BackendConfig:
 
 
 def get_native_backend_config() -> BackendConfig:
+    # [FUNCTION DOC] Returns the BackendConfig named native combining conv, linear (static and dynamic), binary, cat,
+    # default, fixed-qparams, share-qparams, tensor-info, batchnorm, layer norm, RNN and embedding pattern configs.
     """
     Return the `BackendConfig` for PyTorch Native backend (fbgemm/qnnpack).
     """
@@ -217,6 +225,7 @@ def get_native_backend_config() -> BackendConfig:
 
 
 def get_native_backend_config_dict():
+    # [FUNCTION DOC] Returns the native backend config converted to a dict.
     """
     Return the `BackendConfig` for PyTorch Native backend (fbgemm/qnnpack) in dictionary form.
     """
@@ -224,6 +233,7 @@ def get_native_backend_config_dict():
 
 
 def get_test_only_legacy_native_backend_config_dict():
+    # [FUNCTION DOC] Returns the test-only legacy native backend config converted to a dict.
     """
     Return the `BackendConfig` for PyTorch Native backend (fbgemm/qnnpack) with various additional
     fp16 ops in dictionary form.

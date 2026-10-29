@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Backend config for QNNPACK in the PyTorch 2.0 export (aten-level graph) flow. Defines a shared
+# weighted-op quint8 dtype config at import time and getters for linear, conv, pooling, relu and add
+# pattern configs, assembled by get_qnnpack_pt2e_backend_config.
 import operator
 
 import torch
@@ -19,6 +22,8 @@ weighted_op_quint8_dtype_config = DTypeConfig(
 
 
 def get_linear_configs():
+    # [FUNCTION DOC] Returns configs for aten addmm (weight index 2, bias index 0) and mm (weight index 1), with the
+    # different-observer observation type. A commented-out complex-pattern alternative is left in place.
     linear_configs = []
     observation_type = ObservationType.OUTPUT_USE_DIFFERENT_OBSERVER_AS_INPUT
     dtype_configs = [weighted_op_quint8_dtype_config]
@@ -74,6 +79,8 @@ def get_linear_configs():
 
 
 def get_conv_configs():
+    # [FUNCTION DOC] Returns configs for aten convolution alone and followed by relu or in-place relu (weight index 1,
+    # bias index 2), using the quint8 weighted dtype config.
     conv_configs = []
     observation_type = ObservationType.OUTPUT_USE_DIFFERENT_OBSERVER_AS_INPUT
     dtype_configs = [weighted_op_quint8_dtype_config]
@@ -104,11 +111,14 @@ def get_conv_configs():
 
 
 def get_pooling_configs():
+    # [FUNCTION DOC] Returns a config for the max_pool2d_with_indices then getitem pattern (complex format) with
+    # shared observer; a nested root node getter picks the max pool node.
     backend_pattern_configs = []
     observation_type = ObservationType.OUTPUT_SHARE_OBSERVER_WITH_INPUT
     dtype_configs = [weighted_op_quint8_dtype_config]
 
     def root_node_getter(node_pattern):
+        # [FUNCTION DOC] HELPER: Given the matched node pattern (getitem, maxpool, index), returns the maxpool node.
         _getitem, maxpool, _index = node_pattern
         return maxpool
 
@@ -126,6 +136,7 @@ def get_pooling_configs():
 
 
 def get_relu_configs():
+    # [FUNCTION DOC] Returns a config for aten relu that shares the observer with its input.
     backend_pattern_configs = []
     observation_type = ObservationType.OUTPUT_SHARE_OBSERVER_WITH_INPUT
     dtype_configs = [weighted_op_quint8_dtype_config]
@@ -138,6 +149,8 @@ def get_relu_configs():
 
 
 def get_binary_op_configs():
+    # [FUNCTION DOC] Returns configs for aten add.Tensor and add_.Tensor, alone and followed by relu or in-place relu,
+    # with observation type chosen by number of tensor args.
     binary_op_configs: list[BackendPatternConfig] = []
     dtype_configs = [weighted_op_quint8_dtype_config]
     num_tensor_args_to_observation_type_mapping = {
@@ -171,6 +184,8 @@ def get_binary_op_configs():
 
 
 def get_qnnpack_pt2e_backend_config():
+    # [FUNCTION DOC] Returns the BackendConfig named qnnpack_pytorch_2.0_export combining linear, binary op, conv,
+    # pooling and relu pattern configs.
     return (
         BackendConfig("qnnpack_pytorch_2.0_export")
         .set_backend_pattern_configs(get_linear_configs())

@@ -1,3 +1,7 @@
+# [MODULE DOC] BackendConfig for backends lowered through the Executorch stack. Defines executorch dtype configs
+# (static int8, dynamic quint8/qint8/float16, weight-only quint8) and constrained dtype objects at import
+# time, private pattern-config builders (linear, conv2d, binary ops, share-qparams ops, batchnorm, cat,
+# embedding) and the public get_executorch_backend_config.
 # TODO: rename executorch to qnnpack_executorch since executorch is a general runtime
 # not a specific backend
 
@@ -98,6 +102,8 @@ executorch_weight_only_quint8_dtype_config = DTypeConfig(
 
 
 def _get_linear_configs() -> list[BackendPatternConfig]:
+    # [FUNCTION DOC] HELPER: Returns configs for Linear module, QAT Linear and functional linear (weight/bias index 1/2),
+    # using qnnpack symmetric int8 plus executorch static and dynamic dtype configs.
     """
     Return all configs related to linear modules and ops.
     """
@@ -138,6 +144,8 @@ def _get_linear_configs() -> list[BackendPatternConfig]:
 
 
 def _get_conv_configs() -> list[BackendPatternConfig]:
+    # [FUNCTION DOC] HELPER: Returns conv2d configs: module, QAT, functional, relu fusions (module/functional relu) and
+    # fused/QAT variants, bn and bn+relu fusions and their fused/QAT variants. Uses weighted int8 dtype configs.
     """
     Return all configs related to conv modules and ops.
     """
@@ -294,6 +302,8 @@ def _get_conv_configs() -> list[BackendPatternConfig]:
 
 
 def _get_binary_ops_configs() -> list[BackendPatternConfig]:
+    # [FUNCTION DOC] HELPER: Returns configs for add/sub/mul (operator and torch forms), alone or followed by relu variants,
+    # with observation type chosen by number of tensor args.
     """
     Return all configs related to binary ops.
     """
@@ -336,6 +346,8 @@ def _get_binary_ops_configs() -> list[BackendPatternConfig]:
 
 
 def _get_share_qparams_ops_configs() -> list[BackendPatternConfig]:
+    # [FUNCTION DOC] HELPER: Returns shared-observer configs for ops such as flatten, pooling, pad, relu variants, clamp,
+    # mean, permute, squeeze, and matching method-name strings.
     """
     Return the operator configs for the operators that works for both float and quantized
     input if input is quantized, the output Tensor shares the same quantization parameter
@@ -394,6 +406,7 @@ def _get_share_qparams_ops_configs() -> list[BackendPatternConfig]:
 
 
 def _get_bn_configs() -> list[BackendPatternConfig]:
+    # [FUNCTION DOC] HELPER: Returns a config for BatchNorm2d with a different output observer.
     """
     Return all configs related to batchnorm.
     """
@@ -412,6 +425,7 @@ def _get_bn_configs() -> list[BackendPatternConfig]:
 
 
 def _get_cat_configs() -> list[BackendPatternConfig]:
+    # [FUNCTION DOC] HELPER: Returns shared-observer configs for torch.cat, concat and concatenate.
     dtype_configs = [
         qnnpack_default_op_qint8_symmetric_dtype_config,
         executorch_default_op_quint8_dtype_config,
@@ -436,6 +450,8 @@ def _get_cat_configs() -> list[BackendPatternConfig]:
 
 
 def _get_embedding_op_configs() -> list[BackendPatternConfig]:
+    # [FUNCTION DOC] HELPER: Returns configs for Embedding and EmbeddingBag (float, QAT) and functional embedding (weight
+    # index 1), using the weight-only quint8 dtype config.
     dtype_configs = [
         executorch_weight_only_quint8_dtype_config,
     ]
@@ -483,6 +499,8 @@ def _get_embedding_op_configs() -> list[BackendPatternConfig]:
 
 
 def get_executorch_backend_config() -> BackendConfig:
+    # [FUNCTION DOC] Returns the BackendConfig named executorch combining linear, conv, binary op, share-qparams,
+    # batchnorm, cat and embedding pattern configs.
     """
     Return the `BackendConfig` for backends PyTorch lowers to through the Executorch stack.
     """

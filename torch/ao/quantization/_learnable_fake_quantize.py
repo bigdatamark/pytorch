@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Defines _LearnableFakeQuantize, a fake-quantize module whose scale and zero point are
+# torch Parameters that can be learned by backpropagation. Exports nothing publicly (empty __all__).
+# No import-time side effects beyond imports.
 
 import torch
 from torch.nn.parameter import Parameter
@@ -8,6 +11,11 @@ __all__: list[str] = []
 
 
 class _LearnableFakeQuantize(torch.ao.quantization.FakeQuantizeBase):
+    # [CLASS DOC] Fake-quantize module (subclass of FakeQuantizeBase) with learnable per-tensor or per-channel
+    # scale and zero_point Parameters. Holds an observer (activation_post_process), quant_min/quant_max,
+    # bitwidth, dtype, qscheme, ch_axis, and uint8 flag buffers fake_quant_enabled, static_enabled,
+    # learning_enabled plus an eps buffer. Mode helpers switch between learning, static estimation and
+    # observation-only; forward applies the learnable fake-quantize ops.
     r"""Generalized extension of the FakeQuantize module in fake_quantize.py.
 
     This is an extension of the FakeQuantize module in fake_quantize.py, which
@@ -44,6 +52,11 @@ class _LearnableFakeQuantize(torch.ao.quantization.FakeQuantizeBase):
         use_grad_scaling=False,
         **observer_kwargs,
     ):
+        # [FUNCTION DOC] Builds the module. observer is a callable/class constructed with observer_kwargs plus
+        # quant_min/quant_max. channel_len of -1 gives single-element scale/zero_point Parameters; a positive int
+        # gives per-channel vectors of that length. use_grad_scaling enables gradient normalization.
+        # Raises AssertionError if quant_min >= quant_max, channel_len is not a positive int, or the range
+        # exceeds the observer dtype limits. Flags: fake quant on, static observer on, learning off.
         super().__init__()
         if quant_min >= quant_max:
             raise AssertionError("quant_min must be strictly less than quant_max.")
@@ -84,6 +97,8 @@ class _LearnableFakeQuantize(torch.ao.quantization.FakeQuantizeBase):
 
     @torch.jit.export
     def enable_param_learning(self):
+        # [FUNCTION DOC] Switches to learning mode: enables parameter learning and fake quant, disables observer
+        # updates. Returns self.
         r"""Enable parameter learning over static observer estimates.
 
         Enables learning of quantization parameters and
@@ -96,6 +111,8 @@ class _LearnableFakeQuantize(torch.ao.quantization.FakeQuantizeBase):
 
     @torch.jit.export
     def enable_static_estimate(self):
+        # [FUNCTION DOC] Switches to static-estimate mode: learning off, fake quant on, observer updates on.
+        # KNOWN ISSUE: returns None, unlike enable_param_learning which returns self.
         """Enable static estimates of quantization parameters.
 
         Enables static observer estimates and disables learning of
@@ -107,6 +124,8 @@ class _LearnableFakeQuantize(torch.ao.quantization.FakeQuantizeBase):
 
     @torch.jit.export
     def enable_static_observation(self):
+        # [FUNCTION DOC] Switches to observation-only mode: learning off, fake quant off, observer updates on,
+        # so forward returns the input unchanged. Returns None (no chaining).
         """Enable accumulation of data without updating quantization parameters.
 
         Enables static observer accumulating data from input but doesn't
@@ -118,15 +137,18 @@ class _LearnableFakeQuantize(torch.ao.quantization.FakeQuantizeBase):
 
     @torch.jit.export
     def toggle_observer_update(self, enabled=True):
+        # [FUNCTION DOC] Sets the static_enabled flag (observer update) from enabled. Returns self.
         self.static_enabled[0] = int(enabled)  # type: ignore[operator]
         return self
 
     @torch.jit.export
     def enable_observer(self, enabled=True):
+        # [FUNCTION DOC] Alias for toggle_observer_update; returns None.
         self.toggle_observer_update(enabled)
 
     @torch.jit.export
     def toggle_qparam_learning(self, enabled=True):
+        # [FUNCTION DOC] Sets learning_enabled flag and requires_grad of scale and zero_point to enabled. Returns self.
         self.learning_enabled[0] = int(enabled)  # type: ignore[operator]
         self.scale.requires_grad = enabled
         self.zero_point.requires_grad = enabled
@@ -134,16 +156,20 @@ class _LearnableFakeQuantize(torch.ao.quantization.FakeQuantizeBase):
 
     @torch.jit.export
     def toggle_fake_quant(self, enabled=True):
+        # [FUNCTION DOC] Sets the fake_quant_enabled flag from enabled. Returns self.
         self.fake_quant_enabled[0] = int(enabled)
         return self
 
     @torch.jit.export
     def observe_quant_params(self):
+        # [FUNCTION DOC] Prints the detached scale and zero point to stdout (side effect: I/O).
         print(f"_LearnableFakeQuantize Scale: {self.scale.detach()}")
         print(f"_LearnableFakeQuantize Zero Point: {self.zero_point.detach()}")
 
     @torch.jit.export
     def calculate_qparams(self):  # type: ignore[override]
+        # [FUNCTION DOC] Clamps scale in place to at least eps, then returns (detached scale, zero_point rounded,
+        # clamped to [quant_min, quant_max] and cast to long).
         self.scale.data.clamp_(min=self.eps.item())  # type: ignore[operator]
         scale = self.scale.detach()
         zero_point = (
@@ -155,6 +181,11 @@ class _LearnableFakeQuantize(torch.ao.quantization.FakeQuantizeBase):
         return scale, zero_point
 
     def forward(self, X):
+        # [FUNCTION DOC] If static observation is enabled, runs the observer on detached X and copies its computed
+        # scale/zero_point into the Parameters (moved to their devices); otherwise clamps scale to eps.
+        # If fake quant is enabled: zeroes zero_point for symmetric schemes, computes an optional gradient
+        # scaling factor (inverse sqrt of numel times quant_max), and applies the learnable per-channel or
+        # per-tensor fake-quantize op. Returns the (possibly fake-quantized) tensor.
         if self.static_enabled[0] == 1:  # type: ignore[index]
             self.activation_post_process(X.detach())
             _scale, _zero_point = self.activation_post_process.calculate_qparams()

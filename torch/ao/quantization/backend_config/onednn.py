@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] BackendConfig for PyTorch's ONEDNN backend. At import time it builds dtype configs, the conv and
+# linear pattern config lists (starting from the common builders), and appends many module-level fusion
+# configs: conv2d (optionally with batchnorm) + add (extra input on either side) with and without relu,
+# linear + leaky_relu / tanh and linear + bn + leaky_relu. Private fuser methods, root node getters and
+# extra-input getters support these complex-format patterns. get_onednn_backend_config assembles the result.
 import itertools
 import operator
 
@@ -74,6 +79,10 @@ onednn_input_output_only_quint8_dtype_config = DTypeConfig(
 
 
 def _fuse_linear_bn_leaky_relu(is_qat, linear, bn, leaky_relu):
+    # [FUNCTION DOC] HELPER: Fuser method for linear + batchnorm1d + leaky_relu. Raises AssertionError if the three modules
+    # do not share the same training mode, NotImplementedError for QAT or an unsupported linear type. In eval mode
+    # folds the bn into the linear and returns the fused linear-leaky-relu module.
+    # KNOWN ISSUE: the docstring example omits the is_qat argument.
     r"""Given the linear, bn and leaky_relu modules, fuses them and returns the fused module
     Args:
         is_qat: a flag for whether we are using quantization aware training fusion
@@ -133,15 +142,18 @@ conv_configs = _get_conv_configs(conv_dtype_configs)
 
 
 def _fuse_conv_add_left(is_qat, add, conv, _):
+    # [FUNCTION DOC] HELPER: Fuser method for add(conv, other); builds a fused ConvAdd2d from the conv and add (is_qat unused).
     return nni.ConvAdd2d(conv, add)
 
 
 def _conv_add_root_node_getter_left(pattern):
+    # [FUNCTION DOC] HELPER: Root node getter: from the (add, conv, other) pattern returns the conv node.
     _, conv, _ = pattern
     return conv
 
 
 def _conv_add_extra_inputs_getter_left(pattern):
+    # [FUNCTION DOC] HELPER: Extra inputs getter: from the (add, conv, other) pattern returns a list holding the other input.
     """get inputs pattern for extra inputs, inputs for root node
     are assumed to be copied over from root node to the fused node
     """
@@ -157,6 +169,8 @@ def _conv_add_extra_inputs_getter_left(pattern):
 
 
 def _fuse_conv_bn_add_left(is_qat, add, bn_conv, _):
+    # [FUNCTION DOC] HELPER: Fuser method for add(bn(conv), other); raises NotImplementedError for QAT, otherwise folds bn into
+    # conv (eval) and returns ConvAdd2d.
     bn, conv = bn_conv
     if is_qat:
         raise NotImplementedError(f"Cannot fuse train modules: {(conv, bn, add)}")
@@ -166,12 +180,14 @@ def _fuse_conv_bn_add_left(is_qat, add, bn_conv, _):
 
 
 def _conv_bn_add_root_node_getter_left(add_pattern):
+    # [FUNCTION DOC] HELPER: Root node getter: returns the conv node from the (add, (bn, conv), other) pattern.
     _, bn_conv, _ = add_pattern
     _bn, conv = bn_conv
     return conv
 
 
 def _conv_bn_add_extra_inputs_getter_left(add_pattern):
+    # [FUNCTION DOC] HELPER: Extra inputs getter: returns a list with the other input of the (add, (bn, conv), other) pattern.
     """get inputs pattern for extra inputs, inputs for root node
     are assumed to be copied over from root node to the fused node
     """
@@ -216,15 +232,18 @@ for with_bn, add_op in conv_add_left_optioins:
 
 
 def _fuse_conv_add_right(is_qat, add, _, conv):
+    # [FUNCTION DOC] HELPER: Fuser method for add(other, conv); builds a fused ConvAdd2d from the conv and add.
     return nni.ConvAdd2d(conv, add)
 
 
 def _conv_add_root_node_getter_right(pattern):
+    # [FUNCTION DOC] HELPER: Root node getter: returns the conv node from the (add, other, conv) pattern.
     _add, _, conv = pattern
     return conv
 
 
 def _conv_add_extra_inputs_getter_right(pattern):
+    # [FUNCTION DOC] HELPER: Extra inputs getter: returns a list with the other input of the (add, other, conv) pattern.
     """get inputs pattern for extra inputs, inputs for root node
     are assumed to be copied over from root node to the fused node
     """
@@ -240,6 +259,8 @@ def _conv_add_extra_inputs_getter_right(pattern):
 
 
 def _fuse_conv_bn_add_right(is_qat, add, _, bn_conv):
+    # [FUNCTION DOC] HELPER: Fuser method for add(other, bn(conv)); raises NotImplementedError for QAT, otherwise folds bn into
+    # conv and returns ConvAdd2d.
     bn, conv = bn_conv
     if is_qat:
         raise NotImplementedError(f"Cannot fuse train modules: {(conv, bn, add)}")
@@ -249,12 +270,14 @@ def _fuse_conv_bn_add_right(is_qat, add, _, bn_conv):
 
 
 def _conv_bn_add_root_node_getter_right(pattern):
+    # [FUNCTION DOC] HELPER: Root node getter: returns the conv node from the (add, other, (bn, conv)) pattern.
     _add, _, bn_conv = pattern
     _bn, conv = bn_conv
     return conv
 
 
 def _conv_bn_add_extra_inputs_getter_right(pattern):
+    # [FUNCTION DOC] HELPER: Extra inputs getter: returns a list with the other input of the (add, other, (bn, conv)) pattern.
     """get inputs pattern for extra inputs, inputs for root node
     are assumed to be copied over from root node to the fused node
     """
@@ -311,17 +334,20 @@ conv_configs.append(
 
 
 def _fuse_conv_add_relu_left(is_qat, relu, add_pattern):
+    # [FUNCTION DOC] HELPER: Fuser method for relu(add(conv, other)); builds a fused ConvAddReLU2d.
     add, conv, _ = add_pattern
     return nni.ConvAddReLU2d(conv, add, relu)
 
 
 def _conv_add_relu_root_node_getter_left(pattern):
+    # [FUNCTION DOC] HELPER: Root node getter: returns the conv node from the (relu, (add, conv, other)) pattern.
     _relu, add_pattern = pattern
     _, conv, _ = add_pattern
     return conv
 
 
 def _conv_add_relu_extra_inputs_getter_left(pattern):
+    # [FUNCTION DOC] HELPER: Extra inputs getter: returns a list with the other input of the (relu, (add, conv, other)) pattern.
     """get inputs pattern for extra inputs, inputs for root node
     are assumed to be copied over from root node to the fused node
     """
@@ -340,6 +366,8 @@ def _conv_add_relu_extra_inputs_getter_left(pattern):
 
 
 def _fuse_conv_bn_add_relu_left(is_qat, relu, add_pattern):
+    # [FUNCTION DOC] HELPER: Fuser method for relu(add(bn(conv), other)); raises NotImplementedError for QAT, otherwise folds bn
+    # into conv and returns ConvAddReLU2d.
     add, bn_conv, _ = add_pattern
     bn, conv = bn_conv
     if is_qat:
@@ -350,6 +378,7 @@ def _fuse_conv_bn_add_relu_left(is_qat, relu, add_pattern):
 
 
 def _conv_bn_add_relu_root_node_getter_left(pattern):
+    # [FUNCTION DOC] HELPER: Root node getter: returns the conv node from the (relu, (add, (bn, conv), other)) pattern.
     _relu, add_pattern = pattern
     _, bn_conv, _ = add_pattern
     _bn, conv = bn_conv
@@ -357,6 +386,7 @@ def _conv_bn_add_relu_root_node_getter_left(pattern):
 
 
 def _conv_bn_add_relu_extra_inputs_getter_left(pattern):
+    # [FUNCTION DOC] HELPER: Extra inputs getter: returns a list with the other input of the (relu, (add, (bn, conv), other)) pattern.
     """get inputs pattern for extra inputs, inputs for root node
     are assumed to be copied over from root node to the fused node
     """
@@ -404,17 +434,20 @@ for with_bn, add_op in conv_add_relu_left_optioins:
 
 
 def _fuse_conv_add_relu_right(is_qat, relu, add_pattern):
+    # [FUNCTION DOC] HELPER: Fuser method for relu(add(other, conv)); builds a fused ConvAddReLU2d.
     add, _, conv = add_pattern
     return nni.ConvAddReLU2d(conv, add, relu)
 
 
 def _conv_add_relu_root_node_getter_right(pattern):
+    # [FUNCTION DOC] HELPER: Root node getter: returns the conv node from the (relu, (add, other, conv)) pattern.
     _relu, add_pattern = pattern
     _, _extra_input, conv = add_pattern
     return conv
 
 
 def _conv_add_relu_extra_inputs_getter_right(pattern):
+    # [FUNCTION DOC] HELPER: Extra inputs getter: returns a list with the other input of the (relu, (add, other, conv)) pattern.
     """get inputs pattern for extra inputs, inputs for root node
     are assumed to be copied over from root node to the fused node
     """
@@ -433,6 +466,8 @@ def _conv_add_relu_extra_inputs_getter_right(pattern):
 
 
 def _fuse_conv_bn_add_relu_right(is_qat, relu, add_pattern):
+    # [FUNCTION DOC] HELPER: Fuser method for relu(add(other, bn(conv))); raises NotImplementedError for QAT, otherwise folds bn
+    # into conv and returns ConvAddReLU2d.
     add, _, bn_conv = add_pattern
     bn, conv = bn_conv
     if is_qat:
@@ -443,6 +478,7 @@ def _fuse_conv_bn_add_relu_right(is_qat, relu, add_pattern):
 
 
 def _conv_bn_add_relu_root_node_getter_right(pattern):
+    # [FUNCTION DOC] HELPER: Root node getter: returns the conv node from the (relu, (add, other, (bn, conv))) pattern.
     _relu, add_pattern = pattern
     _, _, bn_conv = add_pattern
     _bn, conv = bn_conv
@@ -450,6 +486,7 @@ def _conv_bn_add_relu_root_node_getter_right(pattern):
 
 
 def _conv_bn_add_relu_extra_inputs_getter_right(pattern):
+    # [FUNCTION DOC] HELPER: Extra inputs getter: returns a list with the other input of the (relu, (add, other, (bn, conv))) pattern.
     """get inputs pattern for extra inputs, inputs for root node
     are assumed to be copied over from root node to the fused node
     """
@@ -520,6 +557,10 @@ def _add_eltwise_fusion_configs(
     observation_type,
     ref_quant_module,
 ):
+    # [FUNCTION DOC] HELPER: Appends to the given configs list (mutating it) the fusion configs for a root module plus an
+    # elementwise post op: module+module and module+functional fusion patterns with the fuser method and fused
+    # module, a config for the fused module (root and reference quantized modules), and functional root op +
+    # post module / post op configs. Returns None.
     # 1 base module + op module fusion config
     configs.append(
         BackendPatternConfig((root_module, post_module))
@@ -611,6 +652,8 @@ layer_norm_op_dtype_configs = [onednn_input_output_only_quint8_dtype_config]
 
 
 def get_onednn_backend_config() -> BackendConfig:
+    # [FUNCTION DOC] Returns the BackendConfig named onednn combining the module-level conv and linear config lists with
+    # binary, cat, default, fixed-qparams, share-qparams, batchnorm, layer norm, RNN and embedding configs.
     """
     Return the `BackendConfig` for PyTorch's native ONEDNN backend.
     """

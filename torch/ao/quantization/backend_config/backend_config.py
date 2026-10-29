@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Core data model for quantization backend configuration: ObservationType enum, DTypeWithConstraints and
+# DTypeConfig dataclasses, BackendPatternConfig (per-pattern behavior) and BackendConfig (collection of pattern
+# configs keyed by reversed nested tuple pattern). Also defines dict key string constants used by the
+# from_dict / to_dict serialization. No import-time side effects beyond definitions.
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -53,6 +57,8 @@ INPUT_TYPE_TO_INDEX_DICT_KEY = "input_type_to_index"
 # TODO: maybe rename this to something that's not related to observer
 # e.g. QParamsType
 class ObservationType(Enum):
+    # [CLASS DOC] Enum of how an operator pattern is observed: output uses a different observer than input (0),
+    # output shares the input observer (1), or input and output are never observed (2).
     """An enum that represents different ways of how an operator/operator pattern
     should be observed
     """
@@ -77,6 +83,8 @@ class ObservationType(Enum):
 
 @dataclass
 class DTypeWithConstraints:
+    # [CLASS DOC] Dataclass holding a dtype plus optional constraints: lower bound on quant_min, upper bound on quant_max,
+    # scale min/max bounds and exact-match scale / zero point for fixed-qparams ops. All fields default to None.
     """
     Config for specifying additional constraints for a given dtype, such as quantization
     value ranges, scale value ranges, and fixed quantization params, to be used in
@@ -113,6 +121,8 @@ class DTypeWithConstraints:
 
 @dataclass
 class DTypeConfig:
+    # [CLASS DOC] Describes supported dtypes for a pattern: input, output and weight dtypes (each stored with constraints),
+    # plus bias dtype and an is_dynamic flag. Exposes plain dtype views as properties and converts to/from dicts.
     """
     Config object that specifies the supported data types passed as arguments to
     quantize ops in the reference model spec, for input and output activations,
@@ -196,6 +206,8 @@ scale_min_lower_bound=None, scale_max_upper_bound=None)
         bias_dtype: torch.dtype | None = None,
         is_dynamic: bool | None = None,
     ):
+        # [FUNCTION DOC] Initializes from optional dtypes; input/output/weight may be a plain dtype (wrapped into a
+        # constraints object with no constraints) or a constraints object stored as is. Stores bias dtype and is_dynamic.
         if isinstance(input_dtype, DTypeWithConstraints):
             self.input_dtype_with_constraints = input_dtype
         else:
@@ -220,18 +232,25 @@ scale_min_lower_bound=None, scale_max_upper_bound=None)
 
     @property
     def input_dtype(self) -> torch.dtype | None:
+        # [FUNCTION DOC] Property returning the input dtype held by the input constraints object (may be None).
         return self.input_dtype_with_constraints.dtype
 
     @property
     def output_dtype(self) -> torch.dtype | None:
+        # [FUNCTION DOC] Property returning the output dtype held by the output constraints object (may be None).
         return self.output_dtype_with_constraints.dtype
 
     @property
     def weight_dtype(self) -> torch.dtype | None:
+        # [FUNCTION DOC] Property returning the weight dtype held by the weight constraints object (may be None).
         return self.weight_dtype_with_constraints.dtype
 
     @classmethod
     def from_dict(cls, dtype_config_dict: dict[str, Any]) -> DTypeConfig:
+        # [FUNCTION DOC] Classmethod building a DTypeConfig from a dict with optional keys for input, output, weight dtypes
+        # (dtype or constraints object), bias dtype and is_dynamic. Raises ValueError if an input/output/weight
+        # value is neither a dtype nor a constraints object. Missing keys become None.
+        # KNOWN ISSUE: the docstring names the bias key bias_type but the code reads the key bias_dtype.
         """
         Create a ``DTypeConfig`` from a dictionary with the following items (all optional):
             "input_dtype": torch.dtype or ``DTypeWithConstraints``
@@ -266,6 +285,8 @@ scale_min_lower_bound=None, scale_max_upper_bound=None)
         return cls(input_dtype, output_dtype, weight_dtype, bias_dtype, is_dynamic)
 
     def to_dict(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Returns a dict with only the non-None items: input/output/weight entries hold the constraints objects
+        # (not bare dtypes), plus bias dtype and is_dynamic. Inverse of from_dict.
         """
         Convert this ``DTypeConfig`` to a dictionary with the items described in
         :func:`~torch.ao.quantization.backend_config.DTypeConfig.from_dict`.
@@ -289,6 +310,10 @@ scale_min_lower_bound=None, scale_max_upper_bound=None)
 
 
 class BackendConfig:
+    # [CLASS DOC] Named collection of BackendPatternConfig objects describing which patterns a backend can quantize.
+    # State: name and a private mapping from complex-format (reversed nested tuple) pattern to config, so later
+    # configs for the same pattern override earlier ones. Provides setters returning self for chaining, a configs
+    # property and dict conversion.
     # TODO: refer to NativeBackendConfig once that is implemented
     """Config that defines the set of patterns that can be quantized on a given backend, and how reference
     quantized models can be produced from these patterns.
@@ -356,6 +381,7 @@ class BackendConfig:
     """
 
     def __init__(self, name: str = ""):
+        # [FUNCTION DOC] Creates a config with the given name and an empty pattern-to-config mapping.
         self.name = name
         # Store all BackendPatternConfigs in a map to handle duplicates
         # Note: the key in this map uses the complex reversed tuple format.
@@ -364,9 +390,11 @@ class BackendConfig:
         self._pattern_complex_format_to_config: dict[Pattern, BackendPatternConfig] = {}
 
     def __repr__(self):
+        # [FUNCTION DOC] Returns a string showing the object's attribute dictionary.
         return f"BackendConfig({self.__dict__})"
 
     def set_name(self, name: str) -> BackendConfig:
+        # [FUNCTION DOC] Sets the backend name; returns self.
         """
         Set the name of the target backend.
         """
@@ -374,6 +402,9 @@ class BackendConfig:
         return self
 
     def set_backend_pattern_config(self, config: BackendPatternConfig) -> BackendConfig:
+        # [FUNCTION DOC] Registers a pattern config, keyed by its pattern converted to reversed nested tuple form via a utility
+        # function (looked up lazily to avoid circular imports). Overwrites any existing config for that pattern.
+        # Returns self.
         """
         Set the config for an pattern that can be run on the target backend.
         This overrides any existing config for the given pattern.
@@ -388,6 +419,8 @@ class BackendConfig:
     def set_backend_pattern_configs(
         self, configs: list[BackendPatternConfig]
     ) -> BackendConfig:
+        # [FUNCTION DOC] Registers each config in the list in order via the single-config setter (overriding duplicates).
+        # Returns self.
         """
         Set the configs for patterns that can be run on the target backend.
         This overrides any existing config for a given pattern if it was previously registered already.
@@ -398,6 +431,7 @@ class BackendConfig:
 
     @property
     def configs(self) -> list[BackendPatternConfig]:
+        # [FUNCTION DOC] Property returning a new list of all registered pattern configs in insertion order.
         """
         Return a copy of the list of configs set in this `BackendConfig`.
         """
@@ -405,6 +439,8 @@ class BackendConfig:
 
     @classmethod
     def from_dict(cls, backend_config_dict: dict[str, Any]) -> BackendConfig:
+        # [FUNCTION DOC] Classmethod building a BackendConfig from a dict with optional name and a list of configs; each entry may
+        # be a BackendPatternConfig or a dict (converted via its from_dict). Raises ValueError for any other entry type.
         """
         Create a ``BackendConfig`` from a dictionary with the following items:
 
@@ -426,6 +462,7 @@ class BackendConfig:
         return conf
 
     def to_dict(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Returns a dict with the name and a list of each pattern config converted to a dict.
         """
         Convert this ``BackendConfig`` to a dictionary with the items described in
         :func:`~torch.ao.quantization.backend_config.BackendConfig.from_dict`.
@@ -437,12 +474,19 @@ class BackendConfig:
 
 
 class BackendPatternConfig:
+    # [CLASS DOC] Mutable description of quantization behavior for one pattern: the pattern (or its complex-format form,
+    # mutually exclusive), observation type (default different observer), dtype configs, root / QAT /
+    # reference-quantized / fused modules, fuser method, and internal getters and index mappings. Setters
+    # return self for chaining; converts to/from dict.
     """
     Config object that specifies quantization behavior for a given operator pattern.
     For a detailed example usage, see :class:`~torch.ao.quantization.backend_config.BackendConfig`.
     """
 
     def __init__(self, pattern: Pattern | None = None):
+        # [FUNCTION DOC] Initializes with an optional pattern and defaults: different-observer observation type, empty dtype
+        # configs, no modules or fuser method, and empty internal root node getter, extra inputs getter,
+        # num-tensor-args mapping, input-type-to-index mapping and complex-format pattern.
         self.pattern: Pattern | None = pattern
         self.observation_type = ObservationType.OUTPUT_USE_DIFFERENT_OBSERVER_AS_INPUT
         self.dtype_configs: list[DTypeConfig] = []
@@ -460,6 +504,7 @@ class BackendPatternConfig:
         self._pattern_complex_format: Pattern | None = None
 
     def __repr__(self):
+        # [FUNCTION DOC] Returns a string listing only attributes that are non-None and, for lists/dicts, non-empty.
         dict_nonempty = {
             k: v
             for k, v in self.__dict__.items()
@@ -471,6 +516,8 @@ class BackendPatternConfig:
         return f"BackendPatternConfig({dict_nonempty})"
 
     def set_pattern(self, pattern: Pattern) -> BackendPatternConfig:
+        # [FUNCTION DOC] Sets the pattern (module, function, operator or 2-3 element tuple sequence). Raises ValueError if the
+        # complex-format pattern is already set. Returns self.
         """
         Set the pattern to configure.
 
@@ -488,6 +535,7 @@ class BackendPatternConfig:
     def set_observation_type(
         self, observation_type: ObservationType
     ) -> BackendPatternConfig:
+        # [FUNCTION DOC] Sets the observation type for the pattern; returns self.
         """
         Set how observers should be inserted in the graph for this pattern.
 
@@ -512,6 +560,7 @@ class BackendPatternConfig:
         return self
 
     def add_dtype_config(self, dtype_config: DTypeConfig) -> BackendPatternConfig:
+        # [FUNCTION DOC] Appends one DTypeConfig to the list of supported dtype configs; returns self.
         """
         Add a set of supported data types passed as arguments to quantize ops in the
         reference model spec.
@@ -522,6 +571,7 @@ class BackendPatternConfig:
     def set_dtype_configs(
         self, dtype_configs: list[DTypeConfig]
     ) -> BackendPatternConfig:
+        # [FUNCTION DOC] Replaces the whole list of dtype configs; returns self (stores the given list without copying).
         """
         Set the supported data types passed as arguments to quantize ops in the
         reference model spec, overriding all previously registered data types.
@@ -532,6 +582,7 @@ class BackendPatternConfig:
     def set_root_module(
         self, root_module: type[torch.nn.Module]
     ) -> BackendPatternConfig:
+        # [FUNCTION DOC] Sets the root module type that is swapped for the reference quantized module at convert time; returns self.
         """
         Set the module that represents the root for this pattern.
 
@@ -548,6 +599,7 @@ class BackendPatternConfig:
         return self
 
     def set_qat_module(self, qat_module: type[torch.nn.Module]) -> BackendPatternConfig:
+        # [FUNCTION DOC] Sets the QAT module type for this pattern; returns self.
         """
         Set the module that represents the QAT implementation for this pattern.
         """
@@ -557,6 +609,7 @@ class BackendPatternConfig:
     def set_reference_quantized_module(
         self, reference_quantized_module: type[torch.nn.Module]
     ) -> BackendPatternConfig:
+        # [FUNCTION DOC] Sets the reference quantized module type used for the root module; returns self.
         """
         Set the module that represents the reference quantized implementation for
         this pattern's root module.
@@ -569,6 +622,7 @@ class BackendPatternConfig:
     def set_fused_module(
         self, fused_module: type[torch.nn.Module]
     ) -> BackendPatternConfig:
+        # [FUNCTION DOC] Sets the fused module type for this pattern; returns self.
         """
         Set the module that represents the fused implementation for this pattern.
         """
@@ -576,6 +630,8 @@ class BackendPatternConfig:
         return self
 
     def set_fuser_method(self, fuser_method: Callable) -> BackendPatternConfig:
+        # [FUNCTION DOC] Sets the fuser method, called with an is_qat flag followed by the pattern's items, returning the fused
+        # module; returns self.
         """
         Set the function that specifies how to fuse this BackendPatternConfig's pattern.
 
@@ -594,28 +650,34 @@ class BackendPatternConfig:
         return self
 
     def _set_root_node_getter(self, root_node_getter: Callable) -> BackendPatternConfig:
+        # [FUNCTION DOC] HELPER: Internal setter for the root node getter callable; returns self.
         self._root_node_getter = root_node_getter
         return self
 
     def _set_extra_inputs_getter(
         self, extra_inputs_getter: Callable
     ) -> BackendPatternConfig:
+        # [FUNCTION DOC] HELPER: Internal setter for the extra inputs getter callable; returns self.
         self._extra_inputs_getter = extra_inputs_getter
         return self
 
     def _set_num_tensor_args_to_observation_type(
         self, num_tensor_args_to_observation_type: dict[int, ObservationType]
     ) -> BackendPatternConfig:
+        # [FUNCTION DOC] HELPER: Internal setter for the mapping from number of tensor args to observation type; returns self.
         self._num_tensor_args_to_observation_type = num_tensor_args_to_observation_type
         return self
 
     def _set_input_type_to_index(
         self, input_type_to_index: dict[str, int]
     ) -> BackendPatternConfig:
+        # [FUNCTION DOC] HELPER: Internal setter for the mapping from input kind (weight, bias) to argument index; returns self.
         self._input_type_to_index = input_type_to_index
         return self
 
     def _set_pattern_complex_format(self, pattern: Pattern) -> BackendPatternConfig:
+        # [FUNCTION DOC] HELPER: Internal setter for the reversed nested tuple pattern. Raises ValueError if a regular pattern is
+        # already set. Returns self.
         """
         Set the pattern to configure, using the reversed nested tuple format.
 
@@ -633,6 +695,10 @@ class BackendPatternConfig:
     def from_dict(
         cls, backend_pattern_config_dict: dict[str, Any]
     ) -> BackendPatternConfig:
+        # [FUNCTION DOC] Classmethod building a BackendPatternConfig from a dict (keys: pattern, observation_type, dtype_configs
+        # as objects or dicts, modules, fuser method, getters, num-tensor-args mapping, input-type-to-index, and
+        # complex-format pattern). Missing optional entries are set to None or empty. Raises ValueError for a
+        # conflicting pattern pair or a dtype config entry of the wrong type.
         """
         Create a ``BackendPatternConfig`` from a dictionary with the following items:
 
@@ -651,6 +717,7 @@ class BackendPatternConfig:
         """
 
         def _get_dtype_config(obj: Any) -> DTypeConfig:
+            # [FUNCTION DOC] HELPER: Converts a DTypeConfig or dict into a DTypeConfig. Raises ValueError for any other type.
             """
             Convert the given object into a ``DTypeConfig`` if possible, else throw an exception.
             """
@@ -706,6 +773,8 @@ class BackendPatternConfig:
         return conf
 
     def to_dict(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Returns a dict containing observation type and dtype configs (as dicts) always, plus each other
+        # attribute only when set (non-None, or non-empty for the mappings). Inverse of from_dict.
         """
         Convert this ``BackendPatternConfig`` to a dictionary with the items described in
         :func:`~torch.ao.quantization.backend_config.BackendPatternConfig.from_dict`.

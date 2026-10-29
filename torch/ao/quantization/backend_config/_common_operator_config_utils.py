@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] HELPER: Shared builders of BackendPatternConfig lists for common operator families (binary ops,
+# linear, conv, cat, layer norm, default ops, fixed-qparams ops, share-qparams ops, batchnorm, RNN,
+# embedding, tensor-info ops) reused by the individual backend configs. Defines conv metadata tuples for
+# 1d/2d/3d and fixed-qparams constraint tables at import time. Public __all__ is empty.
 import copy
 import operator
 from collections import namedtuple
@@ -134,6 +138,9 @@ _FIXED_QPARAMS_OP_TO_CONSTRAINTS: dict[Callable | str, DTypeWithConstraints] = {
 def _get_binary_op_configs(
     dtype_configs: list[DTypeConfig],
 ) -> list[BackendPatternConfig]:
+    # [FUNCTION DOC] HELPER: Returns pattern configs for add/mul (operator and torch variants, alone and fused with
+    # relu module/functional relu) plus matmul, each with the given dtype configs. Observation type is chosen
+    # by number of tensor args (0 or 2 tensors: different observer; 1 tensor: shared observer).
     binary_op_configs: list[BackendPatternConfig] = []
     num_tensor_args_to_observation_type_mapping = {
         # TODO: this is not used right now since we have extra check in prepare
@@ -171,6 +178,9 @@ def _get_binary_op_configs(
 
 
 def _get_linear_configs(dtype_configs: list[DTypeConfig]) -> list[BackendPatternConfig]:
+    # [FUNCTION DOC] HELPER: Returns configs for linear: module, QAT module, functional linear (weight and bias
+    # input indices), linear+relu fusion and fused/QAT-fused modules, functional linear+relu, and
+    # linear+batchnorm1d fusion with fused/QAT modules.
     """
     Return all configs related to linear modules and ops.
     """
@@ -286,6 +296,9 @@ def _get_linear_configs(dtype_configs: list[DTypeConfig]) -> list[BackendPattern
 
 
 def _get_conv_configs(dtype_configs):
+    # [FUNCTION DOC] HELPER: Returns configs for conv1d/2d/3d: module, QAT module, functional conv, relu fusions and
+    # fused/QAT variants, bn and bn+relu fusions (module and functional relu), fused/QAT bn variants,
+    # conv transpose (module, bn fusion, functional).
     """
     Return all configs related to conv modules and ops.
     """
@@ -470,6 +483,7 @@ def _get_conv_configs(dtype_configs):
 
 
 def _get_cat_config(dtype_configs: list[DTypeConfig]) -> BackendPatternConfig:
+    # [FUNCTION DOC] HELPER: Returns the single config for torch.cat, sharing the observer between input and output.
     return (
         BackendPatternConfig(torch.cat)
         .set_observation_type(ObservationType.OUTPUT_SHARE_OBSERVER_WITH_INPUT)
@@ -478,6 +492,8 @@ def _get_cat_config(dtype_configs: list[DTypeConfig]) -> BackendPatternConfig:
 
 
 def _get_ln_configs(dtype_configs: list[DTypeConfig]) -> list[BackendPatternConfig]:
+    # [FUNCTION DOC] HELPER: Returns configs for LayerNorm module and functional layer_norm (weight/bias at input
+    # indices 2 and 3), using a different output observer.
     ln_configs = []
     ln_configs.append(
         BackendPatternConfig(torch.nn.LayerNorm)
@@ -496,6 +512,8 @@ def _get_ln_configs(dtype_configs: list[DTypeConfig]) -> list[BackendPatternConf
 def _get_default_op_configs(
     dtype_configs: list[DTypeConfig],
 ) -> list[BackendPatternConfig]:
+    # [FUNCTION DOC] HELPER: Returns configs for default ops (ELU, LeakyReLU, Hardswish, instance norms, Dropout, PReLU
+    # and functional forms) plus functional group_norm and instance_norm with weight/bias input indices.
     default_ops = [
         torch.nn.ELU,
         torch.nn.LeakyReLU,
@@ -537,6 +555,9 @@ def _add_fixed_qparams_to_dtype_configs(
     dtype_configs: list[DTypeConfig],
     constraints: DTypeWithConstraints,
 ) -> list[DTypeConfig]:
+    # [FUNCTION DOC] HELPER: Returns deep copies of the dtype configs where input/output dtypes matching the constraints'
+    # dtype get the fixed-qparams quant min/max bounds, scale and zero point exact-match values.
+    # Raises ValueError if a matching config already sets scale_min_lower_bound or scale_max_upper_bound.
     """
     Return a copy of the list of DTypeConfigs where activations are subject to the specified
     constraints required for fixed qparams ops.
@@ -575,6 +596,8 @@ def _add_fixed_qparams_to_dtype_configs(
 def _get_fixed_qparams_op_configs(
     dtype_configs: list[DTypeConfig],
 ) -> list[BackendPatternConfig]:
+    # [FUNCTION DOC] HELPER: Returns one config per op in the fixed-qparams constraint table (sigmoid, tanh, hardsigmoid,
+    # softmax, ...), with dtype configs adjusted by the matching constraints.
     fixed_qparams_op_configs = []
     for fixed_qparam_op, constraints in _FIXED_QPARAMS_OP_TO_CONSTRAINTS.items():
         new_dtype_configs = _add_fixed_qparams_to_dtype_configs(
@@ -591,6 +614,8 @@ def _get_fixed_qparams_op_configs(
 
 
 def _get_share_qparams_op_configs(dtype_configs):
+    # [FUNCTION DOC] HELPER: Returns configs for ops (pooling, relu, reshape-like, etc.) whose output shares the
+    # quantization parameters of the input; one config per op with shared-observer observation type.
     """Get the operator config for the operators that works for both float and quantized input
     if input is quantized, the output Tensor shares the same quantization parameter
     with input.
@@ -600,6 +625,7 @@ def _get_share_qparams_op_configs(dtype_configs):
     """
 
     def _get_share_qprams_op_backend_config(op):
+        # [FUNCTION DOC] HELPER: Builds a shared-observer config for one op using the enclosing dtype configs.
         return (
             BackendPatternConfig(op)
             .set_observation_type(ObservationType.OUTPUT_SHARE_OBSERVER_WITH_INPUT)
@@ -671,6 +697,8 @@ def _get_share_qparams_op_configs(dtype_configs):
 
 
 def _get_bn_configs(dtype_configs: list[DTypeConfig]) -> list[BackendPatternConfig]:
+    # [FUNCTION DOC] HELPER: Returns configs for BatchNorm2d/3d fused with relu (module and functional) into the BNReLU
+    # fused modules, plus configs for the plain and fused batchnorm modules.
     """Get configs related to batchnorm."""
     bn_configs = []
     bn_to_fused_bn = {
@@ -714,6 +742,8 @@ def _get_bn_configs(dtype_configs: list[DTypeConfig]) -> list[BackendPatternConf
 
 
 def _get_rnn_op_configs(dtype_configs: list[DTypeConfig]) -> list[BackendPatternConfig]:
+    # [FUNCTION DOC] HELPER: Returns configs for GRUCell, LSTMCell, RNNCell, LSTM and GRU mapping each to its reference
+    # quantized module.
     rnn_op_configs = []
     for rnn_op, ref_rnn_op in [
         (nn.GRUCell, nnqr.GRUCell),
@@ -737,6 +767,8 @@ def _get_rnn_op_configs(dtype_configs: list[DTypeConfig]) -> list[BackendPattern
 def _get_embedding_op_configs(
     dtype_configs: list[DTypeConfig],
 ) -> list[BackendPatternConfig]:
+    # [FUNCTION DOC] HELPER: Returns configs for Embedding and EmbeddingBag, both float and QAT modules, with QAT and
+    # reference quantized module mappings.
     embedding_op_configs = []
     for embedding_op, qat_embedding_op, ref_embedding_op in [
         (nn.Embedding, nnqat.Embedding, nnqr.Embedding),
@@ -767,12 +799,14 @@ def _get_embedding_op_configs(
 
 
 def _get_tensor_info_op_configs(dtype_configs):
+    # [FUNCTION DOC] HELPER: Returns configs for ops shape and size, which return non-tensor info and need no observers.
     """
     These ops work on tensors of different dtypes but return non-tensors
     containing information about the input tensor.
     """
 
     def _get_config(op):
+        # [FUNCTION DOC] HELPER: Builds a not-observed config for one op using the enclosing dtype configs.
         return (
             BackendPatternConfig(op)
             .set_observation_type(ObservationType.INPUT_OUTPUT_NOT_OBSERVED)
