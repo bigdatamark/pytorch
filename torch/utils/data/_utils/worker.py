@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Worker-side support for DataLoader: the worker loop run in each worker process,
+# WorkerInfo and get_worker_info, a parent-process watchdog, seed-state generation for numpy,
+# and sentinel dataclasses for iterable exhaustion and worker reuse. The watchdog class is
+# chosen by platform at import time; module global holds the per-worker info.
 r"""Contains definitions of the methods used by the _BaseDataLoaderIter workers.
 
 These **need** to be in global scope since Py2 doesn't support serializing
@@ -30,7 +34,13 @@ if IS_WINDOWS:
     # is gone, and the only way to check it through OS is to let the worker have a process handle
     # of the manager and ask if the process status has changed.
     class ManagerWatchdog:
+        # [CLASS DOC] HELPER: Windows watchdog that detects death of the manager (parent)
+        # process by holding a process handle. State: manager_pid, kernel32 library,
+        # manager_handle and manager_dead flag.
         def __init__(self) -> None:
+            # [FUNCTION DOC] HELPER: Records the parent pid, opens a synchronize-access handle
+            # to the parent via kernel32 and sets manager_dead to false. Raises a Windows
+            # error if the handle cannot be opened.
             self.manager_pid = os.getppid()
 
             # mypy cannot detect this code is windows only
@@ -52,6 +62,8 @@ if IS_WINDOWS:
             self.manager_dead = False
 
         def is_alive(self) -> bool:
+            # [FUNCTION DOC] HELPER: Returns true while the parent process is alive; once death is
+            # observed (wait on the handle returns signaled) the result is cached as dead.
             if not self.manager_dead:
                 # Value obtained from https://msdn.microsoft.com/en-us/library/windows/desktop/ms687032.aspx
                 self.manager_dead = (
@@ -62,11 +74,17 @@ if IS_WINDOWS:
 else:
 
     class ManagerWatchdog:  # type: ignore[no-redef]
+        # [CLASS DOC] HELPER: Non-Windows watchdog that detects death of the manager (parent)
+        # process by comparing the current parent pid with the one recorded at creation.
+        # State: manager_pid and manager_dead flag.
         def __init__(self) -> None:
+            # [FUNCTION DOC] HELPER: Records the current parent pid and sets manager_dead false.
             self.manager_pid = os.getppid()
             self.manager_dead = False
 
         def is_alive(self) -> bool:
+            # [FUNCTION DOC] HELPER: Returns true while the parent pid is unchanged; once a
+            # change is seen the result is cached as dead.
             if not self.manager_dead:
                 self.manager_dead = os.getppid() != self.manager_pid
             return not self.manager_dead
@@ -77,6 +95,9 @@ _worker_info: WorkerInfo | None = None
 
 @dataclass(frozen=True, slots=True)
 class WorkerInfo:
+    # [CLASS DOC] Immutable record describing the current worker: id, num_workers, seed,
+    # dataset copy, optional thread-worker RNG container and the worker method name (default
+    # multiprocessing). Instances are created per worker and exposed via get_worker_info.
     """Information about the current DataLoader worker process or thread.
 
     Attributes:
@@ -97,6 +118,8 @@ class WorkerInfo:
 
 
 def get_worker_info() -> WorkerInfo | None:
+    # [FUNCTION DOC] Returns the WorkerInfo of the current DataLoader worker, or None when
+    # called outside a worker (for example in the main process). Reads module state only.
     r"""Returns the information about the current
     :class:`~torch.utils.data.DataLoader` iterator worker process.
 
@@ -130,6 +153,8 @@ r"""Dummy class used to signal the end of an IterableDataset"""
 
 @dataclass(frozen=True)
 class _IterableDatasetStopIteration:
+    # [CLASS DOC] HELPER: Sentinel sent from a worker to the main process, carrying worker_id,
+    # to signal that the worker's iterable dataset is exhausted.
     worker_id: int
 
 
@@ -138,11 +163,15 @@ r"""Dummy class used to resume the fetching when worker reuse is enabled"""
 
 @dataclass(frozen=True)
 class _ResumeIteration:
+    # [CLASS DOC] HELPER: Message sent to a worker to resume fetching under the worker-reuse
+    # policy; carries an optional seed (required when the dataset is an IterDataPipe).
     seed: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class _RNG:
+    # [CLASS DOC] HELPER: Immutable container of per-thread random generators (Python random,
+    # torch, and optionally numpy) so thread workers avoid sharing RNG state.
     """Container for thread-local random number generator state.
 
     Used by thread workers to maintain separate RNG state per worker thread
@@ -190,6 +219,9 @@ class _RNG:
 # seed and algorithm for `numpy.random` and `random` modules.
 # TODO: Implement `SeedSequence` like object for `torch.random`
 def _generate_state(base_seed, worker_id):
+    # [FUNCTION DOC] HELPER: Deterministically derives a list of four 32-bit integers from the
+    # base seed and worker id, using a hash-and-mix scheme adapted from numpy's SeedSequence.
+    # Used to seed numpy so it does not collide with the Python and torch generators. Pure.
     INIT_A = 0x43B0D7E5
     MULT_A = 0x931E8875
     INIT_B = 0x8B51F9DD
@@ -205,6 +237,8 @@ def _generate_state(base_seed, worker_id):
     hash_const_A = INIT_A
 
     def hash(value):
+        # [FUNCTION DOC] HELPER: Hashes a value with the running constant A (updated on every
+        # call, via nonlocal state) and returns a 32-bit result.
         nonlocal hash_const_A
         value = (value ^ hash_const_A) & MASK32
         hash_const_A = (hash_const_A * MULT_A) & MASK32
@@ -213,6 +247,8 @@ def _generate_state(base_seed, worker_id):
         return value
 
     def mix(x, y):
+        # [FUNCTION DOC] HELPER: Combines two 32-bit values with multiplications, subtraction
+        # and an xor-shift and returns a 32-bit result.
         result_x = (MIX_MULT_L * x) & MASK32
         result_y = (MIX_MULT_R * y) & MASK32
         result = (result_x - result_y) & MASK32
@@ -257,6 +293,17 @@ def _worker_loop(
     persistent_workers,
     shared_seed,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Main function of a DataLoader worker process. Takes the dataset out
+    # of dataset_holder, installs C signal handlers, seeds Python, torch and numpy from
+    # base_seed plus worker_id, applies shared-seed randomness to IterDataPipe datasets, sets
+    # the module worker info, runs init_fn and creates the fetcher (a failure is captured and
+    # reported on the first task). Then loops while the parent lives: get an item from
+    # index_queue; resume messages re-acknowledge, reseed and recreate the fetcher; None ends
+    # the loop; otherwise fetch the batch and put an (index, data) pair on data_queue, where
+    # data may be an ExceptionWrapper or an iterable-exhausted sentinel. Raises AssertionError
+    # on protocol violations (these propagate). Ignores KeyboardInterrupt, clears worker info
+    # at exit, and closes data_queue if done_event is set. The persistent_workers argument is
+    # unused here.
     # See NOTE [ Data Loader Multiprocessing Shutdown Logic ] for details on the
     # logic of this function.
     dataset = dataset_holder.pop()

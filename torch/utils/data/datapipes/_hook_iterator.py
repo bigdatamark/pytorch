@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Helpers that hook the __iter__ (and __next__) of IterDataPipe classes so that only
+# one valid iterator exists per DataPipe, profiler record scopes are added, snapshot state is
+# tracked, samples yielded are counted and error messages name the DataPipe. The entry point is
+# hook_iterator, which rewrites a class namespace. No import-time side effects.
 import functools
 import inspect
 from enum import Enum
@@ -7,6 +11,8 @@ import torch
 
 
 class _SnapshotState(Enum):
+    # [CLASS DOC] HELPER: Enumeration of snapshot states of an IterDataPipe: NotStarted (0),
+    # Restored (1) and Iterating (2).
     r"""
     These are the snapshotting-related states that IterDataPipes can be in.
 
@@ -21,6 +27,8 @@ class _SnapshotState(Enum):
 
 
 def _simplify_obj_name(obj) -> str:
+    # [FUNCTION DOC] HELPER: Returns the name of a function object, or the repr of any other
+    # object, for use in error messages.
     """Simplify the display strings of objects for the purpose of rendering within DataPipe error messages."""
     if inspect.isfunction(obj):
         return obj.__name__
@@ -29,10 +37,14 @@ def _simplify_obj_name(obj) -> str:
 
 
 def _strip_datapipe_from_name(name: str) -> str:
+    # [FUNCTION DOC] HELPER: Returns the name with the substrings IterDataPipe and MapDataPipe
+    # removed.
     return name.replace("IterDataPipe", "").replace("MapDataPipe", "")
 
 
 def _generate_input_args_string(obj):
+    # [FUNCTION DOC] HELPER: Builds a comma-separated list of name=value pairs for the object
+    # attributes whose names match constructor parameters of its class (values simplified).
     """Generate a string for the input arguments of an object."""
     signature = inspect.signature(obj.__class__)
     input_param_names = set(signature.parameters.keys())
@@ -44,6 +56,8 @@ def _generate_input_args_string(obj):
 
 
 def _generate_iterdatapipe_msg(datapipe, simplify_dp_name: bool = False):
+    # [FUNCTION DOC] HELPER: Returns a display string of the class name with its input
+    # arguments; if simplify_dp_name is set, removes the DataPipe suffix words from it.
     output_string = (
         f"{datapipe.__class__.__name__}({_generate_input_args_string(datapipe)})"
     )
@@ -53,6 +67,8 @@ def _generate_iterdatapipe_msg(datapipe, simplify_dp_name: bool = False):
 
 
 def _gen_invalid_iterdatapipe_msg(datapipe) -> str:
+    # [FUNCTION DOC] HELPER: Returns the error message telling that this iterator was invalidated
+    # because another iterator was created from the same IterDataPipe.
     return (
         "This iterator has been invalidated because another iterator has been created "
         f"from the same IterDataPipe: {_generate_iterdatapipe_msg(datapipe)}\n"
@@ -68,6 +84,10 @@ _feedback_msg = (
 
 
 def _check_iterator_valid(datapipe, iterator_id, next_method_exists=False) -> None:
+    # [FUNCTION DOC] HELPER: Raises RuntimeError if the iterator id is no longer the valid one.
+    # With next_method_exists, the datapipe is invalid when its valid id is set and nonzero.
+    # For child datapipes, delegates to the child check method (raising RuntimeError if the
+    # method is missing). Otherwise compares ids for equality. Returns None when valid.
     r"""
     Given an instance of a DataPipe and an iterator ID, check if the IDs match, and if not, raises an exception.
 
@@ -102,6 +122,9 @@ def _check_iterator_valid(datapipe, iterator_id, next_method_exists=False) -> No
 
 
 def _set_datapipe_valid_iterator_id(datapipe):
+    # [FUNCTION DOC] HELPER: Starts a new iterator generation for the datapipe and returns its id.
+    # Child datapipes delegate to their main datapipe (RuntimeError if the method is missing).
+    # Others set the id to zero if unset, else increment it, and call reset on the datapipe.
     """Given a DataPipe, updates its valid iterator ID and reset the DataPipe."""
     if hasattr(datapipe, "_is_child_datapipe") and datapipe._is_child_datapipe is True:
         if hasattr(datapipe, "_set_main_datapipe_valid_iterator_id"):
@@ -120,6 +143,12 @@ def _set_datapipe_valid_iterator_id(datapipe):
 
 
 def hook_iterator(namespace) -> None:
+    # [FUNCTION DOC] Mutates the class namespace mapping so that its __iter__ is wrapped: a
+    # generator __iter__ gets a generator wrapper; otherwise __iter__ gets a wrapper returning
+    # an IteratorDecorator, and an existing __next__ gets a wrapper counting samples. Wrappers
+    # validate the iterator id, honor a fast-forward iterator, set the snapshot state, and
+    # record profiler scopes. Errors from a generator __iter__ get the datapipe description
+    # appended to their message. Returns None.
     r"""
     Define a hook that is applied to all `__iter__` of metaclass `_DataPipeMeta`.
 
@@ -127,6 +156,8 @@ def hook_iterator(namespace) -> None:
     """
 
     def profiler_record_fn_context(datapipe):
+        # [FUNCTION DOC] HELPER: Returns a profiler record_function scope named after the
+        # datapipe, caching the generated name on the datapipe.
         if not hasattr(datapipe, "_profile_name"):
             datapipe._profile_name = _generate_iterdatapipe_msg(
                 datapipe, simplify_dp_name=True
@@ -134,6 +165,9 @@ def hook_iterator(namespace) -> None:
         return torch.autograd.profiler.record_function(datapipe._profile_name)
 
     class IteratorDecorator:
+        # [CLASS DOC] HELPER: Iterator wrapper for DataPipes whose __iter__ is not a generator.
+        # Holds the wrapped iterator, datapipe, iterator id, whether the profiler was enabled
+        # at creation, and whether the iterator is the datapipe itself with its own __next__.
         r"""
         Wrap the iterator and modifying its `__next__` method.
 
@@ -142,6 +176,8 @@ def hook_iterator(namespace) -> None:
         """
 
         def __init__(self, iterator, datapipe, iterator_id, has_next_method) -> None:
+            # [FUNCTION DOC] HELPER: Stores the arguments and records profiler state and the
+            # self-iterator-with-__next__ flag.
             self.iterator = iterator
             self.datapipe = datapipe
             self.iterator_id = iterator_id
@@ -152,9 +188,13 @@ def hook_iterator(namespace) -> None:
             )
 
         def __iter__(self):
+            # [FUNCTION DOC] HELPER: Returns self.
             return self
 
         def _get_next(self):
+            # [FUNCTION DOC] HELPER: Checks the iterator is still valid (raising RuntimeError
+            # if not), gets the next item from the wrapped iterator, and counts it as yielded
+            # unless the datapipe's own __next__ wrapper already counts.
             """Return next with logic related to iterator validity, profiler, and incrementation of samples yielded."""
             _check_iterator_valid(self.datapipe, self.iterator_id)
             result = next(self.iterator)
@@ -163,6 +203,8 @@ def hook_iterator(namespace) -> None:
             return result
 
         def __next__(self):
+            # [FUNCTION DOC] HELPER: Returns the next item, inside a profiler scope if the
+            # profiler was enabled at creation. Propagates StopIteration and errors.
             # TODO: Add try-except to in-place reduce traceback from the Exception
             # See: https://github.com/pytorch/data/issues/284
             if self._profiler_enabled:
@@ -172,6 +214,7 @@ def hook_iterator(namespace) -> None:
                 return self._get_next()
 
         def __getattr__(self, name):
+            # [FUNCTION DOC] HELPER: Forwards unknown attribute lookups to the wrapped iterator.
             return getattr(self.iterator, name)
 
     func = namespace["__iter__"]
@@ -181,6 +224,11 @@ def hook_iterator(namespace) -> None:
 
         @functools.wraps(func)
         def wrap_generator(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Generator wrapper for a generator __iter__. If a fast-forward
+            # iterator is set, consumes it (clearing it, marking state Iterating) and returns. Else
+            # registers a new iterator id, then drives the inner generator, counting samples,
+            # checking validity before every resume and using profiler scopes. Exceptions are
+            # re-raised after appending a note naming the datapipe to string messages.
             gen = func(*args, **kwargs)
             datapipe = args[0]
             if datapipe._fast_forward_iterator:
@@ -243,6 +291,8 @@ def hook_iterator(namespace) -> None:
 
             @functools.wraps(next_func)
             def wrap_next(*args, **kwargs):
+                # [FUNCTION DOC] HELPER: Wraps __next__: runs the original (inside a profiler
+                # scope if enabled) and increments the datapipe's yielded-sample counter.
                 datapipe = args[0]
                 if torch.autograd._profiler_enabled():
                     with profiler_record_fn_context(datapipe):
@@ -262,6 +312,9 @@ def hook_iterator(namespace) -> None:
         # Regardless if `__next__` exists or not, `__iter__` needs a wrapper to track the number of valid iterators
         @functools.wraps(func)
         def wrap_iter(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Wraps __iter__: calls the original, sets the state to
+            # Iterating, and returns the fast-forward iterator if one is pending (clearing it).
+            # Otherwise registers a new iterator id and returns an IteratorDecorator.
             iter_ret = func(*args, **kwargs)
             datapipe = args[0]
             datapipe._snapshot_state = _SnapshotState.Iterating

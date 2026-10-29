@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Collation helpers that merge a list of samples into a batch: default_convert,
+# a type-dispatched collate with a registry of per-type collate functions, per-type collate
+# functions (tensor, numpy, float, int, str) and default_collate. Import time builds the default
+# registry and optionally registers numpy types if numpy is importable.
 r"""Contains definitions of the methods used by the _BaseDataLoaderIter workers.
 
 These methods are used to collate samples fetched from dataset into Tensor(s).
@@ -21,6 +25,11 @@ np_str_obj_array_pattern = re.compile(r"[SaUO]")
 
 
 def default_convert(data):
+    # [FUNCTION DOC] Converts numpy arrays and scalars in data to tensors, recursing into
+    # mappings, named tuples and sequences; plain tuples become lists. Tensors, string-typed or
+    # object numpy arrays, and other objects are returned unchanged. Mutable containers are
+    # shallow-copied and filled; if a container type cannot be rebuilt (TypeError), a plain
+    # dict or list is returned instead. Does not add a batch dimension.
     r"""
     Convert each NumPy array element into a :class:`torch.Tensor`.
 
@@ -120,6 +129,13 @@ def collate(
     *,
     collate_fn_map: dict[type | tuple[type, ...], Callable] | None = None,
 ):
+    # [FUNCTION DOC] Collates a non-empty batch (list of samples) into one structure, looking at
+    # the first element's type. If collate_fn_map has an entry for the exact type, or for a
+    # type the element is an instance of (checked in insertion order), that function is called
+    # with the batch and the map. Otherwise mappings are collated key by key, named tuples
+    # field by field, and sequences position by position (a tuple batch yields a list).
+    # Raises RuntimeError if sequence elements differ in length, and TypeError for unsupported
+    # element types (including strings that fall through).
     r"""
     General collate function that handles collection type of element within each batch.
 
@@ -248,6 +264,10 @@ def collate_tensor_fn(
     *,
     collate_fn_map: dict[type | tuple[type, ...], Callable] | None = None,
 ):
+    # [FUNCTION DOC] Collate function for tensors: stacks the batch along a new first dimension.
+    # Inside a DataLoader worker process the result is allocated directly in shared memory to
+    # avoid an extra copy. Raises RuntimeError for nested or sparse-layout tensors. The map
+    # argument is unused.
     elem = batch[0]
     out = None
     if elem.is_nested:
@@ -280,6 +300,9 @@ def collate_numpy_array_fn(
     *,
     collate_fn_map: dict[type | tuple[type, ...], Callable] | None = None,
 ):
+    # [FUNCTION DOC] Collate function for numpy arrays: converts each array to a tensor and
+    # collates the list. Raises TypeError for arrays with string or object dtype. The map is
+    # forwarded to the recursive collate call.
     elem = batch[0]
     # array of string classes and object
     if np_str_obj_array_pattern.search(elem.dtype.str) is not None:
@@ -293,6 +316,8 @@ def collate_numpy_scalar_fn(
     *,
     collate_fn_map: dict[type | tuple[type, ...], Callable] | None = None,
 ):
+    # [FUNCTION DOC] Collate function for numpy scalars: returns a tensor built from the batch.
+    # The map argument is unused.
     return torch.as_tensor(batch)
 
 
@@ -301,6 +326,8 @@ def collate_float_fn(
     *,
     collate_fn_map: dict[type | tuple[type, ...], Callable] | None = None,
 ):
+    # [FUNCTION DOC] Collate function for Python floats: returns a 64-bit float tensor of the
+    # batch. The map argument is unused.
     return torch.tensor(batch, dtype=torch.float64)
 
 
@@ -309,6 +336,8 @@ def collate_int_fn(
     *,
     collate_fn_map: dict[type | tuple[type, ...], Callable] | None = None,
 ):
+    # [FUNCTION DOC] Collate function for Python ints: returns an integer tensor of the batch.
+    # The map argument is unused.
     return torch.tensor(batch)
 
 
@@ -317,6 +346,8 @@ def collate_str_fn(
     *,
     collate_fn_map: dict[type | tuple[type, ...], Callable] | None = None,
 ):
+    # [FUNCTION DOC] Collate function for strings and bytes: returns the batch list unchanged.
+    # The map argument is unused.
     return batch
 
 
@@ -338,6 +369,8 @@ default_collate_fn_map[bytes] = collate_str_fn
 
 
 def default_collate(batch):
+    # [FUNCTION DOC] Collates a batch using the default registry (tensors, numpy, floats, ints,
+    # strings, bytes, plus containers). Returns the batched structure; raises as collate does.
     r"""
     Take in a batch of data and put the elements within the batch into a tensor with an additional outer dimension - batch size.
 

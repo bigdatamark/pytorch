@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Signal handling for multiprocess data loading: installs a SIGCHLD handler that
+# raises an error if a registered DataLoader worker process died, and re-exports the C helpers
+# for registering worker pids and worker signal handlers. Imports from torch._C at import time.
 r"""Signal handling for multiprocessing data loading.
 
 NOTE [ Signal handling in multiprocessing data loading ]
@@ -52,6 +55,10 @@ handler needs to be set for all DataLoaders in a process."""
 
 
 def _set_SIGCHLD_handler() -> None:
+    # [FUNCTION DOC] HELPER: Installs, once per process, a SIGCHLD handler that checks for
+    # failed workers and then chains to the previous handler if it was callable. Does nothing
+    # on Windows, outside the main thread, or if already installed. Sets the module flag and
+    # replaces the process SIGCHLD handler.
     # Windows doesn't support SIGCHLD handler
     if IS_WINDOWS:
         return
@@ -68,6 +75,8 @@ def _set_SIGCHLD_handler() -> None:
         previous_handler = None
 
     def handler(signum, frame) -> None:
+        # [FUNCTION DOC] HELPER: SIGCHLD callback. Calls the C check that raises an error if any
+        # registered worker failed, then forwards to the previous handler if one exists.
         # This following call uses `waitid` with WNOHANG from C side. Therefore,
         # Python can still get and update the process status successfully.
         _error_if_any_worker_fails()

@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Pinned-memory support for the DataLoader: a thread loop that moves fetched
+# batches into page-locked memory, and a recursive pin_memory function that handles tensors and
+# nested containers. No import-time side effects.
 r"""Contains definitions of the methods used by the _BaseDataLoaderIter to put fetched tensors into pinned memory.
 
 These **need** to be in global scope since Py2 doesn't support serializing
@@ -16,6 +19,11 @@ from . import MP_STATUS_CHECK_INTERVAL
 
 
 def _pin_memory_loop(in_queue, out_queue, device_id, done_event, device) -> None:
+    # [FUNCTION DOC] HELPER: Body of the pin-memory thread. Sets the thread's torch thread count
+    # to one, names the thread and selects the accelerator device index. Then repeats until
+    # done_event is set: take an (index, data) pair from in_queue, pin the data unless it is
+    # an ExceptionWrapper (a failure while pinning becomes an ExceptionWrapper), and put the
+    # pair on out_queue, retrying while full until done_event is set. Returns when done.
     # This setting is thread local, and prevents the copy in pin_memory from
     # consuming all CPU cores.
     torch.set_num_threads(1)
@@ -24,6 +32,9 @@ def _pin_memory_loop(in_queue, out_queue, device_id, done_event, device) -> None
     torch.accelerator.set_device_index(device_id)
 
     def do_one_step() -> None:
+        # [FUNCTION DOC] HELPER: Performs one iteration of the loop: waits up to the status
+        # check interval for an input item (returns if none), pins it unless done or already
+        # an error, and forwards the result to out_queue, retrying while the queue is full.
         try:
             r = in_queue.get(timeout=MP_STATUS_CHECK_INTERVAL)
         except queue.Empty:
@@ -53,6 +64,13 @@ def _pin_memory_loop(in_queue, out_queue, device_id, done_event, device) -> None
 
 
 def pin_memory(data, device=None):
+    # [FUNCTION DOC] Returns a copy of data with all tensors moved to pinned memory. Objects with
+    # their own pin_memory method use it; strings and bytes pass through; mappings, tuples
+    # (including named tuples) and sequences are rebuilt recursively, preferring a shallow copy
+    # for mutable containers and falling back to a plain dict or list when the type cannot be
+    # rebuilt. Other objects are returned unchanged. The device argument is passed down
+    # recursively but is not used for tensor pinning.
+    # KNOWN ISSUE: device is never applied to Tensor.pin_memory, so it has no effect.
     if isinstance(data, torch.Tensor):
         return data.pin_memory()
 
