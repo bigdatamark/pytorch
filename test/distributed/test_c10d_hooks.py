@@ -1,4 +1,7 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Two-process gloo tests for ProcessGroup pre/post collective hooks. Checks the hooks
+# fire for each collective type, correlate by op_id, stop after unregistering, and still fire when
+# a make_fx captured graph is replayed. Needs no import-time setup beyond imports.
 
 import os
 
@@ -11,6 +14,9 @@ from torch.testing._internal.common_utils import run_tests
 
 
 class TestProcessGroupHooks(MultiProcessTestCase):
+    # [CLASS DOC] Multi-process test case (world size 2) that spawns workers in setUp and
+    # exercises hooks registered on the default gloo process group; each test builds its own
+    # group from a FileStore on the rendezvous file and destroys it at the end.
     """
     Verify that pre/post collective hooks registered on a ProcessGroup fire for
     every collective issued through it. The hooks are wired into the c10d
@@ -22,10 +28,13 @@ class TestProcessGroupHooks(MultiProcessTestCase):
     """
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: runs the base setup, then spawns the worker processes.
         super().setUp()
         self._spawn_processes()
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: runs base teardown, then removes the rendezvous file, ignoring
+        # any OS error if it is already gone.
         super().tearDown()
         try:
             os.remove(self.file_name)
@@ -34,9 +43,16 @@ class TestProcessGroupHooks(MultiProcessTestCase):
 
     @property
     def world_size(self):
+        # [FUNCTION DOC] HELPER: property; the number of worker processes, always 2.
         return 2
 
     def test_hooks_fire_for_all_collectives(self):
+        # [FUNCTION DOC] Runs in each worker. Registers pre and post hooks (id 0) recording op
+        # name and op_id, issues broadcast, all_reduce, reduce, all_gather variants,
+        # reduce_scatter variants, all_to_all variants, scatter, gather, barrier and send/recv
+        # (ordered by rank parity to avoid deadlock). Asserts each expected HookOpName appears
+        # in both lists, pre and post counts and op_id sequences are equal, and that after
+        # unregistering both hooks a further all_reduce adds no records.
         store = dist.FileStore(self.file_name, self.world_size)
         dist.init_process_group(
             backend="gloo",
@@ -134,6 +150,9 @@ class TestProcessGroupHooks(MultiProcessTestCase):
         dist.destroy_process_group()
 
     def test_hooks_fire_on_captured_graph_replay(self):
+        # [FUNCTION DOC] Runs in each worker. Registers a pre-hook, traces an all_reduce with
+        # make_fx in real mode, asserts the graph contains the raw allreduce_ op, then clears
+        # the records and calls the graph; asserts the ALLREDUCE hook fired on replay.
         # make_fx traces at the dispatcher (op) level and records the raw
         # c10d.allreduce_ op. Replaying that graph re-dispatches the op directly,
         # bypassing ProcessGroup::allreduce -- so this only fires hooks because
@@ -152,6 +171,7 @@ class TestProcessGroupHooks(MultiProcessTestCase):
         pg.register_pre_hook(0, lambda args: pre_ops.append(args.name))
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: all-reduces x in place on the default group and returns it.
             dist.all_reduce(x)
             return x
 

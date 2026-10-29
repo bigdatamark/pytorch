@@ -4,6 +4,10 @@
 # (torch._C._distributed_c10d.NanCheckHook): NaN checking of collective input
 # buffers driven by the ProcessGroup pre-hooks rather than native backend
 # support, so it works for any backend routed through the c10d ops.
+# [MODULE DOC] Defines AbstractNanCheckHookTest, instantiated per backend in C10D_BACKENDS via
+# instantiate_backend_tests under the suite name NanCheckHook. At import it exits with status 0
+# if torch.distributed is unavailable. DETECTING_TESTS lists tests expected to trigger a
+# detection (crash on CUDA).
 
 import os
 import signal
@@ -32,7 +36,13 @@ DETECTING_TESTS = ("test_nan_in_input_detected", "test_env_var_auto_attach")
 
 
 class AbstractNanCheckHookTest(C10dBackendTest):
+    # [CLASS DOC] Two-rank backend test base (from C10dBackendTest) for NanCheckHook, which
+    # checks floating collective input buffers for NaN via pre-hooks. Tests cover detection,
+    # receive buffers being exempt, clean data, default-off and removal, and env var attach.
     def setUp(self):
+        # [FUNCTION DOC] HELPER: after base setup, for CUDA and a method named in
+        # DETECTING_TESTS, sets special_return_code_checks so the unwrapped test is expected to
+        # exit with SIGABRT.
         super().setUp()
         # Set after super().setUp(): MultiProcessTestCase.setUp() resets the
         # dict, and the parent only consults it when joining the children.
@@ -44,6 +54,10 @@ class AbstractNanCheckHookTest(C10dBackendTest):
             }
 
     def _assert_nan_detected(self, tensor):
+        # [FUNCTION DOC] HELPER: all-reduces the tensor and requires NaN detection. On CUDA any
+        # exception (device trap) synchronizes then aborts via an immediate process exit with
+        # SIGABRT, and fails the test if nothing was raised. On other devices requires a
+        # RuntimeError mentioning NaN.
         if self.device_type == "cuda":
             try:
                 dist.all_reduce(tensor)
@@ -59,6 +73,8 @@ class AbstractNanCheckHookTest(C10dBackendTest):
                 dist.all_reduce(tensor)
 
     def test_nan_in_input_detected(self):
+        # [FUNCTION DOC] Attaches the hook to WORLD, runs a warm-up all_reduce, sets one element
+        # of the input to NaN on every rank, and asserts the NaN is detected.
         self._init_pg()
         # The handle is deliberately dropped: the group owns the hook.
         NanCheckHook.attach(dist.group.WORLD)
@@ -71,6 +87,9 @@ class AbstractNanCheckHookTest(C10dBackendTest):
         self._assert_nan_detected(t)
 
     def test_nan_in_recv_buffer_ok(self):
+        # [FUNCTION DOC] With the hook attached, NaNs in pure receive buffers must not trigger:
+        # non-root broadcast buffer, a recv buffer, and all_gather output list. Verifies the
+        # results hold the sent clean values, then removes the hook.
         self._init_pg()
         hook = NanCheckHook.attach(dist.group.WORLD)
 
@@ -104,6 +123,8 @@ class AbstractNanCheckHookTest(C10dBackendTest):
         hook.remove()
 
     def test_legitimate_data_not_flagged(self):
+        # [FUNCTION DOC] With the hook attached, all_reduce of finite float data (sum 3 across
+        # two ranks) and int64 data (non-float, skipped) succeeds with correct results.
         self._init_pg()
         hook = NanCheckHook.attach(dist.group.WORLD)
 
@@ -120,6 +141,8 @@ class AbstractNanCheckHookTest(C10dBackendTest):
         hook.remove()
 
     def test_off_by_default_and_removable(self):
+        # [FUNCTION DOC] A NaN all_reduce succeeds with no hook attached, and again after
+        # attaching and immediately removing a hook; synchronizes on CUDA.
         self._init_pg()
 
         t = torch.ones(8, device=self.device)
@@ -132,6 +155,9 @@ class AbstractNanCheckHookTest(C10dBackendTest):
             torch.cuda.synchronize()
 
     def test_env_var_auto_attach(self):
+        # [FUNCTION DOC] Sets TORCH_DIST_NAN_CHECK to 1 only around process group init (always
+        # deleted afterwards), relying on auto-attach with no Python-held handle. A clean
+        # all_reduce passes, then a NaN input must be detected.
         os.environ["TORCH_DIST_NAN_CHECK"] = "1"
         try:
             self._init_pg()

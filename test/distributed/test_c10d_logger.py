@@ -1,4 +1,8 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests for the c10d exception logger decorator. At import it exits the process
+# silently (status 0) if torch.distributed is unavailable or dev-asan is enabled, and computes
+# WORLD_SIZE (2 to 4, from the accelerator device count). Defines a with_comms decorator and
+# C10dErrorLoggerTest, which checks the logger's handler and the logged message content.
 
 import json
 import logging
@@ -33,6 +37,9 @@ WORLD_SIZE = min(4, max(2, torch.get_device_module(device_type).device_count()))
 
 
 def with_comms(func=None):
+    # [FUNCTION DOC] HELPER: decorator for test methods. Usable with or without call parentheses.
+    # The wrapper exits with the multi-gpu skip code if fewer devices than world_size exist,
+    # otherwise creates the process group, runs the test, then destroys the comms.
     if func is None:
         return partial(
             with_comms,
@@ -40,6 +47,8 @@ def with_comms(func=None):
 
     @wraps(func)
     def wrapper(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: skip-or-run wrapper; extra args are ignored, the test is
+        # called with self only, and its return value is discarded.
         if torch.get_device_module(device_type).device_count() < self.world_size:
             sys.exit(TEST_SKIPS[f"multi-gpu-{self.world_size}"].exit_code)
         self.create_pg(device_type)
@@ -50,31 +59,43 @@ def with_comms(func=None):
 
 
 class C10dErrorLoggerTest(DistributedTestBase):
+    # [CLASS DOC] Distributed test case with WORLD_SIZE ranks verifying that _exception_logger
+    # logs failure details to _c10d_logger at debug level and still re-raises.
     @property
     def world_size(self):
+        # [FUNCTION DOC] HELPER: property; the module-level WORLD_SIZE.
         return WORLD_SIZE
 
     @property
     def process_group(self):
+        # [FUNCTION DOC] HELPER: property; the default (WORLD) process group.
         return dist.group.WORLD
 
     def destroy_comms(self):
+        # [FUNCTION DOC] HELPER: barriers across all ranks, then destroys the default group.
         # Wait for all ranks to reach here before starting shutdown.
         dist.barrier()
         dist.destroy_process_group()
 
     def test_get_or_create_logger(self):
+        # [FUNCTION DOC] Asserts the c10d logger exists and has exactly one handler, a
+        # NullHandler.
         self.assertIsNotNone(_c10d_logger)
         self.assertEqual(1, len(_c10d_logger.handlers))
         self.assertIsInstance(_c10d_logger.handlers[0], logging.NullHandler)
 
     @_exception_logger
     def _failed_broadcast_raise_exception(self):
+        # [FUNCTION DOC] HELPER: broadcasts with an out-of-range source rank, so the error
+        # propagates; the decorator logs it and re-raises.
         tensor = torch.arange(2, dtype=torch.int64)
         dist.broadcast(tensor, self.world_size + 1)
 
     @_exception_logger
     def _failed_broadcast_not_raise_exception(self):
+        # [FUNCTION DOC] HELPER: same invalid broadcast, but the exception is caught and
+        # swallowed inside, so nothing propagates out of this method; the decorator on it
+        # itself therefore logs nothing.
         try:
             tensor = torch.arange(2, dtype=torch.int64)
             dist.broadcast(tensor, self.world_size + 1)
@@ -83,6 +104,12 @@ class C10dErrorLoggerTest(DistributedTestBase):
 
     @with_comms
     def test_exception_logger(self) -> None:
+        # [FUNCTION DOC] Asserts the raising helper raises. Then captures debug logs while the
+        # swallowing helper runs, parses the first captured message as a mapping, and checks
+        # its size (9 keys on NCCL, else 8) and the values of pg_name, func_name, backend,
+        # nccl_version (NCCL only), group_size, world_size, global_rank and local_rank.
+        # The logged record comes from the logger decorator on the inner broadcast call, since
+        # the helper swallows its own exception.
         with self.assertRaises(Exception):
             self._failed_broadcast_raise_exception()
 
