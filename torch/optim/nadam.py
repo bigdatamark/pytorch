@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] NAdam optimizer (Adam with Nesterov momentum): the NAdam class, the
+# functional entry point nadam, and single-tensor and multi-tensor (foreach) implementations
+# of the update.
+# Import-time side effects: after the class is defined its __doc__ is assigned a long string
+# containing the algorithm in math form and shared argument documentation. Exports NAdam and
+# nadam.
 r"""Implementation for the NAdam algorithm."""
 
 from typing import cast
@@ -30,6 +36,12 @@ __all__ = ["NAdam", "nadam"]
 
 
 class NAdam(Optimizer):
+    # [CLASS DOC] Optimizer implementing NAdam. Per-parameter state: step and mu_product
+    # (scalar tensors, on the parameter device only when capturable, else CPU), exp_avg and
+    # exp_avg_sq (same shape as the parameter). Group options: lr, betas, eps, weight_decay,
+    # momentum_decay, decoupled_weight_decay, maximize, foreach, capturable, differentiable.
+    # Key methods: step gathers tensors per group and calls the functional nadam; the class
+    # docstring is set after the class body.
     def __init__(
         self,
         params: ParamsT,
@@ -45,6 +57,12 @@ class NAdam(Optimizer):
         capturable: bool = False,
         differentiable: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Validate hyperparameters and register the param groups. Raises
+        # ValueError for a multi-element tensor lr, or a negative lr, eps, weight_decay or
+        # momentum_decay, or a beta outside the range zero to one (upper bound exclusive).
+        # Builds the defaults mapping and calls the base optimizer constructor. Args:
+        # params, lr, betas, eps, weight_decay, momentum_decay, decoupled_weight_decay, and
+        # keyword-only foreach, maximize, capturable, differentiable.
         if isinstance(lr, Tensor) and lr.numel() != 1:
             raise ValueError("Tensor lr must be 1-element")
         if not 0.0 <= lr:
@@ -74,6 +92,10 @@ class NAdam(Optimizer):
         super().__init__(params, defaults)
 
     def __setstate__(self, state):
+        # [FUNCTION DOC] Restore after unpickling or loading state. Fills in defaults for
+        # options missing from older checkpoints in every group, and converts any non-tensor
+        # step and mu_product entries in the per-parameter state to scalar tensors (on the
+        # parameter device if capturable, else CPU). Mutates self.
         super().__setstate__(state)
         for group in self.param_groups:
             group.setdefault("maximize", False)
@@ -113,6 +135,11 @@ class NAdam(Optimizer):
         mu_products,
         state_steps,
     ):
+        # [FUNCTION DOC] HELPER: Collect the tensors of one param group that have gradients
+        # into the given output lists (params, grads, exp_avgs, exp_avg_sqs, mu_products,
+        # state_steps), lazily creating state on first use. Raises RuntimeError for sparse
+        # gradients. Returns whether any parameter with a gradient is complex. Mutates the
+        # lists and the optimizer state.
         has_complex = False
         for p in group["params"]:
             if p.grad is not None:
@@ -155,6 +182,11 @@ class NAdam(Optimizer):
 
     @_use_grad_for_differentiable
     def step(self, closure=None):
+        # [FUNCTION DOC] Perform one optimization step. Args: closure (optional callable re-
+        # evaluating the model; run with gradients enabled). Runs a graph-capture health
+        # check, then for each group gathers tensors and invokes the functional nadam with
+        # the group's options. Updates parameters and state in place. Returns the closure's
+        # loss or None.
         """Perform a single optimization step.
 
         Args:
@@ -298,6 +330,18 @@ def _single_tensor_nadam(
     differentiable: bool,
     has_complex: bool,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Per-tensor NAdam update. For each parameter: negates the
+    # gradient if maximize, views complex tensors as real, increments the step tensor,
+    # applies weight decay (decoupled: scales the parameter; otherwise adds to the
+    # gradient), computes the momentum cache values for this and the next step, multiplies
+    # mu_product, updates the first and second moment averages and applies the two Nesterov-
+    # style updates to the parameter. Uses tensor arithmetic when capturable or
+    # differentiable so autograd or graph capture can follow, otherwise scalar values.
+    # Raises AssertionError if capturable is set but tensors are not on a supported device.
+    # Mutates params, exp_avgs, exp_avg_sqs, mu_products and state_steps in place. Returns
+    # nothing.
+    # KNOWN ISSUE: the has_complex argument is unused here; complexness is checked per
+    #     parameter.
     if not torch.jit.is_scripting():
         lr = _to_scalar(lr)
 
@@ -400,6 +444,13 @@ def _multi_tensor_nadam(
     differentiable: bool,
     has_complex: bool,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Batched (foreach) NAdam update with the same math as the
+    # single-tensor version. Returns immediately for an empty list. Raises AssertionError if
+    # differentiable is set, or if capturable is set and tensors are on unsupported devices.
+    # Groups tensors by device and dtype, optionally views complex tensors as real, updates
+    # steps, applies weight decay, updates moment averages, computes the bias corrections,
+    # mu values and step sizes (as tensors when capturable, scalars otherwise) and applies
+    # the two addcdiv-style parameter updates. Mutates inputs in place; returns nothing.
     if len(params) == 0:
         return
 
@@ -627,6 +678,13 @@ def nadam(
     momentum_decay: float,
     eps: float,
 ) -> None:
+    # [FUNCTION DOC] Functional NAdam entry point. Raises RuntimeError if state_steps or
+    # mu_products contain non-tensors, or if foreach is requested under scripting. If
+    # foreach is None it is chosen automatically. Dispatches to the multi-tensor or the
+    # single-tensor implementation (scripting forces single-tensor) with the given options
+    # and updates the tensors in place. Returns nothing.
+    # Note the unusual argument order: several options with defaults precede the keyword-
+    # only beta1, beta2, lr, weight_decay, momentum_decay and eps.
     r"""Functional API that performs NAdam algorithm computation.
 
     See :class:`~torch.optim.NAdam` for details.
