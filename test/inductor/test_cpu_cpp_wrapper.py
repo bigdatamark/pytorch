@@ -1,4 +1,9 @@
 # Owner(s): ["oncall: cpu inductor"]
+# [MODULE DOC] Runs selected Inductor CPU tests (from the torchinductor, CPU repro, select-
+# algorithm and mkldnn pattern matcher modules) under the cpp_wrapper config, with and without
+# dynamic shapes. Import-time effects: imports sibling test modules (exits or re-raises if they
+# skip), decides RUN_CPU, and, when true, builds test lists, registers generated tests on
+# CppWrapperTemplate and copies them into TestCppWrapper and the dynamic shapes class.
 import sys
 import unittest
 from typing import NamedTuple
@@ -50,14 +55,20 @@ RUN_CPU = (
 
 
 class CppWrapperTemplate:
+    # [CLASS DOC] HELPER: empty holder class that receives the generated cpp_wrapper test
+    # functions via setattr; its content is then copied into concrete test classes.
     pass
 
 
 class TestCppWrapper(InductorTestCase):
+    # [CLASS DOC] Concrete CPU test case for the cpp_wrapper tests; tests are copied in with the
+    # cpp_wrapper suffix at import time. Uses device cpu.
     device = "cpu"
 
 
 class DynamicShapesCppWrapperCpuTests(InductorTestCase):
+    # [CLASS DOC] Concrete CPU test case for the dynamic-shapes variant of the cpp_wrapper tests.
+    # Uses device cpu.
     device = "cpu"
 
 
@@ -100,6 +111,12 @@ def make_test_case(
     code_string_count=None,
     test_build_separate=False,
 ):
+    # [FUNCTION DOC] HELPER: builds a cpp_wrapper version of an existing test and, if condition is
+    # true, registers it on CppWrapperTemplate. Looks up the test as name plus device suffix on
+    # the given test instance (AssertionError if not callable), optionally wraps it as a slow
+    # test, and appends a separate-build suffix to the name when test_build_separate is set. The
+    # wrapper copies the original function attributes. func_inputs are passed to the test and
+    # code_string_count maps strings to their required occurrence counts in generated code.
     test_name = f"{name}_{device}" if device else name
     if code_string_count is None:
         code_string_count = {}
@@ -115,6 +132,11 @@ def make_test_case(
         cpp_wrapper_build_separate=test_build_separate,
     )
     def fn(self):
+        # [FUNCTION DOC] HELPER: generated test body. Enables cpp_wrapper (and separate build when
+        # requested), runs class and instance setup, then with the dispatch key included runs the
+        # original test via run_and_get_cpp_code. When code is produced it checks kernel_src
+        # (separate build only), CppWrapperCodeCache, and the expected string counts. Always runs
+        # teardown.
         tests.setUpClass()
         tests.setUp()
         try:
@@ -158,6 +180,9 @@ def make_test_case(
 if RUN_CPU:
 
     class BaseTest(NamedTuple):
+        # [CLASS DOC] HELPER: named tuple describing one test to wrap: test name, device suffix,
+        # test instance providing it, whether to generate it, slow flag, function inputs, expected
+        # code string counts and whether to build separately.
         name: str
         device: str = "cpu"
         tests: InductorTestCase = test_torchinductor.CpuTests()

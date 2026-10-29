@@ -1,4 +1,7 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests the hipify step for generated C++ wrapper code: checks CUDA driver types in
+# snippets and in the CUDA kernel driver header are rewritten to HIP equivalents, and that
+# hipifying is idempotent. Module-level lists hold the input and expected snippets.
 import torch
 from torch._inductor.codegen.aoti_hipify_utils import maybe_hipify_code_wrapper
 from torch._inductor.codegen.common import get_device_op_overrides
@@ -26,7 +29,11 @@ HIP_CODES = [
 
 
 class TestCppWrapperHipify(TestCase):
+    # [CLASS DOC] Tests for maybe_hipify_code_wrapper applied to AOTI C++ wrapper source text.
     def test_hipify_basic_declaration(self) -> None:
+        # [FUNCTION DOC] Raises AssertionError if the input and expected snippet lists differ in
+        # length; then hipifies each CUDA snippet with hipify forced on and compares to the HIP
+        # snippet.
         if len(TEST_CODES) != len(HIP_CODES):
             raise AssertionError(
                 f"TEST_CODES length {len(TEST_CODES)} != HIP_CODES length {len(HIP_CODES)}"
@@ -37,6 +44,10 @@ class TestCppWrapperHipify(TestCase):
             self.assertEqual(result, expected)
 
     def test_hipify_aoti_driver_header(self) -> None:
+        # [FUNCTION DOC] Hipifies the CUDA kernel driver header from the cuda device op overrides,
+        # forced on, and compares (ignoring trailing whitespace) with an expected HIP header. On
+        # ROCm builds the expected text uses the device warp size in place of 32 in the launch
+        # computation.
         cuda_codegen = get_device_op_overrides("cuda")
         header = cuda_codegen.kernel_driver()
         expected = """
@@ -132,6 +143,9 @@ class TestCppWrapperHipify(TestCase):
         self.assertEqual(result.rstrip(), expected.rstrip())
 
     def test_hipify_cross_platform(self) -> None:
+        # [FUNCTION DOC] Raises AssertionError if the snippet lists differ in length. For each
+        # snippet compares the default hipify result with the forced one when running on ROCm, and
+        # with the unchanged input otherwise.
         if len(TEST_CODES) != len(HIP_CODES):
             raise AssertionError(
                 f"TEST_CODES length {len(TEST_CODES)} != HIP_CODES length {len(HIP_CODES)}"
