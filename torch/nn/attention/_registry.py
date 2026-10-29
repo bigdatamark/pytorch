@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Process-global registry of flash attention implementations (FA3, FA4, third-party). Holds
+# a mapping from name to registration callable and the currently active (name, handle) pair.
+# Provides register, activate, list, current and restore functions. No import-time side effects.
 """Registry for flash attention implementations.
 
 This module contains the registration system for flash attention implementations.
@@ -14,6 +18,9 @@ logger = logging.getLogger(__name__)
 
 
 class FlashAttentionHandle(Protocol):
+    # [CLASS DOC]
+    # Structural protocol for the object a registration callable may return; it keeps state
+    # alive and offers a method that undoes the dispatcher registration.
     def remove(self) -> None: ...
 
 
@@ -30,6 +37,9 @@ def register_flash_attention_impl(
     *,
     register_fn: _RegisterFn,
 ) -> None:
+    # [FUNCTION DOC]
+    # Store register_fn under the name impl in the global registry mapping, replacing any
+    # earlier entry of that name. Does not call register_fn or activate anything.
     """
     Register the callable that activates a flash attention impl.
 
@@ -61,6 +71,12 @@ def register_flash_attention_impl(
 def activate_flash_attention_impl(
     impl: str | _FlashAttentionImpl,
 ) -> None:
+    # [FUNCTION DOC]
+    # Activate the registered implementation named impl. First restores any previously
+    # active override (silently). Raises ValueError listing available names if impl is not
+    # registered. Calls the registration callable with no arguments; if it returns a handle,
+    # records (impl, handle) as the active implementation. If it returns nothing, no active
+    # state is recorded (so current_flash_attention_impl reports none).
     """
     Activate into the dispatcher a previously registered flash attention impl.
 
@@ -100,11 +116,13 @@ def activate_flash_attention_impl(
 
 
 def list_flash_attention_impls() -> list[str]:
+    # [FUNCTION DOC] Return the sorted list of registered implementation names.
     """Return the names of all available flash attention implementations."""
     return sorted(_FLASH_ATTENTION_IMPLS.keys())
 
 
 def current_flash_attention_impl() -> str | None:
+    # [FUNCTION DOC] Return the name of the active implementation, or None if none is active.
     """
     Return the currently activated flash attention impl name, if any.
 
@@ -118,6 +136,10 @@ def current_flash_attention_impl() -> str | None:
 
 
 def restore_flash_attention_impl(_raise_warn: bool = True) -> None:
+    # [FUNCTION DOC]
+    # Undo the active override: call remove on the stored handle and clear the active
+    # state. If nothing is active and _raise_warn is true, logs a warning (not an error).
+    # KNOWN ISSUE: the name _raise_warn suggests raising but it only logs a warning.
     """
     Restore the default FA2 implementation
     """

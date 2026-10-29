@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [PACKAGE DOC]
+# Public package for controlling scaled dot product attention (SDPA). Exports the SDPBackend
+# enum, the sdpa_kernel context manager that temporarily enables chosen SDPA backends (and
+# optionally their priority order), the WARN_FOR_UNFUSED_KERNELS flag, and re-exports the
+# flash attention implementation registry functions. Import-time side effects: renames the
+# module and name of SDPBackend, rewrites __module__ of the registry functions, and imports
+# the _fa3 and _fa4 submodules so the built-in implementations self-register.
 """This module contains functions and classes that alter the behavior of torch.nn.functional.scaled_dot_product_attention"""
 
 import contextlib
@@ -57,6 +64,10 @@ SDPBackend.__name__ = "SDPBackend"
 
 
 def _raise_kernel_warnings(params: SDPAParams) -> None:
+    # [FUNCTION DOC] HELPER: only when the module flag WARN_FOR_UNFUSED_KERNELS is true,
+    # check whether efficient and flash attention can be used for params; for each that
+    # cannot, emit a warning and then re-query with the verbose flag so the reasons are
+    # also reported. Does nothing when the flag is false. Returns nothing.
     """
     If WARN_FOR_UNFUSED_KERNELS is set to True, this will raise warnings
     for all the reasons why the fused kernels can't be run. If using subclasses
@@ -80,10 +91,15 @@ _backend_names = {
 
 
 def _backend_from_string(name: str):
+    # [FUNCTION DOC] HELPER: look up an SDPBackend enum member by its attribute name.
+    # Raises AttributeError if the name is not a member.
     return getattr(SDPBackend, name)
 
 
 def _cur_sdpa_kernel_backends(with_priority: bool = False):
+    # [FUNCTION DOC] HELPER: return the list of SDPBackend members whose global enable
+    # flag is currently on (queried from the C++ runtime). If with_priority is true, the
+    # list is sorted by the current global priority order. Read-only.
     backends = []
     for name, val in _backend_names.items():
         if getattr(torch._C, f"_get_{name}_sdp_enabled")():
@@ -97,6 +113,10 @@ def _cur_sdpa_kernel_backends(with_priority: bool = False):
 
 
 def _sdpa_kernel(backends: Iterable, set_priority: bool = False) -> None:
+    # [FUNCTION DOC] HELPER: mutate global SDPA state. Enables exactly the known backends
+    # present in backends and disables the others. If set_priority is true, sets the global
+    # priority order to the given backends in order (assumed unique), followed by the
+    # remaining previously ordered backends. Returns nothing.
     for name, val in _backend_names.items():
         enabled = getattr(SDPBackend, val) in backends
         getattr(torch._C, f"_set_sdp_use_{name}")(enabled)
@@ -112,6 +132,13 @@ def _sdpa_kernel(backends: Iterable, set_priority: bool = False) -> None:
 
 @contextlib.contextmanager
 def sdpa_kernel(backends: list[SDPBackend] | SDPBackend, set_priority: bool = False):
+    # [FUNCTION DOC]
+    # Context manager (generator based). Accepts one SDPBackend or a list; de-duplicates while
+    # keeping order. Records the currently enabled backends, enables only the requested ones
+    # (and sets priority order if set_priority), yields an empty mapping, and on exit (even
+    # on error) restores the previous enabled set (and priority). Raises AssertionError if
+    # backends is neither a list nor an SDPBackend. Mutates process-global SDPA flags.
+    # KNOWN ISSUE: the docstring says exit enables all backends, but code restores the prior state.
     r"""
     Context manager to select which backend to use for scaled dot product attention.
 
@@ -166,11 +193,14 @@ def sdpa_kernel(backends: list[SDPBackend] | SDPBackend, set_priority: bool = Fa
 # variadic version of sdpa_kernel for dynamo to use while reconstructing
 @contextlib.contextmanager
 def _sdpa_kernel_variadic(*backends: SDPBackend):
+    # [FUNCTION DOC] HELPER: context manager taking backends as positional arguments;
+    # delegates to sdpa_kernel with a list (no priority). Used by dynamo reconstruction.
     with sdpa_kernel(list(backends)):
         yield
 
 
 def _get_flash_version() -> str:
+    # [FUNCTION DOC] HELPER: return the hard-coded flash attention version string (2.5.7).
     """This returns the closest matching tag for the flash attention backend"""
     return "2.5.7"
 

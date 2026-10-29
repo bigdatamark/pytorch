@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Scaled dot product attention (SDPA) for jagged-layout nested tensors. Provides input
+# validation, nested-specific kernel eligibility checks (flash, efficient, cuDNN, math),
+# backend selection, preprocessing that flattens jagged tensors into packed buffers with
+# cumulative sequence lengths, autocast handling, and the entry point
+# jagged_scaled_dot_product_attention that dispatches to the chosen kernel. No import-time
+# side effects beyond creating a module logger.
 import logging
 
 import torch
@@ -31,6 +38,12 @@ def _validate_sdpa_input(
     is_causal=False,
     scale=None,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: validate SDPA inputs for jagged nested tensors; returns nothing. Raises
+    # ValueError if q/k/v are not all NestedTensor, differ in dtype or device, have fewer than
+    # 3 dimensions, are ragged on different dimensions, or if attn_mask is given (masks are
+    # not supported). dropout_p, is_causal and scale are not checked.
+    # KNOWN ISSUE: the mask dtype check after the unconditional raise is unreachable dead code.
     if (
         not isinstance(query, NestedTensor)
         or not isinstance(key, NestedTensor)
@@ -74,6 +87,8 @@ def _validate_sdpa_input(
 
 
 def _check_batch_size_nested(params: SDPAParams, debug=False) -> bool:
+    # [FUNCTION DOC] HELPER: return true if query, key and value have the same batch size
+    # (dimension 0). The debug argument is accepted but unused (no logging).
     # This is expected to be called after check_tensor_shapes ensuring that the
     # size() calls won't error since the inputs are all 4 dimensional
     q_batch_size = params.query.size(0)
@@ -87,6 +102,9 @@ def _check_batch_size_nested(params: SDPAParams, debug=False) -> bool:
 
 
 def _check_head_dim_size_flash_nested(params: SDPAParams, debug=False) -> bool:
+    # [FUNCTION DOC] HELPER: return true if q, k, v share the same last dimension, which is a
+    # multiple of 8 and at most 256 (flash limit). Otherwise returns false, logging a warning
+    # with the sizes when debug is true.
     max_size = 256
     query_size_last = params.query.size(-1)
     key_size_last = params.key.size(-1)
@@ -113,6 +131,9 @@ def _check_head_dim_size_flash_nested(params: SDPAParams, debug=False) -> bool:
 
 
 def _check_head_dim_size_cudnn_nested(params: SDPAParams, debug=False) -> bool:
+    # [FUNCTION DOC] HELPER: same as the flash head-dimension check but with a limit of 128
+    # for cuDNN: q, k, v share the last dimension, a multiple of 8, at most 128. Returns
+    # false (with a warning when debug is true) otherwise.
     max_size = 128
     query_size_last = params.query.size(-1)
     key_size_last = params.key.size(-1)
@@ -141,6 +162,9 @@ def _check_head_dim_size_cudnn_nested(params: SDPAParams, debug=False) -> bool:
 def _check_for_seq_len_0_and_consistent_head_dim_nested_helper(
     param: torch.Tensor, param_name: str, debug=False
 ) -> bool:
+    # [FUNCTION DOC] HELPER: for one nested input, return false (warning if debug) when the
+    # ragged dimension is the num_heads dimension or when the minimum sequence length is 0;
+    # else true. Raises AssertionError if param is not a NestedTensor.
     if not isinstance(param, NestedTensor):
         raise AssertionError("param should be a jagged NT")
 
@@ -166,6 +190,8 @@ def _check_for_seq_len_0_and_consistent_head_dim_nested_helper(
 
 
 def _try_broadcast_param_size(q_size, k_size, v_size, param_name, debug=False) -> bool:
+    # [FUNCTION DOC] HELPER: return true if the three sizes are broadcast compatible, i.e. each
+    # equals the maximum or is 1. Otherwise false, with a warning naming param_name if debug.
     max_size = max(q_size, k_size, v_size)
     if (
         (q_size != max_size and q_size != 1)
@@ -189,6 +215,11 @@ def _try_broadcast_param_size(q_size, k_size, v_size, param_name, debug=False) -
 
 
 def _check_for_seq_len_0_nested(params: SDPAParams, debug=False) -> bool:
+    # [FUNCTION DOC] HELPER: check each nested input among query/key/value (non-nested ones are
+    # skipped) for a ragged num_heads dimension or zero-length sequences, short-circuiting on the
+    # first failure. Then, if the head counts differ: false when any input requires grad
+    # (training with broadcast is unsupported), else true only if the head counts are
+    # broadcast compatible. Returns true when all checks pass. Logs warnings if debug.
     # When this function is called we are assured that the nt is dim==4
     q_is_safe = (
         _check_for_seq_len_0_and_consistent_head_dim_nested_helper(
@@ -248,6 +279,9 @@ def _check_for_seq_len_0_nested(params: SDPAParams, debug=False) -> bool:
 
 
 def _check_query_seq_len_cudnn_nested(params: SDPAParams, debug=False) -> bool:
+    # [FUNCTION DOC] HELPER: return false (warning if debug) when the nested query's maximum
+    # sequence length is 128 or less, since cuDNN attention does not support that; else true.
+    # Raises AssertionError if the query is not a NestedTensor.
     query = params.query
     if not isinstance(query, NestedTensor):
         raise AssertionError("query should be a jagged NT")
@@ -263,6 +297,8 @@ def _check_query_seq_len_cudnn_nested(params: SDPAParams, debug=False) -> bool:
 
 
 def _can_use_flash_sdpa_jagged(params: SDPAParams, debug=False) -> bool:
+    # [FUNCTION DOC] HELPER: true if batch size, flash head dimension and seq-len-0 constraints
+    # all hold for the nested inputs; stops at the first failing constraint.
     constraints = (
         _check_batch_size_nested,
         _check_head_dim_size_flash_nested,
@@ -275,6 +311,8 @@ def _can_use_flash_sdpa_jagged(params: SDPAParams, debug=False) -> bool:
 
 
 def _can_use_efficient_sdpa_jagged(params: SDPAParams, debug=False) -> bool:
+    # [FUNCTION DOC] HELPER: true if the batch size and seq-len-0 constraints hold for the
+    # nested inputs; stops at the first failing constraint.
     constraints = (
         _check_batch_size_nested,
         _check_for_seq_len_0_nested,
@@ -286,6 +324,8 @@ def _can_use_efficient_sdpa_jagged(params: SDPAParams, debug=False) -> bool:
 
 
 def _can_use_cudnn_sdpa_jagged(params: SDPAParams, debug=False) -> bool:
+    # [FUNCTION DOC] HELPER: true if batch size, cuDNN head dimension, seq-len-0 and cuDNN
+    # minimum query length constraints all hold; stops at the first failing constraint.
     constraints = (
         _check_batch_size_nested,
         _check_head_dim_size_cudnn_nested,
@@ -299,6 +339,8 @@ def _can_use_cudnn_sdpa_jagged(params: SDPAParams, debug=False) -> bool:
 
 
 def _can_use_math_sdpa_jagged(params: SDPAParams, debug=False) -> bool:
+    # [FUNCTION DOC] HELPER: true if the transposed query, key and value are all contiguous and
+    # is_causal is false; otherwise false (with warnings when debug is true).
     if (
         not params.query.transpose(1, 2).is_contiguous()
         or not params.key.transpose(1, 2).is_contiguous()
@@ -319,6 +361,13 @@ def _can_use_math_sdpa_jagged(params: SDPAParams, debug=False) -> bool:
 
 
 def _select_sdp_backend(query, key, value, attn_mask, dropout, is_causal, enable_gqa):
+    # [FUNCTION DOC]
+    # HELPER: choose an SDPBackend for nested inputs. Returns ERROR immediately if all of the
+    # flash, efficient, math and cuDNN backends are globally disabled. Otherwise tries, in the
+    # order flash, efficient, math, cuDNN, returning the first whose generic and nested-specific
+    # eligibility checks pass (math also requires being enabled). If none qualify, logs
+    # warnings explaining each rejection and returns ERROR.
+    # KNOWN ISSUE: the iteration order is hard coded and ignores the user configured priority order.
     if (
         not flash_sdp_enabled()
         and not mem_efficient_sdp_enabled()
@@ -367,6 +416,12 @@ def _select_sdp_backend(query, key, value, attn_mask, dropout, is_causal, enable
 
 
 def _cumulative_and_max_seq_len_nnz(qkv: torch.Tensor) -> tuple[torch.Tensor, int, int]:
+    # [FUNCTION DOC]
+    # HELPER: compute packed-kernel metadata for a jagged nested tensor. Returns (cumulative
+    # sequence lengths as int32 on the tensor's device, maximum sequence length, total number
+    # of elements along the ragged dimension). Uses the offsets directly when no lengths are
+    # stored; otherwise takes the cumulative sum of lengths (which forces a device-to-host
+    # sync for the total). Raises ValueError if qkv is not a NestedTensor.
     # This function is used to calculate two pieces of metadata that are needed
     # for use with flash-attention and efficient_attention kernels. They are the
     # cumulative sequence_length over a batch of sequences and the maximum
@@ -394,6 +449,11 @@ def _cumulative_and_max_seq_len_nnz(qkv: torch.Tensor) -> tuple[torch.Tensor, in
 
 
 def _is_safe_to_get_storage_as_tensor(tensor: torch.Tensor) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: decide whether a transposed nested tensor can be viewed as packed storage without
+    # a contiguous copy. Returns true if there is at most one component; otherwise true only if
+    # the strides after the first are strictly descending. Raises AssertionError if not a NestedTensor.
+    # KNOWN ISSUE: the comment text mentions checking storage offset differences, but only strides are checked.
     # This function checks if a nested tensor is valid for
     # use with the flash-attention and efficient_attention kernels without
     # needing to call contiguous on the nested tensor input.
@@ -428,6 +488,8 @@ def _is_safe_to_get_storage_as_tensor(tensor: torch.Tensor) -> bool:
 def _view_as_dense(
     tensor: torch.Tensor, Nnz: int, num_heads: int, head_dim: int
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: return the packed dense buffer of a tensor: the values of a nested
+    # tensor, or a dense tensor viewed with shape (Nnz, num_heads, head_dim).
     if tensor.is_nested:
         return tensor.values()
     return tensor.view(Nnz, num_heads, head_dim)
@@ -576,6 +638,14 @@ def _view_as_dense(
 
 
 def _sdpa_nested_preprocessing(query, key, value):
+    # [FUNCTION DOC]
+    # HELPER: prepare jagged nested q/k/v (batch, heads, ragged seq, dim) for packed kernels.
+    # Transposes to (batch, ragged seq, heads, dim), computes cumulative and max sequence
+    # lengths for query and key, copies to contiguous only when the layout is not directly
+    # viewable, and returns the packed buffers for q, k, v, the two cumulative length tensors,
+    # the two max lengths, and a mapping (offsets, lengths, max/min seqlen) used to rebuild the
+    # output nested tensor. Raises RuntimeError if batch sizes or head counts differ (broadcast
+    # not implemented). Assumes key and value share the same total length.
     # Query (Batch x Num_heads x {Q_seq_len}  x Dim_per_head)
     # Key   (Batch x Num_heads x {KV_seq_len} x Dim_per_head)
     # Value (Batch x Num_heads x {KV_seq_len} x Dim_per_head)
@@ -652,6 +722,9 @@ def _sdpa_nested_preprocessing(query, key, value):
 def _pad_last_dim(
     tensor: torch.Tensor, alignment_size: int, slice: bool
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: zero-pad the last dimension up to a multiple of alignment_size
+    # (no-op if already aligned). If slice is true, return a view cut back to the original
+    # size (so padding exists only in storage); otherwise return the padded tensor.
     # FlashAttentionV2 requires that head dimension be a multiple of 8
     # This was previously done within the kernel, however
     # This causes the kernel to maybe alias query, key, value
@@ -669,18 +742,24 @@ def _pad_last_dim(
 
 # TODO: coalesce with torch/nn/utils/attention.py
 def _calculate_scale(query, scale):
+    # [FUNCTION DOC] HELPER: return scale if given, else the default softmax scale: the symbolic
+    # square root of one over the query's last dimension size.
     # TODO: Investigate why math.sqrt() isn't properly handled by Dynamo?
     softmax_scale = scale if scale is not None else torch.sym_sqrt(1.0 / query.size(-1))
     return softmax_scale
 
 
 def _post_process_flash_output(out: torch.Tensor, og_size):
+    # [FUNCTION DOC] HELPER: for a non-nested output whose last dimension differs from og_size,
+    # return a slice keeping the first og_size entries; otherwise return it unchanged.
     if not out.is_nested and out.size(-1) != og_size:
         out = out[..., 0:og_size]
     return out
 
 
 def _is_computing_meta_flops(x):
+    # [FUNCTION DOC] HELPER: true if x is on the meta device (and not scripting) and the
+    # flop counter dispatch mode is active in the current dispatch mode stack; else false.
     # Note: there's a use case of using meta tensors & the dispatch-based flop counter.
     # We can use this function to check for this scenario in order to handle it specially.
     if not torch.jit.is_scripting() and x.device.type == "meta":
@@ -700,6 +779,11 @@ def _autocast(
     value: torch.Tensor,
     attn_mask: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    # [FUNCTION DOC]
+    # HELPER: manually apply autocast to q, k, v and the optional mask before backend
+    # selection. Returns the inputs unchanged for meta-device flop counting or when autocast
+    # is disabled for the device type. Otherwise converts each non-None floating point input
+    # (except float64 or already-target dtype) to the autocast dtype and returns the 4-tuple.
     """
     [Autocasting SDPA for NJT]
 
@@ -726,6 +810,8 @@ def _autocast(
         return query, key, value, attn_mask
 
     def cvt(x):
+        # [FUNCTION DOC] HELPER: return x unchanged if None, non-floating, float64 or already the
+        # autocast dtype; otherwise return x converted to the device's autocast dtype.
         if x is None:
             return x
         target_dtype = torch.get_autocast_dtype(device_type)
@@ -750,6 +836,16 @@ def jagged_scaled_dot_product_attention(
     scale=None,
     enable_gqa=False,
 ):
+    # [FUNCTION DOC]
+    # Scaled dot product attention for jagged nested tensors. Applies autocast, validates inputs
+    # (ValueError for bad inputs or any attn_mask), then: if the ragged dimension is not the
+    # sequence dimension (ragged index 1, 4 or more dims), runs dense SDPA on the underlying
+    # values and rewraps the result as nested. Otherwise selects a backend and runs flash
+    # (head dim padded to a multiple of 8, then sliced), efficient, cuDNN, or the math path
+    # (jagged converted to strided nested and back). Returns a jagged nested tensor of the
+    # attention output. Raises RuntimeError if no backend is viable.
+    # KNOWN ISSUE: enable_gqa is used for backend selection only and is not passed on to the
+    # dense-values path; the math path never uses the attention mask because masks are rejected.
     query, key, value, attn_mask = _autocast(query, key, value, attn_mask)
     _validate_sdpa_input(query, key, value, attn_mask, dropout_p, is_causal, scale)
     # for mypy, ugh
@@ -932,6 +1028,9 @@ def jagged_scaled_dot_product_attention(
         # convert jagged layout Nested Tensor to strided layout Nested Tensor
         # which support the math implementation of SDPA
         def get_strided_layout_nested_tensor(jagged_layout_nt):
+            # [FUNCTION DOC] HELPER: convert a jagged nested tensor to a strided nested tensor:
+            # split the transposed values by per-sequence lengths (from offsets), build a strided
+            # nested tensor from the pieces, transpose back and make it contiguous. Copies data.
             lengths = jagged_layout_nt._offsets[1:] - jagged_layout_nt._offsets[:-1]
             transpose = torch.transpose(jagged_layout_nt, 1, 2)
             tensor_list = transpose.values().split(list(lengths), dim=0)

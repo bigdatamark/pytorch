@@ -5,7 +5,14 @@ For fp8: only supports forward pass right now.
 For fp16/bf16: supports forward and backward pass.
 """
 # mypy: allow-untyped-defs
-
+# [MODULE DOC]
+# Prototype Flash Attention 3 backend (Hopper, compute capability 9.0). Wraps an external
+# FA3 python module's forward/backward kernels and overrides the CUDA implementations of the
+# aten flash attention ops (dense SDPA and varlen/ragged variants, plus quantized fp8 forward
+# overloads) through a dispatcher library. Contains support checks that raise on unsupported
+# inputs, layout helpers (BHSD vs BSHD), and the registration entry point. Import-time side
+# effect: registers "FA3" in the flash attention registry (does not activate it). Keeps
+# module-level caches of the FA3 forward and backward kernels, set on registration.
 from __future__ import annotations
 
 import importlib
@@ -37,9 +44,13 @@ _FA3_CUDA_BWD: Callable | None = None  # Cache for torch.ops.flash_attn_3.bwd
 
 @dataclass
 class _FA3Handle:
+    # [CLASS DOC] HELPER: dataclass holding the dispatcher Library that keeps the FA3
+    # kernel overrides registered. Dropping the reference unregisters them.
     library: Library | None
 
     def remove(self) -> None:
+        # [FUNCTION DOC] HELPER: release the library (unregistering the kernel overrides)
+        # and clear the C++ flag that advertises FA3 availability.
         self.library = None
         # Clear the C++ flag
         torch._C._set_sdp_use_fa3(False)
@@ -47,6 +58,8 @@ class _FA3Handle:
 
 @cache
 def _get_device_major(device: torch.device) -> int:
+    # [FUNCTION DOC] HELPER: return the CUDA compute capability major version of device
+    # (memoized per device).
     major, _ = torch.cuda.get_device_capability(device)
     return major
 
@@ -54,6 +67,11 @@ def _get_device_major(device: torch.device) -> int:
 def register_flash_attention_fa3(
     module_path: str = "flash_attn_interface",
 ) -> _FA3Handle:
+    # [FUNCTION DOC]
+    # Activate FA3: import the named module (which must provide the FA3 forward and backward
+    # ops), cache them, set the C++ flag that FA3 is in use, register the aten kernel
+    # overrides, and return a handle wrapping the registration library. Raises RuntimeError
+    # (from the import helper) if the module lacks the kernels; ImportError if not importable.
     """
     Register FA3 flash attention kernels with the PyTorch dispatcher.
 
@@ -69,6 +87,9 @@ def register_flash_attention_fa3(
 
 
 def _fa3_import_module(module_path: str) -> None:
+    # [FUNCTION DOC] HELPER: import module_path, verify that the flash_attn_3 op namespace
+    # exposes fwd and bwd (raising RuntimeError otherwise), and store them in the module-level
+    # caches used by the run helpers.
     importlib.import_module(module_path)
     if not hasattr(torch.ops, "flash_attn_3"):
         raise RuntimeError(f"Module '{module_path}' does not expose FA3 kernels")
@@ -86,6 +107,9 @@ def _fa3_import_module(module_path: str) -> None:
 
 
 def _fa3_register_kernels() -> Library:
+    # [FUNCTION DOC] HELPER: create an aten implementation library for CUDA and register FA3
+    # implementations for the flash attention forward (quantized, default, in-place no-dropout),
+    # the SDPA flash forward (quantized, default) and both backward ops. Returns the library.
     lib = Library("aten", "IMPL", "CUDA")
     lib.impl(
         "_flash_attention_forward.quantized", _fa3_flash_attention_forward_impl, "CUDA"
@@ -127,6 +151,12 @@ def _fa3_common_support_error(
     k_descale: torch.Tensor | None,
     v_descale: torch.Tensor | None,
 ) -> str | None:
+    # [FUNCTION DOC] HELPER: checks shared by forward and backward. Returns an error string
+    # (or None if supported) for: nonzero dropout, non-CUDA tensors, tensors on different
+    # devices, dense query not 4D, ragged query (cum_seq_q given) not 3D, CUDA unavailable,
+    # or compute capability major not 9. For fp8 queries with missing descale tensors it only
+    # emits a warning.
+    # KNOWN ISSUE: the CUDA availability check comes after tensors were already tested for CUDA.
     if dropout_p != 0.0:
         return "dropout_p must be 0"
 
@@ -168,6 +198,10 @@ def _fa3_forward_support_error(
     k_descale: torch.Tensor | None,
     v_descale: torch.Tensor | None,
 ) -> str | None:
+    # [FUNCTION DOC] HELPER: forward support check. Returns a message string describing the
+    # first unsupported condition, else None. Rejects return_debug_mask, alibi slopes,
+    # seqused_k that is not int32 CUDA, dtypes outside fp8/fp16/bf16 or mixed dtypes, then
+    # applies the common checks (rewording the shared-device message for q/k/v).
     if return_debug_mask:
         return "return_debug_mask must be False"
     if alibi_slopes is not None:
@@ -210,6 +244,10 @@ def _fa3_backward_support_error(
     window_size_left: int | None,
     window_size_right: int | None,
 ) -> str | None:
+    # [FUNCTION DOC] HELPER: backward support check. Returns an error string or None.
+    # Rejects fp8 queries, non-float32 logsumexp, dtypes outside fp16/bf16 or mixed dtypes
+    # among grad_out/query/key/value/out, then applies the common checks (no descales).
+    # The window size arguments are accepted but not examined.
     # FA3 backward ONLY supports fp16/bf16, NOT fp8
     if query.dtype == torch.float8_e4m3fn:
         return (
@@ -240,10 +278,14 @@ Ts = TypeVarTuple("Ts")
 
 
 def _transpose_dense(*tensors: Unpack[Ts]) -> tuple[Unpack[Ts]]:
+    # [FUNCTION DOC] HELPER: return a tuple with dimensions 1 and 2 swapped (views) for each
+    # input, converting between batch-head-seq and batch-seq-head layouts.
     return tuple(t.transpose(1, 2) for t in tensors)  # type: ignore[attr-defined]
 
 
 def _maybe_contiguous(x: torch.Tensor | None) -> torch.Tensor | None:
+    # [FUNCTION DOC] HELPER: pass through None or a tensor whose last-dimension stride is 1;
+    # otherwise return a contiguous copy.
     """Ensure tensor is contiguous in the last dimension."""
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
@@ -268,6 +310,13 @@ def _fa3_run_forward(
     block_table: torch.Tensor | None = None,
     num_splits: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # HELPER: call the cached FA3 forward kernel with query/key/value (batch-seq-head layout,
+    # or packed with cumulative sequence lengths). Makes inputs last-dim contiguous (fp8
+    # values get a full contiguous copy under some stride conditions), maps missing window
+    # sizes to -1, picks num_splits (given, else 1 when deterministic algorithms are on, else
+    # 0 for auto) and reads the SM carveout setting. Returns (output, contiguous logsumexp).
+    # Raises RuntimeError if FA3 was not registered.
     """
     Run the FA3 forward pass by calling the C++ kernel directly.
     """
@@ -346,6 +395,12 @@ def _fa3_run_backward(
     window_size_right: int,
     deterministic: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # HELPER: call the cached FA3 backward kernel. Makes inputs last-dim contiguous,
+    # allocates empty gradient tensors shaped like query/key/value, runs the kernel (which
+    # fills them), and returns (dq, dk, dv). Window sizes are passed as given, deterministic
+    # is forwarded, and the SM carveout setting is read. Raises RuntimeError if FA3 was
+    # not registered.
     if _FA3_CUDA_BWD is None:
         raise RuntimeError("FA3 not registered")
 
@@ -413,6 +468,12 @@ def _fa3_flash_attention_forward_impl(
     compute_auxiliary: bool = True,
     num_splits: int | None = None,
 ):
+    # [FUNCTION DOC]
+    # HELPER: FA3 override of the flash attention forward op (with optional fp8 descale
+    # tensors). Runs the forward support check and raises RuntimeError with the reason if
+    # unsupported; then runs the kernel. Returns (output, logsumexp, rng_state, philox_offset,
+    # debug_mask); the last three are placeholder zero/empty tensors when compute_auxiliary
+    # is true, or None otherwise (no dropout is supported, so they carry no real state).
     error = _fa3_forward_support_error(
         query,
         key,
@@ -480,6 +541,9 @@ def _fa3_flash_attention_forward_no_dropout_inplace_impl(
     block_table: torch.Tensor | None = None,
     num_splits: int | None = None,
 ):
+    # [FUNCTION DOC] HELPER: override for the in-place, no-dropout flash forward op. Writes the
+    # attention result into the caller supplied out tensor via the general forward
+    # implementation (without auxiliary outputs or descales) and returns only the logsumexp.
     _, lse, _, _, _ = _fa3_flash_attention_forward_impl(
         query,
         key,
@@ -528,6 +592,8 @@ def _fa3_flash_attention_forward_impl_default(
     out: torch.Tensor | None = None,
     num_splits: int | None = None,
 ):
+    # [FUNCTION DOC] HELPER: override for the default (non-quantized) flash forward op; calls
+    # the general forward implementation with no descale tensors and returns its 5-tuple.
     return _fa3_flash_attention_forward_impl(
         query,
         key,
@@ -573,6 +639,11 @@ def _fa3_flash_attention_backward_impl(
     window_size_left: int | None = None,
     window_size_right: int | None = None,
 ):
+    # [FUNCTION DOC] HELPER: override for the flash attention backward op. Runs the backward
+    # support check (raises RuntimeError with the reason), then calls the backward kernel
+    # helper with None window sizes mapped to -1 and the deterministic setting taken from
+    # the global deterministic algorithms flag. Returns (dq, dk, dv). rng_state and unused
+    # are accepted for signature compatibility and ignored.
     """FA3 implementation of _flash_attention_backward."""
     error = _fa3_backward_support_error(
         grad_out,
@@ -625,6 +696,12 @@ def _fa3_scaled_dot_product_flash_attention_forward_impl(
     *,
     scale: float | None = None,
 ):
+    # [FUNCTION DOC]
+    # HELPER: override for the SDPA flash forward op on dense batch-head-seq tensors. Checks
+    # support (raises RuntimeError), transposes inputs to batch-seq-head, preallocates an
+    # output with the query's memory layout (bfloat16 when the query is fp8), runs the general
+    # forward on a transposed view of it, and returns the 9-tuple (output, logsumexp, None,
+    # None, max query length, max key length, rng_state, philox_offset, debug_mask).
     error = _fa3_forward_support_error(
         query,
         key,
@@ -693,6 +770,8 @@ def _fa3_scaled_dot_product_flash_attention_forward_impl_default(
     *,
     scale: float | None = None,
 ):
+    # [FUNCTION DOC] HELPER: override for the default (non-quantized) SDPA flash forward op;
+    # delegates to the quantized variant with no descale tensors.
     return _fa3_scaled_dot_product_flash_attention_forward_impl(
         query,
         key,
@@ -725,6 +804,10 @@ def _fa3_scaled_dot_product_flash_attention_backward_impl(
     *,
     scale: float | None = None,
 ):
+    # [FUNCTION DOC] HELPER: override for the SDPA flash backward op on dense batch-head-seq
+    # tensors. Checks support (raises RuntimeError), transposes grad_out/query/key/value/out to
+    # batch-seq-head, calls the flash backward override, transposes the gradients back and
+    # returns (dq, dk, dv). Philox seed and offset are passed through unused.
     """FA3 implementation of _scaled_dot_product_flash_attention_backward."""
     error = _fa3_backward_support_error(
         grad_out, query, key, value, out, logsumexp, dropout_p, None, None, None

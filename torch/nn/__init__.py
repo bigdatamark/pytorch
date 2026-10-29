@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [PACKAGE DOC]
+# Top-level neural network package. Re-exports the parameter/buffer classes, every
+# layer class from torch.nn.modules (star import), and exposes the subpackages
+# attention, functional, init, modules, parallel, parameter and utils. Also defines
+# the helper factory_kwargs used by modules to validate factory keyword arguments.
+# Importing this package eagerly imports all those subpackages (no other side effects).
 from torch.nn.parameter import (  # usort: skip
     Buffer as Buffer,
     Parameter as Parameter,
@@ -19,6 +25,13 @@ from torch.nn.parallel import DataParallel as DataParallel
 
 
 def factory_kwargs(kwargs):
+    # [FUNCTION DOC]
+    # Validate and canonicalize module constructor kwargs into a new mapping usable by
+    # tensor factory functions. Input: a mapping (or None, which gives an empty mapping)
+    # whose keys may only be device, dtype, memory_format, or factory_kwargs (a nested
+    # mapping of explicit factory arguments). Returns a fresh mapping; the input is not
+    # mutated. Raises TypeError for unrecognized keys, or when a key appears both at the
+    # top level and inside the nested factory_kwargs mapping.
     r"""Return a canonicalized dict of factory kwargs.
 
     Given kwargs, returns a canonicalized dict of factory kwargs that can be directly passed

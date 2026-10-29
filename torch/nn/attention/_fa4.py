@@ -1,5 +1,13 @@
 """UBER PROTOTYPE!!!"""
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Prototype Flash Attention 4 backend (compute capability 9.0 or 10.0). Wraps the forward and
+# backward functions of an external FA4 python module (default flash_attn.cute.interface) and
+# overrides the CUDA implementations of the aten flash attention ops (varlen/dense flash forward,
+# in-place no-dropout forward, backward, and the SDPA flash forward/backward) via a dispatcher
+# library. Contains support checks, layout helpers and the registration entry point. Import-time
+# side effect: registers "FA4" in the flash attention registry (not activated). Keeps a
+# module-level record of the module path chosen at registration.
 
 from __future__ import annotations
 
@@ -29,14 +37,20 @@ _FA4_MODULE_PATH: str | None = None
 
 @dataclass
 class _FA4Handle:
+    # [CLASS DOC] HELPER: dataclass holding the dispatcher Library that keeps the FA4 kernel
+    # overrides registered. Dropping the reference unregisters them.
     library: Library | None
 
     def remove(self) -> None:
+        # [FUNCTION DOC] HELPER: release the library, unregistering the kernel overrides.
+        # The registered module path stays recorded.
         self.library = None
 
 
 @cache
 def _get_device_major(device: torch.device) -> int:
+    # [FUNCTION DOC] HELPER: return the CUDA compute capability major version of device
+    # (memoized per device).
     major, _ = torch.cuda.get_device_capability(device)
     return major
 
@@ -44,6 +58,11 @@ def _get_device_major(device: torch.device) -> int:
 def register_flash_attention_fa4(
     module_path: str = "flash_attn.cute.interface",
 ) -> _FA4Handle:
+    # [FUNCTION DOC]
+    # Activate FA4: import and validate the named module (must expose the forward and backward
+    # functions), record its path in module state, register the aten kernel overrides, and
+    # return a handle wrapping the registration library. Raises RuntimeError if the module
+    # lacks the kernels, or ImportError if it cannot be imported.
     """
     Register FA4 flash attention kernels with the PyTorch dispatcher.
 
@@ -58,6 +77,8 @@ def register_flash_attention_fa4(
 
 @cache
 def _fa4_import_module(module_path: str) -> ModuleType:
+    # [FUNCTION DOC] HELPER: import (memoized per path) and return the module; raises
+    # RuntimeError if it lacks the forward or backward kernel functions.
     module = importlib.import_module(module_path)
     if not hasattr(module, "_flash_attn_fwd") or not hasattr(module, "_flash_attn_bwd"):
         raise RuntimeError(f"Module '{module_path}' does not expose FA4 kernels")
@@ -65,6 +86,9 @@ def _fa4_import_module(module_path: str) -> ModuleType:
 
 
 def _fa4_register_kernels() -> Library:
+    # [FUNCTION DOC] HELPER: create an aten implementation library for CUDA and register FA4
+    # implementations for flash attention forward, in-place no-dropout forward, backward, and
+    # the SDPA flash forward and backward ops. Returns the library.
     lib = Library("aten", "IMPL", "CUDA")
     lib.impl("_flash_attention_forward", _fa4_flash_attention_forward_impl, "CUDA")
     lib.impl(
@@ -92,6 +116,12 @@ def _fa4_common_support_error(
     cum_seq_q: torch.Tensor | None,
     require_fp32: tuple[tuple[str, torch.Tensor], ...] = (),
 ) -> str | None:
+    # [FUNCTION DOC] HELPER: checks shared by forward and backward. Returns an error string or
+    # None. Rejects non-CUDA tensors, tensors on different devices, query dtype other than
+    # fp16/bf16, any named tensor in require_fp32 that is not float32, dense query not 4D,
+    # ragged query (cum_seq_q given) not 3D, CUDA unavailable, or compute capability major
+    # outside 9 and 10.
+    # KNOWN ISSUE: the CUDA availability check comes after tensors were already tested for CUDA.
     if not all(t.is_cuda for t in tensors):
         return "inputs must be CUDA tensors"
     if len({t.device for t in tensors}) != 1:
@@ -124,6 +154,12 @@ def _fa4_forward_support_error(
     block_table: torch.Tensor | None = None,
     num_splits: int | None = None,
 ) -> str | None:
+    # [FUNCTION DOC] HELPER: forward support check; returns the first unsupported condition as
+    # a string, else None. Rejects nonzero dropout, return_debug_mask, alibi slopes, seqused_k
+    # not int32 CUDA, paged KV (block_table) or split-KV (num_splits above 1) unless the
+    # device major is 10, then applies the common checks (rewording the shared-device message).
+    # KNOWN ISSUE: the device capability is queried before verifying the tensors are on CUDA,
+    # so a CPU query may fail with a different error instead of a clean message.
     if dropout_p != 0.0:
         return "dropout_p must be 0"
     if return_debug_mask:
@@ -162,6 +198,9 @@ def _fa4_backward_support_error(
     dropout_p: float,
     cum_seq_q: torch.Tensor | None,
 ) -> str | None:
+    # [FUNCTION DOC] HELPER: backward support check; returns an error string or None. Rejects
+    # nonzero dropout, then applies the common checks across all tensors, additionally
+    # requiring logsumexp to be float32.
     if dropout_p != 0.0:
         return "dropout_p must be 0"
     error = _fa4_common_support_error(
@@ -176,6 +215,7 @@ def _fa4_backward_support_error(
 
 
 def _aten_to_fa4_window_size(val: int | None) -> int | None:
+    # [FUNCTION DOC] HELPER: map the aten sentinel -1 (no window) to None; other values unchanged.
     """need to convert -1 to None for FA4"""
     return None if val == -1 else val
 
@@ -184,6 +224,8 @@ Ts = TypeVarTuple("Ts")
 
 
 def _transpose_dense(*tensors: Unpack[Ts]) -> tuple[Unpack[Ts]]:
+    # [FUNCTION DOC] HELPER: return a tuple with dimensions 1 and 2 swapped (views) for each
+    # input, converting between batch-head-seq and batch-seq-head layouts.
     return tuple(t.transpose(1, 2) for t in tensors)  # type: ignore[attr-defined]
 
 
@@ -204,6 +246,11 @@ def _fa4_run_forward(
     block_table: torch.Tensor | None = None,
     num_splits: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] HELPER: call the registered FA4 module's forward function with softmax
+    # scale, causal flag, window sizes (-1 mapped to None), cumulative lengths, max lengths,
+    # contiguous seqused_k, page table, num_splits (default 1) and optional preallocated out,
+    # requesting logsumexp. Returns (output, contiguous logsumexp). Raises RuntimeError if
+    # FA4 has not been registered.
     if _FA4_MODULE_PATH is None:
         raise RuntimeError("FA4 not registered")
     module = _fa4_import_module(_FA4_MODULE_PATH)
@@ -242,6 +289,10 @@ def _fa4_run_backward(
     window_size_right: int | None,
     deterministic: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] HELPER: call the registered FA4 module's backward function with the
+    # forward tensors, grad_out, contiguous logsumexp, scale, causal flag, window sizes
+    # (-1 mapped to None), cumulative lengths and the deterministic flag. Returns (dq, dk, dv).
+    # Raises RuntimeError if FA4 has not been registered.
     if _FA4_MODULE_PATH is None:
         raise RuntimeError("FA4 not registered")
     module = _fa4_import_module(_FA4_MODULE_PATH)
@@ -285,6 +336,10 @@ def _fa4_flash_attention_forward_impl(
     compute_auxiliary: bool = True,
     num_splits: int | None = None,
 ):
+    # [FUNCTION DOC] HELPER: FA4 override of the flash attention forward op. Raises RuntimeError
+    # with the reason if the forward support check fails; otherwise runs the kernel. Returns
+    # (output, logsumexp, rng_state, philox_offset, debug_mask); the last three are placeholder
+    # zero/empty tensors when compute_auxiliary is true, else None (dropout unsupported).
     error = _fa4_forward_support_error(
         query,
         key,
@@ -348,6 +403,9 @@ def _fa4_flash_attention_forward_no_dropout_inplace_impl(
     block_table: torch.Tensor | None = None,
     num_splits: int | None = None,
 ):
+    # [FUNCTION DOC] HELPER: override for the in-place no-dropout flash forward op. Writes the
+    # result into the supplied out tensor via the general forward (no auxiliary outputs) and
+    # returns only the logsumexp.
     _, lse, _, _, _ = _fa4_flash_attention_forward_impl(
         query,
         key,
@@ -392,6 +450,10 @@ def _fa4_flash_attention_backward_impl(
     window_size_left: int | None = None,
     window_size_right: int | None = None,
 ):
+    # [FUNCTION DOC] HELPER: FA4 override of the flash attention backward op. Raises RuntimeError
+    # with the reason if the backward support check fails; otherwise runs the backward kernel,
+    # taking the deterministic flag from the global deterministic algorithms setting. Returns
+    # (dq, dk, dv). rng_state, unused, max_q and max_k are accepted and ignored.
     error = _fa4_backward_support_error(
         grad_out,
         query,
@@ -433,6 +495,11 @@ def _fa4_scaled_dot_product_flash_attention_forward_impl(
     *,
     scale: float | None = None,
 ):
+    # [FUNCTION DOC] HELPER: FA4 override of the SDPA flash forward op on dense batch-head-seq
+    # tensors. Raises RuntimeError if unsupported; transposes inputs to batch-seq-head,
+    # preallocates an output with the query's layout, runs the general forward on a transposed
+    # view of it, and returns the 9-tuple (output, logsumexp, None, None, max query length,
+    # max key length, rng_state, philox_offset, debug_mask).
     error = _fa4_forward_support_error(
         query,
         key,
@@ -502,6 +569,10 @@ def _fa4_scaled_dot_product_flash_attention_backward_impl(
     *,
     scale: float | None = None,
 ):
+    # [FUNCTION DOC] HELPER: FA4 override of the SDPA flash backward op on dense batch-head-seq
+    # tensors. Raises RuntimeError if unsupported; transposes inputs to batch-seq-head, calls the
+    # flash backward override, transposes the gradients back and returns (dq, dk, dv). The
+    # max lengths come from the tensors, not the max_q/max_k arguments.
     error = _fa4_backward_support_error(
         grad_out,
         query,

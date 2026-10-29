@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Causal attention bias types usable as the attention mask of scaled dot product attention:
+# the CausalVariant enum, the CausalBias tensor subclass, and the factory functions
+# causal_upper_left and causal_lower_right. Import-time side effect: registers several
+# SDPA-related callables with dynamo as allowed in graph.
 """Defines bias subclasses that work with scaled_dot_product_attention"""
 
 from enum import auto, IntEnum
@@ -31,6 +36,11 @@ torch._dynamo.allow_in_graph(SDPAParams)
 
 
 class CausalVariant(IntEnum):
+    # [CLASS DOC]
+    # Integer enum naming the two causal mask alignments: UPPER_LEFT (standard lower
+    # triangular mask anchored at the top-left) and LOWER_RIGHT (anchored at the bottom-right
+    # corner). Values are auto-numbered from 1; the integer value is passed to the
+    # efficient attention kernel as its custom mask type.
     r"""
     Enum for causal variants used in attention mechanisms.
 
@@ -84,6 +94,12 @@ class CausalVariant(IntEnum):
 
 
 class CausalBias(torch.Tensor):
+    # [CLASS DOC]
+    # Lightweight tensor subclass describing a causal mask lazily (no storage is allocated
+    # for the mask). Attributes: variant (CausalVariant), seq_len_q, seq_len_kv. Its
+    # __torch_function__ intercepts scaled_dot_product_attention calls and routes them to
+    # _dispatch, which picks a fused kernel or falls back to a materialized boolean mask.
+    # Other torch functions fall through to the default tensor behavior.
     """
     A bias representing causal attention patterns. For an overview of the bias structure, see the :class:`CausalVariant` enum.
 
@@ -117,6 +133,10 @@ class CausalBias(torch.Tensor):
     """
 
     def __init__(self, variant: CausalVariant, seq_len_q: int, seq_len_kv: int) -> None:
+        # [FUNCTION DOC]
+        # Store the variant and the query/key-value sequence lengths on the instance. Raises
+        # AssertionError if variant is not a CausalVariant. Emits a warning when variant is
+        # LOWER_RIGHT and seq_len_q exceeds seq_len_kv (outputs may contain NaNs).
         """
         Initializes the CausalBias instance with a specified variant and sequence lengths.
 
@@ -142,12 +162,17 @@ class CausalBias(torch.Tensor):
             )
 
     def _upper_left(self, device: torch.device) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: build a boolean lower-triangular matrix of shape
+        # (seq_len_q, seq_len_kv) on the given device (diagonal offset zero).
         """Upper left causal bias"""
         return torch.tril(
             torch.ones(self.seq_len_q, self.seq_len_kv, device=device, dtype=torch.bool)
         )
 
     def _lower_right(self, device: torch.device) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: build a boolean lower-triangular matrix of shape
+        # (seq_len_q, seq_len_kv) on the given device, with diagonal offset seq_len_kv minus
+        # seq_len_q so the true region is aligned to the bottom-right corner.
         """Lower right causal bias"""
         diagonal_offset = self.seq_len_kv - self.seq_len_q
         return torch.tril(
@@ -159,6 +184,9 @@ class CausalBias(torch.Tensor):
 
     # pyrefly: ignore [bad-return]
     def _materialize(self, device: torch.device | None = None) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: produce the dense boolean mask for this bias on device
+        # (default CPU), choosing the upper-left or lower-right construction by variant.
+        # Implicitly returns None for an unknown variant (hence the type-ignore above).
         """
         Materializes the causal bias into a tensor form.
 
@@ -189,6 +217,17 @@ class CausalBias(torch.Tensor):
         scale: float | None = None,
         enable_gqa: bool = False,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Static implementation of scaled dot product attention for a CausalBias mask.
+        # Raises ValueError if is_causal is true, or if the variant is unknown. If the
+        # sequence lengths are equal or the variant is upper-left, calls standard SDPA with
+        # the causal flag and no mask. For lower-right: validates inputs, then uses the flash
+        # kernel if allowed (padding the head dimension up to a multiple of 8, or 1 on xpu,
+        # and unpadding the output), else the efficient attention kernel with the variant as
+        # mask type, else standard SDPA with the materialized mask (after optional warnings).
+        # Returns the attention output tensor.
+        # KNOWN ISSUE: enable_gqa is ignored by the flash and efficient kernel paths in the
+        # lower-right case (only the materialized-mask fallback honors it).
         r"""
         Handles the logic for computing attention with the specified causal bias.
 
@@ -294,6 +333,9 @@ class CausalBias(torch.Tensor):
 
     @classmethod
     def __torch_function__(cls, func, types, args=(), kwargs=None):
+        # [FUNCTION DOC] Intercept torch function calls: when func is scaled dot product
+        # attention, forward all arguments to _dispatch and return its result; otherwise
+        # defer to the base tensor implementation. kwargs defaults to an empty mapping.
         """Defines the behavior of torch.nn.functional.scaled_dot_product_attention when the attn_bias is an AttnBias"""
         if kwargs is None:
             kwargs = {}
@@ -302,10 +344,13 @@ class CausalBias(torch.Tensor):
         return super().__torch_function__(func, types, args, kwargs)
 
     def __repr__(self) -> str:  # type:ignore[override]
+        # [FUNCTION DOC] Return the repr of the materialized (CPU) boolean mask tensor.
         return self._materialize().__repr__()
 
 
 def causal_upper_left(*size) -> CausalBias:
+    # [FUNCTION DOC] Factory taking two sizes (query length, key/value length); returns a
+    # CausalBias with the UPPER_LEFT variant. Raises AssertionError unless exactly two sizes are given.
     """
     Creates an upper-left triangular causal bias.
 
@@ -340,6 +385,9 @@ def causal_upper_left(*size) -> CausalBias:
 
 
 def causal_lower_right(*size) -> CausalBias:
+    # [FUNCTION DOC] Factory taking two sizes (query length, key/value length); returns a
+    # CausalBias with the LOWER_RIGHT variant. Raises AssertionError unless exactly two sizes
+    # are given. May warn (from the constructor) when query length exceeds key/value length.
     """
     Creates a lower-right triangular causal bias.
 
