@@ -1,4 +1,14 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Shared helper library for the TorchScript-based ONNX exporter symbolic functions.
+# Contents: argument parsing (parse_args decorator and _parse_arg, which turn JIT Values that
+# are ONNX constants into Python ints, floats, lists, strings or tensors); the quantized_args
+# decorator that wraps ops with dequantize/quantize; JIT Value type predicates and shape/rank
+# accessors; error helpers that raise exporter errors for unsupported ops or opsets; opset
+# dispatching shims (slice, unbind, scatter, arange, lt) that import the right symbolic_opsetN
+# function lazily; reusable graph builders (interpolate/Resize, squeeze/unsqueeze, reduce ops,
+# var_mean, embedding_bag, linalg_vector_norm, quantize/dequantize); and deprecated dtype
+# lookup tables plus the module level _quantized_ops set (mutable global, filled elsewhere).
+# Import time side effects: none besides defining names; nothing is registered here.
 from __future__ import annotations
 
 
@@ -152,6 +162,13 @@ def _parse_arg(
     arg_name: str | None = None,
     node_name: str | None = None,
 ):
+    # [FUNCTION DOC] HELPER: Convert one symbolic-function argument according to a descriptor.
+    # Descriptors: none/v keep the value as is; i, f, b, s, t, is, fs convert an onnx::Constant
+    # node to int, float, bool, str, tensor, list of ints or list of floats. A None-valued node
+    # gives None; a ListConstruct node of constants converts only for descriptor is.
+    # Raises SymbolicValueError for unknown descriptors, non-constant list elements, other
+    # list conversions, or non-constant nodes (message names arg_name/node_name if given).
+    # Non-Value inputs are returned unchanged. No side effects.
     if desc == "none":
         return value
     if desc == "v" or not _is_value(value):
@@ -216,6 +233,9 @@ def _parse_arg(
 
 
 def _node_get(node: _C.Node, key: str):
+    # [FUNCTION DOC] HELPER: Read attribute key of a JIT node whatever its attribute kind.
+    # Looks up the attribute kind and calls the matching getter. Raises an error if node is
+    # not a Node. Returns the attribute value.
     """Gets attributes of a node which is polymorphic over return type."""
     if not isinstance(node, _C.Node):
         raise AssertionError(f"Expected _C.Node, got {type(node)}")
@@ -224,6 +244,7 @@ def _node_get(node: _C.Node, key: str):
 
 
 def _is_onnx_constant(value: _C.Value):
+    # [FUNCTION DOC] HELPER: Return True when the Value is produced by an onnx::Constant node.
     """Whether a Value is an ONNX constant."""
     return value.node().kind() == "onnx::Constant"
 
@@ -232,6 +253,9 @@ def _maybe_get_const(
     value: _C.Value | torch.Tensor | Number | Sequence | None,
     descriptor: _ValueDescriptor,
 ):
+    # [FUNCTION DOC] HELPER: Return the parsed constant if value is a Value from an onnx::Constant
+    # node (parsed with the given descriptor), otherwise return the input unchanged.
+    # prim::Constant nodes are deliberately not treated as constants here.
     # NOTE: prim::Constant at this stage usually means something not compatible in ONNX,
     # otherwise it'd be converted to onnx::Constant
     # TODO(justinchuby): Replace insinstance with _is_value once we figure out mypy
@@ -241,6 +265,8 @@ def _maybe_get_const(
 
 
 def _maybe_get_scalar(value):
+    # [FUNCTION DOC] HELPER: Return value as a tensor if it is an ONNX constant holding a
+    # zero-dimensional tensor, otherwise return the input unchanged.
     value_t = _maybe_get_const(value, "t")
     if isinstance(value_t, torch.Tensor) and value_t.shape == ():
         return value_t
@@ -248,6 +274,9 @@ def _maybe_get_scalar(value):
 
 
 def _get_const(value, desc, arg_name):
+    # [FUNCTION DOC] HELPER: Parse a constant argument with the given descriptor.
+    # Raises SymbolicValueError (naming arg_name) if value is a Value that is neither an
+    # onnx::Constant nor a prim::Constant. Non-Value inputs are treated as constants.
     if not _is_constant(value):
         raise errors.SymbolicValueError(
             f"ONNX symbolic expected a constant value of the '{arg_name}' argument, "
@@ -258,6 +287,8 @@ def _get_const(value, desc, arg_name):
 
 
 def _unpack_list(list_value: _C.Value) -> list[_C.Value]:
+    # [FUNCTION DOC] HELPER: Return the inputs of a prim::ListConstruct node as a Python list.
+    # Raises SymbolicValueError if the Value is not produced by a ListConstruct node.
     list_node = list_value.node()
     if list_node.kind() != "prim::ListConstruct":
         raise errors.SymbolicValueError(
@@ -268,6 +299,8 @@ def _unpack_list(list_value: _C.Value) -> list[_C.Value]:
 
 
 def _unpack_tuple(tuple_value: _C.Value) -> tuple[_C.Value, ...]:
+    # [FUNCTION DOC] HELPER: Return the inputs of a prim::TupleConstruct node as a tuple.
+    # Raises SymbolicValueError if the Value is not produced by a TupleConstruct node.
     tuple_node = tuple_value.node()
     if not _is_tuple_construct(tuple_value):
         raise errors.SymbolicValueError(
@@ -279,6 +312,10 @@ def _unpack_tuple(tuple_value: _C.Value) -> tuple[_C.Value, ...]:
 
 
 def _unpack_quantized_tensor(tuple_value: _C.Value) -> tuple[_C.Value, ...]:
+    # [FUNCTION DOC] HELPER: Unpack a quantized tensor tuple into its elements.
+    # A quantized tensor is a TupleConstruct of (tensor, scale, zero_point) with an optional
+    # trailing axis. Raises SymbolicValueError if the Value is not a tuple construct, and an
+    # error if the tuple does not have 3 or 4 elements. Returns the tuple of inputs.
     """Unpacks a quantized tensor into a tuple of tensor and scale/zero_point.
     Args:
         tuple_value: A tuple of tensor, scale, zero_point, and optionally axis.
@@ -303,12 +340,19 @@ def _unpack_quantized_tensor(tuple_value: _C.Value) -> tuple[_C.Value, ...]:
 # Check if list_value is output from prim::ListConstruct
 # This is usually called before _unpack_list to ensure the list can be unpacked.
 def _is_packed_list(list_value: Any) -> bool:
+    # [FUNCTION DOC] HELPER: Return True if the argument is a Value produced by ListConstruct.
     return _is_value(list_value) and list_value.node().kind() == "prim::ListConstruct"
 
 
 def parse_args(
     *arg_descriptors: _ValueDescriptor,
 ) -> Callable[[Callable[_Concatenate[_U, _P], _T]], Callable[_Concatenate[_U, _P], _T]]:
+    # [FUNCTION DOC] Decorator factory that converts symbolic-function arguments by descriptor.
+    # arg_descriptors gives one descriptor per positional argument after the graph context
+    # (v, i, is, f, fs, b, s, t, none). The returned decorator records the descriptors on the
+    # function (attribute _arg_descriptors, used by overload selection) and wraps it so that
+    # each positional argument is passed through _parse_arg first (using parameter names for
+    # error messages when the signature can be inspected).
     """A decorator which converts args from torch._C.Value to built-in types.
 
     For example:
@@ -338,10 +382,16 @@ def parse_args(
     def decorator(
         fn: Callable[_Concatenate[_U, _P], _T],
     ) -> Callable[_Concatenate[_U, _P], _T]:
+        # [FUNCTION DOC] HELPER: Decorator applied by parse_args to one symbolic function.
+        # Stores the descriptors on the function and returns the converting wrapper.
         fn._arg_descriptors = arg_descriptors  # type: ignore[attr-defined]
 
         @functools.wraps(fn)
         def wrapper(g: _U, *args: _P.args, **kwargs: _P.kwargs) -> _T:
+            # [FUNCTION DOC] HELPER: Convert args by descriptors, then call the wrapped function.
+            # Raises an error if there are more positional args than descriptors, if more than one
+            # keyword argument is passed, or if the only keyword argument is not _outputs.
+            # Returns the wrapped function's result. Fewer args than descriptors is allowed.
             # some args may be optional, so the length may be smaller
             FILE_BUG_MSG = (
                 "If you believe this is not due to custom symbolic implementation within your code or "
@@ -397,6 +447,10 @@ def quantized_args(
     zero_point: int | None = None,
     quantize_output: bool = True,
 ) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
+    # [FUNCTION DOC] Decorator factory adding quantized-tensor support to a symbolic function.
+    # arg_q_descriptors marks which positional args may be quantized tuples (missing ones count
+    # as False). scale/zero_point optionally fix the output quantization parameters and
+    # quantize_output controls whether the result is re-quantized. Returns the decorator.
     """A decorator which extends support for quantized version of the base operator.
 
     Quantization is detected by examining the arguments that are annotated by
@@ -439,8 +493,15 @@ def quantized_args(
     """
 
     def decorator(fn):
+        # [FUNCTION DOC] HELPER: Wrap fn: dequantize quantized inputs and quantize the output.
         @functools.wraps(fn)
         def wrapper(g, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Run fn directly if no flagged argument is quantized; otherwise
+            # dequantize the flagged arguments (including list-construct elements, whose uses are
+            # rewired to the dequantized values), call fn once, and quantize the single output with
+            # the explicit scale/zero point or those of the first quantized input. Raises an
+            # error if no scale or zero point could be determined.
+            # Side effect: adds nodes to graph g.
             nonlocal scale
             nonlocal zero_point
             if scale is not None:
@@ -459,6 +520,7 @@ def quantized_args(
             descriptor_args = tuple(zip(arg_q_descriptors_extended, args))
 
             def _is_arg_quantized(descriptor, arg):
+                # [FUNCTION DOC] HELPER: True if flagged by descriptor and a tuple construct.
                 return descriptor and _is_value(arg) and _is_tuple_construct(arg)
 
             # Run regular symbolic function if none of the argument is QTensor.
@@ -532,6 +594,7 @@ def quantized_args(
 
 
 def _scalar(x: Any) -> Number | None:
+    # [FUNCTION DOC] HELPER: Return the Python number of a zero-dimensional tensor, else None.
     """Convert a scalar tensor into a Python value."""
     if isinstance(x, torch.Tensor) and x.shape == ():
         return x.item()
@@ -539,6 +602,9 @@ def _scalar(x: Any) -> Number | None:
 
 
 def _if_scalar_type_as(self, tensor):
+    # [FUNCTION DOC] HELPER: Convert a Python scalar self to the scalar type of tensor.
+    # A graph Value is returned unchanged; if the tensor type is unknown the input is returned
+    # unchanged; otherwise the matching conversion method of self is called by type name.
     """
     Convert self into the same type of tensor, as necessary.
     We only support implicit casting for scalars, so we never
@@ -558,14 +624,18 @@ def _if_scalar_type_as(self, tensor):
 
 
 def _is_none(x: Any) -> bool:
+    # [FUNCTION DOC] HELPER: True if x is None or a Value whose node is known to be None.
     return x is None or (x.node().mustBeNone() if isinstance(x, _C.Value) else False)
 
 
 def _is_value(x: Any) -> _TypeIs[_C.Value]:
+    # [FUNCTION DOC] HELPER: True if x is a JIT Value (type guard).
     return isinstance(x, _C.Value)
 
 
 def _is_constant(value: Any) -> bool:
+    # [FUNCTION DOC] HELPER: True if value is not a Value or comes from a Constant node
+    # (onnx::Constant or prim::Constant).
     return not _is_value(value) or value.node().kind() in {
         "onnx::Constant",
         "prim::Constant",
@@ -573,21 +643,25 @@ def _is_constant(value: Any) -> bool:
 
 
 def _is_tensor(x: _C.Value) -> bool:
+    # [FUNCTION DOC] HELPER: True if the Value's type is a subtype of the tensor type.
     return x.type().isSubtypeOf(_C.TensorType.get())
 
 
 # Note: _C.JitType is not exposed to Python and cannot be checked in runtime.
 def _as_list_type(jit_type: _C.JitType) -> _C.ListType | None:
+    # [FUNCTION DOC] HELPER: Return the type if it is a list type, otherwise None.
     if isinstance(jit_type, _C.ListType):
         return jit_type
     return None
 
 
 def _is_list(x: _C.Value) -> bool:
+    # [FUNCTION DOC] HELPER: True if the Value has a list type.
     return _as_list_type(x.type()) is not None
 
 
 def _is_tensor_list(x: _C.Value) -> bool:
+    # [FUNCTION DOC] HELPER: True if the Value is a list whose element type is tensor.
     x_type = _as_list_type(x.type())
     if x_type is None:
         return False
@@ -595,6 +669,7 @@ def _is_tensor_list(x: _C.Value) -> bool:
 
 
 def _is_scalar_list(x: _C.Value) -> bool:
+    # [FUNCTION DOC] HELPER: True if the Value is a list whose scalar type is valid in ONNX.
     """Checks if x is a scalar list, for example: List[float], List[int].
 
     Besides checking the type is ListType, we also check if the data type is
@@ -608,10 +683,13 @@ def _is_scalar_list(x: _C.Value) -> bool:
 
 
 def _is_tuple_construct(x: _C.Value) -> bool:
+    # [FUNCTION DOC] HELPER: True if the Value is produced by a prim::TupleConstruct node.
     return x.node().kind() == "prim::TupleConstruct"
 
 
 def is_complex_value(x: _C.Value) -> bool:
+    # [FUNCTION DOC] True if the Value has a complex scalar type (complex32/64/128).
+    # Raises an error if x is not a Value. Unknown types give False.
     if not _is_value(x):
         raise AssertionError("Expected a Value")
     return _type_utils.JitScalarType.from_value(
@@ -624,6 +702,7 @@ def is_complex_value(x: _C.Value) -> bool:
 
 
 def _get_tensor_rank(x: _C.Value) -> int | None:
+    # [FUNCTION DOC] HELPER: Return the rank of a tensor Value, or None if not a tensor or unknown.
     if not _is_tensor(x) or x.type() is None:
         return None
     x_type = x.type()
@@ -632,6 +711,9 @@ def _get_tensor_rank(x: _C.Value) -> int | None:
 
 
 def _get_tensor_sizes(x: _C.Value, allow_nonstatic: bool = True):
+    # [FUNCTION DOC] HELPER: Return the sizes of a tensor Value, or None if not a tensor.
+    # With allow_nonstatic true, symbolic dimensions appear as None entries; otherwise the
+    # result is None if any dimension is symbolic.
     if not _is_tensor(x) or x.type() is None:
         return None
     x_type = x.type()
@@ -646,11 +728,17 @@ def _get_tensor_sizes(x: _C.Value, allow_nonstatic: bool = True):
 
 
 def _get_tensor_dim_size(x: _C.Value, dim: int) -> int | None:
+    # [FUNCTION DOC] HELPER: Return the size of dimension dim, or None if sizes are unavailable.
     sizes = _get_tensor_sizes(x)
     return sizes[dim] if sizes else None
 
 
 def _get_dim_for_cross(x: _C.Value, dim: int | None):
+    # [FUNCTION DOC] HELPER: Resolve the dimension used by the cross product symbolic.
+    # A dim of -1 becomes rank minus one (raises an error if rank unknown); a missing dim
+    # becomes the first dimension of size 3 (raises if sizes unknown); other values pass through.
+    # KNOWN ISSUE: other negative dims are not normalized, and a missing dim with no size-3
+    # dimension falls through and returns None.
     if dim == -1:
         tensor_rank = _get_tensor_rank(x)
         if tensor_rank is None:
@@ -668,12 +756,20 @@ def _get_dim_for_cross(x: _C.Value, dim: int | None):
 
 
 def _unimplemented(op: str, msg: str, value: _C.Value | None = None) -> None:
+    # [FUNCTION DOC] HELPER: Report an unsupported op, raising only for plain ONNX export.
+    # Raises through _onnx_unsupported when the global operator export type is ONNX; for other
+    # export types it silently returns None.
+    # KNOWN ISSUE: callers write return of this call as if it never returns, but for non-ONNX
+    # export types execution continues with a None result.
     # For BC reasons, the behavior for Caffe2 does not raise exception for unimplemented operators
     if GLOBALS.operator_export_type == _C_onnx.OperatorExportTypes.ONNX:
         _onnx_unsupported(f"{op}, {msg}", value)
 
 
 def _onnx_unsupported(op_name: str, value: _C.Value | None = None) -> NoReturn:
+    # [FUNCTION DOC] HELPER: Always raise for an unsupported operator.
+    # Raises SymbolicValueError when value is a graph Value, otherwise OnnxExporterError,
+    # with a message pointing to the PyTorch issue tracker.
     message = (
         f"Unsupported: ONNX export of operator {op_name}. "
         f"Please feel free to request support or submit a pull request "
@@ -693,6 +789,9 @@ def _onnx_opset_unsupported(
     supported_opset: int,
     value: _C.Value | None = None,
 ) -> NoReturn:
+    # [FUNCTION DOC] HELPER: Always raise because the op needs a different opset version.
+    # Raises SymbolicValueError (if value is a graph Value) or OnnxExporterError, suggesting
+    # supported_opset.
     message = (
         f"Unsupported: ONNX export of {op_name} in opset {current_opset}. "
         f"Please try opset version {supported_opset}."
@@ -712,6 +811,8 @@ def _onnx_opset_unsupported_detailed(
     reason: str,
     value: _C.Value | None = None,
 ) -> NoReturn:
+    # [FUNCTION DOC] HELPER: Like _onnx_opset_unsupported but includes a reason in the message.
+    # Always raises SymbolicValueError (if value is a graph Value) or OnnxExporterError.
     message = (
         f"Unsupported: ONNX export of {op_name} in "
         f"opset {current_opset}. {reason}. Please try opset version {supported_opset}."
@@ -725,7 +826,10 @@ def _onnx_opset_unsupported_detailed(
 
 
 def _block_list_in_opset(name: str):
+    # [FUNCTION DOC] HELPER: Return a symbolic function that always fails for the current opset.
     def symbolic_fn(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Raise OnnxExporterError saying the op is not implemented for the
+        # global export opset version, whatever arguments are given.
         raise errors.OnnxExporterError(
             f"ONNX export failed on {name}, which is not implemented for opset "
             f"{GLOBALS.export_onnx_opset_version}. "
@@ -736,6 +840,7 @@ def _block_list_in_opset(name: str):
 
 
 def _try_get_scalar_type(*args) -> _type_utils.JitScalarType | None:
+    # [FUNCTION DOC] HELPER: Return the first known scalar type among args, or None if none known.
     for arg in args:
         scalar_type = _type_utils.JitScalarType.from_value(
             arg, _type_utils.JitScalarType.UNDEFINED
@@ -746,6 +851,11 @@ def _try_get_scalar_type(*args) -> _type_utils.JitScalarType | None:
 
 
 def _type_promote_from_values(*args) -> _type_utils.JitScalarType:
+    # [FUNCTION DOC] HELPER: Compute the promoted scalar type of the given values.
+    # Returns undefined for no args, the single type for one arg, otherwise the promoted type
+    # across all args using PyTorch type promotion.
+    # KNOWN ISSUE: if a value has no known scalar type the entry is None and attribute access
+    # fails; the single-arg result may also be None despite the declared return type.
     undef = _type_utils.JitScalarType.UNDEFINED
     jit_types = [_try_get_scalar_type(arg) for arg in args]
     if len(jit_types) == 0:
@@ -761,6 +871,8 @@ def _type_promote_from_values(*args) -> _type_utils.JitScalarType:
 def _maybe_cast_to_type(
     g: jit_utils.GraphContext, value, jit_type: _type_utils.JitScalarType
 ):
+    # [FUNCTION DOC] HELPER: Emit a Cast node to jit_type unless value already has that type.
+    # Returns the cast value or the original value. Adds a node to graph g.
     if (
         _type_utils.JitScalarType.from_value(value, _type_utils.JitScalarType.UNDEFINED)
         != jit_type
@@ -774,6 +886,10 @@ def _maybe_cast_to_type(
 
 
 def _select_helper(g: jit_utils.GraphContext, self, dim, index, apply_reshape=True):
+    # [FUNCTION DOC] HELPER: Build a Gather along dim using index, normalizing the index first.
+    # A Python scalar index becomes a size-1 int64 constant; a 0-dim index Value is reshaped
+    # to size 1 when apply_reshape is set; non int32/int64 indices are cast to int64.
+    # Returns the Gather output. Adds nodes to graph g.
     index_const = _maybe_get_scalar(index)
     index_dim = _get_tensor_rank(index)
     if not _is_value(index_const):
@@ -805,6 +921,10 @@ def _slice_helper(
     ends,
     steps=None,
 ):
+    # [FUNCTION DOC] HELPER: Slice input along axes, dispatching on opset.
+    # Opset 9 and below use the opset 9 slice (steps is ignored); later opsets use the opset 10
+    # slice with steps. Returns the sliced Value. Imports the opset modules lazily.
+    # KNOWN ISSUE: steps is silently dropped for opset <= 9.
     if g.opset <= 9:
         from torch.onnx._internal.torchscript_exporter.symbolic_opset9 import (
             _slice as _slice9,
@@ -820,6 +940,7 @@ def _slice_helper(
 
 
 def _is_fp(value) -> bool:
+    # [FUNCTION DOC] HELPER: True if the Value has a floating type (float, double, half, bfloat16).
     return _type_utils.JitScalarType.from_value(
         value, _type_utils.JitScalarType.UNDEFINED
     ) in {
@@ -831,6 +952,7 @@ def _is_fp(value) -> bool:
 
 
 def _is_bool(value) -> bool:
+    # [FUNCTION DOC] HELPER: True if the Value has the bool scalar type.
     return (
         _type_utils.JitScalarType.from_value(value, _type_utils.JitScalarType.UNDEFINED)
         == _type_utils.JitScalarType.BOOL
@@ -838,6 +960,9 @@ def _is_bool(value) -> bool:
 
 
 def _generate_wrapped_number(g: jit_utils.GraphContext, scalar):
+    # [FUNCTION DOC] HELPER: Create a constant emulating a PyTorch wrapped number.
+    # Floats become zero-dim double tensors, other scalars zero-dim tensors of their own type.
+    # Raises an error if scalar is already a tensor. Adds a Constant node to graph g.
     """Creates a wrapped number based on https://github.com/pytorch/pytorch/issues/9515.
 
     A Tensor is a considered a "wrapped number" if it is
@@ -857,6 +982,9 @@ def _generate_wrapped_number(g: jit_utils.GraphContext, scalar):
 
 
 def _sort_helper(g: jit_utils.GraphContext, input, dim, descending=True, out=None):
+    # [FUNCTION DOC] HELPER: Emit a sort as a TopK over the whole dimension.
+    # Returns the two TopK outputs (values, indices). Reports unsupported for the out
+    # parameter, and for ascending order when opset is 10 or lower.
     if out is not None:
         _unimplemented("Sort", "Out parameter is not supported")
     shape_ = g.op("Shape", input)
@@ -878,6 +1006,9 @@ def _sort_helper(g: jit_utils.GraphContext, input, dim, descending=True, out=Non
 def _topk_helper(
     g: jit_utils.GraphContext, input, k, dim, largest=True, sorted=False, out=None
 ):
+    # [FUNCTION DOC] HELPER: Emit a TopK node for k, dim, largest and sorted settings.
+    # k is turned into a one-element int64 tensor. Returns the two outputs. Reports
+    # unsupported for the out parameter and for smallest-first when opset is 10 or lower.
     if out is not None:
         _unimplemented("TopK", "Out parameter is not supported")
     if not _is_value(k):
@@ -897,6 +1028,7 @@ def _topk_helper(
 
 
 def _lt_helper(g: jit_utils.GraphContext, input, other):
+    # [FUNCTION DOC] HELPER: Emit a less-than comparison, using the opset 8 or opset 9 version.
     if g.opset <= 8:
         from torch.onnx._internal.torchscript_exporter.symbolic_opset8 import lt as _lt8
 
@@ -908,6 +1040,9 @@ def _lt_helper(g: jit_utils.GraphContext, input, other):
 
 
 def _interpolate_warning(interpolate_mode):
+    # [FUNCTION DOC] HELPER: Warn that Upsample/Resize may not match PyTorch before opset 11.
+    # Side effect: issues a warning naming Resize (opset 10 and up) or Upsample.
+    # KNOWN ISSUE: the interpolate_mode argument is not used.
     onnx_op = (
         "onnx:Resize" if GLOBALS.export_onnx_opset_version >= 10 else "onnx:Upsample"
     )
@@ -926,6 +1061,9 @@ def _interpolate_warning(interpolate_mode):
 
 
 def _unsqueeze_helper(g: jit_utils.GraphContext, input, axes_i):
+    # [FUNCTION DOC] HELPER: Emit an Unsqueeze of input over axes_i.
+    # Empty axes return input unchanged. Constant axes use an attribute (opset < 13) or a
+    # constant input; a non-constant axes tensor needs opset 13 or raises SymbolicValueError.
     if len(axes_i) == 0:
         # unnecessary unsqueeze if axes length==0
         return input
@@ -943,6 +1081,10 @@ def _unsqueeze_helper(g: jit_utils.GraphContext, input, axes_i):
 
 
 def _squeeze_helper(g: jit_utils.GraphContext, input, axes_i):
+    # [FUNCTION DOC] HELPER: Emit a Squeeze of input over axes_i.
+    # Constant axes use an attribute (opset < 13) or a constant input. A tensor axes needs
+    # opset 13, must be rank 0 (unsqueezed to rank 1) or 1; otherwise raises SymbolicValueError.
+    # KNOWN ISSUE: an empty axes list fails on indexing; the error text has typo "axses".
     if _is_constant(axes_i[0]):
         if g.opset >= 13:
             axes = g.op("Constant", value_t=torch.tensor(axes_i, dtype=torch.long))
@@ -975,6 +1117,10 @@ def _reducesum_helper(
     keepdims_i=1,
     noop_with_empty_axes_i=0,
 ):
+    # [FUNCTION DOC] HELPER: Emit a ReduceSum with the right form for the opset.
+    # From opset 13 axes is a constant input (created from a list if needed, omitted when
+    # empty or None) with keepdims and noop_with_empty_axes attributes; before that axes is an
+    # attribute and noop_with_empty_axes is ignored.
     keepdims_i = _maybe_get_const(keepdims_i, "i")
     if g.opset >= 13:
         if axes_i:
@@ -1000,6 +1146,10 @@ def _reducesum_helper(
 
 
 def _interpolate_size_to_scales(g: jit_utils.GraphContext, input, output_size, dim):
+    # [FUNCTION DOC] HELPER: Compute Resize scales from an output size.
+    # A non-constant size becomes size divided by the input spatial shape, preceded by two
+    # ones; a constant size is divided by the static input sizes for each dimension up to dim.
+    # Returns the scales constant or value. Adds nodes to graph g.
     output_size = _maybe_get_const(output_size, "is")
     if _is_value(output_size):
         offset = 2
@@ -1026,6 +1176,9 @@ def _interpolate_size_to_scales(g: jit_utils.GraphContext, input, output_size, d
 
 
 def _interpolate_get_scales_if_available(g: jit_utils.GraphContext, scales):
+    # [FUNCTION DOC] HELPER: Build a Resize scales vector from a scale_factor list if present.
+    # Returns None when the first scale is -1 or None; otherwise two ones followed by the
+    # constant scales.
     available_scales = _maybe_get_const(scales[0], "fs") != -1 and not _is_none(
         scales[0]
     )
@@ -1042,6 +1195,9 @@ def _interpolate_get_scales_if_available(g: jit_utils.GraphContext, scales):
 
 
 def _get_interpolate_attributes(g: jit_utils.GraphContext, mode, args):
+    # [FUNCTION DOC] HELPER: Split interpolate extra args into (scales, align_corners).
+    # For nearest mode all args are scales and align_corners is None; otherwise the first arg
+    # is align_corners and the rest are scales.
     if mode == "nearest":
         align_corners = None
         scales = args[0:]
@@ -1053,6 +1209,9 @@ def _get_interpolate_attributes(g: jit_utils.GraphContext, mode, args):
 
 
 def _interpolate_get_scales(g: jit_utils.GraphContext, scale_factor, dim):
+    # [FUNCTION DOC] HELPER: Build the Resize scales input from a scale_factor value.
+    # A list or rank-greater-than-zero factor is prefixed with two ones; a scalar factor is
+    # unsqueezed, cast to float and repeated for each spatial dimension (dim minus 2).
     offsets = g.op("Constant", value_t=torch.ones(2, dtype=torch.float32))
     scale_factor_rank = _get_tensor_rank(scale_factor)
     if isinstance(scale_factor.type(), _C.ListType) or (
@@ -1072,6 +1231,10 @@ def _interpolate_get_scales(g: jit_utils.GraphContext, scale_factor, dim):
 def _interpolate_get_scales_and_mode(
     g: jit_utils.GraphContext, input, size, scale_factor, mode, align_corners
 ):
+    # [FUNCTION DOC] HELPER: Normalize interpolate mode and compute scales.
+    # Mode names containing linear or cubic are collapsed to those names and a warning is
+    # emitted. Returns (scales, mode). Reports unsupported for align_corners true, unknown
+    # input rank, or when both size and scale_factor are None.
     mode = _maybe_get_const(mode, "s")
     if "linear" in mode:
         mode = "linear"
@@ -1111,7 +1274,12 @@ def _argmin_argmax_helper(
     keepdim: bool,
     op_name: str,
 ):
+    # [FUNCTION DOC] HELPER: Emit ArgMax/ArgMin (op_name) over dim, or over the flattened input.
+    # With no dim the input is flattened and reduced on axis 0, and with keepdim the result is
+    # reshaped to all ones with the input's rank. Returns the index Value.
     def op_wrapper(input, axis_i, keepdims_i):
+        # [FUNCTION DOC] HELPER: Emit the arg-reduction node, adding select_last_index false from
+        # opset 12.
         if g.opset >= 12:
             return g.op(
                 op_name,
@@ -1143,8 +1311,14 @@ def _argmin_argmax_helper(
 
 
 def _interpolate_helper(name, dim, interpolate_mode):
+    # [FUNCTION DOC] HELPER: Build the symbolic function for an interpolate variant.
+    # Returns a quantized-aware symbolic function that emits a Resize node with scales or an
+    # explicit size, depending on the attributes. name and dim are unused.
     @quantized_args(True, False, False)
     def symbolic_fn(g, input, output_size, *args):
+        # [FUNCTION DOC] HELPER: Emit Resize for input using output_size or scales from args.
+        # Coordinate mode is asymmetric for nearest, align_corners or half_pixel otherwise; empty
+        # roi (and scales) use optional placeholders from opset 13. Returns the Resize output.
         scales, align_corners = _get_interpolate_attributes(g, interpolate_mode, args)
         align_corners = _maybe_get_scalar(align_corners)
         coordinate_transformation_mode = (
@@ -1218,6 +1392,11 @@ def __interpolate_helper(
     align_corners,
     recompute_scale_factor,
 ):
+    # [FUNCTION DOC] HELPER: Emit Resize for the generic interpolate op.
+    # Handles an explicit size (scalar sizes are repeated per spatial dim) or scale_factor.
+    # Warns when scalar-ness of size cannot be verified; reports unsupported if the input
+    # rank is unknown. Returns the Resize output.
+    # KNOWN ISSUE: recompute_scale_factor is accepted but not used.
     mode = _maybe_get_const(mode, "s")
     if "linear" in mode:
         mode = "linear"
@@ -1310,6 +1489,7 @@ def __interpolate_helper(
 
 
 def _unbind_helper(g: jit_utils.GraphContext, self, dim, _outputs):
+    # [FUNCTION DOC] HELPER: Dispatch unbind to the opset 9, 11 or 13 implementation by opset.
     if g.opset < 11:
         from torch.onnx._internal.torchscript_exporter.symbolic_opset9 import unbind
     elif g.opset <= 12:
@@ -1324,6 +1504,7 @@ def _unbind_helper(g: jit_utils.GraphContext, self, dim, _outputs):
 
 
 def _scatter_helper(g: jit_utils.GraphContext, self, dim, index, src):
+    # [FUNCTION DOC] HELPER: Dispatch scatter to the opset 9 (<= 10) or opset 11 implementation.
     if g.opset <= 10:
         from torch.onnx._internal.torchscript_exporter.symbolic_opset9 import scatter
     else:
@@ -1335,6 +1516,8 @@ def _scatter_helper(g: jit_utils.GraphContext, self, dim, index, src):
 
 
 def _repeat_interleave_split_helper(g: jit_utils.GraphContext, self, reps, dim):
+    # [FUNCTION DOC] HELPER: Split self into reps single-element pieces along dim.
+    # Uses a Split attribute up to opset 12, a split input afterward. Always returns a list.
     if g.opset <= 12:
         split_out = g.op("Split", self, split_i=[1] * reps, axis_i=dim, outputs=reps)
     else:
@@ -1348,6 +1531,11 @@ def _repeat_interleave_split_helper(g: jit_utils.GraphContext, self, reps, dim):
 def _repeat_interleave_single_value_repeat_helper(
     g: jit_utils.GraphContext, self, repeats, dim
 ):
+    # [FUNCTION DOC] HELPER: Repeat each element of self along dim, for a single repeats value.
+    # Unsqueeze after dim, Tile by repeats on that axis (constant tile counts when repeats is
+    # constant), then flatten the two dims. Returns the result.
+    # KNOWN ISSUE: the non-constant repeats path passes an integer where a tensor is expected
+    # to the unsqueeze helper, which looks wrong.
     from torch.onnx._internal.torchscript_exporter.symbolic_opset9 import (
         flatten,
         unsqueeze,
@@ -1398,7 +1586,12 @@ def _arange_cast_helper(
     _C.Value | None,
     _C.Value | None,
 ]:
+    # [FUNCTION DOC] HELPER: Cast arange arguments to a common type.
+    # The type is the given dtype, or int64 if start/end/step are all integral, otherwise the
+    # default dtype. Returns (scalar type, end, start, step) with provided ones cast.
+    # KNOWN ISSUE: omitted arguments are detected by truthiness of the value.
     def _is_all_integral(scalars):
+        # [FUNCTION DOC] HELPER: True if every scalar has an int64 or undefined type.
         for scalar in scalars:
             scalar_type = _type_utils.JitScalarType.from_value(
                 scalar, _type_utils.JitScalarType.UNDEFINED
@@ -1434,6 +1627,7 @@ def _arange_cast_helper(
 
 
 def _arange_helper(g: jit_utils.GraphContext, *args):
+    # [FUNCTION DOC] HELPER: Dispatch arange to the opset 9 (<= 10) or opset 11 implementation.
     if g.opset <= 10:
         from torch.onnx._internal.torchscript_exporter.symbolic_opset9 import arange
     else:
@@ -1444,6 +1638,7 @@ def _arange_helper(g: jit_utils.GraphContext, *args):
 
 
 def _size_helper(g: jit_utils.GraphContext, self, dim):
+    # [FUNCTION DOC] HELPER: Emit the size of dimension dim of self via Shape and select.
     full_shape = g.op("Shape", self)
     from torch.onnx._internal.torchscript_exporter.symbolic_opset9 import select
 
@@ -1451,6 +1646,10 @@ def _size_helper(g: jit_utils.GraphContext, self, dim):
 
 
 def _index_fill_reshape_helper(g: jit_utils.GraphContext, self, dim, index):
+    # [FUNCTION DOC] HELPER: Prepare the expanded index and shape for index_fill.
+    # Reshapes the index so it lies along dim, builds the index shape by scattering its size
+    # into the input shape, and expands the index. Returns (expanded shape, expanded index).
+    # Reports unsupported if the input rank is unknown.
     # 1. reshape index => [1, ..., 1, dim, 1, ..., 1]
     # 2. expand index => [..., dim, ...], same shape as self except for dim.
     # 3. expand value as well.
@@ -1488,6 +1687,9 @@ def _index_fill_reshape_helper(g: jit_utils.GraphContext, self, dim, index):
 # the zero value is honored, similar to NumPy.
 # allowzero=1 is only supported for opset version >= 14.
 def _reshape_helper(g: jit_utils.GraphContext, input, shape, allowzero=0):
+    # [FUNCTION DOC] HELPER: Emit a Reshape to shape (constants converted to a tensor).
+    # allowzero is only supported from opset 14, otherwise reports an unsupported opset error.
+    # Returns the Reshape output.
     shape = _maybe_get_const(shape, "is")
     if not _is_value(shape):
         shape = g.op("Constant", value_t=torch.LongTensor(shape))
@@ -1504,6 +1706,10 @@ def _reshape_helper(g: jit_utils.GraphContext, input, shape, allowzero=0):
 def _batchnorm_helper(
     g: jit_utils.GraphContext, input, weight, bias, running_mean, running_var
 ):
+    # [FUNCTION DOC] HELPER: Fill in missing batch norm parameters.
+    # Missing weight/bias become constants of ones/zeros (raises SymbolicValueError if the
+    # channel size is unknown). Missing running stats are computed from the input batch.
+    # Returns (weight, bias, running_mean, running_var).
     from torch.onnx._internal.torchscript_exporter.symbolic_opset9 import _var_mean
 
     batch_size = _get_tensor_dim_size(input, 0)
@@ -1567,12 +1773,17 @@ def _avgpool_helper(
     divisor_override,
     name,
 ) -> tuple[int, ...]:
+    # [FUNCTION DOC] HELPER: Return padding converted by tuple_fn as a tuple.
+    # Reports unsupported if divisor_override is given and is not a constant. kernel_size and
+    # stride are accepted but not used.
     if divisor_override and divisor_override.node().kind() != "prim::Constant":
         _unimplemented(name, "divisor_override")
     return tuple(tuple_fn(padding))
 
 
 def check_training_mode(op_train_mode: int, op_name: str) -> None:
+    # [FUNCTION DOC] Warn if the op's train flag disagrees with the global export training mode.
+    # No warning for the preserve mode or when they match. Side effect: warnings.
     """Warns the user if the model's training mode and the export mode do not agree."""
     if GLOBALS.training_mode == _C_onnx.TrainingMode.PRESERVE:
         return
@@ -1599,6 +1810,9 @@ def check_training_mode(op_train_mode: int, op_name: str) -> None:
 
 
 def _flatten_helper(g: jit_utils.GraphContext, input, start_dim, end_dim, dim):
+    # [FUNCTION DOC] HELPER: Flatten dimensions start_dim to end_dim by reshaping.
+    # Builds the target shape from the leading sizes, minus one, and trailing sizes, then
+    # reshapes. Returns the reshaped Value.
     input_size = g.op("Shape", input)
     slice1 = _slice_helper(g, input_size, axes=[0], starts=[0], ends=[start_dim])
     slices = [slice1, g.op("Constant", value_t=torch.tensor([-1], dtype=torch.long))]
@@ -1621,6 +1835,7 @@ def _flatten_helper(g: jit_utils.GraphContext, input, start_dim, end_dim, dim):
 
 
 def _is_split_static(split_size_or_sizes, _outputs):
+    # [FUNCTION DOC] HELPER: True if split sizes are static: outputs known and sizes constant.
     if _outputs is None:
         return False
     if (
@@ -1632,12 +1847,15 @@ def _is_split_static(split_size_or_sizes, _outputs):
 
 
 def _optional_input_placeholder_tensor(g):
+    # [FUNCTION DOC] HELPER: Create an optional-tensor-typed placeholder for an omitted input.
     n = g.op("prim::Constant")
     n.setType(_C.OptionalType.ofTensor())
     return n
 
 
 def _handle_reduce_dim_none(g: jit_utils.GraphContext, self, op_name):
+    # [FUNCTION DOC] HELPER: Emit a full reduction op_name over self.
+    # keepdims is set when any dimension is of size zero, else cleared.
     rank = _get_tensor_rank(self)
     if rank is not None and any(
         _get_tensor_dim_size(self, i) == 0 for i in range(rank)
@@ -1653,6 +1871,9 @@ def dequantize_helper(
     qtensor: _C.Value,
     qdtype: _C_onnx.TensorProtoDataType | None = None,
 ) -> tuple[_C.Value, _C.Value, _C.Value, _C.Value | None]:
+    # [FUNCTION DOC] Emit nodes dequantizing a quantized tensor tuple.
+    # Casts the parts, then emits DequantizeLinear with the axis if present. Returns
+    # (dequantized tensor, scale, zero_point, axis). Raises if an axis is given for opset < 13.
     """Appends to graph `g` ONNX nodes that dequantizes `qtensor` into `tensor`.
 
     Args:
@@ -1703,6 +1924,10 @@ def quantize_helper(
     zero_point: _C.Value,
     axis: _C.Value | None = None,
 ) -> _C.Value:
+    # [FUNCTION DOC] Emit nodes quantizing a tensor and pack the result as a tuple.
+    # Casts scale to float and zero point to uint8 where needed, emits QuantizeLinear, and
+    # returns a TupleConstruct of (output, scale, zero_point[, axis]). Raises if an axis is
+    # given for opset < 13 or if scale or zero_point is None.
     """Appends to graph `g` ONNX nodes that quantizes `tensor` based on `scale`, `zero_point` and `axis`.
 
     Args:
@@ -1762,6 +1987,8 @@ def quantize_helper(
 def requantize_bias_helper(
     g: jit_utils.GraphContext, bias, input_scale, weight_scale, axis=None
 ):
+    # [FUNCTION DOC] Quantize a float bias to int32 using regular ops (divide by bias scale).
+    # Returns a quantized tuple of (int32 bias, bias scale, zero point zeros[, axis]).
     """In PyTorch, bias is float and is quantized to int32 implicitly inside the quantized ATen op kernel.
     In ONNX we need to make the quantization explicit because operators expect all of their inputs to be quantized.
     Since int32 is not a supported output type by ONNX operator `QuantizeLinear`, quantization is exported using
@@ -1782,6 +2009,8 @@ def requantize_bias_helper(
 
 
 def args_have_same_dtype(args):
+    # [FUNCTION DOC] True if all Values in args have the same scalar type as the first.
+    # Raises an error for an empty list.
     if not args:
         raise AssertionError("args must be non-empty")
     base_dtype = _type_utils.JitScalarType.from_value(args[0])
@@ -1792,6 +2021,11 @@ def args_have_same_dtype(args):
 
 
 def _op_with_optional_float_cast(g: jit_utils.GraphContext, op_name, *args, **kwargs):
+    # [FUNCTION DOC] HELPER: Emit op_name with float casting for non-float inputs when needed.
+    # Keyword options opset_before and target_float_t are popped before the node attributes.
+    # If the first input is not floating point and the opset is below opset_before (or it is
+    # not set), casts complete tensor inputs to the float type, runs the op, and casts back.
+    # Raises SymbolicValueError if tensor inputs have differing dtypes. Returns the output.
     """Some PyTorch operators (e.g., Clip/Min/ReLU/Pad) are super set of ONNX in terms of data types.
     This function maximizes the exportability of PyTorch-ONNX by allowing ONNX-unsupported PyTorch
     operator data type. For example, `Cast<int>(Clip<float>(Cast<float>(INPUT)))` can be used to mimic
@@ -1845,6 +2079,8 @@ def _op_with_optional_float_cast(g: jit_utils.GraphContext, op_name, *args, **kw
 
 
 def _maybe_cast_reduce_op_input(g: jit_utils.GraphContext, self):
+    # [FUNCTION DOC] HELPER: Cast non-float non-int64 reduce inputs to int64.
+    # Types that are unknown are left alone. Returns the (possibly cast) input.
     scalar_type = _type_utils.JitScalarType.from_value(
         self, _type_utils.JitScalarType.UNDEFINED
     )
@@ -1857,16 +2093,24 @@ def _maybe_cast_reduce_op_input(g: jit_utils.GraphContext, self):
 
 
 def _apply_params(*args, **kwargs):
+    # [FUNCTION DOC] HELPER: Return a decorator that calls the decorated function with args.
     """Returns a decorator that calls the decorated (higher-order) function with the given parameters."""
 
     def _apply(fn):
+        # [FUNCTION DOC] HELPER: Call fn with the captured arguments and return its result.
         return fn(*args, **kwargs)
 
     return _apply
 
 
 def _reduce_op_symbolic_helper(onnx_op_name, allow_multi_dim_support=True):
+    # [FUNCTION DOC] HELPER: Build a symbolic function for an ONNX reduce op.
+    # The result handles all-reduce (no dim) and dim reduce, using an axes attribute below
+    # opset 18 and an axes input from opset 18.
     def symbolic(g, self, dim=None, keepdim=None):
+        # [FUNCTION DOC] HELPER: Cast the input then emit the reduce op over self.
+        # Without dim, reduces everything. Otherwise needs constant keepdim and (before opset 18)
+        # constant dim.
         self = _maybe_cast_reduce_op_input(g, self)
         if dim is None or dim == ():
             # Dim can be 0, which will cause (not dim) == True. So we don't want to do
@@ -1899,8 +2143,12 @@ def _reduce_op_symbolic_helper(onnx_op_name, allow_multi_dim_support=True):
 
 
 def _overload_by_arg_count(fn):
+    # [FUNCTION DOC] HELPER: Decorator choosing an overload by the number of arguments.
+    # The wrapped function returns candidate overloads (parse_args-decorated); the first whose
+    # descriptor count equals the argument count is called, else reports unsupported.
     @functools.wraps(fn)
     def wrapper(g, *args):
+        # [FUNCTION DOC] HELPER: Call the overload matching the number of args, else unsupported.
         overloads = fn(g, *args)
         for overload in overloads:
             arg_descriptors = overload._arg_descriptors
@@ -1914,15 +2162,21 @@ def _overload_by_arg_count(fn):
 def _reduce_with_dtype_helper(
     onnx_op: str, name: str, allow_multi_dim_support: bool = True
 ):
+    # [FUNCTION DOC] HELPER: Build a symbolic function for a reduce op that accepts dtype.
+    # Returns an overload-by-arg-count function with two variants: without dim and with dim,
+    # keepdim and dtype. A constant dtype casts the input and result.
     symbolic = _reduce_op_symbolic_helper(
         onnx_op, allow_multi_dim_support=allow_multi_dim_support
     )
 
     @_overload_by_arg_count
     def reduce(g, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Return the (no dim, with dim) overload implementations.
         @quantized_args(True)
         @parse_args("v", "none")
         def reduce_nodim(g, self, dtype):
+            # [FUNCTION DOC] HELPER: Reduce all elements, applying a constant dtype cast if given.
+            # Reports unsupported for a non-constant dtype.
             dtype_onnx = None
             if dtype.node().kind() == "onnx::Constant":
                 dtype = _get_const(dtype, "i", "dtype")
@@ -1944,6 +2198,8 @@ def _reduce_with_dtype_helper(
         @quantized_args(True)
         @parse_args("v", dim_desc, "i", "none")  # type: ignore[arg-type]
         def reduce_dim(g, self, dim, keepdim, dtype):
+            # [FUNCTION DOC] HELPER: Reduce over dim with keepdim, with a constant dtype cast.
+            # Reports unsupported for a non-constant dtype.
             dtype_onnx = None
             if dtype.node().kind() == "onnx::Constant":
                 dtype = _get_const(dtype, "i", "dtype")
@@ -1966,6 +2222,8 @@ def _reduce_with_dtype_helper(
 
 
 def _max_helper(g: jit_utils.GraphContext, self, dim_or_y=None, keepdim=None):
+    # [FUNCTION DOC] HELPER: Symbolic helper for max: full reduction, elementwise with another
+    # tensor, or over a dim. Returns the value, or (values, indices) in the dim form.
     # torch.max(input)
     if dim_or_y is None and keepdim is None:
         return g.op("ReduceMax", self, keepdims_i=0)
@@ -1986,6 +2244,8 @@ def _max_helper(g: jit_utils.GraphContext, self, dim_or_y=None, keepdim=None):
 
 
 def _min_helper(g: jit_utils.GraphContext, self, dim_or_y=None, keepdim=None):
+    # [FUNCTION DOC] HELPER: Symbolic helper for min: full reduction, elementwise with another
+    # tensor, or over a dim. Returns the value, or (values, indices) in the dim form.
     # torch.min(input)
     if dim_or_y is None and keepdim is None:
         return g.op("ReduceMin", self, keepdims_i=0)
@@ -2006,12 +2266,16 @@ def _min_helper(g: jit_utils.GraphContext, self, dim_or_y=None, keepdim=None):
 
 
 def _numel_helper(g: jit_utils.GraphContext, self):
+    # [FUNCTION DOC] HELPER: Emit the number of elements of self as shape reduced by product.
     shape = g.op("Shape", self)
     return g.op("ReduceProd", shape, keepdims_i=0)
 
 
 @parse_args("v", "is", "i", "i")
 def _var_mean_helper(g: jit_utils.GraphContext, input, dim, correction, keepdim):
+    # [FUNCTION DOC] HELPER: Compute (variance, mean) of input over dim (or all) with correction.
+    # Variance is mean of squared deviations rescaled by count over count minus correction
+    # when correction is nonzero (default 1). Uses axes attributes below opset 18, inputs after.
     if g.opset < 18:
         if dim is None:
             mean = g.op("ReduceMean", input, keepdims_i=0)
@@ -2095,6 +2359,11 @@ def _embedding_bag_helper(
     include_last_offset,
     padding_idx,
 ):
+    # [FUNCTION DOC] HELPER: Emit the loop based ONNX export of embedding_bag.
+    # For each bag, slices indices by offsets, gathers embeddings, optionally weights them and
+    # reduces by mode (sum, mean, or max). Returns (output, None, None, None).
+    # Raises RuntimeError if padding_idx is nonnegative; reports unsupported for
+    # scale_grad_by_freq in training. Adds a Loop node with a body block to graph g.
     if scale_grad_by_freq and GLOBALS.export_training:
         return _onnx_unsupported(
             "embedding_bag with scale_grad_by_freq for training mode"
@@ -2197,6 +2466,9 @@ def _linalg_vector_norm_helper(
     keepdim: bool,
     dtype: torch._C.Value,
 ):
+    # [FUNCTION DOC] HELPER: Emit the vector norm for ord (inf, -inf, 0, 1, 2, other) over dim.
+    # No dim flattens the input. Casts the result to dtype if given. Returns the result.
+    # KNOWN ISSUE: for ord equal to 0 the function returns early, so dtype is never applied.
     axes = None
     # Conditions based on https://pytorch.org/docs/stable/generated/torch.linalg.vector_norm.html
     if _is_none(dim):
