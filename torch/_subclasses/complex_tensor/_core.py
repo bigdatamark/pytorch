@@ -1,3 +1,6 @@
+# [MODULE DOC] Defines ComplexTensor, a wrapper tensor subclass storing a complex value as separate real and imaginary
+# tensors, and the autograd Function Complex used to build one differentiably. All ops are handled via
+# torch dispatch using the registry in _ops.common. No import-time side effects.
 from __future__ import annotations
 
 from typing import Any, TYPE_CHECKING
@@ -15,6 +18,10 @@ if TYPE_CHECKING:
 
 
 class ComplexTensor(Tensor):
+    # [CLASS DOC] Wrapper subclass of Tensor whose complex dtype value is held as two real tensors, _re and _im, of equal shape,
+    # device, dtype and pinning. Ops are decomposed onto the parts through the dispatch table. Parts are detached copies
+    # (made contiguous), so the subclass itself never requires grad. Key members: re/im/real/imag, from_interleaved,
+    # as_interleaved, flatten/unflatten hooks.
     """A class that decomposes all ops on complex Tensors into their real and imaginary parts."""
 
     _re: Tensor
@@ -26,6 +33,9 @@ class ComplexTensor(Tensor):
         imag: Tensor,
         /,
     ) -> Self:
+        # [FUNCTION DOC] Create a ComplexTensor from real and imaginary parts (made contiguous). The complex dtype is derived from the real dtype.
+        # Raises TypeError for unsupported real dtypes; raises AssertionError if shape, device, dtype or pinning differ.
+        # Builds a wrapper subclass with the geometry of the real part and stores detached parts as _re and _im.
         """Initialize a ComplexTensor from its real and imaginary parts."""
         from ._ops.common import REAL_TO_COMPLEX
 
@@ -90,30 +100,37 @@ class ComplexTensor(Tensor):
         return res
 
     def __init__(self, *a: Any, **kw: Any) -> None:
+        # [FUNCTION DOC] Initializer accepting and ignoring all arguments (construction happens in __new__); calls the base initializer.
         super().__init__()
 
     @property
     def re(self) -> Tensor:
+        # [FUNCTION DOC] Property: the stored real part tensor.
         return self._re
 
     @property
     def im(self) -> Tensor:
+        # [FUNCTION DOC] Property: the stored imaginary part tensor.
         return self._im
 
     @property
     def real(self) -> Tensor:  # type: ignore[bad-override]
+        # [FUNCTION DOC] Property: alias of re, the real part.
         return self.re
 
     @real.setter
     def real(self, value: Tensor) -> None:
+        # [FUNCTION DOC] Setter: copy value into the real part in place (broadcast assignment). Mutates the tensor.
         self.re[...] = value
 
     @property
     def imag(self) -> Tensor:  # type: ignore[bad-override]
+        # [FUNCTION DOC] Property: alias of im, the imaginary part.
         return self.im
 
     @imag.setter
     def imag(self, value: Tensor) -> None:
+        # [FUNCTION DOC] Setter: copy value into the imaginary part in place (broadcast assignment). Mutates the tensor.
         self.im[...] = value
 
     @classmethod
@@ -125,6 +142,8 @@ class ComplexTensor(Tensor):
         args: tuple = (),
         kwargs: dict[str, Any] | None = None,
     ) -> Any:
+        # [FUNCTION DOC] Dispatch hook: looks up an implementation for the op (specific overload, packet, then decompositions) and calls it with
+        # the arguments. Returns NotImplemented if none is found so other handlers may try.
         from ._ops.common import lookup_complex
 
         kwargs = {} if kwargs is None else kwargs
@@ -137,11 +156,14 @@ class ComplexTensor(Tensor):
 
     @staticmethod
     def from_interleaved(t: Tensor) -> ComplexTensor:
+        # [FUNCTION DOC] Convert a regular tensor to a ComplexTensor through the autograd Function Complex. Takes the real part, and the imaginary
+        # part if the input is complex, else zeros. Returns the new ComplexTensor.
         re = torch.real(t)
         im = torch.imag(t) if t.dtype.is_complex else torch.zeros_like(t)
         return Complex.apply(re, im)
 
     def as_interleaved(self) -> Tensor:
+        # [FUNCTION DOC] Convert back to an ordinary complex-dtype tensor by combining the real and imaginary parts.
         return torch.complex(self.re, self.im)
 
     @staticmethod
@@ -151,26 +173,34 @@ class ComplexTensor(Tensor):
         outer_size: tuple[int, ...],
         outer_stride: tuple[int, ...],
     ) -> ComplexTensor:
+        # [FUNCTION DOC] Reconstruct from the inner tensors mapping (keys _re and _im); meta and outer size/stride are ignored.
         re, im = inner_tensors["_re"], inner_tensors["_im"]
         return ComplexTensor(re, im)
 
     def __tensor_flatten__(self) -> tuple[list[str], Any]:
+        # [FUNCTION DOC] Report the inner tensor attribute names (_re, _im) and no extra metadata.
         return ["_re", "_im"], None
 
     def __repr__(self, *, tensor_contents: object | None = None) -> str:
+        # [FUNCTION DOC] Representation showing the real and imaginary tensors; tensor_contents is ignored.
         return f"ComplexTensor({self._re!r}, {self._im!r})"
 
     def is_pinned(self, device: DeviceLikeType | None = None) -> bool:
+        # [FUNCTION DOC] Report pinned memory status by delegating to the real part for the given device.
         return self._re.is_pinned(device)
 
 
 class Complex(Function):
+    # [CLASS DOC] Autograd Function creating a ComplexTensor from real and imaginary tensors; backward splits the complex gradient
+    # back into real and imaginary gradients.
     @staticmethod
     def forward(  # type: ignore[bad-override]
         ctx: FunctionCtx, real: Tensor, imag: Tensor
     ) -> ComplexTensor:
+        # [FUNCTION DOC] Return a new ComplexTensor built from real and imag. ctx is unused.
         return ComplexTensor(real, imag)
 
     @staticmethod
     def backward(ctx: FunctionCtx, grad_output: ComplexTensor) -> tuple[Tensor, Tensor]:  # type: ignore[bad-override]
+        # [FUNCTION DOC] Return the real and imaginary parts of the incoming complex gradient as the two input gradients.
         return grad_output.real, grad_output.imag

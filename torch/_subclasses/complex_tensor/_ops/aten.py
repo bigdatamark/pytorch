@@ -1,3 +1,8 @@
+# [MODULE DOC] Registers ComplexTensor implementations for aten ops in the shared dispatch table, built from real-tensor
+# operations on the real and imaginary parts. Covers linear binary ops, simple per-part ops, binary nonlinear ops
+# (mul, mm, ...), unary math, comparisons, reductions, scatter/index ops, conjugation, dtype/device conversion, and
+# ops that always raise. Import-time side effects: loops register many ops and inject their impl functions into module
+# globals; temporary loop variables are deleted afterwards.
 from __future__ import annotations
 
 import warnings
@@ -31,6 +36,8 @@ aten = torch.ops.aten
 
 
 def register_binary_linear(op: OpType) -> Callable[..., Any]:
+    # [FUNCTION DOC] HELPER: Register an addition-style op (add, sub, copy, fill, ...) that acts separately on real and imaginary parts.
+    # An alpha keyword is folded into the second operand by multiplication. Returns the registered implementation.
     def impl_with_alpha(
         lhs: ComplexTensor,
         rhs: ComplexTensor,
@@ -38,11 +45,14 @@ def register_binary_linear(op: OpType) -> Callable[..., Any]:
         alpha: int | float | complex,
         **kwargs: Any,
     ) -> ComplexTensor:
+        # [FUNCTION DOC] HELPER: Multiply rhs by alpha, then apply the op to the complex operands.
         return op(lhs, aten.mul(rhs, alpha, *args, **kwargs), *args, **kwargs)
 
     def impl(
         lhs: ComplexTensor, rhs: ComplexTensor, *args: Any, **kwargs: Any
     ) -> ComplexTensor:
+        # [FUNCTION DOC] HELPER: Apply the op to real parts and imaginary parts separately after promotion, casting back to the promoted dtype.
+        # Handles the optional alpha keyword by delegating to the alpha variant.
         alpha = kwargs.pop("alpha", None)
         if alpha is not None:
             return impl_with_alpha(lhs, rhs, *args, alpha=alpha, **kwargs)
@@ -59,9 +69,11 @@ def register_binary_linear(op: OpType) -> Callable[..., Any]:
 def register_binary_linear_inplace(
     op: OpType, out_of_place_impl: Callable[..., Any]
 ) -> Callable[..., Any]:
+    # [FUNCTION DOC] HELPER: Register an in-place op whose result is computed by the out-of-place implementation and copied into lhs.
     def impl(
         lhs: ComplexTensor, rhs: ComplexTensor, *args: Any, **kwargs: Any
     ) -> ComplexTensor:
+        # [FUNCTION DOC] HELPER: Compute the out-of-place result, copy it into lhs in place, and return lhs.
         result = out_of_place_impl(lhs, rhs, *args, **kwargs)
         lhs.copy_(result)
         return lhs
@@ -71,16 +83,19 @@ def register_binary_linear_inplace(
 
 @register_complex(aten.real)
 def real_impl(self: ComplexTensor) -> torch.Tensor:
+    # [FUNCTION DOC] aten.real: return the real part tensor.
     return self.re
 
 
 @register_complex(aten.imag)
 def imag_impl(self: ComplexTensor) -> torch.Tensor:
+    # [FUNCTION DOC] aten.imag: return the imaginary part tensor.
     return self.im
 
 
 @register_complex(aten.is_pinned)
 def is_pinned_impl(self: ComplexTensor, device: torch.device | None = None) -> bool:
+    # [FUNCTION DOC] aten.is_pinned: report pinned status of the ComplexTensor for an optional device.
     return self.is_pinned(device)
 
 
@@ -172,6 +187,7 @@ fill__impl = register_binary_linear_inplace(aten.fill_, fill_impl)
 def rsub_impl(
     lhs: ComplexTensor, rhs: ComplexTensor, alpha: int | float | complex | None = None
 ) -> ComplexTensor:
+    # [FUNCTION DOC] rsub: reverse subtraction computed as rhs minus lhs (with optional alpha).
     if alpha is None:
         return torch.sub(rhs, lhs)  # type: ignore[bad-return]
     return torch.sub(rhs, lhs, alpha=alpha)  # type: ignore[bad-return]
@@ -182,6 +198,8 @@ def rsub_impl(
 def div_impl(
     lhs: ComplexTensor, rhs: ComplexTensor, *, rounding_mode: str | None = None
 ) -> ComplexTensor:
+    # [FUNCTION DOC] div and true_divide: complex division. Real divisor divides both parts; complex divisor uses numerator times conjugate over squared magnitude.
+    # Raises NotImplementedError if rounding_mode is given.
     if rounding_mode is not None:
         raise NotImplementedError(
             "`rounding_mode` other than `None` not implemented for`ComplexTensor`."
@@ -202,6 +220,7 @@ def div_impl(
 
 @register_complex(aten.reciprocal)
 def reciprocal_impl(self: ComplexTensor) -> ComplexTensor:
+    # [FUNCTION DOC] Reciprocal: conjugate over squared magnitude, in the promoted dtype.
     self_r, self_i = split_complex_tensor(self)
     out_dt, (self_r, self_i) = promote_tensors(self_r, self_i)
     den = self_r * self_r + self_i * self_i
@@ -214,6 +233,8 @@ def reciprocal_impl(self: ComplexTensor) -> ComplexTensor:
 # reductions
 @register_complex(aten.prod)
 def prod_impl(self: ComplexTensor, *args: Any, **kwargs: Any) -> ComplexTensor:
+    # [FUNCTION DOC] Product reduction via magnitude and phase: product of magnitudes with the sum of angles, then converted to the requested dtype.
+    # Pops dtype from kwargs; other args are passed to the reductions.
     out_dt, (self,) = promote_tensors(self)
     dtype = kwargs.pop("dtype", out_dt)
     kwargs["dtype"] = complex_to_real_dtype(self.dtype)
@@ -227,17 +248,20 @@ def prod_impl(self: ComplexTensor, *args: Any, **kwargs: Any) -> ComplexTensor:
 
 @register_complex(aten.complex)
 def complex_impl(re: torch.Tensor, im: torch.Tensor) -> ComplexTensor:
+    # [FUNCTION DOC] aten.complex: build a ComplexTensor from real and imaginary tensors.
     return ComplexTensor(re, im)
 
 
 @register_complex(aten.pow)
 def pow_impl(self: ComplexTensor, exponent: ComplexTensor) -> ComplexTensor:
+    # [FUNCTION DOC] Power: exp of exponent times log of base, cast to the promoted dtype.
     out_dt, (self, exponent) = promote_tensors(self, exponent)
     return torch.exp(exponent * torch.log(self)).to(out_dt)  # type: ignore[bad-return]
 
 
 @register_complex(aten.cumprod)
 def cumprod_impl(self: ComplexTensor, *args: Any, **kwargs: Any) -> ComplexTensor:
+    # [FUNCTION DOC] Cumulative product via cumprod of magnitudes and cumsum of angles; dtype defaults to the input dtype.
     dtype = kwargs.pop("dtype", self.dtype)
     kwargs["dtype"] = complex_to_real_dtype(dtype)
 
@@ -252,6 +276,7 @@ def cumprod_impl(self: ComplexTensor, *args: Any, **kwargs: Any) -> ComplexTenso
 # most of these are simple or require some kind of identity
 @register_complex(aten.abs)
 def abs_impl(self: ComplexTensor) -> torch.Tensor:
+    # [FUNCTION DOC] Absolute value (magnitude): hypot of real and imaginary parts in the promoted dtype; returns a real tensor.
     x, y = split_complex_tensor(self)
     out_dt, (x, y) = promote_tensors(x, y)
     result = torch.hypot(x, y)
@@ -260,12 +285,15 @@ def abs_impl(self: ComplexTensor) -> torch.Tensor:
 
 @register_complex(aten.angle)
 def angle_impl(self: ComplexTensor) -> torch.Tensor:
+    # [FUNCTION DOC] Phase angle: atan2 of imaginary over real part; returns a real tensor.
     x, y = split_complex_tensor(self)
     return torch.atan2(y, x)
 
 
 @register_complex(aten.acos)
 def acos_impl(self: ComplexTensor) -> ComplexTensor:
+    # [FUNCTION DOC] Inverse cosine via inverse hyperbolic cosine, adjusting signs using the sign bit of the imaginary part.
+    # Raises AssertionError if the intermediate is not a ComplexTensor.
     _, y = split_complex_tensor(self)
     acosh_z = torch.acosh(self)
     if not isinstance(acosh_z, ComplexTensor):
@@ -277,6 +305,7 @@ def acos_impl(self: ComplexTensor) -> ComplexTensor:
 
 @register_complex(aten.asin)
 def asin_impl(self: ComplexTensor) -> ComplexTensor:
+    # [FUNCTION DOC] Inverse sine via inverse hyperbolic sine of i*z; raises AssertionError if the intermediate is not a ComplexTensor.
     x, y = split_complex_tensor(self)
     asinh_iz = torch.asinh(ComplexTensor(-y, x))
     if not isinstance(asinh_iz, ComplexTensor):
@@ -287,6 +316,7 @@ def asin_impl(self: ComplexTensor) -> ComplexTensor:
 
 @register_complex(aten.atan)
 def atan_impl(self: ComplexTensor) -> ComplexTensor:
+    # [FUNCTION DOC] Inverse tangent via inverse hyperbolic tangent of i*z; raises AssertionError if the intermediate is not a ComplexTensor.
     x, y = split_complex_tensor(self)
     tanh_iz = torch.atanh(ComplexTensor(-y, x))
     if not isinstance(tanh_iz, ComplexTensor):
@@ -297,18 +327,21 @@ def atan_impl(self: ComplexTensor) -> ComplexTensor:
 
 @register_complex(aten.asinh)
 def asinh_impl(self: ComplexTensor) -> ComplexTensor:
+    # [FUNCTION DOC] Inverse hyperbolic sine: log of z plus sqrt of z squared plus one.
     out_dt, (self,) = promote_tensors(self)
     return torch.log(self + torch.sqrt(self * self + 1)).to(out_dt)  # type: ignore[bad-return]
 
 
 @register_complex(aten.acosh)
 def acosh_impl(self: ComplexTensor) -> ComplexTensor:
+    # [FUNCTION DOC] Inverse hyperbolic cosine: log of z plus sqrt of z squared minus one.
     out_dt, (self,) = promote_tensors(self)
     return torch.log(self + torch.sqrt(self * self - 1)).to(out_dt)  # type: ignore[bad-return]
 
 
 @register_complex(aten.atanh)
 def atanh_impl(self: ComplexTensor) -> ComplexTensor:
+    # [FUNCTION DOC] Inverse hyperbolic tangent: half the difference of logs of one plus z and one minus z. Raises AssertionError on a non-ComplexTensor intermediate.
     x, y = split_complex_tensor(self)
     out_dt, (x, y) = promote_tensors(x, y)
 
@@ -324,12 +357,14 @@ def atanh_impl(self: ComplexTensor) -> ComplexTensor:
 
 @register_complex(aten.cos)
 def cos_impl(self: ComplexTensor) -> ComplexTensor:
+    # [FUNCTION DOC] Cosine: computed as the hyperbolic cosine of i*z.
     x, y = split_complex_tensor(self)
     return torch.cosh(ComplexTensor(-y, x))  # type: ignore[bad-return]
 
 
 @register_complex(aten.cosh)
 def cosh_impl(self: ComplexTensor) -> ComplexTensor:
+    # [FUNCTION DOC] Hyperbolic cosine from real and imaginary parts: cosh(x)cos(y) + i sinh(x)sin(y).
     x, y = split_complex_tensor(self)
     out_dt, (x, y) = promote_tensors(x, y)
     u = torch.cosh(x) * torch.cos(y)
@@ -339,6 +374,7 @@ def cosh_impl(self: ComplexTensor) -> ComplexTensor:
 
 @register_complex(aten.sin)
 def sin_impl(self: ComplexTensor) -> ComplexTensor:
+    # [FUNCTION DOC] Sine via hyperbolic sine of i*z; raises AssertionError if the intermediate is not a ComplexTensor.
     x, y = split_complex_tensor(self)
     sinh_iz = torch.sinh(ComplexTensor(-y, x))
     if not isinstance(sinh_iz, ComplexTensor):
@@ -349,6 +385,7 @@ def sin_impl(self: ComplexTensor) -> ComplexTensor:
 
 @register_complex(aten.sinh)
 def sinh_impl(self: ComplexTensor) -> ComplexTensor:
+    # [FUNCTION DOC] Hyperbolic sine from parts: sinh(x)cos(y) + i cosh(x)sin(y).
     x, y = split_complex_tensor(self)
     out_dt, (x, y) = promote_tensors(x, y)
     u = torch.sinh(x) * torch.cos(y)
@@ -358,6 +395,7 @@ def sinh_impl(self: ComplexTensor) -> ComplexTensor:
 
 @register_complex(aten.tan)
 def tan_impl(self: ComplexTensor) -> ComplexTensor:
+    # [FUNCTION DOC] Tangent via hyperbolic tangent of i*z; raises AssertionError if the intermediate is not a ComplexTensor.
     x, y = split_complex_tensor(self)
     tanh_iz = torch.tanh(ComplexTensor(-y, x))
     if not isinstance(tanh_iz, ComplexTensor):
@@ -368,6 +406,7 @@ def tan_impl(self: ComplexTensor) -> ComplexTensor:
 
 @register_complex(aten.tanh)
 def tanh_impl(self: ComplexTensor) -> ComplexTensor:
+    # [FUNCTION DOC] Hyperbolic tangent using the double-angle formula: sinh(2x)/d + i sin(2y)/d with d = cosh(2x)+cos(2y).
     x, y = split_complex_tensor(self)
     out_dt, (x, y) = promote_tensors(x, y)
 
@@ -384,6 +423,7 @@ def tanh_impl(self: ComplexTensor) -> ComplexTensor:
 
 @register_complex(aten.exp)
 def exp_impl(self: ComplexTensor) -> ComplexTensor:
+    # [FUNCTION DOC] Exponential: e^x times cos(y) for the real part and e^x times sin(y) for the imaginary part.
     x, y = split_complex_tensor(self)
     out_dt, (x, y) = promote_tensors(x, y)
     ex = torch.exp(x)
@@ -394,6 +434,7 @@ def exp_impl(self: ComplexTensor) -> ComplexTensor:
 
 @register_complex(aten.expm1)
 def expm1_impl(self: ComplexTensor) -> ComplexTensor:
+    # [FUNCTION DOC] exp minus one using exp(x)cos(y)-1 and exp(x)sin(y); may lose precision for small inputs (noted TODO).
     x, y = split_complex_tensor(self)
     out_dt, (x, y) = promote_tensors(x, y)
     # TODO (hameerabbasi): The two lines below may have numerical issues
@@ -405,6 +446,7 @@ def expm1_impl(self: ComplexTensor) -> ComplexTensor:
 
 @register_complex(aten.log)
 def log_impl(self: ComplexTensor) -> ComplexTensor:
+    # [FUNCTION DOC] Natural log: log of magnitude plus i times angle, cast to promoted dtype.
     out_dt, (self,) = promote_tensors(self)
     re = torch.log(torch.abs(self))
     im = torch.angle(self)
@@ -413,6 +455,7 @@ def log_impl(self: ComplexTensor) -> ComplexTensor:
 
 @register_complex(aten.log1p)
 def log1p_impl(self: ComplexTensor) -> ComplexTensor:
+    # [FUNCTION DOC] log(1+z) computed as log of z with one added to the real part; may be numerically inaccurate (noted TODO).
     x, y = split_complex_tensor(self)
     # TODO (hameerabbasi): The line below may have numerical issues
     return torch.log(ComplexTensor(x + 1, y))  # type: ignore[bad-return]
@@ -420,12 +463,15 @@ def log1p_impl(self: ComplexTensor) -> ComplexTensor:
 
 @register_complex(aten.any)
 def any_impl(self: ComplexTensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+    # [FUNCTION DOC] any: true where either real or imaginary part has a true element; extra args pass to the reduction.
     x, y = split_complex_tensor(self)
     return torch.any(x, *args, **kwargs) | torch.any(y, *args, **kwargs)
 
 
 @register_complex(aten.all)
 def all_impl(self: ComplexTensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+    # [FUNCTION DOC] all reduction intended for complex values.
+    # KNOWN ISSUE: combines parts with 'any' reductions instead of 'all', so the result is wrong for all-semantics.
     x, y = split_complex_tensor(self)
     return torch.any(x, *args, **kwargs) & torch.any(y, *args, **kwargs)
 
@@ -434,6 +480,7 @@ def all_impl(self: ComplexTensor, *args: Any, **kwargs: Any) -> torch.Tensor:
 def eq_impl(
     self: ComplexTensor, rhs: ComplexTensor, *args: Any, **kwargs: Any
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Elementwise equality: both real and imaginary parts equal.
     a_r, a_i = split_complex_arg(self)
     b_r, b_i = split_complex_arg(rhs)
     return torch.eq(a_r, b_r, *args, **kwargs) & torch.eq(a_i, b_i, *args, **kwargs)
@@ -443,6 +490,7 @@ def eq_impl(
 def ne_impl(
     self: ComplexTensor, rhs: ComplexTensor, *args: Any, **kwargs: Any
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Elementwise inequality: real parts differ or imaginary parts differ.
     a_r, a_i = split_complex_arg(self)
     b_r, b_i = split_complex_arg(rhs)
     return torch.ne(a_r, b_r, *args, **kwargs) | torch.ne(a_i, b_i, *args, **kwargs)
@@ -452,18 +500,21 @@ def ne_impl(
 def isnan_impl(self: ComplexTensor) -> torch.Tensor:
     re, im = split_complex_tensor(self)
     return torch.isnan(re) | torch.isnan(im)
+    # [FUNCTION DOC] True where either part is NaN.
 
 
 @register_complex(aten.isinf)
 def isinf_impl(self: ComplexTensor) -> torch.Tensor:
     re, im = split_complex_tensor(self)
     return torch.isinf(re) | torch.isinf(im)
+    # [FUNCTION DOC] True where either part is infinite.
 
 
 @register_complex(aten.isfinite)
 def isfinite_impl(self: ComplexTensor) -> torch.Tensor:
     re, im = split_complex_tensor(self)
     return torch.isfinite(re) & torch.isfinite(im)
+    # [FUNCTION DOC] True where both parts are finite.
 
 
 @register_complex(aten.isclose)
@@ -474,6 +525,8 @@ def isclose_impl(
     atol: float = 1e-8,
     equal_nan: bool = False,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] isclose for complex values: the magnitude of the difference is within rtol times magnitude of rhs plus atol.
+    # With equal_nan, positions where both operands have NaN in matching parts are also treated as close.
     abs_diff = torch.abs(self - rhs)
     abs_other = torch.abs(rhs)
     basic_condition = abs_diff <= (rtol * abs_other + atol)
@@ -542,6 +595,7 @@ del err_op
 def masked_scatter_impl(
     self: ComplexTensor, mask: torch.Tensor, source: ComplexTensor
 ) -> ComplexTensor:
+    # [FUNCTION DOC] masked_scatter applied separately to real and imaginary parts.
     self_r, self_i = split_complex_tensor(self)
     source_r, source_i = split_complex_arg(source)
     ret_r = torch.masked_scatter(self_r, mask, source_r)
@@ -552,6 +606,7 @@ def masked_scatter_impl(
 
 @register_complex(aten.where)
 def where_impl(mask: torch.Tensor, x: ComplexTensor, y: ComplexTensor) -> ComplexTensor:
+    # [FUNCTION DOC] where: select between x and y per mask, applied to each part.
     x_r, x_i = split_complex_arg(x)
     y_r, y_i = split_complex_arg(y)
 
@@ -569,6 +624,8 @@ def full_like_impl(
     dtype: torch.dtype | None = None,
     **kwargs: Any,
 ) -> torch.Tensor | ComplexTensor:
+    # [FUNCTION DOC] full_like: with a non-complex dtype returns a real tensor filled with the value for the real part; otherwise fills real and
+    # imaginary parts with the parts of fill_value.
     # Note: Cannot be merged with the cases below due to the `fill_value` argument
     input_r, input_i = split_complex_tensor(input)
     if dtype is not None and dtype not in COMPLEX_TO_REAL:
@@ -585,9 +642,11 @@ def full_like_impl(
 
 
 def register_like(op: OpType) -> Callable[..., Any]:
+    # [FUNCTION DOC] HELPER: Register a '_like' style creation op by applying it to each part; a non-complex dtype returns a real tensor from the real part.
     def impl(
         self: ComplexTensor, *args: Any, dtype: torch.dtype | None = None, **kwargs: Any
     ) -> torch.Tensor | ComplexTensor:
+        # [FUNCTION DOC] HELPER: Apply the op to real and imaginary parts (mapping a complex dtype to its real dtype) and recombine.
         self_re, self_im = split_complex_tensor(self)
 
         if dtype is not None and dtype not in COMPLEX_TO_REAL:
@@ -623,6 +682,7 @@ del like_op
 
 @register_complex(aten.cat)
 def cat_impl(tensors: Sequence[ComplexTensor], dim: int = 0) -> ComplexTensor:
+    # [FUNCTION DOC] cat: concatenate real and imaginary parts of each input (real inputs get zero imaginary) along dim.
     tensors_r = []
     tensors_i = []
 
@@ -639,6 +699,7 @@ def cat_impl(tensors: Sequence[ComplexTensor], dim: int = 0) -> ComplexTensor:
 
 @register_complex(aten.sgn)
 def sgn_impl(self: ComplexTensor) -> ComplexTensor:
+    # [FUNCTION DOC] Complex sign: z divided by its magnitude where nonzero, else zero.
     self_r, self_i = split_complex_tensor(self)
     out_dt, (self_r, self_i) = promote_tensors(self_r, self_i)
     abs_self = torch.abs(ComplexTensor(self_r, self_i))
@@ -651,6 +712,7 @@ def sgn_impl(self: ComplexTensor) -> ComplexTensor:
 
 @register_complex(aten.sqrt)
 def sqrt_impl(self: ComplexTensor) -> ComplexTensor:
+    # [FUNCTION DOC] Square root via square root of magnitude and half the angle.
     self_r, self_i = split_complex_tensor(self)
     out_dt, (self_r, self_i) = promote_tensors(self_r, self_i)
     self = ComplexTensor(self_r, self_i)
@@ -665,6 +727,7 @@ def sqrt_impl(self: ComplexTensor) -> ComplexTensor:
 
 @register_complex(aten.rsqrt)
 def rsqrt_impl(self: ComplexTensor) -> ComplexTensor:
+    # [FUNCTION DOC] Reciprocal square root via reciprocal sqrt of magnitude and negative half angle.
     self_r, self_i = split_complex_tensor(self)
     out_dt, (self_r, self_i) = promote_tensors(self_r, self_i)
     self = ComplexTensor(self_r, self_i)
@@ -686,6 +749,8 @@ def addmm_impl(
     beta: int | float | complex = 1,
     alpha: int | float | complex = 1,
 ) -> ComplexTensor:
+    # [FUNCTION DOC] addmm as beta*input + alpha*(mat1 @ mat2); if out_dtype is given it is mapped to the real dtype and the parts are cast.
+    # Raises AssertionError if the sum is not a ComplexTensor.
     ret = beta * input + alpha * torch.mm(mat1, mat2)
     if not isinstance(ret, ComplexTensor):
         raise AssertionError(f"ret must be a ComplexTensor, got {type(ret)}")
@@ -697,14 +762,17 @@ def addmm_impl(
 
 
 def elemwise_nonzero(self: ComplexTensor) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Boolean tensor true where the real or imaginary part is nonzero.
     re, im = split_complex_tensor(self)
     return (re != 0) | (im != 0)
 
 
 def register_nonzero_impl(op: OpType) -> Callable[..., Any]:
+    # [FUNCTION DOC] HELPER: Register a logical binary op applied to the elementwise nonzero masks of both operands.
     def nonzero_impl(
         self: ComplexTensor, other: ComplexTensor, *args: Any, **kwargs: Any
     ) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Apply the op to the nonzero masks of self and other.
         return op(elemwise_nonzero(self), elemwise_nonzero(other), *args, **kwargs)
 
     func_name = _get_func_name(op)
@@ -722,16 +790,19 @@ logical_xor_impl = register_nonzero_impl(aten.logical_xor)
 @register_complex(aten.logical_not)
 def logical_not_impl(self: ComplexTensor, *args: Any, **kwargs: Any) -> torch.Tensor:
     return torch.logical_not(elemwise_nonzero(self), *args, **kwargs)
+    # [FUNCTION DOC] logical_not applied to the nonzero mask.
 
 
 @register_complex(aten.view_as_real)
 def view_as_real_impl(self: ComplexTensor) -> torch.Tensor:
     return torch.stack([self.re, self.im], dim=-1)
+    # [FUNCTION DOC] view_as_real: stack real and imaginary parts along a new last dimension.
 
 
 @register_complex(aten.view_as_complex)
 def view_as_complex_impl(self: ComplexTensor) -> torch.Tensor:
     if len(self.shape) < 1 or self.shape[-1] != 2:
+    # [FUNCTION DOC] view_as_complex: build a ComplexTensor from the two slices of the last dimension. Raises RuntimeError if last dimension is not size 2.
         raise RuntimeError("Tensor must have a last dimension of size 2")
     return ComplexTensor(self[..., 0], self[..., 1])
 
@@ -740,6 +811,7 @@ def view_as_complex_impl(self: ComplexTensor) -> torch.Tensor:
 def linalg_vector_norm_impl(
     self: ComplexTensor, *args: Any, **kwargs: Any
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Vector norm of the magnitude tensor; arguments pass through.
     return torch.linalg.vector_norm(torch.abs(self), *args, **kwargs)
 
 
@@ -750,6 +822,8 @@ def copy__impl(
     *args: Any,
     **kwargs: Any,
 ) -> ComplexTensor | torch.Tensor:
+    # [FUNCTION DOC] In-place copy. If destination is not complex, warns that the imaginary part is discarded and copies the real part of src.
+    # Otherwise copies real and imaginary parts in place. Mutates self.
     if not self.dtype.is_complex:
         warnings.warn(
             "Casting complex values to real discards the imaginary part", UserWarning
@@ -768,6 +842,7 @@ def copy__impl(
 
 @register_complex(aten._local_scalar_dense)
 def _local_scalar_dense_impl(self: ComplexTensor, *args: Any, **kwargs: Any) -> complex:
+    # [FUNCTION DOC] Extract a Python complex scalar from a one-element ComplexTensor by reading both parts.
     x, y = split_complex_tensor(self)
     u = aten._local_scalar_dense(x, *args, **kwargs)
     v = aten._local_scalar_dense(y, *args, **kwargs)
@@ -782,6 +857,7 @@ def allclose_impl(
     atol: float = 1e-08,
     equal_nan: bool = False,
 ) -> bool:
+    # [FUNCTION DOC] allclose: all elements isclose; returns a Python bool.
     # pyrefly: ignore [bad-return]
     return torch.all(
         torch.isclose(input, other, rtol=rtol, atol=atol, equal_nan=equal_nan)
@@ -790,6 +866,7 @@ def allclose_impl(
 
 @register_complex(aten.stack)
 def stack_impl(self: list[ComplexTensor], *args: Any, **kwargs: Any) -> ComplexTensor:
+    # [FUNCTION DOC] stack: stack real and imaginary parts of each element separately.
     re_im_tuples = [split_complex_arg(self_i) for self_i in self]
     u = torch.stack([c[0] for c in re_im_tuples], *args, **kwargs)
     v = torch.stack([c[1] for c in re_im_tuples], *args, **kwargs)
@@ -800,30 +877,35 @@ def stack_impl(self: list[ComplexTensor], *args: Any, **kwargs: Any) -> ComplexT
 @register_complex(aten._conj_physical)
 @register_complex(aten.conj_physical)
 def conj_physical_impl(self: ComplexTensor) -> ComplexTensor:
+    # [FUNCTION DOC] Physical conjugate: negate the imaginary part. Registered for both conj_physical overloads.
     re, im = split_complex_tensor(self)
     return ComplexTensor(re, -im)
 
 
 @register_complex(aten._conj)
 def _conj_impl(self: ComplexTensor) -> ComplexTensor:
+    # [FUNCTION DOC] Lazy conjugate: alias of real part with negated imaginary part (no true lazy flag).
     # See "NOTE conj/neg (hameerabbasi)"
     return ComplexTensor(aten.alias(self.re), -self.im)
 
 
 @register_complex(aten._neg_view)
 def _neg_view_impl(self: ComplexTensor) -> ComplexTensor:
+    # [FUNCTION DOC] Lazy negation: negate both parts.
     # See "NOTE conj/neg (hameerabbasi)"
     return ComplexTensor(-self.re, -self.im)
 
 
 @register_complex(aten.resolve_conj)
 def resolve_conj_impl(self: ComplexTensor) -> ComplexTensor:
+    # [FUNCTION DOC] resolve_conj: returns self (conjugation is already materialized).
     # See "NOTE conj/neg (hameerabbasi)"
     return self
 
 
 @register_complex(aten.resolve_neg)
 def resolve_neg_impl(self: ComplexTensor) -> ComplexTensor:
+    # [FUNCTION DOC] resolve_neg: returns self (negation is already materialized).
     # See "NOTE conj/neg (hameerabbasi)"
     return self
 
@@ -836,6 +918,7 @@ def index_add_impl(
     source: ComplexTensor,
     **kwargs: Any,
 ) -> ComplexTensor:
+    # [FUNCTION DOC] index_add out of place on each part; an alpha kwarg scales the source first.
     alpha = kwargs.pop("alpha", None)
     if alpha is not None:
         source = source * alpha
@@ -857,6 +940,7 @@ def index_add__impl(
     source: ComplexTensor,
     **kwargs: Any,
 ) -> ComplexTensor:
+    # [FUNCTION DOC] index_add in place on each part; an alpha kwarg scales the source first. Mutates parts.
     alpha = kwargs.pop("alpha", None)
     if alpha is not None:
         source = source * alpha
@@ -874,6 +958,7 @@ def index_add__impl(
 def masked_fill_impl(
     self: ComplexTensor, mask: torch.Tensor, value: complex
 ) -> ComplexTensor:
+    # [FUNCTION DOC] masked_fill on each part with the parts of value.
     self_re, self_im = split_complex_arg(self)
     value_re, value_im = split_complex_arg(value)
 
@@ -888,6 +973,7 @@ def masked_fill_impl(
 def masked_fill__impl(
     self: ComplexTensor, mask: torch.Tensor, value: complex
 ) -> ComplexTensor:
+    # [FUNCTION DOC] In-place masked_fill on each part. Mutates self.
     self_re, self_im = split_complex_arg(self)
     value_re, value_im = split_complex_arg(value)
 
@@ -901,6 +987,7 @@ def masked_fill__impl(
 def constant_pad_nd_impl(
     self: ComplexTensor, pad: Sequence[int], value: complex | None = None
 ) -> ComplexTensor:
+    # [FUNCTION DOC] constant_pad_nd applied to each part; the pad value, if any, is split into parts.
     self_re, self_im = split_complex_tensor(self)
     if value is None:
         ret_re = aten.constant_pad_nd(self_re, pad)
@@ -915,6 +1002,7 @@ def constant_pad_nd_impl(
 
 @register_complex(aten.var)
 def var_impl(self: ComplexTensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+    # [FUNCTION DOC] Variance: sum of the variances of real and imaginary parts.
     self_re, self_im = split_complex_tensor(self)
     return torch.var(self_re, *args, **kwargs) + torch.var(self_im, *args, **kwargs)
 
@@ -923,6 +1011,7 @@ def var_impl(self: ComplexTensor, *args: Any, **kwargs: Any) -> torch.Tensor:
 def scatter_add_impl(
     self: ComplexTensor, dim: int, index: torch.Tensor, src: ComplexTensor
 ) -> ComplexTensor:
+    # [FUNCTION DOC] scatter_add on each part.
     self_re, self_im = split_complex_arg(self)
     src_re, src_im = split_complex_arg(src)
 
@@ -936,6 +1025,7 @@ def scatter_add_impl(
 def scatter_add__impl(
     self: ComplexTensor, dim: int, index: torch.Tensor, src: ComplexTensor
 ) -> ComplexTensor:
+    # [FUNCTION DOC] In-place scatter_add on each part. Mutates self.
     self_re, self_im = split_complex_arg(self)
     src_re, src_im = split_complex_arg(src)
 
@@ -952,6 +1042,7 @@ def index_put__impl(
     values: ComplexTensor,
     accumulate: bool = False,
 ) -> ComplexTensor:
+    # [FUNCTION DOC] In-place index_put on each part with optional accumulate. Mutates self.
     self_re, self_im = split_complex_arg(self)
     values_re, values_im = split_complex_arg(values)
 
@@ -963,6 +1054,7 @@ def index_put__impl(
 
 @register_complex(aten.tanh_backward)
 def tanh_backward(out_grad: ComplexTensor, y: ComplexTensor) -> ComplexTensor:
+    # [FUNCTION DOC] tanh backward: out_grad times conj_physical of one minus y squared.
     # pyrefly: ignore[bad-return]
     return out_grad * (1.0 - y * y).conj_physical()
 
@@ -971,11 +1063,13 @@ def tanh_backward(out_grad: ComplexTensor, y: ComplexTensor) -> ComplexTensor:
 def diagonal_backward(
     grad_output: torch.Tensor, input_sizes: list[int], offset: int, dim1: int, dim2: int
 ) -> torch.Tensor:
+    # [FUNCTION DOC] diagonal backward: scatter grad_output into a zero tensor of input_sizes along the diagonal.
     grad_input = grad_output.new_zeros(input_sizes)
     return torch.diagonal_scatter(grad_input, grad_output, offset, dim1, dim2)
 
 
 def _dt_to_real(dt: torch.dtype | Any) -> torch.dtype | Any:
+    # [FUNCTION DOC] HELPER: Map a complex dtype to its real dtype, pass non-dtype values through. Raises KeyError for non-complex dtypes. Currently unused.
     if not isinstance(dt, torch.dtype):
         return dt
 
@@ -992,6 +1086,8 @@ def to_dtype_layout(
     _op: OpType = aten.to,
     **kwargs: Any,
 ) -> ComplexTensor | torch.Tensor:
+    # [FUNCTION DOC] Core of to(): normalize away no-op device/dtype and return self if nothing changes and copy is False. For non-complex target dtype,
+    # apply the op to the real part only (discarding imaginary); otherwise apply it to both parts with the real dtype and recombine.
     if device == self.device:
         device = None
 
@@ -1020,6 +1116,7 @@ def to_device(
     copy: bool = False,
     memory_format: torch.memory_format | None = torch.preserve_format,
 ) -> ComplexTensor | torch.Tensor:
+    # [FUNCTION DOC] aten.to with device: forwards to the dtype-layout implementation.
     return to_dtype_layout(
         self,
         device=device,
@@ -1038,6 +1135,7 @@ def to_dtype(
     copy: bool = False,
     memory_format: torch.memory_format | None = torch.preserve_format,
 ) -> ComplexTensor | torch.Tensor:
+    # [FUNCTION DOC] aten.to with dtype: forwards to the dtype-layout implementation.
     return to_dtype_layout(
         self,
         dtype=dtype,
@@ -1055,6 +1153,7 @@ def to_other(
     copy: bool = False,
     memory_format: torch.memory_format | None = torch.preserve_format,
 ) -> ComplexTensor | torch.Tensor:
+    # [FUNCTION DOC] aten.to with another tensor: forwards using its dtype and device.
     return to_dtype_layout(
         self,
         dtype=other.dtype,
@@ -1076,6 +1175,7 @@ def _to_copy_default(
     non_blocking: bool = False,
     memory_format: torch.memory_format | None = None,
 ) -> ComplexTensor | torch.Tensor:
+    # [FUNCTION DOC] aten._to_copy default overload: forwards to the dtype-layout implementation using the _to_copy op.
     return to_dtype_layout(
         self,
         dtype=dtype,
@@ -1096,6 +1196,7 @@ def _to_copy_out(
     memory_format: torch.memory_format | None = None,
     out: torch.Tensor | ComplexTensor,
 ) -> ComplexTensor | torch.Tensor:
+    # [FUNCTION DOC] _to_copy out overload: compute the copy using out's dtype, layout, device and pin state, copy into out, and return out. Mutates out.
     temp = _to_copy_default(
         self,
         dtype=out.dtype,
