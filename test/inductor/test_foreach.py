@@ -1,4 +1,12 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Inductor tests for foreach ops (torch._foreach_* and the foreach_map higher-
+# order op) on GPU, with some CPU cases. The module defines wrapper ops, lists of ops under
+# test grouped by arity, parametrize decorators over those lists, an argument generator, and
+# the ForeachTests case class.
+# Tests compile small functions and check results against eager mode plus the number of
+# kernels inductor generated (fusion into a single combo kernel, splitting, fallbacks).
+# Import-time effects: imports test_torchinductor helpers (on failure writes to stderr, exits
+# 0 if run as main, otherwise re-raises) and builds the foreach_map wrapper ops and op lists.
 
 import sys
 import unittest
@@ -40,7 +48,13 @@ except (unittest.SkipTest, ImportError) as e:
 
 
 def foreach_map_wrapper(op):
+    # [FUNCTION DOC] HELPER: Build a callable that applies the given elementwise op over lists
+    # through the foreach_map higher-order op. The returned wrapper is renamed to foreach_map_
+    # plus the op name and keeps the original op in an original_op attribute so tests can look
+    # it up. Returns the wrapper.
     def wrapper(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Forward all positional and keyword arguments to foreach_map
+        # together with the captured op and return its result (a list of tensors).
         return foreach_map(op, *args, **kwargs)
 
     wrapper.__name__ = "foreach_map_" + op.__name__
@@ -50,23 +64,31 @@ def foreach_map_wrapper(op):
 
 
 def add_op(x, y):
+    # [FUNCTION DOC] HELPER: Elementwise sum of two tensors via torch.add; used as a
+    # foreach_map body.
     return torch.add(x, y)
 
 
 def add_inplace_op(x, y):
+    # [FUNCTION DOC] HELPER: Add y into x in place (mutating the input x) and return the sine
+    # of the mutated x. Used to test input mutation inside foreach_map.
     x.add_(y)
     return x.sin()
 
 
 def addrecip_op(x, y):
+    # [FUNCTION DOC] HELPER: Return the elementwise reciprocal of the sum of x and y.
     return torch.reciprocal(torch.add(x, y))
 
 
 def addcmul_op(x, y, z):
+    # [FUNCTION DOC] HELPER: Ternary op body: return the product of the sum of x and y with z.
     return torch.mul(torch.add(x, y), z)
 
 
 def recipaddmul_op(x, y, z):
+    # [FUNCTION DOC] HELPER: Ternary op body: return the sum of the reciprocal of x and y,
+    # multiplied elementwise by z.
     return torch.mul(torch.add(torch.reciprocal(x), y), z)
 
 
@@ -189,6 +211,10 @@ decomp_ops = parametrize("op", compose_ops, name_fn=lambda f: f.__name__)
 
 
 def gen_args(op):
+    # [FUNCTION DOC] HELPER: Create GPU_TYPE random input tensors matching the arity of op.
+    # Unary ops (members of un_ops_under_test) get two tensors, shaped 10x10 and 20x20; binary
+    # ops get four (two such pairs); any other op is treated as ternary and gets six. Returns
+    # a tuple of tensors.
     if op in un_ops_under_test:
         return (
             torch.rand(10, 10, device=GPU_TYPE),
@@ -214,32 +240,53 @@ def gen_args(op):
 
 @instantiate_parametrized_tests
 class ForeachTests(TestCase):
+    # [CLASS DOC] Test case for inductor's lowering and fusion of foreach ops. The class
+    # attributes check_model_gpu and check_model_cpu alias the shared checkers from
+    # test_torchinductor (compare compiled output with eager and references), and
+    # check_kernel_count is True. setUp and tearDown reset inductor metrics so tests can
+    # assert on the generated kernel count. Most tests are GPU-only and parametrized over op
+    # lists.
     check_model_gpu = check_model_gpu
     check_model_cpu = check_model
     check_kernel_count = True
 
     def setUp(self):
+        # [FUNCTION DOC] Run the parent setUp, then reset inductor metrics so the generated
+        # kernel count starts at zero.
         super().setUp()
         torch._inductor.metrics.reset()
 
     def tearDown(self):
+        # [FUNCTION DOC] Run the parent tearDown, then reset inductor metrics again so no
+        # counts leak into later tests.
         super().tearDown()
         torch._inductor.metrics.reset()
 
     def _test_single_list(self, op):
+        # [FUNCTION DOC] HELPER: Compile and check one foreach call over two-element tensor
+        # lists. The wrapped function takes 2, 4 or 6 tensors depending on whether op is
+        # unary, binary or other (ternary), passes them as lists to op, and is verified with
+        # check_model_gpu using generated arguments. Does not assert the kernel count; callers
+        # do.
         if op in un_ops_under_test:
 
             def fn(a0, a1):
+                # [FUNCTION DOC] HELPER: Unary variant: apply op to a list of the two inputs and
+                # return the result.
                 return op([a0, a1])
 
         elif op in bin_ops_under_test:
 
             def fn(a0, a1, b0, b1):
+                # [FUNCTION DOC] HELPER: Binary variant: apply op to a list of the first pair and
+                # a list of the second pair.
                 return op([a0, a1], [b0, b1])
 
         else:
 
             def fn(a0, a1, b0, b1, c0, c1):
+                # [FUNCTION DOC] HELPER: Ternary variant: apply op to three two-element lists
+                # built from the six inputs.
                 return op([a0, a1], [b0, b1], [c0, c1])
 
         self.check_model_gpu(
@@ -248,7 +295,11 @@ class ForeachTests(TestCase):
         )
 
     def _test_single_scalar(self, op):
+        # [FUNCTION DOC] HELPER: Compile and check op applied to a two-tensor list and the
+        # python scalar 3.3, using random 10x10 and 20x20 GPU inputs through check_model_gpu.
         def fn(a0, a1):
+            # [FUNCTION DOC] HELPER: Apply op to the list of both inputs and the scalar 3.3
+            # and return the result.
             return op([a0, a1], 3.3)
 
         self.check_model_gpu(
@@ -260,7 +311,11 @@ class ForeachTests(TestCase):
         )
 
     def _test_single_scalar_tensor(self, op):
+        # [FUNCTION DOC] HELPER: Same as the python-scalar helper, but the scalar operand is a
+        # zero-dim GPU tensor holding 3.3, checked through check_model_gpu.
         def fn(a0, a1):
+            # [FUNCTION DOC] HELPER: Apply op to the list of both inputs and a zero-dim tensor
+            # with value 3.3 on the GPU.
             return op([a0, a1], torch.tensor(3.3, device=GPU_TYPE))
 
         self.check_model_gpu(
@@ -274,6 +329,9 @@ class ForeachTests(TestCase):
     # called in test_gpu_cpp_wrapper.py
     @requires_gpu
     def test_foreach_cpp_wrapper_cuda(self):
+        # [FUNCTION DOC] Run the single-list check with torch._foreach_add. Exists so the cpp-
+        # wrapper GPU test file can reuse it (a xpu alias is assigned below); it makes no
+        # kernel count assertion.
         self._test_single_list(op=torch._foreach_add)
 
     # called in test_gpu_cpp_wrapper.py
@@ -282,39 +340,55 @@ class ForeachTests(TestCase):
     @requires_gpu
     @all_ops
     def test_single_list(self, op):
+        # [FUNCTION DOC] For every op in all_ops, check the single-list case and assert that
+        # exactly one kernel was generated.
         self._test_single_list(op)
         self.assertEqual(torch._inductor.metrics.generated_kernel_count, 1)
 
     @requires_gpu
     @scalar_bin_ops
     def test_single_scalar(self, op):
+        # [FUNCTION DOC] For each scalar-capable binary op, check op applied to a list and a
+        # python scalar, and assert exactly one generated kernel.
         self._test_single_scalar(op)
         self.assertEqual(torch._inductor.metrics.generated_kernel_count, 1)
 
     @requires_gpu
     @scalar_tensor_bin_ops
     def test_single_scalar_tensor(self, op):
+        # [FUNCTION DOC] For each scalar-capable binary op, check op applied to a list and a
+        # zero-dim tensor scalar, and assert exactly one generated kernel.
         self._test_single_scalar_tensor(op)
         self.assertEqual(torch._inductor.metrics.generated_kernel_count, 1)
 
     @requires_gpu
     @all_ops
     def test_scheduler_fusion_list(self, op):
+        # [FUNCTION DOC] Check that a foreach op and a second foreach op consuming its result
+        # fuse in the scheduler. Unary ops are followed by a foreach sqrt; binary and ternary
+        # ops return their result and also a foreach add of the first list with it. Verifies
+        # against eager and asserts a single kernel.
         if op in un_ops_under_test:
 
             def fn(a0, a1):
+                # [FUNCTION DOC] HELPER: Apply the unary op to both inputs and return a foreach
+                # sqrt of the result.
                 c = op([a0, a1])
                 return torch._foreach_sqrt(c)
 
         elif op in bin_ops_under_test:
 
             def fn(a0, a1, b0, b1):
+                # [FUNCTION DOC] HELPER: Apply the binary op to the two pairs, returning the
+                # result and a foreach add of the first list with it.
                 c = op([a0, a1], [b0, b1])
                 return c, torch._foreach_add([a0, a1], c)
 
         else:
 
             def fn(a0, a1, b0, b1, c0, c1):
+                # [FUNCTION DOC] HELPER: Apply the ternary op to three lists, returning the result
+                # and a foreach add of the first list with it.
                 c = op([a0, a1], [b0, b1], [c0, c1])
                 return c, torch._foreach_add([a0, a1], c)
 
@@ -328,7 +402,12 @@ class ForeachTests(TestCase):
     @requires_gpu
     @scalar_bin_ops
     def test_scheduler_fusion_scalar(self, op):
+        # [FUNCTION DOC] Check scheduler fusion of a foreach op with a python scalar followed
+        # by a foreach add of the first list with its result. Asserts a single generated
+        # kernel.
         def fn(a0, a1):
+            # [FUNCTION DOC] HELPER: Apply op with scalar 3.4 and return the result together
+            # with a foreach add of the inputs and that result.
             c = op([a0, a1], 3.4)
             return c, torch._foreach_add([a0, a1], c)
 
@@ -345,7 +424,11 @@ class ForeachTests(TestCase):
     @requires_gpu
     @scalar_bin_ops
     def test_broadcasting(self, op):
+        # [FUNCTION DOC] Check that broadcasting inputs (10x1 against 1x10 style shapes paired
+        # with 20x20 tensors) works in a foreach op. Compares the compiled output with eager
+        # and asserts a single generated kernel.
         def fn(a0, a1, b0, b1):
+            # [FUNCTION DOC] HELPER: Apply op to the two lists of two tensors each.
             return op([a0, a1], [b0, b1])
 
         fn_opt = torch.compile(fn)
@@ -364,15 +447,20 @@ class ForeachTests(TestCase):
     @requires_gpu
     @all_ops
     def test_singleton_lists(self, op):
+        # [FUNCTION DOC] Check foreach ops on single-element lists for unary, binary and
+        # ternary ops, building 10x10 inputs per arity and verifying against eager via
+        # check_model_gpu. Asserts exactly one generated kernel.
         if op in un_ops_under_test:
 
             def fn(a0):
+                # [FUNCTION DOC] HELPER: Apply the unary op to a one-element list.
                 return op([a0])
 
             args = (torch.rand(10, 10, device=GPU_TYPE),)
         elif op in bin_ops_under_test:
 
             def fn(a0, b0):
+                # [FUNCTION DOC] HELPER: Apply the binary op to two one-element lists.
                 return op([a0], [b0])
 
             args = (
@@ -383,6 +471,7 @@ class ForeachTests(TestCase):
         else:
 
             def fn(a0, b0, c0):
+                # [FUNCTION DOC] HELPER: Apply the ternary op to three one-element lists.
                 return op([a0], [b0], [c0])
 
             args = (
@@ -401,7 +490,12 @@ class ForeachTests(TestCase):
     @requires_gpu
     @bin_ops
     def test_type_promotion(self, op):
+        # [FUNCTION DOC] Check type promotion across list members: the last operand is int64
+        # while the others are int32, with random integer data. Compares compiled and eager
+        # outputs and asserts one generated kernel.
         def fn(a0, a1, b0, b1):
+            # [FUNCTION DOC] HELPER: Apply op to the pair of first tensors and the pair of
+            # second tensors.
             return op([a0, a1], [b0, b1])
 
         fn_opt = torch.compile(fn)
@@ -422,9 +516,14 @@ class ForeachTests(TestCase):
     @requires_gpu
     @scalar_bin_ops
     def test_kernel_split_arg_limit_list(self, op):
+        # [FUNCTION DOC] Check that a foreach op over lists long enough to exceed the kernel
+        # argument limit (about 370 arguments, 124 elements per list) is split. Compares with
+        # eager and asserts two generated kernels. The comment notes foreach_copy would not
+        # pass because one buffer set is eliminated as dead code.
         # NB: foeach_copy won't pass this test because it will dce one set of buffers
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Apply op to the two input lists.
             return op(a, b)
 
         fn_opt = torch.compile(fn)
@@ -447,7 +546,11 @@ class ForeachTests(TestCase):
         "Triton recursion depth exceeded: https://github.com/triton-lang/triton/issues/1763"
     )
     def test_kernel_split_arg_limit_scalar(self, op):
+        # [FUNCTION DOC] Skipped test (Triton recursion depth exceeded, per the skip reason).
+        # It would check argument-limit splitting for a single list of 186 tensors with a
+        # scalar and expect two kernels.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Apply op to the input list and the scalar 3.3.
             return op(a, 3.3)
 
         fn_opt = torch.compile(fn)
@@ -464,7 +567,13 @@ class ForeachTests(TestCase):
     @requires_gpu
     @bin_ops
     def test_fusion_duplicate_buffer_list(self, op):
+        # [FUNCTION DOC] Check fusion when the same buffer appears twice: the second foreach
+        # call uses the first call's first output as both elements of its second list. Uses
+        # check_model_gpu without float reference or low-precision checks. Expects one kernel,
+        # or two for foreach_map ops (detected by the op name).
         def fn(a0, a1, b0, b1):
+            # [FUNCTION DOC] HELPER: Apply op twice, the second time on inputs mixed with the
+            # first result's first element used twice, and return the second result.
             c = op([a0, a1], [b0, b1])
             return op([a0, b0], [c[0], c[0]])
 
@@ -488,21 +597,30 @@ class ForeachTests(TestCase):
     @requires_gpu
     @all_ops
     def test_non_foreach_consumer_list(self, op):
+        # [FUNCTION DOC] Check a foreach op whose first output is consumed by a regular
+        # multiply with the first input. Input arity selects unary, binary or ternary form.
+        # Verified against eager; asserts one generated kernel.
         if op in un_ops_under_test:
 
             def fn(a0, a1):
+                # [FUNCTION DOC] HELPER: Unary form: apply op, then multiply the first output by
+                # the first input.
                 c = op([a0, a1])
                 return torch.mul(c[0], a0)
 
         elif op in bin_ops_under_test:
 
             def fn(a0, a1, b0, b1):
+                # [FUNCTION DOC] HELPER: Binary form: apply op to the two pairs, then multiply the
+                # first output by the first input.
                 c = op([a0, a1], [b0, b1])
                 return torch.mul(c[0], a0)
 
         else:
 
             def fn(a0, a1, b0, b1, c0, c1):
+                # [FUNCTION DOC] HELPER: Ternary form: apply op to three lists, then multiply the
+                # first output by the first input.
                 c = op([a0, a1], [b0, b1], [c0, c1])
                 return torch.mul(c[0], a0)
 
@@ -516,7 +634,11 @@ class ForeachTests(TestCase):
     @requires_gpu
     @scalar_bin_ops
     def test_non_foreach_consumer_scalar(self, op):
+        # [FUNCTION DOC] Check a foreach scalar op (scalar 4.7) whose first output feeds a
+        # regular multiply. Asserts one generated kernel.
         def fn(a0, a1):
+            # [FUNCTION DOC] HELPER: Apply op with scalar 4.7 and multiply the first output by
+            # the first input.
             c = op([a0, a1], 4.7)
             return torch.mul(c[0], a0)
 
@@ -533,9 +655,15 @@ class ForeachTests(TestCase):
     @requires_gpu
     @all_ops
     def test_non_foreach_producer_list(self, op):
+        # [FUNCTION DOC] Check a foreach op whose inputs are produced by regular add ops
+        # (unary: sums of each input with itself; binary and ternary: sums of pairs feeding a
+        # list). Checked without float reference or low-precision checks; asserts one
+        # generated kernel.
         if op in un_ops_under_test:
 
             def fn(a0, a1):
+                # [FUNCTION DOC] HELPER: Add each input to itself and apply the unary op to the
+                # two sums.
                 c0 = torch.add(a0, a0)
                 c1 = torch.add(a1, a1)
                 return op([c0, c1])
@@ -543,6 +671,8 @@ class ForeachTests(TestCase):
         elif op in bin_ops_under_test:
 
             def fn(a0, a1, b0, b1):
+                # [FUNCTION DOC] HELPER: Add matching inputs of both pairs and apply op to the
+                # first list and the sums.
                 c0 = torch.add(a0, b0)
                 c1 = torch.add(a1, b1)
                 return op([a0, a1], [c0, c1])
@@ -550,6 +680,8 @@ class ForeachTests(TestCase):
         else:
 
             def fn(a0, a1, b0, b1, c0, c1):
+                # [FUNCTION DOC] HELPER: Add matching inputs of the first two pairs, overwriting
+                # the third pair, then apply the ternary op to the three lists.
                 c0 = torch.add(a0, b0)
                 c1 = torch.add(a1, b1)
                 return op([a0, a1], [b0, b1], [c0, c1])
@@ -563,7 +695,11 @@ class ForeachTests(TestCase):
     @requires_gpu
     @scalar_bin_ops
     def test_non_foreach_producer_scalar(self, op):
+        # [FUNCTION DOC] Check a foreach scalar op (scalar 5.6) whose input list comes from
+        # regular multiplies. Asserts one generated kernel.
         def fn(a0, a1, b0, b1):
+            # [FUNCTION DOC] HELPER: Multiply pairwise, then apply op to the products with
+            # scalar 5.6.
             c0 = torch.mul(a0, b0)
             c1 = torch.mul(a1, b1)
             return op([c0, c1], 5.6)
@@ -583,9 +719,14 @@ class ForeachTests(TestCase):
     @requires_gpu
     @all_ops
     def test_non_foreach_consumer_producer_list(self, op):
+        # [FUNCTION DOC] Check a foreach op that has both regular producers and regular
+        # consumers (outputs multiplied by the original inputs and returned as a list). Arity
+        # selects unary, binary or ternary form. Asserts one generated kernel.
         if op in un_ops_under_test:
 
             def fn(a0, a1):
+                # [FUNCTION DOC] HELPER: Unary form: build a sum and a product as inputs, apply
+                # op, multiply outputs by the original inputs, return both.
                 c0 = torch.add(a0, a0)
                 c1 = torch.mul(a1, a1)
                 d = op([c0, c1])
@@ -596,6 +737,8 @@ class ForeachTests(TestCase):
         elif op in bin_ops_under_test:
 
             def fn(a0, a1, b0, b1):
+                # [FUNCTION DOC] HELPER: Binary form: add matching inputs, apply op to the first
+                # list and the sums, multiply outputs by the originals and return both.
                 c0 = torch.add(a0, b0)
                 c1 = torch.add(a1, b1)
                 d = op([a0, a1], [c0, c1])
@@ -606,6 +749,9 @@ class ForeachTests(TestCase):
         else:
 
             def fn(a0, a1, b0, b1, c0, c1):
+                # [FUNCTION DOC] HELPER: Ternary form: overwrite the third pair with sums of
+                # matching inputs, apply op to three lists, multiply outputs by the originals and
+                # return both.
                 c0 = torch.add(a0, b0)
                 c1 = torch.add(a1, b1)
                 d = op([a0, a1], [b0, b1], [c0, c1])
@@ -625,7 +771,11 @@ class ForeachTests(TestCase):
     @requires_gpu
     @scalar_bin_ops
     def test_non_foreach_consumer_producer_scalar(self, op):
+        # [FUNCTION DOC] Check a foreach scalar op (scalar 5.8) between regular producer adds
+        # and regular consumer multiplies. Asserts one generated kernel.
         def fn(a0, a1, b0, b1):
+            # [FUNCTION DOC] HELPER: Add pairwise, apply op with scalar 5.8, multiply outputs
+            # by the first two inputs and return both results as a list.
             c0 = torch.add(a0, b0)
             c1 = torch.add(a1, b1)
             d = op([c0, c1], 5.8)
@@ -653,7 +803,11 @@ class ForeachTests(TestCase):
     @torch._dynamo.config.patch("assume_static_by_default", False)
     @torch._inductor.config.patch("combo_kernel_foreach_dynamic_shapes", False)
     def test_dynamic_shapes_fallback(self, op):
+        # [FUNCTION DOC] With dynamic shapes forced on (automatic dynamic off, static
+        # assumption off) and the combo kernel dynamic shape option disabled, check foreach
+        # ops fall back and produce two kernels instead of one.
         def fn(a0, a1, b0, b1):
+            # [FUNCTION DOC] HELPER: Apply op to the two input pairs.
             return op([a0, a1], [b0, b1])
 
         inputs = (
@@ -672,7 +826,11 @@ class ForeachTests(TestCase):
     @torch._dynamo.config.patch("assume_static_by_default", False)
     @torch._inductor.config.patch("combo_kernel_foreach_dynamic_shapes", True)
     def test_enable_dynamic_shapes_python_wrapper(self, op=torch._foreach_add):
+        # [FUNCTION DOC] With dynamic shapes enabled and the combo kernel dynamic shape option
+        # on, check torch._foreach_add (default op argument) still compiles to a single kernel
+        # with the Python wrapper.
         def fn(a0, a1, b0, b1):
+            # [FUNCTION DOC] HELPER: Apply op to the two input pairs.
             return op([a0, a1], [b0, b1])
 
         inputs = (
@@ -692,7 +850,11 @@ class ForeachTests(TestCase):
     @torch._inductor.config.patch("combo_kernel_foreach_dynamic_shapes", True)
     @torch._inductor.config.patch("cpp_wrapper", True)
     def test_enable_dynamic_shapes_cpp_wrapper_cuda(self, op=torch._foreach_add):
+        # [FUNCTION DOC] Same setup as the python-wrapper dynamic shape test but with
+        # cpp_wrapper enabled; only checks correctness (no kernel count assertion). Aliased
+        # for xpu below and reused by cpp-wrapper tests.
         def fn(a0, a1, b0, b1):
+            # [FUNCTION DOC] HELPER: Apply op to the two input pairs.
             return op([a0, a1], [b0, b1])
 
         inputs = (
@@ -712,7 +874,10 @@ class ForeachTests(TestCase):
     @unittest.skipIf(IS_FBCODE, "cpp compile not supported in fbcode")
     @bin_ops
     def test_cpu_cpp_fallback(self, op):
+        # [FUNCTION DOC] Check on CPU tensors that foreach ops compile via the C++ fallback
+        # and produce two kernels. Skipped in fbcode. Uses check_model_cpu.
         def fn(a0, a1, b0, b1):
+            # [FUNCTION DOC] HELPER: Apply op to the two input pairs.
             return op([a0, a1], [b0, b1])
 
         inputs = (
@@ -729,7 +894,10 @@ class ForeachTests(TestCase):
     @requires_gpu
     @decomp_ops
     def test_decomp(self, op):
+        # [FUNCTION DOC] Check the decomposition of torch._foreach_addcdiv with value 0.5 over
+        # three two-element lists; verifies against eager and asserts one kernel.
         def fn(a0, a1, b0, b1, c0, c1):
+            # [FUNCTION DOC] HELPER: Apply op with value 0.5 to three lists of two tensors.
             return op([a0, a1], [b0, b1], [c0, c1], value=0.5)
 
         self.check_model_gpu(
@@ -748,7 +916,12 @@ class ForeachTests(TestCase):
 
     @requires_gpu
     def test_fuse_concat(self):
+        # [FUNCTION DOC] Check a foreach-adjacent pattern: three inputs and three weights are
+        # stacked and fed to a batched matrix multiply. Expects two generated kernels (the
+        # stacking and the matmul path).
         def fn(x1, x2, x3, w1, w2, w3):
+            # [FUNCTION DOC] HELPER: Stack the three inputs and the three weights and return
+            # their batched matrix product.
             x = torch.stack([x1, x2, x3])
             w = torch.stack([w1, w2, w3])
 
@@ -771,7 +944,10 @@ class ForeachTests(TestCase):
 
     @requires_gpu
     def test_zero_elems(self):
+        # [FUNCTION DOC] Check a foreach add where the first tensors have zero elements.
+        # Verified with check_model_gpu; asserts one kernel.
         def fn(a0, a1, b0, b1):
+            # [FUNCTION DOC] HELPER: Foreach add of the two pairs.
             return torch._foreach_add([a0, a1], [b0, b1])
 
         self.check_model_gpu(
@@ -789,7 +965,10 @@ class ForeachTests(TestCase):
     @requires_gpu
     @bin_ops
     def test_2d_blocking(self, op):
+        # [FUNCTION DOC] Check 2D blocking of a foreach op with some operands transposed (non-
+        # contiguous). Compares with eager and asserts one kernel.
         def fn(a0, a1, b0, b1):
+            # [FUNCTION DOC] HELPER: Apply op to the two input pairs.
             return op([a0, a1], [b0, b1])
 
         self.check_model_gpu(
@@ -807,7 +986,10 @@ class ForeachTests(TestCase):
     @requires_gpu
     @bin_ops
     def test_2d_blocking_partitioning(self, op):
+        # [FUNCTION DOC] Check that foreach operands with differing 2D layouts (one
+        # transposed) are partitioned, yielding two kernels.
         def fn(a0, a1, b0, b1):
+            # [FUNCTION DOC] HELPER: Apply op to the two input pairs.
             return op([a0, a1], [b0, b1])
 
         self.check_model_gpu(
@@ -825,9 +1007,13 @@ class ForeachTests(TestCase):
     @requires_gpu
     @bin_ops
     def test_2d_blocking_partitioning_elems(self, op):
+        # [FUNCTION DOC] Check that 2D blocking groups kernels by number of y elements, with
+        # three-element lists of different shapes and transposed second operands. Expects two
+        # kernels.
         """2D blocking should be grouped by number of yelems"""
 
         def fn(a0, a1, a2, b0, b1, b2):
+            # [FUNCTION DOC] HELPER: Apply op to two lists of three tensors.
             return op([a0, a1, a2], [b0, b1, b2])
 
         self.check_model_gpu(
@@ -848,9 +1034,12 @@ class ForeachTests(TestCase):
     @bin_ops
     @torch._inductor.config.patch("combo_kernel_allow_mixed_sizes", 2)
     def test_2d_blocking_partitioning_mixed_sizes(self, op):
+        # [FUNCTION DOC] With combo_kernel_allow_mixed_sizes set to 2, check that 2D blocking
+        # over mixed sizes groups all operands into one kernel.
         """2D blocking with mixed sizes should group together"""
 
         def fn(a0, a1, a2, b0, b1, b2):
+            # [FUNCTION DOC] HELPER: Apply op to two lists of three tensors.
             return op([a0, a1, a2], [b0, b1, b2])
 
         self.check_model_gpu(
@@ -870,7 +1059,12 @@ class ForeachTests(TestCase):
     @requires_gpu
     @inplace_bin_ops
     def test_reinplacing(self, op):
+        # [FUNCTION DOC] Check reinplacing of inplace foreach ops: the function applies the op
+        # to the first lists in place and returns them. Verified without low-precision check;
+        # asserts one kernel.
         def fn(a0, a1, b0, b1):
+            # [FUNCTION DOC] HELPER: Apply op in place of the first pair using the second and
+            # return the first pair as a list.
             op([a0, a1], [b0, b1])
             return [a0, a1]
 
@@ -888,7 +1082,11 @@ class ForeachTests(TestCase):
     @requires_gpu
     @inplace_bin_ops
     def test_reinplacing_mut_before(self, op):
+        # [FUNCTION DOC] Reinplacing check with an in-place add of ones on the first tensor
+        # before the foreach call. Asserts one kernel.
         def fn(a0, a1, b0, b1):
+            # [FUNCTION DOC] HELPER: Add ones in place to the first tensor, apply the inplace
+            # op, return the first pair as a list.
             a0.add_(torch.ones(10, 10, device=GPU_TYPE))
             op([a0, a1], [b0, b1])
             return [a0, a1]
@@ -907,7 +1105,11 @@ class ForeachTests(TestCase):
     @requires_gpu
     @inplace_bin_ops
     def test_reinplacing_mut_after(self, op):
+        # [FUNCTION DOC] Reinplacing check with an in-place add of ones on the first tensor
+        # after the foreach call. Asserts one kernel.
         def fn(a0, a1, b0, b1):
+            # [FUNCTION DOC] HELPER: Apply the inplace op, then add ones in place to the first
+            # tensor and return the first pair as a list.
             op([a0, a1], [b0, b1])
             a0.add_(torch.ones(10, 10, device=GPU_TYPE))
             return [a0, a1]
@@ -925,7 +1127,11 @@ class ForeachTests(TestCase):
 
     @requires_gpu
     def test_multi_device(self):
+        # [FUNCTION DOC] Check foreach add over tensors on two devices (GPU and CPU) mixed in
+        # the lists. Compares compiled with eager outputs and asserts two generated kernels
+        # (one per device).
         def test_foreach_add(a0, a1, b0, b1):
+            # [FUNCTION DOC] HELPER: Foreach add of the two lists.
             return torch._foreach_add([a0, a1], [b0, b1])
 
         inps = [
@@ -943,7 +1149,11 @@ class ForeachTests(TestCase):
 
     @requires_gpu
     def test_aliasing(self):
+        # [FUNCTION DOC] Check an in-place foreach add whose list elements alias the same base
+        # tensors via views. Compares compiled with eager and asserts four generated kernels.
         def test_foreach_add(a0, a1, a2, b0, b1, b2):
+            # [FUNCTION DOC] HELPER: In-place foreach add of the first list with the second,
+            # returning its result.
             return torch._foreach_add_([a0, a1, a2], [b0, b1, b2])
 
         input = torch.ones(10, 10, device=GPU_TYPE)
@@ -966,9 +1176,13 @@ class ForeachTests(TestCase):
     @requires_gpu
     @torch._inductor.config.patch("combo_kernel_allow_mixed_sizes", 1)
     def test_2d_block_no_mixed_sizes_no_mask(self):
+        # [FUNCTION DOC] With combo_kernel_allow_mixed_sizes set to 1, check a large foreach
+        # add (1024 and 2048 sized, transposed operands) generates two kernels, i.e. no mixed-
+        # size grouping and no mask.
         """2D blocking with no mixed sizes constant mask"""
 
         def fn(a0, a1, a2, b0, b1, b2):
+            # [FUNCTION DOC] HELPER: Foreach add of two lists of three tensors.
             return torch._foreach_add([a0, a1, a2], [b0, b1, b2])
 
         self.check_model_gpu(
@@ -989,10 +1203,15 @@ class ForeachTests(TestCase):
     @torch._inductor.config.patch("combo_kernel_allow_mixed_sizes", 2)
     @config.patch({"combo_kernel_per_subkernel_blocks": True})
     def test_2d_block_mixed_sizes_with_mask(self):
+        # [FUNCTION DOC] With mixed sizes allowed (2) and per-subkernel blocks on, compile a
+        # foreach add and inspect generated code: output matches eager, the code contains the
+        # foreach triton heuristic, does not contain the sequential flatten combo grid, and
+        # exactly one kernel is generated.
         """2D blocking with mixed sizes should have mask"""
         from torch._inductor.utils import run_and_get_code
 
         def fn(a0, a1, a2, b0, b1, b2):
+            # [FUNCTION DOC] HELPER: Foreach add of two lists of three tensors.
             return torch._foreach_add([a0, a1, a2], [b0, b1, b2])
 
         inputs = (
@@ -1014,13 +1233,23 @@ class ForeachTests(TestCase):
     @requires_gpu
     @foreach_map_bin_ops
     def test_foreach_map_backward_binary(self, op):
+        # [FUNCTION DOC] Run forward and backward through a foreach_map binary op over three-
+        # element lists with gradients, and compare grads to a reference built from the
+        # polyfill foreach_map_fn. Asserts five generated kernels.
+        # KNOWN ISSUE: the grad comparison calls an allclose without asserting its result, so
+        # it never fails; and the reference function always uses add instead of the op under
+        # test.
         from torch._dynamo.polyfills import foreach_map_fn
 
         def fn(xs, ys):
+            # [FUNCTION DOC] HELPER: Apply op to two lists and return the sum of the sums of
+            # the three outputs.
             outs = op(xs, ys)
             return outs[0].sum() + outs[1].sum() + outs[2].sum()
 
         def ref_fn(xs, ys):
+            # [FUNCTION DOC] HELPER: Reference using the polyfill foreach_map_fn with add (not
+            # the parametrized op); returns the sum of the sums of the three outputs.
             outs = foreach_map_fn(torch.add, xs, ys)
             return outs[0].sum() + outs[1].sum() + outs[2].sum()
 
@@ -1054,7 +1283,13 @@ class ForeachTests(TestCase):
 
     @requires_gpu
     def test_foreach_map_input_mutation(self):
+        # [FUNCTION DOC] Check compiling a foreach_map op with input mutation under a patched
+        # supports_input_mutation flag. Expects an InductorError saying buffer mutation was
+        # detected during lowering of copy_ (the TODO notes a functional subgraph with an
+        # inlined epilogue).
         def fn(xs, ys):
+            # [FUNCTION DOC] HELPER: Apply the in-place foreach_map op to two lists and return
+            # the sum of the sums of the three outputs.
             outs = foreach_map_add_inplace(xs, ys)
             return outs[0].sum() + outs[1].sum() + outs[2].sum()
 
@@ -1114,6 +1349,10 @@ class ForeachTests(TestCase):
         ],
     )
     def test_addcmul_scalar_value_vs_tensor_value(self, value):
+        # [FUNCTION DOC] Check with many float64 values that foreach addcmul with a scalar
+        # obtained from a tensor item call (unbacked float symbol) gives bitwise-equal results
+        # to passing the value as a tensor, in compiled mode with full graph. Exercises fp64
+        # handling of unbacked floats in kernel arguments.
         """Test that torch._foreach_addcmul with unbacked float scalar from .item()
         matches tensor scalar value in compiled mode.
 
@@ -1121,11 +1360,15 @@ class ForeachTests(TestCase):
         kernel argument, exercising the fp64 signature fix in triton_utils.py."""
 
         def fn_item_scalar(a0, a1, b0, b1, c0, c1, scalar_tensor):
+            # [FUNCTION DOC] HELPER: Extract the item from the scalar tensor and run foreach
+            # addcmul with value one minus that item.
             # .item() creates an unbacked float symbol - passed as kernel arg
             val = scalar_tensor.item()
             return torch._foreach_addcmul([a0, a1], [b0, b1], [c0, c1], value=1 - val)
 
         def fn_tensor_scalar(a0, a1, b0, b1, c0, c1, val):
+            # [FUNCTION DOC] HELPER: Run foreach addcmul with value one minus the supplied
+            # value.
             return torch._foreach_addcmul([a0, a1], [b0, b1], [c0, c1], value=1 - val)
 
         # Use specific values that are sensitive to fp32/fp64 precision differences
@@ -1201,13 +1444,21 @@ class ForeachTests(TestCase):
         ],
     )
     def test_foreach_scalar_vs_scalar_tensor(self, op, value):
+        # [FUNCTION DOC] Check for each binary op (add, mul, sub) and value that using a
+        # python scalar equals using a float64 tensor scalar, bitwise, in eager, compiled, and
+        # across eager versus compiled. Division is excluded because of a known eager
+        # mismatch.
         """Test that foreach binary ops with python scalar second argument
         match tensor scalar second argument in both eager and compiled modes."""
 
         def fn_python_scalar(a0, a1):
+            # [FUNCTION DOC] HELPER: Apply op to the pair as a list with the captured python
+            # scalar value.
             return op([a0, a1], value)
 
         def fn_tensor_scalar(a0, a1, val):
+            # [FUNCTION DOC] HELPER: Apply op to the pair as a list with the supplied scalar
+            # tensor.
             return op([a0, a1], val)
 
         # Use specific values that are sensitive to fp32/fp64 precision differences
@@ -1267,6 +1518,9 @@ class ForeachTests(TestCase):
         ],
     )
     def test_adam_ema_update_scalar_precision(self, beta2):
+        # [FUNCTION DOC] Check that an Adam-style exponential moving average update (foreach
+        # multiply by beta2, then foreach addcmul with value one minus beta2) compiled with
+        # emulated precision casts is bitwise equal to eager. Skipped on ROCm.
         """Test that Adam-style EMA update compiled matches eager bitwise.
 
         Tests the pattern:
@@ -1275,6 +1529,9 @@ class ForeachTests(TestCase):
         """
 
         def fn(exp_avg_sq0, exp_avg_sq1, grad0, grad1):
+            # [FUNCTION DOC] HELPER: Clone the two averages, multiply them in place by the
+            # captured beta2, add the in-place addcmul of grads with value one minus beta2 and
+            # return the averages.
             exp_avg_sqs = [exp_avg_sq0.clone(), exp_avg_sq1.clone()]
             grads = [grad0, grad1]
             torch._foreach_mul_(exp_avg_sqs, beta2)
@@ -1318,13 +1575,22 @@ class ForeachTests(TestCase):
     @requires_gpu
     @foreach_map_un_ops
     def test_foreach_map_backward_unary(self, op):
+        # [FUNCTION DOC] Run forward and backward of a foreach_map unary op over three tensors
+        # with gradients and compare to a reference using the polyfill foreach_map_fn with the
+        # original op. Asserts five generated kernels.
+        # KNOWN ISSUE: the allclose result on gradients is not asserted, so gradient
+        # mismatches would not fail the test.
         from torch._dynamo.polyfills import foreach_map_fn
 
         def fn(xs):
+            # [FUNCTION DOC] HELPER: Apply op to the list and return the sum of the sums of
+            # the three outputs.
             outs = op(xs)
             return outs[0].sum() + outs[1].sum() + outs[2].sum()
 
         def ref_fn(xs):
+            # [FUNCTION DOC] HELPER: Reference using the polyfill foreach_map_fn with the
+            # original op; returns the sum of the sums of the three outputs.
             outs = foreach_map_fn(op.original_op, xs)
             return outs[0].sum() + outs[1].sum() + outs[2].sum()
 
@@ -1350,6 +1616,9 @@ class ForeachTests(TestCase):
     @requires_cuda_and_triton
     @config.patch({"emulate_precision_casts": True})
     def test_foreach_addcmul_fma_bitwise_equal(self):
+        # [FUNCTION DOC] With emulated precision casts, check compiled foreach addcmul
+        # (default value and value 2.5) matches eager bitwise on CUDA. On ROCm a tolerance of
+        # 1e-5 is allowed.
         """Test that _foreach_addcmul with FMA lowering produces bitwise equal results to eager."""
         self_tensors = [
             torch.randn(64, 64, device=GPU_TYPE),
@@ -1374,6 +1643,7 @@ class ForeachTests(TestCase):
 
         @torch.compile
         def fn(s, t1, t2):
+            # [FUNCTION DOC] HELPER: Compiled foreach addcmul with the default value.
             return torch._foreach_addcmul(s, t1, t2)
 
         compiled_result = fn(self_tensors, tensor1_list, tensor2_list)
@@ -1387,6 +1657,7 @@ class ForeachTests(TestCase):
 
         @torch.compile
         def fn2(s, t1, t2):
+            # [FUNCTION DOC] HELPER: Compiled foreach addcmul with value 2.5.
             return torch._foreach_addcmul(s, t1, t2, value=2.5)
 
         compiled_result2 = fn2(self_tensors, tensor1_list, tensor2_list)
@@ -1396,6 +1667,9 @@ class ForeachTests(TestCase):
     @requires_cuda_and_triton
     @config.patch({"emulate_precision_casts": True})
     def test_foreach_addcmul_uses_fma_instruction(self):
+        # [FUNCTION DOC] Compile foreach addcmul with value 2.0 under emulated precision casts
+        # and check the generated code contains a triton fused multiply-add. Requires CUDA and
+        # triton.
         """Test that _foreach_addcmul generates code using FMA instruction."""
         from torch._inductor.utils import run_and_get_code
 
@@ -1414,6 +1688,7 @@ class ForeachTests(TestCase):
 
         @torch.compile
         def fn(s, t1, t2):
+            # [FUNCTION DOC] HELPER: Compiled foreach addcmul with value 2.0.
             return torch._foreach_addcmul(s, t1, t2, value=2.0)
 
         _, code = run_and_get_code(fn, self_tensors, tensor1_list, tensor2_list)
@@ -1422,7 +1697,10 @@ class ForeachTests(TestCase):
 
     @requires_gpu
     def test_foreach_sub(self):
+        # [FUNCTION DOC] Check compiled foreach sub with an alpha of 2.0 matches eager on
+        # random inputs (seed 42) with full graph compilation.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Foreach sub of the two lists with alpha 2.0.
             return torch._foreach_sub(a, b, alpha=2.0)
 
         torch.manual_seed(42)
@@ -1436,7 +1714,12 @@ class ForeachTests(TestCase):
 
     @requires_gpu
     def test_foreach_reorder_loops_with_nested_foreach_snodes(self):
+        # [FUNCTION DOC] Check a program with an in-place foreach add followed by a foreach
+        # multiply by 2 and per-element sums, on integer inputs, compiled against eager on
+        # cloned inputs. Targets loop reordering with nested foreach scheduler nodes.
         def fn(x0, x1, y0, y1):
+            # [FUNCTION DOC] HELPER: In-place foreach add of y into x, then foreach multiply
+            # by 2, and return the sum of each result.
             xs, ys = [x0, x1], [y0, y1]
             torch._foreach_add_(xs, ys)
             zs = torch._foreach_mul(xs, 2)
