@@ -3,6 +3,12 @@
 
 # ruff: noqa
 # flake8: noqa
+# [MODULE DOC] Dynamo-patched copy of the CPython 3.13.5 test_funcattrs suite. Tests attributes of
+# function, bound method, cell, classmethod/staticmethod and builtin function objects (__code__,
+# __globals__, __builtins__, __closure__, __defaults__, __name__, __qualname__, __type_params__,
+# __dict__, __doc__, __self__, __func__). Cases derive from CPythonTestCase; module level helpers
+# global_function, cell and empty_cell build fixtures. No import-time side effects beyond imports;
+# run_tests is called when executed as a script.
 
 # Test copied from
 # https://raw.githubusercontent.com/python/cpython/refs/tags/v3.13.5/Lib/test/test_funcattrs.py
@@ -25,12 +31,23 @@ from test import support
 
 
 def global_function():
+    # [FUNCTION DOC] HELPER: Fixture for the __qualname__ test. Returns a lambda that returns a
+    # nested function (inner_function), which in turn defines a local class and, through a global
+    # declaration, publishes a module-level function inner_global_function as a side effect of
+    # being called.
     def inner_function():
+        # [FUNCTION DOC] HELPER: Defines LocalClass, declares inner_global_function global and
+        # defines it, then returns LocalClass. Calling it creates the module global
+        # inner_global_function.
         class LocalClass:
+            # [CLASS DOC] HELPER: Empty class used to check its qualified name.
             pass
         global inner_global_function
         def inner_global_function():
+            # [FUNCTION DOC] HELPER: Global function whose body defines and returns a nested
+            # function inner_function2.
             def inner_function2():
+                # [FUNCTION DOC] HELPER: Empty function used to check its qualified name.
                 pass
             return inner_function2
         return LocalClass
@@ -38,18 +55,28 @@ def global_function():
 
 
 class FuncAttrsTest(CPythonTestCase):
+    # [CLASS DOC] Base fixture class for the function attribute tests. setUp creates self.F (a
+    # class with method a), self.fi (an instance of it) and self.b (a plain function returning 3).
+    # Provides cannot_set_attr. Has no tests of its own.
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Calls the base setUp then builds the fixtures: class F with
+        # method a, an instance fi, the class F and a function b returning 3, stored on self.
         super().setUp()
         class F:
+            # [CLASS DOC] HELPER: Fixture class with a single no-op method a.
             def a(self):
+                # [FUNCTION DOC] HELPER: No-op method.
                 pass
         def b():
+            # [FUNCTION DOC] HELPER: Fixture function returning the constant 3.
             return 3
         self.fi = F()
         self.F = F
         self.b = b
 
     def cannot_set_attr(self, obj, name, value, exceptions):
+    # [FUNCTION DOC] HELPER: Asserts that both assigning and deleting attribute name on obj fail
+    # with one of the given exception types; fails the test if either operation succeeds.
         try:
             setattr(obj, name, value)
         except exceptions:
@@ -65,11 +92,17 @@ class FuncAttrsTest(CPythonTestCase):
 
 
 class FunctionPropertiesTest(FuncAttrsTest):
+    # [CLASS DOC] Tests for core attributes of function objects: __module__, dir(), equality,
+    # __code__, __globals__, __builtins__, __closure__, cells, __name__, __qualname__,
+    # __type_params__ and __defaults__.
     # Include the external setUp method that is common to all tests
     def test_module(self):
+        # [FUNCTION DOC] Checks the function's __module__ equals this module's name.
         self.assertEqual(self.b.__module__, __name__)
 
     def test_dir_includes_correct_attrs(self):
+        # [FUNCTION DOC] Checks attributes set on a function (and on the function underlying a
+        # bound method) show up in dir().
         self.b.known_attr = 7
         self.assertIn('known_attr', dir(self.b),
             "set attributes not in dir listing of method")
@@ -79,19 +112,28 @@ class FunctionPropertiesTest(FuncAttrsTest):
                      "implementations, should show up in next dir")
 
     def test_duplicate_function_equality(self):
+        # [FUNCTION DOC] Checks two functions with identical bodies but different objects are not
+        # equal.
         # Body of `duplicate' is the exact same as self.b
         def duplicate():
+            # [FUNCTION DOC] HELPER: Function with a docstring and the same behavior as the
+            # fixture b, used only for the inequality check.
             'my docstring'
             return 3
         self.assertNotEqual(self.b, duplicate)
 
     def test_copying___code__(self):
+        # [FUNCTION DOC] Checks assigning the __code__ of one function to another changes its
+        # behavior.
         def test(): pass
         self.assertEqual(test(), None)
         test.__code__ = self.b.__code__
         self.assertEqual(test(), 3) # self.b always returns 3, arbitrarily
 
     def test_invalid___code___assignment(self):
+        # [FUNCTION DOC] Checks assigning __code__ between a plain function, generator, async
+        # generator and coroutine function emits a DeprecationWarning about non-matching code
+        # type; restores the original code afterwards with the warning suppressed.
         def A(): pass
         def B(): yield
         async def C(): yield
@@ -113,11 +155,17 @@ class FunctionPropertiesTest(FuncAttrsTest):
                         dst.__code__ = prev
 
     def test___globals__(self):
+        # [FUNCTION DOC] Checks __globals__ is the module's globals dict and cannot be set or
+        # deleted.
         self.assertIs(self.b.__globals__, globals())
         self.cannot_set_attr(self.b, '__globals__', 2,
                              (AttributeError, TypeError))
 
     def test___builtins__(self):
+        # [FUNCTION DOC] Checks __builtins__ of a function is the builtins namespace, is read-
+        # only, and is inherited from the current builtins when a function is made with a globals
+        # dict lacking __builtins__; also checks that exec'd code with custom builtins propagates
+        # those builtins to functions created from it.
         if __name__ == "__main__":
             builtins_dict = __builtins__.__dict__
         else:
@@ -154,6 +202,8 @@ class FunctionPropertiesTest(FuncAttrsTest):
         self.assertNotIn('__builtins__', ns['func4'].__globals__)
 
     def test___closure__(self):
+        # [FUNCTION DOC] Checks __closure__ is a tuple of cell objects with one entry for one free
+        # variable and that it cannot be assigned or deleted.
         a = 12
         def f(): print(a)
         c = f.__closure__
@@ -164,6 +214,8 @@ class FunctionPropertiesTest(FuncAttrsTest):
         self.cannot_set_attr(f, "__closure__", c, AttributeError)
 
     def test_cell_new(self):
+        # [FUNCTION DOC] Checks types.CellType creation with and without a value, and that reading
+        # an empty cell raises ValueError.
         cell_obj = types.CellType(1)
         self.assertEqual(cell_obj.cell_contents, 1)
 
@@ -173,6 +225,8 @@ class FunctionPropertiesTest(FuncAttrsTest):
             cell_obj.cell_contents
 
     def test_empty_cell(self):
+        # [FUNCTION DOC] Checks reading the contents of a cell for a free variable not yet
+        # assigned raises ValueError.
         def f(): print(a)
         try:
             f.__closure__[0].cell_contents
@@ -183,6 +237,9 @@ class FunctionPropertiesTest(FuncAttrsTest):
         a = 12
 
     def test_set_cell(self):
+        # [FUNCTION DOC] Checks writing cell_contents changes the closure variable and function
+        # result, and that deleting it empties the cell so reads raise ValueError, calling raises
+        # NameError and the outer name raises UnboundLocalError.
         a = 12
         def f(): return a
         c = f.__closure__
@@ -203,6 +260,9 @@ class FunctionPropertiesTest(FuncAttrsTest):
             print(a)
 
     def test___name__(self):
+        # [FUNCTION DOC] Checks __name__ is readable and writable with strings, rejects non-
+        # strings with TypeError, is available in restricted builtins, and is read-only on bound
+        # methods.
         self.assertEqual(self.b.__name__, 'b')
         self.b.__name__ = 'c'
         self.assertEqual(self.b.__name__, 'c')
@@ -219,6 +279,8 @@ class FunctionPropertiesTest(FuncAttrsTest):
         self.cannot_set_attr(self.fi.a, "__name__", 'a', AttributeError)
 
     def test___qualname__(self):
+        # [FUNCTION DOC] Checks __qualname__ values for local, global, nested and lambda functions
+        # and classes, that it can be set to a string and that non-strings raise TypeError.
         # PEP 3155
         self.assertEqual(self.b.__qualname__, 'FuncAttrsTest.setUp.<locals>.b')
         self.assertEqual(FuncAttrsTest.setUp.__qualname__, 'FuncAttrsTest.setUp')
@@ -239,6 +301,9 @@ class FunctionPropertiesTest(FuncAttrsTest):
         self.cannot_set_attr(self.b, '__qualname__', 7, TypeError)
 
     def test___type_params__(self):
+        # [FUNCTION DOC] Checks __type_params__ of a generic function holds the TypeVar tuple, is
+        # an empty tuple for non-generic functions and lambdas, cannot be deleted or set to a non-
+        # tuple (TypeError) but can be set to a tuple.
         def generic[T](): pass
         def not_generic(): pass
         lambda_ = lambda: ...
@@ -256,6 +321,9 @@ class FunctionPropertiesTest(FuncAttrsTest):
                 self.assertEqual(func.__type_params__, (T,))
 
     def test___code__(self):
+        # [FUNCTION DOC] Checks __code__ is a code object, can be replaced with code having the
+        # same number of free variables, and raises ValueError when the free variable counts
+        # differ.
         num_one, num_two = 7, 8
         def a(): pass
         def b(): return 12
@@ -286,14 +354,21 @@ class FunctionPropertiesTest(FuncAttrsTest):
                       "not be possible")
 
     def test_blank_func_defaults(self):
+        # [FUNCTION DOC] Checks __defaults__ is None for a function without defaults and deleting
+        # it is harmless.
         self.assertEqual(self.b.__defaults__, None)
         del self.b.__defaults__
         self.assertEqual(self.b.__defaults__, None)
 
     def test_func_default_args(self):
+        # [FUNCTION DOC] Checks __defaults__ reports default values, can be assigned to supply
+        # defaults, and deleting it restores the requirement of arguments (TypeError on a call
+        # without args).
         def first_func(a, b):
+            # [FUNCTION DOC] HELPER: Returns the sum of its two required arguments.
             return a+b
         def second_func(a=1, b=2):
+            # [FUNCTION DOC] HELPER: Returns the sum of two arguments that default to 1 and 2.
             return a+b
         self.assertEqual(first_func.__defaults__, None)
         self.assertEqual(second_func.__defaults__, (1, 2))
@@ -314,20 +389,28 @@ class FunctionPropertiesTest(FuncAttrsTest):
 
 
 class InstancemethodAttrTest(FuncAttrsTest):
+    # [CLASS DOC] Tests for attributes of bound method objects: __class__, __func__, __self__ and
+    # attribute access on methods created by assignment.
 
     def test___class__(self):
+        # [FUNCTION DOC] Checks the class of a method's __self__ and that method __class__ cannot
+        # be set or deleted (TypeError).
         self.assertEqual(self.fi.a.__self__.__class__, self.F)
         self.cannot_set_attr(self.fi.a, "__class__", self.F, TypeError)
 
     def test___func__(self):
+        # [FUNCTION DOC] Checks a bound method's __func__ is the class function and is read-only.
         self.assertEqual(self.fi.a.__func__, self.F.a)
         self.cannot_set_attr(self.fi.a, "__func__", self.F.a, AttributeError)
 
     def test___self__(self):
+        # [FUNCTION DOC] Checks a bound method's __self__ is the instance and is read-only.
         self.assertEqual(self.fi.a.__self__, self.fi)
         self.cannot_set_attr(self.fi.a, "__self__", self.fi, AttributeError)
 
     def test___func___non_method(self):
+        # [FUNCTION DOC] Checks a method object stored as an instance attribute is callable,
+        # unknown attributes raise AttributeError and attributes cannot be set or deleted on it.
         # Behavior should be the same when a method is added via an attr
         # assignment
         self.fi.id = types.MethodType(id, self.fi)
@@ -344,7 +427,10 @@ class InstancemethodAttrTest(FuncAttrsTest):
 
 
 class ArbitraryFunctionAttrTest(FuncAttrsTest):
+    # [CLASS DOC] Tests for arbitrary user attributes on functions versus methods.
     def test_set_attr(self):
+        # [FUNCTION DOC] Checks arbitrary attributes can be set on a function but setting them on
+        # a bound method raises AttributeError.
         self.b.known_attr = 7
         self.assertEqual(self.b.known_attr, 7)
         try:
@@ -355,6 +441,7 @@ class ArbitraryFunctionAttrTest(FuncAttrsTest):
             self.fail("setting attributes on methods should raise error")
 
     def test_delete_unknown_attr(self):
+        # [FUNCTION DOC] Checks deleting an unknown attribute of a function raises AttributeError.
         try:
             del self.b.unknown_attr
         except AttributeError:
@@ -363,6 +450,8 @@ class ArbitraryFunctionAttrTest(FuncAttrsTest):
             self.fail("deleting unknown attribute should raise TypeError")
 
     def test_unset_attr(self):
+        # [FUNCTION DOC] Checks reading a missing attribute on a function and a bound method
+        # raises AttributeError.
         for func in [self.b, self.fi.a]:
             try:
                 func.non_existent_attr
@@ -374,13 +463,19 @@ class ArbitraryFunctionAttrTest(FuncAttrsTest):
 
 
 class FunctionDictsTest(FuncAttrsTest):
+    # [CLASS DOC] Tests for assigning, reading and deleting the __dict__ of functions and methods.
     def test_setting_dict_to_invalid(self):
+        # [FUNCTION DOC] Checks assigning a non-dict (None or a UserDict) to __dict__ raises
+        # TypeError.
         self.cannot_set_attr(self.b, '__dict__', None, TypeError)
         from collections import UserDict
         d = UserDict({'known_attr': 7})
         self.cannot_set_attr(self.fi.a.__func__, '__dict__', d, TypeError)
 
     def test_setting_dict_to_valid(self):
+        # [FUNCTION DOC] Checks assigning a dict to __dict__ makes it the same object seen through
+        # the function, its class access, the bound method and the method's __func__, and
+        # attribute values come from it.
         d = {'known_attr': 7}
         self.b.__dict__ = d
         # Test assignment
@@ -397,6 +492,7 @@ class FunctionDictsTest(FuncAttrsTest):
         self.assertEqual(self.fi.a.known_attr, 7)
 
     def test_delete___dict__(self):
+        # [FUNCTION DOC] Checks deleting a function's __dict__ raises TypeError.
         try:
             del self.b.__dict__
         except TypeError:
@@ -405,9 +501,11 @@ class FunctionDictsTest(FuncAttrsTest):
             self.fail("deleting function dictionary should raise TypeError")
 
     def test_unassigned_dict(self):
+        # [FUNCTION DOC] Checks a function that was never given attributes has an empty __dict__.
         self.assertEqual(self.b.__dict__, {})
 
     def test_func_as_dict_key(self):
+        # [FUNCTION DOC] Checks a function can be used as a dictionary key.
         value = "Some string"
         d = {}
         d[self.b] = value
@@ -415,7 +513,10 @@ class FunctionDictsTest(FuncAttrsTest):
 
 
 class FunctionDocstringTest(FuncAttrsTest):
+    # [CLASS DOC] Tests for the __doc__ attribute of functions and methods.
     def test_set_docstring_attr(self):
+        # [FUNCTION DOC] Checks __doc__ defaults to None, can be set on a function and on the
+        # class function (visible through a bound method), and is read-only on bound methods.
         self.assertEqual(self.b.__doc__, None)
         docstr = "A test method that does nothing"
         self.b.__doc__ = docstr
@@ -425,21 +526,30 @@ class FunctionDocstringTest(FuncAttrsTest):
         self.cannot_set_attr(self.fi.a, "__doc__", docstr, AttributeError)
 
     def test_delete_docstring(self):
+        # [FUNCTION DOC] Checks deleting __doc__ resets it to None.
         self.b.__doc__ = "The docstring"
         del self.b.__doc__
         self.assertEqual(self.b.__doc__, None)
 
 
 def cell(value):
+    # [FUNCTION DOC] HELPER: Returns a closure cell containing the given value, obtained from the
+    # __closure__ of an inner function.
     """Create a cell containing the given value."""
     def f():
+        # [FUNCTION DOC] HELPER: Inner function referencing the free variable a to force a closure
+        # cell.
         print(a)
     a = value
     return f.__closure__[0]
 
 def empty_cell(empty=True):
+    # [FUNCTION DOC] HELPER: Returns a closure cell that is empty (variable never assigned) when
+    # empty is true, or holds 1729 when empty is false.
     """Create an empty cell."""
     def f():
+        # [FUNCTION DOC] HELPER: Inner function referencing the free variable a to force a closure
+        # cell.
         print(a)
     # the intent of the following line is simply "if False:";  it's
     # spelt this way to avoid the danger that a future optimization
@@ -450,7 +560,11 @@ def empty_cell(empty=True):
 
 
 class CellTest(CPythonTestCase):
+    # [CLASS DOC] Tests ordering and equality of closure cell objects; empty cells compare lower
+    # than filled ones.
     def test_comparison(self):
+        # [FUNCTION DOC] Exercises cell comparison operators on filled and empty cells (values
+        # compared, empty cell less than any filled cell, two empty cells equal).
         # These tests are here simply to exercise the comparison code;
         # their presence should not be interpreted as providing any
         # guarantees about the semantics (or even existence) of cell
@@ -463,8 +577,12 @@ class CellTest(CPythonTestCase):
 
 
 class StaticMethodAttrsTest(CPythonTestCase):
+    # [CLASS DOC] Tests the __func__ attribute of classmethod and staticmethod wrappers.
     def test_func_attribute(self):
+        # [FUNCTION DOC] Checks classmethod and staticmethod objects expose the wrapped function
+        # as __func__.
         def f():
+            # [FUNCTION DOC] HELPER: No-op function that is wrapped.
             pass
 
         c = classmethod(f)
@@ -475,10 +593,13 @@ class StaticMethodAttrsTest(CPythonTestCase):
 
 
 class BuiltinFunctionPropertiesTest(CPythonTestCase):
+    # [CLASS DOC] Tests attributes of builtin functions and methods: __qualname__ and __self__.
     # XXX Not sure where this should really go since I can't find a
     # test module specifically for builtin_function_or_method.
 
     def test_builtin__qualname__(self):
+        # [FUNCTION DOC] Checks __qualname__ of builtin functions, classmethods, staticmethods and
+        # bound methods.
         import time
 
         # builtin function:
@@ -500,6 +621,9 @@ class BuiltinFunctionPropertiesTest(CPythonTestCase):
 
     @support.cpython_only
     def test_builtin__self__(self):
+        # [FUNCTION DOC] Checks __self__ of builtin functions is their module, of builtin
+        # classmethods the class, of staticmethods None, and of bound builtin methods the
+        # instance. CPython only.
         # See https://github.com/python/cpython/issues/58211.
         import builtins
         import time

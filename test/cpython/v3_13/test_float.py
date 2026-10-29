@@ -3,6 +3,13 @@
 
 # ruff: noqa
 # flake8: noqa
+# [MODULE DOC] Dynamo-patched copy of the CPython 3.13.5 float test suite. Defines unittest cases
+# (built on CPythonTestCase, aliased as the private name __TestCase) covering float construction
+# from strings/bytes/objects, __float__ and __index__ conversion, IEEE 754 special values,
+# pow/mod/floor/ceil, hashing, format/repr/round, inf/nan parsing and float.fromhex/hex. Import-
+# time side effects: inserts a RedirectImportFinder at the front of sys.meta_path that maps a few
+# 'test.*' module names onto standalone modules, and locates the formatfloat test data file path.
+# run_tests is called when executed as a script.
 
 # Test copied from
 # https://raw.githubusercontent.com/python/cpython/refs/tags/v3.13.5/Lib/test/test_float.py
@@ -31,7 +38,14 @@ redirect_imports = (
 )
 
 class RedirectImportFinder(importlib.abc.MetaPathFinder):
+    # [CLASS DOC] HELPER: Meta path finder that redirects imports of a fixed set of 'test.*'
+    # modules (listed in redirect_imports) to the top-level module of the same name without the
+    # 'test.' prefix, since the CPython test package is not available here.
     def find_spec(self, fullname, path, target=None):
+        # [FUNCTION DOC] HELPER: If the requested module name is in redirect_imports, imports the
+        # stripped name, registers the result in sys.modules under the original name and returns
+        # the stripped module's spec; returns None (letting other finders run) when the name is
+        # not listed or the import fails with ImportError.
         # Check if the import is the problematic one
         if fullname in redirect_imports:
             try:
@@ -157,14 +171,26 @@ test_dir = os.path.dirname(__file__) or os.curdir
 format_testfile = os.path.join(test_dir, 'mathdata', 'formatfloat_testcases.txt')
 
 class FloatSubclass(float):
+    # [CLASS DOC] HELPER: Trivial float subclass used to check that float conversion results keep
+    # or lose the subclass type.
     pass
 
 class OtherFloatSubclass(float):
+    # [CLASS DOC] HELPER: Second trivial float subclass, returned from a __float__ method to test
+    # strict float-type handling.
     pass
 
 class GeneralFloatCases(__TestCase):
+    # [CLASS DOC] Test case for general float behavior: constructor parsing and error messages,
+    # __float__/__index__ conversion rules, subclass construction, containment, floor/ceil/mod/pow
+    # special cases and hashing. Holds no state; one helper assertion method
+    # (assertEqualAndEqualSign).
 
     def test_float(self):
+        # [FUNCTION DOC] Checks float() on numbers and strings: whitespace and unicode digit
+        # handling, and ValueError/TypeError for malformed signs, hex strings, lone dots,
+        # surrogates, bad exponent markers and non-string objects such as a dict; very long digit
+        # strings must parse.
         self.assertEqual(float(3.14), 3.14)
         self.assertEqual(float(314), 314.0)
         self.assertEqual(float("  3.14  "), 3.14)
@@ -196,9 +222,14 @@ class GeneralFloatCases(__TestCase):
         self.assertRaises(ValueError, float, '\u3053\u3093\u306b\u3061\u306f')
 
     def test_noargs(self):
+        # [FUNCTION DOC] Checks that calling float() with no argument returns 0.0.
         self.assertEqual(float(), 0.0)
 
     def test_underscores(self):
+        # [FUNCTION DOC] Checks underscore handling in float(): valid underscore literals
+        # (excluding complex, hex, octal and binary ones) parse equal to eval and to the
+        # underscore-stripped text; invalid ones raise ValueError; underscores in or around
+        # nan/inf and in bytes also raise ValueError.
         for lit in VALID_UNDERSCORE_LITERALS:
             if not any(ch in lit for ch in 'jJxXoObB'):
                 self.assertEqual(float(lit), eval(lit))
@@ -220,6 +251,10 @@ class GeneralFloatCases(__TestCase):
         self.assertRaises(ValueError, float, b'0_.\xff9')
 
     def test_non_numeric_input_types(self):
+        # [FUNCTION DOC] Checks float() accepts str/bytes-like inputs (bytes, bytearray,
+        # memoryview, array of bytes and custom subclasses) containing a padded number, and raises
+        # ValueError mentioning 'could not convert' for garbage input of each type. Uses a subtest
+        # per input type.
         # Test possible non-numeric types for the argument x, including
         # subclasses of the explicitly documented accepted types.
         class CustomStr(str): pass
@@ -249,6 +284,8 @@ class GeneralFloatCases(__TestCase):
                     float(f(b'A' * 0x10))
 
     def test_float_memoryview(self):
+        # [FUNCTION DOC] Checks float() on memoryview slices: only the sliced bytes are parsed, so
+        # trailing characters outside the slice do not affect the result.
         self.assertEqual(float(memoryview(b'12.3')[1:4]), 2.3)
         self.assertEqual(float(memoryview(b'12.3\x00')[1:4]), 2.3)
         self.assertEqual(float(memoryview(b'12.3 ')[1:4]), 2.3)
@@ -256,7 +293,12 @@ class GeneralFloatCases(__TestCase):
         self.assertEqual(float(memoryview(b'12.34')[1:4]), 2.3)
 
     def test_error_message(self):
+        # [FUNCTION DOC] Checks the exact ValueError message 'could not convert string to float:
+        # <repr>' for many bad inputs (non-ascii, embedded spaces, empty/blank, embedded NUL,
+        # undecodable bytes).
         def check(s):
+            # [FUNCTION DOC] HELPER: Asserts float(s) raises ValueError whose message is the
+            # standard conversion error text including the repr of s.
             with self.assertRaises(ValueError, msg='float(%r)' % (s,)) as cm:
                 float(s)
             self.assertEqual(str(cm.exception),
@@ -284,6 +326,9 @@ class GeneralFloatCases(__TestCase):
 
     @support.run_with_locale('LC_NUMERIC', 'fr_FR', 'de_DE', '')
     def test_float_with_comma(self):
+        # [FUNCTION DOC] Under a comma-decimal locale (skipped if the locale is not available or
+        # not comma-based), checks float() still only accepts the Python syntax with a dot and
+        # rejects comma decimals and hex strings.
         # set locale to something that doesn't use '.' for the decimal point
         # float must not accept the locale specific decimal point but
         # it still has to accept the normal python syntax
@@ -310,30 +355,51 @@ class GeneralFloatCases(__TestCase):
         self.assertAlmostEqual(float("  .25e-1  "), .025)
 
     def test_floatconversion(self):
+        # [FUNCTION DOC] Checks how float() uses __float__ and __index__: __float__ results must
+        # be float (a float subclass result is accepted with a DeprecationWarning, a non-float
+        # raises TypeError), str subclass __float__ is ignored, __index__ is used as a fallback
+        # (OverflowError for huge values), and __int__ alone is not enough (TypeError).
         # Make sure that calls to __float__() work properly
         class Foo1(object):
+            # [CLASS DOC] HELPER: Old-style object with a float conversion method.
             def __float__(self):
+                # [FUNCTION DOC] HELPER: __float__ returning the plain float 42.0.
                 return 42.
 
         class Foo2(float):
+            # [CLASS DOC] HELPER: Float subclass overriding __float__.
             def __float__(self):
+                # [FUNCTION DOC] HELPER: __float__ returning the plain float 42.0 on a float
+                # subclass.
                 return 42.
 
         class Foo3(float):
+            # [CLASS DOC] HELPER: Float subclass whose constructor doubles the value and whose
+            # __float__ returns self.
             def __new__(cls, value=0.):
+                # [FUNCTION DOC] HELPER: Constructor that doubles the given value before building
+                # the float subclass instance.
                 return float.__new__(cls, 2*value)
 
             def __float__(self):
+                # [FUNCTION DOC] HELPER: __float__ returning self, a float subclass instance
+                # (triggers the deprecation path).
                 return self
 
         class Foo4(float):
+            # [CLASS DOC] HELPER: Float subclass whose __float__ returns an int.
             def __float__(self):
+                # [FUNCTION DOC] HELPER: __float__ returning an int, which is an invalid result
+                # type.
                 return 42
 
         # Issue 5759: __float__ not called on str subclasses (though it is on
         # unicode subclasses).
         class FooStr(str):
+            # [CLASS DOC] HELPER: String subclass defining __float__, which float() should ignore.
             def __float__(self):
+                # [FUNCTION DOC] HELPER: __float__ returning the parsed value plus one; expected
+                # to be ignored for str subclasses.
                 return float(str(self)) + 1
 
         self.assertEqual(float(Foo1()), 42.)
@@ -344,13 +410,19 @@ class GeneralFloatCases(__TestCase):
         self.assertEqual(float(FooStr('8')), 9.)
 
         class Foo5:
+            # [CLASS DOC] HELPER: Class whose __float__ returns an invalid string.
             def __float__(self):
+                # [FUNCTION DOC] HELPER: __float__ returning an empty string, an invalid result
+                # type.
                 return ""
         self.assertRaises(TypeError, time.sleep, Foo5())
 
         # Issue #24731
         class F:
+            # [CLASS DOC] HELPER: Class whose __float__ returns a float subclass instance.
             def __float__(self):
+                # [FUNCTION DOC] HELPER: __float__ returning an instance of a float subclass
+                # (OtherFloatSubclass) with value 42.0.
                 return OtherFloatSubclass(42.)
         with self.assertWarns(DeprecationWarning):
             self.assertEqual(float(F()), 42.)
@@ -362,26 +434,37 @@ class GeneralFloatCases(__TestCase):
             self.assertIs(type(FloatSubclass(F())), FloatSubclass)
 
         class MyIndex:
+            # [CLASS DOC] HELPER: Class exposing an integer through __index__.
             def __init__(self, value):
+                # [FUNCTION DOC] HELPER: Stores the integer value returned later by __index__.
                 self.value = value
             def __index__(self):
+                # [FUNCTION DOC] HELPER: Returns the stored value for use as an index.
                 return self.value
 
         self.assertEqual(float(MyIndex(42)), 42.0)
         self.assertRaises(OverflowError, float, MyIndex(2**2000))
 
         class MyInt:
+            # [CLASS DOC] HELPER: Class exposing only __int__.
             def __int__(self):
+                # [FUNCTION DOC] HELPER: __int__ returning 42; float() must not use it.
                 return 42
 
         self.assertRaises(TypeError, float, MyInt())
 
     def test_keyword_args(self):
+        # [FUNCTION DOC] Checks float() rejects the keyword argument x with a TypeError mentioning
+        # 'keyword argument'.
         with self.assertRaisesRegex(TypeError, 'keyword argument'):
             float(x='3.14')
 
     def test_keywords_in_subclass(self):
+        # [FUNCTION DOC] Checks float subclasses: construction preserves the subclass type,
+        # keyword x is rejected, and subclasses defining __init__ or __new__ with extra keyword
+        # arguments work and keep the extra attribute.
         class subclass(float):
+            # [CLASS DOC] HELPER: Plain float subclass with no overrides.
             pass
         u = subclass(2.5)
         self.assertIs(type(u), subclass)
@@ -390,7 +473,10 @@ class GeneralFloatCases(__TestCase):
             subclass(x=0)
 
         class subclass_with_init(float):
+            # [CLASS DOC] HELPER: Float subclass with an __init__ taking an extra keyword
+            # argument.
             def __init__(self, arg, newarg=None):
+                # [FUNCTION DOC] HELPER: Stores the optional keyword newarg as an attribute.
                 self.newarg = newarg
         u = subclass_with_init(2.5, newarg=3)
         self.assertIs(type(u), subclass_with_init)
@@ -398,7 +484,10 @@ class GeneralFloatCases(__TestCase):
         self.assertEqual(u.newarg, 3)
 
         class subclass_with_new(float):
+            # [CLASS DOC] HELPER: Float subclass with a __new__ taking an extra keyword argument.
             def __new__(cls, arg, newarg=None):
+                # [FUNCTION DOC] HELPER: Builds the instance via the float constructor and sets
+                # the newarg attribute before returning it.
                 self = super().__new__(cls, arg)
                 self.newarg = newarg
                 return self
@@ -408,12 +497,16 @@ class GeneralFloatCases(__TestCase):
         self.assertEqual(u.newarg, 3)
 
     def test_is_integer(self):
+        # [FUNCTION DOC] Checks float.is_integer is False for 1.1, nan and inf and True for 1.0.
         self.assertFalse((1.1).is_integer())
         self.assertTrue((1.).is_integer())
         self.assertFalse(float("nan").is_integer())
         self.assertFalse(float("inf").is_integer())
 
     def test_floatasratio(self):
+        # [FUNCTION DOC] Checks as_integer_ratio on fixed values, on 10000 random floats (the
+        # ratio divided back must equal the float exactly) and against Fraction results; inf and
+        # -inf raise OverflowError, nan raises ValueError. Uses the global random state.
         for f, ratio in [
                 (0.875, (7, 8)),
                 (-0.875, (-7, 8)),
@@ -447,6 +540,9 @@ class GeneralFloatCases(__TestCase):
         self.assertRaises(ValueError, float('nan').as_integer_ratio)
 
     def test_float_containment(self):
+        # [FUNCTION DOC] Checks that floats including inf, -inf, 0.0 and nan are found by identity
+        # in lists, tuples, sets and dicts, counted once, and that containers holding the same nan
+        # object compare equal (identity shortcut).
         floats = (INF, -INF, 0.0, 1.0, NAN)
         for f in floats:
             self.assertIn(f, [f])
@@ -472,12 +568,17 @@ class GeneralFloatCases(__TestCase):
             self.assertTrue(d == d, "{%r : None} not equal to itself" % f)
 
     def assertEqualAndEqualSign(self, a, b):
+    # [FUNCTION DOC] HELPER: Asserts two floats are equal and have the same sign bit, so it
+    # distinguishes 0.0 from -0.0 (via copysign) unlike assertEqual.
         # fail unless a == b and a and b have the same sign bit;
         # the only difference from assertEqual is that this test
         # distinguishes -0.0 and 0.0.
         self.assertEqual((a, copysign(1.0, a)), (b, copysign(1.0, b)))
 
     def test_float_floor(self):
+        # [FUNCTION DOC] Checks float.__floor__ returns an int rounding toward negative infinity,
+        # handles very large values, and raises ValueError for nan and OverflowError for
+        # infinities.
         self.assertIsInstance(float(0.5).__floor__(), int)
         self.assertEqual(float(0.5).__floor__(), 0)
         self.assertEqual(float(1.0).__floor__(), 1)
@@ -492,6 +593,9 @@ class GeneralFloatCases(__TestCase):
         self.assertRaises(OverflowError, float("-inf").__floor__)
 
     def test_float_ceil(self):
+        # [FUNCTION DOC] Checks float.__ceil__ returns an int rounding toward positive infinity,
+        # handles very large values, and raises ValueError for nan and OverflowError for
+        # infinities.
         self.assertIsInstance(float(0.5).__ceil__(), int)
         self.assertEqual(float(0.5).__ceil__(), 1)
         self.assertEqual(float(1.0).__ceil__(), 1)
@@ -507,6 +611,8 @@ class GeneralFloatCases(__TestCase):
 
     @support.requires_IEEE_754
     def test_float_mod(self):
+        # [FUNCTION DOC] Checks the % operator for IEEE 754 corner cases: result takes the sign of
+        # the divisor, including signed zeros. Requires an IEEE 754 platform.
         # Check behaviour of % operator for IEEE 754 special cases.
         # In particular, check signs of zeros.
         mod = operator.mod
@@ -527,6 +633,11 @@ class GeneralFloatCases(__TestCase):
 
     @support.requires_IEEE_754
     def test_float_pow(self):
+        # [FUNCTION DOC] Checks builtin pow and the pow operator against the C99 Annex F.9.4.4
+        # special cases: nan propagation, zero base with negative exponent raising
+        # ZeroDivisionError, signed zero and infinity results, complex results for negative bases
+        # with fractional exponents, and sign of underflowing results. Requires IEEE 754. The
+        # subnormal result checks are commented out.
         # test builtin pow and ** operator for IEEE 754 special cases.
         # Special cases taken from section F.9.4.4 of the C99 specification
 
@@ -727,6 +838,8 @@ class GeneralFloatCases(__TestCase):
             #self.assertTrue(0.0 > pow_op(-2.0, -1047) > -1e-315)
 
     def test_hash(self):
+        # [FUNCTION DOC] Checks hash of floats equals hash of equal ints, including float max, and
+        # that the hash of inf/-inf equals the values in sys.hash_info.
         for x in range(-30, 30):
             self.assertEqual(hash(float(x)), hash(x))
         self.assertEqual(hash(float(sys.float_info.max)),
@@ -735,12 +848,17 @@ class GeneralFloatCases(__TestCase):
         self.assertEqual(hash(float('-inf')), -sys.hash_info.inf)
 
     def test_hash_nan(self):
+        # [FUNCTION DOC] Checks the hash of a nan is identity based (object.__hash__), even for a
+        # float subclass that also inherits a custom __hash__.
         value = float('nan')
         self.assertEqual(hash(value), object.__hash__(value))
         class H:
+            # [CLASS DOC] HELPER: Class with a constant __hash__.
             def __hash__(self):
+                # [FUNCTION DOC] HELPER: Returns the constant 42 as hash.
                 return 42
         class F(float, H):
+            # [CLASS DOC] HELPER: Float subclass also inheriting the constant __hash__ from H.
             pass
         value = F('nan')
         self.assertEqual(hash(value), object.__hash__(value))
@@ -749,6 +867,8 @@ class GeneralFloatCases(__TestCase):
 @unittest.skipUnless(hasattr(float, "__getformat__"), "requires __getformat__")
 class FormatFunctionsTestCase(__TestCase):
     def test_getformat(self):
+        # [FUNCTION DOC] Checks float.__getformat__ returns a known format string for 'double' and
+        # 'float', ValueError for an unknown name and TypeError for a non-string.
         self.assertIn(float.__getformat__('double'),
                       ['unknown', 'IEEE, big-endian', 'IEEE, little-endian'])
         self.assertIn(float.__getformat__('float'),
@@ -773,9 +893,13 @@ LE_FLOAT_NAN = bytes(reversed(BE_FLOAT_NAN))
 # let's also try to guarantee that -0.0 and 0.0 don't get confused.
 
 class IEEEFormatTestCase(__TestCase):
+    # [CLASS DOC] Test case for IEEE 754 bit pattern handling via struct pack/unpack of
+    # infinities, nans and float32 rounding.
 
     @support.requires_IEEE_754
     def test_double_specials_do_unpack(self):
+        # [FUNCTION DOC] Checks struct.unpack does not raise for big/little endian double bit
+        # patterns of infinity and nan. Requires IEEE 754.
         for fmt, data in [('>d', BE_DOUBLE_INF),
                           ('>d', BE_DOUBLE_NAN),
                           ('<d', LE_DOUBLE_INF),
@@ -784,6 +908,8 @@ class IEEEFormatTestCase(__TestCase):
 
     @support.requires_IEEE_754
     def test_float_specials_do_unpack(self):
+        # [FUNCTION DOC] Checks struct.unpack does not raise for big/little endian single
+        # precision bit patterns of infinity and nan. Requires IEEE 754.
         for fmt, data in [('>f', BE_FLOAT_INF),
                           ('>f', BE_FLOAT_NAN),
                           ('<f', LE_FLOAT_INF),
@@ -793,13 +919,20 @@ class IEEEFormatTestCase(__TestCase):
     @support.requires_IEEE_754
     @unittest.skipIf(_testcapi is None, 'needs _testcapi')
     def test_serialized_float_rounding(self):
+        # [FUNCTION DOC] Checks struct.pack of a slightly out-of-range 32-bit float value rounds
+        # to FLT_MAX and not to overflow, for both signs. Skipped when _testcapi is unavailable.
         FLT_MAX = _testcapi.FLT_MAX
         self.assertEqual(struct.pack("<f", 3.40282356e38), struct.pack("<f", FLT_MAX))
         self.assertEqual(struct.pack("<f", -3.40282356e38), struct.pack("<f", -FLT_MAX))
 
 class FormatTestCase(__TestCase):
+    # [CLASS DOC] Test case for formatting floats with format() and percent formatting, including
+    # data driven checks.
 
     def test_format(self):
+        # [FUNCTION DOC] Checks format() on floats: default and empty specs, sign options, percent
+        # type, rejection of integer and string presentation types with ValueError, and nan/inf in
+        # lower and upper case.
         # these should be rewritten to use both format(x, spec) and
         # x.__format__(spec)
 
@@ -853,6 +986,10 @@ class FormatTestCase(__TestCase):
     @support.requires_IEEE_754
     @torch._dynamo.error_on_graph_break(False)
     def test_format_testfile(self):
+        # [FUNCTION DOC] Reads the formatfloat_testcases.txt data file (skipping comment and blank
+        # lines), and for each 'format value -> expected' line checks percent formatting and
+        # format() for the positive and negated value. Opens a file; graph breaks are allowed in
+        # Dynamo.
         with open(format_testfile, encoding="utf-8") as testfile:
             for line in testfile:
                 if line.startswith('--'):
@@ -872,11 +1009,15 @@ class FormatTestCase(__TestCase):
                     self.assertEqual(format(-f, fmt2), '-' + rhs)
 
     def test_issue5864(self):
+        # [FUNCTION DOC] Regression test for issue 5864: format with a precision but no type
+        # switches to exponent notation when needed.
         self.assertEqual(format(123.456, '.4'), '123.5')
         self.assertEqual(format(1234.56, '.4'), '1.235e+03')
         self.assertEqual(format(12345.6, '.4'), '1.235e+04')
 
     def test_issue35560(self):
+        # [FUNCTION DOC] Regression test for issue 35560: format specs with a leading zero width
+        # such as 00 or 01 must not break formatting, for positive and negative values.
         self.assertEqual(format(123.0, '00'), '123.0')
         self.assertEqual(format(123.34, '00f'), '123.340000')
         self.assertEqual(format(123.34, '00e'), '1.233400e+02')
@@ -896,8 +1037,12 @@ class FormatTestCase(__TestCase):
         self.assertEqual(format(-123.34, '00.10g'), '-123.34')
 
 class ReprTestCase(__TestCase):
+    # [CLASS DOC] Test case for float repr round tripping and the short repr style.
     @torch._dynamo.error_on_graph_break(False)
     def test_repr(self):
+        # [FUNCTION DOC] Reads floating_points.txt next to this file, evaluates each non-comment
+        # line as a float and checks eval of its repr round trips exactly. Opens a file; graph
+        # breaks are allowed in Dynamo.
         with open(os.path.join(os.path.split(__file__)[0],
                   'mathdata',
                   'floating_points.txt'), encoding="utf-8") as floats_file:
@@ -911,6 +1056,10 @@ class ReprTestCase(__TestCase):
     @unittest.skipUnless(getattr(sys, 'float_repr_style', '') == 'short',
                          "applies only when using short float repr style")
     def test_short_repr(self):
+        # [FUNCTION DOC] Checks the short float repr: given decimal strings (with up to 15
+        # significant digits, exponent form for values at or above 1e16 and below 1e-4) are
+        # reproduced exactly by repr of the parsed float, for both signs, and repr equals str.
+        # Skipped unless the repr style is short.
         # test short float repr introduced in Python 3.1.  One aspect
         # of this repr is that we get some degree of str -> float ->
         # str roundtripping.  In particular, for any numeric string
@@ -962,7 +1111,12 @@ class ReprTestCase(__TestCase):
 
 @support.requires_IEEE_754
 class RoundTestCase(__TestCase):
+    # [CLASS DOC] Test case for round() on floats (needs IEEE 754): special values, huge and tiny
+    # digit counts, overflow, half-even behavior and agreement with format. Defines
+    # assertFloatsAreIdentical.
     def assertFloatsAreIdentical(self, x, y):
+    # [FUNCTION DOC] Fails the test unless x and y are identical: both nan, same-signed
+    # infinities, same-signed zeros, or equal finite nonzero values.
         """assert that floats x and y are identical, in the sense that:
         (1) both x and y are nans, or
         (2) both x and y are infinities, with the same sign, or
@@ -986,6 +1140,8 @@ class RoundTestCase(__TestCase):
         self.fail(msg.format(x, y))
 
     def test_inf_nan(self):
+        # [FUNCTION DOC] Checks round on inf/nan with no digits raises OverflowError or
+        # ValueError, and with a non-integer ndigits raises TypeError.
         self.assertRaises(OverflowError, round, INF)
         self.assertRaises(OverflowError, round, -INF)
         self.assertRaises(ValueError, round, NAN)
@@ -995,11 +1151,13 @@ class RoundTestCase(__TestCase):
         self.assertRaises(TypeError, round, -0.0, 1j)
 
     def test_inf_nan_ndigits(self):
+        # [FUNCTION DOC] Checks round(inf/nan, 0) returns the input unchanged.
         self.assertEqual(round(INF, 0), INF)
         self.assertEqual(round(-INF, 0), -INF)
         self.assertTrue(math.isnan(round(NAN, 0)))
 
     def test_large_n(self):
+        # [FUNCTION DOC] Checks very large ndigits return the value unchanged.
         for n in [324, 325, 400, 2**31-1, 2**31, 2**32, 2**100]:
             self.assertEqual(round(123.456, n), 123.456)
             self.assertEqual(round(-123.456, n), -123.456)
@@ -1012,6 +1170,8 @@ class RoundTestCase(__TestCase):
         self.assertEqual(round(1.4e-315, 315), 1e-315)
 
     def test_small_n(self):
+        # [FUNCTION DOC] Checks very negative ndigits round to zero, keeping the sign of the
+        # input.
         for n in [-308, -309, -400, 1-2**31, -2**31, -2**31-1, -2**100]:
             self.assertFloatsAreIdentical(round(123.456, n), 0.0)
             self.assertFloatsAreIdentical(round(-123.456, n), -0.0)
@@ -1019,12 +1179,16 @@ class RoundTestCase(__TestCase):
             self.assertFloatsAreIdentical(round(1e-320, n), 0.0)
 
     def test_overflow(self):
+        # [FUNCTION DOC] Checks round raises OverflowError when rounding near the float maximum
+        # overflows.
         self.assertRaises(OverflowError, round, 1.6e308, -308)
         self.assertRaises(OverflowError, round, -1.7e308, -308)
 
     @unittest.skipUnless(getattr(sys, 'float_repr_style', '') == 'short',
                          "applies only when using short float repr style")
     def test_previous_round_bugs(self):
+        # [FUNCTION DOC] Checks specific values from earlier bug reports and round-half-even
+        # behavior for negative digit counts. Skipped unless the repr style is short.
         # particular cases that have occurred in bug reports
         self.assertEqual(round(562949953421312.5, 1),
                           562949953421312.5)
@@ -1043,6 +1207,9 @@ class RoundTestCase(__TestCase):
     @unittest.skipUnless(getattr(sys, 'float_repr_style', '') == 'short',
                          "applies only when using short float repr style")
     def test_matches_float_format(self):
+        # [FUNCTION DOC] Checks round(x, n) equals float(format(x, '.nf')) for n from 0 to 3, over
+        # small multiples of 0.001, halfway cases and random values. Skipped unless the repr style
+        # is short. Uses global random state.
         # round should give the same results as float formatting
         for i in range(500):
             x = i/1000.
@@ -1066,9 +1233,13 @@ class RoundTestCase(__TestCase):
             self.assertEqual(float(format(x, '.3f')), round(x, 3))
 
     def test_format_specials(self):
+        # [FUNCTION DOC] Checks percent formatting and format() of inf and nan for many e/f/g
+        # specs, including the plus and space sign flags (nan is always treated as positive).
         # Test formatting of nans and infs.
 
         def test(fmt, value, expected):
+            # [FUNCTION DOC] HELPER: Checks a percent format and the equivalent format() call
+            # (percent stripped) both produce the expected string.
             # Test with both % and format().
             self.assertEqual(fmt % value, expected, fmt)
             fmt = fmt[1:] # strip off the %
@@ -1096,6 +1267,8 @@ class RoundTestCase(__TestCase):
             test(sfmt, -NAN, ' nan')
 
     def test_None_ndigits(self):
+        # [FUNCTION DOC] Checks round with ndigits None (positional, keyword or absent) returns an
+        # int.
         for x in round(1.23), round(1.23, None), round(1.23, ndigits=None):
             self.assertEqual(x, 1)
             self.assertIsInstance(x, int)
@@ -1107,7 +1280,12 @@ class RoundTestCase(__TestCase):
 # Beginning with Python 2.6 float has cross platform compatible
 # ways to create and represent inf and nan
 class InfNanTest(__TestCase):
+    # [CLASS DOC] Test case for parsing and printing of infinity and nan: string spellings,
+    # invalid spellings, repr/str output and sign of nan/inf.
     def test_inf_from_str(self):
+        # [FUNCTION DOC] Checks float() accepts inf/infinity spellings with optional sign in any
+        # case, gives repr and str 'inf'/'-inf', and raises ValueError for misspellings and
+        # doubled signs.
         self.assertTrue(isinf(float("inf")))
         self.assertTrue(isinf(float("+inf")))
         self.assertTrue(isinf(float("-inf")))
@@ -1153,6 +1331,7 @@ class InfNanTest(__TestCase):
         self.assertRaises(ValueError, float, "--Infinity")
 
     def test_inf_as_str(self):
+        # [FUNCTION DOC] Checks repr and str of overflowed products are 'inf' and '-inf'.
         self.assertEqual(repr(1e300 * 1e300), "inf")
         self.assertEqual(repr(-1e300 * 1e300), "-inf")
 
@@ -1160,6 +1339,8 @@ class InfNanTest(__TestCase):
         self.assertEqual(str(-1e300 * 1e300), "-inf")
 
     def test_nan_from_str(self):
+        # [FUNCTION DOC] Checks float() accepts nan with optional sign in any case, repr and str
+        # are always 'nan', and misspellings or doubled signs raise ValueError.
         self.assertTrue(isnan(float("nan")))
         self.assertTrue(isnan(float("+nan")))
         self.assertTrue(isnan(float("-nan")))
@@ -1189,6 +1370,7 @@ class InfNanTest(__TestCase):
         self.assertRaises(ValueError, float, "--nAn")
 
     def test_nan_as_str(self):
+        # [FUNCTION DOC] Checks repr and str of nan results are 'nan' regardless of sign.
         self.assertEqual(repr(1e300 * 1e300 * 0), "nan")
         self.assertEqual(repr(-1e300 * 1e300 * 0), "nan")
 
@@ -1196,10 +1378,12 @@ class InfNanTest(__TestCase):
         self.assertEqual(str(-1e300 * 1e300 * 0), "nan")
 
     def test_inf_signs(self):
+        # [FUNCTION DOC] Checks the sign bit of parsed inf and -inf using copysign.
         self.assertEqual(copysign(1.0, float('inf')), 1.0)
         self.assertEqual(copysign(1.0, float('-inf')), -1.0)
 
     def test_nan_signs(self):
+        # [FUNCTION DOC] Checks the sign bit of parsed nan and -nan is preserved.
         # The sign of float('nan') should be predictable.
         self.assertEqual(copysign(1.0, float('nan')), 1.0)
         self.assertEqual(copysign(1.0, float('-nan')), -1.0)
@@ -1208,12 +1392,17 @@ class InfNanTest(__TestCase):
 fromHex = float.fromhex
 toHex = float.hex
 class HexFloatTestCase(__TestCase):
+    # [CLASS DOC] Test case for float.fromhex and float.hex. Class attributes MAX, MIN, TINY and
+    # EPS hold the largest normal, smallest normal, smallest subnormal and unit spacing at 1.0 as
+    # floats built from hex strings.
     MAX = fromHex('0x.fffffffffffff8p+1024')  # max normal
     MIN = fromHex('0x1p-1022')                # min normal
     TINY = fromHex('0x0.0000000000001p-1022') # min subnormal
     EPS = fromHex('0x0.0000000000001p0') # diff between 1.0 and next float up
 
     def assertFloatsAreIdentical(self, x, y):
+    # [FUNCTION DOC] Fails the test unless x and y are identical: both nan, same-signed
+    # infinities, same-signed zeros, or equal finite nonzero values.
         """assert that floats x and y are identical, in the sense that:
         (1) both x and y are nans, or
         (2) both x and y are infinities, with the same sign, or
@@ -1237,15 +1426,20 @@ class HexFloatTestCase(__TestCase):
         self.fail(msg.format(x, y))
 
     def identical(self, x, y):
+    # [FUNCTION DOC] HELPER: Alias for assertFloatsAreIdentical.
         self.assertFloatsAreIdentical(x, y)
 
     def test_ends(self):
+    # [FUNCTION DOC] Checks MIN, TINY, EPS and MAX equal the values computed with ldexp.
         self.identical(self.MIN, ldexp(1.0, -1022))
         self.identical(self.TINY, ldexp(1.0, -1074))
         self.identical(self.EPS, ldexp(1.0, -52))
         self.identical(self.MAX, 2.*(ldexp(1.0, 1023) - ldexp(1.0, 970)))
 
     def test_invalid_inputs(self):
+    # [FUNCTION DOC] Checks fromhex raises ValueError for many malformed inputs (misspelled
+    # inf/nan, whitespace inside, doubled signs, missing digits, wrong point, fullwidth digits,
+    # embedded NUL); fails with the unexpected result otherwise.
         invalid_inputs = [
             'infi',   # misspelt infinities and nans
             '-Infinit',
@@ -1310,6 +1504,8 @@ class HexFloatTestCase(__TestCase):
 
 
     def test_whitespace(self):
+    # [FUNCTION DOC] Checks fromhex ignores leading and trailing whitespace of several kinds
+    # around inf, nan and numeric strings.
         value_pairs = [
             ('inf', INF),
             ('-Infinity', -INF),
@@ -1336,6 +1532,9 @@ class HexFloatTestCase(__TestCase):
 
 
     def test_from_hex(self):
+    # [FUNCTION DOC] Large table test of fromhex: infinities and nans, input format variants,
+    # moving the point, overflow to ValueError/OverflowError and max rounding, zeros, underflow,
+    # and round-half-even near 0, MIN and 1.0, plus a regression for bug 44954.
         MIN = self.MIN
         MAX = self.MAX
         TINY = self.TINY
@@ -1635,7 +1834,11 @@ class HexFloatTestCase(__TestCase):
         self.identical(fromHex('+8p-1078'), 0.0)
 
     def test_roundtrip(self):
+    # [FUNCTION DOC] Checks fromhex(hex(x)) recovers x exactly for special values and 10000 random
+    # finite floats of random exponent and sign. Uses global random state.
         def roundtrip(x):
+            # [FUNCTION DOC] HELPER: Returns the float obtained by converting x to hex and parsing
+            # it back.
             return fromHex(toHex(x))
 
         for x in [NAN, INF, self.MAX, self.MIN, self.MIN-self.TINY, self.TINY, 0.0]:
@@ -1656,8 +1859,13 @@ class HexFloatTestCase(__TestCase):
                 self.identical(x, fromHex(toHex(x)))
 
     def test_subclass(self):
+    # [FUNCTION DOC] Checks fromhex called on float subclasses builds the subclass: the subclass
+    # __new__ is applied (value plus one) and a subclass __init__ runs, setting an attribute.
         class F(float):
+            # [CLASS DOC] HELPER: Float subclass whose __new__ adds one to the value.
             def __new__(cls, value):
+                # [FUNCTION DOC] HELPER: Constructor adding one to the value before creating the
+                # float.
                 return float.__new__(cls, value + 1)
 
         f = F.fromhex((1.5).hex())
@@ -1665,7 +1873,9 @@ class HexFloatTestCase(__TestCase):
         self.assertEqual(f, 2.5)
 
         class F2(float):
+            # [CLASS DOC] HELPER: Float subclass whose __init__ sets an attribute.
             def __init__(self, value):
+                # [FUNCTION DOC] HELPER: Initializer setting the foo attribute to a string.
                 self.foo = 'bar'
 
         f = F2.fromhex((1.5).hex())
