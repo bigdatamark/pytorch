@@ -1,5 +1,17 @@
 # mypy: ignore-errors
 
+# [MODULE DOC] Core classes and sample-input generators for the OpInfo operator database.
+# Defines the metadata objects that describe a PyTorch operator for generic tests: OpInfo
+# (dtype support per device, variants, aliases, autograd flags, sample/error input
+# generators, decorators/skips), specialised subclasses (ReductionOpInfo, BinaryUfuncInfo,
+# UnaryUfuncInfo, SpectralFuncInfo, ShapeFuncInfo, ForeachFuncInfo), SampleInput/ErrorInput
+# containers, DecorateInfo (test decorator matching), per-sample skip/xfail rules, shared
+# elementwise and reduction input generators, and gradcheck wrapper helpers.
+# Import-time side effects: creates a module logger, defines the size constants L, M, S, XS
+# and the _NOTHING sentinel, and defines the SpectralFuncType enum; no registration happens.
+# Usage: op definitions in opinfo/definitions build OpInfo objects, test_ops-style tests
+# iterate them and call their sample_inputs / error_inputs methods.
+
 import collections
 import collections.abc
 import contextlib
@@ -60,6 +72,10 @@ _NOTHING = object()
 # Extension of getattr to support qualified names
 # e.g. _getattr_qual(torch, 'linalg.norm') -> torch.linalg.norm
 def _getattr_qual(obj, name, default=_NOTHING):
+    # [FUNCTION DOC] HELPER: getattr that accepts a dotted qualified name.
+    # Walks the name one dotted component at a time starting from obj and returns the final
+    # attribute. If any component is missing, returns default when one was supplied (anything
+    # other than the _NOTHING sentinel), otherwise re-raises the AttributeError.
     try:
         for path in name.split("."):
             obj = getattr(obj, path)
@@ -72,6 +88,12 @@ def _getattr_qual(obj, name, default=_NOTHING):
 
 
 class DecorateInfo:
+    # [CLASS DOC] Describes which tests should get which decorators for an operator.
+    # A test matches when every given filter (test class name, test name, device type or list
+    # of device types, dtypes) agrees; None means "match anything". Attributes (slots only):
+    # decorators (list), cls_name, test_name,
+    # device_type, dtypes, active_if (bool or a callable
+    # over the test's parameter kwargs). Key method: is_active.
     """Describes which test, or type of tests, should be wrapped in the given
     decorators when testing an operator. Any test that matches all provided
     arguments will be decorated. The decorators will only be applied if the
@@ -96,6 +118,12 @@ class DecorateInfo:
         dtypes=None,
         active_if=True,
     ):
+        # [FUNCTION DOC] Stores the matching filters; a
+        # single decorator is wrapped into a list.
+        # decorators may be one decorator or a sequence of
+        # them. device_type/dtypes/active_if are
+        # keyword-only. Raises AssertionError if dtypes is
+        # given and holds a non-torch.dtype entry.
         self.decorators = (
             list(decorators)
             if isinstance(decorators, collections.abc.Sequence)
@@ -114,6 +142,12 @@ class DecorateInfo:
                     raise AssertionError(f"Expected torch.dtype, got {type(dtype)}")
 
     def is_active(self, cls_name, test_name, device_type, dtype, param_kwargs):
+        # [FUNCTION DOC] Returns True if the decorators apply to the described test instance.
+        # Args are the test class name, test name, device
+        # type string, dtype and the dictionary of
+        # test parameter kwargs. Requires active_if to be truthy (calling it with the parameter
+        # kwargs when it is callable) and all of cls_name, test_name, device_type and dtypes to
+        # match. Pure query, no side effects.
         device_type_matched = False
         if isinstance(self.device_type, str):
             device_type_matched = self.device_type == device_type
@@ -142,6 +176,12 @@ class DecorateInfo:
 #   to support scalar inputs, too. Some tests still depend on 'input' being a Tensor
 #   or TensorList, however.
 class SampleInput:
+    # [CLASS DOC] Container for one sample invocation of an operator.
+    # Attributes (slots): input (first argument, usually a tensor or list of tensors, but
+    # scalars are also allowed), args (tuple), kwargs (dict), output_process_fn_grad (callable
+    # applied to outputs before gradient checks, identity by default), broadcasts_input (flag
+    # marking samples whose input is broadcast by the op), name (label, empty by default).
+    # Key methods: with_metadata, summary, transform, numpy, noncontiguous.
     """Represents sample inputs to a function."""
 
     __slots__ = [
@@ -164,6 +204,14 @@ class SampleInput:
         name=None,
         **var_kwargs,
     ):
+        # [FUNCTION DOC] Builds a SampleInput either
+        # "naturally" or with explicit args and kwargs.
+        # Natural form: extra positional and keyword arguments become args and kwargs. Explicit
+        # form: args and kwargs are given directly. The two
+        # forms cannot be mixed and the natural
+        # form cannot also carry metadata. Raises
+        # AssertionError on violations or if args is not a
+        # tuple or kwargs is not a dict. Missing metadata defaults to identity / False / empty.
         # input is the first input to the op and is typically either a Tensor or TensorList (Sequence[Tensor]).
         # This follows the typical pattern where for Tensor inputs op(t, ...) = t.op(...).
         self.input = input
@@ -217,6 +265,10 @@ class SampleInput:
     def with_metadata(
         self, *, output_process_fn_grad=None, broadcasts_input=None, name=None
     ):
+        # [FUNCTION DOC] Overwrites any of the metadata
+        # fields that are not None and returns self.
+        # Mutates the sample in place to allow chaining. Fields: output_process_fn_grad,
+        # broadcasts_input, name.
         if output_process_fn_grad is not None:
             self.output_process_fn_grad = output_process_fn_grad
         if broadcasts_input is not None:
@@ -226,6 +278,11 @@ class SampleInput:
         return self
 
     def _repr_helper(self, formatter):
+        # [FUNCTION DOC] HELPER: Builds the repr string of the
+        # sample using a caller-supplied formatter.
+        # The formatter is applied to input, args and
+        # kwargs; metadata fields are shown verbatim.
+        # Returns text of the form SampleInput(...).
         # Helper function to return the details of the SampleInput as `str`
         # It consolidates all the fields of SampleInput and allows,
         # formatting the fields like `input`, `args`, etc with `formatter`
@@ -242,14 +299,20 @@ class SampleInput:
         return f"SampleInput({', '.join(a for a in arguments if a is not None)})"
 
     def __repr__(self):
+        # [FUNCTION DOC] Returns the full repr of the sample (no condensing of tensors).
         return self._repr_helper(lambda x: x)
 
     def summary(self):
+        # [FUNCTION DOC] Returns a condensed, human friendly description of the sample.
+        # Tensors are shown as shape/device/dtype (marking non-contiguous dense tensors), lists
+        # of tensors as a tensor list, dicts and tuples recursively, everything else by repr.
         # Returns the SampleInput details in a more
         # friendly format.
         # It formats `Tensor` and `TensorList`
         # in a more condensed representation.
         def formatter(arg):
+            # [FUNCTION DOC] HELPER: Recursive formatter used by
+            # summary for tensors, dicts and sequences.
             # Format any instance of `Tensor` (standalone, in list, or in dict)
             # by Tensor[TensorShape]
             # Eg. Tensor with shape (3, 4) is formatted as Tensor[3, 4]
@@ -276,8 +339,18 @@ class SampleInput:
 
     # Applies the transform f(t) -> t to each tensor and dtype in the SampleInput
     def transform(self, f):
+        # [FUNCTION DOC] Returns a new SampleInput with f
+        # applied to every tensor and dtype found.
+        # f runs under no-grad on each tensor or torch.dtype
+        # in input, args and kwargs, recursing
+        # through lists, tuples and dicts; other values are kept as is. Metadata is copied over
+        # and the name gets a transformed suffix. Does not mutate the original sample.
         def tt(t):
+            # [FUNCTION DOC] HELPER: Recursively applies f to
+            # tensors/dtypes inside nested containers.
             def _tt(t):
+                # [FUNCTION DOC] HELPER: Applies f to a single
+                # value with gradient tracking disabled.
                 with torch.no_grad():
                     return f(t)
 
@@ -314,7 +387,12 @@ class SampleInput:
     # Converts tensors to ndarrays by calling .detach().cpu().numpy() on them
     # Converts dtypes by remapping them using torch_to_numpy_dtype_dict
     def numpy(self):
+        # [FUNCTION DOC] Returns the sample converted to NumPy as a new SampleInput.
+        # Tensors are detached, moved to the CPU and turned into arrays (bfloat16 is widened to
+        # float32 and complex half to complex float first); torch dtypes are mapped to NumPy
+        # dtypes. Note the result is a SampleInput, not an (input, args, kwargs) tuple.
         def to_numpy(t):
+            # [FUNCTION DOC] HELPER: Converts one tensor or dtype to its NumPy counterpart.
             if isinstance(t, torch.Tensor):
                 if t.dtype is torch.bfloat16:
                     return t.detach().cpu().to(torch.float32).numpy()
@@ -329,7 +407,15 @@ class SampleInput:
         return self.transform(to_numpy)
 
     def noncontiguous(self):
+        # [FUNCTION DOC] Returns a copy of the sample whose
+        # tensors are replaced by noncontiguous
+        # equivalents with the same values (via
+        # noncontiguous_like); other values are unchanged.
         def to_noncontiguous(t):
+            # [FUNCTION DOC] HELPER: Maps a tensor to a noncontiguous
+            # copy; dtypes and other values pass through.
+            # KNOWN ISSUE: the dtype branch returns the same value
+            # as the fallthrough, so it is redundant.
             if isinstance(t, torch.Tensor):
                 return noncontiguous_like(t)
             elif isinstance(t, torch.dtype):
@@ -344,6 +430,9 @@ NumericsFilter = collections.namedtuple("NumericsFilter", ["condition", "safe_va
 
 
 class ErrorInput:
+    # [CLASS DOC] A SampleInput expected to make the operator fail, plus the expected failure.
+    # Attributes (slots): sample_input, error_type (exception class, default RuntimeError) and
+    # error_regex (pattern the message must match, required).
     """
     A SampleInput that will cause the operation to throw an error plus information
     about the resulting error.
@@ -352,23 +441,34 @@ class ErrorInput:
     __slots__ = ["sample_input", "error_type", "error_regex"]
 
     def __init__(self, sample_input, *, error_type=RuntimeError, error_regex):
+        # [FUNCTION DOC] Stores the failing sample, the
+        # expected exception type and message regex.
         self.sample_input = sample_input
         self.error_type = error_type
         self.error_regex = error_regex
 
 
 class AliasInfo:
+    # [CLASS DOC] Holds the function, method and inplace variants of an operator alias.
+    # Attributes: name, op (function found by qualified name under torch), method_variant and
+    # inplace_variant (Tensor methods named like the alias or with a trailing underscore, or
+    # None when missing). Instances are callable and forward to op.
     """Class holds alias information. For example, torch.abs ->
     torch.absolute, torch.Tensor.absolute, torch.Tensor.absolute_
     """
 
     def __init__(self, alias_name):
+        # [FUNCTION DOC] Resolves the alias name to its variants.
+        # Raises AttributeError if the qualified alias name does not exist under torch; missing
+        # Tensor methods become None.
         self.name = alias_name
         self.op = _getattr_qual(torch, alias_name)
         self.method_variant = getattr(torch.Tensor, alias_name, None)
         self.inplace_variant = getattr(torch.Tensor, alias_name + "_", None)
 
     def __call__(self, *args, **kwargs):
+        # [FUNCTION DOC] Calls the alias function variant with
+        # the given arguments and returns the result.
         return self.op(*args, **kwargs)
 
 
@@ -653,6 +753,15 @@ class AliasInfo:
 # Classes and methods for the operator database
 @dataclass
 class OpInfo:
+    # [CLASS DOC] Dataclass holding all test metadata for one PyTorch operator.
+    # Fields cover: name/aliases/variant_test_name, the function, method, inplace, operator and
+    # inplace-operator variants, skips and decorators, sample/reference/error input generator
+    # functions (including per-sparse-layout ones), forward and backward dtype sets per device
+    # (CPU base, with dtypesIf mapping for other devices), and many boolean/autograd/JIT/
+    # compile feature flags that generic tests read. Invariant: __post_init__ fills every
+    # default, derives inherited dtypes and validates flag consistency, so a constructed
+    # instance is fully resolved. Key methods: sample_inputs, reference_inputs, error_inputs,
+    # the sparse variants, get_decorators, supported_dtypes, supported_backward_dtypes.
     """Operator information and helper functions for acquiring it."""
 
     # the string name of the function
@@ -749,6 +858,12 @@ class OpInfo:
     dtypesIf: dict[str, _dispatch_dtypes] = field(default_factory=dict)
 
     def __getattribute__(self, name: str) -> Any:
+        # [FUNCTION DOC] Attribute read hook that redirects
+        # dtypesIf<Device> names to the mapping.
+        # Any attribute starting with dtypesIf (other than
+        # dtypesIf itself) returns the entry of
+        # the dtypesIf dictionary keyed by the lowercase device suffix, or None if absent; all
+        # other attributes use normal lookup.
         if name.startswith("dtypesIf") and name != "dtypesIf":
             # TODO: Warn if used
             dev_name = name.removeprefix("dtypesIf").lower()
@@ -756,6 +871,13 @@ class OpInfo:
         return super().__getattribute__(name)
 
     def __setattr__(self, name: str, value: Any) -> None:
+        # [FUNCTION DOC] Attribute write hook that stores
+        # dtypesIf<Device> values in the mapping.
+        # For names starting with dtypesIf (other than dtypesIf itself) the value must be a
+        # dispatch-dtypes object or None, otherwise
+        # AssertionError is raised; it is stored in the
+        # dtypesIf dictionary under the lowercase device
+        # suffix. Other attributes are set normally.
         # TODO: After migration, start adding warnings here
         if name.startswith("dtypesIf") and name != "dtypesIf":
             if not isinstance(value, (_dispatch_dtypes, type(None))):
@@ -958,6 +1080,23 @@ class OpInfo:
     has_nondeterministic_output: bool = False
 
     def __post_init__(self):
+        # [FUNCTION DOC] Resolves defaults and validates the
+        # OpInfo after dataclass construction.
+        # Saves a copy of the original arguments, requires dtypes (AssertionError if missing),
+        # validates/normalises dtypesIf, aten_name, dynamic dtype consistency, and derives the
+        # backward dtype sets per device from the explicit ones. Inherits dtypes across devices
+        # (cuda/hpu from cpu, rocm/xpu from cuda, mps from
+        # cpu minus double types). Discovers the
+        # op, method, inplace and operator variants by name when unspecified, merges skips into
+        # decorators, defaults sparse and njt support from the presence of sample functions,
+        # wraps sample generators in no-grad, sets autodiff
+        # node defaults, resolves the autograd
+        # flags (raising AssertionError on inconsistent combinations) and converts aliases to
+        # AliasInfo objects. Side effects: mutates the
+        # instance heavily; looks up torch attributes.
+        # KNOWN ISSUE: the message for check_inplace_batched_forward_grad names
+        # check_batched_forward_grad as the flag being
+        # misused, which looks like a copy-paste slip.
         self._original_opinfo_args = asdict(self).copy()
 
         if self.dtypes is None:
@@ -1259,35 +1398,45 @@ class OpInfo:
             self.aliases = ()
 
     def __call__(self, *args, **kwargs):
+        # [FUNCTION DOC] Calls the function variant of the operator with the given arguments.
         """Calls the function variant of the operator."""
         return self.op(*args, **kwargs)
 
     def __str__(self):
+        # [FUNCTION DOC] Returns a readable multi-line representation of all dataclass fields.
         return dataclass_repr(self)
 
     def get_op(self):
+        # [FUNCTION DOC] Returns the function variant of the operator.
         """Returns the function variant of the operator, torch.<op_name>."""
         return self.op
 
     def get_method(self):
+        # [FUNCTION DOC] Returns the Tensor method variant of
+        # the operator, or None if there is none.
         """Returns the method variant of the operator, torch.Tensor.<op_name>.
         Returns None if the operator has no method variant.
         """
         return self.method_variant
 
     def get_inplace(self):
+        # [FUNCTION DOC] Returns the inplace Tensor method variant, or None if there is none.
         """Returns the inplace variant of the operator, torch.Tensor.<op_name>_.
         Returns None if the operator has no inplace variant.
         """
         return self.inplace_variant
 
     def get_operator(self):
+        # [FUNCTION DOC] Returns the python operator-module
+        # variant (for example operator.neg), or None.
         """Returns operator variant of the operator, e.g. operator.neg
         Returns None if the operator has no operator variant.
         """
         return self.operator_variant
 
     def get_inplace_operator(self):
+        # [FUNCTION DOC] Returns the inplace operator-module
+        # variant (for example operator.iadd), or None.
         """Returns the inplace operator variant of the operator, e.g operator.iadd
         Returns None if the operator has no inplace operator variant"""
         return self.inplace_operator_variant
@@ -1297,7 +1446,17 @@ class OpInfo:
     # I'd love to combine these into one but I haven't figured out how to do it
     # in a way that works like it should, and I tried a LOT of things.
     def _maybe_skip_or_xfail(self, rules, device, sample, idx):
+        # [FUNCTION DOC] HELPER: Builds the subtest and
+        # skip/xfail context factories for one sample.
+        # Args: rules (list of SampleRule or None), device,
+        # sample, idx (sample index). Returns a
+        # pair: a function making a subtest context from a test case, and a function making the
+        # skip/xfail context from a test case. The first rule whose sample_match_fn matches the
+        # sample wins (order matters); with no match a null
+        # context is used. Logs matches at debug.
         def _subtest_fn(test_case, sample=sample.name, idx=idx):
+            # [FUNCTION DOC] HELPER: Returns a subtest context of the
+            # test case labelled with sample name and index.
             return test_case.subTest(sample=sample, idx=idx)
 
         if rules is None or len(rules) == 0:
@@ -1326,6 +1485,14 @@ class OpInfo:
         return (_subtest_fn, lambda _: contextlib.nullcontext())
 
     def _sample_callback_fn(self, use_subtests, device):
+        # [FUNCTION DOC] HELPER: Builds the per-item
+        # callback used by TrackedInputIter, or None.
+        # Reads the sample skip/xfail rules attached to the currently running test function.
+        # Raises RuntimeError if rules exist but use_subtests is False, or if pytest is in use
+        # without pytest-subtests installed. Returns None
+        # when subtests are disabled (samples are
+        # returned as is); otherwise a callback mapping (sample, index) to (sample, subtest
+        # context factory, skip/xfail context factory).
         # Get sample-specific skips / xfails.
         sample_skips_and_xfails = getattr(
             extract_test_fn(), "sample_skips_and_xfails", None
@@ -1367,6 +1534,8 @@ def test_foo(self, device, dtype, op):
             sample_skips_and_xfails=sample_skips_and_xfails,
             use_subtests=use_subtests,
         ):
+            # [FUNCTION DOC] HELPER: Returns the sample together with
+            # its subtest and skip/xfail context factories.
             # When subtests are enabled, also return a subtest context. This is required
             # for xfails / skips to work properly.
             return (
@@ -1379,6 +1548,12 @@ def test_foo(self, device, dtype, op):
         return _f
 
     def conjugate_sample_inputs(self, device, dtype, requires_grad=False, **kwargs):
+        # [FUNCTION DOC] Returns an iterator of samples whose first tensor input is conjugated.
+        # Pops set_seed (default True) and use_subtests (default False) from kwargs, generates
+        # samples with sample_inputs_func, conjugates the
+        # input tensor (or the first element of a
+        # list input) in place preserving requires_grad, and wraps them in a TrackedInputIter.
+        # Mutates the generated samples; assumes input is a tensor or list of tensors.
         """Returns an iterable of SampleInputs but with the tensor input or first
         tensor in a sequence input conjugated.
         """
@@ -1389,6 +1564,8 @@ def test_foo(self, device, dtype, op):
         conj_samples = list(samples)
 
         def conjugate(tensor):
+            # [FUNCTION DOC] HELPER: Returns the conjugate of a
+            # tensor while keeping its requires_grad flag.
             _requires_grad = tensor.requires_grad
             tensor = tensor.conj()
             return tensor.requires_grad_(_requires_grad)
@@ -1410,6 +1587,13 @@ def test_foo(self, device, dtype, op):
         )
 
     def sample_inputs(self, device, dtype, requires_grad=False, **kwargs):
+        # [FUNCTION DOC] Returns a tracked iterator over the operator's sample inputs.
+        # Pops set_seed and use_subtests from kwargs and
+        # forwards the rest to sample_inputs_func.
+        # If include_conjugated_inputs is true in kwargs, the conjugated samples are appended.
+        # Items may be wrapped with subtest/skip contexts
+        # depending on use_subtests; iteration is
+        # restricted to a single sample when the OPINFO_SAMPLE_INPUT_INDEX setting is present.
         """
         Returns an iterable of SampleInputs.
 
@@ -1437,6 +1621,10 @@ def test_foo(self, device, dtype, op):
         )
 
     def reference_inputs(self, device, dtype, requires_grad=False, **kwargs):
+        # [FUNCTION DOC] Returns a tracked iterator over a larger set of "reference" samples.
+        # Uses reference_inputs_func when defined, otherwise falls back to sample_inputs_func.
+        # Pops set_seed and use_subtests like sample_inputs. Raises NotImplementedError when
+        # include_conjugated_inputs is requested and reference_inputs_func is defined.
         """
         Returns an iterable of SampleInputs.
 
@@ -1473,6 +1661,13 @@ def test_foo(self, device, dtype, op):
         )
 
     def error_inputs(self, device, **kwargs):
+        # [FUNCTION DOC] Returns a tracked iterator over
+        # ErrorInput objects from error_inputs_func.
+        # Pops set_seed and use_subtests from kwargs. With
+        # subtests enabled, each item becomes a
+        # pair of the ErrorInput and its subtest context
+        # factory; otherwise the ErrorInput itself.
+        # Requires error_inputs_func to be defined (calling None would raise TypeError).
         """
         Returns an iterable of ErrorInputs.
         """
@@ -1481,6 +1676,8 @@ def test_foo(self, device, dtype, op):
         errs = self.error_inputs_func(self, device, **kwargs)
 
         def _error_item_callback(e, i, use_subtests=use_subtests, device=device):
+            # [FUNCTION DOC] HELPER: Adapts the sample callback to
+            # ErrorInput items (applies it to the wrapped sample).
             cb = self._sample_callback_fn(use_subtests, device)
             # no rules to apply; just return the sample
             if cb is None:
@@ -1500,6 +1697,9 @@ def test_foo(self, device, dtype, op):
         )
 
     def error_inputs_sparse(self, device, layout, **kwargs):
+        # [FUNCTION DOC] Returns the sparse-layout error inputs for the given layout.
+        # Raises unittest.SkipTest if the layout is unsupported by this op; otherwise returns
+        # whatever error_inputs_sparse_func produces for (device, layout).
         """
         Returns an iterable of ErrorInputs that contain sparse sample
         inputs with a specified layout.
@@ -1509,6 +1709,10 @@ def test_foo(self, device, dtype, op):
         return self.error_inputs_sparse_func(self, device, layout, **kwargs)
 
     def supports_sparse_layout(self, layout):
+        # [FUNCTION DOC] Returns the supports_* flag matching the
+        # sparse layout (coo maps to supports_sparse).
+        # Derives the flag name from the layout's string form; raises AttributeError for names
+        # without a matching flag.
         """Return True if OpInfo supports the specified sparse layout."""
         layout_name = str(layout).split(".")[-1]
         # map torch.sparse_coo to OpInfo.supports_sparse:
@@ -1518,6 +1722,9 @@ def test_foo(self, device, dtype, op):
     def sample_inputs_sparse(
         self, layout, device, dtype, requires_grad=False, **kwargs
     ):
+        # [FUNCTION DOC] Returns a generator of samples with the given sparse layout.
+        # Dispatches to the sample_inputs_sparse_<layout> method and raises unittest.SkipTest
+        # when that generator yields no samples at all.
         """Returns an iterable of SampleInputs that contain inputs with a
         specified sparse layout.
         """
@@ -1525,6 +1732,8 @@ def test_foo(self, device, dtype, op):
         sample_inputs_mth = getattr(self, "sample_inputs_" + layout_name)
 
         def non_empty_sampler(op, generator):
+            # [FUNCTION DOC] HELPER: Passes samples through and
+            # raises SkipTest if none were produced.
             found_sample = False
             for sample in generator:
                 found_sample = True
@@ -1538,6 +1747,11 @@ def test_foo(self, device, dtype, op):
         )
 
     def _sample_inputs_unspecified(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Placeholder sample function for
+        # sparse layouts without one; always raises.
+        # Raises NotImplementedError. Installed by
+        # __post_init__ when no sparse sample function was
+        # provided for a layout.
         """Raises an NotImplemented exception in a OpInfo instance creation
         that specifies supports_sparse(|_csr|_csc|_bsr|_bsc)=True
         without specifying the corresponding sample function as
@@ -1553,6 +1767,7 @@ def test_foo(self, device, dtype, op):
         raise NotImplementedError("no sample function specified")
 
     def sample_inputs_sparse_coo(self, device, dtype, requires_grad=False, **kwargs):
+        # [FUNCTION DOC] Returns sparse COO samples by calling sample_inputs_sparse_coo_func.
         """Returns an iterable of SampleInputs that contain inputs with sparse
         coo layout.
         """
@@ -1561,6 +1776,7 @@ def test_foo(self, device, dtype, op):
         )
 
     def sample_inputs_sparse_csr(self, device, dtype, requires_grad=False, **kwargs):
+        # [FUNCTION DOC] Returns sparse CSR samples by calling sample_inputs_sparse_csr_func.
         """Returns an iterable of SampleInputs that contain inputs with sparse
         csr layout.
         """
@@ -1569,6 +1785,7 @@ def test_foo(self, device, dtype, op):
         )
 
     def sample_inputs_sparse_csc(self, device, dtype, requires_grad=False, **kwargs):
+        # [FUNCTION DOC] Returns sparse CSC samples by calling sample_inputs_sparse_csc_func.
         """Returns an iterable of SampleInputs that contain inputs with sparse
         csc layout.
         """
@@ -1577,6 +1794,7 @@ def test_foo(self, device, dtype, op):
         )
 
     def sample_inputs_sparse_bsr(self, device, dtype, requires_grad=False, **kwargs):
+        # [FUNCTION DOC] Returns sparse BSR samples by calling sample_inputs_sparse_bsr_func.
         """Returns an iterable of SampleInputs that contain inputs with sparse
         bsr layout.
         """
@@ -1585,6 +1803,7 @@ def test_foo(self, device, dtype, op):
         )
 
     def sample_inputs_sparse_bsc(self, device, dtype, requires_grad=False, **kwargs):
+        # [FUNCTION DOC] Returns sparse BSC samples by calling sample_inputs_sparse_bsc_func.
         """Returns an iterable of SampleInputs that contain inputs with sparse
         bsc layout.
         """
@@ -1593,6 +1812,10 @@ def test_foo(self, device, dtype, op):
         )
 
     def get_decorators(self, test_class, test_name, device, dtype, param_kwargs):
+        # [FUNCTION DOC] Returns the flat list of decorators that apply to the given test.
+        # DecorateInfo entries are included (all their
+        # decorators) only when active for the test
+        # class, test name, device, dtype and parameter kwargs; plain decorators always apply.
         """Returns the decorators targeting the given test."""
         result = []
         for decorator in self.decorators:
@@ -1606,6 +1829,11 @@ def test_foo(self, device, dtype, op):
         return result
 
     def supported_dtypes(self, device_type):
+        # [FUNCTION DOC] Returns the forward dtype set for the device type.
+        # Resolves privateuse1 to the registered backend name, normalises the device string,
+        # maps cuda to rocm under ROCm builds, and falls
+        # back to the base dtypes when the device
+        # has no explicit entry.
         if device_type == "privateuse1":
             device_type = torch._C._get_privateuse1_backend_name()
         device_type = torch.device(device_type).type
@@ -1615,6 +1843,11 @@ def test_foo(self, device, dtype, op):
         return result
 
     def supported_backward_dtypes(self, device_type):
+        # [FUNCTION DOC] Returns the dtypes for which backward
+        # is expected to work on the device type.
+        # Empty set when autograd is unsupported. Picks the device specific backward dtypes
+        # (cuda/rocm, hpu, xpu, mps, otherwise the base ones) and intersects them with the
+        # floating and complex dtypes (including bfloat16, float16, complex32).
         if not self.supports_autograd:
             return set()
 
@@ -1643,10 +1876,14 @@ def test_foo(self, device, dtype, op):
         return set(allowed_backward_dtypes).intersection(backward_dtypes)
 
     def supports_dtype(self, dtype, device_type) -> bool:
+        # [FUNCTION DOC] Returns whether dtype is in the
+        # forward dtypes of the given device type.
         return dtype in self.supported_dtypes(device_type)
 
     @property
     def full_name(self):
+        # [FUNCTION DOC] Returns the unique name: the op name
+        # plus a dot and variant_test_name if set.
         """Returns a full name that helps to uniquely identify this OpInfo."""
         variant = "." + self.variant_test_name if self.variant_test_name else ""
         # example: "normal.in_place" where "normal" is the name and "in_place" is the variant
@@ -1654,6 +1891,8 @@ def test_foo(self, device, dtype, op):
 
     @property
     def formatted_name(self):
+        # [FUNCTION DOC] Returns full_name with dots replaced
+        # by underscores, usable in test names.
         """Returns a formatted full name for this OpInfo that can be used in test names."""
         return self.full_name.replace(".", "_")
 
@@ -1664,6 +1903,12 @@ def test_foo(self, device, dtype, op):
 # test cases across multiple ops.
 @dataclass
 class SampleRule(ABC):
+    # [CLASS DOC] Abstract dataclass describing a
+    # skip/xfail rule for particular ops and samples.
+    # Fields: op_match_fn (required, takes device type and OpInfo), sample_match_fn (takes
+    # device and SampleInput, defaults to matching everything) and an optional name. Subclasses
+    # supply the rule type string and the context to run a matching sample in. The abstract
+    # methods type and get_context are written as single-line stubs.
     # function to indicate whether the rule applies to this op; return True if so
     # NB: str arg of callable is device_type
     op_match_fn: Callable[[str, OpInfo], bool] = None
@@ -1673,6 +1918,8 @@ class SampleRule(ABC):
     name: str = ""
 
     def __post_init__(self):
+        # [FUNCTION DOC] Validates the rule: raises ValueError if op_match_fn is missing and
+        # defaults sample_match_fn to a function that matches every sample.
         if self.op_match_fn is None:
             raise ValueError("must have op_match_fn set to be useful")
         if self.sample_match_fn is None:
@@ -1691,6 +1938,9 @@ class SampleRule(ABC):
 # useful for specifying xfails
 @dataclass
 class XFailRule(SampleRule):
+    # [CLASS DOC] Rule marking matching samples as expected failures.
+    # Fields: error_type (expected exception class, default Exception) and error_msg (regex the
+    # message must match, default matches anything).
     # expected error type
     error_type: TypeVar = Exception
     # expected error message
@@ -1698,9 +1948,15 @@ class XFailRule(SampleRule):
 
     @property
     def type(self) -> str:
+        # [FUNCTION DOC] Returns the rule type string, xfail.
         return "xfail"
 
     def get_context(self, test_case):
+        # [FUNCTION DOC] Returns an assertRaisesRegex context
+        # of the test case for the expected error.
+        # Accepts error_type or the compiler wrapper
+        # exception BackendCompilerFailed (raised when
+        # failures happen inside torch.compile) with the message regex.
         return test_case.assertRaisesRegex(
             # failing within torch.compile wraps within a BackendCompilerFailed
             (self.error_type, torch._dynamo.exc.BackendCompilerFailed),
@@ -1711,13 +1967,18 @@ class XFailRule(SampleRule):
 # useful for specifying skips
 @dataclass
 class SkipRule(SampleRule):
+    # [CLASS DOC] Rule marking matching samples as skipped; adds no fields beyond SampleRule.
     @property
     def type(self):
+        # [FUNCTION DOC] Returns the rule type string, skip.
         return "skip"
 
     def get_context(self, test_case):
+        # [FUNCTION DOC] Returns a context manager that skips the test case when entered.
         @contextlib.contextmanager
         def skipcontext(test_case=test_case):
+            # [FUNCTION DOC] HELPER: Context manager that calls
+            # skipTest (raising SkipTest) on entry.
             test_case.skipTest("Skipped!")
             yield
 
@@ -1728,10 +1989,20 @@ class SkipRule(SampleRule):
 # present, the @ops decorator will apply these for each op and place them onto the
 # parametrized test functions for use by e.g. OpInfo.sample_inputs().
 class sample_skips_and_xfails:
+    # [CLASS DOC] Decorator that attaches sample level skip/xfail rules to a test function.
+    # State: rules, a list of SampleRule. Applying it to a test sets or extends the function
+    # attribute that OpInfo.sample_inputs and friends consult later.
     def __init__(self, rules):
+        # [FUNCTION DOC] Stores the list of rules to attach.
         self.rules = rules
 
     def __call__(self, fn):
+        # [FUNCTION DOC] Attaches the rules to fn and returns fn.
+        # Raises TypeError if the rules are not a list. If
+        # fn already carries rules, missing ones
+        # are appended to that list; otherwise the rules
+        # list itself becomes the attribute (shared
+        # with this decorator object, not copied).
         if not isinstance(self.rules, list):
             raise TypeError(
                 "The rules for sample_skips_and_xfails must be defined as a list"
@@ -1748,6 +2019,9 @@ class sample_skips_and_xfails:
 
 
 def _generate_reduction_inputs(device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] HELPER: Yields input tensors for
+    # reduction tests: scalar, 1D, 2D and 4D shapes.
+    # Args: device, dtype, requires_grad (kwargs ignored).
     """Generates input tensors for testing reduction operators"""
     yield make_tensor([], dtype=dtype, device=device, requires_grad=requires_grad)
     yield make_tensor([2], dtype=dtype, device=device, requires_grad=requires_grad)
@@ -1758,6 +2032,11 @@ def _generate_reduction_inputs(device, dtype, requires_grad, **kwargs):
 
 
 def _generate_reduction_kwargs(ndim, supports_multiple_dims=True):
+    # [FUNCTION DOC] HELPER: Yields dictionaries of
+    # dim/keepdim kwargs suitable for ndim dimensions.
+    # Includes the empty default, first and last dim, a middle dim for ndim above 2 and, when
+    # multiple dims are supported, all dims, first plus last, and every other dim for ndim
+    # above 3.
     """Generates a subset of all valid dim and keepdim kwargs given ndim that
     is appropriate for testing reduction operators.
     """
@@ -1787,6 +2066,11 @@ def _generate_reduction_kwargs(ndim, supports_multiple_dims=True):
 
 
 def sample_inputs_reduction(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for reduction operators.
+    # Pairs each generated input tensor with each applicable dim/keepdim kwargs set and with
+    # extra args/kwargs from the optional generate_args_kwargs callable in kwargs; the option
+    # supports_multiple_dims is also read from kwargs (default True). Yields detached copies.
+    # Mutates the kwargs dictionaries it receives from generate_args_kwargs.
     """Sample inputs for reduction operators."""
 
     # TODO(@heitorschueroff) Once all reduction operators are using
@@ -1826,6 +2110,11 @@ def sample_inputs_reduction(op_info, device, dtype, requires_grad, **kwargs):
 # be computed from partial results because these are sorting and counting based
 # algorithms that need information that would be lost in the reduced value.
 class ReductionOpInfo(OpInfo):
+    # [CLASS DOC] OpInfo for reduction operators with a consistent dim/keepdim API.
+    # Extra attributes: identity, nan_policy (None, propagate or omit), supports_multiple_dims,
+    # promotes_int_to_int64, complex_to_real, result_dtype and generate_args_kwargs. The
+    # promotes_int_to_float flag is passed to the base class. Defaults inplace_variant to None
+    # and sample_inputs_func to the reduction sample generator.
     """Reduction operator information.
 
     An operator is a reduction operator if it reduces one or more dimensions of
@@ -1884,6 +2173,10 @@ class ReductionOpInfo(OpInfo):
         # Options from the OpInfo base class
         **kwargs,
     ):
+        # [FUNCTION DOC] Builds a ReductionOpInfo; remaining keyword arguments go to OpInfo.
+        # Raises AssertionError for an invalid nan_policy or for mutually exclusive options:
+        # result_dtype with any of promotes_int_to_float, promotes_int_to_int64, complex_to_real,
+        # or the two promotion flags together. Records the constructor arguments for copying.
         self._original_reduction_args = locals().copy()
         if nan_policy not in (None, "propagate", "omit"):
             raise AssertionError(
@@ -1912,6 +2205,8 @@ class ReductionOpInfo(OpInfo):
         # inputs from sample_inputs_reduction with the args and kwargs from
         # generate_args_kwargs. This is only used if sample_inputs_func is None.
         def sample_inputs_func(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Default sample function forwarding
+            # the op's options to sample_inputs_reduction.
             kwargs["supports_multiple_dims"] = supports_multiple_dims
             kwargs["generate_args_kwargs"] = generate_args_kwargs
             yield from sample_inputs_reduction(*args, **kwargs)
@@ -1934,6 +2229,11 @@ class ReductionOpInfo(OpInfo):
 def _reference_inputs_elementwise_binary(
     op, device, dtype, requires_grad, exclude_zero, **kwargs
 ):
+    # [FUNCTION DOC] HELPER: Generator of the full set of binary elementwise reference samples.
+    # Yields op's own samples, then generic tensors, small values (non-bool), large values
+    # (not bool/uint8/int8), broadcasting, scalar and scalar type-promotion samples, plus
+    # extremal values for floating/complex dtypes. exclude_zero is applied to the generators
+    # that take it.
     yield from op.sample_inputs_func(op, device, dtype, requires_grad, **kwargs)
     yield from generate_elementwise_binary_tensors(
         op,
@@ -1974,6 +2274,11 @@ def _reference_inputs_elementwise_binary(
 # Note that these references inputs use scalars for the SampleInput.input value,
 #   and many tests require SampleInput.input be a tensor or a list of tensors
 def reference_inputs_elementwise_binary(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of reference samples for elementwise binary ops.
+    # Yields the base reference samples, then a noncontiguous variant of each, then dedicated
+    # noncontiguous and arbitrarily strided samples.
+    # KNOWN ISSUE: exclude_zero is only assigned when the op has rhs_make_tensor_kwargs, so
+    # an op without it fails with an unbound local error.
     if hasattr(op, "rhs_make_tensor_kwargs"):
         exclude_zero = op.rhs_make_tensor_kwargs.get("exclude_zero", False)
 
@@ -2014,7 +2319,13 @@ def reference_inputs_elementwise_binary(op, device, dtype, requires_grad, **kwar
 # A functional that extends an elementwise binary operator's bespoke error inputs
 #   with generic error inputs for the class of elementwise binary operations
 def make_error_inputs_elementwise_binary(error_inputs_func):
+    # [FUNCTION DOC] Wraps an error-inputs function with
+    # generic binary elementwise error cases.
+    # Returns a generator function that first yields the wrapped function's errors (if given),
+    # then ErrorInputs for scalar arguments the op does not accept (tensor with scalar, scalar
+    # with tensor, two scalars unless skip_two_python_scalars is passed).
     def error_inputs_func_wrapper(op, device, **kwargs):
+        # [FUNCTION DOC] HELPER: The wrapper generator described above.
         if error_inputs_func is not None:
             yield from error_inputs_func(op, device, **kwargs)
 
@@ -2052,6 +2363,9 @@ def make_error_inputs_elementwise_binary(error_inputs_func):
 def generate_elementwise_binary_tensors(
     op, *, device, dtype, requires_grad=False, exclude_zero=False
 ):
+    # [FUNCTION DOC] Generator of SampleInputs with contiguous lhs/rhs tensor pairs.
+    # Covers empty, zero-dim, small, medium and large shapes using the op's lhs/rhs tensor
+    # creation kwargs and sample_kwargs for extra op kwargs.
     shapes = (
         # tensors with no elements
         (0,),
@@ -2083,6 +2397,9 @@ def generate_elementwise_binary_tensors(
 
 def generate_elementwise_binary_arbitrarily_strided_tensors(
     op, *, device, dtype, requires_grad=False, exclude_zero=False
+    # [FUNCTION DOC] Generator of SampleInputs whose lhs is an arbitrarily strided view.
+    # Builds the lhs as a strided view with various shapes, strides and offsets over a flat
+    # buffer of 500 elements, paired with a contiguous rhs.
 ):
     # shape, strides, offset
     strided_cases = (
@@ -2117,6 +2434,10 @@ def generate_elementwise_binary_arbitrarily_strided_tensors(
 def generate_elementwise_binary_small_value_tensors(
     op, *, device, dtype, requires_grad=False, exclude_zero=None
 ):
+    # [FUNCTION DOC] Generator yielding one SampleInput with hand-picked interesting values.
+    # Builds a cross product of special values chosen by dtype (floats near pi and zero,
+    # complex built from them, signed and unsigned integers). Zeros are replaced by one on a
+    # side that must exclude zero. Raises ValueError for unsupported dtypes such as bool.
     if exclude_zero is None:
         if hasattr(op, "rhs_make_tensor_kwargs"):
             exclude_zero = op.rhs_make_tensor_kwargs.get("exclude_zero", False)
@@ -2184,6 +2505,9 @@ def generate_elementwise_binary_small_value_tensors(
 def generate_elementwise_binary_large_value_tensors(
     op, *, device, dtype, requires_grad=False
 ):
+    # [FUNCTION DOC] Generator yielding one SampleInput
+    # with large magnitude values for the dtype.
+    # Raises ValueError for dtypes without a value table (for example bool, uint8, int8).
     _large_int_vals = (-1113, 1113, -10701, 10701)
     _large_float16_vals = (-501, 501, -1001.2, 1001.2, -13437.7, 13437.7)
     _large_float_vals = _large_float16_vals + (-4988429.2, 4988429.2, -1e20, 1e20)
@@ -2222,6 +2546,10 @@ def generate_elementwise_binary_large_value_tensors(
 def generate_elementwise_binary_extremal_value_tensors(
     op, *, device, dtype, requires_grad=False
 ):
+    # [FUNCTION DOC] Generator of SampleInputs with inf, -inf and nan values.
+    # First a cross product of the extremal values, then two random tensors with every third
+    # element set to nan to check nan propagation. Raises ValueError for non floating or
+    # complex dtypes.
     _float_extremals = (float("inf"), float("-inf"), float("nan"))
 
     l_vals = []
@@ -2268,6 +2596,9 @@ def generate_elementwise_binary_extremal_value_tensors(
 def generate_elementwise_binary_broadcasting_tensors(
     op, *, device, dtype, requires_grad=False, exclude_zero=False
 ):
+    # [FUNCTION DOC] Generator of pairs of tensors that need broadcasting.
+    # Uses a fixed list of shape pairs, both contiguous and noncontiguous; samples are marked
+    # as broadcasting their input.
     shapes = (
         ((1,), ()),
         ((2,), ()),
@@ -2310,6 +2641,9 @@ def generate_elementwise_binary_broadcasting_tensors(
 def generate_elementwise_binary_with_scalar_samples(
     op, *, device, dtype, requires_grad=False
 ):
+    # [FUNCTION DOC] Generator of tensor/scalar and scalar/scalar samples.
+    # Which combinations are produced depends on supports_rhs_python_scalar,
+    # supports_one_python_scalar and supports_two_python_scalars of the op.
     make_arg = partial(
         make_tensor, device=device, dtype=dtype, requires_grad=requires_grad
     )
@@ -2349,6 +2683,10 @@ def generate_elementwise_binary_with_scalar_samples(
 def generate_elementwise_binary_with_scalar_and_type_promotion_samples(
     op, *, device, dtype, requires_grad=False
 ):
+    # [FUNCTION DOC] Generator of samples mixing tensors with
+    # nan/inf python scalars and 0-dim tensors.
+    # Only active for comparison and logical ops (a fixed list of names); other ops yield
+    # nothing.
     # add these samples only for logical and comparison ops, arithmetic ops are not happy about extremal scalars
     if op.name in (
         "eq",
@@ -2389,6 +2727,10 @@ def generate_elementwise_binary_with_scalar_and_type_promotion_samples(
 def generate_elementwise_binary_noncontiguous_tensors(
     op, *, device, dtype, requires_grad=False, exclude_zero=False
 ):
+    # [FUNCTION DOC] Generator of SampleInputs with noncontiguous lhs/rhs pairs.
+    # Covers generic noncontiguity, transposition, strided slices of a wider buffer,
+    # noncontiguous indexing and expanded tensors, often yielding both the noncontiguous pair
+    # and a contiguous counterpart.
     make_arg = partial(
         make_tensor,
         device=device,
@@ -2478,6 +2820,13 @@ def generate_elementwise_binary_noncontiguous_tensors(
 
 # Sample inputs for elementwise binary operators, like add
 def sample_inputs_elementwise_binary(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Default sample function for
+    # elementwise binary ops (the sample_inputs_func).
+    # Yields SampleInputs for fixed lhs/rhs shape pairs with broadcasting and an empty case;
+    # broadcasts_input is set when the lhs shape changes under broadcasting. Honors
+    # small_inputs_only from kwargs to shrink shapes.
+    # KNOWN ISSUE: exclude_zero is only assigned when the op has rhs_make_tensor_kwargs, so
+    # an op without it fails with an unbound local error.
     _M = S if kwargs.get("small_inputs_only", False) else M
     _S = XS if kwargs.get("small_inputs_only", False) else S
 
@@ -2520,6 +2869,12 @@ def sample_inputs_elementwise_binary(op, device, dtype, requires_grad, **kwargs)
 # Metadata class for binary "universal functions (ufuncs)" that accept two
 # tensor and have common properties
 class BinaryUfuncInfo(OpInfo):
+    # [CLASS DOC] OpInfo for binary ufuncs (elementwise functions of two tensors).
+    # Extra attributes: sample_kwargs (callable returning torch and reference kwargs),
+    # lhs_make_tensor_kwargs, rhs_make_tensor_kwargs, always_returns_bool and the scalar
+    # support flags supports_rhs_python_scalar, supports_one_python_scalar,
+    # supports_two_python_scalars. Invariant: two-scalar support implies one-scalar support,
+    # which requires rhs scalar support.
     """Operator information for 'universal binary functions (binary ufuncs).'
     These are functions of two tensors with common properties like:
       - they are elementwise functions
@@ -2548,6 +2903,14 @@ class BinaryUfuncInfo(OpInfo):
         supports_two_python_scalars=False,  # Whether the operator allows scalar x scalar inputs
         **kwargs,
     ):
+        # [FUNCTION DOC] Builds the binary ufunc OpInfo with
+        # default elementwise sample generators.
+        # Adds a skip for the redundant numpy reference
+        # test in the common test class, wraps the
+        # error-inputs function with the generic binary error cases, and stores the extra
+        # attributes. Raises AssertionError if scalar-lhs
+        # support is requested without rhs scalar
+        # support.
         self._original_binary_ufunc_args = locals().copy()
 
         # Elementwise binary operations perform the equivalent of test_numpy_refs
@@ -2599,6 +2962,10 @@ class BinaryUfuncInfo(OpInfo):
 def sample_inputs_elementwise_unary(
     op_info, device, dtype, requires_grad, op_kwargs=None, **kwargs
 ):
+    # [FUNCTION DOC] Default sample function for elementwise unary ops.
+    # Yields samples within the op's domain (shrunk by an epsilon for float/complex): a single
+    # 2D tensor if any sparse compressed layout is supported, otherwise 1D, empty and 0-dim
+    # tensors. op_kwargs are passed to every sample; small_inputs_only shrinks sizes.
     if not op_kwargs:
         op_kwargs = {}
 
@@ -2645,12 +3012,18 @@ def sample_inputs_elementwise_unary(
 # Replace values satisfying condition with a safe value. This is used to block
 # out values the could cause singularity like tan(pi/2)
 def _replace_values_in_tensor(tensor, condition, safe_value):
+    # [FUNCTION DOC] HELPER: Fills tensor entries where
+    # condition holds with safe_value, in place.
     mask = condition(tensor)
     tensor.masked_fill_(mask, safe_value)
 
 
 # Helper to create a unary elementwise tensor with valid inputs
 def _make_unary_elementwise_tensor(shape, *, op, dtype, **kwargs):
+    # [FUNCTION DOC] HELPER: Creates a tensor of the given
+    # shape with values inside the op's domain.
+    # Applies the op's reference numerics filter (except for bool) to replace problematic
+    # values. Extra kwargs go to make_tensor.
     low, high = op.domain
     is_floating = dtype.is_floating_point or dtype.is_complex
     low = low if low is None or not is_floating else low + op._domain_eps
@@ -2668,6 +3041,10 @@ def _make_unary_elementwise_tensor(shape, *, op, dtype, **kwargs):
 # Restricts the values in the tensor to the domain of the
 # given elementwise unary operator
 def _filter_unary_elementwise_tensor(a, *, op):
+    # [FUNCTION DOC] HELPER: Restricts a tensor in place to the op's domain and returns it.
+    # Bool tensors are returned unchanged. Applies the numerics filter and clamps (real and
+    # imaginary parts separately for complex), rounding bounds inward for integer dtypes and
+    # clamping the low bound at zero for uint8.
     # short-circuits for boolean tensors
     if a.dtype is torch.bool:
         return a
@@ -2699,6 +3076,11 @@ def _filter_unary_elementwise_tensor(a, *, op):
 
 
 def generate_elementwise_unary_tensors(op, *, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of unary samples: special bool cases, large and empty shapes.
+    # For bool dtype first yields fixed small tensors, then (for every dtype) tensors of
+    # several shapes, including empty ones, made inside the op's domain.
+    # KNOWN ISSUE: there is no early return after the bool cases, so bool also goes through
+    # the generic shapes loop.
     # Special-cases bool
     if dtype is torch.bool:
         tensors = (
@@ -2738,6 +3120,8 @@ def generate_elementwise_unary_tensors(op, *, device, dtype, requires_grad, **kw
 def generate_elementwise_unary_small_value_tensors(
     op, *, device, dtype, requires_grad=False
 ):
+    # [FUNCTION DOC] Generator reusing the binary small-
+    # value tensors, filtered to the op's domain.
     for sample in generate_elementwise_binary_small_value_tensors(
         op, device=device, dtype=dtype, requires_grad=requires_grad
     ):
@@ -2748,6 +3132,9 @@ def generate_elementwise_unary_small_value_tensors(
 def generate_elementwise_unary_large_value_tensors(
     op, *, device, dtype, requires_grad=False
 ):
+    # [FUNCTION DOC] Generator reusing the binary large-
+    # value tensors, filtered to the op's domain.
+    # The filter modifies the tensor in place, so the yielded input is the filtered tensor.
     for sample in generate_elementwise_binary_large_value_tensors(
         op, device=device, dtype=dtype, requires_grad=requires_grad
     ):
@@ -2758,6 +3145,8 @@ def generate_elementwise_unary_large_value_tensors(
 def generate_elementwise_unary_extremal_value_tensors(
     op, *, device, dtype, requires_grad=False
 ):
+    # [FUNCTION DOC] Generator reusing the binary extremal (inf/nan) tensors for unary ops.
+    # Values are not filtered by the domain.
     for sample in generate_elementwise_binary_extremal_value_tensors(
         op, device=device, dtype=dtype, requires_grad=requires_grad
     ):
@@ -2769,6 +3158,8 @@ def generate_elementwise_unary_extremal_value_tensors(
 def generate_elementwise_unary_noncontiguous_tensors(
     op, *, device, dtype, requires_grad=False
 ):
+    # [FUNCTION DOC] Generator of unary samples with noncontiguous layouts.
+    # Yields a generic noncontiguous tensor, a transposed one and expanded tensors.
     make_arg = partial(
         _make_unary_elementwise_tensor,
         op=op,
@@ -2799,6 +3190,8 @@ def generate_elementwise_unary_noncontiguous_tensors(
 def generate_elementwise_unary_arbitrarily_strided_tensors(
     op, *, device, dtype, requires_grad=False
 ):
+    # [FUNCTION DOC] Generator of unary samples that are arbitrarily strided views.
+    # Same stride and offset table as the binary version over a 500 element buffer.
     # shape, strides, offset
     strided_cases = (
         ((5, 6, 2), (1, 1, 7), 2),
@@ -2822,6 +3215,10 @@ def generate_elementwise_unary_arbitrarily_strided_tensors(
 # Reuses the elementwise binary generators for consistency
 # TODO: in the future generalize the reference generators to handle n-ary elementwise operations
 def _reference_inputs_elementwise_unary(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] HELPER: Generator of the full unary reference sample set.
+    # Yields the op's samples, generic tensors, small values (non-bool), large values (not
+    # bool/uint8/int8, only for integer dtypes or ops handling large floats), and extremal
+    # values for floats or complex when the op handles them.
     yield from op.sample_inputs_func(op, device, dtype, requires_grad, **kwargs)
 
     yield from generate_elementwise_unary_tensors(
@@ -2849,6 +3246,9 @@ def _reference_inputs_elementwise_unary(op, device, dtype, requires_grad, **kwar
 
 
 def reference_inputs_elementwise_unary(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of reference samples for elementwise unary ops.
+    # Yields the base reference samples, a noncontiguous variant of each, and dedicated
+    # noncontiguous and arbitrarily strided samples.
     gen = partial(
         _reference_inputs_elementwise_unary, op, device, dtype, requires_grad, **kwargs
     )
@@ -2872,6 +3272,12 @@ def reference_inputs_elementwise_unary(op, device, dtype, requires_grad, **kwarg
 # Metadata class for unary "universal functions (ufuncs)" that accept a single
 # tensor and have common properties like:
 class UnaryUfuncInfo(OpInfo):
+    # [CLASS DOC] OpInfo for unary ufuncs (elementwise functions of one tensor).
+    # Extra attributes: domain (low, high bounds), handles_complex_extremal_values,
+    # handles_large_floats, supports_complex_to_float, reference_numerics_filter (condition,
+    # safe value pair), sample_kwargs (callable returning torch and reference kwargs) and
+    # _domain_eps (epsilon used to stay strictly inside the domain). Default dtypes are the
+    # floating types.
     """Operator information for 'universal unary functions (unary ufuncs).'
     These are functions of a single tensor with common properties like:
       - they are elementwise functions
@@ -2899,6 +3305,12 @@ class UnaryUfuncInfo(OpInfo):
         reference_numerics_filter=None,  # Filters values in the range of the domain specified above but that should not be tested
         **kwargs,
     ):
+        # [FUNCTION DOC] Builds the unary ufunc OpInfo with
+        # elementwise sample generators by default.
+        # Passes name, dtypes and sample functions to OpInfo,
+        # forwards remaining keyword arguments,
+        # then stores the domain, capability flags, numerics filter and sample_kwargs, and sets
+        # the domain epsilon to 1e-5. Records constructor arguments for copying.
         self._original_unary_ufunc_args = locals().copy()
 
         super().__init__(
@@ -2928,6 +3340,11 @@ class UnaryUfuncInfo(OpInfo):
 
 
 def sample_inputs_spectral_ops(self, device, dtype, requires_grad=False, **kwargs):
+    # [FUNCTION DOC] Sample function for torch.fft transforms; self is the SpectralFuncInfo.
+    # Yields SampleInputs whose arguments depend on ndimensional (n-d, 2-d, or 1-d) and on
+    # self.name. For float16 and complex half it picks power-of-two shapes and sizes (cuFFT
+    # requirement), with a narrowed value range for the hermitian n-d variants to avoid
+    # saturation.
     is_fp16_or_chalf = dtype == torch.complex32 or dtype == torch.half
     if not is_fp16_or_chalf:
         nd_tensor = partial(
@@ -3028,6 +3445,10 @@ SpectralFuncType = Enum("SpectralFuncType", ("OneD", "TwoD", "ND"))
 
 # Metadata class for Fast Fourier Transforms in torch.fft.
 class SpectralFuncInfo(OpInfo):
+    # [CLASS DOC] OpInfo for torch.fft transforms.
+    # Extra attributes: ref (NumPy reference), ndimensional (SpectralFuncType). Always adds the
+    # skip-if-no-FFT decorator for CPU and a tolerance override for complex half reference
+    # tests. Default dtypes are floating and complex types.
     """Operator information for torch.fft transforms."""
 
     def __init__(
@@ -3041,6 +3462,11 @@ class SpectralFuncInfo(OpInfo):
         decorators=None,
         **kwargs,
     ):
+        # [FUNCTION DOC] Builds the OpInfo, appending the
+        # FFT decorators to any given decorators.
+        # Records the constructor arguments, builds the
+        # combined decorator list and stores ref and
+        # ndimensional after the base class initialisation.
         self._original_spectral_func_args = dict(locals()).copy()
         self._original_spectral_func_args.update(kwargs)
 
@@ -3066,6 +3492,8 @@ class SpectralFuncInfo(OpInfo):
 
 
 class ShapeFuncInfo(OpInfo):
+    # [CLASS DOC] OpInfo for shape manipulating ops such
+    # as tile and roll; adds the ref attribute.
     """Early version of a specialized OpInfo for Shape manipulating operations like tile and roll"""
 
     def __init__(
@@ -3081,6 +3509,8 @@ class ShapeFuncInfo(OpInfo):
         sample_inputs_func=None,
         **kwargs,
     ):
+        # [FUNCTION DOC] Builds the OpInfo with explicit per-
+        # device dtypes and stores the reference function.
         super().__init__(
             name,
             dtypes=dtypes,
@@ -3110,6 +3540,11 @@ def sample_inputs_foreach(
     # mutually exclusive from same_size and zero_size, which are all or nothing
     intersperse_empty_tensors: bool = False,
 ):
+    # [FUNCTION DOC] Builds a list of N tensors for foreach op tests.
+    # With zero_size every tensor is empty; with same_size every tensor is N by N; otherwise
+    # sizes shrink from N by N, optionally replacing some entries (every third and the last
+    # two) with empty tensors when intersperse_empty_tensors is set. Tensors are created with
+    # the given dtype, device, requires_grad and low/high range.
     if zero_size:
         return [torch.empty(0, dtype=dtype, device=device) for _ in range(N)]
     if same_size:
@@ -3144,6 +3579,9 @@ def sample_inputs_foreach(
 
 
 def get_foreach_method_names(name):
+    # [FUNCTION DOC] Looks up the torch functions for a foreach op name.
+    # Returns a tuple: foreach function, foreach inplace function, plain reference function and
+    # plain inplace Tensor method; each is None when missing.
     # get torch inplace reference function
     op_name = "_foreach_" + name
     inplace_op_name = op_name + "_"
@@ -3158,6 +3596,11 @@ def get_foreach_method_names(name):
 
 @dataclass
 class ForeachFuncInfo(OpInfo):
+    # [CLASS DOC] OpInfo for torch._foreach_* functions (dataclass).
+    # Extra fields: supports_alpha_param, supports_scalar_self_arg and
+    # backward_requires_result. Sets dtypes to all non-quantized dtypes (without complex128
+    # inside fbcode) and derives op, method and inplace variants and reference functions from
+    # the base name.
     """Early version of a specialized OpInfo for foreach functions
 
     The main differences from the parent class are (a) `dtypes`, `dtypesIfCUDA`, and `dtypesIfROCM`
@@ -3176,6 +3619,12 @@ class ForeachFuncInfo(OpInfo):
     backward_requires_result: bool = False
 
     def __post_init__(self):
+        # [FUNCTION DOC] Resolves the foreach functions and
+        # reference functions, then runs the base setup.
+        # Renames the op with the foreach prefix, replaces
+        # refs for norm, minimum and maximum, and
+        # for ops without out support uses the inplace function as the main one. Raises
+        # AssertionError if an op without out support unexpectedly has a non-inplace function.
         (
             foreach_method,
             foreach_method_inplace,
@@ -3227,6 +3676,9 @@ class ForeachFuncInfo(OpInfo):
         super().__post_init__()
 
     def sample_zero_size_inputs(self, device, dtype, requires_grad=False, **kwargs):
+        # [FUNCTION DOC] Returns zero-size tensor inputs from
+        # the sample function, or an empty list.
+        # Delegates to the sample function's zero-size generator attribute when it exists.
         if not hasattr(self.sample_inputs_func, "sample_zero_size_tensor_inputs"):
             return []
         return self.sample_inputs_func.sample_zero_size_tensor_inputs(
@@ -3235,6 +3687,9 @@ class ForeachFuncInfo(OpInfo):
 
 
 def gradcheck_wrapper_hermitian_input(op, input, *args, **kwargs):
+    # [FUNCTION DOC] Gradcheck wrapper that symmetrizes the
+    # input (input plus its conjugate transpose)
+    # before calling the op, so finite differences keep the matrix Hermitian.
     """Gradcheck wrapper for functions that take Hermitian matrices as input.
 
     They require a modified function because the finite-difference algorithm
@@ -3244,12 +3699,18 @@ def gradcheck_wrapper_hermitian_input(op, input, *args, **kwargs):
 
 
 def gradcheck_wrapper_ctc_loss(op, input, *args, **kwargs):
+    # [FUNCTION DOC] Gradcheck wrapper applying log-softmax
+    # over dim 2 to the input before ctc loss.
     """Gradcheck wrapper for ctc loss to project onto log-simplex space."""
     # See https://github.com/pytorch/pytorch/issues/52241
     return op(input.log_softmax(dim=2), *args, **kwargs)
 
 
 def gradcheck_wrapper_triangular_input(op, *args, upper=False, idx=0, **kwargs):
+    # [FUNCTION DOC] Gradcheck wrapper making one argument triangular before calling the op.
+    # The argument at position idx is made upper or lower triangular; the flag upper is passed
+    # as an extra positional argument right after the remaining arguments, and other kwargs are
+    # forwarded.
     """Gradcheck wrapper for functions that take lower or upper triangular matrices as input.
 
     They require a modified function because the finite-difference algorithm
@@ -3263,6 +3724,9 @@ def gradcheck_wrapper_triangular_input(op, *args, upper=False, idx=0, **kwargs):
 def gradcheck_wrapper_triangular_input_real_positive_diagonal(
     op, *args, upper=False, idx=0, **kwargs
 ):
+    # [FUNCTION DOC] Gradcheck wrapper for triangular inputs with real positive diagonal.
+    # Replaces the diagonal of the argument at idx with ones, then defers to the triangular
+    # wrapper with the same upper and idx options.
     """Gradcheck wrapper for functions that take lower/upper triangular matrices
     with real and positive diagonals, for example, cholesky-like operations.
     """
@@ -3279,6 +3743,9 @@ def gradcheck_wrapper_triangular_input_real_positive_diagonal(
 
 
 def gradcheck_wrapper_masked_operation(op, input, *args, **kwargs):
+    # [FUNCTION DOC] Gradcheck wrapper for masked ops; zeros out masked-out output entries.
+    # When a mask kwarg is given, positions outside the output mask are replaced by zero so
+    # non-finite masked-out values do not break gradient checks. Returns the output.
     """Gradcheck wrapper for masked operations.
 
     When mask is specified, replaces masked-out elements with zeros.
@@ -3295,6 +3762,11 @@ def gradcheck_wrapper_masked_operation(op, input, *args, **kwargs):
 
 
 def gradcheck_wrapper_masked_pointwise_operation(op, input, *args, **kwargs):
+    # [FUNCTION DOC] Gradcheck wrapper for masked pointwise ops.
+    # When both input_mask and other_mask are given, entries masked in either operand are
+    # replaced by zero in the output. Returns the output.
+    # KNOWN ISSUE: building the keyword dictionary passes mask explicitly together with all
+    # kwargs, so a caller kwargs entry named mask would raise a TypeError for duplicates.
     """Gradcheck wrapper for masked pointwise operations. Assumes that the result
     will be masked iff both tensors are masked at a specific index
 
@@ -3315,6 +3787,11 @@ def gradcheck_wrapper_masked_pointwise_operation(op, input, *args, **kwargs):
 
 
 def clone_sample(sample, **kwargs):
+    # [FUNCTION DOC] Returns a copy of a SampleInput with
+    # tensors detached, cloned and requires_grad kept.
+    # Non-tensor values are shared by reference. A non-empty kwargs argument replaces the
+    # sample's kwargs entirely.
+    # KNOWN ISSUE: the result drops metadata (name, broadcasts_input, output_process_fn_grad).
     """
     Given a SampleInput, this function analyzes its input, args and kwargs,
     and produces a copy with each non-Tensor entry being copied by reference,
@@ -3322,6 +3799,8 @@ def clone_sample(sample, **kwargs):
     """
 
     def clone_tensor(t):
+        # [FUNCTION DOC] HELPER: Returns a detached clone of a
+        # tensor with the same requires_grad, else the value.
         if isinstance(t, torch.Tensor):
             return t.detach().clone().requires_grad_(t.requires_grad)
         else:

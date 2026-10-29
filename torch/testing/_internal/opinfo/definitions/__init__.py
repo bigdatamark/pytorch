@@ -1,4 +1,9 @@
 # mypy: ignore-errors
+# [PACKAGE DOC] Aggregates the per-area OpInfo definition modules into the global databases.
+# Exports op_db (all OpInfo entries from fft, linalg, signal, special and _masked) and
+# python_ref_db (Python reference OpInfos from fft, linalg and special) as plain lists
+# built at import time by concatenation. Importing this package imports those submodules,
+# which constructs every OpInfo they define.
 
 from torch.testing._internal.opinfo.core import OpInfo
 from torch.testing._internal.opinfo.definitions import (
