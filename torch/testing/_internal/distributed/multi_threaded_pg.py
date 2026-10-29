@@ -1,5 +1,11 @@
 # mypy: allow-untyped-defs
 
+# [MODULE DOC] A process group implementation that simulates collectives among ranks running as
+# threads of a single process, for tests. Contains per-collective work classes (AllToAll,
+# AllReduce, AllGather, Scatter, Gather, ReduceScatter, Broadcast), a Collective rendezvous object,
+# the ProcessLocalGroup backend, a thread-local replacement for the c10d world state
+# (ThreadLocalWorld, WorldData) and install/uninstall functions. Import-time side effect: registers
+# the "threaded" backend for cpu, cuda and xpu.
 import sys
 import threading
 import weakref
@@ -37,16 +43,23 @@ We need some synchronization around cleanup to ensure that timed out ranks don't
 
 
 def flatten_list(lst):
+    # [FUNCTION DOC] HELPER: Returns the flat list of leaves of a nested structure of lists and
+    # tuples, using the pytree utilities.
     return pytree.tree_leaves(lst)
 
 
 def ret_work(ret):
+    # [FUNCTION DOC] HELPER: Wraps a value into an already completed Work object by creating a
+    # Future, setting its result to the value and converting it to a Work.
     fut = Future()
     fut.set_result(ret)
     return _create_work_from_future(fut)
 
 
 def binop_reduce(tensors, op):
+    # [FUNCTION DOC] HELPER: Stacks the list of tensors along a new first dimension and applies the
+    # reduction callable over that dimension. Returns a tensor; for min/max style ops that return a
+    # pair it returns just the values part.
     res = op(torch.stack(tensors), dim=0)
     if isinstance(res, torch.Tensor):
         return res
@@ -55,6 +68,8 @@ def binop_reduce(tensors, op):
 
 
 def bitwise_reduce(tensors, op):
+    # [FUNCTION DOC] HELPER: Folds the list of tensors pairwise with the given bitwise callable and
+    # returns the resulting tensor.
     return reduce(op, tensors)
 
 
@@ -89,8 +104,14 @@ _reduce_ops = {
 
 
 class AllToAll:
+    # [CLASS DOC] Work implementation for all_to_all with lists of tensors. Stateless; its work
+    # method is run once by rank 0 over the data gathered from all ranks.
     @torch.no_grad()
     def work(self, data):
+        # [FUNCTION DOC] Takes a per-rank list of (output tensor list, input tensor list) pairs.
+        # For every destination rank and source rank it copies the source's input tensor at the
+        # destination's index into the destination's output tensor at the source's index. Mutates
+        # outputs in place, hidden from autograd; runs without gradient tracking.
         world_size = len(data)
         for dest_rank in range(world_size):
             output_tensor_list, _ = data[dest_rank]
@@ -103,8 +124,14 @@ class AllToAll:
 
 
 class AllToAllBase:
+    # [CLASS DOC] Work implementation for all_to_all_single on flat buffers with optional split
+    # sizes. Stateless apart from the helper that turns split sizes into offsets.
     @torch.no_grad()
     def work(self, data):
+        # [FUNCTION DOC] Takes per-rank tuples of (output buffer, input buffer, output split sizes,
+        # input split sizes). For each destination and source rank it copies the source's slice
+        # meant for the destination into the destination's slice reserved for the source, using
+        # cumulative offsets. Mutates output buffers in place, hidden from autograd.
         world_size = len(data)
         for dest_rank in range(world_size):
             output_buffer, _, output_split_sizes, _ = data[dest_rank]
@@ -134,6 +161,10 @@ class AllToAllBase:
         sizes: torch.Tensor | list[int] | None,
         world_size: int,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Computes cumulative offsets (with a leading zero) from split
+        # sizes. If sizes is missing or empty, splits the buffer size evenly across world_size
+        # ranks. A list is converted to an int64 tensor. Raises an AssertionError if sizes is not
+        # int64. Returns an int64 tensor of length world_size plus one.
         if sizes is None or len(sizes) == 0:
             sizes = torch.full((world_size,), buf_size // world_size, dtype=torch.int64)
         if not isinstance(sizes, torch.Tensor):
@@ -153,7 +184,12 @@ class AllToAllBase:
 
 
 class AllReduce:
+    # [CLASS DOC] Work implementation for all_reduce. Holds the reduce operation kind, restricted
+    # to the entries of the module-level reduce op table.
     def __init__(self, op):
+        # [FUNCTION DOC] Stores the underlying reduce op kind taken from the given reduce options.
+        # Raises NotImplementedError if the op is not in the supported table (sum, avg, product,
+        # min, max, bitwise and/or/xor).
         if op.op not in _reduce_ops:
             raise NotImplementedError(
                 f"AllReduce op {op.op} not supported on multithreaded pg for now."
@@ -162,6 +198,10 @@ class AllReduce:
 
     @torch.no_grad()
     def work(self, data):
+        # [FUNCTION DOC] Takes per-rank lists of tensors. For each tensor position it moves
+        # all ranks' tensors to rank 0's device, reduces them with the configured op, and
+        # copies the result back into every rank's tensor on its own device. Mutates in
+        # place, hidden from autograd.
         for i in range(len(data[0])):
             # use rank0 as the device for sum
             rank_0_device = data[0][i].device
@@ -181,8 +221,13 @@ class AllReduce:
 
 
 class AllGather:
+    # [CLASS DOC] Work implementation for all_gather; each rank gives exactly one tensor.
     @torch.no_grad()
     def work(self, data):
+        # [FUNCTION DOC] Takes per-rank (output lists, input list) pairs. Copies each rank's
+        # single input tensor into the slot for that rank in every rank's output list.
+        # Raises an AssertionError if a rank supplies more or fewer than one input tensor.
+        # Mutates outputs in place.
         for src_rank in range(len(data)):
             in_tensor_list = data[src_rank][1]
             # Can't handle all_gather with multiple tensors
@@ -199,11 +244,16 @@ class AllGather:
 
 
 class Scatter:
+    # [CLASS DOC] Work implementation for scatter. Stores the source (root) rank.
     def __init__(self, src):
+        # [FUNCTION DOC] Stores the root rank that holds the input tensors.
         self.src = src
 
     @torch.no_grad()
     def work(self, data):
+        # [FUNCTION DOC] Copies the root rank's i-th input tensor into rank i's single output
+        # tensor. Raises an AssertionError if the root has not exactly one input tensor list or any
+        # rank has not exactly one output tensor. Mutates outputs in place, hidden from autograd.
         src_in_tensor_list = data[self.src][1]
         # Can't handle scatter with multiple input tensor list
         if len(src_in_tensor_list) != 1:
@@ -225,11 +275,16 @@ class Scatter:
 
 
 class Gather:
+    # [CLASS DOC] Work implementation for gather. Stores the destination (root) rank.
     def __init__(self, dst):
+        # [FUNCTION DOC] Stores the root rank that receives the gathered tensors.
         self.dst = dst
 
     @torch.no_grad()
     def work(self, data):
+        # [FUNCTION DOC] Copies each rank's single input tensor into the root rank's output list at
+        # that rank's index. Raises an AssertionError if the root output or any rank input is not
+        # exactly one tensor list. Mutates outputs in place, hidden from autograd.
         # Can't handle gather with multiple tensor lists
         if len(data[self.dst][0]) != 1:
             raise AssertionError(
@@ -249,13 +304,21 @@ class Gather:
 
 
 class ReduceScatter:
+    # [CLASS DOC] Work implementation for reduce_scatter supporting only sum and average.
     def __init__(self, op):
+        # [FUNCTION DOC] Stores the reduce op. Raises NotImplementedError for any op other than sum
+        # or avg.
         if op != dist.ReduceOp.SUM and op != dist.ReduceOp.AVG:
             raise NotImplementedError(f"ReduceScatter does not support {op}")
         self.op = op
 
     @torch.no_grad()
     def work(self, data):
+        # [FUNCTION DOC] For each rank's scatter list, adds element i into rank i's output tensor
+        # (the first contribution is copied, later ones added), moving data to the output's device.
+        # For avg it then divides every output by the number of ranks. Raises an AssertionError if
+        # a scatter list or output list does not hold exactly one entry. Mutates in place, hidden
+        # from autograd.
         start_reduction = [False for _ in range(len(data))]
         for each_rank_data in data:
             # Can't handle reduce_scatter with multiple scatter list
@@ -291,11 +354,15 @@ class ReduceScatter:
 
 
 class Broadcast:
+    # [CLASS DOC] Work implementation for broadcast. Stores the source rank.
     def __init__(self, src):
+        # [FUNCTION DOC] Stores the source rank whose tensors are broadcast.
         self.src = src
 
     @torch.no_grad()
     def work(self, data):
+        # [FUNCTION DOC] Copies the flattened tensors of the source rank into the flattened tensors
+        # of every other rank, in place and hidden from autograd.
         in_tensor_list = flatten_list(data[self.src])
         for i in range(len(data)):
             if i == self.src:
@@ -307,7 +374,13 @@ class Broadcast:
 
 
 class Collective:
+    # [CLASS DOC] Rendezvous object for one collective call across all ranks of a group. Holds the
+    # world size, the work object, two condition variables (start, done), a per-rank data slot
+    # list, an arrival count, a done flag and a handle used to check the termination event. Rank 0
+    # waits for all arrivals, runs the work, then releases the other ranks.
     def __init__(self, world_size, collective, pg):
+        # [FUNCTION DOC] Initializes the rendezvous state for the given world size, work object and
+        # the owner (the process group class whose termination event is consulted).
         self._world_size = world_size
         self._collective = collective
 
@@ -321,6 +394,11 @@ class Collective:
         self._pg = pg
 
     def join(self, rank, data):
+        # [FUNCTION DOC] Called by each rank with its data. Stores the data and counts arrivals;
+        # the last arriving non-zero rank wakes rank 0. Rank 0 waits until all ranks arrived, then
+        # runs the work over all data and wakes the others; non-zero ranks wait for completion. If
+        # the termination event is set while waiting, exits the thread with SystemExit. Returns an
+        # already finished Work wrapping this rank's data.
         with self._start_cond:
             self._data[rank] = data
             self._count += 1
@@ -358,6 +436,11 @@ class Collective:
 
 
 class ProcessLocalGroup(dist.ProcessGroup):
+    # [CLASS DOC] Process group for threads-as-ranks testing. Class-level state: a lock, a mapping
+    # from group name to the active Collective, and a termination event shared by all groups. Each
+    # collective method builds the work object, joins the shared Collective for this group and then
+    # removes it. Instance state: rank, world size, a weak reference to the world and a context
+    # manager that disables autograd multithreading.
     _coll_lock = threading.Lock()
     _cur_coll_on_pgs = {}
 
@@ -365,6 +448,8 @@ class ProcessLocalGroup(dist.ProcessGroup):
 
     @classmethod
     def _start_coll(cls, collective, pg):
+        # [FUNCTION DOC] HELPER: Under the class lock, returns the active Collective for the
+        # group's name, creating it with the group size and given work object if none exists.
         with cls._coll_lock:
             # pg_name is unique, we use that to record the mapping between pg and collective
             if pg.pg_name not in cls._cur_coll_on_pgs:
@@ -375,6 +460,8 @@ class ProcessLocalGroup(dist.ProcessGroup):
 
     @classmethod
     def _end_coll(cls, collective, pg):
+        # [FUNCTION DOC] HELPER: Under the class lock, removes the group's active Collective if it
+        # is the given one. Called by every rank, so only the first call has an effect.
         # This is racily called by all ranks, so only one will work
         with cls._coll_lock:
             if (
@@ -385,6 +472,10 @@ class ProcessLocalGroup(dist.ProcessGroup):
 
     @classmethod
     def exception_handle(cls, exc):
+        # [FUNCTION DOC] Called when a rank thread raised an exception: sets the termination
+        # event and wakes all waiters of every active collective so they exit. The exception
+        # argument is unused.
+        # KNOWN ISSUE: iterates the active collective mapping without holding the class lock.
         cls._terminate.set()
         for coll in cls._cur_coll_on_pgs.values():
             with coll._start_cond:
@@ -394,6 +485,8 @@ class ProcessLocalGroup(dist.ProcessGroup):
 
     @classmethod
     def reset(cls):
+        # [FUNCTION DOC] Clears the active collective mapping and the termination event,
+        # under the lock.
         with cls._coll_lock:
             cls._cur_coll_on_pgs = {}
             cls._terminate.clear()
@@ -406,6 +499,8 @@ class ProcessLocalGroup(dist.ProcessGroup):
         input_split_sizes: list[int] | None,
         opts=AllToAllOptions(),
     ) -> torch.Tensor:
+        # [FUNCTION DOC] Joins an all_to_all_single collective with this rank's buffers and split
+        # sizes and returns a finished Work. Mutates the output buffer in place.
         coll = ProcessLocalGroup._start_coll(AllToAllBase(), self)
         res = coll.join(
             self._rank,
@@ -415,55 +510,77 @@ class ProcessLocalGroup(dist.ProcessGroup):
         return res
 
     def alltoall(self, output_tensor_list, input_tensor_list, opts=AllToAllOptions()):
+        # [FUNCTION DOC] Joins an all_to_all collective with this rank's output and input tensor
+        # lists and returns a finished Work.
         coll = ProcessLocalGroup._start_coll(AllToAll(), self)
         res = coll.join(self._rank, (output_tensor_list, input_tensor_list))
         ProcessLocalGroup._end_coll(coll, self)
         return res
 
     def allreduce(self, tensor_list, opts=AllreduceOptions()):
+        # [FUNCTION DOC] Joins an all_reduce collective using the reduce op from the options and
+        # returns a finished Work. Raises NotImplementedError for unsupported ops.
         coll = ProcessLocalGroup._start_coll(AllReduce(opts.reduceOp), self)
         res = coll.join(self._rank, tensor_list)
         ProcessLocalGroup._end_coll(coll, self)
         return res
 
     def allreduce_coalesced(self, tensor_list, opts=AllreduceOptions()):
+        # [FUNCTION DOC] Same behavior as allreduce: joins an all_reduce collective over the
+        # tensor list.
         coll = ProcessLocalGroup._start_coll(AllReduce(opts.reduceOp), self)
         res = coll.join(self._rank, tensor_list)
         ProcessLocalGroup._end_coll(coll, self)
         return res
 
     def barrier(self, opts=BarrierOptions()):
+        # [FUNCTION DOC] Implements barrier as an all_reduce over a one element tensor;
+        # returns its Work.
         return self.allreduce(tensor_list=[torch.ones(1)])
 
     def allgather(self, output_tensors, input_tensor, opts=AllgatherOptions()):
+        # [FUNCTION DOC] Joins an all_gather collective with this rank's output lists and input
+        # tensor and returns a finished Work. Each rank must pass exactly one input tensor.
         coll = ProcessLocalGroup._start_coll(AllGather(), self)
         res = coll.join(self._rank, (output_tensors, input_tensor))
         ProcessLocalGroup._end_coll(coll, self)
         return res
 
     def all_gather_single(self, output_tensor, input_tensor, opts=AllgatherOptions()):
+        # [FUNCTION DOC] Splits the output tensor into world-size chunks and calls allgather with
+        # them and the single input tensor. Returns the Work.
         tensor_list = list(torch.chunk(output_tensor, self._world_size))
         return self.allgather([tensor_list], [input_tensor], opts)
 
     def broadcast(self, tensor_list, opts=BroadcastOptions()):
+        # [FUNCTION DOC] Joins a broadcast collective rooted at the rank in the options;
+        # returns a Work.
         coll = ProcessLocalGroup._start_coll(Broadcast(opts.rootRank), self)
         res = coll.join(self._rank, tensor_list)
         ProcessLocalGroup._end_coll(coll, self)
         return res
 
     def scatter(self, output_tensors, input_tensors, opts=ScatterOptions()):
+        # [FUNCTION DOC] Joins a scatter collective rooted at the rank in the options;
+        # returns a Work.
         coll = ProcessLocalGroup._start_coll(Scatter(opts.rootRank), self)
         res = coll.join(self._rank, (output_tensors, input_tensors))
         ProcessLocalGroup._end_coll(coll, self)
         return res
 
     def gather(self, output_tensors, input_tensors, opts=ScatterOptions()):
+        # [FUNCTION DOC] Joins a gather collective rooted at the rank in the options;
+        # returns a Work.
+        # KNOWN ISSUE: the default options type is ScatterOptions rather than a gather
+        # options type.
         coll = ProcessLocalGroup._start_coll(Gather(opts.rootRank), self)
         res = coll.join(self._rank, (output_tensors, input_tensors))
         ProcessLocalGroup._end_coll(coll, self)
         return res
 
     def reduce_scatter(self, output_tensor, scatter_list, opts=ReduceScatterOptions()):
+        # [FUNCTION DOC] Joins a reduce_scatter collective with the reduce op from the options (sum
+        # or avg only; otherwise NotImplementedError) and returns a Work.
         coll = ProcessLocalGroup._start_coll(ReduceScatter(opts.reduceOp), self)
         res = coll.join(self._rank, (output_tensor, scatter_list))
         ProcessLocalGroup._end_coll(coll, self)
@@ -472,12 +589,17 @@ class ProcessLocalGroup(dist.ProcessGroup):
     def reduce_scatter_single(
         self, output_tensor, input_tensor, opts=ReduceScatterOptions()
     ):
+        # [FUNCTION DOC] Splits the input tensor into world-size chunks and calls reduce_scatter
+        # with the single output tensor. Returns the Work.
         tensor_list = list(torch.chunk(input_tensor, self._world_size))
         return self.reduce_scatter([output_tensor], [tensor_list], opts)
 
     def reduce_scatter_single_coalesced(
         self, output_tensors, input_tensors, opts=ReduceScatterOptions()
     ):
+        # [FUNCTION DOC] Runs reduce_scatter_single for each output/input pair (lengths must match,
+        # else an error is raised), waits on all but the last Work, and returns the last one.
+        # KNOWN ISSUE: fails with an index error when the lists are empty.
         works = [
             self.reduce_scatter_single(output_tensor, input_tensor, opts)
             for output_tensor, input_tensor in zip(
@@ -491,12 +613,20 @@ class ProcessLocalGroup(dist.ProcessGroup):
     def all_gather_single_coalesced(
         self, output_tensor_list, input_tensor_list, opts=AllgatherOptions()
     ):
+        # [FUNCTION DOC] Calls all_gather_single for each output/input pair (lengths must match,
+        # else an error is raised) and returns only the last Work, or None for empty lists.
+        # KNOWN ISSUE: the opts argument is ignored and earlier Works are not waited on.
         res = None
         for o_t, i_t in zip(output_tensor_list, input_tensor_list, strict=True):
             res = self.all_gather_single(o_t, i_t)
         return res
 
     def __init__(self, rank, world_size):
+        # [FUNCTION DOC] Initializes the base group with rank and world size, records them, takes a
+        # weak reference to the current c10d world (unwrapping the thread-local world to this
+        # thread's data) and creates an autograd multithreading-disabled context. Side effect: the
+        # context manager is constructed, which turns off autograd multithreading, and it is never
+        # exited here.
         super().__init__(rank, world_size)
         self._rank = rank
         self._world_size = world_size
@@ -507,10 +637,14 @@ class ProcessLocalGroup(dist.ProcessGroup):
         self._ctx = torch.autograd.set_multithreading_enabled(False)
 
     def size(self):
+        # [FUNCTION DOC] Returns the world size of the group.
         return self._world_size
 
     @property
     def pg_name(self):
+        # [FUNCTION DOC] Returns the globally registered name of this group, looked up in
+        # the world's name mapping. Fails with a lookup error or dead reference error if the
+        # world is gone.
         """
         return the global registered name of the current pg in the world
         """
@@ -518,16 +652,22 @@ class ProcessLocalGroup(dist.ProcessGroup):
 
     @property
     def group_name(self):
+        # [FUNCTION DOC] Returns the group name, same as pg_name.
         return self.pg_name
 
     def getBackendName(self):
+        # [FUNCTION DOC] Returns the backend name "threaded".
         return "threaded"
 
     def __repr__(self):
+        # [FUNCTION DOC] Returns a short string with the world size and rank.
         return f"ThreadedPG world_size:{self._world_size} rank:{self._rank}"
 
 
 def _create_threaded_pg(prefix_store, rank, world_size, timeout):
+    # [FUNCTION DOC] HELPER: Backend factory for "threaded". Creates a ProcessLocalGroup, runs the
+    # store based barrier on the per-group prefix store so all ranks finish creating the group
+    # before collectives start, and returns the group. May raise on barrier timeout.
     pg = ProcessLocalGroup(rank, world_size)
     # https://github.com/pytorch/pytorch/pull/103033 changed store based barrier to optional
     # When device mesh involves sub groups while store based barrier is not enabled in c10d,
@@ -552,6 +692,9 @@ dist.Backend.register_backend(
 
 @dataclass
 class WorldData:
+    # [CLASS DOC] Plain data container mirroring the c10d world state: default group, group maps,
+    # names, group ranks, backend config, group count, tag maps, coalesce state and comms list. One
+    # instance exists per thread inside ThreadLocalWorld.
     default_pg: dist.ProcessGroup
     pg_map: dict[dist.ProcessGroup, tuple[str, Store | None]]
     pg_names: dict[dist.ProcessGroup, str]
@@ -565,9 +708,14 @@ class WorldData:
 
 
 class ThreadLocalWorld:
+    # [CLASS DOC] Drop-in replacement for the c10d world object that keeps a separate WorldData per
+    # thread (thread-local storage), so each rank thread sees its own groups. Properties forward to
+    # the current thread's data; default_pg and group_count are also settable.
     _world = threading.local()
 
     def _get_world(self) -> WorldData:
+        # [FUNCTION DOC] HELPER: Returns this thread's WorldData, creating an empty one on
+        # first use.
         if not hasattr(ThreadLocalWorld._world, "world"):
             ThreadLocalWorld._world.world = WorldData(
                 None, {}, {}, {}, {}, 0, {}, {}, {}, []
@@ -576,50 +724,62 @@ class ThreadLocalWorld:
 
     @property
     def default_pg(self):
+        # [FUNCTION DOC] Returns this thread's default process group.
         return self._get_world().default_pg
 
     @default_pg.setter
     def default_pg(self, value):
+        # [FUNCTION DOC] Sets this thread's default process group.
         self._get_world().default_pg = value
 
     @property
     def pg_map(self):
+        # [FUNCTION DOC] Returns this thread's mapping from group to (backend name, store).
         return self._get_world().pg_map
 
     @property
     def pg_names(self):
+        # [FUNCTION DOC] Returns this thread's mapping from group to group name.
         return self._get_world().pg_names
 
     @property
     def pg_group_ranks(self):
+        # [FUNCTION DOC] Returns this thread's mapping from group to global-to-group rank mapping.
         return self._get_world().pg_group_ranks
 
     @property
     def pg_backend_config(self):
+        # [FUNCTION DOC] Returns this thread's mapping from group to backend configuration.
         return self._get_world().pg_backend_config
 
     @property
     def group_count(self) -> int:
+        # [FUNCTION DOC] Returns this thread's count of created groups.
         return self._get_world().group_count
 
     @group_count.setter
     def group_count(self, value):
+        # [FUNCTION DOC] Sets this thread's count of created groups.
         self._get_world().group_count = value
 
     @property
     def tags_to_pg(self):
+        # [FUNCTION DOC] Returns this thread's mapping from tag to list of groups.
         return self._get_world().tags_to_pg
 
     @property
     def pg_to_tag(self):
+        # [FUNCTION DOC] Returns this thread's mapping from group to tag.
         return self._get_world().pg_to_tag
 
     @property
     def pg_coalesce_state(self) -> dict[dist.ProcessGroup, list[_CollOp | P2POp]]:
+        # [FUNCTION DOC] Returns this thread's mapping from group to pending coalesced operations.
         return self._get_world().pg_coalesce_state
 
     @property
     def comms(self):
+        # [FUNCTION DOC] Returns this thread's list of comms.
         return self._get_world().comms
 
 
@@ -628,6 +788,9 @@ _ctx_manager = None
 
 
 def _install_threaded_pg():
+    # [FUNCTION DOC] Replaces the c10d module-level world with a ThreadLocalWorld, remembering the
+    # old one in a module global, and disables autograd multithreading (storing the context manager
+    # in a module global). Returns the new world. Mutates global state.
     global _old_pg_world
     global _ctx_manager
     _old_pg_world = dist.distributed_c10d._world
@@ -638,6 +801,9 @@ def _install_threaded_pg():
 
 
 def _uninstall_threaded_pg():
+    # [FUNCTION DOC] Restores the saved c10d world and, if a context manager was stored, exits it
+    # to restore the autograd multithreading state, then clears it. Mutates global state.
+    # KNOWN ISSUE: assumes install ran first; the saved old world may be None otherwise.
     global _ctx_manager
     dist.distributed_c10d._world = _old_pg_world
     # Restore autograd multithreading state that was disabled in _install_threaded_pg

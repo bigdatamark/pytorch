@@ -1,5 +1,10 @@
 # mypy: allow-untyped-defs
 
+# [MODULE DOC] Tests for RemoteModule (a module living on another RPC worker) shared by CPU and
+# CUDA suites. Defines RPC handler functions run on the destination worker, a creation-mode enum,
+# jit interfaces and small module classes, a common fixture base with a helper that builds remote
+# modules in both plain and scripted form, and test classes for two workers, three workers and CUDA
+# devices. Import-time side effect: creates one global shared Parameter.
 import enum
 
 import torch
@@ -24,22 +29,30 @@ _PARAM_VAL = torch.nn.Parameter(torch.ones(1))
 
 # RPC handler for querying the device on the destination worker.
 def remote_device(module_rref):
+    # [FUNCTION DOC] HELPER: RPC handler run on the destination worker. Given an RRef to a module,
+    # returns the device of its first parameter (None if it has no parameters).
     for param in module_rref.local_value().parameters():
         return param.device
 
 
 # RPC handler for querying __dict__ on the destination worker.
 def remote_module_attributes(remote_module):
+    # [FUNCTION DOC] HELPER: RPC handler returning the instance attribute mapping of the given
+    # remote module as seen on the destination worker.
     return remote_module.__dict__
 
 
 # RPC handler for running forward on the destination worker.
 def remote_forward(remote_module, args):
+    # [FUNCTION DOC] HELPER: RPC handler that calls forward of the given remote module with the
+    # given tuple of positional arguments and returns the result.
     return remote_module.forward(*args)
 
 
 # RPC handler for running forward_async on the destination worker.
 def remote_forward_async(remote_module, args):
+    # [FUNCTION DOC] HELPER: RPC handler that calls forward_async of the remote module and blocks
+    # on the returned future, because futures cannot be pickled; returns the result.
     # Since future cannot be pickled and sent over the RPC layer,
     # have to wait and behave just like ``forward_sync``.
     return remote_module.forward_async(*args).wait()
@@ -47,54 +60,76 @@ def remote_forward_async(remote_module, args):
 
 # RPC handler for getting training mode on the destination worker.
 def get_remote_training_arg(module_rref):
+    # [FUNCTION DOC] HELPER: RPC handler that returns the training flag of the module behind an
+    # RRef that is owned by the destination worker.
     return module_rref.local_value().training
 
 
 class ModuleCreationMode(enum.Enum):
+    # [CLASS DOC] HELPER: Enum of the ways a remote module is constructed in tests: from a plain
+    # module class, or from a scripted module with a jit interface.
     MODULE_CTOR_WITH_INTERFACE = "module_ctor_with_interface"
     MODULE_CTOR = "module_ctor"
 
 
 @torch.jit.interface
 class MyModuleInterface:
+    # [CLASS DOC] HELPER: jit interface describing a module whose forward takes a tensor, an int
+    # and a string and returns a tuple of string, int and tensor.
     def forward(
         self, tensor: Tensor, number: int, word: str = "default"
     ) -> tuple[str, int, Tensor]:
+        # [FUNCTION DOC] HELPER: Interface method declaration only; has no behavior.
         # pyre-ignore[7]: Pyre and torch.jit.interface don't mix well
         pass
 
 
 @torch.jit.interface
 class RemoteMyModuleInterface:
+    # [CLASS DOC] HELPER: jit interface for a remote module, declaring forward and forward_async.
     def forward(
         self, tensor: Tensor, number: int, word: str = "default"
     ) -> tuple[str, int, Tensor]:
+        # [FUNCTION DOC] HELPER: Interface method declaration only; has no behavior.
         # pyre-ignore[7]: Pyre and torch.jit.interface don't mix well
         pass
 
     def forward_async(
         self, tensor: Tensor, number: int, word: str = "default"
     ) -> Future[tuple[str, int, Tensor]]:
+        # [FUNCTION DOC] HELPER: Interface method declaration only for the asynchronous variant
+        # that returns a future; has no behavior.
         pass
 
 
 class MyModule(nn.Module):
+    # [CLASS DOC] HELPER: Test module owning the shared global Parameter; its forward returns the
+    # inputs reordered as (word, number, tensor).
     def __init__(self, first_arg, first_kwarg=-1):
+        # [FUNCTION DOC] HELPER: Initializes the module and registers the shared global parameter.
+        # The constructor arguments are accepted but ignored.
         super().__init__()
         self.param1 = _PARAM_VAL
 
     def forward(
         self, tensor: Tensor, number: int, word: str = "default"
     ) -> tuple[str, int, Tensor]:
+        # [FUNCTION DOC] HELPER: Returns a tuple of the word, the number and the tensor, in
+        # that order.
         return word, number, tensor
 
 
 class BadModule:
+    # [CLASS DOC] HELPER: Deliberately not an nn.Module, used to check that remote module creation
+    # rejects non-module classes.
     def __init__(self, first_arg, first_kwarg=-1):
+        # [FUNCTION DOC] HELPER: Accepts and ignores its arguments.
         pass
 
 
 def create_scripted_module(first_arg, first_kwarg=-1):
+    # [FUNCTION DOC] HELPER: Builds a MyModule from the arguments and returns it compiled
+    # with jit script.
     module = MyModule(first_arg, first_kwarg=first_kwarg)
     scripted_module = torch.jit.script(module)
     return scripted_module
@@ -102,12 +137,21 @@ def create_scripted_module(first_arg, first_kwarg=-1):
 
 # Common utils for both CPU and CUDA test suites
 class CommonRemoteModuleTest(RpcAgentTestFixture):
+    # [CLASS DOC] HELPER: Base fixture for the remote module tests, built on the RPC agent
+    # test fixture. Provides a world size and a generator of remote modules in the requested
+    # creation modes.
     @property
     def world_size(self):  # Override setting in RpcAgentTestFixture
+        # [FUNCTION DOC] HELPER: Returns 2, the number of workers used by default.
         return 2
 
     @staticmethod
     def _create_remote_module_iter(remote_device, modes=None):
+        # [FUNCTION DOC] HELPER: Generator that yields remote modules targeting the given remote
+        # device string. Modes default to all creation modes. For plain mode it yields a
+        # RemoteModule of MyModule; for interface mode it yields a scripted remote module built
+        # from a scripted module. Constructor args are (1,) and keyword first_kwarg=2. Performs RPC
+        # calls on creation.
         if modes is None:
             modes = ModuleCreationMode.__members__.values()
 
@@ -131,8 +175,13 @@ class CommonRemoteModuleTest(RpcAgentTestFixture):
 
 
 class RemoteModuleTest(CommonRemoteModuleTest):
+    # [CLASS DOC] Tests of RemoteModule behavior with two workers on CPU. Every test runs only on
+    # rank 0 and targets the next rank.
     @dist_utils.dist_init
     def test_bad_module(self):
+        # [FUNCTION DOC] Checks that creating a RemoteModule from a class that is not an nn.Module
+        # raises ValueError with the expected message. Runs on rank 0 only.
+        # KNOWN ISSUE: the same check is performed twice with identical code.
         if self.rank != 0:
             return
         dst_worker_name = dist_utils.worker_name((self.rank + 1) % self.world_size)
@@ -154,6 +203,8 @@ class RemoteModuleTest(CommonRemoteModuleTest):
 
     @dist_utils.dist_init
     def test_forward_async(self):
+        # [FUNCTION DOC] Checks that forward_async on remote modules of each creation mode returns
+        # a future whose result is the reversed argument tuple. Runs on rank 0 only.
         if self.rank != 0:
             return
         dst_worker_name = dist_utils.worker_name((self.rank + 1) % self.world_size)
@@ -165,6 +216,8 @@ class RemoteModuleTest(CommonRemoteModuleTest):
 
     @dist_utils.dist_init
     def test_forward_async_script(self):
+        # [FUNCTION DOC] Checks forward_async called from inside a scripted function on a scripted
+        # remote module returns the expected tuple. Runs on rank 0 only.
         if self.rank != 0:
             return
         dst_worker_name = dist_utils.worker_name((self.rank + 1) % self.world_size)
@@ -177,6 +230,8 @@ class RemoteModuleTest(CommonRemoteModuleTest):
 
         @torch.jit.script
         def run_forward_async(scripted_remote_module: RemoteMyModuleInterface):
+            # [FUNCTION DOC] HELPER: Scripted function that calls forward_async on the module,
+            # waits and returns the result.
             ret_fut = scripted_remote_module.forward_async(torch.ones(1), 2, "3")
             ret = ret_fut.wait()
             return ret
@@ -187,6 +242,8 @@ class RemoteModuleTest(CommonRemoteModuleTest):
 
     @dist_utils.dist_init
     def test_forward_sync(self):
+        # [FUNCTION DOC] Checks that forward on remote modules of each creation mode returns the
+        # reversed argument tuple. Runs on rank 0 only.
         if self.rank != 0:
             return
         dst_worker_name = dist_utils.worker_name((self.rank + 1) % self.world_size)
@@ -197,6 +254,8 @@ class RemoteModuleTest(CommonRemoteModuleTest):
 
     @dist_utils.dist_init
     def test_forward_sync_script(self):
+        # [FUNCTION DOC] Checks forward called from inside a scripted function on a scripted remote
+        # module returns the expected tuple. Runs on rank 0 only.
         if self.rank != 0:
             return
         dst_worker_name = dist_utils.worker_name((self.rank + 1) % self.world_size)
@@ -209,6 +268,8 @@ class RemoteModuleTest(CommonRemoteModuleTest):
 
         @torch.jit.script
         def run_forward(scripted_remote_module: MyModuleInterface):
+            # [FUNCTION DOC] HELPER: Scripted function that calls forward on the module and returns
+            # the result.
             ret = scripted_remote_module.forward(torch.ones(1), 2, "3")
             return ret
 
@@ -218,6 +279,8 @@ class RemoteModuleTest(CommonRemoteModuleTest):
 
     @dist_utils.dist_init
     def test_forward_with_kwargs(self):
+        # [FUNCTION DOC] Checks that forward and forward_async accept keyword arguments for plain
+        # remote modules and return the expected tuple. Runs on rank 0 only.
         if self.rank != 0:
             return
         dst_worker_name = dist_utils.worker_name((self.rank + 1) % self.world_size)
@@ -236,6 +299,8 @@ class RemoteModuleTest(CommonRemoteModuleTest):
 
     @dist_utils.dist_init
     def test_remote_parameters(self):
+        # [FUNCTION DOC] Checks remote_parameters returns one RRef whose fetched value equals the
+        # shared parameter. Runs on rank 0 only.
         if self.rank != 0:
             return
         dst_worker_name = dist_utils.worker_name((self.rank + 1) % self.world_size)
@@ -250,6 +315,8 @@ class RemoteModuleTest(CommonRemoteModuleTest):
 
     @dist_utils.dist_init
     def test_get_module_rref(self):
+        # [FUNCTION DOC] Checks get_module_rref equals the module_rref attribute and that the
+        # fetched module's parameters equal the shared parameter. Runs on rank 0 only.
         if self.rank != 0:
             return
         dst_worker_name = dist_utils.worker_name((self.rank + 1) % self.world_size)
@@ -265,6 +332,8 @@ class RemoteModuleTest(CommonRemoteModuleTest):
 
     @dist_utils.dist_init
     def test_train_eval(self):
+        # [FUNCTION DOC] Checks that train and eval on the remote module propagate to the remote
+        # worker's training flag (true then false), queried via RPC. Runs on rank 0 only.
         if self.rank != 0:
             return
         dst_worker_name = dist_utils.worker_name((self.rank + 1) % self.world_size)
@@ -290,6 +359,10 @@ class RemoteModuleTest(CommonRemoteModuleTest):
 
     @dist_utils.dist_init
     def test_unsupported_methods(self):
+        # [FUNCTION DOC] Checks that a long list of nn.Module methods (registration, apply, dtype
+        # and device moves, hooks, state dict, parameter, buffer, child and module iteration,
+        # requires_grad_, zero_grad, share_memory, extra_repr) each raise ValueError saying the
+        # method is not supported. Runs on rank 0 only.
         if self.rank != 0:
             return
         dst_worker_name = dist_utils.worker_name((self.rank + 1) % self.world_size)
@@ -349,6 +422,7 @@ class RemoteModuleTest(CommonRemoteModuleTest):
                 remote_module.to("cpu", dtype=torch.int32)
 
             def hook(module, grad_input, grad_output):
+                # [FUNCTION DOC] HELPER: No-op hook passed to the hook registration methods.
                 pass
 
             with self.assertRaisesRegex(
@@ -430,6 +504,9 @@ class RemoteModuleTest(CommonRemoteModuleTest):
 
     @dist_utils.dist_init
     def test_send_remote_module_with_a_new_attribute_not_pickled_over_the_wire(self):
+        # [FUNCTION DOC] Checks that an attribute added after construction is not included when the
+        # remote module is sent over RPC, by inspecting the received attribute mapping. Runs on
+        # rank 0 only.
         if self.rank != 0:
             return
         dst_worker_name = dist_utils.worker_name((self.rank + 1) % self.world_size)
@@ -454,6 +531,8 @@ class RemoteModuleTest(CommonRemoteModuleTest):
 
     @dist_utils.dist_init
     def test_remote_module_py_pickle_not_supported(self):
+        # [FUNCTION DOC] Checks that saving a plain remote module with the Python pickler raises
+        # RuntimeError saying it can only be pickled with RPC. Runs on rank 0 only.
         if self.rank != 0:
             return
         dst_worker_name = dist_utils.worker_name((self.rank + 1) % self.world_size)
@@ -470,6 +549,8 @@ class RemoteModuleTest(CommonRemoteModuleTest):
 
     @dist_utils.dist_init
     def test_remote_module_py_pickle_not_supported_script(self):
+        # [FUNCTION DOC] Checks that saving a scripted remote module with torch.save raises a jit
+        # error saying it can only be pickled with RPC. Runs on rank 0 only.
         if self.rank != 0:
             return
         dst_worker_name = dist_utils.worker_name((self.rank + 1) % self.world_size)
@@ -487,12 +568,18 @@ class RemoteModuleTest(CommonRemoteModuleTest):
 
 
 class ThreeWorkersRemoteModuleTest(CommonRemoteModuleTest):
+    # [CLASS DOC] Tests of RemoteModule behavior with three workers, where a module created on one
+    # worker is passed to another.
     @property
     def world_size(self):  # Override setting in CommonRemoteModuleTest
+        # [FUNCTION DOC] HELPER: Returns 3, the number of workers for this test class.
         return 3
 
     @dist_utils.dist_init
     def test_send_remote_module_over_the_wire(self):
+        # [FUNCTION DOC] Creates a remote module on worker1, sends it to worker2 over RPC and
+        # checks the received attribute names, the on and device values and the two flags, then
+        # runs forward and forward_async on worker2 and checks the results. Runs on rank 0 only.
         if self.rank != 0:
             return
         dst_worker1_name = dist_utils.worker_name((self.rank + 1) % self.world_size)
@@ -531,6 +618,9 @@ class ThreeWorkersRemoteModuleTest(CommonRemoteModuleTest):
 
     @dist_utils.dist_init
     def test_send_remote_module_over_the_wire_script_not_supported(self):
+        # [FUNCTION DOC] Checks that sending a scripted remote module over RPC raises RuntimeError
+        # saying it is not supported. Runs on rank 0 only.
+        # KNOWN ISSUE: the local list of expected attribute names is built but never used.
         if self.rank != 0:
             return
         dst_worker1_name = dist_utils.worker_name((self.rank + 1) % self.world_size)
@@ -556,6 +646,8 @@ class ThreeWorkersRemoteModuleTest(CommonRemoteModuleTest):
 
     @dist_utils.dist_init
     def test_create_remote_module_from_module_rref(self):
+        # [FUNCTION DOC] Creates a remote module on worker1, builds another from its module RRef on
+        # worker2 and checks that running forward on each gives equal results. Runs on rank 0 only.
         if self.rank != 0:
             return
         dst_worker1_name = dist_utils.worker_name((self.rank + 1) % self.world_size)
@@ -580,9 +672,13 @@ class ThreeWorkersRemoteModuleTest(CommonRemoteModuleTest):
 
 
 class CudaRemoteModuleTest(CommonRemoteModuleTest):
+    # [CLASS DOC] Tests of RemoteModule with CUDA devices on the destination worker; each test is
+    # skipped when fewer than one GPU is available.
     @skip_if_lt_x_gpu(1)
     @dist_utils.dist_init
     def test_valid_device(self):
+        # [FUNCTION DOC] Checks that a remote module placed on cuda:0, addressed by worker name and
+        # by rank, reports a cuda device with index 0. Runs on rank 0 only.
         if self.rank != 0:
             return
         dst_rank = (self.rank + 1) % self.world_size
@@ -610,6 +706,10 @@ class CudaRemoteModuleTest(CommonRemoteModuleTest):
     @skip_if_lt_x_gpu(1)
     @dist_utils.dist_init
     def test_invalid_devices(self):
+        # [FUNCTION DOC] Checks that malformed or invalid remote device strings (unknown type, bad
+        # ordinal, bad cpu name, empty device, extra or missing parts) raise the expected
+        # RuntimeError or ValueError with the expected message, with a platform specific message on
+        # ROCm. Runs on rank 0 only.
         if self.rank != 0:
             return
         dst_worker_name = dist_utils.worker_name((self.rank + 1) % self.world_size)
@@ -701,6 +801,9 @@ class CudaRemoteModuleTest(CommonRemoteModuleTest):
     @skip_if_lt_x_gpu(1)
     @dist_utils.dist_init
     def test_input_moved_to_cuda_device(self):
+        # [FUNCTION DOC] Checks that CPU tensor arguments (positional and keyword) are implicitly
+        # moved to the cuda device and that results come back on CPU, for forward and
+        # forward_async. Runs on rank 0 only.
         if self.rank != 0:
             return
         dst_worker_name = dist_utils.worker_name((self.rank + 1) % self.world_size)
@@ -731,6 +834,9 @@ class CudaRemoteModuleTest(CommonRemoteModuleTest):
     @skip_if_lt_x_gpu(1)
     @dist_utils.dist_init
     def test_input_moved_to_cuda_device_script(self):
+        # [FUNCTION DOC] Same as the CUDA input move test but through a scripted function on a
+        # scripted remote module; checks the returned value and that the returned tensor is on CPU.
+        # Runs on rank 0 only.
         if self.rank != 0:
             return
         dst_worker_name = dist_utils.worker_name((self.rank + 1) % self.world_size)
@@ -744,6 +850,8 @@ class CudaRemoteModuleTest(CommonRemoteModuleTest):
 
         @torch.jit.script
         def run_forward(scripted_remote_module: MyModuleInterface):
+            # [FUNCTION DOC] HELPER: Scripted function that calls forward on the module and returns
+            # the result.
             ret = scripted_remote_module.forward(torch.ones(1), 2, "3")
             return ret
 
