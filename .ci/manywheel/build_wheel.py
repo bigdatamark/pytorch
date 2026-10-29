@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Command-line script (argument: output directory) that builds a PyTorch wheel
+# inside a manylinux container. Build flags are expected from the caller's environment; this
+# script adds only architecture-dependent BLAS settings (MKL paths on x86_64, ARM Compute
+# Library plus OpenBLAS or NVPL on aarch64) and then runs the build module to produce the
+# wheel. Main entries: configure_blas_env, main. No import-time side effects.
 """Build a PyTorch wheel inside a manylinux container.
 
 Usage: build_wheel.py <output_dir>
@@ -17,6 +22,11 @@ from pathlib import Path
 
 
 def configure_blas_env() -> None:
+    # [FUNCTION DOC] Print the detected architecture and settings, then set process
+    # environment variables: on x86_64 point CMake at MKL under /opt/intel if present; on
+    # aarch64 require /acl, enable MKLDNN with ACL, and choose NVPL (cuda-aarch64) or
+    # OpenBLAS (cpu-aarch64 or cpu) after checking the library exists. Exits the process with
+    # an error message if a required library is missing. Other architectures are untouched.
     """Tell CMake which BLAS to use, based on architecture and GPU type.
 
     On x86, MKL from /opt/intel is wired in via CMAKE_{INCLUDE,LIBRARY}_PATH.
@@ -61,6 +71,9 @@ def configure_blas_env() -> None:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point. Parses the output directory, configures BLAS env variables,
+    # installs the build package with pip and builds the wheel with no build isolation into
+    # the output directory. Raises a called-process error on failure.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output_dir", type=Path)
     args = parser.parse_args()

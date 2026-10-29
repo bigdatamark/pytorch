@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Command-line script (argument: output directory) that builds a macOS arm64
+# PyTorch wheel. Copies the environment, defaults the host platform tag and arch flags to
+# arm64 (existing values win), installs the build package with pip and runs the build module
+# with the wheel and no-isolation options. Main entry: main. No import-time side effects.
 """Build a macOS arm64 PyTorch wheel.
 
 Usage: build_wheel.py <output_dir>
@@ -21,6 +25,10 @@ MACOS_PLATFORM = "macosx-14.0-arm64"
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point. Parses the output directory, prepares the child environment
+    # with default platform and arch settings, then runs pip install build and the wheel build
+    # as subprocesses. Raises a called-process error if either fails. Writes wheels to the
+    # output directory.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output_dir", type=Path)
     args = parser.parse_args()

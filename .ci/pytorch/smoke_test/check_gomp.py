@@ -1,3 +1,7 @@
+# [MODULE DOC] Smoke-test script verifying that OpenMP is not loaded twice. It loads the
+# system libgomp and the installed libtorch_cpu shared library with CPU affinity limited to
+# four cores, asks for the maximum OpenMP thread count, and fails if that is one (the sign of
+# a duplicated libgomp). Main entries: get_gomp_thread, main. No import-time side effects.
 import ctypes
 import os
 import sys
@@ -5,6 +9,13 @@ from pathlib import Path
 
 
 def get_gomp_thread():
+    # [FUNCTION DOC] Compute the path of libtorch_cpu under the interpreter's installation
+    # prefix and Python-version site-packages directory, pick the AlmaLinux libgomp path (or
+    # the Ubuntu multiarch path if absent), set GOMP_CPU_AFFINITY to 0-3 in this process, load
+    # both libraries and return the OpenMP maximum thread count as an integer. Raises an OS
+    # error if a library cannot be loaded.
+    # KNOWN ISSUE: assumes the standard lib/pythonX.Y/site-packages layout and ignores the
+    # real purelib location.
     """
     Retrieves the maximum number of OpenMP threads after loading the `libgomp.so.1` library
     and the `libtorch_cpu.so` library. It then queries the
@@ -63,6 +74,8 @@ def get_gomp_thread():
 
 
 def main():
+    # [FUNCTION DOC] Entry point. Gets the OpenMP thread count, prints it, and raises a
+    # runtime error if it equals one.
     omp_max_threads = get_gomp_thread()
     print(
         f"omp_max_threads after loading libgomp.so and libtorch_cpu.so: {omp_max_threads}"

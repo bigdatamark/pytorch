@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Smoke-test script for installed PyTorch binaries, checking symbols. It verifies
+# that libtorch_cpu uses the cxx11 ABI (cxx11 symbols present, no pre-cxx11 ones, in the
+# torch, at, c10 and caffe2 namespaces), that no libstdc++ filesystem iterator symbols are
+# statically linked, and, by compiling small C++ programs with g++ against the installed
+# headers, that stable-only, header-only, AOTI shim and stable C shim headers behave as
+# expected. Main entry: main. Install root comes from the install_root variable, the current
+# directory for libtorch packages, or the torch directory in site-packages. No import-time
+# side effects beyond compiling regex pattern lists.
 from __future__ import annotations
 
 import concurrent.futures
@@ -39,6 +47,8 @@ STATICALLY_LINKED_CXX11_ABI = [re.compile(r".*recursive_directory_iterator.*")]
 
 
 def _apply_libtorch_symbols(symbols):
+    # [FUNCTION DOC] HELPER: Build regex objects for every pairing of a libtorch namespace
+    # prefix with each given symbol fragment (prefix, anything, fragment). Returns a list.
     return [
         re.compile(f"{x}.*{y}")
         for (x, y) in itertools.product(LIBTORCH_NAMESPACE_LIST, symbols)
@@ -52,6 +62,11 @@ LIBTORCH_PRE_CXX11_PATTERNS = _apply_libtorch_symbols(PRE_CXX11_SYMBOLS)
 
 @functools.lru_cache(100)
 def get_symbols(lib: str) -> list[tuple[str, str, str]]:
+    # [FUNCTION DOC] HELPER: List symbols of a library or object file by running nm piped
+    # through a demangler in a shell, splitting each line into at most three fields. Results
+    # are cached per path (up to 100 entries). Raises a called-process error on failure.
+    # KNOWN ISSUE: the annotation says tuples but lists are returned, and the cache is keyed
+    # only by path, so a reused temporary path could return stale symbols.
     from subprocess import check_output
 
     lines = check_output(f'nm "{lib}"|c++filt', shell=True)
@@ -61,9 +76,16 @@ def get_symbols(lib: str) -> list[tuple[str, str, str]]:
 def grep_symbols(
     lib: str, patterns: list[Any], symbol_type: str | None = None
 ) -> list[str]:
+    # [FUNCTION DOC] Return the names of symbols in the library that match any regex pattern,
+    # optionally only those whose nm type letter equals symbol_type. The symbol list is split
+    # into up to 32 chunks scanned by a thread pool and the results concatenated in order.
+    # KNOWN ISSUE: the continue in the inner pattern loop does not stop checking further
+    # patterns, so a symbol matching several patterns is returned several times.
     def _grep_symbols(
         symbols: list[tuple[str, str, str]], patterns: list[Any]
     ) -> list[str]:
+        # [FUNCTION DOC] HELPER: Scan the given symbol records and return the names of those
+        # passing the type filter and matching any pattern.
         rc = []
         for _s_addr, _s_type, s_name in symbols:
             # Filter by symbol type if specified
@@ -80,6 +102,8 @@ def grep_symbols(
     chunk_size = (len(all_symbols) + num_workers - 1) // num_workers
 
     def _get_symbols_chunk(i):
+        # [FUNCTION DOC] HELPER: Return the i-th contiguous slice of the symbol list, using
+        # the computed chunk size.
         return all_symbols[i * chunk_size : (i + 1) * chunk_size]
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
@@ -91,6 +115,9 @@ def grep_symbols(
 
 
 def check_lib_statically_linked_libstdc_cxx_abi_symbols(lib: str) -> None:
+    # [FUNCTION DOC] Look for defined (type T) symbols matching the statically linked
+    # libstdc++ filesystem iterator pattern in the library, print the count, and raise a
+    # runtime error listing up to 100 of them if any are found.
     cxx11_statically_linked_symbols = grep_symbols(
         lib, STATICALLY_LINKED_CXX11_ABI, symbol_type="T"
     )
@@ -105,6 +132,10 @@ def check_lib_statically_linked_libstdc_cxx_abi_symbols(lib: str) -> None:
 def _compile_and_extract_symbols(
     cpp_content: str, compile_flags: list[str], exclude_list: list[str] | None = None
 ) -> list[str]:
+    # [FUNCTION DOC] HELPER: Write C++ source text to a temporary file, compile it with the
+    # given command and flags to an object file (60 second timeout), then return the names of
+    # all symbols in the object excluding the exclude list (default: main). Raises a runtime
+    # error with the compiler output if compilation fails.
     """
     Helper to compile a C++ file and extract all symbols.
 
@@ -146,6 +177,11 @@ def _compile_and_extract_symbols(
 
 
 def check_stable_only_symbols(install_root: Path) -> None:
+    # [FUNCTION DOC] Compile a program including the full torch C++ headers (C++20) under the
+    # install root. Requires a non-zero symbol count without macros (assertion error
+    # otherwise, also if the include directory is missing), then requires compilation to fail
+    # with the expected explanatory message when the stable-only macro, the target-version
+    # macro, or both are defined. Prints progress; raises runtime errors on mismatch.
     """
     Test TORCH_STABLE_ONLY and TORCH_TARGET_VERSION by compiling test code.
 
@@ -208,6 +244,9 @@ int main() { return 0; }
 
     # Helper to verify compilation fails with expected error
     def _expect_compilation_failure(compile_flags: list[str], macro_name: str) -> None:
+        # [FUNCTION DOC] HELPER: Compile the test program with the given flags and require it
+        # to fail with the stable-only error text in the compiler output; raises a runtime
+        # error if it compiles or the message differs. Prints a confirmation naming the macro.
         with tempfile.TemporaryDirectory() as tmpdir:
             tmppath = Path(tmpdir)
             cpp_file = tmppath / "test.cpp"
@@ -259,6 +298,10 @@ int main() { return 0; }
 
 
 def check_stable_api_symbols(install_root: Path) -> None:
+    # [FUNCTION DOC] Compile a program including every header under the stable header
+    # directory with the stable-only macro (C++17) and require at least one symbol. Raises an
+    # assertion error when directories are missing or no symbols are found, and a runtime
+    # error when no headers exist. Prints the symbol count.
     """
     Test that stable API headers still expose symbols with TORCH_STABLE_ONLY.
     The torch/csrc/stable/c/shim.h header is tested in check_stable_c_shim_symbols
@@ -309,6 +352,10 @@ int main() {{ return 0; }}
 
 
 def check_headeronly_symbols(install_root: Path) -> None:
+    # [FUNCTION DOC] Compile a program including all header-only utility headers (excluding
+    # CPU vector, Windows, CUDA headers and one non-self-contained header) with the
+    # stable-only macro and require at least one symbol. Raises an assertion error for missing
+    # directories or zero symbols, and a runtime error if no headers are found.
     """
     Test that header-only utility headers still expose symbols with TORCH_STABLE_ONLY.
     """
@@ -378,6 +425,9 @@ int main() {{ return 0; }}
 
 
 def check_aoti_shim_symbols(install_root: Path) -> None:
+    # [FUNCTION DOC] Compile a small program taking the addresses of two AOTI shim functions
+    # with the stable-only macro and require at least one symbol. Raises an assertion error
+    # if the include directory is missing or no symbols appear.
     """
     Test that AOTI shim headers still expose symbols with TORCH_STABLE_ONLY.
     """
@@ -419,6 +469,10 @@ int main() {
 
 
 def check_stable_c_shim_symbols(install_root: Path) -> None:
+    # [FUNCTION DOC] Compile a small program referencing two stable C shim functions with the
+    # stable-only macro and require at least one symbol. Raises a runtime error if the shim
+    # header is missing and an assertion error if the include directory is missing or no
+    # symbols appear.
     """
     Test that stable C shim headers still expose symbols with TORCH_STABLE_ONLY.
     """
@@ -466,6 +520,9 @@ int main() {
 
 
 def check_lib_symbols_for_abi_correctness(lib: str) -> None:
+    # [FUNCTION DOC] Count cxx11 and pre-cxx11 ABI symbols matching the libtorch namespace
+    # patterns in the library, printing both counts. Raises a runtime error if any pre-cxx11
+    # symbol exists or fewer than 100 cxx11 symbols exist.
     print(f"lib: {lib}")
     cxx11_symbols = grep_symbols(lib, LIBTORCH_CXX11_PATTERNS)
     pre_cxx11_symbols = grep_symbols(lib, LIBTORCH_PRE_CXX11_PATTERNS)
@@ -482,6 +539,10 @@ def check_lib_symbols_for_abi_correctness(lib: str) -> None:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point. Determines the install root (install_root variable, else
+    # current directory for libtorch packages, else torch under site-packages), runs the ABI
+    # and static-linking checks on libtorch_cpu, then the stable-only, stable API, header-only,
+    # AOTI shim and stable C shim checks. Any failure raises an exception.
     if "install_root" in os.environ:
         install_root = Path(os.getenv("install_root"))
     else:

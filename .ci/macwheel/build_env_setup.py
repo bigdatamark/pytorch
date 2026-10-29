@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Command-line script run once per Python before the macOS arm64 wheel build.
+# Builds a mapping of static macOS build flags (MACOS_BUILD_ENV), adds the OpenMP prefix when
+# the staged conda-forge libomp directory exists, and writes the result as shell export lines
+# to the file given by --env-out so build.sh can source them. Main entry: main. No import-time
+# side effects beyond defining constants.
 """macOS arm64 build environment setup (runs once per Python before the build).
 
 Mirrors .ci/manywheel/build_env_setup.py for the macOS CD wheel build. macOS
@@ -37,12 +42,18 @@ OMP_PREFIX = Path("/opt/llvm-openmp")
 
 
 def shell_quote(value: str) -> str:
+    # [FUNCTION DOC] HELPER: Return the value unchanged if it is non-empty and made only of
+    # letters, digits and a few safe punctuation characters; otherwise return it wrapped in
+    # single quotes with embedded single quotes escaped for a POSIX shell.
     if value and all(c.isalnum() or c in "_-./:=" for c in value):
         return value
     return "'" + value.replace("'", "'\\''") + "'"
 
 
 def write_env_exports(env: dict[str, str], path: Path | None) -> None:
+    # [FUNCTION DOC] Write one export line per key/value pair (values shell-quoted), joined by
+    # newlines with a trailing newline, to the given path, overwriting it. Does nothing when
+    # the path is None. Side effect: file write; raises OS errors if the path is unwritable.
     """Write `export KEY=VALUE` lines for the parent shell to source."""
     if path is None:
         return
@@ -51,6 +62,10 @@ def write_env_exports(env: dict[str, str], path: Path | None) -> None:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point. Parses the optional --env-out path, copies the static macOS
+    # flags, adds the OpenMP prefix variable if that directory exists, writes the exports to
+    # the file (if requested) and prints a confirmation. Returns nothing; exits via argparse
+    # on bad arguments.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--env-out",

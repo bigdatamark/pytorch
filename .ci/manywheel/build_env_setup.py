@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Command-line script run once before any manylinux wheel is built (argument:
+# optional --env-out file). Reads GPU_ARCH_TYPE, DESIRED_CUDA and GPU_ARCH_VERSION from the
+# environment, installs OS packages, ensures pip and MKL, prepares the CUDA toolkit/MAGMA/
+# cuDNN symlinks, sources the oneAPI environment for XPU, or discovers ROCm, then writes the
+# resulting build flags as shell export lines for build.sh to source. Contains static flag
+# tables per backend, the CUDA arch table and PTX policy. Main entry: main. Other repo
+# scripts (repair_wheel.py, build_wheel.py) import or read values prepared here. No
+# import-time side effects beyond defining constants.
 """GPU/toolchain environment setup (runs once before any wheel is built).
 
 The manywheel builder image (.ci/docker/manywheel/Dockerfile_2_28) is
@@ -95,6 +103,9 @@ _PTX_ARCHES: set[int] = {120}
 
 
 def _is_release_build() -> bool:
+    # [FUNCTION DOC] HELPER: Return true when PYTORCH_BUILD_VERSION is non-empty and has no
+    # development marker, i.e. a release or release-candidate build; false for nightly or
+    # unset versions.
     """True for release / RC binary builds (vs nightly / dev builds).
 
     Binary builds off a git tag (releases and RCs, e.g. v2.13.0 / v2.13.0-rc1)
@@ -108,11 +119,17 @@ def _is_release_build() -> bool:
 
 
 def _ptx_arches() -> set[int]:
+    # [FUNCTION DOC] HELPER: Return the set of compute capabilities that also get PTX: empty
+    # for release builds, the nightly forward-compat set otherwise.
     """PTX arches for this build: empty on release/RC, forward-compat set otherwise."""
     return set() if _is_release_build() else _PTX_ARCHES
 
 
 def torch_cuda_arch_list(cuda_version: str, arch: str) -> str:
+    # [FUNCTION DOC] Build the semicolon-separated architecture list string for a CUDA version
+    # and host architecture from the table, converting integer capabilities to dotted form and
+    # appending a PTX suffix for those in the PTX set. Raises SystemExit if the CUDA version is
+    # unknown or no architectures exist for that host arch.
     """Format TORCH_CUDA_ARCH_LIST for the wheel build (";"-separated).
 
     Returns e.g. "8.0;9.0;10.0;11.0;12.0+PTX" for cuda 13.x aarch64 on
@@ -135,6 +152,10 @@ def torch_cuda_arch_list(cuda_version: str, arch: str) -> str:
 
 
 def cuda_build_env(cuda_version: str, arch: str) -> dict[str, str]:
+    # [FUNCTION DOC] Compute the CUDA build environment mapping for a CUDA version and host
+    # arch: default flags (only for variables not already set), the static flags, nvcc flags
+    # (with size compression added for CUDA 13), the arch list, MAGMA disabled on aarch64, and
+    # bundling of the CUDA 13.4 ptxas by default for that version. Returns the mapping.
     nvcc_flags = "-Xfatbin -compress-all --threads 2"
     if cuda_version.startswith("13."):
         nvcc_flags += " -compress-mode=size"
@@ -191,6 +212,10 @@ ROCM_BUILD_ENV_STATIC: dict[str, str] = {
 
 
 def discover_rocm_home() -> str:
+    # [FUNCTION DOC] Locate the ROCm install root: first the ROCM_HOME or ROCM_PATH variable,
+    # then an export line in the rocm_env.sh file under etc, then the output of the rocm-sdk
+    # path query, finally the default /opt/rocm. Returns the path string; reads files and may
+    # run a subprocess (a missing tool is ignored).
     """Locate the ROCm install root.
 
     Supports both the OS/tarball layout (/opt/rocm) and the TheRock multi-arch
@@ -231,6 +256,8 @@ PLATFORM_TAGS: dict[str, str] = {
 
 
 def repo_root() -> Path:
+    # [FUNCTION DOC] HELPER: Return the repository root, taken from GITHUB_WORKSPACE if set,
+    # otherwise two directory levels above this file.
     return Path(
         os.environ.get(
             "GITHUB_WORKSPACE",
@@ -240,6 +267,8 @@ def repo_root() -> Path:
 
 
 def os_name() -> str:
+    # [FUNCTION DOC] HELPER: Return the distribution NAME value from the os-release file with
+    # quotes removed, or an empty string if absent. Raises an OS error if the file is missing.
     for line in Path("/etc/os-release").read_text().splitlines():
         if line.startswith("NAME="):
             return line.partition("=")[2].strip().strip('"')
@@ -247,6 +276,9 @@ def os_name() -> str:
 
 
 def install_os_packages() -> None:
+    # [FUNCTION DOC] Install the zip and openssl packages with yum on AlmaLinux/CentOS/Red Hat
+    # or apt-get on Ubuntu; do nothing for other distributions. Runs subprocesses and raises a
+    # called-process error on failure.
     # Everything else the build needs is baked into the manywheel image
     # (.ci/docker/manywheel/Dockerfile_2_28). Only zip + openssl are not,
     # matching the legacy build_common.sh contract.
@@ -265,6 +297,9 @@ def install_os_packages() -> None:
 
 
 def ensure_pip_on_path() -> None:
+    # [FUNCTION DOC] HELPER: If python3 cannot run pip, prepend the last sorted Python
+    # interpreter bin directory found under /opt/python to PATH in this process (and print
+    # it); otherwise change nothing.
     """Manylinux images ship /usr/bin/python3 without pip; fall back to /opt/python/cp3*."""
     if (
         subprocess.run(
@@ -283,6 +318,9 @@ def ensure_pip_on_path() -> None:
 
 
 def cuda_version_from_env() -> str:
+    # [FUNCTION DOC] Determine the CUDA version string: DESIRED_CUDA if it is already dotted
+    # numeric, or converted from the five-character cu form; otherwise GPU_ARCH_VERSION with
+    # any aarch64 suffix removed (may be empty).
     """Match the original build_cuda.sh precedence: DESIRED_CUDA wins.
 
     GPU_ARCH_VERSION on aarch64 jobs comes through as e.g. "12.6-aarch64"
@@ -301,6 +339,10 @@ def cuda_version_from_env() -> str:
 
 
 def install_cuda_toolkit(cuda_version: str) -> None:
+    # [FUNCTION DOC] Install a CUDA toolkit by copying the CUDA, NCCL and cuSPARSELt install
+    # scripts and NCCL commit pins into a temporary staging directory and running the CUDA
+    # installer there, then run the MAGMA installer. Raises a called-process error on failure;
+    # prints a completion message.
     """Stage install_cuda.sh + its required siblings, then run install_cuda + install_magma."""
     root = repo_root()
     docker_common = root / ".ci/docker/common"
@@ -323,6 +365,11 @@ def install_cuda_toolkit(cuda_version: str) -> None:
 
 
 def setup_cuda(cuda_version: str) -> None:
+    # [FUNCTION DOC] Make the requested CUDA version the active one: install it if its
+    # directory is missing, otherwise repoint the /usr/local/cuda symlink. On non-aarch64
+    # hosts also install MAGMA if absent and repoint the /usr/local/magma symlink. Then create
+    # unversioned cuDNN symlinks and print a cuDNN check. Modifies the filesystem under
+    # /usr/local.
     arch = platform.machine()
     cuda_dir = Path(f"/usr/local/cuda-{cuda_version}")
 
@@ -358,6 +405,9 @@ def setup_cuda(cuda_version: str) -> None:
 
 
 def create_cudnn_unversioned_symlinks() -> None:
+    # [FUNCTION DOC] For each versioned cuDNN shared library in the CUDA lib directory, create
+    # the unversioned symlink if missing so CMake can find it. Does nothing if the directory
+    # does not exist.
     """Some image builders drop libcudnn.so → libcudnn.so.9; CMake's find_library needs it."""
     cuda_lib = Path("/usr/local/cuda/lib64")
     if not cuda_lib.is_dir():
@@ -372,6 +422,8 @@ def create_cudnn_unversioned_symlinks() -> None:
 
 
 def verify_cudnn() -> None:
+    # [FUNCTION DOC] HELPER: Print the cuDNN libraries (with sizes) and headers found under
+    # the CUDA directories, or a warning for each kind that is missing. Never fails on absence.
     print("cuDNN check:")
     libs = list(Path("/usr/local/cuda/lib64").glob("libcudnn*.so*"))
     if libs:
@@ -389,6 +441,8 @@ def verify_cudnn() -> None:
 
 
 def cleanup_cuda_for_cpu_build() -> None:
+    # [FUNCTION DOC] Remove every cuda-named entry under /usr/local: symlinks are unlinked and
+    # real directories are deleted recursively, ignoring errors.
     for entry in Path("/usr/local").glob("cuda*"):
         if entry.is_symlink():
             entry.unlink()
@@ -397,6 +451,10 @@ def cleanup_cuda_for_cpu_build() -> None:
 
 
 def source_oneapi_env() -> dict[str, str]:
+    # [FUNCTION DOC] Source the available Intel oneAPI environment scripts in one shell, read
+    # back the full environment, and return the mapping of new or changed variables. Also
+    # applies those variables to this process environment. Returns an empty mapping (with a
+    # warning) when no scripts exist; raises a called-process error if sourcing fails.
     """Source Intel oneAPI environment scripts and return the env diff.
 
     The vars.sh scripts set PATH, LD_LIBRARY_PATH, CMAKE_PREFIX_PATH, and
@@ -440,6 +498,8 @@ def source_oneapi_env() -> dict[str, str]:
 
 
 def write_env_exports(env: dict[str, str], path: Path | None) -> None:
+    # [FUNCTION DOC] Write one export line per key/value pair (shell-quoted values) to the
+    # given path, overwriting it; does nothing when the path is None.
     """Write `export KEY=VALUE` lines for the parent shell to source."""
     if path is None:
         return
@@ -448,12 +508,21 @@ def write_env_exports(env: dict[str, str], path: Path | None) -> None:
 
 
 def shell_quote(value: str) -> str:
+    # [FUNCTION DOC] HELPER: Return the value unquoted if non-empty and made of safe characters
+    # only, otherwise single-quoted with embedded single quotes escaped for a POSIX shell.
     if value and all(c.isalnum() or c in "_-./:=" for c in value):
         return value
     return "'" + value.replace("'", "'\\''") + "'"
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point. Parses --env-out, installs OS packages, records the
+    # platform tag for the host arch, ensures pip, installs MKL on x86_64 if missing, then by
+    # GPU_ARCH_TYPE: sets up CUDA (exits if the version cannot be determined), cleans CUDA for
+    # CPU or XPU builds and merges the oneAPI env and flags, or merges ROCm flags with
+    # ROCM_HOME and a rocm-prefixed DESIRED_CUDA. Writes the merged exports to the file.
+    # KNOWN ISSUE: an unrecognized GPU_ARCH_TYPE is silently ignored and only the platform tag
+    # is exported.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--env-out",

@@ -1,3 +1,9 @@
+# [MODULE DOC] Smoke-test script validating wheel metadata. check_wheel_platform_tag compares
+# Tag entries of the WHEEL file (from a torch wheel in PYTORCH_FINAL_PACKAGE_DIR, or from the
+# installed torch distribution) with the expected Python, ABI (including free-threaded t
+# suffix) and platform patterns for TARGET_OS. On macOS, check_mac_wheel_minos checks that
+# no bundled dylib needs a newer macOS than the wheel tag claims, using otool. Running the
+# module executes both checks. No import-time side effects beyond constants.
 """Validate wheel platform tags and macOS dylib minos.
 Supports two modes:
 1. Pre-install: reads .whl files from PYTORCH_FINAL_PACKAGE_DIR
@@ -27,6 +33,8 @@ EXPECTED_PLATFORM_TAGS: dict[str, str] = {
 
 
 def _extract_wheel_tags(whl_path: Path) -> list[str]:
+    # [FUNCTION DOC] HELPER: Open the wheel archive and return the values of all lines starting
+    # with the tag prefix in the first WHEEL metadata file; an empty list if none exists.
     """Extract Tag values from the WHEEL metadata file inside a .whl archive."""
     tags = []
     with zipfile.ZipFile(whl_path, "r") as zf:
@@ -41,6 +49,9 @@ def _extract_wheel_tags(whl_path: Path) -> list[str]:
 
 
 def _extract_installed_wheel_tags(package: str = "torch") -> list[str]:
+    # [FUNCTION DOC] HELPER: Read the WHEEL metadata of the installed distribution with the
+    # given name (default torch) and return its tag values; empty if there is no metadata.
+    # Raises if the distribution is not installed.
     """Extract Tag values from an installed package's WHEEL metadata."""
     from importlib.metadata import distribution
 
@@ -56,6 +67,15 @@ def _extract_installed_wheel_tags(package: str = "torch") -> list[str]:
 
 
 def check_wheel_platform_tag() -> None:
+    # [FUNCTION DOC] Compute the expected Python tag, ABI tag (adding a t suffix for
+    # free-threaded builds) and platform regex for the target OS (TARGET_OS or the running
+    # platform, refined for Linux aarch64 and Windows Arm). Skips with a message when the OS has
+    # no pattern, or when no wheel or installed metadata can be read. Otherwise reads tags from
+    # exactly one torch wheel in the package directory or from the installed package, and
+    # raises a runtime error for missing tags, malformed tags, or Python, ABI or platform
+    # mismatches. Prints progress.
+    # KNOWN ISSUE: the docstring says the installed-package mode is soft (warnings), but
+    # mismatches there raise errors as well; only unreadable metadata is skipped.
     """Validate that wheel Tags in WHEEL metadata match the expected platform.
 
     Mode 1: PYTORCH_FINAL_PACKAGE_DIR set → read .whl file (strict, raises on mismatch)
@@ -155,6 +175,10 @@ def check_wheel_platform_tag() -> None:
 
 
 def _check_dylibs_minos(dylibs: list, expected_minos: str, source: str) -> None:
+    # [FUNCTION DOC] HELPER: For each dylib, run otool and find the minimum macOS version
+    # (from the build-version or older version-min load command). Dylibs where otool fails are
+    # skipped. Collect those requiring a higher version than expected_minos and raise a
+    # runtime error listing them; otherwise print a success message naming the source.
     mismatches = []
     for dylib in dylibs:
         try:
@@ -205,6 +229,12 @@ def _check_dylibs_minos(dylibs: list, expected_minos: str, source: str) -> None:
 
 
 def check_mac_wheel_minos() -> None:
+    # [FUNCTION DOC] On macOS only (otherwise returns at once): derive the expected minimum
+    # OS version from each wheel's platform tag in the package directory, extract its dylibs
+    # to a temporary directory and check them; or, without a package directory, take the
+    # version from the installed torch tags and check dylibs in the torch directory. Prints
+    # skip messages when nothing applies; raises a runtime error if the installed torch has no
+    # dylibs or on mismatches.
     if sys.platform != "darwin":
         return
 

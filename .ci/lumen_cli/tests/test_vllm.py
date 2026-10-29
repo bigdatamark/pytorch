@@ -1,3 +1,8 @@
+# [MODULE DOC] Unit tests for the vLLM build and test helpers in cli.lib.core.vllm.vllm_build
+# and vllm_test. Covers VllmBuildParameters validation (env var driven, with patched path and
+# image existence checks), the docker build command text produced by VllmBuildRunner, the
+# runner's clone/prepare/build sequence, and the environment variables set by VllmTestRunner.
+# Tests patch os.environ and collaborators; no import-time side effects beyond imports.
 import os
 import tempfile
 import unittest
@@ -13,6 +18,9 @@ _VLLM_BUILD_MODULE = "cli.lib.core.vllm.vllm_build"
 
 
 class TestVllmBuildParameters(unittest.TestCase):
+    # [CLASS DOC] Tests for VllmBuildParameters: successful normalization of paths and image
+    # from patched environment variables, and error cases for missing wheels path, missing
+    # local base image, missing Dockerfile and an empty output directory.
     @patch(f"{_VLLM_BUILD_MODULE}.local_image_exists", return_value=True)
     @patch(f"{_VLLM_BUILD_MODULE}.is_path_exist", return_value=True)
     @patch(
@@ -39,6 +47,9 @@ class TestVllmBuildParameters(unittest.TestCase):
     def test_params_success_normalizes_and_validates(
         self, mock_env_path, mock_is_path, mock_local_img
     ):
+        # [FUNCTION DOC] With all use-local flags on and existence checks patched to succeed,
+        # builds the parameters and asserts the wheels path, Dockerfile path and output dir are
+        # the normalized absolute paths and the base image comes from the environment.
         params = vllm_build.VllmBuildParameters()
         self.assertEqual(params.torch_whls_path, Path("/abs/dist"))
         self.assertEqual(params.dockerfile_path, Path("/abs/vllm/Dockerfile"))
@@ -50,6 +61,10 @@ class TestVllmBuildParameters(unittest.TestCase):
         os.environ, {"USE_TORCH_WHEEL": "1", "TORCH_WHEELS_PATH": "dist"}, clear=True
     )
     def test_params_missing_torch_whls_raises(self, _is_path):
+        # [FUNCTION DOC] With the path-exists check patched to fail, expects construction to
+        # raise a value error whose message names the wheels path variable.
+        # KNOWN ISSUE: changes the process working directory into a temporary directory that is
+        # deleted afterwards and never restores it.
         with tempfile.TemporaryDirectory() as td:
             os.chdir(td)
             with self.assertRaises(ValueError) as cm:
@@ -65,6 +80,10 @@ class TestVllmBuildParameters(unittest.TestCase):
         os.environ, {"USE_LOCAL_BASE_IMAGE": "1", "BASE_IMAGE": "img:tag"}, clear=True
     )
     def test_params_missing_local_base_image_raises(self, _local_img):
+        # [FUNCTION DOC] With the local image check patched to fail, expects a value error whose
+        # message names the base image variable.
+        # KNOWN ISSUE: changes the process working directory into a temporary directory that is
+        # deleted afterwards and never restores it.
         with tempfile.TemporaryDirectory() as td:
             os.chdir(td)
             with self.assertRaises(ValueError) as cm:
@@ -82,6 +101,10 @@ class TestVllmBuildParameters(unittest.TestCase):
         clear=True,
     )
     def test_params_missing_dockerfile_raises(self, _is_path):
+        # [FUNCTION DOC] With the path-exists check patched to fail, expects a value error whose
+        # message names the Dockerfile path variable.
+        # KNOWN ISSUE: changes the process working directory into a temporary directory that is
+        # deleted afterwards and never restores it.
         with tempfile.TemporaryDirectory() as td:
             os.chdir(td)
             with self.assertRaises(ValueError) as cm:
@@ -99,13 +122,21 @@ class TestVllmBuildParameters(unittest.TestCase):
         clear=True,
     )
     def test_params_missing_output_dir(self, _is_path):
+        # [FUNCTION DOC] With an empty output directory and the path check failing, expects
+        # construction to raise a file-not-found error.
         with self.assertRaises(FileNotFoundError):
             vllm_build.VllmBuildParameters()
 
 
 class TestBuildCmdAndRun(unittest.TestCase):
+    # [CLASS DOC] Tests for VllmBuildRunner: the generated docker build command text and the
+    # run method's orchestration (clone, ensure output dir, generate command, execute).
     @patch(f"{_VLLM_BUILD_MODULE}.local_image_exists", return_value=True)
     def test_generate_docker_build_cmd_includes_bits(self, _exists):
+        # [FUNCTION DOC] Fills a mock parameter object (output dir, local base image, wheels
+        # path, job count, CUDA/Python versions, sccache settings, arch list, target stage, tag)
+        # and asserts the whitespace-normalized command contains the expected output, Dockerfile,
+        # pull, build-arg, target and tag options, with the wheels path reduced to its last part.
         runner = vllm_build.VllmBuildRunner()
         inputs = MagicMock()
         inputs.output_dir = Path("/abs/out")
@@ -161,6 +192,10 @@ class TestBuildCmdAndRun(unittest.TestCase):
     def test_run_calls_clone_prepare_and_build(
         self, mock_gen, mock_clone, mock_ensure, mock_run
     ):
+        # [FUNCTION DOC] With parameters mocked to not use a local Dockerfile or wheels, runs
+        # the runner and asserts clone was called once, the output dir was ensured, the build
+        # command was generated from the parameters, and the command ran once with the working
+        # directory set to vllm (raises an assertion error otherwise).
         params = MagicMock()
         params.output_dir = Path("shared")
         params.use_local_dockerfile = False
@@ -180,6 +215,7 @@ class TestBuildCmdAndRun(unittest.TestCase):
 
 
 class TestVllmTestRunner(unittest.TestCase):
+    # [CLASS DOC] Tests for VllmTestRunner environment preparation.
     @patch.dict(
         os.environ,
         {
@@ -190,6 +226,10 @@ class TestVllmTestRunner(unittest.TestCase):
         clear=True,
     )
     def test_set_envs_disables_custom_op_aliasing_errors(self):
+        # [FUNCTION DOC] Builds a runner from namespace arguments, calls its env-setting method
+        # with parameters carrying an arch list, and asserts the CUDA arch list, HF_TOKEN (copied
+        # from the Hugging Face token variable) and the custom-op aliasing error switch (set to
+        # zero) are present in os.environ. The name is slightly misleading: it covers all three.
         args = SimpleNamespace(
             shard_id=1,
             num_shards=1,

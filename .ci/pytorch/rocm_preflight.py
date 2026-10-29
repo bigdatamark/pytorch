@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Command-line pre-flight check for ROCm/RCCL on distributed CI runners. Spawns
+# up to two ranks (one per visible GPU) that each initialize an NCCL-backend process group on
+# localhost and run a small all_reduce, so a broken GPU topology fails fast with a CI error
+# annotation rather than hanging later. Exit status is zero on success, one on failure. Main
+# entry: main. Import-time side effect: imports torch and defines a 60 second group timeout.
 """Fast ROCm/RCCL pre-flight health check for distributed CI shards.
 
 Some gfx950 runner pods come up with a container that cannot read part of the
@@ -27,6 +32,10 @@ _PG_TIMEOUT = datetime.timedelta(seconds=60)
 
 
 def _worker(rank: int, world_size: int) -> None:
+    # [FUNCTION DOC] HELPER: Per-rank body run by the process spawner. Defaults the master
+    # address and port environment variables, selects the GPU with the rank index, joins the
+    # process group (60 second timeout), all-reduces a small ones tensor, synchronizes, and
+    # always destroys the process group. Exceptions propagate to the spawner.
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29555")
     torch.cuda.set_device(rank)
@@ -42,6 +51,10 @@ def _worker(rank: int, world_size: int) -> None:
 
 
 def main() -> int:
+    # [FUNCTION DOC] Entry point. Counts visible GPUs (prints an error annotation and returns
+    # one if none), spawns the worker on min(2, count) ranks and waits. Any exception is
+    # reported as a CI error annotation with the underlying message and returns one; on
+    # success prints a pass message and returns zero.
     n = torch.cuda.device_count()
     if n < 1:
         print("::error::ROCm pre-flight: no GPUs visible to the container")

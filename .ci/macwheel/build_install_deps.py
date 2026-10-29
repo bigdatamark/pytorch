@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Command-line script (argument: package directory) installing build-time
+# dependencies for the macOS arm64 wheel build: build and runtime requirements, a numpy pin
+# chosen from NUMPY_PINS by the running Python version, an optional spin clean step, and
+# Homebrew libomp when the staged conda-forge libomp directory is absent. Uses pip through
+# the current interpreter with retry/backoff. Main entry: main. No import-time side effects.
 """Install build-time dependencies for the macOS arm64 wheel build.
 
 Usage: build_install_deps.py <package_dir>
@@ -36,6 +41,9 @@ OMP_PREFIX = Path("/opt/llvm-openmp")
 
 
 def retry(cmd: list[str], delays: tuple[int, ...] = (1, 2, 4, 8)) -> None:
+    # [FUNCTION DOC] HELPER: Run the command up to five times, sleeping 1, 2, 4 and 8 seconds
+    # (by default) between attempts, returning on the first zero exit status. If all attempts
+    # fail, terminates the process with the last non-zero exit code.
     """Run cmd, retrying with backoff on failure (mirrors the shell retry helper)."""
     last_rc = 0
     for delay in (0, *delays):
@@ -49,10 +57,14 @@ def retry(cmd: list[str], delays: tuple[int, ...] = (1, 2, 4, 8)) -> None:
 
 
 def pip_install(*args: str) -> None:
+    # [FUNCTION DOC] HELPER: Run pip install with the given arguments via the current Python,
+    # using the retry helper (so failure exits the process).
     retry([sys.executable, "-m", "pip", "install", *args])
 
 
 def numpy_pin() -> str:
+    # [FUNCTION DOC] HELPER: Return the numpy version pinned for the running Python major.minor
+    # version. Exits the process with an explanatory message if the version has no pin.
     version = f"{sys.version_info.major}.{sys.version_info.minor}"
     pin = NUMPY_PINS.get(version)
     if pin is None:
@@ -64,6 +76,9 @@ def numpy_pin() -> str:
 
 
 def preinstall_cp315_build_deps() -> list[str]:
+    # [FUNCTION DOC] HELPER: For Python 3.15 only, install Cython below 3.3.0, a bounded
+    # setuptools and wheel, then return the list containing the no-build-isolation flag so
+    # later installs reuse them. For other versions install nothing and return an empty list.
     """Pin Cython < 3.3.0 for cp315 sdist builds. See pytorch/pytorch#194618."""
     if sys.version_info[:2] != (3, 15):
         return []
@@ -72,6 +87,10 @@ def preinstall_cp315_build_deps() -> list[str]:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point. Changes into the given package directory (process-wide
+    # side effect), installs build requirements, runtime requirements and the pinned numpy,
+    # runs spin clean unless SKIP_SETUP_CLEAN is set (raises on failure), and, when the libomp
+    # directory is missing, installs libomp through brew or exits if brew is unavailable.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("package_dir", type=Path)
     args = parser.parse_args()

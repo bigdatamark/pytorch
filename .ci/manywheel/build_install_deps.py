@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Command-line script (argument: package directory) that installs build-time
+# dependencies for a manylinux wheel build. Changes into the package directory, installs
+# build requirements, conditionally libclang (when a suitable CUPTI header is found and
+# LIBCLANG_PATH is unset), runs spin clean unless SKIP_SETUP_CLEAN is set, installs runtime
+# requirements, a pre-release numpy chosen by Python version, a pinned auditwheel, and runs
+# the AMD source rewrite for ROCm builds. Main entry: main. No import-time side effects.
 """Install build-time dependencies for a PyTorch wheel build.
 
 Usage: build_install_deps.py <package_dir>
@@ -29,6 +35,9 @@ DEFAULT_NUMPY = "2.0.2"
 
 
 def retry(cmd: list[str], delays: tuple[int, ...] = (1, 2, 4, 8)) -> None:
+    # [FUNCTION DOC] HELPER: Run the command up to five times with 1, 2, 4 and 8 second pauses
+    # between attempts; return on the first success, otherwise exit the process with the last
+    # non-zero exit code.
     """Run cmd, retrying with backoff on failure (mirrors the shell retry helper)."""
     last_rc = 0
     for delay in (0, *delays):
@@ -42,10 +51,14 @@ def retry(cmd: list[str], delays: tuple[int, ...] = (1, 2, 4, 8)) -> None:
 
 
 def pip_install(*args: str) -> None:
+    # [FUNCTION DOC] HELPER: pip install the given arguments through the current Python using
+    # the retry helper (exits the process if all attempts fail).
     retry([sys.executable, "-m", "pip", "install", *args])
 
 
 def numpy_pin() -> str:
+    # [FUNCTION DOC] HELPER: Return the numpy version for the running Python: the pin of the
+    # first table entry whose major/minor floor the version meets, else the default pin.
     version = sys.version_info[:2]
     for floor, pin in NUMPY_PINS:
         if version >= floor:
@@ -54,12 +67,17 @@ def numpy_pin() -> str:
 
 
 def is_rocm_py315() -> bool:
+    # [FUNCTION DOC] HELPER: Return true when running Python 3.15 and DESIRED_CUDA contains
+    # the text rocm.
     return sys.version_info[:2] == (3, 15) and "rocm" in os.environ.get(
         "DESIRED_CUDA", ""
     )
 
 
 def prefer_target_python_pkgconfig() -> None:
+    # [FUNCTION DOC] HELPER: If this interpreter has a python3 pkg-config file in its LIBPC
+    # directory, prepend that directory to PKG_CONFIG_PATH in this process so the correct
+    # Python is resolved when numpy is built from source. Does nothing otherwise.
     """Make ``pkg-config python3`` resolve the interpreter we are building for.
 
     cp315 has no numpy wheel, so numpy is built from source. On the ROCm
@@ -81,6 +99,11 @@ def prefer_target_python_pkgconfig() -> None:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point. Parses the package directory, changes into it, applies the
+    # pkg-config workaround for ROCm on Python 3.15, installs requirements, libclang (only if
+    # a CUPTI header probe subprocess succeeds and LIBCLANG_PATH is unset), cleans via spin
+    # (raises on failure) unless skipped, installs numpy and auditwheel, and runs the AMD
+    # build script for ROCm builds. Side effects: cwd and environment changes, subprocesses.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("package_dir", type=Path)
     args = parser.parse_args()

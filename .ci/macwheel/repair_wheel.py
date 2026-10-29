@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Command-line script (arguments: input and output directories) that repairs
+# macOS arm64 wheels with delocate so they bundle their dependency libraries. Installs the
+# pinned delocate release if the tool is missing, then runs it on every wheel in the input
+# directory. Main entries: ensure_delocate, main. No import-time side effects.
 """Repair (delocate) macOS arm64 wheels so they are self-contained.
 
 Usage: repair_wheel.py <input_dir> <output_dir>
@@ -22,6 +26,9 @@ DELOCATE_PIN = "https://github.com/matthew-brett/delocate/archive/refs/tags/0.10
 
 
 def ensure_delocate() -> None:
+    # [FUNCTION DOC] HELPER: If the delocate-wheel executable is not on the path, pip install
+    # the pinned delocate archive using the current Python. Raises a called-process error on
+    # failure.
     if shutil.which("delocate-wheel") is None:
         subprocess.run(
             [sys.executable, "-m", "pip", "install", DELOCATE_PIN], check=True
@@ -29,6 +36,10 @@ def ensure_delocate() -> None:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point. Ensures delocate is available, creates the output directory,
+    # exits with a message if the input directory has no wheels, runs delocate on each wheel
+    # writing into the output directory, and prints how many wheels are there afterwards.
+    # Raises a called-process error if any repair fails.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input_dir", type=Path)
     parser.add_argument("output_dir", type=Path)

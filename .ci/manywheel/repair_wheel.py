@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Command-line script (arguments: input and output directories) that repairs
+# PyTorch wheels built in a manylinux container. For each wheel it unpacks via auditwheel,
+# bundles libgomp and aarch64 BLAS/ACL libraries, optionally bundles ROCm libraries and
+# kernel/db files, rewrites needed-library entries with patchelf, sets RPATHs according to the
+# backend (CUDA, XPU, ROCm wheel layout, ROCm OS layout, CPU), retags the platform to
+# manylinux_2_28 and repacks. Behavior is driven by USE_CUDA, GPU_ARCH_TYPE, GPU_ARCH_VERSION,
+# DESIRED_CUDA, PYTORCH_ROCM_ARCH and ROCM_HOME. Main entry: main. Import-time side effects:
+# imports auditwheel (must be installed) and reads the ROCm version file under ROCM_HOME to
+# decide whether the hipFile library is appended to the module-level ROCm library list.
 """Repair a PyTorch wheel: bundle libgomp + GPU libs, set RPATHs, retag platform.
 
 Uses auditwheel for unpack/repack (not the `wheel` CLI). `wheel pack`/`wheel tags`
@@ -34,6 +43,8 @@ PATCHELF = "/usr/local/bin/patchelf"
 
 
 def wheel_platform_tags(wheel_name: str) -> list[str]:
+    # [FUNCTION DOC] HELPER: Return the list of platform tags from a wheel filename, taken
+    # from the last dash-separated field with the extension removed and split on dots.
     """Platform tags encoded in a wheel filename.
 
     The filename is ``{name}-{version}-{python}-{abi}-{platform}.whl``; the
@@ -46,6 +57,9 @@ def wheel_platform_tags(wheel_name: str) -> list[str]:
 
 @dataclass
 class BundledLib:
+    # [CLASS DOC] HELPER: Plain data record describing a shared library to copy into the
+    # wheel's torch lib directory: source path, destination file name, and an optional
+    # original soname whose needed entries should be rewritten to the destination name.
     """A shared library to copy into torch/lib/ and (optionally) patchelf-rewrite NEEDED entries for."""
 
     src: Path
@@ -55,6 +69,8 @@ class BundledLib:
 
 @dataclass
 class AuxFile:
+    # [CLASS DOC] HELPER: Plain data record for an auxiliary (non-library) file to copy into
+    # the wheel's torch directory: source path and destination path relative to torch.
     """Auxiliary content (e.g. MIOpen db, RCCL algos, gfx kernel files) copied into the wheel."""
 
     src: Path
@@ -62,6 +78,9 @@ class AuxFile:
 
 
 def detect_libgomp() -> Path:
+    # [FUNCTION DOC] HELPER: Return the expected libgomp path for the host: the multiarch
+    # Debian-style path on Ubuntu, otherwise the lib64 path. Reads the os-release file and
+    # raises an OS error if it is missing. Does not check that the library exists.
     """libgomp lives in different places on Ubuntu vs RHEL-family images."""
     arch = platform.machine()
     os_release = Path("/etc/os-release").read_text()
@@ -71,6 +90,11 @@ def detect_libgomp() -> Path:
 
 
 def cuda_rpaths(gpu_arch_version: str) -> str:
+    # [FUNCTION DOC] Build the colon-separated RPATH string for CUDA wheels from the CUDA
+    # version: shared entries for cudnn, nvshmem, nccl and cusparselt, plus a single cu13
+    # directory for CUDA 13 or a list of per-component directories otherwise. Returns text.
+    # KNOWN ISSUE: the cusparselt entry in the per-component list lacks the nvidia segment
+    # unlike all its siblings, which looks like a typo or a legacy path.
     """Build the colon-separated RPATH list for CUDA wheels.
 
     CUDA 13.x bundles all libs under nvidia/cu13/lib; CUDA 12.x ships them
@@ -102,6 +126,8 @@ def cuda_rpaths(gpu_arch_version: str) -> str:
 
 
 def rocm_rpaths() -> str:
+    # [FUNCTION DOC] HELPER: Return the RPATH string pointing at the pip-installed ROCm SDK
+    # directories that sit beside torch in site-packages (used when ROCm is not bundled).
     """RPATH list for the TheRock wheel-based ROCm layout.
 
     ROCm libs come from the `rocm` pip package, which unpacks under
@@ -117,6 +143,9 @@ def rocm_rpaths() -> str:
 
 
 def aarch64_extra_deps(use_cuda: bool) -> list[Path]:
+    # [FUNCTION DOC] Return the existing files among the libraries to bundle on aarch64:
+    # libgfortran, ARM Compute Library libraries (if the build directory exists), and either
+    # NVPL libraries (CUDA) or OpenBLAS (CPU). Missing files are silently skipped.
     """Libraries to bundle into torch/lib/ on aarch64.
 
     CPU builds link against OpenBLAS + libgfortran; CUDA builds link against
@@ -184,6 +213,11 @@ if tuple(int(x) for x in _rocm_version.split(".")[:2] if x.isdigit()) >= (7, 14)
 
 
 def rocm_os_deps() -> list[Path]:
+    # [FUNCTION DOC] HELPER: Return the OS-level library paths (numa, elf, tinfo, dw, drm,
+    # drm_amdgpu) to bundle with ROCm wheels, with locations depending on Ubuntu versus the
+    # RHEL family. Reads the os-release file. Paths are not checked for existence.
+    # KNOWN ISSUE: the Ubuntu paths are hardcoded to the x86_64 multiarch directory, so they
+    # are wrong on other architectures.
     """OS-side runtime deps that must travel with ROCm wheels."""
     os_release = Path("/etc/os-release").read_text()
     if "Ubuntu" in os_release:
@@ -209,6 +243,9 @@ def rocm_os_deps() -> list[Path]:
 
 
 def find_rocm_lib(rocm_home: Path, basename: str) -> Path | None:
+    # [FUNCTION DOC] HELPER: Find a ROCm library file whose name starts with the base name,
+    # searching lib, then lib64, then the whole ROCm tree recursively. Returns the first match
+    # or None.
     """Locate a ROCm library, falling back from lib/ to lib64/ to a wider search."""
     for sub in ("lib", "lib64"):
         for hit in (rocm_home / sub).rglob(basename + "*"):
@@ -221,12 +258,18 @@ def find_rocm_lib(rocm_home: Path, basename: str) -> Path | None:
 
 
 def rocm_arch_filter(arch_list: str) -> list[str]:
+    # [FUNCTION DOC] HELPER: Split a semicolon-separated architecture string into a list,
+    # dropping empty entries.
     return [a for a in arch_list.split(";") if a]
 
 
 def rocm_lib_kernels(
     rocm_home: Path, lib_subdir: str, archs: list[str]
 ) -> list[AuxFile]:
+    # [FUNCTION DOC] HELPER: List kernel files in the library subdirectory of a ROCm library
+    # under lib, skipping files whose names mention a gfx target not in the requested list;
+    # files without a gfx marker are always included. Returns auxiliary-file records with
+    # destinations under lib; returns an empty list if the directory is missing.
     """Per-gfx kernel files under $ROCM_HOME/lib/<lib_subdir>/library/ plus the non-gfx common files."""
     src_dir = rocm_home / "lib" / lib_subdir / "library"
     if not src_dir.is_dir():
@@ -246,6 +289,12 @@ def rocm_lib_kernels(
 def rocm_bundle(
     rocm_home: Path, gpu_arch_version: str
 ) -> tuple[list[BundledLib], list[AuxFile]]:
+    # [FUNCTION DOC] Build the lists of libraries and auxiliary files to bundle for a ROCm
+    # wheel. Libraries come from the fixed ROCm list (plus the smi library when the ROCm
+    # version is 7.2 or older), each found under the ROCm home with its soname rewrite
+    # requested; OS dependencies that exist are added without rewrite. Auxiliary files are
+    # filtered kernel files, MIOpen db files for the architectures, RCCL algorithm files and
+    # the amdgpu ids file. Exits the process if a required ROCm library cannot be found.
     """Build the ROCm bundle spec: shared libs and auxiliary kernel/db files.
 
     Versioned ROCm sonames (libfoo.so.6) get renamed to bare .so to match the
@@ -295,10 +344,14 @@ def rocm_bundle(
 
 
 def patchelf(*args: str) -> None:
+    # [FUNCTION DOC] HELPER: Run the patchelf tool with the given arguments; raises a
+    # called-process error on failure.
     subprocess.run([PATCHELF, *args], check=True)
 
 
 def set_rpath(sofile: Path, rpath: str, force_rpath: bool) -> None:
+    # [FUNCTION DOC] HELPER: Set the RPATH of a shared object with patchelf, adding the force
+    # option when requested (so it becomes RPATH rather than RUNPATH).
     cmd = ["--set-rpath", rpath]
     if force_rpath:
         cmd.append("--force-rpath")
@@ -307,6 +360,9 @@ def set_rpath(sofile: Path, rpath: str, force_rpath: bool) -> None:
 
 
 def replace_needed(unpacked_torch: Path, original: str, replacement: str) -> None:
+    # [FUNCTION DOC] HELPER: For every shared object under the directory, list its needed
+    # entries with patchelf (skipping files patchelf cannot read) and replace each entry equal
+    # to the original name or starting with it plus a dot by the replacement name.
     """Rewrite NEEDED entries that match `original*` to `replacement` across the wheel."""
     for sofile in unpacked_torch.rglob("*.so*"):
         if not sofile.is_file():
@@ -323,6 +379,9 @@ def replace_needed(unpacked_torch: Path, original: str, replacement: str) -> Non
 
 
 def check_no_dangling_bundled_needed(torch_lib: Path) -> None:
+    # [FUNCTION DOC] HELPER: Verify that no shared object in the lib directory needs a
+    # versioned name whose bare-stem file is present but whose exact file is absent. Exits the
+    # process with a message listing the offending pairs; returns normally otherwise.
     """Fail the build if a lib in torch/lib NEEDs a versioned soname of a
     bundled lib without a file of that name in the wheel (a missed
     replace_needed rewrite). Such a reference only resolves against a system
@@ -359,6 +418,14 @@ def repair_wheel(
     lib_so_rpath: str,
     force_rpath: bool,
 ) -> None:
+    # [FUNCTION DOC] Repair one wheel in place of an output copy: open it with the auditwheel
+    # context, copy libgomp and the aarch64 dependencies into torch lib, copy bundled libs
+    # (adding a bare-name symlink for versioned names), rewrite needed entries and check for
+    # dangling ones, copy auxiliary files, set RPATHs on top-level and lib shared objects,
+    # then retag the platform (replacing the old tags). The context repacks on exit. Modifies
+    # the wheel contents; runs patchelf.
+    # KNOWN ISSUE: the libgomp step replaces the needed entry libgomp.so.1 by the identical
+    # name, which has no effect.
     # InWheelCtx unpacks via auditwheel's zip2dir on enter and, once out_wheel is
     # set, regenerates RECORD and repacks via dir2zip on exit. dir2zip uses the
     # stdlib zipfile (correct ZIP64), unlike `wheel pack`/`wheel tags` which
@@ -436,6 +503,11 @@ def repair_wheel(
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point. Parses directories, reads backend settings from the
+    # environment, locates libgomp (exits if absent), chooses RPATHs, force-rpath and the
+    # ROCm bundle by backend (CUDA, XPU, ROCm wheel layout versus OS layout, or CPU), adds
+    # aarch64 dependencies on that architecture, then repairs every wheel found (exits if
+    # none) with the manylinux_2_28 platform tag and prints the count of output wheels.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input_dir", type=Path)
     parser.add_argument("output_dir", type=Path)
