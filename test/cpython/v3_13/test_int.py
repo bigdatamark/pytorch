@@ -3,6 +3,12 @@
 
 # ruff: noqa
 # flake8: noqa
+# [MODULE DOC] Dynamo-patched copy of the CPython 3.13 test_int suite. Covers int() construction
+# from numbers, strings, bytes, memoryviews, __int__/__index__/__trunc__ hooks, bases,
+# underscores, unicode digits, the int/str digit-limit denial-of-service protections and the
+# _pylong helpers. Import-time side effects: installs a RedirectImportFinder at the front of
+# sys.meta_path that maps a few test.* module names to standalone modules, and defines the shared
+# literal tables.
 
 # Test copied from
 # https://raw.githubusercontent.com/python/cpython/refs/tags/v3.13.5/Lib/test/test_int.py
@@ -31,7 +37,13 @@ redirect_imports = (
 )
 
 class RedirectImportFinder(importlib.abc.MetaPathFinder):
+    # [CLASS DOC] HELPER: Meta path finder that redirects selected CPython test.* imports to
+    # top-level modules. Installed in sys.meta_path at import time; stateless.
     def find_spec(self, fullname, path, target=None):
+        # [FUNCTION DOC] HELPER: For a module name listed in redirect_imports, import the same
+        # name without the test. prefix, store the result in sys.modules under the requested name
+        # and return that module's spec. Returns None (let other finders proceed) for other names
+        # or when the import fails with ImportError.
         # Check if the import is the problematic one
         if fullname in redirect_imports:
             try:
@@ -163,11 +175,18 @@ L = [
 ]
 
 class IntSubclass(int):
+    # [CLASS DOC] HELPER: Trivial int subclass used to check that results keep the subclass type.
     pass
 
 class IntTestCases(__TestCase):
+    # [CLASS DOC] Tests for the int() constructor: numeric/string/bytes conversion, bases, error
+    # cases and the __int__, __index__ and __trunc__ protocols.
 
     def test_basic(self):
+        # [FUNCTION DOC] Checks int() on floats (truncation toward zero), strings with whitespace
+        # and signs, the table L, huge values, base 0 prefixes, invalid prefixes and many bases
+        # for 2**32 and 2**32+1; also checks that too many positional arguments raise TypeError
+        # and malformed input raises ValueError.
         self.assertEqual(int(314), 314)
         self.assertEqual(int(3.14), 3)
         # Check that conversion from float truncates towards zero
@@ -354,6 +373,8 @@ class IntTestCases(__TestCase):
         self.assertEqual(int('1z141z5', 36), 4294967297)
 
     def test_invalid_signs(self):
+        # [FUNCTION DOC] Strings with a bare sign, or whitespace between the sign and the digits,
+        # raise ValueError.
         with self.assertRaises(ValueError):
             int('+')
         with self.assertRaises(ValueError):
@@ -366,12 +387,17 @@ class IntTestCases(__TestCase):
             int(' + 1 ')
 
     def test_unicode(self):
+        # [FUNCTION DOC] int() accepts non-ASCII Unicode decimal digits (Devanagari and
+        # Arabic-Indic), with base 0 too.
         self.assertEqual(int("१२३४५६७८९०1234567890"), 12345678901234567890)
         self.assertEqual(int('١٢٣٤٥٦٧٨٩٠'), 1234567890)
         self.assertEqual(int("१२३४५६७८९०1234567890", 0), 12345678901234567890)
         self.assertEqual(int('١٢٣٤٥٦٧٨٩٠', 0), 1234567890)
 
     def test_underscores(self):
+        # [FUNCTION DOC] Valid underscore literals without float or complex markers parse in base
+        # 0 and match their underscore-free value; the invalid list raises ValueError; also checks
+        # base 3, bytes and bad cases.
         for lit in VALID_UNDERSCORE_LITERALS:
             if any(ch in lit for ch in '.eEjJ'):
                 continue
@@ -392,6 +418,8 @@ class IntTestCases(__TestCase):
 
     @support.cpython_only
     def test_small_ints(self):
+        # [FUNCTION DOC] CPython-only: int of small decimal strings and bytes returns the cached
+        # small int objects.
         # Bug #3236: Return small longs from PyLong_FromString
         self.assertIs(int('10'), 10)
         self.assertIs(int('-1'), -1)
@@ -399,9 +427,12 @@ class IntTestCases(__TestCase):
         self.assertIs(int(b'-1'), -1)
 
     def test_no_args(self):
+        # [FUNCTION DOC] int() with no arguments returns 0.
         self.assertEqual(int(), 0)
 
     def test_keyword_args(self):
+        # [FUNCTION DOC] int() accepts base as a keyword; x as a keyword, or base without a value,
+        # raises TypeError.
         # Test invoking int() using keyword arguments.
         self.assertEqual(int('100', base=2), 4)
         with self.assertRaisesRegex(TypeError, 'keyword argument'):
@@ -412,6 +443,8 @@ class IntTestCases(__TestCase):
         self.assertRaises(TypeError, int, base=0)
 
     def test_int_base_limits(self):
+        # [FUNCTION DOC] Bases 2 through 36 and 0 are accepted; out of range bases (1, 37,
+        # negative, huge) raise ValueError.
         """Testing the supported limits of the int() base parameter."""
         self.assertEqual(int('0', 5), 0)
         with self.assertRaises(ValueError):
@@ -429,6 +462,7 @@ class IntTestCases(__TestCase):
             self.assertEqual(int('0', base=base), 0)
 
     def test_int_base_bad_types(self):
+        # [FUNCTION DOC] Non-integer bases such as float values raise TypeError (issue 16772).
         """Not integer types are not valid bases; issue16772."""
         with self.assertRaises(TypeError):
             int('0', 5.5)
@@ -436,10 +470,16 @@ class IntTestCases(__TestCase):
             int('0', 5.0)
 
     def test_int_base_indexable(self):
+        # [FUNCTION DOC] The base may be any object with __index__; out-of-range indexable bases
+        # raise ValueError.
         class MyIndexable(object):
+            # [CLASS DOC] HELPER: Object whose __index__ returns the value passed to
+            # the constructor.
             def __init__(self, value):
+                # [FUNCTION DOC] HELPER: Store value on the instance.
                 self.value = value
             def __index__(self):
+                # [FUNCTION DOC] HELPER: Return the stored value.
                 return self.value
 
         # Check out of range bases.
@@ -453,6 +493,10 @@ class IntTestCases(__TestCase):
         self.assertEqual(int('101', base=MyIndexable(36)), 1 + 36**2)
 
     def test_non_numeric_input_types(self):
+        # [FUNCTION DOC] int() accepts bytes, bytearray, str, memoryview and array subclasses as
+        # text input; a base is allowed only for str/bytes/bytearray (else TypeError) and invalid
+        # text raises ValueError. The one-line helper subclasses CustomStr, CustomBytes and
+        # CustomByteArray are not annotated.
         # Test possible non-numeric types for the argument x, including
         # subclasses of the explicitly documented accepted types.
 
@@ -489,6 +533,8 @@ class IntTestCases(__TestCase):
                     int(f(b'A' * 0x10))
 
     def test_int_memoryview(self):
+        # [FUNCTION DOC] int() of memoryview slices reads only the sliced bytes, ignoring
+        # surrounding data.
         self.assertEqual(int(memoryview(b'123')[1:3]), 23)
         self.assertEqual(int(memoryview(b'123\x00')[1:3]), 23)
         self.assertEqual(int(memoryview(b'123 ')[1:3]), 23)
@@ -496,42 +542,64 @@ class IntTestCases(__TestCase):
         self.assertEqual(int(memoryview(b'1234')[1:3]), 23)
 
     def test_string_float(self):
+        # [FUNCTION DOC] int() of a float-looking string raises ValueError.
         self.assertRaises(ValueError, int, '1.2')
 
     def test_intconversion(self):
+        # [FUNCTION DOC] int() uses __int__ when present, falls back (with DeprecationWarning) to
+        # __trunc__, and raises TypeError for missing methods or non-int results; __trunc__
+        # results may be objects with __index__ or __int__. Loops over old-style and new-style
+        # base classes.
+        # KNOWN ISSUE: the TruncReturnsNonIndex case builds a class but then calls
+        #   TruncReturnsNonInt, so the __int__-only trunc result path is not really exercised.
         # Test __int__()
         class ClassicMissingMethods:
+            # [CLASS DOC] HELPER: Empty class with no conversion methods; int() on it
+            # raises TypeError.
             pass
         self.assertRaises(TypeError, int, ClassicMissingMethods())
 
         class MissingMethods(object):
+            # [CLASS DOC] HELPER: Empty new-style class with no conversion methods.
             pass
         self.assertRaises(TypeError, int, MissingMethods())
 
         class Foo0:
+            # [CLASS DOC] HELPER: Class defining only __int__ returning 42.
             def __int__(self):
+                # [FUNCTION DOC] HELPER: Return 42.
                 return 42
 
         self.assertEqual(int(Foo0()), 42)
 
         class Classic:
+            # [CLASS DOC] HELPER: Empty class used as an alternate base to the object base.
             pass
         for base in (object, Classic):
             class IntOverridesTrunc(base):
+                # [CLASS DOC] HELPER: Class with both __int__ (42) and __trunc__ (-12); __int__
+                # must win.
                 def __int__(self):
+                    # [FUNCTION DOC] HELPER: Return 42.
                     return 42
                 def __trunc__(self):
+                    # [FUNCTION DOC] HELPER: Return -12.
                     return -12
             self.assertEqual(int(IntOverridesTrunc()), 42)
 
             class JustTrunc(base):
+                # [CLASS DOC] HELPER: Class with only __trunc__ returning 42
+                # (deprecated fallback).
                 def __trunc__(self):
+                    # [FUNCTION DOC] HELPER: Return 42.
                     return 42
             with self.assertWarns(DeprecationWarning):
                 self.assertEqual(int(JustTrunc()), 42)
 
             class ExceptionalTrunc(base):
+                # [CLASS DOC] HELPER: Class whose __trunc__ raises ZeroDivisionError.
                 def __trunc__(self):
+                    # [FUNCTION DOC] HELPER: Raise ZeroDivisionError by dividing by zero.
                     1 / 0
             with self.assertRaises(ZeroDivisionError), \
                  self.assertWarns(DeprecationWarning):
@@ -539,32 +607,49 @@ class IntTestCases(__TestCase):
 
             for trunc_result_base in (object, Classic):
                 class Index(trunc_result_base):
+                    # [CLASS DOC] HELPER: Class with __index__ returning 42; used as a
+                    # __trunc__ result.
                     def __index__(self):
+                        # [FUNCTION DOC] HELPER: Return 42.
                         return 42
 
                 class TruncReturnsNonInt(base):
+                    # [CLASS DOC] HELPER: Class whose __trunc__ returns an Index instance.
                     def __trunc__(self):
+                        # [FUNCTION DOC] HELPER: Return a new Index object.
                         return Index()
                 with self.assertWarns(DeprecationWarning):
                     self.assertEqual(int(TruncReturnsNonInt()), 42)
 
                 class Intable(trunc_result_base):
+                    # [CLASS DOC] HELPER: Class with __int__ returning 42; used as a
+                    # __trunc__ result.
                     def __int__(self):
+                        # [FUNCTION DOC] HELPER: Return 42.
                         return 42
 
                 class TruncReturnsNonIndex(base):
+                    # [CLASS DOC] HELPER: Class whose __trunc__ returns an Intable instance (see
+                    # KNOWN ISSUE on the test).
                     def __trunc__(self):
+                        # [FUNCTION DOC] HELPER: Return a new Intable object.
                         return Intable()
                 with self.assertWarns(DeprecationWarning):
                     self.assertEqual(int(TruncReturnsNonInt()), 42)
 
                 class NonIntegral(trunc_result_base):
+                    # [CLASS DOC] HELPER: Class whose __trunc__ returns another instance of itself
+                    # (not an integer).
                     def __trunc__(self):
+                        # [FUNCTION DOC] HELPER: Return a new NonIntegral instance, which would
+                        # recurse if int() followed it.
                         # Check that we avoid infinite recursion.
                         return NonIntegral()
 
                 class TruncReturnsNonIntegral(base):
+                    # [CLASS DOC] HELPER: Class whose __trunc__ returns a NonIntegral instance.
                     def __trunc__(self):
+                        # [FUNCTION DOC] HELPER: Return a new NonIntegral instance.
                         return NonIntegral()
                 try:
                     with self.assertWarns(DeprecationWarning):
@@ -579,11 +664,15 @@ class IntTestCases(__TestCase):
 
                 # Regression test for bugs.python.org/issue16060.
                 class BadInt(trunc_result_base):
+                    # [CLASS DOC] HELPER: Class whose __int__ returns a float (invalid).
                     def __int__(self):
+                        # [FUNCTION DOC] HELPER: Return 42.0, a float.
                         return 42.0
 
                 class TruncReturnsBadInt(base):
+                    # [CLASS DOC] HELPER: Class whose __trunc__ returns a BadInt instance.
                     def __trunc__(self):
+                        # [FUNCTION DOC] HELPER: Return a new BadInt instance.
                         return BadInt()
 
                 with self.assertRaises(TypeError), \
@@ -591,12 +680,18 @@ class IntTestCases(__TestCase):
                     int(TruncReturnsBadInt())
 
     def test_int_subclass_with_index(self):
+        # [FUNCTION DOC] For an int subclass whose __index__ returns 42, int() and equality use
+        # the real value 7; a subclass with a non-int __index__ still converts to 0.
         class MyIndex(int):
+            # [CLASS DOC] HELPER: int subclass whose __index__ returns 42.
             def __index__(self):
+                # [FUNCTION DOC] HELPER: Return 42.
                 return 42
 
         class BadIndex(int):
+            # [CLASS DOC] HELPER: int subclass whose __index__ returns a float (invalid).
             def __index__(self):
+                # [FUNCTION DOC] HELPER: Return 42.0.
                 return 42.0
 
         my_int = MyIndex(7)
@@ -606,12 +701,18 @@ class IntTestCases(__TestCase):
         self.assertEqual(int(BadIndex()), 0)
 
     def test_int_subclass_with_int(self):
+        # [FUNCTION DOC] For an int subclass overriding __int__, int() returns the override (42);
+        # an override returning a float raises TypeError.
         class MyInt(int):
+            # [CLASS DOC] HELPER: int subclass whose __int__ returns 42.
             def __int__(self):
+                # [FUNCTION DOC] HELPER: Return 42.
                 return 42
 
         class BadInt(int):
+            # [CLASS DOC] HELPER: int subclass whose __int__ returns a float (invalid).
             def __int__(self):
+                # [FUNCTION DOC] HELPER: Return 42.0.
                 return 42.0
 
         my_int = MyInt(7)
@@ -623,32 +724,49 @@ class IntTestCases(__TestCase):
         self.assertRaises(TypeError, int, my_int)
 
     def test_int_returns_int_subclass(self):
+        # [FUNCTION DOC] When __index__, __int__ or __trunc__ return bool (an int subclass), int()
+        # warns with DeprecationWarning and returns exact int 1; a non-int through trunc raises
+        # TypeError; the int subclass constructor keeps its own type.
         class BadIndex:
+            # [CLASS DOC] HELPER: Class whose __index__ returns True.
             def __index__(self):
+                # [FUNCTION DOC] HELPER: Return True.
                 return True
 
         class BadIndex2(int):
+            # [CLASS DOC] HELPER: int subclass whose __index__ returns True.
             def __index__(self):
+                # [FUNCTION DOC] HELPER: Return True.
                 return True
 
         class BadInt:
+            # [CLASS DOC] HELPER: Class whose __int__ returns True.
             def __int__(self):
+                # [FUNCTION DOC] HELPER: Return True.
                 return True
 
         class BadInt2(int):
+            # [CLASS DOC] HELPER: int subclass whose __int__ returns True.
             def __int__(self):
+                # [FUNCTION DOC] HELPER: Return True.
                 return True
 
         class TruncReturnsBadIndex:
+            # [CLASS DOC] HELPER: Class whose __trunc__ returns a BadIndex instance.
             def __trunc__(self):
+                # [FUNCTION DOC] HELPER: Return a new BadIndex.
                 return BadIndex()
 
         class TruncReturnsBadInt:
+            # [CLASS DOC] HELPER: Class whose __trunc__ returns a BadInt instance.
             def __trunc__(self):
+                # [FUNCTION DOC] HELPER: Return a new BadInt.
                 return BadInt()
 
         class TruncReturnsIntSubclass:
+            # [CLASS DOC] HELPER: Class whose __trunc__ returns True.
             def __trunc__(self):
+                # [FUNCTION DOC] HELPER: Return True.
                 return True
 
         bad_int = BadIndex()
@@ -696,7 +814,12 @@ class IntTestCases(__TestCase):
 
     @skipIfTorchDynamo("flaky under dynamo")
     def test_error_message(self):
+        # [FUNCTION DOC] Invalid-literal ValueError messages name the base and repr of the input
+        # for odd whitespace, embedded NULs, undecodable bytes and lone surrogates. Skipped under
+        # Dynamo as flaky.
         def check(s, base=None):
+            # [FUNCTION DOC] HELPER: Assert int(s) or int(s, base) raises ValueError with the
+            # standard invalid literal message (base 10 when base is None).
             with self.assertRaises(ValueError,
                                    msg="int(%r, %r)" % (s, base)) as cm:
                 if base is None:
@@ -729,6 +852,8 @@ class IntTestCases(__TestCase):
         check('123\ud800', 10)
 
     def test_issue31619(self):
+        # [FUNCTION DOC] Underscore-separated digits parse correctly in bases 2, 8, 16 and 32
+        # (issue 31619).
         self.assertEqual(int('1_0_1_0_1_0_1_0_1_0_1_0_1_0_1_0_1_0_1_0_1_0_1_0_1_0_1_0_1_0_1', 2),
                          0b1010101010101010101010101010101)
         self.assertEqual(int('1_2_3_4_5_6_7_0_1_2_3', 8), 0o12345670123)
@@ -737,19 +862,26 @@ class IntTestCases(__TestCase):
 
 
 class IntStrDigitLimitsTests(__TestCase):
+    # [CLASS DOC] Tests for the interpreter int-to-str digit limit on int_class (int by default,
+    # overridable). setUp lowers the limit to 2048 and tearDown restores the previous value.
 
     int_class = int  # Override this in subclasses to reuse the suite.
 
     def setUp(self):
+        # [FUNCTION DOC] Save the current max str digits limit in _previous_limit and set it
+        # to 2048.
         super().setUp()
         self._previous_limit = sys.get_int_max_str_digits()
         sys.set_int_max_str_digits(2048)
 
     def tearDown(self):
+        # [FUNCTION DOC] Restore the saved max str digits limit, then run base tearDown.
         sys.set_int_max_str_digits(self._previous_limit)
         super().tearDown()
 
     def test_disabled_limit(self):
+        # [FUNCTION DOC] Disabling the limit allows a 20000 digit conversion; the limit is
+        # restored afterwards.
         self.assertGreater(sys.get_int_max_str_digits(), 0)
         self.assertLess(sys.get_int_max_str_digits(), 20_000)
         with support.adjust_int_max_str_digits(0):
@@ -759,6 +891,8 @@ class IntStrDigitLimitsTests(__TestCase):
         self.assertGreater(sys.get_int_max_str_digits(), 0)
 
     def test_max_str_digits_edge_cases(self):
+        # [FUNCTION DOC] Strings of exactly the max number of digits parse, ignoring sign
+        # and whitespace.
         """Ignore the +/- sign and space padding."""
         int_class = self.int_class
         maxdigits = sys.get_int_max_str_digits()
@@ -771,6 +905,8 @@ class IntStrDigitLimitsTests(__TestCase):
         self.assertEqual(len(str(10 ** (maxdigits - 1))), maxdigits)
 
     def check(self, i, base=None):
+        # [FUNCTION DOC] HELPER: Assert constructing int_class from i (with optional base)
+        # raises ValueError.
         with self.assertRaises(ValueError):
             if base is None:
                 self.int_class(i)
@@ -778,6 +914,8 @@ class IntStrDigitLimitsTests(__TestCase):
                 self.int_class(i, base)
 
     def test_max_str_digits(self):
+        # [FUNCTION DOC] One digit over the limit raises ValueError, also for str()
+        # of 10**maxdigits.
         maxdigits = sys.get_int_max_str_digits()
 
         self.check('1' * (maxdigits + 1))
@@ -792,6 +930,9 @@ class IntStrDigitLimitsTests(__TestCase):
             str(i)
 
     def test_denial_of_service_prevented_int_to_str(self):
+        # [FUNCTION DOC] Converting a huge int to str fails quickly at the limit, much faster than
+        # the full conversion; skipped when the baseline is too fast to time. Uses CPU
+        # stopwatches; asserts maxdigits is small.
         """Regression test: ensure we fail before performing O(N**2) work."""
         maxdigits = sys.get_int_max_str_digits()
         assert maxdigits < 50_000, maxdigits  # A test prerequisite.
@@ -832,6 +973,8 @@ class IntStrDigitLimitsTests(__TestCase):
         self.assertLess(sw_fail_extra_huge.seconds, sw_convert.seconds/2)
 
     def test_denial_of_service_prevented_str_to_int(self):
+        # [FUNCTION DOC] Parsing a huge decimal string fails quickly at the limit; timing based
+        # like the int to str test and skipped if the baseline conversion is too fast to measure.
         """Regression test: ensure we fail before performing O(N**2) work."""
         maxdigits = sys.get_int_max_str_digits()
         assert maxdigits < 100_000, maxdigits  # A test prerequisite.
@@ -869,6 +1012,7 @@ class IntStrDigitLimitsTests(__TestCase):
         self.assertLessEqual(sw_fail_extra_huge.seconds, sw_convert.seconds/2)
 
     def test_power_of_two_bases_unlimited(self):
+        # [FUNCTION DOC] Power of two bases ignore the digit limit for parsing.
         """The limit does not apply to power of 2 bases."""
         maxdigits = sys.get_int_max_str_digits()
 
@@ -879,6 +1023,8 @@ class IntStrDigitLimitsTests(__TestCase):
                 self.int_class('1' * 100_000, base)
 
     def test_underscores_ignored(self):
+        # [FUNCTION DOC] Underscores do not count toward the digit limit; one extra digit
+        # still fails.
         maxdigits = sys.get_int_max_str_digits()
 
         triples = maxdigits // 3
@@ -890,6 +1036,7 @@ class IntStrDigitLimitsTests(__TestCase):
         self.check(f'{s_}_111')
 
     def test_sign_not_counted(self):
+        # [FUNCTION DOC] A leading plus or minus sign does not count toward the digit limit.
         int_class = self.int_class
         max_digits = sys.get_int_max_str_digits()
         s = '5' * max_digits
@@ -902,6 +1049,8 @@ class IntStrDigitLimitsTests(__TestCase):
         str(neg_i)
 
     def _other_base_helper(self, base):
+        # [FUNCTION DOC] HELPER: With digits of 2 at the limit in a given base, parsing works and
+        # str() fails for bases above 10; one extra digit makes parsing raise ValueError.
         int_class = self.int_class
         max_digits = sys.get_int_max_str_digits()
         s = '2' * max_digits
@@ -915,6 +1064,7 @@ class IntStrDigitLimitsTests(__TestCase):
             int_class(f'{s}1', base)
 
     def test_int_from_other_bases(self):
+        # [FUNCTION DOC] Runs the other base helper for bases 3 and 36.
         base = 3
         with self.subTest(base=base):
             self._other_base_helper(base)
@@ -923,6 +1073,8 @@ class IntStrDigitLimitsTests(__TestCase):
             self._other_base_helper(base)
 
     def test_int_max_str_digits_is_per_interpreter(self):
+        # [FUNCTION DOC] A subinterpreter sets its own limit of 2323 and enforces it; the parent
+        # limit is unchanged.
         # Changing the limit in one interpreter does not change others.
         code = """if 1:
         # Subinterpreters maintain and enforce their own limit
@@ -944,23 +1096,30 @@ class IntStrDigitLimitsTests(__TestCase):
 
 
 class IntSubclassStrDigitLimitsTests(IntStrDigitLimitsTests):
+    # [CLASS DOC] Repeats IntStrDigitLimitsTests using IntSubclass as the int class.
     int_class = IntSubclass
 
 
 class PyLongModuleTests(__TestCase):
+    # [CLASS DOC] Tests of large-number conversion paths (the _pylong module) with the digit limit
+    # disabled in setUp and restored in tearDown.
     # Tests of the functions in _pylong.py.  Those get used when the
     # number of digits in the input values are large enough.
 
     def setUp(self):
+        # [FUNCTION DOC] Save the max str digits limit and disable it (set to 0).
         super().setUp()
         self._previous_limit = sys.get_int_max_str_digits()
         sys.set_int_max_str_digits(0)
 
     def tearDown(self):
+        # [FUNCTION DOC] Restore the saved max str digits limit, then run base tearDown.
         sys.set_int_max_str_digits(self._previous_limit)
         super().tearDown()
 
     def _test_pylong_int_to_decimal(self, n, suffix):
+        # [FUNCTION DOC] HELPER: Check str, negated str, percent d formatting and bytes formatting
+        # of n agree and that the last ten digits equal suffix.
         s = str(n)
         self.assertEqual(s[-10:], suffix)
         s2 = str(-n)
@@ -971,6 +1130,8 @@ class PyLongModuleTests(__TestCase):
         self.assertEqual(s4, s.encode('ascii'))
 
     def test_pylong_int_to_decimal(self):
+        # [FUNCTION DOC] Checks decimal conversion of several large powers against known
+        # last digits.
         self._test_pylong_int_to_decimal((1 << 100_000), '9883109376')
         self._test_pylong_int_to_decimal((1 << 100_000) - 1, '9883109375')
         self._test_pylong_int_to_decimal(10**30_000, '0000000000')
@@ -979,16 +1140,22 @@ class PyLongModuleTests(__TestCase):
 
     @support.requires_resource('cpu')
     def test_pylong_int_to_decimal_2(self):
+        # [FUNCTION DOC] Same check for much larger numbers; only runs when the cpu resource
+        # is enabled.
         self._test_pylong_int_to_decimal(2**1_000_000, '2747109376')
         self._test_pylong_int_to_decimal(10**300_000, '0000000000')
         self._test_pylong_int_to_decimal(3**600_000, '3132000001')
 
     def test_pylong_int_divmod(self):
+        # [FUNCTION DOC] divmod of a large number by its power of two base gives the expected
+        # quotient and remainder.
         n = (1 << 100_000)
         a, b = divmod(n*3 + 1, n)
         assert a == 3 and b == 1
 
     def test_pylong_str_to_int(self):
+        # [FUNCTION DOC] Large decimal strings round trip, accept sign/whitespace and reject
+        # trailing letters or underscores, raising ValueError.
         v1 = 1 << 100_000
         s = str(v1)
         v2 = int(s)
@@ -1009,6 +1176,9 @@ class PyLongModuleTests(__TestCase):
     @mock.patch.object(_pylong, "int_to_decimal_string")
     def test_pylong_misbehavior_error_path_to_str(
             self, mock_int_to_str):
+        # [FUNCTION DOC] CPython-only: when the mocked _pylong.int_to_decimal_string returns a
+        # non-str, str() raises TypeError; when it raises RuntimeError, that propagates. Skipped
+        # without _pylong.
         with support.adjust_int_max_str_digits(20_000):
             big_value = int('7'*19_999)
             mock_int_to_str.return_value = None  # not a str
@@ -1025,6 +1195,9 @@ class PyLongModuleTests(__TestCase):
     @mock.patch.object(_pylong, "int_from_string")
     def test_pylong_misbehavior_error_path_from_str(
             self, mock_int_from_str):
+        # [FUNCTION DOC] CPython-only: when the mocked _pylong.int_from_string returns a
+        # non-int, int() raises TypeError; when it raises RuntimeError, that propagates. Skipped
+        # without _pylong.
         big_value = '7'*19_999
         with support.adjust_int_max_str_digits(20_000):
             mock_int_from_str.return_value = b'not an int'
@@ -1038,6 +1211,8 @@ class PyLongModuleTests(__TestCase):
                 int(big_value)
 
     def test_pylong_roundtrip(self):
+        # [FUNCTION DOC] Random large numbers of growing bit lengths round trip through str and
+        # int, without a leading zero.
         from random import randrange, getrandbits
         bits = 5000
         while bits <= 1_000_000:

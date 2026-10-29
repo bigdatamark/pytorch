@@ -3,6 +3,11 @@
 
 # ruff: noqa
 # flake8: noqa
+# [MODULE DOC] Dynamo-patched copy of the CPython 3.13 test_int_literal suite. Checks that
+# hexadecimal, octal and binary integer literals evaluate to the expected values at the 32-bit and
+# 64-bit signed and unsigned boundaries, with and without a leading minus sign. Import-time side
+# effects: installs a RedirectImportFinder at the front of sys.meta_path that maps a few test.*
+# module names to standalone modules.
 
 # Test copied from
 # https://raw.githubusercontent.com/python/cpython/refs/tags/v3.13.5/Lib/test/test_int_literal.py
@@ -31,7 +36,13 @@ redirect_imports = (
 )
 
 class RedirectImportFinder(importlib.abc.MetaPathFinder):
+    # [CLASS DOC] HELPER: Meta path finder that redirects selected CPython test.* imports to
+    # top-level modules. Installed in sys.meta_path at import time; stateless.
     def find_spec(self, fullname, path, target=None):
+        # [FUNCTION DOC] HELPER: For a module name listed in redirect_imports, import the same
+        # name without the test. prefix, store the result in sys.modules under the requested name
+        # and return that module's spec. Returns None (let other finders proceed) for other names
+        # or when the import fails with ImportError.
         # Check if the import is the problematic one
         if fullname in redirect_imports:
             try:
@@ -60,8 +71,12 @@ This is complex because of changes due to PEP 237.
 import unittest
 
 class TestHexOctBin(__TestCase):
+    # [CLASS DOC] Tests that hex, octal and binary literals equal their decimal values, including
+    # negated forms with and without parentheses. Methods take no fixtures.
 
     def test_hex_baseline(self):
+        # [FUNCTION DOC] Hex literals up to the largest signed 64-bit value equal their decimal
+        # values, in upper and lower case prefix, plain and negated.
         # A few upper/lowercase tests
         self.assertEqual(0x0, 0X0)
         self.assertEqual(0x1, 0X1)
@@ -83,6 +98,8 @@ class TestHexOctBin(__TestCase):
         self.assertEqual(-0x7fffffffffffffff, -9223372036854775807)
 
     def test_hex_unsigned(self):
+        # [FUNCTION DOC] Hex literals at the unsigned 32-bit and 64-bit limits equal their decimal
+        # values, plain and negated (historically broken without parentheses).
         # Positive constants
         self.assertEqual(0x80000000, 2147483648)
         self.assertEqual(0xffffffff, 4294967295)
@@ -106,6 +123,8 @@ class TestHexOctBin(__TestCase):
         self.assertEqual(-0xffffffffffffffff, -18446744073709551615)
 
     def test_oct_baseline(self):
+        # [FUNCTION DOC] Octal literals up to the largest signed 64-bit value equal their decimal
+        # values, in both prefix cases, plain and negated.
         # A few upper/lowercase tests
         self.assertEqual(0o0, 0O0)
         self.assertEqual(0o1, 0O1)
@@ -127,6 +146,8 @@ class TestHexOctBin(__TestCase):
         self.assertEqual(-0o777777777777777777777, -9223372036854775807)
 
     def test_oct_unsigned(self):
+        # [FUNCTION DOC] Octal literals at the unsigned 32-bit and 64-bit limits equal their
+        # decimal values, plain and negated.
         # Positive constants
         self.assertEqual(0o20000000000, 2147483648)
         self.assertEqual(0o37777777777, 4294967295)
@@ -150,6 +171,8 @@ class TestHexOctBin(__TestCase):
         self.assertEqual(-0o1777777777777777777777, -18446744073709551615)
 
     def test_bin_baseline(self):
+        # [FUNCTION DOC] Binary literals up to the largest signed 64-bit value equal their decimal
+        # values, in both prefix cases, plain and negated.
         # A few upper/lowercase tests
         self.assertEqual(0b0, 0B0)
         self.assertEqual(0b1, 0B1)
@@ -171,6 +194,8 @@ class TestHexOctBin(__TestCase):
         self.assertEqual(-0b111111111111111111111111111111111111111111111111111111111111111, -9223372036854775807)
 
     def test_bin_unsigned(self):
+        # [FUNCTION DOC] Binary literals at the unsigned 32-bit and 64-bit limits equal their
+        # decimal values, plain and negated.
         # Positive constants
         self.assertEqual(0b10000000000000000000000000000000, 2147483648)
         self.assertEqual(0b11111111111111111111111111111111, 4294967295)
