@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC] Generates the RPC test suites for the faulty (fault-injection) RPC agent. At
+# import time it exits with status 0 when torch.distributed is unavailable; otherwise, unless
+# running in CI on a machine with CUDA, it injects into the module globals the test classes
+# built by generate_tests from FaultyRpcAgentTestFixture and FAULTY_AGENT_TESTS.
 import sys
 
 import torch

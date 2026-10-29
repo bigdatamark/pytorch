@@ -1,6 +1,14 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC] Tests for PipelineStage construction and runtime behavior. Contains a CPU
+# single-process test of metadata inference restoring module buffers, two forward-hook
+# factories used to corrupt stage outputs, a multi-process GPU test class (tracer, tracer with
+# kwargs, manual stage building, custom weight-gradient builder, output chunk memory) and a
+# negative test class (shape/dtype mismatch errors, dw_builder misuse). Module constants: d_hid
+# 512, batch_size 256, chunks 8; device_type and backend come from the current accelerator
+# (cpu if none). Import-time side effect: seeds torch with 0 and registers the parametrized
+# StageTest tests.
 import os
 import tempfile
 
@@ -41,15 +49,28 @@ torch.manual_seed(0)
 
 
 class PipelineStageMetadataInferenceTest(TestCase):
+    # [CLASS DOC] Single-process (gloo, world size 1) test of dynamic metadata inference.
     def test_dynamic_metadata_inference_restores_module_buffers(self):
+        # [FUNCTION DOC] Builds a one-stage GPipe schedule over a module whose forward bumps a
+        # counter buffer and whose output hook bumps it again in backward. Initializes a file
+        # based gloo group if none exists (destroyed afterwards), calls the schedule's private
+        # _initialize_stage with an input requiring grad and a target, then asserts the counter
+        # and scale buffers equal their initial values (inference must restore buffers).
         class BufferMutatingModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a Linear layer and counter and scale buffers;
+            # forward mutates counter without grad and, when output requires grad, registers a
+            # backward hook that also mutates counter. Used to detect un-restored buffers.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates a 4x4 Linear and buffers counter (zeros) and
+                # scale (ones), both of size 4.
                 super().__init__()
                 self.linear = torch.nn.Linear(4, 4)
                 self.register_buffer("counter", torch.zeros(4))
                 self.register_buffer("scale", torch.ones(4))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Adds 1 to counter without grad, returns linear(x)
+                # times scale, and attaches the backward hook if the output requires grad.
                 with torch.no_grad():
                     self.counter.add_(1)
                 out = self.linear(x) * self.scale
@@ -58,6 +79,8 @@ class PipelineStageMetadataInferenceTest(TestCase):
                 return out
 
             def _backward_hook(self, grad):
+                # [FUNCTION DOC] HELPER: Gradient hook that adds 10 to counter without grad and
+                # returns the gradient unchanged.
                 with torch.no_grad():
                     self.counter.add_(10)
                 return grad
@@ -104,10 +127,15 @@ class PipelineStageMetadataInferenceTest(TestCase):
 
 
 def get_dtype_change_hook(new_dtype):
+    # [FUNCTION DOC] HELPER: Returns a forward hook that casts every tensor in the module
+    # output (any pytree) to new_dtype, simulating mixed precision.
     """A simple hook for simulating mixed precision"""
 
     def dtype_change_hook(module, input, output):
+        # [FUNCTION DOC] HELPER: Forward hook returning output with all tensors cast to
+        # new_dtype; module and input are ignored.
         def f(x):
+            # [FUNCTION DOC] HELPER: Casts tensor x to new_dtype.
             return x.to(new_dtype)
 
         return tree_map_only(torch.Tensor, f, output)
@@ -116,10 +144,15 @@ def get_dtype_change_hook(new_dtype):
 
 
 def get_flatten_hook():
+    # [FUNCTION DOC] HELPER: Returns a forward hook that flattens every tensor in the module
+    # output to one dimension, simulating a wrong output shape.
     """A simple hook for simulating wrong model output shape"""
 
     def flatten_hook(module, input, output):
+        # [FUNCTION DOC] HELPER: Forward hook returning output with all tensors flattened;
+        # module and input are ignored.
         def f(x):
+            # [FUNCTION DOC] HELPER: Flattens tensor x.
             return x.flatten()
 
         return tree_map_only(torch.Tensor, f, output)
@@ -128,17 +161,24 @@ def get_flatten_hook():
 
 
 class StageTest(MultiProcContinuousTest):
+    # [CLASS DOC] Multi-process continuous test (one rank per accelerator, world size from the
+    # harness) for PipelineStage with a GPipe schedule. Provides backend and device hooks
+    # and tests that need NCCL/XCCL and 2+ accelerators.
     @classmethod
     def backend_str(cls) -> str:
+        # [FUNCTION DOC] HELPER: Returns the module-level distributed backend name.
         # Testing with NCCL backend
         return backend
 
     @classmethod
     def device_type(cls) -> str:
+        # [FUNCTION DOC] HELPER: Returns the module-level device type string.
         return device_type
 
     @property
     def device(self) -> torch.device:
+        # [FUNCTION DOC] HELPER: Returns the device for this rank (device type with the rank
+        # as index).
         return torch.device(device_type, self.rank)
 
     @requires_accelerator_dist_backend(["nccl", "xccl"])
@@ -147,6 +187,11 @@ class StageTest(MultiProcContinuousTest):
     )
     @parametrize("ModelClass", [ExampleCode, MultiMLP])
     def test_tracer(self, ModelClass):
+        # [FUNCTION DOC] Parametrized over ExampleCode and MultiMLP. Traces the model with
+        # pipeline, builds this rank's stage via pipe.build_stage, runs a GPipe schedule
+        # (rank 0 feeds the input) and on the last rank compares output to eager (loose
+        # tolerances). Raises AssertionError if stage state_dict keys are not a subset of the
+        # original model keys.
         mod = ModelClass(d_hid, self.world_size)
         mod.to(self.device)
 
@@ -170,6 +215,8 @@ class StageTest(MultiProcContinuousTest):
 
         # Run
         def _run_step(x):
+            # [FUNCTION DOC] HELPER: Rank 0 steps the schedule with x; other ranks step with
+            # no input. Returns the step result.
             if self.rank == 0:
                 return schedule.step(x)
             else:
@@ -196,6 +243,10 @@ class StageTest(MultiProcContinuousTest):
     )
     @parametrize("ModelClass", [ModelWithKwargs])
     def test_tracer_kwargs(self, ModelClass):
+        # [FUNCTION DOC] Like test_tracer but for ModelWithKwargs: traces with a keyword
+        # microbatch argument y, builds the stage with build_stage from the stage module and
+        # pipe info, runs the schedule (rank 0 passes x and y), compares the last rank output
+        # to eager, and checks stage state_dict keys are a subset of the original keys.
         mod = ModelClass(d_hid, self.world_size)
         mod.to(self.device)
 
@@ -249,6 +300,8 @@ class StageTest(MultiProcContinuousTest):
         not TEST_MULTIACCELERATOR, f"{backend} test requires 2+ GPUs"
     )
     def test_manual(self):
+        # [FUNCTION DOC] Builds a PipelineStage manually from the rank-th layer of a MultiMLP,
+        # runs a GPipe schedule over chunks and compares the last rank output to eager.
         full_mod = MultiMLP(d_hid, n_layers=self.world_size)
         full_mod.to(self.device)
         stage_mod = full_mod.get_submodule(f"layers.{self.rank}")
@@ -267,6 +320,7 @@ class StageTest(MultiProcContinuousTest):
 
         # Run
         def _run_step(x):
+            # [FUNCTION DOC] HELPER: Rank 0 steps the schedule with x; others step with none.
             if self.rank == 0:
                 return schedule.step(x)
             else:
@@ -283,6 +337,9 @@ class StageTest(MultiProcContinuousTest):
         not TEST_MULTIACCELERATOR, f"{backend} test requires 2+ GPUs"
     )
     def test_custom_dw_with_fb_schedule(self):
+        # [FUNCTION DOC] Gives the stage a dw_builder from a counting helper object and runs
+        # GPipe with MSE loss (sum). Asserts the weight-gradient runner was invoked once per
+        # chunk (the counter equals chunks) and that the last rank output matches eager.
         """Tests that separate weight grad function 'dw_runner' gets run under a schedule that's only aware of F/B."""
         full_mod = MultiMLP(d_hid, n_layers=self.world_size)
         full_mod.to(self.device)
@@ -292,15 +349,20 @@ class StageTest(MultiProcContinuousTest):
         target = torch.randn(batch_size, d_hid, device=self.device)
 
         class CustomState:
+            # [CLASS DOC] HELPER: Holds a call counter i that dw_runner increments.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Initializes the counter i to 0.
                 self.i = 0
 
             def dw_builder(self):
+                # [FUNCTION DOC] HELPER: Returns a new dw_runner closure that prints and
+                # increments the call counter each time it is called.
                 """This simulates a function attached to a model with a custom backward.
                 Each call to builder gives a new dw_runner that has some updated state to compute the latest dw.
                 """
 
                 def dw_runner():
+                    # [FUNCTION DOC] HELPER: Prints the current call count and increments it.
                     # This inner function would be called by PipelineStage during `backward_weight_one_chunk`
                     print(f"dw called {self.i}th time")
                     self.i += 1
@@ -324,6 +386,8 @@ class StageTest(MultiProcContinuousTest):
 
         # Run
         def _run_step(x):
+            # [FUNCTION DOC] HELPER: Rank 0 passes x, the last rank passes the target, middle
+            # ranks pass nothing to the schedule step. Returns the step result.
             if self.rank == 0:
                 return schedule.step(x)
             elif self.rank == self.world_size - 1:
@@ -345,6 +409,12 @@ class StageTest(MultiProcContinuousTest):
         not TEST_MULTIACCELERATOR, f"{backend} test requires 2+ GPUs"
     )
     def test_output_chunks_memory_usage(self):
+        # [FUNCTION DOC] Runs a GPipe schedule with MSE loss and checks stage.output_chunks
+        # is empty initially, fwd_cache is empty after the step, only the last rank holds
+        # output chunks, and clear_runtime_states empties output_chunks.
+        # KNOWN ISSUE: the final assertion message says the last stage should store output
+        # chunks, but it asserts the length is zero after clearing. The non-last-rank
+        # assertion passes a function as the message, which unittest does not call.
         """Test that output_chunks doesn't store memory for non-first stages."""
         full_mod = MultiMLP(d_hid, n_layers=self.world_size)
         full_mod.to(self.device)
@@ -366,6 +436,8 @@ class StageTest(MultiProcContinuousTest):
         )
 
         def _run_step(x):
+            # [FUNCTION DOC] HELPER: Rank 0 passes x, the last rank passes the target, middle
+            # ranks pass nothing to the schedule step. Returns the step result.
             if self.rank == 0:
                 return schedule.step(x)
             elif self.rank == self.world_size - 1:
@@ -405,16 +477,22 @@ instantiate_parametrized_tests(StageTest)
 
 
 class StageNegativeTest(MultiProcContinuousTest):
+    # [CLASS DOC] Multi-process continuous test class for error paths of PipelineStage
+    # (shape/dtype validation and dw_builder misuse); needs NCCL/XCCL and 2+ accelerators.
     @classmethod
     def backend_str(cls) -> str:
+        # [FUNCTION DOC] HELPER: Returns the module-level distributed backend name.
         return backend
 
     @classmethod
     def device_type(cls) -> str:
+        # [FUNCTION DOC] HELPER: Returns the module-level device type string.
         return device_type
 
     @property
     def device(self) -> torch.device:
+        # [FUNCTION DOC] HELPER: Returns the device for this rank (device type with the rank
+        # as index).
         return torch.device(device_type, self.rank)
 
     @requires_accelerator_dist_backend(["nccl", "xccl"])
@@ -422,6 +500,11 @@ class StageNegativeTest(MultiProcContinuousTest):
         not TEST_MULTIACCELERATOR, f"{backend} test requires 2+ GPUs"
     )
     def test_shape_prop_mismatch(self):
+        # [FUNCTION DOC] Builds a manual stage with runtime validation enabled and runs a
+        # valid step first. On rank 0 then expects PipeliningMetadataError for a wrong batch
+        # size (shape mismatch), an int32 input (dtype mismatch), a forward hook that
+        # flattens the stage output (shape mismatch) and a hook casting output to bfloat16
+        # (dtype mismatch). The second hook is left registered.
         """Tests shape prop errors are raised"""
         full_mod = MultiMLP(d_hid, n_layers=self.world_size)
         full_mod.to(self.device)
@@ -442,6 +525,7 @@ class StageNegativeTest(MultiProcContinuousTest):
 
         # Run
         def _run_step(x):
+            # [FUNCTION DOC] HELPER: Rank 0 steps the schedule with x; others step with none.
             if self.rank == 0:
                 return schedule.step(x)
             else:
@@ -471,6 +555,9 @@ class StageNegativeTest(MultiProcContinuousTest):
         not TEST_MULTIACCELERATOR, f"{backend} test requires 2+ GPUs"
     )
     def test_custom_dw_errors(self):
+        # [FUNCTION DOC] Creates a stage with a dw_builder, forces its internal has-backward
+        # flag on, and asserts calling backward_weight_one_chunk for chunk 0 raises
+        # AssertionError mentioning backward_one_chunk (no backward was run first).
         """Tests expected errors are raised"""
         full_mod = MultiMLP(d_hid, n_layers=self.world_size)
         full_mod.to(self.device)

@@ -1,5 +1,10 @@
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC] Tests for CommDebugMode, which counts collective ops issued while active. Most
+# tests run on a fake process group (world size 2, rank 1) and check per-op counts for
+# functional collectives, DTensor redistribution, and (with NCCL/XCCL) raw c10d collectives.
+# A second class checks that module forward hooks are removed after the mode exits. Defines
+# module-level aliases for the c10d_functional and c10d op namespaces and the device type.
 import torch
 import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
@@ -21,11 +26,17 @@ device_type = (
 
 
 class TestCommMode(TestCase):
+    # [CLASS DOC] Tests CommDebugMode using a two-rank fake process group created per test
+    # (setUp) and destroyed afterwards (tearDown). Attributes: world_size, device_type,
+    # world_pg (the default group).
     def tearDown(self):
+        # [FUNCTION DOC] Runs the base teardown, then destroys the default process group.
         super().tearDown()
         dist.destroy_process_group()
 
     def setUp(self):
+        # [FUNCTION DOC] Sets world_size to 2, initializes a fake-backend process group as rank
+        # 1 with a FakeStore, and records the device type and the default process group.
         super().setUp()
         self.world_size = 2
         store = FakeStore()
@@ -36,6 +47,9 @@ class TestCommMode(TestCase):
         self.world_pg = dist.distributed_c10d._get_default_group()
 
     def checksAssert(self, comm_mode, key, expected_value, expected_total_value):
+        # [FUNCTION DOC] HELPER: Asserts that the mode's total collective count equals
+        # expected_total_value and that the count recorded for the op key equals
+        # expected_value. Returns nothing.
         comm_counts = comm_mode.get_comm_counts()
         self.assertEqual(comm_mode.get_total_counts(), expected_total_value)
         self.assertEqual(comm_counts[key], expected_value)
@@ -43,14 +57,21 @@ class TestCommMode(TestCase):
         return
 
     def test_comm_mode(self):
+        # [FUNCTION DOC] Runs a wrapper model (all_gather_single, reduce_scatter_single, MLP,
+        # all_reduce) under CommDebugMode and asserts a total of 3 collectives, one each of
+        # all_reduce, all_gather_into_tensor and reduce_scatter_tensor.
         world_pg = self.world_pg
 
         class WrapperModel(nn.Module):
+            # [CLASS DOC] HELPER: Module wrapping an MLPModule with functional collectives.
             def __init__(self, device):
+                # [FUNCTION DOC] HELPER: Builds the inner MLPModule on the given device.
                 super().__init__()
                 self.model = MLPModule(device=device)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies all_gather_single, reduce_scatter_single, the
+                # MLP, then all_reduce (sum) on the world group; returns the all_reduce result.
                 x = funcol.all_gather_single(x, 0, world_pg)
                 x = funcol.reduce_scatter_single(x, "sum", 0, world_pg)
                 out = self.model(x)
@@ -69,14 +90,21 @@ class TestCommMode(TestCase):
         self.assertEqual(comm_counts[c10d_functional.reduce_scatter_tensor], 1)
 
     def test_comm_mode_coalesced(self):
+        # [FUNCTION DOC] Same as test_comm_mode but the final collective is a coalesced
+        # all_reduce; asserts total 3 with one each of all_reduce_coalesced,
+        # all_gather_into_tensor and reduce_scatter_tensor.
         world_pg = self.world_pg
 
         class WrapperModelCoalesced(nn.Module):
+            # [CLASS DOC] HELPER: Like the previous wrapper but ends with all_reduce_coalesced.
             def __init__(self, device):
+                # [FUNCTION DOC] HELPER: Builds the inner MLPModule on the given device.
                 super().__init__()
                 self.model = MLPModule(device=device)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies all_gather_single, reduce_scatter_single, the
+                # MLP, then all_reduce_coalesced on a one-element list; returns that result.
                 x = funcol.all_gather_single(x, 0, world_pg)
                 x = funcol.reduce_scatter_single(x, "sum", 0, world_pg)
                 out = self.model(x)
@@ -95,9 +123,13 @@ class TestCommMode(TestCase):
         self.assertEqual(comm_counts[c10d_functional.reduce_scatter_tensor], 1)
 
     def test_comm_mode_with_dtensor(self):
+        # [FUNCTION DOC] Multiplies two row-sharded DTensors under CommDebugMode with the
+        # min-cost redistribution plan and asserts exactly one collective was issued, an
+        # all_gather_into_tensor, with no all_reduce or reduce_scatter_tensor.
         mesh = DeviceMesh(self.device_type, list(range(self.world_size)))
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Returns the matrix product of x and y.
             return torch.mm(x, y)
 
         comm_mode = CommDebugMode()
@@ -117,6 +149,10 @@ class TestCommMode(TestCase):
 
     @requires_accelerator_dist_backend(["nccl", "xccl"])
     def test_comm_mode_with_c10d(self):
+        # [FUNCTION DOC] Requires an nccl or xccl backend (decorator); returns early with no
+        # accelerator. Runs each raw c10d collective (all_reduce, all_gather, broadcast,
+        # gather, reduce, scatter, coalesced variants, reduce_scatter, all_to_all) under the
+        # mode and asserts each registers exactly one count under its c10d op key.
         if not torch.accelerator.is_available():
             return
 
@@ -224,9 +260,12 @@ class TestCommMode(TestCase):
 
 
 class TestCommModeModuleReuse(TestCase):
+    # [CLASS DOC] Tests for CommDebugMode hook handling that need no process group.
     """Tests that do not require a process group."""
 
     def test_comm_mode_repeated_module_forward(self):
+        # [FUNCTION DOC] Runs a Linear twice inside the mode, then once outside, and asserts
+        # no forward or forward-pre hooks remain on the module.
         m = torch.nn.Linear(2, 2)
         with CommDebugMode():
             m(torch.ones(1, 2))
@@ -240,6 +279,8 @@ class TestCommModeModuleReuse(TestCase):
         self.assertEqual(len(m._forward_pre_hooks), 0)
 
     def test_comm_mode_many_forwards(self):
+        # [FUNCTION DOC] Runs a Linear ten times inside the mode and asserts no forward hook
+        # remains afterwards, and that a plain forward still works.
         m = torch.nn.Linear(2, 2)
         with CommDebugMode():
             for _ in range(10):
@@ -249,13 +290,18 @@ class TestCommModeModuleReuse(TestCase):
         self.assertEqual(len(m._forward_hooks), 0)
 
     def test_comm_mode_nested_modules_reuse(self):
+        # [FUNCTION DOC] Runs a two-layer MLP twice inside the mode and once outside, then
+        # asserts both child Linear modules have no leftover forward hooks.
         class TwoLayerMLP(torch.nn.Module):
+            # [CLASS DOC] HELPER: Small module with two Linear layers and a ReLU between.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates fc1 and fc2 as 2x2 Linear layers.
                 super().__init__()
                 self.fc1 = torch.nn.Linear(2, 2)
                 self.fc2 = torch.nn.Linear(2, 2)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns fc2 applied to relu of fc1 of x.
                 return self.fc2(torch.relu(self.fc1(x)))
 
         m = TwoLayerMLP()

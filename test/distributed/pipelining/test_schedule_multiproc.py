@@ -1,5 +1,15 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Multi-process (one rank per accelerator) tests of the pipelining schedules.
+# Provides helper functions to build models, stages and reference runs, then three test
+# classes: ScheduleTest (forward only, eval, return outputs, multi-iteration, kwargs and
+# gradients with tracer or manual stages, interleaved and flex attention, weight-update
+# schedules, V-shaped schedules, callbacks, zero bubble, None-gradient handling),
+# CustomSchedulesTest (non-symmetric stage ids, custom runtime schedules, native zero bubble)
+# and PerDirectionScheduleTest (separate process groups per direction). Module constants:
+# d_hid 512, batch_size 64, none-grad hidden size 32 and 8 microbatches. Import-time side
+# effects: seeds torch with 0, resolves device_type/backend from the current accelerator and
+# registers the parametrized tests. Tests need NCCL/XCCL and several accelerators.
 import copy
 import logging
 import os
@@ -76,6 +86,8 @@ backend = dist.get_default_backend_for_device(device_type)
 
 @dataclass
 class PipelineTestConfig:
+    # [CLASS DOC] HELPER: Plain data holder passed to helpers: world_size, device (this rank's
+    # torch device) and rank.
     world_size: int
     device: torch.device
     rank: int
@@ -84,6 +96,11 @@ class PipelineTestConfig:
 def setup_models_and_data(
     config: PipelineTestConfig, n_layers=None, model_class=MultiMLP
 ):
+    # [FUNCTION DOC] HELPER: Builds a model of the given class (default MultiMLP, hidden size
+    # d_hid, n_layers defaulting to the world size) on the config device, and a deep copy as
+    # reference. Creates a random input of shape batch_size by d_hid and a target equal to
+    # the reference output plus noise, with a sum-reduced MSE loss. Returns the tuple
+    # (model, reference model, x, target, loss function).
     """Setup models, input data, target data, and loss function."""
     if n_layers is None:
         n_layers = config.world_size
@@ -104,6 +121,11 @@ def setup_models_and_data(
 def create_single_stage_pipeline(
     config: PipelineTestConfig, mod, x, chunks, use_tracer=True
 ):
+    # [FUNCTION DOC] HELPER: Builds one pipeline stage for this rank. With use_tracer, traces
+    # the module with pipeline() on the first microbatch chunk of x (using the module's
+    # split_spec if any) and builds the stage from the pipe. Otherwise treats layers.<rank>
+    # as the stage module and wraps it in a PipelineStage. Returns (stage, stage module,
+    # list holding that module).
     """Create a single-stage pipeline using either tracer or manual stage creation."""
     if use_tracer:
         x_mb = x.chunk(chunks)[0]
@@ -125,6 +147,10 @@ def create_single_stage_pipeline(
 def create_multi_stage_pipeline(
     config: PipelineTestConfig, mod, stages_per_rank, n_stages, stage_indices=None
 ):
+    # [FUNCTION DOC] HELPER: Builds PipelineStage objects for interleaved schedules. Default
+    # stage indices for this rank are rank plus i times world size for i below
+    # stages_per_rank. Each stage wraps submodule layers.<index> of mod with n_stages total.
+    # Returns (stages, stage modules, submodule names).
     """Create multiple pipeline stages for interleaved schedules."""
     if stage_indices is None:
         stage_indices = [
@@ -141,6 +167,10 @@ def create_multi_stage_pipeline(
 
 
 def run_reference_model(ref_mod, x, target, loss_fn, num_iterations=2, **kwargs):
+    # [FUNCTION DOC] HELPER: Runs the reference model for num_iterations: zero gradients,
+    # forward (extra keyword arguments passed to the model), loss, backward. Gradients are
+    # cleared each iteration, so they reflect only the last iteration. Returns the last
+    # output and loss.
     """Run reference model for specified iterations and return final output and loss."""
     ref_out = None
     ref_loss = None
@@ -162,9 +192,19 @@ def check_gradients(
     rtol=1e-5,
     atol=4e-5,
 ):
+    # [FUNCTION DOC] HELPER: Compares parameter gradients of pipeline stage modules with the
+    # reference model using assert_close with rtol/atol. With no submod_names, stage_modules
+    # is a single module and the code detects whether its parameter names exist on the
+    # reference root (tracer case) or are local to layers.<rank> (manual case). With
+    # submod_names, each stage module is matched with the reference submodule of that name.
+    # Raises AssertionError if exactly one gradient is None or values differ (printing both).
+    # KNOWN ISSUE: the tolerance argument of the inner grad_check is never used.
     """Check that gradients match between pipeline stages and reference model using flexible comparison."""
 
     def grad_check(grad1, grad2, param_name, rtol, atol, tolerance=0.05):
+        # [FUNCTION DOC] HELPER: Returns silently if both gradients are None, raises
+        # AssertionError if only one is None, otherwise asserts they are close within
+        # rtol/atol, printing both gradients before re-raising on mismatch.
         if grad1 is None and grad2 is None:
             return
         if grad1 is None or grad2 is None:
@@ -215,6 +255,7 @@ def check_gradients(
 
 
 def zero_gradients(stage_modules):
+    # [FUNCTION DOC] HELPER: Calls zero_grad on a stage module or on each module of a list.
     """Zero gradients for all stage modules."""
     if not isinstance(stage_modules, list):
         stage_modules = [stage_modules]
@@ -223,10 +264,16 @@ def zero_gradients(stage_modules):
 
 
 def none_grad_loss(output, target):
+    # [FUNCTION DOC] HELPER: Loss for the None-gradient tests: sum-reduced MSE between the
+    # first element of the stage output and the target.
     return torch.nn.functional.mse_loss(output[0], target, reduction="sum")
 
 
 def make_none_grad_flags(pattern: str, device: torch.device) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Builds a boolean tensor of shape batch_size by 1 made of one
+    # block per microbatch (none_grad_microbatches blocks). Default: first block False and
+    # the rest True; for the pattern first_true_then_false: first block True and the rest
+    # False. Created on the given device.
     values = [False] + [True] * (none_grad_microbatches - 1)
     if pattern == "first_true_then_false":
         values = [True] + [False] * (none_grad_microbatches - 1)
@@ -240,6 +287,9 @@ def make_none_grad_flags(pattern: str, device: torch.device) -> torch.Tensor:
 
 
 def setup_none_grad_model_and_data(config: PipelineTestConfig, n_layers: int):
+    # [FUNCTION DOC] HELPER: Seeds torch with 0 and builds a ConditionalGradStack with n_layers
+    # layers on the config device, a deep-copied reference, and random input and target of
+    # shape batch_size by none_grad_d_hid. Returns (model, reference, x, target).
     torch.manual_seed(0)
     mod = ConditionalGradStack(none_grad_d_hid, n_layers).to(config.device)
     ref_mod = copy.deepcopy(mod)
@@ -249,6 +299,9 @@ def setup_none_grad_model_and_data(config: PipelineTestConfig, n_layers: int):
 
 
 def run_none_grad_reference(ref_mod, x, flag, target) -> None:
+    # [FUNCTION DOC] HELPER: Zeroes reference gradients, then splits x, flag and target into
+    # none_grad_microbatches pieces (lengths must match) and accumulates backward of the
+    # None-gradient loss for each piece. Leaves gradients on ref_mod; returns nothing.
     ref_mod.zero_grad()
     for x_mb, flag_mb, target_mb in zip(
         torch.tensor_split(x, none_grad_microbatches),
@@ -269,6 +322,11 @@ def step_with_optional_pre_split(
     return_outputs=True,
     pre_split=False,
 ):
+    # [FUNCTION DOC] HELPER: Runs one schedule step either directly or with pre-split inputs.
+    # Without pre_split, forwards args, kwargs, target, losses and return_outputs to
+    # schedule.step. With pre_split, splits args and kwargs into num_microbatches chunks
+    # (passed as arg_mbs / kwarg_mbs only when present) and splits target along the batch
+    # into target_mbs. Returns the step result.
     kwargs = kwargs or {}
     if not pre_split:
         return schedule.step(
@@ -302,9 +360,16 @@ def step_with_optional_pre_split(
 def create_packed_document_block_mask(
     positions: torch.Tensor, num_heads: int
 ) -> BlockMask:
+    # [FUNCTION DOC] HELPER: Builds a flex-attention block mask for packed documents. A new
+    # document starts wherever positions equals 0 (cumulative count gives document ids). A
+    # query may attend to a key only if the key is not later and both share a document id.
+    # Returns the BlockMask for the batch size and sequence length of positions with
+    # num_heads heads, built on the positions device with dq options enabled.
     doc_ids = torch.cumsum((positions == 0).int(), dim=1) - 1
 
     def document_causal_mask(b, h, q_idx, kv_idx):
+        # [FUNCTION DOC] HELPER: Mask predicate: true when q_idx is at or after kv_idx and both
+        # belong to the same document in batch element b (h is unused).
         return (q_idx >= kv_idx) & (doc_ids[b, q_idx] == doc_ids[b, kv_idx])
 
     batch_size, seq_len = positions.shape
@@ -321,19 +386,25 @@ def create_packed_document_block_mask(
 
 
 class ScheduleTest(MultiProcContinuousTest):
+    # [CLASS DOC] Multi-process continuous test class (world size 4) for pipeline schedules
+    # against a reference model. Properties config and device describe this rank. The test
+    # methods need NCCL/XCCL and enough accelerators.
     world_size = 4
 
     @classmethod
     def backend_str(cls) -> str:
+        # [FUNCTION DOC] HELPER: Returns the module-level distributed backend name.
         # Testing with NCCL backend
         return backend
 
     @property
     def device(self) -> torch.device:
+        # [FUNCTION DOC] HELPER: Returns this rank's device (device type indexed by rank).
         return torch.device(device_type, self.rank)
 
     @property
     def config(self) -> PipelineTestConfig:
+        # [FUNCTION DOC] HELPER: Builds a PipelineTestConfig from the world size, device and rank.
         """Lazily create and return the pipeline test configuration."""
         return PipelineTestConfig(
             world_size=self.world_size, device=self.device, rank=self.rank
@@ -346,6 +417,11 @@ class ScheduleTest(MultiProcContinuousTest):
     @parametrize("ScheduleClass", [_ScheduleForwardOnly])
     @skip_if_lt_x_gpu(4)
     def test_forward_only(self, ScheduleClass):
+        # [FUNCTION DOC] Runs the forward-only schedule over a single-stage pipeline with 8
+        # microbatches for 20 iterations. Rank 0 feeds x and receives the last rank's output
+        # back into x, the last rank sends its output to rank 0. The last rank then applies
+        # the reference model 20 times to a clone of the input and asserts equality with the
+        # final pipelined output.
         mod, mod_ref, x, _, _ = setup_models_and_data(self.config)
         x_clone = x.clone()
 
@@ -390,6 +466,10 @@ class ScheduleTest(MultiProcContinuousTest):
     )
     @skip_if_lt_x_gpu(4)
     def test_eval_inference_mode(self, ScheduleClass):
+        # [FUNCTION DOC] Builds multi-stage (2 stages per rank) or single-stage pipelines
+        # depending on the schedule class, runs the schedule in eval mode (rank 0 under no_grad)
+        # and asserts that no parameter gradient was produced, and on the last rank that the
+        # losses list is non-empty.
         num_microbatches = 4
         if ScheduleClass in [
             ScheduleInterleaved1F1B,
@@ -468,6 +548,10 @@ class ScheduleTest(MultiProcContinuousTest):
     )
     @skip_if_lt_x_gpu(4)
     def test_return_output(self, ScheduleClass):
+        # [FUNCTION DOC] Builds multi-stage (interleaved, looped BFS, interleaved zero
+        # bubble) or single-stage pipelines with 4 microbatches, then steps the schedule with
+        # return_outputs disabled (last rank passes target and losses; others pass the
+        # input). Asserts on the last rank that the returned output is None.
         num_microbatches = 4
         if ScheduleClass in [
             ScheduleInterleaved1F1B,
@@ -524,6 +608,10 @@ class ScheduleTest(MultiProcContinuousTest):
     @parametrize("ScheduleClass", [ScheduleGPipe, Schedule1F1B])
     @skip_if_lt_x_gpu(4)
     def test_multi_iter(self, ScheduleClass):
+        # [FUNCTION DOC] Builds a single-stage pipeline with 4 microbatches and steps the
+        # GPipe or 1F1B schedule 20 times (rank 0 feeds x, the last rank passes target and a
+        # losses list, the others step with no data), then waits at a barrier. Only checks
+        # that it runs to completion.
         mod, _, x, target, loss_fn = setup_models_and_data(self.config)
         chunks = 4
         stage, _, _ = create_single_stage_pipeline(self.config, mod, x, chunks)
@@ -549,6 +637,11 @@ class ScheduleTest(MultiProcContinuousTest):
     @parametrize("pre_split", [False, True])
     @skip_if_lt_x_gpu(4)
     def test_kwargs_with_tracer(self, ScheduleClass, pre_split):
+        # [FUNCTION DOC] Parametrized over GPipe/1F1B and pre_split. Traces a ModelWithKwargs
+        # with a keyword input y, builds this rank's stage and runs the schedule with 4
+        # microbatches (rank 0 passes x and y, optionally pre-split into chunks). On the last
+        # rank, compares the output (loose tolerances) and the summed microbatch losses with
+        # the eager model and loss.
         mod = ModelWithKwargs(d_hid, splits=self.world_size)
         mod.to(self.device)
 
@@ -619,6 +712,10 @@ class ScheduleTest(MultiProcContinuousTest):
     @parametrize("pre_split", [False, True])
     @skip_if_lt_x_gpu(4)
     def test_grad_with_tracer(self, ScheduleClass, pre_split):
+        # [FUNCTION DOC] Parametrized over GPipe/1F1B and pre_split. Computes a reference run,
+        # builds a traced single-stage pipeline with 2 times world size microbatches, runs two
+        # iterations (zeroing stage gradients before each), then compares output and summed
+        # loss on the last rank and per-parameter gradients on every rank via check_gradients.
         mod, ref_mod, x, target, loss_fn = setup_models_and_data(self.config)
 
         # Run reference
@@ -677,6 +774,11 @@ class ScheduleTest(MultiProcContinuousTest):
     @parametrize("shape_inference", [True, False])
     @skip_if_lt_x_gpu(4)
     def test_grad_with_manual(self, ScheduleClass, shape_inference):
+        # [FUNCTION DOC] Parametrized over GPipe/1F1B and shape_inference. Builds a manual
+        # stage; when shape_inference is false, runs the stage module on one microbatch to
+        # create example input and output tensors (detached with requires_grad for non-first
+        # ranks) and rebuilds the stage with explicit input_args and output_args. Runs two
+        # iterations, compares output and loss on the last rank and gradients on all ranks.
         mod, ref_mod, x, target, loss_fn = setup_models_and_data(self.config)
 
         # Run reference
@@ -746,6 +848,11 @@ class ScheduleTest(MultiProcContinuousTest):
     @parametrize("pre_split", [False, True])
     @skip_if_lt_x_gpu(4)
     def test_grad_with_manual_interleaved(self, ScheduleClass, pre_split):
+        # [FUNCTION DOC] Parametrized over interleaved 1F1B, looped BFS and interleaved zero
+        # bubble. Builds 2 stages per rank, uses the class num_microbatches if it has one
+        # (else 2 times world size) and runs two iterations inside check_leaked_tensors,
+        # asserting no tensors leaked. Compares output and loss on the last rank and gradients
+        # on every stage with relaxed tolerances (5e-3).
         stages_per_rank = 2
         n_stages = stages_per_rank * self.world_size
         mod, ref_mod, x, target, loss_fn = setup_models_and_data(
@@ -826,6 +933,13 @@ class ScheduleTest(MultiProcContinuousTest):
     )
     @skip_if_lt_x_gpu(4)
     def test_interleaved_1f1b_pre_split_flex_attention(self):
+        # [FUNCTION DOC] CUDA/NCCL only, 4+ GPUs. Builds a FlexAttentionTransformer split into
+        # 2 stages per rank and two deep copies plus a reference, with packed-document block
+        # masks. Runs interleaved 1F1B twice under deterministic mode: once passing the block
+        # mask as a normal keyword (auto-split) and once with pre-split arg/kwarg/target
+        # microbatches. Asserts the two runs agree on outputs, losses, and parameter gradients
+        # and that both match the reference output, summed loss and gradients. First/last stage
+        # presence must be identical across the two pipelines.
         stages_per_rank = 2
         n_stages = stages_per_rank * self.world_size
         num_microbatches = 8
@@ -959,6 +1073,12 @@ class ScheduleTest(MultiProcContinuousTest):
     @parametrize("ScheduleClass", [ScheduleInterleavedZeroBubble])
     @skip_if_lt_x_gpu(4)
     def test_schedule_with_weight_update_mlp_e2e(self, ScheduleClass):
+        # [FUNCTION DOC] Uses MultiMLPWithDw models (toggled) with 2 stages per rank and a
+        # mean MSE loss; computes a reference run, then rebuilds each stage with a dw_builder
+        # from a small counting state class that calls the module's compute_dW. Runs the
+        # interleaved zero bubble schedule (2 microbatches, default grad scaling) twice. On the
+        # last rank compares output and the mean of the microbatch losses with the reference,
+        # then checks gradients on all stages.
         stages_per_rank = 2
         n_stages = stages_per_rank * self.world_size
         full_mod, ref_mod, x, target, _ = setup_models_and_data(
@@ -976,14 +1096,21 @@ class ScheduleTest(MultiProcContinuousTest):
         )
 
         class CustomState:
+            # [CLASS DOC] HELPER: Per-stage state for the weight-gradient builder: call counter
+            # i plus the stage module, stage index and rank (used for logging and compute_dW).
             def __init__(self, stage_module, stage_idx, rank):
+                # [FUNCTION DOC] HELPER: Stores the stage module, stage index and rank, and
+                # starts the dw call counter i at 0.
                 self.i = 0
                 self.stage_module = stage_module
                 self.stage_idx = stage_idx
                 self.rank = rank
 
             def dw_builder(self):
+                # [FUNCTION DOC] HELPER: Returns a dw_runner closure for the stage.
                 def dw_runner():
+                    # [FUNCTION DOC] HELPER: Increments the call counter, prints rank, count
+                    # and stage index, then calls compute_dW on the stage module.
                     self.i += 1
                     print(
                         f"[Rank {self.rank}] dw_count={self.i} stage={self.stage_idx}"
@@ -1046,6 +1173,11 @@ class ScheduleTest(MultiProcContinuousTest):
     )
     @skip_if_lt_x_gpu(4)
     def test_v_shape_schedules(self, schedule_class):
+        # [FUNCTION DOC] Parametrized over ScheduleZBVZeroBubble and ScheduleDualPipeV. Uses 8
+        # stages in a V layout (rank r owns stages r and 7-r) with 8 microbatches. Rank 0 owns
+        # first and last stages so it passes input, target and losses, others step with
+        # nothing. After two iterations rank 0 compares output and summed loss with the
+        # reference and all ranks check gradients.
         n_stages = 8
         rank_stages = {0: [0, 7], 1: [1, 6], 2: [2, 5], 3: [3, 4]}
         mod, ref_mod, x, target, loss_fn = setup_models_and_data(
@@ -1091,6 +1223,14 @@ class ScheduleTest(MultiProcContinuousTest):
     )
     @skip_if_lt_x_gpu(4)
     def test_custom_function_callback(self):
+        # [FUNCTION DOC] Builds a DualPipeV schedule on a V layout (8 stages, 8 microbatches),
+        # prepares its comms schedule (private method) and registers custom callbacks for the
+        # FORWARD and OVERLAP_F_B actions that re-implement the runtime behavior (wait for
+        # receives, run forward/backward chunks, compute loss, scale grads on the last
+        # backward, hand off locally between adjacent stages on the same rank). Runs two
+        # loops, then on rank 0 checks output, loss, that the overlap callback ran, that the
+        # forward callback count equals microbatches * 2 * loops, and that all calls were for
+        # local stages; finally checks gradients on all ranks.
         """Test the custom function callback functionality with _PipelineScheduleRuntime."""
         n_stages = 8
         rank_stages = {0: [0, 7], 1: [1, 6], 2: [2, 5], 3: [3, 4]}
@@ -1119,6 +1259,14 @@ class ScheduleTest(MultiProcContinuousTest):
         overlap_calls = []
 
         def forward_callback(action: _Action, ctx: _PipelineContext):
+            # [FUNCTION DOC] HELPER: Callback for FORWARD actions on the runtime schedule.
+            # Looks up the action's stage and microbatch, records the pair in forward_calls,
+            # waits for the pending receive unless the previous stage is local, runs
+            # forward_one_chunk, computes the loss, and passes the output directly to the next
+            # stage if it is on this rank. Raises AssertionError if the schedule is not a
+            # _PipelineScheduleRuntime, the microbatch index is None, or no receive was queued.
+            # KNOWN ISSUE: re-imports _wait_batch_p2p locally though it is already imported
+            # at module level.
             """Custom callback for FORWARD computation that mimics the original implementation."""
             schedule = ctx.schedule_ref
             if not isinstance(schedule, _PipelineScheduleRuntime):
@@ -1169,6 +1317,14 @@ class ScheduleTest(MultiProcContinuousTest):
                 )
 
         def overlap_callback(action: _Action, ctx: _PipelineContext):
+            # [FUNCTION DOC] HELPER: Callback for OVERLAP_F_B actions. Runs the forward
+            # sub-action through forward_callback and records the (forward stage, mb,
+            # backward stage, mb) tuple in overlap_calls. Then for the backward sub-action
+            # waits for the pending receive unless the next stage is local, runs
+            # backward_one_chunk with the loss (scaling grads on the last backward) and passes
+            # the gradient to the previous stage locally if it is on this rank. Raises
+            # AssertionError on a wrong schedule type, missing sub_actions, missing microbatch
+            # index or a missing queued receive.
             """Custom callback for OVERLAP_F_B computation that mimics the original implementation."""
             schedule = ctx.schedule_ref
             if not isinstance(schedule, _PipelineScheduleRuntime):
@@ -1296,6 +1452,11 @@ class ScheduleTest(MultiProcContinuousTest):
     )
     @skip_if_lt_x_gpu(4)
     def test_zero_bubble_with_model_kwargs(self, ScheduleClass):
+        # [FUNCTION DOC] Parametrized over interleaved zero bubble and interleaved 1F1B with
+        # MultiMLPKwargs models whose forward takes an extra keyword that is unused. Rank 0
+        # passes a per-microbatch expanded copy of the keyword while the reference uses a
+        # single tensor. Compares output and summed loss on the last rank and gradients (rtol
+        # 3e-5, atol 5e-3) on all ranks.
         stages_per_rank = 2
         n_stages = stages_per_rank * self.world_size
         mod, ref_mod, x, target, loss_fn = setup_models_and_data(
@@ -1353,6 +1514,10 @@ class ScheduleTest(MultiProcContinuousTest):
         )
 
     def _none_grad_stage_indices(self, ScheduleClass):
+        # [FUNCTION DOC] HELPER: Returns (number of stages, stage indices owned by this rank)
+        # for a schedule class: GPipe has world_size stages with one per rank, ZBV uses a V
+        # layout (rank and its mirror), and other classes use looped placement (rank and rank
+        # plus world_size).
         if ScheduleClass is ScheduleGPipe:
             return self.world_size, [self.rank]
         n_stages = 2 * self.world_size
@@ -1361,6 +1526,12 @@ class ScheduleTest(MultiProcContinuousTest):
         return n_stages, [self.rank, self.rank + self.world_size]
 
     def _run_none_grad_schedule(self, ScheduleClass, pattern):
+        # [FUNCTION DOC] HELPER: Runs one None-gradient scenario: builds the ConditionalGradStack
+        # model and data, computes the microbatched reference with the chosen flag pattern,
+        # builds this rank's stages and the schedule (single stage for GPipe) with the
+        # None-grad loss and 8 microbatches. Steps once with arguments depending on whether the
+        # rank has the first stage, last stage, both or neither, waits at a barrier and checks
+        # gradients with tolerance 1e-5.
         n_stages, stage_indices = self._none_grad_stage_indices(ScheduleClass)
         mod, ref_mod, x, target = setup_none_grad_model_and_data(self.config, n_stages)
         flag = make_none_grad_flags(pattern, self.device)
@@ -1413,6 +1584,9 @@ class ScheduleTest(MultiProcContinuousTest):
     @parametrize("pattern", ["first_false_then_true", "first_true_then_false"])
     @skip_if_lt_x_gpu(4)
     def test_NoneGrad_conditional_input_grad(self, ScheduleClass, pattern):
+        # [FUNCTION DOC] Parametrized over GPipe, interleaved 1F1B and ZBV zero bubble and two
+        # flag patterns; runs the None-gradient scenario helper to check that conditionally
+        # missing input gradients are handled and match the reference.
         self._run_none_grad_schedule(ScheduleClass, pattern)
 
 
@@ -1420,6 +1594,10 @@ instantiate_parametrized_tests(ScheduleTest)
 
 
 class CustomSchedulesTest(MultiProcContinuousTest):
+    # [CLASS DOC] Multi-process test class (world size 2) for unusual custom schedules from
+    # the schedule registry: non-symmetric stage placement, a runtime schedule with reordered
+    # backward actions, and a schedule with native weight-gradient actions. Provides device
+    # and config properties for the current rank.
     """
     These schedules are from the ScheduleRegistry and require world_size == 2
     The schedules test weird and unconventional schedules for edge cases
@@ -1429,15 +1607,18 @@ class CustomSchedulesTest(MultiProcContinuousTest):
 
     @classmethod
     def backend_str(cls) -> str:
+        # [FUNCTION DOC] HELPER: Returns the module-level distributed backend name.
         # Testing with NCCL backend
         return backend
 
     @property
     def device(self) -> torch.device:
+        # [FUNCTION DOC] HELPER: Returns this rank's device (device type indexed by rank).
         return torch.device(device_type, self.rank)
 
     @property
     def config(self) -> PipelineTestConfig:
+        # [FUNCTION DOC] HELPER: Builds a PipelineTestConfig from world size, device and rank.
         """Lazily create and return the pipeline test configuration."""
         return PipelineTestConfig(
             world_size=self.world_size, device=self.device, rank=self.rank
@@ -1453,6 +1634,11 @@ class CustomSchedulesTest(MultiProcContinuousTest):
     )
     @skip_if_lt_x_gpu(4)
     def test_non_symmetric_stage_ids(self, schedule_class):
+        # [FUNCTION DOC] Parametrized over ScheduleVShaped and ScheduleUnbalanced. Uses the
+        # schedule class's n_stages and rank_stages to assign (non-symmetric) stage indices to
+        # ranks, with 1 microbatch. Rank 0 owns first and last stage, passing input, target and
+        # losses; others step with nothing. After two iterations rank 0 compares output and
+        # summed loss with the reference, and all ranks check gradients.
         n_stages = schedule_class.n_stages
         rank_stages = schedule_class.rank_stages
 
@@ -1503,6 +1689,11 @@ class CustomSchedulesTest(MultiProcContinuousTest):
     @parametrize("ScheduleClass", [ScheduleWithReorderedB])
     @skip_if_lt_x_gpu(4)
     def test_pipeline_schedule_runtime_custom_sched(self, ScheduleClass):
+        # [FUNCTION DOC] Parametrized over ScheduleWithReorderedB. Builds 2 stages (1 per rank),
+        # uses the class num_microbatches or 8, and asserts the schedule is a
+        # _PipelineScheduleRuntime. Runs two iterations inside check_leaked_tensors and asserts
+        # no leaked tensors, then compares output and summed loss on the last rank and
+        # gradients on all ranks.
         n_stages = 2
         stages_per_rank = 1
         mod, ref_mod, x, target, loss_fn = setup_models_and_data(
@@ -1567,6 +1758,12 @@ class CustomSchedulesTest(MultiProcContinuousTest):
     @parametrize("ScheduleClass", [ScheduleWithW])
     @skip_if_lt_x_gpu(4)
     def test_schedule_with_native_zero_bubble(self, ScheduleClass):
+        # [FUNCTION DOC] Parametrized over ScheduleWithW. Takes stage count, microbatch count
+        # and stage placement from the schedule class, builds the stages and schedule, runs the
+        # reference model 4 times without zeroing gradients (so gradients accumulate over 4
+        # steps), then steps the pipeline 4 times inside check_leaked_tensors (no zeroing
+        # either). Asserts no leaked tensors and that gradients match the reference. Output
+        # and loss are not compared.
         n_stages = ScheduleClass.n_stages
         num_microbatches = ScheduleClass.num_microbatches
         rank_stages = ScheduleClass.rank_stages
@@ -1620,6 +1817,9 @@ instantiate_parametrized_tests(CustomSchedulesTest)
 
 
 class PerDirectionScheduleTest(MultiProcContinuousTest):
+    # [CLASS DOC] Tests per-direction P2P communicators (config flag pipeline_per_direction_p2p)
+    # with 4 ranks. It overrides process group initialization to bind a device id so that
+    # PipelineStage can split the default group into downstream and upstream subgroups.
     """Per-direction PP communicators (``config.pipeline_per_direction_p2p``).
 
     A single PP communicator serializes all send/recv in one FIFO; splitting
@@ -1634,10 +1834,16 @@ class PerDirectionScheduleTest(MultiProcContinuousTest):
 
     @classmethod
     def backend_str(cls) -> str:
+        # [FUNCTION DOC] HELPER: Returns the module-level distributed backend name.
         return backend
 
     @classmethod
     def _init_pg(cls, rank, world_size, rdvz_file):
+        # [FUNCTION DOC] HELPER: Class-level process group initialization for each rank.
+        # Raises AssertionError if rdvz_file is None. Sets LOCAL_RANK in the environment,
+        # opens a FileStore at rdvz_file, binds a device id (device type, rank) only when
+        # enough accelerators exist, initializes the default process group with the class
+        # backend, options and timeout, and stores the default group in the class attribute pg.
         # Bind device_id so PipelineStage can split the default PG into
         # downstream/upstream subgroups. We override here instead of changing
         # MultiProcContinuousTest._init_pg, which also serves CPU/Gloo callers
@@ -1666,10 +1872,12 @@ class PerDirectionScheduleTest(MultiProcContinuousTest):
 
     @property
     def device(self) -> torch.device:
+        # [FUNCTION DOC] HELPER: Returns this rank's device (device type indexed by rank).
         return torch.device(device_type, self.rank)
 
     @property
     def config(self) -> PipelineTestConfig:
+        # [FUNCTION DOC] HELPER: Builds a PipelineTestConfig from world size, device and rank.
         return PipelineTestConfig(
             world_size=self.world_size, device=self.device, rank=self.rank
         )
@@ -1680,6 +1888,9 @@ class PerDirectionScheduleTest(MultiProcContinuousTest):
     )
     @skip_if_lt_x_gpu(4)
     def test_creates_distinct_direction_groups(self):
+        # [FUNCTION DOC] With the per-direction config flag patched on, builds a manual stage
+        # and asserts it reports per-direction P2P and that its downstream and upstream groups
+        # are neither the WORLD group nor the same group.
         """PipelineStage builds two distinct, non-WORLD direction groups when the
         config flag is set (no constructor arg)."""
         with dist_config.patch(pipeline_per_direction_p2p=True):
@@ -1700,6 +1911,10 @@ class PerDirectionScheduleTest(MultiProcContinuousTest):
     @parametrize("ScheduleClass", [ScheduleGPipe, Schedule1F1B])
     @skip_if_lt_x_gpu(4)
     def test_grad_with_manual_per_direction(self, ScheduleClass):
+        # [FUNCTION DOC] Parametrized over GPipe and 1F1B with the per-direction flag patched
+        # on. Builds a manual stage (asserts distinct direction groups), runs two iterations
+        # with 2 times world size microbatches, then compares output and summed loss on the
+        # last rank and gradients on all ranks with the reference model.
         """Per-direction P2P only changes which communicator carries the bytes,
         not the math: gradients/outputs must still match the reference model."""
         with dist_config.patch(pipeline_per_direction_p2p=True):

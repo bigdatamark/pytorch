@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC] Generates the CPU RPC test suites for the TensorPipe agent. At import time it
+# exits with status 0 when torch.distributed is unavailable; otherwise, unless running in CI
+# on a machine with CUDA (where the CPU jobs already cover it), it injects into the module
+# globals the test classes built by generate_tests from TensorPipeRpcAgentTestFixture and the
+# generic plus TensorPipe-specific test lists.
 import sys
 
 import torch

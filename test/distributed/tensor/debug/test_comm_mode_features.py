@@ -1,6 +1,10 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC] DTensor tests of CommDebugMode's reporting features on tensor-parallel models:
+# parameter/sharding info display for MLP and stacked MLP models, and module-level tracing
+# of collective counts for an MLP and a TP Transformer. Uses DTensorTestBase with the
+# with_comms decorator and defines a module-level alias for the c10d_functional ops.
 from typing import Any
 
 import torch
@@ -28,8 +32,14 @@ c10d_functional = torch.ops.c10d_functional
 
 
 class TestCommModeFeatures(DTensorTestBase):
+    # [CLASS DOC] Test case (multi-process DTensorTestBase) for CommDebugMode parameter info,
+    # sharding info and per-module collective counts. Has two comparison helpers and four
+    # tests that parallelize modules with Colwise/Rowwise plans.
     # checks if parameter / sharding info is the same as ground truth
     def check_same_set_of_keys(self, dict1, dict2):
+        # [FUNCTION DOC] HELPER: Flattens each two-level mapping into a list of (outer, inner)
+        # key pairs and asserts the lists have equal length and equal pairs in order. Values
+        # are not compared.
         """
         Used to ensure the comm_mode parameter/sharding dictionaries contain the same information produced by the
         ground truth
@@ -52,6 +62,10 @@ class TestCommModeFeatures(DTensorTestBase):
 
     # generates the ground truth parameter and sharding info
     def ground_truth(self, model):
+        # [FUNCTION DOC] HELPER: Builds the expected parameter and sharding mappings for a
+        # model. For each named parameter, keys are the model class name plus the parent
+        # module path; the first mapping is module -> parameter name -> data, the second maps
+        # "module.param" to placements for DTensor parameters only. Returns both mappings.
         """
         Used to generate the ground-truth parameter and sharding info for a given distributed model to
         verify comm_mode correctness
@@ -77,6 +91,9 @@ class TestCommModeFeatures(DTensorTestBase):
 
     @with_comms
     def test_MLP_distributed_sharding_display(self):
+        # [FUNCTION DOC] Parallelizes an MLP (column then row wise), runs forward and
+        # backward under CommDebugMode, and asserts the mode's parameter and sharding info
+        # have the same keys as the ground truth.
         """
         tests parameters and sharding on a module level
         """
@@ -114,6 +131,9 @@ class TestCommModeFeatures(DTensorTestBase):
     @skipIfHpu
     @with_comms
     def test_MLPStacked_distributed_sharding_display(self):
+        # [FUNCTION DOC] Traces a parallelized MLP, then enters the mode again with a
+        # parallelized MLPStacked and asserts parameter and sharding info start empty (reset).
+        # After forward, asserts keys match ground truth and exactly 8 sharding entries.
         """
         tests model with nested modules and makes sure comm_mode correctly resets parameter and sharding information
         """
@@ -169,6 +189,9 @@ class TestCommModeFeatures(DTensorTestBase):
 
     @with_comms
     def test_MLP_module_tracing(self):
+        # [FUNCTION DOC] Runs forward and backward of a parallelized MLP under the mode and
+        # asserts the module tracker has 5 modules and that the all_reduce forward count is 1
+        # for Global, MLPModule and MLPModule.net2.
         """
         tests module-level tracing for MLP module
         """
@@ -224,6 +247,13 @@ class TestCommModeFeatures(DTensorTestBase):
     @xfailIf(TEST_XPU)  # https://github.com/intel/torch-xpu-ops/issues/1555
     @with_comms
     def test_transformer_module_tracing(self, is_seq_parallel=False):
+        # [FUNCTION DOC] Checks module tracing resets between runs: a fresh mode has one
+        # tracked module and empty Global counts. Then traces a TP Transformer forward and
+        # asserts expected all_reduce / all_gather_into_tensor forward counts per module
+        # (Global and Transformer: 6 and 1; each layer 2; embeddings, attention.wo and
+        # feed_forward.w2: 1; output: one all_gather). The is_seq_parallel argument selects
+        # sequence-parallel parallelization and defaults to False. Skipped on HPU and without
+        # GPU; expected to fail on XPU.
         """
         tests module-level tracing for more complicated transformer module and
         ensures that comm_module depth and tracing dictionaries correctly reset

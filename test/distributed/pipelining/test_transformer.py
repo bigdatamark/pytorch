@@ -1,5 +1,10 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Test that torch.distributed.pipelining.pipeline can split a Transformer-like
+# stack of 8 MLP layers into 2 stages at a SplitPoint and that the resulting pipe is
+# numerically equal to the original. Defines tiny model classes and module constants (hidden
+# size 16, 8 layers, microbatch size 4) and instantiates device-generic tests (including XPU)
+# at import time.
 import torch
 from torch.distributed.pipelining import pipeline, SplitPoint
 from torch.testing._internal.common_device_type import instantiate_device_type_tests
@@ -16,13 +21,16 @@ microbatch_size = 4
 
 
 class MLPModule(torch.nn.Module):
+    # [CLASS DOC] HELPER: Two Linear layers (d_hid to d_hid) with a ReLU between them.
     def __init__(self, d_hid):
+        # [FUNCTION DOC] HELPER: Creates net1, relu and net2 for hidden size d_hid.
         super().__init__()
         self.net1 = torch.nn.Linear(d_hid, d_hid)
         self.relu = torch.nn.ReLU()
         self.net2 = torch.nn.Linear(d_hid, d_hid)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies net1, relu, net2 in order and returns the result.
         x = self.net1(x)
         x = self.relu(x)
         x = self.net2(x)
@@ -30,18 +38,28 @@ class MLPModule(torch.nn.Module):
 
 
 class TransformerLike(torch.nn.Module):
+    # [CLASS DOC] HELPER: Model holding n_layers MLPModules in a Sequential called layers.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Builds the Sequential of n_layers MLPModule(d_hid) blocks.
         super().__init__()
         self.layers = torch.nn.Sequential(*[MLPModule(d_hid) for _ in range(n_layers)])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Runs the input tensor through all layers and returns it.
         return self.layers(x)
 
 
 class TransformerTests(TestCase):
+    # [CLASS DOC] Device-generic test case; hw_classification marks it as needing an
+    # accelerator. Holds the pipeline IR test.
     hw_classification = HardwareClassification.ACCELERATOR
 
     def test_ir(self, device):
+        # [FUNCTION DOC] Builds TransformerLike on the device and traces it with pipeline,
+        # splitting at the start of the middle layer into 2 stages. Raises AssertionError
+        # if the stage count differs or the union of layer names across stage modules does
+        # not equal the original. Finally asserts the pipe output matches the original
+        # model output (assert_close). Prints progress messages.
         transformer = TransformerLike().to(device)
         x = torch.randn(microbatch_size, d_hid, device=device)
 
@@ -58,6 +76,7 @@ class TransformerTests(TestCase):
             raise AssertionError(f"{pipe.num_stages=}, expect {num_stages}")
 
         def get_layers(module):
+            # [FUNCTION DOC] HELPER: Returns the child names of module.layers as a list.
             layers = [name for name, _ in module.layers.named_children()]
             return layers
 
