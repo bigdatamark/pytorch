@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Defines the insert_deferred_runtime_asserts graph pass, which materializes runtime
+# assertions and range checks accumulated in a ShapeEnv as nodes of an FX graph, and
+# deduplicates/CSEs symbolic size computation. Also holds small helpers for reading
+# symbolic example values from node metadata. Import time creates a module logger and
+# a graph-code artifact logger; sympy is imported lazily to keep import cheap.
 import dis
 import functools
 import logging
@@ -32,6 +38,10 @@ graph_code_log = torch._logging.getArtifactLogger(__name__, "graph_code_verbose"
 
 
 def _get_example_value(node: fx.Node) -> str | None:
+    # [FUNCTION DOC] HELPER: Returns the node's example value from metadata, preferring
+    # the dynamo key over the export key, or None if neither exists.
+    # KNOWN ISSUE: the return annotation says string but the value is typically a tensor
+    # or symbolic number; the docstring also has an unbalanced quote.
     """
     Get the example value key for a node, since dynamo uses "example_value"
     while non-strict export uses "val.
@@ -45,6 +55,8 @@ def _get_example_value(node: fx.Node) -> str | None:
 
 
 def _get_sym_val(node: fx.Node) -> Optional["sympy.Expr"]:
+    # [FUNCTION DOC] HELPER: If the node's example value is a symbolic int/float/bool,
+    # returns its underlying sympy expression; otherwise None.
     val = _get_example_value(node)
     if isinstance(val, py_sym_types):
         return val.node.expr
@@ -58,6 +70,22 @@ def insert_deferred_runtime_asserts(
     name: str,
     export: bool = False,
 ) -> None:
+    # [FUNCTION DOC]
+    # Mutates gm.graph in place. Walks the nodes once and (1) rebuilds a mapping from
+    # sympy expressions to graph values, binding symbols found in placeholders (including
+    # tensor sizes, strides and storage offset) and in unbacked bindings of nodes; (2)
+    # replaces nodes producing already-known symbolic values, and size/stride calls on
+    # intermediate tensors, with computation built from known symbols (CSE); (3) removes
+    # duplicate or trivially true assertion nodes and normalizes user assertion calls to
+    # the aten scalar assert while keeping their messages; (4) drops earlier range-constrain
+    # calls; (5) after each newly bound unbacked symbol, emits lower/upper bound asserts
+    # from the ShapeEnv ranges and then the deferred runtime asserts that became fully
+    # expressible; (6) finally deletes reified symbol nodes with no users. Args: gm, the
+    # graph module; shape_env, the source of deferred asserts and ranges; name, used only
+    # for debug logging; export, selecting the non-optimized reference analysis when set.
+    # Returns None. Side effects: graph mutation, debug logging, node metadata hooks.
+    # KNOWN ISSUE: deferred asserts containing unsupported sympy functions are silently
+    # dropped; the inner placeholder loop reuses the outer loop index name.
     """
     During tracing, we may have discovered that some data-dependent values
     had runtime assert on them; e.g., torch.empty(x.item()) induces a runtime
@@ -132,6 +160,9 @@ def insert_deferred_runtime_asserts(
             placeholders.add(node)
 
     def _is_intermediate_tensor_sym_call(node: fx.Node) -> bool:
+        # [FUNCTION DOC] HELPER: True if the node yields a non-constant, reifiable
+        # symbolic value and takes a tensor or size value that is not a placeholder as
+        # an argument.
         """
         If a size/stride/storage offset call on an intermediate tensor,
         we can try to compute the value from input shapes instead.
@@ -169,6 +200,11 @@ def insert_deferred_runtime_asserts(
         custom: dict[str, Any] | None = None,
         skip_val: bool = False,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Hook applied to each node created while it is active.
+        # Unless skip_val is set, computes the node's example value by calling its target
+        # on the example values of its arguments (method calls are resolved on the first
+        # argument) and stores it under the chosen key; an unsupported-operation error is
+        # swallowed. Copies stack trace, module stack and custom annotation metadata when given.
         if not skip_val:
             fake_args = pytree.tree_map(
                 lambda arg: (
@@ -207,6 +243,10 @@ def insert_deferred_runtime_asserts(
     def _sympy_interp(
         expr_to_proxy: dict[sympy.Expr, fx.Proxy], expr: sympy.Expr
     ) -> fx.Proxy:
+        # [FUNCTION DOC] HELPER: Lowers a sympy expression into graph nodes with hash
+        # consing: returns a cached value if the expression was seen, evaluates numbers,
+        # symbols and boolean constants directly, and otherwise recursively lowers the
+        # arguments, runs the operation handler and caches the result in the mapping.
         # Lower a sympy expression into the graph and return the resulting
         # Proxy (use .node to get the FX node representing ``expr``).
         # sympy_interp() with hash consing
@@ -231,6 +271,8 @@ def insert_deferred_runtime_asserts(
         return expr_to_proxy[expr]
 
     def _is_bound_expr_for_symbol(expr: "sympy.Expr") -> bool:
+        # [FUNCTION DOC] HELPER: True if expr is a less-or-equal / greater-or-equal
+        # comparison between exactly one symbol and one numeric constant (a simple bound).
         # This is probably unnecessary, but since torch._check() calls for single-symbol bounds
         # like u0 >= 0, 10 >= u0 accumulate range info in the ShapeEnv, we designate these calls as redundant
         # and instead add 2 runtime asserts at the end of this pass, if the min/max bounds are non-trivial.
@@ -249,6 +291,8 @@ def insert_deferred_runtime_asserts(
     preserve_runtime_assert_key = "_fx_runtime_assert_preserve"
 
     def _assertion_condition(node: fx.Node) -> Any:
+        # [FUNCTION DOC] HELPER: Returns the condition argument of an assert node: the
+        # first positional argument, else the cond keyword, else the self keyword.
         if node.args:
             return node.args[0]
         return node.kwargs.get("cond", node.kwargs.get("self"))
@@ -256,7 +300,17 @@ def insert_deferred_runtime_asserts(
     def _assertion_message(
         node: fx.Node, cond: Any, assert_expr: Optional["sympy.Expr"]
     ) -> str:
+        # [FUNCTION DOC] HELPER: Determines the failure message for an assert node: a
+        # literal string argument, the text of a stored constant string or trivially
+        # constant-string callable attribute referenced from the module, otherwise a
+        # generated message naming the expression and node. Raises AssertionError if a
+        # referenced attribute node has a non-str target.
         def static_string_from_callable(fn: Callable[[], object]) -> str | None:
+            # [FUNCTION DOC] HELPER: Returns the constant string a zero-argument
+            # function would return, found by inspecting its bytecode without calling
+            # it; None if it takes arguments or does anything other than return one
+            # string constant.
+            # KNOWN ISSUE: relies on interpreter-version-specific opcode names.
             code = getattr(fn, "__code__", None)
             if (
                 code is None
@@ -320,6 +374,8 @@ def insert_deferred_runtime_asserts(
         return f"Runtime assertion failed for expression {assert_expr} on node '{cond}'"
 
     def _is_user_runtime_assert(node: fx.Node) -> bool:
+        # [FUNCTION DOC] HELPER: True for user-written check or scalar-assert calls, and
+        # for aten scalar asserts carrying the preserve marker in metadata.
         if node.target in (torch._check, torch._assert_scalar):
             return True
         return (
@@ -330,6 +386,9 @@ def insert_deferred_runtime_asserts(
     def _replace_with_aten_assert(
         node: fx.Node, cond: Any, assert_expr: Optional["sympy.Expr"]
     ) -> None:
+        # [FUNCTION DOC] HELPER: Replaces a user assert node by an aten scalar assert
+        # inserted before it with the same condition and a derived message, copying
+        # metadata and marking it as user-preserved; rewires users and erases the old node.
         with graph.inserting_before(node):
             new_node = graph.call_function(
                 torch.ops.aten._assert_scalar.default,
@@ -350,6 +409,15 @@ def insert_deferred_runtime_asserts(
                     user_assert_exprs.add(assert_expr)
 
     def add_runtime_asserts(ras: list[RuntimeAssert]) -> None:
+        # [FUNCTION DOC] HELPER: For each deferred runtime assert, skips it if redundant
+        # (already added, equal to a user assert, a simple bound on an already constrained
+        # symbol, or containing unsupported functions). If some of its free symbols are not
+        # yet bound it is re-queued under the smallest missing symbol by name; otherwise
+        # its expression is lowered into the graph and an aten scalar assert is appended,
+        # and the expression is recorded as added. Uses enclosing state; the node
+        # metadata comes from the loop variable of the enclosing scope.
+        # KNOWN ISSUE: reads the node loop variable of the enclosing scope, so it is
+        # only valid when called from inside that loop.
         for ra in ras:
             if ra.expr in user_assert_exprs:
                 added_asserts.add(ra.expr)
@@ -423,6 +491,12 @@ def insert_deferred_runtime_asserts(
             ):
 
                 def match_symbol(symint: object, cb: Callable[[], fx.Node]) -> None:
+                    # [FUNCTION DOC] HELPER: If symint is a symbolic int whose
+                    # placeholder expression is a plain symbol not yet bound, calls cb
+                    # to create the graph node producing it and records it in the
+                    # symbol mapping (with metadata hook active). Otherwise does nothing.
+                    # The callbacks passed in capture loop variables of the caller but
+                    # run immediately, so they see the current values.
                     if (
                         isinstance(symint, torch.SymInt)
                         and isinstance(symint.node, SymNode)
@@ -508,6 +582,8 @@ def insert_deferred_runtime_asserts(
             ):
                 # this guards against deleting calls like item() that produce new untracked symbols
                 def has_new_untracked_symbols() -> bool:
+                    # [FUNCTION DOC] HELPER: True if the current node's symbolic
+                    # expression has a free symbol not yet bound in the symbol mapping.
                     # pyrefly: ignore [missing-attribute]
                     for symbol in sym_expr.free_symbols:
                         if symbol not in expr_to_proxy:
@@ -522,6 +598,9 @@ def insert_deferred_runtime_asserts(
                 )
 
                 def has_new_unbacked_bindings() -> bool:
+                    # [FUNCTION DOC] HELPER: True if any resolved unbacked symbol of the
+                    # current node is not yet bound; raises AssertionError if the
+                    # resolved bindings are missing.
                     if resolved_unbacked_bindings is None:
                         raise AssertionError("resolved_unbacked_bindings is None")
                     for key in resolved_unbacked_bindings:
@@ -599,6 +678,9 @@ def insert_deferred_runtime_asserts(
                     # TODO: some CSE when generating these nodes can probably
                     # help reduce graph size and improve compile time
                     def _lower_symint_divisor(d: torch.SymInt) -> fx.Node | int:
+                        # [FUNCTION DOC] HELPER: Lowers a symbolic int's expression into
+                        # the graph and returns the resulting node (or the raw value if
+                        # the result is not a proxy); used to resolve unbacked bindings.
                         p = _sympy_interp(expr_to_proxy, d.node.expr)
                         return p.node if isinstance(p, fx.Proxy) else p
 
@@ -679,6 +761,9 @@ def insert_deferred_runtime_asserts(
                     # (refinement should not be necessary once runtime
                     # asserts cause refinement, but that's NYI)
                     def convert(s: Any) -> int | float | None:
+                        # [FUNCTION DOC] HELPER: Converts a range endpoint to a Python
+                        # int or float matching the range kind; returns None for
+                        # infinite endpoints or when conversion fails.
                         if s in (sympy.oo, -sympy.oo, int_oo, -int_oo):
                             return None
                         try:

@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Graph splitting passes. split_module partitions a GraphModule into submodules
+# according to a user callback mapping nodes to partition ids, handling cross-partition
+# data flow, symbolic-size inputs, get_attr nodes, and autocast / grad-mode regions,
+# and returns a module that calls the submodules. split_module_simple is a faster
+# splitter for simple inference graphs that builds lightweight lazy graph modules.
+# Also defines the Partition record and private helpers. Import time only defines
+# names and a module logger.
 import inspect
 import logging
 from collections import defaultdict, OrderedDict
@@ -18,7 +26,16 @@ log = _LOGGER = logging.getLogger(__name__)
 
 @compatibility(is_backward_compatible=True)
 class Partition:
+    # [CLASS DOC]
+    # Bookkeeping record for one partition during split_module. Attributes: name and
+    # submod_name (name prefixed with submod_), node_names (original nodes assigned, in
+    # order), inputs/outputs (ordered sets of original node names crossing the boundary),
+    # dependencies/dependents (ordered sets of partition names), graph (the new submodule
+    # graph), environment (original node to new node mapping) and targets (attributes
+    # and modules the submodule needs). Dicts with None values are used as ordered sets.
     def __init__(self, name: str) -> None:
+        # [FUNCTION DOC] Creates an empty partition record with the given name and
+        # empty node, input, output, dependency, environment and target collections.
         self.name: str = name
         self.submod_name = f"submod_{name}"
         self.node_names: list[str] = []
@@ -31,6 +48,8 @@ class Partition:
         self.targets: dict[str, Any] = {}
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Returns a multi-line string with the partition's name, nodes,
+        # inputs, outputs, dependencies and dependents.
         return (
             f"name: {self.name},\n"
             f" nodes: {self.node_names},\n"
@@ -42,6 +61,9 @@ class Partition:
 
 
 def _get_attr_from_qualname(mod: torch.nn.Module, qualname: str) -> Any:
+    # [FUNCTION DOC] HELPER: Resolves a dotted attribute path on mod by repeated
+    # attribute lookup and returns the value; raises AttributeError naming the path if
+    # any segment is missing.
     attr_val = mod
     for atom in qualname.split("."):  # type: ignore[union-attr]
         if not hasattr(attr_val, atom):
@@ -64,6 +86,24 @@ def split_module(
     partition_affix: str | None = None,
     tuple_return: bool = False,
 ) -> GraphModule:
+    # [FUNCTION DOC]
+    # Splits graph module m into partitions chosen by split_callback (node to integer
+    # id; placeholders, get_attr and output nodes are not partitioned). Steps: assign
+    # nodes to partitions; record cross-partition inputs/outputs and dependencies
+    # (including symbolic-size source nodes); validate that autocast/grad regions use
+    # monotonically increasing partitions; topologically sort partitions; replicate
+    # grad/autocast enter and exit nodes in each region partition; build each partition
+    # graph and a submod_ GraphModule; emit a top-level graph calling them in sorted
+    # (or original, if keep_original_order) order, unpacking multi-output results.
+    # Returns the top-level module, whose meta records partition_names. Optional
+    # qualname_map is filled in place (new qualified name to old). tuple_return forces
+    # tuple outputs even for one value; partition_affix adds a prefix to partition names.
+    # Raises RuntimeError on a cyclic partition dependency, AssertionError for violated
+    # region invariants, AttributeError for missing targets. Mutates nodes by attaching a
+    # partition-name attribute on the original graph. root_m is unused.
+    # KNOWN ISSUE: the docstring says root_m is unused and keep_original_order is
+    # Optional[bool], but the code never checks for None; in the keep_original_order
+    # branch the attribute mapping returned by one construct_graph call is discarded.
     """
     Creates subgraphs out of main graph
 
@@ -177,6 +217,11 @@ def split_module(
         base_mod_env: dict[str, Node],
         base_mod_attrs: dict[str, torch.fx.graph_module.GraphModule],
     ) -> tuple[dict[str, Node], dict[str, torch.fx.graph_module.GraphModule]]:
+        # [FUNCTION DOC] HELPER: Copies a placeholder or get_attr node into the
+        # top-level graph (base_mod_graph of the enclosing function), copying its meta,
+        # and records it in base_mod_env. For get_attr also stores the resolved attribute
+        # in base_mod_attrs (raises AssertionError for a non-str target). Other ops are
+        # ignored. Returns the two (mutated) mappings.
         if node.op == "placeholder":
             default_value = (
                 node.args[0] if len(node.args) > 0 else inspect.Signature.empty
@@ -214,6 +259,12 @@ def split_module(
     symbol_to_node: dict[sympy.Symbol, Node] = {}
 
     def record_cross_partition_use(def_node: Node, use_node: Node | None) -> None:
+        # [FUNCTION DOC] HELPER: If def_node and use_node live in different partitions
+        # (use_node None means the graph output), registers def_node as an output of its
+        # partition and an input of the using partition, and links dependency/dependent
+        # partitions. Free symbols in def_node's example value also become inputs of the
+        # using partition, with non-placeholder symbol sources exported from their
+        # partition. KeyError can occur if a symbol has no recorded source node.
         from torch.fx.experimental.symbolic_shapes import free_symbols
 
         defined = getattr(def_node, "_fx_partition", None)
@@ -263,6 +314,9 @@ def split_module(
                     use_partition.dependencies.setdefault(defined)
 
     def instantiate_node_partition_mapping(node: Node) -> None:
+        # [FUNCTION DOC] HELPER: Asks split_callback for the node's partition, forms the
+        # partition name (with the optional affix), creates the Partition if new,
+        # appends the node name to it and tags the node with its partition name.
         partition_idx = split_callback(node)
         partition_name = str(partition_idx)
         if partition_affix is not None:
@@ -485,6 +539,9 @@ def split_module(
             # instead set them as targets and use getattr within the module
 
             def add_placeholder() -> Node:
+                # [FUNCTION DOC] HELPER: Adds a placeholder to the current partition
+                # graph for the current input (original name, or a numbered arg_ name
+                # when names are not preserved), records the input as kept, returns it.
                 if keep_original_input_name:
                     name = inp
                 else:
@@ -703,6 +760,14 @@ def split_module(
 
 
 def _decompose_size_nodes(m: GraphModule) -> None:
+    # [FUNCTION DOC] HELPER: Rewrites every no-argument size method call on a tensor
+    # with a known example value into per-dimension values: a symbolic-size call node
+    # for symbolic dims, a literal int for static dims, spliced into each user's
+    # positional args in place of the size result. Erases the original size node.
+    # Mutates m.graph; nodes lacking example values or with dim arguments are skipped.
+    # KNOWN ISSUE: only positional args of users are rewritten; a user referencing the
+    # size node through keyword args or nested containers keeps a dangling use and the
+    # erase would fail.
     """Decompose x.size() into per-dim sym_size.int calls.
 
     torch.Size objects cannot cross split boundaries because aot_autograd
@@ -750,6 +815,11 @@ def _make_lite_graph_module(
     graph: torch.fx.graph.Graph,
     modules: dict[str, GraphModule] | None = None,
 ) -> GraphModule:
+    # [FUNCTION DOC] HELPER: Builds a lazy graph module around graph without running
+    # the normal constructors, by creating a fresh subclass, allocating an instance
+    # and filling its attribute dict with the fields a bare module needs (empty
+    # parameter/buffer/hook containers, given submodule mapping or empty one, the
+    # graph, empty meta). Sets the graph's owning module and a lazy forward. Returns it.
     """Construct a lightweight GraphModule that bypasses expensive init overhead.
 
     Creates a ``_LazyGraphModule`` instance without going through
@@ -800,6 +870,13 @@ def _detect_dependencies(
     dict[int, dict[str, Node]],
     list[int],
 ]:
+    # [FUNCTION DOC] HELPER: First phase of the simple splitter. Walks m's nodes,
+    # tracking which node first binds each symbolic-size symbol, tags every non-
+    # placeholder, non-output node with its partition id from node_to_partition, and
+    # records for each partition the inputs and outputs implied by cross-partition uses
+    # (plus symbol-source nodes) and by graph outputs. Returns the empty per-partition
+    # graphs, inputs, outputs and first-appearance partition order. Mutates nodes by
+    # attaching a partition attribute; raises KeyError if a node is missing from the map.
     """Assign nodes to partitions and detect cross-partition dependencies.
 
     Returns:
@@ -823,6 +900,8 @@ def _detect_dependencies(
         n: Node,
         _outputs: dict[int, dict[str, Node]] = partition_outputs,
     ) -> Node:
+        # [FUNCTION DOC] HELPER: For a node consumed by the graph output, registers it as
+        # an output of its partition if it has one. Returns the node unchanged.
         if hasattr(n, "_fx_partition"):
             _outputs[n._fx_partition].setdefault(n.name, n)
         return n
@@ -857,6 +936,10 @@ def _detect_dependencies(
             _outputs: dict[int, dict[str, Node]] = partition_outputs,
             _sym: dict[sympy.Symbol, Node] = symbol_to_node,
         ) -> Node:
+            # [FUNCTION DOC] HELPER: For a node used in partition use_pid, if it was
+            # defined in another partition (or none), registers it as that partition's
+            # output and a use_pid input, along with any source nodes of its free symbols
+            # (exported from their partition if not placeholders). Returns the node.
             def_pid = getattr(def_node, "_fx_partition", None)
             if def_pid != use_pid:
                 if def_pid is not None:
@@ -889,6 +972,11 @@ def _clone_nodes_into_partitions(
     partition_outputs: dict[int, dict[str, Node]],
     seen_partitions: list[int],
 ) -> dict[int, dict[Node, Node]]:
+    # [FUNCTION DOC] HELPER: Second phase of the simple splitter. For each partition,
+    # adds placeholders for its inputs, clones its tagged nodes (remapping args and
+    # kwargs, copying meta) into the partition graph, and sets the graph output: the
+    # single value, a tuple of values, or an empty tuple when there are none. Mutates
+    # the partition graphs; returns the per-partition original-to-clone mapping.
     """Create placeholders, clone nodes, and set outputs for each partition.
 
     Returns:
@@ -950,6 +1038,11 @@ def _build_stitching_graph(
     seen_partitions: list[int],
     partition_affix: str | None = None,
 ) -> GraphModule:
+    # [FUNCTION DOC] HELPER: Third phase of the simple splitter. Copies placeholders
+    # of m into a new graph, then for each partition in order wraps its graph in a lite
+    # module named submod_ (with optional affix) plus id, emits a call to it with its
+    # inputs, and binds its outputs (indexing into a tuple when there are several).
+    # Finally emits the output from m's output node and returns the lite top-level module.
     """Build the outer stitching graph that calls each partition submodule."""
     base_graph = torch.fx.graph.Graph()
     base_env: dict[str, Node] = {}
@@ -998,6 +1091,14 @@ def split_module_simple(
     *,
     partition_affix: str | None = None,
 ) -> GraphModule:
+    # [FUNCTION DOC]
+    # Fast splitter: detects dependencies, clones nodes into per-partition graphs, and
+    # builds the stitching module, returning it. node_to_partition must cover every
+    # operational node; no topological sorting is done, so partitions are emitted in
+    # order of first appearance and are assumed to be consistent with data flow.
+    # Marks nodes of m with a partition attribute as a side effect.
+    # KNOWN ISSUE: get_attr and call_module nodes are not supported (their targets are
+    # never copied into the partition modules); inputs must be plain tensor/function graphs.
     """Lightweight graph splitter for simple partition patterns.
 
     A faster alternative to :func:`split_module` for inference-only graphs

@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Shape propagation pass for FX graphs. Provides TensorMetadata (a named tuple
+# describing a tensor: shape, dtype, grad flag, stride, memory format, quantization
+# info) and ShapeProp, an Interpreter that runs a GraphModule on sample inputs and
+# stores per-node tensor metadata and result type into node.meta. Optionally runs
+# under a fake tensor mode. No import-time side effects beyond definitions.
 import traceback
 from typing import Any, NamedTuple
 
@@ -16,6 +22,11 @@ __all__ = ["TensorMetadata", "ShapeProp"]
 
 @compatibility(is_backward_compatible=True)
 class TensorMetadata(NamedTuple):
+    # [CLASS DOC]
+    # Immutable record of tensor properties: shape, dtype, requires_grad, stride
+    # (empty for sparse tensors), memory_format (None when no standard contiguity
+    # applies or it was not requested), is_quantized and qparams (mapping holding
+    # quantization scheme, scale, zero point, and axis for per-channel schemes).
     """A structure containing pertinent information about a tensor within a PyTorch program."""
 
     # General Tensor metadata
@@ -37,6 +48,13 @@ class TensorMetadata(NamedTuple):
 def _extract_tensor_metadata(
     result: torch.Tensor, include_contiguity: bool = True
 ) -> TensorMetadata:
+    # [FUNCTION DOC] HELPER: Builds a TensorMetadata record for a tensor. Reads
+    # shape, dtype, requires_grad and stride (empty for sparse tensors). If
+    # include_contiguity is set and the tensor is not sparse, memory_format is the
+    # first of contiguous, channels-last, channels-last-3d for which the tensor is
+    # definitely contiguous (symbolic-safe check), else None. For quantized tensors
+    # fills qparams with qscheme plus scale/zero_point (per-tensor) or lists of
+    # scales/zero points and axis (per-channel). Returns the record; no side effects.
     """
     Extract a TensorMetadata NamedTuple describing `result`.
     """
@@ -87,6 +105,13 @@ def _extract_tensor_metadata(
 
 @compatibility(is_backward_compatible=True)
 class ShapeProp(torch.fx.Interpreter):
+    # [CLASS DOC]
+    # Interpreter that executes a GraphModule node by node and records, for each
+    # node, tensor_meta (TensorMetadata or a nested structure of them, only if the
+    # result contains tensors), type (the Python type of the result) and, in fake
+    # mode, unbacked_bindings. State: fake_mode, fake_module (a fake-tensor copy of
+    # the module used for execution when a fake mode is present), real_module (the
+    # original module whose node metadata is written). Key methods: run_node, propagate.
     """
     Execute an FX graph Node-by-Node and
     record the shape and type of the result
@@ -134,6 +159,11 @@ class ShapeProp(torch.fx.Interpreter):
     """
 
     def __init__(self, gm: torch.fx.GraphModule, fake_mode: Any = None) -> None:
+        # [FUNCTION DOC]
+        # Initializes the interpreter on gm. If fake_mode is None, tries to detect an
+        # active fake mode. When a fake mode exists, builds a fake-tensor deep copy of
+        # the module (fake_module) for execution; otherwise fake_module and fake_mode
+        # are None. Always remembers the original module as real_module.
         super().__init__(gm)
         if fake_mode is None:
             fake_mode = detect_fake_mode()
@@ -158,6 +188,13 @@ class ShapeProp(torch.fx.Interpreter):
         self.real_module = self.module
 
     def run_node(self, n: Node) -> Any:
+        # [FUNCTION DOC]
+        # Executes one node (temporarily swapping in the fake module and running under
+        # the fake mode and python dispatcher when one is set; rebinds unbacked symbols
+        # in the result), then records metadata on the node: tensor_meta if the result
+        # holds any tensor, unbacked_bindings if the fake mode's shape env reports any,
+        # and type. Returns the actual result. Any failure is printed with traceback and
+        # re-raised as a RuntimeError describing the node. Always restores the real module.
         from torch.fx.experimental.symbolic_shapes import (
             compute_unbacked_bindings,
             rebind_unbacked,
@@ -186,6 +223,8 @@ class ShapeProp(torch.fx.Interpreter):
         found_tensor = False
 
         def extract_tensor_meta(obj: Any) -> Any:
+            # [FUNCTION DOC] HELPER: Maps a tensor to its TensorMetadata and marks that
+            # a tensor was found (via enclosing flag); non-tensors are returned unchanged.
             if isinstance(obj, torch.Tensor):
                 nonlocal found_tensor
                 found_tensor = True
@@ -207,6 +246,10 @@ class ShapeProp(torch.fx.Interpreter):
         return result
 
     def propagate(self, *args: Any) -> Any:
+        # [FUNCTION DOC]
+        # Runs the whole graph on the sample inputs, populating node metadata through
+        # run_node. With a fake mode, tensor inputs are first converted to fake tensors
+        # (non-tensors pass through). Returns the graph's output value.
         """
         Run `module` via interpretation and return the result and
         record the shape and type of each node.

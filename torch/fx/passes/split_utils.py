@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Utilities for splitting FX graph modules. Exports getattr_recursive and
+# setattr_recursive (dotted-path attribute access), Component (container for a
+# subgraph under construction), split_by_tags (split a GraphModule into one submodule
+# per node tag) and move_non_tensor_nodes_on_boundary (rebalance non-tensor nodes
+# between subgraphs of a splitter). No import-time side effects beyond definitions.
 import copy
 from dataclasses import dataclass, field
 from typing import Any, TYPE_CHECKING
@@ -25,6 +31,10 @@ __all__ = [
 
 @compatibility(is_backward_compatible=False)
 def getattr_recursive(obj: object, name: str) -> Any:
+    # [FUNCTION DOC]
+    # Resolves a dotted attribute path on obj, one segment at a time. ModuleList
+    # segments are looked up in its registered submodule mapping. Returns the final
+    # object, or None as soon as any segment is missing (no exception raised).
     for layer in name.split("."):
         if isinstance(obj, torch.nn.ModuleList):
             if hasattr(obj, "_modules") and layer in obj._modules:
@@ -40,6 +50,10 @@ def getattr_recursive(obj: object, name: str) -> Any:
 
 @compatibility(is_backward_compatible=False)
 def setattr_recursive(obj: object, attr: str, value: object) -> None:
+    # [FUNCTION DOC]
+    # Sets the attribute named by a dotted path on obj to value, walking intermediate
+    # segments with ordinary attribute lookup. Mutates the target object; raises
+    # AttributeError if an intermediate segment is missing.
     if "." not in attr:
         setattr(obj, attr, value)
     else:
@@ -50,6 +64,12 @@ def setattr_recursive(obj: object, attr: str, value: object) -> None:
 @compatibility(is_backward_compatible=False)
 @dataclass
 class Component:
+    # [CLASS DOC]
+    # Dataclass holding the state for one subgraph produced by split_by_tags: the
+    # graph being built, its order (index of its tag), name, placeholders and the
+    # original nodes they stand for (orig_inputs), original nodes exposed as outputs
+    # (orig_outputs), get_attr copies (getattr_maps), constructor_args, and the final
+    # gm once built. No methods.
     """
     A component serves as a container for a subgraph we want to create afterwards.
     """
@@ -81,6 +101,18 @@ def split_by_tags(
     return_tuple: bool = False,
     GraphModuleCls: type[torch.fx.GraphModule] = torch.fx.GraphModule,
 ) -> torch.fx.GraphModule | tuple[torch.fx.GraphModule, dict[str, str]]:
+    # [FUNCTION DOC]
+    # Splits gm into one submodule per tag, ordered as in tags. Every call_* node must
+    # carry a tag attribute naming one of tags; placeholders are copied to the main
+    # graph and get_attr nodes are copied into each component that uses them. Values
+    # crossing components become submodule inputs/outputs; the main graph calls each
+    # submodule in tag order. With return_tuple, submodule outputs are always tuples.
+    # Returns a new module of type GraphModuleCls (and, if return_fqn_mapping, also the
+    # mapping from original to split qualified names). Raises RuntimeError for multiple
+    # or missing output nodes and AssertionError for an untagged node or when a node's
+    # component order is lower than an upstream component's order.
+    # KNOWN ISSUE: the third docstring example is labeled "main" twice; the last one is
+    # actually the top-level split module.
     """
     Splits a GraphModule using tags on its graph nodes. We honor the order of
     tags. For example, we have tags = ["a", "b", "c"], the function will create
@@ -154,6 +186,8 @@ def split_by_tags(
     """
 
     def flatten(x: torch.fx.node.Argument) -> NodeList:
+        # [FUNCTION DOC] HELPER: Collects every Node found inside a nested argument
+        # structure into a flat list.
         """
         Stores nodes in x to a list and returns the list.
         """
@@ -237,6 +271,12 @@ def split_by_tags(
 
         # Map an input of `node` to nodes in the component's graph.
         def remap_func(x: torch.fx.Node) -> torch.fx.Node:
+            # [FUNCTION DOC] HELPER: Maps an input of the node being copied to a node in
+            # the current component graph. get_attr inputs are copied once into the
+            # component; inputs from the same component map to their clones; anything
+            # else (placeholders, other components) becomes a new placeholder recorded in
+            # orig_inputs and marked as used in main. Raises RuntimeError for a non-str
+            # get_attr target.
             # If input is a get_attr node, copy it to current component's graph.
             # Returns the get_attr node in current component's graph.
             if x.op == "get_attr":
@@ -345,6 +385,14 @@ def split_by_tags(
 
 @compatibility(is_backward_compatible=False)
 def move_non_tensor_nodes_on_boundary(subgraphs: list["Subgraph"]) -> None:
+    # [FUNCTION DOC]
+    # Mutates subgraphs in place. For each accelerated subgraph, finds non-tensor nodes
+    # with consumers in other subgraphs and tries to move them (plus the downstream nodes
+    # that must move with them) into the single consumer subgraph, working through a
+    # queue and enqueueing eligible parents after a successful move. Nodes whose
+    # consumers span several subgraphs, or whose dependents lie in a third subgraph, are
+    # left alone. Prints a message for each skipped or moved node. Raises AssertionError
+    # if a queued node has no consumers or a parent unexpectedly has no outside consumer.
     """
     Move non-tensor nodes on the boundary between subgraphs.
 
@@ -371,6 +419,8 @@ def move_non_tensor_nodes_on_boundary(subgraphs: list["Subgraph"]) -> None:
             node_to_subgraph[node] = i
 
     def get_children_in_graph(node: torch.fx.Node) -> list[torch.fx.Node]:
+        # [FUNCTION DOC] HELPER: Returns the users of node that are callable ops and
+        # belong to some subgraph.
         """Get children nodes that are in callable ops and in some subgraph"""
         return [
             user
@@ -379,6 +429,8 @@ def move_non_tensor_nodes_on_boundary(subgraphs: list["Subgraph"]) -> None:
         ]
 
     def get_parents_in_graph(node: torch.fx.Node) -> list[torch.fx.Node]:
+        # [FUNCTION DOC] HELPER: Returns the input nodes of node that are callable ops
+        # and belong to some subgraph.
         """Get parent nodes that are in callable ops and in some subgraph"""
         return [
             arg
@@ -389,6 +441,8 @@ def move_non_tensor_nodes_on_boundary(subgraphs: list["Subgraph"]) -> None:
     def has_children_in_other_subgraph(
         node: torch.fx.Node, current_subgraph_idx: int
     ) -> bool:
+        # [FUNCTION DOC] HELPER: True if any in-graph consumer of node lies in a
+        # subgraph other than current_subgraph_idx.
         """
         Check if the node has any children in a subgraph different from current_subgraph_idx.
         This is the requirement used in both step 1 and step d.
@@ -401,6 +455,10 @@ def move_non_tensor_nodes_on_boundary(subgraphs: list["Subgraph"]) -> None:
     def can_move_node_and_dependencies(
         node: torch.fx.Node, from_subgraph: int, to_subgraph: int
     ) -> tuple[bool, set[torch.fx.Node]]:
+        # [FUNCTION DOC] HELPER: Depth-first walk over node and its in-graph descendants.
+        # Nodes in to_subgraph stop the walk, nodes in from_subgraph are collected for
+        # moving, and a node in any other subgraph makes the move impossible. Returns
+        # (can_move, nodes_to_move); the set is only meaningful when can_move is true.
         """
         Check if node and its dependencies can be moved from from_subgraph to to_subgraph.
         Returns (can_move, nodes_to_move)
@@ -415,6 +473,9 @@ def move_non_tensor_nodes_on_boundary(subgraphs: list["Subgraph"]) -> None:
         can_move = True
 
         def dfs(current_node: torch.fx.Node) -> None:
+            # [FUNCTION DOC] HELPER: Recursive visit used by the enclosing check; updates
+            # the enclosing can_move flag and nodes_to_move set, skipping visited nodes
+            # and nodes outside any subgraph.
             nonlocal can_move, nodes_to_move
 
             if current_node in visited:
