@@ -1,3 +1,6 @@
+# [MODULE DOC] Public FSDP configuration types: enums for sharding strategy, backward prefetch and
+# state dict type, plus dataclasses for mixed precision, CPU offload, and (optimizer) state dict
+# configs, and the StateDictSettings bundle. Pure definitions; no import-time side effects.
 """
 This file includes public APIs for FSDP such as the classes used for the
 constructor arguments.
@@ -30,6 +33,8 @@ __all__ = [
 
 
 class ShardingStrategy(Enum):
+    # [CLASS DOC] Enum of FSDP sharding strategies: FULL_SHARD, SHARD_GRAD_OP, NO_SHARD,
+    # HYBRID_SHARD and the private _HYBRID_SHARD_ZERO2. Values are auto-assigned integers.
     """
     This specifies the sharding strategy to be used for distributed training by
     :class:`FullyShardedDataParallel`.
@@ -70,6 +75,8 @@ class ShardingStrategy(Enum):
 
 
 class BackwardPrefetch(Enum):
+    # [CLASS DOC] Enum selecting explicit backward prefetch timing: BACKWARD_PRE (prefetch before
+    # current gradient computation) or BACKWARD_POST (after). None disables prefetching.
     """
     This configures explicit backward prefetching, which improves throughput by
     enabling communication and computation overlap in the backward pass at the
@@ -110,6 +117,10 @@ class BackwardPrefetch(Enum):
 
 @dataclass
 class MixedPrecision:
+    # [CLASS DOC] Dataclass of FSDP mixed precision settings: optional dtypes for parameters,
+    # gradient reduction and buffers (None means unchanged/derived), flags to keep low precision
+    # grads and to cast forward inputs (root default true, others default false), and a private
+    # sequence of module classes (default batch norm) excluded from mixed precision under auto wrap.
     """
     This configures FSDP-native mixed precision training.
 
@@ -228,6 +239,8 @@ class MixedPrecision:
 
 @dataclass
 class CPUOffload:
+    # [CLASS DOC] Dataclass with one flag, offload_params (default false); when true, parameters and
+    # gradients are offloaded to CPU and the optimizer step runs on CPU.
     """
     This configures CPU offloading.
 
@@ -242,6 +255,8 @@ class CPUOffload:
 
 
 class StateDictType(Enum):
+    # [CLASS DOC] Enum of state dict flavors FSDP can produce/load: FULL_STATE_DICT, LOCAL_STATE_DICT
+    # and SHARDED_STATE_DICT. Used with the state_dict_type context manager.
     """
     This enum indicates that which type of ``state_dict`` the FSDP module is
     currently processing (returning or loading).
@@ -274,6 +289,8 @@ class StateDictType(Enum):
 
 @dataclass
 class StateDictConfig:
+    # [CLASS DOC] Base dataclass for state dict configs; field offload_to_cpu (default false) decides
+    # whether state dict values are moved to CPU. Subclassed per StateDictType.
     """
     ``StateDictConfig`` is the base class for all ``state_dict`` configuration
     classes. Users should instantiate a child class (e.g.
@@ -291,6 +308,8 @@ class StateDictConfig:
 
 @dataclass
 class FullStateDictConfig(StateDictConfig):
+    # [CLASS DOC] Config for FULL_STATE_DICT; adds rank0_only (default false): only rank 0 keeps the
+    # full state dict, other ranks get an empty one.
     """
     ``FullStateDictConfig`` is a config class meant to be used with
     ``StateDictType.FULL_STATE_DICT``. We recommend enabling both
@@ -333,11 +352,14 @@ class FullStateDictConfig(StateDictConfig):
 
 @dataclass
 class LocalStateDictConfig(StateDictConfig):
+    # [CLASS DOC] Config for LOCAL_STATE_DICT; adds no fields beyond the base offload_to_cpu.
     pass
 
 
 @dataclass
 class ShardedStateDictConfig(StateDictConfig):
+    # [CLASS DOC] Config for SHARDED_STATE_DICT; private flag _use_dtensor (default false) selects
+    # DTensor instead of ShardedTensor values. Set by FSDP, not by users.
     """
     ``ShardedStateDictConfig`` is a config class meant to be used with
     ``StateDictType.SHARDED_STATE_DICT``.
@@ -357,6 +379,8 @@ class ShardedStateDictConfig(StateDictConfig):
 
 @dataclass
 class OptimStateDictConfig:
+    # [CLASS DOC] Base dataclass for optimizer state dict configs; offload_to_cpu defaults to true
+    # (unlike StateDictConfig, which defaults to false).
     """
     ``OptimStateDictConfig`` is the base class for all ``optim_state_dict``
     configuration classes.  Users should instantiate a child class (e.g.
@@ -375,6 +399,7 @@ class OptimStateDictConfig:
 
 @dataclass
 class FullOptimStateDictConfig(OptimStateDictConfig):
+    # [CLASS DOC] Optimizer state dict config for the full flavor; adds rank0_only (default false).
     """
     Attributes:
         rank0_only (bool): If ``True``, then only rank 0 saves the full state
@@ -387,11 +412,14 @@ class FullOptimStateDictConfig(OptimStateDictConfig):
 
 @dataclass
 class LocalOptimStateDictConfig(OptimStateDictConfig):
+    # [CLASS DOC] Optimizer state dict config for the local flavor; overrides offload_to_cpu default to false.
     offload_to_cpu: bool = False
 
 
 @dataclass
 class ShardedOptimStateDictConfig(OptimStateDictConfig):
+    # [CLASS DOC] Optimizer state dict config for the sharded flavor; private _use_dtensor flag
+    # (default false) selects DTensor instead of ShardedTensor values.
     """
     ``ShardedOptimStateDictConfig`` is a config class meant to be used with
     ``StateDictType.SHARDED_STATE_DICT``.
@@ -411,6 +439,8 @@ class ShardedOptimStateDictConfig(OptimStateDictConfig):
 
 @dataclass
 class StateDictSettings:
+    # [CLASS DOC] Dataclass bundling the active state dict type with its state dict config and
+    # optimizer state dict config; all three fields are required (no defaults).
     state_dict_type: StateDictType
     state_dict_config: StateDictConfig
     optim_state_dict_config: OptimStateDictConfig

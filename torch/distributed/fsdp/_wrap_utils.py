@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Internal helpers for FSDP auto wrapping. Applies a wrap policy (a callable or a
+# _Policy object) to a root module, handles mixed-precision overrides for ignored module classes,
+# rejects already-wrapped submodules, and validates frozen/non-frozen parameter uniformity per
+# wrapped module. No import-time side effects.
 import collections
 import functools
 import inspect
@@ -31,6 +35,13 @@ def _auto_wrap(
     root_kwargs: dict[str, Any],
     fsdp_fn: Callable,  # e.g. `FullyShardedDataParallel` or `fully_shard`
 ):
+    # [FUNCTION DOC] HELPER: Auto-wraps submodules of root_module in post-order using fsdp_fn (a wrapper
+    # class or a fully_shard-style function). root_kwargs holds all FSDP args except the module and
+    # is read for mixed_precision and use_orig_params. For a _Policy: runs it, applies the
+    # mixed-precision override policy, validates frozen params, then applies wrapping in place.
+    # For a plain callable policy: delegates to the recursive wrap, OR-ing in a policy that wraps
+    # mixed-precision-ignored classes individually. Raises ValueError if any module is already
+    # FSDP-wrapped or frozen params are mixed (non-orig-params). May emit warnings. Returns None.
     """
     Auto wraps modules in ``root_module`` 's tree according to ``policy``
     following a post-order traversal.
@@ -103,6 +114,8 @@ def _auto_wrap(
 
 
 def _check_nested_wrapping(root_module: nn.Module):
+    # [FUNCTION DOC] HELPER: Walks all named modules of root_module and raises ValueError naming the
+    # first one that already has FSDP state attached. Returns None otherwise.
     for module_name, module in root_module.named_modules():
         if _get_module_fsdp_state(module) is not None:
             raise ValueError(
@@ -114,6 +127,8 @@ def _check_nested_wrapping(root_module: nn.Module):
 def _warn_on_overridden_mixed_precision(
     overridden_module_classes: set[type[nn.Module]],
 ):
+    # [FUNCTION DOC] HELPER: Emits a warning listing module classes whose mixed precision is disabled
+    # because they get wrapped as separate FSDP instances. Does nothing if the set is empty.
     if len(overridden_module_classes) == 0:
         return
     warnings.warn(
@@ -131,6 +146,10 @@ def _validate_frozen_params(
     ignored_params: set[nn.Parameter],
     use_orig_params: bool,
 ):
+    # [FUNCTION DOC] HELPER: For each module to be wrapped (visited in post-order so inner wraps claim
+    # their params first), collects the params it would manage (excluding ignored ones) and checks
+    # they are all frozen or all non-frozen. On a mix: warns if use_orig_params is true, else raises
+    # ValueError listing the FQNs of each group. Mutates nothing but local state. Returns None.
     """
     This checks that, given ``modules_to_wrap``, each module would manage
     parameters that are uniformly frozen or non-frozen. This uniformity
@@ -181,6 +200,9 @@ def _validate_frozen_params(
 def _get_post_order_named_modules(
     root_module: nn.Module,
 ) -> list[tuple[str, nn.Module]]:
+    # [FUNCTION DOC] HELPER: Returns (qualified name, module) pairs for the tree under root_module in
+    # post-order (children before parents, root last), via an iterative stack traversal reversed at
+    # the end. Shared submodules appear once (first visit). Skips None children.
     """
     This returns the named modules following a post-order traversal, which is a
     valid reverse topological sort. We achieve this using the reverse of a
@@ -226,6 +248,9 @@ def _get_managed_param_to_fqn(
     visited_modules: set[nn.Module],
     root_prefix: str,
 ) -> dict[nn.Parameter, str]:
+    # [FUNCTION DOC] HELPER: Breadth-first walk from module_to_wrap that maps each non-ignored direct
+    # parameter to its FQN (prefixed by root_prefix). Modules already in visited_modules are not
+    # entered; every module reached is added to visited_modules (mutated in place). Returns the mapping.
     """
     This returns a dict that maps managed parameter to its FQN for the given
     ``module_to_wrap``. The dict's keys are exactly the parameters that would

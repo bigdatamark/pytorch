@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Gradient scaler for sharded training (FSDP/DDP). Defines ShardedGradScaler, a
+# GradScaler subclass that supports CPU and other non-CUDA devices, keeps the scaled loss in its
+# original (possibly low precision) dtype, and all-reduces inf/nan flags across a process group.
+# Also defines small private helpers. Only creates a module logger at import time.
 import logging
 from collections import abc, defaultdict
 from collections.abc import Iterable
@@ -14,10 +18,14 @@ logger = logging.getLogger(__name__)
 
 
 def _refresh_per_optimizer_state() -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Factory for fresh per-optimizer scaler state: stage READY and an empty
+    # mapping from device to found-inf tensor. Used as the defaultdict default factory.
     return {"stage": OptState.READY, "found_inf_per_device": {}}
 
 
 def _is_supported_device(tensor: torch.Tensor) -> bool:
+    # [FUNCTION DOC] HELPER: True if the tensor lives on CUDA or on one of xla, cpu, hpu, mtia, xpu
+    # or the registered privateuse1 backend; false otherwise.
     return tensor.is_cuda or tensor.device.type in (
         "xla",
         "cpu",
@@ -29,12 +37,17 @@ def _is_supported_device(tensor: torch.Tensor) -> bool:
 
 
 class _GeneralMultiDeviceReplicator(_MultiDeviceReplicator):
+    # [CLASS DOC] HELPER: Multi-device tensor replicator that also accepts CPU and other supported
+    # devices. Holds a master tensor and a lazily filled mapping of device to copy (the base class
+    # get method serves per-device copies).
     """
     Lazily serves tensor to request device. This class extends
     _MultiDeviceReplicator to allow support for "cpu" as a device.
     """
 
     def __init__(self, master_tensor: torch.Tensor) -> None:
+        # [FUNCTION DOC] HELPER: Stores master_tensor and an empty per-device cache. Raises
+        # AssertionError if the tensor's device is unsupported. Does not call the base constructor.
         if not _is_supported_device(master_tensor):
             raise AssertionError(
                 f"Expected supported device, got {master_tensor.device}"
@@ -44,6 +57,10 @@ class _GeneralMultiDeviceReplicator(_MultiDeviceReplicator):
 
 
 class ShardedGradScaler(GradScaler):
+    # [CLASS DOC] GradScaler for sharded/offloaded training. Adds a process_group (set only when
+    # enabled) used to all-reduce found-inf flags in unscale_, supports CPU/non-CUDA devices, keeps
+    # scaled outputs in their input dtype, and tracks per-optimizer state keyed by optimizer id.
+    # Key methods: scale, unscale_, update. When disabled, all methods are no-ops/pass-through.
     """
     ShardedGradScaler helps perform gradient scaling in a shard aware manner. It extends
     functionality from GradScaler:
@@ -102,6 +119,9 @@ class ShardedGradScaler(GradScaler):
         enabled: bool = True,
         process_group: ProcessGroup | None = dist.group.WORLD,
     ) -> None:
+        # [FUNCTION DOC] Initializes the base GradScaler with the given device and scaling
+        # hyperparameters. If enabled, also stores process_group (default world group) and creates
+        # the per-optimizer state mapping with fresh READY entries as default.
         super().__init__(
             device,
             init_scale=init_scale,
@@ -129,6 +149,11 @@ class ShardedGradScaler(GradScaler):
     def scale(
         self, outputs: torch.Tensor | Iterable[torch.Tensor]
     ) -> torch.Tensor | Iterable[torch.Tensor]:
+        # [FUNCTION DOC] Multiplies a tensor, or recursively each tensor in nested lists/tuples/
+        # iterables, by the current scale; the result keeps each input's dtype. Lazily initializes
+        # the scale on the first tensor's device. Returns outputs unchanged if disabled. Raises
+        # AssertionError for unsupported devices and ValueError for non-tensor, non-iterable input.
+        # Non-list/tuple iterables are returned as lazy iterators.
         if not self._enabled:
             return outputs
 
@@ -150,6 +175,9 @@ class ShardedGradScaler(GradScaler):
         stash: list[_GeneralMultiDeviceReplicator] = []
 
         def apply_scale(val: torch.Tensor | Iterable[torch.Tensor]):
+            # [FUNCTION DOC] HELPER: Recursive worker for scale. For a tensor, scales it using a shared
+            # replicator (created once into the stash) and restores its dtype. For an iterable, maps
+            # itself over the elements, rebuilding lists/tuples. Raises ValueError otherwise.
             if isinstance(val, torch.Tensor):
                 if not _is_supported_device(val):
                     raise AssertionError(f"Expected supported device, got {val.device}")
@@ -182,6 +210,12 @@ class ShardedGradScaler(GradScaler):
         found_inf: torch.Tensor,
         allow_fp16: bool = True,
     ) -> dict[torch.device, torch.Tensor]:
+        # [FUNCTION DOC] HELPER: Groups the optimizer's gradients (sparse ones via their values) by
+        # device and dtype, then unscales each group in place with the fused non-finite check,
+        # recording inf/nan into a per-device found_inf tensor. Raises ValueError for fp16 grads when
+        # allow_fp16 is false; fp16 sparse grads are coalesced via fp32 (mutating param.grad).
+        # Ensures the result is non-empty by touching the scale's device (ranks may own no grads).
+        # Returns the mapping of device to found_inf tensor.
         per_device_inv_scale = _GeneralMultiDeviceReplicator(inv_scale)
         per_device_found_inf = _GeneralMultiDeviceReplicator(found_inf)
 
@@ -233,6 +267,11 @@ class ShardedGradScaler(GradScaler):
         return per_device_found_inf._per_device_tensors
 
     def unscale_(self, optimizer: torch.optim.Optimizer) -> None:
+        # [FUNCTION DOC] Divides the optimizer's gradients by the scale (reciprocal computed in fp64),
+        # records per-device found_inf flags, marks the optimizer UNSCALED, then asynchronously
+        # all-reduces the flags over process_group (CPU flags are moved to the scaler device for the
+        # reduce and copied back). No-op if disabled. Raises RuntimeError if already unscaled since
+        # the last update or if called after step.
         if not self._enabled:
             return
 
@@ -286,6 +325,10 @@ class ShardedGradScaler(GradScaler):
             torch._foreach_copy_(found_inf_on_cpus, found_inf_on_devices)
 
     def _amp_update_scale_cpu_(self, found_inf: torch.Tensor) -> None:
+        # [FUNCTION DOC] HELPER: CPU implementation of the scale update. If found_inf is at least 1,
+        # multiplies the scale by the backoff factor and zeroes the growth tracker; otherwise
+        # increments the tracker and, on reaching the growth interval, multiplies the scale by the
+        # growth factor and resets the tracker. Mutates scale/tracker; raises AssertionError if uninitialized.
         """
         If found_inf is 1.0 (True), then scale is multiplied by backoff_factor and growth_tracker is set to zero.
         Otherwise, scale is multiplied by the growth factor when the growth interval is reached.
@@ -307,6 +350,11 @@ class ShardedGradScaler(GradScaler):
                 self._growth_tracker = successful
 
     def update(self, new_scale: float | torch.Tensor | None = None) -> None:
+        # [FUNCTION DOC] Ends the iteration: sets the scale to new_scale if given (a float, or a
+        # one-element non-grad tensor on the scaler device; AssertionError otherwise), else sums the
+        # recorded found_inf flags from all optimizers and applies backoff/growth (CPU path or the
+        # fused update op). Raises AssertionError if no inf checks were recorded. Always resets the
+        # per-optimizer states afterwards. No-op if disabled.
         """
         Updates the scale factor.
         If any optimizer steps were skipped the scale is multiplied by ``backoff_factor``
