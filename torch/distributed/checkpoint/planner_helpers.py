@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Helper functions used by checkpoint planners to turn state dict entries into
+# WriteItems (DTensor, ShardedTensor, checkpointable tensor, plain tensor, bytes), to build
+# chunk lists, and to compute ReadItems via a sweep-line resharding algorithm
+# (create_read_items_for_chunk_list, the only public export). Also has save-plan comparison/merge
+# helpers used for plan caching and utilities to materialize meta tensors in a state dict.
+# No import-time side effects.
 import io
 import itertools
 from bisect import bisect_right, insort
@@ -46,6 +52,9 @@ __all__: list[str] = ["create_read_items_for_chunk_list"]
 
 
 def _compare_save_plans(plan: SavePlan, other_plan: SavePlan) -> bool:
+    # [FUNCTION DOC] HELPER: Return True if two SavePlans are equivalent: same usable flag, same
+    # number of items, and pairwise equal item type, index (fqn, offset, index), tensor_data presence,
+    # tensor size, and chunk offsets and sizes. Returns False at the first difference. Pure.
     """
     Compare the two Save plans and return True if they are equal.
 
@@ -111,6 +120,8 @@ def _compare_save_plans(plan: SavePlan, other_plan: SavePlan) -> bool:
 
 
 def _contains_usable_plan(delta_plans: list[SavePlan]) -> bool:
+    # [FUNCTION DOC] HELPER: True if any delta plan is non-empty and marked usable, meaning the
+    # plan changed relative to the cache.
     """
     Check if any delta plan is usable, indicating the plan has changed.
 
@@ -126,6 +137,9 @@ def _merge_delta_local_plans(
     cached_plans: list[SavePlan],
     delta_plans: list[SavePlan],
 ) -> list[SavePlan]:
+    # [FUNCTION DOC] HELPER: Pair cached and delta plans by position and return a list (one per
+    # pair) taking the cached plan when the delta is non-empty but not usable, else the delta plan.
+    # Stops at the shorter list. Despite the docstring, it returns a list of plans, not a single plan.
     """
     Merge a list of delta plans into a single plan.
 
@@ -148,12 +162,14 @@ def _merge_delta_local_plans(
 
 
 def _create_chunk_from_tensor(tensor: torch.Tensor) -> ChunkStorageMetadata:
+    # [FUNCTION DOC] HELPER: Chunk metadata covering a whole tensor: zero offsets and the tensor's sizes.
     return ChunkStorageMetadata(
         offsets=torch.Size([0] * len(tensor.size())), sizes=tensor.size()
     )
 
 
 def _chunk_for_shard(shard_md: ShardMetadata) -> ChunkStorageMetadata:
+    # [FUNCTION DOC] HELPER: Convert a ShardMetadata into chunk metadata using its offsets and sizes.
     return ChunkStorageMetadata(
         offsets=torch.Size(shard_md.shard_offsets),
         sizes=torch.Size(shard_md.shard_sizes),
@@ -163,6 +179,8 @@ def _chunk_for_shard(shard_md: ShardMetadata) -> ChunkStorageMetadata:
 def _sharded_tensor_metadata(
     sharded_tensor: ShardedTensor, shard_md: ShardMetadata
 ) -> TensorWriteData:
+    # [FUNCTION DOC] HELPER: Build TensorWriteData for one shard: the shard's chunk, tensor properties
+    # copied from the ShardedTensor metadata, and the global size of the sharded tensor.
     shard_properties = sharded_tensor.metadata().tensor_properties
 
     properties = TensorProperties(
@@ -181,6 +199,9 @@ def _sharded_tensor_metadata(
 
 
 def _create_write_items_for_dtensor(fqn: str, tensor: DTensor) -> WriteItem:
+    # [FUNCTION DOC] HELPER: Build one SHARD WriteItem for this rank's local part of a DTensor. Local
+    # shape and global offset come from the device mesh and placements; properties come from the
+    # local tensor and size is the global DTensor size. Returns a single item despite the plural name.
     sizes, offsets = compute_local_shape_and_global_offset(
         tensor.shape, tensor.device_mesh, tensor.placements
     )
@@ -203,6 +224,8 @@ def _create_write_items_for_dtensor(fqn: str, tensor: DTensor) -> WriteItem:
 def _create_write_item_for_shard(
     fqn: str, sharded_tensor: ShardedTensor, shard_md: ShardMetadata
 ) -> WriteItem:
+    # [FUNCTION DOC] HELPER: Build a SHARD WriteItem for one shard of a ShardedTensor, indexed by
+    # fqn and the shard offsets.
     offsets = torch.Size(shard_md.shard_offsets)
     return WriteItem(
         index=MetadataIndex(fqn, offsets),
@@ -212,6 +235,8 @@ def _create_write_item_for_shard(
 
 
 def _create_write_item_for_tensor(fqn: str, tensor: torch.Tensor) -> WriteItem:
+    # [FUNCTION DOC] HELPER: Build a TENSOR WriteItem for a whole plain tensor (zero offsets, full
+    # size, properties taken from the tensor).
     offsets = torch.Size([0] * len(tensor.size()))
     return WriteItem(
         index=MetadataIndex(fqn, offsets),
@@ -227,6 +252,9 @@ def _create_write_item_for_tensor(fqn: str, tensor: torch.Tensor) -> WriteItem:
 def _get_checkpointable_tensor_write_items(
     fqn: str, tensor: CheckpointableTensor
 ) -> list[WriteItem]:
+    # [FUNCTION DOC] HELPER: Build one SHARD WriteItem per local chunk reported by the checkpointable
+    # tensor protocol, indexed by fqn, chunk offsets and chunk position, with the tensor's global shape
+    # as size. Raises TypeError if the object is not a torch.Tensor.
     if not isinstance(tensor, torch.Tensor):
         raise TypeError("CheckpointableTensor must also be a torch.Tensor")
     properties = TensorProperties.create_from_tensor(tensor)
@@ -245,6 +273,7 @@ def _get_checkpointable_tensor_write_items(
 
 
 def _create_write_item_for_bytesio(fqn: str, bytes: Any):
+    # [FUNCTION DOC] HELPER: Build a BYTE_IO WriteItem indexed by fqn only; the bytes argument is unused.
     return WriteItem(
         index=MetadataIndex(fqn),
         type=WriteItemType.BYTE_IO,
@@ -254,6 +283,8 @@ def _create_write_item_for_bytesio(fqn: str, bytes: Any):
 def _create_read_item_for_byteio(
     dest_index, dest_offset, storage_index, storage_offset, length
 ):
+    # [FUNCTION DOC] HELPER: Build a BYTE_IO ReadItem; scalar offsets and length are wrapped as
+    # one-element sizes.
     return ReadItem(
         type=LoadItemType.BYTE_IO,
         dest_index=dest_index,
@@ -267,6 +298,7 @@ def _create_read_item_for_byteio(
 def _create_read_item_for_tensor(
     dest_index, dest_offsets, storage_index, storage_offsets, lengths
 ):
+    # [FUNCTION DOC] HELPER: Build a TENSOR ReadItem; offset and length sequences are converted to sizes.
     return ReadItem(
         type=LoadItemType.TENSOR,
         dest_index=dest_index,
@@ -282,6 +314,12 @@ def create_read_items_for_chunk_list(
     checkpoint_md: TensorStorageMetadata,
     local_chunks: list[ChunkStorageMetadata],
 ) -> list[ReadItem]:
+    # [FUNCTION DOC] Compute the reads needed to fill local_chunks from the saved chunks in
+    # checkpoint_md. Picks a sweep dimension (largest overall extent for multi-dim tensors; 0-d
+    # tensors treat all chunks as overlapping), sorts chunks by start along it, and sweeps while
+    # keeping an active set of saved chunks, then checks real overlap of each candidate pair and
+    # emits one tensor ReadItem per overlapping pair with per-dimension storage/dest offsets and
+    # lengths. Returns an empty list if either chunk list is empty. Pure; no side effects.
     """
     Create a list of ``ReadItem`` based on the checkpoint and local chunks.
 
@@ -401,6 +439,9 @@ def create_read_items_for_chunk_list(
 
 
 def _create_default_metadata_only_plan(state_dict: STATE_DICT_TYPE) -> SavePlan:
+    # [FUNCTION DOC] HELPER: Build a SavePlan with WriteItems derived only from metadata for every
+    # entry: DTensor, ShardedTensor (all shards in the global metadata), checkpointable tensor,
+    # plain tensor, or bytes for anything else. Does not read local data.
     requests = []
     for fqn, obj in state_dict.items():
         if isinstance(obj, DTensor):
@@ -422,6 +463,9 @@ def _create_default_metadata_only_plan(state_dict: STATE_DICT_TYPE) -> SavePlan:
 
 
 def _create_write_items(fqn: str, object: Any) -> list[WriteItem]:
+    # [FUNCTION DOC] HELPER: Return the WriteItems for one state dict value. Uses the value's own
+    # write-item hook if it has one, else dispatches on type: ShardedTensor (one per local shard),
+    # checkpointable tensor (one per chunk), plain tensor (one), otherwise a single bytes item.
     if hasattr(object, "__create_write_items__"):
         # DTensor implements _Checkpointable
         return object.__create_write_items__(fqn, object)  # type: ignore[attr-defined]
@@ -439,6 +483,7 @@ def _create_write_items(fqn: str, object: Any) -> list[WriteItem]:
 
 
 def _create_chunk_from_dtensor(tensor: DTensor) -> ChunkStorageMetadata:
+    # [FUNCTION DOC] HELPER: Chunk metadata (global offset and local shape) of this rank's part of a DTensor.
     sizes, offsets = compute_local_shape_and_global_offset(
         tensor.shape, tensor.device_mesh, tensor.placements
     )
@@ -450,6 +495,9 @@ def _create_chunk_from_dtensor(tensor: DTensor) -> ChunkStorageMetadata:
 
 
 def _create_chunk_list(tensor: torch.Tensor) -> list[ChunkStorageMetadata]:
+    # [FUNCTION DOC] HELPER: Return the local chunks of a tensor-like value: via its chunk-list hook if
+    # present, else checkpointable chunks, ShardedTensor local shards, or one whole-tensor chunk.
+    # Raises ValueError for any other type.
     if hasattr(tensor, "__create_chunk_list__"):
         # DTensor implements _Checkpointable
         local_chunks = tensor.__create_chunk_list__()  # type: ignore[attr-defined]
@@ -471,6 +519,10 @@ def _create_chunk_list(tensor: torch.Tensor) -> list[ChunkStorageMetadata]:
 
 
 def _create_read_items(fqn: str, md: STORAGE_TYPES, obj: Any) -> list[ReadItem]:
+    # [FUNCTION DOC] HELPER: Create ReadItems for one state dict entry given its checkpoint metadata.
+    # For tensor metadata, computes local chunks of obj and resharded read items; a value of
+    # unsupported type is reported as a ValueError about invalid checkpoint metadata. For bytes
+    # metadata returns a single bytes ReadItem with zero offsets and length.
     if not isinstance(md, BytesStorageMetadata):
         try:
             local_chunks = _create_chunk_list(obj)
@@ -494,11 +546,18 @@ def _create_read_items(fqn: str, md: STORAGE_TYPES, obj: Any) -> list[ReadItem]:
 
 
 def _init_state_dict(state_dict: dict[str, Any]) -> Any:
+    # [FUNCTION DOC] HELPER: Replace meta-device tensors in a state dict (in place, for dict and list
+    # containers) with real empty tensors on the default process group device: DTensors are
+    # recreated from an empty local tensor keeping mesh, placements, shape and stride; plain tensors
+    # get empty_like (copying checkpointable metadata); ShardedTensors on meta raise RuntimeError.
+    # KNOWN ISSUE: annotated to return Any but returns nothing (None).
     """
     Initializes meta tensor if the meta tensor is DTensor or torch.Tensor.
     """
 
     def dtensor_func(value: DTensor):
+        # [FUNCTION DOC] HELPER: If the DTensor is on meta, return a new DTensor built from an empty
+        # local tensor on the current default device; otherwise return it unchanged.
         device = getattr(value, "device", None)
         if device == torch.device("meta"):
             device_type = dist.distributed_c10d._get_pg_default_device().type
@@ -520,6 +579,7 @@ def _init_state_dict(state_dict: dict[str, Any]) -> Any:
             return value
 
     def sharded_tensor_func(value: Any):
+        # [FUNCTION DOC] HELPER: Raise RuntimeError if the value is on meta; else return it unchanged.
         device = getattr(value, "device", None)
         if device == torch.device("meta"):
             raise RuntimeError(
@@ -529,6 +589,9 @@ def _init_state_dict(state_dict: dict[str, Any]) -> Any:
             return value
 
     def tensor_func(value: torch.Tensor):
+        # [FUNCTION DOC] HELPER: If the tensor is on meta, return an empty tensor of the same shape on
+        # the current default device (copying checkpointable metadata when applicable); otherwise
+        # return it unchanged.
         device = getattr(value, "device", None)
         if device == torch.device("meta"):
             device_type = dist.distributed_c10d._get_pg_default_device().type
@@ -556,6 +619,10 @@ def _iterate_state_dict(
     sharded_tensor_func: Callable,
     tensor_func: Callable,
 ):
+    # [FUNCTION DOC] HELPER: Recursively walk a nested structure, applying the matching callback to
+    # each DTensor, ShardedTensor or Tensor and returning its result. Scalars, strings, bytes,
+    # BytesIO and None are returned as is. Dicts are updated in place with the results; lists and
+    # tuples produce a new list (tuple preserved). Other types fall through and return None.
     """
     Iterate through the state dict, applying the given functions to each tensor type
     and update the state dict in place.

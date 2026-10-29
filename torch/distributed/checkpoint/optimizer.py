@@ -1,5 +1,12 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 
+# [MODULE DOC] Helpers to load FSDP/TP-sharded optimizer state from a distributed checkpoint.
+# Exports load_sharded_optimizer_state_dict, which allocates empty sharded/plain tensors for every
+# optimizer entry found in checkpoint metadata and fills them via load_state_dict.
+# Private helpers compute per-rank device placement, a column-wise ChunkShardingSpec, the 2D (TP slice)
+# layout of a model state dict, and a load planner that applies TP offsets.
+# No import-time side effects besides defining STATE_DICT_2D_LAYOUT.
+
 import dataclasses
 from collections.abc import Sequence
 from typing import cast
@@ -54,6 +61,9 @@ __all__ = [
 
 
 def _gen_rank_device(global_rank: int, device_type: str = "cuda") -> str:
+    # [FUNCTION DOC] HELPER: Map a global rank to a device string. Returns "cpu" for cpu device type or
+    # when the device module is unavailable; otherwise a normalized device string using the rank
+    # modulo the local device count.
     if device_type == "cpu":
         return "cpu"
     device_module = _get_device_module(device_type)
@@ -67,6 +77,9 @@ def _gen_rank_device(global_rank: int, device_type: str = "cuda") -> str:
 def _create_colwise_spec(
     pg: dist.ProcessGroup | None = None,
 ) -> ChunkShardingSpec:
+    # [FUNCTION DOC] HELPER: Build a ChunkShardingSpec that shards dim 0 across all ranks of the given
+    # process group (or the default world when None). Each placement is "rank:<idx>/<device>" where
+    # the device is derived from the group's default device type and the rank's global rank.
     pg_device_type = dist.distributed_c10d._get_pg_default_device(pg).type
     if pg is None:
         placements = [
@@ -85,6 +98,10 @@ def _create_colwise_spec(
 
 
 def _is_nested_tensor(val: torch.Tensor) -> bool:
+    # [FUNCTION DOC] HELPER: True if val is a ShardedTensor whose first local shard is itself a
+    # ShardedTensor (2D FSDP+TP layout). False for empty or plain values.
+    # Raises ValueError for a DTensor nested in a ShardedTensor, or a DTensor wrapping a DTensor or
+    # ShardedTensor.
     if type(val) is ShardedTensor:
         if len(val.local_shards()) == 0:
             return False
@@ -102,6 +119,10 @@ def _is_nested_tensor(val: torch.Tensor) -> bool:
 def _alloc_tensor(
     props: TensorProperties, size: Sequence[int], device_type: str = "cuda"
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Allocate an uninitialized tensor of the given size on the current device of
+    # device_type, copying dtype, layout, requires_grad and pin_memory from props.
+    # KNOWN ISSUE: for cpu the "device" is whatever the cpu module's current_device returns, cast
+    # to a device without conversion.
     if device_type == "cpu":
         device = cast(torch.device, _get_device_module(device_type).current_device())
     else:
@@ -122,6 +143,10 @@ def _alloc_tensor(
 def _get_state_dict_2d_layout(
     state_dict: STATE_DICT_TYPE,
 ) -> tuple[STATE_DICT_2D_LAYOUT, dist.ProcessGroup | None]:
+    # [FUNCTION DOC] HELPER: Inspect a model state dict and return a mapping from key to (offset, size)
+    # of the local TP slice (offset None for non-nested entries, where size is the tensor size),
+    # plus the data-parallel process group taken from the last nested ShardedTensor (None if none).
+    # Raises AssertionError if a nested tensor has several local shards or is not a ShardedTensor.
     """
     Load the right TP slice of the optimizer state.
 
@@ -155,12 +180,19 @@ def _get_state_dict_2d_layout(
 
 
 class _ReaderWithOffset(DefaultLoadPlanner):
+    # [CLASS DOC] HELPER: DefaultLoadPlanner variant that reads each ShardedTensor shard from a
+    # displaced region of the checkpoint tensor given by fqn_to_offset (the TP slice offset).
+    # State: fqn_to_offset (input), metadata and state_dict (set by the base planner), and
+    # translation, a mapping from displaced MetadataIndex back to the original index, rebuilt on
+    # every create_local_plan and consulted in lookup_tensor.
     translation: dict[MetadataIndex, MetadataIndex]
     state_dict: STATE_DICT_TYPE
     # pyrefly: ignore [bad-override]
     metadata: Metadata
 
     def __init__(self, fqn_to_offset: dict[str, Sequence[int]]) -> None:
+        # [FUNCTION DOC] Store the fqn-to-offset mapping and initialize empty metadata, state_dict
+        # and translation.
         super().__init__()
         self.fqn_to_offset = fqn_to_offset
         self.metadata = Metadata({})
@@ -168,6 +200,11 @@ class _ReaderWithOffset(DefaultLoadPlanner):
         self.translation = {}
 
     def create_local_plan(self) -> LoadPlan:
+        # [FUNCTION DOC] Build the LoadPlan. Entries that are not ShardedTensors or have no offset get
+        # normal read items. For offset entries, the single local shard's chunk is shifted by the
+        # offset to create read items, and each displaced dest index is recorded in translation
+        # mapped to the un-displaced index. Raises AssertionError if the shard count is not one or
+        # a dest offset is missing. Resets translation as a side effect.
         requests = []
         self.translation = {}
         for fqn, obj in self.state_dict.items():
@@ -212,6 +249,8 @@ class _ReaderWithOffset(DefaultLoadPlanner):
         return LoadPlan(requests)
 
     def lookup_tensor(self, index: MetadataIndex) -> torch.Tensor:
+        # [FUNCTION DOC] Resolve the destination tensor, first translating a displaced index back to
+        # the original one when present in translation.
         return super().lookup_tensor(self.translation.get(index, index))
 
 
@@ -221,6 +260,14 @@ def load_sharded_optimizer_state_dict(
     storage_reader: StorageReader,
     planner: LoadPlanner | None = None,
 ) -> STATE_DICT_TYPE:
+    # [FUNCTION DOC] Read checkpoint metadata, and for every entry whose planner path starts with
+    # optimizer_key allocate a destination: a placeholder string for bytes, a plain tensor for
+    # single-element tensors, a chunk-sharded tensor when no TP process group exists, or a
+    # ShardedTensor built from the TP layout (recording TP offsets) otherwise. Then calls
+    # load_state_dict (using _ReaderWithOffset when a TP group exists, else the given planner),
+    # unflattens the result with the saved planner data and returns it.
+    # Args: model_state_dict (must come from FSDP sharded state dict), optimizer_key,
+    # storage_reader, optional planner. Side effects: allocates tensors, performs collective loads.
     """
     Load a state_dict in conjunction with FSDP sharded optimizer state.
 

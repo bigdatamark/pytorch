@@ -1,3 +1,5 @@
+# [MODULE DOC] Geometry helpers for checkpoint resharding: test whether two chunks overlap and
+# compute the overlapping region of a saved chunk and a current chunk. Exports nothing publicly.
 from torch.distributed.checkpoint.metadata import ChunkStorageMetadata
 
 
@@ -7,6 +9,8 @@ __all__: list[str] = []
 def _check_shard_metadata_pair_overlap(
     shard1: ChunkStorageMetadata, shard2: ChunkStorageMetadata
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Return True if the two chunks overlap in every dimension (uses the
+    # first chunk's rank; no overlap if in any dimension one starts at or past the other's end).
     """Check if two shards overlap."""
     # For each dim of each shard, check if one shard resides on the other
     # end of second shard with respect to that dim. As an example for a 2D
@@ -25,6 +29,9 @@ def _check_shard_metadata_pair_overlap(
 def _shards_get_overlap_region_wrt_saved_tensor(
     saved_shard: ChunkStorageMetadata, current_shard: ChunkStorageMetadata
 ) -> list[tuple[int, int, int, int]]:
+    # [FUNCTION DOC] HELPER: For each dimension return (dim, offset within saved shard, offset within
+    # current shard, overlap length). Assumes the shards overlap; with no overlap the length can be
+    # zero or negative (not checked).
     """
     Return the overlapping region between saved_shard and current_shard.
 

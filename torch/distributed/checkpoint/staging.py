@@ -1,3 +1,8 @@
+# [MODULE DOC] Staging utilities for async distributed checkpointing: the AsyncStager protocol,
+# StagingOptions config, DefaultStager (optional background thread, pinned/shared memory,
+# non-blocking copies), BlockingAsyncStager (synchronous CPU copy), and the experimental private
+# _ReplicationStager (exchanges state dicts with a partner rank). The string literal after
+# __all__ is not a real module docstring (just an unused expression). No import-time side effects.
 import os
 import tempfile
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -38,6 +43,11 @@ Classes:
 
 @runtime_checkable
 class AsyncStager(Protocol):
+    # [CLASS DOC] Runtime-checkable protocol for stagers used by async save: stage produces a
+    # training-safe copy of a state dict (possibly as a Future), synchronize_staging waits for
+    # staging to finish (deprecated), close releases resources. The class attribute
+    # _synchronize_after_execute (default True) is exposed through should_synchronize_after_execute
+    # and tells async save whether to synchronize right after starting the save.
     """
     This protocol is meant to provide customization and extensibility for dcp.async_save, allowing users
     to customize how data is staged previous to executing the usual dcp.save path in parallel.
@@ -69,6 +79,7 @@ class AsyncStager(Protocol):
 
     @property
     def should_synchronize_after_execute(self) -> bool:
+        # [FUNCTION DOC] Property returning the _synchronize_after_execute flag.
         """
         Whether to synchronize after executing the stage.
         """
@@ -77,6 +88,8 @@ class AsyncStager(Protocol):
     def stage(
         self, state_dict: STATE_DICT_TYPE
     ) -> Future[STATE_DICT_TYPE] | STATE_DICT_TYPE:
+        # [FUNCTION DOC] Protocol default: raises NotImplementedError naming the class; implementations
+        # return a staged copy of state_dict, or a Future of it.
         """
         Returns a "staged" copy of `state_dict`. The expectation of the staged copy is that it is
         inoculated from any updates incurred after the stage call is complete.
@@ -91,12 +104,15 @@ class AsyncStager(Protocol):
         category=FutureWarning,
     )
     def synchronize_staging(self) -> None:
+        # [FUNCTION DOC] Protocol default: does nothing (deprecated, emits FutureWarning when called);
+        # implementations block until async staging finishes.
         """
         In the case `stage` is async in some way, this method should be called to ensure staging
         is complete and it is safe to begin modifying the original `state_dict`
         """
 
     def close(self) -> None:
+        # [FUNCTION DOC] Protocol default: does nothing; implementations release stager resources.
         """
         Clean up all resources used by the stager.
         """
@@ -104,6 +120,9 @@ class AsyncStager(Protocol):
 
 @dataclass
 class StagingOptions:
+    # [CLASS DOC] Dataclass of DefaultStager settings, all booleans defaulting to True:
+    # use_pinned_memory, use_shared_memory, use_async_staging (background thread) and
+    # use_non_blocking_copy (requires an available accelerator).
     """
     Configuration options for checkpoint staging behavior.
 
@@ -131,6 +150,9 @@ class StagingOptions:
 
 
 class DefaultStager(AsyncStager):
+    # [CLASS DOC] Full-featured stager. Holds a config, a StateDictStager doing the actual copies,
+    # an optional single-worker thread pool (async mode), an optional accelerator stream used for
+    # non-blocking copies in async mode, and the latest staging Future. Not thread-safe.
     """
     DefaultStager provides a full-featured staging implementation that combines
     multiple optimization techniques for efficient checkpoint preparation.
@@ -170,6 +192,10 @@ class DefaultStager(AsyncStager):
         self,
         config: StagingOptions = StagingOptions(),
     ):
+        # [FUNCTION DOC] Create the underlying StateDictStager (pinned/shared memory per config). For
+        # async staging, create a one-thread executor and, if an accelerator is available, a dedicated
+        # stream (created on the calling thread). Raises AssertionError if non-blocking copy is
+        # requested but no accelerator is available. Note the default config is a shared instance.
         self._config = config
         self._state_dict_stager = StateDictStager(
             pin_memory=config.use_pinned_memory, share_memory=config.use_shared_memory
@@ -198,6 +224,10 @@ class DefaultStager(AsyncStager):
         state_dict: STATE_DICT_TYPE,
         **kwargs: Any,
     ) -> STATE_DICT_TYPE | Future[STATE_DICT_TYPE]:
+        # [FUNCTION DOC] Stage state_dict. In async mode submit the staging job to the executor, remember
+        # the Future and return it; otherwise stage synchronously and return the staged dict. Extra
+        # keyword arguments are forwarded to the staging step. Raises AssertionError if async mode has
+        # no executor.
         """
         This function is responsible for staging staging the state_dict.
         See class docstring for more details on staging.
@@ -223,6 +253,11 @@ class DefaultStager(AsyncStager):
             return self._stage(state_dict, **kwargs)
 
     def _stage(self, state_dict: STATE_DICT_TYPE, **kwargs: Any) -> STATE_DICT_TYPE:
+        # [FUNCTION DOC] HELPER: Perform the copy via the StateDictStager. With non-blocking copy, runs
+        # inside the staging stream context (if any) and then synchronizes that stream (or the
+        # accelerator) to wait for queued copies; raises AssertionError if async mode lacks a stream.
+        # Otherwise does a blocking stage. Returns the staged dict.
+        # KNOWN ISSUE: kwargs are accepted but not used.
         if self._config.use_non_blocking_copy:
             if not (self._staging_stream or not self._config.use_async_staging):
                 raise AssertionError(
@@ -244,6 +279,8 @@ class DefaultStager(AsyncStager):
         return state_dict
 
     def close(self) -> None:
+        # [FUNCTION DOC] Shut down the executor (waiting for pending work) if any, and close the
+        # underlying StateDictStager, releasing cached storages. Stager must not be reused afterwards.
         """
         Clean up all resources used by the DefaultStager. Shuts down the ThreadPoolExecutor
         used for async staging operations and cleans up the underlying StateDictStager's
@@ -262,6 +299,8 @@ class DefaultStager(AsyncStager):
         self._state_dict_stager.close()
 
     def synchronize_staging(self) -> None:
+        # [FUNCTION DOC] Block until the most recent staging Future (if any) completes; re-raises its
+        # exception. No-op if nothing was staged asynchronously.
         """
         When use_async_staging is True, this method will wait until staging is complete.
         If use_async_staging is False, this method is a no-op.
@@ -271,6 +310,9 @@ class DefaultStager(AsyncStager):
 
 
 class BlockingAsyncStager(AsyncStager):
+    # [CLASS DOC] Synchronous stager that copies the state dict to CPU memory and returns it. State:
+    # cache_staged_state_dict (reuse one pinned CPU copy across calls), type_check, and
+    # state_dict_cache (the reusable copy, created lazily). Its _synchronize_after_execute is False.
     """
     An implementation of AsyncStager which stages the state_dict on CPU RAM and blocks until the copy is complete.
     This implementation also provides an option to optimize stage latency using pinned memory.
@@ -288,6 +330,7 @@ class BlockingAsyncStager(AsyncStager):
         cache_staged_state_dict: bool = False,
         type_check: bool = False,
     ):
+        # [FUNCTION DOC] Store the caching and type-check options and start with no cached state dict.
         """
         Initializes the BlockingAsyncStager.
 
@@ -303,6 +346,9 @@ class BlockingAsyncStager(AsyncStager):
         self.state_dict_cache: STATE_DICT_TYPE | None = None
 
     def stage(self, state_dict: STATE_DICT_TYPE) -> STATE_DICT_TYPE:
+        # [FUNCTION DOC] Return a CPU copy of state_dict. Without caching, allocate a fresh CPU state
+        # dict and copy into it. With caching, lazily create a pinned CPU cache on first call and copy
+        # into it every time (the same cached object is returned and overwritten on later calls).
         """
         Returns a copy of `state_dict` on the CPU.
         """
@@ -317,15 +363,21 @@ class BlockingAsyncStager(AsyncStager):
         return _copy_state_dict(state_dict, self.state_dict_cache)
 
     def synchronize_staging(self) -> None:
+        # [FUNCTION DOC] No-op because staging is blocking.
         """
         No-op function, since staging is blocking.
         """
 
     def close(self) -> None:
+        # [FUNCTION DOC] No-op; the cached state dict is not released.
         pass
 
 
 class _ReplicationStager(AsyncStager):
+    # [CLASS DOC] HELPER: Experimental stager that replicates a state dict to a partner rank (rank
+    # plus half the world size, modulo world size) over a PGTransport and persists the received
+    # replica to disk. State: process group, timeout, device, transport and storage directory
+    # (a fresh temp dir if none given). Assumes an even world size. Its _synchronize_after_execute is False.
     """
     An AsyncStager implementation that replicates state_dict across training ranks
     using PGTransport.
@@ -348,6 +400,8 @@ class _ReplicationStager(AsyncStager):
         device: torch.device = torch.device("cpu"),
         storage_dir: str | None = None,
     ):
+        # [FUNCTION DOC] Store pg, timeout and device, create a PGTransport, and set the storage
+        # directory (create a temp directory when none is given); makes sure the directory exists.
         self._pg = pg
         self._timeout = timeout
         self._device = device
@@ -363,6 +417,12 @@ class _ReplicationStager(AsyncStager):
     def stage(
         self, state_dict: STATE_DICT_TYPE
     ) -> Future[STATE_DICT_TYPE] | STATE_DICT_TYPE:
+        # [FUNCTION DOC] Exchange state_dict with the partner rank: the lower-numbered rank sends then
+        # receives, the other receives then sends (avoids deadlock). Persists the received replica to
+        # disk and returns it. If distributed is not initialized, returns state_dict unchanged.
+        # Raises RuntimeError if persisting fails. Blocking despite the Future return type.
+        # KNOWN ISSUE: if world size is 1 the partner is the rank itself, so the same rank would
+        # both send and receive; the even-world-size assumption is not checked.
         """
         Stage the state_dict by replicating it across ranks. Returns a state_dict representing
         the received replica.
@@ -405,6 +465,10 @@ class _ReplicationStager(AsyncStager):
     def _persist_state_dict(
         self, state_dict: STATE_DICT_TYPE, current_rank: int, partner_rank: int
     ) -> None:
+        # [FUNCTION DOC] HELPER: Save state_dict with torch.save to the persisted path via a temporary
+        # file (flush, fsync, then atomic rename), creating the directory if needed and overwriting any
+        # earlier replica for the same rank pair. On any failure removes the temp file (ignoring
+        # cleanup errors) and raises RuntimeError with context.
         """
         Persist the received state_dict to disk for future discoverability.
         Only keeps one replica per rank, overwriting any previous replica.
@@ -445,6 +509,8 @@ class _ReplicationStager(AsyncStager):
             ) from e
 
     def _get_persisted_path(self, current_rank: int, partner_rank: int) -> str:
+        # [FUNCTION DOC] HELPER: Return the file path in the storage directory named from the current
+        # and partner ranks (pure; does not touch disk).
         """
         Get the file path where a state_dict would be persisted.
 
@@ -458,11 +524,13 @@ class _ReplicationStager(AsyncStager):
         return os.path.join(self._storage_dir, filename)
 
     def synchronize_staging(self) -> None:
+        # [FUNCTION DOC] No-op because staging is blocking.
         """
         No-op function, since staging is blocking.
         """
 
     def close(self) -> None:
+        # [FUNCTION DOC] No-op; persisted replica files are intentionally kept.
         """
         Clean up resources. Persisted files are intentionally left for future discovery.
         """

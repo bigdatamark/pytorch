@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Provides QuantizedHuggingFaceStorageReader, a HuggingFaceStorageReader that
+# dequantizes weights while reading safetensors checkpoints: 2D block-wise scaled weights
+# (weight with weight_scale_inv, e.g. deepseek) and 4D MXFP4 weights (blocks with scales, e.g.
+# gpt-oss). Creates a module logger at import time; no other import-time side effects.
 import json
 import logging
 import math
@@ -19,6 +23,12 @@ __all__ = ["QuantizedHuggingFaceStorageReader"]
 
 
 class QuantizedHuggingFaceStorageReader(HuggingFaceStorageReader):
+    # [CLASS DOC] Reader for HuggingFace safetensors checkpoints holding quantized tensors, which
+    # must each be fully contained in one file. State: target_dtype and block_size (dequantization
+    # settings), _weight_scale_mapping (quantized tensor name -> scale tensor name), _weight_map
+    # (tensor name -> file from the index) and _tensor_full_shapes (name -> dequantized shape).
+    # Metadata sizes are rewritten to the dequantized shape so planners see full-precision shapes;
+    # read requests for quantized tensors are served by dequantizing on the fly.
     """
     Extension of HuggingFaceStorageReader that handles quantized tensors.
     Checkpoint should have the full tensor in a SafeTensor file. The quantized
@@ -36,6 +46,8 @@ class QuantizedHuggingFaceStorageReader(HuggingFaceStorageReader):
         target_dtype: torch.dtype = torch.float32,
         block_size: int = 128,
     ):
+        # [FUNCTION DOC] Initialize the base reader with path and thread_count, store target_dtype
+        # and block_size, and create empty scale-mapping, weight-map and full-shape caches.
         """
         Initialize the HuggingFace storage reader to load quantized checkpoints
 
@@ -56,6 +68,11 @@ class QuantizedHuggingFaceStorageReader(HuggingFaceStorageReader):
         self._tensor_full_shapes: dict[str, torch.Size] = {}
 
     def read_metadata(self) -> Any:
+        # [FUNCTION DOC] Read base metadata, then load the quantization index (side effect: fills
+        # scale mapping and weight map). For each tensor entry, cache its full shape; for names ending
+        # in _blocks (MXFP4) also cache the original quantized shape under a "_quantized" key and
+        # mutate the metadata size so the last two dims (groups, bytes) become one dim of groups
+        # times bytes times two. Returns the (mutated) metadata.
         metadata = super().read_metadata()
 
         # Load quantization metadata first.
@@ -82,6 +99,8 @@ class QuantizedHuggingFaceStorageReader(HuggingFaceStorageReader):
         return metadata
 
     def _load_quantization_metadata(self):
+        # [FUNCTION DOC] HELPER: Open the checkpoint's JSON index file, read its weight map and build
+        # the weight-scale mapping from it. Raises on missing or invalid file.
         """Load quantization metadata from the checkpoint."""
         checkpoint_path = Path(self.path)
         # Load weight mapping from index file
@@ -93,6 +112,10 @@ class QuantizedHuggingFaceStorageReader(HuggingFaceStorageReader):
             self._build_weight_scale_mapping(weight_map)
 
     def _build_weight_scale_mapping(self, weight_map: dict[str, str]):
+        # [FUNCTION DOC] HELPER: Store weight_map and fill the weight-scale mapping: a name ending in
+        # weight_scale_inv pairs with the same name ending in weight, and a name ending in _scales
+        # pairs with the corresponding _blocks name, when that partner exists in the map.
+        # KNOWN ISSUE: the _scales replacement substitutes every occurrence of the substring, not just the suffix.
         """Analyze and build weight-scale tensor pairs from weight mapping."""
         # Store the complete weight map for file location lookups.
         self._weight_map = weight_map
@@ -111,6 +134,10 @@ class QuantizedHuggingFaceStorageReader(HuggingFaceStorageReader):
     def _process_read_request(
         self, f: Any, req: ReadItem, planner: LoadPlanner
     ) -> None:
+        # [FUNCTION DOC] HELPER: Serve one ReadItem: dequantize via the block-aligned reader if the
+        # tensor is quantized, otherwise slice the raw tensor from the open safetensors file. Then
+        # resolve the destination tensor from the planner, check sizes match (AssertionError if not),
+        # copy the data in and commit it through the planner.
         """Override the Helper function that processes a single read request."""
         tensor_fqn = req.storage_index.fqn
 
@@ -138,6 +165,10 @@ class QuantizedHuggingFaceStorageReader(HuggingFaceStorageReader):
     def _get_slice_to_block_mapping(
         self, req: ReadItem
     ) -> tuple[tuple[int, int], tuple[int, int], slice, slice]:
+        # [FUNCTION DOC] HELPER: From the read item's first two storage offsets and lengths, compute the
+        # row and column slices and the half-open ranges of block indices (block_size units) they span.
+        # Returns (row block range, column block range, row slice, column slice).
+        # KNOWN ISSUE: inline comments call the end block inclusive but the computed end is exclusive.
         """
         Calculate which blocks correspond to the requested slice.
 
@@ -177,6 +208,13 @@ class QuantizedHuggingFaceStorageReader(HuggingFaceStorageReader):
         group_start: int,
         offset_in_first_group: int,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Dequantize MXFP4 data. Slices the full scale tensor to match the blocks
+        # (using the request offsets and group_start), converts scales to exponents by subtracting 127,
+        # raises AssertionError on shape mismatch, then in chunks of rows looks up the low and high
+        # nibble of each byte in a 16-entry FP4 table (written into even and odd output positions) and
+        # scales by two to the exponent. Result is in target_dtype with the last two dims merged to
+        # groups times bytes times two, trimmed to the requested range using offset_in_first_group and
+        # the request length in dim 2.
         """
         Dequantize a 4D tensor using MXFP4 format.
         Adapted from openai's implementation:
@@ -281,6 +319,10 @@ class QuantizedHuggingFaceStorageReader(HuggingFaceStorageReader):
         full_tensor_shape: torch.Size,
         slice_info: tuple[tuple[int, int], tuple[int, int], slice, slice],
     ) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Dequantize a 2D slice of block-quantized weights. Upcasts to float32,
+        # then for each scale block that intersects the slice (blocks clipped to full_tensor_shape),
+        # multiplies the intersecting part by that block's scale_inv entry and writes it, converted to
+        # target_dtype, into the output (initially a target_dtype copy of the weight). Returns the output.
         """
         Dequantize a sliced tensor using the appropriate portion of the scale tensor.
 
@@ -359,6 +401,8 @@ class QuantizedHuggingFaceStorageReader(HuggingFaceStorageReader):
         return dequantized
 
     def _is_tensor_quantized(self, tensor_fqn: str) -> bool:
+        # [FUNCTION DOC] HELPER: True only if the name is not itself a scale tensor and has an entry in
+        # the weight-scale mapping.
         """
         Check if a tensor is a quantized.
 
@@ -382,6 +426,13 @@ class QuantizedHuggingFaceStorageReader(HuggingFaceStorageReader):
     def _read_quantized_tensor_with_block_alignment(
         self, req: ReadItem, safetensor_file: Any
     ) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Read and dequantize the region of a quantized tensor named by req.
+        # For _blocks (MXFP4) tensors, converts the 3D dequantized-space request into a 4D read of just
+        # the needed groups (AssertionError if the request is not 3D) and tracks the starting group and
+        # offset; otherwise reads the 2D slice. Loads the full scale tensor, from the same file handle
+        # or by opening another file from the weight map (ValueError if the scale file or full shape
+        # is unknown). Picks 2D block dequantization or MXFP4 dequantization (ValueError for other
+        # cases). Any exception is logged and re-raised. Returns the dequantized tensor.
         """
         Read a quantized tensor with block alignment.
 

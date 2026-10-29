@@ -1,3 +1,8 @@
+# [MODULE DOC] Core data types and abstract planner interfaces for distributed checkpointing.
+# Defines enums (WriteItemType, LoadItemType), frozen dataclasses describing work items
+# (BytesIOWriteData, TensorWriteData, WriteItem, ReadItem, SavePlan, LoadPlan), and the
+# SavePlanner (abstract) and LoadPlanner interfaces that customize save/load planning.
+# No import-time side effects.
 import abc
 import io
 import operator
@@ -32,23 +37,29 @@ __all__ = [
 
 
 class WriteItemType(Enum):
+    # [CLASS DOC] Kind of a write: TENSOR (whole tensor), SHARD (a shard of a sharded tensor),
+    # BYTE_IO (serialized non-tensor bytes).
     TENSOR = auto()
     SHARD = auto()
     BYTE_IO = auto()
 
 
 class LoadItemType(Enum):
+    # [CLASS DOC] Kind of a read: TENSOR or BYTE_IO.
     TENSOR = auto()
     BYTE_IO = auto()
 
 
 @dataclass(frozen=True)
 class BytesIOWriteData:
+    # [CLASS DOC] Immutable description of a bytes write: nbytes is the number of bytes to write.
     nbytes: int
 
 
 @dataclass(frozen=True)
 class TensorWriteData:
+    # [CLASS DOC] Immutable description of a tensor write: the chunk (offsets and sizes) being
+    # written, the tensor properties (dtype, layout, ...), and the size of the full global tensor.
     chunk: ChunkStorageMetadata
     properties: TensorProperties
     size: torch.Size
@@ -56,6 +67,9 @@ class TensorWriteData:
 
 @dataclass(frozen=True)
 class WriteItem:
+    # [CLASS DOC] Immutable unit of write work: index identifies the entry in the state dict, type is
+    # a WriteItemType, and exactly one of bytes_io_data (bytes writes) or tensor_data (tensor and
+    # shard writes) is normally set; the other is None.
     """Dataclass which holds information about what needs to be written to storage."""
 
     index: MetadataIndex
@@ -68,6 +82,9 @@ class WriteItem:
     tensor_data: TensorWriteData | None = None
 
     def tensor_storage_size(self) -> int | None:
+        # [FUNCTION DOC] Return the byte size of the full tensor (product of tensor_data.size times
+        # the dtype element size), or None when this item has no tensor data.
+        # KNOWN ISSUE: uses the global tensor size, not the chunk size.
         """
         Calculates the storage size of the underlying tensor, or None if this is not a tensor write.
 
@@ -84,6 +101,9 @@ class WriteItem:
 
 @dataclass(frozen=True)
 class ReadItem:
+    # [CLASS DOC] Immutable unit of read work: copy a hypercube of size lengths from the checkpoint
+    # entry storage_index (starting at storage_offsets) into the state dict entry dest_index
+    # (starting at dest_offsets). type is a LoadItemType.
     # Read Item
     type: LoadItemType
 
@@ -103,6 +123,9 @@ class ReadItem:
 
 @dataclass(frozen=True)
 class SavePlan:
+    # [CLASS DOC] Immutable per-rank save plan: items to write, opaque storage_data and
+    # planner_data contributed by the storage writer/planner, and usable, which when False tells
+    # ranks not to reuse cached plans.
     items: list[WriteItem]
     storage_data: Any = None
     planner_data: Any = None
@@ -113,12 +136,19 @@ class SavePlan:
 
 @dataclass
 class LoadPlan:
+    # [CLASS DOC] Mutable per-rank load plan: list of ReadItem plus opaque storage_data and
+    # planner_data.
     items: list[ReadItem]
     storage_data: Any = None
     planner_data: Any = None
 
 
 class SavePlanner(abc.ABC):
+    # [CLASS DOC] Abstract interface for customizing checkpoint saving. Call order: set_up_planner
+    # (all ranks), create_local_plan (all ranks), create_global_plan (coordinator only),
+    # finish_plan (all ranks), resolve_data (many times per rank). Stateful; acts as a proxy to the
+    # state dict. The underscore class attributes are per-key plan caches (local plan, final plan,
+    # all plans, global plan, metadata) used for plan caching; they are class-level shared dicts.
     """
     Abstract class defining the protocol used by save_state_dict to plan the save process.
 
@@ -243,6 +273,8 @@ class SavePlanner(abc.ABC):
         storage_meta: StorageMeta | None = None,
         is_coordinator: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Abstract. Initialize the planner for a save of state_dict, keeping the given
+        # state dict, optional storage_meta and coordinator flag. Called on all ranks.
         """
         Initialize this planner to save ``state_dict``.
 
@@ -253,6 +285,8 @@ class SavePlanner(abc.ABC):
 
     @abc.abstractmethod
     def create_local_plan(self) -> SavePlan:
+        # [FUNCTION DOC] Abstract. Compute this rank's SavePlan from the state dict; planner-specific
+        # data may go in planner_data. Called on all ranks.
         """
         Compute the save plan for the current rank.
 
@@ -266,6 +300,8 @@ class SavePlanner(abc.ABC):
     def create_global_plan(
         self, all_plans: list[SavePlan]
     ) -> tuple[list[SavePlan], Metadata]:
+        # [FUNCTION DOC] Abstract. Given every rank's local plan, make global decisions and return
+        # the per-rank plans plus checkpoint Metadata. Called on the coordinator rank only.
         """
         Compute the global checkpoint plan and return the local plan of each rank.
 
@@ -274,6 +310,8 @@ class SavePlanner(abc.ABC):
 
     @abc.abstractmethod
     def finish_plan(self, new_plan: SavePlan) -> SavePlan:
+        # [FUNCTION DOC] Abstract. Merge the local plan with the global planning result for this rank
+        # and return the final SavePlan passed to the writer. Called on all ranks.
         """
         Merge the plan created by `create_local_plan` and the result of `create_global_plan`.
 
@@ -282,6 +320,9 @@ class SavePlanner(abc.ABC):
 
     @abc.abstractmethod
     def resolve_data(self, write_item: WriteItem) -> torch.Tensor | io.BytesIO:
+        # [FUNCTION DOC] Abstract. Look up the state dict object for write_item and apply any
+        # transformation (e.g. serialization), returning a tensor or BytesIO. Must be idempotent and
+        # thread-safe; called at least once per item, lazily allocating memory.
         """
         Transform and prepare ``write_item`` from ``state_dict`` for storage, ensuring idempotency and thread-safety.
 
@@ -302,6 +343,11 @@ class SavePlanner(abc.ABC):
 
 
 class LoadPlanner:
+    # [CLASS DOC] Interface for customizing checkpoint loading (not declared an ABC though methods
+    # are marked abstract). Call order: set_up_planner, create_local_plan (all ranks),
+    # create_global_plan (coordinator), finish_plan, then load_bytes per non-tensor value and
+    # resolve_tensor/commit_tensor pairs per tensor. Stateful proxy to the state dict, which is
+    # modified in place.
     """
     Abstract class defining the protocol used by load_state_dict to plan the load process.
 
@@ -382,6 +428,8 @@ class LoadPlanner:
         metadata: Metadata | None = None,
         is_coordinator: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Abstract. Initialize to load into state_dict using optional checkpoint
+        # metadata and coordinator flag. Called on every rank.
         """
         Initialize this instance to load data into ``state_dict``.
 
@@ -390,6 +438,8 @@ class LoadPlanner:
 
     @abc.abstractmethod
     def create_local_plan(self) -> LoadPlan:
+        # [FUNCTION DOC] Abstract. Build this rank's LoadPlan from the state dict and metadata given
+        # to set_up_planner. Called on every rank.
         """
         Create a LoadPlan based on state_dict and metadata provided by set_up_planner.
 
@@ -398,6 +448,7 @@ class LoadPlanner:
 
     @abc.abstractmethod
     def create_global_plan(self, global_plan: list[LoadPlan]) -> list[LoadPlan]:
+        # [FUNCTION DOC] Abstract. Take all ranks' plans and return one plan per rank. Coordinator only.
         """
         Compute the global load plan and return plans for each rank.
 
@@ -406,10 +457,13 @@ class LoadPlanner:
 
     @abc.abstractmethod
     def finish_plan(self, central_plan: LoadPlan) -> LoadPlan:
+        # [FUNCTION DOC] Abstract. Accept the coordinator's plan for this rank and return the final plan.
         """Accept the plan from coordinator and return final LoadPlan."""
 
     @abc.abstractmethod
     def load_bytes(self, read_item: ReadItem, value: io.BytesIO) -> None:
+        # [FUNCTION DOC] Abstract. Apply the bytes in value (format defined by the SavePlanner) to the
+        # state dict entry described by read_item, modifying the state dict in place.
         """
         Load the item described by ``read_item``and ``value``.
 
@@ -420,6 +474,8 @@ class LoadPlanner:
         """
 
     def resolve_bytes(self, read_item: ReadItem) -> io.BytesIO:
+        # [FUNCTION DOC] Return the BytesIO the reader should fill for read_item; should alias the one
+        # in the state dict. Base implementation always raises NotImplementedError.
         """
         Return the BytesIO to be used by the StorageReader to load `read_item`.
 
@@ -429,6 +485,8 @@ class LoadPlanner:
 
     @abc.abstractmethod
     def resolve_tensor(self, read_item: ReadItem) -> torch.Tensor:
+        # [FUNCTION DOC] Abstract. Return the destination tensor for read_item that the reader fills;
+        # should alias the state dict tensor, otherwise commit_tensor must copy it back.
         """
         Return the tensor described by ``read_item`` to be used by the StorageReader to load `read_item`.
 
@@ -439,6 +497,8 @@ class LoadPlanner:
 
     @abc.abstractmethod
     def commit_tensor(self, read_item: ReadItem, tensor: torch.Tensor) -> None:
+        # [FUNCTION DOC] Abstract. Called after the reader filled the tensor returned by resolve_tensor;
+        # lets the planner post-process it and copy it into the state dict.
         """
         Call once the StorageReader finished loading data into ``tensor``.
 
