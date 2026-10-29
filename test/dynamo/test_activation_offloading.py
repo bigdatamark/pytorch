@@ -1,4 +1,9 @@
 # Owner(s): ["oncall: pt2"]
+# [MODULE DOC] Tests for activation offloading in torch._functorch (offload and reload of
+# saved tensors to pinned CPU memory) using the min-cut and default partitioners, the ao
+# custom ops, pinned buffer pool, and Inductor codegen. Requires networkx (module-level
+# importorskip) and a GPU for the test classes; the main block runs the tests only when a GPU
+# exists.
 
 import unittest
 from functools import partial
@@ -25,11 +30,17 @@ networkx = pytest.importorskip("networkx")
 
 
 def extract_graph(fx_g, _, graph_cell):
+    # [FUNCTION DOC] HELPER: Compiler callback for aot_function that stores the given graph in the
+    # first slot of the provided list and returns it unchanged.
     graph_cell[0] = fx_g
     return fx_g
 
 
 def get_fw_bw_graph(
+    # [FUNCTION DOC] HELPER: Runs aot_function on f with the given partitioner and default
+    # decompositions, using callbacks to capture the forward and backward graphs, calls the
+    # function on inps, and backpropagates the summed output. Returns a tuple (forward graph,
+    # backward graph).
     f, inps, partitioner=min_cut_rematerialization_partition, dynamic=False
 ):
     fw_graph_cell = [None]
@@ -47,15 +58,25 @@ def get_fw_bw_graph(
 
 @unittest.skipIf(not HAS_GPU, "requires GPU")
 class ActivationOffloadingTests(TestCase):
+    # [CLASS DOC] Tests for activation offloading with the min-cut partitioner. setUp provides six
+    # random GPU inputs requiring grad, a function summing sines of pairwise sums, and a joint
+    # custom pass that marks the cos_1 node for offloading. Skipped without a GPU.
     """Tests activation offloading functionality"""
 
     def setUp(self):
+        # [FUNCTION DOC] Calls the parent setUp and builds the shared fixtures: the function,
+        # a joint pass marking the cos_1 node with should_offload, six 10 by 10 GPU tensors
+        # requiring grad (self.x), self.fn and self.joint_custom_pass.
         super().setUp()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns the sum of sines of the sums of three input
+            # pairs.
             return (x[0] + x[1]).sin() + (x[2] + x[3]).sin() + (x[4] + x[5]).sin()
 
         def mark_one_cos_for_offloading(gm, joint_inputs):
+            # [FUNCTION DOC] HELPER: Joint custom pass setting the should_offload meta
+            # flag on the node named cos_1, returning the graph module.
             for node in gm.graph.nodes:
                 if node.name == "cos_1":
                     node.meta["should_offload"] = True
@@ -73,6 +94,9 @@ class ActivationOffloadingTests(TestCase):
     """
 
     def test_partitioner_offload(self):
+        # [FUNCTION DOC] Partitions with offloading enabled and compares the exact forward and
+        # backward graph code: forward emits a non-blocking device_put to CPU for cos_1 and
+        # backward a reload back to the GPU device.
         torch._dynamo.reset()
         with torch._functorch.config.patch(
             enable_activation_offloading=True,
@@ -111,9 +135,14 @@ def forward(self, cos, cpu_offload_cos_1, cos_2, tangents_1):
         )
 
     def test_inductor_offload(self):
+        # [FUNCTION DOC] Compiles the function with torch.compile and offloading enabled,
+        # fetches forward and backward code, and checks via FileCheck that forward allocates a
+        # pinned CPU buffer and copies into it, and backward allocates a GPU buffer, copies
+        # from the offloaded tensor, then deletes it.
         torch._dynamo.reset()
 
         def run_compiled():
+            # [FUNCTION DOC] HELPER: Compiles self.fn and runs it on self.x.
             return torch.compile(self.fn)(self.x)  # noqa: UNSPECIFIED_BACKEND
 
         with torch._functorch.config.patch(
@@ -138,6 +167,12 @@ def forward(self, cos, cpu_offload_cos_1, cos_2, tangents_1):
         )
 
     def test_partitioner_offload_ao_ops(self):
+        # [FUNCTION DOC] With a separate offload stream enabled, checks forward graph code
+        # contains ao offload then ao wait_tensor with no stream fork, join or record_stream
+        # ops, that each offload's wait has two args whose second (keepalive) is the offloaded
+        # GPU tensor, and that backward has ao reload then wait_tensor, no fork or join, and
+        # reload waits keep the CPU tensor as second arg. Resets user object tracking and
+        # dynamo first.
         """Test that async offload uses ao.offload + ao.wait_tensor with keepalive."""
         reset_user_object_tracking()
         torch._dynamo.reset()
@@ -203,6 +238,9 @@ def forward(self, cos, cpu_offload_cos_1, cos_2, tangents_1):
                 self.assertIs(keepalive_node, reload_node.args[0])
 
     def test_partitioner_offload_sep_stream_accuracy(self):
+        # [FUNCTION DOC] Computes reference gradients eagerly, then gradients with aot_eager
+        # compilation under offloading with a separate stream, and asserts they match within
+        # 1e-5.
         # Run without compilation to get reference gradients
         x_ref = [x.detach().clone().requires_grad_(True) for x in self.x]
         out_ref = self.fn(x_ref)
@@ -233,6 +271,9 @@ def forward(self, cos, cpu_offload_cos_1, cos_2, tangents_1):
             )
 
     def test_partitioner_offload_ao_ops_sink_wait(self):
+        # [FUNCTION DOC] With offloading, separate stream and sink_wait enabled, asserts every
+        # offload's wait_tensor in the forward graph is placed immediately before the output
+        # node.
         """Test that sink_wait moves ao.wait_tensor for offload to end of forward graph."""
         reset_user_object_tracking()
         torch._dynamo.reset()
@@ -261,6 +302,9 @@ def forward(self, cos, cpu_offload_cos_1, cos_2, tangents_1):
                 self.assertEqual(wait_idx, output_idx - 1)
 
     def test_partitioner_offload_ao_ops_prefetch(self):
+        # [FUNCTION DOC] With offloading, separate stream and reload prefetch enabled, asserts
+        # in the backward graph each reload node appears before its corresponding wait_tensor
+        # node.
         """Test that prefetch moves ao.reload earlier in backward graph."""
         reset_user_object_tracking()
         torch._dynamo.reset()
@@ -293,6 +337,9 @@ def forward(self, cos, cpu_offload_cos_1, cos_2, tangents_1):
 
     @serialTest()
     def test_partitioner_offload_sep_stream_reorder_accuracy(self):
+        # [FUNCTION DOC] Serial test using larger 8192 square tensors so copies are slow
+        # enough to expose premature deallocation. Compares eager gradients with aot_eager
+        # gradients under offloading, separate stream, sink_wait and prefetch, within 1e-5.
         # need larger dimension so that memcpy takes longer, and the code is at the risk of
         # premature memory deallocation
         dim = 1024 * 8
@@ -331,6 +378,8 @@ def forward(self, cos, cpu_offload_cos_1, cos_2, tangents_1):
             )
 
     def test_wait_tensor_error_no_pending_transfer(self):
+        # [FUNCTION DOC] Clears the wait registry and asserts _pop_wait on an unregistered GPU
+        # tensor raises RuntimeError matching no pending transfer.
         """Test _pop_wait raises RuntimeError for unregistered tensor."""
         from torch._functorch._activation_offloading.offload_ops import (
             _clear_wait_registry,
@@ -343,6 +392,10 @@ def forward(self, cos, cpu_offload_cos_1, cos_2, tangents_1):
             _pop_wait(x)
 
     def test_offload_reload_fake_tensor(self):
+        # [FUNCTION DOC] Under FakeTensorMode, checks the fake implementations of the ao ops:
+        # offload gives a CPU tensor with same shape and dtype; reload gives a GPU tensor with
+        # the requested shape and strides (contiguous and transposed); wait_tensor returns a
+        # tensor with the same shape and device.
         """Test fake tensor implementations for offload, reload, and wait_tensor."""
         import torch._functorch._activation_offloading.offload_ops
         from torch._subclasses.fake_tensor import FakeTensorMode
@@ -380,9 +433,14 @@ def forward(self, cos, cpu_offload_cos_1, cos_2, tangents_1):
             self.assertEqual(wait_result.device, x_gpu.device)
 
     def test_multiple_tensors_offload_ao_ops(self):
+        # [FUNCTION DOC] Marks all nodes whose name starts with cos for offloading and
+        # partitions with a separate stream. Asserts forward has three offload and three
+        # wait_tensor ops, and backward three reload and three wait_tensor ops.
         """Test offloading all saved tensors simultaneously with ao ops."""
 
         def mark_all_cos_for_offloading(gm, joint_inputs):
+            # [FUNCTION DOC] HELPER: Joint pass setting should_offload on every node whose
+            # name starts with cos, returning the graph module.
             for node in gm.graph.nodes:
                 if node.name.startswith("cos"):
                     node.meta["should_offload"] = True
@@ -406,9 +464,14 @@ def forward(self, cos, cpu_offload_cos_1, cos_2, tangents_1):
         self.assertEqual(bw_code.count("ao.wait_tensor.default"), 3)
 
     def test_multiple_tensors_offload_ao_ops_accuracy(self):
+        # [FUNCTION DOC] Marks all cos nodes for offloading; checks ao offload and reload
+        # appear in the partitioned graphs, then asserts aot_eager gradients match eager
+        # gradients within 1e-5.
         """Test accuracy when offloading all saved tensors with ao ops."""
 
         def mark_all_cos_for_offloading(gm, joint_inputs):
+            # [FUNCTION DOC] HELPER: Joint pass setting should_offload on every node whose
+            # name starts with cos, returning the graph module.
             for node in gm.graph.nodes:
                 if node.name.startswith("cos"):
                     node.meta["should_offload"] = True
@@ -449,11 +512,15 @@ def forward(self, cos, cpu_offload_cos_1, cos_2, tangents_1):
             torch.testing.assert_close(grad_compiled, grad_ref, rtol=1e-5, atol=1e-5)
 
     def test_inductor_offload_ao_ops(self):
+        # [FUNCTION DOC] Compiles with torch.compile under offloading and a separate stream
+        # and checks via FileCheck that forward code has ao offload then wait_tensor and
+        # backward code has ao reload then wait_tensor.
         """Test inductor code generation with ao ops."""
         reset_user_object_tracking()
         torch._dynamo.reset()
 
         def run_compiled():
+            # [FUNCTION DOC] HELPER: Compiles self.fn and runs it on self.x.
             return torch.compile(self.fn)(self.x)  # noqa: UNSPECIFIED_BACKEND
 
         with torch._functorch.config.patch(
@@ -467,6 +534,8 @@ def forward(self, cos, cpu_offload_cos_1, cos_2, tangents_1):
         (FileCheck().check("ao.reload").check("ao.wait_tensor").run(bw_code))
 
     def test_estimate_transfer_time_config(self):
+        # [FUNCTION DOC] Checks _estimate_transfer_time_in_ms for one GiB: 20 ms at a
+        # configured bandwidth of 50 and 40 ms at 25.
         """Test bandwidth config controls transfer time estimation."""
         from torch._functorch._activation_offloading.activation_offloading import (
             _estimate_transfer_time_in_ms,
@@ -481,6 +550,9 @@ def forward(self, cos, cpu_offload_cos_1, cos_2, tangents_1):
             self.assertAlmostEqual(_estimate_transfer_time_in_ms(size_bytes), 40.0)
 
     def test_pinned_pool_reuse(self):
+        # [FUNCTION DOC] Within pinned_memory_pool, allocates a pinned 1024-element float
+        # buffer, frees it into the pool (one cached entry), and asserts a second allocation
+        # of the same size returns the same object and empties that bucket.
         """Pool returns cached buffers on second call with same size."""
         from torch._functorch._activation_offloading.offload_ops import (
             _maybe_pool_alloc,
@@ -502,6 +574,8 @@ def forward(self, cos, cpu_offload_cos_1, cos_2, tangents_1):
             self.assertEqual(len(_pinned_pool.get((1024, torch.float32), [])), 0)
 
     def test_pinned_pool_dtype_separation(self):
+        # [FUNCTION DOC] Within the pool, frees a float32 buffer then allocates 16 bytes worth
+        # of float16; asserts the result is a float16, different buffer.
         """Same nbytes but different dtypes must not share buffers."""
         from torch._functorch._activation_offloading.offload_ops import (
             _maybe_pool_alloc,
@@ -521,6 +595,8 @@ def forward(self, cos, cpu_offload_cos_1, cos_2, tangents_1):
             self.assertIsNot(f16, f32)
 
     def test_pinned_pool_different_sizes(self):
+        # [FUNCTION DOC] Within the pool, frees buffers of 256 and 1024 elements, and asserts
+        # allocation of each size returns the buffer of that size.
         """Pool buckets by size — different sizes don't share buffers."""
         from torch._functorch._activation_offloading.offload_ops import (
             _maybe_pool_alloc,
@@ -542,6 +618,9 @@ def forward(self, cos, cpu_offload_cos_1, cos_2, tangents_1):
             self.assertIs(got2, small)
 
     def test_pinned_pool_disabled_outside_context(self):
+        # [FUNCTION DOC] Outside the pool context, asserts allocation is fresh and pool free
+        # leaves the pool empty and resizes the buffer storage to zero, with later allocation
+        # not reusing it. Clears the pool before and after.
         """Without pinned_memory_pool(), alloc doesn't pool and free releases storage."""
         from torch._functorch._activation_offloading.offload_ops import (
             _maybe_pool_alloc,
@@ -565,6 +644,8 @@ def forward(self, cos, cpu_offload_cos_1, cos_2, tangents_1):
         _pool_clear()
 
     def test_pinned_pool_context_manager(self):
+        # [FUNCTION DOC] Asserts a freed buffer is cached inside the pinned_memory_pool
+        # context and the pool is empty after exit.
         """pinned_memory_pool() enables pooling and clears on exit."""
         from torch._functorch._activation_offloading.offload_ops import (
             _maybe_pool_alloc,
@@ -583,6 +664,10 @@ def forward(self, cos, cpu_offload_cos_1, cos_2, tangents_1):
 
     @unittest.skipIf(not HAS_GPU, "requires GPU")
     def test_pinned_pool_offload_roundtrip(self):
+        # [FUNCTION DOC] Within the pool, runs a GPU offload, wait, reload, wait round trip on
+        # a 64 by 64 tensor, asserting results match the original and the buffer returns to
+        # the pool; a second offload takes the buffer from the pool (count 0) and the full
+        # cycle returns it (count 1).
         """Offload/reload roundtrip reuses pooled buffers on second step."""
         from torch._functorch._activation_offloading.offload_ops import (
             _pinned_pool,
@@ -624,6 +709,9 @@ def forward(self, cos, cpu_offload_cos_1, cos_2, tangents_1):
 
 @unittest.skipIf(not HAS_GPU, "requires GPU")
 class DefaultPartitionerActivationOffloadingTests(TestCase):
+    # [CLASS DOC] Tests for activation offloading with the default partitioner. setUp marks add_1
+    # for offloading because this partitioner saves the add results and recomputes cos in
+    # backward. Skipped without a GPU.
     """Tests activation offloading with the default partitioner.
 
     Note: The default partitioner saves intermediate tensors (like add results)
@@ -633,13 +721,19 @@ class DefaultPartitionerActivationOffloadingTests(TestCase):
     """
 
     def setUp(self):
+        # [FUNCTION DOC] Calls the parent setUp and builds the fixtures as in the min-cut
+        # class, but the joint pass marks the node named add_1 for offloading.
         super().setUp()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns the sum of sines of the sums of three input
+            # pairs.
             return (x[0] + x[1]).sin() + (x[2] + x[3]).sin() + (x[4] + x[5]).sin()
 
         # Mark add_1 for offloading - this IS saved in forward with default partitioner
         def mark_add_for_offloading(gm, joint_inputs):
+            # [FUNCTION DOC] HELPER: Joint custom pass setting should_offload on the node
+            # named add_1, returning the graph module.
             for node in gm.graph.nodes:
                 if node.name == "add_1":
                     node.meta["should_offload"] = True
@@ -653,6 +747,9 @@ class DefaultPartitionerActivationOffloadingTests(TestCase):
         self.joint_custom_pass = mark_add_for_offloading
 
     def test_default_partitioner_offload(self):
+        # [FUNCTION DOC] Partitions with the default partitioner under offloading and compares
+        # the exact forward and backward code: add_1 is offloaded by non-blocking device_put
+        # to CPU and reloaded to the GPU in backward.
         """Test basic offloading with default partitioner"""
         torch._dynamo.reset()
         with torch._functorch.config.patch(
@@ -694,6 +791,9 @@ def forward(self, add, cpu_offload_add_1, add_3, tangents_1):
         )
 
     def test_default_partitioner_offload_ao_ops(self):
+        # [FUNCTION DOC] With a separate stream and the default partitioner, checks forward
+        # has ao offload then wait_tensor and backward has ao reload then wait_tensor, with no
+        # stream fork or join ops in either.
         """Test ao ops with default partitioner."""
         reset_user_object_tracking()
         torch._dynamo.reset()
@@ -727,6 +827,8 @@ def forward(self, add, cpu_offload_add_1, add_3, tangents_1):
         self.assertNotIn("streams.join", bw_code)
 
     def test_default_partitioner_offload_accuracy(self):
+        # [FUNCTION DOC] Compares eager gradients with gradients from aot_function using the
+        # default partitioner under offloading with a separate stream, within 1e-5.
         """Test that offloading with default partitioner produces correct gradients"""
         # Run without compilation to get reference gradients
         x_ref = [x.detach().clone().requires_grad_(True) for x in self.x]
