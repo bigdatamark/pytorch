@@ -1,3 +1,5 @@
+# [MODULE DOC] Triton kernel and launcher for batched outer product (aten::bmm with b,m,1 by b,1,n inputs).
+# Defines a log-key function, the instrumented Triton kernel, a block size heuristic and the public bmm_outer_product entry point.
 import triton
 import triton.language as tl
 
@@ -8,6 +10,7 @@ from ...triton import ConstTensorWrapper
 
 
 def _bmm_log_key(a, b, out, B, M, N, *strides, BLOCK_M, BLOCK_N) -> str:
+    # [FUNCTION DOC] HELPER: Build the log string describing a kernel launch (batch, M, N, dtype, block sizes) used as the compile key text.
     # Receives the kernel's launch args; BLOCK_M/BLOCK_N are the constexprs
     # that (with shapes/dtype) form the Triton compile key.
     return f"bmm_outer B={B} M={M} N={N} {a.dtype} BLOCK_M={BLOCK_M} BLOCK_N={BLOCK_N}"
@@ -31,6 +34,9 @@ def _bmm_outer_product_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
+    # [FUNCTION DOC] HELPER: Triton kernel. Each program handles one BLOCK_M x BLOCK_N tile of one batch of the output.
+    # Loads masked vectors from A (length M) and B (length N) using the given strides, forms their outer product,
+    # and stores it with a mask to OUT. The grid is 1-D: batches * tiles over M * tiles over N.
     pid = tl.program_id(0)
 
     grid_m = tl.cdiv(M, BLOCK_M)
@@ -62,6 +68,8 @@ def _bmm_outer_product_kernel(
 
 
 def _pick_block_sizes(m: int, n: int) -> tuple[int, int]:
+    # [FUNCTION DOC] HELPER: Choose (block_m, block_n) from M and N: block_m is the next power of two up to M for small M, then
+    # 32, 64 or 128 by thresholds; block_n is the next power of two of N capped at 128. Heuristic from manual sweeps, no autotuning.
     """I swept over some shapes and in the future we should figure out @autotune story"""
     if m <= 32:
         block_m = triton.next_power_of_2(m)
@@ -75,6 +83,8 @@ def _pick_block_sizes(m: int, n: int) -> tuple[int, int]:
 
 
 def bmm_outer_product(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] Compute the per-batch outer product of a (B,M,1) and b (B,1,N), returning a new (B,M,N) tensor of a's dtype and device.
+    # Allocates the output, picks block sizes and launches the Triton kernel; inputs are wrapped as read-only so copy-on-write is not materialized.
     B, M, _ = a.shape
     N = b.shape[2]
 

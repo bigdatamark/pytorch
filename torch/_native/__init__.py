@@ -1,3 +1,8 @@
+# [PACKAGE DOC] Package for natively implemented (Python/DSL based) operator overrides.
+# Importing it imports the DSL utility modules, the registry and the ops subpackage,
+# then optionally installs a user graph-ordering function, and finally calls the
+# registry to register all operator overrides (suppressing the one-time override warning).
+# Exports: get_user_ordering_fn and the module-level user_order_fn.
 import os
 import warnings
 from functools import cache
@@ -10,6 +15,11 @@ from . import cutedsl_utils, dsl_registry, helion_utils, ops, registry, triton_u
 
 @cache
 def get_user_ordering_fn() -> registry.UserOrderingFn | None:
+    # [FUNCTION DOC] Cached lookup of an optional user graph-ordering function.
+    # Reads env var TORCH_PYTHON_NATIVE_USER_GRAPH_ORDER_FN holding a dotted path
+    # "package.submodule.fn". Returns None if unset/empty; otherwise imports the module and
+    # returns the named attribute. Raises ValueError (chained) if the import, lookup or
+    # callable check fails. Side effect: imports the user module; result cached.
     """
     Get a user-supplied graph-ordering function if specified.
 

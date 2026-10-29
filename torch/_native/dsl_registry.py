@@ -1,3 +1,6 @@
+# [MODULE DOC] Registry of DSL backend modules (e.g. cutedsl, helion, nvmath) for native ops.
+# Defines the DSLModuleProtocol interface, the DSLRegistry class and a global dsl_registry instance
+# created at import time. DSL utility modules register themselves here on import.
 # Owner(s): ["module: dsl-native-ops"]
 
 import functools
@@ -13,6 +16,10 @@ log = logging.getLogger(__name__)
 
 
 class DSLModuleProtocol(Protocol):
+    # [CLASS DOC] Structural interface every DSL utility module must provide (typing Protocol, stubs only):
+    # runtime_available() -> bool, runtime_version() -> Version or None, deregister_op_overrides() -> None,
+    # and register_op_override(lib_symbol, op_symbol, dispatch_key, cond, impl, *, allow_multiple_override,
+    # unconditional_override) -> None.
     """Complete interface for DSL utility modules"""
 
     def runtime_available(self) -> bool: ...
@@ -34,12 +41,17 @@ class DSLModuleProtocol(Protocol):
 
 
 class DSLRegistry:
+    # [CLASS DOC] Maps DSL name to its module object (_dsl_modules) and answers availability/version queries
+    # by calling the module's own functions. Queries are cached per instance with functools.cache; the caches
+    # are cleared whenever a new DSL is registered. Not thread-safe by design.
     """Registry for DSL modules - calls their existing API functions dynamically"""
 
     def __init__(self):
+        # [FUNCTION DOC] Initialize an empty mapping of DSL name to module.
         self._dsl_modules: dict[str, DSLModuleProtocol] = {}
 
     def _validate_dsl_name(self, name: str) -> None:
+        # [FUNCTION DOC] HELPER: Raise TypeError if name is not a string, ValueError if it is empty/whitespace.
         """Validate DSL name at runtime"""
         if not isinstance(name, str):
             raise TypeError(f"DSL name must be string, got {type(name).__name__}")
@@ -48,6 +60,10 @@ class DSLRegistry:
             raise ValueError("DSL name cannot be empty or whitespace")
 
     def register_dsl(self, name: str, dsl_module: DSLModuleProtocol) -> None:
+        # [FUNCTION DOC] Register a DSL module under a name. Validates the name and that the module has
+        # runtime_available, runtime_version, register_op_override and deregister_op_overrides (TypeError if any
+        # missing). Re-registering the same module object is a no-op (debug log); a different object under the
+        # same name logs a warning and replaces it. On success clears the cached query methods and logs at info.
         """Register a DSL module with required interface"""
         # Runtime validation for name and module interface
         self._validate_dsl_name(name)
@@ -99,6 +115,8 @@ class DSLRegistry:
 
     @functools.cache  # noqa: B019
     def is_dsl_available(self, dsl_name: str) -> bool:
+        # [FUNCTION DOC] Cached. Return True if the named DSL is registered and its runtime_available() returns
+        # True. Returns False for unknown names, ImportError (debug log) or any other exception (logged).
         """Check if DSL is available by calling its runtime_available()"""
         dsl_module = self._dsl_modules.get(dsl_name)
         if dsl_module is None:
@@ -114,6 +132,7 @@ class DSLRegistry:
 
     @functools.cache  # noqa: B019
     def get_dsl_version(self, dsl_name: str) -> Version | None:
+        # [FUNCTION DOC] Cached. Return the named DSL's runtime_version(), or None if unregistered or it raises.
         """Get DSL version by calling its runtime_version()"""
         dsl_module = self._dsl_modules.get(dsl_name)
         if dsl_module is None:
@@ -126,6 +145,7 @@ class DSLRegistry:
 
     @functools.cache  # noqa: B019
     def list_available_dsls(self) -> tuple[str, ...]:
+        # [FUNCTION DOC] Cached. Return a tuple of names of registered DSLs for which is_dsl_available is True.
         """Get names of currently available DSLs"""
         available = []
         for name in self._dsl_modules:
@@ -135,10 +155,12 @@ class DSLRegistry:
 
     @functools.cache  # noqa: B019
     def list_all_dsls(self) -> tuple[str, ...]:
+        # [FUNCTION DOC] Cached. Return a tuple of all registered DSL names, available or not.
         """Get all registered DSL names (available or not)"""
         return tuple(self._dsl_modules.keys())
 
     def get_dsl_module(self, name: str) -> DSLModuleProtocol | None:
+        # [FUNCTION DOC] Return the registered module for the given name, or None if not registered.
         """Get a registered DSL module by name.
 
         Args:

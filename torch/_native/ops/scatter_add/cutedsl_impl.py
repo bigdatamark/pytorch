@@ -1,3 +1,7 @@
+# [MODULE DOC] CuTeDSL overrides of aten::scatter_add (out-of-place, .out and in-place) for fp16/bf16/fp32 on CUDA (non-ROCm).
+# Chooses between a TMA bulk-reduce kernel (sm90+, aligned) and a warp-per-row atomic vec-scatter kernel when TensorIterator analysis
+# shows a 2-D coalesced fast-path layout; otherwise falls through to aten. Declines under deterministic mode, copy-on-write tensors and
+# misalignment. Contains eligibility helpers, condition functions, implementations and registration.
 """CuTeDSL override registrations for ``aten::scatter_add``.
 
 Two kernels for the fast-path layout (self/src 2D-shaped after
@@ -56,6 +60,7 @@ _VEC_DST_ALIGN_BYTES = 4
 
 @functools.cache
 def _is_rocm() -> bool:
+    # [FUNCTION DOC] HELPER: Cached. True on ROCm/HIP builds, where the CuTe DSL cannot compile; used to decline the override.
     # These kernels are built on the CUTLASS Python DSL (CuteDSL), which is
     # NVIDIA-only and performs a hard CUDA-driver dependency check at compile
     # time. On a ROCm/HIP build ``tensor.is_cuda`` is still True, so without
@@ -66,6 +71,7 @@ def _is_rocm() -> bool:
 
 @functools.cache
 def _has_sm90_plus() -> bool:
+    # [FUNCTION DOC] HELPER: Cached. True if CUDA is available and device 0 has compute capability major >= 9.
     if not torch.cuda.is_available():
         return False
     major, _ = torch.cuda.get_device_capability(0)
@@ -73,6 +79,7 @@ def _has_sm90_plus() -> bool:
 
 
 def _deterministic() -> bool:
+    # [FUNCTION DOC] HELPER: True if deterministic algorithms are enabled (these kernels use nondeterministic atomics, so the override must decline).
     # Our kernels use non-deterministic atomicAdd. Under
     # torch.use_deterministic_algorithms(True), aten's scatter_add falls
     # into _scatter_via_index_put instead; we must decline to preserve
@@ -81,6 +88,7 @@ def _deterministic() -> bool:
 
 
 def _any_cow(*tensors: torch.Tensor) -> bool:
+    # [FUNCTION DOC] HELPER: True if any of the given tensors is copy-on-write.
     return any(
         torch._C._is_cow_tensor(t)  # pyrefly: ignore[missing-attribute]
         for t in tensors
@@ -88,6 +96,7 @@ def _any_cow(*tensors: torch.Tensor) -> bool:
 
 
 def _base_cond_ok(*tensors: torch.Tensor) -> bool:
+    # [FUNCTION DOC] HELPER: Shared pre-checks for every path: False on ROCm, in deterministic mode, if any tensor is not CUDA, or if any is copy-on-write.
     """Pre-checks shared by every path: env sanity, all CUDA, non-COW."""
     if _is_rocm():
         return False
@@ -112,12 +121,16 @@ def _base_cond_ok(*tensors: torch.Tensor) -> bool:
 
 
 def _normalize_dim(dim: int, ndim: int) -> int:
+    # [FUNCTION DOC] HELPER: Convert a possibly negative dim to a non-negative one by adding ndim; no range check.
     return dim + ndim if dim < 0 else dim
 
 
 def _scatter_add_eligibility(
     self: torch.Tensor, d: int, index: torch.Tensor, src: torch.Tensor
 ) -> TensorIterator | None:
+    # [FUNCTION DOC] HELPER: Layout analysis. Returns a TensorIterator over (self restrided with scatter-axis stride zero, src, index) if dtypes are supported
+    # (fp16/bf16/fp32 for self and src equal, int32/int64 index), ranks match and are non-zero and d is in range, and the iterator coalesces to
+    # 2-D with dim 0 the contiguous slice axis and dim 1 the index axis; otherwise None (also when iterator construction raises RuntimeError).
     """Return the analysis TensorIterator if (self, d, index, src) fits the
     kernel's expected layout, else ``None``. ``d`` is the already-normalized
     scatter axis.
@@ -171,6 +184,8 @@ def _scatter_add_eligibility(
 def _alignment_contract_ok(
     dst: torch.Tensor, src: torch.Tensor, dim: int, *, dst_ptr_align: int
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Alignment check: src base pointer and its stride along dim (in bytes) must be 16-byte aligned; dst base pointer and stride
+    # must be aligned to dst_ptr_align bytes. Returns False on any violation.
     """Alignment of effective ptrs and outer row strides.
 
     The src side is always read via 16B-wide vector ops (LDG.128 /
@@ -210,6 +225,7 @@ def _alignment_contract_ok(
 def _is_tma_supported(
     self: torch.Tensor, dim: int, index: torch.Tensor, src: torch.Tensor
 ) -> bool:
+    # [FUNCTION DOC] HELPER: True if the TMA path applies: sm90+ available, layout eligible, 16-byte alignment of dst and src, and the slice row shape supported by the TMA kernel.
     if not _has_sm90_plus():
         return False
     d = _normalize_dim(dim, self.ndim)
@@ -228,6 +244,8 @@ def _is_tma_supported(
 def _is_vec_scatter_supported(
     self: torch.Tensor, dim: int, index: torch.Tensor, src: torch.Tensor
 ) -> bool:
+    # [FUNCTION DOC] HELPER: True if the vec-scatter path applies: bf16 only on sm90+, layout eligible, 4-byte dst / 16-byte src alignment,
+    # and slice length divisible by the per-lane vector width (4 for fp32, 8 for halves).
     # ``red.global.add.noftz.bf16x2`` requires sm_90+. fp16x2 (sm_70+) and
     # scalar fp32 atomicAdd (sm_60+) work everywhere we care about.
     if self.dtype is torch.bfloat16 and not _has_sm90_plus():
@@ -260,6 +278,8 @@ def _prepare_kernel_inputs(
     src: torch.Tensor,
     it: TensorIterator,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Build the kernel inputs from an eligible layout: a 2-D (rows along dim d, N) strided view of self, a 1-D int64 index
+    # view (converted from int32 if needed) of length equal to the iterator's index extent, and a 2-D strided view of src. No data copies except an index dtype conversion.
     """Build (self_2d, index_1d, src_2d) for the kernel host functions.
 
     Caller has verified eligibility via ``_scatter_add_eligibility``.
@@ -295,6 +315,9 @@ def _make_cond(
     *,
     out_dst_ptr_align: int | None = None,
 ) -> _OpCondFn:
+    # [FUNCTION DOC] HELPER: Build a dispatch condition function around support_check. For the out overload (out_dst_ptr_align given), the condition also
+    # requires out to match self's dtype and shape, be non-scalar, pass the support check as the destination, and satisfy the explicit alignment contract.
+    # For the functional and in-place variants it requires the shared base checks plus the support check on self. Returned callables return False to decline.
     """Build a cond function that runs ``support_check`` behind the shared
     boilerplate (cutedsl availability, non-deterministic mode, CUDA
     tensors, non-COW, dtype/shape match on ``out`` when present).
@@ -311,6 +334,7 @@ def _make_cond(
     if out_dst_ptr_align is not None:
 
         def _cond(self, dim, index, src, *, out):
+        # [FUNCTION DOC] HELPER: Condition for the out overload (keyword out); see _make_cond.
             if not _base_cond_ok(self, index, src, out):
                 return False
             if out.dtype != self.dtype or out.shape != self.shape:
@@ -332,6 +356,7 @@ def _make_cond(
         return _cond
 
     def _cond(self, dim, index, src, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Condition for the functional and in-place variants; see _make_cond.
         if not _base_cond_ok(self, index, src):
             return False
         return support_check(self, dim, index, src)
@@ -340,6 +365,7 @@ def _make_cond(
 
 
 def _copy_if_distinct(out: torch.Tensor, self: torch.Tensor) -> None:
+    # [FUNCTION DOC] HELPER: Copy self into out unless they share the same data pointer. Mutates out; no resize.
     """Seed ``out`` with ``self``'s values when they're separate buffers.
     Cond guarantees shape match, so no resize is needed."""
     if out.data_ptr() != self.data_ptr():
@@ -347,6 +373,8 @@ def _copy_if_distinct(out: torch.Tensor, self: torch.Tensor) -> None:
 
 
 def _make_impls(kernel_getter):
+    # [FUNCTION DOC] HELPER: Build the (functional, out, in-place) implementation callables for a kernel. The kernel host function is obtained lazily
+    # through kernel_getter so the DSL runtime is not loaded at registration time.
     """Build (functional, out, in-place) impl callables.
 
     ``kernel_getter`` lazily imports the ``*_scatter_add_into`` kernel
@@ -357,6 +385,8 @@ def _make_impls(kernel_getter):
     """
 
     def _run(dst: torch.Tensor, dim: int, index, src) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Run the kernel accumulating src into dst along dim. Rebuilds the layout analysis (RuntimeError if it unexpectedly fails),
+        # returns dst untouched for empty work, else prepares 2-D/1-D views, invokes the kernel in place and returns dst.
         d = _normalize_dim(dim, dst.ndim)
         it = _scatter_add_eligibility(dst, d, index, src)
         if it is None:
@@ -373,25 +403,30 @@ def _make_impls(kernel_getter):
         return dst
 
     def impl(self, dim, index, src, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Functional variant: clones self, runs the kernel on the clone and returns it.
         return _run(self.clone(), dim, index, src)
 
     def out_impl(self, dim, index, src, *, out):
+        # [FUNCTION DOC] HELPER: Out variant: copies self into out if distinct, runs the kernel on out and returns it.
         _copy_if_distinct(out, self)
         return _run(out, dim, index, src)
 
     def inplace_impl(self, dim, index, src, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: In-place variant: runs the kernel directly on self and returns it.
         return _run(self, dim, index, src)
 
     return impl, out_impl, inplace_impl
 
 
 def _tma_kernel():
+    # [FUNCTION DOC] HELPER: Lazily import and return the TMA scatter-add host function.
     from .tma_kernel import tma_scatter_add_into
 
     return tma_scatter_add_into
 
 
 def _vs_kernel():
+    # [FUNCTION DOC] HELPER: Lazily import and return the vec-scatter scatter-add host function.
     from .vec_scatter_kernel import vec_scatter_add_into
 
     return vec_scatter_add_into
@@ -431,6 +466,8 @@ def _register_path(
     out_impl: _OpImplFn,
     inplace_impl: _OpImplFn,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Register one kernel path (cond and impls) for the aten ops scatter_add, scatter_add.out and scatter_add_ under the
+    # given dispatch key via the CuTeDSL registry wrapper, allowing multiple overrides.
     # scatter_add_ has its own dispatcher entry separate from scatter_add
     # and scatter_add.out; it's structured-delegated to .out below the
     # dispatcher layer, so overriding .out alone doesn't catch it.
@@ -450,5 +487,6 @@ def _register_path(
 
 
 def register_to_dispatch() -> None:
+    # [FUNCTION DOC] Register all kernel paths (TMA first, then vec-scatter, so TMA takes priority) for the CUDA dispatch key. Called on package import.
     for path in _PATHS:
         _register_path("CUDA", *path)

@@ -1,3 +1,6 @@
+# [MODULE DOC] HELPER: Shared helpers for native ops built on nvmath-python and cuSOLVER: a no-import availability
+# probe, the cuSOLVER runtime version query, and a per-device cached cuSOLVER Dn handle. nvmath is imported lazily
+# inside functions, so importing this module has no CUDA side effects. Module state: _handles cache (device to handle).
 """Shared helpers for native ops backed by nvmath-python / cuSOLVER.
 
 Centralizes nvmath availability checks, cuSOLVER version gating, and cuSOLVER
@@ -21,6 +24,7 @@ _NVMATH_DEPS = [
 
 
 def nvmath_unavailable_reason() -> str | None:
+    # [FUNCTION DOC] Return a message naming the missing nvmath-python dependency, or None if present. Does not import nvmath.
     """Return a human-readable reason nvmath is unavailable, or None if present.
 
     Does not import nvmath (uses importlib.util.find_spec under the hood).
@@ -29,6 +33,8 @@ def nvmath_unavailable_reason() -> str | None:
 
 
 def cusolver_version() -> int | None:
+    # [FUNCTION DOC] Return the cuSOLVER runtime version encoded as major*1000 + minor*100 + patch via nvmath's
+    # cusolver binding, or None if nvmath or the library cannot be loaded (all exceptions are swallowed).
     """cuSOLVER runtime version as major*1000 + minor*100 + patch, or None.
 
     Queries cusolverGetVersion through nvmath, against the exact cuSOLVER
@@ -56,6 +62,9 @@ _handles: dict[torch.device, int] = {}
 
 
 def get_cusolver_handle(device: torch.device) -> int:
+    # [FUNCTION DOC] Return a cuSOLVER Dn handle (integer) for the given device, creating it under that device the first
+    # time and caching it in the module-level mapping for the process lifetime. Raises ImportError if nvmath is missing.
+    # Side effect: mutates the handle cache; handles are never destroyed.
     """Return a cached cuSOLVER Dn handle bound to ``device``."""
     from nvmath.bindings import cusolverDn as cs  # pyrefly: ignore[missing-import]
 

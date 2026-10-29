@@ -1,3 +1,7 @@
+# [MODULE DOC] Helion DSL backend adapter for native op overrides. Availability requires a CUDA (non-ROCm)
+# build, the helion package plus the package for the chosen HELION_BACKEND (only triton is supported),
+# and helion >= a minimum version unless the version check is skipped. Wraps the generic registry functions.
+# Import-time side effect: registers this module as the "helion" DSL in dsl_registry.
 import functools
 import logging
 import sys
@@ -35,6 +39,7 @@ _DEFAULT_HELION_BACKEND = "triton"
 
 
 def _chosen_backend() -> str:
+    # [FUNCTION DOC] HELPER: Return the Helion lowering backend name from env HELION_BACKEND (default "triton").
     """Selected Helion lowering backend (HELION_BACKEND env, default triton)."""
     import os
 
@@ -43,6 +48,8 @@ def _chosen_backend() -> str:
 
 @functools.cache
 def _check_runtime_available() -> tuple[bool, Version | None]:
+    # [FUNCTION DOC] HELPER: Cached probe returning (available, version) for Helion. (False, None) on CPU-only/ROCm
+    # builds, an unsupported HELION_BACKEND (info log), or missing packages (info log); otherwise (True, helion version).
     if not _cuda.is_built():
         return (False, None)
 
@@ -73,18 +80,22 @@ def _check_runtime_available() -> tuple[bool, Version | None]:
 
 
 def runtime_available() -> bool:
+    # [FUNCTION DOC] Return True if Helion and its backend package are present (version is checked at registration time).
     # Package presence only, like triton/cutedsl; version gated in register_op_override.
     available, _ = _check_runtime_available()
     return available
 
 
 def runtime_version() -> Version | None:
+    # [FUNCTION DOC] Return the installed Helion version, or None if unavailable.
     _, version = _check_runtime_available()
     return version
 
 
 @functools.cache
 def _version_is_sufficient() -> bool:
+    # [FUNCTION DOC] HELPER: Cached check that the Helion version is at least the minimum (or the skip-version-check
+    # env flag is set). Returns False (with info log) if the version is unknown or too old.
     _, version = _check_runtime_available()
     if version is not None and (
         version >= _HELION_MINIMUM_VERSION or check_native_version_skip()
@@ -101,6 +112,7 @@ def _version_is_sufficient() -> bool:
 
 
 def deregister_op_overrides() -> None:
+    # [FUNCTION DOC] Deregister all op overrides registered under the helion DSL name.
     _deregister_op_overrides_impl(disable_dsl_names=_HELION_DSL_NAME)
 
 
@@ -114,6 +126,8 @@ def register_op_override(
     allow_multiple_override: bool = False,
     unconditional_override: bool = False,
 ) -> None:
+    # [FUNCTION DOC] Thin wrapper over the registry's register_op_override for the helion DSL. Does nothing if Helion is
+    # unavailable, native JIT is disabled globally, or the version is insufficient; otherwise forwards all arguments.
     available, _ = _check_runtime_available()
     if (not available) or check_native_jit_disabled():
         return

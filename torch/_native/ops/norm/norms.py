@@ -1,3 +1,6 @@
+# [MODULE DOC] Adaptor from quack's vendored 2-D CuTeDSL RMSNorm kernels to ATen-style signatures (forward and backward).
+# Handles reshaping to contiguous aligned 2-D tensors, output allocation and direct calls to the compiled kernels, with
+# compile instrumentation. quack/cutlass are imported lazily so the module imports on CPU-only builds.
 """Adaptor for quack's 2-D RMSNorm kernel interface to match ATen op signatures.
 
 These functions handle tensor reshaping, memory allocation, and call quack's
@@ -21,6 +24,7 @@ from torch._native.instrumentation import instrument_cutedsl_compile
 # the fwd compile signature and arg 0 in the bwd one.
 @functools.cache
 def _instrumented_rmsnorm_fwd():
+    # [FUNCTION DOC] HELPER: Cached. Return the quack forward-compile function wrapped with CuTeDSL compile instrumentation for aten::_fused_rms_norm (key text shows N).
     from torch._vendor.quack.rmsnorm import _compile_rmsnorm_fwd
 
     return instrument_cutedsl_compile(
@@ -30,6 +34,7 @@ def _instrumented_rmsnorm_fwd():
 
 @functools.cache
 def _instrumented_rmsnorm_bwd():
+    # [FUNCTION DOC] HELPER: Cached. Return the quack backward-compile function wrapped with CuTeDSL compile instrumentation for aten::_fused_rms_norm_backward (key text shows N).
     from torch._vendor.quack.rmsnorm import _compile_rmsnorm_bwd
 
     return instrument_cutedsl_compile(
@@ -43,6 +48,7 @@ def _instrumented_rmsnorm_bwd():
 # importable on CPU-only builds (test_public_bindings /
 # test_circular_dependencies walk every module under `torch.`).
 def _torch2cute(t: torch.Tensor | None):  # type: ignore[no-untyped-def]
+    # [FUNCTION DOC] HELPER: Map a tensor's torch dtype to the corresponding CuTe dtype via quack's table; returns None for a None tensor.
     from torch._vendor.quack import cute_dsl_utils as _cute_dsl_utils
 
     if t is None:
@@ -51,6 +57,7 @@ def _torch2cute(t: torch.Tensor | None):  # type: ignore[no-untyped-def]
 
 
 def _required_align_bytes(t: torch.Tensor, N: int) -> int:
+    # [FUNCTION DOC] HELPER: Required base-pointer alignment in bytes for tensor t with row length N: gcd of N and the elements per 128-bit vector, times the element size.
     # quack compiles the kernel assuming the input base pointer is aligned to
     # the vectorized cp.async width: gcd(N, 128 // dtype_bits) elements. A
     # contiguous tensor with a non-zero storage offset (e.g. buf[1:].view(M, N))
@@ -61,11 +68,14 @@ def _required_align_bytes(t: torch.Tensor, N: int) -> int:
 
 
 def _const_data_ptr(t: torch.Tensor) -> int:
+    # [FUNCTION DOC] HELPER: Return the tensor's read-only data pointer as an integer without triggering torch-function subclass overrides.
     with torch._C.DisableTorchFunctionSubclass():
         return t.const_data_ptr()  # type: ignore[attr-defined]
 
 
 def _read_only(t: torch.Tensor | None):  # type: ignore[no-untyped-def]
+    # [FUNCTION DOC] HELPER: Wrap a tensor as a read-only CuTe tensor through a read-only dlpack wrapper (tvm-ffi enabled); returns None for None.
+    # Imports cutlass lazily.
     if t is None:
         return None
     from cutlass.cute.runtime import from_dlpack
@@ -78,6 +88,8 @@ def _read_only(t: torch.Tensor | None):  # type: ignore[no-untyped-def]
 
 
 def _reshape_2d(t: torch.Tensor, M: int, N: int) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Return t as a contiguous (M, N) tensor whose base pointer meets the kernel's alignment; clones when the pointer is misaligned
+    # (including when a view keeps an offset into storage). Returns the input itself if already suitable.
     align = _required_align_bytes(t, N)
     if t.ndim == 2 and t.shape[0] == M and t.shape[1] == N and t.is_contiguous():
         # .contiguous() is a no-op on an already-contiguous tensor and would
@@ -90,6 +102,7 @@ def _reshape_2d(t: torch.Tensor, M: int, N: int) -> torch.Tensor:
 
 
 def _aligned_weight(w: torch.Tensor, N: int) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Return the weight as a contiguous 1-D tensor of N elements with an aligned base pointer, cloning if misaligned.
     # Same trap as _reshape_2d: reshape(N).contiguous() is a no-op for a
     # contiguous-but-offset weight, leaving a misaligned base. Weight is only
     # N elements, so always clone rather than perf-gating like the input.
@@ -100,6 +113,7 @@ def _aligned_weight(w: torch.Tensor, N: int) -> torch.Tensor:
 
 
 def _flatten_rstd(t: torch.Tensor, M: int) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Return rstd as a 1-D length-M tensor: unchanged if already so, a detached view if contiguous with M elements, else a contiguous reshape.
     if t.ndim == 1 and t.shape[0] == M:
         return t
     if t.is_contiguous() and t.numel() == M:
@@ -113,6 +127,9 @@ def quack_rmsnorm_fwd(
     normalized_shape: list[int],
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] RMSNorm forward via quack. Flattens input to (M, N) with N the product of normalized_shape, allocates the output and
+    # a float32 rstd of length M, aligns the optional weight, fetches the (cached) compiled kernel and runs it with the given eps.
+    # Returns (output reshaped to the input shape, rstd reshaped to the leading dims with ones for normalized dims).
     input_shape = input.shape
     N = math.prod(normalized_shape)
     M = input.numel() // N
@@ -162,6 +179,9 @@ def quack_rmsnorm_bwd(
     normalized_shape: list[int],
     dw_mask: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    # [FUNCTION DOC] RMSNorm backward via quack. Flattens input, grad_out and rstd to 2-D/1-D, allocates dx and, when a weight is
+    # given and dw_mask is true, a float32 per-SM partial weight-gradient buffer; runs the compiled kernel and returns
+    # (dx in the input's shape, dw reduced over partials, reshaped to normalized_shape and cast to the weight dtype, or None).
     N = math.prod(normalized_shape)
     M = input.numel() // N
     x = _reshape_2d(input, M, N)

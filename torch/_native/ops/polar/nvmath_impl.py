@@ -1,3 +1,5 @@
+# [MODULE DOC] cuSOLVER Xpolar (QDWH) polar decomposition via nvmath bindings for a single real 2-D matrix. Provides a dtype map,
+# a column-major buffer helper, the 2-D worker functions and the public polar_xpolar function. nvmath and cuda bindings are imported lazily in functions.
 """cuSOLVER Xpolar (QDWH) polar decomposition via nvmath bindings."""
 
 import ctypes
@@ -14,6 +16,7 @@ _CUBLAS_FILL_MODE_FULL = 2
 
 
 def _cuda_dtype(dtype: torch.dtype):
+    # [FUNCTION DOC] HELPER: Map float32/float64 to the corresponding CUDA data type enum; raises KeyError for any other dtype.
     # cuSOLVER Xpolar supports only real single/double precision. Complex inputs
     # are routed to the SVD path by the caller and never reach here.
     from cuda.bindings.runtime import cudaDataType  # pyrefly: ignore[missing-import]
@@ -25,6 +28,7 @@ def _cuda_dtype(dtype: torch.dtype):
 
 
 def _empty_colmajor(m: int, n: int, A: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Allocate an uninitialized column-major (m, n) tensor (leading dimension m) as a transposed view of an (n, m) buffer.
     # Column-major (m, n) buffer for cuSOLVER (leading dimension m). The view
     # owns its storage and presents logical shape (m, n) so values read back
     # directly without a transpose.
@@ -34,6 +38,8 @@ def _empty_colmajor(m: int, n: int, A: torch.Tensor) -> torch.Tensor:
 def _polar_2d(
     A: torch.Tensor, *, return_residual: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    # [FUNCTION DOC] HELPER: Run polar decomposition of a 2-D matrix A. Creates cuSOLVER params and obtains the per-device cached handle, all with A's
+    # device current, then delegates to the implementation function. Returns (U, H, residual or None).
     from nvmath.bindings import cusolverDn as cs  # pyrefly: ignore[missing-import]
 
     m, n = A.shape
@@ -50,6 +56,10 @@ def _polar_2d(
 
 
 def _polar_2d_impl(A, m, n, dtype, device, handle, params, return_residual):
+    # [FUNCTION DOC] HELPER: Core Xpolar call. Sets the handle's stream to the current stream, copies A into a column-major U buffer, allocates H, queries
+    # and allocates device and host workspaces, zero-initializes a small device diagnostics buffer (residual norm, norm of A, rcond, info), runs xpolar,
+    # symmetrizes H, and optionally computes the relative residual as a device scalar. Always destroys the params object. Asynchronous; no sync.
+    # KNOWN ISSUE: the device info status value is never read or checked, so a failed factorization is not reported.
     from nvmath.bindings import cusolverDn as cs  # pyrefly: ignore[missing-import]
 
     try:
@@ -149,6 +159,8 @@ def _polar_2d_impl(A, m, n, dtype, device, handle, params, return_residual):
 def polar_xpolar(
     A: torch.Tensor, *, return_residual: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    # [FUNCTION DOC] Polar decomposition A = U H of a 2-D matrix via cuSOLVER Xpolar on the current CUDA stream (asynchronous). Returns (U, H, residual)
+    # where residual is the relative residual as a device scalar only when return_residual is True, else None. Raises an error via the check if A is not 2-D.
     """Polar decomposition A = U @ H of a single 2-D matrix via cuSOLVER Xpolar.
 
     Fully asynchronous: issues work on the current CUDA stream and never

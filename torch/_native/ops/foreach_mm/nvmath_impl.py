@@ -1,3 +1,7 @@
+# [MODULE DOC] cublasLt grouped GEMM plan for _foreach_mm using nvmath bindings (bf16 only). Defines a per-(device,size)
+# workspace cache, a ctypes attribute-setting helper and the ForeachMMCublasLt plan class.
+# Import-time requirement: imports cuda.bindings and nvmath, so importing fails with ImportError when they are absent
+# (callers import it lazily).
 """Cached cublasLt grouped GEMM via nvmath bindings."""
 
 import ctypes
@@ -17,6 +21,8 @@ _cublaslt_workspaces: dict[tuple, torch.Tensor] = {}
 
 
 def _get_cublaslt_workspace(device="cuda"):
+    # [FUNCTION DOC] HELPER: Return (workspace tensor, size in bytes) for cublasLt, allocating a uint8 buffer of the configured
+    # cublasLt workspace size on the device on first use and caching it in a module-level mapping (never freed).
     ws_size = torch.backends.cuda.cublaslt_workspace_size()
     key = (torch.device(device), ws_size)
     if key not in _cublaslt_workspaces:
@@ -27,11 +33,17 @@ def _get_cublaslt_workspace(device="cuda"):
 
 
 def _set_attr(setter, handle, attr, val, ctype):
+    # [FUNCTION DOC] HELPER: Pack a single value into a one-element ctypes array of the given type and pass its address and size
+    # to the given cublasLt attribute setter for the handle and attribute.
     buf = (ctype * 1)(val)
     setter(handle, attr, ctypes.addressof(buf), ctypes.sizeof(buf))
 
 
 class ForeachMMCublasLt:
+    # [CLASS DOC] Prebuilt cublasLt grouped GEMM plan for a fixed list of (M,N,K) group shapes, layouts and bf16 dtype. Computes
+    # each output as mat2 and self swapped in column-major terms. Owns device dimension arrays, a pinned host and device pointer
+    # array, device alpha/beta scalars, a workspace, matmul descriptor, grouped matrix layouts and a heuristic-chosen algorithm,
+    # all reused across calls. Calling the instance with two lists of tensors returns the list of products. Destructor releases cublasLt descriptors.
     """Cached cublasLt grouped GEMM. Supports uniform or mixed shapes per group."""
 
     def __init__(
@@ -43,6 +55,12 @@ class ForeachMMCublasLt:
         dtype=torch.bfloat16,
         device="cuda",
     ):
+        # [FUNCTION DOC] Build the plan from shapes (tuple of (M,N,K) per group), group count G, row-major flags for self and mat2,
+        # dtype (only bf16 accepted) and device. Raises ValueError for non-bf16 dtype or any dimension/leading dimension above the
+        # int32 range, and RuntimeError if the heuristic finds no algorithm. Side effects: allocates device and pinned memory, creates
+        # cublasLt objects, reuses PyTorch's cuBLAS handle and the cached workspace, and runs a one-time algorithm heuristic search.
+        # Output columns are padded to 16-byte alignment, with a common padded stride across groups.
+        # KNOWN ISSUE: the preference object is not destroyed when no algorithm is found (raise happens before destroy).
         """
         Args:
             shapes: tuple of (M, N, K) triples, one per group
@@ -124,6 +142,7 @@ class ForeachMMCublasLt:
         )
 
         def _set_desc(attr, val):
+            # [FUNCTION DOC] HELPER: Set an int32 matmul descriptor attribute on the descriptor being built.
             _set_attr(
                 cublasLt.matmul_desc_set_attribute, desc, attr, val, ctypes.c_int32
             )
@@ -203,6 +222,10 @@ class ForeachMMCublasLt:
         self._dev_Dptr = base + 2 * G * ptr_size
 
     def __call__(self, self_list, mat2_list):
+        # [FUNCTION DOC] Run the grouped GEMM on lists self_list and mat2_list (must match the planned shapes, layouts, dtype and device;
+        # not validated). Allocates one output buffer, writes input and output device pointers into the pinned buffer, copies them to
+        # the device asynchronously, launches cublasLt matmul on the current stream and returns per-group views of the buffer
+        # narrowed to each (M, N) (so results may be non-contiguous with padded row stride).
         G = self.G
         max_M = self._max_M
         max_Np = self._max_N_padded
@@ -252,6 +275,7 @@ class ForeachMMCublasLt:
         return [r[: self._out_Ms[i], : self._out_Ns[i]] for i, r in enumerate(results)]
 
     def __del__(self):
+        # [FUNCTION DOC] Destructor: best-effort destruction of the cublasLt matrix layouts and matmul descriptor; all errors are suppressed.
         for attr in ("_Dd", "_Bd", "_Ad"):
             d = getattr(self, attr, None)
             if d is not None:

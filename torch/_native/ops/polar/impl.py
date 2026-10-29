@@ -1,3 +1,7 @@
+# [MODULE DOC] CUDA-only override of aten::linalg_polar (and its out overload) using cuSOLVER Xpolar (QDWH) through nvmath.
+# Only single real (fp32/fp64) 2-D matrices with rows >= cols are accelerated; everything else (CPU, ROCm, complex, batched,
+# old/missing nvmath, mismatching out tensors) falls through to the aten SVD kernel. Module state: a lazily computed,
+# sticky nvmath availability flag. Registration is skipped on builds without CUDA.
 """
 Python override for aten::linalg_polar (polar decomposition A = U @ H).
 
@@ -40,6 +44,8 @@ _nvmath_available: "bool | None" = None
 
 
 def _check_nvmath() -> bool:
+    # [FUNCTION DOC] HELPER: Lazily compute and cache whether the Xpolar path is usable: not HIP, nvmath importable, and the cuSOLVER
+    # runtime version at least 12.2. Returns the cached flag (which may later be set False after a hard failure).
     global _nvmath_available
     if _nvmath_available is None:
         # The cuSOLVER Xpolar path is NVIDIA-only; never attempt it on ROCm
@@ -58,6 +64,8 @@ def _check_nvmath() -> bool:
 
 
 def _out_matches(A: torch.Tensor, U: torch.Tensor, H: torch.Tensor) -> bool:
+    # [FUNCTION DOC] HELPER: For the out overload, True only if U and H already have A's dtype and device and the contiguous shapes (m,n) and (n,n),
+    # since the override copies results in without validating or resizing.
     # The override writes results into U/H with copy_, which neither enforces the
     # output dtype nor resizes like the structured out= machinery does. Only fire
     # when the provided outputs already satisfy that contract (correct dtype,
@@ -77,6 +85,8 @@ def _out_matches(A: torch.Tensor, U: torch.Tensor, H: torch.Tensor) -> bool:
 
 
 def _polar_cond_cuda(A: torch.Tensor, *args, **kwargs) -> bool:
+    # [FUNCTION DOC] Dispatch condition for both overloads. True only for fp32/fp64, a 2-D non-empty-column matrix with rows >= cols, a usable
+    # nvmath/cuSOLVER runtime, and (if outputs U and H are passed by keyword) both provided and matching the contract.
     # Only fire when we can actually accelerate: a single non-empty real 2-D
     # matrix with m >= n, and a usable cuSOLVER Xpolar runtime. Batched inputs
     # (dim > 2) are declined -- Xpolar has no batched API, so looping in Python
@@ -98,6 +108,7 @@ def _polar_cond_cuda(A: torch.Tensor, *args, **kwargs) -> bool:
 
 
 def _run_xpolar(A: torch.Tensor) -> "tuple[torch.Tensor, torch.Tensor] | None":
+    # [FUNCTION DOC] HELPER: Run polar_xpolar and return (U, H), or None after permanently disabling the fast path if any exception occurs.
     # Returns (U, H) from cuSOLVER Xpolar, or None on a hard failure (after
     # permanently disabling the fast path).
     global _nvmath_available
@@ -114,6 +125,7 @@ def _run_xpolar(A: torch.Tensor) -> "tuple[torch.Tensor, torch.Tensor] | None":
 
 
 def _polar_impl_cuda(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] Override implementation for linalg_polar: returns contiguous (U, H) from Xpolar, or calls the aten default kernel if Xpolar fails.
     result = _run_xpolar(A)
     if result is None:
         return torch.ops.aten.linalg_polar.default(A)
@@ -125,6 +137,8 @@ def _polar_impl_cuda(A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 def _polar_out_impl_cuda(
     A: torch.Tensor, *, U: torch.Tensor, H: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] Override implementation for linalg_polar.out: copies the Xpolar factors into U and H and returns them, or calls the aten out
+    # kernel if Xpolar fails.
     result = _run_xpolar(A)
     if result is None:
         return torch.ops.aten.linalg_polar.out(A, U=U, H=H)
@@ -135,6 +149,8 @@ def _polar_out_impl_cuda(
 
 
 def register_to_dispatch() -> None:
+    # [FUNCTION DOC] Register the override for linalg_polar and linalg_polar.out on the CUDA key (DSL name "native") if PyTorch is built with CUDA; no-op otherwise.
+    # Uses the build check rather than availability to avoid initializing CUDA. Called on package import.
     # This is a CUDA-only accelerator. Registering a CUDA override captures the
     # existing aten CUDA kernel as the fallback, which only exists in a CUDA
     # build -- on CPU/XPU/ROCm-only builds there is no aten::linalg_polar.out

@@ -1,3 +1,7 @@
+# [MODULE DOC] Compile/cache instrumentation for native DSL ops (CuTeDSL, Triton, Helion). Wraps compile
+# or kernel-launch callables to time them, detect whether a real compile occurred (cache miss counter grew),
+# and emit a CompileEvent to the native_dsl_compile artifact logger and to trace_structured (tlparse).
+# All work is skipped unless TORCH_LOGS enables that artifact. Import-time side effect: creates the artifact logger.
 """Structured compile/cache instrumentation for ``torch._native`` ops.
 
 Native DSL ops compile device kernels lazily on first call. Those compiles
@@ -94,6 +98,9 @@ R = TypeVar("R")
 
 @dataclass(frozen=True)
 class CompileEvent:
+    # [CLASS DOC] Frozen dataclass describing one instrumented call: op symbol, dsl name, outcome string
+    # ("compiled", "cache_hit" or "error"), compiled flag, wall time in ms, formatted cache key, and the cache's
+    # running hit and miss totals measured after the call.
     """One compile-function invocation, as recorded to logs and tlparse.
 
     ``compiled`` is the ground truth (did the cache run a real compile);
@@ -113,10 +120,13 @@ class CompileEvent:
     misses: int
 
     def as_dict(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Return the event fields as a plain dictionary.
         return asdict(self)
 
 
 def _listening() -> bool:
+    # [FUNCTION DOC] HELPER: Return True if the native_dsl_compile logging artifact is enabled (read live from the
+    # logging state). Gates all instrumentation work so the hot path pays only one check.
     """True if the ``native_dsl_compile`` artifact is enabled.
 
     Lets the wrapper skip all instrumentation work (cache sampling, timing,
@@ -137,6 +147,8 @@ def _listening() -> bool:
 
 
 def _emit(event: CompileEvent) -> None:
+    # [FUNCTION DOC] HELPER: Emit a CompileEvent to the artifact logger (one info line) and to trace_structured as
+    # a JSON "artifact" record (payload built lazily, no trace id expected). Side effects: logging and trace output.
     """Fan the event out to the artifact logger and tlparse."""
     log.info(
         "%s [%s] %s in %.1fms (key=%s, cache hits=%d misses=%d)",
@@ -168,12 +180,15 @@ def _emit(event: CompileEvent) -> None:
 
 
 def _json_payload(event: CompileEvent) -> str:
+    # [FUNCTION DOC] HELPER: Serialize a CompileEvent to a JSON string with sorted keys.
     import json
 
     return json.dumps(event.as_dict(), sort_keys=True)
 
 
 def _format_key(args: tuple, kwargs: dict, key_fn: Callable | None) -> str:
+    # [FUNCTION DOC] HELPER: Build the cache-key string for logs. Uses key_fn(args, kwargs) if given and it succeeds
+    # (any exception is silently ignored); otherwise a repr-based rendering of positional and sorted keyword arguments.
     if key_fn is not None:
         try:
             return key_fn(*args, **kwargs)
@@ -191,6 +206,9 @@ def _make_wrapper(
     key_fn: Callable[..., str] | None,
     sample: Callable[[], tuple[int | None, int | None]],
 ) -> Callable[..., R]:
+    # [FUNCTION DOC] HELPER: Shared core that wraps fn. The returned wrapper calls fn directly if not listening;
+    # otherwise samples (hits, misses) before and after, times the call, marks compiled when misses grew (never on
+    # error, or when sampling is unavailable), emits a CompileEvent (also on exceptions, which are re-raised) and returns fn's result.
     """Shared instrumentation core for both DSL entry points.
 
     ``sample()`` returns a ``(hits, misses)`` snapshot of the relevant cache;
@@ -201,6 +219,7 @@ def _make_wrapper(
 
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> R:
+        # [FUNCTION DOC] HELPER: Wrapper with the same signature as fn; see _make_wrapper for behavior.
         # Fast path: do nothing extra unless a sink is listening. This runs on
         # every call to the wrapped fn (for CuTeDSL, every op invocation), so
         # the no-listener cost must stay at one predicate check.
@@ -246,6 +265,8 @@ def _make_wrapper(
 
 
 def _cache_info_sampler(fn: Any) -> Callable[[], tuple[int | None, int | None]]:
+    # [FUNCTION DOC] HELPER: Build a sampler returning (hits, misses) from fn's cache_info attribute (a jit_cache
+    # wrapper); returns (None, None) if the attribute is missing or raises.
     """Sampler reading ``(hits, misses)`` from a ``jit_cache`` wrapper.
 
     Defensive: the wrapped callable may not be ``jit_cache``-decorated (e.g.
@@ -254,6 +275,7 @@ def _cache_info_sampler(fn: Any) -> Callable[[], tuple[int | None, int | None]]:
     """
 
     def sample() -> tuple[int | None, int | None]:
+        # [FUNCTION DOC] HELPER: Sample the cache counters; (None, None) if unavailable.
         info = getattr(fn, "cache_info", None)
         if info is None:
             return None, None
@@ -271,6 +293,9 @@ def instrument_cutedsl_compile(
     *,
     key_fn: Callable[..., str] | None = None,
 ) -> Callable[[Callable[..., R]], Callable[..., R]]:
+    # [FUNCTION DOC] Return a decorator instrumenting a CuTeDSL jit_cache-decorated compile function for the given
+    # op symbol, with optional key_fn describing the compile key. The decorated function keeps its behavior and
+    # re-exposes cache, cache_clear and cache_info attributes; errors are reported then re-raised.
     """Instrument a CuTeDSL (``@jit_cache``-decorated) compile function.
 
     Args:
@@ -286,6 +311,7 @@ def instrument_cutedsl_compile(
     """
 
     def decorator(fn: Callable[..., R]) -> Callable[..., R]:
+        # [FUNCTION DOC] HELPER: Wrap fn with the shared wrapper (dsl "cutedsl") and copy over the cache attributes it has.
         wrapper = _make_wrapper(fn, op, "cutedsl", key_fn, _cache_info_sampler(fn))
         # Forward jit_cache's bespoke attributes (functools.wraps doesn't copy
         # them) so the instrumented function stays a drop-in for callers that
@@ -299,6 +325,8 @@ def instrument_cutedsl_compile(
 
 
 def _triton_cache_size(kernel: Any) -> int | None:
+    # [FUNCTION DOC] HELPER: Return the total number of compiled variants across a Triton JITFunction's per-device
+    # caches (sum of the first dict of each device entry), or None if device_caches is absent or summing fails.
     """Compiled-variant count across one JITFunction's per-device caches.
 
     Triton stores one entry per specialized variant in
@@ -319,6 +347,10 @@ def _triton_cache_size(kernel: Any) -> int | None:
 
 
 class InstrumentedTritonKernel:
+    # [CLASS DOC] Transparent proxy around one triton.jit kernel. Stores the raw kernel, op symbol and optional key_fn.
+    # Indexing by grid returns the launcher wrapped by the shared instrumentation core, using the kernel's variant
+    # count as the miss counter (no hit counter); every other attribute is delegated to the raw kernel. The raw kernel
+    # is exposed via jit_kernel (needed for wrap_triton, which requires a real JITFunction).
     """Transparent proxy over a single ``@triton.jit`` kernel.
 
     Watches only this kernel's ``device_caches``, so a launch that grows the
@@ -341,27 +373,33 @@ class InstrumentedTritonKernel:
         op: str,
         key_fn: Callable[..., str] | None,
     ) -> None:
+        # [FUNCTION DOC] Store the wrapped kernel, op symbol and key function.
         self._kernel = kernel
         self._op = op
         self._key_fn = key_fn
 
     @property
     def jit_kernel(self) -> Any:
+        # [FUNCTION DOC] Property returning the wrapped raw JITFunction.
         """The wrapped raw ``JITFunction`` (e.g. for ``wrap_triton``)."""
         return self._kernel
 
     def _sample(self) -> tuple[int | None, int | None]:
+        # [FUNCTION DOC] HELPER: Return (None, variant count of the wrapped kernel) as the cache snapshot.
         # Triton has no hit counter; this kernel's variant count stands in for
         # `misses`, so a delta across the launch means a fresh compile.
         return None, _triton_cache_size(self._kernel)
 
     def __getitem__(self, grid: Any) -> Callable[..., Any]:
+        # [FUNCTION DOC] Launch-path hook: take the grid, get the kernel's bound launcher, and return it wrapped with the
+        # shared instrumentation core (dsl "triton") so a compile inside the launch is recorded.
         # kernel[grid](*args) is the launch path -- wrap the bound launcher in
         # the shared core so the compile that may fire inside it is recorded.
         launcher = self._kernel[grid]
         return _make_wrapper(launcher, self._op, "triton", self._key_fn, self._sample)
 
     def __getattr__(self, name: str) -> Any:
+        # [FUNCTION DOC] Delegate attribute lookup for names not set on the proxy to the wrapped kernel.
         # Delegate everything else (warmup, cache_key, wrap_triton hooks, ...)
         # to the real kernel. Only triggered for names not set on the proxy.
         return getattr(self._kernel, name)
@@ -372,6 +410,8 @@ def instrument_triton_kernel(
     *,
     key_fn: Callable[..., str] | None = None,
 ) -> Callable[[Any], InstrumentedTritonKernel]:
+    # [FUNCTION DOC] Return a decorator that wraps a triton.jit kernel in an InstrumentedTritonKernel for the given op
+    # symbol and optional key_fn. Must be stacked above the triton.jit decoration. wall_ms on a miss includes compile plus launch time.
     """Instrument a single ``@triton.jit`` kernel, stacked above the jit::
 
         @instrument_triton_kernel("aten::bmm")
@@ -394,12 +434,15 @@ def instrument_triton_kernel(
     """
 
     def decorator(kernel: Any) -> InstrumentedTritonKernel:
+        # [FUNCTION DOC] HELPER: Build the InstrumentedTritonKernel proxy for the decorated kernel.
         return InstrumentedTritonKernel(kernel, op, key_fn)
 
     return decorator
 
 
 def _helion_cache_size(kernel: Any) -> int | None:
+    # [FUNCTION DOC] HELPER: Return the total count of compiled configurations across a Helion Kernel's bound kernels
+    # (reading private _bound_kernels and _compile_cache attributes), or None if unavailable or on any error.
     """Compiled-config count across a Helion Kernel's bound specializations.
 
     Helion stores compiled configs in ``Kernel._bound_kernels[*]._compile_cache``;
@@ -421,6 +464,9 @@ def _helion_cache_size(kernel: Any) -> int | None:
 
 
 class InstrumentedHelionKernel:
+    # [CLASS DOC] Proxy around a Helion Kernel. Wraps the kernel callable with the shared instrumentation core (dsl "helion")
+    # using the configuration count as the miss counter; calls go through the wrapper and other attributes are delegated
+    # to the raw kernel, which is also available via helion_kernel.
     """Transparent proxy over a Helion ``Kernel`` compile cache."""
 
     def __init__(
@@ -429,20 +475,25 @@ class InstrumentedHelionKernel:
         op: str,
         key_fn: Callable[..., str] | None,
     ) -> None:
+        # [FUNCTION DOC] Store the kernel and build the instrumented wrapper callable for it.
         self._kernel = kernel
         self._wrapped = _make_wrapper(kernel, op, "helion", key_fn, self._sample)
 
     @property
     def helion_kernel(self) -> Any:
+        # [FUNCTION DOC] Property returning the wrapped raw Helion kernel.
         return self._kernel
 
     def _sample(self) -> tuple[int | None, int | None]:
+        # [FUNCTION DOC] HELPER: Return (None, compiled configuration count of the kernel) as the cache snapshot.
         return None, _helion_cache_size(self._kernel)
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        # [FUNCTION DOC] Call the kernel through the instrumented wrapper and return its result.
         return self._wrapped(*args, **kwargs)
 
     def __getattr__(self, name: str) -> Any:
+        # [FUNCTION DOC] Delegate attribute lookup for names not set on the proxy to the wrapped kernel.
         return getattr(self._kernel, name)
 
 
@@ -451,9 +502,11 @@ def instrument_helion_kernel(
     *,
     key_fn: Callable[..., str] | None = None,
 ) -> Callable[[Any], InstrumentedHelionKernel]:
+    # [FUNCTION DOC] Return a decorator wrapping a Helion Kernel in an InstrumentedHelionKernel for the given op and optional key_fn.
     """Instrument a Helion ``Kernel`` without importing Helion eagerly."""
 
     def decorator(kernel: Any) -> InstrumentedHelionKernel:
+        # [FUNCTION DOC] HELPER: Build the InstrumentedHelionKernel proxy for the decorated kernel.
         return InstrumentedHelionKernel(kernel, op, key_fn)
 
     return decorator
@@ -473,6 +526,9 @@ def instrumented_cutedsl_cache(
     *,
     key_fn: Callable[..., str] | None = None,
 ) -> Callable[[Callable[..., R]], Callable[..., R]]:
+    # [FUNCTION DOC] Return a decorator that applies the vendored quack jit_cache and then CuTeDSL compile instrumentation
+    # to a compile function. Imports jit_cache eagerly when this factory is called (raises ImportError if quack/cutlass is
+    # unavailable, e.g. CPU-only builds); the lazy part is only relative to importing torch._native.
     """Cache + instrument a CuTeDSL compile function in one decorator::
 
         @instrumented_cutedsl_cache("aten::topk")
@@ -487,6 +543,7 @@ def instrumented_cutedsl_cache(
     from torch._vendor.quack.cache import jit_cache
 
     def decorator(fn: Callable[..., R]) -> Callable[..., R]:
+        # [FUNCTION DOC] HELPER: Apply jit_cache then the cutedsl instrumentation to fn and return the result.
         return instrument_cutedsl_compile(op, key_fn=key_fn)(jit_cache(fn))
 
     return decorator
@@ -497,6 +554,8 @@ def instrumented_triton_cache(
     *,
     key_fn: Callable[..., str] | None = None,
 ) -> Callable[[Callable[..., R]], InstrumentedTritonKernel]:
+    # [FUNCTION DOC] Return a decorator that applies triton.jit and then Triton instrumentation to a bare kernel function,
+    # yielding an InstrumentedTritonKernel. Imports triton when this factory is called (ImportError if missing).
     """JIT + instrument a Triton kernel in one decorator::
 
         @instrumented_triton_cache("aten::bmm")
@@ -511,6 +570,7 @@ def instrumented_triton_cache(
     import triton
 
     def decorator(fn: Callable[..., R]) -> InstrumentedTritonKernel:
+        # [FUNCTION DOC] HELPER: JIT-compile fn with triton and wrap it in the instrumented proxy.
         return instrument_triton_kernel(op, key_fn=key_fn)(triton.jit(fn))
 
     return decorator
@@ -523,6 +583,8 @@ def instrumented_helion_kernel(
     key_fn: Callable[..., str] | None = None,
     **settings: object,
 ) -> Callable[[Callable[..., R]], InstrumentedHelionKernel]:
+    # [FUNCTION DOC] Return a decorator that creates a Helion kernel from a function (aot selects the experimental AOT kernel
+    # decorator, extra settings are passed to it) and wraps it in an InstrumentedHelionKernel. Imports helion when called (ImportError if missing).
     """Create and instrument a regular or AOT Helion kernel."""
     import helion  # pyrefly: ignore[missing-import]
     import helion.experimental  # pyrefly: ignore[missing-import]
@@ -530,6 +592,7 @@ def instrumented_helion_kernel(
     kernel_decorator = helion.experimental.aot_kernel if aot else helion.kernel
 
     def decorator(fn: Callable[..., R]) -> InstrumentedHelionKernel:
+        # [FUNCTION DOC] HELPER: Create the Helion kernel from fn using the chosen decorator and settings, then instrument it.
         return instrument_helion_kernel(op, key_fn=key_fn)(
             kernel_decorator(**settings)(fn)
         )
