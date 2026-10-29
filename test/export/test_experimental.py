@@ -1,5 +1,13 @@
 # Owner(s): ["oncall: export"]
 # flake8: noqa
+# [MODULE DOC] Tests for experimental export features: forward-backward joint export, sticky
+# export, dynamo graph capture for export (public and private variants), and BlockMask / mask_mod
+# closure extraction into pytree leaves for flex attention.
+# Contains a small pytree-flattenable context class used as a dynamo output type, a helper that
+# registers BlockMask as a pytree node, and one test case class. Many tests need CUDA and are
+# skipped otherwise.
+# Import time effect: defines a module-level global list used by a side-effect test; no
+# registration happens until a test runs.
 import contextlib
 import copy
 import functools
@@ -37,6 +45,10 @@ GLOBAL_LIST = []
 
 
 def _register_blockmask_pytree():
+    # [FUNCTION DOC] HELPER: Import BlockMask and the pytree supported-node table from the flex
+    # attention module and, only if BlockMask is not already registered, register it as a pytree
+    # node using its own flatten, unflatten and keyed flatten methods plus a serialized type
+    # name. Idempotent; mutates global pytree registry.
     """Register BlockMask as a pytree node if not already registered."""
     from torch.nn.attention.flex_attention import BlockMask
     from torch.utils._pytree import register_pytree_node, SUPPORTED_NODES
@@ -52,11 +64,22 @@ def _register_blockmask_pytree():
 
 
 class GlobalContext:
+    # [CLASS DOC] HELPER: Test fixture that acts as both a context manager and a
+    # pytree-flattenable container. State is two dicts, one of summaries and one of tensors, both
+    # initially empty. It provides flatten and unflatten methods suitable for registering as a
+    # custom pytree node. Entering returns itself and exiting does nothing.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Create empty summary and tensor dictionaries. KNOWN ISSUE: the
+        # annotations name MetricValue and Tensor, which are not defined or imported in this
+        # module; harmless only because annotations on attributes inside a function body are
+        # never evaluated.
         self._summaries: dict[str, MetricValue] = {}
         self._tensors: dict[str, Tensor] = {}
 
     def __flatten__(self):
+        # [FUNCTION DOC] HELPER: Flatten both dicts with pytree. Returns a pair: the leaves (all
+        # summary leaves followed by all tensor leaves, as a tuple) and a context tuple holding
+        # the two tree specs.
         """Flattens into (leaves, ctx)."""
         summary_leaves, summary_spec = pytree.tree_flatten(self._summaries)
         tensor_leaves, tensor_spec = pytree.tree_flatten(self._tensors)
@@ -66,6 +89,10 @@ class GlobalContext:
 
     @classmethod
     def __unflatten__(cls, leaves, ctx: tuple[pytree.TreeSpec, pytree.TreeSpec]):
+        # [FUNCTION DOC] HELPER: Class method inverse of flatten. Takes the leaves and the
+        # context pair of specs, raises AssertionError if the number of leaves differs from the
+        # combined leaf count of both specs, then creates a new instance and rebuilds its summary
+        # dict from the first leaves and its tensor dict from the rest. Returns the new instance.
         """Reconstructs from (leaves, ctx)."""
         output = cls()
         summary_spec, tensor_spec = ctx
@@ -83,22 +110,38 @@ class GlobalContext:
         return output
 
     def __enter__(self) -> "GlobalContext":
+        # [FUNCTION DOC] HELPER: Context manager entry; returns the same object.
         return self
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        # [FUNCTION DOC] HELPER: Context manager exit; does nothing and returns None, so
+        # exceptions are not suppressed.
         pass
 
 
 @unittest.skipIf(not torch._dynamo.is_dynamo_supported(), "dynamo isn't supported")
 class TestExperiment(TestCase):
+    # [CLASS DOC] Test case for experimental export APIs. Groups tests for joint forward/backward
+    # export, sticky export wrapping, dynamo graph capture for export, flex attention BlockMask
+    # closure extraction and tracing, and restoring state dict names. The whole class is skipped
+    # when dynamo is unsupported.
     def test_joint_basic(self) -> None:
+        # [FUNCTION DOC] Export a small linear plus cross entropy module strictly with the new
+        # experimental tracer, convert it to a joint forward-backward program and compare the
+        # generated code with an expected snapshot; then run decompositions and compare again
+        # with a second snapshot (alias nodes renamed).
         class Module(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local module made of a three by three linear layer and a cross
+            # entropy loss.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the linear layer and the loss module.
                 super().__init__()
                 self.linear = torch.nn.Linear(3, 3)
                 self.loss = torch.nn.CrossEntropyLoss()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply softmax over dim 0 to the linear output and return
+                # the cross entropy loss against a fixed one-hot target vector.
                 return self.loss(
                     self.linear(x).softmax(dim=0), torch.tensor([1.0, 0.0, 0.0])
                 )
@@ -194,16 +237,27 @@ def forward(self, p_linear_weight, p_linear_bias, c_lifted_tensor_0, x):
         )
 
     def _test_export_blockmask_with_mask_fn(self, make_mask_fn):
+        # [FUNCTION DOC] HELPER: Shared body for block mask export tests. Registers BlockMask as
+        # a pytree node, builds a model whose forward constructs a block mask from a mask
+        # function produced by the given factory, captures it with the private dynamo export
+        # capture function on CUDA input, and checks the captured graph returns the same tensor
+        # and an equivalent mask_mod result as eager execution. Requires CUDA.
         from torch.nn.attention.flex_attention import create_block_mask
 
         _register_blockmask_pytree()
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local module that creates a mask function from a stored factory
+            # and builds a 64 by 64 block mask from it.
             def __init__(self, mask_fn_factory):
+                # [FUNCTION DOC] HELPER: Store the mask function factory.
                 super().__init__()
                 self.mask_fn_factory = mask_fn_factory
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Call the factory for a fresh mask function, build a
+                # block mask with batch 1, heads 1 and length 64 for queries and keys on the
+                # input device, and return the input together with the block mask.
                 mask_fn = self.mask_fn_factory()
                 block_mask = create_block_mask(
                     mask_fn, B=1, H=1, Q_LEN=64, KV_LEN=64, device=x.device
@@ -226,10 +280,16 @@ def forward(self, p_linear_weight, p_linear_bias, c_lifted_tensor_0, x):
 
     @unittest.skipIf(not TEST_CUDA, "CUDA not available")
     def test_export_blockmask(self):
+        # [FUNCTION DOC] CUDA only. Export a model whose mask function is a nested closure
+        # capturing an int, using the shared block mask test body.
         def make_mask_fn():
+            # [FUNCTION DOC] HELPER: Factory returning a mask function whose causal check is
+            # shifted by a captured integer.
             res = 4
 
             def fn(b, h, q, k):
+                # [FUNCTION DOC] HELPER: Mask function that is true where the query index is at
+                # least key index plus the captured constant.
                 return q >= k + res
 
             return fn
@@ -237,14 +297,24 @@ def forward(self, p_linear_weight, p_linear_bias, c_lifted_tensor_0, x):
         self._test_export_blockmask_with_mask_fn(make_mask_fn)
 
     def test_export_with_default_kwargs(self):
+        # [FUNCTION DOC] Capture a module wrapper whose __call__ has a keyword-only parameter
+        # with a default (and forwards other arguments to an inner linear layer) with the public
+        # capture function. Checks captured and eager outputs agree, including the passed-through
+        # default, and compares the generated code with a snapshot.
         class FunctionalWrapper(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local wrapper module overriding __call__ with a keyword-only
+            # default context argument.
             """Wrapper with keyword-only argument in __call__."""
 
             def __init__(self, module):
+                # [FUNCTION DOC] HELPER: Store the wrapped module.
                 super().__init__()
                 self._module = module
 
             def __call__(self, *args, _ctx=None, **kwargs):
+                # [FUNCTION DOC] HELPER: Call the wrapped module with the positional and keyword
+                # arguments and return a pair of its output and the keyword-only context value
+                # (None by default).
                 # _ctx is keyword-only with default None
                 out = self._module(*args, **kwargs)
                 return out, _ctx
@@ -273,10 +343,17 @@ def forward(self, args_0):
 
     @unittest.skipIf(not TEST_CUDA, "CUDA not available")
     def test_export_blockmask_mutated_closure(self):
+        # [FUNCTION DOC] CUDA only. A mask function closure whose captured integer is rebound
+        # after the function is defined must still be exported using the final value; uses the
+        # shared block mask test body.
         def make_mask_fn():
+            # [FUNCTION DOC] HELPER: Factory that defines a mask function capturing a variable,
+            # then reassigns the variable and returns the function.
             res = 1
 
             def fn(b, h, q, k):
+                # [FUNCTION DOC] HELPER: Mask function comparing the query index with key index
+                # plus the captured variable.
                 return q >= k + res
 
             res = 4  # mutation after function definition
@@ -286,11 +363,17 @@ def forward(self, args_0):
 
     @unittest.skipIf(not TEST_CUDA, "CUDA not available")
     def test_export_blockmask_closure_with_containers(self):
+        # [FUNCTION DOC] CUDA only. Export a mask function whose closure captures a list and a
+        # nested dictionary, via the shared body.
         def make_mask_fn():
+            # [FUNCTION DOC] HELPER: Factory creating a list of offsets and a nested config dict
+            # and returning a mask function using them.
             offsets = [1, 2, 3]
             config = {"base": 4, "nested": {"scale": 2}}
 
             def fn(b, h, q, k):
+                # [FUNCTION DOC] HELPER: Mask function true where query index is at least key
+                # index plus the base config value plus the sum of the offsets.
                 return q >= k + config["base"] + sum(offsets)
 
             return fn
@@ -299,16 +382,26 @@ def forward(self, args_0):
 
     @unittest.skipIf(not TEST_CUDA, "CUDA not available")
     def test_export_blockmask_closure_triple_nested(self):
+        # [FUNCTION DOC] CUDA only. Export a mask function whose captured variables come from
+        # three nested enclosing functions, via the shared body.
         def make_mask_fn():
+            # [FUNCTION DOC] HELPER: Outermost factory defining a captured variable and an inner
+            # function, returning the result of calling the inner function.
             a = 1
 
             def level1():
+                # [FUNCTION DOC] HELPER: Middle level defining a second captured variable and a
+                # nested function; returns that function's result.
                 b = 2
 
                 def level2():
+                    # [FUNCTION DOC] HELPER: Innermost enclosing level defining a third captured
+                    # variable and returning the mask function.
                     c = 3
 
                     def fn(bx, h, q, k):
+                        # [FUNCTION DOC] HELPER: Mask function using the variables from all three
+                        # enclosing levels in its comparison.
                         return q >= k + a + b + c
 
                     return fn
@@ -321,20 +414,31 @@ def forward(self, args_0):
 
     @unittest.skipIf(not TEST_CUDA, "CUDA not available")
     def test_export_blockmask_closure_self_recursive(self):
+        # [FUNCTION DOC] CUDA only. A mask function that refers to itself through its closure
+        # cannot be reconstructed; capturing a model that returns such a block mask must raise a
+        # dynamo Unsupported error mentioning a nested function with non-constructible closure
+        # in output.
         from torch.nn.attention.flex_attention import create_block_mask
 
         _register_blockmask_pytree()
 
         def make_mask_fn():
+            # [FUNCTION DOC] HELPER: Factory returning a mask function that refers to itself.
             # Self-referential: fn captures itself through the closure
             def fn(b, h, q, k):
+                # [FUNCTION DOC] HELPER: Mask function that references itself in its body and
+                # compares query index with key index plus four.
                 _ = fn  # self-reference
                 return q >= k + 4
 
             return fn
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local module building a 64 by 64 block mask from the
+            # self-referential mask function.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Build the mask function, create a block mask and return
+                # the input with it.
                 mask_fn = make_mask_fn()
                 block_mask = create_block_mask(
                     mask_fn, B=1, H=1, Q_LEN=64, KV_LEN=64, device=x.device
@@ -352,21 +456,32 @@ def forward(self, args_0):
 
     @unittest.skipIf(not TEST_CUDA, "CUDA not available")
     def test_export_blockmask_closure_tensor(self):
+        # [FUNCTION DOC] CUDA only. A mask function that captures itself and a tensor is not
+        # constructible; capturing must raise the dynamo Unsupported error about
+        # non-constructible closure in output.
         from torch.nn.attention.flex_attention import create_block_mask
 
         _register_blockmask_pytree()
 
         def make_mask_fn():
+            # [FUNCTION DOC] HELPER: Factory creating a captured tensor and returning a mask
+            # function that refers to itself and uses the tensor sum.
             tensor = torch.ones(2, 2)
 
             def fn(b, h, q, k):
+                # [FUNCTION DOC] HELPER: Mask function referencing itself and adding the captured
+                # tensor sum to the comparison.
                 _ = fn
                 return q >= k + 4 + tensor.sum()
 
             return fn
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local module building a 64 by 64 block mask from the
+            # factory function.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Build the mask function, create a block mask and return
+                # the input with it.
                 mask_fn = make_mask_fn()
                 block_mask = create_block_mask(
                     mask_fn, B=1, H=1, Q_LEN=64, KV_LEN=64, device=x.device
@@ -384,24 +499,38 @@ def forward(self, args_0):
 
     @unittest.skipIf(not TEST_CUDA, "CUDA not available")
     def test_export_blockmask_closure_unsupported_class_instance(self):
+        # [FUNCTION DOC] CUDA only. A mask function capturing an instance of an arbitrary user
+        # class is unsupported; capturing must raise the dynamo Unsupported error about
+        # non-constructible closure in output.
         from torch.nn.attention.flex_attention import create_block_mask
 
         _register_blockmask_pytree()
 
         class MaskConfig:
+            # [CLASS DOC] HELPER: Plain user class holding an offset, used as an unsupported
+            # closure value.
             def __init__(self, offset):
+                # [FUNCTION DOC] HELPER: Store the offset.
                 self.offset = offset
 
         def make_mask_fn():
+            # [FUNCTION DOC] HELPER: Factory creating a config object and returning a mask
+            # function that uses its offset.
             cfg = MaskConfig(offset=5)
 
             def fn(b, h, q, k):
+                # [FUNCTION DOC] HELPER: Mask function comparing query index with key index plus
+                # the config offset.
                 return q >= k + cfg.offset
 
             return fn
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local module building a 64 by 64 block mask from the
+            # factory function.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Build the mask function, create a block mask and return
+                # the input with it.
                 mask_fn = make_mask_fn()
                 block_mask = create_block_mask(
                     mask_fn, B=1, H=1, Q_LEN=64, KV_LEN=64, device=x.device
@@ -419,25 +548,38 @@ def forward(self, args_0):
 
     @unittest.skipIf(not TEST_CUDA, "CUDA not available")
     def test_export_blockmask_closure_mutually_recursive(self):
+        # [FUNCTION DOC] CUDA only. Two mask functions that refer to each other cannot be
+        # serialized; capturing must raise the dynamo Unsupported error about non-constructible
+        # closure in output.
         from torch.nn.attention.flex_attention import create_block_mask
 
         _register_blockmask_pytree()
 
         def make_mask_fn():
+            # [FUNCTION DOC] HELPER: Factory defining two mutually referencing functions and
+            # returning the first.
             # Create mutually recursive closures: fn_a references fn_b, fn_b references fn_a
             # This is non-constructible because we cannot serialize mutually recursive closures
             def fn_a(b, h, q, k):
+                # [FUNCTION DOC] HELPER: First mask function; refers to the second function and
+                # compares query index with key index.
                 _ = fn_b  # reference to fn_b
                 return q >= k
 
             def fn_b(b, h, q, k):
+                # [FUNCTION DOC] HELPER: Second mask function; refers to the first function and
+                # compares query index with key index plus one.
                 _ = fn_a  # reference to fn_a
                 return q >= k + 1
 
             return fn_a
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local module building a 64 by 64 block mask from the mutually
+            # recursive function.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Build the mask function, create a block mask and return
+                # the input with it.
                 mask_fn = make_mask_fn()
                 block_mask = create_block_mask(
                     mask_fn, B=1, H=1, Q_LEN=64, KV_LEN=64, device=x.device
@@ -458,6 +600,10 @@ def forward(self, args_0):
         "Requires CUDA with SM >= 8.0, Triton, and not ROCm",
     )
     def test_aot_export_flex_attention_callable_mask_mod(self):
+        # [FUNCTION DOC] Runs only on supported flex attention CUDA platforms that are not ROCm.
+        # Exports a flex attention model whose mask_mod is an instance of a callable class (with
+        # its own equality and hash) with the AOT export module function, and checks the exported
+        # graph output matches eager output in shape and within a small tolerance.
         """Test flex_attention AOT export with callable class as mask_mod.
 
         _MaskModWrapper must delegate __eq__ to callable objects for TreeSpec
@@ -469,28 +615,42 @@ def forward(self, args_0):
         _register_blockmask_pytree()
 
         class ComposedMaskMod:
+            # [CLASS DOC] HELPER: Callable class combining several mask functions with logical
+            # and; defines equality and hash by the tuple of functions.
             def __init__(self, *mask_fns):
+                # [FUNCTION DOC] HELPER: Store the given mask functions as a tuple.
                 self.mask_fns = mask_fns
 
             def __call__(self, b, h, q, k):
+                # [FUNCTION DOC] HELPER: Start from True and combine with each stored mask
+                # function applied to the same indices using bitwise and; return the result.
                 result = True
                 for fn in self.mask_fns:
                     result = result & fn(b, h, q, k)
                 return result
 
             def __eq__(self, other):
+                # [FUNCTION DOC] HELPER: Equality: return NotImplemented for other types,
+                # otherwise compare the tuples of functions.
                 if not isinstance(other, ComposedMaskMod):
                     return NotImplemented
                 return self.mask_fns == other.mask_fns
 
             def __hash__(self):
+                # [FUNCTION DOC] HELPER: Hash of the tuple of functions.
                 return hash(self.mask_fns)
 
         def causal_mask(b, h, q, k):
+            # [FUNCTION DOC] HELPER: Causal mask function: true where query index is at least
+            # key index.
             return q >= k
 
         class FlexAttentionModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Single layer attention model using flex attention with a causal
+            # block mask built inside forward.
             def __init__(self, embed_dim: int, num_heads: int):
+                # [FUNCTION DOC] HELPER: Store head count and head dimension and create query,
+                # key and value linear projections.
                 super().__init__()
                 self.num_heads = num_heads
                 self.head_dim = embed_dim // num_heads
@@ -499,6 +659,10 @@ def forward(self, args_0):
                 self.v_proj = torch.nn.Linear(embed_dim, embed_dim)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Project the input into query, key and value, reshape to
+                # heads and transpose, build a causal block mask from the callable mask class,
+                # run flex attention and return a one element tuple with the output reshaped back
+                # to batch, length, embedding.
                 B, L, D = x.shape
                 q = self.q_proj(x).view(B, L, self.num_heads, self.head_dim)
                 k = self.k_proj(x).view(B, L, self.num_heads, self.head_dim)
@@ -530,13 +694,22 @@ def forward(self, args_0):
         "Requires CUDA with SM >= 8.0, Triton, and not ROCm",
     )
     def test_aot_export_flex_attention_with_blockmask_placeholders(self):
+        # [FUNCTION DOC] Runs only on supported flex attention CUDA platforms that are not ROCm.
+        # Build a model holding a block mask attribute on the meta device, convert its parameters
+        # to fake CUDA parameters under fake tensor mode, capture with the public function,
+        # assert that the graph has placeholders for the block mask, and check the joint export
+        # with descriptors returns a graph module.
         from torch._subclasses.fake_tensor import FakeTensorMode
         from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
         _register_blockmask_pytree()
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local module with a bias-free linear layer and a block mask
+            # attribute created at construction time.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Create the linear layer and a causal block mask of
+                # length 16 on CUDA.
                 super().__init__()
                 self.wq = torch.nn.Linear(64, 64, bias=False)
                 self.block_mask = create_block_mask(
@@ -549,6 +722,8 @@ def forward(self, args_0):
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Project the input, reshape to four heads and run flex
+                # attention using the stored block mask; returns the sum of the result.
                 q = self.wq(x).view(1, 16, 4, 16).transpose(1, 2)
                 return flex_attention(q, q, q, block_mask=self.block_mask).sum()
 
@@ -586,14 +761,23 @@ def forward(self, args_0):
         self.assertIsNotNone(joint_with_descriptors.graph_module)
 
     def test_joint_dynamic(self) -> None:
+        # [FUNCTION DOC] Export a module with a parameter and a dynamically sized input (Dim
+        # for dim 0) strictly, then convert to a forward-backward program; passes if no
+        # exception is raised.
         from torch.export import Dim
 
         class Module(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local module with a parameter that adds it to a tensor of ones
+            # sized by the input batch.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the parameter.
                 super().__init__()
                 self.y = torch.nn.Parameter(torch.randn(3))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Ignore the input values, build a tensor of ones with the
+                # batch size of the input and three columns, and return the sum of the parameter
+                # plus it.
                 x = torch.ones(x.shape[0], 3)
                 return (self.y + x).sum()
 
@@ -606,13 +790,20 @@ def forward(self, args_0):
         _export_forward_backward(ep)
 
     def test_joint_cifar10_backwards(self) -> None:
+        # [FUNCTION DOC] Export a small convolutional classifier (the tutorial CIFAR10 network
+        # with a cross entropy loss) strictly and convert it to a forward-backward program;
+        # passes if no exception is raised.
         import torch.nn as nn
         import torch.nn.functional as F
 
         # From Pytorch's CIFAR10 example:
         # https://pytorch.org/tutorials/beginner/blitz/cifar10_tutorial.html
         class Net(nn.Module):
+            # [CLASS DOC] HELPER: Local convolution and fully connected network with a cross
+            # entropy loss on the labels.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Create two convolutions, a pooling layer, three linear
+                # layers and the loss.
                 super().__init__()
                 self.conv1 = nn.Conv2d(3, 6, 5)
                 self.pool = nn.MaxPool2d(2, 2)
@@ -623,6 +814,9 @@ def forward(self, args_0):
                 self.loss = nn.CrossEntropyLoss()
 
             def forward(self, x, labels):
+                # [FUNCTION DOC] HELPER: Run convolution, relu and pooling twice, flatten, three
+                # linear layers with relu between them, and return the cross entropy loss against
+                # the labels.
                 x = self.pool(F.relu(self.conv1(x)))
                 x = self.pool(F.relu(self.conv2(x)))
                 x = torch.flatten(x, 1)  # flatten all dimensions except batch
@@ -640,13 +834,22 @@ def forward(self, args_0):
         ep = _export_forward_backward(ep)
 
     def test_joint_loss_index(self):
+        # [FUNCTION DOC] For each possible loss index of a two output module, export strictly and
+        # convert to forward-backward using that loss index; the output spec at that index must
+        # be the loss output and no other output spec may be.
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local module returning the loss and its detached negative or
+            # the detached loss and the loss, depending on a constructor argument.
             def __init__(self, index):
+                # [FUNCTION DOC] HELPER: Create a linear layer and store the index.
                 super().__init__()
                 self.l = torch.nn.Linear(4, 4)
                 self.index = index
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Sum the linear output; return the pair of that sum and
+                # its negated detached copy if the index is zero, otherwise the pair of the
+                # detached sum and the sum.
                 x = self.l(x)
                 x = x.sum()
                 if self.index == 0:
@@ -665,14 +868,22 @@ def forward(self, args_0):
                     self.assertTrue(spec.kind != OutputKind.LOSS_OUTPUT)
 
     def test_joint_buffer_input_mutations(self):
+        # [FUNCTION DOC] Export a module that mutates both a user input and a buffer then convert
+        # to forward-backward. Expect five output specs: the first a buffer mutation targeting
+        # buf, the second a user input mutation targeting x, the third the loss output.
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local module with a linear layer, a buffer and a loss that
+            # mutates both the input and the buffer in forward.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Create the linear layer, the buffer and the loss.
                 super().__init__()
                 self.l = torch.nn.Linear(4, 4)
                 self.register_buffer("buf", torch.randn(4))
                 self.loss = torch.nn.CrossEntropyLoss()
 
             def forward(self, x, label):
+                # [FUNCTION DOC] HELPER: Add the buffer to the input in place, apply the linear
+                # layer, add two to the buffer in place and return the cross entropy loss.
                 x.add_(self.buf)
                 x = self.l(x)
                 self.buf.add_(2.0)
@@ -707,19 +918,30 @@ def forward(self, args_0):
         )
 
     def test_sticky_export(self):
+        # [FUNCTION DOC] Wrap the forward method of a model with sticky export, call it through a
+        # small pipeline object, then restore the original forward and call again; the two
+        # results must be close.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local module with a single linear layer.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Create the linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(4, 4)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return the linear layer applied to the input.
                 return self.linear(x)
 
         class Pipeline:
+            # [CLASS DOC] HELPER: Local object that owns a model and forwards generate calls
+            # to it.
             def __init__(self, model):
+                # [FUNCTION DOC] HELPER: Store the model.
                 self.model = model
 
             def generate(self, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: Call the model with the given positional and keyword
+                # arguments and return its result.
                 return self.model(*args, **kwargs)
 
         inp = torch.randn(4, 4)
@@ -734,26 +956,43 @@ def forward(self, args_0):
         self.assertTrue(torch.allclose(res, res2))
 
     def test_sticky_export_dynamic(self):
+        # [FUNCTION DOC] Use sticky export with a callback that marks every dimension of every
+        # tensor argument as automatic dynamic through a shape collection. Calls the pipeline
+        # once on an input with batch four and compares the exported artifact code with a
+        # snapshot showing only the linear branch.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local module that uses its linear layer when the batch is under
+            # five, otherwise the sine.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Create the linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(4, 4)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return the linear output when the first dimension is
+                # less than five, otherwise the sine of the input.
                 if x.shape[0] < 5:
                     return self.linear(x)
                 return x.sin()
 
         class Pipeline:
+            # [CLASS DOC] HELPER: Local object that owns a model and forwards generate calls
+            # to it.
             def __init__(self, model):
+                # [FUNCTION DOC] HELPER: Store the model.
                 self.model = model
 
             def generate(self, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: Call the model with the given arguments and return
+                # its result.
                 return self.model(*args, **kwargs)
 
         inp = torch.randn(4, 4)
 
         def callback(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Sticky export dynamic shapes callback. Flattens the call
+            # arguments, and for every tensor builds an entry in a ShapesCollection that marks
+            # every dimension as automatic. Returns the collection.
             # I think it is bit weird to use the forward arg name here, so
             # lets just use ShapeCollections
 
@@ -784,19 +1023,32 @@ def forward(self, x):
         )
 
     def test_sticky_export_nested_inp(self):
+        # [FUNCTION DOC] Sticky export where the model forward takes a keyword-only list
+        # argument; wrap, call through a pipeline with keyword tensors, restore and call again;
+        # results must be close.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local module applying a linear layer to each of two list
+            # elements and adding them; forward takes keyword-only inputs.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Create the linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(4, 4)
 
             def forward(self, *, inputs):
+                # [FUNCTION DOC] HELPER: Return the sum of the linear layer applied to the first
+                # two items of the inputs.
                 return self.linear(inputs[0]) + self.linear(inputs[1])
 
         class Pipeline:
+            # [CLASS DOC] HELPER: Local object that packs two tensors into a list and calls its
+            # model with the keyword argument.
             def __init__(self, model):
+                # [FUNCTION DOC] HELPER: Store the model.
                 self.model = model
 
             def generate(self, *, input_tensor, input_tensor2):
+                # [FUNCTION DOC] HELPER: Build a list of the two keyword tensors and return the
+                # model result for it.
                 inputs = [input_tensor, input_tensor2]
                 return self.model(inputs=inputs)
 
@@ -813,10 +1065,16 @@ def forward(self, x):
         self.assertTrue(torch.allclose(res, res2))
 
     def test_side_effect(self):
+        # [FUNCTION DOC] With side effect replay turned off by config, capture a module that
+        # appends its input to an outer list; the list must remain empty after capture.
         global_env = []
 
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local module that appends the input to an enclosing list and
+            # returns the sine.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Append the input to the enclosing list and return the
+                # sine of the input.
                 global_env.append(x)
                 return x.sin()
 
@@ -825,8 +1083,18 @@ def forward(self, x):
             self.assertEqual(len(global_env), 0)
 
     def test_export_add_in_out_info(self):
+        # [FUNCTION DOC] Capture a module with a dict, a nested list and an int input whose
+        # outputs include inputs, a copied and extended list, new dict entries and constant
+        # lists; the captured module result must equal eager execution on a deep copy of
+        # the inputs.
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local module that multiplies values of the dict and list
+            # inputs, mutates a copy of the list and returns several values.
             def forward(self, dct, lst, bleh):
+                # [FUNCTION DOC] HELPER: Compute products of dict and list entries, extend a copy
+                # of the list with its first element, and return a tuple of the first dict entry,
+                # product y, the int input, the last item of the extended copy, product x and a
+                # constant list.
                 x = dct["a"] * lst[1][0]
                 y = dct["b"] * lst[0]
                 out_dict = {}
@@ -862,6 +1130,8 @@ def forward(self, x):
         self.assertEqual(res_export, res_eager)
 
     def test_single_op(self):
+        # [FUNCTION DOC] Capture a bare aten operator (addition, then range with an out tensor)
+        # with the public capture function and compare the generated code against snapshots.
         # from torch._dynamo.functional_export import dynamo_graph_capture_for_export
         x, y = (torch.randn(2, 3), torch.randn(2, 3))
         graph = dynamo_graph_capture_for_export(torch.ops.aten.add.Tensor)(x, y)
@@ -890,8 +1160,12 @@ def forward(self, start, end, out):
         )
 
     def test_export_leaf(self):
+        # [FUNCTION DOC] Capture a simple module and check the captured module output equals the
+        # eager result.
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local module returning the sine of its input.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return the sine of the input.
                 return x.sin()
 
         export_inputs = ((torch.randn(4, 4),), {})
@@ -909,8 +1183,15 @@ def forward(self, start, end, out):
         self.assertEqual(res_export, res_eager)
 
     def test_dynamo_graph_capture(self):
+        # [FUNCTION DOC] Capture a module with dict, list and tensor inputs and structured
+        # outputs; compare the captured module with eager on fresh inputs of the same structure.
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local module with products of dict and list entries and
+            # structured output.
             def forward(self, dct, lst, bleh):
+                # [FUNCTION DOC] HELPER: Same computation as the add-in-out test: returns the
+                # first dict entry, a product, the third input, the last item of an extended list
+                # copy, another product and a constant list.
                 x = dct["a"] * lst[1][0]
                 y = dct["b"] * lst[0]
                 out_dict = {}
@@ -932,6 +1213,8 @@ def forward(self, start, end, out):
         foo = Foo()
 
         def make_inputs():
+            # [FUNCTION DOC] HELPER: Build fresh example inputs: a dict of two tensors, a list
+            # holding a tensor and a one-element tuple, and a tensor.
             return (
                 {"a": torch.randn(2, 3), "b": torch.randn(2, 3)},
                 [torch.randn(2, 3), (torch.randn(2, 3),)],
@@ -944,21 +1227,33 @@ def forward(self, start, end, out):
         self.assertEqual(gm(*test_inputs), foo(*test_inputs))
 
     def test_dynamo_graph_capture_with_call_override(self):
+        # [FUNCTION DOC] Capture a module whose call method is overridden to forward to an inner
+        # module; the captured module must agree with eager and have the same number of buffers
+        # and parameters.
         class _InterestingModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local wrapper module whose call method forwards to a
+            # stored module.
             def __init__(self, module):
+                # [FUNCTION DOC] HELPER: Store the wrapped module.
                 super().__init__()
                 self._module = module
 
             def __call__(self, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: Call the wrapped module with all arguments and return
+                # its result.
                 return self._module(*args, **kwargs)
 
         class MyModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local module that adds one to its input.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return the input plus one.
                 return x + 1
 
         foo = _InterestingModule(MyModel())
 
         def make_inputs():
+            # [FUNCTION DOC] HELPER: Build a one element tuple with a random tensor of two
+            # by three.
             return (torch.randn(2, 3),)
 
         trace_inputs = make_inputs()
@@ -969,20 +1264,28 @@ def forward(self, start, end, out):
         self.assertEqual(len(list(gm.parameters())), len(list(foo.parameters())))
 
     def test_dynamo_graph_capture_custom_pytree_type(self):
+        # [FUNCTION DOC] Register a dataclass as a pytree node, capture a module taking it,
+        # compare generated code with a snapshot and check outputs against eager. The
+        # registration is undone in a finally block.
         import torch.utils._pytree as pytree
 
         @dataclass
         class Bar:
+            # [CLASS DOC] HELPER: Dataclass with two tensor fields.
             x: torch.Tensor
             y: torch.Tensor
 
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local module adding the two fields of the dataclass input.
             def forward(self, bar: Bar):
+                # [FUNCTION DOC] HELPER: Return the sum of the two tensor fields.
                 return bar.x + bar.y
 
         foo = Foo()
 
         def make_inputs():
+            # [FUNCTION DOC] HELPER: Build a one element tuple holding the dataclass with two
+            # random tensors.
             return (Bar(torch.randn(2, 3), torch.randn(2, 3)),)
 
         pytree.register_dataclass(Bar)
@@ -1006,13 +1309,20 @@ def forward(self, args_0):
             pytree._deregister_pytree_node(Bar)
 
     def test_dynamo_graph_capture_closure(self):
+        # [FUNCTION DOC] Capture a module that uses an enclosing tensor and constant int, compare
+        # generated code with a snapshot (constants inlined, tensor passed as extra input) and
+        # check output against a fresh module.
         from torch.export import Dim
 
         N = 3
         outer = torch.randn(10, 32)
 
         class MyModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local module that adds an enclosing tensor, slices, stacks
+            # and reshapes.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Add the enclosing tensor, drop the last row, stack the
+                # result three times and reshape to a three dimensional tensor.
                 z = x + outer
                 y = z[:-1, :]  # [s0 - 1, 32]
                 stacked = torch.stack([y] * N, dim=0)  # [N * (s0 - 1), 32]
@@ -1038,13 +1348,20 @@ def forward(self, args_0):
         self.assertEqual(ep(*inps), MyModel()(*inps))
 
     def test_dynamo_graph_capture_full_tracing_context(self) -> None:
+        # [FUNCTION DOC] Capture with an input whose dim 0 is marked dynamic; the captured module
+        # matches eager on a different batch size and its metadata tracing context has a fake
+        # mode and exactly one tensor context entry.
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local module adding the first dimension size to the input.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return the input plus its first dimension size.
                 return x + x.shape[0]
 
         foo = Foo()
 
         def make_inputs(b: int):
+            # [FUNCTION DOC] HELPER: Create a random tensor with the given batch size and three
+            # columns, mark dim 0 dynamic, and return it in a tuple.
             ret = (torch.randn(b, 3),)
             torch._dynamo.mark_dynamic(ret[0], 0)
             return ret
@@ -1057,14 +1374,22 @@ def forward(self, args_0):
         self.assertEqual(len(gm.meta["tracing_context"].tensor_to_context), 1)
 
     def test_dynamo_graph_capture_ctx_return(self):
+        # [FUNCTION DOC] Register GlobalContext as a pytree node, capture a module that returns
+        # such an object created in a with block, and compare flattened leaves of captured and
+        # eager outputs. Deregisters the node in a finally block.
         class Module(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local module that returns a value and a context object holding
+            # a tensor computed from the input.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Inside a context, compute the input plus one, store
+                # input plus two in the context tensors under key six, and return both.
                 with GlobalContext() as ctx:
                     z = x + 1
                     ctx._tensors["6"] = x + 2
                 return z, ctx
 
         def make_inputs():
+            # [FUNCTION DOC] HELPER: Build a one element tuple with a random tensor.
             return (torch.randn(2, 3),)
 
         try:
@@ -1084,25 +1409,37 @@ def forward(self, args_0):
             pytree._deregister_pytree_node(GlobalContext)
 
     def test_dynamo_graph_capture_dict_keys_getitem(self):
+        # [FUNCTION DOC] Capture a module whose forward pre-hook assigns into an attribute of a
+        # local object; the code snapshot shows the hook's dead add and the module's
+        # multiplication, and the captured module matches eager.
         class Module(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local module doubling its input.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return the input times two.
                 return x * 2
 
         foo = Module()
 
         class BlockMask:
+            # [CLASS DOC] HELPER: Local stand-in class named like BlockMask holding a
+            # data attribute.
             def __init__(self, d):
+                # [FUNCTION DOC] HELPER: Store the given value.
                 self.d = d
 
         block_mask = BlockMask(torch.randn(4))
 
         def pre_hook_function(m, input):
+            # [FUNCTION DOC] HELPER: Forward pre-hook: set the data attribute of the local object
+            # to the first input plus one and return the inputs unchanged.
             block_mask.d = input[0] + 1
             return input  # Return a tuple of modified inputs
 
         foo.register_forward_pre_hook(pre_hook_function)
 
         def make_inputs():
+            # [FUNCTION DOC] HELPER: Build a one element tuple with a random tensor of
+            # length four.
             return (torch.randn(4),)
 
         trace_inputs = make_inputs()
@@ -1122,16 +1459,22 @@ def forward(self, args_0):
         self.assertEqual(gm(*test_inputs), foo(*test_inputs))
 
     def test_dynamo_graph_capture_with_tensor_constant(self):
+        # [FUNCTION DOC] Capture a module adding an enclosing tensor constant; the captured
+        # module must match eager and have the same numbers of buffers and parameters.
         outer = torch.randn(2, 3)
 
         class MyModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local module adding an enclosing tensor to the input.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return the input plus the enclosing tensor.
                 z = x + outer
                 return z
 
         foo = MyModel()
 
         def make_inputs():
+            # [FUNCTION DOC] HELPER: Build a one element tuple with a random tensor of two
+            # by three.
             return (torch.randn(2, 3),)
 
         trace_inputs = make_inputs()
@@ -1142,14 +1485,22 @@ def forward(self, args_0):
         self.assertEqual(len(list(gm.parameters())), len(list(foo.parameters())))
 
     def test_dynamo_graph_capture_side_effects(self):
+        # [FUNCTION DOC] Clear the module-level list, capture a plain function that appends to
+        # it, with replay disabled. Checks exactly one warning about side effects while
+        # compiling, that tracing and calling the captured module leave the list empty, and that
+        # eager execution appends one entry.
         GLOBAL_LIST.clear()
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: Add one to the input, append the result to the module-level
+            # list and return it.
             z = x + 1
             GLOBAL_LIST.append(z)
             return z
 
         def make_inputs():
+            # [FUNCTION DOC] HELPER: Build a one element tuple with a random tensor of two
+            # by three.
             return (torch.randn(2, 3),)
 
         trace_inputs = make_inputs()
@@ -1174,29 +1525,49 @@ def forward(self, args_0):
 
     @unittest.skipIf(not TEST_CUDA, "CUDA not available")
     def test_dynamo_graph_capture_fx_graph_annotate_overlap_pass(self):
+        # [FUNCTION DOC] CUDA only. Capture a model composed of custom autograd function
+        # applications, two of them inside fx annotations, with node metadata preservation
+        # enabled, and check the captured module matches the model on fresh inputs. The
+        # triple-quoted block in the body is an unused string literal documenting the expected
+        # graph; nothing asserts on it.
         class DummyOp(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Custom autograd function adding a scalar in forward and passing
+            # the gradient unchanged in backward.
             @staticmethod
             def forward(ctx, x, scalar):
+                # [FUNCTION DOC] HELPER: Save the input for backward and return it plus
+                # the scalar.
                 ctx.save_for_backward(x)
                 return x + scalar
 
             @staticmethod
             def backward(ctx, grad_out):
+                # [FUNCTION DOC] HELPER: Return the incoming gradient for the tensor and None for
+                # the scalar.
                 return grad_out, None
 
         def mock_fw_compute(x):
+            # [FUNCTION DOC] HELPER: Apply the custom function with ten under a
+            # compute annotation.
             with fx_traceback.annotate({"compute": 0}):
                 return DummyOp.apply(x, 10)
 
         def mock_bw_comm(x):
+            # [FUNCTION DOC] HELPER: Apply the custom function with twenty under a
+            # communication annotation.
             with fx_traceback.annotate({"comm": 0}):
                 return DummyOp.apply(x, 20)
 
         def mock_bw_compute(x):
+            # [FUNCTION DOC] HELPER: Apply the custom function with thirty and no annotation.
             return DummyOp.apply(x, 30)
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local module chaining the helper functions on a forward input
+            # and a backward input.
             def forward(self, fw_in, bw_in):
+                # [FUNCTION DOC] HELPER: Apply forward compute to the first input, communication
+                # then compute to the second, and return both results.
                 fw_out = mock_fw_compute(fw_in)
                 # bw_in blocks bw_out
                 bw_in = mock_bw_comm(bw_in)
@@ -1204,6 +1575,8 @@ def forward(self, args_0):
                 return fw_out, bw_out
 
         def input_fn():
+            # [FUNCTION DOC] HELPER: Build a tuple of a random CUDA tensor that requires grad
+            # followed by a random CUDA tensor.
             inputs = (torch.rand(2, 128, device="cuda", requires_grad=True),)
             grad_ins = (torch.rand(2, 128, device="cuda"),)
             return (
@@ -1236,8 +1609,12 @@ def forward(self, args_0):
         self.assertEqual(gm(*test_inputs), model(*test_inputs))
 
     def test_dynamo_graph_capture_default_args(self):
+        # [FUNCTION DOC] Capture a module whose forward has a default second argument and call
+        # the captured module with the default; output must equal eager.
         class Module(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local module adding a default valued second argument.
             def forward(self, x, y=1):
+                # [FUNCTION DOC] HELPER: Return x plus y.
                 return x + y
 
         m = Module()
@@ -1246,16 +1623,23 @@ def forward(self, args_0):
         self.assertEqual(ep(*test_inputs), m(*test_inputs))
 
     def test_restore_state_dict_basic(self):
+        # [FUNCTION DOC] Capture a module with a linear layer and a buffer, restore the original
+        # state dict names onto the captured module, and check parameter and buffer names equal
+        # the original names and outputs equal eager.
         """Test basic state dict restoration with a simple model."""
         from torch.export import _restore_state_dict
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local module with a linear layer and a buffer added to
+            # its output.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Create the linear layer and register a buffer.
                 super().__init__()
                 self.linear = torch.nn.Linear(4, 4)
                 self.register_buffer("buf", torch.randn(4))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return the linear output plus the buffer.
                 return self.linear(x) + self.buf
 
         model = Model()
@@ -1288,25 +1672,34 @@ def forward(self, args_0):
         self.assertEqual(expected, actual)
 
     def test_restore_state_dict_nested_modules(self):
+        # [FUNCTION DOC] Restore state dict names after capturing a model made of two submodules
+        # each with a linear layer and buffer; parameter and buffer names must match the original
+        # and outputs match eager.
         """Test state dict restoration with nested modules."""
         from torch.export import _restore_state_dict
 
         class SubModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local submodule with a linear layer and a scale buffer.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Create the linear layer and register the scale buffer.
                 super().__init__()
                 self.fc = torch.nn.Linear(8, 8)
                 self.register_buffer("scale", torch.tensor(2.0))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return the linear output times the scale.
                 return self.fc(x) * self.scale
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local module summing the outputs of two submodules.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Create two submodules.
                 super().__init__()
                 self.sub1 = SubModule()
                 self.sub2 = SubModule()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return the sum of both submodule outputs.
                 return self.sub1(x) + self.sub2(x)
 
         model = Model()
@@ -1331,15 +1724,20 @@ def forward(self, args_0):
         self.assertEqual(expected, actual)
 
     def test_restore_state_dict_with_bound_method(self):
+        # [FUNCTION DOC] Capture the bound forward method of a model, restore state dict names
+        # passing the bound method, and check parameter names match the original.
         """Test state dict restoration when passing a bound method."""
         from torch.export import _restore_state_dict
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local module with one linear layer.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Create the linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(4, 4)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return the linear layer applied to the input.
                 return self.linear(x)
 
         model = Model()
@@ -1354,6 +1752,8 @@ def forward(self, args_0):
         self.assertEqual(original_param_names, restored_param_names)
 
     def test_restore_state_dict_type_error(self):
+        # [FUNCTION DOC] Restoring state dict names with an argument that is neither a module nor
+        # a bound method must raise TypeError.
         """Test that _restore_state_dict raises TypeError for invalid input."""
         from torch.export import _restore_state_dict
 
@@ -1365,6 +1765,10 @@ def forward(self, args_0):
 
     @unittest.skipIf(not TEST_CUDA, "CUDA not available")
     def test_aot_export_blockmask_with_new_closure(self):
+        # [FUNCTION DOC] CUDA only. Capture a model returning a block mask built from a closure,
+        # then export through the AOT joint export under a tracing context, compile state context
+        # and fake mode; compare the graph code with a snapshot. Then compile the joint result
+        # and check it is not None.
         import contextlib
 
         from torch._export.utils import _compiling_state_context
@@ -1378,15 +1782,22 @@ def forward(self, args_0):
         _register_blockmask_pytree()
 
         def make_mask_fn():
+            # [FUNCTION DOC] HELPER: Factory returning a mask function capturing an integer.
             res = 4
 
             def fn(b, h, q, k):
+                # [FUNCTION DOC] HELPER: Mask function true where query index is at least key
+                # index plus the captured integer.
                 return q >= k + res
 
             return fn
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local module building a block mask from the factory
+            # mask function.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Build the mask function, create a 64 by 64 block mask,
+                # return the input with it.
                 mask_fn = make_mask_fn()
                 block_mask = create_block_mask(
                     mask_fn, B=1, H=1, Q_LEN=64, KV_LEN=64, device=x.device
@@ -1503,6 +1914,9 @@ def forward(self, arg0_1):
 
     @unittest.skipIf(not TEST_CUDA, "CUDA not available")
     def test_aot_export_blockmask_closure_spec_mismatch(self):
+        # [FUNCTION DOC] CUDA only. Flattening block masks: same closure code with same or
+        # different captured values gives equal tree specs, while a mask function with different
+        # code gives a different spec.
         """BlockMasks with same closure structure produce equal TreeSpecs.
 
         Closure values are extracted into pytree leaves, so two BlockMasks
@@ -1516,7 +1930,11 @@ def forward(self, arg0_1):
         _register_blockmask_pytree()
 
         def make_mask_fn(offset):
+            # [FUNCTION DOC] HELPER: Factory returning a mask function that captures the
+            # given offset.
             def fn(b, h, q, k):
+                # [FUNCTION DOC] HELPER: Mask function true where query index is at least key
+                # index plus the offset.
                 return q >= k + offset
 
             return fn
@@ -1543,6 +1961,8 @@ def forward(self, arg0_1):
 
         # Different closure *code* -> different spec
         def different_mask(b, h, q, k):
+            # [FUNCTION DOC] HELPER: Different mask function: true where query index is strictly
+            # greater than key index.
             return q > k
 
         mask_c = create_block_mask(
@@ -1552,6 +1972,11 @@ def forward(self, arg0_1):
         self.assertNotEqual(spec_a, spec_c)
 
     def _assert_blockmask_partial_replays_bound_tensors(self, make_mask_mod):
+        # [FUNCTION DOC] HELPER: Shared check for partial mask_mod extraction. Builds block masks
+        # whose mask_mod is a partial with bound tensors from the given factory, traces the
+        # mask_mod with make_fx on the flattened leaves of the first mask, replays the traced
+        # function with the leaves of a second mask, and asserts the replay equals the second
+        # mask's eager result and differs from the first's.
         from torch.fx.experimental.proxy_tensor import make_fx
         from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 
@@ -1562,6 +1987,8 @@ def forward(self, arg0_1):
         batch1_attn_regions = torch.tensor([0, 0, 1, 1, 0, 0, 1, 1], dtype=torch.int32)
 
         def mask_rule(batch, head, query_idx, key_idx, attn_regions, document_ids):
+            # [FUNCTION DOC] HELPER: Mask rule requiring causal order, equal attention regions
+            # and equal document ids of query and key positions.
             return (
                 (query_idx >= key_idx)
                 & (attn_regions[query_idx] == attn_regions[key_idx])
@@ -1569,6 +1996,8 @@ def forward(self, arg0_1):
             )
 
         def build_block_mask(attn_regions):
+            # [FUNCTION DOC] HELPER: Create a small 8 by 8 CPU block mask whose mask_mod binds
+            # the given attention regions.
             return create_block_mask(
                 make_mask_mod(mask_rule, attn_regions, document_ids),
                 B=1,
@@ -1580,6 +2009,9 @@ def forward(self, arg0_1):
             )
 
         def trace_mask_mod(attn_regions):
+            # [FUNCTION DOC] HELPER: Build a block mask, flatten it, and return a make_fx trace
+            # of a function that rebuilds the block mask from the leaves and evaluates mask_mod
+            # on the index grid.
             block_mask = build_block_mask(attn_regions)
             flat_leaves, spec = block_mask._flatten()
             return make_fx(
@@ -1603,6 +2035,8 @@ def forward(self, arg0_1):
         self.assertTrue(torch.equal(replayed_batch1, expected_batch1))
 
     def test_blockmask_partial_extraction_replays_bound_tensors(self):
+        # [FUNCTION DOC] Run the partial replay check with a mask_mod that is a single functools
+        # partial binding two keyword tensors.
         self._assert_blockmask_partial_replays_bound_tensors(
             lambda mask_rule, attn_regions, document_ids: functools.partial(
                 mask_rule,
@@ -1612,6 +2046,8 @@ def forward(self, arg0_1):
         )
 
     def test_blockmask_recursive_partial_extraction_replays_bound_tensors(self):
+        # [FUNCTION DOC] Run the partial replay check with a mask_mod that is a nested
+        # functools partial.
         self._assert_blockmask_partial_replays_bound_tensors(
             lambda mask_rule, attn_regions, document_ids: functools.partial(
                 functools.partial(mask_rule, attn_regions=attn_regions),
@@ -1620,12 +2056,18 @@ def forward(self, arg0_1):
         )
 
     def test_mask_mod_wrapper_eq_for_partials(self):
+        # [FUNCTION DOC] Mask mod wrappers built from extracted partials with the same function
+        # but different bound tensors compare equal and have equal hashes, for both plain and
+        # nested partials. Calling the wrapper raises RuntimeError saying the stripped callable
+        # is not callable.
         from torch.nn.attention.flex_attention import (
             _extract_callable_pytree,
             _MaskModWrapper,
         )
 
         def mask_rule(batch, head, query_idx, key_idx, attn_regions, document_ids):
+            # [FUNCTION DOC] HELPER: Mask rule requiring causal order, equal attention regions
+            # and equal document ids.
             return (
                 (query_idx >= key_idx)
                 & (attn_regions[query_idx] == attn_regions[key_idx])
@@ -1637,6 +2079,8 @@ def forward(self, arg0_1):
         batch1_attn_regions = torch.tensor([0, 0, 1, 1, 0, 0, 1, 1], dtype=torch.int32)
 
         def wrap(mask_mod):
+            # [FUNCTION DOC] HELPER: Extract the pytree leaves from a callable and wrap the
+            # stripped callable and spec in a mask mod wrapper.
             _, spec, stripped = _extract_callable_pytree(mask_mod)
             return _MaskModWrapper(stripped, spec)
 
@@ -1679,19 +2123,25 @@ def forward(self, arg0_1):
             )
 
     def test_mask_mod_wrapper_eq_for_plain_functions(self):
+        # [FUNCTION DOC] Two separately created but structurally identical plain mask functions
+        # give wrappers that are equal and hash equally.
         from torch.nn.attention.flex_attention import (
             _extract_callable_pytree,
             _MaskModWrapper,
         )
 
         def make_mask_mod():
+            # [FUNCTION DOC] HELPER: Factory returning a new causal mask function.
             def mask_mod(batch, head, query_idx, key_idx):
+                # [FUNCTION DOC] HELPER: Causal mask ignoring batch and head.
                 del batch, head
                 return query_idx >= key_idx
 
             return mask_mod
 
         def wrap(mask_mod):
+            # [FUNCTION DOC] HELPER: Extract the pytree leaves from a callable and wrap the
+            # stripped callable and spec in a mask mod wrapper.
             _, spec, stripped = _extract_callable_pytree(mask_mod)
             return _MaskModWrapper(stripped, spec)
 
@@ -1702,15 +2152,22 @@ def forward(self, arg0_1):
         self.assertEqual(hash(wrapped_a), hash(wrapped_b))
 
     def test_blockmask_self_referential_function_closure_extraction(self):
+        # [FUNCTION DOC] Block masks made from mask functions that refer to a self-referential
+        # helper function must have equal tree specs, and a block mask rebuilt from flattened
+        # leaves must give the same mask_mod result as the original.
         from torch.nn.attention.flex_attention import create_block_mask
 
         _register_blockmask_pytree()
 
         def make_mask_mod():
+            # [FUNCTION DOC] HELPER: Factory returning a causal mask function that references a
+            # self-returning helper.
             def helper():
+                # [FUNCTION DOC] HELPER: Helper that returns itself.
                 return helper
 
             def mask_mod(batch, head, query_idx, key_idx):
+                # [FUNCTION DOC] HELPER: Causal mask that references the helper but ignores it.
                 del batch, head
                 _ = helper
                 return query_idx >= key_idx
@@ -1743,6 +2200,10 @@ def forward(self, arg0_1):
 
     @unittest.skipIf(not TEST_CUDA, "CUDA not available")
     def test_blockmask_and_masks_closure_extraction(self):
+        # [FUNCTION DOC] CUDA only. Combine two mask functions with and_masks where one captures
+        # a CUDA tensor; flattening the block mask yields leaves of the regular tensor attributes
+        # plus the captured tensor, all tensors, passes the dynamo input check, and unflattening
+        # gives a callable mask_mod.
         """and_masks closure tensors are recursively extracted into pytree leaves.
 
         and_masks(fn1, fn2) returns a closure capturing a tuple of functions.
@@ -1760,11 +2221,14 @@ def forward(self, arg0_1):
         _register_blockmask_pytree()
 
         def causal(b, h, q_idx, kv_idx):
+            # [FUNCTION DOC] HELPER: Causal mask: true where query index is at least key index.
             return q_idx >= kv_idx
 
         offset = torch.tensor(3, device="cuda")
 
         def offset_mask(b, h, q_idx, kv_idx):
+            # [FUNCTION DOC] HELPER: Mask comparing the query index against key index plus the
+            # captured tensor.
             return q_idx >= kv_idx + offset
 
         mask_mod = and_masks(causal, offset_mask)
@@ -1794,24 +2258,42 @@ def forward(self, arg0_1):
         self.assertTrue(callable(restored.mask_mod))
 
     def test_aot_export_closure_buffer_mutation(self):
+        # [FUNCTION DOC] Buffer mutation through a closure: captures a wrapper module whose
+        # function mutates a buffer through closure, verifies the dynamo capture mutates the
+        # buffer, exports joint graphs through both the public and private capture functions and
+        # checks their code is identical, then runs both joint graphs and compares outputs and
+        # the mutated buffer with eager.
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local module with a zero buffer that accumulates the input sum
+            # and returns the sine.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Register the buffer.
                 super().__init__()
                 self.register_buffer("buf", torch.zeros(()))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Add the sum of the input to the buffer in place and
+                # return the sine of the input.
                 self.buf.add_(x.sum())
                 return x.sin()
 
         def make_closure(mod):
+            # [FUNCTION DOC] HELPER: Return a function that mutates the buffer of the given
+            # module in place with the input sum and returns the sine.
             def fn(x):
+                # [FUNCTION DOC] HELPER: Add the input sum to the module buffer in place and
+                # return the sine of the input.
                 mod._buffers["buf"].add_(x.sum())
                 return x.sin()
 
             return fn
 
         class Wrapper(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local module sharing the parameter, buffer and submodule
+            # dictionaries of another module and calling a stored function.
             def __init__(self, fn, mod):
+                # [FUNCTION DOC] HELPER: Alias the dictionaries of the given module and store
+                # the function.
                 super().__init__()
                 self._parameters = mod._parameters
                 self._buffers = mod._buffers
@@ -1819,9 +2301,14 @@ def forward(self, arg0_1):
                 self._fn = fn
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Call the stored function with the input.
                 return self._fn(x)
 
         def run_export(capture_fn):
+            # [FUNCTION DOC] HELPER: Create a module and wrapper, capture with the given capture
+            # function, then run joint export with descriptors inside tracing, compile state and
+            # fake mode contexts with input mutation kept and functionalization disabled. Returns
+            # the joint graph module, the wrapper and the input.
             mod = Mod()
             wrapped = Wrapper(make_closure(mod), mod)
             x = torch.randn(4)
