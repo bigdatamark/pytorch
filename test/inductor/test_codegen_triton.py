@@ -1,4 +1,9 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests for the Inductor Triton code generation helpers. Covers reduction function
+# selection, range tree ownership, kernel source escaping, divisibility and pointer range kernel
+# configs, fp8 signatures, pow lowering, and enum sanitizing. Several tests need a GPU plus
+# Triton and are skipped otherwise. The main block runs the tests only if a CPU or GPU backend
+# is available.
 import ast
 import contextlib
 import unittest
@@ -48,11 +53,20 @@ from torch.utils._triton import has_triton_package
 
 
 class TestCodegenTriton(InductorTestCase):
+    # [CLASS DOC] Test case for Triton codegen utilities. Each test runs with a fake graph
+    # handler installed by setUp (a trivial traced module wrapped in a graph lowering object) so
+    # size variable and graph queries work; tearDown closes the handler stack.
     def setUp(self):
+        # [FUNCTION DOC] Build a graph lowering object for a trivial doubling module and enter
+        # its graph handler context on an exit stack stored on the test, so V.graph is usable
+        # inside tests.
         super().setUp()
 
         class DummyModule(torch.nn.Module):
+        # [CLASS DOC] HELPER: Trivial module whose forward doubles its input; only used to build
+        # a graph.
             def forward(self, x):
+            # [FUNCTION DOC] HELPER: Return the input multiplied by two.
                 return x * 2
 
         self._gm = torch.fx.symbolic_trace(DummyModule())
@@ -62,10 +76,15 @@ class TestCodegenTriton(InductorTestCase):
         self._stack.enter_context(V.set_graph_handler(self._graph))
 
     def tearDown(self):
+        # [FUNCTION DOC] Close the exit stack opened in setUp (leaving the graph handler), then
+        # run base teardown.
         self._stack.close()
         super().tearDown()
 
     def test_strict_signed_zero_reduction_function(self):
+        # [FUNCTION DOC] For min and max, the reduction function name is the plain helper
+        # name by default, and gets the strict suffix when the strict_signed_zero config is
+        # patched on.
         for reduction_type in ("min", "max"):
             self.assertEqual(
                 get_triton_reduction_function(reduction_type),
@@ -79,7 +98,13 @@ class TestCodegenTriton(InductorTestCase):
 
     @unittest.skipUnless(HAS_GPU_AND_TRITON, "requires GPU and Triton")
     def test_strict_signed_zero_unrolled_reduction(self):
+        # [FUNCTION DOC] On GPU, compile min and max reductions over a small tensor with signed
+        # zeros and a NaN row with strict_signed_zero on. Checks the bit patterns of the zero
+        # rows match eager results (sign of zero preserved), that the NaN row yields NaN, and
+        # that generated code uses a where.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return the per-row minimum and maximum of the input along
+            # dimension one.
             return torch.amin(x, dim=1), torch.amax(x, dim=1)
 
         x = torch.tensor(
@@ -107,8 +132,16 @@ class TestCodegenTriton(InductorTestCase):
         self.assertIn("tl.where", " ".join(code))
 
     def test_range_tree_entry_ownership_uses_root_identity(self):
+        # [FUNCTION DOC] Check that range tree variable ownership is decided by root identity:
+        # an alternate root with the same prefix only claims its own entry when splitting a
+        # combined index expression, and block shape lookup uses the kernel's current range
+        # trees (temporarily swapped, then restored in a finally block).
         class AlternateR0Root(IterationRangesRoot):
+            # [CLASS DOC] HELPER: Iteration range root with a distinct block size symbol, used
+            # to prove identity (not prefix) decides entry ownership.
             def block_size(self):
+                # [FUNCTION DOC] HELPER: Return a fixed positive integer symbol named as an
+                # alternate reduction block.
                 return sympy.Symbol("ALT_R0_BLOCK", integer=True, positive=True)
 
         kernel = TritonKernel(
@@ -150,6 +183,10 @@ class TestCodegenTriton(InductorTestCase):
                 kernel.range_trees = saved_range_trees
 
     def test_escape_triton_kernel_source_for_wrapper(self):
+        # [FUNCTION DOC] For both plain and C++ wrapper modes, escape a Triton kernel source
+        # containing backslashes and quotes, embed it in a wrapper call string, and check the
+        # result compiles and parses back (including through a nested raw string for the C++
+        # wrapper) to exactly the original source.
         source = """\
 @triton.jit
 def helper(x):
@@ -175,11 +212,19 @@ def helper(x):
             self.assertEqual(ast.literal_eval(call.args[1]), source)
 
     def test_persistent_reduction_choice_two_arg_override(self):
+        # [FUNCTION DOC] Check a custom choices handler overriding the persistent
+        # reduction decision with only features and cooperative flag arguments is called
+        # with the features' tiling scores, and its False result leaves the new Triton
+        # kernel non-persistent.
         seen_scores = []
 
         class CustomChoices(InductorChoices):
+            # [CLASS DOC] HELPER: Choices subclass whose persistent reduction hook records
+            # tiling scores and always declines persistent reduction.
             @staticmethod
             def should_use_persistent_reduction(features, cooperative_reduction):
+                # [FUNCTION DOC] HELPER: Record the tiling scores of the features into the outer
+                # list and return False.
                 seen_scores.append(features.tiling_scores)
                 return False
 
@@ -197,6 +242,10 @@ def helper(x):
 
     @inductor_config.patch("triton.divisible_by_16", True)
     def test_config_of_sizearg(self):
+        # [FUNCTION DOC] With the divisible_by_16 config on, check the kernel config built from
+        # size arguments marks only arguments whose value is statically a multiple of sixteen
+        # (including products with a sixteen-divisible factor) as divisible, using the format of
+        # the installed Triton version.
         from torch._inductor.utils import (
             get_triton_attrs_descriptor_version,
             TritonAttrsDescriptorVersion,
@@ -209,6 +258,10 @@ def helper(x):
         s1 = sympy.Symbol("s1", positive=True, integer=True)
 
         def _check_divisibility(expected_divisible_indices, config):
+            # [FUNCTION DOC] HELPER: Assert the config marks exactly the expected indices as
+            # divisible by sixteen, reading the attribute or dict layout that matches the
+            # detected attribute descriptor version. Raises an assertion error for an unknown
+            # version that is not the dict layout.
             if get_triton_attrs_descriptor_version() in {
                 TritonAttrsDescriptorVersion.V1_COMPILER,
                 TritonAttrsDescriptorVersion.V0_NO_TRITON,
@@ -263,6 +316,9 @@ def helper(x):
         )
 
     def test_config_of_sizearg_with_check_constraint(self):
+        # [FUNCTION DOC] Check a symbol is not known to be a multiple of sixteen until a modulo-
+        # zero axiom is added to the shape environment, after which the size variable query
+        # reports true.
         from torch.utils._sympy.functions import Mod
 
         s2 = sympy.Symbol("s2", positive=True, integer=True)
@@ -280,12 +336,19 @@ def helper(x):
 
     @inductor_config.patch("triton.divisible_by_16", True)
     def test_config_of_skips_graph_input_tensor_divisibility_for_cpp_wrapper_jit(self):
+        # [FUNCTION DOC] Check divisibility of graph input tensor args in the kernel config:
+        # with the C++ wrapper in JIT mode and the skip flag, inputs listed in inputs_to_check
+        # lose divisibility while buffers keep it; with AOT mode the skip is ignored. Graph
+        # state is restored in a finally block.
         from torch._inductor.utils import (
             get_triton_attrs_descriptor_version,
             TritonAttrsDescriptorVersion,
         )
 
         def _has_divisibility_16(config, idx):
+            # [FUNCTION DOC] HELPER: Return whether the config marks the argument index as
+            # divisible by sixteen, for the attribute layouts or the dict layout of the
+            # installed Triton version.
             if get_triton_attrs_descriptor_version() in {
                 TritonAttrsDescriptorVersion.V1_COMPILER,
                 TritonAttrsDescriptorVersion.V0_NO_TRITON,
@@ -312,6 +375,9 @@ def helper(x):
             with patch.object(triton_utils, "is_unaligned_buffer", return_value=False):
 
                 def _check(input_divisible, buffer_divisible, *, skip=False):
+                    # [FUNCTION DOC] HELPER: Build a config for the input and buffer args
+                    # with the given skip flag and assert their divisibility matches the
+                    # expected booleans.
                     triton_config = triton_utils.config_of(
                         [input_arg, buffer_arg],
                         skip_cpp_wrapper_input_tensor_alignment=skip,
@@ -346,6 +412,10 @@ def helper(x):
             V.graph.graph_inputs.pop(input_arg.buffer, None)
 
     def test_cpp_wrapper_python_fallback_return_slots_skip_mutation_outputs(self):
+        # [FUNCTION DOC] With the C++ wrapper on, generate a Python fallback kernel call for a
+        # mutating op whose first output is a mutation output. Asserts the generated code reads
+        # only the real output from the Python result capsule and declares no handle for the
+        # mutated output. State is restored.
         original_cpp_wrapper = V.graph.cpp_wrapper
         try:
             V.graph.cpp_wrapper = True
@@ -388,11 +458,18 @@ def helper(x):
             V.graph.cpp_wrapper = original_cpp_wrapper
 
     def test_pow_uses_active_override_constant_lowering(self):
+        # [FUNCTION DOC] Check pow with a constant base and symbolic integer exponent builds the
+        # constant through the active overrides class, converts the exponent to float64, and
+        # uses the libdevice pow.
         exponent = CSEVariable("ks0", ValueRanges.unknown(), torch.int64)
 
         class TestTritonKernelOverrides(TritonKernelOverrides):
+            # [CLASS DOC] HELPER: Triton overrides subclass whose constant method returns a
+            # custom marker string.
             @classmethod
             def constant(cls, value, dtype):
+                # [FUNCTION DOC] HELPER: Return a marker string embedding the value and dtype
+                # instead of a real constant.
                 return f"custom_constant({value}, {dtype})"
 
         self.assertEqual(
@@ -401,6 +478,8 @@ def helper(x):
         )
 
     def test_pow_preserves_integer_dtype_for_unsigned_scalar_exponents(self):
+        # [FUNCTION DOC] Check dtype propagation for pow with an integer scalar base and an
+        # unsigned 32-bit exponent equals the promoted type of the two operands.
         exponent = CSEVariable("ks0", ValueRanges.unknown(), torch.uint32)
 
         self.assertEqual(
@@ -409,11 +488,18 @@ def helper(x):
         )
 
     def test_pow_uses_integer_helper_for_unsigned_scalar_exponents(self):
+        # [FUNCTION DOC] Check pow with an unsigned 32-bit symbolic exponent is lowered to the
+        # integer power helper in the triton helpers module, with the base built by the
+        # overridden constant method.
         exponent = CSEVariable("ks0", ValueRanges.unknown(), torch.uint32)
 
         class TestTritonKernelOverrides(TritonKernelOverrides):
+            # [CLASS DOC] HELPER: Triton overrides subclass whose constant method returns a
+            # custom marker string.
             @classmethod
             def constant(cls, value, dtype):
+                # [FUNCTION DOC] HELPER: Return a marker string embedding the value and dtype
+                # instead of a real constant.
                 return f"custom_constant({value}, {dtype})"
 
         self.assertEqual(
@@ -422,6 +508,9 @@ def helper(x):
         )
 
     def test_materialize_trunc_to_float_expr_preserves_integer_subexpressions(self):
+        # [FUNCTION DOC] Check materializing integer truncation to float: a bare truncation
+        # becomes the float form, while integer floor division, equality predicates, and large
+        # integers stay unchanged; a float sum has its truncation term converted.
         s0 = sympy.Symbol("s0")
 
         trunc_expr = TruncToInt(s0)
@@ -450,6 +539,9 @@ def helper(x):
 
     @inductor_config.patch("triton.emit_pointer_range_32", True)
     def test_config_of_emit_pointer_range_32_enabled(self):
+        # [FUNCTION DOC] With emit_pointer_range_32 on, check the config built with a pointer
+        # range override of the first argument records it, as an attribute or as a dict entry
+        # depending on Triton version.
         from torch._inductor.utils import (
             get_triton_attrs_descriptor_version,
             TritonAttrsDescriptorVersion,
@@ -476,6 +568,9 @@ def helper(x):
 
     @inductor_config.patch("triton.emit_pointer_range_32", False)
     def test_config_of_emit_pointer_range_32_disabled(self):
+        # [FUNCTION DOC] With emit_pointer_range_32 off, check the config built with an empty
+        # pointer range override has no pointer range entries, in either the attribute or the
+        # dict layout.
         from torch._inductor.utils import (
             get_triton_attrs_descriptor_version,
             TritonAttrsDescriptorVersion,
@@ -504,9 +599,12 @@ def helper(x):
     @unittest.skipUnless(torch.version.hip is not None, "pointer_range_32 is HIP-only")
     @unittest.skipUnless(HAS_GPU_AND_TRITON, "requires GPU and Triton")
     def test_pointer_range_in_generated_code(self):
+        # [FUNCTION DOC] HIP and GPU with Triton only: compile a simple add and check the
+        # generated code mentions the pointer range attribute.
         """Verify tt.pointer_range=32 appears in generated Triton code on HIP."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return the input plus one.
             return x + 1
 
         x = torch.randn(64, 64, device=GPU_TYPE, dtype=torch.bfloat16)
@@ -515,6 +613,10 @@ def helper(x):
         self.assertIn("tt.pointer_range", code_str)
 
     def test_is_multiple_of_rules(self):
+        # [FUNCTION DOC] Check structural multiple-of rules in the size variable query: products
+        # need one divisible factor, sums need all terms divisible, floor division needs the
+        # numerator divisible by the divisor times n, modulo needs divisible operands, and bare
+        # symbols use shape env axioms. Adds axioms to the shared shape environment as it goes.
         """Test structural divisibility rules in _is_multiple_of."""
         from torch.utils._sympy.functions import FloorDiv, Mod
 
@@ -557,6 +659,8 @@ def helper(x):
         self.assertTrue(sv.statically_known_multiple_of(s4, 8))
 
     def test_signature_of_fp8_dtypes(self):
+        # [FUNCTION DOC] Check each fp8 dtype maps to its expected Triton pointer signature
+        # string when passed as a tensor arg. Failure messages name the dtype.
         """fp8 dtypes should produce correct Triton pointer signatures via _type_of."""
         expected = {
             torch.float8_e4m3fn: "*fp8e4nv",
@@ -573,6 +677,9 @@ def helper(x):
 
     @unittest.skipUnless(has_triton_package(), "requires Triton package")
     def test_fp8_dtype_support_matrix(self):
+        # [FUNCTION DOC] With the Triton package present, check the fp8 support table: e4m3fn
+        # needs CUDA arch 89 or newer, e5m2 works from 75, the fnuz variants are rejected on
+        # CUDA and accepted on HIP gfx942.
         self.assertFalse(
             is_triton_fp8_dtype_supported(
                 torch.float8_e4m3fn, triton_backend="cuda", triton_arch=80
@@ -610,13 +717,20 @@ def helper(x):
         )
 
     def test_signature_of_float8_e4m3fn_uses_uint8_on_pre_sm89_cuda_inputs(self):
+        # [FUNCTION DOC] Check signature_of reports unsigned 8-bit pointer for read-only float8
+        # e4m3fn inputs on CUDA compute capability 80, the fp8 type for an output buffer, and
+        # the fp8 type on capability 89. Uses fake graph and patched device properties.
         class FakeGraph:
+            # [CLASS DOC] HELPER: Fake graph with no mutated buffers, no unspecialized args, and
+            # a CUDA device.
             mutated_buffers = set()
 
             def is_unspec_arg(self, name):
+                # [FUNCTION DOC] HELPER: Report that no argument is unspecialized.
                 return False
 
             def get_current_device_or_throw(self):
+                # [FUNCTION DOC] HELPER: Return a CUDA device.
                 return torch.device("cuda")
 
         props = DeviceProperties(
@@ -657,6 +771,10 @@ def helper(x):
         return_value=False,
     )
     def test_no_fp64_in_kernel_when_device_unsupported(self, mock1, mock2):
+        # [FUNCTION DOC] GPU with Triton only, with fp64 support patched to report
+        # unsupported: compile a division by a dynamic shape and check each generated kernel
+        # body uses float32 and no float64. Fails if no kernel body matches the expected
+        # definition pattern.
         """Compile a kernel with dynamic shape division to verify fp64 is
         downgraded to fp32 in the generated Triton kernel body when the device
         does not support fp64.
@@ -668,6 +786,7 @@ def helper(x):
         import re
 
         def div_by_shape(x):
+            # [FUNCTION DOC] HELPER: Return the input divided by its first dimension size.
             return x / x.shape[0]
 
         x = torch.randn(16, 16, device=GPU_TYPE)
@@ -691,10 +810,14 @@ def helper(x):
     @unittest.skipUnless(torch.version.hip is not None, "pointer_range_32 is HIP-only")
     @unittest.skipUnless(HAS_GPU_AND_TRITON, "requires GPU and Triton")
     def test_pointer_range_not_in_user_defined_triton_kernel(self):
+        # [FUNCTION DOC] HIP and GPU with Triton only: compile a function launching a user-
+        # written Triton add kernel and check the generated code has no pointer range attribute.
         """User-defined Triton kernels should not get pointer_range_32."""
         import triton
         import triton.language as tl
 
+        # [FUNCTION DOC] HELPER: User Triton kernel adding two tensors elementwise with a mask
+        # over n_elements.
         @triton.jit
         def add_kernel(in_ptr0, in_ptr1, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
             pid = tl.program_id(axis=0)
@@ -705,10 +828,14 @@ def helper(x):
             tl.store(out_ptr + offsets, x + y, mask=mask)
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Allocate an output, launch the add kernel with a block size
+            # of 128 over a computed grid, and return the output.
             out = torch.empty_like(x)
             n = x.numel()
 
             def grid(meta):
+                # [FUNCTION DOC] HELPER: Return a one-element launch grid sized by ceiling
+                # division of n by block size.
                 return (triton.cdiv(n, meta["BLOCK_SIZE"]),)
 
             add_kernel[grid](x, y, out, n, BLOCK_SIZE=128)
@@ -721,6 +848,10 @@ def helper(x):
         self.assertNotIn("tt.pointer_range", code_str)
 
     def test_imports_for_benchmark_kernel_multiline_get_raw_stream(self):
+        # [FUNCTION DOC] Regression test: when the device ops import for the raw stream is
+        # multi-line, the benchmark kernel imports of both the Triton and combo kernel classes
+        # must still compile and keep the top-level imports unindented (dedent must happen
+        # before substitution).
         # Regression: a backend whose import_get_raw_stream_as returns a
         # multi-line snippet (e.g. the CPU override, which MTIA uses) must not
         # break the textwrap.dedent of the benchmark-kernel imports. Formatting
@@ -729,10 +860,15 @@ def helper(x):
         from torch._inductor.codegen.triton_combo_kernel import ComboKernel
 
         class FakeDeviceOps:
+            # [CLASS DOC] HELPER: Fake device ops returning a two-line raw stream
+            # import definition.
             def import_get_raw_stream_as(self, name):
+                # [FUNCTION DOC] HELPER: Return a two-line function definition text with the
+                # given name.
                 return f"def {name}(_):\n    return 0"
 
         class FakeGraph:
+            # [CLASS DOC] HELPER: Fake graph exposing only the fake device ops.
             device_ops = FakeDeviceOps()
 
         for kernel_cls in (TritonKernel, ComboKernel):
@@ -746,13 +882,18 @@ def helper(x):
             self.assertIn("\nimport torch\n", imports)
 
     def test_sanitize_for_repr(self):
+        # [FUNCTION DOC] Check sanitizing for repr replaces enums by their values, recursing
+        # into dicts (keys and values), lists, tuples and namedtuples (type preserved),
+        # including enums wrapping enums, and leaves other values unchanged.
         from torch._inductor.codegen.wrapper import _sanitize_for_repr
 
         class Color(Enum):
+            # [CLASS DOC] HELPER: Plain string valued enum with two members.
             RED = "red"
             BLUE = "blue"
 
         class Priority(IntEnum):
+            # [CLASS DOC] HELPER: Integer enum with two members.
             LOW = 0
             HIGH = 1
 
@@ -786,6 +927,7 @@ def helper(x):
 
         # Nested enum value
         class Outer(Enum):
+            # [CLASS DOC] HELPER: Enum whose single member wraps another enum member.
             INNER = Color.RED
 
         self.assertEqual(_sanitize_for_repr(Outer.INNER), "red")
@@ -796,14 +938,20 @@ def helper(x):
 
     @unittest.skipUnless(HAS_GPU_AND_TRITON, "requires GPU and Triton")
     def test_enum_constexpr_in_user_defined_triton_kernel(self):
+        # [FUNCTION DOC] GPU with Triton only: compile a function launching a user Triton kernel
+        # with an integer enum constexpr and check the result matches eager and the generated
+        # code contains no enum repr.
         """Custom Triton kernel with IntEnum constexpr generates valid code."""
         import triton
         import triton.language as tl
 
         class Mode(IntEnum):
+            # [CLASS DOC] HELPER: Integer enum with add and multiply modes.
             ADD = 1
             MUL = 2
 
+        # [FUNCTION DOC] HELPER: User Triton kernel adding one or multiplying by two a masked
+        # block, depending on the mode constexpr.
         @triton.jit
         def enum_kernel(
             in_ptr, out_ptr, numel, MODE: tl.constexpr, BLOCK_SIZE: tl.constexpr
@@ -818,6 +966,8 @@ def helper(x):
             tl.store(out_ptr + offsets, output, mask=mask)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Allocate an output, launch the enum kernel with the add
+            # mode, and return it.
             y = torch.empty_like(x)
             enum_kernel[(1,)](x, y, x.numel(), Mode.ADD, 256)
             return y

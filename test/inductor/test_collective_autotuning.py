@@ -1,4 +1,8 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Distributed test that autotunes a custom op between equivalent all-reduce
+# implementations on NCCL, using multi-process test cases with 2 and 4 ranks. Import-time side
+# effect: if distributed or NCCL is unavailable, prints a message to stderr and exits the
+# process with status zero before importing the rest.
 
 import sys
 
@@ -18,18 +22,26 @@ from torch.testing._internal.common_utils import run_tests
 
 
 class TestCollectiveAutotuning2Ranks(MultiProcessTestCase):
+    # [CLASS DOC] Multi-process test case with two ranks; setUp spawns the worker processes.
     """Test collective autotuning with 2 ranks"""
 
     @property
     def world_size(self):
+        # [FUNCTION DOC] HELPER: Return the number of ranks, two.
         return 2
 
     def setUp(self):
+        # [FUNCTION DOC] Run base setup and spawn the worker processes.
         super().setUp()
         self._spawn_processes()
 
     @skip_if_lt_x_gpu(2)
     def test_equivalent_allreduce_strategies(self):
+        # [FUNCTION DOC] Needs at least two GPUs. Initializes NCCL via a file store, registers
+        # the world group, and registers a custom op with two equivalent autotuning configs (sum
+        # all-reduce, and average all-reduce scaled by world size). Compiles a model using the
+        # op and runs it once on identical input; no value assertions, success means autotuning
+        # and the run did not fail. Destroys the process group at the end.
         """
         Test autotuning between mathematically equivalent all_reduce strategies.
 
@@ -54,18 +66,25 @@ class TestCollectiveAutotuning2Ranks(MultiProcessTestCase):
 
         @torch.library.custom_op("test::equiv_ar", mutates_args=())
         def equiv_ar(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Custom op implementation: clone the input and sum all-
+            # reduce it on the default group.
             result = x.clone()
             return torch.ops._c10d_functional.all_reduce_(result, "sum", "default")
 
         @equiv_ar.register_fake
         def _(x):
+            # [FUNCTION DOC] HELPER: Fake implementation returning an empty tensor shaped like
+            # the input.
             return torch.empty_like(x)
 
         def sum_allreduce(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Autotuning candidate: clone and sum all-reduce the input.
             result = x.clone()
             return torch.ops._c10d_functional.all_reduce_(result, "sum", "default")
 
         def avg_allreduce_scaled(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Autotuning candidate: average all-reduce a clone, then
+            # multiply by world size.
             result = x.clone()
             result = torch.ops._c10d_functional.all_reduce_(result, "avg", "default")
             return result * self.world_size
@@ -84,7 +103,9 @@ class TestCollectiveAutotuning2Ranks(MultiProcessTestCase):
         )
 
         class EquivAllReduceModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward calls the custom all-reduce op.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply the custom op to the input.
                 return equiv_ar(x)
 
         model = torch.compile(EquivAllReduceModel()).to(device)
@@ -100,18 +121,26 @@ class TestCollectiveAutotuning2Ranks(MultiProcessTestCase):
 
 
 class TestCollectiveAutotuning4Ranks(MultiProcessTestCase):
+    # [CLASS DOC] Multi-process test case with four ranks; setUp spawns the worker processes.
     """Test collective autotuning with 4 ranks"""
 
     @property
     def world_size(self):
+        # [FUNCTION DOC] HELPER: Return the number of ranks, four.
         return 4
 
     def setUp(self):
+        # [FUNCTION DOC] Run base setup and spawn the worker processes.
         super().setUp()
         self._spawn_processes()
 
     @skip_if_lt_x_gpu(4)
     def test_vllm_style_allreduce(self):
+        # [FUNCTION DOC] Needs at least four GPUs. Initializes NCCL via a file store, registers
+        # a custom op with two all-reduce candidates (flatten, copy to a buffer and reshape,
+        # versus direct clone). Compiles a model using the op, runs it with rank-dependent
+        # random input, and asserts the output shape equals the input shape. Destroys the
+        # process group at the end.
         """
         Test vLLM-style custom allreduce with buffer copy pattern.
 
@@ -136,14 +165,20 @@ class TestCollectiveAutotuning4Ranks(MultiProcessTestCase):
 
         @torch.library.custom_op("test::vllm_allreduce", mutates_args=())
         def vllm_allreduce(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Custom op implementation: clone the input and sum all-
+            # reduce it on the default group.
             result = x.clone()
             return torch.ops._c10d_functional.all_reduce_(result, "sum", "default")
 
         @vllm_allreduce.register_fake
         def _(x):
+            # [FUNCTION DOC] HELPER: Fake implementation returning an empty tensor shaped like
+            # the input.
             return torch.empty_like(x)
 
         def vllm_buffer_copy_allreduce(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Candidate that flattens to a contiguous copy, all-reduces
+            # it, and reshapes back.
             """
             vLLM registered=False: flatten -> copy to IPC buffer -> allreduce -> reshape
 
@@ -161,6 +196,8 @@ class TestCollectiveAutotuning4Ranks(MultiProcessTestCase):
             return result.view(original_shape)
 
         def nccl_allreduce_direct(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Candidate that clones the input and sum all-reduces
+            # it directly.
             """Standard NCCL allreduce without buffer copy."""
             result = x.clone()
             return torch.ops._c10d_functional.all_reduce_(result, "sum", "default")
@@ -179,7 +216,9 @@ class TestCollectiveAutotuning4Ranks(MultiProcessTestCase):
         )
 
         class VLLMAllReduceModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward calls the custom all-reduce op.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply the custom op to the input.
                 return vllm_allreduce(x)
 
         model = torch.compile(VLLMAllReduceModel()).to(device)
