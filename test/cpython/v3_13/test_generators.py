@@ -1,3 +1,12 @@
+# [MODULE DOC] CPython 3.13 test_generators adapted for Dynamo. Installs, at import time, a
+# meta path finder (first on sys.meta_path) that redirects imports of selected "test." modules
+# to their standalone equivalents. Then defines unittest classes covering generator semantics:
+# finalization, naming, copy/pickle, exception state handling, close/throw, stack traces and
+# yield from; plus large doctest-style text sections (tutorial, coroutine pipes, conjoin,
+# n-queens, knights tour, syntax errors, refleaks) and the helper generators and solver
+# classes those doctests use. The doctest suites are defined as strings but not registered in
+# this adaptation (the load_tests hook is commented out), so only the unittest classes
+# execute.
 # ======= BEGIN Dynamo patch =======
 # Owner(s): ["module: dynamo"]
 
@@ -30,7 +39,14 @@ redirect_imports = (
 )
 
 class RedirectImportFinder(importlib.abc.MetaPathFinder):
+    # [CLASS DOC] HELPER: Import hook that, for module names listed in redirect_imports,
+    # imports the same module without the "test." prefix instead and registers it in
+    # sys.modules under the original name. Stateless.
     def find_spec(self, fullname, path, target=None):
+        # [FUNCTION DOC] HELPER: For a fullname in redirect_imports, imports the module with
+        # the "test." prefix removed, stores it in sys.modules under fullname (side effect)
+        # and returns the spec found for the unprefixed name. Returns None for other names or
+        # on ImportError so normal finders continue. Arguments path and target are unused.
         # Check if the import is the problematic one
         if fullname in redirect_imports:
             try:
@@ -76,11 +92,18 @@ except ImportError:
                      hasattr(_testcapi, "raise_SIGINT_then_send_None"),
                      "needs _testcapi.raise_SIGINT_then_send_None")
 class SignalAndYieldFromTest(__TestCase):
+    # [CLASS DOC] Regression test (bpo-30039) that a SIGINT arriving just before sending into
+    # a yield-from chain is raised in the innermost generator. Skipped unless _testcapi
+    # provides raise_SIGINT_then_send_None.
 
     def generator1(self):
+        # [FUNCTION DOC] HELPER: Outer generator that delegates to generator2 and returns its
+        # result.
         return (yield from self.generator2())
 
     def generator2(self):
+        # [FUNCTION DOC] HELPER: Generator that yields once; returns "PASSED" if resumed by a
+        # KeyboardInterrupt, otherwise "FAILED".
         try:
             yield
         except KeyboardInterrupt:
@@ -89,6 +112,8 @@ class SignalAndYieldFromTest(__TestCase):
             return "FAILED"
 
     def test_raise_and_yield_from(self):
+        # [FUNCTION DOC] Primes generator1, then uses the C test hook to raise SIGINT and send
+        # None; expects the result to be StopIteration whose value is "PASSED".
         gen = self.generator1()
         gen.send(None)
         try:
@@ -100,10 +125,16 @@ class SignalAndYieldFromTest(__TestCase):
 
 
 class FinalizationTest(__TestCase):
+    # [CLASS DOC] Tests generator finalization behavior: frame resurrection, reference cycles,
+    # and lambda-defined generators.
 
     def test_frame_resurrect(self):
+        # [FUNCTION DOC] Checks a generator frame resurrected from its finally block during
+        # finalization is kept alive while the generator itself is collected (weakref dead).
         # A generator frame can be resurrected by a generator's finalization.
         def gen():
+            # [FUNCTION DOC] HELPER: Generator that yields once and on close stores its frame
+            # in the enclosing variable frame from a finally block.
             nonlocal frame
             try:
                 yield
@@ -121,10 +152,14 @@ class FinalizationTest(__TestCase):
         support.gc_collect()
 
     def test_refcycle(self):
+        # [FUNCTION DOC] A generator sent a reference to itself (a cycle) must still run its
+        # finally clause after garbage collection and leave gc.garbage unchanged.
         # A generator caught in a refcycle gets finalized anyway.
         old_garbage = gc.garbage[:]
         finalized = False
         def gen():
+            # [FUNCTION DOC] HELPER: Generator that receives a value, yields 1, and sets the
+            # enclosing finalized flag in a finally block.
             nonlocal finalized
             try:
                 g = yield
@@ -143,6 +178,9 @@ class FinalizationTest(__TestCase):
         self.assertEqual(gc.garbage, old_garbage)
 
     def test_lambda_generator(self):
+        # [FUNCTION DOC] bpo-23192 / gh-119897: lambdas containing yield or yield from must
+        # produce generators like equivalent defs; each yields 1 first and returns the sent
+        # value 2 via StopIteration.
         # bpo-23192, gh-119897: Test that a lambda returning a generator behaves
         # like the equivalent function
         f = lambda: (yield 1)
@@ -150,13 +188,16 @@ class FinalizationTest(__TestCase):
         self.assertEqual(next(f()), 1)
 
         def g(): return (yield 1)
+            # [FUNCTION DOC] HELPER: Generator yielding 1 and returning the sent value.
 
         # test 'yield from'
         f2 = lambda: (yield from g())
         def g2(): return (yield from g())
+            # [FUNCTION DOC] HELPER: Generator delegating to g and returning its result.
 
         f3 = lambda: (yield from f())
         def g3(): return (yield from f())
+            # [FUNCTION DOC] HELPER: Generator delegating to the lambda generator f.
 
         for gen_fun in (f, g, f2, g2, f3, g3):
             gen = gen_fun()
@@ -167,9 +208,15 @@ class FinalizationTest(__TestCase):
 
 
 class GeneratorTest(__TestCase):
+    # [CLASS DOC] General generator object tests: names, copy/pickle, send rules, gc safety,
+    # frame back-references, and genexpr iteration protocol.
 
     def test_name(self):
+        # [FUNCTION DOC] Checks __name__ and __qualname__ of generators (defaults, assignment,
+        # TypeError on non-string or deletion, pickup of function renames at creation time,
+        # and genexpr names).
         def func():
+            # [FUNCTION DOC] HELPER: Trivial generator yielding 1.
             yield 1
 
         # check generator names
@@ -205,14 +252,19 @@ class GeneratorTest(__TestCase):
                          "GeneratorTest.test_name.<locals>.<genexpr>")
 
     def test_copy(self):
+        # [FUNCTION DOC] copy.copy of a generator must raise TypeError.
         def f():
+            # [FUNCTION DOC] HELPER: Trivial generator yielding 1.
             yield 1
         g = f()
         with self.assertRaises(TypeError):
             copy.copy(g)
 
     def test_pickle(self):
+        # [FUNCTION DOC] pickle.dumps of a generator under every protocol must raise TypeError
+        # or PicklingError.
         def f():
+            # [FUNCTION DOC] HELPER: Trivial generator yielding 1.
             yield 1
         g = f()
         for proto in range(pickle.HIGHEST_PROTOCOL + 1):
@@ -220,7 +272,10 @@ class GeneratorTest(__TestCase):
                 pickle.dumps(g, proto)
 
     def test_send_non_none_to_new_gen(self):
+        # [FUNCTION DOC] Sending a non-None value to a just-started generator raises
+        # TypeError, and the generator still yields 1 afterwards.
         def f():
+            # [FUNCTION DOC] HELPER: Trivial generator yielding 1.
             yield 1
         g = f()
         with self.assertRaises(TypeError):
@@ -228,14 +283,20 @@ class GeneratorTest(__TestCase):
         self.assertEqual(next(g), 1)
 
     def test_handle_frame_object_in_creation(self):
+        # [FUNCTION DOC] Regression for cpython issue 94262: with a gc callback calling
+        # inspect.stack and GC threshold 1, creating a generator (also with a self-referencing
+        # __del__ object being freed) must not expose a partially built frame. Restores the gc
+        # threshold and callbacks afterwards.
 
         #Attempt to expose partially constructed frames
         #See https://github.com/python/cpython/issues/94262
 
         def cb(*args):
+            # [FUNCTION DOC] HELPER: gc callback that calls inspect.stack.
             inspect.stack()
 
         def gen():
+            # [FUNCTION DOC] HELPER: Trivial generator yielding 1.
             yield 1
 
         thresholds = gc.get_threshold()
@@ -249,7 +310,9 @@ class GeneratorTest(__TestCase):
             gc.callbacks.pop()
 
         class Sneaky:
+        # [CLASS DOC] HELPER: Object whose __del__ calls inspect.stack.
             def __del__(self):
+            # [FUNCTION DOC] HELPER: Calls inspect.stack during finalization.
                 inspect.stack()
 
         sneaky = Sneaky()
@@ -264,31 +327,42 @@ class GeneratorTest(__TestCase):
             gc.set_threshold(*thresholds)
 
     def test_ag_frame_f_back(self):
+        # [FUNCTION DOC] An async generator's frame has no f_back before it runs.
         async def f():
+            # [FUNCTION DOC] HELPER: Async generator that yields once.
             yield
         ag = f()
         self.assertIsNone(ag.ag_frame.f_back)
 
     def test_cr_frame_f_back(self):
+        # [FUNCTION DOC] A coroutine's frame has no f_back before it runs; closes the
+        # coroutine to avoid a RuntimeWarning.
         async def f():
+            # [FUNCTION DOC] HELPER: Empty coroutine.
             pass
         cr = f()
         self.assertIsNone(cr.cr_frame.f_back)
         cr.close()  # Suppress RuntimeWarning.
 
     def test_gi_frame_f_back(self):
+        # [FUNCTION DOC] A generator's frame has no f_back before it runs.
         def f():
+            # [FUNCTION DOC] HELPER: Generator that yields once.
             yield
         gi = f()
         self.assertIsNone(gi.gi_frame.f_back)
 
     def test_issue103488(self):
+        # [FUNCTION DOC] Regression for issue 103488: iterating a generator that raises
+        # ValueError inside a try/except in a for loop must not itself raise.
 
         def gen_raises():
+            # [FUNCTION DOC] HELPER: Generator that yields once and then raises ValueError.
             yield
             raise ValueError()
 
         def loop():
+            # [FUNCTION DOC] HELPER: Iterates gen_raises and swallows the ValueError.
             try:
                 for _ in gen_raises():
                     if True is False:
@@ -301,13 +375,19 @@ class GeneratorTest(__TestCase):
 
     @unittest.expectedFailure
     def test_genexpr_only_calls_dunder_iter_once(self):
+        # [FUNCTION DOC] Expected-failure test: a generator expression over an object whose
+        # __iter__ returns an iterator lacking __iter__ should still work (list is [1, 2]).
 
         class Iterator:
+            # [CLASS DOC] HELPER: Iterator with __next__ yielding 1 then 2, but no __iter__.
 
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Initializes the counter val to 0.
                 self.val = 0
 
             def __next__(self):
+                # [FUNCTION DOC] HELPER: Increments and returns val; raises StopIteration
+                # after val hits 2.
                 if self.val == 2:
                     raise StopIteration
                 self.val += 1
@@ -316,14 +396,19 @@ class GeneratorTest(__TestCase):
             # No __iter__ method
 
         class C:
+            # [CLASS DOC] HELPER: Iterable whose __iter__ returns a new Iterator.
 
             def __iter__(self):
+                # [FUNCTION DOC] HELPER: Returns a fresh Iterator instance.
                 return Iterator()
 
         self.assertEqual([1,2], list(i for i in C()))
 
 
 class ModifyUnderlyingIterableTest(__TestCase):
+    # [CLASS DOC] Tests that replacing the iterable stored in a generator's frame locals, or
+    # rebuilding a generator from gi_code, works. Class attributes iterables and non_iterables
+    # hold sample iterable and non-iterable objects.
     iterables = [
         range(0),
         range(20),
@@ -342,15 +427,22 @@ class ModifyUnderlyingIterableTest(__TestCase):
     ]
 
     def genexpr(self):
+        # [FUNCTION DOC] HELPER: Returns a generator expression over range(10).
         return (x for x in range(10))
 
     def genfunc(self):
+        # [FUNCTION DOC] HELPER: Returns a generator (from a def with parameter it) over
+        # range(10).
         def gen(it):
+            # [FUNCTION DOC] HELPER: Generator yielding every item of iterable it.
             for x in it:
                 yield x
         return gen(range(10))
 
     def process_tests(self, get_generator):
+        # [FUNCTION DOC] HELPER: For each sample iterable and its iterator, builds a generator
+        # via get_generator and asserts it lists the same items; for non-iterables asserts
+        # listing raises TypeError with a "not iterable" message.
         for obj in self.iterables:
             g_obj = get_generator(obj)
             with self.subTest(g_obj=g_obj, obj=obj):
@@ -367,28 +459,42 @@ class ModifyUnderlyingIterableTest(__TestCase):
                 self.assertRaisesRegex(TypeError, err_regex, list, g_obj)
 
     def test_modify_f_locals(self):
+        # [FUNCTION DOC] Overwrites the iterable local in the frame (f_locals) of a genexpr
+        # (name ".0") and of a generator function (name "it"), then runs process_tests on
+        # both.
         def modify_f_locals(g, local, obj):
+            # [FUNCTION DOC] HELPER: Sets the named entry in the generator frame's f_locals
+            # and returns the generator.
             g.gi_frame.f_locals[local] = obj
             return g
 
         def get_generator_genexpr(obj):
+            # [FUNCTION DOC] HELPER: Genexpr with its ".0" local replaced by obj.
             return modify_f_locals(self.genexpr(), '.0', obj)
 
         def get_generator_genfunc(obj):
+            # [FUNCTION DOC] HELPER: Generator function result with local it replaced by obj.
             return modify_f_locals(self.genfunc(), 'it', obj)
 
         self.process_tests(get_generator_genexpr)
         self.process_tests(get_generator_genfunc)
 
     def test_new_gen_from_gi_code(self):
+        # [FUNCTION DOC] Builds new generators by wrapping gi_code of existing generators in a
+        # fresh function and calling it with each sample object; runs process_tests on both.
         def new_gen_from_gi_code(g, obj):
+            # [FUNCTION DOC] HELPER: Creates a function from g's code with empty globals,
+            # calls it with obj and returns the new generator.
             generator_func = types.FunctionType(g.gi_code, {})
             return generator_func(obj)
 
         def get_generator_genexpr(obj):
+            # [FUNCTION DOC] HELPER: Rebuilds the genexpr generator from its code with obj.
             return new_gen_from_gi_code(self.genexpr(), obj)
 
         def get_generator_genfunc(obj):
+            # [FUNCTION DOC] HELPER: Rebuilds the generator-function generator from its code
+            # with obj.
             return new_gen_from_gi_code(self.genfunc(), obj)
 
         self.process_tests(get_generator_genexpr)
@@ -396,11 +502,20 @@ class ModifyUnderlyingIterableTest(__TestCase):
 
 
 class ExceptionTest(__TestCase):
+    # [CLASS DOC] Tests for issue 23353: the currently handled exception (sys.exception) must
+    # be saved and restored correctly across generator resumes, throws and nested generators.
     # Tests for the issue #23353: check that the currently handled exception
     # is correctly saved/restored in PyEval_EvalFrameEx().
 
     def test_except_throw(self):
+        # [FUNCTION DOC] Throws an active ValueError into a generator that inspects
+        # sys.exception and its context at each step; checks the exception is visible inside,
+        # not lost, can be re-raised with no context, and that no exception is active outside
+        # afterwards.
         def store_raise_exc_generator():
+            # [FUNCTION DOC] HELPER: Generator asserting no exception at start, then on
+            # catching the thrown exception checks sys.exception across yields and finally re-
+            # raises it.
             try:
                 self.assertIsNone(sys.exception())
                 yield
@@ -436,7 +551,11 @@ class ExceptionTest(__TestCase):
         self.assertIsNone(sys.exception())
 
     def test_except_next(self):
+        # [FUNCTION DOC] A generator advanced from inside an except block sees that exception
+        # as sys.exception; afterwards the exception is cleared.
         def gen():
+            # [FUNCTION DOC] HELPER: Generator asserting a ValueError is active, then yields
+            # "done".
             self.assertIsInstance(sys.exception(), ValueError)
             yield "done"
 
@@ -448,7 +567,12 @@ class ExceptionTest(__TestCase):
         self.assertIsNone(sys.exception())
 
     def test_except_gen_except(self):
+        # [FUNCTION DOC] A TypeError raised inside a generator resumed from an except-
+        # ValueError block gets the ValueError as context; sys.exception tracks the caller
+        # handler properly across later yields and is None after the handler.
         def gen():
+            # [FUNCTION DOC] HELPER: Generator checking sys.exception and exception context at
+            # each resume point, yielding "done" last.
             try:
                 self.assertIsNone(sys.exception())
                 yield
@@ -475,12 +599,19 @@ class ExceptionTest(__TestCase):
         self.assertIsNone(sys.exception())
 
     def test_nested_gen_except_loop(self):
+        # [FUNCTION DOC] Nested generators iterated inside an outer except block must still
+        # see the TypeError as sys.exception on each of 100 steps; no exception remains
+        # afterwards.
         def gen():
+            # [FUNCTION DOC] HELPER: Yields "doing" 100 times, asserting a TypeError is
+            # active.
             for i in range(100):
                 self.assertIsInstance(sys.exception(), TypeError)
                 yield "doing"
 
         def outer():
+            # [FUNCTION DOC] HELPER: Raises and catches a TypeError, then re-yields everything
+            # from gen.
             try:
                 raise TypeError
             except:
@@ -495,7 +626,11 @@ class ExceptionTest(__TestCase):
         self.assertEqual(sys.exception(), None)
 
     def test_except_throw_exception_context(self):
+        # [FUNCTION DOC] Like test_except_gen_except but the ValueError is delivered by throw
+        # into the generator; the resulting TypeError gets the ValueError as context.
         def gen():
+            # [FUNCTION DOC] HELPER: Generator that converts a thrown ValueError to a
+            # TypeError and checks sys.exception and contexts at each resume.
             try:
                 try:
                     self.assertIsNone(sys.exception())
@@ -524,11 +659,18 @@ class ExceptionTest(__TestCase):
         self.assertIsNone(sys.exception())
 
     def test_except_throw_bad_exception(self):
+        # [FUNCTION DOC] Throwing an exception class whose __new__ returns the class itself
+        # (not a BaseException instance) raises TypeError; the plain generator then stops, and
+        # one that expects the TypeError internally ends with StopIteration.
         class E(Exception):
+            # [CLASS DOC] HELPER: Exception subclass whose __new__ returns the class, an
+            # invalid result.
             def __new__(cls, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: Returns cls instead of an instance.
                 return cls
 
         def boring_generator():
+            # [FUNCTION DOC] HELPER: Generator that yields once.
             yield
 
         gen = boring_generator()
@@ -541,6 +683,8 @@ class ExceptionTest(__TestCase):
         self.assertRaises(StopIteration, next, gen)
 
         def generator():
+            # [FUNCTION DOC] HELPER: Generator that expects TypeError raised inside while
+            # suspended.
             with self.assertRaisesRegex(TypeError, err_msg):
                 yield
 
@@ -550,7 +694,10 @@ class ExceptionTest(__TestCase):
             gen.throw(E)
 
     def test_gen_3_arg_deprecation_warning(self):
+        # [FUNCTION DOC] Calling throw with the deprecated three-argument form emits a
+        # DeprecationWarning and still raises the thrown TypeError.
         def g():
+            # [FUNCTION DOC] HELPER: Generator yielding 42.
             yield 42
 
         gen = g()
@@ -559,9 +706,12 @@ class ExceptionTest(__TestCase):
                 gen.throw(TypeError, TypeError(24), None)
 
     def test_stopiteration_error(self):
+        # [FUNCTION DOC] PEP 479: StopIteration raised in a generator body becomes
+        # RuntimeError mentioning "raised StopIteration".
         # See also PEP 479.
 
         def gen():
+            # [FUNCTION DOC] HELPER: Generator that immediately raises StopIteration.
             raise StopIteration
             yield
 
@@ -569,9 +719,12 @@ class ExceptionTest(__TestCase):
             next(gen())
 
     def test_tutorial_stopiteration(self):
+        # [FUNCTION DOC] Tutorial example: yields 1, then the next resume raises RuntimeError
+        # because the body raised StopIteration.
         # Raise StopIteration" stops the generator too:
 
         def f():
+            # [FUNCTION DOC] HELPER: Yields 1 then raises StopIteration.
             yield 1
             raise StopIteration
             yield 2 # never reached
@@ -583,7 +736,10 @@ class ExceptionTest(__TestCase):
             next(g)
 
     def test_return_tuple(self):
+        # [FUNCTION DOC] A generator returning the value sent in gives StopIteration whose
+        # value is the tuple sent.
         def g():
+            # [FUNCTION DOC] HELPER: Generator yielding 1 and returning the sent value.
             return (yield 1)
 
         gen = g()
@@ -593,7 +749,10 @@ class ExceptionTest(__TestCase):
         self.assertEqual(cm.exception.value, (2,))
 
     def test_return_stopiteration(self):
+        # [FUNCTION DOC] Sending a StopIteration instance into the generator returns it as the
+        # StopIteration value (not treated as termination).
         def g():
+            # [FUNCTION DOC] HELPER: Generator yielding 1 and returning the sent value.
             return (yield 1)
 
         gen = g()
@@ -605,9 +764,15 @@ class ExceptionTest(__TestCase):
 
 
 class GeneratorCloseTest(__TestCase):
+    # [CLASS DOC] Tests for generator close(): return values, uncaught exit,
+    # unstarted/exhausted/ closed states, errors raised while closing and release of frame
+    # locals.
 
     def test_close_no_return_value(self):
+        # [FUNCTION DOC] close on a suspended generator that does not return a value gives
+        # None.
         def f():
+            # [FUNCTION DOC] HELPER: Generator yielding once.
             yield
 
         gen = f()
@@ -615,7 +780,10 @@ class GeneratorCloseTest(__TestCase):
         self.assertIsNone(gen.close())
 
     def test_close_return_value(self):
+        # [FUNCTION DOC] close returns the value the generator returns after catching
+        # GeneratorExit.
         def f():
+            # [FUNCTION DOC] HELPER: Returns 0 when GeneratorExit is raised at its yield.
             try:
                 yield
                 # close() raises GeneratorExit here, which is caught
@@ -627,7 +795,9 @@ class GeneratorCloseTest(__TestCase):
         self.assertEqual(gen.close(), 0)
 
     def test_close_not_catching_exit(self):
+        # [FUNCTION DOC] When GeneratorExit propagates uncaught, close returns None.
         def f():
+            # [FUNCTION DOC] HELPER: Yields once then returns 0 (never reached via close).
             yield
             # close() raises GeneratorExit here, which isn't caught and
             # therefore propagates -- no return value
@@ -638,7 +808,9 @@ class GeneratorCloseTest(__TestCase):
         self.assertIsNone(gen.close())
 
     def test_close_not_started(self):
+        # [FUNCTION DOC] close on an unstarted generator returns None (body never runs).
         def f():
+            # [FUNCTION DOC] HELPER: Generator that would return 0 on GeneratorExit.
             try:
                 yield
             except GeneratorExit:
@@ -648,7 +820,9 @@ class GeneratorCloseTest(__TestCase):
         self.assertIsNone(gen.close())
 
     def test_close_exhausted(self):
+        # [FUNCTION DOC] close on an exhausted generator returns None.
         def f():
+            # [FUNCTION DOC] HELPER: Generator that would return 0 on GeneratorExit.
             try:
                 yield
             except GeneratorExit:
@@ -661,7 +835,10 @@ class GeneratorCloseTest(__TestCase):
         self.assertIsNone(gen.close())
 
     def test_close_closed(self):
+        # [FUNCTION DOC] First close returns the generator's value 0; a second close returns
+        # None.
         def f():
+            # [FUNCTION DOC] HELPER: Returns 0 when GeneratorExit is raised at its yield.
             try:
                 yield
             except GeneratorExit:
@@ -673,7 +850,10 @@ class GeneratorCloseTest(__TestCase):
         self.assertIsNone(gen.close())
 
     def test_close_raises(self):
+        # [FUNCTION DOC] If the generator raises RuntimeError after swallowing GeneratorExit,
+        # close propagates the RuntimeError.
         def f():
+            # [FUNCTION DOC] HELPER: Swallows GeneratorExit then raises RuntimeError.
             try:
                 yield
             except GeneratorExit:
@@ -686,15 +866,20 @@ class GeneratorCloseTest(__TestCase):
             gen.close()
 
     def test_close_releases_frame_locals(self):
+        # [FUNCTION DOC] gh-118272: after close, a generator's frame locals are released so
+        # the object they referenced can be garbage collected (weakref cleared).
         # See gh-118272
 
         class Foo:
+            # [CLASS DOC] HELPER: Empty class whose instance is tracked with a weakref.
             pass
 
         f = Foo()
         f_wr = weakref.ref(f)
 
         def genfn():
+            # [FUNCTION DOC] HELPER: Generator holding a local reference to f and yielding
+            # once.
             a = f
             yield
 
@@ -707,9 +892,14 @@ class GeneratorCloseTest(__TestCase):
 
 
 class GeneratorThrowTest(__TestCase):
+    # [CLASS DOC] Tests exception context chaining when exceptions are thrown into generators,
+    # including through yield from.
 
     def test_exception_context_with_yield(self):
+        # [FUNCTION DOC] Throwing ValueError into a generator suspended inside an except
+        # KeyError block gives the ValueError a KeyError context with the original args.
         def f():
+            # [FUNCTION DOC] HELPER: Raises and handles KeyError, yielding inside the handler.
             try:
                 raise KeyError('a')
             except Exception:
@@ -723,9 +913,13 @@ class GeneratorThrowTest(__TestCase):
         self.assertEqual((type(context), context.args), (KeyError, ('a',)))
 
     def test_exception_context_with_yield_inside_generator(self):
+        # [FUNCTION DOC] Same context check performed from inside the generator: the caught
+        # ValueError has the KeyError context, then the generator yields "b".
         # Check that the context is also available from inside the generator
         # with yield, as opposed to outside.
         def f():
+            # [FUNCTION DOC] HELPER: Yields inside an except handler and asserts the thrown
+            # exception's context, then yields "b".
             try:
                 raise KeyError('a')
             except Exception:
@@ -745,10 +939,14 @@ class GeneratorThrowTest(__TestCase):
         self.assertEqual(actual, 'b')
 
     def test_exception_context_with_yield_from(self):
+        # [FUNCTION DOC] Like the first context test but the yield happens inside a yield from
+        # delegation; the thrown ValueError still has the KeyError context.
         def f():
+            # [FUNCTION DOC] HELPER: Inner generator yielding once.
             yield
 
         def g():
+            # [FUNCTION DOC] HELPER: Handles KeyError and delegates to f inside the handler.
             try:
                 raise KeyError('a')
             except Exception:
@@ -762,14 +960,19 @@ class GeneratorThrowTest(__TestCase):
         self.assertEqual((type(context), context.args), (KeyError, ('a',)))
 
     def test_exception_context_with_yield_from_with_context_cycle(self):
+        # [FUNCTION DOC] Issue 40696: throwing the same exception object that is the active
+        # handler must not create a context cycle; records has_cycle and expects it False.
         # Check trying to create an exception context cycle:
         # https://bugs.python.org/issue40696
         has_cycle = None
 
         def f():
+            # [FUNCTION DOC] HELPER: Inner generator yielding once.
             yield
 
         def g(exc):
+            # [FUNCTION DOC] HELPER: Raises exc, delegates to f in the handler, and records in
+            # has_cycle whether the caught exception is its own context.
             nonlocal has_cycle
             try:
                 raise exc
@@ -788,7 +991,11 @@ class GeneratorThrowTest(__TestCase):
         self.assertEqual(has_cycle, False)
 
     def test_throw_after_none_exc_type(self):
+        # [FUNCTION DOC] After a handled KeyError finished, throwing ValueError at a later
+        # yield that raises RuntimeError must propagate RuntimeError.
         def g():
+            # [FUNCTION DOC] HELPER: Handles a KeyError, then yields and turns any exception
+            # into RuntimeError.
             try:
                 raise KeyError
             except KeyError:
@@ -806,8 +1013,12 @@ class GeneratorThrowTest(__TestCase):
 
 
 class GeneratorStackTraceTest(__TestCase):
+    # [CLASS DOC] Checks the Python call-stack frame names visible from inside generators
+    # driven by send and throw through yield from.
 
     def check_stack_names(self, frame, expected):
+        # [FUNCTION DOC] HELPER: Walks frame back-links collecting function names until a
+        # frame whose name starts with check_ or call_, and asserts the list equals expected.
         names = []
         while frame:
             name = frame.f_code.co_name
@@ -821,7 +1032,11 @@ class GeneratorStackTraceTest(__TestCase):
         self.assertEqual(names, expected)
 
     def check_yield_from_example(self, call_method):
+        # [FUNCTION DOC] HELPER: Builds generator g that delegates to f, primes it, drives it
+        # with call_method (ignoring StopIteration); f and g verify their frame stacks.
         def f():
+            # [FUNCTION DOC] HELPER: Inner generator checking its stack is f over g before and
+            # after its yield.
             self.check_stack_names(sys._getframe(), ['f', 'g'])
             try:
                 yield
@@ -830,6 +1045,7 @@ class GeneratorStackTraceTest(__TestCase):
             self.check_stack_names(sys._getframe(), ['f', 'g'])
 
         def g():
+            # [FUNCTION DOC] HELPER: Outer generator checking its stack is g, delegating to f.
             self.check_stack_names(sys._getframe(), ['g'])
             yield from f()
             self.check_stack_names(sys._getframe(), ['g'])
@@ -842,21 +1058,31 @@ class GeneratorStackTraceTest(__TestCase):
             pass
 
     def test_send_with_yield_from(self):
+        # [FUNCTION DOC] Verifies stack names when the generator is resumed with send.
         def call_send(gen):
+            # [FUNCTION DOC] HELPER: Resumes the generator with send(None).
             gen.send(None)
 
         self.check_yield_from_example(call_send)
 
     def test_throw_with_yield_from(self):
+        # [FUNCTION DOC] Verifies stack names when the generator is resumed with throw.
         def call_throw(gen):
+            # [FUNCTION DOC] HELPER: Throws RuntimeError into the generator.
             gen.throw(RuntimeError)
 
         self.check_yield_from_example(call_throw)
 
 
 class YieldFromTests(__TestCase):
+    # [CLASS DOC] Tests the gi_yieldfrom attribute and generator state across a yield from.
     def test_generator_gi_yieldfrom(self):
+        # [FUNCTION DOC] Drives generator b (delegating to a) through creation, two sends and
+        # exhaustion, checking inspect generator state (created, suspended, closed) and that
+        # gi_yieldfrom is the inner generator only while delegating, otherwise None.
         def a():
+            # [FUNCTION DOC] HELPER: Inner generator asserting gen_b is running with no
+            # yieldfrom before and after its single yield.
             self.assertEqual(inspect.getgeneratorstate(gen_b), inspect.GEN_RUNNING)
             self.assertIsNone(gen_b.gi_yieldfrom)
             yield
@@ -864,6 +1090,8 @@ class YieldFromTests(__TestCase):
             self.assertIsNone(gen_b.gi_yieldfrom)
 
         def b():
+            # [FUNCTION DOC] HELPER: Outer generator that delegates to a, then yields once,
+            # checking gen_b.gi_yieldfrom is None outside the delegation.
             self.assertIsNone(gen_b.gi_yieldfrom)
             yield from a()
             self.assertIsNone(gen_b.gi_yieldfrom)
@@ -1795,10 +2023,16 @@ Lambdas shouldn't have their usual return behavior.
 # each slot depend on the values iterated at previous slots.
 
 def simple_conjoin(gs):
+    # [FUNCTION DOC] HELPER: Recursive backtracking generator. Takes gs, a list of no-argument
+    # callables each returning an iterable, and yields the shared values list (one slot per
+    # callable) each time all slots have been filled by nested iteration. The same list object
+    # is yielded repeatedly and mutated in place.
 
     values = [None] * len(gs)
 
     def gen(i):
+        # [FUNCTION DOC] HELPER: Fills slot i from gs[i] and recurses; yields values when i
+        # passes the last slot.
         if i >= len(gs):
             yield values
         else:
@@ -1816,6 +2050,9 @@ def simple_conjoin(gs):
 # a core building block for some CPU-intensive generator applications.
 
 def conjoin(gs):
+    # [FUNCTION DOC] HELPER: Same contract as simple_conjoin but with loop nests unrolled
+    # three at a time to cut recursion overhead. Yields the shared mutable values list for
+    # every combination.
 
     n = len(gs)
     values = [None] * n
@@ -1824,6 +2061,8 @@ def conjoin(gs):
     # remaining is divisible by 3.
 
     def gen(i):
+        # [FUNCTION DOC] HELPER: Handles one level at a time until the remaining count is
+        # divisible by three, then hands off to _gen3; yields values at the end.
         if i >= n:
             yield values
 
@@ -1842,6 +2081,9 @@ def conjoin(gs):
     # gen's use.
 
     def _gen3(i):
+        # [FUNCTION DOC] HELPER: Fills three slots from index i per step (asserting the
+        # remaining count is a multiple of three), yielding values directly for the last three
+        # or recursing.
         assert i < n and (n-i) % 3 == 0
         ip1, ip2, ip3 = i+1, i+2, i+3
         g, g1, g2 = gs[i : ip3]
@@ -1877,6 +2119,9 @@ def conjoin(gs):
 # than the fancy unrolled recursive conjoin.
 
 def flat_conjoin(gs):  # rename to conjoin to run tests with this instead
+    # [FUNCTION DOC] HELPER: Recursion-free conjoin using an explicit stack of iterators:
+    # descends filling slots, yields the shared values list when full, then backtracks to the
+    # nearest resumable iterator. Same contract as conjoin; stack depth stays constant.
     n = len(gs)
     values = [None] * n
     iters  = [None] * n
@@ -1913,7 +2158,12 @@ def flat_conjoin(gs):  # rename to conjoin to run tests with this instead
 # A conjoin-based N-Queens solver.
 
 class Queens:
+    # [CLASS DOC] HELPER: Conjoin-based N-Queens solver. Precomputes per-row generator
+    # functions using bit masks for columns and both diagonals; state is n, rowgenerators and
+    # the used bit mask (set by solve).
     def __init__(self, n):
+        # [FUNCTION DOC] HELPER: Stores board size n and builds, for each row, a generator
+        # function yielding columns whose column and diagonal bits are not in the used mask.
         self.n = n
         rangen = range(n)
 
@@ -1936,6 +2186,9 @@ class Queens:
                             for j in rangen]
 
             def rowgen(rowuses=rowuses):
+                # [FUNCTION DOC] HELPER: Generator over columns of one row; claims the column
+                # and diagonal bits in self.used while yielding that column and releases them
+                # on resumption.
                 for j in rangen:
                     uses = rowuses[j]
                     if uses & self.used == 0:
@@ -1947,11 +2200,15 @@ class Queens:
 
     # Generate solutions.
     def solve(self):
+        # [FUNCTION DOC] HELPER: Resets the used mask to zero and yields each solution as a
+        # list mapping row to column, via conjoin over the row generators.
         self.used = 0
         for row2col in conjoin(self.rowgenerators):
             yield row2col
 
     def printsolution(self, row2col):
+        # [FUNCTION DOC] HELPER: Prints an ASCII board for a row to column list, asserting its
+        # length equals n. Side effect: writes to stdout.
         n = self.n
         assert n == len(row2col)
         sep = "+" + "-+" * n
@@ -1968,7 +2225,14 @@ class Queens:
 # creating 10s of thousands of generators then!), and is lengthy.
 
 class Knights:
+    # [CLASS DOC] HELPER: Conjoin-based Knight's Tour solver for an m by n board. Holds m, n,
+    # a successor-list table succs, squaregenerators (one generator function per move), and
+    # per-search state lastij (last square index) and final (square to end on).
     def __init__(self, m, n, hard=0):
+        # [FUNCTION DOC] HELPER: Records dimensions and defines the closure generators for the
+        # first move, second move, middle moves (plain or stronger heuristic when hard is set)
+        # and last move, then stores the list of per-move generators (just the first for
+        # boards under 4 squares). succs is filled later by solve.
         self.m, self.n = m, n
 
         # solve() will set up succs[i] to be a list of square #i's
@@ -1980,6 +2244,9 @@ class Knights:
         # detect this makes a solution impossible, else return 1.
 
         def remove_from_successors(i0, len=len):
+            # [FUNCTION DOC] HELPER: Removes square i0 from the successor lists of its
+            # successors. Returns False if that leaves a free square with no exits or more
+            # than one single-exit square, i.e. the tour is impossible; otherwise True.
             # If we remove all exits from a free square, we're dead:
             # even if we move to it next, we can't leave it again.
             # If we create a square with one exit, we must visit it next;
@@ -2002,11 +2269,16 @@ class Knights:
         # Put i0 back in each of its successor's successor lists.
 
         def add_to_successors(i0):
+            # [FUNCTION DOC] HELPER: Undoes remove_from_successors by re-appending i0 to each
+            # of its successors' lists.
             for i in succs[i0]:
                 succs[i].append(i0)
 
         # Generate the first move.
         def first():
+            # [FUNCTION DOC] HELPER: Yields the corner square (0, 0) as the starting move
+            # after pruning it from successors, recording it in lastij; yields nothing for an
+            # empty board. Restores successor lists on resumption.
             if m < 1 or n < 1:
                 return
 
@@ -2020,6 +2292,10 @@ class Knights:
 
         # Generate the second moves.
         def second():
+            # [FUNCTION DOC] HELPER: Yields the second move, one of the corner's two
+            # successors (1,2) or (2,1), recording the other as final and linking it back to
+            # the corner; yields nothing for boards smaller than 3 by 3. Undoes the changes on
+            # resumption.
             corner = self.coords2index(0, 0)
             assert self.lastij == corner  # i.e., we started in the corner
             if m < 3 or n < 3:
@@ -2045,6 +2321,9 @@ class Knights:
 
         # Generate moves 3 through m*n-1.
         def advance(len=len):
+            # [FUNCTION DOC] HELPER: Generates middle moves from the last square: a single-
+            # exit successor is forced, otherwise candidates are tried fewest-exits first,
+            # skipping final and pruning impossible ones. Updates lastij while yielding.
             # If some successor has only one exit, must take it.
             # Else favor successors with fewer exits.
             candidates = []
@@ -2071,6 +2350,8 @@ class Knights:
         # can take eons to undo.  Smallest square board for which this
         # matters a lot is 52x52.
         def advance_hard(vmid=(m-1)/2.0, hmid=(n-1)/2.0, len=len):
+            # [FUNCTION DOC] HELPER: Like advance but breaks ties by squared distance from the
+            # board center (favoring corners and edges); vmid and hmid are the centers.
             # If some successor has only one exit, must take it.
             # Else favor successors with fewer exits.
             # Break ties via max distance from board centerpoint (favor
@@ -2097,6 +2378,8 @@ class Knights:
 
         # Generate the last move.
         def last():
+            # [FUNCTION DOC] HELPER: Yields the final square, asserting it is a successor of
+            # the last square.
             assert self.final in succs[self.lastij]
             yield self.final
 
@@ -2108,15 +2391,21 @@ class Knights:
                 [last]
 
     def coords2index(self, i, j):
+        # [FUNCTION DOC] HELPER: Converts row and column to a flat square index (row * n +
+        # column), asserting both are on the board.
         assert 0 <= i < self.m
         assert 0 <= j < self.n
         return i * self.n + j
 
     def index2coords(self, index):
+        # [FUNCTION DOC] HELPER: Converts a flat index to a (row, column) pair, asserting it
+        # is on the board.
         assert 0 <= index < self.m * self.n
         return divmod(index, self.n)
 
     def _init_board(self):
+        # [FUNCTION DOC] HELPER: Rebuilds succs in place: for every square, the list of
+        # knight-move destinations that lie on the board.
         succs = self.succs
         del succs[:]
         m, n = self.m, self.n
@@ -2134,11 +2423,15 @@ class Knights:
 
     # Generate solutions.
     def solve(self):
+        # [FUNCTION DOC] HELPER: Initializes the board then yields each tour (list of square
+        # indices) found via conjoin over squaregenerators.
         self._init_board()
         for x in conjoin(self.squaregenerators):
             yield x
 
     def printsolution(self, x):
+        # [FUNCTION DOC] HELPER: Prints a tour as a numbered ASCII board (move numbers per
+        # square), asserting x covers every square. Side effect: writes to stdout.
         m, n = self.m, self.n
         assert len(x) == m*n
         w = len(str(m*n))
