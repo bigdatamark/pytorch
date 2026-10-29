@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Generates C++ code for ufunc-based structured operators: CUDA functor structs plus a
+# dispatch stub kernel, and CPU stub declarations plus per-dtype scalar/vectorized
+# kernels. Contains signature dataclasses (functor, ufunc, stub), configs for binary
+# scalar specialization, and the compute_ufunc_cuda / compute_ufunc_cpu /
+# compute_ufunc_cpu_kernel entry points. No import-time side effects.
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -66,28 +72,46 @@ if TYPE_CHECKING:
 #
 @dataclass(frozen=True)
 class UfunctorSignature:
+    # [CLASS DOC]
+    # Immutable description of a CUDA ufunctor struct for a structured group: the group,
+    # the index of the tensor argument treated as a CPU scalar (or None when no operand is
+    # specialized), and the struct name. Methods render constructor, field and call
+    # operator pieces of the C++ functor.
     g: NativeFunctionsGroup
     scalar_tensor_idx: int | None
     name: str
 
     def arguments(self) -> UfunctorBindings:
+        # [FUNCTION DOC]
+        # Returns the constructor and apply bindings of the functor, computed from the
+        # group, the scalar tensor index and the scalar_t type.
         return ufunc.ufunctor_arguments(
             self.g, scalar_tensor_idx=self.scalar_tensor_idx, scalar_t=scalar_t
         )
 
     def fields(self) -> list[Binding]:
+        # [FUNCTION DOC]
+        # Returns the constructor bindings renamed with a trailing underscore; these are the
+        # member fields of the functor.
         # fields are renamed to have a trailing underscore, as is conventional
         return [b.rename(f"{b.name}_") for b in self.arguments().ctor]
 
     def returns_type(self) -> CType:
+        # [FUNCTION DOC]
+        # Returns the functor result type, currently always scalar_t (hardcoded).
         # TODO: don't hardcode; return type will be inferred based on tags on
         # the native function
         return BaseCType(scalar_t)
 
     def decl_fields(self) -> str:
+        # [FUNCTION DOC]
+        # Returns C++ member declarations (type, name, semicolon), one per line, for all fields.
         return "\n".join(f"{f.type} {f.name};" for f in self.fields())
 
     def inline_defn_ctor(self) -> str:
+        # [FUNCTION DOC]
+        # Returns an inline C++ constructor definition taking the constructor bindings and
+        # initializing each underscore-suffixed field from the same-named parameter.
         args_str = ", ".join(a.decl() for a in self.arguments().ctor)
         # NB: hypothetically could do this with translate but the
         # transition here is very regular
@@ -95,20 +119,31 @@ class UfunctorSignature:
         return f"{self.name}({args_str}) : {init_str} {{}}"
 
     def decl_apply(self) -> str:
+        # [FUNCTION DOC]
+        # Returns the const call-operator declaration (return type and apply parameters),
+        # without a body.
         args_str = ", ".join(a.decl() for a in self.arguments().apply)
         return f"{self.returns_type().cpp_type()} operator()({args_str}) const"
 
 
 @dataclass(frozen=True)
 class UfuncSignature:
+    # [CLASS DOC]
+    # Immutable description of a user-written templated ufunc function: the group, the
+    # qualified C++ function name, and the compute type its arguments are instantiated with.
     g: NativeFunctionsGroup
     name: str
     compute_t: CType
 
     def arguments(self) -> list[Binding]:
+        # [FUNCTION DOC]
+        # Returns the bindings of the ufunc template function for the group and compute type.
         return ufunc.ufunc_arguments(self.g, compute_t=self.compute_t)
 
     def call(self, ctx: Sequence[Binding | Expr]) -> str:
+        # [FUNCTION DOC]
+        # Returns a C++ call expression of the ufunc, translating the given context of
+        # available bindings and expressions into the ufunc's argument list.
         return f"{self.name}({', '.join(a.expr for a in translate(ctx, self.arguments()))})"
 
 
@@ -131,6 +166,9 @@ class UfuncSignature:
 
 
 def eligible_for_binary_scalar_specialization(g: NativeFunctionsGroup) -> bool:
+    # [FUNCTION DOC]
+    # Returns true when the functional variant has exactly two tensor-like non-out
+    # arguments, i.e. a binary op for which a CPU-scalar operand can be specialized.
     num_tensors = sum(
         1 for a in g.functional.func.arguments.flat_non_out if a.type.is_tensor_like()
     )
@@ -140,6 +178,13 @@ def eligible_for_binary_scalar_specialization(g: NativeFunctionsGroup) -> bool:
 def compute_ufunc_cuda_functors(
     g: NativeFunctionsGroup,
 ) -> tuple[dict[ScalarType, dict[UfuncKey, UfunctorSignature]], str]:
+    # [FUNCTION DOC]
+    # Builds CUDA functors for a group. Returns a mapping from dtype to a mapping from
+    # functor key to functor signature, and the concatenated C++ source of generated
+    # functor structs. Keys with a user-defined inner loop reuse it and generate nothing;
+    # others are generated from the ScalarOnly/Generic loops, whose ufunc names must match.
+    # Raises an error if a scalar-specialized key is used on a non-binary function, if the
+    # ScalarOnly and Generic names differ, or if no ufunc name is found.
     # First, build the functors.
     ufunctor_sigs: dict[ScalarType, dict[UfuncKey, UfunctorSignature]] = {}
     ufunctors: list[str] = []
@@ -225,6 +270,10 @@ struct {ufunctor_sig.name} {{
 
 @dataclass(frozen=True)
 class BinaryScalarSpecializationConfig:
+    # [CLASS DOC]
+    # Immutable configuration of one binary scalar specialization: which operand index is
+    # the CPU scalar, the name of the other tensor used to build the functor, and the
+    # functor key to use.
     scalar_idx: int
     ctor_tensor: str
     ufunc_key: UfuncKey
@@ -250,6 +299,12 @@ def compute_ufunc_cuda_dtype_body(
     inner_loops: dict[UfuncKey, UfunctorSignature],
     parent_ctx: Sequence[Binding],
 ) -> str:
+    # [FUNCTION DOC]
+    # Returns the C++ body for one dtype case of the CUDA kernel: a chain that, for each
+    # specialization whose key exists, checks if the operand is a CPU scalar, builds the
+    # functor with the scalar value, removes that operand and runs the GPU kernel; the
+    # final branch runs the generic functor. The CUDAFunctor key must be present.
+    # KNOWN ISSUE: the dtype parameter is unused.
     body = "using opmath_t = at::opmath_type<scalar_t>;"
     body += "if (false) {}\n"  # for ease of codegen
     for config in BinaryScalarSpecializationConfigs:
@@ -293,6 +348,10 @@ else {{
 
 @with_native_function
 def compute_ufunc_cuda(g: NativeFunctionsGroup) -> str:
+    # [FUNCTION DOC]
+    # Returns the complete CUDA source for a ufunc group: functor structs, stub type and
+    # dispatch declarations, a kernel that switches on the common dtype, the dispatch
+    # registration, and the structured impl that directly calls the kernel.
     # First, build the functors, indexing them by dtype
     ufunctor_sigs, ufunctors = compute_ufunc_cuda_functors(g)
 
@@ -342,50 +401,76 @@ REGISTER_DISPATCH({stub_sig.name}, &{stub_sig.kernel_name})
 
 @dataclass(frozen=True)
 class StubSignature:
+    # [CLASS DOC]
+    # Immutable description of the dispatch stub of a ufunc group, derived from the base
+    # name of the functional variant (stub, kernel and function-type names). Methods render
+    # the type alias, declare/define dispatch macros, kernel definition and call sites.
     g: NativeFunctionsGroup
 
     @property
     def name(self) -> str:
+        # [FUNCTION DOC] Returns the stub name: functional base name plus _stub.
         return f"{str(self.g.functional.func.name.name)}_stub"
 
     @property
     def kernel_name(self) -> str:
+        # [FUNCTION DOC] Returns the kernel name: functional base name plus _kernel.
         return f"{str(self.g.functional.func.name.name)}_kernel"
 
     @property
     def type_name(self) -> str:
+        # [FUNCTION DOC] Returns the function pointer alias name: base name plus _fn.
         return f"{str(self.g.functional.func.name.name)}_fn"
 
     def arguments(self) -> list[Binding]:
+        # [FUNCTION DOC] Returns the stub's bindings (arguments after the iterator).
         return ufunc.stub_arguments(self.g)
 
     def type(self) -> str:
+        # [FUNCTION DOC]
+        # Returns the C++ function pointer type: void result, a TensorIteratorBase reference
+        # first, then the stub argument types.
         cpp_args = self.arguments()
         return f"void(*)(TensorIteratorBase&, {', '.join(a.type for a in cpp_args)})"
 
     def dispatch_decl(self) -> str:
+        # [FUNCTION DOC] Returns the macro line declaring the dispatch stub of the fn type.
         return f"DECLARE_DISPATCH({self.type_name}, {self.name})"
 
     def dispatch_defn(self) -> str:
+        # [FUNCTION DOC] Returns the macro line defining the dispatch stub.
         return f"DEFINE_DISPATCH({self.name})"
 
     def kernel_defn(self) -> str:
+        # [FUNCTION DOC]
+        # Returns the kernel function header (no body): void, iterator reference, then the
+        # stub arguments as definitions.
         return f"void {self.kernel_name}(TensorIteratorBase& iter, {', '.join(a.defn() for a in self.arguments())})"
 
     def type_defn(self) -> str:
+        # [FUNCTION DOC] Returns the C++ alias declaring the function pointer type name.
         return f"using {self.type_name} = {self.type()}"
 
     # must be called from context where this is TensorIteratorBase*
     def call(self, ctx: Sequence[Binding]) -> str:
+        # [FUNCTION DOC]
+        # Returns a dynamic-dispatch call of the stub using the device type, the current
+        # iterator object and arguments translated from the context.
         return f"{self.name}(device_type(), *this, {', '.join(a.expr for a in translate(ctx, self.arguments()))})"
 
     # used in CUDA to skip the unnecessary dynamic dispatch
     def direct_call(self, ctx: Sequence[Binding]) -> str:
+        # [FUNCTION DOC]
+        # Returns a direct call of the kernel (no dynamic dispatch) with the current
+        # iterator object and arguments translated from the context.
         return f"{self.kernel_name}(*this, {', '.join(a.expr for a in translate(ctx, self.arguments()))})"
 
 
 @with_native_function
 def compute_ufunc_cpu(g: NativeFunctionsGroup) -> str:
+    # [FUNCTION DOC]
+    # Returns the CPU registration source for a ufunc group: stub type, dispatch
+    # declaration and definition, and a structured impl calling the stub.
     stub_sig = StubSignature(g)
     sig = StructuredImplSignature(g, ufunc.kernel_name(g, DispatchKey.CPU))
 
@@ -406,6 +491,13 @@ def compute_ufunc_cpu_dtype_body(
     inner_loops: dict[UfuncKey, UfuncSignature],
     parent_ctx: Sequence[Binding],
 ) -> str:
+    # [FUNCTION DOC]
+    # Returns the C++ body for one dtype case of the CPU kernel: converts scalar context
+    # arguments to scalar_t (and Vectorized when a vector loop exists), then emits a
+    # scalar-only or scalar-plus-vector cpu kernel call with lambdas over tensor arguments.
+    # Raises an error if the scalar loop is missing, keys include anything besides
+    # CPUScalar/CPUVector, or a tensor-like argument is not a plain Tensor.
+    # KNOWN ISSUE: the dtype parameter is only used in an error message.
     if UfuncKey.CPUScalar not in inner_loops:
         raise AssertionError(f"{dtype}, {inner_loops.keys()}")
     if not inner_loops.keys() <= {UfuncKey.CPUScalar, UfuncKey.CPUVector}:
@@ -475,6 +567,7 @@ def compute_ufunc_cpu_dtype_body(
             )
 
     def with_ctx(b: Sequence[Binding]) -> list[Expr | Binding]:
+        # [FUNCTION DOC] HELPER: Returns the scalar setup expressions followed by bindings b.
         r: list[Expr | Binding] = []
         r.extend(ctx)
         r.extend(b)
@@ -500,6 +593,11 @@ cpu_kernel(iter,
 
 @with_native_function
 def compute_ufunc_cpu_kernel(g: NativeFunctionsGroup) -> str:
+    # [FUNCTION DOC]
+    # Returns the CPU kernel source for a group: re-indexes the inner loops by dtype with
+    # precedence direct key, then ScalarOnly (scalar only), then Generic; builds a dtype
+    # switch inside an anonymous namespace, then the stub type, dispatch declaration and
+    # registration. Raises an error on an unexpected key.
     stub_sig = StubSignature(g)
 
     # Reindex the ufunc by dtypes; processing generic/scalaronly as well

@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Generates the per-dispatch-key registration C++ (the Register<key>.cpp files): helper
+# functions for output creation/resizing/in-place checks, include lists, wrapper kernels
+# with device checks and guards, namespaced direct-call bindings, dispatcher registration
+# lines, and the structured-kernel classes and wrappers. Main entry points are
+# gen_registration_headers, gen_registration_helpers, RegisterDispatchKey and its
+# structured subclass. No import-time side effects.
 from __future__ import annotations
 
 import itertools
@@ -49,6 +56,11 @@ def gen_registration_headers(
     per_operator_headers: bool,
     rocm: bool,
 ) -> list[str]:
+    # [FUNCTION DOC]
+    # Returns the include lines for a registration file: the native function header (per
+    # operator or monolithic), an empty-tensor header chosen by dispatch key (hip variant
+    # for CUDA on ROCm), or generic ops/functions headers for other keys, and the macros
+    # header.
     if per_operator_headers:
         headers = ["#include <ATen/ops/as_strided_native.h>"]
     else:
@@ -85,6 +97,11 @@ def gen_registration_headers(
 def gen_empty_impl_names(
     backend_index: BackendIndex,
 ) -> tuple[str | None, str | None]:
+    # [FUNCTION DOC]
+    # Returns the C++ names of the empty and empty-strided allocation functions for the
+    # backend: detail functions named after the key for Meta/CPU/CUDA/MPS/XPU/MTIA, the
+    # public at:: functions for composite non-functional and quantized keys, else None
+    # for both.
     empty_impl = None
     empty_strided_impl = None
 
@@ -111,6 +128,10 @@ def gen_empty_impl_names(
 
 
 def gen_create_out_helper(backend_index: BackendIndex) -> list[str]:
+    # [FUNCTION DOC]
+    # Returns a list with the C++ create_out helper (allocates an output via empty or
+    # empty-strided depending on whether strides are given; Meta forces the meta device),
+    # or an empty list when the backend has no allocation functions.
     if backend_index.dispatch_key == DispatchKey.Meta:
         empty_options = "options.device(at::kMeta)"
     else:
@@ -134,6 +155,10 @@ Tensor create_out(IntArrayRef sizes, IntArrayRef strides, const TensorOptions &o
 
 
 def gen_maybe_create_proxy_helper(backend_index: BackendIndex) -> list[str]:
+    # [FUNCTION DOC]
+    # Returns a list with the C++ helper that allocates a strided proxy tensor when the
+    # out tensor's strides differ from the requested ones (else an empty optional), or an
+    # empty list when the backend has no empty-strided function.
     _, empty_strided_impl = gen_empty_impl_names(backend_index)
     return (
         []
@@ -152,6 +177,10 @@ std::optional<Tensor> maybe_create_proxy(const Tensor &out, IntArrayRef sizes, I
 
 
 def gen_resize_out_helper(backend_index: BackendIndex) -> list[str]:
+    # [FUNCTION DOC]
+    # Returns a list with the C++ resize_out helper (checks dtype and device match the
+    # out tensor, resizes it, and restrides only if a resize happened), or an empty list
+    # for the composite non-functional key where it would be unused.
     if backend_index.dispatch_key == DispatchKey.CompositeExplicitAutogradNonFunctional:
         # The function isn't used by this key (since only functional ops have a kernel for this key),
         # so we need to not include it to avoid a defined-but-not-used error.
@@ -182,6 +211,10 @@ void resize_out(const Tensor &out, IntArrayRef sizes, IntArrayRef strides, const
 
 
 def gen_check_inplace_helper(backend_index: BackendIndex) -> list[str]:
+    # [FUNCTION DOC]
+    # Returns a list with the C++ check_inplace helper that verifies dtype, device and
+    # sizes of the in-place target match the computed options and sizes. The backend
+    # index is unused.
     return [
         """
 void check_inplace(const Tensor &self, IntArrayRef sizes, const TensorOptions &options) {
@@ -205,6 +238,9 @@ void check_inplace(const Tensor &self, IntArrayRef sizes, const TensorOptions &o
 
 
 def gen_registration_helpers(backend_index: BackendIndex) -> list[str]:
+    # [FUNCTION DOC]
+    # Returns all helper snippets (create_out, resize_out, check_inplace, maybe proxy)
+    # wrapped between a diagnostic push ignoring unused-function warnings and a pop.
     return [
         'C10_DIAGNOSTIC_PUSH_AND_IGNORED_IF_DEFINED("-Wunused-function")',
         *gen_create_out_helper(backend_index),
@@ -235,6 +271,12 @@ def gen_registration_helpers(backend_index: BackendIndex) -> list[str]:
 #     directly to kernels, but with user-friendly cpp-style API
 @dataclass(frozen=True)
 class RegisterDispatchKey:
+    # [CLASS DOC]
+    # Immutable generator for one dispatch key's registration file. Fields: backend index,
+    # a target selecting what to emit (anonymous wrapper definitions, namespaced
+    # definitions, namespaced declarations or registration lines), a selective-build
+    # selector, ROCm and symint flags, an optional kernel class name, and a flag to skip
+    # dispatcher registration. Called on a function or group, returns the code strings.
     backend_index: BackendIndex
 
     target: Literal[
@@ -272,6 +314,10 @@ class RegisterDispatchKey:
     def gen_device_check(
         type: DeviceCheckType, args: list[Argument], method_name: str
     ) -> str:
+        # [FUNCTION DOC]
+        # Static: returns C++ checking that all tensor-like arguments live on a common
+        # device, or just a comment line when the check type is NoCheck. Each tensor-like
+        # argument adds a call updating the common device with the method name.
         if type == DeviceCheckType.NoCheck:
             return "  // No device check\n"
 
@@ -286,6 +332,10 @@ class RegisterDispatchKey:
 
     @method_with_native_function
     def __call__(self, f: NativeFunctionsGroup | NativeFunction) -> list[str]:
+        # [FUNCTION DOC]
+        # Returns the generated code strings. For a group: structured generation if the
+        # group is structured, else unstructured generation for each member (None results
+        # dropped). For a single function: a list with its code, or empty if none.
         if isinstance(f, NativeFunctionsGroup):
             g: NativeFunctionsGroup = f
             # Note: We call gen_structured() if the operator is marked structured, regardless of the backend.
@@ -305,6 +355,9 @@ class RegisterDispatchKey:
     def wrapper_kernel_sig(
         self, f: NativeFunction
     ) -> NativeSignature | DispatcherSignature:
+        # [FUNCTION DOC]
+        # Returns the dispatcher-style signature of the wrapper function registered for the
+        # function, named with a prefix containing the dispatch key and overload name.
         # The prefix is just to ensure uniqueness. The Dispatcher API doesn't guarantee unique kernel names.
         return DispatcherSignature.from_schema(
             f.func,
@@ -315,6 +368,12 @@ class RegisterDispatchKey:
     def gen_out_inplace_wrapper(
         self, f: NativeFunction, g: NativeFunctionsGroup | None
     ) -> str | None:
+        # [FUNCTION DOC]
+        # Returns C++ for an in-place or out wrapper without its own kernel: it calls the
+        # functional wrapper and copies the result into the in-place target or out
+        # arguments (resizing for out), then returns them (tuple if several). Returns None
+        # when there is no group. Raises an error for a functional op, or for a function
+        # with no returns and not exactly one out argument.
         if g is None:
             return None
         k = f.func.kind()
@@ -366,6 +425,12 @@ class RegisterDispatchKey:
 """
 
     def gen_structured(self, g: NativeFunctionsGroup) -> list[str]:
+        # [FUNCTION DOC]
+        # Returns code strings for a structured group by delegating to the structured
+        # generator for each member. For non-meta, non-composite keys whose kernel is not
+        # structured, falls back to unstructured generation per member.
+        # Raises an error if the Meta or composite non-functional key explicitly defines a
+        # kernel for the out variant (those are auto-generated).
         metadata = self.backend_index.get_kernel(g)
         if self.backend_index.dispatch_key == DispatchKey.Meta:
             if self.backend_index.has_kernel(g.out):
@@ -399,6 +464,15 @@ class RegisterDispatchKey:
     def gen_unstructured(
         self, f: NativeFunction, g: NativeFunctionsGroup | None = None
     ) -> str | None:
+        # [FUNCTION DOC]
+        # Returns the code for one non-structured function according to the target, or None
+        # if nothing applies (no kernel and no generated wrapper, manual registration, not
+        # selected, or no metadata). Meta in-place ops without a kernel get a stub checking
+        # the target is meta; out/in-place variants lacking kernels may get generated
+        # wrappers. The wrapper adds device check and guard (chosen from tensor options or
+        # the first eligible tensor argument) before calling the kernel. Namespaced targets
+        # emit declarations or forwarding definitions; registration emits an implementation
+        # line unless skipped. Runs inside the native function context manager.
         with native_function_manager(f):
             inplace_meta = False
             gets_out_inplace_wrapper = False
@@ -453,6 +527,8 @@ class RegisterDispatchKey:
             elif self.target is Target.NAMESPACED_DEFINITION:
 
                 def generate_defn(cpp_sig: CppSignature) -> str:
+                    # [FUNCTION DOC] HELPER: Returns a C++ definition of the public binding
+                    # that forwards translated arguments to the wrapper function.
                     return f"""
 {cpp_sig.defn()} {{
 return {sig.name()}({", ".join(e.expr for e in translate(cpp_sig.arguments(), sig.arguments()))});
@@ -586,17 +662,28 @@ namespace {{
 
 @dataclass(frozen=True)
 class StructuredRegisterDispatchKey(RegisterDispatchKey):
+    # [CLASS DOC]
+    # Generator for structured kernels of one group (field g) on one dispatch key. Emits
+    # the per-variant op class (outputs storage, optional proxies, device guard, output
+    # setters overriding the meta base) and the wrapper function that runs meta, then impl,
+    # copies proxies back and returns the outputs.
     g: NativeFunctionsGroup
 
     def gen_class_set_output_functions(
         self, k: SchemaKind, parent_class: str, generate_super: bool
     ) -> str:
+        # [FUNCTION DOC]
+        # Returns C++ for the strided and raw-strided output setter overrides of the op
+        # class; each has the variant-specific body and, when requested, then calls the
+        # parent class implementation so downstream code can read the output.
         if generate_super:
             set_output_super = f"{parent_class}::set_output_raw_strided(output_idx, sizes, strides, options);"
         else:
             set_output_super = ""
 
         def gen_set_output_function(name: str, maybe_create_proxy: bool) -> str:
+            # [FUNCTION DOC] HELPER: Returns one set_output override named by suffix, with the
+            # indented body for the schema kind and the optional parent call.
             return f"""
 void set_output_{name}(
     int64_t output_idx, IntArrayRef sizes, IntArrayRef strides,
@@ -615,6 +702,12 @@ void set_output_{name}(
 """
 
     def gen_class_set_output_body(self, k: SchemaKind, maybe_create_proxy: bool) -> str:
+        # [FUNCTION DOC]
+        # Returns the C++ body of an output setter for the schema kind: functional creates
+        # the output; in-place checks it; out resizes it (the last two optionally create a
+        # proxy). For keys with device guards, a prefix sets or verifies the guard device.
+        # Raises an error for mutable or scratch kinds, or for a functional kind on an
+        # unsupported dispatch key.
         if self.backend_index.dispatch_key in [
             DispatchKey.CUDA,
             DispatchKey.MPS,
@@ -680,6 +773,10 @@ resize_out(out, sizes, strides, options);
     # returns the definition of a ctor, as well as how to construct
     # this class to a variable named op
     def gen_class_ctor(self, k: SchemaKind, class_name: str, returns: int) -> str:
+        # [FUNCTION DOC]
+        # Returns the C++ constructor of the op class: none for functional, one taking self
+        # for in-place, one taking one reference per return for out. Raises an error for
+        # mutable or scratch kinds.
         if k is SchemaKind.functional:
             return ""
         elif k is SchemaKind.inplace:
@@ -705,6 +802,12 @@ resize_out(out, sizes, strides, options);
         parent_class: str,
         generate_super: bool,
     ) -> str:
+        # [FUNCTION DOC]
+        # Returns the C++ struct definition of the op class deriving from the parent: ctor,
+        # output setters, a getter for the current output (proxy if present), the outputs
+        # array (tensors for functional, references otherwise), optional proxy outputs and
+        # a device guard field depending on the dispatch key. Raises a runtime error for
+        # mutable or scratch kinds.
         if k is SchemaKind.functional:
             output_type = "Tensor"
             output_value = "outputs_[output_idx]"
@@ -752,6 +855,14 @@ resize_out(out, sizes, strides, options);
 
     @method_with_native_function
     def gen_one(self, f: NativeFunction) -> str | None:
+        # [FUNCTION DOC]
+        # Returns the code for one member of the structured group per target, or None when
+        # not selected (registration) or when the composite non-functional key meets an out
+        # variant. Declaration and definition targets emit the public bindings; the
+        # anonymous definition emits the op class plus a wrapper that device-checks, runs
+        # meta (keeping any precomputed values), runs impl or the out call, copies proxies
+        # back and returns the outputs; registration emits an implementation line.
+        # Raises an error for manual kernel registration or missing kernel metadata.
         if f.manual_kernel_registration:
             raise AssertionError(
                 f"Function {f.func.name} has manual_kernel_registration=True"
@@ -810,6 +921,8 @@ resize_out(out, sizes, strides, options);
         elif self.target is Target.NAMESPACED_DEFINITION:
 
             def generate_defn(cpp_sig: CppSignature) -> str:
+                # [FUNCTION DOC] HELPER: Returns a C++ definition of the public binding
+                # that forwards translated arguments to the wrapper function.
                 return f"""
 {cpp_sig.defn()} {{
 return {sig.name()}({", ".join(e.expr for e in translate(cpp_sig.arguments(), sig.arguments()))});

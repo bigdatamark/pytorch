@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# [MODULE DOC]
+# Script that generates torch/csrc/jit/runtime/decomposition_registry_util.cpp from the
+# TorchScript decomposition table in torch.jit._decompositions. Holds C++ text templates
+# (header, center, end) and functions that serialize the scripted decomposition source
+# and the schema-to-function-name mapping. Importing it imports torch.jit decompositions.
 import os
 from pathlib import Path
 
@@ -55,12 +60,18 @@ DECOMPOSITION_UTIL_FILE_NAME = "decomposition_registry_util.cpp"
 
 
 def gen_serialized_decompisitions() -> str:
+    # [FUNCTION DOC]
+    # Returns the TorchScript source code of every scripted function in the decomposition
+    # table, joined by newlines, in table order. No side effects.
     return "\n".join(
         [scripted_func.code for scripted_func in decomposition_table.values()]  # type: ignore[misc]
     )
 
 
 def gen_decomposition_mappings() -> str:
+    # [FUNCTION DOC]
+    # Returns C++ initializer lines, one per table entry, pairing each operator schema
+    # string with the name of its scripted decomposition function, joined by newlines.
     decomposition_mappings = []
     for schema, scripted_func in decomposition_table.items():
         decomposition_mappings.append(
@@ -70,6 +81,10 @@ def gen_decomposition_mappings() -> str:
 
 
 def write_decomposition_util_file(path: str) -> None:
+    # [FUNCTION DOC]
+    # Assembles header, serialized decompositions, center, mappings and end text and writes
+    # it as UTF-8 to the util cpp file name inside the directory path. Prints the target
+    # path; overwrites an existing file; I/O errors propagate.
     decomposition_str = gen_serialized_decompisitions()
     decomposition_mappings = gen_decomposition_mappings()
     file_components = [
@@ -86,6 +101,9 @@ def write_decomposition_util_file(path: str) -> None:
 
 
 def main() -> None:
+    # [FUNCTION DOC]
+    # Entry point: derives the repo root as three levels above this file and writes the
+    # generated file into torch/csrc/jit/runtime there.
     pytorch_dir = Path(__file__).resolve().parents[3]
     upgrader_path = pytorch_dir / "torch" / "csrc" / "jit" / "runtime"
     write_decomposition_util_file(str(upgrader_path))

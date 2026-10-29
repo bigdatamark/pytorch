@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Generates the C++ declarations that go into NativeFunctions.h: kernel declarations for
+# unstructured functions and structured kernel classes deriving from the meta classes.
+# No import-time side effects.
 from __future__ import annotations
 
 import torchgen.api.meta as meta
@@ -10,6 +14,9 @@ from torchgen.utils import mapMaybe
 
 @with_native_function_and_index
 def gen_unstructured(f: NativeFunction, backend_index: BackendIndex) -> str | None:
+    # [FUNCTION DOC] HELPER: Returns a C++ kernel declaration line for the function using
+    # the kernel name from the backend index (static for external backends, else TORCH_API),
+    # or None if no kernel is registered or the kernel is a legacy one.
     sig = kernel_signature(f, backend_index)
     metadata = backend_index.get_kernel(f)
     if metadata is None:
@@ -23,6 +30,9 @@ def gen_unstructured(f: NativeFunction, backend_index: BackendIndex) -> str | No
 
 @with_native_function_and_index
 def gen_structured(g: NativeFunctionsGroup, backend_index: BackendIndex) -> list[str]:
+    # [FUNCTION DOC] HELPER: Returns a one-element list with the C++ declaration of a
+    # structured kernel struct deriving from the meta class and declaring the impl method
+    # with the structured impl arguments; returns an empty list if no kernel is registered.
     meta_name = meta.name(g)
     out_args = structured.impl_arguments(g)
     metadata = backend_index.get_kernel(g)
@@ -44,6 +54,11 @@ void impl({", ".join(a.decl() for a in out_args)});
 def compute_native_function_declaration(
     g: NativeFunctionsGroup | NativeFunction, backend_index: BackendIndex
 ) -> list[str]:
+    # [FUNCTION DOC]
+    # Returns the C++ declaration strings for a function or group on a backend: structured
+    # kernel structs when the group's kernel is structured, otherwise one declaration per
+    # function with a kernel (possibly empty).
+    # Raises an error for a structured kernel on an external backend (unsupported).
     metadata = backend_index.get_kernel(g)
     if isinstance(g, NativeFunctionsGroup):
         if metadata is not None and metadata.structured:

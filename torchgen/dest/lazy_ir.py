@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Generates C++ for lazy tensor backends: IR node class declarations (generic and
+# TorchScript flavored), native function definitions that build IR nodes and wrap results
+# as ATen tensors, shape inference declarations, and non-native IR nodes. Also holds helper
+# functions rendering node constructor arguments and eager fallback code. No import-time
+# side effects.
 from __future__ import annotations
 
 import itertools
@@ -41,6 +47,12 @@ from torchgen.model import (
 
 
 def node_ctor_arg_rvalue_string(arg: LazyArgument) -> str:
+    # [FUNCTION DOC]
+    # Returns a C++ expression passing one argument to a lazy node constructor. Value-typed
+    # arguments become IR values (wrapped scalar node, tensor list, symint value, or the
+    # lazy tensor's IR value, with optional forms guarded); other arguments are passed as
+    # is or converted to vectors / optional vectors / symint arrays.
+    # Raises an error for a value type that is neither a base nor an optional C type.
     """
     Given a LazyArgument,
     generate a c++ string for materializing an rvalue of that arg for passing into
@@ -100,6 +112,9 @@ def node_ctor_arg_rvalue_string(arg: LazyArgument) -> str:
 
 
 def node_ctor_inputs(schema: LazyIrSchema) -> str:
+    # [FUNCTION DOC]
+    # Returns the comma-separated constructor argument expressions for all filtered
+    # arguments of the schema, in order.
     """
     Produce a formatted string with the arguments as passed into the constructor of a node class.
     """
@@ -114,6 +129,11 @@ def gen_fallback_code(
     sig: DispatcherSignature | NativeSignature,
     overload_name: str,
 ) -> str:
+    # [FUNCTION DOC]
+    # Returns a C++ conditional that, when the forced-eager-fallback check for the op
+    # symbol is true, returns the result of the eager fallback call with arguments
+    # translated from the given signature to the dispatcher signature. The overload name,
+    # if non-empty, selects the two-part ATen op macro.
     """
     Generate code that falls back to eager conditioned on a predicate
     """
@@ -134,6 +154,10 @@ def gen_fallback_code(
 
 
 def aten_symbol(schema: LazyIrSchema) -> str:
+    # [FUNCTION DOC]
+    # Returns a C++ expression for the ATen symbol of the op: a qualified-string symbol for
+    # names missing from interned strings, the name itself if already prefixed with at::,
+    # otherwise the name under the at::aten namespace.
     missing_interned_strings = {
         "sigmoid_backward",
     }
@@ -150,6 +174,10 @@ def aten_symbol(schema: LazyIrSchema) -> str:
 # (1) a string containing all of the logic that does the conversions.
 # (2) a context, to be used by translate(), with all of the relevant bindings.
 def convert_to_meta_tensors(sig: DispatcherSignature) -> tuple[str, list[Binding]]:
+    # [FUNCTION DOC]
+    # Returns the C++ statements converting every tensor-like argument to a meta tensor
+    # (named with a _meta suffix), and the binding context in which those arguments are
+    # replaced by the converted names while other arguments are unchanged.
     context: list[Binding] = []
     unwrapped_tensor_args: list[str] = []
     for arg in sig.arguments():
@@ -167,6 +195,11 @@ def convert_to_meta_tensors(sig: DispatcherSignature) -> tuple[str, list[Binding
 
 @dataclass(frozen=True)
 class GenLazyIR(ABC):
+    # [CLASS DOC]
+    # Immutable generator of lazy IR node class declarations. State: the backend index,
+    # backend name, the C++ node base class name, and whether lazy shape objects are used.
+    # Hook methods (lowering, create, reuse check) return empty or trivial text here and
+    # are overridden by backend subclasses; gen renders the full node class text.
     backend_index: BackendIndex
     backend_name: str
     node_base: str
@@ -174,6 +207,9 @@ class GenLazyIR(ABC):
 
     @method_with_native_function
     def __call__(self, f: NativeFunctionsGroup | NativeFunction) -> list[str]:
+        # [FUNCTION DOC]
+        # Builds the lazy IR schema from the functional variant (symint-aware according to
+        # the kernel metadata) and returns the generated node class text list from gen.
         func = f.functional.func if isinstance(f, NativeFunctionsGroup) else f.func
         metadata = self.backend_index.get_kernel(
             f.functional if isinstance(f, NativeFunctionsGroup) else f
@@ -186,17 +222,26 @@ class GenLazyIR(ABC):
     # there is no lowering functionality generated unless this IR base class is subclassed and
     # implemented as a backend-specific node
     def lowering_function(self, schema: LazyIrSchema) -> str:
+        # [FUNCTION DOC] Hook: returns the lowering method text; the base returns empty text.
         return ""
 
     def create_function(self, schema: LazyIrSchema, node_ctor_args: str) -> str:
+        # [FUNCTION DOC] Hook: returns the node Create method text; the base returns empty.
         return ""
 
     def can_be_reused_function(self, schema: LazyIrSchema, node_ctor_args: str) -> str:
+        # [FUNCTION DOC] Hook: returns a CanBeReused method that always returns false.
         return f"""bool CanBeReused({node_ctor_args}) const {{
     return false;
     }}"""
 
     def node_base_ctor_call(self, schema: LazyIrSchema) -> str:
+        # [FUNCTION DOC]
+        # Returns the C++ call of the node base constructor: op kind, operand list from
+        # value arguments (optionals use a null default), a shape argument chosen by the
+        # shape property (precomputed, computed, or cached lambda; else none), output
+        # count, and a hash of the scalar arguments.
+        # Raises an error for a value argument whose type is not base, vector or optional.
         value_args = schema.filtered_args(values=True, scalars=False)
         # backends can customize the way the node base class constructor is called,
         # as long as all of its arguments can be generated from information available from the schema
@@ -239,6 +284,11 @@ class GenLazyIR(ABC):
               torch::lazy::MHash({scalar_hashes}))"""
 
     def gen(self, schema: LazyIrSchema) -> list[str]:
+        # [FUNCTION DOC]
+        # Returns a one-element list with the C++ class text for the node: op kind static
+        # method, constructor (with an extra shapes parameter when shape is precomputed),
+        # ToString, create, reuse and lowering hooks, scalar member declarations (string views
+        # stored as strings), and bit flags recording presence of optional value arguments.
         opkind = schema.opkind or aten_symbol(schema)
 
         # for now, we just want one IR class decl and soon after also the method defs
@@ -339,7 +389,13 @@ class {schema.node_name} : public {self.node_base} {{
 
 @dataclass(frozen=True)
 class GenTSLazyIR(GenLazyIR):
+    # [CLASS DOC]
+    # TorchScript backend flavor of GenLazyIR: implements the lowering, create and reuse
+    # hooks according to the schema's properties (declaration only, full definition, or none).
     def lowering_function(self, schema: LazyIrSchema) -> str:
+        # [FUNCTION DOC]
+        # Returns the Lower override: only a declaration if LowerDeclOnly, a full definition
+        # with the TorchScript lowering body if Lower, otherwise empty text.
         signature = """
   torch::lazy::TSOpVector Lower(
       std::shared_ptr<torch::jit::GraphFunction> function,
@@ -356,6 +412,11 @@ class GenTSLazyIR(GenLazyIR):
             return ""
 
     def create_function(self, schema: LazyIrSchema, node_ctor_args: str) -> str:
+        # [FUNCTION DOC]
+        # Returns the static Create method: declaration only if CreateFnDeclOnly, empty if
+        # CreateFn is unset, otherwise a definition reusing or making the node.
+        # KNOWN ISSUE: the generated body passes an identifier named data that is not a
+        # parameter of the generated signature, so it only compiles if one is in scope.
         signature = f"static NodePtr Create({node_ctor_args})"
         if schema.properties.CreateFnDeclOnly:
             return f"{signature};"
@@ -366,6 +427,11 @@ class GenTSLazyIR(GenLazyIR):
   }}"""
 
     def can_be_reused_function(self, schema: LazyIrSchema, node_ctor_args: str) -> str:
+        # [FUNCTION DOC]
+        # Returns the CanBeReused method: declaration only if CanBeReusedDeclOnly, empty if
+        # CanBeReused is unset, otherwise a definition comparing each operand with the value
+        # arguments (optionals via null default) and each scalar member with its argument
+        # (optionals compared by presence then value), all combined by logical and.
         signature = f"bool CanBeReused({node_ctor_args}) const"
         if schema.properties.CanBeReusedDeclOnly:
             return f"{signature};"
@@ -396,6 +462,12 @@ class GenTSLazyIR(GenLazyIR):
 
 @dataclass(frozen=True)
 class GenLazyNativeFuncDefinition:
+    # [CLASS DOC]
+    # Immutable generator of lazy backend native function definitions. State holds the
+    # backend index and backend-specific C++ names (class, namespace, helpers for tensor
+    # lists, wrapped numbers, tensor creation, counters, device lookup, tensor pointer
+    # type). Each call renders one kernel body: fallback, metrics, device, lazy tensor
+    # setup, IR node build, and returning the wrapped result.
     class_method_name: str
     backend_index: BackendIndex
     tensor_class: str
@@ -413,6 +485,10 @@ class GenLazyNativeFuncDefinition:
     get_device_fn: str
 
     def lazy_tensor_decls(self, func: NativeFunction, schema: LazyIrSchema) -> str:
+        # [FUNCTION DOC]
+        # Returns C++ statements declaring lazy tensor variables (or scalar IR nodes, or
+        # tensor list wrappers) for each value argument, one per line. Symint arguments are
+        # skipped. Raises an error for an unexpected optional element type or value type.
         value_args = schema.filtered_args(values=True, scalars=False)
         # Generates lazy_{name} variables for LazyTensors wrapping input tensors
         lazy_tensor_decls: list[str] = []
@@ -468,6 +544,9 @@ class GenLazyNativeFuncDefinition:
         metadata: BackendMetadata,
         sig: DispatcherSignature | NativeSignature,
     ) -> str:
+        # [FUNCTION DOC]
+        # Returns the eager fallback conditional text when forced fallback code generation
+        # is enabled, otherwise empty text. The metadata argument is unused.
         if self.gen_forced_fallback_code:
             return gen_fallback_code(
                 schema, sig, overload_name=func.func.name.overload_name
@@ -475,9 +554,14 @@ class GenLazyNativeFuncDefinition:
         return ""
 
     def metrics(self, func: NativeFunction, schema: LazyIrSchema) -> str:
+        # [FUNCTION DOC] Returns the metrics counter statement configured for the backend.
         return f"{self.metrics_counter};"
 
     def get_device(self, func: NativeFunction, schema: LazyIrSchema) -> str:
+        # [FUNCTION DOC]
+        # Returns C++ computing the common device from the non-wrapped value arguments and
+        # optional device scalar arguments, followed by an internal assertion that it exists.
+        # Raises an error if there are neither value arguments nor optional device arguments.
         value_args = schema.filtered_args(values=True, scalars=False)
         scalar_args = schema.filtered_args(values=False, scalars=True)
         value_types_names = [f"{a.name}" for a in value_args if not a.is_wrapped_scalar]
@@ -495,6 +579,13 @@ class GenLazyNativeFuncDefinition:
         """
 
     def shape_inference(self, func: NativeFunction, schema: LazyIrSchema) -> str:
+        # [FUNCTION DOC]
+        # Returns C++ computing output shapes. Structured and view_copy ops convert tensor
+        # arguments to meta tensors and call the meta (or composite non-functional) function
+        # to derive shape and dtype per output; other ops call a user-provided compute_shape
+        # function. Then asserts the shape count and optionally applies symbolic shapes.
+        # Raises an error if kernel metadata is missing or a view_copy op lacks the required
+        # composite kernel.
         metadata = self.backend_index.get_kernel(func)
         if metadata is None:
             raise AssertionError(f"No kernel metadata found for {func.func.name}")
@@ -518,6 +609,8 @@ std::vector<torch::lazy::Shape> shapes{torch::lazy::Shape(out_meta.scalar_type()
             if returns_length > 1:
 
                 def this_shape(i: int) -> str:
+                    # [FUNCTION DOC] HELPER: Returns C++ building the shape of output i from
+                    # the tuple of meta outputs.
                     return f"torch::lazy::Shape(std::get<{i}>(out_meta).scalar_type(), std::get<{i}>(out_meta).sizes().vec())"
 
                 shapes_str = ",".join([this_shape(i) for i in range(returns_length)])
@@ -575,6 +668,9 @@ std::vector<torch::lazy::Shape> shapes{torch::lazy::Shape(out_meta.scalar_type()
         return shape_str
 
     def build_ir_node(self, func: NativeFunction, schema: LazyIrSchema) -> str:
+        # [FUNCTION DOC]
+        # Returns C++ that tries to reuse a cached node and, if none, computes shapes,
+        # makes a new node with them and caches it.
         node_ctor_input_str = node_ctor_inputs(schema)
         return f"""torch::lazy::NodePtr node = torch::lazy::ReuseNode<{schema.node_name}>({node_ctor_input_str});
         if (!node) {{
@@ -585,6 +681,10 @@ std::vector<torch::lazy::Shape> shapes{torch::lazy::Shape(out_meta.scalar_type()
         """
 
     def create_lazy_tensor(self, first_tensor_name: str | None = None) -> str:
+        # [FUNCTION DOC]
+        # Returns the C++ callee prefix for creating a lazy tensor: a method on the first
+        # tensor if the backend creates from the first tensor, else a namespaced function.
+        # Raises an error if the first-tensor form is needed but no name is given.
         # xla uses an instance method for tensor creation, for the time being
         if self.create_from_first_tensor:
             # TODO(whc) remove this if XLA switches to using static method for creation
@@ -594,6 +694,12 @@ std::vector<torch::lazy::Shape> shapes{torch::lazy::Shape(out_meta.scalar_type()
         return f"{self.backend_namespace}::{self.create_tensor}"
 
     def return_aten_tensor(self, func: NativeFunction, schema: LazyIrSchema) -> str:
+        # [FUNCTION DOC]
+        # Returns C++ wrapping the node as the op result: a single ATen tensor from a new lazy
+        # tensor, a tuple built from one lazy tensor per output, or, for in-place and out
+        # variants, setting the IR value on the first tensor and returning it.
+        # Raises an error for multiple outputs without tensor arguments, or for an in-place
+        # or out variant with a number of outputs other than one.
         returns_length = len(schema.returns)
         value_args = schema.filtered_args(values=True, scalars=False)
         value_types_names = [f"{a.name}" for a in value_args if not a.is_wrapped_scalar]
@@ -627,6 +733,10 @@ std::vector<torch::lazy::Shape> shapes{torch::lazy::Shape(out_meta.scalar_type()
 
     @method_with_native_function
     def __call__(self, func: NativeFunction) -> list[str]:
+        # [FUNCTION DOC]
+        # Returns a one-element list with the full C++ definition of the backend kernel for
+        # the function, composing fallback, metrics, device, lazy tensor, IR node and return
+        # sections. Raises an error if no kernel metadata exists for the function.
         sig = kernel_signature(func, self.backend_index)
         metadata = self.backend_index.get_kernel(func)
         if metadata is None:
@@ -647,11 +757,18 @@ std::vector<torch::lazy::Shape> shapes{torch::lazy::Shape(out_meta.scalar_type()
 
 
 class ComputeShapeSignature:
+    # [CLASS DOC]
+    # Builds the declaration and call text of the compute_shape function for a kernel,
+    # from the dispatcher argument declarations and the schema's filtered call arguments.
+    # State is stored in name-mangled private attributes set at construction.
     """
     Here we use the base name as the suffix of the signature to avoid generating for in-place variants.
     """
 
     def __init__(self, kernel_name: str, f: NativeFunction, *, symint: bool) -> None:
+        # [FUNCTION DOC]
+        # Stores the kernel name, the lazy schema, the comma-separated dispatcher parameter
+        # declarations and the comma-separated call arguments (generator included).
         self.__schema = LazyIrSchema(f.func, symint=symint)
         self.__dispatch_args = ", ".join(
             [a.decl() for a in dispatcher.arguments(f.func, symint=symint)]
@@ -662,27 +779,38 @@ class ComputeShapeSignature:
         self.__kernel_name = kernel_name
 
     def __decl_suffix(self) -> str:
+        # [FUNCTION DOC] HELPER: Returns the kernel name with its parameter declarations.
         return f"{self.__kernel_name}({self.__dispatch_args})"
 
     def __call_suffix(self) -> str:
+        # [FUNCTION DOC] HELPER: Returns the kernel name with its call arguments.
         return f"{self.__kernel_name}({self.__call_args})"
 
     @property
     def shape_decl(self) -> str:
+        # [FUNCTION DOC] Property: the exported C++ declaration of the compute_shape function.
         return f"TORCH_API std::vector<torch::lazy::Shape> compute_shape_{self.__decl_suffix()}"
 
     @property
     def shape_call(self) -> str:
+        # [FUNCTION DOC] Property: the C++ call expression of the lazy compute_shape function.
         return f"torch::lazy::compute_shape_{self.__call_suffix()}"
 
 
 @dataclass(frozen=True)
 class GenLazyShapeInferenceDefinition:
+    # [CLASS DOC]
+    # Immutable generator of shape inference function declarations for lazy backends.
+    # State: the backend index and the tensor class name (unused by the generator).
     backend_index: BackendIndex
     tensor_class: str
 
     @method_with_native_function
     def __call__(self, f: NativeFunction) -> list[str]:
+        # [FUNCTION DOC]
+        # Returns a one-element list with the compute_shape declaration for the function, or
+        # an empty list for structured and view_copy ops (shapes come from meta kernels).
+        # Raises an error if no kernel metadata exists.
         metadata = self.backend_index.get_kernel(f)
         if metadata is None:
             raise AssertionError(f"No kernel metadata found for {f.func.name}")
@@ -702,6 +830,11 @@ class GenLazyShapeInferenceDefinition:
 def generate_non_native_lazy_ir_nodes(
     non_native: list[dict[str, Any]], gen_lazy_ir: GenLazyIR
 ) -> list[str]:
+    # [FUNCTION DOC]
+    # Returns node class text for each non-native op description (mapping with a schema
+    # string, optional properties list and optional op kind). Default properties are shape
+    # cache, can-be-reused and lower-declaration-only, plus any listed ones; symint is
+    # assumed. Uses the given generator's gen method.
     """Generate the non-native lazy IR node classes"""
     nodes = []
     for op in non_native:

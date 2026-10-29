@@ -1,3 +1,8 @@
+# [PACKAGE DOC]
+# Destination generators of torchgen: code that renders C++ declarations, registrations,
+# lazy-tensor IR and ufunc kernels. Re-exports the lazy IR generators, the native function
+# declaration computer, the dispatch key registration generator and helpers, and the
+# ufunc CPU/CUDA computers.
 from torchgen.dest.lazy_ir import (
     generate_non_native_lazy_ir_nodes as generate_non_native_lazy_ir_nodes,
     GenLazyIR as GenLazyIR,

@@ -1,13 +1,23 @@
+# [MODULE DOC]
+# Generates the C++ body of the TorchScript lowering method for a lazy IR node. Contains a
+# single function producing text from a lazy IR schema. No import-time side effects.
 from torchgen.api.lazy import LazyArgument, LazyIrSchema
 from torchgen.api.types import OptionalCType
 
 
 def ts_lowering_body(schema: LazyIrSchema) -> str:
+    # [FUNCTION DOC]
+    # Returns C++ text that builds positional and keyword argument lists of named values
+    # from the node operands (optional lazy values guarded by a has-flag, scalars passed by
+    # name), calls the TorchScript builtin lowering, checks the output count equals the
+    # schema return count, and returns the output vector. Pure text generation.
     # for now, we just want one IR class decl and soon after also the method defs
     # and we use the functional version not out/inplace.
     emplace_arguments = []
 
     def get_value(arg: LazyArgument) -> str:
+        # [FUNCTION DOC] HELPER: Returns the C++ expression fetching the lowered operand for
+        # a lazy value argument; optional arguments yield null when their has-flag is false.
         if isinstance(arg.lazy_type, OptionalCType):
             return f"has_{arg.name} ? loctx->GetOutputOp(operand(i++)) : nullptr"
         return "loctx->GetOutputOp(operand(i++))"

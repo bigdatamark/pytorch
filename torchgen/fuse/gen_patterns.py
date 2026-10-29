@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# [MODULE DOC]
+# Script that regenerates the serialized inductor pattern-matcher files. When run as main
+# it deletes every file in the serialized pattern directory except __init__.py and
+# __pycache__, sets the environment flag requesting pattern generation, and triggers
+# joint graph lazy initialization so patterns are re-serialized. No effect on import.
 import os
 
 from torch._inductor import pattern_matcher
