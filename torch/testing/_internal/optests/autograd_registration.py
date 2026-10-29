@@ -1,4 +1,7 @@
 # mypy: ignore-errors
+# [MODULE DOC] opcheck check that an operator's autograd support is registered at an
+# autograd dispatch key rather than a backend key. Contains autograd_registration_check
+# and the helper context manager set_autograd_fallback_mode. No import-time side effects.
 
 import contextlib
 
@@ -8,6 +11,8 @@ import torch.utils._pytree as pytree
 
 @contextlib.contextmanager
 def set_autograd_fallback_mode(mode):
+    # [FUNCTION DOC] HELPER: Context manager that sets the global autograd fallback mode to
+    # mode for the body and restores the previous mode afterwards, even on error.
     prev = torch._C._get_autograd_fallback_mode()
     try:
         torch._C._set_autograd_fallback_mode(mode)
@@ -17,6 +22,13 @@ def set_autograd_fallback_mode(mode):
 
 
 def autograd_registration_check(op, args, kwargs):
+    # [FUNCTION DOC] Checks that the OpOverload op has autograd registered correctly. Picks
+    # the Autograd key for the device type of the tensor inputs (cuda preferred, then cpu,
+    # then xpu) and returns early if the op has a kernel at that key, at Autograd, or at
+    # CompositeImplicitAutograd. Otherwise runs the op with the autograd fallback set to
+    # nothing and fails if any output that is not an input requires grad. Raises
+    # AssertionError (op not an OpOverload, or the registration problem), RuntimeError
+    # (no input requires grad), NotImplementedError (other device types).
     """Check if autograd was registered correctly (for the operator).
 
     Operators should have "autograd support" registered directly to an
@@ -113,6 +125,8 @@ def autograd_registration_check(op, args, kwargs):
     inp_ids = {id(arg) for arg in flat_args}
 
     def not_an_input_and_requires_grad(tensor):
+        # [FUNCTION DOC] HELPER: True if the tensor requires grad and is not (by identity)
+        # one of the flattened call inputs.
         if not tensor.requires_grad:
             return False
         if id(tensor) in inp_ids:

@@ -1,4 +1,9 @@
 # mypy: ignore-errors
+# [MODULE DOC] opcheck check that a function run through AOTAutograd (functorch
+# compiled_function with no-op compilers) matches eager mode in outputs and gradients.
+# Contains aot_autograd_check, the forward/backward comparison helper, input cloning
+# helpers, and an assert_raises_regex context manager. Defines the module level message
+# outputs_msg. No import-time side effects.
 
 import re
 
@@ -13,6 +18,9 @@ from .make_fx import randomize
 
 
 def _clone_input_for_aot_autograd(x):
+    # [FUNCTION DOC] HELPER: Returns a clone of tensor x; a pinned cpu tensor (not a
+    # traceable wrapper subclass) gets its clone pinned too. Copies dynamo tensor
+    # attributes from x onto the clone.
     result = torch.clone(x)
     if (
         x.device.type == "cpu"
@@ -25,20 +33,33 @@ def _clone_input_for_aot_autograd(x):
 
 
 def _maybe_copy_inputs_for_aot_autograd(args, copy_inputs):
+    # [FUNCTION DOC] HELPER: If copy_inputs is true returns args with every tensor cloned
+    # (pytree map); otherwise returns args unchanged.
     if copy_inputs:
         return pytree.tree_map_only(torch.Tensor, _clone_input_for_aot_autograd, args)
     return args
 
 
 class assert_raises_regex:
+    # [CLASS DOC] Context manager asserting that the body raises exactly the given
+    # exception class with a message matching a regular expression. State: exception_cls
+    # and regex. The expected exception is suppressed on exit.
     def __init__(self, exception_cls, regex):
+        # [FUNCTION DOC] Stores the expected exception class and the regex pattern.
         self.exception_cls = exception_cls
         self.regex = regex
 
     def __enter__(self):
+        # [FUNCTION DOC] Does nothing; returns None.
         pass
 
     def __exit__(self, exc_type, exc_val, traceback):
+        # [FUNCTION DOC] Returns True (suppressing the exception) if the exception type
+        # equals exception_cls and its message matches the regex. Raises AssertionError if
+        # the message does not match, if a different exception type occurred, or if no
+        # exception occurred.
+        # KNOWN ISSUE: the type check is exact equality, so subclasses of exception_cls are
+        # reported as a wrong exception.
         if exc_type == self.exception_cls:
             msg = str(exc_val)
             if not re.search(self.regex, msg):
@@ -63,6 +84,15 @@ def aot_autograd_check(
         skip_correctness_check=False,
         disable_functionalization=False,
         copy_inputs=False):
+    # [FUNCTION DOC] Checks func called with args and kwargs behaves the same under
+    # AOTAutograd as in eager mode. Tensors are pulled out of the flattened args and the
+    # function is rewrapped to take only a list of tensors. Compiles with no-op compilers
+    # (min-cut partitioner, or default partitioner when disable_functionalization is set).
+    # check_gradients may be true, false, or "auto" (true only if some input and some
+    # output require grad). Without gradient checking, outputs are compared via
+    # assert_equals_fn unless skip_correctness_check; with it, delegates to the
+    # forwards/backwards helper (try_check_data_specialization applies only there).
+    # Raises on mismatch; both runs use a fixed seed. Returns nothing.
     """Compares func(*args, **kwargs) in eager-mode to under AOTAutograd.
 
     Compares outputs and (if check_gradients=True) gradients produced by
@@ -76,6 +106,9 @@ def aot_autograd_check(
 
     # We construct a new function that only accepts Tensors as inputs
     def func_no_tensors(args):
+        # [FUNCTION DOC] HELPER: Rebuilds the original args and kwargs by substituting the
+        # given tensor list, in order, for the tensor positions of the flattened inputs,
+        # then calls func and returns its result.
         reconstructed_flat_args = []
         args = iter(args)
         for v in flat_args:
@@ -139,9 +172,18 @@ def _test_aot_autograd_forwards_backwards_helper(
         f, compiled_f, args, assert_raises_regex_fn, assert_equals_fn,
         try_check_data_specialization, skip_correctness_check=False,
         copy_inputs=False):
+    # [FUNCTION DOC] HELPER: Compares outputs and gradients of f and its compiled version
+    # on args. If eager gradients are all None while some input is a non-leaf, expects the
+    # compiled call to fail with a "does not require grad" runtime error instead. On
+    # mismatch re-raises the assertion error type with an explanatory message. When
+    # try_check_data_specialization is set, repeats on randomized data, ignoring failures.
     # Verify grads are equal between compiled and non-compiled versions of f.
 
     def call_forwards_backwards(f, args):
+        # [FUNCTION DOC] HELPER: Runs f on args with a fixed seed, sums the absolute value
+        # of the sums of all tensor outputs, and returns the outputs together with the
+        # gradients of that scalar for the inputs requiring grad (unused allowed).
+        # Raises AssertionError if no tensor output exists.
         flat_args = pytree.arg_tree_leaves(*args)
         diff_args = [arg for arg in flat_args if isinstance(arg, torch.Tensor) and
                      arg.requires_grad]
@@ -160,6 +202,9 @@ def _test_aot_autograd_forwards_backwards_helper(
         return out, torch.autograd.grad(sm, diff_args, allow_unused=True)
 
     def check(args, ignore_failure=False):
+        # [FUNCTION DOC] HELPER: Runs the eager and compiled forward/backward on (copies of)
+        # args and compares outputs and gradients unless skip_correctness_check. If the
+        # eager run fails and ignore_failure is set, returns silently; otherwise re-raises.
         try:
             orig_args = _maybe_copy_inputs_for_aot_autograd(args, copy_inputs)
             orig_out, orig_grad = call_forwards_backwards(f, orig_args)

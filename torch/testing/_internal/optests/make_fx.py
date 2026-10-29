@@ -1,4 +1,7 @@
 # mypy: ignore-errors
+# [MODULE DOC] opcheck check that make_fx tracing of an operator or function gives the
+# same results as running it eagerly. Contains make_fx_check plus helpers for torch.Size
+# arguments and data randomization. No import-time side effects.
 
 import torch
 from torch.fx.experimental.proxy_tensor import make_fx
@@ -14,9 +17,16 @@ def make_fx_check(
     assert_close=torch.testing.assert_close,
     randomize_data=False,
 ):
+    # [FUNCTION DOC] Traces func with make_fx (given tracing_mode) and checks that running
+    # the traced graph gives the same output as running func eagerly, both with a fixed
+    # random seed. If randomize_data is set, floating point inputs are replaced by uniform
+    # random data first, and any failure of the eager run is silently ignored (returns).
+    # Raises via assert_close (with an explanatory message) on mismatch; other errors from
+    # tracing or eager execution propagate. Returns nothing.
     f, *new_args = handle_sizes_for_dynamic_shapes(func, args, kwargs)
 
     def run(f, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Runs f with the given arguments under a seeded RNG.
         return wrapper_set_seed(f, *args, **kwargs)
 
     traced_f = make_fx(f, tracing_mode=tracing_mode)(*new_args)
@@ -59,7 +69,14 @@ def make_fx_check(
 # - Unpack the size in the wrapper to get a torch.Size with dynamic shapes (in
 #   symbolic mode, a no-op otherwise)
 def handle_sizes_for_dynamic_shapes(func, args, kwargs):
+    # [FUNCTION DOC] HELPER: Finds torch.Size values in args and kwargs and, for each, makes
+    # a temporary expanded cpu tensor of that size. Returns a tuple of a wrapper function,
+    # args, kwargs, the list of (position, tensor) pairs and the mapping of name to tensor.
+    # When traced, the wrapper replaces those entries with the tensors' sizes (so shapes
+    # can become symbolic) and calls func.
     def f(args, kwargs, extra_args, extra_kwargs):
+        # [FUNCTION DOC] HELPER: Overwrites the listed positional and keyword entries in
+        # place with the size of the matching tensor, then calls func and returns its result.
         if extra_args:
             for i, t in extra_args:
                 args[i] = t.size()
@@ -82,7 +99,11 @@ def handle_sizes_for_dynamic_shapes(func, args, kwargs):
 
 
 def randomize(args):
+    # [FUNCTION DOC] HELPER: Returns args (a pytree) with every floating point tensor
+    # replaced by a detached clone filled with uniform random values in zero to one that
+    # keeps the requires_grad flag; other tensors are unchanged. Consumes global RNG.
     def transform(x):
+        # [FUNCTION DOC] HELPER: Per-tensor transform used by randomize.
         if not x.dtype.is_floating_point:
             return x
         return x.detach().clone().uniform_(0, 1).requires_grad_(x.requires_grad)

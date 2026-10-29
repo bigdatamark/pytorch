@@ -1,4 +1,10 @@
 # mypy: ignore-errors
+# [MODULE DOC] OpInfo subclasses describing Python references (implementations of existing
+# operations in terms of torch._prims). Each reference OpInfo finds an existing OpInfo by
+# name and variant and reuses that OpInfo's original constructor arguments, with overrides.
+# Contains the helper functions that find the parent and merge arguments, and four classes:
+# PythonRefInfo, ReductionPythonRefInfo, ElementwiseUnaryPythonRefInfo and
+# ElementwiseBinaryPythonRefInfo. No import-time side effects.
 
 from torch.testing._internal.opinfo.core import (
     BinaryUfuncInfo,
@@ -32,6 +38,9 @@ from torch.testing._internal.opinfo.core import (
 
 
 def _find_referenced_opinfo(referenced_name, variant_name, *, op_db=None):
+    # [FUNCTION DOC] HELPER: Searches the given op_db (default: the global op_db, imported
+    # lazily) for the OpInfo with the given name and variant test name and returns it.
+    # Returns None if no entry matches.
     """
     Finds the OpInfo with the given name that has no variant name.
     """
@@ -47,6 +56,12 @@ def _find_referenced_opinfo(referenced_name, variant_name, *, op_db=None):
 
 
 def _inherit_constructor_args(name, op, inherited, overrides):
+    # [FUNCTION DOC] HELPER: Builds the constructor keyword mapping for a reference OpInfo.
+    # Copies the inherited arguments, flattens a nested kwargs entry, drops self, class,
+    # skips and decorators entries, then applies fixed values (name, op, no aliases, no
+    # method or inplace variants, scripting unsupported), then the caller's overrides, and
+    # finally forces all autograd related support flags to false. Returns the mapping; the
+    # inputs are not mutated.
     # inherits metadata
     common_kwargs = {
         "name": name,
@@ -90,6 +105,10 @@ def _inherit_constructor_args(name, op, inherited, overrides):
 
 
 class PythonRefInfo(OpInfo):
+    # [CLASS DOC] OpInfo for a Python reference of a generic operation. Attributes:
+    # torch_opinfo_name, torch_opinfo_variant_name, torch_opinfo (the parent OpInfo found
+    # in the database) and validate_view_consistency. Remaining state is inherited from the
+    # parent's original constructor arguments.
     """
     An OpInfo for a Python reference of an OpInfo base class operation.
     """
@@ -105,6 +124,10 @@ class PythonRefInfo(OpInfo):
         validate_view_consistency=True,
         **kwargs,
     ):  # additional kwargs override kwargs inherited from the torch opinfo
+        # [FUNCTION DOC] Looks up the parent OpInfo by name and variant in op_db, records
+        # the lookup keys and the view consistency flag, merges the parent's original
+        # arguments with kwargs overrides, and initializes the base OpInfo. Raises
+        # AssertionError if the parent is not found or is not an OpInfo.
         self.torch_opinfo_name = torch_opinfo_name
         self.torch_opinfo_variant_name = torch_opinfo_variant_name
         self.torch_opinfo = _find_referenced_opinfo(
@@ -122,6 +145,11 @@ class PythonRefInfo(OpInfo):
 
 
 class ReductionPythonRefInfo(ReductionOpInfo):
+    # [CLASS DOC] OpInfo for a Python reference of a reduction operation. Same attributes
+    # as PythonRefInfo, but view consistency validation is always disabled (see the linked
+    # issue) and the parent must be a ReductionOpInfo.
+    # KNOWN ISSUE: the docstring below says elementwise unary operation, but this class is
+    # for reductions.
     """
     An OpInfo for a Python reference of an elementwise unary operation.
     """
@@ -136,6 +164,10 @@ class ReductionPythonRefInfo(ReductionOpInfo):
         torch_opinfo_variant_name="",  # the variant name for corresponding torch opinfo
         **kwargs,
     ):  # additional kwargs override kwargs inherited from the torch opinfo
+        # [FUNCTION DOC] Finds the parent ReductionOpInfo, merges its original reduction
+        # arguments with the kwargs overrides, sets validate_view_consistency to false and
+        # initializes the base class. Raises AssertionError if the parent is missing or is
+        # not a ReductionOpInfo.
         self.torch_opinfo_name = torch_opinfo_name
         self.torch_opinfo_variant_name = torch_opinfo_variant_name
         self.torch_opinfo = _find_referenced_opinfo(
@@ -156,6 +188,8 @@ class ReductionPythonRefInfo(ReductionOpInfo):
 
 
 class ElementwiseUnaryPythonRefInfo(UnaryUfuncInfo):
+    # [CLASS DOC] OpInfo for a Python reference of an elementwise unary operation. Same
+    # attributes as PythonRefInfo; the parent must be a UnaryUfuncInfo.
     """
     An OpInfo for a Python reference of an elementwise unary operation.
     """
@@ -171,6 +205,9 @@ class ElementwiseUnaryPythonRefInfo(UnaryUfuncInfo):
         validate_view_consistency=True,
         **kwargs,
     ):  # additional kwargs override kwargs inherited from the torch opinfo
+        # [FUNCTION DOC] Finds the parent UnaryUfuncInfo, merges its original unary ufunc
+        # arguments with the kwargs overrides and initializes the base class. Raises
+        # AssertionError if the parent is missing or is not a UnaryUfuncInfo.
         self.torch_opinfo_name = torch_opinfo_name
         self.torch_opinfo_variant_name = torch_opinfo_variant_name
         self.torch_opinfo = _find_referenced_opinfo(
@@ -189,6 +226,8 @@ class ElementwiseUnaryPythonRefInfo(UnaryUfuncInfo):
 
 
 class ElementwiseBinaryPythonRefInfo(BinaryUfuncInfo):
+    # [CLASS DOC] OpInfo for a Python reference of an elementwise binary operation. Same
+    # lookup attributes as PythonRefInfo; the parent must be a BinaryUfuncInfo.
     """
     An OpInfo for a Python reference of an elementwise binary operation.
     """
@@ -203,6 +242,9 @@ class ElementwiseBinaryPythonRefInfo(BinaryUfuncInfo):
         torch_opinfo_variant_name="",  # the variant name for corresponding torch opinfo
         **kwargs,
     ):  # additional kwargs override kwargs inherited from the torch opinfo
+        # [FUNCTION DOC] Finds the parent BinaryUfuncInfo, merges its original binary ufunc
+        # arguments with the kwargs overrides and initializes the base class. Raises
+        # AssertionError if the parent is missing or is not a BinaryUfuncInfo.
         self.torch_opinfo_name = torch_opinfo_name
         self.torch_opinfo_variant_name = torch_opinfo_variant_name
         self.torch_opinfo = _find_referenced_opinfo(

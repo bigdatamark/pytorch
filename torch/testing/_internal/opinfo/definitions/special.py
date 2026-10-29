@@ -1,4 +1,10 @@
 # mypy: ignore-errors
+# [MODULE DOC] OpInfo definitions for the torch.special operators (i0e, i1, i1e, ndtr,
+# polygamma, xlog1py, zeta, entr, ndtri, log_ndtr, erfcx and others). Provides sample input
+# generators, a SciPy based polygamma reference, and two lists: op_db (the torch OpInfos)
+# and python_ref_db (Python reference OpInfos, built against op_db). Import-time side
+# effect: imports scipy.special only when SciPy is available; SciPy references are None
+# otherwise.
 
 import unittest
 from functools import partial
@@ -42,6 +48,10 @@ if TEST_SCIPY:
 #       supports `exclude` argument.
 #       For more context: https://github.com/pytorch/pytorch/pull/56352#discussion_r633277617
 def sample_inputs_i0_i1(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for i0/i1 style ops: one 1-d tensor of
+    # length S and one zero-dimensional tensor. When requires_grad is set and the op is
+    # i0e, zeros are excluded from random data; otherwise, for gradient tests, an extra
+    # sample whose first element is set to zero is yielded.
     exclude_zero = requires_grad and op_info.op is torch.special.i0e
     make_arg = partial(
         make_tensor,
@@ -63,6 +73,10 @@ def sample_inputs_i0_i1(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_polygamma(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for polygamma: for every combination
+    # of shape (a 2-d S by S tensor, a scalar) and order n from one to five, yields the
+    # tensor as input with n as the single extra argument. Integer dtypes use a lower bound
+    # of one for the data.
     make_arg = partial(
         make_tensor,
         device=device,
@@ -79,6 +93,9 @@ def sample_inputs_polygamma(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def reference_polygamma(x, n):
+    # [FUNCTION DOC] SciPy reference for polygamma of order n on NumPy array x. Returns the
+    # result cast to double if x is double, otherwise to the NumPy type of torch's default
+    # dtype (working around SciPy's inconsistent output dtype). Requires SciPy.
     # WEIRD `scipy.special.polygamma` behavior
     # >>> scipy.special.polygamma(0, np.array(501, dtype=np.float32)).dtype
     # dtype('float64')
@@ -93,6 +110,9 @@ def reference_polygamma(x, n):
 
 
 def sample_inputs_entr(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for entr: a 1-d tensor of length L and
+    # a zero-dimensional tensor, with values bounded below by the op's domain start (or, for
+    # gradient tests, by zero plus the domain epsilon).
     low, _ = op_info.domain
 
     if requires_grad:
@@ -106,6 +126,8 @@ def sample_inputs_entr(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_erfcx(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for erfcx: tensors of shapes (L,),
+    # (1, 0, 3) (empty) and scalar, with values bounded below by minus five.
     for shape in ((L,), (1, 0, 3), ()):
         yield SampleInput(
             make_tensor(

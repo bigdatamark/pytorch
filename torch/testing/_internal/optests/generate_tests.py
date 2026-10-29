@@ -1,4 +1,12 @@
 # mypy: ignore-errors
+# [MODULE DOC] Machinery that auto-generates "opcheck" tests for custom operators from the
+# tests of an existing TestCase. Main contents: generate_opcheck_tests (adds one test per
+# existing test and per check), the safe_* check wrappers and ALL_TEST_UTILS registry,
+# OpCheckMode (a torch function mode that runs the checks on each intercepted operator
+# call), the FailuresDict JSON store of expected failures (xfail/skip/xsuccess), the
+# opcheck entry point for direct use, and OpCheckError. Reads the environment variable
+# PYTORCH_OPCHECK_ACCEPT to rewrite the failures file. Only defines state at import time
+# (a thread-local flag marking whether code runs inside an opcheck mode).
 
 import datetime
 import difflib
@@ -29,7 +37,11 @@ from torch.testing._internal.optests import (
 
 
 def dontGenerateOpCheckTests(reason: str):
+    # [FUNCTION DOC] Decorator factory: the returned decorator marks a test function with an
+    # attribute so generate_opcheck_tests skips it, and returns the same function. The
+    # reason is documentation only and is not stored.
     def inner(fun):
+        # [FUNCTION DOC] HELPER: Sets the skip marker attribute on fun and returns fun.
         fun._torch_dont_generate_opcheck_tests = True
         return fun
 
@@ -37,6 +49,7 @@ def dontGenerateOpCheckTests(reason: str):
 
 
 def is_abstract(tensor: torch.Tensor) -> bool:
+    # [FUNCTION DOC] HELPER: Returns True if the tensor is a meta tensor or a fake tensor.
     if tensor.is_meta:
         return True
     if torch._subclasses.fake_tensor.is_fake(tensor):
@@ -53,6 +66,10 @@ def safe_schema_check(
     rtol: float | None = None,
     atol: float | None = None,
 ) -> Any:
+    # [FUNCTION DOC] HELPER: Schema check test util. Optionally deep-copies tensor inputs,
+    # returns None without checking if any tensor is meta or fake, otherwise runs the op
+    # under SchemaCheckMode (which raises if the op violates its declared schema, e.g.
+    # undeclared mutation or aliasing) and returns the op result. rtol and atol are unused.
     if copy_inputs:
         args, kwargs = deepcopy_tensors((args, kwargs))
     if pytree.tree_any_only(torch.Tensor, is_abstract, (args, kwargs)):
@@ -71,6 +88,9 @@ def safe_autograd_registration_check(
     rtol: float | None = None,
     atol: float | None = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Autograd registration test util. Skips (returns) if any tensor
+    # is abstract or if no tensor input requires grad; otherwise runs
+    # autograd_registration_check on (optionally copied) inputs. rtol and atol are unused.
     if pytree.tree_any_only(torch.Tensor, is_abstract, (args, kwargs)):
         return
     if copy_inputs:
@@ -92,6 +112,9 @@ def safe_fake_check(
     rtol: float | None = None,
     atol: float | None = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Fake tensor test util. Returns None without checking if any
+    # tensor is abstract; otherwise runs fake_check on (optionally copied) inputs.
+    # rtol and atol are unused.
     if pytree.tree_any_only(torch.Tensor, is_abstract, (args, kwargs)):
         return None
     if copy_inputs:
@@ -109,6 +132,12 @@ def safe_aot_autograd_check(
     rtol: float | None = None,
     atol: float | None = None,
 ) -> Any:
+    # [FUNCTION DOC] HELPER: AOT dispatch test util (static or dynamic shapes per dynamic).
+    # Returns None if any tensor is abstract; otherwise runs aot_autograd_check on the op
+    # with automatic gradient checking and input copying always on (copy_inputs is
+    # ignored). Uses assert_close with the given tolerances when both are truthy.
+    # KNOWN ISSUE: the tolerances apply only if both rtol and atol are nonzero, so a
+    # zero value for either silently falls back to the default tolerances.
     # NB: the copy_inputs argument to this wrapper is ignored: safe AOT checks
     # always need to copy inputs because they run func(*args, **kwargs) multiple
     # times.
@@ -116,6 +145,7 @@ def safe_aot_autograd_check(
         return None
 
     def func(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Calls the operator with the given arguments.
         return op(*args, **kwargs)
 
     # aot_autograd_check runs func(*args, **kwargs) multiple times
@@ -138,6 +168,8 @@ def safe_aot_autograd_check(
 
 
 def deepcopy_tensors(inputs: Any) -> Any:
+    # [FUNCTION DOC] HELPER: Returns inputs (a pytree) with every tensor replaced by a
+    # dynamo-style clone; other leaves are unchanged.
     return pytree.tree_map_only(torch.Tensor, clone_input, inputs)
 
 
@@ -183,6 +215,15 @@ def generate_opcheck_tests(
     additional_decorators: dict[str, Callable] | None = None,
     test_utils: list[str] = DEFAULT_TEST_UTILS,
 ) -> None:
+    # [FUNCTION DOC] Adds new test methods to the testcase class: for every existing method
+    # whose name starts with test_ and every selected test util, a method named
+    # util-name, two underscores, original-name that runs the original under an
+    # OpCheckMode (skipping methods marked by dontGenerateOpCheckTests). Loads and
+    # validates the failures dict (default file failures_dict.json next to the caller's
+    # file; may create it when PYTORCH_OPCHECK_ACCEPT is 1). Under pytest with the
+    # opcheck_only_one mark, trims non-device parametrize marks to one value. Applies
+    # additional_decorators by generated name. Also generates tag tests. Raises
+    # RuntimeError if a generated name already exists. Mutates the testcase class.
     """Given an existing TestCase, use the existing tests to generate
     additional validation tests for custom operators.
 
@@ -237,6 +278,9 @@ def generate_opcheck_tests(
     validate_failures_dict_formatting(failures_dict_path)
 
     def construct_method(attr, prefix, tester):
+        # [FUNCTION DOC] HELPER: Creates and attaches the generated test for the existing
+        # method attr and the check named prefix (tester is the check function). Does
+        # nothing if the method is marked to be skipped. Raises RuntimeError on a name clash.
         method = getattr(testcase, attr)
         if getattr(method, "_torch_dont_generate_opcheck_tests", False):
             return
@@ -244,6 +288,8 @@ def generate_opcheck_tests(
 
         @functools.wraps(method)
         def new_method(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Runs the original test method inside an OpCheckMode for
+            # this check and returns the method's result.
             with OpCheckMode(
                 namespaces,
                 prefix,
@@ -305,8 +351,17 @@ def generate_opcheck_tests(
 
 
 def generate_tag_tests(testcase, failures_dict, additional_decorators):
+    # [FUNCTION DOC] For each operator in the failures dict adds a test named with the
+    # prefix test_pt2_compliant_tag and the mangled operator name. The test fails if the
+    # operator carries the pt2 compliant tag yet has an xfail entry (ignoring static AOT
+    # entries); it skips if the operator cannot be looked up. Applies matching entries of
+    # additional_decorators. Raises RuntimeError if the generated name already exists.
     def generate_test(qualname, definitely_not_pt2_compliant, xfailed_tests):
+        # [FUNCTION DOC] HELPER: Returns a test function for one operator qualname.
         def inner(self):
+            # [FUNCTION DOC] HELPER: Looks up the op (skips the test if not importable),
+            # returns if it lacks the compliant tag or has no xfails, otherwise raises
+            # AssertionError naming the xfailed tests.
             try:
                 op = torch._library.utils.lookup_op(qualname)
             except AttributeError as e:
@@ -362,6 +417,10 @@ TEST_OPTIONS = ("xfail", "skip", "xsuccess")
 
 
 def validate_failures_dict_formatting(failures_dict_path: str) -> None:
+    # [FUNCTION DOC] Checks that the file's text equals the canonical serialization of its
+    # loaded content. On mismatch, rewrites the file if PYTORCH_OPCHECK_ACCEPT is 1;
+    # otherwise raises RuntimeError containing a unified diff. Reads (and maybe writes)
+    # the file.
     with open(failures_dict_path) as fp:
         actual = fp.read()
     failures_dict = FailuresDict.load(failures_dict_path)
@@ -387,6 +446,14 @@ def validate_failures_dict_formatting(failures_dict_path: str) -> None:
 def validate_failures_dict_structure(
     failure_dict: "FailuresDict", test_utils: list[str], testcase: Any
 ) -> None:
+    # [FUNCTION DOC] Validates the failures dict data: every test entry must have exactly
+    # the keys comment and status, status must be one of TEST_OPTIONS, and the test name
+    # must be class-dot-method where the method begins with a selected test util name. For
+    # entries of the given testcase class, the original test name (after the util prefix
+    # and two underscores, minus any bracketed pytest suffix) must exist on the testcase.
+    # Raises RuntimeError otherwise.
+    # KNOWN ISSUE: the last error message has an unbalanced quote/bracket around the
+    # testcase name, and the name check silently passes for entries of other classes.
     """Validates the failures dict.
 
     The failure dict looks something like the following.
@@ -451,6 +518,8 @@ def validate_failures_dict_structure(
 
 
 def should_update_failures_dict() -> bool:
+    # [FUNCTION DOC] Returns True if the environment variable PYTORCH_OPCHECK_ACCEPT is set
+    # to the string 1 (meaning failures files may be created or rewritten).
     key = "PYTORCH_OPCHECK_ACCEPT"
     return key in os.environ and os.environ[key] == "1"
 
@@ -460,10 +529,21 @@ _is_inside_opcheck_mode.value = False
 
 
 def is_inside_opcheck_mode():
+    # [FUNCTION DOC] Returns the flag saying whether the calling thread is currently inside
+    # an OpCheckMode context.
+    # KNOWN ISSUE: the flag is only initialized for the importing thread; other threads
+    # raise an attribute error when reading it before it is set there.
     return _is_inside_opcheck_mode.value
 
 
 class OpCheckMode(TorchFunctionMode):
+    # [CLASS DOC] Torch function mode that intercepts calls to operators in the given
+    # namespaces, executes the call normally, and also runs one check function on deep
+    # copies of the inputs. Errors from the check are suppressed during the test and
+    # collected per operator name in seen_ops_to_errors, then compared against expected
+    # statuses (xfail, skip, xsuccess) from the failures dict when the mode exits.
+    # Entering sets the thread-local opcheck flag, disables dynamo through the
+    # environment and turns off the functorch custom op aliasing check; exit restores them.
     """
     For a given test, OpCheckMode intercepts calls to operators and runs
     test_util(op, args, kwargs) for each intercepted (op, args, kwargs).
@@ -478,6 +558,9 @@ class OpCheckMode(TorchFunctionMode):
         test_name: str,
         failures_dict_path: str,
     ):
+        # [FUNCTION DOC] Stores the configuration (namespaces to intercept, check function
+        # and its name, failures dict, running test name and failures file path) and
+        # creates an empty mapping from operator name to collected errors.
         # We will intercept calls to ops with these namespaces
         self.namespaces = namespaces
         # The test utility function. Its signature should be (op, args, kwargs) -> None.
@@ -497,6 +580,14 @@ class OpCheckMode(TorchFunctionMode):
         self.seen_ops_to_errors = {}
 
     def maybe_raise_errors_on_exit(self) -> None:
+        # [FUNCTION DOC] Reconciles collected errors with expected statuses. For operators
+        # with no errors: in accept mode records them as xsuccess, otherwise raises
+        # OpCheckError if they were expected to fail (unexpected success). For operators
+        # expected to succeed that had errors: in accept mode marks them xfail; otherwise
+        # raises OpCheckError (chained from the first stored error) with a repro command.
+        # Mutates the failures dict in accept mode. Returns nothing when all is as expected.
+        # KNOWN ISSUE: the unexpected success message lacks a separator between the file
+        # path and the text that follows it.
         # Check expected failures first
         for qualname in self.seen_ops_to_errors:
             option = self.failures_dict.get_status(qualname, self.test_name)
@@ -553,6 +644,10 @@ class OpCheckMode(TorchFunctionMode):
         ) from ex
 
     def __enter__(self, *args, **kwargs):
+        # [FUNCTION DOC] Saves then overrides global state: marks the thread as inside
+        # opcheck, sets the environment variable TORCHDYNAMO_DISABLE to 1 and turns off
+        # functorch's custom op aliasing check. Then enters the base mode and returns its
+        # result.
         self.prev_is_opcheck_mode = _is_inside_opcheck_mode.value
         self.prev_dynamo_disable = os.environ.get("TORCHDYNAMO_DISABLE", "")
         _is_inside_opcheck_mode.value = True
@@ -566,6 +661,10 @@ class OpCheckMode(TorchFunctionMode):
         return super().__enter__(*args, **kwargs)
 
     def __exit__(self, *args, **kwargs):
+        # [FUNCTION DOC] Restores the saved global state, then evaluates the collected
+        # results (maybe_raise_errors_on_exit, which may raise OpCheckError) and in accept
+        # mode saves the failures dict to disk. Always exits the base mode and returns its
+        # result.
         _is_inside_opcheck_mode.value = self.prev_is_opcheck_mode
         os.environ["TORCHDYNAMO_DISABLE"] = self.prev_dynamo_disable
         torch._functorch.config.check_custom_op_aliasing = (
@@ -580,6 +679,9 @@ class OpCheckMode(TorchFunctionMode):
         return result
 
     def run_test_util(self, op, args, kwargs):
+        # [FUNCTION DOC] Runs the configured check on op without copying inputs (the caller
+        # already copied). Silently ignores the unsupported fake tensor exception; other
+        # exceptions propagate to the caller.
         try:
             self.test_util(op, args, kwargs, copy_inputs=False)
         except torch._subclasses.fake_tensor.UnsupportedFakeTensorException:
@@ -590,6 +692,13 @@ class OpCheckMode(TorchFunctionMode):
             pass
 
     def __torch_function__(self, func, types, args=(), kwargs=None):
+        # [FUNCTION DOC] Intercepts a call. Non-operator calls, calls while tracing,
+        # scripting or compiling, and operators outside the namespaces run unchanged. An
+        # operator packet is resolved to its unique overload (RuntimeError if ambiguous).
+        # Otherwise the real call is executed on the original inputs and returned, after
+        # running the check on copies of the inputs when the expected status is xfail or
+        # xsuccess (not skip); any check error is stored for exit-time evaluation, with
+        # the arguments kept only when better repros are enabled.
         kwargs = kwargs if kwargs else {}
 
         # Only intercept calls to operators
@@ -632,6 +741,9 @@ class OpCheckMode(TorchFunctionMode):
 
 
 def should_print_better_repro() -> None:
+    # [FUNCTION DOC] Returns True if the environment variable
+    # PYTORCH_OPCHECK_PRINT_BETTER_REPRO is set to 1, else False.
+    # KNOWN ISSUE: the return annotation says None but a bool is returned.
     """If set, the tests generated by `generate_opcheck_tests` will print a
     repro command on failure.
 
@@ -659,6 +771,12 @@ def opcheck(
     rtol: float | None = None,
     atol: float | None = None,
 ) -> dict[str, str]:
+    # [FUNCTION DOC] Public entry point that runs the selected test utils (a name, a
+    # sequence of names, or ALL) on one operator call. Accepts an OpOverload, a packet with
+    # a single overload, or a CustomOpDef. rtol and atol must be given together. Returns a
+    # mapping from util name to SUCCESS or, when raise_exception is false, the caught
+    # exception. If raise_exception is true the first failure is raised as OpCheckError
+    # (chained). Raises ValueError for bad op type, bad test_utils or a lone rtol/atol.
     """See torch.library.opcheck for docstring"""
 
     if (rtol is None) ^ (atol is None):
@@ -706,6 +824,8 @@ def opcheck(
 
 
 class OpCheckError(Exception):
+    # [CLASS DOC] Exception raised when an opcheck test util fails or when expected
+    # failures do not match reality. Carries no extra state.
     pass
 
 
@@ -718,6 +838,11 @@ def generate_repro(
     save_data: bool,
     dry_run: bool = False,
 ) -> str:
+    # [FUNCTION DOC] Builds the text of a standalone script that reruns opcheck for the
+    # given test util name on the op. If save_data is true the args and kwargs are saved
+    # to a timestamped file in a temporary directory (skipped when dry_run) and the script
+    # loads them; otherwise placeholders for empty args and kwargs are emitted. Returns
+    # the script text. Side effect: may create a directory and write a file.
     if save_data:
         now = datetime.datetime.now()
         path = os.path.join(tempfile.gettempdir(), "pytorch_opcheck_safe_to_delete")
@@ -761,6 +886,9 @@ def generate_repro(
 def resolve_unique_overload_or_throw(
     op: torch._ops.OpOverloadPacket,
 ) -> torch._ops.OpOverload:
+    # [FUNCTION DOC] Returns the single overload of an operator packet (the default one if
+    # its overload name is empty). Raises RuntimeError listing the overload names if the
+    # operator has more than one (or zero) schema.
     all_schemas = torch._C._jit_get_schemas_for_operator(op._qualified_op_name)
     if len(all_schemas) != 1:
         raise RuntimeError(
@@ -790,12 +918,23 @@ DESCRIPTION = (
 
 
 class FailuresDict:
+    # [CLASS DOC] In-memory form of the failures JSON file. Attributes: path (file
+    # location) and data (mapping operator name -> test name -> entry with status and
+    # comment). A missing entry means the default status xsuccess. Key methods: load,
+    # save, get_status, set_status.
     def __init__(self, path: str, data: FailuresDictData):
+        # [FUNCTION DOC] Stores the file path and the data mapping.
         self.path = path
         self.data = data
 
     @staticmethod
     def load(path, *, create_file=False) -> "FailuresDict":
+        # [FUNCTION DOC] Reads the JSON file at path and returns a FailuresDict of its data
+        # section. An empty file gives empty data. Raises AssertionError if the data key or
+        # the expected version is missing. If create_file is true and the file is absent,
+        # intends to create it and return an empty dict.
+        # KNOWN ISSUE: the create path calls save on the class instead of the new
+        # instance, so it fails with a missing-argument error and never creates the file.
         if create_file and not os.path.exists(path):
             result = FailuresDict(path, {})
             FailuresDict.save()
@@ -819,6 +958,9 @@ class FailuresDict:
         return FailuresDict(path, dct["data"])
 
     def _save(self, to_str=False) -> str | None:
+        # [FUNCTION DOC] HELPER: Serializes description, data and version to indented,
+        # key-sorted JSON with a trailing newline. Returns the text if to_str is true;
+        # otherwise writes it to the file path and returns None.
         to_dump = {
             "_description": DESCRIPTION,
             "data": self.data,
@@ -834,9 +976,12 @@ class FailuresDict:
         return None
 
     def save(self) -> None:
+        # [FUNCTION DOC] Writes the current data to the file path (overwriting it).
         return self._save()
 
     def get_status(self, qualname: str, test_name: str) -> str:
+        # [FUNCTION DOC] Returns the status string for the operator and test, or xsuccess
+        # when either has no entry.
         if qualname not in self.data:
             return "xsuccess"
         dct = self.data[qualname]
@@ -852,6 +997,10 @@ class FailuresDict:
         *,
         comment: str | None = None,
     ):
+        # [FUNCTION DOC] Sets the status for the operator and test, creating entries as
+        # needed. Status xsuccess removes the test entry (it is the default). Otherwise
+        # stores the status and, if a comment is given, the comment (new entries start with
+        # an empty comment). Mutates in memory only; call save to persist.
         if qualname not in self.data:
             self.data[qualname] = {}
         dct = self.data[qualname]
