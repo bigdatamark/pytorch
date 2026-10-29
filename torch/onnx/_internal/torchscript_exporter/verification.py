@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Deprecated tools to check an exported ONNX model against its PyTorch source.
+# Public names: OnnxBackend (backend choice), VerificationOptions (tolerances and flags) and
+# verify (export the model, run both versions on the inputs, compare outputs). Private helpers
+# prepare inputs, flatten and convert to numpy, run the ONNX session and compare results.
+# Needs numpy; onnxruntime is imported lazily. No import-time side effects besides imports.
 """The ONNX verification module provides a set of tools to verify the correctness of ONNX models."""
 
 from __future__ import annotations
@@ -42,6 +47,9 @@ _OutputsType = Sequence[_NumericType] | Sequence
 
 
 class OnnxBackend(enum.Enum):
+    # [CLASS DOC] Enumeration of backends that can execute the exported model for verification.
+    # Members: REFERENCE (reference evaluator, not implemented), ONNX_RUNTIME_CPU and
+    # ONNX_RUNTIME_CUDA. Each value is the string used as the onnxruntime provider name.
     """Enum class for ONNX backend used for export verification.
 
     .. deprecated:: 2.7
@@ -56,6 +64,10 @@ class OnnxBackend(enum.Enum):
 
 @dataclasses.dataclass
 class VerificationOptions:
+    # [CLASS DOC] Dataclass bundling the knobs that control verification.
+    # Fields: flatten, ignore_none, check_shape, check_dtype, backend, rtol, atol,
+    # remained_onnx_input_idx (which inputs to feed ONNX) and acceptable_error_percentage
+    # (fraction in 0..1 of mismatching elements tolerated). Range checks happen at compare time.
     """Options for ONNX export verification.
 
     .. deprecated:: 2.7
@@ -98,6 +110,8 @@ class VerificationOptions:
 
 
 def _flatten_tuples(elem):
+    # [FUNCTION DOC] HELPER: Recursively flatten nested tuples into one list, in order.
+    # Only tuples are expanded; lists and other items are kept as single elements.
     flattened = []
     for t in elem:
         if isinstance(t, tuple):
@@ -108,6 +122,10 @@ def _flatten_tuples(elem):
 
 
 def _to_numpy(elem) -> list | npt.NDArray:
+    # [FUNCTION DOC] HELPER: Convert a value to numpy data, recursing into containers.
+    # Tensors are detached if needed, moved to CPU and converted; lists and tuples become lists
+    # of converted items; bool/int/float become zero-dim arrays; a mapping becomes a flat list
+    # of alternating converted keys and values; anything else is returned unchanged.
     if isinstance(elem, torch.Tensor):
         if elem.requires_grad:
             return elem.detach().cpu().numpy()
@@ -126,6 +144,8 @@ def _to_numpy(elem) -> list | npt.NDArray:
 
 
 def _inline_flatten_list(inputs, res_list) -> list:
+    # [FUNCTION DOC] HELPER: Recursively flatten nested lists/tuples, appending to res_list.
+    # Mutates and returns the supplied accumulator list; non-sequence items are appended as is.
     for i in inputs:
         res_list.append(i) if not isinstance(
             i, (list, tuple)
@@ -134,6 +154,10 @@ def _inline_flatten_list(inputs, res_list) -> list:
 
 
 def _unpack_to_numpy(values, cast_onnx_accepted=True) -> list:
+    # [FUNCTION DOC] HELPER: Unpack quantized tensors in values and convert all to numpy.
+    # Each value is expanded by the exporter's quantized-tensor unpacking utility (which may
+    # yield several tensors, optionally cast to ONNX-accepted dtypes), then converted.
+    # Returns the resulting flat list.
     value_unpacked = []
     for value in values:
         value_unpacked.extend(
@@ -143,6 +167,12 @@ def _unpack_to_numpy(values, cast_onnx_accepted=True) -> list:
 
 
 def _run_onnx(onnx_session, inputs) -> _OutputsType:
+    # [FUNCTION DOC] HELPER: Run an ONNX session on inputs and return its output list.
+    # A trailing mapping in inputs is treated as keyword inputs keyed by input name. The rest
+    # is flattened, unpacked and converted to numpy, then bound to session input names by
+    # position. Session kinds: onnxruntime (has a method listing inputs) or reference
+    # evaluator (has an input-names attribute). Raises ValueError for unknown session types,
+    # and for too many positional inputs or a positional input clashing with a keyword one.
     kw_inputs = {}
     if inputs and isinstance(inputs[-1], dict):
         kw_inputs = inputs[-1]
@@ -175,6 +205,10 @@ def _run_onnx(onnx_session, inputs) -> _OutputsType:
 def _ort_session(
     model: str | io.BytesIO, ort_providers: Sequence[str] = _ORT_PROVIDERS
 ):
+    # [FUNCTION DOC] HELPER: Create an onnxruntime inference session for a model.
+    # Args: model (file path, or an in-memory buffer whose bytes are used) and ort_providers
+    # (falls back to the CPU provider when None). Log severity is set to error level.
+    # Raises ImportError if onnxruntime is not installed. Returns the session.
     try:
         import onnxruntime  # type: ignore[import]
     except ImportError as e:
@@ -196,6 +230,9 @@ def _ort_session(
 
 
 def _onnx_backend_session(model: str | io.BytesIO, backend: OnnxBackend):
+    # [FUNCTION DOC] HELPER: Build a session for the chosen backend.
+    # ONNX Runtime CPU/CUDA backends create an onnxruntime session with the matching provider.
+    # Raises NotImplementedError for the reference backend and ValueError for unknown ones.
     if backend == OnnxBackend.REFERENCE:
         raise NotImplementedError
     elif backend in {OnnxBackend.ONNX_RUNTIME_CPU, OnnxBackend.ONNX_RUNTIME_CUDA}:
@@ -210,6 +247,14 @@ def _compare_onnx_pytorch_outputs_in_np(
     pt_outs: _OutputsType,
     options: VerificationOptions,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Compare flat lists of ONNX and PyTorch numpy outputs pairwise.
+    # Uses the torch closeness assertion with the options' tolerances, dtype check and NaN
+    # equality; when shape checking is off, outputs are broadcast together first.
+    # On mismatch with an acceptable error percentage set, computes the fraction of elements
+    # not close and only warns if within the limit; otherwise warns when an output is 8-bit
+    # quantized and re-raises. Raises AssertionError on length mismatch or unaccepted
+    # difference, ValueError if the percentage is outside 0..1.
+    # KNOWN ISSUE: a percentage of exactly 0.0 is falsy and so is treated as not set.
     if len(onnx_outs) != len(pt_outs):
         raise AssertionError(
             f"Number of outputs differ ONNX runtime: ({len(onnx_outs)}) PyTorch: ({len(pt_outs)})"
@@ -263,6 +308,10 @@ def _compare_onnx_pytorch_outputs(
     pt_outs: Any,
     options: VerificationOptions,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Flatten and convert both outputs, then compare them.
+    # PyTorch outputs are flattened (dropping None values when ignore_none is set, otherwise
+    # keeping them), unpacked to numpy without ONNX dtype casting; ONNX outputs are flattened.
+    # Delegates to the numpy comparison, which raises AssertionError or ValueError.
     """
     Compare ONNX and PyTorch outputs.
 
@@ -287,6 +336,9 @@ def _compare_onnx_pytorch_outputs(
 
 
 def _prepare_input_for_pytorch(args, kwargs):
+    # [FUNCTION DOC] HELPER: Return deep copies of args and kwargs safe to feed the PyTorch model.
+    # A lone tensor or mapping in args is wrapped into a one-item tuple; missing kwargs become
+    # an empty mapping. Copies protect against in-place operators mutating the inputs.
     """Prepare input for PyTorch model execution.
 
     Any future changes/formatting to the input before dispatching to the PyTorch
@@ -313,6 +365,10 @@ def _prepare_input_for_pytorch(args, kwargs):
 
 
 def _prepare_input_for_export(args, kwargs):
+    # [FUNCTION DOC] HELPER: Build the positional args tuple for the export call.
+    # Starts from copied args/kwargs. Keyword arguments, if any, are appended as a trailing
+    # mapping. If there are no kwargs and the last positional arg is itself a mapping, an
+    # empty mapping is appended so that the last mapping is not read as keyword inputs.
     """Prepare input for ONNX model export.
 
     Any future changes/formatting to the input before dispatching to the
@@ -339,6 +395,11 @@ def _prepare_input_for_export(args, kwargs):
 def _prepare_input_for_onnx(
     args, kwargs, remained_onnx_input_idx: Sequence[int] | None, flatten: bool
 ):
+    # [FUNCTION DOC] HELPER: Build the input list to execute the ONNX model.
+    # Starts from the export-style inputs; when flatten is set they are flattened by the
+    # TorchScript flatten utility, else a trailing empty mapping is dropped. If
+    # remained_onnx_input_idx is given, only the inputs at those indices are returned (as a
+    # list); otherwise all inputs are returned.
     """Prepare input for ONNX model execution in ONNX backend.
 
     Any future changes/formatting to the input before dispatching to the ONNX backend
@@ -366,6 +427,8 @@ def _prepare_input_for_onnx(
 
 
 def _try_clone_model(model):
+    # [FUNCTION DOC] HELPER: Deep copy a model, falling back to the original on any failure.
+    # Emits a warning (side effect) when cloning fails, since state may then be mutated.
     """Used for preserving original model in case forward mutates model states."""
     try:
         return copy.deepcopy(model)
@@ -385,6 +448,10 @@ def _compare_onnx_pytorch_model(
     additional_test_inputs: Sequence[_InputArgsType] | None,
     options: VerificationOptions,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Run the PyTorch model and the ONNX model and compare outputs.
+    # Creates one backend session, then checks the main inputs and each additional test
+    # input (given no kwargs). Each check runs a cloned PyTorch model, runs ONNX on prepared
+    # inputs and compares the results. Raises AssertionError on difference.
     """Compare outputs from ONNX model runs with outputs from PyTorch model runs.
 
     Args:
@@ -403,6 +470,8 @@ def _compare_onnx_pytorch_model(
     onnx_session = _onnx_backend_session(onnx_model_f, options.backend)
 
     def compare_onnx_pytorch_model_with_input(input_args, input_kwargs) -> None:
+        # [FUNCTION DOC] HELPER: Check one input set; run both models and compare outputs.
+        # Uses the enclosing model, session and options. Raises on mismatch.
         pt_args, pt_kwargs = _prepare_input_for_pytorch(input_args, input_kwargs)
         # TODO: remove this and treat mutating model separately. See #77679
         pt_model_copy = _try_clone_model(pt_model)
@@ -445,6 +514,13 @@ def verify(
     additional_test_inputs: Sequence[_InputArgsType] | None = None,
     options: VerificationOptions | None = None,
 ) -> None:
+    # [FUNCTION DOC] Export a model to ONNX in memory (or a temp file) and verify its outputs.
+    # Uses default options if none given. Switches the passed model to train or eval mode per
+    # the training argument (mutates it), then under no-grad exports it via the private export
+    # function (external data goes to a temporary directory removed afterwards) and compares
+    # ONNX and PyTorch outputs, using a cloned model for the PyTorch side. Returns None.
+    # Raises AssertionError if outputs differ, ValueError for invalid arguments.
+    # KNOWN ISSUE: the compare step receives only args for additional_test_inputs (no kwargs).
     """Verify model export to ONNX against original PyTorch model.
 
     .. deprecated:: 2.7

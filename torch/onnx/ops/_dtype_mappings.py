@@ -1,3 +1,7 @@
+# [MODULE DOC] HELPER: Lookup table from ONNX TensorProto dtype codes to torch dtypes.
+# Defines ONNX_DTYPE_TO_TORCH_DTYPE, a mapping from integer code to torch.dtype.
+# KNOWN ISSUE: the 4-bit codes (UINT4 and INT4) both map to uint8 (packed storage), so
+# signedness is lost; code 8 (STRING) is intentionally absent. No import-time side effects.
 import torch
 
 

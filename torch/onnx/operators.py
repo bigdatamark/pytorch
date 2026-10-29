@@ -1,3 +1,7 @@
+# [MODULE DOC] Backward-compatibility aliases for operators that help ONNX export.
+# Exposes shape_as_tensor and reshape_from_tensor_shape, both bound directly to the
+# internal ATen-backed torch functions. The public export list is empty. At import time
+# it only imports torch and creates the two aliases.
 """This file provides a location for operators that help exporting models via onnx.
 
 E.g. `shape_as_tensor` and `reshape_from_tensor_shape`

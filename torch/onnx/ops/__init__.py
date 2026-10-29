@@ -1,3 +1,9 @@
+# [PACKAGE DOC] Public API for expressing ONNX operators inside torch programs (FX graphs).
+# Exports aten_decompositions (ONNX-to-ATen decomposition table), symbolic and
+# symbolic_multi_out (create arbitrary ONNX nodes with declared output dtype and shape),
+# and rotary_embedding and attention (ONNX opset 23 ops). Implementations live in the
+# private _impl and _symbolic_impl modules; this file maps torch dtypes to ONNX codes and
+# validates arguments. Importing it has no side effects beyond importing those modules.
 """ONNX operators as native torch.fx operators.
 
 This module provides a set of functions to create ONNX operators in the FX graph
@@ -55,11 +61,17 @@ _TORCH_DTYPE_TO_ONNX_DTYPE = {
 
 
 def aten_decompositions() -> dict[torch._ops.OpOverload, Callable]:
+    # [FUNCTION DOC] Return the shared mapping from ONNX-op overloads to their ATen decomposition
+    # callables (the module-level table owned by the private implementation module).
+    # No arguments, no copy is made (callers mutating it affect global state), raises nothing.
     """Return the ONNX to ATen decomp table."""
     return _impl.ONNX_ATEN_DECOMP_TABLE
 
 
 def _parse_domain_op_type(domain_op: str) -> tuple[str, str]:
+    # [FUNCTION DOC] HELPER: Split a qualified operator name into (domain, op_type).
+    # The text is split once on the double-colon separator; with no separator the domain
+    # is the empty string (default ONNX domain) and the whole text is the op type.
     split = domain_op.split("::", 1)
     if len(split) == 1:
         domain = ""
@@ -92,6 +104,14 @@ def symbolic(
     version: int | None = None,
     metadata_props: dict[str, str] | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Create a single-output symbolic op representing any ONNX operator.
+    # Args: domain_op (domain and op name joined by a double colon), inputs (tensors or None),
+    # attrs (optional mapping of attribute name to int/float/str/bool or lists of them),
+    # dtype (torch dtype or ONNX integer code), shape, version, metadata_props.
+    # Converts a torch dtype to its ONNX code, encodes the attributes into flat parallel
+    # lists, and calls the private implementation. Returns the output tensor.
+    # Raises an error via the torch check helper for a dtype with no ONNX mapping.
+    # KNOWN ISSUE: a TODO notes the domain is not fully handled; the domain is only passed along.
     """Create a symbolic FX operator to represent an arbitrary ONNX operator.
 
     This function is used to create a symbolic operator with a single output.
@@ -193,6 +213,11 @@ def symbolic_multi_out(
     version: int | None = None,
     metadata_props: dict[str, str] | None = None,
 ) -> Sequence[torch.Tensor]:
+    # [FUNCTION DOC] Create a multi-output symbolic op representing any ONNX operator.
+    # Same as the single-output variant but takes dtypes and shapes sequences whose lengths
+    # must match; that length defines the number of outputs. Each dtype may be a torch dtype
+    # (mapped to an ONNX code) or an integer code. Returns the sequence of output tensors.
+    # Raises an error via the torch check helper on length mismatch or unsupported dtype.
     """Create a symbolic FX operator to represent an arbitrary ONNX operator with multiple outputs.
 
     You may use ``if torch.onnx.is_in_onnx_export()`` to conditionally enable the
@@ -289,6 +314,11 @@ def rotary_embedding(
     num_heads: int = 0,
     rotary_embedding_dim: int = 0,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Apply ONNX RotaryEmbedding (opset 23) to X using cosine/sine caches.
+    # Args: X (3D or 4D embeddings), cos_cache and sin_cache, optional position_ids,
+    # interleaved flag, num_heads (needed for 3D input), rotary_embedding_dim (partial rotation).
+    # Thin wrapper that forwards everything to the private opset-23 implementation.
+    # Returns a tensor shaped like X. Validation errors come from the implementation.
     """RotaryEmbedding op in ONNX.
 
     https://onnx.ai/onnx/operators/onnx__RotaryEmbedding.html
@@ -361,6 +391,12 @@ def attention(
     softcap: float = 0.0,
     softmax_precision: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] Compute ONNX Attention (opset 23): scaled dot-product attention.
+    # Args: Q, K, V (3D or 4D), optional attn_mask (bool or additive float), optional
+    # past_key and past_value caches, is_causal, kv_num_heads and q_num_heads (for 3D input),
+    # qk_matmul_output_mode, scale, softcap, softmax_precision.
+    # Thin wrapper forwarding to the private implementation. Returns a 4-tuple: output,
+    # updated key cache, updated value cache, and the QK matmul output. Errors come from it.
     """Attention op in ONNX.
 
     https://onnx.ai/onnx/operators/onnx__Attention.html

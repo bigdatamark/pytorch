@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Core of the legacy TorchScript-based ONNX exporter.
+# Provides export and the private _export pipeline: trace or script a model into a JIT graph,
+# optimize and convert it to ONNX (via symbolic functions and C++ passes), set names and
+# dynamic axes, and serialize it. Also holds deprecated context managers, symbolic function
+# registration, graph helpers and a one-time symbolic registration trigger.
+# Import-time state: module-level _params_dict (shared with C++ constant folding) and
+# global exporter settings are kept in GLOBALS. Many names are exported via __all__.
 """Functions to export models into the ONNX IR format.
 
 These models can be loaded with the ONNX library and then
@@ -91,6 +98,14 @@ _params_dict = {}  # type: ignore[var-annotated]
 @deprecated("Please set training mode before exporting the model", category=None)
 @contextlib.contextmanager
 def select_model_mode_for_export(model, mode: _C_onnx.TrainingMode):
+    # [FUNCTION DOC] Context manager that sets the model's training mode for the export duration.
+    # Args: model (module), mode (TrainingMode enum). Raises TypeError if mode is not the enum.
+    # If the model has a training flag: records it, sets global export-training state (on for
+    # TRAINING or PRESERVE-while-training, warns when the opset is below 12) and the global
+    # training mode, then calls train(True/False) for TRAINING/EVAL (PRESERVE leaves it).
+    # On exit restores the original flag unless mode is PRESERVE. Mutates global state and model.
+    # KNOWN ISSUE: the type check and state changes run on entering, but the restore is
+    # in a try block that starts only after state setup, so errors in setup skip restoration.
     """A context manager to temporarily set the training mode of ``model``
     to ``mode``, resetting it when we exit the with-block.
 
@@ -147,6 +162,10 @@ def select_model_mode_for_export(model, mode: _C_onnx.TrainingMode):
 )
 @contextlib.contextmanager
 def disable_apex_o2_state_dict_hook(model: torch.nn.Module | torch.jit.ScriptFunction):
+    # [FUNCTION DOC] Context manager that removes Apex O2 state-dict hooks while exporting.
+    # For a non-scripted module, finds hooks (by class name) in every submodule's state-dict
+    # hook table, removes them, yields, and puts them back on exit (even on error).
+    # For a scripted function nothing is changed. Mutates the modules' hook tables temporarily.
     """A context manager to temporarily disable the Apex O2 hook that returns.
 
     .. deprecated:: 2.7
@@ -184,6 +203,11 @@ def disable_apex_o2_state_dict_hook(model: torch.nn.Module | torch.jit.ScriptFun
 @deprecated("The feature will be removed. Please remove usage of this function")
 @contextlib.contextmanager
 def setup_onnx_logging(verbose: bool):
+    # [FUNCTION DOC] Context manager enabling the JIT ONNX log when verbose (or already on).
+    # Turns the global log flag on if it was on or verbose is set; on exit turns it off only
+    # if it was originally off. Side effect: toggles global C++ logging state.
+    # KNOWN ISSUE: the original-state variable holds the C++ binding function itself rather than
+    # a call result, so it is always truthy; logging is thus never turned off on exit.
     """A context manager to temporarily set the ONNX logging verbosity.
 
     .. deprecated:: 2.7
@@ -206,6 +230,9 @@ def setup_onnx_logging(verbose: bool):
 )
 @contextlib.contextmanager
 def exporter_context(model, mode: _C_onnx.TrainingMode, verbose: bool):
+    # [FUNCTION DOC] Context manager combining the training-mode, Apex-hook and logging managers.
+    # Args: model, mode (TrainingMode), verbose (bool). Enters the three managers together and
+    # yields a tuple of their results; all are undone on exit. Errors from them propagate.
     """A context manager to temporarily set the training mode of ``model``
     to ``mode``, disable the Apex O2 hook, and set the ONNX logging verbosity.
 
@@ -242,6 +269,14 @@ def export(
     export_modules_as_functions: bool | Collection[type[torch.nn.Module]] = False,
     autograd_inlining: bool = True,
 ) -> None:
+    # [FUNCTION DOC] Public entry point: export a model to an ONNX file via the TorchScript path.
+    # Args: model, args (tuple or single tensor), f (output path), keyword-only options for
+    # kwargs, params, verbosity, training mode, names, operator export type, opset, constant
+    # folding, dynamic axes, initializer handling, custom opsets, module-as-function export
+    # and autograd inlining. Emits deprecation warnings for non-default operator export type
+    # or training mode TRAINING. A tensor args is wrapped in a tuple and kwargs is appended
+    # as a trailing mapping, then the private _export does the work. Returns None.
+    # Raises exporter errors (checker, unsupported operator) from the pipeline.
     r"""Exports a model into ONNX format.
 
     If ``model`` is not a :class:`torch.jit.ScriptModule` nor a
@@ -570,6 +605,9 @@ def export(
 
 
 def _is_constant_tensor_list(node) -> bool | None:
+    # [FUNCTION DOC] HELPER: Tell whether a graph node is a constant holding a tensor list.
+    # True when the node is a constant whose output type is a list of tensors or of optional
+    # tensors; False for non-constants. Falls through returning None for other constants.
     if node.kind() != "prim::Constant":
         return False
     output_type = node.output().type()
@@ -584,6 +622,10 @@ def _is_constant_tensor_list(node) -> bool | None:
 
 
 def _split_tensor_list_constants(g, block) -> None:
+    # [FUNCTION DOC] HELPER: Replace tensor-list constants with a list construction of constants.
+    # Recurses into sub-blocks of every node of the block. For each constant tensor-list node,
+    # inserts one constant per element before it, builds a list-construct node from them,
+    # copies metadata, and redirects all uses of the old output. Mutates the graph in place.
     for node in block.nodes():
         for subblock in node.blocks():
             _split_tensor_list_constants(g, subblock)
@@ -615,6 +657,14 @@ def _optimize_graph(
     input_names=None,
     module=None,
 ):
+    # [FUNCTION DOC] HELPER: Run the JIT-graph optimization and ONNX conversion pass pipeline.
+    # Args: graph, operator_export_type, flag to skip constant propagation, fixed_batch_size,
+    # params_dict (defaults to empty), dynamic_axes, input_names, module. Inlines calls,
+    # simplifies (constant prop, dead code, CSE, peephole, addmm fusion), prepares division and
+    # quantized weights, erases number types, optionally sets dynamic input shapes, converts to
+    # ONNX nodes, runs scalar-type analysis and ONNX peephole, then shape/type inference
+    # (a RuntimeError from inference is ignored). Returns the resulting graph; mutates global
+    # quantized-op state. Not a valid JIT graph afterwards.
     if params_dict is None:
         params_dict = {}
 
@@ -721,6 +771,10 @@ def _optimize_graph(
 
 
 def warn_on_static_input_change(input_states) -> None:
+    # [FUNCTION DOC] Warn when dictionary or string inputs changed during tracing.
+    # Arg: input_states, a pair of (original inputs, inputs after tracing). Compares item by
+    # item: for mappings, warns if the key lists differ; for strings, warns if the value differs.
+    # Only emits warnings; returns None.
     """Warns that changes to input dictionaries and strings won't take effect in the traced ONNX graph.
 
     We accept dictionaries and strings as ONNX inputs, but they should be only for
@@ -750,6 +804,8 @@ def warn_on_static_input_change(input_states) -> None:
 
 
 def _resolve_args_by_export_type(arg_name, arg_value, operator_export_type):
+    # [FUNCTION DOC] HELPER: Placeholder hook for per-export-type overrides; returns arg_value.
+    # The name and export type are unused, so every argument passes through unchanged.
     """Resolves the arguments that are ignored when export_type != operator_export_type.ONNX."""
     return arg_value
 
@@ -759,6 +815,10 @@ def _decide_keep_init_as_input(
     operator_export_type: _C_onnx.OperatorExportTypes,
     opset_version: int,
 ):
+    # [FUNCTION DOC] HELPER: Decide whether initializers are also listed as graph inputs.
+    # Opset below 9: always True (warns if the caller asked for False). Otherwise an explicit
+    # setting wins; when unset it is False for the plain ONNX export type and True for others.
+    # KNOWN ISSUE: the warning text is missing spaces between concatenated string pieces.
     """Decides whether the initializers in the graph should be listed as ONNX graph inputs.
 
     This method encapsulates the logic to decide whether the initializers in the graph
@@ -799,12 +859,16 @@ def _decide_keep_init_as_input(
 
 
 def _decide_add_node_names(add_node_names, operator_export_type):
+    # [FUNCTION DOC] HELPER: Return the add_node_names setting (currently passed through as is).
     return _resolve_args_by_export_type(
         "add_node_names", add_node_names, operator_export_type
     )
 
 
 def _decide_constant_folding(do_constant_folding, operator_export_type, training):
+    # [FUNCTION DOC] HELPER: Return the effective constant-folding flag, warning if risky.
+    # Warns when folding is on while the training mode is set and not EVAL, because folding
+    # mutates parameters. The flag itself is returned unchanged.
     do_constant_folding = _resolve_args_by_export_type(
         "do_constant_folding", do_constant_folding, operator_export_type
     )
@@ -824,6 +888,9 @@ def _decide_constant_folding(do_constant_folding, operator_export_type, training
 
 
 def _signature(model) -> inspect.Signature:
+    # [FUNCTION DOC] HELPER: Return the call signature of the model's forward method.
+    # Uses the forward attribute when present, else the model itself. Raises ValueError if
+    # the target is not callable.
     should_be_callable = getattr(model, "forward", model)
     if callable(should_be_callable):
         return inspect.signature(should_be_callable)
@@ -831,6 +898,11 @@ def _signature(model) -> inspect.Signature:
 
 
 def _decide_input_format(model, args):
+    # [FUNCTION DOC] HELPER: Expand a trailing keyword mapping in args into positional values.
+    # Uses the forward signature: keeps the positional args, then for each remaining parameter
+    # in order appends the mapping's value if present, else its default if it has one.
+    # Returns args as a list if given a list, else a tuple. On a missing signature, no args,
+    # or any other failure it warns and returns the args unchanged.
     try:
         sig = _signature(model)
     except ValueError as e:
@@ -869,6 +941,10 @@ def _decide_input_format(model, args):
 
 
 def _trace(func, args, operator_export_type, return_outs=False):
+    # [FUNCTION DOC] HELPER: Trace a function into a JIT graph and optimize it for ONNX.
+    # A single tensor args is wrapped in a tuple. Runs the tracer, warns about changed static
+    # inputs, optimizes the graph. Returns the graph, or (graph, traced outputs) when
+    # return_outs is true. Runs the function once (side effects of func apply).
     # Special case for common case of passing a single Tensor
     if isinstance(args, torch.Tensor):
         args = (args,)
@@ -889,6 +965,10 @@ def _trace(func, args, operator_export_type, return_outs=False):
 
 
 def _trace_and_get_graph_from_model(model, args):
+    # [FUNCTION DOC] HELPER: Trace a model with autocast caching disabled; return (graph, outputs).
+    # Temporarily turns off the autocast cache (restored afterwards, though not on error), runs
+    # the tracer, warns about changed static inputs, and checks the model's state_dict keys are
+    # unchanged. Raises RuntimeError if they changed. Runs the model once.
     # A basic sanity check: make sure the state_dict keys are the same
     # before and after running the model.  Fail fast!
     orig_state_dict_keys = torch.jit._unique_state_dict(model).keys()
@@ -919,6 +999,10 @@ def _trace_and_get_graph_from_model(model, args):
 
 
 def _get_param_count_list(method_graph, args_params):
+    # [FUNCTION DOC] HELPER: Compute how many flat values each graph input consumes.
+    # Pairs graph inputs with args_params. A packed-parameters input counts the number of
+    # flattened tensors in its argument; any other input counts 1 if its argument is not None,
+    # else 0 (stored as a boolean). Returns the list.
     param_count_list = []
     for input_, arg_params_ in zip(method_graph.inputs(), args_params):
         if "PackedParams" in str(input_.type()):
@@ -931,9 +1015,14 @@ def _get_param_count_list(method_graph, args_params):
 
 
 def _check_flatten_did_not_remove(original, jit_flattened) -> None:
+    # [FUNCTION DOC] HELPER: Verify that JIT flattening did not drop any None values.
+    # Fully flattens the original (lists, tuples, mapping values) and compares counts with the
+    # JIT-flattened result. Raises AssertionError if the flattened one is longer, and
+    # ValueError if None values were dropped.
     """torch.jit._flatten removes None. Check if it did so in this case."""
 
     def flatten(x):
+        # [FUNCTION DOC] HELPER: Generator yielding leaves of nested lists, tuples and mappings.
         if isinstance(x, (list, tuple)):
             for inner in x:
                 yield from flatten(inner)
@@ -958,6 +1047,12 @@ def _check_flatten_did_not_remove(original, jit_flattened) -> None:
 def _create_jit_graph(
     model: torch.nn.Module | torch.jit.ScriptFunction, args: Sequence[Any]
 ) -> tuple[_C.Graph, list[_C.IValue], Any | None, _C.ScriptModule | None]:
+    # [FUNCTION DOC] HELPER: Obtain a JIT graph for a model, script or traced.
+    # Returns (graph, params, traced outputs or None, frozen module or None).
+    # Script module: flattens args (no None allowed), substitutes functions, freezes the module
+    # keeping parameters, and assigns input shapes. Script function: same without freezing.
+    # Other modules: traces the model and uses the state dict values as params.
+    # Raises RuntimeError if a script module has no script forward, ValueError for None args.
     if isinstance(model, (torch.jit.ScriptFunction, torch.jit.ScriptModule)):
         flattened_args = tuple(torch.jit._flatten(tuple(args))[0])
         _check_flatten_did_not_remove(args, flattened_args)
@@ -1007,6 +1102,11 @@ def _create_jit_graph(
 
 
 def _get_named_param_dict(graph, params):
+    # [FUNCTION DOC] HELPER: Map parameter names to values using the graph's trailing inputs.
+    # The last len(params) graph inputs are taken as parameters; their debug names are zipped
+    # with params in order. Returns a new mapping of name to value.
+    # KNOWN ISSUE: the local result is named like the module-level shared params dict but is
+    # a different object, so the shared module-level one is not updated here.
     input_and_param_names = [val.debugName() for val in graph.inputs()]
     param_names = input_and_param_names[len(input_and_param_names) - len(params) :]
     _params_dict = dict(zip(param_names, params))
@@ -1014,6 +1114,11 @@ def _get_named_param_dict(graph, params):
 
 
 def _get_example_outputs(model, args):
+    # [FUNCTION DOC] HELPER: Run the model once on copied args and return outputs as a sequence.
+    # A trailing mapping in args is used as keyword arguments. A single non-tuple output is
+    # wrapped in a one-item tuple.
+    # KNOWN ISSUE: a list output is wrapped in a one-item list (not flattened into a tuple),
+    # unlike other outputs, so the caller sees the whole list as one item.
     input_args = copy.deepcopy(args)
     input_kwargs = {}
     if input_args and isinstance(input_args[-1], dict):
@@ -1038,6 +1143,11 @@ _qtype_vtype_map = {
 
 
 def unpack_quantized_tensor(value, cast_onnx_accepted=True):
+    # [FUNCTION DOC] Split a quantized tensor into (integer values, scale, zero point).
+    # For a tensor with a supported quantized dtype: dequantizes, divides by the scale, adds
+    # the zero point and casts to the matching plain integer dtype. The scale is a double
+    # (or float32) and the zero point is int64 (or the value dtype) depending on
+    # cast_onnx_accepted. Any other value is returned as a one-item tuple.
     if isinstance(value, torch.Tensor) and value.dtype in _qtype_vtype_map:
         q_value_dequantize = value.dequantize()
         q_scale = (
@@ -1058,6 +1168,9 @@ def unpack_quantized_tensor(value, cast_onnx_accepted=True):
 
 
 def _pre_trace_quant_model(model, args):
+    # [FUNCTION DOC] HELPER: Trace the model if it or its inputs are quantized, else return it.
+    # Quantized means any submodule has packed params or any arg reports being quantized.
+    # In that case returns the traced module (runs the model once); otherwise the same model.
     r"""Returns `torch.jit.trace(model, args)` if model is quantized. Otherwise do nothing and return
     original model.
 
@@ -1092,6 +1205,14 @@ def _model_to_graph(
     | Any
     | None,
 ]:
+    # [FUNCTION DOC] HELPER: Convert a model and example inputs into an optimized ONNX-node graph.
+    # Steps: wrap scalar/tensor args, pre-trace quantized models, build the JIT graph, name
+    # the params, optimize (logging the graph on failure and re-raising), assign output
+    # shapes (from example outputs for scripts, from traced outputs otherwise, skipped for
+    # quantized outputs), set input/output names, optionally constant-fold (peephole first in
+    # eval mode, if opset allows), run shape inference (RuntimeError ignored), drop unused
+    # items, cast constants for opset below 9, filter non-tensor params and give friendly names.
+    # Returns (graph, params mapping, traced outputs or None). Reads global exporter settings.
     """Converts model into an ONNX graph.
 
     Returns:
@@ -1216,6 +1337,13 @@ def unconvertible_ops(
     training: _C_onnx.TrainingMode = _C_onnx.TrainingMode.EVAL,
     opset_version: int | None = None,
 ) -> tuple[_C.Graph, list[str]]:
+    # [FUNCTION DOC] Deprecated: list graph ops with no registered symbolic function.
+    # Args: model, args, training mode, opset (default if None). Sets the global opset, builds
+    # a mostly clean JIT graph inside the exporter context (inline, remove in-place ops, erase
+    # number types, dead code removal) without converting ops. Ops with onnx or prim namespaces
+    # count as supported; others are unsupported if not registered for the opset (trailing
+    # underscore ignored). Returns (graph, list of op kind names). Raises OnnxExporterError if
+    # graph generation fails. Side effect: mutates global opset setting.
     """Returns an approximated list of all ops that are not yet supported by :mod:`torch.onnx`.
 
     .. deprecated:: 2.5
@@ -1285,13 +1413,25 @@ def _setup_trace_module_map(
     model: torch.nn.Module | torch.jit.ScriptModule,
     export_modules_as_functions: bool | Collection[type[torch.nn.Module]],
 ) -> set[str]:
+    # [FUNCTION DOC] HELPER: Prepare module scope tracking; return type names to export.
+    # Builds a mapping from each submodule to a full scope name and stores it in the global
+    # trace module map. Chooses type names: all modules if the flag is true, the given set of
+    # module types if a non-empty set (raises RuntimeError for a non-type entry), else none.
+    # If any type names result, registers per-module forward hooks to record attributes.
+    # Side effects: sets global tracing state and adds hooks to all submodules.
     def __register_attribute_hook() -> None:
+        # [FUNCTION DOC] HELPER: Add hooks to every submodule that record attributes while tracing.
+        # The pre-hook stashes the module's annotated attributes on the module; the post-hook
+        # (only while tracing) passes them to the tracer's scope records and removes the stash.
         attr_name = "_onnx_attrs"
 
         def _track_module_attributes_forward_pre_hook(module, input) -> None:
+            # [FUNCTION DOC] HELPER: Forward pre-hook; stash the module's attributes on it.
             setattr(module, attr_name, _get_module_attributes(module))
 
         def _track_module_attributes_forward_hook(module, input, output) -> None:
+            # [FUNCTION DOC] HELPER: Forward hook; give stashed attributes to the tracer.
+            # Does nothing when no tracing is active.
             tracing_state = _C._get_tracing_state()
             if not tracing_state:
                 return
@@ -1309,6 +1449,9 @@ def _setup_trace_module_map(
             m.register_forward_pre_hook(_track_module_attributes_forward_pre_hook)
 
     def _unqualified_variable_name(qualified_name: str) -> str:
+        # [FUNCTION DOC] HELPER: Strip a dotted name to its last non-numeric part and what follows.
+        # Walks the dot-separated parts from the end; returns from the first non-numeric
+        # part onward, or the original name if all parts are numeric.
         """
         Parse qualified variable name and return the unqualified version.
 
@@ -1339,6 +1482,7 @@ def _setup_trace_module_map(
     elif isinstance(export_modules_as_functions, set) and export_modules_as_functions:
 
         def _find_typename(v):
+            # [FUNCTION DOC] HELPER: Return a class's qualified type name; else raise RuntimeError.
             if isinstance(v, type):
                 return torch.typename(v)
             else:
@@ -1359,11 +1503,15 @@ def _setup_trace_module_map(
 
 
 def _reset_trace_module_map() -> None:
+    # [FUNCTION DOC] HELPER: Clear the global trace module map and the C++ scope records.
     torch.jit._trace._trace_module_map = None
     _C._jit_pass_onnx_clear_scope_records()
 
 
 def _get_module_attributes(module):
+    # [FUNCTION DOC] HELPER: Collect a module's class-annotated attributes as a name-value mapping.
+    # Uses the type hints of the module's class minus those of the base module class. Names
+    # whose value cannot be read (attribute error) are skipped with a debug log message.
     annotations = typing.get_type_hints(type(module))
     base_m_annotations = typing.get_type_hints(torch.nn.Module)
     [annotations.pop(k, None) for k in base_m_annotations]
@@ -1388,6 +1536,8 @@ def _get_module_attributes(module):
 
 
 def _trigger_symbolic_function_registration() -> None:
+    # [FUNCTION DOC] HELPER: Import every symbolic opset module (7 to 20) to register them.
+    # Side effect: the imports register symbolic functions in the global registry.
     """Trigger the registration of symbolic functions for all supported opsets."""
 
     from torch.onnx._internal.torchscript_exporter import (  # noqa: F401
@@ -1430,6 +1580,18 @@ def _export(
     export_modules_as_functions: Any = False,
     autograd_inlining=True,
 ):
+    # [FUNCTION DOC] HELPER: Main export pipeline writing the ONNX model; returns traced outputs.
+    # Registers symbolic functions, rejects data-parallel models (ValueError), sets global
+    # shape-inference, opset and export-type state, warns above the max supported opset, and
+    # rejects module-as-function export below opset 15 (ValueError). Inside the exporter
+    # context: decides initializer/name/folding options, validates dynamic axes, converts the
+    # model to a graph, optionally extracts functions and dedupes initializers, serializes
+    # with C++ (with or without params), adds onnxscript functions and writes the file/stream.
+    # Always resets in-export state, autograd inlining and the trace module map afterwards.
+    # Raises AssertionError if already exporting. The export_type argument is unused.
+    # KNOWN ISSUE: the saved previous autograd-inlining value is assigned inside the try block,
+    # so an early failure would make the cleanup raise a NameError. The max-opset warning
+    # text has a stray period ("not supported. by").
     if GLOBALS.in_onnx_export is not False:
         raise AssertionError("GLOBALS.in_onnx_export must be False")
 
@@ -1601,6 +1763,10 @@ def _export(
 
 
 def _apply_friendly_debug_names(graph, params) -> None:
+    # [FUNCTION DOC] HELPER: Rename node inputs that only have numeric default names.
+    # For each node input whose debug name equals its unique id, sets a name made of the node
+    # kind and id, and re-keys the params mapping if the old name was a parameter.
+    # Mutates the graph and the params mapping in place.
     for n in graph.nodes():
         for v in n.inputs():
             old_name = v.debugName()
@@ -1613,7 +1779,13 @@ def _apply_friendly_debug_names(graph, params) -> None:
 
 
 def _set_input_and_output_names(graph, input_names, output_names) -> None:
+    # [FUNCTION DOC] HELPER: Apply user-provided input and output names to the graph in order.
+    # Either list may be None (skipped). Mutates the graph's value debug names.
     def set_names(node_list, name_list, descriptor) -> None:
+        # [FUNCTION DOC] HELPER: Name values in order; descriptor is "input" or "output".
+        # Raises RuntimeError if more names than values. For outputs, a value already named
+        # earlier in this call (duplicate output) gets an identity node inserted after it, and
+        # the graph return is rewired to the new value so each output has a distinct name.
         if name_list is None:
             return
         if len(name_list) > len(node_list):
@@ -1644,6 +1816,10 @@ def _set_input_and_output_names(graph, input_names, output_names) -> None:
 
 
 def _run_symbolic_method(g, op_name, symbolic_fn, args):
+    # [FUNCTION DOC] HELPER: Call a symbolic method on behalf of C++ with a fresh graph context.
+    # Args: g (graph), op_name, symbolic_fn, args. Builds a context on the graph's block using
+    # the global opset and shared params dict, then calls symbolic_fn with it and args and
+    # returns the result. A TypeError gets the op name appended to its message and is re-raised.
     r"""
     This trampoline function gets invoked for every symbolic method
     call from C++.
@@ -1669,20 +1845,26 @@ def _run_symbolic_method(g, op_name, symbolic_fn, args):
 
 
 def _add_block(node: _C.Node) -> _C.Block:
+    # [FUNCTION DOC] HELPER: Add and return a new empty sub-block on the node.
     return node.addBlock()
 
 
 def _add_input_to_block(block: _C.Block):
+    # [FUNCTION DOC] HELPER: Add a new input to the block and return the created value.
     return block.addInputToBlock()  # type: ignore[attr-defined]
 
 
 def _add_output_to_block(block: _C.Block, value: _C.Value) -> int:
+    # [FUNCTION DOC] HELPER: Register value as a block output and return its output index.
     return block.registerOutput(value)
 
 
 def _should_aten_fallback(
     name: str, opset_version: int, operator_export_type: _C_onnx.OperatorExportTypes
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Decide whether an op should be exported as a generic ATen op.
+    # False for names outside the aten namespace. True for the ONNX_ATEN export type, or for
+    # ONNX_ATEN_FALLBACK when no symbolic function is registered for the op at that opset.
     # For all builds, if domain=="aten" and operator_export_type==ONNX_ATEN,
     #   an aten::ATen operator is created regardless of symbolics existence
 
@@ -1702,6 +1884,8 @@ def _should_aten_fallback(
 
 
 def _get_aten_op_overload_name(n: _C.Node) -> str:
+    # [FUNCTION DOC] HELPER: Return the overload name of an ATen node from its schema string.
+    # Returns an empty string if the node's schema is not an aten schema.
     # Returns `overload_name` attribute to ATen ops
     schema = n.schema()
     if not schema.startswith("aten::"):
@@ -1719,6 +1903,14 @@ def _run_symbolic_function(
     new_nodes: list[_C.Node],
     operator_export_type=_C_onnx.OperatorExportTypes.ONNX,
 ) -> _C.Value | Sequence[_C.Value | None] | None:
+    # [FUNCTION DOC] HELPER: Convert one JIT node to ONNX via its symbolic function (from C++).
+    # Strips a trailing underscore (in-place variant) from the node kind, splits namespace and
+    # op name, and builds a graph context. Paths: ATen fallback per export type (emits a generic
+    # ATen op with typed attrs); registered symbolic function for the opset (called with inputs
+    # and attrs); onnx namespace nodes are cloned as ONNX ops; otherwise raises
+    # UnsupportedOperatorError with the minimum supported opset. On RuntimeError: returns None
+    # for the fallthrough export type, emits an ATen op for ATEN_FALLBACK, else re-raises.
+    # TypeError gets the op name appended to its message. Returns a value, values, or None.
     """Runs a symbolic function.
 
     The function is used in C++ to export the node to ONNX.
@@ -1824,6 +2016,9 @@ def _run_symbolic_function(
 
 
 def _verify_custom_op_name(symbolic_name: str) -> None:
+    # [FUNCTION DOC] HELPER: Validate a custom operator name of the form domain::name.
+    # Raises OnnxExporterError if it does not match the pattern, and ValueError if the domain
+    # is the reserved onnx domain.
     if not re.match(r"^[a-zA-Z0-9-_]+::[a-zA-Z-_]+[a-zA-Z0-9-_]*$", symbolic_name):
         raise errors.OnnxExporterError(
             f"Failed to register operator {symbolic_name}. "
@@ -1844,6 +2039,9 @@ def register_custom_op_symbolic(
     symbolic_fn: Callable,
     opset_version: int,
 ) -> None:
+    # [FUNCTION DOC] Register symbolic_fn as the ONNX symbolic for a custom op at an opset.
+    # A name starting with a double colon gets the aten domain prefix. The name is validated
+    # (raises OnnxExporterError or ValueError), then registered in the global registry.
     """Registers a symbolic function for a custom operator.
 
     When the user registers symbolic for custom/contrib ops,
@@ -1870,6 +2068,8 @@ def register_custom_op_symbolic(
 
 
 def unregister_custom_op_symbolic(symbolic_name: str, opset_version: int) -> None:
+    # [FUNCTION DOC] Remove the registered symbolic for a custom op at an opset.
+    # Same name normalization and validation as registration; mutates the global registry.
     """Unregisters ``symbolic_name``.
 
     See "Custom Operators" in the module documentation for an example usage.
@@ -1888,6 +2088,12 @@ def unregister_custom_op_symbolic(symbolic_name: str, opset_version: int) -> Non
 
 
 def _validate_dynamic_axes(dynamic_axes, model, input_names, output_names) -> None:
+    # [FUNCTION DOC] HELPER: Validate dynamic_axes; turn list values into name mappings in place.
+    # Does nothing if empty. Valid names are the given input/output names (or the script
+    # graph's, if none given). Warns for keys that are not valid names. A list value is
+    # converted to a mapping from axis index to a generated name, with a warning (and another
+    # for duplicate indices); raises ValueError for non-integer indices. Mutates dynamic_axes.
+    # KNOWN ISSUE: the generated-name warning text is missing a space after its first sentence.
     """Ensures dynamic axes argument follows the expected format."""
     if len(dynamic_axes) == 0:
         return
@@ -1935,6 +2141,7 @@ def _validate_dynamic_axes(dynamic_axes, model, input_names, output_names) -> No
 
 
 def model_signature(model: torch.nn.Module | Callable) -> inspect.Signature:
+    # [FUNCTION DOC] Return the call signature of a module's forward method, or of a callable.
     return inspect.signature(
         model.forward if isinstance(model, torch.nn.Module) else model
     )
