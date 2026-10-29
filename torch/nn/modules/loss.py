@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Defines the loss function modules of torch.nn (L1Loss, NLLLoss, CrossEntropyLoss,
+# BCELoss, CTCLoss, triplet and margin losses, and others) plus private base classes
+# _Loss and _WeightedLoss. Each module stores configuration (reduction, weights,
+# margins) and its forward delegates to the matching function in torch.nn.functional.
+# Exports the public names via __all__. No import-time side effects beyond definitions.
 import math
 from collections.abc import Callable
 from typing_extensions import deprecated
@@ -40,9 +45,16 @@ __all__ = [
 
 
 class _Loss(Module):
+    # [CLASS DOC] HELPER: Base class for loss modules. Holds the string attribute reduction (none,
+    # mean, or sum) that subclasses forward to their functional loss. Invariant:
+    # reduction is always set after construction.
     reduction: str
 
     def __init__(self, size_average=None, reduce=None, reduction: str = "mean") -> None:
+        # [FUNCTION DOC] HELPER: Stores reduction. If either deprecated size_average or reduce is given
+        # (not None), the reduction string is derived from them via the legacy
+        # conversion helper, overriding the reduction argument; otherwise reduction is
+        # used as given. No validation of the string here.
         super().__init__()
         if size_average is not None or reduce is not None:
             self.reduction: str = _Reduction.legacy_get_string(size_average, reduce)
@@ -51,6 +63,8 @@ class _Loss(Module):
 
 
 class _WeightedLoss(_Loss):
+    # [CLASS DOC] HELPER: Base class for losses with an optional per-class weight. Stores weight as
+    # a registered buffer (or None) on top of the reduction string from _Loss.
     def __init__(
         self,
         weight: Tensor | None = None,
@@ -58,12 +72,18 @@ class _WeightedLoss(_Loss):
         reduce=None,
         reduction: str = "mean",
     ) -> None:
+        # [FUNCTION DOC] HELPER: Calls the base constructor with the reduction settings and registers
+        # weight (tensor or None) as a buffer named weight so it moves with the module
+        # device and is saved in state.
         super().__init__(size_average, reduce, reduction)
         self.register_buffer("weight", weight)
         self.weight: Tensor | None
 
 
 class L1Loss(_Loss):
+    # [CLASS DOC] Module computing the mean absolute error (L1 distance) between input and target
+    # elementwise, reduced per the reduction setting. No parameters; the only state is
+    # reduction.
     r"""Creates a criterion that measures the mean absolute error (MAE) between each element in
     the input :math:`x` and target :math:`y`.
 
@@ -127,6 +147,10 @@ class L1Loss(_Loss):
     __constants__ = ["reduction"]
 
     def forward(self, input: Tensor, target: Tensor) -> Tensor:
+        # [FUNCTION DOC] Forward pass. Takes input and target tensors and delegates to the functional
+        # l1_loss, passing the stored reduction. Returns the loss tensor (scalar for
+        # mean/sum reduction, per-element otherwise). No side effects; errors come from
+        # the functional call.
         """
         Runs the forward pass.
         """
@@ -134,6 +158,9 @@ class L1Loss(_Loss):
 
 
 class NLLLoss(_WeightedLoss):
+    # [CLASS DOC] Negative log likelihood loss for classification. Expects log-probabilities as
+    # input and class indices as target. State: optional class weight buffer,
+    # ignore_index (targets with this index are skipped), and reduction.
     r"""The negative log likelihood loss. It is useful to train a classification
     problem with `C` classes.
 
@@ -250,10 +277,16 @@ class NLLLoss(_WeightedLoss):
         reduce=None,
         reduction: str = "mean",
     ) -> None:
+        # [FUNCTION DOC] Stores the optional class weight (buffer), ignore_index (default -100) and
+        # reduction (with legacy size_average/reduce handling via the base classes).
         super().__init__(weight, size_average, reduce, reduction)
         self.ignore_index = ignore_index
 
     def forward(self, input: Tensor, target: Tensor) -> Tensor:
+        # [FUNCTION DOC] Forward pass. Takes log-probability input and class-index target and delegates
+        # to the functional nll_loss, passing the stored reduction, the class weight,
+        # and ignore_index. Returns the loss tensor (scalar for mean/sum reduction, per-
+        # element otherwise). No side effects; errors come from the functional call.
         """
         Runs the forward pass.
         """
@@ -273,6 +306,8 @@ class NLLLoss(_WeightedLoss):
     category=FutureWarning,
 )
 class NLLLoss2d(NLLLoss):
+    # [CLASS DOC] Deprecated alias of NLLLoss (decorated to emit a FutureWarning when used). Behaves
+    # identically to NLLLoss; kept for backward compatibility.
     def __init__(
         self,
         weight: Tensor | None = None,
@@ -281,10 +316,15 @@ class NLLLoss2d(NLLLoss):
         reduce=None,
         reduction: str = "mean",
     ) -> None:
+        # [FUNCTION DOC] Forwards all arguments unchanged to the NLLLoss constructor. Emitting the
+        # deprecation warning is done by the class decorator, not here.
         super().__init__(weight, size_average, ignore_index, reduce, reduction)
 
 
 class PoissonNLLLoss(_Loss):
+    # [CLASS DOC] Negative log likelihood loss assuming a Poisson distribution for the target.
+    # State: log_input flag (input is a log-rate or a rate), full flag (add the Stirling
+    # approximation term), eps (numerical guard), and reduction.
     r"""Negative log likelihood loss with Poisson distribution of target.
 
     The loss can be described as:
@@ -355,12 +395,18 @@ class PoissonNLLLoss(_Loss):
         reduce=None,
         reduction: str = "mean",
     ) -> None:
+        # [FUNCTION DOC] Stores log_input (default true), full (default false), eps (default 1e-8) and
+        # reduction (with legacy size_average/reduce handling).
         super().__init__(size_average, reduce, reduction)
         self.log_input = log_input
         self.full = full
         self.eps = eps
 
     def forward(self, log_input: Tensor, target: Tensor) -> Tensor:
+        # [FUNCTION DOC] Forward pass. Takes input (named log_input) and target tensors and delegates
+        # to the functional poisson_nll_loss, passing the stored reduction, log_input,
+        # full and eps flags. Returns the loss tensor (scalar for mean/sum reduction,
+        # per-element otherwise). No side effects; errors come from the functional call.
         """
         Runs the forward pass.
         """
@@ -375,6 +421,9 @@ class PoissonNLLLoss(_Loss):
 
 
 class GaussianNLLLoss(_Loss):
+    # [CLASS DOC] Gaussian negative log likelihood loss where the input is the predicted mean and an
+    # extra variance argument is supplied at call time. State: full flag (include the
+    # constant term), eps (variance clamp), and reduction.
     r"""Gaussian negative log likelihood loss.
 
     The targets are treated as samples from Gaussian distributions with
@@ -448,11 +497,17 @@ class GaussianNLLLoss(_Loss):
     def __init__(
         self, *, full: bool = False, eps: float = 1e-6, reduction: str = "mean"
     ) -> None:
+        # [FUNCTION DOC] Keyword-only arguments full (default false), eps (default 1e-6) and reduction.
+        # Calls the base constructor with no legacy flags and stores full and eps.
         super().__init__(None, None, reduction)
         self.full = full
         self.eps = eps
 
     def forward(self, input: Tensor, target: Tensor, var: Tensor | float) -> Tensor:
+        # [FUNCTION DOC] Forward pass. Takes input, target and var (a tensor or a float variance) and
+        # delegates to the functional gaussian_nll_loss, passing the stored reduction,
+        # full and eps. Returns the loss tensor (scalar for mean/sum reduction, per-
+        # element otherwise). No side effects; errors come from the functional call.
         """
         Runs the forward pass.
         """
@@ -462,6 +517,9 @@ class GaussianNLLLoss(_Loss):
 
 
 class KLDivLoss(_Loss):
+    # [CLASS DOC] Kullback-Leibler divergence loss between a target distribution and the input log-
+    # probabilities. State: reduction and log_target flag (target given in log space).
+    # Note the batchmean reduction is accepted by the functional.
     r"""The Kullback-Leibler divergence loss.
 
     For tensors of the same shape :math:`y_{\text{pred}},\ y_{\text{true}}`,
@@ -552,10 +610,17 @@ class KLDivLoss(_Loss):
         reduction: str = "mean",
         log_target: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Stores reduction (with legacy size_average/reduce handling) and log_target
+        # (default false).
+        # KNOWN ISSUE: log_target is not listed in __constants__ (only reduction is), unlike similar attributes elsewhere; likely harmless but inconsistent for scripting.
         super().__init__(size_average, reduce, reduction)
         self.log_target = log_target
 
     def forward(self, input: Tensor, target: Tensor) -> Tensor:
+        # [FUNCTION DOC] Forward pass. Takes input and target tensors and delegates to the functional
+        # kl_div, passing the stored reduction and log_target. Returns the loss tensor
+        # (scalar for mean/sum reduction, per-element otherwise). No side effects;
+        # errors come from the functional call.
         """
         Runs the forward pass.
         """
@@ -565,6 +630,8 @@ class KLDivLoss(_Loss):
 
 
 class MSELoss(_Loss):
+    # [CLASS DOC] Mean squared error loss, elementwise squared difference between input and target
+    # reduced per the reduction setting. No parameters.
     r"""Creates a criterion that measures the mean squared error (squared L2 norm) between
     each element in the input :math:`x` and target :math:`y`.
 
@@ -624,6 +691,10 @@ class MSELoss(_Loss):
     __constants__ = ["reduction"]
 
     def forward(self, input: Tensor, target: Tensor) -> Tensor:
+        # [FUNCTION DOC] Forward pass. Takes input and target tensors and delegates to the functional
+        # mse_loss, passing the stored reduction. Returns the loss tensor (scalar for
+        # mean/sum reduction, per-element otherwise). No side effects; errors come from
+        # the functional call.
         """
         Runs the forward pass.
         """
@@ -631,6 +702,8 @@ class MSELoss(_Loss):
 
 
 class BCELoss(_WeightedLoss):
+    # [CLASS DOC] Binary cross entropy loss for probabilities in the input and 0/1 (or soft)
+    # targets. State: optional per-element rescaling weight buffer and reduction.
     r"""Creates a criterion that measures the Binary Cross Entropy between the target and
     the input probabilities:
 
@@ -708,6 +781,10 @@ class BCELoss(_WeightedLoss):
     __constants__ = ["reduction"]
 
     def forward(self, input: Tensor, target: Tensor) -> Tensor:
+        # [FUNCTION DOC] Forward pass. Takes input and target tensors and delegates to the functional
+        # binary_cross_entropy, passing the stored reduction, and the weight. Returns
+        # the loss tensor (scalar for mean/sum reduction, per-element otherwise). No
+        # side effects; errors come from the functional call.
         """
         Runs the forward pass.
         """
@@ -717,6 +794,9 @@ class BCELoss(_WeightedLoss):
 
 
 class BCEWithLogitsLoss(_Loss):
+    # [CLASS DOC] Sigmoid plus binary cross entropy fused for numerical stability; input is raw
+    # logits. State: optional weight and pos_weight buffers (pos_weight rescales
+    # positive examples per class) and reduction.
     r"""This loss combines a `Sigmoid` layer and the `BCELoss` in one single
     class. This version is more numerically stable than using a plain `Sigmoid`
     followed by a `BCELoss` as, by combining the operations into one layer,
@@ -827,6 +907,8 @@ class BCEWithLogitsLoss(_Loss):
         reduction: str = "mean",
         pos_weight: Tensor | None = None,
     ) -> None:
+        # [FUNCTION DOC] Registers weight and pos_weight as buffers (either may be None) and stores
+        # reduction (with legacy size_average/reduce handling).
         super().__init__(size_average, reduce, reduction)
         self.register_buffer("weight", weight)
         self.register_buffer("pos_weight", pos_weight)
@@ -834,6 +916,10 @@ class BCEWithLogitsLoss(_Loss):
         self.pos_weight: Tensor | None
 
     def forward(self, input: Tensor, target: Tensor) -> Tensor:
+        # [FUNCTION DOC] Forward pass. Takes input and target tensors and delegates to the functional
+        # binary_cross_entropy_with_logits, passing the stored reduction, weight and
+        # pos_weight. Returns the loss tensor (scalar for mean/sum reduction, per-
+        # element otherwise). No side effects; errors come from the functional call.
         """Runs the forward pass."""
         return F.binary_cross_entropy_with_logits(
             input,
@@ -845,6 +931,8 @@ class BCEWithLogitsLoss(_Loss):
 
 
 class HingeEmbeddingLoss(_Loss):
+    # [CLASS DOC] Hinge embedding loss for targets of 1 or -1: measures whether two inputs are
+    # similar or dissimilar using a margin. State: margin and reduction.
     r"""Measures the loss given an input tensor :math:`x` and a labels tensor :math:`y`
     (containing 1 or -1).
     This is usually used for measuring whether two inputs are similar or
@@ -912,10 +1000,16 @@ class HingeEmbeddingLoss(_Loss):
         reduce=None,
         reduction: str = "mean",
     ) -> None:
+        # [FUNCTION DOC] Stores margin (default 1.0) and reduction (with legacy size_average/reduce
+        # handling).
         super().__init__(size_average, reduce, reduction)
         self.margin = margin
 
     def forward(self, input: Tensor, target: Tensor) -> Tensor:
+        # [FUNCTION DOC] Forward pass. Takes input and target tensors and delegates to the functional
+        # hinge_embedding_loss, passing the stored reduction and margin. Returns the
+        # loss tensor (scalar for mean/sum reduction, per-element otherwise). No side
+        # effects; errors come from the functional call.
         """Runs the forward pass."""
         return F.hinge_embedding_loss(
             input, target, margin=self.margin, reduction=self.reduction
@@ -923,6 +1017,8 @@ class HingeEmbeddingLoss(_Loss):
 
 
 class MultiLabelMarginLoss(_Loss):
+    # [CLASS DOC] Multi-class multi-label hinge loss. Input is a vector or batch of scores, target
+    # holds class indices padded with a negative sentinel. State: reduction only.
     r"""Creates a criterion that optimizes a multi-class multi-classification
     hinge loss (margin-based loss) between input :math:`x` (a 2D mini-batch `Tensor`)
     and output :math:`y` (which is a 2D `Tensor` of target class indices).
@@ -981,11 +1077,17 @@ class MultiLabelMarginLoss(_Loss):
     __constants__ = ["reduction"]
 
     def forward(self, input: Tensor, target: Tensor) -> Tensor:
+        # [FUNCTION DOC] Forward pass. Takes input and target tensors and delegates to the functional
+        # multilabel_margin_loss, passing the stored reduction. Returns the loss tensor
+        # (scalar for mean/sum reduction, per-element otherwise). No side effects;
+        # errors come from the functional call.
         """Runs the forward pass."""
         return F.multilabel_margin_loss(input, target, reduction=self.reduction)
 
 
 class SmoothL1Loss(_Loss):
+    # [CLASS DOC] Smooth L1 loss: squared term when the absolute error is below beta, L1 term
+    # otherwise. State: beta and reduction.
     r"""Creates a criterion that uses a squared term if the absolute
     element-wise error falls below beta and an L1 term otherwise.
     It is less sensitive to outliers than :class:`torch.nn.MSELoss` and in some cases
@@ -1070,15 +1172,22 @@ class SmoothL1Loss(_Loss):
     def __init__(
         self, size_average=None, reduce=None, reduction: str = "mean", beta: float = 1.0
     ) -> None:
+        # [FUNCTION DOC] Stores reduction (with legacy size_average/reduce handling) and beta (default
+        # 1.0). No validation of beta here.
         super().__init__(size_average, reduce, reduction)
         self.beta = beta
 
     def forward(self, input: Tensor, target: Tensor) -> Tensor:
+        # [FUNCTION DOC] Forward pass. Takes input and target tensors and delegates to the functional
+        # smooth_l1_loss, passing the stored reduction and beta. Returns the loss tensor
+        # (scalar for mean/sum reduction, per-element otherwise). No side effects;
+        # errors come from the functional call.
         """Runs the forward pass."""
         return F.smooth_l1_loss(input, target, reduction=self.reduction, beta=self.beta)
 
 
 class HuberLoss(_Loss):
+    # [CLASS DOC] Huber loss: quadratic below delta, linear above. State: delta and reduction.
     r"""Creates a criterion that uses a squared term if the absolute
     element-wise error falls below delta and a delta-scaled L1 term otherwise.
     This loss combines advantages of both :class:`L1Loss` and :class:`MSELoss`; the
@@ -1140,17 +1249,25 @@ class HuberLoss(_Loss):
     __constants__ = ["reduction", "delta"]
 
     def __init__(self, reduction: str = "mean", delta: float = 1.0) -> None:
+        # [FUNCTION DOC] Raises TypeError if delta is not a float or int (checked before the base
+        # constructor runs). Stores reduction and delta (default 1.0).
         if not isinstance(delta, (float, int)):
             raise TypeError(f"delta must be a float or int, got: {type(delta)}")
         super().__init__(reduction=reduction)
         self.delta = delta
 
     def forward(self, input: Tensor, target: Tensor) -> Tensor:
+        # [FUNCTION DOC] Forward pass. Takes input and target tensors and delegates to the functional
+        # huber_loss, passing the stored reduction and delta. Returns the loss tensor
+        # (scalar for mean/sum reduction, per-element otherwise). No side effects;
+        # errors come from the functional call.
         """Runs the forward pass."""
         return F.huber_loss(input, target, reduction=self.reduction, delta=self.delta)
 
 
 class SoftMarginLoss(_Loss):
+    # [CLASS DOC] Two-class logistic loss between input scores and targets of 1 or -1. State:
+    # reduction only.
     r"""Creates a criterion that optimizes a two-class classification
     logistic loss between input tensor :math:`x` and target tensor :math:`y`
     (containing 1 or -1).
@@ -1193,11 +1310,18 @@ class SoftMarginLoss(_Loss):
     __constants__ = ["reduction"]
 
     def forward(self, input: Tensor, target: Tensor) -> Tensor:
+        # [FUNCTION DOC] Forward pass. Takes input and target tensors and delegates to the functional
+        # soft_margin_loss, passing the stored reduction. Returns the loss tensor
+        # (scalar for mean/sum reduction, per-element otherwise). No side effects;
+        # errors come from the functional call.
         """Runs the forward pass."""
         return F.soft_margin_loss(input, target, reduction=self.reduction)
 
 
 class CrossEntropyLoss(_WeightedLoss):
+    # [CLASS DOC] Cross entropy loss combining log-softmax and negative log likelihood; accepts
+    # class indices or class probabilities as target. State: optional class weight
+    # buffer, ignore_index, label_smoothing and reduction.
     r"""This criterion computes the cross entropy loss between input logits
     and target.
 
@@ -1391,11 +1515,18 @@ class CrossEntropyLoss(_WeightedLoss):
         reduction: str = "mean",
         label_smoothing: float = 0.0,
     ) -> None:
+        # [FUNCTION DOC] Stores optional class weight (buffer), ignore_index (default -100), reduction
+        # and label_smoothing (default 0.0). Range of label_smoothing is validated only
+        # by the functional.
         super().__init__(weight, size_average, reduce, reduction)
         self.ignore_index = ignore_index
         self.label_smoothing = label_smoothing
 
     def forward(self, input: Tensor, target: Tensor) -> Tensor:
+        # [FUNCTION DOC] Forward pass. Takes input and target tensors and delegates to the functional
+        # cross_entropy, passing the stored reduction, the class weight, ignore_index
+        # and label_smoothing. Returns the loss tensor (scalar for mean/sum reduction,
+        # per-element otherwise). No side effects; errors come from the functional call.
         """Runs the forward pass."""
         return F.cross_entropy(
             input,
@@ -1408,6 +1539,11 @@ class CrossEntropyLoss(_WeightedLoss):
 
 
 class LinearCrossEntropyLoss(_WeightedLoss):
+    # [CLASS DOC] Fused linear projection plus cross entropy loss: owns an inner Linear layer (the
+    # classifier) and computes the loss from hidden activations directly, allowing
+    # memory-efficient implementations. State: num_classes, out_features (extra trailing
+    # output dims), ignore_index (may be None), label_smoothing, options, the optional
+    # class weight buffer, and the linear submodule.
     r"""This criterion computes the cross entropy loss between input,
     linearly transformed to logits, and target.
 
@@ -1548,6 +1684,12 @@ class LinearCrossEntropyLoss(_WeightedLoss):
         label_smoothing: float = 0.0,
         options: LinearCrossEntropyOptions | None = None,
     ) -> None:
+        # [FUNCTION DOC] Validates then builds the module. Raises RuntimeError if weight is given and
+        # its shape is not one-dimensional of length num_classes, or if label_smoothing
+        # is outside zero to one. Stores num_classes, out_features, ignore_index
+        # (default None), label_smoothing and options. Creates the inner Linear layer
+        # mapping in_features to the product of num_classes and out_features sizes, so
+        # its weight is kept two-dimensional and reshaped later.
         if weight is not None and weight.shape != (num_classes,):
             raise RuntimeError(
                 f"expected weight shape to be {(num_classes,)}, got {tuple(weight.shape)}"
@@ -1578,6 +1720,11 @@ class LinearCrossEntropyLoss(_WeightedLoss):
         self.options = options
 
     def forward(self, input: Tensor, target: Tensor) -> Tensor:
+        # [FUNCTION DOC] Forward pass. Takes hidden input and target. Reshapes the stored two-
+        # dimensional linear weight (and bias, if present) into shape num_classes,
+        # out_features dims, in_features, then delegates to the functional
+        # linear_cross_entropy with weight, reduction, ignore_index, label_smoothing and
+        # options. Returns the loss tensor.
         """Runs the forward pass."""
         linear_weight = self.linear.weight.reshape(
             (self.num_classes, *self.out_features, self.linear.in_features)
@@ -1600,6 +1747,9 @@ class LinearCrossEntropyLoss(_WeightedLoss):
         )
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] HELPER: Returns the extra representation string listing in_features,
+        # num_classes, out_features, whether a bias exists, reduction, ignore_index,
+        # label_smoothing and options.
         return (
             f"in_features={self.linear.in_features},"
             f" num_classes={self.num_classes},"
@@ -1613,6 +1763,9 @@ class LinearCrossEntropyLoss(_WeightedLoss):
 
 
 class MultiLabelSoftMarginLoss(_WeightedLoss):
+    # [CLASS DOC] Multi-label one-versus-all loss based on max-entropy (soft margin) between input
+    # scores and multi-hot targets. State: optional per-class weight buffer and
+    # reduction.
     r"""Creates a criterion that optimizes a multi-label one-versus-all
     loss based on max-entropy, between input :math:`x` and target :math:`y` of size
     :math:`(N, C)`.
@@ -1662,6 +1815,10 @@ class MultiLabelSoftMarginLoss(_WeightedLoss):
     __constants__ = ["reduction"]
 
     def forward(self, input: Tensor, target: Tensor) -> Tensor:
+        # [FUNCTION DOC] Forward pass. Takes input and target tensors and delegates to the functional
+        # multilabel_soft_margin_loss, passing the stored reduction, and the weight.
+        # Returns the loss tensor (scalar for mean/sum reduction, per-element
+        # otherwise). No side effects; errors come from the functional call.
         """Runs the forward pass."""
         return F.multilabel_soft_margin_loss(
             input, target, weight=self.weight, reduction=self.reduction
@@ -1669,6 +1826,8 @@ class MultiLabelSoftMarginLoss(_WeightedLoss):
 
 
 class CosineEmbeddingLoss(_Loss):
+    # [CLASS DOC] Cosine embedding loss for pairs of inputs with targets of 1 (similar) or -1
+    # (dissimilar). State: margin and reduction.
     r"""Creates a criterion that measures the loss given input tensors
     :math:`x_1`, :math:`x_2` and a `Tensor` label :math:`y` with values 1 or -1.
     Use (:math:`y=1`) to maximize the cosine similarity of two inputs, and (:math:`y=-1`) otherwise.
@@ -1730,10 +1889,16 @@ class CosineEmbeddingLoss(_Loss):
         reduce=None,
         reduction: str = "mean",
     ) -> None:
+        # [FUNCTION DOC] Stores margin (default 0.0) and reduction (with legacy size_average/reduce
+        # handling).
         super().__init__(size_average, reduce, reduction)
         self.margin = margin
 
     def forward(self, input1: Tensor, input2: Tensor, target: Tensor) -> Tensor:
+        # [FUNCTION DOC] Forward pass. Takes two input tensors and a target tensor and delegates to the
+        # functional cosine_embedding_loss, passing the stored reduction and margin.
+        # Returns the loss tensor (scalar for mean/sum reduction, per-element
+        # otherwise). No side effects; errors come from the functional call.
         """Runs the forward pass."""
         return F.cosine_embedding_loss(
             input1, input2, target, margin=self.margin, reduction=self.reduction
@@ -1741,6 +1906,8 @@ class CosineEmbeddingLoss(_Loss):
 
 
 class MarginRankingLoss(_Loss):
+    # [CLASS DOC] Margin ranking loss for two score inputs and a target of 1 or -1 indicating which
+    # should rank higher. State: margin and reduction.
     r"""Creates a criterion that measures the loss given
     inputs :math:`x1`, :math:`x2`, two 1D mini-batch or 0D `Tensors`,
     and a label 1D mini-batch or 0D `Tensor` :math:`y` (containing 1 or -1).
@@ -1797,10 +1964,16 @@ class MarginRankingLoss(_Loss):
         reduce=None,
         reduction: str = "mean",
     ) -> None:
+        # [FUNCTION DOC] Stores margin (default 0.0) and reduction (with legacy size_average/reduce
+        # handling).
         super().__init__(size_average, reduce, reduction)
         self.margin = margin
 
     def forward(self, input1: Tensor, input2: Tensor, target: Tensor) -> Tensor:
+        # [FUNCTION DOC] Forward pass. Takes two input tensors and a target tensor and delegates to the
+        # functional margin_ranking_loss, passing the stored reduction and margin.
+        # Returns the loss tensor (scalar for mean/sum reduction, per-element
+        # otherwise). No side effects; errors come from the functional call.
         """Runs the forward pass."""
         return F.margin_ranking_loss(
             input1, input2, target, margin=self.margin, reduction=self.reduction
@@ -1808,6 +1981,8 @@ class MarginRankingLoss(_Loss):
 
 
 class MultiMarginLoss(_WeightedLoss):
+    # [CLASS DOC] Multi-class hinge loss between input scores and class-index targets. State: p
+    # (norm power, 1 or 2), margin, optional class weight buffer and reduction.
     r"""Creates a criterion that optimizes a multi-class classification hinge
     loss (margin-based loss) between input :math:`x` (a 2D mini-batch `Tensor`) and
     output :math:`y` (which is a 1D tensor of target class indices,
@@ -1881,6 +2056,9 @@ class MultiMarginLoss(_WeightedLoss):
         reduce=None,
         reduction: str = "mean",
     ) -> None:
+        # [FUNCTION DOC] Raises ValueError if p is not 1 or 2, or if weight is given and is not one-
+        # dimensional. Stores p (default 1), margin (default 1.0), weight buffer and
+        # reduction.
         super().__init__(weight, size_average, reduce, reduction)
         if p != 1 and p != 2:
             raise ValueError("only p == 1 and p == 2 supported")
@@ -1892,6 +2070,10 @@ class MultiMarginLoss(_WeightedLoss):
         self.margin = margin
 
     def forward(self, input: Tensor, target: Tensor) -> Tensor:
+        # [FUNCTION DOC] Forward pass. Takes input and target tensors and delegates to the functional
+        # multi_margin_loss, passing the stored reduction, p, margin and weight. Returns
+        # the loss tensor (scalar for mean/sum reduction, per-element otherwise). No
+        # side effects; errors come from the functional call.
         """Runs the forward pass."""
         return F.multi_margin_loss(
             input,
@@ -1904,6 +2086,8 @@ class MultiMarginLoss(_WeightedLoss):
 
 
 class TripletMarginLoss(_Loss):
+    # [CLASS DOC] Triplet margin loss on anchor, positive and negative embeddings using the p-norm
+    # pairwise distance. State: margin, p, eps, swap flag and reduction.
     r"""Creates a criterion that measures the triplet loss given an input
     tensors :math:`x1`, :math:`x2`, :math:`x3` and a margin with a value greater than :math:`0`.
     This is used for measuring a relative similarity between samples. A triplet
@@ -1989,6 +2173,8 @@ class TripletMarginLoss(_Loss):
         reduce=None,
         reduction: str = "mean",
     ) -> None:
+        # [FUNCTION DOC] Raises ValueError if margin is not greater than zero. Stores margin (default
+        # 1.0), p (default 2.0), eps (default 1e-6), swap (default false) and reduction.
         super().__init__(size_average, reduce, reduction)
         if margin <= 0:
             raise ValueError(
@@ -2000,6 +2186,10 @@ class TripletMarginLoss(_Loss):
         self.swap = swap
 
     def forward(self, anchor: Tensor, positive: Tensor, negative: Tensor) -> Tensor:
+        # [FUNCTION DOC] Forward pass. Takes anchor, positive and negative tensors and delegates to the
+        # functional triplet_margin_loss, passing the stored reduction, margin, p, eps
+        # and swap. Returns the loss tensor (scalar for mean/sum reduction, per-element
+        # otherwise). No side effects; errors come from the functional call.
         """Runs the forward pass."""
         return F.triplet_margin_loss(
             anchor,
@@ -2014,6 +2204,8 @@ class TripletMarginLoss(_Loss):
 
 
 class TripletMarginWithDistanceLoss(_Loss):
+    # [CLASS DOC] Triplet margin loss with a user-supplied distance function. State:
+    # distance_function (callable on two tensors), margin, swap flag and reduction.
     r"""Creates a criterion that measures the triplet loss given input
     tensors :math:`a`, :math:`p`, and :math:`n` (representing anchor,
     positive, and negative examples, respectively), and a nonnegative,
@@ -2124,6 +2316,9 @@ class TripletMarginWithDistanceLoss(_Loss):
         swap: bool = False,
         reduction: str = "mean",
     ) -> None:
+        # [FUNCTION DOC] Keyword-only arguments. Raises ValueError if margin is not greater than zero.
+        # Uses the given distance_function, or a default pairwise distance module if
+        # None; stores margin, swap and reduction.
         super().__init__(size_average=None, reduce=None, reduction=reduction)
         if margin <= 0:
             raise ValueError(
@@ -2136,6 +2331,11 @@ class TripletMarginWithDistanceLoss(_Loss):
         self.swap = swap
 
     def forward(self, anchor: Tensor, positive: Tensor, negative: Tensor) -> Tensor:
+        # [FUNCTION DOC] Forward pass. Takes anchor, positive and negative tensors and delegates to the
+        # functional triplet_margin_with_distance_loss, passing the stored reduction,
+        # distance_function, margin and swap. Returns the loss tensor (scalar for
+        # mean/sum reduction, per-element otherwise). No side effects; errors come from
+        # the functional call.
         """Runs the forward pass."""
         return F.triplet_margin_with_distance_loss(
             anchor,
@@ -2149,6 +2349,9 @@ class TripletMarginWithDistanceLoss(_Loss):
 
 
 class CTCLoss(_Loss):
+    # [CLASS DOC] Connectionist Temporal Classification loss for unaligned sequence labeling. State:
+    # blank label index, zero_infinity flag (zero out infinite losses and gradients) and
+    # reduction.
     r"""The Connectionist Temporal Classification loss.
 
     Calculates loss between a continuous (unsegmented) time series and a target sequence. CTCLoss sums over the
@@ -2306,6 +2509,8 @@ class CTCLoss(_Loss):
     def __init__(
         self, blank: int = 0, reduction: str = "mean", zero_infinity: bool = False
     ) -> None:
+        # [FUNCTION DOC] Stores blank (default 0), reduction (default mean) and zero_infinity (default
+        # false).
         super().__init__(reduction=reduction)
         self.blank = blank
         self.zero_infinity = zero_infinity
@@ -2317,6 +2522,9 @@ class CTCLoss(_Loss):
         input_lengths: Tensor,
         target_lengths: Tensor,
     ) -> Tensor:
+        # [FUNCTION DOC] Forward pass. Takes log_probs, targets, input_lengths and target_lengths and
+        # delegates to the functional ctc_loss with blank, reduction and zero_infinity.
+        # Returns the loss tensor.
         """Runs the forward pass."""
         return F.ctc_loss(
             log_probs,
