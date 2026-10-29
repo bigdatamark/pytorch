@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Jiterator support: compile elementwise CUDA kernels from C++ template code strings at
+# call time. Contains a parser for the code string, a callable wrapper that validates arguments and
+# launches the native compile-and-launch routine, and two private factories (single output by value,
+# multiple outputs by reference). Exports nothing publicly. No import-time side effects.
 import re
 from collections.abc import Callable
 
@@ -10,7 +14,12 @@ __all__: list[str] = []
 
 
 class _CodeParser:
+    # [CLASS DOC] HELPER: Parses a single C++ function template string into its parts: template
+    # parameters, return type, function name, parameters and body, stored as attributes.
     def __init__(self, code_string: str):
+        # [FUNCTION DOC] HELPER: Match the code string against a pattern for a templated function
+        # (multi-line allowed) and store the captured pieces. Raises a generic Exception with the code
+        # echoed if the string does not match.
         optional_ws = r"\s*"
         required_ws = r"\s+"
         template_params = r"(?P<template_params>\<.+\>)"
@@ -52,9 +61,14 @@ class _CodeParser:
 
 
 class _JittedFunction:
+    # [CLASS DOC] HELPER: Callable wrapper for a jiterator kernel. Stores the code string, whether
+    # outputs are returned by reference, the output count, the parsed kernel name, default keyword
+    # arguments and whether CUDA was available at construction. Calling it launches the kernel.
     def __init__(
         self, code_string: str, return_by_ref: bool, num_outputs: int, **kwargs
     ):
+        # [FUNCTION DOC] HELPER: Record settings and parse the kernel name from the code string.
+        # Raises AssertionError if returning by value with other than one output; parse errors propagate.
         self.code_string = code_string
 
         if not (return_by_ref or num_outputs == 1):
@@ -69,6 +83,10 @@ class _JittedFunction:
         self.is_cuda_available = torch.cuda.is_available()
 
     def __call__(self, *tensors: Tensor, **kwargs):
+        # [FUNCTION DOC] HELPER: Launch the compiled kernel on the input tensors. Overrides default
+        # keyword values with the provided ones. Raises AssertionError if no GPU was available at
+        # construction or more than 8 tensors are given, and KeyError for an undeclared keyword.
+        # Returns the native launch result (output tensor or tensors).
         # Jiterator follow torch.cuda's lazy initialization behavior
         # Defer checking cuda's availability at the function invocation time
         if not self.is_cuda_available:
@@ -99,6 +117,9 @@ class _JittedFunction:
 
 
 def _create_jit_fn(code_string: str, **kwargs) -> Callable:
+    # [FUNCTION DOC] Build a callable for an elementwise CUDA kernel returning a single output by value
+    # from the given C++ template code string, with default keyword arguments. Compilation happens at
+    # call time. Raises if the code string cannot be parsed.
     """
     Create a jiterator-generated cuda kernel for an elementwise op.
 
@@ -164,6 +185,9 @@ def _create_jit_fn(code_string: str, **kwargs) -> Callable:
 def _create_multi_output_jit_fn(
     code_string: str, num_outputs: int, **kwargs
 ) -> Callable:
+    # [FUNCTION DOC] Build a callable for an elementwise CUDA kernel that writes one or more outputs by
+    # reference, with the given number of outputs and default keyword arguments. Raises if the code
+    # string cannot be parsed.
     """
     Create a jiterator-generated cuda kernel for an elementwise op that supports returning one or more outputs.
 

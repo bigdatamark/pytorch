@@ -1,3 +1,7 @@
+# [MODULE DOC] Public facade for CUDA graph kernel annotations. Re-exports clear_kernel_annotations,
+# get_kernel_annotations, is_available and mark_kernels from the private torch.cuda._graph_annotations
+# module. Import-time side effect: rewrites each exported object's module attribute so it presents
+# as torch.cuda.graph_annotations.
 r"""Annotate kernels captured in CUDA graphs for profiler traces.
 
 During CUDA graph capture, :func:`mark_kernels` tags the GPU work nodes

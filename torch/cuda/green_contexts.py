@@ -1,3 +1,7 @@
+# [MODULE DOC] CUDA green context support: the GreenContext class, which partitions SMs and/or
+# configures workqueues via the cuda.bindings driver API and hands out streams bound to the context.
+# Also holds driver-version and platform checks and workqueue scope parsing. Import-time side
+# effect: none beyond importing cuda bindings helpers.
 from __future__ import annotations
 
 import functools
@@ -37,6 +41,8 @@ _CONTEXT_STACK_DEPRECATION = (
 # the driver version cannot change during the lifetime of a process
 @functools.cache
 def _get_driver_version() -> int:
+    # [FUNCTION DOC] HELPER: Query and cache the CUDA driver version as an integer. On a query error,
+    # emits a warning and returns -1 (the cached result is then -1 for the process).
     try:
         # pyrefly: ignore [missing-attribute]
         return _check_cuda_bindings(_drv.cuDriverGetVersion())
@@ -46,12 +52,16 @@ def _get_driver_version() -> int:
 
 
 def _ensure_driver_version(version: int, message: str) -> None:
+    # [FUNCTION DOC] HELPER: Raise RuntimeError with the message if the driver version is unknown or
+    # below the required version.
     drv_version = _get_driver_version()
     if drv_version < 0 or drv_version < version:
         raise RuntimeError(message)
 
 
 def _ensure_supported() -> None:
+    # [FUNCTION DOC] HELPER: Raise RuntimeError unless running on Nvidia CUDA (not ROCm), not on
+    # Windows, with cuda.bindings available and a driver at least 12.8.
     if torch.version.cuda is None or torch.version.hip is not None:
         raise RuntimeError("Green Context is only supported on Nvidia CUDA")
     if sys.platform == "win32":
@@ -62,12 +72,16 @@ def _ensure_supported() -> None:
 
 
 def _ensure_workqueue_supported() -> None:
+    # [FUNCTION DOC] HELPER: Raise RuntimeError unless the driver is at least 13.1 (needed for
+    # workqueue configuration).
     _ensure_driver_version(
         13010, "CUDA user mode driver too old to use workqueue configuration!"
     )
 
 
 def _parse_workqueue_scope(workqueue_scope: str | None) -> int | None:
+    # [FUNCTION DOC] HELPER: Map the scope name to its numeric value (device context 0, balanced 1).
+    # Returns None for None; raises ValueError for any other name.
     if workqueue_scope is None:
         return None
     if workqueue_scope not in _WORKQUEUE_SCOPE_VALUES:
@@ -79,6 +93,12 @@ def _parse_workqueue_scope(workqueue_scope: str | None) -> int | None:
 
 
 class GreenContext:
+    # [CLASS DOC] Wrapper around a CUDA green context (a partition of device SMs and/or workqueue
+    # configuration). State: device id, green context and regular context driver handles, an optional
+    # parent stream used by the deprecated set/pop context pair, and a fixed-size pool of lazily
+    # created streams used round-robin (index of the most recently handed-out stream tracked).
+    # Key methods: Stream (get a stream bound to the context), create, max_workqueue_concurrency.
+    # Destruction releases the pooled streams and the green context.
     r"""Wrapper around a CUDA green context.
 
     .. warning::
@@ -107,6 +127,12 @@ class GreenContext:
         workqueue_concurrency_limit: int | None = None,
         device_id: int | None = None,
     ) -> None:
+        # [FUNCTION DOC] Create a green context. Validates platform and driver support, requires at
+        # least one of num_sms or workqueue_scope (and a scope when a concurrency limit is given),
+        # ensures a primary context exists (warns and creates one if not), builds SM split and/or
+        # workqueue resources, creates the green context and its regular context handle, and destroys
+        # the green context if conversion fails. Raises RuntimeError or ValueError on bad arguments or
+        # driver failures. Uses the current device when device_id is None.
         r"""Create a CUDA green context.
 
         At least one of ``num_sms`` or ``workqueue_scope`` must be specified.
@@ -222,6 +248,9 @@ class GreenContext:
         self._init_from_cuda_objects(device_id, green_ctx, context)
 
     def __del__(self) -> None:
+        # [FUNCTION DOC] Finalizer: if a green context is held, destroy every created pooled stream
+        # (newest first) and then the green context, converting driver errors into warnings so nothing
+        # is raised during garbage collection.
         green_ctx = getattr(self, "_green_ctx", None)
         if green_ctx is None:
             return
@@ -246,6 +275,8 @@ class GreenContext:
             warnings.warn(f"Error while destroying green context {green_ctx}: {e}")
 
     def _init_from_cuda_objects(self, device_id: int, green_ctx, context) -> None:
+        # [FUNCTION DOC] HELPER: Store the device id and driver handles and reset the parent stream,
+        # the empty stream pool and the stream index.
         self._device_id = device_id
         self._green_ctx = green_ctx
         self._context = context
@@ -263,6 +294,8 @@ class GreenContext:
         workqueue_concurrency_limit: int | None = None,
         device_id: int | None = None,
     ) -> GreenContext:
+        # [FUNCTION DOC] Compatibility factory: forwards all arguments to the constructor and returns
+        # the new green context.
         r"""Create a CUDA green context.
 
         Kept for compatibility, see `GreenContext` constructor.
@@ -276,6 +309,8 @@ class GreenContext:
 
     @staticmethod
     def max_workqueue_concurrency(device_id: int | None = None) -> int:
+        # [FUNCTION DOC] Query the device's default workqueue concurrency limit (current device when
+        # None). Requires platform and driver 13.1+ support; raises RuntimeError otherwise. Returns int.
         r"""Return the maximum workqueue concurrency limit for the device.
 
         This queries the device for the default number of concurrent
@@ -302,11 +337,16 @@ class GreenContext:
         return wq_resource.wqConfig.wqConcurrencyLimit
 
     def _ensure_alive(self) -> None:
+        # [FUNCTION DOC] HELPER: Raise RuntimeError if the green context or its context handle is gone.
         if self._green_ctx is None or self._context is None:
             raise RuntimeError("GreenContext has been destroyed")
 
     @deprecated(_CONTEXT_STACK_DEPRECATION, category=FutureWarning)
     def set_context(self) -> None:
+        # [FUNCTION DOC] Deprecated. Remember the current stream as parent, record an event on it, make
+        # the green context current (set if none, else push on the stack), make the device default
+        # stream current after waiting on the event. Raises RuntimeError if destroyed or called twice
+        # without pop_context.
         r"""Make the green context the current context.
 
         Deprecated. Create streams with :meth:`Stream` and use
@@ -336,6 +376,10 @@ class GreenContext:
 
     @deprecated(_CONTEXT_STACK_DEPRECATION, category=FutureWarning)
     def pop_context(self) -> None:
+        # [FUNCTION DOC] Deprecated. Pop the green context from the context stack, make the parent stream
+        # wait for work on the current stream via an event, and restore the parent stream. Raises
+        # RuntimeError if there was no matching set_context or the popped context is not this one. The
+        # parent stream is always cleared.
         r"""Assuming the green context is the current context, pop it from the
         context stack and restore the previous context.
 
@@ -362,6 +406,9 @@ class GreenContext:
             self._parent_stream = None
 
     def Stream(self) -> torch.cuda.Stream:
+        # [FUNCTION DOC] Hand out a stream bound to this green context. The first pool-size calls create
+        # new non-blocking driver streams; later calls reuse pooled streams round-robin. Returns an
+        # external stream wrapper on this device. Raises RuntimeError if the context was destroyed.
         r"""Return a CUDA stream associated with this green context.
 
         Use the returned stream with :func:`torch.cuda.stream` to run work on
