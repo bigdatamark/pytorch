@@ -1,4 +1,10 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests for the torch._dynamo decorator and stance APIs: disable, allow_in_graph,
+# nonstrict_trace, graph_break, skip_frame, step_unsupported, substitute_in_graph, set_stance,
+# dont_skip_tracing, patch_dynamo_config, error_on_graph_break, mark_static_address,
+# assume_constant_result and override_cudagraphs. Contains one module-level helper function and
+# one test class, instantiated for parametrization at import. Run as a script it calls the
+# dynamo test runner.
 import functools
 import operator
 import os
@@ -25,11 +31,21 @@ from torch.testing._internal.dynamo_pytree_test_utils import PytreeRegisteringTe
 
 
 def my_custom_function(x):
+    # [FUNCTION DOC] HELPER: Trivial module-level function returning its input plus one; used as
+    # the target of allow_in_graph registration in tests.
     return x + 1
 
 
 class DecoratorTests(PytreeRegisteringTestCase):
+    # [CLASS DOC] Test class for the dynamo decorator and stance APIs: disable, allow_in_graph,
+    # nonstrict_trace, graph_break and skip helpers, set_stance, dont_skip_tracing,
+    # error_on_graph_break, mark_static, and override_cudagraphs. Pytree registration helpers
+    # come from the base class. Tests are stateless apart from global dynamo registries that
+    # individual tests restore.
     def test_disallow_in_graph(self):
+        # [FUNCTION DOC] Compiles a function with five tensor ops while disallow_in_graph is
+        # active for torch.sub. Expects a graph break at the sub call: two frames and four ops
+        # in total. The allow_in_graph call afterwards restores global registry state.
         cnts = torch._dynamo.testing.CompileCounter()
 
         @torch.compile(backend=cnts)
@@ -50,6 +66,10 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(cnts.op_count, 4)
 
     def test_invoke_subgraph_wrapper_is_allow_in_graph(self):
+        # [FUNCTION DOC] Builds a boxed wrapper with invoke_subgraph_inner_compiler on a traced
+        # add-one module, checks its only free variable is the unboxed wrapper, and asserts that
+        # inner closure is registered as allowed in graph so dynamo does not fall back to a
+        # disable graph break.
         # `invoke_subgraph_inner_compiler` returns a boxed wrapper that, when
         # called, invokes an inner closure decorated with `@disable` and
         # `@torch._dynamo.allow_in_graph`. The id of that inner closure must
@@ -71,6 +91,9 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertTrue(is_callable_allowed(unboxed))
 
     def test_disable_for_custom_op(self):
+        # [FUNCTION DOC] Defines a scratch custom op library with a CPU kernel using nonzero,
+        # wraps the op in dynamo disable, compiles a relu/op/cos function and expects two frames
+        # and results equal to eager. The original op attribute is restored in a finally block.
         import torch.library
 
         with torch.library._scoped_library("foo", "DEF") as foo:
@@ -105,6 +128,8 @@ class DecoratorTests(PytreeRegisteringTestCase):
                 torch.ops.foo.custom = orig_custom
 
     def test_disable_not_traced_and_correct(self):
+        # [FUNCTION DOC] A disabled inner function must not be traced: compiled output equals
+        # eager and the graph break around the call yields two compiled frames.
         # disable must keep Dynamo from tracing into the function while still
         # returning correct results (exercises the non-export hot path).
         @torch._dynamo.disable
@@ -124,6 +149,8 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(cnts.frame_count, 2)
 
     def test_disable_under_eager_on_recompile_stance(self):
+        # [FUNCTION DOC] Calls a disabled function twice under the eager_on_recompile stance and
+        # checks the results are still correct (no compilation expected).
         # A disabled function honors the stance for its body: under
         # eager_on_recompile the stance callback is False (run-only), not fully
         # off. Pin that it still returns correct results.
@@ -137,6 +164,10 @@ class DecoratorTests(PytreeRegisteringTestCase):
             self.assertEqual(inner(x), x + 1)
 
     def test_disable_ignores_outer_wraps(self):
+        # [FUNCTION DOC] Builds a wrapper via functools wraps around a function carrying an
+        # original-callable attribute and passes it to disable with recursive set. Only checks
+        # the call does not run the wrapper or raise; the known limitation is documented in the
+        # inline comment.
         def orig_inner():
             pass
 
@@ -154,6 +185,10 @@ class DecoratorTests(PytreeRegisteringTestCase):
         torch._dynamo.disable(fn=wrapper, recursive=True)
 
     def test_disable_nn_modules_forward_hook(self):
+        # [FUNCTION DOC] Disables a submodule that has a forward pre-hook and compiles the
+        # parent with the eager counting backend. Expects two frames; the first graph has the
+        # sin node and no sigmoid, and the second graph has no sigmoid either, showing neither
+        # hook nor disabled module is traced.
         class SimpleLinear(torch.nn.Module):
             def __init__(self) -> None:
                 super().__init__()
@@ -204,6 +239,9 @@ class DecoratorTests(PytreeRegisteringTestCase):
         )
 
     def test_disable_nn_module_with_class_decorator(self):
+        # [FUNCTION DOC] Same scenario as the forward-hook test but disable is applied as a
+        # class decorator on the submodule class and torch.compile as a class decorator on the
+        # model. Expects two frames and no sigmoid node in either captured graph.
         cnts = torch._dynamo.testing.CompileCounterWithBackend("eager")
 
         @torch._dynamo.disable
@@ -253,6 +291,9 @@ class DecoratorTests(PytreeRegisteringTestCase):
         )
 
     def test_allow_in_graph(self):
+        # [FUNCTION DOC] With allow_in_graph registered for the module-level custom function, a
+        # compiled function calling it compiles to a single frame with five ops. Unregisters
+        # afterwards.
         cnts = torch._dynamo.testing.CompileCounter()
 
         @torch.compile(backend=cnts)
@@ -273,6 +314,10 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(cnts.op_count, 5)
 
     def test_allow_in_graph_no_id_reuse(self):
+        # [FUNCTION DOC] Registers a local function via allow_in_graph, deletes it, then
+        # compiles a function calling a different function that graph breaks. Checks two frames,
+        # i.e. registry lookups must not confuse a new function with a deleted one that had the
+        # same identity.
         cnts = torch._dynamo.testing.CompileCounter()
 
         def do_allow_in_graph(x):
@@ -303,6 +348,9 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(cnts.frame_count, 2)
 
     def test_incorrect_usage_disallow_in_graph(self):
+        # [FUNCTION DOC] Applying disallow_in_graph as a bare decorator must raise a
+        # RuntimeError whose message says disallow_in_graph is expected (to be given a list of
+        # functions).
         with self.assertRaisesRegex(RuntimeError, "disallow_in_graph is expected"):
 
             @torch._dynamo.disallow_in_graph
@@ -310,6 +358,8 @@ class DecoratorTests(PytreeRegisteringTestCase):
                 return x.cos()
 
     def test_nonstrict_trace_tensor_args(self):
+        # [FUNCTION DOC] nonstrict_trace on a function with tensor args that contains a graph
+        # break: with fullgraph and aot_eager the compiled result must equal eager.
         @torch._dynamo.nonstrict_trace
         def trace_me(x, y, z):
             torch._dynamo.graph_break()
@@ -329,6 +379,8 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(ref, res)
 
     def test_nonstrict_trace_from_torch_compiler(self):
+        # [FUNCTION DOC] Same as the tensor-args test but using the nonstrict_trace exposed
+        # under torch.compiler.
         @torch.compiler.nonstrict_trace
         def trace_me(x, y, z):
             torch._dynamo.graph_break()
@@ -348,6 +400,8 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(ref, res)
 
     def test_nonstrict_trace_pre_existing_dict(self):
+        # [FUNCTION DOC] A pre-existing dict argument is passed to a nonstrict_trace-ed function
+        # that reads one key; compiled output must match eager under fullgraph.
         @torch._dynamo.nonstrict_trace
         def trace_me(x, d):
             torch._dynamo.graph_break()
@@ -366,6 +420,8 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(ref, res)
 
     def test_nonstrict_trace_newly_constructed_dict_with_side_effects(self):
+        # [FUNCTION DOC] A dict is created and mutated inside the compiled function, then passed
+        # to a nonstrict_trace-ed function. Compiled output must match eager.
         @torch._dynamo.nonstrict_trace
         def trace_me(x, d):
             torch._dynamo.graph_break()
@@ -385,6 +441,9 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(ref, res)
 
     def test_nonstrict_trace_pre_existing_dict_with_side_effects(self):
+        # [FUNCTION DOC] The compiled function mutates an input dict before calling a
+        # nonstrict_trace-ed function. Checks outputs match eager and that the mutated dict
+        # contents are identical to the eager run, i.e. the side effect is replayed.
         @torch._dynamo.nonstrict_trace
         def trace_me(x, d):
             torch._dynamo.graph_break()
@@ -406,6 +465,8 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(d0, d1)
 
     def test_nonstrict_trace_pre_existing_custom_class(self):
+        # [FUNCTION DOC] Registers a Point class as a pytree node and passes an instance into a
+        # nonstrict_trace-ed function; results (including the point fields) must match eager.
         class Point:
             x: torch.Tensor
             y: torch.Tensor
@@ -438,6 +499,9 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(ref, res)
 
     def test_nonstrict_trace_pre_existing_custom_class_with_side_effects(self):
+        # [FUNCTION DOC] Like the previous test but the compiled function mutates the point
+        # fields first. Checks outputs match and that the mutated fields on the compiled run
+        # equal those of the eager run.
         class Point:
             x: torch.Tensor
             y: torch.Tensor
@@ -475,6 +539,8 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(p1.y, p2.y)
 
     def test_nonstrict_trace_newly_constructed_custom_class_with_side_effects(self):
+        # [FUNCTION DOC] The point is constructed, mutated, and passed to a nonstrict_trace-ed
+        # function entirely inside the compiled function; output must match eager.
         class Point:
             x: torch.Tensor
             y: torch.Tensor
@@ -510,6 +576,9 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(ref, res)
 
     def test_nonstrict_trace_nested_custom_class(self):
+        # [FUNCTION DOC] Registers two pytree node classes (a point and a point-with-tensor
+        # holding it) and traces a nonstrict function that takes the outer one and calls an
+        # untraced helper on the inner. Compiled result must match eager.
         class Point:
             x: torch.Tensor
             y: torch.Tensor
@@ -564,6 +633,10 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(ref, res)
 
     def test_nonstrict_trace_pre_existing_register_constant_type_guard(self):
+        # [FUNCTION DOC] Registers an opaque custom class as a constant type and calls a
+        # nonstrict_trace-ed function with instances. Same-valued instances reuse the compiled
+        # code (frame count stays one) while a differently valued instance triggers a recompile
+        # (frame count two).
         class State(torch._custom_class_base.CustomClassBase):
             def __init__(self, n):
                 self.n = n
@@ -613,6 +686,8 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(cnts.frame_count, 2)
 
     def test_nonstrict_trace_int_and_float_output(self):
+        # [FUNCTION DOC] The nonstrict function returns a Python int and a float; they are
+        # usable as constants in the compiled graph and results match eager.
         @torch._dynamo.nonstrict_trace
         def trace_me(x):
             torch._dynamo.graph_break()
@@ -630,6 +705,8 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(ref, res)
 
     def test_nonstrict_trace_tuple_and_sym_int_output(self):
+        # [FUNCTION DOC] The nonstrict function returns a tensor and a size value; with dynamic
+        # shapes the size is a symbolic int and results must still match eager.
         @torch._dynamo.nonstrict_trace
         def trace_me(x):
             torch._dynamo.graph_break()
@@ -647,6 +724,8 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(ref, res)
 
     def test_nonstrict_trace_inside_compiled_function(self):
+        # [FUNCTION DOC] Calls nonstrict_trace on a module-external function inside the compiled
+        # function and invokes it immediately; with fullgraph the result must match eager.
         def trace_me(x):
             torch._dynamo.graph_break()
             return x + 42
@@ -663,6 +742,8 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(ref, res)
 
     def test_nonstrict_trace_inside_compiled_function_kwarg(self):
+        # [FUNCTION DOC] Same as above but passes the function to nonstrict_trace by its keyword
+        # name, traceable_fn. Results must match eager.
         def trace_me(x):
             torch._dynamo.graph_break()
             return x + 42
@@ -679,6 +760,8 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(ref, res)
 
     def test_nonstrict_trace_on_method(self):
+        # [FUNCTION DOC] Decorates a method of a pytree-registered class with nonstrict_trace,
+        # calls it on an instance built inside the compiled function, and compares with eager.
         class Num:
             def __init__(self, n):
                 self.n = n
@@ -707,6 +790,8 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(ref, res)
 
     def test_nonstrict_trace_captured_external_tensor(self):
+        # [FUNCTION DOC] The nonstrict function closes over a tensor created outside the
+        # compiled region; compiled output must match eager.
         cst = torch.ones(1)
 
         @torch._dynamo.nonstrict_trace
@@ -725,6 +810,9 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(ref, res)
 
     def test_nonstrict_trace_no_action_at_a_distance(self):
+        # [FUNCTION DOC] Calling nonstrict_trace on a function without using its return value
+        # must not change the original function: compiling a caller still graph breaks inside it
+        # (two frames).
         def trace_me(x):
             x = x + 4
             torch._dynamo.graph_break()
@@ -748,6 +836,9 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(cnts.frame_count, 2)
 
     def test_nonstrict_trace_inside_compiled_function_error(self):
+        # [FUNCTION DOC] Applying nonstrict_trace to a function defined inside the compiled
+        # region must raise Unsupported with a message saying the function must be defined
+        # outside the compile region.
         @torch.compile(fullgraph=True, backend="aot_eager")
         def fn(x, y):
             def trace_me(x, y):
@@ -765,6 +856,8 @@ class DecoratorTests(PytreeRegisteringTestCase):
             self.assertIn(msg, str(e))
 
     def test_nonstrict_trace_custom_class_error(self):
+        # [FUNCTION DOC] Passing an instance of a class not registered with pytree to a
+        # nonstrict_trace-ed function must raise Unsupported mentioning an invalid input type.
         class Point:
             x: torch.Tensor
             y: torch.Tensor
@@ -791,6 +884,8 @@ class DecoratorTests(PytreeRegisteringTestCase):
             self.assertIn("Invalid input type for nonstrict_trace-ed function", str(e))
 
     def test_nonstrict_trace_nested_custom_class_error(self):
+        # [FUNCTION DOC] A registered outer class contains an unregistered inner class instance;
+        # calling a nonstrict function with it must raise Unsupported for an invalid input type.
         class Point:
             x: torch.Tensor
             y: torch.Tensor
@@ -838,6 +933,8 @@ class DecoratorTests(PytreeRegisteringTestCase):
             self.assertIn("Invalid input type for nonstrict_trace-ed function", str(e))
 
     def test_nonstrict_trace_custom_class_output_error(self):
+        # [FUNCTION DOC] A nonstrict_trace-ed function returning an unregistered custom class
+        # must raise Unsupported mentioning an unsupported output type.
         class Point:
             x: torch.Tensor
             y: torch.Tensor
@@ -866,6 +963,9 @@ class DecoratorTests(PytreeRegisteringTestCase):
             )
 
     def test_nonstrict_newly_constructed_trace_register_constant_type_error(self):
+        # [FUNCTION DOC] Registers an opaque class as symbolic, constructs it inside the
+        # compiled function and passes it to a nonstrict function; expects Unsupported saying an
+        # opaque object was created in the middle of the program.
         class State(torch._custom_class_base.CustomClassBase):
             def __init__(self, n):
                 self.n = n
@@ -906,6 +1006,8 @@ class DecoratorTests(PytreeRegisteringTestCase):
             )
 
     def test_nonstrict_trace_object_in_context_error(self):
+        # [FUNCTION DOC] A pytree node stores a non-tensor object in its context; flattening it
+        # for a nonstrict function must raise Unsupported about invalid use of pytree flatten.
         class Point:
             x: torch.Tensor
             y: torch.Tensor
@@ -952,6 +1054,8 @@ class DecoratorTests(PytreeRegisteringTestCase):
             )
 
     def test_nonstrict_trace_nn_module_dict_input(self):
+        # [FUNCTION DOC] Passes a dict of linear modules into a nonstrict function that applies
+        # them; compiled output must match eager under fullgraph.
         @torch._dynamo.nonstrict_trace
         def trace_me(x, modules):
             torch._dynamo.graph_break()
@@ -971,6 +1075,8 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(ref, res)
 
     def test_graph_break(self):
+        # [FUNCTION DOC] Three runs of two cosines separated by explicit graph breaks give three
+        # frames and six ops.
         cnts = torch._dynamo.testing.CompileCounter()
 
         @torch.compile(backend=cnts)
@@ -990,6 +1096,9 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(cnts.op_count, 6)
 
     def test_skip_frame(self):
+        # [FUNCTION DOC] skip_frame at the end of a function leaves it uncompiled (zero frames,
+        # correct result). After an earlier graph break, skip_frame in the resumed part still
+        # leaves one compiled frame for the first part and a correct result.
         cnts = torch._dynamo.testing.CompileCounter()
 
         @torch.compile(backend=cnts)
@@ -1014,6 +1123,8 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(cnts.frame_count, 1)
 
     def test_step_unsupported(self):
+        # [FUNCTION DOC] step_unsupported after some ops: the ops before it compile (one frame,
+        # two ops) and the rest runs eagerly, giving the correct sum.
         cnts = torch._dynamo.testing.CompileCounter()
 
         @torch.compile(backend=cnts)
@@ -1028,6 +1139,8 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(cnts.op_count, 2)
 
     def test_step_unsupported_empty_checkpoint(self):
+        # [FUNCTION DOC] step_unsupported as the first statement must not fail and the function
+        # result is correct.
         @torch.compile(backend="eager")
         def fn(x):
             torch._dynamo.step_unsupported()
@@ -1040,6 +1153,11 @@ class DecoratorTests(PytreeRegisteringTestCase):
         msg="TODO: (xuhancn), confirm if torch.compiler.disable work on Windows."
     )
     def test_disable_recursive_false(self):
+        # [FUNCTION DOC] Checks that disable with recursive false skips only the decorated
+        # function body (two frames; compiling is reported as false inside it), and that
+        # applying it to a function does not change the original: the original is compiled when
+        # called, the disabled copy is run eagerly, in either order and across resets. Compiling
+        # the disabled copy directly compiles it.
         def fn2(x):
             return x + 1
 
@@ -1103,6 +1221,10 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(res, inp - 1)
 
     def test_disable_recursive_false_weird(self):
+        # [FUNCTION DOC] Sets the code execution strategy of a function to skip its next run,
+        # then calls a non-recursive disabled version through a compiled caller (eager result
+        # expected). After restoring the default strategy, directly compiling the function must
+        # give the compiled result.
         from torch._dynamo.types import FrameAction, FrameExecStrategy
 
         # test the case where the next invocation of the function is
@@ -1132,6 +1254,12 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(torch.compile(fn, backend="eager")(inp), inp - 1)
 
     def test_fullgraph_eval_frame_override(self):
+        # [FUNCTION DOC] Patches the instruction translator return code generation to append a
+        # call to a global uncompiled function. With non-fullgraph compile that function is
+        # itself compiled (two frames); with fullgraph it is skipped (zero frames) unless the
+        # config flag making nested compile an error is set, in which case a RuntimeError is
+        # expected. Afterwards non-fullgraph compiles it again after reset of its code. Uses
+        # mock patch and config patch.
         # NOTE it is NOT enough to just call a torch.compile'd function in a compiled
         # function returned by the backend - this is because we apply disable(recursive=True)
         # to compiled functions and if we call a directly torch.compile'd function, that
@@ -1218,6 +1346,10 @@ class DecoratorTests(PytreeRegisteringTestCase):
             self.assertEqual(y, torch.ones(3) + 3)
 
     def test_substitute_in_graph(self):
+        # [FUNCTION DOC] Without a polyfill, a C function call causes one graph break.
+        # Registering a substitute with a mismatching signature raises TypeError. With a
+        # correctly matching polyfill both the original C function and the polyfill compile
+        # under fullgraph with zero graph breaks and matching results.
         counters.clear()
 
         # NB: Choose another C function for test when we support operator.indexOf
@@ -1273,6 +1405,9 @@ class DecoratorTests(PytreeRegisteringTestCase):
 
     @patch.object(torch._dynamo.config, "suppress_errors", True)
     def test_nested_disable_decorator(self):
+        # [FUNCTION DOC] With suppress_errors patched on, a compiled function calling a disabled
+        # function gives two frames and four ops; compiling it from a fullgraph outer function
+        # must raise Unsupported about skipping a disabled function.
         cnts = torch._dynamo.testing.CompileCounter()
 
         @torch._dynamo.disable()
@@ -1302,6 +1437,9 @@ class DecoratorTests(PytreeRegisteringTestCase):
             fn3(torch.randn(4, 5))
 
     def test_disable_optimize(self):
+        # [FUNCTION DOC] The compile option disable and the TORCHDYNAMO_DISABLE environment
+        # variable (patched via a dict patch) both prevent any compilation: frame count stays
+        # zero.
         cnt = torch._dynamo.testing.CompileCounter()
 
         @torch.compile(backend=cnt, disable=True)
@@ -1328,6 +1466,8 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(cnt.frame_count, 0)
 
     def test_torch_guards_stack_frame_register_inlining_disable(self):
+        # [FUNCTION DOC] Compiles a module whose only helper is disabled while the tracing
+        # context current-frame hook is mocked; no frame summaries may be recorded.
         x = torch.tensor([0.5, 0.5])
 
         class encoder(torch.nn.Module):
@@ -1363,6 +1503,8 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(len(seen_frames), 0)
 
     def test_torch_guards_stack_frame_register_inlining_partially_disable(self):
+        # [FUNCTION DOC] A module with one disabled and one normal helper compiles into two
+        # frames and three ops (before and after the disabled call).
         y = torch.nn.Parameter(torch.tensor([0.25, 0.25]))
         x = torch.tensor([0.5, 0.5])
 
@@ -1392,6 +1534,11 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(cnt.op_count, 3)
 
     def _test_mark_static_address(self, guarded):
+        # [FUNCTION DOC] HELPER: Shared body for the static address tests. Marks an input tensor
+        # as static address with the given guard flag, compiles with a counting backend
+        # recording whether the graph owns buffers, then calls with a fresh tensor. If guarded,
+        # the first compile has a buffer and a second compile happens without one; if unguarded,
+        # only one compile happens.
         # This test verifies that dynamo properly marks inputs as static
         # when using the mark_static_address API.
         # We expect the tensor to be present in the buffers attribute of the graph.
@@ -1431,14 +1578,19 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(compiles, 2 if guarded else 1)
 
     def test_mark_static_address_guarded(self):
+        # [FUNCTION DOC] Runs the shared helper with guarding on.
         self._test_mark_static_address(guarded=True)
 
     def test_mark_static_address_unguarded(self):
+        # [FUNCTION DOC] Runs the shared helper with guarding off.
         self._test_mark_static_address(guarded=False)
 
     @parametrize("compile_outer", [False, True])
     @parametrize("fullgraph", [False, True])
     def test_compile_staticmethod(self, compile_outer, fullgraph):
+        # [FUNCTION DOC] Parametrized over decorator order and fullgraph. Applies torch.compile
+        # to a static method either outside or inside the staticmethod wrapper; calling through
+        # class and instance gives sin of the input with one frame and one op.
         cnt = torch._dynamo.testing.CompileCounter()
         compile_decorator = torch.compile(backend=cnt, fullgraph=fullgraph)
 
@@ -1467,6 +1619,9 @@ class DecoratorTests(PytreeRegisteringTestCase):
 
     @torch._dynamo.config.patch(caching_precompile=True)
     def test_compile_staticmethod_caching_precompile(self):
+        # [FUNCTION DOC] With the caching precompile config on and the dynamo cache cleared,
+        # compiles a static method via decorator and checks class and instance calls work with
+        # one frame.
         from torch._dynamo.package import DynamoCache
 
         DynamoCache.clear()
@@ -1485,6 +1640,11 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(cnt.frame_count, 1)
 
     def test_class_methods(self):
+        # [FUNCTION DOC] Compiles a function calling class methods, static methods and regular
+        # methods on instances and classes of a base class and two subclasses, with a random op
+        # to force custom bytecode. Checks returned values and one frame. The check for a
+        # subclass class method called from a regular method is commented out in the test and
+        # flagged by a TODO as unsupported.
         class A:
             @classmethod
             def my_class_method(cls, arg1):
@@ -1545,6 +1705,10 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(cnt.frame_count, 1)
 
     def test_assume_constant_result_on_user_defined_fn(self):
+        # [FUNCTION DOC] Marks a function building a full tensor as assumed constant, uses it in
+        # a function that returns a Python list, with the batch dimension marked static and
+        # scalar capture and dynamic-output-shape configs on. Compiled fullgraph dynamic result
+        # must equal eager.
         @torch._dynamo.assume_constant_result
         def const_fn(n, s):
             return torch.full([n], s)
@@ -1568,6 +1732,8 @@ class DecoratorTests(PytreeRegisteringTestCase):
             )
 
     def test_assume_constant_result_on_computation_with_graph_input(self):
+        # [FUNCTION DOC] An assumed-constant predicate over a graph input chooses a branch; the
+        # compiled eager backend result must equal eager.
         @torch._dynamo.assume_constant_result
         def check(y):
             return y[0].item() == 1
@@ -1584,6 +1750,8 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(fn(x, y), torch.compile(fn, backend="eager")(x, y))
 
     def test_justknobs_check(self):
+        # [FUNCTION DOC] A justknobs check inside a function compiles under fullgraph with
+        # aot_eager; the result equals eager.
         def fn(x, y):
             if torch._utils_internal.justknobs_check("test", True):
                 return x + y
@@ -1598,6 +1766,8 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(eager_out, compiled_out)
 
     def test_assume_constant_result_on_cached_property(self):
+        # [FUNCTION DOC] Marks the getter of a cached property as assumed constant and compiles
+        # a module that multiplies by it under fullgraph; result must be close to eager.
         class MyModule(torch.nn.Module):
             def __init__(self):
                 super().__init__()
@@ -1623,6 +1793,8 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertTrue(torch.allclose(result_eager, result_compiled))
 
     def test_set_stance_aot_eager_then_compile(self):
+        # [FUNCTION DOC] Under the aot_eager_then_compile stance three calls with different
+        # sizes are made; the op count is two where it would have been four without the stance.
         cnts = torch._dynamo.testing.CompileCounter()
 
         @torch.compile(backend=cnts)
@@ -1638,6 +1810,9 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(cnts.op_count, 2)
 
     def test_mark_static_nn_module(self):
+        # [FUNCTION DOC] Marks a module class as static, compiles three instances with different
+        # constants and expects three frames (without static marking the constants would become
+        # symbolic ints and fewer compiles would occur).
         @torch._dynamo.mark_static
         class Mock(torch.nn.Module):
             def __init__(self, c):
@@ -1667,6 +1842,8 @@ class DecoratorTests(PytreeRegisteringTestCase):
         IS_LINUX or IS_MACOS, "https://github.com/pytorch/pytorch/issues/148515"
     )
     def test_set_stance_eager_then_compile(self):
+        # [FUNCTION DOC] Under the eager_then_compile stance three differently sized calls end
+        # up with one compiled frame. Skipped on Linux and macOS (issue 148515).
         cnts = torch._dynamo.testing.CompileCounter()
 
         @torch.compile(backend=cnts)
@@ -1685,6 +1862,8 @@ class DecoratorTests(PytreeRegisteringTestCase):
         "https://github.com/pytorch/pytorch/issues/148463",
     )
     def test_set_stance_eager_then_compile_with_graph_break(self):
+        # [FUNCTION DOC] Like the previous test but the function has a graph break, so two
+        # frames result. Skipped under ASAN, Linux and macOS (issue 148463).
         cnts = torch._dynamo.testing.CompileCounter()
 
         @torch.compile(backend=cnts)
@@ -1703,6 +1882,8 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(cnts.frame_count, 2)
 
     def test_set_stance_eager_then_compile_rank_change(self):
+        # [FUNCTION DOC] Dynamic compile under eager_then_compile: two same-rank calls then a
+        # rank change gives two frames and correct outputs.
         cnts = torch._dynamo.testing.CompileCounter()
 
         @torch.compile(backend=cnts, dynamic=True)
@@ -1720,6 +1901,8 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(cnts.frame_count, 2)
 
     def test_set_stance_eager_then_compile_delayed_rank_change(self):
+        # [FUNCTION DOC] Repeats same-rank calls under eager_then_compile before a rank-four
+        # input arrives; two frames and correct outputs.
         cnts = torch._dynamo.testing.CompileCounter()
 
         @torch.compile(backend=cnts, dynamic=True)
@@ -1739,6 +1922,9 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(cnts.frame_count, 2)
 
     def test_set_stance_force_eager(self):
+        # [FUNCTION DOC] force_eager as decorator, context manager, and global setting runs the
+        # compiled function eagerly (adds two instead of one). A decorator alone leaves no
+        # lasting side effect; the global stance is reset to default at the end.
         @torch.compile(backend="eager")
         def a(x):
             if torch._dynamo.is_compiling():
@@ -1768,6 +1954,9 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(a(inp), inp + 1)
 
     def test_set_stance_eager_on_recompile(self):
+        # [FUNCTION DOC] After one compiled call, under eager_on_recompile a repeat call with the same
+        # argument is served by the compiled code while a call with a new argument value (which
+        # would need a recompile) runs the plain Python path. Checks the three results.
         @torch.compile(backend="eager", dynamic=False)
         def a(x, n):
             if torch._dynamo.is_compiling():
@@ -1785,6 +1974,8 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(out3, inp + 4)
 
     def test_set_stance_fail_on_recompile(self):
+        # [FUNCTION DOC] Under fail_on_recompile a cache hit works but a call needing
+        # recompilation raises RuntimeError mentioning the stance.
         @torch.compile(backend="eager", dynamic=False)
         def a(x, n):
             if torch._dynamo.is_compiling():
@@ -1802,6 +1993,10 @@ class DecoratorTests(PytreeRegisteringTestCase):
         self.assertEqual(out2, inp + 2)
 
     def test_fail_on_recompile_shows_guard_details(self):
+        # [FUNCTION DOC] Compiles twice with different sizes, then under fail_on_recompile calls
+        # with a third size and checks the error text lists the function, the line number
+        # (normalized) and the failure reasons of the cached guards, via an inline expected
+        # string with munging.
         @torch.compile(backend="eager", dynamic=False)
         def f(x):
             return x + 1
@@ -1826,6 +2021,8 @@ Detected recompile when torch.compile stance is 'fail_on_recompile'. filename: '
             )
 
     def test_set_stance_fail_on_recompile_with_disable(self):
+        # [FUNCTION DOC] A disabled callee inside a compiled function does not raise under
+        # fail_on_recompile.
         @torch.compiler.disable
         def inner(x):
             return x
@@ -1840,6 +2037,10 @@ Detected recompile when torch.compile stance is 'fail_on_recompile'. filename: '
             f(torch.randn(3, 3))
 
     def test_set_stance_forbid_in_graph(self):
+        # [FUNCTION DOC] set_stance used as decorator or context manager, or through the private
+        # set function, in traced code must raise AssertionError about tracing a forbidden
+        # callable. When the frame is skipped, using the stance inside raises RuntimeError
+        # saying set_stance in a compiled function is invalid.
         @torch.compiler.set_stance("force_eager")
         def a(x):
             return x + 1
@@ -1909,6 +2110,9 @@ Detected recompile when torch.compile stance is 'fail_on_recompile'. filename: '
             g(torch.ones(3))
 
     def test_set_stance_force_backend(self):
+        # [FUNCTION DOC] A stance with force_backend overrides the backend of a compiled
+        # function (the counting backend sees one frame). A named backend runs without crashing.
+        # Combining force_eager with a forced backend raises RuntimeError.
         @torch.compile  # noqa: UNSPECIFIED_BACKEND
         def a(x):
             return x + 1
@@ -1937,6 +2141,8 @@ Detected recompile when torch.compile stance is 'fail_on_recompile'. filename: '
                 pass
 
     def test_set_stance_force_backend_with_disable(self):
+        # [FUNCTION DOC] A forced failing backend is not invoked for a disabled callee: no error
+        # raised.
         @torch.compiler.disable
         def inner(x):
             return x
@@ -1956,6 +2162,12 @@ Detected recompile when torch.compile stance is 'fail_on_recompile'. filename: '
 
     # also tests a lot of torch._dynamo.patch_dynamo_config functionality
     def test_dont_skip_tracing(self):
+        # [FUNCTION DOC] Exercises dont_skip_tracing on functions from a test helper module that
+        # trace rules skip: as function wrapper, inside traced code, as decorator, on
+        # already-skipped functions, with graph breaks, nested, applied outside a compiled
+        # function, as context manager from inside and outside, and across regions. Checks frame
+        # counts and numeric results at each step, resetting dynamo once where a skipped frame
+        # needs a clean state.
         from torch._dynamo.test_dont_skip_tracing_functions import f1, f3, f4, f5, f6
 
         cnts = torch._dynamo.testing.CompileCounter()
@@ -2060,6 +2272,10 @@ Detected recompile when torch.compile stance is 'fail_on_recompile'. filename: '
         self.assertEqual(res, inp + 1)
 
     def test_patch_dynamo_config_errors(self):
+        # [FUNCTION DOC] patch_dynamo_config used in traced code must raise for an unknown key,
+        # a dict value that is not a safe constant, a dict passed as the only positional
+        # argument, and an argument that cannot be converted to a constant; the messages are
+        # matched by regular expressions.
         @torch.compile(backend="eager")
         def f1(x):
             with torch._dynamo.patch_dynamo_config(nonexistent=False):
@@ -2097,6 +2313,9 @@ Detected recompile when torch.compile stance is 'fail_on_recompile'. filename: '
             f4(torch.randn(3))
 
     def test_error_on_graph_break(self):
+        # [FUNCTION DOC] error_on_graph_break as decorator and context manager: disabling inside
+        # allows graph breaks (two frames, then three frames with multiple breaks and with a
+        # skipped frame), enabling inside raises Unsupported, results are correct otherwise.
         cnts = torch._dynamo.testing.CompileCounter()
 
         @torch._dynamo.error_on_graph_break(True)
@@ -2153,6 +2372,8 @@ Detected recompile when torch.compile stance is 'fail_on_recompile'. filename: '
         self.assertEqual(cnts.frame_count, 2)
 
     def test_error_on_graph_break_skips_redundant_set(self):
+        # [FUNCTION DOC] With the stored flag already false, entering a context that sets false
+        # must not call the setter (the mocked setter raises if called).
         torch._dynamo.utils._set_error_on_graph_break(False)
 
         with mock.patch(
@@ -2163,6 +2384,9 @@ Detected recompile when torch.compile stance is 'fail_on_recompile'. filename: '
                 pass
 
     def test_error_on_graph_break_reentrant_context_restores_outer_state(self):
+        # [FUNCTION DOC] Re-entering the same context object nests correctly: the flag stays
+        # false inside both levels and returns to true afterwards. The flag is reset to false at
+        # the end.
         torch._dynamo.utils._set_error_on_graph_break(True)
         cm = torch._dynamo.error_on_graph_break(False)
 
@@ -2177,6 +2401,9 @@ Detected recompile when torch.compile stance is 'fail_on_recompile'. filename: '
             torch._dynamo.utils._set_error_on_graph_break(False)
 
     def test_error_on_graph_break_compile_wrapper_skips_redundant_set(self):
+        # [FUNCTION DOC] optimize with the flag false and the stored flag false must not call
+        # the setter in eval_frame (mocked to raise); the optimized function still returns the
+        # right value.
         torch._dynamo.utils._set_error_on_graph_break(False)
 
         def fn(x):
@@ -2192,6 +2419,9 @@ Detected recompile when torch.compile stance is 'fail_on_recompile'. filename: '
             self.assertEqual(opt_fn(x), fn(x))
 
     def test_error_on_graph_break_nested(self):
+        # [FUNCTION DOC] Checks the flag in nested frames: an inner function decorated false
+        # inside an outer true region may break, a context manager inside the callee behaves the
+        # same, and inner true inside outer false raises Unsupported.
         # error_on_graph_break in a nested frame
         cnts = torch._dynamo.testing.CompileCounter()
 
@@ -2243,6 +2473,9 @@ Detected recompile when torch.compile stance is 'fail_on_recompile'. filename: '
             f7(inp)
 
     def test_error_on_graph_break_nested_with_skip(self):
+        # [FUNCTION DOC] Same as the nested test but with a skipped frame between outer and
+        # inner (three frames), and a non-recursive disabled middle function case that must
+        # raise Unsupported.
         # error_on_graph_break in a nested frame with a skipped frame in between
         cnts = torch._dynamo.testing.CompileCounter()
 
@@ -2289,6 +2522,8 @@ Detected recompile when torch.compile stance is 'fail_on_recompile'. filename: '
         # test export with error_on_graph_break(False) still errors
 
     def test_error_on_graph_break_export(self):
+        # [FUNCTION DOC] export of a function whose callee has the flag false and a graph break
+        # must still raise Unsupported.
         @torch._dynamo.error_on_graph_break(False)
         def inner(x):
             x = x + 2
@@ -2303,6 +2538,9 @@ Detected recompile when torch.compile stance is 'fail_on_recompile'. filename: '
             torch._dynamo.export(f)(torch.ones(3))
 
     def test_error_on_graph_break_nested_deep(self):
+        # [FUNCTION DOC] Four levels of nested calls with the flag toggled by a context manager
+        # at level three: false inside outer true allows the break (two frames); true inside
+        # outer false raises Unsupported.
         cnts = torch._dynamo.testing.CompileCounter()
 
         def inner1_f1(x):
@@ -2355,6 +2593,8 @@ Detected recompile when torch.compile stance is 'fail_on_recompile'. filename: '
             f2(inp)
 
     def test_error_on_graph_break_error(self):
+        # [FUNCTION DOC] Invalid uses of the error_on_graph_break context manager in compiled
+        # code (unknown keyword, no argument, non-bool argument) each raise an exception.
         @torch.compile(backend="eager")
         def f1():
             with torch._dynamo.error_on_graph_break(foo="bar"):
@@ -2378,6 +2618,9 @@ Detected recompile when torch.compile stance is 'fail_on_recompile'. filename: '
             f3()
 
     def test_nested_compile_error_on_graph_break(self):
+        # [FUNCTION DOC] Between nested compiled functions the innermost setting applies: inner
+        # true under outer false raises Unsupported; inner false under outer true returns the
+        # right value.
         inp = torch.ones(3)
 
         @torch._dynamo.error_on_graph_break(True)
@@ -2410,6 +2653,8 @@ Detected recompile when torch.compile stance is 'fail_on_recompile'. filename: '
         self.assertEqual(f2(inp), inp + 3)
 
     def test_error_on_graph_break_fullgraph(self):
+        # [FUNCTION DOC] Setting the flag false inside a fullgraph compile does not override
+        # fullgraph: Unsupported is raised.
         # Test that error_on_graph_break=False cannot override fullgraph=True
         inp = torch.ones(3)
 
@@ -2424,6 +2669,8 @@ Detected recompile when torch.compile stance is 'fail_on_recompile'. filename: '
             f(inp)
 
     def test_error_on_graph_break_empty_graph(self):
+        # [FUNCTION DOC] A compiled function with no tensor ops and the flag true runs fine and
+        # returns one.
         @torch._dynamo.error_on_graph_break(True)
         @torch.compile(backend="eager")
         def f():
@@ -2432,6 +2679,8 @@ Detected recompile when torch.compile stance is 'fail_on_recompile'. filename: '
         self.assertEqual(f(), 1)
 
     def test_error_on_graph_break_nonempty_checkpoint(self):
+        # [FUNCTION DOC] With three ops compiled before a graph break inside a true context,
+        # Unsupported is raised and no frames get compiled.
         cnts = torch._dynamo.testing.CompileCounter()
 
         @torch.compile(backend=cnts)
@@ -2449,6 +2698,8 @@ Detected recompile when torch.compile stance is 'fail_on_recompile'. filename: '
         self.assertEqual(cnts.frame_count, 0)
 
     def test_nested_compile_fullgraph(self):
+        # [FUNCTION DOC] fullgraph true cannot be undone by an enclosing or enclosed compile
+        # with fullgraph false: both orderings raise Unsupported.
         # Test that fullgraph=True cannot be toggled back by fullgraph=False
         inp = torch.ones(3)
 
@@ -2477,6 +2728,9 @@ Detected recompile when torch.compile stance is 'fail_on_recompile'. filename: '
             outer_f2(inp)
 
     def test_disable_recursive_flags(self):
+        # [FUNCTION DOC] For both recursive flag values, disables a model forward and a whole
+        # model, checks the recursive-flag query returns the flag, and that the models remain
+        # compilable.
         class SimpleLinear(torch.nn.Module):
             def __init__(self) -> None:
                 super().__init__()
@@ -2523,6 +2777,10 @@ Detected recompile when torch.compile stance is 'fail_on_recompile'. filename: '
             torch.compile(other_model, backend="eager")
 
     def test_disable_class_and_instance_method(self):
+        # [FUNCTION DOC] Re-decorating an instance method already decorated at class level keeps
+        # self bound and gives correct results, including double disable. Also checks that the
+        # innermost function lookup unwraps unbound methods to the original but stops at bound
+        # methods.
         # Test that decorating a method at class definition time and then
         # re-decorating the instance method works correctly. This tests the
         # fix in innermost_fn that stops unwrapping when hitting a bound method.
@@ -2579,6 +2837,9 @@ Detected recompile when torch.compile stance is 'fail_on_recompile'. filename: '
         self.assertIs(innermost_fn(disabled_bound), bound_method)
 
     def test_disable_functools_wraps(self):
+        # [FUNCTION DOC] A wrapper created via functools wraps copies the original-callable
+        # attribute; the innermost lookup must not follow it (checked through the wrapper id),
+        # and disabling the outer wrapper must still give the wrapper result.
         # Test that functools.wraps copying _torchdynamo_orig_callable doesn't
         # cause innermost_fn to bypass the outer wrapper. This tests the fix
         # using _torchdynamo_wrapper_id to verify the attribute was set by our
@@ -2607,6 +2868,9 @@ Detected recompile when torch.compile stance is 'fail_on_recompile'. filename: '
         self.assertEqual(expected, actual)
 
     def test_dynamo_disable_annotations(self):
+        # [FUNCTION DOC] Exports a module with two disabled methods under preserved node
+        # metadata and checks that nodes carry custom metadata naming each disabled method. With
+        # forward disabled non-recursively, export raises RuntimeError.
         class SimpleModel(torch.nn.Module):
             def __init__(self) -> None:
                 super().__init__()
@@ -2644,6 +2908,8 @@ Detected recompile when torch.compile stance is 'fail_on_recompile'. filename: '
             exported_model = torch.export.export(model, (inp,))
 
     def test_allow_in_graph_inside_compile_gives_clear_error(self):
+        # [FUNCTION DOC] Regression test: calling allow_in_graph inside a compiled region under
+        # fullgraph raises Unsupported with a message mentioning allow_in_graph.
         # Regression test for https://github.com/pytorch/pytorch/issues/178511
         # Calling allow_in_graph inside a compiled region is not supported.
         # Verify the error message guides users to annotate before compilation.
@@ -2661,6 +2927,10 @@ Detected recompile when torch.compile stance is 'fail_on_recompile'. filename: '
     @parametrize("use_decorator", [False, True])
     @parametrize("fwd,bwd", [(True, False), (False, False)])
     def test_override_cudagraphs_annotation_graph_break(self, use_decorator, fwd, bwd):
+        # [FUNCTION DOC] Parametrized by decorator versus context manager use and flag values. A
+        # callee with a graph break must have both compiled segments carry the cudagraph
+        # annotation (fwd and bwd values as requested) on the graph module metadata. Device
+        # independent.
         # override_cudagraphs must propagate its annotation onto every compiled
         # subgraph even when the graph break happens inside a callee compiled as
         # a separate frame (it cannot be inlined). The override is established
@@ -2704,6 +2974,9 @@ Detected recompile when torch.compile stance is 'fail_on_recompile'. filename: '
             self.assertEqual((ann.fwd, ann.bwd), (fwd, bwd))
 
     def test_override_cudagraphs_annotation_nested_overrides_graph_break(self):
+        # [FUNCTION DOC] Nested overrides: the inner wins while active and the outer is restored
+        # on exit, so segments of the first callee have the inner values and the later callee
+        # has the outer values; no segment lacks an annotation.
         # Nested overrides: the innermost (most recently entered) override wins
         # while active, and on exit the runtime stack restores the outer one so
         # a later separately-compiled callee sees it. Each callee graph-breaks,
@@ -2749,6 +3022,9 @@ Detected recompile when torch.compile stance is 'fail_on_recompile'. filename: '
         self.assertIn((True, False), vals)
 
     def test_override_cudagraphs_annotation_not_guarded_first_compile_wins(self):
+        # [FUNCTION DOC] The override state is not guarded: first compile inside an override
+        # bakes the annotation into both segments, and a later call without override does not
+        # recompile (backend not called again).
         # We intentionally do NOT guard on the dynamo global cudagraph override
         # state. The annotation is therefore sticky per code object: the first
         # compile wins, and toggling the override on a later call does NOT
