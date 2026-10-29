@@ -1,3 +1,11 @@
+# [MODULE DOC] Heuristic that matches keywords drawn from changed file paths (folder names
+# and underscore-separated parts of the file name) against test names. Contains synonym and
+# custom-matcher tables, keyword helpers, and the Filepath heuristic. If the PR only
+# changes documentation files, every test gets a negative score so all are skipped. Running
+# the file as a script prints keyword hit counts for a commit given on the command line.
+# KNOWN ISSUE: REPO_ROOT is taken as the fourth parent of this file, which is the tools
+# directory, not the repository root; it is unused in this module.
+
 from __future__ import annotations
 
 from collections import defaultdict
@@ -42,6 +50,9 @@ custom_matchers: dict[str, Callable[[str], bool]] = {
 
 
 def is_valid_keyword(keyword: str) -> bool:
+    # [FUNCTION DOC] Returns True if the keyword is useful: the keyword nn is always valid,
+    # otherwise it must be longer than two characters and not in a list of generic words
+    # (torch, test, utils, src, tools, and similar).
     not_keyword = [
         "torch",
         "test",
@@ -60,6 +71,11 @@ def is_valid_keyword(keyword: str) -> bool:
 
 @lru_cache(maxsize=1)
 def get_keywords(file: str) -> list[str]:
+    # [FUNCTION DOC] Returns the valid keywords for a path: each parent folder name and each
+    # underscore-separated part of the file stem, normalized by sanitize_name and filtered by
+    # is_valid_keyword. Results are cached.
+    # KNOWN ISSUE: the cache holds a single entry, but callers alternate between many files, so
+    # it is almost never hit.
     keywords = []
     for folder in Path(file).parts[:-1]:
         folder = sanitize_name(folder)
@@ -71,6 +87,9 @@ def get_keywords(file: str) -> list[str]:
 
 
 def sanitize_name(folder_name: str) -> str:
+    # [FUNCTION DOC] Strips one leading underscore and maps any known synonym (or the
+    # canonical name itself) to its canonical name from keyword_synonyms; otherwise returns
+    # the stripped name.
     folder_name = folder_name.removeprefix("_")
 
     for syn_rep, syns in keyword_synonyms.items():
@@ -81,6 +100,9 @@ def sanitize_name(folder_name: str) -> str:
 
 
 def file_matches_keyword(file: str, keyword: str) -> bool:
+    # [FUNCTION DOC] Returns True if the keyword matches the file: it is one of the file's
+    # keywords, a synonym of it appears in the keywords or in the path, or the custom matcher
+    # (or plain substring test when no custom matcher exists) accepts the path.
     keywords = get_keywords(file)
     return (
         keyword in keywords
@@ -92,6 +114,9 @@ def file_matches_keyword(file: str, keyword: str) -> bool:
 
 
 def get_freq_dict(tests: list[str], changed_files: list[str]) -> dict[str, int]:
+    # [FUNCTION DOC] Counts how often each keyword appears across the changed files, then for
+    # every test adds the keyword's count each time the keyword matches that test. Returns a
+    # mapping from test name to integer score; tests with no match are absent.
     keyword_frequency: dict[str, int] = defaultdict(int)
     for cf in changed_files:
         keywords = get_keywords(cf)
@@ -108,12 +133,19 @@ def get_freq_dict(tests: list[str], changed_files: list[str]) -> dict[str, int]:
 
 
 class Filepath(HeuristicInterface):
+    # [CLASS DOC] Heuristic rating tests by overlap between changed file path keywords and
+    # test names, or skipping all tests for documentation-only changes.
     # Heuristic based on folders in the file path.  Takes each folder of each
     # changed file and attempts to find matches based on those folders
     def __init__(self, **kwargs: dict[str, Any]) -> None:
+        # [FUNCTION DOC] Forwards keyword arguments (e.g. trial_mode) to the base class.
         super().__init__(**kwargs)
 
     def get_prediction_confidence(self, tests: list[str]) -> TestPrioritizations:
+        # [FUNCTION DOC] Queries the changed files. If all are documentation files, prints a
+        # message and gives every test score -1 (skip). Otherwise scores tests by keyword
+        # frequency, rescaled so the best is 0.25 and a zero rating would map to 0.125 (every
+        # rated test lies between 0.125 and 0.25). Returns a TestPrioritizations.
         changed_files = query_changed_files()
 
         # If only documentation files (.rst, .md) were modified, skip all tests

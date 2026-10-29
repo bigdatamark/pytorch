@@ -1,3 +1,11 @@
+# [MODULE DOC] Script run weekly by CI that refreshes test/slow_tests.json. It queries
+# ClickHouse (QUERY) for tests averaging over 60 seconds on recent viable/strict commits,
+# writes the result, commits it on a new branch and pushes it, then opens (or reuses) a
+# pull request labeled for slow CI, approves it with a second bot and posts a merge
+# comment. Import-time side effects: reads the UPDATEBOT_TOKEN and PYTORCHBOT_TOKEN
+# environment variables (KeyError if unset) and imports clickhouse helpers. The
+# work runs only when executed as a script; it uses git, GitHub API and ClickHouse.
+
 import json
 import os
 import subprocess
@@ -98,6 +106,10 @@ PYTORCHBOT_TOKEN = os.environ["PYTORCHBOT_TOKEN"]
 def git_api(
     url: str, params: dict[str, Any], type: str = "get", token: str = UPDATEBOT_TOKEN
 ) -> Any:
+    # [FUNCTION DOC] Sends a GitHub API request to the given path using a token header. The
+    # type argument selects post or patch (JSON body) or, by default, get (query parameters).
+    # Returns the decoded JSON response.
+    # KNOWN ISSUE: HTTP errors are not checked, so error bodies are returned as normal data.
     headers = {
         "Accept": "application/vnd.github.v3+json",
         "Authorization": f"token {token}",
@@ -123,12 +135,15 @@ def git_api(
 
 
 def make_pr(source_repo: str, params: dict[str, Any]) -> int:
+    # [FUNCTION DOC] Creates a pull request with the given parameters, prints its URL and
+    # returns the PR number.
     response = git_api(f"/repos/{source_repo}/pulls", params, type="post")
     print(f"made pr {response['html_url']}")
     return cast(int, response["number"])
 
 
 def approve_pr(source_repo: str, pr_number: int) -> None:
+    # [FUNCTION DOC] Approves the pull request using the second bot token.
     params = {"event": "APPROVE"}
     # use pytorchbot to approve the pr
     git_api(
@@ -140,6 +155,7 @@ def approve_pr(source_repo: str, pr_number: int) -> None:
 
 
 def make_comment(source_repo: str, pr_number: int, msg: str) -> None:
+    # [FUNCTION DOC] Posts a comment on the pull request using the second bot token.
     params = {"body": msg}
     # comment with pytorchbot because pytorchmergebot gets ignored
     git_api(
@@ -151,6 +167,7 @@ def make_comment(source_repo: str, pr_number: int, msg: str) -> None:
 
 
 def add_labels(source_repo: str, pr_number: int, labels: list[str]) -> None:
+    # [FUNCTION DOC] Adds the labels to the pull request using the default token.
     params = {"labels": labels}
     git_api(
         f"/repos/{source_repo}/issues/{pr_number}/labels",
@@ -160,6 +177,8 @@ def add_labels(source_repo: str, pr_number: int, labels: list[str]) -> None:
 
 
 def search_for_open_pr(source_repo: str, search_string: str) -> tuple[int, str] | None:
+    # [FUNCTION DOC] Searches for an open PR by the update bot whose title contains the search
+    # string. If one exists, prints details and returns (number, head branch name); else None.
     params = {
         "q": f"is:pr is:open in:title author:pytorchupdatebot repo:{source_repo} {search_string}",
         "sort": "created",

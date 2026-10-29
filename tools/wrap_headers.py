@@ -1,3 +1,7 @@
+# [MODULE DOC] Install-time script that wraps installed C++ headers in a guard producing a
+# compile error when stable-only or target-version macros are defined. Excludes headeronly,
+# stable, AOTI shim and third-party headers. Idempotent. No import-time side effects.
+
 """Wrap installed headers with TORCH_STABLE_ONLY / TORCH_TARGET_VERSION guards.
 
 Headers under the include directory are wrapped so they emit a compile error
@@ -30,6 +34,9 @@ WRAP_MARKER = "#if !defined(TORCH_STABLE_ONLY) && !defined(TORCH_TARGET_VERSION)
 
 
 def main() -> None:
+    # [FUNCTION DOC] Parses the include directory argument and does nothing if it is missing.
+    # Otherwise rewrites in place every header (by extension) not matching an exclude prefix and
+    # not yet wrapped, surrounding the content with the guard and an error branch.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "include_dir", type=pathlib.Path, help="Installed include directory"

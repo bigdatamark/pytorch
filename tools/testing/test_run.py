@@ -1,3 +1,8 @@
+# [MODULE DOC] Defines TestRun, a set of tests of one test file described by included or
+# excluded test classes with set algebra (union, subtraction, intersection), and
+# ShardedTest, a TestRun assigned to one shard of several with an optional duration. No
+# import-time side effects.
+
 from __future__ import annotations
 
 from copy import copy
@@ -10,6 +15,10 @@ if TYPE_CHECKING:
 
 
 class TestRun:
+    # [CLASS DOC] Immutable description of tests to run from one file: test_file plus either a
+    # frozenset of included classes (run only those) or of excluded classes (run all but
+    # those); neither means the whole file. The empty file name is the empty run. __test__ is
+    # False so pytest does not collect it. Supports union, subtraction and intersection.
     """
     TestRun defines the set of tests that should be run together in a single pytest invocation.
     It'll either be a whole test file or a subset of a test file.
@@ -36,6 +45,10 @@ class TestRun:
         excluded: Iterable[str] | None = None,
         included: Iterable[str] | None = None,
     ) -> None:
+        # [FUNCTION DOC] Builds a run from a name and optional included or excluded class
+        # collections. Raises ValueError if both are given. A name containing the class separator
+        # means file and one included class; combining that with included or excluded
+        # raises AssertionError.
         if excluded and included:
             raise ValueError("Can't specify both included and excluded")
 
@@ -57,23 +70,30 @@ class TestRun:
 
     @staticmethod
     def empty() -> TestRun:
+        # [FUNCTION DOC] Returns the empty run, which stands for nothing to run.
         return TestRun("")
 
     def is_empty(self) -> bool:
+        # [FUNCTION DOC] Returns True if the run has no test file name.
         # Lack of a test_file means that this is an empty run,
         # which means there is nothing to run. It's the zero.
         return not self.test_file
 
     def is_full_file(self) -> bool:
+        # [FUNCTION DOC] Returns True if there are no included and no excluded classes.
         return not self._included and not self._excluded
 
     def included(self) -> frozenset[str]:
+        # [FUNCTION DOC] Returns the included classes.
         return self._included
 
     def excluded(self) -> frozenset[str]:
+        # [FUNCTION DOC] Returns the excluded classes.
         return self._excluded
 
     def get_pytest_filter(self) -> str:
+        # [FUNCTION DOC] Returns the pytest keyword expression: included names joined by or, or the
+        # negated expression of excluded names, or an empty string for a whole file. Names sorted.
         if self._included:
             return " or ".join(sorted(self._included))
         elif self._excluded:
@@ -82,6 +102,9 @@ class TestRun:
             return ""
 
     def contains(self, test: TestRun) -> bool:
+        # [FUNCTION DOC] Returns True if every test of the other run is also in this run. False for
+        # different files. A whole-file run contains everything; otherwise containment is decided
+        # by comparing the included and excluded sets.
         if self.test_file != test.test_file:
             return False
 
@@ -104,12 +127,16 @@ class TestRun:
         return not self._excluded.intersection(test._included)
 
     def __copy__(self) -> TestRun:
+        # [FUNCTION DOC] Returns an equal new run.
         return TestRun(self.test_file, excluded=self._excluded, included=self._included)
 
     def __bool__(self) -> bool:
+        # [FUNCTION DOC] Truthy if the run is not empty.
         return not self.is_empty()
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Debug text with the file name and included or excluded sets.
+        # KNOWN ISSUE: the text starts with RunTest rather than the class name TestRun.
         r: str = f"RunTest({self.test_file}"
         r += f", included: {self._included}" if self._included else ""
         r += f", excluded: {self._excluded}" if self._excluded else ""
@@ -117,6 +144,8 @@ class TestRun:
         return r
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Returns Empty for the empty run, else the file name followed by the pytest
+        # filter if any.
         if self.is_empty():
             return "Empty"
 
@@ -126,6 +155,8 @@ class TestRun:
         return self.test_file
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] Equal when the other is a TestRun with the same file and the same
+        # included and excluded sets.
         if not isinstance(other, TestRun):
             return False
 
@@ -135,9 +166,15 @@ class TestRun:
         return ret
 
     def __hash__(self) -> int:
+        # [FUNCTION DOC] Hash from file name, included set and excluded set.
         return hash((self.test_file, self._included, self._excluded))
 
     def __or__(self, other: TestRun) -> TestRun:
+        # [FUNCTION DOC] Union of two runs (all tests in either). Empty runs act as identity.
+        # Raises AssertionError if the files differ. Cases: any whole file gives the whole file;
+        # two include sets union; two exclude sets intersect; mixed keeps the exclusions that are
+        # not included.
+        # KNOWN ISSUE: the error message wrongly says exclude instead of union.
         """
         To OR/Union test runs means to run all the tests that either of the two runs specify.
         """
@@ -180,6 +217,10 @@ class TestRun:
         return TestRun(self.test_file, excluded=excluded - included)
 
     def __sub__(self, other: TestRun) -> TestRun:
+        # [FUNCTION DOC] Difference: the tests in this run that are not in the other. Empty if this
+        # run is empty or the other is a whole file; returns a copy if the other is empty or in
+        # another file. Otherwise computes the new included or excluded set, returning the empty
+        # run when nothing is left.
         """
         To subtract test runs means to run all the tests in the first run except for what the second run specifies.
         """
@@ -199,6 +240,8 @@ class TestRun:
             return TestRun.empty()
 
         def return_inclusions_or_empty(inclusions: frozenset[str]) -> TestRun:
+        # [FUNCTION DOC] HELPER: Returns a run including the given classes, or the empty run if
+        # there are none.
             if inclusions:
                 return TestRun(self.test_file, included=inclusions)
             return TestRun.empty()
@@ -217,12 +260,16 @@ class TestRun:
                 return return_inclusions_or_empty(other._excluded - self._excluded)
 
     def __and__(self, other: TestRun) -> TestRun:
+        # [FUNCTION DOC] Intersection of two runs. Empty if the files differ; otherwise derived
+        # from union minus both differences.
         if self.test_file != other.test_file:
             return TestRun.empty()
 
         return (self | other) - (self - other) - (other - self)
 
     def to_json(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Returns a JSON-ready mapping with the file name and, if non-empty,
+        # lists of included and excluded classes (list order is unspecified).
         r: dict[str, Any] = {
             "test_file": self.test_file,
         }
@@ -234,6 +281,8 @@ class TestRun:
 
     @staticmethod
     def from_json(json: dict[str, Any]) -> TestRun:
+        # [FUNCTION DOC] Builds a run from the mapping produced by to_json; missing lists default
+        # to empty.
         return TestRun(
             json["test_file"],
             included=json.get("included", []),
@@ -243,6 +292,8 @@ class TestRun:
 
 @total_ordering
 class ShardedTest:
+    # [CLASS DOC] A TestRun assigned to shard number shard out of num_shards, with an optional
+    # estimated time in seconds. Ordered by name, shard, shard count then time (None smallest).
     test: TestRun
     shard: int
     num_shards: int
@@ -255,6 +306,8 @@ class ShardedTest:
         num_shards: int,
         time: float | None = None,
     ) -> None:
+        # [FUNCTION DOC] Stores the run (a string is converted to a TestRun), shard, shard count
+        # and time.
         if isinstance(test, str):
             test = TestRun(test)
         self.test = test
@@ -264,9 +317,13 @@ class ShardedTest:
 
     @property
     def name(self) -> str:
+        # [FUNCTION DOC] Returns the test file name of the run.
         return self.test.test_file
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] Equal when the other is a ShardedTest with equal run, shard, shard count
+        # and time.
+        # KNOWN ISSUE: defining equality without a hash method makes instances unhashable.
         if not isinstance(other, ShardedTest):
             return False
         return (
@@ -277,6 +334,7 @@ class ShardedTest:
         )
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Text with run, shard over count, and the time if set.
         ret = f"{self.test} {self.shard}/{self.num_shards}"
         if self.time:
             ret += f" ({self.time}s)"
@@ -284,6 +342,9 @@ class ShardedTest:
         return ret
 
     def __lt__(self, other: object) -> bool:
+        # [FUNCTION DOC] Ordering used by sorting. Raises NotImplementedError for non-ShardedTest.
+        # Compares name, shard, shard count, then time with None treated as smallest.
+        # KNOWN ISSUE: if both times are None it reports less-than, so it is not irreflexive.
         if not isinstance(other, ShardedTest):
             raise NotImplementedError
 
@@ -303,12 +364,16 @@ class ShardedTest:
         return self.time < other.time
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Text with run, shard over count.
         return f"{self.test} {self.shard}/{self.num_shards}"
 
     def get_time(self, default: float = 0) -> float:
+        # [FUNCTION DOC] Returns the time, or the default when the time is unknown.
         return self.time if self.time is not None else default
 
     def get_pytest_args(self) -> list[str]:
+        # [FUNCTION DOC] Returns the pytest arguments selecting this run's classes (a keyword
+        # option followed by the filter), or an empty list for a whole file.
         filter = self.test.get_pytest_filter()
         if filter:
             return ["-k", self.test.get_pytest_filter()]

@@ -1,8 +1,14 @@
+# [MODULE DOC] Process-wide switches for future behavior of module parameter conversion.
+# Two private flags (overwrite and swap, both False initially) with setters and getters;
+# nn.Module code reads them to decide how to replace parameters. No import-time
+# side effects.
+
 _overwrite_module_params_on_conversion: bool = False
 _swap_module_params_on_conversion: bool = False
 
 
 def set_overwrite_module_params_on_conversion(value: bool) -> None:
+    # [FUNCTION DOC] Sets the global overwrite flag. Side effect: mutates module state.
     """
     Sets whether to assign new tensors to the parameters instead of changing the
     existing parameters in-place when converting an ``nn.Module``.
@@ -23,6 +29,7 @@ def set_overwrite_module_params_on_conversion(value: bool) -> None:
 
 
 def get_overwrite_module_params_on_conversion() -> bool:
+    # [FUNCTION DOC] Returns the global overwrite flag.
     """
     Returns whether to assign new tensors to the parameters instead of changing the
     existing parameters in-place when converting an :class:`torch.nn.Module`. Defaults to ``False``.
@@ -33,6 +40,7 @@ def get_overwrite_module_params_on_conversion() -> bool:
 
 
 def set_swap_module_params_on_conversion(value: bool) -> None:
+    # [FUNCTION DOC] Sets the global swap flag. Side effect: mutates module state.
     """
     Sets whether to use :func:`~torch.utils.swap_tensors` instead of setting ``.data`` to
     change the existing parameters in-place when converting an ``nn.Module`` and instead
@@ -66,6 +74,7 @@ def set_swap_module_params_on_conversion(value: bool) -> None:
 
 
 def get_swap_module_params_on_conversion() -> bool:
+    # [FUNCTION DOC] Returns the global swap flag.
     """
     Returns whether to use :func:`~torch.utils.swap_tensors` instead of setting .data to
     change the existing parameters in-place when converting an ``nn.Module``. Defaults to ``False``.

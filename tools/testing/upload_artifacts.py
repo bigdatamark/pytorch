@@ -1,3 +1,8 @@
+# [MODULE DOC] Helpers that upload test artifacts from a CI job to S3 while tests run:
+# zipped reports, logs and JSON files, concatenated logs for the log classifier, per-xml
+# JSON conversions guarded by file locks, and ad hoc failure records. Rate limited by the
+# module-level LAST_UPDATED timestamp (20 minutes). No import-time side effects.
+
 import glob
 import gzip
 import json
@@ -20,12 +25,15 @@ LOG_BUCKET_PREFIX = "temp_logs"
 
 @lru_cache(maxsize=1)
 def get_s3_resource() -> Any:
+    # [FUNCTION DOC] Returns a cached boto3 S3 client, importing boto3 lazily.
     import boto3  # type: ignore[import]
 
     return boto3.client("s3")
 
 
 def zip_artifact(file_name: str, paths: list[str]) -> None:
+    # [FUNCTION DOC] Writes a zip file containing files matching each glob pattern (relative to
+    # REPO_ROOT, recursive), stored under their path relative to REPO_ROOT.
     """Zip the files in the paths listed into file_name. The paths will be used
     in a glob and should be relative to REPO_ROOT."""
 
@@ -36,6 +44,8 @@ def zip_artifact(file_name: str, paths: list[str]) -> None:
 
 
 def concated_logs() -> str:
+    # [FUNCTION DOC] Reads every log under the test-reports folder and returns one string with
+    # a header line per file and each log line prefixed by a fake timestamp for the classifier.
     """Concatenate all the logs in the test-reports directory into a single string."""
     logs = []
     for log_file in glob.glob(
@@ -51,6 +61,13 @@ def concated_logs() -> str:
 
 
 def upload_to_s3_artifacts(failed: bool) -> None:
+    # [FUNCTION DOC] Zips xml and csv reports, logs and json reports and uploads them to the
+    # artifacts bucket under a prefix built from the run id, attempt and file suffix, then
+    # writes a marker object. Does nothing (prints a message) if required environment
+    # variables are missing. If failed and a job id is set, also uploads gzipped concatenated
+    # logs. Side effects: files, S3 uploads.
+    # KNOWN ISSUE: the json archive upload passes the logs zip path as the file, so the logs
+    # archive is uploaded twice and the json archive is never uploaded.
     """Upload the file to S3."""
     workflow_id = os.environ.get("GITHUB_RUN_ID")
     workflow_run_attempt = os.environ.get("GITHUB_RUN_ATTEMPT")
@@ -108,6 +125,9 @@ def upload_to_s3_artifacts(failed: bool) -> None:
 
 
 def zip_and_upload_artifacts(failed: bool) -> None:
+    # [FUNCTION DOC] Uploads artifacts if a test failed or at least 20 minutes passed since
+    # the last successful upload. Errors are printed rather than raised; prints elapsed time.
+    # Updates global LAST_UPDATED only on success.
     # not thread safe but correctness of the LAST_UPDATED var doesn't really
     # matter for this
     # Upload if a test failed or every 20 minutes
@@ -124,6 +144,10 @@ def zip_and_upload_artifacts(failed: bool) -> None:
 
 
 def trigger_upload_test_stats_intermediate_workflow() -> None:
+    # [FUNCTION DOC] Dispatches the intermediate test stats workflow through the GitHub API
+    # using the GITHUB_TOKEN and run environment variables, and prints the response.
+    # KNOWN ISSUE: per the inline comment, the token cannot trigger workflows, so this is
+    # currently unused.
     import requests
 
     # The GITHUB_TOKEN cannot trigger workflow so this isn't used for now
@@ -146,6 +170,10 @@ def trigger_upload_test_stats_intermediate_workflow() -> None:
 
 
 def parse_xml_and_upload_json() -> None:
+    # [FUNCTION DOC] For each xml report without a sibling json file: takes a non-blocking
+    # file lock, parses the xml into test case records, uploads them gzipped as line-delimited
+    # json to S3 and writes the json locally to mark it done. Skips files being processed by
+    # another process. Errors are printed, not raised.
     """
     Parse xml test reports that do not yet have a corresponding json report
     uploaded to s3, and upload the json reports to s3. Use filelock to avoid
@@ -209,6 +237,9 @@ def parse_xml_and_upload_json() -> None:
 
 
 def upload_adhoc_failure_json(invoking_file: str, current_failure: str) -> None:
+    # [FUNCTION DOC] Uploads a gzipped json record to S3 stating that a whole test file failed
+    # without xml (likely a crash). Splits the failure string into class and test name. Needs
+    # JOB_ID and GITHUB_RUN_ID; prints and returns if missing.
     """
     manually upload a json to s3 indicating that the entire test file failed
     since xml was probably not generated in this case

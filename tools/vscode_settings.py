@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 
+# [MODULE DOC] Script that merges the recommended VS Code settings file into the user's
+# settings file in the .vscode folder. Uses the json5 package when available, which allows
+# comments and trailing commas. No import-time side effects other than the optional import.
+
 from pathlib import Path
 
 
@@ -22,6 +26,11 @@ SETTINGS = VSCODE_FOLDER / "settings.json"
 
 # settings can be nested, so we need to recursively update the settings.
 def deep_update(d: dict, u: dict) -> dict:  # type: ignore[type-arg]
+    # [FUNCTION DOC] Recursively merges the update mapping into the first mapping, in place:
+    # nested mappings are merged, lists are concatenated, other values replaced. Returns the
+    # first mapping.
+    # KNOWN ISSUE: lists are appended without removing duplicates, so running the script
+    # repeatedly duplicates list entries.
     for k, v in u.items():
         if isinstance(v, dict):
             d[k] = deep_update(d.get(k, {}), v)
@@ -33,6 +42,10 @@ def deep_update(d: dict, u: dict) -> dict:  # type: ignore[type-arg]
 
 
 def main() -> None:
+    # [FUNCTION DOC] Loads the recommended and current settings (an absent current file counts
+    # as empty), merges them and writes the result back with four-space indentation. Raises
+    # SystemExit with a message if the current settings cannot be parsed.
+    # Existing comments in the user's settings file are lost.
     recommended_settings = json.loads(RECOMMENDED_SETTINGS.read_text())
     try:
         current_settings_text = SETTINGS.read_text()

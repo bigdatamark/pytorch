@@ -1,3 +1,9 @@
+# [MODULE DOC] Shared helpers for heuristics: GitHub API access, git merge base and diff
+# queries for the changed files of the current PR (or of the last commit on the default
+# branch), PR number discovery from the environment, text fetching for issues and PRs,
+# rating normalization and loading of correlation files. Several results are cached for the
+# process lifetime. REPO_ROOT is the repository root. No import-time side effects.
+
 from __future__ import annotations
 
 import json
@@ -20,6 +26,9 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 
 
 def _github_api_json(path: str) -> object:
+    # [FUNCTION DOC] HELPER: GETs a path under the GitHub repository API (repository from
+    # GITHUB_REPOSITORY, default pytorch/pytorch) with an optional GITHUB_TOKEN header and
+    # returns the decoded JSON. Raises URL errors on network failure.
     github_repository = os.environ.get("GITHUB_REPOSITORY", "pytorch/pytorch")
     github_token = os.environ.get("GITHUB_TOKEN")
     headers = {
@@ -33,18 +42,25 @@ def _github_api_json(path: str) -> object:
 
 
 def _git_merge_base(base: str) -> str:
+    # [FUNCTION DOC] HELPER: Returns the merge base commit hash of the given ref and HEAD.
+    # Raises CalledProcessError if git fails.
     return subprocess.check_output(["git", "merge-base", base, "HEAD"]).decode().strip()
 
 
 def _git_head() -> str:
+    # [FUNCTION DOC] HELPER: Returns the hash of HEAD from git.
     return subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip()
 
 
 def _get_pr_info(pr_number: int) -> dict[str, object]:
+    # [FUNCTION DOC] HELPER: Fetches the pull request metadata mapping from the GitHub API.
     return cast(dict[str, object], _github_api_json(f"pulls/{pr_number}"))
 
 
 def _get_pr_merge_base(pr_info: dict[str, object]) -> str:
+    # [FUNCTION DOC] HELPER: Finds the merge base of a PR. Tries the remote base branch and the
+    # recorded base sha with git; if both fail, asks the GitHub compare API using HEAD. Falls
+    # back to the base sha, then re-raises the last git error, else raises RuntimeError.
     base_info = cast(dict[str, object], pr_info["base"])
     base_ref = cast(str, base_info["ref"])
     base_sha = cast("str | None", base_info.get("sha"))
@@ -75,6 +91,8 @@ def _get_pr_merge_base(pr_info: dict[str, object]) -> str:
 
 
 def _query_changed_files_from_github(pr_number: int) -> list[str]:
+    # [FUNCTION DOC] HELPER: Lists the changed file names of a PR from the GitHub API, paging
+    # 100 files at a time until a short page is returned.
     changed_files: list[str] = []
     page = 1
     while True:
@@ -89,6 +107,8 @@ def _query_changed_files_from_github(pr_number: int) -> list[str]:
 
 
 def python_test_file_to_test_name(tests: set[str]) -> set[str]:
+    # [FUNCTION DOC] Converts changed paths into test names: normalizes backslashes, keeps
+    # paths under test/ ending in the python extension, and strips that prefix and extension.
     prefix = "test/"
     valid_tests = {
         f
@@ -102,6 +122,8 @@ def python_test_file_to_test_name(tests: set[str]) -> set[str]:
 
 @cache
 def get_pr_number() -> int | None:
+    # [FUNCTION DOC] Returns the PR number from the PR_NUMBER environment variable or from a
+    # GITHUB_REF tag reference ending in a number; None if neither is available. Cached.
     pr_number = os.environ.get("PR_NUMBER", "")
     if pr_number == "":
         re_match = re.match(r"^refs/tags/.*/(\d+)$", os.environ.get("GITHUB_REF", ""))
@@ -114,6 +136,9 @@ def get_pr_number() -> int | None:
 
 @cache
 def get_merge_base() -> str:
+    # [FUNCTION DOC] Returns the commit to diff against: the PR merge base if a PR number is
+    # known, else the merge base with the default branch (GIT_DEFAULT_BRANCH or main); on the
+    # default branch itself it returns the previous commit. Cached; runs git.
     pr_number = get_pr_number()
     if pr_number is not None:
         return _get_pr_merge_base(_get_pr_info(pr_number))
@@ -129,6 +154,10 @@ def get_merge_base() -> str:
 
 
 def query_changed_files() -> list[str]:
+    # [FUNCTION DOC] Returns the list of files changed between the merge base and HEAD using
+    # git, printing the base and the files. If git fails and a PR number is known, falls back
+    # to the GitHub API; otherwise re-raises. Side effects: subprocess calls and printing.
+    # KNOWN ISSUE: empty git output yields a list containing one empty string.
     pr_number = get_pr_number()
     try:
         base_commit = get_merge_base()
@@ -160,6 +189,9 @@ DOCS_ONLY_EXTENSIONS = frozenset({".rst", ".md"})
 
 
 def is_docs_only_change(changed_files: list[str]) -> bool:
+    # [FUNCTION DOC] Returns True if the list is non-empty and every non-empty entry has a
+    # documentation-only extension (.rst or .md); False otherwise.
+    # KNOWN ISSUE: a list consisting only of empty strings returns True.
     """
     Returns True if all changed files are documentation-only files
     (e.g., .rst, .md files) that don't require running tests.
@@ -181,6 +213,8 @@ def is_docs_only_change(changed_files: list[str]) -> bool:
 
 @cache
 def get_git_commit_info() -> str:
+    # [FUNCTION DOC] Returns the git log text of commits between the merge base and HEAD.
+    # Cached; runs git and raises CalledProcessError on failure.
     """Gets the commit info since the last commit on the default branch."""
     base_commit = get_merge_base()
 
@@ -195,6 +229,10 @@ def get_git_commit_info() -> str:
 
 @cache
 def get_issue_or_pr_body(number: int) -> str:
+    # [FUNCTION DOC] Returns the body text of an issue or PR (empty if none) from the GitHub
+    # issues API. Cached. Raises URL errors on failure.
+    # KNOWN ISSUE: the authorization header is always sent, so a missing GITHUB_TOKEN produces a
+    # header with the text None.
     """Gets the body of an issue or PR"""
     github_token = os.environ.get("GITHUB_TOKEN")
     headers = {
@@ -211,6 +249,11 @@ def get_issue_or_pr_body(number: int) -> str:
 def normalize_ratings(
     ratings: dict[TestRun, float], max_value: float, min_value: float = 0
 ) -> dict[TestRun, float]:
+    # [FUNCTION DOC] Returns a new mapping with ratings scaled so the maximum becomes max_value
+    # and the rest proportionally, then shifted so that a zero rating maps to min_value.
+    # Returns the input unchanged when empty. Raises AssertionError if the minimum or maximum
+    # rating is not positive.
+    # KNOWN ISSUE: the comment says ratings must be >= 0, but a zero rating raises an error.
     # Takse the ratings, makes the max value into max_value, and proportionally
     # distributes the rest of the ratings.
     # Ex [1,2,3,4] and max_value 8 gets converted to [2,4,6,8]
@@ -233,6 +276,9 @@ def normalize_ratings(
 
 
 def get_ratings_for_tests(file: str | Path) -> dict[str, float]:
+    # [FUNCTION DOC] Loads a correlation JSON (changed file to test to score) located relative
+    # to the repo root and sums, over the changed files of the PR, the scores per test. Returns
+    # an empty mapping, after printing a message, if the file is missing.
     path = REPO_ROOT / file
     if not os.path.exists(path):
         print(f"could not find path {path}")
@@ -248,6 +294,7 @@ def get_ratings_for_tests(file: str | Path) -> dict[str, float]:
 
 
 def get_correlated_tests(file: str | Path) -> list[str]:
+    # [FUNCTION DOC] Returns the correlated tests of the file sorted by descending total score.
     ratings = get_ratings_for_tests(file)
     prioritize = sorted(ratings, key=lambda x: -ratings[x])
     return prioritize

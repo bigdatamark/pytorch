@@ -1,3 +1,11 @@
+# [MODULE DOC] Sharding of test runs across CI shards by estimated duration. Splits long
+# runs into pytest shards (ShardedTest), distributes serial and parallel tests over
+# ShardJob bins, and offers helpers for disabled-test download and job base name parsing.
+# Import-time side effects: tries to import torch and its CUDA test utilities (falling back
+# to no CUDA), reads environment variables, derives NUM_PROCS and NUM_PROCS_FOR_SHARDING_CALC
+# (3 processes, 2 on pre-SM80 CUDA, 1 with the memory leak check) and on ROCm runs the
+# rocminfo tool to count GPUs (at most 8), raising AssertionError if none are found.
+
 from __future__ import annotations
 
 import math
@@ -66,11 +74,20 @@ if IS_ROCM and not IS_MEM_LEAK_CHECK:
 
 
 class ShardJob:
+    # [CLASS DOC] One shard of work: lists of serial tests and parallel tests (ShardedTest).
+    # Estimates its total time as the longest worker load for parallel tests plus all
+    # serial time.
     def __init__(self) -> None:
+        # [FUNCTION DOC] Creates empty serial and parallel lists.
         self.serial: list[ShardedTest] = []
         self.parallel: list[ShardedTest] = []
 
     def get_total_time(self) -> float:
+        # [FUNCTION DOC] Estimated seconds for the shard: greedily assigns parallel tests to the
+        # least loaded of NUM_PROCS_FOR_SHARDING_CALC workers, takes the maximum load and adds the
+        # sum of serial test times.
+        # KNOWN ISSUE: the docstring talks about a default substitute value, but the function
+        # has no such parameter; tests with unknown time count as zero.
         """Default is the value for which to substitute if a test has no time"""
         procs = [0.0 for _ in range(NUM_PROCS_FOR_SHARDING_CALC)]
         for test in self.parallel:
@@ -80,6 +97,8 @@ class ShardJob:
         return time
 
     def convert_to_tuple(self) -> tuple[float, list[ShardedTest]]:
+        # [FUNCTION DOC] Returns the pair of total time and the combined list of serial then
+        # parallel tests.
         return (self.get_total_time(), self.serial + self.parallel)
 
 
@@ -88,6 +107,9 @@ def get_with_pytest_shard(
     test_file_times: dict[str, float],
     test_class_times: dict[str, dict[str, float]] | None,
 ) -> list[ShardedTest]:
+    # [FUNCTION DOC] Turns runs into ShardedTest objects. A run whose known duration exceeds
+    # THRESHOLD (10 minutes) is split into ceil(duration/threshold) equal-time shards; others
+    # become a single 1 of 1 shard. Duration comes from get_duration (None if unknown).
     sharded_tests: list[ShardedTest] = []
 
     for test in tests:
@@ -109,6 +131,10 @@ def get_duration(
     test_file_times: dict[str, float],
     test_class_times: dict[str, dict[str, float]],
 ) -> float | None:
+    # [FUNCTION DOC] Returns the estimated seconds of a run, or None if unknown. A whole file
+    # uses the file time. Otherwise sums class times for included classes, or the file time
+    # minus excluded class times; None if any needed time is missing. Raises AssertionError for
+    # a partial run with neither included nor excluded classes.
     """Calculate the time for a TestRun based on the given test_file_times and
     test_class_times.  Returns None if the time is unknown."""
     file_duration = test_file_times.get(test.test_file, None)
@@ -118,6 +144,8 @@ def get_duration(
     def get_duration_for_classes(
         test_file: str, test_classes: frozenset[str]
     ) -> float | None:
+        # [FUNCTION DOC] HELPER: Sums the times of the given classes of the file, or returns None
+        # if any class has no recorded time.
         duration: float = 0
 
         for test_class in test_classes:
@@ -153,6 +181,10 @@ def shard(
     estimated_time_limit: float | None = None,
     serial: bool = False,
 ) -> None:
+    # [FUNCTION DOC] Distributes tests over the given jobs in place: serial tests go into each
+    # job's serial list, otherwise into the parallel list. Raises AssertionError if there are
+    # no jobs but tests exist, or if serial sharding lacks a time limit. Tests with unknown time
+    # are assigned round robin; the rest go to the job with the least total time.
     # Modifies sharded_jobs in place
     if len(sharded_jobs) == 0:
         if len(pytest_sharded_tests) != 0:
@@ -164,6 +196,8 @@ def shard(
     def _get_min_sharded_job(
         sharded_jobs: list[ShardJob], test: ShardedTest
     ) -> ShardJob:
+        # [FUNCTION DOC] HELPER: Picks the job for a test: round robin (shared counter) if the time
+        # is unknown, else the job with the smallest estimated total time.
         if test.time is None:
             nonlocal round_robin_index
             job = sharded_jobs[round_robin_index % len(sharded_jobs)]
@@ -174,6 +208,11 @@ def shard(
     def _shard_serial(
         tests: Sequence[ShardedTest], sharded_jobs: list[ShardJob]
     ) -> None:
+        # [FUNCTION DOC] HELPER: Adds each test to the serial list of the least loaded job. Once
+        # the last job exceeds the estimated time limit it is excluded from further choices, which
+        # keeps the last shard free for parallel work. Raises AssertionError without a limit.
+        # KNOWN ISSUE: the candidate list is always rebuilt from the full list, so at most the last
+        # job is excluded, and the check is always against the last job of the full list.
         if estimated_time_limit is None:
             raise AssertionError("Estimated time limit must be provided")
         new_sharded_jobs = sharded_jobs
@@ -189,6 +228,7 @@ def shard(
     def _shard_parallel(
         tests: Sequence[ShardedTest], sharded_jobs: list[ShardJob]
     ) -> None:
+        # [FUNCTION DOC] HELPER: Adds each test to the parallel list of the least loaded job.
         for test in tests:
             min_sharded_job = _get_min_sharded_job(sharded_jobs, test)
             min_sharded_job.parallel.append(test)
@@ -209,6 +249,11 @@ def calculate_shards(
     must_serial: Callable[[str], bool] | None = None,
     sort_by_time: bool = True,
 ) -> list[tuple[float, list[ShardedTest]]]:
+    # [FUNCTION DOC] Partitions runs into num_shards shards and returns one (estimated time,
+    # tests) pair per shard. Tests with known time are sorted from longest to shortest when
+    # sort_by_time is true, followed by unknown-time tests. Tests accepted by must_serial
+    # (default: all) are serial. Serial tests fill the first shards by a time limit; parallel
+    # tests are spread over all shards.
     must_serial = must_serial or (lambda x: True)
     test_class_times = test_class_times or {}
 
@@ -277,6 +322,8 @@ def calculate_shards(
 
 
 def get_test_case_configs(dirpath: str) -> None:
+    # [FUNCTION DOC] Downloads the disabled tests list into the directory by calling
+    # get_disabled_tests (network and file side effects).
     get_disabled_tests(dirpath=dirpath)
 
 
@@ -286,4 +333,7 @@ JOB_BASE_NAME_RE = re.compile(r" / test(?:-osdc)? \(")
 
 
 def get_job_base_name(job_name: str) -> str:
+    # [FUNCTION DOC] Returns the build environment name from a CI job name by splitting at the
+    # test target suffix (test or test-osdc followed by a parenthesis) and keeping the part
+    # before it.
     return JOB_BASE_NAME_RE.split(job_name, maxsplit=1)[0]

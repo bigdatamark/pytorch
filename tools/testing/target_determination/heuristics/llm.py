@@ -1,3 +1,7 @@
+# [MODULE DOC] Heuristic using precomputed LLM-generated mappings from changed files to
+# tests (a JSON in the additional CI files folder). REPO_ROOT is the repository root. No
+# import-time side effects.
+
 from __future__ import annotations
 
 import json
@@ -20,10 +24,15 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 
 
 class LLM(HeuristicInterface):
+    # [CLASS DOC] Heuristic scoring test files by the LLM mapping scores. Stateless apart
+    # from trial_mode.
     def __init__(self, **kwargs: dict[str, Any]) -> None:
+        # [FUNCTION DOC] Forwards keyword arguments (e.g. trial_mode) to the base class.
         super().__init__(**kwargs)
 
     def get_prediction_confidence(self, tests: list[str]) -> TestPrioritizations:
+        # [FUNCTION DOC] Takes per-test scores from get_mappings, keeps those in the given list,
+        # rescales so the best is 0.25 and returns a TestPrioritizations.
         critical_tests = self.get_mappings()
         filter_valid_tests = {
             TestRun(test): score
@@ -34,6 +43,12 @@ class LLM(HeuristicInterface):
         return TestPrioritizations(tests, normalized_scores)
 
     def get_mappings(self) -> dict[str, float]:
+        # [FUNCTION DOC] Reads the LLM mapping JSON and returns a mapping from test name (key
+        # with the python extension removed) to the average of the values for that name. Returns an
+        # empty mapping, after printing a message, if the file is missing. Reads a file.
+        # KNOWN ISSUE: the pattern is not anchored and its dot matches any character, so a key such
+        # as one containing "npy" or "xpy" mid-name is cut at that point instead of at a real
+        # python extension.
         path = (
             REPO_ROOT
             / ADDITIONAL_CI_FILES_FOLDER

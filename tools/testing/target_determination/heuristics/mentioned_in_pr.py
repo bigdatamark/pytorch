@@ -1,3 +1,7 @@
+# [MODULE DOC] Heuristic rating tests whose names appear in the commit messages, the PR
+# body or the bodies of issues and PRs linked from them. Uses the GitHub API. No
+# import-time side effects.
+
 from __future__ import annotations
 
 import re
@@ -21,13 +25,24 @@ from tools.testing.test_run import TestRun
 # body, test_foo will be rated 1.  If I mention #123 in the PR body, and #123
 # mentions "test_foo", test_foo will be rated 1.
 class MentionedInPR(HeuristicInterface):
+    # [CLASS DOC] Heuristic that gives score 1 to tests mentioned (by plain substring match) in
+    # the text gathered from the PR. Stateless apart from trial_mode.
+    # KNOWN ISSUE: substring matching means a short test name also matches longer names that
+    # contain it.
     def __init__(self, **kwargs: Any) -> None:
+        # [FUNCTION DOC] Forwards keyword arguments (e.g. trial_mode) to the base class.
         super().__init__(**kwargs)
 
     def _search_for_linked_issues(self, s: str) -> list[str]:
+        # [FUNCTION DOC] HELPER: Returns the issue or PR numbers (as strings) referenced in the
+        # text, by hash-number syntax or by pytorch repository URLs.
         return re.findall(r"#(\d+)", s) + re.findall(r"/pytorch/pytorch/.*/(\d+)", s)
 
     def get_prediction_confidence(self, tests: list[str]) -> TestPrioritizations:
+        # [FUNCTION DOC] Collects commit messages and the PR body (errors are printed and treated
+        # as empty text), fetches the bodies of linked issues (failures ignored), and gives score 1
+        # to every test name found in any of that text. Returns a TestPrioritizations.
+        # Side effects: git and GitHub API calls, prints on error.
         try:
             commit_messages = get_git_commit_info()
         except Exception as e:

@@ -1,3 +1,6 @@
+# [MODULE DOC] Script that regenerates the generated docstrings module of torch.masked.
+# Run it from the repository root; torch must be importable. No import-time side effects.
+
 """This script updates the file torch/masked/_docs.py that contains
 the generated doc-strings for various masked operations. The update
 should be triggered whenever a new masked operation is introduced to
@@ -9,6 +12,10 @@ import os
 
 
 def main() -> None:
+    # [FUNCTION DOC] Imports torch (prints and returns on failure), builds new file content
+    # with a header and one docstring variable per public masked operation (sorted by name),
+    # and rewrites the target file only if the content changed. Prints the outcome. The target
+    # path is relative to the current directory.
     target = os.path.join("torch", "masked", "_docs.py")
 
     try:

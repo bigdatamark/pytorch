@@ -1,3 +1,12 @@
+# [PACKAGE DOC] Target-determination heuristics package. Imports every concrete heuristic
+# class (PreviouslyFailedInPR, EditedByPR, MentionedInPR, HistoricalClassFailurCorrelation,
+# CorrelatedWithHistoricalFailures, HistorialEditedFiles, Profiling, LLM, Filepath,
+# PublicBindings) and re-exports AggregatedHeuristics and TestPrioritizations. It builds the
+# module-level HEURISTICS list: one instance of each heuristic, in the order they run
+# (HistoricalClassFailurCorrelation is created in trial mode, so its results are only
+# reported in metrics). The HeuristicInterface name is imported only for type checking.
+# Import-time effect: instantiates all heuristics (constructors do no I/O).
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING

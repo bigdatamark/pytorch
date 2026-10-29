@@ -1,3 +1,8 @@
+# [MODULE DOC] Heuristic that gives top priority to test files modified by the current PR.
+# Also holds ADDITIONAL_MAPPINGS, which maps generated test names to regexes over changed
+# file paths so edits to those directories trigger the generated tests. No import-time
+# side effects.
+
 from __future__ import annotations
 
 import re
@@ -27,10 +32,14 @@ ADDITIONAL_MAPPINGS = {
 
 
 class EditedByPR(HeuristicInterface):
+    # [CLASS DOC] Heuristic rating tests edited by the PR with score 1 and all others 0.
     def __init__(self, **kwargs: dict[str, Any]) -> None:
+        # [FUNCTION DOC] Forwards keyword arguments (e.g. trial_mode) to the base class.
         super().__init__(**kwargs)
 
     def get_prediction_confidence(self, tests: list[str]) -> TestPrioritizations:
+        # [FUNCTION DOC] Computes the set of modified tests and returns a TestPrioritizations over
+        # the given tests where each modified test that is in the list gets score 1.
         critical_tests = _get_modified_tests()
         return TestPrioritizations(
             tests, {TestRun(test): 1 for test in critical_tests if test in tests}
@@ -38,6 +47,9 @@ class EditedByPR(HeuristicInterface):
 
 
 def _get_modified_tests() -> set[str]:
+    # [FUNCTION DOC] HELPER: Returns the set of test names that the PR touched. Takes the
+    # changed files, converts changed test/*.py paths to test names, and adds each test name in
+    # ADDITIONAL_MAPPINGS whose regexes match any changed file path. Queries git or GitHub.
     changed_files = query_changed_files()
     should_run = python_test_file_to_test_name(set(changed_files))
     for test_file, regexes in ADDITIONAL_MAPPINGS.items():
