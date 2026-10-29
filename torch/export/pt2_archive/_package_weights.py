@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Helpers for deduplicating model weights in a PT2 archive: records per-tensor
+# storage properties (TensorProperties), a name-to-(tensor, properties) mapping
+# (Weights), groups weights that share one storage (group_weights), and
+# recovers the full tensor spanning a shared storage (get_complete_tensor).
+# No import-time side effects.
 import collections
 import warnings
 
@@ -7,6 +13,9 @@ from torch.utils._ordered_set import OrderedSet
 
 
 def _end_ptr(tensor: torch.Tensor) -> int:
+    # [FUNCTION DOC] HELPER: Returns the address one past the last byte of the
+    # tensor's data (address of last element plus element size), or just the
+    # data pointer for an empty tensor. Reads the data pointer only; no mutation.
     if tensor.nelement():
         stop = tensor.view(-1)[-1].data_ptr() + tensor.element_size()
     else:
@@ -15,7 +24,17 @@ def _end_ptr(tensor: torch.Tensor) -> int:
 
 
 class TensorProperties:
+    # [CLASS DOC] Snapshot of the storage-related properties of one tensor,
+    # used to detect shared storage and to recover the tensor later.
+    # Attributes: is_fake, is_contiguous, storage_ptr/storage_size/start/end
+    # (None for fake tensors; size/start/end also None when non-contiguous),
+    # plus shape, stride and storage offset needed to rebuild the view.
+    # Key method: is_complete.
     def __init__(self, tensor: torch.Tensor):
+        # [FUNCTION DOC] Captures the properties of the given tensor. Real
+        # tensors record the storage pointer; contiguous real tensors also
+        # record storage byte size and the start/end data addresses. Shape,
+        # stride and storage offset are always recorded. Does not mutate the tensor.
         self.is_fake = is_fake_tensor(tensor)
         self.is_contiguous = tensor.is_contiguous()
         self.storage_ptr = None
@@ -42,6 +61,11 @@ class TensorProperties:
         self.offset = tensor.storage_offset()
 
     def is_complete(self) -> bool:
+        # [FUNCTION DOC] Returns True if the tensor covers its whole storage:
+        # always True for fake tensors, False for non-contiguous tensors, and
+        # otherwise True when start equals the storage pointer and end equals
+        # storage pointer plus storage size.
+        # Raises AssertionError if a real contiguous tensor lacks recorded pointers.
         """
         Whether the tensor completely overlaps with its underlying storage
         """
@@ -67,6 +91,9 @@ class TensorProperties:
 
 
 class Weights(dict):
+    # [CLASS DOC] Dict subclass mapping weight name to a (tensor, TensorProperties)
+    # pair. The tensor may be a clone, so the properties describe the original
+    # weight. Adds typed accessors; no extra state beyond the dict contents.
     """
     A dictionary mapping from weight name to a tuple of (tensor, TensorProperties).
     tensor represents the actual initial value of the weight.
@@ -77,18 +104,34 @@ class Weights(dict):
     """
 
     def __init__(self, weight_dict: dict[str, tuple[torch.Tensor, TensorProperties]]):
+        # [FUNCTION DOC] Initializes the dict from the given name-to-pair mapping (copied).
         super().__init__(weight_dict)
 
     def get_weight(self, name: str) -> tuple[torch.Tensor, TensorProperties]:
+        # [FUNCTION DOC] Returns the (tensor, properties) pair for the name.
+        # Raises KeyError if the name is absent.
         return self[name]
 
     def get_weight_properties(self, name: str) -> TensorProperties:
+        # [FUNCTION DOC] Returns only the TensorProperties for the name.
+        # Raises KeyError if the name is absent.
         return self[name][1]
 
 
 def get_complete_tensor(
     group: OrderedSet[tuple[str, str]], models_weights: dict[str, Weights]
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Given a group of (model name, weight name) pairs that share
+    # one storage, returns a tensor covering the whole storage range: the first
+    # complete tensor found, else a flat tensor rebuilt over the union of the
+    # slices' address ranges (assumes one dtype).
+    # Raises AssertionError for an empty group, inconsistent start/end info, or
+    # a size not a multiple of the element size. Emits a warning when no
+    # complete tensor exists. Returns the first tensor unchanged if no address
+    # info exists (fake tensors).
+    # KNOWN ISSUE: the alignment check happens after the integer division, and
+    # the size is computed from the end address minus the storage pointer, which
+    # ignores the minimum start address that was tracked.
     """
     Given a group of (model_name, weight_name) pairs whose tensors share the same
     underlying storage, return the complete (maximal) tensor covering that storage
@@ -194,6 +237,10 @@ def get_complete_tensor(
 
 
 def group_weights(all_weights: dict[str, Weights]) -> list[OrderedSet[tuple[str, str]]]:
+    # [FUNCTION DOC] Groups weights by (storage pointer, dtype) across all models.
+    # Input: mapping of model name to Weights. Output: list of ordered sets of
+    # (model name, weight name) pairs, one per distinct key, in first-seen order.
+    # Fake tensors share a None storage pointer, so same-dtype fakes group together.
     """
     Group weights that share the same underlying storage.
 

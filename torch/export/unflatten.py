@@ -1,4 +1,14 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Implements torch.export.unflatten: turns a flat ExportedProgram graph back into
+# a module hierarchy matching the original eager module. Public contents:
+# unflatten, UnflattenedModule (root module), InterpreterModule and
+# InterpreterModuleDispatcher (per-call submodule types), FlatArgsAdapter
+# (abstract input adapter). Private contents: _ModuleFrame and helpers that
+# outline graph nodes into submodules, sink parameters/buffers/constants to the
+# modules that use them, deduplicate repeated module calls, and inline or
+# reorder modules. Import-time side effects: creates the module logger and the
+# module-level flag RUN_WITH_INTERPRETER (default True).
 import abc
 import copy
 import logging
@@ -49,6 +59,8 @@ __all__ = [
 
 
 class _AttrKind(Enum):
+    # [CLASS DOC] HELPER: Enumeration of kinds of attributes installed on
+    # modules during unflattening: parameter, buffer, constant, or module.
     PARAMETER = "parameter"
     BUFFER = "buffer"
     CONSTANT = "constant"
@@ -57,6 +69,9 @@ class _AttrKind(Enum):
 
 @dataclass(frozen=True)
 class _TensorID:
+    # [CLASS DOC] HELPER: Frozen (hashable) identity key for a tensor made of its
+    # untyped storage, stride, size and storage offset; used to detect aliased
+    # tensors that share the same memory view.
     """Custom tensor identifier containing storage, stride, and size information."""
 
     untyped_storage: torch.UntypedStorage
@@ -70,6 +85,10 @@ RUN_WITH_INTERPRETER = True
 
 @contextmanager
 def _disable_interpreter():
+    # [FUNCTION DOC] HELPER: Context manager that temporarily sets the module
+    # global RUN_WITH_INTERPRETER to False, so modules constructed inside the
+    # block run via generated code instead of the interpreter. The previous value
+    # is restored on exit, even on error.
     global RUN_WITH_INTERPRETER
     old_flag = RUN_WITH_INTERPRETER
     RUN_WITH_INTERPRETER = False
@@ -88,6 +107,13 @@ def _assign_attr(
     attr_kind: _AttrKind,
     persistent: bool = True,
 ):
+    # [FUNCTION DOC] HELPER: Installs from_obj at the dotted path target under
+    # to_module, creating empty intermediate modules as needed. The attribute is
+    # assigned on every call-name variant of each intermediate module so all
+    # calls share it. By kind: registers a parameter, registers a buffer (with the
+    # persistent flag), sets a constant, or sets a submodule. Mutates modules.
+    # Raises AssertionError if from_obj has the wrong type for the kind
+    # (including a FakeScriptObject constant).
     *prefix, field = target.split(".")
     # We need to generate all submodules of `to_module` that are at `prefix` and
     # variants of `prefix` that differ only by call name. All of these submodules
@@ -152,9 +178,12 @@ def _assign_attr(
 
 
 class _SubmoduleBase:
+    # [CLASS DOC] HELPER: Mixin for unflattened module types holding _ty, the
+    # original eager module's type name (or None), exposed through type_name.
     _ty: str | None
 
     def type_name(self) -> str | None:
+        # [FUNCTION DOC] Returns the recorded original module type name, or None if unknown.
         """
         Subclass of this class - InterpreterModule, InterpreterModuleDispatcher, represents
         corresponding model in eager model. To get this type information for those modules
@@ -164,6 +193,12 @@ class _SubmoduleBase:
 
 
 class InterpreterModule(_SubmoduleBase, torch.nn.Module):
+    # [CLASS DOC] Module backed by an fx graph that executes by interpreting the
+    # graph node by node (better stack traces) instead of generated code.
+    # State: graph, _ty (eager type name), _run_with_interpreter (captured from
+    # the global flag at construction), graph_module (generated-code version,
+    # present only after finalize) and arg_names (placeholder names, set by
+    # finalize). Must be finalized before use.
     """A module that uses torch.fx.Interpreter to execute instead of the usual
     codegen that GraphModule uses. This provides better stack trace information
     and makes it easier to debug execution.
@@ -176,6 +211,8 @@ class InterpreterModule(_SubmoduleBase, torch.nn.Module):
         graph: torch.fx.Graph,
         ty: str | None = None,
     ):
+        # [FUNCTION DOC] Stores the graph and eager type name, makes this module the
+        # graph's owning module, and captures the current RUN_WITH_INTERPRETER flag.
         super().__init__()
         self.graph = graph
         self._ty = ty
@@ -183,6 +220,15 @@ class InterpreterModule(_SubmoduleBase, torch.nn.Module):
         self._run_with_interpreter = RUN_WITH_INTERPRETER
 
     def forward(self, *args, **kwargs):
+        # [FUNCTION DOC] Runs the graph. Raises AssertionError if finalize was not
+        # called (or, with keyword arguments, if their names do not exactly match
+        # the remaining placeholder names). When dynamo is compiling or the
+        # interpreter is disabled, runs the generated code of graph_module bound to
+        # this module; otherwise maps keyword arguments onto positional ones by
+        # placeholder name and runs the fx interpreter. Returns the graph output.
+        # KNOWN ISSUE: the graph_module check is an attribute read that raises
+        # AttributeError (not the intended AssertionError) when never finalized,
+        # because only a class annotation exists.
         if self.graph_module is None:
             raise AssertionError("Didn't finalize this InterpreterModule")
         if not is_fx_symbolic_tracing() and (
@@ -225,6 +271,10 @@ class InterpreterModule(_SubmoduleBase, torch.nn.Module):
             )
 
     def finalize(self):
+        # [FUNCTION DOC] Builds the generated-code GraphModule from the completed
+        # graph (stored directly in the instance dict so it is not registered as a
+        # submodule), lints the graph, and caches the placeholder names in
+        # arg_names for keyword handling. Call once after the graph is fully built.
         # We need to "finalize" because GraphModule populates its own state_dict
         # based on the get_attrs observed in the graph. So we need to fully
         # construct the graph and call _sink_params before generating this
@@ -248,6 +298,8 @@ class InterpreterModule(_SubmoduleBase, torch.nn.Module):
         include_device=False,
         colored=False,
     ):
+        # [FUNCTION DOC] Pretty-prints (and returns) the readable form of this module
+        # under the label InterpreterModule; flags control printing, strides, devices and color.
         return _print_readable(
             self,
             "InterpreterModule",
@@ -259,6 +311,11 @@ class InterpreterModule(_SubmoduleBase, torch.nn.Module):
 
 
 class InterpreterModuleDispatcher(_SubmoduleBase, torch.nn.Module):
+    # [CLASS DOC] Stand-in for a module called several times with different
+    # per-call graphs. State: _call_modules (one InterpreterModule per call, in
+    # call order), _num_calls (index of the next call, wraps around), shared
+    # submodule table and selected attributes copied from the first call module.
+    # Each forward runs the next call module.
     """
     A module that carries a sequence of InterpreterModules corresponding to
     a sequence of calls of that module. Each call to the module dispatches
@@ -266,6 +323,10 @@ class InterpreterModuleDispatcher(_SubmoduleBase, torch.nn.Module):
     """
 
     def __init__(self, attrs: set[str], call_modules: list[InterpreterModule]):
+        # [FUNCTION DOC] Takes the attribute names to expose and the ordered call
+        # modules. Shares the first call module's submodule table, copies the named
+        # attributes and type name from it, and resets the call counter.
+        # Raises AssertionError if call_modules is empty.
         super().__init__()
         if not call_modules:
             raise AssertionError("call_modules must not be empty")
@@ -277,6 +338,9 @@ class InterpreterModuleDispatcher(_SubmoduleBase, torch.nn.Module):
         self._num_calls = 0
 
     def forward(self, *args, **kwargs):
+        # [FUNCTION DOC] Calls the current call module with the arguments, then
+        # advances the counter modulo the number of call modules. If the call raises,
+        # the counter is reset to zero and the error is re-raised. Returns the call's output.
         call_module = self._call_modules[self._num_calls]
         self._num_calls = (self._num_calls + 1) % len(self._call_modules)
         try:
@@ -286,6 +350,7 @@ class InterpreterModuleDispatcher(_SubmoduleBase, torch.nn.Module):
             raise
 
     def call_modules(self):
+        # [FUNCTION DOC] Returns the ordered list of per-call modules.
         return self._call_modules
 
     def print_readable(
@@ -295,6 +360,7 @@ class InterpreterModuleDispatcher(_SubmoduleBase, torch.nn.Module):
         include_device=False,
         colored=False,
     ):
+        # [FUNCTION DOC] Returns the readable forms of all call modules joined by newlines.
         outputs = [
             mod.print_readable(
                 print_output,
@@ -308,6 +374,9 @@ class InterpreterModuleDispatcher(_SubmoduleBase, torch.nn.Module):
 
 
 class FlatArgsAdapter(abc.ABC):
+    # [CLASS DOC] Abstract interface for adapting flat input arguments whose tree
+    # structure differs from the exported module's expected structure. Subclasses
+    # implement adapt; get_flat_arg_paths optionally names argument locations.
     """
     Adapts input arguments with ``input_spec`` to align ``target_spec``.
     """
@@ -321,25 +390,52 @@ class FlatArgsAdapter(abc.ABC):
         metadata: dict[str, Any] | None = None,
         obj: Any | None = None,
     ) -> list[Any]:
+        # [FUNCTION DOC] Abstract. Converts flat input_args laid out per input_spec into a
+        # flat list laid out per target_spec, using optional metadata and the original
+        # input object. Returns the adapted list; may mutate input_args.
         """NOTE: This adapter may mutate given ``input_args_with_path``."""
         ...
 
     def get_flat_arg_paths(self) -> list[str]:
+        # [FUNCTION DOC] Returns names describing where each flat adapted argument came
+        # from (used in constraint-check error paths); default is an empty list.
         """Returns a list of paths that are used to access the flat args."""
         return []
 
 
 class UnflattenedModule(_SubmoduleBase, torch.nn.Module):
+    # [CLASS DOC] Root module produced by unflattening an ExportedProgram: a module
+    # tree mirroring the original eager hierarchy. State: graph and graph_signature
+    # (copies), module_call_graph, flat_args_adapter, adapted flag, meta (shared with
+    # the program, holds a back reference), ivals (intermediate-value mutation
+    # tracker), range_constraints, input_placeholders, check_input_constraints, and
+    # per-module parameters, buffers and constants. Calling it flattens the inputs,
+    # runs the root graph and rebuilds the output structure.
     def __init__(
         self,
         export_module: ExportedProgram,
         flat_args_adapter: FlatArgsAdapter | None = None,
     ):
+        # [FUNCTION DOC] Builds the module tree from the exported program. Steps: copy
+        # graph, signature and call graph; convert functionalized buffer/input
+        # mutations to in-place copies; fix inconsistent module stacks; outline graph
+        # nodes into submodules; install parameters, buffers (persistent or not) and
+        # constants as attributes with aliasing preserved by tensor identity (tensors
+        # are cloned); sink them to the modules that use them; deduplicate repeated
+        # module calls; replace multi-call modules with dispatchers; reorder
+        # submodules by call-graph order; lint and finalize. Raises ValueError for
+        # joint (backward) programs; AssertionError for malformed inputs. Mutates
+        # export_module.graph_module.meta by adding a self reference.
+        # KNOWN ISSUE: in the loop adding aliased constants, added_params_buffers adds
+        # the stale loop variable s.target (leaked from the earlier loop) rather than the
+        # constant name; harmless today because that set is only consulted for state-dict names.
         super().__init__()
         if export_module.graph_signature.backward_signature is not None:
             raise ValueError("Unflattening on JointExportModule NYI")
 
         def _id(obj):
+            # [FUNCTION DOC] HELPER: Returns a tensor identity key (storage, stride, size,
+            # offset) for tensors, or the Python object id for anything else.
             """Returns _TensorID dataclass for tensors, otherwise id()."""
             if isinstance(obj, torch.Tensor):
                 return _TensorID(
@@ -497,6 +593,8 @@ class UnflattenedModule(_SubmoduleBase, torch.nn.Module):
         consts_targets: set[str] = set()
 
         def add_to_consts_map(obj_id, node_name, target_name):
+            # [FUNCTION DOC] HELPER: Appends a (placeholder node name, target attribute
+            # name) pair to the list of aliases recorded for the object identity key.
             name_list = consts_map[obj_id]
             name_list.append((node_name, target_name))
 
@@ -600,12 +698,18 @@ class UnflattenedModule(_SubmoduleBase, torch.nn.Module):
         self.finalize()
 
     def _print_graph(self):
+        # [FUNCTION DOC] HELPER: Debug aid that prints, for every named submodule that
+        # has an fx graph, the module name and its graph to standard output.
         for fqn, mod in self.named_modules():
             print(fqn + ":")
             if hasattr(mod, "graph") and isinstance(mod.graph, torch.fx.Graph):
                 print(mod.graph)
 
     def _adapt_flat_args(self, flat_args, in_spec, input):
+        # [FUNCTION DOC] HELPER: Returns flat_args unchanged when the input tree spec equals
+        # the exported signature's input spec. Otherwise runs the flat args adapter
+        # (target spec, input spec, args, metadata, original input) and checks the result
+        # length. Raises TypeError if no adapter is configured or the adapted count mismatches.
         signature = self.module_call_graph[0].signature
         if in_spec == signature.in_spec:
             return flat_args
@@ -633,6 +737,13 @@ class UnflattenedModule(_SubmoduleBase, torch.nn.Module):
             return flat_args
 
     def process_forward_inputs(self, *args, **kwargs):
+        # [FUNCTION DOC] Turns call arguments into the flat list the graph expects:
+        # reorders keyword arguments to the signature, flattens (args, kwargs) with
+        # paths, and, if the tree spec differs, prints a notice (first time only) and
+        # adapts via the adapter, setting the adapted flag. During fx symbolic tracing
+        # returns the flat args directly. When enabled, checks input constraints against
+        # range constraints. Returns the flat args. Raises TypeError from adaptation or
+        # constraint violations from the check; side effect: prints to standard output.
         signature = self.module_call_graph[0].signature
 
         reordered_kwargs = kwargs
@@ -697,6 +808,11 @@ class UnflattenedModule(_SubmoduleBase, torch.nn.Module):
         return flat_args
 
     def forward(self, *args, **kwargs):
+        # [FUNCTION DOC] Runs the unflattened program: processes inputs to a flat list,
+        # runs the root graph (interpreter, or generated code when dynamo-compiling or the
+        # interpreter is disabled), and rebuilds the output structure from the signature's
+        # output spec. Under fx symbolic tracing returns the raw result, unwrapping a
+        # one-element tuple. Returns the structured output.
         flat_args = self.process_forward_inputs(*args, **kwargs)
         signature = self.module_call_graph[0].signature
 
@@ -718,10 +834,18 @@ class UnflattenedModule(_SubmoduleBase, torch.nn.Module):
         return pytree.tree_unflatten(tree_out, signature.out_spec)
 
     def finalize(self):
+        # [FUNCTION DOC] Builds the generated-code GraphModule for the root graph (kept out
+        # of the registered submodules) and lints the graph. Call after the graph is complete.
         self.__dict__["graph_module"] = torch.fx.GraphModule(self, self.graph)
         self.graph.lint()
 
     def _dispatch_modules(self, redirected_call_indices, consts_targets):
+        # [FUNCTION DOC] HELPER: For modules whose call signatures are preserved and that are
+        # called more than once, removes the per-call submodules (names with an @ suffix) and
+        # installs one InterpreterModuleDispatcher at the base name, exposing the constant
+        # attribute names found for it. Then rewrites call_module targets in all graphs to drop
+        # the call index. Inputs: mapping of redirected call names to kept names, and the set
+        # of constant target names. Mutates the module tree and graphs.
         """For a module whose call signatures are preserved, replace
         multiple modules corresponding to multiple calls to that module
         with a single dispatcher module that tracks which module to call.
@@ -764,6 +888,8 @@ class UnflattenedModule(_SubmoduleBase, torch.nn.Module):
         # elide call indices in call modules because they are
         # tracked automatically inside the dispatcher module
         def elide_call_indices(prefix, graph):
+            # [FUNCTION DOC] HELPER: In the graph, strips the call index suffix from each
+            # call_module target whose full path (prefix plus base name) is a dispatched module.
             for node in graph.nodes:
                 if node.op == "call_module":
                     fqn = node.target.split("@")[0]
@@ -789,6 +915,8 @@ class UnflattenedModule(_SubmoduleBase, torch.nn.Module):
         include_device=False,
         colored=False,
     ):
+        # [FUNCTION DOC] Pretty-prints (and returns) the readable form under the label
+        # UnflattenedModule; flags control printing, strides, devices and color.
         return _print_readable(
             self,
             "UnflattenedModule",
@@ -802,6 +930,10 @@ class UnflattenedModule(_SubmoduleBase, torch.nn.Module):
 def unflatten(
     module: ExportedProgram, flat_args_adapter: FlatArgsAdapter | None = None
 ) -> UnflattenedModule:
+    # [FUNCTION DOC] Public entry point. Removes effect tokens from the exported program,
+    # builds an UnflattenedModule with the optional input adapter, and wraps its input
+    # processing method so dynamo does not trace into it. Returns the unflattened module
+    # (module hierarchy matching the eager module). Errors from construction propagate.
     """Unflatten an ExportedProgram, producing a module with the same module
     hierarchy as the original eager module. This can be useful if you are trying
     to use :mod:`torch.export` with another system that expects a module
@@ -839,6 +971,11 @@ def _inplace_buffer_and_input_mutations(
     graph: torch.fx.Graph,
     graph_signature: ExportGraphSignature,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Rewrites the graph in place so each mutated buffer or user
+    # input, which functionalization returns as leading outputs, is instead updated by an
+    # in-place copy node inserted after the mutation value; uses of the value are redirected
+    # and the mutation outputs are dropped from the output node. Metadata is copied to the
+    # new nodes. Raises AssertionError if the last node is not a single-argument output node.
     """Transform buffer and input mutations from their functionalized form
     into copy_ nodes in the graph.
 
@@ -911,6 +1048,8 @@ def _inplace_buffer_and_input_mutations(
 
 
 def _root_module_type(graph: torch.fx.Graph) -> str | None:
+    # [FUNCTION DOC] HELPER: Returns the type name recorded for the root module (empty path)
+    # in the first node whose module stack contains it, or None if none does.
     for node in graph.nodes:
         if "nn_module_stack" not in node.meta:
             continue
@@ -922,6 +1061,9 @@ def _root_module_type(graph: torch.fx.Graph) -> str | None:
 
 
 def _fix_nn_module_stacks(graph):
+    # [FUNCTION DOC] HELPER: For every node with a module stack, strips call suffixes from
+    # the names and keeps only the leading entries where each name is a strict prefix of the
+    # next; the remaining entries are dropped with a logged warning. Mutates node metadata.
     # For each nn module stack in the graph, check if the fqns in it represent a stack:
     # 1. Each fqn must be a prefix of the next fqn.
     # 2. If not, remove the entries starting from the next fqn, emitting a warning.
@@ -961,11 +1103,16 @@ def _fix_nn_module_stacks(graph):
 
 
 def _is_prefix(candidate, target):
+    # [FUNCTION DOC] HELPER: True if candidate is a strictly shorter string-prefix of target.
+    # KNOWN ISSUE: plain string prefix, so "a.b" counts as a prefix of "a.bc".
     """Check whether `candidate` is a prefix of `target`."""
     return len(candidate) < len(target) and target[: len(candidate)] == candidate
 
 
 def _compute_accessor(parent_fqn: str, child_fqn: str) -> str:
+    # [FUNCTION DOC] HELPER: Returns the dotted attribute path of the child relative to the
+    # parent (the child name unchanged for the root parent). Raises RuntimeError if the child
+    # is not a descendant of the parent.
     if parent_fqn == "":
         # Handle the root module correctly.
         return child_fqn
@@ -984,11 +1131,17 @@ def _compute_accessor(parent_fqn: str, child_fqn: str) -> str:
 
 
 def _check_graph_equivalence(x: torch.nn.Module, y: torch.nn.Module):
+    # [FUNCTION DOC] HELPER: Returns True if the two modules' fx graphs have identical
+    # textual dumps (op, target for calls/attributes, and arguments with nodes numbered by
+    # position). Raises AssertionError if either graph is not an fx Graph.
     def graph_dump(graph: torch.fx.Graph) -> str:
+        # [FUNCTION DOC] HELPER: Renders the graph as one line per node, with node arguments
+        # shown as position references so names do not matter.
         ret = []
         nodes_idx: dict[int, int] = {}
 
         def arg_dump(arg) -> str:
+            # [FUNCTION DOC] HELPER: Renders a node as its position reference, other values via text conversion.
             if isinstance(arg, torch.fx.Node):
                 return "%" + str(nodes_idx[id(arg)])
             return str(arg)
@@ -1017,6 +1170,8 @@ def _check_graph_equivalence(x: torch.nn.Module, y: torch.nn.Module):
 
 
 def _add_spec(gm: torch.nn.Module, spec) -> str:
+    # [FUNCTION DOC] HELPER: Stores the tree spec on the module under the first unused name
+    # of the form _spec_N and returns that name. Mutates the module.
     i = 0
     while hasattr(gm, f"_spec_{i}"):
         i += 1
@@ -1026,6 +1181,8 @@ def _add_spec(gm: torch.nn.Module, spec) -> str:
 
 
 def _generate_flatten(gm: torch.fx.GraphModule, node) -> torch.fx.Node:
+    # [FUNCTION DOC] HELPER: Adds graph nodes that flatten the node's value with the pytree
+    # flatten function and select the leaf list; returns that selecting node.
     flatten = gm.graph.call_function(pytree.tree_flatten, (node,))
     getitem_0 = gm.graph.call_function(operator.getitem, (flatten, 0))
     return getitem_0
@@ -1034,6 +1191,8 @@ def _generate_flatten(gm: torch.fx.GraphModule, node) -> torch.fx.Node:
 def _generate_flatten_spec(
     gm: torch.fx.GraphModule | InterpreterModule | UnflattenedModule, node, spec
 ) -> torch.fx.Node:
+    # [FUNCTION DOC] HELPER: Stores the spec on the module, then adds graph nodes that
+    # flatten the given node according to that spec; returns the flatten node.
     name = _add_spec(gm, spec)
     spec_node = gm.graph.get_attr(name)
     return gm.graph.call_function(fx_pytree.tree_flatten_spec, (node, spec_node))
@@ -1042,12 +1201,16 @@ def _generate_flatten_spec(
 def _generate_unflatten(
     gm: torch.fx.GraphModule | InterpreterModule | UnflattenedModule, nodes, spec
 ) -> torch.fx.Node:
+    # [FUNCTION DOC] HELPER: Stores the spec on the module, then adds a graph node that
+    # rebuilds a structure from the leaf nodes according to that spec; returns that node.
     name = _add_spec(gm, spec)
     spec_node = gm.graph.get_attr(name)
     return gm.graph.call_function(pytree.tree_unflatten, (nodes, spec_node))
 
 
 def _get_submodule(mod: torch.nn.Module, target: str):
+    # [FUNCTION DOC] HELPER: Walks the dotted path from the module and returns the final
+    # attribute (any type), or None if an intermediate attribute is missing or is not a module.
     *prefix, field = target.split(".")
 
     for item in prefix:
@@ -1070,6 +1233,10 @@ def _add_submodule(
     module_to_add: torch.nn.Module,
     create_module: Callable[[str], torch.nn.Module] | None = None,
 ):
+    # [FUNCTION DOC] HELPER: Adds module_to_add at the dotted path under mod, creating missing
+    # intermediate modules with the create_module factory (given the partial path) or empty
+    # modules. Returns False if an existing intermediate attribute is not a module, else None.
+    # Mutates the module tree.
     *prefix, field = target.split(".")
 
     for i, item in enumerate(prefix):
@@ -1091,17 +1258,28 @@ def _add_submodule(
 
 
 def _call_name(base: str, n: int) -> str:
+    # [FUNCTION DOC] HELPER: Returns the name of the n-th call (1-based) of the module: the
+    # base for the first call, else the base with an @ and the zero-based repeat index.
     # Given n >= 0, generate call names to a submodule `base` of the form
     # `base`, `base@1`, `base@2`, etc.
     return base if n == 1 else f"{base}@{n - 1}"
 
 
 def _is_call_name(call_name: str, base: str) -> bool:
+    # [FUNCTION DOC] HELPER: True if call_name is the base name or the base followed by an
+    # @ and digits (any call variant of that module).
     # Recognize when call_name = _call_name(base, n) for some n >= 0.
     return re.match(re.escape(base) + r"(@\d+)?$", call_name) is not None
 
 
 class _ModuleFrame:
+    # [CLASS DOC] HELPER: Working state for outlining one call of one module from the
+    # flat graph. Holds the flat graph, the nodes belonging to this frame, shared
+    # bookkeeping (seen nodes, seen module entries, seen attrs, created modules), the parent
+    # frame, the module stack and call signature info, the target module and its graph,
+    # a node map from flat-graph nodes to this graph, and placeholders. Its constructor
+    # attaches the module to the parent and wires call arguments; run_outer and
+    # its helpers copy nodes, create placeholders and outputs, and recurse into children.
     def __init__(
         self,
         flat_graph: torch.fx.Graph,
@@ -1116,6 +1294,14 @@ class _ModuleFrame:
         module_call_graph: dict[str, ModuleCallSignature],
         module: torch.fx.GraphModule | UnflattenedModule | None = None,
     ):
+        # [FUNCTION DOC] Sets up the frame for the last entry of the module stack: derives the
+        # call name, picks or creates the module (an existing created module or a new
+        # InterpreterModule), and, for non-root frames, adds it to the parent module, emits a
+        # call_module node in the parent graph, shares submodules with earlier calls of the
+        # same module, and records a submodule entry. If the module's call signature was
+        # preserved, builds input placeholders and flatten nodes in this graph and unflatten
+        # nodes in the parent so arguments match the original call. Raises AssertionError on
+        # unexpected signature structure.
         self.flat_graph = flat_graph
         self.nodes = nodes
         self.seen_nodes = seen_nodes
@@ -1155,6 +1341,9 @@ class _ModuleFrame:
             accessor = _compute_accessor(parent.fqn, self.child_fqn)
 
             def create_module(fqn):
+                # [FUNCTION DOC] HELPER: Returns the intermediate module for the given partial
+                # name under the parent, reusing one already created or creating and recording
+                # a new empty InterpreterModule of the current type.
                 path = f"{parent.fqn}.{fqn}" if parent.fqn else fqn
                 if path in self.created_modules:
                     return self.created_modules[path]
@@ -1285,6 +1474,9 @@ class _ModuleFrame:
             self.parent_call_module.kwargs = kwarg_nodes  # type: ignore[assignment]
 
     def add_placeholder(self, x):
+        # [FUNCTION DOC] Adds a placeholder to this frame's graph for flat-graph node x (copying
+        # name, type and metadata) and records it in the node-to-placeholder map; returns nothing.
+        # Raises AssertionError for the root frame or if x is not from the flat graph.
         if self.fqn == "":
             raise AssertionError(f"Cannot add placeholder {x} to root module")
         if x.graph is not self.flat_graph:
@@ -1300,6 +1492,9 @@ class _ModuleFrame:
         self.node_to_placeholder[x] = placeholder_node
 
     def copy_sym_call_function(self, x):
+        # [FUNCTION DOC] Re-creates the call_function node x (symbolic-value computations that
+        # export deduplicated) in this frame's graph, remapping its node arguments, copying
+        # metadata and recording it in the node map. Returns the new node.
         # This only exists because we deduplicate sym_size nodes in the flat export graph,
         # and if preserve_module_call_signature is set, we may not be able to pass sym_size
         # nodes, or their downstream users, as inputs to submodule calls.
@@ -1314,6 +1509,13 @@ class _ModuleFrame:
         return node
 
     def remap_input(self, x):
+        # [FUNCTION DOC] Maps a flat-graph node used as an input to the corresponding node in
+        # this frame's graph. Order of resolution: already copied node; existing placeholder;
+        # a new placeholder (for graph inputs, or when call signatures are not preserved), also
+        # threaded through the parent call node; a copy of a sym-size-like or operator call
+        # function; or, for an intermediate value of a mutation, a read recorded in the ivals
+        # tracker. Raises AssertionError if x is not from the flat graph, RuntimeError for an
+        # unsupported node kind.
         if x.graph is not self.flat_graph:
             raise AssertionError(
                 "expected x.graph to be flat_graph, got different graph"
@@ -1360,6 +1562,12 @@ class _ModuleFrame:
             )
 
     def uplift_common_custom_metadata(self) -> None:
+        # [FUNCTION DOC] If every node copied into this frame carries identical, non-empty
+        # custom metadata, moves it onto the parent's call node and deletes it from the
+        # children. Raises AssertionError if there is common metadata but no parent call node.
+        # KNOWN ISSUE: deleting the custom key from every node assumes each node has it; nodes
+        # lacking it would raise KeyError (they would have made the metadata differ, so only the
+        # empty-versus-missing case is at risk).
         # Copy custom metadata if all nodes have same custom metadata
         custom_meta = None
         for node in self.node_map.values():
@@ -1384,6 +1592,14 @@ class _ModuleFrame:
                 del node.meta["custom"]
 
     def finalize_outputs(self):
+        # [FUNCTION DOC] Closes this frame by emitting its graph output and rewiring the
+        # parent. With a preserved call signature the outputs are rebuilt into the original
+        # output structure and the parent flattens the call result; otherwise every copied node
+        # used by nodes outside this frame becomes an output. Parent-side getitem nodes are
+        # created for each output and registered in the parent's node map, output value metadata
+        # is set, and common custom metadata is lifted. Also forgets this module from the
+        # created-modules table. Raises RuntimeError for unsupported output types or a missing
+        # output node.
         self.created_modules.pop(self.fqn, None)
 
         orig_outputs = []
@@ -1411,6 +1627,9 @@ class _ModuleFrame:
                     )
 
             def get_actual_output_node(output):
+                # [FUNCTION DOC] HELPER: Returns this frame's node (copied node or placeholder)
+                # for a signature output, or None for a missing one. Raises RuntimeError if
+                # the value was not produced or imported in this frame.
                 if output is None:
                     return None
 
@@ -1478,11 +1697,16 @@ class _ModuleFrame:
                 self.parent.node_map[orig_output] = proxy_out
 
     def copy_node(self, node):
+        # [FUNCTION DOC] Copies a flat-graph node into this frame's graph (remapping its
+        # inputs), records the mapping, and marks the node name as seen.
         self.print("copying", node.format_node())
         self.node_map[node] = self.graph.node_copy(node, self.remap_input)
         self.seen_nodes[node.name] = node
 
     def run_outer(self):
+        # [FUNCTION DOC] Drives outlining from the root frame: copies the leading placeholder
+        # nodes, runs the nested outlining over the remaining nodes, then copies the output
+        # node(s) of the flat graph. Prints debug info only when verbose.
         for i, node in enumerate(self.flat_graph.nodes):
             self.print(i, node.meta.get("nn_module_stack"), node.format_node())
 
@@ -1502,11 +1726,21 @@ class _ModuleFrame:
                 self.copy_node(node)
 
     def print(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Prints the arguments to standard output only when the verbose flag is set.
         if self.verbose:
             # pyrefly: ignore [not-iterable]
             print(*args, **kwargs)
 
     def run_from(self, node_idx):
+        # [FUNCTION DOC] Walks nodes from node_idx, using each node's module stack to decide
+        # what to do: on the output node, finalize (except in the root frame) and return; on a
+        # node outside this frame's module, finalize this frame and return the index; on a node
+        # in a deeper module, start a nested frame and continue from where it stopped; on a node
+        # in this module, copy it (recording graph-argument attribute names for get_attr nodes).
+        # Returns the index at which this frame stopped. Raises AssertionError on unexpected
+        # placeholders or stack mismatch, RuntimeError if a node has no module stack.
+        # KNOWN ISSUE: module_idx is incremented but never used, and the None check on the
+        # computed module stack comes after it was already used.
         module_idx = 0
         # Walk through the graph, building up a new graph with the right submodules
         while node_idx < len(self.nodes):
@@ -1608,6 +1842,8 @@ class _ModuleFrame:
 
 @dataclass
 class _SubmoduleEntry:
+    # [CLASS DOC] HELPER: Record of one call of a module during outlining: the parent's name,
+    # module and call node, this module's name, its 1-based call index, and the module itself.
     parent_fqn: str
     parent_module: torch.nn.Module
     parent_call_module: torch.fx.Node
@@ -1617,6 +1853,10 @@ class _SubmoduleEntry:
 
 
 def _outline_submodules(orig_graph: torch.fx.Graph, root_module: UnflattenedModule):
+    # [FUNCTION DOC] HELPER: Splits the flat graph into per-module graphs under the root module by
+    # running a root _ModuleFrame over it (using the preserved call signatures from the root's
+    # call graph). Returns a pair: mapping of module identity to the list of its call entries,
+    # and mapping of call name to graph-argument attribute names. Mutates the root module.
     seen_nodes: dict[str, torch.fx.Node] = {}
     seen_modules: dict[int, list[_SubmoduleEntry]] = defaultdict(list)
     seen_attrs: dict[str, set[str]] = defaultdict(set)
@@ -1644,6 +1884,10 @@ def _outline_submodules(orig_graph: torch.fx.Graph, root_module: UnflattenedModu
 def _reorder_submodules(
     parent: torch.nn.Module, fqn_order: dict[str, int], prefix: str = ""
 ):
+    # [FUNCTION DOC] HELPER: Recursively re-registers submodules so each module's children are
+    # ordered by the given name-to-position mapping (unknown names go last, call variants use
+    # their base name's position). At the top level it first adds empty modules for any ordered
+    # names missing from the tree. Mutates the module tree.
     # TODO Can be optimized by adding submodules ahead of time.
     if prefix == "":
         for fqn in list(fqn_order.keys())[1:]:
@@ -1667,6 +1911,10 @@ def _reorder_submodules(
 
 
 class _IVals:
+    # [CLASS DOC] HELPER: Tracker for intermediate values of functionalized mutations that are
+    # read across module boundaries. State: node_names_by_fqn, a mapping of module name to the
+    # set of node names whose in-place mutation must be re-applied. read records a value;
+    # update later inserts the in-place copy nodes into every call of the shared modules.
     """
     Collect the intermediate values of mutations in a graph.
 
@@ -1688,15 +1936,25 @@ class _IVals:
     """
 
     def __init__(self):
+        # [FUNCTION DOC] Creates the empty mapping from module name to node-name sets.
         # for each fqn, set of node names corresponding to intermediate values
         self.node_names_by_fqn = defaultdict(set)
 
     def _is_mutable(self, target):
+        # [FUNCTION DOC] HELPER: True if the target is an operator overload whose schema is
+        # mutable; False for anything else.
         if isinstance(target, torch._ops.OpOverload):
             return target._schema.is_mutable
         return False
 
     def read(self, mf, node):
+        # [FUNCTION DOC] Called when a frame reads an intermediate mutation value (a call_function
+        # node). If the operator is not itself mutable (the mutation was functionalized), records
+        # the node name under the innermost module of its stack so update can re-apply the
+        # mutation. Returns the frame's remapping of the node's first argument (the mutated
+        # input). Raises AssertionError for non call_function nodes.
+        # KNOWN ISSUE: unconditionally prints a debug line ("Checking mutability") to standard
+        # output on every call.
         """
         Read state corresponding to a given intermediate value.
         """
@@ -1715,6 +1973,9 @@ class _IVals:
         return mf.remap_input(node.args[0])
 
     def update(self, partitions):
+        # [FUNCTION DOC] For each group of calls sharing a module, finds in each call's graph the
+        # recorded nodes and inserts after each an in-place copy of its value into its first
+        # argument, copying metadata. Mutates the graphs.
         """
         Update states corresponding to intermediate values that were read.
         """
@@ -1740,6 +2001,9 @@ def _copy_graph_attrs(
     root_module: UnflattenedModule,
     seen_attrs: dict[str, set[str]],
 ):
+    # [FUNCTION DOC] HELPER: For each module name, copies the named graph-argument attributes
+    # (for example subgraph modules used by higher-order ops) from the original graph module onto
+    # the corresponding unflattened module (the root for an empty name). Mutates modules.
     for child_fqn, names in seen_attrs.items():
         module = _get_attr(root_module, child_fqn) if child_fqn else root_module
         for name in names:
@@ -1748,6 +2012,11 @@ def _copy_graph_attrs(
 
 
 def _deduplicate_modules(partitions):
+    # [FUNCTION DOC] HELPER: Within each group of calls sharing a module, finds calls whose graphs
+    # are equivalent to an earlier call. Same module name: removes the duplicate from the
+    # hierarchy and points the parent's call node at the earlier call. Different module name:
+    # replaces the duplicate with the earlier module object but keeps the call name. Returns a
+    # mapping of removed call names to the kept call names. Mutates the module tree and call nodes.
     redirected_call_indices = {}
     for shared_submodules in partitions:
         for i, entry in enumerate(shared_submodules):
@@ -1796,6 +2065,16 @@ def _sink_params(
     scope: list[str],
     module_id_to_inputs_removed: dict[int, set[str]] | None = None,
 ):
+    # [FUNCTION DOC] HELPER: Recursively replaces placeholder inputs that stand for parameters,
+    # buffers or constants with get_attr nodes reading the module's own attribute, erasing the
+    # placeholder and removing the matching argument from call_module nodes in parents. Children
+    # are processed first; a module already processed (by identity) returns its recorded
+    # removals. Inputs are matched using the scope path and the name-to-state-names mapping;
+    # unmatched shared-module inputs are skipped. Finalizes InterpreterModules. Returns a mapping
+    # of module identity to removed placeholder names. Raises AssertionError on wrong graph or
+    # attribute types.
+    # KNOWN ISSUE: the early-exit and no-graph paths return a mapping for different keys (all
+    # modules versus only this module), so the return value is not uniform.
     """Sink params, buffers, and constants from graph inputs into get_attr nodes.
 
     Exported modules are purely functional, so they pass their parameters and

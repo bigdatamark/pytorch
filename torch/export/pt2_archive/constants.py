@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Python-visible string constants describing the PT2 archive layout: directory
+# names, file name prefixes and format templates, and archive format/version
+# values. Every name is a typed alias read from the C++ pt2_archive_constants
+# extension object, so Python and C++ agree on the layout.
+# Import-time side effect: imports torch._C._export; no other state is touched.
 # Defined in torch/csrc/export/pt2_archive_constants.h
 from torch._C._export import pt2_archive_constants
 

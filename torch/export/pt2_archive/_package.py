@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Reading and writing of the PT2 archive format (a zip-based container) that
+# bundles exported programs, their weights and constants, AOTInductor compiled
+# artifacts, extra files and executorch files. Main contents: PT2ArchiveWriter
+# and PT2ArchiveReader (record-level I/O), package_pt2 (save), load_pt2 (load),
+# is_pt2_package, AOTICompiledModel (callable wrapper over a compiled package
+# loader), PT2ArchiveContents (load result), plus private helpers that split
+# tensors into pickled versus raw-byte payloads with storage deduplication.
+# Import-time side effects: creates the module logger and overrides the
+# __module__ attribute of the public functions/classes to torch.export.pt2_archive.
 import glob
 import io
 import json
@@ -72,6 +82,12 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 
 def is_pt2_package(serialized_model: bytes | str) -> bool:
+    # [FUNCTION DOC] Returns True if the given bytes or file path is a zip whose
+    # first entry's root folder contains an archive-format record equal to the
+    # marker "pt2". Any failure to open or parse the zip is caught, logged at info
+    # level, and results in False. Never raises for bad input; reads the input only.
+    # KNOWN ISSUE: the root folder is split on the OS path separator although zip
+    # entry names always use forward slashes, so this misdetects on Windows.
     """
     Check if the serialized model is a PT2 Archive package.
     """
@@ -91,11 +107,19 @@ def is_pt2_package(serialized_model: bytes | str) -> bool:
 
 
 class PT2ArchiveWriter:
+    # [CLASS DOC] Context manager that writes records into a PT2 archive through
+    # a native PyTorchFileWriter. State: archive_file, the native writer. On
+    # normal or exceptional exit it adds the archive format and archive version
+    # records if missing, then finalizes the file. Methods write bytes, strings,
+    # files and whole folders, and query already written records.
     """
     Context manager for writing a PT2 archive.
     """
 
     def __init__(self, archive_path_or_buffer: FileLike):
+        # [FUNCTION DOC] Opens a native file writer on a path (separators
+        # normalized) or a writable buffer and sets the zip format minimum
+        # version to 6. Side effect: creates/truncates the target file.
         if isinstance(archive_path_or_buffer, str):
             archive_path_or_buffer = normalize_path_separator(archive_path_or_buffer)
         self.archive_file = torch._C.PyTorchFileWriter(archive_path_or_buffer)  # type: ignore[arg-type]
@@ -105,9 +129,14 @@ class PT2ArchiveWriter:
         self.archive_file.set_min_version(6)
 
     def __enter__(self) -> "PT2ArchiveWriter":
+        # [FUNCTION DOC] Returns the writer itself for use in a with statement.
         return self
 
     def __exit__(self, *args: Any) -> None:
+        # [FUNCTION DOC] Writes the archive format and version records if they are
+        # not yet present, then closes (finalizes) the archive. Runs even when the
+        # with body raised, so a partial archive is still finalized; never
+        # suppresses the exception.
         if not self.has_record(ARCHIVE_FORMAT_PATH):
             self.write_string(ARCHIVE_FORMAT_PATH, ARCHIVE_FORMAT_VALUE)
 
@@ -117,12 +146,16 @@ class PT2ArchiveWriter:
         self.close()
 
     def has_record(self, name: str) -> bool:
+        # [FUNCTION DOC] Returns True if a record with exactly this name has
+        # already been written to the archive.
         """
         Check if a record exists in the archive.
         """
         return name in self.archive_file.get_all_written_records()
 
     def count_prefix(self, prefix: str) -> int:
+        # [FUNCTION DOC] Returns how many already written records have a name
+        # starting with the prefix; used to pick the next free file index.
         """
         Count the number of records that start with a given prefix.
         """
@@ -133,6 +166,9 @@ class PT2ArchiveWriter:
         )
 
     def write_bytes(self, name: str, data: bytes) -> None:
+        # [FUNCTION DOC] Writes a bytes object as a record with the given name.
+        # Raises AssertionError if data is not a bytes object. Side effect: appends
+        # a record to the archive.
         """
         Write a bytes object to the archive.
         name: The destination file inside the archive.
@@ -143,6 +179,8 @@ class PT2ArchiveWriter:
         self.archive_file.write_record(name, data, len(data))
 
     def write_string(self, name: str, data: str) -> None:
+        # [FUNCTION DOC] Encodes the string (default encoding, UTF-8) and writes it
+        # as a record. Raises AssertionError if data is not a string.
         """
         Write a string object to the archive.
         name: The destination file inside the archive.
@@ -154,6 +192,9 @@ class PT2ArchiveWriter:
         self.write_bytes(name, data_bytes)
 
     def write_file(self, name: str, file_path: str) -> None:
+        # [FUNCTION DOC] Reads the whole file from disk into memory and writes it
+        # as a record named name. Raises AssertionError if file_path is not an
+        # existing regular file.
         """
         Copy a file into the archive.
         name: The destination file inside the archive.
@@ -167,6 +208,11 @@ class PT2ArchiveWriter:
             self.write_bytes(name, file_bytes)
 
     def write_folder(self, archive_dir: str, folder_dir: str) -> None:
+        # [FUNCTION DOC] Recursively copies every regular file under folder_dir
+        # into the archive beneath archive_dir, keeping relative paths. Raises
+        # AssertionError if folder_dir is not a directory. Side effect: writes
+        # one record per file.
+        # KNOWN ISSUE: the recursive glob skips hidden (dot) files and folders.
         """
         Copy a folder into the archive.
         archive_dir: The destination folder inside the archive.
@@ -186,6 +232,8 @@ class PT2ArchiveWriter:
             self.write_file(archive_path, file_path)
 
     def close(self) -> None:
+        # [FUNCTION DOC] Finalizes the archive by writing the end-of-file
+        # structures; no further writes are valid afterwards.
         """
         Close the archive.
         """
@@ -193,11 +241,20 @@ class PT2ArchiveWriter:
 
 
 class PT2ArchiveReader:
+    # [CLASS DOC] Context manager that reads records from a PT2 archive through
+    # a native PyTorchFileReader. State: archive_file, the native reader.
+    # Invariant: the archive format record matched the expected value at
+    # construction. Methods read bytes/strings, report the archive version and
+    # list record names. Nothing needs closing.
     """
     Context manager for reading a PT2 archive.
     """
 
     def __init__(self, archive_path_or_buffer: FileLike):
+        # [FUNCTION DOC] Opens a native reader on a path (separators normalized)
+        # or a buffer and validates the archive format record. Raises
+        # AssertionError if the format record differs; the native reader may raise
+        # if the record is missing or the file is not a valid archive.
         if isinstance(archive_path_or_buffer, str):
             archive_path_or_buffer = normalize_path_separator(archive_path_or_buffer)
         self.archive_file = torch._C.PyTorchFileReader(archive_path_or_buffer)  # type: ignore[arg-type]
@@ -205,13 +262,17 @@ class PT2ArchiveReader:
             raise AssertionError("Invalid archive format")
 
     def __enter__(self) -> "PT2ArchiveReader":
+        # [FUNCTION DOC] Returns the reader itself for use in a with statement.
         return self
 
     def __exit__(self, *args: Any) -> None:
+        # [FUNCTION DOC] Does nothing; the native reader has no close operation.
         # torch._C.PyTorchFileReader doesn't have a close method
         pass
 
     def read_bytes(self, name: str) -> bytes:
+        # [FUNCTION DOC] Returns the raw contents of the named record. The native
+        # reader raises an error if the record does not exist.
         """
         Read a bytes object from the archive.
         name: The source file inside the archive.
@@ -219,6 +280,8 @@ class PT2ArchiveReader:
         return self.archive_file.get_record(name)
 
     def read_string(self, name: str) -> str:
+        # [FUNCTION DOC] Returns the named record decoded as a string (default
+        # encoding, UTF-8). Errors from missing records or decoding propagate.
         """
         Read a string object from the archive.
         name: The source file inside the archive.
@@ -227,6 +290,10 @@ class PT2ArchiveReader:
         return data.decode()
 
     def archive_version(self) -> int:
+        # [FUNCTION DOC] Returns the PT2 archive spec version as an integer, read
+        # from the version record. If the record cannot be read the archive is
+        # treated as the oldest version, 0. Raises ValueError if the record text
+        # is not an integer.
         """
         Get the archive version.
         """
@@ -240,6 +307,7 @@ class PT2ArchiveReader:
         return int(archive_version)
 
     def get_file_names(self) -> list[str]:
+        # [FUNCTION DOC] Returns the names of all records in the archive.
         """
         Get the file names in the archive.
         """
@@ -256,6 +324,14 @@ def _package_aoti_files(
     aoti_files: AOTI_FILES | None,
     pickle_protocol: int = DEFAULT_PICKLE_PROTOCOL,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Writes AOTInductor artifacts into the archive. A
+    # plain list is treated as one model named "model"; otherwise a mapping of
+    # model name to files. Ordinary files go under the AOTInductor directory per
+    # model (custom object files go to the constants directory); empty names are
+    # skipped. Weights objects are deduplicated by shared storage, saved with
+    # torch.save into the weights directory, and a per-model weights_config.json
+    # maps weight name to file, shape, stride and offset. Does nothing for None.
+    # Raises AssertionError if the input is neither list nor mapping or a file is missing.
     if aoti_files is None:
         return
 
@@ -329,14 +405,21 @@ def _package_aoti_files(
 
 
 def _is_fake_tensor(t: torch.Tensor) -> TypeIs[FakeTensor]:
+    # [FUNCTION DOC] HELPER: Type-narrowing wrapper returning whether t is a fake tensor.
     return is_fake_tensor(t)
 
 
 def _is_tensor_subclass(t: torch.Tensor) -> bool:
+    # [FUNCTION DOC] HELPER: Returns True for a tensor whose underlying data
+    # tensor is of a type other than the plain tensor class (a tensor subclass).
     return isinstance(t, torch.Tensor) and type(t.data) is not torch.Tensor
 
 
 def _get_raw_tensor_bytes(value: torch.Tensor) -> bytes:
+    # [FUNCTION DOC] HELPER: Returns the raw bytes of the tensor's whole
+    # untyped storage (metadata is saved elsewhere). Fake and empty tensors
+    # yield empty bytes. Non-CPU tensors are copied to CPU first and the copy is
+    # kept alive while its memory is read.
     """
     Get the raw bytes of a tensor. This is used to save the tensor in pt2 archive.
     """
@@ -364,6 +447,8 @@ def _get_raw_tensor_bytes(value: torch.Tensor) -> bytes:
 
 
 def _should_use_pickle(t: torch.Tensor) -> bool:
+    # [FUNCTION DOC] HELPER: True for real (non-fake) tensor subclasses, which
+    # must be pickled; plain and fake tensors use the raw-byte path.
     return _is_tensor_subclass(t) and not _is_fake_tensor(t)
 
 
@@ -376,6 +461,10 @@ def _save_pickled_tensors(
     idx: int,
     pickle_protocol: int = DEFAULT_PICKLE_PROTOCOL,
 ) -> int:
+    # [FUNCTION DOC] HELPER: Saves each (name, tensor) with torch.save to a new
+    # record named prefix plus a running index under the directory, and records
+    # a PayloadMeta (pickle flag set, parameter flag, tensor meta) in the config
+    # mapping keyed by name. Mutates config; writes archive records. Returns the next free index.
     """Save pickled tensors and update config. Returns updated index."""
     for item_fqn, tensor in pickled_items:
         path_name = f"{filename_prefix}{idx}"
@@ -403,6 +492,11 @@ def _save_raw_tensors(
     filename_prefix: str,
     idx: int,
 ) -> int:
+    # [FUNCTION DOC] HELPER: Groups the tensors by shared storage, and for each
+    # group writes the bytes of the complete covering tensor as one record
+    # (prefix plus running index) under the directory. Each member gets a
+    # PayloadMeta (no pickle) in the config mapping so aliasing can be restored
+    # at load time. Mutates config; returns the next free index (unchanged for empty input).
     """Save deduplicated raw tensor bytes and update config. Returns updated index."""
     if not raw_items:
         return idx
@@ -438,6 +532,10 @@ def _package_state_dict(
     archive_writer: PT2ArchiveWriter,
     pickle_protocol: int = DEFAULT_PICKLE_PROTOCOL,
 ) -> schema.PayloadConfig:
+    # [FUNCTION DOC] HELPER: Writes the exported program's state dict into the
+    # weights directory. Tensor subclasses are pickled; other tensors are saved
+    # as deduplicated raw bytes. Returns a PayloadConfig describing every weight.
+    # Raises AssertionError if a state dict value is not a tensor.
     weights_config: dict[str, schema.PayloadMeta] = {}
 
     pickled_weights: list[tuple[str, torch.Tensor]] = []
@@ -485,6 +583,12 @@ def _package_constants(
     archive_writer: PT2ArchiveWriter,
     pickle_protocol: int = DEFAULT_PICKLE_PROTOCOL,
 ) -> schema.PayloadConfig:
+    # [FUNCTION DOC] HELPER: Writes the exported program's constants into the
+    # constants directory and returns a PayloadConfig. Tensor constants follow
+    # the pickled/raw split like weights; torchbind script objects are saved with
+    # the native pickler under the custom-object prefix, and other custom or
+    # opaque objects with standard pickle under the opaque prefix.
+    # Raises RuntimeError for any other constant type.
     constants_config: dict[str, schema.PayloadMeta] = {}
 
     pickled_constants: list[tuple[str, torch.Tensor]] = []
@@ -570,6 +674,8 @@ def _package_payload_config(
     payload_config: schema.PayloadConfig,
     config_file: str,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Converts the payload config to plain data, dumps it
+    # as JSON text, and writes it to the archive record config_file.
     """
     Save the payload config as json file in the archive.
     """
@@ -584,6 +690,11 @@ def _package_exported_programs(
     opset_version: dict[str, int] | None = None,
     pickle_protocol: int = DEFAULT_PICKLE_PROTOCOL,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Saves one or several exported programs (a single
+    # program is named "model"). Per model it writes the weights, the weights
+    # config, the constants, the constants config, then the serialized program
+    # (without state dict or constants) and its sample inputs. Does nothing for
+    # None. Raises AssertionError if the input is neither a program nor a mapping.
     if exported_programs is None:
         return
 
@@ -628,6 +739,8 @@ def _package_exported_programs(
 def _package_extra_files(
     archive_writer: PT2ArchiveWriter, extra_files: dict[str, Any] | None
 ) -> None:
+    # [FUNCTION DOC] HELPER: Writes each extra file as a string record under the
+    # extra directory prefix; no-op for None. Contents must be strings.
     if extra_files is None:
         return
 
@@ -638,6 +751,8 @@ def _package_extra_files(
 def _package_executorch_files(
     archive_writer: PT2ArchiveWriter, executorch_files: dict[str, bytes] | None
 ) -> None:
+    # [FUNCTION DOC] HELPER: Writes each executorch file as a bytes record under
+    # the executorch directory prefix; no-op for None.
     if executorch_files is None:
         return
 
@@ -655,6 +770,12 @@ def package_pt2(
     pickle_protocol: int = DEFAULT_PICKLE_PROTOCOL,
     executorch_files: dict[str, bytes] | None = None,
 ) -> FileLike:
+    # [FUNCTION DOC] Public save entry point. Writes exported programs, AOTInductor
+    # files, extra files and executorch files into a PT2 archive at path or buffer f.
+    # Raises AssertionError if exported_programs, aoti_files and extra_files are all
+    # None. Logs a warning (not an error) if f is not a .pt2 path or writable seekable
+    # buffer. Returns f (path converted to a string; buffers are rewound to the start).
+    # Side effect: creates the archive file.
     r"""
     Saves the artifacts to a PT2Archive format. The artifact can then be loaded
     using ``load_pt2``.
@@ -729,14 +850,24 @@ def package_pt2(
 
 
 class AOTICompiledModel:
+    # [CLASS DOC] Callable wrapper around a native AOTInductor package loader.
+    # State: loader, the native object that owns the compiled model and its
+    # constants. Calling it flattens inputs per the stored call spec and runs the
+    # model; other methods expose metadata and constant loading.
     """
     Callable AOT Inductor loaded model from a .pt2
     """
 
     def __init__(self, loader: torch._C._aoti.AOTIModelPackageLoader) -> None:
+        # [FUNCTION DOC] Stores the native loader; no other work.
         self.loader = loader
 
     def __call__(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Runs the compiled model. Reads the input/output tree specs
+        # from the loader, reorders keyword arguments to the input spec, flattens
+        # args and kwargs, keeps only tensor leaves (non-tensor inputs are silently
+        # dropped), runs the loader, and rebuilds the output structure. Returns the
+        # structured output.
         call_spec = self.loader.get_call_spec()
         in_spec = pytree.treespec_loads(call_spec[0])
         out_spec = pytree.treespec_loads(call_spec[1])
@@ -746,6 +877,7 @@ class AOTICompiledModel:
         return pytree.tree_unflatten(flat_outputs, out_spec)
 
     def get_metadata(self) -> dict[str, str]:
+        # [FUNCTION DOC] Returns the string metadata mapping of the compiled package.
         return self.loader.get_metadata()
 
     def load_constants(
@@ -756,6 +888,11 @@ class AOTICompiledModel:
         user_managed: bool = False,
         allow_h2d_copy: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Loads the given constant tensors (by fully qualified name)
+        # into the compiled model via the native loader. check_full_update requires
+        # every constant to be provided; user_managed makes the loader keep the
+        # caller's tensor pointers (caller keeps them alive); allow_h2d_copy permits
+        # copying CPU tensors to the model device. Errors come from the native loader.
         """
         Given a mapping of constant fqns to tensors, load the constants into the model.
         You can use ``get_constant_fqns`` to get the list of constant fqns that
@@ -776,9 +913,13 @@ class AOTICompiledModel:
         )
 
     def get_constant_fqns(self) -> list[str]:
+        # [FUNCTION DOC] Returns the fully qualified names of constants the compiled model needs.
         return self.loader.get_constant_fqns()
 
     def __deepcopy__(self, memo: dict[Any, Any] | None) -> "AOTICompiledModel":
+        # [FUNCTION DOC] Logs a warning and returns a new wrapper that shares the
+        # same native loader.
+        # KNOWN ISSUE: this is not a real deep copy; the copy aliases the loader's state.
         logger.warning(
             "AOTICompiledModel deepcopy warning: AOTICompiledModel.loader is not deepcopied."
         )
@@ -787,6 +928,9 @@ class AOTICompiledModel:
 
 @dataclass
 class PT2ArchiveContents:
+    # [CLASS DOC] Plain result record of load_pt2. Fields: exported_programs
+    # (model name to program), aoti_runners (model name to compiled model) and
+    # extra_files (file name to string contents).
     exported_programs: dict[str, ExportedProgram]
     aoti_runners: dict[str, AOTICompiledModel]
     extra_files: dict[str, Any]
@@ -797,6 +941,12 @@ def _build_file_map(
     config: schema.PayloadConfig,
     base_dir: str,
 ) -> dict[str, torch.Tensor]:
+    # [FUNCTION DOC] HELPER: For each non-pickled payload in the config, loads its
+    # record (once per distinct path name) as a flat one-dimensional tensor of the
+    # recorded dtype, moved to the recorded device, with requires_grad restored.
+    # Zero-byte records become zero-filled tensors of the recorded size. Returns
+    # a mapping of path name to tensor. Raises AssertionError if tensor meta is
+    # missing and ValueError if the byte size is not a multiple of the element size.
     """
     Build a map from file path to the payload in flat tensor format.
     """
@@ -852,6 +1002,7 @@ def _load_payload_config(
     archive_reader: PT2ArchiveReader,
     config_file: str,
 ) -> schema.PayloadConfig:
+    # [FUNCTION DOC] HELPER: Reads the JSON record config_file and converts it to a PayloadConfig.
     """
     Load and parse a payload config from the archive.
     """
@@ -865,6 +1016,12 @@ def _load_state_dict(
     archive_reader: PT2ArchiveReader,
     model_name: str,
 ) -> dict[str, torch.Tensor] | bytes:
+    # [FUNCTION DOC] HELPER: Loads the state dict of a model. If a legacy single
+    # weights file exists, warns and returns its raw bytes. Otherwise reads the
+    # weights config, builds flat payload tensors, and returns a mapping of weight
+    # name to tensor: pickled entries via torch.load (unrestricted unpickling),
+    # others as strided views of shared payloads (aliasing preserved), wrapped as
+    # Parameter when flagged. Raises AssertionError if the config or tensor meta is missing.
     # Make it BC compatible with legacy weight files
     legacy_weights_file = f"{WEIGHTS_DIR}{model_name}.pt"
     if legacy_weights_file in archive_reader.get_file_names():
@@ -921,6 +1078,13 @@ def _load_constants(
     archive_reader: PT2ArchiveReader,
     model_name: str,
 ) -> dict[str, torch.Tensor] | bytes:
+    # [FUNCTION DOC] HELPER: Loads the constants of a model. A legacy single
+    # constants file is returned as raw bytes with a warning. Otherwise reads the
+    # constants config and, by file name prefix, rebuilds tensor constants
+    # (unpickled or strided views of shared payloads), torchbind objects (native
+    # unpickler) and opaque objects (standard unpickle). Returns name to value mapping.
+    # Raises AssertionError for a missing config or tensor meta, RuntimeError for
+    # an unknown prefix.
     # Make it BC compatible with legacy constant files
     legacy_constants_file = f"{CONSTANTS_DIR}{model_name}.pt"
     if legacy_constants_file in archive_reader.get_file_names():
@@ -990,6 +1154,11 @@ def _load_exported_programs(
     file_names: list[str],
     expected_opset_version: dict[str, int] | None,
 ) -> dict[str, ExportedProgram]:
+    # [FUNCTION DOC] HELPER: For every record under the models directory, derives
+    # the model name from the file name, loads its sample inputs, deserialized
+    # program description, state dict and constants, and deserializes an
+    # ExportedProgram checking the expected opset versions. Returns a mapping of
+    # model name to program.
     exported_program_files = [
         file for file in file_names if file.startswith(MODELS_DIR)
     ]
@@ -1029,6 +1198,8 @@ def _load_exported_programs(
 def _load_extra_files(
     archive_reader: PT2ArchiveReader, file_names: list[str]
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Reads every record under the extra directory as a
+    # string and returns a mapping of name (prefix removed) to contents.
     extra_files = [file for file in file_names if file.startswith(EXTRA_DIR)]
 
     extra_file_contents: dict[str, Any] = {}
@@ -1046,6 +1217,10 @@ def _load_aoti(
     num_runners: int,
     device_idx: int,
 ) -> AOTICompiledModel:
+    # [FUNCTION DOC] HELPER: Creates a native package loader for one model in the
+    # package file and wraps it. Compares the device information stored in the
+    # package metadata with the current device and logs a warning for each
+    # mismatching key. Returns the AOTICompiledModel.
     loaded_metadata = torch._C._aoti.AOTIModelPackageLoader.load_metadata_from_package(  # type: ignore[attr-defined]
         file, model_name
     )
@@ -1088,6 +1263,15 @@ def load_pt2(
     device_index: int = -1,
     load_weights_from_disk: bool = False,
 ) -> PT2ArchiveContents:  # type: ignore[type-arg]
+    # [FUNCTION DOC] Public load entry point. Opens the archive, checks its version
+    # equals the current one, loads exported programs and extra files, finds AOTI
+    # model names, and creates compiled runners (buffers are first copied to a
+    # temporary .pt2 file because the native loader cannot read buffers). With
+    # load_weights_from_disk it also loads weight files and pushes the weights
+    # into each runner as user-managed constants. Returns PT2ArchiveContents.
+    # Raises ValueError on version mismatch; warns if f is not a .pt2 path or buffer.
+    # KNOWN ISSUE: the docstring omits load_weights_from_disk, and the weight files
+    # are read with torch.load using default arguments.
     """
     Loads all the artifacts previously saved with ``package_pt2``.
 
@@ -1227,6 +1411,10 @@ def load_pt2(
 def load_weights_to_pt2_contents(
     pt2_contents: PT2ArchiveContents, weights_map: dict[str, Any]
 ) -> None:
+    # [FUNCTION DOC] For each model name in weights_map, loads the given weights
+    # into that model's AOTI runner as user-managed constants with a full-update
+    # check. Raises RuntimeError if a model name has no runner in the contents.
+    # KNOWN ISSUE: the docstring does not document the weights_map argument.
     """
     Load weights into the models in PT2 archive contents
 
