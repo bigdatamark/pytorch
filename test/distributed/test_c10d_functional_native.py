@@ -1,4 +1,11 @@
 # Owner(s): ["module: c10d"]
+# [MODULE DOC] Tests for the native _c10d_functional custom ops and the Python functional
+# collective wrappers. Contains multi-GPU eager tests (TestWithNCCL), tests with a dummy
+# process group that discards data (work lifetime, cross thread wait, process group arguments,
+# opaque type registration), and inductor compile tests on fake process groups that check
+# generated code and AOT Inductor runs. Import time side effects: loads the inductor AOT test
+# utility module through a file loader, and exits the process with status zero if
+# torch.distributed is unavailable.
 import gc
 import re
 import threading
@@ -38,6 +45,10 @@ from torch.testing._internal.inductor_utils import HAS_GPU
 
 
 def load_test_module(name):
+    # [FUNCTION DOC] HELPER: loads a test module by dotted name from the parent of this test
+    # directory. Temporarily patches sys.path to include that directory, builds the file path
+    # by replacing dots with slashes, loads it with a source file loader and returns the
+    # module object.
     import sys
     from importlib.machinery import SourceFileLoader
     from pathlib import Path
@@ -62,24 +73,40 @@ if not dist.is_available():
 
 @requires_accelerator_dist_backend()
 class TestWithNCCL(DistributedTestBase):
+    # [CLASS DOC] Two rank accelerator tests of the eager _c10d_functional ops and their
+    # Python wrappers; the whole class requires an accelerator distributed backend and each
+    # test needs at least 2 GPUs. Each test initializes the default group registered under the
+    # name default. Tests check numerics, whether results alias inputs, and that Python
+    # wrappers return AsyncCollectiveTensor that completes on first use, plus work registry
+    # bookkeeping and inductor behavior.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] Property: world size for these tests, always 2.
         return 2
 
     @property
     def ranks(self) -> list[int]:
+        # [FUNCTION DOC] Property: list of all ranks, from zero up to world size minus one.
         return list(range(self.world_size))
 
     @property
     def device(self) -> torch.device:
+        # [FUNCTION DOC] Property: torch device whose index is this rank.
         return torch.device(self.rank)
 
     def _init_process_group(self) -> None:
+        # [FUNCTION DOC] HELPER: creates the process group for the device type, then registers
+        # the world group in the native process group registry under the name default so ops
+        # can refer to it by that name.
         self.create_pg(self.device.type)
         torch._C._distributed_c10d._register_process_group("default", dist.group.WORLD)
 
     @skip_if_lt_x_gpu(2)
     def test_all_reduce_single(self) -> None:
+        # [FUNCTION DOC] Test: functional all_reduce with average on a rank filled tensor
+        # returns a new tensor (not the input) holding the mean over ranks after wait_tensor.
+        # The Python wrapper returns an AsyncCollectiveTensor that is not completed until its
+        # values are first used, after which it is completed.
         self._init_process_group()
 
         input = torch.full((10, 10), float(self.rank), device=self.device)
@@ -112,6 +139,8 @@ class TestWithNCCL(DistributedTestBase):
 
     @skip_if_lt_x_gpu(2)
     def test_all_reduce_single_(self) -> None:
+        # [FUNCTION DOC] Test: in place all_reduce with average returns the same object as the
+        # input after wait_tensor, holding the mean over ranks.
         self._init_process_group()
 
         input = torch.full((10, 10), float(self.rank), device=self.device)
@@ -129,6 +158,9 @@ class TestWithNCCL(DistributedTestBase):
 
     @skip_if_lt_x_gpu(2)
     def test_all_reduce_coalesced(self) -> None:
+        # [FUNCTION DOC] Test: coalesced all_reduce over ten tensors with average gives new
+        # tensors equal to the mean rank times the index; the Python wrapper returns
+        # incomplete async tensors that complete when accessed.
         self._init_process_group()
 
         inputs = [
@@ -167,6 +199,8 @@ class TestWithNCCL(DistributedTestBase):
 
     @skip_if_lt_x_gpu(2)
     def test_all_reduce_coalesced_(self) -> None:
+        # [FUNCTION DOC] Test: in place coalesced all_reduce with average returns the very
+        # same tensor objects after wait_tensor, with the expected mean values.
         self._init_process_group()
 
         inputs = [
@@ -188,6 +222,9 @@ class TestWithNCCL(DistributedTestBase):
 
     @skip_if_lt_x_gpu(2)
     def test_all_gather_into_tensor_single(self) -> None:
+        # [FUNCTION DOC] Test: all_gather_into_tensor concatenates rank filled tensors in rank
+        # order; checks the plain op, the out variant that writes into a preallocated tensor,
+        # and the Python wrapper returning an async tensor that completes when accessed.
         self._init_process_group()
 
         input = torch.full((10, 10), float(self.rank), device=self.device)
@@ -240,6 +277,9 @@ class TestWithNCCL(DistributedTestBase):
     # https://github.com/pytorch/pytorch/issues/133421
     @skip_if_lt_x_gpu(2)
     def test_functional_collectives_inference_mode(self) -> None:
+        # [FUNCTION DOC] Test: regression check for issue 133421. Under inference mode an
+        # all_gather_single result converted with a dtype change must trigger the wait, give a
+        # plain tensor and equal the expected gathered bfloat16 values.
         self._init_process_group()
 
         with torch.inference_mode():
@@ -261,9 +301,15 @@ class TestWithNCCL(DistributedTestBase):
 
     @skip_if_lt_x_gpu(2)
     def test_functional_collectives_batched(self) -> None:
+        # [FUNCTION DOC] Test: batched point to point ops under inference mode. Rank 0 sends
+        # and rank 1 receives via batch_p2p_ops_inplace followed by wait_tensor. Rank 0 is
+        # expected to get an empty tensor and rank 1 a tensor equal to rank 0's data, zeros.
         self._init_process_group()
 
         def f(x):
+            # [FUNCTION DOC] HELPER: scales the input by this rank and does a batched isend
+            # (rank 0) or irecv (rank 1) with the other rank, returning the waited result.
+            # Ranks outside 0 and 1 return nothing.
             if self.rank not in [0, 1]:
                 return
             tensor = self.rank * x
@@ -292,9 +338,16 @@ class TestWithNCCL(DistributedTestBase):
     @skip_if_lt_x_gpu(2)
     # https://github.com/pytorch/pytorch/issues/126338
     def test_inductor_dtypeview_memory_leak(self):
+        # [FUNCTION DOC] Test: regression for issue 126338. Compiles a function doing
+        # all_gather_into_tensor followed by a dtype view and wait_tensor, checks the
+        # generated code keeps the view dtype call as input of wait_tensor, then runs the
+        # compiled function repeatedly and raises an error if peak memory differs between the
+        # last two iterations (memory leak).
         self._init_process_group()
 
         def func(arg: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: all_gathers the argument over the default group, views
+            # the result as int32 and waits on it.
             ag0 = torch.ops._c10d_functional.all_gather_into_tensor.default(
                 arg,
                 self.world_size,
@@ -330,6 +383,9 @@ class TestWithNCCL(DistributedTestBase):
 
     @skip_if_lt_x_gpu(2)
     def test_all_gather_into_tensor_coalesced(self) -> None:
+        # [FUNCTION DOC] Test: coalesced all_gather_into_tensor over ten tensors returns
+        # concatenations in rank order; Python wrapper results are incomplete async tensors
+        # that complete when accessed.
         self._init_process_group()
 
         inputs = [
@@ -372,6 +428,9 @@ class TestWithNCCL(DistributedTestBase):
 
     @skip_if_lt_x_gpu(2)
     def test_reduce_scatter_tensor_single(self) -> None:
+        # [FUNCTION DOC] Test: reduce_scatter_tensor with average of a tensor of rank ids
+        # gives each rank a value equal to its rank; the Python wrapper returns an async
+        # tensor that completes when accessed.
         self._init_process_group()
 
         input = torch.tensor(self.ranks, device=self.device)
@@ -403,6 +462,8 @@ class TestWithNCCL(DistributedTestBase):
 
     @skip_if_lt_x_gpu(2)
     def test_reduce_scatter_tensor_out(self) -> None:
+        # [FUNCTION DOC] Test: reduce_scatter_tensor_out with average writes the scattered
+        # result into the provided out tensor; after waiting, the out tensor equals the rank.
         self._init_process_group()
 
         input = torch.tensor(self.ranks, device=self.device)
@@ -420,6 +481,9 @@ class TestWithNCCL(DistributedTestBase):
 
     @skip_if_lt_x_gpu(2)
     def test_reduce_scatter_tensor_coalesced(self) -> None:
+        # [FUNCTION DOC] Test: coalesced reduce_scatter_tensor over ten tensors with average
+        # gives rank times index; the Python wrapper returns incomplete async tensors that
+        # complete when accessed.
         self._init_process_group()
 
         inputs = [torch.tensor(self.ranks, device=self.device) * i for i in range(10)]
@@ -455,6 +519,10 @@ class TestWithNCCL(DistributedTestBase):
 
     @skip_if_lt_x_gpu(2)
     def test_all_to_all_single(self) -> None:
+        # [FUNCTION DOC] Test: all_to_all_single with random per rank split sizes (seeded)
+        # sends rank filled data; the received tensor must equal the concatenation of rank
+        # filled chunks of the output split sizes. Also checks the Python wrapper completes
+        # lazily. Sets the accelerator device index to the rank first.
         self._init_process_group()
         torch.accelerator.set_device_index(self.rank)
 
@@ -496,6 +564,9 @@ class TestWithNCCL(DistributedTestBase):
 
     @skip_if_lt_x_gpu(2)
     def test_broadcast(self) -> None:
+        # [FUNCTION DOC] Test: broadcast from rank 1 returns a new tensor (not the input)
+        # filled with 1 after wait_tensor; the Python wrapper returns an async tensor that
+        # completes when accessed.
         self._init_process_group()
 
         input = torch.full((10, 10), float(self.rank), device=self.device)
@@ -528,6 +599,8 @@ class TestWithNCCL(DistributedTestBase):
 
     @skip_if_lt_x_gpu(2)
     def test_wait_tensor(self) -> None:
+        # [FUNCTION DOC] Test: the native work registry has size 0, grows to 1 after launching
+        # a functional all_reduce and returns to 0 immediately after wait_tensor.
         self._init_process_group()
 
         input = torch.full((10, 10), float(self.rank), device=self.device)
@@ -544,6 +617,8 @@ class TestWithNCCL(DistributedTestBase):
 
     @skip_if_lt_x_gpu(2)
     def test_unwaited(self) -> None:
+        # [FUNCTION DOC] Test: launches a functional all_reduce and never waits on it; only
+        # checks the work registry size is 1 and that the process can still exit cleanly.
         # Verify that the process can terminate gracefully
         # even with unwaited tensors
         self._init_process_group()
@@ -561,10 +636,17 @@ class TestWithNCCL(DistributedTestBase):
     @skip_if_lt_x_gpu(2)
     @fresh_cache()
     def test_threading(self):
+        # [FUNCTION DOC] Test: compiles a function containing an all_reduce and
+        # checks the generated code uses the in place variant on the intermediate
+        # buffer, then runs the eager and compiled functions from a second thread
+        # and re-raises any exception there, showing the process group registered in
+        # the main thread can be resolved from another thread.
         self._init_process_group()
         device = self.device
 
         def func(arg: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: adds 42 to the argument, all_reduces it with average over
+            # group name 0, waits and adds one.
             buf0 = arg + 42
             ar0 = funcol.all_reduce(buf0, "avg", "0")
             ar0 = funcol.wait_tensor(ar0)
@@ -582,7 +664,13 @@ class TestWithNCCL(DistributedTestBase):
         # verify that a process group registered in main thread can be resolved
         # in a different thread.
         class TestThread(threading.Thread):
+            # [CLASS DOC] HELPER: thread subclass that runs the eager and compiled function,
+            # stores any exception in an attribute exc and re-raises it from join. Since exc
+            # is set inside run, join before the thread has started running is not supported.
             def run(self):
+                # [FUNCTION DOC] HELPER: thread body; resets exc to none, calls the eager
+                # function and the compiled function with the captured argument, and stores
+                # any exception.
                 self.exc = None
                 try:
                     func(arg)
@@ -591,6 +679,8 @@ class TestWithNCCL(DistributedTestBase):
                     self.exc = exc
 
             def join(self):
+                # [FUNCTION DOC] HELPER: joins the thread and then raises the exception stored
+                # by run, if any.
                 threading.Thread.join(self)
                 if self.exc:
                     raise self.exc
@@ -606,9 +696,16 @@ class TestWithNCCL(DistributedTestBase):
     @skip_if_lt_x_gpu(2)
     @fresh_cache()
     def test_fixed_striding(self):
+        # [FUNCTION DOC] Test: skipped without FP8 matmul support. Compares eager and compiled
+        # results of an FP8 rowwise backward pass that uses all_gather_single and a scaled
+        # matmul, and checks the compiled weight gradient is close to the eager one (guards
+        # against wrong strides for collective outputs).
         self._init_process_group()
 
         def scale(t):
+            # [FUNCTION DOC] HELPER: row wise FP8 quantization; returns the input multiplied
+            # by the max representable e4m3 value over the row max abs, cast to e4m3, together
+            # with the scale.
             scale = (
                 torch.finfo(e4m3_type).max / t.abs().amax(dim=-1, keepdim=True).float()
             )
@@ -616,6 +713,10 @@ class TestWithNCCL(DistributedTestBase):
             return t, scale
 
         def fp8_rowwise_backward(in_, w, out_grad):
+            # [FUNCTION DOC] HELPER: computes the input gradient from FP8 quantized
+            # all_gathered output gradient and weight using a scaled matmul, and the weight
+            # gradient from the all_gathered transposed output gradient times the input.
+            # Returns both.
             out_grad_fp8, scale_out_grad = scale(out_grad)
             w_fp8, scale_w = scale(w.t().contiguous())
             out_grad_fp8 = funcol.all_gather_single(
@@ -655,6 +756,8 @@ class TestWithNCCL(DistributedTestBase):
 
 
 def dummy_init_pg() -> None:
+# [FUNCTION DOC] HELPER: initializes a one rank gloo default group over an in memory store if
+# no default group exists yet; otherwise does nothing.
     if not dist.is_initialized():
         dist.init_process_group(
             backend="gloo", rank=0, world_size=1, store=dist.HashStore()
@@ -662,19 +765,31 @@ def dummy_init_pg() -> None:
 
 
 class _DummyWork(dist.Work):
+    # [CLASS DOC] HELPER: work object returned by the dummy process group. Holds a reference
+    # to the group; wait counts calls on the group and every destruction is counted on the
+    # group, which lets tests observe work lifetime.
     def __init__(self, pg: "ProcessGroupDummy") -> None:
+        # [FUNCTION DOC] HELPER: initializes the base work and stores the owning dummy group.
         super().__init__()
         self.pg = pg
 
     def wait(self, timeout: timedelta | None = None) -> bool:
+        # [FUNCTION DOC] HELPER: increments the wait counter of the owning group and returns
+        # true; the timeout argument is ignored.
         self.pg.waits += 1
         return True
 
     def __del__(self):
+        # [FUNCTION DOC] HELPER: increments the owning group's destruction counter.
         self.pg.dels += 1
 
 
 class ProcessGroupDummy(dist.ProcessGroup):
+    # [CLASS DOC] HELPER: single rank process group whose collectives (broadcast,
+    # coalesced all_gather, all_reduce, coalesced reduce_scatter) do nothing and
+    # return a dummy work object. Attributes: waits and dels count waits and
+    # destructions of its work objects; the group name defaults to dummy:dummy. The
+    # register method makes it usable as a named backend.
     """
     This process group discards all data passed to it and returns success. This
     is intended for rare cases where we want to discard certain operations
@@ -684,6 +799,8 @@ class ProcessGroupDummy(dist.ProcessGroup):
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: initializes the base group as rank 0 of size 1, sets the
+        # group name and zeroes the wait and destruction counters.
         super().__init__(0, 1)
 
         self._group_name = "dummy:dummy"
@@ -692,6 +809,7 @@ class ProcessGroupDummy(dist.ProcessGroup):
         self.dels = 0
 
     def broadcast(self, tensor_list: list[torch.Tensor], opts: object) -> dist.Work:
+        # [FUNCTION DOC] HELPER: discards the tensors and returns a new dummy work.
         return _DummyWork(self)
 
     def allgather_into_tensor_coalesced(
@@ -700,9 +818,11 @@ class ProcessGroupDummy(dist.ProcessGroup):
         input_list: list[torch.Tensor],
         opts: object,
     ) -> dist.Work:
+        # [FUNCTION DOC] HELPER: discards the tensors and returns a new dummy work.
         return _DummyWork(self)
 
     def allreduce(self, tensors: list[torch.Tensor], opts: object) -> dist.Work:
+        # [FUNCTION DOC] HELPER: discards the tensors and returns a new dummy work.
         return _DummyWork(self)
 
     def reduce_scatter_tensor_coalesced(
@@ -711,21 +831,31 @@ class ProcessGroupDummy(dist.ProcessGroup):
         inputTensors: list[torch.Tensor],
         opts: object,
     ) -> dist.Work:
+        # [FUNCTION DOC] HELPER: discards the tensors and returns a new dummy work.
         return _DummyWork(self)
 
     @property
     def group_name(self) -> str:
+        # [FUNCTION DOC] HELPER: property returning the group name; raises ValueError if the
+        # name is unset.
         if self._group_name is None:
             raise ValueError("ProcessGroup name not set")
         return self._group_name
 
     def _set_group_name(self, name: str) -> None:
+        # [FUNCTION DOC] HELPER: replaces the stored group name.
         self._group_name = name
 
     def register(self) -> dist.ProcessGroup:
+        # [FUNCTION DOC] HELPER: registers a backend named after the group name, whose creator
+        # always returns this very object, for cpu devices, then creates and returns a new
+        # group over rank 0 with that backend and a 60 second timeout (unused). Side effect:
+        # global backend registration and a new group.
         def create_pg(
             prefix_store: dist.PrefixStore, rank: int, world_size: int, timeout: float
         ) -> dist.ProcessGroup:
+            # [FUNCTION DOC] HELPER: backend creator callback that ignores its arguments and
+            # returns the enclosing dummy group.
             return self
 
         dist.Backend.register_backend(self.group_name, create_pg, devices=["cpu"])
@@ -739,6 +869,8 @@ class ProcessGroupDummy(dist.ProcessGroup):
 
 
 class CrossThreadWaitTest(TestCase):
+    # [CLASS DOC] Single process test case for wait_tensor finding work that was registered
+    # from a different thread.
     """
     Test that wait_tensor can find work registered on a different thread.
     This validates the cross-thread work registry lookup in wait_tensor
@@ -747,6 +879,10 @@ class CrossThreadWaitTest(TestCase):
     """
 
     def test_wait_tensor_cross_thread(self) -> None:
+        # [FUNCTION DOC] Test: registers a custom work for a tensor in the main
+        # thread, checks the registry size is 1, calls wait_tensor from another
+        # thread, re-raises any exception raised there, and verifies the work wait
+        # ran and the registry is empty again.
         """
         Test that wait_tensor works when called from a different thread
         than where the collective was registered.
@@ -755,7 +891,10 @@ class CrossThreadWaitTest(TestCase):
         exception_in_thread: BaseException | None = None
 
         class MyWork(dist.Work):
+            # [CLASS DOC] HELPER: work subclass whose wait sets the enclosing flag
+            # and returns true.
             def wait(self, _=None):
+                # [FUNCTION DOC] HELPER: marks the enclosing flag as set and returns true.
                 nonlocal wait_called
                 wait_called = True
                 return True
@@ -770,6 +909,8 @@ class CrossThreadWaitTest(TestCase):
 
         # Wait for the tensor in a different thread
         def wait_in_different_thread():
+            # [FUNCTION DOC] HELPER: thread target; calls wait_tensor on the tensor and stores
+            # any exception in the enclosing variable.
             nonlocal exception_in_thread
             try:
                 # This should find the work registered in the main thread
@@ -793,6 +934,8 @@ class CrossThreadWaitTest(TestCase):
 
 
 class PyWorkTest(TestCase):
+    # [CLASS DOC] Single process test case checking Python subclasses of work and process
+    # groups stay alive while native functional collectives hold them.
     """
     Native functional collectives have some interesting interactions with
     PyProcessGroup due to Python reference counting and pybind trampoline
@@ -801,10 +944,15 @@ class PyWorkTest(TestCase):
     """
 
     def test_wait_tensor(self) -> None:
+        # [FUNCTION DOC] Test: registers a Python work subclass for a tensor, deletes the
+        # Python reference and forces garbage collection, then calls wait_tensor and expects
+        # the work wait to run (it would hang or fail if the work were freed).
         wait_called = False
 
         class MyWork(dist.Work):
+            # [CLASS DOC] HELPER: work subclass that records that its wait was called.
             def wait(self, _):
+                # [FUNCTION DOC] HELPER: sets the enclosing flag; returns nothing.
                 nonlocal wait_called
                 wait_called = True
 
@@ -823,6 +971,10 @@ class PyWorkTest(TestCase):
         self.assertTrue(wait_called)
 
     def test_collectives(self) -> None:
+        # [FUNCTION DOC] Test: runs functional all_reduce, broadcast, all_gather_single and
+        # reduce_scatter_single on the dummy group. After each, garbage collection must not
+        # destroy the work (destruction count unchanged); calling wait on the result
+        # increments the wait count and destroys the work exactly once.
         dummy_init_pg()
 
         pg = ProcessGroupDummy().register()
@@ -861,49 +1013,68 @@ class PyWorkTest(TestCase):
 
 
 class ProcessGroupArgTest(TestCase):
+    # [CLASS DOC] Single process test case checking _c10d_functional ops accept a process
+    # group object directly in place of the group name string, using the dummy group.
     """
     Test that _c10d_functional ops accept ProcessGroup objects directly
     (not just string group names) via the Any-typed group argument.
     """
 
     def setUp(self):
+        # [FUNCTION DOC] Test fixture: calls parent setUp, ensures a default group exists and
+        # registers a dummy group stored as self.pg.
         super().setUp()
         dummy_init_pg()
         self.pg = ProcessGroupDummy().register()
 
     def test_all_reduce(self) -> None:
+        # [FUNCTION DOC] Test: the all_reduce op accepts a process group object; result is
+        # waited on.
         x = torch.rand(2, 2)
         out = torch.ops._c10d_functional.all_reduce(x, "sum", self.pg)
         torch.ops._c10d_functional.wait_tensor(out)
 
     def test_all_reduce_(self) -> None:
+        # [FUNCTION DOC] Test: the in place all_reduce op accepts a process group object;
+        # result is waited on.
         x = torch.rand(2, 2)
         out = torch.ops._c10d_functional.all_reduce_(x, "sum", self.pg)
         torch.ops._c10d_functional.wait_tensor(out)
 
     def test_all_gather_into_tensor(self) -> None:
+        # [FUNCTION DOC] Test: all_gather_into_tensor accepts a process group object with
+        # group size 1.
         x = torch.rand(2, 2)
         out = torch.ops._c10d_functional.all_gather_into_tensor(x, 1, self.pg)
         torch.ops._c10d_functional.wait_tensor(out)
 
     def test_reduce_scatter_tensor(self) -> None:
+        # [FUNCTION DOC] Test: reduce_scatter_tensor accepts a process group object with group
+        # size 1.
         x = torch.rand(2, 2)
         out = torch.ops._c10d_functional.reduce_scatter_tensor(x, "sum", 1, self.pg)
         torch.ops._c10d_functional.wait_tensor(out)
 
     def test_broadcast(self) -> None:
+        # [FUNCTION DOC] Test: broadcast accepts a process group object.
         x = torch.rand(2, 2)
         out = torch.ops._c10d_functional.broadcast(x, 0, self.pg)
         torch.ops._c10d_functional.wait_tensor(out)
 
     def test_broadcast_(self) -> None:
+        # [FUNCTION DOC] Test: the in place broadcast accepts a process group object.
         x = torch.rand(2, 2)
         out = torch.ops._c10d_functional.broadcast_(x, 0, self.pg)
         torch.ops._c10d_functional.wait_tensor(out)
 
 
 class ProcessGroupOpaqueTypeRegistrationTest(TestCase):
+    # [CLASS DOC] Single process test case for the opaque type registration of ProcessGroup.
     def test_process_group_is_registered_on_distributed_import(self) -> None:
+        # [FUNCTION DOC] Test: importing the distributed package registers ProcessGroup as an
+        # opaque custom class whose size member uses the real object, and schema inference for
+        # a function with a ProcessGroup argument yields the fully qualified class name in the
+        # schema string.
         from torch._library.opaque_object import (
             get_member_type,
             is_custom_class,
@@ -916,6 +1087,8 @@ class ProcessGroupOpaqueTypeRegistrationTest(TestCase):
         )
 
         def f(x: torch.Tensor, pg: dist.ProcessGroup) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: identity function on the tensor, only used for
+            # schema inference.
             return x
 
         self.assertEqual(
@@ -925,13 +1098,19 @@ class ProcessGroupOpaqueTypeRegistrationTest(TestCase):
 
 
 def find_buffer_assignments(code):
+# [FUNCTION DOC] HELPER: scans generated code text for assignments of the form buf number =
+# empty_strided_ and returns a tuple of the buffer names in order of appearance.
     pattern = r"buf(\d+) = empty_strided_"
     matches = re.finditer(pattern, code)
     return tuple(f"buf{match.group(1)}" for match in matches)
 
 
 class CompileTestCPU(TestCase):
+    # [CLASS DOC] CPU inductor test case on a fake process group of world size 2.
     def setUp(self):
+        # [FUNCTION DOC] Test fixture: calls parent setUp; if no default group is initialized,
+        # sets rank 0 and world size 2 on self and initializes a fake backend group over a
+        # fake store.
         super().setUp()
 
         if not dist.is_initialized():
@@ -947,11 +1126,22 @@ class CompileTestCPU(TestCase):
             )
 
     def tearDown(self):
+        # [FUNCTION DOC] Test fixture: destroys the default process group without checking it
+        # is initialized.
+        # KNOWN ISSUE: setUp sets rank and world size on self only inside the not-
+        # initialized branch.
         dist.destroy_process_group()
 
     @fresh_cache()
     def _test_inductor_all_reduce_cpu(self, cpp_wrapper=False):
+        # [FUNCTION DOC] HELPER: compiles a function with all_reduce and wait_tensor on cpu,
+        # optionally with the cpp wrapper enabled by config, and asserts the generated code
+        # mentions the expected in place all_reduce and wait_tensor calls (C shim names for
+        # the cpp wrapper, op names otherwise). Then runs it through the AOT Inductor runner
+        # and synchronizes.
         def func(arg: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: adds 42, all_reduces with average over group
+            # name 0 and waits.
             buf0 = arg + 42
             ar0 = funcol.all_reduce(buf0, "avg", "0")
             ar0 = funcol.wait_tensor(ar0)
@@ -981,12 +1171,19 @@ class CompileTestCPU(TestCase):
         torch.cpu.synchronize()
 
     def test_inductor_all_reduce_cpu(self):
+        # [FUNCTION DOC] Test: runs the cpu inductor all_reduce check without and
+        # with the cpp wrapper.
         self._test_inductor_all_reduce_cpu(cpp_wrapper=False)
         self._test_inductor_all_reduce_cpu(cpp_wrapper=True)
 
 
 class CompileTest(TestCase):
+    # [CLASS DOC] Inductor tests on the current accelerator with a fake process group of world
+    # size 2; most tests compile a function, check the generated code with pattern matching
+    # and run it through the AOT Inductor runner.
     def setUp(self):
+        # [FUNCTION DOC] Test fixture: sets rank 0 and world size 2, selects accelerator index
+        # 0 as the device and initializes a fake backend group if none is initialized.
         super().setUp()
 
         self.rank = 0
@@ -1004,6 +1201,7 @@ class CompileTest(TestCase):
             )
 
     def tearDown(self):
+        # [FUNCTION DOC] Test fixture: destroys the default process group if initialized.
         if dist.is_initialized():
             dist.destroy_process_group()
 
@@ -1013,7 +1211,14 @@ class CompileTest(TestCase):
         {"aten_distributed_optimizations.enable_simple_overlap": False}
     )
     def test_inductor_all_reduce_single(self):
+        # [FUNCTION DOC] Test: compiled all_reduce on an inductor allocated buffer must use
+        # the in place variant on that buffer, while an all_reduce of a graph input uses a
+        # clone; wait_tensor results must be unused and buffers returned without copies. Also
+        # checks the cpp wrapper deletes four tensor objects and does not call the non in
+        # place op, and runs AOT Inductor. Overlap optimization is disabled.
         def func(arg: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: two waited all_reduce ops, one on an intermediate buffer
+            # and one on the graph input; returns both.
             buf0 = arg + 42
             # Expect in-place with inductor allocated buf
             ar0 = funcol.all_reduce(buf0, "avg", "0")
@@ -1064,7 +1269,12 @@ class CompileTest(TestCase):
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @fresh_cache()
     def test_inductor_all_reduce_coalesced(self):
+        # [FUNCTION DOC] Test: coalesced version of the previous test, with two tensors: in
+        # place on buffers allocated by inductor, clones for graph inputs, no used wait_tensor
+        # results, and AOT Inductor run.
         def func(args: list[torch.Tensor]) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: coalesced all_reduce of derived buffers and of the raw
+            # inputs; returns both lists.
             bufs = [arg + 42 for arg in args]
             # Expect in-place with inductor allocated buf
             ar0 = funcol.all_reduce_coalesced(bufs, "avg", "0")
@@ -1112,7 +1322,11 @@ class CompileTest(TestCase):
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @fresh_cache()
     def test_inductor_inplace_op_on_view(self):
+        # [FUNCTION DOC] Test: all_reduce of a view of an intermediate gets a contiguous
+        # buffer, so the in place op acts on a fresh buffer that is waited on and returned.
         def func(arg: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: takes the first two rows of the input plus 10,
+            # all_reduces and waits.
             buf0 = (arg + 10)[:2]
             ar0 = funcol.all_reduce(buf0, "avg", "0")
             ar0 = funcol.wait_tensor(ar0)
@@ -1137,7 +1351,13 @@ class CompileTest(TestCase):
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @fresh_cache()
     def test_inductor_all_reduce_non_contig_input(self):
+        # [FUNCTION DOC] Test: compiles all_reduce on a transposed (non contiguous) input and
+        # checks wait_tensor appears in the generated code. Then repeats the same compile of
+        # the first function.
+        # KNOWN ISSUE: the second function is defined but never compiled; the second half re-
+        # compiles the first function, so the in place variant is not tested.
         def func(arg: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: all_reduces the argument and waits.
             ar0 = funcol.all_reduce(arg, "avg", "0")
             ar0 = funcol.wait_tensor(ar0)
             # Expect allocation
@@ -1152,6 +1372,7 @@ class CompileTest(TestCase):
             raise AssertionError("Expected wait_tensor.default in code")
 
         def func2(arg: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: in place all_reduce of the argument, returns it.
             torch.ops._c10d_functional.all_reduce_(arg, "avg", "0")
             return arg
 
@@ -1168,7 +1389,13 @@ class CompileTest(TestCase):
     )
     @fresh_cache()
     def test_inductor_reuse_buffer_after_inplace_collective(self):
+        # [FUNCTION DOC] Test: after an in place all_reduce, inductor must reuse the freed
+        # buffer for a later matmul output. Checks allocation, the in place op, the reuse
+        # statement and the returned buffers, and that wait results are unused. Skipped when
+        # native matmul is enabled.
         def func(arg: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: all_reduce an intermediate, then two chained matrix
+            # multiplications; returns the two products.
             # Expect allocation
             buf0 = arg + 42
             ar0 = funcol.all_reduce(buf0, "avg", "0")
@@ -1207,7 +1434,11 @@ class CompileTest(TestCase):
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @fresh_cache()
     def test_inductor_all_gather_into_tensor_single(self):
+        # [FUNCTION DOC] Test: compiled all_gather_single emits the non in place
+        # all_gather_into_tensor op feeding wait_tensor with the result returned directly;
+        # also runs AOT Inductor.
         def func(arg: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: all_gather_single on dim 0 of the argument then wait.
             ag0 = funcol.all_gather_single(arg, 0, "0")
             ag0 = funcol.wait_tensor(ag0)
             return ag0
@@ -1241,7 +1472,14 @@ class CompileTest(TestCase):
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @fresh_cache()
     def test_inductor_all_gather_into_tensor_coalesced(self):
+        # [FUNCTION DOC] Test: compiled coalesced all_gather of four tensors produces one
+        # coalesced op, indexes each output and waits on each; also runs AOT Inductor. Skipped
+        # under inductor testing or on Linux (issue 146806).
+        # KNOWN ISSUE: the skip condition is true on every Linux machine, so the test is
+        # effectively disabled there, which looks broader than the linked issue suggests.
         def func(args: list[torch.Tensor]) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: coalesced all_gather_single over a list,
+            # waiting each output.
             ag0 = funcol.all_gather_single_coalesced(args, "0")
             ag0 = [funcol.wait_tensor(out) for out in ag0]
             return ag0
@@ -1275,7 +1513,11 @@ class CompileTest(TestCase):
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @fresh_cache()
     def test_inductor_all_reduce_output_stride_matches_eager(self):
+        # [FUNCTION DOC] Test: strides of compiled all_reduce and wait_tensor outputs on a
+        # transposed input match those from eager execution.
         def func(x):
+            # [FUNCTION DOC] HELPER: transposes the input, calls the raw all_reduce op and the
+            # raw wait_tensor op, and returns both outputs.
             x = x.t()
             y = torch.ops._c10d_functional.all_reduce.default(x, "sum", "0")
             z = torch.ops._c10d_functional.wait_tensor.default(y)
@@ -1294,7 +1536,11 @@ class CompileTest(TestCase):
     @unittest.skipIf(not HAS_GPU, "This is a GPU test!")
     @fresh_cache()
     def test_wait_tensor(self):
+        # [FUNCTION DOC] Test: a compiled function using the raw all_reduce op and
+        # funcol wait_tensor calls wait_tensor on the first buffer and returns it;
+        # also runs AOT Inductor.
         def func(arg: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: raw all_reduce op then wait_tensor.
             t = torch.ops._c10d_functional.all_reduce(arg, "avg", "0")
             return funcol.wait_tensor(t)
 
@@ -1316,7 +1562,10 @@ class CompileTest(TestCase):
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @fresh_cache()
     def test_inductor_reduce_scatter_tensor_single(self):
+        # [FUNCTION DOC] Test: compiled reduce_scatter_single emits the reduce_scatter_tensor
+        # op feeding wait_tensor with the result returned directly; also runs AOT Inductor.
         def func(arg: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: reduce_scatter_single with average on dim 0, then wait.
             rs0 = funcol.reduce_scatter_single(arg, "avg", 0, "0")
             rs0 = funcol.wait_tensor(rs0)
             return rs0
@@ -1342,7 +1591,12 @@ class CompileTest(TestCase):
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @fresh_cache()
     def test_inductor_reduce_scatter_tensor_coalesced(self):
+        # [FUNCTION DOC] Test: compiled coalesced reduce_scatter of four tensors
+        # produces one coalesced op, indexes each output, waits each and returns
+        # them; also runs AOT Inductor.
         def func(args: list[torch.Tensor]) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: coalesced reduce_scatter_single with average over a list,
+            # waiting each output.
             rs0 = funcol.reduce_scatter_single_coalesced(
                 args, "avg", [0] * len(args), "0"
             )
@@ -1378,11 +1632,16 @@ class CompileTest(TestCase):
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @fresh_cache()
     def test_inductor_all_to_all_single(self):
+        # [FUNCTION DOC] Test: compiled all_to_all_single with dynamic shapes where split
+        # sizes come from tensors converted to lists (dynamic shape config patched). Checks
+        # the generated code passes symbolic split size lists to the op and calls wait_tensor.
         def func(
             input: torch.Tensor,
             output_split_sizes: torch.Tensor,
             input_split_sizes: torch.Tensor,
         ) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: all_to_all_single using split size lists from the
+            # tensors, then wait.
             output = funcol.all_to_all_single(
                 input,
                 output_split_sizes.tolist(),
@@ -1425,7 +1684,12 @@ class CompileTest(TestCase):
         {"aten_distributed_optimizations.enable_simple_overlap": False}
     )
     def test_inductor_broadcast(self):
+        # [FUNCTION DOC] Test: compiled broadcast on an inductor buffer uses the in place
+        # broadcast op and, for a graph input, a clone; checks wait_tensor and return of
+        # buffers without copy; runs AOT Inductor. Overlap optimization is disabled.
         def func(arg: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: broadcast of an intermediate from rank 1 and of the input
+            # from rank 0, each waited; returns both.
             buf0 = arg + 42
             # Expect in-place with inductor allocated buf
             br0 = funcol.broadcast(buf0, 1, "0")
@@ -1463,7 +1727,12 @@ class CompileTest(TestCase):
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @fresh_cache()
     def test_ranks_and_tag(self):
+        # [FUNCTION DOC] Test: all_reduce given an explicit ranks list and empty tag is
+        # compiled with fullgraph and the generated code uses the in place all_reduce with
+        # group name 0.
         def func(arg: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: two waited all_reduce ops over ranks 0 and 1, one on an
+            # intermediate and one on the input.
             buf0 = arg + 42
             # Expect in-place with inductor allocated buf
             ar0 = funcol.all_reduce(buf0, "avg", [0, 1], "")
@@ -1482,7 +1751,12 @@ class CompileTest(TestCase):
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @fresh_cache()
     def test_compile_all_gather_into_tensor_out(self):
+        # [FUNCTION DOC] Test: compiling all_gather_into_tensor_out with fullgraph gives an
+        # output of world size times the input length and generated code that allocates a
+        # buffer, passes it as out and waits on it.
         def func(input, out):
+            # [FUNCTION DOC] HELPER: all_gather_into_tensor_out into the given out tensor,
+            # wait, then add one.
             y = torch.ops._c10d_functional.all_gather_into_tensor_out(
                 input, self.world_size, "0", out=out
             )
@@ -1509,7 +1783,12 @@ class CompileTest(TestCase):
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @fresh_cache()
     def test_compile_reduce_scatter_tensor_out(self):
+        # [FUNCTION DOC] Test: compiling reduce_scatter_tensor_out with fullgraph gives an
+        # output of the input length divided by world size and generated code that allocates a
+        # buffer, passes it as out and waits on it.
         def func(input, out):
+            # [FUNCTION DOC] HELPER: reduce_scatter_tensor_out into the given out tensor,
+            # wait, then add one.
             y = torch.ops._c10d_functional.reduce_scatter_tensor_out(
                 input, "sum", self.world_size, "0", out=out
             )
@@ -1535,6 +1814,8 @@ class CompileTest(TestCase):
 
 
 class ACTCompileTest(TestCase):
+    # [CLASS DOC] Single process test case for AsyncCollectiveTensor inputs to compiled
+    # regions and direct AOT autograd functions.
     """
     Test that AsyncCollectiveTensor inputs to compiled regions are resolved
     before AOT autograd tracing begins. ACTs are transient eager-mode wrappers
@@ -1544,6 +1825,10 @@ class ACTCompileTest(TestCase):
     """
 
     def test_act_compile_backward_tangent_mismatch(self):
+        # [FUNCTION DOC] Test: an AsyncCollectiveTensor passed to a function compiled with
+        # aot_eager and a view op must be waited for (trigger_wait is patched to record the
+        # call), backward must not fail with a tangent type mismatch, and the output equals
+        # the unsqueezed underlying data.
         """
         When a bare AsyncCollectiveTensor (ACT) enters a torch.compiled
         region and passes through a view op, the output remains an ACT.
@@ -1573,6 +1858,8 @@ class ACTCompileTest(TestCase):
         wait_called = False
 
         def tracked_trigger_wait(self):
+            # [FUNCTION DOC] HELPER: replacement for trigger_wait that sets the enclosing flag
+            # and calls the original implementation, returning its result.
             nonlocal wait_called
             wait_called = True
             return original_trigger_wait(self)
@@ -1592,6 +1879,10 @@ class ACTCompileTest(TestCase):
         self.assertEqual(out.detach(), ref)
 
     def test_act_runtime_unwrap(self):
+        # [FUNCTION DOC] Test: a custom AOT autograd backend asserts none of the
+        # runtime arguments are AsyncCollectiveTensor, for both the first
+        # (compiling) call and a second call that reuses the cached graph; results
+        # must equal twice the underlying data.
         """
         Verify that ACT inputs are resolved before the compiled graph
         executes.
@@ -1605,10 +1896,18 @@ class ACTCompileTest(TestCase):
         """
 
         def assert_no_act_backend(gm, example_inputs):
+            # [FUNCTION DOC] HELPER: backend wrapping the graph with aot_autograd, using a
+            # forward compiler whose callable checks the arguments.
             from torch._dynamo.backends.common import aot_autograd
 
             def inner_compiler(gm, example_inputs):
+                # [FUNCTION DOC] HELPER: forward compiler returning a boxed callable
+                # that fails if any argument is an AsyncCollectiveTensor and
+                # otherwise runs the graph.
                 def compiled(args):
+                    # [FUNCTION DOC] HELPER: boxed callable that checks every argument in the
+                    # list is not an AsyncCollectiveTensor (assertion failure message includes
+                    # the argument index) and then calls the graph with them.
                     for i, a in enumerate(args):
                         self.assertNotIsInstance(
                             a,
@@ -1639,6 +1938,9 @@ class ACTCompileTest(TestCase):
         self.assertEqual(r2, elem2 * 2)
 
     def test_direct_aot_top_level_act_path_accepts_plain_runtime_input(self):
+        # [FUNCTION DOC] Test: a function wrapped with aot_function (no dynamo guards) is
+        # first called with an AsyncCollectiveTensor and then with a plain tensor; both calls
+        # must work and return twice the input.
         """
         Unlike torch.compile, direct AOTAutograd entry points do not have
         Dynamo input-type guards to force a recompile when a top-level ACT input
@@ -1648,6 +1950,7 @@ class ACTCompileTest(TestCase):
         from torch._functorch.aot_autograd import aot_function
 
         def fw_compiler(gm, example_inputs):
+            # [FUNCTION DOC] HELPER: forward compiler that returns the graph module unchanged.
             return gm
 
         compiled_fn = aot_function(lambda x: x * 2, fw_compiler=fw_compiler)
@@ -1661,6 +1964,9 @@ class ACTCompileTest(TestCase):
         self.assertEqual(r2, plain * 2)
 
     def test_act_guard_recompiles(self):
+        # [FUNCTION DOC] Test: with a compile counter backend, switching an input between
+        # plain tensor and AsyncCollectiveTensor forces a second compilation; returning to a
+        # plain tensor reuses the first graph, so frame count goes 1, 2, 2.
         """
         Dynamo must recompile when an input switches between plain tensor
         and AsyncCollectiveTensor (or vice versa).
