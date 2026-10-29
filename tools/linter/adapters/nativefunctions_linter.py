@@ -4,6 +4,11 @@
 #   "ruamel.yaml==0.18.10",
 # ]
 # ///
+# [MODULE DOC] Script that checks native_functions.yaml survives a load and dump round trip
+# through ruamel.yaml (preserving quotes, wide lines and capitalized booleans) without any
+# change. On a YAML parse failure it prints an error message and exits; on a mismatch it
+# prints an error message carrying the original and re-dumped text so lintrunner can apply the
+# fix. Everything runs under the main guard.
 """
 Verify that it is possible to round-trip native_functions.yaml via ruamel under some
 configuration.  Keeping native_functions.yaml consistent in this way allows us to
@@ -32,6 +37,8 @@ import ruamel.yaml  # type: ignore[import]
 
 
 class LintSeverity(str, Enum):
+    # [CLASS DOC] HELPER: String-valued enum of the severities lintrunner understands: error,
+    # warning, advice and disabled.
     ERROR = "error"
     WARNING = "warning"
     ADVICE = "advice"
@@ -39,6 +46,9 @@ class LintSeverity(str, Enum):
 
 
 class LintMessage(NamedTuple):
+    # [CLASS DOC] HELPER: Record for one lint finding in lintrunner's JSON schema (path, line,
+    # char, code, severity, name, original, replacement, description; None means unset). Instances
+    # are converted to a mapping and printed as one JSON object per line.
     path: str | None
     line: int | None
     char: int | None

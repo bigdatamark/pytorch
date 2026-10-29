@@ -1,3 +1,7 @@
+# [MODULE DOC] Lint adapter that detects text files ending with extra blank lines (a final
+# line consisting only of a newline) and files using DOS line endings, offering whole-file
+# fixes. Files larger than a size limit are skipped with a warning. When run as a script it
+# checks each file and prints the resulting messages as JSON lines.
 """
 NEWLINE: Checks files to make sure there are no trailing newlines.
 """
@@ -20,6 +24,8 @@ MAX_FILE_SIZE: int = 1024 * 1024 * 1024  # 1GB in bytes
 
 
 class LintSeverity(str, Enum):
+    # [CLASS DOC] HELPER: String-valued enum of the severities lintrunner understands: error,
+    # warning, advice and disabled.
     ERROR = "error"
     WARNING = "warning"
     ADVICE = "advice"
@@ -27,6 +33,9 @@ class LintSeverity(str, Enum):
 
 
 class LintMessage(NamedTuple):
+    # [CLASS DOC] HELPER: Record for one lint finding in lintrunner's JSON schema (path, line,
+    # char, code, severity, name, original, replacement, description; None means unset). Instances
+    # are converted to a mapping and printed as one JSON object per line.
     path: str | None
     line: int | None
     char: int | None
@@ -39,6 +48,15 @@ class LintMessage(NamedTuple):
 
 
 def check_file(filename: str) -> LintMessage | None:
+    # [FUNCTION DOC] Check one file and return a LintMessage or None if it is fine. Reports a
+    # warning when the file is too big and an error when its size cannot be read. Empty files
+    # pass. A file whose final line is only a newline gets a trailing-newline error whose
+    # replacement strips trailing newlines and adds exactly one; otherwise any line ending in
+    # carriage return plus newline is rewritten and reported as a DOS newline error. Decoding
+    # failures yield a decoding-failure error. Reads the file; does not modify it.
+    # KNOWN ISSUE: a file consisting of a single byte gets the odd rule name testestTrailing
+    # newline (a typo) and no replacement; the argparse description and verbose help text in the
+    # main block are copy-pasted from another linter; only one problem is reported per file.
     logging.debug("Checking file %s", filename)
 
     # Check if file is too large

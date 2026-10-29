@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Lint adapter ensuring every symbol listed in the header-only API list file is
+# exercised by at least one C++ or CUDA test source under the aoti_abi_check test directories,
+# which are built without linking libtorch. Defines the test glob list and the repository
+# root, and when run as a script checks the header-only API list and prints an error message
+# per untested symbol as a JSON line.
 """
 Checks that all symbols in torch/header_only_apis.txt are tested in a .cpp
 test file to ensure header-only-ness. The .cpp test file must be built
@@ -17,6 +22,8 @@ LINTER_CODE = "HEADER_ONLY_LINTER"
 
 
 class LintSeverity(str, Enum):
+    # [CLASS DOC] HELPER: String-valued enum of the severities lintrunner understands: error,
+    # warning, advice and disabled.
     ERROR = "error"
     WARNING = "warning"
     ADVICE = "advice"
@@ -24,6 +31,9 @@ class LintSeverity(str, Enum):
 
 
 class LintMessage(NamedTuple):
+    # [CLASS DOC] HELPER: Record for one lint finding in lintrunner's JSON schema (path, line,
+    # char, code, severity, name, original, replacement, description; None means unset). Instances
+    # are converted to a mapping and printed as one JSON object per line.
     path: str | None
     line: int | None
     char: int | None
@@ -46,6 +56,11 @@ REPO_ROOT = Path(__file__).parents[3]
 def find_matched_symbols(
     symbols_regex: re.Pattern[str], test_globs: list[str] = CPP_TEST_GLOBS
 ) -> set[str]:
+    # [FUNCTION DOC] Scan the non-comment lines of all test files matching the globs (relative to
+    # the repo root) and return the set of symbols that the given compiled regex matches. Lines
+    # that are empty or begin with a double slash or hash sign are skipped. The regex is expected
+    # to be built from symbols sorted in reverse order so that longer symbols sharing a prefix
+    # match first. Reads files; no other side effects.
     """
     Goes through all lines not starting with // in the cpp files and
     accumulates a list of matches with the symbols_regex. Note that
@@ -71,6 +86,15 @@ def find_matched_symbols(
 def check_file(
     filename: str, test_globs: list[str] = CPP_TEST_GLOBS
 ) -> list[LintMessage]:
+    # [FUNCTION DOC] Parse the header-only API list file (one symbol per line, blank lines and
+    # hash comments ignored, recording the last line number of each symbol), build an alternation
+    # regex from the symbols in reverse sorted order, find which symbols appear in the tests, and
+    # return one error LintMessage for every symbol that is not tested. The test globs argument
+    # exists mainly so tests can override the default.
+    # KNOWN ISSUE: the message tells users to edit tools/linters/adapters/header_only_linter.py,
+    # but the actual directory is tools/linter/adapters; matching is plain substring/regex
+    # matching, so one symbol that is a prefix of another may be matched spuriously and symbols
+    # are not regex-escaped.
     """
     Goes through the header_only_apis.txt file and verifies that all symbols
     within the file can be found tested in an appropriately independent .cpp

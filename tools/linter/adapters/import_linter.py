@@ -1,3 +1,8 @@
+# [MODULE DOC] Lint adapter that flags import statements of modules outside an allow list
+# (standard library modules plus a few approved third-party packages such as torch, numpy,
+# sympy and triton). Uses the shared _linter package (imported relatively when type checking
+# or when this directory is not on the module path, otherwise absolutely) to tokenize files.
+# When run as a script, prints each finding as a JSON line.
 """
 Checks files to make sure there are no imports from disallowed third party
 libraries.
@@ -25,6 +30,8 @@ else:
 
 
 class LintSeverity(str, Enum):
+    # [CLASS DOC] HELPER: String-valued enum of the severities lintrunner understands: error,
+    # warning, advice and disabled.
     ERROR = "error"
     WARNING = "warning"
     ADVICE = "advice"
@@ -32,6 +39,9 @@ class LintSeverity(str, Enum):
 
 
 class LintMessage(NamedTuple):
+    # [CLASS DOC] HELPER: Record for one lint finding in lintrunner's JSON schema (path, line,
+    # char, code, severity, name, original, replacement, description; None means unset). Instances
+    # are converted to a mapping and printed as one JSON object per line.
     path: str | None
     line: int | None
     char: int | None
@@ -81,6 +91,14 @@ use sys.modules.get("torchrec") or the like.
 
 
 def check_file(filepath: str) -> list[LintMessage]:
+    # [FUNCTION DOC] Tokenize the file with the shared PythonFile helper and, for each logical
+    # line, skip leading indent tokens and check whether it starts with the import or from keyword
+    # followed by a name token; if that first module name is not in the allow list, record an
+    # error LintMessage with the standard explanatory text. Returns the list of messages. Relative
+    # imports and the part after the first dotted component are not examined.
+    # KNOWN ISSUE: the reported line is the zero-based token line index rather than a one-based
+    # line number; the argparse description in the main block is copy-pasted from the native
+    # functions linter.
     path = Path(filepath)
     file = _linter.PythonFile("import_linter", path=path)
     lint_messages = []

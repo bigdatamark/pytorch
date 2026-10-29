@@ -6,6 +6,11 @@
 #   "ruff==0.14.4",
 # ]
 # ///
+# [MODULE DOC] Lint adapter that formats Python files by applying isort, then usort, then ruff
+# format, and reports a warning with the original and formatted text when they differ. Files
+# are processed in parallel worker processes, capped by the MAX_JOBS environment variable or
+# the CPU count. Prints JSON lint messages. Import-time side effects: imports isort and usort
+# and computes the repository root.
 from __future__ import annotations
 
 import argparse
@@ -29,6 +34,8 @@ REPO_ROOT = Path(__file__).absolute().parents[3]
 
 
 class LintSeverity(str, Enum):
+    # [CLASS DOC] HELPER: String-valued enum of the severities lintrunner understands: error,
+    # warning, advice and disabled.
     ERROR = "error"
     WARNING = "warning"
     ADVICE = "advice"
@@ -36,6 +43,9 @@ class LintSeverity(str, Enum):
 
 
 class LintMessage(NamedTuple):
+    # [CLASS DOC] HELPER: Record for one lint finding in lintrunner's JSON schema (path, line,
+    # char, code, severity, name, original, replacement, description; None means unset). Instances
+    # are converted to a mapping and printed as one JSON object per line.
     path: str | None
     line: int | None
     char: int | None
@@ -48,10 +58,14 @@ class LintMessage(NamedTuple):
 
 
 def as_posix(name: str) -> str:
+    # [FUNCTION DOC] HELPER: Convert a path to forward-slash form on Windows; unchanged elsewhere.
+    # Not used in this module.
     return name.replace("\\", "/") if IS_WINDOWS else name
 
 
 def format_error_message(filename: str, err: Exception) -> LintMessage:
+    # [FUNCTION DOC] HELPER: Wrap an exception into an advice-level command-failed LintMessage for
+    # the given file.
     return LintMessage(
         path=filename,
         line=None,
@@ -66,6 +80,10 @@ def format_error_message(filename: str, err: Exception) -> LintMessage:
 
 
 def run_isort(content: str, path: Path) -> str:
+    # [FUNCTION DOC] HELPER: Sort imports with isort using the repository configuration. For every
+    # file other than this script, usort skip comments are temporarily turned into isort split
+    # markers before sorting and turned back afterwards, so both tools respect the same
+    # boundaries. Returns the new content.
     isort_config = isort.Config(settings_path=str(REPO_ROOT))
 
     is_this_file = path.samefile(__file__)
@@ -81,12 +99,18 @@ def run_isort(content: str, path: Path) -> str:
 
 
 def run_usort(content: str, path: Path) -> str:
+    # [FUNCTION DOC] HELPER: Sort imports with usort, using the configuration found for the path,
+    # and return the new content.
     usort_config = usort.Config.find(path)
 
     return usort.usort_string(content, path=path, config=usort_config)
 
 
 def run_ruff_format(content: str, path: Path) -> str:
+    # [FUNCTION DOC] HELPER: Format the content with ruff format, run as a subprocess reading
+    # standard input, using the repository pyproject configuration and the file name for context.
+    # Returns the formatted text; raises a ValueError carrying ruff's output if ruff exits
+    # with failure.
     try:
         return subprocess.check_output(
             [
@@ -110,6 +134,10 @@ def run_ruff_format(content: str, path: Path) -> str:
 
 
 def check_file(filename: str) -> list[LintMessage]:
+    # [FUNCTION DOC] Read a file, run isort, usort and ruff format over it in that order (isort
+    # first to fix blank-line style) and return an empty list if nothing changed, otherwise a
+    # warning LintMessage with original and replacement. Any exception becomes an advice-level
+    # command-failed message instead of propagating.
     path = Path(filename).absolute()
     original = replacement = path.read_text(encoding="utf-8")
 
@@ -140,6 +168,8 @@ def check_file(filename: str) -> list[LintMessage]:
 
 
 def _default_num_workers() -> int | None:
+    # [FUNCTION DOC] HELPER: Return the worker count: the positive integer value of MAX_JOBS when
+    # set, otherwise the CPU count.
     # Forks one process per file batch, so respect MAX_JOBS to cap parallelism.
     max_jobs = os.environ.get("MAX_JOBS")
     if max_jobs and max_jobs.isdigit() and int(max_jobs) > 0:
@@ -148,6 +178,9 @@ def _default_num_workers() -> int | None:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point. Parses options (verbose, number of workers, file names),
+    # configures logging to stderr, then checks all files in a process pool and prints each lint
+    # message as a JSON line. If a check raises, logs the failing file and re-raises.
     parser = argparse.ArgumentParser(
         description="Format files with usort + ruff-format.",
         fromfile_prefix_chars="@",

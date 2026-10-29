@@ -5,6 +5,11 @@
 #   "tomli==2.2.1 ; python_version < '3.11'",
 # ]
 # ///
+# [MODULE DOC] Lint adapter that validates pyproject.toml consistency: the project table must
+# exist, and a requires-python entry must be a string, only mention Python 3 specifiers, admit
+# at least one 3.x minor version, and exclude 3.0 (a minimum is required); the classifiers
+# entry must be a list of unique strings. Uses tomllib or tomli and the packaging library.
+# Checks files in parallel processes and prints error JSON lines.
 from __future__ import annotations
 
 import argparse
@@ -28,6 +33,8 @@ else:
 
 
 class LintSeverity(str, Enum):
+    # [CLASS DOC] HELPER: String-valued enum of the severities lintrunner understands: error,
+    # warning, advice and disabled.
     ERROR = "error"
     WARNING = "warning"
     ADVICE = "advice"
@@ -35,6 +42,9 @@ class LintSeverity(str, Enum):
 
 
 class LintMessage(NamedTuple):
+    # [CLASS DOC] HELPER: Record for one lint finding in lintrunner's JSON schema (path, line,
+    # char, code, severity, name, original, replacement, description; None means unset). Instances
+    # are converted to a mapping and printed as one JSON object per line.
     path: str | None
     line: int | None
     char: int | None
@@ -52,6 +62,9 @@ def format_error_message(
     *,
     message: str | None = None,
 ) -> LintMessage:
+    # [FUNCTION DOC] HELPER: Build an error LintMessage with code PYPROJECT for the file. The
+    # description is the explicit message if given, otherwise a text built from the exception type
+    # and text.
     if message is None and error is not None:
         message = f"Failed due to {error.__class__.__name__}:\n{error}"
     return LintMessage(
@@ -68,6 +81,16 @@ def format_error_message(
 
 
 def check_file(filename: str) -> list[LintMessage]:
+    # [FUNCTION DOC] Parse the TOML file and return a list with at most one error message
+    # describing the first violated rule (unreadable or invalid TOML, missing project table,
+    # requires-python of the wrong type, non-3 specifier, no supported 3.x version, no minimum
+    # version, malformed or duplicate classifiers); an empty list means the file is consistent.
+    # Supported versions are found by filtering minor versions up to 1000 against the
+    # specifier set.
+    # KNOWN ISSUE: the classifier checks only run when requires-python is present (they are nested
+    # inside that branch); an invalid specifier or a wildcard version raises an uncaught packaging
+    # exception; large blocks of commented-out code (maximum-version and classifier-sync
+    # checks) remain.
     path = Path(filename).absolute()
     try:
         pyproject = tomllib.loads(path.read_text(encoding="utf-8"))
@@ -213,6 +236,9 @@ def check_file(filename: str) -> list[LintMessage]:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point. Parses options, configures logging to stderr, checks all given
+    # files in a process pool sized to the CPU count and prints each lint message as a JSON line,
+    # logging and re-raising if a check fails.
     parser = argparse.ArgumentParser(
         description="Check consistency of pyproject.toml files.",
         fromfile_prefix_chars="@",

@@ -32,6 +32,11 @@
 #   { name = "spmd-types", version = "0.2.1", requires-dist = [] },
 # ]
 # ///
+# [MODULE DOC] Lint adapter that runs the pyrefly type checker on the project (as selected by
+# the config file, not by individual file arguments) with JSON output and converts each
+# reported error into a lint message, ignoring errors named deprecated. Supports options to
+# remove unused ignores and to add suppressions. Also scans stderr for internal-error lines.
+# Prints JSON lint messages. Import-time effect: compiles two regular expressions.
 from __future__ import annotations
 
 import argparse
@@ -47,6 +52,8 @@ from typing import NamedTuple
 
 
 class LintSeverity(str, Enum):
+    # [CLASS DOC] HELPER: String-valued enum of the severities lintrunner understands: error,
+    # warning, advice and disabled.
     ERROR = "error"
     WARNING = "warning"
     ADVICE = "advice"
@@ -54,6 +61,9 @@ class LintSeverity(str, Enum):
 
 
 class LintMessage(NamedTuple):
+    # [CLASS DOC] HELPER: Record for one lint finding in lintrunner's JSON schema (path, line,
+    # char, code, severity, name, original, replacement, description; None means unset). Instances
+    # are converted to a mapping and printed as one JSON object per line.
     path: str | None
     line: int | None
     char: int | None
@@ -98,6 +108,10 @@ def run_command(
     extra_env: dict[str, str] | None,
     retries: int,
 ) -> subprocess.CompletedProcess[bytes]:
+    # [FUNCTION DOC] HELPER: Run a command with captured output, logging the command line and
+    # elapsed time at debug level, and return the finished process without raising on a
+    # nonzero status.
+    # KNOWN ISSUE: the extra_env and retries parameters are accepted but ignored.
     logging.debug("$ %s", " ".join(args))
     start_time = time.monotonic()
     try:
@@ -119,6 +133,11 @@ severities = {
 
 
 def check_pyrefly_installed(code: str) -> list[LintMessage]:
+    # [FUNCTION DOC] Verify that the pyrefly executable runs by asking for its version. Returns an
+    # empty list on success or a single error LintMessage with the stderr text if it exits
+    # with failure.
+    # KNOWN ISSUE: only a failing exit status is handled; if the executable is missing the
+    # resulting OS error propagates uncaught.
     cmd = ["pyrefly", "--version"]
     try:
         subprocess.run(cmd, check=True, capture_output=True)
@@ -141,12 +160,23 @@ def check_pyrefly_installed(code: str) -> list[LintMessage]:
 
 
 def in_github_actions() -> bool:
+    # [FUNCTION DOC] HELPER: Return whether the GITHUB_ACTIONS environment variable is set to a
+    # non-empty value. Not used in this module.
     return bool(os.getenv("GITHUB_ACTIONS"))
 
 
 def check_files(
     code: str, config: str, remove_unused_ignores: bool, suppress: bool
 ) -> list[LintMessage]:
+    # [FUNCTION DOC] Run pyrefly check with JSON output using the given config, adding flags to
+    # remove unused ignores or suppress errors when requested, and return lint messages. Returns
+    # command-failed messages if the process cannot start or exits with a status other than 0 or
+    # 1. Decodes the first JSON object from stdout (trailing GitHub Actions lines are ignored),
+    # drops errors named deprecated, and builds one error message per remaining entry; malformed
+    # output yields a json-parse-error message. Also adds messages for internal errors matched
+    # in stderr.
+    # KNOWN ISSUE: the severity expression for the deprecated name can never choose advice because
+    # those entries are filtered out first.
     try:
         pyrefly_commands = [
             "pyrefly",
@@ -257,6 +287,11 @@ def check_files(
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point. Parses options (code, verbose, config, remove-unused-ignores,
+    # suppress), configures logging at info level to stderr, runs the install check and the
+    # pyrefly check, and prints each lint message as a JSON line.
+    # KNOWN ISSUE: the help text for the config option says mypy .ini file although it is a
+    # pyrefly config; the verbose option has no effect.
     parser = argparse.ArgumentParser(
         description="pyrefly wrapper linter.",
         fromfile_prefix_chars="@",

@@ -1,3 +1,9 @@
+# [MODULE DOC] Generic lint adapter that runs grep with an extended regex pattern over the
+# given files and reports each match as a lint error, optionally proposing a whole-file
+# replacement computed with sed. Supports an allowlist pattern (skip files containing it), a
+# per-line allowlist, a match-first-only mode, and caps on reported matches and file size.
+# Module globals LINTER_NAME and ERROR_DESCRIPTION are set from the command line in main and
+# used when printing messages. Prints JSON lint messages to stdout.
 """
 Generic linter that greps for a pattern and optionally suggests replacements.
 """
@@ -25,6 +31,8 @@ MAX_ORIGINAL_SIZE: int = (
 
 
 class LintSeverity(str, Enum):
+    # [CLASS DOC] HELPER: String-valued enum of the severities lintrunner understands: error,
+    # warning, advice and disabled.
     ERROR = "error"
     WARNING = "warning"
     ADVICE = "advice"
@@ -36,6 +44,9 @@ ERROR_DESCRIPTION: str | None = None
 
 
 class LintMessage(NamedTuple):
+    # [CLASS DOC] HELPER: Record for one lint finding in lintrunner's JSON schema (path, line,
+    # char, code, severity, name, original, replacement, description; None means unset). Instances
+    # are converted to a mapping and printed as one JSON object per line.
     path: str | None
     line: int | None
     char: int | None
@@ -48,12 +59,17 @@ class LintMessage(NamedTuple):
 
 
 def as_posix(name: str) -> str:
+    # [FUNCTION DOC] HELPER: Convert a path to forward-slash form when running on Windows; returns
+    # it unchanged elsewhere.
     return name.replace("\\", "/") if IS_WINDOWS else name
 
 
 def run_command(
     args: list[str],
 ) -> subprocess.CompletedProcess[bytes]:
+    # [FUNCTION DOC] HELPER: Run an external command with captured output, logging the command and
+    # its elapsed time at debug level. Returns the finished process; does not raise on a nonzero
+    # exit status.
     logging.debug("$ %s", " ".join(args))
     start_time = time.monotonic()
     try:
@@ -75,6 +91,10 @@ def print_lint_message(
     replacement: str | None = None,
     description: str | None = None,
 ) -> None:
+    # [FUNCTION DOC] Build a lint message from the arguments and print it as a JSON line on
+    # stdout. The code field comes from the global linter name, and the description falls back to
+    # the global error description when none is given. Side effects: writes to stdout, reads
+    # module globals.
     """
     Create a LintMessage and print it as JSON.
 
@@ -90,6 +110,9 @@ def print_lint_message(
 
 
 def group_lines_by_file(lines: list[str]) -> dict[str, list[str]]:
+    # [FUNCTION DOC] HELPER: Group grep output lines by file name. Input lines look like name,
+    # line number and content separated by colons; the result maps each file name to the list of
+    # text after the first colon. Empty lines are skipped.
     """
     Group matching lines by filename.
 
@@ -117,6 +140,13 @@ def check_allowlist(
     filename: str,
     allowlist_pattern: str,
 ) -> bool:
+    # [FUNCTION DOC] Report whether a file should be skipped because it contains the allowlist
+    # pattern, found by running grep on that file. Returns false immediately when the pattern is
+    # empty, and also false when grep finds nothing. On an exception it prints a command-failed
+    # lint message and returns false.
+    # KNOWN ISSUE: run_command never uses the check option, so the branch formatting a
+    # CalledProcessError is effectively dead code; a grep exit status of 2 (a real grep error) is
+    # treated like no match.
     """
     Check if a file matches the allowlist pattern.
 
@@ -169,6 +199,13 @@ def lint_file(
     error_name: str,
     line_allowlist_pattern: re.Pattern[str] | None = None,
 ) -> None:
+    # [FUNCTION DOC] Emit lint messages for one file given its grep match remainders. Skips the
+    # file if the allowlist pattern is present, drops lines matching the line allowlist, and then
+    # either (a) when a replace pattern is given and the file is small enough, runs sed over the
+    # file and prints a single message carrying the original and replaced text, or (b) prints one
+    # message per matching line up to a maximum, followed by a too-many-matches message if the
+    # limit was exceeded. Errors reading or running sed print a command-failed message. Side
+    # effects: reads the file, runs sed, prints to stdout.
     """
     Lint a file with one or more pattern matches, printing LintMessages as they're created.
 
@@ -265,6 +302,16 @@ def lint_file(
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point. Parses command-line options (pattern, allowlist patterns, linter
+    # name, error name and description, replace pattern, match-first-only, verbose), rejecting
+    # duplicated options, sets the module globals, configures logging to stderr, and filters out
+    # oversized or inaccessible files with warnings. Runs grep over the remaining files in batches
+    # sized to stay below the command-line length limit, groups the output per file and calls the
+    # per-file linter. If grep itself raises, prints a command-failed message and exits with
+    # status zero.
+    # KNOWN ISSUE: the batch size is computed by integer division and could be zero if the
+    # argument length is huge relative to the file count, which would make the range step invalid;
+    # in match-first-only mode the output has no line numbers, so messages carry no line.
     parser = argparse.ArgumentParser(
         description="grep wrapper linter.",
         fromfile_prefix_chars="@",

@@ -1,3 +1,9 @@
+# [MODULE DOC] Script that checks the installed lintrunner version against a minimum (0.10.7)
+# by running the lintrunner command with the version flag. If the installed version is older,
+# prints an advice-level JSON lint message asking the user to upgrade. Everything runs under
+# the main guard, so importing has no effects.
+# KNOWN ISSUE: when the version output cannot be parsed, an error message is built but never
+# printed and the script exits with status zero, so a missing lintrunner is silently ignored.
 from __future__ import annotations
 
 import json
@@ -11,6 +17,8 @@ LINTER_CODE = "LINTRUNNER_VERSION"
 
 
 class LintSeverity(str, Enum):
+    # [CLASS DOC] HELPER: String-valued enum of the severities lintrunner understands: error,
+    # warning, advice and disabled.
     ERROR = "error"
     WARNING = "warning"
     ADVICE = "advice"
@@ -18,6 +26,9 @@ class LintSeverity(str, Enum):
 
 
 class LintMessage(NamedTuple):
+    # [CLASS DOC] HELPER: Record for one lint finding in lintrunner's JSON schema (path, line,
+    # char, code, severity, name, original, replacement, description; None means unset). Instances
+    # are converted to a mapping and printed as one JSON object per line.
     path: str | None
     line: int | None
     char: int | None
@@ -30,6 +41,7 @@ class LintMessage(NamedTuple):
 
 
 def toVersionString(version_tuple: tuple[int, int, int]) -> str:
+    # [FUNCTION DOC] HELPER: Format a three-integer version tuple as a dotted string.
     return ".".join(str(x) for x in version_tuple)
 
 

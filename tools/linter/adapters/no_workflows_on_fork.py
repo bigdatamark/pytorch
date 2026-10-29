@@ -4,6 +4,12 @@
 #   "pyyaml==6.0.2",
 # ]
 # ///
+# [MODULE DOC] Lint adapter for GitHub workflow files that ensures jobs triggered by push,
+# schedule, pull_request or pull_request_target are guarded so they do not run on forks, i.e.
+# the job condition must check that the repository (or its owner) is pytorch. It can propose
+# an automatic rewrite adding or extending the condition. Prefers the C-based YAML loader when
+# available. Files are checked in parallel processes when run as a script.
+# KNOWN ISSUE: the docstring's last sentence is incomplete (it ends with the words so this is).
 """
 This a linter that ensures that jobs that can be triggered by push,
 pull_request, or schedule will check if the repository owner is 'pytorch'.  This
@@ -45,6 +51,8 @@ except ImportError:
 
 
 class LintSeverity(str, Enum):
+    # [CLASS DOC] HELPER: String-valued enum of the severities lintrunner understands: error,
+    # warning, advice and disabled.
     ERROR = "error"
     WARNING = "warning"
     ADVICE = "advice"
@@ -52,6 +60,9 @@ class LintSeverity(str, Enum):
 
 
 class LintMessage(NamedTuple):
+    # [CLASS DOC] HELPER: Record for one lint finding in lintrunner's JSON schema (path, line,
+    # char, code, severity, name, original, replacement, description; None means unset). Instances
+    # are converted to a mapping and printed as one JSON object per line.
     path: str | None
     line: int | None
     char: int | None
@@ -64,6 +75,7 @@ class LintMessage(NamedTuple):
 
 
 def load_yaml(path: Path) -> Any:
+    # [FUNCTION DOC] HELPER: Load a YAML file with the chosen safe loader; returns parsed data.
     with open(path) as f:
         return load(f, Loader)
 
@@ -74,6 +86,8 @@ def gen_lint_message(
     replacement: str | None = None,
     description: str | None = None,
 ) -> LintMessage:
+    # [FUNCTION DOC] HELPER: Build an error LintMessage with the fixed code NO_WORKFLOWS_ON_FORK
+    # and rule name format, with optional path, original text, replacement text and description.
     return LintMessage(
         path=filename,
         line=None,
@@ -88,6 +102,15 @@ def gen_lint_message(
 
 
 def check_file(filename: str) -> list[LintMessage]:
+    # [FUNCTION DOC] Check one workflow file and return lint messages. Only mappings whose
+    # triggers (stored under the boolean key that YAML uses for the word on) include push,
+    # schedule, pull_request or pull_request_target are considered. Jobs that have a needs entry
+    # or an if condition of false are exempt; other jobs must have a condition that mentions the
+    # pytorch repository or owner, otherwise they are marked bad. Then rewrites the file text line
+    # by line, inserting or extending the condition for each bad job, and returns a message with
+    # original and replacement. Gives only a description-only message when an existing condition
+    # spans multiple lines, and an error message when a condition cannot be parsed. Returns an
+    # empty list if nothing changes.
     logging.debug("Checking file %s", filename)
 
     workflow = load_yaml(Path(filename))

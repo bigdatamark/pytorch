@@ -4,6 +4,12 @@
 #   "ruff==0.14.4",
 # ]
 # ///
+# [MODULE DOC] Lint adapter for the ruff linter. Runs ruff check with JSON output over the
+# given files, maps each finding to a lint message with a severity derived from the rule code
+# (or an explicit code-to-severity option), optionally appends rule explanations and disable
+# hints, and then, in parallel threads and unless disabled, runs ruff in fix-only mode on
+# each file with findings to offer a whole-file replacement. Messages are printed as JSON
+# lines. Includes helpers for running commands with a timeout and retry.
 """Adapter for https://github.com/charliermarsh/ruff."""
 
 from __future__ import annotations
@@ -27,6 +33,8 @@ IS_WINDOWS: bool = os.name == "nt"
 
 
 class LintSeverity(str, enum.Enum):
+    # [CLASS DOC] HELPER: String-valued enum of severities (error, warning, advice, disabled) in
+    # the form lintrunner expects.
     """Severity of a lint message."""
 
     ERROR = "error"
@@ -37,6 +45,9 @@ class LintSeverity(str, enum.Enum):
 
 @dataclasses.dataclass(frozen=True)
 class LintMessage:
+    # [CLASS DOC] HELPER: Immutable record for one lint finding following the lintrunner schema
+    # (path, line, char, code, severity, name, original, replacement, description). Can be
+    # converted to a mapping and printed as a JSON line.
     """A lint message defined by https://docs.rs/lintrunner/latest/lintrunner/lint_message/struct.LintMessage.html."""
 
     path: str | None
@@ -50,14 +61,17 @@ class LintMessage:
     description: str | None
 
     def asdict(self) -> dict[str, Any]:
+        # [FUNCTION DOC] HELPER: Return the message fields as a mapping.
         return dataclasses.asdict(self)
 
     def display(self) -> None:
+        # [FUNCTION DOC] HELPER: Print the message as a JSON line on stdout for lintrunner.
         """Print to stdout for lintrunner to consume."""
         print(json.dumps(self.asdict()), flush=True)
 
 
 def as_posix(name: str) -> str:
+    # [FUNCTION DOC] HELPER: Convert a path to forward-slash form on Windows; unchanged elsewhere.
     return name.replace("\\", "/") if IS_WINDOWS else name
 
 
@@ -70,6 +84,10 @@ def _run_command(
     check: bool,
     cwd: os.PathLike[Any] | None,
 ) -> subprocess.CompletedProcess[bytes]:
+    # [FUNCTION DOC] HELPER: Run a command once with captured output, never through a shell,
+    # logging the command and elapsed time at debug level. Passes either the given input bytes or
+    # stdin, a timeout, a check flag and a working directory. Returns the finished process; may
+    # raise TimeoutExpired or CalledProcessError (when check is set).
     logging.debug("$ %s", " ".join(args))
     start_time = time.monotonic()
     try:
@@ -108,6 +126,9 @@ def run_command(
     check: bool = False,
     cwd: os.PathLike[Any] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
+    # [FUNCTION DOC] HELPER: Run a command, retrying up to the given number of times only when it
+    # times out, sleeping one second between attempts and logging a warning. Returns the finished
+    # process; re-raises the timeout error once retries run out.
     remaining_retries = retries
     while True:
         try:
@@ -128,6 +149,7 @@ def run_command(
 
 
 def add_default_options(parser: argparse.ArgumentParser) -> None:
+    # [FUNCTION DOC] HELPER: Add the shared options (retries, verbose, file names) to the parser.
     """Add default options to a parser.
 
     This should be called the last in the chain of add_argument calls.
@@ -151,6 +173,9 @@ def add_default_options(parser: argparse.ArgumentParser) -> None:
 
 
 def explain_rule(code: str) -> str:
+    # [FUNCTION DOC] HELPER: Ask ruff to explain a rule by its code (JSON output) and return a
+    # newline-prefixed text containing the rule's linter and summary. Raises CalledProcessError if
+    # ruff fails.
     proc = run_command(
         ["ruff", "rule", "--output-format=json", code],
         check=True,
@@ -160,6 +185,9 @@ def explain_rule(code: str) -> str:
 
 
 def get_issue_severity(code: str) -> LintSeverity:
+    # [FUNCTION DOC] HELPER: Map a ruff rule code to a default severity: advice for style,
+    # complexity and type-note prefixes, error for undefined names, syntax errors and pylint error
+    # rules, and warning for everything else.
     # "B901": `return x` inside a generator
     # "B902": Invalid first argument to a method
     # "B903": __slots__ efficiency
@@ -204,6 +232,11 @@ def get_issue_severity(code: str) -> LintSeverity:
 def format_lint_message(
     message: str, code: str, rules: dict[str, str], show_disable: bool
 ) -> str:
+    # [FUNCTION DOC] HELPER: Build the message text: optionally append the explanation for the
+    # code, always append a pointer to the ruff rules documentation, and optionally append a hint
+    # on disabling with a noqa comment.
+    # KNOWN ISSUE: the documentation link does not include the rule code, and the explanation and
+    # pointer are appended after a period, so messages ending in punctuation get doubled periods.
     if rules:
         message += f".\n{rules.get(code) or ''}"
     message += ".\nSee https://beta.ruff.rs/docs/rules/"
@@ -222,6 +255,13 @@ def check_files(
     explain: bool,
     show_disable: bool,
 ) -> list[LintMessage]:
+    # [FUNCTION DOC] Run ruff check as a subprocess with JSON output over all the given files
+    # (using the config if given, with retries and a timeout) and return one LintMessage per
+    # finding. Optionally gathers explanations for each distinct rule code. Severity comes from
+    # the explicit mapping, falling back to the default mapping. Returns a single command-failed
+    # message if ruff cannot be run or exits with failure.
+    # KNOWN ISSUE: a timeout that persists after all retries raises TimeoutExpired, which is not
+    # caught here and propagates.
     try:
         proc = run_command(
             [
@@ -273,6 +313,9 @@ def check_files(
         rules = {}
 
     def lint_message(vuln: dict[str, Any]) -> LintMessage:
+        # [FUNCTION DOC] HELPER: Convert one ruff finding into a LintMessage, treating an empty
+        # code as the syntax error code and showing the disable hint only when the finding has a
+        # real code.
         code = vuln["code"] or SYNTAX_ERROR
         return LintMessage(
             path=vuln["filename"],
@@ -303,6 +346,10 @@ def check_file_for_fixes(
     retries: int,
     timeout: int,
 ) -> list[LintMessage]:
+    # [FUNCTION DOC] Run ruff in fix-only mode on one file, feeding its content on standard input,
+    # and return an empty list if the output is identical to the original, else a warning
+    # LintMessage named format with the original and fixed text. Returns a command-failed error
+    # message if ruff cannot be run. Reads the file; does not write it.
     try:
         with open(filename, "rb") as f:
             original = f.read()
@@ -369,6 +416,8 @@ def check_file_for_fixes(
 
 
 def _default_num_workers() -> int | None:
+    # [FUNCTION DOC] HELPER: Return the worker count: the positive integer value of MAX_JOBS when
+    # set, otherwise the CPU count.
     # Forks one process per file batch, so respect MAX_JOBS to cap parallelism.
     max_jobs = os.environ.get("MAX_JOBS")
     if max_jobs and max_jobs.isdigit() and int(max_jobs) > 0:
@@ -377,6 +426,12 @@ def _default_num_workers() -> int | None:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point. Parses options (workers, config, explain, show-disable, timeout,
+    # severity overrides, no-fix and the shared options), configures logging to stderr and builds
+    # the severity override mapping, raising an AssertionError for a malformed override. Runs the
+    # check over all files and prints the messages, then unless disabled or there were no
+    # findings, runs the fix check for each file with findings in a thread pool and prints its
+    # messages. Logs and re-raises any failure.
     parser = argparse.ArgumentParser(
         description=f"Ruff linter. Linter code: {LINTER_CODE}. Use with RUFF-FIX to auto-fix issues.",
         fromfile_prefix_chars="@",

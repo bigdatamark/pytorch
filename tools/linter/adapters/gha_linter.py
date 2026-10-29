@@ -4,6 +4,13 @@
 #   "ruamel.yaml==0.18.10",
 # ]
 # ///
+# [MODULE DOC] Command-line lint adapter for GitHub Actions workflow YAML files. For each file
+# it parses the YAML and, for every job whose reusable workflow name contains build or test
+# (but not binary), requires the job to declare secrets as inherit. Emits one JSON lint
+# message per problem (or per YAML parse failure) on stdout. Runs only as a script; importing
+# it has no side effects beyond importing ruamel.yaml.
+# KNOWN ISSUE: the module docstring is only a TODO placeholder, and the reported line is the
+# zero-based position from ruamel, so it may be off by one.
 """
 TODO
 """
@@ -20,6 +27,8 @@ import ruamel.yaml  # type: ignore[import]
 
 
 class LintSeverity(str, Enum):
+    # [CLASS DOC] HELPER: String-valued enum of the severities lintrunner understands: error,
+    # warning, advice and disabled.
     ERROR = "error"
     WARNING = "warning"
     ADVICE = "advice"
@@ -27,6 +36,9 @@ class LintSeverity(str, Enum):
 
 
 class LintMessage(NamedTuple):
+    # [CLASS DOC] HELPER: Record for one lint finding in lintrunner's JSON schema (path, line,
+    # char, code, severity, name, original, replacement, description; None means unset). Instances
+    # are converted to a mapping and printed as one JSON object per line.
     path: str | None
     line: int | None
     char: int | None

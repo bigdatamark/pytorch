@@ -1,3 +1,12 @@
+# [MODULE DOC] Script that downloads a platform-specific linter binary from a URL listed in a
+# JSON config, verifies it against an expected SHA256 hash and makes it executable.
+# Import-time side effects: computes the host platform strings and determines the repository
+# root by running git (falling back to three directories above this file). Holds a
+# module-level dry run flag set by the main guard.
+# KNOWN ISSUE: the dry-run option defaults to a boolean false that never equals the text 0, so
+# dry run is on unless the option is explicitly given as 0.
+# KNOWN ISSUE: the repository-root lookup catches only a failing git exit status, so a missing
+# git executable raises an uncaught OS error despite the comment saying otherwise.
 import argparse
 import hashlib
 import json
@@ -32,6 +41,8 @@ DRY_RUN = False
 
 
 def compute_file_sha256(path: str) -> str:
+    # [FUNCTION DOC] HELPER: Return the SHA256 hex digest of the file, or an empty string if the
+    # file does not exist. Reads the file line by line in binary mode.
     """Compute the SHA256 hash of a file and return it as a hex string."""
     # If the file doesn't exist, return an empty string.
     if not os.path.exists(path):
@@ -51,6 +62,11 @@ def compute_file_sha256(path: str) -> str:
 def report_download_progress(
     chunk_number: int, chunk_size: int, file_size: int
 ) -> None:
+    # [FUNCTION DOC] HELPER: Download progress callback that writes a text progress bar to
+    # standard output from the chunk number, chunk size and total size; does nothing when the
+    # total size is unknown.
+    # KNOWN ISSUE: output has no trailing newline or flush and always starts with a fixed 0
+    # percent text.
     """
     Pretty printer for file download progress.
     """
@@ -61,6 +77,10 @@ def report_download_progress(
 
 
 def check(binary_path: Path, reference_hash: str) -> bool:
+    # [FUNCTION DOC] Check that a binary exists and matches the reference hash. Returns true if it
+    # matches. Returns false if it is missing, or if the hash differs, in which case the file is
+    # deleted for safety (unless dry run, where only a critical log is written); a failed deletion
+    # is logged critically. Side effects: logging, possible file deletion.
     """Check whether the binary exists and is the right one.
 
     If there is hash difference, delete the actual binary.
@@ -109,6 +129,12 @@ def download(
     url: str,
     reference_bin_hash: str,
 ) -> bool:
+    # [FUNCTION DOC] Ensure the named binary exists in the output directory with the expected
+    # hash. If it already matches, returns true. Otherwise creates the directory, downloads the
+    # URL (with a progress bar only on a terminal), re-checks the hash, sets the owner execute bit
+    # and returns true; returns false if the downloaded file fails the hash check. In dry run mode
+    # it stops before downloading and returns true. Network and file errors from the download are
+    # not caught.
     """
     Download a platform-appropriate binary if one doesn't already exist at the expected location and verifies
     that it is the right binary by checking its SHA256 hash against the expected hash.
