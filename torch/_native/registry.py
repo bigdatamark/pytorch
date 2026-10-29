@@ -1,3 +1,9 @@
+# [MODULE DOC] Registry of native DSL (Triton, CuteDSL, etc.) operator overrides for aten ops.
+# Register calls only build an in-memory graph (ordered list of override nodes per op symbol and dispatch key);
+# _register_overrides_from_graph installs an eager router through a torch.library IMPL library and records a
+# compile/export router in a private decomposition table (see native_decomp_table). Supports filtering by DSL name,
+# op symbol or dispatch key (deregister/reenable) and user reordering. Import-time side effects: only module-level
+# state (dicts, sets, filter state); no libraries are created until registration happens.
 import logging
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -27,6 +33,9 @@ _OpImplFn = Callable[P, R]
 
 @dataclass
 class _OverrideNode:
+    # [CLASS DOC] HELPER: Dataclass describing one registered override: DSL name, aten op symbol, dispatch key,
+    # condition predicate, implementation, stable node_id naming the opaque _native op, and the unconditional and active flags.
+    # node_id is minted once and never changes; active is toggled by the filter logic during registration.
     """Track function override data."""
 
     dsl_name: str
@@ -48,6 +57,8 @@ UserOrderingFn = Callable[[str, str, list[_OverrideNode]], list[_OverrideNode]]
 
 @dataclass
 class _FilterState:
+    # [CLASS DOC] HELPER: Holds three sets (DSL names, op symbols, dispatch keys) whose members are disabled.
+    # A node is enabled only if none of its three attributes is in the corresponding set. A single global instance is used.
     """Manages filtering state for override nodes."""
 
     _dsl_names: set[str] = field(default_factory=set)
@@ -55,6 +66,7 @@ class _FilterState:
     _dispatch_keys: set[str] = field(default_factory=set)
 
     def check_enabled(self, node: _OverrideNode) -> bool:
+        # [FUNCTION DOC] Return False if the node's DSL name, op symbol or dispatch key is filtered out, otherwise True.
         """
         Check if a node is enabled based on current filter state.
 
@@ -82,6 +94,8 @@ class _FilterState:
         dispatch_keys: str | Iterable[str] | None,
         remove_keys: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Add (or, when remove_keys is true, remove) the given names/symbols/keys to the filter sets.
+        # Each argument may be None, a single string or an iterable of strings. Mutates the filter state.
         """
         Update filter sets as (current | new) or (current ~ new).
 
@@ -105,6 +119,7 @@ class _FilterState:
             self._dispatch_keys |= set(_resolve_iterable(dispatch_keys))
 
     def build_disable_key_set(self) -> set[tuple[str, str]]:
+        # [FUNCTION DOC] Return the set of (op_symbol, dispatch_key) graph keys touched by anything currently in the filter.
         """
         Build a set of dictionary keys based on the current filter state.
 
@@ -118,6 +133,7 @@ class _FilterState:
         )
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Return a multi-line, human readable listing of the three filter sets.
         """Return string representation of filter state."""
         s = ""
         s += "Filter State:\n"
@@ -165,7 +181,10 @@ _native_decomp_overrides: dict[object, Callable] = {}
 
 
 def _has_cow_tensor(*args, **kwargs) -> bool:
+    # [FUNCTION DOC] HELPER: Return True if any tensor found in args or kwargs (searching nested lists, tuples and
+    # dict values) is a copy-on-write tensor.
     def is_cow_tensor(arg) -> bool:
+        # [FUNCTION DOC] HELPER: Recursively test one argument for being or containing a copy-on-write tensor.
         if isinstance(arg, torch.Tensor):
             return torch._C._is_cow_tensor(arg)  # pyrefly: ignore[missing-attribute]
         if isinstance(arg, (list, tuple)):
@@ -211,6 +230,8 @@ def _build_key_set(
     op_symbols: str | Iterable[str] | None,
     dispatch_keys: str | Iterable[str] | None,
 ) -> set[tuple[str, str]]:
+    # [FUNCTION DOC] HELPER: Collect graph keys (op_symbol, dispatch_key) from the reverse lookup maps for every
+    # given DSL name, op symbol and dispatch key; unknown entries are ignored.
     """
     Build a set of dictionary keys based on filter criteria.
 
@@ -227,6 +248,7 @@ def _build_key_set(
     def _append_to_set(
         entries: str | Iterable[str] | None, graph_lib_dict: _MappingType
     ) -> None:
+        # [FUNCTION DOC] HELPER: Add all keys mapped from each entry in the given mapping to the enclosing key set.
         """Helper to add matching keys from graph_lib_dict to key_set."""
         resolved_entries = _resolve_iterable(entries)
 
@@ -243,6 +265,7 @@ def _build_key_set(
 
 
 def _print_override_graphs(*, print_inactive: bool = False) -> None:
+    # [FUNCTION DOC] HELPER: Debug aid that prints each graph's key and its nodes; inactive nodes only if print_inactive is set.
     """
     Print all override graphs for debugging purposes.
 
@@ -274,12 +297,14 @@ _aten_override_libs: dict[tuple[str, str], torch.library.Library] = {}
 
 
 def _get_def_library(namespace: str) -> torch.library.Library:
+    # [FUNCTION DOC] HELPER: Return the cached FRAGMENT library for a namespace, creating it on first use (one per process).
     if namespace not in _def_libs:
         _def_libs[namespace] = torch.library.Library(namespace, "FRAGMENT")
     return _def_libs[namespace]
 
 
 def _get_or_create_library(dispatch_key: str) -> torch.library.Library:
+    # [FUNCTION DOC] HELPER: Return the shared _native IMPL library for a dispatch key, creating and caching it if needed.
     """
     Get or create the _native IMPL library for a given dispatch key.
 
@@ -295,6 +320,9 @@ def _get_or_create_library(dispatch_key: str) -> torch.library.Library:
 
 
 def _install_aten_override(op_symbol: str, dispatch_key: str, kernel: Callable) -> None:
+    # [FUNCTION DOC] HELPER: Install an aten kernel at (op_symbol, dispatch_key), destroying any previous override library
+    # for that pair first. Uses a fresh library per pair so teardown is independent; the kernel receives the dispatch keyset.
+    # Side effect: mutates the dispatcher and the aten override library table.
     """
     Install (or replace) an aten kernel at (op_symbol, dispatch_key).
 
@@ -316,6 +344,7 @@ def _install_aten_override(op_symbol: str, dispatch_key: str, kernel: Callable) 
 
 
 def _destroy_aten_override(op_symbol: str, dispatch_key: str) -> None:
+    # [FUNCTION DOC] HELPER: Destroy and forget the aten override library for the pair, if any.
     """Tear down the aten override at (op_symbol, dispatch_key), if any."""
     lib = _aten_override_libs.pop((op_symbol, dispatch_key), None)
     if lib is not None:
@@ -323,6 +352,8 @@ def _destroy_aten_override(op_symbol: str, dispatch_key: str) -> None:
 
 
 def _resolve_aten_overload(op_symbol: str) -> "torch._ops.OpOverload | None":
+    # [FUNCTION DOC] HELPER: Resolve an op symbol (bare name or name.overload) to an aten OpOverload; the overload
+    # defaults to 'default'. Returns None when no such aten op exists.
     """
     Resolve `op_symbol` to a concrete OpOverload on `torch.ops.aten`.
 
@@ -340,6 +371,8 @@ def _resolve_aten_overload(op_symbol: str) -> "torch._ops.OpOverload | None":
 
 
 def _aten_schema_tail(op_symbol: str) -> str:
+    # [FUNCTION DOC] HELPER: Return the aten schema string for the op symbol without its namespace and name prefix.
+    # Raises AttributeError if the aten op cannot be found.
     """Return the schema of at::<op_symbol> with the `aten::<name>` prefix stripped.
 
     Accepts bare names ("bmm" → aten.bmm.default) and overload-qualified
@@ -356,6 +389,9 @@ def _aten_schema_tail(op_symbol: str) -> str:
 
 
 def _define_native_op_once(name: str, op_symbol: str) -> None:
+    # [FUNCTION DOC] HELPER: Define (once per name) an opaque _native op whose schema is cloned from the aten op, and
+    # register a fake kernel that redispatches to the aten op so tracing can infer shapes. No autograd or autocast kernels
+    # are registered. Records the name in the set of defined ops. Callers must not use Meta or Composite dispatch keys.
     # Invariant: callers must only install the eager router at a real backend
     # dispatch key (CPU, CUDA, XPU, ...). The fake kernel below redispatches
     # to the aten op, and if the router were installed at Meta /
@@ -386,6 +422,8 @@ def _define_native_op_once(name: str, op_symbol: str) -> None:
 def _register_node_impl(
     lib: torch.library.Library, node: _OverrideNode, dispatch_key: str
 ) -> None:
+    # [FUNCTION DOC] HELPER: Define the node's opaque _native op if needed and register the node's implementation on the
+    # given library at the dispatch key (overriding allowed, no keyset). Raises ValueError if node_id is empty.
     """
     Register a single node implementation with the library.
 
@@ -410,6 +448,8 @@ def _register_node_impl(
 
 
 def _resolve_iterable(iterable: str | Iterable[str] | None) -> Iterable[str]:
+    # [FUNCTION DOC] HELPER: Normalize None to an empty list, a single string to a one-element tuple, and any other
+    # iterable to itself.
     """
     Resolve various input types to a consistent iterable of strings.
 
@@ -434,6 +474,8 @@ def reenable_op_overrides(
     enable_op_symbols: str | list[str] | None = None,
     enable_dispatch_keys: str | list[str] | None = None,
 ) -> None:
+    # [FUNCTION DOC] Re-enable overrides: remove the given DSL names, op symbols and dispatch keys from the filter state,
+    # then re-register every affected graph with the updated filter. Logs at info level; mutates global registry state.
     """
     Re-enable overrides by removing them from filter state and reregistering.
 
@@ -487,6 +529,9 @@ def deregister_op_overrides(
     disable_op_symbols: str | list[str] | None = None,
     disable_dispatch_keys: str | list[str] | None = None,
 ) -> None:
+    # [FUNCTION DOC] Disable overrides: add the given DSL names, op symbols and dispatch keys to the filter state, then
+    # re-register the affected graphs so disabled nodes are dropped from routing (original behavior is restored when no
+    # node remains active). Logs at info level; mutates global registry state.
     """
     De-register overrides by updating filter state and reregistering graphs.
 
@@ -526,6 +571,7 @@ def deregister_op_overrides(
 
 
 def get_dsl_operations(dsl_name: str) -> list[str]:
+    # [FUNCTION DOC] Return a sorted list of the op symbols for which the named DSL has at least one registered node.
     """Get list of operations registered by a specific DSL.
 
     Args:
@@ -549,6 +595,7 @@ def _update_registration_maps(
     dispatch_key: str,
     key: tuple[str, str],
 ) -> None:
+    # [FUNCTION DOC] HELPER: Record the graph key under the DSL name, op symbol and dispatch key in the reverse lookup maps.
     """
     Update the registration mapping dictionaries.
 
@@ -567,6 +614,7 @@ def _update_registration_maps(
         symbol: str,
         key: tuple[str, str],
     ) -> None:
+        # [FUNCTION DOC] HELPER: Append the key to the list for a symbol, creating the list when missing.
         """Helper to add key to registration list or create new entry."""
         entry_list = registration.get(symbol)
 
@@ -582,6 +630,7 @@ def _update_registration_maps(
 
 
 def _always_true(*args: object, **kwargs: object) -> bool:
+    # [FUNCTION DOC] HELPER: Trivial predicate that accepts any arguments and always returns True.
     return True
 
 
@@ -596,6 +645,11 @@ def register_op_override(
     allow_multiple_override: bool = False,
     unconditional_override: bool = False,
 ) -> None:
+    # [FUNCTION DOC] Add an override node to the graph for (op_symbol, dispatch_key); does not touch the dispatcher.
+    # backend is the DSL name; lib_symbol must be aten; cond decides per call whether impl applies and may be None only
+    # when unconditional_override is true (then it always matches). A unique node_id is minted from a global counter.
+    # Updates the reverse lookup maps. Raises ValueError for non-aten lib_symbol, a disallowed dispatch key, or missing cond.
+    # KNOWN ISSUE: allow_multiple_override is accepted but never used.
     """
     Register a passed override function to the dispatcher.
 
@@ -671,6 +725,7 @@ def _should_reregister_graph(
     *,
     force_reregister: bool = False,
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Return True when reregistration is needed, i.e. forced or the two graphs differ.
     """
     Determine if a graph needs reregistration based on changes.
 
@@ -696,6 +751,8 @@ def _cleanup_and_reregister_graph(
     *,
     filter_state: _FilterState | None = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Rebuild the routers for one graph from scratch by delegating to the registration routine,
+    # honoring the optional filter state.
     """
     Reregister a graph's routes from scratch.
 
@@ -723,6 +780,9 @@ def _apply_graph_transformation(
     reregister_overrides: bool = False,
     filter_state: _FilterState | None = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Apply a transformation function to each selected graph (default all) and store the result.
+    # A transformation that raises, or returns a non-list, leaves that graph unchanged (logged). Graphs that changed are
+    # re-registered when requested. Mutates the global graph table and possibly the dispatcher.
     """
     Apply a transformation function to graphs and optionally reregister.
 
@@ -800,6 +860,9 @@ def _apply_graph_transformation(
 def native_decomp_table(
     overrides_only: bool = False,
 ) -> dict[object, Callable]:
+    # [FUNCTION DOC] Return a decomposition table mapping aten OpOverloads to the native compile routers, for use with
+    # run_decompositions or compile. Unless overrides_only is set, starts from the default export decompositions (imported
+    # lazily) and layers the native overrides on top so they win on conflicts. Returns a new dict; no global table is changed.
     """
     Return a decomposition table suitable for passing to
     ``ExportedProgram.run_decompositions`` or to Inductor / Dynamo as a
@@ -858,6 +921,11 @@ def _register_overrides_from_graph(
     *,
     filter_state: _FilterState | None = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Register all nodes of one graph. Registers each enabled node's opaque op (marking nodes
+    # active or inactive from the filter), tears down any existing aten override, and if conditions remain captures the prior
+    # kernel and installs a first-match-wins eager router (falls back to the captured kernel; under dynamo tracing without
+    # copy-on-write inputs it calls the aten op directly). Also records a compile router in the private decomposition table
+    # that swallows condition errors and returns NotImplemented on no match. With no active node the table entry is removed.
     """
     Register all overrides in a single graph.
 
@@ -924,6 +992,8 @@ def _register_overrides_from_graph(
     _NO_MATCH = object()  # sentinel; impl return values of None would be valid outputs
 
     def _dispatch(args, kwargs, swallow_cond_exceptions: bool):
+        # [FUNCTION DOC] HELPER: Try each (condition, op name) in order; call the first matching _native op and return its result,
+        # else return the no-match sentinel. Condition exceptions propagate unless swallow_cond_exceptions is true (then skipped).
         for cond, impl_name in cond_impl:
             try:
                 matched = cond(*args, **kwargs)
@@ -938,6 +1008,9 @@ def _register_overrides_from_graph(
     def eager_router(
         keyset, *args, _fallback=fallback_kernel, _aten_overload=overload, **kwargs
     ):
+        # [FUNCTION DOC] HELPER: Eager router given the dispatch keyset and call arguments: under dynamo tracing with no
+        # copy-on-write tensor it calls the aten overload; otherwise dispatches to the first matching override or falls back to
+        # the captured native kernel.
         # This branch is only safe while Dynamo is actively tracing this Python
         # router. The broader compile-session flag can be true when this router
         # executes eagerly; redispatching to aten there would re-enter us.
@@ -959,6 +1032,7 @@ def _register_overrides_from_graph(
         return result
 
     def compile_router(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Decomposition-style router: returns the first matching override result or NotImplemented.
         result = _dispatch(args, kwargs, swallow_cond_exceptions=True)
         if result is _NO_MATCH:
             return NotImplemented
@@ -976,6 +1050,7 @@ def _register_overrides_from_graph(
 
 
 def _register_all_overrides() -> None:
+    # [FUNCTION DOC] HELPER: Register every graph currently in the registry, with no filter state.
     """
     Perform all registration calls from previously-built override graphs.
     """
@@ -994,6 +1069,8 @@ def reorder_graphs_from_user_function(
     *,
     reregister_overrides: bool = False,
 ) -> None:
+    # [FUNCTION DOC] Reorder every override graph using a user function taking (op_symbol, dispatch_key, node list) and
+    # returning a node list; optionally re-register graphs that changed. Failing graphs are left unchanged.
     """
     Reorder override graphs using a user-provided ordering function.
 
@@ -1017,6 +1094,8 @@ def _apply_graph_filter(
     *,
     reregister_overrides: bool = False,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Remove nodes from all graphs for which filter_fn(op_symbol, dispatch_key, node) is false,
+    # optionally re-registering. Errors in filter_fn keep the original graph.
     """
     Apply a filter function to remove nodes from graphs.
 
@@ -1043,6 +1122,7 @@ def _apply_graph_filter(
     def filtering_transformation(
         op_symbol: str, dispatch_key: str, graph: list[_OverrideNode]
     ) -> list[_OverrideNode]:
+        # [FUNCTION DOC] HELPER: Return the graph's nodes accepted by filter_fn; on error log and return the graph unchanged.
         """Apply filter_fn to graph with error handling."""
         try:
             return [node for node in graph if filter_fn(op_symbol, dispatch_key, node)]
@@ -1074,6 +1154,8 @@ def _apply_selective_reordering(
     *,
     reregister_overrides: bool = False,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Apply ordering_fn only to graphs for which condition_fn(op_symbol, dispatch_key) is true,
+    # optionally re-registering. Errors in either function keep the original graph.
     """
     Apply reordering only to graphs that match a condition.
 
@@ -1101,6 +1183,8 @@ def _apply_selective_reordering(
     def conditional_transformation(
         op_symbol: str, dispatch_key: str, graph: list[_OverrideNode]
     ) -> list[_OverrideNode]:
+        # [FUNCTION DOC] HELPER: Return ordering_fn's result if condition_fn accepts the graph, else the graph; errors are logged
+        # and the graph is returned unchanged.
         """Apply ordering_fn conditionally based on condition_fn result."""
         try:
             should_reorder = condition_fn(op_symbol, dispatch_key)

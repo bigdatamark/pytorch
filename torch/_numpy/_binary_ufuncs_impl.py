@@ -1,4 +1,6 @@
 # mypy: ignore-errors
+# [MODULE DOC] Torch implementations of NumPy binary ufuncs: re-exports torch functions under NumPy names (for
+# example power, mod, equal, left_shift) and defines matmul and divmod workarounds. Wrapped into public ufuncs in _ufuncs.
 
 """Export torch work functions for binary ufuncs, rename/tweak to match numpy.
 This listing is further exported to public symbols in the `torch._numpy/_ufuncs.py` module.
@@ -52,6 +54,8 @@ from . import _dtypes_impl, _util
 
 # work around torch limitations w.r.t. numpy
 def matmul(x, y):
+    # [FUNCTION DOC] Matrix product with NumPy dtype promotion. Computes the result dtype, runs in uint8 for bool and in
+    # float32 for CPU half inputs (to avoid unsupported kernels), then casts back to the result dtype. Returns a tensor.
     # work around:
     #  - RuntimeError: expected scalar type Int but found Double
     #  - RuntimeError: "addmm_impl_cpu_" not implemented for 'Bool'
@@ -82,4 +86,5 @@ def matmul(x, y):
 # a stub implementation of divmod, should be improved after
 # https://github.com/pytorch/pytorch/issues/90820 is fixed in pytorch
 def divmod(x, y):
+    # [FUNCTION DOC] Stub divmod returning the tuple of floor division and remainder; not a fused implementation.
     return x // y, x % y

@@ -1,3 +1,6 @@
+# [MODULE DOC] Triton DSL adapter for the native override registry: detects whether triton is installed and a
+# sufficient version (3.x with minor >= 6, unless skip-version env is set), and provides DSL-checked register and
+# deregister wrappers. Import-time side effect: registers this module with the global DSL registry under the name triton.
 import functools
 import logging
 import sys
@@ -31,6 +34,8 @@ _TRITON_MINIMUM_VERSION_MINOR = 6
 
 @functools.cache
 def _check_runtime_available() -> tuple[bool, Version | None]:
+    # [FUNCTION DOC] HELPER: Cached check returning (available, version). False/None on CPU-only builds or when triton is
+    # missing (logged at info level); otherwise True and the installed version.
     """
     Check if triton is available
 
@@ -58,17 +63,21 @@ def _check_runtime_available() -> tuple[bool, Version | None]:
 
 
 def runtime_available() -> bool:
+    # [FUNCTION DOC] Return True if triton is available at runtime.
     available, _ = _check_runtime_available()
     return available
 
 
 def runtime_version() -> None | Version:
+    # [FUNCTION DOC] Return the installed triton version, or None if unavailable.
     _, version = _check_runtime_available()
     return version
 
 
 @functools.cache
 def _version_is_sufficient() -> bool:
+    # [FUNCTION DOC] HELPER: Cached check that the triton version is major 3 and minor at least 6, or that the version check
+    # is skipped by environment setting; logs at info level and returns False otherwise.
     _, version = _check_runtime_available()
 
     if version is None:
@@ -92,6 +101,7 @@ def _version_is_sufficient() -> bool:
 
 
 def deregister_op_overrides() -> None:
+    # [FUNCTION DOC] Disable all overrides registered by the triton DSL via the registry filter.
     """
     Deregister all ops through triton
     """
@@ -108,6 +118,9 @@ def register_op_override(
     allow_multiple_override: bool = False,
     unconditional_override: bool = False,
 ) -> None:
+    # [FUNCTION DOC] Register an override under the triton DSL name by forwarding to the registry. Silently does nothing if
+    # triton is unavailable, native JIT is disabled, or the version is insufficient.
+    # KNOWN ISSUE: allow_multiple_override is forwarded but ignored by the registry.
     """
     See torch/_native/registry.py for the underlying implementation
     and arguments. This is a thin, DSL-checking wrapper over

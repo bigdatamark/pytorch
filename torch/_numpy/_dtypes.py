@@ -1,3 +1,6 @@
+# [MODULE DOC] NumPy-like scalar types and dtype objects backed by torch dtypes: abstract and concrete scalar type
+# classes, name/typecode/alias lookup tables, the DType wrapper, and functions to build dtypes, set default dtypes and
+# test dtype subclassing. Import-time side effect: installs the NumPy alias names as module attributes.
 """Define analogs of numpy dtypes supported by pytorch.
 Define the scalar types and supported dtypes and numpy <--> torch dtype mappings.
 """
@@ -25,6 +28,7 @@ _T = TypeVar("_T")
 
 
 class generic:
+    # [CLASS DOC] Base scalar type. Concrete subclasses define name, typecode and torch_dtype. Calling a type builds a 0-D array.
     name = "generic"
     # Concrete scalar types below set these; declared here so the dtype machinery
     # can read them off any scalar type.
@@ -32,6 +36,10 @@ class generic:
     torch_dtype: torch.dtype
 
     def __new__(cls, value: object) -> ndarray:
+# [FUNCTION DOC] Create a 0-D ndarray of this scalar type from value; strings inf and nan are accepted, and an existing
+# ndarray is cast to the type.
+# NumPy scalars are modelled as 0-D arrays
+# so a call to np.float32(4) produces a 0-D array.
         # NumPy scalars are modelled as 0-D arrays
         # so a call to np.float32(4) produces a 0-D array.
 
@@ -52,30 +60,37 @@ class generic:
 
 
 class number(generic):
+    # [CLASS DOC] Abstract scalar type number.
     name = "number"
 
 
 class integer(number):
+    # [CLASS DOC] Abstract scalar type integer.
     name = "integer"
 
 
 class inexact(number):
+    # [CLASS DOC] Abstract scalar type inexact.
     name = "inexact"
 
 
 class signedinteger(integer):
+    # [CLASS DOC] Abstract scalar type signedinteger.
     name = "signedinteger"
 
 
 class unsignedinteger(integer):
+    # [CLASS DOC] Abstract scalar type unsignedinteger.
     name = "unsignedinteger"
 
 
 class floating(inexact):
+    # [CLASS DOC] Abstract scalar type floating.
     name = "floating"
 
 
 class complexfloating(inexact):
+    # [CLASS DOC] Abstract scalar type complexfloating.
     name = "complexfloating"
 
 
@@ -96,24 +111,28 @@ _abstract_dtypes = [
 
 
 class int8(signedinteger):
+    # [CLASS DOC] Concrete scalar type int8 mapped to torch int8.
     name = "int8"
     typecode = "b"
     torch_dtype = torch.int8
 
 
 class int16(signedinteger):
+    # [CLASS DOC] Concrete scalar type int16 mapped to torch int16.
     name = "int16"
     typecode = "h"
     torch_dtype = torch.int16
 
 
 class int32(signedinteger):
+    # [CLASS DOC] Concrete scalar type int32 mapped to torch int32.
     name = "int32"
     typecode = "i"
     torch_dtype = torch.int32
 
 
 class int64(signedinteger):
+    # [CLASS DOC] Concrete scalar type int64 mapped to torch int64.
     name = "int64"
     typecode = "l"
     torch_dtype = torch.int64
@@ -123,24 +142,30 @@ class int64(signedinteger):
 
 
 class uint8(unsignedinteger):
+    # [CLASS DOC] Concrete scalar type uint8 mapped to torch uint8.
     name = "uint8"
     typecode = "B"
     torch_dtype = torch.uint8
 
 
 class uint16(unsignedinteger):
+    # [CLASS DOC] Concrete scalar type uint16 mapped to torch uint16.
     name = "uint16"
     typecode = "H"
     torch_dtype = torch.uint16
 
 
 class uint32(signedinteger):
+    # [CLASS DOC] Concrete scalar type uint32 mapped to torch uint32.
+    # KNOWN ISSUE: derives from signedinteger rather than unsignedinteger.
     name = "uint32"
     typecode = "I"
     torch_dtype = torch.uint32
 
 
 class uint64(signedinteger):
+    # [CLASS DOC] Concrete scalar type uint64 mapped to torch uint64.
+    # KNOWN ISSUE: derives from signedinteger rather than unsignedinteger.
     name = "uint64"
     typecode = "L"
     torch_dtype = torch.uint64
@@ -150,36 +175,42 @@ class uint64(signedinteger):
 
 
 class float16(floating):
+    # [CLASS DOC] Concrete scalar type float16 mapped to torch float16.
     name = "float16"
     typecode = "e"
     torch_dtype = torch.float16
 
 
 class float32(floating):
+    # [CLASS DOC] Concrete scalar type float32 mapped to torch float32.
     name = "float32"
     typecode = "f"
     torch_dtype = torch.float32
 
 
 class float64(floating):
+    # [CLASS DOC] Concrete scalar type float64 mapped to torch float64.
     name = "float64"
     typecode = "d"
     torch_dtype = torch.float64
 
 
 class complex64(complexfloating):
+    # [CLASS DOC] Concrete scalar type complex64 mapped to torch complex64.
     name = "complex64"
     typecode = "F"
     torch_dtype = torch.complex64
 
 
 class complex128(complexfloating):
+    # [CLASS DOC] Concrete scalar type complex128 mapped to torch complex128.
     name = "complex128"
     typecode = "D"
     torch_dtype = torch.complex128
 
 
 class bool_(generic):
+    # [CLASS DOC] Concrete scalar type bool_ mapped to torch bool.
     name = "bool_"
     typecode = "?"
     torch_dtype = torch.bool
@@ -259,6 +290,8 @@ _python_types = {
 
 
 def sctype_from_string(s: object) -> type[generic]:
+    # [FUNCTION DOC] Resolve a string (type name, alias, typecode, width alias or python type name) to a scalar type class.
+    # Raises TypeError if the string is not recognized.
     """Normalize a string value: a type 'name' or a typecode or a width alias."""
     if s in _names:
         return _names[s]
@@ -274,6 +307,7 @@ def sctype_from_string(s: object) -> type[generic]:
 
 
 def sctype_from_torch_dtype(torch_dtype: torch.dtype) -> type[generic]:
+    # [FUNCTION DOC] Return the scalar type class for a torch dtype; raises KeyError if unsupported.
     return _torch_dtypes[torch_dtype]
 
 
@@ -281,15 +315,20 @@ def sctype_from_torch_dtype(torch_dtype: torch.dtype) -> type[generic]:
 
 
 def dtype(arg: object) -> DType:
+    # [FUNCTION DOC] Build a DType from arg; None gives the current default float dtype.
     if arg is None:
         arg = _dtypes_impl.default_dtypes().float_dtype
     return DType(arg)
 
 
 class DType:
+    # [CLASS DOC] NumPy-like dtype object holding one scalar type class. Constructed from a torch dtype, tensor, scalar type,
+    # DType, object with a dtype attribute, or string. Provides name, type, kind, typecode, itemsize and torch_dtype;
+    # equality accepts anything convertible to a DType; hashes by scalar type name; picklable via its scalar type.
     _scalar_type: type[generic]
 
     def __init__(self, arg: object) -> None:
+        # [FUNCTION DOC] Resolve arg to a scalar type by trying the supported input kinds in order; raises TypeError for unknown strings.
         # a pytorch object?
         if isinstance(arg, torch.dtype):
             sctype = _torch_dtypes[arg]
@@ -310,22 +349,27 @@ class DType:
 
     @property
     def name(self) -> str:
+        # [FUNCTION DOC] Property: name of the scalar type.
         return self._scalar_type.name
 
     @property
     def type(self) -> type[generic]:
+        # [FUNCTION DOC] Property: the scalar type class.
         return self._scalar_type
 
     @property
     def kind(self) -> str:
+        # [FUNCTION DOC] Property: single-character kind taken from the first letter of the scalar type name (b, i, u, f, c).
         # https://numpy.org/doc/stable/reference/generated/numpy.dtype.kind.html
         return _torch_dtypes[self.torch_dtype].name[0]
 
     @property
     def typecode(self) -> str:
+        # [FUNCTION DOC] Property: NumPy typecode character of the scalar type.
         return self._scalar_type.typecode
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] Compare scalar types; other values are converted to a DType, and unconvertible values compare unequal.
         if isinstance(other, DType):
             return self._scalar_type == other._scalar_type
         try:
@@ -336,25 +380,31 @@ class DType:
 
     @property
     def torch_dtype(self) -> torch.dtype:
+        # [FUNCTION DOC] Property: the corresponding torch dtype.
         return self._scalar_type.torch_dtype
 
     def __hash__(self) -> int:
+        # [FUNCTION DOC] Hash of the scalar type name.
         return hash(self._scalar_type.name)
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Return the string form dtype(name).
         return f'dtype("{self.name}")'
 
     __str__ = __repr__
 
     @property
     def itemsize(self) -> int:
+        # [FUNCTION DOC] Property: element size in bytes, computed by building a one-element value and querying its tensor.
         elem = self.type(1)
         return elem.tensor.element_size()
 
     def __getstate__(self) -> builtins.type[generic]:
+        # [FUNCTION DOC] Pickle support: return the scalar type class as state.
         return self._scalar_type
 
     def __setstate__(self, value: builtins.type[generic]) -> None:
+        # [FUNCTION DOC] Pickle support: restore the scalar type from state.
         self._scalar_type = value
 
 
@@ -375,6 +425,11 @@ typecodes = {
 def set_default_dtype(
     fp_dtype: object = "numpy", int_dtype: object = "numpy"
 ) -> Callable[[], _dtypes_impl.DefaultDTypes]:
+    # [FUNCTION DOC] Set the global default float, complex and int dtypes. Each argument is numpy (float64/int64), pytorch
+    # (float32/int64) or a dtype-like value; complex is derived from float (float64 gives complex128, float32 and float16 give
+    # complex64). Mutates global state in _dtypes_impl and returns the previous default-dtypes accessor.
+    # KNOWN ISSUE: the docstring says it returns the old state tuple but the returned value is the accessor function;
+    # the new state is stored in a private attribute that the accessor may not read.
     """Set the (global) defaults for fp, complex, and int dtypes.
 
     The complex dtype is inferred from the float (fp) dtype. It has
@@ -439,17 +494,22 @@ def set_default_dtype(
 
 
 def issubclass_(arg: object, klass: type[_T]) -> TypeGuard[type[_T]]:
+    # [FUNCTION DOC] Return True only if arg is a class and a subclass of klass; non-classes give False instead of raising.
     # issubclass() raises TypeError if arg is not a class; guard explicitly so a
     # non-class arg returns False (and narrows arg to type[_T] on success).
     return isinstance(arg, type) and issubclass(arg, klass)
 
 
 def issubdtype(arg1: object, arg2: object) -> bool:
+# [FUNCTION DOC] NumPy-style subtype test between two dtype-likes; abstract type names given as strings are accepted and
+# other values are converted to scalar types first. Returns a bool.
+# cf https://github.com/numpy/numpy/blob/v1.24.0/numpy/core/numerictypes.py#L356-L420
     # cf https://github.com/numpy/numpy/blob/v1.24.0/numpy/core/numerictypes.py#L356-L420
 
     # We also accept strings even if NumPy doesn't as dtypes are serialized as their
     # string representation in dynamo's graph
     def str_to_abstract(t: object) -> object:
+        # [FUNCTION DOC] HELPER: Map an abstract dtype name string to its class in this module; other values are returned unchanged.
         if isinstance(t, str) and t in _abstract_dtypes:
             return globals()[t]
         return t
