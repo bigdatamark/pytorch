@@ -1,4 +1,8 @@
 # Owner(s): ["module: PrivateUse1"]
+# [MODULE DOC] Storage and serialization tests for the openreg backend: rewrapping
+# pinned storage, save and load with location tags and map_location, tensor metadata
+# preservation, and legacy numpy and CPU-based rebuild paths. Needs numpy. No
+# import-time side effects.
 
 import _codecs
 import io
@@ -18,8 +22,11 @@ from torch.testing._internal.common_utils import (
 
 
 class TestStorage(TestCase):
+    # [CLASS DOC] Tests for pinned storage rewrapping.
     @skipIfTorchDynamo("unsupported aten.is_pinned.default")
     def test_rewrapped_storage(self):
+        # [FUNCTION DOC] A tensor set_ from a slice of a pinned tensor's untyped storage is
+        # pinned and has a different data pointer. Skipped under Dynamo.
         """Test rewrapping pinned storage"""
         pinned_a = torch.randn(10).pin_memory()
         rewrapped_a = torch.tensor((), dtype=torch.float32).set_(
@@ -33,7 +40,11 @@ class TestStorage(TestCase):
 
 
 class TestSerialization(TestCase):
+    # [CLASS DOC] Tests for saving and loading openreg tensors and storages.
     def test_serialization(self):
+        # [FUNCTION DOC] Checks location tags, restoring a CPU storage to openreg, tensor
+        # metadata set and get, and save then load to openreg (metadata kept) and with
+        # map_location cpu (metadata dropped).
         """Test basic serialization and deserialization"""
         storage = torch.UntypedStorage(4, device=torch.device("openreg"))
         self.assertEqual(torch.serialization.location_tag(storage), "openreg:0")
@@ -71,6 +82,11 @@ class TestSerialization(TestCase):
         "versions < 1.25 serialize dtypes differently from how it's serialized in data_legacy_numpy",
     )
     def test_open_device_numpy_serialization(self):
+        # [FUNCTION DOC] Loads an embedded legacy archive that uses the numpy rebuild path with
+        # weights_only and a safe-globals allowlist; with and without map_location cpu; checks
+        # values, and device placement. Skipped under Dynamo and for old numpy versions.
+        # KNOWN ISSUE: version gates compare version strings lexicographically (for example
+        # "1.9" versus "1.25").
         """
         This tests the legacy _rebuild_device_tensor_from_numpy serialization path
         """
@@ -140,6 +156,10 @@ class TestSerialization(TestCase):
         self.assertTrue(sd_loaded_cpu["x"].is_cpu)
 
     def test_open_device_cpu_serialization(self):
+        # [FUNCTION DOC] With the storage-presence check patched to false, an openreg tensor
+        # reduces through the CPU-tensor rebuild function; save and load round trips
+        # (also with map_location cpu); saving under skip_data raises RuntimeError.
+        # KNOWN ISSUE: uses unittest.mock without importing it explicitly.
         default_protocol = torch.serialization.DEFAULT_PROTOCOL
 
         with unittest.mock.patch.object(torch._C, "_has_storage", return_value=False):
@@ -171,6 +191,7 @@ class TestSerialization(TestCase):
                         torch.save(sd, f)
 
     def test_serialization_metadata_preservation(self):
+        # [FUNCTION DOC] Tensor metadata survives a save and load round trip.
         """Test that metadata is preserved during serialization"""
         tensor = torch.empty(3, 3, device="openreg")
         metadata = {"version_number": True, "format_number": True}
@@ -184,6 +205,7 @@ class TestSerialization(TestCase):
             self.assertEqual(torch._utils.get_tensor_metadata(loaded_tensor), metadata)
 
     def test_serialization_map_location_cpu(self):
+        # [FUNCTION DOC] Loading with map_location cpu yields an equal CPU tensor.
         """Test serialization with map_location to CPU"""
         tensor = torch.randn(3, 3, device="openreg")
 
@@ -196,6 +218,8 @@ class TestSerialization(TestCase):
             self.assertEqual(loaded_cpu, tensor.cpu())
 
     def test_serialization_map_location_device(self):
+        # [FUNCTION DOC] Loading a device-zero tensor with map_location openreg:1 lands on index
+        # one with equal values.
         """Test serialization with map_location to specific device"""
         tensor = torch.randn(3, 3, device="openreg:0")
 
@@ -208,6 +232,7 @@ class TestSerialization(TestCase):
             self.assertEqual(loaded_device.cpu(), tensor.cpu())
 
     def test_serialization_storage_location_tag(self):
+        # [FUNCTION DOC] Location tags are openreg:1 for device one and openreg:0 for the default.
         """Test storage location tag"""
         storage = torch.UntypedStorage(4, device=torch.device("openreg:1"))
         self.assertEqual(torch.serialization.location_tag(storage), "openreg:1")
@@ -216,6 +241,8 @@ class TestSerialization(TestCase):
         self.assertEqual(torch.serialization.location_tag(storage), "openreg:0")
 
     def test_serialization_default_restore_location(self):
+        # [FUNCTION DOC] Restoring a CPU storage
+        # to openreg:0 and openreg:1 yields openreg storages.
         """Test default restore location"""
         storage_cpu = torch.empty(4, 4).storage()
 

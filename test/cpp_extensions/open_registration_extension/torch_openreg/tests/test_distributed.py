@@ -1,4 +1,10 @@
 # Owner(s): ["module: PrivateUse1"]
+# [MODULE DOC] Smoke tests for the OCCL (dummy openreg collective) distributed backend.
+# Import-time side effects: raises SkipTest when distributed or the occl backend is
+# missing; sets the BACKEND and WORLD_SIZE environment variables; if TEMP_DIR is unset
+# creates a temporary directory with barrier, test_dir and init_dir subfolders and sets
+# TEMP_DIR and INIT_METHOD (a file store). After defining the test class it replaces
+# every inherited test method not on the allowed list with None to disable it.
 
 import os
 import tempfile
@@ -42,9 +48,15 @@ from torch.testing._internal.distributed.distributed_test import (
 
 
 class TestProcessGroupOCCL(TestDistBackend, DistributedTest._DistTestBase):
+    # [CLASS DOC] Multi-process test case on the occl backend reusing the generic
+    # distributed test base classes. Only the registration test and the allreduce test run;
+    # all other inherited tests are nulled out at module level.
     # OCCL collectives are dummy; we only validate registration and basic API.
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Skips the parent setUp, does the minimal multi-process setup,
+        # sets up temp directories and the barrier, clears skip_return_code_checks, and spawns
+        # worker processes when running in the main process.
         # Bypass TestDistBackend.setUp (which expects many inherited tests) and
         # perform the minimal MultiProcessTestCase setup plus temp dir wiring.
         MultiProcessTestCase.setUp(self)
@@ -56,10 +68,13 @@ class TestProcessGroupOCCL(TestDistBackend, DistributedTest._DistTestBase):
             self._spawn_processes()
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Removes the temp directory then runs the parent tearDown.
         cleanup_temp_dir()
         super().tearDown()
 
     def test_occl_backend_registration_and_default_group(self) -> None:
+        # [FUNCTION DOC] Checks occl is in the backend list, the default group is initialized
+        # with backend occl, world size is two and rank matches the test case rank.
         # Backend is registered and available in the backend list.
         self.assertTrue(dist.is_available())
         self.assertIn("occl", dist.Backend.backend_list)
@@ -74,6 +89,9 @@ class TestProcessGroupOCCL(TestDistBackend, DistributedTest._DistTestBase):
         self.assertEqual(dist.get_rank(), self.rank)
 
     def test_occl_allreduce(self) -> None:
+        # [FUNCTION DOC] Runs allreduce on a one-element openreg tensor through the default
+        # group, waits on the future, requires it to be done and its value to be None because
+        # OCCL collectives are dummy.
         pg = _get_default_group()
         device = torch.device("openreg")
 

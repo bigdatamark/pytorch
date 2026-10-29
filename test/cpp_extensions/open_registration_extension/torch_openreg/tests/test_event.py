@@ -1,12 +1,19 @@
 # Owner(s): ["module: PrivateUse1"]
+# [MODULE DOC] Event and stream tests for the openreg backend: event creation, query,
+# recording, elapsed time, stream waits, synchronization and multi-device events. Most
+# tests are skipped under Dynamo. No import-time side effects.
 
 import torch
 from torch.testing._internal.common_utils import run_tests, skipIfTorchDynamo, TestCase
 
 
 class TestEvent(TestCase):
+    # [CLASS DOC] Test cases for torch.Event and torch.Stream on openreg.
     @skipIfTorchDynamo()
     def test_event_create(self):
+        # [FUNCTION DOC] Unrecorded events report type openreg, no device index and id zero
+        # (even when openreg:1 was requested); an event recorded on a stream of device one
+        # reports index one and a nonzero id.
         """Test event creation with different methods"""
         event = torch.Event(device="openreg")
         self.assertEqual(event.device.type, "openreg")
@@ -31,6 +38,8 @@ class TestEvent(TestCase):
 
     @skipIfTorchDynamo()
     def test_event_query(self):
+        # [FUNCTION DOC] A fresh event queries done; an event recorded on a stream is done
+        # after synchronize.
         """Test event query operation"""
         event = torch.Event()
         self.assertTrue(event.query())
@@ -42,6 +51,7 @@ class TestEvent(TestCase):
 
     @skipIfTorchDynamo()
     def test_event_record(self):
+        # [FUNCTION DOC] Recording two events on one stream gives nonzero, distinct event ids.
         """Test recording events on streams"""
         stream = torch.Stream(device="openreg:1")
         event1 = stream.record_event()
@@ -54,6 +64,8 @@ class TestEvent(TestCase):
 
     @skipIfTorchDynamo()
     def test_event_elapsed_time(self):
+        # [FUNCTION DOC] Records two timing events on a stream, synchronizes, requires both
+        # done and a positive elapsed time between them.
         """Test elapsed time calculation between events"""
         stream = torch.Stream(device="openreg:1")
 
@@ -71,6 +83,8 @@ class TestEvent(TestCase):
 
     @skipIfTorchDynamo()
     def test_event_wait_stream(self):
+        # [FUNCTION DOC] One stream records an event and a second stream waits on it; checks
+        # only that no error occurs.
         """Test stream waiting on event"""
         stream1 = torch.Stream(device="openreg")
         stream2 = torch.Stream(device="openreg")
@@ -80,6 +94,8 @@ class TestEvent(TestCase):
 
     @skipIfTorchDynamo()
     def test_event_synchronize(self):
+        # [FUNCTION DOC] A fresh event is done; after recording on a stream and synchronizing
+        # it is still done.
         """Test event synchronization"""
         event = torch.Event(device="openreg")
         self.assertTrue(event.query())
@@ -91,6 +107,8 @@ class TestEvent(TestCase):
 
     @skipIfTorchDynamo()
     def test_event_different_devices(self):
+        # [FUNCTION DOC] Events recorded on streams of devices zero and one keep their
+        # device indices.
         """Test events on different devices"""
         event0 = torch.Event(device="openreg:0")
         event1 = torch.Event(device="openreg:1")
@@ -106,6 +124,8 @@ class TestEvent(TestCase):
 
     @skipIfTorchDynamo()
     def test_event_timing_disabled(self):
+        # [FUNCTION DOC] Elapsed time between events created without timing raises ValueError
+        # about enable_timing.
         """Test event with timing disabled"""
         event1 = torch.Event(device="openreg:1", enable_timing=False)
         event2 = torch.Event(device="openreg:1", enable_timing=False)
@@ -124,6 +144,9 @@ class TestEvent(TestCase):
 
     @skipIfTorchDynamo()
     def test_event_wait_event(self):
+        # [FUNCTION DOC] Stream two waits on an event recorded on stream one, then
+        # synchronizes; the event must be done.
+        # KNOWN ISSUE: near duplicate of test_event_wait_stream and shares its docstring.
         """Test stream waiting on event"""
         stream1 = torch.Stream(device="openreg")
         stream2 = torch.Stream(device="openreg")

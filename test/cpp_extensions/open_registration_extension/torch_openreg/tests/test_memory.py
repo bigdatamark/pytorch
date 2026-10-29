@@ -1,4 +1,8 @@
 # Owner(s): ["module: PrivateUse1"]
+# [MODULE DOC] Memory tests for the openreg device allocator: allocation sizes and dtypes,
+# copies, views, in-place ops, leak-style stress loops, pinned memory and
+# multi-device allocation and transfer. No import-time side effects beyond importing
+# torch_openreg.
 
 import gc
 import time
@@ -9,9 +13,11 @@ from torch.testing._internal.common_utils import run_tests, skipIfTorchDynamo, T
 
 
 class TestDeviceAllocator(TestCase):
+    # [CLASS DOC] Basic allocation, lifecycle, copy and view behavior of the openreg allocator.
     """Test cases for OpenRegDeviceAllocator functionality."""
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Runs the parent setUp and forces garbage collection.
         """Reset memory state before each test."""
         super().setUp()
         # Force garbage collection to ensure clean state
@@ -20,6 +26,8 @@ class TestDeviceAllocator(TestCase):
         # but we can ensure tensors are properly released
 
     def test_basic_allocation(self):
+        # [FUNCTION DOC] Allocates small, large and multi-dimensional openreg tensors and
+        # checks device type, element count and shape.
         """Test basic memory allocation with various sizes."""
         # Small allocation
         x = torch.empty(100, device="openreg")
@@ -35,6 +43,8 @@ class TestDeviceAllocator(TestCase):
         self.assertEqual(w.shape, torch.Size([10, 20, 30]))
 
     def test_memory_lifecycle(self):
+        # [FUNCTION DOC] Allocates, deletes and collects, then allocates again to check memory
+        # can be reused.
         """Test complete memory allocation and deallocation lifecycle."""
         # Allocate tensor
         x = torch.empty(1000, device="openreg")
@@ -51,6 +61,7 @@ class TestDeviceAllocator(TestCase):
         gc.collect()
 
     def test_tensor_copy_operations(self):
+        # [FUNCTION DOC] Copies CPU to openreg and back (values equal) and clones on openreg.
         """Test memory operations during tensor copies."""
         # CPU to OpenReg
         cpu_tensor = torch.randn(100)
@@ -69,6 +80,9 @@ class TestDeviceAllocator(TestCase):
         self.assertTrue(torch.allclose(openreg_tensor.cpu(), cloned.cpu()))
 
     def test_tensor_shallow_copy(self):
+        # [FUNCTION DOC] Assigning openreg data to a CPU tensor and CPU data to an openreg
+        # tensor via the data attribute shares the same data pointer; checks the
+        # compatible shallow copy type predicate is true in both directions.
         # set_data from openreg to cpu
         self_t = torch.randn(4, 4)
         from_t = torch.randn(4, 4, device="openreg")
@@ -86,6 +100,7 @@ class TestDeviceAllocator(TestCase):
         self.assertEqual(self_t.data_ptr(), from_t.data_ptr())
 
     def test_inplace_operations(self):
+        # [FUNCTION DOC] In-place add and mul keep the data pointer and produce expected values.
         """Test memory stability during inplace operations."""
         x = torch.ones(100, device="openreg")
         original_data_ptr = x.data_ptr()
@@ -101,6 +116,8 @@ class TestDeviceAllocator(TestCase):
         self.assertTrue(torch.all(x == 4))
 
     def test_view_operations(self):
+        # [FUNCTION DOC] A reshaped view shares the data pointer; a slice has the expected
+        # element count.
         """Test that views share memory correctly."""
         x = torch.randn(100, device="openreg")
         original_data_ptr = x.data_ptr()
@@ -116,6 +133,8 @@ class TestDeviceAllocator(TestCase):
         self.assertEqual(z.numel(), 10)
 
     def test_different_dtypes(self):
+        # [FUNCTION DOC] Allocates tensors of four dtypes on openreg and checks device,
+        # dtype and size.
         """Test allocation with different data types."""
         dtypes = [torch.float32, torch.float64, torch.int32, torch.int64]
 
@@ -126,6 +145,7 @@ class TestDeviceAllocator(TestCase):
             self.assertEqual(x.numel(), 100)
 
     def test_tensor_resize(self):
+        # [FUNCTION DOC] Shrinks then restores a tensor with resize and checks element counts.
         """Test tensor resizing operations."""
         x = torch.empty(100, device="openreg")
         _ = x.data_ptr()
@@ -140,6 +160,10 @@ class TestDeviceAllocator(TestCase):
         self.assertEqual(x.numel(), 100)
 
     def test_empty_cache_operation(self):
+        # [FUNCTION DOC] Allocates and frees tensors, then calls the CUDA empty_cache only if
+        # CUDA is available.
+        # KNOWN ISSUE: never exercises the openreg allocator cache; on CPU-only hosts
+        # nothing is asserted.
         """Test empty cache functionality."""
         # Allocate some tensors
         x = torch.empty(1000, device="openreg")
@@ -154,6 +178,8 @@ class TestDeviceAllocator(TestCase):
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
     def test_memory_format_allocation(self):
+        # [FUNCTION DOC] Allocates with channels-last and contiguous memory formats and checks
+        # the matching contiguity predicate.
         """Test allocation with different memory formats."""
         # Channels last format
         x = torch.empty(2, 3, 4, 4, device="openreg", memory_format=torch.channels_last)
@@ -168,6 +194,7 @@ class TestDeviceAllocator(TestCase):
         self.assertTrue(y.is_contiguous())
 
     def test_large_allocation(self):
+        # [FUNCTION DOC] Allocates roughly ten megabytes of float32 and checks size and device.
         """Test large memory allocation."""
         # Allocate a large tensor (10MB approximately)
         size = 10 * 1024 * 1024 // 4  # 10MB in float32
@@ -176,6 +203,7 @@ class TestDeviceAllocator(TestCase):
         self.assertEqual(x.numel(), size)
 
     def test_sequential_allocations_and_deallocations(self):
+        # [FUNCTION DOC] Allocates and drops ten tensors of growing size in a loop, then collects.
         """Test sequential allocation and deallocation patterns."""
         for i in range(10):
             x = torch.empty(1000 + i * 100, device="openreg")
@@ -185,6 +213,7 @@ class TestDeviceAllocator(TestCase):
         gc.collect()
 
     def test_allocation_with_requires_grad(self):
+        # [FUNCTION DOC] Empty and random openreg tensors can be created with requires_grad.
         """Test allocation of tensors with gradient tracking."""
         x = torch.empty(100, device="openreg", requires_grad=True)
         self.assertEqual(x.device.type, "openreg")
@@ -195,6 +224,8 @@ class TestDeviceAllocator(TestCase):
         self.assertTrue(y.requires_grad)
 
     def test_storage_operations(self):
+        # [FUNCTION DOC] The storage of an openreg tensor is on openreg and at least as
+        # big as the tensor.
         """Test storage-level operations."""
         x = torch.randn(100, device="openreg")
         storage = x.storage()
@@ -206,6 +237,9 @@ class TestDeviceAllocator(TestCase):
         self.assertGreaterEqual(storage.size(), x.numel())
 
     def test_tensor_from_blob(self):
+        # [FUNCTION DOC] Creates a view_as alias of a tensor, checks equal data pointers, and
+        # that a fill on the original shows in the alias.
+        # KNOWN ISSUE: despite the name and docstring it does not use from_blob.
         """Test creating tensors that reference existing memory."""
         x = torch.randn(100, device="openreg")
 
@@ -221,15 +255,20 @@ class TestDeviceAllocator(TestCase):
 
 
 class TestMemoryLeaks(TestCase):
+    # [CLASS DOC] Stress loops that allocate and free many openreg tensors; they only
+    # detect crashes or exhaustion, not measured leaks.
     """Test cases for detecting memory leaks in OpenRegDeviceAllocator."""
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Runs the parent setUp, collects garbage and sleeps briefly.
         """Reset memory state before each test."""
         super().setUp()
         gc.collect()
         time.sleep(0.1)  # Allow time for cleanup
 
     def test_no_leak_simple_allocations(self):
+        # [FUNCTION DOC] Warms up then allocates and deletes a 1000-element tensor 1000 times
+        # with periodic collection. KNOWN ISSUE: no assertion; passes if nothing crashes.
         """Test that simple allocations don't leak memory."""
         # Warm-up
         for _ in range(10):
@@ -255,6 +294,8 @@ class TestMemoryLeaks(TestCase):
         # The test passes if no exception/crash occurred
 
     def test_no_leak_varying_sizes(self):
+        # [FUNCTION DOC] Allocates and deletes tensors cycling through five sizes for 500
+        # iterations. KNOWN ISSUE: no assertion.
         """Test that allocations of varying sizes don't leak."""
         iterations = 500
         sizes = [100, 500, 1000, 5000, 10000]
@@ -271,6 +312,8 @@ class TestMemoryLeaks(TestCase):
         time.sleep(0.1)
 
     def test_no_leak_with_copies(self):
+        # [FUNCTION DOC] Loops creating a tensor, copying to CPU, back to device and cloning,
+        # then deleting all. KNOWN ISSUE: no assertion.
         """Test that tensor copies don't leak memory."""
         iterations = 300
 
@@ -297,6 +340,8 @@ class TestMemoryLeaks(TestCase):
         time.sleep(0.1)
 
     def test_no_leak_with_views(self):
+        # [FUNCTION DOC] Loops creating a tensor and several views and deleting them.
+        # KNOWN ISSUE: no assertion.
         """Test that tensor views don't leak memory."""
         iterations = 500
 
@@ -318,6 +363,8 @@ class TestMemoryLeaks(TestCase):
         time.sleep(0.1)
 
     def test_no_leak_inplace_operations(self):
+        # [FUNCTION DOC] Loops applying four in-place ops to a tensor then deleting it.
+        # KNOWN ISSUE: no assertion.
         """Test that inplace operations don't leak memory."""
         iterations = 500
 
@@ -339,6 +386,8 @@ class TestMemoryLeaks(TestCase):
         time.sleep(0.1)
 
     def test_no_leak_with_gradients(self):
+        # [FUNCTION DOC] Loops building a small autograd graph from two tensors and deleting
+        # it. KNOWN ISSUE: no assertion.
         """Test that tensors with gradients don't leak."""
         iterations = 300
 
@@ -359,6 +408,8 @@ class TestMemoryLeaks(TestCase):
         time.sleep(0.1)
 
     def test_no_leak_repeated_large_allocations(self):
+        # [FUNCTION DOC] Repeatedly allocates and frees a roughly 50 MB tensor, with a sleep
+        # each time. KNOWN ISSUE: no assertion.
         """Test repeated large allocations for memory leaks."""
         # Large tensor size (50MB)
         size = 50 * 1024 * 1024 // 4
@@ -375,6 +426,9 @@ class TestMemoryLeaks(TestCase):
         time.sleep(0.1)
 
     def test_leak_detection_with_statistics(self):
+        # [FUNCTION DOC] Ten cycles of allocating 100 tensors, clearing the list and
+        # collecting; finally allocates once more and checks its device.
+        # KNOWN ISSUE: docstring mentions statistics but none are read.
         """Test memory leak detection using allocation patterns."""
         # This test verifies that after many alloc/dealloc cycles,
         # the allocator properly frees memory
@@ -406,8 +460,12 @@ class TestMemoryLeaks(TestCase):
 
 
 class TestPinMemory(TestCase):
+    # [CLASS DOC] Tests pinned host memory for tensors and storages with openreg as the
+    # pinning device. Skipped under Dynamo.
     @skipIfTorchDynamo("unsupported aten.is_pinned.default")
     def test_pin_memory(self):
+        # [FUNCTION DOC] Pinning a CPU tensor, its slice, a typed storage and an untyped
+        # storage reports pinned only after pin_memory.
         """Test pin memory for tensors, storage, and untyped storage"""
         tensor = torch.randn(10)
         self.assertFalse(tensor.is_pinned())
@@ -430,6 +488,8 @@ class TestPinMemory(TestCase):
 
     @skipIfTorchDynamo("unsupported aten.is_pinned.default")
     def test_pin_memory_different_devices(self):
+        # [FUNCTION DOC] Pins a tensor with the default device and with an explicit openreg
+        # device and checks pinned status.
         """Test pin memory on different devices"""
         tensor = torch.randn(10)
         pinned_tensor = tensor.pin_memory()
@@ -441,6 +501,7 @@ class TestPinMemory(TestCase):
 
     @skipIfTorchDynamo("unsupported aten.is_pinned.default")
     def test_pin_memory_view(self):
+        # [FUNCTION DOC] A slice, strided slice and reshape of a pinned tensor are all pinned.
         """Test pin memory with tensor views"""
         tensor = torch.randn(20)
         pinned_tensor = tensor.pin_memory()
@@ -457,6 +518,7 @@ class TestPinMemory(TestCase):
 
     @skipIfTorchDynamo("unsupported aten.is_pinned.default")
     def test_pin_memory_storage_sharing(self):
+        # [FUNCTION DOC] A tensor built by set_ from the storage of a pinned tensor is pinned.
         """Test pin memory with shared storage"""
         tensor = torch.randn(10)
         pinned_tensor = tensor.pin_memory()
@@ -469,26 +531,32 @@ class TestPinMemory(TestCase):
 
 
 class TestMultiDeviceAllocation(TestCase):
+    # [CLASS DOC] Allocation tests that need exactly two openreg devices.
     """Test basic multi-device allocation functionality."""
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Requires device count two and collects garbage.
         super().setUp()
         self.device_count = torch.openreg.device_count()
         self.assertEqual(self.device_count, 2, "This test requires 2 OpenReg devices")
         gc.collect()
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Resets the current device to zero and collects garbage.
         """Restore device 0 to avoid affecting subsequent tests."""
         torch.openreg.set_device(0)
         gc.collect()
 
     def test_allocation_on_device_1(self):
+        # [FUNCTION DOC] Sets device one and allocates on it; checks type and index.
         torch.openreg.set_device(1)
         x = torch.empty(100, device="openreg:1")
         self.assertEqual(x.device.type, "openreg")
         self.assertEqual(x.device.index, 1)
 
     def test_simultaneous_device_allocations(self):
+        # [FUNCTION DOC] Tensors on devices zero and one have the right indices and
+        # different data pointers.
         """Test allocations on both devices simultaneously."""
         x = torch.empty(100, device="openreg:0")
         y = torch.empty(200, device="openreg:1")
@@ -498,6 +566,8 @@ class TestMultiDeviceAllocation(TestCase):
         self.assertNotEqual(x.data_ptr(), y.data_ptr())
 
     def test_memory_isolation_between_devices(self):
+        # [FUNCTION DOC] Ten tensors on each device keep their index, and the two sets of data
+        # pointers do not overlap.
         """Test that memory allocations are isolated between devices."""
 
         tensors_dev0 = [torch.empty(1000, device="openreg:0") for _ in range(10)]
@@ -519,6 +589,8 @@ class TestMultiDeviceAllocation(TestCase):
         )
 
     def test_alternating_device_allocations(self):
+        # [FUNCTION DOC] Allocates twenty tensors alternating devices and checks each
+        # keeps its index.
         """Test alternating allocations between devices."""
         tensors = []
         for i in range(20):
@@ -534,20 +606,25 @@ class TestMultiDeviceAllocation(TestCase):
 
 
 class TestCrossDeviceOperations(TestCase):
+    # [CLASS DOC] Tests for transfers between two openreg devices.
     """Test cross-device tensor operations."""
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Requires device count two and collects garbage.
         super().setUp()
         self.device_count = torch.openreg.device_count()
         self.assertEqual(self.device_count, 2)
         gc.collect()
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Resets the current device to zero and collects garbage.
         """Restore device 0 to avoid affecting subsequent tests."""
         torch.openreg.set_device(0)
         gc.collect()
 
     def test_tensor_to_different_device(self):
+        # [FUNCTION DOC] Moving a tensor from device zero to one changes index and data pointer
+        # and preserves values.
         """Test moving tensor from one device to another."""
         # Create on device 0
         x = torch.randn(100, device="openreg:0")
@@ -562,6 +639,8 @@ class TestCrossDeviceOperations(TestCase):
         self.assertTrue(torch.allclose(x.cpu(), y.cpu()))
 
     def test_bidirectional_device_transfer(self):
+        # [FUNCTION DOC] Copies zero to one to zero and checks values match the original
+        # on the CPU.
         """Test transferring tensor back and forth between devices."""
         original = torch.randn(100, device="openreg:0")
         original_cpu = original.cpu()

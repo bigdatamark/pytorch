@@ -1,4 +1,9 @@
 # Owner(s): ["module: PrivateUse1"]
+# [MODULE DOC] Profiler tests for the openreg backend: autograd profiler basics, record
+# function annotations, streams and events, export and tables, edge cases, multi-device,
+# model workflows, overhead, and Kineto plugin integration (PrivateUse1 activity, session
+# lifecycle, fallback mode, Chrome trace, activity filters). Most tests are skipped
+# under Dynamo. No import-time side effects.
 
 import json
 import os
@@ -14,15 +19,18 @@ from torch.testing._internal.common_utils import run_tests, skipIfTorchDynamo, T
 
 
 class SimpleModel(nn.Module):
+    # [CLASS DOC] HELPER: Two-layer MLP (10 to 20 to 10 with ReLU) used by the integration tests.
     """Simple neural network for integration testing."""
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Builds the two linear layers and the ReLU.
         super().__init__()
         self.fc1 = nn.Linear(10, 20)
         self.fc2 = nn.Linear(20, 10)
         self.relu = nn.ReLU()
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies first linear, ReLU, second linear and returns the result.
         x = self.fc1(x)
         x = self.relu(x)
         x = self.fc2(x)
@@ -30,10 +38,13 @@ class SimpleModel(nn.Module):
 
 
 class TestProfiler(TestCase):
+    # [CLASS DOC] Core profiler behavior on openreg using the autograd profiler context.
     """Test PyTorch profiler integration with OpenReg backend."""
 
     @skipIfTorchDynamo()
     def test_profiler_basic(self):
+        # [FUNCTION DOC] Profiles an add of two openreg
+        # tensors; events exist and some are aten ops.
         """Test basic profiler functionality with OpenReg device."""
         with autograd_profile(use_device="openreg") as prof:
             x = torch.randn(10, 10, device="openreg")
@@ -49,6 +60,7 @@ class TestProfiler(TestCase):
 
     @skipIfTorchDynamo()
     def test_profiler_with_record_function(self):
+        # [FUNCTION DOC] A custom record_function label around a matmul appears among event names.
         """Test profiler with custom record_function annotations."""
         with autograd_profile(use_device="openreg") as prof:
             with record_function("openreg_custom_operation"):
@@ -62,6 +74,7 @@ class TestProfiler(TestCase):
 
     @skipIfTorchDynamo()
     def test_profiler_multiple_streams(self):
+        # [FUNCTION DOC] Profiles work run under two different streams; events are recorded.
         """Test profiler with multiple OpenReg streams."""
         stream1 = torch.Stream(device="openreg")
         stream2 = torch.Stream(device="openreg")
@@ -80,6 +93,8 @@ class TestProfiler(TestCase):
 
     @skipIfTorchDynamo()
     def test_profiler_event_synchronization(self):
+        # [FUNCTION DOC] Records a timing event inside a stream while profiling and synchronizes
+        # it; events are recorded.
         """Test that profiler correctly handles event synchronization."""
         with autograd_profile(use_device="openreg") as prof:
             stream = torch.Stream(device="openreg")
@@ -97,6 +112,8 @@ class TestProfiler(TestCase):
 
     @skipIfTorchDynamo()
     def test_profiler_nested_record_function(self):
+        # [FUNCTION DOC] Nested record_function labels (one outer,
+        # two inner) all appear in event names.
         """Test profiler with nested record_function calls."""
         with autograd_profile(use_device="openreg") as prof:
             with record_function("outer_operation"):
@@ -117,6 +134,8 @@ class TestProfiler(TestCase):
 
     @skipIfTorchDynamo()
     def test_profiler_key_averages(self):
+        # [FUNCTION DOC] key_averages after ten adds is nonempty and entries have a key, a
+        # nonnegative count and nonnegative total CPU time.
         """Test that key_averages works correctly with OpenReg operations."""
         with autograd_profile(use_device="openreg") as prof:
             for _ in range(10):
@@ -134,6 +153,8 @@ class TestProfiler(TestCase):
 
     @skipIfTorchDynamo()
     def test_profiler_table_output(self):
+        # [FUNCTION DOC] The averages table sorted by total CPU
+        # time with a row limit is a nonempty string.
         """Test that profiler can generate table output."""
         with autograd_profile(use_device="openreg") as prof:
             x = torch.randn(10, 10, device="openreg")
@@ -147,6 +168,8 @@ class TestProfiler(TestCase):
 
     @skipIfTorchDynamo()
     def test_profiler_export_chrome_trace(self):
+        # [FUNCTION DOC] Exports a trace to a temp file, reloads the JSON (dict with traceEvents
+        # or a list), requires events, and always deletes the file.
         """Test exporting profiler results to Chrome trace format."""
         with autograd_profile(use_device="openreg") as prof:
             x = torch.randn(10, 10, device="openreg")
@@ -177,6 +200,7 @@ class TestProfiler(TestCase):
 
     @skipIfTorchDynamo()
     def test_profiler_with_shapes(self):
+        # [FUNCTION DOC] With shape recording, grouping averages by input shape is nonempty.
         """Test profiler with shape recording enabled."""
         with autograd_profile(use_device="openreg", record_shapes=True) as prof:
             x = torch.randn(10, 20, device="openreg")
@@ -188,6 +212,8 @@ class TestProfiler(TestCase):
 
     @skipIfTorchDynamo()
     def test_profiler_default_stream_initialization(self):
+        # [FUNCTION DOC] Profiling works with only the default stream (regression for stream
+        # pool initialization); events are recorded.
         """Test that profiler works without explicit stream initialization."""
         # This test verifies the bug fix: profiler should work even when
         # getStreamFromPool is not called first
@@ -201,6 +227,8 @@ class TestProfiler(TestCase):
 
     @skipIfTorchDynamo()
     def test_profiler_stream_event_correlation(self):
+        # [FUNCTION DOC] Work under two streams each wrapped in a record_function label; both
+        # labels have recorded events.
         """Test that profiler correctly correlates events across streams."""
         stream1 = torch.Stream(device="openreg")
         stream2 = torch.Stream(device="openreg")
@@ -225,6 +253,8 @@ class TestProfiler(TestCase):
 
     @skipIfTorchDynamo()
     def test_profiler_elapsed_time(self):
+        # [FUNCTION DOC] Runs ten chained matmuls on a stream and, if matmul events are found,
+        # requires their total CPU time to be positive.
         """Test that event elapsed time is correctly calculated."""
         with autograd_profile(use_device="openreg") as prof:
             stream = torch.Stream(device="openreg")
@@ -250,6 +280,9 @@ class TestProfiler(TestCase):
 
     @skipIfTorchDynamo()
     def test_profiler_context_manager_multiple_times(self):
+        # [FUNCTION DOC] Profiles a loop of three adds and expects events.
+        # KNOWN ISSUE: docstring says the profiler is used multiple times but only one session
+        # is created.
         """Test that profiler can be used multiple times."""
         with autograd_profile(use_device="openreg") as prof:
             for i in range(3):
@@ -261,6 +294,8 @@ class TestProfiler(TestCase):
 
     @skipIfTorchDynamo()
     def test_profiler_with_backward_pass(self):
+        # [FUNCTION DOC] Profiles forward matmul and backward; names
+        # include a matmul op and a backward event.
         """Test profiler with autograd operations."""
         with autograd_profile(use_device="openreg", record_shapes=True) as prof:
             x = torch.randn(10, 10, device="openreg", requires_grad=True)
@@ -279,10 +314,12 @@ class TestProfiler(TestCase):
 
 
 class TestProfilerEdgeCases(TestCase):
+    # [CLASS DOC] Edge cases: empty profile, exceptions, many events.
     """Test edge cases and error conditions for profiler."""
 
     @skipIfTorchDynamo()
     def test_profiler_empty_operations(self):
+        # [FUNCTION DOC] An empty profile still exposes a list of events.
         """Test profiler with no operations."""
         with autograd_profile(use_device="openreg") as prof:
             pass
@@ -293,6 +330,9 @@ class TestProfilerEdgeCases(TestCase):
 
     @skipIfTorchDynamo()
     def test_profiler_exception_handling(self):
+        # [FUNCTION DOC] An exception raised inside the profiler context propagates with its
+        # message and the profiler's events remain readable.
+        # KNOWN ISSUE: passes silently if no exception were raised.
         """Test that profiler handles exceptions gracefully."""
         try:
             with autograd_profile(use_device="openreg") as prof:
@@ -307,6 +347,7 @@ class TestProfilerEdgeCases(TestCase):
 
     @skipIfTorchDynamo()
     def test_profiler_large_number_of_events(self):
+        # [FUNCTION DOC] Hundred labeled adds produce more than one hundred events.
         """Test profiler with large number of events."""
         with autograd_profile(use_device="openreg") as prof:
             x = torch.randn(10, 10, device="openreg")
@@ -321,10 +362,12 @@ class TestProfilerEdgeCases(TestCase):
 
 
 class TestProfilerMultiDevice(TestCase):
+    # [CLASS DOC] Profiler tests that depend on the number of available openreg devices.
     """Test profiler with multiple OpenReg devices if available."""
 
     @skipIfTorchDynamo()
     def test_profiler_single_device(self):
+        # [FUNCTION DOC] Profiles work on openreg:0; skipped when no devices exist.
         """Test profiler with explicit device specification."""
         device_count = torch.openreg.device_count()
         if device_count < 1:
@@ -339,6 +382,8 @@ class TestProfilerMultiDevice(TestCase):
 
     @skipIfTorchDynamo()
     def test_profiler_multiple_devices(self):
+        # [FUNCTION DOC] Profiles work on devices zero
+        # and one; skipped with fewer than two devices.
         """Test profiler with operations on multiple devices."""
         device_count = torch.openreg.device_count()
         if device_count < 2:
@@ -356,10 +401,12 @@ class TestProfilerMultiDevice(TestCase):
 
 
 class TestProfilerIntegration(TestCase):
+    # [CLASS DOC] Profiler tests with model workflows (inference, training, transfers).
     """Integration tests for profiler with realistic PyTorch workflows."""
 
     @skipIfTorchDynamo()
     def test_profiler_with_simple_model(self):
+        # [FUNCTION DOC] Profiles a forward pass of SimpleModel; names include linear or addmm.
         """Test profiler with a simple neural network."""
         model = SimpleModel().to("openreg")
         x = torch.randn(32, 10, device="openreg")
@@ -381,6 +428,8 @@ class TestProfilerIntegration(TestCase):
 
     @skipIfTorchDynamo()
     def test_profiler_with_training_step(self):
+        # [FUNCTION DOC] Profiles forward, loss, backward and optimizer step each under its own
+        # label; all four labels must appear.
         """Test profiler with a complete training step."""
         model = SimpleModel().to("openreg")
         optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
@@ -418,6 +467,7 @@ class TestProfilerIntegration(TestCase):
 
     @skipIfTorchDynamo()
     def test_profiler_with_multiple_batches(self):
+        # [FUNCTION DOC] Profiles five labeled batches; every batch label must appear.
         """Test profiler with multiple training batches."""
         model = SimpleModel().to("openreg")
 
@@ -436,6 +486,8 @@ class TestProfilerIntegration(TestCase):
 
     @skipIfTorchDynamo()
     def test_profiler_table_with_model(self):
+        # [FUNCTION DOC] Builds the averages table for ten forward passes; it must be a
+        # nonempty string that mentions linear, addmm or relu.
         """Test that profiler table output works with model operations."""
         model = SimpleModel().to("openreg")
         x = torch.randn(32, 10, device="openreg")
@@ -457,6 +509,8 @@ class TestProfilerIntegration(TestCase):
 
     @skipIfTorchDynamo()
     def test_profiler_with_inference(self):
+        # [FUNCTION DOC] Profiles inference under no_grad and checks events exist.
+        # KNOWN ISSUE: collects backward-named events but asserts nothing about them.
         """Test profiler during model inference (no gradients)."""
         model = SimpleModel().to("openreg")
         model.eval()
@@ -479,6 +533,7 @@ class TestProfilerIntegration(TestCase):
 
     @skipIfTorchDynamo()
     def test_profiler_with_data_transfer(self):
+        # [FUNCTION DOC] Labels a CPU-to-openreg copy, a matmul and a copy back; all labels appear.
         """Test profiler with CPU-OpenReg data transfers."""
         with autograd_profile(use_device="openreg") as prof:
             # CPU tensor
@@ -505,6 +560,7 @@ class TestProfilerIntegration(TestCase):
 
     @skipIfTorchDynamo()
     def test_profiler_with_mixed_operations(self):
+        # [FUNCTION DOC] Profiles add, matmul, relu, transpose and sum; aten events exist.
         """Test profiler with mixed tensor operations."""
         with autograd_profile(use_device="openreg", record_shapes=True) as prof:
             x = torch.randn(20, 20, device="openreg")
@@ -525,10 +581,13 @@ class TestProfilerIntegration(TestCase):
 
 
 class TestProfilerPerformance(TestCase):
+    # [CLASS DOC] Overhead check for profiling.
     """Performance-related profiler tests."""
 
     @skipIfTorchDynamo()
     def test_profiler_overhead(self):
+        # [FUNCTION DOC] After warmup, profiles one hundred forward passes; events exist and
+        # the wall time is under sixty seconds.
         """Verify profiler doesn't add excessive overhead."""
         model = SimpleModel().to("openreg")
         x = torch.randn(32, 10, device="openreg")
@@ -559,6 +618,8 @@ class TestProfilerPerformance(TestCase):
     not torch.profiler.kineto_available(), "Kineto is required for these tests"
 )
 class TestKinetoIntegration(TestCase):
+    # [CLASS DOC] Kineto plugin tests for openreg, skipped when Kineto is unavailable.
+    # Uses the PrivateUse1 activity and exported Chrome traces.
     """End-to-end integration tests for OpenReg Kineto profiler plugin.
 
     Covers IActivityProfiler plugin registration, session lifecycle, fallback
@@ -567,6 +628,8 @@ class TestKinetoIntegration(TestCase):
     """
 
     def _export_and_load_trace(self, prof):
+        # [FUNCTION DOC] HELPER: Exports the profile to a temp JSON file, returns the traceEvents
+        # list from the loaded JSON, and always removes the file.
         """Export Chrome trace to a temp file, load and return traceEvents."""
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
             trace_file = f.name
@@ -579,6 +642,8 @@ class TestKinetoIntegration(TestCase):
 
     @skipIfTorchDynamo()
     def test_basic_profiling_cpu_ops(self):
+        # [FUNCTION DOC] PrivateUse1 must be a supported activity; a CPU plus PrivateUse1 session
+        # records events including aten ops.
         """PrivateUse1 profiler session runs without error and CPU ops are recorded."""
         self.assertIn(
             ProfilerActivity.PrivateUse1, torch.profiler.supported_activities()
@@ -603,6 +668,7 @@ class TestKinetoIntegration(TestCase):
 
     @skipIfTorchDynamo()
     def test_multi_session_lifecycle(self):
+        # [FUNCTION DOC] Two sequential sessions each record events including aten ops.
         """Two independent sessions run to completion without error."""
         activities = [ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]
 
@@ -628,6 +694,8 @@ class TestKinetoIntegration(TestCase):
 
     @skipIfTorchDynamo()
     def test_fallback_preserved(self):
+        # [FUNCTION DOC] With use_kineto false the profiler uses stubs; events include aten ops
+        # and the profiler kind is the Kineto PrivateUse1 fallback state.
         """use_kineto=False still uses ProfilerStubs for device timing."""
         with autograd_profile(
             use_device="openreg", use_kineto=False, use_cpu=True
@@ -651,6 +719,7 @@ class TestKinetoIntegration(TestCase):
 
     @skipIfTorchDynamo()
     def test_chrome_trace_cpu_ops(self):
+        # [FUNCTION DOC] The exported Chrome trace has events, including category cpu_op ones.
         """CPU ops appear in the exported Chrome trace JSON."""
         with torch.profiler.profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
@@ -669,6 +738,9 @@ class TestKinetoIntegration(TestCase):
 
     @skipIfTorchDynamo()
     def test_activity_filter_compatibility(self):
+        # [FUNCTION DOC] Four filter scenarios: PrivateUse1 with an empty filter only, and with
+        # the CONCURRENT_KERNEL filter only, give zero events; CPU plus empty PrivateUse1
+        # captures the record_function marker; CPU only captures its marker and no device events.
         """Fine-grained activity filter API (PR #176351) works with PrivateUse1 backend.
 
         Four scenarios cover all distinct filter configurations:
