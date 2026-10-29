@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Implements DistributedOptimizer (the public export), which creates a local optimizer on each worker owning parameters
+# and drives steps over RPC using distributed autograd gradients. Also holds private local/functional optimizer wrappers
+# and RPC helper functions. Creates a module logger at import time.
 import logging
 from collections import defaultdict
 from threading import Lock
@@ -19,11 +22,16 @@ logger = logging.getLogger(__name__)
 
 
 class _FunctionalLocalOptimizer:
+    # [CLASS DOC] HELPER: Worker-side wrapper that builds a functional optimizer over local parameters resolved from RRefs
+    # and applies it using gradients fetched from a distributed autograd context without touching the grad attribute.
     def __init__(self, optim_cls, local_params_rref, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Resolves each RRef to its local tensor, stores the list, and instantiates the optimizer class on it with the extra arguments.
         self._local_params = [rref.local_value() for rref in local_params_rref]
         self.optim = optim_cls(self._local_params, *args, **kwargs)
 
     def step(self, autograd_ctx_id: int):
+        # [FUNCTION DOC] HELPER: Fetches the gradients of the given autograd context, builds a list aligned with the local parameters
+        # (None where a parameter has no gradient), and calls the functional optimizer step with it.
         all_local_grads = dist_autograd.get_gradients(autograd_ctx_id)
         # apply functional optimizer step with a list of gradients
         grads: list[Tensor | None] = [
@@ -37,6 +45,8 @@ class _FunctionalLocalOptimizer:
 # TODO (wanchaol): remove/merge this with _FunctionalLocalOptimizer once
 # we have converted all to functional optimizer in distributed.optim
 class _LocalOptimizer:
+    # [CLASS DOC] HELPER: Worker-side wrapper around a regular optimizer over local parameters resolved from RRefs.
+    # A class-level global lock serializes steps across instances on a worker (assumes they optimize the same parameters).
     # Ideally we would only need to share a lock for instances of
     # _LocalOptimizer that deal with the same parameters. We are
     # making a simplifying assumption here that if there is more
@@ -47,10 +57,12 @@ class _LocalOptimizer:
     global_lock = Lock()
 
     def __init__(self, optim_cls, local_params_rref, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Resolves each RRef to its local tensor, stores the list, and instantiates the optimizer class on it with the extra arguments.
         self._local_params = [rref.local_value() for rref in local_params_rref]
         self.optim = optim_cls(self._local_params, *args, **kwargs)
 
     def step(self, autograd_ctx_id):
+        # [FUNCTION DOC] HELPER: Under the global lock, copies the context's gradients onto the parameters' grad attributes and calls the optimizer step.
         all_local_grads = dist_autograd.get_gradients(autograd_ctx_id)
 
         with _LocalOptimizer.global_lock:
@@ -60,15 +72,18 @@ class _LocalOptimizer:
 
 
 def _new_local_optimizer(optim_cls, local_params_rref, *args, **kwargs):
+# [FUNCTION DOC] HELPER: RPC target that creates a _LocalOptimizer on the worker and returns an RRef to it.
     return rpc.RRef(_LocalOptimizer(optim_cls, local_params_rref, *args, **kwargs))
 
 
 def _local_optimizer_step(local_optim_rref, autograd_ctx_id):
+# [FUNCTION DOC] HELPER: RPC target that runs step on the local optimizer behind the given RRef for the autograd context id.
     local_optim = local_optim_rref.local_value()
     local_optim.step(autograd_ctx_id)
 
 
 def _new_functional_local_optimizer(optim_cls, local_params_rref, *args, **kwargs):
+# [FUNCTION DOC] HELPER: RPC target that creates a _FunctionalLocalOptimizer on the worker and returns an RRef to it.
     optim = _FunctionalLocalOptimizer(optim_cls, local_params_rref, *args, **kwargs)
     return rpc.RRef(optim)
 
@@ -76,11 +91,14 @@ def _new_functional_local_optimizer(optim_cls, local_params_rref, *args, **kwarg
 def _functional_local_optimizer_step(
     local_optim_rref: RRef, autograd_ctx_id: int
 ) -> None:
+    # [FUNCTION DOC] HELPER: RPC target that runs step on the functional local optimizer behind the given RRef for the autograd context id.
     local_optim = local_optim_rref.local_value()
     local_optim.step(autograd_ctx_id)
 
 
 def _wait_for_all(rpc_futs):
+    # [FUNCTION DOC] HELPER: Waits on every future in order, collecting results (exceptions are collected as results too).
+    # If any failed, raises the last exception seen after all have been waited on; otherwise returns the list of results.
     # TODO: improve error propagation
     exception = None
     results = []
@@ -96,6 +114,9 @@ def _wait_for_all(rpc_futs):
 
 
 class DistributedOptimizer:
+    # [CLASS DOC] Public distributed optimizer: groups parameter RRefs by owning worker and creates one optimizer per worker over RPC.
+    # State: is_functional_optim (whether a functional optimizer was substituted) and remote_optimizers (RRefs to per-worker optimizers).
+    # step triggers a step on each worker using a distributed autograd context.
     """
     DistributedOptimizer takes remote references to parameters scattered
     across workers and applies the given optimizer locally for each parameter.
@@ -153,6 +174,9 @@ class DistributedOptimizer:
     """
 
     def __init__(self, optimizer_class, params_rref, *args, **kwargs):
+        # [FUNCTION DOC] Groups params_rref by owner, picks a functional optimizer from functional_optim_map when the class is mapped
+        # and JIT is enabled (otherwise logs a slow-path warning and uses the class as is), then asynchronously creates the optimizer on each worker
+        # and waits for all creations, storing the RRefs. Raises any exception from a failed worker.
         torch._C._log_api_usage_once("torch.distributed.optim.DistributedOptimizer")
         per_worker_params_rref = defaultdict(list)
         for param in params_rref:
@@ -190,6 +214,8 @@ class DistributedOptimizer:
         self.remote_optimizers = _wait_for_all(remote_optim_futs)
 
     def step(self, context_id):
+        # [FUNCTION DOC] Validates the autograd context id, asynchronously invokes the matching step function on every worker's optimizer,
+        # and blocks until all finish, raising if any failed. Returns None.
         """
         Performs a single optimization step.
 

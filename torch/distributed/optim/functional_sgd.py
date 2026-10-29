@@ -1,4 +1,5 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] HELPER: Defines _FunctionalSGD, a functional SGD optimizer for the distributed optimizer; no exports (empty __all__), no import-time side effects.
 
 import torch
 import torch.optim._functional as F
@@ -21,6 +22,10 @@ __all__: list[str] = []
 # NOTE: This should be only used by distributed optimizer internals
 # and not meant to expose to the user.
 class _FunctionalSGD:
+    # [CLASS DOC] HELPER: Functional SGD optimizer used only by the distributed optimizer internals.
+    # Holds a single param_group (mapping with the parameter list), a defaults mapping, and a per-parameter state mapping.
+    # Gradients are passed explicitly to step instead of read from the grad attribute, so threads do not race on it.
+    # Supports momentum, dampening, weight decay, nesterov, maximize, foreach and fused flags; the only state is a per-parameter momentum buffer.
     def __init__(
         self,
         params: list[Tensor],
@@ -34,6 +39,9 @@ class _FunctionalSGD:
         fused: bool = False,
         _allow_empty_param_list: bool = False,
     ):
+        # [FUNCTION DOC] HELPER: Builds the optimizer; emits the scripted-functional-optimizer deprecation warning.
+        # Stores hyperparameters in defaults (no range validation), flags, a single param_group and empty state.
+        # Raises ValueError if the parameter list is empty (unless _allow_empty_param_list is true).
         _scripted_functional_optimizer_deprecation_warning(stacklevel=2)
         self.defaults = {
             "lr": lr,
@@ -55,6 +63,12 @@ class _FunctionalSGD:
         self.param_group = {"params": params}
 
     def step_param(self, param: Tensor, grad: Tensor | None):
+        # [FUNCTION DOC] HELPER: Single-parameter variant of step: applies SGD to one parameter with its gradient.
+        # If grad is None nothing is computed beyond an empty functional call. Otherwise looks up (or creates empty)
+        # state, runs the functional SGD routine under no-grad, then stores any resulting momentum buffer in state.
+        # Mutates the parameter in place. Returns None.
+        # KNOWN ISSUE: when grad is None the state lookup after the call fails for a parameter with no state entry,
+        # and the momentum buffer list is empty so indexing it raises an error.
         """Similar to self.step, but operates on a single parameter and
         its gradient.
         """
@@ -105,6 +119,10 @@ class _FunctionalSGD:
             state["momentum_buffer"] = momentum_buffer
 
     def step(self, gradients: list[Tensor | None]):
+        # [FUNCTION DOC] HELPER: Performs one SGD update from a gradient list aligned with the parameters.
+        # Raises ValueError on a length mismatch; parameters with None gradients are skipped. Collects existing momentum
+        # buffers (None if absent), notes whether any gradient is sparse, calls the functional SGD routine under no-grad,
+        # then writes back any non-None momentum buffers into state. Mutates parameters in place. Returns None.
         params = self.param_group["params"]
         params_with_grad = []
         grads = []

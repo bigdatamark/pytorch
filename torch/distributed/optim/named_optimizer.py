@@ -1,3 +1,6 @@
+# [MODULE DOC] Defines _NamedOptimizer, a wrapper around a regular optimizer whose state_dict is keyed by parameter fully qualified names
+# instead of integer indices, plus the helper _gen_param_group_key. Exports nothing publicly (empty __all__);
+# creates a module logger at import time.
 import logging
 import warnings
 from collections.abc import Callable, Collection, Mapping
@@ -17,6 +20,11 @@ logger = logging.getLogger(__name__)
 
 
 class _NamedOptimizer(optim.Optimizer):
+    # [CLASS DOC] Wraps an optimizer instance built from a mapping of FQN to parameter (optionally with explicit param_groups and an owning module).
+    # State: named_parameters (dict), ordered_param_keys (FQN per optimizer-internal parameter index, in optimizer order),
+    # module, the wrapped _optimizer, and param_groups shared with the wrapped optimizer.
+    # Key methods: state_dict / load_state_dict translate between indices and FQNs (with FSDP hooks when the module is FSDP),
+    # step delegates, add_param_group extends both, init_state runs a dummy step to force lazy state creation.
     """
     ``_NamedOptimizer`` takes a dict of parameters and exposes ``state_dict`` by parameter key.
 
@@ -69,6 +77,10 @@ class _NamedOptimizer(optim.Optimizer):
         *args: tuple[Any, ...],
         **kwargs: dict[str, Any],
     ) -> None:
+        # [FUNCTION DOC] Builds the wrapped optimizer. Validates any given param_groups, copies named_parameters to a dict,
+        # and instantiates optimizer_class on all parameters or on the given groups. Without groups, ordered_param_keys is the mapping key order;
+        # with groups, it is derived by looking up each group parameter's FQN (warns that only the groups are used).
+        # Raises ValueError if a group parameter is not among the named parameters. Logs API usage once.
         torch._C._log_api_usage_once("torch.distributed.optim._NamedOptimizer")
         self.param_groups: Collection[Mapping[str, Any]] = param_groups  # type: ignore[assignment]
         self._param_groups_check()
@@ -104,6 +116,9 @@ class _NamedOptimizer(optim.Optimizer):
         self.param_groups = self._optimizer.param_groups
 
     def _param_groups_check(self) -> None:
+        # [FUNCTION DOC] HELPER: Validates self.param_groups when not None: each group must be a dict with a params key
+        # (AssertionError otherwise) and every parameter must be a tensor (TypeError otherwise).
+        # Side effect: replaces each group's params with a list (a single tensor is wrapped).
         if self.param_groups is not None:
             for param_group in self.param_groups:
                 if not isinstance(param_group, dict):
@@ -123,6 +138,9 @@ class _NamedOptimizer(optim.Optimizer):
                 param_group["params"] = params
 
     def state_dict(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Returns the wrapped optimizer's state dict re-keyed by FQN: per-parameter state is mapped from index to FQN,
+        # and each group's params become a sorted list of FQNs with other entries deep-copied. The result is passed through
+        # _post_state_dict (FSDP post-processing). Returns a dict with state and param_groups.
         """
         Return the ``state_dict`` of the optimizer.
 
@@ -155,6 +173,7 @@ class _NamedOptimizer(optim.Optimizer):
     def step(self, closure: Callable[[], float]) -> float: ...
 
     def step(self, closure: Callable[[], float] | None = None) -> float | None:
+        # [FUNCTION DOC] Runs one step of the wrapped optimizer, optionally evaluating the closure, and returns its result (loss or None).
         """
         Perform a single optimization step.
 
@@ -165,9 +184,15 @@ class _NamedOptimizer(optim.Optimizer):
 
     @property
     def state(self) -> Mapping[torch.Tensor, Any]:  # type: ignore[override]
+        # [FUNCTION DOC] Property returning the wrapped optimizer's per-parameter state mapping.
         return self._optimizer.state
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        # [FUNCTION DOC] Loads an FQN-keyed state dict into the wrapped optimizer in place. First applies _pre_load_state_dict.
+        # Raises ValueError if the optimizer state is not yet initialized, or if per-parameter state length, state keys, shard counts or param group
+        # sizes/keys do not match. Parameters missing from the incoming state are skipped. Tensor and sharded-tensor state is copied in place,
+        # other values are deep-copied; param groups are matched by a key made of their sorted FQNs and their non-params entries copied.
+        # Finally calls the wrapped optimizer's load_state_dict with the merged result.
         """
         Define the default behavior to load a state_dict for ``_NamedOptimizer``.
 
@@ -274,6 +299,9 @@ class _NamedOptimizer(optim.Optimizer):
         self._optimizer.load_state_dict(new_state_dict)
 
     def add_param_group(self, param_group: Mapping[str, Any]) -> None:
+        # [FUNCTION DOC] Adds a param group to the wrapped optimizer. Normalizes params to a list (mutating the given dict),
+        # appends each parameter's FQN to ordered_param_keys, and refreshes param_groups.
+        # Raises AssertionError if the group is not a dict, ValueError if a parameter is not one of the named parameters.
         """
         Add a param group to the :class:`_NamedOptimizer` s `param_groups`.
 
@@ -299,6 +327,8 @@ class _NamedOptimizer(optim.Optimizer):
         self.param_groups = self._optimizer.param_groups
 
     def init_state(self) -> None:
+        # [FUNCTION DOC] Forces lazy optimizer state creation: sets a zero gradient on every parameter requiring grad, then calls step.
+        # Side effect: overwrites parameter grads with zeros and performs a real step with them.
         """
         Run a dummy optimizer step, which allows us to initialize optimizer state because we do lazy init for most optimizers.
 
@@ -312,6 +342,7 @@ class _NamedOptimizer(optim.Optimizer):
         self.step(closure=None)
 
     def _pre_load_state_dict(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+        # [FUNCTION DOC] HELPER: If the module is FSDP, converts the FQN state dict into the form FSDP expects for loading; otherwise returns it unchanged.
         # TODO(chienchin): This API should be FSDP agnostic and should support
         # general user hooks.
         if isinstance(self.module, FSDP):
@@ -321,6 +352,7 @@ class _NamedOptimizer(optim.Optimizer):
         return state_dict
 
     def _post_state_dict(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+        # [FUNCTION DOC] HELPER: If the module is FSDP, lets FSDP post-process the state dict (it updates the dict); returns the state dict.
         # TODO(chienchin): This API should be FSDP agnostic and should support
         # general user hooks.
         if isinstance(self.module, FSDP):
@@ -329,5 +361,6 @@ class _NamedOptimizer(optim.Optimizer):
 
 
 def _gen_param_group_key(param_keys: list[str]) -> str:
+    # [FUNCTION DOC] HELPER: Returns a stable identifier for a param group: the sorted parameter keys joined with a slash.
     """Concatenate all param keys as a unique identifier for one param group."""
     return "/".join(sorted(param_keys))

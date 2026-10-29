@@ -1,4 +1,5 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] HELPER: Defines _FunctionalRprop, a functional Rprop optimizer for the distributed optimizer; no exports (empty __all__), no import-time side effects.
 
 import torch
 import torch.optim._functional as F
@@ -21,6 +22,10 @@ __all__: list[str] = []
 # NOTE: This should be only used by distributed optimizer internals
 # and not meant to expose to the user.
 class _FunctionalRprop:
+    # [CLASS DOC] HELPER: Functional Rprop optimizer used only by the distributed optimizer internals.
+    # Holds a single param_group (mapping with the parameter list), a defaults mapping, and a per-parameter state mapping.
+    # Gradients are passed explicitly to step instead of read from the grad attribute, so threads do not race on it.
+    # Also stores etas, step_sizes (min, max), foreach and maximize.
     def __init__(
         self,
         params: list[Tensor],
@@ -31,6 +36,9 @@ class _FunctionalRprop:
         maximize: bool = False,
         _allow_empty_param_list: bool = False,
     ):
+        # [FUNCTION DOC] HELPER: Builds the optimizer; emits the scripted-functional-optimizer deprecation warning.
+        # Stores lr in defaults, plus etas, step size bounds and flags, a single param_group and empty state.
+        # Raises ValueError if the parameter list is empty (unless _allow_empty_param_list is true).
         _scripted_functional_optimizer_deprecation_warning(stacklevel=2)
         self.defaults = {
             "lr": lr,
@@ -50,6 +58,10 @@ class _FunctionalRprop:
         self.state = torch.jit.annotate(dict[torch.Tensor, dict[str, torch.Tensor]], {})
 
     def step(self, gradients: list[Tensor | None]):
+        # [FUNCTION DOC] HELPER: Performs one Rprop update from a gradient list aligned with the parameters.
+        # Raises ValueError on a length mismatch; parameters with a None gradient are skipped. Lazily creates state
+        # (step counter, prev zeros, and step_size filled with lr), then calls the functional Rprop routine under no-grad,
+        # mutating parameters and state in place. Returns None.
         params = self.param_group["params"]
         params_with_grad = []
         grads = []

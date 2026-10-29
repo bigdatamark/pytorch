@@ -1,4 +1,6 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Defines PostLocalSGDOptimizer, an optimizer wrapper that applies a local optimizer then runs a model averager (post-local SGD).
+# No import-time side effects beyond imports.
 import warnings
 
 import torch
@@ -6,6 +8,9 @@ import torch.distributed.algorithms.model_averaging.averagers as averagers
 
 
 class PostLocalSGDOptimizer(torch.optim.Optimizer):
+    # [CLASS DOC] Wraps a torch optimizer plus a ModelAverager. Delegates state, param_groups, repr, zero_grad and add_param_group to the wrapped optimizer;
+    # step runs the local step then averages parameters across workers via the averager. The averager's step counter is saved in and restored from state dicts.
+    # Does not call the base optimizer constructor; it only mirrors the wrapped optimizer's param_groups.
     r"""
     Wraps an arbitrary :class:`torch.optim.Optimizer` and runs `post-local SGD <https://arxiv.org/abs/1808.07217>`_,
     This optimizer runs local optimizer at every step.
@@ -56,18 +61,22 @@ class PostLocalSGDOptimizer(torch.optim.Optimizer):
     """
 
     def __init__(self, optim: torch.optim.Optimizer, averager: averagers.ModelAverager):
+        # [FUNCTION DOC] Stores the wrapped optimizer and averager and shares the optimizer's param_groups list.
         self.optim = optim
         self.param_groups = self.optim.param_groups
         self.averager = averager
 
     @property
     def state(self):  # type: ignore[override]
+        # [FUNCTION DOC] Property returning the wrapped optimizer's state mapping.
         return self.optim.state
 
     def __repr__(self):
+        # [FUNCTION DOC] Returns the repr of the wrapped optimizer.
         return self.optim.__repr__()
 
     def state_dict(self):
+        # [FUNCTION DOC] Returns the wrapped optimizer's state dict with an added step entry holding the averager's current step.
         r"""
         This is the same as :class:`torch.optim.Optimizer` :meth:`state_dict`,
         but adds an extra entry to record model averager's step to the checkpoint
@@ -78,6 +87,8 @@ class PostLocalSGDOptimizer(torch.optim.Optimizer):
         return optim_state_dict
 
     def load_state_dict(self, state_dict):
+        # [FUNCTION DOC] Loads the state dict into the wrapped optimizer, then sets the averager step from the step entry.
+        # If the entry is missing, warns and resets the averager step to 0.
         r"""
         This is the same as :class:`torch.optim.Optimizer` :meth:`load_state_dict`,
         but also restores model averager's step value to the one
@@ -98,6 +109,7 @@ class PostLocalSGDOptimizer(torch.optim.Optimizer):
             self.averager.step = 0
 
     def step(self):  # type: ignore[override]
+        # [FUNCTION DOC] Runs the wrapped optimizer step, then asks the averager to average parameters over the param_groups (a collective operation). Returns None.
         r"""
         Performs a single optimization step (parameter update).
         """
@@ -105,7 +117,9 @@ class PostLocalSGDOptimizer(torch.optim.Optimizer):
         self.averager.average_parameters(params=self.param_groups)
 
     def zero_grad(self, set_to_none: bool = True):  # type: ignore[override]
+        # [FUNCTION DOC] Delegates zero_grad to the wrapped optimizer, passing set_to_none (default true).
         self.optim.zero_grad(set_to_none=set_to_none)
 
     def add_param_group(self, param_group):
+        # [FUNCTION DOC] Delegates adding a param group to the wrapped optimizer.
         self.optim.add_param_group(param_group)

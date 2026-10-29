@@ -1,4 +1,5 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] HELPER: Defines _FunctionalRMSprop, a functional RMSprop optimizer for the distributed optimizer; no exports (empty __all__), no import-time side effects.
 
 import torch
 import torch.optim._functional as F
@@ -21,6 +22,11 @@ __all__: list[str] = []
 # NOTE: This should be only used by distributed optimizer internals
 # and not meant to expose to the user.
 class _FunctionalRMSprop:
+    # [CLASS DOC] HELPER: Functional (stateless-API) RMSprop optimizer used only by the distributed optimizer internals.
+    # Holds a single param_group (a mapping with the parameter list), a defaults mapping of hyperparameters,
+    # and a per-parameter state mapping created lazily on first step. Gradients are passed explicitly to step
+    # instead of being read from the parameter grad attribute, so multithreaded trainers avoid racing on it.
+    # Supports centered, momentum, foreach and maximize options.
     def __init__(
         self,
         params: list[Tensor],
@@ -34,6 +40,10 @@ class _FunctionalRMSprop:
         maximize: bool = False,
         _allow_empty_param_list: bool = False,
     ):
+        # [FUNCTION DOC] HELPER: Builds the functional RMSprop optimizer from a parameter list and hyperparameters.
+        # Emits the scripted-functional-optimizer deprecation warning. No hyperparameter range validation is performed.
+        # Raises ValueError if the parameter list is empty (unless _allow_empty_param_list is true).
+        # Stores defaults, a single param_group, and an empty state mapping.
         _scripted_functional_optimizer_deprecation_warning(stacklevel=2)
         self.defaults = {
             "lr": lr,
@@ -56,6 +66,10 @@ class _FunctionalRMSprop:
         self.state = torch.jit.annotate(dict[torch.Tensor, dict[str, torch.Tensor]], {})
 
     def step(self, gradients: list[Tensor | None]):
+        # [FUNCTION DOC] HELPER: Performs one RMSprop update given a gradient list aligned with the parameters.
+        # Raises ValueError if the gradient count differs from the parameter count. Parameters with a None gradient
+        # are skipped. State (step counter, square_avg, plus momentum_buffer when momentum is positive and grad_avg when centered) is lazily created per parameter,
+        # then the shared functional RMSprop routine is called under no-grad, mutating parameters and state in place. Returns None.
         params = self.param_group["params"]
         params_with_grad = []
         grads = []

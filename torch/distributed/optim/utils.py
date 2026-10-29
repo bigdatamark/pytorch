@@ -1,4 +1,6 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Maps regular torch optimizer classes to their private functional counterparts (functional_optim_map) and provides helpers
+# to register new mappings and to construct an empty-parameter functional optimizer. Import-time side effect: builds the mapping.
 
 from torch import optim
 
@@ -29,6 +31,8 @@ functional_optim_map = {
 
 
 def register_functional_optim(key, optim):
+    # [FUNCTION DOC] Registers a functional optimizer class under the given key in the global mapping.
+    # Does nothing if the key is already present (existing entries are never overwritten). Mutates module-level state. Returns None.
     """
     Interface to insert a new functional optimizer to functional_optim_map.
     ``fn_optim_key`` and ``fn_optimizer`` are user defined. The optimizer and key
@@ -48,6 +52,8 @@ def register_functional_optim(key, optim):
 
 
 def as_functional_optim(optim_cls: type, *args, **kwargs):
+    # [FUNCTION DOC] Looks up the functional class for a regular optimizer class and builds an instance with an empty parameter list.
+    # Raises ValueError if no functional counterpart is registered. Extra arguments are forwarded to the constructor.
     try:
         functional_cls = functional_optim_map[optim_cls]
     except KeyError as e:
@@ -59,6 +65,7 @@ def as_functional_optim(optim_cls: type, *args, **kwargs):
 
 
 def _create_functional_optim(functional_optim_cls: type, *args, **kwargs):
+    # [FUNCTION DOC] HELPER: Instantiates the given functional optimizer class with an empty parameter list, allowing empty lists, forwarding extra arguments.
     return functional_optim_cls(
         [],
         *args,

@@ -1,4 +1,5 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] HELPER: Defines _FunctionalAdamW, a functional AdamW optimizer for the distributed optimizer; no exports (empty __all__), no import-time side effects.
 
 import torch
 import torch.optim._functional as F
@@ -21,6 +22,11 @@ __all__: list[str] = []
 # NOTE: This should be only used by distributed optimizer internals
 # and not meant to expose to the user.
 class _FunctionalAdamW:
+    # [CLASS DOC] HELPER: Functional (stateless-API) AdamW optimizer used only by the distributed optimizer internals.
+    # Holds a single param_group (a mapping with the parameter list), a defaults mapping of hyperparameters,
+    # and a per-parameter state mapping created lazily on first step. Gradients are passed explicitly to step
+    # instead of being read from the parameter grad attribute, so multithreaded trainers avoid racing on it.
+    # Supports amsgrad, maximize, foreach and fused flags.
     def __init__(
         self,
         params: list[Tensor],
@@ -34,6 +40,10 @@ class _FunctionalAdamW:
         fused: bool = False,
         _allow_empty_param_list: bool = False,
     ):
+        # [FUNCTION DOC] HELPER: Builds the functional AdamW optimizer from a parameter list and hyperparameters.
+        # Emits the scripted-functional-optimizer deprecation warning. Validates lr, eps, weight_decay non-negative and both betas in [0, 1), else raises ValueError.
+        # Raises ValueError if the parameter list is empty (unless _allow_empty_param_list is true).
+        # Stores defaults, a single param_group, and an empty state mapping.
         _scripted_functional_optimizer_deprecation_warning(stacklevel=2)
         if not 0.0 <= lr:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -67,6 +77,11 @@ class _FunctionalAdamW:
         self.param_group = {"params": params}
 
     def step_param(self, param: Tensor, grad: Tensor | None):
+        # [FUNCTION DOC] HELPER: Updates a single parameter with the given gradient (None means no update is applied).
+        # Lazily creates per-parameter state (step, exp_avg, exp_avg_sq, and max_exp_avg_sq when amsgrad), then calls
+        # the functional AdamW routine under no-grad, mutating parameter and state in place. Returns None.
+        # KNOWN ISSUE: when grad is None, state is still created and appended but the parameter and grad lists stay empty,
+        # so the lists passed to the routine have mismatched lengths.
         params_with_grad = []
         grads = []
         exp_avgs = []
@@ -128,6 +143,10 @@ class _FunctionalAdamW:
             )
 
     def step(self, gradients: list[Tensor | None]):
+        # [FUNCTION DOC] HELPER: Performs one AdamW update given a gradient list aligned with the parameters.
+        # Raises ValueError if the gradient count differs from the parameter count. Parameters with a None gradient
+        # are skipped. State (step counter, exp_avg, exp_avg_sq, optional max_exp_avg_sq) is lazily created per parameter,
+        # then the shared functional AdamW routine is called under no-grad, mutating parameters and state in place. Returns None.
         params = self.param_group["params"]
         params_with_grad = []
         grads = []
