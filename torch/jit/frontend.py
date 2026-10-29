@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] TorchScript frontend: converts Python source of functions and classes into the
+# C++ tree-view AST (Def, ClassDef, statements, expressions) that the TorchScript compiler
+# consumes. Contains the error types raised for unsupported syntax, the statement and expression
+# builders (one build method per Python ast node type), helpers for classes (properties, class
+# assignments, dataclass magic methods), the support for the ignore context manager, and
+# default-argument inspection. Import-time side effects: creates the module-level builder
+# instances build_expr, build_stmt and build_withitem.
 import ast
 import copy
 import dataclasses
@@ -82,6 +89,8 @@ _identifier_chars = set(string.ascii_lowercase + string.ascii_uppercase + string
 
 
 def is_reserved_name(name):
+    # [FUNCTION DOC] True if the name begins with the reserved JIT prefix or is one of the
+    # reserved names (currently print).
     return name.startswith(_reserved_prefix) or name in _reserved_names
 
 
@@ -147,7 +156,11 @@ pretty_node_names.update(
 
 
 class FrontendError(Exception):
+    # [CLASS DOC] Base exception for errors found while building the TorchScript AST. Stores the
+    # source range, the message, and a native ErrorReport captured at raise time so it reflects
+    # the compiler call stack.
     def __init__(self, source_range, msg) -> None:
+        # [FUNCTION DOC] Store source_range and msg and create the native ErrorReport for the range.
         self.source_range = source_range
         self.msg = msg
 
@@ -156,15 +169,24 @@ class FrontendError(Exception):
         self.error_report = torch._C.ErrorReport(self.source_range)
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Return the message followed by the error report text with leading
+        # whitespace removed.
         return self.msg + self.error_report.what().lstrip()
 
 
 class NotSupportedError(FrontendError):
+    # [CLASS DOC] FrontendError subclass for Python constructs TorchScript does not support.
     pass
 
 
 class UnsupportedNodeError(NotSupportedError):
+    # [CLASS DOC] NotSupportedError for a whole unsupported Python ast node type; builds the
+    # message from a friendly node name and the node's source range.
     def __init__(self, ctx, offending_node, reason="") -> None:
+        # [FUNCTION DOC] Compute a source range at the node's position (width of its keyword token,
+        # or 1 if unknown), look up a friendly feature name (fallback: the node class name), and
+        # initialize the base error with a message saying the feature, plus optional reason,
+        # is not supported.
         # If we don't have a specific token, we default to length of 1
         node_type = type(offending_node)
         range_len = len(node_start_tokens.get(node_type, " "))
@@ -179,20 +201,28 @@ class UnsupportedNodeError(NotSupportedError):
 
 
 class FrontendTypeError(FrontendError):
+    # [CLASS DOC] FrontendError subclass for type errors detected while building the AST.
     pass
 
 
 def build_withitems(ctx, items):
+    # [FUNCTION DOC] Build tree-view with-items from a list of Python with-items; returns a list.
     items = [build_withitem(ctx, i) for i in items]
     return list(items)
 
 
 def build_stmts(ctx, stmts):
+    # [FUNCTION DOC] Build tree-view statements for a list of Python statements, dropping those that
+    # build to nothing (such as docstring expressions). Returns a list.
     stmts = [build_stmt(ctx, s) for s in stmts]
     return list(filter(None, stmts))
 
 
 def get_class_properties(cls, self_name):
+    # [FUNCTION DOC] Build Property tree views for every property of cls, except those listed in
+    # the class attribute of unused properties or whose getter is marked to be dropped. For each,
+    # builds getter (and setter if present) definitions named after the property with
+    # self_name as the self type. Returns a list of Property objects.
     """
     Get a list of Property objects representing the properties of a class.
 
@@ -227,9 +257,13 @@ def get_class_properties(cls, self_name):
 
 
 def get_class_assigns(ctx, cls_ast):
+    # [FUNCTION DOC] Build assignment statements for the plain and annotated assignments directly
+    # in a class body; entries that raise NotSupportedError are skipped. Returns a list.
     assigns = []
 
     def maybe_build_assign(builder, entry) -> None:
+        # [FUNCTION DOC] HELPER: Try the builder on the entry and append the result to the
+        # enclosing assigns list; swallow NotSupportedError.
         nonlocal assigns
         try:
             assigns.append(builder(ctx, entry))
@@ -245,6 +279,11 @@ def get_class_assigns(ctx, cls_ast):
 
 
 def get_jit_class_def(cls, self_name):
+    # [FUNCTION DOC] Build the ClassDef tree view for a Python class. Collects its own methods
+    # (not static, not dropped), parses the class source, synthesizes dataclass magic methods
+    # that the user did not define (registering their source in the loader cache), builds a
+    # definition for each method and property, and class-level assignments. Returns a ClassDef.
+    # Raises an error if the source is not a class definition; source lookup may also fail.
     """Get definitions for each method within the current class independently.
 
     Args:
@@ -265,6 +304,7 @@ def get_jit_class_def(cls, self_name):
     )
 
     def is_classmethod(fn):
+        # [FUNCTION DOC] HELPER: True if fn is a bound method whose bound object is the class.
         return inspect.ismethod(fn) and getattr(fn, "__self__", None) == cls
 
     # Get and parse the source code for this class
@@ -322,6 +362,14 @@ def get_jit_class_def(cls, self_name):
 
 
 def get_jit_def(fn, def_name, self_name=None, is_classmethod=False):
+    # [FUNCTION DOC] Build a Def tree view for a function or an already parsed definition. Reads the
+    # type comment, for class methods inserts a statement assigning the first argument to the
+    # class name, and for functions marked to be dropped replaces the body with a raise of
+    # RuntimeError and the argument annotations with Any (also clearing the return annotation
+    # for the drop kind). If MonkeyType tracing is available and fn is a real function, looks up
+    # traced argument types. Returns the result of build_def. Raises RuntimeError if the
+    # replacement body is malformed. Mutates the parsed AST.
+    # KNOWN ISSUE: the docstring omits the is_classmethod argument.
     """
     Build a JIT AST (TreeView) from the given function.
 
@@ -389,6 +437,9 @@ def get_jit_def(fn, def_name, self_name=None, is_classmethod=False):
 
 # TODO: more robust handling of recognizing ignore context manager
 def is_torch_jit_ignore_context_manager(stmt) -> bool:
+    # [FUNCTION DOC] True if the first item of a with statement is a call to the ignore context
+    # manager accessed through the exact attribute chain torch.jit with that name. Purely
+    # syntactic check; other spellings (aliases) are not recognized.
     # checks if the statement is torch.jit.ignore context manager
     if isinstance(stmt.items[0].context_expr, ast.Call):
         # extract torch part
@@ -407,7 +458,11 @@ def is_torch_jit_ignore_context_manager(stmt) -> bool:
 
 
 class Builder:
+    # [CLASS DOC] Base dispatcher for AST builders: calling it on a Python ast node invokes the
+    # method named build_ plus the node class name; subclasses define those methods.
     def __call__(self, ctx, node):
+        # [FUNCTION DOC] Dispatch to the matching build method. Raises UnsupportedNodeError if the
+        # subclass has no method for the node type.
         method = getattr(self, "build_" + node.__class__.__name__, None)
         if method is None:
             raise UnsupportedNodeError(ctx, node)
@@ -415,6 +470,9 @@ class Builder:
 
 
 def build_class_def(ctx, py_def, methods, properties, self_name, assigns):
+    # [FUNCTION DOC] Create the ClassDef tree view named self_name from already built method
+    # definitions (wrapped as statements), properties and assignments. The range covers the class
+    # keyword of py_def.
     r = ctx.make_range(
         py_def.lineno, py_def.col_offset, py_def.col_offset + len("class")
     )
@@ -424,6 +482,10 @@ def build_class_def(ctx, py_def, methods, properties, self_name, assigns):
 
 
 def build_def(ctx, py_def, type_line, def_name, self_name=None, pdt_arg_types=None):
+    # [FUNCTION DOC] Create a Def tree view named def_name from a Python function AST: builds the
+    # parameter list and return annotation into a declaration; if a type comment line is given,
+    # parses it and merges its types into the declaration (treating the function as a method
+    # when self_name is set); then builds the body statements. Returns the Def.
     body = py_def.body
     r = ctx.make_range(py_def.lineno, py_def.col_offset, py_def.col_offset + len("def"))
 
@@ -452,6 +514,10 @@ _vararg_kwarg_err = (
 
 
 def build_param_list(ctx, py_args, self_name, pdt_arg_types=None):
+    # [FUNCTION DOC] Build the list of Param tree views from a Python arguments node (positional
+    # first, then keyword-only marked as such), optionally using profile-guided argument types.
+    # Raises NotSupportedError for double-star or star arguments, or keyword-only arguments
+    # with defaults.
     if py_args.kwarg is not None:
         expr = py_args.kwarg
         ctx_range = ctx.make_range(
@@ -504,6 +570,9 @@ def build_param_list(ctx, py_args, self_name, pdt_arg_types=None):
 
 
 def build_param(ctx, py_arg, self_name, kwarg_only, pdt_arg_type=None):
+    # [FUNCTION DOC] Build one Param tree view. The annotation comes from, in priority order: the
+    # explicit annotation, the profile-guided type, the class name for a parameter called self
+    # in a method, or an empty annotation. kwarg_only marks keyword-only parameters.
     # NB: In Python3 py_arg is a pair of (str arg, expr? annotation)
     name = py_arg.arg
     r = ctx.make_range(py_arg.lineno, py_arg.col_offset, py_arg.col_offset + len(name))
@@ -519,10 +588,22 @@ def build_param(ctx, py_arg, self_name, kwarg_only, pdt_arg_type=None):
 
 
 def build_ignore_context_manager(ctx, stmt):
+    # [FUNCTION DOC] Rewrite a with-statement using the ignore context manager into a call to a
+    # generated ignored function. Keyword arguments of the manager declare inputs and outputs as
+    # strings of kind and type. A function is generated whose body is the with body plus a
+    # return of the outputs, executed in a copy of this module's globals, and registered in
+    # this module's globals under a name derived from the file name and line number. Returns the
+    # Python AST of the replacement assignment (or bare call). Side effects: exec of generated
+    # code and mutation of module globals; mutates the with body list.
+    # KNOWN ISSUE: the TODO notes no validation of inputs and outputs; a malformed keyword value
+    # fails with unpacking errors.
     InputType = namedtuple("InputType", ["name", "ann"])
     OutputType = namedtuple("OutputType", ["name", "ann"])
 
     def process_ins_outs(args):
+        # [FUNCTION DOC] HELPER: Split keyword arguments into input and output lists of named
+        # tuples with the variable name and its annotation string, using the kind prefix in each
+        # value. Other kinds are ignored.
         # parse the context manager to figure out inputs and outputs
         # with their annotated types
         # TODO: add input, output validator
@@ -539,12 +620,16 @@ def build_ignore_context_manager(ctx, stmt):
         return inputs, outputs
 
     def create_unique_name_ext(ctx, stmt) -> str:
+        # [FUNCTION DOC] HELPER: Return a name suffix made of the file name with non-identifier
+        # characters replaced by underscores, then an underscore and the statement line number.
         # extension will be based on the full path filename plus
         # the line number of original context manager
         fn = re.sub(r"[^a-zA-Z0-9_]", "_", ctx.filename)
         return f"{fn}_{stmt.lineno}"
 
     def build_return_ann_stmt(outputs):
+        # [FUNCTION DOC] HELPER: Return a pair of strings: the return annotation (none, the single
+        # type, or a tuple of the types) and the return statement text listing the output names.
         return_type_ann = ""
         return_statement_str = "return "
         if len(outputs) == 0:
@@ -559,6 +644,7 @@ def build_ignore_context_manager(ctx, stmt):
         return return_type_ann, return_statement_str
 
     def build_args(args):
+        # [FUNCTION DOC] HELPER: Join the names of the given variables with commas.
         return ", ".join([arg.name for arg in args])
 
     inputs, outputs = process_ins_outs(stmt.items[0].context_expr.keywords)
@@ -613,6 +699,8 @@ from typing import List, Dict, Tuple
 
 
 def get_default_args(fn):
+    # [FUNCTION DOC] Return a mapping from parameter name to default value for parameters of fn that
+    # have defaults; an empty mapping if fn is None. Raises if the signature cannot be inspected.
     """
     Get a dictionary of default arguments for a function.
 
@@ -635,6 +723,8 @@ def get_default_args(fn):
 
 
 def get_default_args_for_class(cls):
+    # [FUNCTION DOC] Return a mapping from method name to its default-argument mapping for every
+    # method or function defined directly in cls, excluding static methods (compiled separately).
     """
     Get default arguments for all methods in a class (except for static methods).
 
@@ -664,8 +754,13 @@ def get_default_args_for_class(cls):
 
 
 class WithItemBuilder(Builder):
+    # [CLASS DOC] Builder for with-statement items.
     @staticmethod
     def build_withitem(ctx, item):
+        # [FUNCTION DOC] Build a WithItem from a Python with-item: the context expression plus the
+        # optional target variable expression.
+        # KNOWN ISSUE: the range width is the length of the friendly name for with statements
+        # (the plural phrase) rather than of the with keyword, so the range is too wide.
         lineno = item.context_expr.lineno
         start = item.context_expr.col_offset
         end = start + len(pretty_node_names[ast.With])
@@ -680,6 +775,9 @@ class WithItemBuilder(Builder):
 
 
 class StmtBuilder(Builder):
+    # [CLASS DOC] Builder for Python statement nodes: one static build method per statement kind
+    # returns the tree view (or None for ignorable docstrings). The class-level mapping
+    # augassign_map translates augmented-assignment operator types to operator tokens.
     augassign_map = {
         ast.Add: "+",
         ast.Sub: "-",
@@ -696,6 +794,10 @@ class StmtBuilder(Builder):
 
     @staticmethod
     def build_Expr(ctx, stmt):
+        # [FUNCTION DOC] Build an expression statement; returns None for a string literal
+        # (docstring) so it is dropped.
+        # KNOWN ISSUE: detection compares the class name to the legacy string node name, so on
+        # modern Python (where strings are constants) docstrings are not dropped here.
         value = stmt.value
         if value.__class__.__name__ == "Str":
             # If a statement is a string literal expression,
@@ -706,12 +808,16 @@ class StmtBuilder(Builder):
 
     @staticmethod
     def build_Assign(ctx, stmt):
+        # [FUNCTION DOC] Build an Assign with the value and all target expressions.
         rhs = build_expr(ctx, stmt.value)
         lhs = [build_expr(ctx, x) for x in stmt.targets]
         return Assign(lhs, rhs)
 
     @staticmethod
     def build_AnnAssign(ctx, stmt):
+        # [FUNCTION DOC] Build an Assign with a type annotation. Raises UnsupportedNodeError if there
+        # is no assigned value, and ValueError if an annotated attribute assignment on self occurs
+        # outside the init method.
         if stmt.value is None:
             raise UnsupportedNodeError(ctx, stmt, reason="without assigned value")
 
@@ -738,12 +844,14 @@ class StmtBuilder(Builder):
 
     @staticmethod
     def build_Delete(ctx, stmt):
+        # [FUNCTION DOC] Build a Delete over all target expressions.
         r = ctx.make_range(stmt.lineno, stmt.col_offset, stmt.col_offset + len("del"))
 
         return Delete(r, [build_expr(ctx, target) for target in stmt.targets])
 
     @staticmethod
     def build_Return(ctx, stmt):
+        # [FUNCTION DOC] Build a Return, with no value if the statement returns nothing.
         r = ctx.make_range(
             stmt.lineno, stmt.col_offset, stmt.col_offset + len("return")
         )
@@ -751,12 +859,16 @@ class StmtBuilder(Builder):
 
     @staticmethod
     def build_Raise(ctx, stmt):
+        # [FUNCTION DOC] Build a Raise of the exception expression.
+        # KNOWN ISSUE: a bare raise has no exception expression and building it from a missing
+        # value would fail.
         r = ctx.make_range(stmt.lineno, stmt.col_offset, stmt.col_offset + len("raise"))
         expr = build_expr(ctx, stmt.exc)
         return Raise(r, expr)
 
     @staticmethod
     def build_Assert(ctx, stmt):
+        # [FUNCTION DOC] Build an Assert from the test and the optional message expression.
         r = ctx.make_range(
             stmt.lineno, stmt.col_offset, stmt.col_offset + len("assert")
         )
@@ -766,6 +878,8 @@ class StmtBuilder(Builder):
 
     @staticmethod
     def build_AugAssign(ctx, stmt):
+        # [FUNCTION DOC] Build an AugAssign using the operator token from augassign_map. Raises
+        # NotSupportedError for operators not in the map (such as floor division).
         lhs = build_expr(ctx, stmt.target)
         rhs = build_expr(ctx, stmt.value)
         op = type(stmt.op)
@@ -780,6 +894,8 @@ class StmtBuilder(Builder):
 
     @staticmethod
     def build_While(ctx, stmt):
+        # [FUNCTION DOC] Build a While from the test and body. Raises NotSupportedError if the loop
+        # has an else branch.
         if stmt.orelse:
             # TODO: try to recover the location of else:? Python doesn't give us useful
             # annotations in this case
@@ -791,6 +907,8 @@ class StmtBuilder(Builder):
 
     @staticmethod
     def build_For(ctx, stmt):
+        # [FUNCTION DOC] Build a For from a single target, a single iterable and the body. Raises
+        # NotSupportedError if the loop has an else branch.
         r = ctx.make_range(stmt.lineno, stmt.col_offset, stmt.col_offset + len("for"))
         if stmt.orelse:
             raise NotSupportedError(r, "else branches of for loops aren't supported")
@@ -804,6 +922,7 @@ class StmtBuilder(Builder):
 
     @staticmethod
     def build_If(ctx, stmt):
+        # [FUNCTION DOC] Build an If from the test, body and else statements.
         r = ctx.make_range(stmt.lineno, stmt.col_offset, stmt.col_offset + len("if"))
         return If(
             r,
@@ -814,6 +933,8 @@ class StmtBuilder(Builder):
 
     @staticmethod
     def build_Print(ctx, stmt):
+        # [FUNCTION DOC] Build a call statement to print with the given values (legacy Python 2
+        # print statement node). Raises NotSupportedError if a destination is given.
         r = ctx.make_range(stmt.lineno, stmt.col_offset, stmt.col_offset + len("print"))
         if stmt.dest:
             raise NotSupportedError(
@@ -824,16 +945,19 @@ class StmtBuilder(Builder):
 
     @staticmethod
     def build_Pass(ctx, stmt):
+        # [FUNCTION DOC] Build a Pass statement.
         r = ctx.make_range(stmt.lineno, stmt.col_offset, stmt.col_offset + len("pass"))
         return Pass(r)
 
     @staticmethod
     def build_Break(ctx, stmt):
+        # [FUNCTION DOC] Build a Break statement.
         r = ctx.make_range(stmt.lineno, stmt.col_offset, stmt.col_offset + len("break"))
         return Break(r)
 
     @staticmethod
     def build_Continue(ctx, stmt):
+        # [FUNCTION DOC] Build a Continue statement.
         r = ctx.make_range(
             stmt.lineno, stmt.col_offset, stmt.col_offset + len("continue")
         )
@@ -841,6 +965,9 @@ class StmtBuilder(Builder):
 
     @staticmethod
     def build_With(ctx, stmt):
+        # [FUNCTION DOC] Build a With from items and body. If the first item is the ignore context
+        # manager, instead rewrites the statement into a call of a generated ignored function
+        # (side effects described in build_ignore_context_manager) and builds that.
         r = ctx.make_range(stmt.lineno, stmt.col_offset, stmt.col_offset + len("with"))
         # Handle ignore context manager
         if is_torch_jit_ignore_context_manager(stmt):
@@ -850,6 +977,9 @@ class StmtBuilder(Builder):
 
 
 class ExprBuilder(Builder):
+    # [CLASS DOC] Builder for Python expression nodes: one static build method per expression kind
+    # returns a tree view. Class-level mappings (binop_map, unop_map, boolop_map, cmpop_map)
+    # translate ast operator types to operator tokens.
     binop_map = {
         ast.Add: "+",
         ast.Sub: "-",
@@ -894,12 +1024,16 @@ class ExprBuilder(Builder):
 
     @staticmethod
     def build_Attribute(ctx, expr):
+        # [FUNCTION DOC] Build a Select for attribute access. Since the attribute name has no source
+        # position, computes its range by scanning the encoded source after the base expression,
+        # skipping whitespace.
         base = build_expr(ctx, expr.value)
         # expr.attr is just a string, so it's not annotated in any way, so we have
         # to build the range manually
         source = ctx.source.encode("utf-8")
 
         def get_char(index):
+            # [FUNCTION DOC] HELPER: Return the character at a byte offset of the encoded source.
             return chr(source[index])
 
         start_pos = base.range().end + 1
@@ -911,6 +1045,9 @@ class ExprBuilder(Builder):
 
     @staticmethod
     def build_Call(ctx, expr):
+        # [FUNCTION DOC] Build an Apply with positional args (plus a star argument if the legacy
+        # node field exists) and keyword args. Raises NotSupportedError for keyword-argument
+        # expansion (double-star).
         func = build_expr(ctx, expr.func)
         args = [build_expr(ctx, py_arg) for py_arg in expr.args]
         if hasattr(expr, "starargs") and expr.starargs:
@@ -929,6 +1066,7 @@ class ExprBuilder(Builder):
 
     @staticmethod
     def build_Ellipsis(ctx, expr):
+        # [FUNCTION DOC] Build a Dots node spanning three characters.
         r = ctx.make_range(
             expr.lineno, expr.col_offset, expr.col_offset + 3
         )  # len("...") == 3
@@ -936,6 +1074,8 @@ class ExprBuilder(Builder):
 
     @staticmethod
     def build_Name(ctx, expr):
+        # [FUNCTION DOC] Build a literal for the names for true, false, none and ellipsis, otherwise
+        # a Var. Raises NotSupportedError if the name starts with the reserved JIT prefix.
         r = ctx.make_range(expr.lineno, expr.col_offset, expr.col_offset + len(expr.id))
         if expr.id.startswith(_reserved_prefix):
             raise NotSupportedError(
@@ -955,6 +1095,8 @@ class ExprBuilder(Builder):
 
     @staticmethod
     def build_NameConstant(ctx, expr):
+        # [FUNCTION DOC] Build a true, false, none or Dots literal from a constant value. Raises
+        # ValueError for any other value.
         r = ctx.make_range(
             expr.lineno, expr.col_offset, expr.col_offset + len(str(expr.value))
         )
@@ -971,6 +1113,9 @@ class ExprBuilder(Builder):
 
     @staticmethod
     def build_BinOp(ctx, expr):
+        # [FUNCTION DOC] Build a BinOp from both operands and the token from binop_map. Raises
+        # FrontendError for division when the file lacks true-division semantics, and
+        # NotSupportedError for unmapped operators.
         lhs = build_expr(ctx, expr.left)
         rhs = build_expr(ctx, expr.right)
         op = type(expr.op)
@@ -993,6 +1138,10 @@ class ExprBuilder(Builder):
 
     @staticmethod
     def build_UnaryOp(ctx, expr):
+        # [FUNCTION DOC] Build a UnaryOp from the operand and token from unop_map. Raises
+        # NotSupportedError for unmapped operators (such as unary plus).
+        # KNOWN ISSUE: the error path calls a range method on the Python ast node, which has none,
+        # so an AttributeError would occur instead of the intended NotSupportedError.
         sub_expr = build_expr(ctx, expr.operand)
         op = type(expr.op)
         op_token = ExprBuilder.unop_map.get(op)
@@ -1007,6 +1156,9 @@ class ExprBuilder(Builder):
 
     @staticmethod
     def build_BoolOp(ctx, expr):
+        # [FUNCTION DOC] Build a left-nested chain of BinOp for and/or over two or more operands.
+        # Raises AssertionError if fewer than two operands, NotSupportedError for unmapped
+        # operators.
         if len(expr.values) < 2:
             raise AssertionError(
                 "expected at least 2 values in BoolOp, but got " + str(len(expr.values))
@@ -1028,6 +1180,7 @@ class ExprBuilder(Builder):
 
     @staticmethod
     def build_IfExp(ctx, expr):
+        # [FUNCTION DOC] Build a TernaryIf from test, body and else expressions.
         return TernaryIf(
             build_expr(ctx, expr.test),
             build_expr(ctx, expr.body),
@@ -1036,6 +1189,9 @@ class ExprBuilder(Builder):
 
     @staticmethod
     def build_Compare(ctx, expr):
+        # [FUNCTION DOC] Build comparisons; chained comparisons become pairwise comparisons joined
+        # by logical and. The not-in operator becomes a negation of an in expression. Raises
+        # NotSupportedError for unmapped comparison operators.
         operands = [build_expr(ctx, e) for e in [expr.left] + list(expr.comparators)]
         result = None
         # pyrefly: ignore [bad-assignment]
@@ -1064,7 +1220,13 @@ class ExprBuilder(Builder):
 
     @staticmethod
     def build_Subscript(ctx, expr):
+        # [FUNCTION DOC] Build a Subscript from the base and index expressions. Handles the several
+        # slice node shapes across Python versions: single index, tuple of indices (an empty
+        # tuple becomes an empty tuple literal), slices, and extended slices with mixed items.
+        # Raises NotSupportedError for unsupported nested forms.
         def build_SliceExpr(ctx, base, slice_expr):
+            # [FUNCTION DOC] HELPER: Build a SliceExpr with optional lower, upper and step, using
+            # the base range as its range.
             lower = (
                 build_expr(ctx, slice_expr.lower)
                 if slice_expr.lower is not None
@@ -1083,6 +1245,9 @@ class ExprBuilder(Builder):
             return SliceExpr(base.range(), lower, upper, step)
 
         def build_Index(ctx, base, index_expr):
+            # [FUNCTION DOC] HELPER: Build the expression for an index node. Raises
+            # NotSupportedError if the index is a tuple (multi-dimension tuple inside extended
+            # slices).
             if isinstance(index_expr.value, ast.Tuple):
                 raise NotSupportedError(
                     base.range(),
@@ -1091,6 +1256,8 @@ class ExprBuilder(Builder):
             return build_expr(ctx, index_expr.value)
 
         def build_ExtSlice(ctx, base, extslice):
+            # [FUNCTION DOC] HELPER: Build a list of expressions for each dimension of an extended
+            # slice: index, slice, or ellipsis. Raises NotSupportedError for other kinds.
             sub_exprs = []
             for expr in extslice.dims:
                 sub_type = type(expr)
@@ -1156,6 +1323,7 @@ class ExprBuilder(Builder):
 
     @staticmethod
     def build_List(ctx, expr):
+        # [FUNCTION DOC] Build a ListLiteral from the element expressions.
         return ListLiteral(
             ctx.make_range(expr.lineno, expr.col_offset, expr.col_offset + 1),
             [build_expr(ctx, e) for e in expr.elts],
@@ -1163,6 +1331,7 @@ class ExprBuilder(Builder):
 
     @staticmethod
     def build_Tuple(ctx, expr):
+        # [FUNCTION DOC] Build a TupleLiteral from the element expressions.
         return TupleLiteral(
             ctx.make_range(expr.lineno, expr.col_offset, expr.col_offset + 1),
             [build_expr(ctx, e) for e in expr.elts],
@@ -1170,6 +1339,8 @@ class ExprBuilder(Builder):
 
     @staticmethod
     def build_Dict(ctx, expr):
+        # [FUNCTION DOC] Build a DictLiteral from key and value expressions. Raises
+        # NotSupportedError for dictionary expansion (detected by an empty first key).
         range = ctx.make_range(expr.lineno, expr.col_offset, expr.col_offset + 1)
         if expr.keys and not expr.keys[0]:
             raise NotSupportedError(
@@ -1183,12 +1354,16 @@ class ExprBuilder(Builder):
 
     @staticmethod
     def build_Num(ctx, expr):
+        # [FUNCTION DOC] Build a Const holding the string form of the numeric value.
         value = str(expr.value)
         r = ctx.make_range(expr.lineno, expr.col_offset, expr.col_offset + len(value))
         return Const(r, value)
 
     @staticmethod
     def build_Constant(ctx, expr):
+        # [FUNCTION DOC] Dispatch on the constant's value type: none or bool to name constants,
+        # numbers to Num, strings to Str, ellipsis to Ellipsis. Raises FrontendError for other
+        # types (such as bytes).
         value = expr.value
         if value is None or isinstance(value, bool):
             # NB: this check has to happen before the int check because bool is
@@ -1208,6 +1383,7 @@ class ExprBuilder(Builder):
 
     @staticmethod
     def build_Str(ctx, expr):
+        # [FUNCTION DOC] Build a StringLiteral from the string value.
         value = str(expr.value)
         r = ctx.make_range(
             expr.lineno, expr.col_offset, expr.col_offset + len(value) + 1
@@ -1216,6 +1392,10 @@ class ExprBuilder(Builder):
 
     @staticmethod
     def build_JoinedStr(ctx, expr):
+        # [FUNCTION DOC] Convert an f-string into a call of the format method on a string literal:
+        # constant parts are concatenated into the template and each interpolated value becomes an
+        # argument with an empty placeholder. Raises NotSupportedError for conversions, format
+        # specs, or other value kinds.
         s = ""
         args = []
         for value in expr.values:
@@ -1238,6 +1418,8 @@ class ExprBuilder(Builder):
 
     @staticmethod
     def build_ListComp(ctx, stmt):
+        # [FUNCTION DOC] Build a ListComp from the element, target and iterable. Raises
+        # NotSupportedError unless there is exactly one generator without conditions.
         r = ctx.make_range(stmt.lineno, stmt.col_offset, stmt.col_offset)
         if len(stmt.generators) != 1:
             raise NotSupportedError(r, "Only a single generator is currently supported")
@@ -1253,11 +1435,14 @@ class ExprBuilder(Builder):
 
     @staticmethod
     def build_GeneratorExp(ctx, stmt):
+        # [FUNCTION DOC] Treat a generator expression as a list comprehension.
         # Convert Generator expression to ListComp
         return ExprBuilder.build_ListComp(ctx, stmt)
 
     @staticmethod
     def build_DictComp(ctx, stmt):
+        # [FUNCTION DOC] Build a DictComp from key, value, target and iterable. Raises
+        # NotSupportedError unless there is exactly one generator without conditions.
         r = ctx.make_range(stmt.lineno, stmt.col_offset, stmt.col_offset)
         if len(stmt.generators) != 1:
             raise NotSupportedError(r, "Only a single generator is currently supported")
@@ -1274,6 +1459,7 @@ class ExprBuilder(Builder):
 
     @staticmethod
     def build_Starred(ctx, expr):
+        # [FUNCTION DOC] Build a Starred node wrapping the built inner expression.
         r = ctx.make_range(expr.lineno, expr.col_offset, expr.col_offset + 1)
         return Starred(r, build_expr(ctx, expr.value))
 
@@ -1284,5 +1470,8 @@ build_withitem = WithItemBuilder()
 
 
 def find_before(ctx, pos, substr, offsets=(0, 0)):
+    # [FUNCTION DOC] Find the last occurrence of substr in the source before position pos and
+    # return a raw range covering it, adjusted by the start and end offsets. Raises ValueError if
+    # the substring does not occur.
     new_pos = ctx.source[:pos].rindex(substr)
     return ctx.make_raw_range(new_pos + offsets[0], new_pos + len(substr) + offsets[1])

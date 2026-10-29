@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Type-annotation handling for TorchScript: extracts function signatures from
+# real Python annotations or from legacy "# type:" comments, evaluates annotation strings in a
+# restricted environment, and converts Python annotations (typing constructs, builtins, enums,
+# classes, torch types) into TorchScript C++ type objects. Import-time side effects: conditionally
+# imports RRef support when torch.distributed.rpc is available. Re-exports many typing helpers via
+# __all__.
 import ast
 import builtins
 import dis
@@ -68,11 +74,16 @@ from torch._ops import OpOverloadPacket
 
 
 class Module:
+    # [CLASS DOC] Minimal fake module object used when evaluating type annotation strings: holds
+    # a name and a mapping of member names to objects, and exposes members as attributes.
     def __init__(self, name, members) -> None:
+        # [FUNCTION DOC] Store the module name and the members mapping.
         self.name = name
         self.members = members
 
     def __getattr__(self, name):
+        # [FUNCTION DOC] Called for attributes not found normally; returns the member with that
+        # name, or raises RuntimeError naming the module and member if it is missing.
         try:
             return self.members[name]
         except KeyError:
@@ -82,6 +93,10 @@ class Module:
 
 
 class EvalEnv:
+    # [CLASS DOC] Name-lookup environment (mapping-like, supports item access only) used to
+    # evaluate type annotation strings. A shared class-level dict holds well-known names (torch,
+    # Tensor, typing, Tuple, List, Dict, Optional, Union, Future, Await, and RRef when rpc is
+    # available); other names fall back to the resolution callback rcb, then to Python builtins.
     env = {
         "torch": Module("torch", {"Tensor": torch.Tensor}),
         "Tensor": torch.Tensor,
@@ -96,12 +111,16 @@ class EvalEnv:
     }
 
     def __init__(self, rcb) -> None:
+        # [FUNCTION DOC] Store the resolution callback rcb (may be None). If rpc is available,
+        # registers RRef in the shared class-level env dict (mutates global state).
         self.rcb = rcb
         if torch.distributed.rpc.is_available():
             # pyrefly: ignore [bad-typed-dict-key, unsupported-operation]
             self.env["RRef"] = RRef
 
     def __getitem__(self, name):
+        # [FUNCTION DOC] Resolve a name: the well-known env first, then the rcb callback if set
+        # (its result is returned as-is), otherwise the Python builtin of that name or None.
         if name in self.env:
             return self.env[name]
         if self.rcb is not None:
@@ -110,6 +129,13 @@ class EvalEnv:
 
 
 def get_signature(fn, rcb, loc, is_method):
+    # [FUNCTION DOC] Determine the (parameter types, return type) signature of fn as TorchScript
+    # types. First tries real annotations (using the underlying op for operator overload
+    # packets); for methods drops the leading self parameter. If none, looks for a type comment
+    # in the dedented source and parses it using rcb. Returns None if neither source gives a
+    # signature (including when source is unavailable). May raise errors from the helpers.
+    # KNOWN ISSUE: the self parameter is dropped only in the real-annotation path; type-comment
+    # signatures are assumed not to include self.
     if isinstance(fn, OpOverloadPacket):
         signature = try_real_annotations(fn.op, loc)
     else:
@@ -139,12 +165,16 @@ def get_signature(fn, rcb, loc, is_method):
 
 
 def is_function_or_method(the_callable):
+    # [FUNCTION DOC] True for Python functions and bound methods, false for builtins and other
+    # callables.
     # A stricter version of `inspect.isroutine` that does not pass for built-in
     # functions
     return inspect.isfunction(the_callable) or inspect.ismethod(the_callable)
 
 
 def is_vararg(the_callable):
+    # [FUNCTION DOC] True if the callable (or, for a non-function callable, its call method)
+    # is a Python function accepting variadic positional arguments; false otherwise.
     if not is_function_or_method(the_callable) and callable(the_callable):
         # If `the_callable` is a class, de-sugar the call so we can still get
         # the signature
@@ -157,6 +187,10 @@ def is_vararg(the_callable):
 
 
 def get_param_names(fn, n_args):
+    # [FUNCTION DOC] Return the list of parameter names of fn: unwraps overload packets to the
+    # op, de-sugars callable objects to their call method, unwraps ignored functions, and reads
+    # the argument spec. If fn is not a function or method, returns the decimal strings of
+    # indices below n_args as default names.
     if isinstance(fn, OpOverloadPacket):
         fn = fn.op
 
@@ -179,6 +213,10 @@ def get_param_names(fn, n_args):
 
 
 def check_fn(fn, loc) -> None:
+    # [FUNCTION DOC] Validate that fn's source is a single top-level function definition. Returns
+    # silently if source cannot be obtained. Raises FrontendError at loc if the source is a
+    # single class definition (cannot instantiate class in a script function) or is not exactly
+    # one function definition.
     # Make sure the function definition is not a class instantiation
     try:
         source = dedent("".join(get_source_lines_and_file(fn)[0]))
@@ -200,6 +238,9 @@ def check_fn(fn, loc) -> None:
 
 
 def _eval_no_call(stmt, glob, loc):
+    # [FUNCTION DOC] HELPER: Compile an expression string and scan its bytecode; raises
+    # RuntimeError if any call instruction is present, otherwise evaluates it with the given
+    # globals and locals (an EvalEnv in practice) and returns the value.
     """Evaluate statement as long as it does not contain any method/function calls."""
     bytecode = compile(stmt, "", mode="eval")
     for insn in dis.get_instructions(bytecode):
@@ -211,6 +252,13 @@ def _eval_no_call(stmt, glob, loc):
 
 
 def parse_type_line(type_line, rcb, loc):
+    # [FUNCTION DOC] Parse a "# type: (args) -> ret" comment line into (list of argument types,
+    # return type) as TorchScript types. Splits at the arrow, evaluates both parts without allowing
+    # calls in an EvalEnv using rcb, wraps a non-tuple argument part into a one-element tuple, and
+    # converts each annotation. Raises RuntimeError if the argument list or return type cannot be
+    # parsed (name or syntax errors).
+    # KNOWN ISSUE: rcb is not passed to the final annotation conversion, so classes resolved only
+    # through rcb are not found there.
     """Parse a type annotation specified as a comment.
 
     Example inputs:
@@ -241,6 +289,12 @@ def parse_type_line(type_line, rcb, loc):
 
 
 def get_type_line(source):
+    # [FUNCTION DOC] Find the type annotation comment in a function's source. Ignores "type:
+    # ignore" comments. With exactly one type comment, returns it stripped. With none, raises
+    # RuntimeError if a malformed prefix like a misspelled type comment is detected, else returns
+    # None. With several (PEP 484 split style), combines the per-parameter comments into the
+    # return line that has an ellipsis placeholder; raises RuntimeError if that return line is
+    # missing.
     """Try to find the line containing a comment with the type annotation."""
     type_comment = "# type:"
 
@@ -298,6 +352,7 @@ def get_type_line(source):
         )
 
     def get_parameter_type(line):
+        # [FUNCTION DOC] HELPER: Return the stripped text following the type comment marker in line.
         item_type = line[line.find(type_comment) + len(type_comment) :]
         return item_type.strip()
 
@@ -308,6 +363,9 @@ def get_type_line(source):
 
 
 def split_type_line(type_line):
+    # [FUNCTION DOC] Split a type comment into (argument part, return part) strings around the
+    # first arrow, dropping the comment prefix and stripping whitespace. Raises RuntimeError if
+    # no arrow is found.
     """Split the comment with the type annotation into parts for argument and return types.
 
     For example, for an input of:
@@ -328,6 +386,10 @@ def split_type_line(type_line):
 
 
 def try_real_annotations(fn, loc):
+    # [FUNCTION DOC] Build (list of parameter types, return type) from fn's Python annotations.
+    # Returns None if the signature cannot be inspected or if nothing at all (parameters and
+    # return) is annotated. Unannotated parameters/returns are converted as the inferred tensor
+    # type. May raise ValueError from conversion of unknown annotations.
     """Try to use the Py3.5+ annotation syntax to get the type."""
     try:
         # Note: anything annotated as `Optional[T]` will automatically
@@ -351,6 +413,12 @@ def try_real_annotations(fn, loc):
 # Finds common type for enum values belonging to an Enum class. If not all
 # values have the same type, AnyType is returned.
 def get_enum_value_type(e: type[enum.Enum], loc):
+    # [FUNCTION DOC] Compute the common TorchScript type of an enum class's values by converting
+    # the set of value Python types and unifying them. Returns AnyType if unification yields
+    # nothing. Raises ValueError if the enum has no members.
+    # KNOWN ISSUE: the empty-enum error message uses the class of the enum class (the metaclass)
+    # rather than the enum itself; also, per the comment, mixed value types are expected to raise
+    # an error but unification failing here returns AnyType.
     enum_values: List[enum.Enum] = list(e)
     if not enum_values:
         raise ValueError(f"No enum values defined for: '{e.__class__}'")
@@ -369,6 +437,9 @@ def get_enum_value_type(e: type[enum.Enum], loc):
 
 
 def is_tensor(ann) -> bool:
+    # [FUNCTION DOC] True if the class ann is a subclass of Tensor. For dtype-specific legacy
+    # tensor classes also returns True but emits a warning that dtype constraints are not
+    # enforced. Otherwise False. ann must be a class (issubclass raises TypeError otherwise).
     if issubclass(ann, torch.Tensor):
         return True
 
@@ -398,10 +469,24 @@ def is_tensor(ann) -> bool:
 
 
 def _fake_rcb(inp) -> None:
+    # [FUNCTION DOC] HELPER: Placeholder resolution callback that resolves nothing (returns None).
     return None
 
 
 def try_ann_to_type(ann, loc, rcb=None):
+    # [FUNCTION DOC] Convert a Python annotation to a TorchScript type object, or return None if
+    # unresolvable. Handles an empty annotation (inferred tensor), None, Tensor subclasses,
+    # tuples (including the empty tuple form), lists, dicts, optionals, unions (the int/float/
+    # complex union becomes the number type), rpc RRef, futures, awaits, scalar builtins, Any,
+    # device, generator, stream, dtype and qscheme (both mapped to int), script interfaces,
+    # enums (compiling the enum class if needed), and compilable classes. Falls back to the native
+    # object resolver using rcb (a no-op resolver if None), which handles named tuples.
+    # Raises ValueError for unknown dict key/value types and AssertionError for unresolvable
+    # optional/union members. May compile classes as a side effect.
+    # KNOWN ISSUE: in the union branch a None member is appended as the none type and then
+    # appended again by the generic conversion, producing duplicate entries.
+    # KNOWN ISSUE: for lists, an unresolvable element type falls through to later checks instead
+    # of raising.
     ann_args = typing.get_args(ann)  # always returns a tuple!
 
     if ann is inspect.Signature.empty:
@@ -519,6 +604,8 @@ def try_ann_to_type(ann, loc, rcb=None):
 
 
 def ann_to_type(ann, loc, rcb=None):
+    # [FUNCTION DOC] Like try_ann_to_type but never returns None: raises ValueError naming the
+    # annotation and source location if it cannot be converted.
     the_type = try_ann_to_type(ann, loc, rcb)
     if the_type is not None:
         return the_type

@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [PACKAGE DOC] Python API for the TorchScript lite (mobile) interpreter: loading mobile
+# models into LiteScriptModule, and private utilities to inspect bytecode version, contained
+# types and root operators, and to backport a model to an older bytecode version. All
+# functions are thin wrappers over torch._C bindings that accept a path or a file-like object.
 import os
 
 import torch
@@ -6,6 +10,10 @@ from torch.jit._serialization import validate_map_location
 
 
 def _load_for_lite_interpreter(f, map_location=None):
+    # [FUNCTION DOC] Load a lite-interpreter model from a path or file-like object. For a path,
+    # raises ValueError if it does not exist or is a directory. Validates map_location, loads
+    # via the native loader (reading the whole stream for file-like input), and returns the
+    # result wrapped in LiteScriptModule.
     r"""
     Load a :class:`LiteScriptModule` saved with :func:`torch.jit._save_for_lite_interpreter`.
 
@@ -55,29 +63,43 @@ def _load_for_lite_interpreter(f, map_location=None):
 
 
 class LiteScriptModule:
+    # [CLASS DOC] Python wrapper around a native lite-interpreter module, stored in the
+    # attribute _c. Delegates calling, method lookup and method execution to it.
     def __init__(self, cpp_module) -> None:
+        # [FUNCTION DOC] Store the native module in _c.
         self._c = cpp_module
         super().__init__()
 
     def __call__(self, *input):
+        # [FUNCTION DOC] Run forward on the native module with the positional inputs packed as
+        # a tuple; returns its output.
         return self._c.forward(input)
 
     def find_method(self, method_name):
+        # [FUNCTION DOC] Look up a method by name on the native module and return what it returns.
         return self._c.find_method(method_name)
 
     def forward(self, *input):
+        # [FUNCTION DOC] Run forward on the native module with the inputs packed as a tuple.
         return self._c.forward(input)
 
     def run_method(self, method_name, *input):
+        # [FUNCTION DOC] Run the named method on the native module with the inputs packed as a
+        # tuple; returns its output.
         return self._c.run_method(method_name, input)
 
 
 def _export_operator_list(module: LiteScriptModule):
+    # [FUNCTION DOC] HELPER: Return the set of root operator names (with overload names) used
+    # by any method of the given mobile module.
     r"""Return a set of root operator names (with overload name) that are used by any method in this mobile module."""
     return torch._C._export_operator_list(module._c)
 
 
 def _get_model_bytecode_version(f_input) -> int:
+    # [FUNCTION DOC] HELPER: Return the bytecode version of a model given by path or file-like
+    # object (-1 if invalid, per the docstring). Raises ValueError for a nonexistent path or a
+    # directory. File-like input is read fully.
     r"""Take a file-like object to return an integer.
 
     Args:
@@ -110,6 +132,10 @@ def _get_model_bytecode_version(f_input) -> int:
 
 
 def _get_mobile_model_contained_types(f_input) -> int:
+    # [FUNCTION DOC] HELPER: Return the set of type-name strings used in a mobile model's
+    # bytecode; input is a path or file-like object (read fully). Raises ValueError for a
+    # nonexistent path or a directory.
+    # KNOWN ISSUE: the return annotation says int but a set of strings is returned.
     r"""Take a file-like object and return a set of string, like ("int", "Optional").
 
     Args:
@@ -142,6 +168,10 @@ def _get_mobile_model_contained_types(f_input) -> int:
 
 
 def _backport_for_mobile(f_input, f_output, to_version):
+    # [FUNCTION DOC] HELPER: Convert a model to bytecode version to_version and write it to
+    # f_output; returns True on success, False otherwise. Raises ValueError for a nonexistent
+    # or directory input path. If both are paths they are passed natively; otherwise the input
+    # is read fully and the output is converted to a string path.
     r"""Take an input string containing a file name (file-like object) and a new destination to return a boolean.
 
     Args:
@@ -175,6 +205,9 @@ def _backport_for_mobile(f_input, f_output, to_version):
 
 
 def _backport_for_mobile_to_buffer(f_input, to_version):
+    # [FUNCTION DOC] HELPER: Backport a model (path or file-like object) to bytecode version
+    # to_version and return the result as an in-memory buffer. Raises ValueError for a
+    # nonexistent or directory path.
     r"""Take a string containing a file name (file-like object).
 
     Args:
@@ -198,6 +231,9 @@ def _backport_for_mobile_to_buffer(f_input, to_version):
 
 
 def _get_model_ops_and_info(f_input):
+    # [FUNCTION DOC] HELPER: Return a mapping from root operator names of the model (path or
+    # file-like object) to their OperatorInfo structs. Raises ValueError for a nonexistent
+    # path or a directory.
     r"""Retrieve the root (top level) operators of a model and their corresponding compatibility info.
 
     These root operators can call other operators within them (traced ops), and
