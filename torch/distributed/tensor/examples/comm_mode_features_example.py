@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Example script (run with torchrun on exactly 4 ranks, with -e choosing the
+# example) demonstrating CommDebugMode features: sharding info display, module
+# level and operation level collective tracing tables, JSON dumps and activation
+# checkpointing tracing, using MLP and Transformer test models. Examples print
+# tables and write log or JSON files in the working directory.
 """
 To run the example, use the following command:
 torchrun --standalone --nnodes=1 --nproc-per-node=4 comm_mode_features_example.py -e MLP_operation_tracing
@@ -31,6 +37,8 @@ if TYPE_CHECKING:
 
 
 def get_device_type() -> str:
+    # [FUNCTION DOC] HELPER: Returns the current accelerator type when at least 4
+    # accelerator devices exist, otherwise cpu.
     device_type = "cpu"
     if torch.accelerator.device_count() >= 4:
         device_type = getattr(torch.accelerator.current_accelerator(), "type", "cpu")
@@ -44,12 +52,16 @@ supported_ops = [aten.view.default, aten._to_copy.default]
 
 
 class CommDebugModeExample:
+    # [CLASS DOC] Collection of example methods, each running a model under
+    # CommDebugMode and printing or saving the collected communication information.
+    # State: world_size, rank and device_type. Examples seed the RNG for determinism.
     """
     Checks if the set of keys in ground truth dictionary and the set
     produced in advanced_module_tracker are in the same order
     """
 
     def __init__(self, world_size: int, rank: int) -> None:
+        # [FUNCTION DOC] Stores world size and rank and picks the device type.
         self.world_size = world_size
         self.rank = rank
         self.device_type = get_device_type()
@@ -57,6 +69,9 @@ class CommDebugModeExample:
     def _MLP_model_setup(
         self, model_type: type, parallelize_plan: dict | None = None
     ) -> tuple[nn.Module, torch.Tensor]:
+        # [FUNCTION DOC] HELPER: Builds the given MLP model class on the device, applies
+        # tensor parallelism (default plan: column-wise net1, row-wise net2) over a mesh
+        # of NUM_DEVICES devices, and returns the model with a random 8 by 10 input.
         """
         Creates MLP or MLPStacked model for examples
         """
@@ -82,6 +97,9 @@ class CommDebugModeExample:
     def _transformer_model_setup(
         self, is_seq_parallel: bool = False
     ) -> tuple[nn.Module, torch.Tensor]:
+        # [FUNCTION DOC] HELPER: Builds a Transformer on the device, parallelizes it over a
+        # mesh of NUM_DEVICES devices (optionally sequence parallel), and returns it with
+        # random integer token input of shape 8 by 8.
         """
         Creates transformer model for examples
         """
@@ -100,6 +118,8 @@ class CommDebugModeExample:
         return model, inp
 
     def example_MLP_distributed_sharding_display(self) -> None:
+        # [FUNCTION DOC] Example: runs a tensor parallel MLP forward and backward under
+        # CommDebugMode and prints the per-parameter sharding info.
         """
         Example of obtaining all module's FQN and parameters for a given distributed model and printing the sharding info
 
@@ -122,6 +142,8 @@ class CommDebugModeExample:
         print(comm_mode.get_sharding_info())
 
     def example_MLPStacked_distributed_sharding_display(self) -> None:
+        # [FUNCTION DOC] Example: same as the MLP sharding display but for the stacked
+        # MLP model; prints the sharding info collected under CommDebugMode.
         """
         Example of obtaining all module's FQN and parameters for a given
         distributed model with nested modules and printing the sharding info
@@ -159,6 +181,8 @@ class CommDebugModeExample:
         print(comm_mode.get_sharding_info())
 
     def example_MLP_module_tracing(self) -> None:
+        # [FUNCTION DOC] Example: runs an MLP under CommDebugMode and prints the module
+        # level collective tracing table; also logs it to a file.
         """
         Example code to demonstrate CommModeDebug's module level tracing using a MLP model.
         Prints a table of module level collective tracing information and logs table to comm_mode_log.txt
@@ -192,6 +216,8 @@ class CommDebugModeExample:
         comm_mode.log_comm_debug_tracing_table_to_file(noise_level=0)
 
     def example_transformer_module_tracing(self) -> None:
+        # [FUNCTION DOC] Example: runs a parallelized Transformer forward under
+        # CommDebugMode and prints the module level tracing table; also logs it to a file.
         """
         Example code to demonstrate CommModeDebug's module level tracing using a distributed Transformer model.
         Prints a table of module level collective tracing information and logs table to comm_mode_log.txt
@@ -280,6 +306,9 @@ class CommDebugModeExample:
         comm_mode.log_comm_debug_tracing_table_to_file(noise_level=0)
 
     def example_MLP_operation_tracing(self) -> None:
+        # [FUNCTION DOC] Example: runs an MLP forward and backward under CommDebugMode
+        # and prints the operation level tracing table (noise level 3), also logging
+        # it to a file.
         """
         Example code to demonstrate CommModeDebug's module operation level tracing using a distributed MLP model.
         Prints a table of module operation level collective tracing information and logs table to comm_mode_log.txt
@@ -584,6 +613,10 @@ class CommDebugModeExample:
     def example_transformer_operation_tracing(
         self, is_seq_parallel: bool = False
     ) -> None:
+        # [FUNCTION DOC] Example: runs a Transformer forward under CommDebugMode, prints
+        # the operation level tracing table and logs a lower noise table to
+        # transformer_operation_log.txt.
+        # KNOWN ISSUE: is_seq_parallel is accepted but never passed to the model setup.
         """
         Example code to demonstrate CommModeDebug's module operation level tracing using a distributed transformer model.
         Prints a table of module operation level collective tracing information, excluding trivial operations and logs
@@ -605,6 +638,8 @@ class CommDebugModeExample:
         )
 
     def example_MLP_json_dump(self) -> None:
+        # [FUNCTION DOC] Example: runs an MLP forward and backward under CommDebugMode
+        # and writes the default JSON dump file.
         """
         Example code to demonstrate CommModeDebug's json dump using a MLP model. Sends the information to default
         comm_mode_log.json file
@@ -621,6 +656,10 @@ class CommDebugModeExample:
         comm_mode.generate_json_dump()
 
     def example_transformer_json_dump(self, is_seq_parallel: bool = False) -> None:
+        # [FUNCTION DOC] Example: runs a Transformer forward under CommDebugMode and
+        # writes two JSON dumps (noise levels 1 and 2) to transformer_log.json and
+        # transformer_log_2.json.
+        # KNOWN ISSUE: is_seq_parallel is accepted but never passed to the model setup.
         """
         Example code to demonstrate CommModeDebug's json dump using a transformer model, excluding the trivial
         operations. Sends the information to user-passed transformer_log.json file
@@ -638,6 +677,10 @@ class CommDebugModeExample:
         comm_mode.generate_json_dump(file_name="transformer_log_2.json", noise_level=2)
 
     def example_activation_checkpointing(self) -> None:
+        # [FUNCTION DOC] Example: defines a small local model with optional activation
+        # checkpointing, runs forward and backward under CommDebugMode, and prints,
+        # logs and dumps the tracing showing activation checkpointing separately from
+        # backward. Needs no process group data parallelism.
         """
         Example code showing that CommDebugMode is able to differentiate between backward passes
         and activation checkpointing. Sends the information to default comm_mode_log.json file.
@@ -677,7 +720,10 @@ class CommDebugModeExample:
         """
 
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Stack of linear layers with relu after each; layers after
+            # the first are wrapped in activation checkpointing when use_ac is set.
             def __init__(self, n_layers: int, dim: int, use_ac: bool = False):
+                # [FUNCTION DOC] HELPER: Creates n_layers linear layers of size dim and stores use_ac.
                 super().__init__()
                 self.linears = torch.nn.ModuleList()
                 self.use_ac = use_ac
@@ -685,6 +731,8 @@ class CommDebugModeExample:
                     self.linears.append(torch.nn.Linear(dim, dim))
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Applies each layer (checkpointed for index 1 and above
+                # when use_ac) then relu; raises an error if a layer returns None.
                 for i, block in enumerate(self.linears):
                     if i >= 1 and self.use_ac:
                         x = checkpoint(
@@ -714,6 +762,8 @@ class CommDebugModeExample:
 
 
 def run_example(world_size: int, rank: int, example_name: str) -> None:
+    # [FUNCTION DOC] Builds the example class and runs the example selected by name from
+    # a fixed mapping of names to methods. An unknown name raises KeyError.
     # set manual seed
     # initializing class with all of the functions
     instantiated_example = CommDebugModeExample(world_size, rank)

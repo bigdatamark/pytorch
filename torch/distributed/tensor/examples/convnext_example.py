@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Example script (run with torchrun, CUDA, WORLD_SIZE from the environment) that
+# defines a small ConvNeXt model and trains it with DTensor: parameters are
+# replicated, the input is sharded on its width dimension. Importing the module
+# runs the training benchmark immediately (no main guard), prints latency and
+# memory per rank, and destroys the process group.
 """
 The following example demonstrates how to train a ConvNeXt model
 with intermediate activations sharded across multiple GPUs via DTensor
@@ -28,7 +34,13 @@ ITER_TIME = 20
 
 
 class LayerNorm(nn.Module):
+    # [CLASS DOC] HELPER: Channel-first layer norm for 4D inputs. Holds per-channel
+    # weight and bias parameters and an epsilon. Only the contiguous data format is
+    # supported.
     def __init__(self, normalized_shape, eps=1e-6, data_format=torch.contiguous_format):
+        # [FUNCTION DOC] HELPER: Creates weight (ones) and bias (zeros) parameters of
+        # the given channel count; stores eps and data format. Raises
+        # NotImplementedError for any format other than contiguous.
         super().__init__()
         self.weight = nn.Parameter(torch.ones(normalized_shape))
         self.bias = nn.Parameter(torch.zeros(normalized_shape))
@@ -39,6 +51,9 @@ class LayerNorm(nn.Module):
         self.normalized_shape = (normalized_shape,)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Normalizes over the channel dimension (mean and
+        # variance computed per position), then scales and shifts per channel. Returns
+        # a tensor of the same shape.
         u = x.mean(1, keepdim=True)
         s = (x - u).pow(2).mean(1, keepdim=True)
         x = (x - u) / torch.sqrt(s + self.eps)
@@ -47,7 +62,13 @@ class LayerNorm(nn.Module):
 
 
 class Block(nn.Module):
+    # [CLASS DOC] HELPER: ConvNeXt residual block: depthwise 7x7 conv, channel norm,
+    # pointwise expansion by 4, GELU, pointwise projection, optional learnable
+    # per-channel scale (gamma), then residual add. Drop path is an identity.
     def __init__(self, dim, drop_path=0.0, layer_scale_init_value=1e-6):
+        # [FUNCTION DOC] HELPER: Builds the block layers for dim channels. gamma is
+        # created only when layer_scale_init_value is positive, else None.
+        # KNOWN ISSUE: drop_path argument is unused; drop path is always an identity.
         super().__init__()
         self.dwconv = nn.Conv2d(
             dim, dim, kernel_size=7, padding=3, groups=dim
@@ -70,6 +91,8 @@ class Block(nn.Module):
         self.drop_path = nn.Identity()
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies the block layers and adds the input as a
+        # residual; returns a tensor of the same shape as the input.
         input_x = x
         x = self.dwconv(x)
 
@@ -85,7 +108,12 @@ class Block(nn.Module):
 
 
 class DownSampling(nn.Module):
+    # [CLASS DOC] HELPER: Downsampling stage: a strided conv and a channel norm,
+    # with the norm before the conv when norm_first is set, otherwise after it.
     def __init__(self, dim_in=3, dim_out=2, down_scale=4, norm_first=False):
+        # [FUNCTION DOC] HELPER: Builds the conv (kernel and stride equal to
+        # down_scale) and the norm (sized to the input channels if norm_first, else
+        # the output channels).
         super().__init__()
         self.norm_first = norm_first
         if norm_first:
@@ -102,6 +130,8 @@ class DownSampling(nn.Module):
             )
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies norm then conv, or conv then norm, depending
+        # on norm_first. Returns the downsampled tensor.
         if self.norm_first:
             return self.conv(self.norm(x))
         else:
@@ -110,6 +140,9 @@ class DownSampling(nn.Module):
 
 @torch.no_grad()
 def init_weights(m):
+    # [FUNCTION DOC] HELPER: Initializes a Conv2d or Linear module in place with
+    # all-ones weights and zero bias (if any); other modules are untouched. Runs
+    # without gradient tracking.
     if type(m) is nn.Conv2d or type(m) is nn.Linear:
         nn.init.ones_(m.weight)
         if m.bias is not None:
@@ -117,6 +150,9 @@ def init_weights(m):
 
 
 class ConvNeXt(nn.Module):
+    # [CLASS DOC] HELPER: Small ConvNeXt classifier: stem plus downsampling layers,
+    # stages of residual blocks, spatial mean pooling and a linear head. All conv and
+    # linear weights are set to constants by init_weights.
     def __init__(
         self,
         in_chans=3,
@@ -127,6 +163,9 @@ class ConvNeXt(nn.Module):
         layer_scale_init_value=1e-6,
         head_init_scale=1.0,
     ):
+        # [FUNCTION DOC] HELPER: Builds downsampling layers, stages (depths blocks per
+        # stage, widths from dims), and the linear head, then applies init_weights.
+        # KNOWN ISSUE: head_init_scale is never used.
         super().__init__()
 
         self.downsample_layers = nn.ModuleList()
@@ -157,6 +196,8 @@ class ConvNeXt(nn.Module):
         self.apply(init_weights)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Runs each downsample layer and stage in turn, averages
+        # over the two spatial dimensions, applies the head; returns class logits.
         for i in range(len(self.stages)):
             x = self.downsample_layers[i](x)
             x = self.stages[i](x)
@@ -170,6 +211,12 @@ def _conv_fn(
     module: nn.Module,
     device_mesh: DeviceMesh,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Partition function for distribute_module. Replaces every
+    # parameter of the module with a replicated DTensor parameter and registers a
+    # gradient hook redistributing grads to replicated. Parameter names have dots
+    # replaced by underscores when re-registered.
+    # KNOWN ISSUE: the name argument is shadowed by the loop variable, and flattened
+    # names are registered as new parameters while the originals may remain.
     for name, param in module.named_parameters():
         dist_spec = [Replicate()]
         dist_param = torch.nn.Parameter(
@@ -181,6 +228,11 @@ def _conv_fn(
 
 
 def train_convnext_example():
+    # [FUNCTION DOC] Trains the ConvNeXt model on CUDA with DTensor: builds a mesh over
+    # WORLD_SIZE, distributes the model with replicated parameters, shards random
+    # input on dim 3, runs one warm-up step then timed iterations (forward, backward,
+    # Adam step), prints per-rank latency and peak memory, and destroys the process
+    # group. Requires CUDA and the WORLD_SIZE environment variable.
     device_type = "cuda"
     world_size = int(os.environ["WORLD_SIZE"])
     mesh = init_device_mesh(device_type, (world_size,))

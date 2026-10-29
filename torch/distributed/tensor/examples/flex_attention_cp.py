@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Example script (run with torchrun, CUDA) that manually implements context
+# parallel flex attention with DTensor: shards q, k, v on the sequence dimension,
+# all-gathers k and v, rewrites the causal mask for each rank's shard, and checks
+# forward outputs and gradients against local flex attention and scaled dot
+# product attention. Main block reads RANK and WORLD_SIZE from the environment and
+# destroys the process group at exit.
 """
 To run the example, use the following command:
 torchrun --standalone --nnodes=1 --nproc-per-node=4 flex_attention_cp.py
@@ -20,6 +27,8 @@ from torch.nn.attention.flex_attention import (
 
 
 def get_device_type() -> str:
+    # [FUNCTION DOC] HELPER: Returns the device type string used by the example,
+    # always cuda.
     return "cuda"
 
 
@@ -32,11 +41,24 @@ def create_block_mask_cached(
     N: int,
     device: str = "cuda",
 ) -> BlockMask:
+    # [FUNCTION DOC] HELPER: Cached (by argument values) wrapper around creating a
+    # flex attention block mask for the given mask function, batch and head sizes
+    # (None allowed), query length M, key/value length N and device. Returns the
+    # BlockMask. Note the first parameter is named score_mod but is a mask function.
+    # KNOWN ISSUE: parameter name score_mod is misleading; it is typed and used as a mask_mod.
     block_mask = create_block_mask(score_mod, B, H, M, N, device=device)
     return block_mask
 
 
 def flex_attn_example(world_size: int, rank: int) -> None:
+    # [FUNCTION DOC] Runs the full context parallel flex attention demo on this rank
+    # given world size and rank. Sets the CUDA device and dynamo cache limit (global
+    # config mutation), builds a device mesh named cp, creates random q, k, v,
+    # compares compiled flex attention to scaled dot product attention, then does the
+    # sharded version (local q, all-gathered k and v, shifted mask) and compares
+    # forward output and gradients through DTensor full_tensor. Raises an error when
+    # the device module is missing, outputs are not tensors, grads are not DTensors,
+    # or tensors mismatch beyond tolerance.
     device_type = get_device_type()
     device_handle = getattr(torch, device_type, None)
     if device_handle is None:
@@ -53,6 +75,8 @@ def flex_attn_example(world_size: int, rank: int) -> None:
     )
 
     def causal_mask(b: int, h: int, q_idx: int, kv_idx: int) -> bool:
+        # [FUNCTION DOC] HELPER: Causal mask: true when the query index is at or
+        # after the key/value index. Ignores batch and head indices.
         return q_idx >= kv_idx
 
     # Compile the flex_attention function
@@ -108,6 +132,9 @@ def flex_attn_example(world_size: int, rank: int) -> None:
         rank: int,
         shard_size: int,
     ) -> _mask_mod_signature:
+        # [FUNCTION DOC] HELPER: Returns a new mask function that offsets the query
+        # index by rank times shard_size so the local shard's indices map to global
+        # positions before calling the original mask function.
         # since we're sharding on `seq_dim`, global q_idx is mapped to q_idx % shard_size
         # on each rank which means q_idx = q_idx_on_rank + shard_size * rank
         return lambda b, h, q_idx, kv_idx: mask_mod(

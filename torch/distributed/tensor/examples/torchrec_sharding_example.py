@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Example script (run with torchrun on exactly 4 ranks, with -e choosing the
+# example) showing how torchrec style embedding table sharding (row-wise even,
+# row-wise uneven, table-wise) is represented with DTensor. Defines a wrapper tensor
+# subclass holding local shards plus checkpoint storage metadata, and the example
+# runners. Main block checks rank count, parses arguments and runs one example.
 """
 The following example demonstrates how to represent torchrec's embedding
 sharding with the DTensor API.
@@ -30,6 +36,8 @@ if TYPE_CHECKING:
 
 
 def get_device_type():
+    # [FUNCTION DOC] HELPER: Returns cuda if CUDA is available with at least 4
+    # devices, otherwise cpu.
     return (
         "cuda"
         if torch.cuda.is_available() and torch.cuda.device_count() >= 4
@@ -44,6 +52,11 @@ supported_ops = [aten.view.default, aten._to_copy.default]
 # this torch.Tensor subclass is a wrapper around all local shards associated
 # with a single sharded embedding table.
 class LocalShardsWrapper(torch.Tensor):
+    # [CLASS DOC] Wrapper tensor subclass around all local shards of one sharded
+    # embedding table. Attributes: local_shards (list of 2D tensors) and storage_meta
+    # (checkpoint style storage metadata with one chunk per shard). Its logical shape
+    # is the first shard's shape widened along dim 1 by the other shards' widths.
+    # Supports only the ops in supported_ops, applied shard by shard.
     local_shards: list[torch.Tensor]
     storage_meta: TensorStorageMetadata
 
@@ -51,6 +64,13 @@ class LocalShardsWrapper(torch.Tensor):
     def __new__(
         cls, local_shards: list[torch.Tensor], offsets: list[torch.Size]
     ) -> "LocalShardsWrapper":
+        # [FUNCTION DOC] Builds the wrapper from a non-empty list of 2D local shards
+        # and an equal-length list of offsets. Computes the logical shape and checkpoint
+        # metadata from the first shard's properties and creates a wrapper subclass
+        # instance holding the shards. Raises an error if the list is empty, lengths
+        # differ, or the first shard is not 2D.
+        # KNOWN ISSUE: the shape sums widths along dim 1 only, which is right for
+        # column-wise sharding but not for row-wise shards with several local shards.
         if len(local_shards) <= 0:
             raise AssertionError
         if len(local_shards) != len(offsets):
@@ -88,6 +108,9 @@ class LocalShardsWrapper(torch.Tensor):
     # necessary for ops dispatching from this subclass to its local shards
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):  # type: ignore[override]
+        # [FUNCTION DOC] Dispatch hook: for ops in supported_ops, applies the op to each
+        # local shard of the first argument (extra args passed through) and wraps the
+        # results with the same offsets. Any other op raises NotImplementedError.
         kwargs = kwargs or {}
 
         # TODO: we shall continually extend this function to support more ops if needed
@@ -106,22 +129,32 @@ class LocalShardsWrapper(torch.Tensor):
 
     @property
     def shards(self) -> list[torch.Tensor]:
+        # [FUNCTION DOC] Property returning the list of local shard tensors.
         return self.local_shards
 
     @shards.setter
     def shards(self, local_shards: list[torch.Tensor]):
+        # [FUNCTION DOC] Setter storing the given list as the local shards.
         self.local_shards = local_shards
 
     @cached_property
     def shard_sizes(self) -> list[torch.Size]:
+        # [FUNCTION DOC] Cached property: per shard sizes taken from the storage
+        # metadata chunks.
         return [chunk.sizes for chunk in self.storage_meta.chunks]
 
     @cached_property
     def shard_offsets(self) -> list[torch.Size]:
+        # [FUNCTION DOC] Cached property: per shard offsets taken from the storage
+        # metadata chunks.
         return [chunk.offsets for chunk in self.storage_meta.chunks]
 
 
 def run_torchrec_row_wise_even_sharding_example(rank, world_size):
+    # [FUNCTION DOC] Demo of row-wise even sharding of one 8 by 16 table over a 1D
+    # mesh of all ranks (2 by 16 shard each): builds local shards, wraps them in
+    # LocalShardsWrapper, creates a DTensor from them, visualizes it and asserts on
+    # shape, placements and local shard contents. Raises AssertionError on mismatch.
     # row-wise even sharding example:
     #   One table is evenly sharded by rows within the global ProcessGroup.
     #   In our example, the table's num_embedding is 8, and the embedding dim is 16
@@ -197,6 +230,9 @@ def run_torchrec_row_wise_even_sharding_example(rank, world_size):
 
 
 def run_torchrec_row_wise_uneven_sharding_example(rank, world_size):
+    # [FUNCTION DOC] Demo of row-wise uneven sharding of one 8 by 16 table: ranks
+    # hold differently sized row blocks, wrapped as a DTensor with matching
+    # offsets, then checked by assertions. Raises AssertionError on mismatch.
     # row-wise uneven sharding example:
     #   One table is unevenly sharded by rows within the global ProcessGroup.
     #   In our example, the table's num_embedding is 8, and the embedding dim is 16
@@ -278,6 +314,9 @@ def run_torchrec_row_wise_uneven_sharding_example(rank, world_size):
 
 
 def run_torchrec_table_wise_sharding_example(rank, world_size):
+    # [FUNCTION DOC] Demo of table-wise sharding where each rank holds one whole table
+    # on its own device; builds a mesh, a DTensor per table, and asserts that only
+    # the owning rank has a non-empty local shard. Raises AssertionError on mismatch.
     # table-wise example:
     #   each rank in the global ProcessGroup holds one different table.
     #   In our example, the table's num_embedding is 8, and the embedding dim is 16
@@ -390,6 +429,9 @@ def run_torchrec_table_wise_sharding_example(rank, world_size):
 
 
 def run_example(rank, world_size, example_name):
+    # [FUNCTION DOC] Looks up the named example (row-wise-even, row-wise-uneven,
+    # table-wise), prints a message and returns if unknown, otherwise seeds the RNG
+    # with 0 and runs it with rank and world size.
     # the dict that stores example code
     name_to_example_code = {
         "row-wise-even": run_torchrec_row_wise_even_sharding_example,

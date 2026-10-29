@@ -1,3 +1,7 @@
+# [PACKAGE DOC]
+# Experimental DTensor APIs. Exports context_parallel, local_map,
+# register_sharding and the implicit_replication context manager, and rewrites
+# their __module__ so they appear under this public namespace.
 # Copyright (c) Meta Platforms, Inc. and affiliates
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -13,6 +17,12 @@ __all__ = ["context_parallel", "implicit_replication", "local_map", "register_sh
 
 @contextmanager
 def implicit_replication() -> Iterator[None]:
+    # [FUNCTION DOC]
+    # Context manager that turns on implicit replication in the DTensor operator
+    # dispatcher: plain tensors mixed with DTensors are treated as replicated
+    # DTensors. Takes no arguments, yields nothing. Side effect: sets a global
+    # flag on the dispatcher, and always resets it to False on exit (even on error),
+    # so nesting does not restore a previously enabled state.
     """
     This context manager allows :class:`DTensor` to implicitly treat all non-DTensors (``torch.Tensor``)
     in the program be replicate :class:`DTensor` s during the operator computation.

@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# HELPER: Backward compatibility stub. Re-exports the context parallel attention
+# and load balancer names from the _context_parallel subpackage so old import
+# paths keep working. No logic of its own; import-time effect is importing those
+# submodules.
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Backward compatibility stub - this module has been moved to _context_parallel/_attention.py
 

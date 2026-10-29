@@ -1,3 +1,9 @@
+# [PACKAGE DOC]
+# Context parallel subpackage of experimental DTensor. Re-exports the public
+# context parallel API (context_parallel, context_parallel_unshard,
+# set_rotate_method), the flex attention all-gather custom op, the load balancer
+# classes, and private helpers (dispatcher enable/disable, rotate method and
+# causal behavior enums) from its submodules.
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Context Parallel components
 

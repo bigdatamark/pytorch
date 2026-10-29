@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Example script (run with torchrun on at least 4 ranks) that shows how
+# DTensor sharding is visualized for 1D and 2D tensors on 1D and 2D device meshes
+# using Replicate and Shard placements. Runs at import time: raises an error if
+# fewer than 4 ranks, initializes device meshes, prints visualizations from rank 0
+# only, and destroys the process group at the end.
 """
 To run the example, use the following command:
 TERM=xterm-256color torchrun --nproc-per-node=4 visualize_sharding_example.py
@@ -23,11 +29,16 @@ device_type = getattr(torch.accelerator.current_accelerator(), "type", "cpu")
 
 
 def section(msg: str) -> None:
+    # [FUNCTION DOC] HELPER: Prints a section header rule with the given message
+    # (rich markup allowed), on rank 0 only; other ranks do nothing.
     if rank == 0:
         rich.print(rich.rule.Rule(msg))
 
 
 def visualize(t: dt.DTensor, msg: str = "") -> None:
+    # [FUNCTION DOC] HELPER: On rank 0 only, prints the message then shows the
+    # sharding of the given DTensor twice, once as plain text and once with rich
+    # formatting. Other ranks do nothing. Returns nothing.
     if rank == 0:
         rich.print(msg)
         dt.debug.visualize_sharding(t, use_rich=False)
