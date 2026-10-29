@@ -8,6 +8,11 @@ torch.ops.aten.add(1.0, Tensor) as well, which means we need a mechanism to`
 
 # mypy: allow-untyped-defs
 # mypy: disable-error-code=union-attr
+# [MODULE DOC] Builds ONNX IR nodes from calls to onnxscript functions and ops. Contains helpers
+# that bind Python/IR arguments to an operator signature, resolve dtypes, turn Python constants
+# and sequences into Constant/Concat/SequenceConstruct nodes (deduplicated via a constant farm),
+# construct IR nodes, and OpRecorder, an onnxscript Evaluator that records nodes instead of
+# executing. Import-time side effects: creates the module logger and type aliases only.
 from __future__ import annotations
 
 import copy
@@ -49,6 +54,13 @@ def _construct_named_inputs_and_attrs(
     args: Sequence[AllowedArgType],
     kwargs: Mapping[str, AllowedArgType],
 ) -> tuple[dict[str, AllowedArgType], dict[str, ValidAttributeType]]:
+    # [FUNCTION DOC] HELPER: Matches positional then keyword arguments to the signature's
+    # parameters. Input parameters go to the inputs mapping (a variadic one takes all args as a
+    # tuple; missing optional inputs become none; a missing required input raises ValueError).
+    # Attribute parameters go to the attributes mapping (positional, then keyword, then default);
+    # none-valued optional attributes are dropped, required ones raise ValueError. IR attribute
+    # defaults are copied and renamed; integers for float attributes are converted to float.
+    # Returns (inputs, attributes). Logs at debug level. Unknown kwargs are silently ignored.
     """Construct two mappings: name to inputs and named to attributes based on the signature and args/kwargs.
 
     This function uses the OpSignature to determine which argument in args and kwargs corresponds to
@@ -146,6 +158,11 @@ def _construct_named_inputs_and_attrs(
 def _resolve_parameter_dtypes(
     signature: ir.schemas.OpSignature, named_inputs: Mapping[str, AllowedArgType]
 ) -> Mapping[ir.schemas.TypeConstraintParam, ir.TypeProtocol]:
+    # [FUNCTION DOC] HELPER: Builds a mapping from each type constraint to the type of an IR
+    # value input that uses it, skipping Python constants, sequences, tensors and untyped
+    # values; later inputs overwrite earlier ones (no type promotion yet). Raises AssertionError
+    # if a name maps to a non-Parameter. KNOWN ISSUE: the second check for a missing type is
+    # unreachable because untyped values are skipped just before it.
     """Determine which parameter takes which type.
 
     Handle non-tensor input corner cases and type promotion.
@@ -191,6 +208,11 @@ def _determine_input_dtype(
     arg: AllowedArgType,
     type_binding: Mapping[ir.schemas.TypeConstraintParam, ir.TypeProtocol],
 ) -> ir.DataType:
+    # [FUNCTION DOC] HELPER: Picks the dtype for an argument. Order: the resolved binding of the
+    # parameter's constraint; the sole allowed type; the Python type of the argument (bool,
+    # float, int, string, tensor dtype, complex as float, none as undefined); for a sequence,
+    # int64 if empty, else the dtype of the first IR value, else float if any float, else int64
+    # if any int. Raises ValueError if nothing applies.
     """Determine the dtype of the input that is a mix of Python constants and ir.Value."""
     if param.type_constraint in type_binding:
         # A known dtype is available because it was resolved
@@ -242,6 +264,8 @@ def _determine_input_dtype(
 
 
 def _allowed_types_are_sequence_types(allowed_types: Iterable[ir.TypeProtocol]) -> bool:
+    # [FUNCTION DOC] HELPER: True if every allowed type is an IR sequence type (also true for an
+    # empty collection).
     """Check if all allowed types are Sequence types."""
     return all(isinstance(t, ir.SequenceType) for t in allowed_types)
 
@@ -273,6 +297,10 @@ def _get_or_create_constant(
     dtype: ir.DataType,
     opset: onnxscript.values.Opset,
 ) -> ir.Value:
+    # [FUNCTION DOC] HELPER: Returns a Constant node output for a scalar or tuple/list value with
+    # the given dtype, reusing one from the constant farm mapping when the (value, dtype) key
+    # exists; otherwise creates a tensor and Constant node and stores it in the farm (mutates
+    # it). Complex numbers become a (real, imag) pair; lists become tuples for hashing.
     # float representation of complex numbers
     if isinstance(arg, complex):
         # Convert the complex number to a float
@@ -304,6 +332,12 @@ def _process_python_constants(
     ],
     opset: onnxscript.values.Opset,
 ) -> dict[str, ir.Value | None]:
+    # [FUNCTION DOC] HELPER: Replaces Python constant inputs with Constant node outputs, in
+    # place in the inputs mapping, which is also returned. Skips IR values, sequences containing
+    # IR values, variadic parameters and sequence-typed parameters (handled by the sequence
+    # step). None stays none, tensors get a Constant directly, other values use the dtype from
+    # _determine_input_dtype and the deduplicating constant farm. Raises AssertionError for a
+    # non-Parameter entry; ValueError may propagate from dtype determination.
     """Convert Python constants to Constant nodes and list to Sequence nodes based on the dtype information.
 
     The added constants will be replacing values in named_inputs in place.
@@ -365,6 +399,8 @@ def _process_python_constants(
 
 
 def _reshape_to_1d_tensor(opset: onnxscript.values.Opset, arg: ir.Value) -> ir.Value:
+    # [FUNCTION DOC] HELPER: Emits a Reshape node flattening the value to rank one (shape of
+    # minus one) and returns its output.
     """Reshape the input to a 1D tensor."""
 
     return opset.Reshape(
@@ -392,6 +428,12 @@ def _process_python_sequences(
     ],
     opset: onnxscript.values.Opset,
 ):
+    # [FUNCTION DOC] HELPER: Rewrites list or tuple inputs, in place in the inputs mapping which
+    # is returned. Empty sequences are skipped. Sequence-typed parameters become a
+    # SequenceConstruct node. Variadic parameters with any Python constants get those
+    # constants turned into Constant nodes. Other parameters are flattened to rank one per item
+    # (none items dropped) and joined by a Concat node on axis zero. Raises AssertionError for a
+    # non-Parameter entry or an unsupported element type.
     """Handle three types of sequences.
 
     1. Variadic inputs
@@ -475,6 +517,9 @@ def _process_python_sequences(
 def _determine_output_number(
     signature: ir.schemas.OpSignature, named_attrs: Mapping[str, ValidAttributeType]
 ) -> int:
+    # [FUNCTION DOC] HELPER: Returns the output count: one for a standard-domain BatchNormalization
+    # when training mode is off; the num_outputs attribute for Split (raises ValueError if it is
+    # not an integer); otherwise the number of outputs declared by the signature.
     """Determine the number of outputs for the node with heuristics."""
     if signature.domain == "":
         if signature.name == "BatchNormalization":
@@ -499,6 +544,11 @@ def _construct_node(
     opset: onnxscript.values.Opset,
     num_outputs: int,
 ) -> ir.Node:
+    # [FUNCTION DOC] HELPER: Creates an IR node for the signature's domain, name and version.
+    # Inputs are the mapping values in order with sequence values flattened and trailing none
+    # inputs stripped; attributes come from the attribute mapping with none-valued ones removed;
+    # outputs are fresh symbolic tensors, one per requested output. Does not add the node to a
+    # graph. KNOWN ISSUE: docstring omits the opset argument.
     """Construct the node with the inputs and attributes.
 
     Variadic inputs are flattened.
@@ -545,11 +595,17 @@ def _construct_node(
 
 
 class OpRecorder(evaluator.Evaluator):
+    # [CLASS DOC] onnxscript Evaluator that records every evaluated op or function call as IR
+    # nodes instead of computing values. State: the ordered node list, the opset used for
+    # helper nodes, the used-function mapping keyed by (domain, name, overload) and the shared
+    # constant farm. Key methods: eval (ops), eval_function (onnxscript functions), _call_op.
     """An onnxscript Evaluator that captures the graph into ONNX IR."""
 
     def __init__(
         self, opset: onnxscript.values.Opset, constant_farm: dict[Any, ir.Value]
     ) -> None:
+        # [FUNCTION DOC] Initializes an empty node list and function mapping, and stores the
+        # opset and the (shared, mutable) constant farm.
         self.nodes: list[ir.Node] = []
         self.opset = opset
         self.functions: dict[
@@ -564,6 +620,11 @@ class OpRecorder(evaluator.Evaluator):
         named_attrs: dict[str, ValidAttributeType],
         num_outputs: int,
     ) -> Sequence[_tensors.SymbolicTensor]:
+        # [FUNCTION DOC] HELPER: Converts the named inputs (resolving dtypes, then Python
+        # constants, then sequences), builds one node with the given output count, appends it to
+        # the recorded node list and returns its outputs. Wraps any failure in
+        # GraphConstructionError (raised from the original). KNOWN ISSUE: docstring omits
+        # num_outputs.
         """Record nodes for the given opschema and arguments.
 
         Args:
@@ -614,6 +675,10 @@ class OpRecorder(evaluator.Evaluator):
         args: Sequence[AllowedArgType],  # type: ignore[override]
         kwargs: Mapping[str, AllowedArgType],
     ) -> _tensors.SymbolicTensor | Sequence[_tensors.SymbolicTensor]:
+        # [FUNCTION DOC] Evaluator entry for a plain ONNX op: derives the signature from the
+        # schema, binds args and kwargs, decides the output count, records the node and returns
+        # the single output or the sequence of outputs. Side effect: appends a node. Wraps any
+        # failure in GraphConstructionError.
         try:
             op_signature = ir.schemas.OpSignature.from_op_schema(schema)
             named_inputs, named_attrs = _construct_named_inputs_and_attrs(
@@ -637,6 +702,13 @@ class OpRecorder(evaluator.Evaluator):
         args: Sequence[AllowedArgType],
         kwargs: Mapping[str, AllowedArgType],
     ) -> _tensors.SymbolicTensor | Sequence[_tensors.SymbolicTensor] | bool | int:
+        # [FUNCTION DOC] Evaluator entry for an onnxscript function. Gets (and caches on the
+        # function) its signature, binds args and kwargs. A traceable function is called
+        # directly with Python-constant-converted inputs and its result returned, so its inner
+        # ops get recorded. Otherwise records a call node, registers the function in the used
+        # function mapping and returns the output(s). Failures become GraphConstructionError.
+        # KNOWN ISSUE: the error message expression has a conditional with wrong precedence, so
+        # when the source file is unknown the whole message becomes an empty string.
         try:
             # NOTE: signature should be written to function in the registration process
             if hasattr(function, "_pt_onnx_signature"):

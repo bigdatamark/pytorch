@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Core of the dynamo-based ONNX exporter. Converts a torch.export ExportedProgram
+# (or a model captured into one) into an ONNX IR model: dtype mapping, a torch-tensor-backed IR
+# tensor, shape/type annotation, FX node translation (with or without lowering to torchlib
+# functions), subgraph handling, graph/model construction, optimization and export entry points
+# (including the error report and verification options). Import-time side effects: builds the
+# dtype table and step error message constants, creates the logger, and defines the module-level
+# current_tracer, which holds the OpRecorder active while a torchlib function is being traced.
 
 from __future__ import annotations
 
@@ -106,11 +113,21 @@ current_tracer: _building.OpRecorder | None = None
 
 
 def torch_dtype_to_onnx_dtype(dtype: torch.dtype) -> ir.DataType:
+    # [FUNCTION DOC] Looks up the ONNX IR data type for a torch dtype in the module table.
+    # Raises KeyError for unsupported dtypes. No side effects.
     return _TORCH_DTYPE_TO_ONNX[dtype]
 
 
 class TorchTensor(ir.Tensor):
+    # [CLASS DOC] IR tensor whose raw storage is a torch tensor, so initializers can wrap model
+    # weights without copying to NumPy. The ONNX dtype comes from the torch dtype; packed
+    # float4 tensors report an unpacked shape. Supports conversion to NumPy (viewing
+    # non-NumPy dtypes through same-size unsigned ints), raw byte export directly from tensor
+    # memory (fake tensors are rejected), and writing to files.
     def __init__(self, tensor: torch.Tensor, name: str | None = None) -> None:
+        # [FUNCTION DOC] Wraps the torch tensor as raw data with the mapped ONNX dtype and
+        # optional name. For the packed float4 dtype the shape is the unpacked shape; otherwise
+        # the base class derives the shape. Raises KeyError for unsupported dtypes.
         # Pass the tensor as the raw data to ir.Tensor's constructor
         if tensor.dtype == torch.float4_e2m1fn_x2:
             # Change the shape to the unpacked shape
@@ -126,6 +143,9 @@ class TorchTensor(ir.Tensor):
         )
 
     def numpy(self) -> npt.NDArray:
+        # [FUNCTION DOC] Returns the tensor data as a NumPy array (moved to CPU as needed).
+        # bfloat16 and float8 dtypes are viewed through unsigned ints and reinterpreted with the
+        # ml_dtypes dtype; float4 is unpacked to bytes then reinterpreted; others convert directly.
         self.raw: torch.Tensor
 
         # Handle dtypes that are not natively supported by NumPy:
@@ -152,12 +172,18 @@ class TorchTensor(ir.Tensor):
         return self.raw.numpy(force=True)
 
     def __array__(self, dtype: Any = None, copy: bool | None = None) -> npt.NDArray:
+        # [FUNCTION DOC] NumPy array protocol: returns the numpy conversion, cast to the dtype
+        # when one is given. The copy argument is ignored.
         del copy  # Unused, but needed for the signature
         if dtype is None:
             return self.numpy()
         return self.numpy().__array__(dtype)
 
     def _get_cbytes(self):
+        # [FUNCTION DOC] HELPER: Detaches the raw tensor to a contiguous CPU tensor with fake
+        # mode temporarily disabled and returns (tensor, ctypes byte array over its memory); the
+        # tensor must be kept alive while the array is used. Raises TypeError if the result is
+        # still a fake tensor.
         """Get a ctypes byte array pointing to the tensor data."""
         import torch._subclasses.fake_tensor
 
@@ -178,6 +204,9 @@ class TorchTensor(ir.Tensor):
         ).from_address(tensor.data_ptr())
 
     def tobytes(self) -> bytes:
+        # [FUNCTION DOC] Returns the raw tensor bytes (little endian). On big-endian machines
+        # defers to the base class; otherwise reads tensor memory directly. Raises TypeError for
+        # fake tensors.
         # On big-endian machines, call the super's tobytes() which returns a little-endian result.
         if sys.byteorder == "big":
             return super().tobytes()
@@ -188,6 +217,8 @@ class TorchTensor(ir.Tensor):
         return bytes(data)
 
     def tofile(self, file) -> None:
+        # [FUNCTION DOC] Writes the raw tensor bytes to the open binary file (base class on
+        # big-endian machines) and returns the write result. Raises TypeError for fake tensors.
         # On big-endian machines, call the super's tofile() which returns a little-endian result.
         if sys.byteorder == "big":
             return super().tofile(file)
@@ -220,6 +251,9 @@ def _set_shape_types(
     meta_vals: Sequence[torch.Tensor],
     complex_to_float: bool = True,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Sets dtype and shape on each IR value from the matching metadata
+    # value, pairing them in order (extra items on either side are ignored). A non-sequence
+    # metadata value is logged as a warning and wrapped in a one-item tuple. Mutates the values.
     if not isinstance(meta_vals, Sequence):
         logger.warning(
             "Expected meta_vals to be a sequence, but got %s. There may be an internal error.",
@@ -239,6 +273,12 @@ def _set_shape_type(
     | tuple[torch.Tensor],
     complex_to_float: bool,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Sets dtype and shape of an IR value from a fake-tensor metadata
+    # value. Tensors: dims are ints or the string form of symbolic sizes; the dtype is set only
+    # if unset, and a complex dtype becomes its real dtype with a trailing dim of two when
+    # complex_to_float is true; the shape is always replaced. Symbolic or plain ints become
+    # int64 scalars, bools become bool scalars, floats become float scalars. Tuples only log a
+    # warning (and are then ignored). Mutates the value.
     if isinstance(meta_val, tuple):
         logger.warning("Setting shape and type of tensors is not supported yet")
     if isinstance(meta_val, torch.Tensor):
@@ -284,6 +324,8 @@ def _set_shape_type(
 
 
 def _get_qualified_module_name(cls: Any) -> str:
+    # [FUNCTION DOC] HELPER: Returns a string unchanged; for a class returns its dotted
+    # module-qualified name, or just the class name when the module is missing or builtins.
     if isinstance(cls, str):
         return cls
     module = cls.__module__
@@ -293,6 +335,10 @@ def _get_qualified_module_name(cls: Any) -> str:
 
 
 def _get_node_namespace(node: torch.fx.Node) -> tuple[str, list[str], list[str]]:
+    # [FUNCTION DOC] HELPER: Builds module-scope metadata for an FX node from its module stack:
+    # a slash-joined namespace of "scope: class" entries ending with the node name and target,
+    # the list of class names ending with the target, and the list of scope names ending with
+    # the node name. Without a module stack it logs a warning and returns node-only values.
     """Get the namespace and scope of the node.
 
     Example::
@@ -338,6 +384,9 @@ def _get_node_namespace(node: torch.fx.Node) -> tuple[str, list[str], list[str]]
 
 
 def _set_node_metadata(fx_node: torch.fx.Node, ir_node: ir.Node) -> None:
+    # [FUNCTION DOC] HELPER: Writes namespace, class hierarchy, name scopes, formatted FX node
+    # text and stack trace (empty if absent) into the IR node's metadata properties. Mutates
+    # the IR node.
     """Adds namespace and other node metadata to the ONNX node."""
     namespace, class_hierarchy, name_scopes = _get_node_namespace(fx_node)
     ir_node.metadata_props["namespace"] = namespace
@@ -352,6 +401,10 @@ def _set_node_metadata(fx_node: torch.fx.Node, ir_node: ir.Node) -> None:
 def _handle_getitem_node(
     node: torch.fx.Node, node_name_to_values: dict[str, ir.Value | Sequence[ir.Value]]
 ) -> ir.Value:
+    # [FUNCTION DOC] HELPER: For an index-into-sequence FX node, takes the value at the node's
+    # index from its single input's recorded sequence of values, records it under the node name
+    # in the mapping, renames the value to the node name, and returns it. Raises AssertionError
+    # unless there is exactly one input node and its recorded outputs are a sequence.
     """Handle a getitem node.
 
     Add the input value it is getting to the mapping, then return the value.
@@ -384,6 +437,12 @@ def _handle_call_function_node(
     node: torch.fx.Node,
     node_name_to_values: dict[str, ir.Value | Sequence[ir.Value]],
 ) -> None:
+    # [FUNCTION DOC] HELPER: Translates a call_function node without lowering: emits one node in
+    # the pkg.torch.ops domain named after the target, with inputs from earlier values (getitem
+    # inputs resolved), non-node arguments as attributes named by position, and outputs typed
+    # from node metadata (not converting complex to float). Records outputs in the mapping,
+    # attaches the FX node and metadata, appends to the graph. KNOWN ISSUE: for a getitem node
+    # it handles the getitem and then still falls through and emits a node.
     """Handle a call_function node.
 
     Args:
@@ -440,6 +499,11 @@ def _convert_fx_arg_to_onnx_arg(
     node_name_to_values: dict[str, ir.Value | Sequence[ir.Value]],
     node_name_to_local_functions: dict[str, ir.Function],
 ) -> Any:
+    # [FUNCTION DOC] HELPER: Recursively converts an FX argument: none stays none; named nodes
+    # map to their recorded IR value (getitem of a sequence is resolved; get_attr nodes map to
+    # a recorded value or to a local function); lists and tuples become lists; device, memory
+    # format and layout become strings; torch dtypes become ONNX dtypes; others pass through.
+    # Raises KeyError for unknown node names.
     """Convert an FX argument to an ONNX compatible argument.
 
     This function
@@ -492,10 +556,14 @@ def _convert_fx_arg_to_onnx_arg(
 
 
 def _get_onnxscript_opset(opset_version: int) -> onnxscript.values.Opset:
+    # [FUNCTION DOC] HELPER: Returns the onnxscript opset object for the default domain at the
+    # given version.
     return onnxscript.values.Opset("", opset_version)
 
 
 def _is_onnx_op(op: Any) -> bool:
+    # [FUNCTION DOC] HELPER: True if the object is an op overload whose qualified name starts
+    # with the onnx namespace prefix.
     """Whether the op overload is an ONNX custom op implemented with PyTorch."""
     if not isinstance(op, torch._ops.OpOverload):
         return False
@@ -503,6 +571,8 @@ def _is_onnx_op(op: Any) -> bool:
 
 
 def _parse_onnx_op(op: torch._ops.OpOverload) -> tuple[str, int]:
+    # [FUNCTION DOC] HELPER: Strips the onnx namespace prefix and splits at the opset suffix,
+    # returning (op type, integer opset version). Raises ValueError if no numeric suffix exists.
     """Parse the ONNX custom op overload name to get the op type and opset version."""
     name = op.name()[len("onnx::") :]
     name, _, opset = name.partition(".opset")
@@ -520,6 +590,14 @@ def _handle_call_function_node_with_lowering(
     opset: onnxscript.values.Opset,
     node_name_to_local_functions: dict[str, ir.Function],
 ) -> None:
+    # [FUNCTION DOC] HELPER: Translates a call_function node by lowering to ONNX. Getitem on a
+    # sequence is resolved and returns. Arguments are converted (a none dtype keyword becomes
+    # minus one). Direct onnx-namespace ops become one node (trailing none inputs stripped).
+    # Other targets are dispatched through the registry (raises DispatchError if none) and the
+    # function is traced with an OpRecorder installed as the module-level current tracer and
+    # default evaluator (failures raise GraphConstructionError); used functions are copied into
+    # the model. Outputs are typed from metadata, renamed after the node (indexed when several)
+    # and producers renamed, nodes get metadata and are added to the graph.
     """Translate a call_function node to an ONNX node.
 
     Args:
@@ -672,6 +750,9 @@ def _handle_placeholder_node(
     lower: str,
     opset: onnxscript.values.Opset,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Creates a symbolic tensor for a placeholder (graph input) node,
+    # typed from node metadata (complex becomes real with a trailing dim unless lowering is
+    # none), records it in the mapping, and appends it to the graph's inputs.
     # Placeholder nodes are user inputs
     # We need to create a new tensor for each user input
     # and add it to the graph's inputs
@@ -690,6 +771,9 @@ def _handle_get_attr_node(
     owned_graphs: Mapping[str, ir.Function],
     node_name_to_local_functions: dict[str, ir.Function],
 ) -> None:
+    # [FUNCTION DOC] HELPER: Maps the node name to the owned subgraph function named by the
+    # node target, in the local function mapping. A non-string target only logs a warning and
+    # returns. Raises KeyError if the subgraph is unknown.
     """Handle a get_attr node by assigning the corresponding ONNX function to the node name.
 
     An example ExportedProgram that has uses get_attr nodes is:
@@ -734,6 +818,10 @@ def _handle_output_node(
     node_name_to_values: dict[str, ir.Value | Sequence[ir.Value]],
     graph_like: ir.Graph | ir.Function,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Appends the values of the output node's arguments to the graph's
+    # outputs (a tuple of arguments is flattened; none entries are skipped with a warning).
+    # KNOWN ISSUE: when an output maps to a sequence of values, those values are added and the
+    # function returns immediately, silently skipping any remaining outputs.
     """Handle an output node by adding the output to the graph's outputs.
 
     Args:
@@ -773,6 +861,13 @@ def _translate_fx_graph(
     lower: Literal["at_conversion", "none"],
     registry: _registration.ONNXRegistry,
 ) -> dict[str, ir.Value | Sequence[ir.Value]]:
+    # [FUNCTION DOC] HELPER: Walks the FX graph nodes in order and translates each into the
+    # given graph or function: placeholders become inputs, call_function nodes are lowered or
+    # emitted raw by the lowering mode, get_attr nodes become local subgraph functions or
+    # (for lifted tensor constants) initializers in the root graph or inline Constant nodes in
+    # function scope (KeyError if neither), output nodes set outputs. Any failure is wrapped in
+    # ConversionError. Returns the node-name to value mapping. KNOWN ISSUE: the docstring lists
+    # arguments (current_scope, graph_name, graph) that do not exist in the signature.
     """Translate a submodule to an ONNX function.
 
     Any functions used by the traced functions will be added to the model.
@@ -893,6 +988,16 @@ def _translate_fx_graph(
 def _get_inputs_and_attributes(
     node: torch.fx.Node,
 ) -> tuple[list[torch.fx.Node | None], dict[str, Any], list[str], list[str]]:
+    # [FUNCTION DOC] HELPER: Splits an ATen call node into ONNX inputs and attributes using its
+    # schema. Requires the target to have a schema (AssertionError otherwise). Positional
+    # arguments that are none, nodes, or sequences of those become inputs (with the schema
+    # argument name recorded per input); devices and dtypes become string and ONNX dtype
+    # attributes; other values become attributes by schema name. Schema-named keyword arguments
+    # become attributes (layout, device, requires_grad, memory_format, implicit and devices as
+    # strings, dtypes converted). Builtin targets use all positional args as inputs. Output
+    # names are the node name joined with each schema return name. Returns
+    # (inputs, attributes, input_names, output_names). KNOWN ISSUE: the docstring is a
+    # misleading summary; keyword arguments that are nodes become attributes, not inputs.
     """Find and Fill in the not provided kwargs with default values.
 
     Returns:
@@ -958,6 +1063,8 @@ def _get_inputs_and_attributes(
 
 
 def _maybe_start_profiler(should_profile: bool) -> Any:
+    # [FUNCTION DOC] HELPER: When requested, imports pyinstrument (ImportError if missing),
+    # starts a synchronous profiler and returns it; otherwise returns none.
     if should_profile:
         import pyinstrument  # type: ignore[import-not-found]
 
@@ -968,6 +1075,8 @@ def _maybe_start_profiler(should_profile: bool) -> Any:
 
 
 def _maybe_stop_profiler_and_get_result(profiler) -> str | None:
+    # [FUNCTION DOC] HELPER: Returns none for no profiler; otherwise stops it and returns its
+    # text report.
     if profiler is None:
         return None
     profiler.stop()
@@ -975,11 +1084,14 @@ def _maybe_stop_profiler_and_get_result(profiler) -> str | None:
 
 
 def _format_exception(e: Exception) -> str:
+    # [FUNCTION DOC] HELPER: Returns the exception's full traceback text, lines joined by newlines.
     """Format the full traceback as Python would show it."""
     return "\n".join(traceback.format_exception(type(e), e, e.__traceback__))
 
 
 def _summarize_exception_stack(e: BaseException) -> str:
+    # [FUNCTION DOC] HELPER: Follows the chain of causes from the exception, then returns a
+    # markdown-style summary listing type and message of each exception, root cause first.
     """Format the exception stack by showing the text of each exception."""
     causes = [e]
     while e.__cause__ is not None:
@@ -995,6 +1107,9 @@ def _summarize_exception_stack(e: BaseException) -> str:
 def _format_exceptions_for_all_strategies(
     results: list[_capture_strategies.Result],
 ) -> str:
+    # [FUNCTION DOC] HELPER: For each capture result that recorded an exception, produces a
+    # heading naming the strategy followed by the full traceback; returns them newline-joined
+    # (empty string if none).
     """Format all the exceptions from the capture strategies."""
     return "\n".join(
         [
@@ -1012,6 +1127,10 @@ def exported_program_to_ir(
     registry: _registration.ONNXRegistry | None = None,
     lower: Literal["at_conversion", "none"] = "at_conversion",
 ) -> ir.Model:
+    # [FUNCTION DOC] Public helper: converts an ExportedProgram into an ONNX IR model. Uses the
+    # torchlib registry when none is given. Unless lowering is none, first decomposes and
+    # prepares the program (see _prepare_exported_program_for_export), then translates it and
+    # returns only the model. Side effects: may mutate the program's graph module.
     """Convert an exported program to an ONNX IR model.
 
     Reference:
@@ -1040,6 +1159,10 @@ def _prepare_exported_program_for_export(
     *,
     registry: _registration.ONNXRegistry,
 ) -> torch.export.ExportedProgram:
+    # [FUNCTION DOC] HELPER: Under backed size oblivious mode, decomposes the program using the
+    # registry (keeping ops that ONNX implements), inserts explicit type promotion nodes into
+    # the graph module, removes assertion nodes, stores the resulting graph module on the
+    # program (private attribute mutation) and returns the program.
     """Decompose and apply pre-export transformations to the exported program."""
 
     with (
@@ -1061,6 +1184,8 @@ def _prepare_exported_program_for_export(
 
 
 def _get_scope_name(scoped_name: str) -> tuple[str, str]:
+    # [FUNCTION DOC] HELPER: Splits a dotted name at its last dot into (scope, name); a name
+    # with no dot has an empty scope.
     """Get the scope and name of a node.
 
     Examples::
@@ -1092,6 +1217,17 @@ def _exported_program_to_onnx_program(
     registry: _registration.ONNXRegistry,
     lower: Literal["at_conversion", "none"] = "at_conversion",
 ) -> _onnx_program.ONNXProgram:
+    # [FUNCTION DOC] Builds an ONNX IR model from an already decomposed program and wraps it in
+    # an ONNXProgram. Steps: create the model with graph signature and range constraint
+    # metadata; translate every submodule graph innermost first (non-root ones become local
+    # functions, made visible to their parent scope) and the root graph; rebuild graph inputs
+    # (user inputs first) and initializers from input specs and outputs from output specs,
+    # tagging values with spec kinds (constant arguments skipped); rename initializers to their
+    # parameter, buffer or constant names (keeping the original node name in metadata);
+    # attach torch tensors as initializer data (complex viewed as real when lowering) with
+    # shapes and types; add opset imports. Raises AssertionError for inconsistent state,
+    # TypeError for bad output values, NotImplementedError for non-tensor initializer data,
+    # and KeyError for unknown names. Logs warnings for multi-valued outputs.
     """Convert an exported program to an ONNX Program.
 
     The exported_program field in the returned ONNXProgram is one that is after
@@ -1326,6 +1462,9 @@ def _exported_program_to_onnx_program(
 
 
 def _verbose_printer(verbose: bool | None) -> Callable[..., None]:
+    # [FUNCTION DOC] HELPER: Returns a print function: a no-op if verbose is exactly false,
+    # otherwise one printing to stdout with a torch.onnx prefix (none counts as verbose).
+    # Duplicates the helper of the same name in the capture strategies module.
     """Prints messages based on `verbose`."""
     if verbose is False:
         return lambda *_, **__: None
@@ -1356,6 +1495,17 @@ def export(
     optimize: bool = True,
     opset_version: int | None = None,
 ) -> _onnx_program.ONNXProgram:
+    # [FUNCTION DOC] Main export pipeline, run with the onnx-exporting flag set. Step 1: use the
+    # given ExportedProgram or try each capture strategy in order until one succeeds; if all
+    # fail, optionally write an error report and raise TorchExportError (first failure as the
+    # cause). Optionally dump the program to a file. Step 2: build the registry (torchlib by
+    # default) and decompose; failure raises ConversionError. Step 3: translate to ONNX; failure
+    # raises ConversionError. Then optionally convert the opset, optimize, and rename inputs and
+    # outputs. With verify, runs the ONNX checker (failure only warns) and ONNX Runtime
+    # verification with accuracy thresholds (failures only warn). Report generation and
+    # profiling write to the artifacts directory (created when needed). Returns the ONNXProgram.
+    # KNOWN ISSUE: the model type annotation includes script modules but no step handles them
+    # beyond the capture strategies.
     """Export a PyTorch model to ONNXProgram.
 
     Args:

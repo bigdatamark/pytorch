@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Helpers that relate the ONNX registry to PyTorch decompositions: listing the
+# torch ops the registry implements, and building a decomposition table of ops that lack an
+# ONNX implementation. No import-time side effects beyond imports.
 from __future__ import annotations
 
 import itertools
@@ -17,6 +20,10 @@ if TYPE_CHECKING:
 def get_onnx_implemented_overloads(
     registry: _registration.ONNXRegistry,
 ) -> list[_registration.TorchOp]:
+    # [FUNCTION DOC] Returns a list with one torch op target per entry of the registry's
+    # function mapping, taking the fx target of the first decomposition metadata of each entry.
+    # Args: registry. Raises AssertionError if any entry has an empty metadata list.
+    # No side effects.
     """
     Creates a set of OperatorBase and Callable objects that represent ONNX-supported PyTorch operations.
 
@@ -40,6 +47,12 @@ def get_onnx_implemented_overloads(
 def create_onnx_friendly_decomposition_table(
     onnx_registered_ops: set[_registration.TorchOp],
 ) -> dict[_registration.TorchOp, Callable]:
+    # [FUNCTION DOC] Builds a mapping from op overload to decomposition function, drawn first
+    # from the torch.export default decompositions and then from the general decomposition
+    # table (first occurrence wins). Skips ops already implemented in ONNX (the given set) and
+    # entries without a schema (higher-order ops). Returns the new mapping; no side effects.
+    # KNOWN ISSUE: the docstring says ops are excluded when they have an "ONNX symbolic
+    # function", but the check is membership in the registered-ops set argument.
     """
     This function creates a dictionary of op overloads and their decomposition functions
     for ops that do not have ONNX symbolic functions. If an op already has an ONNX symbolic function,

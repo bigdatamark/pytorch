@@ -2,6 +2,10 @@
 
 # mypy: allow-untyped-defs
 # mypy: disable-error-code=attr-defined
+# [MODULE DOC] Compatibility layer that lets the legacy torch.onnx.export signature drive the
+# dynamo-based exporter in _core. Contains an argument-splitting helper and export_compat, which
+# normalizes arguments, builds a registry, runs the export and optionally saves the result.
+# Import-time side effects: creates the module logger only.
 from __future__ import annotations
 
 import io
@@ -33,6 +37,9 @@ def _get_torch_export_args(
     args: tuple[Any, ...],
     kwargs: dict[str, Any] | None,
 ) -> tuple[tuple[Any, ...], dict[str, Any] | None]:
+    # [FUNCTION DOC] HELPER: If no kwargs were given and the last positional argument is a
+    # dict, treats that dict as the keyword arguments and drops it from the positional ones.
+    # Returns the (args, kwargs) pair; does not mutate its inputs.
     """Obtain the arguments for torch.onnx.export from the model and the input arguments."""
     if not kwargs and args and isinstance(args[-1], dict):
         kwargs = args[-1]
@@ -68,6 +75,15 @@ def export_compat(
     dump_exported_program: bool = False,
     artifacts_dir: str | os.PathLike = ".",
 ) -> _onnx_program.ONNXProgram:
+    # [FUNCTION DOC] Exports a model with the legacy torch.onnx.export argument set via the
+    # dynamo exporter. Steps: default the opset; warn if the module is in training mode; for an
+    # ExportableModule with no args, fill args, names and dynamic shapes from it; for non-exported
+    # models, split kwargs and convert dynamic_axes to dynamic_shapes (warns; raises RuntimeError
+    # on conversion failure); convert string dims to export dims; clamp the registry opset to at
+    # least the torchlib opset (logs a warning); build the torchlib registry plus custom
+    # translations (raises TypeError if a value is a sequence); call _core.export; rename dynamic
+    # axes if needed; save to f when given (BytesIO triggers a DeprecationWarning).
+    # Returns the ONNXProgram. Side effects: warnings, logging, file writes.
     if opset_version is None:
         opset_version = onnx_constants.ONNX_DEFAULT_OPSET
 
