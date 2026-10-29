@@ -1,5 +1,11 @@
 # Owner(s): ["module: cuda"]
 # run time cuda tests, but with the allocator using expandable segments
+# [MODULE DOC] Re-runs the TestAotCudagraphs tests from dynamo/test_cudagraphs.py with the
+# CUDA caching allocator set to expandable segments. On import it appends the test directory
+# to the module search path, imports that test class (so the runner collects it), and
+# temporarily puts the repo root on the search path to import get_disabled_tests, removing it
+# afterwards. When run as a script on a CUDA machine (not Jetson or Windows) it fetches the
+# disabled-tests list into the current directory, enables the allocator setting, and runs tests.
 
 import os
 import pathlib

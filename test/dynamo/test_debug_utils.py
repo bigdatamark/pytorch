@@ -1,4 +1,11 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests for torch._dynamo.debug_utils and the debug override configs that
+# route individual compiled graphs to different backends / inductor / dynamo settings.
+# Covers storage-size serialization, repro-script import generation, fp64 casting, env-var
+# string generation, nvcc probing errors, AOT graph input parsing, NNModule-to-source
+# conversion, and per-graph-id override routing. Defines dtype aliases f32/i64/i32; device
+# generic classes are instantiated at import time into the module globals via
+# instantiate_device_type_tests.
 
 import ast
 import math
@@ -27,7 +34,14 @@ i32 = torch.int32
 
 
 class TestDebugUtils(TestCase):
+    # [CLASS DOC] Device-independent tests of debug_utils helpers: storage size
+    # serialization, repro string imports, fp64 casting, env var strings, nvcc errors.
     def test_serialize_symbolic_storage_nbytes(self):
+        # [FUNCTION DOC] Builds a symbolic integer storage size from a shape-env symbol and
+        # checks that its serialized source has no Max call and, evaluated with a max
+        # builtin for several symbol values, equals the sympy-substituted result. Also checks
+        # that a floor expression is serialized using the math floor function and evaluates
+        # correctly.
         from sympy import floor
 
         from torch._dynamo.source import ConstantSource
@@ -58,6 +72,9 @@ class TestDebugUtils(TestCase):
         )
 
     def test_repro_templates_import_symexpr_dependencies(self):
+        # [FUNCTION DOC] Generates the after-AOT and after-dynamo repro scripts for a traced
+        # add-one graph, parses each, executes only its import statements in a fresh
+        # namespace, and asserts the math module is available there (floor of 3/2 is 1).
         from torch._dynamo.repro.after_aot import generate_compiler_repro_string
         from torch._dynamo.repro.after_dynamo import generate_dynamo_fx_repro_string
 
@@ -86,9 +103,15 @@ class TestDebugUtils(TestCase):
                 self.assertEqual(eval("math.floor(3 / 2)", namespace), 1)
 
     def test_cast_model_to_fp64_dtype_args(self):
+        # [FUNCTION DOC] Traces a function with make_fx and core ATen decompositions,
+        # asserts the generated code uses float16/float32 dtypes, then applies the debug
+        # cast-to-fp64 helper in place and asserts the example inputs become float64 and every
+        # dtype argument in the graph code is rewritten to float64.
         # Test that dtype arguments are converted to fp64
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns a tuple of a prim dtype conversion to half, a
+            # to-half cast, a float32 full tensor and a new empty tensor, all shaped like x.
             return (
                 torch.ops.prims.convert_element_type(x, torch.float16),
                 x.to(torch.float16),
@@ -139,6 +162,11 @@ def forward(self, x_1):
         },
     )
     def test_generate_env_vars_string(self):
+        # [FUNCTION DOC] With a patched environment, checks the generated env var string
+        # contains an import of os, assignments for inductor variables (single quotes in a
+        # value are expected to come out as double quotes), omits unrelated variables, omits
+        # assignments for the repro-after and repro-level variables and instead emits pop
+        # statements for them.
         env_strings = generate_env_vars_string()
         self.assertIn(
             """os.environ['TORCHINDUCTOR_MAX_AUTOTUNE'] = '1'
@@ -171,6 +199,11 @@ def forward(self, x_1):
         self.assertIn("os.environ.pop('TORCHDYNAMO_REPRO_LEVEL', None)", env_strings)
 
     def test_cuda_system_info_comment_nvcc_os_errors(self):
+        # [FUNCTION DOC] For a permission error and a generic OS error, clears the cache
+        # of the cuda system info comment helper, mocks CUDA as available (non-HIP) with
+        # the nvcc subprocess raising that error and zero devices, and asserts the result
+        # reports nvcc not found and an empty GPU hardware line. The cache is cleared again
+        # at cleanup.
         self.addCleanup(debug_utils._cuda_system_info_comment.cache_clear)
         errors = (
             PermissionError(13, "Permission denied", "nvcc"),
@@ -197,7 +230,12 @@ def forward(self, x_1):
 
 
 class TestDebugUtilsDevice(TestCase):
+    # [CLASS DOC] Device-generic tests of the AOT graph input parser; instantiated per
+    # device (excluding mps, allowing xpu) by instantiate_device_type_tests.
     def test_aot_graph_parser(self, device):
+        # [FUNCTION DOC] Defines a large AOT-style forward function whose parameters carry
+        # shape/dtype string annotations, asks the input parser to build matching tensors on
+        # the device, and asserts the function runs with those generated inputs.
         def forward(
             self,
             primals_1: "f32[1001, 6]",
@@ -208,6 +246,8 @@ class TestDebugUtilsDevice(TestCase):
             primals_6: "f32[1739, 4190]",
             primals_48: "f32[6144, 4191]",
         ):
+            # [FUNCTION DOC] HELPER: Sample traced graph (embedding bag over indexed
+            # inputs, using the enclosing device); returns the embedding bag output tuple.
             _tensor_constant0: "i64[4190]" = self._tensor_constant0
             lift_fresh_copy: "i64[4190]" = torch.ops.aten.lift_fresh_copy.default(
                 _tensor_constant0
@@ -285,6 +325,9 @@ class TestDebugUtilsDevice(TestCase):
         forward(**kwargs)
 
     def test_sym_aot_graph_parser(self, device):
+        # [FUNCTION DOC] Parses a forward signature that has symbolic sizes. With s0 mapped
+        # to 10 and a default of 5, asserts tensor inputs sized by s0 get length 10, the
+        # symbolic int for s0 equals 10, and those for s1 use the default 5.
         def forward(
             self,
             primals_1: "f32[1001, 6]",
@@ -293,6 +336,8 @@ class TestDebugUtilsDevice(TestCase):
             primals_4: "f32[s1]",  # noqa: F821,
             primals_5: "Sym(s1)",  # noqa: F821,
         ):
+            # [FUNCTION DOC] HELPER: Signature-only stub; its body reads one constant
+            # attribute and is never called, only inspected by the parser.
             _tensor_constant0: "i64[4190]" = self._tensor_constant0
 
         kwargs = aot_graph_input_parser(
@@ -307,7 +352,12 @@ class TestDebugUtilsDevice(TestCase):
 
 
 class TestNNModuleToStringBufferDevice(TestCase):
+    # [CLASS DOC] Device-generic tests that converting a graph module to source preserves
+    # buffer and parameter device placement; instantiated per device (xpu allowed).
     def test_nn_module_to_string_buffer_device(self, device):
+        # [FUNCTION DOC] Registers a buffer on the device in a traced identity module and
+        # converts it to source. On cpu asserts no device move appears; otherwise asserts the
+        # source moves the buffer to the concrete device string and not to the generic GPU type.
         gm = torch.fx.symbolic_trace(torch.nn.Identity())
         gm.register_buffer("test_buf", torch.empty(5, device=device))
 
@@ -321,6 +371,9 @@ class TestNNModuleToStringBufferDevice(TestCase):
             self.assertNotIn(f".{GPU_TYPE}()", result)
 
     def test_nn_module_to_string_param_device(self, device):
+        # [FUNCTION DOC] Same as the buffer test but with a registered parameter: on cpu the
+        # source has no device argument; otherwise it names the concrete device and does not
+        # name the generic GPU type.
         gm = torch.fx.symbolic_trace(torch.nn.Identity())
         gm.register_parameter(
             "test_param", torch.nn.Parameter(torch.empty(5, device=device))
@@ -348,16 +401,24 @@ instantiate_device_type_tests(
 
 
 class TestBackendOverrideIntegration(TestCase):
+    # [CLASS DOC] Device-generic tests of the debug backend override config, which maps
+    # rules on graph ids to backend names. Keeps a list of override backend names that
+    # were actually applied during a run; resets dynamo before and after each test.
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Calls the base setUp, resets dynamo state, and starts an
+        # empty list of backends called.
         super().setUp()
         torch._dynamo.reset()
         self._backends_called = []
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Resets dynamo state and calls the base tearDown.
         torch._dynamo.reset()
         super().tearDown()
 
     def _fn_with_4_graphs(self, x):
+        # [FUNCTION DOC] HELPER: Function with three explicit graph breaks (four graphs
+        # when compiled): add one, multiply by two, subtract one, divide by two.
         x = x + 1
         torch._dynamo.graph_break()
         x = x * 2
@@ -368,6 +429,14 @@ class TestBackendOverrideIntegration(TestCase):
         return x
 
     def _run_with_override(self, device, override_config, default_backend="eager"):
+        # [FUNCTION DOC] HELPER: Resets dynamo and the router cache, clears the recorded
+        # list, and pre-parses the semicolon separated rules (filter before the first
+        # colon, backend name after) into a graph id to backend name map for the first 100
+        # ids (first matching rule wins). Then patches the debug backend override config and
+        # the output graph's lookup to record the backend name for each graph where an
+        # override was found, compiles the four-graph function with the default backend on a
+        # random input of size 10, and returns a copy of the recorded names. Conflicting
+        # rules surface as errors from the compile.
         from torch._dynamo.graph_id_filter import (
             _create_backend_router,
             get_backend_override_for_compile_id,
@@ -400,6 +469,9 @@ class TestBackendOverrideIntegration(TestCase):
                         backend_str_map[graph_id] = backend_str
 
         def tracking_get_override(compile_id, config_str):
+            # [FUNCTION DOC] HELPER: Wrapper around the real override lookup; when it finds
+            # an override and the frame id has a known backend name, records that name.
+            # Returns the real result unchanged.
             result = original_get_override(compile_id, config_str)
             if result is not None:
                 graph_id = compile_id.frame_id
@@ -422,42 +494,54 @@ class TestBackendOverrideIntegration(TestCase):
         return self._backends_called.copy()
 
     def test_no_override(self, device):
+        # [FUNCTION DOC] An empty override config applies no overrides.
         result = self._run_with_override(device, "")
         self.assertEqual(result, [])
 
     def test_override_all_graphs(self, device):
+        # [FUNCTION DOC] A greater-or-equal-zero rule overrides all four graphs.
         result = self._run_with_override(device, ">=0:aot_eager")
         self.assertEqual(result, ["aot_eager", "aot_eager", "aot_eager", "aot_eager"])
 
     def test_override_greater_than(self, device):
+        # [FUNCTION DOC] A greater-than-zero rule overrides graphs 1 to 3 (three graphs).
         result = self._run_with_override(device, ">0:eager")
         self.assertEqual(result, ["eager", "eager", "eager"])
 
     def test_override_less_than(self, device):
+        # [FUNCTION DOC] A less-than-two rule overrides graphs 0 and 1.
         result = self._run_with_override(device, "<2:aot_eager")
         self.assertEqual(result, ["aot_eager", "aot_eager"])
 
     def test_override_less_or_equal(self, device):
+        # [FUNCTION DOC] A less-or-equal-one rule overrides graphs 0 and 1.
         result = self._run_with_override(device, "<=1:aot_eager")
         self.assertEqual(result, ["aot_eager", "aot_eager"])
 
     def test_override_single_id(self, device):
+        # [FUNCTION DOC] A rule naming graph id 1 overrides exactly one graph.
         result = self._run_with_override(device, "1:aot_eager")
         self.assertEqual(result, ["aot_eager"])
 
     def test_override_multiple_ids(self, device):
+        # [FUNCTION DOC] A comma separated id list (0 and 2) overrides those two graphs.
         result = self._run_with_override(device, "0,2:aot_eager")
         self.assertEqual(result, ["aot_eager", "aot_eager"])
 
     def test_override_range(self, device):
+        # [FUNCTION DOC] An inclusive id range (1 to 2) overrides two graphs.
         result = self._run_with_override(device, "1-2:eager")
         self.assertEqual(result, ["eager", "eager"])
 
     def test_multiple_rules(self, device):
+        # [FUNCTION DOC] Three rules for ids 0, 1 and 3 apply different backends; graph 2
+        # is not overridden, so three names are recorded in order.
         result = self._run_with_override(device, "0:aot_eager;1:inductor;3:eager")
         self.assertEqual(result, ["aot_eager", "inductor", "eager"])
 
     def test_conflicting_rules_raise(self, device):
+        # [FUNCTION DOC] Two overlapping rules naming different backends make compilation
+        # raise an internal dynamo error mentioning a conflicting backend override.
         with self.assertRaisesRegex(
             torch._dynamo.exc.InternalTorchDynamoError,
             "Conflicting backend override",
@@ -465,10 +549,15 @@ class TestBackendOverrideIntegration(TestCase):
             self._run_with_override(device, ">=0:aot_eager;>=1:inductor")
 
     def test_complex_config(self, device):
+        # [FUNCTION DOC] Combines an exact-id rule and a greater-or-equal rule that do not
+        # overlap: graph 0 gets one backend, graphs 2 and 3 another.
         result = self._run_with_override(device, "0:aot_eager;>=2:inductor")
         self.assertEqual(result, ["aot_eager", "inductor", "inductor"])
 
     def test_override_with_backward(self, device):
+        # [FUNCTION DOC] Compiles a sum-producing function with an override for all graphs
+        # and runs forward and backward on an input requiring grad. Asserts the override
+        # lookup returned a result only for frame 0 (once) and that the gradient exists.
         """Verify that backend override works when backward compilation occurs."""
         from torch._dynamo.graph_id_filter import (
             _create_backend_router,
@@ -481,12 +570,15 @@ class TestBackendOverrideIntegration(TestCase):
         original_get_override = get_backend_override_for_compile_id
 
         def tracking_get_override(compile_id, config_str):
+            # [FUNCTION DOC] HELPER: Calls the real override lookup and, when it finds an
+            # override, records the frame id. Returns the real result.
             result = original_get_override(compile_id, config_str)
             if result is not None:
                 overrides_applied.append(compile_id.frame_id)
             return result
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns the sum of x times two plus one.
             return (x * 2 + 1).sum()
 
         with (
@@ -513,15 +605,23 @@ instantiate_device_type_tests(
 
 
 class TestInductorConfigOverrideIntegration(TestCase):
+    # [CLASS DOC] Device-generic tests of the per-graph inductor config override: the
+    # config router parser (ids, ranges, comparisons, value typing, merging, conflicts),
+    # the backend router conflict rules, and end-to-end application of overrides. Resets
+    # dynamo around each test; instantiated for cpu, cuda and xpu only.
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Calls the base setUp and resets dynamo state.
         super().setUp()
         torch._dynamo.reset()
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Resets dynamo state and calls the base tearDown.
         torch._dynamo.reset()
         super().tearDown()
 
     def test_config_router_single_graph(self, device):
+        # [FUNCTION DOC] A rule for graph 0 yields a one-entry mapping for graph 0 and
+        # nothing (None) for graph 1.
         from torch._dynamo.graph_id_filter import GraphConfigRouter
 
         router = GraphConfigRouter("0:triton.cudagraph_skip_dynamic_graphs=False")
@@ -532,6 +632,7 @@ class TestInductorConfigOverrideIntegration(TestCase):
         self.assertIsNone(router.get_value_for_graph(1))
 
     def test_config_router_multiple_options(self, device):
+        # [FUNCTION DOC] Comma separated options in one rule are all returned for graph 0.
         from torch._dynamo.graph_id_filter import GraphConfigRouter
 
         router = GraphConfigRouter(
@@ -543,6 +644,7 @@ class TestInductorConfigOverrideIntegration(TestCase):
         )
 
     def test_config_router_comparison(self, device):
+        # [FUNCTION DOC] A greater-than-1 rule matches graph 2 only among graphs 0 to 2.
         from torch._dynamo.graph_id_filter import GraphConfigRouter
 
         router = GraphConfigRouter(">1:triton.cudagraphs=True")
@@ -551,6 +653,7 @@ class TestInductorConfigOverrideIntegration(TestCase):
         self.assertEqual(router.get_value_for_graph(2), {"triton.cudagraphs": True})
 
     def test_config_router_range(self, device):
+        # [FUNCTION DOC] An inclusive range 1 to 3 matches graphs 1, 2, 3 and not 0 or 4.
         from torch._dynamo.graph_id_filter import GraphConfigRouter
 
         router = GraphConfigRouter("1-3:triton.cudagraphs=False")
@@ -561,6 +664,8 @@ class TestInductorConfigOverrideIntegration(TestCase):
         self.assertIsNone(router.get_value_for_graph(4))
 
     def test_config_router_value_types(self, device):
+        # [FUNCTION DOC] Checks option values parse to bool, int, float, plain string and
+        # None according to their text.
         from torch._dynamo.graph_id_filter import GraphConfigRouter
 
         router = GraphConfigRouter(
@@ -574,6 +679,7 @@ class TestInductorConfigOverrideIntegration(TestCase):
         self.assertIsNone(config["none_opt"])
 
     def test_config_router_aggregation(self, device):
+        # [FUNCTION DOC] Options from all rules matching a graph are merged into one mapping.
         from torch._dynamo.graph_id_filter import GraphConfigRouter
 
         router = GraphConfigRouter("0:a=1;>=0:b=2")
@@ -583,12 +689,16 @@ class TestInductorConfigOverrideIntegration(TestCase):
         self.assertEqual(router.get_value_for_graph(1), {"b": 2})
 
     def test_config_router_conflict_raises(self, device):
+        # [FUNCTION DOC] Constructing a router whose overlapping rules set the same option
+        # to different values raises ValueError about a conflicting config override.
         from torch._dynamo.graph_id_filter import GraphConfigRouter
 
         with self.assertRaisesRegex(ValueError, "Conflicting config override"):
             GraphConfigRouter("0:a=1;>=0:a=2")
 
     def test_config_router_same_value_no_conflict(self, device):
+        # [FUNCTION DOC] Overlapping rules that set an option to the same value are not a
+        # conflict; graphs 0 and 1 both get that value.
         from torch._dynamo.graph_id_filter import GraphConfigRouter
 
         router = GraphConfigRouter("0:a=1;>=0:a=1")
@@ -596,6 +706,8 @@ class TestInductorConfigOverrideIntegration(TestCase):
         self.assertEqual(router.get_value_for_graph(1), {"a": 1})
 
     def test_config_router_aggregation_multiple_rules(self, device):
+        # [FUNCTION DOC] Three rules (two id-specific, one catch-all) merge per graph: graph
+        # 0 gets two options, graph 1 two different ones, graph 2 only the catch-all.
         from torch._dynamo.graph_id_filter import GraphConfigRouter
 
         router = GraphConfigRouter("0:a=1;1:b=2;>=0:c=3")
@@ -604,18 +716,24 @@ class TestInductorConfigOverrideIntegration(TestCase):
         self.assertEqual(router.get_value_for_graph(2), {"c": 3})
 
     def test_backend_router_conflict_raises(self, device):
+        # [FUNCTION DOC] Overlapping ranges naming different backends make the backend
+        # router constructor raise ValueError about a conflicting backend override.
         from torch._dynamo.graph_id_filter import GraphBackendRouter
 
         with self.assertRaisesRegex(ValueError, "Conflicting backend override"):
             GraphBackendRouter("0-5:eager;3-10:inductor")
 
     def test_backend_router_same_backend_no_conflict(self, device):
+        # [FUNCTION DOC] Overlapping rules naming the same backend construct fine and give
+        # a non-None result for graph 0.
         from torch._dynamo.graph_id_filter import GraphBackendRouter
 
         router = GraphBackendRouter("0:eager;>=0:eager")
         self.assertIsNotNone(router.get_value_for_graph(0))
 
     def test_get_inductor_config_override_empty(self, device):
+        # [FUNCTION DOC] With a None compile id and an empty config string, the inductor
+        # config lookup returns None.
         from torch._dynamo.graph_id_filter import (
             get_inductor_config_override_for_compile_id,
         )
@@ -624,6 +742,11 @@ class TestInductorConfigOverrideIntegration(TestCase):
         self.assertIsNone(result)
 
     def test_combined_backend_and_config_override(self, device):
+        # [FUNCTION DOC] Resets dynamo and router caches, patches both the backend and
+        # inductor config override settings, wraps the lookup and the config-wrapping hook
+        # to record calls, and compiles a three-graph function with the eager backend.
+        # Asserts all three graphs were routed to inductor and that the recorded config
+        # patches are merged per graph (graph 1 gets both of its matching rules).
         """
         Test combining backend override with config override.
 
@@ -644,6 +767,8 @@ class TestInductorConfigOverrideIntegration(TestCase):
         configs_applied: list[dict] = []
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Three-graph function (two explicit graph breaks):
+            # add one, multiply by two, subtract one.
             x = x + 1
             torch._dynamo.graph_break()
             x = x * 2
@@ -656,6 +781,8 @@ class TestInductorConfigOverrideIntegration(TestCase):
         original_wrap = output_graph._wrap_with_inductor_config
 
         def tracking_wrap(compiler_fn, config_patches):
+            # [FUNCTION DOC] HELPER: Records the config patches and delegates to the
+            # original wrapper, returning its result.
             configs_applied.append(config_patches)
             return original_wrap(compiler_fn, config_patches)
 
@@ -665,6 +792,8 @@ class TestInductorConfigOverrideIntegration(TestCase):
         original_get_backend = get_backend_override_for_compile_id
 
         def tracking_get_backend(compile_id, config_str):
+            # [FUNCTION DOC] HELPER: Calls the real backend override lookup and records
+            # the name inductor whenever an override is found; returns the real result.
             result = original_get_backend(compile_id, config_str)
             if result is not None:
                 backends_used.append("inductor")
@@ -710,6 +839,9 @@ class TestInductorConfigOverrideIntegration(TestCase):
         self.assertEqual(configs_applied[2], {"triton.cudagraphs": True})
 
     def test_multiple_config_overrides_with_backend(self, device):
+        # [FUNCTION DOC] Routes graphs 0 and 2 of a four-graph function to inductor and
+        # gives each a different inductor config override. Asserts two backend overrides
+        # and two config patches were recorded, each containing one of the expected patches.
         """
         Test multiple config overrides applied to different graphs with backend override.
 
@@ -729,6 +861,8 @@ class TestInductorConfigOverrideIntegration(TestCase):
         configs_applied: list[dict] = []
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Four-graph function (three explicit graph breaks):
+            # add one, multiply by two, subtract one, divide by two.
             x = x + 1
             torch._dynamo.graph_break()
             x = x * 2
@@ -743,6 +877,8 @@ class TestInductorConfigOverrideIntegration(TestCase):
         original_wrap = output_graph._wrap_with_inductor_config
 
         def tracking_wrap(compiler_fn, config_patches):
+            # [FUNCTION DOC] HELPER: Records the config patches and delegates to the
+            # original wrapper, returning its result.
             configs_applied.append(config_patches)
             return original_wrap(compiler_fn, config_patches)
 
@@ -767,6 +903,8 @@ class TestInductorConfigOverrideIntegration(TestCase):
         original_get_backend = get_backend_override_for_compile_id
 
         def tracking_get_backend(compile_id, config_str):
+            # [FUNCTION DOC] HELPER: Calls the real backend override lookup; if an override
+            # is found for a known frame id, records its backend name. Returns the result.
             result = original_get_backend(compile_id, config_str)
             if result is not None and compile_id.frame_id in backend_str_map:
                 backends_used.append(backend_str_map[compile_id.frame_id])
@@ -803,6 +941,11 @@ class TestInductorConfigOverrideIntegration(TestCase):
         self.assertIn({"triton.cudagraph_skip_dynamic_graphs": False}, configs_applied)
 
     def test_config_override_backward_propagation(self, device):
+        # [FUNCTION DOC] Compiles a three-graph function with overlapping inductor config
+        # override rules, with autograd cache disabled and compile_fx wrapped so the inner
+        # compile snapshots three tracked inductor options per (frame id, is-backward).
+        # Asserts every graph has forward and backward snapshots equal to the baseline plus
+        # that graph's expected overrides (no leakage across graphs), and that grad exists.
         """
         Verify that inductor config overrides are active at inductor compile
         time for both forward and backward, across multiple graph breaks.
@@ -824,6 +967,8 @@ class TestInductorConfigOverrideIntegration(TestCase):
         ]
 
         def _read_config(key):
+            # [FUNCTION DOC] HELPER: Returns the inductor config value at a dotted path,
+            # following attributes one segment at a time.
             obj = inductor_config
             for part in key.split("."):
                 obj = getattr(obj, part)
@@ -836,6 +981,9 @@ class TestInductorConfigOverrideIntegration(TestCase):
         original_inner_compile = compile_fx_mod.compile_fx_inner
 
         def tracking_inner_compile(gm, example_inputs, **kwargs):
+            # [FUNCTION DOC] HELPER: Snapshots the tracked inductor options under the current
+            # compile id and backward flag (taken from the is_backward keyword, default
+            # false), then delegates to the real inner compile and returns its result.
             compile_id = torch._guards.CompileContext.current_compile_id()
             is_backward = kwargs.get("is_backward", False)
             snapshot = {k: _read_config(k) for k in TRACKED_CONFIGS}
@@ -843,6 +991,8 @@ class TestInductorConfigOverrideIntegration(TestCase):
             return original_inner_compile(gm, example_inputs, **kwargs)
 
         def tracking_compile_fx(model_, example_inputs_, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Calls the real compile_fx, supplying the tracking inner
+            # compile when the caller did not pass one; returns its result.
             # Inject tracking inner_compile so compile_fx's config.patch
             # wrapping covers it for both forward and backward.
             if "inner_compile" not in kwargs:
@@ -850,6 +1000,8 @@ class TestInductorConfigOverrideIntegration(TestCase):
             return original_compile_fx(model_, example_inputs_, *args, **kwargs)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Three-graph function: affine step, sine, then
+            # exponential summed to a scalar, with graph breaks between them.
             y = x * 2 + 1
             torch._dynamo.graph_break()
             z = y.sin()
@@ -922,7 +1074,12 @@ instantiate_device_type_tests(
 
 
 class TestConfigOverrideValidation(TestCase):
+    # [CLASS DOC] Tests that invalid names in the debug override configs (backend, dynamo
+    # option, inductor option) raise ValueError when compiling. Clears the validation
+    # caches and resets dynamo around each test.
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Calls the base setUp, clears the cached validators for
+        # backend names, dynamo config keys and inductor config keys, and resets dynamo.
         super().setUp()
         from torch._dynamo.graph_id_filter import (
             _validate_backend_names,
@@ -936,6 +1093,7 @@ class TestConfigOverrideValidation(TestCase):
         torch._dynamo.reset()
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Resets dynamo state and calls the base tearDown.
         torch._dynamo.reset()
         super().tearDown()
 
@@ -943,7 +1101,10 @@ class TestConfigOverrideValidation(TestCase):
         debug_backend_override="0:not_a_real_backend",
     )
     def test_invalid_backend_raises_on_compile(self):
+        # [FUNCTION DOC] With an override naming an unknown backend, compiling and calling
+        # a small function raises ValueError mentioning the bad name.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns x plus one.
             return x + 1
 
         with self.assertRaisesRegex(ValueError, "not_a_real_backend"):
@@ -953,7 +1114,10 @@ class TestConfigOverrideValidation(TestCase):
         debug_dynamo_config_override="0:nonexistent_dynamo_option=True",
     )
     def test_invalid_dynamo_config_raises_on_compile(self):
+        # [FUNCTION DOC] With a dynamo config override naming a nonexistent option,
+        # compiling and calling a small function raises ValueError mentioning that option.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns x plus one.
             return x + 1
 
         with self.assertRaisesRegex(ValueError, "nonexistent_dynamo_option"):
@@ -963,7 +1127,10 @@ class TestConfigOverrideValidation(TestCase):
         debug_inductor_config_override="0:nonexistent_inductor_option=True",
     )
     def test_invalid_inductor_config_raises_on_compile(self):
+        # [FUNCTION DOC] With an inductor config override naming a nonexistent option,
+        # compiling and calling a small function raises ValueError mentioning that option.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns x plus one.
             return x + 1
 
         with self.assertRaisesRegex(ValueError, "nonexistent_inductor_option"):
@@ -971,11 +1138,16 @@ class TestConfigOverrideValidation(TestCase):
 
 
 class TestDynamoConfigOverrideIntegration(TestCase):
+    # [CLASS DOC] Tests per-graph dynamo config overrides (applied during each graph's
+    # compile) and the warning emitted when such a router is created. Resets dynamo
+    # around each test.
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Calls the base setUp and resets dynamo state.
         super().setUp()
         torch._dynamo.reset()
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Resets dynamo state and calls the base tearDown.
         torch._dynamo.reset()
         super().tearDown()
 
@@ -987,6 +1159,10 @@ class TestDynamoConfigOverrideIntegration(TestCase):
         ),
     )
     def test_dynamo_config_override_per_graph(self):
+        # [FUNCTION DOC] Compiles a three-graph function with a capturing backend that records
+        # three dynamo options per frame id while compiling. Asserts the overrides apply only
+        # to their targeted graphs (graph 0: float specialization on; graph 1: verbose on and
+        # recompile limit 10; graph 2: base values).
         """Per-graph dynamo config overrides target the right graphs.
 
         Graph 0: specialize_float overridden True (base False)
@@ -1000,6 +1176,8 @@ class TestDynamoConfigOverrideIntegration(TestCase):
         observed: dict[int, dict] = {}
 
         def capturing_backend(gm, example_inputs):
+            # [FUNCTION DOC] HELPER: Backend that stores the current values of three dynamo
+            # options under the current frame id and returns the graph module unchanged.
             fid = torch._guards.CompileContext.current_compile_id().frame_id
             observed[fid] = {
                 "specialize_float": torch._dynamo.config.specialize_float,
@@ -1009,6 +1187,8 @@ class TestDynamoConfigOverrideIntegration(TestCase):
             return gm
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Three-graph function: add one, multiply by two, subtract
+            # one, with graph breaks between.
             x = x + 1
             torch._dynamo.graph_break()
             x = x * 2
@@ -1028,6 +1208,9 @@ class TestDynamoConfigOverrideIntegration(TestCase):
         self.assertFalse(observed[2]["verbose"])
 
     def test_dynamo_config_override_warning(self):
+        # [FUNCTION DOC] Clears the dynamo config router cache and asserts that creating a
+        # router from a rule string emits a UserWarning mentioning the override environment
+        # variable.
         from torch._dynamo.graph_id_filter import _create_dynamo_config_router
 
         _create_dynamo_config_router.cache_clear()
