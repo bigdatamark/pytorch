@@ -1,4 +1,12 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests for Inductor combo kernels (horizontal fusion of independent Triton
+# kernels). Covers the debug logging of partition separation in the combo kernel partitioner,
+# and GPU end-to-end tests that compile small functions and check generated kernel counts,
+# generated Triton source (via FileCheck), profiler grid sizes, autotuning, mutation,
+# reductions, dynamic shapes and per-subkernel block sizes. Test classes are run both with and
+# without the per-subkernel-blocks option via subclasses. Import-time side effect: tries to
+# import check_model helpers from test_torchinductor and exits quietly (or re-raises) if that
+# import is skipped.
 
 import contextlib
 import json
@@ -57,23 +65,38 @@ except (unittest.SkipTest, ImportError) as e:
 
 
 class _Features:
+    # [CLASS DOC] HELPER: Minimal stand-in for a node features object. It stores a single flag
+    # set at construction and reports it through is_reduction; used only to build fake
+    # NodeInfo values.
     def __init__(self, is_reduction=False):
+        # [FUNCTION DOC] HELPER: Store the is_reduction flag (default false) on the instance.
         self._is_reduction = is_reduction
 
     def is_reduction(self):
+        # [FUNCTION DOC] HELPER: Return the stored reduction flag.
         return self._is_reduction
 
 
 class _PartitionLoggingNode:
+    # [CLASS DOC] HELPER: Fake scheduler node for partition tests. Its group attribute is a
+    # one-item list holding a pair of (no sizes, reduction numel), which is all the partitioner
+    # reads here.
     def __init__(self, rnumel=1):
+        # [FUNCTION DOC] HELPER: Build the fake node with group holding None and the
+        # given rnumel.
         self.group = [(None, rnumel)]
 
 
 def _optimization_hint(expr, fallback=None):
+    # [FUNCTION DOC] HELPER: Stand-in for the size-variable optimization hint: returns the
+    # expression unchanged and ignores the fallback argument.
     return expr
 
 
 def _make_node_info(x_hint, rnumel=1, is_reduction=False):
+    # [FUNCTION DOC] HELPER: Build a NodeInfo with an empty node schedule, tiling of x equal to
+    # x_hint and y equal to rnumel, numel equal to x_hint, the given rnumel, a fake features
+    # object carrying is_reduction, and persistent reduction disabled.
     return NodeInfo(
         node_schedule=[],
         tiling={"x": x_hint, "y": rnumel},
@@ -86,7 +109,16 @@ def _make_node_info(x_hint, rnumel=1, is_reduction=False):
 
 
 class ComboKernelPartitionLoggingTests(TestCase):
+    # [CLASS DOC] Tests that the combo kernel horizontal partitioner emits its "nodes are
+    # separated" debug messages once per distinct partition context (not once per equivalent
+    # recompile), and that the de-duplication cache resets when Inductor caches are cleared.
     def test_large_pointwise_separation_debug_log_uses_companion_context(self):
+        # [FUNCTION DOC] Large pointwise node (x above the large-numel threshold) plus a small
+        # companion is partitioned into two singleton groups, large first. Partitions three
+        # times: twice with equivalent node infos and once with a differently sized companion.
+        # Asserts the partition results and that the "large pointwise nodes are separated"
+        # debug message appears exactly twice (the equivalent repeat is de-duplicated, the
+        # different companion logs again). The de-dup cache is cleared before and after.
         large_x = int(LARGE_NUMELS) + 1
         large_node = _PartitionLoggingNode()
         small_node = _PartitionLoggingNode()
@@ -144,6 +176,10 @@ class ComboKernelPartitionLoggingTests(TestCase):
         self.assertEqual(len(large_pointwise_logs), 2)
 
     def test_long_reduction_separation_debug_log_uses_companion_context(self):
+        # [FUNCTION DOC] Same scenario for long reductions (reduction numel 4096 vs 1024): the
+        # short reduction is ordered before the long one in the partitions. Two equivalent runs
+        # plus one with a different short companion (rnumel 1536) must produce exactly two
+        # "long reduction nodes are separated" debug messages.
         long_node = _PartitionLoggingNode(rnumel=4096)
         short_node = _PartitionLoggingNode(rnumel=1024)
         equivalent_long_node = _PartitionLoggingNode(rnumel=4096)
@@ -205,6 +241,10 @@ class ComboKernelPartitionLoggingTests(TestCase):
         self.assertEqual(len(long_reduction_logs), 2)
 
     def test_long_reduction_log_with_very_large_reduction_split(self):
+        # [FUNCTION DOC] Partition a long reduction, a reduction whose x size equals the
+        # large-numel threshold, and a short reduction. Expects the order very-large, short,
+        # long, and exactly one "long reduction" message plus exactly one "very large
+        # reduction" message.
         long_node = _PartitionLoggingNode(rnumel=4096)
         very_large_node = _PartitionLoggingNode(rnumel=4096)
         short_node = _PartitionLoggingNode(rnumel=1024)
@@ -255,6 +295,10 @@ class ComboKernelPartitionLoggingTests(TestCase):
         )
 
     def test_partition_separation_debug_log_cache_clears_with_inductor_caches(self):
+        # [FUNCTION DOC] Verifies the de-dup cache is dropped by clear_caches: partition two
+        # equivalent large/small pairs, clear Inductor caches, then partition a third
+        # equivalent pair. The large pointwise separation message must be logged twice (before
+        # the clear and after it).
         large_x = int(LARGE_NUMELS) + 1
         large_node = _PartitionLoggingNode()
         small_node = _PartitionLoggingNode()
@@ -308,12 +352,22 @@ class ComboKernelPartitionLoggingTests(TestCase):
 
 @instantiate_parametrized_tests
 class ComboKernelTests(TestCase):
+    # [CLASS DOC] End-to-end combo kernel tests on GPU with Triton. setUp enables combo kernels
+    # with benchmarking off, unlimited distance, no peak-memory limits, and per-subkernel
+    # blocks taken from the class attribute (false here; subclasses flip it). Also holds the
+    # check_model helpers and the flag asking for kernel count checks. Each test compiles a
+    # function and asserts results match eager and typically the number of generated kernels or
+    # substrings of the generated code.
     check_model_gpu = check_model_gpu
     check_model_cpu = check_model
     check_kernel_count = True
     combo_kernel_per_subkernel_blocks = False
 
     def setUp(self):
+        # [FUNCTION DOC] Reset Inductor metrics, then open an ExitStack holding an Inductor
+        # config patch that enables combo kernels (benchmark off, max distance -1, no
+        # memory-increase limits, and the per-subkernel-blocks option from the class
+        # attribute). Undone in tearDown.
         super().setUp()
         torch._inductor.metrics.reset()
         self._test_stack = contextlib.ExitStack()
@@ -331,13 +385,19 @@ class ComboKernelTests(TestCase):
         )
 
     def tearDown(self):
+        # [FUNCTION DOC] Close the config patch stack, reset Inductor metrics, then call the
+        # base tearDown.
         self._test_stack.close()
         torch._inductor.metrics.reset()
         super().tearDown()
 
     @requires_gpu_and_triton
     def test_activation_functions(self):
+        # [FUNCTION DOC] Relu, sigmoid and tanh on differently shaped inputs must give
+        # eager-equal results and fuse into a single generated kernel.
         def test_activations(a, b, c):
+            # [FUNCTION DOC] HELPER: Apply relu, sigmoid and tanh to three inputs and return
+            # the three results.
             a1 = torch.nn.functional.relu(a)
             b1 = torch.nn.functional.sigmoid(b)
             c1 = torch.nn.functional.tanh(c)
@@ -357,7 +417,11 @@ class ComboKernelTests(TestCase):
 
     @requires_gpu_and_triton
     def test_reduce_functions(self):
+        # [FUNCTION DOC] Sum, max and min reductions along dim 0 plus a tanh pointwise op:
+        # compiled output matches eager and at most two kernels are generated.
         def test_reduce(a, b, c, d):
+            # [FUNCTION DOC] HELPER: Return sum, max (values and indices) and min results plus
+            # tanh of the last.
             a1 = torch.sum(a, dim=0)
             b1 = torch.max(b, dim=0)
             c1 = torch.min(c, dim=0)
@@ -380,7 +444,11 @@ class ComboKernelTests(TestCase):
 
     @requires_gpu_and_triton
     def test_mutated_args(self):
+        # [FUNCTION DOC] In-place add, in-place sigmoid and in-place tanh on inputs plus one
+        # out-of-place add: compiled outputs equal eager and everything fuses into one kernel.
         def test_mutated(a, b, c, d):
+            # [FUNCTION DOC] HELPER: Mutate three inputs in place, add 5 out of place to the
+            # third, return all.
             a.add_(1)
             b.sigmoid_()
             c = torch.add(c, 5)
@@ -403,7 +471,11 @@ class ComboKernelTests(TestCase):
 
     @requires_gpu_and_triton
     def test_reduce_split(self):
+        # [FUNCTION DOC] A full vector norm of a large matrix (needs a split reduction)
+        # together with a small column sum must still compile and match eager results.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the vector norm of the first input and the dim 0
+            # sum of the second.
             a1 = torch.linalg.vector_norm(a)
             b1 = torch.sum(b, dim=0)
             return a1, b1
@@ -419,7 +491,14 @@ class ComboKernelTests(TestCase):
 
     @requires_gpu_and_triton
     def test_2d_blocking_partitioning(self):
+        # [FUNCTION DOC] Three adds where two operands are transposed (2D tiling with
+        # blocking) must yield two kernels. When cpp_wrapper and per-subkernel blocks are both
+        # on, also profiles two runs, exports a chrome trace, finds the fused pointwise combo
+        # kernel events, and asserts their grid is smaller than the degenerate
+        # one-element-per-block grid, guarding against missing per-subkernel block meta keys
+        # in the wrapper grid computation.
         def fn(a0, a1, a2, b0, b1, b2):
+            # [FUNCTION DOC] HELPER: Add three pairs of tensors and return the three sums.
             c0 = torch.add(a0, b0)
             c1 = torch.add(a1, b1)
             c2 = torch.add(a2, b2)
@@ -476,7 +555,11 @@ class ComboKernelTests(TestCase):
 
     @requires_gpu_and_triton
     def test_persistent_reduction_size_hint(self):
+        # [FUNCTION DOC] Two row max/min reductions over different widths must compile to a
+        # persistent reduction kernel whose generated source has the expected size hints;
+        # output matches eager.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Return max over dim 1 of x and min over dim 1 of y.
             return x.max(1), y.min(1)
 
         inps = (
@@ -504,7 +587,12 @@ class ComboKernelTests(TestCase):
         }
     )
     def test_combo_kernel_tma_descriptor_block_name(self):
+        # [FUNCTION DOC] Needs CUDA, Hopper or newer and non-ROCm; runs with tensor descriptor
+        # use and aligned inputs. Two row sums of different widths must match eager and the
+        # generated code must reference tensor descriptor creation (checks the combo kernel
+        # block naming works with TMA).
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return last-dim sums of both inputs.
             return a.sum(dim=-1), b.sum(dim=-1)
 
         inps = [
@@ -519,12 +607,19 @@ class ComboKernelTests(TestCase):
 
     @requires_gpu_and_triton
     def test_sort_in_combo_kernel_forces_persistent_reduction(self):
+        # [FUNCTION DOC] Sort sub-kernels in a combo kernel must be forced to persistent
+        # reduction even if the choices heuristic says otherwise. A patched choices method
+        # returns false for kernels containing sort, while config enables per-subkernel blocks,
+        # mixed sizes and combo autotuning. Compiling must not fail and the output must match
+        # eager and use a persistent reduction kernel.
         # ops.sort only works under persistent reduction. Combo kernel codegen
         # must override the persistent_reduction heuristic for sort sub-kernels,
         # otherwise the TritonKernel.sort() assertion fires.
         from torch._inductor.choices import InductorChoices
 
         def fn(a, b, c, d):
+            # [FUNCTION DOC] HELPER: Sort three integer inputs along dim 1 and return values;
+            # tanh of the fourth.
             a1 = torch.sort(a, dim=1).values
             b1 = torch.sort(b, dim=1).values
             c1 = torch.sort(c, dim=1).values
@@ -542,6 +637,9 @@ class ComboKernelTests(TestCase):
 
         @staticmethod
         def force_non_persistent_for_sort(features, cooperative_reduction):
+            # [FUNCTION DOC] HELPER: Replacement for the persistent-reduction heuristic:
+            # returns false for features containing a sort op, otherwise defers to the saved
+            # original implementation.
             if features.contains_op("sort"):
                 return False
             return orig(features, cooperative_reduction)
@@ -570,7 +668,13 @@ class ComboKernelTests(TestCase):
 
     @requires_gpu_and_triton
     def test_fuse_mix_order_reductions_combo_kernels(self):
+        # [FUNCTION DOC] Mix-order reductions (row and column sums of the same input) are fused
+        # into a separate kernel, a consumer of the row sum is excluded from combos, and two
+        # independent scalar sums become a combo kernel: expects output equal to eager and
+        # three generated kernels total.
         def fn(x, y, z):
+            # [FUNCTION DOC] HELPER: Return the sum of the row sums, the column sums, and two
+            # scalar sums.
             # FusedMixOrderReductions produces row_sum (buf0)
             row_sum = x.sum(dim=1)
             col_sum = x.sum(dim=0)
@@ -600,7 +704,12 @@ class ComboKernelTests(TestCase):
 
     @requires_gpu_and_triton
     def test_combo_kernel_scalar_store_broadcast(self):
+        # [FUNCTION DOC] Scalar add, a row sum and a scalar reduction depending on the
+        # scalar add are combined: results close to eager (loose tolerance) and exactly one
+        # kernel generated.
         def fn(a, b, c, d):
+            # [FUNCTION DOC] HELPER: Compute a scalar add, a row sum, and a full sum of a
+            # product with it.
             scalar_sum = a + b
             vector_result = c.sum(dim=1)
             scalar_red = (d * scalar_sum).sum()
@@ -621,7 +730,12 @@ class ComboKernelTests(TestCase):
     @requires_gpu_and_triton
     @parametrize("benchmark_combo_kernel", [False, True])
     def test_single_combo_kernels(self, benchmark_combo_kernel):
+        # [FUNCTION DOC] Parametrized by benchmark_combo_kernel. A big and a small tensor each
+        # get a pointwise add; since only single-node groups exist, no combo kernel is
+        # produced. Checks output, kernel count (four with benchmarking, two otherwise) and
+        # that generated code is a plain 1D pointwise kernel without combo grid meta.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Add 1 to each input and return both.
             c = torch.add(a, 1)
             d = torch.add(b, 1)
             return c, d
@@ -650,7 +764,11 @@ class ComboKernelTests(TestCase):
 
     @requires_gpu_and_triton
     def test_combo_kernel_per_config_subkernel_poi(self):
+        # [FUNCTION DOC] Two pointwise ops of very different sizes make one kernel. With
+        # per-subkernel blocks on, the code must declare separate block parameters per
+        # subkernel; otherwise none.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the first input times 2 and the second plus 1.
             o1 = a * 2.0
             o2 = b + 1.0
             return o1, o2
@@ -673,7 +791,11 @@ class ComboKernelTests(TestCase):
 
     @requires_gpu_and_triton
     def test_combo_kernel_per_config_subkernel_per(self):
+        # [FUNCTION DOC] Two row sums of different widths give one kernel. With per-subkernel
+        # blocks the generated code has per-subkernel reduction block constants (64 and 512);
+        # without, a shared block.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return last-dim sums of both inputs.
             return a.sum(dim=-1), b.sum(dim=-1)
 
         inps = [
@@ -696,7 +818,11 @@ class ComboKernelTests(TestCase):
 
     @requires_gpu_and_triton
     def test_combo_kernel_per_config_subkernel_red_per(self):
+        # [FUNCTION DOC] Reductions with persistent (width 128) and regular (width 2048) styles
+        # combine into one kernel; per-subkernel blocks produce separate block parameters for
+        # the second.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the last-dim sums of both inputs.
             r1 = a.sum(dim=-1)
             r2 = b.sum(dim=-1)
             return r1, r2
@@ -719,7 +845,11 @@ class ComboKernelTests(TestCase):
 
     @requires_gpu_and_triton
     def test_combo_kernel_per_config_subkernel_red(self):
+        # [FUNCTION DOC] Two reductions over dims 0 and 2 of 3D inputs combine into one
+        # kernel; with per-subkernel blocks both subkernels declare their own X and reduction
+        # block parameters.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return sums over dims 0 and 2 of both inputs.
             r1 = a.sum(dim=(0, 2))
             r2 = b.sum(dim=(0, 2))
             return r1, r2
@@ -751,7 +881,11 @@ class ComboKernelTests(TestCase):
         }
     )
     def test_combo_kernel_per_config_subkernel_r0_r1(self):
+        # [FUNCTION DOC] Skipped on ROCm. With ND tiling and tiled reductions, 2D
+        # reductions over two dims on permuted inputs are separated from combos, so two
+        # kernels are generated.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return sums over dims 1 and 2 of both inputs.
             return a.sum(dim=(1, 2)), b.sum(dim=(1, 2))
 
         inps = [
@@ -774,7 +908,10 @@ class ComboKernelTests(TestCase):
         }
     )
     def test_combo_kernel_per_config_subkernel_poi_3d(self):
+        # [FUNCTION DOC] With ND tiling and up to three tiles, 3D pointwise ops on sliced views
+        # are separated from combo kernels: output equals eager and two kernels are generated.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the first input plus 1 and the second times 2.
             return a + 1.0, b * 2.0
 
         inps = [
@@ -792,9 +929,15 @@ class ComboKernelTests(TestCase):
     @skipIfXpu(msg="Profiler JSON traceEvents is not supported on XPU")
     @requires_gpu_and_triton
     def test_combo_kernel_per_config_subkernel_block_size(self):
+        # [FUNCTION DOC] Skipped on XPU. Contiguous channels-last conversions of eight
+        # differently shaped tensors fuse into one combo kernel. Profiles the run, finds the
+        # fused kernel event and checks its grid (single dimension with per-subkernel blocks,
+        # else a 2D grid), then checks results, kernel count and the pid offset code form.
         from torch.profiler import ProfilerActivity
 
         def fn(t0, t1, t2, t3, t4, t5, t6, t7):
+            # [FUNCTION DOC] HELPER: Convert each of eight inputs to channels-last layout and
+            # return them.
             o0 = t0.contiguous(
                 memory_format=torch.channels_last
             )  # ynumel=12,    xnumel=50176
@@ -872,14 +1015,22 @@ class ComboKernelTests(TestCase):
     @requires_gpu_and_triton
     @torch._dynamo.config.patch("assume_static_by_default", False)
     def test_combo_kernel_dynamic_shapes_grid_changes(self):
+        # [FUNCTION DOC] Skipped on XPU; dynamic shapes. Profiles the combo kernel for two
+        # input shape sets and asserts the first grid dimension differs between them (grid
+        # computed at runtime), that results match eager, and that with per-subkernel blocks
+        # the second grid dimension is one.
         from torch.profiler import ProfilerActivity
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Return the sine of x and the cosine of y.
             return x.sin(), y.cos()
 
         fn_c = torch.compile(fn)
 
         def get_grid(x, y):
+            # [FUNCTION DOC] HELPER: Run the compiled function under the profiler, export the
+            # chrome trace to a temp file, and return the grid of the first fused pointwise
+            # kernel event with the outputs.
             with tempfile.NamedTemporaryFile(suffix=".json") as trace_file:
                 trace_path = trace_file.name
                 activity = getattr(ProfilerActivity, GPU_TYPE.upper())
@@ -920,7 +1071,12 @@ class ComboKernelTests(TestCase):
     @requires_gpu_and_triton
     @parametrize("pointwise_only,expected_kernel_count", [(False, 2), (True, 3)])
     def test_combo_kernels_pointwise_only(self, pointwise_only, expected_kernel_count):
+        # [FUNCTION DOC] Parametrized by combo_kernels_pointwise_only: two pointwise ops and
+        # two reductions produce 2 kernels normally and 3 when only pointwise nodes may be
+        # combined. Checks eager equality.
         def fn(a, b, c, d):
+            # [FUNCTION DOC] HELPER: Return two pointwise results, a sum and a mean over the
+            # last dim.
             p1 = a * 2.0
             p2 = b + 1.0
             r1 = c.sum(dim=-1)
@@ -954,7 +1110,11 @@ class ComboKernelTests(TestCase):
         [(8, 1), (3, 2), (2, 3)],
     )
     def test_combo_kernel_max_num_nodes(self, max_num_nodes, expected_kernel_count):
+        # [FUNCTION DOC] Parametrized by the combo_kernel_max_num_nodes limit (8, 3, 2): the
+        # six pointwise ops yield 1, 2 or 3 kernels. Metrics are reset before compiling; output
+        # must equal eager.
         def fn(a, b, c, d, e, f):
+            # [FUNCTION DOC] HELPER: Return six different pointwise results of the six inputs.
             return (
                 a * 2.0,
                 b + 1.0,
@@ -990,10 +1150,15 @@ class ComboKernelTests(TestCase):
     @requires_gpu_and_triton
     @parametrize("max_autotune", [False, True])
     def test_combo_kernel_amd_special_config_args(self, max_autotune):
+        # [FUNCTION DOC] ROCm only, parametrized by max_autotune. Skips itself unless
+        # per-subkernel blocks are enabled. Two pointwise ops compile with and without
+        # max_autotune (HIP-only Triton options get rewritten in the combo path); output must
+        # equal eager and one kernel is generated.
         if not torch._inductor.config.combo_kernel_per_subkernel_blocks:
             self.skipTest("requires combo_kernel_per_subkernel_blocks")
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the first input times 2 and the second plus 1.
             return a * 2.0, b + 1.0
 
         inps = [
@@ -1014,9 +1179,16 @@ class ComboKernelTests(TestCase):
     @requires_gpu_and_triton
     @unittest.skipIf(not SM90OrLater, "Avoid oom on CI")
     def test_combo_kernel_yz_overflow(self):
+        # [FUNCTION DOC] Skipped on XPU and before SM90. Two huge permute-clone-reshape
+        # workloads are fused; the profiler trace of the fused kernel gives the grid: one
+        # flattened dimension with per-subkernel blocks, otherwise a three dimensional grid
+        # whose y extent is large. Checks the grid handles y/z size limits and that results
+        # equal eager.
         from torch.profiler import ProfilerActivity
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Permute, clone contiguous and reshape each input to
+            # two dimensions.
             a_permute = a.permute(0, 2, 1)
             a_clone = a_permute.clone(memory_format=torch.contiguous_format)
             a_view = a_clone.view(-1, a.shape[1])
@@ -1070,9 +1242,15 @@ class ComboKernelTests(TestCase):
         }
     )
     def test_combo_kernel_no_bench_stitched_config(self):
+        # [FUNCTION DOC] With autotuning off and per-subkernel blocks on, three pointwise ops
+        # compile to exactly one Triton kernel (counted from async compile calls in the code).
+        # The emitted code must contain a default config entry carrying XBLOCK values for
+        # subkernels 0..2 and must not declare per-subkernel XBLOCK constants with default
+        # values in the signature.
         import re
 
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Return a times 2, b plus 1, c minus 1.
             return a * 2.0, b + 1.0, c - 1.0
 
         inps = [
@@ -1105,9 +1283,14 @@ class ComboKernelTests(TestCase):
         }
     )
     def test_combo_kernel_no_bench_persistent_reduction(self):
+        # [FUNCTION DOC] Autotuning off, per-subkernel blocks on, three row sums over 1024
+        # elements. Output equals eager (looser tolerance on XPU because of summation order).
+        # One Triton kernel; its default config holds only the XBLOCK entries for the three
+        # subkernels, no reduction block.
         import re
 
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Return the last-dim sum of each of the three inputs.
             return a.sum(-1), b.sum(-1), c.sum(-1)
 
         inps = [torch.randn(64, 1024, device=GPU_TYPE) for _ in range(3)]
@@ -1142,12 +1325,18 @@ class ComboKernelTests(TestCase):
         }
     )
     def test_combo_kernel_no_bench_carve_out(self):
+        # [FUNCTION DOC] A bucketize op must be carved out of the combo kernel (several
+        # pointwise configs on CUDA, a one-element-per-thread hint on ROCm/XPU) while two
+        # simple pointwise ops combine. Compiles in a fresh cache with autotuning off and
+        # expects two real Triton kernels.
         # torch.bucketize triggers carve-out under all gate variants:
         #   CUDA: pointwise heuristic returns 3 configs (>2) -> carve out
         #   ROCm/XPU: lowering sets AutotuneHint.ONE_ELEMENT_PER_THREAD -> carve out
         # Simple pointwise (b*2.0, c+1.0) passes all gates -> fuses into combo.
         # Expect 1 combo + 1 standalone on all backends.
         def fn(a, b, c, boundaries):
+            # [FUNCTION DOC] HELPER: Return bucketize of a against boundaries, b times 2, c
+            # plus 1.
             return torch.bucketize(a, boundaries), b * 2.0, c + 1.0
 
         a = torch.rand(1024, device=GPU_TYPE)
@@ -1175,15 +1364,26 @@ class ComboKernelTests(TestCase):
         }
     )
     def test_combo_kernel_split_large_reductions(self):
+        # [FUNCTION DOC] Regression test from squeezenet backward: two very large sum
+        # reductions over dims 0, 2, 3 must not be combined into one combo kernel. Builds a
+        # module, compiles it with per-subkernel blocks, compares to eager (close), and expects
+        # five kernels (four would mean the reductions were fused).
         # squeezenet1_1 backward (combo regression sum_sum_8bcd6e12dcd4):
         # two very large reductions (sum over [0,2,3] of [512,64,55,55]) must NOT be
         # co-fused into one combo kernel -- each is split out (5 kernels, vs 4 if fused).
         import torch._inductor.inductor_prims
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module reproducing the squeezenet backward subgraph:
+            # scatter-add of max pool gradients, slicing into two halves, masked selection and
+            # two reductions. Has no state.
             def forward(
                 self, getitem_54, arg33_1, arg61_1, full, arg62_1, sp0, sp1, sp2
             ):
+                # [FUNCTION DOC] HELPER: Build a zero buffer, scatter add the viewed gradient
+                # using indices recovered from low-memory max pool offsets, slice the result
+                # into two channel halves, apply where masks with a scalar fill, and return the
+                # sums over dims 0, 2, 3 of both halves.
                 full_default = torch.ops.aten.full.default(
                     [65536, 3025], 0, dtype=torch.float32, device=getitem_54.device
                 )
@@ -1239,6 +1439,13 @@ class ComboKernelTests(TestCase):
         }
     )
     def test_combo_kernel_dynamic_scale_rblock(self):
+        # [FUNCTION DOC] Skipped on XPU. Checks that a combo reduction kernel (per-subkernel
+        # blocks, size hints absent at the autotuner level) takes part in occupancy-driven
+        # reduction block scaling. Patches the autotuner constructor to collect combo
+        # autotuners and the candidate iterator to run under a forced register-bound
+        # single-multiprocessor device profile, then asserts a combo reduction autotuner
+        # exists, can scale, produced scaled candidates and that a candidate carries a suffixed
+        # per-subkernel reduction block key. Output compared to eager.
         # A combo kernel with per-subkernel blocks carries size_hints=None at the
         # autotuner level (per-subkernel hints live in combo_grid_meta), so
         # _dynamic_scale_rblock used to skip it entirely. With this change a combo
@@ -1257,6 +1464,7 @@ class ComboKernelTests(TestCase):
         #      so _iter_rblock_scale_candidates must be exercised during the live
         #      _dynamic_scale_rblock call, while compile_results is still populated.
         def fn(a, b, c, d):
+            # [FUNCTION DOC] HELPER: Return row sums of two fused sigmoid-and-add expressions.
             r1 = (a * torch.sigmoid(a) + b).sum(dim=1)
             r2 = (c * torch.sigmoid(c) + d).sum(dim=1)
             return r1, r2
@@ -1272,11 +1480,19 @@ class ComboKernelTests(TestCase):
         orig_iter = CachingAutotuner._iter_rblock_scale_candidates
 
         def capture_init(self, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Replacement autotuner constructor: calls the original
+            # and, when the metadata has combo grid meta, appends the new autotuner to the
+            # collected list.
             orig_init(self, *args, **kwargs)
             if (getattr(self, "inductor_meta", {}) or {}).get("combo_grid_meta"):
                 autotuners.append(self)
 
         def forced_iter(self):
+            # [FUNCTION DOC] HELPER: Replacement candidate iterator (a generator). For a combo
+            # reduction without size hints it temporarily swaps in a device profile with one
+            # multiprocessor and a huge thread limit, collects candidates from the original
+            # iterator into the shared list, restores the profile (even on error) and yields
+            # them; otherwise it delegates to the original.
             # For the combo reduction (size_hints=None), force a register-bound,
             # single-SM profile so candidate generation is deterministic across
             # GPUs, then restore the real profile before the caller precompiles.
@@ -1335,12 +1551,19 @@ class ComboKernelTests(TestCase):
 
 
 class ComboKernelBenchmarkTests(TestCase):
+    # [CLASS DOC] Same combo kernel scenarios as the main tests but with combo kernel
+    # benchmarking turned on (config benchmark_combo_kernel), which generates extra throwaway
+    # kernels and so changes expected kernel counts. Per-subkernel blocks default off via a
+    # class attribute.
     check_model_gpu = check_model_gpu
     check_model_cpu = check_model
     check_kernel_count = True
     combo_kernel_per_subkernel_blocks = False
 
     def setUp(self):
+        # [FUNCTION DOC] Reset dynamo and Inductor metrics, then push a config patch enabling
+        # combo kernels with benchmarking, unlimited distance and no peak-memory limits onto
+        # an ExitStack.
         super().setUp()
         torch._dynamo.reset()
         torch._inductor.metrics.reset()
@@ -1359,6 +1582,8 @@ class ComboKernelBenchmarkTests(TestCase):
         )
 
     def tearDown(self):
+        # [FUNCTION DOC] Close the config patch stack, reset dynamo and metrics, call
+        # base tearDown.
         self._test_stack.close()
         torch._dynamo.reset()
         torch._inductor.metrics.reset()
@@ -1366,7 +1591,11 @@ class ComboKernelBenchmarkTests(TestCase):
 
     @requires_gpu_and_triton
     def test_activation_benchmark(self):
+        # [FUNCTION DOC] Relu, sigmoid, tanh on three inputs matches eager and generates five
+        # kernels (benchmarking inflates the count).
         def test_activations(a, b, c):
+            # [FUNCTION DOC] HELPER: Apply relu, sigmoid and tanh to three inputs and return
+            # the results.
             a1 = torch.nn.functional.relu(a)
             b1 = torch.nn.functional.sigmoid(b)
             c1 = torch.nn.functional.tanh(c)
@@ -1386,7 +1615,11 @@ class ComboKernelBenchmarkTests(TestCase):
 
     @requires_gpu_and_triton
     def test_reduce_benchmark(self):
+        # [FUNCTION DOC] Sum, max, min reductions plus tanh match eager; kernel count must be
+        # between five and ten inclusive.
         def test_reduce(a, b, c, d):
+            # [FUNCTION DOC] HELPER: Return sum, max (values and indices), min and tanh of the
+            # four inputs.
             a1 = torch.sum(a, dim=0)
             b1 = torch.max(b, dim=0)
             c1 = torch.min(c, dim=0)
@@ -1409,7 +1642,11 @@ class ComboKernelBenchmarkTests(TestCase):
 
     @requires_gpu_and_triton
     def test_mutated_benchmark(self):
+        # [FUNCTION DOC] Mutating ops on four inputs match eager; kernel count between five
+        # and ten.
         def test_mutated(a, b, c, d):
+            # [FUNCTION DOC] HELPER: Mutate three inputs in place, add 5 to the third, return
+            # all four.
             a.add_(1)
             b.sigmoid_()
             c = torch.add(c, 5)
@@ -1432,8 +1669,12 @@ class ComboKernelBenchmarkTests(TestCase):
 
     @requires_gpu_and_triton
     def test_round_robin_dispatch(self):
+        # [FUNCTION DOC] Exercises the round-robin dispatch strategy of combo kernels with
+        # mutated inputs of varied shapes: output equals eager and six kernels are generated.
         # combo kernel dispatch strategy: round robin
         def test_mutated(a, b, c, d):
+            # [FUNCTION DOC] HELPER: Mutate three inputs in place, add 5 to the third, return
+            # all four.
             a.add_(1)
             b.sigmoid_()
             c = torch.add(c, 5)
@@ -1456,7 +1697,10 @@ class ComboKernelBenchmarkTests(TestCase):
 
     @requires_gpu_and_triton
     def test_2d_blocking_benchmark(self):
+        # [FUNCTION DOC] Three adds with two transposed operands through the model checker; six
+        # kernels generated with benchmarking enabled.
         def fn(a0, a1, a2, b0, b1, b2):
+            # [FUNCTION DOC] HELPER: Add three pairs of tensors and return the sums.
             c0 = torch.add(a0, b0)
             c1 = torch.add(a1, b1)
             c2 = torch.add(a2, b2)
@@ -1478,7 +1722,11 @@ class ComboKernelBenchmarkTests(TestCase):
 
     @requires_gpu_and_triton
     def test_persistent_reduction_no_x_dim(self):
+        # [FUNCTION DOC] Row sums of two inputs with a dynamic leading dimension (marked
+        # dynamic with bounds). Persistent reductions without an x dimension still match eager;
+        # four kernels.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Return the dim 1 sums of both inputs.
             return x.sum(1), y.sum(1)
 
         inps = (
@@ -1495,6 +1743,12 @@ class ComboKernelBenchmarkTests(TestCase):
 
     @requires_gpu_and_triton
     def test_graph_state_restored_on_swallowed_compilation_error(self):
+        # [FUNCTION DOC] Verifies the scheduler restores the graph removed-buffer state when
+        # the benchmark codegen fails with a swallowed loop-carried-variable compilation error.
+        # Patches speedup_by_combo_kernel to record whether the removed buffers object is the
+        # same afterwards, and patches combo kernel code generation so only-source codegen
+        # mutates the removed buffers and raises a fake error (real codegen passes through).
+        # Asserts the state was restored.
         # speedup_by_combo_kernel swallows Loop-carried-variable CompilationError
         # and keeps compiling; benchmark_combo_kernel must restore the original
         # V.graph.removed_buffers/inplaced_to_remove on that path, not leak the
@@ -1505,14 +1759,20 @@ class ComboKernelBenchmarkTests(TestCase):
         from torch._inductor.scheduler import Scheduler
 
         class FakeCompilationError(CompilationError):
+            # [CLASS DOC] HELPER: Fake triton CompilationError that skips the base constructor
+            # and keeps only a message, so it can be raised without a real compiler context.
             def __init__(self, msg):
+                # [FUNCTION DOC] HELPER: Initialize only the base Exception with the message
+                # and store it.
                 Exception.__init__(self, msg)
                 self.msg = msg
 
             def __str__(self):
+                # [FUNCTION DOC] HELPER: Return the stored message.
                 return self.msg
 
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Return a times 2, b plus 1, c minus 1.
             return a * 2.0, b + 1.0, c - 1.0
 
         inps = [torch.rand(64, device=GPU_TYPE) for _ in range(3)]
@@ -1522,6 +1782,9 @@ class ComboKernelBenchmarkTests(TestCase):
         orig_generate = SIMDScheduling.generate_combo_kernel_code
 
         def speedup_capturing_restore(sched, nodes):
+            # [FUNCTION DOC] HELPER: Wrapper around the original scheduler speedup check.
+            # Records the result and whether the graph removed-buffers object is the same
+            # object after the call; returns the result.
             before = V.graph.removed_buffers
             result = orig_speedup(sched, nodes)
             captured["result"] = result
@@ -1529,6 +1792,10 @@ class ComboKernelBenchmarkTests(TestCase):
             return result
 
         def mutate_then_raise(self, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Replacement combo codegen. Delegates to the original
+            # unless the call asks for source only; in that case adds a throwaway name to the
+            # graph removed buffers and raises the fake compilation error mentioning a
+            # loop-carried variable.
             # Real codegen (only_gen_src_code=False) must keep working; only
             # the benchmark's throwaway codegen simulates mutate-then-fail.
             if not kwargs.get("only_gen_src_code"):
@@ -1553,12 +1820,19 @@ class ComboKernelBenchmarkTests(TestCase):
 
 
 class ComboKernelDynamicShapesTests(TestCase):
+    # [CLASS DOC] Combo kernel tests with dynamic shapes: benchmarking is on, automatic dynamic
+    # shapes are off and static-by-default is off, so all sizes are symbolic. Expected kernel
+    # counts include benchmark kernels. Per-subkernel blocks come from a class attribute
+    # (default off).
     check_model_gpu = check_model_gpu
     check_model_cpu = check_model
     check_kernel_count = True
     combo_kernel_per_subkernel_blocks = False
 
     def setUp(self):
+        # [FUNCTION DOC] Reset Inductor metrics, then push onto an ExitStack an Inductor config
+        # patch (combo kernels on, benchmarking on, unlimited distance, no peak-memory limits)
+        # and a dynamo config patch (no automatic dynamic shapes, not static by default).
         super().setUp()
         torch._inductor.metrics.reset()
         self._test_stack = contextlib.ExitStack()
@@ -1584,13 +1858,19 @@ class ComboKernelDynamicShapesTests(TestCase):
         )
 
     def tearDown(self):
+        # [FUNCTION DOC] Close the config patch stack, reset Inductor metrics, call
+        # base tearDown.
         self._test_stack.close()
         torch._inductor.metrics.reset()
         super().tearDown()
 
     @requires_gpu_and_triton
     def test_dynamic_shapes_activations(self):
+        # [FUNCTION DOC] Relu, sigmoid, tanh under dynamic shapes match eager; five
+        # kernels generated.
         def test_activations(a, b, c):
+            # [FUNCTION DOC] HELPER: Apply relu, sigmoid and tanh to three inputs and return
+            # the results.
             a1 = torch.nn.functional.relu(a)
             b1 = torch.nn.functional.sigmoid(b)
             c1 = torch.nn.functional.tanh(c)
@@ -1610,7 +1890,10 @@ class ComboKernelDynamicShapesTests(TestCase):
 
     @requires_gpu_and_triton
     def test_dynamic_shapes_2d_blocking(self):
+        # [FUNCTION DOC] Three adds with two transposed operands under dynamic shapes, via the
+        # model checker; six kernels generated.
         def fn(a0, a1, a2, b0, b1, b2):
+            # [FUNCTION DOC] HELPER: Add three pairs of tensors and return the sums.
             c0 = torch.add(a0, b0)
             c1 = torch.add(a1, b1)
             c2 = torch.add(a2, b2)
@@ -1631,7 +1914,11 @@ class ComboKernelDynamicShapesTests(TestCase):
 
     @requires_gpu_and_triton
     def test_dynamic_shapes_reduce(self):
+        # [FUNCTION DOC] Sum, max, min and tanh under dynamic shapes match eager; between five
+        # and ten kernels.
         def test_reduce(a, b, c, d):
+            # [FUNCTION DOC] HELPER: Return sum, max, min over dim 0 and tanh of the
+            # fourth input.
             a1 = torch.sum(a, dim=0)
             b1 = torch.max(b, dim=0)
             c1 = torch.min(c, dim=0)
@@ -1655,8 +1942,12 @@ class ComboKernelDynamicShapesTests(TestCase):
     @skipIfXpu(msg="https://github.com/pytorch/pytorch/issues/181863")
     @requires_gpu_and_triton
     def test_dynamic_shapes_mutated(self):
+        # [FUNCTION DOC] Skipped on XPU (known issue link). Mutating ops with round-robin
+        # dispatch under dynamic shapes: output equals eager, six kernels generated.
         # combo kernel dispatch strategy: round robin
         def test_mutated(a, b, c, d):
+            # [FUNCTION DOC] HELPER: Mutate three inputs in place, add 5 to the third, return
+            # all four.
             a.add_(1)
             b.sigmoid_()
             c = torch.add(c, 5)
@@ -1680,7 +1971,11 @@ class ComboKernelDynamicShapesTests(TestCase):
     @requires_gpu_and_triton
     @torch._inductor.config.patch("combo_kernels_autotune", 0)
     def test_dynamic_shapes_activations_no_autotune(self):
+        # [FUNCTION DOC] With combo autotuning off, three activations compile to one Triton
+        # kernel (counted via async compile calls in the generated code) and match eager.
         def test_activations(a, b, c):
+            # [FUNCTION DOC] HELPER: Apply relu, sigmoid and tanh to three inputs and return
+            # the results.
             a1 = torch.nn.functional.relu(a)
             b1 = torch.nn.functional.sigmoid(b)
             c1 = torch.nn.functional.tanh(c)
@@ -1702,7 +1997,11 @@ class ComboKernelDynamicShapesTests(TestCase):
     @torch._dynamo.config.patch("automatic_dynamic_shapes", True)
     @torch._dynamo.config.patch("assume_static_by_default", True)
     def test_dynamic_shapes_persistent_reduction_no_x_dim(self):
+        # [FUNCTION DOC] Automatic dynamic shapes on, static by default on; two row sums with
+        # the first dimension marked dynamic. Persistent reduction lacking an x dimension
+        # matches eager; four kernels.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Return the dim 1 sums of both inputs.
             return x.sum(1), y.sum(1)
 
         inps = (
@@ -1721,7 +2020,10 @@ class ComboKernelDynamicShapesTests(TestCase):
     @torch._dynamo.config.patch("automatic_dynamic_shapes", True)
     @torch._dynamo.config.patch("assume_static_by_default", True)
     def test_dynamic_shapes_persistent_reduction_no_x_dim_2(self):
+        # [FUNCTION DOC] Like the previous test with 3D inputs and dims 0 and 1 marked dynamic,
+        # reducing the last dim; output matches eager and four kernels are generated.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Return the dim 2 sums of both inputs.
             return x.sum(2), y.sum(2)
 
         inps = (
@@ -1740,7 +2042,11 @@ class ComboKernelDynamicShapesTests(TestCase):
     @torch._dynamo.config.patch("automatic_dynamic_shapes", True)
     @torch._dynamo.config.patch("assume_static_by_default", True)
     def test_dynamic_shapes_2d_blocking_round_robin(self):
+        # [FUNCTION DOC] Three adds with transposed operands, compiled once and then called
+        # with a second set of different shapes (recompiles dynamically). Both runs match eager
+        # and the kernel count (reset between runs) is five or six each time.
         def fn(a0, a1, a2, b0, b1, b2):
+            # [FUNCTION DOC] HELPER: Add three pairs of tensors and return the sums.
             c0 = torch.add(a0, b0)
             c1 = torch.add(a1, b1)
             c2 = torch.add(a2, b2)
@@ -1780,7 +2086,11 @@ class ComboKernelDynamicShapesTests(TestCase):
     @torch._dynamo.config.patch("assume_static_by_default", True)
     @torch._inductor.config.patch("triton.autotune_at_compile_time", True)
     def test_dynamic_shapes_persistent_reduction_mixed_x_dim_cuda(self):
+        # [FUNCTION DOC] CUDA only. Row sum, mean and max over different widths with the
+        # first dim marked dynamic and compile-time autotuning enabled; only checks output
+        # equals eager.
         def fn(x, y, z):
+            # [FUNCTION DOC] HELPER: Return sum, mean and max over dim 1 of the three inputs.
             return x.sum(1), y.mean(1), z.max(1)
 
         inps = (
@@ -1801,7 +2111,10 @@ class ComboKernelDynamicShapesTests(TestCase):
     @torch._dynamo.config.patch("assume_static_by_default", True)
     @torch._inductor.config.patch("triton.autotune_at_compile_time", True)
     def test_dynamic_shapes_persistent_reduction_mixed_x_dim_xpu(self):
+        # [FUNCTION DOC] XPU variant of the previous test: same function and checks,
+        # XPU-only decorator.
         def fn(x, y, z):
+            # [FUNCTION DOC] HELPER: Return sum, mean and max over dim 1 of the three inputs.
             return x.sum(1), y.mean(1), z.max(1)
 
         inps = (
@@ -1819,7 +2132,12 @@ class ComboKernelDynamicShapesTests(TestCase):
 
     @requires_gpu_and_triton
     def test_helper_fn_defined(self):
+        # [FUNCTION DOC] A sum, a mean and a cumulative sum in one function: output matches
+        # eager and the generated code defines the scan add helper function exactly once
+        # (no duplicates).
         def fn(x, y, z):
+            # [FUNCTION DOC] HELPER: Return sum, mean and cumulative sum over dim 1 of the
+            # three inputs.
             return x.sum(1), y.mean(1), z.cumsum(1)
 
         inps = (
@@ -1837,7 +2155,17 @@ class ComboKernelDynamicShapesTests(TestCase):
 
     @requires_gpu_and_triton
     def test_dynamic_shapes_persistent_reduction_dynamic_rdim(self):
+        # [FUNCTION DOC] Loops over benchmarking off and on, resetting dynamo and metrics. With
+        # dynamic compilation and shape upper bounds of 32, two full sums must be correct,
+        # produce 1 kernel (4 with benchmarking) and the code must declare the reduction block
+        # constant with value 32.
+        # KNOWN ISSUE: the code check branches on the per-subkernel-blocks config in the
+        # opposite sense to the other tests: the unsuffixed block name is expected when
+        # the option is on and the suffixed names when it is off. Not verified whether
+        # this is intended.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Assert both leading sizes are at most 32 and return the
+            # full sums.
             torch._check(a.shape[0] <= 32)
             torch._check(b.shape[0] <= 32)
             return a.sum(), b.sum()
@@ -1867,15 +2195,22 @@ class ComboKernelDynamicShapesTests(TestCase):
 
 
 class ComboKernelTestsPerSubkernelBlocks(ComboKernelTests):
+    # [CLASS DOC] Re-runs all main combo kernel tests with per-subkernel blocks enabled, and
+    # adds tests that check each sub-kernel body is emitted as a separate non-inlined Triton
+    # device function called from its dispatch branch (so register allocation is per body).
     combo_kernel_per_subkernel_blocks = True
 
     @requires_gpu_and_triton
     def test_noinline_sub_kernel_bodies(self):
+        # [FUNCTION DOC] Three pointwise ops of different sizes: asserts via FileCheck that
+        # three no-inline function definitions come first, then the program id read, then
+        # dispatch branches each calling its body. Output must match eager.
         # Per-subkernel combos emit each body as a @triton.jit(noinline=True)
         # device function called from its dispatch branch, so ptxas allocates
         # registers per body instead of jointly over the merged control-flow
         # graph (a register-fat member cannot degrade the others' occupancy).
         def fn(x, y, z):
+            # [FUNCTION DOC] HELPER: Return x plus 1, sigmoid of y, tanh of z.
             return x + 1, torch.sigmoid(y), torch.tanh(z)
 
         inps = (
@@ -1900,7 +2235,10 @@ class ComboKernelTestsPerSubkernelBlocks(ComboKernelTests):
 
     @requires_gpu_and_triton
     def test_noinline_sub_kernel_body_dedupes_identical_members(self):
+        # [FUNCTION DOC] Two identical add-one members: only one no-inline body function is
+        # emitted, and both dispatch branches call it (deduplication of identical bodies).
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Return x plus 1 and y plus 1.
             return x + 1, y + 1
 
         inps = (
@@ -1926,7 +2264,10 @@ class ComboKernelTestsPerSubkernelBlocks(ComboKernelTests):
 
     @requires_gpu_and_triton
     def test_noinline_sub_kernel_body_dedupes_by_signature(self):
+        # [FUNCTION DOC] Two add-one members with float32 vs float64 inputs: bodies differ by
+        # signature so two no-inline functions are emitted, one per dispatch branch.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Return x plus 1 and y plus 1.
             return x + 1, y + 1
 
         inps = (
@@ -1954,7 +2295,11 @@ class ComboKernelTestsPerSubkernelBlocks(ComboKernelTests):
     @requires_gpu_and_triton
     @torch._inductor.config.patch("combo_kernels_autotune", 0)
     def test_noinline_sub_kernel_bodies_no_bench(self):
+        # [FUNCTION DOC] With combo autotuning off, two members of different sizes: checks body
+        # function definitions and signature block parameters (shared and per-subkernel, with
+        # no baked default for the first), then dispatch branches calling the matching body.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Return x plus 1 and tanh of y.
             return x + 1, torch.tanh(y)
 
         inps = (
@@ -1985,6 +2330,8 @@ class ComboKernelTestsPerSubkernelBlocks(ComboKernelTests):
 
 
 class ComboKernelBenchmarkTestsPerSubkernelBlocks(ComboKernelBenchmarkTests):
+    # [CLASS DOC] Re-runs the benchmark combo kernel tests with per-subkernel blocks enabled
+    # and adds a test on source-only codegen configs for regular (non-persistent) reductions.
     combo_kernel_per_subkernel_blocks = True
 
     @requires_gpu_and_triton
@@ -1997,9 +2344,16 @@ class ComboKernelBenchmarkTestsPerSubkernelBlocks(ComboKernelBenchmarkTests):
         }
     )
     def test_no_autotune_regular_reduction(self):
+        # [FUNCTION DOC] With autotuning, max_autotune and persistent reductions off, two row
+        # sums of 2048 columns. Wraps combo kernel code generation to record, for source-only
+        # calls, the change in generated kernel count and the stitched config kwargs of
+        # multi-node kernels. Asserts the output close to eager, exactly one such config, a
+        # kernel count delta of one, and that its reduction block keys are exactly the two
+        # per-subkernel ones.
         from torch._inductor.codegen.simd import SIMDScheduling
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return last-dim sums of both inputs.
             return a.sum(-1), b.sum(-1)
 
         source_only_configs = []
@@ -2007,6 +2361,9 @@ class ComboKernelBenchmarkTestsPerSubkernelBlocks(ComboKernelBenchmarkTests):
         orig_generate = SIMDScheduling.generate_combo_kernel_code
 
         def capture_source_only_config(scheduling, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Wrapper over the original combo codegen; for source-only
+            # calls records the kernel count delta and the stitched-config kwargs of results
+            # with several nodes, and returns the original result unchanged.
             old_kernel_count = torch._inductor.metrics.generated_kernel_count
             result = orig_generate(scheduling, *args, **kwargs)
             if kwargs.get("only_gen_src_code"):
@@ -2048,15 +2405,22 @@ class ComboKernelBenchmarkTestsPerSubkernelBlocks(ComboKernelBenchmarkTests):
 
 
 class ComboKernelDynamicShapesTestsPerSubkernelBlocks(ComboKernelDynamicShapesTests):
+    # [CLASS DOC] Re-runs the dynamic shape combo tests with per-subkernel blocks enabled.
     combo_kernel_per_subkernel_blocks = True
 
 
 @instantiate_parametrized_tests
 class ComboKernelCompileTimeAutotuneTests(TestCase):
+    # [CLASS DOC] Tests for compile-time per-subkernel autotuning of combo kernels: each
+    # subkernel is tuned standalone and winners are stitched into the combo launch config.
+    # setUp enables combo kernels, per-subkernel blocks and compile-time autotune with
+    # benchmarking off.
     """Compile-time per-subkernel autotune: each combo subkernel autotunes its blocks
     standalone at compile time; winners are stitched into the combo's launch config."""
 
     def setUp(self):
+        # [FUNCTION DOC] Reset metrics and push a config patch (combo kernels, no benchmarking,
+        # per-subkernel blocks and compile-time autotune on) onto an ExitStack.
         super().setUp()
         torch._inductor.metrics.reset()
         self._test_stack = contextlib.ExitStack()
@@ -2072,6 +2436,7 @@ class ComboKernelCompileTimeAutotuneTests(TestCase):
         )
 
     def tearDown(self):
+        # [FUNCTION DOC] Close the patch stack, reset metrics, call base tearDown.
         self._test_stack.close()
         torch._inductor.metrics.reset()
         super().tearDown()
@@ -2079,6 +2444,12 @@ class ComboKernelCompileTimeAutotuneTests(TestCase):
     @requires_gpu_and_triton
     @parametrize("mode", ["default", "cdt"])
     def test_compile_time_autotune(self, mode):
+        # [FUNCTION DOC] Parametrized by mode: default, or coordinate descent tuning enabled.
+        # In a fresh cache compiles a function that gives one pointwise combo and one reduction
+        # combo (four subkernels with differing shapes). Asserts output equals eager, that the
+        # compile-time autotune counters (tuned plus cached) total four with zero fallbacks,
+        # and, for the coordinate descent mode, that the coordinate descent benchmark counter
+        # is positive.
         extra = {}
         if mode == "cdt":
             extra["coordinate_descent_tuning"] = True
@@ -2086,6 +2457,8 @@ class ComboKernelCompileTimeAutotuneTests(TestCase):
         # one fn -> a pointwise combo (a+b, c*d) AND a reduction combo (e.sum, g.amax),
         # each with differently-shaped subkernels so their blocks differ.
         def f(a, b, c, d, e, g):
+            # [FUNCTION DOC] HELPER: Return a plus b, c times d, last-dim sum of e and last-dim
+            # max of g.
             return a + b, c * d, e.sum(-1), g.amax(-1)
 
         inps = [
@@ -2116,9 +2489,15 @@ class ComboKernelCompileTimeAutotuneTests(TestCase):
 
     @requires_gpu_and_triton
     def test_compile_time_autotune_caching(self):
+        # [FUNCTION DOC] Checks the on-disk autotune cache for compile-time subkernel tuning.
+        # With max autotune on and graph caches off in a fresh cache, a cold compile must tune
+        # at least one subkernel with no fallbacks. After resetting dynamo and purging only the
+        # in-memory code cache, a warm compile must tune none and report the same number as
+        # cached, again with no fallbacks.
         from torch._inductor.codecache import PyCodeCache
 
         def f(a, b, c, d):
+            # [FUNCTION DOC] HELPER: Return a plus b and c times d.
             return a + b, c * d
 
         # shapes distinct from the other test so these subkernels aren't already cached
@@ -2163,10 +2542,15 @@ class ComboKernelCompileTimeAutotuneTests(TestCase):
 
     @requires_gpu_and_triton
     def test_compile_time_autotune_looped_reduction(self):
+        # [FUNCTION DOC] Row sums/max of 8192 and 16384 wide rows (looped, not persistent, not
+        # split) compile in a fresh cache; result close to eager (loose tolerance). Unless
+        # cpp_wrapper is on, the generated source must mention both per-subkernel reduction
+        # block arguments in order. No autotune fallback may be counted.
         # rnumel above the persistent threshold but below the split-reduction
         # threshold -> single-pass looped reductions, whose winning configs
         # carry R0_BLOCK; the combo must expose R0_BLOCK_i as constexpr args.
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Return the last-dim sum of a and last-dim max of b.
             return a.sum(-1), b.amax(-1)
 
         inps = [
@@ -2186,7 +2570,11 @@ class ComboKernelCompileTimeAutotuneTests(TestCase):
 
     @requires_gpu_and_triton
     def test_compile_time_autotune_dynamic_shapes(self):
+        # [FUNCTION DOC] Two pointwise ops with dynamic sizes compile once in a fresh cache
+        # with dynamic mode; the result matches eager, calling again with new sizes also
+        # matches, and no fallback is counted.
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Return a plus 1 and b times 2.
             return a + 1.0, b * 2.0
 
         a = torch.randn(4096, device=GPU_TYPE)
@@ -2206,6 +2594,11 @@ class ComboKernelCompileTimeAutotuneTests(TestCase):
 
     @requires_gpu_and_triton
     def test_compile_time_autotune_sort_forces_persistent(self):
+        # [FUNCTION DOC] Sort members must stay persistent in the compile-time benchmark twin
+        # even if the choices heuristic says non-persistent. Patches the heuristic to return
+        # false for kernels containing sort, disables coalesced tiling analysis, compiles two
+        # sorts; expects eager-equal output and zero autotune fallbacks (sorts stay fused in
+        # the combo).
         # The standalone benchmark twin must stay persistent for sort even when the
         # choices-level heuristic says otherwise (TritonKernel.sort asserts persistent;
         # TritonKernel.should_use_persistent_reduction enforces it above the heuristic).
@@ -2215,11 +2608,14 @@ class ComboKernelCompileTimeAutotuneTests(TestCase):
 
         @staticmethod
         def force_non_persistent_for_sort(features, cooperative_reduction):
+            # [FUNCTION DOC] HELPER: Replacement persistent-reduction heuristic: false when the
+            # features contain sort, otherwise the saved original heuristic result.
             if features.contains_op("sort"):
                 return False
             return orig(features, cooperative_reduction)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return sorted values along dim 1 of both inputs.
             return torch.sort(a, dim=1).values, torch.sort(b, dim=1).values
 
         inps = [
@@ -2244,7 +2640,13 @@ class ComboKernelCompileTimeAutotuneTests(TestCase):
     @requires_gpu_and_triton
     @parametrize("benchmark_combo_kernel", [False, True])
     def test_benchmarking_excludes_indirect_indexing(self, benchmark_combo_kernel):
+        # [FUNCTION DOC] Parametrized by benchmark_combo_kernel (compile-time autotune is set
+        # to the opposite). A gather with an indirect index plus two pointwise ops: result
+        # matches eager, and the generated code shows the gather as its own kernel while the
+        # combo has only 2 subkernels, so indirect indexing is excluded from benchmarking in
+        # both modes.
         def fn(a, b, c, idx):
+            # [FUNCTION DOC] HELPER: Return a gathered at idx plus 1024, b times 2, c plus 1.
             return a[idx + 1024], b * 2.0, c + 1.0
 
         inps = [
@@ -2273,7 +2675,10 @@ class ComboKernelCompileTimeAutotuneTests(TestCase):
 
     @requires_gpu_and_triton
     def test_disabled_autotune_keeps_indirect_indexing(self):
+        # [FUNCTION DOC] With combo autotuning disabled, the same gather plus two pointwise ops
+        # stay in one combo kernel of 3 subkernels, with output equal to eager.
         def fn(a, b, c, idx):
+            # [FUNCTION DOC] HELPER: Return a gathered at idx plus 1024, b times 2, c plus 1.
             return a[idx + 1024], b * 2.0, c + 1.0
 
         inps = [
@@ -2290,9 +2695,14 @@ class ComboKernelCompileTimeAutotuneTests(TestCase):
 
 @instantiate_parametrized_tests
 class ComboKernelPDLTests(TestCase):
+    # [CLASS DOC] Tests for Programmatic Dependent Launch (PDL) codegen in combo kernels.
+    # setUp enables combo kernels, PDL, no benchmarking, unlimited distance and no
+    # peak-memory limits.
     """Tests for PDL (Programmatic Dependent Launch) support in combo kernels."""
 
     def setUp(self):
+        # [FUNCTION DOC] Reset metrics and push a config patch enabling combo kernels and PDL
+        # onto an ExitStack.
         super().setUp()
         torch._inductor.metrics.reset()
         self._test_stack = contextlib.ExitStack()
@@ -2310,6 +2720,7 @@ class ComboKernelPDLTests(TestCase):
         )
 
     def tearDown(self):
+        # [FUNCTION DOC] Close the patch stack, reset metrics, call base tearDown.
         self._test_stack.close()
         torch._inductor.metrics.reset()
         super().tearDown()
@@ -2318,9 +2729,14 @@ class ComboKernelPDLTests(TestCase):
     @skipIfRocm
     @unittest.skipIf(not SM90OrLater, "PDL requires SM90 or later (Hopper+)")
     def test_pdl_codegen_in_combo_kernel(self):
+        # [FUNCTION DOC] Needs Hopper or newer, non-ROCm. Two same-sized pointwise ops compile
+        # with round-robin dispatch; the code must set the PDL launch flag, and each subkernel
+        # branch must have exactly one wait on the grid dependency before its load and one
+        # launch-dependents call after, with no redundant waits between.
         """Test that PDL flag and gdc calls are generated in combo kernels."""
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return relu of a and sigmoid of b.
             return torch.relu(a), torch.sigmoid(b)
 
         inps = [
@@ -2358,9 +2774,13 @@ class ComboKernelPDLTests(TestCase):
     @skipIfRocm
     @unittest.skipIf(not SM90OrLater, "PDL requires SM90 or later (Hopper+)")
     def test_pdl_combo_kernel_pointwise(self):
+        # [FUNCTION DOC] Needs Hopper or newer, non-ROCm. Three pointwise ops compile to one
+        # kernel with the right results; generated code has the PDL flag and each of the three
+        # dispatch branches has one wait and one launch-dependents call, with no extra waits.
         """Test that pointwise combo kernels produce correct results with PDL."""
 
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Return relu of a, sigmoid of b, tanh of c.
             return torch.relu(a), torch.sigmoid(b), torch.tanh(c)
 
         inps = [
@@ -2401,9 +2821,12 @@ class ComboKernelPDLTests(TestCase):
     @skipIfRocm
     @unittest.skipIf(not SM90OrLater, "PDL requires SM90 or later (Hopper+)")
     def test_pdl_combo_kernel_reduction(self):
+        # [FUNCTION DOC] Needs Hopper or newer, non-ROCm. Reduction combo kernels with PDL
+        # enabled: sum and mean over the last dim must match eager.
         """Test that reduction combo kernels produce correct results with PDL."""
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Return last-dim sum of x and last-dim mean of y.
             return x.sum(dim=-1), y.mean(dim=-1)
 
         inps = [
@@ -2419,7 +2842,12 @@ class ComboKernelPDLTests(TestCase):
 
 @instantiate_parametrized_tests
 class ComboKernelTestsMaxAutotune(TestCase):
+    # [CLASS DOC] Combo kernel tests under max autotune: setUp enables combo kernels with
+    # per-subkernel blocks, max_autotune, no local autotune cache, unlimited distance and no
+    # peak-memory limits. Tests look for debug logs from the sequential combo autotune path.
     def setUp(self):
+        # [FUNCTION DOC] Reset metrics and push the max-autotune combo kernel config patch onto
+        # an ExitStack.
         super().setUp()
         torch._inductor.metrics.reset()
         self._test_stack = contextlib.ExitStack()
@@ -2439,13 +2867,19 @@ class ComboKernelTestsMaxAutotune(TestCase):
         )
 
     def tearDown(self):
+        # [FUNCTION DOC] Close the patch stack, reset metrics, call base tearDown.
         self._test_stack.close()
         torch._inductor.metrics.reset()
         super().tearDown()
 
     @requires_gpu_and_triton
     def test_combo_kernel_max_autotune(self):
+        # [FUNCTION DOC] Three pointwise activations of different shapes compile under debug
+        # logging of the autotuner module; asserts at least one "Combo sequential autotune" log
+        # line, eager-equal output and one generated kernel.
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Apply relu, sigmoid and tanh to three inputs and return
+            # the results.
             a1 = torch.nn.functional.relu(a)
             b1 = torch.nn.functional.sigmoid(b)
             c1 = torch.nn.functional.tanh(c)
@@ -2474,7 +2908,10 @@ class ComboKernelTestsMaxAutotune(TestCase):
 
     @requires_gpu_and_triton
     def test_combo_kernel_max_autotune_with_reduction(self):
+        # [FUNCTION DOC] Same as the previous test with a sum and a mean reduction over the
+        # last dim.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Return last-dim sum of x and last-dim mean of y.
             return x.sum(dim=-1), y.mean(dim=-1)
 
         inps = [
@@ -2499,7 +2936,10 @@ class ComboKernelTestsMaxAutotune(TestCase):
 
     @requires_gpu_and_triton
     def test_combo_autotune_many_subkernels(self):
+        # [FUNCTION DOC] Six pointwise ops over very different shapes compile to one kernel;
+        # sequential autotune debug logs must appear and the output must match eager.
         def fn(a, b, c, d, e, f):
+            # [FUNCTION DOC] HELPER: Return six different pointwise results of the six inputs.
             return (
                 a * 2.0,
                 b + 1.0,
@@ -2532,7 +2972,11 @@ class ComboKernelTestsMaxAutotune(TestCase):
 
     @requires_gpu_and_triton
     def test_combo_kernel_per_subkernel_reduction_hint(self):
+        # [FUNCTION DOC] A last-dim sum and a dim 0 sum of same-shaped inputs. Reads the
+        # generated code for per-subkernel reduction hint entries and asserts both exist with
+        # value INNER for the first and OUTER for the second; output matches eager.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Return the last-dim sum of x and the dim 0 sum of y.
             return x.sum(dim=-1), y.sum(dim=0)
 
         inps = [
@@ -2567,7 +3011,11 @@ class ComboKernelTestsMaxAutotune(TestCase):
         }
     )
     def test_combo_autotune_grouping(self):
+        # [FUNCTION DOC] With autotune grouping on, four pointwise ops fall into two size
+        # buckets. Parses debug log lines naming phase one groups and asserts exactly two
+        # distinct group indices, then checks output equals eager and one kernel is generated.
         def fn(a, b, c, d):
+            # [FUNCTION DOC] HELPER: Return cos, sin, exp and negation of the four inputs.
             return a.cos(), b.sin(), c.exp(), d.neg()
 
         # a,b: numel=262144 -> bs=1024, c,d: numel=32 -> bs=256
@@ -2608,6 +3056,12 @@ class ComboKernelTestsMaxAutotune(TestCase):
     @requires_gpu_and_triton
     @torch._inductor.config.patch("combo_kernel_autotune_grouping", True)
     def test_combo_autotune_grouping_by_metadata_fingerprint(self):
+        # [FUNCTION DOC] With autotune grouping on, builds combo grid metadata by hand for two
+        # reduction subkernels and calls the per-subkernel-blocks handler with the reduction
+        # heuristic mocked to return one fixed config. In each subtest one field of subkernel 1
+        # is changed (size hints, load count, device TMA use, tiling scores) and the resulting
+        # number of tuning groups stored in the metadata is compared: one group when identical,
+        # two when any field differs.
         """Sub-kernels share a group iff every per-sub-kernel heuristic input
         is identical; any difference in the fingerprint separates them.
         """
@@ -2623,6 +3077,10 @@ class ComboKernelTestsMaxAutotune(TestCase):
             uses_device_tma=False,
             tiling_scores=None,
         ):
+            # [FUNCTION DOC] HELPER: Build a per-subkernel metadata mapping with the given
+            # load, store and reduction counts, autotune hints (empty list if none), atomic
+            # add flag, no-x-dim flag, device TMA flag and tiling scores (default x of 1 and
+            # r0 of 8).
             return {
                 "num_load": num_load,
                 "num_store": num_store,
@@ -2637,6 +3095,9 @@ class ComboKernelTestsMaxAutotune(TestCase):
             }
 
         def base_combo_meta():
+            # [FUNCTION DOC] HELPER: Build combo grid metadata for two reduction subkernels
+            # with identical size hints, INNER reduction hints and per-subkernel metadata, and
+            # the grouping flag set.
             return {
                 "num_kernels": 2,
                 # Captured config — real combo_grid_meta() always sets this.
@@ -2654,6 +3115,9 @@ class ComboKernelTestsMaxAutotune(TestCase):
             }
 
         def reduction_configs(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Mock replacement for the reduction heuristic; ignores its
+            # arguments and returns a list with one Triton config (x block 8, reduction block
+            # 256, 4 warps, 1 stage).
             return [
                 triton.Config(
                     {"XBLOCK": 8, "R0_BLOCK": 256}, num_warps=4, num_stages=1
@@ -2711,6 +3175,10 @@ class ComboKernelTestsMaxAutotune(TestCase):
     @requires_gpu_and_triton
     @parametrize("per_subkernel", [True, False])
     def test_combo_max_persistent_rblock_gated_on_per_subkernel(self, per_subkernel):
+        # [FUNCTION DOC] Parametrized by per_subkernel. Two row sums of different widths
+        # compile with the option set to the parameter; output matches eager. When
+        # per-subkernel blocks are on, the code must not carry the max persistent reduction
+        # block key; otherwise it must carry it with 1024.
         """The combo-only HIP filter (XBLOCK * max_persistent_rblock <= 4096)
         from PR #175671 guards a shared-XBLOCK blowup that only exists in
         the legacy combo path. Under per_subkernel_blocks=True each sub has
@@ -2719,6 +3187,7 @@ class ComboKernelTestsMaxAutotune(TestCase):
         """
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the last-dim sums of both inputs.
             return a.sum(-1), b.sum(-1)
 
         inps = [
@@ -2739,7 +3208,14 @@ class ComboKernelTestsMaxAutotune(TestCase):
 
     @requires_gpu_and_triton
     def test_combo_kernel_coordesc_tunes_largest_subkernel_first(self):
+        # [FUNCTION DOC] With coordinate descent tuning on, compiles three activations of
+        # different sizes while capturing debug logs of the coordinate descent tuner. Output
+        # must equal eager; there must be baseline and attempt logs naming per-subkernel block
+        # fields, more than one distinct block configuration tried, and the first attempt must
+        # change only the block field of subkernel 1 (the largest one), i.e. the largest
+        # subkernel is tuned first.
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Return relu, sigmoid and tanh of the three inputs.
             return (
                 torch.nn.functional.relu(a),
                 torch.nn.functional.sigmoid(b),
@@ -2755,6 +3231,9 @@ class ComboKernelTestsMaxAutotune(TestCase):
         out_eager = fn(*inps)
 
         def parse_block_cfg(msg: str) -> dict[str, int]:
+            # [FUNCTION DOC] HELPER: Parse a log message into a mapping from per-subkernel
+            # block names to integer values, taking every name-and-number pair that matches the
+            # block naming pattern.
             return {
                 m.group(1): int(m.group(2))
                 for m in re.finditer(r"(\w+BLOCK_\d+): (\d+)", msg)
@@ -2799,7 +3278,13 @@ class ComboKernelTestsMaxAutotune(TestCase):
 
 @instantiate_parametrized_tests
 class ComboKernelMetadataTests(TestCase):
+    # [CLASS DOC] Tests that combo kernel generated code carries the expected metadata
+    # (inductor_meta, triton meta, per-subkernel fields, profiling numbers). setUp
+    # enables combo kernels with per-subkernel blocks and no benchmarking; _combo_code compiles
+    # and returns code text.
     def setUp(self):
+        # [FUNCTION DOC] Reset metrics and push a config patch (combo kernels, no benchmarking,
+        # per-subkernel blocks) onto an ExitStack.
         super().setUp()
         torch._inductor.metrics.reset()
         self._test_stack = contextlib.ExitStack()
@@ -2814,11 +3299,15 @@ class ComboKernelMetadataTests(TestCase):
         )
 
     def tearDown(self):
+        # [FUNCTION DOC] Close the patch stack, reset metrics, call base tearDown.
         self._test_stack.close()
         torch._inductor.metrics.reset()
         super().tearDown()
 
     def _combo_code(self, fn, inps):
+        # [FUNCTION DOC] HELPER: Run the function eagerly and compiled, assert the outputs are
+        # equal, and return all generated code strings joined with spaces. Args: the function
+        # and the input list.
         out_eager = fn(*inps)
         out_compiled, code = run_and_get_code(torch.compile(fn), *inps)
         self.assertEqual(out_eager, out_compiled)
@@ -2826,7 +3315,10 @@ class ComboKernelMetadataTests(TestCase):
 
     @requires_gpu_and_triton
     def test_combo_inductor_meta_has_optimize_mem(self):
+        # [FUNCTION DOC] Two pointwise ops compile to a combo whose code includes the memory
+        # optimization flag set true.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return relu of a and sigmoid of b.
             return torch.relu(a), torch.sigmoid(b)
 
         inps = [torch.rand(1024, device=GPU_TYPE) for _ in range(2)]
@@ -2835,7 +3327,10 @@ class ComboKernelMetadataTests(TestCase):
 
     @requires_gpu_and_triton
     def test_combo_inductor_meta_optimize_mem_false_in_training_forward(self):
+        # [FUNCTION DOC] Same function with inputs requiring grad (training forward): the
+        # memory optimization flag in the generated code must be false.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return relu of a and sigmoid of b.
             return torch.relu(a), torch.sigmoid(b)
 
         inps = [torch.rand(1024, device=GPU_TYPE, requires_grad=True) for _ in range(2)]
@@ -2845,7 +3340,11 @@ class ComboKernelMetadataTests(TestCase):
     @requires_gpu_and_triton
     @parametrize("disable_ftz", [False, True])
     def test_combo_triton_meta_has_disable_ftz(self, disable_ftz):
+        # [FUNCTION DOC] Parametrized by disable_ftz. With the numerics config set accordingly,
+        # the generated combo kernel meta must contain the disable flush-to-zero entry with the
+        # same value.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return relu of a and sigmoid of b.
             return torch.relu(a), torch.sigmoid(b)
 
         inps = [torch.rand(1024, device=GPU_TYPE) for _ in range(2)]
@@ -2855,7 +3354,12 @@ class ComboKernelMetadataTests(TestCase):
 
     @requires_gpu_and_triton
     def test_combo_pointwise_combo_grid_meta_has_per_subkernel_fields(self):
+        # [FUNCTION DOC] Three pointwise subkernels: the generated code must have, for each
+        # subkernel index, a per-subkernel inductor meta entry followed by load, store,
+        # reduction counts, autotune hints and atomic add fields (order among the fields is
+        # not enforced).
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Return relu, sigmoid and tanh of the three inputs.
             return torch.relu(a), torch.sigmoid(b), torch.tanh(c)
 
         inps = [torch.rand(1024, device=GPU_TYPE) for _ in range(3)]
@@ -2878,7 +3382,10 @@ class ComboKernelMetadataTests(TestCase):
 
     @requires_gpu_and_triton
     def test_combo_reduction_combo_grid_meta_has_per_subkernel_fields(self):
+        # [FUNCTION DOC] Same field check for two reduction subkernels, covering load, store
+        # and reduction counts.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the last-dim sum of a and mean of b.
             return a.sum(-1), b.mean(-1)
 
         inps = [torch.rand(32, 1024, device=GPU_TYPE) for _ in range(2)]
@@ -2894,7 +3401,10 @@ class ComboKernelMetadataTests(TestCase):
     @requires_gpu_and_triton
     @torch._inductor.config.patch({"deterministic": True})
     def test_combo_reduction_deterministic_has_contiguous_rdim_per_subkernel(self):
+        # [FUNCTION DOC] In deterministic mode, each reduction subkernel meta must carry the
+        # entry saying whether it has a load or store with contiguous reduction dimension.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the last-dim sum of a and mean of b.
             return a.sum(-1), b.mean(-1)
 
         inps = [torch.rand(32, 1024, device=GPU_TYPE) for _ in range(2)]
@@ -2909,6 +3419,11 @@ class ComboKernelMetadataTests(TestCase):
 
     @requires_gpu_and_triton
     def test_combo_per_kernel_inductor_meta_matches_standalone(self):
+        # [FUNCTION DOC] Extracts selected per-kernel meta fields (load/store/reduction counts,
+        # atomic add, no-x-dim, autotune hints, tiling scores) by regex from kernels compiled
+        # with combo kernels off (one dict per standalone kernel, split on the meta keyword)
+        # and from per-subkernel meta entries of the combo kernel, and asserts both lists of
+        # dicts are equal.
         per_kernel_fields = re.compile(
             r"'(num_load|num_store|num_reduction|"
             r"atomic_add_found|no_x_dim|"
@@ -2917,6 +3432,7 @@ class ComboKernelMetadataTests(TestCase):
         )
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return relu of a and sigmoid of b.
             return torch.relu(a), torch.sigmoid(b)
 
         inps = [torch.rand(1024, device=GPU_TYPE) for _ in range(2)]
@@ -2946,10 +3462,15 @@ class ComboKernelMetadataTests(TestCase):
     @requires_gpu_and_triton
     @torch._inductor.config.patch({"benchmark_kernel": True})
     def test_combo_kernel_num_gb_and_flop_match_standalone_sum(self):
+        # [FUNCTION DOC] With kernel benchmarking on, compares the combo kernel's top-level
+        # memory traffic and flop meta values against the sums over standalone kernels compiled
+        # with combo off. The last match in the combo source is taken as the combo-level value;
+        # compared to six places.
         kernel_num_gb_re = re.compile(r"'kernel_num_gb'\s*:\s*([\d.eE+-]+)")
         kernel_flop_re = re.compile(r"'kernel_flop'\s*:\s*([\d.eE+-]+)")
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return relu of a and sigmoid of b.
             return torch.relu(a), torch.sigmoid(b)
 
         inps = [torch.rand(1024, device=GPU_TYPE) for _ in range(2)]
@@ -2977,7 +3498,10 @@ class ComboKernelMetadataTests(TestCase):
     @requires_gpu_and_triton
     @torch._inductor.config.patch({"profile_bandwidth": True})
     def test_combo_inductor_meta_has_kernel_num_gb_under_profile_bandwidth(self):
+        # [FUNCTION DOC] Under bandwidth profiling, the combo meta has the memory traffic entry
+        # but no flop entry.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return relu of a and sigmoid of b.
             return torch.relu(a), torch.sigmoid(b)
 
         inps = [torch.rand(1024, device=GPU_TYPE) for _ in range(2)]
@@ -2987,7 +3511,10 @@ class ComboKernelMetadataTests(TestCase):
 
     @requires_gpu_and_triton
     def test_combo_inductor_meta_no_kernel_num_gb_without_profile(self):
+        # [FUNCTION DOC] Without profiling or benchmarking, the combo code has neither memory
+        # traffic nor flop meta.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return relu of a and sigmoid of b.
             return torch.relu(a), torch.sigmoid(b)
 
         inps = [torch.rand(1024, device=GPU_TYPE) for _ in range(2)]
@@ -2997,6 +3524,9 @@ class ComboKernelMetadataTests(TestCase):
 
     @requires_gpu_and_triton
     def test_combo_rms_norm_forwards_add_persistent_rblock(self):
+        # [FUNCTION DOC] Two parallel RMS norms over large rows form a combo; each
+        # per-subkernel meta must include the add-persistent-rblock entry (forwarded from the
+        # standalone large-rblock optimization so the specialized config can be emitted).
         """rms_norm at (2048, 4096) triggers the large-rblock persistent
         optimization for standalone kernels (set by triton.py:5820). Two
         parallel rms_norms forming a combo kernel must forward
@@ -3004,10 +3534,14 @@ class ComboKernelMetadataTests(TestCase):
         the same specialized large-RBLOCK config."""
 
         def rms_norm(x, w, eps=1e-6):
+            # [FUNCTION DOC] HELPER: RMS norm: weight times x times reciprocal sqrt of (mean of
+            # squares over the last dim plus eps).
             v = x.pow(2).mean(-1, keepdim=True)
             return w * x * torch.rsqrt(v + eps)
 
         def fn(a, wa, b, wb):
+            # [FUNCTION DOC] HELPER: Apply the RMS norm helper to two input and weight pairs;
+            # return both.
             return rms_norm(a, wa), rms_norm(b, wb)
 
         a = torch.rand(2048, 4096, device=GPU_TYPE)
@@ -3027,7 +3561,11 @@ class ComboKernelMetadataTests(TestCase):
     @requires_gpu_and_triton
     @torch._inductor.config.patch({"benchmark_combo_kernel": True})
     def test_benchmark_combo_kernel_emits_real_num_gb(self):
+        # [FUNCTION DOC] With combo benchmarking on, the generated benchmark code must print a
+        # real decimal bandwidth number and quote the device string in the benchmark setup
+        # (not unquoted).
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return relu of a and sigmoid of b.
             return torch.relu(a), torch.sigmoid(b)
 
         inps = [torch.rand(1024, device=GPU_TYPE) for _ in range(2)]
@@ -3039,7 +3577,12 @@ class ComboKernelMetadataTests(TestCase):
 
 # Minimal scheduler doubles for direct _try_combo_with_memory_check tests.
 class _PeakMemFakeNode:
+    # [CLASS DOC] HELPER: Fake scheduler node for combo memory check tests. Holds a name, a
+    # bare scheduler object, an output list, a mem-planning node with no predecessor buffers,
+    # and an optional list of sub-nodes (when set, outputs come from the sub-nodes).
     def __init__(self, name: str) -> None:
+        # [FUNCTION DOC] HELPER: Store the name and set up the empty output list, scheduler
+        # object, planning node with an empty predecessor set, and no sub-nodes.
         self.name = name
         self.scheduler = object()
         self._outputs: list = []
@@ -3047,12 +3590,16 @@ class _PeakMemFakeNode:
         self.snodes: list | None = None
 
     def get_name(self) -> str:
+        # [FUNCTION DOC] HELPER: Return the node name.
         return self.name
 
     def get_first_name(self) -> str:
+        # [FUNCTION DOC] HELPER: Return the node name (same as the full name here).
         return self.name
 
     def get_outputs(self):
+        # [FUNCTION DOC] HELPER: Return the concatenated outputs of the sub-nodes if present,
+        # else the own outputs.
         if self.snodes is not None:
             out = []
             for s in self.snodes:
@@ -3062,7 +3609,11 @@ class _PeakMemFakeNode:
 
 
 class _PeakMemFakeBuffer:
+    # [CLASS DOC] HELPER: Fake buffer with a name and a planning record holding allocation
+    # size, free size and successor nodes.
     def __init__(self, name: str, succ_nodes, size_alloc: int, size_free: int) -> None:
+        # [FUNCTION DOC] HELPER: Store name and build the planning record from sizes
+        # and successors.
         self.name = name
         self.mpi_buffer = SimpleNamespace(
             size_alloc=size_alloc,
@@ -3071,25 +3622,36 @@ class _PeakMemFakeBuffer:
         )
 
     def get_name(self) -> str:
+        # [FUNCTION DOC] HELPER: Return the buffer name.
         return self.name
 
 
 class _PeakMemFakeScheduler:
+    # [CLASS DOC] HELPER: Fake scheduler exposing a node list, a map from names to fused nodes
+    # (empty if not given), and an identity topological sort.
     def __init__(self, nodes, name_to_fused_node=None) -> None:
+        # [FUNCTION DOC] HELPER: Store the node list and the name map (empty mapping
+        # when None).
         self.nodes = nodes
         self.name_to_fused_node = (
             {} if name_to_fused_node is None else name_to_fused_node
         )
 
     def topological_sort_schedule(self, nodes):
+        # [FUNCTION DOC] HELPER: Return the given nodes unchanged.
         return nodes
 
 
 @instantiate_parametrized_tests
 class ComboKernelPeakMemoryTests(InductorTestCase):
+    # [CLASS DOC] Tests for memory-aware acceptance and commit of combo kernels (peak memory
+    # thresholds, reordering). setUp enables combo kernels with per-subkernel blocks; helper
+    # methods build thresholds and a WideResNet-like model.
     """Coverage for memory-aware combo-kernel acceptance and commit logic."""
 
     def setUp(self):
+        # [FUNCTION DOC] Reset metrics and push a config patch (combo kernels, no benchmarking,
+        # per-subkernel blocks) onto an ExitStack.
         super().setUp()
         torch._inductor.metrics.reset()
         self._test_stack = contextlib.ExitStack()
@@ -3104,12 +3666,16 @@ class ComboKernelPeakMemoryTests(InductorTestCase):
         )
 
     def tearDown(self):
+        # [FUNCTION DOC] Close the patch stack, reset metrics, call base tearDown.
         self._test_stack.close()
         torch._inductor.metrics.reset()
         super().tearDown()
 
     @staticmethod
     def _thresholds(*, abs_thr_gb=None, pct_thr=None, max_distance=-1):
+        # [FUNCTION DOC] HELPER: Static method; returns a config mapping with the peak memory
+        # absolute and percent thresholds and the max distance, keyword-only with defaults
+        # none, none and -1.
         return {
             "combo_kernel_peak_memory_increase_gb": abs_thr_gb,
             "combo_kernel_peak_memory_pct_threshold": pct_thr,
@@ -3119,6 +3685,11 @@ class ComboKernelPeakMemoryTests(InductorTestCase):
     @requires_cuda_and_triton
     @parametrize("gate_enabled", [True, False])
     def test_peak_memory_reorder_order(self, gate_enabled):
+        # [FUNCTION DOC] CUDA only, parametrized by whether the percent threshold gate is on.
+        # Wraps combo node creation, reorder-for-peak-memory and planning-info preparation
+        # with recorders, compiles two pointwise ops in a fresh cache and asserts the result
+        # matches eager, the call order is reorder then combo, and planning info is prepared
+        # exactly once.
         from torch._inductor import memory
         from torch._inductor.scheduler import Scheduler
 
@@ -3129,19 +3700,26 @@ class ComboKernelPeakMemoryTests(InductorTestCase):
         reorder = memory.reorder_for_peak_memory
 
         def record_combo(scheduler, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Record a combo event then delegate to the original combo
+            # node creation.
             calls.append("combo")
             return create_combo(scheduler, *args, **kwargs)
 
         def record_reorder(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Record a reorder event then delegate to the original
+            # reorder function.
             calls.append("reorder")
             return reorder(*args, **kwargs)
 
         def record_prepare_planning_info(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Count the call (nonlocal counter) and delegate to the
+            # original planning-info preparation.
             nonlocal planning_calls
             planning_calls += 1
             return prepare_planning_info(*args, **kwargs)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return sine of a and cosine of b.
             return a.sin(), b.cos()
 
         inputs = [torch.randn(16, device=GPU_TYPE) for _ in range(2)]
@@ -3166,12 +3744,21 @@ class ComboKernelPeakMemoryTests(InductorTestCase):
 
     @staticmethod
     def _make_wide_resnet_like():
+        # [FUNCTION DOC] HELPER: Static method that builds and returns a small WideResNet-like
+        # module: a stem, four layers of bottleneck blocks and a classifier (details in the
+        # nested definitions).
         """Build a WideResNet-like model."""
 
         class Bottleneck(torch.nn.Module):
+            # [CLASS DOC] HELPER: Residual bottleneck block with three convolutions, each
+            # followed by batch norm, in-place relu, optional downsample on the shortcut,
+            # expansion factor 4.
             expansion = 4
 
             def __init__(self, in_ch, mid_ch, stride=1, downsample=None):
+                # [FUNCTION DOC] HELPER: Create the three conv and batch norm pairs (channel
+                # counts in, mid, mid times expansion; stride on the middle conv), relu and the
+                # optional downsample module.
                 super().__init__()
                 self.conv1 = torch.nn.Conv2d(in_ch, mid_ch, 1, bias=False)
                 self.bn1 = torch.nn.BatchNorm2d(mid_ch)
@@ -3187,6 +3774,8 @@ class ComboKernelPeakMemoryTests(InductorTestCase):
                 self.downsample = downsample
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Run the three conv-bn stages with relu after the first
+                # two, add the (possibly downsampled) input and apply relu.
                 identity = x
                 out = self.relu(self.bn1(self.conv1(x)))
                 out = self.relu(self.bn2(self.conv2(out)))
@@ -3196,6 +3785,8 @@ class ComboKernelPeakMemoryTests(InductorTestCase):
                 return self.relu(out + identity)
 
         def make_layer(in_ch, mid_ch, blocks, stride=1):
+            # [FUNCTION DOC] HELPER: Build a sequential layer: first block with a conv and
+            # batch norm downsample shortcut, then the remaining blocks at expanded width.
             downsample = torch.nn.Sequential(
                 torch.nn.Conv2d(in_ch, mid_ch * 4, 1, stride=stride, bias=False),
                 torch.nn.BatchNorm2d(mid_ch * 4),
@@ -3206,7 +3797,12 @@ class ComboKernelPeakMemoryTests(InductorTestCase):
             return torch.nn.Sequential(*layers)
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Small bottleneck-ResNet-like network: 7x7 stride-2 stem with
+            # batch norm, relu and max pool, three layers of bottleneck blocks (3, 4 and 20
+            # blocks), global average pool and a 1000-way linear classifier.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Create the stem, pooling, the three bottleneck layers
+                # via the layer builder, the average pool and the classifier.
                 super().__init__()
                 self.conv1 = torch.nn.Conv2d(3, 64, 7, stride=2, padding=3, bias=False)
                 self.bn1 = torch.nn.BatchNorm2d(64)
@@ -3219,6 +3815,8 @@ class ComboKernelPeakMemoryTests(InductorTestCase):
                 self.fc = torch.nn.Linear(2048, 1000)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Run stem, max pool, the three layers, average pool,
+                # flatten and classifier.
                 x = self.maxpool(self.relu(self.bn1(self.conv1(x))))
                 x = self.layer1(x)
                 x = self.layer2(x)
@@ -3237,6 +3835,12 @@ class ComboKernelPeakMemoryTests(InductorTestCase):
         thresholds,
         graph_outputs=None,
     ):
+        # [FUNCTION DOC] HELPER: Static method running the scheduler memory-gated combo attempt
+        # with a fake scheduler. Builds a memory context (graph outputs default to empty, index
+        # per node, baseline and running peak, baseline live memory), patches combo node
+        # construction with a fake that unions the members' predecessor buffers, applies the
+        # threshold config, and returns the pair of combo node (or none if rejected) and its
+        # step from the scheduler method, with autotune off.
         from torch._inductor.scheduler import ComboKernelMemoryContext, Scheduler
 
         scheduler = _PeakMemFakeScheduler(nodes)
@@ -3249,6 +3853,9 @@ class ComboKernelPeakMemoryTests(InductorTestCase):
         )
 
         def _fake_combo(scheduler_arg, snodes, **kwargs):
+            # [FUNCTION DOC] HELPER: Fake combo node factory: builds a fake node named combo
+            # whose sub-nodes are the members and whose planning node has the union of the
+            # members' predecessor buffers.
             n = _PeakMemFakeNode("combo")
             n.snodes = list(snodes)
             pred_buffers: set = set()
@@ -3272,6 +3879,10 @@ class ComboKernelPeakMemoryTests(InductorTestCase):
             )
 
     def test_threshold_gating(self):
+        # [FUNCTION DOC] Four fake nodes with 2 MB buffers freed by consumers; the combo of the
+        # two producers forces a 2 MB peak increase. Absolute limit zero, percent limit zero
+        # and a 1 MB absolute limit must each reject (no combo); a one GB limit must accept
+        # with combo step 0.
         """abs_thr/pct_thr set to 0 or a too-small bound reject."""
         ONE_MB = 1024 * 1024
         a = _PeakMemFakeNode("a")
@@ -3292,6 +3903,8 @@ class ComboKernelPeakMemoryTests(InductorTestCase):
         baseline_live_before = [0, 2 * ONE_MB, 0, 2 * ONE_MB, 0]
 
         def run(thresholds):
+            # [FUNCTION DOC] HELPER: Run the fake-scheduler combo attempt on the producers a
+            # and b with the given thresholds and the shared baseline numbers.
             return self._try_combo_with_fake_scheduler(
                 nodes,
                 [a, b],
@@ -3314,6 +3927,10 @@ class ComboKernelPeakMemoryTests(InductorTestCase):
         self.assertEqual(combo_step, 0)
 
     def test_region_carry_in_uses_post_free_boundary(self):
+        # [FUNCTION DOC] Region boundary accounting: a buffer freed before the region starts
+        # (producer a, freed at step 1) must not count as carry-in memory for a region starting
+        # at step 2 of combining c and d. With a zero absolute limit and graph outputs as the
+        # two new buffers, the combo must be accepted.
         a = _PeakMemFakeNode("a")
         consume_a = _PeakMemFakeNode("consume_a")
         c = _PeakMemFakeNode("c")
@@ -3345,6 +3962,10 @@ class ComboKernelPeakMemoryTests(InductorTestCase):
     @skipIfRocm  # https://github.com/pytorch/pytorch/issues/182444
     @requires_cuda_and_triton
     def test_combo_kernel_peak_memory_wide_resnet(self):
+        # [FUNCTION DOC] CUDA only, skipped on ROCm. Builds a WideResNet-like model, compiles
+        # it twice in fresh caches (with and without a tight 1 MB peak memory threshold, same
+        # max distance) and measures runtime peak CUDA memory of the second forward call;
+        # asserts the tight threshold gives a strictly lower peak than gating disabled.
         """A tight peak-memory threshold must measurably reduce the
         runtime CUDA peak memory of the compiled forward pass compared
         to the gating-disabled baseline. Both runs pin
@@ -3355,6 +3976,10 @@ class ComboKernelPeakMemoryTests(InductorTestCase):
         x = torch.randn(1, 3, 224, 224, device=GPU_TYPE)
 
         def compile_and_measure_peak(**cfg):
+            # [FUNCTION DOC] HELPER: Reset dynamo and metrics, clear CUDA cache and peak stats,
+            # compile the model under the given config patch in a fresh cache, run it once to
+            # warm up, reset peak stats, run again under no-grad and return the peak allocated
+            # CUDA memory in bytes.
             torch._dynamo.reset()
             torch._inductor.metrics.reset()
             torch.cuda.synchronize()
@@ -3394,6 +4019,10 @@ class ComboKernelPeakMemoryTests(InductorTestCase):
         )
 
     def test_estimate_region_peak_memory(self):
+        # [FUNCTION DOC] Checks the region peak memory estimator on fake nodes with steps, one
+        # buffer freed in-window, one graph output never freed, and one allocation past the
+        # window (ignored). The walk allocates and checks the peak before freeing at each step;
+        # expects peak of 350.
         from torch._inductor import memory as mem_mod
 
         # Window [0, 5] with three buffers + one out-of-window node:
