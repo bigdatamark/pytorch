@@ -1,3 +1,6 @@
+# [PACKAGE DOC] Lookup-table package for Inductor template choices; exports only
+# LookupTableChoices (from .choices), a choices handler that serves pre-configured
+# template configs from a table. Importing it has no side effects beyond the import.
 """
 Template lookup table system for PyTorch Inductor.
 

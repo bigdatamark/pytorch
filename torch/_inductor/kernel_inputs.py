@@ -1,3 +1,7 @@
+# [MODULE DOC] Defines KernelInputs, an abstract wrapper over the input nodes of an
+# inductor kernel (shapes, strides, dtypes, device, scalars), and MMKernelInputs,
+# its matmul-specialized subclass exposing M/N/K, batch size and output layout.
+# No import-time side effects beyond imports.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -18,6 +22,10 @@ if TYPE_CHECKING:
 
 
 class KernelInputs(ABC):
+    # [CLASS DOC] Abstract holder of a non-empty list of input IR nodes plus optional
+    # named scalars and an optional output dtype. Offers read-only queries (shapes,
+    # strides, dtypes, device) and caches the device name lazily. Subclasses must
+    # implement out_dtype and output_layout.
     """
     Class to store and provide access to input nodes for kernels.
     This class takes in a tuple of input nodes and provides methods to access
@@ -30,6 +38,9 @@ class KernelInputs(ABC):
         scalars: dict[str, float | int] | None = None,
         out_dtype: torch.dtype | None = None,
     ):
+        # [FUNCTION DOC] Stores the input nodes, scalars (empty mapping if None) and
+        # optional output dtype; device name starts unset.
+        # Raises AssertionError if input_nodes is empty.
         """
         Initialize with a tuple of input nodes.
 
@@ -45,6 +56,9 @@ class KernelInputs(ABC):
             raise AssertionError("Expected at least one input node")
 
     def nodes(self, reorder: Sequence[int] | None = None) -> list[Any]:
+        # [FUNCTION DOC] Returns the stored input node list (same object, not a copy)
+        # or, if reorder is given, a new list picking nodes by those indices.
+        # Raises AssertionError if reorder length differs from the node count.
         """
         Return the stored input nodes, optionally reordered.
 
@@ -65,6 +79,7 @@ class KernelInputs(ABC):
 
     @property
     def count(self) -> int:
+        # [FUNCTION DOC] Property: number of stored input nodes.
         """
         Get the number of input nodes.
 
@@ -75,6 +90,8 @@ class KernelInputs(ABC):
 
     @property
     def device_type(self) -> str | None:
+        # [FUNCTION DOC] Property: device type string (e.g. cuda, cpu) of the first
+        # input node, via ir.get_device_type; may be None.
         """
         Get the device type of the first node.
 
@@ -85,6 +102,7 @@ class KernelInputs(ABC):
         return ir.get_device_type(self._input_nodes[0])
 
     def device(self) -> torch.device:
+        # [FUNCTION DOC] Returns the torch device of the first input node.
         """
         Get the device of the first node.
 
@@ -94,6 +112,11 @@ class KernelInputs(ABC):
         return self._input_nodes[0].get_device()
 
     def device_name(self) -> str | None:
+        # [FUNCTION DOC] Returns the cached device name; on first call, if the device
+        # type is cuda, queries the device properties and caches the gcnArchName
+        # attribute (an AMD/ROCm architecture string). Stays None for other devices.
+        # KNOWN ISSUE: docstring promises a (gpu_name, vendor, model) tuple, but a
+        # single string or None is returned; gcnArchName may be absent on non-ROCm CUDA.
         """
         Get the device name information.
 
@@ -108,6 +131,7 @@ class KernelInputs(ABC):
         return self._device_name
 
     def shapes_symbolic(self) -> tuple[tuple[Any, ...], ...]:
+        # [FUNCTION DOC] Returns one (possibly symbolic) size tuple per input node.
         """
         Get the symbolic shapes of all input nodes.
 
@@ -117,6 +141,9 @@ class KernelInputs(ABC):
         return tuple(node.get_size() for node in self._input_nodes)
 
     def shapes_hinted(self) -> tuple[tuple[int, ...], ...]:
+        # [FUNCTION DOC] Returns one tuple of concrete integer size hints per input
+        # node, obtained from the current graph's sizevars optimization hints.
+        # Requires an active graph (V.graph).
         """
         Get the size hints for shapes of all input nodes.
 
@@ -129,6 +156,7 @@ class KernelInputs(ABC):
         )
 
     def strides_symbolic(self) -> tuple[tuple[sympy.Integer, ...], ...]:
+        # [FUNCTION DOC] Returns one (possibly symbolic) stride tuple per input node.
         """
         Get the symbolic strides of all input nodes.
 
@@ -138,6 +166,8 @@ class KernelInputs(ABC):
         return tuple(node.get_stride() for node in self._input_nodes)
 
     def strides_hinted(self) -> tuple[tuple[int, ...], ...]:
+        # [FUNCTION DOC] Returns one tuple of concrete integer stride hints per input
+        # node via the current graph's sizevars. Requires an active graph.
         """
         Get the size hints for strides of all input nodes.
 
@@ -150,6 +180,7 @@ class KernelInputs(ABC):
         )
 
     def dtypes(self) -> tuple[torch.dtype, ...]:
+        # [FUNCTION DOC] Returns the dtype of every input node as a tuple.
         """
         Get the dtypes of all input nodes.
 
@@ -159,6 +190,8 @@ class KernelInputs(ABC):
         return tuple(node.get_dtype() for node in self._input_nodes)
 
     def dtype(self, idx: int = 0) -> torch.dtype:
+        # [FUNCTION DOC] Returns the dtype of the input node at idx (default first).
+        # Raises IndexError if idx is out of range.
         """
         Get the dtype of a specific input node.
 
@@ -172,6 +205,8 @@ class KernelInputs(ABC):
 
     @abstractmethod
     def out_dtype(self) -> torch.dtype:
+        # [FUNCTION DOC] Abstract: subclasses return the output dtype, either the
+        # explicitly provided one or one inferred from the input nodes.
         """
         Get the output dtype, whether passed in or inferred from the nodes
 
@@ -180,6 +215,8 @@ class KernelInputs(ABC):
         """
 
     def get_scalar(self, name: str) -> float | int:
+        # [FUNCTION DOC] Returns the named scalar from the stored mapping.
+        # Raises AssertionError if the name is missing.
         """
         Get the scalar value for a given name.
 
@@ -195,6 +232,9 @@ class KernelInputs(ABC):
 
     @abstractmethod
     def output_layout(self, flexible: bool = True) -> Layout:
+        # [FUNCTION DOC] Abstract: subclasses build the output Layout, flexible
+        # (FlexibleLayout) when flexible is true, else fixed (FixedLayout).
+        # KNOWN ISSUE: docstring lists an out_dtype argument that does not exist.
         """
         Abstract method to handle output layout generation.
 
@@ -205,6 +245,10 @@ class KernelInputs(ABC):
 
 
 class MMKernelInputs(KernelInputs):
+    # [CLASS DOC] KernelInputs for matmul-like ops. Tracks which input positions are
+    # mat1 and mat2 (default last two; negative indices allowed) so extra inputs such
+    # as bias or scales can coexist. Provides M/N/K (symbolic and hinted), batch
+    # size, mat accessors, output dtype and output layout.
     """
     Specialized KernelInputs for matrix multiplication operations.
     Provides additional methods to access M, N, K dimensions.
@@ -218,6 +262,10 @@ class MMKernelInputs(KernelInputs):
         mat1_idx: int = -2,
         mat2_idx: int = -1,
     ):
+        # [FUNCTION DOC] Initializes the base class, then validates and stores the
+        # mat1/mat2 positions (negative values count from the end).
+        # Raises AssertionError if fewer than 2 nodes or either index is out of range.
+        # Note the stored indices are the originals (possibly negative), not resolved.
         """
         Initialize with a tuple of input nodes.
 
@@ -249,6 +297,9 @@ class MMKernelInputs(KernelInputs):
     def mnk_symbolic(
         self,
     ) -> tuple[sympy.Integer, sympy.Integer, sympy.Integer]:
+        # [FUNCTION DOC] Returns symbolic (M, N, K): M and K from the last two dims of
+        # mat1, N from the last dim of mat2; leading batch dims are ignored. Asserts
+        # via sizevars that mat1's K equals mat2's second-to-last dim (may add a guard).
         """
         Get the symbolic M, N, K dimensions for matrix multiplication.
         Handles both 2D (MM) and 3D (BMM) tensors.
@@ -273,6 +324,7 @@ class MMKernelInputs(KernelInputs):
         return (m, n, k)
 
     def out_dtype(self) -> torch.dtype:
+        # [FUNCTION DOC] Returns the explicit output dtype if given, else the dtype of mat1.
         """
         Get the output dtype, whether passed in or inferred from the nodes
 
@@ -284,6 +336,12 @@ class MMKernelInputs(KernelInputs):
         return self.mat1mat2()[0].get_dtype()
 
     def output_layout(self, flexible: bool = True) -> Layout:
+        # [FUNCTION DOC] Builds the matmul output layout on the first node's device
+        # with out_dtype(); size is the broadcast-checked batch dims of mat1/mat2
+        # (equality enforced/simplified through sizevars) followed by M and N.
+        # Returns FlexibleLayout if flexible else FixedLayout.
+        # KNOWN ISSUE: docstring mentions a nonexistent out_dtype argument; the k1/k2
+        # dims are unpacked but never compared here.
         """
         Handle output layout generation for matrix multiplication.
 
@@ -304,6 +362,7 @@ class MMKernelInputs(KernelInputs):
             return FixedLayout(self.device(), out_dtype, size)
 
     def mat1mat2(self) -> tuple[Any, Any]:
+        # [FUNCTION DOC] Returns the (mat1, mat2) input nodes at the configured positions.
         """
         Get the mat1 and mat2 nodes.
 
@@ -314,6 +373,8 @@ class MMKernelInputs(KernelInputs):
         return nodes[self._mat1_idx], nodes[self._mat2_idx]
 
     def mnk_hinted(self) -> tuple[int, int, int]:
+        # [FUNCTION DOC] Returns integer-hinted (M, N, K) using shapes_hinted, same
+        # dimension convention as mnk_symbolic. Raises AssertionError if the K hints differ.
         """
         Get the hinted M, N, K dimensions for matrix multiplication.
         Handles both 2D (MM) and 3D (BMM) tensors.
@@ -339,6 +400,8 @@ class MMKernelInputs(KernelInputs):
         return (m, n, k)
 
     def batch_hinted(self) -> int:
+        # [FUNCTION DOC] Returns the hinted size of the third-from-last dim of mat1
+        # if mat1 has at least 3 dims, else 1. Only one batch dim is considered.
         """
         Get the hinted batch size for batched matrix multiplication.
         Returns 1 for non-batched (2D) operations.

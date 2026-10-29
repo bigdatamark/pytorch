@@ -1,3 +1,7 @@
+# [MODULE DOC] Defines LookupTableChoices, an InductorChoices subclass that replaces
+# heuristic template choices with configs found in a user-supplied lookup table
+# (config.lookup_table.table), keyed by device, input dtypes/shapes/strides, scalars
+# and op name. Creates a module logger at import; no other side effects.
 from __future__ import annotations
 
 import copy
@@ -24,12 +28,20 @@ if TYPE_CHECKING:
 
 
 class LookupTableChoices(InductorChoices):
+    # [CLASS DOC] Choices handler that, for each op, builds a lookup key from the
+    # kernel inputs, fetches matching template configs from the table, filters them by
+    # template source hash, and turns hits into KernelTemplateChoice objects. On a
+    # miss (or no table) it defers to the parent class. Stateless apart from config;
+    # key generation, table source and fallback are overridable hooks.
     """
     InductorChoices subclass that uses lookup table when available, otherwise falls back to parent.
     All lookup functionality is contained within this class and can be customized by overriding methods.
     """
 
     def _get_lookup_table(self) -> dict[str, list[dict[str, Any]]]:
+        # [FUNCTION DOC] HELPER: Returns the table from config.lookup_table.table
+        # (mapping from key string to list of config mappings), or an empty mapping if
+        # CUDA is unavailable or no table is configured. Override for other sources.
         """
         Get the template lookup table from config.
         Override this method to use custom lookup table sources (database, API, etc.).
@@ -41,6 +53,10 @@ class LookupTableChoices(InductorChoices):
     @staticmethod
     @lru_cache
     def _get_device_key(device: torch.device) -> str | None:
+        # [FUNCTION DOC] HELPER: Cached static method. Returns None for non-cuda
+        # devices; for cuda returns the gcnArchName of the device properties.
+        # KNOWN ISSUE: lru_cache keeps results for the process lifetime; gcnArchName
+        # may be missing on non-ROCm builds, which would raise AttributeError.
         """
         Generate a device key for lookup table indexing.
         For CPU devices, returns None.
@@ -57,6 +73,10 @@ class LookupTableChoices(InductorChoices):
 
     @staticmethod
     def _generate_kernel_inputs_key(kernel_inputs: KernelInputs) -> str:
+        # [FUNCTION DOC] HELPER: Static. Builds the input part of a lookup key: the
+        # string form of a tuple of (dtype, hinted shape list, hinted stride list) per
+        # input; if scalars exist, appends a plus sign and the name=value pairs sorted
+        # by name and joined with ampersands. Reads the private scalars of the inputs.
         """
         Generate a key based on input node properties and scalars.
         The key includes dtype, size, and stride information for each input node,
@@ -90,6 +110,9 @@ class LookupTableChoices(InductorChoices):
     def make_lookup_key(
         self, kernel_inputs: KernelInputs, op_name: str, include_device: bool = False
     ) -> str | None:
+        # [FUNCTION DOC] Builds the full lookup key: optional device key, the inputs
+        # key and the op name, joined with plus signs. Returns None if the inputs'
+        # device has no device key (non-cuda), even when include_device is false.
         """
         Create a flattened lookup key from kernel inputs and operation name.
         Override this method to customize key generation.
@@ -125,6 +148,9 @@ class LookupTableChoices(InductorChoices):
     def make_lookup_key_variants(
         self, kernel_inputs: KernelInputs, op_name: str
     ) -> tuple[str | None, str | None]:
+        # [FUNCTION DOC] Returns a pair (device-specific key, device-agnostic key)
+        # by calling make_lookup_key with include_device true and false. Either is None
+        # when the device is unsupported.
         """
         Generate both device-specific and device-agnostic lookup keys.
         Override this method to customize key variant generation.
@@ -149,6 +175,11 @@ class LookupTableChoices(InductorChoices):
         template_id: str,
         template_hash_map: dict[str, str | None] | None,
     ) -> bool:
+        # [FUNCTION DOC] HELPER: Static. Decides whether a config entry is kept. Always
+        # true when src hash checking is disabled or no hash map is given. If both the
+        # template hash and the entry's template_hash exist and differ, logs a warning
+        # and returns false; in all other cases (match, missing hash on either side)
+        # returns true.
         """
         Check if a config entry is valid based on template hash validation.
 
@@ -210,6 +241,12 @@ class LookupTableChoices(InductorChoices):
         template_uids: list[str],
         template_hash_map: dict[str, str | None] | None = None,
     ) -> dict[str, list[dict[str, Any]]]:
+        # [FUNCTION DOC] Looks up configs for the given op and templates. Returns an
+        # empty mapping if there is no table or no key matches (device-specific key is
+        # tried first, then device-agnostic). Otherwise groups the matched entries by
+        # their template_id, keeping only ids in template_uids, drops entries failing
+        # the hash check, and returns deep copies without template_id/template_hash.
+        # Raises ValueError if an entry is not a mapping or lacks template_id.
         """
         Unified function to look up template configurations for multiple templates.
         Override this method to customize lookup logic.
@@ -317,6 +354,10 @@ class LookupTableChoices(InductorChoices):
         op_name: str,
         kwarg_overrides: dict[str, dict[str, Any]] | None = None,
     ) -> list[KernelTemplateChoice]:
+        # [FUNCTION DOC] Override of the parent hook. Collects each template's uid and
+        # src_hash (if any), does one batch lookup; on a miss returns the _fallback
+        # result, on a hit returns choices built only for templates with table entries.
+        # Logs hit/miss at info level.
         """Check lookup table for hits, use those if found, otherwise fall back to parent."""
         # 1. Collect template src_hashes for validation
         template_uids = [template.uid for template in templates]
@@ -368,6 +409,9 @@ class LookupTableChoices(InductorChoices):
         op_name: str,
         kwarg_overrides: dict[str, dict[str, Any]] | None = None,
     ) -> list[KernelTemplateChoice]:
+        # [FUNCTION DOC] HELPER: Delegates to the parent class implementation of
+        # finalizing template configs; separate method so subclasses can customize
+        # miss handling.
         """Fallback to parent if no lookup table or no matches."""
         # NOTE: this is broken out, so that subclasses are able to override this
         # to handle explicitly the situations where the lookup table had a miss vs
@@ -387,6 +431,11 @@ class LookupTableChoices(InductorChoices):
         kernel_inputs: KernelInputs,
         op_name: str,
     ) -> list[KernelTemplateChoice]:
+        # [FUNCTION DOC] HELPER: For each template uid in lookup_results, takes the
+        # first choice from the parent's get_ktc generator as a base (skips the
+        # template if the generator is empty), then for every table config creates a
+        # new KernelTemplateChoice whose params are the base params overlaid by the
+        # config. Returns the list of all such choices.
         """Create KernelTemplateChoice objects from lookup results using parent's get_ktc method."""
         templates_by_uid = {template.uid: template for template in templates}
         lookup_choices: list[KernelTemplateChoice] = []

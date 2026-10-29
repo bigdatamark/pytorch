@@ -1,3 +1,6 @@
+# [MODULE DOC] Defines KernelTemplateChoice, a lazy bundle of template, params,
+# layout and inputs that builds a ChoiceCaller on demand, and make_ktc_generator,
+# which yields such choices from template parameter sets with overrides applied.
 from __future__ import annotations
 
 from typing import Any, TYPE_CHECKING
@@ -16,6 +19,9 @@ if TYPE_CHECKING:
 
 
 class KernelTemplateChoice:
+    # [CLASS DOC] Holds template, params, extra kwargs, layout and KernelInputs, plus
+    # an annotations mapping that points back to this object under the key ktc.
+    # The ChoiceCaller is created lazily and cached (a None result is cached too).
     """
     A class that encapsulates all the components needed to create a ChoiceCaller from a template.
 
@@ -31,6 +37,8 @@ class KernelTemplateChoice:
         layout: Layout,
         inputs: KernelInputs,
     ):
+        # [FUNCTION DOC] Stores the arguments as attributes and creates the
+        # annotations mapping referencing self. No choice is built here.
         self.template = template
         self.params = params
         self.extra_kwargs = extra_kwargs
@@ -40,6 +48,10 @@ class KernelTemplateChoice:
 
     @property
     def choice(self) -> ChoiceCaller | None:
+        # [FUNCTION DOC] Property: on first access calls the template's
+        # choice_or_none with the params as keyword args, extra kwargs, layout and the
+        # input nodes; caches the result (even None). If non-None, sets its
+        # annotations to this object's annotations mapping. Later calls return the cache.
         """
         Lazily evaluate and return the ChoiceCaller for this template choice.
 
@@ -72,6 +84,9 @@ def make_ktc_generator(
     layout: Layout,
     inputs: KernelInputs,
 ) -> Generator[KernelTemplateChoice, None, None]:
+    # [FUNCTION DOC] Generator: for each params object from cs, merges its kwargs
+    # with overrides (overrides win), wraps them in DictKernelTemplateParams and
+    # yields a KernelTemplateChoice sharing template, extra_kwargs, layout, inputs.
     """
     Create a generator of KernelTemplateChoice objects for a given template.
 
