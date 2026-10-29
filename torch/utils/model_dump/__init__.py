@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 # mypy: allow-untyped-defs
+# [PACKAGE DOC] Deprecated tool that inspects a TorchScript model archive (a zip file) and
+# reports its files, pickled data, constants, code with debug ranges, and small extra files as
+# JSON, or as a self-contained HTML page. Exports get_storage_info, hierarchical_pickle,
+# get_model_info, get_inline_skeleton, burn_in_info, get_info_and_burn_skeleton; the main
+# command line entry (used by the package __main__) emits a deprecation warning.
 """
 model_dump: a one-stop shop for TorchScript model inspection.
 
@@ -87,6 +92,10 @@ __all__ = ['get_storage_info', 'hierarchical_pickle', 'get_model_info', 'get_inl
            'burn_in_info', 'get_info_and_burn_skeleton']
 
 def get_storage_info(storage):
+    # [FUNCTION DOC] Validate that storage is the placeholder object the unpickler produces for
+    # a persistent torch storage record (five element tuple starting with the storage tag) and
+    # return a list of the storage type name without its Storage suffix followed by the
+    # remaining tuple items. Raises AssertionError if the structure differs.
     if not isinstance(storage, torch.utils.show_pickle.FakeObject):
         raise AssertionError(f"storage is not FakeObject: {type(storage)}")
     if storage.module != "pers":
@@ -117,6 +126,11 @@ def get_storage_info(storage):
 
 
 def hierarchical_pickle(data):
+    # [FUNCTION DOC] Convert unpickled data into a JSON-friendly structure. Scalars and None
+    # pass through, lists are converted elementwise, tuples and dicts become tagged mappings, and
+    # known placeholder objects (scripted modules, tensors, quantized tensors, type tags, typed
+    # lists, devices, string decode errors) become tagged mappings or plain values. Raises
+    # AssertionError on malformed known objects and Exception for unknown objects or types.
     if isinstance(data, (bool, int, float, str, type(None))):
         return data
     if isinstance(data, list):
@@ -214,6 +228,13 @@ def get_model_info(
         path_or_file,
         title=None,
         extra_file_size_limit=DEFAULT_EXTRA_FILE_SIZE_LIMIT):
+    # [FUNCTION DOC] Read a model zip archive (path, path-like or seekable binary buffer) and
+    # return a mapping with a single model entry holding title, file size, format version, zip
+    # member listing, interned strings, source files split into annotated code parts using debug
+    # info, unpickled data and constants, small extra JSON files (those over the size limit are
+    # skipped, invalid ones marked), and rendered pickle files (bytecode always, others only when
+    # small). Raises Exception on mismatched top-level prefixes, AssertionError on empty archives
+    # or bad ranges. Reads only; the buffer position is reset to the start.
     """Get JSON-friendly information about a model.
 
     The result is suitable for being saved as model_info.json,
@@ -257,6 +278,8 @@ def get_model_info(
         version = zf.read(path_prefix + "/version").decode("utf-8").strip()
 
         def get_pickle(name):
+            # [FUNCTION DOC] HELPER: Unpickle the named pkl member under the archive prefix with
+            # placeholder classes (tolerating bad UTF-8) and return its hierarchical form.
             if path_prefix is None:
                 raise AssertionError("path_prefix is None")
             with zf.open(path_prefix + f"/{name}.pkl") as handle:
@@ -274,6 +297,8 @@ def get_model_info(
         interned_strings : dict[str, int] = {}
 
         def intern(s):
+            # [FUNCTION DOC] HELPER: Return the stable integer index of string s in the intern
+            # table, adding it if new.
             if s not in interned_strings:
                 interned_strings[s] = len(interned_strings)
             return interned_strings[s]
@@ -298,6 +323,8 @@ def get_model_info(
                 _, text_table, content = debug_info_t
 
                 def parse_new_format(line):
+                    # [FUNCTION DOC] HELPER: Convert one debug record of the string table format
+                    # into the old format by joining text pieces and looking up the file name.
                     # (0, (('', '', 0), 0, 0))
                     num, ((text_indexes, fname_idx, offset), start, end), tag = line
                     text = ''.join(text_table[x] for x in text_indexes)  # type: ignore[index]
@@ -384,6 +411,9 @@ def get_model_info(
 
 
 def get_inline_skeleton():
+    # [FUNCTION DOC] Load the packaged HTML skeleton and viewer script, replace the remote
+    # preact and htm imports with inlined data URLs, and embed the script in the page. Returns
+    # the HTML string. Reads package resource files.
     """Get a fully-inlined skeleton of the frontend.
 
     The returned HTML page has no external network dependencies for code.
@@ -406,6 +436,9 @@ def get_inline_skeleton():
 
 
 def burn_in_info(skeleton, info):
+    # [FUNCTION DOC] Return the skeleton HTML with its placeholder model info assignment
+    # replaced by the JSON encoding of info (keys sorted, slashes escaped so that closing script
+    # tags cannot terminate the page script).
     """Burn model info into the HTML skeleton.
 
     The result will render the hard-coded model info and
@@ -422,6 +455,8 @@ def burn_in_info(skeleton, info):
 
 
 def get_info_and_burn_skeleton(path_or_bytesio, **kwargs):
+    # [FUNCTION DOC] Convenience: compute model info (extra keyword arguments go to
+    # get_model_info) and return the inline skeleton with that info burned in.
     model_info = get_model_info(path_or_bytesio, **kwargs)
     skeleton = get_inline_skeleton()
     page = burn_in_info(skeleton, model_info)
@@ -429,6 +464,11 @@ def get_info_and_burn_skeleton(path_or_bytesio, **kwargs):
 
 
 def main(argv, *, stdout=None) -> None:
+    # [FUNCTION DOC] Command line entry. Warns that the module is deprecated, parses argv
+    # (program name first) for the model path plus optional style (json or html) and title, and
+    # writes the JSON or the burned-in HTML page to stdout (default sys.stdout). Raises Exception
+    # for a missing or invalid style.
+    # KNOWN ISSUE: the style option has no default, so omitting it always raises.
     warnings.warn("torch.utils.model_dump is deprecated and will be removed in a future PyTorch release.", stacklevel=2)
     parser = argparse.ArgumentParser()
     parser.add_argument("--style", choices=["json", "html"])

@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Converts a traced PyTorch model into a TensorBoard GraphDef. The graph function
+# traces the model, parse walks the JIT graph building node wrappers (NodePyIO, NodePyOP) inside
+# a GraphPy that resolves scope names, and to_proto emits node protos. Module level lists name
+# the node methods copied from the C++ nodes. No import-time side effects beyond imports.
 from collections import OrderedDict
 import contextlib
 from typing import Any
@@ -34,6 +38,8 @@ CLASSTYPE_KIND = "ClassType"
 
 
 class NodeBase:
+    # [CLASS DOC] Plain record of one graph node: debug name, input names, scope name, tensor
+    # size, kind (operator type string) and attributes string. Its repr dumps all attributes.
     def __init__(
         self,
         debugName=None,
@@ -43,6 +49,7 @@ class NodeBase:
         op_type="UnSpecified",
         attributes="",
     ) -> None:
+        # [FUNCTION DOC] Store the given fields as attributes (kind is set from op_type).
         # TODO; Specify a __slots__ for this class or potentially
         # used namedtuple instead
         self.debugName = debugName
@@ -53,6 +60,8 @@ class NodeBase:
         self.scope = scope
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Return the type and a name, value and value type line for every public
+        # attribute, joined by newlines and followed by a blank line.
         repr = []
         repr.append(str(type(self)))
         repr.extend(
@@ -64,7 +73,13 @@ class NodeBase:
 
 
 class NodePy(NodeBase):
+    # [CLASS DOC] Node wrapper built from a C++ JIT node: copies the listed methods' results as
+    # attributes; for inputs and outputs it stores lists of debug names and, under a name with a
+    # tensor size suffix, the list of sizes (None for non-complete tensors).
     def __init__(self, node_cpp, valid_methods) -> None:
+        # [FUNCTION DOC] Initialize the base with the node as debug name, then for each method
+        # name in valid_methods call it on node_cpp and store the result (inputs and outputs
+        # are expanded as described in the class doc).
         super().__init__(node_cpp)
         valid_methods = valid_methods[:]
         self.inputs = []
@@ -89,7 +104,11 @@ class NodePy(NodeBase):
 
 
 class NodePyIO(NodePy):
+    # [CLASS DOC] Wrapper for graph input, output or parameter nodes. Kind is Parameter, or
+    # IO Node when input_or_output (a label such as input or output) is given.
     def __init__(self, node_cpp, input_or_output=None) -> None:
+        # [FUNCTION DOC] Copy the IO methods, record the tensor size from the node type (a
+        # one-element placeholder if the size cannot be read), and set the kind and label.
         super().__init__(node_cpp, methods_IO)
         try:
             tensor_size = node_cpp.type().sizes()
@@ -109,7 +128,11 @@ class NodePyIO(NodePy):
 
 
 class NodePyOP(NodePy):
+    # [CLASS DOC] Wrapper for operator nodes: copies the operator methods, stores the node
+    # attributes as a string with single quotes replaced by spaces, and uses the node kind.
     def __init__(self, node_cpp) -> None:
+        # [FUNCTION DOC] Copy operator methods, then set attributes (stringified, quotes removed)
+        # and kind from the C++ node.
         super().__init__(node_cpp, methods_OP)
         # Replace single quote which causes strange behavior in TensorBoard
         # TODO: See if we can remove this in the future
@@ -120,6 +143,10 @@ class NodePyOP(NodePy):
 
 
 class GraphPy:
+    # [CLASS DOC] Collects wrapped nodes into an ordered mapping of IO nodes and a list of
+    # operator nodes, then assigns fully qualified scope names and converts to node protos.
+    # State: nodes_op, nodes_io, unique name to scoped name mapping, the shallowest scope name
+    # (default "default") and the scope names seen.
     """Helper class to convert torch.nn.Module to GraphDef proto and visualization with TensorBoard.
 
     GraphDef generation operates in two passes:
@@ -141,6 +168,7 @@ class GraphPy:
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Initialize empty node containers and scope bookkeeping.
         self.nodes_op = []
         self.nodes_io = OrderedDict()
         self.unique_name_to_scoped_name = {}
@@ -148,12 +176,15 @@ class GraphPy:
         self.scope_name_appeared = []
 
     def append(self, x) -> None:
+        # [FUNCTION DOC] Add an IO node to the IO mapping (keyed by debug name) or an operator
+        # node to the operator list; other types are ignored.
         if isinstance(x, NodePyIO):
             self.nodes_io[x.debugName] = x
         if isinstance(x, NodePyOP):
             self.nodes_op.append(x)
 
     def printall(self) -> None:
+        # [FUNCTION DOC] Debug helper: print all operator nodes then all IO nodes to stdout.
         print("all nodes")
         for node in self.nodes_op:
             print(node)
@@ -161,11 +192,18 @@ class GraphPy:
             print(self.nodes_io[key])
 
     def find_common_root(self) -> None:
+        # [FUNCTION DOC] Set the shallowest scope name to the first path component of the last
+        # non-empty scope seen. Mutates state.
         for fullscope in self.scope_name_appeared:
             if fullscope:
                 self.shallowest_scope_name = fullscope.split("/")[0]
 
     def populate_namespace_from_OP_to_IO(self) -> None:
+        # [FUNCTION DOC] Second pass: turn every operator output into a generic node in the IO
+        # mapping, find the root scope, compute scoped names for inputs and nodes (prefixing
+        # scope, or IO label, or the root scope for empty scopes), then rewrite each node's debug
+        # name and input names with the scoped names. Mutates nodes; raises KeyError if an
+        # input has no scoped name.
         for node in self.nodes_op:
             for node_output, outputSize in zip(node.outputs, node.outputstensor_size, strict=True):
                 self.scope_name_appeared.append(node.scopeName)
@@ -215,6 +253,8 @@ class GraphPy:
                 ]
 
     def to_proto(self):
+        # [FUNCTION DOC] Return a list of node protos, one per IO-mapping node, built from its
+        # debug name, inputs, tensor size, kind and attributes.
         """Convert graph representation of GraphPy object to TensorBoard required format."""
         # TODO: compute correct memory usage and CPU time once
         # PyTorch supports it
@@ -232,6 +272,11 @@ class GraphPy:
 
 
 def parse(graph, trace, args=None, omit_useless_nodes=True):
+    # [FUNCTION DOC] Convert a JIT graph and its traced module into a list of node protos.
+    # Input nodes (skipping unused ones and class-typed ones when omitting) and attribute
+    # accessors build a scope mapping; operator nodes and output sink nodes are wrapped; scope
+    # names are rewritten using module aliases from the trace; then names are resolved through
+    # GraphPy. The args parameter is unused.
     """Parse an optimized PyTorch model graph and produces a list of nodes and node stats.
 
     Useful for eventual conversion to TensorBoard protobuf format.
@@ -283,6 +328,8 @@ def parse(graph, trace, args=None, omit_useless_nodes=True):
         nodes_py.append(node_pyio)
 
     def parse_traced_name(module):
+        # [FUNCTION DOC] HELPER: Return the traced module's name, or its original name
+        # (default Module) for other modules.
         if isinstance(module, torch.jit.TracedModule):
             module_name = module._name
         else:
@@ -311,6 +358,10 @@ def parse(graph, trace, args=None, omit_useless_nodes=True):
 
 
 def graph(model, args, verbose=False, use_strict_trace=True):
+    # [FUNCTION DOC] Trace the model (in eval mode, restored afterwards) with example args, inline
+    # calls, and build a GraphDef (producer version 22) plus run metadata declaring a CPU device.
+    # Prints the graph if verbose. On a RuntimeError from tracing, prints a message and re-raises.
+    # Returns (GraphDef, RunMetadata).
     """
     Process a PyTorch model and produces a `GraphDef` proto that can be logged to TensorBoard.
 
@@ -356,6 +407,8 @@ def graph(model, args, verbose=False, use_strict_trace=True):
 
 @contextlib.contextmanager
 def _set_model_to_eval(model):
+    # [FUNCTION DOC] HELPER: Context manager that puts a module into eval mode and restores its
+    # prior training flag on exit; scripted functions are left untouched.
     """Context manager to temporarily set the training mode of ``model`` to eval."""
     if not isinstance(model, torch.jit.ScriptFunction):
         originally_training = model.training
@@ -373,6 +426,8 @@ def _set_model_to_eval(model):
 
 
 def _node_get(node: torch._C.Node, key: str):
+    # [FUNCTION DOC] HELPER: Read attribute key from a JIT node using the accessor method named
+    # by the node for that key's type.
     """Get attributes of a node which is polymorphic over return type."""
     sel = node.kindOf(key)
     return getattr(node, sel)(key)

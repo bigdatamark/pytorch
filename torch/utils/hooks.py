@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Hook infrastructure shared by tensors and nn.Module: RemovableHandle (weakly
+# references hook dictionaries so a hook can be removed), unserializable_hook (marks hooks
+# that should not trigger a pickling warning), warn_if_has_hooks, and BackwardHook (adapts
+# module full backward hooks and pre-hooks onto autograd). No import-time side effects.
 import torch
 from collections import OrderedDict
 import weakref
@@ -8,6 +12,10 @@ from typing import Any
 __all__ = ["RemovableHandle", "unserializable_hook", "warn_if_has_hooks", "BackwardHook"]
 
 class RemovableHandle:
+    # [CLASS DOC] Handle returned when registering a hook; calling remove (or leaving a with
+    # block) deletes the hook entry by its unique integer id from the hook dictionary and
+    # any extra dictionaries. State: weak references to those dictionaries and the id, taken
+    # from a class-wide counter that only grows. Supports pickling via __getstate__/__setstate__.
     r"""
     A handle which provides the capability to remove a hook.
 
@@ -22,6 +30,9 @@ class RemovableHandle:
     next_id: int = 0
 
     def __init__(self, hooks_dict: Any, *, extra_dict: Any = None) -> None:
+        # [FUNCTION DOC] Store a weak reference to hooks_dict, take the next global id (and
+        # increment the class counter), and keep weak references to extra_dict, which may be
+        # one dictionary or a list of dictionaries; any other value means no extra dictionaries.
         self.hooks_dict_ref = weakref.ref(hooks_dict)
         self.id = RemovableHandle.next_id
         RemovableHandle.next_id += 1
@@ -33,6 +44,8 @@ class RemovableHandle:
             self.extra_dict_ref = tuple(weakref.ref(d) for d in extra_dict)
 
     def remove(self) -> None:
+        # [FUNCTION DOC] Delete this handle's id from the hooks dictionary and from each extra
+        # dictionary, skipping any that were garbage collected or lack the id. Safe to repeat.
         hooks_dict = self.hooks_dict_ref()
         if hooks_dict is not None and self.id in hooks_dict:
             del hooks_dict[self.id]
@@ -43,12 +56,18 @@ class RemovableHandle:
                 del extra_dict[self.id]
 
     def __getstate__(self):
+        # [FUNCTION DOC] Pickle support: return a tuple of the (dereferenced) hooks dictionary
+        # and id, plus a tuple of the extra dictionaries when the reference tuple is not None.
+        # KNOWN ISSUE: extra_dict_ref is always a tuple, so the None branch is unreachable.
         if self.extra_dict_ref is None:
             return (self.hooks_dict_ref(), self.id)
         else:
             return (self.hooks_dict_ref(), self.id, tuple(ref() for ref in self.extra_dict_ref))
 
     def __setstate__(self, state) -> None:
+        # [FUNCTION DOC] Restore from the state tuple: weakly reference the hooks dictionary (a
+        # dead reference if it was None), restore the id and raise the class counter above it,
+        # and rebuild weak references to extra dictionaries when present in the state.
         if state[0] is None:
             # create a dead reference
             self.hooks_dict_ref = weakref.ref(OrderedDict())
@@ -63,13 +82,17 @@ class RemovableHandle:
             self.extra_dict_ref = tuple(weakref.ref(d) for d in state[2])
 
     def __enter__(self) -> "RemovableHandle":
+        # [FUNCTION DOC] Context manager entry; returns the handle itself.
         return self
 
     def __exit__(self, type: Any, value: Any, tb: Any) -> None:
+        # [FUNCTION DOC] Context manager exit; removes the hook. Exceptions are not suppressed.
         self.remove()
 
 
 def unserializable_hook(f):
+    # [FUNCTION DOC] Decorator that sets a marker attribute on function f (mutating it) so
+    # warn_if_has_hooks does not warn about it; returns f itself.
     """
     Mark a function as an unserializable hook with this decorator.
 
@@ -81,6 +104,8 @@ def unserializable_hook(f):
 
 
 def warn_if_has_hooks(tensor) -> None:
+    # [FUNCTION DOC] Emit a warning for each backward hook on the tensor that is not marked
+    # as unserializable, saying it will not be serialized. Returns nothing.
     if tensor._backward_hooks:
         for k in tensor._backward_hooks:
             hook = tensor._backward_hooks[k]
@@ -91,6 +116,12 @@ def warn_if_has_hooks(tensor) -> None:
                               "to suppress this warning", stacklevel=2)
 
 class BackwardHook:
+    # [CLASS DOC] Per-module helper that implements full backward hooks and backward pre-hooks.
+    # State: the module, lists of user hooks and pre-hooks, the grad_outputs captured at the
+    # output node, and the count and tensor positions of inputs and outputs (-1/None until set
+    # up). setup_input_hook and setup_output_hook wrap forward inputs/outputs with an identity
+    # autograd function and register hooks on its node; the user hook fires once both
+    # grad_output (captured at the output) and grad_input are known.
     """
     A wrapper class to implement nn.Module backward hooks.
 
@@ -102,6 +133,8 @@ class BackwardHook:
     """
 
     def __init__(self, module, user_hooks, user_pre_hooks) -> None:
+        # [FUNCTION DOC] Store the module and the user hook and pre-hook collections and
+        # initialize the captured gradient and index bookkeeping to empty values.
         self.user_hooks = user_hooks
         self.user_pre_hooks = user_pre_hooks
         self.module = module
@@ -113,6 +146,8 @@ class BackwardHook:
         self.input_tensors_index = None
 
     def _pack_with_none(self, indices, values, size):
+        # [FUNCTION DOC] HELPER: Build a tuple of length size filled with None, placing each
+        # value at its matching index. Raises ValueError if indices and values differ in length.
         res = [None] * size
         for idx, val in zip(indices, values, strict=True):
             res[idx] = val
@@ -120,12 +155,20 @@ class BackwardHook:
         return tuple(res)
 
     def _unpack_none(self, indices, values):
+        # [FUNCTION DOC] HELPER: Return a tuple of the entries of values at the given indices.
         res = [values[idx] for idx in indices]
 
         return tuple(res)
 
     def _set_user_hook(self, grad_fn) -> None:
+        # [FUNCTION DOC] HELPER: Register on the input-side autograd node a hook that runs the
+        # user hooks with the full grad_input and the saved grad_outputs.
         def hook(grad_input, _):
+            # [FUNCTION DOC] HELPER: Autograd hook. Does nothing if no grad_outputs were saved
+            # (e.g. double backward). Otherwise expands grad_input to the full input positions,
+            # calls each user hook in order; a non-None result replaces the gradients, and raises
+            # RuntimeError if its length differs. Clears saved grad_outputs and returns the
+            # gradients restricted to tensor inputs.
             if self.grad_outputs is None:
                 # This happens because the gradient in your nn.Module flows to
                 # the Module's input without " passing through the Module's
@@ -152,6 +195,11 @@ class BackwardHook:
         grad_fn.register_hook(hook)
 
     def _apply_on_tensors(self, fn, args):
+        # [FUNCTION DOC] HELPER: Pass the tensors among args through the identity backward-hook
+        # autograd function and call fn on the resulting node. Returns (new args, indices of the
+        # tensor positions), or (args, None) if no tensor requires grad or grad mode is off.
+        # Rebuilds args as the same tuple or namedtuple type. Raises RuntimeError if there are
+        # no tensors or the expected node cannot be found.
         # Can be used to apply the given function to the tensors contained in the
         # args. Will return updated args and the tensors indices
         tensors_idx = []
@@ -189,7 +237,11 @@ class BackwardHook:
         return out, tensors_idx
 
     def setup_input_hook(self, args):
+        # [FUNCTION DOC] Wrap the module's forward inputs so the user hook is registered on
+        # their autograd node. Records the input count and tensor positions and returns the
+        # wrapped args (same container type).
         def fn(grad_fn) -> None:
+            # [FUNCTION DOC] HELPER: Register the user hook on the given node.
             self._set_user_hook(grad_fn)
 
         res, input_idx = self._apply_on_tensors(fn, args)
@@ -198,8 +250,18 @@ class BackwardHook:
         return res
 
     def setup_output_hook(self, args):
+        # [FUNCTION DOC] Wrap the module's forward outputs (a single value is treated as a
+        # one-element tuple and unwrapped again) so a hook captures grad_output on their node.
+        # Records the output count and tensor positions and returns the wrapped outputs.
         def fn(grad_fn) -> None:
+            # [FUNCTION DOC] HELPER: Register the output gradient capture hook on the node.
             def hook(_, grad_output):
+                # [FUNCTION DOC] HELPER: Autograd hook on the output node. Saves grad_output
+                # expanded to full output positions, then runs pre-hooks (a non-None result
+                # replaces it; raises RuntimeError on a length change). If no input requires
+                # grad, warns and runs the full user hooks directly with empty grad_input (raises
+                # RuntimeError if a hook returns anything but None) and clears the saved
+                # grads. Returns the possibly modified grad_output for tensor positions.
                 self.grad_outputs = self._pack_with_none(self.output_tensors_index,
                                                          grad_output,
                                                          self.n_outputs)

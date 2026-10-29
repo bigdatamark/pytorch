@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Provides ModuleTracker, a context manager that tracks which nn.Module
+# (by qualified name) is executing in forward or backward using global module hooks and
+# multi-grad hooks. Exports only ModuleTracker; creates a module logger at import.
 import logging
 import weakref
 from typing import TYPE_CHECKING
@@ -23,6 +26,11 @@ __all__ = ["ModuleTracker"]
 
 
 class ModuleTracker:
+    # [CLASS DOC] Context manager that maintains the set parents of names of modules currently
+    # running (always containing "Global"). On enter it installs global forward pre and post
+    # hooks; for tensors requiring grad it adds autograd hooks to track backward as well. State:
+    # weak maps of module names, per-run hook handles, and a flag for a pending engine callback.
+    # On exit it removes all hooks. Not safe for concurrent backward calls.
     """
     ``ModuleTracker`` is a context manager that tracks the nn.Module hierarchy during execution
     so that other system can query which Module is currently being executed (or its backward is being
@@ -62,6 +70,7 @@ class ModuleTracker:
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Initialize parents to contain Global and empty name caches and hook list.
         self.parents = {"Global"}
         self._known_modules: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
         self._seen_modules: weakref.WeakSet = weakref.WeakSet()
@@ -69,11 +78,14 @@ class ModuleTracker:
         self._hooks: list[RemovableHandle] = []
 
     def _maybe_set_engine_callback(self) -> None:
+        # [FUNCTION DOC] HELPER: Once per backward pass, queue an autograd engine callback that
+        # resets parents to only Global when the pass ends. No-op if one is already queued.
         # This assumes no concurrent calls to backward
         if self._has_callback:
             return
 
         def callback() -> None:
+            # [FUNCTION DOC] HELPER: Reset parents to Global and clear the pending callback flag.
             self.parents = {"Global"}
             self._has_callback = False
 
@@ -82,12 +94,15 @@ class ModuleTracker:
 
     @property
     def is_bw(self):
+        # [FUNCTION DOC] Property: True when called while an autograd backward task is running.
         """
         A boolean marking if this is currently running during the backward pass or not
         """
         return torch._C._current_graph_task_id() != -1
 
     def _get_mod_name(self, mod):
+        # [FUNCTION DOC] HELPER: Return the cached name of mod (its class name if first seen). On
+        # first visit, record dotted child names (parent name, dot, attribute) for all submodules.
         if mod not in self._known_modules:
             self._known_modules[mod] = type(mod).__name__
         mod_name = self._known_modules[mod]
@@ -99,7 +114,10 @@ class ModuleTracker:
         return mod_name
 
     def _get_append_fn(self, name, is_bw):
+        # [FUNCTION DOC] HELPER: Build a hook function that marks name as entered.
         def fn(*args) -> None:
+            # [FUNCTION DOC] HELPER: In backward, ensure the reset callback is queued; log at info
+            # level if name is already entered; add name to parents. Arguments are ignored.
             if is_bw:
                 self._maybe_set_engine_callback()
             if name in self.parents:
@@ -113,7 +131,10 @@ class ModuleTracker:
         return fn
 
     def _get_pop_fn(self, name, is_bw):
+        # [FUNCTION DOC] HELPER: Build a hook function that marks name as exited.
         def fn(*args) -> None:
+            # [FUNCTION DOC] HELPER: Remove name from parents, or log at info level if it is not
+            # there. Arguments are ignored.
             if name in self.parents:
                 self.parents.remove(name)
             else:
@@ -126,6 +147,9 @@ class ModuleTracker:
         return fn
 
     def _fw_pre_hook(self, mod, input) -> None:
+        # [FUNCTION DOC] HELPER: Global forward pre-hook. Marks mod entered for forward and
+        # registers a multi-grad hook on its grad-requiring input tensors that marks it exited
+        # for backward (handle stored for cleanup).
         name = self._get_mod_name(mod)
         self._get_append_fn(name, False)()
 
@@ -137,6 +161,9 @@ class ModuleTracker:
             )
 
     def _fw_post_hook(self, mod, input, output) -> None:
+        # [FUNCTION DOC] HELPER: Global forward hook. Marks mod exited for forward and registers
+        # a multi-grad hook on its grad-requiring output tensors that marks it entered for
+        # backward.
         name = self._get_mod_name(mod)
         self._get_pop_fn(name, False)()
 
@@ -148,11 +175,14 @@ class ModuleTracker:
             )
 
     def __enter__(self):
+        # [FUNCTION DOC] Register the global forward pre and post hooks; returns self.
         self._fw_pre_handle = register_module_forward_pre_hook(self._fw_pre_hook)
         self._fw_post_handle = register_module_forward_hook(self._fw_post_hook)
         return self
 
     def __exit__(self, *args):
+        # [FUNCTION DOC] Remove the global hooks and all autograd hooks added during the run.
+        # Does not reset parents or suppress exceptions.
         self._fw_pre_handle.remove()
         self._fw_post_handle.remove()
         for hook in self._hooks:

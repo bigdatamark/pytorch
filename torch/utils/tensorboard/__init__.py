@@ -1,3 +1,6 @@
+# [PACKAGE DOC] TensorBoard logging integration for PyTorch.
+# On import, checks that the installed tensorboard is at least version 1.15 and raises
+# ImportError otherwise. Exports FileWriter, SummaryWriter and RecordWriter.
 import tensorboard
 from torch._vendor.packaging.version import Version
 

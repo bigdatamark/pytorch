@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Utilities for preparing TorchScript modules for mobile: optimize_for_mobile
+# (runs backend specific optimization passes), generate_mobile_module_lints (reports common
+# deployment problems) and the LintCode enum. Re-exports MobileOptimizerType from torch._C.
 """This module contains utility method for mobile model optimization and lint."""
 
 import torch
@@ -7,6 +10,8 @@ from torch._C import _MobileOptimizerType as MobileOptimizerType
 from typing import AnyStr
 
 class LintCode(Enum):
+    # [CLASS DOC] Enumeration of lint categories reported by generate_mobile_module_lints:
+    # missing bundled inputs, parameters requiring grad, leftover dropout, leftover batch norm.
     BUNDLED_INPUT = 1
     REQUIRES_GRAD = 2
     DROPOUT = 3
@@ -17,6 +22,11 @@ def optimize_for_mobile(
         optimization_blocklist: set[MobileOptimizerType] | None = None,
         preserved_methods: list[AnyStr] | None = None,
         backend: str = 'CPU') -> torch.jit.RecursiveScriptModule:
+    # [FUNCTION DOC] Optimize a ScriptModule for mobile for the backend (case insensitive:
+    # cpu, vulkan or metal). Methods to preserve gain the bundled-input accessors when all
+    # exist. Returns a new wrapped module; the input is not modified. Raises TypeError for a
+    # non-ScriptModule input or unknown backend, AttributeError if a preserved method is missing.
+    # The blocklist is not used by the metal backend.
     """
     Optimize a torch script module for mobile deployment.
 
@@ -74,6 +84,10 @@ def optimize_for_mobile(
 
 
 def generate_mobile_module_lints(script_module: torch.jit.ScriptModule):
+    # [FUNCTION DOC] Return a list of lint dictionaries (name and message keys) for a
+    # ScriptModule: missing bundled inputs for forward, each parameter requiring grad, and each
+    # exported operator whose name mentions dropout or batch_norm. Raises TypeError if the
+    # input is not a ScriptModule.
     """
     Generate a list of lints for a given torch script module.
 
@@ -115,6 +129,9 @@ def generate_mobile_module_lints(script_module: torch.jit.ScriptModule):
     return lint_list
 
 def _get_bundled_inputs_preserved_attributes(script_module: torch.jit.ScriptModule, preserved_methods: list[str]) -> list[str]:
+    # [FUNCTION DOC] HELPER: List the bundled-input related attributes present on the module
+    # (getters for forward, plus per-function accessors, and functions not already in
+    # preserved_methods) so they can be preserved during freezing.
 
     bundled_inputs_attributes = []
     # Has bundled inputs for forward

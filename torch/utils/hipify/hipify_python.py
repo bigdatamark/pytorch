@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
 # mypy: allow-untyped-defs
+# [MODULE DOC] Core of the CUDA to HIP source translator used for ROCm builds and extensions.
+# Walks a project, copies it to an output directory, and rewrites matching files: CUDA API names
+# via the mapping tables (compiled into one trie regex at import), include paths, kernel launch
+# syntax, math calls and headers; hipified C-style outputs get a breadcrumb first line. A
+# module-level result registry (HIPIFY_FINAL_RESULT) tracks each file. Entry point: hipify.
+# Import-time side effects: builds the mapping trie and regex; raises TypeError if a mapping
+# entry is not a Mapping.
 """ The Python Hipify script.
 ##
 # Copyright (c) 2015-2016 Advanced Micro Devices, Inc. All rights reserved.
@@ -43,19 +50,25 @@ import functools
 import hashlib
 
 def _deprecated(name):
+    # [FUNCTION DOC] HELPER: Emit a FutureWarning that the named function is no longer used.
     warnings.warn(f"hipify version 2.0.0 no longer uses function {name}", FutureWarning, stacklevel=2)
 
 class CurrentState(Enum):
+    # [CLASS DOC] Processing state of one file: INITIALIZED (registered, not yet written) or DONE.
     INITIALIZED = 1
     DONE = 2
 
 class HipifyResult:
+    # [CLASS DOC] Outcome record for one source file: current_state (a CurrentState), hipified_path
+    # (output path, or None when the file is ignored) and a status text such as ok or skipped.
     def __init__(self, current_state, hipified_path) -> None:
+        # [FUNCTION DOC] Store the state and path; status starts empty.
         self.current_state = current_state
         self.hipified_path = hipified_path
         self.status = ""
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Return a one-line description with state, path and status.
         return (f"HipifyResult:: current_state: {self.current_state}, hipified_path : {self.hipified_path}, status: {self.status}")
 
 HipifyFinalResult = dict[str, HipifyResult]
@@ -76,22 +89,27 @@ __all__ = ['InputError', 'openf', 'bcolors', 'GeneratedFileCleaner', 'match_exte
 
 
 class InputError(Exception):
+    # [CLASS DOC] Error for invalid user input; keeps the message and prefixes it when printed.
     # Exception raised for errors in the input.
 
     def __init__(self, message) -> None:
+        # [FUNCTION DOC] Initialize the exception and keep the message as an attribute.
         super().__init__(message)
         self.message = message
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Return the message prefixed with the words Input error.
         return f"Input error: {self.message}"
 
 
 def openf(filename, mode):
+    # [FUNCTION DOC] Open a file in the given mode, silently ignoring undecodable bytes.
     return open(filename, mode, errors='ignore')
 
 
 # Color coding for printing
 class bcolors:
+    # [CLASS DOC] Namespace of ANSI terminal escape strings used to color console output.
     HEADER = '\033[95m'
     OKBLUE = '\033[94m'
     OKGREEN = '\033[92m'
@@ -111,22 +129,32 @@ class bcolors:
 # not recompile unchanged files), but in cases where you don't want to
 # keep them (e.g. in the CI), this can be used to remove files.
 class GeneratedFileCleaner:
+    # [CLASS DOC] Context manager that records files and directories created through its open and
+    # makedirs methods and, unless keep_intermediates is set, deletes them on exit (files first,
+    # then directories in reverse creation order).
     """Context Manager to clean up generated files"""
     def __init__(self, keep_intermediates=False) -> None:
+        # [FUNCTION DOC] Store the keep flag and initialize empty file set and directory list.
         self.keep_intermediates = keep_intermediates
         self.files_to_clean = set()
         self.dirs_to_clean = []
 
     def __enter__(self):
+        # [FUNCTION DOC] Return self.
         return self
 
     def open(self, fn, *args, **kwargs):
+        # [FUNCTION DOC] Open fn like the builtin open; if the file did not exist beforehand,
+        # remember its absolute path for later cleanup. Returns the file object.
         if not os.path.exists(fn):
             self.files_to_clean.add(os.path.abspath(fn))
 
         return open(fn, *args, **kwargs)
 
     def makedirs(self, dn, exist_ok=False) -> None:
+        # [FUNCTION DOC] Recursively create directory dn, creating missing parents first and
+        # recording each directory this call created. With exist_ok, an existing directory is fine;
+        # otherwise an existing one makes the underlying mkdir raise an OS error.
         parent, n = os.path.split(dn)
         if not n:
             parent, n = os.path.split(parent)
@@ -137,6 +165,9 @@ class GeneratedFileCleaner:
             self.dirs_to_clean.append(os.path.abspath(dn))
 
     def __exit__(self, type, value, traceback):
+        # [FUNCTION DOC] Unless keep_intermediates is set, delete recorded files and then remove
+        # recorded directories (newest first). Deletion errors propagate; exceptions from the
+        # with block are not suppressed.
         if not self.keep_intermediates:
             for f in self.files_to_clean:
                 os.unlink(f)
@@ -145,14 +176,17 @@ class GeneratedFileCleaner:
 
 # Follow UNIX convention for paths to use '/' instead of '\\' on Windows
 def _to_unix_path(path: str) -> str:
+    # [FUNCTION DOC] HELPER: Replace the OS path separator with a forward slash.
     return path.replace(os.sep, '/')
 
 def match_extensions(filename: str, extensions: Iterable) -> bool:
+    # [FUNCTION DOC] Return True if filename ends with any of the given suffixes.
     """Helper method to see if filename ends with certain extension"""
     return any(filename.endswith(e) for e in extensions)
 
 
 def _fnmatch(filepath, patterns):
+    # [FUNCTION DOC] HELPER: Return True if filepath matches any shell-style pattern.
     return any(fnmatch.fnmatch(filepath, pattern) for pattern in patterns)
 
 
@@ -163,6 +197,11 @@ def matched_files_iter(
         extensions: Iterable = (),
         out_of_place_only: bool = False,
         is_pytorch_extension: bool = False) -> Iterator[str]:
+    # [FUNCTION DOC] Generator over files under root_path that match an include pattern, match no
+    # ignore pattern, and either have an accepted extension or equal an include verbatim. Paths
+    # use forward slashes. Skips the git and build directories and, at the top level, replaces
+    # third_party with only its nvfuser subdirectory. No filesystem writes.
+    # KNOWN ISSUE: out_of_place_only and is_pytorch_extension are accepted but unused.
 
     exact_matches = set(includes)
 
@@ -204,6 +243,9 @@ def preprocess_file_and_save_result(
         is_pytorch_extension: bool,
         clean_ctx: GeneratedFileCleaner,
         show_progress: bool) -> None:
+    # [FUNCTION DOC] Register an INITIALIZED result for the file in the global result registry,
+    # run the preprocessor on it, optionally print the source to output mapping (unless ignored),
+    # and store the final result. Side effects: registry update, file writes, console output.
     fin_path = os.path.abspath(os.path.join(output_directory, filepath))
     hipify_result = HipifyResult(current_state=CurrentState.INITIALIZED, hipified_path=fin_path)
     HIPIFY_FINAL_RESULT[fin_path] = hipify_result
@@ -220,6 +262,8 @@ def preprocess_file_and_save_result(
 
 
 def compute_stats(stats) -> None:
+    # [FUNCTION DOC] Print the count and list of distinct unsupported CUDA calls and the count of
+    # replaced kernel launches from the stats mapping (lists under two keys). Output only.
     unsupported_calls = {cuda_call for (cuda_call, _filepath) in stats["unsupported_calls"]}
 
     # Print the number of unsupported calls
@@ -233,6 +277,10 @@ def compute_stats(stats) -> None:
 
 
 def add_dim3(kernel_string, cuda_kernel):
+    # [FUNCTION DOC] Given a kernel launch configuration text and the full launch text, wrap the
+    # first two top-level configuration arguments (grid and block) in dim3 constructor calls and
+    # return the launch text with that substitution applied. Arguments split on commas outside
+    # parentheses.
     '''adds dim3() to the second and third arguments in the kernel launch'''
     count = 0
     closure = 0
@@ -271,11 +319,20 @@ RE_KERNEL_LAUNCH = re.compile(r'([ ]+)(detail?)::[ ]+\\\n[ ]+')
 
 
 def processKernelLaunches(string, stats):
+    # [FUNCTION DOC] Rewrite every CUDA triple-angle-bracket kernel launch in the source text
+    # into a HIP launch macro call, padding missing configuration args with zeros and wrapping grid
+    # and block in dim3. First joins namespace qualifiers split over lines. Launches inside
+    # comments and string literals are ignored. Appends each new launch to stats under
+    # kernel_launches and returns the new text. Raises InputError for an unterminated launch.
     """ Replace the CUDA style Kernel launches with the HIP style kernel launches."""
     # Concat the namespace with the kernel names. (Find cleaner way of doing this later).
     string = RE_KERNEL_LAUNCH.sub(lambda inp: f"{inp.group(1)}{inp.group(2)}::", string)
 
     def grab_method_and_template(in_kernel):
+        # [FUNCTION DOC] HELPER: Scan backwards from a launch start to locate the kernel name and
+        # optional template argument span. Returns a list of three position mappings (name,
+        # template, launch), each with start and end.
+        # KNOWN ISSUE: returns None if no kernel name is found, which later fails when indexed.
         # The positions for relevant kernel components.
         pos = {
             "kernel_launch": {"start": in_kernel["start"], "end": in_kernel["end"]},
@@ -335,6 +392,8 @@ def processKernelLaunches(string, stats):
                         return [(pos["kernel_name"]), (pos["template"]), (pos["kernel_launch"])]
 
     def find_kernel_bounds(string):
+        # [FUNCTION DOC] HELPER: Return a list of mappings with start, end and group text for each
+        # launch configuration span. Raises InputError if an opening marker has no closing one.
         """Finds the starting and ending points for all kernel launches in the string."""
         kernel_end = 0
         kernel_positions = []
@@ -359,6 +418,8 @@ def processKernelLaunches(string, stats):
     # wrongly capture kernels in comments and string literals.
     # This function replaces them with "x" to keep positions.
     def mask_comments(string):
+        # [FUNCTION DOC] HELPER: Return a same-length copy of the text with comment and string
+        # literal contents replaced by x so positions stay valid.
         in_comment = ''
         prev_c = ''
         new_string = ''
@@ -425,6 +486,8 @@ def processKernelLaunches(string, stats):
 
 
 def find_closure_group(input_string, start, group):
+    # [FUNCTION DOC] Find the first balanced pair of group[0] and group[1] at or after start in
+    # the text. Returns the pair of positions, or (None, None) if no balanced group is found.
     """Generalization for finding a balancing closure group
 
          if group = ["(", ")"], then finds the first balanced parentheses.
@@ -463,11 +526,15 @@ def find_closure_group(input_string, start, group):
 
 
 def find_bracket_group(input_string, start):
+    # [FUNCTION DOC] Return positions of the first balanced curly-brace group at or after start.
+    # KNOWN ISSUE: its docstring says parentheses, but it searches for curly braces.
     """Finds the first balanced parentheses."""
     return find_closure_group(input_string, start, group=["{", "}"])
 
 
 def find_parentheses_group(input_string, start):
+    # [FUNCTION DOC] Return positions of the first balanced parentheses group at or after start.
+    # KNOWN ISSUE: its docstring says bracket, but it searches for parentheses.
     """Finds the first balanced bracket."""
     return find_closure_group(input_string, start, group=["(", ")"])
 
@@ -476,6 +543,9 @@ RE_ASSERT = re.compile(r"\bassert[ ]*\(")
 
 
 def replace_math_functions(input_string):
+    # [FUNCTION DOC] Replace each call of a math function listed in the transpilation table with
+    # its replacement name (plain substring replacement of the name followed by an opening paren).
+    # Returns the new text.
     """FIXME: Temporarily replace std:: invocations of math functions
         with non-std:: versions to prevent linker errors NOTE: This
         can lead to correctness issues when running tests, since the
@@ -495,6 +565,9 @@ RE_SYNCTHREADS = re.compile(r":?:?\b(__syncthreads)\b(\w*\()")
 
 
 def hip_header_magic(input_string):
+    # [FUNCTION DOC] If neither HIP runtime header is already included and the text looks like
+    # device code (launch macro, global or shared qualifiers, or a thread sync call), prepend an
+    # include of the HIP runtime header. Returns the possibly extended text.
     """If the file makes kernel builtin calls and does not include the cuda_runtime.h header,
     then automatically add an #include to match the "magic" includes provided by NVCC.
     TODO:
@@ -527,6 +600,9 @@ RE_EXTERN_SHARED = re.compile(r"extern\s+([\w\(\)]+)?\s*__shared__\s+([\w:<>\s]+
 
 
 def replace_extern_shared(input_string):
+    # [FUNCTION DOC] Rewrite declarations of dynamically sized extern shared arrays into the HIP
+    # dynamic shared macro form. Returns the new text. Currently not called, because the
+    # preprocessor has this step disabled.
     """
     Match 'extern __shared__ type foo[];' syntax and use HIP_DYNAMIC_SHARED() MACRO instead.
     See: https://github.com/ROCm/hip/blob/master/docs/markdown/hip_kernel_language.md#__shared__
@@ -544,6 +620,11 @@ def replace_extern_shared(input_string):
 
 
 def get_hip_file_path(rel_filepath, is_pytorch_extension=False):
+    # [FUNCTION DOC] Compute the output path for a relative source path. Files kept in place are
+    # returned unchanged (non extension mode). Otherwise renames cuda to hip, CUDA to HIP, THC to
+    # THH in the directory and file name (THC kept for the caffe2/core directory), turns the cu
+    # suffix into hip, and if nothing else changed adds a hip directory (or a hip suffix on the
+    # name in extension mode). Raises AssertionError for absolute paths.
     """
     Returns the new name of the hipified file
     """
@@ -617,6 +698,8 @@ def get_hip_file_path(rel_filepath, is_pytorch_extension=False):
 
 
 def is_out_of_place(rel_filepath) -> bool:
+    # [FUNCTION DOC] Return False for paths hipified in place (torch/, third_party/nvfuser/,
+    # tools/autograd/templates/) and True otherwise. Raises AssertionError for absolute paths.
     if os.path.isabs(rel_filepath):
         raise AssertionError("rel_filepath must be a relative path")
     if rel_filepath.startswith("torch/"):
@@ -630,6 +713,9 @@ def is_out_of_place(rel_filepath) -> bool:
 
 # Keep this synchronized with includes/ignores in build_amd.py
 def is_pytorch_file(rel_filepath) -> bool:
+    # [FUNCTION DOC] Deprecated (warns). Return True if the relative path belongs to the PyTorch
+    # source areas (aten except its core, torch, selected third_party and test areas). Raises
+    # AssertionError for absolute paths.
     _deprecated("is_pytorch_file")
     if os.path.isabs(rel_filepath):
         raise AssertionError("rel_filepath must be a relative path")
@@ -653,6 +739,7 @@ def is_pytorch_file(rel_filepath) -> bool:
 
 
 def is_cusparse_file(rel_filepath):
+    # [FUNCTION DOC] Deprecated (warns). True for PyTorch files whose path mentions sparse.
     _deprecated("is_cusparse_file")
     if is_pytorch_file(rel_filepath):
         return "sparse" in rel_filepath.lower()
@@ -660,6 +747,8 @@ def is_cusparse_file(rel_filepath):
 
 
 def is_special_file(rel_filepath) -> bool:
+    # [FUNCTION DOC] Deprecated (warns). True for PyTorch files with sparse or linalg in the path,
+    # except the batch linear algebra blas file.
     _deprecated("is_special_file")
     if is_pytorch_file(rel_filepath):
         if "sparse" in rel_filepath.lower():
@@ -672,6 +761,8 @@ def is_special_file(rel_filepath) -> bool:
 
 
 def is_caffe2_gpu_file(rel_filepath):
+    # [FUNCTION DOC] Deprecated (warns). True for c10/cuda paths, or files with gpu in the name or
+    # a cu/cuh suffix, unless the name mentions cudnn. Raises AssertionError for absolute paths.
     _deprecated("is_caffe2_gpu_file")
     if os.path.isabs(rel_filepath):
         raise AssertionError("rel_filepath must be a relative path")
@@ -684,26 +775,34 @@ def is_caffe2_gpu_file(rel_filepath):
 
 
 class TrieNode:
+    # [CLASS DOC] Node of a character trie; children maps a character to a child node, and the
+    # empty-string key marks the end of a word.
     """A Trie node whose children are represented as a dictionary of char: TrieNode.
        A special char '' represents end of word
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Create a node with no children.
         self.children = {}
 
 
 class Trie:
+    # [CLASS DOC] Character trie over added words that can be exported as a compact regular
+    # expression alternation. Keeps a running hash and digest of all added words, which is used
+    # as the cache key for the memoized pattern builder.
     """Creates a Trie out of a list of words. The trie can be exported to a Regex pattern.
     The corresponding Regex should match much faster than a simple Regex union."""
 
     def __init__(self) -> None:
         """Initialize the trie with an empty root node."""
+        # [FUNCTION DOC] Create an empty root and initialize the hash and its digest.
         self.root = TrieNode()
         self._hash = hashlib.md5(usedforsecurity=False)
         self._digest = self._hash.digest()
 
     def add(self, word) -> None:
         """Add a word to the Trie. """
+        # [FUNCTION DOC] Insert word, mark its end, and fold it into the running hash and digest.
         self._hash.update(word.encode())
         self._digest = self._hash.digest()
         node = self.root
@@ -715,15 +814,18 @@ class Trie:
 
     def dump(self):
         """Return the root node of Trie. """
+        # [FUNCTION DOC] Return the root node.
         return self.root
 
     def quote(self, char):
         """ Escape a char for regex. """
+        # [FUNCTION DOC] Return char escaped for use in a regular expression.
         return re.escape(char)
 
     def search(self, word):
         """Search whether word is present in the Trie.
         Returns True if yes, else return False"""
+        # [FUNCTION DOC] Return True only if word was added as a complete word.
         node = self.root
         for char in word:
             if char in node.children:
@@ -736,6 +838,12 @@ class Trie:
 
     @functools.lru_cache  # noqa: B019
     def _pattern(self, root, digest):
+        # [FUNCTION DOC] HELPER: Recursively build the regex text for the subtree at root; returns
+        # None for a leaf that only marks a word end. Single characters merge into a class, longer
+        # branches into alternations, and an optional group if a word ends here. Memoized.
+        # KNOWN ISSUE: recursion passes the trie-level digest rather than a per-node key, and
+        # a failure from a None sub-pattern is swallowed by catching all exceptions to build
+        # the character class.
         """Convert a Trie into a regular expression pattern
 
         Memoized on the hash digest of the trie, which is built incrementally
@@ -780,12 +888,15 @@ class Trie:
 
     def pattern(self):
         """Export the Trie to a regex pattern."""
+        # [FUNCTION DOC] Return the regex text for the whole trie (same as export_to_regex).
         return self._pattern(self.root, self._digest)
 
     def export_to_regex(self):
         """Export the Trie to a regex pattern."""
+        # [FUNCTION DOC] Return the regex text for the whole trie (same as pattern).
         return self._pattern(self.root, self._digest)
 
+# Build the global mapping table and the trie of all CUDA names at import time.
 PYTORCH_TRIE = Trie()
 PYTORCH_MAP: dict[str, object] = {}
 
@@ -824,6 +935,14 @@ def preprocessor(
         is_pytorch_extension: bool,
         clean_ctx: GeneratedFileCleaner,
         show_progress: bool) -> HipifyResult:
+    # [FUNCTION DOC] Hipify one file. Looks up the registered result; files not in all_files or
+    # already carrying the breadcrumb are marked ignored. Otherwise reads the source, applies the
+    # name mapping regex, caffe2 path mappings (avoiding double conversion), include and define
+    # rewrites (recursively hipifying local headers for extensions), CMake text fixes, kernel
+    # launch rewriting (unless hip_clang_launch) and math and header fixes. Writes the output
+    # path from get_hip_file_path (creating directories through clean_ctx) unless identical or
+    # unchanged, prefixing a breadcrumb for C-style files. Returns the updated HipifyResult; an
+    # OS error on write leaves the input in place with a no-permissions status and a warning.
     """ Executes the CUDA -> HIP conversion on the specified file. """
     fin_path = os.path.abspath(os.path.join(output_directory, filepath))
     filepath = _to_unix_path(filepath)
@@ -854,6 +973,7 @@ def preprocessor(
 
     # unsupported_calls statistics reporting is broken atm
     def pt_repl(m):
+        # [FUNCTION DOC] HELPER: Return the HIP name for the matched CUDA name.
         return PYTORCH_MAP[m.group(0)]
 
     output_source = RE_PYTORCH_PREPROCESSOR.sub(pt_repl, output_source)
@@ -878,7 +998,14 @@ def preprocessor(
 
     # Header rewrites
     def mk_repl(templ, include_current_dir=True):
+        # [FUNCTION DOC] HELPER: Build a regex replacement function that rewrites the path in an
+        # include or define line using the format template, optionally searching the including
+        # file directory first.
         def repl(m):
+            # [FUNCTION DOC] HELPER: Rewrite one matched header path. CUDA/THC library headers get
+            # their hip file path; headers that are part of the extension build are hipified first
+            # (if not yet registered) and referenced relative to the including directory. Others
+            # are returned unchanged.
             f = m.group(1)
             filename = os.path.basename(f)
             if (
@@ -1003,6 +1130,8 @@ def preprocessor(
         return hipify_result
 
 def file_specific_replacement(filepath, search_string, replace_string, strict=False) -> None:
+    # [FUNCTION DOC] Rewrite the file in place, replacing search_string with replace_string
+    # (whole-word match only when strict). Side effect: modifies the file.
     with openf(filepath, "r+") as f:
         contents = f.read()
         if strict:
@@ -1015,6 +1144,8 @@ def file_specific_replacement(filepath, search_string, replace_string, strict=Fa
 
 
 def file_add_header(filepath, header) -> None:
+    # [FUNCTION DOC] Prepend an include line for header to the file, quoting the name unless it
+    # is already in angle brackets. Side effect: modifies the file.
     with openf(filepath, "r+") as f:
         contents = f.read()
         if header[0] != "<" and header[-1] != ">":
@@ -1027,6 +1158,9 @@ def file_add_header(filepath, header) -> None:
 
 def fix_static_global_kernels(in_txt):
     """Static global kernels in HIP results in a compilation error."""
+    # [FUNCTION DOC] Replace the text of a static global kernel qualifier with the plain global
+    # qualifier and return the result.
+    # KNOWN ISSUE: the match includes a leading space that is dropped from the output.
     in_txt = in_txt.replace(" __global__ static", "__global__")
     return in_txt
 
@@ -1035,6 +1169,10 @@ RE_INCLUDE = re.compile(r"#include .*\n")
 
 
 def extract_arguments(start, string):
+    # [FUNCTION DOC] Scan from position start (an opening paren) and return a list of mappings
+    # with start and end offsets for each top-level comma separated argument until the parens
+    # balance; angle brackets (template arguments, but not arrows) are tracked so their commas
+    # do not split. Returns an empty list if the group never closes.
     """
     Return the list of arguments in the upcoming function parameter closure.
     Example:
@@ -1079,6 +1217,8 @@ def extract_arguments(start, string):
 
 
 def str2bool(v : str) -> bool:
+    # [FUNCTION DOC] Parse a yes/no style string (case insensitive) into a bool for argparse.
+    # Raises argparse.ArgumentTypeError for any other value.
     """ArgumentParser doesn't support type=bool. Thus, this helper method will convert
     from possible string types to True / False."""
     if v.lower() in ('yes', 'true', 't', 'y', '1'):
@@ -1106,6 +1246,13 @@ def hipify(
     hipify_extra_files_only: bool = False,
     clean_ctx: GeneratedFileCleaner | None = None
 ) -> HipifyFinalResult:
+    # [FUNCTION DOC] Main entry point. Resolves the project directory (current directory if
+    # empty; exits the process with status 1 if missing) and output directory (default is the
+    # project path plus an amd suffix), copies the project tree there if absent, collects matching
+    # files plus extra files and header-include directory files, then hipifies each (only extra
+    # files when requested). Prints a success note to stderr and optional statistics. Returns the
+    # global result registry mapping output paths to HipifyResult.
+    # KNOWN ISSUE: the result of stripping a trailing slash from project_directory is discarded.
     if project_directory == "":
         project_directory = os.getcwd()
 

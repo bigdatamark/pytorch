@@ -1,4 +1,6 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Converts an ONNX model graph into a TensorBoard GraphDef message.
+# Contains load_onnx_graph (load from file) and parse (convert). No import-time side effects.
 from tensorboard.compat.proto.graph_pb2 import GraphDef
 from tensorboard.compat.proto.node_def_pb2 import NodeDef
 from tensorboard.compat.proto.versions_pb2 import VersionDef
@@ -7,6 +9,8 @@ from tensorboard.compat.proto.tensor_shape_pb2 import TensorShapeProto
 
 
 def load_onnx_graph(fname):
+    # [FUNCTION DOC] Load the ONNX model file fname (imports onnx lazily; raises ImportError if
+    # missing) and return the GraphDef produced by parse for its graph.
     import onnx
     m = onnx.load(fname)  # type: ignore[attr-defined]
     g = m.graph
@@ -14,6 +18,12 @@ def load_onnx_graph(fname):
 
 
 def parse(graph):
+    # [FUNCTION DOC] Convert an ONNX graph into a GraphDef (producer version 22). Graph inputs
+    # and outputs become Variable nodes carrying dtype and shape attributes; each operator node
+    # becomes a node named after its first output, with its attributes rendered into a
+    # parameters string. Side effect: prints every node name to stdout.
+    # KNOWN ISSUE: the name-to-opname mapping built at the end is never used, so the "token
+    # replacement" described in its comment has no effect.
     nodes = []
     import itertools
 

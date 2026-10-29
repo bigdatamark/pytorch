@@ -1,3 +1,5 @@
+# [MODULE DOC] Builders for TensorBoard graph protobuf messages (NodeDef, AttrValue,
+# TensorShapeProto) used when exporting model graphs. Pure constructors, no import-time effects.
 import torch
 
 from collections.abc import Sequence
@@ -7,6 +9,10 @@ from tensorboard.compat.proto.tensor_shape_pb2 import TensorShapeProto
 
 
 def attr_value_proto(dtype: object, shape: Sequence[int] | None, s: str | None) -> dict[str, AttrValue]:
+    # [FUNCTION DOC] Build the attr mapping for a NodeDef. If s is given, adds key attr holding
+    # the utf-8 encoded string; if shape is given, adds key _output_shapes holding a list with
+    # one shape proto. Returns the mapping (possibly empty).
+    # KNOWN ISSUE: the dtype argument is accepted but never used.
     """Create a dict of objects matching a NodeDef's attr field.
 
     Follows https://github.com/tensorflow/tensorboard/blob/master/tensorboard/compat/proto/attr_value.proto
@@ -23,6 +29,7 @@ def attr_value_proto(dtype: object, shape: Sequence[int] | None, s: str | None) 
 
 
 def tensor_shape_proto(outputsize: Sequence[int]) -> TensorShapeProto:
+    # [FUNCTION DOC] Build a TensorShapeProto with one dimension entry per element of outputsize.
     """Create an object matching a tensor_shape field.
 
     Follows https://github.com/tensorflow/tensorboard/blob/master/tensorboard/compat/proto/tensor_shape.proto .
@@ -39,6 +46,10 @@ def node_proto(
     outputsize: Sequence[int] | None = None,
     attributes: str = "",
 ) -> NodeDef:
+    # [FUNCTION DOC] Build a NodeDef with the utf-8 encoded name, the op, a list of input node
+    # names (None becomes empty, a single string is wrapped in a list) and attrs derived from
+    # outputsize and attributes via attr_value_proto.
+    # KNOWN ISSUE: the shape argument is unused; dtype is passed on but ignored downstream.
     """Create an object matching a NodeDef.
 
     Follows https://github.com/tensorflow/tensorboard/blob/master/tensorboard/compat/proto/node_def.proto .

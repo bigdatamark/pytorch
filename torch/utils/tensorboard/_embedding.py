@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Helpers that write TensorBoard embedding projector files: metadata tsv, sprite
+# image, tensors tsv, projector config text and the EmbeddingInfo message. All output goes
+# through tensorboard's tf file API. Import-time: computes whether gfile has a join function.
 import math
 import numpy as np
 from ._convert_np import make_np
@@ -11,6 +14,8 @@ _HAS_GFILE_JOIN = hasattr(tf.io.gfile, "join")
 
 
 def _gfile_join(a, b):
+    # [FUNCTION DOC] HELPER: Join two path pieces using gfile.join when available, otherwise
+    # the join method of the filesystem object for the first path. Returns the joined path.
     # The join API is different between tensorboard's TF stub and TF:
     # https://github.com/tensorflow/tensorboard/issues/6080
     # We need to try both because `tf` may point to either the stub or the real TF.
@@ -22,6 +27,10 @@ def _gfile_join(a, b):
 
 
 def make_tsv(metadata, save_path, metadata_header=None) -> None:
+    # [FUNCTION DOC] Write metadata.tsv under save_path. Without a header, each entry becomes
+    # one line; with a header, metadata is a list of rows, each joined by tabs, and the header
+    # is the first line. Raises AssertionError if header length differs from the column count.
+    # Side effect: creates or overwrites the file.
     if not metadata_header:
         metadata = [str(x) for x in metadata]
     else:
@@ -38,6 +47,10 @@ def make_tsv(metadata, save_path, metadata_header=None) -> None:
 
 # https://github.com/tensorflow/tensorboard/issues/44 image label will be squared
 def make_sprite(label_img, save_path) -> None:
+    # [FUNCTION DOC] Tile a batch of label images into one square grid image and save it as
+    # sprite.png under save_path. The grid has ceil(sqrt(batch)) columns, is padded to a square
+    # with zeros, and pixel values are scaled by 255 and clipped. Requires PIL. Side effect:
+    # file write.
     from PIL import Image
     from io import BytesIO
 
@@ -63,6 +76,10 @@ def make_sprite(label_img, save_path) -> None:
 
 
 def get_embedding_info(metadata, label_img, subdir, global_step, tag):
+    # [FUNCTION DOC] Build an EmbeddingInfo message named tag plus the step zero-padded to five
+    # digits, with the tensors path inside subdir. Adds a metadata path if metadata is given and
+    # a sprite path and image dimensions (width, height from label_img) if label_img is given.
+    # Returns the message; no I/O.
     info = EmbeddingInfo()
     info.tensor_name = f"{tag}:{str(global_step).zfill(5)}"
     info.tensor_path = _gfile_join(subdir, "tensors.tsv")
@@ -75,12 +92,16 @@ def get_embedding_info(metadata, label_img, subdir, global_step, tag):
 
 
 def write_pbtxt(save_path, contents) -> None:
+    # [FUNCTION DOC] Write the text contents to projector_config.pbtxt under save_path
+    # (side effect: creates or overwrites the file).
     config_path = _gfile_join(save_path, "projector_config.pbtxt")
     with tf.io.gfile.GFile(config_path, "wb") as f:
         f.write(tf.compat.as_bytes(contents))
 
 
 def make_mat(matlist, save_path) -> None:
+    # [FUNCTION DOC] Write tensors.tsv under save_path with one line per row of matlist; each
+    # row is an iterable of scalar tensors whose values are tab separated. Side effect: file write.
     with tf.io.gfile.GFile(_gfile_join(save_path, "tensors.tsv"), "wb") as f:
         for x in matlist:
             x = [str(i.item()) for i in x]
