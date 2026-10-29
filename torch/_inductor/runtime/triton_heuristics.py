@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Core runtime for Inductor-generated Triton kernels: the CachingAutotuner that
+# precompiles candidate Triton configs, benchmarks them, caches the winner on disk and launches it,
+# plus the config-generating heuristics (pointwise, reduction, persistent reduction, split scan,
+# template, user-defined, foreach, fixed-config) and helpers for grids, TMA descriptors, debug dumps.
+# Import-time side effects: creates module loggers, an artifact logger, a compiled regex, and checks
+# that the kernel type alias matches the TypeVar constraints (raises an error otherwise).
 from __future__ import annotations
 
 import builtins
@@ -103,6 +109,8 @@ from .triton_helpers import get_constexprs
 
 
 class BenchmarkFailureReason(enum.Enum):
+# [CLASS DOC] Enumeration of why benchmarking a Triton config produced an infinite time:
+# REGISTER_SPILLING or INVALID_CONFIG.
     """Reasons why a triton config benchmark may return float('inf')."""
 
     REGISTER_SPILLING = "register_spilling"
@@ -110,18 +118,24 @@ class BenchmarkFailureReason(enum.Enum):
 
 
 class InductorConfig(Config):
+# [CLASS DOC] Triton Config subclass adding a dynamic_scale_rblock flag (default true) that marks
+# whether the reduction block size may be scaled at runtime based on register usage.
     """Inductor-specific Triton config with additional control flags"""
 
     def __init__(self, *args, dynamic_scale_rblock=True, **kwargs):
+    # [FUNCTION DOC] Forwards all positional/keyword args to Config and stores dynamic_scale_rblock.
         super().__init__(*args, **kwargs)
         self.dynamic_scale_rblock = dynamic_scale_rblock
 
 
 class NoTritonConfigsError(RuntimeError):
+# [CLASS DOC] Error raised when no valid Triton configs are available for a kernel.
     pass
 
 
 def _should_enable_triton_debug_asserts(inductor_meta: InductorMeta) -> bool:
+    # [FUNCTION DOC] HELPER: Decide whether Triton debug asserts should be enabled. False when
+    # assert_indirect_indexing is off in the meta; true on non-HIP; on HIP only for Triton >= 3.7.
     """
     Enable Triton debug asserts whenever indirect indexing asserts are on,
     except on HIP where older Triton releases lack the required support.
@@ -165,6 +179,8 @@ triton_name_sub = re.compile(r"^def [^(]+\(")
 
 
 def generate_lookup_hash_from_source_code(size_hints_str: str, source_code: str) -> str:
+    # [FUNCTION DOC] Compute a sha256 hex digest used as an autotune lookup-table key from the size
+    # hints string plus the kernel source with the function name stripped and whitespace trimmed.
     # Name agnostic + strip white space
     fn_strip_name = re.sub(triton_name_sub, "(", source_code.strip(), count=1)
     hash_str = size_hints_str + fn_strip_name
@@ -174,6 +190,9 @@ def generate_lookup_hash_from_source_code(size_hints_str: str, source_code: str)
 
 
 def lookup_autotune_config(size_hints, fn) -> Config | None:
+    # [FUNCTION DOC] Look up a preset Config for a fused kernel in config.autotune_lookup_table. Returns
+    # None unless the table is non-empty, the source contains a fused-kernel marker, and the hash of
+    # (size_hints, source) is present; otherwise builds a Config from BLOCK entries, num_warps, num_stages.
     lookup_table = torch._inductor.config.autotune_lookup_table
     cached_config = None
     if len(lookup_table) > 0 and "_fused_" in fn.src:
@@ -191,12 +210,16 @@ def lookup_autotune_config(size_hints, fn) -> Config | None:
 
 
 def get_total_reduction_numel(numels: dict[str, int]) -> int:
+    # [FUNCTION DOC] Product of all numels whose prefix denotes a reduction dimension (via
+    # conditional_product, which handles symbolic values).
     return conditional_product(
         *[numel for prefix, numel in numels.items() if prefix_is_reduction(prefix)]
     )
 
 
 def _resolve_dims(dims, cfg_kwargs, constants):
+    # [FUNCTION DOC] HELPER: Resolve each descriptor dim (int, or a name found in constants or config
+    # kwargs) to a concrete int list. Returns None (with a debug log) if any dim cannot be resolved.
     """Resolve a list of block/shape/stride dims to concrete ints."""
     result = []
     for s in dims:
@@ -214,6 +237,8 @@ def _resolve_dims(dims, cfg_kwargs, constants):
 
 @functools.lru_cache(None)
 def _warn_host_tma_clone(name: str) -> None:
+    # [FUNCTION DOC] HELPER: Log (once per input name, via lru_cache) a warning that a host-side TMA
+    # input is misaligned and will be cloned on each launch.
     log.warning(
         "host-side TMA: input %s is not %d-byte aligned; cloning it (an extra "
         "copy per launch). Pass aligned inputs to avoid this.",
@@ -223,6 +248,8 @@ def _warn_host_tma_clone(name: str) -> None:
 
 
 def _host_tma_aligned(tensor, name):
+    # [FUNCTION DOC] HELPER: Return the tensor itself if its data pointer is TMA-aligned, else warn once
+    # and return a clone. Used by the host-side TMA launcher.
     """Return a TMA_ALIGNMENT-aligned view of `tensor`, cloning (with a one-time
     warning) only if its base address is not aligned. Used by the host-side TMA
     launcher to build TensorDescriptors from aligned storage."""
@@ -238,6 +265,10 @@ def autotune_hints_to_configs(
     block_size: int,
     device_props: DeviceProperties,
 ) -> list[Config]:
+    # [FUNCTION DOC] Turn AutotuneHint values into extra triton configs. Only ONE_ELEMENT_PER_THREAD is
+    # handled: skipped (debug log) if the device reports no warp size; otherwise builds configs with
+    # block_size//4 placed on each dimension in turn (1, 2 or 3 dims by size_hints length).
+    # KNOWN ISSUE: for size_hints lengths other than 1-3 xyz_options is unbound and would raise.
     """
     AutotuneHints can be attached to the metadata of triton kernels for providing
     suggestions about what to try for autotuning. One reason to do this is if there are
@@ -283,6 +314,9 @@ def autotune_hints_to_configs(
 
 
 def _dump_launch_params(args, kwargs, launcher, kernel_name, grid):
+    # [FUNCTION DOC] HELPER: Append one line "name | args | grid" to a file next to the running script
+    # (argv[0] + .launch_params). Tensors are shown as T, ints/bools as values, then kwargs, config kwargs,
+    # num_warps, num_stages (and warp-spec options when supported).
     call_args = []
     call_kwargs = dict(kwargs)
     for arg in args:
@@ -309,6 +343,9 @@ def _dump_launch_params(args, kwargs, launcher, kernel_name, grid):
 
 
 def _dump_launch_tensors(args, kernel_path, kernel_hash, kernel_name):
+    # [FUNCTION DOC] HELPER: Debug dump of tensor args via torch.save into a per-run directory next to
+    # the kernel file (or a cache dir for unhashed kernels). Keeps a rotating run index per kernel hash in
+    # the config, wrapping at max_kernel_dump_occurrences. Creates directories, writes files, logs.
     tensor_list = [arg for arg in args if isinstance(arg, torch.Tensor)]
 
     run_index = 0
@@ -347,6 +384,8 @@ def _dump_launch_tensors(args, kernel_path, kernel_hash, kernel_name):
 
 
 def _combo_has_reduction_subkernel(inductor_meta: InductorMeta) -> bool:
+    # [FUNCTION DOC] HELPER: True if combo-kernel meta has any sub-kernel with reduction heuristic and is
+    # not a stitched combo (stitched ones fix blocks at codegen time and do not runtime-scale rblock).
     combo_meta = inductor_meta.get("combo_grid_meta")
     if combo_meta is None or "heuristic_0" not in combo_meta:
         return False
@@ -369,6 +408,10 @@ def _could_dynamic_scale_rblock(
     device_prop: DeviceProperties | None,
     inductor_meta: InductorMeta,
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Whether the reduction block may be dynamically scaled: needs a device,
+    # non-deterministic mode, flag enabled, non-persistent reduction heuristic, size hints (or combo
+    # reduction sub-kernel), a cuda/hip device with compute capability >= 8 (or HIP), and known register
+    # and warp-size properties.
     return (
         device_prop is not None
         and not inductor_meta.get("deterministic", False)
@@ -393,6 +436,11 @@ def check_autotune_cache(
     inductor_meta: InductorMeta,
     dynamic_scale_rblock_eligible: bool = False,
 ) -> tuple[list[Config], AutotuneCache | None, dict[str, Any]]:
+    # [FUNCTION DOC] Consult the on-disk autotune cache. Returns (configs, cache object or None, info
+    # dict). If caching is allowed (not force-disabled, has filename, multiple configs or coordinate
+    # descent or eligible rblock scaling, not interpreter mode) it hashes configs, creates the cache and
+    # on a hit narrows configs to the best one; records hit/miss/only-1-config/force_disabled state in info.
+    # Side effects: reports watchdog phase, debug log.
     """
     Given a list of configs, checks autotune cache and return metadata
     """
@@ -452,6 +500,8 @@ DEFER: Final[object] = object()
 
 
 class CachingAutotunerPlugin:
+# [CLASS DOC] Base class for CachingAutotuner plugins. Every hook returns the DEFER sentinel to fall
+# through to the next plugin or default behavior, or another value to short-circuit run().
     """Base class for ``CachingAutotuner`` plugins.
 
     Each hook returns ``DEFER`` to fall through to the next plugin / default
@@ -459,6 +509,8 @@ class CachingAutotunerPlugin:
     """
 
     def pre_compile(self, autotuner: CachingAutotuner) -> object:
+    # [FUNCTION DOC] Hook at the start of precompile; default returns DEFER. Non-DEFER skips the whole
+    # standard precompile flow (plugin owns compile and launcher creation).
         """Fires at the top of ``CachingAutotuner.precompile`` (the
         parent-side, non-warm-cache-only path).
 
@@ -479,6 +531,8 @@ class CachingAutotunerPlugin:
         stream: object,
         **kwargs: object,
     ) -> object:
+    # [FUNCTION DOC] Hook before kernel dispatch (ahead of precompile/autotune); default returns DEFER.
+    # Not called on the cached-launcher fast path.
         """Fires before kernel dispatch, ahead of precompile or autotune.
 
         Note: ``run()``'s steady-state fast path returns ``self._cached_launcher``
@@ -496,6 +550,8 @@ class CachingAutotunerPlugin:
         stream: object,
         **kwargs: object,
     ) -> object:
+    # [FUNCTION DOC] Hook replacing autotune_to_one_config when several launchers remain; default
+    # returns DEFER. A non-DEFER result ends run() and the plugin must launch and finalize itself.
         """Fires after precompile when more than one launcher remains, in
         place of ``autotune_to_one_config()``.
 
@@ -514,6 +570,8 @@ class CachingAutotunerPlugin:
 def get_caching_autotuner_plugins(
     autotuner: CachingAutotuner,
 ) -> list[CachingAutotunerPlugin]:
+    # [FUNCTION DOC] Build the plugin list for an autotuner. Adds the incremental autotune plugin when
+    # inductor_meta enables it and the optional fb module imports; import failure is ignored.
     """Build the list of plugins active for ``autotuner``.
 
     Each plugin adds an entry here, gated on its own config flag, with
@@ -531,6 +589,8 @@ def get_caching_autotuner_plugins(
 
 
 def _resolve_load_device(device: int | None, device_type: str) -> int | None:
+    # [FUNCTION DOC] HELPER: Resolve a rank-agnostic None device to the current device of the device
+    # type's interface (hip mapped to cuda); CPU and already-set devices are returned unchanged.
     # compile-on-one-rank: a None device is the rank-agnostic marker; resolve it to the
     # current device at load time so a shared kernel's cubin loads on the running rank's
     # GPU rather than a baked compile-time index. CPU has no device index and its
@@ -544,6 +604,11 @@ def _resolve_load_device(device: int | None, device_type: str) -> int | None:
 
 
 class CachingAutotuner(KernelInterface):
+    # [CLASS DOC] Simplified Triton autotuner: holds candidate configs, precompiles each into a compile
+    # result and launcher, benchmarks them, picks the best (optionally coordinate-descent tuned), caches
+    # it via the save hook and launches kernels. State: fn, triton_meta, inductor_meta, configs,
+    # compile_results, launchers, lock, plugins, cached fast-path launcher, timing counters, debug flags.
+    # Does not use the Triton JIT autotuner.
     """
     Simplified version of Triton autotuner that has no invalidation
     key and caches the best config to disk to improve cold start times.
@@ -567,6 +632,11 @@ class CachingAutotuner(KernelInterface):
         reset_to_zero_arg_names: list[str] | None = None,
         autotune_cache_info: dict[str, Any] | None = None,
     ):
+        # [FUNCTION DOC] Store the kernel function, metadata and configs. Raises an error if configs is
+        # empty; validates each config has no pre-hooks. Substitutes a lookup-table config if one exists.
+        # Copies device info into triton_meta, adds warp size and max threads to inductor_meta, creates the
+        # coordinate descent tuner, derives kernel_hash from filename, reads dump env vars, sets TRITON_CACHE_DIR
+        # if unset (side effect on os.environ), and initializes plugins and launch fast-path eligibility.
         super().__init__()
 
         if len(configs) == 0:
@@ -693,6 +763,9 @@ class CachingAutotuner(KernelInterface):
 
     @staticmethod
     def _close_compiled_kernel(kernel: Any) -> None:
+        # [FUNCTION DOC] HELPER: Static method that releases a compiled kernel's device module. Does nothing for
+        # None; calls its close method if present; otherwise (older Triton) invokes its destructor if a module is
+        # still loaded. Safe to call repeatedly.
         if kernel is None:
             return
         close = getattr(kernel, "close", None)
@@ -709,6 +782,8 @@ class CachingAutotuner(KernelInterface):
                 delete()
 
     def release_benchmark_artifacts(self) -> None:
+        # [FUNCTION DOC] Free benchmarking state: closes the kernels behind every launcher and compile result,
+        # then empties launchers, compile_results, failure reasons, the cached fast-path launcher and debug call.
         for launcher in self.launchers:
             kernel = getattr(launcher, "__self__", None)
             self._close_compiled_kernel(kernel)
@@ -723,6 +798,8 @@ class CachingAutotuner(KernelInterface):
         self._debug_call = None
 
     def is_statically_launchable(self):
+        # [FUNCTION DOC] True only if there is at least one compile result and all are static (statically
+        # launched) compile results; such autotuners can be cached in the FX graph cache.
         """
         Checks if every compiled kernel is statically launchable, which
         allows us to efficiently cache it in FXGraphCache
@@ -736,6 +813,11 @@ class CachingAutotuner(KernelInterface):
     def recheck_autotune_cache(
         self, reload_kernel_from_src: Callable[[], CachingAutotuner]
     ) -> None:
+        # [FUNCTION DOC] After loading a static autotuner from cache, re-query the autotune cache since a
+        # best config may have been found since. Raises an error if not statically launchable. Updates
+        # autotune_cache_info; on a hit keeps only the matching compile result (marking found_by_coordesc),
+        # or, if the best config was found dynamically and is absent, compiles it now (reloading the kernel
+        # source through the callback if the function was stripped).
         """
         On cache load on static autotuner, we need to recheck the autotune cache, since
         a best config could have been found from a previous run
@@ -774,6 +856,7 @@ class CachingAutotuner(KernelInterface):
                 self.compile_results = [self._precompile_config(best_config)]
 
     def set_compile_info(self, compile_id: CompileId | None, is_backward: bool) -> None:
+        # [FUNCTION DOC] Record compile id and whether this kernel is in the backward graph (for logging).
         self.compile_id = compile_id
         self.is_backward = is_backward
 
@@ -782,6 +865,10 @@ class CachingAutotuner(KernelInterface):
         warm_cache_only=False,
         reload_kernel: Callable[[], CachingAutotuner] | None = None,
         static_triton_bundle_key: str | None = None,
+        # [FUNCTION DOC] Compile all candidate configs under the lock. If warm_cache_only, only run the worker
+        # compile step (populating caches). Otherwise stores reload_kernel, gives plugins a chance to take over
+        # (non-DEFER return exits), compiles, optionally registers the static autotuner with the bundler,
+        # builds launchers and tries dynamic rblock scaling.
     ):
         if warm_cache_only:
             self._precompile_worker()
@@ -808,6 +895,10 @@ class CachingAutotuner(KernelInterface):
             self._dynamic_scale_rblock()
 
     def _precompile_worker(self):
+        # [FUNCTION DOC] Compile every config into a compile result (no launching). If results already exist,
+        # just registers their kernels with the TritonBundler. Raises an error if launchers already exist or no
+        # configs are left; configs failing with resource/ptxas errors are skipped; raises NoTritonConfigsError
+        # if all fail. Clears self.configs afterward.
         if self.compile_results:
             for result in self.compile_results:
                 TritonBundler.put(
@@ -836,6 +927,8 @@ class CachingAutotuner(KernelInterface):
 
     @functools.cached_property
     def _could_rblock_scale(self) -> bool:
+        # [FUNCTION DOC] Cached property: whether occupancy-driven rblock halving may be attempted. False when
+        # strict_sum_rblock is in the meta; otherwise delegates to the module level eligibility check.
         """Whether ``_dynamic_scale_rblock`` should attempt occupancy-
         driven rblock halving for this autotuner.
         """
@@ -851,11 +944,18 @@ class CachingAutotuner(KernelInterface):
 
     @functools.cached_property
     def _combo_has_reduction_subkernel(self) -> bool:
+        # [FUNCTION DOC] Cached property: whether this is a combo kernel with a non-persistent reduction sub-kernel.
         """True for a combo kernel (per-subkernel blocks) with a non-persistent
         reduction sub-kernel; these carry size_hints=None at the autotuner level."""
         return _combo_has_reduction_subkernel(self.inductor_meta)
 
     def _iter_rblock_scale_candidates(self):
+        # [FUNCTION DOC] Generator of new configs with a smaller reduction block to raise occupancy. Requires device
+        # register/thread/SM/warp properties (raises an error if missing). For each compiled config with reduction
+        # blocks (product > 64) and a known register count above regs-per-SM / max-threads-per-SM, it estimates the
+        # number of blocks resident per SM; if total blocks exceed what the device can hold, halves the largest
+        # reduction block (respecting min_rblock, skipping duplicates) and yields it. Combo kernels also yield a
+        # variant with all reduction blocks halved. Loads the kernel in the parent before yielding.
         """Yield new configs with halved rblock for occupancy improvement.
 
         Caller is responsible for gating on ``self._could_rblock_scale``.
@@ -1018,6 +1118,8 @@ class CachingAutotuner(KernelInterface):
                         yield all_halved
 
     def _dynamic_scale_rblock(self):
+        # [FUNCTION DOC] Add rblock-scaled configs: skipped on an autotune cache hit or when ineligible; otherwise
+        # compiles each generated candidate, appends to compile_results and rebuilds launchers.
         if (
             self.autotune_cache_info
             and self.autotune_cache_info.get("autotune_cache_state") == "hit"
@@ -1030,6 +1132,8 @@ class CachingAutotuner(KernelInterface):
         self._make_launchers()
 
     def compile_by_disabling_pipelining(self, config):
+        # [FUNCTION DOC] Fallback for resource errors: deep-copies the config with num_stages (and NUM_STAGES
+        # kwarg) set to 1, compiles it, makes it the only compile result and returns its launcher.
         self._ensure_kernel_loaded()
         cfg = copy.deepcopy(config)
         cfg.num_stages = 1
@@ -1042,6 +1146,8 @@ class CachingAutotuner(KernelInterface):
     def _make_launcher(
         self, compile_result: _KernelCompileResult
     ) -> tuple[LauncherType, None] | tuple[None, Exception]:
+        # [FUNCTION DOC] HELPER: Make a launcher from a compile result, catching resource, ptxas, out of memory and
+        # Intel GPU errors. Returns (launcher, None) or (None, exception). Caller must hold the device guard.
         """Create a launcher from a compile result.
 
         Caller must hold a DeviceGuard for the target device.
@@ -1058,6 +1164,10 @@ class CachingAutotuner(KernelInterface):
             return None, e
 
     def _make_launchers(self):
+        # [FUNCTION DOC] Build launchers for all compile results (no-op if already built), inside a device guard
+        # for the resolved load device. If none succeed: on resource/OOM failure with pipelining stages, retries with
+        # pipelining disabled (if allowed); otherwise raises an error. Drops the stored exception to avoid keeping
+        # tracebacks (and large benchmark buffers) alive.
         if len(self.launchers) == len(self.compile_results):
             return
 
@@ -1102,6 +1212,8 @@ class CachingAutotuner(KernelInterface):
             exc = None
 
     def _prune_compile_results_to_launcher(self, launcher: LauncherType) -> None:
+        # [FUNCTION DOC] HELPER: Keep only the compile result matching the chosen launcher's config (by identity,
+        # then by hashable form). Raises an error if none matches; no-op if there are no compile results.
         if not self.compile_results:
             return
 
@@ -1122,6 +1234,8 @@ class CachingAutotuner(KernelInterface):
         )
 
     def _ensure_kernel_loaded(self) -> None:
+        # [FUNCTION DOC] HELPER: If the Triton function was cleared for pickling, reload it via the stashed
+        # reload callback (errors if absent or not callable). No-op otherwise.
         """Reload the kernel in the parent process if needed.
 
         When this autotuner was compiled in a worker subprocess and
@@ -1140,6 +1254,9 @@ class CachingAutotuner(KernelInterface):
             self.fn = self._reload_kernel().fn
 
     def prepare_for_pickle(self) -> tuple[Any, ...]:
+        # [FUNCTION DOC] Strip unpicklable parts of the JIT function (fn, globals, used values, repr replaced by a
+        # constant, hash lock) and clear launchers, fast-path launcher and failure reasons. Returns the old
+        # values tuple so they can be restored.
         """Drop stuff from triton.JITFunction that does not pickle.
         This must be called after precompile so that these things are no longer needed.
         Returns a tuple of old values
@@ -1164,6 +1281,8 @@ class CachingAutotuner(KernelInterface):
         return old_values
 
     def restore_after_unpickle(self, old_values: tuple[Any, ...] | None) -> None:
+        # [FUNCTION DOC] Undo prepare_for_pickle: clears fast-path launcher and restores saved values; if none were
+        # given, just installs a fresh reentrant lock as the hash lock.
         self._cached_launcher = None
         if old_values:
             (
@@ -1181,6 +1300,8 @@ class CachingAutotuner(KernelInterface):
             self.fn._hash_lock = threading.RLock()
 
     def prepare_for_caching(self) -> None:
+        # [FUNCTION DOC] Before caching, null out the raw cubin on static compile results unless the
+        # keep_static_cubin_raw config is set (they are large; the bundler stores them separately).
         """
         Statically Launched CUDA Kernels have a raw cubin on them
         that we don't need to store in the cache(since TritonBundler handles the collection for us),
@@ -1198,6 +1319,8 @@ class CachingAutotuner(KernelInterface):
                 result.kernel.cubin_raw = None
 
     def __getstate__(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Pickle support: raises an error if launchers exist; returns the instance dict with lock and
+        # plugins cleared.
         if self.launchers:
             raise AssertionError("pickle should not be called after make_launchers()")
         return {
@@ -1207,17 +1330,21 @@ class CachingAutotuner(KernelInterface):
         }
 
     def __setstate__(self, state: dict[str, Any]) -> None:
+        # [FUNCTION DOC] Unpickle support: restores the dict, creates a new lock, and rebuilds plugins.
         self.__dict__.update(state)
         self.lock = threading.Lock()
         self._plugins = get_caching_autotuner_plugins(self)
 
     def get_device_interface(self):
+        # [FUNCTION DOC] Return the device interface for the device type (hip mapped to cuda). Imports torch
+        # dynamo lazily, so it cannot run in compile workers.
         # this code cannot run in compile workers, because it imports from torch
         from torch._dynamo.device_interface import get_interface_for_device
 
         return get_interface_for_device(self.device_props.type.replace("hip", "cuda"))
 
     def _create_compile_meta(self, cfg: Config) -> dict[str, Any]:
+        # [FUNCTION DOC] Build the compile metadata dict for a config from a deep copy of triton_meta.
         """
         Create compilation metadata for a given autotuner config. This involves
         processing the Config kwargs so that the kwargs that are not part
@@ -1320,6 +1447,10 @@ class CachingAutotuner(KernelInterface):
     def _create_compile_options(
         self, cfg: Config, compile_meta: dict[str, Any]
     ) -> dict[str, Any]:
+        # [FUNCTION DOC] Build the options dict passed to triton.compile: num_warps, num_stages, debug, overflow
+        # sanitizing off, optional fp fusion and warp-specialization settings, CUDA cooperative grid/PDL flags,
+        # ftz reflection override, TLX-only CUDA options from the config, backend options, and native code
+        # generation for XPU zebin format. Returns the dict.
         """
         Create options to pass to triton.compile based on the compile metadata
         and the given config.
@@ -1367,6 +1498,11 @@ class CachingAutotuner(KernelInterface):
     def _precompile_config(
         self, cfg: Config, *, cc_override: str | int | None = None
     ) -> _KernelCompileResult:
+        # [FUNCTION DOC] Compile one config ahead of time. Sets the Triton driver for CPU or GPU, raises an error if
+        # Triton is too old, builds the AST source and GPU target (MTIA uses its build codename), compiles (logging
+        # and re-raising on failure), optionally invokes the JIT post-compile hook (failures are logged only),
+        # registers the binary with the TritonBundler, and returns a static compile result if the binary can be
+        # launched statically, else a regular compile result.
         """Ahead of time compile a given autotuner config."""
         compile_meta = self._create_compile_meta(cfg)
         if cc_override is not None:
@@ -1469,6 +1605,12 @@ class CachingAutotuner(KernelInterface):
         return TritonCompileResult(binary, cfg, compile_meta, self.inductor_meta)
 
     def bench(self, launcher, *args, with_profiler=False, **kwargs):
+        # [FUNCTION DOC] Benchmark one launcher and return its time (infinity on failure). Returns infinity early
+        # (recording REGISTER_SPILLING) for non-custom kernels whose spills exceed the threshold. Otherwise defines
+        # a call closure that clones mutated args, zeroes reset-to-zero args, launches on the current raw stream
+        # (optionally under the profiler recorder, logging and re-raising launch errors), then restores args from
+        # CPU copies. Uses profiler based timing if requested, else the benchmarker; infinity from it records
+        # INVALID_CONFIG.
         """Measure the performance of a given launcher."""
         # we don't skip configs with spilled registers when auto-tuning custom
         # (user-written) Triton kernels, as (i) we don't have any knowledge or
@@ -1496,6 +1638,8 @@ class CachingAutotuner(KernelInterface):
         cpu_copies = self.copy_args_to_cpu_if_needed(*args, **kwargs)
 
         def kernel_call():
+            # [FUNCTION DOC] HELPER: One benchmark iteration: resolve the stream at call time, clone mutated args, zero
+            # reset args, launch (with optional profiler record, logging launch errors and re-raising), restore CPU copies.
             # Resolve the raw stream at call time rather than at closure-creation
             # time so that CUDA graph capture on a different stream works correctly.
             stream = device_interface.get_raw_stream(device_interface.current_device())
@@ -1578,6 +1722,11 @@ class CachingAutotuner(KernelInterface):
         return result
 
     def copy_args_to_cpu_if_needed(self, *args, **kwargs):
+        # [FUNCTION DOC] When optimize_mem is on, decide which mutated CUDA/XPU tensor args should be backed up to
+        # pinned CPU memory instead of cloned on device, based on remaining memory budget (peak minus current
+        # allocated). Returns a mapping from arg name to (device tensor, cpu copy); empty if disabled, no
+        # accelerator, or memory queries fail.
+        # KNOWN ISSUE: the tensor type check in the nested helper happens after the device attribute is read.
         """
         To support benchmarking in the presence of mutated args, we need to avoid
         autotuning contaminating them. We try to pass cloned args to the kernel.
@@ -1602,6 +1751,8 @@ class CachingAutotuner(KernelInterface):
             return {}
 
         def maybe_copy(name, arg):
+            # [FUNCTION DOC] HELPER: For a mutated arg on cuda/xpu, copy its storage to pinned CPU memory if it exceeds
+            # the remaining budget; otherwise subtract its size from the budget. Raises an error for non-tensors.
             if name in self.mutated_arg_names and arg.device.type in (
                 "cuda",
                 "xpu",
@@ -1642,6 +1793,7 @@ class CachingAutotuner(KernelInterface):
         return copies
 
     def restore_args_from_cpu(self, cpu_copies):
+        # [FUNCTION DOC] Copy each backed-up CPU buffer back into its device tensor storage (non-blocking).
         for pair in cpu_copies.values():
             arg, cpu_arg = pair
             required_storage_length = compute_required_storage_length(
@@ -1654,6 +1806,8 @@ class CachingAutotuner(KernelInterface):
             )
 
     def reset_to_zero_args(self, *args, **kwargs):
+        # [FUNCTION DOC] Zero in place every positional/keyword arg named in reset_to_zero_arg_names; raises an
+        # error if such an arg is not a tensor. No-op if the name list is empty.
         if not self.reset_to_zero_arg_names:
             return
         for i, arg in enumerate(args):
@@ -1675,6 +1829,8 @@ class CachingAutotuner(KernelInterface):
     def maybe_clone_args(
         self, exclude: Container[str], *args, **kwargs
     ) -> tuple[list[Any], dict[str, Any]]:
+        # [FUNCTION DOC] Return (args list, kwargs dict) where mutated tensor args not in the exclusion container are
+        # replaced by stride-preserving clones; other args pass through. Raises an error if a mutated arg is not a tensor.
         """
         Prepare new args and kwargs by cloning any in-place buffers
         (that are not in the provided exclusion list), to avoid autotune
@@ -1684,6 +1840,7 @@ class CachingAutotuner(KernelInterface):
         from ..compile_fx import clone_preserve_strides
 
         def prepare_arg(name, arg):
+            # [FUNCTION DOC] HELPER: Clone the arg if it is a mutated one not excluded, else return it unchanged.
             if name in self.mutated_arg_names and name not in exclude:
                 if not isinstance(arg, torch.Tensor):
                     raise AssertionError(
@@ -1701,10 +1858,13 @@ class CachingAutotuner(KernelInterface):
         return cloned_args, cloned_kwargs
 
     def clone_args(self, *args, **kwargs) -> tuple[list[Any], dict[str, Any]]:
+        # [FUNCTION DOC] Clone all mutated args (nothing excluded); returns (args list, kwargs dict).
         return self.maybe_clone_args(OrderedSet(), *args, **kwargs)
 
     @staticmethod
     def _close_static_launcher(launcher: LauncherType) -> None:
+        # [FUNCTION DOC] HELPER: Static method closing the kernel behind a statically launched launcher; no-op for
+        # non-static launchers.
         if not getattr(launcher, "_is_static", False):
             return
         runner = getattr(launcher, "__globals__", {}).get("runner")
@@ -1714,6 +1874,8 @@ class CachingAutotuner(KernelInterface):
             close()
 
     def _release_static_launchers_except(self, keep_launcher: LauncherType) -> None:
+        # [FUNCTION DOC] HELPER: Close all static launchers other than the one kept; for a static kept launcher with a
+        # known cache hash, also close other static compile results' kernels and keep only the matching result.
         for launcher in self.launchers:
             if launcher is not keep_launcher:
                 self._close_static_launcher(launcher)
@@ -1739,6 +1901,9 @@ class CachingAutotuner(KernelInterface):
             self.compile_results = keep_results
 
     def _log_autotune_inputs(self, args, kwargs) -> None:
+        # [FUNCTION DOC] HELPER: Emit debug logs to the autotuning_inputs artifact logger describing kernel name,
+        # heuristic, size hints, config count, device, and each positional/keyword argument (tensor metadata or
+        # scalar values).
         """Log input tensor shapes/dtypes and scalar values for autotuning."""
         kernel_name = self.inductor_meta.get("kernel_name", self.fn.__name__)
         signature = self.triton_meta.get("signature", {})
@@ -1812,6 +1977,10 @@ class CachingAutotuner(KernelInterface):
         autotuning_inputs_log.debug("=" * 60)
 
     def benchmark_all_configs(self, *args, **kwargs):
+        # [FUNCTION DOC] Benchmark every launcher with the given kernel args under a timing context. Returns a
+        # mapping from launcher to time. Eagerly closes losing static launchers, feeds results to the coordinate
+        # descent tuner cache, logs at debug level, records kernel_autotune metrics if that table is enabled, and
+        # zeroes reset-to-zero args at the end.
         with (
             dynamo_timed(
                 "CachingAutotuner.benchmark_all_configs",
@@ -1875,6 +2044,11 @@ class CachingAutotuner(KernelInterface):
             return timings
 
     def autotune_to_one_config(self, *args, **kwargs):
+        # [FUNCTION DOC] Pick the fastest launcher: benchmark all configs (logging inputs if enabled), log how many
+        # were skipped for spilling or invalid config, then keep only the best launcher and its compile result,
+        # releasing other static launchers. Records total autotune time, registers the winner with the bundler and
+        # calls the save-cache hook with the config, time, coordesc flag and cache hash.
+        # KNOWN ISSUE: if every config timed out as infinite the best is an arbitrary one.
         """Execute autotuning to select the optimal kernel configuration."""
         if autotuning_inputs_log.isEnabledFor(logging.DEBUG):
             self._log_autotune_inputs(args, kwargs)
@@ -1956,6 +2130,11 @@ class CachingAutotuner(KernelInterface):
             )
 
     def _combo_sequential_autotune(self, launcher, *args, **kwargs):
+        # [FUNCTION DOC] Combo kernels only: sequentially tune block sizes per tuning group (phase 1, keeping warps and
+        # stages fixed, accepting trial configs that benchmark faster) then tune warp/stage candidates with the final
+        # blocks (phase 2). Returns the original launcher if no tuning groups exist, else the best launcher; marks its
+        # config as found by combo autotune, adds the elapsed time and calls the save-cache hook. Compiles trials
+        # under the lock and counts benchmarks in counters.
         """
         Chain block-size decisions for combo kernels: tune one group at a time,
         each step building on the previous winner.
@@ -2106,6 +2285,11 @@ class CachingAutotuner(KernelInterface):
         return launcher
 
     def save_gpu_kernel(self, stream, launcher):
+        # [FUNCTION DOC] Save the chosen GPU kernel binary, assembly and launch parameters into the CudaKernelParamCache
+        # for AOT packaging. Raises an error if the kernel name is missing. For multi-arch CUDA with a different target
+        # arch it recompiles for that arch (error if no Triton binary). Parameters come from the launch metadata schema
+        # when available, else from probing binary attributes. For ROCm multi-arch it needs LLVM IR (raises an error if
+        # absent); otherwise stores arch specific asm. Sets cuda_kernel_saved.
         """Save the selected GPU kernel binary and assembly for AOTI packaging."""
         key = self.inductor_meta.get("kernel_name", None)  # unique kernel name
         if key is None:
@@ -2234,6 +2418,9 @@ class CachingAutotuner(KernelInterface):
         self.cuda_kernel_saved = True
 
     def save_cpu_kernel(self, launcher):
+        # [FUNCTION DOC] CPU counterpart of save_gpu_kernel: stores the kernel and launcher shared object bytes plus
+        # symbol and signature in CpuTritonKernelCache. Raises an error if kernel name is missing or if the backend did
+        # not emit both shared objects. Sets cpu_kernel_saved.
         """AOTI counterpart of save_gpu_kernel for CPU Triton kernels.
 
         Captures the kernel and launcher `.so` files into
@@ -2273,6 +2460,8 @@ class CachingAutotuner(KernelInterface):
 
     @functools.cached_property
     def _should_coordesc_tune(self) -> bool:
+        # [FUNCTION DOC] Cached property: false for template, user autotune and fixed heuristics, and for reduction,
+        # persistent reduction and split scan kernels in deterministic or strict-sum mode; true otherwise.
         """Whether this autotuner is eligible for coordinate descent tuning."""
         if self.heuristic_type in (
             HeuristicType.TEMPLATE,
@@ -2293,6 +2482,8 @@ class CachingAutotuner(KernelInterface):
         return True
 
     def coordinate_descent_tuning(self, launcher, *args, **kwargs):
+        # [FUNCTION DOC] Run coordinate descent tuning starting from the given launcher if eligible, inside a timing
+        # context; otherwise return the launcher unchanged. Starts from the autotune winner (or the single config).
         """
         Coordinate descent tuning can be run with or without max-autotune.
 
@@ -2320,11 +2511,17 @@ class CachingAutotuner(KernelInterface):
             return self._coordinate_descent_tuning(launcher, *args, **kwargs)
 
     def _coordinate_descent_tuning(self, launcher, *args, **kwargs):
+        # [FUNCTION DOC] Run the coordinate descent tuner from the launcher's config, benchmarking each candidate by
+        # compiling it under the lock and timing it. Raises an error if a persistent reduction config has an R0 block.
+        # Marks the best config as found by coordesc, calls the save-cache hook, compiles the winner if not already
+        # built, registers it with the bundler, logs the function hash and returns the winning launcher.
         config2launcher = {launcher.config: launcher}
 
         self._ensure_kernel_loaded()
 
         def benchmark_one_config(config):
+        # [FUNCTION DOC] HELPER: Compile and launch-wrap one config under the lock, remember its launcher, benchmark it,
+        # count it and return its time.
             with self.lock:
                 launcher = self._precompile_config(config).make_launcher()
             config2launcher[config] = launcher
@@ -2380,6 +2577,8 @@ class CachingAutotuner(KernelInterface):
         return winner
 
     def get_profiler_kwargs(self, stream, launcher):
+        # [FUNCTION DOC] Build the profiler metadata dict for a launch: kernel file, hash, backend, stream, warps,
+        # stages, config kwargs as a string, plus kernel name, flop and gigabytes if present in inductor_meta.
         kernel_kwargs_str = ",".join(
             f"{k}={v}" for (k, v) in launcher.config.kwargs.items()
         )
@@ -2402,6 +2601,9 @@ class CachingAutotuner(KernelInterface):
         return ret
 
     def _pre_launch(self, launcher, *args, stream, **kwargs):
+        # [FUNCTION DOC] Before launching: optionally dump launch params (interpreting grid) and tensors (when the
+        # kernel matches the dump list), and enter a profiler record context if profiling is enabled (stored for
+        # _post_launch). Side effects: file writes and profiler state.
         """Pre-launch instrumentation: param/tensor dumping and profiler context entry."""
         if self.dump_launch_params:
             new_args, grid = self._interpret_args_grid(args, launcher.config)
@@ -2429,6 +2631,8 @@ class CachingAutotuner(KernelInterface):
             self._profiler_ctx = None
 
     def _post_launch(self) -> None:
+        # [FUNCTION DOC] After launching: exit the stored profiler context and finalize the debug-mode call record,
+        # clearing both fields.
         """Post-launch instrumentation: profiler context exit and debug mode finalization."""
         if (profiler_ctx := self._profiler_ctx) is not None:
             self._profiler_ctx = None
@@ -2444,6 +2648,13 @@ class CachingAutotuner(KernelInterface):
         benchmark_run=False,
         **kwargs,
     ):  # type:ignore[override]
+        # [FUNCTION DOC] Launch the kernel and return the launch result. Fast path: if a cached launcher exists and
+        # there is no benchmark run, kwargs, profiler or debug mode, call it directly. Otherwise: record debug info,
+        # install a Triton allocator, run the interpreter if enabled, and let plugins pre_dispatch. Then precompile if
+        # no launchers exist (timing it), let plugins pre_autotune or autotune to one config when several remain,
+        # optionally run combo sequential autotune and coordinate descent, register the winner with the bundler,
+        # save the GPU/CPU kernel when cubin storage is requested, launch with pre/post instrumentation (turning a
+        # TypeError into a clearer argument-count error), and finally cache the (fast) launcher for later calls.
         """Launch triton kernel call and return result."""
         # --- FAST PATH ---
         # After the first successful launch in steady state, cache the launcher
@@ -2478,6 +2689,7 @@ class CachingAutotuner(KernelInterface):
         if hasattr(triton, "set_allocator"):
 
             def alloc_fn(size: int, align: int, stream: int | None):
+                # [FUNCTION DOC] HELPER: Triton allocator callback returning an int8 tensor of the requested size on the device.
                 return torch.empty(
                     size, dtype=torch.int8, device=self.device_props.type
                 )
@@ -2578,6 +2790,8 @@ class CachingAutotuner(KernelInterface):
         return result
 
     def _check_launcher_call_args(
+        # [FUNCTION DOC] HELPER: If the launcher recorded an expected positional arg count and more positional args were
+        # passed, raise a TypeError explaining that stream must be passed as a keyword. Otherwise does nothing.
         self,
         launcher: LauncherType,
         args: tuple[Any, ...],
@@ -2592,6 +2806,11 @@ class CachingAutotuner(KernelInterface):
             raise TypeError(
                 f"{kernel_name}: too many positional arguments - "
                 f"expected {expected}, got {len(args)}. "
+        # [FUNCTION DOC] HELPER: Try to wrap a statically launched CUDA/HIP launcher in a vectorcall based fast launcher
+        # (C extension) built from the kernel's function pointer, warps, shared memory, arg types and scratch count.
+        # Returns the new launcher function (copying launcher attributes and keeping the static kernel alive) or None
+        # when disabled, using host TMA descriptors, a non-CUDA/HIP device, a missing extension, a non-static or
+        # device-agnostic launcher, or on any error (unexpected errors are logged as warnings).
                 "'stream' must be passed as a keyword argument."
             ) from None
 
@@ -2703,9 +2922,14 @@ class CachingAutotuner(KernelInterface):
             # Unexpected failures - log for debugging
             log.warning("Unexpected error building fast launcher", exc_info=True)
             return None
+        # [FUNCTION DOC] HELPER: For interpreter mode, compute the launch grid by evaluating the grid expression with a
+        # mapping from kernel signature names (plus extra launcher args) to the given args. Returns (args with extra
+        # launcher args removed, grid).
 
     def _interpret_args_grid(
         self, args: tuple[Any, ...], cfg: Config
+                # [FUNCTION DOC] HELPER: Signature names excluding constexprs (for interpreted functions, excluding names found in
+                # the config kwargs; otherwise excluding constexpr positions).
     ) -> tuple[tuple[Any, ...], tuple[int, int, int]]:
         if triton_version_uses_attrs_dict():
 
@@ -2727,6 +2951,7 @@ class CachingAutotuner(KernelInterface):
                         new_signature.append(x)
 
                 return new_signature
+                # [FUNCTION DOC] HELPER: All signature names, in order.
 
         else:
 
@@ -2748,14 +2973,20 @@ class CachingAutotuner(KernelInterface):
         )
         if self.inductor_meta.get("extra_launcher_args"):
             args = args[: -len(self.inductor_meta["extra_launcher_args"])]
+# [CLASS DOC] HELPER: Picklable callable that returns a fixed string, used to replace a JIT function's repr.
         return args, grid
+        # [FUNCTION DOC] HELPER: Store the string value.
 
 
 class _ConstRepr:
+        # [FUNCTION DOC] HELPER: Return the stored string, ignoring any argument.
     def __init__(self, value: str):
         self.value = value
 
     def __call__(self, _=None) -> str:
+# [CLASS DOC] Base class for a compiled kernel result for one config. Holds the kernel object, config, compile
+# metadata and inductor metadata. Subclasses implement make_launcher (a stub here) to produce a callable launcher;
+# this class supplies shared helpers for host TMA descriptor setup, launcher source generation and argument lists.
         return self.value
 
 
@@ -2767,6 +2998,7 @@ class CompileResult(Generic[_T]):
     def __init__(
         self,
         kernel: _T,
+        # [FUNCTION DOC] Store kernel, config, compile_meta and inductor_meta.
         config: Config,
         compile_meta: dict[str, Any],
         inductor_meta: InductorMeta,
@@ -2777,6 +3009,9 @@ class CompileResult(Generic[_T]):
         self.inductor_meta = inductor_meta
 
     def make_launcher(self) -> LauncherType: ...
+        # [FUNCTION DOC] HELPER: For host-side TMA, produce launcher source lines that build (aligned) tensor descriptors
+        # for configured args, and replace those names in the runner args. Returns (lines, runner args); returns no lines
+        # when host TMA is not configured. Raises an error if Triton lacks the stable TMA API. Unresolvable descriptors skipped.
 
     def _host_tma_pre_runner_lines(
         self, runner_args: list[str], call_args: list[str]
@@ -2816,6 +3051,9 @@ class CompileResult(Generic[_T]):
             )
             runner_args = [desc_var if a == inner_name else a for a in runner_args]
         return pre_runner_lines, runner_args
+        # [FUNCTION DOC] HELPER: Generate and exec the source of a launcher function that computes the three grid values
+        # from the grid expression, runs optional pre-runner lines, and calls the runner. Executed in the given scope;
+        # stores the expected positional arg count on the function and returns it.
 
     def _gen_launcher_code(
         self, scope, def_args, runner_args, pre_runner_lines=None
@@ -2838,6 +3076,11 @@ class CompileResult(Generic[_T]):
         # _check_launcher_call_args can validate without inspect.signature().
         launcher._expected_positional_count = len(def_args)
         return launcher
+        # [FUNCTION DOC] HELPER: Compute (call_args, def_args, none_args) used for launcher code. none_args are constants
+        # that are None, not known constexprs and not in the signature (filtered args from user-defined kernels). With
+        # newer Triton, args are kept but implicit num_warps/num_stages are replaced by literal values in call args and
+        # dropped from def args; with older Triton, constexprs/None args and config keys are filtered. Extra launcher args
+        # are appended to def args.
 
     def _get_arg_lists(
         self, arg_names, constexprs
@@ -2870,6 +3113,7 @@ class CompileResult(Generic[_T]):
             k
             for k, v in compile_meta["constants"].items()
             if v is None and k not in known_constants
+        # [FUNCTION DOC] HELPER: Source text for a constant: raw-quoted string for strings, repr otherwise.
         )
         none_args = none_args.difference(OrderedSet(compile_meta["signature"].keys()))
 
@@ -2922,10 +3166,13 @@ _KernelCompileResult: TypeAlias = (
     CompileResult[CompiledKernel]
     | CompileResult[StaticallyLaunchedCudaKernel]
     | CompileResult[StaticallyLaunchedXpuKernel]
+# [CLASS DOC] Exception signalling a kernel cannot use the static launcher.
 )
 
 
 class CannotStaticallyLaunchKernel(Exception):
+# [CLASS DOC] Compile result that launches a kernel from its cubin using the static launcher, avoiding most Triton
+# runtime metadata. Provides eligibility checking, cubin path reloading after cache load and launcher creation.
     pass
 
 
@@ -2938,10 +3185,16 @@ class StaticTritonCompileResult(CompileResult[_T]):
     @staticmethod
     def can_statically_launch(
         kernel: CompiledKernel,
+        # [FUNCTION DOC] Static method deciding whether a kernel can be statically launched; returns the static kernel
+        # object or None. Fails (logged, re-raised only under strict_static_triton_launcher) for: disabled config,
+        # unsupported device or SPIR-V on XPU, cpp wrapper, user kernels (unless allowed), store_cubin, launch
+        # attributes (PDL/cooperative), missing cubin file, or unimplemented device support.
         inductor_meta: InductorMeta,
         triton_meta: TritonMeta,
         heuristic_type: HeuristicType,
     ) -> _KernelType | None:
+            # [FUNCTION DOC] HELPER: Run the checks above and return the static kernel; raises CannotStaticallyLaunchKernel on
+            # failure. Sets the kernel cubin path as a side effect.
         if not torch._inductor.config.use_static_triton_launcher:
             return None
 
@@ -3010,6 +3263,10 @@ class StaticTritonCompileResult(CompileResult[_T]):
         except CannotStaticallyLaunchKernel as e:
             log.info("Bypassing StaticallyLaunchedCudaKernel due to %s", e)
             if torch._inductor.config.strict_static_triton_launcher:
+        # [FUNCTION DOC] Recompute the cubin location in the Triton cache directory and set the kernel cubin path; if the
+        # file is missing, restore it from raw cubin bytes if saved, otherwise raise an error.
+        # KNOWN ISSUE: the error is built with a format argument passed as a second exception argument, so the path is
+        # never substituted into the message.
                 raise e
             return None
 
@@ -3036,6 +3293,11 @@ class StaticTritonCompileResult(CompileResult[_T]):
             else:
                 raise RuntimeError(
                     "Cubin file saved by TritonBundler not found at %s", cubin_location
+        # [FUNCTION DOC] Build a launcher for the statically launched kernel: marks the static launcher feature as used,
+        # reloads the cubin path if needed, flags the kernel device-agnostic when no device was baked in, loads it on the
+        # resolved device, then generates launcher source calling the static runner with grid values, stream and
+        # non-constexpr args (host TMA descriptors substituted if configured). Attaches config, register/spill counts,
+        # shared memory, cache hash, store_cubin False and a static marker to the launcher and returns it.
                 )
         self.kernel.cubin_path = cubin_location
 
@@ -3111,6 +3373,8 @@ class StaticTritonCompileResult(CompileResult[_T]):
         launcher.cache_hash = triton_hash_to_path_key(self.kernel.hash)  # type: ignore[attr-defined]
         launcher.store_cubin = False  # type: ignore[attr-defined]
         launcher._is_static = True  # type: ignore[attr-defined]
+# [CLASS DOC] Compile result wrapping an upstream Triton CompiledKernel (which cannot be pickled itself). Supports
+# pickling by converting kernel metadata to plain dicts and dropping handles, and builds the dynamic launcher.
         return launcher
 
 
@@ -3119,10 +3383,14 @@ class TritonCompileResult(CompileResult[CompiledKernel]):
     Upstream Triton CompileKernel can not be pickled.  This is a wrapper
     to support serialization and generate the launcher function.
     """
+        # [FUNCTION DOC] HELPER: Cached factory (static, lru_cache of 32) returning a namedtuple class named KernelMetadata
+        # with the given sorted field names.
 
     @staticmethod
     @functools.lru_cache(32)
     def _kernel_metadata_cls(fields: tuple[str, ...]) -> Any:
+        # [FUNCTION DOC] HELPER: Static method turning a Triton metadata namedtuple into a dict (for pickling); other values
+        # are returned unchanged.
         return namedtuple("KernelMetadata", sorted(fields))
 
     @staticmethod
@@ -3135,6 +3403,7 @@ class TritonCompileResult(CompileResult[CompiledKernel]):
 
         As for packed_metadata, depending on the triton backend, KernelMetadata can be
         a namedtuple, or a regular tuple! So the serialization function branches on whether
+            # [FUNCTION DOC] HELPER: True if the object is a tuple with namedtuple dict conversion and field attributes.
         the metadata to be serialized is a namedtuple or regular, serializable one.
         """
 
@@ -3148,6 +3417,7 @@ class TritonCompileResult(CompileResult[CompiledKernel]):
         if is_namedtuple(metadata):
             return metadata._asdict()
         else:
+        # [FUNCTION DOC] HELPER: Static method rebuilding a KernelMetadata namedtuple from a dict; non-dicts returned as is.
             return metadata
 
     @staticmethod
@@ -3156,6 +3426,8 @@ class TritonCompileResult(CompileResult[CompiledKernel]):
             return TritonCompileResult._kernel_metadata_cls(tuple(metadata.keys()))(
                 **metadata
             )
+        # [FUNCTION DOC] Pickle support: returns the instance state with the kernel replaced by its attribute dict, with
+        # metadata serialized and module, function and run handles cleared (regenerated by the kernel's handle init).
         else:
             return metadata
 
@@ -3172,6 +3444,9 @@ class TritonCompileResult(CompileResult[CompiledKernel]):
             "module": None,  # regenerated by kernel._init_handles()
             "function": None,  # regenerated by kernel._init_handles()
             "run": None,  # regenerated by kernel._init_handles()
+        # [FUNCTION DOC] Unpickle support: rebuilds a CompiledKernel object from the saved dict, deserializing metadata
+        # and packed metadata, and restores the other state.
+        # KNOWN ISSUE: the kernel source (src.fn) is not restored (TODO in code).
         }
         return {**self.__dict__, "kernel": kernel_state}  # type: ignore[dict-item]
 
@@ -3190,6 +3465,12 @@ class TritonCompileResult(CompileResult[CompiledKernel]):
                 "packed_metadata": self._deserialize_metadata(packed_metadata),
             }
         )
+        # [FUNCTION DOC] Build a Python launcher: initializes kernel handles, computes call/def args, collects binary
+        # properties (shared memory, warps, cluster dims, function, runner, hooks) into a scope, and chooses runner args
+        # depending on whether the binary has launch metadata (the metadata expression is only evaluated when a launch
+        # enter hook is installed). Adds host TMA setup if configured, generates the launcher code, then attaches config,
+        # register/spill counts, shared memory, cache hash and store_cubin. If store_cubin, also attaches function, binary,
+        # filtered arg lists and scratch sizes (global scratch defaults to 0 on HIP, None otherwise) for AOT packaging.
         self.__dict__.update(state)
         self.kernel = kernel
 
@@ -3356,6 +3637,8 @@ class TritonCompileResult(CompileResult[CompiledKernel]):
             )
             launcher.global_scratch = global_scratch
             launcher.profile_scratch = profile_scratch
+# [FUNCTION DOC] HELPER: Find names (dict keys in referrers, e.g. module globals) bound to the object using the
+# garbage collector; first forces frame locals to materialize. Returns a list of names (possibly empty).
         return launcher
 
 
@@ -3380,10 +3663,14 @@ def _find_names(obj):
     return obj_names
 
 
+# [FUNCTION DOC] Clear the list of collected profiled kernel calls (start of a graph).
 collected_calls: list[Any] = []
 
 
 def start_graph():
+# [FUNCTION DOC] Summarize collected kernel calls: logs total time, GB and bandwidth, and if output_file is given
+# appends a per-kernel bandwidth table (sorted by time, with percentages) to it; write failures only log warnings.
+# Returns immediately if there are no collected calls. Reads the caller's filename from the stack.
     collected_calls.clear()
 
 
@@ -3431,6 +3718,9 @@ def end_graph(output_file):
                 "failed to write profile bandwidth result into %s",
                 output_file,
                 exc_info=True,
+# [CLASS DOC] CachingAutotuner subclass used for bandwidth profiling (profile_bandwidth). Its run benchmarks the
+# kernel once, records time/GB/bandwidth in the module collected_calls list instead of normally launching, and
+# filters kernels by regex. State: regex_filter, with_profiler, with_bandwidth_info, cached result tuple.
             )
 
 
@@ -3439,6 +3729,7 @@ class DebugAutotuner(CachingAutotuner):
         self,
         *args,
         regex_filter="",
+        # [FUNCTION DOC] Store profiling options, then initialize the base autotuner; cached starts as None.
         with_profiler=False,
         with_bandwidth_info=True,
         **kwargs,
@@ -3446,6 +3737,11 @@ class DebugAutotuner(CachingAutotuner):
         self.regex_filter = regex_filter
         self.with_profiler = with_profiler
         self.with_bandwidth_info = with_bandwidth_info
+        # [FUNCTION DOC] Profiling run (always returns None). Without bandwidth info, runs the base class in benchmark
+        # mode. Otherwise determines the kernel name (longest name bound to this object, else meta kernel name), skips
+        # non-matching names (regex match), precompiles/autotunes as needed, saves the cubin if requested, and on the
+        # first call benchmarks the kernel, computes GB (from meta or arg bytes) and GB/s, logs and records it; later
+        # calls append the cached numbers. The kernel is not launched normally.
         super().__init__(*args, **kwargs)
         self.cached = None
 
@@ -3502,6 +3798,8 @@ class DebugAutotuner(CachingAutotuner):
                 )
             else:
                 # in AOTI, we will call the kernel and its timing info has been cached already
+# [FUNCTION DOC] sha256 hex digest of the configs (sorted kwargs, num_warps, num_stages each), used to detect
+# config changes for cache keys.
                 collected_calls.append(self.cached)
 
 
@@ -3524,6 +3822,10 @@ def cached_autotune(
     heuristic_type,
     filename=None,
     inductor_meta: InductorMeta | None = None,
+    # [FUNCTION DOC] Decorator factory like Triton's autotune: enforces reduction block minimums, removes duplicate
+    # configs (raises an error if multiple configs and no filename), checks the autotune cache, extracts mutated and
+    # reset-to-zero arg names from the meta (mutating the passed metas by popping keys), and returns a decorator that
+    # wraps a kernel function into a DebugAutotuner (bandwidth profiling) or a CachingAutotuner subclass instance.
     custom_kernel=False,
     caching_autotuner_cls: type[CachingAutotuner] = CachingAutotuner,
     debug_autotuner_cls: type[DebugAutotuner] = DebugAutotuner,
@@ -3566,6 +3868,8 @@ def cached_autotune(
         mutated_arg_names += triton_meta.pop("restore_value")
 
     reset_to_zero_arg_names: list[str] = []
+    # [FUNCTION DOC] HELPER: Given the Triton function, drop XBLOCK from the configs if it is not a function parameter
+    # (raises an error if its value is not 1), then build the debug or caching autotuner with the collected settings.
     if "reset_to_zero" in triton_meta:
         reset_to_zero_arg_names.extend(triton_meta.pop("reset_to_zero"))
 
@@ -3621,6 +3925,7 @@ def cached_autotune(
             autotune_cache_info=autotune_cache_info,
         )
 
+# [FUNCTION DOC] Return the configs with duplicates removed (by hashable form), keeping first occurrences.
     return decorator
 
 
@@ -3634,6 +3939,8 @@ def unique_configs(configs: list[Config]):
         if key not in seen:
             seen.add(key)
             pruned_configs.append(cfg)
+# [FUNCTION DOC] Validate a block config against numels: a numel of 1 requires block 1, and the configured maximum
+# block for each dimension must be divisible by the block. Raises an error otherwise; None numels are skipped.
     return pruned_configs
 
 
@@ -3654,6 +3961,7 @@ def check_config(cfg, *, xnumel=None, ynumel=None, znumel=None):
             raise AssertionError(
                 f"TritonKernel.indexing assumes {label}BLOCK divides {max_block_str}"
                 f" but {label}BLOCK={block} and {max_block_str}={max_block} (cfg={cfg})."
+# [FUNCTION DOC] Raise an error if any BLOCK entry exceeds the maximum block for its dimension prefix.
             )
 
 
@@ -3671,6 +3979,7 @@ def check_max_block(cfg: dict[str, int]):
                     f"'{var}' too large. Maximum: {max_block}. Actual: {val}."
                 )
 
+# [FUNCTION DOC] HELPER: Raise an error if the native matmul block element count exceeds the Triton maximum tensor size.
 
 def _check_native_matmul_block_numel(
     kwargs: dict[str, int], r0_block: int | None = None
@@ -3682,6 +3991,7 @@ def _check_native_matmul_block_numel(
             f"{TRITON_MAX_TENSOR_NUMEL}"
         )
 
+# [FUNCTION DOC] HELPER: True if the config's native matmul block element count is within the Triton maximum.
 
 def _native_matmul_config_under_numel_limit(
     cfg: Config, r0_block: int | None = None
@@ -3689,6 +3999,9 @@ def _native_matmul_config_under_numel_limit(
     return (
         native_matmul_block_numel(cfg.kwargs, r0_block=r0_block)
         <= TRITON_MAX_TENSOR_NUMEL
+    # [FUNCTION DOC] HELPER: For native matmul, deep-copy each config and repeatedly halve the larger of XBLOCK/YBLOCK
+    # (only while above 16) until the block element count fits the Triton limit. Configs that still do not fit are
+    # dropped. Returns the de-duplicated list.
     )
 
 
@@ -3712,6 +4025,10 @@ def _cap_native_matmul_configs(configs: list[Config], r0_block: int) -> list[Con
 
 
 def _enforce_reduction_config_block_minimums(
+    # [FUNCTION DOC] HELPER: Apply min_xblock/min_rblock floors from the meta to reduction configs (no-op if neither is
+    # set). Mutates each config: raises XBLOCK/R0_BLOCK to the floors, then halves the other block to keep the original
+    # tile size where possible, and validates with the max-block and numel checks. Raises an error for configs with
+    # Y/Z/R1 blocks. Returns the same list.
     configs: list[Config],
     size_hints: dict[str, int],
     inductor_meta: InductorMeta,
@@ -3739,11 +4056,13 @@ def _enforce_reduction_config_block_minimums(
 
         if has_xblock:
             cfg.kwargs["XBLOCK"] = max(cfg.kwargs["XBLOCK"], x_floor)
+        # [FUNCTION DOC] HELPER: Current product of XBLOCK and R0_BLOCK (missing ones count as 1).
         if has_rblock:
             cfg.kwargs["R0_BLOCK"] = max(cfg.kwargs["R0_BLOCK"], r_floor)
 
         def current_tile_product() -> int:
             return (cfg.kwargs["XBLOCK"] if has_xblock else 1) * (
+        # [FUNCTION DOC] HELPER: Halve the named block while the tile product exceeds the target and the block is above the floor.
                 cfg.kwargs["R0_BLOCK"] if has_rblock else 1
             )
 
@@ -3775,6 +4094,8 @@ def _num_warps(
     num_warps,
     max_num_warps=8,
     min_num_warps=2,
+    # [FUNCTION DOC] HELPER: Clamp a suggested warp count between min and max (halving the range on 64-lane wavefront
+    # GPUs, halving the max for register intensive kernels) and round up to a power of two.
     register_intensive=False,
     *,
     warp_size: int = 32,
@@ -3788,6 +4109,9 @@ def _num_warps(
     # persistent reduction is register intensive
     if register_intensive:
         max_num_warps = max_num_warps // 2
+    # [FUNCTION DOC] HELPER: Ensure the number of blocks along x stays under the 2^31-1 grid limit (on HIP the limit is
+    # applied to total threads) by doubling the x block up to the size hint and maximum block. Returns (x, num_blocks);
+    # raises an error if the limit is still exceeded.
     return next_power_of_2(min(max(num_warps, min_num_warps), max_num_warps))
 
 
@@ -3830,6 +4154,10 @@ def triton_config(
     num_warps=None,
     matrix_instr=None,
     waves_per_eu=None,
+    # [FUNCTION DOC] Build a pointwise Triton Config for tile sizes x/y/z. Clamps to size hints, grows blocks while below
+    # a target element count or exceeding per-dimension grid limits, derives num_warps from elements per warp (at least 4
+    # warps for blocks of 128+ elements on non-HIP), enlarges x for the minimum elements per thread, applies the x grid
+    # limit, validates block limits, and adds HIP-only matrix_instr_nonkdim, waves_per_eu and kpack options. Returns Config.
     kpack=None,
     *,
     warp_size: int = 32,
@@ -3935,6 +4263,9 @@ def triton_config(
         if kpack is not None:
             config.kwargs["kpack"] = kpack
 
+    # [FUNCTION DOC] HELPER: Split a linear reduction numel into per-dimension reduction block sizes (row-major, last
+    # reduction dimension filled first, bounded by size hints and max blocks). Returns a mapping from prefix to size;
+    # raises an error if sizes do not divide evenly or exceed hints.
     return config
 
 
@@ -3987,6 +4318,10 @@ def triton_config_reduction(
     waves_per_eu=None,
     dynamic_scale_rblock=True,
     reduction_hint=None,
+    # [FUNCTION DOC] Build a reduction InductorConfig for x block and linear reduction size r. Splits r over reduction
+    # dimensions, grows blocks toward a target element count, picks num_warps (r/128 for inner reductions, else
+    # elements/128; clamped via the warp helper with a max of 16 or 32), applies the grid limit, shrinks reduction blocks
+    # to the target, validates, and sets the dynamic scale flag and HIP waves_per_eu. Returns the config.
     min_num_warps=None,
     *,
     warp_size: int = 32,
@@ -4002,6 +4337,7 @@ def triton_config_reduction(
     # shrink sizes to size hints
     x = min(x, size_hints["x"])
     target = conditional_product(x, *rnumels.values())
+        # [FUNCTION DOC] HELPER: Product of the x block and all reduction blocks.
     if conditional_product(*size_hints.values()) < target:
         target //= 8
 
@@ -4058,6 +4394,8 @@ def triton_config_reduction(
         if waves_per_eu is not None:
             config.kwargs["waves_per_eu"] = waves_per_eu
 
+    # [FUNCTION DOC] HELPER: Convert prefixes to kernel argument names by uppercasing and appending BLOCK
+    # (for example x to XBLOCK, r0_ to R0_BLOCK).
     return config
 
 
@@ -4066,6 +4404,9 @@ def _get_config(numels: dict[str, int]) -> dict[str, int]:
     Convert numels ("x", "r0_", etc.) to block sizes ("XBLOCK", "R0_BLOCK"), etc.
     """
 
+    # [FUNCTION DOC] HELPER: Build a hashable tuple of the inputs that determine a combo sub-kernel's heuristic output
+    # (heuristic type, size hints, load/store counts, hints, tiling scores, TMA sizes, flags) so identical sub-kernels
+    # can be grouped for autotuning.
     return {prefix.upper() + "BLOCK": numel for prefix, numel in numels.items()}
 
 
@@ -4103,6 +4444,9 @@ def _subkernel_fingerprint(combo_meta: dict[str, Any], i: int) -> tuple[Any, ...
 def _update_combo_kernel_kwargs(
     kwargs: dict[str, Any],
     cfg_kwargs: dict[str, Any],
+    # [FUNCTION DOC] HELPER: Copy config kwargs into the combo kernel kwargs, skipping reduction block entries when
+    # requested; keys get a sub-kernel index suffix only if that suffixed name is a combo block argument, else stay
+    # unsuffixed. Mutates kwargs.
     subkernel_idx: int,
     skip_rblock: bool,
     block_arg_names: OrderedSet[str],
@@ -4122,6 +4466,15 @@ def _handle_combo_kernel_per_subkernel_blocks(
     inductor_meta: InductorMeta,
     triton_meta: TritonMeta,
     filename: str | None = None,
+    # [FUNCTION DOC] HELPER: Build configs for combo kernels where each sub-kernel has its own block sizes. Returns None
+    # unless combo grid meta with per-subkernel info exists. For stitched combos returns launch-candidate configs or one
+    # stitched config from recorded defaults. Otherwise, for each sub-kernel it calls the pointwise, reduction or
+    # persistent reduction heuristic (raises an error for an unknown heuristic), takes the first config, merges its
+    # suffixed block args into one combined kwargs set, and records warps/stages and coordinate descent field limits.
+    # Sub-kernels are grouped (optionally by fingerprint) and groups sorted largest first. Mutates inductor_meta,
+    # storing combo_tuning_groups, coordesc field order and limits, and warp/stage candidates. Returns one base config
+    # using the max warps and stages.
+    # KNOWN ISSUE: the reduction_hint and tile_hint parameters are not used in the body.
     reduction_hint: bool = False,
     tile_hint: Any = None,
     min_elem_per_thread: int = 0,
@@ -4320,6 +4673,9 @@ def triton_config_tiled_reduction(
     r,
     num_stages=1,
     register_intensive=False,
+    # [FUNCTION DOC] Build a tiled reduction Config (x, y and reduction blocks) from size hints: splits the reduction
+    # numel across dimensions, grows blocks toward a target element count, derives warps from elements per 256 (max 16,
+    # register-aware), validates, and adds HIP waves_per_eu. Returns a Config.
     waves_per_eu=None,
     *,
     warp_size: int = 32,
@@ -4333,6 +4689,7 @@ def triton_config_tiled_reduction(
     rnumels = _get_nd_reduction_numels(r, size_hints)
 
     # shrink sizes to size hints
+    # [FUNCTION DOC] HELPER: Product of x, y and all reduction block sizes.
     x = min(x, size_hints["x"])
     y = min(y, size_hints["y"])
 
@@ -4368,6 +4725,10 @@ def triton_config_tiled_reduction(
             config.kwargs["waves_per_eu"] = waves_per_eu
     return config
 
+    # [FUNCTION DOC] HELPER: If the meta lists TMA minimum block sizes, drop configs whose blocks are below them (ignoring
+    # reduction blocks for persistent reductions) and prepend a config copied from the first with blocks raised to the
+    # minimums. Raises an error if the first config lacks a TMA block key. Returns the new list, or the input unchanged
+    # if no restrictions apply.
 
 def _maybe_filter_configs_for_tma_restrictions(
     inductor_meta: InductorMeta, configs: list[Config]
@@ -4427,6 +4788,10 @@ def pointwise(
     triton_meta: TritonMeta,
     tile_hint=None,
     filename=None,
+    # [FUNCTION DOC] Heuristic for pointwise kernels. Combo kernels with per-subkernel blocks are handled by the combo
+    # helper. Otherwise (raising an error if no_x_dim is set) it picks a base block size from numel, builds hint-driven
+    # configs, gets configs from the registered pointwise device heuristic, filters for TMA limits and returns either
+    # the configs (if return_configs) or an autotuner decorator from cached_autotune.
     min_elem_per_thread=0,
     inductor_meta: InductorMeta | None = None,
     return_configs=False,
@@ -4495,6 +4860,8 @@ def pointwise(
         inductor_meta=inductor_meta,
         heuristic_type=HeuristicType.POINTWISE,
         filename=filename,
+# [FUNCTION DOC] Build a Config for native matmul from a mapping of sizes (keys x, y, z, r) to XBLOCK, YBLOCK,
+# ZBLOCK, R0_BLOCK (missing ones omitted) with given warps and stages. Raises an error if the block exceeds the limit.
     )
 
 
@@ -4508,6 +4875,8 @@ def make_matmul_triton_config(sizes: dict[str, int], num_warps: int, num_stages:
     # Remove keys with None values (i.e., missing in sizes)
     config = {k: v for k, v in config.items() if v is not None}
     _check_native_matmul_block_numel(config)
+# [FUNCTION DOC] HELPER: Return the deduplicated list of (size mapping, num_warps, num_stages) tuples for native
+# matmul, from a fixed table; persistent variants drop the reduction size and bmm variants add z equal to 1.
     return Config(config, num_warps=num_warps, num_stages=num_stages)
 
 
@@ -4558,6 +4927,8 @@ triton_native_persistent_bmm_configs = _config_helper(bmm=True, persistent=True)
 def _reduction_configs(
     *,
     size_hints: dict[str, int],
+    # [FUNCTION DOC] HELPER: Get reduction configs from the registered device heuristic; if strict_sum_rblock is set,
+    # copy them with R0_BLOCK forced to that value and de-duplicate.
     inductor_meta: InductorMeta,
     triton_meta: TritonMeta,
     num_dynamic=0,
@@ -4580,6 +4951,10 @@ def _reduction_configs(
         configs = unique_configs(configs)
     return configs
 
+    # [FUNCTION DOC] Reduce configs to a single deterministic choice when deterministic/forced filtering is on (else return
+    # de-duplicated configs unchanged). Drops configs with tiny R0_BLOCK (<= 4) and, when no contiguous reduction load/store
+    # exists, XBLOCK of 1 (only if configs remain), then breaks ties by selecting the second largest R0_BLOCK, num_warps,
+    # and XBLOCK in turn, finally the first. Raises an error if there are no configs. Logs before/after at debug level.
 
 def filter_reduction_configs_for_determinism(
     inductor_meta: InductorMeta, configs: list[Config]
@@ -4595,6 +4970,7 @@ def filter_reduction_configs_for_determinism(
     - if there is still a tie, pick the config with second largest XBLOCK
     """
     configs = unique_configs(configs)
+    # [FUNCTION DOC] HELPER: Whether filtering is required: deterministic, forced, or deterministic algorithms enabled.
     if len(configs) == 0:
         raise AssertionError("No configs remaining after deduplication")
 
@@ -4611,11 +4987,13 @@ def filter_reduction_configs_for_determinism(
     if log.isEnabledFor(logging.DEBUG):
         log.debug("reduction configs before filtering:")
         for c in configs:
+    # [FUNCTION DOC] HELPER: True if the config has an R0_BLOCK of 4 or less.
             log.debug("%s", c)
             log.debug("")
 
     def _has_too_small_rblock(config):
         rblock = config.kwargs.get("R0_BLOCK")
+    # [FUNCTION DOC] HELPER: True for XBLOCK 1 configs when the kernel lacks a contiguous reduction load/store.
         # too small RBLOCK is likely to be bad
         return rblock is not None and rblock <= 4
 
@@ -4635,15 +5013,20 @@ def filter_reduction_configs_for_determinism(
     if len(newconfigs) > 0:
         configs = newconfigs
 
+    # [FUNCTION DOC] HELPER: Config's R0_BLOCK or minus one if absent.
     if len(configs) == 0:
         raise AssertionError("No configs remaining after filtering")
 
+    # [FUNCTION DOC] HELPER: Config's XBLOCK or minus one if absent.
     def _r0_block(c):
         return c.kwargs.get("R0_BLOCK", -1)
 
+    # [FUNCTION DOC] HELPER: Config's num_warps (shadows the module level helper of the same name).
     def _xblock(c):
         return c.kwargs.get("XBLOCK", -1)
 
+    # [FUNCTION DOC] HELPER: Sort configs by the accessor and, if values differ, keep only those with the second largest
+    # value. Updates and returns the enclosing configs list.
     def _num_warps(c):
         return c.num_warps
 
@@ -4654,6 +5037,8 @@ def filter_reduction_configs_for_determinism(
             max_val = accessor(configs[-1])
             configs = [*filter(lambda x: accessor(x) != max_val, configs)]
             second_max_val = accessor(configs[-1])
+    # [FUNCTION DOC] HELPER: Pick one config via successive tie breaking on R0_BLOCK, num_warps and XBLOCK; raises an error
+    # if none are available.
             configs = [*filter(lambda x: accessor(x) == second_max_val, configs)]
         return configs
 
@@ -4694,6 +5079,10 @@ def reduction(
     size_hints,
     reduction_hint=False,
     triton_meta: TritonMeta | None = None,
+    # [FUNCTION DOC] Heuristic for reduction kernels. Records the reduction hint in the meta (mutating it; forces size hint x
+    # to 1 when no_x_dim). Raises an error if triton_meta is None. Combo kernels go through the combo helper. Otherwise
+    # counts dynamic-shape args, gets configs, filters for TMA and determinism, checks strict-sum R0_BLOCK consistency
+    # (raises an error on mismatch), and returns either configs (return_configs) or a cached_autotune decorator.
     filename=None,
     inductor_meta: InductorMeta | None = None,
     return_configs=False,
@@ -4764,6 +5153,9 @@ def reduction(
 def cooperative_reduction(
     size_hints,
     reduction_hint,
+    # [FUNCTION DOC] Heuristic for cooperative reduction kernels: records the reduction hint (mutating meta; x forced to 1
+    # for no_x_dim), gets cooperative configs from the device heuristic, applies TMA and determinism filters and returns
+    # a cached_autotune decorator.
     triton_meta: TritonMeta,
     filename,
     inductor_meta: InductorMeta | None = None,
@@ -4798,6 +5190,7 @@ def cooperative_reduction(
 
 def _persistent_reduction_configs(
     size_hints,
+    # [FUNCTION DOC] HELPER: Ask the registered device reduction heuristic for persistent reduction configs.
     reduction_hint=False,
     inductor_meta: InductorMeta | None = None,
     triton_meta: TritonMeta | None = None,
@@ -4817,6 +5210,10 @@ def persistent_reduction(
     size_hints,
     reduction_hint=False,
     triton_meta: TritonMeta | None = None,
+    # [FUNCTION DOC] Heuristic for persistent reduction kernels (also mix-order via RSPLIT_SIZE). Records the reduction hint
+    # (mutating meta). Raises an error if triton_meta is None. Combo kernels use the combo helper. Otherwise gets persistent
+    # configs, applies TMA filtering with a temporary persistent flag, applies the split size if requested, filters for
+    # determinism, and returns configs (return_configs) or a cached_autotune decorator.
     filename=None,
     inductor_meta: InductorMeta | None = None,
     return_configs=False,
@@ -4889,6 +5286,9 @@ def persistent_reduction(
 def split_scan(
     size_hints,
     reduction_hint=False,
+    # [FUNCTION DOC] Heuristic for the split scan kernel: requires triton_meta and exactly two size hints (raises an error
+    # otherwise), obtains split-scan configs from the device heuristic, applies TMA and determinism filters and returns
+    # a cached_autotune decorator. Mutates the meta with the reduction hint.
     triton_meta: TritonMeta | None = None,
     filename=None,
     inductor_meta: InductorMeta | None = None,
@@ -4931,6 +5331,9 @@ def template(
     triton_meta: TritonMeta,
     num_consumer_groups=0,
     num_buffers_warp_spec=0,
+    # [FUNCTION DOC] Heuristic for Triton template kernels: builds a single config with the given stages and warps (plus
+    # warp-specialization settings when supported and TLX-only CUDA options found in triton_meta) and returns a
+    # cached_autotune decorator with the template heuristic type. Extra keyword args are ignored.
     filename=None,
     inductor_meta: InductorMeta | None = None,
     **kwargs,
@@ -4964,6 +5367,8 @@ def template(
         inductor_meta=inductor_meta,
         heuristic_type=HeuristicType.TEMPLATE,
         filename=filename,
+    # [FUNCTION DOC] HELPER: Remove and return the Triton Config options (num_warps, num_stages, num_ctas, maxnreg and warp
+    # specialization settings) present in the mapping that are not None. Mutates the input mapping.
     )
 
 
@@ -4981,6 +5386,8 @@ def _pop_config_kwargs(config: dict[str, Any]) -> dict[str, Any]:
         val = config.pop(key, None)
         if val is not None:
             popped[key] = val
+    # [FUNCTION DOC] Flatten a Config into a dict of its kwargs plus num_warps, num_stages (and warp specialization settings
+    # when supported).
     return popped
 
 
@@ -4997,6 +5404,8 @@ def config_to_dict(config: Config) -> dict[str, Any]:
                 "num_buffers_warp_spec": getattr(config, "num_buffers_warp_spec", 0),
             }
         )
+    # [FUNCTION DOC] Inverse of config_to_dict: copies the dict, pops the Triton config options, and builds a Config with the
+    # rest as kernel kwargs.
     return config_dict
 
 
@@ -5004,6 +5413,8 @@ def config_from_dict(config: dict[str, Any]) -> Config:
     config = {**config}
     return Config(config, **_pop_config_kwargs(config))
 
+    # [FUNCTION DOC] Heuristic for a configuration decided at compile time: builds one Config from the given dict (config
+    # options popped from a copy) and returns a cached_autotune decorator with the fixed heuristic type.
 
 def fixed_config(
     config, filename, triton_meta: TritonMeta, inductor_meta: InductorMeta
@@ -5025,6 +5436,8 @@ def fixed_config(
 def user_autotune(
     configs,
     triton_meta: TritonMeta,
+    # [FUNCTION DOC] Heuristic for user-defined Triton kernels: converts config dicts to Configs (or one empty Config if there
+    # are none) and returns a cached_autotune decorator with the user autotune heuristic type; custom_kernel is forwarded.
     filename=None,
     inductor_meta: InductorMeta | None = None,
     custom_kernel=False,
@@ -5046,6 +5459,8 @@ def user_autotune(
         custom_kernel=custom_kernel,
     )
 
+    # [FUNCTION DOC] Heuristic for foreach kernels: one config with 8 warps by default, or 1, 2, 4 and 8 warps when max
+    # autotune (or pointwise max autotune) is enabled; returns a cached_autotune decorator.
 
 def foreach(
     triton_meta: TritonMeta, filename=None, inductor_meta: InductorMeta | None = None
@@ -5073,6 +5488,10 @@ def foreach(
         heuristic_type=HeuristicType.TEMPLATE,
         filename=filename,
     )
+# [CLASS DOC] Base dataclass that generates the launch grid expressions (x, y, z) for a kernel launcher as strings or
+# ints, in Python or C++ syntax. State: inductor_meta, mode, prefix (list of setup statements to emit before the grid),
+# and the three grid expressions. Subclasses implement generate; the grid class is chosen by name from inductor_meta.
+# Provides code generation helpers (ceildiv, maximum, summation, product, assign_tmp) with constant folding.
 
 
 @dataclasses.dataclass
@@ -5083,13 +5502,18 @@ class GridExpr:
     mode: Literal["python", "cpp"] = "python"
     prefix: list[str] = dataclasses.field(default_factory=list)
     x_grid: str | int = 1
+        # [FUNCTION DOC] Validate that mode is python or cpp; raises an error otherwise.
     y_grid: str | int = 1
     z_grid: str | int = 1
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC] Abstract: fill in the grid expressions from block-size meta; subclasses override. Raises NotImplementedError.
         if self.mode not in ("python", "cpp"):
             raise AssertionError(f"mode must be 'python' or 'cpp', got {self.mode!r}")
 
+        # [FUNCTION DOC] Expression for ceiling division of numel by block. Returns numel when the block is None or 1,
+        # a constant folded int when both are ints, otherwise a string expression (floor-division trick in Python, the usual
+        # formula in C++).
     def generate(self, meta: dict[str, int], is_lazy: bool = False) -> None:
         raise NotImplementedError
 
@@ -5102,6 +5526,8 @@ class GridExpr:
         # negative integer division is floored
         if self.mode == "python":
             return f"-(({numel}) // -({block}))"
+        # [FUNCTION DOC] Expression for the maximum of the items with ints folded together. Single result returned as is; Python
+        # mode emits a max call string; C++ mode emits nested std max with int literals cast to long.
         # For cpp code gen
         return f"(({numel} + ({block} - 1)) / ({block}))"
 
@@ -5114,6 +5540,7 @@ class GridExpr:
             return f"max({', '.join(map(str, items))})"
         # Cast int constants to (long) to avoid type deduction errors with std::max
         # when mixing long variables with int literals
+        # [FUNCTION DOC] Expression for the sum of the items, folding int constants; returns the single item or a plus-joined string.
         cpp_items = [f"(long){x}" if isinstance(x, int) else str(x) for x in items]
         return functools.reduce(lambda x, y: f"std::max({x}, {y})", cpp_items)
 
@@ -5121,6 +5548,7 @@ class GridExpr:
         """Codegen for sum function with constant folding, constants are represented as int"""
         items = self._constant_fold(sum, seq)
         if len(items) <= 1:
+        # [FUNCTION DOC] Expression for the product of the items, folding int constants; returns the single item or a times-joined string.
             return items[0]
         return " + ".join(map(str, items))
 
@@ -5129,6 +5557,7 @@ class GridExpr:
         if len(items) <= 1:
             return items[0]
         return " * ".join(map(str, items))
+        # [FUNCTION DOC] HELPER: Apply a commutative function to all int items and return the non-int items followed by the folded constant.
 
     def _constant_fold(
         self, fn: Callable[[list[int]], int], seq: list[int | str]
@@ -5137,6 +5566,8 @@ class GridExpr:
         items: list[int | str] = [x for x in seq if not isinstance(x, int)]
         const_items = [x for x in seq if isinstance(x, int)]
         if const_items:
+        # [FUNCTION DOC] Statement assigning an expression to a name: plain assignment in Python mode, typed unsigned 32-bit
+        # declaration with semicolon in C++ mode; raises an error for an invalid mode.
             items.append(fn(const_items))
         return items
 
@@ -5150,6 +5581,9 @@ class GridExpr:
 
     @staticmethod
     def from_meta(
+        # [FUNCTION DOC] Static factory: look up the grid class by the name stored in inductor_meta under grid_type in this module
+        # (raises an error if not a GridExpr subclass), instantiate it, generate from a Config (converted to a dict) or dict, and
+        # return the instance.
         inductor_meta: InductorMeta,
         cfg: Config | dict[str, int],
         mode: Literal["python", "cpp"] = "python",
@@ -5160,6 +5594,8 @@ class GridExpr:
         grid = grid_cls(inductor_meta=inductor_meta, mode=mode)
         if isinstance(cfg, Config):
             cfg = config_to_dict(cfg)
+        # [FUNCTION DOC] Evaluate the grid for concrete values: executes the prefix statements and the three grid expressions in a
+        # scope seeded with the given mapping (Python mode only). Returns (grid_0, grid_1, grid_2). Uses dynamic code execution.
         grid.generate(cfg)
         return grid
 
@@ -5169,6 +5605,8 @@ class GridExpr:
             exec(line, scope)
         exec(f"grid_0 = {self.x_grid}", scope)
         exec(f"grid_1 = {self.y_grid}", scope)
+        # [FUNCTION DOC] Generate grid expressions for lazy compile, using variable references like the kernel result's block
+        # arrays and split values instead of real numbers; assertions on real values are skipped.
         exec(f"grid_2 = {self.z_grid}", scope)
         return scope["grid_0"], scope["grid_1"], scope["grid_2"]
 
@@ -5190,6 +5628,8 @@ class GridExpr:
 
     @classmethod
     def from_meta_lazy(
+        # [FUNCTION DOC] Class method factory for lazy compile mode: requires inductor_meta and its grid_type (raises an error if
+        # missing or not a GridExpr subclass), builds a C++ mode grid and generates its lazy expressions.
         cls,
         inductor_meta: InductorMeta | None,
         kernel_name: str,
@@ -5205,32 +5645,44 @@ class GridExpr:
             raise AssertionError(f"Expected GridExpr subclass, got {grid_cls}")
         grid = grid_cls(inductor_meta=inductor_meta, mode="cpp")
         grid.generate_lazy(kernel_name)
+# [CLASS DOC] One dimensional grid: x grid is ceiling of xnumel over XBLOCK.
         return grid
+        # [FUNCTION DOC] Set the x grid from xnumel and XBLOCK.
 
 
 class Grid1D(GridExpr):
     def generate(self, meta: dict[str, int], is_lazy: bool = False) -> None:
+# [CLASS DOC] Two dimensional grid over x and y.
         self.x_grid = self.ceildiv("xnumel", meta.get("XBLOCK"))
+        # [FUNCTION DOC] Set x grid from xnumel/XBLOCK and y grid from ynumel/YBLOCK.
 
 
 class Grid2D(GridExpr):
     def generate(self, meta: dict[str, int], is_lazy: bool = False) -> None:
         self.x_grid = self.ceildiv("xnumel", meta.get("XBLOCK"))
+# [CLASS DOC] Three dimensional grid over x, y and z.
         self.y_grid = self.ceildiv("ynumel", meta.get("YBLOCK"))
+        # [FUNCTION DOC] Set x, y, z grids from xnumel/XBLOCK, ynumel/YBLOCK, znumel/ZBLOCK.
 
 
 class Grid3D(GridExpr):
     def generate(self, meta: dict[str, int], is_lazy: bool = False) -> None:
         self.x_grid = self.ceildiv("xnumel", meta.get("XBLOCK"))
         self.y_grid = self.ceildiv("ynumel", meta.get("YBLOCK"))
+# [CLASS DOC] Batch matmul grid with the axes permuted: z from xnumel, y from ynumel, x from znumel.
         self.z_grid = self.ceildiv("znumel", meta.get("ZBLOCK"))
+        # [FUNCTION DOC] Set z grid from xnumel/XBLOCK, y grid from ynumel/YBLOCK, and x grid from znumel/ZBLOCK.
 
 
 class BatchMatmulGrid3D(GridExpr):
     def generate(self, meta: dict[str, int], is_lazy: bool = False) -> None:
         self.z_grid = self.ceildiv("xnumel", meta.get("XBLOCK"))
         self.y_grid = self.ceildiv("ynumel", meta.get("YBLOCK"))
+# [CLASS DOC] Two dimensional grid that spills y-dimension overflow into z: when the y block count exceeds the hardware y limit,
+# it is divided by a computed factor and the factor becomes the z grid.
         self.x_grid = self.ceildiv("znumel", meta.get("ZBLOCK"))
+        # [FUNCTION DOC] Set x grid; add prefix statements computing a raw y grid and an overflow divisor from the maximum y grid;
+        # y grid becomes the guarded ceiling of raw over divisor (zero when the divisor is zero) and z grid is the divisor.
 
 
 class Grid2DWithYZOverflow(GridExpr):
@@ -5251,7 +5703,10 @@ class Grid2DWithYZOverflow(GridExpr):
             self.y_grid = f"(0 if y_grid_div_ == 0 else {ceildiv_expr})"
         else:
             self.y_grid = f"(y_grid_div_ == 0 ? 0 : {ceildiv_expr})"
+# [CLASS DOC] Grid for mix-order reductions: x grid is ceiling of xnumel over the split size.
         self.z_grid = "y_grid_div_"
+        # [FUNCTION DOC] Set x grid from xnumel and RSPLIT_SIZE. Unless lazy, raises an error if the split size or XBLOCK is
+        # missing or the split size is not a multiple of XBLOCK.
 
 
 class MixOrderReductionGrid(GridExpr):
@@ -5265,13 +5720,17 @@ class MixOrderReductionGrid(GridExpr):
                 raise AssertionError("Missing XBLOCK")
             if split_size % xblock != 0:
                 raise AssertionError(f"{split_size=}, {xblock=}")
+# [CLASS DOC] Grid for cooperative reductions: x grid is the RSPLIT value and y grid is blocks over xnumel.
         self.x_grid = self.ceildiv("xnumel", split_size)
+        # [FUNCTION DOC] Set x grid to RSPLIT and y grid to ceiling of xnumel over XBLOCK.
 
 
 class CooperativeReductionGrid(GridExpr):
     def generate(self, meta: dict[str, int], is_lazy: bool = False) -> None:
         self.x_grid = str(meta["RSPLIT"])
+# [CLASS DOC] Grid for split scans: x grid is blocks over the reduction numel, y grid is xnumel.
         self.y_grid = self.ceildiv("xnumel", meta.get("XBLOCK"))
+        # [FUNCTION DOC] Set x grid from r0_numel and R0_BLOCK and y grid to xnumel; unless lazy, raises an error if XBLOCK is not 1.
 
 
 class SplitScanGrid(GridExpr):
@@ -5282,8 +5741,11 @@ class SplitScanGrid(GridExpr):
                     f"Expected XBLOCK == 1 for SplitScanGrid, got {meta.get('XBLOCK', 1)}"
                 )
         self.x_grid = self.ceildiv("r0_numel", meta.get("R0_BLOCK"))
+# [CLASS DOC] Grid whose three dimensions are passed to the launcher as extra arguments and read from inductor_meta.
         self.y_grid = "xnumel"
 
+        # [FUNCTION DOC] Static method returning inductor meta entries (grid type, fixed grid names, extra launcher args) so the
+        # launcher takes three extra grid arguments.
 
 class FixedGrid(GridExpr):
     @staticmethod
@@ -5292,11 +5754,15 @@ class FixedGrid(GridExpr):
         return {
             "grid_type": FixedGrid.__name__,
             "fixed_grid": ["_grid_0", "_grid_1", "_grid_2"],
+        # [FUNCTION DOC] Take x, y, z grid expressions from the fixed_grid entry of inductor_meta.
             "extra_launcher_args": ["_grid_0", "_grid_1", "_grid_2"],
         }
 
     def generate(self, meta: dict[str, int], is_lazy: bool = False) -> None:
+# [CLASS DOC] Grid chosen from a list of precomputed grids in inductor_meta keyed by config values.
         self.x_grid, self.y_grid, self.z_grid = self.inductor_meta["fixed_grid"]
+        # [FUNCTION DOC] Pick the first precomputed candidate whose config entries all match the meta and use its grid for the
+        # current mode; raises an error if none matches.
 
 
 class PrecomputedGrid(GridExpr):
@@ -5307,7 +5773,12 @@ class PrecomputedGrid(GridExpr):
                 return
         raise AssertionError(
             f"Precomputed grid not found for {meta} in {self.inductor_meta['precomputed_grids']}"
+# [CLASS DOC] Base grid for combo kernels (several sub-kernels in one launch). Reads combo_grid_meta; subclasses define how
+# the x grid is combined. y dimension overflow is handled like the two dimensional overflow grid.
         )
+        # [FUNCTION DOC] Build grid from combo metadata: merges default config into meta, validates each xnumel (raises an error if
+        # not None or positive), collects xnumels, no_x_dim flags and ynumels, sets the combined x grid (at least min_blocks if given),
+        # and when y sizes exist adds prefix statements and y/z grids with overflow handling.
 
 
 class ComboKernelGrid(GridExpr):
@@ -5356,16 +5827,20 @@ class ComboKernelGrid(GridExpr):
 
     def combo_x_grid(
         self,
+        # [FUNCTION DOC] Abstract: combine per-sub-kernel xnumels into the x grid expression; subclasses override.
         xnumels: list[int | str],
         no_x_dims: list[bool],
         meta: dict[str, int],
     ) -> str | int:
+# [CLASS DOC] Combo kernel grid where sub-kernels run one after another along x: x grid is the sum of each sub-kernel's blocks.
         raise NotImplementedError
 
 
 class SequentialComboKernelGrid(ComboKernelGrid):
     def combo_x_grid(
         self,
+        # [FUNCTION DOC] Sum of ceiling divisions of each xnumel by XBLOCK (or 1 for sub-kernels without an x dim). Raises an error
+        # if the lists differ in length.
         xnumels: list[int | str],
         no_x_dims: list[bool],
         meta: dict[str, int],
@@ -5379,9 +5854,12 @@ class SequentialComboKernelGrid(ComboKernelGrid):
                 self.ceildiv(x, 1 if no_x_dim else meta.get("XBLOCK"))
                 for x, no_x_dim in zip(xnumels, no_x_dims)
             ]
+# [CLASS DOC] Combo grid with a flattened one dimensional launch: x grid is the sum over sub-kernels of x blocks times y blocks,
+# using per-subkernel XBLOCK and YBLOCK; y and z grids are 1.
         )
 
 
+        # [FUNCTION DOC] Lazy-compile variant: builds meta of per-subkernel block references from the kernel result and generates.
 class SequentialFlattenComboKernelGrid(GridExpr):
     """Flattened grid: (sum of x*y blocks, 1, 1) for per-subkernel with flattened dispatch."""
 
@@ -5391,6 +5869,8 @@ class SequentialFlattenComboKernelGrid(GridExpr):
         meta: dict[str, Any] = {}
         for i in range(num_kernels):
             meta[f"XBLOCK_{i}"] = f"{kernel_name}_result.xblocks[{i}]"
+        # [FUNCTION DOC] For each sub-kernel compute x blocks and y blocks (validating xnumel is None or positive, raising an error
+        # otherwise), multiply them, sum over sub-kernels, apply min_blocks if set, and set y and z grids to 1.
             meta[f"YBLOCK_{i}"] = f"{kernel_name}_result.yblocks[{i}]"
         self.generate(meta, is_lazy=True)
 
@@ -5425,12 +5905,16 @@ class SequentialFlattenComboKernelGrid(GridExpr):
         if combo_meta["min_blocks"]:
             self.x_grid = self.maximum([self.x_grid, combo_meta["min_blocks"]])
         self.y_grid = 1
+# [CLASS DOC] Combo kernel grid where sub-kernels are interleaved: x grid is the maximum block count across sub-kernels times
+# the number of kernels.
         self.z_grid = 1
 
 
 class RoundRobinComboKernelGrid(ComboKernelGrid):
     def combo_x_grid(
         self,
+        # [FUNCTION DOC] Build the x grid as the maximum of no-x-dim xnumels and the ceiling of the largest remaining xnumel over
+        # XBLOCK, multiplied by the kernel count. Raises an error if the lists differ in length.
         xnumels: list[int | str],
         no_x_dims: list[bool],
         meta: dict[str, int],
