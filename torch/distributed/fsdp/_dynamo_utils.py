@@ -1,3 +1,5 @@
+# [MODULE DOC] HELPER: Utility that marks modules wrapped by FSDP so that Dynamo can
+# recognize them (Dynamo skips FSDP frames and cannot inspect the wrapper itself).
 import torch.nn as nn
 
 
@@ -6,6 +8,10 @@ def _annotate_modules_for_dynamo(
     ignored_modules: set[nn.Module],
     use_orig_params: bool,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Walks every submodule of module (including itself) not in
+    # ignored_modules and sets two attributes on it: a flag marking it as FSDP-managed and
+    # the use_orig_params setting, which Dynamo reads (it only supports use_orig_params true).
+    # Mutates the modules in place; returns nothing.
     """
     Annotates the submodules in ``module`` 's tree, except those in
     ``ignored_modules``, indicating that the submodules are FSDP-managed and

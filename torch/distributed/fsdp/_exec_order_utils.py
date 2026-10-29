@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] HELPER: Tracks FSDP1 execution order for forward/backward prefetching and, at
+# DETAIL debug level, validates that the forward order matches across ranks (first iteration)
+# and across iterations (warnings). Contains _ExecOrderWarnStatus and _ExecOrderData.
 import itertools
 import warnings
 from enum import auto, Enum
@@ -12,6 +15,8 @@ from torch.distributed.fsdp._flat_param import FlatParamHandle
 
 
 class _ExecOrderWarnStatus(Enum):
+    # [CLASS DOC] HELPER: Enum of the order-deviation warning state: NONE (no deviation),
+    # WARNING (deviating in the current iteration), WARNED (deviated in an earlier iteration).
     """Used internally for execution order validation."""
 
     NONE = auto()  # no deviation yet
@@ -20,6 +25,12 @@ class _ExecOrderWarnStatus(Enum):
 
 
 class _ExecOrderData:
+    # [CLASS DOC] HELPER: Per-root-FSDP record of handle execution order. State: the static
+    # pre-forward order (first iteration only), the post-forward order (reset every
+    # iteration), prefetch limits, an iteration counter, and (when checking at DETAIL debug
+    # level) the process group, world size, ordered list of all handles, parameter to FQN
+    # mapping, current order index and warning status. Key methods: init, record_pre_forward,
+    # record_post_forward, get_handle_to_forward/backward_prefetch, next_iter.
     """
     This contains the data structures to track the execution order. We track
     the pre-forward order on the *first* iteration for forward prefetching
@@ -34,6 +45,9 @@ class _ExecOrderData:
         backward_prefetch_limit: int,
         forward_prefetch_limit: int,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Creates empty order lists, stores the backward and forward
+        # prefetch limits, and enables order checking only if debug_level is DETAIL. The
+        # process group, world size and handle metadata are filled later by init.
         # Tracks the (static) pre-forward order for execution order validation
         # and forward prefetching
         self.handles_pre_forward_order: list[FlatParamHandle] = []
@@ -63,6 +77,10 @@ class _ExecOrderData:
         root_module: nn.Module,
         process_group: dist.ProcessGroup,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Called once after the root FSDP is set during lazy init.
+        # Stores the process group, rank and world size, assigns each handle found under
+        # root_module a stable index (setting its handle index attribute) and builds the
+        # parameter to FQN mapping. The state argument is unused.
         """
         Initializes the data structures needed for checking the forward order.
         This should be called after a root FSDP instance has been set during
@@ -83,12 +101,18 @@ class _ExecOrderData:
 
     @property
     def is_first_iter(self) -> bool:
+        # [FUNCTION DOC] HELPER: True while the iteration counter is zero.
         return self._iter == 0
 
     def get_handle_to_backward_prefetch(
         self,
         current_handle: FlatParamHandle,
     ) -> FlatParamHandle | None:
+        # [FUNCTION DOC] HELPER: Returns the single handle to prefetch for backward: walking
+        # back from the current handle's post-forward index by up to the backward prefetch
+        # limit, the last handle reached. Returns None if the current handle has no recorded
+        # index (or the limit/index leaves nothing to fetch).
+        # KNOWN ISSUE: docstring says it returns a list; it returns one handle or None.
         """
         Returns a :class:`list` of the handles keys of the handles to backward
         prefetch given the current handles key. If there are no valid handles
@@ -110,6 +134,11 @@ class _ExecOrderData:
         self,
         current_handle: FlatParamHandle,
     ) -> FlatParamHandle | None:
+        # [FUNCTION DOC] HELPER: Returns the single handle to prefetch for forward: walking
+        # ahead from the current handle's pre-forward order index by up to the forward
+        # prefetch limit (stopping at the end of the recorded order), the last handle reached.
+        # Returns None if the current handle has no recorded index or nothing is available.
+        # KNOWN ISSUE: docstring says it returns a list; it returns one handle or None.
         """
         Returns a :class:`list` of the handles keys of the handles to forward
         prefetch given the current handles key. If there are no valid handles
@@ -128,6 +157,11 @@ class _ExecOrderData:
         return target_handle
 
     def record_post_forward(self, handle: FlatParamHandle | None) -> None:
+        # [FUNCTION DOC] HELPER: Appends the handle to the post-forward order (does nothing
+        # for a falsy handle). Sets the handle's post-forward index to its position on first
+        # use only; later uses are appended without changing the index.
+        # KNOWN ISSUE: the first-use test is truthiness of the index, so a handle whose index
+        # is 0 is treated as already recorded (harmless: index stays 0).
         """
         Records ``handles`` in the post-forward order, where ``handles`` should
         be a group of handles used in the same module's forward. If ``handles``
@@ -150,6 +184,9 @@ class _ExecOrderData:
     def record_pre_forward(
         self, handle: FlatParamHandle | None, is_training: bool
     ) -> None:
+        # [FUNCTION DOC] HELPER: Ignores a falsy handle. Otherwise runs the order check, then
+        # on the first iteration only, records the handle's index and appends it to the static
+        # pre-forward order (once per handle). Can raise RuntimeError from the check.
         """
         Records ``handles`` in the pre-forward order, where ``handles`` should
         be a group of handles used in the same module's forward. If ``handles``
@@ -170,6 +207,12 @@ class _ExecOrderData:
         self.handles_pre_forward_order.append(handle)
 
     def _check_order(self, handle: FlatParamHandle, is_training: bool) -> None:
+        # [FUNCTION DOC] HELPER: No-op unless training and checking is enabled. First
+        # iteration: all-gathers each rank's handle count, then handle indices, and raises
+        # RuntimeError if ranks disagree (comparisons skipped under Dynamo compilation).
+        # Later iterations: compares the handle to the expected one at the current order
+        # index and warns once per deviating run (extra or different all-gather), updating the
+        # warning status; advances the order index. Side effects: collectives, warnings.
         """
         Checks the forward execution order as long as ``is_training`` is
         ``True`` since checking in eval mode is not supported. This only checks
@@ -308,6 +351,8 @@ class _ExecOrderData:
         self,
         handle: FlatParamHandle,
     ) -> tuple[int | None, ...]:
+        # [FUNCTION DOC] HELPER: Returns a tuple holding the handle's assigned index, or an
+        # empty tuple if the handle is falsy.
         """
         Returns the handle indices (i.e. indices into ``self.all_handles``)
         corresponding to the handles in ``handle``. An entry in the
@@ -322,6 +367,8 @@ class _ExecOrderData:
         self,
         handle_indices: tuple[int, ...],
     ) -> list[list[str]]:
+        # [FUNCTION DOC] HELPER: Maps each valid index into the ordered handle list to the
+        # FQN list of that handle's flat parameter; invalid or None indices are skipped.
         """
         Returns a list of FQNs for each handle in ``handle_indices``. If a
         handle index is invalid, then its FQNs are omitted from the returned
@@ -340,6 +387,8 @@ class _ExecOrderData:
         self,
         handle: FlatParamHandle,
     ) -> list[list[str]]:
+        # [FUNCTION DOC] HELPER: Returns a list with the FQN list of the handle's flat
+        # parameter, or an empty list if the handle is falsy or its parameter is unknown.
         """
         Returns a list of FQNs for each handle in ``handles_key``. If a handle
         is invalid, then its FQNs are omitted from the returned list.
@@ -352,6 +401,9 @@ class _ExecOrderData:
         return fqns
 
     def next_iter(self):
+        # [FUNCTION DOC] HELPER: Ends an iteration: increments the counter, clears the
+        # post-forward order and, when checking, resets the order index and promotes the
+        # warning status from WARNING to WARNED.
         """
         Advances the internal data structures per iteration. This should be
         called in the post-backward callback since that marks the true end of

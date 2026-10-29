@@ -1,3 +1,9 @@
+# [PACKAGE DOC] Public entry point of torch.distributed.fsdp (Fully Sharded Data Parallel).
+# Re-exports the FSDP1 wrapper FullyShardedDataParallel with its configuration classes
+# (sharding strategy, mixed precision, CPU offload, state dict configs and settings) and the
+# FSDP2 API (fully_shard, FSDPModule, policies, mesh dims, forward-method registration,
+# unshard handle, share_comm_ctx), plus FlatParameter. Import-time side effect: the __module__
+# of the FSDP2 names is rewritten to torch.distributed.fsdp so they appear public.
 from ._flat_param import FlatParameter as FlatParameter
 from ._fully_shard import (
     CPUOffloadPolicy,

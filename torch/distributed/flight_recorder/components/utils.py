@@ -51,6 +51,8 @@ except ModuleNotFoundError:
 
 
 def format_frame(frame: dict[str, str]) -> str:
+    # [FUNCTION DOC] Formats one stack frame mapping (keys name, filename, line) as the
+    # string "name at filename:line". Raises KeyError if a key is missing.
     name = frame["name"]
     filename = frame["filename"]
     line = frame["line"]
@@ -58,6 +60,8 @@ def format_frame(frame: dict[str, str]) -> str:
 
 
 def format_frames(frames: list[dict[str, str]]) -> str:
+    # [FUNCTION DOC] Formats each frame with format_frame and joins them with newlines.
+    # Returns the combined string (empty for an empty list).
     formatted_frames = []
     for frame in frames:
         formatted_frames.append(format_frame(frame))
@@ -70,6 +74,8 @@ def match_one_event(
     memberships: dict[str, set[Any]],
     pg_name: str,
 ) -> MatchInfo:
+    # [FUNCTION DOC] Wraps two raw event mappings into Op objects for the given process group
+    # name and returns the MatchInfo from comparing the first against the second.
     op_a = Op(event_a, memberships, pg_name)
     op_b = Op(event_b, memberships, pg_name)
     return op_a.match(op_b)
@@ -117,6 +123,9 @@ def match_coalesced_groups(
         match: bool,
         _pg_guids: dict[tuple[str, int], str],
     ) -> None:
+        # [FUNCTION DOC] HELPER: Logs a table with one column per rank and one row per
+        # event position, titled Match or MISMATCH. Entries whose process group guid is
+        # unknown are shown as empty cells. Requires tabulate to be installed.
         all_ops = {
             rank: [
                 Op(e, memberships, _pg_guids[(e["process_group"][0], rank)])
@@ -253,6 +262,8 @@ def match_coalesced_groups_with_non_p2p(
         match: bool,
         _pg_guids: dict[tuple[str, int], str],
     ) -> None:
+        # [FUNCTION DOC] HELPER: Logs a rank-by-position table of ops titled Match or
+        # MISMATCH; entries with unknown process group guid appear as empty cells.
         all_ops = {
             rank: [
                 Op(e, memberships, _pg_guids[(e["process_group"][0], rank)])
@@ -414,6 +425,8 @@ def match_coalesced_groups_with_non_p2p(
 
 
 def check_size_alltoall(alltoall_cases: list[dict[str, Any]]) -> tuple[bool, int, int]:
+    # [FUNCTION DOC] Sums the element counts of the first input size and first output size of
+    # each alltoall entry. Returns (totals differ, total input numel, total output numel).
     input_numel = 0
     output_numel = 0
     for e in alltoall_cases:
@@ -431,6 +444,12 @@ def check_current_entry_match(
     mismatch: dict[str, int],
     match_record: MatchStateRecord,
 ) -> None:
+    # [FUNCTION DOC] For each other expected rank, finds the first entry in the same process
+    # group (name and description) with the same collective_seq_id as the record's entry, and
+    # compares it with current_entry. Fully matched/undecided results (when no mismatch has
+    # been seen for the group) go into found_ranks/found_idx and set has_undecided_case;
+    # otherwise the rank goes into candidate_ranks/candidate_idx and real mismatches are added
+    # to match_record.errors. Mutates match_record; returns nothing.
     pg_name, desc = pg_info[0], pg_info[1]
     for o in match_record.expected_ranks.intersection(set(match_record.other_ranks)):
         for i, e in enumerate(all_entries[o]):  # type: ignore[index]
@@ -476,6 +495,14 @@ def error_analysis(
     version: tuple[int, int],
     pg_name: str,
 ) -> None:
+    # [FUNCTION DOC] Heuristically classifies the result of matching one collective entry and
+    # logs diagnostics. Cases: (1) some expected ranks never joined though their dumps exist,
+    # (2) alltoall with undecided matches, where total input/output element counts are checked
+    # (skipped for versions up to 2.3), (3) everything matched, (4) explicit errors recorded,
+    # (5) undecided because dumps from some ranks are missing. Increments mismatch for the
+    # process group on problems and moves found ranks/indices to the candidate sets in
+    # match_record (or the reverse on success). Side effects: logging and mutation of
+    # match_record and mismatch. Returns nothing.
     major_v, minor_v = version[0], version[1]
     # case one: not every rank join the collective or in the flight recorder.
     if (
@@ -581,6 +608,11 @@ def find_coalesced_group(
     _pg_guids: dict[tuple[str, int], str],
     rank: int,
 ) -> list[tuple[int, dict[str, Any]]]:
+    # [FUNCTION DOC] Scans a rank's entries, skipping other process groups, and collects
+    # (index, entry) pairs that share the sequence id (p2p or collective) of the first entry
+    # of the named group, stopping at the first differing one. Returns the list if it has more
+    # than one element, else an empty list. Raises AssertionError if the last collected entry
+    # is not named nccl:coalesced.
     """Given a list of entries, if the collective_seq_id of the first entry matches that of subsequent ones,
     build and return a list of entries terminating in a 'coalesced' op entry all sharing a collective_seq_id
     """
@@ -615,6 +647,10 @@ def find_coalesced_group_with_non_p2p(
     _pg_guids: dict[tuple[str, int], str],
     rank: int,
 ) -> list[tuple[int, dict[str, Any]]]:
+    # [FUNCTION DOC] Same grouping as find_coalesced_group, but does not raise when the last
+    # entry is not a coalesced end: it only logs an error if an nccl-prefixed name does not end
+    # with the coalesced suffix. Returns the grouped (index, entry) pairs if more than one,
+    # else an empty list.
     """Given a list of entries, if the collective_seq_id of the first entry matches that of subsequent ones,
     build and return a list of entries terminating in a 'coalesced' op entry all sharing a collective_seq_id
     """
@@ -651,6 +687,11 @@ def just_print_entries(
     args: argparse.Namespace,
     stack_id_trace_map: dict[str, int],
 ) -> None:
+    # [FUNCTION DOC] Prints all entries as a table with one column per (selected) rank and one
+    # row per position, consuming (popping) entries from all_entries. Entries outside
+    # args.pg_filters are shown blank. If stack_id_trace_map is non-empty and
+    # args.print_stack_trace is set, also prints a stack_id to frame stack table. Output goes
+    # through the logger; requires tabulate. Returns nothing.
     rows = []
     ranks = sorted(all_entries.keys())
     headers = [
@@ -699,6 +740,8 @@ def just_print_entries(
 def check_no_missing_dump_files(
     entries: dict[int, Any], memberships: list[Membership]
 ) -> None:
+    # [FUNCTION DOC] Verifies a dump exists for every global rank listed in memberships.
+    # Raises AssertionError naming the missing ranks.
     all_ranks = {int(membership.global_rank) for membership in memberships}
     dumps_ranks = {int(key) for key in entries}
     missing = all_ranks - dumps_ranks
@@ -707,6 +750,8 @@ def check_no_missing_dump_files(
 
 
 def check_version(version_by_ranks: dict[str, str], version: str) -> None:
+    # [FUNCTION DOC] Raises AssertionError for the first rank whose version differs from the
+    # given version; returns nothing otherwise.
     for rank, v in version_by_ranks.items():
         if v != version:
             raise AssertionError(
@@ -715,6 +760,9 @@ def check_version(version_by_ranks: dict[str, str], version: str) -> None:
 
 
 def get_version_detail(version: str) -> tuple[int, int]:
+    # [FUNCTION DOC] Parses a "major.minor" version string into an integer pair. Raises
+    # AssertionError if it does not have exactly two dot-separated parts and ValueError if
+    # the parts are not integers.
     # pyrefly: ignore [bad-assignment]
     version = version.split(".")
     if len(version) != 2:
@@ -726,6 +774,9 @@ def get_version_detail(version: str) -> tuple[int, int]:
 def add_stack_id_in_entries(
     entries: dict[int, list[dict[str, Any]]],
 ) -> tuple[dict[int, list[dict[str, Any]]], dict[str, int]]:
+    # [FUNCTION DOC] Assigns each entry a stack_id field (mutating the entries in place):
+    # identical frame lists share an id allocated incrementally from 0, entries without frames
+    # get -1. Returns the entries and the mapping from stringified frames to stack id.
     stack_id = 0
     stack_id_trace_map = {}
     for rank in entries:
@@ -747,6 +798,9 @@ def add_stack_id_in_entries(
 def align_trace_from_beginning(
     entries: dict[int, list[dict[str, Any]]],
 ) -> dict[int, list[dict[str, Any]]]:
+    # [FUNCTION DOC] Drops, for every rank, entries whose record_id is below the largest first
+    # record_id across non-empty ranks, so all ranks start at a common point. Replaces the
+    # per-rank lists in the input mapping and returns it.
     """
     Align the trace entries by record ID for entries.
     This function takes a dictionary of rank names to lists of trace entries as input.

@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] HELPER: Private utilities shared by FSDP1 and composable fully_shard: the
+# per-module FSDP state class, device handle abstraction, training-state enums, helpers to
+# find FSDP states/handles/FQNs for modules and parameters, nested-output gradient tensor
+# collection/replacement, and tensor-name cleaning. Import-time side effect: creates the
+# module-to-input-dtype weak mapping.
 """
 This file includes private common utilities for FSDP.
 """
@@ -46,6 +51,8 @@ _MAX_TRAVERSE_DEPTH = 128
 
 
 def _is_namedtuple(obj: Any) -> bool:
+    # [FUNCTION DOC] HELPER: True if obj is a tuple whose type has string field names and a
+    # conversion-to-dict method (i.e. a named tuple instance).
     # Mirrors torch.nn.parallel.scatter_gather._is_namedtuple
     fields = getattr(type(obj), "_fields", None)
     return (
@@ -57,6 +64,9 @@ def _is_namedtuple(obj: Any) -> bool:
 
 
 def collect_grad_tensors(output: Any) -> tuple[torch.Tensor, ...]:
+    # [FUNCTION DOC] Returns a tuple of all tensors requiring grad found in a nested structure
+    # of dicts, lists, tuples, named tuples and dataclasses, in traversal order. Raises
+    # RuntimeError if nesting exceeds the maximum depth (likely a cycle).
     """
     Recursively collect tensors that require gradients from a nested structure.
 
@@ -73,6 +83,9 @@ def collect_grad_tensors(output: Any) -> tuple[torch.Tensor, ...]:
 def _collect_grad_tensors(
     output: Any, out: list[torch.Tensor], _depth: int = 0
 ) -> None:
+    # [FUNCTION DOC] HELPER: Recursive worker appending grad-requiring tensors to out. Branch
+    # order (tensor, named tuple, dataclass, dict, list/tuple) must mirror _replace_grad_tensors.
+    # Raises RuntimeError past the maximum depth.
     """Collect grad-requiring tensors in the same order as _replace_grad_tensors."""
     if _depth >= _MAX_TRAVERSE_DEPTH:
         raise RuntimeError(
@@ -100,6 +113,10 @@ def _collect_grad_tensors(
 
 
 def replace_grad_tensors(output: Any, tensor_iter: Iterator[torch.Tensor]) -> Any:
+    # [FUNCTION DOC] Returns a copy of the nested structure with each grad-requiring tensor
+    # replaced by the next tensor from tensor_iter (same order as collect_grad_tensors);
+    # unchanged containers are returned as-is. Raises RuntimeError if replacements remain
+    # unconsumed or depth is exceeded, and StopIteration-style errors if the iterator runs out.
     """
     Replace grad-requiring tensors in a nested structure using replacements
     from tensor_iter.
@@ -131,6 +148,10 @@ def replace_grad_tensors(output: Any, tensor_iter: Iterator[torch.Tensor]) -> An
 def _replace_grad_tensors(
     output: Any, tensor_iter: Iterator[torch.Tensor], _depth: int = 0
 ) -> Any:
+    # [FUNCTION DOC] HELPER: Recursive worker for replace_grad_tensors. Rebuilds named tuples,
+    # dataclasses (via field replacement; raises TypeError if that fails), dicts (keeping
+    # the subclass type when possible) and lists/tuples (falling back to the base type) only
+    # when some element changed. Raises RuntimeError past the maximum depth.
     # Branch order must mirror _collect_grad_tensors exactly.
     if _depth >= _MAX_TRAVERSE_DEPTH:
         raise RuntimeError(
@@ -215,6 +236,9 @@ _MODULE_TO_INP_DTYPE: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 
 class _FSDPDeviceHandle:
+    # [CLASS DOC] HELPER: Thin proxy over a torch device backend module (CUDA-like API) used
+    # by FSDP; unknown attribute lookups are forwarded to the backend. Holds the backend and
+    # (when not supplied explicitly) the device.
     """
     This is a simple abstraction for FSDP computing devices,
     which enables custom backends that implement CUDA-like
@@ -222,6 +246,10 @@ class _FSDPDeviceHandle:
     """
 
     def __init__(self, device: torch.device, backend: Any = None):
+        # [FUNCTION DOC] HELPER: Stores the backend: the given one, or the torch submodule named
+        # after the device type. Raises AttributeError if no such submodule is registered.
+        # KNOWN ISSUE: the device is only stored when no backend is given, so the error path
+        # of attribute lookup would fail for an explicit backend lacking the attribute.
         if backend is None:
             try:
                 self.__backend = getattr(torch, device.type)
@@ -235,6 +263,8 @@ class _FSDPDeviceHandle:
 
     @classmethod
     def from_device(cls, device: torch.device) -> "_FSDPDeviceHandle":
+        # [FUNCTION DOC] HELPER: Returns the torch.cuda or torch.mtia module directly for those
+        # device types (for faster attribute access), otherwise a new handle for the device.
         """
         Return a device handle corresponding to the device, and through this handle,
         operations with the same semantics as CUDA can be performed on the device.
@@ -248,6 +278,8 @@ class _FSDPDeviceHandle:
         return cls(device)
 
     def __getattr__(self, name: str, /) -> Any:
+        # [FUNCTION DOC] HELPER: Forwards the attribute lookup to the backend; raises
+        # AttributeError naming the custom backend if the backend lacks it.
         try:
             return getattr(self.__backend, name)
         except AttributeError as exc:
@@ -257,15 +289,27 @@ class _FSDPDeviceHandle:
 
 
 class _UninitializedDeviceHandle(_FSDPDeviceHandle):
+    # [CLASS DOC] HELPER: Placeholder device handle used before the compute device is known;
+    # any attribute access raises RuntimeError.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Does nothing (no backend is set).
         pass
 
     def __getattribute__(self, name: str, /) -> Any:
+        # [FUNCTION DOC] HELPER: Always raises RuntimeError for any attribute access.
         raise RuntimeError("Trying to use an uninitialized device handle.")
 
 
 class _FSDPState(_State):
+    # [CLASS DOC] HELPER: Plain state container shared by FSDP1 and composable fully_shard.
+    # Holds ignored modules/params/buffer names, process group, rank, world size, device mesh,
+    # sharding strategy, training state, state-dict settings, root flag, flat-param handles
+    # (own and per fully sharded module), compute device and device handle, gradient divide
+    # factors, communication hook, and root-only caches of all states and handles.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Initializes all attributes to defaults (full shard strategy,
+        # idle training state, full state-dict configs, unset rank/world size, an
+        # uninitialized device handle, empty collections).
         # TODO: Move all the attributes to this class to enable typing for
         # FSDP/fully_shard.
         self._ignored_modules: set[nn.Module] = set()
@@ -305,6 +349,8 @@ class _FSDPState(_State):
 
 
 def _get_module_fsdp_state(module: nn.Module) -> _FSDPState | None:
+    # [FUNCTION DOC] HELPER: Returns the composable state attached to module if it is an
+    # FSDP state, else None.
     state = _get_module_state(module)
     if state is None or not isinstance(state, _FSDPState):
         return None
@@ -314,6 +360,9 @@ def _get_module_fsdp_state(module: nn.Module) -> _FSDPState | None:
 def _get_module_fsdp_state_if_fully_sharded_module(
     module: nn.Module,
 ) -> _FSDPState | None:
+    # [FUNCTION DOC] HELPER: Returns the module's FSDP state only if the module itself is the
+    # state (FSDP1 wrapper) or is registered as a fully sharded module of that state
+    # (fully_shard); otherwise None.
     state = _get_module_fsdp_state(module)
     if state is None:
         return None
@@ -325,6 +374,7 @@ def _get_module_fsdp_state_if_fully_sharded_module(
 
 
 class TrainingState(Enum):
+    # [CLASS DOC] Enum of the FSDP instance state: IDLE, FORWARD_BACKWARD, SUMMON_FULL_PARAMS.
     """
     An enum that indicates the state of a ``FullyShardedDataParallel` instance.
     """
@@ -335,6 +385,8 @@ class TrainingState(Enum):
 
 
 class HandleTrainingState(Enum):
+    # [CLASS DOC] Enum of a flat-param handle's state: IDLE, FORWARD, BACKWARD_PRE,
+    # BACKWARD_POST, SUMMON_FULL_PARAMS.
     """
     An enum that indicates the state of a ``FlatParamHandle`.
     """
@@ -347,12 +399,17 @@ class HandleTrainingState(Enum):
 
 
 def _is_composable(state: _FSDPState):
+    # [FUNCTION DOC] HELPER: True if the state is not itself an nn.Module, i.e. it comes from
+    # fully_shard rather than the FSDP1 wrapper (temporary heuristic).
     # TODO: This is a temporary hack for differentiate between code paths.
     return not isinstance(state, nn.Module)
 
 
 @no_type_check
 def _module_handle(state: _FSDPState, module: nn.Module) -> Optional["FlatParamHandle"]:
+    # [FUNCTION DOC] HELPER: Returns the flat-param handle for module. Composable case: None
+    # if the state has no handle, else the registered handle for the module (AssertionError
+    # if the module is not registered). FSDP1 case: the module's own handle attribute.
     """
     Returns the ``FlatParamHandle`` s corresponding to ``module``. This is
     the handle that contains some parameter in ``module``.
@@ -374,11 +431,13 @@ def _module_handle(state: _FSDPState, module: nn.Module) -> Optional["FlatParamH
 
 @no_type_check
 def _has_fsdp_params(state: _FSDPState, module: nn.Module) -> bool:
+    # [FUNCTION DOC] HELPER: True if _module_handle finds a handle for the module.
     """Returns if ``module`` has parameters managed by FSDP."""
     return _module_handle(state, module) is not None
 
 
 def _get_sharding_strategy(handle):
+    # [FUNCTION DOC] HELPER: Returns the handle's sharding strategy, or None for a falsy handle.
     """
     Returns the sharding strategy of the handle.
     """
@@ -386,6 +445,8 @@ def _get_sharding_strategy(handle):
 
 
 def clean_tensor_name(tensor_name: str) -> str:
+    # [FUNCTION DOC] Returns the name with all FSDP wrapped-module prefixes and checkpoint
+    # wrapper prefixes removed.
     """
     Cleans the parameter or buffer name by removing any module wrapper
     prefixes.
@@ -399,6 +460,7 @@ def clean_tensor_name(tensor_name: str) -> str:
 
 
 def _set_fsdp_flattened(tensor: torch.Tensor) -> None:
+    # [FUNCTION DOC] HELPER: Marks the tensor (sets an attribute) as already flattened by FSDP.
     """
     Sets an attribute on ``tensor`` to mark it as flattened by FSDP. This is to
     avoid re-flattening it during nested construction.
@@ -407,6 +469,7 @@ def _set_fsdp_flattened(tensor: torch.Tensor) -> None:
 
 
 def _is_fsdp_flattened(tensor: torch.Tensor) -> bool:
+    # [FUNCTION DOC] HELPER: True if the tensor carries the FSDP flattened mark.
     """Returns if ``tensor`` has been marked as flattened by FSDP."""
     return getattr(tensor, FSDP_FLATTENED, False)
 
@@ -414,6 +477,9 @@ def _is_fsdp_flattened(tensor: torch.Tensor) -> bool:
 def _named_parameters_with_duplicates(
     module: nn.Module, **kwargs: Any
 ) -> list[tuple[str, nn.Parameter]]:
+    # [FUNCTION DOC] HELPER: Lists named parameters of module including duplicates by passing
+    # a no-dedup option; if the module's override rejects it (AssertionError), retries
+    # without. Raises AssertionError if the caller already passes that option.
     """
     This API is required as some modules overwrite `named_parameters()` but do not support
     `remove_duplicate`.
@@ -435,6 +501,10 @@ def _get_param_to_fqns(
     model: torch.nn.Module,
     dedup_shared_params: bool = True,
 ) -> dict[nn.Parameter, list[str]]:
+    # [FUNCTION DOC] Builds a mapping from each parameter (or FlatParameter) of model to its
+    # canonical cleaned FQN list, via a module-tree traversal. Shared parameters keep only the
+    # first FQNs unless dedup_shared_params is false (then FQNs accumulate); a repeated
+    # FlatParameter overwrites its entry and emits a warning (DMP + FSDP hack).
     """
     Constructs a mapping from parameter to a list of its \"canonical\" FQNs. Here,
     we use canonical to mean the fully-qualified name assigned to the parameter
@@ -465,6 +535,9 @@ def _get_param_to_fqns(
     """
 
     def module_fn(module, prefix, tree_level, param_to_fqns):
+        # [FUNCTION DOC] HELPER: Per-module visitor that records the module's direct
+        # parameters (with duplicates) into the shared mapping, handling shared and repeated
+        # flat parameters as described in the enclosing function.
         for param_name, param in _named_parameters_with_duplicates(
             module, recurse=False
         ):
@@ -503,6 +576,7 @@ def _get_param_to_fqns(
                     param_to_fqns[param].extend(global_fqns)
 
     def return_fn(param_to_fqns):
+        # [FUNCTION DOC] HELPER: Returns the accumulated mapping unchanged.
         return param_to_fqns
 
     param_to_unflat_param_names: dict[torch.nn.Parameter, list[str]] = {}
@@ -519,6 +593,8 @@ def _get_param_to_fqns(
 def _log_post_backward_hook(
     state: _FSDPState, handle: "FlatParamHandle", logger: logging.Logger
 ) -> None:
+    # [FUNCTION DOC] HELPER: When the state uses original params and the handle's debug level
+    # is INFO, logs a warning listing the parameter FQNs whose post-backward hook fires.
     # Under TORCH_DISTRIBUTED_DEBUG=INFO, log the module names this hook fires for.
     # Below logging of module names this post-bwd hook fires for can help debug certain
     # cases where hooks don't fire, such as under certain activation checkpoint configs.
@@ -531,6 +607,9 @@ def _log_post_backward_hook(
 def _get_handle_fqns_from_root(
     state: _FSDPState, handle: "FlatParamHandle"
 ) -> list[str] | None:
+    # [FUNCTION DOC] HELPER: Returns the concatenated FQNs of the original parameters held by
+    # the handle's flat parameter (looked up in the root's execution-order data), or None if
+    # the handle is None. Only meaningful with original params in use.
     if handle is None:
         return None
     param_to_fqn = state._exec_order_data.param_to_fqn
@@ -547,6 +626,10 @@ def _apply_to_modules(
     *args,
     **kwargs,
 ):
+    # [FUNCTION DOC] HELPER: Pre-order traversal of root_module's tree calling module_fn with
+    # (module, dotted prefix, depth, extra args), then returns return_fn applied to the extra
+    # args. If filter_fqns is given, the wrapper-module children (FSDP, DMP, or a child
+    # named module) whose prefix is not a known FQN prefix do not extend the prefix.
     """
     Performs a pre-order traversal of the modules in the hierarchy rooted at
     ``root_module``, applying ``module_fn`` at each module and finally
@@ -571,6 +654,8 @@ def _apply_to_modules(
                 i = fqn.find(".", i + 1)
 
     def f(module: torch.nn.Module, prefix: str, tree_level: int, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Recursive step: calls module_fn on the module, then recurses
+        # into each non-None child with the extended prefix and depth plus one.
         # Call the module function before recursing over children (pre-order)
         module_fn(module, prefix, tree_level, *args, **kwargs)
         for submodule_name, submodule in module.named_children():
@@ -604,6 +689,9 @@ def _assert_in_training_states(
     state: _FSDPState,
     training_states: list[TrainingState],
 ) -> None:
+    # [FUNCTION DOC] HELPER: Raises ValueError if the state's training state is not in the
+    # allowed list. On rank 0 it first prints the error (and the FSDP instance if it is a
+    # module) and a stack trace to stdout.
     """Asserts that FSDP is in the states ``_training_states``."""
     # Raise a `ValueError` instead of using `assert` to ensure that these
     # logical assertions run even if `assert`s are disabled
@@ -622,6 +710,8 @@ def _assert_in_training_states(
 
 
 def _get_root_modules(modules: set[nn.Module]) -> set[nn.Module]:
+    # [FUNCTION DOC] HELPER: Returns the members of the set that are not submodules of any
+    # other member (quadratic scan over each member's full submodule set).
     """
     Returns:
         Set[nn.Module]: The subset of ``modules`` that are root modules (i.e.
@@ -650,6 +740,11 @@ def _override_module_mixed_precision(
     module_classes_to_override: Iterable[type[nn.Module]],
     wrap_override_dict: dict[str, Any] = {"mixed_precision": None},  # noqa: B006
 ) -> set[type[nn.Module]]:
+    # [FUNCTION DOC] HELPER: For every module under root that is an instance of the given
+    # classes, sets its wrap-override mapping (default disables mixed precision) and registers
+    # appended forward pre/post hooks that upcast floating inputs to float32 and cast outputs
+    # back to the remembered input dtype. Returns the set of classes actually found. Side
+    # effects: mutates modules and the global module-to-input-dtype map.
     module_classes_to_override = tuple(set(module_classes_to_override))
     # Return a set of the actually overridden module classes
     overridden_module_classes: set[type[nn.Module]] = set()
@@ -667,15 +762,20 @@ def _override_module_mixed_precision(
             def cast_fn(
                 dtype: torch.dtype, module: nn.Module, x: torch.Tensor
             ) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Returns x unchanged if non-floating or already of
+                # dtype; otherwise records x's dtype for the module and returns x converted.
                 if not torch.is_floating_point(x) or x.dtype == dtype:
                     return x
                 _MODULE_TO_INP_DTYPE[module] = x.dtype
                 return x.to(dtype)
 
             def forward_pre_hook(module, args):
+                # [FUNCTION DOC] HELPER: Casts floating tensors in the inputs to float32.
                 return _apply_to_tensors(partial(cast_fn, torch.float32, module), args)
 
             def forward_post_hook(module, args, output):
+                # [FUNCTION DOC] HELPER: If an input dtype was recorded for the module, casts
+                # floating tensors in the output back to it; otherwise returns None (no change).
                 # NOTE: If the forward did not have any floating-point tensors,
                 # then the dtype will not be set for this module, and we do not
                 # upcast the dtype.
@@ -693,6 +793,11 @@ def _override_module_mixed_precision(
 
 
 def _no_dispatch_record_stream(tensor: torch.Tensor, stream: torch.Stream) -> None:
+    # [FUNCTION DOC] HELPER: Records the stream on the tensor (to delay memory reuse) with
+    # dispatch modes disabled. Does nothing for device types other than cuda, mtia, xpu or the
+    # private-use backend, or while Dynamo is compiling.
+    # KNOWN ISSUE: the record_stream call after the early return in the Dynamo branch is
+    # unreachable dead code.
     # FIXME record_stream doesn't work with non-cuda/mtia/xpu tensors
     if tensor.device.type not in [
         "cuda",

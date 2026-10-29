@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] HELPER: FSDP debugging utilities: SimpleProfiler, a class-level wall-clock
+# accumulator for named FSDP phases, and a function that renders the sharded module tree with
+# per-module parameter FQNs for the composable fully_shard path. Creates a module logger.
 import logging
 import time
 from collections import defaultdict
@@ -20,7 +23,13 @@ logger = logging.getLogger(__name__)
 
 
 class SimpleProfiler:
+    # [CLASS DOC] HELPER: Process-global profiler with only class-level state: results maps a
+    # profile type name to accumulated seconds and profiling is the set of types currently
+    # being timed (nesting the same type is not allowed). Methods: reset, profile (context
+    # manager), dump_and_reset. Type enumerates the known phase names.
     class Type(str, Enum):
+        # [CLASS DOC] HELPER: String enum of profile phase names (all, all_gather,
+        # all_gather_object, resharding, H2D, D2H).
         ALL = "all"
         ALLGATHER = "all_gather"
         ALLGATHER_OBJ = "all_gather_object"
@@ -33,12 +42,16 @@ class SimpleProfiler:
 
     @classmethod
     def reset(cls) -> None:
+        # [FUNCTION DOC] HELPER: Clears accumulated results and the in-progress set.
         cls.results.clear()
         cls.profiling.clear()
 
     @classmethod
     @contextmanager
     def profile(cls, profile_type: str) -> Iterator[None]:
+        # [FUNCTION DOC] HELPER: Context manager timing its body with a monotonic clock and
+        # adding the elapsed seconds to results for profile_type. Raises AssertionError if that
+        # type is already being profiled. Always unmarks the type on exit, even on error.
         if profile_type in cls.profiling:
             raise AssertionError(
                 f"{profile_type} is already being profiled. "
@@ -57,6 +70,8 @@ class SimpleProfiler:
 
     @classmethod
     def dump_and_reset(cls, msg: str) -> None:
+        # [FUNCTION DOC] HELPER: On rank 0 and only when the distributed debug level is INFO,
+        # logs msg with the results mapping; then always resets the profiler.
         # This cannot be combined with DETAIL distributed log
         # as the profiling will be very incorrect.
         if dist.get_rank() == 0 and dist.get_debug_level() == dist.DebugLevel.INFO:
@@ -67,6 +82,12 @@ class SimpleProfiler:
 def _get_sharded_module_tree_with_module_name_to_fqns(
     model: torch.nn.Module,
 ) -> tuple[str, dict[str, list[str]]]:
+    # [FUNCTION DOC] HELPER: Traverses model's module tree and returns a tuple of (indented
+    # text tree of "prefix[ClassName]" lines, marking modules that own an FSDP handle as
+    # FULLY SHARDED; mapping from that module name to the cleaned FQNs of the original
+    # parameters in its flat parameter, extended if the name repeats). Modules without FSDP
+    # state are listed but not mapped. Raises AssertionError if a handle's flat_param is not a
+    # FlatParameter.
     """
     It is used for composable fully_shard() code path, it returns
       1. sharded module tree info: each line represents a submodule name that contains the
@@ -107,6 +128,10 @@ def _get_sharded_module_tree_with_module_name_to_fqns(
     def module_fn(
         module, prefix, tree_level, sharded_tree_info, sharded_module_name_to_fqns
     ):
+        # [FUNCTION DOC] HELPER: Per-module visitor passed to the traversal. Appends the
+        # indented module line (4 spaces per level) to the single-element text accumulator,
+        # adding a sharded marker if the module has an FSDP handle, and records the handle's
+        # parameter FQNs in the mapping. Raises AssertionError on a non-FlatParameter.
         num_spaces = tree_level * 4
         trimed_prefix = (
             prefix[:-1] if (len(prefix) > 0 and prefix[-1] == ".") else prefix
@@ -142,6 +167,7 @@ def _get_sharded_module_tree_with_module_name_to_fqns(
                 sharded_module_name_to_fqns[prefixed_module_name] = global_fqns
 
     def return_fn(sharded_tree_info, sharded_module_name_to_fqns):
+        # [FUNCTION DOC] HELPER: Finalizer returning the accumulated tree text and the mapping.
         return sharded_tree_info[0], sharded_module_name_to_fqns
 
     # Use List to mutate its value in place while running the recursive functions

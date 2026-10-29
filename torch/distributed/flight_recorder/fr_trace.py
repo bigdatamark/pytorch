@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Command-line entry point of the flight recorder trace analyzer. Parses the job
+# config, loads per-rank dumps from a trace directory, optionally transforms fault-tolerance
+# traces, builds the merged database with collective matching, and optionally pickles
+# (types, db) to an output file. No import-time side effects; main runs under __main__.
 """Flight Recorder Trace Analyzer
 
 This script primarily merges data from individual flight recorder buffers from individual ranks in a
@@ -41,6 +45,11 @@ __all__ = ["main"]
 
 
 def main(args: Sequence[str] | None = None) -> None:
+    # [FUNCTION DOC] Runs the analyzer. args is an optional list of command-line strings
+    # (defaults to the process arguments). Raises AssertionError if no trace directory is given,
+    # or if the fault-tolerance transform is requested without a group world size. Reads the
+    # dump directory, builds the database (which logs analysis), and if an output path is given
+    # writes a pickle of the types and database there. Returns nothing.
     config = JobConfig()
     # pyrefly: ignore [bad-assignment]
     args = config.parse_args(args)
