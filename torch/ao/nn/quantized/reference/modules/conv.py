@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Reference quantized convolution modules: Conv1d/2d/3d and
+# ConvTranspose1d/2d/3d plus private base classes. They keep float weights (no
+# backend packing) and, in forward, run the float functional convolution on a
+# quantize-dequantize round trip of the weight so backends can lower them.
+# Provides from_float constructors that copy a float conv's configuration and
+# detached weight/bias. No import-time side effects.
 from typing import Any, Literal
 
 import torch
@@ -20,6 +26,10 @@ __all__ = [
 
 
 class _ConvNd(torch.nn.modules.conv._ConvNd, ReferenceQuantizedModule):
+    # [CLASS DOC] HELPER: Base for the reference convolution modules (combines the
+    # float conv base with ReferenceQuantizedModule). Does not pack parameters.
+    # Provides the shared from_float builder used by the Conv1d/2d/3d classes;
+    # _IS_REFERENCE is true.
     """A reference version of nn.quantized.Conv2d
     we will not pack the parameters in this module, since weight packing is an
     optimization for quantized backends supported in PyTorch (fbgemm/qnnpack),
@@ -31,6 +41,12 @@ class _ConvNd(torch.nn.modules.conv._ConvNd, ReferenceQuantizedModule):
 
     @staticmethod
     def from_float(cls, float_conv, weight_qparams):
+    # [FUNCTION DOC] HELPER: Static builder (the target class is passed
+    # explicitly as cls): creates an instance of cls from a float conv, copying
+    # channels, kernel size, stride, padding, dilation, groups, bias presence,
+    # padding mode, device and dtype, and passes weight_qparams; then replaces
+    # weight and bias with detached copies wrapped as new parameters. Returns
+    # the new module.
         qref_conv = cls(
             float_conv.in_channels,
             float_conv.out_channels,
@@ -52,6 +68,9 @@ class _ConvNd(torch.nn.modules.conv._ConvNd, ReferenceQuantizedModule):
 
 
 class Conv1d(_ConvNd, nn.Conv1d):
+    # [CLASS DOC] Reference quantized 1D convolution: float Conv1d plus weight
+    # quantization parameters. Activations stay float; the weight is fake-
+    # quantized in forward. Built directly or via from_float.
     def __init__(
         self,
         in_channels: int,
@@ -67,6 +86,10 @@ class Conv1d(_ConvNd, nn.Conv1d):
         dtype=None,
         weight_qparams: dict[str, Any] | None = None,
     ):
+        # [FUNCTION DOC] Initializes the float Conv1d base with the given
+        # arguments (channels, kernel, stride, padding, dilation, groups, bias,
+        # padding mode, device, dtype), then sets up weight quantization
+        # parameters from weight_qparams (mapping, may be None).
         nn.Conv1d.__init__(
             self,
             in_channels,
@@ -84,6 +107,9 @@ class Conv1d(_ConvNd, nn.Conv1d):
         self._init_weight_qparams(weight_qparams, device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] Gets the quantize-dequantized weight and applies float
+        # conv1d to x with the module's bias, stride, padding, dilation and
+        # groups; returns the float result.
         """
         we have:
         w(float) -- quant - dequant \
@@ -108,14 +134,22 @@ class Conv1d(_ConvNd, nn.Conv1d):
         return result
 
     def _get_name(self):
+        # [FUNCTION DOC] HELPER: returns the display name
+        # QuantizedConv1d(Reference).
         return "QuantizedConv1d(Reference)"
 
     @classmethod
     def from_float(cls, float_conv, weight_qparams):  # type: ignore[override]
+        # [FUNCTION DOC] Classmethod: builds a reference Conv1d from a float
+        # conv and weight_qparams through the shared base builder. Returns the
+        # new module.
         return _ConvNd.from_float(cls, float_conv, weight_qparams)
 
 
 class Conv2d(_ConvNd, nn.Conv2d):
+    # [CLASS DOC] Reference quantized 2D convolution: float Conv2d plus weight
+    # quantization parameters. Activations stay float; the weight is fake-
+    # quantized in forward. Built directly or via from_float.
     def __init__(
         self,
         in_channels,
@@ -131,6 +165,10 @@ class Conv2d(_ConvNd, nn.Conv2d):
         dtype=None,
         weight_qparams: dict[str, Any] | None = None,
     ):
+        # [FUNCTION DOC] Initializes the float Conv2d base with the given
+        # arguments (channels, kernel, stride, padding, dilation, groups, bias,
+        # padding mode, device, dtype), then sets up weight quantization
+        # parameters from weight_qparams (mapping, may be None).
         nn.Conv2d.__init__(
             self,
             in_channels,
@@ -149,6 +187,9 @@ class Conv2d(_ConvNd, nn.Conv2d):
         self._init_weight_qparams(weight_qparams, device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] Gets the quantize-dequantized weight and applies float
+        # conv2d to x with the module's bias, stride, padding, dilation and
+        # groups; returns the float result.
         """
         we have:
         w(float) -- quant - dequant \
@@ -173,14 +214,22 @@ class Conv2d(_ConvNd, nn.Conv2d):
         return result
 
     def _get_name(self):
+        # [FUNCTION DOC] HELPER: returns the display name
+        # QuantizedConv2d(Reference).
         return "QuantizedConv2d(Reference)"
 
     @classmethod
     def from_float(cls, float_conv, weight_qparams):  # type: ignore[override]
+        # [FUNCTION DOC] Classmethod: builds a reference Conv2d from a float
+        # conv and weight_qparams through the shared base builder. Returns the
+        # new module.
         return _ConvNd.from_float(cls, float_conv, weight_qparams)
 
 
 class Conv3d(_ConvNd, nn.Conv3d):
+    # [CLASS DOC] Reference quantized 3D convolution: float Conv3d plus weight
+    # quantization parameters. Activations stay float; the weight is fake-
+    # quantized in forward. Built directly or via from_float.
     def __init__(
         self,
         in_channels,
@@ -196,6 +245,10 @@ class Conv3d(_ConvNd, nn.Conv3d):
         dtype=None,
         weight_qparams: dict[str, Any] | None = None,
     ):
+        # [FUNCTION DOC] Initializes the float Conv3d base with the given
+        # arguments (channels, kernel, stride, padding, dilation, groups, bias,
+        # padding mode, device, dtype), then sets up weight quantization
+        # parameters from weight_qparams (mapping, may be None).
         nn.Conv3d.__init__(
             self,
             in_channels,
@@ -214,6 +267,9 @@ class Conv3d(_ConvNd, nn.Conv3d):
         self._init_weight_qparams(weight_qparams, device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] Gets the quantize-dequantized weight and applies float
+        # conv3d to x with the module's bias, stride, padding, dilation and
+        # groups; returns the float result.
         """
         we have:
         w(float) -- quant - dequant \
@@ -238,14 +294,23 @@ class Conv3d(_ConvNd, nn.Conv3d):
         return result
 
     def _get_name(self):
+        # [FUNCTION DOC] HELPER: returns the display name
+        # QuantizedConv3d(Reference).
         return "QuantizedConv3d(Reference)"
 
     @classmethod
     def from_float(cls, float_conv, weight_qparams):  # type: ignore[override]
+        # [FUNCTION DOC] Classmethod: builds a reference Conv3d from a float
+        # conv and weight_qparams through the shared base builder. Returns the
+        # new module.
         return _ConvNd.from_float(cls, float_conv, weight_qparams)
 
 
 class _ConvTransposeNd(_ConvNd, torch.nn.modules.conv._ConvTransposeNd):
+    # [CLASS DOC] HELPER: Base for the reference transposed convolution modules;
+    # same role as the non-transposed base but its from_float passes constructor
+    # arguments in the transposed-conv order (output_padding before bias, dilation
+    # after bias).
     """A reference version of nn.quantized.ConvTranspose2d
     we will not pack the parameters in this module, since weight packing is an
     optimization for quantized backends supported in PyTorch (fbgemm/qnnpack),
@@ -254,6 +319,11 @@ class _ConvTransposeNd(_ConvNd, torch.nn.modules.conv._ConvTransposeNd):
 
     @staticmethod
     def from_float(cls, float_conv, weight_qparams):
+    # [FUNCTION DOC] HELPER: Static builder (cls passed explicitly): creates an
+    # instance from a float transposed conv, copying channels, kernel size,
+    # stride, padding, output padding, groups, bias presence, dilation, padding
+    # mode, device and dtype, plus weight_qparams; replaces weight and bias with
+    # detached parameter copies. Returns the new module.
         qref_conv = cls(
             float_conv.in_channels,
             float_conv.out_channels,
@@ -276,6 +346,10 @@ class _ConvTransposeNd(_ConvNd, torch.nn.modules.conv._ConvTransposeNd):
 
 
 class ConvTranspose1d(_ConvTransposeNd, nn.ConvTranspose1d):
+    # [CLASS DOC] Reference quantized 1D transposed convolution: float
+    # ConvTranspose1d plus weight quantization parameters. Activations stay
+    # float; the weight is fake-quantized in forward. Built directly or via
+    # from_float.
     def __init__(
         self,
         in_channels: int,
@@ -292,6 +366,11 @@ class ConvTranspose1d(_ConvTransposeNd, nn.ConvTranspose1d):
         dtype=None,
         weight_qparams: dict[str, Any] | None = None,
     ):
+        # [FUNCTION DOC] Initializes the float ConvTranspose1d base with the
+        # given arguments (channels, kernel, stride, padding, output padding,
+        # groups, bias, dilation, padding mode, device, dtype), then sets up
+        # weight quantization parameters from weight_qparams (mapping, may be
+        # None).
         nn.ConvTranspose1d.__init__(
             self,
             in_channels,
@@ -312,6 +391,13 @@ class ConvTranspose1d(_ConvTransposeNd, nn.ConvTranspose1d):
     def forward(
         self, x: torch.Tensor, output_size: list[int] | None = None
     ) -> torch.Tensor:
+        # [FUNCTION DOC] Computes the output padding for the optional
+        # output_size, gets the quantize-dequantized weight and applies float
+        # conv_transpose1d to x; returns the float result. Raises AssertionError
+        # if padding is not a tuple.
+        # KNOWN ISSUE: the output padding computation is passed the builtin name
+        # input rather than the argument x, so the call with a real output_size
+        # (or even without) is likely to fail or use the wrong object.
         """
         we have:
         w(float) -- quant - dequant \
@@ -351,14 +437,23 @@ class ConvTranspose1d(_ConvTransposeNd, nn.ConvTranspose1d):
         return result
 
     def _get_name(self):
+        # [FUNCTION DOC] HELPER: returns the display name
+        # QuantizedConvTranspose1d(Reference).
         return "QuantizedConvTranspose1d(Reference)"
 
     @classmethod
     def from_float(cls, float_conv, weight_qparams):  # type: ignore[override]
+        # [FUNCTION DOC] Classmethod: builds a reference ConvTranspose1d from a
+        # float transposed conv and weight_qparams through the shared base
+        # builder. Returns the new module.
         return _ConvTransposeNd.from_float(cls, float_conv, weight_qparams)
 
 
 class ConvTranspose2d(_ConvTransposeNd, nn.ConvTranspose2d):
+    # [CLASS DOC] Reference quantized 2D transposed convolution: float
+    # ConvTranspose2d plus weight quantization parameters. Activations stay
+    # float; the weight is fake-quantized in forward. Built directly or via
+    # from_float.
     def __init__(
         self,
         in_channels,
@@ -375,6 +470,11 @@ class ConvTranspose2d(_ConvTransposeNd, nn.ConvTranspose2d):
         dtype=None,
         weight_qparams: dict[str, Any] | None = None,
     ):
+        # [FUNCTION DOC] Initializes the float ConvTranspose2d base with the
+        # given arguments (channels, kernel, stride, padding, output padding,
+        # groups, bias, dilation, padding mode, device, dtype), then sets up
+        # weight quantization parameters from weight_qparams (mapping, may be
+        # None).
         nn.ConvTranspose2d.__init__(
             self,
             in_channels,
@@ -396,6 +496,13 @@ class ConvTranspose2d(_ConvTransposeNd, nn.ConvTranspose2d):
     def forward(
         self, x: torch.Tensor, output_size: list[int] | None = None
     ) -> torch.Tensor:
+        # [FUNCTION DOC] Computes the output padding for the optional
+        # output_size, gets the quantize-dequantized weight and applies float
+        # conv_transpose2d to x; returns the float result. Raises AssertionError
+        # if padding is not a tuple.
+        # KNOWN ISSUE: the output padding computation is passed the builtin name
+        # input rather than the argument x, so the call with a real output_size
+        # (or even without) is likely to fail or use the wrong object.
         """
         we have:
         w(float) -- quant - dequant \
@@ -436,14 +543,23 @@ class ConvTranspose2d(_ConvTransposeNd, nn.ConvTranspose2d):
         return result
 
     def _get_name(self):
+        # [FUNCTION DOC] HELPER: returns the display name
+        # QuantizedConvTranspose2d(Reference).
         return "QuantizedConvTranspose2d(Reference)"
 
     @classmethod
     def from_float(cls, float_conv, weight_qparams):  # type: ignore[override]
+        # [FUNCTION DOC] Classmethod: builds a reference ConvTranspose2d from a
+        # float transposed conv and weight_qparams through the shared base
+        # builder. Returns the new module.
         return _ConvTransposeNd.from_float(cls, float_conv, weight_qparams)
 
 
 class ConvTranspose3d(_ConvTransposeNd, nn.ConvTranspose3d):
+    # [CLASS DOC] Reference quantized 3D transposed convolution: float
+    # ConvTranspose3d plus weight quantization parameters. Activations stay
+    # float; the weight is fake-quantized in forward. Built directly or via
+    # from_float.
     def __init__(
         self,
         in_channels,
@@ -460,6 +576,11 @@ class ConvTranspose3d(_ConvTransposeNd, nn.ConvTranspose3d):
         dtype=None,
         weight_qparams: dict[str, Any] | None = None,
     ):
+        # [FUNCTION DOC] Initializes the float ConvTranspose3d base with the
+        # given arguments (channels, kernel, stride, padding, output padding,
+        # groups, bias, dilation, padding mode, device, dtype), then sets up
+        # weight quantization parameters from weight_qparams (mapping, may be
+        # None).
         nn.ConvTranspose3d.__init__(
             self,
             in_channels,
@@ -481,6 +602,13 @@ class ConvTranspose3d(_ConvTransposeNd, nn.ConvTranspose3d):
     def forward(
         self, x: torch.Tensor, output_size: list[int] | None = None
     ) -> torch.Tensor:
+        # [FUNCTION DOC] Computes the output padding for the optional
+        # output_size, gets the quantize-dequantized weight and applies float
+        # conv_transpose3d to x; returns the float result. Raises AssertionError
+        # if padding is not a tuple.
+        # KNOWN ISSUE: the output padding computation is passed the builtin name
+        # input rather than the argument x, so the call with a real output_size
+        # (or even without) is likely to fail or use the wrong object.
         """
         we have:
         w(float) -- quant - dequant \
@@ -520,8 +648,13 @@ class ConvTranspose3d(_ConvTransposeNd, nn.ConvTranspose3d):
         return result
 
     def _get_name(self):
+        # [FUNCTION DOC] HELPER: returns the display name
+        # QuantizedConvTranspose3d(Reference).
         return "QuantizedConvTranspose3d(Reference)"
 
     @classmethod
     def from_float(cls, float_conv, weight_qparams):  # type: ignore[override]
+        # [FUNCTION DOC] Classmethod: builds a reference ConvTranspose3d from a
+        # float transposed conv and weight_qparams through the shared base
+        # builder. Returns the new module.
         return _ConvTransposeNd.from_float(cls, float_conv, weight_qparams)

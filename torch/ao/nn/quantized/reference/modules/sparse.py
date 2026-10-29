@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Reference quantized Embedding and EmbeddingBag modules for FX
+# graph mode quantization. Each keeps a float weight and runs the float
+# functional embedding op on a quantize-dequantize round trip of the weight. No
+# import-time side effects.
 from typing import Any
 
 import torch.nn as nn
@@ -12,6 +16,9 @@ __all__ = ["Embedding", "EmbeddingBag"]
 
 
 class Embedding(nn.Embedding, ReferenceQuantizedModule):
+    # [CLASS DOC] Reference quantized Embedding: subclass of the float Embedding
+    # and ReferenceQuantizedModule. Holds the float weight and weight
+    # quantization parameters; the output is float.
     """A reference quantized Embedding module that fits into the
     FX Graph Mode Quantization workflow, activation will be floating point Tensor,
     we will store floating point weight as well in the module, but in forward we'll
@@ -33,6 +40,10 @@ class Embedding(nn.Embedding, ReferenceQuantizedModule):
         dtype=None,
         weight_qparams: dict[str, Any] | None = None,
     ) -> None:
+        # [FUNCTION DOC] Initializes the float Embedding base with the given
+        # arguments (including optional pre-supplied weight, device, dtype),
+        # then sets up weight quantization parameters from weight_qparams
+        # (mapping, may be None).
         super().__init__(
             num_embeddings,
             embedding_dim,
@@ -49,9 +60,14 @@ class Embedding(nn.Embedding, ReferenceQuantizedModule):
         self._init_weight_qparams(weight_qparams, device)
 
     def _get_name(self):
+        # [FUNCTION DOC] HELPER: returns the display name
+        # QuantizedEmbedding(Reference).
         return "QuantizedEmbedding(Reference)"
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Looks up embeddings for the index tensor using the
+        # quantize-dequantized weight and the module's padding, max norm, norm
+        # type, gradient scaling and sparse settings; returns a float tensor.
         weight_quant_dequant = self.get_weight()
         return F.embedding(
             input,
@@ -65,6 +81,9 @@ class Embedding(nn.Embedding, ReferenceQuantizedModule):
 
     @classmethod
     def from_float(cls, mod, weight_qparams):
+        # [FUNCTION DOC] Builds a reference Embedding from a float Embedding,
+        # reusing its configuration, weight (not copied), device and dtype with
+        # the given weight_qparams. Returns the new module.
         return cls(
             mod.num_embeddings,
             mod.embedding_dim,
@@ -81,6 +100,9 @@ class Embedding(nn.Embedding, ReferenceQuantizedModule):
 
 
 class EmbeddingBag(nn.EmbeddingBag, ReferenceQuantizedModule):
+    # [CLASS DOC] Reference quantized EmbeddingBag: subclass of the float
+    # EmbeddingBag and ReferenceQuantizedModule. Holds the float weight and
+    # weight quantization parameters; the output is float.
     """A reference quantized EmbeddingBag module that fits into the
     FX Graph Mode Quantization workflow, activation will be floating point Tensor,
     we will store floating point weight as well in the module, but in forward we'll
@@ -104,6 +126,10 @@ class EmbeddingBag(nn.EmbeddingBag, ReferenceQuantizedModule):
         dtype=None,
         weight_qparams: dict[str, Any] | None = None,
     ) -> None:
+        # [FUNCTION DOC] Initializes the float EmbeddingBag base with the given
+        # arguments (including mode, last-offset flag, padding index, optional
+        # weight, device, dtype), then sets up weight quantization parameters
+        # from weight_qparams (mapping, may be None).
         super().__init__(
             num_embeddings,
             embedding_dim,
@@ -121,6 +147,9 @@ class EmbeddingBag(nn.EmbeddingBag, ReferenceQuantizedModule):
         self._init_weight_qparams(weight_qparams, device)
 
     def _get_name(self):
+        # [FUNCTION DOC] HELPER: returns the display name
+        # QuantizedEmbedding(Reference) (same name as the Embedding reference
+        # module).
         return "QuantizedEmbedding(Reference)"
 
     def forward(
@@ -129,6 +158,10 @@ class EmbeddingBag(nn.EmbeddingBag, ReferenceQuantizedModule):
         offsets: Tensor | None = None,
         per_sample_weights: Tensor | None = None,
     ) -> Tensor:
+        # [FUNCTION DOC] Computes bagged embeddings of input (with optional
+        # offsets and per-sample weights) using the quantize-dequantized weight
+        # and the module's mode, norm and padding settings; returns a float
+        # tensor.
         weight_quant_dequant = self.get_weight()
         return F.embedding_bag(
             input,
@@ -146,6 +179,10 @@ class EmbeddingBag(nn.EmbeddingBag, ReferenceQuantizedModule):
 
     @classmethod
     def from_float(cls, mod, weight_qparams, use_precomputed_fake_quant=False):
+        # [FUNCTION DOC] Builds a reference EmbeddingBag from a float
+        # EmbeddingBag, reusing its configuration, weight (not copied), device
+        # and dtype with the given weight_qparams. use_precomputed_fake_quant is
+        # unused. Returns the new module.
         return cls(
             mod.num_embeddings,
             mod.embedding_dim,
