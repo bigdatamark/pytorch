@@ -879,19 +879,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         epilogue_output2: cute.Tensor,
         local_reduce_tensor: cute.Tensor,
     ):
-        # [FUNCTION DOC] GPU device kernel with warp specialization and a persistent tile loop.
-        # Setup: prefetch TMA descriptors, init AB / accumulator pipelines and the TMEM allocator,
-        # carve shared memory tensors, build multicast masks and partition global/shared/TMEM
-        # tensors. Roles: TMA warp loads A/B/SFA/SFB tiles per k-tile (optional prefetch ahead);
-        # MMA warp (leader CTA) copies scale factors smem->TMEM and issues block-scaled MMAs per
-        # k-block into the accumulator stage; epilogue warps allocate TMEM, read the accumulator in
-        # subtiles, apply alpha, epilogue_op with optional extra input tensors, write extra outputs,
-        # optionally compute grouped local reductions (along N in registers, or along M via warp
-        # shuffles and shared memory), convert to C type, stage through smem and TMA-store to C.
-        # Frees TMEM at the end. Writes C and optional outputs / reduce tensor in global memory.
-        # Out-of-range elements for extra tensors/outputs are guarded by bounds checks.
-        # KNOWN ISSUE: the local_reduce source asserts use plain assert (stripped under -O).
- performing the Persistent batched GEMM computation.
+        """
+        GPU device kernel performing the Persistent batched GEMM computation.
         """
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
