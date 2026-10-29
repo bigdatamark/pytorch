@@ -1,5 +1,15 @@
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC]
+# Tests the interaction of FSDP2 (fully_shard) with the optional spmd_types package, which
+# annotates tensors with per-mesh-axis SPMD types (Replicate, Invariant, Varying, Partial,
+# Shard). Checks that FSDP, given a storage mesh and explicit data-parallel mesh dims,
+# restores the user's compute-time parameter annotations, shards with the right DTensor
+# placements, issues the expected collectives in backward, and raises ValueError with
+# specific messages for ambiguous or incomplete annotations. Uses a fake process group with
+# 16 ranks on CPU; the test class is skipped when spmd_types is unavailable. Import time
+# imports spmd_types only if available and defines two small helper modules.
+
 import unittest
 
 import torch
@@ -25,7 +35,12 @@ if dist._is_spmd_types_available():
 
 
 class SpmdLinear(nn.Module):
+    # [CLASS DOC] HELPER: Toy module with an unsharded and a tensor-parallel-sharded 16x16
+    # weight that simulates TP collectives with spmd redistribute calls. Records the SPMD
+    # types of both weights as seen during forward in compute_param_types (None before).
     def __init__(self, mesh, seq_parallel: bool):
+        # [FUNCTION DOC] HELPER: Stores the mesh, its tp process group and the sequence parallel
+        # flag, and creates two random 16x16 weights and the empty compute_param_types.
         super().__init__()
         self.mesh = mesh
         self.tp_pg = mesh.get_group("tp")
@@ -35,6 +50,11 @@ class SpmdLinear(nn.Module):
         self.compute_param_types = None
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Records the local SPMD types of both weights, multiplies the
+        # input by the unsharded weight, redistributes over tp (from sharded on dim 1 with
+        # sequence parallel, else invariant, to replicate; float32 backward), multiplies by the
+        # transposed sharded weight, redistributes from sharded on dim 2 to invariant and
+        # returns the sum as a scalar loss.
         """Simulate the TP collectives around a sharded projection.
 
         The global computation is x = x @ A; x = x @ B; return x.sum().
@@ -65,13 +85,18 @@ class SpmdLinear(nn.Module):
 
 
 class DenseSparseParams(nn.Module):
+    # [CLASS DOC] HELPER: Toy module with a dense and a sparse (expert-style) 16x16 weight,
+    # recording the SPMD types of both as seen in forward in compute_param_types.
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Creates the two random weights and empty compute_param_types.
         super().__init__()
         self.dense_weight = nn.Parameter(torch.randn(16, 16))
         self.sparse_weight = nn.Parameter(torch.randn(16, 16))
         self.compute_param_types = None
 
     def forward(self):
+        # [FUNCTION DOC] HELPER: Records the local SPMD types of both weights and returns the
+        # sum of each as a pair of scalars.
         self.compute_param_types = (
             dict(spmd.get_local_type(self.dense_weight)),
             dict(spmd.get_local_type(self.sparse_weight)),
@@ -81,8 +106,16 @@ class DenseSparseParams(nn.Module):
 
 @unittest.skipUnless(dist._is_spmd_types_available(), "requires spmd_types")
 class TestFullyShardSpmdTypes(TestCase):
+    # [CLASS DOC]
+    # Single-process test case run on a fake 16-rank group. setUpClass builds a dense type
+    # mesh (dp, cp, tp), a dense storage mesh (dp_replicate, dp_shard, cp, tp) and a sparse
+    # mesh (dp_replicate, efsdp, ep) on CPU plus the corresponding spmd mesh axis objects as
+    # class attributes. Tests exercise annotation restoration and annotation validation errors.
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] HELPER: Destroys any existing process group, initializes a fake
+        # backend group (rank 0 of 16), builds the three CPU device meshes, and stores spmd
+        # MeshAxis objects for the dp, cp, tp, dp_replicate, efsdp and ep groups on the class.
         super().setUpClass()
         if dist.is_initialized():
             dist.destroy_process_group()
@@ -111,11 +144,19 @@ class TestFullyShardSpmdTypes(TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] HELPER: Destroys the fake process group if initialized, then defers to
+        # the parent teardown.
         if dist.is_initialized():
             dist.destroy_process_group()
         super().tearDownClass()
 
     def test_restores_param_spmd_type_for_compute(self):
+        # [FUNCTION DOC] For both values of sequence parallel, annotates the weights, shards the
+        # module over the storage mesh with a bf16 mixed precision policy, and checks the
+        # sharded weight placements (replicate, strided shard, shard). Runs a strictly
+        # typechecked forward and asserts the loss is partial over dp and cp, that the
+        # annotations seen in compute are restored (replicate, with tp invariant or varying),
+        # and the backward counts: 2 or 1 reduce-scatters and 2 all-reduces.
         """FSDP restores user SPMD metadata on params for compute.
 
         FSDP should preserve the compute-mesh annotations when applied with
@@ -233,6 +274,8 @@ class TestFullyShardSpmdTypes(TestCase):
                 )
 
     def test_full_param_annotations_do_not_require_init_compute_mesh(self):
+        # [FUNCTION DOC] Fully annotates the weights on all type mesh axes, shards without
+        # setting a current mesh, then runs a typechecked forward and checks the loss type.
         """Full per-axis annotations are enough without an init compute mesh."""
         model = SpmdLinear(self.dense_type_mesh, seq_parallel=False)
 
@@ -274,6 +317,9 @@ class TestFullyShardSpmdTypes(TestCase):
             )
 
     def test_local_v_param_requires_partition_spec(self):
+        # [FUNCTION DOC] Annotates the sharded weight as plain varying on tp (no dim info)
+        # and asserts fully_shard raises ValueError saying a plain Varying cannot be converted
+        # to a DTensor placement.
         """Local-only V@TP params are ambiguous for FSDP.
 
         Without PartitionSpec shard info, FSDP cannot choose the matching
@@ -308,6 +354,9 @@ class TestFullyShardSpmdTypes(TestCase):
         )
 
     def test_partial_param_annotations_infer_fsdp_axes_at_init(self):
+        # [FUNCTION DOC] Annotates only tp axis on the weights, shards under a current mesh so
+        # the dp/cp axes are inferred as replicate, then checks a typechecked forward yields
+        # the expected loss type.
         """Use init-time current_mesh to infer omitted FSDP axes as R.
 
         Params annotate only TP; FSDP fills DP/CP axes during fully_shard().
@@ -349,6 +398,11 @@ class TestFullyShardSpmdTypes(TestCase):
             )
 
     def test_mixed_dense_sparse_params_use_per_param_restore_meshes(self):
+        # [FUNCTION DOC] Annotates a dense weight on the dense type mesh and a sparse weight on
+        # the sparse mesh, shards both in one call with a placement function that picks the
+        # sparse or dense mesh info per parameter, runs a typechecked forward, and asserts the
+        # compute-time types of each parameter are restored on its own mesh axes (varying on tp
+        # and ep respectively).
         """
         Test restoring per-param dense and sparse type meshes.
 
@@ -388,6 +442,8 @@ class TestFullyShardSpmdTypes(TestCase):
         sparse_param = model.sparse_weight
 
         def shard_placement_fn(param):
+            # [FUNCTION DOC] HELPER: Returns a Shard on dim 0 with sparse mesh info for the
+            # sparse weight and dense mesh info for any other parameter.
             if param is sparse_param:
                 return ShardPlacementResult(
                     placement=Shard(0),
@@ -422,6 +478,9 @@ class TestFullyShardSpmdTypes(TestCase):
         )
 
     def test_spmd_params_require_dp_mesh_dims(self):
+        # [FUNCTION DOC] Calling fully_shard with only a mesh (no dp_mesh_dims) on a module with
+        # spmd_types annotated params must raise ValueError with the message requiring a named
+        # full mesh plus data parallel mesh dims.
         """Require explicit DP mesh axes before FSDP handles spmd_types params."""
         model = SpmdLinear(self.dense_type_mesh, seq_parallel=False)
 
@@ -446,6 +505,9 @@ class TestFullyShardSpmdTypes(TestCase):
         )
 
     def test_fully_annotated_sparse_param_requires_sparse_storage_mesh(self):
+        # [FUNCTION DOC] A weight annotated on sparse mesh axes (including ep) but sharded on
+        # the dense storage mesh must raise ValueError naming the axis that is neither a
+        # non-FSDP storage axis nor in the DP mesh.
         """Fully-annotated sparse param + dense FSDP mesh errors out."""
         model = nn.Linear(16, 16, bias=False)
         spmd.assert_type(
@@ -474,6 +536,9 @@ class TestFullyShardSpmdTypes(TestCase):
         )
 
     def test_spmd_restore_mesh_must_contain_annotated_axes(self):
+        # [FUNCTION DOC] Partial tp annotation while the current mesh is the sparse mesh (no tp
+        # axis) must raise ValueError whose message says the parameter is annotated on axes
+        # and to annotate only axes in the compute mesh.
         """Partial TP annotations w/ sparse current_mesh context fail."""
         model = SpmdLinear(self.dense_type_mesh, seq_parallel=False)
         spmd.assert_type(model.unsharded_weight, {self.tp_axis: spmd.I})
@@ -497,6 +562,8 @@ class TestFullyShardSpmdTypes(TestCase):
         self.assertIn("Annotate only axes in the compute mesh", str(cm.exception))
 
     def test_partial_non_storage_annotations_require_current_mesh(self):
+        # [FUNCTION DOC] A partial annotation only on the ep axis (not in the storage mesh)
+        # with no current mesh must raise ValueError listing annotated axes and storage axes.
         """Partial non-storage annotations need a shared current mesh."""
         model = nn.Linear(16, 16, bias=False)
         spmd.assert_type(model.weight, {self.ep_axis: spmd.S(0)})
@@ -523,6 +590,9 @@ class TestFullyShardSpmdTypes(TestCase):
         )
 
     def test_partial_param_annotations_missing_non_fsdp_axis_errors(self):
+        # [FUNCTION DOC] One weight is annotated only on dp and cp, missing the tp axis that FSDP
+        # does not manage; fully_shard must raise ValueError listing the annotated axes, storage
+        # axes, the DP mesh dims and the missing non-FSDP storage axes.
         """Require annotations for storage axes that FSDP does not manage."""
         model = SpmdLinear(self.dense_type_mesh, seq_parallel=False)
 
@@ -557,6 +627,8 @@ class TestFullyShardSpmdTypes(TestCase):
         )
 
     def test_fsdp_dp_axes_must_be_r(self):
+        # [FUNCTION DOC] Annotating a weight as invariant on the FSDP managed dp axis must raise
+        # ValueError saying FSDP requires replicate there since it handles gradient reduction.
         """FSDP-managed DP axes must be Replicate in spmd_types annotations."""
         model = SpmdLinear(self.dense_type_mesh, seq_parallel=False)
 

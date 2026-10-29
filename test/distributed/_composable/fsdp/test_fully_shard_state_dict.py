@@ -1,5 +1,13 @@
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC]
+# Tests that FSDP2 (fully_shard) modules produce and consume sharded state dicts made of
+# DTensors. Covers save/load round trips for FSDP, HSDP, FSDP+TP and HSDP+TP meshes, state
+# dict caching and aliasing of parameter storage, CPU offload with meta-device models,
+# 2D parity against an unsharded model, and gathering a full CPU state dict on rank 0.
+# Multi-process tests need at least 2 GPUs (some 4). At import time it only defines tests
+# and a module-level device_type taken from the available accelerator.
+
 import copy
 import functools
 from contextlib import nullcontext
@@ -33,12 +41,21 @@ device_type = torch.device(get_devtype())
 
 
 class TestFullyShardStateDictMultiProcess(FSDPTest):
+    # [CLASS DOC]
+    # Multi-process test case (up to 8 ranks, one per accelerator) checking FSDP2 state
+    # dicts under several device mesh layouts. Public tests build meshes and drive subtest
+    # sweeps; underscore helpers hold the per-configuration logic.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Property giving the rank count: the accelerator count capped at 8.
         return min(8, torch.get_device_module(device_type).device_count())
 
     @skip_if_lt_x_gpu(2)
     def test_dp_state_dict_save_load(self):
+        # [FUNCTION DOC] Runs the save/load round trip over a 1D FSDP mesh with several small
+        # MLP widths, then (if 16 divides evenly by world size) with a custom per-parameter
+        # shard placement on the largest dim. If world size is even, repeats on a 2D HSDP mesh
+        # (dp_replicate x dp_shard). Needs at least 2 GPUs.
         fsdp_mesh = init_device_mesh(device_type.type, (self.world_size,))
         self.run_subtests(
             {"mlp_dim": [2, 3, 4, 5], "mesh": [fsdp_mesh]},
@@ -74,6 +91,11 @@ class TestFullyShardStateDictMultiProcess(FSDPTest):
     def _test_dp_state_dict_save_load(
         self, mlp_dim: int, mesh: DeviceMesh, use_shard_placement_fn: bool = False
     ):
+        # [FUNCTION DOC] HELPER: Builds a three-part nested MLP/Linear model, shards it with
+        # fully_shard on the given mesh (optionally with a shard placement function choosing the
+        # largest dim), and checks save/load with reshard_after_forward true. Then with it
+        # false checks again, and verifies that after a forward (params left unsharded) a
+        # new state_dict call has the same keys and values, i.e. hooks reshard first.
         torch.manual_seed(42)
         base_model = nn.Sequential(
             MLP(mlp_dim),
@@ -82,6 +104,8 @@ class TestFullyShardStateDictMultiProcess(FSDPTest):
         )
 
         def _shard_placement_fn(param: nn.Parameter) -> Shard | None:
+            # [FUNCTION DOC] HELPER: Returns a Shard placement on the dimension of the
+            # parameter with the largest size (first one wins on ties).
             largest_dim = largest_dim_size = -1
             for dim, dim_size in enumerate(param.shape):
                 if dim_size > largest_dim_size:
@@ -118,12 +142,19 @@ class TestFullyShardStateDictMultiProcess(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_cached_state_dict(self):
+        # [FUNCTION DOC] Sweeps MLP widths and whether the model is moved between devices after
+        # taking the state dict, delegating to the cached state dict check. Needs 2 GPUs.
         self.run_subtests(
             {"mlp_dim": [2, 3, 4, 5], "mutate_after_state_dict": [True, False]},
             self._test_cached_state_dict,
         )
 
     def _test_cached_state_dict(self, mlp_dim: int, mutate_after_state_dict: bool):
+        # [FUNCTION DOC] HELPER: Shards a bias-free Linear, takes the state dict once, and
+        # checks the weight's local storage pointer. Without mutation, the state dict entry
+        # shares storage with the parameter and keeps doing so over five AdamW training steps.
+        # With a CPU round trip of the model, the old state dict no longer aliases the weight.
+        # Raises AssertionError if the weight is not a DTensor.
         torch.manual_seed(42)
         model = nn.Linear(mlp_dim, mlp_dim, bias=False)
         fully_shard(model, reshard_after_forward=True)
@@ -162,6 +193,8 @@ class TestFullyShardStateDictMultiProcess(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_dp_state_dict_cpu_offload(self):
+        # [FUNCTION DOC] Sweeps pinned/unpinned CPUOffloadPolicy and whether the loaded state
+        # dict lives on CPU or device. Needs 2 GPUs.
         self.run_subtests(
             {
                 "offload_policy": [
@@ -176,6 +209,12 @@ class TestFullyShardStateDictMultiProcess(FSDPTest):
     def _test_dp_state_dict_cpu_offload(
         self, offload_policy: CPUOffloadPolicy, cpu_state_dict: bool
     ):
+        # [FUNCTION DOC] HELPER: Builds a meta-device two-layer model sharded with CPU
+        # offload, creates one single-entry random DTensor state dict per parameter (moved to CPU
+        # if requested), and loads each with assign and non-strict mode. Then runs a forward.
+        # With device-resident state dicts the forward must raise RuntimeError listing
+        # parameters on a non-CPU device; with CPU ones the forward succeeds and every
+        # returned state dict entry is on CPU.
         mlp_dim = 4
         torch.manual_seed(42)
         with torch.device("meta"):
@@ -222,6 +261,9 @@ class TestFullyShardStateDictMultiProcess(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_2d_state_dict_correctness(self):
+        # [FUNCTION DOC] Applies tensor parallel (column/row wise) over the tp dim and FSDP over
+        # the dp dim (size 2) of a 2D mesh to a three-MLP model, then checks each state dict
+        # entry is a DTensor whose full tensor equals the unsharded model's value. Needs 2 GPUs.
         dp_size = 2
         global_mesh = init_device_mesh(
             device_type.type,
@@ -264,6 +306,8 @@ class TestFullyShardStateDictMultiProcess(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_dp_tp_state_dict_save_load(self):
+        # [FUNCTION DOC] Builds a 2D mesh (dp size 2 by tp) and sweeps MLP widths through the
+        # FSDP+TP save/load helper. Needs 2 GPUs.
         dp_size = 2
         global_mesh = init_device_mesh(
             device_type.type,
@@ -276,6 +320,8 @@ class TestFullyShardStateDictMultiProcess(FSDPTest):
         )
 
     def _test_dp_tp_state_dict_save_load(self, global_mesh: DeviceMesh, mlp_dim: int):
+        # [FUNCTION DOC] HELPER: Applies tensor parallelism on the tp submesh then fully_shard
+        # on the dp submesh to a three-MLP model and runs the generic save/load check.
         dp_mesh, tp_mesh = global_mesh["dp"], global_mesh["tp"]
         torch.manual_seed(42)
         model = nn.Sequential(*[MLP(mlp_dim) for _ in range(3)])
@@ -298,6 +344,8 @@ class TestFullyShardStateDictMultiProcess(FSDPTest):
 
     @skip_if_lt_x_gpu(4)
     def test_hsdp_tp_state_dict_save_load(self):
+        # [FUNCTION DOC] Builds a 3D mesh (dp_replicate 2, dp_shard 2, tp) and sweeps MLP widths
+        # through the HSDP+TP save/load helper. Needs 4 GPUs.
         global_mesh = init_device_mesh(
             device_type.type,
             (2, 2, self.world_size // 4),
@@ -309,6 +357,9 @@ class TestFullyShardStateDictMultiProcess(FSDPTest):
         )
 
     def _test_hsdp_tp_state_dict_save_load(self, global_mesh: DeviceMesh, mlp_dim: int):
+        # [FUNCTION DOC] HELPER: Like the FSDP+TP helper but shards over the two-dim HSDP
+        # submesh (dp_replicate, dp_shard) and applies tensor parallelism on tp, then runs the
+        # generic save/load check.
         dp_mesh, tp_mesh = global_mesh["dp_replicate", "dp_shard"], global_mesh["tp"]
         torch.manual_seed(42)
         model = nn.Sequential(*[MLP(mlp_dim) for _ in range(3)])
@@ -330,6 +381,12 @@ class TestFullyShardStateDictMultiProcess(FSDPTest):
         self._test_state_dict_save_load(model)
 
     def _test_state_dict_save_load(self, model: nn.Module):
+        # [FUNCTION DOC] HELPER: Core check on a sharded model. Asserts all parameters are
+        # DTensors, fills them with 1, records local data pointers, takes the state dict and
+        # verifies param sizes and types are unchanged, keys match, values are DTensors sharing
+        # the parameter storage (zero pointer only allowed as padding on nonzero ranks). Then
+        # loads cloned DTensors filled with a rank dependent value and verifies the parameters
+        # updated, keeping the same data pointer when sharding was even (no padding).
         for param_name, param in model.named_parameters():
             self.assertIsInstance(
                 param,
@@ -395,12 +452,21 @@ class TestFullyShardStateDictMultiProcess(FSDPTest):
 
 
 class TestFullyShardStateDictMultiThread(FSDPTestMultiThread):
+    # [CLASS DOC]
+    # Two-rank thread-simulated test case for gathering a sharded state dict into a full
+    # state dict on rank 0 only.
     @property
     def world_size(self):
+        # [FUNCTION DOC] HELPER: Property returning two ranks for the multithread harness.
         return 2
 
     @skip_if_lt_x_gpu(1)
     def test_rank0_offload_full_state_dict(self):
+        # [FUNCTION DOC] Builds a reference Transformer (parameters broadcast from rank 0) and a
+        # deep copy sharded per TransformerBlock and root. Gathers each sharded state dict entry
+        # to a full tensor on every rank, keeping a CPU copy only on rank 0. On rank 0 asserts
+        # keys, order, CPU device and values equal the reference; other ranks hold nothing.
+        # Needs at least 1 GPU.
         # Construct a reference unsharded model on all ranks
         model_args = ModelArgs(dropout_p=0.0)
         torch.manual_seed(42)

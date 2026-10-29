@@ -1,5 +1,14 @@
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC]
+# Tests that FSDP2 (fully_shard) overlaps communication (all-gather, reduce-scatter) with
+# computation on separate streams. Compute is emulated with device sleeps inside a custom
+# autograd matmul (LinearWithSleep), and communication delays are injected by patching the
+# collective entry points. Tests compare timings against non-overlapped reference runs,
+# cover a dedicated reduce-scatter process group, the post-optimizer event, and per-parameter
+# mesh sharding with expert parallelism versus a replicate baseline. Import time defines
+# device_type and device_module from the available accelerator; most tests need 2-4 GPUs.
+
 import contextlib
 import copy
 import functools
@@ -43,6 +52,9 @@ device_module = torch.get_device_module(device_type)
 
 
 def _time_fn(fn: Callable):
+    # [FUNCTION DOC] HELPER: Times a zero-argument callable on the device. Barriers across
+    # ranks and synchronizes, records start/end events around the call, synchronizes again,
+    # and returns elapsed milliseconds as a float. Requires an initialized process group.
     start_event = device_module.Event(enable_timing=True)
     end_event = device_module.Event(enable_timing=True)
     dist.barrier()
@@ -55,6 +67,11 @@ def _time_fn(fn: Callable):
 
 
 class TestFullyShardOverlap(FSDPTest):
+    # [CLASS DOC]
+    # Multi-process test case (up to 2 ranks) that sanity checks stream overlap of FSDP2
+    # collectives with compute using sleeps or real large matmuls, and the API for giving
+    # reduce-scatter its own process group. See the NOTE docstring on why timing checks
+    # are only relative to non-overlapped baselines.
     """
     NOTE: Testing stream overlap in PyTorch CI is tricky.
 
@@ -71,6 +88,7 @@ class TestFullyShardOverlap(FSDPTest):
 
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Property giving the rank count: accelerator count capped at 2.
         return min(2, torch.get_device_module(device_type).device_count())
 
     @skip_if_rocm_arch_multiprocess(MI200_ARCH)
@@ -80,6 +98,12 @@ class TestFullyShardOverlap(FSDPTest):
         "Sleep is not supported on this device",
     )
     def test_fully_shard_training_overlap(self):
+        # [FUNCTION DOC] Shards three sleeping linears (one weight each) and times forward and
+        # forward-backward with collectives delayed by a sleep on a shared communication
+        # stream. Each is compared with a reference model that serially issues dummy
+        # all-gathers/reduce-scatters per weight; the FSDP times must be no larger than the
+        # reference times (exact expected times are deliberately not asserted, flaky in CI).
+        # Skipped on MI200, with fewer than 2 GPUs, or when the device has no sleep support.
         torch.manual_seed(42)
 
         # Use non-trivial comm. time but still shorter than compute time
@@ -99,6 +123,8 @@ class TestFullyShardOverlap(FSDPTest):
         comm_stream = torch.get_device_module(device_type).Stream()
 
         def delay_collective():
+            # [FUNCTION DOC] HELPER: Makes the shared comm stream wait for the current stream,
+            # sleeps for the emulated comm time on it, then makes the current stream wait on it.
             # Share a stream so that all-gather and reduce-scatter block each
             # other like in `ProcessGroupNCCL`
             comm_stream.wait_stream(
@@ -113,10 +139,14 @@ class TestFullyShardOverlap(FSDPTest):
             )
 
         def delayed_all_gather(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Injects the emulated delay, then calls the original
+            # single-tensor all-gather with the same arguments and returns its result.
             delay_collective()
             return orig_all_gather_into_tensor(*args, **kwargs)
 
         def delayed_reduce_scatter(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Injects the emulated delay, then calls the original
+            # single-tensor reduce-scatter with the same arguments and returns its result.
             delay_collective()
             return orig_reduce_scatter_tensor(*args, **kwargs)
 
@@ -125,6 +155,8 @@ class TestFullyShardOverlap(FSDPTest):
         loss.backward()
 
         def ref_fwd():
+            # [FUNCTION DOC] HELPER: Reference forward: with delayed all-gather patched in, runs a
+            # dummy all-gather per linear weight, then the unsharded reference model's forward.
             with patch_all_gather(delayed_all_gather):
                 # Run dummy all-gathers per weight (which is one FSDP group)
                 for lin in ref_model:
@@ -136,6 +168,7 @@ class TestFullyShardOverlap(FSDPTest):
                 return ref_model(inp)
 
         def fwd():
+            # [FUNCTION DOC] HELPER: FSDP forward of the sharded model with delayed all-gather.
             with patch_all_gather(delayed_all_gather):
                 model(inp)
 
@@ -147,6 +180,9 @@ class TestFullyShardOverlap(FSDPTest):
         self.assertLessEqual(fwd_time, ref_fwd_time)
 
         def ref_fwd_bwd():
+            # [FUNCTION DOC] HELPER: Reference forward-backward: dummy all-gathers per weight
+            # before forward and again before backward (resharding), the real backward, then dummy
+            # reduce-scatters per weight, with delayed collectives patched in for all-gather.
             with patch_all_gather(delayed_all_gather):
                 # Run dummy all-gathers per weight (which is one FSDP group)
                 for lin in ref_model:
@@ -174,6 +210,8 @@ class TestFullyShardOverlap(FSDPTest):
                     dist.reduce_scatter_single(dummy_rs_output, dummy_rs_input)
 
         def fwd_bwd():
+            # [FUNCTION DOC] HELPER: FSDP forward and backward with both all-gather and
+            # reduce-scatter patched to be delayed.
             with (
                 patch_all_gather(delayed_all_gather),
                 patch_reduce_scatter(delayed_reduce_scatter),
@@ -195,6 +233,11 @@ class TestFullyShardOverlap(FSDPTest):
     @skip_if_rocm_arch_multiprocess(MI200_ARCH)
     @skip_if_lt_x_gpu(2)
     def test_fully_shard_backward_comm_overlap(self):
+        # [FUNCTION DOC] Uses large real linears (real matmuls, large collectives) with
+        # reduce-scatter opted in to its own process group. Checks each FSDP param group has a
+        # dedicated reduce-scatter group distinct from the shard group. Times a train step with
+        # reduce-scatter forced back onto the shard group, then restores and times it with the
+        # separate group. Timing is not asserted. Needs 2 GPUs; skipped on MI200.
         """Exercise backward with reduce-scatter sharing the shard process
         group and with reduce-scatter opted in to a dedicated process group via
         set_separate_reduce_scatter_group.
@@ -251,6 +294,8 @@ class TestFullyShardOverlap(FSDPTest):
             pg.mesh_info.reduce_scatter_process_group = pg.mesh_info.shard_process_group
 
         def ref_bwd():
+            # [FUNCTION DOC] HELPER: One train step (forward, backward, SGD step under implicit
+            # replication, zero grads) used as the shared-process-group baseline.
             loss = model(inp).sum()
             loss.backward()
             with implicit_replication():
@@ -264,6 +309,8 @@ class TestFullyShardOverlap(FSDPTest):
             pg.mesh_info.reduce_scatter_process_group = saved_pg
 
         def fsdp_bwd():
+            # [FUNCTION DOC] HELPER: Same train step as the baseline, run with the separate
+            # reduce-scatter group restored.
             loss = model(inp).sum()
             loss.backward()
             with implicit_replication():
@@ -277,6 +324,11 @@ class TestFullyShardOverlap(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_set_separate_reduce_scatter_group(self):
+        # [FUNCTION DOC] Checks the process group bookkeeping of set_separate_reduce_scatter_group
+        # on a two-linear sharded model: by default reduce-scatter reuses the shard group and no
+        # dedicated group is recorded; after enabling, all param groups share exactly one
+        # dedicated group that differs from the shard group; after disabling with false, the
+        # shared setup is restored. Needs 2 GPUs.
         """Reduce-scatter shares the shard PG by default; enabling gives it a
         dedicated PG (one communicator shared across same-rank-set meshes), and
         disabling resets to the shared PG."""
@@ -291,6 +343,8 @@ class TestFullyShardOverlap(FSDPTest):
                 param_groups.extend(state._fsdp_param_groups)
 
         def _assert_shares_all_gather():
+            # [FUNCTION DOC] HELPER: Asserts that every param group has no dedicated reduce-scatter
+            # group in its mesh info and uses the shard process group for reduce-scatter.
             for pg in param_groups:
                 self.assertIsNone(pg.mesh_info.reduce_scatter_process_group)
                 self.assertIs(
@@ -327,6 +381,13 @@ class TestFullyShardOverlap(FSDPTest):
         "Sleep is not supported on this device",
     )
     def test_fully_shard_post_optim_event_overlap(self):
+        # [FUNCTION DOC] Builds a high-compute sleeping linear followed by a plain linear that
+        # alone is sharded without resharding. Trains with delayed all-gather and compares a
+        # baseline (FSDP waits for the whole current stream) against recording a post-optimizer
+        # event and setting it on the FSDP module so the all-gather overlaps the earlier
+        # compute. Asserts the baseline is within its bound, the test run within its expected
+        # time, and baseline slower than test. Skipped on Linux (issue 131081) and without
+        # sleep support; needs 2 GPUs.
         torch.manual_seed(42)
 
         # Use non-trivial comm. time but still shorter than compute time
@@ -342,6 +403,8 @@ class TestFullyShardOverlap(FSDPTest):
         orig_all_gather_into_tensor = dist.all_gather_single
 
         def delayed_all_gather(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Sleeps the emulated comm time on the current stream, then
+            # calls the original single-tensor all-gather and returns its result.
             torch.get_device_module(device_type)._sleep(
                 int(comm_sleep_ms * get_cycles_per_ms())
             )
@@ -350,6 +413,9 @@ class TestFullyShardOverlap(FSDPTest):
         inp = torch.randn((2, dim), device=device_type)
 
         def run_train_steps(num_iters: int, use_post_optim_event: bool):
+            # [FUNCTION DOC] HELPER: Runs the given number of train steps (forward under delayed
+            # all-gather, backward, optimizer step). If requested, records an event on the current
+            # stream after each step and sets it as the post-optimizer event of the FSDP module.
             for _ in range(num_iters):
                 optim.zero_grad()
                 with patch_all_gather(delayed_all_gather):
@@ -392,9 +458,13 @@ class TestFullyShardOverlap(FSDPTest):
 
 
 class Matmul(torch.autograd.Function):
+    # [CLASS DOC] HELPER: Autograd function for a matmul whose compute time is emulated by a
+    # device sleep: forward sleeps for the given ms, backward for twice that.
     # Use CUDA sleeps to emulate compute time
     @staticmethod
     def forward(ctx, input: torch.Tensor, weight: torch.Tensor, sleep_ms: int):
+        # [FUNCTION DOC] HELPER: Saves input and weight and the sleep duration on ctx, sleeps
+        # sleep_ms milliseconds worth of device cycles, and returns the matrix product.
         ctx.save_for_backward(input, weight)
         ctx.sleep_ms = sleep_ms
         torch.get_device_module(device_type)._sleep(int(sleep_ms * get_cycles_per_ms()))
@@ -402,6 +472,8 @@ class Matmul(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
+        # [FUNCTION DOC] HELPER: Sleeps twice the saved duration, then returns gradients for
+        # input and weight (None for the sleep argument).
         (input, weight) = ctx.saved_tensors
         torch.get_device_module(device_type)._sleep(
             int(2 * ctx.sleep_ms * get_cycles_per_ms())
@@ -412,23 +484,38 @@ class Matmul(torch.autograd.Function):
 
 
 class LinearWithSleep(nn.Module):
+    # [CLASS DOC] HELPER: Bias-free square linear layer with one random weight parameter whose
+    # matmul sleeps for sleep_ms to emulate compute, followed by relu.
     def __init__(self, dim: int, sleep_ms: int):
+        # [FUNCTION DOC] HELPER: Creates a dim by dim random weight parameter and stores sleep_ms.
         super().__init__()
         self.weight = nn.Parameter(torch.randn((dim, dim)))
         self.sleep_ms = sleep_ms
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Applies the sleeping matmul with the weight and then relu.
         return nn.functional.relu(Matmul.apply(x, self.weight, self.sleep_ms))
 
 
 class TestFullyShardPerParamMeshOverlap(FSDPTest):
+    # [CLASS DOC]
+    # Multi-process test case (up to 4 ranks) for per-parameter mesh FSDP with expert
+    # parallelism, checking that reduce-scatter state is kept per param group so the dp and
+    # expert-FSDP reduce-scatters do not serialize, compared against a replicate baseline.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Property giving the rank count: accelerator count capped at 4.
         return min(4, torch.get_device_module(device_type).device_count())
 
     @staticmethod
     @contextlib.contextmanager
     def _delayed_foreach_reduce(sleep_ms: int):
+        # [FUNCTION DOC] HELPER: Context manager (static) that temporarily replaces the
+        # foreach_reduce function of the FSDP param group module with a wrapper. The wrapper
+        # calls the original, then makes a per-process-group delay stream wait for the returned
+        # reduce event, sleeps sleep_ms there, and returns a new event recorded after the sleep
+        # in place of the original. Barriers before patching and in the cleanup, which always
+        # restores the original function. Delays on different groups can run concurrently.
         """Inject a CUDA sleep after each reduce-scatter / all-reduce.
 
         Each process group gets its own delay stream so that delays for
@@ -459,6 +546,9 @@ class TestFullyShardPerParamMeshOverlap(FSDPTest):
             *args,
             **kwargs,
         ):
+            # [FUNCTION DOC] HELPER: Calls the original foreach_reduce, then substitutes its
+            # returned event (second result element) with a delayed one on the stream for the
+            # given reduce-scatter group; other result elements are passed through unchanged.
             result = orig(
                 fsdp_params,
                 unsharded_grads,
@@ -492,6 +582,7 @@ class TestFullyShardPerParamMeshOverlap(FSDPTest):
         "Sleep is not supported on this device",
     )
     def test_fully_shard_per_param_mesh_training_overlap(self):
+        # [FUNCTION DOC] Runs the per-param-mesh overlap check with normal inputs. Needs 4 GPUs.
         self._test_per_param_mesh_overlap(simulate_no_grad_input=False)
 
     @skip_if_rocm_arch_multiprocess(MI200_ARCH)
@@ -501,9 +592,18 @@ class TestFullyShardPerParamMeshOverlap(FSDPTest):
         "Sleep is not supported on this device",
     )
     def test_fully_shard_per_param_mesh_no_grad_input_overlap(self):
+        # [FUNCTION DOC] Runs the per-param-mesh overlap check with detached block inputs. Needs
+        # 4 GPUs.
         self._test_per_param_mesh_overlap(simulate_no_grad_input=True)
 
     def _test_per_param_mesh_overlap(self, simulate_no_grad_input: bool):
+        # [FUNCTION DOC] HELPER: Builds dp and sparse (expert-FSDP by expert-parallel) meshes
+        # and a 20-layer MoE Transformer. Measures a forward-backward of a replicate+EP model
+        # and of an FSDP+EP model (experts sharded on the expert-FSDP mesh, others on dp, with
+        # prefetching) while each reduce is delayed by 500 ms. Optionally replaces the FSDP
+        # model's forward to detach block inputs so no post-backward hooks are registered,
+        # exercising the root final callback fallback. Asserts the FSDP to replicate time
+        # ratio is under 1.5 (it would be near 2 if reduce-scatter state were shared).
         """Verify per-param-group reduce-scatter state avoids cross-group
         serialization in per-param-mesh FSDP with expert parallelism.
 
@@ -545,6 +645,10 @@ class TestFullyShardPerParamMeshOverlap(FSDPTest):
         )
 
         def _build_fsdp_model():
+            # [FUNCTION DOC] HELPER: Seeds, builds the Transformer with expert parallel, shards
+            # each block with a placement function routing expert params to the expert-FSDP mesh
+            # and others to the dp mesh, shards embeddings/norm/output together and the root,
+            # sets forward and backward prefetch between neighboring blocks, returns the model.
             torch.manual_seed(42)
             model = Transformer(model_args)
             Transformer.parallelize(
@@ -554,6 +658,8 @@ class TestFullyShardPerParamMeshOverlap(FSDPTest):
                 expert_params = set(block.expert_layer.experts.parameters())
 
                 def _shard_placement_fn(param, _expert_params=expert_params):
+                    # [FUNCTION DOC] HELPER: Returns a Shard on dim 0 with the expert-FSDP
+                    # mesh info for expert params and with the dp mesh info for all others.
                     if param in _expert_params:
                         return ShardPlacementResult(
                             placement=Shard(0), mesh_info=efsdp_mesh_info
@@ -577,6 +683,9 @@ class TestFullyShardPerParamMeshOverlap(FSDPTest):
             return model
 
         def _build_replicate_model():
+            # [FUNCTION DOC] HELPER: Seeds and builds the same expert-parallel Transformer
+            # but applies replicate per block (ignoring expert params), to embeddings/norm/output
+            # together, and to the root over the dp mesh; returns the model.
             torch.manual_seed(42)
             model = Transformer(model_args)
             Transformer.parallelize(
@@ -597,6 +706,7 @@ class TestFullyShardPerParamMeshOverlap(FSDPTest):
             rep_model = _build_replicate_model()
 
             def rep_fwd_bwd():
+                # [FUNCTION DOC] HELPER: One forward and backward of the replicate model.
                 rep_model(inp).sum().backward()  # noqa: F821
 
             for _ in range(5):
@@ -614,6 +724,9 @@ class TestFullyShardPerParamMeshOverlap(FSDPTest):
                 # forcing the safety-net path in
                 # _root_post_backward_final_callback.
                 def _no_grad_input_forward(self, tokens):
+                    # [FUNCTION DOC] HELPER: Replacement forward: embeds tokens with positions,
+                    # applies each layer residually on a detached copy of the hidden state,
+                    # then norm and output, returning float logits.
                     h = self.tok_embeddings(tokens)
                     h = h + self.pos_embeddings(
                         torch.arange(tokens.size(1), device=tokens.device)
@@ -628,6 +741,7 @@ class TestFullyShardPerParamMeshOverlap(FSDPTest):
                 )
 
             def fsdp_fwd_bwd():
+                # [FUNCTION DOC] HELPER: One forward and backward of the FSDP model.
                 fsdp_model(inp).sum().backward()
 
             for _ in range(5):
