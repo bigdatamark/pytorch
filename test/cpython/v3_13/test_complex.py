@@ -4,6 +4,12 @@
 # ruff: noqa
 # flake8: noqa
 
+# [MODULE DOC] Dynamo-adapted copy of the CPython test_complex test suite. Defines test data for
+# underscore literals and zero division, small helper classes (index, float and complex
+# conversion objects, a complex subclass, an import redirecting finder installed into the import
+# hooks at import time) and the ComplexTest case covering the built-in complex type. Run via the
+# PyTorch test runner.
+
 # Test copied from
 # https://raw.githubusercontent.com/python/cpython/refs/tags/v3.13.5/Lib/test/test_complex.py
 
@@ -35,7 +41,14 @@ redirect_imports = (
 )
 
 class RedirectImportFinder(importlib.abc.MetaPathFinder):
+    # [CLASS DOC] HELPER: Meta path finder that redirects imports of CPython test-support module
+    # names (the redirect_imports tuple) to the standalone top-level modules, so copied tests
+    # can import them.
     def find_spec(self, fullname, path, target=None):
+        # [FUNCTION DOC] HELPER: Returns a module spec for a redirected name, or None. For a
+        # name in redirect_imports it strips the "test." prefix, imports that module, registers
+        # it in sys.modules under the original name (side effect) and returns its spec; on
+        # ImportError or any other name it returns None.
         # Check if the import is the problematic one
         if fullname in redirect_imports:
             try:
@@ -156,29 +169,52 @@ ZERO_DIVISION = (
 )
 
 class WithIndex:
+    # [CLASS DOC] HELPER: Test helper whose instances expose an integer value through
+    # the index protocol.
     def __init__(self, value):
+        # [FUNCTION DOC] HELPER: Stores the given value on the instance.
         self.value = value
     def __index__(self):
+        # [FUNCTION DOC] HELPER: Returns the stored value; used to check that constructors
+        # accept index-like objects.
         return self.value
 
 class WithFloat:
+    # [CLASS DOC] HELPER: Test helper whose instances expose a stored value through the
+    # float conversion protocol.
     def __init__(self, value):
+        # [FUNCTION DOC] HELPER: Stores the given value on the instance.
         self.value = value
     def __float__(self):
+        # [FUNCTION DOC] HELPER: Returns the stored value (may deliberately be a non-float to
+        # exercise error paths).
         return self.value
 
 class ComplexSubclass(complex):
+    # [CLASS DOC] HELPER: Trivial subclass of complex used to check subclass handling in
+    # constructors and arithmetic.
     pass
 
 class WithComplex:
+    # [CLASS DOC] HELPER: Test helper whose instances expose a stored value through the
+    # complex conversion protocol.
     def __init__(self, value):
+        # [FUNCTION DOC] HELPER: Stores the given value on the instance.
         self.value = value
     def __complex__(self):
+        # [FUNCTION DOC] HELPER: Returns the stored value (may deliberately be a non-complex to
+        # exercise error paths).
         return self.value
 
 class ComplexTest(__TestCase):
+    # [CLASS DOC] Test case (CPython test_complex, run under the Dynamo harness) for the built-
+    # in complex type: arithmetic, comparison, pow, construction from numbers and strings,
+    # repr/str, hashing, formatting. Also carries identity/closeness assertion helpers.
 
     def assertFloatIdentical(self, x, y):
+        # [FUNCTION DOC] HELPER: Fails the test unless two floats are identical: both NaN, both
+        # infinities of the same sign, both zeros of the same sign, or equal finite nonzero
+        # values. Raises the test failure otherwise.
         """Fail unless floats x and y are identical, in the sense that:
         (1) both x and y are nans, or
         (2) both x and y are infinities, with the same sign, or
@@ -202,6 +238,8 @@ class ComplexTest(__TestCase):
         self.fail(msg.format(x, y))
 
     def assertComplexesAreIdentical(self, x, y):
+        # [FUNCTION DOC] HELPER: Fails unless two complex numbers have identical real parts and
+        # identical imaginary parts under the float identity rule (signed zeros must match).
         """Fail unless complex numbers x and y have equal values and signs.
 
         In particular, if x and y both have real (or imaginary) part
@@ -212,6 +250,9 @@ class ComplexTest(__TestCase):
         self.assertFloatIdentical(x.imag, y.imag)
 
     def assertAlmostEqual(self, a, b):
+        # [FUNCTION DOC] Overrides the unittest almost-equal assertion to accept complex or real
+        # operands. Complex values are compared part by part; a real operand is treated as
+        # having zero imaginary part. Fails the test if parts differ at the default precision.
         if isinstance(a, complex):
             if isinstance(b, complex):
                 unittest.TestCase.assertAlmostEqual(self, a.real, b.real)
@@ -227,6 +268,11 @@ class ComplexTest(__TestCase):
                 unittest.TestCase.assertAlmostEqual(self, a, b)
 
     def assertCloseAbs(self, x, y, eps=1e-9):
+        # [FUNCTION DOC] HELPER: Checks closeness of two floats. If either is zero the other
+        # must have magnitude below eps (returned as a boolean); otherwise asserts the relative
+        # difference is below eps.
+        # KNOWN ISSUE: the return value of the zero cases is a bare boolean and is ignored by
+        # callers, so those cases never fail the test; only the nonzero branch asserts.
         """Return true iff floats x and y "are close"."""
         # put the one with larger magnitude second
         if abs(x) > abs(y):
@@ -239,6 +285,9 @@ class ComplexTest(__TestCase):
         self.assertTrue(abs((x-y)/y) < eps)
 
     def assertFloatsAreIdentical(self, x, y):
+        # [FUNCTION DOC] HELPER: Same identity check as assertFloatIdentical using the imported
+        # math helpers: fails unless both NaN, both same-signed infinities or zeros, or equal
+        # finite nonzero values.
         """assert that floats x and y are identical, in the sense that:
         (1) both x and y are nans, or
         (2) both x and y are infinities, with the same sign, or
@@ -262,11 +311,16 @@ class ComplexTest(__TestCase):
         self.fail(msg.format(x, y))
 
     def assertClose(self, x, y, eps=1e-9):
+        # [FUNCTION DOC] HELPER: Checks that real and imaginary parts of two complex numbers are
+        # close within eps using the close-abs helper.
         """Return true iff complexes x and y "are close"."""
         self.assertCloseAbs(x.real, y.real, eps)
         self.assertCloseAbs(x.imag, y.imag, eps)
 
     def check_div(self, x, y):
+        # [FUNCTION DOC] HELPER: Multiplies x and y, then checks that dividing the product by x
+        # yields y and by y yields x, using both the operator and the explicit truediv method;
+        # division by a zero operand is skipped.
         """Compute complex z=x*y, and check that z/x==y and z/y==x."""
         z = x * y
         if x != 0:
@@ -282,6 +336,8 @@ class ComplexTest(__TestCase):
 
     @slowTest
     def test_truediv(self):
+        # [FUNCTION DOC] Slow test: for every pair of complex numbers with small integer-valued
+        # parts in the range -5..5, runs the multiply/divide round trip check.
         simple_real = [float(i) for i in range(-5, 6)]
         simple_complex = [complex(x, y) for x in simple_real for y in simple_real]
         for x in simple_complex:
@@ -308,11 +364,15 @@ class ComplexTest(__TestCase):
             self.assertTrue(isnan(z.imag))
 
     def test_truediv_zero_division(self):
+        # [FUNCTION DOC] Checks that true division by zero values of several kinds (the
+        # ZERO_DIVISION pairs) raises ZeroDivisionError.
         for a, b in ZERO_DIVISION:
             with self.assertRaises(ZeroDivisionError):
                 a / b
 
     def test_floordiv(self):
+        # [FUNCTION DOC] Checks floor division of complex numbers is unsupported and raises
+        # TypeError for complex and mixed operands.
         with self.assertRaises(TypeError):
             (1+1j) // (1+0j)
         with self.assertRaises(TypeError):
@@ -325,11 +385,15 @@ class ComplexTest(__TestCase):
             1 // (1+0j)
 
     def test_floordiv_zero_division(self):
+        # [FUNCTION DOC] Checks floor division by zero raises an error for each ZERO_DIVISION
+        # pair (the type error takes precedence over zero division).
         for a, b in ZERO_DIVISION:
             with self.assertRaises(TypeError):
                 a // b
 
     def test_richcompare(self):
+        # [FUNCTION DOC] Checks equality/inequality and ordering of complex with ints, floats,
+        # huge ints, and other types: equality works, ordering comparisons raise TypeError.
         self.assertIs(complex.__eq__(1+1j, 1<<10000), False)
         self.assertIs(complex.__lt__(1+1j, None), NotImplemented)
         self.assertIs(complex.__eq__(1+1j, None), NotImplemented)
@@ -358,7 +422,12 @@ class ComplexTest(__TestCase):
         self.assertIs(operator.eq(1+1j, 2.0), False)
 
     def test_richcompare_boundaries(self):
+        # [FUNCTION DOC] Checks equality between complex and large ints near float precision
+        # boundaries, using a local helper over offsets from powers of two.
         def check(n, deltas, is_equal, imag = 0.0):
+            # [FUNCTION DOC] HELPER: Compares the complex built from n plus each delta (with
+            # imaginary part imag) against the integer, asserting equality results match the
+            # is_equal expectation for each delta.
             for delta in deltas:
                 i = n + delta
                 z = complex(i, imag)
@@ -375,6 +444,8 @@ class ComplexTest(__TestCase):
         check(2 ** 53, range(-100, 0), lambda delta: True)
 
     def test_add(self):
+        # [FUNCTION DOC] Checks complex addition with complex, int and float operands, including
+        # reflected operations and type errors for unsupported operands.
         self.assertEqual(1j + int(+1), complex(+1, 1))
         self.assertEqual(1j + int(-1), complex(-1, 1))
         self.assertRaises(OverflowError, operator.add, 1j, 10**1000)
@@ -382,6 +453,8 @@ class ComplexTest(__TestCase):
         self.assertRaises(TypeError, operator.add, None, 1j)
 
     def test_sub(self):
+        # [FUNCTION DOC] Checks complex subtraction with complex, int and float operands,
+        # including reflected operations.
         self.assertEqual(1j - int(+1), complex(-1, 1))
         self.assertEqual(1j - int(-1), complex(1, 1))
         self.assertRaises(OverflowError, operator.sub, 1j, 10**1000)
@@ -389,6 +462,8 @@ class ComplexTest(__TestCase):
         self.assertRaises(TypeError, operator.sub, None, 1j)
 
     def test_mul(self):
+        # [FUNCTION DOC] Checks complex multiplication with complex, int and float operands,
+        # including infinities and reflected operations.
         self.assertEqual(1j * int(20), complex(0, 20))
         self.assertEqual(1j * int(-1), complex(0, -1))
         self.assertRaises(OverflowError, operator.mul, 1j, 10**1000)
@@ -396,6 +471,8 @@ class ComplexTest(__TestCase):
         self.assertRaises(TypeError, operator.mul, None, 1j)
 
     def test_mod(self):
+        # [FUNCTION DOC] Checks the modulo operator is unsupported for complex numbers
+        # and raises TypeError.
         # % is no longer supported on complex numbers
         with self.assertRaises(TypeError):
             (1+1j) % (1+0j)
@@ -409,11 +486,14 @@ class ComplexTest(__TestCase):
             1 % (1+0j)
 
     def test_mod_zero_division(self):
+        # [FUNCTION DOC] Checks modulo by zero values of each ZERO_DIVISION pair
+        # raises an error.
         for a, b in ZERO_DIVISION:
             with self.assertRaises(TypeError):
                 a % b
 
     def test_divmod(self):
+        # [FUNCTION DOC] Checks divmod is unsupported for complex numbers and raises TypeError.
         self.assertRaises(TypeError, divmod, 1+1j, 1+0j)
         self.assertRaises(TypeError, divmod, 1+1j, 1.0)
         self.assertRaises(TypeError, divmod, 1+1j, 1)
@@ -421,10 +501,15 @@ class ComplexTest(__TestCase):
         self.assertRaises(TypeError, divmod, 1, 1+0j)
 
     def test_divmod_zero_division(self):
+        # [FUNCTION DOC] Checks divmod with zero divisors raises an error for
+        # each ZERO_DIVISION pair.
         for a, b in ZERO_DIVISION:
             self.assertRaises(TypeError, divmod, a, b)
 
     def test_pow(self):
+        # [FUNCTION DOC] Checks complex power: small integer exponents, negative and fractional
+        # exponents, zero base cases, results against known values, three-argument pow raising
+        # ValueError, and overflow raising OverflowError.
         self.assertAlmostEqual(pow(1+1j, 0+0j), 1.0)
         self.assertAlmostEqual(pow(0+0j, 2+0j), 0.0)
         self.assertEqual(pow(0+0j, 2000+0j), 0.0)
@@ -497,6 +582,8 @@ class ComplexTest(__TestCase):
             x**y
 
     def test_pow_with_small_integer_exponents(self):
+        # [FUNCTION DOC] Checks pow of a complex with small integer exponents gives the same
+        # result as repeated multiplication, including negative exponents.
         # Check that small integer exponents are handled identically
         # regardless of their type.
         values = [
@@ -525,6 +612,8 @@ class ComplexTest(__TestCase):
                     self.assertEqual(str(complex_pow), str(int_pow))
 
     def test_boolcontext(self):
+        # [FUNCTION DOC] Checks truthiness: zero complex is false, any nonzero part
+        # makes it true.
         for i in range(100):
             r1 = random()
             r2 = random()
@@ -533,10 +622,16 @@ class ComplexTest(__TestCase):
         self.assertTrue(1j)
 
     def test_conjugate(self):
+        # [FUNCTION DOC] Checks the conjugate method flips the sign of the imaginary part.
         self.assertClose(complex(5.3, 9.8).conjugate(), 5.3-9.8j)
 
     def test_constructor(self):
+        # [FUNCTION DOC] Checks the complex constructor: from real/imag numbers, from strings,
+        # from objects with the complex or float or index protocols, with subclasses, error
+        # cases (TypeError, ValueError), and warnings from deprecated conversions.
         def check(z, x, y):
+            # [FUNCTION DOC] HELPER: Asserts that the complex z has real part x and
+            # imaginary part y.
             self.assertIs(type(z), complex)
             self.assertFloatsAreIdentical(z.real, x)
             self.assertFloatsAreIdentical(z.imag, y)
@@ -622,10 +717,14 @@ class ComplexTest(__TestCase):
         self.assertRaises(TypeError, complex, WithComplex(None), object())
 
         class EvilExc(Exception):
+            # [CLASS DOC] HELPER: Exception type used to check that errors raised by
+            # conversion hooks propagate.
             pass
 
         class evilcomplex:
+            # [CLASS DOC] HELPER: Object whose complex conversion method raises EvilExc.
             def __complex__(self):
+                # [FUNCTION DOC] HELPER: Raises the EvilExc exception.
                 raise EvilExc
 
         self.assertRaises(EvilExc, complex, evilcomplex())
@@ -651,7 +750,10 @@ class ComplexTest(__TestCase):
         self.assertRaises(TypeError, complex, 1.5, WithIndex(None))
 
         class MyInt:
+            # [CLASS DOC] HELPER: Object defining only an int conversion method, used to check
+            # it is not accepted as complex input.
             def __int__(self):
+                # [FUNCTION DOC] HELPER: Returns a fixed integer.
                 return 42
 
         self.assertRaises(TypeError, complex, MyInt())
@@ -659,21 +761,31 @@ class ComplexTest(__TestCase):
         self.assertRaises(TypeError, complex, 1.5, MyInt())
 
         class complex0(complex):
+            # [CLASS DOC] HELPER: complex subclass whose complex conversion method returns a
+            # fixed value, to check how constructors treat it.
             """Test usage of __complex__() when inheriting from 'complex'"""
             def __complex__(self):
+                # [FUNCTION DOC] HELPER: Returns a fixed complex value.
                 return 42j
 
         class complex1(complex):
+            # [CLASS DOC] HELPER: complex subclass with a custom construction hook.
             """Test usage of __complex__() with a __new__() method"""
             def __new__(self, value=0j):
+                # [FUNCTION DOC] HELPER: Creates the instance by delegating to complex
+                # construction with the given value.
                 return complex.__new__(self, 2*value)
             def __complex__(self):
+                # [FUNCTION DOC] HELPER: Returns a fixed complex value.
                 return self
 
         class complex2(complex):
+            # [CLASS DOC] HELPER: complex subclass with a conversion method returning a
+            # complex subclass instance.
             """Make sure that __complex__() calls fail if anything other than a
             complex is returned"""
             def __complex__(self):
+                # [FUNCTION DOC] HELPER: Returns an instance of a complex subclass.
                 return None
 
         check(complex(complex0(1j)), 0.0, 42.0)
@@ -682,6 +794,8 @@ class ComplexTest(__TestCase):
         self.assertRaises(TypeError, complex, complex2(1j))
 
     def test___complex__(self):
+        # [FUNCTION DOC] Checks the explicit complex conversion method returns an equal complex
+        # for complex, bool-like and subclass inputs.
         z = 3 + 4j
         self.assertEqual(z.__complex__(), z)
         self.assertEqual(type(z.__complex__()), complex)
@@ -692,6 +806,8 @@ class ComplexTest(__TestCase):
 
     @support.requires_IEEE_754
     def test_constructor_special_numbers(self):
+        # [FUNCTION DOC] Checks construction from special values (inf and nan) in real and
+        # imaginary slots, comparing parts with the identity helper.
         for x in 0.0, -0.0, INF, -INF, NAN:
             for y in 0.0, -0.0, INF, -INF, NAN:
                 with self.subTest(x=x, y=y):
@@ -712,7 +828,12 @@ class ComplexTest(__TestCase):
                     self.assertFloatsAreIdentical(z.imag, y)
 
     def test_constructor_from_string(self):
+        # [FUNCTION DOC] Checks construction from strings: valid forms with sign, j suffix,
+        # parentheses, inf and nan; invalid strings raise ValueError, embedded null or non-str
+        # raise the proper errors.
         def check(z, x, y):
+            # [FUNCTION DOC] HELPER: Asserts that the complex z has real part x and
+            # imaginary part y.
             self.assertIs(type(z), complex)
             self.assertFloatsAreIdentical(z.real, x)
             self.assertFloatsAreIdentical(z.imag, y)
@@ -774,12 +895,16 @@ class ComplexTest(__TestCase):
         self.assertRaises(ValueError, complex, '\u3053\u3093\u306b\u3061\u306f')
 
     def test_constructor_negative_nans_from_string(self):
+        # [FUNCTION DOC] Checks that parsing strings with negative nan parts keeps the
+        # nan sign bit.
         self.assertEqual(copysign(1., complex("-nan").real), -1.)
         self.assertEqual(copysign(1., complex("-nanj").imag), -1.)
         self.assertEqual(copysign(1., complex("-nan-nanj").real), -1.)
         self.assertEqual(copysign(1., complex("-nan-nanj").imag), -1.)
 
     def test_underscores(self):
+        # [FUNCTION DOC] Checks underscore digit separators: valid literals parse via the
+        # constructor, invalid ones raise ValueError.
         # check underscores
         for lit in VALID_UNDERSCORE_LITERALS:
             if not any(ch in lit for ch in 'xXoObB'):
@@ -792,6 +917,8 @@ class ComplexTest(__TestCase):
                 self.assertRaises(ValueError, complex, lit)
 
     def test_hash(self):
+        # [FUNCTION DOC] Checks hash behavior: equal values hash equal, hash matches real hash
+        # for real-valued numbers, and unhashable-style special cases are consistent.
         for x in range(-30, 30):
             self.assertEqual(hash(x), hash(complex(x, 0)))
             x /= 3.0    # now check against floating-point
@@ -800,6 +927,8 @@ class ComplexTest(__TestCase):
         self.assertNotEqual(hash(2000005 - 1j), -1)
 
     def test_abs(self):
+        # [FUNCTION DOC] Checks the absolute value for known inputs and that huge
+        # values raise OverflowError.
         nums = [complex(x/3., y/7.) for x in range(-9,9) for y in range(-9,9)]
         for num in nums:
             self.assertAlmostEqual((num.real**2 + num.imag**2)  ** 0.5, abs(num))
@@ -807,7 +936,11 @@ class ComplexTest(__TestCase):
         self.assertRaises(OverflowError, abs, complex(DBL_MAX, DBL_MAX))
 
     def test_repr_str(self):
+        # [FUNCTION DOC] Checks repr and str formatting of complex numbers, including signed
+        # zeros, inf, nan, and large/small magnitudes.
         def test(v, expected, test_fn=self.assertEqual):
+            # [FUNCTION DOC] HELPER: Asserts the given test function compares the repr and the
+            # str of v to the expected text.
             test_fn(repr(v), expected)
             test_fn(str(v), expected)
 
@@ -836,7 +969,10 @@ class ComplexTest(__TestCase):
 
     @support.requires_IEEE_754
     def test_negative_zero_repr_str(self):
+        # [FUNCTION DOC] Checks repr and str of complex numbers with negative zero parts.
         def test(v, expected, test_fn=self.assertEqual):
+            # [FUNCTION DOC] HELPER: Asserts the given test function compares the repr and the
+            # str of v to the expected text.
             test_fn(repr(v), expected)
             test_fn(str(v), expected)
 
@@ -851,14 +987,18 @@ class ComplexTest(__TestCase):
         test(complex(-0., -0.), "(-0-0j)")
 
     def test_pos(self):
+        # [FUNCTION DOC] Checks the unary plus operator returns an equal value.
         self.assertEqual(+(1+6j), 1+6j)
         self.assertEqual(+ComplexSubclass(1, 6), 1+6j)
         self.assertIs(type(+ComplexSubclass(1, 6)), complex)
 
     def test_neg(self):
+        # [FUNCTION DOC] Checks the unary negation operator negates both parts.
         self.assertEqual(-(1+6j), -1-6j)
 
     def test_getnewargs(self):
+        # [FUNCTION DOC] Checks the pickling arguments method returns the real and imaginary
+        # parts as a tuple.
         self.assertEqual((1+2j).__getnewargs__(), (1.0, 2.0))
         self.assertEqual((1-2j).__getnewargs__(), (1.0, -2.0))
         self.assertEqual((2j).__getnewargs__(), (0.0, 2.0))
@@ -868,6 +1008,8 @@ class ComplexTest(__TestCase):
 
     @support.requires_IEEE_754
     def test_plus_minus_0j(self):
+        # [FUNCTION DOC] Checks that adding or subtracting a zero imaginary part keeps signed
+        # zeros as expected.
         # test that -0j and 0j literals are not identified
         z1, z2 = 0j, -0j
         self.assertFloatsAreIdentical(z1.imag, 0.0)
@@ -875,6 +1017,8 @@ class ComplexTest(__TestCase):
 
     @support.requires_IEEE_754
     def test_negated_imaginary_literal(self):
+        # [FUNCTION DOC] Checks negated imaginary literals keep the correct zero signs in
+        # the real part.
         z0 = -0j
         z1 = -7j
         z2 = -1e1000j
@@ -891,12 +1035,15 @@ class ComplexTest(__TestCase):
 
     @support.requires_IEEE_754
     def test_overflow(self):
+        # [FUNCTION DOC] Checks that operations overflowing float range raise OverflowError.
         self.assertEqual(complex("1e500"), complex(INF, 0.0))
         self.assertEqual(complex("-1e500j"), complex(0.0, -INF))
         self.assertEqual(complex("-1e500+1.8e308j"), complex(-INF, INF))
 
     @support.requires_IEEE_754
     def test_repr_roundtrip(self):
+        # [FUNCTION DOC] Checks that evaluating the repr of random and special complex values
+        # reproduces an identical value.
         vals = [0.0, 1e-500, 1e-315, 1e-200, 0.0123, 3.1415, 1e50, INF, NAN]
         vals += [-v for v in vals]
 
@@ -924,6 +1071,8 @@ class ComplexTest(__TestCase):
                                               0.0 + roundtrip.imag)
 
     def test_format(self):
+        # [FUNCTION DOC] Checks complex string formatting with format specs: type codes, width,
+        # alignment, sign, precision and invalid specs raising ValueError.
         # empty format string is same as str()
         self.assertEqual(format(1+3j, ''), str(1+3j))
         self.assertEqual(format(1.5+3.5j, ''), str(1.5+3.5j))
