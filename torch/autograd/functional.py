@@ -1,5 +1,12 @@
 # mypy: allow-untyped-defs
 
+# [MODULE DOC] Functional (non-module) higher-order autograd API: vjp, jvp, jacobian, hessian, hvp, vhp.
+# Each takes a user function plus input Tensor(s) and returns outputs and derivative results, optionally
+# differentiable (create_graph) and with strict checking for independence of outputs from inputs. Also holds
+# private helpers for tuple normalization, input preparation, zero filling and error checks. Forward-mode
+# products are emulated with the double backward trick unless forward AD is used. No import-time side effects
+# beyond imports; exports the six public names.
+
 import torch
 from torch._vmap_internals import _vmap
 
@@ -12,6 +19,8 @@ __all__ = ["vjp", "jvp", "jacobian", "hessian", "hvp", "vhp"]
 
 
 def _as_tuple_nocheck(x):
+    # [FUNCTION DOC] HELPER: Returns x unchanged if a tuple, converts a list to a tuple, otherwise wraps x in a
+    # one-element tuple. No validation.
     if isinstance(x, tuple):
         return x
     elif isinstance(x, list):
@@ -21,6 +30,9 @@ def _as_tuple_nocheck(x):
 
 
 def _as_tuple(inp, arg_name=None, fn_name=None):
+    # [FUNCTION DOC] HELPER: Normalizes inp to a tuple of Tensors. If both names are None, defers to the unchecked
+    # version and returns only the tuple. Otherwise returns a pair (was_tuple, tuple_of_inp) and raises TypeError,
+    # naming arg_name and fn_name, if any element is not a Tensor.
     # Ensures that inp is a tuple of Tensors
     # Returns whether or not the original inp was a tuple and the tupled version of the input
     if arg_name is None and fn_name is None:
@@ -48,6 +60,9 @@ def _as_tuple(inp, arg_name=None, fn_name=None):
 
 
 def _tuple_postprocess(res, to_unpack):
+    # [FUNCTION DOC] HELPER: Inverts _as_tuple on results. A single boolean to_unpack false takes the first element
+    # of res. A pair of booleans: second false takes the first element of each inner tuple, then first false takes
+    # the first element of the outer tuple. Raises AssertionError if a tuple to_unpack is not of length 2.
     # Unpacks a potentially nested tuple of Tensors
     # to_unpack should be a single boolean or a tuple of two booleans.
     # It is used to:
@@ -67,6 +82,9 @@ def _tuple_postprocess(res, to_unpack):
 
 
 def _grad_preprocess(inputs, create_graph, need_graph):
+    # [FUNCTION DOC] HELPER: Returns a tuple of fresh Tensor objects for inputs. If create_graph is set and the input
+    # requires grad, a differentiable alias (view, or clone for sparse) is used so gradients flow to the original.
+    # Otherwise the input is detached and requires_grad is set to need_graph. Always creates new objects.
     # Preprocess the inputs to make sure they require gradient
     # inputs is a tuple of Tensors to preprocess
     # create_graph specifies if the user wants gradients to flow back to the Tensors in inputs
@@ -90,6 +108,8 @@ def _grad_preprocess(inputs, create_graph, need_graph):
 
 
 def _grad_postprocess(inputs, create_graph):
+    # [FUNCTION DOC] HELPER: Detaches result Tensors when create_graph is false, else returns them as is. Recurses
+    # over nested tuples (decided by whether the first element is a Tensor). Returns a tuple.
     # Postprocess the generated Tensors to avoid returning Tensors with history when the user did not
     # request it.
     if isinstance(inputs[0], torch.Tensor):
@@ -102,6 +122,8 @@ def _grad_postprocess(inputs, create_graph):
 
 
 def _validate_v(v, other, is_other_tuple):
+    # [FUNCTION DOC] HELPER: Checks the tuple v matches the tuple other in length and per-entry size. Raises
+    # RuntimeError with a message depending on is_other_tuple on mismatch. Returns nothing.
     # This assumes that other is the correct shape, and v should match
     # Both are assumed to be tuples of Tensors
     if len(other) != len(v):
@@ -123,6 +145,9 @@ def _validate_v(v, other, is_other_tuple):
 
 
 def _check_requires_grad(inputs, input_type, strict):
+    # [FUNCTION DOC] HELPER: In strict mode only, validates each entry of inputs. A None entry or an entry without
+    # requires_grad raises RuntimeError with a message chosen by input_type (outputs, grad_inputs, jacobian,
+    # hessian). Unknown input_type raises RuntimeError. No-op when strict is false.
     # Used to make all the necessary checks to raise nice errors in strict mode.
     if not strict:
         return
@@ -173,6 +198,10 @@ def _autograd_grad(
     retain_graph=None,
     is_grads_batched=False,
 ):
+    # [FUNCTION DOC] HELPER: Wrapper around the autograd grad call that tolerates None or non-differentiable entries in
+    # outputs by dropping them (with the matching grad_outputs). outputs and grad_outputs must be tuples of equal
+    # length (AssertionError otherwise). Returns a tuple of None per input if nothing is differentiable, else the
+    # gradients with unused inputs allowed (None for unused).
     # Version of autograd.grad that accepts `None` in outputs and do not compute gradients for them.
     # This has the extra constraint that inputs has to be a tuple
     if not isinstance(outputs, tuple):
@@ -211,6 +240,10 @@ def _autograd_grad(
 
 
 def _fill_in_zeros(grads, refs, strict, create_graph, stage):
+    # [FUNCTION DOC] HELPER: Replaces None gradients with zero Tensors shaped like the matching refs entry. In strict
+    # mode a None raises RuntimeError with a message chosen by stage (back, back_trick, double_back,
+    # double_back_trick); an invalid stage raises RuntimeError. Also in strict mode with create_graph, a gradient
+    # that does not require grad raises RuntimeError. Returns a tuple.
     # Used to detect None in the grads and depending on the flags, either replace them
     # with Tensors full of 0s of the appropriate size based on the refs or raise an error.
     # strict and create graph allow us to detect when it is appropriate to raise an error
@@ -269,6 +302,11 @@ def _fill_in_zeros(grads, refs, strict, create_graph, stage):
 
 
 def vjp(func, inputs, v=None, create_graph=False, strict=False):
+    # [FUNCTION DOC] Vector-Jacobian product via reverse mode. Runs func on fresh copies of inputs with grad enabled,
+    # then back-propagates v (or an implicit one when the output is a single element tensor; otherwise RuntimeError)
+    # through the outputs. Validates v against outputs, raises on bad types or sizes, and in strict mode on outputs
+    # independent of inputs. Returns (func_output, vjp) in the same tuple/Tensor structure as outputs and inputs;
+    # results are detached unless create_graph is set. Unused inputs get zeros when not strict.
     r"""Compute the dot product between a vector ``v`` and the Jacobian of the given function at the point given by the inputs.
 
     Args:
@@ -364,6 +402,11 @@ def vjp(func, inputs, v=None, create_graph=False, strict=False):
 
 
 def jvp(func, inputs, v=None, create_graph=False, strict=False):
+    # [FUNCTION DOC] Jacobian-vector product using the double backward trick (not forward AD). Builds dummy zero
+    # grad_outputs requiring grad, takes a differentiable backward, then back-propagates v through that backward to
+    # get the product. v defaults to one only for a single-element single-tensor input, else RuntimeError. Returns
+    # (func_output, jvp) with jvp structured like the outputs; detached unless create_graph. Strict mode raises on
+    # independence of outputs, grad inputs, or the trick gradients.
     r"""Compute the dot product between the Jacobian of the given function at the point given by the inputs and a vector ``v``.
 
     Args:
@@ -479,6 +522,9 @@ def jvp(func, inputs, v=None, create_graph=False, strict=False):
 def _construct_standard_basis_for(
     tensors: tuple[torch.Tensor, ...], tensor_numels: tuple[int, ...]
 ) -> tuple[torch.Tensor, ...]:
+    # [FUNCTION DOC] HELPER: Builds an identity matrix of side equal to the total element count and splits its columns
+    # into one chunk per tensor (chunk i has tensor_numels[i] columns, same dtype and device as tensors[i]). Used as
+    # batched grad outputs or tangents. Raises AssertionError on length mismatch or empty input.
     # This function:
     # - constructs a N=sum(tensor_numels) standard basis. i.e. an NxN identity matrix.
     # - Splits the identity matrix into chunks with each chunk size determined by `tensor_numels`.
@@ -517,6 +563,10 @@ def _construct_standard_basis_for(
 
 
 def _jacfwd(func, inputs, strict=False, vectorize=False):
+    # [FUNCTION DOC] HELPER: Forward-mode Jacobian. Raises RuntimeError if strict, NotImplementedError unless vectorize
+    # is set. Builds a standard basis of tangents, maps over it with vmap, wrapping inputs as dual tensors and
+    # unpacking output tangents (zeros when an output has no tangent). Splits and reshapes per input to shape
+    # output-shape plus input-shape and returns the nested result unpacked per tuple-ness of outputs and inputs.
     if strict:
         raise RuntimeError(
             "torch.autograd.functional.jacobian: `strict=True` "
@@ -536,6 +586,9 @@ def _jacfwd(func, inputs, strict=False, vectorize=False):
 
         # Step 2: Compute vmap over computation with dual tensors
         def jvp(tangents):
+            # [FUNCTION DOC] HELPER: Runs func on dual inputs built from one batch of tangents inside a dual level. Records
+            # whether the outputs were a tuple and the primal outputs in the enclosing output_info list (side effect), and
+            # returns the tuple of output tangents (zeros for outputs without tangent).
             with fwAD.dual_level():
                 dual_inputs = tuple(
                     fwAD.make_dual(input, tangent.view_as(input))
@@ -592,6 +645,12 @@ def jacobian(
     vectorize=False,
     strategy="reverse-mode",
 ):
+    # [FUNCTION DOC] Computes the Jacobian of func at inputs. Raises AssertionError for an unknown strategy and
+    # NotImplementedError for forward-mode with create_graph (forward-mode delegates to _jacfwd). Reverse mode: with
+    # vectorize, one batched backward over a standard basis (RuntimeError if strict), then splits per output and
+    # input; otherwise one backward per output element, stacking rows, with zeros for unused inputs or RuntimeError
+    # in strict mode. Returns a Tensor or nested tuple indexed by output then input, shaped output-shape plus
+    # input-shape; detached unless create_graph.
     r"""Compute the Jacobian of a given function.
 
     Args:
@@ -758,6 +817,8 @@ def jacobian(
 
             # Step 2: Call vmap + autograd.grad
             def vjp(grad_output):
+                # [FUNCTION DOC] HELPER: Batched backward of the flattened outputs for the given batch of grad outputs,
+                # replacing None gradients with zeros expanded to the batch size. Returns a tuple with one entry per input.
                 vj = list(
                     _autograd_grad(
                         flat_outputs,
@@ -861,6 +922,10 @@ def hessian(
     vectorize=False,
     outer_jacobian_strategy="reverse-mode",
 ):
+    # [FUNCTION DOC] Hessian of a scalar-valued func, computed as the Jacobian (outer strategy, forward or reverse)
+    # of the reverse-mode Jacobian. Raises AssertionError on an invalid strategy and RuntimeError if func does not
+    # return one single-element Tensor. Returns a Tensor for a single input or a tuple of tuples indexed by input
+    # pairs; detached unless create_graph.
     r"""Compute the Hessian of a given scalar function.
 
     Args:
@@ -956,6 +1021,8 @@ def hessian(
         )
 
     def ensure_single_output_function(*inp):
+        # [FUNCTION DOC] HELPER: Calls func and validates the result is a single Tensor with exactly one element
+        # (RuntimeError otherwise; strict mode also checks requires_grad). Returns the squeezed scalar.
         out = func(*inp)
         is_out_tuple, t_out = _as_tuple(
             out, "outputs of the user-provided function", "hessian"
@@ -975,6 +1042,8 @@ def hessian(
         return out.squeeze()
 
     def jac_func(*inp):
+        # [FUNCTION DOC] HELPER: Differentiable inner Jacobian of the single-output function. For forward-mode outer strategy
+        # it first sets requires_grad on the inputs in place. In strict mode checks the Jacobian requires grad.
         if outer_jacobian_strategy == "forward-mode":
             # _grad_preprocess requires create_graph=True and input to require_grad
             # or else the input will be detached
@@ -995,6 +1064,10 @@ def hessian(
 
 
 def vhp(func, inputs, v=None, create_graph=False, strict=False):
+    # [FUNCTION DOC] Vector-Hessian product for a scalar function. Takes a differentiable gradient, then
+    # back-propagates v through it. v defaults to one only for a single-element single-tensor input. Raises
+    # RuntimeError if func output is not a single one-element Tensor or on strict violations. Returns (func_output,
+    # vhp) with vhp shaped like inputs; detached unless create_graph.
     r"""Compute the dot product between vector ``v`` and Hessian of a  given scalar function at a specified point.
 
     Args:
@@ -1096,6 +1169,11 @@ def vhp(func, inputs, v=None, create_graph=False, strict=False):
 
 
 def hvp(func, inputs, v=None, create_graph=False, strict=False):
+    # [FUNCTION DOC] Hessian-vector product for a scalar function, via the double backward trick: differentiable
+    # gradient, backward against dummy zero grad outputs, then backward against v. Same validation and return
+    # conventions as vhp; slower than vhp.
+    # KNOWN ISSUE: the strict hessian check is applied to jac (already checked) rather than to double_back, so the
+    # intended check on the Hessian is never performed.
     r"""Compute the dot product between the scalar function's Hessian and a vector ``v`` at a specified point.
 
     Args:

@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Grad-mode context managers for autograd: no_grad, enable_grad, set_grad_enabled, inference_mode,
+# set_multithreading_enabled and enforce_grad_layout_policy (public), plus internal view-replay and
+# version-counter-preservation managers. Each works as a context manager and decorator and changes thread-local
+# engine state through the C extension. No import-time side effects beyond imports and class definitions.
 from typing import Any
 
 import torch
@@ -20,6 +24,9 @@ __all__ = [
 
 
 class no_grad(_NoParamDecoratorContextManager):
+    # [CLASS DOC] Context manager and decorator that disables gradient recording in the current thread. Stores the previous
+    # grad mode in prev and restores it on exit. Factory functions that take requires_grad are unaffected.
+    # Usable bare as a decorator (no call parentheses) as well as called.
     r"""Context-manager that disables gradient calculation.
 
     Disabling gradient calculation is useful for inference, when you are sure
@@ -74,19 +81,24 @@ class no_grad(_NoParamDecoratorContextManager):
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Initializes the base class unless TorchScript scripting is active, and sets prev to False.
         if not torch._jit_internal.is_scripting():
             super().__init__()
         self.prev = False
 
     def __enter__(self) -> None:
+        # [FUNCTION DOC] Saves the current grad-enabled flag in prev and disables grad mode.
         self.prev = torch.is_grad_enabled()
         torch.set_grad_enabled(False)
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        # [FUNCTION DOC] Restores the grad mode saved on entry; exception info is ignored and exceptions propagate.
         torch.set_grad_enabled(self.prev)
 
 
 class enable_grad(_NoParamDecoratorContextManager):
+    # [CLASS DOC] Context manager and decorator that enables gradient recording in the current thread, even inside a no_grad
+    # region. Remembers the previous mode in prev (set on enter) and restores it on exit.
     r"""Context-manager that enables gradient calculation.
 
     Enables gradient calculation, if it has been disabled via :class:`~no_grad`
@@ -134,14 +146,19 @@ class enable_grad(_NoParamDecoratorContextManager):
     """
 
     def __enter__(self) -> None:
+        # [FUNCTION DOC] Saves the current grad-enabled flag in prev and turns grad mode on.
         self.prev = torch.is_grad_enabled()
         torch._C._set_grad_enabled(True)
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        # [FUNCTION DOC] Restores the grad mode saved on entry; exceptions propagate.
         torch._C._set_grad_enabled(self.prev)
 
 
 class set_grad_enabled(_DecoratorContextManager):
+    # [CLASS DOC] Context manager, decorator and plain function that sets grad mode to mode. State: prev (mode at construction)
+    # and mode. Constructing the object applies mode immediately (so a bare call acts as a function), entering
+    # re-applies it, exiting restores prev.
     r"""Context-manager that sets gradient calculation on or off.
 
     ``set_grad_enabled`` will enable or disable grads based on its argument :attr:`mode`.
@@ -183,27 +200,36 @@ class set_grad_enabled(_DecoratorContextManager):
     """
 
     def __init__(self, mode: bool) -> None:
+        # [FUNCTION DOC] Records the current grad mode as prev and mode, and immediately sets grad mode to mode (side effect on
+        # thread-local global state).
         self.prev = torch.is_grad_enabled()
         self.mode = mode
         torch._C._set_grad_enabled(mode)
 
     def __call__(self, orig_func: F) -> F:
+        # [FUNCTION DOC] Decorator hook: first undoes the immediate effect of construction by restoring prev, then wraps orig_func
+        # using the base class decorator logic so the mode applies only during calls. Returns the wrapped function.
         torch._C._set_grad_enabled(self.prev)
         return super().__call__(orig_func)
 
     def __enter__(self) -> None:
+        # [FUNCTION DOC] Sets grad mode to the stored mode.
         torch._C._set_grad_enabled(self.mode)
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        # [FUNCTION DOC] Restores grad mode to prev; exceptions propagate.
         torch._C._set_grad_enabled(self.prev)
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Returns a string with the type name and the mode value.
         return f"{torch.typename(self)}(mode={self.mode})"
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Returns the same text as the string form.
         return str(self)
 
     def clone(self) -> "set_grad_enabled":
+        # [FUNCTION DOC] Returns a new instance of the same class built from the stored mode (note: construction applies it at once).
         r"""
         Create a copy of this class
         """
@@ -211,6 +237,10 @@ class set_grad_enabled(_DecoratorContextManager):
 
 
 class inference_mode(_DecoratorContextManager):
+    # [CLASS DOC] Context manager and decorator that enables or disables inference mode in the current thread, which skips view
+    # tracking and version counter bumps; tensors made inside cannot be used in autograd-recorded computation.
+    # State: mode flag and an internal context object created on enter. Can also be applied directly to a function
+    # via the constructor (non-bool argument is treated as the function to decorate).
     r"""Context manager that enables or disables inference mode.
 
     InferenceMode is analogous to :class:`~no_grad` and should be used
@@ -278,23 +308,29 @@ class inference_mode(_DecoratorContextManager):
     """
 
     def __init__(self, mode: bool = True) -> None:
+        # [FUNCTION DOC] Initializes the base class unless scripting, and stores mode.
         if not torch._jit_internal.is_scripting():
             super().__init__()
         self.mode = mode
 
     def __new__(cls, mode=True):
+        # [FUNCTION DOC] Constructor hook. If mode is a bool, creates a normal instance. Otherwise treats mode as a function and
+        # returns it decorated by a default (mode True) instance.
         if isinstance(mode, bool):
             return super().__new__(cls)
         return cls()(mode)
 
     def __enter__(self) -> None:
+        # [FUNCTION DOC] Creates the native inference-mode context for the stored mode, keeps it on the instance and enters it.
         self._inference_mode_context = torch._C._InferenceMode(self.mode)
         self._inference_mode_context.__enter__()
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        # [FUNCTION DOC] Exits the native inference-mode context created on enter, passing the exception info through.
         self._inference_mode_context.__exit__(exc_type, exc_value, traceback)
 
     def clone(self) -> "inference_mode":
+        # [FUNCTION DOC] Returns a new instance of the same class with the same mode.
         r"""
         Create a copy of this class
         """
@@ -302,16 +338,21 @@ class inference_mode(_DecoratorContextManager):
 
 
 def _enter_inference_mode(mode):
+    # [FUNCTION DOC] HELPER: Creates and enters a native inference-mode context for mode and returns it so the caller can exit later.
     mode_context = torch._C._InferenceMode(mode)
     mode_context.__enter__()
     return mode_context
 
 
 def _exit_inference_mode(mode):
+    # [FUNCTION DOC] HELPER: Exits a context returned by _enter_inference_mode with no exception info.
     mode.__exit__(None, None, None)
 
 
 class set_multithreading_enabled(_DecoratorContextManager):
+    # [CLASS DOC] Context manager, decorator and function that toggles multithreaded backward execution (thread local). State:
+    # prev (setting at construction) and mode. Construction applies mode immediately; exit restores prev. Entering
+    # does nothing.
     r"""Context-manager that enables or disables multithreaded backward.
 
     Ordinarily, when :ref:`accelerator<accelerators>` devices are in use,
@@ -336,17 +377,21 @@ class set_multithreading_enabled(_DecoratorContextManager):
     """
 
     def __init__(self, mode: bool) -> None:
+        # [FUNCTION DOC] Saves the current multithreading setting as prev, applies mode immediately and stores mode.
         self.prev = torch._C._is_multithreading_enabled()
         torch._C._set_multithreading_enabled(mode)
         self.mode = mode
 
     def __enter__(self) -> None:
+        # [FUNCTION DOC] No-op; the setting was already applied at construction.
         pass
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        # [FUNCTION DOC] Restores the multithreading setting saved at construction; exceptions propagate.
         torch._C._set_multithreading_enabled(self.prev)
 
     def clone(self) -> "set_multithreading_enabled":
+        # [FUNCTION DOC] Returns a new instance of the same class with the same mode (applies it immediately).
         r"""
         Create a copy of this class
         """
@@ -354,6 +399,9 @@ class set_multithreading_enabled(_DecoratorContextManager):
 
 
 class enforce_grad_layout_policy(_DecoratorContextManager):
+    # [CLASS DOC] Context manager, decorator and function controlling enforcement of the gradient layout contract in the autograd
+    # engine (thread local). State: prev (setting at construction) and mode. Construction applies enable at once;
+    # exit restores prev. When disabled, mismatched-layout gradients may be stolen and the warning is suppressed.
     r"""Context-manager that controls the gradient layout policy enforcement.
 
     The gradient layout contract ensures that accumulated gradients have
@@ -390,21 +438,27 @@ class enforce_grad_layout_policy(_DecoratorContextManager):
     """
 
     def __init__(self, enable: bool = True) -> None:
+        # [FUNCTION DOC] Saves the current layout-enforcement flag as prev, applies enable immediately and stores it as mode.
         self.prev = torch._C._is_grad_layout_enforcement_enabled()
         torch._C._set_grad_layout_enforcement_enabled(enable)
         self.mode = enable
 
     def __call__(self, orig_func: F) -> F:
+        # [FUNCTION DOC] Decorator hook: restores prev (undoing construction effect) then wraps orig_func via the base class, so the
+        # setting applies only during calls. Returns the wrapped function.
         torch._C._set_grad_layout_enforcement_enabled(self.prev)
         return super().__call__(orig_func)
 
     def __enter__(self) -> None:
+        # [FUNCTION DOC] No-op; the setting was applied at construction.
         pass
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        # [FUNCTION DOC] Restores the saved layout-enforcement flag; exceptions propagate.
         torch._C._set_grad_layout_enforcement_enabled(self.prev)
 
     def clone(self) -> "enforce_grad_layout_policy":
+        # [FUNCTION DOC] Returns a new instance of the same class with the same enable setting.
         r"""
         Create a copy of this class
         """
@@ -412,6 +466,10 @@ class enforce_grad_layout_policy(_DecoratorContextManager):
 
 
 class _force_original_view_tracking(_DecoratorContextManager):
+    # [CLASS DOC] HELPER: Internal context manager, decorator and function forcing autograd to always use view replay when
+    # regenerating a mutated view. State: prev and mode. Construction applies mode immediately, entering reapplies
+    # it, exit restores prev.
+    # KNOWN ISSUE: the docstring refers to set_view_replay_enabled, which is not this class name.
     r"""Context-manager that sets whether or not to always enable view-replay in autograd.
 
     ``set_view_replay_enabled`` will enable or disable view-replay based on its argument :attr:`mode`.
@@ -434,25 +492,32 @@ class _force_original_view_tracking(_DecoratorContextManager):
     """
 
     def __init__(self, mode: bool) -> None:
+        # [FUNCTION DOC] HELPER: Saves the current view-replay flag as prev, stores mode and applies it immediately.
         self.prev = torch._C._is_view_replay_enabled()
         self.mode = mode
         torch._C._set_view_replay_enabled(mode)
 
     def __call__(self, orig_func: F) -> F:
+        # [FUNCTION DOC] HELPER: Decorator hook: restores prev, then wraps orig_func via the base class. Returns the wrapped function.
         torch._C._set_view_replay_enabled(self.prev)
         return super().__call__(orig_func)
 
     def __enter__(self) -> None:
+        # [FUNCTION DOC] HELPER: Sets the view-replay flag to the stored mode.
         torch._C._set_view_replay_enabled(self.mode)
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        # [FUNCTION DOC] HELPER: Restores the view-replay flag to prev; exceptions propagate.
         torch._C._set_view_replay_enabled(self.prev)
 
     def clone(self):
+        # [FUNCTION DOC] HELPER: Returns a new instance of the same class with the same mode.
         return self.__class__(self.mode)
 
 
 class _unsafe_preserve_version_counter(_DecoratorContextManager):
+    # [CLASS DOC] HELPER: Dangerous internal context manager that hides mutations of the given tensors from autograd by restoring
+    # their version counters on exit. State: tensors (tuple) and prev_versions (counters captured at construction).
     r"""DO NOT USE THIS UNLESS YOU KNOW EXACTLY WHAT YOU'RE DOING.
 
     This context manager can lead to arbitrary silent-correctness issues in any other part of your code
@@ -476,14 +541,19 @@ class _unsafe_preserve_version_counter(_DecoratorContextManager):
     """
 
     def __init__(self, tensors: torch.Tensor | tuple[torch.Tensor, ...]) -> None:
+        # [FUNCTION DOC] HELPER: Accepts a Tensor or tuple of Tensors, normalizes to a tuple (AssertionError if not a tuple) and records
+        # each tensor current version counter.
         self.tensors = (tensors,) if isinstance(tensors, torch.Tensor) else tensors
         if not isinstance(self.tensors, tuple):
             raise AssertionError("Expected tensors to be a tuple")
         self.prev_versions = tuple(t._version for t in self.tensors)
 
     def __enter__(self) -> None:
+        # [FUNCTION DOC] HELPER: No-op on entry.
         pass
 
     # pyrefly: ignore [bad-override]
     def __exit__(self, *args) -> None:
+        # [FUNCTION DOC] HELPER: On exit sets the version counters of the tensors back to the values recorded at construction, hiding
+        # any mutations done inside the block. Exceptions propagate.
         torch._C._autograd._unsafe_set_version_counter(self.tensors, self.prev_versions)
