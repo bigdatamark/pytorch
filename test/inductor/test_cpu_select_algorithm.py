@@ -1,4 +1,14 @@
 # Owner(s): ["oncall: cpu inductor"]
+# [MODULE DOC] Tests for the Inductor CPU GEMM template path (the C++ max-autotune backend) for
+# linear, quantized linear, weight-only-quantized matmul, grouped linear and batched matmul.
+# Each test compiles a small module with freezing and max-autotune enabled, checks numerics
+# against eager, and asserts on Inductor counters for templated kernels and epilogue fusion.
+# Import time: imports the sibling CPU repro and torchinductor test modules (exits quietly or
+# re-raises if they raise a skip), and binds check_model, set_num_threads, run_and_get_cpp_code
+# and the aten op namespace as module globals.
+# Contains the patches decorator, the verify tolerance context manager, an epilogue factory,
+# the base and main test classes, a dynamic-shapes variant, and the device-type instantiation
+# at the bottom.
 import contextlib
 import functools
 import sys
@@ -60,6 +70,10 @@ aten = torch.ops.aten
 
 
 def should_reduce_range(device: torch.device) -> bool:
+    # [FUNCTION DOC] HELPER: Returns True when the given device is a CPU and the CPU lacks VNNI
+    # support (checked through the private CPU capability query), meaning int8 quantization ranges
+    # should be reduced to avoid overflow. Returns False for non-CPU devices or VNNI-capable CPUs.
+    # No side effects.
     """
     Helper to determine if int8 tensor quantization range should be reduced
     to avoid overflow on CPUs without VNNI support (e.g., AMD CPUs).
@@ -69,7 +83,19 @@ def should_reduce_range(device: torch.device) -> bool:
 
 
 def patches(fn):
+    # [FUNCTION DOC] HELPER: Decorator factory used by almost every test here. Wraps the test
+    # function with four patchers: verbose dynamo config, inductor config (debug, max autotune,
+    # epilogue fusion, GEMM backends restricted to the C++ template and ATen), a loose-tolerance
+    # numerical verify setting in the algorithm selector, and a replacement for the selector cache
+    # lookup. Returns a wrapper that clears the dynamo counters and seeds the random generator
+    # before each call.
     def skip_cache(self, choices, name, key, benchmark, hint_override=None):
+        # [FUNCTION DOC] HELPER: Replacement for the algorithm selector cache lookup that never
+        # reads or writes a cache. If no benchmark callable is given it returns an empty
+        # mapping; otherwise it runs the benchmark over all choices and multiplies the timing of
+        # every extern (ATen) kernel choice by a huge factor so that template kernels always
+        # win. The extra arguments (name, key, hint override) are ignored. Returns the
+        # choice-to-timing mapping.
         if benchmark is None:
             return {}
         timings = benchmark(choices)
@@ -99,6 +125,9 @@ def patches(fn):
 
     @functools.wraps(fn)
     def wrapped(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Inner wrapper returned by the patches decorator. Clears the
+        # global dynamo counters, seeds the random number generator with a fixed value, then calls
+        # the patched test function with the received arguments and returns its result.
         counters.clear()
         torch.manual_seed(12345)
         return fn(*args, **kwargs)
@@ -108,6 +137,10 @@ def patches(fn):
 
 @contextlib.contextmanager
 def verify(dtype):
+    # [FUNCTION DOC] HELPER: Context manager that patches the algorithm selector numerical
+    # verification tolerances. Absolute and relative tolerance are 1e-4 for most dtypes and
+    # relaxed to 1e-2 for half and bfloat16, because different kernels accumulate in different
+    # orders. Yields the chosen (atol, rtol) pair; the previous setting is restored on exit.
     # For bfloat16 and half, we have to relax the tolerance
     # due to the difference associave orders in different
     # kernel implementations
@@ -119,6 +152,12 @@ def verify(dtype):
 
 
 def _get_epilogue(epilogue: str, other: torch.Tensor | None = None):
+    # [FUNCTION DOC] HELPER: Maps an epilogue name to a callable used as the post-op of a linear
+    # layer in the tests. Names none, relu, gelu, silu, sigmoid, tanh, hardswish, hardsigmoid,
+    # leaky_relu and hardtanh return the matching torch.nn activation module (none returns an
+    # identity function); add, sub, mul and div return a function applying that binary op with the
+    # given other tensor as right operand. An unknown name falls through and returns None (no
+    # error is raised).
     if epilogue == "none":
         return lambda x: x
     elif epilogue == "relu":
@@ -150,13 +189,22 @@ def _get_epilogue(epilogue: str, other: torch.Tensor | None = None):
 
 
 class BaseTestSelectAlgorithm(TestCase):
+    # [CLASS DOC] HELPER: Shared base class for the select-algorithm tests; adds two
+    # counter-assertion helpers for the AMX and brgemm micro GEMM counters. Holds no state of
+    # its own.
     def _check_amx_counter(self, vec_amx):
+        # [FUNCTION DOC] HELPER: Asserts on the global inductor counter for AMX micro GEMM
+        # usage: if the ISA flag is truthy the counter must be positive, otherwise it must be
+        # exactly zero.
         if vec_amx:
             self.assertTrue(counters["inductor"]["cpp_micro_gemm_amx_counter"] > 0)
         else:
             self.assertEqual(counters["inductor"]["cpp_micro_gemm_amx_counter"], 0)
 
     def _check_brgemm_counter(self, vec_amx):
+        # [FUNCTION DOC] HELPER: Asserts on the brgemm micro GEMM counter: it must be positive
+        # only when the ISA flag is truthy and the CPU supports AMX float16; in every other case
+        # the counter must be exactly zero.
         if vec_amx and torch.cpu._is_amx_fp16_supported():
             self.assertTrue(counters["inductor"]["cpp_micro_brgemm_counter"] > 0)
         else:
@@ -164,6 +212,10 @@ class BaseTestSelectAlgorithm(TestCase):
 
 
 class TestSelectAlgorithm(BaseTestSelectAlgorithm):
+    # [CLASS DOC] Main CPU template GEMM test class. Sets the common checker to check_model,
+    # which compiles a module and compares it with eager. Methods are parametrized over shapes,
+    # bias, dtype and epilogue; they check numerics and the counters for templated kernels and
+    # epilogue fusion.
     common = check_model
 
     @inductor_config.patch({"freezing": True})
@@ -179,12 +231,21 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     def test_linear_static_shapes(
         self, batch_size, in_features, out_features, bias, input_3d, dtype
     ):
+        # [FUNCTION DOC] Compiles a single linear layer over many static shapes (batch, in/out
+        # features, bias, 2D or 3D input, float/bfloat16/half) and checks numerics. Expects
+        # exactly one C++ templated kernel, except when the matmul was decomposed (then the
+        # vectorized path is used and the templated kernel counter must be zero).
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Wrapper module holding one linear layer with the configured
+            # feature sizes and optional bias; forward applies it to the input.
             def __init__(self, bias):
+                # [FUNCTION DOC] HELPER: Builds the single linear layer, using the enclosing
+                # test's in/out feature sizes.
                 super().__init__()
                 self.linear = torch.nn.Linear(in_features, out_features, bias)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer to x and returns the result.
                 return self.linear(x)
 
         counters.clear()
@@ -213,14 +274,23 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
         torch.float,
     )
     def test_linear_wgt_multi_users(self, in_features, out_features, bias, dtype):
+        # [FUNCTION DOC] Checks that a linear layer whose weight is shared with an embedding table
+        # (the weight has multiple users) still uses the C++ template: exactly one templated
+        # kernel is expected. Input is a small integer index tensor.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with an embedding and a linear layer that share the same
+            # weight parameter; forward embeds the indices then applies the linear layer.
             def __init__(self, bias):
+                # [FUNCTION DOC] HELPER: Creates the embedding and linear layers and ties the
+                # linear weight to the embedding weight.
                 super().__init__()
                 self.embeddings = torch.nn.Embedding(out_features, in_features)
                 self.linear = torch.nn.Linear(in_features, out_features, bias)
                 self.linear.weight = self.embeddings.weight
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Looks up embeddings for integer indices x and applies the
+                # linear layer to them.
                 x = self.embeddings(x)
                 return self.linear(x)
 
@@ -238,17 +308,25 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     @parametrize("bias", (True, False))
     @dtypes(torch.float)
     def test_linear_input_transpose(self, bias, dtype):
+        # [FUNCTION DOC] Checks a linear layer compiled on a transposed (non-contiguous) input.
+        # Numerics must match eager, and no templated kernel should be generated (counter zero),
+        # as transposed input is not supported yet (see the TODO).
         batch_size = 384
         in_features = 196
         out_features = 384
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with one linear layer whose forward method is itself
+            # wrapped by the compile decorator.
             def __init__(self, bias):
+                # [FUNCTION DOC] HELPER: Builds the single linear layer from the enclosing
+                # test sizes.
                 super().__init__()
                 self.linear = torch.nn.Linear(in_features, out_features, bias)
 
             @torch.compile
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Compiled forward; applies the linear layer to x.
                 return self.linear(x)
 
         counters.clear()
@@ -291,13 +369,24 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     def test_linear_with_pointwise(
         self, batch_size, in_features, out_features, bias, epilogue, dtype
     ):
+        # [FUNCTION DOC] Linear followed by one pointwise epilogue (activation or binary op with a
+        # random tensor) on a 2D input. Checks numerics, expects exactly one templated kernel, and
+        # checks the epilogue fusion counter: zero when the epilogue is folded into the template
+        # itself (oneDNN low precision linear paths for bfloat16/float16, or float32 with dynamic
+        # shapes, except mul and div, or low precision add without bias treated as bias),
+        # otherwise one fused epilogue.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module applying a linear layer followed by an epilogue callable
+            # built by the epilogue factory.
             def __init__(self, bias, epilogue, other):
+                # [FUNCTION DOC] HELPER: Builds the linear layer and the epilogue callable; other
+                # is the right operand for binary epilogues.
                 super().__init__()
                 self.linear = torch.nn.Linear(in_features, out_features, bias)
                 self.epilogue = _get_epilogue(epilogue, other)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the epilogue applied to the linear output.
                 return self.epilogue(self.linear(x))
 
         counters.clear()
@@ -364,13 +453,22 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     def test_linear_with_transpose(
         self, batch_size, in_features, out_features, bias, epilogue, dtype
     ):
+        # [FUNCTION DOC] Linear plus an optional epilogue, then a transpose of the result and
+        # an add with a second input. Verifies numerics against eager and expects one
+        # templated kernel and one fused epilogue, i.e. the transposed consumer is fused into
+        # the template epilogue.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module computing the epilogue of a linear output, transposing
+            # the first two dimensions and adding a second input.
             def __init__(self, bias, epilogue, other):
+                # [FUNCTION DOC] HELPER: Builds the epilogue callable and the linear layer.
                 super().__init__()
                 self.epilogue = _get_epilogue(epilogue, other)
                 self.linear = torch.nn.Linear(in_features, out_features, bias)
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Applies linear and epilogue to x, transposes the result
+                # and adds y.
                 return self.epilogue(self.linear(x)).transpose(0, 1) + y
 
         counters.clear()
@@ -415,9 +513,19 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
         has_non_epilogue_users,
         dtype,
     ):
+        # [FUNCTION DOC] Reproducer from the convnext model in timm, run under CPU autocast with
+        # bfloat16: linear, permute, multiply, add, depthwise convolution, second linear, permute
+        # and multiply, with an optional extra add that gives the intermediate buffer a
+        # non-epilogue user. Expects two templated kernels and two fused epilogues, and checks
+        # that buffer aliasing with the output buffer is avoided when other users exist.
         # Reproducer from the convnext model in timm
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module mimicking a convnext block tail: two linear layers around
+            # a depthwise convolution with frozen constant tensors, permutes and multiplies; a
+            # flag adds a second user of an intermediate tensor.
             def __init__(self, bias, has_non_epilogue_users):
+                # [FUNCTION DOC] HELPER: Builds two linear layers, a depthwise 7x7 convolution,
+                # two random frozen constant tensors and stores the non-epilogue-users flag.
                 super().__init__()
                 self.linear = torch.nn.Linear(in_features, out_features, bias)
                 self._frozen_param398 = torch.randn(batch_size, out_features, 1, 1)
@@ -433,6 +541,11 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
                 self.has_non_epilogue_users = has_non_epilogue_users
 
             def forward(self, mul_272, _convolution_pointwise_default_31):
+                # [FUNCTION DOC] HELPER: Casts the first input to bfloat16, applies the first
+                # linear, permutes to channels first, scales by a constant, adds the second input,
+                # runs the depthwise convolution, permutes back, applies the second linear,
+                # permutes and scales again. Returns that result, or with the flag set returns its
+                # sum with the earlier add output.
                 out1 = torch.ops.prims.convert_element_type.default(
                     mul_272, torch.bfloat16
                 )
@@ -498,11 +611,20 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     def test_linear_with_input_of_flexible_layout(
         self, batch_size, in_features, linear_in_features, out_features, bias, dtype
     ):
+        # [FUNCTION DOC] Reproducer from the resmlp model in timm: a strided convolution followed
+        # by reshapes, permutes and elementwise ops feeding a linear layer whose input has
+        # flexible layout, then more elementwise ops. Verifies numerics for float32, expects one
+        # fused epilogue and one templated kernel.
         # Reproducer from the resmlp_12_224 model in timm
         flatten_BS = int(batch_size * linear_in_features)
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a patch-embedding convolution, frozen constant
+            # tensors and one linear layer; forward does reshape/permute/affine ops around
+            # the linear.
             def __init__(self, bias):
+                # [FUNCTION DOC] HELPER: Builds the convolution, three random frozen constants and
+                # the linear layer, using sizes from the enclosing test.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(
                     in_features,
@@ -520,6 +642,10 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
                 self.linear = torch.nn.Linear(out_features, out_features, bias)
 
             def forward(self, arg150_1):
+                # [FUNCTION DOC] HELPER: Runs the convolution, reshapes and permutes, applies
+                # multiply and add with frozen constants, reshapes to 2D and applies the linear
+                # layer, then reshapes back, permutes, scales and adds the saved residual tensor;
+                # returns the sum.
                 _convolution_pointwise_default = self.conv(arg150_1)
                 view_73 = torch.ops.aten.reshape.default(
                     _convolution_pointwise_default,
@@ -593,6 +719,11 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
         epilogue,
         dtype,
     ):
+        # [FUNCTION DOC] Reproducer from the jx_nest_base model in timm using two linear layers
+        # and a convolution with reshape/permute operations in between. When the epilogue flag is
+        # set, a power and a forced realization follow the second linear. Expects two templated
+        # kernels, and the epilogue fusion counter is one with the flag, zero without (full fusion
+        # is not yet supported, see the TODO). Runs with autocast disabled for float32.
         img_size_0 = int(size_0 * size_0)
         img_size_1 = int(size_1 * size_1)
         conv_shape = int(size_0 * size_1)
@@ -600,7 +731,12 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
 
         # Reproducer from the jx_nest_base model in timm
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with two linear layers and a convolution, wired with
+            # reshapes, permutes and adds as in the nest model; an optional flag adds a power plus
+            # realize step after the second linear.
             def __init__(self, bias):
+                # [FUNCTION DOC] HELPER: Builds the two linear layers, a 3x3 convolution and
+                # stores the epilogue flag.
                 super().__init__()
                 self.linear1 = torch.nn.Linear(in_features, in_features, bias=bias)
                 self.linear2 = torch.nn.Linear(out_features, in_features, bias=bias)
@@ -616,6 +752,10 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
                 self.epilogue = epilogue
 
             def forward(self, mul_239, view_425, add_184):
+                # [FUNCTION DOC] HELPER: Applies the first linear and adds it to the residual
+                # input, applies the second linear to a reshaped input (optionally squared and
+                # realized), adds both, regroups the result via reshape, permute and contiguous
+                # clone, then applies the convolution and returns its output.
                 _mkl_linear_91 = self.linear1(view_425)
                 view_426 = torch.ops.aten.reshape.default(
                     _mkl_linear_91, [batch_size, img_size_0, img_size_1, in_features]
@@ -713,14 +853,23 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     def test_linear_with_unary_binary(
         self, batch_size, in_features, out_features, bias, unary, binary, dtype
     ):
+        # [FUNCTION DOC] Linear followed by relu and then a binary op (add, sub, mul or div with a
+        # random tensor). Checks numerics, expects one fused epilogue and one templated kernel for
+        # each tested dtype.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module applying linear, then a unary epilogue, then a
+            # binary epilogue.
             def __init__(self, bias, unary, binary, other):
+                # [FUNCTION DOC] HELPER: Builds the linear layer and the unary and binary epilogue
+                # callables from the epilogue factory.
                 super().__init__()
                 self.linear = torch.nn.Linear(in_features, out_features, bias)
                 self.unary = _get_epilogue(unary)
                 self.binary = _get_epilogue(binary, other)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the binary epilogue applied to the unary epilogue
+                # applied to the linear output.
                 return self.binary(self.unary(self.linear(x)))
 
         counters.clear()
@@ -748,13 +897,19 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     def test_linear_with_binary_input_3d(
         self, batch_size, in_features, out_features, bias, binary, dtype
     ):
+        # [FUNCTION DOC] Linear on a 3D input followed by an add of a same-shaped random tensor.
+        # Checks numerics and expects exactly one templated kernel.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module applying a linear layer then a binary epilogue with a
+            # stored operand.
             def __init__(self, bias, binary, other):
+                # [FUNCTION DOC] HELPER: Builds the linear layer and the binary epilogue callable.
                 super().__init__()
                 self.linear = torch.nn.Linear(in_features, out_features, bias)
                 self.binary = _get_epilogue(binary, other)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the binary epilogue applied to the linear output.
                 return self.binary(self.linear(x))
 
         counters.clear()
@@ -775,12 +930,19 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     @parametrize("bias", (True, False))
     @dtypes(torch.bfloat16)
     def test_linear_binary_same_input(self, batch_size, features, bias, dtype):
+        # [FUNCTION DOC] Linear with square size where the output is added to the very same input
+        # tensor (bfloat16). Checks numerics and expects exactly one templated kernel.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module returning the sum of a square linear output and its
+            # own input.
             def __init__(self, bias):
+                # [FUNCTION DOC] HELPER: Builds a square linear layer with the enclosing
+                # feature count.
                 super().__init__()
                 self.linear = torch.nn.Linear(features, features, bias)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the linear output plus the unmodified input.
                 return self.linear(x) + x
 
         counters.clear()
@@ -806,15 +968,26 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     def test_linear_local_and_global_buffer_dynamic_shapes(
         self, batch_size, in_features, out_features, out_features2, bias, dtype
     ):
+        # [FUNCTION DOC] Reproducer from soft_actor_critic with dynamic shapes, one thread and
+        # oneDNN required: a three-layer MLP with relu followed by split, tanh, scale and exp.
+        # Expects three templated kernels and zero fused epilogues, exercising local and global
+        # buffer handling with dynamic batch size.
         # Reproducer from soft_actor_critic
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Three linear layers with relus between them whose last output is
+            # split into two columns, one passed through tanh, an affine transform and exp.
             def __init__(self, bias):
+                # [FUNCTION DOC] HELPER: Builds three linear layers with the enclosing
+                # feature sizes.
                 super().__init__()
                 self.linear = torch.nn.Linear(in_features, out_features, bias)
                 self.linear1 = torch.nn.Linear(out_features, out_features, bias)
                 self.linear2 = torch.nn.Linear(out_features, out_features2, bias)
 
             def forward(self, arg7_1):
+                # [FUNCTION DOC] HELPER: Runs the MLP, splits the final output along the feature
+                # dimension, and returns a tuple of the first slice and the exponential of a
+                # scaled and shifted tanh of the second slice.
                 addmm_3 = self.linear(arg7_1)
                 relu_2 = torch.ops.aten.relu.default(addmm_3)
 
@@ -858,12 +1031,19 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     @parametrize("bias", (True, False))
     @dtypes(torch.bfloat16, torch.half)
     def test_linear_amx(self, batch_size, in_features, out_features, bias, dtype):
+        # [FUNCTION DOC] Skipped unless the picked vector ISA is AMX. Compiles a bfloat16 or
+        # half linear layer and expects one templated kernel; then checks the AMX micro GEMM
+        # counter, except for half on hardware without AMX fp16 where the brgemm counter is
+        # checked instead.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module wrapping one linear layer.
             def __init__(self, bias):
+                # [FUNCTION DOC] HELPER: Builds the linear layer with the enclosing feature sizes.
                 super().__init__()
                 self.linear = torch.nn.Linear(in_features, out_features, bias)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer to x.
                 return self.linear(x)
 
         counters.clear()
@@ -901,11 +1081,19 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
         bias,
         dtype,
     ):
+        # [FUNCTION DOC] Reproducer from the levit model in timm: a bias-free linear followed by
+        # reshape, affine ops with frozen constants and a hardswish-like clamp pipeline. Expects
+        # one templated kernel and two fused epilogues, exercising epilogue nodes with multiple
+        # index remappings.
         flatten_BS = int(batch_size * in_features_2)
 
         # Reproducer from the levit_128 model in timm
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a convolution (unused in forward), a bias-free
+            # linear and four random frozen constant tensors used as per-feature scale and shift.
             def __init__(self, bias):
+                # [FUNCTION DOC] HELPER: Builds a convolution, a bias-free linear layer and four
+                # random frozen vectors.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(
                     64,
@@ -923,6 +1111,10 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
                 self._frozen_param21 = torch.randn(out_features)
 
             def forward(self, view_368):
+                # [FUNCTION DOC] HELPER: Applies the linear, reshapes to 3D and back to 2D,
+                # subtracts, multiplies twice and adds frozen constants, reshapes to 3D, then
+                # applies a clamped hardswish-style activation (add 3, clamp to 0..6, multiply,
+                # divide by 6). Returns the result.
                 _mkl_linear_57 = self.linear(view_368)
                 view_369 = torch.ops.aten.reshape.default(
                     _mkl_linear_57, [batch_size, in_features_2, out_features]
@@ -982,8 +1174,13 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     def test_linear_with_embedding(
         self, batch_size, in_features, out_features, bias, dtype
     ):
+        # [FUNCTION DOC] bfloat16 linear whose output is added to an embedding lookup. Expects one
+        # templated kernel and one fused epilogue.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module summing an embedding lookup and a bfloat16 linear output.
             def __init__(self, bias):
+                # [FUNCTION DOC] HELPER: Builds a bfloat16 linear layer and an embedding with
+                # 64 rows.
                 super().__init__()
                 self.linear = torch.nn.Linear(in_features, out_features, bias).to(
                     dtype=dtype
@@ -991,6 +1188,8 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
                 self.emb = torch.nn.Embedding(64, out_features)
 
             def forward(self, idx, x):
+                # [FUNCTION DOC] HELPER: Returns the embedding of idx added to the linear output
+                # of x.
                 return self.emb(idx) + self.linear(x)
 
         idx = torch.randint(0, 64, (batch_size,))
@@ -1013,15 +1212,25 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     def test_linear_with_indirect_indexing(
         self, batch_size, in_features, seq_lens, out_features, bias, dtype
     ):
+        # [FUNCTION DOC] Reproducer from the GPT2 sequence classification model in HuggingFace:
+        # token and position embeddings (indirect indexing) added to a linear output, under CPU
+        # autocast. Expects one templated kernel and one fused epilogue.
         # Reproducer from the GPT2ForSequenceClassification model in HuggingFace
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with token and position embeddings and a linear layer;
+            # combines their sums with an input and the reshaped linear result.
             def __init__(self, bias):
+                # [FUNCTION DOC] HELPER: Builds two embeddings and a linear layer using the
+                # enclosing sequence length and feature sizes.
                 super().__init__()
                 self.wte = torch.nn.Embedding(128, seq_lens)
                 self.wpe = torch.nn.Embedding(in_features, seq_lens)
                 self.linear = torch.nn.Linear(out_features, seq_lens, bias)
 
             def forward(self, view_12, input_ids, view_9):
+                # [FUNCTION DOC] HELPER: Embeds input ids and an arange of positions, sums both
+                # embeddings with view_9, applies the linear to view_12, reshapes the result to 3D
+                # and returns the sum with the embedding sum.
                 inputs_embeds = self.wte(input_ids)
 
                 position_ids = torch.arange(0, in_features, dtype=torch.long)
@@ -1082,9 +1291,19 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
         bias,
         dtype,
     ):
+        # [FUNCTION DOC] Reproducer from the coat_lite_mini model in timm: a patch-embedding
+        # convolution, layer-norm style statistics, concatenations, depthwise convolutions,
+        # attention-like batched matmuls and a linear layer. Requires oneDNN. Expects two
+        # templated kernels and two fused epilogues (one when MKL is not available).
         # Reproducer from the coat_lite_mini model in timm
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Large module reproducing a CoaT block: convolutions, layer-norm
+            # arithmetic written with explicit ops, a linear projection, softmax, two batched
+            # matmuls and a convolutional position encoding.
             def __init__(self, bias):
+                # [FUNCTION DOC] HELPER: Creates five convolutions (a strided patch embedding and
+                # four depthwise ones), two linear layers, several random frozen parameters and a
+                # class-token constant.
                 super().__init__()
                 self._frozen_param398 = torch.randn(batch_size, out_features, 1, 1)
                 self.conv = torch.nn.Conv2d(
@@ -1146,6 +1365,11 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
                 self._frozen_param153 = torch.randn(batch_size, 1, out_features)
 
             def forward(self, arg152_1):
+                # [FUNCTION DOC] HELPER: Runs the long traced graph: patch embedding, layer-norm
+                # style normalization, concatenation with the class token, depthwise convolution
+                # residual, second normalization, the linear projection, qkv split, softmax, two
+                # batched matmuls, three depthwise convolutions on channel groups, concatenation,
+                # multiply, pad and add. Returns the final tensor.
                 _convolution_pointwise_default_35 = self.conv(arg152_1)
                 arg152_1 = None
 
@@ -1380,11 +1604,20 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     def test_quantized_linear_with_pointwise(
         self, batch_size, in_features, out_features, bias, input_3d, dtype, epilogue
     ):
+        # [FUNCTION DOC] Builds two statically quantized linear layers back to back (first outputs
+        # uint8, second the test dtype) with an optional relu or gelu epilogue, exports them, then
+        # compiles and compares to the exported eager run with dtype dependent tolerances (looser
+        # for bfloat16). The feature dimension is marked static. Expects two templated kernels and
+        # zero fused epilogues. Skipped on Windows.
         B = (2, batch_size) if input_3d else (batch_size,)
         input = torch.randn(*B, in_features).to(dtype=torch.float32)
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module chaining two statically quantized linear modules from the
+            # common quantization test helper.
             def __init__(self, bias):
+                # [FUNCTION DOC] HELPER: Builds two quantized linear modules; the second one is
+                # calibrated using the first one's float output on the example input.
                 super().__init__()
                 self.linear = _static_quantized_linear_module(
                     N=out_features,
@@ -1404,6 +1637,8 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the first quantized linear, then the second, and
+                # returns the result.
                 res = self.linear(x)
                 res = self.linear2(res)
                 return res
@@ -1471,6 +1706,12 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
         dtype,
         epilogue,
     ):
+        # [FUNCTION DOC] Tests static quantized linear with binary post-ops. Returns immediately
+        # for bfloat16 unless int8 mixed bf16 is on. Exports two modules (one with add and sum
+        # binary ops chained, one with two sum ops), compiles both, compares each with its eager
+        # result with 5e-2 tolerances, and expects four templated kernels and zero fused
+        # epilogues. The binary operands are reshaped so the in-place sum fusion is intentionally
+        # not triggered. Skipped on Windows.
         if not int8_mixed_bf16 and dtype == torch.bfloat16:
             return
         B = (2, batch_size) if input_3d else (batch_size,)
@@ -1488,7 +1729,12 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
         other_clone = other.clone()
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Two chained quantized linear modules with binary post-ops: the
+            # first adds an extra tensor, the second sums into a reshaped extra tensor.
             def __init__(self, bias, input_3d):
+                # [FUNCTION DOC] HELPER: Builds the first binary quantized linear (add, uint8
+                # output), derives example input for the second from an eager run, builds the
+                # second (sum, test dtype output), and stores the 3D flag.
                 super().__init__()
                 self.linear = _static_quantized_linear_binary_module(
                     N=out_features,
@@ -1516,6 +1762,9 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
                 self.input_3d = input_3d
 
             def forward(self, x, other, other2):
+                # [FUNCTION DOC] HELPER: Reshapes the third input to either 3D or 2D matching the
+                # flag (avoiding in-place sum fusion), applies the first linear with the second
+                # input, then the second linear with the reshaped tensor, and returns the result.
                 # Avoid hitting qlinear inplace sum fusion with intentionally mismatched shapes
                 if self.input_3d:
                     other2 = other2.view(2, other2.size(0) // 2, other2.size(1))
@@ -1526,7 +1775,11 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
                 return res
 
         class M2(torch.nn.Module):
+            # [CLASS DOC] HELPER: Two quantized linear modules both using the sum binary post-op;
+            # the second consumes the first output as its binary operand.
             def __init__(self, bias):
+                # [FUNCTION DOC] HELPER: Builds two binary quantized linear modules with sum
+                # post-ops and the enclosing dtype and epilogue.
                 super().__init__()
                 self.linear = _static_quantized_linear_binary_module(
                     N=out_features,
@@ -1550,6 +1803,9 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
                 )
 
             def forward(self, x0, x1, other):
+                # [FUNCTION DOC] HELPER: Applies the first linear to x0 with the extra tensor,
+                # then the second linear to x1 with the previous result as the binary operand;
+                # returns the final result.
                 res = self.linear(x0, other)
                 res = self.linear2(x1, res)
                 return res
@@ -1623,16 +1879,23 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     @parametrize("bias", (True, False))
     @unittest.skipIf(IS_WINDOWS, "Not supported on Windows")
     def test_quantized_linear_amx(self, batch_size, in_features, out_features, bias):
+        # [FUNCTION DOC] Skipped unless AMX is the picked ISA (and on Windows). Compiles a static
+        # quantized linear for several batch sizes with in-features that are multiples of four.
+        # Verifies with 1e-2 tolerances, expects one templated kernel and checks the AMX counter.
         v = torch.randn(batch_size, in_features).to(dtype=torch.float32)
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module wrapping one statically quantized linear module.
             def __init__(self, bias):
+                # [FUNCTION DOC] HELPER: Builds the quantized linear module using the enclosing
+                # sizes and example input.
                 super().__init__()
                 self.linear = _static_quantized_linear_module(
                     N=out_features, K=in_features, bias=bias, example_input=v
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the quantized linear module to x.
                 return self.linear(x)
 
         counters.clear()
@@ -1653,8 +1916,17 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     @torch.no_grad
     @dtypes(torch.float32, torch.bfloat16)
     def test_qlinear_pointwise_int8_layout(self, dtype):
+        # [FUNCTION DOC] Tests the oneDNN quantized linear op producing an int8 output (int8
+        # layout path) with random packed weights, bias of the test dtype, float or bfloat16 input
+        # quantized per tensor with decomposed ops. Expects one templated kernel.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module calling the oneDNN quantized pointwise linear op with
+            # prepacked random int8 weights, fixed weight scales and zero points, output scale 0.5
+            # and int8 output dtype.
             def __init__(self, N, K):
+                # [FUNCTION DOC] HELPER: Creates random int8 weights, prepacks them, and stores
+                # weight scales, zero points, bias, output quantization parameters and post-op
+                # settings as attributes.
                 super().__init__()
                 qw = torch.randint(-128, 127, (N, K), dtype=torch.int8)
                 self.w_scales = torch.Tensor([0.8] * N)
@@ -1670,6 +1942,9 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
                 self.post_op_algo = "none"
 
             def forward(self, qx, x_scale, x_zp):
+                # [FUNCTION DOC] HELPER: Calls the quantized pointwise linear op with the
+                # quantized input, its scale and zero point and all stored parameters; returns the
+                # int8 result.
                 return torch.ops.onednn.qlinear_pointwise(
                     qx,
                     x_scale,
@@ -1725,7 +2000,17 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     )
     @unittest.skipIf(TEST_ACL, "OP fusion disabled with ACL")
     def test_int8_woq_mm(self, dtype, batch_size, mid_dim, in_features, out_features):
+        # [FUNCTION DOC] Weight-only int8 quantized matmul pattern (bfloat16, oneDNN required):
+        # linear with an int8 weight converted to the activation dtype and multiplied by
+        # per-channel scales, on a 3D input. Skipped on AArch64 without SVE and when ACL is used.
+        # Expects one templated kernel; when batch times middle dimension is at least 16 it also
+        # checks the AMX counter.
         def _convert_weight_to_int8pack(w):
+            # [FUNCTION DOC] HELPER: Quantizes a floating weight tensor per output channel to
+            # int8. Computes per-channel scale and zero point from the weight converted to float32
+            # with the shared quantization helper, converts them from numpy to tensors, and
+            # applies the decomposed per-channel quantize op along axis zero with range minus 128
+            # to 127. Returns the int8 weight and the scale converted to bfloat16.
             scale, zp = _calculate_dynamic_per_channel_qparams(
                 w.to(torch.float), torch.int8
             )
@@ -1743,11 +2028,17 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
             return w_int8, scale.to(torch.bfloat16)
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module holding a frozen int8 weight parameter; forward is a
+            # linear with the weight cast to the input dtype, then multiplied by the given scale.
             def __init__(self, w):
+                # [FUNCTION DOC] HELPER: Stores the int8 weight tensor as a parameter that does
+                # not require gradients.
                 super().__init__()
                 self.linear_weight = torch.nn.Parameter(w, requires_grad=False)
 
             def forward(self, x, scale):
+                # [FUNCTION DOC] HELPER: Returns the linear of x with the dequantized-by-cast
+                # weight, multiplied by scale.
                 return (
                     torch.nn.functional.linear(x, self.linear_weight.to(x.dtype))
                     * scale
@@ -1793,7 +2084,14 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     def test_int8_woq_mm_concat(
         self, dtype, batch_size, mid_dim, in_features, out_features
     ):
+        # [FUNCTION DOC] Same weight-only int8 pattern as the single case but with three
+        # independent weights sharing the same input, with the concat-linear option enabled (so
+        # the three matmuls are merged). Expects one templated kernel; checks the AMX counter when
+        # batch times middle dimension is at least 16. Skipped on AArch64 without SVE.
         def _convert_weight_to_int8pack(w):
+            # [FUNCTION DOC] HELPER: Quantizes a floating weight per output channel to int8 and
+            # returns the int8 weight with its bfloat16 scales; identical in behavior to the
+            # helper of the same name in the single-weight test.
             scale, zp = _calculate_dynamic_per_channel_qparams(
                 w.to(torch.float), torch.int8
             )
@@ -1811,13 +2109,21 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
             return w_int8, scale.to(torch.bfloat16)
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with three frozen int8 weight parameters; forward
+            # computes three matmuls of the flattened input with each transposed weight cast to
+            # the input dtype, scales each result, and returns a tuple of three outputs reshaped
+            # to the leading input shape.
             def __init__(self, w1, w2, w3):
+                # [FUNCTION DOC] HELPER: Stores the three int8 weights as parameters that do not
+                # require gradients.
                 super().__init__()
                 self.w1 = torch.nn.Parameter(w1, requires_grad=False)
                 self.w2 = torch.nn.Parameter(w2, requires_grad=False)
                 self.w3 = torch.nn.Parameter(w3, requires_grad=False)
 
             def forward(self, x, scale1, scale2, scale3):
+                # [FUNCTION DOC] HELPER: Flattens x to 2D, computes the three scaled matmuls,
+                # reshapes each to the original leading dimensions and returns them as a tuple.
                 # Ref: _linear_fp_act_int8_weight_impl in torchao/dtypes/uintx/plain_layout.py
                 y1 = (
                     torch.mm(x.reshape(-1, x.shape[-1]), self.w1.t().to(x.dtype))
@@ -1865,8 +2171,18 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     def test_int4_woq_mm_avx512(
         self, dtype, batch_size, in_features, out_features, group_size
     ):
+        # [FUNCTION DOC] Int4 weight-only matmul via the CPU int4 pack matmul op, with bfloat16
+        # scales and zeros. The result is compared with the reference computed in the low
+        # precision dtype. The count of autotune selections must be one when the picked vector ISA
+        # name mentions avx512, otherwise zero.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a random packed uint8 int4 weight, random per-group
+            # scale and zero tensor, and group size; forward flattens the input, runs the int4
+            # pack matmul and restores the leading shape.
             def __init__(self, K, N, group_size):
+                # [FUNCTION DOC] HELPER: Creates random packed weights (half the input features
+                # per row) and random scale and zeros tensors, one entry per group, and stores the
+                # group size.
                 super().__init__()
                 self.linear_weight = torch.randint(
                     0, 15, (N, K // 2), dtype=torch.uint8
@@ -1875,6 +2191,9 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
                 self.group_size = group_size
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Reshapes x to 2D, calls the int4 pack matmul op with the
+                # stored weight, group size and scales, and reshapes the result back to the
+                # leading dimensions with the enclosing out_features.
                 x_shape = x.shape
                 x = x.reshape(-1, x_shape[-1])
                 y = torch._weight_int4pack_mm_for_cpu(
@@ -1910,6 +2229,11 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     def test_int4_woq_mm_amx_Nc_larger_than_one(
         self, dtype, batch_size, in_features, out_features, group_size
     ):
+        # [FUNCTION DOC] Skipped unless AMX is available. Runs with one thread. Compiles an int4
+        # matmul with a large reduction dimension and compares with a reference that dequantizes
+        # the weight and does a bfloat16 linear, with 1e-2 tolerances, with algorithm verification
+        # turned off (the int4 op computes in float32 while the AMX template uses bfloat16).
+        # Expects exactly one autotune selection.
         """
         Note:
         `torch._weight_int4pack_mm_for_cpu` computes with float32, while the AMX-based GEMM
@@ -1922,7 +2246,11 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
         """
 
         class M1(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module providing the int4 pack matmul pattern and its random
+            # packed parameters.
             def __init__(self, K, N, group_size):
+                # [FUNCTION DOC] HELPER: Creates random packed uint8 weights, scale and zeros
+                # tensor, and stores the group size.
                 super().__init__()
                 self.linear_weight = torch.randint(
                     0, 255, (N, K // 2), dtype=torch.uint8
@@ -1931,6 +2259,8 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
                 self.group_size = group_size
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Flattens x, applies the int4 pack matmul and reshapes to
+                # the leading dimensions with the enclosing out_features.
                 x_shape = x.shape
                 x = x.reshape(-1, x_shape[-1])
                 y = torch._weight_int4pack_mm_for_cpu(
@@ -1939,11 +2269,18 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
                 return y.reshape(*x_shape[:-1], out_features)
 
         class M2(torch.nn.Module):
+            # [CLASS DOC] HELPER: Reference module that wraps the int4 module and reconstructs a
+            # bfloat16 dequantized weight by passing an identity matrix through it, then applies a
+            # regular linear.
             def __init__(self, mod: M1):
+                # [FUNCTION DOC] HELPER: Stores the wrapped int4 module.
                 super().__init__()
                 self.mod = mod
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Builds an identity matrix matching the last dimension and
+                # dtype of x, passes it through the wrapped module and transposes the result into
+                # a contiguous dequantized weight, then returns the linear of x with it.
                 x_eye = torch.eye(x.shape[-1], device=x.device, dtype=x.dtype)
                 dq_w = self.mod(x_eye).T.contiguous()
                 return torch.nn.functional.linear(x, dq_w)
@@ -1983,8 +2320,17 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     def test_int4_woq_mm_with_small_buffer_config(
         self, dtype, batch_size, in_features, out_features, group_size
     ):
+        # [FUNCTION DOC] Skipped unless AMX is available; one thread; enables the small dequant
+        # buffer option. Compiles an int4 matmul with batch size sixteen and sequence length
+        # one, with verification off, and checks the generated C++ source contains a constant
+        # for the number of K blocks equal to the group size divided by 32 (the only supported
+        # value of kr).
         class M1(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with the int4 pack matmul pattern and random
+            # packed parameters.
             def __init__(self, K, N, group_size):
+                # [FUNCTION DOC] HELPER: Creates random packed uint8 weights, scale and zeros
+                # tensor, and stores the group size.
                 super().__init__()
                 self.linear_weight = torch.randint(
                     0, 255, (N, K // 2), dtype=torch.uint8
@@ -1993,6 +2339,8 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
                 self.group_size = group_size
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Flattens x, applies the int4 pack matmul and reshapes to
+                # the leading dimensions with the enclosing out_features.
                 x_shape = x.shape
                 x = x.reshape(-1, x_shape[-1])
                 y = torch._weight_int4pack_mm_for_cpu(
@@ -2027,6 +2375,10 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     def test_int4_woq_mm_amx(
         self, dtype, batch_size, in_features, out_features, group_size
     ):
+        # [FUNCTION DOC] Expected to fail on ARM64 (numerical errors); skipped unless AMX is
+        # available. Compiles an int4 matmul for several batch, feature and group sizes with
+        # verification off and compares to a bfloat16 reference using dequantized weights with
+        # 1e-2 tolerances. Expects exactly one autotune selection.
         """
         Note:
         `torch._weight_int4pack_mm_for_cpu` computes with float32, while the AMX-based GEMM
@@ -2039,7 +2391,11 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
         """
 
         class M1(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with the int4 pack matmul pattern and random
+            # packed parameters.
             def __init__(self, K, N, group_size):
+                # [FUNCTION DOC] HELPER: Creates random packed uint8 weights, scale and zeros
+                # tensor, and stores the group size.
                 super().__init__()
                 self.linear_weight = torch.randint(
                     0, 255, (N, K // 2), dtype=torch.uint8
@@ -2048,6 +2404,8 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
                 self.group_size = group_size
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Flattens x, applies the int4 pack matmul and reshapes to
+                # the leading dimensions with the enclosing out_features.
                 x_shape = x.shape
                 x = x.reshape(-1, x_shape[-1])
                 y = torch._weight_int4pack_mm_for_cpu(
@@ -2056,11 +2414,17 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
                 return y.reshape(*x_shape[:-1], out_features)
 
         class M2(torch.nn.Module):
+            # [CLASS DOC] HELPER: Reference module that dequantizes the int4 weight by feeding an
+            # identity matrix through the wrapped module and then applies a regular linear.
             def __init__(self, mod: M1):
+                # [FUNCTION DOC] HELPER: Stores the wrapped int4 module.
                 super().__init__()
                 self.mod = mod
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Builds an identity matrix, obtains the dequantized
+                # transposed contiguous weight from the wrapped module, and returns the linear of
+                # x with it.
                 x_eye = torch.eye(x.shape[-1], device=x.device, dtype=x.dtype)
                 dq_w = self.mod(x_eye).T.contiguous()
                 return torch.nn.functional.linear(x, dq_w)
@@ -2100,8 +2464,19 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     def test_int4_concat_woq_mm(
         self, dtype, batch_size, in_features, out_features, group_size
     ):
+        # [FUNCTION DOC] Expected to fail on ARM64; skipped unless AMX is available; enables
+        # concat linear. Compiles an int4 module with several int4 matmuls sharing one input (two
+        # or three output sizes) and compares the list of outputs with a dequantized bfloat16
+        # reference using 1e-2 tolerances, with verification off. Because the weights get
+        # concatenated, only one autotune selection is expected.
         class M1(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module holding lists of random packed int4 weights and
+            # scale tensors, one per output size; forward runs one int4 pack matmul per
+            # entry on the same flattened input and returns a list of outputs reshaped to
+            # the leading dimensions.
             def __init__(self, K, out_features, group_size):
+                # [FUNCTION DOC] HELPER: Creates one random packed weight and one scale and zeros
+                # tensor for each output size, and stores the group size and output sizes.
                 super().__init__()
                 self.linear_weight = [
                     torch.randint(0, 255, (N, K // 2), dtype=torch.uint8)
@@ -2114,6 +2489,8 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
                 self.out_features = out_features
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Flattens x, runs each int4 matmul and returns a list of
+                # reshaped outputs.
                 x_shape = x.shape
                 x = x.reshape(-1, x_shape[-1])
                 y = [
@@ -2131,11 +2508,17 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
                 ]
 
         class M2(torch.nn.Module):
+            # [CLASS DOC] HELPER: Reference module that dequantizes each weight by passing an
+            # identity matrix through the int4 op and returns a list of regular linear results.
             def __init__(self, mod: M1):
+                # [FUNCTION DOC] HELPER: Stores the wrapped int4 module.
                 super().__init__()
                 self.mod = mod
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: For each weight, runs the int4 op on an identity matrix
+                # to get a dequantized contiguous transposed weight, then returns the list of
+                # linear results of x with each.
                 x_eye = torch.eye(x.shape[-1], device=x.device, dtype=x.dtype)
                 dq_w_list = []
                 for idx in range(len(self.mod.out_features)):
@@ -2193,13 +2576,19 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     def test_linear_k_slicing(
         self, batch_size, in_features, out_features, bias, epilogue, dtype
     ):
+        # [FUNCTION DOC] Linear with a tiny output size and large reduction dimension, with the
+        # maximum number of K slices option set to zero (auto), optionally followed by relu.
+        # Verifies numerics and expects one templated kernel.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module applying a linear layer then an epilogue callable.
             def __init__(self, bias, epilogue, other):
+                # [FUNCTION DOC] HELPER: Builds the linear layer and the epilogue callable.
                 super().__init__()
                 self.linear = torch.nn.Linear(in_features, out_features, bias)
                 self.epilogue = _get_epilogue(epilogue, other)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the epilogue applied to the linear output.
                 return self.epilogue(self.linear(x))
 
         counters.clear()
@@ -2224,12 +2613,17 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     def test_linear_cache_blocking(
         self, batch_size, in_features, out_features, bias, dtype
     ):
+        # [FUNCTION DOC] Single-thread linear with explicit cache blocking configuration of 2,2,2.
+        # Verifies numerics and expects one templated kernel.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module wrapping one linear layer.
             def __init__(self, bias):
+                # [FUNCTION DOC] HELPER: Builds the linear layer with the enclosing sizes.
                 super().__init__()
                 self.linear = torch.nn.Linear(in_features, out_features, bias)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer to x.
                 return self.linear(x)
 
         counters.clear()
@@ -2253,12 +2647,17 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     def test_linear_thread_factors(
         self, batch_size, in_features, out_features, bias, dtype
     ):
+        # [FUNCTION DOC] Linear with a fixed thread factor configuration of 4,2,7 and the thread
+        # count set to 56. Verifies numerics and expects one templated kernel.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module wrapping one linear layer.
             def __init__(self, bias):
+                # [FUNCTION DOC] HELPER: Builds the linear layer with the enclosing sizes.
                 super().__init__()
                 self.linear = torch.nn.Linear(in_features, out_features, bias)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer to x.
                 return self.linear(x)
 
         counters.clear()
@@ -2277,12 +2676,18 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     @requires_mkl
     @set_num_threads(56)
     def test_linear_thread_factors_k_slicing_misaligned_cache_blocks(self):
+        # [FUNCTION DOC] Float32 linear 1024 by 1024 with bias, 56 threads, thread factors 4,2,7
+        # and cache blocking 3,3,1024, which forces cache blocks to cross thread-block boundaries
+        # when K slicing is active. Verifies numerics and expects one templated kernel.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module wrapping a 1024 by 1024 linear layer with bias.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Builds the linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(1024, 1024, True)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer to x.
                 return self.linear(x)
 
         # Forces cache blocks to cross thread-block boundaries while k-slicing is active.
@@ -2306,6 +2711,11 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
         torch.float,
     )
     def test_aoti_linear(self, batch_size, in_features, out_features, bias, dtype):
+        # [FUNCTION DOC] Compiles a linear plus relu model ahead of time with the AOT Inductor
+        # test runner (freezing off) and compares with eager. The test returns silently if the AOT
+        # test utility module cannot be imported. Raises an assertion error if freezing is
+        # unexpectedly enabled. Resets dynamo and inductor metrics, seeds the generator, and
+        # expects one templated kernel.
         try:
             try:
                 from . import test_aot_inductor_utils
@@ -2316,7 +2726,9 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
             return
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a sequential linear layer followed by relu.
             def __init__(self, bias=bias) -> None:
+                # [FUNCTION DOC] HELPER: Builds the sequential container of linear and relu.
                 super().__init__()
                 self.mlp = torch.nn.Sequential(
                     torch.nn.Linear(in_features, out_features, bias=bias),
@@ -2324,6 +2736,7 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the sequential container to x.
                 return self.mlp(x)
 
         if torch._inductor.config.freezing is not False:
@@ -2361,8 +2774,19 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
         out_features,
         gemm_num,
     ):
+        # [FUNCTION DOC] With the grouped GEMM template enabled, builds a module with several
+        # bias-free linear layers on the same input where each layer has a different output size,
+        # so grouping is invalid. For each low precision dtype supported by oneDNN (bfloat16,
+        # float16) it resets metrics, compiles under autocast and checks numerics, then expects
+        # one independent templated kernel per linear layer and zero grouped GEMM template uses.
+        # Does nothing if neither dtype is supported.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module holding a plain Python list of bias-free linear layers
+            # whose output sizes grow by one per index; forward returns the list of all outputs
+            # for the same input.
             def __init__(self, in_feature, out_feature, gemm_num):
+                # [FUNCTION DOC] HELPER: Creates the requested number of linear layers with
+                # distinct output sizes.
                 super().__init__()
                 self.linears = [
                     torch.nn.Linear(in_feature, out_feature + gemm_idx, bias=False)
@@ -2370,6 +2794,8 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
                 ]
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies every linear layer to x and returns the list
+                # of results.
                 return [linear(x) for linear in self.linears]
 
         # each linear has different num of out features, thus invalid grouped gemm
@@ -2415,8 +2841,15 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
         input_3d,
         gemm_num,
     ):
+        # [FUNCTION DOC] With the grouped GEMM template enabled, runs several bias-free linear
+        # layers of identical shape on the same 2D or 3D input, for each oneDNN-supported low
+        # precision dtype under autocast (float16 with 3D input is skipped to cut test count).
+        # Checks numerics and expects exactly one grouped GEMM template use.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module holding a plain Python list of identical-shaped bias-free
+            # linear layers; forward returns the list of outputs for one input.
             def __init__(self, in_feature, out_feature, gemm_num):
+                # [FUNCTION DOC] HELPER: Creates the requested number of identical linear layers.
                 super().__init__()
                 self.linears = [
                     torch.nn.Linear(in_feature, out_feature, bias=False)
@@ -2424,6 +2857,8 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
                 ]
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies every linear layer to x and returns the list
+                # of results.
                 return [linear(x) for linear in self.linears]
 
         dtypes = []
@@ -2489,8 +2924,19 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
         epilogue,
         loop_ordering_after_fusion,
     ):
+        # [FUNCTION DOC] Grouped GEMM with epilogues: two linear layers on the same input with
+        # per-layer bias flags and epilogue choices (none, relu, or a silu on the first multiplied
+        # with the second), with the loop-ordering-after-fusion option toggled. For each
+        # oneDNN-supported low precision dtype (float16 with 3D input skipped), checks numerics
+        # under autocast, expects exactly one grouped GEMM template use, and requires at least one
+        # fused epilogue when any epilogue is not none.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with two linear layers sharing the same input; forward
+            # either returns silu of the first times the second, or returns both outputs with
+            # optional relu on each depending on the epilogue names.
             def __init__(self, in_feature, out_feature, bias, epilogue):
+                # [FUNCTION DOC] HELPER: Creates two linear layers with the per-layer bias flags
+                # and stores the two epilogue names.
                 super().__init__()
                 self.linear0 = torch.nn.Linear(in_feature, out_feature, bias=bias[0])
                 self.linear1 = torch.nn.Linear(in_feature, out_feature, bias=bias[1])
@@ -2498,6 +2944,9 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
                 self.epilogue1 = epilogue[1]
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Computes both linear outputs; returns the
+                # silu-times-product when the epilogues are silu and mul, otherwise applies relu
+                # where requested and returns a tuple of both results.
                 res0 = self.linear0(x)
                 res1 = self.linear1(x)
                 if self.epilogue0 == "silu" and self.epilogue1 == "mul":
@@ -2552,6 +3001,10 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     def test_aoti_linear_multi_view_operations(
         self, batch_size, in_features, out_features, dtype
     ):
+        # [FUNCTION DOC] AOT Inductor test with an addmm whose weight is produced by permute and
+        # view operations from a 3D tensor, followed by relu. Returns silently if the AOT utility
+        # cannot be imported. Raises an assertion error if freezing is on. Compares the AOT result
+        # with eager and expects one templated kernel.
         try:
             try:
                 from . import test_aot_inductor_utils
@@ -2562,13 +3015,19 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
             return
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with random bias, a 3D weight tensor and relu; forward
+            # does an addmm against the weight permuted and viewed to 2D, followed by relu.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates a random bias, a random weight of shape half the
+                # output size by two by input size, and a relu module.
                 super().__init__()
                 self.bias = torch.randn(out_features)
                 self.weight = torch.randn(out_features // 2, 2, in_features)
                 self.relu = torch.nn.ReLU()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Computes the bias-added matrix product of x with the
+                # permuted and viewed weight and returns its relu.
                 tmp = torch.addmm(
                     self.bias,
                     x,
@@ -2600,12 +3059,18 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     @torch.no_grad
     @requires_mkl
     def test_cpp_coordinate_descent_tuning(self):
+        # [FUNCTION DOC] Compiles a bias-free 512 by 1024 linear with coordinate descent tuning
+        # and freezing on, under CPU autocast with bfloat16 tolerances, after resetting dynamo and
+        # inductor metrics. Expects one templated kernel.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module wrapping one bias-free linear layer.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Builds the linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(512, 1024, bias=False)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer to x.
                 return self.linear(x)
 
         v = torch.randn(1, 512)
@@ -2626,12 +3091,19 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     @parametrize("out_features", (64,))
     @parametrize("bias", (True, False))
     def test_linear_to_lowp_fp(self, batch_size, in_features, out_features, bias):
+        # [FUNCTION DOC] Linear computed in float32 whose output is cast to float16 inside the
+        # model. Verifies numerics and expects one templated kernel (the cast to low precision is
+        # handled with the template).
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module applying a linear layer and then casting its output
+            # to float16.
             def __init__(self, bias):
+                # [FUNCTION DOC] HELPER: Builds the linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(in_features, out_features, bias)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies linear and casts the result to float16.
                 return self.linear(x).to(torch.float16)
 
         counters.clear()
@@ -2648,12 +3120,18 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     @torch.no_grad
     @requires_mkl
     def test_cpp_weight_prune(self):
+        # [FUNCTION DOC] Bias-free bfloat16 linear with freezing; resets metrics and expects one
+        # templated kernel and one weight pruning counter increment (the original weight is
+        # dropped after packing).
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module wrapping one bias-free 32 by 128 linear layer.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Builds the linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(32, 128, bias=False)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer to x.
                 return self.linear(x)
 
         v = torch.randn(2, 32).to(torch.bfloat16)
@@ -2675,11 +3153,17 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     @parametrize("Ndim", (84, 385))
     @dtypes(torch.float, torch.bfloat16, torch.half)
     def test_bmm(self, dtype, bs, Mdim, Kdim, Ndim):
+        # [FUNCTION DOC] Batched matmul of two random inputs with varying batch size and matrix
+        # dimensions and three dtypes; checks numerics and expects exactly one templated kernel.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Stateless module whose forward returns the batched matrix
+            # product of its two inputs.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Plain module constructor with no state.
                 super().__init__()
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the matrix product of x and y.
                 return x @ y
 
         counters.clear()
@@ -2699,11 +3183,18 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     @parametrize("Ndim", (3, 16, 32, 48, 128, 1024, 1025))
     @dtypes(torch.bfloat16, torch.half)
     def test_bmm_amx(self, dtype, bs, Mdim, Kdim, Ndim):
+        # [FUNCTION DOC] Batched matmul for bfloat16 and half with small M and K and a range of N
+        # sizes (including non multiples). Expects one templated kernel, then checks the brgemm
+        # counter for half or the AMX counter for bfloat16 according to detected AMX support.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Stateless module whose forward returns the batched matrix
+            # product of its two inputs.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Plain module constructor with no state.
                 super().__init__()
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the matrix product of x and y.
                 return x @ y
 
         counters.clear()
@@ -2730,11 +3221,18 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     @parametrize("Ndim", (84,))
     @dtypes(torch.float, torch.bfloat16, torch.half)
     def test_bmm_amp(self, dtype, bs, Mdim, Kdim, Ndim):
+        # [FUNCTION DOC] Batched matmul under CPU autocast (which converts to bfloat16), verified
+        # with bfloat16 tolerances for float, bfloat16 and half inputs. Requires oneDNN. Expects
+        # one templated kernel.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Stateless module whose forward returns the batched matrix
+            # product of its two inputs.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Plain module constructor with no state.
                 super().__init__()
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the matrix product of x and y.
                 return x @ y
 
         counters.clear()
@@ -2756,12 +3254,19 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     @parametrize("Ndim", (64, 65))
     @dtypes(torch.float, torch.bfloat16, torch.half)
     def test_bmm_freezing(self, dtype, bs, Mdim, Kdim, Ndim):
+        # [FUNCTION DOC] Batched matmul where the second operand is a frozen parameter of the
+        # module and freezing is enabled. Expects one templated kernel.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module holding a frozen weight parameter; forward returns the
+            # batched matrix product of the input with it.
             def __init__(self, w):
+                # [FUNCTION DOC] HELPER: Stores the given tensor as a parameter that does not
+                # require gradients.
                 super().__init__()
                 self.w = torch.nn.Parameter(w, requires_grad=False)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the matrix product of x with the stored weight.
                 return x @ self.w
 
         counters.clear()
@@ -2791,6 +3296,11 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
         "Skip for now since it's flaky: https://github.com/pytorch/pytorch/actions/runs/19916391966/job/57096613514?pr=169151"
     )
     def test_bmm_2d_permute(self, Ndim, order, dtype):
+        # [FUNCTION DOC] Currently skipped as flaky. Intended to test batched matmul where one or
+        # both operands are created through reshape, clone and permute from tensors laid out in
+        # several orders (taken from huggingface models). Expects one templated kernel when the
+        # first operand has the identity order, else none (transposed first operand unsupported,
+        # see the TODO).
         # TODO: Support bmm with transposed X
         bs = 12
         Mdim = 10
@@ -2800,10 +3310,17 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
         inverse_order = [torch.argsort(torch.tensor(o)).tolist() for o in order]
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that rebuilds each operand from a contiguous clone with
+            # the inverse permutation order to obtain the configured strided layout, then returns
+            # their batched product.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Plain module constructor with no state.
                 super().__init__()
 
             def forward(self, x, w):
+                # [FUNCTION DOC] HELPER: For each operand whose order is not the identity,
+                # reshapes it to 2D, clones it, reshapes to the inverse-permuted shape and
+                # permutes it into the target layout; then returns the matrix product of the two.
                 if order[0] != (0, 1, 2):
                     x_order = [x_args[i] for i in inverse_order[0]]
                     x = x.reshape(x_order[0], x_order[1] * x_order[2]).clone()
@@ -2834,11 +3351,18 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     @parametrize("Kdim", (96,))
     @dtypes(torch.float, torch.float16, torch.bfloat16)
     def test_bmm_self_permute(self, bs, Mdim, Kdim, dtype):
+        # [FUNCTION DOC] Batched matmul of a tensor with its own transposed last two dimensions.
+        # Verifies numerics and expects one templated kernel.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Stateless module computing the product of its input with its own
+            # permuted view.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Plain module constructor with no state.
                 super().__init__()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the product of x with x permuted to swap its last
+                # two dimensions.
                 return x @ x.permute(0, 2, 1)
 
         counters.clear()
@@ -2856,11 +3380,17 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     @parametrize("Mdim", (3, 64))  # Test small Mdim which uses reshaped weights
     @dtypes(torch.float)
     def test_bmm_self_square(self, bs, Mdim, dtype):
+        # [FUNCTION DOC] Batched matmul of a square matrix batch with itself, for both a tiny and
+        # a normal size (the small case uses reshaped weights). Requires oneDNN. Expects one
+        # templated kernel.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Stateless module computing the product of its input with itself.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Plain module constructor with no state.
                 super().__init__()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the product of x with itself.
                 return x @ x
 
         counters.clear()
@@ -2879,11 +3409,20 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     @parametrize("Ndim", (64,))
     @dtypes(torch.float)
     def test_bmm_with_broadcasted_mat1(self, bs, Mdim, Kdim, Ndim, dtype):
+        # [FUNCTION DOC] Batched matmul where the first operand is a 2D matrix broadcast
+        # (expanded) along a new batch dimension. Verifies numerics and expects one
+        # templated kernel.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Stateless module expanding a 2D first input to the batch size
+            # and multiplying with the second input.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Plain module constructor with no state.
                 super().__init__()
 
             def forward(self, x, w):
+                # [FUNCTION DOC] HELPER: Asserts that x is 2D (using a plain assert statement with
+                # an inline suppression for the lint rule), adds a leading dimension expanded to
+                # the batch size, and returns the batched product with w.
                 assert x.dim() == 2, f"Expected x to be 2D, got {x.dim()}D"  # noqa: S101
                 x_expanded = x.unsqueeze(0).expand(bs, -1, -1)
                 return x_expanded @ w
@@ -2915,12 +3454,20 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     )
     @dtypes(torch.float32, torch.bfloat16, torch.half)
     def test_bmm_with_pointwise(self, bs, Mdim, Kdim, Ndim, epilogue, dtype):
+        # [FUNCTION DOC] Batched matmul followed by one pointwise epilogue (relu or a binary op
+        # with a random tensor). Verifies numerics and expects one templated kernel and one
+        # fused epilogue.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module applying an epilogue callable to the batched product of
+            # its inputs.
             def __init__(self, epilogue, other):
+                # [FUNCTION DOC] HELPER: Builds the epilogue callable using the other operand for
+                # binary ops.
                 super().__init__()
                 self.epilogue = _get_epilogue(epilogue, other)
 
             def forward(self, x, w):
+                # [FUNCTION DOC] HELPER: Returns the epilogue applied to the product of x and w.
                 return self.epilogue(x @ w)
 
         counters.clear()
@@ -2938,14 +3485,25 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     @requires_mkl
     @dtypes(torch.float32, torch.bfloat16, torch.half)
     def test_bmm_with_fused_epilogues(self, dtype):
+        # [FUNCTION DOC] Reproducer of a batched matmul in an attention graph followed by reshape,
+        # scaling and addition of a padded strided constant. Verifies numerics and expects one
+        # templated kernel and one fused epilogue.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module holding a strided constant tensor; forward does
+            # reshape, batched matmul, reshape back, scale, and add of the constant padded along
+            # one dimension.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates a random constant tensor viewed with
+                # custom strides.
                 super().__init__()
                 self.mul = torch.randn(8, 8, 3136, 8).as_strided(
                     (8, 8, 3136, 8), (200704, 8, 64, 1)
                 )
 
             def forward(self, x, w):
+                # [FUNCTION DOC] HELPER: Reshapes inputs to batched form, applies batched matmul,
+                # reshapes back to four dimensions, scales by a constant factor and adds the
+                # padded stored constant; returns the sum.
                 x = torch.ops.aten.reshape.default(x, [64, 3137, 8])
                 w = torch.ops.aten.reshape.default(w, [64, 8, 8])
                 bmm = torch.ops.aten.bmm.default(x, w)
@@ -2971,12 +3529,20 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     @requires_mkl
     @dtypes(torch.float32, torch.bfloat16, torch.half)
     def test_bmm_with_template_buffer_other_users(self, dtype):
+        # [FUNCTION DOC] Regression test for a GitHub issue: the batched matmul output is both
+        # returned directly and consumed by a scaling op, so the template buffer has other users
+        # and needs a batch reindexer for its copy epilogue. Verifies numerics, expects one
+        # templated kernel and one fused epilogue (required for the bug to trigger).
         # https://github.com/pytorch/pytorch/issues/185405
         # The BMM output is returned raw *and* consumed by an epilogue, so the GEMM
         # output buffer gets an extra local-to-global copy epilogue whose ranges are
         # 3D while the template stores 2D tiles, hence it needs the batch reindexer.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Stateless module returning both a batched matmul with a
+            # transposed second input and that result scaled by a constant.
             def forward(self, q, k):
+                # [FUNCTION DOC] HELPER: Computes the product of q and the transposed k, returns a
+                # tuple of the product and its scaled version.
                 matmul = torch.matmul(q, k.transpose(-2, -1))
                 return matmul, torch.mul(matmul, 0.35355339059327373)
 
@@ -2999,11 +3565,20 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     @parametrize("Ndim", (84, 385))
     @dtypes(torch.float, torch.bfloat16, torch.half)
     def test_bmm_with_y_storage_offset(self, dtype, bs, Mdim, Kdim, Ndim):
+        # [FUNCTION DOC] Batched matmul where the second operand is a contiguous slice of a larger
+        # buffer (non-zero storage offset). Verifies numerics and expects one templated kernel.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Stateless module that copies its second input into a slice of
+            # a bigger uninitialized buffer, creating a nonzero storage offset, and multiplies
+            # with it.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Plain module constructor with no state.
                 super().__init__()
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Allocates an uninitialized buffer with three times the
+                # leading size, selects the last slice and copies y into it, then returns the
+                # product of x with that slice.
                 # y_with_offset: contiguous, but has non-zero storage offset
                 y_with_offset = torch.empty(
                     (3, *y.shape), dtype=y.dtype, device=y.device
@@ -3022,6 +3597,10 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     @torch.no_grad
     @dtypes(torch.float)
     def test_aoti_bmm_unique_identifiers(self, dtype):
+        # [FUNCTION DOC] AOT Inductor test with two chained batched matmuls using the same weight.
+        # Returns silently if the AOT utility cannot be imported. Compares the AOT-compiled result
+        # with eager and expects two templated kernels, checking that each generated kernel gets a
+        # unique identifier.
         try:
             try:
                 from . import test_aot_inductor_utils
@@ -3032,10 +3611,14 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
             return
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Stateless module computing the batched product of x and w and
+            # then multiplying that result by w again.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Plain module constructor with no state.
                 super().__init__()
 
             def forward(self, x, w):
+                # [FUNCTION DOC] HELPER: Returns the product of the product of x and w with w.
                 y = x @ w
                 return y @ w
 
@@ -3068,6 +3651,11 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     )
     @dtypes(torch.float)
     def test_local_and_global_accumulator(self, out_features1, dtype):
+        # [FUNCTION DOC] AOT Inductor test of two linears in sequence where the first output is
+        # viewed to the second's input width, so the second kernel needs both a local and a global
+        # accumulator for varying output sizes. Single thread to avoid K slicing nondeterminism.
+        # Returns silently if the AOT utility is unavailable. Expects two templated kernels and
+        # eager equivalence.
         batch_size = 256
         in_features = 64
         out_features = 129
@@ -3083,13 +3671,18 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
             return
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with two linear layers connected by a view of the first
+            # output to the second input width.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Builds both linear layers from the enclosing sizes.
                 super().__init__()
 
                 self.linear = torch.nn.Linear(in_features, out_features, bias)
                 self.linear1 = torch.nn.Linear(in_features1, out_features1, bias)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the first linear, views its output as 2D with the
+                # second layer's input width, and returns the second linear applied to it.
                 y = self.linear(x)
                 view = torch.ops.aten.view.default(y, [-1, in_features1])
                 return self.linear1(view)
@@ -3112,11 +3705,21 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     @inductor_config.patch(freezing=True)
     @unittest.skipIf(not torch._C._has_mkldnn, "MKLDNN is not enabled")
     def test_bmm_flexible_layout(self):
+        # [FUNCTION DOC] Tests batched matmul where one operand is a reinterpreted view and
+        # the other is an intermediate with flexible layout that must become fixed. Skipped if
+        # MKLDNN is unavailable. Only checks that compiled output matches eager; no counters
+        # are asserted.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Stateless module that reshapes u, builds a transposed and scaled
+            # copy of v, and returns their batched product.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Plain module constructor with no state.
                 super().__init__()
 
             def forward(self, u, v):
+                # [FUNCTION DOC] HELPER: Reshapes u to batch by 512 by 64, makes a contiguous
+                # clone of v reshaped likewise, transposes its last two dimensions, divides by 8
+                # and returns the batched matmul of the two.
                 view_3 = torch.ops.aten.reshape.default(u, [-1, 512, 64])
                 clone_1 = torch.ops.aten.clone.default(
                     v, memory_format=torch.contiguous_format
@@ -3146,14 +3749,23 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     @parametrize("out_features", (2048,))
     @dtypes(torch.bfloat16)
     def test_linear_reuse_kernels(self, batch_size, in_features, out_features, dtype):
+        # [FUNCTION DOC] Skipped unless AMX is available. Compiles three bfloat16 linear layers
+        # where the first and third share shapes, runs them, compares with eager, and inspects the
+        # generated C++ code to require exactly two AMX state declarations, i.e. the identical
+        # kernel is reused instead of generated three times.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with three linear layers in sequence; the first and third
+            # have identical shapes.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Builds three linear layers with the enclosing sizes.
                 super().__init__()
                 self.linear_x = torch.nn.Linear(in_features, out_features)
                 self.linear_y = torch.nn.Linear(out_features, in_features)
                 self.linear_z = torch.nn.Linear(in_features, out_features)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the three linear layers in sequence and returns
+                # the result.
                 out = self.linear_x(x)
                 out = self.linear_y(out)
                 out = self.linear_z(out)
@@ -3185,6 +3797,11 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     @patches
     @torch.no_grad
     def test_qlinear_unary_with_computed_buffer_x_zp(self):
+        # [FUNCTION DOC] Regression test that the oneDNN quantized unary linear lowering works
+        # when input scale and zero point are computed buffers created inside the forward. Resets
+        # dynamo, picks reduced int8 ranges on CPUs without VNNI support, compares eager and
+        # compiled outputs (shape and values), and on non-HIP builds expects exactly one autotune
+        # selection. Requires oneDNN and MKL; skipped on Windows.
         """
         Test that qlinear_pointwise (unary) lowering correctly handles x_zp and
         x_scale when they are ComputedBuffers.
@@ -3204,7 +3821,14 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
             x_zp_val = 128  # Middle of [0, 255]
 
         class QLinearUnaryModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a prepacked random int8 weight, constant weight
+            # scales, zero weight zero points and random bias; forward creates scalar input scale
+            # and zero point tensors and calls the oneDNN quantized pointwise linear with no
+            # post-op and float32 output.
             def __init__(self, N, K, x_zp_val):
+                # [FUNCTION DOC] HELPER: Generates random int8 weights in the enclosing range,
+                # prepacks them, creates weight scales, zero points and bias, sets output scale
+                # one and zero point zero, and stores the input zero point value.
                 super().__init__()
                 qw = torch.randint(w_qmin, w_qmax, (N, K), dtype=torch.int8)
                 self.qw_packed = torch.ops.onednn.qlinear_prepack(qw, None)
@@ -3216,6 +3840,8 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
                 self.x_zp_val = x_zp_val
 
             def forward(self, qx):
+                # [FUNCTION DOC] HELPER: Builds scalar input zero point and scale tensors, then
+                # returns the quantized pointwise linear output for the given quantized input.
                 x_zp = torch.full([], self.x_zp_val, dtype=torch.int32)
                 x_scale = torch.full([], 0.1, dtype=torch.float32)
 
@@ -3268,6 +3894,10 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     @patches
     @torch.no_grad
     def test_qlinear_binary_with_computed_buffer_x_zp(self):
+        # [FUNCTION DOC] Same as the unary computed-buffer test but for the binary-add form of the
+        # oneDNN quantized linear with an extra float tensor. Compares eager and compiled outputs
+        # and expects one autotune selection on non-HIP builds. Requires oneDNN and MKL; skipped
+        # on Windows.
         """
         Test that qlinear_pointwise.binary lowering correctly handles x_zp and
         x_scale when they are ComputedBuffers.
@@ -3287,7 +3917,12 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
             x_zp_val = 128  # Middle of [0, 255]
 
         class QLinearBinaryModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Like the unary quantized module but forward also takes an extra
+            # tensor and calls the binary tensor variant with add post-op and float32 output.
             def __init__(self, N, K, x_zp_val):
+                # [FUNCTION DOC] HELPER: Generates and prepacks random int8 weights, creates
+                # weight scales, zero points and bias, sets output scale one and zero point zero,
+                # and stores the input zero point value.
                 super().__init__()
                 qw = torch.randint(w_qmin, w_qmax, (N, K), dtype=torch.int8)
                 self.qw_packed = torch.ops.onednn.qlinear_prepack(qw, None)
@@ -3299,6 +3934,9 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
                 self.x_zp_val = x_zp_val
 
             def forward(self, qx, other):
+                # [FUNCTION DOC] HELPER: Builds scalar input zero point and scale tensors, then
+                # returns the binary-add quantized pointwise linear output for the quantized input
+                # and the extra tensor.
                 x_zp = torch.full([], self.x_zp_val, dtype=torch.int32)
                 x_scale = torch.full([], 0.1, dtype=torch.float32)
 
@@ -3358,6 +3996,11 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     @patches
     @torch.no_grad
     def test_qlinear_unary_with_dynamic_x_scale(self):
+        # [FUNCTION DOC] Checks that the quantized unary linear can enter the GEMM template when
+        # the input scale has shape one by one (dynamic quantization as in the torchao int8
+        # dynamic activation config) and must be converted to a scalar. Uses reduced int8 ranges
+        # without VNNI. Compares eager and compiled outputs and expects one autotune selection on
+        # non-HIP builds. Requires oneDNN and MKL; skipped on Windows.
         """
         Test that qlinear_pointwise (unary) can enter GEMM template when x_scale
         has shape [1, 1] and needs to be converted to 0D.
@@ -3379,7 +4022,14 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
             qmax = 127.0
 
         class DynamicQLinearUnaryModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that dynamically quantizes a float input (scale from
+            # maximum absolute value, clamped to a minimum, reshaped to one by one, zero point
+            # zero) to int8 and applies the oneDNN quantized pointwise linear with prepacked
+            # random weights.
             def __init__(self, N, K, qmax, x_qmin, x_qmax):
+                # [FUNCTION DOC] HELPER: Generates and prepacks random int8 weights, creates
+                # weight scales, zero points and bias, sets output quantization parameters, and
+                # stores the maximum quantized value and the activation clamp range.
                 super().__init__()
                 qw = torch.randint(w_qmin, w_qmax, (N, K), dtype=torch.int8)
                 self.qw_packed = torch.ops.onednn.qlinear_prepack(qw, None)
@@ -3393,6 +4043,9 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
                 self.x_qmax = x_qmax
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Computes the dynamic input scale from the absolute
+                # maximum, rounds and clamps the scaled input into the int8 range, casts to int8,
+                # and calls the quantized pointwise linear returning float32 output.
                 x_max = torch.max(torch.abs(x.to(torch.float32)))
                 x_scale = x_max / self.qmax
                 x_scale = torch.clamp(x_scale, min=torch.finfo(torch.float32).eps)
@@ -3451,6 +4104,10 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
     @patches
     @torch.no_grad
     def test_qlinear_binary_with_dynamic_x_scale(self):
+        # [FUNCTION DOC] Binary-add counterpart of the dynamic input-scale test: the one by one
+        # input scale must become a scalar for the quantized binary linear to enter the GEMM
+        # template. Compares eager and compiled outputs and expects one autotune selection on
+        # non-HIP builds. Requires oneDNN and MKL; skipped on Windows.
         """
         Test that qlinear_pointwise.binary can enter GEMM template when x_scale
         has shape [1, 1] and needs to be converted to 0D.
@@ -3471,7 +4128,13 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
             qmax = 127.0
 
         class DynamicQLinearBinaryModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Like the dynamic unary quantized module, but forward also
+            # takes an extra tensor and calls the binary tensor variant of the quantized linear
+            # with add post-op.
             def __init__(self, N, K, qmax, x_qmin, x_qmax):
+                # [FUNCTION DOC] HELPER: Generates and prepacks random int8 weights, creates
+                # weight scales, zero points and bias, sets output quantization parameters, and
+                # stores the maximum quantized value and the activation clamp range.
                 super().__init__()
                 qw = torch.randint(w_qmin, w_qmax, (N, K), dtype=torch.int8)
                 self.qw_packed = torch.ops.onednn.qlinear_prepack(qw, None)
@@ -3485,6 +4148,9 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
                 self.x_qmax = x_qmax
 
             def forward(self, x, other):
+                # [FUNCTION DOC] HELPER: Dynamically quantizes x to int8 with a one by one scale
+                # and zero point zero, then returns the binary-add quantized pointwise linear
+                # output with the extra tensor.
                 x_max = torch.max(torch.abs(x.to(torch.float32)))
                 x_scale = x_max / self.qmax
                 x_scale = torch.clamp(x_scale, min=torch.finfo(torch.float32).eps)
@@ -3544,10 +4210,16 @@ class TestSelectAlgorithm(BaseTestSelectAlgorithm):
 
 @dynamo_config.patch({"dynamic_shapes": True, "assume_static_by_default": False})
 class _DynamicShapesTestBase(BaseTestSelectAlgorithm):
+    # [CLASS DOC] HELPER: Empty test base class that, via a class decorator, enables dynamic
+    # shapes and disables assume-static-by-default for dynamo; inherits the counter helpers from
+    # the base class.
     pass
 
 
 class TestSelectAlgorithmDynamicShapes(_DynamicShapesTestBase):
+    # [CLASS DOC] Dynamic-shape variant of the template tests. Aliases several TestSelectAlgorithm
+    # test methods under new names so they run in this class with dynamic shapes enabled, and adds
+    # its own batched matmul tests that mark dimensions dynamic or static.
     common = check_model
     test_linear_dynamic_shapes = TestSelectAlgorithm.test_linear_static_shapes
     test_linear_with_pointwise_dynamic_shapes = (
@@ -3593,12 +4265,18 @@ class TestSelectAlgorithmDynamicShapes(_DynamicShapesTestBase):
     @parametrize("Ndim", (64, 65))
     @dtypes(torch.float, torch.bfloat16, torch.half)
     def test_bmm_with_pointwise_dynamic_shapes(self, bs, Mdim, Kdim, Ndim, dtype):
+        # [FUNCTION DOC] Batched matmul with relu where the batch and M dimensions of the first
+        # input are marked dynamic and the feature dimensions static. Verifies numerics and
+        # expects one templated kernel and one fused epilogue.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a relu applied to the batched product of its inputs.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the relu module.
                 super().__init__()
                 self.epilogue = torch.nn.ReLU()
 
             def forward(self, x, other):
+                # [FUNCTION DOC] HELPER: Returns relu of the matrix product of x and other.
                 return self.epilogue(x @ other)
 
         counters.clear()
@@ -3625,12 +4303,20 @@ class TestSelectAlgorithmDynamicShapes(_DynamicShapesTestBase):
     def test_bmm_with_pointwise_with_reshape_dynamic_shapes(
         self, bs, Mdim, Kdim, Ndim, dtype
     ):
+        # [FUNCTION DOC] Batched matmul from 4D inputs reshaped to 3D, followed by relu and
+        # addition of a noise tensor, with dynamic batch dimensions and static feature dimensions.
+        # Verifies numerics and expects one templated kernel and one fused epilogue.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module reshaping two 4D inputs to batched 3D, multiplying,
+            # applying relu and adding a third input.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the relu module.
                 super().__init__()
                 self.epilogue = torch.nn.ReLU()
 
             def forward(self, x, other, noise):
+                # [FUNCTION DOC] HELPER: Reshapes x and other to 3D with the enclosing M, K and N,
+                # multiplies them, applies relu and adds noise.
                 result = x.reshape(-1, Mdim, Kdim) @ other.reshape(-1, Kdim, Ndim)
                 return self.epilogue(result) + noise
 
@@ -3656,14 +4342,27 @@ class TestSelectAlgorithmDynamicShapes(_DynamicShapesTestBase):
     @requires_mkl
     @dtypes(torch.float, torch.bfloat16)
     def test_bmm_epilogue_dynamic_reshape(self, dtype):
+        # [FUNCTION DOC] Reproducer with dynamic leading dimension from a T5 style attention
+        # graph: batched matmul after reshaping with a symbolic batch, followed by an add with a
+        # relative position bias made through embedding, permute and a broadcast addition.
+        # Verifies numerics and expects one templated kernel and one fused epilogue.
         bs = 5
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module reproducing a relative-position-bias attention score
+            # computation: reshape and batched matmul with a symbolic size, then add a bias table
+            # gathered by embedding lookup.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates a relu module (not used in the forward).
                 super().__init__()
                 self.epilogue = torch.nn.ReLU()
 
             def forward(self, x, w, arg5_1):
+                # [FUNCTION DOC] HELPER: Reshapes inputs using the symbolic first dimension,
+                # performs batched matmul and reshapes to four dimensions, builds relative
+                # position index tensors from ones and constants, gathers biases from the
+                # embedding table, permutes and broadcasts them with a negative-zero fill and adds
+                # them to the matmul result; returns the sum.
                 arg131_1 = x.shape[0]
                 mul_91 = arg131_1 * 8
                 view_422 = torch.ops.aten.reshape.default(x, [mul_91, 512, 64])
@@ -3715,16 +4414,24 @@ class TestSelectAlgorithmDynamicShapes(_DynamicShapesTestBase):
     @torch.no_grad
     @requires_mkl
     def test_bmm_dynamic_bm_stride(self):
+        # [FUNCTION DOC] Batched matmul where the second operand is a permuted view and the first
+        # has dynamic batch and M dimensions, exercising a dynamic batch stride. Verifies numerics
+        # for float32 and expects one templated kernel.
         bs = 8
         Mdim = 256
         Kdim = 64
         dtype = torch.float
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Stateless module multiplying the input by the permuted
+            # second input.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Plain module constructor with no state.
                 super().__init__()
 
             def forward(self, x, weight):
+                # [FUNCTION DOC] HELPER: Returns the product of x with weight permuted so its last
+                # dimension becomes the leading one.
                 return x @ weight.permute(2, 0, 1)
 
         counters.clear()
