@@ -1,4 +1,9 @@
 # Owner(s): ["module: functorch"]
+# [MODULE DOC] Tests for functorch memory-efficient fusion and for the FX common subexpression
+# elimination pass (fx_graph_cse). Defines several activation functions, a helper that compares
+# eager and fused results (forward and gradients) on CUDA, and a helper that checks the CSE pass
+# node counts, idempotence and numerics. Test classes cover activations, no-change cases,
+# reductions and random-op graphs. Import-time side effect: sets the HAS_CUDA flag.
 
 import inspect
 import random
@@ -19,31 +24,40 @@ HAS_CUDA = torch.cuda.is_available()
 
 
 def _num_args(fn: Callable):
+    # [FUNCTION DOC] HELPER: Returns how many parameters the given callable's signature has.
     return len(inspect.signature(fn).parameters)
 
 
 def gelu_bias(bias, y):
+    # [FUNCTION DOC] HELPER: Bias-add followed by tanh-approximated GELU; returns a tensor computed
+    # from the sum of the two inputs.
     x = bias + y
     return x * 0.5 * (1.0 + torch.tanh(0.79788456 * x * (1 + 0.044715 * x * x)))
 
 
 def swish(x):
+    # [FUNCTION DOC] HELPER: Swish activation; multiplies the input by its sigmoid.
     return x * torch.sigmoid(x)
 
 
 def mish(x):
+    # [FUNCTION DOC] HELPER: Mish activation; multiplies the input by tanh of its softplus.
     return x.mul(torch.tanh(F.softplus(x)))
 
 
 def hard_sigmoid(x):
+    # [FUNCTION DOC] HELPER: Hard sigmoid; adds 3, clamps to the range 0 to 6, divides by 6.
     return (x + 3.0).clamp(min=0.0, max=6.0).div(6.0)
 
 
 def hard_swish(x):
+    # [FUNCTION DOC] HELPER: Hard swish; input times the hard sigmoid of the input.
     return x * (x + 3.0).clamp(min=0.0, max=6.0).div(6.0)
 
 
 def hard_mish(x):
+    # [FUNCTION DOC] HELPER: Hard mish; half the input times the input plus 2 clamped to 0..2.
+    # Currently unused (its test is commented out with a TODO about an assertion failure).
     return 0.5 * x * (x + 2.0).clamp(min=0.0, max=2.0)
 
 
@@ -97,6 +111,11 @@ def hard_mish(x):
 
 
 def run_and_compare_activation(self, fn, inps):
+    # [FUNCTION DOC] HELPER: Compares eager execution of fn against its memory_efficient_fusion
+    # version on CUDA in float32 under the fuser1 JIT fuser. Builds random inputs of the given
+    # shapes (requiring grad), runs the reference forward and backward, then runs the fused
+    # function five times, clearing gradients on each pass. Asserts via the test case self that
+    # outputs and input gradients match. Modules are moved to CUDA first. Needs CUDA.
     with torch.jit.fuser("fuser1"):
         device = "cuda"
         dtype = torch.float
@@ -126,23 +145,35 @@ def run_and_compare_activation(self, fn, inps):
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
 class TestMemoryEfficientOpAuthoring(TestCase):
+    # [CLASS DOC] CUDA-only test case comparing memory-efficient fusion against eager mode for
+    # several activation and normalization functions. Stateless; each test calls the shared compare
+    # helper with a function and input shapes. Skipped when CUDA is unavailable.
     def test_gelu_bias(self):
+        # [FUNCTION DOC] Checks fusion of the bias-add GELU on two 1024-element inputs.
         run_and_compare_activation(self, gelu_bias, [(1024,), (1024,)])
 
     def test_mish(self):
+        # [FUNCTION DOC] Checks fusion of mish on one 1024-element input.
         run_and_compare_activation(self, mish, [(1024,)])
 
     def test_swish(self):
+        # [FUNCTION DOC] Checks fusion of swish on one 1024-element input.
         run_and_compare_activation(self, swish, [(1024,)])
 
     def test_hard_sigmoid(self):
+        # [FUNCTION DOC] Checks fusion of hard sigmoid on one 1024-element input.
         run_and_compare_activation(self, hard_sigmoid, [(1024,)])
 
     def test_hard_swish(self):
+        # [FUNCTION DOC] Checks fusion of hard swish on one 1024-element input.
         run_and_compare_activation(self, hard_swish, [(1024,)])
 
     def test_layer_norm(self):
+        # [FUNCTION DOC] Checks fusion of a hand-written layer norm over inputs of shape 10 by 16,
+        # a weight of 16 and a bias of 16.
         def layer_norm(x, weight, bias):
+            # [FUNCTION DOC] HELPER: Layer norm over the last dimension with epsilon 1e-5; computes
+            # mean and variance manually, normalizes, then applies weight and bias.
             dim = -1
             eps = 1e-5
             mean = torch.mean(x, dim, keepdim=True)
@@ -158,8 +189,14 @@ class TestMemoryEfficientOpAuthoring(TestCase):
         run_and_compare_activation(self, layer_norm, layer_norm_inps)
 
     def test_rmsnorm(self):
+        # [FUNCTION DOC] Checks fusion of a T5-style RMS norm module on an input of shape 256 by
+        # 256 by 1024.
         class T5LayerNorm(nn.Module):
+            # [CLASS DOC] HELPER: Module with a learnable weight of ones and an epsilon attribute;
+            # normalizes by the root mean square over the last dimension without mean subtraction.
             def __init__(self, hidden_size, eps=1e-6):
+                # [FUNCTION DOC] HELPER: Stores a ones-initialized weight parameter of the given
+                # hidden size and the variance epsilon.
                 """
                 Construct a layernorm module in the T5 style No bias and no subtraction of mean.
                 """
@@ -168,6 +205,9 @@ class TestMemoryEfficientOpAuthoring(TestCase):
                 self.variance_epsilon = eps
 
             def forward(self, hidden_states):
+                # [FUNCTION DOC] HELPER: Computes variance as the mean of squares in float32,
+                # scales the input by the reciprocal square root of variance plus epsilon, casts to
+                # the weight dtype if that is half or bfloat16, and returns weight times result.
                 # layer norm should always be calculated in float32
                 variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
                 hidden_states = hidden_states * torch.rsqrt(
@@ -197,6 +237,12 @@ class TestMemoryEfficientOpAuthoring(TestCase):
 # delta is an integer >= -1. If delta = -1, only check if the new graph
 #   has less or equal number of nodes
 def check(f, t, delta, check_val=True, graph_input=False):
+    # [FUNCTION DOC] HELPER: Runs the CSE pass on a graph and validates it. The graph comes
+    # from tracing f with make_fx on t, or is f itself when graph_input is true. A delta of -1
+    # only requires that node count not grow; otherwise old count must equal new count plus
+    # delta. A second pass must not remove further nodes. If check_val, the original and
+    # rewritten modules are run on t and results compared (both None, or equal). Raises
+    # AssertionError on any violation.
     if graph_input:
         fx_g = f
     else:
@@ -241,8 +287,12 @@ def check(f, t, delta, check_val=True, graph_input=False):
 
 
 class NoChangeTestCase(TestCase):
+    # [CLASS DOC] Test case where CSE must not merge anything (or only match as stated), such as
+    # random ops, signed zeros and differing NaN signs. Stateless.
     def test_nochange(self):
+        # [FUNCTION DOC] Graph with no duplicate computations; expects no node reduction.
         def f(x):
+            # [FUNCTION DOC] HELPER: Traced function reusing the input in sums; no duplicates.
             a = x + 1
             b = x + a
             a = x
@@ -253,14 +303,18 @@ class NoChangeTestCase(TestCase):
         check(f, t, 0)
 
     def test_empty(self):
+        # [FUNCTION DOC] Function with an empty body returning None; expects no change.
         def f(x):
+            # [FUNCTION DOC] HELPER: Does nothing and returns None.
             pass
 
         t = torch.randn(2, 2)
         check(f, t, 0)
 
     def test_rand_like(self):
+        # [FUNCTION DOC] Two rand_like calls must not be merged; value check is skipped.
         def f(x):
+            # [FUNCTION DOC] HELPER: Adds two independent random tensors shaped like the input.
             a = torch.rand_like(x)
             b = torch.rand_like(x)
             return a + b
@@ -269,7 +323,9 @@ class NoChangeTestCase(TestCase):
         check(f, t, 0, check_val=False)
 
     def test_rand_n(self):
+        # [FUNCTION DOC] Two randn calls must not be merged; value check is skipped.
         def f(x):
+            # [FUNCTION DOC] HELPER: Adds two independent random vectors of length 4.
             a = torch.randn(4)
             b = torch.randn(4)
             return a + b
@@ -278,6 +334,10 @@ class NoChangeTestCase(TestCase):
         check(f, t, 0, check_val=False)
 
     def test_hash_with_numbers(self):
+        # [FUNCTION DOC] Regression test for hash collisions between an integer and a float
+        # constant. Skipped when running compiled. Compiles a function with a dynamic-shape compile
+        # backend that records the graph, asserts exactly one graph was captured, and expects CSE
+        # to change nothing in it (graph passed directly, no value check).
         # Test to repro issue with fx_graph_cse when
         # hash((primals_2, 1.0)) == hash((primals_2, 1))
 
@@ -285,6 +345,8 @@ class NoChangeTestCase(TestCase):
             self.skipTest("Unsupported if test run is compiled")
 
         def f(inpt, osize):
+            # [FUNCTION DOC] HELPER: Computes a scale from the last dimension size (as an integer
+            # and as a float) and the output size, clamps the input and multiplies by the scale.
             size = inpt.shape[-1]
             s1 = size - 1
             s2 = size - 1.0
@@ -296,6 +358,8 @@ class NoChangeTestCase(TestCase):
         gms = []
 
         def toy_backend(gm, _):
+            # [FUNCTION DOC] HELPER: Backend that records the graph module in the list and returns
+            # its forward method.
             gms.append(gm)
             return gm.forward
 
@@ -310,7 +374,9 @@ class NoChangeTestCase(TestCase):
         check(fx_g, None, 0, check_val=False, graph_input=True)
 
     def test_neg_nan_not_merged(self):
+        # [FUNCTION DOC] Fills with NaN and with negative NaN; the two must not be merged.
         def f(x):
+            # [FUNCTION DOC] HELPER: Adds a NaN-filled and a negative-NaN-filled tensor.
             a = torch.full_like(x, float("nan"))
             b = torch.full_like(x, -float("nan"))
             return a + b
@@ -319,7 +385,10 @@ class NoChangeTestCase(TestCase):
         check(f, t, 0, check_val=False)
 
     def test_neg_zero_not_merged(self):
+        # [FUNCTION DOC] Fills with 0.0 and -0.0; they must not be merged since reciprocals differ.
         def f(x):
+            # [FUNCTION DOC] HELPER: Stacks reciprocals of tensors filled with positive
+            # and negative zero.
             a = torch.full_like(x, 0.0)
             b = torch.full_like(x, -0.0)
             return torch.stack([a.reciprocal(), b.reciprocal()])
@@ -328,7 +397,11 @@ class NoChangeTestCase(TestCase):
         check(f, t, 0)
 
     def test_complex_neg_zero_not_merged(self):
+        # [FUNCTION DOC] Complex tensors filled with positive and negative zero real parts must
+        # not be merged.
         def f(x):
+            # [FUNCTION DOC] HELPER: Casts input to complex, stacks reciprocals of the real parts
+            # of two tensors filled with complex values differing in the sign of zero.
             y = x.to(torch.cfloat)
             a = torch.full_like(y, complex(0.0, 0.0))
             b = torch.full_like(y, complex(-0.0, 0.0))
@@ -339,8 +412,13 @@ class NoChangeTestCase(TestCase):
 
 
 class ReduceTestCase(TestCase):
+    # [CLASS DOC] Test case where CSE must reduce the node count by a stated amount: duplicated ops
+    # with list arguments, keyword arguments and NaN fills. Stateless.
     def test_immutable_list_type(self):
+        # [FUNCTION DOC] Duplicate sums with list-typed and default dim arguments; expects
+        # 2 fewer nodes.
         def f(x):
+            # [FUNCTION DOC] HELPER: Sums over dim 1 twice and over all dims twice, then adds all.
             a = x.sum(dim=1)
             b = x.sum(dim=1)
             c = x.sum()
@@ -351,7 +429,10 @@ class ReduceTestCase(TestCase):
         check(f, t, 2)
 
     def test_immutable_list_multiple_entries(self):
+        # [FUNCTION DOC] Duplicate sums over a two-element dim list and over dim 1; expects
+        # 2 fewer nodes.
         def f(x):
+            # [FUNCTION DOC] HELPER: Sums over dims 0 and 1 twice and over dim 1 twice, adds all.
             a = x.sum(dim=[0, 1])
             b = x.sum(dim=[0, 1])
             c = x.sum(dim=1)
@@ -362,7 +443,9 @@ class ReduceTestCase(TestCase):
         check(f, t, 2)
 
     def test_simple(self):
+        # [FUNCTION DOC] Duplicate cos calls; expects 2 fewer nodes.
         def f(x):
+            # [FUNCTION DOC] HELPER: Computes cos twice, doubles each by self-addition, adds them.
             a = x.cos()
             b = x.cos()
             c = a + a
@@ -373,7 +456,9 @@ class ReduceTestCase(TestCase):
         check(f, t, 2)
 
     def test_simple_2(self):
+        # [FUNCTION DOC] Duplicate chains of cos then sin; expects 3 fewer nodes.
         def f(x):
+            # [FUNCTION DOC] HELPER: Computes cos then sin twice, doubles each, adds them.
             a = x.cos().sin()
             b = x.cos().sin()
             c = a + a
@@ -384,7 +469,10 @@ class ReduceTestCase(TestCase):
         check(f, t, 3)
 
     def test_two_args_default(self):
+        # [FUNCTION DOC] Sums with an explicit default keepdim equal those without; expects
+        # 3 fewer nodes.
         def f(x):
+            # [FUNCTION DOC] HELPER: Four sums over dim 1, two with explicit keepdim false.
             a = x.sum(dim=1)
             b = x.sum(dim=1, keepdim=False)
             c = x.sum(dim=1, keepdim=False)
@@ -395,7 +483,10 @@ class ReduceTestCase(TestCase):
         check(f, t, 3)
 
     def test_two_args(self):
+        # [FUNCTION DOC] Sums with keepdim true are distinct from those without; expects
+        # 2 fewer nodes.
         def f(x):
+            # [FUNCTION DOC] HELPER: Two sums over dim 1 and two with keepdim true, all added.
             a = x.sum(dim=1)
             b = x.sum(dim=1, keepdim=True)
             c = x.sum(dim=1, keepdim=True)
@@ -406,7 +497,9 @@ class ReduceTestCase(TestCase):
         check(f, t, 2)
 
     def test_simple_multiple_same_ops(self):
+        # [FUNCTION DOC] Four identical full sums collapse to one; expects 3 fewer nodes.
         def f(x):
+            # [FUNCTION DOC] HELPER: Adds four identical full-tensor sums.
             a = x.sum()
             b = x.sum()
             c = x.sum()
@@ -417,7 +510,9 @@ class ReduceTestCase(TestCase):
         check(f, t, 3)
 
     def test_nested_immutable_list_type(self):
+        # [FUNCTION DOC] Duplicate concatenations of a tuple of tensors; expects 1 fewer node.
         def f(x):
+            # [FUNCTION DOC] HELPER: Concatenates the input with itself twice and adds the results.
             a = torch.cat((x, x))
             b = torch.cat((x, x))
             return a + b
@@ -426,7 +521,9 @@ class ReduceTestCase(TestCase):
         check(f, t, 1)
 
     def test_kwarg(self):
+        # [FUNCTION DOC] Duplicate ones_like calls (keyword/factory style); expects 1 fewer node.
         def f(x):
+            # [FUNCTION DOC] HELPER: Adds two ones tensors shaped like the input.
             a = torch.ones_like(x)
             b = torch.ones_like(x)
             return a + b
@@ -435,7 +532,10 @@ class ReduceTestCase(TestCase):
         check(f, t, 1)
 
     def test_nan_full_deduplication(self):
+        # [FUNCTION DOC] Two identical NaN-filled tensors are merged; expects 1 fewer node,
+        # no value check.
         def f(x):
+            # [FUNCTION DOC] HELPER: Adds two identical NaN-filled tensors shaped like the input.
             a = torch.full_like(x, float("nan"))
             b = torch.full_like(x, float("nan"))
             return a + b
@@ -444,7 +544,9 @@ class ReduceTestCase(TestCase):
         check(f, t, 1, check_val=False)
 
     def test_nan_dedup_non_factory_op(self):
+        # [FUNCTION DOC] Two identical clamps with a NaN minimum are merged; expects 1 fewer node.
         def f(x):
+            # [FUNCTION DOC] HELPER: Adds two identical clamps of the input with a NaN minimum.
             a = x.clamp(min=float("nan"))
             b = x.clamp(min=float("nan"))
             return a + b
@@ -453,7 +555,10 @@ class ReduceTestCase(TestCase):
         check(f, t, 1, check_val=False)
 
     def test_nan_dedup_constant_pad(self):
+        # [FUNCTION DOC] Two identical constant pads with a NaN value are merged; expects
+        # 1 fewer node.
         def f(x):
+            # [FUNCTION DOC] HELPER: Adds two identical NaN-valued pads of the input.
             a = torch.nn.functional.pad(x, (1, 1, 1, 1), value=float("nan"))
             b = torch.nn.functional.pad(x, (1, 1, 1, 1), value=float("nan"))
             return a + b
@@ -462,7 +567,10 @@ class ReduceTestCase(TestCase):
         check(f, t, 1, check_val=False)
 
     def test_complex_nan_full_deduplication(self):
+        # [FUNCTION DOC] Two identical complex NaN fills are merged; expects 1 fewer node.
         def f(x):
+            # [FUNCTION DOC] HELPER: Casts input to complex and adds two identical
+            # complex NaN fills.
             y = x.to(torch.cfloat)
             a = torch.full_like(y, complex(float("nan"), 0.0))
             b = torch.full_like(y, complex(float("nan"), 0.0))
@@ -473,8 +581,15 @@ class ReduceTestCase(TestCase):
 
 
 class RandomOpTestCase(TestCase):
+    # [CLASS DOC] Test case running CSE on randomly generated graphs. Stateless.
     def test_random(self):
+        # [FUNCTION DOC] Builds a function applying 100 randomly chosen unary ops (clone, cos,
+        # tanh, gelu) to randomly chosen earlier values, symbolically traces it, removes dead code,
+        # recompiles, then 30 times runs the check helper requiring only that node count not grow.
+        # Uses the global random module, so the traced graph varies between runs.
         def f(x):
+            # [FUNCTION DOC] HELPER: Function with the random op chain described above; returns
+            # the last value.
             vals = [x]
             ops = [torch.clone, torch.cos, torch.tanh, torch.nn.functional.gelu]
             for _ in range(100):
