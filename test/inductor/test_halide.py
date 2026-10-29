@@ -1,4 +1,11 @@
 # Owner(s): ["oncall: pt2"]
+# [MODULE DOC] Tests for the Halide backend of inductor. Defines a factory that clones existing
+# test classes from test_torchinductor with config patches selecting the halide backend, plus a
+# small HalideTests class that exercises the Halide code cache, scheduling modes, random number
+# consistency with triton, compile options and an in-place alias case. Import-time side effects:
+# on Windows CI it writes to stderr and exits or skips; HAS_HALIDE is probed by importing
+# halide; the generated Halide test classes are registered in module globals when CPU (or GPU
+# with the TEST_HALIDE_GPU env var set to one) tests and halide are available.
 import functools
 import itertools
 import os
@@ -45,6 +52,12 @@ test_classes = {}
 
 
 def make_halide(cls):
+    # [FUNCTION DOC] Builds a Halide variant of a test class using make_test_cls_with_patches
+    # with the Halide name prefix and suffix. Patches enable halide scan kernels, set both cpu
+    # and cuda backends to halide and disable runtime triton dtype and shape asserts; tests
+    # listed under the halide expected-failure property are treated as expected failures.
+    # Records the new class in test_classes, publishes it into module globals (required for test
+    # discovery), sets its module name to this module and returns it.
     suffix = "_halide"
 
     cls_prefix = "Halide"
@@ -70,7 +83,14 @@ def make_halide(cls):
 
 @unittest.skipUnless(HAS_HALIDE, "requires halide")
 class HalideTests(TestCase):
+    # [CLASS DOC] Halide-specific tests, skipped entirely when halide is not importable. Covers
+    # direct use of the Halide code cache with an autoscheduler and a manual schedule, plus end
+    # to end checks through torch.compile.
     def test_codecache(self):
+        # [FUNCTION DOC] Compiles a hand written Halide generator (elementwise add of two 1024
+        # float buffers) through the code cache with the Mullapudi2016 autoscheduler and a
+        # thread count from parallel_num_threads. Calls the resulting function on random CPU
+        # tensors and asserts the output buffer equals the sum of the inputs.
         fn = HalideCodeCache.generate_halide(
             HalideMeta(
                 argtypes=[
@@ -142,6 +162,10 @@ class HalideTests(TestCase):
         self.assertEqual(c, a + b)
 
     def test_manual_schedule(self):
+        # [FUNCTION DOC] Same elementwise add generator as the code cache test but with no
+        # scheduler, so the generator applies a manual schedule (split, parallel, vectorize,
+        # compute_at/store_at, inline). Runs it on random CPU tensors and asserts the output
+        # equals the sum.
         fn = HalideCodeCache.generate_halide(
             HalideMeta(
                 argtypes=[
@@ -217,6 +241,13 @@ class HalideTests(TestCase):
 
     @unittest.skipUnless(has_triton(), "requires triton")
     def test_random_consistency(self):
+        # [FUNCTION DOC] Requires triton. For each of three CUDA random generators (uniform,
+        # normal, random integer) compiles a function with the halide cuda backend and one with
+        # the triton cuda backend, seeds the global RNG identically before each call and gets
+        # both outputs.
+        # KNOWN ISSUE: the final equality assertion sits after the loop, so only the last
+        # generator (the integer one) is actually compared; the earlier two are computed but
+        # never checked.
         seed = 1234
         shape = (3, 3)
         dtype = torch.float32
@@ -238,10 +269,14 @@ class HalideTests(TestCase):
 
             @torch.compile(backend="inductor", options={"cuda_backend": "halide"})
             def get_rand_halide():
+                # [FUNCTION DOC] HELPER: Compiled with inductor using the halide cuda backend;
+                # returns the output of the current loop iteration's random generator.
                 return rand_fn()
 
             @torch.compile(backend="inductor", options={"cuda_backend": "triton"})
             def get_rand_triton():
+                # [FUNCTION DOC] HELPER: Compiled with inductor using the triton cuda backend;
+                # returns the output of the current loop iteration's random generator.
                 return rand_fn()
 
             torch.manual_seed(seed)
@@ -252,6 +287,10 @@ class HalideTests(TestCase):
         self.assertEqual(halide_output, triton_output)
 
     def test_compile_options(self):
+        # [FUNCTION DOC] Compiles a sum of two softmaxes with inductor using halide for cpu and
+        # cuda and the Adams2019 (cpu) and Anderson2021 (cuda) schedulers. Runs it on CPU and,
+        # if CUDA is available, on GPU, asserting the generated source contains a Halide
+        # generator declaration.
         @torch.compile(
             backend="inductor",
             options={
@@ -262,6 +301,8 @@ class HalideTests(TestCase):
             },
         )
         def halide(a, b):
+            # [FUNCTION DOC] HELPER: Compiled function returning the sum of the last-dimension
+            # softmaxes of its two inputs.
             return torch.softmax(a, -1) + torch.softmax(b, -1)
 
         _, (code,) = run_and_get_code(
@@ -278,8 +319,13 @@ class HalideTests(TestCase):
             self.assertIn("@hl.generator", code)
 
     def test_inplace_add_broadcast_input_alias(self):
+        # [FUNCTION DOC] Regression test: an in-place add on a transposed tensor with a
+        # broadcast (size one dimension) second input, compiled with the halide cpu backend.
+        # Asserts the returned value and the mutated input both equal the eager in-place result.
         @torch.compile(backend="inductor", options={"cpu_backend": "halide"})
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Compiled function that adds y into x in place and returns
+            # x.
             return x.add_(y)
 
         x = torch.ones([2, 12, 13, 17]).transpose(1, 2)

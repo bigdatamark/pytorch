@@ -1,4 +1,11 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests for inductor's group and batch fusion FX passes (group_batch_fusion): group
+# linear, batch layernorm, batch linear (lhs, pre-grad, post-grad), pointwise, math and dropout
+# batching, the cat-then-linear rewrite, and the greedy independent-subset search used to pick
+# fusion candidates. Defines small fixture modules, then test cases that compile them and check
+# the pass counters from the dynamo counters registry plus numerics versus eager. Import-time
+# side effect: tries to import an fbgemm inductor lowerings module and records availability in
+# has_fbgemm; no other global state is touched.
 
 import collections
 import operator
@@ -24,11 +31,15 @@ except Exception:
 
 
 class _TestHighwaySelfGating(torch.nn.Module):
+    # [CLASS DOC] HELPER: Fixture module with a highway-style gate. See forward for the
+    # computation.
     def __init__(
         self,
         d_model: int,
         size: int,
         device="cuda",
+        # [FUNCTION DOC] HELPER: Stores the list length and device, builds two linear layers of
+        # equal d_model size (gating and transform) and a sigmoid, all moved to the device.
     ) -> None:
         super().__init__()
         self.size = size
@@ -43,6 +54,9 @@ class _TestHighwaySelfGating(torch.nn.Module):
         self,
         inputs: list[torch.Tensor],
     ) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: For each of the first size tensors in the input list,
+        # multiplies the gating projection by the sigmoid of the transform projection, and
+        # returns all results joined along the last dimension.
         results = []
         for i in range(self.size):
             x = inputs[i]
@@ -55,7 +69,14 @@ class _TestHighwaySelfGating(torch.nn.Module):
 
 
 class MyModule(torch.nn.Module):
+    # [CLASS DOC] HELPER: Fixture with three groups of ten square linear layers kept in plain
+    # Python lists.
+    # KNOWN ISSUE: the layers sit in plain lists, not registered submodules, so named_parameters
+    # of this module is empty and the parameter and gradient comparisons are vacuous.
     def __init__(self, z: int, has_bias: bool, device="cuda") -> None:
+        # [FUNCTION DOC] HELPER: Records size z and device, fixes the sequence length at ten,
+        # and builds three lists of ten z by z linear layers (with or without bias) on the
+        # device.
         super().__init__()
         self.z = z
         self.device = device
@@ -71,6 +92,10 @@ class MyModule(torch.nn.Module):
         ]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Builds ten shifted copies of the input, passes them through the
+        # first linear group, shifts back, mixes some copies from the earlier stage with later
+        # ones, applies the second group, shifts again, picks another mixed set of ten tensors,
+        # applies the third group and returns the results concatenated along dimension one.
         x1 = [x + 0.1 * i for i in range(self.seq_len)]
         x2 = [self.seq1[i](x1[i]) for i in range(self.seq_len)]
         x3 = [x2[i] - 0.1 * i for i in range(self.seq_len)]
@@ -88,7 +113,12 @@ class MyModule(torch.nn.Module):
 
 
 class MyModule2(torch.nn.Module):
+    # [CLASS DOC] HELPER: Fixture with six linear layers of differing input widths (six, eight,
+    # ten) and three batch norm layers, used to exercise group linear fusion with different
+    # shapes.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates linear0 to linear5 (inputs 6, 8, 10, 6, 8, 10; output
+        # 8) and batch norms bn0 to bn2 with eight features.
         super().__init__()
         self.linear0 = torch.nn.Linear(6, 8)
         self.linear1 = torch.nn.Linear(8, 8)
@@ -101,6 +131,10 @@ class MyModule2(torch.nn.Module):
         self.bn2 = torch.nn.BatchNorm1d(8)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Splits the input along dimension one into widths six, eight,
+        # ten. The three pieces get a constant offset, a linear and a batch norm each; the same
+        # pieces also go through sin, cos and a scaled sin followed by the remaining linears.
+        # All six outputs are concatenated along dimension zero and passed through a sigmoid.
         t = torch.split(x, [6, 8, 10], dim=1)
         a0 = self.bn0(self.linear0(t[0] + 0.1))
         a1 = self.bn1(self.linear1(t[1] + 0.2))
@@ -114,7 +148,13 @@ class MyModule2(torch.nn.Module):
 
 
 class MyModule3(torch.nn.Module):
+    # [CLASS DOC] HELPER: Fixture applying two rounds of layer norm over split chunks, with
+    # optional per-chunk weights and biases. Used for the batch layernorm fusion test.
     def __init__(self, device, has_weight=True, has_bias=True):
+        # [FUNCTION DOC] HELPER: Stores the device. Creates two parameter lists of five
+        # one-dimensional size-ten tensors (scale0, bias0) and two lists of five tensors of
+        # shape five by ten (scale1, bias1). The scale1 and bias1 entries are replaced by lists
+        # of None when has_weight or has_bias is false. Parameter lists are moved to the device.
         super().__init__()
         self.device = device
         self.scale0 = torch.nn.ParameterList(
@@ -139,6 +179,11 @@ class MyModule3(torch.nn.Module):
         )
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Moves the input to the device, splits the last dimension into
+        # chunks of ten, layer-normalizes each over size ten with scale0 and bias0,
+        # concatenates, splits again, layer-normalizes each chunk over the trailing five by ten
+        # shape with the optional scale1 and bias1, and returns the chunks concatenated on
+        # dimension two.
         l1_out = torch.split(x.to(self.device), 10, dim=2)
         post_l1 = [
             torch.nn.functional.layer_norm(
@@ -160,7 +205,14 @@ class MyModule3(torch.nn.Module):
 
 
 class MyModule4(torch.nn.Module):
+    # [CLASS DOC] HELPER: Fixture applying ten linears with a shared input (varying output
+    # sizes) twice, with a concat and split between, used for batch_linear_lhs fusion.
+    # KNOWN ISSUE: the weights and biases are plain Python lists, not registered parameters, so
+    # parameter and gradient comparisons see an empty set.
     def __init__(self, z, device, has_bias):
+        # [FUNCTION DOC] HELPER: Stores size, device, bias flag and sequence length ten. Builds
+        # two lists of ten weight tensors with row counts that decrease by index modulo five,
+        # and, when has_bias is set, matching bias lists, all moved to the device.
         super().__init__()
         self.z = z
         self.device = device
@@ -186,6 +238,10 @@ class MyModule4(torch.nn.Module):
             ]
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Adds a constant to the input, applies ten functional linears
+        # sharing it as the left operand, concatenates on dimension one, splits into chunks of
+        # ten and concatenates them on dimension zero, applies ten more linears to that result,
+        # concatenates and returns the sigmoid.
         x = x + 1.2
         x1 = [
             torch.nn.functional.linear(
@@ -207,7 +263,12 @@ class MyModule4(torch.nn.Module):
 
 
 class MyModule5(torch.nn.Module):
+    # [CLASS DOC] HELPER: Fixture with five parallel linear layers over input slices, for
+    # batch_linear (pre-grad) fusion.
     def __init__(self, device, has_bias=True):
+        # [FUNCTION DOC] HELPER: Stores the device, builds a parameter list of five 50 by 100
+        # weights and either five bias vectors of size 50 or a list of None values when has_bias
+        # is false.
         super().__init__()
         self.device = device
 
@@ -222,6 +283,9 @@ class MyModule5(torch.nn.Module):
         )
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Splits the input into slices of width 100, applies one
+        # functional linear per slice with its own weight and bias, concatenates on dimension
+        # one and returns the sin.
         l1_out = torch.split(x.to(self.device), 100, dim=1)
         l1_linear = [
             torch.nn.functional.linear(l1_out[i], self.weights[i], self.biases[i])
@@ -232,11 +296,18 @@ class MyModule5(torch.nn.Module):
 
 
 class _TestPointwiseOps(torch.nn.Module):
+    # [CLASS DOC] HELPER: Fixture with parallel pointwise ops (sigmoid, relu, add, mul, sub,
+    # div) on split chunks, for pre-grad and post-grad pointwise batching tests.
     def __init__(self, device, has_bias=True):
+        # [FUNCTION DOC] HELPER: Stores the device; the has_bias argument is unused.
         super().__init__()
         self.device = device
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Splits the input in two halves of width 500, then each half
+        # into chunks of 50, applies sigmoid then relu to each chunk of both halves, adds the
+        # two branches pairwise, then multiplies, subtracts and divides each result with itself.
+        # Returns the chunks concatenated on dimension one.
         inputs = torch.split(x.to(self.device), 500, dim=1)
         x_split = torch.split(inputs[0].to(self.device), 50, dim=1)
         y_split = torch.split(inputs[1].to(self.device), 50, dim=1)
@@ -252,11 +323,17 @@ class _TestPointwiseOps(torch.nn.Module):
 
 
 class _TestPointwiseOpsPostGrad(torch.nn.Module):
+    # [CLASS DOC] HELPER: Fixture using aten-level ops (tanh, sigmoid, relu, add) on split
+    # chunks, for post-grad batching passes.
     def __init__(self, device):
+        # [FUNCTION DOC] HELPER: Stores the device.
         super().__init__()
         self.device = device
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Splits the input into two halves and then chunks of 50 using
+        # aten ops, applies tanh, sigmoid and relu per chunk in each half, adds the halves
+        # pairwise and returns the sums concatenated on dimension one.
         inputs = torch.ops.aten.split(x.to(self.device), 500, dim=1)
         x_split = torch.ops.aten.split(inputs[0].to(self.device), 50, dim=1)
         y_split = torch.ops.aten.split(inputs[1].to(self.device), 50, dim=1)
@@ -271,11 +348,18 @@ class _TestPointwiseOpsPostGrad(torch.nn.Module):
 
 
 class _TestMathOps(torch.nn.Module):
+    # [CLASS DOC] HELPER: Fixture exercising clamp, nan_to_num, detach and stack in lists of
+    # ten, for the math op batching passes.
     def __init__(self, device):
+        # [FUNCTION DOC] HELPER: Stores the device.
         super().__init__()
         self.device = device
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Makes two lists of ten device copies of the input, clamps each
+        # to a symmetric range, replaces non-finite values with a constant, detaches, stacks
+        # each list on dimension zero, then stacks the two stacks together and returns the
+        # result.
         inputs = [x.to(self.device) for i in range(10)]
         others = [x.to(self.device) for i in range(10)]
         clamp_input = [x.clamp(min=-1000.1, max=1000.1) for x in inputs]
@@ -290,13 +374,19 @@ class _TestMathOps(torch.nn.Module):
 
 
 class _TestDropout(torch.nn.Module):
+    # [CLASS DOC] HELPER: Fixture applying five independent training-mode dropouts to equal
+    # slices.
     def __init__(self, device):
+        # [FUNCTION DOC] HELPER: Stores the device.
         super().__init__()
         self.device = device
 
     def forward(
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC] HELPER: Splits the input into five slices of width 20 along dimension
+        # one, applies dropout with probability 0.05 in training mode (not in place) to each and
+        # returns the five results as a tuple.
         split = x.split([20, 20, 20, 20, 20], 1)
         getitem_1 = split[0]
         getitem_2 = split[1]
@@ -322,7 +412,15 @@ class _TestDropout(torch.nn.Module):
 
 
 class TestGroupBatchFusion(TestCase):
+    # [CLASS DOC] Tests for group and batch fusion passes driven through torch.compile. Most
+    # tests set the fusion option config, clear the dynamo counters, compile a fixture module,
+    # compare results, parameters and gradients with eager, and assert how many times each pass
+    # fired. Helper comparison methods are defined first.
     def compare_dict_tensors(self, ref_dict, res_dict, rtol=1e-3, atol=1e-3):
+        # [FUNCTION DOC] HELPER: Compares two mappings of tensors. Returns False if sizes differ
+        # or any tensor pair is not close within the tolerances. The compiled side's keys must
+        # carry the compiled-module prefix on each eager key; raises AssertionError if one is
+        # missing. Returns True when all match.
         if len(set(ref_dict.keys())) != len(set(res_dict.keys())):
             return False
         for key1 in ref_dict:
@@ -334,16 +432,22 @@ class TestGroupBatchFusion(TestCase):
         return True
 
     def compare_pred(self, module, traced, input, rtol=1e-3, atol=1e-3):
+        # [FUNCTION DOC] HELPER: Runs both the eager and compiled module on the inputs and
+        # asserts the outputs are equal within the tolerances.
         ref = module(*input)
         res = traced(*input)
         self.assertEqual(ref, res, rtol=rtol, atol=atol)
 
     def compare_parameters(self, module, traced, rtol=1e-3, atol=1e-3):
+        # [FUNCTION DOC] HELPER: Gathers named parameters of both modules and asserts they match
+        # through compare_dict_tensors.
         ref_params = dict(module.named_parameters())
         res_params = dict(traced.named_parameters())
         self.assertTrue(self.compare_dict_tensors(ref_params, res_params, rtol, atol))
 
     def compare_gradients(self, module, traced, rtol=1e-3, atol=1e-3):
+        # [FUNCTION DOC] HELPER: Gathers the gradient of every named parameter of both modules
+        # and asserts they match through compare_dict_tensors.
         ref_grad = {key: param.grad for key, param in module.named_parameters()}
         res_grad = {key: param.grad for key, param in traced.named_parameters()}
         self.assertTrue(
@@ -359,6 +463,9 @@ class TestGroupBatchFusion(TestCase):
         },
     )
     def test_group_linear_fusion(self):
+        # [FUNCTION DOC] Needs GPU and fbgemm. Compiles the grouped linear fixture with and
+        # without bias and checks group_linear fires twice after the forward pass and four times
+        # after the backward, with outputs, parameters and gradients matching eager.
         z = 10
         for has_bias in [True, False]:
             counters.clear()
@@ -391,6 +498,9 @@ class TestGroupBatchFusion(TestCase):
         },
     )
     def test_group_linear_fusion_different_shapes(self):
+        # [FUNCTION DOC] Needs GPU and fbgemm. Compiles the fixture with differently shaped
+        # linears and asserts group_linear fires once after forward and twice after backward,
+        # batch_fusion never fires, and outputs, parameters and gradients match eager.
         counters.clear()
         module = MyModule2().eval().to(GPU_TYPE)
         input = [torch.rand(4, 24, device=GPU_TYPE)]
@@ -423,6 +533,9 @@ class TestGroupBatchFusion(TestCase):
         post_grad_fusion_options={},
     )
     def test_batch_layer_norm_fusion(self):
+        # [FUNCTION DOC] Needs GPU (skipped on MPS). Runs the layer norm fixture over all weight
+        # and bias presence combinations with batch layernorm enabled and expects two firings
+        # per case, with outputs, parameters and gradients matching eager at tight tolerance.
         for has_weight in [True, False]:
             for has_bias in [True, False]:
                 counters.clear()
@@ -445,6 +558,9 @@ class TestGroupBatchFusion(TestCase):
         post_grad_fusion_options={},
     )
     def test_batch_linear_lhs_fusion(self):
+        # [FUNCTION DOC] Needs GPU. With batch_linear_lhs enabled, compiles the lhs fixture with
+        # and without bias and expects two firings, with matching outputs, parameters and
+        # gradients.
         z = 10
         for has_bias in [True, False]:
             counters.clear()
@@ -463,6 +579,11 @@ class TestGroupBatchFusion(TestCase):
 
     @requires_gpu()
     def test_as_strided_storage_offset_after_mm_fusion(self):
+        # [FUNCTION DOC] Needs GPU. Regression test for storage offsets after the post-grad
+        # batched matmul rewrite: builds a custom backend that fuses the first three matched mm
+        # nodes with the batch linear rule, compiles a small QKV attention model through it and
+        # checks that exactly three nodes were fused and that outputs match eager. Resets dynamo
+        # state before each run.
         """
         Post-grad batch linear fusion rewrites parallel mm nodes into a
         batched bmm followed by select views. The select outputs preserve the
@@ -484,6 +605,11 @@ class TestGroupBatchFusion(TestCase):
         fused_counts = []
 
         def fusing_compiler(gm, example_inputs):
+            # [FUNCTION DOC] HELPER: Backend compiler. Copies the default graph search options
+            # with a minimum fuse set size of three, finds nodes matched by the post-grad batch
+            # linear rule, records how many matched, and if at least three matched fuses the
+            # first three, re-sorts topologically, lints and recompiles the graph. Then compiles
+            # with the standard inductor inner compiler.
             opts = graph_search_options.copy()
             opts["min_fuse_set_size"] = 3
             rule = PostGradBatchLinearFusion(graph_search_options=opts)
@@ -502,7 +628,13 @@ class TestGroupBatchFusion(TestCase):
         )
 
         class QKVModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Small QKV projection model whose forward reshapes and
+            # re-strides q, k, v so that downstream strides depend on the storage offsets
+            # produced by the fused matmuls.
             def __init__(self, hidden_size=64, num_heads=4):
+                # [FUNCTION DOC] HELPER: Stores hidden size, head count and head dim; creates
+                # three bias-free linear layers for q, k, v and the attention scale (square root
+                # of head dim).
                 super().__init__()
                 self.hidden_size = hidden_size
                 self.num_heads = num_heads
@@ -513,6 +645,10 @@ class TestGroupBatchFusion(TestCase):
                 self.scale = self.head_dim**0.5
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Permutes the input, projects it with the three linears,
+                # scales q, reshapes each to heads by flattened-tokens by head dim and re-views
+                # it with explicit strides, transposes k and v, and returns the batched product
+                # of q and k together with k and v.
                 # Reduced-size version of the issue author's QKV repro.
                 x = x.permute(1, 0, 2)
                 q = self.q_proj(x)
@@ -572,17 +708,26 @@ class TestGroupBatchFusion(TestCase):
         post_grad_fusion_options={},
     )
     def test_batch_linear_lhs_fusion_nn_linear_inlined(self):
+        # [FUNCTION DOC] Needs GPU. Like the lhs fusion test but the linears come from nn.Linear
+        # modules that dynamo inlines into the low-level linear call; expects one firing with
+        # matching outputs, parameters and gradients.
         # Same shape pattern as test_batch_linear_lhs_fusion, but the linears
         # are produced through nn.Linear modules. Dynamo inlines those to
         # torch._C._nn.linear, which the upstream matcher used to miss.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a list of n registered linear layers of shrinking
+            # output size.
             def __init__(self, z, n, has_bias):
+                # [FUNCTION DOC] HELPER: Builds a module list of n linears from z inputs,
+                # outputs z minus index modulo five, optional bias.
                 super().__init__()
                 self.linears = torch.nn.ModuleList(
                     [torch.nn.Linear(z, z - i % 5, bias=has_bias) for i in range(n)]
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Adds a constant to the input, applies every linear,
+                # concatenates on dimension one and returns the sigmoid.
                 x = x + 1.2
                 outs = [lin(x) for lin in self.linears]
                 return torch.sigmoid(torch.cat(outs, dim=1))
@@ -609,6 +754,9 @@ class TestGroupBatchFusion(TestCase):
         post_grad_fusion_options={},
     )
     def test_batch_linear_pre_grad_fusion(self):
+        # [FUNCTION DOC] Needs GPU. With batch_linear enabled in the pre-grad options, compiles
+        # the five-linear fixture with and without bias and expects one firing; outputs,
+        # parameters and gradients must match eager.
         for has_bias in [True, False]:
             counters.clear()
             module = MyModule5(GPU_TYPE, has_bias)
@@ -638,6 +786,9 @@ class TestGroupBatchFusion(TestCase):
         },
     )
     def test_pointwise_op_fusion(self):
+        # [FUNCTION DOC] Needs GPU. Enables pre-grad relu and sigmoid batching and post-grad
+        # add, mul, sub and div batching, compiles the pointwise fixture and expects one firing
+        # for each, with outputs, parameters and gradients matching eager.
         counters.clear()
         module = _TestPointwiseOps(GPU_TYPE)
         input = [torch.randn(50, 1000, requires_grad=True, device=GPU_TYPE)]
@@ -668,6 +819,10 @@ class TestGroupBatchFusion(TestCase):
         },
     )
     def test_pointwise_op_fusion_post_grad(self):
+        # [FUNCTION DOC] Needs GPU. Enables post-grad relu, sigmoid, tanh and unbind-stack
+        # batching, compiles the aten pointwise fixture and expects one firing each for tanh,
+        # relu and sigmoid and two for the unbind stack pass; results and gradients must match
+        # eager.
         counters.clear()
         module = _TestPointwiseOpsPostGrad(GPU_TYPE)
         input = [torch.randn(50, 1000, requires_grad=True, device=GPU_TYPE)]
@@ -702,6 +857,11 @@ class TestGroupBatchFusion(TestCase):
         },
     )
     def test_gate_fusion_post_grad(self):
+        # [FUNCTION DOC] Needs GPU, with canonical output node ordering disabled in dynamo
+        # config. Compiles the highway gating fixture on 20 inputs with several post-grad
+        # batching passes enabled and asserts the exact firing counts (linear 2, sigmoid 1, mul
+        # 1, add 2, normalization 1, unbind stack 5), then that outputs, parameters and
+        # gradients match eager.
         counters.clear()
         size = 20
         module = _TestHighwaySelfGating(d_model=10, size=size, device=GPU_TYPE)
@@ -740,6 +900,9 @@ class TestGroupBatchFusion(TestCase):
         post_grad_fusion_options={},
     )
     def test_math_op_fusion(self):
+        # [FUNCTION DOC] Needs GPU. Enables normalization, detach, nan_to_num, clamp and
+        # unbind-stack passes, compiles the math op fixture on a vector with NaN and infinities,
+        # asserts the per-pass firing counts and that eager and compiled results are close.
         counters.clear()
         module = _TestMathOps(GPU_TYPE)
         input = [
@@ -765,9 +928,15 @@ class TestGroupBatchFusion(TestCase):
         pre_grad_fusion_options={"batch_clamp": {}},
     )
     def test_math_op_fusion_predispatch_positional_args(self):
+        # [FUNCTION DOC] Config enables the predispatch path and batch clamp. Compiles a
+        # function stacking clamps whose bounds are passed positionally, in two groups with
+        # different bounds, with full graph capture, and expects results equal to eager and two
+        # batch_clamp firings.
         counters.clear()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Stacks ten clamped shifted copies of the input; the first
+            # five use one pair of positional bounds and the last five another.
             return torch.stack(
                 [torch.clamp(x + i, -1.0, 1.0) for i in range(5)]
                 + [torch.clamp(x + i, 0.0, 2.0) for i in range(5, 10)]
@@ -786,6 +955,9 @@ class TestGroupBatchFusion(TestCase):
         }
     )
     def test_batch_dropout_pre_grad_fusion(self):
+        # [FUNCTION DOC] Needs GPU. Enables normalization and batch dropout, runs eager and
+        # compiled dropout fixtures on one input and asserts each pass fired once. Outputs are
+        # not compared because dropout is random.
         counters.clear()
         module = _TestDropout(GPU_TYPE)
         input = [torch.randn(10, 100, requires_grad=True, device=GPU_TYPE)]
@@ -803,6 +975,11 @@ class TestGroupBatchFusion(TestCase):
         },
     )
     def test_xpu_batch_linear_lhs(self):
+        # [FUNCTION DOC] Runs only when XPU is available, with batch_linear_lhs restricted to
+        # xpu devices. Asserts the default option restricts devices to xpu, compiles the lhs
+        # fixture on xpu with and without bias, expects at least one firing, matching results,
+        # parameters and gradients, and that the global pre-grad option mapping is not mutated
+        # by compilation.
         # batch_linear_lhs is disabled by default; enabling it for XPU via mock
         # config must make the fusion fire on XPU tensors.
         default_options = config.pre_grad_fusion_options
@@ -839,6 +1016,10 @@ class TestGroupBatchFusion(TestCase):
         },
     )
     def test_predispatch_device_aware_batch_linear_lhs(self):
+        # [FUNCTION DOC] Needs GPU. With the predispatch path enabled and devices restricted to
+        # the current GPU type, compiles the lhs fixture with full graph capture and asserts the
+        # pass fires at least once and results, parameters and gradients match eager. Verifies
+        # option resolution and device filtering in the predispatch path.
         # Verify that the predispatch path (_run_pre_dispatch_passes) routes
         # through _resolve_pre_grad_fusion_options and applies device filtering.
         # The default config has devices=("xpu",) which was previously bypassed
@@ -873,6 +1054,10 @@ class TestGroupBatchFusion(TestCase):
         },
     )
     def test_predispatch_cpu_device_agnostic_batch_linear_lhs(self):
+        # [FUNCTION DOC] Runs on CPU. With the predispatch path and batch_linear_lhs enabled
+        # without any devices restriction, compiles the lhs fixture with full graph capture and
+        # asserts the pass fires at least once and results, parameters and gradients match
+        # eager.
         # Verify that the predispatch path correctly enables batch_linear_lhs
         # when no "devices" key is present (user explicitly opts in).
         # This test runs on CPU so it can be verified in local dev without GPU.
@@ -898,6 +1083,10 @@ class TestGroupBatchFusion(TestCase):
         counters.clear()
 
     def test_batch_linear_lhs_skips_tensor_subclass_weights(self):
+        # [FUNCTION DOC] Builds a tiny FX graph with a linear call whose weight example value is
+        # a tensor subclass that raises if concatenation is dispatched. Asserts the match method
+        # of the batch linear lhs rule returns None so that the weight subclass is never
+        # concatenated. Only the matcher is exercised; no compilation happens.
         """batch_linear_lhs match() must return None when weight is a tensor subclass.
 
         Regression test for incompatibility with torchao W8A8 quantization:
@@ -909,10 +1098,16 @@ class TestGroupBatchFusion(TestCase):
         from torch._inductor.fx_passes.group_batch_fusion import BatchLinearLHSFusion
 
         class _SubclassWeight(torch.Tensor):
+            # [CLASS DOC] HELPER: Tensor subclass whose dispatch hook raises AssertionError when
+            # the default aten concatenation is called and otherwise forwards the call
+            # unchanged.
             """Minimal subclass that raises on aten.cat to detect the bug."""
 
             @classmethod
             def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+                # [FUNCTION DOC] HELPER: Dispatch hook; raises AssertionError on the aten cat
+                # op, otherwise runs the op on the given arguments, with empty keyword arguments
+                # if none were given.
                 if func == torch.ops.aten.cat.default:
                     raise AssertionError(
                         "aten.cat called on _SubclassWeight — "
@@ -944,13 +1139,18 @@ class TestGroupBatchFusion(TestCase):
 
 
 class _TestBMMFusionModule(torch.nn.Module):
+    # [CLASS DOC] HELPER: Fixture holding ten 10 by 10 linear layers; forward sums their
+    # outputs.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates a module list of ten 10 by 10 linear layers.
         super().__init__()
         self.my_modules = torch.nn.ModuleList()
         for _ in range(10):
             self.my_modules.append(torch.nn.Linear(10, 10))
 
     def forward(self, inputs):
+        # [FUNCTION DOC] HELPER: Pairs each linear layer with an input, and returns the sum of
+        # all outputs (the first one seeds the accumulator, the rest are added in place).
         output = None
         for linear, input in zip(self.my_modules, inputs):
             if output is None:
@@ -965,7 +1165,13 @@ class _TestBMMFusionModule(torch.nn.Module):
     post_grad_fusion_options={"batch_linear_post_grad": {"require_fbgemm": False}}
 )
 class TestPostGradBatchLinearFusion(TestCase):
+    # [CLASS DOC] GPU-only test class (class decorators require a GPU and set post-grad batch
+    # linear fusion without fbgemm) checking the post-grad batch linear pass on ten summed
+    # linears.
     def test_batch_linear_post_grad_fusion(self):
+        # [FUNCTION DOC] Compiles the BMM fixture on ten random inputs, asserts the result is
+        # close to eager and that the batch_linear_post_grad counter equals two. The counters
+        # are not cleared first.
         pt1_module = _TestBMMFusionModule().to(GPU_TYPE)
         inputs = []
         for _ in range(10):
@@ -981,8 +1187,14 @@ class TestPostGradBatchLinearFusion(TestCase):
 
 
 class TestFindIndependentSubsetGreedy(TestCase):
+    # [CLASS DOC] Tests for the greedy independent-subset iterator used by fusion. Graphs are
+    # described by name-to-argument-names mappings and built as FX placeholder nodes.
     # Helper function to build a Graph from a data description.
     def build_graph(self, desc):
+        # [FUNCTION DOC] HELPER: Builds an FX graph from a mapping of node name to the names of
+        # its inputs. Nodes are created once all their inputs exist; others are deferred to the
+        # back of a queue. Raises AssertionError if a full pass over the queue makes no progress
+        # (cycle or unknown name). Returns the graph and a mapping from name to node.
         # desc: {
         #   "n1": ["n2", "n3"],
         #   "n2": ["n3"],
@@ -1008,6 +1220,9 @@ class TestFindIndependentSubsetGreedy(TestCase):
         return g, lookup
 
     def verify(self, tree, subnodes, min_fuse, max_fuse, expected):
+        # [FUNCTION DOC] HELPER: Builds the graph, maps names to nodes, runs the greedy subset
+        # iterator with min and max fuse set sizes and asserts the produced groups equal the
+        # expected groups of nodes.
         _, lookup = self.build_graph(tree)
         subnodes = [lookup[n] for n in subnodes]
         expected = [[lookup[n] for n in sub] for sub in expected]
@@ -1023,6 +1238,9 @@ class TestFindIndependentSubsetGreedy(TestCase):
         self.assertEqual(expected, result)
 
     def test_find_independent_subset_greedy(self):
+        # [FUNCTION DOC] Table-driven check of the independent subset iterator with many graphs
+        # (some randomly generated) and various min and max set sizes; each case lists the
+        # expected ordered groups. Only calls verify.
         # First some randomly generated tests.
         self.verify({"n0": (), "n1": ()}, ["n0"], 0, 100, [["n0"]])
         self.verify(
@@ -1568,6 +1786,9 @@ class TestFindIndependentSubsetGreedy(TestCase):
         )
 
     def test_find_independent_subset_greedy_fuse(self):
+        # [FUNCTION DOC] Checks that fusing nodes while iterating changes later groups: after
+        # the first group of n2, n3 and n5 is yielded, n2 and n3 are replaced by one fused node,
+        # so the remaining nodes come out as n4 alone, then n0 with n1, then the iterator ends.
         # ensure that fusing the sets during iteration results in the correct
         # iteration results. In the example graph after we merge n2 and n3,
         # n4 is no longer independent from n1.
@@ -1606,8 +1827,13 @@ class TestFindIndependentSubsetGreedy(TestCase):
 
 
 class CatLinearMod(torch.nn.Module):
+    # [CLASS DOC] HELPER: Fixture applying a linear layer to a concatenation of a list of tensors
+    # along the chosen dimension (default last). The input width is the sum of widths if
+    # concatenating on the last dimension, otherwise the first width.
     # linear(cat(parts, dim=cat_dim)). cat_dim=-1 is the matchable shape.
     def __init__(self, widths, out_features, has_bias=True, cat_dim=-1, device="cpu"):
+        # [FUNCTION DOC] HELPER: Stores the cat dimension and builds the linear layer on the
+        # given device.
         super().__init__()
         self.cat_dim = cat_dim
         # when the cat is not on the last dim the feature width is unchanged,
@@ -1616,17 +1842,25 @@ class CatLinearMod(torch.nn.Module):
         self.lin = torch.nn.Linear(in_features, out_features, bias=has_bias).to(device)
 
     def forward(self, parts):
+        # [FUNCTION DOC] HELPER: Concatenates the list of tensors on the stored dimension and
+        # returns the linear layer applied to it.
         x = torch.cat(parts, dim=self.cat_dim)
         return self.lin(x)
 
 
 class CatLinearTwoUserMod(torch.nn.Module):
+    # [CLASS DOC] HELPER: Fixture whose concatenation feeds both a linear layer and a sum, so the
+    # cat has two users.
     # the cat feeds the linear *and* a second consumer, so it can't be erased.
     def __init__(self, widths, out_features, device="cpu"):
+        # [FUNCTION DOC] HELPER: Builds a linear layer over the summed widths with bias on the
+        # given device.
         super().__init__()
         self.lin = torch.nn.Linear(sum(widths), out_features).to(device)
 
     def forward(self, parts):
+        # [FUNCTION DOC] HELPER: Concatenates on the last dimension and returns the linear
+        # output together with the sum of the concatenated tensor.
         x = torch.cat(parts, dim=-1)
         return self.lin(x), x.sum()
 
@@ -1636,7 +1870,14 @@ class CatLinearTwoUserMod(torch.nn.Module):
     post_grad_fusion_options={},
 )
 class TestCatLinearFusion(TestCase):
+    # [CLASS DOC] Tests for the cat_linear pre-grad pass (config patched to enable only it) that
+    # rewrites a linear over a concatenation into per-part linears plus adds. Helpers report
+    # whether the pass fires or return the rewritten graph; tests cover accepted and rejected
+    # shapes.
     def _fires(self, module, parts, traffic_floor=0):
+        # [FUNCTION DOC] HELPER: Clears counters and dynamo state, compiles the module on the
+        # inputs with the traffic floor constant of the pass replaced temporarily by the given
+        # value, then reads the cat_linear counter, clears counters and returns that count.
         # unit-test tensors never reach the real 512 MiB floor, so unless a test
         # is exercising the floor, drop it to 0 and let the shape gates decide.
         from unittest import mock
@@ -1654,6 +1895,10 @@ class TestCatLinearFusion(TestCase):
         return n
 
     def _fuse_and_get_graph(self, module, parts):
+        # [FUNCTION DOC] HELPER: Captures the dynamo graph with a custom backend that runs the
+        # pre-grad fusion passes, eliminates dead code, lints and recompiles, with the traffic
+        # floor set to zero. Returns the rewritten graph module. Counters are left set for the
+        # caller to inspect.
         # run the pre-grad pass on the dynamo graph and hand the rewritten
         # GraphModule back so we can check the cat is really gone, not just that
         # the counter bumped (the counter increments inside fuse, before DCE).
@@ -1667,6 +1912,9 @@ class TestCatLinearFusion(TestCase):
         captured = {}
 
         def backend(gm, example_inputs):
+            # [FUNCTION DOC] HELPER: Backend that applies the pre-grad fusion passes to the
+            # graph, removes dead nodes, lints, recompiles, stores the module in the enclosing
+            # mapping and returns its forward.
             group_batch_fusion_passes(gm.graph, pre_grad=True)
             # the rewrite drops the linear's only use of the cat; DCE is what
             # actually deletes the now-dead cat, same as the real pre-grad path.
@@ -1683,6 +1931,9 @@ class TestCatLinearFusion(TestCase):
         return captured["gm"]
 
     def _node_counts(self, gm):
+        # [FUNCTION DOC] HELPER: Counts call_function nodes that are concatenations, linears
+        # (either the functional or the low-level variant) and python-operator additions.
+        # Returns the three counts.
         cats = linears = adds = 0
         for n in gm.graph.nodes:
             if n.op != "call_function":
@@ -1696,6 +1947,8 @@ class TestCatLinearFusion(TestCase):
         return cats, linears, adds
 
     def test_cat_linear_removes_cat_two_part(self):
+        # [FUNCTION DOC] Two-part cat-linear case: asserts the pass fires once and the rewritten
+        # graph has no cat, two linears and one add.
         m = CatLinearMod([16, 16], 32)
         parts = [torch.randn(4, 16), torch.randn(4, 16)]
         gm = self._fuse_and_get_graph(m, parts)
@@ -1707,6 +1960,8 @@ class TestCatLinearFusion(TestCase):
         counters.clear()
 
     def test_cat_linear_removes_cat_three_part(self):
+        # [FUNCTION DOC] Three-part case: asserts the pass fires once and the graph has no cat,
+        # three linears and two adds.
         m = CatLinearMod([16, 16, 16], 32)
         parts = [torch.randn(4, 16) for _ in range(3)]
         gm = self._fuse_and_get_graph(m, parts)
@@ -1718,6 +1973,8 @@ class TestCatLinearFusion(TestCase):
         counters.clear()
 
     def test_cat_linear_keeps_cat_when_rejected(self):
+        # [FUNCTION DOC] Four parts exceed the allowed count, so the pass must not fire and the
+        # graph must keep its single cat.
         # a rejected case (too many parts) must leave the cat untouched
         m = CatLinearMod([16, 16, 16, 16], 32)
         parts = [torch.randn(4, 16) for _ in range(4)]
@@ -1728,32 +1985,41 @@ class TestCatLinearFusion(TestCase):
         counters.clear()
 
     def test_cat_linear_two_part(self):
+        # [FUNCTION DOC] Asserts the pass fires once for a two-part concatenation.
         m = CatLinearMod([16, 16], 32)
         parts = [torch.randn(4, 16), torch.randn(4, 16)]
         self.assertEqual(self._fires(m, parts), 1)
 
     def test_cat_linear_three_part(self):
+        # [FUNCTION DOC] Asserts the pass fires once for a three-part concatenation.
         m = CatLinearMod([16, 16, 16], 32)
         parts = [torch.randn(4, 16) for _ in range(3)]
         self.assertEqual(self._fires(m, parts), 1)
 
     def test_cat_linear_rejects_non_last_dim(self):
+        # [FUNCTION DOC] Concatenating on dimension zero must be rejected; the pass must not
+        # fire.
         m = CatLinearMod([16, 16], 16, cat_dim=0)
         parts = [torch.randn(4, 16), torch.randn(4, 16)]
         self.assertEqual(self._fires(m, parts), 0)
 
     def test_cat_linear_rejects_too_many_parts(self):
+        # [FUNCTION DOC] Four parts must be rejected; the pass must not fire.
         m = CatLinearMod([16, 16, 16, 16], 32)
         parts = [torch.randn(4, 16) for _ in range(4)]
         self.assertEqual(self._fires(m, parts), 0)
 
     def test_cat_linear_rejects_wide_output(self):
+        # [FUNCTION DOC] An output width of 128 exceeds the allowed ceiling, so the pass must
+        # not fire.
         # N=128 is past the N<=96 ceiling; a wide output is compute-bound.
         m = CatLinearMod([64, 64], 128)
         parts = [torch.randn(4, 64), torch.randn(4, 64)]
         self.assertEqual(self._fires(m, parts), 0)
 
     def test_cat_linear_rejects_small_traffic(self):
+        # [FUNCTION DOC] With the real traffic floor in effect, a small concatenation is below
+        # it, so the pass must not fire even though shape checks would pass.
         # all shape gates pass; at the real 512 MiB floor this concat is too small.
         from torch._inductor.fx_passes import group_batch_fusion as gbf
 
@@ -1765,17 +2031,23 @@ class TestCatLinearFusion(TestCase):
         )
 
     def test_cat_linear_rejects_thin_piece(self):
+        # [FUNCTION DOC] A part of width 4 is too thin; the pass must not fire.
         m = CatLinearMod([4, 16], 32)
         parts = [torch.randn(4, 4), torch.randn(4, 16)]
         self.assertEqual(self._fires(m, parts), 0)
 
     def test_cat_linear_rejects_multi_user_cat(self):
+        # [FUNCTION DOC] A concatenation also used by a sum has two users; the pass must not
+        # fire.
         m = CatLinearTwoUserMod([16, 16], 32)
         parts = [torch.randn(4, 16), torch.randn(4, 16)]
         self.assertEqual(self._fires(m, parts), 0)
 
     @requires_gpu()
     def test_cat_linear_numerics(self):
+        # [FUNCTION DOC] Needs GPU. For both bias settings, compares eager and compiled bfloat16
+        # output of a two-part cat-linear (traffic floor patched to zero), expects one firing
+        # and a close match at loose bfloat16 tolerance.
         from unittest import mock
 
         from torch._inductor.fx_passes import group_batch_fusion as gbf
@@ -1799,6 +2071,10 @@ class TestCatLinearFusion(TestCase):
 
     @requires_gpu()
     def test_cat_linear_numerics_backward(self):
+        # [FUNCTION DOC] Needs GPU. Same setup as the forward numerics test in bfloat16, but
+        # runs backward on the summed output and compares the weight grad, bias grad (if
+        # present) and per-input grads of eager versus compiled at loose tolerance; asserts the
+        # pass fired once.
         # forward is not enough: the rewrite has to keep the backward correct too.
         # grads reach the shared weight through the differentiable slices (one
         # slice per piece), and the bias grad flows only through out_0 since bias
@@ -1820,6 +2096,10 @@ class TestCatLinearFusion(TestCase):
             ]
 
             def run(compiled):
+                # [FUNCTION DOC] HELPER: Zeroes module grads, clones the base inputs as leaf
+                # tensors that need grad, runs eager or compiled forward, backward on the sum,
+                # and returns clones of the weight grad, bias grad (None without bias) and the
+                # list of input grads.
                 module.zero_grad(set_to_none=True)
                 parts = [p.detach().clone().requires_grad_(True) for p in base]
                 fn = torch.compile(module) if compiled else module
@@ -1843,6 +2123,8 @@ class TestCatLinearFusion(TestCase):
             counters.clear()
 
     def test_cat_linear_numerics_cpu(self):
+        # [FUNCTION DOC] CPU float32 forward check of the two-part cat-linear with and without
+        # bias, traffic floor patched to zero: expects one firing and equal outputs.
         from unittest import mock
 
         from torch._inductor.fx_passes import group_batch_fusion as gbf
@@ -1860,6 +2142,10 @@ class TestCatLinearFusion(TestCase):
             counters.clear()
 
     def test_cat_linear_numerics_backward_cpu(self):
+        # [FUNCTION DOC] CPU float32 backward check at default tight tolerances, for both bias
+        # settings: weight, bias and input gradients of compiled versus eager must match, and
+        # the pass must fire once. Guards against slice offset or bias placement errors that
+        # forward checks cannot see.
         # fp32 pin for the backward. forward alone can't catch a wrong weight
         # column offset or a misplaced bias, both only show up in the grads:
         # the shared weight grad comes through the differentiable slices (one
@@ -1877,6 +2163,10 @@ class TestCatLinearFusion(TestCase):
             base = [torch.randn(8, 24), torch.randn(8, 24)]
 
             def run(compiled):
+                # [FUNCTION DOC] HELPER: Zeroes module grads, clones the base inputs as leaf
+                # tensors that need grad, runs eager or compiled forward, backward on the sum,
+                # and returns clones of the weight grad, bias grad (None without bias) and the
+                # list of input grads.
                 module.zero_grad(set_to_none=True)
                 parts = [p.detach().clone().requires_grad_(True) for p in base]
                 fn = torch.compile(module) if compiled else module
