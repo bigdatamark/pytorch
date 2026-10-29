@@ -1,4 +1,8 @@
 # Owner(s): ["module: fx"]
+# [MODULE DOC] Tests for the FX shape inference helpers: infer_symbol_values (solves symbolic
+# dimension values from error message constraint strings) and infer_shape (runs shape inference
+# over a traced graph module). Running the file directly raises a RuntimeError since it is not
+# used by test discovery.
 
 import copy
 import unittest
@@ -15,8 +19,19 @@ from torch.fx.experimental.symbolic_shapes import DimDynamic, ShapeEnv
 
 
 class TestShapeInference(unittest.TestCase):
+    # [CLASS DOC] unittest based test case with one test for infer_symbol_values and one smoke
+    # test for infer_shape.
     def test_infer_symbol_values(self):
+        # [FUNCTION DOC] Creates a ShapeEnv with eight dynamic symbolic ints named s0 to s7,
+        # each with hint two, and keeps a deep copy as the initial values. Feeds a series of
+        # runtime error message strings (size mismatches, invalid reshapes, matmul reduction
+        # dimension mismatches, split size sums) to infer_symbol_values one by one, which
+        # updates the working symint list in place. Finally asserts symbols one through seven
+        # were resolved to 1773, 216, 640, 4160, 40, 160 and 4258.
         def mksym(shape_env, value, source, dynamic_dim) -> None:
+            # [FUNCTION DOC] HELPER: Builds a symbolic integer node in the given shape env:
+            # creates a symbol with the given value, source and dynamic dim, and wraps it with
+            # the same value as hint and the same source.
             return shape_env.create_symintnode(
                 shape_env.create_symbol(
                     value,
@@ -85,8 +100,16 @@ class TestShapeInference(unittest.TestCase):
         self.assertEqual(symints[7], 4258)
 
     def test_infer_shape(self):
+        # [FUNCTION DOC] Smoke test: traces a small two linear layer model with sigmoid and tanh
+        # into a graph module and calls infer_shape with a single input tensor of shape 1 by 1.
+        # Only checks that no exception is raised.
         class TestModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with two linear style weights and biases (256 by 328
+            # and 328 by 256) stored as uninitialized tensors, applying linear, sigmoid,
+            # linear and tanh.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Allocates uninitialized tensors for the first and
+                # second weights and biases as plain attributes.
                 super().__init__()
                 self.w_1 = torch.empty([256, 328])
                 self.b_1 = torch.empty([256])
@@ -94,6 +117,8 @@ class TestShapeInference(unittest.TestCase):
                 self.b_2 = torch.empty([328])
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies a linear layer with w_1 and b_1, sigmoid, a
+                # linear layer with w_2 and b_2, then tanh, and returns the result.
                 l_1 = torch.nn.functional.linear(x, self.w_1, bias=self.b_1)
                 s_1 = torch.sigmoid(l_1)
                 l_2 = torch.nn.functional.linear(s_1, self.w_2, bias=self.b_2)
@@ -101,6 +126,8 @@ class TestShapeInference(unittest.TestCase):
                 return t_1
 
         def generate_graph_module(model):
+            # [FUNCTION DOC] HELPER: Symbolically traces the given model and returns
+            # the resulting GraphModule.
             gm = fx.symbolic_trace(model)
             return gm
 
