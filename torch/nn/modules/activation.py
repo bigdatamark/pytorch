@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Element-wise and softmax-family activation layers as torch.nn Modules.
+# Most classes are thin stateful wrappers that store hyperparameters (and an inplace flag) and
+# delegate forward to the matching function in torch.nn.functional or torch. Also defines
+# MultiheadAttention (learnable projections plus an inference fast path) and PReLU (learnable
+# slope). Exports the names listed in __all__. No import-time side effects beyond defining classes.
 import warnings
 
 import torch
@@ -45,6 +50,8 @@ __all__ = [
 
 
 class Threshold(Module):
+    # [CLASS DOC] Module that replaces input elements not greater than a threshold with a fixed value.
+    # State: threshold, value, inplace (all listed in __constants__ for TorchScript). No parameters.
     r"""Thresholds each element of the input Tensor.
 
     Threshold is defined as:
@@ -81,6 +88,9 @@ class Threshold(Module):
     inplace: bool
 
     def __init__(self, threshold: float, value: float, inplace: bool = False) -> None:
+        # [FUNCTION DOC] Store the threshold, replacement value and inplace flag.
+        # Args: threshold (float), value (float), inplace (bool, default False). No validation is done
+        # (a TODO comment notes a missing check that value must not exceed threshold when inplace).
         super().__init__()
         self.threshold = threshold
         self.value = value
@@ -88,12 +98,15 @@ class Threshold(Module):
         # TODO: check in THNN (if inplace == True, then assert value <= threshold)
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply the threshold function element-wise to the input tensor.
+        # Returns a tensor of the same shape; modifies the input in place when inplace is set.
         """
         Runs the forward pass.
         """
         return F.threshold(input, self.threshold, self.value, self.inplace)
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] Return the repr suffix string with threshold, value and, if enabled, inplace=True.
         """
         Return the extra representation of the module.
         """
@@ -102,6 +115,8 @@ class Threshold(Module):
 
 
 class ReLU(Module):
+    # [CLASS DOC] Module applying the rectified linear unit, max(0, x), element-wise.
+    # State: inplace flag only. No parameters.
     r"""Applies the rectified linear unit function element-wise.
 
     :math:`\text{ReLU}(x) = (x)^+ = \max(0, x)`
@@ -133,16 +148,20 @@ class ReLU(Module):
     inplace: bool
 
     def __init__(self, inplace: bool = False) -> None:
+        # [FUNCTION DOC] Store the inplace flag. Args: inplace (bool, default False).
         super().__init__()
         self.inplace = inplace
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply ReLU to the input via the functional API; returns a same-shaped tensor
+        # (the input itself modified when inplace is set).
         """
         Runs the forward pass.
         """
         return F.relu(input, inplace=self.inplace)
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] Return "inplace=True" when the inplace flag is set, otherwise an empty string.
         """
         Return the extra representation of the module.
         """
@@ -151,6 +170,9 @@ class ReLU(Module):
 
 
 class RReLU(Module):
+    # [CLASS DOC] Module for the randomized leaky ReLU activation.
+    # Negative inputs are scaled by a slope drawn uniformly from [lower, upper] in training mode and
+    # by the fixed midpoint (lower + upper) / 2 in eval mode. State: lower, upper, inplace.
     r"""Applies the randomized leaky rectified linear unit function, element-wise.
 
     Method described in the paper:
@@ -197,18 +219,24 @@ class RReLU(Module):
     def __init__(
         self, lower: float = 1.0 / 8, upper: float = 1.0 / 3, inplace: bool = False
     ) -> None:
+        # [FUNCTION DOC] Store the slope bounds and the inplace flag.
+        # Args: lower (float, default 1/8), upper (float, default 1/3), inplace (bool, default False).
+        # No validation that lower <= upper is performed here.
         super().__init__()
         self.lower = lower
         self.upper = upper
         self.inplace = inplace
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply randomized leaky ReLU, passing the module's training flag so the slope is
+        # sampled in training mode and fixed in eval mode. Returns a same-shaped tensor.
         """
         Runs the forward pass.
         """
         return F.rrelu(input, self.lower, self.upper, self.training, self.inplace)
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] Return the repr suffix with lower, upper and, if enabled, inplace=True.
         """
         Return the extra representation of the module.
         """
@@ -217,6 +245,9 @@ class RReLU(Module):
 
 
 class Hardtanh(Module):
+    # [CLASS DOC] Module that clamps every element to the closed range [min_val, max_val].
+    # State: min_val, max_val, inplace. Invariant: max_val is strictly greater than min_val.
+    # Subclassed by ReLU6.
     r"""Applies the HardTanh function element-wise.
 
     HardTanh is defined as:
@@ -263,6 +294,10 @@ class Hardtanh(Module):
         min_value: float | None = None,
         max_value: float | None = None,
     ) -> None:
+        # [FUNCTION DOC] Store the clamp bounds and inplace flag.
+        # Args: min_val (float, default -1), max_val (float, default 1), inplace (bool),
+        # min_value / max_value (deprecated aliases that override min_val / max_val and emit a
+        # FutureWarning). Raises AssertionError if max_val is not greater than min_val.
         super().__init__()
         if min_value is not None:
             warnings.warn(
@@ -288,12 +323,14 @@ class Hardtanh(Module):
             )
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Clamp the input to [min_val, max_val] element-wise via the functional API.
         """
         Runs the forward pass.
         """
         return F.hardtanh(input, self.min_val, self.max_val, self.inplace)
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] Return the repr suffix with min_val, max_val and, if enabled, inplace=True.
         """
         Return the extra representation of the module.
         """
@@ -302,6 +339,8 @@ class Hardtanh(Module):
 
 
 class ReLU6(Hardtanh):
+    # [CLASS DOC] Hardtanh specialization with fixed bounds 0 and 6, i.e. min(max(0, x), 6).
+    # Inherits state and forward from Hardtanh; only the inplace flag is configurable.
     r"""Applies the ReLU6 function element-wise.
 
     .. math::
@@ -324,9 +363,12 @@ class ReLU6(Hardtanh):
     """
 
     def __init__(self, inplace: bool = False) -> None:
+        # [FUNCTION DOC] Initialize the parent Hardtanh with bounds 0.0 and 6.0. Args: inplace (bool).
         super().__init__(0.0, 6.0, inplace)
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] Return "inplace=True" when inplace is set, else an empty string (the bounds are
+        # not shown, unlike the parent class).
         """
         Return the extra representation of the module.
         """
@@ -335,6 +377,7 @@ class ReLU6(Hardtanh):
 
 
 class Sigmoid(Module):
+    # [CLASS DOC] Module applying the logistic sigmoid, 1 / (1 + exp(-x)), element-wise. Stateless.
     r"""Applies the Sigmoid function element-wise.
 
     .. math::
@@ -355,6 +398,7 @@ class Sigmoid(Module):
     """
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Return the element-wise sigmoid of the input as a same-shaped tensor.
         """
         Runs the forward pass.
         """
@@ -362,6 +406,8 @@ class Sigmoid(Module):
 
 
 class Hardsigmoid(Module):
+    # [CLASS DOC] Module applying the piecewise-linear Hardsigmoid approximation of the sigmoid:
+    # 0 for x <= -3, 1 for x >= 3, x / 6 + 1/2 between. State: inplace flag.
     r"""Applies the Hardsigmoid function element-wise.
 
     Hardsigmoid is defined as:
@@ -394,10 +440,12 @@ class Hardsigmoid(Module):
     inplace: bool
 
     def __init__(self, inplace: bool = False) -> None:
+        # [FUNCTION DOC] Store the inplace flag. Args: inplace (bool, default False).
         super().__init__()
         self.inplace = inplace
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply Hardsigmoid to the input via the functional API; same-shaped output.
         """
         Runs the forward pass.
         """
@@ -405,6 +453,7 @@ class Hardsigmoid(Module):
 
 
 class Tanh(Module):
+    # [CLASS DOC] Module applying the hyperbolic tangent element-wise. Stateless.
     r"""Applies the Hyperbolic Tangent (Tanh) function element-wise.
 
     Tanh is defined as:
@@ -427,6 +476,7 @@ class Tanh(Module):
     """
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Return the element-wise tanh of the input as a same-shaped tensor.
         """
         Runs the forward pass.
         """
@@ -434,6 +484,7 @@ class Tanh(Module):
 
 
 class SiLU(Module):
+    # [CLASS DOC] Module applying SiLU (swish), x * sigmoid(x), element-wise. State: inplace flag.
     r"""Applies the Sigmoid Linear Unit (SiLU) function, element-wise.
 
     The SiLU function is also known as the swish function.
@@ -466,16 +517,19 @@ class SiLU(Module):
     inplace: bool
 
     def __init__(self, inplace: bool = False) -> None:
+        # [FUNCTION DOC] Store the inplace flag. Args: inplace (bool, default False).
         super().__init__()
         self.inplace = inplace
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply SiLU to the input via the functional API; same-shaped output.
         """
         Runs the forward pass.
         """
         return F.silu(input, inplace=self.inplace)
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] Return "inplace=True" when inplace is set, else an empty string.
         """
         Return the extra representation of the module.
         """
@@ -484,6 +538,7 @@ class SiLU(Module):
 
 
 class Mish(Module):
+    # [CLASS DOC] Module applying Mish, x * tanh(softplus(x)), element-wise. State: inplace flag.
     r"""Applies the Mish function, element-wise.
 
     Mish: A Self Regularized Non-Monotonic Neural Activation Function.
@@ -511,16 +566,19 @@ class Mish(Module):
     inplace: bool
 
     def __init__(self, inplace: bool = False) -> None:
+        # [FUNCTION DOC] Store the inplace flag. Args: inplace (bool, default False).
         super().__init__()
         self.inplace = inplace
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply Mish to the input via the functional API; same-shaped output.
         """
         Runs the forward pass.
         """
         return F.mish(input, inplace=self.inplace)
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] Return "inplace=True" when inplace is set, else an empty string.
         """
         Return the extra representation of the module.
         """
@@ -529,6 +587,8 @@ class Mish(Module):
 
 
 class Hardswish(Module):
+    # [CLASS DOC] Module applying Hardswish (from MobileNetV3): 0 for x <= -3, x for x >= 3, and
+    # x * (x + 3) / 6 between. State: inplace flag.
     r"""Applies the Hardswish function, element-wise.
 
     Method described in the paper: `Searching for MobileNetV3 <https://arxiv.org/abs/1905.02244>`_.
@@ -563,10 +623,12 @@ class Hardswish(Module):
     inplace: bool
 
     def __init__(self, inplace: bool = False) -> None:
+        # [FUNCTION DOC] Store the inplace flag. Args: inplace (bool, default False).
         super().__init__()
         self.inplace = inplace
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply Hardswish to the input via the functional API; same-shaped output.
         """
         Runs the forward pass.
         """
@@ -574,6 +636,8 @@ class Hardswish(Module):
 
 
 class ELU(Module):
+    # [CLASS DOC] Module applying the Exponential Linear Unit: x for positive inputs and
+    # alpha * (exp(x) - 1) otherwise. State: alpha, inplace.
     r"""Applies the Exponential Linear Unit (ELU) function, element-wise.
 
     Method described in the paper: `Fast and Accurate Deep Network Learning by Exponential Linear
@@ -609,17 +673,20 @@ class ELU(Module):
     inplace: bool
 
     def __init__(self, alpha: float = 1.0, inplace: bool = False) -> None:
+        # [FUNCTION DOC] Store alpha and the inplace flag. Args: alpha (float, default 1.0), inplace (bool).
         super().__init__()
         self.alpha = alpha
         self.inplace = inplace
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply ELU with the stored alpha via the functional API; same-shaped output.
         """
         Runs the forward pass.
         """
         return F.elu(input, self.alpha, self.inplace)
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] Return the repr suffix with alpha and, if enabled, inplace=True.
         """
         Return the extra representation of the module.
         """
@@ -628,6 +695,8 @@ class ELU(Module):
 
 
 class CELU(Module):
+    # [CLASS DOC] Module applying CELU: max(0, x) + min(0, alpha * (exp(x / alpha) - 1)), element-wise.
+    # State: alpha, inplace.
     r"""Applies the CELU function element-wise.
 
     .. math::
@@ -660,17 +729,20 @@ class CELU(Module):
     inplace: bool
 
     def __init__(self, alpha: float = 1.0, inplace: bool = False) -> None:
+        # [FUNCTION DOC] Store alpha and the inplace flag. Args: alpha (float, default 1.0), inplace (bool).
         super().__init__()
         self.alpha = alpha
         self.inplace = inplace
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply CELU with the stored alpha via the functional API; same-shaped output.
         """
         Runs the forward pass.
         """
         return F.celu(input, self.alpha, self.inplace)
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] Return the repr suffix with alpha and, if enabled, inplace=True.
         """
         Return the extra representation of the module.
         """
@@ -679,6 +751,8 @@ class CELU(Module):
 
 
 class SELU(Module):
+    # [CLASS DOC] Module applying the self-normalizing SELU activation: a fixed scale times an ELU
+    # with a fixed alpha. State: inplace flag only (alpha and scale are constants in the functional).
     r"""Applies the SELU function element-wise.
 
     .. math::
@@ -717,16 +791,19 @@ class SELU(Module):
     inplace: bool
 
     def __init__(self, inplace: bool = False) -> None:
+        # [FUNCTION DOC] Store the inplace flag. Args: inplace (bool, default False).
         super().__init__()
         self.inplace = inplace
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply SELU to the input via the functional API; same-shaped output.
         """
         Runs the forward pass.
         """
         return F.selu(input, self.inplace)
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] Return "inplace=True" when inplace is set, else an empty string.
         """
         Return the extra representation of the module.
         """
@@ -735,6 +812,8 @@ class SELU(Module):
 
 
 class GLU(Module):
+    # [CLASS DOC] Module applying the gated linear unit: the input is split in two halves along dim,
+    # and the first half is multiplied by the sigmoid of the second. State: dim.
     r"""Applies the gated linear unit function.
 
     :math:`{GLU}(a, b)= a \otimes \sigma(b)` where :math:`a` is the first half
@@ -759,16 +838,20 @@ class GLU(Module):
     dim: int
 
     def __init__(self, dim: int = -1) -> None:
+        # [FUNCTION DOC] Store the split dimension. Args: dim (int, default -1).
         super().__init__()
         self.dim = dim
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply GLU along dim; the output has half the size of the input along that
+        # dimension. The functional call raises an error if that size is odd.
         """
         Runs the forward pass.
         """
         return F.glu(input, self.dim)
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] Return the repr suffix showing dim.
         """
         Return the extra representation of the module.
         """
@@ -776,6 +859,8 @@ class GLU(Module):
 
 
 class GELU(Module):
+    # [CLASS DOC] Module applying the Gaussian Error Linear Unit, x * Phi(x), element-wise, either
+    # exact or with the tanh approximation. State: approximate (string, "none" or "tanh").
     r"""Applies the Gaussian Error Linear Units function.
 
     .. math:: \text{GELU}(x) = x * \Phi(x)
@@ -807,16 +892,20 @@ class GELU(Module):
     approximate: str
 
     def __init__(self, approximate: str = "none") -> None:
+        # [FUNCTION DOC] Store the approximation mode. Args: approximate (str, default "none").
+        # Validation of the value is deferred to the functional call.
         super().__init__()
         self.approximate = approximate
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply GELU using the stored approximation mode; same-shaped output.
         """
         Runs the forward pass.
         """
         return F.gelu(input, approximate=self.approximate)
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] Return the repr suffix showing the approximate mode as a quoted string.
         """
         Return the extra representation of the module.
         """
@@ -824,6 +913,8 @@ class GELU(Module):
 
 
 class Hardshrink(Module):
+    # [CLASS DOC] Module applying hard shrinkage: elements with magnitude above lambd are kept and
+    # all others are set to zero. State: lambd.
     r"""Applies the Hard Shrinkage (Hardshrink) function element-wise.
 
     Hardshrink is defined as:
@@ -856,16 +947,19 @@ class Hardshrink(Module):
     lambd: float
 
     def __init__(self, lambd: float = 0.5) -> None:
+        # [FUNCTION DOC] Store the shrinkage threshold. Args: lambd (float, default 0.5).
         super().__init__()
         self.lambd = lambd
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply hard shrinkage via the functional API; same-shaped output.
         """
         Run forward pass.
         """
         return F.hardshrink(input, self.lambd)
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] Return the repr suffix: just the lambd value, without a name.
         """
         Return the extra representation of the module.
         """
@@ -873,6 +967,8 @@ class Hardshrink(Module):
 
 
 class LeakyReLU(Module):
+    # [CLASS DOC] Module applying LeakyReLU: x for non-negative inputs and negative_slope * x
+    # otherwise. State: negative_slope, inplace.
     r"""Applies the LeakyReLU function element-wise.
 
     .. math::
@@ -912,17 +1008,21 @@ class LeakyReLU(Module):
     negative_slope: float
 
     def __init__(self, negative_slope: float = 1e-2, inplace: bool = False) -> None:
+        # [FUNCTION DOC] Store the slope and inplace flag.
+        # Args: negative_slope (float, default 0.01), inplace (bool, default False).
         super().__init__()
         self.negative_slope = negative_slope
         self.inplace = inplace
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply leaky ReLU via the functional API; same-shaped output.
         """
         Run forward pass.
         """
         return F.leaky_relu(input, self.negative_slope, self.inplace)
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] Return the repr suffix with negative_slope and, if enabled, inplace=True.
         """
         Return the extra representation of the module.
         """
@@ -931,6 +1031,7 @@ class LeakyReLU(Module):
 
 
 class LogSigmoid(Module):
+    # [CLASS DOC] Module applying log(sigmoid(x)) element-wise in a numerically stable way. Stateless.
     r"""Applies the Logsigmoid function element-wise.
 
     .. math::
@@ -950,6 +1051,7 @@ class LogSigmoid(Module):
     """
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Return the element-wise log-sigmoid of the input as a same-shaped tensor.
         """
         Run forward pass.
         """
@@ -957,6 +1059,9 @@ class LogSigmoid(Module):
 
 
 class Softplus(Module):
+    # [CLASS DOC] Module applying Softplus, (1 / beta) * log(1 + exp(beta * x)), a smooth ReLU.
+    # Reverts to the identity where beta * x exceeds threshold, for numerical stability.
+    # State: beta, threshold.
     r"""Applies the Softplus function element-wise.
 
     .. math::
@@ -990,17 +1095,20 @@ class Softplus(Module):
     threshold: float
 
     def __init__(self, beta: float = 1.0, threshold: float = 20.0) -> None:
+        # [FUNCTION DOC] Store beta and threshold. Args: beta (float, default 1.0), threshold (float, default 20.0).
         super().__init__()
         self.beta = beta
         self.threshold = threshold
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply softplus with the stored beta and threshold; same-shaped output.
         """
         Run forward pass.
         """
         return F.softplus(input, self.beta, self.threshold)
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] Return the repr suffix with beta and threshold.
         """
         Return the extra representation of the module.
         """
@@ -1008,6 +1116,8 @@ class Softplus(Module):
 
 
 class Softshrink(Module):
+    # [CLASS DOC] Module applying soft shrinkage: moves elements toward zero by lambd and sets those
+    # with magnitude at most lambd to zero. State: lambd (should be non-negative).
     r"""Applies the soft shrinkage function element-wise.
 
     .. math::
@@ -1038,16 +1148,19 @@ class Softshrink(Module):
     lambd: float
 
     def __init__(self, lambd: float = 0.5) -> None:
+        # [FUNCTION DOC] Store the shrinkage amount. Args: lambd (float, default 0.5). Not validated here.
         super().__init__()
         self.lambd = lambd
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply soft shrinkage via the functional API; same-shaped output.
         """
         Run forward pass.
         """
         return F.softshrink(input, self.lambd)
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] Return the repr suffix: just the lambd value as a string.
         """
         Return the extra representation of the module.
         """
@@ -1055,6 +1168,9 @@ class Softshrink(Module):
 
 
 def _check_arg_device(x: torch.Tensor | None) -> bool:
+# [FUNCTION DOC] HELPER: Report whether an optional tensor lives on a device type that the
+# MultiheadAttention fast path supports (cpu, cuda or the registered privateuse1 backend).
+# Returns True when the tensor is None.
     if x is not None:
         return x.device.type in [
             "cpu",
@@ -1065,12 +1181,16 @@ def _check_arg_device(x: torch.Tensor | None) -> bool:
 
 
 def _arg_requires_grad(x: torch.Tensor | None) -> bool:
+# [FUNCTION DOC] HELPER: Return the requires_grad flag of the tensor, or False when it is None.
     if x is not None:
         return x.requires_grad
     return False
 
 
 def _is_make_fx_tracing():
+# [FUNCTION DOC] HELPER: Report whether the code is being traced by make_fx or exported, i.e.
+# a proxy-tensor dispatch mode is on the current dispatch mode stack or the compiler is exporting.
+# Always False while TorchScript is scripting. Reads global dispatch-mode state, no mutation.
     if not torch.jit.is_scripting():
         torch_dispatch_mode_stack = (
             torch.utils._python_dispatch._get_current_dispatch_mode_stack()
@@ -1088,6 +1208,13 @@ def _is_make_fx_tracing():
 
 
 class MultiheadAttention(Module):
+    # [CLASS DOC] Multi-head scaled dot-product attention layer (Attention Is All You Need).
+    # State: embed_dim, kdim, vdim, num_heads, head_dim, dropout, batch_first, add_zero_attn,
+    # parameters in_proj_weight (when q/k/v dims equal embed_dim) or separate q/k/v_proj_weight,
+    # optional in_proj_bias, optional bias_k / bias_v, and an out_proj linear layer.
+    # Unused parameter slots are registered as None. forward either takes an optimized native
+    # inference fast path (self-attention, eval, no grad, batch_first, etc.) or delegates to the
+    # functional multi_head_attention_forward.
     r"""Allows the model to jointly attend to information from different representation subspaces.
 
     This MultiheadAttention layer implements the original architecture described
@@ -1174,6 +1301,12 @@ class MultiheadAttention(Module):
         device=None,
         dtype=None,
     ) -> None:
+        # [FUNCTION DOC] Build the attention layer and initialize all parameters.
+        # Args: embed_dim, num_heads, dropout, bias, add_bias_kv, add_zero_attn, kdim, vdim, batch_first,
+        # device, dtype. kdim / vdim default to embed_dim. Raises ValueError if embed_dim or num_heads
+        # is not positive and AssertionError if embed_dim is not divisible by num_heads.
+        # Creates the input projection(s), output projection and optional bias_k / bias_v, then calls
+        # the private parameter reset.
         if embed_dim <= 0 or num_heads <= 0:
             raise ValueError(
                 f"embed_dim and num_heads must be greater than 0,"
@@ -1231,6 +1364,9 @@ class MultiheadAttention(Module):
         self._reset_parameters()
 
     def _reset_parameters(self) -> None:
+        # [FUNCTION DOC] HELPER: Initialize parameters: xavier-uniform for the input projection weight(s),
+        # zero for the input and output projection biases when present, xavier-normal for bias_k and
+        # bias_v when present. Mutates parameters in place.
         if self._qkv_same_embed_dim:
             xavier_uniform_(self.in_proj_weight)
         else:
@@ -1247,6 +1383,9 @@ class MultiheadAttention(Module):
             xavier_normal_(self.bias_v)
 
     def __setstate__(self, state):
+        # [FUNCTION DOC] Support unpickling: old checkpoints (from v1.1.0) lack the flag saying q/k/v
+        # share one embedding dimension, so it is defaulted to True before delegating to the parent.
+        # Mutates the passed state mapping.
         # Support loading old MultiheadAttention checkpoints generated by v1.1.0
         if "_qkv_same_embed_dim" not in state:
             state["_qkv_same_embed_dim"] = True
@@ -1264,6 +1403,22 @@ class MultiheadAttention(Module):
         average_attn_weights: bool = True,
         is_causal: bool = False,
     ) -> tuple[Tensor, Tensor | None]:
+        # [FUNCTION DOC] Compute attention outputs for query, key, value tensors.
+        # Args: query, key, value, optional key_padding_mask, need_weights (default True), optional
+        # attn_mask, average_attn_weights (default True), is_causal (hint only).
+        # Returns a pair: attention output and attention weights (None if need_weights is False,
+        # except on the native fast path which follows need_weights).
+        # Flow: canonicalize masks to the query dtype, work out the first reason (if any) the fast path
+        # cannot be used (non-batched, non-self attention, training, grad needed, nested/mask conflicts,
+        # tracing, autocast, odd num_heads, ...); if none, merge masks and call the native fused kernel.
+        # Otherwise transposes batch-first input, calls the functional multi_head_attention_forward
+        # (with separate projection weights when q/k/v dims differ) and transposes the output back.
+        # Raises AssertionError if nested tensors are used outside the fast path.
+        # KNOWN ISSUE: the fast path is also disabled when num_heads is odd, which the class
+        # docstring does not list among the conditions.
+        # KNOWN ISSUE: the fast path only returns when both in_proj_bias and in_proj_weight are set;
+        # with bias=False the work falls through to the slow path (which rejects nested inputs).
+        # KNOWN ISSUE: is_causal is forwarded to the functional call but not used by the fast path.
         r"""Compute attention outputs using query, key, and value embeddings.
 
             Supports optional parameters for padding, masks and attention weights.
@@ -1528,6 +1683,13 @@ class MultiheadAttention(Module):
         key_padding_mask: Tensor | None,
         query: Tensor,
     ) -> tuple[Tensor | None, int | None]:
+        # [FUNCTION DOC] Combine attention and key-padding masks for the native fast path.
+        # Args: attn_mask (2D or 3D or None), key_padding_mask (or None), query (batch, seq, embed).
+        # Returns (merged_mask, mask_type): (None, None) if no masks; key padding mask with type 1 if
+        # only that is given; otherwise the attention mask is viewed/expanded to 4D (batch, heads, seq,
+        # seq), the padding mask (if any) is expanded and added, and type 2 is returned.
+        # KNOWN ISSUE: the docstring says masks are combined with logical or and labels attn_mask as
+        # type 0, but the code adds them and returns type 2 whenever attn_mask is given.
         r"""Determine mask type and combine masks if necessary.
 
         If only one mask is provided, that mask
@@ -1574,6 +1736,9 @@ class MultiheadAttention(Module):
 
 
 class PReLU(Module):
+    # [CLASS DOC] Module applying PReLU: max(0, x) + a * min(0, x) with a learnable slope a.
+    # State: num_parameters, init, and the learnable weight parameter of that length (one shared
+    # slope, or one slope per channel where channel is the second input dimension).
     r"""Applies the element-wise PReLU function.
 
     .. math::
@@ -1629,6 +1794,9 @@ class PReLU(Module):
     def __init__(
         self, num_parameters: int = 1, init: float = 0.25, device=None, dtype=None
     ) -> None:
+        # [FUNCTION DOC] Create the learnable slope parameter and fill it with the initial value.
+        # Args: num_parameters (int, default 1), init (float, default 0.25), device, dtype.
+        # Note num_parameters is assigned before the parent constructor runs.
         factory_kwargs = {"device": device, "dtype": dtype}
         self.num_parameters = num_parameters
         super().__init__()
@@ -1637,18 +1805,21 @@ class PReLU(Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
+        # [FUNCTION DOC] Reset the weight parameter in place to the constant init value.
         """
         Resets parameters based on their initialization used in ``__init__``.
         """
         torch.nn.init.constant_(self.weight, self.init)
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply PReLU with the learnable weight via the functional API; same-shaped output.
         """
         Runs the forward pass.
         """
         return F.prelu(input, self.weight)
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] Return the repr suffix showing num_parameters.
         """
         Return the extra representation of the module.
         """
@@ -1656,6 +1827,7 @@ class PReLU(Module):
 
 
 class Softsign(Module):
+    # [CLASS DOC] Module applying Softsign, x / (1 + |x|), element-wise. Stateless.
     r"""Applies the element-wise Softsign function.
 
     .. math::
@@ -1675,6 +1847,7 @@ class Softsign(Module):
     """
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Return the element-wise softsign of the input as a same-shaped tensor.
         """
         Runs the forward pass.
         """
@@ -1682,6 +1855,7 @@ class Softsign(Module):
 
 
 class Tanhshrink(Module):
+    # [CLASS DOC] Module applying Tanhshrink, x - tanh(x), element-wise. Stateless.
     r"""Applies the element-wise Tanhshrink function.
 
     .. math::
@@ -1701,6 +1875,7 @@ class Tanhshrink(Module):
     """
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Return the element-wise tanhshrink of the input as a same-shaped tensor.
         """
         Runs the forward pass.
         """
@@ -1708,6 +1883,8 @@ class Tanhshrink(Module):
 
 
 class Softmin(Module):
+    # [CLASS DOC] Module applying softmin (softmax of the negated input) along one dimension so the
+    # slice sums to 1. State: dim (None means implicit dimension choice with a deprecation warning).
     r"""Applies the Softmin function to an n-dimensional input Tensor.
 
     Rescales them so that the elements of the n-dimensional output Tensor
@@ -1742,21 +1919,27 @@ class Softmin(Module):
     dim: int | None
 
     def __init__(self, dim: int | None = None) -> None:
+        # [FUNCTION DOC] Store the dimension. Args: dim (int or None, default None).
+        # KNOWN ISSUE: unlike Softmax and LogSoftmax, the type of dim is not validated here.
         super().__init__()
         self.dim = dim
 
     def __setstate__(self, state):
+        # [FUNCTION DOC] Support unpickling: after parent restore, set dim to None if the attribute is
+        # missing (old checkpoints). Mutates the module.
         super().__setstate__(state)
         if not hasattr(self, "dim"):
             self.dim = None
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply softmin along dim via the functional API; same-shaped output.
         """
         Runs the forward pass.
         """
         return F.softmin(input, self.dim, _stacklevel=5)
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] Return the repr suffix showing dim.
         """
         Return the extra representation of the module.
         """
@@ -1764,6 +1947,8 @@ class Softmin(Module):
 
 
 class Softmax(Module):
+    # [CLASS DOC] Module applying softmax along one dimension, producing values in [0, 1] that sum to
+    # 1 along that dimension. State: dim (None means implicit dimension choice with a warning).
     r"""Applies the Softmax function to an n-dimensional input Tensor.
 
     Rescales them so that the elements of the n-dimensional output Tensor
@@ -1807,23 +1992,28 @@ class Softmax(Module):
     dim: int | None
 
     def __init__(self, dim: int | None = None) -> None:
+        # [FUNCTION DOC] Store the dimension. Args: dim (int or None, default None).
+        # Raises TypeError if dim is neither None nor a plain int (bool is rejected).
         if dim is not None and (not isinstance(dim, int) or isinstance(dim, bool)):
             raise TypeError(f"dim must be an int or None, got {type(dim)}")
         super().__init__()
         self.dim = dim
 
     def __setstate__(self, state):
+        # [FUNCTION DOC] Support unpickling: after parent restore, set dim to None if missing.
         super().__setstate__(state)
         if not hasattr(self, "dim"):
             self.dim = None
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply softmax along dim via the functional API; same-shaped output.
         """
         Runs the forward pass.
         """
         return F.softmax(input, self.dim, _stacklevel=5)
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] Return the repr suffix showing dim.
         """
         Return the extra representation of the module.
         """
@@ -1831,6 +2021,8 @@ class Softmax(Module):
 
 
 class Softmax2d(Module):
+    # [CLASS DOC] Module applying softmax over the channel dimension at each spatial location of a
+    # 3D (C, H, W) or 4D (N, C, H, W) input. Stateless.
     r"""Applies SoftMax over features to each spatial location.
 
     When given an image of ``Channels x Height x Width``, it will
@@ -1853,6 +2045,8 @@ class Softmax2d(Module):
     """
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply softmax over dimension -3 of the input.
+        # Raises ValueError if the input is not 3D or 4D.
         """
         Runs the forward pass.
         """
@@ -1864,6 +2058,8 @@ class Softmax2d(Module):
 
 
 class LogSoftmax(Module):
+    # [CLASS DOC] Module applying log(softmax(x)) along one dimension in a numerically stable way.
+    # State: dim (None means implicit dimension choice with a warning).
     r"""Applies the :math:`\log(\text{Softmax}(x))` function to an n-dimensional input Tensor.
 
     The LogSoftmax formulation can be simplified as:
@@ -1894,23 +2090,28 @@ class LogSoftmax(Module):
     dim: int | None
 
     def __init__(self, dim: int | None = None) -> None:
+        # [FUNCTION DOC] Store the dimension. Args: dim (int or None, default None).
+        # Raises TypeError if dim is neither None nor a plain int (bool is rejected).
         if dim is not None and (not isinstance(dim, int) or isinstance(dim, bool)):
             raise TypeError(f"dim must be an int or None, got {type(dim)}")
         super().__init__()
         self.dim = dim
 
     def __setstate__(self, state):
+        # [FUNCTION DOC] Support unpickling: after parent restore, set dim to None if missing.
         super().__setstate__(state)
         if not hasattr(self, "dim"):
             self.dim = None
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply log-softmax along dim via the functional API; same-shaped output.
         """
         Runs the forward pass.
         """
         return F.log_softmax(input, self.dim, _stacklevel=5)
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] Return the repr suffix showing dim.
         """
         Return the extra representation of the module.
         """

@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Defines AdaptiveLogSoftmaxWithLoss, an approximate softmax for large output spaces
+# that splits classes into a frequent "head" shortlist plus lower-dimensional tail clusters.
+# Also defines the private namedtuple _ASMoutput (output, loss) used as its return type.
+# No import-time side effects beyond class and namedtuple creation.
 
 import itertools
 from collections import namedtuple
@@ -19,6 +23,12 @@ _ASMoutput = namedtuple("_ASMoutput", ["output", "loss"])
 
 
 class AdaptiveLogSoftmaxWithLoss(Module):
+    # [CLASS DOC] Adaptive softmax layer (Grave et al.) returning per-example target log-probabilities
+    # and the mean negative log-likelihood loss. Classes must be sorted by decreasing frequency.
+    # State: in_features, n_classes, cutoffs (user cutoffs with n_classes appended), div_value,
+    # head_bias, shortlist_size, n_clusters, head_size, a head Linear layer (shortlist plus one logit
+    # per cluster) and a tail ModuleList of two-layer Sequential projections, one per cluster, whose
+    # hidden size shrinks by div_value per cluster index. Key methods: forward, log_prob, predict.
     (
         """Efficient softmax approximation.
 
@@ -127,6 +137,12 @@ class AdaptiveLogSoftmaxWithLoss(Module):
         device=None,
         dtype=None,
     ) -> None:
+        # [FUNCTION DOC] Validate cutoffs and build the head layer and the tail cluster projections.
+        # Args: in_features, n_classes, cutoffs (sequence of unique, increasing, positive integers all at
+        # most n_classes - 1), div_value (default 4.0), head_bias (default False), device, dtype.
+        # Raises ValueError if cutoffs is empty or violates those constraints.
+        # Cluster i (starting at 1) uses hidden size equal to in_features divided by div_value to the
+        # power i, truncated to an integer.
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
 
@@ -175,6 +191,8 @@ class AdaptiveLogSoftmaxWithLoss(Module):
             self.tail.append(projection)
 
     def reset_parameters(self) -> None:
+        # [FUNCTION DOC] Re-initialize the head layer and every tail projection layer by calling their own
+        # parameter reset methods; mutates parameters in place.
         """
         Resets parameters based on their initialization used in ``__init__``.
         """
@@ -184,6 +202,15 @@ class AdaptiveLogSoftmaxWithLoss(Module):
             h2o.reset_parameters()  # type: ignore[has-type]
 
     def forward(self, input_: Tensor, target_: Tensor) -> _ASMoutput:
+        # [FUNCTION DOC] Compute target log-probabilities and the loss for a batch (or a single example).
+        # Args: input_ (2D batch of features, or 1D for a single example), target_ (1D class indices, or
+        # 0D for a single example). Returns an _ASMoutput of per-example log-probabilities of the targets
+        # and the scalar mean negative log-likelihood.
+        # Raises RuntimeError on batch-size or dimensionality mismatch, multi-target input, or targets
+        # outside the valid class range. Per cluster, rows whose targets fall in that range get a
+        # cluster-local log-softmax lookup; the head log-softmax then adds the shortlist or cluster term.
+        # KNOWN ISSUE: the class docstring says targets may equal n_classes, but the code rejects any
+        # target not in [0, n_classes - 1].
         """
         Runs the forward pass.
         """
@@ -266,6 +293,10 @@ class AdaptiveLogSoftmaxWithLoss(Module):
         return _ASMoutput(output, loss)
 
     def _get_full_log_prob(self, input, head_output):
+        # [FUNCTION DOC] HELPER: Build the full log-probability matrix over all classes from the input and
+        # the precomputed head output. Shortlist columns come from the head log-softmax; each cluster's
+        # columns are its own log-softmax plus the head log-probability of that cluster. Returns a tensor
+        # of shape (batch, n_classes).
         """Given input tensor, and output of ``self.head``, compute the log of the full distribution."""
         out = input.new_empty((head_output.size(0), self.n_classes))
         head_logprob = F.log_softmax(head_output, dim=1)
@@ -284,6 +315,8 @@ class AdaptiveLogSoftmaxWithLoss(Module):
         return out
 
     def log_prob(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Return log-probabilities for all n_classes classes for each example of a 2D input
+        # batch. Runs the head layer and delegates to the private full-distribution helper.
         r"""Compute log probabilities for all :math:`\texttt{n\_classes}`.
 
         Args:
@@ -303,6 +336,10 @@ class AdaptiveLogSoftmaxWithLoss(Module):
         return self._get_full_log_prob(input, head_output)
 
     def predict(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Return the most probable class index per example of a 2D input batch.
+        # Takes the head argmax; if every example lands in the shortlist that is the answer, otherwise
+        # the full log-probabilities are computed (for all rows or only the rows landing in a cluster)
+        # and their argmax is used. Returns a 1D tensor of class indices.
         r"""Return the class with the highest probability for each example in the input minibatch.
 
         This is equivalent to ``self.log_prob(input).argmax(dim=1)``, but is more efficient in some cases.

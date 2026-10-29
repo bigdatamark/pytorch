@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Batch normalization layers: BatchNorm1d/2d/3d, their lazy variants that infer
+# num_features from the first input, and SyncBatchNorm which synchronizes statistics across
+# distributed processes. Private bases _NormBase (shared parameters/buffers, state-dict version
+# handling), _BatchNorm (forward via the functional batch_norm) and _LazyNormBase (deferred
+# parameter creation) hold the shared logic. Exports the names in __all__. No import-time side effects.
 from typing import Any
 
 import torch
@@ -23,6 +28,12 @@ __all__ = [
 
 
 class _NormBase(Module):
+    # [CLASS DOC] HELPER: Shared base of batch and instance norm layers.
+    # State: num_features, eps, momentum (None means cumulative average), affine, track_running_stats.
+    # Parameters weight and bias exist only when affine (bias may be disabled separately); buffers
+    # running_mean, running_var and num_batches_tracked exist only when track_running_stats, otherwise
+    # they are registered as None. Class version is 2 (version 2 added num_batches_tracked).
+    # Subclasses must implement the input dimension check.
     """Common base of _InstanceNorm and _BatchNorm."""
 
     _version = 2
@@ -47,6 +58,10 @@ class _NormBase(Module):
         *,
         bias: bool = True,
     ) -> None:
+        # [FUNCTION DOC] Create the affine parameters and running-statistics buffers, then reset them.
+        # Args: num_features, eps, momentum, affine, track_running_stats, device, dtype, bias
+        # (keyword-only; whether the affine shift exists). num_batches_tracked is a long scalar that
+        # ignores the requested dtype. Side effect: parameters initialized to weight 1, bias 0, mean 0, var 1.
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.num_features = num_features
@@ -89,6 +104,8 @@ class _NormBase(Module):
         self.reset_parameters()
 
     def reset_running_stats(self) -> None:
+        # [FUNCTION DOC] Reset running mean to zeros, running variance to ones and the batch counter to
+        # zero in place; does nothing when running statistics are not tracked.
         if self.track_running_stats:
             # running_mean/running_var/num_batches... are registered at runtime depending
             # if self.track_running_stats is on
@@ -97,6 +114,8 @@ class _NormBase(Module):
             self.num_batches_tracked.zero_()  # type: ignore[union-attr,operator]
 
     def reset_parameters(self) -> None:
+        # [FUNCTION DOC] Reset running statistics, then (if affine) set weight to ones and bias to zeros
+        # in place when it exists.
         self.reset_running_stats()
         if self.affine:
             init.ones_(self.weight)
@@ -104,9 +123,13 @@ class _NormBase(Module):
                 init.zeros_(self.bias)
 
     def _check_input_dim(self, input):
+        # [FUNCTION DOC] HELPER: Abstract input validation hook; the base version always raises
+        # NotImplementedError and is overridden by subclasses to check input dimensionality.
         raise NotImplementedError
 
     def extra_repr(self):
+        # [FUNCTION DOC] Return the repr suffix listing num_features, eps, momentum, affine, whether bias
+        # exists, and track_running_stats.
         return (
             "{num_features}, eps={eps}, momentum={momentum}, affine={affine}, "
             "bias={use_bias}, track_running_stats={track_running_stats}".format(
@@ -124,6 +147,10 @@ class _NormBase(Module):
         unexpected_keys,
         error_msgs,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Load hook for state dicts. For checkpoints saved before module version 2
+        # that track running stats, inserts a missing num_batches_tracked entry (the current buffer, or a
+        # zero long scalar when the buffer is absent or on the meta device) into the state dict (mutated in
+        # place), then defers to the parent loader which fills missing/unexpected keys and error messages.
         version = local_metadata.get("version", None)
 
         if (version is None or version < 2) and self.track_running_stats:
@@ -150,6 +177,8 @@ class _NormBase(Module):
 
 
 class _BatchNorm(_NormBase):
+    # [CLASS DOC] HELPER: Base for the concrete batch norm layers. Adds the forward pass on top of
+    # _NormBase; subclasses supply the input dimension check. No extra state.
     def __init__(
         self,
         num_features: int,
@@ -162,6 +191,7 @@ class _BatchNorm(_NormBase):
         *,
         bias: bool = True,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Forward construction arguments to the _NormBase constructor unchanged.
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__(
             num_features,
@@ -174,6 +204,13 @@ class _BatchNorm(_NormBase):
         )
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Normalize the input per channel using batch statistics or running statistics.
+        # Validates input dimensionality (subclass hook), then chooses the averaging factor: momentum, or
+        # 1 / batches-seen for cumulative averaging when momentum is None (incrementing
+        # num_batches_tracked in training mode). Batch statistics are used in training mode, or in eval
+        # mode when running stats are absent. Running buffers are passed (and thus updated in training)
+        # only when tracked. Returns a tensor of the input's shape. Raises ValueError from the check hook.
+        # Side effects: increments num_batches_tracked and updates running buffers in training mode.
         self._check_input_dim(input)
 
         # exponential_average_factor is set to self.momentum
@@ -225,6 +262,10 @@ class _BatchNorm(_NormBase):
 
 
 class _LazyNormBase(LazyModuleMixin, _NormBase):
+    # [CLASS DOC] HELPER: Mixin base providing lazy batch norm: num_features is unknown at
+    # construction. weight, bias and running buffers start uninitialized and are materialized on the
+    # first forward from the input's channel dimension, after which the layer turns into its
+    # non-lazy class (via cls_to_become).
     weight: UninitializedParameter  # type: ignore[assignment]
     bias: UninitializedParameter  # type: ignore[assignment]
 
@@ -239,6 +280,10 @@ class _LazyNormBase(LazyModuleMixin, _NormBase):
         *,
         bias=True,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Construct with num_features 0 and no real tensors, then record the
+        # requested affine / track_running_stats settings and create uninitialized weight, bias and
+        # running statistics placeholders (plus a zero batch counter). Args: eps, momentum, affine,
+        # track_running_stats, device, dtype, bias (keyword-only).
         factory_kwargs = {"device": device, "dtype": dtype}
         # pyrefly: ignore [bad-argument-type]
         super().__init__(
@@ -273,11 +318,17 @@ class _LazyNormBase(LazyModuleMixin, _NormBase):
             )
 
     def reset_parameters(self) -> None:
+        # [FUNCTION DOC] Reset parameters only once everything has been materialized and num_features is
+        # nonzero; otherwise does nothing.
         # pyrefly: ignore [bad-argument-type]
         if not self.has_uninitialized_params() and self.num_features != 0:
             super().reset_parameters()
 
     def initialize_parameters(self, input) -> None:  # type: ignore[override]
+        # [FUNCTION DOC] HELPER: Materialize lazy tensors from the first input. Sets num_features to the
+        # size of dimension 1 of the input, materializes weight, bias and running buffers to that length
+        # and resets parameters. Does nothing if nothing is uninitialized. Raises AssertionError if
+        # weight or bias are not uninitialized parameters.
         # pyrefly: ignore [bad-argument-type]
         if self.has_uninitialized_params():
             self.num_features = input.shape[1]
@@ -304,6 +355,9 @@ class _LazyNormBase(LazyModuleMixin, _NormBase):
 
 
 class BatchNorm1d(_BatchNorm):
+    # [CLASS DOC] Batch normalization over 2D (N, C) or 3D (N, C, L) input, normalizing each channel
+    # over the batch (and length) dimensions. Inherits all state and behavior from _BatchNorm; only the
+    # accepted input dimensionality is defined here.
     r"""Applies Batch Normalization over a 2D or 3D input.
 
     Method described in the paper
@@ -377,11 +431,14 @@ class BatchNorm1d(_BatchNorm):
     """
 
     def _check_input_dim(self, input) -> None:
+        # [FUNCTION DOC] HELPER: Raise ValueError unless the input is 2D or 3D.
         if input.dim() != 2 and input.dim() != 3:
             raise ValueError(f"expected 2D or 3D input (got {input.dim()}D input)")
 
 
 class LazyBatchNorm1d(_LazyNormBase, _BatchNorm):
+    # [CLASS DOC] BatchNorm1d whose num_features is inferred from the first input (dimension 1).
+    # After materialization its class becomes BatchNorm1d (cls_to_become).
     r"""A :class:`torch.nn.BatchNorm1d` module with lazy initialization.
 
     Lazy initialization based on the ``num_features`` argument of the :class:`BatchNorm1d` that is inferred
@@ -413,11 +470,14 @@ class LazyBatchNorm1d(_LazyNormBase, _BatchNorm):
     cls_to_become = BatchNorm1d  # type: ignore[assignment]
 
     def _check_input_dim(self, input) -> None:
+        # [FUNCTION DOC] HELPER: Raise ValueError unless the input is 2D or 3D.
         if input.dim() != 2 and input.dim() != 3:
             raise ValueError(f"expected 2D or 3D input (got {input.dim()}D input)")
 
 
 class BatchNorm2d(_BatchNorm):
+    # [CLASS DOC] Batch normalization over 4D (N, C, H, W) input. Inherits all state and behavior from
+    # _BatchNorm; only the accepted input dimensionality is defined here.
     r"""Applies Batch Normalization over a 4D input.
 
     4D is a mini-batch of 2D inputs
@@ -492,11 +552,14 @@ class BatchNorm2d(_BatchNorm):
     """
 
     def _check_input_dim(self, input) -> None:
+        # [FUNCTION DOC] HELPER: Raise ValueError unless the input is 4D.
         if input.dim() != 4:
             raise ValueError(f"expected 4D input (got {input.dim()}D input)")
 
 
 class LazyBatchNorm2d(_LazyNormBase, _BatchNorm):
+    # [CLASS DOC] BatchNorm2d whose num_features is inferred from the first input (dimension 1).
+    # After materialization its class becomes BatchNorm2d (cls_to_become).
     r"""A :class:`torch.nn.BatchNorm2d` module with lazy initialization.
 
     Lazy initialization is done for the ``num_features`` argument of the :class:`BatchNorm2d` that is inferred
@@ -528,11 +591,14 @@ class LazyBatchNorm2d(_LazyNormBase, _BatchNorm):
     cls_to_become = BatchNorm2d  # type: ignore[assignment]
 
     def _check_input_dim(self, input) -> None:
+        # [FUNCTION DOC] HELPER: Raise ValueError unless the input is 4D.
         if input.dim() != 4:
             raise ValueError(f"expected 4D input (got {input.dim()}D input)")
 
 
 class BatchNorm3d(_BatchNorm):
+    # [CLASS DOC] Batch normalization over 5D (N, C, D, H, W) input. Inherits all state and behavior
+    # from _BatchNorm; only the accepted input dimensionality is defined here.
     r"""Applies Batch Normalization over a 5D input.
 
     5D is a mini-batch of 3D inputs with additional channel dimension as described in the paper
@@ -607,11 +673,14 @@ class BatchNorm3d(_BatchNorm):
     """
 
     def _check_input_dim(self, input) -> None:
+        # [FUNCTION DOC] HELPER: Raise ValueError unless the input is 5D.
         if input.dim() != 5:
             raise ValueError(f"expected 5D input (got {input.dim()}D input)")
 
 
 class LazyBatchNorm3d(_LazyNormBase, _BatchNorm):
+    # [CLASS DOC] BatchNorm3d whose num_features is inferred from the first input (dimension 1).
+    # After materialization its class becomes BatchNorm3d (cls_to_become).
     r"""A :class:`torch.nn.BatchNorm3d` module with lazy initialization.
 
     Lazy initialization is done for the ``num_features`` argument of the :class:`BatchNorm3d` that is inferred
@@ -643,11 +712,17 @@ class LazyBatchNorm3d(_LazyNormBase, _BatchNorm):
     cls_to_become = BatchNorm3d  # type: ignore[assignment]
 
     def _check_input_dim(self, input) -> None:
+        # [FUNCTION DOC] HELPER: Raise ValueError unless the input is 5D.
         if input.dim() != 5:
             raise ValueError(f"expected 5D input (got {input.dim()}D input)")
 
 
 class SyncBatchNorm(_BatchNorm):
+    # [CLASS DOC] Batch normalization whose statistics are synchronized across all processes of a
+    # distributed process group during training, for N-D inputs with at least 2 dimensions.
+    # State: as _BatchNorm plus process_group (None means the world group). Falls back to ordinary
+    # batch norm in eval mode, without an initialized distributed setup, or with a world size of 1.
+    # Use convert_sync_batchnorm to convert an existing model.
     r"""Applies Batch Normalization over a N-Dimensional input.
 
     The N-D input is a mini-batch of [N-2]D inputs with additional channel dimension as described in the paper
@@ -765,6 +840,9 @@ class SyncBatchNorm(_BatchNorm):
         *,
         bias: bool = True,
     ) -> None:
+        # [FUNCTION DOC] Build like _BatchNorm and store the process group.
+        # Args: num_features, eps, momentum, affine, track_running_stats, process_group (optional),
+        # device, dtype, bias (keyword-only).
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__(
             num_features,
@@ -778,16 +856,27 @@ class SyncBatchNorm(_BatchNorm):
         self.process_group = process_group
 
     def _check_input_dim(self, input) -> None:
+        # [FUNCTION DOC] HELPER: Raise ValueError unless the input has at least 2 dimensions.
         if input.dim() < 2:
             raise ValueError(f"expected at least 2D input (got {input.dim()}D input)")
 
     def _check_non_zero_input_channels(self, input) -> None:
+        # [FUNCTION DOC] HELPER: Raise ValueError if the channel dimension (size of dimension 1) is zero.
         if input.size(1) == 0:
             raise ValueError(
                 "SyncBatchNorm number of input channels should be non-zero"
             )
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Normalize the input, synchronizing statistics across processes when needed.
+        # Validates the input, computes the averaging factor like the regular batch norm (incrementing
+        # num_batches_tracked in training; raises AssertionError if that buffer is None), and picks
+        # batch statistics in training or when no running stats exist. Synchronization happens only in
+        # training with torch.distributed initialized and a group world size above 1; then the input must
+        # be on cuda, hpu, xpu or the privateuse1 device (else ValueError) and a custom autograd function
+        # exchanges statistics. Otherwise the functional batch_norm is used. Returns same-shaped tensor.
+        # KNOWN ISSUE: the device error message mentions GPU, XPU and privateuse1 but not hpu, which is
+        # also accepted.
         """
         Runs the forward pass.
         """
@@ -888,6 +977,12 @@ class SyncBatchNorm(_BatchNorm):
 
     @classmethod
     def convert_sync_batchnorm(cls, module, process_group=None):
+        # [FUNCTION DOC] Recursively replace every batch norm layer (instances of the private base class)
+        # in a module tree with SyncBatchNorm.
+        # Args: module, process_group (optional). Returns the converted module; if the root itself is a
+        # batch norm layer a new SyncBatchNorm is returned. Converted layers share the original weight,
+        # bias, running statistics and counter tensors, copy the training flag and any qconfig attribute.
+        # Children are converted recursively and re-attached by name; the input reference is deleted locally.
         r"""Converts all :attr:`BatchNorm*D` layers in the model to :class:`torch.nn.SyncBatchNorm` layers.
 
         Args:
