@@ -1,3 +1,16 @@
+# [PACKAGE DOC]
+# torch.fft package: discrete Fourier transform API. Each public name is the
+# corresponding builtin from the C extension fft namespace, with a docstring
+# attached at import time (the docstr helper mutates the builtin and returns it).
+# Contents: 1D/2D/ND complex transforms and inverses, real-input (r*) and
+# Hermitian (h*, ih*) variants, sample-frequency helpers (fftfreq, rfftfreq) and
+# shift helpers (fftshift, ifftshift). Also re-exports Tensor.
+# Import-time side effects: attaches docstrings (formatted with shared argument
+# text from the torch docs module) to the C builtins; no other state.
+# KNOWN ISSUE: hfft2, ihfft2, hfftn and ihfftn are defined here but missing from
+# the export list, so star-imports omit them.
+# KNOWN ISSUE: several docstring examples are wrong (the ihfft2 and ihfftn
+# examples use undefined variables, and the hfft2 example is missing a blank line).
 import torch
 from torch._C import _add_docstr, _fft  # type: ignore[attr-defined]
 from torch._torch_docs import common_args, factory_common_args

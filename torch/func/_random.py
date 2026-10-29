@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Experimental stateless PRNG API. A key is a tensor encoding generator state;
+# functions derive new keys (key, split, fold_in) and fill or create tensors of
+# random values (normal_, normal, uniform_, uniform) deterministically from a
+# key, with no global generator state. Only the "philox4x32-10" algorithm exists.
+# Random work is delegated to private ATen philox ops. No import-time side effects.
 """Stateless PRNG APIs.
 
 These are experimental and subject to change without notice.
@@ -12,6 +18,10 @@ import torch
 def key(
     seed: int, *, device: torch.device | None = None, impl: str = "philox4x32-10"
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Builds a PRNG key from an integer seed: a two-element uint64 tensor holding
+    # the seed and a zero offset, created on the given device (default cpu).
+    # Raises NotImplementedError if impl is anything but "philox4x32-10".
     r"""Create a PRNG key from a seed.
 
     A key is a tensor that encodes the state needed to deterministically
@@ -47,6 +57,10 @@ def key(
 
 
 def split(key: torch.Tensor, num: int = 2) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Derives num new keys from key (default 2) via the ATen philox split op.
+    # Returns a tensor with a new leading dimension of size num followed by the
+    # input key shape; batched keys are split independently. Does not mutate key.
     r"""Split a PRNG key into ``num`` new independent keys.
 
     Each returned key produces a different, deterministic random sequence.
@@ -73,6 +87,12 @@ def split(key: torch.Tensor, num: int = 2) -> torch.Tensor:
 
 
 def fold_in(key: torch.Tensor, data: int | torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Derives one new key from key by mixing in data. A tensor data is passed to
+    # the tensor overload of the ATen op unchanged (no validation here). An
+    # integer is converted, range-checked and, if at or above 2**63, reinterpreted
+    # as a signed 64-bit value because the op schema takes signed ints.
+    # Raises ValueError if the integer is outside [-2**63, 2**64 - 1].
     r"""Deterministically derive a new key by folding in an integer value.
 
     ``data`` may be a Python ``int`` or a single-item ``uint64`` tensor on the
@@ -131,6 +151,10 @@ def normal_(
     mean: float = 0.0,
     std: float = 1.0,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Fills result in place with normal samples (given mean and std) determined
+    # by key, via the ATen philox normal op. Mutates and returns result.
+    # Batched keys must have leading dims broadcastable with result's.
     r"""Fill ``result`` in-place with normal random values from a PRNG key.
 
     The values are drawn from a normal distribution with the specified ``mean``
@@ -167,6 +191,11 @@ def normal(
     std: float = 1.0,
     dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Allocates an uninitialized tensor on key's device (dtype default float32)
+    # and fills it with normal samples via the in-place variant. The shape may be
+    # given as separate sizes or as one sequence, which is unpacked to a tuple.
+    # Returns the new tensor; key is not mutated.
     r"""Generate normally distributed random values from a PRNG key.
 
     Produces a tensor of the given shape filled with values drawn from a normal
@@ -211,6 +240,10 @@ def uniform_(
     low: float = 0.0,
     high: float = 1.0,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Fills result in place with samples uniform on [low, high) determined by
+    # key, via the ATen philox uniform op. Mutates and returns result.
+    # Batched keys must have leading dims broadcastable with result's.
     r"""Fill ``result`` in-place with uniform random values from a PRNG key.
 
     The values are drawn uniformly from the interval ``[low, high)``. The output
@@ -247,6 +280,10 @@ def uniform(
     high: float = 1.0,
     dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Allocates an uninitialized tensor on key's device (dtype default float32)
+    # and fills it with uniform samples on [low, high) via the in-place variant.
+    # The shape may be separate sizes or one sequence. Returns the new tensor.
     r"""Generate uniformly distributed random values from a PRNG key.
 
     Produces a tensor of the given shape filled with values drawn uniformly
