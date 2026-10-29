@@ -1,3 +1,7 @@
+# [MODULE DOC] Theoretical hardware limits of Nvidia GPUs. Exports GPULimits, which wraps the CUDA device
+# properties of a target device and derives peak TFLOPs (CUDA cores or tensor cores), global memory
+# bandwidth and shared memory bandwidth from hardcoded per-architecture tables (Ampere, Hopper, Blackwell).
+# No import-time side effects beyond imports.
 import torch
 from torch._C import dtype
 
@@ -6,6 +10,10 @@ __all__ = ["GPULimits"]
 
 
 class GPULimits:
+    # [CLASS DOC] Calculator of peak theoretical throughput for one CUDA device.
+    # State: device_properties (from the CUDA runtime) and compute_capability (integer such as 80, 90, 100).
+    # Ignores thermal throttling; assumes peak rated clocks. Methods raise RuntimeError for
+    # unsupported dtype/architecture combinations.
     r"""Utility class that provides the theoretical limits of Nvidia GPU devices. The
     limits don't take into account thermal throttling (assume that the GPU run at its
     peak rated frequency). This is because user hardware configuration may influence
@@ -13,6 +21,8 @@ class GPULimits:
     """
 
     def __init__(self, target_device: torch.device):
+        # [FUNCTION DOC] Constructor: query device properties for target_device and compute the integer
+        # compute capability by concatenating major and minor version digits. Requires CUDA to be available.
         # The device properties object is obtained by calling 'cudaGetDeviceProperties' CUDA
         # runtime function. We need the total memory bus width and the memory clock rate to
         # calculate the memory bandwidth.
@@ -29,6 +39,9 @@ class GPULimits:
     # Returns the number of FMA instructions retired per cycle per SM for a given
     # data type, when tensor cores are NOT used
     def get_fma_per_cycle_per_sm_cuda_cores(self, data_type: dtype) -> int:
+        # [FUNCTION DOC] Return FMA instructions retired per cycle per SM without tensor cores for float16,
+        # float32 or float64, looked up by dtype and compute capability.
+        # Raises RuntimeError if the dtype or architecture is not in the hardcoded table (e.g. bfloat16 or sm_86).
         hardcoded_device_values = {
             # Ampere Architecture
             "fp16_80": 256,
@@ -63,6 +76,10 @@ class GPULimits:
     # Returns the number of FMA instructions retired per cycle per SM for a given
     # data type, when tensor cores ARE used
     def get_fma_per_cycle_per_sm_tensor_cores(self, data_type: dtype) -> int:
+        # [FUNCTION DOC] Return FMA instructions retired per cycle per SM with tensor cores for float16,
+        # bfloat16 (treated as float16), float32, int8 or float64, by dtype and compute capability.
+        # Raises RuntimeError if the combination is not in the table.
+        # KNOWN ISSUE: the table has fp8 entries but no dtype maps to them, and fp64 has no sm_100 entry.
         hardcoded_device_values = {
             # Ampere Architecture
             "int8_80": 2048,
@@ -106,6 +123,9 @@ class GPULimits:
     def get_tflops_per_second(
         self, data_type: dtype, use_tensor_cores: bool = True
     ) -> float:
+        # [FUNCTION DOC] Peak TFLOPs per second for data_type, using tensor cores by default or CUDA cores.
+        # Computed as SM count times FMA per cycle per SM times 2 (an FMA is two operations) times clock rate
+        # (reported in kHz) divided by 1e9. Propagates RuntimeError from the lookup methods.
         num_sms = self.device_properties.multi_processor_count
         clock_rate = self.device_properties.clock_rate  # KHz
 
@@ -121,6 +141,8 @@ class GPULimits:
         return tflops_per_second
 
     def get_memory_bandwidth_Bps(self) -> int:
+        # [FUNCTION DOC] Peak global memory bandwidth in bytes per second: bus width in bytes times 2
+        # (double data rate) times the memory clock rate converted from kHz to Hz.
         # DRAM devices are Double-Data which means they provide an output at both fronts of
         # a clock beat
         bus_bytes_per_cycle = int(2 * self.device_properties.memory_bus_width / 8)
@@ -129,6 +151,8 @@ class GPULimits:
         return bytes_per_second
 
     def get_shared_memory_bandwidth_Bps(self) -> int:
+        # [FUNCTION DOC] Peak shared memory bandwidth in bytes per second: 128 bytes per cycle per SM
+        # (one warp of 32 four-byte accesses) times SM count times core clock rate converted from kHz to Hz.
         # Each warp can LD or ST 32 x 4 bytes per cycle. To calculate the
         # device's throughput we need to multiply with frequency and number of SMs.
         num_sms = self.device_properties.multi_processor_count

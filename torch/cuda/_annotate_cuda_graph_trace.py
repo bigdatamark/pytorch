@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Command line tool (run as a module) that post-processes a profiler trace JSON (plain or gzip)
+# using a pickled mapping of graph node id to kernel annotations. Contents: annotate_trace (merge annotations
+# into kernel event args, reassign streams, drop noise events, fix metadata), two private timestamp/stream
+# cleanup passes, load_trace/save_trace, annotation pickle discovery, and main (argparse entry point).
+# Import-time side effects: none; main runs only under the script guard and prints progress, may exit 1.
 """Post-process a profiler trace to add CUDA graph kernel annotations.
 
 Reads a profiler trace (gzipped or plain JSON) and a kernel annotations
@@ -38,6 +43,9 @@ _WORK_CATEGORIES = {"kernel", "gpu_memcpy", "gpu_memset"}
 def _move_overlapping_to_stream(
     trace: dict, default_stream: int = 7, overlap_stream: int = 8
 ) -> int:
+    # [FUNCTION DOC] HELPER: Move graphed kernel events (nonzero graph node id) on default_stream that start before
+    # the previous such kernel ends onto overlap_stream, updating both tid and the stream arg, mutating the trace.
+    # Events are processed in timestamp order; returns the count moved. Missing args are treated as not graphed.
     """Move graphed kernels that overlap with their predecessor to a separate stream.
 
     Perfetto cannot display overlapping (non-nested) events on the same
@@ -72,6 +80,10 @@ def _move_overlapping_to_stream(
 
 
 def _fix_overlapping_timestamps(trace: dict, max_adjust_us: float = 1.0) -> int:
+    # [FUNCTION DOC] HELPER: For graphed kernel/memcpy/memset events grouped per stream, sort by timestamp and push a
+    # start time forward to the previous event end when overlap is at most max_adjust_us; larger overlaps print
+    # a warning and are left unchanged. Mutates events in place; returns the number adjusted.
+    # Note: after a skipped large overlap the running end time still uses the unchanged event.
     """Clamp graphed kernel/memcpy timestamps so they don't overlap on the same stream.
 
     CUPTI can produce slightly overlapping timestamps for consecutive graphed
@@ -120,6 +132,13 @@ def annotate_trace(
     annotations: dict[int, list[Any]],
     default_stream: int = 7,
 ) -> int:
+    # [FUNCTION DOC] Annotate graphed events (nonzero graph node id) in the trace in place. For each, merge fields from
+    # the annotation list for its id into args (legacy bare strings and the key str become name; values stringified),
+    # reassign tid and stream arg to the annotated stream or default_stream, and move matching ac2g flow-finish
+    # events with the same old tid and timestamp. Then remove gpu_user_annotation and ac2g finish events on streams
+    # without kernel/memcpy/memset work (printing the count), drop metadata for streams with no events, and add
+    # thread_name metadata for new work streams. Returns the number of events that had annotations.
+    # KNOWN ISSUE: annotated count excludes graphed events lacking annotations even though they are restreamed.
     """Add annotation fields to kernel events matching the annotations dict.
 
     Each annotation entry is a list (from nested ``mark_kernels`` scopes).
@@ -187,6 +206,7 @@ def annotate_trace(
             tids_with_work.add(event.get("tid"))
 
     def _is_noise(event: dict) -> bool:
+        # [FUNCTION DOC] HELPER: Predicate for the filter: true for annotation or ac2g flow-finish events whose tid has no work.
         cat = event.get("cat")
         if cat == "gpu_user_annotation":
             return event.get("tid") not in tids_with_work
@@ -247,6 +267,8 @@ def annotate_trace(
 
 
 def load_trace(path: Path) -> dict:
+    # [FUNCTION DOC] Load and return the trace JSON dictionary from path, using gzip text mode for .gz files.
+    # Raises file or JSON decoding errors from the underlying calls.
     if path.suffix == ".gz" or path.name.endswith(".json.gz"):
         with gzip.open(path, "rt") as f:
             return json.load(f)
@@ -256,6 +278,8 @@ def load_trace(path: Path) -> dict:
 
 
 def save_trace(trace: dict, path: Path) -> None:
+    # [FUNCTION DOC] Write the trace dictionary to path as JSON, gzip compressed if the name ends in .gz.
+    # Overwrites any existing file; returns nothing.
     if path.suffix == ".gz" or path.name.endswith(".json.gz"):
         with gzip.open(path, "wt") as f:
             json.dump(trace, f)
@@ -265,6 +289,9 @@ def save_trace(trace: dict, path: Path) -> None:
 
 
 def _find_annotations_pkl(trace_file: Path) -> Path | None:
+    # [FUNCTION DOC] HELPER: Find the annotations pickle for a trace file. Parses the leading digits of the trace file name
+    # as the rank and returns the first sorted match of the rank-specific annotations pickle in the grandparent
+    # directory, or None if the name has no leading digits or nothing matches.
     """Auto-discover the annotations pickle from the trace file location.
 
     Trace files live in e.g. ``traces/step_000000000014/000000.<id>.pt.trace.json.gz``
@@ -284,6 +311,10 @@ def _find_annotations_pkl(trace_file: Path) -> Path | None:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point. Parses arguments (trace file, annotations pickle, output path, default stream),
+    # auto-discovers the pickle if absent (prints to stderr and exits with status 1 on failure), loads pickle and trace,
+    # annotates, fixes overlaps, picks a default .annotated output name, saves, and prints progress.
+    # KNOWN ISSUE: the overlap message always says stream 8 regardless of the stream used by the helper default.
     parser = argparse.ArgumentParser(
         description="Annotate a profiler trace with CUDA graph kernel annotations."
     )

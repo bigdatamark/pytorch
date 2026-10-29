@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Main entry of the torch.cuda package: lazy CUDA initialization, device/stream management, memory,
+# RNG, properties, capability checks and re-exports from submodules (graphs, streams, green contexts, gds, memory,
+# random, profiler, etc). Import-time side effects: probes optional pynvml/amdsmi (on ROCm temporarily hooks
+# ctypes CDLL to avoid loading two copies of libamd_smi), records import errors in module globals, defines
+# fallback stubs when built without CUDA, creates the thread-local state, init lock and queued-call list,
+# and queues the compute-capability and cubin compatibility checks to run at CUDA initialization.
 r"""
 This package adds support for CUDA tensor types.
 
@@ -87,7 +93,12 @@ try:
             # rpath/LD_LIBRARY_PATH first, so that we only load a single copy
             # of the .so.
             class _amdsmi_cdll_hook:
+            # [CLASS DOC] HELPER: Context manager (ROCm only) that temporarily replaces ctypes.CDLL so that any request to load
+            # libamd_smi is first tried against ROCM_HOME/ROCM_PATH, the loader path and rocm sdk core wheel locations, avoiding
+            # loading a second copy of the library. State: original_CDLL and the candidate path list. Restores CDLL on exit.
                 def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Save the original CDLL and build the candidate path list (ROCM home copy first when set,
+                # then the bare name, then on Linux the versioned files found in the rocm sdk core wheel).
                     self.original_CDLL = ctypes.CDLL  # type: ignore[misc,assignment]
                     paths = ["libamd_smi.so"]
                     if rocm_home := os.getenv("ROCM_HOME", os.getenv("ROCM_PATH")):
@@ -106,6 +117,8 @@ try:
 
                 @staticmethod
                 def _rocm_sdk_core_amdsmi_paths() -> list[str]:
+                # [FUNCTION DOC] HELPER: Static. Locate the _rocm_sdk_core package and return a sorted list of its libamd_smi shared
+                # library files; returns an empty list if the package is missing or has no search locations.
                     try:
                         spec = importlib.util.find_spec("_rocm_sdk_core")
                     except (ImportError, ValueError):
@@ -122,6 +135,8 @@ try:
                 def hooked_CDLL(
                     self, name: str | Path | None, *args: Any, **kwargs: Any
                 ) -> ctypes.CDLL:
+                # [FUNCTION DOC] HELPER: Replacement for CDLL. For library names starting with libamd_smi.so, try each candidate path
+                # and return the first that loads (ignoring OS errors); otherwise fall back to the original loader with the given name.
                     if name and Path(name).name.startswith("libamd_smi.so"):
                         for path in self.paths:
                             try:
@@ -131,9 +146,11 @@ try:
                     return self.original_CDLL(name, *args, **kwargs)  # type: ignore[arg-type]
 
                 def __enter__(self) -> None:
+                # [FUNCTION DOC] HELPER: Install the hooked loader as ctypes.CDLL (global side effect).
                     ctypes.CDLL = self.hooked_CDLL  # type: ignore[misc,assignment]
 
                 def __exit__(self, type: Any, value: Any, traceback: Any) -> None:
+                # [FUNCTION DOC] HELPER: Restore the original ctypes.CDLL; does not suppress exceptions.
                     ctypes.CDLL = self.original_CDLL  # type: ignore[misc]
 
             try:
@@ -176,6 +193,7 @@ if hasattr(torch._C, "_cuda_exchangeDevice"):
 else:
 
     def _exchange_device(device: int) -> int:
+    # [FUNCTION DOC] HELPER: Fallback when built without CUDA: returns -1 for a negative device, otherwise raises RuntimeError.
         if device < 0:
             return -1
         raise RuntimeError("PyTorch was compiled without CUDA support")
@@ -186,6 +204,7 @@ if hasattr(torch._C, "_cuda_maybeExchangeDevice"):
 else:
 
     def _maybe_exchange_device(device: int) -> int:
+    # [FUNCTION DOC] HELPER: Fallback when built without CUDA: returns -1 for a negative device, otherwise raises RuntimeError.
         if device < 0:
             return -1
         raise RuntimeError("PyTorch was compiled without CUDA support")
@@ -198,15 +217,19 @@ default_generators: tuple[torch._C.Generator] = ()  # type: ignore[assignment]
 
 
 def _is_compiled() -> bool:
+    # [FUNCTION DOC] HELPER: True if the build contains CUDA bindings (detected by the presence of the device count binding).
     r"""Return true if compile with CUDA support."""
     return hasattr(torch._C, "_cuda_getDeviceCount")
 
 
 def _nvml_based_avail() -> bool:
+    # [FUNCTION DOC] HELPER: True if the environment variable requesting NVML based availability checks is set to 1.
     return os.getenv("PYTORCH_NVML_BASED_CUDA_CHECK") == "1"
 
 
 def is_available() -> bool:
+    # [FUNCTION DOC] Return whether CUDA is usable: False if not compiled with CUDA; if the NVML check env var is set,
+    # use device_count (NVML based, avoids poisoning fork); otherwise ask the CUDA runtime whether at least one device exists.
     r"""
     Return a bool indicating if CUDA is currently available.
 
@@ -229,6 +252,9 @@ def is_available() -> bool:
 
 
 def is_bf16_supported(including_emulation: bool = True):
+    # [FUNCTION DOC] Return whether the current device supports bfloat16. Always True on ROCm, False when CUDA is unavailable,
+    # True for compute capability major 8 or higher; otherwise, when including_emulation is set, probes by trying to create a
+    # bfloat16 tensor on the current device.
     r"""Return a bool indicating if the current CUDA/ROCm device supports dtype bfloat16."""
     # Check for ROCm, if true return true, no ROCM_VERSION check required,
     # since it is supported on AMD GPU archs.
@@ -253,6 +279,7 @@ def is_bf16_supported(including_emulation: bool = True):
 
 @lru_cache(maxsize=16)
 def _check_bf16_tensor_supported(device: Device):
+    # [FUNCTION DOC] HELPER: Cached (16 entries) probe that tries creating a bfloat16 tensor on the device; True on success, False on any exception.
     try:
         torch.tensor([1.0], dtype=torch.bfloat16, device=device)
         return True
@@ -261,6 +288,8 @@ def _check_bf16_tensor_supported(device: Device):
 
 
 def is_tf32_supported() -> bool:
+    # [FUNCTION DOC] Return whether the current device supports tf32. On ROCm true only for gfx94 or gfx95 architectures;
+    # otherwise equals native (non-emulated) bfloat16 support.
     r"""Return a bool indicating if the current CUDA/ROCm device supports dtype tf32."""
     if torch.version.hip:
         prop_name = torch.cuda.get_device_properties().gcnArchName
@@ -276,10 +305,12 @@ def is_tf32_supported() -> bool:
 
 
 def _sleep(cycles):
+    # [FUNCTION DOC] HELPER: Launch a kernel that spins the GPU for the given number of cycles (testing aid).
     torch._C._cuda_sleep(cycles)
 
 
 def _extract_arch_version(arch_string: str) -> int:
+    # [FUNCTION DOC] HELPER: Parse an architecture string like sm_90a (second underscore-separated token, with a trailing a or f removed) into an integer.
     """Extracts the architecture string from a CUDA version"""
     base = arch_string.split("_", maxsplit=2)[1]
     base = base.removesuffix("a").removesuffix("f")
@@ -287,6 +318,8 @@ def _extract_arch_version(arch_string: str) -> int:
 
 
 class _CompatInterval:
+    # [CLASS DOC] HELPER: Membership test for a range of compute capabilities (integers like 90): all versions with the same major
+    # as the start and a minor at or above the start's minor, minus an optional exclusion set. Provides printing of the range.
     """
     Defines a range of compute capabilities starting at a given
     version and going up to the end of that major version. This
@@ -294,16 +327,19 @@ class _CompatInterval:
     """
 
     def __init__(self, start, exclude: set[int] | None = None):
+        # [FUNCTION DOC] HELPER: Split start into major and minor digits and store the exclusion set (empty by default).
         self.major, self.minor = start // 10, start % 10
         self.exclude = set() if exclude is None else exclude
 
     def __contains__(self, x):
+        # [FUNCTION DOC] HELPER: True if x is not excluded, has the same major and a minor at or above the start minor.
         if x in self.exclude:
             return False
         x_major, x_minor = x // 10, x % 10
         return x_major == self.major and x_minor >= self.minor
 
     def __str__(self):
+        # [FUNCTION DOC] HELPER: Human readable range text, with excluded versions appended.
         result = f">={self.major}.{self.minor},<{self.major + 1}.0"
         if len(self.exclude) > 0:
             exceptions = ", ".join(f"{x // 10}.{x % 10}" for x in self.exclude)
@@ -312,18 +348,22 @@ class _CompatInterval:
 
 
 class _CompatSet:
+    # [CLASS DOC] HELPER: Plain set of compute capabilities with membership test and custom printing as major.minor values.
     """
     A set of compute capabilities. It exists primarily to support custom
     printing logic and is otherwise equivalent to a plain python set().
     """
 
     def __init__(self, values: set[int]):
+        # [FUNCTION DOC] HELPER: Store the set of integer capabilities.
         self.values = values
 
     def __contains__(self, x):
+        # [FUNCTION DOC] HELPER: Membership test against the stored set.
         return x in self.values
 
     def __str__(self):
+        # [FUNCTION DOC] HELPER: Format members as major.minor values in braces (set iteration order).
         return "{" + ", ".join(f"{v // 10}.{v % 10}" for v in self.values) + "}"
 
 
@@ -394,6 +434,8 @@ PYTORCH_RELEASES_CODE_CC: dict[str, dict[str, set[int]]] = {
 
 
 def _device_requirement(code_cc):
+    # [FUNCTION DOC] HELPER: Return the device capability rule (interval or set) able to run code built for code_cc, choosing the post-Jetson-SBSA
+    # table for CUDA 13.2 or later; None if torch is not a CUDA build or the capability is unknown.
     if torch.version.cuda is None:
         return None
     requirement = (
@@ -405,11 +447,14 @@ def _device_requirement(code_cc):
 
 
 def _host_arch_key() -> str:
+    # [FUNCTION DOC] HELPER: Return aarch64 if the host machine is aarch64, otherwise x86_64.
     machine = platform.machine().lower()
     return "aarch64" if machine == "aarch64" else "x86_64"
 
 
 def _code_compatible_with_device(device_cc: int, code_cc: int):
+    # [FUNCTION DOC] HELPER: True if code built for code_cc can run on a device of capability device_cc. Warns (and falls back to a
+    # same-major, minor-or-higher rule) when code_cc is not a known capability.
     compatible_devices = _device_requirement(code_cc)
     if compatible_devices is None:
         warnings.warn(
@@ -422,6 +467,9 @@ def _code_compatible_with_device(device_cc: int, code_cc: int):
 
 
 def _warn_unsupported_code(device_index: int, device_cc: int, code_ccs: list[int]):
+    # [FUNCTION DOC] HELPER: Emit a warning that the GPU is not supported by this build: lists the build capabilities and the hardware
+    # each supports, then suggests pip install commands for published CUDA builds (nightly index for dev versions) that support
+    # the device, or points to the install page if none does. Side effect: calls warnings.warn.
     name = get_device_name(device_index)
 
     arch = _host_arch_key()
@@ -467,6 +515,8 @@ def _warn_unsupported_code(device_index: int, device_cc: int, code_ccs: list[int
 
 
 def _check_capability():
+    # [FUNCTION DOC] HELPER: Lazy startup check (CUDA builds only): for each visible device, warn if no compiled architecture
+    # in this build is compatible. Does nothing on ROCm or when the arch list is empty.
     if torch.version.cuda is None:  # on ROCm we don't want this check
         return
 
@@ -485,6 +535,9 @@ def _check_capability():
 
 
 def _check_cubins():
+    # [FUNCTION DOC] HELPER: Lazy startup check (CUDA builds only): warn for each device whose compute major version matches no
+    # compiled sm architecture. Does nothing on ROCm or an empty arch list.
+    # KNOWN ISSUE: overlaps with the newer capability check and uses only major version matching.
     incompatible_device_warn = """
 {} with CUDA capability sm_{} is not compatible with the current PyTorch installation.
 The current PyTorch install supports CUDA capabilities {}.
@@ -512,11 +565,14 @@ If you want to use the {} GPU with PyTorch, please check the instructions at htt
 
 
 def is_initialized():
+    # [FUNCTION DOC] Return True if CUDA state is initialized and the process is not in a bad forked child.
     r"""Return whether PyTorch's CUDA state has been initialized."""
     return _initialized and not _is_in_bad_fork()
 
 
 def _lazy_call(callable, **kwargs):
+    # [FUNCTION DOC] HELPER: Run callable now if CUDA is initialized; otherwise queue it under the init lock. Keyword seed_all or seed
+    # route it to the lazy seed tracker; other calls are appended to the queued calls list with the stack trace text.
     with _initialization_lock:
         if is_initialized():
             callable()
@@ -539,6 +595,7 @@ _lazy_call(_check_cubins)
 
 
 class DeferredCudaCallError(Exception):
+# [CLASS DOC] Exception raised when a call queued before CUDA initialization fails once initialization runs (carries the original stack).
     pass
 
 
@@ -547,6 +604,7 @@ OutOfMemoryError = torch._C.OutOfMemoryError
 
 
 def init():
+    # [FUNCTION DOC] Initialize CUDA state explicitly by calling the lazy initializer; no-op if already initialized.
     r"""Initialize PyTorch's CUDA state.
 
     You may need to call this explicitly if you are interacting with
@@ -561,6 +619,10 @@ def init():
 
 
 def _lazy_init():
+    # [FUNCTION DOC] HELPER: Lazily initialize CUDA exactly once (double-checked locking). Returns immediately if initialized
+    # or if the current thread is already mid-initialization. Raises RuntimeError in a forked child, AssertionError if torch lacks
+    # CUDA or the cudart module. Calls the native init, then runs all queued calls (plus seed calls from the seed tracker),
+    # wrapping any failure in DeferredCudaCallError that includes the original call stack. Sets the initialized flag last.
     global _initialized, _queued_calls
     if is_initialized() or hasattr(_tls, "is_initializing"):
         return
@@ -612,6 +674,8 @@ def _lazy_init():
 
 
 def cudart():
+    # [FUNCTION DOC] Initialize CUDA if needed and return the native CUDA runtime module (None-valued if unavailable).
+    # Raises the same errors as lazy initialization.
     r"""Retrieves the CUDA runtime API module.
 
 
@@ -670,18 +734,22 @@ def cudart():
 
 
 class cudaStatus:
+    # [CLASS DOC] HELPER: Constants for CUDA runtime status codes: SUCCESS is 0 and ERROR_NOT_READY is 34.
     SUCCESS: int = 0
     ERROR_NOT_READY: int = 34
 
 
 class CudaError(RuntimeError):
+    # [CLASS DOC] RuntimeError subclass for CUDA runtime failures; message holds the runtime error string and numeric code.
     def __init__(self, code: int) -> None:
+        # [FUNCTION DOC] Build the message from the runtime error string for code plus the code in parentheses.
         # pyrefly: ignore [missing-attribute]
         msg = _cudart.cudaGetErrorString(_cudart.cudaError(code))
         super().__init__(f"{msg} ({code})")
 
 
 def check_error(res: int) -> None:
+    # [FUNCTION DOC] Raise CudaError if res differs from the runtime success code; otherwise return nothing.
     r"""Raise an error if the result of a CUDA runtime API call is not success."""
     # pyrefly: ignore [missing-attribute]
     if res != _cudart.cudaError.success:
@@ -689,19 +757,26 @@ def check_error(res: int) -> None:
 
 
 class _DeviceGuard:
+    # [CLASS DOC] HELPER: Lightweight device context manager without index normalization: on enter switches the current device
+    # to idx (saving the previous one), on exit switches back. State: idx and prev_idx.
     def __init__(self, index: int):
+        # [FUNCTION DOC] HELPER: Store the device index and initialize the previous index to -1.
         self.idx = index
         self.prev_idx = -1
 
     def __enter__(self):
+        # [FUNCTION DOC] HELPER: Exchange the current device with idx and remember the previous device.
         self.prev_idx = torch.cuda._exchange_device(self.idx)
 
     def __exit__(self, type: Any, value: Any, traceback: Any):
+        # [FUNCTION DOC] HELPER: Restore the previous device; never suppresses exceptions (returns False).
         self.idx = torch.cuda._maybe_exchange_device(self.prev_idx)
         return False
 
 
 class device:
+    # [CLASS DOC] Context manager that selects a CUDA device for its body and restores the previous device on exit.
+    # No-op when the index is negative or None. State: idx (normalized device index) and prev_idx.
     r"""Context-manager that changes the selected device.
 
     Args:
@@ -710,18 +785,22 @@ class device:
     """
 
     def __init__(self, device: Any):
+        # [FUNCTION DOC] Normalize the given device (int, string, device object or None) into an index; previous index starts at -1.
         self.idx = _get_device_index(device, optional=True)
         self.prev_idx = -1
 
     def __enter__(self):
+        # [FUNCTION DOC] Switch to the selected device, recording the previously current device.
         self.prev_idx = torch.cuda._exchange_device(self.idx)
 
     def __exit__(self, type: Any, value: Any, traceback: Any):
+        # [FUNCTION DOC] Switch back to the recorded device; returns False so exceptions propagate.
         self.idx = torch.cuda._maybe_exchange_device(self.prev_idx)
         return False
 
 
 class device_of(device):
+    # [CLASS DOC] Device context manager that selects the device holding a given tensor or storage; no-op if the object is not on a GPU.
     r"""Context-manager that changes the current device to that of given object.
 
     You can use both tensors and storages as arguments. If a given object is
@@ -732,11 +811,14 @@ class device_of(device):
     """
 
     def __init__(self, obj):
+        # [FUNCTION DOC] Pick the object's device index if it is a CUDA object, else -1, and delegate to the base constructor.
         idx = obj.get_device() if obj.is_cuda else -1
         super().__init__(idx)
 
 
 def set_device(device: Device) -> None:
+    # [FUNCTION DOC] Set the current CUDA device (index, string or device object). Negative values are ignored.
+    # Side effect: changes the thread's current device via the native call.
     r"""Set the current device.
 
     Usage of this function is discouraged in favor of :any:`device`. In most
@@ -752,6 +834,7 @@ def set_device(device: Device) -> None:
 
 
 def get_device_name(device: Device = None) -> str:
+    # [FUNCTION DOC] Return the name string of the given device (current device if None) from its properties.
     r"""Get the name of a device.
 
     Args:
@@ -767,6 +850,7 @@ def get_device_name(device: Device = None) -> str:
 
 
 def get_device_capability(device: Device = None) -> tuple[int, int]:
+    # [FUNCTION DOC] Return the (major, minor) compute capability of the given device (current if None).
     r"""Get the cuda capability of a device.
 
     Args:
@@ -785,6 +869,8 @@ def get_device_capability(device: Device = None) -> tuple[int, int]:
 
 # pyrefly: ignore [not-a-type]
 def get_device_properties(device: Device = None) -> _CudaDeviceProperties:
+    # [FUNCTION DOC] Return the properties object of a device (current if None). Initializes CUDA lazily.
+    # Raises AssertionError for an out of range device index.
     r"""Get the properties of a device.
 
     Args:
@@ -804,6 +890,8 @@ def get_device_properties(device: Device = None) -> _CudaDeviceProperties:
 
 
 def can_device_access_peer(device: Device, peer_device: Device) -> bool:
+    # [FUNCTION DOC] Return whether the first device can directly access memory of peer_device. Initializes CUDA lazily;
+    # raises AssertionError for out of range indices.
     r"""Check if peer access between two devices is possible."""
     _lazy_init()
     device = _get_device_index(device, optional=True)
@@ -816,6 +904,9 @@ def can_device_access_peer(device: Device, peer_device: Device) -> bool:
 
 
 class StreamContext:
+    # [CLASS DOC] Context manager that makes a stream current for kernels launched in its body and restores the previous
+    # streams on exit; a no-op if the stream is None or no CUDA device exists. State: stream, idx (device index, -1 if none),
+    # src_prev_stream and dst_prev_stream (streams to restore on the original and the stream's own device).
     r"""Context-manager that selects a given stream.
 
     All CUDA kernels queued within its context will be enqueued on a selected
@@ -830,6 +921,8 @@ class StreamContext:
     cur_stream: Optional["torch.cuda.Stream"]
 
     def __init__(self, stream: Optional["torch.cuda.Stream"]):
+        # [FUNCTION DOC] Store the stream and the current device index (-1 if unavailable outside scripting); initialize
+        # the saved previous streams (default streams under scripting, otherwise None).
         self.stream = stream
         self.idx = _get_device_index(None, True)
         if not torch.jit.is_scripting():
@@ -845,6 +938,8 @@ class StreamContext:
         )
 
     def __enter__(self):
+        # [FUNCTION DOC] Save the current stream; if the target stream lives on another device also save that device's current
+        # stream; then set the target stream current. Does nothing for a None stream or when no device exists.
         # Local cur_stream variable for type refinement
         cur_stream = self.stream
         # Return if stream is None or CUDA device not available
@@ -860,6 +955,8 @@ class StreamContext:
         torch.cuda.set_stream(cur_stream)
 
     def __exit__(self, type: Any, value: Any, traceback: Any):
+        # [FUNCTION DOC] Restore the saved streams (destination device first when devices differ, then the original one).
+        # Does nothing for a None stream or when no device exists. Does not suppress exceptions.
         # Local cur_stream variable for type refinement
         cur_stream = self.stream
         # If stream is None or no CUDA device available, return
@@ -874,6 +971,7 @@ class StreamContext:
 
 
 def stream(stream: Optional["torch.cuda.Stream"]) -> StreamContext:
+    # [FUNCTION DOC] Return a StreamContext for the given stream (may be None, which makes the context a no-op).
     r"""Wrap around the Context-manager StreamContext that selects a given stream.
 
     Arguments:
@@ -887,6 +985,7 @@ def stream(stream: Optional["torch.cuda.Stream"]) -> StreamContext:
 
 
 def _set_stream_by_id(stream_id, device_index, device_type):
+    # [FUNCTION DOC] HELPER: Set the current stream through the native call using stream id, device index and device type enum.
     r"""set stream specified by the stream id, device index and
         device type
 
@@ -902,6 +1001,7 @@ def _set_stream_by_id(stream_id, device_index, device_type):
 
 
 def set_stream(stream: Stream):
+    # [FUNCTION DOC] Set the current stream from a Stream object (via its id, device index and device type); does nothing if None.
     r"""Set the current stream. This is a wrapper API to set the stream.
         Usage of this function is discouraged in favor of the ``stream``
         context manager.
@@ -920,6 +1020,10 @@ def set_stream(stream: Stream):
 
 
 def _parse_visible_devices() -> list[int] | list[str]:
+    # [FUNCTION DOC] HELPER: Parse visible device environment variables into either a list of integer ordinals or a list of UUID strings.
+    # On ROCm, combines ROCR and HIP variables (HIP preferred; raises RuntimeError if HIP lists more devices than ROCR).
+    # Unset gives ordinals 0..63. UUID-style lists (GPU- or MIG- prefix) keep matching prefixed entries until the first non-prefixed;
+    # integer lists are parsed like strtoul, a duplicate yields an empty list and a negative value ends parsing.
     r"""Parse CUDA_VISIBLE_DEVICES environment variable."""
     var = os.getenv("CUDA_VISIBLE_DEVICES")
 
@@ -950,6 +1054,8 @@ def _parse_visible_devices() -> list[int] | list[str]:
         return list(range(64))
 
     def _strtoul(s: str) -> int:
+        # [FUNCTION DOC] HELPER: Parse the leading integer (optional sign plus digits) of a string like strtoul; -1 if empty or no digits.
+        # KNOWN ISSUE: a lone sign character makes the final integer conversion raise ValueError instead of returning -1.
         """Return -1 or positive integer sequence string starts with."""
         if not s:
             return -1
@@ -961,6 +1067,7 @@ def _parse_visible_devices() -> list[int] | list[str]:
         return int(s[:idx]) if idx > 0 else -1
 
     def parse_list_with_prefix(lst: str, prefix: str) -> list[str]:
+        # [FUNCTION DOC] HELPER: Split a comma list, collecting elements until one lacks the prefix; a repeated element yields an empty list.
         rcs: list[str] = []
         for elem in lst.split(","):
             # Repeated id results in empty set
@@ -992,6 +1099,8 @@ def _parse_visible_devices() -> list[int] | list[str]:
 
 
 def _raw_device_count_amdsmi() -> int:
+    # [FUNCTION DOC] HELPER: Device count via amdsmi: -1 if amdsmi is unavailable or fails to initialize (with a warning),
+    # otherwise the number of processor handles.
     if not _HAS_AMDSMI:
         return -1
     try:
@@ -1006,6 +1115,8 @@ def _raw_device_count_amdsmi() -> int:
 
 
 def _raw_device_count_nvml() -> int:
+    # [FUNCTION DOC] HELPER: Device count via the NVML shared library loaded with ctypes. Returns -1 with a warning if init or count fails.
+    # May raise OSError if the NVML library cannot be loaded.
     r"""Return number of devices as reported by NVML or negative value if NVML discovery/initialization failed."""
     from ctypes import byref, c_int, CDLL
 
@@ -1024,6 +1135,8 @@ def _raw_device_count_nvml() -> int:
 
 
 def _raw_device_uuid_amdsmi() -> list[str] | None:
+    # [FUNCTION DOC] HELPER: List of lower-cased device serial identifiers (without 0x prefix) from amdsmi. Returns None with a warning on
+    # any amdsmi failure or when amdsmi is unavailable.
     from ctypes import byref, c_int, c_void_p, CDLL, create_string_buffer
 
     if not _HAS_AMDSMI:
@@ -1060,6 +1173,7 @@ def _raw_device_uuid_amdsmi() -> list[str] | None:
 
 
 def _raw_device_uuid_nvml() -> list[str] | None:
+    # [FUNCTION DOC] HELPER: List of device UUID strings from NVML via ctypes; returns None with a warning if init, count, handle or UUID queries fail.
     r"""Return list of device UUID as reported by NVML or None if NVM discovery/initialization failed."""
     from ctypes import byref, c_int, c_void_p, CDLL, create_string_buffer
 
@@ -1092,9 +1206,13 @@ def _raw_device_uuid_nvml() -> list[str] | None:
 
 
 def _transform_uuid_to_ordinals(candidates: list[str], uuids: list[str]) -> list[int]:
+    # [FUNCTION DOC] HELPER: Convert partial UUID strings into device ordinals by prefix match against the known UUID list.
+    # Parsing stops at the first unmatched or ambiguous candidate; a duplicate ordinal yields an empty list.
+    # On ROCm the GPU- prefix is stripped from candidates first.
     r"""Given the set of partial uuids and list of known uuids builds a set of ordinals excluding ambiguous partials IDs."""
 
     def uuid_to_ordinal(candidate: str, uuids: list[str]) -> int:
+    # [FUNCTION DOC] HELPER: Index of the single known UUID starting with candidate; -1 if none or more than one matches.
         best_match = -1
         for idx, uuid in enumerate(uuids):
             if not uuid.startswith(candidate):
@@ -1123,6 +1241,8 @@ def _transform_uuid_to_ordinals(candidates: list[str], uuids: list[str]) -> list
 
 
 def _device_count_amdsmi() -> int:
+    # [FUNCTION DOC] HELPER: Device count seen through amdsmi honoring visible-device variables. Returns 0 if none visible, -1 on failures
+    # (missing UUIDs, OS or attribute errors); for ordinal lists, truncates at the first ordinal beyond the real count.
     visible_devices = _parse_visible_devices()
     if not visible_devices:
         return 0
@@ -1152,6 +1272,9 @@ def _device_count_amdsmi() -> int:
 
 
 def _device_count_nvml() -> int:
+    # [FUNCTION DOC] HELPER: Device count seen through NVML honoring the visible-devices variable. 0 if none visible, negative on NVML failure;
+    # MIG identifiers are not supported (returns -1); UUID lists are mapped to ordinals; ordinal lists are cut at the first ordinal
+    # at or beyond the real count.
     r"""Return number of devices as reported by NVML taking CUDA_VISIBLE_DEVICES into account.
 
     Negative value is returned if NVML discovery or initialization has failed.
@@ -1188,6 +1311,9 @@ def _device_count_nvml() -> int:
 
 
 def _get_nvml_device_index(device: Device) -> int:
+    # [FUNCTION DOC] HELPER: Map a logical device (None meaning current) to its NVML index using the visible-devices variable
+    # (UUID entries are converted to ordinals). Raises RuntimeError if UUIDs cannot be obtained or the index is not visible.
+    # KNOWN ISSUE: assumes the visible device list is nonempty; an empty list would raise IndexError.
     r"""Return the NVML index of the device, taking CUDA_VISIBLE_DEVICES into account."""
     idx = _get_device_index(device, optional=True)
     visible_devices = _parse_visible_devices()
@@ -1210,6 +1336,9 @@ _cached_device_count: int | None = None
 
 
 def device_count() -> int:
+    # [FUNCTION DOC] Return the number of visible GPUs; 0 if built without CUDA. Returns the cached value when set. Before CUDA init
+    # it asks NVML (or amdsmi on ROCm) to avoid poisoning fork, falling back to the runtime when that fails; once initialized
+    # it uses the runtime and caches the result in a module global (never cached before init, since visibility may change).
     r"""
     Return the number of GPUs available.
 
@@ -1239,6 +1368,7 @@ def device_count() -> int:
 
 
 def get_arch_list() -> list[str]:
+    # [FUNCTION DOC] Return the list of architecture strings this build was compiled for (empty if no CUDA or none reported).
     r"""Return list CUDA architectures this library was compiled for."""
     if not _is_compiled():
         return []
@@ -1249,6 +1379,7 @@ def get_arch_list() -> list[str]:
 
 
 def get_gencode_flags() -> str:
+    # [FUNCTION DOC] Return the NVCC gencode flag string for each compiled architecture, or an empty string if none.
     r"""Return NVCC gencode flags this library was compiled with."""
     arch_list = get_arch_list()
     if len(arch_list) == 0:
@@ -1263,12 +1394,14 @@ def get_gencode_flags() -> str:
 
 
 def current_device() -> int:
+    # [FUNCTION DOC] Initialize CUDA lazily and return the index of the current device.
     r"""Return the index of a currently selected device."""
     _lazy_init()
     return torch._C._cuda_getDevice()
 
 
 def synchronize(device: Device = None) -> None:
+    # [FUNCTION DOC] Block until all kernels in all streams on the device (current if None) finish. Initializes CUDA lazily.
     r"""Wait for all kernels in all streams on a CUDA device to complete.
 
     Args:
@@ -1282,6 +1415,7 @@ def synchronize(device: Device = None) -> None:
 
 
 def ipc_collect():
+    # [FUNCTION DOC] Force-collect GPU memory released through CUDA IPC (closes unused shared reference-counting files) via the native call.
     r"""Force collects GPU memory after it has been released by CUDA IPC.
 
     .. note::
@@ -1295,6 +1429,7 @@ def ipc_collect():
 
 
 def current_stream(device: Device = None) -> Stream:
+    # [FUNCTION DOC] Return a Stream object for the current stream of the device (current device if None).
     r"""Return the currently selected :class:`Stream` for a given device.
 
     Args:
@@ -1313,6 +1448,7 @@ def current_stream(device: Device = None) -> Stream:
 
 
 def default_stream(device: Device = None) -> Stream:
+    # [FUNCTION DOC] Return a Stream object for the default stream of the device (current device if None).
     r"""Return the default :class:`Stream` for a given device.
 
     Args:
@@ -1331,6 +1467,8 @@ def default_stream(device: Device = None) -> Stream:
 
 
 def get_stream_from_external(data_ptr: int, device: Device = None) -> Stream:
+    # [FUNCTION DOC] Wrap an externally created CUDA stream (given as an integer pointer) in a Stream object for the device.
+    # Does not own or keep the stream alive; the caller must.
     r"""Return a :class:`Stream` from an externally allocated CUDA stream.
 
     This function is used to wrap streams allocated in other libraries in order
@@ -1357,18 +1495,22 @@ def get_stream_from_external(data_ptr: int, device: Device = None) -> Stream:
 
 
 def current_blas_handle():
+    # [FUNCTION DOC] Initialize CUDA and return the pointer to the current cuBLAS handle.
     r"""Return cublasHandle_t pointer to current cuBLAS handle"""
     _lazy_init()
     return torch._C._cuda_getCurrentBlasHandle()
 
 
 def current_solver_handle():
+    # [FUNCTION DOC] Initialize CUDA and return the pointer to the current cuSOLVER dense handle.
     r"""Return cusolverDnHandle_t pointer to current cuSOLVER handle"""
     _lazy_init()
     return torch._C._cuda_getCurrentSolverHandle()
 
 
 def set_sync_debug_mode(debug_mode: int | str) -> None:
+    # [FUNCTION DOC] Set the sync debug mode (0 or default: nothing, 1 or warn: warn, 2 or error: raise) for synchronizing operations.
+    # Raises RuntimeError for an unrecognized string. Initializes CUDA lazily.
     r"""Set the debug mode for cuda synchronizing operations.
 
     Args:
@@ -1396,12 +1538,15 @@ def set_sync_debug_mode(debug_mode: int | str) -> None:
 
 
 def get_sync_debug_mode() -> int:
+    # [FUNCTION DOC] Return the current sync debug mode integer.
     r"""Return current value of debug mode for cuda synchronizing operations."""
     _lazy_init()
     return torch._C._cuda_get_sync_debug_mode()
 
 
 def _get_pynvml_handler(device: Device = None):
+    # [FUNCTION DOC] HELPER: Initialize NVML through pynvml and return the handle for the device (current if None). Raises ModuleNotFoundError
+    # if pynvml is missing, RuntimeError if the driver is not loaded or the device is invisible.
     if not _HAS_PYNVML:
         raise ModuleNotFoundError(
             "nvidia-ml-py does not seem to be installed or it can't be imported."
@@ -1421,6 +1566,8 @@ def _get_pynvml_handler(device: Device = None):
 
 
 def _get_amdsmi_handler(device: Device = None):
+    # [FUNCTION DOC] HELPER: Initialize amdsmi and return the processor handle for the device (current if None). Raises ModuleNotFoundError if
+    # amdsmi is missing and RuntimeError if the driver cannot be loaded.
     if not _HAS_AMDSMI:
         raise ModuleNotFoundError(
             "amdsmi does not seem to be installed or it can't be imported."
@@ -1440,6 +1587,9 @@ _cached_hip_to_amdsmi: dict[int, int] | None = None
 
 
 def _get_amdsmi_device_index_from_hip_index(device: int) -> int:
+    # [FUNCTION DOC] HELPER: Translate a HIP device id to an amdsmi index using a lazily built cached mapping from the enumeration info.
+    # Warns when the mapping is unavailable (older ROCm with several devices) or the id is absent, then returns the id unchanged.
+    # Assumes amdsmi is already initialized.
     r"""Return amdsmi index from HIP device index. They are not always the same.
 
     Assume amdsmi_init() already completes successfully."""
@@ -1448,6 +1598,7 @@ def _get_amdsmi_device_index_from_hip_index(device: int) -> int:
         amdsmi_handles = amdsmi.amdsmi_get_processor_handles()
 
         def gen():
+        # [FUNCTION DOC] HELPER: Generator yielding pairs of HIP id and amdsmi index for handles that report a HIP id.
             for amdsmi_idx, handle in enumerate(amdsmi_handles):
                 info = amdsmi.amdsmi_get_gpu_enumeration_info(handle)
                 if "hip_id" in info:
@@ -1474,6 +1625,8 @@ def _get_amdsmi_device_index_from_hip_index(device: int) -> int:
 
 
 def _get_amdsmi_device_index(device: Device) -> int:
+    # [FUNCTION DOC] HELPER: Map a logical device to its amdsmi index honoring visible-device settings (UUIDs map directly to ordinals,
+    # ordinal lists go through the HIP-to-amdsmi translation). Raises RuntimeError if UUIDs are unavailable or the device is not visible.
     r"""Return the amdsmi index of the device, taking visible_devices into account."""
     idx = _get_device_index(device, optional=True)
     visible_devices = _parse_visible_devices()
@@ -1498,6 +1651,7 @@ def _get_amdsmi_device_index(device: Device) -> int:
 
 
 def _get_amdsmi_device_memory_used(device: Device = None) -> int:
+    # [FUNCTION DOC] HELPER: Used VRAM in bytes for the device via amdsmi (reported in megabytes, converted).
     handle = _get_amdsmi_handler(device)
     # amdsmi_get_gpu_vram_usage returns mem usage in megabytes
     mem_mega_bytes = amdsmi.amdsmi_get_gpu_vram_usage(handle)["vram_used"]
@@ -1506,16 +1660,19 @@ def _get_amdsmi_device_memory_used(device: Device = None) -> int:
 
 
 def _get_amdsmi_memory_usage(device: Device = None) -> int:
+    # [FUNCTION DOC] HELPER: Memory controller activity percentage for the device via amdsmi.
     handle = _get_amdsmi_handler(device)
     return amdsmi.amdsmi_get_gpu_activity(handle)["umc_activity"]
 
 
 def _get_amdsmi_utilization(device: Device = None) -> int:
+    # [FUNCTION DOC] HELPER: Graphics activity percentage for the device via amdsmi.
     handle = _get_amdsmi_handler(device)
     return amdsmi.amdsmi_get_gpu_activity(handle)["gfx_activity"]
 
 
 def _get_amdsmi_temperature(device: Device = None) -> int:
+    # [FUNCTION DOC] HELPER: Current junction temperature of the device via amdsmi.
     handle = _get_amdsmi_handler(device)
     return amdsmi.amdsmi_get_temp_metric(
         handle,
@@ -1525,6 +1682,7 @@ def _get_amdsmi_temperature(device: Device = None) -> int:
 
 
 def _get_amdsmi_power_draw(device: Device = None) -> int:
+    # [FUNCTION DOC] HELPER: Average socket power via amdsmi, falling back to current socket power, then 0 if both are reported unavailable.
     handle = _get_amdsmi_handler(device)
     socket_power = amdsmi.amdsmi_get_power_info(handle)["average_socket_power"]
     if socket_power != "N/A":
@@ -1538,6 +1696,7 @@ def _get_amdsmi_power_draw(device: Device = None) -> int:
 
 
 def _get_amdsmi_clock_rate(device: Device = None) -> int:
+    # [FUNCTION DOC] HELPER: Current graphics clock via amdsmi (handles the older and newer key names); 0 if reported unavailable.
     handle = _get_amdsmi_handler(device)
     clock_info = amdsmi.amdsmi_get_clock_info(handle, amdsmi.AmdSmiClkType.GFX)
     if "cur_clk" in clock_info:  # ROCm 6.2 deprecation
@@ -1551,6 +1710,8 @@ def _get_amdsmi_clock_rate(device: Device = None) -> int:
 
 
 def device_memory_used(device: Device = None) -> int:
+    # [FUNCTION DOC] Return used device memory in bytes from NVML (or amdsmi on ROCm) for the device (current if None).
+    # Raises ModuleNotFoundError if the monitoring library is missing.
     r"""Return used global (device) memory in bytes as given by `nvidia-smi` or `amd-smi`.
 
     Args:
@@ -1569,6 +1730,8 @@ def device_memory_used(device: Device = None) -> int:
 
 
 def memory_usage(device: Device = None) -> int:
+    # [FUNCTION DOC] Return the percent of the last sample period in which device memory was read or written (NVML or amdsmi).
+    # KNOWN ISSUE: the NVML branch acquires a handle for the default device first, then overwrites it, so the device argument is only used for the final handle.
     r"""Return the percent of time over the past sample period during which global (device)
     memory was being read or written as given by `nvidia-smi`.
 
@@ -1590,6 +1753,7 @@ def memory_usage(device: Device = None) -> int:
 
 
 def utilization(device: Device = None) -> int:
+    # [FUNCTION DOC] Return the percent of the last sample period in which any kernel was executing on the GPU (NVML or amdsmi).
     r"""Return the percent of time over the past sample period during which one or
     more kernels was executing on the GPU as given by `nvidia-smi`.
 
@@ -1611,6 +1775,7 @@ def utilization(device: Device = None) -> int:
 
 
 def temperature(device: Device = None) -> int:
+    # [FUNCTION DOC] Return the GPU die temperature in degrees Celsius (NVML sensor 0, or amdsmi junction temperature).
     r"""Return the average temperature of the GPU sensor in Degrees C (Centigrades).
 
     The average temperature is computed based on past sample period as given by `nvidia-smi`.
@@ -1632,6 +1797,7 @@ def temperature(device: Device = None) -> int:
 
 
 def power_draw(device: Device = None) -> int:
+    # [FUNCTION DOC] Return GPU power draw in milliwatts from NVML or amdsmi on ROCm.
     r"""Return the average power draw of the GPU sensor in mW (MilliWatts)
         over the past sample period as given by `nvidia-smi` for Fermi or newer fully supported devices.
 
@@ -1651,6 +1817,7 @@ def power_draw(device: Device = None) -> int:
 
 
 def clock_rate(device: Device = None) -> int:
+    # [FUNCTION DOC] Return the SM clock in MHz from NVML or the graphics clock from amdsmi on ROCm.
     r"""Return the clock speed of the GPU SM in MHz (megahertz) over the past sample period as given by `nvidia-smi`.
 
     Args:
@@ -1669,6 +1836,7 @@ def clock_rate(device: Device = None) -> int:
 
 
 def _get_device(device: int | str | torch.device) -> torch.device:
+    # [FUNCTION DOC] HELPER: Normalize a string or integer into a torch device (integers become CUDA devices); device objects pass through.
     r"""Return the torch.device type object from the passed in device.
 
     Args:
@@ -1682,6 +1850,7 @@ def _get_device(device: int | str | torch.device) -> torch.device:
 
 
 def _get_generator(device: torch.device) -> torch._C.Generator:
+    # [FUNCTION DOC] HELPER: Return the default CUDA generator for the device (current index if the device has none).
     r"""Return the CUDA Generator object for the given device.
 
     Args:
@@ -1696,6 +1865,7 @@ def _get_generator(device: torch.device) -> torch._C.Generator:
 def _set_rng_state_offset(
     offset: int, device: int | str | torch.device = "cuda"
 ) -> None:
+    # [FUNCTION DOC] HELPER: Set the RNG state offset of the device's default generator, deferring the work until CUDA is initialized.
     r"""Set the random number generator state offset of the specified GPU.
 
     Args:
@@ -1706,6 +1876,7 @@ def _set_rng_state_offset(
     final_device = _get_device(device)
 
     def cb():
+    # [FUNCTION DOC] HELPER: Deferred callback that sets the offset on the default generator of the resolved device.
         default_generator = _get_generator(final_device)
         default_generator.set_offset(offset)
 
@@ -1713,6 +1884,7 @@ def _set_rng_state_offset(
 
 
 def _get_rng_state_offset(device: int | str | torch.device = "cuda") -> int:
+    # [FUNCTION DOC] HELPER: Return the RNG state offset of the device's default generator; eagerly initializes CUDA.
     r"""Return the random number generator state offset of the specified GPU.
 
     Args:
@@ -1741,6 +1913,7 @@ from .random import *  # noqa: F403
 
 @staticmethod  # type: ignore[misc]
 def _lazy_new(cls, *args, **kwargs):
+    # [FUNCTION DOC] HELPER: Replacement for object construction on CUDA storage classes: initializes CUDA lazily then defers to the parent new.
     _lazy_init()
     # We may need to call lazy init again if we are a forked child
     # del _CudaBase.__new__
@@ -1748,10 +1921,13 @@ def _lazy_new(cls, *args, **kwargs):
 
 
 class _CudaBase:
+    # [CLASS DOC] HELPER: Mixin for legacy CUDA storage classes: marks them as CUDA (not sparse), runs type conversion under the storage's
+    # device, and routes construction through the lazy initializer.
     is_cuda = True
     is_sparse = False
 
     def type(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Call the parent type method with the storage's device selected as current.
         # We could use a Protocol here to tell mypy that self has `get_device` method
         # but it is only available in the typing module on Python >= 3.8
         # or on typing_extensions module on Python >= 3.6
@@ -1765,149 +1941,189 @@ from torch.storage import _LegacyStorage, _warn_typed_storage_removal
 
 
 class _CudaLegacyStorage(_LegacyStorage):
+    # [CLASS DOC] HELPER: Base for legacy typed CUDA storage classes; disables from_buffer, weak pointer and shared filename constructors.
     @classmethod
     def from_buffer(cls, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Warn about typed storage removal then always raise RuntimeError (unsupported for CUDA storage).
         _warn_typed_storage_removal()
         raise RuntimeError("from_buffer: Not available for CUDA storage")
 
     @classmethod
     def _new_with_weak_ptr(cls, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Always raises RuntimeError (unsupported for CUDA storage).
         raise RuntimeError("_new_with_weak_ptr: Not available for CUDA storage")
 
     @classmethod
     def _new_shared_filename(cls, manager, obj, size, *, device=None, dtype=None):
+        # [FUNCTION DOC] HELPER: Always raises RuntimeError (unsupported for CUDA storage).
         raise RuntimeError("_new_shared_filename: Not available for CUDA storage")
 
 
 class ByteStorage(_CudaLegacyStorage):
+    # [CLASS DOC] Legacy CUDA typed storage class for uint8 elements; exposes the element type via class properties (dtype warns about typed storage removal).
     @classproperty
     def dtype(self):
+        # [FUNCTION DOC] HELPER: Class property: warn that typed storage is deprecated, then return the element dtype uint8.
         _warn_typed_storage_removal()
         return self._dtype
 
     @classproperty
     def _dtype(self):
+        # [FUNCTION DOC] HELPER: Class property returning the element dtype uint8 without warning.
         return torch.uint8
 
 
 class DoubleStorage(_CudaLegacyStorage):
+    # [CLASS DOC] Legacy CUDA typed storage class for float64 elements; exposes the element type via class properties (dtype warns about typed storage removal).
     @classproperty
     def dtype(self):
+        # [FUNCTION DOC] HELPER: Class property: warn that typed storage is deprecated, then return the element dtype float64.
         _warn_typed_storage_removal()
         return self._dtype
 
     @classproperty
     def _dtype(self):
+        # [FUNCTION DOC] HELPER: Class property returning the element dtype float64 without warning.
         return torch.double
 
 
 class FloatStorage(_CudaLegacyStorage):
+    # [CLASS DOC] Legacy CUDA typed storage class for float32 elements; exposes the element type via class properties (dtype warns about typed storage removal).
     @classproperty
     def dtype(self):
+        # [FUNCTION DOC] HELPER: Class property: warn that typed storage is deprecated, then return the element dtype float32.
         _warn_typed_storage_removal()
         return self._dtype
 
     @classproperty
     def _dtype(self):
+        # [FUNCTION DOC] HELPER: Class property returning the element dtype float32 without warning.
         return torch.float
 
 
 class HalfStorage(_CudaLegacyStorage):
+    # [CLASS DOC] Legacy CUDA typed storage class for float16 elements; exposes the element type via class properties (dtype warns about typed storage removal).
     @classproperty
     def dtype(self):
+        # [FUNCTION DOC] HELPER: Class property: warn that typed storage is deprecated, then return the element dtype float16.
         _warn_typed_storage_removal()
         return self._dtype
 
     @classproperty
     def _dtype(self):
+        # [FUNCTION DOC] HELPER: Class property returning the element dtype float16 without warning.
         return torch.half
 
 
 class LongStorage(_CudaLegacyStorage):
+    # [CLASS DOC] Legacy CUDA typed storage class for int64 elements; exposes the element type via class properties (dtype warns about typed storage removal).
     @classproperty
     def dtype(self):
+        # [FUNCTION DOC] HELPER: Class property: warn that typed storage is deprecated, then return the element dtype int64.
         _warn_typed_storage_removal()
         return self._dtype
 
     @classproperty
     def _dtype(self):
+        # [FUNCTION DOC] HELPER: Class property returning the element dtype int64 without warning.
         return torch.long
 
 
 class IntStorage(_CudaLegacyStorage):
+    # [CLASS DOC] Legacy CUDA typed storage class for int32 elements; exposes the element type via class properties (dtype warns about typed storage removal).
     @classproperty
     def dtype(self):
+        # [FUNCTION DOC] HELPER: Class property: warn that typed storage is deprecated, then return the element dtype int32.
         _warn_typed_storage_removal()
         return self._dtype
 
     @classproperty
     def _dtype(self):
+        # [FUNCTION DOC] HELPER: Class property returning the element dtype int32 without warning.
         return torch.int
 
 
 class ShortStorage(_CudaLegacyStorage):
+    # [CLASS DOC] Legacy CUDA typed storage class for int16 elements; exposes the element type via class properties (dtype warns about typed storage removal).
     @classproperty
     def dtype(self):
+        # [FUNCTION DOC] HELPER: Class property: warn that typed storage is deprecated, then return the element dtype int16.
         _warn_typed_storage_removal()
         return self._dtype
 
     @classproperty
     def _dtype(self):
+        # [FUNCTION DOC] HELPER: Class property returning the element dtype int16 without warning.
         return torch.short
 
 
 class CharStorage(_CudaLegacyStorage):
+    # [CLASS DOC] Legacy CUDA typed storage class for int8 elements; exposes the element type via class properties (dtype warns about typed storage removal).
     @classproperty
     def dtype(self):
+        # [FUNCTION DOC] HELPER: Class property: warn that typed storage is deprecated, then return the element dtype int8.
         _warn_typed_storage_removal()
         return self._dtype
 
     @classproperty
     def _dtype(self):
+        # [FUNCTION DOC] HELPER: Class property returning the element dtype int8 without warning.
         return torch.int8
 
 
 class BoolStorage(_CudaLegacyStorage):
+    # [CLASS DOC] Legacy CUDA typed storage class for bool elements; exposes the element type via class properties (dtype warns about typed storage removal).
     @classproperty
     def dtype(self):
+        # [FUNCTION DOC] HELPER: Class property: warn that typed storage is deprecated, then return the element dtype bool.
         _warn_typed_storage_removal()
         return self._dtype
 
     @classproperty
     def _dtype(self):
+        # [FUNCTION DOC] HELPER: Class property returning the element dtype bool without warning.
         return torch.bool
 
 
 class BFloat16Storage(_CudaLegacyStorage):
+    # [CLASS DOC] Legacy CUDA typed storage class for bfloat16 elements; exposes the element type via class properties (dtype warns about typed storage removal).
     @classproperty
     def dtype(self):
+        # [FUNCTION DOC] HELPER: Class property: warn that typed storage is deprecated, then return the element dtype bfloat16.
         _warn_typed_storage_removal()
         return self._dtype
 
     @classproperty
     def _dtype(self):
+        # [FUNCTION DOC] HELPER: Class property returning the element dtype bfloat16 without warning.
         return torch.bfloat16
 
 
 class ComplexDoubleStorage(_CudaLegacyStorage):
+    # [CLASS DOC] Legacy CUDA typed storage class for complex128 elements; exposes the element type via class properties (dtype warns about typed storage removal).
     @classproperty
     def dtype(self):
+        # [FUNCTION DOC] HELPER: Class property: warn that typed storage is deprecated, then return the element dtype complex128.
         _warn_typed_storage_removal()
         return self._dtype
 
     @classproperty
     def _dtype(self):
+        # [FUNCTION DOC] HELPER: Class property returning the element dtype complex128 without warning.
         return torch.cdouble
 
 
 class ComplexFloatStorage(_CudaLegacyStorage):
+    # [CLASS DOC] Legacy CUDA typed storage class for complex64 elements; exposes the element type via class properties (dtype warns about typed storage removal).
     @classproperty
     def dtype(self):
+        # [FUNCTION DOC] HELPER: Class property: warn that typed storage is deprecated, then return the element dtype complex64.
         _warn_typed_storage_removal()
         return self._dtype
 
     @classproperty
     def _dtype(self):
+        # [FUNCTION DOC] HELPER: Class property returning the element dtype complex64 without warning.
         return torch.cfloat
 
 
@@ -1929,21 +2145,27 @@ torch._storage_classes.add(ComplexFloatStorage)
 
 
 class _WrappedTritonKernel:
+    # [CLASS DOC] HELPER: Callable wrapper around a kernel function that records whether it was ever invoked (kernel_invoked), for tests.
     """Just a simple wrapper to store some metadata for testing purposes."""
 
     def __init__(self, kernel):
+        # [FUNCTION DOC] HELPER: Store the wrapped kernel and set the invoked flag to False.
         self.kernel = kernel
         self.kernel_invoked = False
 
     def __call__(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Forward all arguments to the wrapped kernel, mark it invoked, and return its result.
         res = self.kernel(*args, **kwargs)
         self.kernel_invoked = True
         return res
 
 
 def _register_triton_kernels():
+    # [FUNCTION DOC] HELPER: Queued at CUDA init: if triton is importable, register the BSR dense matmul and addmm sparse CUDA ops with the
+    # triton library registry, each wrapped to record invocation. Side effect: global operator registration.
     @_WrappedTritonKernel
     def kernel_impl(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Wrapped kernel calling the sparse BSR dense matmul with argument checks skipped.
         from torch.sparse._triton_ops import bsr_dense_mm
 
         # pyrefly: ignore [not-callable]
@@ -1951,6 +2173,7 @@ def _register_triton_kernels():
 
     @_WrappedTritonKernel
     def addmm_kernel_impl(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Wrapped kernel calling the sparse BSR dense addmm with argument checks skipped.
         from torch.sparse._triton_ops import bsr_dense_addmm
 
         return bsr_dense_addmm(*args, skip_checks=True, **kwargs)
@@ -1985,6 +2208,9 @@ def _compile_kernel(
     cuda_include_dirs: list | None = None,
     nvcc_options: list | None = None,
 ):
+    # [FUNCTION DOC] HELPER: Compile CUDA source with NVRTC (target capability defaults to the current device) and load the resulting PTX,
+    # returning the callable for the named kernel; it works on raw pointers. Extra include dirs and compiler options are optional.
+    # KNOWN ISSUE: the docstring example refers to a public compile_kernel name, but the function defined here is private.
     """
     Compiles a CUDA kernel using NVRTC and returns a callable function.
 
