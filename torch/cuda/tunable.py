@@ -1,3 +1,9 @@
+# [MODULE DOC] Python interface to the TunableOp feature (runtime selection of the fastest
+# GEMM implementation, e.g. rocblas/hipblaslt on ROCm, cuBLASLt heuristics on CUDA).
+# Thin setters/getters forward to torch._C tunableop bindings (enable, tuning, untuned
+# recording, duration/iteration limits, filename, results, validators, rotating buffer,
+# numerical tolerances), plus offline tuning helpers that read untuned CSV files, tune
+# GEMMs on one or many GPUs, and merge result files. No import-time side effects.
 r"""
 This module exposes a TunableOp interface.
 
@@ -225,16 +231,19 @@ __all__ = [
 
 
 def enable(val: bool = True) -> None:
+    # [FUNCTION DOC] Turns the TunableOp feature on or off globally (side effect on native tuning context).
     r"""This is the big on/off switch for all TunableOp implementations."""
     torch._C._cuda_tunableop_enable(val)  # type: ignore[attr-defined]
 
 
 def is_enabled() -> bool:
+    # [FUNCTION DOC] Returns whether TunableOp is enabled.
     r"""Returns whether the TunableOp feature is enabled."""
     return torch._C._cuda_tunableop_is_enabled()  # type: ignore[attr-defined]
 
 
 def tuning_enable(val: bool = True) -> None:
+    # [FUNCTION DOC] Enables or disables the tuning phase: when on, missing tuned entries are benchmarked and recorded.
     r"""Enable tuning of TunableOp implementations.
 
     When enabled, if a tuned entry isn't found, run the tuning step and record
@@ -244,11 +253,13 @@ def tuning_enable(val: bool = True) -> None:
 
 
 def tuning_is_enabled() -> bool:
+    # [FUNCTION DOC] Returns whether the tuning phase is enabled.
     r"""Returns whether TunableOp implementations can be tuned."""
     return torch._C._cuda_tunableop_tuning_is_enabled()  # type: ignore[attr-defined]
 
 
 def record_untuned_enable(val: bool = True) -> None:
+    # [FUNCTION DOC] Enables or disables writing operations lacking a tuned entry to the untuned file for offline tuning.
     r"""Enable recording untuned TunableOp operations for offline tuning.
 
     When enabled, if a tuned entry isn't found, write it to the untuned file.
@@ -257,11 +268,13 @@ def record_untuned_enable(val: bool = True) -> None:
 
 
 def record_untuned_is_enabled() -> bool:
+    # [FUNCTION DOC] Returns whether untuned operations are being recorded.
     r"""Returns whether TunableOp operations are recorded for offline tuning."""
     return torch._C._cuda_record_untuned_is_enabled()  # type: ignore[attr-defined]
 
 
 def set_max_tuning_duration(duration: int) -> None:
+    # [FUNCTION DOC] Sets the per-solution tuning time cap in milliseconds; the smaller of duration and iteration limits wins, minimum one iteration.
     r"""Set max time in milliseconds to spend tuning a given solution.
 
     If both max tuning duration and iterations are set, the smaller of the two
@@ -271,11 +284,13 @@ def set_max_tuning_duration(duration: int) -> None:
 
 
 def get_max_tuning_duration() -> int:
+    # [FUNCTION DOC] Returns the per-solution tuning time cap (milliseconds).
     r"""Get max time to spend tuning a given solution."""
     return torch._C._cuda_tunableop_get_max_tuning_duration()  # type: ignore[attr-defined]
 
 
 def set_max_tuning_iterations(iterations: int) -> None:
+    # [FUNCTION DOC] Sets the per-solution tuning iteration cap; combined with the duration cap, the smaller wins.
     r"""Set max number of iterations to spend tuning a given solution.
 
     If both max tuning duration and iterations are set, the smaller of the two
@@ -285,11 +300,13 @@ def set_max_tuning_iterations(iterations: int) -> None:
 
 
 def get_max_tuning_iterations() -> int:
+    # [FUNCTION DOC] Returns the per-solution tuning iteration cap.
     r"""Get max iterations to spend tuning a given solution."""
     return torch._C._cuda_tunableop_get_max_tuning_iterations()  # type: ignore[attr-defined]
 
 
 def set_cublaslt_requested_algo_count(count: int) -> None:
+    # [FUNCTION DOC] Sets how many cuBLASLt heuristic candidates to request on CUDA (values below 1 are clamped to 1).
     r"""Set the number of cuBLASLt heuristic algorithms to request on CUDA.
 
     Values less than 1 are clamped to 1.
@@ -298,6 +315,7 @@ def set_cublaslt_requested_algo_count(count: int) -> None:
 
 
 def get_cublaslt_requested_algo_count() -> int:
+    # [FUNCTION DOC] Returns the number of cuBLASLt heuristic candidates requested.
     r"""Get the number of cuBLASLt heuristic algorithms requested on CUDA."""
     get_count = (
         torch._C._cuda_tunableop_get_cublaslt_requested_algo_count  # type: ignore[attr-defined]
@@ -306,6 +324,7 @@ def get_cublaslt_requested_algo_count() -> int:
 
 
 def set_filename(filename: str, insert_device_ordinal: bool = False) -> None:
+    # [FUNCTION DOC] Sets the results CSV filename; optionally inserts the current device ordinal into it (one file per process/GPU).
     r"""Set the filename to use for input/output of tuning results.
 
     If :attr:`insert_device_ordinal` is ``True`` then the current device ordinal
@@ -316,21 +335,26 @@ def set_filename(filename: str, insert_device_ordinal: bool = False) -> None:
 
 
 def get_filename() -> str:
+    # [FUNCTION DOC] Returns the results filename (may be an empty string if unset).
     r"""Get the results filename."""
     return torch._C._cuda_tunableop_get_filename()  # type: ignore[attr-defined]
 
 
 def get_results() -> tuple[str, str, str, float]:
+    # [FUNCTION DOC] Returns the tuned results from the native context.
+    # KNOWN ISSUE: the annotation says one 4-tuple, but the native call likely returns a collection of (operator, params, solution, time) records.
     r"""Return all TunableOp results."""
     return torch._C._cuda_tunableop_get_results()  # type: ignore[attr-defined]
 
 
 def get_validators() -> tuple[str, str]:
+    # [FUNCTION DOC] Returns the validator entries (library/PyTorch version info) the native context checks result files against.
     r"""Return the TunableOp validators."""
     return torch._C._cuda_tunableop_get_validators()  # type: ignore[attr-defined]
 
 
 def read_file(filename: str | None = None) -> bool:
+    # [FUNCTION DOC] Loads tuned results from a CSV file (default: the configured results filename); returns success flag from the native reader.
     r"""Read results from a TunableOp CSV file.
 
     If :attr:`filename` is not given, ``get_filename()`` is called.
@@ -341,6 +365,7 @@ def read_file(filename: str | None = None) -> bool:
 
 
 def set_rotating_buffer_size(buffer_size: int) -> None:
+    # [FUNCTION DOC] Sets the rotating input buffer size in MB: positive sets it, negative uses the L2 cache size, zero disables rotation.
     r"""Set rotating buffer size to this value in MB, if the buffer size is greater than zero.
 
     If less than zero, query L2 cache size. If equal to zero, means deactivate rotating buffer.
@@ -349,6 +374,8 @@ def set_rotating_buffer_size(buffer_size: int) -> None:
 
 
 def get_rotating_buffer_size() -> int:
+    # [FUNCTION DOC] Returns the rotating buffer size.
+    # KNOWN ISSUE: docstring says kilobytes while the setter takes megabytes; unit is unverified here.
     r"""Get the rotating buffer size in kilobytes."""
     return torch._C._cuda_tunableop_get_rotating_buffer_size()  # type: ignore[attr-defined]
 
@@ -356,11 +383,14 @@ def get_rotating_buffer_size() -> int:
 def set_numerical_check_tolerances(
     enable: bool, atol: float = 1e-5, rtol: float = 1e-5
 ) -> None:
+    # [FUNCTION DOC] Enables or disables the numerical accuracy check of candidate solutions and sets absolute/relative tolerances (default 1e-5 each).
     r"""Set the atol and rtol values in numeric check"""
     return torch._C._cuda_tunableop_set_numerical_check_tolerances(enable, atol, rtol)  # type: ignore[attr-defined]
 
 
 def tune_gemm_in_file(filename: str) -> None:
+    # [FUNCTION DOC] Offline tunes each GEMM line (names starting with Gemm or ScaledGemm) of an untuned CSV on the
+    # current device. Raises AssertionError if TunableOp or tuning is not enabled. Results go to the tuning context.
     r"""tune GEMM in file."""
 
     if not is_enabled():
@@ -377,6 +407,7 @@ def tune_gemm_in_file(filename: str) -> None:
 
 
 def _gather_unique_untuned_gemm_from_files(filename_pattern: str) -> set[str]:
+    # [FUNCTION DOC] HELPER: reads all files matching the glob pattern and returns the set of distinct GEMM lines.
     r"""Process multiple untuned results file and return a set with duplicates removed."""
     unique_gemm_entries = set()  # set will avoid duplicates
 
@@ -390,6 +421,10 @@ def _gather_unique_untuned_gemm_from_files(filename_pattern: str) -> set[str]:
 
 
 def _gather_tunableop_results() -> None:
+    # [FUNCTION DOC] HELPER: merges per-GPU results files into one file whose name has the device digit replaced by
+    # "_full0". Derives the glob pattern from the configured filename or the env variable (default pattern for
+    # tunableop_results); raises AssertionError if the pattern has no wildcard. Validator lines are taken from the
+    # first file only; all other lines are deduplicated. Writes the output file.
     r"""Gather results from multiple tunableop results file and create a single file."""
     gemm_lines = set()
     validator_lines = []
@@ -470,6 +505,11 @@ def _create_matrices(
     randn: bool = True,
     subMatrix: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] HELPER: builds the two GEMM operand matrices (A: m by k, B: k by n, transposed views when
+    # transA/transB) on the device, as random values or constant fills (0.25 / 0.75). dtypeB defaults to dtypeA.
+    # With subMatrix, allocates larger buffers using the leading dimensions and returns slices of them.
+    # KNOWN ISSUE: in the subMatrix random path, matrix B uses dtypeA rather than dtypeB; the constant path uses
+    # dtypeB for both matrices.
     r"""Helper function for _process_single_offline_gemm.
     Creates matrices that are then consumed by one of the Torch GEMM APIs.
     """
@@ -538,6 +578,8 @@ def _create_batch_matrices(
     deviceid: str,
     subMatrix: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] HELPER: batched (3D) analogue of _create_matrices with batch size b; random values only,
+    # same dtype for both operands; subMatrix returns slices of larger buffers sized by leading dimensions.
     r"""Helper function for _process_single_offline_gemm.
     Creates batch matrices that are then consumed by one of the Torch GEMM APIs.
     Similar to _create_matrices but for 3D batch matrices.
@@ -573,6 +615,12 @@ def _create_batch_matrices(
 
 
 def _process_single_offline_gemm(untuned_gemm_line: str, gpu_id: int) -> None:
+    # [FUNCTION DOC] HELPER: parses one untuned CSV line (operator signature with dtype/layout, then shape and
+    # leading-dimension fields), selects the cuda device gpu_id, builds matching operands and runs one matching
+    # torch call (matmul, batched matmul, scaled matmul with optional rowwise scales and bias, or linear with bias)
+    # so TunableOp tunes it. Side effects: sets the current device and the global tf32 matmul flag. Unsupported
+    # degenerate shapes (a dimension of 1) warn and return; unknown operators warn. Raises AssertionError on
+    # malformed fields and TypeError if the data type is unknown.
     r"""Process a single untuned GEMM."""
 
     deviceid = "cuda:" + str(gpu_id)
@@ -816,6 +864,7 @@ def _process_single_offline_gemm(untuned_gemm_line: str, gpu_id: int) -> None:
 
 
 def _process_offline_gemms(untuned_gemm_lines: list[str], gpu_id: int) -> None:
+    # [FUNCTION DOC] HELPER: worker entry point; validates tuning settings, then tunes each GEMM line on gpu_id.
     r"""Process multiple untuned GEMMs on a single GPU."""
     _check_tuning_assertions()
     for line in untuned_gemm_lines:
@@ -823,6 +872,8 @@ def _process_offline_gemms(untuned_gemm_lines: list[str], gpu_id: int) -> None:
 
 
 def _check_tuning_assertions() -> None:
+    # [FUNCTION DOC] HELPER: ensures TunableOp is enabled (warns and enables it if off), tuning is enabled, and
+    # untuned recording is off; raises AssertionError otherwise.
     r"""Helper function for multi-GPU tuning case. Need to check that TunableOp feature
     is enabled and that tuning is enabled.
     """
@@ -839,6 +890,10 @@ def _check_tuning_assertions() -> None:
 
 
 def mgpu_tune_gemm_in_file(filename_pattern: str, num_gpus: int) -> None:
+    # [FUNCTION DOC] Gathers unique untuned GEMM lines from files matching the wildcard pattern, spreads them
+    # round-robin over num_gpus spawned processes (one GPU each), waits for all, then synchronizes and merges
+    # the per-GPU results into a combined file copied once per GPU. Raises AssertionError if num_gpus is outside
+    # 1..device count, and RuntimeError listing failed processes. Must be called under a main guard.
     r"""Process one or more files and distribute work over one or more GPUs."""
     unique_gemm_entries = _gather_unique_untuned_gemm_from_files(filename_pattern)
 

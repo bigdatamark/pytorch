@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] CUDA random number generator control: get/set RNG state per device,
+# seed the current or all GPUs (manually or randomly), and query the initial seed.
+# Setters are deferred through the lazy-call queue so they are safe before CUDA
+# initializes. Operates on torch.cuda.default_generators.
 from collections.abc import Iterable
 
 import torch
@@ -21,6 +25,8 @@ __all__ = [
 
 
 def get_rng_state(device: int | str | torch.device = "cuda") -> Tensor:
+    # [FUNCTION DOC] Returns the RNG state (byte tensor) of the given device (string, int
+    # index, or device; a missing index means the current device). Eagerly initializes CUDA.
     r"""Return the random number generator state of the specified GPU as a ByteTensor.
 
     Args:
@@ -43,12 +49,17 @@ def get_rng_state(device: int | str | torch.device = "cuda") -> Tensor:
 
 
 def get_rng_state_all() -> list[Tensor]:
+    # [FUNCTION DOC] Returns a list of RNG state tensors, one per visible CUDA device, in index order.
     r"""Return a list of ByteTensor representing the random number states of all devices."""
     results = [get_rng_state(i) for i in range(device_count())]
     return results
 
 
 def set_rng_state(new_state: Tensor, device: int | str | torch.device = "cuda") -> None:
+    # [FUNCTION DOC] Sets the RNG state of a device (missing index means the current
+    # device at callback time). If CUDA is not yet initialized the state is cloned first
+    # so later mutation by the caller cannot affect it; the actual set is queued via a
+    # lazy call and runs on initialization (or immediately if already initialized).
     r"""Set the random number generator state of the specified GPU.
 
     Args:
@@ -67,6 +78,7 @@ def set_rng_state(new_state: Tensor, device: int | str | torch.device = "cuda") 
         device = torch.device("cuda", device)
 
     def cb():
+        # [FUNCTION DOC] HELPER: lazy callback applying the saved state to the target device's default generator.
         idx = device.index
         if idx is None:
             idx = current_device()
@@ -77,6 +89,7 @@ def set_rng_state(new_state: Tensor, device: int | str | torch.device = "cuda") 
 
 
 def set_rng_state_all(new_states: Iterable[Tensor]) -> None:
+    # [FUNCTION DOC] Sets the RNG state of device i to the i-th entry of new_states, for each entry.
     r"""Set the random number generator state of all devices.
 
     Args:
@@ -87,6 +100,8 @@ def set_rng_state_all(new_states: Iterable[Tensor]) -> None:
 
 
 def manual_seed(seed: int) -> None:
+    # [FUNCTION DOC] Seeds the current GPU's generator with the integer seed. Deferred
+    # via lazy call (flagged as a seed call), so silently harmless without CUDA.
     r"""Set the seed for generating random numbers for the current GPU.
 
     It's safe to call this function if CUDA is not available; in that
@@ -102,6 +117,7 @@ def manual_seed(seed: int) -> None:
     seed = int(seed)
 
     def cb():
+        # [FUNCTION DOC] HELPER: lazy callback seeding the current device's generator.
         idx = current_device()
         default_generator = torch.cuda.default_generators[idx]
         default_generator.manual_seed(seed)
@@ -110,6 +126,7 @@ def manual_seed(seed: int) -> None:
 
 
 def manual_seed_all(seed: int) -> None:
+    # [FUNCTION DOC] Seeds every GPU's generator with the same integer seed, deferred via lazy call.
     r"""Set the seed for generating random numbers on all GPUs.
 
     It's safe to call this function if CUDA is not available; in that
@@ -121,6 +138,7 @@ def manual_seed_all(seed: int) -> None:
     seed = int(seed)
 
     def cb():
+        # [FUNCTION DOC] HELPER: lazy callback seeding all devices' generators.
         for i in range(device_count()):
             default_generator = torch.cuda.default_generators[i]
             default_generator.manual_seed(seed)
@@ -129,6 +147,7 @@ def manual_seed_all(seed: int) -> None:
 
 
 def seed() -> None:
+    # [FUNCTION DOC] Seeds the current GPU's generator with a random seed, deferred via lazy call.
     r"""Set the seed for generating random numbers to a random number for the current GPU.
 
     It's safe to call this function if CUDA is not available; in that
@@ -140,6 +159,7 @@ def seed() -> None:
     """
 
     def cb():
+        # [FUNCTION DOC] HELPER: lazy callback randomly seeding the current device's generator.
         idx = current_device()
         default_generator = torch.cuda.default_generators[idx]
         default_generator.seed()
@@ -148,6 +168,8 @@ def seed() -> None:
 
 
 def seed_all() -> None:
+    # [FUNCTION DOC] Seeds all GPUs with one shared random seed (first device draws it,
+    # the rest are manually seeded with its initial seed), deferred via lazy call.
     r"""Set the seed for generating random numbers to a random number on all GPUs.
 
     It's safe to call this function if CUDA is not available; in that
@@ -155,6 +177,7 @@ def seed_all() -> None:
     """
 
     def cb():
+        # [FUNCTION DOC] HELPER: lazy callback; seeds first device randomly, then copies its seed to the others.
         random_seed = 0
         seeded = False
         for i in range(device_count()):
@@ -170,6 +193,7 @@ def seed_all() -> None:
 
 
 def initial_seed() -> int:
+    # [FUNCTION DOC] Returns the initial seed of the current GPU's generator; eagerly initializes CUDA.
     r"""Return the current random seed of the current GPU.
 
     .. warning::

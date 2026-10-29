@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] CUDA profiler control: start/stop collection through the CUDA runtime
+# and a profile context manager. Also defines DEFAULT_FLAGS, a list of legacy
+# profiler option strings (not used within this module).
 import contextlib
 
 from . import check_error, cudart
@@ -18,6 +21,7 @@ DEFAULT_FLAGS = [
 
 
 def start():
+    # [FUNCTION DOC] Starts CUDA profiler collection via the runtime; check_error raises on failure.
     r"""Starts cuda profiler data collection.
 
     .. warning::
@@ -27,6 +31,7 @@ def start():
 
 
 def stop():
+    # [FUNCTION DOC] Stops CUDA profiler collection via the runtime; check_error raises on failure.
     r"""Stops cuda profiler data collection.
 
     .. warning::
@@ -37,6 +42,7 @@ def stop():
 
 @contextlib.contextmanager
 def profile():
+    # [FUNCTION DOC] Context manager that starts profiling on entry and always stops it on exit.
     """
     Enable profiling.
 

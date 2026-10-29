@@ -1,5 +1,9 @@
 # mypy: allow-untyped-defs
 # pylint: disable=useless-parent-delegation
+# [MODULE DOC] Python wrappers for CUDA streams (Stream, ExternalStream) and events
+# (Event) built on the C extension base classes. Import-time side effect: if the
+# C extension lacks CUDA stream/event bases, dummy placeholder base classes are
+# registered in torch._C so this module still imports.
 from __future__ import annotations
 
 import ctypes
@@ -15,6 +19,10 @@ if not hasattr(torch._C, "_CudaStreamBase"):
 
 
 class Stream(torch._C._CudaStreamBase):
+    # [CLASS DOC] Wrapper around a CUDA stream (an ordered work queue on one device) with an
+    # optional priority; usable as a context manager. Provides event/stream waiting,
+    # event recording, query and synchronize, equality/hash by (handle, device), and the
+    # CUDA stream protocol (version 0 plus raw handle).
     r"""Wrapper around a CUDA stream.
 
     A CUDA stream is a linear sequence of execution that belongs to a specific
@@ -35,6 +43,9 @@ class Stream(torch._C._CudaStreamBase):
     """
 
     def __new__(cls, device=None, priority=0, **kwargs):
+        # [FUNCTION DOC] Creates a stream on the given device (default current) with the
+        # given priority. Raises RuntimeError if PyTorch is built without CUDA. Switches
+        # device context only when needed (not when wrapping an existing stream id and device index).
         # Check CUDA availability
         if not torch.backends.cuda.is_built():
             raise RuntimeError("torch.cuda.Stream requires CUDA support")
@@ -46,6 +57,7 @@ class Stream(torch._C._CudaStreamBase):
                 return super().__new__(cls, priority=priority, **kwargs)
 
     def wait_event(self, event: Event | torch.Event) -> None:
+        # [FUNCTION DOC] Makes future work on this stream wait for the event; returns immediately.
         r"""Make all future work submitted to the stream wait for an event.
 
         Args:
@@ -63,6 +75,8 @@ class Stream(torch._C._CudaStreamBase):
         event.wait(self)
 
     def wait_stream(self, stream: Stream | torch.Stream) -> None:
+        # [FUNCTION DOC] Makes future work on this stream wait for everything currently
+        # queued on the other stream, by recording an event there and waiting on it.
         r"""Synchronize with another stream.
 
         All future work submitted to this stream will wait until all kernels
@@ -77,6 +91,8 @@ class Stream(torch._C._CudaStreamBase):
         self.wait_event(stream.record_event())
 
     def record_event(self, event: Event | torch.Event | None = None):
+        # [FUNCTION DOC] Records an event on this stream (allocating a new Event if none is
+        # given) and returns it.
         r"""Record an event.
 
         Args:
@@ -92,6 +108,7 @@ class Stream(torch._C._CudaStreamBase):
         return event
 
     def query(self) -> bool:
+        # [FUNCTION DOC] Returns True if all work submitted to the stream has completed.
         r"""Check if all the work submitted has been completed.
 
         Returns:
@@ -100,6 +117,7 @@ class Stream(torch._C._CudaStreamBase):
         return super().query()
 
     def synchronize(self) -> None:
+        # [FUNCTION DOC] Blocks the host until all work on this stream completes.
         r"""Wait for all the kernels in this stream to complete.
 
         .. note:: This is a wrapper around ``cudaStreamSynchronize()``: see
@@ -109,20 +127,25 @@ class Stream(torch._C._CudaStreamBase):
 
     @property
     def _as_parameter_(self):
+        # [FUNCTION DOC] HELPER: property giving the raw stream handle as a ctypes void pointer for foreign calls.
         return ctypes.c_void_p(self.cuda_stream)
 
     def __eq__(self, o) -> bool:
+        # [FUNCTION DOC] Equal only to another cuda Stream with the same underlying stream; False for other types.
         if isinstance(o, Stream):
             return super().__eq__(o)
         return False
 
     def __hash__(self):
+        # [FUNCTION DOC] Hash of the pair (raw stream handle, device).
         return hash((self.cuda_stream, self.device))
 
     def __repr__(self):
+        # [FUNCTION DOC] Returns a string showing the device and the stream handle in hex.
         return f"<torch.cuda.Stream device={self.device} cuda_stream={self.cuda_stream:#x}>"
 
     def __cuda_stream__(self):
+        # [FUNCTION DOC] CUDA stream protocol: returns the pair (protocol version 0, raw stream handle as int).
         """Implements the CUDA Stream Protocol:
         https://nvidia.github.io/cuda-python/cuda-core/latest/interoperability.html#cuda-stream-protocol
 
@@ -134,6 +157,8 @@ class Stream(torch._C._CudaStreamBase):
 
 
 class ExternalStream(Stream):
+    # [CLASS DOC] Stream wrapping a CUDA stream allocated elsewhere, identified by its raw
+    # pointer. Does not own the stream: the caller must keep it alive.
     r"""Wrapper around an externally allocated CUDA stream.
 
     This class is used to wrap streams allocated in other libraries in order
@@ -152,11 +177,16 @@ class ExternalStream(Stream):
     """
 
     def __new__(cls, stream_ptr, device=None, **kwargs):
+        # [FUNCTION DOC] Wraps the external stream pointer under the given device context
+        # (wrong device may break later launches).
         with torch.cuda.device(device):
             return super().__new__(cls, stream_ptr=stream_ptr, **kwargs)
 
 
 class Event(torch._C._CudaEventBase):
+    # [CLASS DOC] Wrapper around a CUDA event: a synchronization/timing marker. Lazily
+    # initialized on first record or IPC export; recorded only by streams of its device,
+    # waitable from any device. Flags: enable_timing, blocking, interprocess, external.
     r"""Wrapper around a CUDA event.
 
     CUDA events are synchronization markers that can be used to monitor the
@@ -183,6 +213,7 @@ class Event(torch._C._CudaEventBase):
     def __new__(
         cls, enable_timing=False, blocking=False, interprocess=False, external=False
     ):
+        # [FUNCTION DOC] Creates an event with the given timing/blocking/interprocess/external flags.
         return super().__new__(
             cls,
             enable_timing=enable_timing,
@@ -193,10 +224,12 @@ class Event(torch._C._CudaEventBase):
 
     @classmethod
     def from_ipc_handle(cls, device, handle):
+        # [FUNCTION DOC] Class method: rebuilds an event from an IPC handle on the given device.
         r"""Reconstruct an event from an IPC handle on the given device."""
         return super().from_ipc_handle(device, handle)
 
     def record(self, stream: Stream | torch.Stream | None = None):
+        # [FUNCTION DOC] Records the event on the given stream (default current stream); stream device must match the event's.
         r"""Record the event in a given stream.
 
         Args:
@@ -209,6 +242,7 @@ class Event(torch._C._CudaEventBase):
         super().record(stream)
 
     def wait(self, stream: Stream | torch.Stream | None = None) -> None:
+        # [FUNCTION DOC] Makes future work on the stream (default current) wait for this event; non-blocking for the host.
         r"""Make all future work submitted to the given stream wait for this event.
 
         Args:
@@ -223,6 +257,7 @@ class Event(torch._C._CudaEventBase):
         super().wait(stream)
 
     def query(self):
+        # [FUNCTION DOC] Returns True if all work captured by the event has completed.
         r"""Check if all work currently captured by event has completed.
 
         Returns:
@@ -232,6 +267,7 @@ class Event(torch._C._CudaEventBase):
         return super().query()
 
     def elapsed_time(self, end_event: Event):
+        # [FUNCTION DOC] Returns milliseconds between this event and end_event (both must be recorded, timing enabled).
         r"""Return the time elapsed.
 
         Time reported in milliseconds after the event was recorded and
@@ -243,6 +279,7 @@ class Event(torch._C._CudaEventBase):
         return super().elapsed_time(end_event)
 
     def synchronize(self) -> None:
+        # [FUNCTION DOC] Blocks the host thread until the event completes.
         r"""Wait for the event to complete.
 
         Waits until the completion of all work currently captured in this event.
@@ -254,6 +291,7 @@ class Event(torch._C._CudaEventBase):
         super().synchronize()
 
     def ipc_handle(self):
+        # [FUNCTION DOC] Returns an IPC handle for sharing the event across processes (uses current device if unrecorded).
         r"""Return an IPC handle of this event.
 
         If not recorded yet, the event will use the current device.
@@ -262,9 +300,11 @@ class Event(torch._C._CudaEventBase):
 
     @property
     def _as_parameter_(self):
+        # [FUNCTION DOC] HELPER: property giving the raw event handle as a ctypes void pointer.
         return ctypes.c_void_p(self.cuda_event)
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Returns a string with the event handle in hex, or marks it uninitialized if no handle exists.
         if self.cuda_event:
             return f"<torch.cuda.Event {self._as_parameter_.value:#x}>"
         else:

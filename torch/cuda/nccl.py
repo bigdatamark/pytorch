@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Python wrappers over the NCCL collective bindings in torch._C for
+# multi-GPU single-process use (all_reduce, reduce, broadcast, all_gather,
+# reduce_scatter), plus NCCL version/unique-id/rank-init helpers. Each
+# collective validates that its inputs are tensor collections, then delegates to
+# the C extension. SUM is the default reduction op code. No import-time side effects.
 import collections
 import warnings
 from collections.abc import Sequence
@@ -12,6 +17,9 @@ SUM = 0  # ncclRedOp_t
 
 
 def is_available(tensors):
+    # [FUNCTION DOC] Returns True if NCCL can operate on the given tensors: NCCL support
+    # must be compiled in (otherwise warns and returns False), and every tensor must be
+    # dense, contiguous, on a CUDA device, with no two tensors on the same device.
     if not hasattr(torch._C, "_nccl_all_reduce"):
         warnings.warn("PyTorch is not compiled with NCCL support", stacklevel=2)
         return False
@@ -33,6 +41,9 @@ def is_available(tensors):
 
 
 def version():
+    # [FUNCTION DOC] Decodes the packed NCCL version integer into major, minor, patch
+    # and returns them as a tuple, with the version suffix string appended as a fourth
+    # element only when the suffix is non-empty.
     """
     Returns the version of the NCCL.
 
@@ -54,14 +65,19 @@ def version():
 
 
 def unique_id():
+    # [FUNCTION DOC] Returns a new NCCL unique id (opaque bytes) used to bootstrap a communicator.
     return torch._C._nccl_unique_id()
 
 
 def init_rank(num_ranks, uid, rank):
+    # [FUNCTION DOC] Creates and returns an NCCL communicator for the given rank in a
+    # group of num_ranks, using the shared unique id uid.
     return torch._C._nccl_init_rank(num_ranks, uid, rank)
 
 
 def _check_sequence_type(inputs: torch.Tensor | Sequence[torch.Tensor]) -> None:
+    # [FUNCTION DOC] HELPER: raises TypeError unless the argument is a container that is
+    # not itself a single tensor.
     if not isinstance(inputs, collections.abc.Container) or isinstance(
         inputs, torch.Tensor
     ):
@@ -69,6 +85,9 @@ def _check_sequence_type(inputs: torch.Tensor | Sequence[torch.Tensor]) -> None:
 
 
 def all_reduce(inputs, outputs=None, op=SUM, streams=None, comms=None):
+    # [FUNCTION DOC] In-place-capable all-reduce across the per-device tensors in inputs.
+    # Results go to outputs (defaults to inputs, i.e. in place). Both must be tensor
+    # collections, else TypeError. op is the reduction code; streams/comms optional.
     _check_sequence_type(inputs)
     if outputs is None:
         outputs = inputs
@@ -88,6 +107,11 @@ def reduce(
     *,
     outputs: Sequence[torch.Tensor] | None = None,
 ) -> None:
+    # [FUNCTION DOC] Reduces the per-device input tensors onto the root device's tensor.
+    # The destination is output (a single tensor); if omitted it is the root's input
+    # (in place). Deprecated list forms (keyword outputs, or a sequence passed as output)
+    # emit FutureWarning and select the root's entry. Passing both output and outputs
+    # raises ValueError; non-collection inputs raise TypeError.
     _check_sequence_type(inputs)
     _output: torch.Tensor
     if outputs is not None:
@@ -124,6 +148,8 @@ def reduce(
 def broadcast(
     inputs: Sequence[torch.Tensor], root: int = 0, streams=None, comms=None
 ) -> None:
+    # [FUNCTION DOC] Broadcasts the root device's tensor in inputs to the other tensors
+    # in place. Raises TypeError if inputs is not a tensor collection.
     _check_sequence_type(inputs)
     torch._C._nccl_broadcast(inputs, root, streams, comms)
 
@@ -134,6 +160,8 @@ def all_gather(
     streams=None,
     comms=None,
 ) -> None:
+    # [FUNCTION DOC] Gathers each device's input tensor into every device's output tensor.
+    # Both arguments must be tensor collections, else TypeError.
     _check_sequence_type(inputs)
     _check_sequence_type(outputs)
     torch._C._nccl_all_gather(inputs, outputs, streams, comms)
@@ -146,6 +174,8 @@ def reduce_scatter(
     streams=None,
     comms=None,
 ) -> None:
+    # [FUNCTION DOC] Reduces inputs across devices with op and scatters one shard of the
+    # result to each device's output tensor. Non-collection arguments raise TypeError.
     _check_sequence_type(inputs)
     _check_sequence_type(outputs)
     torch._C._nccl_reduce_scatter(inputs, outputs, op, streams, comms)
