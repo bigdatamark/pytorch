@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Pipeline-parallel schedule definitions for torch.distributed.pipelining.
+# Defines the action vocabulary (_ComputationType, _Action), helpers that format, parse,
+# validate and rewrite per-rank action lists (unshard/reshard, reduce-grad, send/recv insertion,
+# backward merging), the base _PipelineSchedule, single-stage-per-rank schedules (GPipe, 1F1B)
+# and multi-stage-per-rank schedules (interleaved 1F1B, looped BFS, zero-bubble, ZBV, DualPipeV),
+# plus CSV-driven custom schedules and a name-to-class lookup. Public names are listed in __all__.
+# Import time: creates a module logger, shorthand constants (F, I, W, B, ...) and a compiled regex.
 # Copyright (c) Meta Platforms, Inc. and affiliates
 
 import copy
@@ -52,6 +59,10 @@ logger = logging.getLogger(__name__)
 
 
 class _ComputationType(str, Enum):
+# [CLASS DOC] HELPER: String-valued enum naming each kind of pipeline action: forward (F), input-only
+# backward (I), weight-only backward (W), full backward (B), FSDP unshard/reshard, send/recv of
+# activations (SEND_F/RECV_F) and gradients (SEND_B/RECV_B), overlapped forward+backward, and grad reduce.
+# Values double as the short tokens used in the textual action format.
     # TODO(whc) rename to _ActType?
     FORWARD = "F"
     BACKWARD_INPUT = "I"
@@ -68,6 +79,8 @@ class _ComputationType(str, Enum):
 
     @staticmethod
     def from_str(action: str) -> "_ComputationType":
+        # [FUNCTION DOC] HELPER: Convert a token string to the enum member. Raises RuntimeError (chained from the
+        # underlying ValueError) if the string is not a valid computation type.
         try:
             return _ComputationType(action)
         except ValueError as exc:
@@ -107,15 +120,22 @@ _action_regex = re.compile(
 
 
 class _Action(NamedTuple):
+    # [CLASS DOC] HELPER: Immutable record of one scheduled step: the stage index, the computation type, an
+    # optional microbatch index, and optional sub_actions (a tuple of actions fused into one overlapped action).
+    # Its string form is compact, e.g. stage 2 forward microbatch 0, and can be parsed back with from_str.
     stage_index: int
     computation_type: _ComputationType
     microbatch_index: int | None = None
     sub_actions: tuple["_Action", ...] | None = None
 
     def __str__(self):
+        # [FUNCTION DOC] HELPER: String form; identical to the repr.
         return self.__repr__()
 
     def __repr__(self):
+        # [FUNCTION DOC] HELPER: Compact text form. With sub_actions: the sub-action reprs joined by semicolons in
+        # parentheses followed by the computation type token. Otherwise stage index, type token and, if present,
+        # the microbatch index concatenated.
         if self.sub_actions is not None:
             # Use recursive repr for sub_actions
             sub_action_reprs = [repr(sub_action) for sub_action in self.sub_actions]
@@ -130,6 +150,8 @@ class _Action(NamedTuple):
 
     @property
     def is_compute_op(self) -> bool:
+        # [FUNCTION DOC] HELPER: True if the action is a compute op (forward, full/input/weight backward, or
+        # overlapped forward-backward) as opposed to communication, FSDP or reduce actions.
         return self.computation_type in (
             FORWARD,
             FULL_BACKWARD,
@@ -140,6 +162,11 @@ class _Action(NamedTuple):
 
     @staticmethod
     def from_str(action_string: str):
+        # [FUNCTION DOC] HELPER: Parse the text form produced by repr back into an _Action. Blank input gives None.
+        # Parenthesized input is split on semicolons into recursively parsed sub_actions, producing a container
+        # action with stage index -1 and no microbatch. Otherwise the leading regex match supplies stage, type and
+        # optional microbatch. Raises RuntimeError for malformed strings or unknown types.
+        # KNOWN ISSUE: the parenthesis search uses the first closing parenthesis, so nested sub_actions are not parsed correctly.
         """
         Reverse of __repr__
 
@@ -195,6 +222,7 @@ class _Action(NamedTuple):
 
 @lru_cache
 def _get_profiler_function_name(action: _Action) -> str:
+    # [FUNCTION DOC] HELPER: Cached profiler label for an action, formatted as the prefix PP: plus the action text.
     return f"PP:{str(action)}"
 
 
@@ -202,6 +230,9 @@ def _format_pipeline_order(
     pipeline_order: dict[int, list[_Action | None]],
     error_step_number: int | None = None,
 ) -> str:
+    # [FUNCTION DOC] HELPER: Render a rank-to-actions mapping as a text grid with one row per timestep and one
+    # column per rank, padded to column width, with a header of rank labels. Works on a deep copy (None entries
+    # shown blank). If error_step_number is given, that row is suffixed with an error marker. Returns the string.
     """
     Formats the pipeline order in a timestep (row) x rank (column) grid of actions
     and returns the formatted string.
@@ -262,6 +293,11 @@ def _format_pipeline_order(
 
 
 class _PipelineSchedule(ABC):
+    # [CLASS DOC] HELPER: Abstract base for all pipeline schedules. Stores the microbatch count, optional loss
+    # function, chunk specs for args/kwargs, output merge spec, the scale_grads flag, whether a backward pass is
+    # run (true iff a loss function exists) and the per-step list of microbatch losses. Provides loss
+    # bookkeeping, P2P warm-up, stage initialization, input splitting/merging, and eval; subclasses implement
+    # step and _step_microbatches.
     def __init__(
         self,
         n_microbatches: int,
@@ -271,6 +307,9 @@ class _PipelineSchedule(ABC):
         output_merge_spec: dict[str, Any] | tuple[Any] | None = None,
         scale_grads: bool = True,
     ):
+        # [FUNCTION DOC] Store configuration (microbatch count, loss function, chunk specs, merge spec, scale_grads)
+        # and initialize the empty internal loss list. Backward is enabled only when a loss function is given.
+        # Logs the schedule class name.
         # From arguments
         self._n_microbatches = n_microbatches
         self._loss_fn = loss_fn
@@ -299,11 +338,16 @@ class _PipelineSchedule(ABC):
     def _maybe_compute_loss(
         self, stage, output, target_mbs, mb_index, loss_kwargs=None
     ):
+        # [FUNCTION DOC] HELPER: If the stage is the last one and a loss function exists, compute the loss for the
+        # given microbatch output against its target microbatch and append it to the internal loss list.
         if stage.is_last and self._loss_fn is not None:
             loss = self._compute_loss(output, target_mbs[mb_index], loss_kwargs)  # type: ignore[index]
             self._internal_losses.append(loss)
 
     def _maybe_get_loss(self, stage, mb_index):
+        # [FUNCTION DOC] HELPER: Return the stored loss for a microbatch on the last stage when a loss function
+        # exists and the index is valid. Raises RuntimeError if losses exist but the index is out of range; returns
+        # None otherwise.
         valid_index = 0 <= mb_index < len(self._internal_losses)
         if stage.is_last and self._loss_fn is not None and valid_index:
             return self._internal_losses[mb_index]
@@ -316,6 +360,9 @@ class _PipelineSchedule(ABC):
             return None
 
     def _update_losses(self, stages, losses):
+        # [FUNCTION DOC] HELPER: Copy internal losses into the caller-supplied list (cleared first) when any given
+        # stage is the last stage; stages may be a single stage or a list. Raises RuntimeError if the number of
+        # internal losses differs from the microbatch count. Always clears the internal losses at the end.
         """
         Update the losses to those in the internal state
         """
@@ -344,6 +391,11 @@ class _PipelineSchedule(ABC):
         has_backward: bool,
         p2p_done: bool,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Warm up point-to-point communication for the stages and decide each stage's inference
+        # mode. For PipelineStage instances: with cross-rank neighbours on a fake process group, set STATIC mode
+        # locally (raising RuntimeError if a stage needs dynamic inference); otherwise run a forward vote through the
+        # stages and a backward result pass in reverse, setting each stage to STATIC or DYNAMIC (RuntimeError if
+        # voting fails). For other stage types, run the legacy neighbour-init batched P2P once when p2p_done is false.
         """Run the P2P warm-up protocol for the given stages.
 
         For ``PipelineStage`` instances this executes the forward/backward vote
@@ -440,6 +492,11 @@ class _PipelineSchedule(ABC):
         bwd_initialized: bool,
         loss_kwargs: dict[str, Any] | None = None,
     ) -> tuple[bool, bool]:
+        # [FUNCTION DOC] HELPER: Shared stage initialization for single and multi schedules. Detects eval/train
+        # switches (resets flags if has_backward changed), warms up P2P, then with the RNG forked (all non-CPU
+        # devices must share a device type, else AssertionError) prepares forward infra for stages in order and
+        # backward infra in reverse order, with metadata inference backup/cleanup around it. Returns the updated
+        # (fwd_initialized, bwd_initialized) flags; returns early if nothing needs initialization.
         """Common stage initialization shared by Single and Multi schedules.
 
         Handles mode-change detection (eval↔train), P2P warm-up, RNG forking,
@@ -529,6 +586,8 @@ class _PipelineSchedule(ABC):
         return_outputs: bool = True,
         loss_kwargs: dict[str, Any] | None = None,
     ):
+        # [FUNCTION DOC] HELPER: Abstract hook: run one iteration over lists of microbatch args, kwargs and targets,
+        # optionally filling losses and returning last-stage outputs. Subclasses implement it.
         """
         Run one iteration of the pipeline schedule with list of microbatches.
         Will go through all the microbatches according to the schedule
@@ -554,6 +613,8 @@ class _PipelineSchedule(ABC):
         target_mbs: Any = None,
         **kwargs,
     ):
+        # [FUNCTION DOC] Abstract entry point: run one full iteration of the schedule on a batch (splitting it into
+        # microbatches, running the schedule, and returning merged outputs). Subclasses implement it.
         r"""Run one iteration of the pipeline schedule."""
         raise NotImplementedError
 
@@ -567,6 +628,9 @@ class _PipelineSchedule(ABC):
         target_mbs: Any = None,
         **kwargs,
     ):
+        # [FUNCTION DOC] Run one forward-only iteration: temporarily sets the schedule's has_backward flag to false,
+        # delegates to step with the same arguments (whole-batch or pre-split microbatch inputs), and restores the
+        # flag afterwards even if an error occurs. Returns whatever step returns (merged last-stage output or None).
         r"""Run one forward-only iteration of the pipeline schedule.
 
         ``eval`` uses the same input contract as ``step``, but temporarily
@@ -640,11 +704,17 @@ class _PipelineSchedule(ABC):
         target_mbs: list | None = None,
         losses: list | None = None,
     ) -> tuple[list, list]:
+        # [FUNCTION DOC] HELPER: Validate pre-split inputs. Each given arg/kwarg/target microbatch container must be
+        # a list with exactly the microbatch count (TypeError for wrong type, ValueError for wrong length); losses,
+        # if given, must be a list. Missing args/kwargs default to lists of empty tuples/dicts. Returns the
+        # (arg_mbs, kwarg_mbs) pair.
         """
         Pre-process/check inputs
         """
 
         def check_type_and_len(mbs, name: str):
+            # [FUNCTION DOC] HELPER: Check that mbs is a list whose length equals the microbatch count; raises TypeError
+            # or ValueError (message uses name) otherwise.
             if not isinstance(mbs, list):
                 raise TypeError(f"{name} must be a list but got a {type(mbs)}")
             if len(mbs) != self._n_microbatches:
@@ -672,6 +742,8 @@ class _PipelineSchedule(ABC):
         return arg_mbs, kwarg_mbs
 
     def _compute_loss(self, output, target, loss_kwargs=None):
+        # [FUNCTION DOC] HELPER: Apply the configured loss function to an output and target, forwarding optional
+        # extra loss keyword arguments; returns its result.
         return self._loss_fn(output, target, **(loss_kwargs or {}))  # type: ignore[misc]
 
     def _split_inputs(
@@ -679,6 +751,9 @@ class _PipelineSchedule(ABC):
         args: tuple[Any, ...],
         kwargs: dict[str, Any] | None = None,
     ):
+        # [FUNCTION DOC] HELPER: Split full-batch args and kwargs into per-microbatch lists using the chunk specs.
+        # When both are empty (e.g. middle stages) returns lists of empty tuples and dicts of microbatch length.
+        # Returns (args_split, kwargs_split).
         """
         Splits a full-batch input into chunks (i.e. microbatches) and returns
         the chunks
@@ -706,6 +781,11 @@ class _PipelineSchedule(ABC):
         kwarg_mbs: Any,
         target_mbs: Any,
     ) -> tuple[list | None, list | None, list | None]:
+        # [FUNCTION DOC] HELPER: Produce per-microbatch args, kwargs and targets. If no pre-split containers are
+        # given, splits the whole-batch inputs (targets are split along dim 0 with the tensor splitter, or None).
+        # Otherwise raises ValueError if whole-batch args, kwargs or target are also passed, validates the pre-split
+        # containers via _check_inputs, and raises TypeError unless each arg entry is a tuple and each kwarg entry a
+        # dict. Returns (arg_mbs, kwarg_mbs, target_mbs).
         pre_split = any(mbs is not None for mbs in (arg_mbs, kwarg_mbs, target_mbs))
         if not pre_split:
             args_split, kwargs_split = self._split_inputs(args, kwargs)
@@ -755,6 +835,8 @@ class _PipelineSchedule(ABC):
         return arg_mbs, kwarg_mbs, target_mbs
 
     def _merge_outputs(self, output_chunks: list[Any]) -> Any:
+        # [FUNCTION DOC] HELPER: Merge per-microbatch output chunks into one batch-level output using the output
+        # merge spec (default merges along the batch dimension).
         """
         Merge output chunks back to a batch state.
         If output_merge_spec is None, the utility will merge output chunks by dimension 0 (batch dim).
@@ -766,6 +848,10 @@ class _PipelineSchedule(ABC):
 
 
 def _batch_p2p(p2p_ops: list[dist.P2POp], desc: str | None = None) -> list[dist.Work]:
+    # [FUNCTION DOC] HELPER: Issue a list of P2P ops and return the resulting work handles. Empty input gives an
+    # empty list. Ops are grouped by process-group name; with several groups, each group is issued separately in
+    # sorted group-name order (same on every rank). All-send or all-recv batches are issued individually to avoid
+    # coalescing; mixed batches use the batched send/recv call. Logs at debug level.
     """
     Wrapper over batch_isend_irecv that avoids coalescing for homogeneous
     batches (all-send or all-recv).  Coalescing serializes ops on a single
@@ -817,6 +903,8 @@ def _batch_p2p(p2p_ops: list[dist.P2POp], desc: str | None = None) -> list[dist.
 def _sorted_batch_p2p(
     p2p_ops: list[dist.P2POp], desc: str | None = None
 ) -> dict[int, list[dist.Work]]:
+    # [FUNCTION DOC] HELPER: Group P2P ops by peer rank and issue each peer's ops via _batch_p2p in sorted peer
+    # order (avoids hangs with skip connections). Returns a mapping from peer rank to list of work handles.
     """
     Sorts the list of P2P ops by the peer rank, and then calls
     batch_isend_irecv. Return a dictionary of works by peer rank. This function
@@ -842,6 +930,7 @@ def _sorted_batch_p2p(
 
 
 def _wait_batch_p2p(work: list[dist.Work]):
+    # [FUNCTION DOC] HELPER: Block until every work handle in the list has completed.
     """
     Waits for a list of dist.Work (typically from _batch_p2p / _sorted_batch_p2p).
     """
@@ -850,6 +939,10 @@ def _wait_batch_p2p(work: list[dist.Work]):
 
 
 class PipelineScheduleSingle(_PipelineSchedule):
+    # [CLASS DOC] Base class for schedules with exactly one pipeline stage per rank. Holds the stage, the stage
+    # count, forward/backward initialization flags and the pipeline_order IR (from _get_pipeline_order).
+    # Implements step (input splitting, running microbatches, output merging); subclasses implement
+    # _step_microbatches. Gradients are scaled by microbatch count when scale_grads is true.
     """
     Base class for single-stage schedules.
     Implements the `step` method.
@@ -870,6 +963,8 @@ class PipelineScheduleSingle(_PipelineSchedule):
         output_merge_spec: dict[str, Any] | tuple[Any] | None = None,
         scale_grads: bool = True,
     ):
+        # [FUNCTION DOC] Initialize base state and store the single stage, its num_stages, the init flags (both false)
+        # and the pipeline_order computed by _get_pipeline_order. loss_fn may be None, which disables backward.
         # Init parent
         super().__init__(
             n_microbatches=n_microbatches,
@@ -890,6 +985,8 @@ class PipelineScheduleSingle(_PipelineSchedule):
         )
 
     def _initialize_stage(self, args, kwargs, target=None, loss_kwargs=None):
+        # [FUNCTION DOC] HELPER: Run shared stage initialization for the single stage (P2P warm-up, metadata
+        # inference) and update the forward/backward initialized flags.
         (
             self._stage_forward_initialized,
             self._stage_backward_initialized,
@@ -915,6 +1012,11 @@ class PipelineScheduleSingle(_PipelineSchedule):
         target_mbs: Any = None,
         **kwargs,
     ):
+        # [FUNCTION DOC] Run one training iteration for this rank's stage. Raises RuntimeError if backward is enabled
+        # but grad mode is disabled. Syncs has_backward onto the stage, clears its runtime state, gets microbatch
+        # inputs (whole-batch splitting or pre-split lists; ValueError/TypeError on bad inputs), runs
+        # _step_microbatches, and returns the merged last-stage outputs if this is the last stage and return_outputs
+        # is true, else None. Fills the losses list when provided.
         r"""Run one training iteration of a single-stage pipeline schedule.
 
         By default, ``args``, ``kwargs``, and ``target`` are full-batch values
@@ -1009,6 +1111,8 @@ class PipelineScheduleSingle(_PipelineSchedule):
             return None
 
     def _get_pipeline_order(self) -> dict[int, list[_Action | None]] | None:
+        # [FUNCTION DOC] Return the schedule IR as a mapping from rank to a list of actions (None marks an idle
+        # bubble, skipped by the runtime). The base implementation returns None (no IR available).
         """
         Returns the pipeline execution order as a schedule IR.
 
@@ -1028,6 +1132,8 @@ class PipelineScheduleSingle(_PipelineSchedule):
 
 
 class _ScheduleForwardOnly(PipelineScheduleSingle):
+    # [CLASS DOC] HELPER: Single-stage schedule that only runs forward passes over all microbatches (inference).
+    # Does not support losses or targets.
     """
     The forward-only schedule.
     Will go through all the microbatches and perform only the forward pass
@@ -1042,6 +1148,10 @@ class _ScheduleForwardOnly(PipelineScheduleSingle):
         return_outputs: bool = True,
         loss_kwargs: dict[str, Any] | None = None,
     ):
+        # [FUNCTION DOC] HELPER: Run forward-only over every microbatch: raises RuntimeError if targets or a losses
+        # list are supplied; validates inputs, initializes the stage using the first microbatch, then for each
+        # microbatch receives activations, runs the forward chunk and sends outputs, deferring send waits until the
+        # end. Outputs stay in the stage (return_outputs and loss_kwargs are unused).
         """
         Run one iteration of the pipeline schedule
         """
@@ -1081,6 +1191,8 @@ class _ScheduleForwardOnly(PipelineScheduleSingle):
 
 
 class ScheduleGPipe(PipelineScheduleSingle):
+    # [CLASS DOC] GPipe schedule for one stage per rank: all forward microbatches first (fill), then all backward
+    # microbatches (drain). Provides both the executable microbatch loop and the schedule IR.
     """
     The GPipe schedule.
     Will go through all the microbatches in a fill-drain manner.
@@ -1095,6 +1207,11 @@ class ScheduleGPipe(PipelineScheduleSingle):
         return_outputs: bool = True,
         loss_kwargs: dict[str, Any] | None = None,
     ):
+        # [FUNCTION DOC] Execute GPipe: forward every microbatch (receive, compute, send, compute loss on the last
+        # stage), wait for forward sends, then backward every microbatch (receive grads, backward with the stored
+        # loss, send grads; last_backward marks the final one), wait for sends, copy losses to the caller's list and
+        # perform the reduce-grad step scaled by microbatch count when scale_grads is set. Input validation errors
+        # come from _check_inputs.
         """
         Run one iteration of the pipeline schedule with list of microbatches.
         Will go through all the microbatches according to the GPipe schedule.
@@ -1171,6 +1288,9 @@ class ScheduleGPipe(PipelineScheduleSingle):
         self._stage.perform_reduce_grad(self._n_microbatches if self.scale_grads else 1)
 
     def _get_pipeline_order(self) -> dict[int, list[_Action | None]] | None:
+        # [FUNCTION DOC] Build the GPipe IR: for each rank, leading idle steps equal to the rank, all forwards, idle
+        # steps equal to three times the distance to the last stage, then all full backwards, with reduce-grad actions
+        # appended via _add_reduce_grad. Returns a mapping from rank to action list.
         """
         Returns the pipeline order for GPipe schedule.
 
@@ -1204,6 +1324,9 @@ class ScheduleGPipe(PipelineScheduleSingle):
 
 
 class Schedule1F1B(PipelineScheduleSingle):
+    # [CLASS DOC] 1F1B schedule for one stage per rank: warmup forwards, a steady state alternating one backward
+    # and one forward (with fused send/recv batches), then cooldown backwards. Requires at least as many
+    # microbatches as stages.
     """
     The 1F1B schedule.
     Will perform one forward and one backward on the microbatches in steady state.
@@ -1219,6 +1342,8 @@ class Schedule1F1B(PipelineScheduleSingle):
         output_merge_spec: dict[str, Any] | tuple[Any] | None = None,
         scale_grads: bool = True,
     ):
+        # [FUNCTION DOC] Initialize via the single-stage base. Raises ValueError if the microbatch count is smaller
+        # than the number of stages.
         super().__init__(
             stage=stage,
             n_microbatches=n_microbatches,
@@ -1243,6 +1368,11 @@ or equal to the number of stages ({self._num_stages})."
         return_outputs: bool = True,
         loss_kwargs: dict[str, Any] | None = None,
     ):
+        # [FUNCTION DOC] Execute 1F1B: warmup forwards (count is the lesser of microbatches and stages minus the stage
+        # index, holding back the last send to fuse it), then the 1B1F loop fusing forward sends with backward
+        # receives and backward sends with forward receives, then cooldown backwards with overlapped sends. Computes
+        # losses on the last stage, copies losses to the caller's list, and performs reduce-grad scaled by
+        # microbatch count when scale_grads is set.
         """
         Run one iteration of the pipeline schedule with list of microbatches.
         Will go through all the microbatches according to the 1F1B schedule.
@@ -1388,6 +1518,10 @@ or equal to the number of stages ({self._num_stages})."
         self._stage.perform_reduce_grad(self._n_microbatches if self.scale_grads else 1)
 
     def _get_pipeline_order(self) -> dict[int, list[_Action | None]] | None:
+        # [FUNCTION DOC] Build the 1F1B IR per rank: idle steps by rank, initial forwards, idle steps awaiting
+        # backward, steady-state forward/backward pairs, then cooldown backwards each preceded by an idle step, and
+        # reduce-grad actions appended. Returns a mapping from rank to action list.
+        # KNOWN ISSUE: the cooldown branch condition (stages minus rank greater than zero) is always true, so the else branch is dead code.
         """
         Returns the pipeline order for 1F1B schedule.
 
@@ -1457,12 +1591,16 @@ or equal to the number of stages ({self._num_stages})."
 
 
 def _requires_reduce_grad(action_type: _ComputationType) -> bool:
+# [FUNCTION DOC] HELPER: True if the computation type is weight backward or full backward.
     return action_type in (W, B)
 
 
 def _add_reduce_grad(
     actions: list[_Action | None], n_microbatches: int
 ) -> list[_Action | None]:
+# [FUNCTION DOC] HELPER: Return a copy of the action list with a reduce-grad action inserted right after the
+# last backward-like action (weight or full backward, including sub-actions of overlapped actions) of each
+# stage, i.e. once its count reaches n_microbatches. None entries are dropped from the result.
     """
     REDUCE_GRAD refers to joint across minibatches grad reduction.
     reduce_grad frees memory and we want to schedule it just after the last "backward"-like stage.
@@ -1471,6 +1609,8 @@ def _add_reduce_grad(
     cnt: dict[int, int] = defaultdict(int)
 
     def _leaf_action(a, to_schedule):
+    # [FUNCTION DOC] HELPER: Count a backward-like leaf action for its stage; when the count reaches the
+    # microbatch count, append the stage index to the to_schedule list.
         if _requires_reduce_grad(a.computation_type):
             stage_index = a.stage_index
             cnt[stage_index] += 1
@@ -1497,6 +1637,10 @@ def _add_unshard_reshard(
     compute_actions: list[_Action | None],
     max_active_stages: int = 3,
 ) -> list[_Action]:
+# [FUNCTION DOC] HELPER: Add FSDP unshard/reshard actions to a compute-only action list. Walking the actions
+# (None entries skipped), it looks ahead for the next max_active_stages distinct stages that will compute,
+# emits reshard for active stages that fall out of that window and unshard for newly needed ones before each
+# action, and finally reshards everything still active. Returns the new action list.
     """Given a basic schedule involving only compute actions (F,B,W,OVERLAP_F_B), add UNSHARD/RESHARD actions for FSDP.
 
     UNSHARD refers to fetching the full contents of an FSDP-sharded layer, requiring an all-gather operation.
@@ -1510,6 +1654,8 @@ def _add_unshard_reshard(
     """
 
     def next_stage_indices(count: int, next_actions: list[_Action | None]) -> list[int]:
+    # [FUNCTION DOC] HELPER: From a list of upcoming actions, return up to count distinct stage indices in order
+    # of first use, looking inside overlapped actions' sub-actions.
         """Remove duplicates (same stage, different microbatch), find next 'count' stages that will do compute."""
         seen: set[int] = set()
         ret: list[int] = []
@@ -1537,10 +1683,13 @@ def _add_unshard_reshard(
     fsdp_aware_actions: list[_Action] = []
 
     def _unshard(stage_index: int):
+    # [FUNCTION DOC] HELPER: Mark a stage active and append its unshard action to the enclosing output list.
         active_stages.add(stage_index)
         fsdp_aware_actions.append(_Action(stage_index, UNSHARD, None))
 
     def _reshard(stage_index: int):
+    # [FUNCTION DOC] HELPER: Remove a stage from the active set (KeyError if not active) and append its reshard
+    # action to the enclosing output list.
         active_stages.remove(stage_index)
         fsdp_aware_actions.append(_Action(stage_index, RESHARD, None))
 
@@ -1579,6 +1728,9 @@ def _add_unshard_reshard(
 def _merge_bw(
     compute_actions: list[_Action | None],
 ) -> list[_Action]:
+# [FUNCTION DOC] HELPER: Merge each input-backward action immediately followed (ignoring None gaps) by a
+# weight-backward action for the same stage and microbatch into one full-backward action. Other actions are
+# kept; None entries are dropped. Consumes (pops from) the input list and returns a new list.
     """Given a basic schedule involving only compute actions (F,I,W), merge adjacent I and W ops into B ops.
     (note: I = BACKWARD_INPUT, W = BACKWARD_WEIGHT, B = FULL_BACKWARD)
 
@@ -1619,6 +1771,12 @@ def _add_send_recv(
     stage_to_rank: Callable[[int], int],
     num_stages: int,
 ) -> dict[int, list[_Action]]:
+# [FUNCTION DOC] HELPER: Turn a per-rank compute-only schedule into one with send/recv actions. Repeatedly
+# takes the head action of each rank (in rank order) once its dependencies (own recv, or the producing
+# neighbour stage's action already scheduled) are satisfied, appends it, and adds a send after
+# forward/backward-input/full-backward actions that cross ranks, while placing the matching recv on the
+# destination rank. Consumes the input mapping. Raises AssertionError if no rank can progress (malformed
+# schedule) or a rank has an empty list. Returns the per-rank list with communication.
     """
     Transforms a compute-only schedule into a complete schedule with communication actions.
 
@@ -1629,6 +1787,8 @@ def _add_send_recv(
     prev_actions: dict[int, set[_Action]] = {rank: set() for rank in compute_actions}
 
     def _has_comms(action: _Action) -> bool:
+    # [FUNCTION DOC] HELPER: True if the action is a forward (non-last stage) or backward (non-first stage) whose
+    # neighbouring stage lives on a different rank, so it needs send/recv.
         if action.computation_type == F:
             return action.stage_index != num_stages - 1 and stage_to_rank(
                 action.stage_index + 1
@@ -1640,6 +1800,9 @@ def _add_send_recv(
         return False
 
     def _get_comms(action: _Action) -> tuple[_Action, _Action]:
+    # [FUNCTION DOC] HELPER: Build the (send, recv) action pair for a communicating action: the send for the
+    # same stage and the recv for the neighbouring stage (next for forward, previous for backward). Raises
+    # AssertionError if the action has no communication.
         if not _has_comms(action):
             raise AssertionError(f"{action} is not a valid comm action")
         stage_idx = action.stage_index
@@ -1651,6 +1814,10 @@ def _add_send_recv(
         return send, recv
 
     def _ready_to_schedule(action: _Action | None, prev_actions: set[_Action]) -> bool:
+    # [FUNCTION DOC] HELPER: Decide whether an action's inputs are available given already-scheduled actions:
+    # None is always ready; a non-first-stage forward needs its recv or the previous stage's forward scheduled;
+    # a non-last-stage backward-input or full backward needs its recv or the next stage's backward scheduled;
+    # anything else is ready.
         """We don't put our own recv ops in the schedule, we let a sender on another rank put our recv ops in place.
         This helps ensure a sane (non-hanging) ordering of sends and recvs.
         But it also means we might not be able to schedule our next compute action yet.
@@ -1737,6 +1904,10 @@ def _defer_recv_ops(
     actions: dict[int, list[_Action]],
     stage_to_rank: Callable[[int], int],
 ) -> dict[int, list[_Action]]:
+# [FUNCTION DOC] HELPER: Reorder each rank's actions so every recv is deferred until just before the compute
+# op that consumes it (including sub-actions of overlapped ops), to avoid blocking unrelated compute.
+# Deadlock avoidance: before a send to a peer with a higher rank, deferred recvs from that peer are flushed
+# first. Returns a new mapping; raises AssertionError if a recv is left with no consumer.
     """
     Defers RECV operations to reduce interference with unrelated compute ops,
     while maintaining deadlock-safe ordering via rank-parity P2P ordering.
@@ -1763,12 +1934,14 @@ def _defer_recv_ops(
     SEND_B = _ComputationType.SEND_B
 
     def _recv_peer_rank(action: _Action) -> int:
+    # [FUNCTION DOC] HELPER: Rank that sends the data for a recv action (previous stage for recv-forward, else next stage).
         if action.computation_type == RECV_F:
             return stage_to_rank(action.stage_index - 1)
         else:
             return stage_to_rank(action.stage_index + 1)
 
     def _send_peer_rank(action: _Action) -> int:
+    # [FUNCTION DOC] HELPER: Rank that receives the data for a send action (next stage for send-forward, else previous stage).
         if action.computation_type == SEND_F:
             return stage_to_rank(action.stage_index + 1)
         else:
@@ -1833,6 +2006,12 @@ def _validate_schedule(
     num_stages: int,
     num_microbatches: int,
 ) -> dict[int, int]:
+# [FUNCTION DOC] HELPER: Validate a schedule IR. Checks the rank count equals pp_group_size and each rank has
+# an entry, that actions are _Action instances, that a stage runs on one rank only, that backward ops follow
+# their forward (and weight backward follows input backward), that each stage has num_microbatches forwards,
+# equal input/weight backward counts, and full backward plus paired I/W counts totalling num_microbatches.
+# Raises AssertionError (with a formatted schedule on ordering errors). Returns stage index to rank mapping.
+# KNOWN ISSUE: only F/B/I/W actions are inspected; other action types are ignored, and an action with a None microbatch index is recorded as is.
     if not (len(actions) == pp_group_size):
         raise AssertionError(
             f"Schedule has incorrect number of ranks - expected {pp_group_size}, actual {len(actions)}"
@@ -1855,6 +2034,9 @@ def _validate_schedule(
     stage_index_to_rank_mapping = {}
 
     def _process_action(action: _Action, rank: int, step: int):
+    # [FUNCTION DOC] HELPER: Record one action in the per-stage sets of microbatches, checking ordering (backward
+    # needs prior forward, weight needs prior input backward; AssertionError with a formatted schedule marking the
+    # step) and that the stage is not mapped to two different ranks.
         """Process a single action and update stage_actions and stage_index_to_rank_mapping"""
         s_id = action.stage_index
         ctype = action.computation_type
@@ -1958,6 +2140,11 @@ def _validate_schedule(
 
 
 class PipelineScheduleMulti(_PipelineSchedule):
+    # [CLASS DOC] Base class for schedules with several pipeline stages per rank. Holds the list of local
+    # stages, total stage count, pipeline group size and rank, a stage-to-rank mapping shared with the stages,
+    # init flags, a loss predicate, the pipeline_order IR (rank to action list, filled by subclasses or by
+    # loading a CSV) and a flag saying whether backward needs autograd. step splits inputs and runs
+    # _step_microbatches, which executes the IR with compute actions and neighbour send/recv per timestep.
     """
     Base class for multi-stage schedules.
     Implements the `step` method.
@@ -1979,6 +2166,9 @@ class PipelineScheduleMulti(_PipelineSchedule):
         scale_grads: bool = True,
         backward_requires_autograd: bool = True,
     ):
+        # [FUNCTION DOC] Initialize base state; record stages, num_stages, group size and rank from the first stage;
+        # generate the default stage-to-rank mapping and push it into every stage; set init flags false and an empty
+        # pipeline_order. use_full_backward is deprecated and only triggers a logged warning.
         # Init parent
         super().__init__(
             n_microbatches=n_microbatches,
@@ -2024,6 +2214,9 @@ class PipelineScheduleMulti(_PipelineSchedule):
     def _initialize_stages(
         self, args: tuple[Any, ...], kwargs, target=None, loss_kwargs=None
     ):
+        # [FUNCTION DOC] HELPER: Initialize all local stages via the shared initializer (updating the init flags).
+        # After a first or mode-switch forward initialization, checks adjacent-stage-only communication (may raise
+        # RuntimeError).
         reinit_for_mode_switch = self._stages_forward_initialized and (
             self._has_backward != self._stages_backward_initialized
         )
@@ -2047,6 +2240,9 @@ class PipelineScheduleMulti(_PipelineSchedule):
             self._validate_adjacent_stage_communication()
 
     def _validate_adjacent_stage_communication(self) -> None:
+        # [FUNCTION DOC] HELPER: For each local stage, verify that forward receive sources and forward send
+        # destinations are only the immediately previous/next stage. Raises RuntimeError mentioning unsupported skip
+        # connections otherwise.
         """Validate that stage communication follows adjacent-stage topology only."""
 
         def _check_stage_indices(
@@ -2055,6 +2251,8 @@ class PipelineScheduleMulti(_PipelineSchedule):
             actual_stage_indices: set[int],
             expected_stage_indices: set[int],
         ) -> None:
+            # [FUNCTION DOC] HELPER: Raise RuntimeError if the actual stage indices contain any not in the expected set
+            # (non-adjacent communication).
             non_adjacent_stage_indices = actual_stage_indices - expected_stage_indices
             if non_adjacent_stage_indices:
                 raise RuntimeError(
@@ -2102,6 +2300,8 @@ class PipelineScheduleMulti(_PipelineSchedule):
     def _validate_and_set_stage_mapping(
         self, actions: dict[int, list[_Action | None]]
     ) -> None:
+        # [FUNCTION DOC] HELPER: Validate the given action IR with _validate_schedule and store the resulting stage to
+        # rank mapping on the schedule and on every local stage (overwrites the default mapping).
         """
         Allocates the stage index to rank mapping which is needed for communication
         """
@@ -2115,6 +2315,8 @@ class PipelineScheduleMulti(_PipelineSchedule):
             stage.stage_index_to_group_rank = self.stage_index_to_group_rank
 
     def _dump_csv(self, filename):
+        # [FUNCTION DOC] HELPER: Write pipeline_order to a CSV file, one row per rank with the action strings (empty
+        # cells for idle). Side effect: creates or overwrites the file.
         """Dump a CSV representation of the schedule into a file with the provided filename."""
         with open(filename, "w", newline="") as csvfile:
             writer = csv.writer(csvfile)
@@ -2126,6 +2328,9 @@ class PipelineScheduleMulti(_PipelineSchedule):
         filename: str,
         format: Literal["compute_only", "compute_comms"] = "compute_only",
     ):
+        # [FUNCTION DOC] HELPER: Read pipeline_order from a CSV file, one row per rank, parsing each cell into an
+        # action (empty cells become idle), then validate it and reset the stage-to-rank mapping. Only the
+        # compute-only format is accepted (AssertionError otherwise). Side effect: reads a file and mutates state.
         """Load a CSV representation of the schedule from a file with the provided filename.
         This API will most likely get renamed/refactored so is marked as internal for now.
 
@@ -2154,6 +2359,10 @@ class PipelineScheduleMulti(_PipelineSchedule):
         target_mbs: Any = None,
         **kwargs,
     ):
+        # [FUNCTION DOC] Run one training iteration across this rank's stages. Raises RuntimeError if backward is
+        # enabled and requires autograd but grad mode is off. Sets has_backward on each stage, clears their runtime
+        # state, builds microbatch inputs (whole-batch or pre-split), runs _step_microbatches, and returns the merged
+        # output of the last stage if hosted here and return_outputs is true, otherwise None.
         r"""Run one training iteration of a multi-stage pipeline schedule.
 
         By default, ``args``, ``kwargs``, and ``target`` are full-batch values
@@ -2265,6 +2474,10 @@ class PipelineScheduleMulti(_PipelineSchedule):
         return_outputs: bool = True,
         loss_kwargs: dict[str, Any] | None = None,
     ):
+        # [FUNCTION DOC] Execute pipeline_order for this rank. Initializes stages, then per timestep runs this
+        # rank's action (forward with loss and send ops; full backward with grad scaling on the last microbatch; input
+        # backward; weight backward; ValueError on unknown type) and inspects neighbouring ranks' actions at the same
+        # timestep to issue matching receive ops, batching all ops for the step. Does not support skip connections.
         """
         Operate on the microbatches for looped schedules (multiple stages on each rank).
 
@@ -2458,6 +2671,9 @@ at time_step %s when running action %s",
 
 @dataclass
 class _PipelineContext:
+    # [CLASS DOC] HELPER: Dataclass passed to custom action functions: a reference to the owning schedule plus
+    # the current step's pre-split arg microbatches, kwarg microbatches, target microbatches and the losses list
+    # (all optional, default None).
     """Context passed to custom functions during pipeline execution."""
 
     schedule_ref: _PipelineSchedule
@@ -2468,10 +2684,17 @@ class _PipelineContext:
 
 
 class _CustomFunctionProtocol(Protocol):
+    # [CLASS DOC] HELPER: Protocol for custom action handlers: a callable taking an action and a pipeline
+    # context and returning nothing (its one-line __call__ stub is the interface).
     def __call__(self, action: _Action, ctx: _PipelineContext) -> None: ...
 
 
 class _PipelineScheduleRuntime(PipelineScheduleMulti):
+    # [CLASS DOC] HELPER: Schedule runtime that executes a full schedule IR including communication, FSDP
+    # unshard/reshard and reduce-grad actions. State: the per-rank IR with comms (pipeline_order_with_comms),
+    # registered custom handlers per computation type, backward counters, pending forward/backward recv work keyed
+    # by (stage, microbatch), and pending unshard handles plus the set of unsharded stages. Can load a CSV or be
+    # subclassed to generate the IR; optionally defers recv ops.
     """
     Provides a simple runtime that requires a 'schedule IR' including specified communication operations.
 
@@ -2480,6 +2703,9 @@ class _PipelineScheduleRuntime(PipelineScheduleMulti):
     """
 
     def __init__(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Pop the optional defer_pp_recv keyword (default false) before delegating to the
+        # multi-stage constructor, then create empty custom-function map, backward counter, forward/backward recv-work
+        # maps and FSDP unshard tracking state.
         self._defer_pp_recv: bool = kwargs.pop("defer_pp_recv", False)
         super().__init__(*args, **kwargs)
         # Action to custom function mapping
@@ -2500,6 +2726,9 @@ class _PipelineScheduleRuntime(PipelineScheduleMulti):
         computation_type: _ComputationType,
         custom_function: _CustomFunctionProtocol,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Register a handler for a computation type (forward, full/input/weight backward,
+        # overlapped, unshard, reshard, reduce-grad only). Raises ValueError for any other type; warns and
+        # overwrites if one is already registered.
         """
         Register a custom function to be executed for a specific computation type.
 
@@ -2539,6 +2768,11 @@ class _PipelineScheduleRuntime(PipelineScheduleMulti):
         actions: dict[int, list[_Action | None]],
         format: Literal["compute_only", "compute_comms"] = "compute_only",
     ):
+        # [FUNCTION DOC] HELPER: Store a schedule with communication in pipeline_order_with_comms. First validates the
+        # actions and resets the stage-to-rank mapping. For the compute_comms format, copies actions (AssertionError on
+        # None). For compute_only, raises ValueError if any communication action is present, then adds unshard/reshard,
+        # reduce-grad and send/recv actions, optionally deferring recvs. Other formats raise NotImplementedError.
+        # Must be called before running microbatches.
         """
         Given an in-memory representation for a simple compute-only schedule, lower it to a complex schedule including
         communication actions.  Stores the schedule in self, and must be called before running step_mo()
@@ -2599,6 +2833,9 @@ class _PipelineScheduleRuntime(PipelineScheduleMulti):
         filename: str,
         format: Literal["compute_only", "compute_comms"] = "compute_only",
     ):
+        # [FUNCTION DOC] HELPER: Load a CSV schedule. For compute_only, loads and validates via the base class then
+        # lowers with communication. For compute_comms, reads rows directly into actions and stores them as-is.
+        # Raises NotImplementedError for other formats. Side effect: reads a file, sets schedule state.
         """Loads a csv in simple format and then lowers it to include communication actions
 
         format must be either "compute_only" or "compute_comms".  If compute_only, the lowering passes
@@ -2624,6 +2861,9 @@ class _PipelineScheduleRuntime(PipelineScheduleMulti):
         filename: str,
         format: Literal["compute_only", "compute_comms"] = "compute_comms",
     ):
+        # [FUNCTION DOC] HELPER: Write the schedule to a CSV file, one row per rank. compute_only writes the compute
+        # schedule (AssertionError if missing); compute_comms (default) writes the schedule with communication
+        # (AssertionError if missing). Other format values silently write nothing. Side effect: file output.
         """Dump a CSV representation of the schedule into a file with the provided filename."""
         if format == "compute_only":
             if self.pipeline_order is None:
@@ -2643,6 +2883,8 @@ class _PipelineScheduleRuntime(PipelineScheduleMulti):
                     writer.writerow(self.pipeline_order_with_comms[rank])
 
     def _simulate(self):
+        # [FUNCTION DOC] HELPER: Simulate the schedule with communication to check execution order, delegating to
+        # the comms/compute simulator with the stage to rank mapping and stage count; returns its result.
         return _simulate_comms_compute(
             self.pipeline_order_with_comms,
             lambda s: self.stage_index_to_group_rank[s],
@@ -2650,6 +2892,8 @@ class _PipelineScheduleRuntime(PipelineScheduleMulti):
         )
 
     def _assert_unsharded(self, stage: _PipelineStageBase):
+        # [FUNCTION DOC] HELPER: For an FSDP-wrapped stage, wait on any pending unshard handles and mark the stage
+        # unsharded; raises AssertionError if the stage is still sharded. No-op for non-FSDP stages.
         """If an unshard is active for `stage_idx`, wait() it and mark `stage_idx` unshared."""
         stage_uses_fsdp = isinstance(stage.submod, FSDPModule)
         if stage_uses_fsdp:
@@ -2671,6 +2915,11 @@ class _PipelineScheduleRuntime(PipelineScheduleMulti):
         return_outputs: bool = True,
         loss_kwargs: dict[str, Any] | None = None,
     ):
+        # [FUNCTION DOC] HELPER: Execute the lowered per-rank IR (pipeline_order_with_comms) action by action:
+        # validates inputs, initializes stages, dispatches registered custom handlers or built-in handling of
+        # send/recv, FSDP unshard/reshard, forward, backward variants, overlapped forward-backward and reduce-grad,
+        # waits for outstanding recvs/sends and copies losses to the caller's list. Raises AssertionError if the IR
+        # was not prepared.
         """
         Operate on the microbatches for looped schedules (multiple stages on each rank).
 
@@ -2698,6 +2947,12 @@ class _PipelineScheduleRuntime(PipelineScheduleMulti):
         send_ops: list[list[dist.Work]] = []
 
         def _perform_action(action: _Action) -> None:
+        # [FUNCTION DOC] HELPER: Perform one lowered action for this rank. Send/recv actions issue batched P2P ops
+        # (storing recv work keyed by stage and microbatch; AssertionError on a double recv). Unshard and reshard
+        # drive FSDP modules (AssertionError on double unshard, or reshard without unshard). Forward and backward
+        # variants first assert FSDP stages are unsharded and recvs completed, run the stage chunk, compute loss or
+        # pass data locally when adjacent stages share the rank, and count backwards to flag the last one. Reduce-grad
+        # performs scaled gradient reduction. Raises ValueError for unknown action types.
             comp_type = action.computation_type
             mb_index: int = (
                 action.microbatch_index if action.microbatch_index is not None else -1
@@ -2920,6 +3175,10 @@ class _PipelineScheduleRuntime(PipelineScheduleMulti):
 
 
 class ScheduleLoopedBFS(_PipelineScheduleRuntime):
+    # [CLASS DOC] Looped breadth-first schedule (multiple stages per rank): every rank runs all microbatches of
+    # its earliest local stage forward, then waits for backward to arrive, then runs all microbatches of its
+    # latest local stage backward in reverse order, moving to earlier stages. Builds the compute IR for all ranks
+    # in the constructor and lowers it with communication.
     """
     Breadth-First Pipeline Parallelism.
     See https://arxiv.org/abs/2211.05953 for details.
@@ -2939,6 +3198,9 @@ class ScheduleLoopedBFS(_PipelineScheduleRuntime):
         backward_requires_autograd: bool = True,
         defer_pp_recv: bool = False,
     ):
+        # [FUNCTION DOC] Initialize the runtime base, build pipeline_order for every rank via
+        # _calculate_single_rank_operations, then lower it with communication (via _prepare_schedule_with_comms).
+        # Note loss_fn may also be a loss module; chunk specs are not configurable here.
         super().__init__(
             stages=stages,
             n_microbatches=n_microbatches,
@@ -2962,6 +3224,9 @@ class ScheduleLoopedBFS(_PipelineScheduleRuntime):
         self._prepare_schedule_with_comms(self.pipeline_order)
 
     def _calculate_single_rank_operations(self, rank):
+        # [FUNCTION DOC] HELPER: Build one rank's compute action list: idle steps equal to the rank, forward of all
+        # microbatches for each local stage in order, idle steps of twice the distance to the last rank, then full
+        # backward for all microbatches (reversed) of each local stage in reverse order. Returns the list.
         n_local_stages = len(self._stages)
         stage_indices = range(
             rank, self.pp_group_size * n_local_stages, self.pp_group_size
@@ -3002,6 +3267,13 @@ def _get_1f1b_rank_ops(
     num_1f1b_microbatches=0,
     enable_zero_bubble=False,
 ):
+# [FUNCTION DOC] HELPER: Generate one rank's action list for interleaved 1F1B-style schedules. The count of
+# warmup, steady-state (forward plus backward pair) and cooldown ops is given; the callables
+# forward_stage_index and backward_stage_index map an op number to a stage index. Per-stage microbatch
+# counters assign microbatch indices. After the warmup, idle steps pad the rank until the first backward can
+# arrive. With enable_zero_bubble, backwards are input-only and weight-backward actions are interleaved
+# (after num_1f1b_microbatches, then flushed at the end); cooldown has no idle padding. Otherwise cooldown
+# backwards are each preceded by an idle step. Returns the action list.
     # All stages start with handling microbatch 0
     fwd_stage_mb_index: dict[int, int] = defaultdict(int)
     bwd_stage_mb_index: dict[int, int] = defaultdict(int)
@@ -3135,6 +3407,9 @@ def _get_warmup_ops(
     n_microbatches: int,
     multiply_factor: int = 2,
 ) -> int:
+# [FUNCTION DOC] HELPER: Number of warmup forward ops for an interleaved schedule on a rank: the local-stage
+# based warmup for the last rank plus multiply_factor per hop away from it, capped at the total number of
+# forward ops (microbatches times local stages).
     """
     Calculate the number of warmup operations for interleaved schedules.
     """
@@ -3147,6 +3422,10 @@ def _get_warmup_ops(
 
 
 class ScheduleInterleaved1F1B(_PipelineScheduleRuntime):
+    # [CLASS DOC] Interleaved 1F1B schedule with several stages per rank (depth-first), as in the Megatron
+    # paper but relaxing the requirement that microbatches be a multiple of the group size: rounds are the larger
+    # of one and microbatches divided by group size, and microbatches must divide evenly into rounds. Builds
+    # the compute IR in the constructor and lowers it with communication.
     """
     The Interleaved 1F1B schedule.
     See https://arxiv.org/pdf/2104.04473 for details.
@@ -3176,6 +3455,10 @@ class ScheduleInterleaved1F1B(_PipelineScheduleRuntime):
         backward_requires_autograd: bool = True,
         defer_pp_recv: bool = False,
     ):
+        # [FUNCTION DOC] Initialize the runtime base with the stages and options, record local stage count, rank,
+        # number of rounds (at least 1) and microbatches per round, build pipeline_order for every rank via
+        # _calculate_single_rank_operations and lower it with communication. Raises ValueError if the microbatch count
+        # is not a multiple of the number of rounds.
         self.pp_group_size = stages[0].group_size
         super().__init__(
             stages=stages,
@@ -3210,6 +3493,10 @@ class ScheduleInterleaved1F1B(_PipelineScheduleRuntime):
         self._prepare_schedule_with_comms(self.pipeline_order)
 
     def _calculate_single_rank_operations(self, rank) -> list[_Action | None]:
+        # [FUNCTION DOC] HELPER: Compute one rank's action list for interleaved 1F1B: warmup count from
+        # _get_warmup_ops with factor 2, steady-state ops for the remaining forwards, cooldown for the remaining
+        # backwards; forward stages cycle through local stages by round and backward stages cycle in reverse.
+        # Delegates to _get_1f1b_rank_ops and logs the op counts at debug level.
         warmup_ops = _get_warmup_ops(
             rank,
             self.n_local_stages,
@@ -3237,11 +3524,15 @@ class ScheduleInterleaved1F1B(_PipelineScheduleRuntime):
 
         # Calculates the stage index based on step and pp_group_size
         def forward_stage_index(step):
+        # [FUNCTION DOC] HELPER: Map a global step number to the global stage index of the forward at that step
+        # (local stage cycles every microbatches_per_round steps; stage = local index times group size plus rank).
             # Get the local index from 0 to n_local_stages-1
             local_index = (step // self.microbatches_per_round) % self.n_local_stages
             return (local_index * self.pp_group_size) + rank
 
         def backward_stage_index(step):
+        # [FUNCTION DOC] HELPER: Map a global step number to the global stage index of the backward at that step
+        # (local stages visited in reverse, offset by the warmup count).
             local_index = (
                 self.n_local_stages
                 - 1
@@ -3263,6 +3554,10 @@ class ScheduleInterleaved1F1B(_PipelineScheduleRuntime):
 
 
 class ScheduleInterleavedZeroBubble(_PipelineScheduleRuntime):
+    # [CLASS DOC] Interleaved zero-bubble schedule (ZB1P in the paper) with several stages per rank. Splits
+    # backward into input-backward and weight-backward actions, using weight-backward to fill pipeline bubbles.
+    # Builds the IR in the constructor, adds dependency bubbles, and lowers it with communication. Not supported
+    # with torch.compile-wrapped stages.
     """
     The Interleaved Zero Bubble schedule.
     See https://arxiv.org/pdf/2401.10241 for details.
@@ -3285,6 +3580,9 @@ class ScheduleInterleavedZeroBubble(_PipelineScheduleRuntime):
         backward_requires_autograd: bool = True,
         defer_pp_recv: bool = False,
     ):
+        # [FUNCTION DOC] Check stages are compatible (not compiled; may raise), initialize the runtime base, record
+        # rank, local stage count and rounds, raise ValueError if the microbatch count is not a multiple of the
+        # rounds, build per-rank IR, insert dependency bubbles, and lower with communication.
         # TODO: we don't support input/weight backward split with torch.compile
         _check_torch_compile_compatibility(stages, self.__class__.__name__)
         self.pp_group_size = stages[0].group_size
@@ -3328,6 +3626,9 @@ class ScheduleInterleavedZeroBubble(_PipelineScheduleRuntime):
         self._prepare_schedule_with_comms(self.pipeline_order)
 
     def _calculate_single_rank_operations(self, rank) -> list[_Action | None]:
+        # [FUNCTION DOC] HELPER: Compute one rank's action list for the zero-bubble schedule: warmup with factor 1,
+        # then the generic 1F1B rank-op generator with zero-bubble enabled and the rank as the count of steady-state
+        # microbatches before weight backwards start.
         warmup_ops = _get_warmup_ops(
             rank,
             self.n_local_stages,
@@ -3356,11 +3657,13 @@ class ScheduleInterleavedZeroBubble(_PipelineScheduleRuntime):
         # Calculates the stage index based on step and pp_group_size
 
         def forward_stage_index(step):
+        # [FUNCTION DOC] HELPER: Global stage index of the forward at a given step (see interleaved 1F1B).
             # Get the local index from 0 to n_local_stages-1
             local_index = (step // self.microbatches_per_round) % self.n_local_stages
             return (local_index * self.pp_group_size) + rank
 
         def backward_stage_index(step):
+        # [FUNCTION DOC] HELPER: Global stage index of the backward at a given step (see interleaved 1F1B).
             local_index = (
                 self.n_local_stages
                 - 1
@@ -3385,9 +3688,17 @@ class ScheduleInterleavedZeroBubble(_PipelineScheduleRuntime):
         )
 
     def _add_bubbles_to_actions(self, num_stages_global):
+        # [FUNCTION DOC] HELPER: Rebuild the pipeline order timestep by timestep, inserting idle entries where a
+        # forward waits for the previous stage's forward or a full backward waits for the next stage's backward (or
+        # own forward on the last stage). Dependencies are judged against actions finished in earlier timesteps.
+        # Returns the new per-rank mapping.
+        # KNOWN ISSUE: the total bubble counter is never incremented, so the non-zero-bubble warning can never be logged; input-backward actions are never checked for dependencies.
         actions = self.pipeline_order
 
         def need_bubble(stage, op, microbatch, num_stages_global, seen_ops):
+            # [FUNCTION DOC] HELPER: True if the action must wait: a non-first-stage forward whose previous-stage forward
+            # is unseen, or a full backward whose dependency (own forward on the last stage, else next stage's backward)
+            # is unseen. Other action types never need a bubble.
             if op == _ComputationType.FORWARD:
                 if stage != 0 and (stage - 1, op, microbatch) not in seen_ops:
                     return True
@@ -3455,6 +3766,10 @@ class ScheduleInterleavedZeroBubble(_PipelineScheduleRuntime):
 
 
 class ScheduleZBVZeroBubble(_PipelineScheduleRuntime):
+    # [CLASS DOC] Zero-bubble V schedule (ZBV): exactly two stages per rank arranged in a V shape (stage to
+    # rank mapping uses the V style), using input and weight backward actions. Achieves zero bubble only if
+    # forward, input-backward and weight-backward take equal time. Builds the IR in the constructor and lowers it
+    # with communication.
     """
     The Zero Bubble schedule (ZBV variant).
     See https://arxiv.org/pdf/2401.10241 Section 6 for details.
@@ -3482,6 +3797,9 @@ class ScheduleZBVZeroBubble(_PipelineScheduleRuntime):
         backward_requires_autograd: bool = True,
         defer_pp_recv: bool = False,
     ):
+        # [FUNCTION DOC] Check stages are compatible (not compiled), initialize the runtime base, set the V-style
+        # stage to rank mapping on schedule and stages, raise ValueError unless there are exactly two local stages,
+        # record rank and total stages, build per-rank IR and lower with communication.
         # TODO: we don't support input/weight backward split with torch.compile
         _check_torch_compile_compatibility(stages, self.__class__.__name__)
         self.pp_group_size = stages[0].group_size
@@ -3524,6 +3842,12 @@ class ScheduleZBVZeroBubble(_PipelineScheduleRuntime):
         self._prepare_schedule_with_comms(self.pipeline_order)
 
     def _calculate_single_rank_operations(self, rank) -> list[_Action | None]:
+        # [FUNCTION DOC] HELPER: Compute one rank's ZBV action list. Uses two chunks per rank (stage ids rank and
+        # last stage minus rank), at least twice group size minus one microbatches. Phases: warmup forwards of both
+        # chunks, steady state of forward/input-backward/weight-backward triples for both chunks, cooldown of
+        # input-backwards followed by remaining weight-backwards. Raises AssertionError if the forward, backward-input
+        # and backward-weight counts for a chunk disagree. Finally actions with microbatch index at or above the real
+        # microbatch count are replaced by idle entries. Returns the list.
         # max(2 * self.pp_group_size - 1, ...) ensure the number of microbatches is at least
         # as large of the number of microbatches needed to fully utilize the pipeline
         n_micro = max(2 * self.pp_group_size - 1, self._n_microbatches)
@@ -3649,6 +3973,10 @@ class ScheduleZBVZeroBubble(_PipelineScheduleRuntime):
 
 
 class ScheduleDualPipeV(_PipelineScheduleRuntime):
+    # [CLASS DOC] DualPipeV schedule (a V-shaped variant of DeepSeek's DualPipe): exactly two stages per rank with
+    # V-style stage mapping, overlapped forward+backward actions, and zero-bubble input/weight backward in later
+    # steps. Requires at least as many microbatches as stages. Builds the IR in the constructor and lowers it
+    # with communication.
     """
     The DualPipeV schedule. A more efficient schedule variant based on the
     DualPipe schedule introduced by DeepSeek in https://arxiv.org/pdf/2412.19437
@@ -3668,6 +3996,9 @@ class ScheduleDualPipeV(_PipelineScheduleRuntime):
         backward_requires_autograd: bool = True,
         defer_pp_recv: bool = False,
     ):
+        # [FUNCTION DOC] Check stages are compatible (not compiled), initialize the runtime base, set the V-style
+        # stage mapping, raise ValueError unless there are exactly two local stages or if microbatches are fewer than
+        # stages, record rank and total stages, build per-rank IR and lower with communication.
         # TODO: we don't support input/weight backward split with torch.compile
         _check_torch_compile_compatibility(stages, self.__class__.__name__)
         self.pp_group_size = stages[0].group_size
@@ -3715,6 +4046,11 @@ class ScheduleDualPipeV(_PipelineScheduleRuntime):
         self._prepare_schedule_with_comms(self.pipeline_order)
 
     def _calculate_single_rank_operations(self, rank) -> list[_Action | None]:
+        # [FUNCTION DOC] HELPER: Build one rank's DualPipeV action list in eight phases: forwards of chunk 0;
+        # forward pairs; input-backward/weight/forward of chunk 1; main phase of overlapped forward+backward pairs
+        # (the first on the last rank is not overlapped); backward then overlap; paired backwards switching to
+        # input-only midway; weight/backward drain; remaining weight actions. Uses per-stage counters for microbatch
+        # indices and a queue of pending weight actions. Returns the list.
         actions: list[_Action | None] = []
         counters: dict[
             tuple[int, _ComputationType], int
@@ -3730,6 +4066,8 @@ class ScheduleDualPipeV(_PipelineScheduleRuntime):
         stage0_index, stage1_index = rank_to_stages[rank]
 
         def increment_backward_counts(stage_index: int):
+        # [FUNCTION DOC] HELPER: Increment the input and weight backward counters of a stage (used when a full
+        # backward covers both).
             """Helper method to increment BACKWARD_INPUT and BACKWARD_WEIGHT counters when FULL_BACKWARD is used."""
             input_key = (stage_index, BACKWARD_INPUT)
             weight_key = (stage_index, BACKWARD_WEIGHT)
@@ -3741,6 +4079,9 @@ class ScheduleDualPipeV(_PipelineScheduleRuntime):
             forward_stage: int,
             backward_stage: int,
         ):
+        # [FUNCTION DOC] HELPER: Append an overlapped forward+backward action whose sub-actions are a forward of
+        # forward_stage and a full backward of backward_stage, using current counters for microbatch indices, then
+        # advance those counters.
             """Helper method to add an overlapped forward+backward action which tracks microbatch index."""
             # Create new overlapped forward+backward action with sub_actions
             forward_key = (forward_stage, FORWARD)
@@ -3764,6 +4105,9 @@ class ScheduleDualPipeV(_PipelineScheduleRuntime):
             stage_index: int,
             computation_type: _ComputationType,
         ):
+        # [FUNCTION DOC] HELPER: Append a single action for a stage with the next microbatch index from counters
+        # (full backward uses the input-backward counter and advances both backward counters). An input backward also
+        # queues a pending weight action.
             # Regular single action, for FULL_BACKWARD we only use the BACKWARD_INPUT counter
             key = (
                 (stage_index, computation_type)
@@ -3784,6 +4128,8 @@ class ScheduleDualPipeV(_PipelineScheduleRuntime):
                 counters[key] = mb_index + 1
 
         def add_weight_action_if_pending(actions: list):
+        # [FUNCTION DOC] HELPER: Pop the oldest pending weight action from the queue and append it, advancing the
+        # weight counter; does nothing if the queue is empty.
             """Helper method to add a weight action from the queue."""
             if not weight_queue:
                 return  # No pending weight actions, skip
@@ -3876,6 +4222,9 @@ class ScheduleDualPipeV(_PipelineScheduleRuntime):
 
 
 def get_schedule_class(schedule_name: str):
+# [FUNCTION DOC] Look up a schedule class by name (case insensitive) among 1F1B, Interleaved1F1B, GPipe,
+# LoopedBFS, InterleavedZeroBubble, PipelineScheduleSingle, PipelineScheduleMulti, ZBVZeroBubble and
+# DualPipeV. Raises ValueError listing valid names if unknown. Returns the class.
     """
     Maps a schedule name (case insensitive) to its corresponding class object.
 
@@ -3905,6 +4254,11 @@ def get_schedule_class(schedule_name: str):
 def _simulate_comms_compute(
     pipeline_order, stage_to_rank: Callable[[int], int], num_stages: int
 ):
+# [FUNCTION DOC] HELPER: Dry-run a schedule with communication across all ranks, one timestep per loop, to
+# detect deadlocks and measure bubbles. Idle entries are filtered, ranks advance when dependencies are met
+# (recv needs the matching send done on the peer rank), and a second pass fills slots unblocked by later
+# ranks. Returns the simulated per-rank schedule (idle entries as None). If no progress is made, prints the
+# partial schedule and next actions, then raises ValueError. Does not model overlap or streams.
     """This function dry-run simulates the actions in the schedule from the perspective of all ranks, and flags
     any deadlocks caused by missing or misordered communications.  It also simulates any bubbles in time where a rank
     can not execute any action due to waiting for unmet dependencies.  The total number of simulator steps can be used
@@ -3925,11 +4279,16 @@ def _simulate_comms_compute(
     _prev_ops_rank: dict[int, set[_Action]] = {rank: set() for rank in _schedule}
 
     def add_to_schedule(rank: int, action: _Action | None):
+    # [FUNCTION DOC] HELPER: Append an action (or idle) to a rank's simulated schedule and record real actions as done.
         _schedule[rank].append(action)
         if action is not None:
             _prev_ops_rank[rank].add(action)
 
     def _ready_to_schedule(action: _Action | None) -> bool:
+    # [FUNCTION DOC] HELPER: Whether an action can run now given actions completed on its rank: forwards and
+    # backwards need their recv or the neighbour stage's compute; weight backward is always ready; sends need
+    # their compute done; recvs need the matching send done on the peer's rank. Raises ValueError for
+    # unsupported types.
         if action is None:
             return True
 
@@ -4036,6 +4395,10 @@ def _simulate_comms_compute(
 
 
 def _dump_chrometrace(schedule, filename):
+# [FUNCTION DOC] HELPER: Write a schedule IR as a Chrome trace JSON file: one event per non-idle action with
+# rank as process and thread, timestep as start time and unit duration, categorized as computation for
+# forward/full-backward/weight and communication otherwise. Side effect: writes the file.
+# KNOWN ISSUE: input-backward actions are categorized as communication since only forward, full backward and weight backward count as computation.
     """
     This function dumps a schedule IR into a chrometrace format so it can be visualized.
 
@@ -4074,6 +4437,8 @@ def _dump_chrometrace(schedule, filename):
 def _check_torch_compile_compatibility(
     stages: list[_PipelineStageBase], schedule_name: str
 ):
+# [FUNCTION DOC] HELPER: Raise RuntimeError if any stage's submodule contains a torch.compile-wrapped module,
+# naming the schedule; used by schedules that split input and weight backward.
     """
     Check if the schedule is compatible with torch.compile.
 
