@@ -1,4 +1,10 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Multi-process tests for the c10d Gloo backend (ProcessGroupGloo) and DDP over
+# Gloo. Exits the interpreter silently (status 0) at import time when c10d or Gloo is
+# unavailable. Contains reference-case generators for reductions, rendezvous/timeout tests,
+# collective check/basics/stress tests (broadcast, allreduce, scatter, gather, allgather,
+# alltoall, reduce, barrier, send/recv), DDP, sharded tensor, and communication-hook tests.
+# Run as a script, it calls the common run_tests entry point.
 
 import copy
 import json
@@ -65,6 +71,11 @@ from torch.testing._internal.common_utils import (
 
 
 def simple_reduce_tests(rank, world_size):
+    # [FUNCTION DOC] Build the list of allreduce cases for a given rank and world size.
+    # Returns tuples of (reduce op, this rank's input tensor, expected reduced tensor)
+    # covering SUM, PRODUCT, MIN, MAX, AVG on float, BAND (4 cases), BOR and BXOR (4 cases
+    # each, emulating larger worlds by pre-combining several values per rank) on int32, plus
+    # SUM and AVG on cfloat.
     tests = [
         (
             c10d.ReduceOp.SUM,
@@ -165,6 +176,9 @@ def simple_reduce_tests(rank, world_size):
 
 
 def simple_coalesced_reduce_tests(rank, world_size):
+    # [FUNCTION DOC] Build allreduce_coalesced cases for a rank and world size. Returns
+    # tuples of (reduce op, list of two input tensors, list of two expected outputs) for SUM
+    # (rank+1 and its square), PRODUCT, MIN and MAX with closed-form expected results.
     return [
         (
             c10d.ReduceOp.SUM,
@@ -198,6 +212,10 @@ def simple_coalesced_reduce_tests(rank, world_size):
 
 
 def simple_multi_input_reduce_tests(rank, world_size):
+    # [FUNCTION DOC] Build multi-input allreduce cases for a rank and world size. Returns
+    # tuples of (reduce op, list of two input tensors held by this rank, single expected
+    # tensor that every input tensor should equal afterwards) for SUM, PRODUCT, MIN and MAX,
+    # treating each rank as owning two logical participants.
     return [
         (
             c10d.ReduceOp.SUM,
@@ -223,8 +241,12 @@ def simple_multi_input_reduce_tests(rank, world_size):
 
 
 class RendezvousTCPTest(TestCase):
+    # [CLASS DOC] Tests TCP rendezvous with a single process and no spawned workers.
     @retry_on_connect_failures
     def test_tcp_init(self):
+        # [FUNCTION DOC] Run the tcp rendezvous with port 0, rank 0, world size 1 (retried
+        # on connect failures) and check that the returned rank/world size match and the
+        # store got a real port.
         rendezvous_iterator = dist.rendezvous("tcp://127.0.0.1:0", rank=0, world_size=1)
         store, rank, world_size = next(rendezvous_iterator)
         self.assertEqual(rank, 0)
@@ -234,9 +256,14 @@ class RendezvousTCPTest(TestCase):
 
 
 class RendezvousEnvTest(TestCase):
+    # [CLASS DOC] Tests env:// rendezvous side effects in a single process.
     @requires_gloo()
     @retry_on_connect_failures
     def test_logging_init(self):
+        # [FUNCTION DOC] Sets WORLD_SIZE, MASTER_ADDR, MASTER_PORT (free port) and RANK in
+        # os.environ (side effect, never restored), initializes a one-rank gloo group via
+        # env://, and checks that the root logging handler list is unchanged by init.
+        # Destroys the group at the end.
         os.environ["WORLD_SIZE"] = "1"
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = str(common.find_free_port())
@@ -255,25 +282,41 @@ class RendezvousEnvTest(TestCase):
 
 
 class TimeoutTest(test_c10d_common.AbstractTimeoutTest, TestCase):
+    # [CLASS DOC] Gloo specialization of the shared timeout tests from test_c10d_common.
     @requires_gloo()
     @retry_on_connect_failures
     def test_default_store_timeout_gloo(self):
+        # [FUNCTION DOC] Delegates to the shared default-store-timeout check using the gloo
+        # backend.
         self._test_default_store_timeout("gloo")
 
 
 class ProcessGroupGlooTest(MultiProcessTestCase):
+    # [CLASS DOC] Multi-process test case for ProcessGroupGloo collectives. Each test runs
+    # in world_size spawned processes (spawned in setUp); the class attribute lazy_init
+    # controls whether created Gloo devices initialize lazily and is overridden by
+    # subclasses. Helpers build the group over a file store; test methods come in checks
+    # (error paths), basics (correctness), and stress (many concurrent async ops) flavors,
+    # with CUDA variants.
     lazy_init = False
 
     def _create_process_group_gloo(self, store, rank, world_size, opts):
+        # [FUNCTION DOC] HELPER: Construct a ProcessGroupGloo from the store using self.rank
+        # and self.world_size (the rank/world_size arguments are ignored), then run a
+        # barrier on it so all ranks are connected. Returns the group.
         pg = c10d.ProcessGroupGloo(store, self.rank, self.world_size, opts)
         dist.barrier(group=pg)
         return pg
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Run the base setUp, then spawn the worker processes.
         super().setUp()
         self._spawn_processes()
 
     def opts(self, threads=2, group_name="0"):
+        # [FUNCTION DOC] HELPER: Build Gloo options with a 50 second timeout, one loopback
+        # device (lazy per class setting), the given thread count and group name. Returns
+        # the options.
         opts = c10d.ProcessGroupGloo._Options()
         opts._timeout = 50.0
         opts._devices = [create_device(interface=LOOPBACK, lazy_init=self.lazy_init)]
@@ -283,6 +326,9 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_multi_device_constructor(self):
+        # [FUNCTION DOC] Creates a group with two loopback devices and issues four async
+        # allreduces of different sizes (twice the device count) so every device is used;
+        # waits on all futures.
         store = c10d.FileStore(self.file_name, self.world_size)
         opts = c10d.ProcessGroupGloo._Options()
         opts._timeout = 5.0
@@ -298,6 +344,10 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_split_world_pg_created_after_another_gloo_pg(self):
+        # [FUNCTION DOC] Regression test: creates an unrelated gloo group, then a world-
+        # sized group with default options, then splits it over all ranks. Checks the split
+        # group exists, reports all ranks as its global ranks, and that an allreduce on it
+        # yields the sum over ranks.
         # Regression test: ProcessGroupGloo::groupRanks() used to derive the
         # identity rank mapping only when local_id_ == 0. local_id_ is a
         # process-global counter over every ProcessGroupGloo constructed in the
@@ -335,6 +385,8 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_empty_tensors(self):
+        # [FUNCTION DOC] Broadcasting a zero-element tensor completes and returns an empty
+        # tensor equal to the input.
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
             store, self.rank, self.world_size, self.opts()
@@ -349,6 +401,10 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_broadcast_checks(self):
+        # [FUNCTION DOC] Checks broadcast argument validation: invalid root rank (negative
+        # or too large), invalid root tensor index (negative, out of range, or empty list),
+        # mismatched dtype and mismatched size among inputs each raise RuntimeError with the
+        # matching message.
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
             store, self.rank, self.world_size, self.opts()
@@ -401,12 +457,19 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
             pg.broadcast([t1, t3], opts)
 
     def _test_broadcast_basics(self, fn):
+        # [FUNCTION DOC] HELPER: Shared broadcast correctness test; fn transforms each input
+        # tensor (for example clone or move to CUDA). With every rank taking a turn as root,
+        # checks results for one tensor, two tensors with each as root tensor, and a complex
+        # tensor, then checks the convenience overload that takes a single tensor and a
+        # root.
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
             store, self.rank, self.world_size, self.opts()
         )
 
         def broadcast(xs, rootRank, rootTensor):
+            # [FUNCTION DOC] HELPER: Broadcast the list of tensors from the given root rank
+            # and root tensor index, wait for completion and return the future's value.
             opts = c10d.BroadcastOptions()
             opts.rootRank = rootRank
             opts.rootTensor = rootTensor
@@ -453,14 +516,20 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_broadcast_basics(self):
+        # [FUNCTION DOC] CPU broadcast correctness test using cloned inputs.
         self._test_broadcast_basics(lambda t: t.clone())
 
     @skip_if_lt_x_gpu(2)
     @requires_gloo()
     def test_broadcast_basics_cuda(self):
+        # [FUNCTION DOC] CUDA broadcast correctness test; inputs are cloned and moved to the
+        # GPU.
         self._test_broadcast_basics(lambda t: t.clone().cuda())
 
     def _test_broadcast_stress(self, inputs):
+        # [FUNCTION DOC] HELPER: Create a group with 8 threads, issue one async broadcast
+        # per input with root cycling over ranks, then wait on each and check the tensor
+        # holds the root's value.
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
             store, self.rank, self.world_size, self.opts(threads=8)
@@ -479,6 +548,7 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_broadcast_stress(self):
+        # [FUNCTION DOC] Stress test: 1000 CPU broadcasts of rank-dependent values.
         inputs = [torch.tensor([i * self.world_size + self.rank]) for i in range(1000)]
         self._test_broadcast_stress(inputs)
 
@@ -486,6 +556,7 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
     @requires_gloo()
     @skipIfRocm
     def test_broadcast_stress_cuda(self):
+        # [FUNCTION DOC] Stress test: 1000 CUDA broadcasts (needs 2 GPUs; skipped on ROCm).
         inputs = [
             torch.tensor([i * self.world_size + self.rank]).cuda() for i in range(1000)
         ]
@@ -493,6 +564,8 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_allreduce_checks(self):
+        # [FUNCTION DOC] Checks allreduce validation: an empty tensor list, mixed dtypes and
+        # mixed sizes raise RuntimeError with the matching messages.
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
             store, self.rank, self.world_size, self.opts()
@@ -516,6 +589,10 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_allreduce_op_timeout(self):
+        # [FUNCTION DOC] Sets a 1ms timeout on the allreduce options; only rank 0 issues the
+        # op so it times out. Checks wait raises RuntimeError mentioning the timeout and
+        # that the work's exception() returns a typed RuntimeError (regression for a raw
+        # exception pointer).
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
             store, self.rank, self.world_size, self.opts()
@@ -536,6 +613,8 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_allreduce_overall_timeout(self):
+        # [FUNCTION DOC] Sets a 1ms group-wide timeout via set_timeout; only rank 0 issues
+        # an allreduce, which must raise RuntimeError about timing out when waited on.
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
             store, self.rank, self.world_size, self.opts()
@@ -549,6 +628,10 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
                 pg.allreduce([t1]).wait()
 
     def _test_allreduce_basics(self, fn):
+        # [FUNCTION DOC] HELPER: Shared allreduce correctness test with a tensor transform
+        # fn. Runs all single-input cases, all multi-input cases, the default (SUM)
+        # convenience overload, and an fp16 SUM check comparing allreduce against allgather
+        # followed by a local sum with loose tolerances.
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
             store, self.rank, self.world_size, self.opts()
@@ -615,14 +698,19 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_allreduce_basics(self):
+        # [FUNCTION DOC] CPU allreduce correctness test.
         self._test_allreduce_basics(lambda t: t.clone())
 
     @skip_if_lt_x_gpu(2)
     @requires_gloo()
     def test_allreduce_basics_cuda(self):
+        # [FUNCTION DOC] CUDA allreduce correctness test (needs 2 GPUs).
         self._test_allreduce_basics(lambda t: t.clone().cuda())
 
     def _test_allreduce_stress(self, inputs):
+        # [FUNCTION DOC] HELPER: Create a group with 8 threads, issue one async allreduce
+        # per input and check each result equals the expected sum over ranks for that
+        # iteration.
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
             store, self.rank, self.world_size, self.opts(threads=8)
@@ -645,6 +733,7 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_allreduce_stress(self):
+        # [FUNCTION DOC] Stress test: 1000 CPU allreduces.
         inputs = [torch.tensor([i + self.rank]) for i in range(1000)]
         self._test_allreduce_stress(inputs)
 
@@ -652,11 +741,15 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
     @requires_gloo()
     @skipIfRocm
     def test_allreduce_stress_cuda(self):
+        # [FUNCTION DOC] Stress test: 1000 CUDA allreduces (needs 2 GPUs; skipped on ROCm).
         inputs = [torch.tensor([i + self.rank]).cuda() for i in range(1000)]
         self._test_allreduce_stress(inputs)
 
     @requires_gloo()
     def test_allreduce_coalesced_checks(self):
+        # [FUNCTION DOC] Checks allreduce_coalesced validation: empty list, mixed dtypes,
+        # mixing dense and sparse layouts, and all-sparse input each raise RuntimeError with
+        # the matching message.
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
             store, self.rank, self.world_size, self.opts()
@@ -687,6 +780,8 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
     @skip_if_lt_x_gpu(1)
     @requires_gloo()
     def test_allreduce_coalesced_checks_cuda(self):
+        # [FUNCTION DOC] Checks that allreduce_coalesced on CUDA tensors raises RuntimeError
+        # about an unsupported device type.
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
             store, self.rank, self.world_size, self.opts()
@@ -699,6 +794,8 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
             pg.allreduce_coalesced([t1.cuda(), t1.cuda()], opts)
 
     def _test_allreduce_coalesced_basics(self, fn):
+        # [FUNCTION DOC] HELPER: Run every coalesced reduce case with inputs transformed by
+        # fn and compare each result tensor to the expected tensor.
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
             store, self.rank, self.world_size, self.opts()
@@ -717,13 +814,19 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_allreduce_coalesced_basics(self):
+        # [FUNCTION DOC] CPU allreduce_coalesced correctness test.
         self._test_allreduce_coalesced_basics(lambda t: t.clone())
 
     def _expected_output(self, i):
+        # [FUNCTION DOC] HELPER: Expected output of the i-th stress iteration: a list of two
+        # identical tensors holding i times world size plus the sum of ranks.
         ws = self.world_size
         return 2 * [torch.tensor([(i * ws) + (ws * (ws - 1) // 2)])]
 
     def _test_allreduce_coalesced_stress(self, inputs):
+        # [FUNCTION DOC] HELPER: Create a group with 8 threads, issue one async
+        # allreduce_coalesced per input and compare each result against the expected output
+        # for its iteration.
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
             store, self.rank, self.world_size, self.opts(threads=8)
@@ -742,11 +845,16 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_allreduce_coalesced_stress(self):
+        # [FUNCTION DOC] Stress test: 1000 coalesced allreduces, each of two identical
+        # tensors.
         inputs = [2 * [torch.tensor([i + self.rank])] for i in range(1000)]
         self._test_allreduce_coalesced_stress(inputs)
 
     @requires_gloo()
     def test_sparse_allreduce_checks(self):
+        # [FUNCTION DOC] Checks sparse allreduce validation: empty list, mixing dense and
+        # sparse, mismatched sparse sizes raise RuntimeError; PRODUCT, MIN and MAX
+        # reductions on sparse tensors raise RuntimeError about unsupported reduction.
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
             store, self.rank, self.world_size, self.opts()
@@ -778,6 +886,10 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
                 pg.allreduce([t3], opts)
 
     def _test_sparse_allreduce_basics(self, fn):
+        # [FUNCTION DOC] HELPER: Run sparse allreduce on cases from
+        # simple_sparse_reduce_tests with one and two inputs per rank (inputs transformed by
+        # fn); checks both the in-place tensors and the returned result equal the expected
+        # outputs.
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
             store, self.rank, self.world_size, self.opts()
@@ -797,16 +909,21 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_sparse_allreduce_basics(self):
+        # [FUNCTION DOC] CPU sparse allreduce correctness test.
         self._test_sparse_allreduce_basics(lambda t: t)
 
     @skip_if_lt_x_gpu(2)
     @requires_gloo()
     def test_sparse_allreduce_basics_cuda(self):
+        # [FUNCTION DOC] CUDA sparse allreduce correctness test (needs 2 GPUs).
         self._test_sparse_allreduce_basics(lambda t: t.clone().cuda())
 
     @skip_if_lt_x_gpu(2)
     @requires_gloo()
     def test_sparse_allreduce_cuda_dispatched(self):
+        # [FUNCTION DOC] Initializes the default gloo process group, then runs
+        # dist.all_reduce asynchronously on a sparse CUDA tensor for each case (needs 2
+        # GPUs) and checks the result. Does not destroy the group.
         store = c10d.FileStore(self.file_name, self.world_size)
         dist.init_process_group(
             backend="gloo", store=store, rank=self.rank, world_size=self.world_size
@@ -820,6 +937,9 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_allgather_into_tensor_coalesced(self):
+        # [FUNCTION DOC] Initializes the default gloo group and runs the coalesced
+        # allgather-into-tensor on three differently shaped random tensors; each output must
+        # equal the input concatenated world_size times. Seeds the RNG with 42.
         store = c10d.FileStore(self.file_name, self.world_size)
         dist.init_process_group(
             backend="gloo",
@@ -842,6 +962,10 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_reduce_scatter(self):
+        # [FUNCTION DOC] Initializes the default gloo group and runs async reduce_scatter
+        # for SUM, AVG, MIN, MAX and PRODUCT with list inputs (constant tensors of
+        # rank+i+1). Compares each output to the value computed locally over ranks, one
+        # subtest per op.
         store = c10d.FileStore(self.file_name, self.world_size)
         dist.init_process_group(
             backend="gloo",
@@ -893,6 +1017,9 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_reduce_scatter_tensor(self):
+        # [FUNCTION DOC] Same as the list reduce_scatter test but through the single-tensor
+        # reduce_scatter_single variant: input is a concatenation of per-rank chunks of size
+        # 10. Checks each op's result against the locally computed reduction.
         store = c10d.FileStore(self.file_name, self.world_size)
         dist.init_process_group(
             backend="gloo",
@@ -946,6 +1073,10 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_reduce_scatter_tensor_coalesced(self):
+        # [FUNCTION DOC] Tests coalesced reduce_scatter_tensor with three tensors of
+        # different chunk sizes (5, 10, 15) per op, via the world group's coalesced method
+        # and ReduceScatterOptions; checks every output against the locally computed
+        # reduction.
         store = c10d.FileStore(self.file_name, self.world_size)
         dist.init_process_group(
             backend="gloo",
@@ -1009,6 +1140,10 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_scatter_checks(self):
+        # [FUNCTION DOC] Checks scatter validation: bad root rank, output list not of length
+        # one, input list not a single list on the root, wrong inner list length (too short
+        # or too long), mismatched dtype or size, and non-empty input on a non-root rank
+        # each raise RuntimeError with the matching message.
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
             store, self.rank, self.world_size, self.opts()
@@ -1090,6 +1225,9 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
             pg.scatter([t1], [[t1] * self.world_size], opts)
 
     def _test_scatter_basics(self, fn):
+        # [FUNCTION DOC] HELPER: Scatter correctness; ranks take turns as root, the root
+        # supplying per-rank tensors holding its own rank. Each rank's output must equal the
+        # root's rank value.
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
             store, self.rank, self.world_size, self.opts()
@@ -1117,14 +1255,19 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_scatter_basics(self):
+        # [FUNCTION DOC] CPU scatter correctness test.
         self._test_scatter_basics(lambda t: t.clone())
 
     @skip_if_lt_x_gpu(2)
     @requires_gloo()
     def test_scatter_basics_cuda(self):
+        # [FUNCTION DOC] CUDA scatter correctness test (needs 2 GPUs).
         self._test_scatter_basics(lambda t: t.clone().cuda())
 
     def _test_scatter_stress(self, inputs, fn):
+        # [FUNCTION DOC] HELPER: Create an 8-thread group and queue one scatter per (input,
+        # root) pair; afterwards each result must equal the iteration index plus the root
+        # rank. Inputs are transformed by fn on the root only.
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
             store, self.rank, self.world_size, self.opts(threads=8)
@@ -1162,6 +1305,8 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_set_gloo_pg_timeout(self):
+        # [FUNCTION DOC] Checks the private default timeout of the group options is 50
+        # seconds, and that setting the default timeout to 23 seconds updates the options.
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
             store, self.rank, self.world_size, self.opts()
@@ -1173,6 +1318,10 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_gloo_set_timeout_api(self):
+        # [FUNCTION DOC] Initializes the default gloo group with a 50s timeout, checks the
+        # backend options, runs an allreduce, then changes the timeout to 1ms via
+        # set_timeout (checking the backend options update). Only rank 0 then issues an
+        # allreduce, which must time out. Destroys the process group at the end.
         """
         Test set_timeout API for Gloo backend (issue #165422).
         This test demonstrates that dynamically changing timeout via set_timeout
@@ -1214,6 +1363,9 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_gloo_set_pg_timeout_deprecated(self):
+        # [FUNCTION DOC] Checks that the deprecated private _set_pg_timeout still works: it
+        # emits a FutureWarning and updates the backend timeout to 23 seconds. Destroys the
+        # group afterwards.
         """
         The private `_set_pg_timeout` alias is deprecated but must remain
         functional, delegating to the public `set_timeout`.
@@ -1238,6 +1390,7 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_scatter_stress(self):
+        # [FUNCTION DOC] Stress test: 1000 CPU scatters of rank-independent tensors.
         inputs = [
             [torch.tensor([i + self.rank]) for _ in range(self.world_size)]
             for i in range(1000)
@@ -1251,6 +1404,8 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
     @requires_gloo()
     @skipIfRocm
     def test_scatter_stress_cuda(self):
+        # [FUNCTION DOC] Stress test: 1000 CUDA scatters (needs 2 GPUs; skipped on ROCm and
+        # in sandcastle runs, where it is reported as passing because it is flaky).
         inputs = [
             [torch.tensor([i + self.rank]) for _ in range(self.world_size)]
             for i in range(1000)
@@ -1259,6 +1414,10 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_gather_checks(self):
+        # [FUNCTION DOC] Checks gather validation: bad root rank, input list not of length
+        # one, output list not a single list on the root, wrong output list length (short or
+        # long), mismatched dtype or size, and non-empty output on a non-root rank each
+        # raise RuntimeError with the message.
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
             store, self.rank, self.world_size, self.opts()
@@ -1340,6 +1499,8 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
             pg.gather([[t1] * self.world_size], [t1], opts)
 
     def _test_gather_basics(self, fn):
+        # [FUNCTION DOC] HELPER: Gather correctness; ranks take turns as root; the root's
+        # output list is compared with each rank's value, transformed by fn.
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
             store, self.rank, self.world_size, self.opts()
@@ -1369,19 +1530,26 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_gather_basics(self):
+        # [FUNCTION DOC] CPU gather correctness test.
         self._test_gather_basics(lambda t: t.clone())
 
     @skip_if_lt_x_gpu(2)
     @requires_gloo()
     def test_gather_basics_cuda(self):
+        # [FUNCTION DOC] CUDA gather correctness test (needs 2 GPUs).
         self._test_gather_basics(lambda t: t.clone().cuda())
 
     @requires_gloo()
     def test_gather_noncontiguous_input(self):
+        # [FUNCTION DOC] Gather correctness with non-contiguous, non-dense input tensors (a
+        # strided column view of a two-dimensional tensor).
         # Take a column of 2D tensor, such that memory is not dense
         self._test_gather_basics(lambda t: t.expand(2, 2).tril().contiguous()[:, 0])
 
     def _test_gather_stress(self, inputs, fn):
+        # [FUNCTION DOC] HELPER: Create an 8-thread group and queue one gather per (input,
+        # root) pair; on the root, the gathered list must equal the per-rank values for that
+        # iteration.
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
             store, self.rank, self.world_size, self.opts(threads=8)
@@ -1421,6 +1589,7 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_gather_stress(self):
+        # [FUNCTION DOC] Stress test: 1000 CPU gathers.
         inputs = [torch.tensor([i + self.rank]) for i in range(1000)]
         self._test_gather_stress(inputs, lambda t: t.clone())
 
@@ -1428,11 +1597,16 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
     @skipIfRocm
     @requires_gloo()
     def test_gather_stress_cuda(self):
+        # [FUNCTION DOC] Stress test: 1000 CUDA gathers (needs 2 GPUs; skipped on ROCm).
         inputs = [torch.tensor([i + self.rank]).cuda() for i in range(1000)]
         self._test_gather_stress(inputs, lambda t: t.clone().cuda())
 
     @requires_gloo()
     def test_allgather_checks(self):
+        # [FUNCTION DOC] Checks allgather validation: empty input/output lists, input and
+        # output lists of different lengths, output list not of world size (short or long),
+        # and mismatched dtype or size among inputs or among output tensors each raise
+        # RuntimeError with the matching message.
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
             store, self.rank, self.world_size, self.opts()
@@ -1480,6 +1654,10 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
             pg.allgather([([t1, t3] * (self.world_size))[: self.world_size]], [t1])
 
     def _test_allgather_basics(self, fn):
+        # [FUNCTION DOC] HELPER: Allgather correctness with 1, 2 and 3 input tensors per
+        # rank (values derived from the rank, transformed by fn); the gathered lists must
+        # equal consecutive integers. With a single input the returned value is wrapped in a
+        # list before comparison.
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
             store, self.rank, self.world_size, self.opts()
@@ -1505,24 +1683,31 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_allgather_basics(self):
+        # [FUNCTION DOC] CPU allgather correctness test.
         self._test_allgather_basics(lambda t: t.clone())
 
     @skip_if_lt_x_gpu(2)
     @requires_gloo()
     def test_allgather_basics_cuda(self):
+        # [FUNCTION DOC] CUDA allgather correctness test (needs 2 GPUs).
         self._test_allgather_basics(lambda t: t.clone().cuda())
 
     @requires_gloo()
     def test_allgather_noncontiguous_input(self):
+        # [FUNCTION DOC] Allgather correctness with non-contiguous, non-dense input tensors.
         # Take a column of 2D tensor, such that memory is not dense
         self._test_allgather_basics(lambda t: t.expand(2, 2).tril().contiguous()[:, 0])
 
     @requires_gloo()
     def test_allgather_inference_mode(self):
+        # [FUNCTION DOC] Runs the CPU allgather correctness test under inference mode.
         with torch.inference_mode():
             self._test_allgather_basics(lambda t: t.clone())
 
     def _test_allgather_stress(self, inputs, fn):
+        # [FUNCTION DOC] HELPER: Create an 8-thread group and queue one allgather per input
+        # (each input kept alive in a holder mapping to avoid a known data race), then check
+        # each gathered list equals the iteration value plus each rank index.
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
             store, self.rank, self.world_size, self.opts(threads=8)
@@ -1557,6 +1742,7 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_allgather_stress(self):
+        # [FUNCTION DOC] Stress test: 1000 CPU allgathers.
         inputs = [torch.tensor([i + self.rank]) for i in range(1000)]
         self._test_allgather_stress(inputs, lambda t: t.clone())
 
@@ -1564,11 +1750,16 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
     @requires_gloo()
     @skipIfRocm
     def test_allgather_stress_cuda(self):
+        # [FUNCTION DOC] Stress test: 1000 CUDA allgathers (needs 2 GPUs; skipped on ROCm).
         inputs = [torch.tensor([i + self.rank]).cuda() for i in range(1000)]
         self._test_allgather_stress(inputs, lambda t: t.clone().cuda())
 
     @requires_gloo()
     def test_allgather_coalesced_checks(self):
+        # [FUNCTION DOC] Checks all_gather_coalesced validation: output tensor with wrong
+        # size or wrong dtype relative to the input (RuntimeError naming index 0), output
+        # list count not equal to world size (RuntimeError), and a flat tensor list instead
+        # of list of lists (TypeError).
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
             store, self.rank, self.world_size, self.opts()
@@ -1608,6 +1799,11 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_allgather_coalesced_async(self):
+        # [FUNCTION DOC] Initializes the default gloo group, launches two async
+        # all_gather_coalesced calls with two identical tensors each, waits for all futures
+        # and checks each gathered tensor equals the corresponding rank's input. Destroys
+        # the process group explicitly at the end because otherwise the Gloo group may not
+        # be destructed before the interpreter exits.
         store = c10d.FileStore(self.file_name, self.world_size)
         c10d.init_process_group(
             backend="gloo", rank=self.rank, world_size=self.world_size, store=store
@@ -1650,6 +1846,9 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_reduce_checks(self):
+        # [FUNCTION DOC] Checks reduce validation: bad root rank (negative or too large),
+        # bad root tensor index, and a tensor list that is not a single element each raise
+        # RuntimeError.
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
             store, self.rank, self.world_size, self.opts()
@@ -1684,6 +1883,9 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
             pg.reduce([t1, t1], opts)
 
     def _test_reduce_basics(self, fn):
+        # [FUNCTION DOC] HELPER: Run every simple reduce case with every rank as root,
+        # inputs transformed by fn; the root rank compares its result to the expected tensor
+        # (non-roots are not checked).
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
             store, self.rank, self.world_size, self.opts()
@@ -1702,14 +1904,19 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_reduce_basics(self):
+        # [FUNCTION DOC] CPU reduce correctness test.
         self._test_reduce_basics(lambda t: t.clone())
 
     @skip_if_lt_x_gpu(2)
     @requires_gloo()
     def test_reduce_basics_cuda(self):
+        # [FUNCTION DOC] CUDA reduce correctness test (needs 2 GPUs).
         self._test_reduce_basics(lambda t: t.clone().cuda())
 
     def _test_reduce_stress(self, inputs):
+        # [FUNCTION DOC] HELPER: Create an 8-thread group and queue a reduce (default SUM)
+        # on a clone of each input for every root; when this rank is root, the result must
+        # equal the sum over ranks.
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
             store, self.rank, self.world_size, self.opts(threads=8)
@@ -1746,6 +1953,7 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_reduce_stress(self):
+        # [FUNCTION DOC] Stress test: 1000 CPU reduces over all roots.
         inputs = [torch.tensor([i + self.rank]) for i in range(1000)]
         self._test_reduce_stress(inputs)
 
@@ -1753,12 +1961,16 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
     @requires_gloo()
     @skipIfRocm
     def test_reduce_stress_cuda(self):
+        # [FUNCTION DOC] Stress test: 1000 CUDA reduces (needs 2 GPUs; skipped on ROCm).
         inputs = [torch.tensor([i + self.rank]).cuda() for i in range(1000)]
         self._test_reduce_stress(inputs)
 
     @unittest.skipIf(IS_MACOS, "https://github.com/pytorch/pytorch/issues/71195")
     @requires_gloo()
     def test_send_recv_all_to_all(self):
+        # [FUNCTION DOC] Every rank sends its rank value to every other rank with point-to-
+        # point send and recv (tag 0), waits for all work, checks it reports completed, and
+        # checks received values equal the sender's rank. Skipped on macOS.
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
             store, self.rank, self.world_size, self.opts()
@@ -1800,6 +2012,9 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_barrier_implies_wait(self):
+        # [FUNCTION DOC] Issues 16 allreduces whose work handles are dropped, then a
+        # barrier, and checks after the barrier future completes that all tensors hold the
+        # reduced values (barrier waits for prior work).
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
             store, self.rank, self.world_size, self.opts()
@@ -1823,6 +2038,9 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
     @requires_gloo()
     @skipIfRocm
     def test_block_current_stream_cuda(self):
+        # [FUNCTION DOC] On a CUDA tensor, calls block_current_stream on an allreduce work,
+        # synchronizes the current stream, then waits on the work. Needs 2 GPUs; skipped on
+        # ROCm.
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
             store, self.rank, self.world_size, self.opts()
@@ -1836,6 +2054,9 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_send_recv_complex(self):
+        # [FUNCTION DOC] Rank 0 sends a seeded random complex tensor to rank 1, which
+        # receives into a tensor and checks equality with the same locally regenerated
+        # tensor.
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
             store, self.rank, self.world_size, self.opts()
@@ -1852,6 +2073,10 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_alltoall_checks(self):
+        # [FUNCTION DOC] Checks alltoall validation: input or output list not of world size,
+        # mismatched dtype or size inside the input or output lists, and input/output
+        # tensors differing in dtype or size each raise RuntimeError with the matching
+        # message.
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
             store, self.rank, self.world_size, self.opts()
@@ -1902,6 +2127,9 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
             pg.alltoall([t3] * self.world_size, [t1] * self.world_size)
 
     def _test_alltoall_basics(self, fn):
+        # [FUNCTION DOC] HELPER: Each rank sends a tensor holding its rank value to every
+        # rank; after alltoall, the output at index j must hold j. Tensors are transformed
+        # by fn.
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
             store, self.rank, self.world_size, self.opts()
@@ -1923,14 +2151,19 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_alltoall_basics(self):
+        # [FUNCTION DOC] CPU alltoall correctness test.
         self._test_alltoall_basics(lambda t: t.clone())
 
     @skip_if_lt_x_gpu(2)
     @requires_gloo()
     def test_alltoall_basics_cuda(self):
+        # [FUNCTION DOC] CUDA alltoall correctness test (needs 2 GPUs).
         self._test_alltoall_basics(lambda t: t.clone().cuda())
 
     def _test_alltoall_stress(self, inputs, fn):
+        # [FUNCTION DOC] HELPER: Create an 8-thread group and queue one alltoall per input
+        # list; each output j must hold the value sent by rank j to this rank (iteration
+        # times world size plus this rank).
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
             store, self.rank, self.world_size, self.opts(threads=8)
@@ -1967,6 +2200,7 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_alltoall_stress(self):
+        # [FUNCTION DOC] Stress test: 1000 CPU alltoalls.
         inputs = [
             [torch.tensor([i * self.world_size + j]) for j in range(self.world_size)]
             for i in range(1000)
@@ -1977,6 +2211,7 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
     @requires_gloo()
     @skipIfRocm
     def test_alltoall_stress_cuda(self):
+        # [FUNCTION DOC] Stress test: 1000 CUDA alltoalls (needs 2 GPUs; skipped on ROCm).
         inputs = [
             [torch.tensor([i * self.world_size + j]) for j in range(self.world_size)]
             for i in range(1000)
@@ -1984,6 +2219,8 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
         self._test_alltoall_stress(inputs, lambda t: t.clone().cuda())
 
     def _test_alltoall_data_routing(self, fn):
+        # [FUNCTION DOC] HELPER: Verifies routing: rank i sends value i times 100 plus j to
+        # rank j, and rank r must receive j times 100 plus r from every rank j.
         """
         Test that data routing is correct: rank i sends inputTensors[j]
         to rank j
@@ -2024,14 +2261,19 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_alltoall_data_routing(self):
+        # [FUNCTION DOC] CPU alltoall routing test.
         self._test_alltoall_data_routing(lambda t: t.clone())
 
     @skip_if_lt_x_gpu(2)
     @requires_gloo()
     def test_alltoall_data_routing_cuda(self):
+        # [FUNCTION DOC] CUDA alltoall routing test (needs 2 GPUs).
         self._test_alltoall_data_routing(lambda t: t.clone().cuda())
 
     def _test_alltoall_multidim(self, fn):
+        # [FUNCTION DOC] HELPER: alltoall with 3 by 4 tensors whose entries encode source,
+        # destination, row and column; each received tensor (moved to CPU) must match what
+        # its source sent here.
         """Test alltoall with multi-dimensional tensors."""
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
@@ -2065,22 +2307,31 @@ class ProcessGroupGlooTest(MultiProcessTestCase):
 
     @requires_gloo()
     def test_alltoall_multidim(self):
+        # [FUNCTION DOC] CPU multi-dimensional alltoall test.
         self._test_alltoall_multidim(lambda t: t.clone())
 
     @skip_if_lt_x_gpu(2)
     @requires_gloo()
     def test_alltoall_multidim_cuda(self):
+        # [FUNCTION DOC] CUDA multi-dimensional alltoall test (needs 2 GPUs).
         self._test_alltoall_multidim(lambda t: t.clone().cuda())
 
 
 class DistributedDataParallelTest(
     test_c10d_common.CommonDistributedDataParallelTest, MultiProcessTestCase
 ):
+    # [CLASS DOC] Gloo DDP tests running in spawned processes. Mixes the shared DDP test
+    # implementations from test_c10d_common into a multi-process case; tests cover device
+    # layouts, unused parameters, buffers, comm hooks and related DDP options over a gloo
+    # process group.
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Run the base setUp, then spawn the worker processes.
         super().setUp()
         self._spawn_processes()
 
     def _get_process_group(self):
+        # [FUNCTION DOC] HELPER: Initializes the default gloo process group from the common
+        # store (side effect: global default group) and returns it.
         store = self._get_store()
         c10d.init_process_group(
             backend="gloo", store=store, rank=self.rank, world_size=self.world_size
@@ -2090,6 +2341,10 @@ class DistributedDataParallelTest(
     def _test_gloo_backend(
         self, devices, device_ids, multi_device=False, gradient_as_bucket_view=False
     ):
+        # [FUNCTION DOC] HELPER: Initializes the default gloo group over a file store, takes
+        # the backend for the last device in devices, creates a loopback device on it, then
+        # delegates to the shared DDP-with-process-group test with the given device list,
+        # device ids and options.
         store = c10d.FileStore(self.file_name, self.world_size)
         c10d.init_process_group(
             backend="gloo", store=store, rank=self.rank, world_size=self.world_size
@@ -2104,10 +2359,12 @@ class DistributedDataParallelTest(
 
     @requires_gloo()
     def test_gloo_backend_cpu_module(self):
+        # [FUNCTION DOC] Gloo DDP test on CPU module.
         self._test_gloo_backend([torch.device("cpu")], None)
 
     @requires_gloo()
     def test_gloo_backend_cpu_module_grad_is_view(self):
+        # [FUNCTION DOC] Gloo DDP test on CPU module with gradient_as_bucket_view enabled.
         self._test_gloo_backend(
             [torch.device("cpu")], None, gradient_as_bucket_view=True
         )
@@ -2115,6 +2372,8 @@ class DistributedDataParallelTest(
     @requires_gloo()
     @skip_if_lt_x_gpu(2)
     def test_gloo_backend_1gpu_module_device_ids_integer_list(self):
+        # [FUNCTION DOC] Gloo DDP with one GPU per rank, device ids given as a list of
+        # integers.
         int_devices = gpus_for_rank(self.world_size)[self.rank][:1]
         devices = [torch.device("cuda:" + str(i)) for i in int_devices]
         self._test_gloo_backend(devices, int_devices)
@@ -2122,6 +2381,7 @@ class DistributedDataParallelTest(
     @requires_gloo()
     @skip_if_lt_x_gpu(2)
     def test_gloo_backend_1gpu_module_device_ids_torch_device_list(self):
+        # [FUNCTION DOC] Gloo DDP with one GPU per rank, device ids given as torch devices.
         int_devices = gpus_for_rank(self.world_size)[self.rank][:1]
         devices = [torch.device("cuda:" + str(i)) for i in int_devices]
         self._test_gloo_backend(devices, devices)
@@ -2129,6 +2389,7 @@ class DistributedDataParallelTest(
     @requires_gloo()
     @skip_if_lt_x_gpu(4)
     def test_gloo_backend_2gpu_module(self):
+        # [FUNCTION DOC] Gloo DDP with a module spanning two GPUs per rank (multi_device).
         int_devices = gpus_for_rank(self.world_size)[self.rank][:2]
         devices = [torch.device("cuda:" + str(i)) for i in int_devices]
         self._test_gloo_backend(devices, None, multi_device=True)
@@ -2136,6 +2397,7 @@ class DistributedDataParallelTest(
     @requires_gloo()
     @skip_if_lt_x_gpu(8)
     def test_gloo_backend_4gpu_module(self):
+        # [FUNCTION DOC] Gloo DDP with a module spanning four GPUs per rank (multi_device).
         int_devices = gpus_for_rank(self.world_size)[self.rank][:4]
         devices = [torch.device("cuda:" + str(i)) for i in int_devices]
         self._test_gloo_backend(devices, None, multi_device=True)
@@ -2143,6 +2405,11 @@ class DistributedDataParallelTest(
     def _test_global_local_unused_params_grad(
         self, gradient_as_bucket_view=False, static_graph=False
     ):
+        # [FUNCTION DOC] HELPER: Simulates multi-task training with a module using one of
+        # two tasks depending on rank. For CPU and GPU DDP wrappers (find_unused_parameters
+        # on) it checks that gradients start as None, and after backward the locally used
+        # task parameters have gradients on all ranks while the globally unused task
+        # parameter stays None.
         """
         By simulating a multi-task training, this test is to make sure:
         1) DDP does not touch the grad of globally unused parameters.
@@ -2150,19 +2417,30 @@ class DistributedDataParallelTest(
         """
 
         class GlobalLocalUnusedParamModule(nn.Module):
+            # [CLASS DOC] HELPER: Module with three Task submodules; forward uses the first
+            # on rank 0 and the second otherwise, so the third is never used.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the three Task submodules t0, t1 and
+                # task_unused.
                 super().__init__()
                 self.t0 = Task()
                 self.t1 = Task()
                 self.task_unused = Task()
 
             def task_parameters(self):
+                # [FUNCTION DOC] HELPER: Returns the tuple of the parameter of each of the
+                # three tasks.
                 return (self.t0.p, self.t1.p, self.task_unused.p)
 
             def forward(self, x, rank):
+                # [FUNCTION DOC] HELPER: Applies task t0 to the input on rank 0, else task
+                # t1.
                 return self.t0(x) if rank == 0 else self.t1(x)
 
         def run_and_verify_grad(model):
+            # [FUNCTION DOC] HELPER: Runs a forward and backward on the DDP model, asserting
+            # gradients of all task parameters are None before backward, and afterwards the
+            # two used ones are set while the unused one is still None.
             # Run forward
             output = model(8, self.rank)
 
@@ -2208,21 +2486,28 @@ class DistributedDataParallelTest(
     @requires_gloo()
     @skip_if_lt_x_gpu(2)
     def test_global_local_unused_params_grad(self):
+        # [FUNCTION DOC] Unused-parameter gradient test with default options (needs 2 GPUs).
         self._test_global_local_unused_params_grad()
 
     @requires_gloo()
     @skip_if_lt_x_gpu(2)
     def test_global_local_unused_params_grad_with_grad_is_view(self):
+        # [FUNCTION DOC] Unused-parameter gradient test with gradient_as_bucket_view (needs
+        # 2 GPUs).
         self._test_global_local_unused_params_grad(gradient_as_bucket_view=True)
 
     @requires_gloo()
     @skip_if_lt_x_gpu(2)
     def test_global_local_unused_params_grad_with_static_graph(self):
+        # [FUNCTION DOC] Unused-parameter gradient test with static_graph (needs 2 GPUs).
         self._test_global_local_unused_params_grad(static_graph=True)
 
     @requires_gloo()
     @skip_if_lt_x_gpu(2)
     def test_find_unused_parameters_when_unused_parameters_empty(self):
+        # [FUNCTION DOC] Checks DDP allreduces unused parameters correctly when one rank
+        # (rank 0) uses all parameters, so its unused-parameter list is empty, while other
+        # ranks skip some. Needs 2 GPUs.
         """
         An empty unused_parameters array does not imply find_unused_parameters =
         false. This test makes sure that DDP allreduces unused parameters
@@ -2232,18 +2517,27 @@ class DistributedDataParallelTest(
         """
 
         class FindUnusedParamModule(nn.Module):
+            # [CLASS DOC] HELPER: Module with two Task submodules; rank 0 applies both in
+            # sequence, other ranks only the second.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates Task submodules t0 and t1.
                 super().__init__()
                 self.t0 = Task()
                 self.t1 = Task()
 
             def task_parameters(self):
+                # [FUNCTION DOC] HELPER: Returns the tuple of both tasks' parameters.
                 return (self.t0.p, self.t1.p)
 
             def forward(self, x, rank):
+                # [FUNCTION DOC] HELPER: Rank 0 applies t0 then t1 to the input; other ranks
+                # apply only t1.
                 return self.t1(self.t0(x)) if rank == 0 else self.t1(x)
 
         def run_and_verify_grad(model):
+            # [FUNCTION DOC] HELPER: Runs forward and backward on the DDP model; checks
+            # every task parameter has no gradient before backward and has a gradient on
+            # every rank afterwards.
             # Run forward
             output = model(8, self.rank)
 
@@ -2278,6 +2572,9 @@ class DistributedDataParallelTest(
 
     @requires_gloo()
     def test_ignored_output(self):
+        # [FUNCTION DOC] Builds a small DDP model on the default gloo group and runs 4
+        # forward passes whose outputs are discarded (no backward required), then 4
+        # iterations with cross-entropy loss and backward, checking nothing hangs or errors.
         """
         Test that the output of a model can be ignored and that there is no
         implicit requirement that `backward` gets called.
@@ -2285,13 +2582,19 @@ class DistributedDataParallelTest(
         process_group = self._get_process_group()
 
         class IgnoredOutput(nn.Module):
+            # [CLASS DOC] HELPER: Two-layer bias-free linear network with ReLU after each
+            # layer and a softmax over dim 1 on the output.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates fc1 (2 to 10), fc2 (10 to 4), both without
+                # bias, and a ReLU.
                 super().__init__()
                 self.fc1 = nn.Linear(2, 10, bias=False)
                 self.fc2 = nn.Linear(10, 4, bias=False)
                 self.relu = nn.ReLU()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies fc1, ReLU, fc2, ReLU and returns the
+                # softmax over dim 1.
                 x = self.relu(self.fc1(x))
                 x = self.relu(self.fc2(x))
                 return F.softmax(x, dim=1)
@@ -2319,6 +2622,9 @@ class DistributedDataParallelTest(
 
     @requires_gloo()
     def test_ignored_output_with_unused_parameters(self):
+        # [FUNCTION DOC] Like the ignored-output test but with find_unused_parameters
+        # enabled and a module containing an unused third linear layer; ignored forward
+        # outputs must not require backward, and subsequent normal iterations must succeed.
         """
         Test that the output of a model can be ignored and that there is no
         implicit requirement that `backward` gets called, if not all model
@@ -2327,7 +2633,11 @@ class DistributedDataParallelTest(
         process_group = self._get_process_group()
 
         class IgnoredOutputWithUnusedParameters(nn.Module):
+            # [CLASS DOC] HELPER: Same network as the ignored-output module but also owns an
+            # unused fc3 layer that forward never touches.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates fc1, fc2, an unused fc3 (all bias-free
+                # linear) and a ReLU.
                 super().__init__()
                 self.fc1 = nn.Linear(2, 10, bias=False)
                 self.fc2 = nn.Linear(10, 4, bias=False)
@@ -2335,6 +2645,8 @@ class DistributedDataParallelTest(
                 self.relu = nn.ReLU()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies fc1, ReLU, fc2, ReLU and returns softmax;
+                # fc3 is unused.
                 x = self.relu(self.fc1(x))
                 x = self.relu(self.fc2(x))
                 return F.softmax(x, dim=1)
@@ -2364,14 +2676,27 @@ class DistributedDataParallelTest(
     @requires_gloo()
     @skip_if_lt_x_gpu(2)
     def test_ignored_sharded_tensor(self):
+        # [FUNCTION DOC] Checks that DDP construction succeeds when the module holds a
+        # ShardedTensor parameter that is registered as ignored. Initializes a gloo group
+        # from a file init method, builds a sharded tensor from per-rank local CUDA shards,
+        # marks it ignored and constructs DDP with static graph and bucket-view grads. Needs
+        # 2 GPUs.
+        # KNOWN ISSUE: the device type is compared to the string gpu, which never matches
+        # cuda, so device_ids is always None here.
         class MyModule(nn.Module):
+            # [CLASS DOC] HELPER: Linear layer plus a sharded-tensor parameter; forward only
+            # uses the linear layer, ReLU and softmax.
             def __init__(self, shard_tensor: ShardedTensor) -> None:
+                # [FUNCTION DOC] HELPER: Creates fc1, wraps the given sharded tensor as a
+                # parameter named st, and a ReLU.
                 super().__init__()
                 self.fc1 = nn.Linear(2, 10, bias=False)
                 self.st = nn.Parameter(shard_tensor)
                 self.relu = nn.ReLU()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies fc1 and ReLU and returns the softmax over
+                # dim 1.
                 x = self.relu(self.fc1(x))
                 return F.softmax(x, dim=1)
 
@@ -2404,6 +2729,10 @@ class DistributedDataParallelTest(
         )
 
     def _run_and_verify_sparse_gradients(self, vanilla_model, ddp_model):
+        # [FUNCTION DOC] HELPER: Runs the vanilla model on the full batch and the DDP model
+        # on this rank's slice of it, both with cross-entropy backward, then checks the
+        # first parameter's gradients (coalesced) are equal, i.e. DDP averaged the sparse
+        # gradients correctly.
         mult = 2
         batch_size = mult * self.world_size
         criterion = nn.CrossEntropyLoss()
@@ -2428,6 +2757,12 @@ class DistributedDataParallelTest(
     @requires_gloo()
     @skip_if_lt_x_gpu(2)
     def test_save_load_checkpoint(self):
+        # [FUNCTION DOC] Trains three copies of a small network on GPU (a DDP model that
+        # gets checkpointed, a plain copy reloaded from the same state dict with the module
+        # prefix removed, and a DDP model trained without interruption), all starting from
+        # zeroed parameters. Rank 0 saves the DDP state dict to a temp-directory file and
+        # all ranks reload it after a barrier. After equal total steps all parameters must
+        # match. Needs 2 GPUs.
         dist.init_process_group(
             "gloo",
             init_method=f"file://{self.file_name}",
@@ -2436,18 +2771,25 @@ class DistributedDataParallelTest(
         )
 
         class TestModel(nn.Module):
+            # [CLASS DOC] HELPER: Same network as in the ignored-output tests (fc1, fc2,
+            # ReLU, softmax).
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates fc1, fc2 (bias-free) and a ReLU.
                 super().__init__()
                 self.fc1 = nn.Linear(2, 10, bias=False)
                 self.fc2 = nn.Linear(10, 4, bias=False)
                 self.relu = nn.ReLU()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies fc1, ReLU, fc2, ReLU and returns the
+                # softmax.
                 x = self.relu(self.fc1(x))
                 x = self.relu(self.fc2(x))
                 return F.softmax(x, dim=1)
 
         def train_loop(model, optimizer, iterations):
+            # [FUNCTION DOC] HELPER: Runs the given number of SGD-style steps (zero grad,
+            # forward on the enclosing input and target, loss, backward, step) on a model.
             for _ in range(iterations):
                 optimizer.zero_grad()
                 output = model(input)
@@ -2534,6 +2876,10 @@ class DistributedDataParallelTest(
     def _test_sparse_gradients(
         self, gradient_as_bucket_view=False, batched_grad_copy=False
     ):
+        # [FUNCTION DOC] HELPER: Seeds the RNG identically on all ranks, wraps a deep copy
+        # of a sparse embedding module in DDP with the given gradient_as_bucket_view and
+        # batched_grad_copy options, then compares sparse gradients against the single-
+        # process model.
         process_group = self._get_process_group()
 
         # Ensure initialized weights and inputs are identical across processes
@@ -2551,24 +2897,32 @@ class DistributedDataParallelTest(
 
     @requires_gloo()
     def test_sparse_gradients(self):
+        # [FUNCTION DOC] Sparse gradient test with default DDP options.
         self._test_sparse_gradients()
 
     @requires_gloo()
     def test_sparse_gradients_grad_is_view(self):
+        # [FUNCTION DOC] Sparse gradient test with gradient_as_bucket_view.
         self._test_sparse_gradients(gradient_as_bucket_view=True)
 
     @requires_gloo()
     def test_sparse_gradients_batched_grad_copy(self):
+        # [FUNCTION DOC] Sparse gradient test with batched_grad_copy.
         self._test_sparse_gradients(batched_grad_copy=True)
 
     @requires_gloo()
     def test_sparse_gradients_grad_is_view_batched_grad_copy(self):
+        # [FUNCTION DOC] Sparse gradient test with both bucket-view grads and
+        # batched_grad_copy.
         self._test_sparse_gradients(
             gradient_as_bucket_view=True, batched_grad_copy=True
         )
 
     @requires_gloo()
     def test_static_graph_batched_grad_copy(self):
+        # [FUNCTION DOC] Trains a double-precision linear layer both locally on the full
+        # batch and in DDP with static graph and batched_grad_copy on per-rank slices, for 3
+        # iterations with SGD, checking gradients each step and final parameters match.
         """Test batched_grad_copy with static_graph (delay_all_reduce path)."""
         process_group = self._get_process_group()
         torch.manual_seed(42)
@@ -2614,6 +2968,9 @@ class DistributedDataParallelTest(
 
     @requires_gloo()
     def test_ddp_comm_hook_future_passing_cpu(self):
+        # [FUNCTION DOC] Registers the simple test hook (which makes the gradient bucket the
+        # constant result) on a CPU DDP model and checks gradients equal the hook's output
+        # rather than the default average. Creates an unused file store.
         """
         This unit test verifies whether the Future object is passed properly.
         The callback function creates a Future object and sets a value to it.
@@ -2637,6 +2994,9 @@ class DistributedDataParallelTest(
     def _gpu_model_with_ddp_comm_hook(
         self, process_group, hook=None, gradient_as_bucket_view=False, state=None
     ):
+        # [FUNCTION DOC] HELPER: Builds a GPU DDP model (first GPU assigned to this rank) of
+        # the small hook-test module with the given process group and bucket-view option;
+        # registers the hook with the given state if one is supplied. Returns the model.
         device_id = gpus_for_rank(self.world_size)[self.rank][0]
         gpu_model = DistributedDataParallel(
             ModuleForDdpCommHook().to(device_id),
@@ -2654,6 +3014,8 @@ class DistributedDataParallelTest(
     @requires_gloo()
     @skip_if_lt_x_gpu(2)
     def test_ddp_comm_hook_future_passing_gpu_gloo(self):
+        # [FUNCTION DOC] Same as the CPU future-passing test but on a GPU model (needs 2
+        # GPUs).
         """
         This unit test verifies whether the Future object is passed properly using gloo backend.
         The hook callback function creates a Future object and sets a value to it.
@@ -2669,6 +3031,9 @@ class DistributedDataParallelTest(
 
     @requires_gloo()
     def test_ddp_invalid_comm_hook_init(self):
+        # [FUNCTION DOC] Checks register_comm_hook rejects a non-callable hook with
+        # TypeError and a hook whose bucket parameter is annotated with a wrong type with
+        # ValueError.
         """
         This unit test makes sure that register_comm_hook properly checks the format
         of hook defined by user. The Python hook must be callable. This test also
@@ -2690,12 +3055,19 @@ class DistributedDataParallelTest(
             def comm_hook(
                 state: object, bucket: int
             ) -> torch.futures.Future[torch.Tensor]:
+                # [FUNCTION DOC] HELPER: Hook with an incorrect bucket annotation (int);
+                # returns a new Future. Never called by the test, only inspected at
+                # registration.
                 return torch.futures.Future()
 
             model.register_comm_hook(state=None, hook=comm_hook)
 
     @requires_gloo()
     def test_ddp_invalid_comm_hook_return_type(self):
+        # [FUNCTION DOC] Checks a hook annotated to return int raises ValueError at
+        # registration and the error is logged in DDP logging data; checks that an
+        # unannotated hook returning a non-Future makes backward raise RuntimeError about
+        # the callback return type.
         """
         This test checks whether return annotation checked properly if defined. It also
         checks whether an internal error is thrown if return type is incorrect and user
@@ -2716,6 +3088,8 @@ class DistributedDataParallelTest(
         ):
 
             def comm_hook(state: object, bucket: dist.GradBucket) -> int:
+                # [FUNCTION DOC] HELPER: Hook with a wrong return annotation (int) that
+                # returns a new Future.
                 return torch.futures.Future()
 
             model.register_comm_hook(state=None, hook=comm_hook)
@@ -2728,6 +3102,8 @@ class DistributedDataParallelTest(
         ):
 
             def comm_hook(state: object, bucket: dist.GradBucket):
+                # [FUNCTION DOC] HELPER: Hook without annotations that wrongly returns the
+                # integer 1.
                 return 1
 
             model.register_comm_hook(state=None, hook=comm_hook)
@@ -2740,6 +3116,8 @@ class DistributedDataParallelTest(
 
     @requires_gloo()
     def test_ddp_comm_hook_register_just_once(self):
+        # [FUNCTION DOC] Registers a hook once on a DDP model, then checks registering again
+        # raises RuntimeError saying hooks can only be registered once.
         """
         DDP communication hook can only be registered once. This test validates whether
         the error is thrown properly when register_comm_hook is called more than once.
@@ -2751,6 +3129,8 @@ class DistributedDataParallelTest(
         )
 
         def dummy_hook(state, bucket):
+            # [FUNCTION DOC] HELPER: Returns a future already resolved with a list holding
+            # the bucket buffer.
             fut = torch.futures.Future()
             fut.set_result([bucket.buffer()])
             return fut
@@ -2765,6 +3145,9 @@ class DistributedDataParallelTest(
 
     @requires_gloo()
     def test_ddp_comm_hook_sparse_gradients(self):
+        # [FUNCTION DOC] Runs the sparse gradient comparison with a DDP communication hook
+        # that allreduces the bucket buffer on the process group and divides the result by
+        # world size.
         """
         Runs "test_sparse_gradients" unit test with DDP communication hook. We define a
         simple hook that does allreduce and works with gloo backend for this test.
@@ -2783,7 +3166,14 @@ class DistributedDataParallelTest(
         def allreduce_hook_gloo(
             state: object, bucket: dist.GradBucket
         ) -> torch.futures.Future[torch.Tensor]:
+            # [FUNCTION DOC] HELPER: Hook that starts an async allreduce on the bucket
+            # buffer and returns a future that divides the first result tensor by world
+            # size.
+            # KNOWN ISSUE: a comment in the body says divide by 2 times world size but the
+            # code only divides by world size.
             def div_by_world_size(fut):
+                # [FUNCTION DOC] HELPER: Waits on the future and returns its first tensor
+                # divided by world size.
                 # Divide the result by 2 * world_size.
                 return fut.wait()[0] / self.world_size
 
@@ -2797,6 +3187,9 @@ class DistributedDataParallelTest(
 
     @requires_gloo()
     def test_ddp_complex_params(self):
+        # [FUNCTION DOC] Wraps an FFT model with complex parameters in DDP, runs one
+        # forward, summed loss, backward and Adam step to check complex parameters work with
+        # the gloo reducer.
         process_group = self._get_process_group()
         N, C, H, W = 1, 16, 64, 64
         ddp_model = DistributedDataParallel(
@@ -2815,7 +3208,10 @@ class DistributedDataParallelTest(
 
 
 class ReducerModule(nn.Module):
+    # [CLASS DOC] HELPER: Network with three bias-free linear layers (2 to 10, 10 to 4, 4 to
+    # 4) used to exercise the reducer; the last layer can be skipped in forward.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates fc1, fc2, fc3 (bias-free) and a ReLU.
         super().__init__()
         self.fc1 = nn.Linear(2, 10, bias=False)
         self.fc2 = nn.Linear(10, 4, bias=False)
@@ -2823,6 +3219,9 @@ class ReducerModule(nn.Module):
         self.relu = nn.ReLU()
 
     def forward(self, x, use_fc3=True):
+        # [FUNCTION DOC] HELPER: Applies fc1 and fc2 each followed by ReLU and a cast to
+        # float, then fc3 (cast to float) if use_fc3 is true, and returns softmax over dim
+        # 1.
         x = self.relu(self.fc1(x)).float()
         x = self.relu(self.fc2(x)).float()
         if use_fc3:
@@ -2831,7 +3230,12 @@ class ReducerModule(nn.Module):
 
 
 class ReducerTest(TestCase):
+    # [CLASS DOC] Single-process tests of the DDP Reducer on a one-rank gloo group. The
+    # default process group is created in setUp from a temporary file store and stored in
+    # self.process_group.
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Creates a temp file, a one-rank file store on it,
+        # initializes the default gloo group and stores the group.
         super().setUp()
         with tempfile.NamedTemporaryFile(delete=False) as f:
             self.file = f
@@ -2843,6 +3247,8 @@ class ReducerTest(TestCase):
         self.process_group = c10d.distributed_c10d._get_default_group()
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Destroys the process group and removes the temp file,
+        # printing the error if removal fails.
         c10d.destroy_process_group()
         try:
             os.remove(self.file.name)
@@ -2851,6 +3257,8 @@ class ReducerTest(TestCase):
 
     @requires_gloo()
     def test_single_dtype_single_bucket(self):
+        # [FUNCTION DOC] Builds a Reducer with all parameters in one bucket (single dtype);
+        # must succeed.
         model = ReducerModule()
         parameters = list(model.parameters())
         buckets = [list(range(len(parameters)))]
@@ -2859,6 +3267,8 @@ class ReducerTest(TestCase):
         )
 
     def _create_mixed_precision_model(self):
+        # [FUNCTION DOC] HELPER: Returns the reducer module cast to float with the first
+        # layer in double.
         model = ReducerModule()
         model.float()
         model.fc1.double()
@@ -2866,6 +3276,8 @@ class ReducerTest(TestCase):
 
     @requires_gloo()
     def test_multi_dtype_single_bucket(self):
+        # [FUNCTION DOC] Checks that building a Reducer with one bucket for parameters of
+        # mixed dtypes raises RuntimeError.
         model = self._create_mixed_precision_model()
 
         # Raise if there are multiple types per bucket.
@@ -2882,6 +3294,8 @@ class ReducerTest(TestCase):
 
     @requires_gloo()
     def test_multi_dtype_multi_bucket(self):
+        # [FUNCTION DOC] Builds a Reducer with one bucket per consecutive run of identical
+        # dtype; must succeed.
         model = self._create_mixed_precision_model()
         parameters = list(model.parameters())
         group_by_dtype = groupby(
@@ -2896,6 +3310,9 @@ class ReducerTest(TestCase):
         )
 
     def _create_reducer_for_models(self, models, find_unused_parameters=False):
+        # [FUNCTION DOC] HELPER: Asserts exactly one model is passed, buckets its parameters
+        # by consecutive runs of the same dtype, and returns a Reducer on the test process
+        # group with the given find_unused_parameters flag.
         self.assertEqual(len(models), 1)
         parameters = list(models[0].parameters())
         group_by_dtype = groupby(
@@ -2912,6 +3329,8 @@ class ReducerTest(TestCase):
 
     @requires_gloo()
     def test_forward_backward(self):
+        # [FUNCTION DOC] Mixed-precision model with a Reducer: prepare_for_forward, forward,
+        # cross-entropy, prepare_for_backward and backward must run without error.
         batch_size = 10
         model = self._create_mixed_precision_model()
         reducer = self._create_reducer_for_models([model])
@@ -2925,6 +3344,8 @@ class ReducerTest(TestCase):
 
     @requires_gloo()
     def test_forward_backward_unused_parameters(self):
+        # [FUNCTION DOC] Reducer with find_unused_parameters: forward skips the last layer;
+        # its gradient is None before and after backward because it is globally unused.
         batch_size = 10
         model = self._create_mixed_precision_model()
         reducer = self._create_reducer_for_models([model], find_unused_parameters=True)
@@ -2948,6 +3369,9 @@ class ReducerTest(TestCase):
 
     @requires_gloo()
     def test_forward_backward_optimizer(self):
+        # [FUNCTION DOC] Runs 3 training iterations with Adam through a Reducer (find_unused
+        # on), with the last layer unused only in the first; zero_grad each time must not
+        # break reducer buckets.
         batch_size = 10
         model = self._create_mixed_precision_model()
         reducer = self._create_reducer_for_models([model], find_unused_parameters=True)
@@ -2976,6 +3400,9 @@ class ReducerTest(TestCase):
         gradient_as_bucket_view=False,
         batched_grad_copy=False,
     ):
+        # [FUNCTION DOC] HELPER: Like the models-based reducer creator but for one model;
+        # buckets parameters by consecutive dtype runs and forwards find_unused_parameters,
+        # gradient_as_bucket_view and batched_grad_copy to the Reducer.
         parameters = list(model.parameters())
         group_by_dtype = groupby(
             range(len(parameters)), key=lambda i: parameters[i].dtype
@@ -2992,6 +3419,8 @@ class ReducerTest(TestCase):
         )
 
     def _run_forward_backward(self, model, reducer, batch_size=10):
+        # [FUNCTION DOC] HELPER: Runs one forward and backward pass with random double input
+        # and random class targets through the reducer; returns the loss tensor.
         """Run one forward+backward pass, return loss."""
         loss_fn = nn.CrossEntropyLoss()
         input = torch.rand([batch_size, 2], dtype=torch.double)
@@ -3003,6 +3432,9 @@ class ReducerTest(TestCase):
 
     @requires_gloo()
     def test_batched_grad_copy_basic(self):
+        # [FUNCTION DOC] Profiles one backward with batched_grad_copy and checks the batched
+        # foreach copy operator appears, the per-parameter mul_out operator does not, and
+        # gradients are non-zero.
         """Verify batched_grad_copy uses _foreach_copy_ and produces grads."""
         model = self._create_mixed_precision_model()
         reducer = self._create_reducer(model, batched_grad_copy=True)
@@ -3024,6 +3456,9 @@ class ReducerTest(TestCase):
 
     @requires_gloo()
     def test_batched_grad_copy_matches_default(self):
+        # [FUNCTION DOC] Builds one reducer with and one without batched grad copy over
+        # identical seeded model copies, runs the same input through both, and checks all
+        # gradients are equal.
         """Verify grads are numerically identical with and without batching."""
         torch.manual_seed(42)
         model_ref = self._create_mixed_precision_model()
@@ -3052,6 +3487,9 @@ class ReducerTest(TestCase):
 
     @requires_gloo()
     def test_batched_grad_copy_with_set_to_none(self):
+        # [FUNCTION DOC] Trains two identical models for 3 SGD iterations, one reducer plain
+        # and one with batched grad copy, zeroing gradients to None each step; gradients
+        # must match every iteration and parameters must match at the end.
         """Multi-iteration with set_to_none=True — the primary use case."""
         torch.manual_seed(42)
         model_ref = self._create_mixed_precision_model()
@@ -3094,6 +3532,9 @@ class ReducerTest(TestCase):
 
     @requires_gloo()
     def test_batched_grad_copy_with_bucket_view(self):
+        # [FUNCTION DOC] Same comparison as the set-to-none test but both reducers use
+        # gradient_as_bucket_view, so gradients alias bucket memory after the first
+        # iteration.
         """Test batched_grad_copy + gradient_as_bucket_view (alias path)."""
         torch.manual_seed(42)
         model_ref = self._create_mixed_precision_model()
@@ -3140,6 +3581,9 @@ class ReducerTest(TestCase):
 
     @requires_gloo()
     def test_batched_grad_copy_with_unused_parameters(self):
+        # [FUNCTION DOC] Compares plain and batched reducers (find_unused_parameters on)
+        # when the last layer is skipped in forward: its gradient must stay None in both and
+        # other gradients match.
         """Test batched_grad_copy + find_unused_parameters with fc3 unused."""
         torch.manual_seed(42)
         model_ref = self._create_mixed_precision_model()
@@ -3177,6 +3621,10 @@ class ReducerTest(TestCase):
 
     @requires_gloo()
     def test_batched_grad_copy_with_create_graph(self):
+        # [FUNCTION DOC] Runs backward with create_graph on a plain reducer and on a batched
+        # reducer (identically seeded), capturing any RuntimeError message from each; both
+        # must behave the same (same error text or both None), since batching falls back in
+        # that mode.
         """batched_grad_copy falls back to non-batched path with create_graph=True."""
         torch.manual_seed(42)
 
@@ -3215,6 +3663,9 @@ class ReducerTest(TestCase):
 
     @requires_gloo()
     def test_batched_grad_copy_with_comm_hook(self):
+        # [FUNCTION DOC] Registers a simple hook on both a plain and a batched reducer
+        # (world size one), runs the same forward and backward, and checks gradients are
+        # equal.
         """batched_grad_copy works correctly when a comm_hook is registered."""
         torch.manual_seed(42)
         model_ref = self._create_mixed_precision_model()
@@ -3225,6 +3676,9 @@ class ReducerTest(TestCase):
 
         # A simple comm hook that just allreduces and divides by world_size.
         def simple_hook(state, bucket):
+            # [FUNCTION DOC] HELPER: Hook returning a resolved future holding the bucket
+            # buffer divided by the state value (no allreduce is performed despite the
+            # comment).
             fut = torch.futures.Future()
             fut.set_result(bucket.buffer() / state)
             return fut
@@ -3253,27 +3707,47 @@ class ReducerTest(TestCase):
 
 @skip_if_win32()
 class ProcessGroupGlooLazyInitTest(ProcessGroupGlooTest):
+    # [CLASS DOC] Runs every ProcessGroupGlooTest test with lazy Gloo device initialization:
+    # lazy_init is true and the environment variable enabling lazy init is set for each test
+    # and removed in tearDown. Skipped on Windows.
     lazy_init = True
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Sets the lazy-init environment variable to 1 then runs the
+        # base setUp.
         os.environ["TORCH_GLOO_LAZY_INIT"] = "1"
         super().setUp()
 
     def tearDown(self) -> None:
+        # [FUNCTION DOC] HELPER: Removes the lazy-init environment variable then runs the
+        # base tearDown.
         del os.environ["TORCH_GLOO_LAZY_INIT"]
         return super().tearDown()
 
 
 class ProcessGroupGlooFRTest(ProcessGroupGlooTest):
+    # [CLASS DOC] Runs ProcessGroupGlooTest with the flight recorder enabled (buffer of 10
+    # entries via environment variable, set in setUp and removed in tearDown) and adds tests
+    # that dump and inspect the recorded trace.
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Sets the flight recorder buffer size variable to 10 then
+        # runs the base setUp.
         os.environ["TORCH_FR_BUFFER_SIZE"] = "10"
         super().setUp()
 
     def tearDown(self) -> None:
+        # [FUNCTION DOC] HELPER: Removes the flight recorder buffer size variable then runs
+        # the base tearDown.
         del os.environ["TORCH_FR_BUFFER_SIZE"]
         return super().tearDown()
 
     def _verify_trace(self, t, is_json):
+        # [FUNCTION DOC] HELPER: Validates a flight recorder dump after two allreduces on
+        # the default group: version string, a single process group config with
+        # name/desc/ranks, group status counters (3 enqueued and completed, none started),
+        # three entries whose last is a scheduled float allreduce on a 3 by 4 tensor with
+        # sequence id 3, timeout 50000 ms and no duration. Stack frames are checked only for
+        # the pickle format (is_json false).
         ver = t["version"]
         self.assertEqual(ver, "2.10")
         pg_config = t["pg_config"]
@@ -3312,6 +3786,8 @@ class ProcessGroupGlooFRTest(ProcessGroupGlooTest):
 
     @requires_gloo()
     def test_short_json(self):
+        # [FUNCTION DOC] Runs two allreduces, waits a second, dumps the flight recorder
+        # trace as JSON and validates it.
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
             store, self.rank, self.world_size, self.opts(group_name="0")
@@ -3328,6 +3804,8 @@ class ProcessGroupGlooFRTest(ProcessGroupGlooTest):
 
     @requires_gloo()
     def test_short_pickle(self):
+        # [FUNCTION DOC] Same as the JSON trace test but dumps the pickled trace and
+        # validates it including stack frames.
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
             store, self.rank, self.world_size, self.opts(group_name="0")
@@ -3347,6 +3825,10 @@ class ProcessGroupGlooFRTest(ProcessGroupGlooTest):
 
     @requires_gloo()
     def test_long(self):
+        # [FUNCTION DOC] Runs broadcast, allreduce, reduce, allgather, reduce_scatter and
+        # another allreduce twice, then checks the pickled trace has 10 entries (9 apart in
+        # sequence ids from first to last), last entry being gloo all_reduce with expected
+        # metadata.
         store = c10d.FileStore(self.file_name, self.world_size)
         pg = self._create_process_group_gloo(
             store, self.rank, self.world_size, self.opts(group_name="0")
@@ -3381,15 +3863,21 @@ class ProcessGroupGlooFRTest(ProcessGroupGlooTest):
 
 
 class CommTest(test_c10d_common.AbstractCommTest, MultiProcessTestCase):
+    # [CLASS DOC] Gloo specialization of the shared communication tests; runs in spawned CPU
+    # processes and removes the file store file in tearDown.
     @property
     def device(self):
+        # [FUNCTION DOC] HELPER: Returns the string cpu as the device for the shared tests.
         return "cpu"
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Runs the base setUp and spawns the worker processes.
         super().setUp()
         self._spawn_processes()
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Runs the base tearDown, then removes the store file,
+        # ignoring OS errors.
         super().tearDown()
         try:
             os.remove(self.file_name)
@@ -3397,6 +3885,10 @@ class CommTest(test_c10d_common.AbstractCommTest, MultiProcessTestCase):
             pass
 
     def _test_broadcast_coalesced(self, process_group, device, root_rank):
+        # [FUNCTION DOC] HELPER: Broadcast six groups of five chunks (a mix of fp16 or fp32
+        # on CPU, fp32, fp64) with the coalesced broadcast using a small 256 buffer; the
+        # root keeps real values, others start with zeros and must end up equal to the
+        # target.
         half = torch.float16
 
         # No support for float16 for CPU tensors
@@ -3430,6 +3922,9 @@ class CommTest(test_c10d_common.AbstractCommTest, MultiProcessTestCase):
     @requires_gloo()
     @skip_if_lt_x_gpu(2)
     def test_broadcast_coalesced_gloo_cuda(self):
+        # [FUNCTION DOC] Initializes the default gloo group, creates a loopback device for
+        # this rank's CUDA device and runs the coalesced broadcast for every rank as root.
+        # Needs 2 GPUs.
         store = c10d.FileStore(self.file_name, self.world_size)
         c10d.init_process_group(
             backend="gloo", store=store, rank=self.rank, world_size=self.world_size
@@ -3444,6 +3939,7 @@ class CommTest(test_c10d_common.AbstractCommTest, MultiProcessTestCase):
 
     @requires_gloo()
     def test_broadcast_coalesced_gloo_cpu(self):
+        # [FUNCTION DOC] CPU variant of the coalesced broadcast test for every root rank.
         store = c10d.FileStore(self.file_name, self.world_size)
         c10d.init_process_group(
             backend="gloo", store=store, rank=self.rank, world_size=self.world_size
@@ -3459,29 +3955,40 @@ class CommTest(test_c10d_common.AbstractCommTest, MultiProcessTestCase):
     @skip_if_lt_x_gpu(2)
     @requires_gloo()
     def test_gloo_warn_not_in_group(self):
+        # [FUNCTION DOC] Runs the shared not-in-group warning test with gloo (needs 2 GPUs).
         self._test_warn_not_in_group(backend="gloo")
 
     @skip_if_lt_x_gpu(2)
     @requires_gloo()
     def test_gloo_rank_membership(self):
+        # [FUNCTION DOC] Runs the shared rank-membership test with gloo (needs 2 GPUs).
         self._test_rank_membership(backend="gloo")
 
     @skip_if_lt_x_gpu(2)
     @requires_gloo()
     def test_tensor_dtype_mismatch(self):
+        # [FUNCTION DOC] Runs the shared tensor dtype mismatch test with gloo (needs 2
+        # GPUs).
         self._test_tensor_dtype_mismatch(backend="gloo")
 
     @skip_if_lt_x_gpu(2)
     @requires_gloo()
     def test_tensor_dtype_complex(self):
+        # [FUNCTION DOC] Runs the shared complex dtype test with gloo (needs 2 GPUs).
         self._test_tensor_dtype_complex(backend="gloo")
 
     @requires_gloo()
     def test_bool_tensors(self):
+        # [FUNCTION DOC] Runs the shared bool tensor test with gloo.
         self._test_bool_tensors(backend="gloo")
 
     @requires_gloo()
     def test_split_group_does_not_alias_parent_options(self):
+        # [FUNCTION DOC] Regression test: after splitting the default group into halves, the
+        # child options object must be distinct from the parent's; the parent keeps its
+        # group name, 111 second timeout and empty global ranks, while the child has the 222
+        # second timeout and its own ranks. A second split by rank parity must report the
+        # parity ranks. Destroys the group at the end.
         # Regression test: ProcessGroup::splitGroup used to hand the parent
         # backend's live Options object to the child, so a split rewrote the
         # parent's group_name/timeout and ProcessGroupGloo::split overwrote the
@@ -3529,6 +4036,10 @@ class CommTest(test_c10d_common.AbstractCommTest, MultiProcessTestCase):
     @skip_if_lt_x_gpu(1)
     @requires_gloo()
     def test_split_group_keeps_gloo_options(self):
+        # [FUNCTION DOC] Regression test: with a gloo world bound to a CUDA device,
+        # splitting all ranks into one group with a 222 second timeout must give the CPU
+        # gloo backend options carrying that timeout, the child's group name and the ranks.
+        # Needs 1 GPU; destroys the group.
         # dist.split_group used to substitute a deep copy of the accelerator
         # backend's options for every device. On a gloo world that raised
         # "cannot pickle _Options" (ProcessGroupGloo._Options has no
@@ -3555,20 +4066,29 @@ class CommTest(test_c10d_common.AbstractCommTest, MultiProcessTestCase):
 class GlooProcessGroupWithDispatchedCollectivesTests(
     test_c10d_common.ProcessGroupWithDispatchedCollectivesTests
 ):
+    # [CLASS DOC] Gloo specialization of the shared dispatched-collective tests
+    # (collectives, coalesced allreduce, all-to-all single), plus gloo-only allgather
+    # coalesced and monitored barrier tests.
     @requires_gloo()
     def test_collectives(self):
+        # [FUNCTION DOC] Runs the shared collectives test with gloo.
         self._test_collectives(backend="gloo")
 
     @requires_gloo()
     def test_allreduce_coalesced(self):
+        # [FUNCTION DOC] Runs the shared allreduce_coalesced test with gloo.
         self._test_allreduce_coalesced(backend="gloo")
 
     @requires_gloo()
     def test_all_to_all_single(self):
+        # [FUNCTION DOC] Runs the shared all_to_all_single test with gloo.
         self._test_all_to_all_single(backend="gloo")
 
     @requires_gloo()
     def test_allgather_coalesced(self):
+        # [FUNCTION DOC] Initializes the default gloo group and runs the module-level
+        # all_gather_coalesced on one 10 by 10 tensor of ones; the output list entry must
+        # equal it.
         store = dist.FileStore(self.file_name, self.world_size)
         dist.init_process_group(
             "gloo",
@@ -3583,6 +4103,8 @@ class GlooProcessGroupWithDispatchedCollectivesTests(
 
     @requires_gloo()
     def test_monitored_barrier(self):
+        # [FUNCTION DOC] Initializes the default gloo group and calls monitored_barrier;
+        # passes if it returns without error on all ranks.
         store = dist.FileStore(self.file_name, self.world_size)
         dist.init_process_group(
             "gloo",
@@ -3594,11 +4116,16 @@ class GlooProcessGroupWithDispatchedCollectivesTests(
 
 
 class LargeCommTest(test_c10d_common.AbstractLargeCommTest, MultiProcessTestCase):
+    # [CLASS DOC] Gloo specialization of the shared large-communicator tests; spawned CPU
+    # processes with file cleanup in tearDown.
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Runs the base setUp and spawns the worker processes.
         super().setUp()
         self._spawn_processes()
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Runs the base tearDown, then removes the store file,
+        # ignoring OS errors.
         super().tearDown()
         try:
             os.remove(self.file_name)
@@ -3607,22 +4134,28 @@ class LargeCommTest(test_c10d_common.AbstractLargeCommTest, MultiProcessTestCase
 
     @property
     def device(self):
+        # [FUNCTION DOC] HELPER: Returns the CPU torch device for the shared tests.
         return torch.device("cpu")
 
     @requires_gloo()
     def test_new_group_local_sync(self):
+        # [FUNCTION DOC] Runs the shared new_group local-sync test with gloo.
         self._test_new_group_local_sync(backend="gloo")
 
     @requires_gloo()
     def test_new_group_local_sync_sanity_check(self):
+        # [FUNCTION DOC] Runs the shared new_group local-sync sanity check with gloo.
         self._test_new_group_local_sync_sanity_check(backend="gloo")
 
     @requires_gloo()
     def test_new_group_local_sync_duplicate_pg(self):
+        # [FUNCTION DOC] Runs the shared new_group local-sync duplicate-group test with
+        # gloo.
         self._test_new_group_local_sync_duplicate_pg(backend="gloo")
 
     @requires_gloo()
     def test_new_group_ordered(self):
+        # [FUNCTION DOC] Runs the shared ordered new_group test with gloo.
         self._test_new_group_ordered(backend="gloo")
 
 
