@@ -1,3 +1,9 @@
+# [MODULE DOC] Holds the default mappings used by quantization flows: float module to (reference) static
+# quantized module, to QAT module, to dynamic quantized module, to sparse quantized module, float function
+# to quantized operator, and module to fixed-qparams activation post-process. Also provides getter
+# functions (mostly returning deep copies) and lookup helpers. Import-time side effects: imports many
+# torch.ao.nn subpackages (including sparse, explicitly, because of lazy imports) and builds the
+# module-level mapping dictionaries.
 import copy
 from collections.abc import Callable
 from typing import Any
@@ -207,22 +213,28 @@ DEFAULT_DYNAMIC_SPARSE_QUANT_MODULE_MAPPINGS: dict[Callable, Any] = {
 
 
 def no_observer_set() -> set[Any]:
+    # [FUNCTION DOC] Returns a new set of module classes (quantizable LSTM and MultiheadAttention) that must
+    # not have observers inserted by default.
     r"""These modules cannot have observers inserted by default."""
     no_observers = {nn.quantizable.LSTM, nn.quantizable.MultiheadAttention}
     return no_observers
 
 
 def get_default_static_quant_module_mappings() -> dict[Callable, Any]:
+    # [FUNCTION DOC] Returns a deep copy of the default float-to-static-quantized module mapping.
     """Get module mapping for post training static quantization"""
     return copy.deepcopy(DEFAULT_STATIC_QUANT_MODULE_MAPPINGS)
 
 
 def get_default_static_quant_reference_module_mappings() -> dict[Callable, Any]:
+    # [FUNCTION DOC] Returns a deep copy of the default float-to-reference-quantized module mapping.
     """Get reference module mapping for post training static quantization"""
     return copy.deepcopy(DEFAULT_REFERENCE_STATIC_QUANT_MODULE_MAPPINGS)
 
 
 def get_embedding_static_quant_module_mappings() -> dict[Callable, Any]:
+    # [FUNCTION DOC] Returns a deep copy of the default static mapping extended with QAT Embedding and
+    # EmbeddingBag mapped to their quantized versions.
     """Get module mapping, including mapping for embedding QAT"""
     mapping = copy.deepcopy(DEFAULT_STATIC_QUANT_MODULE_MAPPINGS)
     mapping[nnqat.EmbeddingBag] = nnq.EmbeddingBag
@@ -231,6 +243,7 @@ def get_embedding_static_quant_module_mappings() -> dict[Callable, Any]:
 
 
 def get_default_static_sparse_quant_module_mappings() -> dict[Callable, Any]:
+    # [FUNCTION DOC] Returns a deep copy of the default static sparse quantized module mapping.
     """Get module mapping for post training static sparse quantization"""
     return copy.deepcopy(DEFAULT_STATIC_SPARSE_QUANT_MODULE_MAPPINGS)
 
@@ -240,6 +253,9 @@ def get_static_quant_module_class(
     additional_static_quant_mapping: dict[Callable, Any] | None = None,
     is_reference: bool = False,
 ) -> Any:
+    # [FUNCTION DOC] Looks up the statically quantized class for a float module class, merging the optional
+    # additional mapping over the default (or reference, if is_reference) mapping. Returns a deep copy of
+    # the found class. Raises AssertionError if no mapping exists.
     r"""Get the statically quantized module class corresponding to
     the floating point module class
     """
@@ -264,6 +280,9 @@ def get_dynamic_quant_module_class(
     float_module_class: Callable,
     additional_dynamic_quant_mapping: dict[Callable, Any] | None = None,
 ) -> Any:
+    # [FUNCTION DOC] Looks up the dynamically quantized class for a float module class, merging the optional
+    # additional mapping over the default dynamic mapping. Returns a deep copy of the found class.
+    # Raises AssertionError if no mapping exists.
     r"""Get the dynamically quantized module class corresponding to
     the floating point module class
     """
@@ -282,11 +301,14 @@ def get_dynamic_quant_module_class(
 
 
 def get_default_qat_module_mappings() -> dict[Callable, Any]:
+    # [FUNCTION DOC] Returns a deep copy of the default float-to-QAT module mapping.
     """Get default module mapping for quantization aware training"""
     return copy.deepcopy(DEFAULT_QAT_MODULE_MAPPINGS)
 
 
 def get_embedding_qat_module_mappings() -> dict[Callable, Any]:
+    # [FUNCTION DOC] Returns a deep copy of the default QAT mapping extended with Embedding and EmbeddingBag
+    # mapped to their QAT versions.
     """Get module mapping for quantization aware training
     This is includes default values in addition to
     enabling qat for embeddings.
@@ -298,16 +320,21 @@ def get_embedding_qat_module_mappings() -> dict[Callable, Any]:
 
 
 def get_default_dynamic_quant_module_mappings() -> dict[Callable, Any]:
+    # [FUNCTION DOC] Returns the default dynamic quantization mapping itself (not a copy), so callers
+    # mutating it change the global default.
     """Get module mapping for post training dynamic quantization"""
     return DEFAULT_DYNAMIC_QUANT_MODULE_MAPPINGS
 
 
 def get_default_dynamic_sparse_quant_module_mappings() -> dict[Callable, Any]:
+    # [FUNCTION DOC] Returns the default dynamic sparse quantization mapping itself (not a copy).
     """Get module mapping for post training dynamic sparse quantization"""
     return DEFAULT_DYNAMIC_SPARSE_QUANT_MODULE_MAPPINGS
 
 
 def get_default_qconfig_propagation_list() -> set[Callable]:
+    # [FUNCTION DOC] Returns a deep-copied set of module types that receive a qconfig in prepare: keys of the
+    # static, QAT and dynamic mappings plus the extra allowlist (Sequential).
     """Get the default list of module types that we'll attach qconfig
     attribute to in prepare
     """
@@ -321,6 +348,8 @@ def get_default_qconfig_propagation_list() -> set[Callable]:
 
 
 def get_default_compare_output_module_list() -> set[Callable]:
+    # [FUNCTION DOC] Returns a deep-copied set of module classes whose outputs are recorded by the numeric
+    # suite: keys and values of the static, QAT and dynamic mappings plus the extra allowlist.
     """Get list of module class types that we will record output
     in numeric suite
     """
@@ -339,11 +368,14 @@ def get_default_compare_output_module_list() -> set[Callable]:
 def get_default_float_to_quantized_operator_mappings() -> dict[
     Callable | str, Callable
 ]:
+    # [FUNCTION DOC] Returns a deep copy of the float function to quantized operator mapping.
     return copy.deepcopy(DEFAULT_FLOAT_TO_QUANTIZED_OPERATOR_MAPPINGS)
 
 
 # TODO: merge with get_static_quant_module_class
 def get_quantized_operator(float_op: Callable | str) -> Callable:
+    # [FUNCTION DOC] Returns the quantized operator for a float function or op name from the default operator
+    # mapping. Raises AssertionError if there is none.
     """Get the quantized operator corresponding to the float operator"""
     quantized_op = DEFAULT_FLOAT_TO_QUANTIZED_OPERATOR_MAPPINGS.get(float_op)
     if quantized_op is None:
@@ -354,6 +386,8 @@ def get_quantized_operator(float_op: Callable | str) -> Callable:
 
 
 def _get_special_act_post_process(module: torch.nn.Module) -> Callable | None:
+    # [FUNCTION DOC] HELPER: Returns the fixed-qparams activation post-process constructor registered for the
+    # module's type (ignoring parametrizations), or None. Takes priority over the qconfig's activation.
     r"""Get the special activation post process for `module`, this has
     higher priority than the activation post process in `qconfig`
     e.g.
@@ -364,4 +398,6 @@ def _get_special_act_post_process(module: torch.nn.Module) -> Callable | None:
 
 
 def _has_special_act_post_process(module: torch.nn.Module) -> bool:
+    # [FUNCTION DOC] HELPER: True if the module is in training mode and its exact type has a special
+    # activation post-process registered.
     return module.training and type(module) in DEFAULT_MODULE_TO_ACT_POST_PROCESS

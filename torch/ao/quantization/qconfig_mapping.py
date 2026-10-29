@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Defines QConfigMapping, which maps model ops/modules to QConfigs by global default, object
+# type, module-name regex, module name, and (module name, object type, index) with increasing priority,
+# plus factories for default PTQ/QAT/symmetric-qnnpack mappings. Import-time side effect: builds the
+# module-level table of ops with fixed quantization parameters (sigmoid, hardsigmoid, softmax, tanh) and
+# the dictionary key constants.
 from __future__ import annotations
 
 from collections import OrderedDict
@@ -65,6 +70,12 @@ _FIXED_QPARAMS_OP_TO_OBSERVER: dict[Callable | str, _PartialWrapper] = {
 def _get_default_qconfig_mapping(
     is_qat: bool, backend: str, version: int
 ) -> QConfigMapping:
+    # [FUNCTION DOC] HELPER: Builds the default QConfigMapping for QAT or PTQ. Global qconfig comes from the
+    # backend defaults; reshape uses the reuse-input qconfig; ConvTranspose modules/functions use a qconfig
+    # with a per-tensor weight for fbgemm/x86 (per-channel unsupported); LayerNorm uses a placeholder weight;
+    # PReLU uses the quint8 weight qconfig; fixed-qparams ops (sigmoid, tanh, softmax, ...) get a qconfig whose
+    # activation is the fixed-qparams observer (wrapped in FixedQParamsFakeQuantize for QAT), shared per
+    # observer. Returns the new mapping.
     """
     Return the default QConfigMapping for the given quantization type and backend.
     """
@@ -128,6 +139,8 @@ def _get_default_qconfig_mapping(
 
 
 def get_default_qconfig_mapping(backend="x86", version=0) -> QConfigMapping:
+    # [FUNCTION DOC] Returns the default post-training-quantization QConfigMapping for the given backend
+    # (x86, fbgemm, qnnpack, onednn) and version. Backend is not validated here.
     """
     Return the default QConfigMapping for post training quantization.
 
@@ -141,6 +154,8 @@ def get_default_qconfig_mapping(backend="x86", version=0) -> QConfigMapping:
 
 
 def get_default_qat_qconfig_mapping(backend="x86", version=1) -> QConfigMapping:
+    # [FUNCTION DOC] Returns the default quantization-aware-training QConfigMapping for the given backend and
+    # version.
     """
     Return the default QConfigMapping for quantization aware training.
 
@@ -153,6 +168,8 @@ def get_default_qat_qconfig_mapping(backend="x86", version=1) -> QConfigMapping:
 
 
 def _get_symmetric_qnnpack_qconfig_mapping() -> QConfigMapping:
+    # [FUNCTION DOC] HELPER: Default qnnpack PTQ mapping with the symmetric qnnpack qconfig as global and
+    # for all non fixed-qparams object types.
     """
     Return a QConfigMapping that uses `torch.ao.quantization.default_symmetric_qnnpack_qconfig`
     as the default QConfig.
@@ -164,6 +181,8 @@ def _get_symmetric_qnnpack_qconfig_mapping() -> QConfigMapping:
 
 
 def _get_symmetric_qnnpack_qat_qconfig_mapping() -> QConfigMapping:
+    # [FUNCTION DOC] HELPER: Default qnnpack QAT mapping with the symmetric qnnpack QAT qconfig as global and
+    # for all non fixed-qparams object types.
     """
     Return a QConfigMapping that uses `torch.ao.quantization.default_symmetric_qnnpack_qat_qconfig`
     as the default QConfig.
@@ -179,6 +198,9 @@ def _get_default_qconfig_mapping_with_default_qconfig(
     backend: str,
     default_qconfig: QConfig,
 ) -> QConfigMapping:
+    # [FUNCTION DOC] HELPER: Starts from the default (QAT or PTQ) mapping for the backend, sets the given qconfig
+    # as global, and overrides every registered object type qconfig except fixed-qparams ops with it.
+    # Returns the mutated mapping.
     """
     Return a QConfigMapping that uses the provided qconfig as the default QConfig.
     """
@@ -203,6 +225,11 @@ _QCONFIG_STYLE_ORDER: list[str] = [
 
 
 class QConfigMapping:
+    # [CLASS DOC] Container mapping model ops to QConfigs. State: global_qconfig plus ordered mappings
+    # object_type_qconfigs, module_name_regex_qconfigs, module_name_qconfigs and
+    # module_name_object_type_order_qconfigs (insertion order is preserved and matters for regexes).
+    # Priority increases in that order. Setters return self for chaining; to_dict/from_dict convert to
+    # the legacy dictionary form.
     """
     Mapping from model ops to :class:`torch.ao.quantization.QConfig` s.
 
@@ -234,6 +261,7 @@ class QConfigMapping:
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Creates an empty mapping: no global qconfig and empty ordered mappings for each style.
         # In increasing match priority:
         self.global_qconfig: QConfigAny = None
         self.object_type_qconfigs: OrderedDict[Callable | str, QConfigAny] = (
@@ -246,6 +274,7 @@ class QConfigMapping:
         ] = OrderedDict()
 
     def set_global(self, global_qconfig: QConfigAny) -> QConfigMapping:
+        # [FUNCTION DOC] Sets the global default qconfig (may be None); returns self.
         """
         Set the global (default) QConfig.
         """
@@ -255,6 +284,8 @@ class QConfigMapping:
     def set_object_type(
         self, object_type: Callable | str, qconfig: QConfigAny
     ) -> QConfigMapping:
+        # [FUNCTION DOC] Sets the qconfig for a module type, function, or method name; overrides an existing
+        # entry; returns self.
         """
         Set the QConfig for a given module type, function, or method name.
         If the QConfig for an existing object type was already set, the new QConfig will override the old one.
@@ -265,6 +296,8 @@ class QConfigMapping:
     def set_module_name_regex(
         self, module_name_regex: str, qconfig: QConfigAny
     ) -> QConfigMapping:
+        # [FUNCTION DOC] Sets the qconfig for modules whose names match the regex string. Regexes are matched in
+        # registration order; overriding an existing regex keeps its original position. Returns self.
         """
         Set the QConfig for modules matching the given regex string.
 
@@ -286,6 +319,7 @@ class QConfigMapping:
         return self
 
     def set_module_name(self, module_name: str, qconfig: QConfigAny) -> QConfigMapping:
+        # [FUNCTION DOC] Sets the qconfig for the exact module name, overriding any existing entry; returns self.
         """
         Set the QConfig for modules matching the given module name.
         If the QConfig for an existing module name was already set, the new QConfig will override the old one.
@@ -296,6 +330,8 @@ class QConfigMapping:
     def set_module_name_object_type_order(
         self, module_name: str, object_type: Callable, index: int, qconfig: QConfigAny
     ) -> QConfigMapping:
+        # [FUNCTION DOC] Sets the qconfig for the (module name, object type, occurrence index) combination,
+        # overriding any existing entry; returns self.
         """
         Set the QConfig for modules matching a combination of the given module name, object type,
         and the index at which the module appears.
@@ -309,6 +345,8 @@ class QConfigMapping:
         return self
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Returns a multi-line string listing each style (in priority order) with its entries,
+        # or the raw value for the global qconfig and for empty mappings.
         output = self.__class__.__name__ + " ("
         for style_name in _QCONFIG_STYLE_ORDER:
             output += f"\n {style_name}"
@@ -322,6 +360,9 @@ class QConfigMapping:
 
     # TODO: remove this
     def to_dict(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Returns a dictionary keyed by "" (global qconfig), object_type, module_name_regex,
+        # module_name and module_name_object_type_order; the non-global values are lists of tuples (the last
+        # one flattened to name, type, index, qconfig). Legacy API.
         """
         Convert this ``QConfigMapping`` to a dictionary with the following keys:
 
@@ -350,6 +391,8 @@ class QConfigMapping:
     # TODO: remove this
     @classmethod
     def from_dict(cls, qconfig_dict: dict[str, Any]) -> QConfigMapping:
+        # [FUNCTION DOC] Builds a QConfigMapping from a dictionary in the to_dict format; all keys are optional.
+        # Entries are applied in list order through the setters. Returns the new mapping. Legacy API.
         """
         Create a ``QConfigMapping`` from a dictionary with the following keys (all optional):
 

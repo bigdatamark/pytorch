@@ -1,3 +1,8 @@
+# [MODULE DOC] FX graph mode quantization public API: fuse_fx, prepare_fx, prepare_qat_fx, convert_fx and
+# convert_to_reference_fx (plus internal standalone-module and decomposed variants). It traces a model to a
+# GraphModule, fuses, prepares or converts through the torch.ao.quantization.fx implementation, accepts
+# legacy dict configs with a FutureWarning, and preserves user-listed attributes across the transforms.
+# Several names are imported only for backward compatibility. No import-time side effects.
 import copy
 import typing_extensions
 import warnings
@@ -26,6 +31,8 @@ def attach_preserved_attrs_to_model(
     model: GraphModule | torch.nn.Module,
     preserved_attrs: dict[str, Any],
 ) -> None:
+    # [FUNCTION DOC] Stores a copy of the preserved attribute mapping in the model meta (so it survives
+    # deep copies) and also sets each attribute directly on the model. Mutates the model; returns None.
     """Store preserved attributes to the model.meta so that it can be preserved during deepcopy"""
     model.meta[_USER_PRESERVED_ATTRIBUTES_KEY] = copy.copy(preserved_attrs)  # type: ignore[operator, index, assignment]
     # set the preserved attributes in the model so that user can call
@@ -35,6 +42,7 @@ def attach_preserved_attrs_to_model(
 
 
 def _check_is_graph_module(model: torch.nn.Module) -> None:
+    # [FUNCTION DOC] HELPER: Raises ValueError (naming the actual type) unless the model is a GraphModule.
     if not isinstance(model, GraphModule):
         raise ValueError(
             "input model must be a GraphModule, "
@@ -46,6 +54,8 @@ def _check_is_graph_module(model: torch.nn.Module) -> None:
 
 
 def _attach_meta_to_node_if_not_exist(model: GraphModule) -> None:
+    # [FUNCTION DOC] HELPER: Gives every graph node an empty meta mapping if it lacks the attribute (nodes
+    # from symbolic tracing may not have one). Mutates the graph nodes.
     """Attach meta field to all nodes of the graph if it does not exist,
     meta field is a field stores some meta information about the node, such
     as dtype and shape information for output of the node, this only exists
@@ -59,6 +69,8 @@ def _attach_meta_to_node_if_not_exist(model: GraphModule) -> None:
 
 
 def _swap_ff_with_fxff(model: torch.nn.Module) -> None:
+    # [FUNCTION DOC] HELPER: Recursively replaces every FloatFunctional child with a fresh FXFloatFunctional,
+    # in place. Replacements are collected first and applied after iterating each module's children.
     r"""Swap FloatFunctional with FXFloatFunctional"""
     modules_to_swap = []
     for name, module in model.named_children():
@@ -78,6 +90,9 @@ def _fuse_fx(
     fuse_custom_config: FuseCustomConfig | dict[str, Any] | None = None,
     backend_config: BackendConfig | dict[str, Any] | None = None,
 ) -> GraphModule:
+    # [FUNCTION DOC] HELPER: Validates that the model is a GraphModule (raises ValueError otherwise) and runs
+    # the FX fusion pass for QAT or PTQ with the optional custom config and backend config. Returns the fused
+    # GraphModule.
     r"""Internal helper function to fuse modules in preparation for quantization
 
     Args:
@@ -97,6 +112,12 @@ def _prepare_fx(
     backend_config: BackendConfig | dict[str, Any] | None = None,
     is_standalone_module: bool = False,
 ) -> GraphModule:
+    # [FUNCTION DOC] HELPER: Shared implementation of prepare_fx, prepare_qat_fx and the standalone variant.
+    # Defaults the custom config and equalization config; converts a dict custom config (FutureWarning).
+    # Swaps FloatFunctional modules, records preserved attributes, traces the model with a tracer that skips
+    # configured modules/classes, attaches node meta, fuses, runs the FX prepare pass to insert observers,
+    # and re-attaches preserved attributes. Mutates the input model (functional swap). Returns the prepared
+    # GraphModule.
     r"""Internal helper function for prepare_fx
         Args:
           `model`, `qconfig_mapping`, `prepare_custom_config`, `_equalization_config`:
@@ -167,6 +188,8 @@ def _prepare_standalone_module_fx(
     prepare_custom_config: PrepareCustomConfig | dict[str, Any] | None = None,
     backend_config: BackendConfig | dict[str, Any] | None = None,
 ) -> GraphModule:
+    # [FUNCTION DOC] HELPER: Prepares a standalone submodule (quantized separately as a unit) by calling the
+    # shared prepare implementation with the standalone flag set. Returns the prepared GraphModule.
     r"""[Internal use only] Prepare a standalone module, so that it can be used when quantizing the
     parent module.
     standalone_module means it a submodule that is not inlined in parent module,
@@ -206,6 +229,10 @@ def fuse_fx(
     fuse_custom_config: FuseCustomConfig | dict[str, Any] | None = None,
     backend_config: BackendConfig | dict[str, Any] | None = None,
 ) -> GraphModule:
+    # [FUNCTION DOC] Fuses patterns such as conv+bn(+relu) in an eval-mode model. Converts a dict custom
+    # config (FutureWarning), logs API usage, records preserved attributes, symbolically traces the model,
+    # attaches node meta, runs fusion in non-QAT mode, restores preserved attributes. Returns the fused
+    # GraphModule.
     r"""Fuse modules like conv+bn, conv+bn+relu etc, model must be in eval mode.
     Fusion rules are defined in torch.ao.quantization.fx.fusion_pattern.py
 
@@ -259,6 +286,9 @@ def prepare_fx(
     _equalization_config: QConfigMapping | dict[str, Any] | None = None,
     backend_config: BackendConfig | dict[str, Any] | None = None,
 ) -> GraphModule:
+    # [FUNCTION DOC] Deprecated (warns). Prepares a model for post-training quantization by tracing it and
+    # inserting observers per the qconfig mapping and backend config (non-QAT). example_inputs is accepted
+    # but currently only passed through. Returns a GraphModule ready for calibration.
     r""" Prepare a model for post training quantization
 
     Args:
@@ -410,6 +440,8 @@ def prepare_qat_fx(
     prepare_custom_config: PrepareCustomConfig | dict[str, Any] | None = None,
     backend_config: BackendConfig | dict[str, Any] | None = None,
 ) -> GraphModule:
+    # [FUNCTION DOC] Deprecated (warns). Same as prepare_fx but in QAT mode, inserting fake-quantize modules;
+    # the model should be in training mode. Returns a GraphModule ready for QAT.
     r"""Prepare a model for quantization aware training
 
     Args:
@@ -526,6 +558,11 @@ def _convert_fx(
     is_decomposed: bool = False,
     keep_original_weights: bool = False,
 ) -> GraphModule:
+    # [FUNCTION DOC] HELPER: Shared implementation of the convert functions. Defaults the custom config and
+    # converts a dict config (FutureWarning); raises ValueError if the input is not a GraphModule. Records
+    # preserved attributes, runs the FX convert pass (reference or not, optionally decomposed, optionally
+    # keeping original weights and the qconfig), and restores preserved attributes. Returns the converted
+    # GraphModule.
     """`is_standalone_module`: see docs in :func:`~torch.ao.quantization.prepare_standalone_module_fx`"""
     if convert_custom_config is None:
         convert_custom_config = ConvertCustomConfig()
@@ -572,6 +609,8 @@ def convert_fx(
     backend_config: BackendConfig | dict[str, Any] | None = None,
     keep_original_weights: bool = False,
 ) -> GraphModule:
+    # [FUNCTION DOC] Deprecated (warns). Converts a prepared and calibrated/trained GraphModule into a
+    # quantized model using the non-reference path. Logs API usage. Returns the quantized model.
     r"""Convert a calibrated or trained model to a quantized model
 
     Args:
@@ -640,6 +679,8 @@ def convert_to_reference_fx(
     qconfig_mapping: QConfigMapping | dict[str, Any] | None = None,
     backend_config: BackendConfig | dict[str, Any] | None = None,
 ) -> GraphModule:
+    # [FUNCTION DOC] Converts a prepared GraphModule to a reference quantized model (quantize/dequantize
+    # around float ops) that can be lowered to a backend. Logs API usage. Returns the GraphModule.
     r"""Convert a calibrated or trained model to a reference quantized model,
     see https://github.com/pytorch/rfcs/blob/master/RFC-0019-Extending-PyTorch-Quantization-to-Custom-Backends.md for more details,
     reference quantized model is a standard representation of a quantized model provided
@@ -689,6 +730,9 @@ def _convert_to_reference_decomposed_fx(
     qconfig_mapping: QConfigMapping | dict[str, Any] | None = None,
     backend_config: BackendConfig | dict[str, Any] | None = None,
 ) -> GraphModule:
+    # [FUNCTION DOC] HELPER: Non-public variant of the reference conversion using the decomposed
+    # representation of quantized tensors; never removes qconfig. Logs API usage. Returns the GraphModule.
+    # KNOWN ISSUE: the docstring documents a _remove_qconfig argument that this function does not accept.
     r"""Convert a calibrated or trained model to a reference quantized model, with
     decomposed representation for quantized Tensor
     see https://github.com/pytorch/rfcs/blob/master/RFC-0019-Extending-PyTorch-Quantization-to-Custom-Backends.md for more details,
@@ -743,6 +787,8 @@ def _convert_standalone_module_fx(
     is_reference: bool = False,
     convert_custom_config: ConvertCustomConfig | dict[str, Any] | None = None,
 ) -> GraphModule:
+    # [FUNCTION DOC] HELPER: Converts a prepared standalone module (reference or regular) by calling the shared
+    # convert implementation with the standalone flag set. Returns the GraphModule.
     r"""[Internal use only] Convert a model produced by :func:`~torch.ao.quantization.prepare_standalone_module_fx`
     and convert it to a quantized model
 

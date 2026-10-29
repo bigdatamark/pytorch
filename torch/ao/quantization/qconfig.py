@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Defines QConfig (a namedtuple of activation and weight observer/fake-quant constructors),
+# the deprecated QConfigDynamic, and a large set of predefined default qconfigs (static, dynamic, QAT,
+# weight-only, qnnpack symmetric, embedding). Also provides backend-specific factories
+# (get_default_qconfig, get_default_qat_qconfig), deprecated dict variants, and helpers for validating,
+# comparing and device-adapting qconfigs. Import-time side effect: builds all module-level default
+# qconfig constants.
 import copy
 import warnings
 from collections import namedtuple
@@ -84,6 +90,9 @@ __all__ = [
 
 # pyrefly: ignore [invalid-inheritance]
 class QConfig(namedtuple("QConfig", ["activation", "weight"])):
+    # [CLASS DOC] Immutable namedtuple with fields activation and weight, each an observer or fake-quantize
+    # constructor (class or partial wrapper), never an instance. Describes how a layer is quantized.
+    # The constructor raises ValueError if either argument is an nn.Module instance (common mistake).
     """
     Describes how to quantize a layer or a part of the network by providing
     settings (observer classes) for activations and weights respectively.
@@ -107,6 +116,8 @@ class QConfig(namedtuple("QConfig", ["activation", "weight"])):
     __slots__ = ()
 
     def __new__(cls, activation, weight):
+        # [FUNCTION DOC] Creates a QConfig after rejecting module instances for activation or weight.
+        # Raises ValueError if either is an nn.Module; otherwise returns the namedtuple.
         # catch common mistakes
         if isinstance(activation, nn.Module) or isinstance(weight, nn.Module):
             raise ValueError(
@@ -122,6 +133,8 @@ class QConfig(namedtuple("QConfig", ["activation", "weight"])):
 )
 # pyrefly: ignore [invalid-inheritance]
 class QConfigDynamic(namedtuple("QConfigDynamic", ["activation", "weight"])):
+    # [CLASS DOC] Deprecated (emits FutureWarning on use) namedtuple like QConfig for dynamic quantization;
+    # both fields default to nn.Identity. Superseded by QConfig.
     """
     Describes how to dynamically quantize a layer or a part of the network by providing
     settings (observer classes) for weights.
@@ -141,6 +154,8 @@ class QConfigDynamic(namedtuple("QConfigDynamic", ["activation", "weight"])):
     __slots__ = ()
 
     def __new__(cls, activation=torch.nn.Identity, weight=torch.nn.Identity):
+        # [FUNCTION DOC] Creates a QConfigDynamic; raises ValueError if weight is an nn.Module instance.
+        # Note only weight is checked, activation is not.
         # catch common mistakes
         if isinstance(weight, nn.Module):
             raise ValueError(
@@ -257,6 +272,12 @@ Default qconfig for operators that reuse the observers from input Tensor, e.g. r
 
 
 def get_default_qconfig(backend="x86", version=0):
+    # [FUNCTION DOC] Returns the default post-training-quantization QConfig for a backend.
+    # Args: backend, one of fbgemm, x86, qnnpack, onednn; version, must be 0.
+    # fbgemm and x86 use histogram activation with reduced range and per-channel weights; qnnpack uses
+    # histogram activation without reduced range and per-tensor weights; onednn uses per-channel weights
+    # without reduced range and warns if the CPU lacks VNNI support.
+    # Raises AssertionError for an unsupported backend or version.
     """
     Returns the default PTQ qconfig for the specified backend.
 
@@ -372,6 +393,13 @@ default_quint8_weight_qconfig = QConfig(
 
 
 def get_default_qat_qconfig(backend="x86", version=1):
+    # [FUNCTION DOC] Returns the default quantization-aware-training QConfig for a backend.
+    # Args: backend, one of fbgemm, x86, qnnpack, onednn; version, 0 (separate observer plus FakeQuantize
+    # with moving-average min/max) or 1 (fused moving-average observer and fake-quant, default).
+    # Reduce-range and per-channel weight choices mirror the PTQ defaults per backend.
+    # Raises AssertionError for an unsupported backend or version.
+    # KNOWN ISSUE: the version error message lacks a space before "in get_default_qat_qconfig" and the
+    # docstring says version may be None, but None raises.
     """
     Returns the default QAT qconfig for the specified backend.
 
@@ -529,6 +557,8 @@ _default_quint8_placeholder_qconfig = QConfig(
     category=FutureWarning,
 )
 def get_default_qconfig_dict(backend="x86", version=0):
+    # [FUNCTION DOC] Deprecated: builds the default qconfig mapping for the backend and version and returns
+    # it converted to a dictionary.
     return torch.ao.quantization.get_default_qconfig_mapping(backend, version).to_dict()
 
 
@@ -538,12 +568,17 @@ def get_default_qconfig_dict(backend="x86", version=0):
     category=FutureWarning,
 )
 def get_default_qat_qconfig_dict(backend="x86", version=1):
+    # [FUNCTION DOC] Deprecated: builds the default QAT qconfig mapping for the backend and version and
+    # returns it converted to a dictionary.
     return torch.ao.quantization.get_default_qat_qconfig_mapping(
         backend, version
     ).to_dict()
 
 
 def _assert_valid_qconfig(qconfig: QConfig | None, mod: torch.nn.Module) -> None:
+    # [FUNCTION DOC] HELPER: Validates a qconfig for a module. Returns silently for None. For ConvTranspose
+    # 1d/2d/3d modules with a weight constructor, instantiates the weight observer and raises
+    # AssertionError if it is a per-channel observer (unsupported). Other modules are not checked.
     """
     Verifies that this `qconfig` is valid.
     """
@@ -577,6 +612,10 @@ QConfigAny = TypeAliasType("QConfigAny", QConfig | None)
 def _add_module_to_qconfig_obs_ctr(
     qconfig: QConfigAny, module: nn.Module | None
 ) -> Any:
+    # [FUNCTION DOC] HELPER: Returns a new QConfig whose activation and weight constructors create observers
+    # on the same device as the given module. Returns the input unchanged if module or qconfig is None or
+    # the qconfig lacks exactly the fields activation and weight. Constructors that do not accept a
+    # factory_kwargs argument are left unchanged.
     r"""This is a helper function for use in quantization prepare that updates a qconfig so that
     the constructors stored in the qconfig will create observers on the same device that
     'module' is on. This is intended to be used when the qconfigs are propagated to each
@@ -594,6 +633,8 @@ def _add_module_to_qconfig_obs_ctr(
         return qconfig
 
     def get_factory_kwargs_based_on_module_device():
+        # [FUNCTION DOC] HELPER: Collects devices of the module's parameters and buffers and returns a mapping with
+        # the first device, or None if the module has none. Raises AssertionError if module is not an nn.Module.
         if not isinstance(module, torch.nn.Module):
             raise AssertionError("module must be an instance of torch.nn.Module")
         devices = {p.device for p in module.parameters()} | {
@@ -603,6 +644,9 @@ def _add_module_to_qconfig_obs_ctr(
         return None if device is None else {"device": device}
 
     def configure_constructor_to_put_obs_on_module_device(original_constructor):
+        # [FUNCTION DOC] HELPER: Probes whether the constructor accepts factory_kwargs by instantiating it; if so
+        # returns a version binding factory_kwargs lazily to the module device callable, otherwise (attribute or
+        # type error) returns the original constructor. Side effect: constructs one throwaway observer.
         try:
             # check if constructor can accept factory_kwargs
             check = original_constructor.with_args(factory_kwargs=None)
@@ -630,6 +674,8 @@ def _obs_or_fq_ctr_equals(
     obs_or_fq1: _ObserverOrFakeQuantizeConstructor,
     obs_or_fq2: _ObserverOrFakeQuantizeConstructor,
 ):
+    # [FUNCTION DOC] HELPER: Equality of two observer/fake-quant constructors; compares by partial-wrapper
+    # contents when both are partial wrappers, otherwise by plain equality. Returns a bool.
     if isinstance(obs_or_fq1, _PartialWrapper) and isinstance(
         obs_or_fq2, _PartialWrapper
     ):
@@ -638,6 +684,9 @@ def _obs_or_fq_ctr_equals(
 
 
 def _partial_wrapper_equals(obs_or_fq1: _PartialWrapper, obs_or_fq2: _PartialWrapper):
+    # [FUNCTION DOC] HELPER: Returns True if two partial wrappers have equal wrapped function, positional args
+    # and keyword args. The nested observer keyword is compared recursively and removed from copies first,
+    # since partial objects have no equality. Does not mutate the inputs.
     """
     Return whether the two partial wrappers are equal,
     """
@@ -661,6 +710,9 @@ def _partial_wrapper_equals(obs_or_fq1: _PartialWrapper, obs_or_fq2: _PartialWra
 
 
 def qconfig_equals(q1: QConfigAny, q2: QConfigAny):
+    # [FUNCTION DOC] Returns True if two qconfigs are equal. If either is None, compares them directly.
+    # Otherwise compares activation and weight constructors (partial-aware); on attribute errors falls back
+    # to plain equality.
     """
     Returns `True` if `q1` equals `q2`, and `False` otherwise.
     """
@@ -683,12 +735,16 @@ def qconfig_equals(q1: QConfigAny, q2: QConfigAny):
 
 
 def _activation_is_memoryless(qconfig: QConfig):
+    # [FUNCTION DOC] HELPER: Returns True if the activation observer of the qconfig is memoryless, i.e. it has
+    # an averaging constant equal to 1. Instantiates the activation constructor; for fake-quant modules
+    # inspects the inner activation_post_process observer.
     """
     Return whether the observer for activations defined in the given QConfig is memoryless.
     This means a MovingAverage observer with averaging constant equal to 1.
     """
 
     def _is_memoryless(observer):
+        # [FUNCTION DOC] HELPER: True if the observer has an averaging_constant attribute equal to 1.
         return (
             hasattr(observer, "averaging_constant") and observer.averaging_constant == 1
         )
@@ -701,6 +757,8 @@ def _activation_is_memoryless(qconfig: QConfig):
 
 
 def _is_reuse_input_qconfig(qconfig: QConfig | None):
+    # [FUNCTION DOC] HELPER: True if qconfig is not None, its activation builds a ReuseInputObserver and its
+    # weight builds a NoopObserver. Instantiates both constructors.
     return (
         qconfig is not None
         and isinstance(qconfig.activation(), ReuseInputObserver)

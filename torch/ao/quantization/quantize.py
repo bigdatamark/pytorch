@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Eager-mode quantization entry points: propagating qconfigs through a module tree, inserting
+# observers/fake-quant modules and forward hooks (prepare, prepare_qat), wrapping leaves with quant/dequant
+# stubs, and converting observed modules to quantized ones (convert, quantize, quantize_dynamic,
+# quantize_qat, swap_module). Import-time side effect: defines the default custom config dictionary and a
+# backward-compat alias is_activation_post_process.
 import copy
 import inspect
 import itertools
@@ -69,6 +74,8 @@ _DEFAULT_CUSTOM_CONFIG_DICT = {
 
 
 def get_default_custom_config_dict():
+    # [FUNCTION DOC] Returns the shared default custom config dictionary (not a copy) mapping nn.LSTM and
+    # MultiheadAttention to their observed classes, and observed classes to their quantized classes.
     r"""Defines the default custom config dict."""
     return _DEFAULT_CUSTOM_CONFIG_DICT
 
@@ -80,6 +87,13 @@ def _propagate_qconfig_helper(
     prefix="",
     prepare_custom_config_dict=None,
 ):
+    # [FUNCTION DOC] HELPER: Recursively attaches a qconfig attribute to module and its children, in place.
+    # Precedence for a module: an existing qconfig attribute, then a match on its name prefix in the dict, then
+    # a match on its type, then the parent's qconfig. Validates the qconfig and wraps it so observers are
+    # created on the module's device. Children listed as non-traceable by name or class in the custom config
+    # are skipped.
+    # KNOWN ISSUE: the recursive call does not forward prepare_custom_config_dict, so the non-traceable
+    # filter only applies at the top level.
     r"""This is a helper function for `propagate_qconfig_`
 
     Args:
@@ -123,6 +137,9 @@ def _propagate_qconfig_helper(
 
 
 def propagate_qconfig_(module, qconfig_dict=None, prepare_custom_config_dict=None):
+    # [FUNCTION DOC] Public entry: assigns a qconfig attribute to every module in the hierarchy, in place, using
+    # a mapping from submodule name or type to qconfig (default empty) and the optional custom config.
+    # Returns None.
     r"""Propagate qconfig through the module hierarchy and assign `qconfig`
     attribute on each leaf module
 
@@ -148,16 +165,22 @@ def propagate_qconfig_(module, qconfig_dict=None, prepare_custom_config_dict=Non
 
 
 def _observer_forward_hook(self, input, output):
+    # [FUNCTION DOC] HELPER: Forward hook that runs the module's activation_post_process observer on the
+    # output and returns its result (which replaces the output).
     r"""Forward hook that calls observer on the output"""
     return self.activation_post_process(output)
 
 
 def _observer_forward_pre_hook(self, input):
+    # [FUNCTION DOC] HELPER: Forward pre-hook that runs the activation_post_process observer on the first
+    # input and returns the result. Note it returns a bare tensor, not a tuple.
     r"""Forward pre hook that calls observer on the output"""
     return self.activation_post_process(input[0])
 
 
 def _register_activation_post_process_hook(module, pre_hook=False):
+    # [FUNCTION DOC] HELPER: Registers the observer pre-hook (if pre_hook) or post-hook, prepended so it runs
+    # first. Raises AssertionError if the module has no activation_post_process attribute.
     if not hasattr(module, "activation_post_process"):
         raise AssertionError(
             "Expect activation_post_process attribute already attached to the module"
@@ -175,6 +198,13 @@ def _add_observer_(
     device=None,
     custom_module_class_mapping=None,
 ):
+    # [FUNCTION DOC] HELPER: Recursively inserts observers/fake-quant modules into the module in place. Device
+    # defaults to the single non-meta device of the module (raises AssertionError if more than one).
+    # Per child: Dropout is skipped; FloatFunctional/QFunctional get their activation_post_process set;
+    # fused modules, listed non-leaf modules and modules with a special fixed-qparams post-process get an
+    # observer submodule plus hook; custom-mapped modules are replaced by from_float results (observed
+    # unless in the no-observer set); anything else is recursed into. Finally the module itself is observed
+    # if it is a non-Sequential leaf in the propagation list, or has a weight_fake_quant (AdaRound case).
     r"""Add observer for the leaf child of the module.
 
     This function insert observer module to all leaf child module that
@@ -206,6 +236,8 @@ def _add_observer_(
         device = next(iter(devices)) if len(devices) > 0 else None
 
     def get_activation_post_process(qconfig, device, special_act_post_process=None):
+        # [FUNCTION DOC] HELPER: Instantiates the qconfig activation (or the special constructor if given) and
+        # moves it to the device when one is known; returns it.
         activation = (
             qconfig.activation()
             if special_act_post_process is None
@@ -216,9 +248,12 @@ def _add_observer_(
         return activation
 
     def needs_observation(m):
+        # [FUNCTION DOC] HELPER: True if the module has a non-None qconfig attribute.
         return hasattr(m, "qconfig") and m.qconfig is not None
 
     def insert_activation_post_process(m, special_act_post_process=None):
+        # [FUNCTION DOC] HELPER: Adds an activation_post_process submodule to m and registers its hook (pre-hook
+        # if the qconfig activation is memoryless), unless m has no qconfig or is a DeQuantStub.
         """Adds an activation post process module and register
         a pre or post hook that calls the module
         """
@@ -308,12 +343,17 @@ def _add_observer_(
 
 
 def _get_unique_devices_(module):
+    # [FUNCTION DOC] HELPER: Returns the set of devices of the module's parameters and buffers, ignoring
+    # meta tensors.
     return {p.device for p in module.parameters() if p.device.type != "meta"} | {
         p.device for p in module.buffers() if p.device.type != "meta"
     }
 
 
 def add_quant_dequant(module):
+    # [FUNCTION DOC] Recursively wraps leaf modules that have a truthy qconfig in QuantWrapper, replacing
+    # children in place. Returns the (mutated) module, or a new QuantWrapper if the input itself is a
+    # quantizable leaf.
     r"""Wrap the leaf child module in QuantWrapper if it has a valid qconfig
     Note that this function will modify the children of module inplace and it
     can return a new module which wraps the input module as well.
@@ -348,6 +388,10 @@ def prepare(
     observer_non_leaf_module_list=None,
     prepare_custom_config_dict=None,
 ):
+    # [FUNCTION DOC] Deprecated (warns). Prepares a model for calibration/QAT: deep-copies it unless inplace,
+    # propagates existing qconfig attributes, warns if no module has a qconfig, then inserts observers using the
+    # allow list (default propagation list), non-leaf list and custom float-to-observed class mapping from
+    # the custom config (default config if None). Logs API usage. Returns the prepared model.
     r"""Prepares a copy of the model for quantization calibration or quantization-aware training.
 
     Quantization configuration should be assigned preemptively
@@ -409,6 +453,8 @@ def prepare(
 
 
 def _remove_activation_post_process(module):
+    # [FUNCTION DOC] HELPER: Deletes the module's activation_post_process submodule if it is an observer or
+    # fake-quant, and removes the observer forward pre-hook and forward hook entries from the module in place.
     # TODO: maybe we should change activation_post_process to _activation_post_process
     # to prevent it from being used by user
     if hasattr(module, "activation_post_process") and _is_activation_post_process(
@@ -418,6 +464,8 @@ def _remove_activation_post_process(module):
 
     # remove activation_post_process pre and post hooks
     def remove_hooks(pre_hook=False):
+        # [FUNCTION DOC] HELPER: Removes every registered pre-hook (or post-hook) that is the module-level
+        # observer hook function, by collecting matching handle ids and popping them from the hook mapping.
         hook_map = module._forward_pre_hooks if pre_hook else module._forward_hooks
         observer_hook = (
             _observer_forward_pre_hook if pre_hook else _observer_forward_hook
@@ -435,6 +483,8 @@ def _remove_activation_post_process(module):
 
 # TODO: rename to something more general
 def _remove_qconfig(module):
+    # [FUNCTION DOC] HELPER: Recursively deletes the qconfig attribute and any observer post-process
+    # module/hooks from the module and all descendants, in place.
     r"""Clean up the qconfig left in the module so that new qconfig can be
     propagated.
 
@@ -452,6 +502,9 @@ def _remove_qconfig(module):
 
 @typing_extensions.deprecated(DEPRECATION_WARNING)
 def quantize(model, run_fn, run_args, mapping=None, inplace=False):
+    # [FUNCTION DOC] Deprecated (warns). Post-training static quantization: copies the model unless inplace,
+    # sets eval mode, prepares it, calls the calibration function with the model and run_args, then converts
+    # it with the mapping (default static mapping). Returns the quantized model.
     r"""Quantize the input float model with post training static quantization.
 
     First it will prepare the model for calibration, then it calls
@@ -484,6 +537,12 @@ def quantize(model, run_fn, run_args, mapping=None, inplace=False):
 def quantize_dynamic(
     model, qconfig_spec=None, dtype=torch.qint8, mapping=None, inplace=False
 ):
+    # [FUNCTION DOC] Deprecated (warns). Dynamic quantization. If qconfig_spec is None, picks a default
+    # mapping from module types to qconfigs by dtype (qint8 or float16: Linear and RNN variants; quint8:
+    # Embedding and EmbeddingBag; quint4x2: EmbeddingBag only) and raises ValueError for other dtypes. If it
+    # is a set, assigns the dtype-default qconfig to each element and raises RuntimeError for an unknown dtype.
+    # Then copies the model unless inplace, sets eval mode, propagates qconfigs and converts using the dynamic
+    # mapping. Returns the model.
     r"""Converts a float model to dynamic (i.e. weights-only) quantized model.
 
     Replaces specified modules with dynamic weight-only quantized versions and output the quantized model.
@@ -573,6 +632,10 @@ def quantize_dynamic(
 
 @typing_extensions.deprecated(DEPRECATION_WARNING)
 def prepare_qat(model, mapping=None, inplace=False):
+    # [FUNCTION DOC] Deprecated (warns). Prepares a model for QAT. Raises AssertionError if the model is not
+    # in training mode. Copies unless inplace, propagates qconfigs, converts modules to their QAT versions via
+    # the mapping (default QAT mapping) keeping qconfigs, then prepares with the mapped QAT module classes as
+    # non-leaf modules so observers are inserted. Returns the model.
     r"""
     Prepares a copy of the model for quantization calibration or
     quantization-aware training and converts it to quantized version.
@@ -604,6 +667,8 @@ def prepare_qat(model, mapping=None, inplace=False):
 
 @typing_extensions.deprecated(DEPRECATION_WARNING)
 def quantize_qat(model, run_fn, run_args, inplace=False):
+    # [FUNCTION DOC] Deprecated (warns). Copies the model unless inplace, sets train mode, runs prepare_qat,
+    # calls the training function with the model and run_args, then converts to a quantized model. Returns it.
     r"""Do quantization aware training and output a quantized model
 
     Args:
@@ -636,6 +701,9 @@ def convert(
     convert_custom_config_dict=None,
     use_precomputed_fake_quant=False,
 ):
+    # [FUNCTION DOC] Deprecated (warns). Public conversion: copies the module unless inplace, swaps submodules
+    # for their quantized counterparts via the recursive converter (static, or reference mapping when
+    # is_reference), and removes qconfig and observers if remove_qconfig. Returns the converted module.
     r"""Converts submodules in input module to a different module according to `mapping`
     by calling `from_float` method on the target module class. And remove qconfig at the
     end if remove_qconfig is set to True.
@@ -687,6 +755,10 @@ def _convert(
     convert_custom_config_dict=None,
     use_precomputed_fake_quant=False,
 ):
+    # [FUNCTION DOC] HELPER: Recursive worker for convert. Defaults the mapping (static or reference) and the
+    # custom config. Copies unless inplace. Recurses into each child except fused modules and observed custom
+    # modules (swapped as one unit), computes the replacement via swap_module for every child, then assigns
+    # all replacements into the module's children after the loop. Returns the module.
     r"""Converts submodules in input module to a different module according to `mapping`
     by calling `from_float` method on the target module class
 
@@ -744,6 +816,12 @@ def _convert(
 def swap_module(
     mod, mapping, custom_module_class_mapping, use_precomputed_fake_quant=False
 ):
+    # [FUNCTION DOC] Returns the quantized replacement for mod, or mod itself when it has no qconfig or no
+    # mapping. Custom observed classes use from_observed; mapped classes use from_float (reference modules
+    # receive weight qparams computed by running the qconfig weight observer on the module weight; others
+    # get use_precomputed_fake_quant when their from_float accepts it). On swap, copies the old forward
+    # pre-hooks and post-hooks (except the observer hook) to the new module and moves it to the original
+    # single device. Raises AssertionError for a missing qconfig on a reference module or multiple devices.
     r"""Swaps the module if it has a quantized counterpart and it has an
     `observer` attached.
 
@@ -809,6 +887,9 @@ def swap_module(
 
 
 def _get_observer_dict(mod, target_dict, prefix=""):
+    # [FUNCTION DOC] HELPER: Recursively walks the module tree and stores each activation_post_process
+    # observer into target_dict keyed by its dotted module path plus the suffix activation_post_process.
+    # Used for accuracy debugging; mutates target_dict.
     r"""Traverse the modules and save all observers into dict.
     This is mainly used for quantization accuracy debug
     Args:
@@ -818,6 +899,7 @@ def _get_observer_dict(mod, target_dict, prefix=""):
     """
 
     def get_prefix(prefix):
+        # [FUNCTION DOC] HELPER: Returns the prefix with a trailing dot, or empty string if it is empty.
         return prefix if prefix == "" else prefix + "."
 
     if hasattr(mod, "activation_post_process"):
