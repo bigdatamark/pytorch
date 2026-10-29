@@ -1,3 +1,7 @@
+# [MODULE DOC] Default constants for the RPC package: timeouts, init method, worker thread
+# count, process-group timeout and the unset-timeout sentinel. Values for the RPC-agent
+# defaults are imported from the C++ extension; the rest are defined here. No side effects
+# beyond defining names; exports nothing via the all-list (empty).
 from datetime import timedelta
 
 from torch._C._distributed_rpc import (

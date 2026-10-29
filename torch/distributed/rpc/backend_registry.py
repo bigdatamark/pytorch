@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Registry of RPC backends. Maintains the dynamically extensible BackendType enum
+# (name to a pair of handlers: build backend options, initialize backend/agent), plus the
+# TensorPipe backend implementation: device-map validation/exchange across workers, reverse
+# device maps, and static or dynamic group agent initialization. Import-time side effect:
+# registers the built-in TENSORPIPE backend (rebinding the module-level BackendType).
 
 
 import collections
@@ -27,6 +32,8 @@ BackendValue = collections.namedtuple(
 
 
 def _backend_type_repr(self):
+    # [FUNCTION DOC] HELPER: repr for backend enum members; returns the type name, a dot, and
+    # the member name.
     return "BackendType." + self.name
 
 
@@ -49,6 +56,8 @@ if BackendType.__doc__:
 
 
 def backend_registered(backend_name):
+    # [FUNCTION DOC] Returns True if backend_name is a member of the current BackendType enum,
+    # else False. No side effects.
     """
     Checks if backend_name is registered as an RPC backend.
 
@@ -64,6 +73,11 @@ def backend_registered(backend_name):
 def register_backend(
     backend_name, construct_rpc_backend_options_handler, init_backend_handler
 ):
+    # [FUNCTION DOC] Registers a new backend. Raises RuntimeError if the name already exists.
+    # Rebuilds the module-level BackendType enum with the old members plus the new one
+    # (value is a BackendValue pair of handlers), reinstalls repr and doc, and returns the
+    # new member. Side effect: replaces the global BackendType; references to the old enum
+    # class held elsewhere become stale.
     """Registers a new RPC backend.
 
     Args:
@@ -105,16 +119,24 @@ def construct_rpc_backend_options(
     init_method=rpc_constants.DEFAULT_INIT_METHOD,
     **kwargs,
 ):
+    # [FUNCTION DOC] Builds backend options by calling the options handler stored in the backend
+    # enum member with the timeout, init method and extra keyword arguments; returns it.
     return backend.value.construct_rpc_backend_options_handler(
         rpc_timeout, init_method, **kwargs
     )
 
 
 def init_backend(backend, *args, **kwargs):
+    # [FUNCTION DOC] Calls the backend's init handler with all given arguments and returns the
+    # created RPC agent.
     return backend.value.init_backend_handler(*args, **kwargs)
 
 
 def _init_process_group(store, rank, world_size):
+    # [FUNCTION DOC] HELPER: creates a Gloo process group from the store using the default long
+    # process-group timeout. Raises AssertionError if creation yields nothing and
+    # RuntimeError if a given rank or world size (other than minus one) does not match
+    # the group. Returns the group.
     # Initialize ProcessGroup.
     process_group_timeout = rpc_constants.DEFAULT_PROCESS_GROUP_TIMEOUT
 
@@ -142,6 +164,9 @@ def _tensorpipe_construct_rpc_backend_options_handler(
     _channels=None,
     **kwargs,
 ):
+    # [FUNCTION DOC] HELPER: handler for the TensorPipe backend that builds a
+    # TensorPipeRpcBackendOptions from timeout, init method, worker thread count and
+    # private transports/channels. Extra keyword arguments are silently ignored.
     from . import TensorPipeRpcBackendOptions
 
     return TensorPipeRpcBackendOptions(
@@ -154,6 +179,8 @@ def _tensorpipe_construct_rpc_backend_options_handler(
 
 
 def _tensorpipe_validate_devices(devices, device_count):
+    # [FUNCTION DOC] HELPER: returns True if every device is either cpu or of the current
+    # accelerator type (cpu if none) with an index in range of the device count.
     device_type = (
         acc.type if (acc := torch.accelerator.current_accelerator()) else "cpu"
     )
@@ -168,6 +195,10 @@ def _tensorpipe_validate_devices(devices, device_count):
 def _tensorpipe_exchange_and_check_all_device_maps(
     my_name, my_device_count, my_device_maps, my_devices, group
 ):
+    # [FUNCTION DOC] HELPER: collective call over the group. Gathers each worker's name, device
+    # count, device maps and devices, validates them (raising ValueError on bad
+    # configuration), then returns the reverse device maps for this worker and its final
+    # sorted device list.
     gathered: list[
         tuple[str, int, dict[str, dict[torch.device, torch.device]], list[torch.device]]
     ] = [("", 0, {}, []) for _ in range(group.size())]
@@ -190,6 +221,11 @@ def _tensorpipe_exchange_and_check_all_device_maps(
 def _validate_device_maps(
     all_names, all_device_counts, all_device_maps, all_devices, is_static_group=True
 ):
+    # [FUNCTION DOC] HELPER: validates device configuration of all workers; raises ValueError on
+    # duplicate devices, out-of-range indices, device-map target names not among workers
+    # (checked only for static groups), duplicate target devices in a map, source devices
+    # not in the worker's declared devices (or invalid when none declared), and target
+    # devices not in the target's declared devices (or invalid when known and none declared).
     for node in all_names:
         devices = all_devices[node]
         if len(set(devices)) != len(devices):
@@ -255,6 +291,8 @@ def _validate_device_maps(
 
 
 def _create_device_list(my_devices, my_device_maps, reverse_device_maps):
+    # [FUNCTION DOC] HELPER: if no devices were given, derives them from the keys of forward
+    # and reverse device maps (excluding cpu). Returns the devices sorted by index.
     if not my_devices:
         devices_set: set[torch.device] = set()
         for map_ in my_device_maps.values():
@@ -268,6 +306,8 @@ def _create_device_list(my_devices, my_device_maps, reverse_device_maps):
 
 
 def _create_reverse_mapping(my_name, all_names, all_device_maps):
+    # [FUNCTION DOC] HELPER: for each worker whose device map targets this worker, returns the
+    # inverted map, as a mapping keyed by that worker name.
     reverse_device_maps: dict[str, dict[torch.device, torch.device]] = {}
     for node in all_names:
         if my_name in all_device_maps[node]:
@@ -278,6 +318,9 @@ def _create_reverse_mapping(my_name, all_names, all_device_maps):
 
 
 def _get_device_infos():
+    # [FUNCTION DOC] HELPER: runs on a worker (called via RPC); returns the accelerator device
+    # count, the agent's device maps and devices. Initializes the accelerator runtime if
+    # available and devices are configured.
     from . import TensorPipeAgent
 
     agent = cast(TensorPipeAgent, api._get_current_rpc_agent())
@@ -290,6 +333,11 @@ def _get_device_infos():
 
 
 def _set_devices_and_reverse_device_map(agent):
+    # [FUNCTION DOC] HELPER: dynamic-group join step. Collects device info from every worker
+    # (via synchronous RPC for others, locally for self), validates it without target-name
+    # checks, computes reverse maps and device lists, then calls every worker, including
+    # itself, to update group membership with them. Raises ValueError on invalid config;
+    # RPC errors propagate.
     from . import TensorPipeAgent
 
     agent = cast(TensorPipeAgent, agent)
@@ -344,6 +392,13 @@ def _set_devices_and_reverse_device_map(agent):
 def _tensorpipe_init_backend_handler(
     store, name, rank, world_size, rpc_backend_options
 ):
+    # [FUNCTION DOC] HELPER: init handler of the TensorPipe backend; raises TypeError for a
+    # non-store or wrong options type. Static group (nonzero world size): creates a Gloo
+    # group, exchanges and checks device maps, initializes the accelerator, creates the
+    # agent, sets global RPC state, runs a dummy all-gather and a barrier, returns agent.
+    # Dynamic group (world size zero): under group membership management, creates an agent
+    # with empty maps, sets RPC state, and updates devices/reverse maps with all workers;
+    # on any error shuts down RPC and re-raises. Returns the agent.
     from . import TensorPipeAgent, TensorPipeRpcBackendOptions
 
     if not isinstance(store, dist.Store):

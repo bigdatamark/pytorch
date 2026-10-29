@@ -1,5 +1,10 @@
 # mypy: allow-untyped-decorators
 # mypy: allow-untyped-defs
+# [MODULE DOC] Public Python API of torch.distributed.rpc: shutdown, worker lookup, rpc_sync,
+# rpc_async, remote, RRef wrapper, and the all-gather/barrier machinery built on RPC used
+# for init and graceful shutdown. Also decorators/utilities for method wrapping. Import-time
+# side effects: creates module-level state (worker name set, locks, sequence-id maps,
+# default pickler, thread-local storage, a logger).
 
 import collections
 import contextlib
@@ -77,6 +82,9 @@ _default_pickler = _internal_rpc_pickler
 
 @contextlib.contextmanager
 def _use_rpc_pickler(rpc_pickler):
+    # [FUNCTION DOC] HELPER: context manager that overrides the module-level default pickler
+    # with rpc_pickler inside the block and resets it to the internal pickler on exit
+    # (even on error). Not thread-safe: it changes a global.
     r"""
     rpc_pickler: (.internal._InternalRPCPickler) Overrides the default RPC pickler
     """
@@ -89,8 +97,12 @@ def _use_rpc_pickler(rpc_pickler):
 
 
 def _require_initialized(func: Callable[_P, _R]) -> Callable[_P, _R]:
+    # [FUNCTION DOC] HELPER: decorator that makes func raise RuntimeError unless an RPC agent
+    # is currently set; otherwise calls func unchanged. Returns the wrapper.
     @functools.wraps(func)
     def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        # [FUNCTION DOC] HELPER: checks that an RPC agent is set (raises RuntimeError if not),
+        # then forwards to the wrapped function and returns its result.
         if not _is_current_rpc_agent_set():
             raise RuntimeError(
                 "RPC has not been initialized. Call "
@@ -102,7 +114,11 @@ def _require_initialized(func: Callable[_P, _R]) -> Callable[_P, _R]:
 
 
 class AllGatherStates:
+    # [CLASS DOC] HELPER: per-sequence-id state of an RPC based all-gather. Holds the mapping of
+    # worker name to gathered object (filled on the leader, replaced by the leader's full
+    # mapping on followers) and an event signaled when all objects are available.
     def __init__(self):
+        # [FUNCTION DOC] HELPER: creates an empty gathered-objects mapping and an unset event.
         # Each `gathered_objects` is an empty dict at beginning.
         # The leader worker is elected as the first worker in a sorted worker
         # name list. Whenever there is a worker entering `_all_gather()`, it
@@ -129,6 +145,8 @@ _all_gather_sequence_id_to_states: collections.defaultdict = collections.default
 
 
 def _init_rpc_states(agent):
+    # [FUNCTION DOC] HELPER: records the set of all worker names from the agent and starts the
+    # agent as the current one unless an agent is already set. Mutates global state.
     worker_infos = agent.get_worker_infos()
     global _ALL_WORKER_NAMES
     _ALL_WORKER_NAMES = {worker_info.name for worker_info in worker_infos}
@@ -139,6 +157,10 @@ def _init_rpc_states(agent):
 
 
 def _gather_to_leader(sequence_id, worker_name, obj, worker_names=None):
+    # [FUNCTION DOC] HELPER: runs on the leader (via RPC or locally). Under a lock, stores obj
+    # for worker_name in the state of sequence_id and signals when all expected workers
+    # (the given names or all known) have reported. Raises AssertionError if the worker is
+    # unexpected (only checked when names are not given) or reports twice.
     with _all_gather_dict_lock:
         if not worker_names:
             worker_names = _ALL_WORKER_NAMES
@@ -155,6 +177,9 @@ def _gather_to_leader(sequence_id, worker_name, obj, worker_names=None):
 
 
 def _broadcast_to_followers(sequence_id, objects_map):
+    # [FUNCTION DOC] HELPER: runs on followers; stores the leader's full mapping in the state
+    # of sequence_id and sets the proceed signal. Raises AssertionError if the signal was
+    # already set.
     with _all_gather_dict_lock:
         states = _all_gather_sequence_id_to_states[sequence_id]
 
@@ -171,6 +196,9 @@ _thread_local_var = threading.local()
 
 @contextlib.contextmanager
 def _wait_all():
+    # [FUNCTION DOC] HELPER: context manager; creates a thread-local list collecting futures from
+    # rpc_async calls in the block, and on exit waits for all of them (raising the first
+    # failure), always removing the list afterwards.
     r"""
     A context manager that collects all futures returned by ``rpc_async`` and
     waits them on the context manager's exit; relieving the user of needing
@@ -200,6 +228,13 @@ def _wait_all():
 
 @_require_initialized
 def _all_gather(obj, worker_names=None, timeout: float = UNSET_RPC_TIMEOUT):
+    # [FUNCTION DOC] HELPER: RPC based all-gather of obj among worker_names (default all
+    # workers). Leader is the smallest name. Sequence id is derived from the joined
+    # sorted names and a per-group counter. Followers send obj to the leader by sync RPC;
+    # everyone waits for the signal; the leader then async-broadcasts the result to
+    # followers and raises RuntimeError listing followers that failed. Timeout unset: agent
+    # RPC timeout and no signal timeout; shutdown-default value: no timeouts; else both.
+    # Returns the mapping of worker name to object. Requires initialized RPC.
     r"""
     This is similar to torch.distributed.all_gather(), but is using RPC. It
     picks the worker with the smallest name (alphabetic order) as the leader.
@@ -291,6 +326,8 @@ def _all_gather(obj, worker_names=None, timeout: float = UNSET_RPC_TIMEOUT):
 
 @_require_initialized
 def _barrier(worker_names):
+    # [FUNCTION DOC] HELPER: blocks until all listed workers reach it, by an all-gather of no
+    # data. A RuntimeError is logged, not raised.
     r"""
     Synchronizes local and remote RPC processes.
 
@@ -309,6 +346,8 @@ def _barrier(worker_names):
 
 @_require_initialized
 def _wait_all_workers(timeout=DEFAULT_SHUTDOWN_TIMEOUT):
+    # [FUNCTION DOC] HELPER: graceful shutdown barrier; all-gathers no data across all workers
+    # with the given timeout. Logs and re-raises RuntimeError on failure.
     r"""
     Block until all local and remote RPC processes reach this method and wait
     for all outstanding work to complete. Every RPC process must call this
@@ -325,6 +364,12 @@ def _wait_all_workers(timeout=DEFAULT_SHUTDOWN_TIMEOUT):
 
 @_require_initialized
 def shutdown(graceful=True, timeout=DEFAULT_SHUTDOWN_TIMEOUT):
+    # [FUNCTION DOC] Shuts down the RPC agent and destroys it. Graceful: for a static group (or
+    # non-TensorPipe agent) waits for all workers, deletes user and unforked owner RRefs,
+    # and joins the agent; for a dynamic TensorPipe group, under the group membership
+    # token it tells every other worker to drop this worker, then joins the agent. In all
+    # cases the local finalization runs even on error. Non-graceful: only finalizes.
+    # Raises RuntimeError if RPC is not initialized; barrier errors propagate.
     r"""
     Perform a shutdown of the RPC agent, and then destroy the RPC agent. This
     stops the local agent from accepting outstanding requests, and shuts
@@ -404,6 +449,9 @@ def shutdown(graceful=True, timeout=DEFAULT_SHUTDOWN_TIMEOUT):
 
 
 def _finalize_shutdown():
+    # [FUNCTION DOC] HELPER: destroys the RRef context (may raise on detected RRef leaks unless
+    # leaks are ignored), then always shuts down the agent, cleans up the Python RPC
+    # handler and resets the current agent to unset.
     try:
         # This raises a `TORCH_CHECK()` exception on RRef leak detected.
         _destroy_rref_context(_ignore_rref_leak)
@@ -426,6 +474,8 @@ def _finalize_shutdown():
 
 @_require_initialized
 def get_worker_info(worker_name=None):
+    # [FUNCTION DOC] Returns the WorkerInfo for the named worker, or for the current worker if
+    # no name is given. Raises RuntimeError if RPC is not initialized.
     r"""
     Get :class:`~torch.distributed.rpc.WorkerInfo` of a given worker name.
     Use this :class:`~torch.distributed.rpc.WorkerInfo` to avoid passing an
@@ -447,6 +497,8 @@ def get_worker_info(worker_name=None):
 
 
 def _to_worker_info(to):
+    # [FUNCTION DOC] HELPER: returns to if it is a WorkerInfo; looks up by name or rank if a
+    # string or integer; raises ValueError otherwise.
     if isinstance(to, WorkerInfo):
         return to
     elif isinstance(to, (str, int)):
@@ -456,6 +508,8 @@ def _to_worker_info(to):
 
 
 def _rref_typeof_on_owner(rref, blocking: bool = True):
+    # [FUNCTION DOC] HELPER: runs on the owner; returns the type of the RRef's local value, or a
+    # completed Future holding it when blocking is False.
     rref_type = type(rref.local_value())
     if blocking:
         return rref_type
@@ -471,6 +525,8 @@ def _rref_typeof_on_owner(rref, blocking: bool = True):
 def _rref_typeof_on_user(
     rref, timeout: float = UNSET_RPC_TIMEOUT, blocking: bool = True
 ):
+    # [FUNCTION DOC] HELPER: asks the RRef owner (async RPC) for the type of the value; returns
+    # the type after waiting if blocking, else the Future.
     fut = rpc_async(rref.owner(), _rref_typeof_on_owner, args=(rref,), timeout=timeout)
     if blocking:
         return fut.wait()
@@ -486,12 +542,16 @@ GenericWithOneTypeVar = Generic[T]
 if TYPE_CHECKING:
 
     class RRef(PyRRef[T], Generic[T]):
+        # [CLASS DOC] Type-checking-only generic RRef class deriving from PyRRef.
         pass
 
 else:
     try:
         # Combine the implementation class and the type class.
         class RRef(PyRRef, Generic[T]):
+            # [CLASS DOC] Runtime RRef class: the C++ PyRRef combined with Generic so it can be
+            # subscripted by value type. No added behavior; public methods are installed
+            # below by copying from PyRRef.
             pass
 
     except TypeError:
@@ -499,11 +559,15 @@ else:
         # must be a (non-strict) subclass of the metaclasses of all its bases
         # Mypy doesn't understand __class__ (mypy bug #4177)
         class RRefMeta(PyRRef.__class__, GenericWithOneTypeVar.__class__):  # type: ignore[name-defined, misc, valid-type]
+            # [CLASS DOC] HELPER: metaclass combining the PyRRef and Generic metaclasses to
+            # resolve a metaclass conflict; no added behavior.
             pass
 
         # Combine the implementation class and the type class.
         # Types for classes expecting a certain generic parameter (mypy bug #7791)
         class RRef(PyRRef, GenericWithOneTypeVar, metaclass=RRefMeta):  # type: ignore[misc, no-redef, valid-type]
+            # [CLASS DOC] Fallback RRef class used when metaclasses conflict; same role as the
+            # primary definition (PyRRef plus Generic) using the combined metaclass.
             pass
 
 
@@ -515,7 +579,14 @@ else:
 # we have to do the following process to replace `rpc.PyRRef` with `rpc.RRef`.
 #
 def method_factory(method_name, docstring):
+    # [FUNCTION DOC] Creates a method for the RRef class that forwards to the same-named method
+    # of the PyRRef base with all arguments; sets its docstring (only if the generated
+    # method has one, which it does not, so in practice the docstring is not applied).
+    # KNOWN ISSUE: the method has no docstring when created, so the condition on setting
+    # the given docstring is never true and the docstring argument is ignored.
     def method(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: calls the named method on the base class view of self and
+        # returns its result.
         return getattr(super(RRef, self), method_name)(*args, **kwargs)
 
     if method.__doc__:
@@ -553,6 +624,13 @@ for method_name, method in inspect.getmembers(PyRRef):
 
 @_require_initialized
 def remote(to, func, args=None, kwargs=None, timeout=UNSET_RPC_TIMEOUT):
+    # [FUNCTION DOC] Runs func on worker to without waiting and returns a user RRef to the
+    # result (owned by the destination). Builtin operators, TorchScript functions and
+    # Python callables are dispatched differently (the last pickled with the default
+    # pickler); async-execution functions are flagged. With the legacy profiler active, the
+    # call is wrapped in a profiling record and its future attached to the RRef. Missing
+    # args/kwargs default to empty. Raises RuntimeError if RPC is uninitialized; error on
+    # the remote side is surfaced when the RRef is used.
     r"""
     Make a remote call to run ``func`` on worker ``to`` and return an
     :class:`~torch.distributed.rpc.RRef` to the result value immediately.
@@ -710,6 +788,11 @@ def remote(to, func, args=None, kwargs=None, timeout=UNSET_RPC_TIMEOUT):
 def _invoke_rpc(
     to, func, rpc_type, args=None, kwargs=None, rpc_timeout: float = UNSET_RPC_TIMEOUT
 ):
+    # [FUNCTION DOC] HELPER: common path for sync and async RPC. Raises TypeError if func is
+    # not callable. Dispatches to the builtin, TorchScript or pickled Python function
+    # invocation (handling the async-execution marker), optionally wraps the call in the
+    # RPC profiler and chains profiling callbacks onto the future. Returns the Future of
+    # the result.
     if not callable(func):
         raise TypeError("function should be callable.")
 
@@ -770,6 +853,9 @@ def _invoke_rpc(
 
 @_require_initialized
 def rpc_sync(to, func, args=None, kwargs=None, timeout: float = UNSET_RPC_TIMEOUT):
+    # [FUNCTION DOC] Blocking RPC: runs func with args and kwargs on worker to and returns the
+    # result. Raises on timeout, remote exception (re-raised locally), uninitialized RPC
+    # (RuntimeError) or non-callable func (TypeError).
     r"""
     Make a blocking RPC call to run function ``func`` on worker ``to``. RPC
     messages are sent and received in parallel to execution of Python code. This
@@ -844,6 +930,9 @@ def rpc_sync(to, func, args=None, kwargs=None, timeout: float = UNSET_RPC_TIMEOU
 
 @_require_initialized
 def rpc_async(to, func, args=None, kwargs=None, timeout=UNSET_RPC_TIMEOUT):
+    # [FUNCTION DOC] Non-blocking RPC: same as the sync variant but returns a Future. If called
+    # inside the collect-and-wait context, the future is also recorded in the thread-local
+    # list to be waited on at exit.
     r"""
     Make a non-blocking RPC call to run function ``func`` on worker ``to``. RPC
     messages are sent and received in parallel to execution of Python code. This
@@ -939,6 +1028,8 @@ def rpc_async(to, func, args=None, kwargs=None, timeout=UNSET_RPC_TIMEOUT):
 
 
 def _get_should_profile():
+    # [FUNCTION DOC] HELPER: returns True only when the autograd profiler is enabled and is the
+    # legacy kind (RPC profiling is unsupported with the Kineto profiler).
     # Legacy profiler should be enabled. RPC profiling is not supported with
     # Kineto profiler.
     ActiveProfilerType = torch._C._profiler.ActiveProfilerType
@@ -951,6 +1042,11 @@ def _get_should_profile():
 def _enable_rpc_profiler(
     should_profile, qualified_name, func, rpc_type, dst_worker_info
 ):
+    # [FUNCTION DOC] HELPER: returns a context manager for profiling an RPC call. If profiling
+    # is off, a no-op context. Otherwise builds the profiling key from RPC type, function
+    # name (builtin name, script qualified name or Python qualname), current and
+    # destination worker names; stores it as current key (global side effect) and returns
+    # a record-function context with that key.
     ctx_manager = contextlib.nullcontext()
 
     if should_profile:

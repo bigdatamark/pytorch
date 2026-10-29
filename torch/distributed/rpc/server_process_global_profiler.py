@@ -1,5 +1,9 @@
 #!/usr/bin/python3
 # mypy: allow-untyped-defs
+# [MODULE DOC] Defines a context-manager profiler that enables autograd profiling on all
+# threads handling RPC server request callbacks (process-global on the server side).
+# Depends on the C++ enable/disable hooks imported from the rpc package. No import-time
+# side effects; exports nothing via the all-list.
 
 import itertools
 
@@ -18,6 +22,11 @@ __all__: list[str] = []
 
 
 class _server_process_global_profile(profile):
+    # [CLASS DOC] HELPER: subclass of the legacy autograd profile context manager. Entering
+    # turns on profiling on all RPC server callback threads; exiting turns it off and
+    # gathers events. After exit it holds function_events (flattened EventList) and
+    # process_global_function_events (one sorted list per RPC request-handling thread
+    # result). Constructor arguments are those of the base profile class.
     """
     It has the same API as ``torch.autograd.profiler.profile`` class,
     except that it enables profiling on all threads running RPC server request callbacks.
@@ -104,9 +113,14 @@ class _server_process_global_profile(profile):
     """
 
     def __init__(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: passes all arguments unchanged to the base profile initializer.
         super().__init__(*args, **kwargs)
 
     def __enter__(self):
+        # [FUNCTION DOC] Starts server-side process-global profiling. Returns None if disabled;
+        # raises RuntimeError if already entered (not reentrant). Builds a profiler config
+        # (CUDA or CPU kind, shape and memory recording flags) and calls the C++ enable
+        # hook. Marks the instance as entered. Returns self.
         """
         Turn on server-side process-global profiling.
         This enables thread-local profiler on all RPC threads running server-side request callbacks.
@@ -136,6 +150,11 @@ class _server_process_global_profile(profile):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        # [FUNCTION DOC] Stops profiling and collects events. Returns None if disabled. Otherwise
+        # calls the C++ disable hook, parses each thread's records into function events,
+        # sorts each by start time (ties: later end first), stores the per-thread lists as
+        # process_global_function_events, and stores a flattened EventList with its tree
+        # built as function_events. Returns False so exceptions are not suppressed.
         """
         Turn off server-side process-global profiling.
         Aggregate all profiling events recorded by RPC threads.

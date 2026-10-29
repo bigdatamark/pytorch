@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Defines TensorPipeRpcBackendOptions (options for the TensorPipe RPC agent) and
+# helpers converting user device specs into torch.device values. At import time, binds the
+# C++ base options class if TensorPipe is available, otherwise falls back to plain object.
 import torch
 
 from . import _is_tensorpipe_available, constants as rpc_contants
@@ -10,6 +13,8 @@ __all__ = ["TensorPipeRpcBackendOptions"]
 
 
 def _to_device(device: DeviceType) -> torch.device:
+    # [FUNCTION DOC] HELPER: converts an int, string or device to a torch.device; raises
+    # ValueError if the device type is not cuda.
     device = torch.device(device)
     if device.type != "cuda":
         raise ValueError(
@@ -22,6 +27,9 @@ def _to_device(device: DeviceType) -> torch.device:
 def _to_device_map(
     device_map: dict[DeviceType, DeviceType],
 ) -> dict[torch.device, torch.device]:
+    # [FUNCTION DOC] HELPER: converts a mapping of device specs to a mapping of torch.device
+    # keys and values. Raises ValueError if two keys map to the same value (the map must be
+    # one-to-one so it is invertible). Does not check device types.
     full_device_map: dict[torch.device, torch.device] = {}
     reverse_map: dict[torch.device, torch.device] = {}
     for k, v in device_map.items():
@@ -37,6 +45,8 @@ def _to_device_map(
 
 
 def _to_device_list(devices: list[DeviceType]) -> list[torch.device]:
+    # [FUNCTION DOC] HELPER: converts each device spec to a CUDA torch.device (raises
+    # ValueError for non-CUDA devices) and returns the list.
     return list(map(_to_device, devices))
 
 
@@ -48,6 +58,11 @@ else:
 
 # pyrefly: ignore [invalid-inheritance]
 class TensorPipeRpcBackendOptions(_TensorPipeRpcBackendOptionsBase):
+    # [CLASS DOC] Configuration for the TensorPipe RPC agent: worker thread count, default RPC
+    # timeout, rendezvous init method, per-callee device maps and the local CUDA device
+    # list. State is stored in the C++ base class; device specs are normalized to
+    # torch.device. Key methods: set_device_map (incrementally add one-to-one mappings
+    # for a callee) and set_devices.
     r"""
     The backend options for
     :class:`~torch.distributed.rpc.TensorPipeAgent`, derived from
@@ -92,6 +107,10 @@ class TensorPipeRpcBackendOptions(_TensorPipeRpcBackendOptionsBase):
         _transports: list | None = None,
         _channels: list | None = None,
     ):
+        # [FUNCTION DOC] Keyword-only constructor. Normalizes device_maps (per callee name) and
+        # devices into torch.device forms (raising ValueError on non-1-to-1 maps or
+        # non-CUDA devices) and forwards all settings, including private transports and
+        # channels lists, to the base class initializer.
         full_device_maps = (
             {}
             if device_maps is None
@@ -109,6 +128,9 @@ class TensorPipeRpcBackendOptions(_TensorPipeRpcBackendOptionsBase):
         )
 
     def set_device_map(self, to: str, device_map: dict[DeviceType, DeviceType]):
+        # [FUNCTION DOC] Adds device mappings from this worker's devices to callee "to". Raises
+        # ValueError if the map is not one-to-one, or if it conflicts with a mapping
+        # already set for the same callee and local device. Mutates the stored maps.
         r"""
         Set device mapping between each RPC caller and callee pair. This
         function can be called multiple times to incrementally add
@@ -167,6 +189,8 @@ class TensorPipeRpcBackendOptions(_TensorPipeRpcBackendOptionsBase):
         super()._set_device_map(to, full_device_map)
 
     def set_devices(self, devices: list[DeviceType]):
+        # [FUNCTION DOC] Sets the local CUDA devices used by the agent, replacing any previous
+        # list. Raises ValueError for non-CUDA devices.
         r"""
         Set local devices used by the TensorPipe RPC agent. When processing
         CUDA RPC requests, the TensorPipe RPC agent will properly synchronize

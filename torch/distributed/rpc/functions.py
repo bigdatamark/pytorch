@@ -1,8 +1,14 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Holds the async_execution decorator used to mark functions that return a
+# Future and may run asynchronously on the RPC callee. No import-time side effects.
 import functools
 
 
 def async_execution(fn):
+    # [FUNCTION DOC] Decorator: wraps fn in a pass-through function (preserving metadata)
+    # and attaches the attribute for the async marker, set to the original fn, so the RPC
+    # layer knows the return value is a Future to be chained on the callee. Returns the
+    # wrapper. Does not validate that fn returns a Future; no errors raised here.
     r"""
     A decorator for a function indicating that the return value of the function
     is guaranteed to be a :class:`~torch.futures.Future` object and this
@@ -162,6 +168,7 @@ def async_execution(fn):
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: forwards all arguments to the wrapped fn and returns its result.
         return fn(*args, **kwargs)
 
     # Can't declare and use attributes of function objects (mypy#2087)
