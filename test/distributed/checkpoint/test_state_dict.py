@@ -1,5 +1,12 @@
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC] Multi-GPU tests of torch.distributed.checkpoint.state_dict (get/set model and
+# optimizer state dict, StateDictOptions, patched state_dict hooks) across DDP, FSDP1, FSDP2
+# (fully_shard), tensor parallel, frozen parameters, optimizer-in-backward and plain single GPU
+# models. Import-time side effects: computes the module level device_type string, and exits the
+# process with status 0 (printing to stderr) when torch.distributed is unavailable or when
+# running under the dev-asan configuration.
+
 import copy
 import functools
 import sys
@@ -78,10 +85,16 @@ if TEST_WITH_DEV_DBG_ASAN:
 
 
 class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
+    # [CLASS DOC] Multi-process test case checking the distributed state dict API against plain
+    # single-process reference models and optimizers. Per-parallelism _test_* helpers build a
+    # model/optimizer factory and delegate to _test_save_load; public test_* methods sweep their
+    # arguments with run_subtests. Verification helpers come from VerifyStateDictMixin.
     """Tests state_dict and load_state_dict"""
 
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] Returns the number of processes to spawn: the smaller of 4 and the
+        # accelerator device count.
         return min(4, torch.accelerator.device_count())
 
     def _test_save_load(
@@ -90,6 +103,14 @@ class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
         test_frozen: bool = False,
         flatten_optimizer: bool = False,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Core round trip check. The factory returns (reference model,
+        # reference optimizer, copy optimizer, distributed model, distributed optimizer or list
+        # of them). Trains both models for 10 steps on identical random batches, compares
+        # get_state_dict output with the reference state dicts, builds a fresh distributed model,
+        # restores it via set_model_state_dict and set_optimizer_state_dict, compares again, and
+        # finally checks the patched state_dict hooks. With test_frozen, frozen params are
+        # ignored and the test returns before the reload step. flatten_optimizer selects the
+        # flattened optimizer state dict format and skips structural optimizer comparison.
         options = StateDictOptions(
             ignore_frozen_params=test_frozen,
             flatten_optimizer_state_dict=flatten_optimizer,
@@ -182,6 +203,12 @@ class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
         compile_model: bool = False,
         optimizer_class: type[Optimizer],
     ) -> None:
+        # [FUNCTION DOC] HELPER: Round trip test for FSDP1 wrapped models. Wraps a composite model
+        # with the module wrap policy (default UnitModule, or the given wrapping), optionally with
+        # a device mesh and torch.compile, and runs _test_save_load.
+        # KNOWN ISSUE: returns immediately without testing when use_orig_params is false or when
+        # use_dtensor is true (the latter pending composable API device_mesh support), so only the
+        # use_orig_params true / use_dtensor false combination is exercised.
         if not use_orig_params:
             return
 
@@ -190,6 +217,8 @@ class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
             return
 
         def init_model_optim():
+            # [FUNCTION DOC] HELPER: Factory returning the reference model and two optimizers on
+            # it plus an FSDP wrapped deep copy (compiled if requested) and its optimizer.
             if use_dtensor:
                 device_mesh = init_device_mesh(device_type, (self.world_size,))
 
@@ -225,6 +254,8 @@ class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
     @with_comms
     @skip_if_lt_x_gpu(2)
     def test_fsdp(self) -> None:
+        # [FUNCTION DOC] Sweeps use_orig_params, use_dtensor, wrapping and optimizer class
+        # through _test_fsdp (many combinations are skipped there). Requires at least 2 GPUs.
         self.run_subtests(
             {
                 "use_orig_params": [True, False],
@@ -242,6 +273,9 @@ class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
     @with_comms
     @skip_if_lt_x_gpu(2)
     def test_compiled_fsdp(self) -> None:
+        # [FUNCTION DOC] Runs _test_fsdp for Adam and AdamW with the default wrapping.
+        # KNOWN ISSUE: never passes compile_model, so despite the name the model is not compiled.
+        # Requires at least 2 GPUs.
         self.run_subtests(
             {
                 "use_orig_params": [True],
@@ -260,7 +294,12 @@ class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
         compile_model: bool,
         foreach: bool = True,
     ):
+        # [FUNCTION DOC] HELPER: Round trip test for FSDP2: the distributed model is a deep copy
+        # sharded with fully_shard using the given reshard_after_forward, optionally compiled,
+        # with optimizers built using the foreach setting. Runs _test_save_load.
         def init_model_optim():
+            # [FUNCTION DOC] HELPER: Factory returning reference model, two reference optimizers,
+            # the fully_shard copy and its optimizer.
             orig_model = CompositeParamModel(device=torch.device(device_type))
             orig_optim = optimizer_class(
                 orig_model.parameters(), lr=1e-4, foreach=foreach
@@ -287,6 +326,8 @@ class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
     @with_comms
     @skip_if_lt_x_gpu(2)
     def test_fsdp2(self) -> None:
+        # [FUNCTION DOC] Sweeps reshard_after_forward, optimizer class (Adam, AdamW) and
+        # compile_model through _test_fsdp2. Requires at least 2 GPUs.
         self.run_subtests(
             {
                 "reshard_after_forward": [True, False],
@@ -297,7 +338,11 @@ class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
         )
 
     def _test_ddp(self, use_composable: bool, optimizer_class: type[Optimizer]) -> None:
+        # [FUNCTION DOC] HELPER: Round trip test where the distributed model is a deep copy
+        # wrapped with either the composable replicate API or DistributedDataParallel.
         def init_model_optim():
+            # [FUNCTION DOC] HELPER: Factory returning reference model, two reference optimizers,
+            # the replicated/DDP copy and its optimizer.
             orig_model = CompositeParamModel(device=torch.device(device_type))
             orig_optim = optimizer_class(orig_model.parameters(), lr=1e-4)
             copy_optim = optimizer_class(orig_model.parameters(), lr=1e-4)
@@ -313,6 +358,8 @@ class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
     @with_comms
     @skip_if_lt_x_gpu(2)
     def test_ddp(self) -> None:
+        # [FUNCTION DOC] Sweeps composable vs wrapper DDP and three optimizer classes through
+        # _test_ddp. Requires at least 2 GPUs.
         self.run_subtests(
             {
                 "use_composable": [True, False],
@@ -331,7 +378,16 @@ class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
         optim_in_backward: bool = False,
         test_frozen: bool = False,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Round trip test for a model mixing FSDP and DDP: the l submodule
+        # is wrapped in DDP and listed as an ignored module of the outer FSDP. Optionally freezes
+        # the u1 and u2 parameters, and optionally uses optimizer-in-backward, in which case the
+        # per-parameter optimizers form the list of distributed optimizers.
+        # KNOWN ISSUE: the FSDP wrapper is built from a fresh deepcopy of the original model, not
+        # from the model whose l was wrapped in DDP, so ignored_modules refers to a module that is
+        # not part of the wrapped model and the DDP wrapping has no effect on it.
         def init_model_optim():
+            # [FUNCTION DOC] HELPER: Factory returning reference model/optimizers and the
+            # FSDP-wrapped model with its optimizer (or list of in-backward optimizers).
             orig_model = CompositeParamModel(device=torch.device(device_type))
             if test_frozen:
                 for param in chain(
@@ -364,6 +420,7 @@ class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
     @with_comms
     @skip_if_lt_x_gpu(2)
     def test_fsdp_ddp(self) -> None:
+        # [FUNCTION DOC] Runs _test_fsdp_ddp for Adam and AdamW. Requires at least 2 GPUs.
         self.run_subtests(
             {
                 "optimizer_class": [torch.optim.Adam, torch.optim.AdamW],
@@ -372,7 +429,11 @@ class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
         )
 
     def _test_single_gpu(self, optimizer_class: type[Optimizer]) -> None:
+        # [FUNCTION DOC] HELPER: Round trip test where the "distributed" model is just a deep
+        # copy without any parallel wrapper.
         def init_model_optim():
+            # [FUNCTION DOC] HELPER: Factory returning reference model/optimizers plus a plain
+            # model copy and its optimizer.
             orig_model = CompositeParamModel(device=torch.device(device_type))
             orig_optim = optimizer_class(orig_model.parameters(), lr=1e-4)
             copy_optim = optimizer_class(orig_model.parameters(), lr=1e-4)
@@ -384,10 +445,16 @@ class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
 
     @skip_if_lt_x_gpu(1)
     def test_single_gpu(self) -> None:
+        # [FUNCTION DOC] Runs the unwrapped model round trip with Adam then AdamW. Requires at
+        # least 1 GPU; does not use process group communication.
         self._test_single_gpu(torch.optim.Adam)
         self._test_single_gpu(torch.optim.AdamW)
 
     def _test_strict(self, parallelism: str) -> None:
+        # [FUNCTION DOC] HELPER: Wraps a model in DDP (when parallelism is DDP) or fully_shard,
+        # then checks that set_model_state_dict raises RuntimeError mentioning an unexpected key
+        # for an added extra entry, returns the missing and unexpected key lists when strict is
+        # off, and raises RuntimeError mentioning a missing key after a real entry was removed.
         model = CompositeParamModel(device=torch.device(device_type))
         if parallelism == "DDP":
             model = DDP(model)
@@ -417,6 +484,7 @@ class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
     @with_comms
     @skip_if_lt_x_gpu(1)
     def test_strict(self) -> None:
+        # [FUNCTION DOC] Runs _test_strict for DDP and fully_shard. Requires at least 1 GPU.
         self.run_subtests(
             {"parallelism": ["DDP", "fully_shard"]},
             self._test_strict,
@@ -425,6 +493,10 @@ class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
     def _test_cpu_offload_full_state_dict(
         self, optimizer_class: type[Optimizer]
     ) -> None:
+        # [FUNCTION DOC] HELPER: With an FSDP model on a device mesh, checks that get_state_dict
+        # with cpu_offload puts every tensor on CPU, with full_state_dict leaves no DTensor or
+        # ShardedTensor, and with both options yields CPU tensors on rank 0 and empty dicts on all
+        # other ranks.
         orig_model = CompositeParamModel(device=torch.device(device_type))
         device_mesh = init_device_mesh(device_type, (self.world_size,))
         dist_model = FSDP(
@@ -445,6 +517,8 @@ class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
         cpu_device = torch.device("cpu")
 
         def is_cpu(v):
+            # [FUNCTION DOC] HELPER: True if a tensor, DTensor, or ShardedTensor is on CPU; a
+            # ShardedTensor without local shards counts as CPU, otherwise its first shard decides.
             if isinstance(v, DTensor):
                 return v.device == cpu_device
             elif isinstance(v, ShardedTensor):
@@ -493,6 +567,8 @@ class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
     @with_comms
     @skip_if_lt_x_gpu(2)
     def test_cpu_offload_full_state_dict(self) -> None:
+        # [FUNCTION DOC] Runs _test_cpu_offload_full_state_dict for Adam and AdamW. Requires at
+        # least 2 GPUs.
         self.run_subtests(
             {"optimizer_class": [torch.optim.Adam, torch.optim.AdamW]},
             self._test_cpu_offload_full_state_dict,
@@ -501,6 +577,8 @@ class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
     @with_comms
     @skip_if_lt_x_gpu(1)
     def test_activation_ckpt_fqns_ddp(self) -> None:
+        # [FUNCTION DOC] Checks that after applying activation checkpointing and wrapping in DDP,
+        # get_model_state_dict returns the same keys as before (wrapper prefixes are stripped).
         """Tests that activation checkpointing prefixes are removed from module names"""
         model = CompositeParamModel(device=torch.device(device_type))
         original_keys = get_model_state_dict(model).keys()
@@ -514,12 +592,16 @@ class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
     @with_comms
     @skip_if_lt_x_gpu(1)
     def test_activation_ckpt_fqns_fsdp1(self) -> None:
+        # [FUNCTION DOC] Runs the FSDP1 activation checkpoint key check with use_orig_params true
+        # and false.
         self.run_subtests(
             {"use_orig_params": [True, False]},
             self._test_activation_ckpt_fqns_fsdp1,
         )
 
     def _test_activation_ckpt_fqns_fsdp1(self, use_orig_params: bool) -> None:
+        # [FUNCTION DOC] HELPER: Applies activation checkpointing, wraps the model in FSDP, and
+        # asserts the model state dict keys equal those of the original unwrapped model.
         """Tests that activation checkpointing prefixes are removed from module names"""
         model = CompositeParamModel(device=torch.device(device_type))
         original_keys = get_model_state_dict(model).keys()
@@ -532,12 +614,17 @@ class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
 
     @skip_if_lt_x_gpu(1)
     def test_extra_state(self) -> None:
+        # [FUNCTION DOC] Monkeypatches get_extra_state and set_extra_state onto the UnitModule
+        # class, then checks that a model state dict round trip preserves the extra state entry.
+        # Side effect: the patch is never undone, so it leaks into later tests in the process.
         model = CompositeParamModel(device=torch.device(device_type))
 
         def get_extra_state(self):
+            # [FUNCTION DOC] HELPER: Returns the constant extra state string.
             return "MyState"
 
         def set_extra_state(self, state):
+            # [FUNCTION DOC] HELPER: Ignores the loaded extra state.
             return
 
         UnitModule.get_extra_state = get_extra_state
@@ -550,6 +637,8 @@ class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
 
     @skip_if_lt_x_gpu(1)
     def test_non_persistent_buffers(self) -> None:
+        # [FUNCTION DOC] Checks that a non-persistent buffer is excluded from the model state dict
+        # and that loading the dict into a copy leaves state dicts equal.
         model = CompositeParamModel(device=torch.device(device_type))
         model.register_buffer(
             "dont_save_me", torch.rand(100, device=device_type), persistent=False
@@ -559,6 +648,12 @@ class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
         self.assertEqual(model.state_dict(), get_model_state_dict(target_model))
 
     def _test_broadcast_from_rank0(self, wrapper) -> None:
+        # [FUNCTION DOC] HELPER: Trains a reference model one step, takes its full state dicts,
+        # trains a wrapped (FSDP/fully_shard/HSDP) copy one step and checks its full state dicts
+        # equal the reference; steps again so they differ; then, with only rank 0 keeping the
+        # states, loads them with broadcast_from_rank0 and checks equality is restored. Finally
+        # checks that loading a model state dict missing one key raises RuntimeError about a
+        # missing key.
         model = CompositeParamModel(device=torch.device(device_type))
         optim = torch.optim.Adam(model.parameters())
         fsdp_model = wrapper(copy.deepcopy(model))
@@ -573,6 +668,9 @@ class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
         fsdp_optim.step()
 
         def check(equal):
+            # [FUNCTION DOC] HELPER: Fetches full model and optimizer state dicts of the wrapped
+            # model and asserts they are equal (or not equal) to the reference states captured
+            # earlier.
             fsdp_states = get_model_state_dict(
                 fsdp_model,
                 options=StateDictOptions(full_state_dict=True),
@@ -634,6 +732,8 @@ class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
     @with_comms
     @skip_if_lt_x_gpu(4)
     def test_broadcast_from_rank0(self) -> None:
+        # [FUNCTION DOC] Runs _test_broadcast_from_rank0 with three wrappers: fully_shard on a 1D
+        # mesh, FSDP on a 1D mesh, and FSDP hybrid sharding on a 2D mesh. Requires at least 4 GPUs.
         device_mesh = init_device_mesh(device_type, (self.world_size,))
         hsdp_device_mesh = init_device_mesh(device_type, (2, self.world_size // 2))
         self.run_subtests(
@@ -654,6 +754,8 @@ class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
     @with_comms
     @skip_if_lt_x_gpu(2)
     def test_fsdp_root_not_initialized(self) -> None:
+        # [FUNCTION DOC] Builds an FSDP model whose root has not run yet and checks that
+        # fetching the model and optimizer state dicts works without error.
         # This test verifies that FSDP root is not initialized but we should
         # still be able to  get the state_dict without errors because
         # fsdp_model.state_dict() will trigger the FSDP initialization.
@@ -667,6 +769,10 @@ class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
     @with_comms
     @skip_if_lt_x_gpu(2)
     def test_optim_state_dict_param_matching(self) -> None:
+        # [FUNCTION DOC] Attaches a LambdaLR scheduler (which adds initial_lr to param groups),
+        # gets the full CPU-offloaded optimizer state dict, then loads it into a new optimizer
+        # with broadcast from rank 0 and checks that on rank 0 initial_lr appears in the new
+        # optimizer param group even though it was absent before loading.
         # This test verifies parameters between optim and optim_state_dict
         # "initial_lr" is added to optim_state_dict, but not to the new optim
         # We test whether "initial_lr" appear in optim after
@@ -707,6 +813,9 @@ class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
     @with_comms
     @skip_if_lt_x_gpu(2)
     def test_flattened_osd(self) -> None:
+        # [FUNCTION DOC] For every combination of flattened/unflattened save and load format,
+        # trains an fully_shard model one step, saves the optimizer state dict, loads it into a
+        # fresh optimizer and asserts both optimizers report equal state dicts.
         """
         Test flattened optimizer state dictionaries with different combinations of
         flatten_optimizer_state_dict flag for saving and loading.
@@ -746,6 +855,10 @@ class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
             self.assertEqual(fsdp_optim.state_dict(), fsdp_optim2.state_dict())
 
     def _test_deprecate_partial(self) -> None:
+        # [FUNCTION DOC] HELPER: Checks that getting a state dict for a submodule subset emits a
+        # FutureWarning, with and without keeping the submodule prefix, and that values match the
+        # full dict; then zeroes the model and loads the partial dict, including the deprecated
+        # mapping-from-module form (which also warns), verifying the submodule weights restore.
         model = CompositeParamModel(device=torch.device(device_type))
 
         model_state_dict1 = get_model_state_dict(model)
@@ -799,6 +912,9 @@ class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
         self.assertEqual(model.l.bias, model_state_dict1["l.bias"])
 
     def _test_deprecate_fsdp_api(self) -> None:
+        # [FUNCTION DOC] HELPER: Checks that the FSDP state_dict_type context manager emits the
+        # deprecation FutureWarning, and that the new get_model_state_dict API on a plain model
+        # does not (an assertion error about the warning not triggering is expected there).
         device_mesh = init_device_mesh(device_type, (self.world_size,))
         model = CompositeParamModel(device=torch.device(device_type))
         fsdp_model = FSDP(copy.deepcopy(model), device_mesh=device_mesh)
@@ -819,26 +935,38 @@ class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
     @with_comms
     @skip_if_lt_x_gpu(1)
     def test_deprecate_api(self) -> None:
+        # [FUNCTION DOC] Runs the partial state dict and FSDP API deprecation checks. Requires at
+        # least 1 GPU.
         self._test_deprecate_partial()
         self._test_deprecate_fsdp_api()
 
     @with_comms
     @skip_if_lt_x_gpu(2)
     def test_shared_weight(self):
+        # [FUNCTION DOC] Runs the save/load round trip on an FSDP model whose embedding and
+        # decoder weights are tied, once directly and once with flattened optimizer state dicts
+        # both on and off. Requires at least 2 GPUs.
         class TiedEmbeddingModel(nn.Module):
+            # [CLASS DOC] HELPER: Embedding followed by a linear decoder whose weight is the same
+            # parameter as the embedding weight (weight tying).
             def __init__(self, vocab_size, embedding_dim):
+                # [FUNCTION DOC] HELPER: Creates the embedding and decoder and ties their weights.
                 super().__init__()
                 self.embedding = nn.Embedding(vocab_size, embedding_dim)
                 self.decoder = nn.Linear(embedding_dim, vocab_size)
                 self.decoder.weight = self.embedding.weight  # Tying weights
 
             def forward(self, input):
+                # [FUNCTION DOC] HELPER: Scales the float input by 10, casts to int indices,
+                # embeds them and decodes to vocabulary-sized outputs.
                 input = (input * 10).to(torch.int)
                 embedded = self.embedding(input)
                 output = self.decoder(embedded)
                 return output
 
         def init_model_optim():
+            # [FUNCTION DOC] HELPER: Factory returning a tied model, two AdamW optimizers, an
+            # FSDP wrapped copy on a device mesh and its AdamW optimizer.
             device_mesh = init_device_mesh(device_type, (self.world_size,))
             orig_model = TiedEmbeddingModel(10000, 300).to(torch.device(device_type))
             orig_optim = torch.optim.AdamW(orig_model.parameters(), lr=1e-4)
@@ -859,6 +987,9 @@ class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
     @with_comms
     @skip_if_lt_x_gpu(2)
     def test_setting_meta_device_model(self) -> None:
+        # [FUNCTION DOC] Builds a fully_shard model on the meta device, loads the full state dict
+        # of an equally shaped CPU model into it, and checks every gathered full tensor equals
+        # the CPU model's value. Requires at least 2 GPUs.
         # This test verifies that we can set model state dict by a meta device model
         torch.manual_seed(0)
         with torch.device("meta"):
@@ -887,6 +1018,10 @@ class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
     @with_comms
     @skip_if_lt_x_gpu(4)
     def test_setting_meta_device_model_broadcasting_and_memory(self) -> None:
+        # [FUNCTION DOC] Same as the meta device load test but with large layers and
+        # broadcast_from_rank0, then asserts device 0 allocated memory is at most 384 MiB and
+        # reserved memory at most 768 MiB, guarding against the view-instead-of-clone regression
+        # in tensor distribution. Requires at least 4 GPUs.
         # This test verifies that we can set model state dict by a meta device model
         # With the correlated changes in state_dict, meta device model should be accepted
         # in broadcasting and get copied successfully.
@@ -933,6 +1068,9 @@ class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
     @with_comms
     @skip_if_lt_x_gpu(2)
     def test_set_cpu_model_state_dict_broadcast_from_rank0(self) -> None:
+        # [FUNCTION DOC] Zeroes a CPU linear model, then loads the expected state held only by
+        # rank 0 (other ranks pass an empty dict) with broadcast_from_rank0, and checks names and
+        # values match the expected state on every rank. Requires at least 2 GPUs.
         torch.manual_seed(42)
         model = nn.Linear(2, 2)
         expected_state_dict = {
@@ -960,6 +1098,9 @@ class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
     @with_comms
     @skip_if_lt_x_gpu(2)
     def test_multi_device_load_model_state_dict(self) -> None:
+        # [FUNCTION DOC] Checks broadcast loading into a model spanning meta and accelerator
+        # devices succeeds, while a model spanning CPU and accelerator devices raises ValueError
+        # mentioning multiple devices. Requires at least 2 GPUs.
         torch.manual_seed(0)
         with torch.device("meta"):
             meta_submodel = nn.Linear(4, 4, bias=False)
@@ -995,6 +1136,9 @@ class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
     @with_comms
     @skip_if_lt_x_gpu(2)
     def test_state_dict_with_hook_on_keys(self) -> None:
+        # [FUNCTION DOC] Takes the state dict of a model with a key-renaming hook and checks that
+        # loading it into a plain meta model raises RuntimeError about a missing key, but loading
+        # into a meta model with the matching modifier succeeds. Requires at least 2 GPUs.
         with torch.device("meta"):
             metamodel = FusionEmbedding(4, 4, 4)
         with torch.device(device_type):
@@ -1009,13 +1153,20 @@ class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
     @with_comms
     @skip_if_lt_x_gpu(2)
     def test_multi_param_groups(self) -> None:
+        # [FUNCTION DOC] Tensor-parallelizes a two layer model and checks an optimizer state dict
+        # round trip preserves param groups and state for optimizers with multiple param groups,
+        # including one with an empty group, across full_state_dict and broadcast settings.
+        # Requires at least 2 GPUs.
         class TestModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Two stacked 64x64 linear layers (fc then fc1).
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the fc and fc1 linear layers.
                 super().__init__()
                 self.fc = torch.nn.Linear(64, 64)
                 self.fc1 = torch.nn.Linear(64, 64)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies fc then fc1 to the input.
                 return self.fc1(self.fc(x))
 
         device_mesh = init_device_mesh(device_type, (self.world_size,))
@@ -1032,6 +1183,9 @@ class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
         def _test_multi(
             optim_kwargs, full_state_dict, broadcast_from_rank0, cpu_offload
         ):
+            # [FUNCTION DOC] HELPER: Skips the invalid combination of broadcast without full
+            # state dict; otherwise runs one AdamW step, saves the optimizer state dict with the
+            # options, loads it into a new optimizer and asserts param groups and state are equal.
             if broadcast_from_rank0 and not full_state_dict:
                 return
 
@@ -1084,12 +1238,18 @@ class TestStateDict(DTensorTestBase, VerifyStateDictMixin):
 
 
 class TestNoComm(MultiProcessTestCase):
+    # [CLASS DOC] Multi-process test case that spawns workers but never initializes a process
+    # group, to exercise the state dict API in a non-distributed setting.
     def setUp(self) -> None:
+        # [FUNCTION DOC] Runs the base setup and spawns the worker processes.
         super().setUp()
         self._spawn_processes()
 
     @skip_if_lt_x_gpu(1)
     def test_no_dist(self) -> None:
+        # [FUNCTION DOC] With no process group, checks get/set of model and optimizer state dicts
+        # work with full_state_dict and cpu_offload: offloaded tensors are not CUDA and match the
+        # model state dict, and optimizer state dicts reload. Requires at least 1 GPU.
         model = CompositeParamModel(device=torch.device(device_type))
         optim = torch.optim.AdamW(model.parameters(), lr=1e-4)
 

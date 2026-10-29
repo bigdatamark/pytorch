@@ -1,5 +1,11 @@
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC] Tests for torch.distributed.checkpoint staging: StateDictStager (copying nested
+# state dicts from accelerator to CPU with storage sharing, caching, pinned/shared memory,
+# tensor attributes, dataclasses, DTensor and ShardedTensor), plus DefaultStager, the
+# replication stager and async_save integration. Also defines comparison helpers and small
+# dataclass fixtures. Import-time side effect: computes the module level device_type string.
+
 import dataclasses
 import os
 import tempfile
@@ -42,6 +48,9 @@ device_type = acc.type if (acc := torch.accelerator.current_accelerator()) else 
 
 
 def create_cpu_state_dict(state_dict):
+    # [FUNCTION DOC] HELPER: Returns a new flat dict with the same keys whose values are the CPU
+    # copies of the tensors in the input. Assumes every value supports a cpu method; nested
+    # containers are not handled.
     cpu_state_dict = {}
     for key, value in state_dict.items():
         cpu_state_dict[key] = value.cpu()
@@ -49,6 +58,15 @@ def create_cpu_state_dict(state_dict):
 
 
 def compare_state_dicts(gpu_state_dict, cpu_state_dict, rtol=1e-5, atol=1e-8):
+    # [FUNCTION DOC] HELPER: Recursively compares an accelerator state dict with its staged CPU
+    # counterpart and returns a pair (success flag, error message; empty on success). Tensors
+    # must be on the accelerator and CPU respectively, have equal storage offsets and equal
+    # values, and tensors sharing a storage on one side must share it on the other. Mappings
+    # must have equal keys, sequences/sets equal length and type, objects equal type and
+    # attributes, and other values equal type and value.
+    # KNOWN ISSUE: rtol and atol are accepted but never used (exact equality is required), and
+    # the reverse storage pointer map is filled but never read, so CPU tensors that share
+    # storage while their accelerator sources do not are not detected.
     """
     Compare if two state dictionaries (one on GPU, one on CPU) are otherwise the same.
 
@@ -71,6 +89,9 @@ def compare_state_dicts(gpu_state_dict, cpu_state_dict, rtol=1e-5, atol=1e-8):
     cpu_storage_ptrs = {}
 
     def compare_objects(gpu_obj, cpu_obj, path=""):
+        # [FUNCTION DOC] HELPER: Recursive worker of compare_state_dicts; path is a dotted string
+        # used in messages. Returns (True, empty string) or (False, description of the first
+        # mismatch). Updates the enclosing storage pointer maps as a side effect.
         # If objects are tensors, compare them
         if isinstance(gpu_obj, torch.Tensor) and isinstance(cpu_obj, torch.Tensor):
             # Check if devices are as expected
@@ -189,17 +210,23 @@ def compare_state_dicts(gpu_state_dict, cpu_state_dict, rtol=1e-5, atol=1e-8):
 
 @dataclasses.dataclass
 class TestStruct:
+    # [CLASS DOC] HELPER: Dataclass fixture with a single tensor field, used to check staging of
+    # tensors held inside user objects.
     tensor1: torch.Tensor
 
 
 @dataclasses.dataclass
 class NestedTensorStruct:
+    # [CLASS DOC] HELPER: Dataclass fixture holding a tensor and an integer value (default 42);
+    # nested inside ComplexDataClass.
     tensor: torch.Tensor
     value: int = 42
 
 
 @dataclasses.dataclass
 class ComplexDataClass:
+    # [CLASS DOC] HELPER: Dataclass fixture combining a tensor, a name string, a list of floats
+    # and a nested NestedTensorStruct.
     tensor: torch.Tensor
     name: str
     values: list[float]
@@ -208,13 +235,21 @@ class ComplexDataClass:
 
 @dataclasses.dataclass(frozen=True)
 class FrozenDataClass:
+    # [CLASS DOC] HELPER: Immutable (frozen) dataclass fixture with a tensor and an integer value
+    # (default 100); fields cannot be assigned after construction.
     tensor: torch.Tensor
     value: int = 100
 
 
 class TestStateDictStager(TestCase):
+    # [CLASS DOC] Single-process tests of StateDictStager behavior; most require an accelerator
+    # and are skipped otherwise. Each test builds its own state dict and stager instances.
     @unittest.skipIf(not HAS_ACCELERATOR, "No accelerator")
     def test_views(self):
+        # [FUNCTION DOC] For all four pin_memory/share_memory settings, stages a state dict with a
+        # tensor, a view of it, another tensor and a dataclass holding a narrow view, and checks
+        # the stager cache holds exactly two storages with the expected total bytes, the result
+        # matches the original, everything is on CPU, and view relationships share storage.
         test_configs = [
             (False, False),  # pin_memory=False, share_memory=False,
             (True, False),  # pin_memory=True, share_memory=False
@@ -310,6 +345,9 @@ class TestStateDictStager(TestCase):
 
     @unittest.skipIf(not HAS_ACCELERATOR, "No accelerator")
     def test_caching(self):
+        # [FUNCTION DOC] Stages the same state dict three times with one stager, for each memory
+        # setting, and checks the cached storage count and CPU storage pointers stay the same,
+        # while later stages overwrite the cached CPU memory with updated accelerator values.
         """
         Test that the StateDictStager correctly caches and reuses storages.
         """
@@ -410,6 +448,8 @@ class TestStateDictStager(TestCase):
 
     @unittest.skipIf(not HAS_ACCELERATOR, "No accelerator")
     def test_tensor_attrs(self):
+        # [FUNCTION DOC] Sets custom Python attributes on accelerator tensors, stages with pinned
+        # and shared memory, and asserts the attributes and their values exist on the CPU copies.
         """
         Test that tensor attributes are preserved during stage with StateDictStager.
         """
@@ -456,6 +496,8 @@ class TestStateDictStager(TestCase):
 
     @unittest.skipIf(not HAS_ACCELERATOR, "No accelerator")
     def test_different_dtypes(self):
+        # [FUNCTION DOC] Stages tensors of float32, float64, int32, int64 and bool dtype with a
+        # default stager and checks each CPU copy has the same dtype and values.
         """
         Test that StateDictStager works correctly with tensors of different data types.
         """
@@ -498,6 +540,8 @@ class TestStateDictStager(TestCase):
 
     @unittest.skipIf(not HAS_ACCELERATOR, "No accelerator")
     def test_empty_tensors(self):
+        # [FUNCTION DOC] Stages empty tensors of several shapes under all four memory settings
+        # and checks they are handled correctly.
         """
         Test that StateDictStager works correctly with empty tensors.
         """
@@ -553,6 +597,9 @@ class TestStateDictStager(TestCase):
 
     @unittest.skipIf(not HAS_ACCELERATOR, "No accelerator")
     def test_complex_storage_sharing(self):
+        # [FUNCTION DOC] Stages a base tensor plus reshaped views and strided slices of it and
+        # checks the CPU result matches the original, every CPU tensor shares the base CPU storage,
+        # and writing to the CPU base is visible through all views and slices.
         """
         Test that StateDictStager correctly handles complex storage sharing scenarios.
         """
@@ -637,6 +684,10 @@ class TestStateDictStager(TestCase):
 
     @unittest.skipIf(not HAS_ACCELERATOR, "No accelerator")
     def test_dataclasses(self):
+        # [FUNCTION DOC] Stages a state dict containing a plain tensor, a nested dataclass
+        # instance and a frozen dataclass instance; checks tensors land on CPU with equal values,
+        # non-tensor fields (name, list, ints) are preserved, and later in-place changes to the
+        # accelerator tensors do not alter the staged copies.
         # Create tensors
         tensor1 = torch.randn(4, 4).to(device_type)
         tensor2 = torch.randn(8, 8).to(device_type)
@@ -694,6 +745,9 @@ class TestStateDictStager(TestCase):
         self.assertFalse(torch.allclose(frozen_cpu.tensor, tensor4.cpu()))
 
     def test_cpu_storage_independence(self):
+        # [FUNCTION DOC] Stages tensors that are already on CPU and checks the staged tensors have
+        # new storage with equal values and are unaffected by later in-place changes to the
+        # sources. Needs no accelerator.
         """
         Test ensures CPU tensors passed to StateDictStager are actually cloned
         """
@@ -750,6 +804,9 @@ class TestStateDictStager(TestCase):
 
     @unittest.skipIf(not HAS_ACCELERATOR, "No accelerator")
     def test_tensor_pinned_and_shared(self):
+        # [FUNCTION DOC] For all four pin_memory/share_memory settings, stages two accelerator
+        # tensors and checks the CPU copies have equal values and report pinned and shared status
+        # (for both the tensor and its storage) exactly as requested.
         """
         Test that verifies tensors are actually pinned and shared using tensor.is_pinned() and tensor.is_shared() methods.
         """
@@ -849,6 +906,9 @@ class TestStateDictStager(TestCase):
 
     @unittest.skipIf(not HAS_ACCELERATOR, "No accelerator")
     def test_async_save_can_reuse_default_stager(self):
+        # [FUNCTION DOC] Uses one synchronous DefaultStager (no pinning, sharing, async staging
+        # or non-blocking copy) for two consecutive async_save calls without a process group into
+        # a temporary directory, checks each returns metadata, then closes the stager.
         state_dict = {
             "weight": torch.randn(4, 4, device=device_type),
             "step": 42,
@@ -876,10 +936,15 @@ class TestStateDictStager(TestCase):
 
 
 class TestDTensorStateDictStager(DTensorTestBase):
+    # [CLASS DOC] Multi-process test case for staging DTensors and for async_save memory
+    # behavior; the process group is created by with_comms.
     @with_comms
     @requires_accelerator_dist_backend()
     @skip_if_lt_x_gpu(2)
     def test_dtensor(self):
+        # [FUNCTION DOC] Stages a sharded DTensor (after arithmetic ops) with pinned and shared
+        # memory and checks the CPU DTensor's local values, placement spec and size match the
+        # original. Requires at least 2 GPUs and an accelerator distributed backend.
         """
         Test that StateDictStager works correctly with DTensors.
         """
@@ -912,6 +977,9 @@ class TestDTensorStateDictStager(DTensorTestBase):
 
     @unittest.skipIf(not HAS_ACCELERATOR, "No accelerator")
     def test_async_save_no_memory_leak(self):
+        # [FUNCTION DOC] After one warmup async_save of a 128 MiB tensor, performs five more
+        # saves to a temporary directory and asserts process resident memory grows by less than
+        # 1.2 times the checkpoint size, to catch staging buffers being leaked per save.
         # repeatedly calling async_save should not cause memory to grow by
         # the checkpoint size each iteration
         model_size_mb = 128
@@ -951,6 +1019,8 @@ class TestDTensorStateDictStager(DTensorTestBase):
 
 
 class TestReplicationStager(DTensorTestBase):
+    # [CLASS DOC] Multi-process test case for _ReplicationStager, which replicates a staged CPU
+    # state dict to peer ranks; uses a mixed gloo (CPU) and nccl (CUDA) backend.
     """
     Test suite for _ReplicationStager functionality.
     Tests replication of state_dict across training ranks using CPU tensors only.
@@ -958,9 +1028,14 @@ class TestReplicationStager(DTensorTestBase):
 
     @property
     def backend(self) -> str:
+        # [FUNCTION DOC] Returns the process group backend specification string mapping CPU to
+        # gloo and CUDA to nccl.
         return "cpu:gloo,cuda:nccl"
 
     def _create_simple_state_dict(self, rank: int) -> dict:
+        # [FUNCTION DOC] HELPER: Seeds the global RNG with 42 plus the rank (side effect) and
+        # returns a state dict of random CPU tensors (two weights, two biases, a nested mapping
+        # and more), so contents differ deterministically per rank.
         """
         Create a simple state_dict with CPU tensors, deterministically unique per rank.
 
@@ -988,6 +1063,9 @@ class TestReplicationStager(DTensorTestBase):
     def _verify_simple_state_dict_replication(
         self, replicated_dict: dict, rank: int, partner_rank: int
     ):
+        # [FUNCTION DOC] HELPER: Rebuilds the state dict the partner rank would have created and
+        # recursively asserts the replicated dict has the same keys, CPU tensors of equal shape,
+        # dtype and values, and equal non-tensor values. The rank argument is unused.
         """
         Verify that replication worked correctly.
 
@@ -1000,6 +1078,9 @@ class TestReplicationStager(DTensorTestBase):
         expected_dict = self._create_simple_state_dict(partner_rank)
 
         def compare_tensors(actual, expected, path=""):
+            # [FUNCTION DOC] HELPER: Recursive assertion helper; walks mappings by key, checks
+            # tensors for CPU device, shape, dtype and exact equality, and compares anything else
+            # by equality. The dotted path appears in failure messages.
             if isinstance(actual, dict) and isinstance(expected, dict):
                 self.assertEqual(
                     actual.keys(),
@@ -1040,6 +1121,9 @@ class TestReplicationStager(DTensorTestBase):
         compare_tensors(replicated_dict, expected_dict)
 
     def _create_dtensor_state_dict(self, rank: int, device_mesh: DeviceMesh) -> dict:
+        # [FUNCTION DOC] HELPER: Returns a state dict with a 128x16 arange tensor distributed with
+        # row sharding, an 8x8 constant tensor (value 12800) distributed as replicated, and a
+        # scalar CPU tensor holding the rank. Only the scalar differs between ranks.
         """
         Create state_dict with DTensor and regular tensors for deterministic testing
         due to DTensor Shard, Replicate placements.
@@ -1078,6 +1162,11 @@ class TestReplicationStager(DTensorTestBase):
     def _verify_dtensor_replication(
         self, replicated_dict: dict, rank: int, partner_rank: int
     ):
+        # [FUNCTION DOC] HELPER: Asserts that whichever of the sharded, replicated and scalar
+        # entries are present in the replicated dict are DTensors (or tensor) holding the partner
+        # rank's data: the sharded local slice is the partner's row block, the replicated value is
+        # the constant, placements keep their kinds, and the scalar equals the partner rank. The
+        # rank argument is unused.
         """
         Verify DTensor replication accuracy by checking local shards and global reconstruction.
 
@@ -1155,6 +1244,9 @@ class TestReplicationStager(DTensorTestBase):
             )
 
     def _create_sharded_tensor_state_dict(self, rank: int, world_size: int) -> dict:
+        # [FUNCTION DOC] HELPER: Returns a state dict with a 64x8 ShardedTensor built from this
+        # rank's row block of an arange (placed on this rank's CPU) and a scalar CPU tensor
+        # holding the rank. Assumes 64 divides evenly by world_size.
         """
         Create state_dict with ShardedTensor for deterministic testing.
 
@@ -1200,6 +1292,10 @@ class TestReplicationStager(DTensorTestBase):
     def _verify_sharded_tensor_replication(
         self, replicated_dict: dict, rank: int, partner_rank: int
     ):
+        # [FUNCTION DOC] HELPER: Asserts the replicated dict's ShardedTensor has one local shard
+        # holding the partner rank's row block with matching shard offsets and sizes, and the
+        # scalar equals the partner rank. Checks are skipped for absent keys. The rank argument
+        # is unused.
         """
         Verify ShardedTensor replication accuracy by checking local shards and metadata.
 
@@ -1268,6 +1364,12 @@ class TestReplicationStager(DTensorTestBase):
     @with_comms
     @skip_if_lt_x_gpu(4)
     def test_replication_basic(self):
+        # [FUNCTION DOC] Stages a per-rank CPU state dict with a replication stager over a new
+        # gloo group, and verifies the returned dict equals the one created by the partner rank
+        # (the rank half a world away, modulo world size); then closes the stager. Requires at
+        # least 4 GPUs.
+        # KNOWN ISSUE: the docstring mentions world_size=16 but the test only requires 4 GPUs
+        # and works for any even world size.
         """Test basic replication functionality with world_size=16"""
         world_size = dist.get_world_size()
 
@@ -1300,6 +1402,10 @@ class TestReplicationStager(DTensorTestBase):
     @with_comms
     @skip_if_lt_x_gpu(4)
     def test_replication_dtensors(self):
+        # [FUNCTION DOC] Replicates a state dict of DTensors (sharded and replicated, on a CPU
+        # mesh) plus a scalar over the world group, waits on the result if it is a future, and
+        # verifies the received data belongs to the partner rank; then closes the stager.
+        # Requires at least 4 GPUs.
         """Test replication with DTensor and mixed tensor types"""
         world_size = dist.get_world_size()
 
@@ -1341,6 +1447,9 @@ class TestReplicationStager(DTensorTestBase):
     @with_comms
     @skip_if_lt_x_gpu(4)
     def test_replication_sharded_tensors(self):
+        # [FUNCTION DOC] Same flow as the DTensor replication test but with a ShardedTensor
+        # state dict; verifies shard values and metadata come from the partner rank. Requires at
+        # least 4 GPUs.
         """Test replication with ShardedTensor and mixed tensor types"""
         world_size = dist.get_world_size()
 
@@ -1381,6 +1490,12 @@ class TestReplicationStager(DTensorTestBase):
     @with_comms
     @skip_if_lt_x_gpu(4)
     def test_replication_persistence(self):
+        # [FUNCTION DOC] Checks the replication stager writes the received partner state dict to
+        # disk: first with the default storage directory (must exist and lie under the system
+        # temp directory), then with a custom directory (must be created and used). In both cases
+        # the persisted file at the stager's computed path must exist and load back (via
+        # torch.load) to the partner's data. Stagers are closed after each case. Requires at least
+        # 4 GPUs.
         """Test persistence functionality in _ReplicationStager"""
         world_size = dist.get_world_size()
 

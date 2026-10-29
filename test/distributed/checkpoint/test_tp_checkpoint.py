@@ -1,5 +1,9 @@
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC] Multi-GPU tests that save and load tensor-parallel (DTensor) model state dicts
+# with torch.distributed.checkpoint, including loading into a model built on the meta device.
+# Defines a small uneven-shape model used by the meta device test. No import-time side effects.
+
 from copy import deepcopy
 
 import torch
@@ -25,7 +29,12 @@ from torch.testing._internal.distributed.checkpoint_utils import with_temp_dir
 
 
 class UnevenShardedModel(torch.nn.Module):
+    # [CLASS DOC] HELPER: Three layer MLP (linear 5->10, ReLU, linear 10->15, linear 15->1) whose
+    # dimensions do not divide evenly across typical world sizes, so tensor parallel sharding
+    # produces uneven shards. Parameters are created directly on the given device.
     def __init__(self, device):
+        # [FUNCTION DOC] HELPER: Seeds the global RNG with 5 (side effect) so weights are
+        # deterministic, then builds the three linear layers and the ReLU on the given device.
         super().__init__()
         torch.manual_seed(5)
         self.net1 = torch.nn.Linear(5, 10, device=device)
@@ -34,14 +43,22 @@ class UnevenShardedModel(torch.nn.Module):
         self.net3 = torch.nn.Linear(15, 1, device=device)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies net1, ReLU, net2, net3 in sequence to the input and
+        # returns the result.
         return self.net3(self.net2(self.relu(self.net1(x))))
 
 
 class TestTpCheckpoint(DTensorTestBase):
+    # [CLASS DOC] Multi-process DTensor test case; each test runs on every rank with a process
+    # group set up by with_comms and a shared temporary checkpoint directory (self.temp_dir).
     @with_comms
     @skip_if_lt_x_gpu(2)
     @with_temp_dir
     def test_tp_checkpoint(self):
+        # [FUNCTION DOC] Parallelizes an MLP with column/row tensor parallelism, saves its state
+        # dict with the default planners, takes an SGD step so parameters differ, loads the
+        # checkpoint back in place and checks local shards equal the originally saved values.
+        # Requires at least 2 GPUs.
         CHECKPOINT_DIR = self.temp_dir
         mesh_shpe = (self.world_size,)
         tp_mesh = init_device_mesh(self.device_type, mesh_shpe)
@@ -89,6 +106,10 @@ class TestTpCheckpoint(DTensorTestBase):
     @skip_if_lt_x_gpu(2)
     @with_temp_dir
     def test_tp_checkpoint_load_on_meta_device(self):
+        # [FUNCTION DOC] Saves a tensor-parallel uneven-shape model, then builds a second model
+        # on the meta device, loads the checkpoint into its state dict in place (the same dict
+        # object must be kept), assigns it into the model and checks no parameter is still meta
+        # and all local shards match the saved ones. Requires at least 2 GPUs.
         CHECKPOINT_DIR = self.temp_dir
         mesh_shpe = (self.world_size,)
         tp_mesh = init_device_mesh(self.device_type, mesh_shpe)

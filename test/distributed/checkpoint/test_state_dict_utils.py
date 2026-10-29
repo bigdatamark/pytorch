@@ -1,4 +1,9 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Multi-GPU tests for torch.distributed._state_dict_utils: gathering sharded
+# state dicts (_gather_state_dict), offloading to CPU (_offload_state_dict_to_cpu), building
+# CPU mirrors (_create_cpu_state_dict), copying into them (_copy_state_dict), checking
+# structural similarity, and redistributing tensors (_distribute_tensors). Uses DTensor and
+# ShardedTensor inputs. No import-time side effects.
 import copy
 import io
 
@@ -30,13 +35,20 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 
 
 class TestStateDictUtils(DTensorTestBase):
+    # [CLASS DOC] Multi-process DTensor test case for the state dict utilities; the world size
+    # is capped at four and at the number of available accelerators.
     @property
     def world_size(self):
+        # [FUNCTION DOC] Returns the number of processes to spawn: the smaller of 4 and the
+        # accelerator device count.
         return min(4, torch.accelerator.device_count())
 
     @with_comms
     @skip_if_lt_x_gpu(2)
     def test_gather_state_dict_dtensor(self):
+        # [FUNCTION DOC] Builds a dim-0 sharded DTensor from per-rank random local data and
+        # checks _gather_state_dict returns the full tensor equal to an all-gather of the local
+        # shards, still on the accelerator device. Requires at least 2 GPUs.
         device_mesh = self.build_device_mesh()
         shard_spec = [Shard(0)]
         torch.random.manual_seed(dist.get_rank())
@@ -54,6 +66,9 @@ class TestStateDictUtils(DTensorTestBase):
     @with_comms
     @skip_if_lt_x_gpu(4)
     def test_gather_with_cpu_and_ranks_only(self):
+        # [FUNCTION DOC] Gathers a sharded DTensor with CPU offload restricted to ranks 0 and 2:
+        # those ranks must get the full tensor on a non-accelerator device, other ranks must
+        # get an empty dict. Requires at least 4 GPUs.
         device_mesh = self.build_device_mesh()
         shard_spec = [Shard(0)]
         torch.random.manual_seed(dist.get_rank())
@@ -78,6 +93,9 @@ class TestStateDictUtils(DTensorTestBase):
     @with_comms
     @skip_if_lt_x_gpu(4)
     def test_cpu_and_ranks_only(self):
+        # [FUNCTION DOC] Offloads a dict of plain accelerator tensors with ranks_only of 0 and 2:
+        # those ranks get CPU copies with equal values, other ranks get an empty dict.
+        # Requires at least 4 GPUs.
         device = torch.device(self.device_type)
         state_dict = {
             "tensor1": torch.arange(10, device=device),
@@ -96,7 +114,12 @@ class TestStateDictUtils(DTensorTestBase):
     @with_comms
     @skip_if_lt_x_gpu(4)
     def test_complicated_dict(self):
+        # [FUNCTION DOC] Gathers a state dict mixing a DTensor, a list alternating DTensors and
+        # plain tensors, and a plain tensor, and checks the result equals the expected dict of
+        # fully gathered tensors. Requires at least 4 GPUs.
         def create_dtensor():
+            # [FUNCTION DOC] HELPER: Seeds the RNG by rank, makes a sharded DTensor from random
+            # local data and returns the pair (all-gathered full tensor, the DTensor).
             device_mesh = self.build_device_mesh()
             shard_spec = [Shard(0)]
             torch.random.manual_seed(dist.get_rank())
@@ -131,6 +154,12 @@ class TestStateDictUtils(DTensorTestBase):
     @with_comms
     @skip_if_lt_x_gpu(2)
     def test_create_cpu_state_dict(self):
+        # [FUNCTION DOC] Builds a state dict with plain tensors, a ShardedTensor, a DTensor, a
+        # BytesIO, raw bytes, a scalar tensor, a float and a nested dict. For each combination of
+        # pin_memory and share_memory, creates the CPU mirror with _create_cpu_state_dict and
+        # verifies similarity checking, copying into it, CPU placement, separate storage and
+        # preserved non-tensor values; finally exercises deletion and garbage collection.
+        # Requires at least 2 GPUs.
         device = torch.device(self.device_type)
         rank = dist.get_rank()
         # Scale tensors based on world size
@@ -172,6 +201,10 @@ class TestStateDictUtils(DTensorTestBase):
         }
 
         def _verify(cpu_state_dict):
+            # [FUNCTION DOC] HELPER: Checks that the similarity check passes, then fails after
+            # swapping in a wrongly sized tensor (restored afterwards); copies the source dict into
+            # the CPU dict and asserts values, CPU devices, distinct storages and non-tensor
+            # values. Mutates cpu_state_dict.
             # Verify the correctness of _check_state_dict_similarity()
             self.assertTrue(_check_state_dict_similarity(state_dict, cpu_state_dict))
             tensor1 = cpu_state_dict["tensor1"]
@@ -223,6 +256,9 @@ class TestStateDictUtils(DTensorTestBase):
             self.assertEqual(cpu_state_dict["nested"], {"list": [1, 2, 3, 4]})
 
         def _verify_weakref_finalize(cpu_state_dict):
+            # [FUNCTION DOC] HELPER: Deletes one entry and the local reference, then forces
+            # garbage collection to make sure releasing a CPU state dict does not crash. Asserts
+            # nothing explicitly.
             import gc
 
             del cpu_state_dict["tensor1"]
@@ -244,6 +280,10 @@ class TestStateDictUtils(DTensorTestBase):
     @with_comms
     @skip_if_lt_x_gpu(2)
     def test_state_dict_util_distribute_tensors(self):
+        # [FUNCTION DOC] Puts a DTensor and a differing plain tensor in a list for an evenly and
+        # an unevenly shaped case, calls _distribute_tensors to replace each list by the plain
+        # tensor distributed like the DTensor, and checks size, stride and full tensor values.
+        # Requires at least 2 GPUs.
         even_tensor = torch.randn(self.world_size, 2)
         uneven_tensor = torch.randn(1, 2)
 
@@ -275,6 +315,10 @@ class TestStateDictUtils(DTensorTestBase):
     @with_comms
     @skip_if_lt_x_gpu(2)
     def test_cpu_offload_for_dtensor(self):
+        # [FUNCTION DOC] Creates a CPU mirror of a DTensor state dict, checks both the DTensor and
+        # its local tensor live on CPU, then verifies non-blocking _copy_state_dict (followed by a
+        # device synchronize) syncs values before and after the source is modified in place.
+        # Requires at least 2 GPUs.
         device_mesh = init_device_mesh(self.device_type, mesh_shape=(self.world_size,))
         sd = {
             "k": DTensor.from_local(
