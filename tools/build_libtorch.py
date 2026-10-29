@@ -1,3 +1,9 @@
+# [MODULE DOC] Command line script that configures and builds libtorch with CMake (python
+# bindings off) and installs it into the torch directory of the repository. Options: --rerun-
+# cmake and --cmake-only. Reads DEBUG, REL_WITH_DEB_INFO, CMAKE_BUILD_TYPE, CMAKE_GENERATOR
+# and MAX_JOBS from the environment. The build tree is created under the current working
+# directory. No import-time side effects besides defining constants.
+
 import argparse
 import multiprocessing
 import os
@@ -11,10 +17,16 @@ REPO_ROOT = Path(__file__).absolute().parent.parent
 
 
 def _check_env_flag(name: str, default: str = "") -> bool:
+    # [FUNCTION DOC] HELPER: Returns True if the named environment variable is set
+    # to a truthy value (on, 1, yes, true or y, case-insensitive); otherwise
+    # returns the default's truthiness.
     return os.getenv(name, default).upper() in ("ON", "1", "YES", "TRUE", "Y")
 
 
 def _set_cmake_build_type() -> None:
+    # [FUNCTION DOC] HELPER: Sets the CMAKE_BUILD_TYPE environment variable if absent: Debug
+    # when DEBUG is set, RelWithDebInfo when REL_WITH_DEB_INFO is set, otherwise Release. Side
+    # effect: mutates the process environment.
     # Hotpatch CMAKE_BUILD_TYPE based on DEBUG / REL_WITH_DEB_INFO env flags so
     # CMake picks up the build type when build_libtorch.py is invoked directly
     # (the scikit-build-core path handles this via [[tool.scikit-build.overrides]]
@@ -29,6 +41,14 @@ def _set_cmake_build_type() -> None:
 
 
 def build_libtorch(rerun_cmake: bool, cmake_only: bool) -> None:
+    # [FUNCTION DOC] Configures (if no cache exists) and builds the install target
+    # of the CMake project in a build directory under the current directory.
+    # rerun_cmake deletes the CMake cache and generator state first; cmake_only
+    # stops after configuring. Prefers Ninja unless CMAKE_GENERATOR is set; passes
+    # a job count from MAX_JOBS or the CPU count for non-Ninja generators. Side
+    # effects: creates directories, runs cmake subprocesses, prints commands to
+    # stderr. Exits with status 1 if cmake is missing; failing subprocesses raise
+    # an error (CalledProcessError).
     _set_cmake_build_type()
     # Resolve the build directory relative to the current working directory,
     # not the repo root: CI invokes this script from a scratch dir to build

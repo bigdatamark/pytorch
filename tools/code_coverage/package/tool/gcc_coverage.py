@@ -1,3 +1,6 @@
+# [MODULE DOC] GCC coverage workflow for OSS: run tests and export gcov data as JSON files in
+# the profile JSON folder. No import-time side effects.
+
 from __future__ import annotations
 
 import os
@@ -12,6 +15,9 @@ from .utils import run_cpp_test
 
 
 def update_gzip_dict(gzip_dict: dict[str, int], file_name: str) -> str:
+    # [FUNCTION DOC] HELPER: Counts the file name (lowercased) in the dictionary and returns
+    # the name prefixed with its running count, which makes names from different folders
+    # unique. Mutates the dictionary.
     file_name = file_name.lower()
     gzip_dict[file_name] = gzip_dict.get(file_name, 0) + 1
     num = gzip_dict[file_name]
@@ -19,6 +25,8 @@ def update_gzip_dict(gzip_dict: dict[str, int], file_name: str) -> str:
 
 
 def run_target(binary_file: str, test_type: TestType) -> None:
+    # [FUNCTION DOC] Runs a C++ or python test binary and prints how long it took. Raises
+    # AssertionError for other test types.
     print_log("start run", test_type.value, "test: ", binary_file)
     start_time = time.time()
     if test_type not in {TestType.CPP, TestType.PY}:
@@ -32,6 +40,10 @@ def run_target(binary_file: str, test_type: TestType) -> None:
 
 
 def export() -> None:
+    # [FUNCTION DOC] Converts every gcda file to JSON: runs gcov, moves the produced
+    # compressed file into the JSON folder under a unique name, and decompresses it. Side
+    # effects: runs subprocesses and writes and renames files in the working directory. Prints
+    # elapsed time.
     start_time = time.time()
     # collect .gcda files
     gcda_files = get_gcda_files()

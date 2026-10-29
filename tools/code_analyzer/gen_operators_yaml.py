@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Command line tool that generates the model_operators.yaml file for a model from
+# a pt_operator_library rule. Combines static root operators (expanded by the op dependency
+# graph), training root operators, and operators traced from the model YAML files, plus custom
+# classes, build features and kernel metadata, and writes the merged selective-build YAML. The
+# format and inputs are described in the comment block below. No import-time side effects.
 
 from __future__ import annotations
 
@@ -92,6 +97,7 @@ from torchgen.selective_build.selector import merge_kernel_metadata
 
 
 def canonical_opnames(opnames: list[str]) -> list[str]:
+    # [FUNCTION DOC] HELPER: Returns the operator names with overload suffixes removed.
     return [canonical_name(opname) for opname in opnames]
 
 
@@ -101,7 +107,13 @@ def make_filter_from_options(
     model_assets: list[str] | None,
     model_backends: list[str] | None,
 ):
+    # [FUNCTION DOC] Builds a predicate that selects model YAML entries matching the model
+    # name, one of the versions, and (if given) one of the assets. Backends are accepted but
+    # not yet used. The returned predicate takes a parsed model entry and returns a bool.
+    # KNOWN ISSUE: model_backends is ignored (see the TODO in the predicate).
     def is_model_included(model_info) -> bool:
+        # [FUNCTION DOC] HELPER: Returns True if a model entry matches the name, version and
+        # asset filters captured from the enclosing function.
         model = model_info["model"]
         if model["name"] != model_name:
             return False
@@ -117,6 +129,8 @@ def make_filter_from_options(
 
 # Returns if a the specified rule is a new or old style pt_operator_library
 def is_new_style_rule(model_name: str, model_versions: list[str] | None):
+    # [FUNCTION DOC] HELPER: Returns True when both a model name and model versions are given,
+    # which marks the newer style of pt_operator_library rule.
     return model_name is not None and model_versions is not None
 
 
@@ -131,7 +145,14 @@ def verify_all_specified_present(
     model_name: str,
     new_style_rule: bool,
 ) -> None:
+    # [FUNCTION DOC] Verifies that every requested version and asset appears in at
+    # least one selected model YAML. Returns None on success; raises RuntimeError
+    # with a detailed message (including a warning when no YAML matched the model
+    # name) when anything is missing.
     def find_missing_items(model_items, key, selected_models_yaml):
+        # [FUNCTION DOC] HELPER: Returns the requested items (assets or versions)
+        # that appear in none of the selected model YAMLs. Returns an empty list
+        # for old style rules or no items.
         missing_items = []
         if not new_style_rule or not model_items:
             return missing_items
@@ -190,6 +211,9 @@ def create_debug_info_from_selected_models(
     selected_models: list[dict],
     new_style_rule: bool,
 ) -> None:
+    # [FUNCTION DOC] Aggregates the md5 hashes of the selected models per asset and stores
+    # them, together with the new-style rule flag, as a JSON string in the output mapping
+    # under the top-level debug_info key. Mutates output; later consumed by gen_oplist.
     model_dict = {
         "asset_info": {},  # maps asset name -> dict of asset metadata like hashes
         "is_new_style_rule": new_style_rule,
@@ -210,6 +234,14 @@ def create_debug_info_from_selected_models(
 
 
 def fill_output(output: dict[str, object], options: Namespace) -> None:
+    # [FUNCTION DOC] Populates the output mapping from the parsed options. Loads the
+    # dependency graph and model YAMLs, selects matching models, verifies them, computes
+    # static root operators (with transitive closure) and tracing-based operators, builds
+    # operator buckets for inference and training, merges them, and sets operators, custom
+    # classes, build features, include_all_non_op_selectives and (if present) merged kernel
+    # metadata. Mutates output; raises on invalid inputs.
+    # KNOWN ISSUE: when model versions are omitted the list is empty, so the filter rejects
+    # every model entry and no traced operators are selected.
     """Populate the output dict with the information required to serialize
     the YAML file used for selective build.
     """
@@ -501,6 +533,10 @@ def fill_output(output: dict[str, object], options: Namespace) -> None:
 
 
 def add_arguments_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    # [FUNCTION DOC] Registers all command line arguments (root ops, training root ops, output
+    # path, dependency graph path, model identity, models YAML paths, include-all flag, rule
+    # name and overload-inclusion switches) on the parser and returns it. Both dash and
+    # underscore spellings are accepted.
     parser.add_argument(
         "--root-ops",
         "--root_ops",
@@ -598,15 +634,23 @@ def add_arguments_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
 
 
 def parse_options(parser: argparse.ArgumentParser) -> argparse.Namespace:
+    # [FUNCTION DOC] HELPER: Parses the process command line with the given parser.
     return parser.parse_args()
 
 
 def get_parser_options(parser: argparse.ArgumentParser) -> argparse.Namespace:
+    # [FUNCTION DOC] HELPER: Adds the tool's arguments to the parser and returns
+    # the parsed options.
     parser = add_arguments_parser(parser)
     return parse_options(parser)
 
 
 def main(argv) -> None:
+    # [FUNCTION DOC] Entry point. Parses options, then either writes an include-all-operators
+    # result (empty operators and kernel metadata) or fills the output via fill_output, and
+    # writes it as YAML to the output path. Side effect: writes a file.
+    # KNOWN ISSUE: the argv parameter is unused; options are read from the process
+    # command line.
     parser = argparse.ArgumentParser(description="Generate used operators YAML")
     options = get_parser_options(parser)
 

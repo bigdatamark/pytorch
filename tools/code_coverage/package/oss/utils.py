@@ -1,3 +1,7 @@
+# [MODULE DOC] Path and environment helpers for the OSS coverage flow: locating test binaries,
+# shared libraries and the pytorch and llvm folders, detecting the compiler, and handling gcda
+# files and python test execution. Reads the CXX, LLVM_TOOL_PATH and PYTORCH_FOLDER variables.
+
 from __future__ import annotations
 
 import os
@@ -8,6 +12,8 @@ from ..util.utils import print_error, remove_file
 
 
 def get_oss_binary_folder(test_type: TestType) -> str:
+    # [FUNCTION DOC] Returns the folder holding test programs: build/bin for C++ tests or test
+    # for python tests, under the pytorch folder. Raises AssertionError for other test types.
     if test_type not in {TestType.CPP, TestType.PY}:
         raise AssertionError(f"Invalid test_type: {test_type}")
     # TODO: change the way we get binary file -- binary may not in build/bin ?
@@ -17,6 +23,8 @@ def get_oss_binary_folder(test_type: TestType) -> str:
 
 
 def get_oss_shared_library() -> list[str]:
+    # [FUNCTION DOC] Returns the full paths of the dylib files in the build lib folder.
+    # KNOWN ISSUE: only matches dylib (macOS) files, so the list is empty for shared objects.
     lib_dir = os.path.join(get_pytorch_folder(), "build", "lib")
     return [
         os.path.join(lib_dir, lib)
@@ -26,6 +34,9 @@ def get_oss_shared_library() -> list[str]:
 
 
 def get_oss_binary_file(test_name: str, test_type: TestType) -> str:
+    # [FUNCTION DOC] Returns the command or path to run a test: the binary path,
+    # prefixed with the python interpreter command for python tests. Raises
+    # AssertionError for other test types.
     if test_type not in {TestType.CPP, TestType.PY}:
         raise AssertionError(f"Invalid test_type: {test_type}")
     binary_folder = get_oss_binary_folder(test_type)
@@ -37,12 +48,15 @@ def get_oss_binary_file(test_name: str, test_type: TestType) -> str:
 
 
 def get_llvm_tool_path() -> str:
+    # [FUNCTION DOC] Returns the llvm tools folder from LLVM_TOOL_PATH or a default location.
     return os.environ.get(
         "LLVM_TOOL_PATH", "/usr/local/opt/llvm/bin"
     )  # set default as llvm path in dev server, on mac the default may be /usr/local/opt/llvm/bin
 
 
 def get_pytorch_folder() -> str:
+    # [FUNCTION DOC] Returns the absolute pytorch folder, from PYTORCH_FOLDER if set,
+    # otherwise two levels above the tools folder.
     # TOOLS_FOLDER in oss: pytorch/tools/code_coverage
     return os.path.abspath(
         os.environ.get("PYTORCH_FOLDER", os.path.dirname(os.path.dirname(TOOLS_FOLDER)))
@@ -50,6 +64,9 @@ def get_pytorch_folder() -> str:
 
 
 def detect_compiler_type() -> CompilerType | None:
+    # [FUNCTION DOC] Returns the compiler type, from CXX if set (clang, clang++, gcc, g++) or
+    # by running the cc compiler with its version flag and checking for clang or gcc. Raises
+    # RuntimeError for an unsupported compiler.
     # check if user specifies the compiler type
     user_specify = os.environ.get("CXX", None)
     if user_specify:
@@ -72,12 +89,16 @@ def detect_compiler_type() -> CompilerType | None:
 
 
 def clean_up_gcda() -> None:
+    # [FUNCTION DOC] Deletes every gcda file found in the build folder.
     gcda_files = get_gcda_files()
     for item in gcda_files:
         remove_file(item)
 
 
 def get_gcda_files() -> list[str]:
+    # [FUNCTION DOC] Returns the paths of gcda files under the build folder (found with the
+    # find command), or an empty list when the build folder is missing.
+    # KNOWN ISSUE: splitting the output on newlines leaves a trailing empty string entry.
     folder_has_gcda = os.path.join(get_pytorch_folder(), "build")
     if os.path.isdir(folder_has_gcda):
         # TODO use glob
@@ -89,6 +110,8 @@ def get_gcda_files() -> list[str]:
 
 
 def run_oss_python_test(binary_file: str) -> None:
+    # [FUNCTION DOC] Runs a python test command through the shell in the python test folder. A
+    # failing exit status is reported with an error message instead of being raised.
     # python test script
     try:
         subprocess.check_call(

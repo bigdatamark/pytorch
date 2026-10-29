@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Command line tool that recompiles chosen source files of an existing ninja
+# build with debug info and relinks the dependent outputs of the torch_python target, using
+# the commands reported by ninja. Supports --verbose and --dry-run, then re-points torch/lib
+# libraries at build/lib. Linux and macOS only. Defines path constants at import time.
+
 # Tool to quickly rebuild one or two files with debug info.
 #
 # It recompiles each named source with -g (in place of -O2/-O3), reusing the
@@ -31,10 +36,14 @@ BUILD_LIB_DIR = BUILD_DIR / "lib"
 
 
 def check_output(args: list[str], cwd: str | None = None) -> str:
+    # [FUNCTION DOC] HELPER: Runs a command and returns its decoded standard output; raises
+    # CalledProcessError on a nonzero exit.
     return subprocess.check_output(args, cwd=cwd).decode("utf-8")
 
 
 def parse_args() -> Any:
+    # [FUNCTION DOC] HELPER: Parses command line options (verbose, dry-run and a list of
+    # files) and returns the argparse namespace.
     from argparse import ArgumentParser
 
     parser = ArgumentParser(description="Incremental build PyTorch with debinfo")
@@ -49,6 +58,8 @@ def parse_args() -> Any:
 
 
 def get_lib_extension() -> str:
+    # [FUNCTION DOC] HELPER: Returns the shared library extension for the platform (so on
+    # Linux, dylib on macOS). Raises RuntimeError on other platforms.
     if sys.platform == "linux":
         return "so"
     if sys.platform == "darwin":
@@ -57,6 +68,10 @@ def get_lib_extension() -> str:
 
 
 def create_symlinks() -> None:
+    # [FUNCTION DOC] HELPER: Replaces each real shared library in torch/lib with a symlink to
+    # the same-named file in build/lib, skipping existing symlinks. Raises RuntimeError if
+    # either directory or a corresponding build library is missing. Side effect: deletes and
+    # links files.
     """Creates symlinks from build/lib to torch/lib"""
     if not TORCH_LIB_DIR.exists():
         raise RuntimeError(f"Can't create symlinks as {TORCH_LIB_DIR} does not exist")
@@ -73,15 +88,21 @@ def create_symlinks() -> None:
 
 
 def has_build_ninja() -> bool:
+    # [FUNCTION DOC] HELPER: Returns True if the build directory contains a build.ninja file.
     return (BUILD_DIR / "build.ninja").exists()
 
 
 def is_devel_setup() -> bool:
+    # [FUNCTION DOC] HELPER: Returns True if importing torch with the current interpreter
+    # resolves to the in-tree torch package (an editable development install).
     output = check_output([sys.executable, "-c", "import torch;print(torch.__file__)"])
     return output.strip() == str(TORCH_DIR / "__init__.py")
 
 
 def debugify(cmd: str) -> str:
+    # [FUNCTION DOC] HELPER: Rewrites a compile command string, replacing -O2 and
+    # -O3 with -g and adding source recording flags to Metal shader compile
+    # commands. Returns the new command.
     """Swap optimization flags for debug info, leaving everything else intact."""
     cmd = cmd.replace("-O2", "-g").replace("-O3", "-g")
     # Build Metal shaders with debug information.
@@ -91,6 +112,8 @@ def debugify(cmd: str) -> str:
 
 
 def command_tokens(cmd: str, build_dir: Path) -> list[tuple[str, Path]]:
+    # [FUNCTION DOC] HELPER: Splits a shell command into tokens, honoring a leading cd prefix,
+    # and returns each token paired with its path resolved against the working directory.
     tokens = shlex.split(cmd)
     cwd = build_dir
     if len(tokens) > 2 and tokens[0] == "cd" and tokens[2] == "&&":
@@ -100,6 +123,8 @@ def command_tokens(cmd: str, build_dir: Path) -> list[tuple[str, Path]]:
 
 
 def command_outputs(cmd: str, build_dir: Path) -> set[Path]:
+    # [FUNCTION DOC] HELPER: Returns the set of resolved paths that follow an
+    # output flag in a command.
     tokens = command_tokens(cmd, build_dir)
     return {
         tokens[idx + 1][1]
@@ -111,6 +136,11 @@ def command_outputs(cmd: str, build_dir: Path) -> set[Path]:
 def create_build_plan(
     files: list[str], ninja_commands: str, build_dir: Path
 ) -> list[tuple[str, str]]:
+    # [FUNCTION DOC] Builds the rebuild plan from ninja's command list. Commands that mention
+    # a requested source file are marked for a debug rebuild; later commands that consume (or
+    # embed the path of) an output of a selected command are added as dependents, in order.
+    # Returns a list of pairs (kind label, command), with debug-info flags applied to source
+    # compiles. Raises RuntimeError when no command matches the requested files.
     commands = [line.strip() for line in ninja_commands.splitlines() if line.strip()]
     sources = {Path(file).resolve() for file in files}
     parsed = []
@@ -151,6 +181,11 @@ def create_build_plan(
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point. Rejects Windows and non-ninja builds, requires an editable
+    # install unless dry-run, obtains the plan from ninja, then prints it (dry-run) or
+    # executes each command in the build directory and finally recreates the torch/lib
+    # symlinks. Exits with a negative status on unsupported setups or when no commands match;
+    # prints a message and returns when no files were given.
     if sys.platform == "win32":
         print("Not supported on Windows yet")
         sys.exit(-95)

@@ -1,3 +1,10 @@
+# [MODULE DOC] Loads and validates derivatives.yaml and turns each entry into per-dispatch-key
+# DifferentiabilityInfo objects (backward Derivative and ForwardDerivative lists) used by the
+# autograd codegen. Main entry point: load_derivatives (cached). Also generates derivative
+# entries for the codegen'd view_copy ops, rewrites formulas to replace tensor expressions
+# with saved attributes, and expands the auto_linear / auto_element_wise forward shortcuts.
+# Import side effects: builds a module-level result cache and the set of valid autograd keys.
+
 # Parses derivatives.yaml into autograd functions
 #
 # Each autograd function is represented by `DifferentiabilityInfo` containing
@@ -72,6 +79,15 @@ def add_view_copy_derivatives(
     infos: dict[FunctionSchema, dict[str, DifferentiabilityInfo]],
     view_groups: list[NativeFunctionsViewGroup],
 ) -> None:
+    # [FUNCTION DOC] Mutates infos in place: for every entry whose op is a view op
+    # that has a view_copy sibling, derives a view_copy DifferentiabilityInfo for
+    # each dispatch key and adds it under the view_copy schema, unless a manually
+    # written entry for that schema already exists. Args: infos maps schema to a
+    # mapping of dispatch key to info; view_groups lists view groups. Raises an
+    # error if an internal schema is unexpectedly missing.
+    # KNOWN ISSUE: the schema variable of the previous entry can leak into later
+    # iterations (a static checker flags it as possibly unbound); it is only used
+    # when new infos were collected.
     # Get the map from each view op's name to its corresponding view group
     view_name_to_group: dict[OperatorName, NativeFunctionsViewGroup] = {
         g.view.func.name: g for g in view_groups
@@ -107,6 +123,14 @@ def add_view_copy_derivatives(
 def load_derivatives(
     derivatives_yaml_path: str, native_yaml_path: str, tags_yaml_path: str
 ) -> DerivativeRet:
+    # [FUNCTION DOC] Parses derivatives.yaml (plus native_functions.yaml and tags.yaml) and
+    # returns a pair: a mapping from FunctionSchema to a mapping of dispatch key to
+    # DifferentiabilityInfo, and the set of dispatch keys (or "Default") used. Results are
+    # memoized in a module-level cache. Old-style entries without a dispatch section are
+    # wrapped under the Default key. Raises errors for malformed entries; view_copy
+    # derivatives are added at the end.
+    # KNOWN ISSUE: the cache key uses only the derivatives and native yaml paths,
+    # not the tags path.
     # Do some caching as this is a deterministic function
     global _GLOBAL_LOAD_DERIVATIVE_CACHE
     key = (derivatives_yaml_path, native_yaml_path)
@@ -185,6 +209,8 @@ def load_derivatives(
 # TODO: Why is this going through CppSignatureGroup, that doesn't make sense...
 @with_native_function
 def cpp_arguments(f: NativeFunction) -> Sequence[Binding]:
+    # [FUNCTION DOC] HELPER: Returns the C++ argument bindings of a native function,
+    # preferring the SymInt signature when one exists, otherwise the plain signature.
     sigs = CppSignatureGroup.from_native_function(f, method=False)
     if sigs.symint_signature is not None:
         return sigs.symint_signature.arguments()
@@ -198,6 +224,12 @@ def create_derivative(
     var_names: tuple[str, ...],
     available_named_gradients: Sequence[str],
 ) -> Derivative:
+    # [FUNCTION DOC] Builds a Derivative from one backward formula string. Collects the C++
+    # input and output (return) names and types, rewrites the formula via saved_variables so
+    # that expressions on inputs and outputs become saved attributes, and records which named
+    # gradients (grad_NAME) the formula uses. Raises RuntimeError if a grads index is out of
+    # range for the number of forward returns. Returns the Derivative with original and
+    # rewritten formulas.
     original_formula = formula
     arguments: list[NamedCType] = [
         a.nctype.remove_const_ref() for a in cpp_arguments(f)
@@ -242,6 +274,11 @@ def create_derivative(
 def create_forward_derivative(
     f: NativeFunction, formula: str, names: tuple[str, ...]
 ) -> ForwardDerivative:
+    # [FUNCTION DOC] Builds a ForwardDerivative from a forward-mode formula and the output
+    # names it defines. Output types come from returns whose name matches; otherwise the
+    # default names result or resultN are mapped to return types by position. Raises
+    # AssertionError if no matching output is found. Required-input fields are left unset for
+    # later postprocessing.
     var_names = names
     var_types: tuple[Type, ...] | None = None
     for r in f.func.returns:
@@ -288,7 +325,17 @@ def postprocess_forward_derivatives(
     forward_derivatives: list[ForwardDerivative],
     args_with_derivatives: Sequence[Binding],
 ) -> list[ForwardDerivative]:
+    # [FUNCTION DOC] Finalizes forward derivatives once the differentiable arguments are
+    # known. Computes which inputs' tangents and primals each formula needs, and expands the
+    # special formulas auto_element_wise (reuse the backward formula with tangent/primal
+    # substitution and a final conjugate) and auto_linear (call the forward op again on the
+    # tangents). Raises errors for ambiguous bare argument names or misuse of the shortcuts.
+    # Returns the updated list.
     def find_required_inputs(formula: str, postfix: str) -> tuple[str, ...]:
+        # [FUNCTION DOC] HELPER: Returns the argument names whose suffixed variant (the
+        # postfix, such as _t for tangent or _p for primal) appears in the formula. Raises
+        # RuntimeError if a bare argument name is used. Tensor-list arguments are skipped
+        # except for foreach ops.
         is_foreach = f.func.name.name.base.startswith("_foreach_")
         required_inputs = set()
         for arg in args_with_derivatives:
@@ -358,6 +405,9 @@ def postprocess_forward_derivatives(
 
             # Do replacement 1) of the grad
             def repl(m: Any) -> str:
+                # [FUNCTION DOC] HELPER: Regex replacement callback that substitutes the
+                # matched gradient name with the conjugated tangent of the single
+                # differentiable input, keeping the surrounding delimiter characters.
                 return f"{m.group(1)}{input_name}_t.conj(){m.group(2)}"
 
             fw_formula = re.sub(IDENT_REGEX.format("grad"), repl, backward_formula)
@@ -367,6 +417,9 @@ def postprocess_forward_derivatives(
                 arg_name = arg.name
 
                 def repl(m: Any) -> str:
+                    # [FUNCTION DOC] HELPER: Regex replacement callback that substitutes the
+                    # matched input name with its primal variable name, keeping the
+                    # surrounding delimiter characters.
                     return f"{m.group(1)}{arg_name}_p{m.group(2)}"
 
                 fw_formula = re.sub(IDENT_REGEX.format(arg_name), repl, fw_formula)
@@ -451,6 +504,10 @@ def postprocess_forward_derivatives(
 def is_forward_derivative_definition(
     all_arg_names: list[str], names: tuple[str, ...]
 ) -> bool:
+    # [FUNCTION DOC] Returns True if the names in a derivative entry denote forward-mode
+    # outputs rather than function arguments. Raises RuntimeError if the names tuple is empty.
+    # KNOWN ISSUE: only the first name is examined because the loop returns on its
+    # first iteration.
     for name in names:
         return name not in all_arg_names
     raise RuntimeError("Expected `names` to be non-empty")
@@ -463,11 +520,23 @@ def create_differentiability_info(
     op_counter: Counter[str],
     used_dispatch_keys: set[str],
 ) -> tuple[FunctionSchema, dict[str, DifferentiabilityInfo]]:
+    # [FUNCTION DOC] Processes one derivatives.yaml entry. Looks up the native function by
+    # schema, finds its canonical (non-functional, non-out) variant, validates the dispatch
+    # keys, and for each dispatch key builds a DifferentiabilityInfo holding backward and
+    # forward derivatives, saved inputs/outputs, named gradients and a unique autograd node
+    # name from op_counter. Mutates the entry dict (pops name and output_differentiability),
+    # op_counter and used_dispatch_keys. Returns the canonical schema and a mapping of
+    # dispatch key to info. Raises RuntimeError for unknown schemas, bad dispatch keys or
+    # shadowed argument names.
     """Processes a single entry `defn` in derivatives.yaml"""
 
     def canonical_function(
         functions: Sequence[NativeFunction], name: str
     ) -> NativeFunction:
+        # [FUNCTION DOC] HELPER: Picks the function to attach derivatives to: the
+        # first non-functional, non-out variant whose base name matches, else the
+        # first function (in-place only ops). Raises AssertionError if that
+        # fallback is not the matching in-place name.
         for f in functions:
             if (
                 not f.func.is_functional_fn()
@@ -483,10 +552,15 @@ def create_differentiability_info(
         return functions[0]
 
     def split_names(raw_names: str) -> tuple[str, ...]:
+        # [FUNCTION DOC] HELPER: Splits a comma separated list of names into a tuple of
+        # stripped names.
         """Given "foo, bar", return ["foo", "bar"]."""
         return tuple(x.strip() for x in raw_names.split(","))
 
     def check_grad_usage(defn_name: str, derivatives: Sequence[Derivative]) -> None:
+        # [FUNCTION DOC] HELPER: Sanity-checks use of grad, grads indexing and named grad_NAME
+        # across the formulas of one op. Raises RuntimeError when they are mixed, or when only
+        # the first grads index is used.
         """
         Check for some subtle mistakes one might make when writing derivatives.
         These mistakes will compile, but will be latent until a function is
@@ -550,6 +624,13 @@ def create_differentiability_info(
         Sequence[str],
         Sequence[str],
     ]:
+        # [FUNCTION DOC] HELPER: Builds the derivative data for one canonical function from
+        # the enclosing entry. Computes available named gradients, classifies each entry key
+        # as forward derivative, non_differentiable marker or backward derivative,
+        # postprocesses forward derivatives, runs the grad usage check, and returns
+        # derivatives, forward derivatives, differentiable argument bindings, non-
+        # differentiable names and available named gradients. Raises on name clashes or
+        # overlap between differentiable and non-differentiable names.
         # Set up the derivative information
         derivatives: list[Derivative] = []
         forward_derivatives: list[ForwardDerivative] = []
@@ -762,6 +843,8 @@ GRAD_INDEX_REGEX = r"(?:^|\W)grads\[(\d+)\]"
 
 
 def used_gradient_indices(formula: str) -> list[int]:
+    # [FUNCTION DOC] Returns the list of integer indices found in grads index
+    # accesses in a formula.
     """Determine a list of gradient indices (the i in grads[i]) that
     are used by the formula.
 
@@ -776,7 +859,18 @@ def saved_variables(
     nctypes: list[NamedCType],
     var_names: tuple[str, ...],
 ) -> tuple[str, tuple[SavedAttribute, ...]]:
+    # [FUNCTION DOC] Rewrites a backward formula for the given typed names (inputs or
+    # outputs). Expressions such as size, numel, dim, options or layout queries of a name are
+    # replaced by precomputed saved attributes (evaluated when the node is created) and any
+    # name still used in the formula is saved as a whole. Returns the new formula and the
+    # tuple of SavedAttribute. Raises RuntimeError for unsupported size()/sizes()/strides()
+    # calls in the formula.
+    # KNOWN ISSUE: the sym_blocksize replacement uses the suffix _self_sym_blocksize_opt,
+    # which disagrees with its comment (self_sym_blocksize_opt) and doubles self in the name.
     def stride_expr(name: str) -> str:
+        # [FUNCTION DOC] HELPER: Builds the save-time expression for a strides
+        # replacement; only valid when the derivative is solely for that same
+        # tensor, otherwise raises AssertionError.
         if var_names != (name,):
             raise AssertionError(
                 'Replacement for ".strides()" is currently only supported for single derivatives of the same tensor '
@@ -966,6 +1060,10 @@ def saved_variables(
         for regex, info in REPLACEMENTS:
 
             def repl(m: re.Match[str]) -> str:
+                # [FUNCTION DOC] HELPER: Regex replacement callback. Records a
+                # SavedAttribute for the matched expression (using the suffix,
+                # type and optional save-time expression of the current rule) and
+                # returns the replacement text used in the formula.
                 suffix: str = (
                     # pyrefly: ignore [bad-assignment]
                     info["suffix"](m) if callable(info["suffix"]) else info["suffix"]
@@ -1007,6 +1105,9 @@ def saved_variables(
 
 
 def _create_op_prefix(name: str) -> str:
+    # [FUNCTION DOC] HELPER: Converts a native function base name into the
+    # autograd node class prefix, a title-cased name with Backward appended (a
+    # trailing ForwardBackward collapses).
     r"""Takes a native function name converts to an op prefix name.
 
     Note that the "name" parameter must be the native function name
@@ -1025,6 +1126,8 @@ def _create_op_prefix(name: str) -> str:
 
 
 def dedup_vars(vars: Sequence[SavedAttribute]) -> Sequence[SavedAttribute]:
+    # [FUNCTION DOC] HELPER: Removes saved attributes whose names were already seen, keeping
+    # the first occurrence and the original order. Returns the deduplicated list.
     seen: set[str] = set()
     saved: list[SavedAttribute] = []
     for var in vars:

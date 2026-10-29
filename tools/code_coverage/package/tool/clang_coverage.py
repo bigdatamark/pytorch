@@ -1,3 +1,7 @@
+# [MODULE DOC] Clang (llvm) coverage workflow: run a test with a raw profile output path,
+# merge raw profiles with llvm-profdata, and export JSON with llvm-cov, mirroring the folder
+# layout across the raw, merged and JSON output trees. No import-time side effects.
+
 from __future__ import annotations
 
 import os
@@ -28,6 +32,8 @@ from .utils import get_tool_path_by_platform, run_cpp_test
 def create_corresponding_folder(
     cur_path: str, prefix_cur_path: str, dir_list: list[str], new_base_folder: str
 ) -> None:
+    # [FUNCTION DOC] HELPER: For each subfolder name, creates the matching folder under the
+    # new base folder, using the current path relative to the given prefix.
     for dir_name in dir_list:
         relative_path = convert_to_relative_path(
             cur_path, prefix_cur_path
@@ -39,6 +45,9 @@ def create_corresponding_folder(
 def run_target(
     binary_file: str, raw_file: str, test_type: TestType, platform_type: TestPlatform
 ) -> None:
+    # [FUNCTION DOC] Runs one test with the LLVM_PROFILE_FILE environment variable set to the
+    # raw file path. Python tests on OSS use the python runner; others use the C++ runner.
+    # Side effect: modifies the process environment and executes the binary.
     print_log("start run: ", binary_file)
     # set environment variable -- raw profile output path of the binary run
     os.environ["LLVM_PROFILE_FILE"] = raw_file
@@ -52,6 +61,8 @@ def run_target(
 
 
 def merge_target(raw_file: str, merged_file: str, platform_type: TestPlatform) -> None:
+    # [FUNCTION DOC] Merges one raw profile into an indexed profile file using llvm-profdata.
+    # Raises CalledProcessError on failure.
     print_log("start to merge target: ", raw_file)
     # run command
     llvm_tool_path = get_tool_path_by_platform(platform_type)
@@ -74,6 +85,11 @@ def export_target(
     shared_library_list: list[str],
     platform_type: TestPlatform,
 ) -> None:
+    # [FUNCTION DOC] Exports a merged profile to a JSON file with llvm-cov, adding the binary
+    # and shared libraries as objects. Raises an error if the binary is None. Runs a shell
+    # command with output redirection; its exit status is not checked.
+    # KNOWN ISSUE: the binary None check never triggers for the empty string used
+    # by python tests.
     if binary_file is None:
         raise Exception(  # noqa: TRY002
             f"{merged_file} doesn't have corresponding binary!"
@@ -94,6 +110,8 @@ def export_target(
 
 
 def merge(test_list: TestList, platform_type: TestPlatform) -> None:
+    # [FUNCTION DOC] Merges every raw .profraw profile related to the test list into the
+    # merged folder tree, creating mirrored folders, and prints the elapsed time.
     print("start merge")
     start_time = time.time()
     # find all raw profile under raw_folder and sub-folders
@@ -122,6 +140,9 @@ def merge(test_list: TestList, platform_type: TestPlatform) -> None:
 
 
 def export(test_list: TestList, platform_type: TestPlatform) -> None:
+    # [FUNCTION DOC] Exports every merged profile related to the test list to JSON in the JSON
+    # folder tree. Determines the binary (fbcode or OSS; none for python tests) and shared
+    # libraries per platform, then calls export_target. Prints the elapsed time.
     print("start export")
     start_time = time.time()
     # find all merged profile under merged_folder and sub-folders

@@ -1,3 +1,7 @@
+# [MODULE DOC] Writes the coverage summary reports: line oriented and file oriented text
+# summaries in the summary folder, and an html report generated with lcov and genhtml. Defines
+# the CoverageItem tuple type (file name, percentage, covered count, total count).
+
 from __future__ import annotations
 
 import os
@@ -12,14 +16,18 @@ CoverageItem = tuple[str, float, int, int]
 
 
 def key_by_percentage(x: CoverageItem) -> float:
+    # [FUNCTION DOC] HELPER: Sort key returning the coverage percentage of a report item.
     return x[1]
 
 
 def key_by_name(x: CoverageItem) -> str:
+    # [FUNCTION DOC] HELPER: Sort key returning the file name of a report item.
     return x[0]
 
 
 def is_intrested_file(file_path: str, interested_folders: list[str]) -> bool:
+    # [FUNCTION DOC] Returns True if the file path is under any interested folder, excluding
+    # cuda files and generated aten files.
     if "cuda" in file_path:
         return False
     if "aten/gen_aten" in file_path or "aten/aten_" in file_path:
@@ -31,6 +39,8 @@ def is_intrested_file(file_path: str, interested_folders: list[str]) -> bool:
 
 
 def is_this_type_of_tests(target_name: str, test_set_by_type: set[str]) -> bool:
+    # [FUNCTION DOC] HELPER: Returns True if the target name is a substring of any test name
+    # in the given set.
     # tests are divided into three types: success / partial success / fail to collect coverage
     for test in test_set_by_type:
         if target_name in test:
@@ -41,6 +51,9 @@ def is_this_type_of_tests(target_name: str, test_set_by_type: set[str]) -> bool:
 def print_test_by_type(
     tests: TestList, test_set_by_type: set[str], type_name: str, summary_file: IO[str]
 ) -> None:
+    # [FUNCTION DOC] HELPER: Writes a section to the summary file listing the target patterns
+    # of tests belonging to the given set (for example fully succeeded), under a heading with
+    # the type name, followed by an empty line.
     print("Tests " + type_name + " to collect coverage:", file=summary_file)
     for test in tests:
         if is_this_type_of_tests(test.name, test_set_by_type):
@@ -56,6 +69,9 @@ def print_test_condition(
     summary_file: IO[str],
     summary_type: str,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Writes the shared report header to the summary file: tests
+    # grouped by success, partial success and failure, the interested folders, the coverage-
+    # only flags and a title line for the summary type.
     print_test_by_type(tests, tests_type["success"], "fully success", summary_file)
     print_test_by_type(tests, tests_type["partial"], "partially success", summary_file)
     print_test_by_type(tests, tests_type["fail"], "failed", summary_file)
@@ -85,6 +101,10 @@ def line_oriented_report(
     covered_lines: dict[str, set[int]],
     uncovered_lines: dict[str, set[int]],
 ) -> None:
+    # [FUNCTION DOC] Writes the line_summary report in the summary folder: the header, then
+    # per file the sorted lists of covered and uncovered lines. Side effect: creates or
+    # overwrites it.
+    # KNOWN ISSUE: the output text misspells uncovered as unconvered.
     with open(os.path.join(SUMMARY_FOLDER_DIR, "line_summary"), "w+") as report_file:
         print_test_condition(
             tests,
@@ -106,6 +126,11 @@ def line_oriented_report(
 def print_file_summary(
     covered_summary: int, total_summary: int, summary_file: IO[str]
 ) -> float:
+    # [FUNCTION DOC] HELPER: Writes the overall coverage summary block (percentage computed
+    # from covered and total counts, zero if total is zero) to the file, warns on the console
+    # if it is zero, and returns the percentage.
+    # KNOWN ISSUE: the label uncovered is printed with the total line count, not
+    # the uncovered count.
     # print summary first
     try:
         coverage_percentage = 100.0 * covered_summary / total_summary
@@ -130,6 +155,9 @@ def print_file_oriented_report(
     interested_folders: list[str],
     coverage_only: list[str],
 ) -> None:
+    # [FUNCTION DOC] HELPER: Writes the whole file oriented report: summary, test condition
+    # header, and one aligned row per file (name, percentage, covered, total); prints the
+    # overall percentage to the console.
     coverage_percentage = print_file_summary(
         covered_summary, total_summary, summary_file
     )
@@ -163,6 +191,9 @@ def file_oriented_report(
     covered_lines: dict[str, set[int]],
     uncovered_lines: dict[str, set[int]],
 ) -> None:
+    # [FUNCTION DOC] Writes the file_summary report in the summary folder. Computes per file
+    # coverage percentage and totals, sorts items by name then stably by percentage ascending,
+    # and delegates printing. Side effect: creates or overwrites the file.
     with open(os.path.join(SUMMARY_FOLDER_DIR, "file_summary"), "w+") as summary_file:
         covered_summary = 0
         total_summary = 0
@@ -197,10 +228,14 @@ def file_oriented_report(
 
 
 def get_html_ignored_pattern() -> list[str]:
+    # [FUNCTION DOC] HELPER: Returns the glob patterns of paths excluded from the html report.
     return ["/usr/*", "*anaconda3/*", "*third_party/*"]
 
 
 def html_oriented_report() -> None:
+    # [FUNCTION DOC] Generates the html coverage report: captures coverage info from the build
+    # folder with lcov, removes ignored paths, and renders html with genhtml into the summary
+    # folder. Side effect: runs subprocesses (raises CalledProcessError on failure).
     # use lcov to generate the coverage report
     build_folder = os.path.join(get_pytorch_folder(), "build")
     coverage_info_file = os.path.join(SUMMARY_FOLDER_DIR, "coverage.info")

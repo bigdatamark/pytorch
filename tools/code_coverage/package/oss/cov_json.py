@@ -1,3 +1,6 @@
+# [MODULE DOC] Drives coverage data collection for the OSS platform according to the detected
+# compiler (clang or gcc). No import-time side effects.
+
 from ..tool import clang_coverage
 from ..util.setting import CompilerType, Option, TestList, TestPlatform
 from ..util.utils import check_compiler_type
@@ -6,6 +9,10 @@ from .run import clang_run, gcc_run
 
 
 def get_json_report(test_list: TestList, options: Option) -> None:
+    # [FUNCTION DOC] Detects and checks the compiler type. For clang, optionally runs the
+    # tests, merges raw profiles and exports JSON according to the need_run, need_merge and
+    # need_export options. For gcc, only runs the tests when requested.
+    # KNOWN ISSUE: the gcc branch never exports; gcov export is handled elsewhere.
     cov_type = detect_compiler_type()
     check_compiler_type(cov_type)
     if cov_type == CompilerType.CLANG:

@@ -1,3 +1,6 @@
+# [MODULE DOC] Runs the OSS test binaries for clang and gcc coverage collection and reports
+# the elapsed time. No import-time side effects.
+
 import os
 import time
 
@@ -8,6 +11,9 @@ from .utils import get_oss_binary_file
 
 
 def clang_run(tests: TestList) -> None:
+    # [FUNCTION DOC] Runs each test under clang coverage, directing each raw
+    # profile to a .profraw file named after the test in the raw profiles folder,
+    # then prints the total time.
     start_time = time.time()
     for test in tests:
         # raw_file
@@ -21,6 +27,8 @@ def clang_run(tests: TestList) -> None:
 
 
 def gcc_run(tests: TestList) -> None:
+    # [FUNCTION DOC] Runs each test binary under gcc coverage (gcda files are produced by the
+    # binaries themselves) and prints the total time.
     start_time = time.time()
     for test in tests:
         # binary file

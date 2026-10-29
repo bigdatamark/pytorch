@@ -1,3 +1,7 @@
+# [MODULE DOC] Initialization for the OSS coverage flow: creates folders, parses command line
+# arguments, discovers the test binaries and scripts, and prints configuration. Defines the
+# set of python tests skipped under clang. No import-time side effects besides constants.
+
 from __future__ import annotations
 
 import argparse
@@ -41,6 +45,10 @@ BLOCKED_PYTHON_TESTS = {
 
 
 def initialization() -> tuple[Option, TestList, list[str]]:
+    # [FUNCTION DOC] Sets up a coverage run: creates the working folders, parses arguments,
+    # cleans old data if requested, builds the test list, determines the folders of interest,
+    # prints settings and removes the previous log file. Returns the options, test list and
+    # interested folders. Side effects: file system changes and console output.
     # create folder if not exists
     create_folders()
     # add arguments
@@ -67,6 +75,8 @@ def initialization() -> tuple[Option, TestList, list[str]]:
 
 
 def add_arguments_oss(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    # [FUNCTION DOC] Adds the OSS specific --run-only option (list of tests to run) to the
+    # parser and returns the parser.
     parser.add_argument(
         "--run-only",
         help="only run certain test(s), for example: atest test_nn.py.",
@@ -80,6 +90,8 @@ def add_arguments_oss(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
 def parse_arguments(
     parser: argparse.ArgumentParser,
 ) -> tuple[Option, list[str] | None, list[str] | None, bool | None]:
+    # [FUNCTION DOC] Parses command line arguments and returns the options object, interested
+    # folders, run-only list and clean flag.
     # parse args
     args = parser.parse_args()
     # get option
@@ -88,6 +100,9 @@ def parse_arguments(
 
 
 def get_test_list_by_type(run_only: list[str] | None, test_type: TestType) -> TestList:
+    # [FUNCTION DOC] Builds the test list for one test type by walking the binary folder and
+    # creating a Test for each file, filtered by the run-only list when given. Walks nested
+    # folders but uses file names only.
     test_list: TestList = []
     binary_folder = get_oss_binary_folder(test_type)
     g = os.walk(binary_folder)
@@ -107,6 +122,8 @@ def get_test_list_by_type(run_only: list[str] | None, test_type: TestType) -> Te
 
 
 def get_test_list(run_only: list[str] | None) -> TestList:
+    # [FUNCTION DOC] Returns the combined list of C++ and python tests to run. Raises an error
+    # (via raise_no_test_found_exception) when no tests are found.
     test_list: TestList = []
     # add c++ test list
     test_list.extend(get_test_list_by_type(run_only, TestType.CPP))
@@ -123,6 +140,7 @@ def get_test_list(run_only: list[str] | None) -> TestList:
 
 
 def empty_list_if_none(arg_interested_folder: list[str] | None) -> list[str]:
+    # [FUNCTION DOC] HELPER: Returns the given list, or an empty list when it is None.
     if arg_interested_folder is None:
         return []
     # if this argument is specified, just return itself
@@ -130,11 +148,16 @@ def empty_list_if_none(arg_interested_folder: list[str] | None) -> list[str]:
 
 
 def gcc_export_init() -> None:
+    # [FUNCTION DOC] HELPER: Recreates the base JSON output folder (removes it, then creates
+    # it). Side effect: deletes existing JSON profile data.
     remove_folder(JSON_FOLDER_BASE_DIR)
     create_folder(JSON_FOLDER_BASE_DIR)
 
 
 def get_python_run_only(args_run_only: list[str] | None) -> list[str]:
+    # [FUNCTION DOC] Returns the python test file names to run: the user's run-only list if
+    # given; otherwise run_test.py for gcc, or for clang all top-level python files in the
+    # test folder except the blocked ones (their intermediate files are too large to merge).
     # if user specifies run-only option
     if args_run_only:
         return args_run_only
@@ -158,6 +181,10 @@ def get_python_run_only(args_run_only: list[str] | None) -> list[str]:
 
 
 def print_init_info() -> None:
+    # [FUNCTION DOC] Prints the pytorch folder, test binary and script folders, compiler type
+    # and llvm tool folder to the log.
+    # KNOWN ISSUE: assumes the compiler type is not None; a None result would fail
+    # on the value.
     print_log("pytorch folder: ", get_pytorch_folder())
     print_log("cpp test binaries folder: ", get_oss_binary_folder(TestType.CPP))
     print_log("python test scripts folder: ", get_oss_binary_folder(TestType.PY))

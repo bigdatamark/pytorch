@@ -1,3 +1,8 @@
+# [MODULE DOC] Command line util (invoked from cmake) that prints the op registration
+# allowlist for custom mobile builds: the sorted transitive closure of root ops over the op
+# dependency graph, or just the root ops when no graph is given. Also provides loaders for the
+# graph and root op YAML files, used by gen_operators_yaml. No import-time side effects.
+
 """
 This util is invoked from cmake to produce the op registration allowlist param
 for `ATen/gen.py` for custom mobile build.
@@ -20,11 +25,16 @@ DepGraph = dict[str, set[str]]
 
 
 def canonical_name(opname: str) -> str:
+    # [FUNCTION DOC] HELPER: Strips the overload name from an operator name (text after the
+    # first dot).
     # Skip the overload name part as it's not supported by code analyzer yet.
     return opname.split(".", 1)[0]
 
 
 def load_op_dep_graph(fname: str) -> DepGraph:
+    # [FUNCTION DOC] Loads the op dependency graph YAML (a list of entries with name and
+    # optional depends list) and returns a mapping of canonical op name to the set of
+    # canonical names it depends on. Raises on missing files or malformed entries.
     with open(fname) as stream:
         result = defaultdict(set)
         for op in yaml.safe_load(stream):
@@ -36,6 +46,8 @@ def load_op_dep_graph(fname: str) -> DepGraph:
 
 
 def load_root_ops(fname: str) -> list[str]:
+    # [FUNCTION DOC] Loads a YAML list of root operator names and returns them as canonical
+    # names (overloads removed), preserving order.
     result = []
     with open(fname) as stream:
         for op in yaml.safe_load(stream):
@@ -48,6 +60,10 @@ def gen_transitive_closure(
     root_ops: list[str],
     train: bool = False,
 ) -> list[str]:
+    # [FUNCTION DOC] Computes all ops reachable from the root ops through the dependency
+    # graph, always including the entries reachable from the special __BASE__ key, and from
+    # __ROOT__ when train is set. Returns the sorted list including the roots. Does not mutate
+    # its inputs.
     result = set(root_ops)
     queue = root_ops.copy()
 
@@ -75,6 +91,8 @@ def gen_transitive_closure(
 
 
 def gen_transitive_closure_str(dep_graph: DepGraph, root_ops: list[str]) -> str:
+    # [FUNCTION DOC] HELPER: Returns the transitive closure (inference mode) as one space
+    # separated string.
     return " ".join(gen_transitive_closure(dep_graph, root_ops))
 
 
