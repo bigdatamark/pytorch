@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Utilities for Inductor loop-tiling analysis. Normalizes the reads and writes of a
+# (fused) scheduler node into common index variables, scores memory accesses by size,
+# finds which variable coalesces each access, and suggests a tiling (split) of a
+# variable that would coalesce otherwise uncoalesced accesses. Main entry points are
+# analyze_memory_coalescing_for_nodes, extract_normalized_read_writes and NodeSplitGetter.
+# Import-time side effects: creates the "loop_tiling" artifact logger.
 import dataclasses
 import itertools
 from collections import Counter, defaultdict
@@ -38,6 +45,11 @@ if TYPE_CHECKING:
 
 
 def solve_for_zero(expr: sympy.Expr) -> sympy.Expr | None:
+    # [FUNCTION DOC] Given an expression with exactly one free symbol, find the constant
+    # value of that symbol that makes it zero (for a modular-indexing term, the value that
+    # makes the base equal the modulus). Returns None for constants, floor-division terms,
+    # or when no constant solution exists. Raises AssertionError if the expression is
+    # non-constant and does not have exactly one free symbol.
     """
     Given an expr with a single free symbol, solve for a constant relation that would make
     this expression 0.
@@ -62,6 +74,12 @@ def solve_for_zero(expr: sympy.Expr) -> sympy.Expr | None:
 
 
 def solve_for_tiling(expr: sympy.Expr) -> sympy.Expr | None:
+    # [FUNCTION DOC] Given an expression with a single free symbol, find a constant tiling
+    # factor that would make the expression coalesced (stride one) in that symbol. Without
+    # modular/floor-div terms it solves the expression equal to one directly. Otherwise
+    # it solves multiplicative terms for zero, approximates modular/floor-div nodes by
+    # plain division for the remaining terms, solves for one, and verifies the result by
+    # substitution. Returns None if there is no single consistent constant solution.
     """
     Giving an expr with a single free symbol, try to find a tiling that would
     make the expression coalesced with respect to that symbol.
@@ -79,6 +97,10 @@ def solve_for_tiling(expr: sympy.Expr) -> sympy.Expr | None:
     free_symbol = next(iter(expr.free_symbols))
 
     def _solve_simple_expr(expr: sympy.Expr) -> sympy.Expr | None:
+        # [FUNCTION DOC] HELPER: Solve the expression equal to one for the enclosing free
+        # symbol. Returns the constant solution, or None if the expression still contains
+        # modular/floor-div nodes, does not have exactly one free symbol, or has no
+        # constant solution.
         if expr.has(ModularIndexing) or expr.has(FloorDiv):
             # the div approximation could not eliminate all ModularIndexing /
             # FloorDiv nodes; we cannot solve this expression
@@ -132,6 +154,9 @@ def solve_for_tiling(expr: sympy.Expr) -> sympy.Expr | None:
         y: sympy.Expr,
         z: sympy.Expr | None = None,
     ) -> sympy.Expr:
+        # [FUNCTION DOC] HELPER: Replacement used to approximate modular-indexing and
+        # floor-div nodes: returns the first argument divided by the second; the optional
+        # third argument is ignored.
         return x / y
 
     # For the purposes of tiling/coalesced access, approximate ModularIndexing and FloorDiv
@@ -162,6 +187,10 @@ def solve_for_tiling(expr: sympy.Expr) -> sympy.Expr | None:
 def find_broadcast_var(
     index: sympy.Expr, var_ranges: dict[sympy.Expr, int]
 ) -> sympy.Expr | None:
+    # [FUNCTION DOC] Find a variable in var_ranges over which the index is a broadcast, i.e.
+    # incrementing it from 0 to 1 (others at 0, non-range symbols at their size hints)
+    # leaves the index value unchanged. Returns the first such variable or None. Division
+    # by zero during substitution is logged and that variable skipped.
     """
     Try to find the variable that this index is broadcast over.
     A broadcast pattern is one where consecutive values of a variable
@@ -197,6 +226,11 @@ def find_broadcast_var(
 def find_coalesced_var(
     index: sympy.Expr, var_ranges: dict[sympy.Expr, int]
 ) -> sympy.Expr | None:
+    # [FUNCTION DOC] Find the variable in var_ranges that coalesces the index (unit stride).
+    # Returns a variable appearing directly as a top-level additive term, else the first
+    # variable whose increments 0->1 and 1->2 each raise the index by exactly one (others
+    # at 0, non-range symbols at size hints). Returns None if none; division by zero is
+    # logged and skipped.
     """
     Try to find the symbol which coalesces this index
     """
@@ -233,6 +267,8 @@ def find_coalesced_var(
 
 
 def has_indirect_access(memory_expr: sympy.Expr) -> bool:
+    # [FUNCTION DOC] Returns True if any free symbol of the expression is an indirect
+    # indexing symbol.
     """
     Check if this memory expression has any indirect indexing.
     """
@@ -241,6 +277,9 @@ def has_indirect_access(memory_expr: sympy.Expr) -> bool:
 
 @dataclasses.dataclass(frozen=True)
 class FusedNormalizedReadsWrites:
+    # [CLASS DOC] Immutable result of normalizing a fused node: the normalized pointwise
+    # index variables, the reduction variables, mappings from normalized read/write index
+    # expressions to the set of buffer names accessed, and the range of each variable.
     """
     Normalized reads and writes for nodes in the same FusedSchedulerNode.
     """
@@ -254,17 +293,23 @@ class FusedNormalizedReadsWrites:
 
 @dataclasses.dataclass(frozen=True)
 class _FusedNodeView:
+    # [CLASS DOC] HELPER: Lightweight stand-in for a fused scheduler node built from a
+    # sequence of nodes, their merged read/writes and iteration group. Provides the
+    # accessors the tiling analysis needs (nodes, buffer names, operation names).
     nodes: Sequence["BaseSchedulerNode"]
     read_writes: ReadWrites
     group: Any
 
     def get_nodes(self) -> Sequence["BaseSchedulerNode"]:
+        # [FUNCTION DOC] HELPER: Returns the wrapped nodes.
         return self.nodes
 
     def get_buffer_names(self) -> OrderedSet[str]:
+        # [FUNCTION DOC] HELPER: Returns the union of buffer names of all wrapped nodes.
         return OrderedSet.union(*(node.get_buffer_names() for node in self.nodes))
 
     def get_operation_names(self) -> OrderedSet[str]:
+        # [FUNCTION DOC] HELPER: Returns the set of operation names of all wrapped nodes.
         return OrderedSet(node.get_name() for node in self.nodes)
 
 
@@ -292,6 +337,13 @@ def get_pw_red_splits(
     red_numel: sympy.Expr,
     none_if_not_divisible: bool = False,
 ) -> tuple[VarsAndRanges, VarsAndRanges] | None:
+    # [FUNCTION DOC] Split a scheduler node's iteration variables and sizes into a
+    # (pointwise vars, ranges) pair and a (reduction vars, ranges) pair relative to the
+    # fused group's pointwise_numel and red_numel. Reduction nodes or nodes whose first
+    # size list already multiplies to pointwise_numel use their own iter/reduce split.
+    # Otherwise the trailing sizes whose product equals red_numel become the reduction
+    # part. If no such suffix exists, returns None when none_if_not_divisible is set,
+    # else the node's own split. Raises AssertionError if sizes do not match the hints.
     # nb: use statically_known_equals here to mimic scheduler.
     # TODO : store type of split/broadcast on fused node itself,
     # instead of re-deriving it.
@@ -337,6 +389,11 @@ def get_pw_red_splits(
 
 
 class NodeSplitGetter:
+    # [CLASS DOC] Computes a (pointwise split, reduction split) of iteration ranges that is
+    # compatible with every SchedulerNode in a fused node. The constructor collects each
+    # node's candidate pw/red splits by length (pw_split_options, red_split_options), the
+    # set of all node sizes, and a reduction split. State: seen_pw_splits caches tried
+    # splits. Key methods: get_node_splits and try_split.
     """
     Finds a Pointwise, Reduction Split that compatible with all nodes in a SchedulerNode.
     """
@@ -345,6 +402,10 @@ class NodeSplitGetter:
         self,
         node: Union["_FusedNodeView", "FusedSchedulerNode", "SchedulerNode"],
     ):
+        # [FUNCTION DOC] Records the node and its pointwise/reduction numel, then, for each
+        # SchedulerNode (iterated in reverse), derives its pw/red split via get_pw_red_splits.
+        # Non-divisible nodes only contribute their raw sizes to all_node_sizes; others
+        # contribute filled-in splits to the option tables and set the reduction split.
         self.node = node
         self.pointwise_numel: sympy.Expr = node.group[1][0]
         self.red_numel: sympy.Expr = node.group[1][1]
@@ -391,6 +452,11 @@ class NodeSplitGetter:
         self.seen_pw_splits: OrderedSet[Split] = OrderedSet()
 
     def get_node_splits(self) -> tuple[Split, Split]:
+        # [FUNCTION DOC] Returns a (pointwise split, reduction split) compatible with all
+        # nodes. If all nodes share one size, returns it; if there are no options, returns
+        # the unsplit (pointwise_numel, red_numel). Otherwise searches from the longest total
+        # split downward, trying every pw/red option pair via try_split and progressively
+        # adding options made by merging adjacent entries. Falls back to the unsplit default.
         """
         Get a compatible pointwise, reduction split of the node
         """
@@ -407,6 +473,9 @@ class NodeSplitGetter:
         def add_combined_split_options(
             split_options: dict[int, OrderedSet[Split]], curr_length: int
         ) -> None:
+            # [FUNCTION DOC] HELPER: For every split of the given length, add all splits
+            # obtained by merging one adjacent pair of entries into their product, keyed by
+            # the new length. Mutates split_options in place.
             for split in split_options[curr_length]:
                 for i in range(len(split) - 1):
                     new_split = tuple(
@@ -433,6 +502,12 @@ class NodeSplitGetter:
         return ((self.pointwise_numel,), (self.red_numel,))
 
     def try_split(self, pw: Split, red: Split) -> tuple[Split, Split] | None:
+        # [FUNCTION DOC] Check whether the (pw, red) split can be applied to every known
+        # node size. Returns None if already tried (recorded in seen_pw_splits) or if any
+        # node cannot be split this way. If splitting forced a variable to be divided,
+        # recursively tries the larger induced pointwise split and returns that result if
+        # compatible; otherwise returns the input (pw, red). Raises AssertionError on
+        # unexpected getter counts.
         """
         See if this split is compatible, and potentially returning a longer split
         than the input.
@@ -475,6 +550,12 @@ def apply_var_mapping(
     new_ranges: list[list[sympy.Expr]],
     return_getters_groups: list[list[Callable[[list[sympy.Expr]], sympy.Expr]]],
 ) -> dict[sympy.Symbol, sympy.Expr]:
+    # [FUNCTION DOC] Build a mapping from a node's original iteration/reduction variables
+    # to expressions in the normalized variables. Creates flattened variables for all new
+    # ranges, applies the getter callables to express original vars in flat vars, then
+    # rewrites flat vars as normalized var times the product of the inner ranges. Returns
+    # an empty mapping if there are no variables. Raises AssertionError on inconsistent
+    # lengths; a missing reduction group (size one reduction) is skipped.
     """Maps original variables to expressions using normalized variables."""
 
     # the output of split_iteration_range is a new_ranges, return_getters_groups
@@ -547,6 +628,13 @@ def apply_var_mapping(
 def extract_normalized_read_writes(
     node: Union["_FusedNodeView", "FusedSchedulerNode", "SchedulerNode"],
 ) -> FusedNormalizedReadsWrites | None:
+    # [FUNCTION DOC] Normalize the reads and writes of a fused node onto shared index
+    # variables. Determines which buffers are inputs/outputs (excluding buffers removable
+    # through fusion), picks a compatible split via NodeSplitGetter, and for each
+    # SchedulerNode remaps its read/write index expressions (Identity wrappers removed)
+    # to the normalized variables, merging buffer names per expression. Finally simplifies
+    # with the variable ranges. Returns None if the ranges cannot be split under dynamic
+    # shapes; raises AssertionError if the split fails with static shapes. Logs the result.
     """Extracts index variables, reduce variables, read/write expressions, and variable ranges from a fused node."""
     reads: dict[sympy.Expr, OrderedSet[str]] = defaultdict(OrderedSet)
     writes: dict[sympy.Expr, OrderedSet[str]] = defaultdict(OrderedSet)
@@ -635,6 +723,8 @@ def extract_normalized_read_writes(
         # We create Identity sympy.Functions to prevent expansion to int64,
         # unwrap for tiling analysis.
         def remove_identity(expr: sympy.Expr) -> sympy.Expr:
+            # [FUNCTION DOC] HELPER: Replace every Identity wrapper in the expression with
+            # its argument and return the result.
             return expr.replace(Identity, lambda x: x)
 
         n_reads_new = {
@@ -672,6 +762,8 @@ def extract_normalized_read_writes(
 def get_score(
     addr: sympy.Expr, var_ranges: dict[sympy.Symbol, int], buf_names: OrderedSet[str]
 ) -> int:
+    # [FUNCTION DOC] Score an address expression by the size-hint of the product of the
+    # ranges of its non-indirect free variables found in var_ranges. buf_names is unused.
     """
     Score addr according to its approximate size.
     """
@@ -688,6 +780,8 @@ def get_score(
 
 
 def try_get_buf_size(buf_name: str) -> int | None:
+    # [FUNCTION DOC] Returns the size-hint of the number of elements of the named graph
+    # buffer, or None if the graph has no such buffer.
     buf = V.graph.try_get_buffer(buf_name)
     if not buf:
         return None
@@ -695,6 +789,8 @@ def try_get_buf_size(buf_name: str) -> int | None:
 
 
 def get_hint(v: sympy.Expr | int) -> int:
+    # [FUNCTION DOC] Returns an integer unchanged, or the optimization size-hint of a
+    # symbolic expression from the current graph's size variables.
     if isinstance(v, int):
         return v
     else:
@@ -703,6 +799,8 @@ def get_hint(v: sympy.Expr | int) -> int:
 
 @dataclasses.dataclass(frozen=True)
 class VarTiling:
+    # [CLASS DOC] Immutable suggestion to tile variable var by tiling_factor, with a score
+    # estimating the extra coalesced memory traffic gained.
     """
     Tiling of a var by `tiling_factor` that yields additional coalesced mem accesses by `benefit_score`
     """
@@ -714,6 +812,9 @@ class VarTiling:
 
 @dataclasses.dataclass(frozen=True)
 class CoalesceVarAnalysis:
+    # [CLASS DOC] Immutable result of memory coalescing analysis: score per coalescing
+    # variable, score per uncoalesced address expression, the normalized reads/writes
+    # analyzed, and an optional suggested VarTiling (None if no tiling helps).
     # Var -> Memory Score - not strictly the amount of memory
     # because we multiply writes x2
     # TODO: separate into dataclass that holds mem, dtype, is_write
@@ -729,6 +830,14 @@ class CoalesceVarAnalysis:
 def _analyze_memory_coalescing(
     fused_node: Union["_FusedNodeView", "FusedSchedulerNode", "SchedulerNode"],
 ) -> CoalesceVarAnalysis | None:
+    # [FUNCTION DOC] HELPER: Core of the coalescing analysis. Normalizes reads/writes
+    # (returns None if that fails), then scores each access by buffer bytes (writes count
+    # double) and attributes it to a coalescing or broadcast variable, or marks it
+    # uncoalesced (indirect accesses always are). For pointwise-only kernels, accesses
+    # already coalesced along the innermost variable are credited to it. For uncoalesced
+    # addresses, solves per-variable tiling factors (must be constant integers below the
+    # range and leave blocks larger than 8) and picks the highest scoring one as
+    # suggested_split. Reads graph state only.
     """
     Implementation for BaseSchedulerNode.get_coalesce_analysis().
     Call that node method so loop-transform cache invalidation is honored.
@@ -921,6 +1030,11 @@ def _analyze_memory_coalescing(
 def analyze_memory_coalescing_for_nodes(
     nodes: Sequence["BaseSchedulerNode"],
 ) -> CoalesceVarAnalysis | None:
+    # [FUNCTION DOC] Coalescing analysis for a list of scheduler nodes. Returns None for an
+    # empty list or if any node is not a SchedulerNode/FusedSchedulerNode. A single node
+    # uses its own cached analysis; a list matching a known fused node in the scheduler
+    # uses that fused node's analysis; otherwise analyzes a temporary view of the nodes
+    # with merged read/writes and the group of a reduction node if present.
     if not nodes:
         return None
 

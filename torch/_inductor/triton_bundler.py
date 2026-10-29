@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Bundles compiled Triton kernel artifacts (cubin/json/ttir etc. files) and statically
+# launchable autotuners into a serializable structure stored in the FX graph cache, and
+# restores them to the local Triton cache directory on a cache read. Main contents: small
+# frozen dataclasses describing entries/artifacts/bundles and the TritonBundler class
+# with class-level state. Import-time side effects: creates a module logger only.
 import copy
 import dataclasses
 import logging
@@ -20,6 +26,8 @@ log = logging.getLogger(__name__)
 
 @dataclasses.dataclass(frozen=True)
 class TritonBundleEntry:
+    # [CLASS DOC] Immutable record of a compiled Triton kernel noted for later bundling:
+    # its Triton hash, device index and the Triton cache directory containing it.
     """
     When we have compiled a triton kernel, we take note of that kernel by
     its triton generated hash, its device, and where this kernel is located.
@@ -34,6 +42,8 @@ class TritonBundleEntry:
 
 @dataclasses.dataclass(frozen=True)
 class TritonKernelArtifact:
+    # [CLASS DOC] Immutable single kernel file: its file name and raw bytes (payload is
+    # hidden from repr).
     """
     Artifact for an individual kernel converted to bytes.
     Bytes could be a cubin, json, ttir, or ttgir.
@@ -45,6 +55,8 @@ class TritonKernelArtifact:
 
 @dataclasses.dataclass(frozen=True)
 class StaticallyLaunchedAutotuner:
+    # [CLASS DOC] Immutable holder of a picklable copy of a CachingAutotuner with its
+    # cache key and kernel name, saved directly in the cache.
     """
     Represents a statically compiled CachingAutotuner object that we can
     save directly in the cache. A CachingAutotuner is made up of a list of
@@ -60,6 +72,8 @@ class StaticallyLaunchedAutotuner:
 
 @dataclasses.dataclass(frozen=True)
 class TritonKernelArtifacts:
+    # [CLASS DOC] Immutable collection of all file artifacts of one kernel (hash, device,
+    # list of TritonKernelArtifact).
     """
     Collection of artifacts for a particular kernel.
     """
@@ -71,6 +85,8 @@ class TritonKernelArtifacts:
 
 @dataclasses.dataclass(frozen=True)
 class TritonBundlerMetadata:
+    # [CLASS DOC] Immutable instrumentation info: names of cached kernels and of
+    # statically launched kernels handled by a collect or read_and_emit call.
     """
     Metadata used for instrumentation
     """
@@ -81,6 +97,8 @@ class TritonBundlerMetadata:
 
 @dataclasses.dataclass(frozen=True)
 class TritonBundle:
+    # [CLASS DOC] Immutable serializable bundle stored in the FX graph cache: the kernel
+    # artifacts and the static autotuners.
     """
     Serializable bundle to save into FXGraphCache
     """
@@ -90,6 +108,12 @@ class TritonBundle:
 
 
 class TritonBundler:
+    # [CLASS DOC] Never instantiated; all state and methods are class-level. State:
+    # _entries (noted compiled kernels, None when inactive), _static_autotuners and
+    # _winners (kernel hashes of winning autotune configs). _REPLACE_BYTES is a sentinel
+    # substituted for the cache directory path inside json files. Lifecycle:
+    # begin_compile, put/put_winner/put_static_autotuner, collect (which ends the compile),
+    # and read_and_emit on cache reads. State is process-global and not thread-safe.
     """
     Lightweight Triton Kernel bundler that notes each time we compile a triton
     kernel. When collect is called, converts all the previously noted kernels and
@@ -115,6 +139,9 @@ class TritonBundler:
 
     @staticmethod
     def is_enabled() -> bool:
+        # [FUNCTION DOC] Returns whether Triton bundling is on: False if caches are force
+        # disabled; otherwise the explicit config setting if not None; otherwise False
+        # outside fbcode, and the justknob value inside fbcode.
         from torch._inductor import config
 
         if config.force_disable_caches:
@@ -132,6 +159,9 @@ class TritonBundler:
 
     @classmethod
     def begin_compile(cls) -> None:
+        # [FUNCTION DOC] Starts a new bundle if bundling is enabled: resets entries,
+        # static autotuners and winners to empty. Raises AssertionError if a bundle is
+        # already active. Does nothing when disabled.
         """
         Initializes the TritonBundler.
         The current TritonBundler bundle is finalized by TritonBundler.collect.
@@ -150,6 +180,8 @@ class TritonBundler:
 
     @classmethod
     def end_compile(cls) -> None:
+        # [FUNCTION DOC] Discards the current bundle state (entries, static autotuners,
+        # winners) by resetting them to None.
         """
         Finalizes the TritonBundler. If collect is not yet called, it
         discards the current bundle.
@@ -161,6 +193,8 @@ class TritonBundler:
 
     @classmethod
     def put(cls, kernel_hash: str, device: int) -> None:
+        # [FUNCTION DOC] Records a compiled kernel (hash, device and that device's Triton
+        # cache directory) if a bundle is active; otherwise does nothing.
         """
         Lazily observes that we have seen a Triton kernel compilation. Remembers
         it for when collect is later called.
@@ -172,6 +206,8 @@ class TritonBundler:
 
     @classmethod
     def put_winner(cls, kernel_hash: str) -> None:
+        # [FUNCTION DOC] Adds the hash to the set of winning autotune kernels if a bundle
+        # is active; no effect otherwise.
         """
         Marks a kernel hash as a winning autotuning config. Only winning
         kernels are included in the bundle by collect(). If no winners are
@@ -183,6 +219,11 @@ class TritonBundler:
 
     @classmethod
     def put_static_autotuner(cls, key: str, kernel: "CachingAutotuner") -> None:  # type: ignore[name-defined] # noqa: F821
+        # [FUNCTION DOC] Saves a picklable deep copy of a CachingAutotuner under the given
+        # key when a bundle is active. Temporarily strips unpicklable values from the
+        # original, copies it, prepares the copy for caching (reload hook cleared), appends
+        # it, then restores the original. Raises AssertionError if the static launcher
+        # config is off (even when no bundle is active).
         from torch._inductor import config
 
         if not config.use_static_triton_launcher:
@@ -210,6 +251,8 @@ class TritonBundler:
     def collect_static_autotuners(
         cls,
     ) -> tuple[list[StaticallyLaunchedAutotuner], list[str]]:
+        # [FUNCTION DOC] Returns the recorded static autotuners and their kernel names
+        # (two empty lists if none). Logs and bumps a save counter when non-empty.
         if not cls._static_autotuners:
             return [], []
         else:
@@ -225,6 +268,11 @@ class TritonBundler:
     def load_autotuners(
         cls, static_autotuners: list[StaticallyLaunchedAutotuner] | None
     ) -> list[str]:
+        # [FUNCTION DOC] Registers saved static autotuners in the compiled-kernel cache.
+        # For each, reloads the cubin paths of its compile results (RuntimeError logs a
+        # warning and skips it), wraps the kernel in a StaticAutotunerFuture stored under
+        # its cache key, and counts it. Returns the names of loaded kernels (empty for no
+        # input). Mutates CompiledTritonKernels._cache.
         """
         Load statically launchable CachingAutotuners into async_compile.CompiledTritonKernels
         cache.
@@ -265,6 +313,15 @@ class TritonBundler:
     def collect(
         cls,
     ) -> tuple[TritonBundle, TritonBundlerMetadata | None]:
+        # [FUNCTION DOC] Called on cache write. If disabled, ends the compile and returns an
+        # empty bundle with no metadata. Otherwise, for each noted entry (skipping non-winners
+        # when any winners exist, and missing directories) reads every file in the kernel
+        # directory; for json files the directory path is replaced by a sentinel. Files that
+        # fail to read are skipped with a debug log. Kernel names come from binary-extension
+        # files. Static autotuners are included if the static launcher config is on. Ends the
+        # compile and returns the bundle plus metadata (None if no bundle was active).
+        # KNOWN ISSUE: the AssertionErrors for a non-regular file or a pre-existing sentinel
+        # are raised inside a broad exception handler, so they are only logged at debug level.
         """
         This is the main function called when a cache write happens. This function
         converts all the previously remembered kernels into bundled format so that
@@ -355,6 +412,14 @@ class TritonBundler:
 
     @staticmethod
     def read_and_emit(bundle: TritonBundle) -> TritonBundlerMetadata | None:
+        # [FUNCTION DOC] Called on cache read. Returns None if disabled. For each kernel
+        # artifact set, skips it if its target directory already exists and is non-empty;
+        # otherwise writes the files into a uniquely named temporary directory (restoring
+        # the sentinel in json files to the real directory path) and moves it into place
+        # (under a file lock with replace on Windows, atomic rename elsewhere, warning on
+        # OSError). Then loads static autotuners if configured. Returns metadata with the
+        # emitted kernel names and static kernel names. Side effects: creates directories
+        # and files, updates counters.
         """
         This is the main function called when a cache read happens. This function
         converts the bundled format back into individual files and writes them
