@@ -1,5 +1,14 @@
 # mypy: ignore-errors
 
+# [MODULE DOC]
+# Converts the standard OpInfo database (op_db) into an NJT (nested jagged tensor) compatible
+# database, njt_op_db. Contains ExtraOpData metadata and the extra_op_data table (view ops,
+# dim-related arg names), sample input generators for NJTs (unary, binary with broadcasting,
+# reductions, and many op-specific ones), reference implementations based on unbinding the NJT
+# into components, the njt_sample_inputs and njt_references override tables, and
+# translate_opinfo. Importing builds njt_op_db by copying every op_db entry (import-time work,
+# no mutation of the original entries).
+
 import math
 from copy import copy
 from dataclasses import dataclass
@@ -19,6 +28,11 @@ from torch.utils._pytree import tree_flatten, tree_map
 
 @dataclass
 class ExtraOpData:
+    # [CLASS DOC]
+    # Dataclass of NJT-specific metadata attached to each translated OpInfo. State: is_view
+    # (whether the op returns a view) and dim_args (a list with one entry per op overload, each
+    # a list of dim-related argument names, a trailing marker of three dots meaning a
+    # multi-dim argument; None if the op takes no dim args). Key method: get_dim_argnames.
     """
     Contains info on top of the typical OpInfo data that is useful for NJT test generation.
 
@@ -47,6 +61,11 @@ class ExtraOpData:
     # If the op doesn't support dim-related args at all OR this op only has overloads
     # with multiple dim args (e.g. transpose()), then this returns (None, None).
     def get_dim_argnames(self) -> tuple[str | None, str | None]:
+        # [FUNCTION DOC]
+        # Returns a pair (single dim argument name, dim list argument name), each possibly None.
+        # Only overloads with exactly one dim argument are considered. A name ending in the
+        # multi-dim marker sets the list name (marker stripped) and also the single name if not
+        # yet set; a plain name sets the single name. Returns (None, None) if dim_args is None.
         if self.dim_args is None:
             return (None, None)
 
@@ -210,10 +229,15 @@ extra_op_data = {
 
 # random integer used for sizes
 def _rnd():
+    # [FUNCTION DOC]
+    # HELPER: Returns a random Python int in the range 3 to 7 inclusive (uses global RNG).
     return torch.randint(3, 8, ()).item()
 
 
 def _raggedness_matches(nt1, nt2):
+    # [FUNCTION DOC]
+    # HELPER: True when both tensors are nested and share the same ragged dim index and the
+    # same size symbol at that dim (i.e. the same ragged structure).
     return (
         nt1.is_nested
         and nt2.is_nested
@@ -225,12 +249,18 @@ def _raggedness_matches(nt1, nt2):
 # Helper function to avoid reusing the exact same tensor / NJT across SampleInputs,
 # as this causes autograd problems.
 def _clone(t):
+    # [FUNCTION DOC]
+    # HELPER: Returns a detached copy of t that keeps the original requires_grad flag, so
+    # samples do not share autograd history.
     requires_grad = t.requires_grad
     return t.detach().clone().requires_grad_(requires_grad)
 
 
 # Helper function to update a sample with new kwargs / name
 def _update_sample(sample, new_kwargs):
+    # [FUNCTION DOC]
+    # HELPER: Returns a new SampleInput with a cloned input, same args, kwargs merged with
+    # new_kwargs (new values win), and a name extended with the added key=value pairs.
     all_kwargs = dict(sample.kwargs)
     all_kwargs.update(new_kwargs)
     full_name = ", ".join([sample.name, *(f"{k}={v}" for (k, v) in new_kwargs.items())])
@@ -248,6 +278,11 @@ def _update_sample(sample, new_kwargs):
 def random_nt_from_dims(
     dims, device=None, dtype=None, layout=torch.strided, requires_grad=False
 ):
+    # [FUNCTION DOC]
+    # Builds a nested tensor with batch size dims[0] whose components are random normal tensors
+    # shaped by the remaining dims, where a None entry means a random size (3 to 7) chosen
+    # independently per component. Takes device, dtype, layout (strided or jagged) and
+    # requires_grad and returns the nested tensor.
     sizes = [[d if d is not None else _rnd() for d in dims[1:]] for d in range(dims[0])]
     return torch.nested.nested_tensor(
         [torch.randn(*size) for size in sizes],
@@ -261,6 +296,10 @@ def random_nt_from_dims(
 # Helper function to get a reasonable string representation of an NJT for use in
 # SampleInput names.
 def _describe_njt(njt) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns a short description string of an NJT: its dimensionality, whether it is
+    # contiguous (with suffix for holes or transposed ragged dim), and whether the max seqlen
+    # cache is present. Used for sample names.
     contig_type = "_contig" if njt.is_contiguous() else "_noncontig"
     if njt._lengths is not None and njt._offsets is not None:
         contig_type += "_holes"
@@ -276,6 +315,8 @@ def _describe_njt(njt) -> str:
 
 # Helper function to get a reasonable string representation of a given dim wrt an NJT.
 def _describe_dim(njt, dim):
+    # [FUNCTION DOC]
+    # HELPER: Classifies a dim of an NJT as batch_dim, ragged_dim or normal_dim for sample names.
     if dim == 0:
         return "batch_dim"
     elif dim == njt._ragged_idx:
@@ -285,6 +326,11 @@ def _describe_dim(njt, dim):
 
 # Helper function for generating a comprehensive set of NJT sample inputs.
 def _sample_njts(device, dtype, requires_grad=False, dims=None):
+    # [FUNCTION DOC]
+    # HELPER: Generator of jagged NJTs for each requested dimensionality (default 2, 3, 4; a
+    # single int is accepted). For each dim yields: a contiguous NJT with cached seqlen info, a
+    # contiguous one rebuilt without the cache, a transposed non-contiguous one (dim above 2
+    # only), and a non-contiguous one with holes (lengths shorter than offsets differences).
     if dims is None:
         dims = [2, 3, 4]
     if not isinstance(dims, (list, tuple)):
@@ -330,6 +376,15 @@ def _sample_njts(device, dtype, requires_grad=False, dims=None):
 # This reference unbinds the input NJT and invokes the op on each of the components,
 # optionally wrapping the result in an NJT.
 def unbind_reference(op, sample, wrap_output_as_njt=True):
+    # [FUNCTION DOC]
+    # Reference result for op on a sample: for each batch component, slices every tensor that
+    # shares the first NJT's ragged structure (or has a batch dim marker), converts dim-related
+    # kwargs from outer to inner dim space, special-cases index_put indices, and calls the op.
+    # Returns a list of component results, or (when wrap_output_as_njt) a jagged NJT, or a
+    # list/tuple of NJTs when the op returns multiple outputs. Raises AssertionError if the
+    # number of returns differs between components.
+    # KNOWN ISSUE: kwargs are only searched for NJTs when slicing, not when locating the
+    # reference NJT (see the TODO in the code).
     # first NJT in the arglist determines expected ragged structure
     nt_inp = (
         sample.input
@@ -342,6 +397,10 @@ def unbind_reference(op, sample, wrap_output_as_njt=True):
     for i in range(nt_inp.shape[0]):
 
         def _slice_input(t, i=i, inp=nt_inp):
+            # [FUNCTION DOC]
+            # HELPER: Returns the i-th component of t if it is an NJT with the same ragged
+            # structure as inp, or the slice along its batch dim marker (index 0 if that dim has
+            # size 1); any other value is returned unchanged.
             # any NJT with the same ragged structure as the input should
             # be sliced to pass to the reference
             if isinstance(t, torch.Tensor) and _raggedness_matches(t, inp):
@@ -429,6 +488,11 @@ def unbind_reference(op, sample, wrap_output_as_njt=True):
 
 # Computes the reference value for a non-reduction unary op with dim-wise application.
 def unary_dimwise_reference(op, sample, batchwise_reference=None):
+    # [FUNCTION DOC]
+    # Reference for non-reduction unary ops applied along one dim. Requires the op to have a
+    # single non-list dim argument. If the sample operates over the batch dim (0), calls
+    # batchwise_reference; otherwise falls back to the unbind reference. Raises AssertionError
+    # if the op has no suitable dim arg or batchwise_reference is needed but missing.
     # extract info about the dim args this op supports
     if op._extra_op_data.dim_args is None:
         raise AssertionError("Expected op._extra_op_data.dim_args to not be None")
@@ -448,6 +512,13 @@ def unary_dimwise_reference(op, sample, batchwise_reference=None):
 
 # Computes the reference value for a reduction op.
 def reduction_reference(op, sample):
+    # [FUNCTION DOC]
+    # Reference for reductions over an NJT. No dim: reduce the values buffer. Dims covering both
+    # batch and ragged: reduce the values buffer with dims converted to the inner space (and
+    # unsqueeze outputs if keepdim). Ragged but not batch: run the unbind reference and stack
+    # the component results (per output for multi-output ops). Otherwise: unbind reference.
+    # Raises AssertionError for a non-nested input, an op without a single dim argument, or a
+    # reduction over only the batch dim.
     if not sample.input.is_nested:
         raise AssertionError("Expected sample.input.is_nested to be True")
 
@@ -522,6 +593,9 @@ def reduction_reference(op, sample):
 def sample_inputs_elementwise_njt_unary(
     op_info, device, dtype, requires_grad, op_kwargs=None, **kwargs
 ):
+    # [FUNCTION DOC]
+    # Generator of unary elementwise samples: one per NJT from the standard NJT set (2D to 4D),
+    # passing op_kwargs as the op's keyword arguments and naming each by its NJT description.
     if not op_kwargs:
         op_kwargs = {}
 
@@ -534,6 +608,12 @@ def sample_inputs_elementwise_njt_unary(
 def sample_inputs_elementwise_njt_binary(
     op_info, device, dtype, requires_grad, op_kwargs=None, **kwargs
 ):
+    # [FUNCTION DOC]
+    # Generator of binary elementwise samples. For each NJT: (NT, NT) with a random like tensor,
+    # and both operand orders of NT with dense tensors broadcasting over the ragged dim, all
+    # ones, normal trailing dims (if any), and a scalar. Dense tensors get a batch dim marker
+    # used by the unbind reference. Finally yields a mixed broadcasting pair (B, j, 1) with
+    # (B, 1, D).
     if not op_kwargs:
         op_kwargs = {}
 
@@ -685,6 +765,14 @@ def sample_inputs_njt_reduction(
     op_kwargs=None,
     **kwargs,
 ):
+    # [FUNCTION DOC]
+    # Generator of reduction samples over NJTs (2D to 4D), for keepdim False and True when
+    # supported. Per NJT yields single-dim reductions over every non-batch dim; if the op
+    # takes a dim list, also batch+ragged, batch+ragged+another dim, two normal dims (4D+,
+    # ragged index 1) and all dims; and finally a full reduction with no dim. Raises
+    # AssertionError if the op has no dim args.
+    # KNOWN ISSUE: the final full-reduction sample name uses the loop variable keepdim from the
+    # last iteration, so it reports a keepdim value that is not passed to the op.
     if not op_kwargs:
         op_kwargs = {}
 
@@ -783,7 +871,12 @@ def sample_inputs_njt_reduction(
 
 
 def unsupported_sample_inputs_func(op_name):
+    # [FUNCTION DOC]
+    # Returns a sample inputs function for an op without NJT support; calling it always raises
+    # RuntimeError naming the op and pointing to this file.
     def _f(op_info, device, dtype, requires_grad, op_name=op_name, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Raises RuntimeError saying the op does not support NJT.
         raise RuntimeError(
             f"OpInfo for {op_name} does not support NJT. Support can be added by modifying "
             "torch/testing/_internal/opinfo/definitions/nested.py."
@@ -793,7 +886,12 @@ def unsupported_sample_inputs_func(op_name):
 
 
 def unsupported_reference(op_name):
+    # [FUNCTION DOC]
+    # Returns a reference function for an op without an NJT reference; calling it always raises
+    # RuntimeError naming the op and pointing to this file.
     def _f(op, sample):
+        # [FUNCTION DOC]
+        # HELPER: Raises RuntimeError saying the op defines no ref function.
         raise RuntimeError(
             f"OpInfo for {op_name} does not define a ref() function. Support can be added by "
             "modifying torch/testing/_internal/opinfo/definitions/nested.py."
@@ -806,6 +904,11 @@ def unsupported_reference(op_name):
 def sample_inputs_unary_dimwise(
     op_info, device, dtype, requires_grad, op_kwargs=None, **kwargs
 ):
+    # [FUNCTION DOC]
+    # Generator of samples for ops with one dim argument: for each NJT (2D to 4D) and every dim
+    # including batch and ragged, yields the NJT with that dim passed under the op's dim
+    # argument name plus op_kwargs. Raises AssertionError if the op lacks extra data, has no
+    # single dim argument, or has a dim list argument.
     if op_kwargs is None:
         op_kwargs = {}
 
@@ -832,6 +935,10 @@ def sample_inputs_unary_dimwise(
 
 
 def batchwise_reference_chunk(op, sample):
+    # [FUNCTION DOC]
+    # Reference for chunk over the batch dim: splits the unbound components into groups of
+    # ceil(B / chunks) with a smaller final group, and returns a list of jagged NJTs, one per
+    # group.
     # reference for chunk() over dim=0
     B = sample.input.size(0)
     num_chunks = sample.kwargs["chunks"]
@@ -855,35 +962,51 @@ def batchwise_reference_chunk(op, sample):
 
 
 def batchwise_reference_narrow(op, sample):
+    # [FUNCTION DOC]
+    # Placeholder batch-dim reference for narrow; always raises NotImplementedError.
     # TODO: write this!
     raise NotImplementedError
 
 
 def batchwise_reference_select(op, sample):
+    # [FUNCTION DOC]
+    # Reference for select over the batch dim: returns the component at the sample's index.
     # reference for select() over dim=0
     return sample.input.unbind()[sample.kwargs["index"]]
 
 
 def batchwise_reference_split(op, sample):
+    # [FUNCTION DOC]
+    # Placeholder batch-dim reference for split; always raises NotImplementedError.
     # TODO: write this!
     raise NotImplementedError
 
 
 def batchwise_reference_split_with_sizes(op, sample):
+    # [FUNCTION DOC]
+    # Placeholder batch-dim reference for split_with_sizes; always raises NotImplementedError.
     # TODO: write this!
     raise NotImplementedError
 
 
 def batchwise_reference_unflatten(op, sample):
+    # [FUNCTION DOC]
+    # Placeholder batch-dim reference for unflatten; always raises NotImplementedError.
     # TODO: write this!
     raise NotImplementedError
 
 
 def batchwise_reference_unsqueeze(op, sample):
+    # [FUNCTION DOC]
+    # Batch-dim reference for unsqueeze; always raises ValueError since unsqueeze is not meant
+    # to operate on the batch dim.
     raise ValueError("unsqueeze() is not intended to operate on the batch dim")
 
 
 def sample_inputs_clone(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of clone samples: the standard NJT set, then a non-contiguous NJT with holes
+    # cloned with each of contiguous_format and preserve_format.
     # non-contiguous NJTs
     for njt in _sample_njts(
         device=device, dtype=dtype, requires_grad=requires_grad, dims=[2, 3, 4]
@@ -910,6 +1033,8 @@ def sample_inputs_clone(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_fill(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of fill samples: unary elementwise NJT samples with the scalar fill value 42.
     # scalar case
     unary_func = partial(sample_inputs_elementwise_njt_unary, op_kwargs={"value": 42.0})
     yield from unary_func(op_info, device, dtype, requires_grad)
@@ -918,18 +1043,32 @@ def sample_inputs_fill(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_mvl_gamma(p):
+    # [FUNCTION DOC]
+    # Returns a unary elementwise sample generator that passes p to the op.
+    # KNOWN ISSUE: the njt_sample_inputs table calls this with p fixed to 1 for every
+    # mvlgamma variant (p 1, 3, 5) instead of the loop value.
     return partial(sample_inputs_elementwise_njt_unary, op_kwargs={"p": p})
 
 
 def sample_inputs_polygamma_n(n):
+    # [FUNCTION DOC]
+    # Returns a unary elementwise sample generator that passes n to the op.
     return partial(sample_inputs_elementwise_njt_unary, op_kwargs={"n": n})
 
 
 def sample_inputs_special_polygamma_n(n):
+    # [FUNCTION DOC]
+    # Returns a unary elementwise sample generator that passes n to the special polygamma op.
     return partial(sample_inputs_elementwise_njt_unary, op_kwargs={"n": n})
 
 
 def sample_inputs_to(op_info, device, dtype, requires_grad, op_kwargs=None, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of dtype/device conversion samples for each NJT (2D to 4D): one sample per
+    # target dtype among float32, half, double other than the input dtype, and for CUDA devices
+    # a transfer to cpu.
+    # KNOWN ISSUE: the dtype conversion samples pass the input dtype (not other_dtype) as the
+    # target, so they convert to the same dtype while being named as a conversion.
     for njt in _sample_njts(
         device=device,
         dtype=dtype,
@@ -953,6 +1092,9 @@ def sample_inputs_to(op_info, device, dtype, requires_grad, op_kwargs=None, **kw
 
 
 def sample_inputs_bmm(op_info, device, dtype, requires_grad, op_kwargs=None, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of bmm samples: for 3D NJTs whose ragged dim is 1, multiplies by a random dense
+    # (B, D, D+2) matrix passed as mat2 (with a batch dim marker for the unbind reference).
     for njt_3d in _sample_njts(
         device=device, dtype=dtype, requires_grad=requires_grad, dims=[3]
     ):
@@ -975,6 +1117,10 @@ def sample_inputs_bmm(op_info, device, dtype, requires_grad, op_kwargs=None, **k
 
 
 def reference_bmm(op, sample):
+    # [FUNCTION DOC]
+    # Reference for bmm: copies the op and sample, swaps the op for matmul (bmm needs 3D inputs
+    # but unbinding removes a dim), renames the mat2 kwarg to other, and returns the unbind
+    # reference.
     # unbind reduces a dim and bmm requires 3D, so use matmul as the reference
     matmul_op = copy(op)
     matmul_op.op = torch.matmul
@@ -987,6 +1133,9 @@ def reference_bmm(op, sample):
 
 
 def sample_inputs_chunk(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of chunk samples built from the dimwise samples: 3 chunks for the ragged dim,
+    # and for other dims chunk counts 1, D//2, D-1 and D where D is the size of that dim.
     for sample_input in sample_inputs_unary_dimwise(
         op_info, device, dtype, requires_grad, **kwargs
     ):
@@ -1003,6 +1152,11 @@ def sample_inputs_chunk(op_info, device, dtype, requires_grad, **kwargs):
 def sample_inputs_matmul(
     op_info, device, dtype, requires_grad, op_kwargs=None, **kwargs
 ):
+    # [FUNCTION DOC]
+    # Generator of matmul samples: the bmm samples with mat2 renamed to other; 3D NJT times 2D
+    # dense; 4D NJT times 2D dense; dense (B, F, E) times NJT (B, E, j) as the first operand;
+    # and NJT (B, E, j) times a contiguous NJT (B, j, F) giving a dense result. Only layouts
+    # with the matching ragged index are used.
     # also run bmm samples through
     for sample_input in sample_inputs_bmm(op_info, device, dtype, requires_grad):
         # change arg name from mat2 -> other
@@ -1095,6 +1249,9 @@ def sample_inputs_matmul(
 def sample_inputs_masked_select(
     op_info, device, dtype, requires_grad, op_kwargs=None, **kwargs
 ):
+    # [FUNCTION DOC]
+    # Generator of masked_select samples: for each 2D NJT, a boolean mask of the same ragged
+    # shape (true where a random normal value is negative).
     for njt in _sample_njts(
         device=device, dtype=dtype, requires_grad=requires_grad, dims=[2]
     ):
@@ -1106,6 +1263,9 @@ def sample_inputs_masked_select(
 
 
 def sample_inputs_narrow(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of narrow samples built from the dimwise samples: start 1, length 2 for the
+    # ragged dim; for other dims several (start, length) pairs derived from the dim size D.
     for sample_input in sample_inputs_unary_dimwise(
         op_info, device, dtype, requires_grad, **kwargs
     ):
@@ -1122,6 +1282,10 @@ def sample_inputs_narrow(op_info, device, dtype, requires_grad, **kwargs):
 def sample_inputs_nn_functional_embedding(
     op_info, device, dtype, requires_grad, **kwargs
 ):
+    # [FUNCTION DOC]
+    # Generator of embedding samples: a jagged int64 NJT of indices and a random weight matrix
+    # (20 by 32). The weight is the sample input (so its gradient can be checked) and the
+    # indices are the arg; yields one sample without and one with padding_idx.
     indices = torch.nested.nested_tensor(
         [
             torch.tensor([0, 2, 1, 3]),
@@ -1154,6 +1318,10 @@ def sample_inputs_nn_functional_embedding(
 def sample_inputs_index_put(
     op_info, device, dtype, requires_grad, op_kwargs=None, **kwargs
 ):
+    # [FUNCTION DOC]
+    # Generator of index_put samples: for each NJT and dim, an index list covering the batch
+    # dim plus zero indices for further dims, with a scalar value; plus one non-contiguous NJT
+    # with holes indexed over all dims.
     for njt in _sample_njts(
         device=device, dtype=dtype, requires_grad=requires_grad, dims=[2, 3, 4]
     ):
@@ -1198,6 +1366,10 @@ def sample_inputs_index_put(
 def sample_inputs_nn_functional_embedding_bag(
     op_info, device, dtype, requires_grad, **kwargs
 ):
+    # [FUNCTION DOC]
+    # Generator of embedding_bag samples: a random weight (10 by 32) as the input and a jagged
+    # int64 NJT of indices (bags of 2, 3, 4) as the arg, for modes sum, mean and max. Per sample
+    # weights (random, NJT shaped) are only generated for mode sum.
     for generate_per_sample_weight in (True, False):
         for mode in ("sum", "mean", "max"):
             # per_sample_weights is only supported for mode='sum'
@@ -1238,6 +1410,12 @@ def sample_inputs_nn_functional_embedding_bag(
 
 
 def reference_nn_functional_embedding_bag(op, sample):
+    # [FUNCTION DOC]
+    # Reference for embedding_bag: swaps the weight and indices back to the order the unbind
+    # reference expects, sets a single-bag offsets kwarg, temporarily replaces the op's callable
+    # with the functional embedding_bag (restored afterwards, mutating op), runs the unbind
+    # reference per bag and concatenates the bag outputs along dim 0.
+    # KNOWN ISSUE: the op callable is not restored if the unbind reference raises.
     # run reference on a single bag at a time
     new_kwargs = dict(sample.kwargs)
     new_kwargs.update(
@@ -1254,6 +1432,9 @@ def reference_nn_functional_embedding_bag(op, sample):
 
 
 def sample_inputs_nn_functional_linear(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of linear samples for NJTs of 3D to 5D whose last dim is not ragged: weight of
+    # 10 output features, with and without a bias.
     for njt in _sample_njts(
         device=device, dtype=dtype, requires_grad=requires_grad, dims=[3, 4, 5]
     ):
@@ -1293,6 +1474,9 @@ def sample_inputs_nn_functional_linear(op_info, device, dtype, requires_grad, **
 
 
 def sample_inputs_nn_functional_prelu(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of prelu samples for 3D and 4D NJTs whose channel dim (dim 1) is not ragged:
+    # one with a 1D per-channel weight and one with a scalar tensor weight.
     for njt in _sample_njts(
         device=device, dtype=dtype, requires_grad=requires_grad, dims=[3, 4]
     ):
@@ -1330,6 +1514,9 @@ def sample_inputs_nn_functional_prelu(op_info, device, dtype, requires_grad, **k
 def sample_inputs_nn_functional_rms_norm(
     op_info, device, dtype, requires_grad, **kwargs
 ):
+    # [FUNCTION DOC]
+    # Generator of rms_norm samples for 3D and 4D NJTs: for each start dim after the ragged dim,
+    # normalizes over the trailing shape with a random weight of that shape.
     for njt in _sample_njts(
         device=device, dtype=dtype, requires_grad=requires_grad, dims=[3, 4]
     ):
@@ -1363,6 +1550,9 @@ sample_inputs_nn_functional_threshold = partial(
 
 
 def sample_inputs_select(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of select samples built from the dimwise samples: index 0 for the ragged dim;
+    # for other dims indices 0, D//2 and D-1.
     for sample_input in sample_inputs_unary_dimwise(
         op_info, device, dtype, requires_grad, **kwargs
     ):
@@ -1377,6 +1567,9 @@ def sample_inputs_select(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_split(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of split samples built from the dimwise samples: split size 3 for the ragged dim;
+    # for other dims sizes 1, D//2, D-1 and D.
     for sample_input in sample_inputs_unary_dimwise(
         op_info, device, dtype, requires_grad, **kwargs
     ):
@@ -1393,6 +1586,10 @@ def sample_inputs_split(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_split_with_sizes(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of split_with_sizes samples built from the dimwise samples, skipping the ragged
+    # dim: one random two-way split of the dim size D (second part is the remainder) per sample.
+    # Uses the global RNG. Note D must be at least 2 for the random split to be valid.
     for sample_input in sample_inputs_unary_dimwise(
         op_info, device, dtype, requires_grad, **kwargs
     ):
@@ -1409,8 +1606,17 @@ def sample_inputs_split_with_sizes(op_info, device, dtype, requires_grad, **kwar
 
 
 def sample_inputs_squeeze(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of squeeze samples over NJTs with size-1 dims (shape 4, ragged, 1, 3, 1): for
+    # each NJT variant and each dim other than batch and ragged, a single-dim sample, then one
+    # more sample described as multiple dims.
+    # KNOWN ISSUE: the "multiple dims" sample passes the dim from the last loop iteration as a
+    # single-dim kwarg, although its comment says no args are passed.
     # squeeze-specific NJT generator (need to ensure there are some 1s in the shape)
     def _get_njts():
+        # [FUNCTION DOC]
+        # HELPER: Generator of four NJT variants of shape (4, ragged, 1, 3, 1): original,
+        # without cached seqlen info, transposed (dims 1 and 3), and non-contiguous with holes.
         njt = random_nt_from_dims(
             (4, None, 1, 3, 1),
             device=device,
@@ -1459,6 +1665,9 @@ def sample_inputs_squeeze(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_unflatten(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of unflatten samples built from the dimwise samples, skipping the ragged dim:
+    # sizes (D, 1) and (1, D), plus (D/2, 2) and (2, D/2) when D is even.
     for sample_input in sample_inputs_unary_dimwise(
         op_info, device, dtype, requires_grad, **kwargs
     ):
@@ -1477,6 +1686,10 @@ def sample_inputs_unflatten(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_unsqueeze(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of unsqueeze samples: every dimwise sample, plus for each a variant unsqueezing
+    # at dim -1 (end) whose input is tagged with an explicit dimensionality one larger, so the
+    # unbind reference can canonicalize the dim. Mutates the new sample's name and input.
     for sample_input in sample_inputs_unary_dimwise(
         op_info, device, dtype, requires_grad, **kwargs
     ):
@@ -1494,6 +1707,10 @@ def sample_inputs_unsqueeze(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_where(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of where samples derived from the binary elementwise samples: the second operand
+    # moves to the other kwarg, a condition kwarg is added (input greater than zero), and the
+    # sample name is adjusted. Mutates each generated sample.
     for sample in sample_inputs_elementwise_njt_binary(
         op_info, device, dtype, requires_grad, **kwargs
     ):
@@ -1580,6 +1797,11 @@ njt_references = {
 
 # Translates an OpInfo entry to one that operates on NJTs.
 def translate_opinfo(op):
+    # [FUNCTION DOC]
+    # Returns a shallow copy of an OpInfo adapted to NJTs: marks njt support, attaches the
+    # matching ExtraOpData, and sets the sample inputs function and reference from the override
+    # tables, or by op class (unary, binary, reduction) using the unbind or reduction
+    # reference. Other ops get functions that raise RuntimeError and supports_njt False.
     new_op = copy(op)
     new_op.supports_njt = True
     # add some extra info for use in generating tests on the right subset of ops

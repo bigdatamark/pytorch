@@ -1,5 +1,12 @@
 # mypy: ignore-errors
 
+# [MODULE DOC]
+# OpInfo definitions for the torch.signal.windows operators (hamming, hann, bartlett, blackman,
+# cosine, exponential, gaussian, kaiser, general_cosine, general_hamming, nuttall).
+# Contains sample, reference and error input generators for windows, a wrapper adapting scipy
+# window functions as references, a factory building the OpInfo entries, and the op_db list.
+# Importing optionally imports scipy.signal when scipy is available; no other side effects.
+
 import unittest
 from collections.abc import Callable
 from functools import partial
@@ -23,6 +30,10 @@ if TEST_SCIPY:
 
 
 def sample_inputs_window(op_info, device, dtype, requires_grad, *args, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of SampleInput objects for window ops: every window size from 0 to 5 crossed with
+    # sym True and False. Extra positional and keyword args are forwarded to each sample, along
+    # with device, dtype and requires_grad. A include_conjugated_inputs keyword is discarded.
     r"""Base function used to create sample inputs for windows.
 
     For additional required args you should use *args, as well as **kwargs for
@@ -45,6 +56,10 @@ def sample_inputs_window(op_info, device, dtype, requires_grad, *args, **kwargs)
 
 
 def reference_inputs_window(op_info, device, dtype, requires_grad, *args, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of reference inputs for windows taking only size and sym: first yields all the
+    # basic samples, then sizes 8 to 256 (powers of two) with sym False and True, using default
+    # dtype and device.
     r"""Reference inputs function to use for windows which have a common signature, i.e.,
     window size and sym only.
 
@@ -65,6 +80,12 @@ def reference_inputs_window(op_info, device, dtype, requires_grad, *args, **kwar
 def reference_inputs_exponential_window(
     op_info, device, dtype, requires_grad, **kwargs
 ):
+    # [FUNCTION DOC]
+    # Generator of reference inputs for the exponential window: the basic samples plus sizes 8 to
+    # 256 with center and tau settings. Non-symmetric samples use the listed center; symmetric
+    # ones reset center to None, since a center is invalid for symmetric windows.
+    # KNOWN ISSUE: the shared per-case mapping is mutated in place (center set to None), which
+    # is harmless only because the cases are rebuilt on each call.
     yield from sample_inputs_window(op_info, device, dtype, requires_grad, **kwargs)
 
     cases = (
@@ -83,6 +104,9 @@ def reference_inputs_exponential_window(
 
 
 def reference_inputs_gaussian_window(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of reference inputs for the gaussian window: the basic samples plus sizes 8 to
+    # 256 each paired with a standard deviation, for sym False and True.
     yield from sample_inputs_window(op_info, device, dtype, requires_grad, **kwargs)
 
     cases = (
@@ -100,6 +124,9 @@ def reference_inputs_gaussian_window(op_info, device, dtype, requires_grad, **kw
 
 
 def reference_inputs_kaiser_window(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of reference inputs for the kaiser window: the basic samples plus sizes 8 to 256
+    # each paired with a beta value, for sym False and True.
     yield from sample_inputs_window(op_info, device, dtype, requires_grad, **kwargs)
 
     cases = (
@@ -119,6 +146,10 @@ def reference_inputs_kaiser_window(op_info, device, dtype, requires_grad, **kwar
 def reference_inputs_general_cosine_window(
     op_info, device, dtype, requires_grad, **kwargs
 ):
+    # [FUNCTION DOC]
+    # Generator of reference inputs for the general cosine window: the basic samples plus sizes
+    # 8 to 256 each paired with a list of cosine coefficients (1 to 5 terms), for sym False
+    # and True.
     yield from sample_inputs_window(op_info, device, dtype, requires_grad, **kwargs)
 
     cases = (
@@ -138,6 +169,9 @@ def reference_inputs_general_cosine_window(
 def reference_inputs_general_hamming_window(
     op_info, device, dtype, requires_grad, **kwargs
 ):
+    # [FUNCTION DOC]
+    # Generator of reference inputs for the general hamming window: the basic samples plus sizes
+    # 8 to 256 each paired with an alpha value, for sym False and True.
     yield from sample_inputs_window(op_info, device, dtype, requires_grad, **kwargs)
 
     cases = (
@@ -155,6 +189,11 @@ def reference_inputs_general_hamming_window(
 
 
 def error_inputs_window(op_info, device, *args, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of ErrorInput cases shared by all windows. Each expects a ValueError: negative
+    # window length, a non-strided (sparse coo) layout, and non-supported dtypes (int64,
+    # bfloat16, float16; only float32 and float64 are allowed). Extra args and keywords are
+    # forwarded to every sample.
     # Tests for windows that have a negative size
     yield ErrorInput(
         SampleInput(-1, *args, dtype=torch.float32, device=device, **kwargs),
@@ -199,6 +238,9 @@ def error_inputs_window(op_info, device, *args, **kwargs):
 
 
 def error_inputs_exponential_window(op_info, device, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of ErrorInput cases for the exponential window: the common window errors plus a
+    # negative tau and a center given for a symmetric window (both ValueError).
     # Yield common error inputs
     yield from error_inputs_window(op_info, device, **kwargs)
 
@@ -218,6 +260,9 @@ def error_inputs_exponential_window(op_info, device, **kwargs):
 
 
 def error_inputs_gaussian_window(op_info, device, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of ErrorInput cases for the gaussian window: the common window errors (with a
+    # valid std) plus a negative standard deviation (ValueError).
     # Yield common error inputs
     yield from error_inputs_window(op_info, device, std=0.5, **kwargs)
 
@@ -230,6 +275,9 @@ def error_inputs_gaussian_window(op_info, device, **kwargs):
 
 
 def error_inputs_kaiser_window(op_info, device, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of ErrorInput cases for the kaiser window: the common window errors (with a
+    # valid beta) plus a negative beta (ValueError).
     # Yield common error inputs
     yield from error_inputs_window(op_info, device, beta=12, **kwargs)
 
@@ -242,6 +290,11 @@ def error_inputs_kaiser_window(op_info, device, **kwargs):
 
 
 def error_inputs_general_cosine_window(op_info, device, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of ErrorInput cases for the general cosine window: the common window errors
+    # (with valid coefficients) plus coefficients of None (TypeError) and an empty list
+    # (ValueError).
+    # KNOWN ISSUE: a source comment says "negative beta" but the cases test bad coefficients.
     # Yield common error inputs
     yield from error_inputs_window(op_info, device, a=[0.54, 0.46], **kwargs)
 
@@ -260,6 +313,11 @@ def error_inputs_general_cosine_window(op_info, device, **kwargs):
 
 
 def reference_signal_window(fn: Callable):
+    # [FUNCTION DOC]
+    # Wraps a scipy window function so it can be called with torch style arguments. Returns a
+    # function that ignores device, layout and requires_grad, forwards the remaining arguments
+    # to the scipy function and casts the resulting numpy array to the requested dtype
+    # (default float64).
     r"""Wrapper for scipy signal window references.
 
     Discards keyword arguments for window reference functions that don't have a matching signature with
@@ -274,6 +332,9 @@ def reference_signal_window(fn: Callable):
         requires_grad=False,
         **kwargs,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Calls the wrapped scipy function with the positional and extra keyword args
+        # and returns its result cast to dtype; device, layout and requires_grad are unused.
         r"""The unused arguments are defined to disregard those values"""
         return fn(*args, **kwargs).astype(dtype)
 
@@ -289,6 +350,11 @@ def make_signal_windows_opinfo(
     *,
     skips: tuple[DecorateInfo, ...] = (),
 ):
+    # [FUNCTION DOC]
+    # Builds an OpInfo for a window op from its name, reference function (used only when scipy
+    # is available), and the sample, reference and error input generators. The op supports
+    # float dtypes only, has no out variant and no autograd, and carries a common set of skips
+    # (signature, jit, noncontiguous, math bits, vmap, MPS numpy reference) plus extra skips.
     r"""Helper function to create OpInfo objects related to different windows."""
     return OpInfo(
         name=name,

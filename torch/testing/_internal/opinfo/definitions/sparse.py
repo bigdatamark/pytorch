@@ -1,5 +1,13 @@
 # mypy: ignore-errors
 
+# [MODULE DOC]
+# Helpers for generating and validating sample and error inputs of OpInfos on sparse tensors
+# (COO, CSR, CSC, BSR, BSC layouts). Provides generators for sparse reductions (sum), sparse
+# elementwise binary ops (mul), like-functions, and a dispatching validator that classifies each
+# sample as valid (SampleInput) or known-failing (ErrorInput with the expected error message).
+# The environment variable PYTORCH_TEST_CHECK_VALIDATE_SPARSE_SAMPLES set to 1 makes the
+# validation actually run each op to confirm the classification. No import-time side effects.
+
 import os
 
 import torch
@@ -16,7 +24,15 @@ from torch.testing._internal.opinfo.core import (
 
 
 def _check_validate(op_info, sample):
+    # [FUNCTION DOC]
+    # HELPER: Confirms a classified sample by calling the op on it. For an ErrorInput the call
+    # must raise the expected error type; for a SampleInput it must succeed. Raises
+    # AssertionError describing the mismatch otherwise. Runs the operator (side effects of op).
     def _check_fail(sample):
+        # [FUNCTION DOC]
+        # HELPER: Calls the op on the wrapped sample of an ErrorInput; swallows the expected
+        # error type, raises AssertionError for a different exception or for no exception.
+        # KNOWN ISSUE: only the error type is checked, the error_regex is never matched.
         try:
             op_info(
                 sample.sample_input.input,
@@ -37,6 +53,8 @@ def _check_validate(op_info, sample):
             )
 
     def _check_success(sample):
+        # [FUNCTION DOC]
+        # HELPER: Calls the op on a SampleInput; raises AssertionError wrapping any exception.
         try:
             op_info(sample.input, *sample.args, **sample.kwargs)
         except Exception as msg:
@@ -59,6 +77,11 @@ def _sample_inputs_sparse(
     *args,
     **kwargs,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Generator combining regular and maybe-failing sample generators. Each produced
+    # sample goes through validate_sample_input (with check_validate read from the environment
+    # variable PYTORCH_TEST_CHECK_VALIDATE_SPARSE_SAMPLES equal to 1) and only those classified
+    # as SampleInput are yielded; ErrorInput results are dropped here.
     check_validate = (
         os.environ.get("PYTORCH_TEST_CHECK_VALIDATE_SPARSE_SAMPLES", "0") == "1"
     )
@@ -77,6 +100,10 @@ def _sample_inputs_sparse(
 def _error_inputs_sparse(
     maybe_failing_sample_inputs, validate_sample_input, op_info, *args, **kwargs
 ):
+    # [FUNCTION DOC]
+    # HELPER: Generator counterpart of the sample generator: runs the maybe-failing samples
+    # through validate_sample_input (check_validate from the environment variable
+    # PYTORCH_TEST_CHECK_VALIDATE_SPARSE_SAMPLES equal to 1) and yields only ErrorInput results.
     check_validate = (
         os.environ.get("PYTORCH_TEST_CHECK_VALIDATE_SPARSE_SAMPLES", "0") == "1"
     )
@@ -88,6 +115,11 @@ def _error_inputs_sparse(
 
 
 def _apply_requires_grad_to_samples(sample_inputs):
+    # [FUNCTION DOC]
+    # HELPER: Decorator for sample generator functions. Returns a wrapper generator that, when
+    # requires_grad is set, clones/detaches every floating or complex tensor in each sample and
+    # marks it as requiring grad (so samples sharing tensor instances stay independent);
+    # otherwise passes the samples through unchanged.
     """Decorator to _maybe_failing_sample_inputs_... generator functions
     that clones and sets requires_grad argument to tensors in sample
     input arguments. This is needed when the generated samples share
@@ -95,7 +127,13 @@ def _apply_requires_grad_to_samples(sample_inputs):
     """
 
     def wrapper(op_info, device, dtype, requires_grad, layout, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: The decorated generator; see the enclosing decorator for behavior.
         def apply_requires_grad(x):
+            # [FUNCTION DOC]
+            # HELPER: Returns x unchanged unless it is a floating/complex tensor that does not
+            # yet require grad (and requires_grad is wanted); then returns a detached clone that
+            # requires grad.
             if (
                 not isinstance(x, torch.Tensor)
                 or x.requires_grad
@@ -121,6 +159,14 @@ def _apply_requires_grad_to_samples(sample_inputs):
 def sample_inputs_sparse_reduction(
     op_info, device, dtype, requires_grad, layout, blocksize=None, **kwargs
 ):
+    # [FUNCTION DOC]
+    # Generator of sparse-tensor samples for reduction ops: starts from the dense reduction
+    # samples and converts each input to the given layout (blocksize defaults to 1x1 for block
+    # layouts). Yields nothing if the op does not support the layout. Skips scalar inputs,
+    # compressed layouts with fewer than 2 dims, and batched compressed samples with explicit
+    # zeros. Also yields an uncoalesced COO variant (float/complex dtypes) and a hybrid variant
+    # (dense dims) for inputs with more than 2 dims. Raises AssertionError if the uncoalesced
+    # tensor turns out coalesced.
     """Sample inputs for reduction operations on sparse tensors."""
     layout_name = str(layout).split(".", 1)[-1].rsplit("_coo", 1)[0]
     op_supports_layout = getattr(op_info, "supports_" + layout_name)
@@ -196,6 +242,12 @@ def sample_inputs_sparse_reduction(
 
 
 def _validate_sample_input_sparse_reduction(op_info, sample, check_validate=False):
+    # [FUNCTION DOC]
+    # HELPER: Classifies a reduction sample. Returns the sample unchanged if supported, or an
+    # ErrorInput carrying the known error type and message for op specific unsupported cases:
+    # sum (delegates to the sum validator), masked sum, and masked amax/amin/mean/prod (missing
+    # mask, keepdim false, batched or 3D inputs, mask layout/nnz mismatches). If check_validate
+    # is set, also runs the op to confirm the classification.
     """Return the specified sample when it is valid and supported by the
     operation. Otherwise, return the sample as ErrorInput instance.
 
@@ -320,6 +372,11 @@ def _validate_sample_input_sparse_reduction(op_info, sample, check_validate=Fals
 
 
 def _validate_sample_input_sparse_reduction_sum(sample, check_validate=False):
+    # [FUNCTION DOC]
+    # HELPER: For sum with an explicit dim on a sparse compressed input, returns an ErrorInput
+    # with the known message for unsupported cases (non-CSR compressed layouts, CSR/CSC with
+    # keepdim false, non-2D input, bool CSR, complex32 CSR); otherwise returns the sample.
+    # KNOWN ISSUE: the check_validate argument is accepted but never used.
     # NOTE: When fixing a failing sample case, remove the
     #       corresponding if-block
     t_inp, t_kwargs = sample.input, sample.kwargs
@@ -371,6 +428,10 @@ def _validate_sample_input_sparse_reduction_sum(sample, check_validate=False):
 def _maybe_failing_sample_inputs_sparse_reduction_sum(
     op_info, device, dtype, requires_grad, layout, **kwargs
 ):
+    # [FUNCTION DOC]
+    # HELPER: Generator of sum samples (dim, keepdim variants on small 2D and hybrid sparse
+    # tensors) for compressed layouts that are known to fail with NotImplementedError or
+    # RuntimeError. Yields nothing for COO. Block layouts use explicit blocksizes.
     """Generator of samples that are known to fail or that were failing in past."""
     # NOTE: When fixing a failing case, remove the Exception comment
     #       but keep the `yield sample` statement.
@@ -466,6 +527,9 @@ def _maybe_failing_sample_inputs_sparse_reduction_sum(
 def sample_inputs_sparse_reduction_sum(
     op_info, device, dtype, requires_grad, layout, **kwargs
 ):
+    # [FUNCTION DOC]
+    # Generator of valid sample inputs for sum on sparse tensors: regular reduction samples plus
+    # the maybe-failing ones that validate as supported.
     """Sample inputs for sum on sparse tensors."""
     yield from _sample_inputs_sparse(
         sample_inputs_sparse_reduction,
@@ -481,6 +545,9 @@ def sample_inputs_sparse_reduction_sum(
 
 
 def error_inputs_sparse_reduction_sum(op_info, device, layout, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of ErrorInput cases for sum on sparse tensors, built from the maybe-failing
+    # samples that validate as errors. Uses float64 and no requires_grad.
     """Error inputs for sum on sparse tensors."""
     dtype = torch.float64
     requires_grad = False
@@ -499,6 +566,11 @@ def error_inputs_sparse_reduction_sum(op_info, device, layout, **kwargs):
 def sample_inputs_sparse_elementwise_binary_operation(
     op_info, device, dtype, requires_grad, layout, **kwargs
 ):
+    # [FUNCTION DOC]
+    # Generator of sparse samples for elementwise binary ops. For each dense binary sample
+    # (zeros excluded) it converts both operands to the layout for every valid dense_dim (and
+    # block sizes 1x1 and full block for block layouts), yielding op(sparse, sparse) and
+    # op(sparse, scalar tensor). Compressed layouts skip inputs with fewer than 2 dims.
     """Sample inputs for elementwise binary operations on sparse tensors.
 
     The samples include regular, zero-sized, batched, and hybrid
@@ -506,6 +578,9 @@ def sample_inputs_sparse_elementwise_binary_operation(
     """
 
     def _to_sparse(tensor, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Detaches the tensor, converts it with the given to_sparse keywords and sets
+        # requires_grad as requested by the enclosing generator.
         return tensor.detach().to_sparse(**kwargs).requires_grad_(requires_grad)
 
     for sample_input in generate_elementwise_binary_tensors(
@@ -568,6 +643,11 @@ def sample_inputs_sparse_elementwise_binary_operation(
 
 
 def _validate_sample_input_elementwise_binary_sparse_mul(sample):
+    # [FUNCTION DOC]
+    # HELPER: Classifies a mul sample on sparse input: returns an ErrorInput with the known
+    # error message for unsupported combinations (batched CSR, CSC/BSR/BSC with non-scalar
+    # other, bool or half dtypes on CPU, mixed strided/sparse CSR operands, shape mismatches);
+    # otherwise returns the sample unchanged.
     # NOTE: When fixing a failing sample case, remove the
     #       corresponding if-block
     t_inp, t_args = sample.input, sample.args
@@ -656,6 +736,11 @@ def _validate_sample_input_elementwise_binary_sparse_mul(sample):
 def _maybe_failing_sample_inputs_sparse_elementwise_binary_mul(
     op_info, device, dtype, requires_grad, layout, **kwargs
 ):
+    # [FUNCTION DOC]
+    # HELPER: Generator (wrapped to give each sample its own grad-requiring tensors) of mul
+    # samples known to fail per layout and dtype: batched or hybrid CSR, CSC/BSR/BSC regular
+    # inputs, and complex32/bool/half cases for COO and CSR. Builds regular, batch and hybrid
+    # sparse tensors on the given device and dtype.
     """Generator of samples that are known to fail or that were failing in past."""
     # NOTE: When fixing a failing case, remove the Exception comment
     #       but keep the `yield sample` statement.
@@ -711,6 +796,9 @@ def _maybe_failing_sample_inputs_sparse_elementwise_binary_mul(
 def _validate_sample_input_sparse_elementwise_binary_operation(
     op_info, sample, check_validate=False
 ):
+    # [FUNCTION DOC]
+    # HELPER: Validator for elementwise binary ops on sparse input. Only mul is classified
+    # (via the mul validator); other ops pass through. Optionally runs the op to confirm.
     if op_info.name == "mul":
         sample = _validate_sample_input_elementwise_binary_sparse_mul(sample)
 
@@ -720,6 +808,9 @@ def _validate_sample_input_sparse_elementwise_binary_operation(
 
 
 def sample_inputs_sparse_mul(op_info, device, dtype, requires_grad, layout, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of valid sample inputs for mul on sparse tensors, combining the generic sparse
+    # binary samples with the maybe-failing mul samples that validate as supported.
     """Sample inputs for mul operation on sparse tensors."""
     yield from _sample_inputs_sparse(
         sample_inputs_sparse_elementwise_binary_operation,
@@ -735,6 +826,9 @@ def sample_inputs_sparse_mul(op_info, device, dtype, requires_grad, layout, **kw
 
 
 def error_inputs_sparse_mul(op_info, device, layout, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of ErrorInput cases for mul on sparse tensors (known failing samples that
+    # validate as errors), using float64 and no requires_grad.
     """Error inputs for mul operation on sparse tensors."""
     dtype = torch.float64
     requires_grad = False
@@ -753,6 +847,12 @@ def error_inputs_sparse_mul(op_info, device, layout, **kwargs):
 def _sample_inputs_sparse_like_fns(
     op_info, device, dtype, requires_grad, layout, **kwargs
 ):
+    # [FUNCTION DOC]
+    # HELPER: Generator of samples for like-functions (e.g. zeros_like) on sparse tensors. For
+    # each simple input tensor of the layout (batch, hybrid, zero-sized) yields the tensor alone
+    # and with explicit device/dtype/layout, a highest-precision float dtype, the other
+    # device if CUDA is available, a related layout (csr<->csc, bsr<->bsc, else strided), and
+    # COO for non-COO inputs. Imports TestCase lazily to build the inputs.
     from torch.testing._internal.common_utils import TestCase
 
     for tensor in TestCase().generate_simple_inputs(
@@ -795,6 +895,11 @@ def _sample_inputs_sparse_like_fns(
 
 
 def _validate_sample_input_sparse_like_fns(op_info, sample, check_validate=False):
+    # [FUNCTION DOC]
+    # HELPER: Classifies a like-function sample. Returns an ErrorInput for compressed inputs
+    # (other than zeros_like) requesting a different layout, and for every COO input (the
+    # random-normal fill is unsupported on sparse). Otherwise returns the sample, optionally
+    # confirming by running the op when check_validate is set.
     if (
         sample.input.layout
         in {
@@ -828,6 +933,10 @@ def _validate_sample_input_sparse_like_fns(op_info, sample, check_validate=False
 def _maybe_failing_sample_inputs_sparse_like_fns(
     op_info, device, dtype, requires_grad, layout, **kwargs
 ):
+    # [FUNCTION DOC]
+    # HELPER: Generator of like-function samples expected to fail. Only when CUDA is available
+    # and the layout is not COO: yields a small 2D sparse tensor requesting the opposite device
+    # type, and one requesting a different related layout.
     if torch.cuda.is_available() and layout is not torch.sparse_coo:
         other_device = "cuda" if torch.device(device).type == "cpu" else "cpu"
         if layout is torch.sparse_csr:
@@ -861,6 +970,9 @@ def _maybe_failing_sample_inputs_sparse_like_fns(
 def sample_inputs_sparse_like_fns(
     op_info, device, dtype, requires_grad, layout, **kwargs
 ):
+    # [FUNCTION DOC]
+    # Generator of valid sample inputs for like-functions on sparse tensors (regular plus the
+    # maybe-failing ones that validate as supported).
     """Sample inputs for like-functions on sparse tensors."""
     yield from _sample_inputs_sparse(
         _sample_inputs_sparse_like_fns,
@@ -876,6 +988,9 @@ def sample_inputs_sparse_like_fns(
 
 
 def error_inputs_sparse_like_fns(op_info, device, layout, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of ErrorInput cases for like-functions on sparse tensors, using float64 and no
+    # requires_grad.
     """Error inputs for like-functions on sparse tensors."""
     dtype = torch.float64
     requires_grad = False
@@ -892,6 +1007,10 @@ def error_inputs_sparse_like_fns(op_info, device, layout, **kwargs):
 
 
 def _validate_sample_input_sparse_default(op_info, sample, check_validate=False):
+    # [FUNCTION DOC]
+    # HELPER: Default validator. For to_sparse on a compressed input with an integer sparse_dim
+    # argument other than 2, returns an ErrorInput; otherwise returns the sample. Optionally
+    # runs the op to confirm when check_validate is set.
     if op_info.name == "to_sparse":
         if (
             sample.input.layout
@@ -911,6 +1030,10 @@ def _validate_sample_input_sparse_default(op_info, sample, check_validate=False)
 
 
 def validate_sample_input_sparse(op_info, sample, check_validate=False):
+    # [FUNCTION DOC]
+    # Entry point validator: dispatches on the OpInfo type to the reduction validator
+    # (ReductionOpInfo), the elementwise binary validator (BinaryUfuncInfo) or the default
+    # validator. Returns the sample as is when valid, else an ErrorInput.
     """Return the specified sample when it is valid and supported by the
     operation. Otherwise, return the sample as ErrorInput instance.
 
