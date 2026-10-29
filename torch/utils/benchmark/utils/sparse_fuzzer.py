@@ -1,10 +1,18 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Fuzzer support for sparse COO tensors in the benchmark utilities.
+# Defines FuzzedSparseTensor, a FuzzedTensor subclass that builds random sparse
+# tensors from fuzzed parameters (density, coalesced, sparse_dim).
+# No import-time side effects beyond imports.
 from numbers import Number
 import torch
 from torch.utils.benchmark import FuzzedTensor
 import math
 
 class FuzzedSparseTensor(FuzzedTensor):
+    # [CLASS DOC] A FuzzedTensor specification that produces sparse COO tensors.
+    # Stores the names of the fuzzed parameters for density, coalesced and sparse_dim
+    # (in addition to the base class state) and uses them in _make_tensor to build a
+    # tensor plus a properties mapping describing it.
     def __init__(
         self,
         name: str,
@@ -19,6 +27,11 @@ class FuzzedSparseTensor(FuzzedTensor):
         dtype=torch.float32,
         cuda=False
     ) -> None:
+        # [FUNCTION DOC] Initializes the spec: forwards name, size, element bounds,
+        # dim_parameter, dtype and cuda to the base class, and stores the parameter
+        # names for density, coalesced and sparse_dim. Returns nothing.
+        # KNOWN ISSUE: the nnz argument is accepted but never used or stored, and the
+        # docstring does not document it.
         """
         Args:
             name:
@@ -56,6 +69,14 @@ class FuzzedSparseTensor(FuzzedTensor):
 
     @staticmethod
     def sparse_tensor_constructor(size, dtype, sparse_dim, nnz, is_coalesced):
+        # [FUNCTION DOC] Builds a random CPU sparse COO tensor. A single number for size
+        # is expanded to that value for each sparse dimension. Values are uniform random
+        # for floating dtypes, else random integers in a small range; indices are random
+        # within each sparse dimension. If not coalesced, values and indices are
+        # duplicated (so duplicate coordinates exist); if coalesced, coalesce is applied.
+        # Raises an error if all sparse dims are non-positive while nnz is nonzero.
+        # KNOWN ISSUE: the uncoalesced duplicate values are drawn with a normal
+        # distribution, unlike the first half.
         """sparse_tensor_constructor creates a sparse tensor with coo format.
 
         Note that when `is_coalesced` is False, the number of elements is doubled but the number of indices
@@ -91,6 +112,14 @@ class FuzzedSparseTensor(FuzzedTensor):
         return x
 
     def _make_tensor(self, params, state):
+        # [FUNCTION DOC] HELPER: Creates the sparse tensor for one set of fuzzed params.
+        # Computes nnz as the ceiling of the sum of the size entries times density, builds
+        # the tensor with sparse_tensor_constructor (sparse_dim is capped at the number of
+        # dims), moves it to GPU if requested, and returns (tensor, properties) where
+        # properties holds numel, shape, coalesced flag, density, sparsity, sparse/dense
+        # dims, hybrid flag and dtype. Raises an error if nnz exceeds the size sum.
+        # KNOWN ISSUE: nnz uses the sum of the sizes, not their product, so it is not
+        # density times the element count.
         size, _, _ = self._get_size_and_steps(params)
         density = params['density']
         nnz = math.ceil(sum(size) * density)

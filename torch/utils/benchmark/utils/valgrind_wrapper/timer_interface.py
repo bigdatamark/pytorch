@@ -1,3 +1,10 @@
+# [MODULE DOC] Bridge between Timer and Valgrind/Callgrind. Defines result containers
+# (FunctionCount, FunctionCounts, CallgrindStats), the globals serialization helpers
+# (Serialization, CopyIfCallgrind, GlobalsBridge), and a private wrapper that spawns a
+# valgrind subprocess running a generated script (or compiled C++ template) and parses
+# callgrind_annotate output. A lazily created singleton wrapper is exposed through
+# wrapper_singleton. Exports FunctionCount, FunctionCounts, CallgrindStats, CopyIfCallgrind.
+# No import-time side effects beyond imports and defining module constants.
 """Intermediate layer between `Timer` and `valgrind`."""
 from __future__ import annotations
 
@@ -36,6 +43,8 @@ else:
 
 
 class FunctionCount(NamedTuple):
+    # [CLASS DOC] One Callgrind row: an instruction count and the function name
+    # (file and function text) it belongs to.
     # TODO(#105471): Rename the count field
     count: int  # type: ignore[assignment]
     function: str
@@ -43,6 +52,11 @@ class FunctionCount(NamedTuple):
 
 @dataclasses.dataclass(repr=False, eq=False, frozen=True)
 class FunctionCounts:
+    # [CLASS DOC] Immutable, tuple-like collection of FunctionCount rows. Fields: the
+    # data tuple, an inclusive flag (counts include callees), whether repr truncates
+    # long output, and an optional line width override for tests. Supports iteration,
+    # length, indexing/slicing, addition, subtraction, scaling, filter, transform,
+    # sum and denoise. Merging requires matching inclusive flags.
     """Container for manipulating Callgrind results.
 
     It supports:
@@ -62,12 +76,16 @@ class FunctionCounts:
     _linewidth: int | None = None
 
     def __iter__(self) -> Iterator[FunctionCount]:
+        # [FUNCTION DOC] Yields each FunctionCount row in stored order.
         yield from self._data
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] Returns the number of rows.
         return len(self._data)
 
     def __getitem__(self, item: Any) -> FunctionCount | FunctionCounts:
+        # [FUNCTION DOC] Returns a single FunctionCount for an integer index, or a new
+        # FunctionCounts (same inclusive flag, no row truncation in repr) for a slice.
         data: FunctionCount | tuple[FunctionCount, ...] = self._data[item]
         return (
             FunctionCounts(cast(tuple[FunctionCount, ...], data), self.inclusive, truncate_rows=False)
@@ -75,6 +93,10 @@ class FunctionCounts:
         )
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Formats the default object repr followed by one right-aligned
+        # count and function name per row. Long names are shortened in the middle to fit
+        # the line width (tensor print width unless overridden). When truncating, shows
+        # only the first and last 9 rows if over 18. Exclusive counts get a Total line.
         count_len = 0
         for c, _ in self:
             # Account for sign in string length.
@@ -101,20 +123,28 @@ class FunctionCounts:
         self,
         other: FunctionCounts,
     ) -> FunctionCounts:
+        # [FUNCTION DOC] Returns the per-function sum of two counts objects. Raises an
+        # error if the inclusive flags differ.
         return self._merge(other, lambda c: c)
 
     def __sub__(
         self,
         other: FunctionCounts,
     ) -> FunctionCounts:
+        # [FUNCTION DOC] Returns the per-function difference (self minus other). Raises
+        # an error if the inclusive flags differ; zero results are dropped.
         return self._merge(other, operator.neg)
 
     def __mul__(self, other: int | float) -> FunctionCounts:
+        # [FUNCTION DOC] Returns a new object with every count multiplied by other and
+        # truncated to an integer; rows that become zero are dropped.
         return self._from_dict({
             fn: int(c * other) for c, fn in self._data
         }, self.inclusive)
 
     def transform(self, map_fn: Callable[[str], str]) -> FunctionCounts:
+        # [FUNCTION DOC] Maps every function name through map_fn, summing counts of names
+        # that collide, and returns the new sorted FunctionCounts.
         """Apply `map_fn` to all of the function names.
 
         This can be used to regularize function names (e.g. stripping irrelevant
@@ -128,13 +158,18 @@ class FunctionCounts:
         return self._from_dict(counts, self.inclusive)
 
     def filter(self, filter_fn: Callable[[str], bool]) -> FunctionCounts:
+        # [FUNCTION DOC] Returns a new FunctionCounts with only rows whose function name
+        # makes filter_fn return true; order and inclusive flag are preserved.
         """Keep only the elements where `filter_fn` applied to function name returns True."""
         return FunctionCounts(tuple(i for i in self if filter_fn(i.function)), self.inclusive)
 
     def sum(self) -> int:
+        # [FUNCTION DOC] Returns the total of all counts.
         return sum(c for c, _ in self)
 
     def denoise(self) -> FunctionCounts:
+        # [FUNCTION DOC] Returns a copy without rows whose name mentions the CPython
+        # unicode dictionary lookup function, a known source of nondeterministic counts.
         """Remove known noisy instructions.
 
         Several instructions in the CPython interpreter are rather noisy. These
@@ -149,6 +184,9 @@ class FunctionCounts:
         second: FunctionCounts,
         merge_fn: Callable[[int], int]
     ) -> FunctionCounts:
+        # [FUNCTION DOC] HELPER: Sums counts per function name, applying merge_fn to the
+        # counts from second (identity to add, negation to subtract). Raises an error if
+        # the inclusive flags differ. Returns a new FunctionCounts.
         if self.inclusive != second.inclusive:
             raise AssertionError("Cannot merge inclusive and exclusive counts.")
         counts: collections.defaultdict[str, int] = collections.defaultdict(int)
@@ -162,12 +200,18 @@ class FunctionCounts:
 
     @staticmethod
     def _from_dict(counts: dict[str, int], inclusive: bool) -> FunctionCounts:
+        # [FUNCTION DOC] HELPER: Builds a FunctionCounts from a name-to-count mapping,
+        # dropping zero counts and sorting rows by count in descending order.
         flat_counts = (FunctionCount(c, fn) for fn, c in counts.items() if c)
         return FunctionCounts(tuple(sorted(flat_counts, reverse=True)), inclusive)
 
 
 @dataclasses.dataclass(repr=False, eq=False, frozen=True)
 class CallgrindStats:
+    # [CLASS DOC] Immutable result of one Callgrind collection. Holds the task spec,
+    # iterations per run, whether PyTorch has debug symbols, inclusive and exclusive
+    # FunctionCounts for both the statement and the empty baseline, and optionally the
+    # raw callgrind output text. Key methods: stats, counts, delta, as_standardized.
     """Top level container for Callgrind results collected by Timer.
 
     Manipulation is generally done using the FunctionCounts class, which is
@@ -185,6 +229,9 @@ class CallgrindStats:
     stmt_callgrind_out: str | None
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Returns a summary: default repr, task spec summary, statement and
+        # baseline instruction totals (raw and denoised), runs per measurement and thread
+        # count, plus a warning if PyTorch lacks debug symbols.
         base_stats = self.baseline_exclusive_stats
         output = f"""
 {super().__repr__()}
@@ -202,6 +249,8 @@ class CallgrindStats:
         return output
 
     def stats(self, inclusive: bool = False) -> FunctionCounts:
+        # [FUNCTION DOC] Returns the statement's inclusive or exclusive FunctionCounts
+        # depending on the flag.
         """Returns detailed function counts.
 
         Conceptually, the FunctionCounts returned can be thought of as a tuple
@@ -216,6 +265,8 @@ class CallgrindStats:
         return self.stmt_inclusive_stats if inclusive else self.stmt_exclusive_stats
 
     def counts(self, *, denoise: bool = False) -> int:
+        # [FUNCTION DOC] Returns the total exclusive instruction count of the statement,
+        # optionally after removing noisy symbols.
         """Returns the total number of instructions executed.
 
         See `FunctionCounts.denoise()` for an explanation of the `denoise` arg.
@@ -229,6 +280,8 @@ class CallgrindStats:
         other: CallgrindStats,
         inclusive: bool = False,
     ) -> FunctionCounts:
+        # [FUNCTION DOC] Returns the difference between this object's and other's
+        # statement counts (inclusive or exclusive per the flag), as a FunctionCounts.
         """Diff two sets of counts.
 
         One common reason to collect instruction counts is to determine the
@@ -242,6 +295,10 @@ class CallgrindStats:
         return self.stats(inclusive=inclusive) - other.stats(inclusive=inclusive)
 
     def as_standardized(self) -> CallgrindStats:
+        # [FUNCTION DOC] Returns a new CallgrindStats whose function names have build-dir
+        # prefixes, CPython path prefixes and trailing library names removed, so profiles
+        # from different builds diff cleanly. The raw callgrind output is dropped (set to
+        # none) since it no longer matches the names.
         """Strip library names and some prefixes from function strings.
 
         When comparing two different sets of instruction counts, on stumbling
@@ -264,6 +321,8 @@ class CallgrindStats:
         when diffing.
         """
         def strip(stats: FunctionCounts) -> FunctionCounts:
+            # [FUNCTION DOC] HELPER: Applies the prefix and library-name regex
+            # substitutions in order to every function name and returns the result.
             transforms = (
                 # PyTorch may have been built in different locations.
                 (r"^.+build/\.\./", "build/../"),
@@ -298,6 +357,8 @@ class CallgrindStats:
 
 
 class Serialization(enum.Enum):
+    # [CLASS DOC] HELPER: How a global is transferred to the Valgrind subprocess:
+    # pickle, torch save/load, or TorchScript save/load.
     PICKLE = 0
     TORCH = 1
     TORCH_JIT = 2
@@ -311,11 +372,20 @@ _GLOBALS_ALLOWED_TYPES: dict[Serialization, tuple[Any, ...]] = {
 
 
 class CopyIfCallgrind:
+    # [CLASS DOC] Wrapper marking a global as safe to replace by a deserialized copy
+    # during Callgrind collection. Holds the value, an optional setup string for the
+    # subprocess, and the Serialization method chosen from the value's type (builtin
+    # scalars, strings and bytes, TorchScript objects, or nn.Modules).
     """Signal that a global may be replaced with a deserialized copy.
 
     See `GlobalsBridge` for why this matters.
     """
     def __init__(self, value: Any, *, setup: str | None = None) -> None:
+        # [FUNCTION DOC] Picks the serialization method whose allowed types match value
+        # and stores value, setup and method. Raises ValueError listing supported types
+        # if the value type is not allowed.
+        # KNOWN ISSUE: the supported-type list is built by chaining over the dict values
+        # (tuples), so it prints the tuples' reprs rather than each type name.
         for method, supported_types in _GLOBALS_ALLOWED_TYPES.items():
             if any(isinstance(value, t) for t in supported_types):
                 self._value: Any = value
@@ -335,18 +405,23 @@ class CopyIfCallgrind:
 
     @property
     def value(self) -> Any:
+        # [FUNCTION DOC] Returns the wrapped value.
         return self._value
 
     @property
     def setup(self) -> str | None:
+        # [FUNCTION DOC] Returns the optional setup code run in the subprocess before loading.
         return self._setup
 
     @property
     def serialization(self) -> Serialization:
+        # [FUNCTION DOC] Returns the Serialization method chosen for the value.
         return self._serialization
 
     @staticmethod
     def unwrap_all(globals: dict[str, Any]) -> dict[str, Any]:
+        # [FUNCTION DOC] Returns a new mapping where each CopyIfCallgrind entry is
+        # replaced by its wrapped value and other entries are unchanged.
         return {
             k: (v.value if isinstance(v, CopyIfCallgrind) else v)
             for k, v in globals.items()
@@ -354,6 +429,9 @@ class CopyIfCallgrind:
 
 
 class GlobalsBridge:
+    # [CLASS DOC] Prepares user globals for the Valgrind subprocess. Holds the validated
+    # mapping of names to CopyIfCallgrind wrappers and a data directory. construct writes
+    # each value to disk and returns source code lines that reload them in the subprocess.
     """Handle the transfer of (certain) globals when collecting Callgrind statistics.
 
     Key takeaway: Any globals passed must be wrapped in `CopyIfCallgrind` to
@@ -427,6 +505,10 @@ class GlobalsBridge:
     """
 
     def __init__(self, globals: dict[str, Any], data_dir: str) -> None:
+        # [FUNCTION DOC] Validates globals and keeps the wrapped entries, skipping torch
+        # and the builtins entry. Creates data_dir if it does not exist (side effect).
+        # Raises ValueError if torch is mocked or if any other entry is not wrapped in
+        # CopyIfCallgrind.
         self._globals: dict[str, CopyIfCallgrind] = {}
         self._data_dir = data_dir
         if not os.path.exists(data_dir):
@@ -450,6 +532,10 @@ class GlobalsBridge:
             self._globals[name] = value
 
     def construct(self) -> str:
+        # [FUNCTION DOC] Serializes every global into data_dir (pickle file, torch save
+        # file or TorchScript save file by method) and returns newline-joined source
+        # text that runs each setup string and then loads the value in the subprocess.
+        # Raises NotImplementedError for an unknown serialization method. Writes files.
         load_lines = []
         for name, wrapped_value in self._globals.items():
             if wrapped_value.setup is not None:
@@ -484,7 +570,15 @@ class GlobalsBridge:
 
 
 class _ValgrindWrapper:
+    # [CLASS DOC] HELPER: Runs Callgrind collection. State: optional JIT-compiled bindings
+    # module, whether the platform supports valgrind, availability of the valgrind tool
+    # commands, and the PyTorch build type. Methods: collect_callgrind (public entry),
+    # _invoke (subprocess run and parsing) and _construct_script (script generation).
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Detects Callgrind bindings in the torch extension module,
+        # otherwise JIT-compiles them (prints a message). Records platform support, checks
+        # the required commands on supported platforms via a subprocess, and extracts the
+        # build type from the torch config. Raises an error if JIT bindings lack symbols.
         self._bindings_module: CallgrindModuleType | None = None
         valgrind_symbols = (
             "_valgrind_supported_platform",
@@ -517,6 +611,8 @@ class _ValgrindWrapper:
             self._build_type = build_search.groups()[0].split(",")[0]
 
     def _validate(self) -> None:
+        # [FUNCTION DOC] HELPER: Raises OSError if the platform is unsupported or if any
+        # required command (valgrind, callgrind_control, callgrind_annotate) is missing.
         if not self._supported_platform:
             raise OSError("Valgrind is not supported on this platform.")
 
@@ -535,6 +631,10 @@ class _ValgrindWrapper:
         is_python: bool,
         retain_out_file: bool,
     ) -> tuple[CallgrindStats, ...]:
+        # [FUNCTION DOC] HELPER: Validates the environment, runs the collection through
+        # _invoke, splits off the baseline (last) result, and returns one CallgrindStats
+        # per repeat that shares the baseline. Raises OSError if unsupported and an error
+        # if a baseline is requested for non-Python timers or the result count is wrong.
         """Collect stats, and attach a reference run which can be used to filter interpreter overhead."""
         self._validate()
         if not is_python and collect_baseline:
@@ -577,6 +677,13 @@ class _ValgrindWrapper:
         is_python: bool,
         retain_out_file: bool,
     ) -> tuple[tuple[FunctionCounts, FunctionCounts, str | None], ...]:
+        # [FUNCTION DOC] HELPER: Creates a temp directory, then for Python writes a
+        # generated script (copying JIT bindings if used) or for C++ compiles a template,
+        # runs it under valgrind's callgrind tool, and parses callgrind_annotate output.
+        # Returns, for each repeat plus a baseline slot, (inclusive, exclusive, optional
+        # raw output); the baseline is empty when not collected. Raises OSError if
+        # valgrind fails (with the error log) and an error for bad arguments or parse
+        # failures. The temp directory is always removed.
         """Core invocation method for Callgrind collection.
 
         Valgrind operates by effectively replacing the CPU with an emulated
@@ -606,6 +713,9 @@ class _ValgrindWrapper:
         stdout_stderr_log = os.path.join(working_dir, "stdout_stderr.log")
 
         def run(args: list[str], **kwargs: Any) -> tuple[CompletedProcessType, str]:
+            # [FUNCTION DOC] HELPER: Runs a subprocess with combined output redirected to a
+            # log file (avoiding pipe deadlocks). Returns the completed process and the
+            # log text; extra keyword arguments go to the subprocess call.
             # https://thraxil.org/users/anders/posts/2008/03/13/Subprocess-Hanging-PIPE-is-your-enemy/
             with open(stdout_stderr_log, "wb") as f_stdout_stderr:
                 invocation = subprocess.run(
@@ -675,6 +785,11 @@ class _ValgrindWrapper:
                 raise OSError(f"Failed to collect callgrind profile:\n{error_report}")
 
             def parse_output(fpath: str, inclusive: bool) -> FunctionCounts:
+                # [FUNCTION DOC] HELPER: Runs callgrind_annotate on a profile file and
+                # scans its text with a small state machine: find the program total, find
+                # the column header, then read count/function rows, skipping rows equal to
+                # the total and separator lines, stopping at the first other line.
+                # Returns a sorted FunctionCounts. Raises an error if parsing never starts.
                 _annotate_invocation, annotate_invocation_output = run([
                     "callgrind_annotate",
                     f"--inclusive={'yes' if inclusive else 'no'}",
@@ -688,6 +803,8 @@ class _ValgrindWrapper:
                 function_pattern = re.compile(r"^\s*([0-9,]+)\s+(.+:.+)$")
 
                 class ScanState(enum.Enum):
+                    # [CLASS DOC] HELPER: Parser phases: looking for the totals line,
+                    # looking for the column header, and reading function rows.
                     SCANNING_FOR_TOTAL = 0
                     SCANNING_FOR_START = 1
                     PARSING = 2
@@ -730,6 +847,9 @@ class _ValgrindWrapper:
                 return FunctionCounts(tuple(sorted(fn_counts, reverse=True)), inclusive=inclusive)
 
             def read_results(i: int) -> tuple[FunctionCounts, FunctionCounts, str | None]:
+                # [FUNCTION DOC] HELPER: Returns the inclusive counts, exclusive counts and
+                # optional raw text for output file number i (one-indexed on disk). The
+                # extra baseline slot without baseline collection yields empty counts.
                 if i == repeats and not collect_baseline:
                     # Null baseline.
                     return (
@@ -766,7 +886,15 @@ class _ValgrindWrapper:
         stat_log: str,
         bindings: CallgrindModuleType | None,
     ) -> str:
+        # [FUNCTION DOC] HELPER: Returns the source of the Python script run under
+        # valgrind. It verifies the interpreter and torch match the parent, loads globals,
+        # runs setup and a short warmup, confirms callgrind is active, then for each repeat
+        # toggles collection around a partially unrolled statement loop and dumps stats;
+        # optionally measures an empty baseline. Failures are written to the error log.
         def block_stmt(stmt: str, indent: int = 0) -> str:
+            # [FUNCTION DOC] HELPER: Builds the statement loop text: blocks of 100 copies
+            # inside a loop plus the remainder copies (no loop when only one block),
+            # indented by the given amount.
             """Partially unroll benchmark loop.
 
             The naive template looks something like:
@@ -913,6 +1041,8 @@ class _ValgrindWrapper:
 
 CALLGRIND_SINGLETON: _ValgrindWrapper | None = None
 def wrapper_singleton() -> _ValgrindWrapper:
+    # [FUNCTION DOC] Returns the process-wide _ValgrindWrapper, creating it on first call
+    # (global state; creation may print a message and JIT-compile bindings).
     global CALLGRIND_SINGLETON
     if CALLGRIND_SINGLETON is None:
         CALLGRIND_SINGLETON = _ValgrindWrapper()

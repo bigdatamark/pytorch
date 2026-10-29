@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 # mypy: allow-untyped-defs
+# [MODULE DOC] Utilities to attach sample ("bundled") inputs to TorchScript modules so
+# benchmarking and coverage tools can run them uniformly. Provides bundle_inputs (copy a
+# model and attach inputs), the in-place augment functions, InflatableArg for compactly
+# stored inputs, helpers bundle_randn and bundle_large_tensor, and private helpers that
+# generate script methods and name inflate helpers. Defines MAX_RAW_TENSOR_SIZE.
+# No import-time side effects beyond imports.
 from typing import Any, TypeVar, NamedTuple
 from collections.abc import Callable, Sequence
 import textwrap
@@ -13,6 +19,11 @@ T = TypeVar("T")
 MAX_RAW_TENSOR_SIZE = 16
 
 class InflatableArg(NamedTuple):
+    # [CLASS DOC] Immutable record describing a compressed bundled input. Fields: value
+    # (the stored deflated data), fmt (a format string that inflates it, using the
+    # reference to the stored value), and fmt_fn (a format string defining an inflate
+    # helper function, whose name fills the placeholder). Setting both fmt_fn and a
+    # non-default fmt is an error when bundling. Only top-level arguments can be inflatable.
     """Helper type for bundled inputs.
 
     'value' is the compressed/deflated input that is stored in the model. Value
@@ -45,6 +56,13 @@ def bundle_inputs(
         *,
         _receive_inflate_expr: list[str] | None = None,
 ) -> torch.jit.ScriptModule:
+    # [FUNCTION DOC] Clones the scripted model (excluding any existing bundled-input
+    # methods and attributes), wraps the clone as a script module, and attaches the
+    # inputs: a mapping of function to inputs goes to the many-function augmenter, a
+    # sequence (or none) goes to the forward-only augmenter. Returns the clone; the input
+    # model is not mutated. Raises an error for non-script modules, and an assertion error
+    # when info's type does not match inputs' type. _receive_inflate_expr is a debug
+    # list that collects generated expressions.
     """Create and return a copy of the specified model with inputs attached.
 
     The original model is not mutated or changed in any way.
@@ -135,6 +153,10 @@ def augment_model_with_bundled_inputs(
         info: list[str] | None = None,  # Optional argument to provide info about forward or its inputs
         skip_size_check=False,
 ) -> None:
+    # [FUNCTION DOC] Mutates the model in place to bundle inputs for forward only. Gives
+    # forward a name if it lacks one, then delegates to the many-function augmenter with
+    # mappings keyed by forward (info only when non-empty). Raises an error for non-script
+    # modules or when the many-function checks fail (e.g. already augmented).
     """Add bundled sample inputs to a model for the forward function.
 
     Models with bundled inputs can be invoked in a uniform manner by
@@ -189,6 +211,16 @@ def augment_many_model_functions_with_bundled_inputs(
         info: dict[Callable, list[str]] | None = None,  # Optional argument to provide info about the function or its inputs
         skip_size_check=False,
 ) -> None:
+    # [FUNCTION DOC] Mutates the model in place: for each function in the inputs mapping,
+    # registers a deflated-inputs attribute, then either relies on a model-defined
+    # generator method (inputs must then be none) or deflates every argument via
+    # _inflate_expr and defines a generator method returning the inflated list. Also
+    # defines get_all_bundled_inputs_for_<name>, forward-only wrappers
+    # (get_all_bundled_inputs, get_num_bundled_inputs) and
+    # get_bundled_inputs_functions_and_info. skip_size_check allows large tensors.
+    # Raises an error for non-script models, empty inputs, a model already augmented,
+    # functions without a name, or missing/conflicting inputs; TypeError for non-sequence
+    # inputs. Side effects: registers attributes and defines script methods.
     """Add bundled sample inputs to a model for an arbitrary list of public functions.
 
     Models with bundled inputs can be invoked in a uniform manner by
@@ -367,6 +399,14 @@ def augment_many_model_functions_with_bundled_inputs(
 def _inflate_expr(
     arg: T, ref: str, inflate_helper_fn_name: str, skip_size_check: bool = False
 ) -> tuple[T | torch.Tensor, str, str | None]:
+    # [FUNCTION DOC] HELPER: Decides how to store one argument. Returns (deflated value,
+    # inflate expression text referencing ref, optional helper function definition text).
+    # InflatableArg uses its fmt or fmt_fn (error if both are set). Tensors: small storage
+    # is kept as is; small contiguous tensors are cloned; constant-filled contiguous
+    # (or channels-last) tensors are stored as one value and re-expanded; otherwise an
+    # error is raised for large tensors unless skip_size_check. Other values pass through.
+    # KNOWN ISSUE: the constant-tensor branch returns an expanded view of the single
+    # element, so the deflated value keeps full logical shape (stride-zero), not a scalar.
     # Allow custom inflation expressions any object.
     # For example, calling custom image-decoding ops.
     # Or just use "{}" as the format string to ignore size limits.
@@ -413,6 +453,11 @@ def _inflate_expr(
         return arg, ref, None
 
 def _get_bundled_inputs_attributes_and_methods(script_module: torch.jit.ScriptModule) -> tuple[list[str], list[str]]:
+    # [FUNCTION DOC] HELPER: Lists the bundled-input methods and attributes present on a
+    # script module so cloning can exclude them. Returns (method names, attribute names)
+    # including per-function getters, generators, deflated attributes and any inflate
+    # helper functions found for each argument and input.
+    # KNOWN ISSUE: lists run_on_bundled_input, which this module never defines.
     methods: list[str] = []
     attributes: list[str] = []
 
@@ -457,16 +502,23 @@ def _get_inflate_helper_fn_name(
     input_idx: int,
     function_name: str,
 ) -> str:
+    # [FUNCTION DOC] HELPER: Returns the deterministic name of the inflate helper for a
+    # function, input index and argument index.
     return f"_inflate_helper_for_{function_name}_input_{input_idx}_arg_{arg_idx}"
 
 
 
 def bundle_randn(*size, dtype=None):
+    # [FUNCTION DOC] Returns an InflatableArg whose stored value is a stride-zero zero
+    # tensor of the given size and dtype and which is inflated by a random normal tensor
+    # of the same shape, so the bundle stays small.
     """Generate a tensor that will be inflated with torch.randn."""
     stub = torch.zeros(1, dtype=dtype).expand(*size)
     return InflatableArg(value=stub, fmt="torch.randn_like({})")
 
 
 def bundle_large_tensor(t):
+    # [FUNCTION DOC] Returns an InflatableArg holding the tensor unchanged with an identity
+    # format, which bypasses the size limit on bundled tensors.
     """Wrap a tensor to allow bundling regardless of size."""
     return InflatableArg(value=t, fmt="{}")

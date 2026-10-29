@@ -1,3 +1,8 @@
+# [MODULE DOC] Torch-aware benchmarking Timer built on timeit. Provides the public Timer
+# (wall-time measurement with warmup, thread control, replicates and Callgrind
+# instruction counts), the Language enum, a synchronizing timer() function, and the
+# internal CPPTimer used for C++ snippets. Exports Timer, timer and Language.
+# No import-time side effects beyond imports.
 """Timer class based on the timeit.Timer class, but torch aware."""
 import enum
 import timeit
@@ -15,17 +20,24 @@ __all__ = ["Timer", "timer", "Language"]
 
 
 def timer() -> float:
+    # [FUNCTION DOC] Returns the current time from the default timeit clock. If an
+    # accelerator is available, first synchronizes it so pending asynchronous work is
+    # included in the measurement.
     if torch.accelerator.is_available():
         torch.accelerator.synchronize()
     return timeit.default_timer()
 
 
 class Language(enum.Enum):
+    # [CLASS DOC] Enumeration of the statement languages a Timer can run: PYTHON and CPP.
     PYTHON = 0
     CPP = 1
 
 
 class CPPTimer:
+    # [CLASS DOC] HELPER: Stand-in for timeit.Timer that times C++ snippets. Holds the
+    # dedented stmt, setup and global_setup strings and lazily compiles a timeit module
+    # through cpp_jit on first use. Exposes a timeit method like timeit.Timer.
     def __init__(
         self,
         stmt: str,
@@ -34,6 +46,9 @@ class CPPTimer:
         timer: Callable[[], float],
         globals: dict[str, Any],
     ) -> None:
+        # [FUNCTION DOC] HELPER: Stores the dedented C++ snippets; compilation is deferred.
+        # Raises NotImplementedError if a custom timer is given while an accelerator is
+        # available, and ValueError if globals is non-empty (unsupported for C++).
         if timer is not timeit.default_timer and torch.accelerator.is_available():
             raise NotImplementedError(
                 "PyTorch was built with accelerators and an accelerator is present; however "
@@ -53,6 +68,9 @@ class CPPTimer:
         self._timeit_module: TimeitModuleType | None = None
 
     def timeit(self, number: int) -> float:
+        # [FUNCTION DOC] HELPER: Runs the C++ statement number times and returns the
+        # elapsed seconds. Compiles and caches the timeit module on the first call
+        # (side effect: JIT compilation).
         if self._timeit_module is None:
             self._timeit_module = cpp_jit.compile_timeit_template(
                 stmt=self._stmt,
@@ -64,6 +82,11 @@ class CPPTimer:
 
 
 class Timer:
+    # [CLASS DOC] Public benchmarking helper wrapping a timeit-style timer (Python) or
+    # CPPTimer (C++). State: the copied globals, the language, the underlying timer
+    # object and a TaskSpec holding stmt, setup, labels and thread count. Key methods:
+    # timeit (fixed count), blocked_autorange and adaptive_autorange (replicates), and
+    # collect_callgrind (instruction counts). All return Measurement or CallgrindStats.
     """Helper class for measuring execution time of PyTorch statements.
 
     For a full tutorial on how to use this class, see:
@@ -187,6 +210,13 @@ class Timer:
         num_threads: int = 1,
         language: Language | str = Language.PYTHON,
     ) -> None:
+        # [FUNCTION DOC] Builds the timer. Copies globals (adding torch for Python),
+        # selects the language (string aliases accepted), dedents and trims stmt and
+        # setup, creates the underlying timer, and records a TaskSpec.
+        # Raises ValueError for a non-string stmt, global_setup used with Python, or an
+        # unknown language; raises an error if the C++ timer class was already swapped.
+        # KNOWN ISSUE: for C++ it sets the timer class on the instance only, so the
+        # swapped-check guards nothing at class level.
         if not isinstance(stmt, str):
             raise ValueError("Currently only a `str` stmt is supported.")
 
@@ -252,11 +282,16 @@ class Timer:
         )
 
     def _timeit(self, number: int) -> float:
+        # [FUNCTION DOC] HELPER: Runs the underlying timer for number iterations and
+        # returns seconds, clamped to a minimum of one nanosecond to avoid division by zero.
         # Even calling a timer in C++ takes ~50 ns, so no real operation should
         # take less than 1 ns. (And this prevents divide by zero errors.)
         return max(self._timer.timeit(number), 1e-9)
 
     def timeit(self, number: int = 1000000) -> common.Measurement:
+        # [FUNCTION DOC] Runs stmt number times in a single replicate under the configured
+        # thread count, after a warmup of about one percent of number (at least 2).
+        # Returns a Measurement with one raw time. Temporarily changes torch threads.
         """Mirrors the semantics of timeit.Timer.timeit().
 
         Execute the main statement (`stmt`) `number` times.
@@ -273,9 +308,13 @@ class Timer:
             )
 
     def repeat(self, repeat: int = -1, number: int = -1) -> None:
+        # [FUNCTION DOC] Unsupported; always raises NotImplementedError pointing to
+        # blocked_autorange.
         raise NotImplementedError("See `Timer.blocked_autorange.`")
 
     def autorange(self, callback: Callable[[int, float], NoReturn] | None = None) -> None:
+        # [FUNCTION DOC] Unsupported; always raises NotImplementedError pointing to
+        # blocked_autorange.
         raise NotImplementedError("See `Timer.blocked_autorange.`")
 
     def _threaded_measurement_loop(
@@ -287,6 +326,11 @@ class Timer:
         max_run_time: float | None = None,
         callback: Callable[[int, float], NoReturn] | None = None
     ) -> list[float]:
+        # [FUNCTION DOC] HELPER: Repeatedly calls time_hook, collecting each result, until
+        # the total time reaches min_run_time and stop_hook says the data suffices.
+        # Also stops early when max_run_time (if set) is exceeded. The optional callback
+        # receives number and each time. Returns the list of times; runs with the
+        # configured torch thread count.
         total_time = 0.0
         can_stop = False
         times: list[float] = []
@@ -303,6 +347,11 @@ class Timer:
         return times
 
     def _estimate_block_size(self, min_run_time: float) -> int:
+        # [FUNCTION DOC] HELPER: Finds the iteration count per block. Measures empty-loop
+        # overhead (median of five runs), then multiplies the count by ten until overhead
+        # is under 0.01 percent of the run and the run is at least min_run_time/1000,
+        # or the run exceeds min_run_time, or the count would overflow a 32-bit int.
+        # Returns the count; doubles as a warmup.
         with common.set_torch_threads(self._task_spec.num_threads):
             # Estimate the block size needed for measurement to be negligible
             # compared to the inner loop. This also serves as a warmup.
@@ -326,6 +375,11 @@ class Timer:
         callback: Callable[[int, float], NoReturn] | None = None,
         min_run_time: float = 0.2,
     ) -> common.Measurement:
+        # [FUNCTION DOC] Estimates a block size, then repeatedly times blocks until
+        # min_run_time total has elapsed. The callback is invoked per block. Returns a
+        # Measurement with all block times.
+        # KNOWN ISSUE: the docstring says overhead is brought under 0.1 percent, but the
+        # code uses a relative overhead threshold of 0.01 percent.
         """Measure many replicates while keeping timer overhead to a minimum.
 
         At a high level, blocked_autorange executes the following pseudo-code::
@@ -365,9 +419,11 @@ class Timer:
         number = self._estimate_block_size(min_run_time)
 
         def time_hook() -> float:
+            # [FUNCTION DOC] HELPER: Times one block of number iterations.
             return self._timeit(number)
 
         def stop_hook(times: list[float]) -> bool:
+            # [FUNCTION DOC] HELPER: Always allows stopping; only min_run_time governs.
             return True
 
         times = self._threaded_measurement_loop(
@@ -389,6 +445,11 @@ class Timer:
             max_run_time: float = 10.0,
             callback: Callable[[int, float], NoReturn] | None = None,
     ) -> common.Measurement:
+        # [FUNCTION DOC] Like blocked_autorange, but keeps collecting blocks until the
+        # Measurement meets the confidence threshold (needs more than 3 blocks), after
+        # at least min_run_time, or until max_run_time elapses. Returns a Measurement.
+        # KNOWN ISSUE: the block size is estimated with a fixed 0.05 seconds, not
+        # min_run_time; the docstring pseudo-code also differs from the confidence test.
         """Similar to `blocked_autorange` but also checks for variability in measurements
         and repeats until iqr/median is smaller than `threshold` or `max_run_time` is reached.
 
@@ -425,9 +486,12 @@ class Timer:
         number = self._estimate_block_size(min_run_time=0.05)
 
         def time_hook() -> float:
+            # [FUNCTION DOC] HELPER: Times one block of number iterations.
             return self._timeit(number)
 
         def stop_hook(times: list[float]) -> bool:
+            # [FUNCTION DOC] HELPER: Returns true once more than 3 times exist and the
+            # resulting Measurement meets the confidence threshold; otherwise false.
             if len(times) > 3:
                 return common.Measurement(
                     number_per_run=number,
@@ -453,6 +517,8 @@ class Timer:
         collect_baseline: bool,
         retain_out_file: bool,
     ) -> valgrind_timer_interface.CallgrindStats:
+        # [FUNCTION DOC] HELPER: Typing overload for repeats None; returns a single
+        # CallgrindStats.
         ...
 
     @overload
@@ -464,6 +530,8 @@ class Timer:
         collect_baseline: bool,
         retain_out_file: bool,
     ) -> tuple[valgrind_timer_interface.CallgrindStats, ...]:
+        # [FUNCTION DOC] HELPER: Typing overload for integer repeats; returns a tuple of
+        # CallgrindStats.
         ...
 
     def collect_callgrind(
@@ -474,6 +542,12 @@ class Timer:
         collect_baseline: bool = True,
         retain_out_file: bool = False,
     ) -> Any:
+        # [FUNCTION DOC] Runs stmt under Callgrind in a subprocess via the singleton
+        # valgrind wrapper, after one local trial run to catch errors early. Returns one
+        # CallgrindStats if repeats is None, else a tuple of them. Baseline collection
+        # applies to Python only. Raises ValueError for a non-string stmt or repeats < 1,
+        # and an error if C++ timers have globals. Side effects: spawns processes, may
+        # keep the out file.
         """Collect instruction counts using Callgrind.
 
         Unlike wall times, instruction counts are deterministic
