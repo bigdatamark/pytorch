@@ -1,4 +1,12 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Multi-GPU tests of FSDP collective communication behavior.
+# Defines TestCommunication, which counts all-gather and reduce-scatter calls (via mocked
+# torch.distributed single-tensor collectives) per iteration for FULL_SHARD / SHARD_GRAD_OP,
+# with and without no_sync(), and TestExplicitUnshard, which checks the private
+# _unshard(async_op=...) API overlaps with other async collectives and works after backward.
+# Import-time side effects: exits the process (status 0) if torch.distributed is unavailable
+# or under dev-asan; computes the device type; instantiates device-generic test classes for
+# cuda/hpu/xpu at module level. Running the file calls run_tests().
 import sys
 from contextlib import nullcontext
 from enum import auto, Enum
@@ -45,12 +53,17 @@ if TEST_WITH_DEV_DBG_ASAN:
 
 
 class PassType(Enum):
+    # [CLASS DOC] HELPER: Enum naming the two phases of an iteration (FWD, BWD) whose
+    # all-gather counts are computed separately; iteration order is forward then backward.
     __order__ = "FWD BWD"
     FWD = auto()
     BWD = auto()
 
 
 class TestCommunication(FSDPTestContinuous):
+    # [CLASS DOC] Multi-process test case that verifies the number of all-gathers and
+    # reduce-scatters FSDP issues per iteration against analytically derived reference counts.
+    # Stateless apart from the inherited process group; helper methods compute the references.
     """Tests ``FullyShardedDataParallel``'s collective communication usage."""
 
     def _init_model(
@@ -59,6 +72,10 @@ class TestCommunication(FSDPTestContinuous):
         nested_model: bool,
         sharding_strategy: ShardingStrategy,
     ):
+        # [FUNCTION DOC] HELPER: Builds the FSDP model under test. With nested_model, wraps a
+        # recursively wrapped NestedWrappedModule in an outer FSDP; otherwise builds a
+        # recursively wrapped TransformerWithSharedParams. The device argument is unused (the
+        # module-level device_type is used). Returns the FSDP model.
         fsdp_kwargs = {
             "sharding_strategy": sharding_strategy,
             "device_id": device_type.type,
@@ -85,6 +102,9 @@ class TestCommunication(FSDPTestContinuous):
         return fsdp_model
 
     def _run_iter(self, fsdp_model, batch, use_no_sync: bool):
+        # [FUNCTION DOC] HELPER: Runs one forward, loss computation and backward on the model,
+        # inside no_sync() if use_no_sync else a null context. Accumulates gradients; returns
+        # nothing.
         """Runs an iteration inside or outside the ``no_sync()`` context."""
         context = fsdp_model.no_sync() if use_no_sync else nullcontext()
         with context:
@@ -97,6 +117,8 @@ class TestCommunication(FSDPTestContinuous):
         num_fsdp: int,
         in_no_sync: bool,
     ) -> int:
+        # [FUNCTION DOC] HELPER: Expected reduce-scatter count for one iteration: one per FSDP
+        # instance that manages parameters, or zero when the iteration ran in no_sync().
         """Returns the reference number of reduce-scatters for an iteration
         in the ``no_sync()`` context."""
         return num_fsdp if not in_no_sync else 0
@@ -108,6 +130,8 @@ class TestCommunication(FSDPTestContinuous):
         is_first_iter: bool,
         is_last_iter_no_sync: bool,
     ) -> int:
+        # [FUNCTION DOC] HELPER: Expected all-gather count for a whole iteration: the sum of
+        # the per-pass reference counts over the forward and backward passes.
         """Returns the reference number of all-gathers in an iteration, summing
         over the forward and backward passes."""
         return sum(
@@ -129,6 +153,13 @@ class TestCommunication(FSDPTestContinuous):
         is_first_iter: bool,
         is_last_iter_no_sync: bool,
     ):
+        # [FUNCTION DOC] HELPER: Expected all-gather count for a single pass. A None strategy
+        # is treated as FULL_SHARD. Forward: zero for SHARD_GRAD_OP if the previous iteration
+        # ran in no_sync() (parameters were never freed), else one per FSDP instance; on the
+        # first iteration the forward count is tripled because execution-order validation adds
+        # two extra all-gathers per real one. Backward: FULL_SHARD gives one per instance
+        # except the root; SHARD_GRAD_OP gives zero. Raises AssertionError for any other
+        # strategy/pass combination.
         """Returns the reference number of all-gathers for a given setting."""
         if sharding_strategy is None:
             sharding_strategy = ShardingStrategy.FULL_SHARD  # default
@@ -182,6 +213,9 @@ class TestCommunication(FSDPTestContinuous):
         is_first_iter: bool,
         is_last_iter_no_sync: bool,
     ):
+        # [FUNCTION DOC] HELPER: Debugging aid that prints, on rank 0 only, the pass type,
+        # iteration flags, strategy and the reference all-gather count for that setting.
+        # Not called by the tests; prints to stdout.
         """Helper method for printing the number of all-gathers for a specific
         setting. This may be helpful since the branching is complex."""
         if self.rank != 0:
@@ -212,6 +246,12 @@ class TestCommunication(FSDPTestContinuous):
         use_no_sync: bool,
         sharding_strategy: ShardingStrategy | None,
     ):
+        # [FUNCTION DOC] Parameterized over nested model, no_sync use and sharding strategy
+        # (SHARD_GRAD_OP or default). Enables detailed distributed debug level, builds the
+        # model, then with all-gather and reduce-scatter single-tensor collectives mocked,
+        # runs three iterations inside no_sync() (only if requested) followed by three
+        # iterations outside it, asserting after each that the mock call counts equal the
+        # reference counts. Side effect: sets the global distributed debug level.
         """
         Tests FSDP's communication cost in terms of calls to collective
         communication primitives (i.e. all-gather and reduce-scatter).
@@ -247,6 +287,8 @@ class TestCommunication(FSDPTestContinuous):
         ):
 
             def reset_mocks():
+                # [FUNCTION DOC] HELPER: Clears the recorded calls of both collective mocks
+                # so the next iteration's counts start from zero.
                 mock_all_gather.reset_mock()
                 mock_reduce_scatter.reset_mock()
 
@@ -290,20 +332,36 @@ class TestCommunication(FSDPTestContinuous):
 
 
 class TestExplicitUnshard(FSDPTestContinuous):
+    # [CLASS DOC] Multi-process test case for FSDP's private explicit-unshard API; compares
+    # against a DDP reference model and checks the handle returned by _unshard.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] Number of processes to launch: the accelerator device count, capped
+        # at 2.
         return min(_get_device_module(self.device_type).device_count(), 2)
 
     @skip_if_lt_x_gpu(2)
     @parametrize("use_orig_params", [False, True])
     def test_unshard_async(self, device, use_orig_params: bool):
+        # [FUNCTION DOC] Checks that asynchronously unsharding FSDP-wrapped MLPs while
+        # non-differentiable async all-reduces are in flight yields the same losses as a plain
+        # DDP reference. Builds the reference and a model whose inner MLPs are FSDP-wrapped
+        # (SHARD_GRAD_OP, parameters ignored by the outer DDP), then runs ten training steps
+        # on both with Adam, asserting equal losses and waiting on unshard streams each step.
         class ReduceModule(nn.Module):
+            # [CLASS DOC] HELPER: Linear-plus-relu module that also launches an async
+            # all-reduce on its output over the given group and returns both result and work.
             def __init__(self, dim: int, group: dist.ProcessGroup):
+                # [FUNCTION DOC] HELPER: Stores the group and creates a random dim x dim
+                # weight parameter.
                 super().__init__()
                 self.group = group
                 self.weight = nn.Parameter(torch.randn(dim, dim))
 
             def forward(self, x: torch.Tensor):
+                # [FUNCTION DOC] HELPER: Computes relu of x times the weight, starts an async
+                # in-place all-reduce on it, and returns the tensor and the work handle (the
+                # caller must wait on the work).
                 y = F.relu(x @ self.weight)
                 # NOTE: This all-reduce is not differentiable and is included
                 # to exercise the overlap.
@@ -311,13 +369,19 @@ class TestExplicitUnshard(FSDPTestContinuous):
                 return y, work
 
         class MLPs(nn.Module):
+            # [CLASS DOC] HELPER: Three independent MLPs applied to three inputs whose
+            # all-reduces must complete first; the FSDP-wrapped submodule in the test.
             def __init__(self, dim: int):
+                # [FUNCTION DOC] HELPER: Creates three MLP submodules of width dim.
                 super().__init__()
                 self.mlp1 = MLP(dim)
                 self.mlp2 = MLP(dim)
                 self.mlp3 = MLP(dim)
 
             def forward(self, ys: list[torch.Tensor], works: list[dist.Work]):
+                # [FUNCTION DOC] HELPER: For each of the three (input, work) pairs in order,
+                # waits on the pending all-reduce then applies the matching MLP; returns the
+                # sum of the three outputs.
                 (y1, y2, y3), (work1, work2, work3) = ys, works
                 work1.wait()
                 z1 = self.mlp1(y1)
@@ -328,7 +392,11 @@ class TestExplicitUnshard(FSDPTestContinuous):
                 return z1 + z2 + z3
 
         class ReduceModel(nn.Module):
+            # [CLASS DOC] HELPER: Model of three ReduceModules feeding one MLPs block; its
+            # forward triggers explicit async unshard of each FSDP-wrapped MLP to overlap with
+            # the later all-reduces.
             def __init__(self, dim: int, group: dist.ProcessGroup):
+                # [FUNCTION DOC] HELPER: Creates three ReduceModules and the MLPs block.
                 super().__init__()
                 self.reduce_module1 = ReduceModule(dim, group)
                 self.reduce_module2 = ReduceModule(dim, group)
@@ -336,6 +404,9 @@ class TestExplicitUnshard(FSDPTestContinuous):
                 self.mlps = MLPs(dim)
 
             def forward(self, x: torch.Tensor):
+                # [FUNCTION DOC] HELPER: Runs the three reduce modules on x; after each, if the
+                # corresponding MLP is an FSDP instance, starts its asynchronous unshard so it
+                # overlaps with the next all-reduce. Returns the MLPs block output.
                 y1, work1 = self.reduce_module1(x)
                 if isinstance(self.mlps.mlp1, FSDP):
                     self.mlps.mlp1._unshard(async_op=True)
@@ -385,6 +456,10 @@ class TestExplicitUnshard(FSDPTestContinuous):
     def test_unshard_after_backward(
         self, device, use_orig_params: bool, async_op: bool
     ):
+        # [FUNCTION DOC] Regression test: after a forward and backward through a model whose
+        # first layer is FSDP-wrapped, calling _unshard must not raise. With async_op it must
+        # return a handle that can be waited on; without, it must return None. Afterwards the
+        # wrapped parameters must be non-empty.
         """
         Tests that _unshard() works correctly after backward().
         This is a regression test for issue #168947 where a Stream was

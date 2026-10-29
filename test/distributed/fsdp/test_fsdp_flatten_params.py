@@ -1,4 +1,12 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Single-rank unit tests of FSDP parameter flattening (FlatParamHandle and the
+# flat parameter): partial flattening of a transformer, empty parameter lists and empty
+# modules, element count preservation with and without shared parameters, forward output and
+# parameter-norm parity with the unwrapped module, shard metadata computation (unaligned,
+# 16-byte-aligned in full and mixed precision, and with channels_last memory format), and
+# writing back a changed original parameter dtype under NO_SHARD. Import-time side effects:
+# exits with status 0 if distributed is unavailable or under dev-asan; parametrized tests are
+# instantiated at module level. Running the file calls run_tests().
 
 import sys
 
@@ -34,16 +42,24 @@ if TEST_WITH_DEV_DBG_ASAN:
 
 
 class TestFlattenParams(FSDPTestContinuous):
+    # [CLASS DOC] Test case for flat parameter construction and shard metadata. Runs with a
+    # single process; transformer-based helpers create models with deterministic seeds, and
+    # many tests are run for full and half precision modules via run_subtests.
     """Tests parameter flattening and shard metadata logic."""
 
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] Number of processes to launch: always 1 (the tests need no peers).
         # Clamp the world size to 1 since these unit tests either exercise only
         # the flattening logic or check sharding subroutines directly without
         # requiring multiple ranks
         return 1
 
     def _get_default_config(self):
+        # [FUNCTION DOC] HELPER: Returns the keyword arguments for constructing a
+        # FlatParamHandle: current accelerator (or CPU) device, FULL_SHARD strategy, no
+        # offload, no mixed precision dtypes, no low-precision grads, this test's process
+        # group, use_orig_params off and no FSDP extension.
         device_type = (
             acc.type if (acc := torch.accelerator.current_accelerator()) else "cpu"
         )
@@ -60,6 +76,10 @@ class TestFlattenParams(FSDPTestContinuous):
         }
 
     def _get_transformer(self, seed=0):
+        # [FUNCTION DOC] HELPER: Seeds the RNG and builds a small nn.Transformer (model dim 32,
+        # two encoder and two decoder layers, feedforward 128, dropout 0.1), adds a scalar
+        # buffer, and attaches a get_input function (returns seeded random source and target
+        # tensors on the given device/dtype). Returns the module.
         torch.manual_seed(seed)  # keep everything deterministic
         module = torch.nn.Transformer(
             d_model=32,
@@ -71,6 +91,8 @@ class TestFlattenParams(FSDPTestContinuous):
         module.dummy_buffer = nn.Buffer(torch.tensor(1.0))
 
         def get_input(device, dtype):
+            # [FUNCTION DOC] HELPER: Seeds the RNG with 1 and returns a (source, target) tuple
+            # of random tensors shaped 20x8x32 and 10x8x32 on the given device and dtype.
             torch.manual_seed(1)  # keep everything deterministic
             src = torch.rand(20, 8, 32).to(device=device, dtype=dtype)  # T x B x C
             tgt = torch.rand(10, 8, 32).to(device=device, dtype=dtype)  # T x B x C
@@ -80,6 +102,8 @@ class TestFlattenParams(FSDPTestContinuous):
         return module
 
     def _get_shared_params_transformer(self, seed=0):
+        # [FUNCTION DOC] HELPER: Builds the transformer and makes each decoder layer share
+        # both feedforward weight tensors with the matching encoder layer. Returns the module.
         module = self._get_transformer(seed=seed)
         # share the FFNs
         for enc_layer, dec_layer in zip(module.encoder.layers, module.decoder.layers):
@@ -89,6 +113,7 @@ class TestFlattenParams(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(1)
     def test_partial_flattening(self):
+        # [FUNCTION DOC] Runs the partial flattening check in float32 and float16.
         """Tests flattening some submodules but not others."""
         self.run_subtests(
             {"half": [False, True]},
@@ -96,6 +121,11 @@ class TestFlattenParams(FSDPTestContinuous):
         )
 
     def _test_partial_flattening(self, half: bool):
+        # [FUNCTION DOC] HELPER: Wraps one encoder layer and one decoder layer in FSDP and
+        # asserts: total flat parameter elements equal the wrapped layers' original element
+        # count, total model elements are unchanged, each wrapped layer exposes exactly one
+        # parameter, unwrapped layers keep their original parameter count, and converting the
+        # module to another dtype changes the flat parameters and the unwrapped parameters.
         module = self._get_transformer()
         if half:
             module = module.half()
@@ -145,6 +175,7 @@ class TestFlattenParams(FSDPTestContinuous):
         )
 
     def test_flatten_nothing(self):
+        # [FUNCTION DOC] Runs the empty-parameter-list check in float32 and float16.
         """
         Tests that constructing a ``FlatParamHandle`` with no parameters
         raises an error.
@@ -155,6 +186,8 @@ class TestFlattenParams(FSDPTestContinuous):
         )
 
     def _test_flatten_nothing(self, half: bool):
+        # [FUNCTION DOC] HELPER: Asserts that constructing a FlatParamHandle from an empty
+        # parameter list raises ValueError mentioning an empty parameter list.
         module = self._get_transformer()
         if half:
             module = module.half()
@@ -170,6 +203,9 @@ class TestFlattenParams(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(1)
     def test_empty_module(self):
+        # [FUNCTION DOC] Wraps a parameter-free module in FSDP and asserts it exposes no
+        # parameters, has no flat parameter (None), and produces the same forward output as the
+        # unwrapped module.
         """
         Tests flattening an empty module (i.e. one without any parameters).
         """
@@ -183,20 +219,28 @@ class TestFlattenParams(FSDPTestContinuous):
         self.assertEqual(ref_out, fsdp_out)
 
     def _get_empty_module(self):
+        # [FUNCTION DOC] HELPER: Seeds the RNG and returns an instance of a parameter-free
+        # module that adds one to its input.
         """Returns a module with no parameters."""
         torch.manual_seed(0)  # keep everything deterministic
 
         class EmptyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with no parameters or buffers; forward adds one.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input plus one.
                 return x + 1
 
             def get_input(self, device, dtype):
+                # [FUNCTION DOC] HELPER: Seeds the RNG with 1 and returns a random
+                # one-element tensor on the given device and dtype.
                 torch.manual_seed(1)  # keep everything deterministic
                 return torch.rand(1).to(device=device, dtype=dtype)
 
         return EmptyModule()
 
     def test_numel_without_shared_params(self):
+        # [FUNCTION DOC] Runs the element count check on an unshared transformer in float32
+        # and float16.
         """
         Tests that numel is preserved after flattening when there are no shared
         parameters in the module.
@@ -207,12 +251,16 @@ class TestFlattenParams(FSDPTestContinuous):
         )
 
     def _test_numel_without_shared_params(self, half: bool):
+        # [FUNCTION DOC] HELPER: Builds the plain transformer (optionally half precision) and
+        # runs the element count check.
         module = self._get_transformer()
         if half:
             module = module.half()
         self._test_numel(module)
 
     def test_numel_with_shared_params(self):
+        # [FUNCTION DOC] Runs the element count check on a shared-parameter transformer in
+        # float32 and float16.
         """
         Tests that numel is preserved after flattening when there are shared
         parameters in the module.
@@ -223,12 +271,18 @@ class TestFlattenParams(FSDPTestContinuous):
         )
 
     def _test_numel_with_shared_params(self, half: bool):
+        # [FUNCTION DOC] HELPER: Builds the shared-parameter transformer (optionally half
+        # precision) and runs the element count check.
         module = self._get_shared_params_transformer()
         if half:
             module = module.half()
         self._test_numel(module)
 
     def _test_numel(self, module):
+        # [FUNCTION DOC] HELPER: Creates a FlatParamHandle over all module parameters with the
+        # default config and asserts the flat parameter's element count equals the sum of the
+        # module's parameter element counts (parameters yielded by parameters() are
+        # deduplicated, so shared ones count once).
         ref_numel = sum(p.numel() for p in module.parameters())
         params_to_flatten = list(module.parameters())
         flat_param_handle = FlatParamHandle(
@@ -240,6 +294,8 @@ class TestFlattenParams(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(1)
     def test_output_without_shared_params(self):
+        # [FUNCTION DOC] Runs the forward output parity check on an unshared transformer in
+        # float32 and float16.
         """
         Tests a forward pass after flattening when there are no shared
         parameters in the module.
@@ -250,6 +306,8 @@ class TestFlattenParams(FSDPTestContinuous):
         )
 
     def _test_output_without_shared_params(self, half: bool):
+        # [FUNCTION DOC] HELPER: Builds the plain transformer (optionally half precision) and
+        # runs the output parity check.
         module = self._get_transformer()
         if half:
             module = module.half()
@@ -257,6 +315,8 @@ class TestFlattenParams(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(1)
     def test_output_with_shared_params(self):
+        # [FUNCTION DOC] Runs the forward output parity check on a shared-parameter
+        # transformer in float32 and float16.
         """
         Tests a forward pass after flattening when there are shared parameters
         in the module.
@@ -267,12 +327,16 @@ class TestFlattenParams(FSDPTestContinuous):
         )
 
     def _test_output_with_shared_params(self, half: bool):
+        # [FUNCTION DOC] HELPER: Builds the shared-parameter transformer (optionally half
+        # precision) and runs the output parity check.
         module = self._get_shared_params_transformer()
         if half:
             module = module.half()
         self._test_output(module)
 
     def _test_output(self, module: nn.Module):
+        # [FUNCTION DOC] HELPER: Moves the module to this rank's device, computes its forward
+        # output, wraps it in FSDP, computes the output again, and asserts both are equal.
         module = module.to(self.rank)
         ref_output = self._get_output(module)
         fsdp_module = FSDP(module)
@@ -280,6 +344,8 @@ class TestFlattenParams(FSDPTestContinuous):
         self.assertEqual(ref_output, fsdp_output)
 
     def _get_output(self, module):
+        # [FUNCTION DOC] HELPER: Reads the device and dtype of the module's first parameter,
+        # asks the module for a matching input and returns its forward output.
         device = next(module.parameters()).device
         dtype = next(module.parameters()).dtype
         input = module.get_input(device, dtype)
@@ -287,6 +353,8 @@ class TestFlattenParams(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(1)
     def test_pnorm_after_step_with_shared_params(self):
+        # [FUNCTION DOC] Runs the parameter-norm-after-step parity check in float32 and
+        # float16.
         """
         Tests for parameter Frobenius norm parity after an optimizer step when
         there are shared parameters in the module. If the parameter sharing is
@@ -298,6 +366,9 @@ class TestFlattenParams(FSDPTestContinuous):
         )
 
     def _test_pnorm_after_step_with_shared_params(self, half: bool):
+        # [FUNCTION DOC] HELPER: Computes the parameter norm after one SGD step for a plain
+        # shared-parameter transformer, then recreates the same model, wraps it in FSDP,
+        # computes the same quantity, and asserts the two norms are equal.
         module = self._get_shared_params_transformer().to(self.rank)
         if half:
             module = module.half()
@@ -310,6 +381,8 @@ class TestFlattenParams(FSDPTestContinuous):
         self.assertEqual(ref_pnorm_after_step, fsdp_pnorm_after_step)
 
     def _get_pnorm_after_step(self, module):
+        # [FUNCTION DOC] HELPER: Runs one forward, backward and SGD step (lr 0.01) on the
+        # module and returns the norm of the stacked per-parameter norms. Mutates the module.
         optim = torch.optim.SGD(module.parameters(), lr=0.01)
         loss = self._get_output(module).sum()
         loss.backward()
@@ -317,6 +390,11 @@ class TestFlattenParams(FSDPTestContinuous):
         return torch.norm(torch.stack([p.detach().norm() for p in module.parameters()]))
 
     def test_flat_param_shard_metadata_unaligned(self):
+        # [FUNCTION DOC] Builds a handle over three bias-free 10x10 linear weights (300
+        # elements, no padding) and checks the shard metadata for many inclusive start/end
+        # index ranges: single-element, partial, spanning two or three parameters, and an end
+        # index past the last element. Expected offsets are inclusive element ranges within
+        # each parameter.
         """
         Tests that ``FlatParameter`` shard metadata are computed as expected
         without any explicit alignment padding.
@@ -468,6 +546,10 @@ class TestFlattenParams(FSDPTestContinuous):
         )
 
     def test_flat_param_shard_metadata_aligned_full_precision(self):
+        # [FUNCTION DOC] With original-parameter mode and float32, parameters are padded to a
+        # multiple of four elements (16 bytes), so the 21, 35 and 25 element weights lay out as
+        # 85 elements. Checks metadata for the two halves a 2-rank split would give; padding is
+        # counted in positions but never reported in the metadata.
         """
         Tests that ``FlatParameter`` shard metadata are computed as expected
         with alignment padding and parameter full precision.
@@ -521,6 +603,10 @@ class TestFlattenParams(FSDPTestContinuous):
         )
 
     def test_flat_param_shard_metadata_aligned_mixed_precision(self):
+        # [FUNCTION DOC] Same as the full precision alignment test but with a float16 parameter
+        # mixed-precision dtype, so padding aligns to eight elements (16 bytes): the 10, 25
+        # and 15 element weights lay out as 63 elements. Checks the metadata for the two halves
+        # a 2-rank split would give.
         """
         Tests that ``FlatParameter`` shard metadata are computed as expected
         with alignment padding and parameter mixed precision.
@@ -581,6 +667,10 @@ class TestFlattenParams(FSDPTestContinuous):
         end: int,
         expected: FlatParamShardMetadata,
     ):
+        # [FUNCTION DOC] HELPER: Overwrites the handle's flat parameter shard info with the
+        # result of computing shard metadata for the inclusive start/end range, reads it back
+        # via the public shard metadata accessor, and asserts it equals expected. Mutates the
+        # flat parameter.
         """
         Tests the subroutine ``_get_shard_metadata()`` that computes shard
         metadata based on start and end indices in the unsharded flat
@@ -603,6 +693,12 @@ class TestFlattenParams(FSDPTestContinuous):
 
     @parametrize("memory_format", [torch.contiguous_format, torch.channels_last])
     def test_flat_param_shard_metadata_with_memory_format(self, memory_format):
+        # [FUNCTION DOC] Parametrized over contiguous and channels_last layout. Builds three
+        # bias-free conv weights (1800, 5000 and 100 elements) in that layout and checks the
+        # shard metadata for two ranges (0-2999 and 3000-6899) including the layout-dependent
+        # strides and contiguity flags.
+        # KNOWN ISSUE: the docstring is copied from another test and mentions alignment padding
+        # and full precision, which this test does not exercise.
         """
         Tests that ``FlatParameter`` shard metadata are computed as expected
         with alignment padding and parameter full precision.
@@ -652,12 +748,21 @@ class TestFlattenParams(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(1)
     def test_writeback_orig_params_no_shard(self):
+        # [FUNCTION DOC] Wraps a half-precision embedding model with NO_SHARD and original
+        # parameters, then (emulating a user library) converts each flat parameter's data to
+        # float32 and sets the handle's recorded original dtype to float32. A no_grad forward on
+        # random indices must succeed and return a scalar.
         class EmbeddingModel(nn.Module):
+            # [CLASS DOC] HELPER: Module with one 5 by 4 embedding; forward returns the sum of
+            # looked-up embeddings as a scalar.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the embedding layer.
                 super().__init__()
                 self.emb = nn.Embedding(5, 4)
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Looks up embeddings for indices x and sums all
+                # elements into a scalar tensor.
                 return self.emb(x).sum()
 
         model = EmbeddingModel().half().to(self.rank)

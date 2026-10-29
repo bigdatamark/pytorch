@@ -1,4 +1,12 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Multi-GPU tests of FSDP's gradient communication hook interface.
+# Covers the default (no hook) behavior and gradient values, registration rules for
+# register_comm_hook (only once, only on the root, not for hybrid sharding), and that the
+# built-in fp16/bf16 compress hooks produce the same gradients as MixedPrecision with
+# reduce_dtype. Also defines a small test network and dummy hook/state helpers.
+# Import-time side effects: exits with status 0 if torch.distributed is unavailable; computes
+# the accelerator device type (cpu fallback) and whether bf16 is supported; running the file
+# calls run_tests().
 
 import sys
 
@@ -37,7 +45,16 @@ BFLOAT16_AVAILABLE = torch.cuda.is_bf16_supported() or torch.xpu.is_bf16_support
 
 
 class Net(nn.Module):
+    # [CLASS DOC] HELPER: Small network (8 -> 16 -> 8 -> 4 linear layers) used by the hook
+    # tests. The "net" part is either a plain Sequential or, when has_wrapping is set, an FSDP
+    # root around a Sequential whose last Linear is itself a nested FSDP instance. The final
+    # "out" Linear is never wrapped here.
     def __init__(self, has_wrapping, sharding_strategy, mixed_precision=None):
+        # [FUNCTION DOC] HELPER: Seeds the CPU and accelerator RNGs with 0 for determinism
+        # before building layers. If has_wrapping, wraps the inner Linear and the whole
+        # Sequential in FSDP using the given sharding strategy, mixed precision and the
+        # current accelerator index as device_id; otherwise uses an unwrapped Sequential.
+        # Side effect: reseeds global RNGs.
         # to ensure determinism
         torch.manual_seed(0)
         torch.get_device_module(device_type).manual_seed(0)
@@ -65,19 +82,29 @@ class Net(nn.Module):
         self.out = nn.Linear(8, 4)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies the net, a relu, then the output Linear; returns
+        # the result.
         return self.out(F.relu(self.net(x)))
 
 
 class DummyState:
+    # [CLASS DOC] HELPER: Plain state object (slots: process_group, noise) handed to dummy
+    # communication hooks; noise is the value added to gradients.
     __slots__ = ["process_group", "noise"]
 
     def __init__(self, process_group: dist.ProcessGroup, noise: int):
+        # [FUNCTION DOC] HELPER: Stores the process group and the noise amount.
         self.process_group = process_group
         self.noise = noise
 
 
 class DummyHook:
+    # [CLASS DOC] HELPER: Namespace of illustrative communication hooks and a stub
+    # reduce-scatter. The hooks are registered in tests but never actually run by them.
     def dummy_hook_for_no_shard_fsdp(self, state: DummyState, grad: torch.Tensor):
+        # [FUNCTION DOC] HELPER: Hook for unsharded (NO_SHARD) training: adds the state's noise
+        # to the gradient in place, then all-reduces it over the state's process group (sum).
+        # Mutates grad; returns nothing.
         """
         This communication hook is for illustration and testing purpose only.
         This communication hook is used during FSDP ``NO_SHARD`` training. It adds some noise to
@@ -88,6 +115,7 @@ class DummyHook:
         dist.all_reduce(grad, group=state.process_group)
 
     def custom_reduce_scatter(self, output, input, group=None):
+        # [FUNCTION DOC] HELPER: Placeholder for a custom reduce-scatter; does nothing.
         """
         This function is for illustrative purpose only.
         It is meant to implement a custom reduce-scatter
@@ -98,6 +126,9 @@ class DummyHook:
     def dummy_hook_for_sharded_fsdp(
         self, state: DummyState, grad: torch.Tensor, output: torch.Tensor
     ):
+        # [FUNCTION DOC] HELPER: Hook for sharded training: adds the state's noise to the
+        # gradient in place, then calls the (no-op) custom reduce-scatter with output, grad and
+        # the state's group. Because that stub does nothing, output is left untouched.
         """
         This communication hook is for illustration and testing purposes only.
         This communication hook is used during FSDP ``FULL_SHARD`` or ``SHARD_GRAD_OP`` training.
@@ -109,6 +140,8 @@ class DummyHook:
 
 
 class TestCommunicationHooks(FSDPTest):
+    # [CLASS DOC] Multi-process FSDP test case (at least 2 GPUs) for communication hook
+    # defaults, registration constraints, and the fp16/bf16 compression hooks.
     @skip_if_lt_x_gpu(2)
     @parametrize(
         "sharding_strategy",
@@ -121,6 +154,10 @@ class TestCommunicationHooks(FSDPTest):
     def test_default_communication_hook_behavior(
         self, sharding_strategy: ShardingStrategy | None
     ):
+        # [FUNCTION DOC] Wraps a bias-free 1-input linear layer in FSDP and verifies that every
+        # FSDP module has no comm hook by default. Over four iterations (zeroing grads each
+        # time) checks the first element of the weight gradient equals the mean of all ranks,
+        # because each rank feeds its own rank as input and gradients are averaged.
         """
         Tests FSDP's default communication hook's behavior and correctness.
         This test creates a simple linear net with weight shape  ``1 X N``,
@@ -165,6 +202,8 @@ class TestCommunicationHooks(FSDPTest):
             )
 
     def _get_submodules(self, fsdp_net):
+        # [FUNCTION DOC] HELPER: Returns the list of FSDP modules inside fsdp_net that are not
+        # the root.
         return [
             submodule
             for submodule in FSDP.fsdp_modules(fsdp_net)
@@ -172,6 +211,9 @@ class TestCommunicationHooks(FSDPTest):
         ]
 
     def _init_model(self, core, sharding_strategy, mixed_precision=None):
+        # [FUNCTION DOC] HELPER: Wraps core in an FSDP root with the given strategy and
+        # mixed precision, using the current accelerator index as device_id, and moves it to
+        # the module-level device type. Returns the FSDP model.
         device = torch.device(device_type)
         return FSDP(
             core,
@@ -193,6 +235,12 @@ class TestCommunicationHooks(FSDPTest):
     def test_default_communication_hook_initialization(
         self, has_wrapping: bool, sharding_strategy: ShardingStrategy | None
     ):
+        # [FUNCTION DOC] Builds a Net (wrapped or not) in FSDP, checks all FSDP modules start
+        # with no hook, registers a dummy hook and state on the root, and checks that a second
+        # registration raises AssertionError ("already registered") and that the hook and state
+        # are set on the root and every nested FSDP module.
+        # KNOWN ISSUE: the hook choice is inverted (the NO_SHARD hook is used for sharded
+        # strategies and the sharded hook for NO_SHARD); harmless since the hook never runs.
         """
         Tests FSDP's communication hook interface behavior.
 
@@ -243,6 +291,11 @@ class TestCommunicationHooks(FSDPTest):
     def test_registering_hook_non_root(
         self, sharding_strategy: ShardingStrategy | None
     ):
+        # [FUNCTION DOC] Builds a wrapped Net and verifies that registering a comm hook on a
+        # non-root FSDP submodule raises AssertionError saying it can only be called on a
+        # root instance.
+        # KNOWN ISSUE: docstring says only NO_SHARD is tested but three strategies are
+        # parametrized; the dummy hook choice is also inverted relative to the strategy.
         """
         Tests FSDP's communication hook registering for submodules.
         Make sure it can't be registered for non-root submodules.
@@ -273,6 +326,9 @@ class TestCommunicationHooks(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_registering_hook_hybrid_strategy(self):
+        # [FUNCTION DOC] For HYBRID_SHARD and the private hybrid zero2 strategy, wraps a
+        # Linear-wrapped Net and checks that register_comm_hook raises AssertionError stating
+        # communication hooks are unsupported for hybrid strategies.
         for sharding_strategy in (
             ShardingStrategy.HYBRID_SHARD,
             ShardingStrategy._HYBRID_SHARD_ZERO2,
@@ -303,6 +359,11 @@ class TestCommunicationHooks(FSDPTest):
     def test_registering_hook_submodules(
         self, sharding_strategy: ShardingStrategy | None
     ):
+        # [FUNCTION DOC] Sets a hook directly on a nested FSDP submodule's private attribute,
+        # then checks that registering a hook on the root raises AssertionError ("already
+        # registered"), i.e. registration refuses when any module already has a hook.
+        # KNOWN ISSUE: docstring says only NO_SHARD is tested but three strategies run; the
+        # dummy hook choice is inverted relative to the strategy.
         """
         Tests FSDP's communication hook registering for submodules.
         Checks behavior if a hook was registered for a non-root submodule
@@ -335,6 +396,11 @@ class TestCommunicationHooks(FSDPTest):
     def _check_low_precision_hook(
         self, state, hook, sharding_strategy, dtype, has_wrapping
     ):
+        # [FUNCTION DOC] HELPER: Compares a model with a low-precision comm hook registered
+        # against an identical model using MixedPrecision with reduce_dtype set to dtype. Both
+        # get the same seeded input, one forward/backward and an SGD step; asserts the hooked
+        # model's flat gradient has dtype state.parameter_type, then after a barrier that
+        # corresponding parameter gradients are equal. Side effects: reseeds RNGs, barrier.
         # keep everything deterministic for input data
         torch.manual_seed(0)
         torch.get_device_module(device_type).manual_seed(0)
@@ -392,6 +458,8 @@ class TestCommunicationHooks(FSDPTest):
     def test_fp16_hook(
         self, has_wrapping: bool, sharding_strategy: ShardingStrategy | None
     ):
+        # [FUNCTION DOC] Runs the low-precision hook check with the fp16 compress hook, a
+        # state on the default group, and float16 reduce dtype. Requires an nccl or xccl backend.
         state = default_hooks.LowPrecisionState(process_group=_get_default_group())
         hook = default_hooks.fp16_compress_hook
 
@@ -418,6 +486,8 @@ class TestCommunicationHooks(FSDPTest):
     def test_bf16_hook(
         self, has_wrapping: bool, sharding_strategy: ShardingStrategy | None
     ):
+        # [FUNCTION DOC] Same as the fp16 test but with the bf16 compress hook and bfloat16
+        # reduce dtype; skipped without bf16 support or NCCL 2.10+.
         state = default_hooks.LowPrecisionState(process_group=_get_default_group())
         hook = default_hooks.bf16_compress_hook
 

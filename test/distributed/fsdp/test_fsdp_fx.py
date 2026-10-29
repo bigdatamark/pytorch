@@ -1,4 +1,10 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Unit test of FSDP's execution-order tracer used with torch.fx symbolic tracing:
+# traces a small model with two conditional paths and checks the recorded module forward
+# order, per-module parameter usage records, parameter forward order and visited parameter
+# set, and that the tracer's patched methods are restored afterward. Import-time side effect:
+# instantiates the device-generic test class for cuda/hpu/xpu; running the file calls
+# run_tests().
 import torch
 from torch.distributed.fsdp._trace_utils import _ExecOrderTracer
 from torch.testing._internal.common_device_type import instantiate_device_type_tests
@@ -6,7 +12,13 @@ from torch.testing._internal.common_utils import run_tests, TestCase
 
 
 class Model(torch.nn.Module):
+    # [CLASS DOC] HELPER: Model for tracing tests with direct parameters (weight1, weight2 and
+    # an unused weight_unused) and several submodules (layer0, layer1, a three-part layer2,
+    # shared relu). forward takes a flag choosing whether to also run layer1 and weight2.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates the three random direct parameters (6x6, 6x6, 2x2),
+        # linear layers layer0 (6 to 6), layer1 (6 to 6, no bias), layer2 (Linear 6 to 3,
+        # ReLU, Linear 3 to 6, no biases) and a shared ReLU.
         super().__init__()
         self.weight1 = torch.nn.Parameter(torch.randn(6, 6))
         self.weight2 = torch.nn.Parameter(torch.randn(6, 6))
@@ -21,6 +33,13 @@ class Model(torch.nn.Module):
         self.relu = torch.nn.ReLU()
 
     def forward(self, x: torch.Tensor, run_all_layers: bool) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Applies layer0 with ReLU, layer2 with ReLU, then multiplies by
+        # weight1. If run_all_layers, then also layer1 with ReLU, multiplication by weight2, and
+        # finally recomputes the result from x through layer0 again (to test repeated module use).
+        # weight_unused is never used. Returns the result tensor.
+        # KNOWN ISSUE: in the run_all_layers branch the last assignment discards the previous
+        # value of z and uses x, so layer1 and weight2 do not affect the output; this is
+        # intentional for tracing coverage only.
         z = self.relu(self.layer0(x))
         z = self.relu(self.layer2(z))
         z = z @ self.weight1
@@ -34,7 +53,15 @@ class Model(torch.nn.Module):
 
 
 class TestSymbolicTracing(TestCase):
+    # [CLASS DOC] Single-process test case for the execution-order tracer's recorded data.
     def test_symbolic_tracing_outputs(self):
+        # [FUNCTION DOC] Traces the model with run_all_layers fixed to true inside the
+        # execution-order tracer's patch context and asserts: the tracer's call_module and
+        # create_proxy are restored on exit; the recorded module forward order is the expected
+        # twelve-entry sequence (with repeats for reused modules); each module's parameter
+        # usage list matches expectations (including the root's interleaved direct parameters
+        # and no entries for relu); the parameter forward order has seven parameters; and the
+        # visited set has the same size and members.
         """
         Tests running ``tracer.trace()`` inside ``patch_tracer()`` by checking
         the saved data structures.
