@@ -1,3 +1,6 @@
+# [MODULE DOC] Inductor lowerings for aten.bmm and aten.baddbmm. Defines the Triton bmm template, ExternKernelChoice entries for aten bmm/baddbmm,
+# and lowerings that either decompose tiny/dot-shaped or native-matmul cases into pointwise+reduction IR, or autotune across
+# aten, Triton, CUTLASS, C++, CK and NV universal GEMM choices. Import-time side effects: creates templates and registers the two lowerings.
 # mypy: allow-untyped-defs
 import logging
 from typing import TYPE_CHECKING
@@ -45,6 +48,8 @@ aten = torch.ops.aten
 
 @SymbolicGridFn
 def bmm_grid(b, m, n, meta, *, cdiv, max):
+    # [FUNCTION DOC] HELPER: Launch grid for the bmm Triton template: (m-tiles * n-tiles, grid_y, grid_z).
+    # The batch is split across grid_y and grid_z so grid_y stays within the CUDA max y grid limit. cdiv and max are supplied by the grid framework.
     tiles = cdiv(m, meta["BLOCK_M"]) * cdiv(n, meta["BLOCK_N"])
     # Split batch across grid_y and grid_z to avoid exceeding CUDA grid_y limit.
     # When b <= max_y_grid, grid_z = 1 and behavior is identical to the original.
@@ -90,6 +95,11 @@ _BMM_DOT_DECOMPOSE_DTYPES = (
 
 @L.register_lowering(aten.bmm)
 def tuned_bmm(mat1, mat2, out_dtype=None, *, layout=None):
+    # [FUNCTION DOC] Lowering for aten.bmm. Args: mat1, mat2 (3D TensorBoxes), optional out_dtype, optional layout. Returns the result node.
+    # Paths in order: (1) CUDA/XPU float dot-shaped case (M or N of one, K not known larger than a threshold) becomes unsqueeze+mul+sum;
+    # (2) CPU: same decomposition when M or N is one, else may force contiguous inputs; (3) native matmul becomes a dot reduction;
+    # (4) otherwise collects aten/Triton/CUTLASS/C++/CK/NV universal choices and autotunes. Bumps a counters entry and logs.
+    # Raises AssertionError if out_dtype is used on a device other than CUDA/XPU.
     """
     Lowering for autotuning aten.bmm with different backends (Aten, Triton, CUTLASS, etc.)
     """
@@ -98,11 +108,13 @@ def tuned_bmm(mat1, mat2, out_dtype=None, *, layout=None):
     device_type = mat1.get_device().type
 
     def dim_is_one_or_hint(dim):
+        # [FUNCTION DOC] HELPER: True if the dimension's optimization hint (fallback 2) equals one; used only as a profitability signal, avoiding specialization.
         # The mul+sum decomposition is valid for any M/N. The size-1 hint is
         # only a profitability signal, so avoid specializing dynamic dims here.
         return sizevars.optimization_hint(dim, fallback=2) == 1
 
     def dim_is_not_known_gt(dim, threshold):
+        # [FUNCTION DOC] HELPER: True if the dimension is not statically known to exceed threshold (avoids hints since graphs may be reused across K values).
         # Do not use optimization_hint() for K: the same symbolic FX graph can
         # be code-cache reused across different concrete K values.
         return not sizevars.statically_known_gt(dim, threshold)
@@ -131,12 +143,14 @@ def tuned_bmm(mat1, mat2, out_dtype=None, *, layout=None):
             return L.sum_(L.mul(mat1, mat2), axis=2)
 
         def is_valid_to_require_contiguous(t):
+        # [FUNCTION DOC] HELPER: True if the tensor may be made contiguous: not backed by storage, or its layout is flexible.
             if not ir.is_storage_and_layout(t):
                 return True
             _, layout = ir.as_storage_and_layout(t, freeze=False)
             return isinstance(layout, ir.FlexibleLayout)
 
         def is_preferred_layout_as_bmm_input(sizes, strides):
+            # [FUNCTION DOC] HELPER: True if strides are contiguous-like on one of the last two dims (the layout CPU bmm accepts without copying).
             # contiguous on one of the last two dims
             return (
                 strides[-1] == 1 and (sizes[-2] == 1 or strides[-2] >= sizes[-1])
@@ -147,6 +161,7 @@ def tuned_bmm(mat1, mat2, out_dtype=None, *, layout=None):
         # because bmm cpu implementation would do contiguous() if not.
         # This is to avoid additional copies in bmm.
         def may_require_contiguous(t, meta_t):
+            # [FUNCTION DOC] HELPER: Requires contiguity of t unless the example-value sizes/strides of the FX node meta_t already have a preferred bmm layout. Returns t.
             sizes = meta_t.meta["val"].size()
             strides = meta_t.meta["val"].stride()
             if not is_preferred_layout_as_bmm_input(sizes, strides):
@@ -177,6 +192,7 @@ def tuned_bmm(mat1, mat2, out_dtype=None, *, layout=None):
         ]:
 
             def _to_dtype(x):
+            # [FUNCTION DOC] HELPER: Pointwise converter casting x back to mat1's dtype without compute-type upcasting.
                 return ops.to_dtype(x, mat1.dtype, use_compute_types=False)
 
             args = [make_pointwise(_to_dtype)(x) for x in args]
@@ -276,6 +292,10 @@ def tuned_bmm(mat1, mat2, out_dtype=None, *, layout=None):
 
 @L.register_lowering(aten.baddbmm)
 def tuned_baddbmm(inp, mat1, mat2, *, alpha=1, beta=1, layout=None):
+    # [FUNCTION DOC] Lowering for aten.baddbmm (inp + beta/alpha scaled bmm). Args: inp, mat1, mat2, alpha, beta, layout. Returns the result node.
+    # With native matmul it composes mul/bmm/add lowerings (skipping zero-scaled terms); otherwise autotunes between the aten baddbmm
+    # extern kernel and the Triton bmm template. Bumps a counters entry and logs.
+    # KNOWN ISSUE: the docstring says aten.mm, but this lowers aten.baddbmm.
     """
     Lowering for autotuning aten.mm with different backends (Aten, Triton, CUTLASS, etc.)
     """

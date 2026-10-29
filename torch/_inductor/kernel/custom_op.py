@@ -1,3 +1,7 @@
+# [MODULE DOC] Custom-op autotuning for Inductor. Lets users register a custom op (or OpOverload) with several decomposition implementations
+# (CustomOpConfig), benchmarks them against an eager fallback via SubgraphTemplate and autotune_select_algorithm, and inlines the winner.
+# Supports static configs, dynamically generated configs, and range-based dispatch on a tensor dimension that builds a nested conditional graph.
+# Public names: autotune_custom_op, register_custom_op_autotuning, CustomOpConfig. Registering writes into the user_lowerings table (side effect on call, none at import).
 # Owner(s): ["module: inductor"]
 
 import contextlib
@@ -34,6 +38,7 @@ DEFAULT_RANGE_UPPER_BOUND = 65536
 
 
 class DispatchOnConfig(TypedDict):
+    # [CLASS DOC] Typed mapping describing range-based dispatch: required tensor_name and dim, optional range_upper_bound (benchmark size for the unbounded last range).
     """Range-based dispatch spec for register_custom_op_autotuning(dispatch_on=...)."""
 
     tensor_name: str
@@ -42,6 +47,7 @@ class DispatchOnConfig(TypedDict):
 
 
 class _AutotuneChoice(Protocol):
+    # [CLASS DOC] HELPER: Structural interface of an autotuning winner: name, optional fx graph module, config patches, decomposition and its kwargs, layout, and an output_node method.
     """Winning-choice surface consumed after autotuning.
 
     Structurally satisfied by ChoiceCaller and its SubgraphChoiceCaller subclass;
@@ -60,29 +66,35 @@ class _AutotuneChoice(Protocol):
 
 @dataclass(frozen=True)
 class RangeBounds:
+    # [CLASS DOC] Immutable inclusive integer range [start, end] used for dimension dispatch; end may be infinity. Invariants: start >= 1 and start <= end.
     """Inclusive range [start, end] for dimension-based dispatch."""
 
     start: int
     end: int | float  # float('inf') for unbounded
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC] Validates the range after construction. Raises ValueError if start is below one or start exceeds a finite end.
         if self.start < 1:
             raise ValueError(f"Range start must be >= 1, got {self.start}")
         if self.end != float("inf") and self.start > self.end:
             raise ValueError(f"Invalid range: start={self.start} > end={self.end}")
 
     def contains(self, value: int) -> bool:
+        # [FUNCTION DOC] Returns True if value lies in the inclusive range (only the lower bound is checked when end is infinite).
         if self.end == float("inf"):
             return value >= self.start
         return self.start <= value <= int(self.end)
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Returns a text form like "[start, end]" with "inf" for an unbounded end.
         end_str = "inf" if self.end == float("inf") else str(int(self.end))
         return f"[{self.start}, {end_str}]"
 
 
 @dataclass(frozen=True)
 class ImplConfig:
+    # [CLASS DOC] Immutable record of one implementation choice: name, callable, keyword arguments and config patches.
+    # Identity (hash and equality) uses only the name and kwargs; the callable and config patches are excluded.
     """Implementation config with semantic identity (name + kwargs) for hashing."""
 
     impl_name: str
@@ -93,14 +105,17 @@ class ImplConfig:
     )
 
     def __hash__(self) -> int:
+        # [FUNCTION DOC] Hash from the implementation name and the sorted kwargs items (kwarg values must be hashable).
         return hash((self.impl_name, tuple(sorted(self.kwargs.items()))))
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] Equality by implementation name and kwargs only; non-ImplConfig objects compare unequal.
         if not isinstance(other, ImplConfig):
             return False
         return self.impl_name == other.impl_name and self.kwargs == other.kwargs
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Text form: the name, followed by sorted key=value kwargs in parentheses when any exist.
         if self.kwargs:
             kwargs_str = ", ".join(f"{k}={v}" for k, v in sorted(self.kwargs.items()))
             return f"{self.impl_name}({kwargs_str})"
@@ -109,37 +124,45 @@ class ImplConfig:
 
 @dataclass
 class RangeImplGroup:
+    # [CLASS DOC] Mutable group of (possibly non-adjacent) ranges that share one ImplConfig; ranges are kept sorted by start. Properties expose the config's name, callable, kwargs and patches.
     """Groups non-adjacent ranges using the same implementation."""
 
     impl_config: ImplConfig
     ranges: list[RangeBounds] = field(default_factory=list)
 
     def add_range(self, range_bounds: RangeBounds) -> None:
+        # [FUNCTION DOC] Appends a range and re-sorts the list by start (mutates the group).
         self.ranges.append(range_bounds)
         self.ranges.sort(key=lambda r: r.start)
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Text form: the implementation name followed by the comma-separated ranges.
         ranges_str = ", ".join(str(r) for r in self.ranges)
         return f"{self.impl_config.impl_name}: {ranges_str}"
 
     @property
     def impl_name(self) -> str:
+        # [FUNCTION DOC] Property: name of the group's implementation.
         return self.impl_config.impl_name
 
     @property
     def impl_func(self) -> Callable[..., Any]:
+        # [FUNCTION DOC] Property: callable of the group's implementation.
         return self.impl_config.impl_func
 
     @property
     def impl_kwargs(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Property: keyword arguments of the group's implementation.
         return self.impl_config.kwargs
 
     @property
     def config_patches(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Property: config patches of the group's implementation.
         return self.impl_config.config_patches
 
 
 def _detect_collective_ops(choices: list) -> bool:
+    # [FUNCTION DOC] HELPER: Returns True if any choice carrying an fx graph contains a call to a collective communication op (checked by name with and without a torch.ops prefix).
     """
     Detect if choices contain collective operations.
     """
@@ -162,6 +185,8 @@ def _detect_collective_ops(choices: list) -> bool:
 
 
 class CustomOpConfig:
+    # [CLASS DOC] User-facing config for one custom-op autotuning variant: an optional decomposition callable, optional config patches applied during codegen,
+    # and extra keyword parameters passed to the decomposition. Each config yields exactly one variant; with no decomposition the op's default implementation is used.
     """Config for custom op autotuning.
 
     Specifies optional decomposition function with parameter values.
@@ -185,6 +210,7 @@ class CustomOpConfig:
         config_patches: dict[str, Any] | None = None,
         **params: Any,
     ):
+        # [FUNCTION DOC] Stores decomposition, config_patches (empty mapping if None) and params. Raises TypeError if decomposition is given but not callable.
         if decomposition is not None and not callable(decomposition):
             raise TypeError(
                 f"decomposition must be callable, got {type(decomposition)}"
@@ -197,6 +223,7 @@ class CustomOpConfig:
     def get_decomposition(
         self, default_impl: Callable[..., Any] | None = None
     ) -> Callable[..., Any]:
+        # [FUNCTION DOC] Returns the config's decomposition, else default_impl if it is callable. Raises TypeError if neither is available.
         """Return the decomposition function for this config.
         When decomposition is not specified, return the default implementation.
         """
@@ -212,6 +239,7 @@ class CustomOpConfig:
         )
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Text form listing the decomposition name (or "default") and the params.
         decomp_name = self.decomposition.__name__ if self.decomposition else "default"
         if self.params:
             params_str = ", ".join(f"{k}={v}" for k, v in self.params.items())
@@ -231,6 +259,8 @@ def _extract_tensor_inputs(
     kwargs: dict[str, Any],
     op_overload: torch._ops.OpOverload,
 ) -> tuple[list[Any], dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Splits call arguments into IR tensor inputs (TensorBox, Buffer, StorageBox) and non-tensor kwargs.
+    # Positional non-tensors are named from the op schema (fallback names for extras); keyword values are split the same way. Returns (tensor list, kwargs mapping).
     """Extract tensor inputs from mixed args/kwargs.
     Separates tensors (for autotuning input_nodes) from non-tensor parameters.
 
@@ -270,6 +300,7 @@ def _merge_config_and_runtime_kwargs(
     config_params: dict[str, Any],
     runtime_kwargs: dict[str, Any],
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Returns a new mapping of runtime kwargs updated with config params, so config params win on conflicts.
     """Merge config parameters with runtime kwargs. Config params take precedence,
     since they represent the values being autotuned.
 
@@ -290,6 +321,8 @@ def _adapt_user_input_gen_fns(
     op_overload: torch._ops.OpOverload,
     user_input_gen_fns: dict[str, Callable[[torch.Tensor], torch.Tensor]],
 ) -> dict[int, Callable[[Any], torch.Tensor]]:
+    # [FUNCTION DOC] HELPER: Converts user input generators keyed by argument name into ones keyed by schema argument index, wrapped so they receive a fake tensor built from the IR buffer.
+    # Entries whose index is beyond the number of inputs are dropped. Raises ValueError for an unknown argument name.
     """Convert user input generators from name-based to index-based format.
     Inductor autotune's input_gen_fns expects index of arg_names as key.
     """
@@ -309,9 +342,11 @@ def _adapt_user_input_gen_fns(
     def create_internal_input_gen_fn(
         user_function: Callable[[torch.Tensor], torch.Tensor], arg_name: str
     ) -> Callable[[Any], torch.Tensor]:
+        # [FUNCTION DOC] HELPER: Wraps a user generator into one that converts an IR buffer into a fake tensor (symbols replaced by hints) and calls the user function.
         """Create internal input generator that converts IR buffer to user's fake tensor."""
 
         def internal_input_gen_fn(ir_buffer: Any) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Converts the IR buffer to a fake tensor and returns the user's generated tensor. Raises AssertionError if conversion yields nothing.
             fake_tensor = ir_node_to_tensor(ir_buffer, replace_symbols_with_hints=True)
             if fake_tensor is None:
                 raise AssertionError("ir_node_to_tensor returned None")
@@ -331,6 +366,8 @@ def _adapt_user_input_gen_fns(
 def _group_ranges_by_impl(
     range_to_best_impl: dict[RangeBounds, ImplConfig],
 ) -> list[RangeImplGroup]:
+    # [FUNCTION DOC] HELPER: Groups ranges that map to equal ImplConfigs into RangeImplGroup objects sorted by first range start. Returns an empty list for empty input.
+    # In test mode (force_no_impl_grouping) every range becomes its own group. Logs when grouping reduces the count.
     """Group ranges by implementation using semantic identity (name + kwargs)."""
     from torch._inductor import config
 
@@ -377,6 +414,7 @@ def _group_ranges_by_impl(
 def _create_ranges_from_split_points(
     split_points: list[int],
 ) -> list[tuple[int, int] | tuple[int, float]]:
+    # [FUNCTION DOC] HELPER: Turns ascending split points into contiguous ranges starting at one, with the last range extending to infinity.
     """Convert split points into ranges for autotuning dispatch.
 
     Example:
@@ -404,6 +442,8 @@ def _create_range_input_gen_fn(
     range_upper_bound: int,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """Create input generator that modifies target dimension to top of range.
+    # [FUNCTION DOC] HELPER: Builds an input generator that calls the base generator, then resizes the target dimension to the range's end (or range_upper_bound when unbounded).
+    # Recomputes strides preserving the fill order and returns a random strided tensor of that shape.
     range_upper_bound: Size to use for benchmarking when range_end is unbounded.
     Default is DEFAULT_RANGE_UPPER_BOUND = 65536
     """
@@ -413,6 +453,7 @@ def _create_range_input_gen_fn(
     target_dim = range_upper_bound if range_end == float("inf") else int(range_end)
 
     def constrained_gen_fn(fake_tensor: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Generates the base tensor, replaces the dispatch dimension size, rebuilds strides from the original fill order and returns a random tensor viewed with them.
         result = base_gen_fn(fake_tensor)
         shape = list(result.shape)
         shape[dim_index] = target_dim
@@ -430,6 +471,7 @@ def _create_range_input_gen_fn(
 
 
 def _default_input_gen_fn(fake_tensor: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Default benchmark input generator: random normal tensor with the fake tensor's shape, dtype and device.
     """Default input generator that creates a real tensor matching the fake tensor's shape."""
     return torch.randn(
         fake_tensor.shape, dtype=fake_tensor.dtype, device=fake_tensor.device
@@ -439,6 +481,7 @@ def _default_input_gen_fn(fake_tensor: torch.Tensor) -> torch.Tensor:
 def _create_fallback_choice(
     op_overload: torch._ops.OpOverload,
 ) -> ExternKernelChoice:
+    # [FUNCTION DOC] HELPER: Returns the extern fallback choice calling the op eagerly, named from the op name; reuses an existing registered choice of that name.
     """Create or reuse fallback choice that calls the op eagerly.
 
     Since kwargs are passed at bind time via maybe_append_choice rather than
@@ -473,6 +516,11 @@ def autotune_custom_op(
     min_speedup_threshold: float = 1.0,
     benchmark_with_cudagraphs: bool = False,
 ) -> tuple[TensorBox, _AutotuneChoice]:
+    # [FUNCTION DOC] Benchmarks decomposition variants of a single-output custom op against an eager fallback and returns (result IR node, winning choice).
+    # Validates inputs, converts user input generators, builds subgraph choices plus a fallback choice with a layout inferred from fake execution, autotunes,
+    # and (test configs may force decomposition or fallback) inlines the winner's graph into the IR, tagging inlined ops with its config patches.
+    # Raises TypeError if decompositions is not a list/tuple, RuntimeError if no inputs or no choices, ValueError if decompositions and non_tensor_args lengths differ.
+    # KNOWN ISSUE: docstring says user_input_gen_fns maps indices, but the code expects argument names (converted to indices internally).
     """Autotune custom operations by comparing multiple decomposition implementations.
 
     Currently supports SINGLE OUTPUT custom ops only.
@@ -636,6 +684,8 @@ def _generate_dynamic_configs(
     op_overload: torch._ops.OpOverload,
     operation_name: str,
 ) -> list[CustomOpConfig]:
+    # [FUNCTION DOC] HELPER: Calls the user's config generator with a mapping of schema parameter names (non kwarg-only) to fake tensors built from the inputs.
+    # Returns the list of configs (empty list, logged, means default lowering). Raises TypeError if the generator does not return a list or tuple.
     """Generate configs dynamically based on input tensors at lowering time."""
     # Get parameter names from op schema instead of impl signature
     schema = op_overload._schema
@@ -672,6 +722,9 @@ def _prepare_configs_and_decompositions(
     runtime_kwargs: dict[str, Any],
     name: str,
 ) -> tuple[list[Callable], list[dict[str, Any]], list[dict[str, Any]]]:
+    # [FUNCTION DOC] HELPER: Resolves the configs (dynamic generator or static list) into parallel lists: decompositions, merged non-tensor kwargs and config patches.
+    # Raises AssertionError if neither a generator nor processed configs is supplied.
+    # KNOWN ISSUE: docstring says runtime kwargs take precedence, but the merge lets config params override runtime kwargs.
     """Prepare decompositions and merged kwargs from configs.
 
     Handles both static configs and dynamic config generation.
@@ -719,6 +772,7 @@ def _standard_lowering_fn(
     min_speedup_threshold: float = 1.0,
     benchmark_with_cudagraphs: bool = False,
 ) -> Any:
+    # [FUNCTION DOC] HELPER: Standard lowering: prepares configs, runs autotune_custom_op and validates the resulting IR. Returns None when there are no decompositions (caller then uses normal lowering).
     """Standard autotuning lowering function.
 
     Returns None if no configs/decompositions available, signaling caller to
@@ -760,6 +814,7 @@ def _apply_config_patches_recursive(
     operations: list,
     config_patches: dict[str, Any],
 ) -> None:
+    # [FUNCTION DOC] HELPER: Recursively sets a copy of config_patches on each operation that supports it, descending into subgraphs of control-flow operations. Mutates the operations.
     """Apply config_patches to operations, including those inside subgraphs."""
     for op in operations:
         if hasattr(op, "set_config_patches"):
@@ -781,6 +836,8 @@ def _lower_single_impl(
     name: str,
     config_patches: dict[str, Any] | None = None,
 ) -> Any:
+    # [FUNCTION DOC] HELPER: Traces one implementation with symbolic make_fx under a guard-forbidding context, inlines it into the IR, applies config patches and validates.
+    # Returns the IR result, or None (and bumps a counter) if tracing would add shape guards. Other errors are re-raised.
     """Lower a single implementation by tracing and inlining it.
 
     Uses error_on_new_guards() during tracing to detect if the impl adds guards.
@@ -795,6 +852,7 @@ def _lower_single_impl(
     merged_kwargs = _merge_config_and_runtime_kwargs(impl_kwargs, runtime_kwargs)
 
     def impl_wrapper(*tensors):
+        # [FUNCTION DOC] HELPER: Calls the implementation with the tensors and the merged kwargs.
         return impl(*tensors, **merged_kwargs)
 
     shape_env = V.fake_mode.shape_env
@@ -857,6 +915,9 @@ def _range_based_lowering_fn(
     min_speedup_threshold: float = 1.0,
     benchmark_with_cudagraphs: bool = False,
 ) -> Any:
+    # [FUNCTION DOC] HELPER: Range-based lowering. For each range, benchmarks all variants with inputs resized along the dispatch dimension and records the winning ImplConfig
+    # (the default implementation when the fallback wins), groups ranges by implementation, and either inlines a single winner or traces a nested conditional dispatch over the
+    # dimension size, inlines it, applies merged config patches and validates. Returns None (and bumps a counter) if tracing adds guards; re-raises other tracing errors.
     """Range-based autotuning lowering function."""
     from torch._inductor.codegen.subgraph import inline_subgraph_to_ir_nodes
     from torch.fx.experimental.proxy_tensor import make_fx
@@ -961,6 +1022,7 @@ def _range_based_lowering_fn(
         )
 
     def dispatch_fn(*fake_tensors):
+        # [FUNCTION DOC] HELPER: Traced function building nested conditionals over impl groups, selecting by whether the dispatch dimension size falls in a group's ranges. Raises RuntimeError with fewer than two groups.
         """Build nested torch.cond dispatch: cond(pred1, impl1, cond(pred2, impl2, ...))."""
         num_impl_groups = len(impl_groups)
         if num_impl_groups < 2:
@@ -971,6 +1033,7 @@ def _range_based_lowering_fn(
         dim_value = fake_tensors[0].size(dim_index)
 
         def build_range_predicate(ranges_list: list[RangeBounds]) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Builds a combined boolean predicate that is true when the dimension size lies in any of the given ranges.
             predicates = []
             for rb in ranges_list:
                 end = int(rb.end) if rb.end != float("inf") else None
@@ -985,6 +1048,7 @@ def _range_based_lowering_fn(
             return result  # pyrefly: ignore [bad-return]
 
         def build_nested_cond(idx: int):
+            # [FUNCTION DOC] HELPER: Recursively builds the dispatch callable: the last group is called directly, earlier groups conditionally call their implementation or the next one. Raises RuntimeError on a bad index.
             if idx >= num_impl_groups:
                 raise RuntimeError(f"Invalid impl group index: {idx}")
 
@@ -995,6 +1059,7 @@ def _range_based_lowering_fn(
 
             @torch._dynamo.dont_skip_tracing
             def group_fn(*ops):
+                # [FUNCTION DOC] HELPER: Calls the group's implementation with the merged kwargs.
                 return group.impl_func(*ops, **merged_kwargs)
 
             if idx == num_impl_groups - 1:
@@ -1004,6 +1069,7 @@ def _range_based_lowering_fn(
 
             @torch._dynamo.dont_skip_tracing
             def cond_wrapper(*ops, _ranges=group.ranges):
+                # [FUNCTION DOC] HELPER: Conditional wrapper choosing between the group's implementation and the next dispatch function based on the range predicate.
                 return torch.cond(
                     pred=build_range_predicate(_ranges),
                     true_fn=group_fn,
@@ -1087,11 +1153,14 @@ def _create_autotuning_lowering(
     min_speedup_threshold: float = 1.0,
     benchmark_with_cudagraphs: bool = False,
 ) -> Callable[..., Any]:
+    # [FUNCTION DOC] HELPER: Returns the lowering callable for a registered op: a standard wrapper, or when range-based, a wrapper dispatching on the given tensor name and dimension
+    # with ranges from the split points. Wrappers split call arguments into tensor inputs and runtime kwargs first.
     """Create the lowering function for autotuning."""
     if not is_range_based:
         # Standard autotuning path
         @functools.wraps(op_overload)
         def standard_lowering_wrapper(*args: Any, **kwargs: Any) -> Any:
+            # [FUNCTION DOC] HELPER: Lowering entry point for the standard path; extracts inputs and delegates to the standard lowering function.
             tensor_inputs, runtime_kwargs = _extract_tensor_inputs(
                 args, kwargs, op_overload
             )
@@ -1118,6 +1187,7 @@ def _create_autotuning_lowering(
 
     @functools.wraps(op_overload)
     def range_based_lowering_wrapper(*args: Any, **kwargs: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Lowering entry point for the range-based path; extracts inputs and delegates to the range-based lowering function.
         tensor_inputs, runtime_kwargs = _extract_tensor_inputs(
             args, kwargs, op_overload
         )
@@ -1153,6 +1223,10 @@ def register_custom_op_autotuning(
     min_speedup_threshold: float = 1.0,
     benchmark_with_cudagraphs: bool = False,
 ) -> None:
+    # [FUNCTION DOC] Registers autotuning for a custom op (CustomOpDef or OpOverload): validates arguments and installs a lowering in the user_lowerings table (side effect), overriding the built-in lowering.
+    # Needs exactly one of configs (non-empty list of CustomOpConfig) or config_generator. Range-based dispatch needs both dispatch_on (tensor_name, dim, optional range_upper_bound) and ascending, non-empty split_points.
+    # Default name is the op name plus "_autotuned". Raises TypeError for a bad op or config types and ValueError for conflicting or invalid arguments.
+    # KNOWN ISSUE: docstring names the dispatch_on key unbounded_size but the code reads range_upper_bound.
     """Register custom op for autotuning with custom_op configs where each config
     specifies a decomposition implementation function with its parameter values.
     It also supports Range-based autotuning to benchmark per range and generate
@@ -1249,6 +1323,7 @@ def register_custom_op_autotuning(
 
     # impl_fn calls through op_overload so fake handlers are used during tracing
     def impl_fn(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Default implementation that calls the op overload so fake handlers are used during tracing.
         return op_overload(*args, **kwargs)
 
     # Validate configs and config_generator are mutually exclusive

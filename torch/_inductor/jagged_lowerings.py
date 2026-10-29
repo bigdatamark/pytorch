@@ -1,3 +1,6 @@
+# [MODULE DOC] Lowering helpers for jagged (nested) tensor ops in Inductor: converts between jagged values+offsets and padded dense layouts.
+# Defines index-mapping helpers, a cached inverse-offsets builder, and register_jagged_ops which registers lowerings for
+# _jagged_to_padded_dense_forward and _padded_dense_to_jagged_forward. No import-time side effects (registration happens when register_jagged_ops is called).
 # mypy: allow-untyped-defs
 
 import sympy
@@ -10,6 +13,9 @@ from .virtualized import ops
 
 # pyre-ignore[2,3]
 def dense_idx_to_jagged_idx(batch_idx, seq_idx, offsets_loader, jagged_len):
+    # [FUNCTION DOC] HELPER: Maps a dense (batch_idx, seq_idx) position to a jagged row index.
+    # Loads the begin offset for the batch (as an indirect index bounded by jagged_len + 1, since the last sequence may be empty),
+    # adds seq_idx, and loads the end offset of the next batch. Returns (jagged_idx, end_idx); caller masks where jagged_idx >= end_idx.
     # jagged_len + 1 is used as the upper bound,
     # because the last sequence length may be zero
     begin_idx = ops.indirect_indexing(
@@ -26,6 +32,10 @@ def get_inverse_offsets(
     jagged_len: int | sympy.Expr,
     realize: bool = True,
 ) -> TensorBox:
+    # [FUNCTION DOC] Builds (or returns the cached) inverse of an offsets tensor: for each jagged row, the batch index owning it.
+    # Realizes offsets, then creates a pointwise node that binary-searches (bucketize, right side) the offsets and subtracts one to get 0-based batches.
+    # Args: offsets (TensorBox), jagged_len (output length), realize (freeze the result so it is not inlined). Returns a TensorBox.
+    # Side effect: caches the result as an attribute on the offsets object and realizes offsets.
     """
     Returns "inverse_offsets" - the inverse of the offsets array.
     offsets maps batch index (dense) to jagged index (i.e. offset into jagged tensor).
@@ -53,6 +63,7 @@ def get_inverse_offsets(
 
     # pyre-ignore[2,3]
     def inner_fn(index):
+        # [FUNCTION DOC] HELPER: Pointwise body; for a jagged row index returns the 0-based bucket (batch) found by bucketizing it against offsets.
         idx = index[0]
         bucket = ops.bucketize(
             values=ops.index_expr(idx, dtype),
@@ -96,6 +107,9 @@ def jagged_idx_to_dense_idx(
     offsets_dtype: torch.dtype,
 ) -> tuple[sympy.Expr, sympy.Expr]:
     batch_idx = ops.indirect_indexing(
+    # [FUNCTION DOC] HELPER: Maps a jagged row index to dense (batch_idx, seq_idx).
+    # Batch index comes from the inverse offsets via bounded indirect indexing; seq is the row minus the batch start offset.
+    # The seq index bound check is disabled because sequences may exceed max_seq_len (caller masks them out).
         inverse_offsets_loader([jagged_idx]),
         batch_size + 1,
     )
@@ -107,6 +121,8 @@ def jagged_idx_to_dense_idx(
 
 
 def register_jagged_ops():
+    # [FUNCTION DOC] Registers the jagged-tensor lowerings with Inductor. Imports lowering helpers lazily to avoid a circular import.
+    # Side effect: registers lowerings for the jagged-to-padded-dense and padded-dense-to-jagged aten ops.
     # Avoid circular import by importing here
     from .lowering import fallback_handler, is_integer_type, register_lowering
 
@@ -118,6 +134,9 @@ def register_jagged_ops():
         max_lengths: list[int],  # list of ints/SymInts
         padding_value: float = 0.0,
     ) -> TensorBox:
+        # [FUNCTION DOC] Lowering for _jagged_to_padded_dense_forward: builds a dense [batch, max_seq_len, embedding] pointwise node.
+        # Only handles one jagged dimension, 2D values, 1D integer offsets on a CUDA device matching the values; otherwise falls back to the aten kernel.
+        # Out-of-range positions (past each sequence end) are filled with padding_value through a masked load. Returns a TensorBox.
         device = jagged_values.get_device_or_error()
         dtype = jagged_values.get_dtype()
 
@@ -158,6 +177,7 @@ def register_jagged_ops():
 
         # pyre-ignore[2,3,53]
         def inner_fn(index):
+            # [FUNCTION DOC] HELPER: Pointwise body; maps a dense (batch, seq, emb) index to the jagged row and loads it, or padding_value if beyond the sequence end.
             # dense tensor size: [B, N, D]
             batch_idx, seq_idx, emb_idx = index
             jagged_idx, end_idx = dense_idx_to_jagged_idx(
@@ -188,6 +208,9 @@ def register_jagged_ops():
         jagged_offsets: list[TensorBox],
         jagged_len: int | None = None,
     ) -> TensorBox:
+        # [FUNCTION DOC] HELPER: Shared lowering for padded-dense-to-jagged: builds a [jagged_len, embedding] pointwise node from a 3D dense tensor.
+        # Falls back to fallback_op unless there is one jagged dimension, 3D dense, 1D integer CUDA offsets and jagged_len is known.
+        # Uses cached inverse offsets to find each row's batch; rows with sequence index beyond max_seq_len produce 0.0.
         device = dense.get_device_or_error()
         dtype = dense.get_dtype()
 
@@ -228,6 +251,7 @@ def register_jagged_ops():
 
         # pyre-ignore[2,3,53]
         def inner_fn(index):
+            # [FUNCTION DOC] HELPER: Pointwise body; maps a jagged (row, emb) index to dense (batch, seq, emb) and loads it, or 0.0 if seq exceeds max_seq_len.
             # jagged tensor size: [sum_B(N_B), D]
             jagged_idx, emb_idx = index
             batch_idx, seq_idx = jagged_idx_to_dense_idx(
@@ -261,6 +285,7 @@ def register_jagged_ops():
         jagged_offsets: list[TensorBox],
         jagged_len: int | None = None,
     ) -> TensorBox:
+        # [FUNCTION DOC] Lowering for _padded_dense_to_jagged_forward; delegates to the shared implementation with the aten default overload as fallback.
         return _dense_to_jagged_forward_impl(
             fallback_op=torch.ops.aten._padded_dense_to_jagged_forward.default,
             dense=dense,

@@ -1,3 +1,7 @@
+# [MODULE DOC] Inductor lowerings for aten.convolution and aten.convolution_backward. Holds Triton templates (2D/3D implicit-GEMM forward,
+# 1D depthwise, 2D backward-input and backward-weight), ExternKernelChoice entries (aten conv, 1x1-via-matmul, aten dw/dx), layout helpers,
+# and the lowerings that pick between ATen, Triton, CK and matmul-based choices via autotuning. Import-time side effects: builds templates,
+# registers the lowerings and registers layout constraints for aten.convolution and aten.convolution_backward.
 # mypy: allow-untyped-defs
 from __future__ import annotations
 
@@ -46,6 +50,7 @@ aten = torch.ops.aten
 
 @SymbolicGridFn
 def conv2d_grid(n, c, h, w, meta, *, cdiv):
+    # [FUNCTION DOC] HELPER: Launch grid for the 2D conv template: (tiles over batch*height*width, tiles over channels, group count).
     return (
         cdiv(n * h * w, meta["BLOCK_M"]),
         cdiv(c, meta["BLOCK_N"]),
@@ -55,6 +60,7 @@ def conv2d_grid(n, c, h, w, meta, *, cdiv):
 
 @SymbolicGridFn
 def conv3d_grid(n, c, d, h, w, meta, *, cdiv):
+    # [FUNCTION DOC] HELPER: Launch grid for the 3D conv template: (tiles over batch*depth*height*width, tiles over channels, group count).
     return (
         cdiv(n * d * h * w, meta["BLOCK_M"]),
         cdiv(c, meta["BLOCK_N"]),
@@ -71,6 +77,7 @@ def conv3d_grid(n, c, d, h, w, meta, *, cdiv):
 
 @SymbolicGridFn
 def depthwise_conv1d_grid(n, c, l, meta, *, cdiv):
+    # [FUNCTION DOC] HELPER: Launch grid for the depthwise conv1d template: tiles over batch, length and channels.
     return (
         cdiv(n, meta["BLOCK_N"]),
         cdiv(l, meta["BLOCK_L"]),
@@ -356,6 +363,7 @@ aten_convolution = ExternKernelChoice(
 
 
 def conv1x1_via_mm(x, w, *, out):
+    # [FUNCTION DOC] HELPER: Extern implementation of a 1x1 convolution as a matmul: squeezes the weight to 2D, permutes x to channels-last and writes into out (viewed channels-last).
     w = torch.squeeze(torch.squeeze(w, -1), -1)
     return torch.matmul(
         x.permute(0, 2, 3, 1), w.permute(1, 0), out=out.permute(0, 2, 3, 1)
@@ -366,6 +374,7 @@ aten_conv1x1_via_mm = ExternKernelChoice(conv1x1_via_mm, None)
 
 
 class ConvLayoutParams(TypedDict):
+    # [CLASS DOC] HELPER: Typed mapping of the keyword arguments describing a convolution (stride, padding, dilation, transposed, output_padding, groups) used for layout computation and kernel binding.
     stride: tuple[int, ...]
     padding: tuple[int, ...]
     dilation: tuple[int, ...]
@@ -385,6 +394,8 @@ def conv_layout(
     output_padding: tuple[int, ...],
     groups: int,
 ) -> ir.Layout:
+    # [FUNCTION DOC] Computes the output layout of a convolution by running aten.convolution on fake tensors with guarded (concrete) stride/padding/dilation/output_padding.
+    # Returns a fixed layout with the resulting sizes and strides, using x's device and dtype.
     """Determine output layout for a convolution"""
     # We use guard_int_seq rather than size_hints because the output shape
     # depends on these values — if they ever contained symbols, size_hints
@@ -418,12 +429,15 @@ def conv_layout(
 
 
 def channels_last_order(rank):
+    # [FUNCTION DOC] HELPER: Returns the dimension order list for a channels-last layout of the given rank (channel dim moved to be the innermost).
     order = list(reversed(range(rank)))
     order.insert(1, order.pop(-1))
     return order
 
 
 def convert_1x1_conv_to_mm(x, weight, bias):
+    # [FUNCTION DOC] HELPER: Rewrites a stride-1, unpadded, ungrouped 1x1 convolution as a matmul. Squeezes/permutes the weight, forces x to channels-last,
+    # flattens to 2D, applies mm (or addmm when bias is given), then reshapes and permutes back to the NC... layout. Returns the result.
     # special case for 1x1 convolution, which is actually just a matmul
     rank = len(weight.get_size())
     for _ in range(rank - 2):
@@ -458,6 +472,11 @@ def convolution(
     output_padding: Sequence[int],
     groups: int,
 ):
+    # [FUNCTION DOC] Lowering for aten.convolution. Normalizes arguments to tuples, guards groups/stride/padding (and dilation if transposed) to concrete ints.
+    # Handles unbatched input by adding a batch dim, converts XPU conv1d to 2d, may rewrite 1x1 conv as mm, and peels off bias on non-CPU devices.
+    # Chooses layouts (channels-last when layout optimization is on for 2D, otherwise by the output stride order), then builds choices: ATen, 1x1 via mm,
+    # depthwise conv1d, 2D/3D Triton templates, transposed 2D via the backward-input template (not on CUDA), and CK; autotunes and returns the node.
+    # Side effects: realizes inputs, may increment the graph's channels-last conv counter. Raises AssertionError on a non-int groups or missing bias after realize.
     """Lower aten.convolution using Inductor convolution kernels or fallbacks."""
     stride = tuple(stride)
     padding = tuple(padding)
@@ -528,6 +547,8 @@ def convolution(
     output_padding = pad_listlike(output_padding, ndim)
 
     def channels_last_conv():
+        # [FUNCTION DOC] HELPER: True if the convolution output would be in channels-last (NHWC) stride order, or if layout optimization is enabled for 2D.
+        # KNOWN ISSUE: does not guard on the stride order decision (see TODO in code).
         if V.graph.layout_opt and ndim == 2:
             return True
 
@@ -794,12 +815,15 @@ def _convolution(
     cudnn_enabled,
     allow_tf32,
 ):
+    # [FUNCTION DOC] Lowering for aten._convolution; drops the benchmark/deterministic/cudnn_enabled/allow_tf32 flags and delegates to the aten.convolution lowering.
     return convolution(
         x, weight, bias, stride, padding, dilation, transposed, output_padding, groups
     )
 
 
 def constrain_conv_to_fx_strides(fx_node, *args, **kwargs):
+    # [FUNCTION DOC] HELPER: Layout constraint hook for aten.convolution; asserts the target and returns args unchanged when layout optimization is on,
+    # otherwise constrains inputs to the FX node strides. Returns (args, kwargs). Raises AssertionError on a wrong target.
     if fx_node.target is not torch.ops.aten.convolution.default:
         raise AssertionError(f"Expected aten.convolution.default, got {fx_node.target}")
     if V.graph.layout_opt:
@@ -822,6 +846,8 @@ def conv_bwd_input_layout(
     output_padding: tuple[int, ...],
     groups: int,
 ) -> ir.Layout:
+    # [FUNCTION DOC] HELPER: Output layout of the input gradient of a convolution, computed with aten.convolution_backward on fake tensors (only the input gradient requested).
+    # Returns a fixed layout with the input's device and dtype.
     guard = V.graph.sizevars.guard_int_seq
     with V.graph.fake_mode:
         go = ir.ir_node_to_tensor(grad_out)
@@ -863,6 +889,8 @@ def conv_bwd_weight_layout(
     output_padding: tuple[int, ...],
     groups: int,
 ) -> ir.Layout:
+    # [FUNCTION DOC] HELPER: Output layout of the weight gradient of a convolution, computed with aten.convolution_backward on fake tensors (only the weight gradient requested).
+    # Returns a fixed layout with the weight's device and dtype.
     guard = V.graph.sizevars.guard_int_seq
     with V.graph.fake_mode:
         go = ir.ir_node_to_tensor(grad_out)
@@ -906,6 +934,8 @@ def call_aten_dw(
     groups,
     out,
 ):
+    # [FUNCTION DOC] HELPER: Extern ATen implementation of the weight gradient: allocates a dummy weight of w_shape (channels-last if x_t is), calls the out variant of
+    # convolution_backward writing the weight gradient into out, and returns out.
     if x_t.is_contiguous(memory_format=torch.channels_last):
         memory_fmt = torch.channels_last
     else:
@@ -950,6 +980,8 @@ def call_aten_dx(
     groups,
     out,
 ):
+    # [FUNCTION DOC] HELPER: Extern ATen implementation of the input gradient: allocates a dummy input of x_shape (channels-last if go_t is), calls the out variant of
+    # convolution_backward writing the input gradient into out, and returns out.
     if go_t.is_contiguous(memory_format=torch.channels_last):
         memory_fmt = torch.channels_last
     else:
@@ -983,6 +1015,7 @@ ext_kn_aten_dx = ExternKernelChoice(call_aten_dx, None)
 
 @SymbolicGridFn
 def conv2d_bwd_weight_grid(cout, cin, kh, kw, meta, *, cdiv):
+    # [FUNCTION DOC] HELPER: Launch grid for the 2D backward-weight template: (tiles over cin*kh*kw, tiles over cout per group, groups).
     g = meta["GROUPS"]
     return (
         cdiv(cin * kh * kw, meta["BLOCK_M"]),
@@ -1000,6 +1033,7 @@ conv2d_bwd_weight_template = TritonTemplate(
 
 @SymbolicGridFn
 def conv2d_bwd_input_grid(n, cin, h, w, meta, *, cdiv):
+    # [FUNCTION DOC] HELPER: Launch grid for the 2D backward-input template: (tiles over batch*height*width, tiles over cin per group, groups).
     g = meta["GROUPS"]
     return (
         cdiv(n * h * w, meta["BLOCK_M"]),
@@ -1032,6 +1066,11 @@ def convolution_backward_lowering(
     groups: int,
     output_mask: Sequence[bool],
 ):
+    # [FUNCTION DOC] Lowering for aten.convolution_backward. Returns the tuple (input grad, weight grad, bias grad) with None for outputs not requested in output_mask.
+    # Guards stride/padding/dilation/groups to ints, realizes inputs, and for each requested gradient builds choices: Triton 2D templates (not on CUDA, only on ROCm,
+    # non-transposed, zero output padding) plus an ATen extern fallback. If no Triton choice exists, calls the ATen fallback handler for the whole op.
+    # Bias gradient is a sum over all dims but channel, only when bias_sizes is given. 3D backward is not implemented (TODO).
+    # KNOWN ISSUE: backward Triton templates use the cudnn allow_tf32 flag while the forward lowering uses the fp32_precision setting, so TF32 control is inconsistent.
     """
     Lowering function for backward convolution operator.
 
@@ -1290,6 +1329,8 @@ def convolution_backward_lowering(
 
 
 def constrain_conv_bwd_to_fx_strides(fx_node, *args, **kwargs):
+    # [FUNCTION DOC] HELPER: Layout constraint hook for aten.convolution_backward; returns args unchanged when layout optimization is on, else constrains to FX strides.
+    # Raises AssertionError if the node target is not convolution_backward.
     if fx_node.target != torch.ops.aten.convolution_backward.default:
         raise AssertionError(
             f"expected convolution_backward target, got {fx_node.target}"
