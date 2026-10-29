@@ -1,3 +1,6 @@
+# [MODULE DOC] Defines Node, the unit of the fx intermediate representation, plus helpers: argument mapping (map_arg, map_aggregate),
+# the has_side_effect registry used by dead code elimination, and printing helpers for types, targets and arguments.
+# Import-time side effects: creates the module logger and builds the global set of side-effectful functions (including some optional inductor ops).
 # Nodes represent a definition of a value in our graph of operators.
 import builtins
 import inspect
@@ -120,6 +123,10 @@ if hasattr(_ops.inductor, "resize_storage_bytes_"):
 
 
 def _device_annotation(device: torch.device) -> str:
+    # [FUNCTION DOC] HELPER: Returns the printable string for a device used in graph dumps. When the compiler config flag
+    # compile_on_one_rank is set and the device has an index equal to the current accelerator's current device index (and the same type),
+    # returns only the device type so output is identical across ranks; otherwise returns the full device string.
+    # Reads global accelerator and compiler config state; no mutation.
     # Render a tensor's device for graph printing. Under compile-on-one-rank the device
     # index is rank-specific; drop it when it is the current default device for the
     # accelerator (e.g. "cuda:3" -> "cuda") so the printed graph is byte-identical across
@@ -139,6 +146,8 @@ def _device_annotation(device: torch.device) -> str:
 
 @compatibility(is_backward_compatible=False)
 def has_side_effect(fn: Callable[_P, _R]) -> Callable[_P, _R]:
+    # [FUNCTION DOC] Adds fn to the module-level set of side-effectful functions so dead code elimination keeps calls to it.
+    # Returns fn unchanged so it can be used as a decorator. Side effect: mutates the global set.
     """
     Registers a function to not be dead code eliminated by
     fx.graph.eliminate_dead_code
@@ -157,6 +166,9 @@ def has_side_effect(fn: Callable[_P, _R]) -> Callable[_P, _R]:
 
 # this is fixed on master, WAR for 1.5
 def _find_module_of_method(orig_method: Callable[..., Any]) -> str:
+    # [FUNCTION DOC] HELPER: Returns the name of the module that defines orig_method: its module attribute if set, otherwise the
+    # first of torch or torch.nn.functional that has an attribute of the same name that is the same object.
+    # Raises RuntimeError if no module is found.
     name = orig_method.__name__
     module = orig_method.__module__
     if module is not None:
@@ -170,6 +182,8 @@ def _find_module_of_method(orig_method: Callable[..., Any]) -> str:
 # Borrowed from CPython typing module
 # https://github.com/python/cpython/blob/f90dc36c15d7fee0efaf6d39e97be0bdf2683e93/Lib/typing.py#L156
 def _type_repr(obj: object) -> str:
+    # [FUNCTION DOC] HELPER: Returns a short string for obj: module-qualified name for classes (bare qualified name for builtins),
+    # three dots for the ellipsis, the plain name for functions, and the repr for everything else. Generic aliases use repr.
     """Return the repr() of an object, special-casing types (internal helper).
     If obj is a type, we return a shorter version than the default
     type.__repr__, based on the module and qualified name, which is
@@ -190,6 +204,10 @@ def _type_repr(obj: object) -> str:
 
 
 def _get_qualified_name(func: Callable[..., Any]) -> str:
+    # [FUNCTION DOC] HELPER: Returns a dotted importable name for func, e.g. torch.add or torch.Tensor.method.
+    # Builtins give the bare name; Tensor methods give a torch.Tensor prefix; torch._ops is rewritten to torch.ops; lambdas are named
+    # by reading their source assignment target. A few private names are fixed up (segment_reduce, scaling/swizzle type enums).
+    # Raises RuntimeError if a lambda's source is unavailable or the defining module cannot be found.
     # things like getattr just appear in builtins
     if getattr(builtins, func.__name__, None) is func:
         return func.__name__
@@ -223,6 +241,10 @@ def _get_qualified_name(func: Callable[..., Any]) -> str:
 
 
 def _format_arg(arg: object, max_list_len: float = float("inf")) -> str:
+    # [FUNCTION DOC] HELPER: Formats a node argument for printing. Uses a custom repr hook if the object has one; lists, tuples and dicts are
+    # formatted recursively; Nodes print with a percent prefix; devices go through the device annotation helper; others use str.
+    # Lists and tuples are truncated to max_list_len elements with a total-length marker.
+    # KNOWN ISSUE: max_list_len is not propagated to nested elements, and dict contents are never truncated.
     if hasattr(arg, "_custom_fx_repr_fn"):
         return arg._custom_fx_repr_fn()
     elif isinstance(arg, list):
@@ -256,6 +278,12 @@ def _format_arg(arg: object, max_list_len: float = float("inf")) -> str:
 
 @compatibility(is_backward_compatible=True)
 class Node(_NodeBase):
+    # [CLASS DOC] A single operation (a value definition) in an fx Graph, implemented on top of the C++ _NodeBase.
+    # State: graph, name, op (one of placeholder, get_attr, call_function, call_method, call_module, output), target, type (optional
+    # return annotation), args and kwargs (tuple and dict of Arguments), users (ordered set of nodes that use this one), the private
+    # _input_nodes (nodes it uses), neighbors _prev and _next in the graph's doubly linked list, _erased, and meta (a free-form
+    # mapping preserved across copies). Assigning args or kwargs keeps use/user accounting up to date. Key methods: prepend, append,
+    # replace_all_uses_with, replace_input_with, update_arg, insert_arg, update_kwarg, format_node, is_impure, normalized_arguments.
     """
     ``Node`` is the data structure that represents individual operations within
     a ``Graph``. For the most part, Nodes represent callsites to various entities,
@@ -332,6 +360,9 @@ class Node(_NodeBase):
         kwargs: dict[str, "Argument"],
         return_type: Any | None = None,
     ) -> None:
+        # [FUNCTION DOC] Creates a node belonging to graph with the given name, opcode, target, args and kwargs and optional type annotation.
+        # Validates the target: a callable for call_function, otherwise op must be legal and target a string; raises ValueError for a wrong
+        # target type and AssertionError for an illegal op. Initializes the base class and records args/kwargs (updating users).
         """
         Instantiate an instance of ``Node``. Note: most often, you want to use the
         Graph APIs, i.e. ``Graph.call_module``, ``Graph.call_method``, etc. rather
@@ -376,6 +407,8 @@ class Node(_NodeBase):
         self._update_args_kwargs(args, kwargs)
 
     def __getstate__(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Pickle support: returns a dict of the instance dict plus all C-level node fields (graph, name, op, target, type,
+        # sort key, args, kwargs, erased flag, prev/next links, input nodes, users, repr function and meta).
         return {
             **self.__dict__,
             "graph": self.graph,
@@ -396,11 +429,13 @@ class Node(_NodeBase):
         }
 
     def __setstate__(self, state: dict[str, Any]) -> None:
+        # [FUNCTION DOC] Pickle support: restores every entry of state as an attribute on the node.
         for k, v in state.items():
             setattr(self, k, v)
 
     @property
     def next(self) -> "Node":
+        # [FUNCTION DOC] Property: the next node in the graph's linked list.
         """
         Returns the next ``Node`` in the linked list of Nodes.
 
@@ -412,6 +447,7 @@ class Node(_NodeBase):
 
     @property
     def prev(self) -> "Node":
+        # [FUNCTION DOC] Property: the previous node in the graph's linked list.
         """
         Returns the previous ``Node`` in the linked list of Nodes.
 
@@ -423,6 +459,7 @@ class Node(_NodeBase):
 
     @compatibility(is_backward_compatible=True)
     def prepend(self, x: "Node") -> None:
+        # [FUNCTION DOC] Moves node x to just before this node in the graph's node list (delegates to the base class; x must be in the same graph).
         """
         Insert x before this node in the list of nodes in the graph. Example::
 
@@ -439,6 +476,7 @@ class Node(_NodeBase):
 
     @compatibility(is_backward_compatible=True)
     def append(self, x: "Node") -> None:
+        # [FUNCTION DOC] Moves node x to just after this node, implemented as prepending x to the next node.
         """
         Insert ``x`` after this node in the list of nodes in the graph.
         Equivalent to ``self.next.prepend(x)``
@@ -451,6 +489,7 @@ class Node(_NodeBase):
 
     @property
     def args(self) -> tuple[Argument, ...]:
+        # [FUNCTION DOC] Property: the tuple of positional arguments of this node.
         """
         The tuple of arguments to this ``Node``. The interpretation of arguments
         depends on the node's opcode. See the :class:`Node` docstring for more
@@ -463,6 +502,7 @@ class Node(_NodeBase):
 
     @args.setter
     def args(self, a: tuple[Argument, ...]) -> None:
+        # [FUNCTION DOC] Setter: replaces the positional arguments with a, keeping the existing kwargs and updating use/user bookkeeping.
         """
         Set the tuple of arguments to this Node. The interpretation of arguments
         depends on the node's opcode. See the ``fx.Graph`` docstring for more
@@ -474,6 +514,7 @@ class Node(_NodeBase):
 
     @property
     def kwargs(self) -> dict[str, Argument]:
+        # [FUNCTION DOC] Property: the mapping of keyword arguments of this node.
         """
         The dict of keyword arguments to this ``Node``. The interpretation of arguments
         depends on the node's opcode. See the :class:`Node` docstring for more
@@ -486,6 +527,7 @@ class Node(_NodeBase):
 
     @kwargs.setter
     def kwargs(self, k: dict[str, Argument]) -> None:
+        # [FUNCTION DOC] Setter: replaces the keyword arguments with k, keeping the existing args and updating use/user bookkeeping.
         """
         Set the dict of kwargs to this Node. The interpretation of arguments
         depends on the node's opcode. See the ``fx.Graph`` docstring for more
@@ -497,6 +539,7 @@ class Node(_NodeBase):
 
     @property
     def all_input_nodes(self) -> list["Node"]:
+        # [FUNCTION DOC] Property: list of distinct nodes used by this node's args and kwargs, in order of first appearance.
         """
         Return all Nodes that are inputs to this Node. This is equivalent to
         iterating over ``args`` and ``kwargs`` and only collecting the values that
@@ -511,6 +554,8 @@ class Node(_NodeBase):
 
     @compatibility(is_backward_compatible=True)
     def update_arg(self, idx: int, arg: Argument) -> None:
+        # [FUNCTION DOC] Replaces the positional argument at index idx with arg by assigning a new args tuple (so bookkeeping is updated).
+        # Raises IndexError if idx is out of range.
         """
         Update an existing positional argument to contain the new value
         ``arg``. After calling, ``self.args[idx] == arg``.
@@ -526,6 +571,9 @@ class Node(_NodeBase):
 
     @compatibility(is_backward_compatible=True)
     def insert_arg(self, idx: int, arg: Argument) -> None:
+        # [FUNCTION DOC] Inserts arg into the positional arguments before index idx (0 up to the current length inclusive).
+        # Raises AssertionError if idx is out of range. Updates _args directly and adds any new Node inputs to the input and user sets.
+        # KNOWN ISSUE: bypasses the args setter and the base class update path, so it does not go through the normal update logic.
         """
         Insert a positional argument to the argument list with given index.
 
@@ -553,6 +601,7 @@ class Node(_NodeBase):
 
     @compatibility(is_backward_compatible=True)
     def update_kwarg(self, key: str, arg: Argument) -> None:
+        # [FUNCTION DOC] Sets keyword argument key to arg (adding it if absent) by assigning a new kwargs mapping, so bookkeeping is updated.
         """
         Update an existing keyword argument to contain the new value
         ``arg``. After calling, ``self.kwargs[key] == arg``.
@@ -566,6 +615,7 @@ class Node(_NodeBase):
 
     @property
     def stack_trace(self) -> str | None:
+        # [FUNCTION DOC] Property: the recorded Python stack trace string from meta, or None if absent.
         """
         Return the Python stack trace that was recorded during tracing, if any.
         When traced with fx.Tracer, this property is usually populated by
@@ -580,15 +630,20 @@ class Node(_NodeBase):
 
     @stack_trace.setter
     def stack_trace(self, trace: str | None) -> None:
+        # [FUNCTION DOC] Setter: stores trace in meta under the stack_trace key.
         self.meta["stack_trace"] = trace
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Returns the result of the custom repr function when one is set, otherwise the node's name.
         if self._repr_fn:
             return self._repr_fn(self)
         return self.name
 
     @staticmethod
     def _pretty_print_target(target: object) -> str:
+        # [FUNCTION DOC] HELPER: Static method giving a readable target string: strings as is, builtins and operator functions with builtins or
+        # operator prefix, everything else via the qualified-name helper.
+        # KNOWN ISSUE: when a target has a module attribute but no name attribute, it falls back to the qualified-name helper, which itself needs the name attribute (see the TODO).
         """
         Make target printouts more user-friendly.
         1) builtins will be printed as `builtins.xyz`
@@ -620,6 +675,11 @@ class Node(_NodeBase):
         *,
         include_tensor_metadata: bool = False,
     ) -> str | None:
+        # [FUNCTION DOC] Returns a one-line description of this node, e.g. a percent-prefixed name with type, user count, opcode, target and args/kwargs.
+        # For a placeholder, if placeholder_names is a non-empty list it appends a signature entry to it and returns None; for an output node, fills the
+        # first slot of maybe_return_typename with a return annotation when given. With include_tensor_metadata, call nodes show dtype, shape, stride and device
+        # taken from the tensor metadata. Mutates the passed lists as side effect. Raises AssertionError if a placeholder target is not a string.
+        # KNOWN ISSUE: the placeholder signature entry doubles the argument name when a type is present, and a non-empty-list test means an empty list is never appended to.
         """
         Return a descriptive string representation of ``self``.
 
@@ -677,6 +737,7 @@ class Node(_NodeBase):
         else:
 
             def stringify_shape(shape: Iterable[Any]) -> str:
+            # [FUNCTION DOC] HELPER: Formats shape as a bracketed comma-separated string.
                 return f"[{', '.join([str(x) for x in shape])}]"
 
             meta_val = self.meta.get(
@@ -717,6 +778,9 @@ class Node(_NodeBase):
         *,
         propagate_meta: bool = False,
     ) -> list["Node"]:
+        # [FUNCTION DOC] Makes every user of this node use replace_with instead. delete_user_cb, if given, is called per user and users for which it returns false are skipped.
+        # With propagate_meta, copies this node's meta onto replace_with (raising AssertionError if replace_with already has meta).
+        # Calls registered replace hooks of the owning module for each changed user. Returns the list of users that were modified.
         """
         Replace all uses of ``self`` in the Graph with the Node ``replace_with``.
 
@@ -758,6 +822,9 @@ class Node(_NodeBase):
 
     @compatibility(is_backward_compatible=False)
     def is_impure(self, impure_random: bool = True) -> bool:
+        # [FUNCTION DOC] Returns whether the node must not be removed by dead code elimination. Placeholders and outputs are always impure; a call_module is impure if
+        # its submodule has a truthy impure marker; call_function defers to the library impurity check (impure_random controls random ops); others are pure.
+        # Raises AssertionError if a call_module node has no owning module or the submodule is missing.
         """
         Returns whether this op is impure, i.e. if its op is a placeholder or
         output, or if a call_function or call_module which is impure.
@@ -815,6 +882,9 @@ class Node(_NodeBase):
         kwarg_types: dict[str, Any] | None = None,
         normalize_to_only_use_kwargs: bool = False,
     ) -> ArgsKwargsPair | None:
+        # [FUNCTION DOC] For call_function and call_module nodes, matches args and kwargs to the target's signature (filling defaults) and returns the pair,
+        # optionally using only kwargs. arg_types and kwarg_types may disambiguate overloads. Returns None for other opcodes. root resolves module targets.
+        # Raises AssertionError for a wrongly typed target.
         """
         Returns normalized arguments to Python targets. This means that
         `args/kwargs` will be matched up to the module/functional's
@@ -867,6 +937,7 @@ class Node(_NodeBase):
 
     @compatibility(is_backward_compatible=True)
     def replace_input_with(self, old_input: "Node", new_input: "Node") -> None:
+        # [FUNCTION DOC] Replaces every use of old_input among this node's inputs with new_input, calling replace hooks of the owning module first (if any).
         """
         Loop through input nodes of ``self``, and replace all instances of
         ``old_input`` with ``new_input``.
@@ -885,6 +956,7 @@ class Node(_NodeBase):
         self._replace_input_with(old_input, new_input)
 
     def _rename(self, candidate: str) -> None:
+        # [FUNCTION DOC] HELPER: Renames the node to a unique name derived from candidate using the graph namespace; does nothing if the name is unchanged.
         if candidate == self.name:
             return
         name = self.graph._graph_namespace.create_name(candidate, None)
@@ -892,6 +964,8 @@ class Node(_NodeBase):
         self.graph._graph_namespace._rename_object(self, name)
 
     def __setattr__(self, name: str, value: Any) -> None:
+        # [FUNCTION DOC] Attribute assignment hook. On renaming an existing name, notifies owning-module replace hooks for each user (AssertionError if the
+        # new name is not a string). If the node is in the graph's find-nodes lookup table, removes it before the assignment and reinserts afterwards so the table stays consistent.
         if name == "name" and hasattr(self, "name"):
             m = self.graph.owning_module
             if getattr(m, "_replace_hooks", None):
@@ -915,6 +989,8 @@ class Node(_NodeBase):
 
 @compatibility(is_backward_compatible=True)
 def map_arg(a: ArgumentT, fn: Callable[[Node], Argument]) -> ArgumentT:
+    # [FUNCTION DOC] Applies fn to every Node found recursively inside a (lists, tuples, slices and dicts with string keys), returning a structure of the same shape.
+    # Raises AssertionError if fn is not callable.
     """
     Apply fn recursively to each Node appearing in arg.
 
@@ -928,6 +1004,7 @@ def map_arg(a: ArgumentT, fn: Callable[[Node], Argument]) -> ArgumentT:
 
 @compatibility(is_backward_compatible=True)
 def map_aggregate(a: ArgumentT, fn: Callable[[Argument], Argument]) -> ArgumentT:
+    # [FUNCTION DOC] Applies fn to every leaf object found recursively inside a (lists, tuples, slices and dicts), returning a structure of the same shape.
     """
     Apply fn recursively to each object appearing in arg.
 

@@ -1,3 +1,6 @@
+# [MODULE DOC] Provides Interpreter, which executes an fx Graph node by node with overridable per-opcode methods,
+# and Transformer, an Interpreter that re-traces a GraphModule symbolically into a new GraphModule.
+# Also defines a debug-format helper for nodes. Import-time side effects: creates the module logger only.
 import inspect
 import logging
 from collections.abc import Iterator
@@ -25,6 +28,9 @@ __all__ = ["Interpreter", "Transformer"]
 
 
 def _format_fx_node(n: Node) -> str:
+    # [FUNCTION DOC] HELPER: Builds a one-line debug string for node n of the form name = module.target(args, kwargs).
+    # The module prefix comes from the target's module attribute when present; the target name falls back to the target itself.
+    # Args are stringified positionally then as key=value pairs. Pure; no side effects.
     """
     Format a torch.fx.Node into a human-readable string for debug logging.
 
@@ -50,6 +56,12 @@ def _format_fx_node(n: Node) -> str:
 
 @compatibility(is_backward_compatible=True)
 class Interpreter:
+    # [CLASS DOC] Executes an fx Graph node by node with concrete values.
+    # State: module (source of attributes and submodules), submodules (mapping from qualified name to module), graph (the graph run),
+    # env (mapping from Node to computed value), name, garbage_collect_values, extra_traceback, and user_to_last_uses
+    # (when garbage collection is on: mapping from a node to the nodes whose values die after it runs) plus args_iter during a run.
+    # Dispatch: run walks the nodes and run_node calls the method named by node.op (placeholder, get_attr, call_function,
+    # call_method, call_module, output); subclasses override these to customize execution.
     """
     An Interpreter executes an FX graph Node-by-Node. This pattern
     can be useful for many things, including writing code
@@ -116,6 +128,10 @@ class Interpreter:
         garbage_collect_values: bool = True,
         graph: Graph | None = None,
     ) -> None:
+        # [FUNCTION DOC] Sets up the interpreter for module, using graph if given else module.graph.
+        # Builds the submodule name mapping, empty env and flags. If garbage_collect_values is true, scans nodes in reverse
+        # to record, for each node, the last user node so values can be freed after that user executes.
+        # Side effects: stores state on self only. Raises AttributeError if no graph is given and module has no graph attribute.
         self.module = module
         self.submodules = dict(self.module.named_modules())
         if graph is not None:
@@ -151,6 +167,13 @@ class Interpreter:
         initial_env: dict[Node, Any] | None = None,
         enable_io_processing: bool = True,
     ) -> Any:
+        # [FUNCTION DOC] Runs the graph on the positional args and returns the output value.
+        # initial_env pre-populates node values (those nodes are skipped); enable_io_processing applies graph.process_inputs to the
+        # args and graph.process_outputs to the result. Shows a progress bar, executes each node via run_node, stores the result in env,
+        # and frees dead values if garbage collection is on. On an exception, augments the message with the node description,
+        # original stack trace and a tlparse hint (logging a structured trace artifact when module is a GraphModule); KeyError becomes
+        # RuntimeError, others are re-raised. Returns None implicitly if the graph has no output node.
+        # KNOWN ISSUE: self.env is set to initial_env itself (not a copy), so the caller's mapping is mutated, including by garbage collection.
         """
         Run `module` via interpretation and return the result.
 
@@ -238,6 +261,9 @@ class Interpreter:
 
     @compatibility(is_backward_compatible=True)
     def boxed_run(self, args_list: list[Any]) -> Any:
+        # [FUNCTION DOC] Runs the graph using the boxed calling convention: args_list holds one value per placeholder node, in order.
+        # Raises RuntimeError if the count differs from the number of placeholders. Binds the values to placeholders, clears args_list
+        # in place so inputs can be freed early, then runs with that initial environment and returns the result.
         """
         Run `module` via interpretation and return the result.  This uses the "boxed"
         calling convention, where you pass a list of arguments, which will be cleared
@@ -265,6 +291,8 @@ class Interpreter:
 
     @contextmanager
     def _set_current_node(self, node: Node) -> Iterator[None]:
+        # [FUNCTION DOC] HELPER: Context manager that marks node as the current fx traceback metadata source (named after the
+        # Interpreter subclass) for the duration of the with block.
         with fx_traceback.set_current_meta(
             node, f"Interpreter_{self.__class__.__name__}"
         ):
@@ -272,6 +300,9 @@ class Interpreter:
 
     @compatibility(is_backward_compatible=True)
     def run_node(self, n: Node) -> Any:
+        # [FUNCTION DOC] Executes node n: logs it at debug level, fetches concrete args and kwargs from env, then calls the method
+        # named by n.op with target, args and kwargs and returns its result. Raises AssertionError if fetched args are not a tuple
+        # or kwargs not a dict.
         """
         Run a specific node ``n`` and return the result.
         Calls into placeholder, get_attr, call_function,
@@ -298,6 +329,9 @@ class Interpreter:
     def placeholder(
         self, target: "Target", args: tuple[Argument, ...], kwargs: dict[str, Any]
     ) -> Any:
+        # [FUNCTION DOC] Returns the value for a placeholder node. A target starting with an asterisk consumes all remaining inputs as a list;
+        # otherwise the next input is taken. If inputs are exhausted, returns the default in args if present, else raises RuntimeError.
+        # Raises AssertionError if target is not a string. Advances args_iter.
         """
         Execute a ``placeholder`` node. Note that this is stateful:
         ``Interpreter`` maintains an internal iterator over
@@ -335,6 +369,8 @@ class Interpreter:
     def get_attr(
         self, target: "Target", args: tuple[Argument, ...], kwargs: dict[str, Any]
     ) -> Any:
+        # [FUNCTION DOC] Returns the attribute named by target (dotted path) looked up on self.module via fetch_attr.
+        # Raises AssertionError if target is not a string; RuntimeError if the path does not exist.
         """
         Execute a ``get_attr`` node. Will retrieve an attribute
         value from the ``Module`` hierarchy of ``self.module``.
@@ -357,6 +393,7 @@ class Interpreter:
     def call_function(
         self, target: "Target", args: tuple[Argument, ...], kwargs: dict[str, Any]
     ) -> Any:
+        # [FUNCTION DOC] Calls the callable target with args and kwargs and returns its result. Exceptions from the callee propagate.
         """
         Execute a ``call_function`` node and return the result.
 
@@ -380,6 +417,8 @@ class Interpreter:
     def call_method(
         self, target: "Target", args: tuple[Argument, ...], kwargs: dict[str, Any]
     ) -> Any:
+        # [FUNCTION DOC] Calls the method named target on the first positional arg (the receiver) with the remaining args and kwargs
+        # and returns the result. Raises AssertionError if target is not a string.
         """
         Execute a ``call_method`` node and return the result.
 
@@ -405,6 +444,8 @@ class Interpreter:
     def call_module(
         self, target: "Target", args: tuple[Argument, ...], kwargs: dict[str, Any]
     ) -> Any:
+        # [FUNCTION DOC] Looks up the submodule named by target via fetch_attr, calls it with args and kwargs and returns the result.
+        # Raises AssertionError if target is not a string.
         """
         Execute a ``call_module`` node and return the result.
 
@@ -431,6 +472,7 @@ class Interpreter:
     def output(
         self, target: "Target", args: tuple[Argument, ...], kwargs: dict[str, Any]
     ) -> Any:
+        # [FUNCTION DOC] Returns the value referenced by an output node, which is the first positional arg.
         """
         Execute an ``output`` node. This really just retrieves
         the value referenced by the ``output`` node and returns it.
@@ -450,6 +492,8 @@ class Interpreter:
     # Helper methods
     @compatibility(is_backward_compatible=True)
     def fetch_attr(self, target: str) -> Any:
+        # [FUNCTION DOC] Resolves the dotted attribute path target by walking from self.module and returns the value.
+        # Raises RuntimeError naming the missing prefix if any step is absent.
         """
         Fetch an attribute from the ``Module`` hierarchy of ``self.module``.
 
@@ -473,6 +517,8 @@ class Interpreter:
     def fetch_args_kwargs_from_env(
         self, n: Node
     ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        # [FUNCTION DOC] Returns the (args, kwargs) of node n with every Node replaced by its value in env (via map_nodes_to_values).
+        # Raises AssertionError if the mapped args is not a tuple or kwargs not a dict; RuntimeError for missing values.
         """
         Fetch the concrete values of ``args`` and ``kwargs`` of node ``n``
         from the current execution environment.
@@ -493,6 +539,8 @@ class Interpreter:
 
     @compatibility(is_backward_compatible=True)
     def map_nodes_to_values(self, args: Argument, n: Node) -> Argument:
+        # [FUNCTION DOC] Recursively replaces each Node in the nested structure args with its value from env. n is used only in the error text.
+        # Raises RuntimeError if a referenced node has no value in env.
         """
         Recursively descend through ``args`` and look up the concrete value
         for each ``Node`` in the current execution environment.
@@ -504,6 +552,7 @@ class Interpreter:
         """
 
         def load_arg(n_arg: Node) -> Any:
+            # [FUNCTION DOC] HELPER: Returns env value for n_arg or raises RuntimeError suggesting Graph.lint.
             if n_arg not in self.env:
                 raise RuntimeError(
                     f"Node {n} referenced nonexistent value {n_arg}! Run Graph.lint() "
@@ -516,6 +565,9 @@ class Interpreter:
 
 @compatibility(is_backward_compatible=True)
 class Transformer(Interpreter):
+    # [CLASS DOC] An Interpreter that runs symbolically to build a new GraphModule rather than computing values.
+    # State: new_graph (graph being built, sharing the source codegen) and tracer (a leaf-everything Tracer writing into new_graph with root set to the module).
+    # Overrides placeholder, get_attr, call_module and call_function to emit nodes and return Proxy objects; transform returns the result.
     """
     ``Transformer`` is a special type of interpreter that produces a
     new ``Module``. It exposes a ``transform()`` method that returns
@@ -568,17 +620,22 @@ class Transformer(Interpreter):
 
     @compatibility(is_backward_compatible=True)
     def __init__(self, module: GraphModule) -> None:
+        # [FUNCTION DOC] Initializes the base Interpreter, creates an empty new_graph using the codegen of module's graph, and
+        # creates a tracer bound to it whose root is module.
         super().__init__(module)
         self.new_graph = Graph()
         self.new_graph.set_codegen(module.graph._codegen)
 
         class TransformerTracer(Tracer):
+        # [CLASS DOC] HELPER: Tracer that writes into a supplied graph, treats every module as a leaf, and starts with empty tensor_attrs.
             def __init__(self, graph: Graph) -> None:
+            # [FUNCTION DOC] HELPER: Initializes the Tracer and sets its graph to the supplied one.
                 super().__init__()
                 self.graph = graph
                 self.tensor_attrs: dict[torch.Tensor, str] = {}  # type: ignore[assignment]
 
             def is_leaf_module(self, _: torch.nn.Module, __: str) -> bool:
+            # [FUNCTION DOC] HELPER: Always returns True so modules are never inlined.
                 return True
 
         self.tracer = TransformerTracer(self.new_graph)
@@ -588,6 +645,8 @@ class Transformer(Interpreter):
     def placeholder(
         self, target: "Target", args: tuple[Argument, ...], kwargs: dict[str, Any]
     ) -> Proxy:
+        # [FUNCTION DOC] Adds a placeholder named target to new_graph (default taken from the first arg if given) and returns a Proxy for it.
+        # Raises AssertionError if target is not a string.
         """
         Execute a ``placeholder`` node. In ``Transformer``, this is
         overridden to insert a new ``placeholder`` into the output
@@ -611,6 +670,8 @@ class Transformer(Interpreter):
     def get_attr(
         self, target: "Target", args: tuple[Argument, ...], kwargs: dict[str, Any]
     ) -> Proxy:
+        # [FUNCTION DOC] Adds a get_attr node for target to new_graph via the tracer and returns its Proxy.
+        # Raises AssertionError if target is not a string.
         """
         Execute a ``get_attr`` node. In ``Transformer``, this is
         overridden to insert a new ``get_attr`` node into the output
@@ -631,6 +692,8 @@ class Transformer(Interpreter):
     def call_module(
         self, target: "Target", args: tuple[Argument, ...], kwargs: dict[str, Any]
     ) -> Any:
+        # [FUNCTION DOC] Fetches the submodule and delegates to the tracer's call_module so its leaf-module policy applies (here always a leaf).
+        # Raises AssertionError if target is not a string.
         # Override so that the leaf module policy from `self.tracer` is respected.
         if not isinstance(target, str):
             raise AssertionError(f"Expected target to be str, got {type(target)}")
@@ -641,11 +704,15 @@ class Transformer(Interpreter):
     def call_function(
         self, target: "Target", args: tuple[Argument, ...], kwargs: dict[str, Any]
     ) -> Any:
+        # [FUNCTION DOC] Emits a call_function node for target through the tracer and returns the resulting Proxy, preserving wrapped functions.
         # Override so that functions that were wrapped are still wrapped.
         return self.tracer.create_proxy("call_function", target, args, kwargs)
 
     @compatibility(is_backward_compatible=True)
     def transform(self) -> GraphModule:
+        # [FUNCTION DOC] Runs the interpretation symbolically (preserving node metadata, without IO processing) to fill new_graph,
+        # adds an output node from the result (unwrapping Proxy objects), copies metadata from the old output node, and returns a new GraphModule
+        # built from self.module and new_graph. Raises AssertionError if the last node of the old graph is not an output node.
         """
         Transform ``self.module`` and return the transformed
         ``GraphModule``.
@@ -655,6 +722,7 @@ class Transformer(Interpreter):
         if result is not None:
 
             def strip_proxy(a: Argument | Proxy) -> Any:
+                # [FUNCTION DOC] HELPER: Returns the underlying node for a Proxy, otherwise the value unchanged.
                 return a.node if isinstance(a, Proxy) else a
 
             new_output_node = self.new_graph.output(map_aggregate(result, strip_proxy))
