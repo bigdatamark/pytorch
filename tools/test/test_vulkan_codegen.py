@@ -1,3 +1,6 @@
+# [MODULE DOC] Tests for the Vulkan SPIR-V shader generator (tools.gen_vulkan_spv). Defines an
+# inline GLSL template and a YAML parameter file, and checks which shader variants the
+# generator produces. Import time: only defines the two data strings.
 import tempfile
 import unittest
 
@@ -97,7 +100,14 @@ test_shader:
 
 
 class TestVulkanSPVCodegen(unittest.TestCase):
+    # [CLASS DOC] Test case for SPVGenerator variant enumeration. State: tmpdir (source dir),
+    # tmpoutdir (output dir, unused by the test) and generator built over tmpdir.
     def setUp(self) -> None:
+        # [FUNCTION DOC] Creates temporary source and output directories, writes the shader
+        # template and parameter YAML into the source directory, and builds a generator
+        # with the default environment and no shader compiler path.
+        # KNOWN ISSUE: the shader file name has a trailing comma in its name, so it is not a
+        # glsl file by extension; the test still passes since variants come from the YAML.
         self.tmpdir = tempfile.TemporaryDirectory()
 
         with open(f"{self.tmpdir.name}/test_shader.glsl,", "w") as f:
@@ -113,10 +123,16 @@ class TestVulkanSPVCodegen(unittest.TestCase):
         )
 
     def cleanUp(self) -> None:
+        # [FUNCTION DOC] HELPER: Intended to remove both temporary directories.
+        # KNOWN ISSUE: unittest calls tearDown, not cleanUp, so this is never run
+        # automatically and the directories are left until garbage collection.
         self.tmpdir.cleanup()
         self.tmpoutdir.cleanup()
 
     def testOutputMap(self) -> None:
+        # [FUNCTION DOC] Checks the set of generated shader names equals the six expected
+        # variants (two names crossed with dtype and in-place options, with the second name
+        # overriding the dtype list).
         # Each shader variant will produce variants generated based on all possible combinations
         # of the DTYPE and INPLACE parameters. test_shader_3 has fewer generated variants due to
         # a custom specified generate_variant_forall field.

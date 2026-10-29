@@ -1,3 +1,7 @@
+# [MODULE DOC] Tests for the stable shim usage linter: parsing versioned declarations out of a
+# sample shim header, writing the function-to-version listing file, and flagging calls in a
+# sample usage header that lack a sufficient version guard. Fixtures live in
+# stable_shim_usage_linter_data. Import time: appends the repo root to sys.path.
 import sys
 import tempfile
 import unittest
@@ -15,9 +19,15 @@ from tools.linter.adapters.stable_shim_usage_linter import (
 
 
 class TestStableShimUsageLinter(unittest.TestCase):
+    # [CLASS DOC] Test case for get_shim_functions, write_shim_function_versions and
+    # check_file of the stable shim usage linter. Stateless.
     """Test stable shim usage linter functionality."""
 
     def test_get_shim_functions(self):
+        # [FUNCTION DOC] Parses the sample shim header and checks the resulting mapping from
+        # identifier to (major, minor, patch) version, covering nested guards, else/elif
+        # branches, typedefs, using/struct/class declarations, multi-line declarations,
+        # versions embedded in names, and ignoring commented or unversioned entries.
         """
         Test parsing a comprehensive sample shim.h that covers all edge cases:
         - Simple versioned functions
@@ -85,6 +95,9 @@ class TestStableShimUsageLinter(unittest.TestCase):
         self.assertEqual(result, expected)
 
     def test_write_shim_function_versions(self):
+        # [FUNCTION DOC] Writes a small function-to-version mapping to a temporary file and
+        # checks the header marks it auto-generated and that the entry lines are ordered by
+        # version (then name) in the version-macro format.
         """Test that write_shim_function_versions creates the expected output file."""
         functions = {
             "func_a": (2, 9, 0),
@@ -119,6 +132,11 @@ class TestStableShimUsageLinter(unittest.TestCase):
             self.assertEqual(lines, expected_lines)
 
     def test_check_file(self):
+        # [FUNCTION DOC] Runs the usage check on the sample usage header against functions
+        # parsed from the sample shim header and asserts one message per expected line, with
+        # the expected message name and the function name present in the description.
+        # KNOWN ISSUE: the explanatory comment for line 138 mentions fallback and 2.11, but
+        # the expected error list uses function_2_12_1; the comment is stale.
         """
         Test checking a file for proper usage of versioned shim functions.
         This tests various scenarios:

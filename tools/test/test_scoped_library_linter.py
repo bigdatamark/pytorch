@@ -1,4 +1,6 @@
 # mypy: ignore-errors
+# [MODULE DOC] Regression tests for the scoped-library linter adapter's check_file. Each test
+# writes a small Python source into a temporary directory and checks the reported messages.
 from __future__ import annotations
 
 import tempfile
@@ -17,15 +19,21 @@ EXPECTED_DESCRIPTION = f"In tests, use torch.library._scoped_library, or skip li
 
 
 class TestScopedLibraryLinter(unittest.TestCase):
+    # [CLASS DOC] Test case for direct torch Library construction detection and its noqa
+    # suppression rules. Stateless apart from per-test temporary directories.
     """Regression tests for ``scoped_library_linter.check_file``."""
 
     def _write(self, directory: Path, rel: str, content: str) -> Path:
+        # [FUNCTION DOC] HELPER: Writes content as UTF-8 text to a path relative to the given
+        # directory, creating parent directories, and returns the full path.
         path = directory / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
         return path
 
     def test_reports_torch_dot_library_dot_library(self) -> None:
+        # [FUNCTION DOC] Checks that a call through the fully qualified torch library Library
+        # name yields exactly one error message at line 3, column 6, with the expected text.
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             path = self._write(
@@ -51,6 +59,8 @@ class TestScopedLibraryLinter(unittest.TestCase):
             )
 
     def test_reports_imported_library_name(self) -> None:
+        # [FUNCTION DOC] Checks that calling Library after importing it by name is reported
+        # once, on line 3.
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             path = self._write(
@@ -63,6 +73,7 @@ class TestScopedLibraryLinter(unittest.TestCase):
             self.assertEqual(msgs[0].line, 3)
 
     def test_allows_inline_noqa(self) -> None:
+        # [FUNCTION DOC] Checks that a noqa marker on the same line suppresses the message.
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             path = self._write(
@@ -74,6 +85,7 @@ class TestScopedLibraryLinter(unittest.TestCase):
             self.assertEqual(check_file(str(path)), [])
 
     def test_allows_noqa_alone_on_previous_line(self) -> None:
+        # [FUNCTION DOC] Checks that a noqa comment on its own preceding line suppresses it.
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             path = self._write(
@@ -86,6 +98,8 @@ class TestScopedLibraryLinter(unittest.TestCase):
             self.assertEqual(check_file(str(path)), [])
 
     def test_allows_multiline_call_if_any_line_has_noqa(self) -> None:
+        # [FUNCTION DOC] Checks that a multi-line call is suppressed when any of its lines
+        # carries the noqa marker.
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             path = self._write(
@@ -100,6 +114,8 @@ class TestScopedLibraryLinter(unittest.TestCase):
             self.assertEqual(check_file(str(path)), [])
 
     def test_reports_multiline_call_without_noqa(self) -> None:
+        # [FUNCTION DOC] Checks that a multi-line call without any noqa is reported once,
+        # at the line where the call starts (line 3).
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             path = self._write(
@@ -116,12 +132,16 @@ class TestScopedLibraryLinter(unittest.TestCase):
             self.assertEqual(msgs[0].line, 3)
 
     def test_empty_on_syntax_error(self) -> None:
+        # [FUNCTION DOC] Checks that a source file with a syntax error yields no messages
+        # instead of raising.
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             path = self._write(root, "broken.py", "def incomplete(\n")
             self.assertEqual(check_file(str(path)), [])
 
     def test_no_match_for_non_library_call(self) -> None:
+        # [FUNCTION DOC] Checks that calling an unrelated user-defined class instance does
+        # not produce a message.
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             path = self._write(

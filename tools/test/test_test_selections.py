@@ -1,3 +1,7 @@
+# [MODULE DOC] Unit tests for tools.testing.test_selections: calculate_shards (round robin
+# without times, time-balanced greedy sharding, splitting of long tests into pytest shards,
+# serial-first ordering, randomized invariants) and get_job_base_name. Import time: appends
+# the repo root to sys.path and exits the process if imports fail.
 from __future__ import annotations
 
 import functools
@@ -24,10 +28,14 @@ except ModuleNotFoundError:
 
 
 def gen_class_times(test_times: dict[str, float]) -> dict[str, dict[str, float]]:
+    # [FUNCTION DOC] HELPER: Builds per-class timing data from per-file times by putting the
+    # whole time of each file under a single class named class1.
     return {k: {"class1": v} for k, v in test_times.items()}
 
 
 class TestCalculateShards(unittest.TestCase):
+    # [CLASS DOC] Test case for calculate_shards. Class attributes hold shared fixtures: a
+    # list of eleven TestRun objects, per-file times in seconds, and matching per-class times.
     tests: list[TestRun] = [
         TestRun("super_long_test"),
         TestRun("long_test1"),
@@ -75,11 +83,16 @@ class TestCalculateShards(unittest.TestCase):
         expected_shards: list[tuple[float, list[ShardedTest]]],
         actual_shards: list[tuple[float, list[ShardedTest]]],
     ) -> None:
+        # [FUNCTION DOC] HELPER: Compares shards pairwise: shard times approximately and test
+        # lists exactly (order matters). Pairing stops at the shorter list, so a missing or
+        # extra shard is not detected.
         for expected, actual in zip(expected_shards, actual_shards):
             self.assertAlmostEqual(expected[0], actual[0])
             self.assertListEqual(expected[1], actual[1])
 
     def test_no_times(self) -> None:
+        # [FUNCTION DOC] Checks that with no timing data and no sorting, tests are dealt to two
+        # shards round robin in input order, all with unknown time and zero shard time.
         # Check that round robin sharding is used when no times are provided
         expected_shards = [
             (
@@ -112,6 +125,8 @@ class TestCalculateShards(unittest.TestCase):
         )
 
     def test_some_times_with_not_sort_by_time(self) -> None:
+        # [FUNCTION DOC] Checks two-shard assignment when only some tests have times and input
+        # order is kept: tests with known times drive the balance, unknown ones fill in.
         expected_shards = [
             (
                 400.0,
@@ -147,6 +162,8 @@ class TestCalculateShards(unittest.TestCase):
         )
 
     def test_serial_parallel_interleaving(self) -> None:
+        # [FUNCTION DOC] Checks that tests flagged by the must-serial predicate are placed
+        # first in the shards that get them, ahead of the other tests.
         expected_shards = [
             (
                 300.0,
@@ -183,6 +200,7 @@ class TestCalculateShards(unittest.TestCase):
         )
 
     def test_calculate_2_shards_with_complete_test_times(self) -> None:
+        # [FUNCTION DOC] Checks time-balanced two-shard output when every test has a time.
         expected_shards = [
             (
                 60.0,
@@ -212,6 +230,8 @@ class TestCalculateShards(unittest.TestCase):
         )
 
     def test_calculate_1_shard_with_complete_test_times(self) -> None:
+        # [FUNCTION DOC] Checks single-shard output when one file appears twice, once
+        # excluding and once including a class: each run is timed from per-class times.
         tests = self.tests.copy()
         class_test1 = TestRun("long_test1", excluded=["class2"])
         class_test2 = TestRun("long_test1", included=["class2"])
@@ -244,6 +264,7 @@ class TestCalculateShards(unittest.TestCase):
         )
 
     def test_calculate_5_shards_with_complete_test_times(self) -> None:
+        # [FUNCTION DOC] Checks time-balanced five-shard output when every test has a time.
         expected_shards = [
             (
                 55.0,
@@ -276,6 +297,8 @@ class TestCalculateShards(unittest.TestCase):
         )
 
     def test_calculate_2_shards_with_incomplete_test_times(self) -> None:
+        # [FUNCTION DOC] Checks two-shard output when only tests with test1 in their name have
+        # times; untimed tests are distributed without time.
         incomplete_test_times = {
             k: v for k, v in self.test_times.items() if "test1" in k
         }
@@ -315,6 +338,7 @@ class TestCalculateShards(unittest.TestCase):
         )
 
     def test_calculate_5_shards_with_incomplete_test_times(self) -> None:
+        # [FUNCTION DOC] Same as the two-shard incomplete-times test but with five shards.
         incomplete_test_times = {
             k: v for k, v in self.test_times.items() if "test1" in k
         }
@@ -369,6 +393,9 @@ class TestCalculateShards(unittest.TestCase):
         )
 
     def test_split_shards(self) -> None:
+        # [FUNCTION DOC] Checks splitting by THRESHOLD: tests at or under it stay whole; longer
+        # tests are split into several pytest shards of roughly threshold size, assigned
+        # alternately across shards.
         test_times: dict[str, float] = {"test1": THRESHOLD, "test2": THRESHOLD}
         expected_shards = [
             (600.0, [ShardedTest(test="test1", shard=1, num_shards=1, time=THRESHOLD)]),
@@ -433,9 +460,16 @@ class TestCalculateShards(unittest.TestCase):
         )
 
     def test_zero_tests(self) -> None:
+        # [FUNCTION DOC] Checks that sharding no tests yields the requested number of empty
+        # shards with zero time.
         self.assertListEqual([(0.0, []), (0.0, [])], calculate_shards(2, [], {}, None))
 
     def test_split_shards_random(self) -> None:
+        # [FUNCTION DOC] Seeds the random generator (global state) and runs 100 randomized
+        # cases with random shard counts, serial flags, partial times and sort mode. Checks
+        # the shard time spread bound, that every test appears, that split shard times sum to
+        # the original and shard numbers are complete, and that each shard follows the
+        # expected ordering (serial first, then by time or input order).
         random.seed(120)
         for _ in range(100):
             num_shards = random.randint(1, 10)
@@ -489,6 +523,9 @@ class TestCalculateShards(unittest.TestCase):
             if sort_by_time:
 
                 def comparator(a: ShardedTest, b: ShardedTest) -> int:
+                    # [FUNCTION DOC] HELPER: Expected ordering when sorting by time: serial
+                    # tests first, then tests with known time, then longer before shorter;
+                    # returns a negative, zero or positive comparison result.
                     # serial comes first
                     if a.name in serial and b.name not in serial:
                         return -1
@@ -507,6 +544,8 @@ class TestCalculateShards(unittest.TestCase):
             else:
 
                 def comparator(a: ShardedTest, b: ShardedTest) -> int:
+                    # [FUNCTION DOC] HELPER: Expected ordering without time sorting: serial
+                    # tests first, then original input order; returns a comparison result.
                     # serial comes first
                     if a.name in serial and b.name not in serial:
                         return -1
@@ -521,6 +560,9 @@ class TestCalculateShards(unittest.TestCase):
                 )
 
     def test_calculate_2_shards_against_optimal_shards(self) -> None:
+        # [FUNCTION DOC] Seeds the random generator (global state) and runs 100 cases with
+        # random times constructed so an optimal two-way split is known. Checks the computed
+        # makespan is within a 7/6 ratio of optimal and that all tests are present.
         random.seed(120)
         for _ in range(100):
             random_times = {k.test_file: random.random() * 10 for k in self.tests}
@@ -554,7 +596,10 @@ class TestCalculateShards(unittest.TestCase):
 
 
 class TestGetJobBaseName(unittest.TestCase):
+    # [CLASS DOC] Test case for get_job_base_name, which strips a trailing test target
+    # (test or test-osdc with a parenthesized config) from a CI job name.
     def test_strips_test_target(self) -> None:
+        # [FUNCTION DOC] Checks the test target suffix is removed from a job name.
         self.assertEqual(
             get_job_base_name(
                 "linux-jammy-py3.10-clang18 / test (dynamo_wrapped, 1, 3, lf-l-x86)"
@@ -563,6 +608,7 @@ class TestGetJobBaseName(unittest.TestCase):
         )
 
     def test_strips_test_osdc_target(self) -> None:
+        # [FUNCTION DOC] Checks the test-osdc target suffix is removed.
         self.assertEqual(
             get_job_base_name(
                 "linux-jammy-py3.14t-clang18 / test-osdc (dynamo_wrapped, 1, 3, mt-l-x86)"
@@ -571,6 +617,8 @@ class TestGetJobBaseName(unittest.TestCase):
         )
 
     def test_build_env_with_test_substring_is_preserved(self) -> None:
+        # [FUNCTION DOC] Checks a test word inside the build environment name is kept; only
+        # the target suffix is stripped.
         # The build env itself contains "-test-"; only the target suffix is stripped.
         self.assertEqual(
             get_job_base_name(
@@ -580,6 +628,7 @@ class TestGetJobBaseName(unittest.TestCase):
         )
 
     def test_multi_segment_name_keeps_full_prefix(self) -> None:
+        # [FUNCTION DOC] Checks only the final target is removed from a multi-segment name.
         # Only the final target is split; the rest is the key.
         self.assertEqual(
             get_job_base_name(
@@ -589,6 +638,8 @@ class TestGetJobBaseName(unittest.TestCase):
         )
 
     def test_unrelated_targets_are_not_matched(self) -> None:
+        # [FUNCTION DOC] Checks names whose target is not test or test-osdc are returned
+        # unchanged.
         # Non-test/test-osdc targets are left intact so they miss the lookup.
         for name in (
             "env / test-foo (default, 1, 1, r)",

@@ -1,3 +1,5 @@
+# [MODULE DOC] Regression test that the tools.stats modules imported by run_test.py still
+# import when boto3 is unavailable. The check runs in a fresh interpreter with boto3 blocked.
 from __future__ import annotations
 
 import subprocess
@@ -29,7 +31,11 @@ assert m.EMIT_METRICS is False, f"EMIT_METRICS should be False without boto3, go
 
 
 class TestRunTestNoBoto3(unittest.TestCase):
+    # [CLASS DOC] Test case guarding the optional-boto3 import behavior of the stats tools.
     def test_stats_imports_without_boto3(self) -> None:
+        # [FUNCTION DOC] Runs a child Python process (from the repo root) that blocks boto3,
+        # imports the stats modules and verifies the metrics-emission flag is off. Fails the
+        # test, showing the child's stderr, if the child exits with a nonzero status.
         result = subprocess.run(
             [sys.executable, "-c", _CHECK],
             cwd=REPO_ROOT,

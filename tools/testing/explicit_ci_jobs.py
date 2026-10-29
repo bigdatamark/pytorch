@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Command line tool that deletes GitHub Actions workflow files whose names do not
+# match a glob filter, so that only chosen CI jobs run on a branch, and optionally commits the
+# deletions as a do-not-merge commit. Import time: defines the repo root and workflows path.
+# Running as a script parses arguments, deletes files and may run git commands.
 
 from __future__ import annotations
 
@@ -14,6 +18,10 @@ WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
 
 
 def commit_ci(files: list[str], message: str) -> None:
+    # [FUNCTION DOC] Stages the given files and creates a commit with the message, by running
+    # git. First lists the status in short form and raises a runtime error if any line shows
+    # something already staged (first column not a space), to avoid committing unrelated work.
+    # Git exit codes of the add and commit steps are not checked.
     # Check that there are no other modified files than the ones edited by this
     # tool
     stdout = subprocess.run(

@@ -1,6 +1,10 @@
 # /// script
 # dependencies = ["boto3==1.35.42"]
 # ///
+# [MODULE DOC] Script that runs test target determination (heuristic test prioritization) for
+# all discovered tests, downloads the needed historical stats first, prints the aggregated
+# result, emits it as metrics when running in CI, and writes td_results.json at the repo root.
+# Import time: temporarily puts the repo root on sys.path while importing tools modules.
 import json
 import os
 import sys
@@ -33,6 +37,9 @@ sys.path.remove(str(REPO_ROOT))
 
 
 def import_results() -> TestPrioritizations:
+    # [FUNCTION DOC] Loads previously saved target determination results from the additional
+    # CI files directory in the repo and returns them as prioritizations; if the file is
+    # missing, prints a notice and returns an empty prioritization.
     if not (REPO_ROOT / ".additional_ci_files/td_results.json").exists():
         print("No TD results found")
         return TestPrioritizations([], {})
@@ -44,6 +51,12 @@ def import_results() -> TestPrioritizations:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Downloads and copies historical test stats and heuristic inputs (network
+    # and file writes), computes aggregated heuristics for all discovered tests, prints a
+    # summary, emits two metrics when the CI variable equals true, and writes the final
+    # prioritizations as td_results.json in the repo root.
+    # KNOWN ISSUE: a comment says the metrics are split into 3 but only 2 are emitted; and the
+    # initial aggregated heuristics object is immediately overwritten (redundant).
     selected_tests = TESTS
 
     aggregated_heuristics: AggregatedHeuristics = AggregatedHeuristics(selected_tests)

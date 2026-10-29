@@ -1,3 +1,6 @@
+# [MODULE DOC] Unit tests for the header-only linter adapter. They exercise symbol matching
+# against C++ test globs and file checking against fixture files in
+# tools/test/header_only_linter_testdata. No import-time side effects besides imports.
 import re
 import unittest
 
@@ -13,11 +16,15 @@ from tools.linter.adapters.header_only_linter import (
 
 
 class TestHeaderOnlyLinter(unittest.TestCase):
+    # [CLASS DOC] Test case covering find_matched_symbols and check_file of the header-only
+    # linter. Stateless; each test uses fixture data under the repo test data directory.
     """
     Test the header only linter functionality
     """
 
     def test_find_matched_symbols(self) -> None:
+        # [FUNCTION DOC] Checks that only regex alternatives actually appearing as symbols in
+        # the fixture cpp files are returned, as a set (expects symDef, symC and a).
         sample_regex = re.compile("symDef|symD|symC|bbb|a")
         test_globs = ["tools/test/header_only_linter_testdata/*.cpp"]
 
@@ -27,6 +34,7 @@ class TestHeaderOnlyLinter(unittest.TestCase):
         )
 
     def test_find_matched_symbols_empty_regex(self) -> None:
+        # [FUNCTION DOC] Checks that an empty regex yields an empty set of matched symbols.
         sample_regex = re.compile("")
         test_globs = ["tools/test/header_only_linter_testdata/*.cpp"]
 
@@ -36,16 +44,22 @@ class TestHeaderOnlyLinter(unittest.TestCase):
         )
 
     def test_check_file_no_issues(self) -> None:
+        # [FUNCTION DOC] Checks that a fixture file whose symbols are all tested yields no
+        # lint messages.
         sample_txt = str(REPO_ROOT / "tools/test/header_only_linter_testdata/good.txt")
         test_globs = ["tools/test/header_only_linter_testdata/*.cpp"]
         self.assertEqual(len(check_file(sample_txt, test_globs)), 0)
 
     def test_check_empty_file(self) -> None:
+        # [FUNCTION DOC] Checks that an empty fixture file yields no lint messages.
         sample_txt = str(REPO_ROOT / "tools/test/header_only_linter_testdata/empty.txt")
         test_globs = ["tools/test/header_only_linter_testdata/*.cpp"]
         self.assertEqual(len(check_file(sample_txt, test_globs)), 0)
 
     def test_check_file_with_untested_symbols(self) -> None:
+        # [FUNCTION DOC] Checks that symbols listed in the bad fixture but absent from the
+        # test cpp files (bbb on line 7, symD on line 8) each produce an untested-symbol
+        # error message; the comparison ignores ordering by using sets.
         sample_txt = str(REPO_ROOT / "tools/test/header_only_linter_testdata/bad.txt")
         test_globs = ["tools/test/header_only_linter_testdata/*.cpp"]
 

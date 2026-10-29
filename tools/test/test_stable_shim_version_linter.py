@@ -1,3 +1,7 @@
+# [MODULE DOC] Tests for the stable shim version linter: parsing added line numbers from
+# git diff output (with subprocess mocked), reading the current version, and checking that new
+# declarations sit inside a correct version guard. Import time: appends the repo root to
+# sys.path.
 import sys
 import tempfile
 import unittest
@@ -16,9 +20,13 @@ from tools.linter.adapters.stable_shim_version_linter import (
 
 
 class TestStableShimVersionLinter(unittest.TestCase):
+    # [CLASS DOC] Test case for get_added_lines, get_current_version and check_file of the
+    # stable shim version linter. Stateless; git calls are replaced by mocks.
     """Test the overall stable shim version linter functionality."""
 
     def test_get_added_lines_simple_addition(self):
+        # [FUNCTION DOC] Mocks the subprocess call to return a one-hunk diff and checks the
+        # set of added line numbers in the new file (18 through 24).
         """Test parsing a simple git diff with added lines."""
         simulated_diff = """diff --git a/torch/csrc/stable/c/shim.h b/torch/csrc/stable/c/shim.h
 index 365c954dbe7..18ca6525f73 100644
@@ -53,6 +61,8 @@ index 365c954dbe7..18ca6525f73 100644
             self.assertEqual(result, {18, 19, 20, 21, 22, 23, 24})
 
     def test_get_added_lines_parse_multiple_hunks(self):
+        # [FUNCTION DOC] Mocks a two-hunk diff and checks added line numbers from both hunks
+        # are combined, using each hunk's new-file start line.
         """Test parsing git diff with multiple hunks."""
         simulated_diff = """diff --git a/torch/csrc/stable/c/shim.h b/torch/csrc/stable/c/shim.h
 index 365c954dbe7..c5fcf7a09cf 100644
@@ -100,6 +110,7 @@ index 365c954dbe7..c5fcf7a09cf 100644
             )
 
     def test_get_current_version(self):
+        # [FUNCTION DOC] Checks the current version is a three-element tuple of integers.
         """Test that we can get the current version from version.txt."""
         version = get_current_version()
         self.assertIsInstance(version, tuple)
@@ -110,6 +121,10 @@ index 365c954dbe7..c5fcf7a09cf 100644
         self.assertIsInstance(version[2], int)
 
     def test_check_file_with_simulated_content(self):
+        # [FUNCTION DOC] Writes a temporary header with a correctly guarded, a wrongly guarded
+        # and an unguarded new function, mocks the diff to mark them as added and the current
+        # version as 2.10.0, and checks exactly two messages: wrong version and unversioned.
+        # Side effect: leaves the temporary header on disk (it is created without deletion).
         """Test checking a file with simulated content and git diffs."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".h", delete=False) as f:
             f.write("""

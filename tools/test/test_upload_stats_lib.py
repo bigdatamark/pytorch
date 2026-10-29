@@ -1,3 +1,7 @@
+# [MODULE DOC] Tests for tools.stats.upload_metrics (emit_metric, add_global_metric) and
+# remove_nan_inf from upload_stats_lib, with boto3 resource creation mocked so emitted metrics
+# are captured in memory. Import time: temporarily puts the repo root first on sys.path for
+# the imports, then removes it, and defines default CI environment constants.
 from __future__ import annotations
 
 import gzip
@@ -35,9 +39,14 @@ JOB_NAME = "some-job-name"
 
 @mock.patch("boto3.resource")
 class TestUploadStats(unittest.TestCase):
+    # [CLASS DOC] Test case for metric emission. The class decorator patches the boto3 resource
+    # factory for every test, passing the mock as an extra argument. State: emitted_metric
+    # holds the last decoded uploaded payload, or a marker mapping saying nothing was emitted.
     emitted_metric: dict[str, Any] = {"did_not_emit": True}
 
     def mock_put_item(self, **kwargs: Any) -> None:
+        # [FUNCTION DOC] HELPER: Stand-in for the storage object put call. Decompresses and
+        # decodes the gzip JSON payload given as the body keyword and stores it in emitted_metric.
         # Utility for mocking putting items into s3.  THis will save the emitted
         # metric so tests can check it
         self.emitted_metric = json.loads(
@@ -46,6 +55,10 @@ class TestUploadStats(unittest.TestCase):
 
     # Before each test, set the env vars to their default values
     def setUp(self) -> None:
+        # [FUNCTION DOC] Clears the cached storage resource and global metrics, then patches
+        # the process environment to a clean set of CI variables (repo, workflow, job, run ids).
+        # KNOWN ISSUE: the environment patcher is started but never stopped or registered for
+        # cleanup, so the patched environment leaks into later tests in the process.
         get_s3_resource.cache_clear()
         global_metrics.clear()
 
@@ -68,6 +81,8 @@ class TestUploadStats(unittest.TestCase):
         ).start()
 
     def test_emits_default_and_given_metrics(self, mock_resource: Any) -> None:
+        # [FUNCTION DOC] Emits a metric and checks the uploaded payload contains the caller
+        # file, module and function names, the CI environment fields and the given info.
         metric = {
             "some_number": 123,
             "float_number": 32.34,
@@ -108,6 +123,7 @@ class TestUploadStats(unittest.TestCase):
     def test_when_global_metric_specified_then_it_emits_it(
         self, mock_resource: Any
     ) -> None:
+        # [FUNCTION DOC] Checks a registered global metric is merged into the emitted info.
         metric = {
             "some_number": 123,
         }
@@ -134,6 +150,8 @@ class TestUploadStats(unittest.TestCase):
     def test_when_local_and_global_metric_specified_then_global_is_overridden(
         self, mock_resource: Any
     ) -> None:
+        # [FUNCTION DOC] Checks a per-call metric value overrides a global metric of the same
+        # name in the emitted info.
         global_metric_name = "global_metric"
         global_metric_value = "global_value"
         local_override = "local_override"
@@ -162,6 +180,8 @@ class TestUploadStats(unittest.TestCase):
     def test_when_optional_envvar_set_to_actual_value_then_emit_vars_emits_it(
         self, mock_resource: Any
     ) -> None:
+        # [FUNCTION DOC] Sets the optional pull request number variable and checks it appears
+        # in the emitted payload.
         metric = {
             "some_number": 123,
         }
@@ -190,6 +210,8 @@ class TestUploadStats(unittest.TestCase):
     def test_when_optional_envvar_set_to_a_empty_str_then_emit_vars_ignores_it(
         self, mock_resource: Any
     ) -> None:
+        # [FUNCTION DOC] Sets the optional pull request number variable to an empty string
+        # and checks the metric is still emitted but without a pull request number field.
         metric = {"some_number": 123}
 
         emit_should_include: dict[str, Any] = metric.copy()
@@ -220,6 +242,8 @@ class TestUploadStats(unittest.TestCase):
     def test_no_metrics_emitted_if_required_env_var_not_set(
         self, mock_resource: Any
     ) -> None:
+        # [FUNCTION DOC] Replaces the environment with only a few variables and checks nothing
+        # is uploaded because required ones are missing.
         metric = {"some_number": 123}
 
         mock.patch.dict(
@@ -240,6 +264,8 @@ class TestUploadStats(unittest.TestCase):
     def test_no_metrics_emitted_if_required_env_var_set_to_empty_string(
         self, mock_resource: Any
     ) -> None:
+        # [FUNCTION DOC] Sets a required variable (job) to an empty string and checks nothing
+        # is uploaded.
         metric = {"some_number": 123}
 
         mock.patch.dict(
@@ -256,6 +282,9 @@ class TestUploadStats(unittest.TestCase):
         self.assertTrue(self.emitted_metric["did_not_emit"])
 
     def test_remove_nan_inf(self, _mocked_resource: Any) -> None:
+        # [FUNCTION DOC] Checks remove_nan_inf turns infinite and not-a-number floats, also
+        # nested in mappings and lists, into the strings inf and nan so JSON output is strict,
+        # while plain JSON dumping of the raw input yields non-standard Infinity and NaN.
         checks = [
             (float("inf"), '"inf"', "Infinity"),
             (float("nan"), '"nan"', "NaN"),

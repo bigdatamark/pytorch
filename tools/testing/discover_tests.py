@@ -1,3 +1,9 @@
+# [MODULE DOC] Discovers the repository's test names: Python test files named with a test_
+# prefix under the test directory plus C++ test binaries (default build/bin, overridable by the
+# CPP_TESTS_DIR variable), minus blocklists, plus extra names. Import time: scans the file
+# system and builds the module-level TESTS sorted list; run as a script it prints that list.
+# KNOWN ISSUE: the TESTS blocklist entry for the inductor aot utils has a test/ prefix unlike
+# its siblings, so it likely never matches names relative to the test directory.
 from __future__ import annotations
 
 import glob
@@ -13,6 +19,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def parse_test_module(test: str) -> str:
+    # [FUNCTION DOC] Returns the part of a test name before its first dot (drops any
+    # extension or class/method suffix).
     return test.split(".", maxsplit=1)[0]
 
 
@@ -23,6 +31,12 @@ def discover_tests(
     blocklisted_tests: list[str] | None = None,
     extra_tests: list[str] | None = None,
 ) -> list[str]:
+    # [FUNCTION DOC] Returns a sorted list of test names. Python tests are test_ files found
+    # recursively (symlinks followed) under base_dir, named by relative path without the
+    # extension. Every file under cpp_tests_dir (default: build/bin next to base_dir) becomes
+    # a name prefixed with cpp, cut at its first dot. Path separators are normalized to forward
+    # slashes on Windows. Names starting with a blocklisted pattern or equal to a blocklisted
+    # test are dropped; extra tests are appended afterwards and are not filtered.
     """
     Searches for all python files starting with test_ excluding one specified by patterns.
     If cpp_tests_dir is provided, also scan for all C++ tests under that directory. They
@@ -30,6 +44,8 @@ def discover_tests(
     """
 
     def skip_test_p(name: str) -> bool:
+        # [FUNCTION DOC] HELPER: True if the name starts with any blocklisted pattern or is
+        # exactly a blocklisted test; unset lists are ignored.
         rc = False
         if blocklisted_patterns is not None:
             rc |= any(name.startswith(pattern) for pattern in blocklisted_patterns)

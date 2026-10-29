@@ -1,3 +1,5 @@
+# [MODULE DOC] Entry point for target determination: runs every registered heuristic over a
+# list of tests and aggregates their prioritization results.
 from __future__ import annotations
 
 import sys
@@ -13,6 +15,10 @@ from tools.testing.target_determination.heuristics import (
 def get_test_prioritizations(
     tests: list[str], file: Any = sys.stdout
 ) -> AggregatedHeuristics:
+    # [FUNCTION DOC] Prints the received test names to the given stream (default standard
+    # output), then asks each registered heuristic for its prediction confidence over the
+    # tests and adds it to an aggregate, printing each heuristic's summary. An exception from
+    # one heuristic is caught and printed so the rest still run. Returns the aggregate.
     aggregated_results = AggregatedHeuristics(tests)
     print(f"Received {len(tests)} tests to prioritize", file=file)
     for test in tests:

@@ -1,3 +1,6 @@
+# [MODULE DOC] Unit tests for torchgen selective build: SelectiveBuildOperator, operator
+# combination, and SelectiveBuilder construction from YAML or legacy allow lists, covering
+# operator, training, root and kernel dtype selection queries.
 import unittest
 
 from torchgen.model import Location, NativeFunction
@@ -9,7 +12,10 @@ from torchgen.selective_build.selector import (
 
 
 class TestSelectiveBuild(unittest.TestCase):
+    # [CLASS DOC] Test case for selective build operator and selector behavior. Stateless;
+    # each test builds its own operators or selectors from inline data.
     def test_selective_build_operator(self) -> None:
+        # [FUNCTION DOC] Checks that SelectiveBuildOperator keeps the flags it was given.
         op = SelectiveBuildOperator(
             "aten::add.int",
             is_root_operator=True,
@@ -22,6 +28,10 @@ class TestSelectiveBuild(unittest.TestCase):
         self.assertFalse(op.include_all_overloads)
 
     def test_selector_factory(self) -> None:
+        # [FUNCTION DOC] Checks the SelectiveBuilder factories: from a v1 and v2 YAML string
+        # (v1 ignores overload names, v2 selects by exact operator), an include-all config,
+        # an invalid config (must raise), and the legacy allow list with root and training
+        # flags set globally for every listed operator.
         yaml_config_v1 = """
 debug_info:
   - model1@v100
@@ -70,6 +80,8 @@ operators:
         self.assertTrue(selector1.is_operator_selected("aten::add.float"))
 
         def gen():
+            # [FUNCTION DOC] HELPER: Builds a selector from the invalid YAML config; used to
+            # assert that construction raises.
             return SelectiveBuilder.from_yaml_str(yaml_config_invalid)
 
         self.assertRaises(Exception, gen)
@@ -136,6 +148,8 @@ operators:
         )
 
     def test_operator_combine(self) -> None:
+        # [FUNCTION DOC] Checks combine_operators: root and training flags are OR-ed across
+        # operators with the same name, and combining different operator names raises.
         op1 = SelectiveBuildOperator(
             "aten::add.int",
             is_root_operator=True,
@@ -176,11 +190,15 @@ operators:
         self.assertTrue(op6.is_used_for_training)
 
         def gen_new_op():
+            # [FUNCTION DOC] HELPER: Combines two operators with different names; used to
+            # assert that this raises.
             return combine_operators(op1, op3)
 
         self.assertRaises(Exception, gen_new_op)
 
     def test_training_op_fetch(self) -> None:
+        # [FUNCTION DOC] Checks that training selection is true for both an operator marked
+        # for training and an overload whose base operator includes all overloads.
         yaml_config = """
 operators:
   aten::add.int:
@@ -198,6 +216,8 @@ operators:
         self.assertTrue(selector.is_operator_selected_for_training("aten::add"))
 
     def test_kernel_dtypes(self) -> None:
+        # [FUNCTION DOC] Checks that kernel dtype selection is true only for dtypes listed
+        # for the exact kernel name in the kernel metadata.
         yaml_config = """
 kernel_metadata:
   add_kernel:
@@ -225,6 +245,8 @@ kernel_metadata:
         self.assertFalse(selector.is_kernel_dtype_selected("add/sub_kernel", "int32"))
 
     def test_merge_kernel_dtypes(self) -> None:
+        # [FUNCTION DOC] Checks that combining two selectors unions their per-kernel dtype
+        # lists, including kernels present in only one of them.
         yaml_config1 = """
 kernel_metadata:
   add_kernel:
@@ -270,6 +292,8 @@ kernel_metadata:
         self.assertFalse(selector.is_kernel_dtype_selected("mul_kernel", "int32"))
 
     def test_all_kernel_dtypes_selected(self) -> None:
+        # [FUNCTION DOC] Checks that the include-all-non-op-selectives flag selects every
+        # kernel and dtype combination.
         yaml_config = """
 include_all_non_op_selectives: True
 """
@@ -283,6 +307,8 @@ include_all_non_op_selectives: True
         self.assertTrue(selector.is_kernel_dtype_selected("add_kernel", "float"))
 
     def test_custom_namespace_selected_correctly(self) -> None:
+        # [FUNCTION DOC] Checks that a native function in a custom namespace, parsed from a
+        # minimal YAML entry, is selected when the selector lists that operator.
         yaml_config = """
 operators:
   aten::add.int:

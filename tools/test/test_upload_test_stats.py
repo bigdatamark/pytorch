@@ -1,3 +1,6 @@
+# [MODULE DOC] Tests for tools.stats.upload_test_stats: a network-dependent summary check on
+# a known job (skipped in CI) and a mocked test of backfill_test_jsons_while_running over
+# different test-report directory layouts. Import time: reads the CI environment variable.
 import os
 import tempfile
 import unittest
@@ -19,11 +22,14 @@ _MINIMAL_JUNIT_XML = (
 
 
 class TestUploadTestStats(unittest.TestCase):
+    # [CLASS DOC] Test case for test stats upload helpers; stateless.
     @unittest.skipIf(
         IN_CI,
         "don't run in CI as this does a lot of network calls and uses up GH API rate limit",
     )
     def test_existing_job(self) -> None:
+        # [FUNCTION DOC] Fetches test cases of a fixed historical job over the network and
+        # checks the case count and the summary size equal recorded values. Skipped in CI.
         """Run on a known-good job and make sure we don't error and get basically okay results."""
         test_cases = get_tests(2561394934, 1)
         self.assertEqual(len(test_cases), 609873)
@@ -31,6 +37,11 @@ class TestUploadTestStats(unittest.TestCase):
         self.assertEqual(len(summary), 5068)
 
     def test_backfill_uploads_both_report_layouts(self) -> None:
+        # [FUNCTION DOC] Builds three fake unzipped report trees (standard, ROCm layout, and
+        # one with no test-reports directory) in a temporary directory, mocks download, unzip,
+        # job id lookup and upload, runs the backfill, and checks exactly two uploads (the
+        # first two layouts). Side effect: the backfill changes the working directory; a
+        # cleanup restores it.
         """Reports usually live under <dir>/test/test-reports, but ROCm jobs
         upload them under <dir>/test-reports (no test/ prefix). Backfill keys off
         the nearest test-reports dir and uploads both, while skipping reports
@@ -62,6 +73,8 @@ class TestUploadTestStats(unittest.TestCase):
             zips = ["normal.zip", "rocm.zip", "other.zip"]
 
             def fake_download(prefix: str, *_a: object, **_k: object) -> list[str]:
+                # [FUNCTION DOC] HELPER: Fake artifact downloader; returns the three report zip
+                # names for the test-report prefix and an empty list for any other prefix.
                 # No pre-existing test-jsons; three test-report artifacts.
                 return zips if prefix == "test-report" else []
 

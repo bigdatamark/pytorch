@@ -1,4 +1,7 @@
 # mypy: ignore-errors
+# [MODULE DOC] Tests for SetLinter, which flags set usage in Python sources. Uses fixture files
+# under tools/test/set_linter_testdata and the shared LinterTestCase base. Import time: builds
+# path constants and picks an absolute or relative import of the base class based on sys.path.
 from __future__ import annotations
 
 import sys
@@ -27,24 +30,35 @@ FILES = TESTFILE, INCLUDES_FILE, INCLUDES_FILE2
 
 
 class TestSetLinter(LinterTestCase):
+    # [CLASS DOC] Test case binding the generic linter test machinery to SetLinter (via the
+    # LinterClass attribute) and adding token, omitted-line and bracket-matching tests.
     maxDiff = 10000000
     LinterClass = SetLinter
 
     def test_get_all_tokens(self) -> None:
+        # [FUNCTION DOC] Checks that the set tokens found in the main fixture equal the
+        # expected token list (EXPECTED_SETS).
         self.assertEqual(EXPECTED_SETS, SetLinter.make_file(TESTFILE).sets)
 
     def test_omitted_lines(self) -> None:
+        # [FUNCTION DOC] Checks that the lines excluded from linting in the main fixture are
+        # exactly lines 6 and 16.
         actual = sorted(SetLinter.make_file(TESTFILE).omitted.omitted)
         expected = [6, 16]
         self.assertEqual(expected, actual)
 
     def test_linting(self) -> None:
+        # [FUNCTION DOC] For each fixture file runs the base-class lint-and-fix comparison with
+        # no extra arguments and checks the result name is the set_linter suggested fixes name.
         for path in (TESTFILE, INCLUDES_FILE, INCLUDES_FILE2):
             with self.subTest(path):
                 r = self.lint_fix_test(path, [])
                 self.assertEqual(r.name, "Suggested fixes for set_linter")
 
     def test_bracket_pairs(self) -> None:
+        # [FUNCTION DOC] For several source strings checks the mapping from opening to closing
+        # brace token index on the first line containing sets; an empty source must have no
+        # such lines and an f-string with a plain name yields an empty mapping.
         TESTS: tuple[tuple[str, dict[int, int]], ...] = (
             ("", {}),
             ("{}", {0: 1}),
@@ -68,6 +82,9 @@ class TestSetLinter(LinterTestCase):
             self.assertEqual(actual, expected)
 
     def test_match_braced_sets(self) -> None:
+        # [FUNCTION DOC] Checks the number of brace set literals detected per source string:
+        # dict literals, empty braces and f-string braces count zero; set literals and
+        # comprehensions count, including nested ones.
         TESTS: tuple[tuple[str, int], ...] = (
             ("{cast(int, inst.offset): inst for inst in instructions}", 0),
             ("", 0),

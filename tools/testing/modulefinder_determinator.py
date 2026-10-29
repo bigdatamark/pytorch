@@ -1,3 +1,8 @@
+# [MODULE DOC] Heuristic for deciding whether a slow test file needs to run for a set of
+# changed files, by comparing the changed Python modules with the test's static import
+# dependencies found with the standard module finder. Exports TARGET_DET_LIST (tests subject
+# to determination), should_run_test, test_impact_of_file, get_dep_modules and small helpers.
+# Import time: defines constants and an empty module-level dependency cache.
 from __future__ import annotations
 
 import modulefinder
@@ -59,6 +64,12 @@ _DEP_MODULES_CACHE: dict[str, set[str]] = {}
 def should_run_test(
     target_det_list: list[str], test: str, touched_files: list[str], options: Any
 ) -> bool:
+    # [FUNCTION DOC] Decides whether the test should run given the changed file paths. Tests
+    # not in the determination list always run. Otherwise ninja-variant suffixes are stripped
+    # to get a real module, and each changed file is classified: no-impact files are skipped;
+    # CI and unknown files force a run; Python files under torch, caffe2 or test force a run
+    # when their module is a dependency of the test or is the test itself. Returns false if
+    # nothing matched. Prints reasons to standard error when options.verbose is set.
     test = parse_test_module(test)
     # Some tests are faster to execute than to determine.
     if test not in target_det_list:
@@ -106,6 +117,9 @@ def should_run_test(
 
 
 def test_impact_of_file(filename: str) -> str:
+    # [FUNCTION DOC] Classifies a repo-relative path by its top-level directory and extension
+    # and returns one of CI, NONE, TORCH, CAFFE2, TEST or UNKNOWN. Non-Python files under
+    # torch, caffe2 or test fall through to UNKNOWN.
     """Determine what class of impact this file has on test runs.
 
     Possible values:
@@ -135,10 +149,14 @@ def test_impact_of_file(filename: str) -> str:
 
 
 def _split_path(filename: str) -> list[str]:
+    # [FUNCTION DOC] HELPER: Splits a path into components on forward slashes after converting
+    # backslashes to forward slashes.
     return filename.replace("\\", "/").split("/")
 
 
 def log_test_reason(file_type: str, filename: str, test: str, options: Any) -> None:
+    # [FUNCTION DOC] When options.verbose is set, prints to standard error why the test is
+    # being run (file type and changed file); otherwise does nothing.
     if options.verbose:
         print_to_stderr(
             f"Determination found {file_type} file {filename} -- running {test}"
@@ -146,6 +164,10 @@ def log_test_reason(file_type: str, filename: str, test: str, options: Any) -> N
 
 
 def get_dep_modules(test: str) -> set[str]:
+    # [FUNCTION DOC] Returns the set of module names that the test script under the test
+    # directory statically imports, found with the module finder while skipping a list of
+    # heavy or problematic third party modules and suppressing warnings. Results are cached
+    # per test name in a module-level mapping. Raises if the test file cannot be read.
     # Cache results in case of repetition
     if test in _DEP_MODULES_CACHE:
         return _DEP_MODULES_CACHE[test]
@@ -190,8 +212,10 @@ def get_dep_modules(test: str) -> set[str]:
 
 
 def parse_test_module(test: str) -> str:
+    # [FUNCTION DOC] Returns the part of a test name before its first dot.
     return test.split(".", maxsplit=1)[0]
 
 
 def print_to_stderr(message: str) -> None:
+    # [FUNCTION DOC] HELPER: Prints the message to standard error.
     print(message, file=sys.stderr)
