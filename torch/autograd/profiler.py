@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Python front-end of the autograd profiler. Provides the profile context manager (Kineto-based, lazily building FunctionEvent lists), record_function labels,
+# emit_itt and emit_nvtx context managers, nvprof trace loading, and KinetoStepTracker. Also holds a module-level flag tracking whether profiling is enabled and the optional active cupti observer.
+# No significant import-time side effects beyond creating a logger.
 import copy
 import logging
 import uuid
@@ -64,15 +67,20 @@ except ImportError:
     import functools
 
     class _ContextDecorator:  # type: ignore[no-redef]
+        # [CLASS DOC] HELPER: Fallback stand-in for contextlib.ContextDecorator on very old Pythons; wraps a function in a with-block of self.
         def __enter__(self):
+            # [FUNCTION DOC] HELPER: Abstract; raises NotImplementedError.
             raise NotImplementedError
 
         def __exit__(self, exc_type, exc_val, exc_tb):
+            # [FUNCTION DOC] HELPER: Abstract; raises NotImplementedError.
             raise NotImplementedError
 
         def __call__(self, func):
+            # [FUNCTION DOC] HELPER: Decorator form; returns a wrapper running func inside this context.
             @functools.wraps(func)
             def wrapped(*args, **kwargs):
+                # [FUNCTION DOC] HELPER: Runs func inside the with-block of the decorator instance.
                 with self:
                     return func(*args, **kwargs)
 
@@ -85,20 +93,24 @@ _is_profiler_enabled: bool = False
 
 
 def _set_is_profiler_enabled(enable: bool):
+    # [FUNCTION DOC] HELPER: Sets the module-level flag recording whether the profiler is active.
     global _is_profiler_enabled
     _is_profiler_enabled = enable
 
 
 def _run_on_profiler_start():
+    # [FUNCTION DOC] HELPER: Marks the profiler as enabled (called when tracing starts).
     _set_is_profiler_enabled(True)
 
 
 def _run_on_profiler_stop():
+    # [FUNCTION DOC] HELPER: Marks the profiler as disabled (called when tracing stops).
     _set_is_profiler_enabled(False)
 
 
 @dataclass
 class _ProfilerStats:
+    # [CLASS DOC] HELPER: Dataclass of developer-facing timing counters (window duration, event count, durations in microseconds of prepare, enable, disable, parse and tree-build steps), all defaulting to zero.
     "Profiler timing and stats used by developers to catch issues/regressions"
 
     profiling_window_duration_sec: float = 0
@@ -111,6 +123,10 @@ class _ProfilerStats:
 
 
 class profile:
+    # [CLASS DOC] Context manager over the Kineto-based autograd profiler. Configured at construction (device, shapes, flops, memory, stack,
+    # experimental config, event accumulation, trace id callback, post-processing timeout, activity filters). Entering prepares and starts tracing;
+    # exiting synchronizes the device, stops tracing and stores raw kineto_results. FunctionEvents are built lazily on first access and cached.
+    # When disabled it is a no-op. Not reentrant. Also tracks _ProfilerStats timings.
     """Context manager that manages autograd profiler state and holds a summary of results.
 
     .. note::
@@ -229,6 +245,10 @@ class profile:
         post_processing_timeout_s: float | None = None,
         activity_filters: dict[ProfilerActivity, set[str]] | None = None,
     ):
+        # [FUNCTION DOC] Validates and stores options. If disabled, returns immediately. with_flops implies record_shapes; trace_only is disabled with a warning when with_stack is set;
+        # warns (FutureWarning) for deprecated profiler_metrics options and with_modules. Validates use_device against supported names, falling back to None with a warning
+        # if invalid or the device is unavailable. Chooses the profiler_kind and kineto activity set for cuda/xpu/mtia/hpu/privateuse1.
+        # Raises AssertionError for unsupported combinations (no CPU without kineto, legacy xpu/mtia/hpu without kineto, no activities) and ValueError for a negative timeout.
         self.enabled: bool = enabled
         if not self.enabled:
             return
@@ -369,17 +389,20 @@ class profile:
             raise ValueError("post_processing_timeout_s must be non-negative")
 
     def default_trace_id(self):
+        # [FUNCTION DOC] Returns a fresh random trace id as a 32-digit uppercase hex string.
         # Generate a UUID
         uuid_raw = uuid.uuid4()
 
         return f"{uuid_raw.int:032X}"
 
     def create_trace_id(self):
+        # [FUNCTION DOC] Returns a trace id from the custom callback if provided, else a default random one.
         if self.custom_trace_id_callback:
             return self.custom_trace_id_callback()
         return self.default_trace_id()
 
     def config(self, create_trace_id=False):
+        # [FUNCTION DOC] Builds a ProfilerConfig from current options. If create_trace_id is true, generates a new trace id and stores it on self first (done at prepare time only).
         # only need to generate new trace id upon prepare trace not start trace
         if create_trace_id:
             trace_id = self.create_trace_id()
@@ -396,6 +419,7 @@ class profile:
         )
 
     def __enter__(self):
+        # [FUNCTION DOC] No-op if disabled. Raises RuntimeError if already entered. Otherwise prepares and starts tracing and returns self.
         if not self.enabled:
             return
         if self.entered:
@@ -405,6 +429,7 @@ class profile:
         return self
 
     def _prepare_trace(self):
+        # [FUNCTION DOC] HELPER: Marks entered, calls the C++ prepare with a new trace id, activities and filters, and records the call duration.
         self.entered = True
         t0 = perf_counter_ns()
         _prepare_profiler(
@@ -416,6 +441,7 @@ class profile:
         self._stats.profiler_prepare_call_duration_us = int((t1 - t0) / 1000)
 
     def _start_trace(self):
+        # [FUNCTION DOC] HELPER: Marks entered, flags profiler enabled, enables the C++ profiler, records enable duration and the start timestamp.
         self.entered = True
         _run_on_profiler_start()
         t0 = perf_counter_ns()
@@ -425,6 +451,8 @@ class profile:
         self.profiling_start_time_ns = t1
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        # [FUNCTION DOC] Stops profiling. Synchronizes the device module if any, optionally keeping previous events when accumulating, disables the C++ profiler to obtain kineto_results,
+        # records timings, clears the enabled flag, and eagerly processes events if accumulating (and not trace_only). Returns False. No-op if disabled.
         if not self.enabled:
             return
         if self.use_device and hasattr(torch, self.use_device):
@@ -457,6 +485,7 @@ class profile:
         return False
 
     def __repr__(self):
+        # [FUNCTION DOC] Processes events if pending and returns the event list repr, or a placeholder if no events exist.
         if self._needs_processing:
             self._ensure_function_events()
         if self._function_events is None:
@@ -464,6 +493,7 @@ class profile:
         return repr(self._function_events)
 
     def __str__(self):
+        # [FUNCTION DOC] Processes events if pending and returns the event list string, or a placeholder if no events exist.
         if self._needs_processing:
             self._ensure_function_events()
         if self._function_events is None:
@@ -471,6 +501,8 @@ class profile:
         return str(self._function_events)
 
     def _ensure_function_events(self):
+        # [FUNCTION DOC] HELPER: Lazily parses kineto_results into an EventList, builds its tree, updates stats, and merges previously accumulated events if acc_events.
+        # Raises RuntimeError if trace_only is set. Does nothing if events already exist.
         """Process function events lazily if required"""
         if self.experimental_config.trace_only:
             raise RuntimeError(
@@ -509,6 +541,7 @@ class profile:
 
     @property
     def function_events(self):
+        # [FUNCTION DOC] Property: returns the (lazily computed) EventList of the last profiling run.
         if self._function_events is None or self._needs_processing:
             self._ensure_function_events()
         return self._function_events
@@ -523,6 +556,7 @@ class profile:
         header=None,
         top_level_events_only=False,
     ):
+        # [FUNCTION DOC] Ensures events are built, then returns the formatted table string from the EventList, forwarding all arguments. Raises AssertionError if no results.
         self._ensure_function_events()
         if self._function_events is None:
             raise AssertionError("Expected profiling results")
@@ -539,6 +573,8 @@ class profile:
     table.__doc__ = EventList.table.__doc__
 
     def export_chrome_trace(self, path, metadata=None, use_python_export=False):
+        # [FUNCTION DOC] Writes a Chrome trace JSON to path. With kineto available uses either the Python exporter (if requested) or the native save of the kineto results;
+        # otherwise falls back to the EventList exporter. Metadata is only used by the Python exporter.
         """
         Exports the collected trace in Chrome JSON format. If kineto is enabled, only
         last cycle in schedule is exported.
@@ -558,6 +594,7 @@ class profile:
     export_chrome_trace.__doc__ = EventList.export_chrome_trace.__doc__
 
     def export_stacks(self, path: str, metric: str = "self_cpu_time_total"):
+        # [FUNCTION DOC] Writes stack data for the given metric to path. Raises AssertionError if no results or with_stack was not set.
         self._ensure_function_events()
         if self._function_events is None:
             raise AssertionError("Expected profiling results")
@@ -568,6 +605,7 @@ class profile:
     def toggle_collection_dynamic(
         self, enabled: bool, activities: Iterable[ProfilerActivity]
     ):
+        # [FUNCTION DOC] Dynamically enables or disables collection of the given activities in the running profiler via the C++ call; returns its result.
         """
         Toggles the collection of activities for the current profiler instance.
         """
@@ -580,6 +618,7 @@ class profile:
         group_by_overload_name=False,
         include_python_functions=False,
     ):
+        # [FUNCTION DOC] Ensures events are built and returns the EventList averaged by key, forwarding grouping options. Raises AssertionError if no results.
         self._ensure_function_events()
         if self._function_events is None:
             raise AssertionError("Expected profiling results")
@@ -593,6 +632,7 @@ class profile:
     key_averages.__doc__ = EventList.key_averages.__doc__
 
     def total_average(self):
+        # [FUNCTION DOC] Ensures events are built and returns one aggregate FunctionEventAvg over all events. Raises AssertionError if no results.
         self._ensure_function_events()
         if self._function_events is None:
             raise AssertionError("Expected profiling results")
@@ -602,6 +642,7 @@ class profile:
 
     @property
     def self_cpu_time_total(self):
+        # [FUNCTION DOC] Property: sum of self CPU time over all events (builds events if needed). Raises AssertionError if no results.
         """Returns total time spent on CPU.
 
         The total time is a sum of all self times across all the events.
@@ -614,6 +655,10 @@ class profile:
     def _parse_kineto_results(
         self, result: _ProfilerResult, timeout_s: float | None = None
     ):
+        # [FUNCTION DOC] HELPER: Converts a kineto result into a list of FunctionEvent sorted by start then descending end time.
+        # Builds events for each non-filtered kineto event with relative times, attributes memory allocations falling inside CPU events, records kernels from cuda or privateuse1 timings,
+        # and groups by correlation id: device events linked to frontend CPU events add kernel entries (or adopt the parent thread). Adds standalone events for unattributed memory and OOM records.
+        # Stops early with a logged warning if the optional timeout expires. Raises ValueError for negative timeout and RuntimeError for a negative correlation id.
         # result.events() has most of the events - PyTorch op-level and device-level events
 
         timeout_ns = int(timeout_s * 1e9) if timeout_s is not None else None
@@ -624,6 +669,7 @@ class profile:
         timed_out = False
 
         def _check_timeout() -> bool:
+            # [FUNCTION DOC] HELPER: Returns True once the elapsed time since parsing began has reached the timeout (sticky); always False without a timeout.
             """Check if timeout has been exceeded. Returns True if timed out."""
             nonlocal timed_out
             if timeout_ns is not None and not timed_out:
@@ -642,6 +688,7 @@ class profile:
         mem_records_acc = MemRecordsAcc(mem_records)
 
         def _cpu_memory_usage(mem_record):
+        # [FUNCTION DOC] HELPER: Returns the record's byte count if it is on a host-type device (CPU, MKLDNN, IDEEP), else 0.
             return (
                 mem_record.nbytes()
                 if mem_record.device_type()
@@ -650,6 +697,7 @@ class profile:
             )
 
         def _device_memory_usage(mem_record):
+        # [FUNCTION DOC] HELPER: Returns the record's byte count if it is on an accelerator device (CUDA, PrivateUse1, HIP, XPU), else 0.
             return (
                 mem_record.nbytes()
                 if mem_record.device_type()
@@ -797,6 +845,7 @@ class profile:
                         f_evt.thread = fe.thread
 
         def _create_function_event_for_memory_events(evt):
+        # [FUNCTION DOC] HELPER: Builds a zero-duration CPU FunctionEvent for a memory or OOM record, using the enclosing max_evt_id counter as its id.
             rel_start_ns = evt.start_ns() - trace_start_ns
             fe = FunctionEvent(
                 id=max_evt_id,
@@ -861,11 +910,13 @@ _active_cupti_profiler_observer: Any = None
 
 
 def _set_active_cupti_profiler_observer(observer: Any) -> None:
+    # [FUNCTION DOC] HELPER: Stores (or clears with None) the active cupti observer that record_function routes annotations to.
     global _active_cupti_profiler_observer
     _active_cupti_profiler_observer = observer
 
 
 class record_function(_ContextDecorator):  # pyrefly: ignore [invalid-inheritance]
+    # [CLASS DOC] Context manager and decorator labeling a code region in profiler output. Takes a name, optional node_id and optional args; see the methods below for entry/exit behavior.
     """Context manager/function decorator that adds a label to a code block/function when running autograd profiler.
     Label will only appear if CPU activity tracing is enabled.
 
@@ -905,6 +956,7 @@ class record_function(_ContextDecorator):  # pyrefly: ignore [invalid-inheritanc
     """
 
     def __init__(self, name: str, args: str | None = None):
+        # [FUNCTION DOC] Stores the label name and optional args string, sets run_callbacks_on_exit to true, and initializes the underlying record handle and cupti external id to None.
         self.name: str = name
         self.args: str | None = args
         # Whether or not we should run record function's end callbacks when exiting.
@@ -919,6 +971,7 @@ class record_function(_ContextDecorator):  # pyrefly: ignore [invalid-inheritanc
         self._cupti_monitor_external_id: int | None = None
 
     def __enter__(self):
+        # [FUNCTION DOC] Opens the profiler record range via the profiler op and stores the handle. If a cupti observer is active (and not scripting), pushes an annotation and remembers its id. Returns self.
         self.record = torch.ops.profiler._record_function_enter_new(
             self.name, self.args
         )
@@ -933,6 +986,8 @@ class record_function(_ContextDecorator):  # pyrefly: ignore [invalid-inheritanc
         return self
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any):
+        # [FUNCTION DOC] Pops the cupti annotation if one was pushed, then (unless callbacks were deferred to a future) closes the record range via the profiler op.
+        # Raises AssertionError if the record handle is unset. Returns None.
         if not torch.jit.is_scripting():
             if self._cupti_monitor_external_id is not None:
                 observer = _active_cupti_profiler_observer
@@ -956,6 +1011,8 @@ class record_function(_ContextDecorator):  # pyrefly: ignore [invalid-inheritanc
             torch.ops.profiler._record_function_exit(record)
 
     def _call_end_callbacks_on_future(self, fut: Future[Any]) -> Future[Any]:
+        # [FUNCTION DOC] HELPER: Defers the end callbacks of this record until fut completes and returns the profiled future. Sets run_callbacks_on_exit to false so exit skips them.
+        # Raises RuntimeError if called more than once, AssertionError if the record handle is unset.
         """Use for profiling async calls that return a future.
 
         Calling this function will extend recording beyond this scope, until the future is
@@ -1002,6 +1059,7 @@ class record_function(_ContextDecorator):  # pyrefly: ignore [invalid-inheritanc
 
 
 class emit_itt:
+    # [CLASS DOC] Context manager that enables the ITT profiler state so autograd ops emit Intel VTune ranges, optionally recording input shapes. No-op when disabled; not reentrant.
     """Context manager that makes every autograd operation emit an ITT range.
 
     It is useful when running the program under Intel(R) VTune Profiler::
@@ -1039,11 +1097,13 @@ class emit_itt:
     """
 
     def __init__(self, enabled=True, record_shapes=False):
+        # [FUNCTION DOC] Stores enabled and record_shapes and marks the manager as not entered.
         self.enabled = enabled
         self.entered = False
         self.record_shapes = record_shapes
 
     def __enter__(self):
+        # [FUNCTION DOC] No-op if disabled. Raises RuntimeError if already entered. Otherwise flags the profiler enabled and starts the ITT profiler state; returns self.
         if not self.enabled:
             return
         if self.entered:
@@ -1065,6 +1125,7 @@ class emit_itt:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        # [FUNCTION DOC] No-op if disabled. Otherwise disables the profiler, clears the enabled flag and returns False.
         if not self.enabled:
             return
         _disable_profiler()
@@ -1073,6 +1134,7 @@ class emit_itt:
 
 
 class emit_nvtx:
+    # [CLASS DOC] Context manager that enables the NVTX profiler state so autograd ops emit NVTX ranges (for nvprof or Nsight), optionally recording input shapes. Synchronizes CUDA on entry and exit. No-op when disabled; not reentrant.
     """Context manager that makes every autograd operation emit an NVTX range.
 
     It is useful when running the program under nvprof::
@@ -1158,11 +1220,13 @@ class emit_nvtx:
     """
 
     def __init__(self, enabled=True, record_shapes=False):
+        # [FUNCTION DOC] Stores enabled and record_shapes and marks the manager as not entered.
         self.enabled = enabled
         self.entered = False
         self.record_shapes = record_shapes
 
     def __enter__(self):
+        # [FUNCTION DOC] No-op if disabled. Raises RuntimeError if already entered. Otherwise synchronizes CUDA, flags the profiler enabled and starts the NVTX profiler state; returns self.
         if not self.enabled:
             return
         if self.entered:
@@ -1185,6 +1249,7 @@ class emit_nvtx:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        # [FUNCTION DOC] No-op if disabled. Otherwise synchronizes CUDA, disables the profiler, clears the enabled flag and returns False.
         if not self.enabled:
             return
         torch.cuda.synchronize()
@@ -1194,6 +1259,7 @@ class emit_nvtx:
 
 
 def load_nvprof(path):
+    # [FUNCTION DOC] Parses the nvprof SQLite trace at path and returns an EventList of the autograd function events.
     """Open an nvprof trace file and parses autograd annotations.
 
     Args:
@@ -1203,12 +1269,15 @@ def load_nvprof(path):
 
 
 class EnforceUnique:
+    # [CLASS DOC] HELPER: Tracks keys seen so far and raises an error on a repeat; state is a set of key tuples.
     """Raises an error if a key is seen more than once."""
 
     def __init__(self):
+        # [FUNCTION DOC] Creates the empty seen-key set.
         self.seen = set()
 
     def see(self, *key):
+        # [FUNCTION DOC] Records the key tuple; raises RuntimeError naming it if it was already seen.
         r"""
         Observe a key and raise an error if it is seen multiple times.
         """
@@ -1218,6 +1287,9 @@ class EnforceUnique:
 
 
 def parse_nvprof_trace(path):
+    # [FUNCTION DOC] Reads an nvprof SQLite database at path (opened read via sqlite3) and returns a list of FunctionEvent sorted by start time.
+    # First joins start/end marker rows into function events (keys must be unique), then correlates runtime launch rows with kernel rows inside each marker range
+    # and appends kernels to the matching event with their durations. Raises RuntimeError on duplicate keys and AssertionError if a runtime callback id is not the expected kernel launch id.
     import sqlite3
 
     conn = sqlite3.connect(path)
@@ -1286,6 +1358,8 @@ def parse_nvprof_trace(path):
 
 
 class KinetoStepTracker:
+    # [CLASS DOC] Global (class-level) step counter shared by requesters such as the profiler and optimizers. Keeps a mapping of requester name to its step count and the
+    # last global step (the maximum). The Kineto step function is invoked only when the maximum increases, avoiding double counting. All methods are classmethods mutating class state.
     """Provides an abstraction for incrementing the step count globally.
 
     Previously, we only had one place to mark that a step() has occurred
@@ -1332,6 +1406,7 @@ class KinetoStepTracker:
 
     @classmethod
     def init_step_count(cls, requester: str):
+        # [FUNCTION DOC] Registers the requester with the current global step as its count.
         r"""
         Initialize for a given requester.
         """
@@ -1339,6 +1414,7 @@ class KinetoStepTracker:
 
     @classmethod
     def erase_step_count(cls, requester: str) -> bool:
+        # [FUNCTION DOC] Removes the requester; returns True if it was present.
         r"""
         Remove a given requester.
         """
@@ -1346,6 +1422,8 @@ class KinetoStepTracker:
 
     @classmethod
     def increment_step(cls, requester: str) -> int:
+        # [FUNCTION DOC] Increments the requester's count (registering it first if needed). If the maximum over requesters grew, calls the Kineto step function once per unit of growth
+        # (warning if growth exceeds one), and updates the global step. Returns the global step.
         """Increments the step count for the requester.
 
         Additionally if the max over all step counts has incremented then
@@ -1371,6 +1449,7 @@ class KinetoStepTracker:
 
     @classmethod
     def current_step(cls) -> int:
+        # [FUNCTION DOC] Returns the latest global step.
         r"""
         Get the latest step for any requester
         """

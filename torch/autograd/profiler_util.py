@@ -27,6 +27,9 @@ __all__ = [
 
 
 class EventList(list):
+    # [CLASS DOC] List subclass holding FunctionEvent (or FunctionEventAvg) objects with analysis helpers: building the CPU parent/child tree, table formatting,
+    # Chrome trace and stack export, and averaging by key. Extra state: the profiled device name, whether memory profiling and flop counting are on, and whether the tree has been built
+    # (key_averages requires it). Usually created by the profiler, not by users.
     """A list of profiling events with helper methods for analysis and visualization.
 
     EventList extends the standard Python list to provide specialized methods for
@@ -96,6 +99,7 @@ class EventList(list):
     """
 
     def __init__(self, *args, **kwargs):
+        # [FUNCTION DOC] Pops use_device, profile_memory and with_flops from the keyword arguments (defaults None, False, False), passes the rest to list, and marks the tree as not built.
         use_device = kwargs.pop("use_device", None)
         profile_memory = kwargs.pop("profile_memory", False)
         with_flops = kwargs.pop("with_flops", False)
@@ -107,15 +111,18 @@ class EventList(list):
         self._with_flops = with_flops
 
     def _build_tree(self):
+        # [FUNCTION DOC] HELPER: Links CPU parents and children, removes duplicate parent/child nodes of the same name, assigns backward stack traces from forward events, and marks the tree as built.
         self._populate_cpu_children()
         self._remove_dup_nodes()
         self._set_backward_stacktraces()
         self._tree_built = True
 
     def __str__(self):
+        # [FUNCTION DOC] Returns the default formatted table of the events.
         return self.table()
 
     def _remove_dup_nodes(self):
+        # [FUNCTION DOC] HELPER: Repeatedly removes events whose only-child parent has the same name: the child's children and kernels are lifted onto the parent, and the child is deleted from the list in place. Loops until no more removals occur.
         while True:
             to_delete = set()
 
@@ -140,6 +147,8 @@ class EventList(list):
             self.extend(new_evts)
 
     def _populate_cpu_children(self):
+        # [FUNCTION DOC] HELPER: Computes parent and child links among synchronous CPU events. Events are grouped by (thread, node id), sorted by start then descending end, and nested using a stack
+        # so that an event fully inside another becomes its child; partially overlapping events get no relation. Raises AssertionError if an event would receive a second parent. Mutates the events.
         """Populate child events into each underlying FunctionEvent object.
 
         One event is a child of another if [s1, e1) is inside [s2, e2). Where
@@ -210,7 +219,10 @@ class EventList(list):
                 current_events.append(event)
 
     def _set_backward_stacktraces(self):
+        # [FUNCTION DOC] HELPER: For events under a backward-function ancestor, replaces the stack with the stack of the forward event having the same sequence number and forward thread (empty if none).
+        # Forward stacks are collected from events with no backward ancestor. Raises AssertionError if a backward ancestor lacks a forward thread. Mutates event stacks.
         def bw_parent(evt):
+            # [FUNCTION DOC] HELPER: Returns the nearest ancestor (including itself) with backward-function scope, or None if there is none.
             if evt is None:
                 return None
             elif evt.scope == 1:  # BACKWARD_FUNCTION
@@ -237,6 +249,7 @@ class EventList(list):
 
     @property
     def self_cpu_time_total(self):
+        # [FUNCTION DOC] Property: sum of self CPU time over all events.
         return sum(event.self_cpu_time_total for event in self)
 
     def table(
@@ -250,6 +263,7 @@ class EventList(list):
         top_level_events_only=False,
         time_unit=None,
     ):
+        # [FUNCTION DOC] Returns the events formatted as a text table, delegating to the table builder with this list's memory and flops settings. See the docstring for argument meanings.
         """Print an EventList as a nicely formatted table.
 
         Args:
@@ -286,6 +300,8 @@ class EventList(list):
         )
 
     def export_chrome_trace(self, path):
+        # [FUNCTION DOC] Writes a minimal Chrome trace JSON file to path (overwritten): one complete-duration entry per event having a trace name, plus a flow-start entry per kernel.
+        # Written manually for speed, trimming the trailing separator. Side effect: file I/O only; the device name used in flow categories defaults to cuda.
         """Export an EventList as a Chrome tracing tools file.
 
         The checkpoint can be later loaded and inspected under ``chrome://tracing`` URL.
@@ -343,6 +359,7 @@ class EventList(list):
             f.write("]")
 
     def supported_export_stacks_metrics(self):
+        # [FUNCTION DOC] Returns the list of metric names accepted by export_stacks.
         return [
             "self_cpu_time_total",
             "self_cuda_time_total",
@@ -351,6 +368,8 @@ class EventList(list):
         ]
 
     def export_stacks(self, path: str, metric: str):
+        # [FUNCTION DOC] Writes flamegraph-style lines to path for events having stacks and a positive integer metric value: stack entries (spaces, semicolons, tabs and newlines replaced by underscores)
+        # joined by semicolons from outermost to innermost, then a space and the value. Device metrics are mapped to the generic device attribute. Raises ValueError for an unsupported metric.
         if metric not in self.supported_export_stacks_metrics():
             raise ValueError(
                 "metric should be one of: "
@@ -381,6 +400,8 @@ class EventList(list):
         group_by_overload_name=False,
         include_python_functions=False,
     ):
+        # [FUNCTION DOC] Aggregates events into one FunctionEventAvg per key (name, node, device, optionally shapes, stack prefix, overload name) and returns them as an EventList carrying this list's settings.
+        # Requires the tree to be built (raises AssertionError otherwise). Python-function events are excluded unless requested. See the docstring for argument meanings.
         """Averages all function events over their keys.
 
         Args:
@@ -412,6 +433,8 @@ class EventList(list):
         stats: dict[tuple[str, ...], FunctionEventAvg] = defaultdict(FunctionEventAvg)
 
         def get_key(
+        # [FUNCTION DOC] HELPER: Builds the grouping key tuple for an event: its key, node id, device type, legacy flag and user-annotation flag, plus optionally the overload name, input shapes and top stack entries.
+        # KNOWN ISSUE: the overload name is read from the enclosing loop variable evt instead of the event parameter; it only works because the caller passes that same event.
             event, group_by_input_shapes, group_by_stack_n, group_by_overload_name
         ) -> tuple[str, ...]:
             key = [
@@ -453,6 +476,7 @@ class EventList(list):
         return avg_list
 
     def total_average(self):
+        # [FUNCTION DOC] Sums all events into a single FunctionEventAvg whose key is set to Total and returns it (averaged metrics then mix all operations).
         """Compute aggregate statistics across all events.
 
         Accumulates statistics from all events into a single FunctionEventAvg object.
@@ -480,6 +504,7 @@ class EventList(list):
 
 
 def _format_time(time_us):
+    # [FUNCTION DOC] HELPER: Formats a microsecond value as a string with three decimals and unit s, ms or us depending on magnitude.
     """Define how to format time in FunctionEvent."""
     US_IN_SECOND = 1000.0 * 1000.0
     US_IN_MS = 1000.0
@@ -491,6 +516,8 @@ def _format_time(time_us):
 
 
 def _format_time_share(time_us, total_time_us):
+    # [FUNCTION DOC] HELPER: Returns the percentage of time_us in total_time_us with two decimals, or NaN if the total is zero (raises AssertionError if the total is zero but the part is not).
+    # KNOWN ISSUE: the docstring is copied from the time formatter and is inaccurate.
     """Define how to format time in FunctionEvent."""
     if total_time_us == 0:
         if time_us != 0:
@@ -500,6 +527,7 @@ def _format_time_share(time_us, total_time_us):
 
 
 def _format_memory(nbytes):
+    # [FUNCTION DOC] HELPER: Formats a byte count (sign-aware) as GB, MB, KB with two decimals, or bytes.
     """Return a formatted memory size string."""
     KB = 1024
     MB = 1024 * KB
@@ -515,10 +543,12 @@ def _format_memory(nbytes):
 
 
 def _attr_formatter(name):
+    # [FUNCTION DOC] HELPER: Returns a read-only property that formats the named time attribute of the instance as a time string.
     return property(lambda self: _format_time(getattr(self, name)))
 
 
 class FormattedTimesMixin:
+    # [CLASS DOC] Mixin giving FunctionEvent and FunctionEventAvg formatted-time string properties and per-call average times. Subclasses must define the total time attributes and count.
     """Helpers for FunctionEvent and FunctionEventAvg.
 
     The subclass should define `*_time_total` and `count` attributes.
@@ -533,10 +563,12 @@ class FormattedTimesMixin:
 
     @property
     def cpu_time(self):
+        # [FUNCTION DOC] Property: average CPU time per call (zero when count is zero).
         return 0.0 if self.count == 0 else 1.0 * self.cpu_time_total / self.count  # type: ignore[attr-defined]
 
     @property
     def device_time(self):
+        # [FUNCTION DOC] Property: average device time per call (zero when count is zero).
         return 0.0 if self.count == 0 else 1.0 * self.device_time_total / self.count  # type: ignore[attr-defined]
 
     @property
@@ -545,15 +577,19 @@ class FormattedTimesMixin:
         category=FutureWarning,
     )
     def cuda_time(self):  # To be deprecated
+        # [FUNCTION DOC] Deprecated property alias of device_time (emits a FutureWarning).
         return self.device_time
 
 
 class Interval:
+    # [CLASS DOC] Simple closed time range holding start and end timestamps in microseconds.
     def __init__(self, start, end):
+        # [FUNCTION DOC] Stores start and end.
         self.start = start
         self.end = end
 
     def elapsed_us(self):
+        # [FUNCTION DOC] Returns end minus start.
         r"""
         Returns the length of the interval
         """
@@ -564,6 +600,7 @@ Kernel = namedtuple("Kernel", ["name", "device", "duration"])
 
 
 class EventMetadata(NamedTuple):
+    # [CLASS DOC] Immutable record of structured Kineto metadata for an event, grouped as kernel, memory and NCCL collective fields; every field may be None when absent.
     # Kernel fields
     registers_per_thread: int | None
     shared_memory: int | None
@@ -605,10 +642,12 @@ class EventMetadata(NamedTuple):
 
 
 def _to_str(v: str) -> str:
+    # [FUNCTION DOC] HELPER: Strips double quote characters from both ends of the string.
     return v.strip('"')
 
 
 def _to_bool(v: str) -> bool:
+    # [FUNCTION DOC] HELPER: Returns True for the strings 1 and true, else False.
     return v in ("1", "true")
 
 
@@ -653,6 +692,8 @@ _EVENT_METADATA_KEYS: dict[str, tuple[str, Callable[[str], Any]]] = {
 
 
 def _build_metadata(extra_meta):
+    # [FUNCTION DOC] HELPER: Converts a mapping of Kineto metadata strings into an EventMetadata using the key table and converters; absent keys become None.
+    # Returns None if no known key was present.
     fields: dict[str, Any] = {}
     any_populated = False
     for kineto_key, (field_name, convert) in _EVENT_METADATA_KEYS.items():
@@ -666,6 +707,8 @@ def _build_metadata(extra_meta):
 
 
 class FunctionEvent(FormattedTimesMixin):
+    # [CLASS DOC] Record of a single profiled operation or device activity: id, name, thread, time interval, kernels, CPU parent/children, shapes, stack, memory usage, device info, flops,
+    # metadata and flow ids. Provides derived totals (CPU/device time, self times, memory) computed from the tree links and kernels. Normally created by the profiler.
     """Profiling information about a single function.
 
     FunctionEvent records the execution of a single operation during profiling.
@@ -785,6 +828,8 @@ class FunctionEvent(FormattedTimesMixin):
         python_module_id=-1,
         typed_metadata=None,
     ):
+        # [FUNCTION DOC] Stores all event fields as attributes: identifiers, naming, time interval, thread, empty kernel list and CPU children, shapes, stack, memory, device info, flops, flow and python ids.
+        # The device resource id defaults to the thread. Structured metadata is built from the extra_meta mapping when given; typed_metadata is stored as the metadata mapping. Count starts at 1.
         self.id: int = id
         self.node_id: int = node_id
         self.name: str = name
@@ -848,11 +893,13 @@ class FunctionEvent(FormattedTimesMixin):
         self.python_module_id: int = python_module_id
 
     def append_kernel(self, name, device, duration):
+        # [FUNCTION DOC] Adds a Kernel record (name, device, duration) to this event. Raises AssertionError if this is not a CPU event.
         if self.device_type != DeviceType.CPU:
             raise AssertionError("Expected device_type to be CPU")
         self.kernels.append(Kernel(name, device, duration))
 
     def append_cpu_child(self, child):
+        # [FUNCTION DOC] Appends a direct CPU child. Raises AssertionError if self or the child is not a CPU event or the child is not a FunctionEvent.
         """Append a CPU child of type FunctionEvent.
 
         One is supposed to append only direct children to the event to have
@@ -867,6 +914,7 @@ class FunctionEvent(FormattedTimesMixin):
         self.cpu_children.append(child)
 
     def set_cpu_parent(self, parent):
+        # [FUNCTION DOC] Sets the immediate CPU parent. Raises AssertionError if self or the parent is not a CPU event or the parent is not a FunctionEvent.
         """Set the immediate CPU parent of type FunctionEvent.
 
         One profiling FunctionEvent should have only one CPU parent such that
@@ -885,6 +933,7 @@ class FunctionEvent(FormattedTimesMixin):
     # metrics of other events, have only total cpu time
     @property
     def self_cpu_memory_usage(self):
+        # [FUNCTION DOC] Property: CPU memory usage minus that of direct CPU children; zero for async or non-CPU events.
         if self.is_async or self.device_type != DeviceType.CPU:
             return 0
         return self.cpu_memory_usage - sum(
@@ -893,6 +942,7 @@ class FunctionEvent(FormattedTimesMixin):
 
     @property
     def self_device_memory_usage(self):
+        # [FUNCTION DOC] Property: device memory usage minus that of direct CPU children; zero for async or non-CPU events.
         if self.is_async or self.device_type != DeviceType.CPU:
             return 0
         return self.device_memory_usage - sum(
@@ -905,6 +955,7 @@ class FunctionEvent(FormattedTimesMixin):
         category=FutureWarning,
     )
     def metadata_json(self):
+        # [FUNCTION DOC] Deprecated property returning the raw metadata JSON string (emits a FutureWarning).
         return self._metadata_json
 
     @property
@@ -913,10 +964,12 @@ class FunctionEvent(FormattedTimesMixin):
         category=FutureWarning,
     )
     def self_cuda_memory_usage(self):  # To be deprecated
+        # [FUNCTION DOC] Deprecated alias of self_device_memory_usage (emits a FutureWarning).
         return self.self_device_memory_usage
 
     @property
     def cpu_time_total(self):
+        # [FUNCTION DOC] Property: duration of the event if it is a CPU event, else zero.
         if self.device_type == DeviceType.CPU:
             return self.time_range.elapsed_us()
         else:
@@ -924,6 +977,7 @@ class FunctionEvent(FormattedTimesMixin):
 
     @property
     def self_cpu_time_total(self):
+        # [FUNCTION DOC] Property: CPU duration minus children durations; zero for async or non-CPU events.
         if self.is_async or self.device_type != DeviceType.CPU:
             return 0
         return self.cpu_time_total - sum(
@@ -932,6 +986,8 @@ class FunctionEvent(FormattedTimesMixin):
 
     @property
     def device_time_total(self):
+        # [FUNCTION DOC] Property: device time. Zero if async or no device is profiled. For CPU events sums the launched kernels' durations (plus children's totals unless legacy);
+        # for device events returns the event duration. Raises AssertionError for an unsupported device type.
         if self.is_async or not self.use_device:
             return 0
         if self.device_type == DeviceType.CPU:
@@ -962,10 +1018,12 @@ class FunctionEvent(FormattedTimesMixin):
         category=FutureWarning,
     )
     def cuda_time_total(self):  # To be deprecated
+        # [FUNCTION DOC] Deprecated alias of device_time_total (emits a FutureWarning).
         return self.device_time_total
 
     @property
     def self_device_time_total(self):
+        # [FUNCTION DOC] Property: device time excluding children for CPU events; the full device time for device events. Zero if async or no device. Raises AssertionError for an unsupported device type.
         if self.is_async or not self.use_device:
             return 0
         if self.device_type == DeviceType.CPU:
@@ -991,13 +1049,16 @@ class FunctionEvent(FormattedTimesMixin):
         category=FutureWarning,
     )
     def self_cuda_time_total(self):  # To be deprecated
+        # [FUNCTION DOC] Deprecated alias of self_device_time_total (emits a FutureWarning).
         return self.self_device_time_total
 
     @property
     def key(self):
+        # [FUNCTION DOC] Property: the grouping key, which is the event name.
         return self.name
 
     def __repr__(self):
+        # [FUNCTION DOC] Returns a single-line description of the event including ids, times, children ids, device, memory and flags.
         device_name = self.use_device
         device_time = self.device_time_str
         device_memory_usage = self.device_memory_usage
@@ -1013,6 +1074,8 @@ class FunctionEvent(FormattedTimesMixin):
 
 
 class FunctionEventAvg(FormattedTimesMixin):
+    # [CLASS DOC] Accumulator of statistics over events sharing a key: summed counts, CPU/device times (total and self) and memory, plus fields copied from the first event added
+    # (key, node, flags, parent/children, shapes, stack, scope, device type). Built by adding events with add or the in-place add operator.
     """Averaged profiling statistics over multiple FunctionEvent objects.
 
     FunctionEventAvg aggregates statistics from multiple FunctionEvent objects
@@ -1059,6 +1122,8 @@ class FunctionEventAvg(FormattedTimesMixin):
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Initializes an empty accumulator: no key, zero counts, times, memory and flops, CPU device type.
+        # KNOWN ISSUE: is_user_annotation is not initialized here; it only exists after the first add.
         self.key: str | None = None
         self.count: int = 0
         self.node_id: int = 0
@@ -1084,6 +1149,8 @@ class FunctionEventAvg(FormattedTimesMixin):
         self.flops: int = 0
 
     def add(self, other):
+        # [FUNCTION DOC] Adds another FunctionEvent or FunctionEventAvg. On the first call copies identity fields from it. Raises AssertionError if the type is wrong or keys differ,
+        # then sums times, memory, count and flops. Returns self.
         if self.key is None:
             # First function being recorded as part of FunctionEventAvg, propagate
             # fields.
@@ -1129,6 +1196,7 @@ class FunctionEventAvg(FormattedTimesMixin):
         return self
 
     def __iadd__(self, other):
+        # [FUNCTION DOC] In-place add; delegates to add and returns self.
         return self.add(other)
 
     def __repr__(self):
@@ -1144,7 +1212,9 @@ class FunctionEventAvg(FormattedTimesMixin):
 
 
 class StringTable(defaultdict):
+    # [CLASS DOC] Mapping that lazily demangles missing keys (C++ symbol names) via the C++ demangler, caching the result; single-character keys are kept as is.
     def __missing__(self, key):
+        # [FUNCTION DOC] Computes, stores and returns the demangled name (or the key itself when it has length one).
         # manage cases like 't' (demangled to 'unsigned short') separately,
         # for now simply check the length to avoid unexpected results for
         # the short sequences
@@ -1153,9 +1223,11 @@ class StringTable(defaultdict):
 
 
 class MemRecordsAcc:
+    # [CLASS DOC] Index over memory records sorted by start time enabling interval lookups by binary search. Each record is a pair whose first element has a start time in nanoseconds.
     """Acceleration structure for accessing mem_records in interval."""
 
     def __init__(self, mem_records):
+        # [FUNCTION DOC] Stores the records and builds sorted start-time and index arrays (empty if no records).
         self._mem_records = mem_records
         self._start_nses: list[int] = []
         self._indices: list[int] = []
@@ -1164,6 +1236,7 @@ class MemRecordsAcc:
             self._start_nses, self._indices = zip(*tmp)  # type: ignore[assignment]
 
     def in_interval(self, start_ns, end_ns):
+        # [FUNCTION DOC] Generator yielding the records whose start time lies within the inclusive interval, in start-time order.
         r"""
         Return all records in the given interval
         """
@@ -1174,6 +1247,7 @@ class MemRecordsAcc:
 
 
 def _filter_stack_entry(entry):
+    # [FUNCTION DOC] HELPER: Returns False for stack entries belonging to known autograd or test-harness wrapper frames, True otherwise.
     filtered_entries = [
         ("autograd/__init__", "_make_grads"),
         ("autograd/__init__", "backward"),
@@ -1190,6 +1264,7 @@ OUT_OF_MEMORY_EVENT_NAME = "[OutOfMemory]"
 
 
 def _filter_name(name):
+    # [FUNCTION DOC] HELPER: Returns True if the event name is one of the internal utility ops (memory markers, record-function enter/exit, leaf/output_nr/version queries) that should be skipped.
     # ignoring the following utility ops
     filtered_out_names = [
         MEMORY_EVENT_NAME,  # used only for the top-level memory events
@@ -1209,6 +1284,7 @@ def _filter_name(name):
 # with a wildcard name to aggregate them together in the profiler table
 # output
 def _rewrite_name(name, with_wildcard=False):
+    # [FUNCTION DOC] HELPER: Demangles the event name via a StringTable and, if with_wildcard, collapses numbered ProfilerStep names into a single wildcard name. Returns the name.
     string_table = StringTable()
     name = string_table[name]
     if with_wildcard:
@@ -1230,6 +1306,10 @@ def _build_table(
     top_level_events_only=False,
     time_unit=None,
 ):
+    # [FUNCTION DOC] HELPER: Renders events (FunctionEvent or FunctionEventAvg) as a fixed-width text table and returns it ('' if there are no events).
+    # Optionally sorts descending by an attribute (cuda/xpu/privateuse1 names mapped to device), sizes columns, adds optional columns (overload, device times, memory, node id, shapes, source, flops),
+    # limits rows, optionally shows only top-level events, and finishes with total self CPU/device time lines. Also updates percent fields on the events.
+    # Raises RuntimeError if device data exists without a device name; AssertionError for non-positive flops scaling input.
     """Print a summary of events (which can be a list of FunctionEvent or FunctionEventAvg)."""
     if len(events) == 0:
         return ""
@@ -1340,6 +1420,7 @@ def _build_table(
     line_length_lst = [-SPACING_SIZE]
 
     def add_column(padding, text_dir=">"):
+        # [FUNCTION DOC] HELPER: Appends a column of the given width and alignment to the row format, separator and total line length.
         row_format_lst[0] += (
             "{: " + text_dir + str(padding) + "}" + (" " * SPACING_SIZE)
         )
@@ -1347,6 +1428,7 @@ def _build_table(
         line_length_lst[0] += padding + SPACING_SIZE
 
     def auto_scale_flops(flops):
+        # [FUNCTION DOC] HELPER: Chooses a units prefix (FLOPs to PFLOPs) for a positive flops value; returns the scale multiplier and the header label. Raises AssertionError for non-positive input.
         flop_headers = [
             "FLOPs",
             "KFLOPs",
@@ -1397,6 +1479,7 @@ def _build_table(
     result = []
 
     def append(s):
+        # [FUNCTION DOC] HELPER: Appends the text and a newline to the result buffer.
         result.append(s)
         result.append("\n")  # Yes, newline after the end as well
 
@@ -1433,6 +1516,7 @@ def _build_table(
     append(header_sep)
 
     def trim_path(path, src_column_width):
+        # [FUNCTION DOC] HELPER: Truncates a source path from the left to fit the column width, marking the cut with an ellipsis.
         if len(path) > src_column_width:
             offset = len(path) - src_column_width
             path = path[offset:]
@@ -1441,6 +1525,7 @@ def _build_table(
         return path
 
     def override_time_unit(time_us, default_str, time_unit):
+        # [FUNCTION DOC] HELPER: Formats microseconds in the requested unit (s, ms or us), or returns the default string for any other unit.
         US_IN_SECOND = 1000.0 * 1000.0
         US_IN_MS = 1000.0
         if time_unit == "s":
@@ -1581,6 +1666,8 @@ def _build_table(
 
 # Collect all events with stack traces and format them canonically
 def _canonicalize_profiler_events(events):
+    # [FUNCTION DOC] HELPER: Converts trace event dicts into a deterministic multi-line string of event name (30 chars), node name and the last real source line of the stack trace
+    # (caret/tilde marker lines skipped), ordered by start time. KNOWN ISSUE: a comment says sorting is by node name but the code sorts by start time.
     """
     Extract and format all events with stack traces in a canonical way
     for deterministic testing.

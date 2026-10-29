@@ -1,4 +1,6 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Deprecated legacy autograd profiler (use torch.profiler instead). Exports profile, a context manager over the legacy C++ profiler,
+# plus a parser turning raw records into FunctionEvent lists. No import-time side effects.
 import itertools
 import warnings
 from typing_extensions import deprecated
@@ -31,6 +33,9 @@ __all__ = ["profile"]
     category=None,  # TODO: change to `FutureWarning`
 )
 class profile:
+    # [CLASS DOC] Deprecated legacy context manager that profiles CPU (and optionally CUDA) ops via the legacy C++ profiler.
+    # State: enabled flag, config options (use_cuda, record_shapes, with_flops, profile_memory, with_stack, with_modules), entered flag,
+    # profiler_kind and function_events (None until the context exits). Not reentrant. When disabled, most attributes are never set.
     """DEPRECATED: use torch.profiler instead."""
 
     def __init__(
@@ -44,6 +49,8 @@ class profile:
         with_stack=False,
         with_modules=False,
     ):
+        # [FUNCTION DOC] Stores options. If enabled is false returns early leaving other attributes unset. with_flops forces record_shapes on.
+        # If use_cuda is requested but CUDA is unavailable, warns and falls back to CPU. Chooses ProfilerState.CUDA or CPU as profiler_kind.
         self.enabled: bool = enabled
         if not self.enabled:
             return
@@ -70,6 +77,7 @@ class profile:
             self.profiler_kind = ProfilerState.CPU
 
     def config(self):
+        # [FUNCTION DOC] Builds and returns a ProfilerConfig from the stored options with a default experimental config.
         return ProfilerConfig(
             self.profiler_kind,
             self.record_shapes,
@@ -82,6 +90,7 @@ class profile:
         )
 
     def __enter__(self):
+        # [FUNCTION DOC] Starts profiling and returns self (returns None if disabled). Raises RuntimeError if already entered.
         if not self.enabled:
             return
         if self.entered:
@@ -91,9 +100,12 @@ class profile:
         return self
 
     def _start_trace(self):
+        # [FUNCTION DOC] HELPER: Enables the legacy C++ profiler with the current config.
         _enable_profiler_legacy(self.config())
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        # [FUNCTION DOC] Stops profiling (synchronizing CUDA first if used), parses the legacy records into events, stores them as an EventList
+        # in function_events and builds the event tree. Does nothing if disabled. Returns False so exceptions propagate.
         if not self.enabled:
             return
         if self.use_cuda:
@@ -113,16 +125,19 @@ class profile:
         return False
 
     def __repr__(self):
+        # [FUNCTION DOC] Returns a placeholder string if profiling is unfinished, else the repr of the event list.
         if self.function_events is None:
             return "<unfinished profiler_legacy.profile>"
         return repr(self.function_events)
 
     def __str__(self):
+        # [FUNCTION DOC] Returns a placeholder string if profiling is unfinished, else the string form of the event list.
         if self.function_events is None:
             return "<unfinished profile.profiler_legacy.profile>"
         return str(self.function_events)
 
     def _check_finish(self):
+        # [FUNCTION DOC] HELPER: Raises RuntimeError if profiling results are not yet available.
         if self.function_events is None:
             raise RuntimeError("Profiler didn't finish running")
 
@@ -136,6 +151,7 @@ class profile:
         header=None,
         top_level_events_only=False,
     ):
+        # [FUNCTION DOC] Checks that profiling finished, then returns the formatted table string from the event list, forwarding all arguments.
         self._check_finish()
         if self.function_events is None:
             raise AssertionError("Expected profiling results")
@@ -152,6 +168,7 @@ class profile:
     table.__doc__ = EventList.table.__doc__
 
     def export_chrome_trace(self, path):
+        # [FUNCTION DOC] Checks that profiling finished, then writes a Chrome trace JSON to path via the event list.
         self._check_finish()
         if self.function_events is None:
             raise AssertionError("Expected profiling results")
@@ -160,6 +177,7 @@ class profile:
     export_chrome_trace.__doc__ = EventList.export_chrome_trace.__doc__
 
     def export_stacks(self, path: str, metric: str = "self_cpu_time_total"):
+        # [FUNCTION DOC] Writes stack-based profile data for the given metric to path. Raises RuntimeError if unfinished, AssertionError if with_stack was not set.
         self._check_finish()
         if self.function_events is None:
             raise AssertionError("Expected profiling results")
@@ -168,6 +186,7 @@ class profile:
         return self.function_events.export_stacks(path, metric)
 
     def key_averages(self, group_by_input_shape=False, group_by_stack_n=0):
+        # [FUNCTION DOC] Returns the event list averaged by key, optionally grouped by input shape and stack depth. Raises RuntimeError if unfinished.
         self._check_finish()
         if self.function_events is None:
             raise AssertionError("Expected profiling results")
@@ -176,6 +195,7 @@ class profile:
     key_averages.__doc__ = EventList.key_averages.__doc__
 
     def total_average(self):
+        # [FUNCTION DOC] Returns a single event aggregating all events' averages. Raises RuntimeError if unfinished.
         self._check_finish()
         if self.function_events is None:
             raise AssertionError("Expected profiling results")
@@ -185,6 +205,7 @@ class profile:
 
     @property
     def self_cpu_time_total(self):
+        # [FUNCTION DOC] Property: sum of self CPU time over all events. Raises RuntimeError if unfinished.
         """Return CPU time as the sum of self times across all events."""
         self._check_finish()
         if self.function_events is None:
@@ -193,7 +214,12 @@ class profile:
 
 
 def _parse_legacy_records(thread_records):
+    # [FUNCTION DOC] HELPER: Converts per-thread lists of legacy profiler records into a sorted list of FunctionEvent.
+    # Finds the '__start_profile' record (AssertionError if missing or remote) as the time origin. For each thread pairs push/pop records by (handle, node_id),
+    # skips filtered names and duplicate consecutive pushes, accumulates memory allocation per open range, and emits standalone memory events when no range is open.
+    # Raises AssertionError on a pop without push or mismatched memory tables. Sorts by start time then descending end time.
     def _get_record_key(record):
+        # [FUNCTION DOC] HELPER: Returns the (handle, node_id) pair used to match push and pop records.
         """Return a tuple for correlating start and end records in `_parse_legacy_records`."""
         return (record.handle(), record.node_id())
 
