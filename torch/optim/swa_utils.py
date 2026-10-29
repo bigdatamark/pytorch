@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Utilities for Stochastic Weight Averaging (SWA) and Exponential Moving Average
+# (EMA) of model weights. Provides AveragedModel (a wrapper keeping an averaged copy of a
+# model), update_bn (recompute batch-norm statistics), the SWALR scheduler, and factory
+# functions returning per-parameter or multi-parameter averaging callables. No import-time
+# side effects beyond defining names.
 r"""Implementation for Stochastic Weight Averaging implementation."""
 
 from __future__ import annotations
@@ -40,6 +45,11 @@ PARAM_LIST = tuple[Tensor, ...] | list[Tensor]
 
 
 def get_ema_multi_avg_fn(decay=0.999):
+    # [FUNCTION DOC] Builds an in-place EMA update callable for lists of parameters.
+    # Args: decay, weight of the old average, must lie in [0, 1]; otherwise raises an error.
+    # Returns a function taking (ema list, current list, ignored count) that moves each EMA
+    # tensor toward the current one by (1 - decay): via a fused foreach interpolation for
+    # float/complex dtypes, else a per-tensor copy of the weighted sum (integer dtypes).
     """Get the function applying exponential moving average (EMA) across multiple params.
 
     The EMA is computed as:
@@ -70,6 +80,8 @@ def get_ema_multi_avg_fn(decay=0.999):
     def ema_update(
         ema_param_list: PARAM_LIST, current_param_list: PARAM_LIST, _
     ) -> None:
+        # [FUNCTION DOC] HELPER: Closure doing the in-place EMA update of the listed tensors
+        # using the captured decay; the dtype of the first tensor selects the foreach path.
         # foreach lerp only handles float and complex
         if torch.is_floating_point(ema_param_list[0]) or torch.is_complex(
             ema_param_list[0]
@@ -83,6 +95,9 @@ def get_ema_multi_avg_fn(decay=0.999):
 
 
 def get_swa_multi_avg_fn():
+    # [FUNCTION DOC] Returns an in-place running-mean update callable for lists of parameters.
+    # The callable takes (averaged list, current list, number averaged so far) and moves each
+    # averaged tensor toward the current one by 1 / (num_averaged + 1).
     """Get the function applying stochastic weight average (SWA) across multiple params."""
 
     @torch.no_grad()
@@ -91,6 +106,9 @@ def get_swa_multi_avg_fn():
         current_param_list: PARAM_LIST,
         num_averaged: Tensor | int,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Closure applying the running-mean update in place. Float and
+        # complex tensors use a foreach interpolation; other dtypes add the scaled difference,
+        # dividing by a tensor count or scaling by a reciprocal for a plain integer count.
         # foreach lerp only handles float and complex
         if torch.is_floating_point(averaged_param_list[0]) or torch.is_complex(
             averaged_param_list[0]
@@ -117,6 +135,9 @@ def get_swa_multi_avg_fn():
 
 
 def get_ema_avg_fn(decay=0.999):
+    # [FUNCTION DOC] Builds a single-tensor EMA callable (returns a new value, no mutation).
+    # Args: decay, must lie in [0, 1]; otherwise raises an error.
+    # KNOWN ISSUE: the docstring says "across multiple params" but this works on one tensor.
     """Get the function applying exponential moving average (EMA) across multiple params.
 
     The EMA is computed as:
@@ -145,24 +166,34 @@ def get_ema_avg_fn(decay=0.999):
 
     @torch.no_grad()
     def ema_update(ema_param: Tensor, current_param: Tensor, num_averaged):
+        # [FUNCTION DOC] HELPER: Returns decay times the EMA tensor plus (1 - decay) times the
+        # current tensor; the count argument is ignored.
         return decay * ema_param + (1 - decay) * current_param
 
     return ema_update
 
 
 def get_swa_avg_fn():
+    # [FUNCTION DOC] Returns a single-tensor running-mean callable (no mutation).
     """Get the function applying stochastic weight average (SWA) across a single param."""
 
     @torch.no_grad()
     def swa_update(
         averaged_param: Tensor, current_param: Tensor, num_averaged: Tensor | int
     ):
+        # [FUNCTION DOC] HELPER: Returns the averaged tensor plus the difference to the current
+        # tensor divided by (num_averaged + 1).
         return averaged_param + (current_param - averaged_param) / (num_averaged + 1)
 
     return swa_update
 
 
 class AveragedModel(Module):
+    # [CLASS DOC] Module wrapper holding a deep copy of a model whose parameters (and optionally
+    # buffers) are maintained as a running average of a source model, for SWA or EMA.
+    # State: module (the copy), n_averaged (long buffer counting updates), avg_fn or
+    # multi_avg_fn (optional custom averaging; at most one), use_buffers flag. Forward delegates
+    # to the copy. The first update copies weights; later updates apply the averaging function.
     r"""Implements averaged model for Stochastic Weight Averaging (SWA) and Exponential Moving Average (EMA).
 
     Stochastic Weight Averaging was proposed in `Averaging Weights Leads to
@@ -272,6 +303,9 @@ class AveragedModel(Module):
         | None = None,
         use_buffers=False,
     ) -> None:
+        # [FUNCTION DOC] Deep-copies the model (moved to device if given), registers the
+        # n_averaged counter buffer (starting at zero) and stores the averaging options.
+        # Raises an error if both avg_fn and multi_avg_fn are given.
         super().__init__()
         if avg_fn is not None and multi_avg_fn is not None:
             raise AssertionError(
@@ -288,10 +322,21 @@ class AveragedModel(Module):
         self.use_buffers = use_buffers
 
     def forward(self, *args, **kwargs):
+        # [FUNCTION DOC] Runs the wrapped averaged copy on the given arguments and returns its
+        # output.
         """Forward pass."""
         return self.module(*args, **kwargs)
 
     def update_parameters(self, model: Module) -> None:
+        # [FUNCTION DOC] Folds the source model's current weights into the running average.
+        # Pairs parameters (plus buffers if use_buffers) positionally with the source model.
+        # On the first call (n_averaged is zero) copies the source values in. Afterwards:
+        # with a single-tensor avg_fn, applies it per tensor; otherwise groups tensors by device
+        # and dtype and applies multi_avg_fn, or the default SWA running mean (foreach kernel
+        # when the device supports it, else per tensor). Without use_buffers, buffers are copied
+        # straight from the source. Increments n_averaged. Mutates tensors in place.
+        # KNOWN ISSUE: pairing of parameters uses non-strict zip, so a structural mismatch
+        # between the models is silently truncated rather than reported.
         """Update model parameters."""
         self_param = (
             # pyrefly: ignore [bad-argument-type]
@@ -374,6 +419,12 @@ def update_bn(
     model: Module,
     device: int | torch.device | None = None,
 ) -> None:
+    # [FUNCTION DOC] Recomputes BatchNorm running statistics with one pass over the loader.
+    # Args: loader (iterable of tensors or lists/tuples whose first item is the input),
+    # model, device (optional destination for inputs). Resets running stats of every batch-norm
+    # module, sets momentum to None (cumulative average), switches to train mode, runs the
+    # forward pass on each batch, then restores momenta and the previous training mode.
+    # Returns early, doing nothing, if the model has no batch-norm layers. No gradients.
     r"""Update BatchNorm running_mean, running_var buffers in the model.
 
     It performs one pass over data in `loader` to estimate the activation
@@ -428,6 +479,11 @@ def update_bn(
 
 
 class SWALR(LRScheduler):
+    # [CLASS DOC] Learning-rate scheduler that anneals each param group's lr toward a fixed
+    # swa_lr over anneal_epochs epochs, then holds it there. State: anneal_epochs, the chosen
+    # anneal function (cosine or linear, stored by name and as a bound method), and a per-group
+    # swa_lr entry written into the optimizer's param groups. State dict excludes the optimizer
+    # and the anneal function.
     r"""Anneals the learning rate in each parameter group to a fixed value.
 
     This learning rate scheduler is meant to be used with Stochastic Weight
@@ -479,6 +535,10 @@ class SWALR(LRScheduler):
         anneal_strategy: Literal["cos", "linear"] = "cos",
         last_epoch=-1,
     ) -> None:
+        # [FUNCTION DOC] Stores swa_lr (a number or per-group list) into each param group,
+        # selects the anneal function and anneal_epochs, then initializes the base scheduler.
+        # Raises an error for an unknown strategy or an anneal_epochs that is not a
+        # non-negative integer. Side effect: adds a swa_lr key to every optimizer param group.
         swa_lrs = _format_param("swa_lr", optimizer, swa_lr)
         for swa_lr, group in zip(swa_lrs, optimizer.param_groups, strict=True):
             group["swa_lr"] = swa_lr
@@ -497,20 +557,31 @@ class SWALR(LRScheduler):
 
     @staticmethod
     def _linear_anneal(t):
+        # [FUNCTION DOC] HELPER: Identity mapping of progress t in [0, 1] to blend weight.
         return t
 
     @staticmethod
     def _cosine_anneal(t):
+        # [FUNCTION DOC] HELPER: Maps progress t in [0, 1] to a blend weight along a half cosine
+        # curve (0 at start, 1 at end).
         return (1 - math.cos(math.pi * t)) / 2
 
     @staticmethod
     def _get_initial_lr(lr, swa_lr, alpha):
+        # [FUNCTION DOC] HELPER: Inverts one annealing step to recover the lr the schedule
+        # started from, given current lr, target swa_lr and blend weight alpha. When alpha is 1
+        # (division would be by zero) returns swa_lr.
         if alpha == 1:
             return swa_lr
         return (lr - alpha * swa_lr) / (1 - alpha)
 
     @override
     def get_lr(self):
+        # [FUNCTION DOC] Computes the next lr for every param group. Warns if called outside a
+        # scheduler step. Derives the previous and current blend weights from the step count
+        # (clamped progress over anneal_epochs; with zero epochs jumps straight to the target),
+        # reconstructs each group's starting lr from the previous weight, then returns the
+        # mix of swa_lr and starting lr by the current weight. Returns a list, one per group.
         r"""Compute the next learning rate for each of the optimizer's
         :attr:`~torch.optim.Optimizer.param_groups`.
 
@@ -561,6 +632,8 @@ class SWALR(LRScheduler):
         ]
 
     def _set_anneal_func(self, anneal_strategy: Literal["cos", "linear"]) -> None:
+        # [FUNCTION DOC] HELPER: Records the strategy name and binds anneal_func to the cosine
+        # function for cos, else the linear function.
         self._anneal_strategy = anneal_strategy
         if anneal_strategy == "cos":
             self.anneal_func = self._cosine_anneal
@@ -569,6 +642,8 @@ class SWALR(LRScheduler):
 
     @override
     def state_dict(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Returns a new mapping of all instance attributes except the optimizer
+        # and the anneal function.
         """Return the state of the scheduler as a :class:`dict`.
 
         It contains an entry for every variable in self.__dict__ which
@@ -582,6 +657,8 @@ class SWALR(LRScheduler):
 
     @override
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        # [FUNCTION DOC] Merges the given mapping into the instance attributes, then rebinds the
+        # anneal function from the restored strategy name. Mutates the scheduler in place.
         """Load the scheduler's state.
 
         Args:

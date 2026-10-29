@@ -1,8 +1,13 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Minimal directed graph used by torch.package to track module dependencies.
+# Exports the DiGraph class. No import-time side effects.
 from collections import deque
 
 
 class DiGraph:
+    # [CLASS DOC] Simple unweighted directed graph with networkx-like method names. State:
+    # node attribute mapping, successor and predecessor adjacency mappings (no edge data), and
+    # an insertion-order index per node used to find the earliest path. Nodes are any hashable.
     """Really simple unweighted directed graph data structure to track dependencies.
 
     The API is pretty much the same as networkx so if you add something just
@@ -10,6 +15,8 @@ class DiGraph:
     """
 
     def __init__(self):
+        # [FUNCTION DOC] Creates an empty graph with empty node, successor, predecessor and
+        # insertion-order mappings and a zero insertion counter.
         # Dict of node -> dict of arbitrary attributes
         self._node = {}
         # Nested dict of node -> successor node -> nothing.
@@ -24,6 +31,8 @@ class DiGraph:
         self._insertion_idx = 0
 
     def add_node(self, n, **kwargs):
+        # [FUNCTION DOC] Adds node n with keyword attributes. A new node gets empty adjacency
+        # and the next insertion index; an existing node only has its attributes merged.
         """Add a node to the graph.
 
         Args:
@@ -40,6 +49,8 @@ class DiGraph:
             self._node[n].update(kwargs)
 
     def add_edge(self, u, v):
+        # [FUNCTION DOC] Adds a directed edge from u to v, creating either node if missing.
+        # Recording the same edge twice has no further effect.
         """Add an edge to graph between nodes ``u`` and ``v``
 
         ``u`` and ``v`` will be created if they do not already exist.
@@ -53,6 +64,8 @@ class DiGraph:
         self._pred[v][u] = True
 
     def successors(self, n):
+        # [FUNCTION DOC] Returns an iterator over nodes with an edge from n. Raises an error
+        # (ValueError) if n is not in the graph.
         """Returns an iterator over successor nodes of n."""
         try:
             return iter(self._succ[n])
@@ -60,6 +73,8 @@ class DiGraph:
             raise ValueError(f"The node {n} is not in the digraph.") from e
 
     def predecessors(self, n):
+        # [FUNCTION DOC] Returns an iterator over nodes with an edge into n. Raises an error
+        # (ValueError) if n is not in the graph.
         """Returns an iterator over predecessor nodes of n."""
         try:
             return iter(self._pred[n])
@@ -68,6 +83,8 @@ class DiGraph:
 
     @property
     def edges(self):
+        # [FUNCTION DOC] Property generating every edge as a (source, target) pair, grouped by
+        # source node in insertion order.
         """Returns an iterator over all edges (u, v) in the graph"""
         for n, successors in self._succ.items():
             for succ in successors:
@@ -75,14 +92,19 @@ class DiGraph:
 
     @property
     def nodes(self):
+        # [FUNCTION DOC] Property returning the live mapping of node to its attribute mapping
+        # (not a copy).
         """Returns a dictionary of all nodes to their attributes."""
         return self._node
 
     def __iter__(self):
+        # [FUNCTION DOC] Returns an iterator over the nodes in insertion order.
         """Iterate over the nodes."""
         return iter(self._node)
 
     def __contains__(self, n):
+        # [FUNCTION DOC] Membership test for a node; unhashable values yield false instead of
+        # raising.
         """Returns True if ``n`` is a node in the graph, False otherwise."""
         try:
             return n in self._node
@@ -90,6 +112,10 @@ class DiGraph:
             return False
 
     def forward_transitive_closure(self, src: str) -> set[str]:
+        # [FUNCTION DOC] Breadth-first search along successor edges; returns the set of nodes
+        # reachable from src, including the start.
+        # KNOWN ISSUE: the set and queue are built directly from src, so a multi-character
+        # string is split into one start node per character; only correct for one-char names.
         """Returns a set of nodes that are reachable from src"""
 
         result = set(src)
@@ -103,6 +129,10 @@ class DiGraph:
         return result
 
     def backward_transitive_closure(self, src: str) -> set[str]:
+        # [FUNCTION DOC] Breadth-first search along predecessor edges; returns the set of nodes
+        # that can reach src, including the start.
+        # KNOWN ISSUE: same per-character splitting of a multi-character src as the forward
+        # closure.
         """Returns a set of nodes that are reachable from src in reverse direction"""
 
         result = set(src)
@@ -116,6 +146,14 @@ class DiGraph:
         return result
 
     def all_paths(self, src: str, dst: str):
+        # [FUNCTION DOC] Builds the subgraph of nodes and edges lying on some path from src to
+        # dst: computes everything reachable from src, then walks predecessors back from dst
+        # keeping only reachable nodes. Returns the dot text of that subgraph; if dst is not
+        # reachable, returns an empty graph object instead.
+        # KNOWN ISSUE: inconsistent return type (graph object vs dot string), and the
+        # annotation is missing; also the walk has no visited set, so cyclic or diamond-shaped
+        # graphs revisit nodes (possible non-termination on cycles); dst is also split per
+        # character when used to seed the queue.
         """Returns a subgraph rooted at src that shows all the paths to dst."""
 
         result_graph = DiGraph()
@@ -140,6 +178,9 @@ class DiGraph:
         return result_graph.to_dot()
 
     def first_path(self, dst: str) -> list[str]:
+        # [FUNCTION DOC] Walks back from dst, at each step moving to the predecessor that was
+        # added to the graph earliest, until a node has no predecessor. Returns the nodes in
+        # order from the root to dst. Stops early if a predecessor has no recorded order.
         """Returns a list of nodes that show the first path that resulted in dst being added to the graph."""
         path = []
 
@@ -158,6 +199,8 @@ class DiGraph:
         return list(reversed(path))
 
     def to_dot(self) -> str:
+        # [FUNCTION DOC] Returns Graphviz text for the graph: left-to-right layout, box nodes,
+        # one quoted edge line per edge.
         """Returns the dot representation of the graph.
 
         Returns:

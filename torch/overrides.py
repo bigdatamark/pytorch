@@ -1,3 +1,10 @@
+# [MODULE DOC] Python-level support for the __torch_function__ protocol: finding which arguments
+# define overrides, dispatching to them (and to active function modes), and reporting which
+# torch functions are overridable. Main contents: handle_torch_function, has_torch_function
+# helpers (bound from C++ with docstrings), wrap_torch_function, registries of ignored and
+# testing-override functions, name resolution, is_tensor_like, and the TorchFunctionMode
+# classes with their mode-stack helpers. Import-time side effects: attaches docstrings to the
+# C++ has_torch_function builtins; the registry functions are cached and built lazily.
 """
 Python implementation of ``__torch_function__``
 
@@ -70,6 +77,10 @@ def _disable_user_warnings(
     regex: str = ".*is deprecated, please use.*",
     module: str = "torch",
 ) -> Callable[_P, _R]:
+    # [FUNCTION DOC] HELPER: Decorator wrapping func so each call runs with matching user
+    # warnings suppressed. Args: func, regex matched against the warning message, module
+    # restricting the filter. Returns the wrapper, which preserves func's metadata. The warning
+    # filter state is saved and restored around each call.
     """
     Decorator that temporarily disables ``UserWarning``s for the given ``module`` if the warning message matches the
     given ``regex`` pattern.
@@ -91,6 +102,8 @@ def _disable_user_warnings(
 
     @wraps(func)
     def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        # [FUNCTION DOC] HELPER: Calls the wrapped function inside a warning-catching scope
+        # that ignores matching user warnings, and returns its result.
         with warnings.catch_warnings():
             warnings.filterwarnings(
                 "ignore", category=UserWarning, message=regex, module=module
@@ -103,6 +116,10 @@ def _disable_user_warnings(
 @functools.cache
 @_disable_user_warnings
 def get_ignored_functions() -> set[Callable]:
+    # [FUNCTION DOC] Returns a cached set of public torch functions, methods and property
+    # accessors that cannot be overridden through the protocol (factory functions, utilities,
+    # non-tensor-taking helpers). Used to exclude them from overridable-function discovery and
+    # to check consistency with the testing overrides. Cached: later calls return the same set.
     """
     Return public functions that cannot be overridden by ``__torch_function__``.
 
@@ -396,6 +413,9 @@ def get_ignored_functions() -> set[Callable]:
 
 @functools.cache
 def get_default_nowrap_functions() -> set[Callable]:
+    # [FUNCTION DOC] Returns a cached set holding the getter functions of the tensor base and
+    # gradient properties. The default subclass-preserving tensor protocol must not rewrap
+    # their results, to keep object identity stable across repeated accesses.
     """
     Return public functions that do not wrap in a subclass when invoked by
     the default ``Tensor.__torch_function__`` that preserves subclasses.  Typically,
@@ -423,6 +443,11 @@ def get_default_nowrap_functions() -> set[Callable]:
 @functools.cache
 @_disable_user_warnings
 def get_testing_overrides() -> dict[Callable, Callable]:
+    # [FUNCTION DOC] Builds (once, cached) a mapping from each overridable torch function,
+    # tensor method or property accessor to a dummy stand-in with the same signature that
+    # returns a constant. Starts from a large literal table, then adds entries for distributed
+    # and sparse-related functions and property getters/setters, and for the C++ torch function
+    # tensor methods. Tests use it to check override coverage and call signatures.
     """Return a dict containing dummy overrides for all overridable functions
 
     Returns
@@ -1601,6 +1626,11 @@ def get_testing_overrides() -> dict[Callable, Callable]:
 def wrap_torch_function(
     dispatcher: Callable[_P, Iterable[Any]],
 ) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
+    # [FUNCTION DOC] Decorator factory. Args: dispatcher, a function with the same signature as
+    # the decorated one that returns the iterable of arguments to inspect. The returned decorator
+    # wraps a function so that, when any inspected argument is tensor-like with an override (or
+    # a mode is active), the call is routed through handle_torch_function; otherwise the original
+    # function runs. Adds per-call overhead.
     """Wraps a given function with ``__torch_function__`` -related functionality.
 
     Parameters
@@ -1625,8 +1655,12 @@ def wrap_torch_function(
     """
 
     def inner(func: Callable[_P, _R]) -> Callable[_P, _R]:
+        # [FUNCTION DOC] HELPER: The actual decorator; returns the dispatching wrapper of func.
         @functools.wraps(func)
         def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+            # [FUNCTION DOC] HELPER: Computes the relevant arguments via the dispatcher; if any
+            # has an override or a mode is active, defers to handle_torch_function with this
+            # wrapper as the public API, else calls the original function.
             relevant_args = dispatcher(*args, **kwargs)
             if has_torch_function(relevant_args):
                 return handle_torch_function(
@@ -1644,6 +1678,11 @@ def _get_overloaded_args(
     relevant_args: Iterable[Any],
     get_type_fn: Callable[[Any], type] | None = None,
 ) -> list[Any]:
+    # [FUNCTION DOC] HELPER: Selects the arguments whose type defines a real (non-disabled)
+    # torch function method, keeping one argument per distinct type. Args: relevant_args, an
+    # iterable; get_type_fn, optional type extractor (default: the builtin type lookup).
+    # Returns a list ordered with subclasses before their base classes, otherwise left to right.
+    # Returns an empty list when the protocol is globally disabled.
     """Returns a list of arguments on which to call __torch_function__.
 
     Checks arguments in relevant_args for __torch_function__ implementations,
@@ -1725,6 +1764,13 @@ def handle_torch_function(
     *args: _P.args,
     **kwargs: _P.kwargs,
 ) -> _R:
+    # [FUNCTION DOC] Dispatches a public API call to torch function overrides. Args: public_api
+    # (the function being called), relevant_args (iterable to inspect), plus the original
+    # positional and keyword arguments. First asks the active torch function mode (temporarily
+    # popped off the stack so nested calls see the outer modes); then each overloaded argument's
+    # method in precedence order. The first result that is not the not-implemented marker is
+    # returned. Warns if a method is a plain bound method instead of a classmethod.
+    # Raises a type error naming the function and argument types when nothing handled it.
     """Implement a function with checks for ``__torch_function__`` overrides.
 
     See torch::autograd::handle_torch_function for the equivalent of this
@@ -1861,6 +1907,16 @@ has_torch_function_variadic = _add_docstr(
 def _get_overridable_functions() -> tuple[
     dict[Any, list[Callable]], dict[Callable, str]
 ]:
+    # [FUNCTION DOC] HELPER: Cached discovery pass over the torch namespaces (torch, functional,
+    # nn.functional, nn.init, Tensor, linalg, fft, special). Returns a pair: a mapping from
+    # namespace (or property object) to its overridable callables, and an index from each
+    # callable (and property getter/setter) to its dotted display name. Skips private,
+    # underscore-suffixed, capitalized, module and future-feature names, builtin object members,
+    # and anything in the ignored set. Raises an error if a function is both ignored and has a
+    # testing override.
+    # KNOWN ISSUE: the Tensor branch in the loop fetches the attribute and then fetches it again
+    # below with the same object-member check, so that check is duplicated; also the error
+    # message uses the namespace object and a name attribute that property objects may lack.
     overridable_funcs = collections.defaultdict(list)
     index = {}
     tested_namespaces = [
@@ -1944,6 +2000,8 @@ def _get_overridable_functions() -> tuple[
 
 @_disable_user_warnings
 def get_overridable_functions() -> dict[Any, list[Callable]]:
+    # [FUNCTION DOC] Returns the mapping from namespace to the list of functions in it that can
+    # be overridden via the protocol (first part of the cached discovery result).
     """List functions that are overridable via __torch_function__
 
     Returns
@@ -1957,6 +2015,9 @@ def get_overridable_functions() -> dict[Any, list[Callable]]:
 
 @_disable_user_warnings
 def resolve_name(f):
+    # [FUNCTION DOC] Returns a readable dotted name for a function passed to a torch function
+    # handler. Operator overloads and overload packets use their string form; others are looked
+    # up in the discovery index and yield none if unknown.
     """Get a human readable string name for a function passed to
     __torch_function__
 
@@ -1978,6 +2039,8 @@ def resolve_name(f):
 
 @functools.cache
 def _get_tensor_methods() -> set[Callable]:
+    # [FUNCTION DOC] HELPER: Cached set of the overridable Tensor methods and property getters,
+    # taken from the discovery result for the Tensor namespace.
     """Returns a set of the overridable methods on ``torch.Tensor``"""
     overridable_funcs = get_overridable_functions()
     methods = set(overridable_funcs[torch.Tensor])
@@ -1986,6 +2049,10 @@ def _get_tensor_methods() -> set[Callable]:
 
 @_disable_user_warnings
 def is_tensor_method_or_property(func: Callable) -> bool:
+    # [FUNCTION DOC] Returns true if func is an overridable Tensor method, or any callable named
+    # as a property getter (its name is the getter name), as seen by torch function handlers.
+    # KNOWN ISSUE: any function whose name is the getter name counts, even if it does not belong
+    # to Tensor, so the result can be a false positive.
     """
     Returns True if the function passed in is a handler for a
     method or property belonging to ``torch.Tensor``, as passed
@@ -2011,6 +2078,8 @@ def is_tensor_method_or_property(func: Callable) -> bool:
 
 
 def is_tensor_like(inp):
+    # [FUNCTION DOC] Returns true if the input's type is exactly Tensor or the input has a
+    # torch function attribute (so subclasses and user-defined tensor-likes qualify).
     """
     Returns ``True`` if the passed-in input is a Tensor-like.
 
@@ -2048,6 +2117,10 @@ def is_tensor_like(inp):
 
 
 class TorchFunctionMode:
+    # [CLASS DOC] Base class for dynamic-scope overrides of every torch function call. Used as a
+    # context manager: entering pushes the instance on the global torch function mode stack,
+    # leaving pops it. Subclasses implement the torch function method; calls made inside it go
+    # to the next mode on the stack. Has an annotation for an inner mode attribute (no value).
     """
     A ``TorchFunctionMode`` allows you to override the meaning of all
     ``__torch_function__`` overridable functions within a dynamic scope,
@@ -2082,20 +2155,30 @@ class TorchFunctionMode:
 
     # Force metaclass to generate constructor at the base of the hierarchy
     def __init__(self) -> None:
+        # [FUNCTION DOC] No-op constructor; exists so the metaclass generates the constructor
+        # at the base of the hierarchy.
         pass
 
     def __torch_function__(self, func, types, args=(), kwargs=None):
+        # [FUNCTION DOC] Hook invoked for each intercepted call with the function, the argument
+        # types, positional args and optional keyword args. Subclasses override it; the base
+        # version raises a not-implemented error.
         raise NotImplementedError
 
     def __enter__(self):
+        # [FUNCTION DOC] Pushes this mode on the global mode stack and returns it.
         _push_mode(self)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        # [FUNCTION DOC] Pops the top mode off the global stack (assumed to be this one);
+        # exception details are ignored and nothing is suppressed.
         _pop_mode()
 
     @classmethod
     def push(cls, *args, **kwargs):
+        # [FUNCTION DOC] Deprecated constructor shortcut: warns that it is unnecessary, builds
+        # an instance with the given arguments and returns it (does not push it).
         warnings.warn(
             "`Mode.push()` is no longer necessary and can be replaced with just `with Mode()`",
             stacklevel=2,
@@ -2105,26 +2188,32 @@ class TorchFunctionMode:
 
 
 def _get_current_function_mode():
+    # [FUNCTION DOC] HELPER: Returns the top mode of the torch function stack, or none if empty.
     stack_len = _len_torch_function_stack()
     return _get_function_stack_at(stack_len - 1) if stack_len > 0 else None
 
 
 def _get_current_function_mode_stack():
+    # [FUNCTION DOC] HELPER: Returns a list copy of the mode stack, bottom first.
     stack_len = _len_torch_function_stack()
     return [_get_function_stack_at(i) for i in range(stack_len)]
 
 
 def _push_mode(mode):
+    # [FUNCTION DOC] HELPER: Pushes the mode on the global torch function stack (mutation).
     _push_on_torch_function_stack(mode)
 
 
 def _pop_mode():
+    # [FUNCTION DOC] HELPER: Pops and returns the top mode of the global stack (mutation).
     old = _pop_torch_function_stack()
     return old
 
 
 @contextlib.contextmanager
 def _pop_mode_temporarily():
+    # [FUNCTION DOC] HELPER: Context manager that pops the top mode, yields it, and pushes it
+    # back on exit even if an error occurred.
     old = _pop_mode()
     try:
         yield old
@@ -2133,7 +2222,11 @@ def _pop_mode_temporarily():
 
 
 class BaseTorchFunctionMode(TorchFunctionMode):
+    # [CLASS DOC] Mode that performs the default behavior: simply calls the intercepted function.
+    # Stateless; useful as a base for modes that only observe calls.
     def __torch_function__(self, func, types, args=(), kwargs=None):
+        # [FUNCTION DOC] Calls func with the given args and keyword args (empty if none) and
+        # returns the result.
         if kwargs is None:
             kwargs = {}
         return func(*args, **kwargs)
@@ -2141,6 +2234,8 @@ class BaseTorchFunctionMode(TorchFunctionMode):
 
 @contextlib.contextmanager
 def _enable_torch_function():
+    # [FUNCTION DOC] HELPER: Context manager that sets the global torch function state to
+    # enabled, and restores the previous state on exit even after an error.
     old_state = torch._C._get_torch_function_state()
     try:
         torch._C._set_torch_function_state(torch._C._TorchFunctionState.ENABLED)
@@ -2151,6 +2246,9 @@ def _enable_torch_function():
 
 @contextlib.contextmanager
 def enable_reentrant_dispatch():
+    # [FUNCTION DOC] Context manager that restores the saved Python thread-local dispatch state
+    # snapshot for the duration of the block, allowing dispatch re-entry from Python.
+    # Written as a function (not an alias of the C++ type) to keep a public module name.
     # NB: this can't simply be
     # `enable_reentrant_dispatch = torch._C._RestorePythonTLSSnapshot`
     # because:
@@ -2166,6 +2264,10 @@ def enable_reentrant_dispatch():
 
 
 def redispatch_function(func, types, args, kwargs):
+    # [FUNCTION DOC] Calls func while skipping one level of torch function dispatch, so a
+    # handler can invoke the real implementation without re-triggering itself. Args mirror the
+    # handler's: function, argument types, positional args, keyword args. Returns the result
+    # (typically a plain tensor for subclass inputs).
     """Skip one level of ``__torch_function__`` dispatch and call the function.
 
     This is primarily useful for **Tensor subclasses** that want to call into

@@ -1,5 +1,9 @@
 # mypy: allow-untyped-defs
 
+# [MODULE DOC] Defines the SparseAdam optimizer, a masked variant of Adam for dense parameters
+# whose gradients use a sparse layout. Exports SparseAdam only. The class docstring is assigned
+# after the class body. No import-time side effects besides that assignment.
+
 import torch
 from torch import Tensor
 
@@ -11,6 +15,11 @@ __all__ = ["SparseAdam"]
 
 
 class SparseAdam(Optimizer):
+    # [CLASS DOC] Adam optimizer that only updates moments and parameters at the entries
+    # materialized in a sparse-layout gradient. Parameters must be dense and non-complex;
+    # gradients must be sparse. Per-parameter state: step count, exp_avg, exp_avg_sq (dense,
+    # same shape as the parameter). Defaults hold lr, betas, eps and maximize. The numerical
+    # update is delegated to the functional sparse_adam routine.
     def __init__(
         self,
         params: ParamsT,
@@ -19,6 +28,12 @@ class SparseAdam(Optimizer):
         eps: float = 1e-8,
         maximize: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Validates hyperparameters and builds the optimizer.
+        # Args: params (iterable of tensors or groups), lr (float or one-element tensor),
+        # betas (pair, each in [0, 1)), eps (positive), maximize (flag).
+        # Raises an error for a multi-element tensor lr, non-positive lr or eps, out-of-range
+        # betas, and for any sparse-layout or complex parameter (reporting group/param indices).
+        # KNOWN ISSUE: lr of exactly zero is rejected (strict positivity check).
         if isinstance(lr, Tensor) and lr.numel() != 1:
             raise ValueError("Tensor lr must be 1-element")
         if not 0.0 < lr:
@@ -62,6 +77,12 @@ class SparseAdam(Optimizer):
 
     @torch.no_grad()
     def step(self, closure=None):
+        # [FUNCTION DOC] Performs one optimization step without autograd tracking.
+        # Args: closure, optional callable re-evaluating the model and returning the loss
+        # (run with gradients enabled). For each group, collects parameters that have a grad,
+        # lazily creates zeroed state, increments the step count, then calls the functional
+        # sparse_adam routine which updates parameters and moments in place.
+        # Returns the closure loss or None. Raises an error if a gradient is not sparse.
         """Perform a single optimization step.
 
         Args:

@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Helpers copied from CPython's import machinery, used by torch.package's importer
+# to resolve relative module names and compute package names. Contains a zip search order
+# constant and small functions for name resolution, argument checks, package calculation, path
+# normalization and line-ending normalization. No import-time side effects.
 import _warnings
 import os.path
 
@@ -22,12 +26,17 @@ _zip_searchorder = (
 # Replace any occurrences of '\r\n?' in the input string with '\n'.
 # This converts DOS and Mac line endings to Unix line endings.
 def _normalize_line_endings(source):
+    # [FUNCTION DOC] HELPER: Takes source bytes and returns them with Windows and old Mac
+    # line endings converted to Unix newlines.
     source = source.replace(b"\r\n", b"\n")
     source = source.replace(b"\r", b"\n")
     return source
 
 
 def _resolve_name(name, package, level):
+    # [FUNCTION DOC] HELPER: Turns a relative module name into an absolute one by stripping
+    # level-1 trailing components from package and appending name (if non-empty). Raises an
+    # error when level exceeds the depth of the package.
     """Resolve a relative module name to an absolute one."""
     bits = package.rsplit(".", level - 1)
     if len(bits) < level:
@@ -37,6 +46,10 @@ def _resolve_name(name, package, level):
 
 
 def _sanity_check(name, package, level):
+    # [FUNCTION DOC] HELPER: Validates import arguments. Raises a type error if name is not a
+    # string or package (needed when level > 0) is not a string; a value error for negative
+    # level or an empty name at level zero; an import error for a relative import with an
+    # empty package. Returns nothing.
     """Verify arguments are "sane"."""
     if not isinstance(name, str):
         raise TypeError(f"module name must be str, not {type(name)}")
@@ -52,6 +65,10 @@ def _sanity_check(name, package, level):
 
 
 def _calc___package__(globals):
+    # [FUNCTION DOC] HELPER: Determines the package name for a module namespace mapping.
+    # Prefers the package entry (warning if it disagrees with the spec parent), then the
+    # spec parent, else falls back to the module name (dropping the last component unless
+    # the module has a path, i.e. is a package) with a warning. Returns the package name.
     """Calculate what __package__ should be.
 
     __package__ is not guaranteed to be defined or could be set to None
@@ -84,6 +101,8 @@ def _calc___package__(globals):
 
 
 def _normalize_path(path):
+    # [FUNCTION DOC] HELPER: Returns path unchanged if it is a bare file name; raises an error
+    # if it contains a directory part.
     """Normalize a path by ensuring it is a string.
 
     If the resulting string contains path separators, an exception is raised.
