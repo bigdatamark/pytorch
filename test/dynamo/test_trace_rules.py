@@ -1,4 +1,9 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests for Dynamo trace rules: validates module inline lists, GPU seed function skip
+# rules, forced-inline overrides, special-handler cacheability, and direct compilation of a
+# single torch function. Also defines a heuristic walker over the torch and math modules and a
+# debugging dump helper. Import time: builds a set of ignored C-binding names (extended when
+# the LLVM backend is enabled) and imports a local test utility with a fallback import path.
 import dataclasses
 import importlib
 import inspect
@@ -98,6 +103,10 @@ if torch._C._llvm_enabled():
 # Helper function to dump the torch name rule map generated based on
 # the heuristic defined in gen_allowed_objs_and_ids.
 def dump_allowed_torch_name_rule_map() -> None:
+    # [FUNCTION DOC] HELPER: Developer utility, not a test. Runs the allowed-object walk with
+    # recording enabled and all functions included, then prints one line per recorded name
+    # giving the name and the class name of its Dynamo rule. Output goes to standard output;
+    # returns nothing.
     m = gen_allowed_objs_and_ids(record=True, c_binding_only=False).name_rule_map
     for k, v in m.items():
         print(f'"{k}": {v.__name__},')
@@ -105,6 +114,10 @@ def dump_allowed_torch_name_rule_map() -> None:
 
 @dataclasses.dataclass
 class AllowedObjects:
+    # [CLASS DOC] Plain data record produced by the allowed-object walk. Holds a mapping from
+    # object id to dotted name, the set of C-binding in-graph functions, the set of
+    # non-C-binding in-graph functions, and a mapping from dotted name to the Dynamo variable
+    # class chosen for it.
     """
     Track the objects, object id - name pairs, and name - dynamo wrapping rule pairs
     from the heuristic defined in `gen_allowed_objs_and_ids`.
@@ -117,6 +130,12 @@ class AllowedObjects:
 
 
 def gen_allowed_objs_and_ids(record=False, c_binding_only=True) -> AllowedObjects:
+    # [FUNCTION DOC] HELPER: Walks the torch and math modules recursively and collects ids and
+    # names of reachable objects that the heuristic treats as allowed. When record is true it also
+    # classifies functions into C-binding and non-C-binding sets and fills the name-to-rule
+    # mapping with the torch in-graph function variable class; c_binding_only restricts recording
+    # to C functions. Returns an AllowedObjects. Side effect: installs a global warning filter
+    # ignoring user warnings from torch.distributed modules.
     """
     Walk torch.* and get the ids of all the stuff in it
     """
@@ -130,6 +149,9 @@ def gen_allowed_objs_and_ids(record=False, c_binding_only=True) -> AllowedObject
     # In some platforms, these functions were loaded as classes instead of functions.
     # To mitigate these weird cases, we need this special check.
     def is_special_functions(obj):
+        # [FUNCTION DOC] HELPER: Returns true if the object is hashable and is one of two named C
+        # functions (the CUDA stream-capturing query and graph pool handle) that some platforms
+        # load as classes rather than functions.
         return hashable(obj) and obj in {
             torch._C._cuda_isCurrentStreamCapturing,
             torch._C._graph_pool_handle,
@@ -139,6 +161,13 @@ def gen_allowed_objs_and_ids(record=False, c_binding_only=True) -> AllowedObject
     # if it's a torch function or method.
     # This is used to generate the in graph function list based on heuristic.
     def heuristic_record_if_in_graph_function(obj, module, name):
+        # [FUNCTION DOC] HELPER: Records a candidate torch function. Unwraps an object with a
+        # wrapped attribute (ignoring errors during the lookup). If the object is a Python
+        # function, builtin function, method descriptor or wrapper descriptor (or one of the
+        # special functions), it maps its dotted name to the torch in-graph variable class, then
+        # adds it to the C-binding set when it has no code object, or, when not C-binding-only, to
+        # the non-C-binding set when it has a code object. Mutates the enclosing collections;
+        # returns nothing.
         try:
             if hasattr(obj, "__wrapped__"):
                 obj = obj.__wrapped__
@@ -166,6 +195,11 @@ def gen_allowed_objs_and_ids(record=False, c_binding_only=True) -> AllowedObject
                     c_binding_in_graph_functions.add(obj)
 
     def _is_allowed_module_prefix(obj):
+        # [FUNCTION DOC] HELPER: Decides whether an object belongs to an allowed module. Returns
+        # false when the object has no module or its module name starts with any entry in a long
+        # exclusion list (for example optimizer, dynamo, inductor, fx, jit, distributed and utils
+        # packages; the RNN module is excluded so its parameter flattening is inlined). Otherwise
+        # returns true if the module is torch or math or a submodule of either.
         allowed_modules = ("torch", "math")
         # torch.nn.modules.rnn is disallowed because these modules internally
         # flatten their parameters.  This flattening process will call
@@ -251,6 +285,14 @@ def gen_allowed_objs_and_ids(record=False, c_binding_only=True) -> AllowedObject
         return mod_name in allowed_modules or mod_name.startswith(allowed_modules_dot)
 
     def _find_torch_objects(module):
+        # [FUNCTION DOC] HELPER: Recursive walk over one module. Stops immediately for modules
+        # whose name starts with an entry of the allowed-functions ignore list in the Dynamo
+        # config. Records the module id and name, then visits a snapshot of its namespace; for
+        # objects not yet recorded it skips higher-order operators and a fixed set of
+        # traced-through functions (grad, vmap, a triplet-margin loss and cond), recurses into
+        # allowed torch submodules, and for other objects either from allowed modules or lacking a
+        # module and not safe constants, optionally records them via the heuristic and stores id
+        # to dotted name. Mutates the enclosing collections.
         if any(
             module.__name__.startswith(mod_name)
             for mod_name in config.allowed_functions_module_string_ignorelist
@@ -308,7 +350,14 @@ def gen_allowed_objs_and_ids(record=False, c_binding_only=True) -> AllowedObject
 
 
 class TraceRuleTests(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Test case checking Dynamo trace-rule data: module inline lists import correctly,
+    # GPU seed functions are skipped, forced-inline rule overrides work for a torch utility and a
+    # custom module function, special handlers are audited against the cacheable function list,
+    # and name lookup copes with objects lacking a name.
     def _check_set_equality(self, generated, used, rule_map, ignored_set):
+        # [FUNCTION DOC] HELPER: Compares the generated set of objects with the set in use and
+        # asserts both differences are empty, with failure messages telling the developer to add
+        # new objects to the named rule map or ignore set, or remove stale ones.
         x = generated - used
         y = used - generated
         msg1 = (
@@ -328,6 +377,10 @@ class TraceRuleTests(torch._dynamo.test_case.TestCase):
     # this unit test is to make sure the functions/modules can be correctly imported
     # or loaded in case there is typo in the strings.
     def test_skipfiles_inlinelist(self):
+        # [FUNCTION DOC] Imports every module name from the legacy and current inline lists,
+        # skipping ones that fail to import, and asserts each result is a module object.
+        # KNOWN ISSUE: the failure message argument is a function object, not a string, so the
+        # intended message is not displayed.
         for m in LEGACY_MOD_INLINELIST.union(MOD_INLINELIST):
             try:
                 mod = importlib.import_module(m)
@@ -342,6 +395,9 @@ class TraceRuleTests(torch._dynamo.test_case.TestCase):
 
     @unittest.skipUnless(TEST_XPU or TEST_CUDA, "GPU is not available")
     def test_gpu_manual_seed_functions_graph_break(self):
+        # [FUNCTION DOC] Runs only when CUDA or XPU is available. Loads the manual seed functions
+        # of the GPU backend (plain and all-device, in the top namespace and the random submodule)
+        # and asserts the trace-rule lookup maps each to the skip-function variable class.
         for name in (
             f"torch.{GPU_TYPE}.manual_seed",
             f"torch.{GPU_TYPE}.manual_seed_all",
@@ -358,6 +414,10 @@ class TraceRuleTests(torch._dynamo.test_case.TestCase):
         "This test keeps getting broken and our disable infra is not handling well. see #120627"
     )
     def test_torch_name_rule_map_updated(self):
+        # [FUNCTION DOC] Skipped unconditionally (two skip decorators referencing known issues).
+        # If enabled it generates the heuristic set of C-binding in-graph functions and asserts it
+        # equals the loaded rule-map entries plus the ignore set, and checks every non-C-binding
+        # entry loads as a function-like object.
         # Generate the allowed objects based on heuristic defined in `allowed_functions.py`,
         objs = gen_allowed_objs_and_ids(record=True, c_binding_only=True)
         # Test C binding in graph functions are updated in torch_name_rule_map.
@@ -391,8 +451,15 @@ class TraceRuleTests(torch._dynamo.test_case.TestCase):
             )
 
     def test_force_inline_torch_function(self):
+        # [FUNCTION DOC] Copies the manual rule map, overrides the rule for the Dynamo istype
+        # utility to force inlining, checks Dynamo is not in either inline list, then patches the
+        # global rule map and bypasses the cache on the object rule map getter. Compiles a
+        # function using that utility with full graph and the eager backend and asserts the result
+        # equals eager.
         # `torch._dynamo.utils.istype` is skipped by default
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns the input plus one if it is a tensor by exact type
+            # test, else the input minus one.
             if istype(x, torch.Tensor):
                 return x + 1
             else:
@@ -430,9 +497,15 @@ class TraceRuleTests(torch._dynamo.test_case.TestCase):
             self.assertEqual(ref, res)
 
     def test_force_inline_custom_function(self):
+        # [FUNCTION DOC] Creates a dummy module and function, forces an inline rule for it in a
+        # patched rule map, and temporarily adds the module to the skip directories. Compiles a
+        # wrapper with full graph and checks equality with eager. Always restores the saved skip
+        # directory set and regex in a finally block.
         mod, func = create_dummy_module_and_function()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Calls the dummy function from the dummy module on the input
+            # and returns the result.
             return func(x)
 
         _manual_torch_name_rule_map = manual_torch_name_rule_map.copy()
@@ -472,6 +545,12 @@ class TraceRuleTests(torch._dynamo.test_case.TestCase):
                 torch._dynamo.trace_rules.SKIP_DIRS_RE = skip_dirs_re_backup
 
     def test_no_special_handlers_for_torch_non_c_bindings(self):
+        # [FUNCTION DOC] Gets the registered special handlers of the torch in-graph variable and,
+        # for every function whose handler is not in a manually audited safe list, asserts the
+        # function is not in the non-C-binding in-graph function collection (such functions must
+        # be cacheable, and special handlers may close over global state).
+        # KNOWN ISSUE: the failure message argument is a function object, not a string, so the
+        # intended message is not displayed.
         handlers = TorchInGraphFunctionVariable._get_handlers()
         # These handlers are manually audited to be safe
         safe_handlers = (
@@ -510,8 +589,15 @@ class TraceRuleTests(torch._dynamo.test_case.TestCase):
             )
 
     def test_almost_impossible_missing_name(self):
+        # [FUNCTION DOC] Checks that the trace-rule inner lookup returns the skip-function
+        # variable class for an object whose name attribute lookup raises AttributeError (no name
+        # given, fresh empty reasons set).
         class weird:
+            # [CLASS DOC] HELPER: Class whose attribute access raises AttributeError for the name
+            # attribute and returns nothing for other names.
             def __getattribute__(self, name):
+                # [FUNCTION DOC] HELPER: Raises AttributeError when the requested attribute is the
+                # name attribute, otherwise returns None.
                 if name == "__name__":
                     raise AttributeError("test")
 
@@ -523,6 +609,8 @@ class TraceRuleTests(torch._dynamo.test_case.TestCase):
 
 
 class TestModuleSurviveSkipFiles(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Test case checking that a distributed-test model module still gets compiled when
+    # its file falls under the skip rules.
     @unittest.skipIf(
         not torch.distributed.is_available(),
         "need to import MLP module from distributed",
@@ -531,6 +619,9 @@ class TestModuleSurviveSkipFiles(torch._dynamo.test_case.TestCase):
         msg="AssertionError: False is not true : MLP did not survive skip files"
     )
     def test_module_survive_skip_files(self):
+        # [FUNCTION DOC] Skipped if distributed is unavailable or on Windows. Builds the MLP test
+        # module, compiles it with the eager backend, runs it once, and asserts the Dynamo frame
+        # counter increased.
         from torch.testing._internal.common_fsdp import MLP
 
         model = MLP(3)
@@ -545,7 +636,11 @@ class TestModuleSurviveSkipFiles(torch._dynamo.test_case.TestCase):
 
 
 class SingleOpCompileTests(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Test case for compiling a single torch function directly.
     def test_top_level_torch_exp_compiles_through_dynamo(self):
+        # [FUNCTION DOC] Compiles a lambda wrapping exp as a sanity check and asserts one frame
+        # was compiled, then compiles the exp function itself directly and asserts exactly one
+        # frame compiled, and finally checks both outputs are numerically close.
         x = torch.randn(4)
 
         # Sanity: lambda version should go through Dynamo
