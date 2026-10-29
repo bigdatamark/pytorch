@@ -1,4 +1,9 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests for DTensor single-dim sharding strategies: expanding a per-mesh-dim rule list
+# to a full-mesh OpStrategy (including foreach, cat, mm, multi-output, out-variant and in-place
+# ops), placeholder filling, partial-type filtering, the Dijkstra (priority queue) search compared
+# against full expansion, pointwise rule generation, and strategy registration. Uses a fake process
+# group; no import-time side effects beyond defining two mylib custom ops.
 
 
 from itertools import chain, permutations, product
@@ -57,6 +62,8 @@ from torch.testing._internal.distributed.fake_pg import FakeStore
 
 
 def _get_mm_metas(M=64, K=32, N=64) -> tuple[TensorMeta, TensorMeta]:
+    # [FUNCTION DOC] HELPER: Build the TensorMeta pair (float32, contiguous) for a matmul of an M
+    # by K left operand and a K by N right operand. Returns (left_meta, right_meta).
     """
     Helper function to generate tensor metadata for matmul operation (M, K) @ (K, N) -> (M, N).
     """
@@ -80,6 +87,8 @@ def _get_mm_specs(
     left_placements: tuple[Placement, ...],
     right_placements: tuple[Placement, ...],
 ) -> tuple[DTensorSpec, DTensorSpec]:
+    # [FUNCTION DOC] HELPER: Wrap the two matmul TensorMetas and per-mesh-dim placement tuples into
+    # DTensorSpecs on the given mesh. Returns (left_spec, right_spec).
     """
     Helper function to generate DTensorSpecs for matmul operation (M, K) @ (K, N) -> (M, N).
     """
@@ -93,7 +102,11 @@ def _get_mm_specs(
 
 
 class TestExpandPlaceholder(TestCase):
+    # [CLASS DOC] Tests for _expand_single_dim_strategy_to_mesh and related helpers on fake-
+    # process-group meshes. setUp creates a 64-rank fake group; tearDown destroys it.
     def setUp(self):
+        # [FUNCTION DOC] Initialize a fake process group (world size 64, rank 0) and record
+        # world_size.
         super().setUp()
         self.world_size = 64
         store = FakeStore()
@@ -102,13 +115,22 @@ class TestExpandPlaceholder(TestCase):
         )
 
     def tearDown(self):
+        # [FUNCTION DOC] Destroy the process group created in setUp.
         super().tearDown()
         dist.destroy_process_group()
 
     def test_foreach_ops_variants(self):
+        # [FUNCTION DOC] Check that foreach op variants (unary, List, Scalar, Tensor, ternary
+        # Scalar, in-place) expand on a 2x2x2 mesh into a TupleStrategy with one child per list
+        # element. In-place gets exactly 1 strategy, additive linearity gets 634, others at least
+        # about 64.
         mesh = DeviceMesh("cpu", mesh=torch.arange(8).reshape(2, 2, 2))
 
         def _test_op(op, *args, linearity=None, inplace=None):
+            # [FUNCTION DOC] HELPER: Build DTensorSpecs from (placements, tensor) lists, wrap them
+            # as a TupleStrategy OpSchema, expand the common pointwise single-dim strategy to the
+            # mesh and assert on the strategy count. Inplace is auto-detected from the op name when
+            # not given; linearity 1 adds the binary additive partial rules.
             # Auto-detect inplace ops by checking for "_." in the op name (e.g., _foreach_add_.List)
             if inplace is None:
                 inplace = "_." in str(op)
@@ -225,6 +247,10 @@ class TestExpandPlaceholder(TestCase):
         )
 
     def test_expand_foreach_add_to_3d_mesh(self):
+        # [FUNCTION DOC] Check expansion of foreach_add.List to a 3D mesh: the per-child strategy
+        # counts (634 for tensors, 139 for scalar-like inputs, derived by inclusion-exclusion in
+        # the comments) and that the min-cost strategy for each child ties with the cheapest
+        # strategy that has the expected output placements.
         mesh = DeviceMesh("cpu", mesh=torch.arange(8).reshape(2, 2, 2))
 
         def _expand_foreach_add_list(
@@ -233,6 +259,9 @@ class TestExpandPlaceholder(TestCase):
             placements_a: list[tuple[Placement, ...]],
             placements_b: list[tuple[Placement, ...]],
         ) -> TupleStrategy:
+            # [FUNCTION DOC] HELPER: Expand the pointwise strategy with additive partial rules for
+            # foreach_add.List given two lists of tensors and per-tensor placements on the
+            # enclosing mesh. Asserts and returns the resulting TupleStrategy.
             specs_a = (
                 DTensorSpec(mesh, placement, TensorMeta(t.shape, t.stride(), t.dtype))
                 for placement, t in zip(placements_a, inputs_a)
@@ -314,6 +343,7 @@ class TestExpandPlaceholder(TestCase):
             self.assertEqual(len(child.strategies), expected_num_strategies[child_i])
 
             def sum_cost(x):
+                # [FUNCTION DOC] HELPER: Return the total of a nested list of redistribution costs.
                 return sum(sum(y) for y in x)
 
             # Multiple strategies can produce the same output placement but
@@ -332,11 +362,20 @@ class TestExpandPlaceholder(TestCase):
             self.assertAlmostEqual(min(expected_costs), min_cost, places=5)
 
     def test_expand_cat_strategy_to_3d_mesh(self):
+        # [FUNCTION DOC] Check cat single-dim strategy expansion on a 3D mesh: strategy count of
+        # 199 (or 198 when a tensor dim cannot be sharded three times), independence from the
+        # number of inputs, and the min-cost output placement for several input placement
+        # combinations.
         mesh = DeviceMesh("cpu", mesh=torch.arange(8).reshape(2, 2, 2))
 
         def _expand_cat(
             inputs: list[torch.Tensor], placements: list[tuple[Placement, ...]], dim=0
         ) -> OpStrategy:
+            # [FUNCTION DOC] HELPER: Expand the cat single-dim strategy on the enclosing mesh for
+            # tensors with given placements and cat dim, computing the output meta by summing sizes
+            # along dim. Asserts an OpStrategy and returns it.
+            # KNOWN ISSUE: the OpSchema is built with aten.mm.default instead of aten.cat.default
+            # as the op, which is harmless to the test but misleading.
             specs = (
                 DTensorSpec(mesh, placement, TensorMeta(t.shape, t.stride(), t.dtype))
                 for placement, t in zip(placements, inputs)
@@ -450,6 +489,10 @@ class TestExpandPlaceholder(TestCase):
         #     print(f"{i=}, cost={s.redistribute_cost}, {s}")
 
     def test_expand_matmul_like_strategy_to_3d_mesh(self):
+        # [FUNCTION DOC] Check that expanding the mm single-dim strategy on a 3D mesh gives 512 (8
+        # rules per dim cubed) strategies, all with tensor_meta filled on outputs and inputs, no
+        # remaining sharding placeholders, an all-Replicate strategy, and some strategy sharding
+        # the left input on dim 0.
         """Test expanding matmul-like single-dim strategies to a 3D mesh.
 
         This test verifies that:
@@ -568,6 +611,10 @@ class TestExpandPlaceholder(TestCase):
         )
 
     def test_fill_single_dim_strategy_placeholders(self):
+        # [FUNCTION DOC] Check _fill_single_dim_strategy_placeholders for mm rules: replicate-only
+        # inputs drop placeholder rules, Shard inputs fill Shard, _StridedShard inputs fill each
+        # split factor, and mixed inputs fill both kinds. Linearity rules without placeholders
+        # always pass through.
         """Test _fill_single_dim_strategy_placeholders with different input sharding types.
 
         This test validates that:
@@ -710,6 +757,8 @@ class TestExpandPlaceholder(TestCase):
         self.assertEqual(expanded_mixed, expected_mixed)
 
     def test_opschema_hash_includes_placements(self):
+        # [FUNCTION DOC] Check that OpSchema hashes are equal for identical placements and differ
+        # when the placements differ.
         """Test OpSchema hashing includes placements for LRU cache correctness."""
         mesh = DeviceMesh("cpu", mesh=torch.arange(8).reshape(2, 2, 2))
         meta = TensorMeta(torch.Size([8, 8]), (8, 1), torch.float32)
@@ -733,6 +782,8 @@ class TestExpandPlaceholder(TestCase):
         self.assertNotEqual(hash(schema1), hash(schema3))
 
     def test_get_unique_placements_includes_kwargs(self):
+        # [FUNCTION DOC] Regression test: _get_unique_placements on a mul.out schema must include
+        # placements from the out kwarg as well as the positional args.
         """Test that _get_unique_placements includes placements from kwargs (e.g., out tensor).
 
         This is a regression test for the fix where out-variant ops like torch.mul(..., out=...)
@@ -761,6 +812,8 @@ class TestExpandPlaceholder(TestCase):
         self.assertIn(Shard(1), unique_placements)
 
     def test_get_num_tensor_inputs_includes_kwargs(self):
+        # [FUNCTION DOC] Regression test: _get_num_tensor_inputs on a mul.out schema must count the
+        # tensor out kwarg, giving 3.
         """Test that _get_num_tensor_inputs counts tensor kwargs (e.g., out tensor).
 
         This is a regression test for the fix where out-variant ops like torch.mul(..., out=...)
@@ -785,6 +838,11 @@ class TestExpandPlaceholder(TestCase):
         self.assertEqual(num_inputs, 3)  # 2 args + 1 out kwarg
 
     def test_expand_strategy_handles_symbolic_shapes(self):
+        # [FUNCTION DOC] Check expand_to_full_mesh_op_strategy with an unhashable symbolic-shape
+        # output TensorMeta: it must not raise and returns an OpStrategy with at least one
+        # strategy.
+        # KNOWN ISSUE: docstring names _create_expanded_strategy but the test actually calls
+        # expand_to_full_mesh_op_strategy.
         """Test that _create_expanded_strategy handles symbolic shapes (SymInts).
         When using dynamic shapes with torch.compile, TensorMeta may contain SymInts
         which are not hashable. This test verifies that the caching logic gracefully
@@ -846,6 +904,9 @@ class TestExpandPlaceholder(TestCase):
         self.assertGreater(len(result.strategies), 0)
 
     def test_strategy_length_validation(self):
+        # [FUNCTION DOC] Check that _PreparedSingleDimStrategy raises an AssertionError for a rule
+        # missing the out kwarg placement (length 3 vs expected 4) and accepts a correct rule with
+        # num_outputs 1 and num_inputs 3.
         """Test that _PreparedSingleDimStrategy validates strategy length against
         the op schema. Strategies must include placements for all outputs, args,
         and tensor kwargs. A strategy missing the out kwarg placement should fail.
@@ -872,6 +933,8 @@ class TestExpandPlaceholder(TestCase):
         # Strategy missing the out kwarg placement: [output, arg1, arg2] = 3
         # but mul.out has 1 output + 3 inputs (2 args + 1 out kwarg) = 4 expected
         def bad_strategy(op, args, kwargs):
+            # [FUNCTION DOC] HELPER: Strategy function returning one rule that is too short (3
+            # placements) for mul.out.
             return [[Shard(0), Shard(0), Shard(0)]]
 
         with self.assertRaisesRegex(AssertionError, r"Strategy length 3 != expected 4"):
@@ -879,6 +942,8 @@ class TestExpandPlaceholder(TestCase):
 
         # Strategy with correct length: [output, arg1, arg2, out_kwarg] = 4
         def good_strategy(op, args, kwargs):
+            # [FUNCTION DOC] HELPER: Strategy function returning one correctly sized rule (4
+            # placements) for mul.out.
             return [[Shard(0), Shard(0), Shard(0), Shard(0)]]
 
         # Should not raise
@@ -887,6 +952,8 @@ class TestExpandPlaceholder(TestCase):
         self.assertEqual(prepared.num_inputs, 3)
 
     def test_out_variant_partial_propagation(self):
+        # [FUNCTION DOC] Check that for mul.out the rule with a Partial sum output also gives the
+        # out kwarg input spec Partial sum, not Replicate, in at least one expanded strategy.
         """Test that partial rules work correctly for .out variant ops.
 
         For mul.out with rule [P(sum), P(sum), R, P(sum)]
@@ -941,6 +1008,8 @@ class TestExpandPlaceholder(TestCase):
         )
 
     def test_expand_multi_output_strategy(self):
+        # [FUNCTION DOC] Check expansion for topk with two outputs: every resulting OpSpec has a
+        # tuple of 2 non-None DTensorSpec output specs and one input spec.
         """Test expanding single-dim strategies for multi-output ops.
 
         Uses aten.topk (2 tensor outputs, 1 tensor input) to verify that
@@ -974,6 +1043,8 @@ class TestExpandPlaceholder(TestCase):
 
         # 2 outputs + 1 input = 3 placements per strategy
         def mock_multi_output_strategy(op, args_schema, kwargs_schema):
+            # [FUNCTION DOC] HELPER: Strategy function returning a single two-output, one-input
+            # rule of Partial, Partial, Shard(0).
             return [
                 [Partial(), Partial(), Shard(0)],
             ]
@@ -1010,6 +1081,8 @@ class TestExpandPlaceholder(TestCase):
             self.assertEqual(len(op_spec.input_specs), 1, "Should have 1 input tensor")
 
     def test_sdpa_efficient_attention_preserves_none_scalar_outputs(self):
+        # [FUNCTION DOC] Check that expanding the efficient SDPA strategy on a 2x2 mesh keeps
+        # outputs 2 and 3 as None in every resulting strategy.
         mesh = DeviceMesh("cpu", mesh=torch.arange(4).reshape(2, 2))
 
         op = torch.ops.aten._scaled_dot_product_efficient_attention.default
@@ -1050,6 +1123,9 @@ class TestExpandPlaceholder(TestCase):
             self.assertEqual(output_specs[2:4], (None, None))
 
     def test_expand_rejects_mixed_none_output_placements(self):
+        # [FUNCTION DOC] Check that expand_to_full_mesh_op_strategy raises an AssertionError
+        # mentioning 'mixes None with placements' when one rule has None and another a placement at
+        # the same output position.
         mesh = DeviceMesh("cpu", mesh=torch.arange(4).reshape(2, 2))
         meta = TensorMeta(torch.Size([8, 8]), (8, 1), torch.float32)
         input_spec = DTensorSpec(
@@ -1076,6 +1152,9 @@ class TestExpandPlaceholder(TestCase):
             )
 
     def test_inplace_op_partial_input_raises_clear_error(self):
+        # [FUNCTION DOC] Check that expanding for the in-place op clamp_ with a Partial input and
+        # no valid rule raises a RuntimeError saying in-place ops requiring placement changes are
+        # unsupported.
         """Test that inplace ops with Partial input raise a clear error.
 
         When an inplace op (like clamp_) is called on a tensor with Partial placement,
@@ -1113,6 +1192,8 @@ class TestExpandPlaceholder(TestCase):
         # Define a single-dim strategy that only supports Replicate
         # (like clamp which doesn't preserve Partial)
         def mock_pointwise_strategy(op, args_schema, kwargs_schema):
+            # [FUNCTION DOC] HELPER: Strategy function returning no rules, so only the implicit
+            # replicate rule remains.
             # For a scalar (0-dim) tensor, there are no Shard strategies
             # Only the implicit Replicate strategy will be added
             return []
@@ -1136,6 +1217,8 @@ class TestExpandPlaceholder(TestCase):
             )
 
     def test_expand_filters_mixed_partial_types(self):
+        # [FUNCTION DOC] Check that expand_to_full_mesh_op_strategy on a 2D mesh drops outputs
+        # mixing Partial reduce ops (sum with max) while keeping all-sum and all-max outputs.
         """Test that expand_to_full_mesh_op_strategy filters out mixed partial types.
 
         When single-dim strategies are expanded to a multi-dimensional mesh, some
@@ -1213,6 +1296,8 @@ class TestExpandPlaceholder(TestCase):
         self.assertTrue(found_all_max, "Should include (P_max, P_max) strategy")
 
     def test_expand_filters_partial_subclass_with_same_reduce_op(self):
+        # [FUNCTION DOC] Check that Partial and _MaskPartial, both with reduce op sum, are never
+        # mixed in one expanded output placement.
         """Partial subclasses with the same reduce_op should still be treated as mixed."""
         mesh = DeviceMesh("cpu", mesh=torch.arange(4).reshape(2, 2))
         meta = TensorMeta(torch.Size([8, 8]), (8, 1), torch.float32)
@@ -1253,6 +1338,8 @@ class TestExpandPlaceholder(TestCase):
             )
 
     def test_expand_allows_sum_avg_partial_mix(self):
+        # [FUNCTION DOC] Check that expansion keeps outputs mixing Partial sum and Partial avg on a
+        # 2D mesh, as they commute.
         """Test that sum+avg partial mix is allowed since they commute."""
         mesh = DeviceMesh("cpu", mesh=torch.arange(4).reshape(2, 2))
         meta = TensorMeta(torch.Size([8, 8]), (8, 1), torch.float32)
@@ -1300,16 +1387,22 @@ class TestExpandPlaceholder(TestCase):
 
 
 class TestDijkstraExpandSingleDimStrategy(TestCase):
+    # [CLASS DOC] Tests that _dijkstra_expand_single_dim_strategy_to_mesh finds the same or lower
+    # cost strategy than full expansion for mm, falls back (None) for strided shards, tracks
+    # transitions, and reaches every valid strategy. Uses a fake 64-rank group.
     def setUp(self):
+        # [FUNCTION DOC] Initialize a fake process group with world size 64.
         super().setUp()
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=0, world_size=64, store=store)
 
     def tearDown(self):
+        # [FUNCTION DOC] Destroy the process group created in setUp.
         super().tearDown()
         dist.destroy_process_group()
 
     def _get_mm_output_meta(self, M=64, K=32, N=64):
+        # [FUNCTION DOC] HELPER: Return the float32 TensorMeta of an M by N mm output (K unused).
         return TensorMeta(
             shape=torch.Size([M, N]),
             stride=(N, 1),
@@ -1317,6 +1410,9 @@ class TestDijkstraExpandSingleDimStrategy(TestCase):
         )
 
     def _compare_pq_vs_full_expansion(self, mesh, left_placements, right_placements):
+        # [FUNCTION DOC] HELPER: For mm with given placements, run the Dijkstra expansion and the
+        # full expansion under the min-cost redistribution plan, assert the search yields one
+        # strategy and its total redistribution cost is not above the best full-expansion cost.
         """Run both PQ search and full expansion, verify same min cost."""
         M, K, N = 64, 32, 64
         left_meta, right_meta = _get_mm_metas(M, K, N)
@@ -1374,6 +1470,9 @@ class TestDijkstraExpandSingleDimStrategy(TestCase):
         )
 
     def test_dijkstra_expand_single_dim_strategy_to_mesh_basic(self):
+        # [FUNCTION DOC] Check the Dijkstra expansion on a 3D mesh when inputs already match a
+        # rule: a single strategy with unchanged placements and the output tensor_meta shape (64,
+        # 64).
         mesh = DeviceMesh("cpu", mesh=torch.arange(8).reshape(2, 2, 2))
         left_meta, right_meta = _get_mm_metas()
         output_meta = self._get_mm_output_meta()
@@ -1418,6 +1517,8 @@ class TestDijkstraExpandSingleDimStrategy(TestCase):
         self.assertEqual(output_spec.tensor_meta.shape, torch.Size([64, 64]))
 
     def test_dijkstra_expand_single_dim_strategy_to_mesh_hard(self):
+        # [FUNCTION DOC] Compare the search with full expansion on a 3D mesh for a harder placement
+        # pair.
         """Verify PQ search matches full expansion min cost on 3D mesh."""
         mesh = DeviceMesh("cpu", mesh=torch.arange(8).reshape(2, 2, 2))
         self._compare_pq_vs_full_expansion(
@@ -1427,6 +1528,8 @@ class TestDijkstraExpandSingleDimStrategy(TestCase):
         )
 
     def test_dijkstra_expand_single_dim_strategy_to_mesh_hard_4d(self):
+        # [FUNCTION DOC] Compare the search with full expansion on a 4D mesh for a harder placement
+        # pair.
         """Verify PQ search matches full expansion min cost on 4D mesh."""
         mesh = DeviceMesh("cpu", mesh=torch.arange(16).reshape(2, 2, 2, 2))
         self._compare_pq_vs_full_expansion(
@@ -1436,6 +1539,8 @@ class TestDijkstraExpandSingleDimStrategy(TestCase):
         )
 
     def test_pq_vs_full_expansion_data_driven(self):
+        # [FUNCTION DOC] Compare the search with full expansion for all Shard(0), Shard(1),
+        # Replicate and Partial sum placement combinations on 1D, 2D and 3D meshes, as subtests.
         """Data-driven comparison across mesh shapes, all placement types for mm.
 
         Enumerates all combos of R, S(0), S(1), P(sum) for each mesh dim on
@@ -1460,6 +1565,7 @@ class TestDijkstraExpandSingleDimStrategy(TestCase):
                         self._compare_pq_vs_full_expansion(mesh, left_pl, right_pl)
 
     def test_strided_shard_fallback(self):
+        # [FUNCTION DOC] Check the search returns None when an input has a _StridedShard placement.
         """Verify PQ search returns None for StridedShard inputs."""
         mesh = DeviceMesh("cpu", mesh=torch.arange(4).reshape(2, 2))
         left_meta, right_meta = _get_mm_metas()
@@ -1490,6 +1596,9 @@ class TestDijkstraExpandSingleDimStrategy(TestCase):
         self.assertIsNone(result)
 
     def test_if_elif_dead_end_fix(self):
+        # [FUNCTION DOC] Regression test: on a 2D mesh with left Shard(0),Replicate and right
+        # Replicate,Shard(0), the search finds the single allgather solution, with cost equal to
+        # the full expansion minimum.
         """Counterexample: state has R dims but chunking is useless, needs allgather.
 
         On a 2D mesh with strategies [R, S(0) -> S(0)] + [R, R -> R],
@@ -1555,6 +1664,8 @@ class TestDijkstraExpandSingleDimStrategy(TestCase):
         self.assertAlmostEqual(pq_cost, ref_min_cost, places=5)
 
     def test_transitions_tracked(self):
+        # [FUNCTION DOC] Check the returned strategy carries a list attribute _pq_transitions whose
+        # entries each have 4 elements.
         """Verify that PQ search tracks transitions for TransformInfo."""
         mesh = DeviceMesh("cpu", mesh=torch.arange(4).reshape(2, 2))
         left_meta, right_meta = _get_mm_metas()
@@ -1595,6 +1706,9 @@ class TestDijkstraExpandSingleDimStrategy(TestCase):
             self.assertEqual(len(t), 4)
 
     def test_pq_reachability_collect_all_2d(self):
+        # [FUNCTION DOC] Check on a 2D mesh that, for every starting placement pair, collecting all
+        # matches with the _collect_all_matches hook and uniting them covers every input placement
+        # combination from full expansion.
         """On a 2D mesh, verify PQ search can reach all valid strategies.
 
         For every starting placement combo, run _dijkstra_expand_single_dim_strategy_to_mesh with
@@ -1680,6 +1794,9 @@ class TestDijkstraExpandSingleDimStrategy(TestCase):
         )
 
     def test_single_dim_transition_reachability(self):
+        # [FUNCTION DOC] Check for each mm input and mesh dim that a graph built from
+        # replicate/shard/partial transition rules between placements seen in full expansion lets a
+        # breadth-first search from any placement reach all others.
         """Verify single-dim transition rules form a connected graph.
 
         For mm on a 2D mesh, collect all placements that appear per input
@@ -1729,6 +1846,7 @@ class TestDijkstraExpandSingleDimStrategy(TestCase):
 
                 # Build directed graph from transition rules
                 def is_sharding(p: Placement) -> bool:
+                    # [FUNCTION DOC] HELPER: Return whether the placement is a Shard.
                     return isinstance(p, Shard)
 
                 edges: dict[Placement, set[Placement]] = {
@@ -1772,6 +1890,9 @@ class TestDijkstraExpandSingleDimStrategy(TestCase):
                     )
 
     def test_pq_cost_not_underestimated(self):
+        # [FUNCTION DOC] Check for all 2D placement pairs that the per-input redistribution costs
+        # of the search result are not lower than redistribute_cost under the min-cost plan; clears
+        # the _gen_transform_infos cache first. Fails listing the underestimated cases.
         """Verify PQ per-input costs >= graph-based redistribute cost.
 
         The PQ computes costs per-dim independently. This test checks that
@@ -1842,6 +1963,9 @@ class TestDijkstraExpandSingleDimStrategy(TestCase):
         )
 
     def test_pq_selects_optimal_actual_cost_strategy(self):
+        # [FUNCTION DOC] Check for all 2D placement pairs that the search's strategy actual graph-
+        # based cost does not exceed the minimum from full expansion; clears the transform cache
+        # first. Fails listing the worse cases.
         """Verify PQ-selected strategy has graph-based cost <= full expansion min.
 
         Both the PQ and the reference use graph-based (min-cost) redistribution
@@ -1928,34 +2052,44 @@ class TestDijkstraExpandSingleDimStrategy(TestCase):
 
 @torch.library.custom_op("mylib::dummy_add", mutates_args=())
 def dummy_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Custom op mylib dummy_add: returns the elementwise sum of x and y.
     return x + y
 
 
 @dummy_add.register_fake
 def _dummy_add_fake(x, y):
+    # [FUNCTION DOC] HELPER: Fake implementation of dummy_add returning an empty tensor like x.
     return torch.empty_like(x)
 
 
 @torch.library.custom_op("mylib::dummy_check", mutates_args=())
 def dummy_check(x: torch.Tensor) -> None:
+    # [FUNCTION DOC] HELPER: Custom op mylib dummy_check with no outputs; does nothing.
     """A no-output op similar to _linalg_check_errors."""
 
 
 @dummy_check.register_fake
 def _dummy_check_fake(x):
+    # [FUNCTION DOC] HELPER: Fake implementation of dummy_check returning None.
     return None
 
 
 class TestCommonPointwiseSingleDimStrategy(TestCase):
+    # [CLASS DOC] Unit tests of the rules produced by _common_pointwise_single_dim_strategy for
+    # given input TensorMetas, without mesh expansion.
     """Unit tests for _common_pointwise_single_dim_strategy raw rule generation."""
 
     def _meta(self, *dims: int) -> TensorMeta:
+        # [FUNCTION DOC] HELPER: Return a float32 TensorMeta of the given dims with contiguous
+        # strides.
         shape = torch.Size(dims)
         stride = torch.empty(shape).stride()
         return TensorMeta(shape=shape, stride=stride, dtype=torch.float32)
 
     @staticmethod
     def _normalize(rules):
+        # [FUNCTION DOC] HELPER: Turn each rule into a tuple, replacing sharding placeholders with
+        # Shard of the same dim, so rules compare to expected values. Returns a list.
         """Convert rules to a comparable form (replace _ShardingPlaceholder with Shard)."""
         out = []
         for rule in rules:
@@ -1968,6 +2102,8 @@ class TestCommonPointwiseSingleDimStrategy(TestCase):
         return out
 
     def test_unary_2d_shard_rules(self):
+        # [FUNCTION DOC] Check abs on a 4 by 8 tensor yields exactly the two rules sharding dim 0
+        # and dim 1.
         """Unary op with a 2D tensor should produce two Shard rules."""
         fn = _common_pointwise_single_dim_strategy()
         rules = self._normalize(fn(torch.ops.aten.abs.default, (self._meta(4, 8),), {}))
@@ -1977,6 +2113,8 @@ class TestCommonPointwiseSingleDimStrategy(TestCase):
         )
 
     def test_unary_with_partial_extra_rules(self):
+        # [FUNCTION DOC] Check neg with the unary linear rules appends Partial sum and Partial avg
+        # rules after the shard rules.
         """Unary op with _UNARY_LINEAR_RULES should append partial rules."""
         fn = _common_pointwise_single_dim_strategy(
             partial_extra_rules=_UNARY_LINEAR_RULES
@@ -1991,6 +2129,8 @@ class TestCommonPointwiseSingleDimStrategy(TestCase):
         self.assertEqual(rules, expected)
 
     def test_binary_broadcast_replicate(self):
+        # [FUNCTION DOC] Check add of (4,8) with (8,) gives a Replicate for the second arg when dim
+        # 0 is broadcast, and shard dim 0 of the second arg for dim 1.
         """When one input is broadcast, the broadcast dim gets Replicate."""
         fn = _common_pointwise_single_dim_strategy()
         # (4, 8) + (8,) — dim 0 is broadcast for the second arg
@@ -2003,6 +2143,8 @@ class TestCommonPointwiseSingleDimStrategy(TestCase):
         )
 
     def test_partial_extra_rules_filtered_by_arity(self):
+        # [FUNCTION DOC] Check mul with a tensor and a scalar keeps only extra rules of length 2
+        # (unary linear) and drops the length 3 mul rules.
         """Binary extra rules are filtered out when only one tensor arg is present."""
         fn = _common_pointwise_single_dim_strategy(
             partial_extra_rules=_MUL_RULES + _UNARY_LINEAR_RULES
@@ -2021,6 +2163,9 @@ class TestCommonPointwiseSingleDimStrategy(TestCase):
         self.assertEqual(rules, expected)
 
     def test_binary_with_additive_rules(self):
+        # [FUNCTION DOC] Check add on two same-shape tensors with the binary additive rules gives
+        # two shard rules followed by the sum, avg, avg-with-replicate, max, min and avg rules in
+        # the expected order.
         """Binary op with _BINARY_ADDITIVE_RULES appends the right partial rules."""
         fn = _common_pointwise_single_dim_strategy(
             partial_extra_rules=_BINARY_ADDITIVE_RULES
@@ -2042,7 +2187,10 @@ class TestCommonPointwiseSingleDimStrategy(TestCase):
 
 
 class TestSingleDimStrategyRegistration(TestCase):
+    # [CLASS DOC] Tests registering single-dim strategies via register_single_dim_strategy for
+    # custom ops, run with a 4-rank fake process group and a patched empty strategy registry.
     def setUp(self):
+        # [FUNCTION DOC] Initialize a fake process group of world size 4 and record world_size.
         super().setUp()
         self.world_size = 4
         store = FakeStore()
@@ -2051,6 +2199,7 @@ class TestSingleDimStrategyRegistration(TestCase):
         )
 
     def tearDown(self):
+        # [FUNCTION DOC] Destroy the process group created in setUp.
         super().tearDown()
         torch.distributed.destroy_process_group()
 
@@ -2059,6 +2208,9 @@ class TestSingleDimStrategyRegistration(TestCase):
         {},
     )
     def test_register_single_dim_strategy(self):
+        # [FUNCTION DOC] Check that dummy_add on DTensors raises NotImplementedError before
+        # registration, then registering an empty rule list adds it to the (patched) registry and
+        # the op runs.
         mesh = DeviceMesh("cpu", torch.arange(self.world_size))
         x = torch.randn(8, 16)
         y = torch.randn(8, 16)
@@ -2074,6 +2226,8 @@ class TestSingleDimStrategyRegistration(TestCase):
 
         @register_single_dim_strategy(torch.ops.mylib.dummy_add.default)
         def dummy_add_single_dim_strategy(op, args_schema, kwargs_schema):
+            # [FUNCTION DOC] HELPER: Registered strategy for dummy_add returning no rules (implicit
+            # replication only).
             # implicit replication only, is valid
             return []
 
@@ -2091,6 +2245,8 @@ class TestSingleDimStrategyRegistration(TestCase):
         {},
     )
     def test_register_single_dim_strategy_no_output(self):
+        # [FUNCTION DOC] Check that a registered empty-rule strategy lets a no-output op
+        # (dummy_check) run on a DTensor and return None.
         """Test that single-dim strategy works for ops with no tensor output.
 
         This tests the fix for operators like _linalg_check_errors that return None.
@@ -2104,6 +2260,7 @@ class TestSingleDimStrategyRegistration(TestCase):
         # Register a single-dim strategy for the no-output op
         @register_single_dim_strategy(torch.ops.mylib.dummy_check.default)
         def dummy_check_single_dim_strategy(op, args_schema, kwargs_schema):
+            # [FUNCTION DOC] HELPER: Registered strategy for dummy_check returning no rules.
             # For no-output ops, return empty list (replicate-only)
             return []
 
