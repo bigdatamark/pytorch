@@ -1,3 +1,5 @@
+# [PACKAGE DOC] Test package marker for the elastic timer tests; it contains only a license
+# header and defines nothing.
 # Copyright (c) Facebook, Inc. and its affiliates.
 # All rights reserved.
 #

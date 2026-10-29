@@ -1,3 +1,6 @@
+# [MODULE DOC] Test that out-of-tree rendezvous handlers are discovered. It relies on the sample
+# package under out_of_tree_test_package/src, which is put on sys.path temporarily. Defines
+# constants for the expected backend name and the package path suffix.
 # Owner(s): ["oncall: r2p"]
 
 # Copyright (c) Facebook, Inc. and its affiliates.
@@ -17,7 +20,15 @@ TEST_PACKAGE_PATH = "/out_of_tree_test_package/src"
 
 
 class OutOfTreeRendezvousTest(unittest.TestCase):
+    # [CLASS DOC] Holds a single test of the out-of-tree handler registration mechanism.
     def test_out_of_tree_handler_loading(self):
+        # [FUNCTION DOC] Calls the private registration function and checks the testbackend name
+        # is not in the handler registry. Then appends the test package directory to sys.path,
+        # calls registration again and checks the backend is now registered, and finally removes
+        # the path entry again. Mutates sys.path and the global registry (the registration is
+        # not undone).
+        # KNOWN ISSUE: the path removal is not in a finally block, so a failed assertion leaves
+        # sys.path modified.
         current_path = str(pathlib.Path(__file__).parent.resolve())
         rdvz._register_out_of_tree_handlers()
         registry_dict = rdvz.rendezvous_handler_registry._registry

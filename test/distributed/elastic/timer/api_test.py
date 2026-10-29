@@ -1,3 +1,6 @@
+# [MODULE DOC] Tests for the TimerServer watchdog in torch.distributed.elastic.timer.api, using
+# a mock request queue and a mock timer server whose reaping outcomes differ per worker. No
+# import-time side effects.
 # Owner(s): ["oncall: r2p"]
 
 # Copyright (c) Facebook, Inc. and its affiliates.
@@ -13,14 +16,23 @@ from torch.distributed.elastic.timer.api import RequestQueue, TimerRequest
 
 
 class MockRequestQueue(RequestQueue):
+    # [CLASS DOC] HELPER: Fake RequestQueue reporting size 2 and always returning two timer
+    # requests for workers 1 and 2 (get ignores its arguments).
     def size(self):
+        # [FUNCTION DOC] HELPER: Returns the fixed queue size of 2.
         return 2
 
     def get(self, size, timeout):
+        # [FUNCTION DOC] HELPER: Returns two TimerRequest objects (workers 1 and 2) regardless
+        # of the requested size and timeout.
         return [TimerRequest(1, "test_1", 0), TimerRequest(2, "test_2", 0)]
 
 
 class MockTimerServer(TimerServer):
+    # [CLASS DOC] HELPER: Concrete TimerServer for tests. It reports three workers each with two
+    # expired timers, and its _reap_worker raises RuntimeError for worker 1, returns True
+    # (reaped) for worker 2 and False (not reaped) for worker 3. Registering and clearing timers
+    # do nothing and are meant to be patched.
     """
      Mock implementation of TimerServer for testing purposes.
      This mock has the following behavior:
@@ -33,21 +45,29 @@ class MockTimerServer(TimerServer):
     """
 
     def __init__(self, request_queue, max_interval):
+        # [FUNCTION DOC] HELPER: Forwards the request queue and max interval to the
+        # TimerServer constructor.
         super().__init__(request_queue, max_interval)
 
     def register_timers(self, timer_requests):
+        # [FUNCTION DOC] HELPER: No-op replacement for registering timer requests.
         pass
 
     def clear_timers(self, worker_ids):
+        # [FUNCTION DOC] HELPER: No-op replacement for clearing timers of reaped workers.
         pass
 
     def get_expired_timers(self, deadline):
+        # [FUNCTION DOC] HELPER: Returns a mapping from worker ids 1 to 3 to a list of two
+        # expired TimerRequest objects each, ignoring the deadline.
         return {
             i: [TimerRequest(i, f"test_{i}_0", 0), TimerRequest(i, f"test_{i}_1", 0)]
             for i in range(1, 4)
         }
 
     def _reap_worker(self, worker_id):
+        # [FUNCTION DOC] HELPER: Simulated reaping outcome by worker id: raises RuntimeError for
+        # 1, returns True for 2, returns False for 3 (implicitly None for any other id).
         if worker_id == 1:
             raise RuntimeError("test error")
         elif worker_id == 2:
@@ -57,9 +77,15 @@ class MockTimerServer(TimerServer):
 
 
 class TimerApiTest(unittest.TestCase):
+    # [CLASS DOC] Contains the watchdog test with MockTimerServer.
     @mock.patch.object(MockTimerServer, "register_timers")
     @mock.patch.object(MockTimerServer, "clear_timers")
     def test_run_watchdog(self, mock_clear_timers, mock_register_timers):
+        # [FUNCTION DOC] Runs one watchdog pass with the register and clear methods patched.
+        # Checks the queue size is read once, the queue is read with that size and the max
+        # interval, timers from the queue are registered, and clear_timers receives only workers
+        # 1 and 2: worker 1 is cleared even though reaping raised, worker 2 as it was reaped,
+        # and worker 3 (reap returned False) is not.
         """
         tests that when a ``_reap_worker()`` method throws an exception
         for a particular worker_id, the timers for successfully reaped workers

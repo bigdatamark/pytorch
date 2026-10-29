@@ -1,3 +1,7 @@
+# [MODULE DOC] Tests for the EtcdServer helper that launches a local etcd process: start and
+# stop behavior, host, port and endpoint accessors, and a full single-node rendezvous through
+# the server. Import-time side effect: if the CIRCLECI environment variable is set, prints a
+# notice to stderr and exits the process with status 0, skipping all tests.
 # Owner(s): ["oncall: r2p"]
 
 # Copyright (c) Facebook, Inc. and its affiliates.
@@ -20,7 +24,12 @@ if os.getenv("CIRCLECI"):
 
 
 class EtcdServerTest(unittest.TestCase):
+    # [CLASS DOC] Tests that start their own EtcdServer instances (no shared fixture) and always
+    # stop them in a finally block.
     def test_etcd_server_start_stop(self):
+        # [FUNCTION DOC] Starts a server and checks the port is positive, the host is localhost,
+        # the endpoint is host and port joined by a colon, and the client exposes a version.
+        # Stops the server afterward even on failure.
         server = EtcdServer()
         server.start()
 
@@ -36,6 +45,9 @@ class EtcdServerTest(unittest.TestCase):
             server.stop()
 
     def test_etcd_server_with_rendezvous(self):
+        # [FUNCTION DOC] Starts a server and builds an etcd rendezvous handler with min and max
+        # nodes of 1 for it (local address 127.0.0.1), calls next_rendezvous, and expects a
+        # store, rank 0 and world size 1. Stops the server afterward.
         server = EtcdServer()
         server.start()
 
