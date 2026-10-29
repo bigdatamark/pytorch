@@ -1,5 +1,13 @@
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC] Multi-process GPU tests comparing a ShardedTensor-sharded EmbeddingBag weight
+# against an identical unsharded EmbeddingBag, for both the module and the functional API.
+# Contains one test class covering column-wise and row-wise chunk sharding across many
+# configurations (sum/mean/max modes, 1D offsets and 2D inputs, max_norm, padding_idx,
+# include_last_offset). Import-time side effects: computes the module-level device_type and
+# backend from the current accelerator (cpu fallback), and exits the process with status 0
+# if the dev-asan flag is set.
+
 import sys
 
 import torch
@@ -36,6 +44,9 @@ if TEST_WITH_DEV_DBG_ASAN:
 
 
 class TestShardedEmbeddingBag(ShardedTensorTestBase):
+    # [CLASS DOC] Distributed test case (one process per rank) checking that sharded
+    # embedding-bag forward results and renormalized weight shards match the local
+    # reference. Has a shared runner helper plus colwise and rowwise entry tests.
     def _run_sharded_embedding_bag(
         self,
         spec,
@@ -49,6 +60,14 @@ class TestShardedEmbeddingBag(ShardedTensorTestBase):
         norm_type=2.0,
         padding_idx=None,
     ):
+        # [FUNCTION DOC] HELPER: Builds a local EmbeddingBag (seeded) on this rank's device and a
+        # second one whose weight is a clone of it, then shards that weight with the given spec.
+        # Inputs are random indices (seeded by rank, so they differ per rank); per-sample weights
+        # are used only in sum mode; for 1D input a sorted unique offsets vector of exactly
+        # offset_size entries is resampled until it fits. With max_norm, all ranks' inputs are
+        # gathered and run through the local module so renorm matches, then the local weight
+        # slice is compared to the local shard. Asserts module outputs and functional
+        # embedding_bag outputs are equal. Raises AssertionError on mismatch.
         # Use same seed.
         torch.manual_seed(0)
         local_embedding_bag = torch.nn.EmbeddingBag(
@@ -168,6 +187,9 @@ class TestShardedEmbeddingBag(ShardedTensorTestBase):
     @skip_if_lt_x_gpu(TEST_GPU_NUM)
     @requires_accelerator_dist_backend(["nccl", "xccl"])
     def test_sharded_embedding_bag_colwise(self):
+        # [FUNCTION DOC] Runs the full embedding-bag case list for every generated chunk
+        # sharding spec that shards the embedding dimension (dim 1). Needs enough GPUs and an
+        # nccl or xccl backend, else it is skipped.
         for spec in generate_chunk_sharding_specs_for_test(1):
             self._test_sharded_embedding_bag_with_test_cases(spec, 1)
 
@@ -175,10 +197,16 @@ class TestShardedEmbeddingBag(ShardedTensorTestBase):
     @skip_if_lt_x_gpu(TEST_GPU_NUM)
     @requires_accelerator_dist_backend(["nccl", "xccl"])
     def test_sharded_embedding_bag_rowwise(self):
+        # [FUNCTION DOC] Same as the colwise test but with specs sharding the row dimension
+        # (dim 0, the number of embeddings). Skipped without enough GPUs or nccl/xccl.
         for spec in generate_chunk_sharding_specs_for_test(0):
             self._test_sharded_embedding_bag_with_test_cases(spec, 0)
 
     def _test_sharded_embedding_bag_with_test_cases(self, spec, sharded_dim):
+        # [FUNCTION DOC] HELPER: Invokes the runner helper over a fixed list of configurations:
+        # 2D inputs in sum/mean/max modes, with and without max_norm and padding_idx, and 1D
+        # inputs with offsets (optionally include_last_offset, max_norm, padding_idx). The
+        # sharded_dim argument is accepted but not used.
         self._run_sharded_embedding_bag(spec, [5, 5], 17, 14, "sum")
         self._run_sharded_embedding_bag(spec, [5, 4], 17, 12, "mean")
         self._run_sharded_embedding_bag(spec, [6, 7], 21, 11, "max")

@@ -1,5 +1,11 @@
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC] Multi-process GPU tests that torch.nn.init functions (uniform_, normal_,
+# kaiming_uniform_) work on a ShardedTensor, giving the same values in each rank's local shard
+# as applying the init to a clone of that shard under the same seed. Import-time side effects:
+# computes module-level device_type and backend from the current accelerator, and exits the
+# process with status 0 if the dev-asan flag is set.
+
 import sys
 
 import torch
@@ -30,12 +36,17 @@ if TEST_WITH_DEV_DBG_ASAN:
 
 
 class TestShardedTensorNNInit(ShardedTensorTestBase):
+    # [CLASS DOC] Distributed test case with one test per torch.nn.init function; each uses a
+    # 4-way row-chunk sharded double tensor of shape 8 by 2 so every rank holds one shard.
     """Testing torch.nn.init functions for ShardedTensor"""
 
     @with_comms(backend=backend)
     @skip_if_lt_x_gpu(4)
     @requires_accelerator_dist_backend(["nccl", "xccl"])
     def test_init_sharded_tensor_with_uniform(self):
+        # [FUNCTION DOC] Creates an empty sharded tensor, seeds the RNG and applies uniform_
+        # with bounds 10 and 20, then seeds again and applies it to a clone of the local shard;
+        # asserts the two local results are equal. Needs 4 GPUs and nccl/xccl.
         """Test torch.nn.init.uniform_(ShardedTensor, a, b)"""
 
         spec = ChunkShardingSpec(
@@ -69,6 +80,8 @@ class TestShardedTensorNNInit(ShardedTensorTestBase):
     @skip_if_lt_x_gpu(4)
     @requires_accelerator_dist_backend(["nccl", "xccl"])
     def test_init_sharded_tensor_with_normal(self):
+        # [FUNCTION DOC] Same pattern as the uniform test using normal_ with mean 10 and
+        # standard deviation 5; asserts the sharded result equals the clone's result.
         """Test torch.nn.init.normal_(ShardedTensor, mean, std)"""
 
         spec = ChunkShardingSpec(
@@ -102,6 +115,8 @@ class TestShardedTensorNNInit(ShardedTensorTestBase):
     @skip_if_lt_x_gpu(4)
     @requires_accelerator_dist_backend(["nccl", "xccl"])
     def test_init_sharded_tensor_with_kaiming_uniform(self):
+        # [FUNCTION DOC] Same pattern using kaiming_uniform_ (a of 0, fan_in mode, leaky_relu
+        # nonlinearity); asserts the sharded result equals the clone's result.
         """Test torch.nn.init.kaiming_uniform_(ShardedTensor, a, mode, nonlinearit)"""
 
         spec = ChunkShardingSpec(

@@ -1,5 +1,10 @@
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC] Multi-process GPU tests of basic tensor operations on ShardedTensor: deepcopy,
+# in-place copy_, clone, detach and requires_grad_. All use a 4-way row-chunk sharding of a
+# 12 by 5 tensor. Import-time side effect: computes module-level device_type and backend from
+# the current accelerator (cpu fallback).
+
 import copy
 
 import torch
@@ -24,10 +29,14 @@ backend = torch.distributed.get_default_backend_for_device(device_type)
 
 
 class TestTensorOps(ShardedTensorTestBase):
+    # [CLASS DOC] Distributed test case with one test per ShardedTensor basic operation; each
+    # needs enough GPUs and an nccl or xccl backend, with RPC not initialized.
     @with_comms(init_rpc=False, backend=backend)
     @skip_if_lt_x_gpu(TEST_GPU_NUM)
     @requires_accelerator_dist_backend(["nccl", "xccl"])
     def test_deep_copy(self):
+        # [FUNCTION DOC] Deep-copies a random sharded tensor; asserts the copy has the same
+        # type, equal local tensor contents, and is a different object.
         spec = ChunkShardingSpec(
             dim=0,
             placements=[
@@ -47,6 +56,9 @@ class TestTensorOps(ShardedTensorTestBase):
     @skip_if_lt_x_gpu(TEST_GPU_NUM)
     @requires_accelerator_dist_backend(["nccl", "xccl"])
     def test_inplace_copy(self):
+        # [FUNCTION DOC] Copies an all-ones sharded tensor into a random one and checks they
+        # become equal. Then, under no-grad, copies into a sharded tensor that requires grad
+        # (source does not) and checks the local tensors match.
         spec = ChunkShardingSpec(
             dim=0,
             placements=[
@@ -74,6 +86,8 @@ class TestTensorOps(ShardedTensorTestBase):
     @skip_if_lt_x_gpu(TEST_GPU_NUM)
     @requires_accelerator_dist_backend(["nccl", "xccl"])
     def test_clone(self):
+        # [FUNCTION DOC] Clones a random sharded tensor; asserts same type, equal local
+        # tensor contents, and a distinct object.
         spec = ChunkShardingSpec(
             dim=0,
             placements=[
@@ -93,6 +107,8 @@ class TestTensorOps(ShardedTensorTestBase):
     @skip_if_lt_x_gpu(TEST_GPU_NUM)
     @requires_accelerator_dist_backend(["nccl", "xccl"])
     def test_detach(self):
+        # [FUNCTION DOC] Creates a sharded tensor requiring grad, checks its local shards
+        # require grad, then detaches and asserts the result and all its local shards do not.
         spec = ChunkShardingSpec(
             dim=0,
             placements=[
@@ -118,6 +134,9 @@ class TestTensorOps(ShardedTensorTestBase):
     @skip_if_lt_x_gpu(TEST_GPU_NUM)
     @requires_accelerator_dist_backend(["nccl", "xccl"])
     def test_set_requires_grad(self):
+        # [FUNCTION DOC] Checks local shards start without grad, calls requires_grad_ on the
+        # sharded tensor, then asserts the tensor and the previously fetched local shards
+        # all require grad (the change propagates to shards in place).
         spec = ChunkShardingSpec(
             dim=0,
             placements=[
