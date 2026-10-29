@@ -4,6 +4,12 @@
 # ruff: noqa
 # flake8: noqa
 
+# [MODULE DOC] Tests for the bool type's PEP 285 properties, copied from CPython 3.13
+# Lib/test/test_bool.py and run under CPythonTestCase. Contains a single BoolTest class
+# covering repr/str, numeric and bitwise behavior, conversion rules, builtin predicates
+# returning bool, pickling/marshalling and __bool__ edge cases. Runs the tests via
+# run_tests when executed as a script; no import-time side effects beyond imports.
+
 # Test copied from
 # https://raw.githubusercontent.com/python/cpython/refs/tags/v3.13.5/Lib/test/test_bool.py
 
@@ -24,10 +30,16 @@ from test.support import os_helper
 import os
 
 class BoolTest(CPythonTestCase):
+    # [CLASS DOC] Test case verifying that bool is a non-subclassable int subtype with
+    # singleton True/False, that arithmetic on bools yields ints while bitwise ops between
+    # bools yield bools, and that bool conversion and related protocols behave as specified.
 
     def test_subclass(self):
+        # [FUNCTION DOC] Checks that subclassing bool raises TypeError
+        # and that creating a bool through int.__new__ raises TypeError.
         try:
             class C(bool):
+                # [CLASS DOC] HELPER: Attempted subclass of bool; creating it must raise TypeError.
                 pass
         except TypeError:
             pass
@@ -37,34 +49,45 @@ class BoolTest(CPythonTestCase):
         self.assertRaises(TypeError, int.__new__, bool, 0)
 
     def test_repr(self):
+        # [FUNCTION DOC] Checks repr of False and True and that
+        # evaluating the repr returns the same singletons.
         self.assertEqual(repr(False), 'False')
         self.assertEqual(repr(True), 'True')
         self.assertIs(eval(repr(False)), False)
         self.assertIs(eval(repr(True)), True)
 
     def test_str(self):
+        # [FUNCTION DOC] Checks str of False and True.
         self.assertEqual(str(False), 'False')
         self.assertEqual(str(True), 'True')
 
     def test_int(self):
+        # [FUNCTION DOC] Checks int conversion values (0, 1)
+        # and that the result is a plain int, not a bool.
         self.assertEqual(int(False), 0)
         self.assertIsNot(int(False), False)
         self.assertEqual(int(True), 1)
         self.assertIsNot(int(True), True)
 
     def test_float(self):
+        # [FUNCTION DOC] Checks float conversion values and that the result is not a bool.
         self.assertEqual(float(False), 0.0)
         self.assertIsNot(float(False), False)
         self.assertEqual(float(True), 1.0)
         self.assertIsNot(float(True), True)
 
     def test_complex(self):
+        # [FUNCTION DOC] Checks complex conversion values and equality with the bool values.
         self.assertEqual(complex(False), 0j)
         self.assertEqual(complex(False), False)
         self.assertEqual(complex(True), 1+0j)
         self.assertEqual(complex(True), True)
 
     def test_math(self):
+        # [FUNCTION DOC] Checks unary and binary arithmetic with bools (results are ints, not
+        # bools), DeprecationWarning for bitwise invert (both runtime and constant-folded
+        # forms), power, and the type of results of bitwise and/or/xor between bools versus
+        # with ints, plus comparison, identity, membership and not results being real bools.
         self.assertEqual(+False, 0)
         self.assertIsNot(+False, False)
         self.assertEqual(-False, 0)
@@ -188,6 +211,8 @@ class BoolTest(CPythonTestCase):
         self.assertIs(not False, True)
 
     def test_convert(self):
+        # [FUNCTION DOC] Checks bool() conversion of various values,
+        # TypeError for too many arguments, and False for no argument.
         self.assertRaises(TypeError, bool, 42, 42)
         self.assertIs(bool(10), True)
         self.assertIs(bool(1), True)
@@ -198,24 +223,31 @@ class BoolTest(CPythonTestCase):
         self.assertIs(bool(), False)
 
     def test_keyword_args(self):
+        # [FUNCTION DOC] Checks that passing a keyword argument
+        # to bool raises TypeError mentioning keyword argument.
         with self.assertRaisesRegex(TypeError, 'keyword argument'):
             bool(x=10)
 
     def test_format(self):
+        # [FUNCTION DOC] Checks that percent formatting with
+        # decimal and hex codes renders bools as 0 and 1.
         self.assertEqual("%d" % False, "0")
         self.assertEqual("%d" % True, "1")
         self.assertEqual("%x" % False, "0")
         self.assertEqual("%x" % True, "1")
 
     def test_hasattr(self):
+        # [FUNCTION DOC] Checks that hasattr returns real bools.
         self.assertIs(hasattr([], "append"), True)
         self.assertIs(hasattr([], "wobble"), False)
 
     def test_callable(self):
+        # [FUNCTION DOC] Checks that callable returns real bools.
         self.assertIs(callable(len), True)
         self.assertIs(callable(1), False)
 
     def test_isinstance(self):
+        # [FUNCTION DOC] Checks isinstance results for bools and ints against bool and int.
         self.assertIs(isinstance(True, bool), True)
         self.assertIs(isinstance(False, bool), True)
         self.assertIs(isinstance(True, int), True)
@@ -224,14 +256,17 @@ class BoolTest(CPythonTestCase):
         self.assertIs(isinstance(0, bool), False)
 
     def test_issubclass(self):
+        # [FUNCTION DOC] Checks issubclass results for bool and int.
         self.assertIs(issubclass(bool, int), True)
         self.assertIs(issubclass(int, bool), False)
 
     def test_contains(self):
+        # [FUNCTION DOC] Checks that the in operator on dicts returns real bools.
         self.assertIs(1 in {}, False)
         self.assertIs(1 in {1:1}, True)
 
     def test_string(self):
+        # [FUNCTION DOC] Checks that str predicate and prefix/suffix methods return real bools.
         self.assertIs("xyz".endswith("z"), True)
         self.assertIs("xyz".endswith("x"), False)
         self.assertIs("xyz0123".isalnum(), True)
@@ -258,6 +293,8 @@ class BoolTest(CPythonTestCase):
         self.assertIs("xyz".startswith("z"), False)
 
     def test_boolean(self):
+        # [FUNCTION DOC] Checks that bitwise and/or/xor of a bool
+        # with an int give ints while with two bools give bools.
         self.assertEqual(True & 1, 1)
         self.assertNotIsInstance(True & 1, bool)
         self.assertIs(True & True, True)
@@ -272,6 +309,10 @@ class BoolTest(CPythonTestCase):
 
     @torch._dynamo.error_on_graph_break(False)
     def test_fileclosed(self):
+        # [FUNCTION DOC] Creates and removes a scratch file named by os_helper.TESTFN, checking
+        # that the file object's closed attribute is False inside the with block and True after
+        # it. Side effects: writes and deletes a file; graph-break errors are disabled for this
+        # test.
         try:
             with open(os_helper.TESTFN, "w", encoding="utf-8") as f:
                 self.assertIs(f.closed, False)
@@ -280,12 +321,15 @@ class BoolTest(CPythonTestCase):
             os.remove(os_helper.TESTFN)
 
     def test_types(self):
+        # [FUNCTION DOC] Checks that built-in types are truthy.
         # types are always true.
         for t in [bool, complex, dict, float, int, list, object,
                   set, str, tuple, type]:
             self.assertIs(bool(t), True)
 
     def test_operator(self):
+        # [FUNCTION DOC] Checks that operator-module predicates
+        # (truth, not_, contains, lt, is_, is_not) return real bools.
         import operator
         self.assertIs(operator.truth(0), False)
         self.assertIs(operator.truth(1), True)
@@ -301,17 +345,22 @@ class BoolTest(CPythonTestCase):
         self.assertIs(operator.is_not(True, False), True)
 
     def test_marshal(self):
+        # [FUNCTION DOC] Checks that marshal round-trips True and False to the same singletons.
         import marshal
         self.assertIs(marshal.loads(marshal.dumps(True)), True)
         self.assertIs(marshal.loads(marshal.dumps(False)), False)
 
     def test_pickle(self):
+        # [FUNCTION DOC] Checks that pickle round-trips True
+        # and False to the same singletons for every protocol.
         import pickle
         for proto in range(pickle.HIGHEST_PROTOCOL + 1):
             self.assertIs(pickle.loads(pickle.dumps(True, proto)), True)
             self.assertIs(pickle.loads(pickle.dumps(False, proto)), False)
 
     def test_picklevalues(self):
+        # [FUNCTION DOC] Checks the exact pickle byte strings
+        # for True and False under protocols 0, 1 and 2.
         # Test for specific backwards-compatible pickle values
         import pickle
         self.assertEqual(pickle.dumps(True, protocol=0), b"I01\n.")
@@ -322,43 +371,63 @@ class BoolTest(CPythonTestCase):
         self.assertEqual(pickle.dumps(False, protocol=2), b'\x80\x02\x89.')
 
     def test_convert_to_bool(self):
+        # [FUNCTION DOC] Checks that bool raises TypeError when __bool__
+        # returns a non-bool (self, a string, or an int, even for int
+        # subclasses) and ValueError when __len__ returns a negative number.
         # Verify that TypeError occurs when bad things are returned
         # from __bool__().  This isn't really a bool test, but
         # it's related.
         check = lambda o: self.assertRaises(TypeError, bool, o)
         class Foo(object):
+            # [CLASS DOC] HELPER: Class whose __bool__ returns the instance itself.
             def __bool__(self):
+                # [FUNCTION DOC] HELPER: Returns self (invalid result).
                 return self
         check(Foo())
 
         class Bar(object):
+            # [CLASS DOC] HELPER: Class whose __bool__ returns a string.
             def __bool__(self):
+                # [FUNCTION DOC] HELPER: Returns the string "Yes" (invalid result).
                 return "Yes"
         check(Bar())
 
         class Baz(int):
+            # [CLASS DOC] HELPER: int subclass whose __bool__ returns itself.
             def __bool__(self):
+                # [FUNCTION DOC] HELPER: Returns self (invalid result).
                 return self
         check(Baz())
 
         # __bool__() must return a bool not an int
         class Spam(int):
+            # [CLASS DOC] HELPER: int subclass whose __bool__ returns the integer 1.
             def __bool__(self):
+                # [FUNCTION DOC] HELPER: Returns the integer 1 (invalid; a real bool is required).
                 return 1
         check(Spam())
 
         class Eggs:
+            # [CLASS DOC] HELPER: Class whose __len__ returns -1.
             def __len__(self):
+                # [FUNCTION DOC] HELPER: Returns -1.
                 return -1
         self.assertRaises(ValueError, bool, Eggs())
 
     def test_interpreter_convert_to_bool_raises(self):
+        # [FUNCTION DOC] Checks that an exception raised by __bool__ while
+        # evaluating a comparison result in a conditional propagates as
+        # TypeError (regression test for negative refcounts).
         class SymbolicBool:
+            # [CLASS DOC] HELPER: Result type whose __bool__ raises TypeError.
             def __bool__(self):
+                # [FUNCTION DOC] HELPER: Always raises TypeError.
                 raise TypeError
 
         class Symbol:
+            # [CLASS DOC] HELPER: Type whose greater-than comparison returns a SymbolicBool.
             def __gt__(self, other):
+                # [FUNCTION DOC] HELPER: Returns a new SymbolicBool.
                 return SymbolicBool()
 
         x = Symbol()
@@ -373,15 +442,21 @@ class BoolTest(CPythonTestCase):
         del x
 
     def test_from_bytes(self):
+        # [FUNCTION DOC] Checks bool.from_bytes for
+        # all-zero bytes (False) and nonzero bytes (True).
         self.assertIs(bool.from_bytes(b'\x00'*8, 'big'), False)
         self.assertIs(bool.from_bytes(b'abcd', 'little'), True)
 
     def test_sane_len(self):
+        # [FUNCTION DOC] Checks that, for an invalid length result,
+        # the error raised by bool matches the one raised by len.
         # this test just tests our assumptions about __len__
         # this will start failing if __len__ changes assertions
         for badval in ['illegal', -1, 1 << 32]:
             class A:
+                # [CLASS DOC] HELPER: Class whose __len__ returns the loop's invalid value.
                 def __len__(self):
+                    # [FUNCTION DOC] HELPER: Returns the enclosing loop variable badval.
                     return badval
             try:
                 bool(A())
@@ -392,17 +467,24 @@ class BoolTest(CPythonTestCase):
                     self.assertEqual(str(e_bool), str(e_len))
 
     def test_blocked(self):
+        # [FUNCTION DOC] Checks that setting __bool__ to None makes
+        # bool raise TypeError, even when __len__ is defined.
         class A:
+            # [CLASS DOC] HELPER: Class with __bool__ set to None.
             __bool__ = None
         self.assertRaises(TypeError, bool, A())
 
         class B:
+            # [CLASS DOC] HELPER: Class with __len__ returning 10 and __bool__ set to None.
             def __len__(self):
+                # [FUNCTION DOC] HELPER: Returns 10.
                 return 10
             __bool__ = None
         self.assertRaises(TypeError, bool, B())
 
     def test_real_and_imag(self):
+        # [FUNCTION DOC] Checks the real and imag attributes
+        # of True and False and that they are plain ints.
         self.assertEqual(True.real, 1)
         self.assertEqual(True.imag, 0)
         self.assertIs(type(True.real), int)
@@ -413,14 +495,21 @@ class BoolTest(CPythonTestCase):
         self.assertIs(type(False.imag), int)
 
     def test_bool_called_at_least_once(self):
+        # [FUNCTION DOC] Checks that evaluating a short-circuit
+        # condition on an object calls its __bool__ at least once.
         class X:
+            # [CLASS DOC] HELPER: Class counting how many times __bool__ is called.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Initializes the call counter to zero.
                 self.count = 0
             def __bool__(self):
+                # [FUNCTION DOC] HELPER: Increments the counter and returns True.
                 self.count += 1
                 return True
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Evaluates the truthiness of its argument
+            # inside a condition that is always true, then returns None.
             if x or True:
                 pass
 
@@ -429,6 +518,7 @@ class BoolTest(CPythonTestCase):
         self.assertGreaterEqual(x.count, 1)
 
     def test_bool_new(self):
+        # [FUNCTION DOC] Checks bool.__new__ with no argument and with truthy and falsy arguments.
         self.assertIs(bool.__new__(bool), False)
         self.assertIs(bool.__new__(bool, 1), True)
         self.assertIs(bool.__new__(bool, 0), False)
