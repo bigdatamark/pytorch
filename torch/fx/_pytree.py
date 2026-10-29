@@ -1,3 +1,8 @@
+# [MODULE DOC] Flattening of pytrees guided by a precomputed TreeSpec, used by FX/export for
+# containers where the spec is trusted. Holds two registries (container type to flatten
+# function, and container type to exact-match check function), the registration helpers,
+# and the tree_flatten_spec entry point. Import-time side effect: registers the built-in
+# dict, list, tuple, every torch return-type and the namedtuple factory.
 from collections import namedtuple
 from collections.abc import Callable
 from typing import Any, TypeVar
@@ -27,6 +32,10 @@ def register_pytree_flatten_spec(
     flatten_fn_spec: FlattenFnSpec,
     flatten_fn_exact_match_spec: FlattenFnExactMatchSpec | None = None,
 ) -> None:
+    # [FUNCTION DOC] Record, in the two module-level registries, the function that extracts the
+    # direct children of a container of type cls according to a spec, and an optional check
+    # that the container exactly matches a spec. Overwrites any previous registration for
+    # cls. Returns nothing; mutates global state.
     SUPPORTED_NODES[cls] = flatten_fn_spec
     SUPPORTED_NODES_EXACT_MATCH[cls] = flatten_fn_exact_match_spec
 
@@ -34,6 +43,8 @@ def register_pytree_flatten_spec(
 def _deregister_pytree_flatten_spec(
     cls: type[Any],
 ) -> None:
+    # [FUNCTION DOC] HELPER: Remove cls from both registries. Raises a key error if cls was not
+    # registered. Mutates global state.
     del SUPPORTED_NODES[cls]
     del SUPPORTED_NODES_EXACT_MATCH[cls]
 
@@ -42,6 +53,15 @@ def tree_flatten_spec(
     pytree: PyTree,
     spec: TreeSpec,
 ) -> list[Any]:
+    # [FUNCTION DOC] Flatten a pytree into a list of leaves following the given spec. A leaf spec
+    # yields a one-element list holding the input. If the spec's container type is
+    # registered, the registered function extracts children by the spec (so missing extra
+    # entries are tolerated) and each child is flattened recursively against the matching
+    # child spec, concatenating results in order. Otherwise the standard flattener is used
+    # and its spec must equal the given spec, else a RuntimeError is raised asking for a bug
+    # report. No side effects.
+    # KNOWN ISSUE: pairing children with child specs stops at the shorter sequence, so a
+    # mismatch in child count is silently ignored on the registered path.
     if spec.is_leaf():
         return [pytree]
     # I guess these exist for BC, FC reasons.
@@ -67,34 +87,47 @@ def tree_flatten_spec(
 
 
 def _dict_flatten_spec(d: dict[_K, _V], spec: TreeSpec) -> list[_V]:
+    # [FUNCTION DOC] HELPER: Return the mapping's values in the order of the keys stored in the
+    # spec context. Raises a key error if a key is missing.
     return [d[k] for k in spec.context]
 
 
 def _list_flatten_spec(d: list[_T], spec: TreeSpec) -> list[_T]:
+    # [FUNCTION DOC] HELPER: Return the first num_children items of the list, by position.
+    # Raises an index error if the list is shorter.
     return [d[i] for i in range(spec.num_children)]
 
 
 def _tuple_flatten_spec(d: tuple[_T, ...], spec: TreeSpec) -> list[_T]:
+    # [FUNCTION DOC] HELPER: Return the first num_children items of the tuple as a list.
+    # Raises an index error if the tuple is shorter.
     return [d[i] for i in range(spec.num_children)]
 
 
 def _namedtuple_flatten_spec(d: NamedTuple, spec: TreeSpec) -> list[Any]:
+    # [FUNCTION DOC] HELPER: Return the first num_children fields of the named tuple, by
+    # position, as a list. Raises an index error if it is shorter.
     return [d[i] for i in range(spec.num_children)]
 
 
 def _dict_flatten_spec_exact_match(d: dict[_K, _V], spec: TreeSpec) -> bool:
+    # [FUNCTION DOC] HELPER: True when the mapping has exactly as many entries as the spec has
+    # children (keys are not compared).
     return len(d) == spec.num_children
 
 
 def _list_flatten_spec_exact_match(d: list[_T], spec: TreeSpec) -> bool:
+    # [FUNCTION DOC] HELPER: True when the list length equals the spec's child count.
     return len(d) == spec.num_children
 
 
 def _tuple_flatten_spec_exact_match(d: tuple[_T, ...], spec: TreeSpec) -> bool:
+    # [FUNCTION DOC] HELPER: True when the tuple length equals the spec's child count.
     return len(d) == spec.num_children
 
 
 def _namedtuple_flatten_spec_exact_match(d: NamedTuple, spec: TreeSpec) -> bool:
+    # [FUNCTION DOC] HELPER: True when the named tuple length equals the spec's child count.
     return len(d) == spec.num_children
 
 

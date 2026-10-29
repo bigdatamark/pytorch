@@ -1,7 +1,14 @@
+# [MODULE DOC] Defines the BackwardState marker class used by Dynamo, AOTAutograd and compiled
+# autograd to carry forward-pass hooks into the backward pass. Only imports torch.fx.
 import torch.fx
 
 
 class BackwardState:
+    # [CLASS DOC] Marker/container type for passing Python hooks from forward to backward. It is
+    # created by Dynamo as an empty object that is an input to the forward graph, populated
+    # with attributes only after the forward graph is finished, and becomes an input of the
+    # backward graph. At most one may exist per graph. Its only declared attribute is the
+    # proxy that represents it while tracing; no methods are defined.
     """
     BackwardState is used to pass Python hooks from the forwards pass
     into the backwards pass in Dynamo+Compiled Autograd.

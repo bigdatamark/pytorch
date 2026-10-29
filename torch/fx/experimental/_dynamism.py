@@ -1,3 +1,7 @@
+# [MODULE DOC] Utilities for detecting which tensor dimensions and scalar values vary across a
+# set of example inputs (to infer dynamic shapes). Exports a source-name normalizer, a
+# module-to-nested-mapping converter, the dynamism tracker, and a clone-to-meta helper.
+# No import-time side effects.
 import re
 from collections.abc import Callable
 from typing import Any
@@ -18,11 +22,22 @@ __all__ = [
 
 
 def normalize_source_name(name: str) -> str:
+    # [FUNCTION DOC] Rewrite every dotted attribute access in a source name string into a
+    # bracketed quoted-key access (a dot followed by an identifier becomes a bracketed single-
+    # quoted key). Returns the new string; pure.
     # Match attribute access like .x and replace with ['x']
     return re.sub(r"\.([a-zA-Z_][a-zA-Z0-9_]*)", r"['\1']", name)
 
 
 def module_to_nested_dict(module: torch.nn.Module) -> dict[str, Any]:
+    # [FUNCTION DOC] Convert a module into a nested mapping with two special entries (private
+    # names for parameters and for child modules) plus one entry per public, non-callable
+    # attribute whose value is an int, float or tensor (booleans and modules excluded; attributes
+    # raising NotImplementedError on access are skipped). Direct parameters AND buffers are
+    # both stored under the parameters entry; children are converted recursively. Pure apart
+    # from attribute access on the module.
+    # KNOWN ISSUE: docstring says keys are 'parameters' and 'modules', but the code uses keys
+    # with a leading underscore; buffers are also placed under the parameters entry.
     """Recursively converts an nn.Module into a nested dictionary with explicit 'parameters' and 'modules' keys."""
     self_dict: dict[str, Any] = {}
 
@@ -62,6 +77,15 @@ def module_to_nested_dict(module: torch.nn.Module) -> dict[str, Any]:
 def track_dynamism_across_examples(
     example_inputs: list[Any],
 ) -> dict[Any, Any]:
+    # [FUNCTION DOC] Given a list of example-input mappings, record per leaf path (int, float or
+    # tensor leaves only) the set of observed sizes for each dimension (a scalar counts as a
+    # one-dimension shape). Returns a mapping from the top-level key to a mapping from a path
+    # string (prefixed with "L") to a tuple of booleans, true where more than one distinct
+    # size was seen. Side effect: if an example has a "self" entry that is a module, that entry
+    # is replaced in place by its nested-mapping form. Dimension lists grow if later examples
+    # have more dimensions.
+    # KNOWN ISSUE: a mismatch between tensor and non-tensor leaves at the same path is detected
+    # but ignored; also the example inputs are mutated despite the docstring.
     """
     This function analyzes a list of example inputs to determine the dynamism of their shapes.
     It tracks whether the dimensions of tensors or non-tensor values change across
@@ -108,12 +132,16 @@ def track_dynamism_across_examples(
 
 
 def clone_and_convert_to_meta(example_input: Any) -> Any:
+    # [FUNCTION DOC] Map over a nested structure (any pytree, not only a list) and return a
+    # new structure where each tensor is cloned and moved to the meta device; other leaves are
+    # kept by reference.
     """
     This function takes a list of example inputs and for each tensor, clones it and converts it to device=meta.
     For non-tensor values, it keeps the reference. It uses pytree to handle nested structures recursively.
     """
 
     def transform_fn(value: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Return a meta-device clone for a tensor, else the value itself.
         if isinstance(value, torch.Tensor):
             return value.clone().to(device="meta")
         return value

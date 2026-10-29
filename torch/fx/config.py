@@ -1,3 +1,7 @@
+# [MODULE DOC] Plain module-level configuration flags for FX passes and tracing: whether
+# compilation-pass progress display is disabled (default True), whether progress also lists node
+# names (default False), and whether stack-trace capture during tracing is skipped (default
+# False). It is separate from the dynamo config to avoid a circular import. No logic.
 # Whether to disable showing progress on compilation passes
 # Need to add a new config otherwise will get a circular import if dynamo config is imported here
 disable_progress = True

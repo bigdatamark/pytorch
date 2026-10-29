@@ -1,3 +1,9 @@
+# [MODULE DOC] Core of FX symbolic tracing: the Tracer class that runs a Module or function with
+# proxy inputs to record a Graph, plus the public entry points symbolic_trace and wrap, the
+# proxyable-class metaclass, concrete-argument placeholders, and patching of torch.nn.Module call
+# and attribute access, torch.Tensor-creating functions and wrapped/auto-wrapped functions during
+# tracing. Import-time side effects: captures the original Module call/getattr, creates module
+# level registries (proxyable classes, wrapped-function records) and a thread-local tracing flag.
 import builtins
 import collections
 import contextlib
@@ -54,6 +60,8 @@ _constant_attribute_types = get_args(_ConstantAttributeType)
 # We only want to print this once to avoid flooding logs
 @functools.lru_cache
 def is_fx_tracing_warning() -> None:
+    # [FUNCTION DOC] HELPER: Log a warning (only once, via caching) that the tracing check is
+    # true for both symbolic tracing and export, pointing at narrower alternatives.
     log.warning(
         "is_fx_tracing will return true for both fx.symbolic_trace and "
         "torch.export. Please use "
@@ -63,15 +71,19 @@ def is_fx_tracing_warning() -> None:
 
 
 def _set_is_fx_tracing(value: bool) -> None:
+    # [FUNCTION DOC] HELPER: Set the current thread's tracing flag.
     _is_fx_tracing_tls.flag = value
 
 
 def _get_is_fx_tracing() -> bool:
+    # [FUNCTION DOC] HELPER: Return the current thread's tracing flag (False if never set).
     return getattr(_is_fx_tracing_tls, "flag", False)
 
 
 @contextlib.contextmanager
 def _is_fx_tracing_context(value: bool) -> Iterator[None]:
+    # [FUNCTION DOC] HELPER: Context manager that sets the thread's tracing flag to value and
+    # restores the previous value on exit, even on error.
     previous = _get_is_fx_tracing()
     _set_is_fx_tracing(value)
     try:
@@ -81,16 +93,24 @@ def _is_fx_tracing_context(value: bool) -> Iterator[None]:
 
 
 def is_fx_tracing() -> bool:
+    # [FUNCTION DOC] Return whether the current thread is inside FX tracing (symbolic trace or
+    # export). Side effect: emits the one-time warning about the broad meaning.
     is_fx_tracing_warning()
     return _get_is_fx_tracing()
 
 
 def is_fx_symbolic_tracing() -> bool:
+    # [FUNCTION DOC] Return True only when tracing via symbolic trace, i.e. the tracing flag is
+    # set and the compiler is not currently compiling (export/compile). No warning.
     return _get_is_fx_tracing() and not torch.compiler.is_compiling()
 
 
 @compatibility(is_backward_compatible=True)
 class ProxyableClassMeta(type):
+    # [CLASS DOC] Metaclass making construction of a class traceable. Each class created with
+    # it is recorded in a module-level registry. While FX tracing, constructing an instance
+    # with any proxy among its arguments records a function-call node for the class instead of
+    # running its initializer; otherwise the instance is built normally.
     """
     ProxyableClassMeta allows you to make construction of a given Python class
     symbolically traceable. For example::
@@ -141,10 +161,17 @@ class ProxyableClassMeta(type):
     def __init__(
         cls, name: str, bases: tuple[type, ...], attrs: dict[str, Any]
     ) -> None:
+        # [FUNCTION DOC] Register the new class in the proxyable-class registry (global side
+        # effect), then run the normal metaclass initialization.
         _proxyable_classes.setdefault(cls)
         super().__init__(name, bases, attrs)
 
     def __call__(cls, *args: Any, **kwargs: Any) -> Any:
+        # [FUNCTION DOC] Construct an instance. Outside tracing, create and initialize it
+        # normally. During tracing, if any argument (searched through nested containers) is a
+        # proxy, return a new proxy for a call-function node of the class using the first
+        # found proxy's tracer; otherwise initialize and return a real instance.
+        # Side effect: may add a node to the traced graph.
         instance = cls.__new__(cls)  # type: ignore[call-overload]
 
         if not is_fx_tracing():
@@ -154,6 +181,7 @@ class ProxyableClassMeta(type):
         found_proxies: list[Proxy] = []
 
         def check_proxy(a: object) -> None:
+            # [FUNCTION DOC] HELPER: Append the value to the found list if it is a proxy.
             if isinstance(a, Proxy):
                 found_proxies.append(a)
 
@@ -169,6 +197,11 @@ class ProxyableClassMeta(type):
 
 
 def _patch_function(fn: FunctionType, nargs: int) -> FunctionType:
+    # [FUNCTION DOC] HELPER: Return a copy of the function whose code object is rebuilt to take
+    # exactly nargs positional parameters, with the variadic-args and variadic-keywords flags
+    # cleared and positional-only/keyword-only counts zeroed, so star-args and star-kwargs
+    # parameters can be fed as ordinary arguments during tracing. Globals, defaults and closure
+    # are kept. The code-object constructor argument layout is chosen by Python version.
     co = fn.__code__
     co_flags = co.co_flags & ~HAS_VARSTUFF
     co_args: tuple[Any, ...]
@@ -243,11 +276,15 @@ def _patch_function(fn: FunctionType, nargs: int) -> FunctionType:
 
 @compatibility(is_backward_compatible=False)
 class PHBase:
+    # [CLASS DOC] Marker type for an input placeholder in concrete_args: an argument that should
+    # stay a runtime input (proxy) instead of being specialized. The singleton PH is the
+    # default instance. Carries no state.
     """
     Object representing an input placeholder to `concrete_args`
     """
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: Return the fixed text "PH".
         return "PH"
 
 
@@ -256,11 +293,14 @@ PH = PHBase()
 
 @compatibility(is_backward_compatible=False)
 class PHWithMeta(PHBase):
+    # [CLASS DOC] Placeholder marker carrying an optional user key (ph_key). Its attributes are
+    # copied to the created placeholder node so users can identify it during analysis.
     """
     Object representing an input placeholder to `concrete_args`
     """
 
     def __init__(self, ph_key: str | None = None) -> None:
+        # [FUNCTION DOC] Store the optional identifying key as an attribute.
         super().__init__()
 
         # Provide a key for user to identify placeholder node during analysis
@@ -268,6 +308,8 @@ class PHWithMeta(PHBase):
 
 
 def _transfer_attrs(fr: object, to: object) -> None:
+    # [FUNCTION DOC] HELPER: Copy every non-callable, non-dunder attribute of the source object
+    # that the destination does not already have onto the destination (mutates it).
     for attr_name in dir(fr):
         attr_val = getattr(fr, attr_name)
         if (
@@ -280,6 +322,12 @@ def _transfer_attrs(fr: object, to: object) -> None:
 
 @compatibility(is_backward_compatible=True)
 class Tracer(TracerBase):
+    # [CLASS DOC] Implements symbolic tracing: running a Module or function on proxy inputs while
+    # recording operations into a Graph. State: set of ids of auto-wrapped functions, list of
+    # modules searched for auto-wrapping, flag for treating parameter shape queries as
+    # constants, submodule path cache, root module name, module scope/stack and per-module call
+    # counts (used for module-call metadata), and node-name-to-scope mapping. Overridable hooks:
+    # create_arg, is_leaf_module, call_module, getattr, path_of_module; main entry is trace.
     # Reference: https://github.com/pytorch/pytorch/issues/54354
     # The first line of this docstring overrides the one Sphinx generates for the
     # documentation. We need it so that Sphinx doesn't leak `math`s path from the
@@ -306,6 +354,10 @@ class Tracer(TracerBase):
         autowrap_functions: tuple[Callable[..., Any], ...] = (),
         param_shapes_constant: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Initialize tracer state. Builds the set of ids of public callables in the
+        # autowrap modules plus the autowrap functions, remembers the modules to scan for
+        # auto-wrapping, stores the parameter-shape-constant flag and sets empty tracking
+        # structures (module scope, module stack, call counts, node-to-scope mapping).
         # This method's signature is overridden by the first line of this class'
         # docstring. If this method's signature is modified, the signature that
         # overrides it also should be modified accordingly.
@@ -364,6 +416,10 @@ class Tracer(TracerBase):
 
     @compatibility(is_backward_compatible=True)
     def get_fresh_qualname(self, prefix: str) -> str:
+        # [FUNCTION DOC] Return an attribute name made of the prefix and a number that is not an
+        # existing attribute of the root module. Uses a class-wide per-prefix counter shared by
+        # all tracers, which is reset to zero when the first candidate is free.
+        # Side effect: updates that shared counter.
         """
         Gets a fresh name for a prefix and returns it. This function ensures
         that it will not clash with an existing attribute on the graph.
@@ -390,6 +446,15 @@ class Tracer(TracerBase):
 
     @compatibility(is_backward_compatible=True)
     def create_arg(self, a: Any) -> "Argument":
+        # [FUNCTION DOC] Convert a value into a graph argument. Parameters, buffer tensors and
+        # submodules found in the root module become attribute-fetch nodes (a parameter not
+        # found raises NameError). Named tuples become a constructor call node of their
+        # elements. Constant tensors, script objects, tree specs and opaque objects are stored
+        # as new attributes on the root (under fresh names) and referenced by attribute nodes;
+        # unsupported constant types raise RuntimeError. Instances of proxyable classes are
+        # interned the same way. Everything else is handled by the base class.
+        # Side effects: creates nodes, may set attributes on the root and records them in the
+        # tensor attribute mapping.
         """
         A method to specify the behavior of tracing when preparing values to
         be used as arguments to nodes in the ``Graph``.
@@ -493,6 +558,9 @@ class Tracer(TracerBase):
 
     @compatibility(is_backward_compatible=True)
     def is_leaf_module(self, m: torch.nn.Module, module_qualified_name: str) -> bool:
+        # [FUNCTION DOC] Return True if the module is an atomic unit recorded as a module call:
+        # its defining module path starts with the torch.nn or torch.ao.nn packages and it is
+        # not a Sequential container. The qualified name is unused by default.
         """
         A method to specify whether a given ``nn.Module`` is a "leaf" module.
 
@@ -518,6 +586,10 @@ class Tracer(TracerBase):
 
     @compatibility(is_backward_compatible=True)
     def path_of_module(self, mod: torch.nn.Module) -> str:
+        # [FUNCTION DOC] Return the dotted qualified name of the module within the root
+        # hierarchy, using the cached path mapping when available, else scanning all named
+        # modules. Raises NameError if the module is not a submodule.
+        # KNOWN ISSUE: the docstring types the argument as a string, but it is a Module.
         """
         Helper method to find the qualified name of ``mod`` in the Module hierarchy
         of ``root``. For example, if ``root`` has a submodule named ``foo``, which has
@@ -552,6 +624,12 @@ class Tracer(TracerBase):
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
     ) -> Any:
+        # [FUNCTION DOC] Handle a call to a module during tracing. Looks up the module path,
+        # enters a scope and records the call in the module stack (key suffixed by the call
+        # count for repeated calls). If the module is not a leaf, runs its forward with the
+        # arguments and returns the result; if a leaf, creates and returns a module-call proxy.
+        # Always pops the stack entry afterwards and raises an assertion error on a mismatch.
+        # Side effects: updates scope, module stack and per-module call counts.
         """
         Method that specifies the behavior of this ``Tracer`` when it encounters
         a call to an ``nn.Module`` instance.
@@ -608,6 +686,11 @@ class Tracer(TracerBase):
     def getattr(
         self, attr: str, attr_val: Any, parameter_proxy_cache: dict[str, Proxy]
     ) -> Any:
+        # [FUNCTION DOC] Hook for attribute reads on modules during tracing. If the value is a
+        # module parameter (or, when buffer proxying is enabled, a buffer tensor) of the root,
+        # return a cached or newly created attribute-fetch proxy (a parameter proxy when
+        # parameter shapes are constant) and cache it by name; otherwise return the value
+        # unchanged. The attribute name argument is unused.
         """
         Method that specifies the behavior of this ``Tracer`` when we call getattr
         on a call to an ``nn.Module`` instance.
@@ -635,6 +718,9 @@ class Tracer(TracerBase):
             collection_to_search: Iterable[tuple[str, Any]],
             parameter_proxy_cache: dict[str, Proxy],
         ) -> Proxy | None:
+            # [FUNCTION DOC] HELPER: Find the named entry whose value is the given object; return
+            # its cached proxy, creating (and caching) an attribute-fetch proxy if needed.
+            # Returns None when no entry matches.
             for n, p in collection_to_search:
                 if attr_val is p:
                     if n not in parameter_proxy_cache:
@@ -680,6 +766,15 @@ class Tracer(TracerBase):
         is_module: bool,
         concrete_args: dict[str, Any] | tuple[Any, ...] | None = None,
     ) -> tuple[Any, list[Any]]:
+        # [FUNCTION DOC] Create placeholder nodes for the root callable's parameters and return
+        # the callable to trace plus the list of argument values (root module first when it is
+        # a module). Special cases: flat tuple concrete args with a star-args-only signature
+        # become numbered input placeholders (copying placeholder attributes to nodes);
+        # otherwise names come from the code object, a tuple of concrete args is zipped with
+        # names (length mismatch raises RuntimeError), star-args/kwargs get placeholders and
+        # the function is patched to accept them as plain arguments; a module with no
+        # arguments raises RuntimeError. Pytree-flattened inputs are handled below.
+        # Side effects: creates nodes.
         """
         Create ``placeholder`` nodes corresponding to the signature of the ``root``
         Module. This method introspects root's signature and emits those
@@ -742,6 +837,7 @@ class Tracer(TracerBase):
             concrete_args = dict(zip(arg_names, concrete_args))
 
         def proxy_placeholder(name: str) -> Any:
+            # [FUNCTION DOC] HELPER: Create the placeholder (or concrete value) for one argument.
             return self._proxy_placeholder(name, concrete_args, sig, fn_for_analysis)
 
         args.extend(proxy_placeholder(names) for names in arg_names)
@@ -768,6 +864,11 @@ class Tracer(TracerBase):
             def flatten_fn(  # pyrefly: ignore[unannotated-parameter, unannotated-return]
                 *args: Any,
             ):
+                # [FUNCTION DOC] HELPER: Wrapper taking flat leaf arguments; rebuilds the original
+                # nested inputs from the saved input spec, calls the root function, flattens its
+                # output and records the output spec in the graph's code generator (raises an
+                # assertion error if that is not the pytree code generator). Returns the flat
+                # list of outputs.
                 tree_args = pytree.tree_unflatten(list(args), in_spec)
                 tree_out = root_fn(*tree_args)
                 out_args, out_spec = pytree.tree_flatten(tree_out)
@@ -790,6 +891,16 @@ class Tracer(TracerBase):
         root: torch.nn.Module | Callable[..., Any],
         concrete_args: dict[str, Any] | None = None,
     ) -> Graph:
+        # [FUNCTION DOC] Trace a module or function into a new Graph and return it. Sets the
+        # thread tracing flag (restored afterwards), forces pending lazy recompilation of a
+        # module, picks the traced method (assertion error if missing), creates a fresh graph
+        # and a mapping of constant tensor-like attributes to their paths, creates input
+        # placeholders, then under a patcher that wraps module attribute access and calls plus
+        # wrapped and auto-wrapped functions, runs the function and records its result as the
+        # output node. For non-module roots an empty module is used as root. On a
+        # RuntimeError mentioning data-dependent behavior, attaches the partial graph source
+        # to the error and re-raises. Side effects: sets root, graph and attribute mapping
+        # on the tracer; temporarily patches global classes and functions.
         """
         Trace ``root`` and return the corresponding FX ``Graph`` representation. ``root``
         can either be an ``nn.Module`` instance or a Python callable.
@@ -864,6 +975,8 @@ class Tracer(TracerBase):
             def collect_tensor_attrs(
                 m: torch.nn.Module, prefix_atoms: list[str]
             ) -> None:
+                # [FUNCTION DOC] HELPER: Recursively record each constant-typed attribute of the
+                # module and its children in the tracer's attribute mapping under its dotted path.
                 for k, v in m.__dict__.items():
                     if isinstance(v, _constant_attribute_types):
                         self.tensor_attrs[v] = ".".join(prefix_atoms + [k])
@@ -888,6 +1001,8 @@ class Tracer(TracerBase):
             # Thus, we need to insert a proxy when __getattr__ requests a parameter.
             @functools.wraps(_orig_module_getattr)
             def module_getattr_wrapper(mod: torch.nn.Module, attr: str) -> Any:
+                # [FUNCTION DOC] HELPER: Replacement for module attribute lookup: do the original
+                # lookup, then pass the value through the tracer's getattr hook.
                 attr_val = _orig_module_getattr(mod, attr)
                 return self.getattr(attr, attr_val, parameter_proxy_cache)
 
@@ -895,7 +1010,11 @@ class Tracer(TracerBase):
             def module_call_wrapper(
                 mod: torch.nn.Module, *args: Any, **kwargs: Any
             ) -> Any:
+                # [FUNCTION DOC] HELPER: Replacement for module call: scans the module's forward
+                # globals for auto-wrap candidates (patching them), then delegates to the
+                # tracer's call_module hook with a closure that runs the original call.
                 def forward(*args: Any, **kwargs: Any) -> Any:
+                    # [FUNCTION DOC] HELPER: Invoke the original unpatched module call.
                     return _orig_module_call(mod, *args, **kwargs)
 
                 _autowrap_check(
@@ -950,6 +1069,9 @@ class Tracer(TracerBase):
         return self.graph
 
     def __deepcopy__(self, memo: dict[int, Any]) -> "Tracer":
+        # [FUNCTION DOC] Deep copy a tracer: every attribute is deep-copied except the list of
+        # modules to auto-wrap, which is shallow-copied since modules cannot be deep-copied.
+        # The initializer is not run.
         # _autowrap_search contains modules, which cannot be deepcopied.
         new_tracer = Tracer.__new__(Tracer)
 
@@ -970,10 +1092,19 @@ class Tracer(TracerBase):
         sig: inspect.Signature,
         fn_for_analysis: Callable[..., Any],
     ) -> Any:
+        # [FUNCTION DOC] HELPER: Produce the value for one parameter. If the name has a concrete
+        # argument, map over its nested structure: each leaf becomes a numbered placeholder
+        # proxy (placeholder markers return the proxy; scalars and booleans return the concrete
+        # value after emitting an assertion that the runtime input equals it; None emits an
+        # is-none assertion; other types warn that specialization is unchecked and return the
+        # value). Otherwise create a plain placeholder proxy, with a default taken from the
+        # signature (none for star names) and the annotation as its type.
         if concrete_args is not None and name in concrete_args:
             cnt = 0
 
             def replace_ph(x: object) -> object:
+                # [FUNCTION DOC] HELPER: Handle one leaf of a concrete argument as described
+                # above; increments a counter used to name the placeholder.
                 nonlocal cnt
                 cnt += 1
                 param = sig.parameters[name]
@@ -1057,6 +1188,8 @@ if os.environ.get("FX_PATCH_GETITEM") == "1":
 
 
 def _find_proxy(*objects_to_search: object) -> Proxy | None:
+    # [FUNCTION DOC] HELPER: Search the given objects (including nested containers) for a proxy;
+    # return the last one visited, or None if none.
     """
     Recursively search a data structure for a Proxy() and return it,
     return None if not found.
@@ -1064,6 +1197,7 @@ def _find_proxy(*objects_to_search: object) -> Proxy | None:
     proxy = None
 
     def find_proxy(x: object) -> None:
+        # [FUNCTION DOC] HELPER: Remember the value if it is a proxy.
         nonlocal proxy
         if isinstance(x, Proxy):
             proxy = x
@@ -1074,8 +1208,12 @@ def _find_proxy(*objects_to_search: object) -> Proxy | None:
 
 
 def _create_wrapped_func(orig_fn: Callable[_P, _T]) -> Callable[_P, _T]:
+    # [FUNCTION DOC] HELPER: Return a wrapper of the function that, when any argument contains a
+    # proxy, records a function-call node (marked as wrapped in node metadata) and returns the
+    # proxy; otherwise calls the original and returns its result.
     @functools.wraps(orig_fn)
     def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> Any:
+        # [FUNCTION DOC] HELPER: The wrapper described above.
         """
         Given a closed-over ``orig_function`` to invoke, search the args and kwargs for
         a Proxy object. If there is one, emit a ``call_function`` node to preserve the
@@ -1095,10 +1233,13 @@ def _create_wrapped_func(orig_fn: Callable[_P, _T]) -> Callable[_P, _T]:
 
 
 def _create_wrapped_method(cls: type, name: str) -> Callable[..., Any]:
+    # [FUNCTION DOC] HELPER: Return a wrapper of the class's named method that records a
+    # method-call node when any argument contains a proxy, else calls the original.
     orig_fn = getattr(cls, name)
 
     @functools.wraps(orig_fn)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
+        # [FUNCTION DOC] HELPER: The wrapper described above.
         """
         Search the args and kwargs for a Proxy object. If there is one,
         emit a ``call_method`` node to preserve the call to this method
@@ -1114,44 +1255,62 @@ def _create_wrapped_method(cls: type, name: str) -> Callable[..., Any]:
 
 
 class _PatchedFn(NamedTuple):
+    # [CLASS DOC] HELPER: Record of one patch: the target (mapping or class), the name, the
+    # original function (or none) and the replacement. Subclasses define how to apply and undo.
     frame_dict: Any  # dict[str, Any] for SetItem/Del, type for SetAttr
     fn_name: str
     orig_fn: Callable[..., Any] | None
     new_fn: Callable[..., Any]
 
     def revert(self) -> None:
+        # [FUNCTION DOC] HELPER: Abstract; undo the patch. Raises NotImplementedError here.
         raise NotImplementedError
 
     def patch(self) -> None:
+        # [FUNCTION DOC] HELPER: Abstract; apply the patch. Raises NotImplementedError here.
         raise NotImplementedError
 
 
 class _PatchedFnSetItem(_PatchedFn):
+    # [CLASS DOC] HELPER: Patch of an existing mapping entry; revert restores the original.
     def revert(self) -> None:
+        # [FUNCTION DOC] HELPER: Put the original function back into the mapping.
         self.frame_dict[self.fn_name] = self.orig_fn
 
     def patch(self) -> None:
+        # [FUNCTION DOC] HELPER: Store the replacement in the mapping.
         self.frame_dict[self.fn_name] = self.new_fn
 
 
 class _PatchedFnDel(_PatchedFn):
+    # [CLASS DOC] HELPER: Patch that shadows a builtin by adding a new mapping entry; revert
+    # deletes the entry.
     def revert(self) -> None:
+        # [FUNCTION DOC] HELPER: Delete the added entry.
         del self.frame_dict[self.fn_name]
 
     def patch(self) -> None:
+        # [FUNCTION DOC] HELPER: Store the replacement in the mapping.
         self.frame_dict[self.fn_name] = self.new_fn
 
 
 class _PatchedFnSetAttr(_PatchedFn):
+    # [CLASS DOC] HELPER: Patch of a class attribute; revert restores the original.
     def revert(self) -> None:
+        # [FUNCTION DOC] HELPER: Set the original function back on the class.
         setattr(self.frame_dict, self.fn_name, self.orig_fn)
 
     def patch(self) -> None:
+        # [FUNCTION DOC] HELPER: Set the replacement on the class.
         setattr(self.frame_dict, self.fn_name, self.new_fn)
 
 
 class _Patcher:
+    # [CLASS DOC] HELPER: Context manager that applies function and method patches and undoes
+    # all of them in reverse order on exit. State: ordered list of patches made and a set of
+    # ids of already-scanned mappings (so each is scanned once).
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Start with no patches and nothing visited.
         super().__init__()
         self.patches_made: list[_PatchedFn] = []
         self.visited: set[int] = set()
@@ -1163,6 +1322,10 @@ class _Patcher:
         new_fn: Callable[..., Any],
         deduplicate: bool = True,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Replace a named entry of a mapping with new_fn until exit. Marks
+        # new_fn with the deduplicate flag. If the name is absent but is a builtin, adds the
+        # entry (removed on revert); if the existing entry is already a patched function, does
+        # nothing; else replaces and records the original. Records and applies the patch.
         """
         Replace frame_dict[name] with new_fn until we exit the context manager.
         """
@@ -1181,6 +1344,9 @@ class _Patcher:
     def patch_method(
         self, cls: type, name: str, new_fn: Callable[..., Any], deduplicate: bool = True
     ) -> None:
+        # [FUNCTION DOC] HELPER: Replace a class attribute with new_fn until exit, marking new_fn
+        # with the deduplicate flag. Does nothing if the current attribute is already marked
+        # as patched; otherwise records and applies a set-attribute patch.
         """
         Replace object_or_dict.name with new_fn until we exit the context manager.
         """
@@ -1192,6 +1358,7 @@ class _Patcher:
         self.patches_made[-1].patch()
 
     def visit_once(self, thing: object) -> bool:
+        # [FUNCTION DOC] HELPER: True the first time an object (by identity) is seen, else False.
         """Return True on the first call to with thing, otherwise false"""
         idx = id(thing)
         if idx in self.visited:
@@ -1200,6 +1367,8 @@ class _Patcher:
         return True
 
     def revert_all_patches(self) -> list[_PatchedFn]:
+        # [FUNCTION DOC] HELPER: Undo every recorded patch in recorded order without clearing the
+        # list; returns the list.
         """
         Remove all the stored patcheds. It doesn't modify patches_made.
         """
@@ -1208,6 +1377,8 @@ class _Patcher:
         return self.patches_made
 
     def reapply_all_patches(self) -> list[_PatchedFn]:
+        # [FUNCTION DOC] HELPER: Apply every recorded patch again without changing the list;
+        # returns the list.
         """
         Patch all the stored patcheds. It doesn't modify patches_made.
         """
@@ -1216,6 +1387,7 @@ class _Patcher:
         return self.patches_made
 
     def __enter__(self) -> "_Patcher":
+        # [FUNCTION DOC] HELPER: Return the patcher itself.
         return self
 
     def __exit__(
@@ -1224,6 +1396,8 @@ class _Patcher:
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Undo all patches in reverse order, emptying the list, and clear
+        # the visited set. Exceptions are not suppressed.
         """
         Undo all the changes made via self.patch() and self.patch_method()
         """
@@ -1238,6 +1412,9 @@ CURRENT_PATCHER: _Patcher | None = None
 
 @contextlib.contextmanager
 def _new_patcher() -> Iterator[_Patcher]:
+    # [FUNCTION DOC] HELPER: Context manager creating a new patcher, making it the module-wide
+    # current patcher, yielding it, and on exit reverting its patches and restoring the prior
+    # current patcher. Raises an assertion error if the current patcher was cleared meanwhile.
     global CURRENT_PATCHER
     prior_patcher = CURRENT_PATCHER
     try:
@@ -1253,6 +1430,10 @@ def _new_patcher() -> Iterator[_Patcher]:
 
 @contextlib.contextmanager
 def _maybe_revert_all_patches() -> Iterator[None]:
+    # [FUNCTION DOC] HELPER: Context manager that, if a current patcher exists, temporarily
+    # undoes all its patches for the body and reapplies them afterwards. Raises an assertion
+    # error if the reapplied list differs from the removed one (also when no patcher exists
+    # and nothing was recorded, the comparison is of two unset values).
     current_patcher = CURRENT_PATCHER
     patches_made = None
     patches_removed = None
@@ -1270,6 +1451,9 @@ def _maybe_revert_all_patches() -> Iterator[None]:
 
 
 def _patch_wrapped_functions(patcher: _Patcher) -> None:
+    # [FUNCTION DOC] HELPER: Apply, through the patcher, wrapper versions of all functions
+    # registered via wrap (by globals mapping and name, including builtins) and of all
+    # registered class methods.
     """
     Go through ``_wrapped_fn_patch_table`` and, for each frame object, wrap
     the listed global functions in the `_create_wrapped_func` wrapper.
@@ -1288,6 +1472,8 @@ def _patch_wrapped_functions(patcher: _Patcher) -> None:
 def _autowrap_check(
     patcher: _Patcher, frame_dict: dict[str, Any], function_ids: set[int]
 ) -> None:
+    # [FUNCTION DOC] HELPER: Once per mapping, patch every public callable entry whose identity
+    # is in the auto-wrap id set with a wrapper version.
     """
     Some methods, like `math.sqrt` are common enough we want to automatically wrap them as we see them.
     This method searches a scope for them and patches them if found.
@@ -1308,6 +1494,12 @@ def wrap(fn_or_name: _F) -> _F: ...
 def wrap(fn_or_name: str) -> str: ...
 @compatibility(is_backward_compatible=True)
 def wrap(fn_or_name: str | Callable[..., Any]) -> str | Callable[..., Any]:
+    # [FUNCTION DOC] Register a global function (given by callable or name) as a leaf function
+    # that stays a call node during tracing. Must be called at the top level of a module;
+    # the caller's global namespace and the name are stored in the module-level registry.
+    # Returns its argument (so it works as a decorator). Raises RuntimeError for an
+    # unsupported argument type and NotImplementedError when not called at module top level.
+    # Side effect: mutates the registry.
     """
     This function can be called at module-level scope to register fn_or_name as a "leaf function".
     A "leaf function" will be preserved as a CallFunction node in the FX trace instead of being
@@ -1380,6 +1572,10 @@ def symbolic_trace(
     root: torch.nn.Module | Callable[..., Any],
     concrete_args: dict[str, Any] | None = None,
 ) -> GraphModule:
+    # [FUNCTION DOC] Trace a module or function with a default Tracer and return a graph module
+    # built from the recorded graph, named after the module's class or the function's name.
+    # Args: root to trace; optional concrete_args to specialize inputs. Errors from tracing
+    # propagate.
     """
     Symbolic tracing API
 
@@ -1441,5 +1637,7 @@ def symbolic_trace(
 
 @wrap
 def _assert_is_none(value: object, msg: str) -> None:
+    # [FUNCTION DOC] HELPER: Leaf function (registered via wrap) recorded in graphs to assert a
+    # specialized input is none; raises an assertion error with the message otherwise.
     if value is not None:
         raise AssertionError(msg)

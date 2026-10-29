@@ -1,3 +1,10 @@
+# [MODULE DOC] Custom pickling of FX graphs and GraphModules (GraphPickler) for caching and
+# precompilation. A Pickler subclass intercepts fake tensors, graph modules, ops, shape
+# environments, symbolic ints, tracing contexts, weakrefs, opaque script objects and torch-numpy
+# functions and replaces them with small "pickle data" helper classes; unpickling needs a
+# FakeTensorMode, which is passed to those helpers through a persistent-id token. Also holds
+# the Options dataclass (op and metadata filters). Import-time side effect: uses dill in place
+# of pickle when dill is importable.
 import contextlib
 import dataclasses
 import importlib
@@ -42,6 +49,8 @@ _SymNodeT = TypeVar("_SymNodeT", torch.SymInt, torch.SymFloat)
 
 
 def _ops_filter_safe(name: str) -> bool:
+    # [FUNCTION DOC] HELPER: Default op filter. True when the op name starts with the aten or
+    # fbgemm op namespace prefixes, i.e. ops that any machine with PyTorch can resolve.
     """
     An ops filter which allows pickle-safe ops. Pickle-safe ops are built-in
     ones where it will be possible to unpickle on any machine which has PyTorch.
@@ -56,6 +65,8 @@ def _ops_filter_safe(name: str) -> bool:
 
 
 def _node_metadata_key_filter_safe(key: str) -> bool:
+    # [FUNCTION DOC] HELPER: Default node-metadata filter. False for the keys holding source
+    # function stacks and module stacks (which reference unpicklable objects), true otherwise.
     """
     A metadata filter which allows pickle-safe node metadata. These often times contain
     stacks with pointers to unserializable objects, so we clear them out.
@@ -65,6 +76,11 @@ def _node_metadata_key_filter_safe(key: str) -> bool:
 
 @dataclasses.dataclass
 class Options:
+    # [CLASS DOC] Settings for GraphPickler: ops_filter (predicate on op name; ops failing it
+    # make the cache-bypass validator signal bypass; None allows all), node_metadata_key_filter
+    # (predicate on metadata key; keys failing it are dropped; None keeps all), and
+    # ignore_raw_node (replace stray Node objects with None instead of raising). Defaults are
+    # the pickle-safe filters.
     # A filter for which ops will cause the pickler to raise a
     # BypassFxGraphCache exception. If None then all ops are allowed.
     ops_filter: Callable[[str], bool] | None = _ops_filter_safe
@@ -77,19 +93,28 @@ class Options:
 
 
 def _unpickle_as_none() -> None:
+    # [FUNCTION DOC] HELPER: Unpickle callable that always yields None.
     return None
 
 
 def _unpickle_as_weakref(referent: object) -> weakref.ref[object]:
+    # [FUNCTION DOC] HELPER: Unpickle callable that builds a new weak reference to the already
+    # unpickled referent.
     return weakref.ref(referent)
 
 
 def _unpickle_as_dead_weakref() -> Callable[[], None]:
+    # [FUNCTION DOC] HELPER: Unpickle callable returning a function that takes no arguments and
+    # returns None, imitating a weak reference whose referent is gone.
     return lambda: None
 
 
 @contextlib.contextmanager
 def patch_pytree_map_over_slice() -> Generator[None]:
+    # [FUNCTION DOC] Context manager that temporarily registers slice objects as pytree nodes
+    # (children are start, stop, step) so tree maps can traverse them while pickling. If
+    # slice is already registered it does nothing; otherwise the registration is removed on
+    # exit. Mutates the global pytree registry; not thread safe.
     if slice in pytree.SUPPORTED_NODES:
         yield
         return
@@ -106,12 +131,20 @@ def patch_pytree_map_over_slice() -> Generator[None]:
 
 # pyrefly: ignore [invalid-inheritance]
 class GraphPickler(pickle.Pickler):
+    # [CLASS DOC] Pickler specialised for FX graphs. Holds the Options, an opaque token object
+    # that stands in for the unpickling state (written as a persistent id), and a shared
+    # tensor describer so views and duplicates stay consistent within one pickle. Entry points:
+    # dumps, loads (static, needs a FakeTensorMode), and debug_dumps for locating the first
+    # unpicklable part. Special types are routed through reducer_override.
     """
     GraphPickler is a Pickler which helps pickling fx graph - in particular
     GraphModule.
     """
 
     def __init__(self, file: io.BytesIO, options: Options | None = None) -> None:
+        # [FUNCTION DOC] Create a pickler writing to the given byte stream (by-reference mode
+        # when dill is used). Stores the options (defaults if None), creates the unpickle-state
+        # token and a tensor describer that does not copy data.
         if dill is not None:
             super().__init__(file, byref=True)
         else:
@@ -135,6 +168,14 @@ class GraphPickler(pickle.Pickler):
     def reducer_override(
         self, obj: object
     ) -> tuple[Callable[..., Any], tuple[Any, ...]]:
+        # [FUNCTION DOC] Pickle hook choosing a custom reduction per object type. Primitive
+        # types use default pickling. Fake tensors, graph modules, operators, shape envs,
+        # symbolic ints and tracing contexts delegate to their pickle-data helper. Opaque script
+        # objects holding value-type constants use default pickling, others become None. Weak
+        # references are rebuilt (live) or become dead stand-ins. A raw Node raises an assertion
+        # error unless ignore_raw_node is set (then None). Torch-numpy functions are encoded
+        # by name; anything else returns NotImplemented for default behavior.
+        # KNOWN ISSUE: the return annotation omits the NotImplemented result.
         # This function is supposed to return either NotImplemented (meaning to
         # do the default pickle behavior) or a pair of (unpickle callable, data
         # to pass to unpickle).
@@ -201,6 +242,8 @@ class GraphPickler(pickle.Pickler):
     @override
     # pyrefly: ignore [bad-override]
     def persistent_id(self, obj: object) -> str | None:
+        # [FUNCTION DOC] Return the fixed unpickle-state identifier string when obj is this
+        # pickler's state token; otherwise None so the object is pickled normally.
         if obj is self._unpickle_state:
             return "unpickle_state"
         else:
@@ -208,6 +251,9 @@ class GraphPickler(pickle.Pickler):
 
     @classmethod
     def dumps(cls, obj: object, options: Options | None = None) -> bytes:
+        # [FUNCTION DOC] Pickle obj with a fresh pickler into memory (with slice pytree support
+        # enabled) and return the bytes. May raise errors from pickling, cache-bypass signals
+        # from the op filter, or assertion errors for raw nodes.
         """
         Pickle an object.
         """
@@ -218,6 +264,10 @@ class GraphPickler(pickle.Pickler):
 
     @staticmethod
     def loads(data: bytes, fake_mode: FakeTensorMode) -> object:
+        # [FUNCTION DOC] Unpickle bytes produced by dumps, reconstructing tensors and shape
+        # information against the given fake mode (whose existing shape env is reused and
+        # overwritten). Runs under a timing context and slice pytree support. Returns the
+        # object.
         """
         Unpickle an object.
         """
@@ -239,6 +289,13 @@ class GraphPickler(pickle.Pickler):
         max_iter_items: int = 50,
         verbose: bool = True,
     ) -> str | None:
+        # [FUNCTION DOC] Diagnostic: recursively search obj for the first sub-object that fails
+        # to pickle and return a path string to it ("root" based), or None if everything
+        # pickles. Each candidate is tested by pickling it alone; failing builtin containers,
+        # bounded iterator prefixes, custom reduce arguments, dataclass fields, saved state,
+        # instance attributes, slots and finally the reduce protocol are explored in that order,
+        # with depth and revisit limits. Prints progress when verbose.
+        # KNOWN ISSUE: the returned path can be the container itself when no child fails.
         """
         Find the first leaf that GraphPickler.dumps cannot serialize and return its path.
 
@@ -265,10 +322,12 @@ class GraphPickler(pickle.Pickler):
         visited: set[int] = set()
 
         def log(msg: str) -> None:
+            # [FUNCTION DOC] HELPER: Print the message when verbose is enabled.
             if verbose:
                 print(msg)
 
         def fail_exc(o: Any) -> BaseException | None:
+            # [FUNCTION DOC] HELPER: Try pickling o alone; return the raised exception or None.
             try:
                 cls.dumps(o, options)
                 return None
@@ -276,6 +335,9 @@ class GraphPickler(pickle.Pickler):
                 return e
 
         def walk(o: Any, path: str, depth: int) -> str | None:
+            # [FUNCTION DOC] HELPER: Recursive search step. Returns None for already visited or
+            # fine-to-pickle objects, a depth-limit marker past the depth bound, else the path of
+            # the deepest-first failing part found, or this path if no child is blamed.
             if depth > max_depth:
                 log(f"{'  ' * depth}Depth limit at {path} ({type(o)})")
                 return path + " (depth_limit)"
@@ -419,7 +481,10 @@ class GraphPickler(pickle.Pickler):
 
 
 class _UnpickleState:
+    # [CLASS DOC] HELPER: Shared context during unpickling: the fake mode to build tensors in
+    # and a meta converter reused across tensors so views and duplicates map consistently.
     def __init__(self, fake_mode: FakeTensorMode) -> None:
+        # [FUNCTION DOC] HELPER: Store the fake mode and create a fresh meta converter.
         self.fake_mode = fake_mode
         self.meta_converter: MetaConverter[FakeTensor] = MetaConverter()
 
@@ -431,13 +496,18 @@ _UnpickleStateToken = NewType("_UnpickleStateToken", object)
 
 # pyrefly: ignore [invalid-inheritance]
 class _GraphUnpickler(pickle.Unpickler):
+    # [CLASS DOC] HELPER: Unpickler that resolves the persistent-id state token written by
+    # GraphPickler to the unpickle state object it was constructed with.
     def __init__(self, stream: io.BytesIO, unpickle_state: _UnpickleState) -> None:
+        # [FUNCTION DOC] HELPER: Read from the stream and remember the state to hand out.
         super().__init__(stream)
         self._unpickle_state = unpickle_state
 
     @override
     # pyrefly: ignore [bad-override]
     def persistent_load(self, pid: object) -> object:
+        # [FUNCTION DOC] HELPER: Return the unpickle state for the known identifier string;
+        # raise an unpickling error for any other identifier.
         if pid == "unpickle_state":
             return self._unpickle_state
         else:
@@ -445,6 +515,9 @@ class _GraphUnpickler(pickle.Unpickler):
 
 
 class _ShapeEnvPickleData:
+    # [CLASS DOC] HELPER: Picklable snapshot of a ShapeEnv: a copy of its attribute mapping
+    # minus the tracked fakes and fake tensor cache. Unpickling copies these attributes onto
+    # the shape env of the target fake mode rather than creating a new ShapeEnv.
     data: dict[str, object]
 
     @classmethod
@@ -453,9 +526,13 @@ class _ShapeEnvPickleData:
     ) -> tuple[
         Callable[[Self, _UnpickleState], ShapeEnv], tuple[Self, _UnpickleStateToken]
     ]:
+        # [FUNCTION DOC] HELPER: Return the unpickle method plus arguments (snapshot of obj and
+        # the pickler's state token) for use as a reduction.
         return cls.unpickle, (cls(obj), pickler._unpickle_state)
 
     def __init__(self, env: ShapeEnv) -> None:
+        # [FUNCTION DOC] HELPER: Snapshot the env's attributes, dropping tracked fakes and the
+        # fake tensor cache. Raises an assertion error if translation validation is enabled.
         # In theory pickle should recognize that a given ShapeEnv was already
         # pickled and reuse the resulting _ShapeEnvPickleData (so two objects
         # pointing at the same ShapeEnv get the same ShapeEnv out).
@@ -466,6 +543,9 @@ class _ShapeEnvPickleData:
         del self.data["fake_tensor_cache"]
 
     def unpickle(self, unpickle_state: _UnpickleState) -> ShapeEnv:
+        # [FUNCTION DOC] HELPER: Copy each saved attribute onto the existing shape env of the
+        # state's fake mode (mutating it) and return that env. Raises an assertion error if
+        # the fake mode or its shape env is missing.
         # Fill in the existing ShapeEnv rather than creating a new one
         if not unpickle_state.fake_mode:
             raise AssertionError("unpickle_state.fake_mode is not set")
@@ -479,6 +559,8 @@ class _ShapeEnvPickleData:
 
 
 class _SymNodePickleData:
+    # [CLASS DOC] HELPER: Picklable form of a symbolic node: its expression, shape env, Python
+    # type and hint. Unpickling rebuilds a symbolic node and wraps it as a symbolic int.
     @classmethod
     def reduce_helper(
         cls,
@@ -487,6 +569,8 @@ class _SymNodePickleData:
     ) -> tuple[
         Callable[[Self, _UnpickleState], _SymNodeT], tuple[Self, _UnpickleStateToken]
     ]:
+        # [FUNCTION DOC] HELPER: Return the symbolic-int unpickle method plus arguments. Raises
+        # NotImplementedError for any type other than a symbolic int (e.g. symbolic floats).
         args = (cls(obj.node), pickler._unpickle_state)
         if isinstance(obj, torch.SymInt):
             # pyrefly: ignore [bad-return]
@@ -495,21 +579,29 @@ class _SymNodePickleData:
             raise NotImplementedError(f"Unhandled SymNode type {type(obj)}")
 
     def __init__(self, node: SymNode) -> None:
+        # [FUNCTION DOC] HELPER: Save the node's expression, shape env, Python type and hint.
         self.expr = node._expr
         self.shape_env = node.shape_env
         self.pytype = node.pytype
         self.hint = node._hint
 
     def _to_sym_node(self) -> SymNode:
+        # [FUNCTION DOC] HELPER: Rebuild a symbolic node from the saved fields. Raises an
+        # assertion error if no shape env was saved.
         if self.shape_env is None:
             raise AssertionError("shape_env is None")
         return SymNode(self.expr, self.shape_env, self.pytype, self.hint)
 
     def unpickle_sym_int(self, unpickle_state: _UnpickleState) -> torch.SymInt:
+        # [FUNCTION DOC] HELPER: Return a symbolic int wrapping a rebuilt node; the state is
+        # unused (the saved shape env is used directly, not the fake mode's).
         return torch.SymInt(self._to_sym_node())
 
 
 class _TensorPickleData:
+    # [CLASS DOC] HELPER: Picklable description of a fake tensor (a meta tensor descriptor with
+    # the fake mode removed). Unpickling recreates a fake tensor in the state's fake mode via
+    # its shared meta converter, restoring the fake mode on views' bases too.
     metadata: MetaTensorDesc[FakeTensor]
 
     @classmethod
@@ -518,12 +610,17 @@ class _TensorPickleData:
     ) -> tuple[
         Callable[[Self, _UnpickleState], FakeTensor], tuple[Self, _UnpickleStateToken]
     ]:
+        # [FUNCTION DOC] HELPER: Return the unpickle method plus arguments (description built
+        # with the pickler's shared describer, and the state token).
         return cls.unpickle, (
             cls(pickler._meta_tensor_describer, obj),
             pickler._unpickle_state,
         )
 
     def __init__(self, describer: MetaTensorDescriber, t: Tensor) -> None:
+        # [FUNCTION DOC] HELPER: Describe the tensor with the shared describer and store the
+        # description without its fake mode. Raises an assertion error if the view function is
+        # a custom one, or if any other unserializable field of the description is set.
         # THINGS TO WORRY ABOUT:
         # 1. Need to make sure that two tensors with the same id end up with the
         #    same id on the other side of the wire.
@@ -549,6 +646,9 @@ class _TensorPickleData:
                 raise AssertionError(f"not None: {k}: {getattr(self.metadata, k)}")
 
     def unpickle(self, unpickle_state: _UnpickleState) -> FakeTensor:
+        # [FUNCTION DOC] HELPER: Attach the state's fake mode to the description (and to the
+        # base if a view) and build a fake tensor through the shared meta converter, wrapping
+        # the created meta tensor with dispatch disabled. Returns the fake tensor.
         # TODO: make common w/ _output_from_cache_entry() in fake_tensor.py?
         metadata = dataclasses.replace(
             self.metadata,
@@ -566,6 +666,8 @@ class _TensorPickleData:
         def with_fake(
             make_meta_t: Callable[[], torch.Tensor], device: torch.device | str
         ) -> FakeTensor:
+            # [FUNCTION DOC] HELPER: Callback for the meta converter: wrap the meta tensor made
+            # by the given factory in a fake tensor of the state's fake mode on the device.
             with no_dispatch():
                 return FakeTensor(
                     unpickle_state.fake_mode,
@@ -584,6 +686,9 @@ class _TensorPickleData:
 
 
 class _TorchNumpyPickleData:
+    # [CLASS DOC] HELPER: Picklable reference to a numpy function by module and name, used for
+    # the torch-numpy replacement functions; unpickling looks up the numpy function and maps
+    # it back to the torch-numpy equivalent.
     @classmethod
     def reduce_helper(
         cls, pickler: GraphPickler, obj: object
@@ -593,21 +698,30 @@ class _TorchNumpyPickleData:
         ]
         | None
     ):
+        # [FUNCTION DOC] HELPER: If obj is a known torch-numpy function return the unpickle
+        # method plus arguments; otherwise None.
         if data := cls.from_object(obj):
             return (cls.unpickle, (data, pickler._unpickle_state))
         else:
             return None
 
     def __init__(self, mod: str, name: str) -> None:
+        # [FUNCTION DOC] HELPER: Store the numpy module name and function name.
         self.mod = mod
         self.name = name
 
     def unpickle(self, unpickle_state: _UnpickleState) -> Callable[..., object]:
+        # [FUNCTION DOC] HELPER: Import the module, fetch the numpy function by name and return
+        # its torch-numpy replacement from the dynamo mapping.
         np = getattr(importlib.import_module(self.mod), self.name)
         return torch._dynamo.variables.misc.get_np_to_tnp_map()[np]
 
     @classmethod
     def from_object(cls, tnp: object) -> Self | None:
+        # [FUNCTION DOC] HELPER: If tnp is a callable listed in the dynamo torch-numpy to numpy
+        # mapping, return a reference to the numpy function (module defaults to numpy);
+        # return None if it is not callable, unhashable, unmapped or nameless. Raises an
+        # assertion error if the named module attribute is not the mapped numpy object.
         if not callable(tnp):
             return None
 
@@ -634,6 +748,9 @@ class _TorchNumpyPickleData:
 
 
 class _GraphModulePickleData:
+    # [CLASS DOC] HELPER: Picklable form of a GraphModule: its attribute mapping without the
+    # graph, plus a _GraphPickleData for the graph. Unpickling builds a plain GraphModule
+    # (even for lazy ones) and rebuilds its graph.
     @classmethod
     def reduce_helper(
         cls, pickler: GraphPickler, obj: torch.fx.GraphModule
@@ -641,12 +758,17 @@ class _GraphModulePickleData:
         Callable[[Self, _UnpickleState], torch.fx.GraphModule],
         tuple[Self, _UnpickleStateToken],
     ]:
+        # [FUNCTION DOC] HELPER: Return the unpickle method plus arguments (snapshot built with
+        # the pickler's options, and the state token).
         return cls.unpickle, (
             cls(obj, pickler.options),
             pickler._unpickle_state,
         )
 
     def __init__(self, gm: torch.fx.GraphModule, options: Options) -> None:
+        # [FUNCTION DOC] HELPER: Force code generation on the module (real recompile for lazy
+        # modules), copy its state without the graph and pickle-wrap the graph. Side effect:
+        # recompiles the module in place.
         # Need to do this to ensure the code is created for later pickling.
         if isinstance(gm, torch.fx._lazy_graph_module._LazyGraphModule):
             _python_code = gm._real_recompile()
@@ -660,6 +782,8 @@ class _GraphModulePickleData:
         self.graph = _GraphPickleData(gm._graph, options)
 
     def unpickle(self, unpickle_state: _UnpickleState) -> torch.fx.GraphModule:
+        # [FUNCTION DOC] HELPER: Create a bare GraphModule, install the saved state and the
+        # rebuilt graph, and return it. The constructor is bypassed.
         gm = torch.fx.GraphModule.__new__(torch.fx.GraphModule)
         gm.__dict__ = self.gm_dict
         gm._graph = self.graph.unpickle(gm, unpickle_state)
@@ -667,12 +791,18 @@ class _GraphModulePickleData:
 
 
 class _NodePickleData:
+    # [CLASS DOC] HELPER: Picklable form of one graph node: name, op kind, pickled target, type,
+    # filtered metadata, and args/kwargs in which other nodes are replaced by their pickle data.
     def __init__(
         self,
         node: torch.fx.Node,
         mapping: dict[torch.fx.Node, "_NodePickleData"],
         options: Options,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Capture the node. Args and kwargs nodes are looked up in the
+        # mapping (so inputs must have been captured earlier; a missing one raises a key
+        # error). The target is pickled through the op helper (may raise for unsupported
+        # targets), and metadata keys are kept only if they pass the filter.
         self.args = pytree.tree_map_only(torch.fx.Node, lambda n: mapping[n], node.args)
         self.kwargs = pytree.tree_map_only(
             torch.fx.Node, lambda n: mapping[n], node.kwargs
@@ -702,6 +832,10 @@ class _NodePickleData:
         mapping: dict["_NodePickleData", torch.fx.Node],
         unpickle_state: _UnpickleState,
     ) -> torch.fx.Node:
+        # [FUNCTION DOC] HELPER: Recreate the node inside the given graph, mapping argument
+        # pickle data back to already created nodes, resolving the target, and attaching the
+        # saved metadata. Raises an assertion error if the target is neither callable nor a
+        # string. Returns the new node.
         args = pytree.tree_map_only(_NodePickleData, lambda n: mapping[n], self.args)
         kwargs = pytree.tree_map_only(
             _NodePickleData, lambda n: mapping[n], self.kwargs
@@ -715,15 +849,27 @@ class _NodePickleData:
 
 
 class _OpPickleData:
+    # [CLASS DOC] HELPER: Abstract base for picklable references to graph-node targets (strings,
+    # operator overloads, packets, precompiled artifacts, standard functions). The pickle
+    # factory picks the subclass; each subclass implements unpickle to resolve the target.
     @classmethod
     def reduce_helper(
         cls, pickler: GraphPickler, op: object
     ) -> tuple[Callable[[_UnpickleState], object], tuple[_UnpickleStateToken]]:
+        # [FUNCTION DOC] HELPER: Pickle the op into a helper and return its unpickle method with
+        # the state token as the argument.
         result = cls.pickle(op, pickler.options)
         return (result.unpickle, (pickler._unpickle_state,))
 
     @classmethod
     def pickle(cls, op: object, options: Options) -> "_OpPickleData":
+        # [FUNCTION DOC] HELPER: Choose and build the helper for a target: strings kept as is;
+        # objects wrapping a precompiled artifact serialized; operator overloads and packets
+        # go through the op filter; functions whose pretty name starts with a supported root
+        # (builtins, math, torch, operator, einops) split into root and detail. Anything else
+        # raises NotImplementedError.
+        # KNOWN ISSUE: the redundant attribute-existence check after the wrapped-artifact test
+        # can never fail; the TODO notes unsupported targets should bypass the cache instead.
         if isinstance(op, str):
             return _OpStrPickleData(op)
 
@@ -756,6 +902,9 @@ class _OpPickleData:
         datacls: type["_OpOverloadPickleData"] | type["_OpOverloadPacketPickleData"],
         options: Options,
     ) -> "_OpPickleData":
+        # [FUNCTION DOC] HELPER: If an ops filter exists and rejects the name, signal a cache
+        # bypass through the inductor cacheability validator (which may raise). Otherwise
+        # return a new instance of the given helper class for the name.
         if (ops_filter := options.ops_filter) and not ops_filter(name):
             from torch._inductor.codecache import CacheabilityValidator
 
@@ -764,10 +913,14 @@ class _OpPickleData:
 
     @abstractmethod
     def unpickle(self, unpickle_state: _UnpickleState) -> object:
+        # [FUNCTION DOC] HELPER: Abstract hook; subclasses return the real target object.
         pass
 
     @classmethod
     def _lookup_global_by_name(cls, name: str) -> object:
+        # [FUNCTION DOC] HELPER: Resolve a possibly dotted name starting from this module's global
+        # names (the first part must be a global here, e.g. torch), then attribute lookups for
+        # the rest. Raises a key error or attribute error if not found.
         """
         Like `globals()[name]` but supports dotted names.
         """
@@ -780,6 +933,8 @@ class _OpPickleData:
 
     @staticmethod
     def _getattr_by_name(root: object, name: str) -> object:
+        # [FUNCTION DOC] HELPER: Follow a dotted attribute path starting at root and return the
+        # final attribute. Raises an attribute error if any part is missing.
         """
         Like `getattr(root, name)` but supports dotted names.
         """
@@ -790,18 +945,25 @@ class _OpPickleData:
 
 
 class _OpStrPickleData(_OpPickleData):
+    # [CLASS DOC] HELPER: Target that is just a string name (e.g. a method or attribute name).
     def __init__(self, name: str) -> None:
+        # [FUNCTION DOC] HELPER: Store the string.
         self.name = name
 
     def unpickle(self, unpickle_state: _UnpickleState) -> str:
+        # [FUNCTION DOC] HELPER: Return the stored string.
         return self.name
 
 
 class _OpOverloadPickleData(_OpPickleData):
+    # [CLASS DOC] HELPER: Reference to an operator overload by its dotted name.
     def __init__(self, name: str) -> None:
+        # [FUNCTION DOC] HELPER: Store the dotted name.
         self.name = name
 
     def unpickle(self, unpickle_state: _UnpickleState) -> torch._ops.OpOverload:
+        # [FUNCTION DOC] HELPER: Look up the name and return the operator overload. Raises an
+        # assertion error if the result is not an operator overload.
         obj = self._lookup_global_by_name(self.name)
         if not isinstance(obj, torch._ops.OpOverload):
             raise AssertionError(f"Expected OpOverload, got {type(obj)}")
@@ -809,10 +971,14 @@ class _OpOverloadPickleData(_OpPickleData):
 
 
 class _OpOverloadPacketPickleData(_OpPickleData):
+    # [CLASS DOC] HELPER: Reference to an operator overload packet by its dotted name.
     def __init__(self, name: str) -> None:
+        # [FUNCTION DOC] HELPER: Store the dotted name.
         self.name = name
 
     def unpickle(self, unpickle_state: _UnpickleState) -> torch._ops.OpOverloadPacket:
+        # [FUNCTION DOC] HELPER: Look up the name and return the overload packet. Raises an
+        # assertion error if the result is not an overload packet.
         obj = self._lookup_global_by_name(self.name)
         if not isinstance(obj, torch._ops.OpOverloadPacket):
             raise AssertionError(f"Expected OpOverloadPacket, got {type(obj)}")
@@ -820,15 +986,20 @@ class _OpOverloadPacketPickleData(_OpPickleData):
 
 
 class _OpPrecompiledPickleData(_OpPickleData):
+    # [CLASS DOC] HELPER: Target that is a precompiled artifact, stored as its serialized bytes.
     def __init__(self, artifact: AOTCompiledArtifact) -> None:
+        # [FUNCTION DOC] HELPER: Serialize the artifact and keep the bytes.
         self.contents = artifact.serialize()
 
     def unpickle(self, unpickle_state: _UnpickleState) -> object:
+        # [FUNCTION DOC] HELPER: Deserialize the artifact and return a wrapper function that
+        # forwards positional arguments to it (keyword arguments are not supported).
         precompiled_artifact = AOTCompiledArtifact.deserialize(self.contents)
         import functools
 
         @functools.wraps(precompiled_artifact)
         def wrapped(*args: Any) -> Any:
+            # [FUNCTION DOC] HELPER: Call the deserialized artifact with the given arguments.
             return precompiled_artifact(*args)
 
         return wrapped
@@ -840,15 +1011,22 @@ class _OpFunctionPickleData(_OpPickleData):
     These must be prefixed with the full namespace in order to properly
     be pickled (i.e `einops.rearrange` and not `from einops import rearrange`)
     """
+    # [CLASS DOC] HELPER: Target that is a standard function identified by a root module name
+    # (one of the supported roots) and a dotted detail name; unpickling imports the root and
+    # follows the detail path.
 
     # Static variable listing supported root names
     SUPPORTED_ROOTS = ("builtins.", "math.", "torch.", "operator.", "einops.")
 
     def __init__(self, root: str, name: str) -> None:
+        # [FUNCTION DOC] HELPER: Store the root module name and the remaining dotted name.
         self.root = root
         self.name = name
 
     def unpickle(self, unpickle_state: _UnpickleState) -> object:
+        # [FUNCTION DOC] HELPER: Resolve the function from its root module (builtins via the
+        # builtins mapping, which yields None for unknown names; others by attribute path).
+        # Raises NotImplementedError for an unsupported root.
         if self.root == "builtins":
             return __builtins__.get(self.name)  # type: ignore[attr-defined]
         elif self.root == "math":
@@ -870,7 +1048,11 @@ class _OpFunctionPickleData(_OpPickleData):
 
 
 class _GraphPickleData:
+    # [CLASS DOC] HELPER: Picklable form of a Graph: tracer class and extras, the ordered tuple of
+    # node pickle data, and the code generator. Other graph state is rebuilt on unpickle.
     def __init__(self, graph: torch.fx.Graph, options: Options) -> None:
+        # [FUNCTION DOC] HELPER: Capture each node in order (earlier nodes available to later
+        # ones), the tracer class and extras, and the code generator.
         self.tracer_cls = graph._tracer_cls
         self.tracer_extras = graph._tracer_extras
 
@@ -892,6 +1074,9 @@ class _GraphPickleData:
     def unpickle(
         self, gm: torch.fx.GraphModule, unpickle_state: _UnpickleState
     ) -> torch.fx.Graph:
+        # [FUNCTION DOC] HELPER: Create a new graph owned by gm, recreate nodes in saved order
+        # and restore the code generator. Returns the graph.
+        # KNOWN ISSUE: the attribute-existence check for the code generator is always true here.
         graph = torch.fx.Graph(gm, self.tracer_cls, self.tracer_extras)
 
         nodes: dict[_NodePickleData, torch.fx.Node] = {}
@@ -904,6 +1089,9 @@ class _GraphPickleData:
 
 
 class _TracingContextPickleData:
+    # [CLASS DOC] HELPER: Picklable subset of a TracingContext (module context, frame info, graph
+    # name, flattened parameter info, output strides, unspecialization flag). Other fields
+    # are deliberately not saved. Unpickling builds a new context on the state's fake mode.
     @classmethod
     def reduce_helper(
         cls, pickler: GraphPickler, obj: torch._guards.TracingContext
@@ -911,6 +1099,8 @@ class _TracingContextPickleData:
         Callable[[Self, _UnpickleState], torch._guards.TracingContext],
         tuple[Self, _UnpickleStateToken],
     ]:
+        # [FUNCTION DOC] HELPER: Return the unpickle method plus arguments (snapshot of obj and
+        # the state token).
         return (
             cls.unpickle,
             (
@@ -920,6 +1110,7 @@ class _TracingContextPickleData:
         )
 
     def __init__(self, context: TracingContext) -> None:
+        # [FUNCTION DOC] HELPER: Copy the selected fields from the context by reference.
         # TODO: Do we really need all of this?
         self.module_context = context.module_context
         self.frame_summary_stack = context.frame_summary_stack
@@ -942,6 +1133,8 @@ class _TracingContextPickleData:
         #   self.tensor_to_context = context.tensor_to_context
 
     def unpickle(self, unpickle_state: _UnpickleState) -> TracingContext:
+        # [FUNCTION DOC] HELPER: Create a tracing context on the state's fake mode and fill in
+        # the saved fields; returns it.
         context = TracingContext(unpickle_state.fake_mode)
         context.module_context = self.module_context
         context.frame_summary_stack = self.frame_summary_stack

@@ -1,3 +1,11 @@
+# [MODULE DOC] Configuration flags for the FX experimental symbolic-shapes machinery (ShapeEnv,
+# guard handling, translation validation, extended debugging, size-oblivious reasoning).
+# Most flags are plain module attributes, several defaulting from TORCHDYNAMO_* or
+# TORCHEXPORT_* environment variables read once at import; one uses a Config object with its
+# own environment-variable default. Import-time side effect: install_config_module converts
+# this module into a config module (supports patching, save/load) at the end of the flag
+# definitions. Also defines the AggressiveGuardFreeMode enum of valid values for the
+# aggressive guard-free setting.
 import enum
 import os
 import sys
@@ -136,6 +144,9 @@ install_config_module(sys.modules[__name__])
 
 
 class AggressiveGuardFreeMode(enum.IntEnum):
+    # [CLASS DOC] Integer enum of valid values for the aggressive guard-free semantics flag:
+    # DISABLED (0) keeps normal reasoning, VALUE_RANGE_ANALYSIS (1) consults symbolic bounds
+    # before returning the fallback, SKIP_RANGE_ANALYSIS (2) returns the fallback directly.
     DISABLED = 0
     VALUE_RANGE_ANALYSIS = 1  # use bound_sympy before returning fallback
     SKIP_RANGE_ANALYSIS = 2  # skip range analysis entirely, just return fallback_value
