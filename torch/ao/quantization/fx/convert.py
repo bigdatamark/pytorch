@@ -1,4 +1,11 @@
 # mypy: ignore-errors
+# [MODULE DOC] FX graph mode quantization convert step. Turns a model produced by prepare_fx (observers and
+# fake-quants in the graph) into a reference quantized model: observer calls become quantize/dequantize nodes
+# (either the standard torch ops or the quantized_decomposed ops), weighted modules (linear, conv, RNN cells,
+# fused/QAT modules) are swapped for reference quantized modules, custom and standalone modules are converted,
+# and finally the model is optionally lowered to fbgemm. Public API: convert, convert_custom_module,
+# convert_standalone_module, convert_weighted_module. Import-time side effect: importing the decomposed lib
+# registers the quantized_decomposed ops. Defines SUPPORTED_QDTYPES and a map from qscheme to choose_qparams op.
 
 import copy
 import operator
@@ -102,6 +109,13 @@ def _replace_observer_with_quantize_dequantize_node_decomposed(
     node_name_to_qconfig: dict[str, QConfigAny],
     model_device: torch.device | None = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Replaces one observer call node with a quantize/dequantize pair built from quantized_decomposed ops.
+    # If the observer has its own convert hook, delegates to it. If every producer/consumer qconfig is None or the observer's dtype
+    # is unsupported, the observer node is just removed. Static (per tensor or per channel) case: reads qparams from the observer,
+    # registers non-scalar scale/zero point as getattr nodes on the root model and emits quantize and dequantize nodes. Dynamic case
+    # (uint8/int8 only): inserts a choose_qparams node and tensor-variant ops. float16 case: inserts two dtype-conversion nodes.
+    # Mutates the graph and model; raises AssertionError for bad inputs or unsupported dynamic dtype, NotImplementedError if numeric
+    # debug handles are present in node metadata.
     """Replace activation_post_process module call node with quantize and
     dequantize node working with decomposed Tensor
 
@@ -152,6 +166,8 @@ def _replace_observer_with_quantize_dequantize_node_decomposed(
         is_dynamic = activation_post_process.is_dynamic  # type: ignore[assignment]
 
     def add_dequantize_op_kwargs(dequantize_op, input_node):
+        # [FUNCTION DOC] HELPER: Returns kwargs for the dequantize op: an out_dtype entry when the input node's recorded value dtype is
+        # not float32, otherwise an empty mapping.
         dequantize_op_kwargs = {}
         if "val" in input_node.meta:
             dq_out_dtype = input_node.meta["val"].dtype
@@ -375,6 +391,11 @@ def _replace_observer_with_quantize_dequantize_node(
     node_name_to_qconfig: dict[str, QConfigAny],
     model_device: torch.device | None = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Replaces an observer call node with a standard quantize and dequantize pair. If all neighbor qconfigs are None
+    # or the observer dtype is unsupported, simply removes the observer. Static case: per-channel or per-tensor quantize using the
+    # observer's calculated qparams (stored as getattr nodes) followed by a dequantize method call. Dynamic case: dynamic quantize
+    # with reduce_range chosen from the active quantized engine. float16 case: a to-dtype method call then dequantize.
+    # Mutates the graph; raises AssertionError on invalid inputs.
     """Replace activation_post_process module call node with quantize and
     dequantize node
 
@@ -528,6 +549,8 @@ def _replace_observer_with_quantize_dequantize_node(
 def _replace_observer_or_dequant_stub_with_dequantize_node(
     node: Node, graph: Graph
 ) -> None:
+    # [FUNCTION DOC] HELPER: For an observer or DeQuantStub node whose input is a custom module call, removes the node (reroutes its
+    # users to the custom module node) and inserts a dequantize node after the custom module. Raises AssertionError if the input is not a Node.
     call_custom_module_node = node.args[0]
     if not isinstance(call_custom_module_node, Node):
         raise AssertionError(
@@ -539,6 +562,8 @@ def _replace_observer_or_dequant_stub_with_dequantize_node(
 
 
 def _is_conversion_supported(activation_post_process: torch.nn.Module) -> bool:
+    # [FUNCTION DOC] HELPER: Returns true if the observer's dtype can be converted: a supported quantized dtype for static observers,
+    # any dynamic observer, or float16.
     dtype = activation_post_process.dtype  # type: ignore[attr-defined]
 
     is_dynamic = False
@@ -555,6 +580,8 @@ def _is_conversion_supported(activation_post_process: torch.nn.Module) -> bool:
 def _has_none_qconfig(
     node: Argument, node_name_to_qconfig: dict[str, QConfigAny]
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Returns true if the argument is a graph Node whose name maps to a qconfig of None in the given mapping
+    # (the user asked not to quantize it).
     """Check if a node has a qconfig of None, i.e. user requested to not quantize
     the node
     """
@@ -566,6 +593,9 @@ def _has_none_qconfig(
 
 
 def _run_weight_observers(observed: GraphModule, backend_config: BackendConfig) -> None:
+    # [FUNCTION DOC] HELPER: For each call_function node, finds weight arguments, extracts the subgraph that produces the weight (its
+    # weight observer), builds a module from it and runs it once so weight observers collect statistics (needed for dynamic or
+    # weight-only quantized ops). Side effect: runs observers.
     """Extract the subgraph that produces the weight for dynamic quant
     or weight only quant node and run the subgraph to observe the weight.
     Note that the observers of dynamic quant or weight only quant ops are
@@ -588,6 +618,9 @@ def _run_weight_observers(observed: GraphModule, backend_config: BackendConfig) 
 
 
 def _maybe_recursive_remove_dequantize(arg: Any, node: Node, graph: Graph) -> None:
+    # [FUNCTION DOC] HELPER: Recursively walks an argument (Node, list, tuple or dict values). A dequantize method-call Node is replaced
+    # as an input of the given node by its own input; containers are traversed. Anything else triggers a warning.
+    # KNOWN ISSUE: a Node that is not a dequantize call also falls into the final branch and emits the unsupported-type warning.
     """If the arg is a dequantize Node, or a list/tuple/dict of dequantize Node,
     we'll recursively remove the dequantize Node
     """
@@ -614,6 +647,10 @@ def _get_module_path_and_prefix(
     node_name_to_scope: dict[str, tuple[str, type]],
     node_name_to_qconfig: dict[str, QConfigAny],
 ) -> tuple[str, str]:
+    # [FUNCTION DOC] HELPER: Given an observer node, returns (module path, prefix) used to name qparam attributes. The path is the scope
+    # of the observed node, or of the first linear user (else first user) when the observer only observes an op input (observed node has
+    # a None qconfig), in which case the prefix is the input marker; otherwise the prefix is empty. Path is empty if no scope is found.
+    # Raises AssertionError if the observed argument is not a Node.
     """Given an observer node, get the `Scope` or the fully qualified name for
     the submodule containing the observed node, also return a prefix of "_input"
     when the observed node is an input of a F.linear op, and not the output of another
@@ -668,6 +705,7 @@ def _get_module_path_and_prefix(
 
 
 def _insert_dequantize_node(node: Node, graph: Graph) -> None:
+    # [FUNCTION DOC] HELPER: Inserts a dequantize method-call node right after the node and redirects all other users of the node to it.
     """Inserts dequantize node for `node` in `graph`"""
     with graph.inserting_after(node):
         dequantize_node = graph.call_method("dequantize", (node,))
@@ -679,6 +717,7 @@ def _insert_dequantize_node(node: Node, graph: Graph) -> None:
 def _maybe_get_observer_for_node(
     node: Node, modules: dict[str, torch.nn.Module]
 ) -> torch.nn.Module | None:
+    # [FUNCTION DOC] HELPER: Returns the activation post process module among the node's call_module users, or None if the node is not observed.
     """
     If the node is observed, return the observer
     instance. Otherwise, return None.
@@ -698,6 +737,10 @@ def convert_standalone_module(
     is_reference: bool,
     backend_config: BackendConfig | None,
 ) -> None:
+    # [FUNCTION DOC] Converts an observed standalone submodule: removes dequantize nodes feeding inputs that the standalone module expects
+    # quantized, adds a dequantize after the call if its output is quantized (only output index 0 supported), runs the fx convert (reference
+    # or regular, per is_reference) on the submodule with the backend config, and replaces the module in the parent's module mapping and the
+    # model. Raises AssertionError for unsupported output indexes. Mutates graph, model and modules mapping.
     """Converts an observed standalone module to a quantized standalone module by calling
     the fx convert api, currently using the same `is_reference` flag as parent, but we may
     changing this behavior in the future (e.g. separating quantization and lowering for
@@ -767,6 +810,11 @@ def convert_weighted_module(
     is_reference: bool = False,
     model_device: torch.device | None = None,
 ) -> None:
+    # [FUNCTION DOC] Swaps a weighted module (linear, conv, RNN cell, LSTM/GRU, fused, or QAT) for its reference quantized module.
+    # QAT modules are first turned into float modules (keeping the weight fake-quant). Returns without change if the node is not observed,
+    # the qconfig is None, unsupported by backend dtype configs, or the weight is not quantized. Otherwise runs the weight observer to get
+    # qparams, builds the qparam dict and replaces the module (or the first element of a fused module) with the reference class from_float
+    # result. Raises AssertionError if no reference class is configured. Mutates the modules mapping and parent module.
     """Convert a weighted module to reference quantized module in the model
     If the QConfig of a QAT module is not set, the module will still be converted to
     a float module.
@@ -909,6 +957,8 @@ def convert_weighted_module(
 def _remove_previous_dequantize_in_custom_module(
     node: Node, prev_node: Node, graph: Graph
 ) -> None:
+    # [FUNCTION DOC] HELPER: If the previous node feeding a custom module is a dequantize method call, rewires the custom module node to take
+    # the dequantize's input and erases the dequantize if it has no other users. Raises AssertionError if prev_node is not a Node.
     """
     Given a custom module `node`, if the previous node is a dequantize, reroute the custom as follows:
 
@@ -935,6 +985,10 @@ def convert_custom_module(
     custom_module_class_mapping: dict[QuantType, dict[type, type]],
     statically_quantized_custom_module_nodes: set[Node],
 ) -> None:
+    # [FUNCTION DOC] Converts an observed custom module to its quantized class using the class mapping. For statically quantized modules
+    # it records the node, strips preceding dequantize nodes (LSTM: input and both hidden states; MHA: query, key, value; others: first arg and
+    # attaches the following observer to the module). Then swaps the module via from_observed in the parent module.
+    # Raises AssertionError on unexpected argument structure or missing observer.
     """Converts an observed custom module to a quantized custom module based on
     `custom_module_class_mapping`
     For static quantization, we'll also remove the previous `dequantize` node and
@@ -1041,6 +1095,13 @@ def convert(
     is_decomposed: bool = False,
     keep_original_weights: bool = False,
 ) -> GraphModule:
+    # [FUNCTION DOC] Main entry point of convert. Normalizes deprecated dict configs (FutureWarning), defaults the backend config to native,
+    # requires a prepared model, optionally re-checks the qconfig mapping against prepare time, applies equalization, runs weight observers,
+    # then walks graph nodes: inserts dequantize for user-specified quantized inputs, removes dequantize for quantized outputs, replaces
+    # observers/DeQuantStubs with quantize-dequantize nodes, and converts standalone, weighted and custom modules. Afterwards removes dead
+    # code, rebuilds the GraphModule, lowers to fbgemm unless is_reference, removes qconfigs (if requested) and unused submodules and drops
+    # the prepare metadata. Returns the converted GraphModule. Raises AssertionError if the model was not prepared or qconfigs conflict.
+    # KNOWN ISSUE: the keep_original_weights flag is only forwarded to lowering and ignored when is_reference is true.
     """
     We will convert an observed model (a module with observer calls) to a reference
     quantized model, the rule is simple:

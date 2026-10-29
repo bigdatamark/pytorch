@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Defines ModelReport, the driver of the FX model report workflow: it inserts detector-chosen
+# observers into a GraphModule, generates reports after calibration, optionally removes the observers,
+# builds a ModelReportVisualizer, and converts report suggestions into QConfigMapping objects
+# (quantization and equalization). No import-time side effects.
 from collections import OrderedDict
 from collections.abc import Callable
 from typing import Any
@@ -22,6 +26,12 @@ from torch.ao.quantization.qconfig_mapping import QConfig, QConfigMapping
 
 
 class ModelReport:
+    # [CLASS DOC] Coordinates a set of unique DetectorBase objects over one traceable GraphModule.
+    # State: _model, _desired_report_detectors, _desired_detector_names, _detector_name_to_observer_fqns (detector name
+    # to the set of inserted observer fqns), _prepared_flag (observers inserted once only), _removed_observers
+    # (set after removal; blocks further report/mapping generation) and _generated_reports (detector name to the
+    # per-module info dict, kept for the visualizer). Typical flow: prepare_detailed_calibration, calibrate,
+    # generate_model_report, then generate_visualizer / generate_qconfig_mapping / generate_equalization_mapping.
     r"""
     The ModelReport class aims to provide users an easy way to diagnose issues that they run into
     with their models. The class works with all traceable GraphModules to help diagnose issues,
@@ -126,6 +136,8 @@ class ModelReport:
     """
 
     def __init__(self, model: GraphModule, desired_report_detectors: set[DetectorBase]):
+        # [FUNCTION DOC] Stores the model and detector set, derives the detector name set, and starts with empty observer
+        # bookkeeping, cleared flags and no generated reports. Raises ValueError if the detector set is empty.
         if len(desired_report_detectors) == 0:
             raise ValueError("Should include at least 1 desired report")
 
@@ -156,14 +168,22 @@ class ModelReport:
         self._generated_reports: dict[str, dict] = {}
 
     def get_desired_reports_names(self) -> set[str]:
+        # [FUNCTION DOC] Returns a shallow copy of the set of detector names requested for this report.
         """Returns a copy of the desired reports for viewing"""
         return self._desired_detector_names.copy()
 
     def get_observers_of_interest(self) -> dict[str, set[str]]:
+        # [FUNCTION DOC] Returns a shallow copy of the mapping from detector name to the set of observer fqns inserted for it
+        # (the inner sets are shared, not copied).
         """Returns a copy of the observers of interest for viewing"""
         return self._detector_name_to_observer_fqns.copy()
 
     def prepare_detailed_calibration(self) -> GraphModule:
+        # [FUNCTION DOC] Asks each detector for its observer insert points, records the observer fqns per detector, then inserts
+        # every observer into the model and graph. Sets the prepared flag and returns the same (mutated) GraphModule.
+        # Raises ValueError if called a second time on this instance.
+        # KNOWN ISSUE: if detectors share an observer fqn the later entry silently overrides the earlier one; the docstring's
+        # claim that redundant observers are skipped is not implemented here (it is up to the detectors).
         r"""
         Takes in a graph model and inserts the following observers:
         - ModelReportObserver
@@ -218,6 +238,9 @@ class ModelReport:
         observer_args: tuple,
         insert_post: bool,
     ):
+        # [FUNCTION DOC] HELPER: Adds the observer as a submodule under the given fqn and creates a call_module graph node with the
+        # given args before the target node (or before the node following it when insert_post is true), then recompiles
+        # the model. Mutates the model graph and module hierarchy.
         r"""
         Helper function that inserts the observer into both the graph structure and the module of the model
 
@@ -242,6 +265,9 @@ class ModelReport:
         self._model.recompile()
 
     def _get_node_from_fqn(self, node_fqn: str) -> torch.fx.node.Node:
+        # [FUNCTION DOC] HELPER: Scans the graph for the first node whose target equals the given fqn and returns it.
+        # Raises ValueError if no such node exists.
+        # KNOWN ISSUE: the docstring says it returns None when not found, but the code raises ValueError.
         r"""
         Takes in a node fqn and returns the node based on the fqn
 
@@ -269,6 +295,11 @@ class ModelReport:
     def generate_model_report(
         self, remove_inserted_observers: bool
     ) -> dict[str, tuple[str, dict]]:
+        # [FUNCTION DOC] Runs every detector's report generation on the model and returns a mapping from detector name to a
+        # tuple of (text summary, per-module info dict). If remove_inserted_observers is true, deletes all observers this
+        # instance inserted from the module tree and graph, recompiles, and marks observers removed. Saves the info dicts
+        # for later visualization. Raises a generic Exception if the model was not prepared or observers were already removed;
+        # raises ValueError if an observer node cannot be found during removal.
         r"""
         Generates all the requested reports.
 
@@ -349,6 +380,8 @@ class ModelReport:
         return reports_of_interest
 
     def _is_same_info_for_same_key(self, info_dict_a: dict, info_dict_b: dict) -> bool:
+        # [FUNCTION DOC] HELPER: Returns true if every key present in both dicts maps to equal values; tensor values are compared
+        # element-wise and must both be tensors. Keys in only one dict are ignored.
         r"""
         Takes in two dictionaries and ensures that any common keys between the two have the same
         values.
@@ -387,6 +420,9 @@ class ModelReport:
         return True
 
     def _reformat_reports_for_visualizer(self) -> OrderedDict:
+        # [FUNCTION DOC] HELPER: Merges the saved per-detector reports into one mapping from module fqn to its combined feature dict,
+        # then returns an OrderedDict ordered by module order in the model. Raises ValueError if two detectors report
+        # conflicting values for the same key on one module.
         r"""
         Takes the generated reports and reformats them into the format that is desired by the
         ModelReportVisualizer
@@ -441,6 +477,8 @@ class ModelReport:
         return features_by_module
 
     def generate_visualizer(self) -> ModelReportVisualizer:
+        # [FUNCTION DOC] Builds and returns a ModelReportVisualizer from the generated reports (merged and ordered per module).
+        # Raises a generic Exception if no reports were generated yet.
         r"""
         Generates a ModelReportVisualizer instance using the reports generated
         by the generate_model_report() method.
@@ -471,6 +509,8 @@ class ModelReport:
         detector_qconfig_info_combined: dict[str, DetectorQConfigInfo],
         generation_function: Callable,
     ) -> QConfigMapping:
+        # [FUNCTION DOC] HELPER: Builds a QConfigMapping by walking the model's named modules and, for each fqn that has detector
+        # qconfig info, calling generation_function with the info and module and setting the result as that module name's qconfig.
         r"""
         This helper takes in the compiled detector qconfig info that
         has been compiled together and merges it into a QConfigMapping
@@ -496,6 +536,8 @@ class ModelReport:
     def _update_detector_quantizaiton_qconfig_info(
         self, combined_info: DetectorQConfigInfo, new_info: DetectorQConfigInfo
     ):
+        # [FUNCTION DOC] HELPER: Merges new_info into combined_info in place for quantization: dynamic-activation and per-channel-weight
+        # flags become true if either input has them true.
         r"""
         Takes in the old and new information and updates the combined information.
 
@@ -514,6 +556,8 @@ class ModelReport:
     def _update_detector_equalization_qconfig_info(
         self, combined_info: DetectorQConfigInfo, new_info: DetectorQConfigInfo
     ):
+        # [FUNCTION DOC] HELPER: Merges new_info into combined_info in place for equalization: the equalization-recommended flag
+        # becomes true if either input has it true.
         r"""
         Takes in the old and new information and updates the combined information.
 
@@ -531,6 +575,9 @@ class ModelReport:
     def _generate_module_fqn_to_detector_info_mapping(
         self, update_qconfig_info_function: Callable
     ) -> dict[str, DetectorQConfigInfo]:
+        # [FUNCTION DOC] HELPER: Asks every detector for its per-module qconfig info and combines them into one mapping from module fqn
+        # to DetectorQConfigInfo, using the supplied update function to merge entries for the same module (the first-seen object is
+        # mutated). Raises a generic Exception if the model was not prepared or observers were already removed.
         r"""
         Generates a QConfigMapping based on the suggestions of the
         ModelReport API. The generated mapping encompasses all the
@@ -589,6 +636,8 @@ class ModelReport:
         return detector_qconfig_info_combined
 
     def generate_qconfig_mapping(self) -> QConfigMapping:
+        # [FUNCTION DOC] Returns a QConfigMapping built from all detectors' quantization suggestions (merged per module).
+        # Raises the same exceptions as the merging helper (not prepared, or observers removed).
         r"""
         Generates a QConfigMapping based on the suggestions of the
         ModelReport API. The generated mapping encompasses all the
@@ -624,6 +673,7 @@ class ModelReport:
     def _quantization_config_generator(
         self, detector_qconfig_info: DetectorQConfigInfo, module: torch.nn.Module
     ) -> QConfig:
+        # [FUNCTION DOC] HELPER: Returns the quantization qconfig that the given info object generates for the module.
         r"""
         Returns the quantization configuration generated by the DetectorQConfigInfo object
         """
@@ -632,6 +682,7 @@ class ModelReport:
     def _equalization_config_generator(
         self, detector_qconfig_info: DetectorQConfigInfo, module: torch.nn.Module
     ) -> EqualizationQConfig:
+        # [FUNCTION DOC] HELPER: Returns the equalization qconfig generated by the info object; the module argument is ignored.
         r"""
         We ignore the module argument here, and only focus on thedetector_qconfig_info
 
@@ -640,6 +691,9 @@ class ModelReport:
         return detector_qconfig_info.generate_equalization_qconfig()
 
     def generate_equalization_mapping(self) -> QConfigMapping:
+        # [FUNCTION DOC] Returns a QConfigMapping built from the detectors' equalization suggestions (merged per module).
+        # KNOWN ISSUE: unlike the quantization variant, the docstring lists no exceptions but the shared helper still raises
+        # a generic Exception if the model was not prepared or observers were removed.
         r"""
         Generates a QConfigMapping based on the suggestions of the
         ModelReport API for equalization. The generated mapping encompasses all the

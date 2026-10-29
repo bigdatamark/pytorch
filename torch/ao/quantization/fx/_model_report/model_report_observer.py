@@ -1,9 +1,17 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Defines ModelReportObserver, an observer module used by the FX model report tooling.
+# It records activation range, per-channel min/max and percentile-ratio statistics so that
+# detectors can recommend dynamic vs static quantization and spot outliers. No import-time side effects.
 import torch
 from torch.ao.quantization.observer import ObserverBase
 
 
 class ModelReportObserver(ObserverBase):
+    # [CLASS DOC] Observer (subclass of ObserverBase, qint8 dtype) that passes data through unchanged while
+    # accumulating statistics. Plain attribute: num_batches_tracked and average_batch_activation_range (running mean of per-batch
+    # max-min). Buffers: epoch_activation_min/max (global range), min_val/max_val (per channel, along ch_axis),
+    # comp_percentile, average_percentile_ratio, percentile_batches_tracked, constant_channels (all per channel,
+    # empty until first batch). Key methods: forward, get_batch_to_epoch_ratio, reset_batch_and_epoch_values.
     r"""This observer is used to record additional information regarding keeping track
     of S = average_batch_activation_range/epoch_activation_range.
 
@@ -53,6 +61,9 @@ class ModelReportObserver(ObserverBase):
     constant_channels: torch.Tensor
 
     def __init__(self, ch_axis: int = 1, comp_percentile: float = 0.9):
+        # [FUNCTION DOC] Initializes the observer with the channel axis (ch_axis) and the comparison percentile
+        # (comp_percentile, expected to be strictly between 0 and 1; not validated here). Registers the statistic buffers:
+        # epoch min is +inf, epoch max is -inf, per-channel buffers are empty tensors.
         super().__init__(torch.qint8)
         self.num_batches_tracked = 0
 
@@ -73,6 +84,9 @@ class ModelReportObserver(ObserverBase):
         self.register_buffer("constant_channels", torch.tensor([]))
 
     def forward(self, x):
+        # [FUNCTION DOC] Updates all statistics from the input tensor (detached, cast to the epoch buffer dtype)
+        # by calling the range, min/max and percentile helpers in order, and returns the original input unchanged.
+        # Side effects: mutates the observer's buffers and counters.
         x_copy = x.detach()  # avoid keeping autograd tape
         x_copy = x_copy.to(self.epoch_activation_min.dtype)
 
@@ -84,6 +98,8 @@ class ModelReportObserver(ObserverBase):
         return x
 
     def _calculate_range_stats(self, x_copy):
+        # [FUNCTION DOC] HELPER: Updates the global epoch min/max buffers and the running average of per-batch range
+        # (max minus min) using the input, increments num_batches_tracked, and returns the input tensor.
         r"""Calculates and stores range stats with forward values.
 
         Args
@@ -114,6 +130,9 @@ class ModelReportObserver(ObserverBase):
         return x_copy
 
     def _calculate_min_max_stats(self, x_copy):
+        # [FUNCTION DOC] HELPER: Updates per-channel min_val/max_val buffers along ch_axis. Permutes the channel axis to the front,
+        # flattens the rest, and takes min/max per channel (combined with the stored values if already
+        # initialized). Resizes and overwrites the buffers in place; returns the input tensor.
         r"""Calculates and stores the per_channel min, max stats with forward values.
         Does calculation based on channel axis: self.ch_axis
 
@@ -150,6 +169,12 @@ class ModelReportObserver(ObserverBase):
         return x_copy
 
     def _calculate_percentile_stats(self, x_copy):
+        # [FUNCTION DOC] HELPER: Updates per-channel percentile statistics. Computes the 0th, comp_percentile and 100th quantiles
+        # (lower interpolation, on CPU) per channel, then maintains a running average of the ratio of 100th to
+        # comp percentile quantile, counting only batches where a channel is not all zeros, and counts batches where the channel was
+        # constant. Lazily initializes the percentile buffers on first call. Returns the input tensor.
+        # KNOWN ISSUE: the quantile call uses dim=ch_axis after the channel axis was moved to the front and flattened, so for
+        # a ch_axis other than 0 or 1 the reduced dimension may not be the intended one.
         r"""Calculates and stores the per_channel percentile stats with forward values.
         Does calculation based on channel axis: self.ch_axis
 
@@ -252,6 +277,8 @@ class ModelReportObserver(ObserverBase):
 
     @torch.jit.export
     def get_batch_to_epoch_ratio(self):
+        # [FUNCTION DOC] Returns the average per-batch activation range divided by the whole-epoch range (max minus min).
+        # Raises ValueError if the epoch range is zero, or if it is infinite (no data observed).
         epoch_activation_range = self.epoch_activation_max - self.epoch_activation_min
 
         if epoch_activation_range == torch.tensor(float(0)):
@@ -265,6 +292,8 @@ class ModelReportObserver(ObserverBase):
 
     @torch.jit.export
     def reset_batch_and_epoch_values(self):
+        # [FUNCTION DOC] Resets all counters and statistics to their initial values for a new epoch, keeping the device of
+        # the max_val buffer. Replaces buffers with fresh tensors; note comp_percentile is left unchanged.
         # set all the values back to their original defaults for a new epoch
         # keep device
         device = self.max_val.device
@@ -280,6 +309,7 @@ class ModelReportObserver(ObserverBase):
 
     @torch.jit.export
     def calculate_qparams(self):  # type: ignore[override]
+        # [FUNCTION DOC] Always raises a generic Exception: qparams are not meaningful for this observer.
         raise Exception(  # noqa: TRY002
             "calculate_qparams should not be called for ModelReportObserver"
         )
