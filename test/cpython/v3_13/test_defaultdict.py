@@ -33,7 +33,14 @@ redirect_imports = (
 )
 
 class RedirectImportFinder(importlib.abc.MetaPathFinder):
+    # [CLASS DOC] HELPER: Import-system finder that redirects imports of names in
+    # redirect_imports (test support modules) to the same-named top-level modules. Instance is
+    # inserted into the meta path at import time.
     def find_spec(self, fullname, path, target=None):
+        # [FUNCTION DOC] HELPER: If the module name is in the redirect list, imports the module
+        # without the "test." prefix, registers it in the module table under the requested name
+        # and returns its spec; on an import failure, or for other names, returns None so other
+        # finders run.
         # Check if the import is the problematic one
         if fullname in redirect_imports:
             try:
@@ -54,6 +61,12 @@ sys.meta_path.insert(0, RedirectImportFinder())
 
 # ======= END DYNAMO PATCH =======
 
+# [MODULE DOC] Dynamo-patched copy of the CPython 3.13 test_defaultdict tests for the
+# defaultdict container from the collections module. At import time it installs a meta path
+# finder at the front of the import system that redirects selected "test." module imports to
+# their top-level equivalents. The test class derives from CPythonTestCase. Running as a script
+# calls run_tests.
+
 
 """Unit tests for collections.defaultdict."""
 
@@ -64,11 +77,17 @@ import unittest
 from collections import defaultdict
 
 def foobar():
+    # [FUNCTION DOC] HELPER: Module-level default factory used by copy tests; returns the
+    # list type.
     return list
 
 class TestDefaultDict(__TestCase):
+    # [CLASS DOC] Test suite for defaultdict, run through the Dynamo CPython test harness.
 
     def test_basic(self):
+        # [FUNCTION DOC] Checks construction with and without a factory, missing-key creation,
+        # key containment semantics, clearing the factory, and the TypeError for a
+        # non-callable factory.
         d1 = defaultdict()
         self.assertEqual(d1.default_factory, None)
         d1.default_factory = list
@@ -105,12 +124,16 @@ class TestDefaultDict(__TestCase):
         self.assertRaises(TypeError, defaultdict, 1)
 
     def test_missing(self):
+        # [FUNCTION DOC] Checks the missing-key hook: raises KeyError without a factory, builds
+        # a value with one.
         d1 = defaultdict()
         self.assertRaises(KeyError, d1.__missing__, 42)
         d1.default_factory = list
         self.assertEqual(d1.__missing__(42), [])
 
     def test_repr(self):
+        # [FUNCTION DOC] Checks the repr format for no factory, builtin type factory and
+        # function factory.
         d1 = defaultdict()
         self.assertEqual(d1.default_factory, None)
         self.assertEqual(repr(d1), "defaultdict(None, {})")
@@ -128,6 +151,8 @@ class TestDefaultDict(__TestCase):
         self.assertEqual(repr(d3), "defaultdict(%s, {13: 43})" % repr(foo))
 
     def test_copy(self):
+        # [FUNCTION DOC] Checks that the copy method preserves type, factory and contents,
+        # including the empty case.
         d1 = defaultdict()
         d2 = d1.copy()
         self.assertEqual(type(d2), defaultdict)
@@ -153,6 +178,8 @@ class TestDefaultDict(__TestCase):
         self.assertEqual(e['a'], 42)
 
     def test_shallow_copy(self):
+        # [FUNCTION DOC] Checks that a shallow copy keeps the factory and contents equal to
+        # the original.
         d1 = defaultdict(foobar, {1: 1})
         d2 = copy.copy(d1)
         self.assertEqual(d2.default_factory, foobar)
@@ -163,6 +190,8 @@ class TestDefaultDict(__TestCase):
         self.assertEqual(d2, d1)
 
     def test_deep_copy(self):
+        # [FUNCTION DOC] Checks that a deep copy keeps the factory and equal contents but
+        # duplicates stored values.
         d1 = defaultdict(foobar, {1: [1]})
         d2 = copy.deepcopy(d1)
         self.assertEqual(d2.default_factory, foobar)
@@ -174,6 +203,8 @@ class TestDefaultDict(__TestCase):
         self.assertEqual(d2, d1)
 
     def test_keyerror_without_factory(self):
+        # [FUNCTION DOC] Checks that a missing key without a factory raises KeyError carrying
+        # the key.
         d1 = defaultdict()
         try:
             d1[(1,)]
@@ -183,11 +214,16 @@ class TestDefaultDict(__TestCase):
             self.fail("expected KeyError")
 
     def test_recursive_repr(self):
+        # [FUNCTION DOC] Checks that repr does not recurse infinitely when the factory is a
+        # bound method of the dict.
         # Issue2045: stack overflow when default_factory is a bound method
         class sub(defaultdict):
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Initializer that sets the factory to its own
+                # bound method.
                 self.default_factory = self._factory
             def _factory(self):
+                # [FUNCTION DOC] HELPER: Factory returning a new empty list.
                 return []
         d = sub()
         self.assertRegex(repr(d),
@@ -195,9 +231,12 @@ class TestDefaultDict(__TestCase):
             r"of sub\(\.\.\., \{\}\)>, \{\}\)")
 
     def test_callable_arg(self):
+        # [FUNCTION DOC] Checks that constructing with a non-callable first argument raises
+        # a TypeError.
         self.assertRaises(TypeError, defaultdict, {})
 
     def test_pickling(self):
+        # [FUNCTION DOC] Checks pickle round trips of a defaultdict at every protocol version.
         d = defaultdict(int)
         d[1]
         for proto in range(pickle.HIGHEST_PROTOCOL + 1):
@@ -206,6 +245,9 @@ class TestDefaultDict(__TestCase):
             self.assertEqual(d, o)
 
     def test_union(self):
+        # [FUNCTION DOC] Checks the merge operator: the left operand's factory is kept, key
+        # order follows the left operand first, mixing with plain dicts works, merging with a
+        # non-mapping raises a TypeError, and in-place merge accepts item pairs.
         i = defaultdict(int, {1: 1, 2: 2})
         s = defaultdict(str, {0: "zero", 1: "one"})
 

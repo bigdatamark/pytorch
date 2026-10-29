@@ -21,6 +21,13 @@ from torch.testing._internal.common_utils import (
 
 # ======= END DYNAMO PATCH =======
 
+# [MODULE DOC] Dynamo-patched copy of the CPython 3.13 test_deque tests for collections.deque:
+# basic operations, bounded length, comparison, indexing, rotation, pickling, copying, weak
+# references, subclassing, and the common sequence tests from seq_tests. Defines helper
+# comparison and subclass fixtures and several CPythonTestCase suites. Some tests are skipped
+# under Dynamo (closed-over class bodies, slow tests). The reference-manual examples are exposed
+# through the module-level doctest mapping. Running as a script calls run_tests.
+
 from collections import deque
 import doctest
 import unittest
@@ -36,24 +43,38 @@ import struct
 BIG = 100000
 
 def fail():
+    # [FUNCTION DOC] HELPER: Generator that raises a SyntaxError as soon as iteration starts, so
+    # it never yields a value.
     raise SyntaxError
     yield 1
 
 class BadCmp:
+    # [CLASS DOC] HELPER: Fixture whose equality method always raises a RuntimeError.
     def __eq__(self, other):
+        # [FUNCTION DOC] HELPER: Raises a RuntimeError unconditionally.
         raise RuntimeError
 
 class MutateCmp:
+    # [CLASS DOC] HELPER: Fixture whose equality method clears a given deque and returns a
+    # preset result.
     def __init__(self, deque, result):
+        # [FUNCTION DOC] HELPER: Stores the deque to mutate and the result to return
+        # from comparison.
         self.deque = deque
         self.result = result
     def __eq__(self, other):
+        # [FUNCTION DOC] HELPER: Empties the stored deque as a side effect and returns the
+        # preset result.
         self.deque.clear()
         return self.result
 
 class TestBasic(CPythonTestCase):
+    # [CLASS DOC] Test suite for core deque behavior, run through the Dynamo CPython
+    # test harness.
 
     def test_basics(self):
+        # [FUNCTION DOC] Checks construction, append and appendleft at both ends, popleft and
+        # pop, length, and re-initializing an existing deque.
         d = deque(range(-5125, -5000))
         d.__init__(range(200))
         for i in range(200, 400):
@@ -73,6 +94,9 @@ class TestBasic(CPythonTestCase):
         self.assertEqual(list(d), list(range(50, 150)))
 
     def test_maxlen(self):
+        # [FUNCTION DOC] Checks maximum length: negative lengths raise a ValueError, old items
+        # are dropped from the opposite end on append, extend and their left variants, repr
+        # shows the length bound and marks recursive entries.
         self.assertRaises(ValueError, deque, 'abc', -1)
         self.assertRaises(ValueError, deque, 'abc', -2)
         it = iter(range(10))
@@ -96,6 +120,8 @@ class TestBasic(CPythonTestCase):
         self.assertEqual(repr(d), 'deque([0, 1, 2, 3, 4, 5, 6, 7, 8, 9])')
 
     def test_maxlen_zero(self):
+        # [FUNCTION DOC] Checks that a zero maximum length drains iterators but keeps the
+        # deque empty.
         it = iter(range(100))
         deque(it, maxlen=0)
         self.assertEqual(list(it), [])
@@ -111,6 +137,8 @@ class TestBasic(CPythonTestCase):
         self.assertEqual(list(it), [])
 
     def test_maxlen_attribute(self):
+        # [FUNCTION DOC] Checks the maxlen attribute value for several constructions and that it
+        # is read only.
         self.assertEqual(deque().maxlen, None)
         self.assertEqual(deque('abc').maxlen, None)
         self.assertEqual(deque('abc', maxlen=4).maxlen, 4)
@@ -125,6 +153,9 @@ class TestBasic(CPythonTestCase):
         "__build_class__ with closed over objects not supported",
     )
     def test_count(self):
+        # [FUNCTION DOC] Checks count: results match list counting, arity errors raise a
+        # TypeError, an erroring comparison propagates, a comparison that mutates the deque
+        # raises a RuntimeError, and counting still works after rotations. Skipped under Dynamo.
         for s in ('', 'abracadabra', 'simsalabim'*500+'abc'):
             s = list(s)
             d = deque(s)
@@ -133,14 +164,20 @@ class TestBasic(CPythonTestCase):
         self.assertRaises(TypeError, d.count)       # too few args
         self.assertRaises(TypeError, d.count, 1, 2) # too many args
         class BadCompare:
+            # [CLASS DOC] HELPER: Fixture whose equality method raises an ArithmeticError.
             def __eq__(self, other):
+                # [FUNCTION DOC] HELPER: Raises an ArithmeticError unconditionally.
                 raise ArithmeticError
         d = deque([1, 2, BadCompare(), 3])
         self.assertRaises(ArithmeticError, d.count, 2)
         d = deque([1, 2, 3])
         self.assertRaises(ArithmeticError, d.count, BadCompare())
         class MutatingCompare:
+            # [CLASS DOC] HELPER: Fixture whose equality method pops an item from the deque
+            # stored on it.
             def __eq__(self, other):
+                # [FUNCTION DOC] HELPER: Pops the last item of the stored deque and
+                # reports equality.
                 self.d.pop()
                 return True
         m = MutatingCompare()
@@ -158,6 +195,9 @@ class TestBasic(CPythonTestCase):
         self.assertEqual(d.count(None), 16)
 
     def test_comparisons(self):
+        # [FUNCTION DOC] Checks equality and ordering of deques against other deques and a
+        # list, matching the results of comparing equivalent lists, with a deque never equal to
+        # a list.
         d = deque('xabc')
         d.popleft()
         for e in [d, deque('abc'), deque('ab'), deque(), list(d)]:
@@ -179,6 +219,8 @@ class TestBasic(CPythonTestCase):
         "__build_class__ with closed over objects not supported",
     )
     def test_contains(self):
+        # [FUNCTION DOC] Checks membership: present and absent items, a mutation during the scan
+        # and an erroring comparison both raise a RuntimeError. Skipped under Dynamo.
         n = 200
 
         d = deque(range(n))
@@ -203,8 +245,14 @@ class TestBasic(CPythonTestCase):
         "__build_class__ with closed over objects not supported",
     )
     def test_contains_count_index_stop_crashes(self):
+        # [FUNCTION DOC] Checks that membership, count and index raise a RuntimeError rather
+        # than crashing when a comparison empties the deque. Skipped under Dynamo.
         class A:
+            # [CLASS DOC] HELPER: Fixture whose equality method clears the enclosing deque and
+            # defers the comparison.
             def __eq__(self, other):
+                # [FUNCTION DOC] HELPER: Clears the enclosing deque variable and
+                # returns NotImplemented.
                 d.clear()
                 return NotImplemented
         d = deque([A(), A()])
@@ -219,6 +267,8 @@ class TestBasic(CPythonTestCase):
             d.index(0)
 
     def test_extend(self):
+        # [FUNCTION DOC] Checks extend with invalid input (TypeError), a string, and extending a
+        # deque by itself.
         d = deque('a')
         self.assertRaises(TypeError, d.extend, 1)
         d.extend('bcd')
@@ -227,6 +277,8 @@ class TestBasic(CPythonTestCase):
         self.assertEqual(list(d), list('abcdabcd'))
 
     def test_add(self):
+        # [FUNCTION DOC] Checks the concatenation operator: results are new deques, a maximum
+        # length applies to the left operand, and concatenating a non-deque raises a TypeError.
         d = deque()
         e = deque('abc')
         f = deque('def')
@@ -247,6 +299,8 @@ class TestBasic(CPythonTestCase):
             deque('abc') + 'def'
 
     def test_iadd(self):
+        # [FUNCTION DOC] Checks in-place concatenation with an iterable and with the
+        # deque itself.
         d = deque('a')
         d += 'bcd'
         self.assertEqual(list(d), list('abcd'))
@@ -254,6 +308,8 @@ class TestBasic(CPythonTestCase):
         self.assertEqual(list(d), list('abcdabcd'))
 
     def test_extendleft(self):
+        # [FUNCTION DOC] Checks extendleft: invalid input raises a TypeError, items end up in
+        # reversed order, self-extension works, and an exception from a generator propagates.
         d = deque('a')
         self.assertRaises(TypeError, d.extendleft, 1)
         d.extendleft('bcd')
@@ -266,6 +322,8 @@ class TestBasic(CPythonTestCase):
         self.assertRaises(SyntaxError, d.extendleft, fail())
 
     def test_getitem(self):
+        # [FUNCTION DOC] Checks indexing with positive and negative positions during a
+        # randomized sequence of operations, and that an empty deque raises an IndexError.
         n = 200
         d = deque(range(n))
         l = list(range(n))
@@ -290,6 +348,9 @@ class TestBasic(CPythonTestCase):
         "__build_class__ with closed over objects not supported",
     )
     def test_index(self):
+        # [FUNCTION DOC] Checks index: finds all items, raises a ValueError for absent items,
+        # detects mutation and comparison errors with a RuntimeError, and matches list behavior
+        # for start and stop arguments, including large starts. Skipped under Dynamo.
         for n in 1, 2, 30, 40, 200:
 
             d = deque(range(n))
@@ -336,11 +397,15 @@ class TestBasic(CPythonTestCase):
             d.rotate()
 
     def test_index_bug_24913(self):
+        # [FUNCTION DOC] Checks a regression: searching a short deque with an out-of-range stop
+        # raises ValueError.
         d = deque('A' * 3)
         with self.assertRaises(ValueError):
             i = d.index("Hello world", 0, 4)
 
     def test_insert(self):
+        # [FUNCTION DOC] Checks that insert at many positions (including out of range) matches
+        # list insert.
         # Test to make sure insert behaves like lists
         elements = 'ABCDEFGHI'
         for i in range(-5 - len(elements)*2, 5 + len(elements) * 2):
@@ -351,6 +416,9 @@ class TestBasic(CPythonTestCase):
             self.assertEqual(list(d), s)
 
     def test_insert_bug_26194(self):
+        # [FUNCTION DOC] Checks insert on a full bounded deque raises an IndexError, and on a
+        # roomy bounded deque places the item at the expected position for negative and
+        # positive indices.
         data = 'ABC'
         d = deque(data, maxlen=len(data))
         with self.assertRaises(IndexError):
@@ -366,6 +434,9 @@ class TestBasic(CPythonTestCase):
                 self.assertEqual(d[i-1], 'Z')
 
     def test_imul(self):
+        # [FUNCTION DOC] Checks in-place repetition for empty, single and multi item deques,
+        # with and without a maximum length, including negative and zero counts and truncation
+        # to the bound.
         for n in (-10, -1, 0, 1, 2, 10, 1000):
             d = deque()
             d *= n
@@ -397,6 +468,9 @@ class TestBasic(CPythonTestCase):
             self.assertEqual(d.maxlen, 500)
 
     def test_mul(self):
+        # [FUNCTION DOC] Checks the repetition operator on either side for various counts:
+        # results are new deques, negative or zero counts give empty deques, and a maximum
+        # length truncates.
         d = deque('abc')
         self.assertEqual(d * -5, deque())
         self.assertEqual(d * 0, deque())
@@ -423,6 +497,8 @@ class TestBasic(CPythonTestCase):
         self.assertEqual(d * 30, deque('bcabc'))
 
     def test_setitem(self):
+        # [FUNCTION DOC] Checks item assignment with positive and negative indices against
+        # a list.
         n = 200
         d = deque(range(n))
         for i in range(n):
@@ -435,6 +511,8 @@ class TestBasic(CPythonTestCase):
         self.assertEqual(list(d), l)
 
     def test_delitem(self):
+        # [FUNCTION DOC] Checks item deletion: out-of-range indices raise an IndexError, and
+        # deleting random positions removes the item and shrinks the length until empty.
         n = 500         # O(n**2) test, don't make this too big
         d = deque(range(n))
         self.assertRaises(IndexError, d.__delitem__, -n-1)
@@ -449,6 +527,8 @@ class TestBasic(CPythonTestCase):
         self.assertEqual(len(d), 0)
 
     def test_reverse(self):
+        # [FUNCTION DOC] Checks reverse: reverses in place, returns None, and rejects any
+        # argument with a TypeError.
         n = 500         # O(n**2) test, don't make this too big
         data = [random.random() for i in range(n)]
         for i in range(n):
@@ -461,6 +541,9 @@ class TestBasic(CPythonTestCase):
         self.assertRaises(TypeError, d.reverse, 1)          # Arity is zero
 
     def test_rotate(self):
+        # [FUNCTION DOC] Checks rotate with positive, negative, default, wrapping and very large
+        # counts against repeated single steps, plus bad argument types, too many arguments, and
+        # an empty deque.
         s = tuple('abcde')
         n = len(s)
 
@@ -514,6 +597,8 @@ class TestBasic(CPythonTestCase):
         self.assertEqual(d, deque())
 
     def test_len(self):
+        # [FUNCTION DOC] Checks the length through appends, pops, clear, and that popping an
+        # empty deque raises.
         d = deque('ab')
         self.assertEqual(len(d), 2)
         d.popleft()
@@ -530,11 +615,13 @@ class TestBasic(CPythonTestCase):
         self.assertEqual(len(d), 0)
 
     def test_underflow(self):
+        # [FUNCTION DOC] Checks that pop and popleft on an empty deque raise an IndexError.
         d = deque()
         self.assertRaises(IndexError, d.pop)
         self.assertRaises(IndexError, d.popleft)
 
     def test_clear(self):
+        # [FUNCTION DOC] Checks that clear empties a deque and is safe on an empty deque.
         d = deque(range(100))
         self.assertEqual(len(d), 100)
         d.clear()
@@ -548,6 +635,9 @@ class TestBasic(CPythonTestCase):
         "__build_class__ with closed over objects not supported",
     )
     def test_remove(self):
+        # [FUNCTION DOC] Checks remove: deletes the first match, raises a ValueError when
+        # absent, leaves order intact when a comparison raises, and copes with comparisons that
+        # mutate the deque. Skipped under Dynamo.
         d = deque('abcdefghcij')
         d.remove('c')
         self.assertEqual(d, deque('abdefghcij'))
@@ -572,6 +662,8 @@ class TestBasic(CPythonTestCase):
             self.assertEqual(d, deque())
 
     def test_repr(self):
+        # [FUNCTION DOC] Checks that repr can be evaluated back into an equal deque and marks
+        # self references.
         d = deque(range(200))
         e = eval(repr(d))
         self.assertEqual(list(d), list(e))
@@ -579,14 +671,19 @@ class TestBasic(CPythonTestCase):
         self.assertEqual(repr(d)[-20:], '7, 198, 199, [...]])')
 
     def test_init(self):
+        # [FUNCTION DOC] Checks that too many or non-iterable constructor arguments raise
+        # a TypeError.
         self.assertRaises(TypeError, deque, 'abc', 2, 3)
         self.assertRaises(TypeError, deque, 1)
 
     def test_hash(self):
+        # [FUNCTION DOC] Checks that deques are unhashable, so hashing raises a TypeError.
         self.assertRaises(TypeError, hash, deque('abc'))
 
     @skipIfTorchDynamo("slow Test")
     def test_long_steadystate_queue_popleft(self):
+        # [FUNCTION DOC] Steady-state queue test: append to the right and popleft keeps FIFO
+        # order. Skipped as slow.
         for size in (0, 1, 2, 100, 1000):
             d = deque(range(size))
             append, pop = d.append, d.popleft
@@ -599,6 +696,8 @@ class TestBasic(CPythonTestCase):
 
     @skipIfTorchDynamo("slow Test")
     def test_long_steadystate_queue_popright(self):
+        # [FUNCTION DOC] Steady-state queue test: appendleft and pop from the right keep order.
+        # Skipped as slow.
         for size in (0, 1, 2, 100, 1000):
             d = deque(reversed(range(size)))
             append, pop = d.appendleft, d.pop
@@ -612,6 +711,8 @@ class TestBasic(CPythonTestCase):
 
     @skipIfTorchDynamo("slow Test")
     def test_big_queue_popleft(self):
+        # [FUNCTION DOC] Fills a large deque by append and drains it with popleft in order.
+        # Skipped as slow.
         pass
         d = deque()
         append, pop = d.append, d.popleft
@@ -624,6 +725,8 @@ class TestBasic(CPythonTestCase):
 
     @skipIfTorchDynamo("slow Test")
     def test_big_queue_popright(self):
+        # [FUNCTION DOC] Fills a large deque by appendleft and drains it with pop in order.
+        # Skipped as slow.
         d = deque()
         append, pop = d.appendleft, d.pop
         for i in range(BIG):
@@ -635,6 +738,8 @@ class TestBasic(CPythonTestCase):
 
     @skipIfTorchDynamo("slow Test")
     def test_big_stack_right(self):
+        # [FUNCTION DOC] Uses a large deque as a right-side stack (append then pop in reverse).
+        # Skipped as slow.
         d = deque()
         append, pop = d.append, d.pop
         for i in range(BIG):
@@ -647,6 +752,8 @@ class TestBasic(CPythonTestCase):
 
     @skipIfTorchDynamo("slow Test")
     def test_big_stack_left(self):
+        # [FUNCTION DOC] Uses a large deque as a left-side stack (appendleft then popleft).
+        # Skipped as slow.
         d = deque()
         append, pop = d.appendleft, d.popleft
         for i in range(BIG):
@@ -658,12 +765,16 @@ class TestBasic(CPythonTestCase):
         self.assertEqual(len(d), 0)
 
     def test_roundtrip_iter_init(self):
+        # [FUNCTION DOC] Checks that building a deque from another deque gives an equal but
+        # distinct object.
         d = deque(range(200))
         e = deque(d)
         self.assertNotEqual(id(d), id(e))
         self.assertEqual(list(d), list(e))
 
     def test_pickle(self):
+        # [FUNCTION DOC] Checks pickling round trips at every protocol, preserving contents and
+        # maximum length.
         for d in deque(range(200)), deque(range(200), 100):
             for i in range(pickle.HIGHEST_PROTOCOL + 1):
                 s = pickle.dumps(d, i)
@@ -673,6 +784,8 @@ class TestBasic(CPythonTestCase):
                 self.assertEqual(e.maxlen, d.maxlen)
 
     def test_pickle_recursive(self):
+        # [FUNCTION DOC] Checks that pickling a deque containing itself restores the
+        # self reference.
         for d in deque('abc'), deque('abc', 3):
             d.append(d)
             for i in range(pickle.HIGHEST_PROTOCOL + 1):
@@ -682,6 +795,9 @@ class TestBasic(CPythonTestCase):
                 self.assertEqual(e.maxlen, d.maxlen)
 
     def test_iterator_pickle(self):
+        # [FUNCTION DOC] Checks that deque iterators pickle at four stages (fresh, running,
+        # empty, exhausted) and, once restored, iterate over the restored deque with the
+        # expected remaining items.
         orig = deque(range(200))
         data = [i*1.01 for i in orig]
         for proto in range(pickle.HIGHEST_PROTOCOL + 1):
@@ -723,6 +839,7 @@ class TestBasic(CPythonTestCase):
             self.assertEqual(list(it), [])
 
     def test_deepcopy(self):
+        # [FUNCTION DOC] Checks that a deep copy duplicates contained mutable items.
         mut = [10]
         d = deque([mut])
         e = copy.deepcopy(d)
@@ -732,6 +849,8 @@ class TestBasic(CPythonTestCase):
         self.assertNotEqual(list(d), list(e))
 
     def test_copy(self):
+        # [FUNCTION DOC] Checks that a shallow copy shares items, and that copy keeps contents,
+        # maximum length and item identity over several sizes.
         mut = [10]
         d = deque([mut])
         e = copy.copy(d)
@@ -750,6 +869,8 @@ class TestBasic(CPythonTestCase):
                 self.assertTrue(all(x is y for x, y in zip(d, e)))
 
     def test_copy_method(self):
+        # [FUNCTION DOC] Checks that the copy method makes a distinct deque sharing the
+        # same items.
         mut = [10]
         d = deque([mut])
         e = d.copy()
@@ -759,15 +880,21 @@ class TestBasic(CPythonTestCase):
         self.assertEqual(list(d), list(e))
 
     def test_reversed(self):
+        # [FUNCTION DOC] Checks that reversed iteration of a deque matches reversing the
+        # source sequence.
         for s in ('abcd', range(2000)):
             self.assertEqual(list(reversed(deque(s))), list(reversed(s)))
 
     def test_reversed_new(self):
+        # [FUNCTION DOC] Checks that the reversed iterator type can be constructed directly from
+        # a deque.
         klass = type(reversed(deque()))
         for s in ('abcd', range(2000)):
             self.assertEqual(list(klass(deque(s))), list(reversed(s)))
 
     def test_gc_doesnt_blowup(self):
+        # [FUNCTION DOC] Checks that garbage collection during growth does not crash
+        # (traversal regression).
         import gc
         # This used to assert-fail in deque_traverse() under a debug
         # build, or run wild with a NULL pointer in a release build.
@@ -777,8 +904,12 @@ class TestBasic(CPythonTestCase):
             gc.collect()
 
     def test_container_iterator(self):
+        # [FUNCTION DOC] Checks that a reference cycle through a deque iterator or reversed
+        # iterator is collected by the garbage collector.
         # Bug #3680: tp_traverse was not implemented for deque iterator objects
         class C(object):
+            # [CLASS DOC] HELPER: Empty class whose instance holds an iterator in an attribute
+            # to form a cycle.
             pass
         for i in range(2):
             obj = C()
@@ -796,6 +927,8 @@ class TestBasic(CPythonTestCase):
 
     @support.cpython_only
     def test_sizeof(self):
+        # [FUNCTION DOC] Checks the reported memory size of deques of several lengths against
+        # computed block-based sizes. Runs only on CPython.
         MAXFREEBLOCKS = 16
         BLOCKLEN = 64
         basesize = support.calcvobjsize('2P5n%dPP' % MAXFREEBLOCKS)
@@ -809,8 +942,12 @@ class TestBasic(CPythonTestCase):
         check(deque('a' * (42 * BLOCKLEN)), basesize + 43 * blocksize)
 
 class TestVariousIteratorArgs(CPythonTestCase):
+    # [CLASS DOC] Test suite for deque construction from various iterator types, using
+    # seq_tests helpers.
 
     def test_constructor(self):
+        # [FUNCTION DOC] Checks that deques built from many iterator kinds match the list
+        # contents, and that bad iterators raise the expected errors.
         for s in ("123", "", range(1000), ('do', 1.2), range(2000,2200,5)):
             for g in (seq_tests.Sequence, seq_tests.IterFunc,
                       seq_tests.IterGen, seq_tests.IterFuncStop,
@@ -821,30 +958,41 @@ class TestVariousIteratorArgs(CPythonTestCase):
             self.assertRaises(ZeroDivisionError, deque, seq_tests.IterGenExc(s))
 
     def test_iter_with_altered_data(self):
+        # [FUNCTION DOC] Checks that advancing an iterator after the deque shrank raises
+        # a RuntimeError.
         d = deque('abcdefg')
         it = iter(d)
         d.pop()
         self.assertRaises(RuntimeError, next, it)
 
     def test_runtime_error_on_empty_deque(self):
+        # [FUNCTION DOC] Checks that an iterator made on an empty deque raises a RuntimeError
+        # after an append.
         d = deque()
         it = iter(d)
         d.append(10)
         self.assertRaises(RuntimeError, next, it)
 
 class Deque(deque):
+    # [CLASS DOC] HELPER: Plain deque subclass used by the subclass tests.
     pass
 
 class DequeWithSlots(deque):
+    # [CLASS DOC] HELPER: Deque subclass with declared slots plus a dynamic attribute mapping.
     __slots__ = ('x', 'y', '__dict__')
 
 class DequeWithBadIter(deque):
+    # [CLASS DOC] HELPER: Deque subclass used to check pickling of subclasses.
     def __iter__(self):
+        # [FUNCTION DOC] HELPER: Iteration hook that always raises a TypeError.
         raise TypeError
 
 class TestSubclass(CPythonTestCase):
+    # [CLASS DOC] Test suite for subclasses of deque, run through the Dynamo CPython
+    # test harness.
 
     def test_basics(self):
+        # [FUNCTION DOC] Checks the basic append, pop and clear operations on a deque subclass.
         d = Deque(range(25))
         d.__init__(range(200))
         for i in range(200, 400):
@@ -867,6 +1015,8 @@ class TestSubclass(CPythonTestCase):
         self.assertEqual(len(d), 0)
 
     def test_copy_pickle(self):
+        # [FUNCTION DOC] Checks copying and pickling of subclasses with extra attributes: type,
+        # contents and attributes are kept, slot attributes not set are absent.
         for cls in Deque, DequeWithSlots:
             for d in cls('abc'), cls('abcde', maxlen=4):
                 d.x = ['x']
@@ -891,6 +1041,8 @@ class TestSubclass(CPythonTestCase):
                     self.assertFalse(hasattr(e, 'y'))
 
     def test_pickle_recursive(self):
+        # [FUNCTION DOC] Checks pickling recursive subclass instances, including via an
+        # attribute, and that a subclass whose iteration raises a TypeError cannot be pickled.
         for proto in range(pickle.HIGHEST_PROTOCOL + 1):
             for d in Deque('abc'), Deque('abc', 3):
                 d.append(d)
@@ -912,6 +1064,8 @@ class TestSubclass(CPythonTestCase):
                 self.assertRaises(TypeError, pickle.dumps, d, proto)
 
     def test_weakref(self):
+        # [FUNCTION DOC] Checks weak proxies to deques: usable while alive, ReferenceError
+        # after collection.
         d = deque('gallahad')
         p = weakref.proxy(d)
         self.assertEqual(str(p), str(d))
@@ -920,8 +1074,12 @@ class TestSubclass(CPythonTestCase):
         self.assertRaises(ReferenceError, str, p)
 
     def test_strange_subclass(self):
+        # [FUNCTION DOC] Checks that comparing instances of a subclass with unusual iteration
+        # does not raise a system error.
         class X(deque):
+            # [CLASS DOC] HELPER: Deque subclass whose iterator is always empty.
             def __iter__(self):
+                # [FUNCTION DOC] HELPER: Returns an iterator over an empty list.
                 return iter([])
         d1 = X([1,2,3])
         d2 = X([4,5,6])
@@ -930,12 +1088,17 @@ class TestSubclass(CPythonTestCase):
 
     @support.cpython_only
     def test_bug_31608(self):
+        # [FUNCTION DOC] Checks that repetition and concatenation raise a TypeError instead of
+        # crashing when a subclass construction hook returns a non-deque. Runs only on CPython.
         # The interpreter used to crash in specific cases where a deque
         # subclass returned a non-deque.
         class X(deque):
+            # [CLASS DOC] HELPER: Deque subclass that has its construction hook replaced during
+            # the test.
             pass
         d = X()
         def bad___new__(cls, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Construction hook that returns a list instead of a deque.
             return [42]
         X.__new__ = bad___new__
         with self.assertRaises(TypeError):
@@ -945,30 +1108,45 @@ class TestSubclass(CPythonTestCase):
 
 
 class SubclassWithKwargs(deque):
+    # [CLASS DOC] HELPER: Deque subclass whose initializer takes an extra keyword argument.
     def __init__(self, newarg=1):
+        # [FUNCTION DOC] HELPER: Calls the base initializer with no arguments, ignoring newarg.
         deque.__init__(self)
 
 class TestSubclassWithKwargs(CPythonTestCase):
+    # [CLASS DOC] Test suite for a deque subclass accepting extra keyword arguments.
     def test_subclass_with_kwargs(self):
+        # [FUNCTION DOC] Checks that constructing the subclass with a keyword argument does not
+        # raise a TypeError.
         # SF bug #1486663 -- this used to erroneously raise a TypeError
         SubclassWithKwargs(newarg=1)
 
 class TestSequence(seq_tests.CommonTest):
+    # [CLASS DOC] Runs the common sequence test suite from seq_tests against deque as the
+    # sequence type. Slicing-dependent tests are overridden to do nothing.
     type2test = deque
 
     def test_getitem(self):
+        # [FUNCTION DOC] Overridden to skip: the base test requires slicing, which deque does
+        # not support.
         # For now, bypass tests that require slicing
         pass
 
     def test_getslice(self):
+        # [FUNCTION DOC] Overridden to skip: the base test requires slicing, which deque does
+        # not support.
         # For now, bypass tests that require slicing
         pass
 
     def test_subscript(self):
+        # [FUNCTION DOC] Overridden to skip: the base test requires slicing, which deque does
+        # not support.
         # For now, bypass tests that require slicing
         pass
 
     def test_free_after_iterating(self):
+        # [FUNCTION DOC] Skips the test with a message, since exhausted deque iterators do not
+        # free the deque.
         # For now, bypass tests that require slicing
         self.skipTest("Exhausted deque iterator doesn't free a deque")
 

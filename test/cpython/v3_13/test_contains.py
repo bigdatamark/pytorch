@@ -16,25 +16,48 @@ from torch.testing._internal.common_utils import run_tests
 
 # ======= END DYNAMO PATCH =======
 
+# [MODULE DOC] Dynamo-patched copy of the CPython 3.13 test_contains tests, which check the
+# containment operator (membership test and its negation) on builtin and user-defined
+# containers. Defines small helper container classes and one CPythonTestCase suite. Running the
+# file as a script calls run_tests. Import has no side effects beyond imports.
+
 from collections import deque
 import unittest
 from test.support import NEVER_EQ
 
 
 class base_set:
+    # [CLASS DOC] HELPER: Base fixture class that stores a single element in the attribute el.
+    # It defines no containment, iteration or indexing support of its own.
     def __init__(self, el):
+        # [FUNCTION DOC] HELPER: Stores the given element in the attribute el.
         self.el = el
 
 class myset(base_set):
+    # [CLASS DOC] HELPER: Fixture container that supports membership through an explicit
+    # containment method.
     def __contains__(self, el):
+        # [FUNCTION DOC] HELPER: Returns whether the given element equals the stored element.
         return self.el == el
 
 class seq(base_set):
+    # [CLASS DOC] HELPER: Fixture container that is only indexable, so membership falls back
+    # to iteration.
     def __getitem__(self, n):
+        # [FUNCTION DOC] HELPER: Returns the item at position n of a one-element list holding
+        # el. Indexing past the end raises an error, which ends the fallback iteration used
+        # for membership.
         return [self.el][n]
 
 class TestContains(CPythonTestCase):
+    # [CLASS DOC] Test suite for the membership operator, run through the Dynamo CPython test
+    # harness. Covers custom containers, builtin sequences, non-reflexive elements and
+    # containment blocking.
     def test_common_tests(self):
+        # [FUNCTION DOC] Checks membership on the helper classes and strings: a class with a
+        # containment method, an indexable class and plain strings behave correctly; a class
+        # with neither raises a TypeError; a non-string element tested against a string raises
+        # a TypeError.
         a = base_set(1)
         b = myset(1)
         c = seq(1)
@@ -55,6 +78,9 @@ class TestContains(CPythonTestCase):
         self.assertRaises(TypeError, lambda: None in 'abc')
 
     def test_builtin_sequence_types(self):
+        # [FUNCTION DOC] Checks membership on range and tuple (every member found, an absent
+        # value and the container itself not found), and that a list mutated during comparison
+        # does not crash the membership test.
         # a collection of tests on builtin sequence types
         a = range(10)
         for i in a:
@@ -69,6 +95,8 @@ class TestContains(CPythonTestCase):
         self.assertNotIn(a, a)
 
         class Deviant1:
+            # [CLASS DOC] HELPER: Element whose equality method mutates the shared class-level
+            # list during comparison.
             """Behaves strangely when compared
 
             This class is designed to make sure that the contains code
@@ -76,6 +104,8 @@ class TestContains(CPythonTestCase):
             """
             aList = list(range(15))
             def __eq__(self, other):
+                # [FUNCTION DOC] HELPER: Equality method that, when compared with 12, removes
+                # 12, 13 and 14 from the shared list, and always returns a false value.
                 if other == 12:
                     self.aList.remove(12)
                     self.aList.remove(13)
@@ -85,6 +115,9 @@ class TestContains(CPythonTestCase):
         self.assertNotIn(Deviant1(), Deviant1.aList)
 
     def test_nonreflexive(self):
+        # [FUNCTION DOC] Checks that for several container types holding non-reflexive elements
+        # (NaN, an object never equal to anything), each element is still reported as contained
+        # and the container equals an equal container and itself.
         # containment and equality tests involving elements that are
         # not necessarily equal to themselves
 
@@ -98,12 +131,19 @@ class TestContains(CPythonTestCase):
             self.assertTrue(container == container)
 
     def test_block_fallback(self):
+        # [FUNCTION DOC] Checks that setting the containment attribute to None blocks the
+        # fallback to iteration: membership on such an object raises a TypeError, while
+        # iterating it works.
         # blocking fallback with __contains__ = None
         class ByContains(object):
+            # [CLASS DOC] HELPER: Container whose containment method always returns false.
             def __contains__(self, other):
+                # [FUNCTION DOC] HELPER: Always returns false regardless of the element.
                 return False
         c = ByContains()
         class BlockContains(ByContains):
+            # [CLASS DOC] HELPER: Iterable subclass that disables inherited containment by
+            # setting it to None.
             """Is not a container
 
             This class is a perfectly good iterable (as tested by
@@ -115,6 +155,7 @@ class TestContains(CPythonTestCase):
             doing so.
             """
             def __iter__(self):
+                # [FUNCTION DOC] HELPER: Generator that yields nothing.
                 while False:
                     yield None
             __contains__ = None
