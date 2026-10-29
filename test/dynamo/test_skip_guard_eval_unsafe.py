@@ -1,4 +1,9 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests for the compiler stance that skips guard evaluation as unsafe. Covers
+# reusing existing cache entries without guard checks for changed bool flags, dtypes, plain
+# attribute values and keyword arguments, the error raised when a new compilation would be
+# needed under the stance, and a filter that drops all guards so one cache entry has no guards
+# at all.
 
 import torch
 import torch._dynamo.test_case
@@ -6,12 +11,22 @@ import torch._dynamo.testing
 
 
 def my_custom_function(x):
+    # [FUNCTION DOC] HELPER: Trivial module-level function returning its input plus one; not
+    # used by any test in this file.
     return x + 1
 
 
 class RunDiffGuardTests(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Test case for the skip_guard_eval_unsafe stance. Tests first warm the compile
+    # cache normally, then repeat calls inside the stance and compare against reference results.
     def test_bool_recompile(self):
+        # [FUNCTION DOC] Compiles a function that multiplies or adds two tensors depending on a
+        # bool flag, with the inductor backend. Runs both flag values normally for references,
+        # then again inside the stance in reversed order, and asserts the results equal the
+        # references.
         def fn(x, y, c):
+            # [FUNCTION DOC] HELPER: Returns the product of x and y if the flag is truthy,
+            # otherwise their sum.
             if c:
                 return x * y
             else:
@@ -32,7 +47,12 @@ class RunDiffGuardTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(ref2, res2)
 
     def test_tensor_recompile(self):
+        # [FUNCTION DOC] Compiles an elementwise product with the eager backend for float32
+        # inputs, then for float64 inputs, getting reference results. Inside the stance repeats
+        # both calls and asserts both match the references, so the cached entries for each dtype
+        # are picked.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Returns the elementwise product of x and y.
             return x * y
 
         opt_fn = torch.compile(fn, backend="eager")
@@ -53,14 +73,23 @@ class RunDiffGuardTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(ref2, res2)
 
     def test_post_recompile(self):
+        # [FUNCTION DOC] Tracks recompilation caused by changes to attributes of a closed-over
+        # object, using a frame-counting backend. Frame count is 1 after the first run and 2
+        # after changing the first attribute. Inside the stance, resetting the attribute to its
+        # original value and then to the second value still gives correct results using existing
+        # entries. After leaving the stance, changing the other attribute recompiles, giving a
+        # count of 3.
         class Foo:
+            # [CLASS DOC] HELPER: Plain object with two integer attributes holding 4 and 5.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Sets attribute a to 4 and attribute b to 5.
                 self.a = 4
                 self.b = 5
 
         foo = Foo()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns x plus the closed-over object's two attributes.
             return x + foo.a + foo.b
 
         cnts = torch._dynamo.testing.CompileCounter()
@@ -98,7 +127,13 @@ class RunDiffGuardTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(cnts.frame_count, 3)
 
     def test_fail_on_tensor_shape_change(self):
+        # [FUNCTION DOC] Compiles a function reading a key from a dictionary of tensors, warms
+        # the cache with a vector, then inside the stance replaces the entry with a matrix and
+        # calls again. Asserts a runtime error saying recompilation was triggered with the
+        # stance, because the shape change would need a new compile.
         def fn(dt):
+            # [FUNCTION DOC] HELPER: Returns the tensor under the key x of the dictionary plus
+            # one.
             return dt["x"] + 1
 
         x = torch.randn(4)
@@ -116,7 +151,12 @@ class RunDiffGuardTests(torch._dynamo.test_case.TestCase):
                 opt_fn(dt)
 
     def test_cache_line_pickup(self):
+        # [FUNCTION DOC] Calls a compiled function with three keyword argument combinations
+        # (neither, one, both optional flags set) normally to create entries, then again inside
+        # the stance, and asserts each result equals the corresponding reference.
         def fn(x, a=None, b=None):
+            # [FUNCTION DOC] HELPER: Multiplies x by 3, then by 5 if a is truthy, then by 7 if b
+            # is truthy, and returns it.
             x = x * 3
             if a:
                 x = x * 5
@@ -141,7 +181,12 @@ class RunDiffGuardTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(ref3, res3)
 
     def test_skip_all_guards_single_cache_entry(self):
+        # [FUNCTION DOC] Compiles with a guard filter that drops every guard. Asserts one frame
+        # compiled and one cache entry whose guard manager root has no leaf guards, accessors or
+        # epilogue lambda guards. Then inside the stance a differently shaped input gives the
+        # correct result and no new frame is compiled.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns x plus one.
             return x + 1
 
         cnts = torch._dynamo.testing.CompileCounter()
