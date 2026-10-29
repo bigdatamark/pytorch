@@ -1,3 +1,8 @@
+# [MODULE DOC] Translation of JIT schema arguments to the C++ API used by structured kernels
+# (meta and impl functions). Like the native API, but with symint always off, const-reference
+# tensors, and special reference types (optional tensor/scalar refs, int array refs).
+# Exposes type mapping helpers and functions returning Binding lists for impl/meta/out
+# arguments of a NativeFunctionsGroup. No import-time side effects.
 from __future__ import annotations
 
 from typing_extensions import assert_never
@@ -42,6 +47,12 @@ from torchgen.model import (
 # NB: For now, mutable doesn't do anything; but it could if we make
 # some more nominal types
 def argumenttype_type(t: Type, *, mutable: bool, binds: ArgName) -> NamedCType:
+    # [FUNCTION DOC] Map a schema Type to the NamedCType used for a structured kernel argument.
+    # Value types are delegated to cpp.valuetype_type (symint off). Tensor and Scalar become
+    # const references; optional Tensor/Scalar/int-list use dedicated ref types; lists of
+    # Tensor, optional Tensor and int use ITensorListRef-like types; others recurse on the
+    # element type. The mutable flag is currently unused. Raises AssertionError for an
+    # unexpected base type or an unrecognized type.
     # If it's a value type, do the value type translation
     # NB: structured kernels ALWAYS have symint off, since they involve actual
     # kernels that require real ints.  The one exception is the
@@ -85,6 +96,7 @@ def argumenttype_type(t: Type, *, mutable: bool, binds: ArgName) -> NamedCType:
 
 
 def argument_type(a: Argument, *, binds: ArgName) -> NamedCType:
+    # [FUNCTION DOC] HELPER: Type mapping for an Argument, using its is_write flag as mutability.
     return argumenttype_type(a.type, mutable=a.is_write, binds=binds)
 
 
@@ -96,6 +108,9 @@ def argument_type(a: Argument, *, binds: ArgName) -> NamedCType:
 
 # Structured kernels are never defaulted
 def argument(a: Argument | SelfArgument | TensorOptionsArguments) -> list[Binding]:
+    # [FUNCTION DOC] Convert a schema argument into a one-element list of Binding (no default
+    # value). A SelfArgument is unwrapped to its inner argument. Raises AssertionError for
+    # TensorOptionsArguments, which structured kernels do not support.
     if isinstance(a, Argument):
         return [
             Binding(
@@ -114,6 +129,10 @@ def argument(a: Argument | SelfArgument | TensorOptionsArguments) -> list[Bindin
 
 
 def impl_arguments(g: NativeFunctionsGroup) -> list[Binding]:
+    # [FUNCTION DOC] Bindings for the arguments of the impl function of group g: the non-out
+    # arguments of the out variant, then the out arguments. If the out variant has precomputed
+    # info, arguments named in its replace mapping are substituted by the replacement
+    # parameters, and the add parameters follow the non-out arguments, before the out ones.
     args: list[Argument | TensorOptionsArguments | SelfArgument] = []
 
     if g.out.precomputed:
@@ -144,12 +163,15 @@ def impl_arguments(g: NativeFunctionsGroup) -> list[Binding]:
 
 
 def meta_arguments(g: NativeFunctionsGroup) -> list[Binding]:
+    # [FUNCTION DOC] Bindings for the meta function: the non-out arguments of the functional
+    # variant of group g.
     args: list[Argument | TensorOptionsArguments | SelfArgument] = []
     args.extend(g.functional.func.arguments.non_out)
     return [r for arg in args for r in argument(arg)]
 
 
 def out_arguments(g: NativeFunctionsGroup) -> list[Binding]:
+    # [FUNCTION DOC] Bindings for the out arguments of the out variant of group g.
     args: list[Argument | TensorOptionsArguments | SelfArgument] = []
     args.extend(g.out.func.arguments.out)
     return [r for arg in args for r in argument(arg)]

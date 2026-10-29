@@ -1,3 +1,7 @@
+# [MODULE DOC] Codegen for unboxing wrappers: C++ code that reads IValue arguments from a stack
+# and converts them to the C++ types of an unboxed kernel (base, optional and list types),
+# following the long example in the comment below. Provides the helpers that build
+# the conversion code and bindings. Defines the connector string at import time.
 from __future__ import annotations
 
 from torchgen.api import cpp
@@ -75,11 +79,16 @@ connector = "\n\t"
 
 # Return unboxing function name for a NativeFunction
 def name(f: NativeFunction) -> str:
+    # [FUNCTION DOC] Return the unboxing function name, the unambiguous operator name.
     return f.func.name.unambiguous_name()
 
 
 # Convert all the arguments in a NativeFunction to C++ code
 def convert_arguments(f: NativeFunction) -> tuple[list[Binding], list[str]]:
+    # [FUNCTION DOC] Build the conversion code for all arguments of NativeFunction f, using the
+    # most faithful non-method C++ signature. Returns a pair: the Binding list renamed to the
+    # unboxed variable names, and the C++ source lines (stack peeks, declarations, conversions).
+    # Raises an exception if an argument is not a plain Argument.
     # we need the 'self' argument so method needs to be False
     args = (
         CppSignatureGroup.from_native_function(f, method=False)
@@ -115,6 +124,12 @@ def convert_arguments(f: NativeFunction) -> tuple[list[Binding], list[str]]:
 def argumenttype_ivalue_convert(
     t: Type, arg_name: str, *, mutable: bool = False
 ) -> tuple[str, CType, list[str], list[str]]:
+    # [FUNCTION DOC] Generate unboxing code for one argument given its type, name and mutability.
+    # Returns a 4-tuple: the output variable name, its CType, the list of conversion code lines
+    # and the list of declarations that must live in the enclosing scope. Symint is off.
+    # Dispatches on base, optional and list types; raises an exception for other types.
+    # # KNOWN ISSUE: the comment above this function says the result contains a Binding, but
+    # # the returned value is a (name, CType, code, decl) tuple.
     # Unboxing is for mobile, which doesn't care about SymInts
     ctype = cpp.argumenttype_type(
         t=t, mutable=mutable, binds=arg_name, symint=False
@@ -149,6 +164,8 @@ def argumenttype_ivalue_convert(
 def _gen_code_base_type(
     arg_name: str, out_name: str, ctype: CType
 ) -> tuple[list[str], list[str]]:
+    # [FUNCTION DOC] HELPER: Return a single line converting the IValue via its to method into the
+    # C++ type, and an empty declaration list.
     return [
         f"{ctype.cpp_type(strip_ref=True)} {out_name} = {arg_name}.to<{ctype.cpp_type(strip_ref=True)}>();"
     ], []
@@ -157,6 +174,9 @@ def _gen_code_base_type(
 def _gen_code_optional_type(
     arg_name: str, out_name: str, t: OptionalType, ctype: CType
 ) -> tuple[list[str], list[str]]:
+    # [FUNCTION DOC] HELPER: Generate code for an optional argument: unwrap into an optional of
+    # the element conversion if a value is present, else an empty optional. Returns (code lines,
+    # declarations).
     in_name = f"{arg_name}_opt_in"
     res_name, _, res_code, decl = argumenttype_ivalue_convert(t.elem, in_name)
     return (
@@ -178,6 +198,9 @@ if ({arg_name}_opt.has_value()) {{
 def _gen_code_list_type(
     arg_name: str, out_name: str, t: ListType, ctype: CType
 ) -> tuple[list[str], list[str]]:
+    # [FUNCTION DOC] HELPER: Generate code for a list argument: convert the IValue list element by
+    # element. Sized bool lists become arrays, optional elements use a c10 List, others fill a
+    # vector (declared in the outer scope) and wrap it as ArrayRef. Returns (code, declarations).
     in_name = f"{arg_name}_list_in"
     elem_name = f"{arg_name}_elem"
     code = [f"const c10::List<c10::IValue> {in_name} = {arg_name}.toList();"]

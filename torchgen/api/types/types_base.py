@@ -1,3 +1,7 @@
+# [MODULE DOC] Implementation-agnostic base of the torchgen C++ type model: ArgName and
+# SpecialArgName, BaseCppType and the basic scalar type constants, the CType hierarchy
+# (base, const/mutable ref, vector, array, tuple), NamedCType, Binding and Expr.
+# Defines constants at import time; no other side effects.
 """
 Where should I add a new type? `types_base.py` vs `types.py`
 
@@ -32,6 +36,8 @@ if TYPE_CHECKING:
 
 
 class SpecialArgName(Enum):
+    # [CLASS DOC] Enumeration of special argument names that may stand in for a string name;
+    # currently only a redundant memory_format marker.
     possibly_redundant_memory_format = auto()
 
 
@@ -41,10 +47,14 @@ ArgName = str | SpecialArgName
 # This class shouldn't be created directly; instead, use/create one of the singletons below.
 @dataclass(frozen=True)
 class BaseCppType:
+    # [CLASS DOC] Frozen description of a basic C++ type: optional namespace ns and name. Create
+    # singletons rather than ad hoc instances.
     ns: str | None
     name: str
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Return the qualified name (namespace and name), or just the name when the
+        # namespace is None or empty.
         if self.ns is None or self.ns == "":
             return self.name
         return f"{self.ns}::{self.name}"
@@ -67,86 +77,112 @@ voidT = BaseCppType("", "void")
 
 
 class CType(ABC):
+    # [CLASS DOC] Abstract base of the C++ type model. Subclasses produce a C++ spelling via
+    # cpp_type and a version without const references via remove_const_ref.
     @abstractmethod
     def cpp_type(self, *, strip_ref: bool = False) -> str:
+        # [FUNCTION DOC] Abstract: return the C++ spelling; strip_ref drops an outer reference.
         raise NotImplementedError
 
     @abstractmethod
     def remove_const_ref(self) -> CType:
+        # [FUNCTION DOC] Abstract: return the type without const reference wrappers (the default
+        # implementation returns self).
         return self
 
 
 @dataclass(frozen=True)
 class BaseCType(CType):
+    # [CLASS DOC] A plain C++ type wrapping a BaseCppType.
     type: BaseCppType
 
     def cpp_type(self, *, strip_ref: bool = False) -> str:
+        # [FUNCTION DOC] Return the qualified name of the wrapped type.
         return str(self.type)
 
     def remove_const_ref(self) -> CType:
+        # [FUNCTION DOC] Return self; nothing to remove.
         return self
 
 
 @dataclass(frozen=True)
 class ConstRefCType(CType):
+    # [CLASS DOC] A const reference to the element CType elem.
     elem: CType
 
     def cpp_type(self, *, strip_ref: bool = False) -> str:
+        # [FUNCTION DOC] Return the spelling of the const reference; with strip_ref return the
+        # element spelling without the reference.
         if strip_ref:
             return self.elem.cpp_type(strip_ref=strip_ref)
         return f"const {self.elem.cpp_type()} &"
 
     def remove_const_ref(self) -> CType:
+        # [FUNCTION DOC] Return the element with its own const-refs removed (this wrapper dropped).
         return self.elem.remove_const_ref()
 
 
 @dataclass(frozen=True)
 class VectorCType(CType):
+    # [CLASS DOC] A std vector of elem.
     elem: CType
 
     def cpp_type(self, *, strip_ref: bool = False) -> str:
+        # [FUNCTION DOC] Return the std vector spelling (strip_ref not forwarded to the element).
         # Do not pass `strip_ref` recursively.
         return f"::std::vector<{self.elem.cpp_type()}>"
 
     def remove_const_ref(self) -> CType:
+        # [FUNCTION DOC] Return a VectorCType with const-ref removed from the element.
         return VectorCType(self.elem.remove_const_ref())
 
 
 @dataclass(frozen=True)
 class ArrayCType(CType):
+    # [CLASS DOC] A std array of elem with a fixed integer size.
     elem: CType
     size: int
 
     def cpp_type(self, *, strip_ref: bool = False) -> str:
+        # [FUNCTION DOC] Return the std array spelling with element type and size (strip_ref not
+        # forwarded).
         # Do not pass `strip_ref` recursively.
         return f"::std::array<{self.elem.cpp_type()},{self.size}>"
 
     def remove_const_ref(self) -> CType:
+        # [FUNCTION DOC] Return an ArrayCType with const-ref removed from the element, same size.
         return ArrayCType(self.elem.remove_const_ref(), self.size)
 
 
 @dataclass(frozen=True)
 class TupleCType(CType):
+    # [CLASS DOC] A std tuple of the CTypes in elems.
     elems: list[CType]
 
     def cpp_type(self, *, strip_ref: bool = False) -> str:
+        # [FUNCTION DOC] Return the std tuple spelling of the element types (strip_ref is not
+        # forwarded).
         # Do not pass `strip_ref` recursively.
         return f"::std::tuple<{','.join([e.cpp_type() for e in self.elems])}>"
 
     def remove_const_ref(self) -> CType:
+        # [FUNCTION DOC] Return a TupleCType with const-ref removed from each element.
         return TupleCType([e.remove_const_ref() for e in self.elems])
 
 
 @dataclass(frozen=True)
 class MutRefCType(CType):
+    # [CLASS DOC] A mutable (non-const) reference to elem.
     elem: CType
 
     def cpp_type(self, *, strip_ref: bool = False) -> str:
+        # [FUNCTION DOC] Return the reference spelling; with strip_ref return the element spelling.
         if strip_ref:
             return self.elem.cpp_type(strip_ref=strip_ref)
         return f"{self.elem.cpp_type()} &"
 
     def remove_const_ref(self) -> CType:
+        # [FUNCTION DOC] Return the element with its own const-refs removed (this wrapper dropped).
         return self.elem.remove_const_ref()
 
 
@@ -160,16 +196,21 @@ class MutRefCType(CType):
 
 @dataclass(frozen=True)
 class NamedCType:
+    # [CLASS DOC] A C++ type (CType) tagged with a semantic argument name, so that translate only
+    # substitutes values of the right meaning. Frozen dataclass: name and type.
     name: ArgName
     type: CType
 
     def cpp_type(self, *, strip_ref: bool = False) -> str:
+        # [FUNCTION DOC] Return the C++ spelling of the underlying type; strip_ref is forwarded.
         return self.type.cpp_type(strip_ref=strip_ref)
 
     def remove_const_ref(self) -> NamedCType:
+        # [FUNCTION DOC] Return a NamedCType with the same name, const-ref removed from the type.
         return NamedCType(self.name, self.type.remove_const_ref())
 
     def with_name(self, name: str) -> NamedCType:
+        # [FUNCTION DOC] Return a NamedCType with the given name and the same type.
         return NamedCType(name, self.type)
 
 
@@ -182,6 +223,9 @@ class NamedCType:
 
 @dataclass(frozen=True)
 class Binding:
+    # [CLASS DOC] A C++ binding site for a formal parameter: name, NamedCType nctype, the source
+    # schema argument, and optional default value text. Immutable; the methods return changed
+    # copies or render strings for declarations and definitions.
     name: str
     nctype: NamedCType
     argument: Argument | TensorOptionsArguments | SelfArgument
@@ -189,6 +233,7 @@ class Binding:
     default: str | None = None
 
     def rename(self, name: str) -> Binding:
+        # [FUNCTION DOC] Return a copy of this binding with a new name.
         return Binding(
             name=name,
             nctype=self.nctype,
@@ -198,9 +243,11 @@ class Binding:
 
     @property
     def type(self) -> str:
+        # [FUNCTION DOC] Property: the C++ spelling of the binding type.
         return self.nctype.cpp_type()
 
     def no_default(self) -> Binding:
+        # [FUNCTION DOC] Return a copy with the default value removed.
         return Binding(
             name=self.name,
             nctype=self.nctype,
@@ -209,6 +256,8 @@ class Binding:
         )
 
     def decl(self, *, func_ptr_cast: bool = False) -> str:
+        # [FUNCTION DOC] Render the parameter declaration: type, name and any default value text.
+        # With func_ptr_cast only the type is returned (for function pointer casts).
         mb_default = ""
         if self.default is not None:
             mb_default = f"={self.default}"
@@ -220,9 +269,11 @@ class Binding:
             return f"{self.type} {self.name}{mb_default}"
 
     def defn(self) -> str:
+        # [FUNCTION DOC] Render the parameter definition: type and name, without default value.
         return f"{self.type} {self.name}"
 
     def with_name(self, name: str) -> Binding:
+        # [FUNCTION DOC] Return a copy of this binding with a new name (same as rename).
         return Binding(
             name=name, nctype=self.nctype, argument=self.argument, default=self.default
         )
@@ -234,5 +285,6 @@ class Binding:
 
 @dataclass(frozen=True)
 class Expr:
+    # [CLASS DOC] A C++ expression: expr holds source text and type the NamedCType it provides.
     expr: str
     type: NamedCType

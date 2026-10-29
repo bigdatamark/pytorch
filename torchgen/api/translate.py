@@ -1,3 +1,8 @@
+# [MODULE DOC] Small program synthesis engine used by the codegen to convert between C++ API
+# styles: given available bindings, it builds C++ expression strings for requested goal
+# NamedCTypes (trivial reuse, reference/value adaptation, TensorOptions gather/scatter,
+# SymInt/int and array ref conversions). Main entry point is translate; failure raises
+# UnsatError. No import-time side effects other than defining some constant NamedCTypes.
 from __future__ import annotations
 
 from typing import NoReturn, TYPE_CHECKING
@@ -80,6 +85,7 @@ optionalTensor_ctype = OptionalCType(BaseCType(tensorT))
 
 
 class UnsatError(RuntimeError):
+    # [CLASS DOC] Raised when translate cannot synthesize an expression for a goal.
     pass
 
 
@@ -107,6 +113,13 @@ def translate(
     method: bool = False,
     allow_expensive_conversions: bool = False,
 ) -> list[Expr]:
+    # [FUNCTION DOC] Produce, for each goal (in order), a C++ Expr built only from the given
+    # bindings. Bindings and goals may be Binding objects or plain Expr / NamedCType. Applies some
+    # forward inference when seeding the context (optional tensor to tensor, OptionalTensorRef,
+    # opmath conversions, IOptTensorListRef), adds an implicit self when method is true, then
+    # solves each goal by backtracking search. allow_expensive_conversions enables copies from
+    # reference to value types (for lambda captures). Raises UnsatError when a goal has no
+    # derivation. No side effects.
     binding_exprs: list[Expr] = []
     for b in bindings:
         if isinstance(b, Binding):
@@ -208,6 +221,8 @@ def translate(
         # ctx[NamedCType("self", ConstRefCType(BaseCType(tensorT)))] = "*this"
 
     def unsat(goal: NamedCType) -> NoReturn:
+        # [FUNCTION DOC] HELPER: Raise UnsatError for goal, with a message listing the available
+        # bindings in the context.
         ctx_desc = "\n".join(
             f"  {t.cpp_type()} {t.name}; // {e}" for t, e in ctx.items()
         )
@@ -231,7 +246,13 @@ Check this module for more information.
     # existing rules in this function simply try to solve immediately,
     # and bail if things don't work out.
     def solve(goal: NamedCType, *, direct: bool) -> str:
+        # [FUNCTION DOC] HELPER: Return an expression string satisfying goal from the context:
+        # direct hits, reference adaptation and, unless direct is true, synthesis rules for
+        # memory_format, options, dtype, layout, device, pin_memory, int/symint and array ref
+        # conversions, plus optional expensive value conversions and tensor const_cast.
+        # Raises UnsatError when no rule applies.
         def direct_solve(goal: NamedCType) -> str:
+            # [FUNCTION DOC] HELPER: Solve goal with only trivial conversions (direct mode).
             return solve(goal, direct=True)
 
         if goal in ctx:

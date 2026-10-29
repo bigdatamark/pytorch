@@ -1,3 +1,7 @@
+# [MODULE DOC] Argument and type mappings for codegen of structured ufunc kernels: the
+# dispatch stub signature (CPU), the CUDA ufunctor constructor/apply split, and the inner
+# ufunc template function. Provides Binding builders for each, driven by a
+# NativeFunctionsGroup. No import-time side effects.
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -26,12 +30,15 @@ from torchgen.model import (
 
 
 def schema_kernel_name(func: FunctionSchema, dispatch_key: DispatchKey) -> str:
+    # [FUNCTION DOC] Name of the generated ufunc kernel for an out schema and dispatch key, of the
+    # form ufunc_<base name>_<dispatch key>. Raises AssertionError if func is not an out schema.
     if not func.is_out_fn():
         raise AssertionError("ufunc.kernel_name should only be invoked on out schemas")
     return f"ufunc_{func.name.name}_{dispatch_key}"
 
 
 def kernel_name(g: NativeFunctionsGroup, dispatch_key: DispatchKey) -> str:
+    # [FUNCTION DOC] Ufunc kernel name for the out variant of group g and the dispatch key.
     return schema_kernel_name(g.out.func, dispatch_key)
 
 
@@ -41,6 +48,9 @@ def kernel_name(g: NativeFunctionsGroup, dispatch_key: DispatchKey) -> str:
 #
 # NB: used for CPU only
 def dispatchstub_type(t: Type, *, binds: ArgName) -> NamedCType | None:
+    # [FUNCTION DOC] C++ type of an argument in a CPU dispatch stub signature. Value types map as
+    # in cpp.valuetype_type (no symint), Scalar becomes a const reference, and Tensor yields None
+    # because tensors are carried by the TensorIterator. Raises AssertionError on other types.
     # Dispatch stubs are always plain ints
     r = cpp.valuetype_type(t, binds=binds, symint=False)
     if r is not None:
@@ -55,6 +65,8 @@ def dispatchstub_type(t: Type, *, binds: ArgName) -> NamedCType | None:
 
 
 def opmath_type(scalar_t: BaseCppType) -> BaseCppType:
+    # [FUNCTION DOC] HELPER: Map the scalar_t C++ type to opmath_t. Raises NotImplementedError
+    # for any other input.
     if scalar_t == api_types.scalar_t:
         return api_types.opmath_t
     raise NotImplementedError
@@ -66,6 +78,9 @@ def opmath_type(scalar_t: BaseCppType) -> BaseCppType:
 #
 # NB: CUDA only
 def ufunctor_ctor_type(t: Type, *, binds: ArgName, scalar_t: BaseCppType) -> NamedCType:
+    # [FUNCTION DOC] C++ type of an argument stored in a CUDA ufunctor constructor. Value types
+    # map as in cpp.valuetype_type; both Scalar and Tensor become the opmath type for scalar_t.
+    # Raises AssertionError on other types.
     r = cpp.valuetype_type(t, binds=binds, symint=False)
     if r is not None:
         return r
@@ -85,6 +100,8 @@ def ufunctor_ctor_type(t: Type, *, binds: ArgName, scalar_t: BaseCppType) -> Nam
 def ufunctor_apply_type(
     t: Type, *, binds: ArgName, scalar_t: BaseCppType
 ) -> NamedCType:
+    # [FUNCTION DOC] C++ type of an argument passed to the ufunctor operator(): only Tensor is
+    # accepted, becoming scalar_t. Raises AssertionError for any other type.
     if t == BaseType(BaseTy.Tensor):
         return NamedCType(binds, BaseCType(scalar_t))
     else:
@@ -95,6 +112,9 @@ def ufunctor_apply_type(
 # is done in the computation type.  compute_t is opmath_t in CUDA and scalar_t
 # in CPU
 def ufunc_type(t: Type, *, binds: ArgName, compute_t: CType) -> NamedCType:
+    # [FUNCTION DOC] C++ type of an argument of the user-written ufunc template function. Value
+    # types map as in cpp.valuetype_type; Scalar and Tensor both use compute_t.
+    # Raises AssertionError on other types.
     r = cpp.valuetype_type(t, binds=binds, symint=False)
     if r is not None:
         return r
@@ -108,6 +128,8 @@ def ufunc_type(t: Type, *, binds: ArgName, compute_t: CType) -> NamedCType:
 
 
 def ufunctor_ctor_argument(a: Argument, scalar_t: BaseCppType) -> Binding:
+    # [FUNCTION DOC] HELPER: Build a Binding (no default) for argument a using its ufunctor
+    # constructor type.
     return Binding(
         nctype=ufunctor_ctor_type(a.type, binds=a.name, scalar_t=scalar_t),
         name=a.name,
@@ -117,6 +139,8 @@ def ufunctor_ctor_argument(a: Argument, scalar_t: BaseCppType) -> Binding:
 
 
 def ufunctor_apply_argument(a: Argument, scalar_t: BaseCppType) -> Binding:
+    # [FUNCTION DOC] HELPER: Build a Binding (no default) for argument a using its ufunctor
+    # operator() parameter type.
     return Binding(
         nctype=ufunctor_apply_type(a.type, binds=a.name, scalar_t=scalar_t),
         name=a.name,
@@ -126,6 +150,7 @@ def ufunctor_apply_argument(a: Argument, scalar_t: BaseCppType) -> Binding:
 
 
 def ufunc_argument(a: Argument, compute_t: CType) -> Binding:
+    # [FUNCTION DOC] HELPER: Build a Binding (no default) for argument a using its ufunc type.
     return Binding(
         nctype=ufunc_type(a.type, binds=a.name, compute_t=compute_t),
         name=a.name,
@@ -136,6 +161,8 @@ def ufunc_argument(a: Argument, compute_t: CType) -> Binding:
 
 @dataclass(frozen=True)
 class UfunctorBindings:
+    # [CLASS DOC] Immutable pair of binding lists for a CUDA ufunctor: ctor holds arguments taken
+    # by the host-side constructor, apply holds those taken by the device-side operator().
     ctor: list[Binding]
     apply: list[Binding]
 
@@ -160,6 +187,11 @@ class UfunctorBindings:
 def ufunctor_arguments(
     g: NativeFunctionsGroup, *, scalar_tensor_idx: int | None, scalar_t: BaseCppType
 ) -> UfunctorBindings:
+    # [FUNCTION DOC] Split the non-out arguments of the functional variant of g into constructor
+    # and apply bindings. Non-tensor arguments go to the constructor; tensor arguments go to
+    # apply, except that the tensor at position scalar_tensor_idx (counted among tensors) is
+    # treated as a scalar and put in the constructor. Returns UfunctorBindings. Raises
+    # AssertionError if scalar_tensor_idx is not consumed (index too large).
     ctor = []
     apply = []
     for a in g.functional.func.arguments.flat_non_out:
@@ -189,6 +221,8 @@ def ufunctor_arguments(
 #
 # In this file, we refer to T as compute_t which is bound by caller
 def ufunc_arguments(g: NativeFunctionsGroup, *, compute_t: CType) -> list[Binding]:
+    # [FUNCTION DOC] Bindings for the parameters of the ufunc template function: every non-out
+    # argument of the functional variant of g, typed with compute_t for tensors and scalars.
     return [
         ufunc_argument(a, compute_t=compute_t)
         for a in g.functional.func.arguments.flat_non_out
@@ -201,6 +235,8 @@ def ufunc_arguments(g: NativeFunctionsGroup, *, compute_t: CType) -> list[Bindin
 # using structured_binary_fn_alpha = void(*)(TensorIteratorBase&, const Scalar& alpha);
 # DECLARE_DISPATCH(structured_binary_fn_alpha, add_stub);
 def stub_arguments(g: NativeFunctionsGroup) -> list[Binding]:
+    # [FUNCTION DOC] Bindings for the dispatch stub extra arguments: the non-out arguments of the
+    # out variant of g that are not tensor-like, typed through structured.argument.
     # stubs drop all tensor arguments (they are implicit in the TensorIterator
     # argument and keep everything else)
     return [

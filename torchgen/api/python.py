@@ -1,3 +1,9 @@
+# [MODULE DOC] Data models and helpers for the Python binding codegen and the .pyi stub
+# codegen. Defines PythonSignature and friends (parsed from a FunctionSchema), functions that
+# render PythonArgParser schema strings and pyi type strings, the dispatch lambda models for
+# calling the C++ function, and the binding of parser outputs to lambda arguments. The
+# long notes in the comments below describe the overall design. Imports torchgen.gen at
+# import time (for pythonify_default); no other import-time side effects.
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -189,6 +195,10 @@ if TYPE_CHECKING:
 def format_function_signature(
     name: str, arguments: Iterable[str] = (), return_type: str | None = None
 ) -> str:
+    # [FUNCTION DOC] Format a pyi def line "def name(args) -> ret: ..." from the argument strings.
+    # Returns one line if it fits in 80 columns, there are no arguments or only self; otherwise
+    # one argument per line. If a line would still exceed 80 columns, the result ends with a
+    # "fmt: skip" marker so the formatter leaves it alone. Accepts any iterable of arguments.
     if not isinstance(arguments, (list, tuple)):
         arguments = tuple(arguments)
     return_type = f" -> {return_type}" if return_type is not None else ""
@@ -212,11 +222,17 @@ def format_function_signature(
 
 @dataclass(frozen=True)
 class PythonReturns:
+    # [CLASS DOC] Return values of a Python signature: a tuple of schema Return objects.
+    # Frozen dataclass; only used by pyi generation.
     returns: tuple[Return, ...]
 
 
 @dataclass(frozen=True)
 class PythonArgument:
+    # [CLASS DOC] One Python-visible argument: name, schema type, default value text (already in
+    # Python form) and an optional C++ default_init expression passed to PythonArgParser unpack
+    # methods. Frozen dataclass. argument_str gives the parser format and argument_str_pyi the
+    # pyi form of the argument.
     name: str
     type: Type
     default: str | None
@@ -232,6 +248,10 @@ class PythonArgument:
     # Compute argument formal for python argument parsing.
     # Needs to be consistent with torch/csrc/utils/python_arg_parser.h.
     def argument_str(self, *, method: bool = False, symint: bool = True) -> str:
+        # [FUNCTION DOC] Render the argument as a PythonArgParser formal, "type name" or
+        # "type name=default". Const and reference markers are stripped from the type. A self of
+        # Tensor or Number type is renamed to input unless method is true. C++ null-like defaults
+        # become None. Must stay consistent with python_arg_parser.h.
         type_str = (
             argument_type_str(self.type, symint=symint)
             .replace("const ", "")
@@ -260,6 +280,11 @@ class PythonArgument:
     def argument_str_pyi(
         self, *, method: bool = False, deprecated: bool = False
     ) -> str:
+        # [FUNCTION DOC] Render the argument as a pyi parameter, "name: type" with " = default" if
+        # there is one. self of Tensor type is renamed input outside methods and non-deprecated
+        # signatures; from gets a trailing underscore. A non-deprecated out argument becomes
+        # optional. Deprecated out arguments with default None get no default. Integer list
+        # defaults written in braces become tuples; C++ constants are mapped to Python names.
         type_str = argument_type_str_pyi(self.type)
 
         name = self.name
@@ -310,6 +335,9 @@ class PythonArgument:
 
 @dataclass(frozen=True)
 class PythonOutArgument(PythonArgument):
+    # [CLASS DOC] The packed out argument of a Python signature. outputs holds the original
+    # scattered output arguments; the combined argument is bound to a local out variable and then
+    # to the individual C++ out arguments. Default is None. Build with from_outputs.
     # In Python signature multiple output fields are packed into one 'out' argument.
     # When binding to C++, it's first binded to a local 'out' variable:
     #   'auto out = _r.tensorlist_n<2>(2);',
@@ -319,6 +347,9 @@ class PythonOutArgument(PythonArgument):
 
     @staticmethod
     def from_outputs(outputs: tuple[PythonArgument, ...]) -> PythonOutArgument | None:
+        # [FUNCTION DOC] Build the packed out argument from the output arguments. Returns None for
+        # no outputs, an argument with the same name and type for one output, and for several a
+        # Tensor list argument named out. Raises RuntimeError if the outputs are not all tensors.
         if not outputs:
             return None
 
@@ -347,6 +378,9 @@ class PythonOutArgument(PythonArgument):
 
 @dataclass(frozen=True)
 class PythonSignature:
+    # [CLASS DOC] A Python function signature: name, positional input_args, keyword-only
+    # input_kwargs, optional packed output_args, returns, scattered tensor_options_args and
+    # whether it is a method. Frozen dataclass; used by both PythonArgParser and pyi codegen.
     # Base operator name, without inplace/outplace suffix.
     name: str
 
@@ -376,11 +410,15 @@ class PythonSignature:
 
     @property
     def deprecated(self) -> bool:
+        # [FUNCTION DOC] Property: whether this is a deprecated signature; always false here.
         return False
 
     def arguments(
         self, *, skip_outputs: bool = False, skip_tensor_options: bool = False
     ) -> tuple[PythonArgument | PythonOutArgument, ...]:
+        # [FUNCTION DOC] Return all arguments in order: positional inputs, keyword inputs, the out
+        # argument (unless skip_outputs), then tensor options arguments (unless
+        # skip_tensor_options).
         result: list[PythonArgument | PythonOutArgument] = []
         result.extend(self.input_args)
         result.extend(self.input_kwargs)
@@ -391,9 +429,11 @@ class PythonSignature:
         return tuple(result)
 
     def arguments_count(self) -> int:
+        # [FUNCTION DOC] Return the number of arguments including outputs and tensor options.
         return len(self.arguments())
 
     def output_idx(self) -> int:
+        # [FUNCTION DOC] Return the index of the out argument, i.e. positional plus keyword inputs.
         return len(self.input_args) + len(self.input_kwargs)
 
     # [old codegen] Compute the Python function signature for argument parsing,
@@ -406,6 +446,8 @@ class PythonSignature:
     # For a translation to mypy-valid type signatures, see
     # signature_str_pyi().
     def signature_str(self, *, skip_outputs: bool = False, symint: bool = True) -> str:
+        # [FUNCTION DOC] Render the PythonArgParser signature string: name and parenthesized
+        # formals with a star inserted before keyword-only arguments. Not valid PEP 484.
         args = self.arguments(skip_outputs=skip_outputs)
         schema_formals: list[str] = [
             a.argument_str(method=self.method, symint=symint) for a in args
@@ -417,6 +459,8 @@ class PythonSignature:
         return f"{self.name}({', '.join(schema_formals)})"
 
     def signature_str_pyi(self, *, skip_outputs: bool = False) -> str:
+        # [FUNCTION DOC] Render the pyi def line: formals from argument_str_pyi with a star after
+        # the positional ones, self prepended for methods, and the pyi return type.
         args = self.arguments(skip_outputs=skip_outputs)
         schema_formals: list[str] = [
             a.argument_str_pyi(method=self.method) for a in args
@@ -433,6 +477,10 @@ class PythonSignature:
         return format_function_signature(self.name, schema_formals, returns_str)
 
     def signature_str_pyi_vararg(self, *, skip_outputs: bool = False) -> str | None:
+        # [FUNCTION DOC] Render the pyi vararg variant of the signature, or None. Only applies when
+        # there is exactly one positional argument and it is an int or SymInt list; that argument
+        # is turned into a star argument of the element type. Returns None otherwise or if there
+        # are no arguments.
         # only pyi uses vararg signatures
         args = self.arguments(skip_outputs=skip_outputs)
         schema_formals: list[str] = [
@@ -470,6 +518,9 @@ class PythonSignature:
 # dedicated data model to store these extra properties.
 @dataclass(frozen=True)
 class PythonSignatureDeprecated(PythonSignature):
+    # [CLASS DOC] A Python signature for a deprecated overload. Adds deprecated_schema (the schema
+    # of the deprecated function) and deprecated_args_exprs (the expressions, including constant
+    # defaults, to pass to the C++ call in order).
     # Schema for the deprecated function
     deprecated_schema: FunctionSchema
 
@@ -484,9 +535,11 @@ class PythonSignatureDeprecated(PythonSignature):
 
     @property
     def deprecated(self) -> bool:
+        # [FUNCTION DOC] Property: always true.
         return True
 
     def signature_str(self, *, skip_outputs: bool = False, symint: bool = True) -> str:
+        # [FUNCTION DOC] Same as the base parser signature string, with a deprecated suffix.
         return (
             PythonSignature.signature_str(
                 self, skip_outputs=skip_outputs, symint=symint
@@ -495,6 +548,8 @@ class PythonSignatureDeprecated(PythonSignature):
         )
 
     def signature_str_pyi(self, *, skip_outputs: bool = False) -> str:
+        # [FUNCTION DOC] Render the pyi def line using deprecated-style arguments. Unlike the base
+        # class it never adds self or the vararg form.
         args = self.arguments(skip_outputs=skip_outputs)
         schema_formals: list[str] = [
             a.argument_str_pyi(method=self.method, deprecated=True) for a in args
@@ -507,6 +562,7 @@ class PythonSignatureDeprecated(PythonSignature):
         return format_function_signature(self.name, schema_formals, returns_str)
 
     def signature_str_pyi_vararg(self, *, skip_outputs: bool = False) -> str | None:
+        # [FUNCTION DOC] Always returns None: no vararg variants exist for deprecated overloads.
         # the codegen doesn't include vararg variants for deprecated signatures
         return None
 
@@ -522,6 +578,8 @@ class PythonSignatureDeprecated(PythonSignature):
 # function - see 'PythonSignatureGroup'.
 @dataclass(frozen=True)
 class PythonSignatureNativeFunctionPair:
+    # [CLASS DOC] Pairs a PythonSignature with its NativeFunction before base and out variants are
+    # grouped. Frozen dataclass: signature and function.
     signature: PythonSignature
     function: NativeFunction
 
@@ -531,6 +589,8 @@ class PythonSignatureNativeFunctionPair:
 # list for both (output arguments become optional).
 @dataclass(frozen=True)
 class PythonSignatureGroup:
+    # [CLASS DOC] A merged base/out-variant function sharing one PythonSignature: signature (the
+    # out-place one when it exists, since it parses both), base and optional outplace function.
     # The signature used for Python argument parsing. The outplace signature
     # is preferred if exists, because it can be used to parse inputs for both
     # the out-place variant and the base version (with output omitted).
@@ -548,6 +608,9 @@ class PythonSignatureGroup:
         functional: PythonSignatureNativeFunctionPair,
         out: PythonSignatureNativeFunctionPair | None,
     ) -> PythonSignatureGroup:
+        # [FUNCTION DOC] Merge a functional pair and an optional out pair into a group. Without an
+        # out pair the functional signature is used. With one, the out signature is copied but
+        # its tensor options arguments are replaced by those from the functional variant.
         if out is None:
             return PythonSignatureGroup(
                 signature=functional.signature,
@@ -579,6 +642,8 @@ class PythonSignatureGroup:
 # signature.
 @dataclass(frozen=True)
 class DispatchLambdaArgument:
+    # [CLASS DOC] An argument of the generated dispatch lambda: name, C++ type string and whether
+    # it is an out argument.
     name: str
     type_str: str
     is_out_arg: bool
@@ -591,6 +656,8 @@ class DispatchLambdaArgument:
 # It has 1-1 mapping with PythonArgument in PythonSignature.
 @dataclass(frozen=True)
 class PythonArgParserOutputExpr:
+    # [CLASS DOC] One PythonArgParser output: argument name, the expression reading it, its index
+    # and the PythonArgument it maps to. Maps one-to-one with the signature's arguments.
     # argument name
     name: str
 
@@ -606,6 +673,7 @@ class PythonArgParserOutputExpr:
 
     @property
     def is_none_expr(self) -> str:
+        # [FUNCTION DOC] Property: expression testing whether the parser output at index is None.
         return f"_r.isNone({self.index})"
 
 
@@ -616,6 +684,8 @@ class PythonArgParserOutputExpr:
 # that the lambda function wrapper takes.
 @dataclass(frozen=True)
 class DispatchLambdaArgumentExprs:
+    # [CLASS DOC] The binding of lambda arguments: exprs, the expression per lambda argument (in
+    # order), and inits, local statements that must run first because exprs may refer to them.
     # The exprs that provide the binding for lambda arguments, e.g.:
     #
     #   'self' -> '_r.tensor(0)'
@@ -641,10 +711,12 @@ class DispatchLambdaArgumentExprs:
 
 
 def _cpp_signature(f: NativeFunction, *, method: bool = False) -> CppSignature:
+    # [FUNCTION DOC] HELPER: Return the regular (non-faithful, non-symint) CppSignature for f.
     return CppSignatureGroup.from_native_function(f, method=method).signature
 
 
 def has_tensor_options(f: NativeFunction) -> bool:
+    # [FUNCTION DOC] Return whether the function schema has a TensorOptions argument group.
     return f.func.arguments.tensor_options is not None
 
 
@@ -661,6 +733,10 @@ def has_tensor_options(f: NativeFunction) -> bool:
 def argument_type_str(
     t: Type, *, simple_type: bool = False, symint: bool = True
 ) -> str:
+    # [FUNCTION DOC] Return the PythonArgParser type name for a schema type. Base types map to
+    # their schema names (int becomes int64_t, float double, str string view); optionals add a
+    # question mark; lists become array/ref names with optional size, with symint selecting
+    # SymInt array refs. simple_type drops the sizes. Raises RuntimeError on unknown types.
     if isinstance(t, BaseType):
         if t.name == BaseTy.int:
             return "int64_t"
@@ -720,6 +796,8 @@ def argument_type_str(
 
 
 def argument_type_size(t: Type) -> int | None:
+    # [FUNCTION DOC] Return the fixed size of a list-like type, or None when it is not a list, has
+    # no size, or is a bool list.
     l = t.is_list_like()
     if l is not None and str(l.elem) != "bool":
         return l.size
@@ -728,6 +806,8 @@ def argument_type_size(t: Type) -> int | None:
 
 
 def argument(a: Argument) -> PythonArgument:
+    # [FUNCTION DOC] Convert a schema Argument to a PythonArgument with its default translated to
+    # Python form (via the C++ default expression); no default_init.
     return PythonArgument(
         name=a.name,
         type=a.type,
@@ -745,6 +825,8 @@ def argument(a: Argument) -> PythonArgument:
 def signature(
     f: NativeFunction, *, method: bool = False, pyi: bool = False
 ) -> PythonSignature:
+    # [FUNCTION DOC] Build the PythonSignature of a NativeFunction (uses its category override);
+    # usable for both pyi and PythonArgParser codegen.
     return signature_from_schema(
         f.func, category_override=f.category_override, method=method, pyi=pyi
     )
@@ -757,6 +839,10 @@ def signature_from_schema(
     method: bool = False,
     pyi: bool = False,
 ) -> PythonSignature:
+    # [FUNCTION DOC] Build a PythonSignature from a schema. Splits arguments into positional
+    # inputs, keyword inputs and outputs (skipping self for methods and TensorOptions). For
+    # factory, like or new functions it adds dtype, layout, device, pin_memory and requires_grad
+    # arguments. Raises ValueError if the schema itself has a requires_grad argument.
     args: list[Argument] = []
     args.extend(func.arguments.pre_self_positional)
     # Skip SelfArgument if this is method.
@@ -814,6 +900,8 @@ def signature_from_schema(
     if (is_factory_function or is_like_or_new_function) and not is_dummy_function:
 
         def topt_default_init(name: str) -> str | None:
+            # [FUNCTION DOC] HELPER: Default init expression for a TensorOptions field, or None if
+            # the schema has no such group or the default is absent or None.
             topt_args = func.arguments.tensor_options
             if topt_args is None:
                 return None
@@ -895,6 +983,8 @@ def signature_from_schema(
 
 
 def structseq_fieldnames(returns: tuple[Return, ...]) -> list[str]:
+    # [FUNCTION DOC] Field names of a structseq return, or empty if there are at most one return or
+    # none are named. Raises ValueError if only some returns are named.
     if len(returns) <= 1 or all(r.name is None for r in returns):
         return []
     else:
@@ -914,11 +1004,17 @@ def structseq_fieldnames(returns: tuple[Return, ...]) -> list[str]:
 
 
 def _append_optional_pyi(type_str: str) -> str:
+    # [FUNCTION DOC] HELPER: Make a type string optional by appending the None alternative once.
     # Append `| None`, avoiding a doubled `| None` if the type is already optional.
     return f"{type_str} | None".replace(" | None | None", " | None")
 
 
 def argument_type_str_pyi(t: Type) -> str:
+    # [FUNCTION DOC] Return the pyi type string for an argument type (accepting unions such as
+    # int or SymInt, sequences, device-like). Optional adds a None alternative. Raises
+    # RuntimeError for unrecognized types.
+    # # KNOWN ISSUE: base types without a branch (for example SymBool or DimVector) silently
+    # # yield an empty type string instead of raising.
     add_optional = False
     if isinstance(t, OptionalType):
         t = t.elem
@@ -989,6 +1085,8 @@ def argument_type_str_pyi(t: Type) -> str:
 
 
 def return_type_str_pyi(t: Type) -> str:
+    # [FUNCTION DOC] Return the pyi type string for a return type: concrete types where arguments
+    # accept unions, devices as _device, lists as variable-length tuples, optional as None union.
     # Where arguments are open to accepting Union, return types should return
     # concrete types
 
@@ -1010,6 +1108,9 @@ def return_type_str_pyi(t: Type) -> str:
 
 
 def returns_structseq_pyi(signature: PythonSignature) -> tuple[str, str] | None:
+    # [FUNCTION DOC] Build the pyi class definition for a structseq return type. Returns a pair
+    # of the class name (the signature name) and the class source text with a property per field,
+    # a constructor taking a sequence and field counts; None when the returns are not named.
     python_returns = [return_type_str_pyi(r.type) for r in signature.returns.returns]
     structseq_name = signature.name
     field_names = structseq_fieldnames(signature.returns.returns)
@@ -1065,6 +1166,8 @@ def returns_structseq_pyi(signature: PythonSignature) -> tuple[str, str] | None:
 
 
 def returns_str_pyi(signature: PythonSignature) -> str:
+    # [FUNCTION DOC] Return the pyi return annotation: the return_types class name for structseq,
+    # a tuple type for several returns, the single type, or None for no returns.
     field_names = structseq_fieldnames(signature.returns.returns)
     if field_names:
         return f"torch.return_types.{signature.name}"
@@ -1120,6 +1223,10 @@ def returns_str_pyi(signature: PythonSignature) -> str:
 def dispatch_lambda_args(
     ps: PythonSignature, f: NativeFunction, symint: bool = True
 ) -> tuple[DispatchLambdaArgument, ...]:
+    # [FUNCTION DOC] Compute the arguments of the dispatch lambda from the C++ signature (the
+    # deprecated schema for deprecated signatures). Mutable tensor reference arguments become
+    # by-value tensors, except scattered multi-output arguments; a method self is a const
+    # reference. Returns a tuple of DispatchLambdaArgument.
     if isinstance(ps, PythonSignatureDeprecated):
         schema = ps.deprecated_schema
     else:
@@ -1137,6 +1244,7 @@ def dispatch_lambda_args(
 
     # Convert from cpp argument to lambda argument
     def dispatch_lambda_arg(cpp_arg: Binding) -> DispatchLambdaArgument:
+        # [FUNCTION DOC] HELPER: Convert one C++ binding into a DispatchLambdaArgument.
         type_str = cpp_arg.type
         is_out_arg = cpp_arg.name in out_args
         if ps.method and cpp_arg.name == "self":
@@ -1194,6 +1302,9 @@ SUPPORTED_RETURN_TYPES = {
 
 
 def dispatch_lambda_return_str(f: NativeFunction) -> str:
+    # [FUNCTION DOC] Return the C++ return type for the dispatch lambda, with alias annotations
+    # removed so mutable returns are by value. Raises RuntimeError if the type is not in
+    # SUPPORTED_RETURN_TYPES (symint is always on).
     # [old codegen] Remove type annotation (e.g. 'Tensor' rather than 'Tensor &')
     # because the dispatch lambdas take mutable arguments *by value*, not
     # by reference. If you then return a reference to such an argument, you
@@ -1223,6 +1334,9 @@ def dispatch_lambda_return_str(f: NativeFunction) -> str:
 
 
 def cpp_dispatch_target(f: NativeFunction) -> str:
+    # [FUNCTION DOC] Return the C++ call target: self.name for methods, otherwise a namespaced
+    # function, torch for TensorOptions or like functions and at for others. Raises RuntimeError
+    # if the function has neither variant.
     symint = f.func.has_symint()
     name = cpp.name(f.func, symint_overload=symint)
     if Variant.method in f.variants:
@@ -1241,6 +1355,9 @@ def cpp_dispatch_exprs(
     *,
     python_signature: PythonSignature | None = None,
 ) -> tuple[str, ...]:
+    # [FUNCTION DOC] Return the argument expressions for the C++ call. By default the C++ signature
+    # argument names; for deprecated signatures the stored deprecated expressions (dropping
+    # out unless an out function). For method variants self is removed.
     cpp_args: Sequence[Binding] = _cpp_signature(f, method=False).arguments()
 
     exprs: tuple[str, ...] = ()
@@ -1279,6 +1396,10 @@ def cpp_dispatch_exprs(
 def arg_parser_unpack_method(
     t: Type, default: str | None, default_init: str | None, *, symint: bool = True
 ) -> str:
+    # [FUNCTION DOC] Choose the PythonArgParser unpack method name for a type, default and optional
+    # default init. Maps base types, optional (adding an Optional suffix when the default is
+    # None), tensor lists and numeric lists. Raises RuntimeError for unsupported types or when a
+    # default init is given for a type that cannot use one.
     has_default_init = default_init is not None
     if has_default_init and str(t) not in (
         "ScalarType?",
@@ -1367,6 +1488,8 @@ def arg_parser_unpack_method(
 def arg_parser_output_expr(
     arg_index: int, a: PythonArgument, *, symint: bool = True
 ) -> PythonArgParserOutputExpr:
+    # [FUNCTION DOC] Build the parser output expression reading argument a at arg_index, with the
+    # default init as an extra argument if present.
     has_default = a.default_init is not None
     unpack_method = arg_parser_unpack_method(
         t=a.type, default=a.default, default_init=a.default_init, symint=symint
@@ -1386,6 +1509,8 @@ def arg_parser_output_expr(
 def arg_parser_output_exprs(
     ps: PythonSignature, f: NativeFunction, *, symint: bool = True
 ) -> dict[str, PythonArgParserOutputExpr]:
+    # [FUNCTION DOC] Return a mapping from argument name to its parser output expression, for all
+    # arguments (including outputs and tensor options) by position.
     return {
         e.name: e
         for i, a in enumerate(ps.arguments())
@@ -1407,6 +1532,11 @@ TENSOR_OPTIONS_FIELDS = {
 def dispatch_lambda_exprs(
     ps: PythonSignature, f: NativeFunction, *, symint: bool = True
 ) -> DispatchLambdaArgumentExprs:
+    # [FUNCTION DOC] Bind parser outputs to dispatch lambda arguments. Handles scattered
+    # multi-output (local out variable), method self, packing TensorOptions into a local
+    # options variable (raising RuntimeError if the fields are missing or mis-typed or an out
+    # function has them), and output type checks for out variants. Returns the argument
+    # expressions in lambda order and the local init statements.
     # This method is to bind 'arg_parser_outputs' and 'lambda_args' by producing
     # 'inits' and 'lambda_args_exprs' for each lambda argument using arg parser
     # outputs.

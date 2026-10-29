@@ -1,3 +1,7 @@
+# [MODULE DOC] ATen/c10-specific C++ type definitions for torchgen: BaseCppType constants for
+# common types (Tensor, Scalar, SymInt, ...), mappings from ScalarType/BaseTy to C++ types,
+# and CType wrappers for Optional, List, ArrayRef and Vectorized. Defines constants at
+# import time; no other side effects.
 """
 Where should I add a new type? `types_base.py` vs `types.py`
 
@@ -131,42 +135,56 @@ BaseTypeToCppMapping: dict[BaseTy, BaseCppType] = {
 
 @dataclass(frozen=True)
 class OptionalCType(CType):
+    # [CLASS DOC] CType for an optional wrapping the element CType elem.
     elem: CType
 
     def cpp_type(self, *, strip_ref: bool = False) -> str:
+        # [FUNCTION DOC] Return the std optional spelling of the element type (strip_ref is not
+        # forwarded).
         # Do not pass `strip_ref` recursively.
         return f"::std::optional<{self.elem.cpp_type()}>"
 
     def remove_const_ref(self) -> CType:
+        # [FUNCTION DOC] Return an OptionalCType with const-ref removed from the element.
         return OptionalCType(self.elem.remove_const_ref())
 
 
 @dataclass(frozen=True)
 class ListCType(CType):
+    # [CLASS DOC] CType for a c10 List of element CType elem.
     elem: CType
 
     def cpp_type(self, *, strip_ref: bool = False) -> str:
+        # [FUNCTION DOC] Return the c10 List spelling of the element type (strip_ref is not
+        # forwarded).
         # Do not pass `strip_ref` recursively.
         return f"c10::List<{self.elem.cpp_type()}>"
 
     def remove_const_ref(self) -> CType:
+        # [FUNCTION DOC] Return a ListCType with const-ref removed from the element.
         return ListCType(self.elem.remove_const_ref())
 
 
 @dataclass(frozen=True)
 class ArrayRefCType(CType):
+    # [CLASS DOC] CType for an at ArrayRef of element CType elem.
     elem: CType
 
     def cpp_type(self, *, strip_ref: bool = False) -> str:
+        # [FUNCTION DOC] Return the ArrayRef spelling of the element type (strip_ref is not
+        # forwarded).
         # Do not pass `strip_ref` recursively.
         return f"at::ArrayRef<{self.elem.cpp_type()}>"
 
     def remove_const_ref(self) -> CType:
+        # [FUNCTION DOC] Return an ArrayRefCType with const-ref removed from the element.
         return ArrayRefCType(self.elem.remove_const_ref())
 
 
 @dataclass(frozen=True)
 class VectorizedCType(CType):
+    # [CLASS DOC] CType for at vec Vectorized over a base element type, which must be one with an
+    # explicit specialization (such as float, double or scalar_t).
     # This template is explicitly specialized, so the only valid
     # elems are those we have specializations for (e.g., float, double, ...)
     # scalar_t is also a common argument here (when we are codegen in
@@ -174,7 +192,9 @@ class VectorizedCType(CType):
     elem: BaseCType
 
     def cpp_type(self, *, strip_ref: bool = False) -> str:
+        # [FUNCTION DOC] Return the Vectorized spelling of the element type.
         return f"at::vec::Vectorized<{self.elem.cpp_type()}>"
 
     def remove_const_ref(self) -> CType:
+        # [FUNCTION DOC] Return self unchanged.
         return self
