@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Unit tests for trymerge (the merge bot): merge rule matching, bot-initiated co-dev
+# merge detection, label checks, check classification (flaky, broken trunk, unstable, CRCR_L3),
+# revert validation, ghstack handling, rev-list to PR mapping, timeline helpers and docker build
+# gates. GitHub GraphQL and Dr.CI answers are replayed from the gzipped cache files
+# gql_mocks.json.gz and drci_mocks.json.gz next to this file via mock_query. Import-time side
+# effect: sets GIT_REMOTE_URL in the environment if it is not set. Also defines mock helpers and
+# DummyGitRepo reused by other test modules.
 
 # Tests implemented in this file are relying on GitHub GraphQL APIs
 # In order to avoid test flakiness, results of the queries
@@ -66,15 +73,24 @@ def mock_query(
     key_function: Any,
     *args: Any,
 ) -> Any:
+    # [FUNCTION DOC] HELPER: Looks up a cached query result. Takes a fallback live function, the
+    # cache file name, a function that builds the cache key from the remaining args, and those
+    # args. Loads the compressed cache next to this file, returns the entry for the key if
+    # present, otherwise raises a ValueError naming the missing key.
+    # KNOWN ISSUE: everything after the raise (live fallback call, error handling, cache writing)
+    # is unreachable, so the cache can no longer be refreshed here.
     gql_db_fname = os.path.join(os.path.dirname(__file__), file_name)
 
     def get_mocked_queries() -> Any:
+        # [FUNCTION DOC] HELPER: Returns the cache mapping from the file, or an empty
+        # mapping if missing.
         if not os.path.exists(gql_db_fname):
             return {}
         with gzip.open(gql_db_fname, encoding="utf-8", mode="rt") as f:
             return json.load(f)
 
     def save_mocked_queries(obj: Any) -> None:
+        # [FUNCTION DOC] HELPER: Writes the cache mapping to the compressed file as indented text.
         with gzip.open(gql_db_fname, encoding="utf-8", mode="wt") as f:
             json.dump(obj, f, indent=2)
             f.write("\n")
@@ -111,18 +127,26 @@ def mock_query(
 
 
 def mocked_gh_graphql(query: str, **kwargs: Any) -> Any:
+    # [FUNCTION DOC] HELPER: Replacement for gh_graphql that answers from the cache. Builds a key
+    # from the query text hash and the sorted keyword arguments.
     def key_function(query: str, kwargs: Any) -> str:
+        # [FUNCTION DOC] HELPER: Builds the cache key from a query hash and
+        # sorted keyword arguments.
         return f"query_sha={sha256(query.encode('utf-8')).hexdigest()} " + " ".join(
             [f"{k}={kwargs[k]}" for k in sorted(kwargs.keys())]
         )
 
     def gh_graphql_wrapper(query: str, kwargs: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Calls the real gh_graphql; only used as
+        # the (unreachable) fallback.
         return gh_graphql(query, **kwargs)
 
     return mock_query(gh_graphql_wrapper, GQL_MOCKS, key_function, query, kwargs)
 
 
 def mocked_drci_classifications(pr_num: int, project: str, num_retries: int = 3) -> Any:
+    # [FUNCTION DOC] HELPER: Replacement for get_drci_classifications that answers from the Dr.CI
+    # cache keyed by PR number and project; the retry count is ignored.
     return mock_query(
         get_drci_classifications,
         DRCI_MOCKS,
@@ -133,8 +157,13 @@ def mocked_drci_classifications(pr_num: int, project: str, num_retries: int = 3)
 
 
 def mock_parse_args(revert: bool = False, force: bool = False) -> Any:
+    # [FUNCTION DOC] HELPER: Builds a fake parsed-arguments object for main with the given revert
+    # and force flags and fixed values for the other fields (dry run on, PR 76123).
     class Object:
+    # [CLASS DOC] HELPER: Plain holder for the fake command line arguments.
         def __init__(self) -> None:
+            # [FUNCTION DOC] HELPER: Sets the fake argument fields from the enclosing revert
+            # and force values.
             self.revert = revert
             self.force = force
             self.pr_num = 76123
@@ -150,6 +179,7 @@ def mock_parse_args(revert: bool = False, force: bool = False) -> Any:
 def mock_remove_label(
     org: str, repo: str, pr_num: str, label: str, dry_run: bool
 ) -> None:
+    # [FUNCTION DOC] HELPER: No-op stand-in for label removal.
     pass
 
 
@@ -161,6 +191,7 @@ def mock_revert(
     comment_id: int | None = None,
     reason: str | None = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: No-op stand-in for the revert entry point.
     pass
 
 
@@ -174,10 +205,13 @@ def mock_merge(
     stale_pr_days: int = 3,
     ignore_current: bool = False,
 ) -> None:
+    # [FUNCTION DOC] HELPER: No-op stand-in for the merge entry point.
     pass
 
 
 def mock_gh_get_info() -> Any:
+    # [FUNCTION DOC] HELPER: Returns a minimal fake PR info mapping (open, same-repo,
+    # no changed files).
     return {
         "closed": False,
         "isCrossRepository": False,
@@ -190,6 +224,8 @@ def mock_gh_get_info() -> Any:
 
 
 def mocked_read_merge_rules_NE(repo: Any, org: str, project: str) -> list[MergeRule]:
+    # [FUNCTION DOC] HELPER: Fake merge rules loader returning one catch-all rule that requires a
+    # nonexistent mandatory check.
     return [
         MergeRule(
             name="mock with nonexistent check",
@@ -202,6 +238,7 @@ def mocked_read_merge_rules_NE(repo: Any, org: str, project: str) -> list[MergeR
 
 
 def mocked_read_merge_rules(repo: Any, org: str, project: str) -> list[MergeRule]:
+    # [FUNCTION DOC] HELPER: Fake merge rules loader returning a general rule and an xla pin rule.
     return [
         MergeRule(
             name="super",
@@ -231,6 +268,8 @@ def mocked_read_merge_rules(repo: Any, org: str, project: str) -> list[MergeRule
 def mocked_read_merge_rules_approvers(
     repo: Any, org: str, project: str
 ) -> list[MergeRule]:
+    # [FUNCTION DOC] HELPER: Fake merge rules loader returning two rules with different approver
+    # sets (Core Reviewers and Core Maintainers).
     return [
         MergeRule(
             name="Core Reviewers",
@@ -254,10 +293,13 @@ def mocked_read_merge_rules_approvers(
 
 
 def mocked_read_merge_rules_raise(repo: Any, org: str, project: str) -> list[MergeRule]:
+    # [FUNCTION DOC] HELPER: Fake merge rules loader that always raises a runtime error.
     raise RuntimeError("testing")
 
 
 def xla_merge_rules(repo: Any, org: str, project: str) -> list[MergeRule]:
+    # [FUNCTION DOC] HELPER: Fake merge rules loader returning one xla rule that does not
+    # ignore flaky failures.
     return [
         MergeRule(
             name=" OSS CI / pytorchbot / XLA",
@@ -276,13 +318,19 @@ def xla_merge_rules(repo: Any, org: str, project: str) -> list[MergeRule]:
 
 
 class DummyGitRepo(GitRepo):
+    # [CLASS DOC] HELPER: Git repo test double bound to the real repo dir and remote name, whose
+    # commit lookups return fixed fake values.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Initializes the base GitRepo with the detected repo
+        # dir and remote.
         super().__init__(get_git_repo_dir(), get_git_remote_name())
 
     def commits_resolving_gh_pr(self, pr_num: int) -> list[str]:
+        # [FUNCTION DOC] HELPER: Returns a single fake commit sha for any PR number.
         return ["FakeCommitSha"]
 
     def commit_message(self, ref: str) -> str:
+        # [FUNCTION DOC] HELPER: Returns a fixed fake commit message for any ref.
         return "super awesome commit message"
 
 
@@ -291,13 +339,20 @@ class DummyGitRepo(GitRepo):
     "trymerge.get_drci_classifications", side_effect=mocked_drci_classifications
 )
 class TestTryMerge(TestCase):
+    # [CLASS DOC] Tests for the core TryMerge behavior: merge rule matching and parsing, co-dev
+    # bot merge detection, auto-labeling, PR data accessors, main dispatch (revert, force, merge)
+    # and revert validation. GraphQL and Dr.CI are served from cached mocks.
     def test_merge_rules_valid(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks the real merge rules file can be parsed and has more
+        # than one rule.
         "Test that merge_rules.yaml can be parsed"
         repo = DummyGitRepo()
         merge_rules = read_merge_rules(repo, "pytorch", "pytorch")
         self.assertGreater(len(merge_rules), 1)
 
     def test_negative_pattern_excludes_subpath(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks a pattern with a leading dash excludes matching files from the
+        # rule, so only files outside the included set or inside the exclusion are non-matching.
         "Patterns prefixed with '-' exclude matching files from a rule."
         patterns = [".ci/**", "-.ci/docker/**", ".github/**"]
         files = [
@@ -318,6 +373,8 @@ class TestTryMerge(TestCase):
         )
 
     def test_negative_pattern_no_negatives(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks that without negative patterns only files outside the patterns are
+        # reported as non-matching.
         "Without negative patterns, behavior matches the positive-only case."
         files = [".ci/test.sh", "torch/foo.py"]
         self.assertEqual(_find_non_matching_files([".ci/**"], files), ["torch/foo.py"])
@@ -329,6 +386,8 @@ class TestTryMerge(TestCase):
         diff_revision: str | None = "D123456",
         editor_login: str | None = None,
     ) -> Any:
+        # [FUNCTION DOC] HELPER: Builds a fake PR object whose merge comment has the given author
+        # login, author url, editor login, and whose diff revision is the given value.
         pr = mock.MagicMock()
         pr.get_diff_revision.return_value = diff_revision
         pr.get_comment_by_id.return_value = mock.MagicMock(
@@ -339,6 +398,7 @@ class TestTryMerge(TestCase):
         return pr
 
     def test_is_bot_initiated_codev_merge_meta_codesync(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks the meta-codesync bot is recognized as a co-dev merge initiator.
         "meta-codesync, the current export bot, is recognized as a co-dev merge."
         pr = self._pr_with_merge_comment(
             "meta-codesync[bot]", "https://github.com/apps/meta-codesync"
@@ -346,6 +406,8 @@ class TestTryMerge(TestCase):
         self.assertTrue(is_bot_initiated_codev_merge(pr, 123))
 
     def test_is_bot_initiated_codev_merge_legacy_bots(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks the older bots (facebook-github-tools and facebook-github-bot) are
+        # still recognized as co-dev merge initiators.
         "The bots meta-codesync superseded are still recognized."
         tools = self._pr_with_merge_comment(
             "facebook-github-tools[bot]",
@@ -356,6 +418,8 @@ class TestTryMerge(TestCase):
         self.assertTrue(is_bot_initiated_codev_merge(legacy, 123))
 
     def test_is_bot_initiated_codev_merge_false_without_diff(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks a bot merge is not a co-dev merge when the PR has
+        # no internal diff.
         "A bot-initiated merge without an internal diff is not a co-dev merge."
         pr = self._pr_with_merge_comment(
             "meta-codesync[bot]",
@@ -365,11 +429,14 @@ class TestTryMerge(TestCase):
         self.assertFalse(is_bot_initiated_codev_merge(pr, 123))
 
     def test_is_bot_initiated_codev_merge_false_when_human(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks a human-initiated merge is never a co-dev merge.
         "A human-initiated merge is never treated as a co-dev merge."
         pr = self._pr_with_merge_comment("some-human")
         self.assertFalse(is_bot_initiated_codev_merge(pr, 123))
 
     def test_is_bot_initiated_codev_merge_false_when_edited(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks a merge comment that was edited by a human is not trusted as
+        # a co-dev merge.
         "An edited merge comment can't be trusted to name its real author."
         pr = self._pr_with_merge_comment(
             "meta-codesync[bot]",
@@ -379,6 +446,8 @@ class TestTryMerge(TestCase):
         self.assertFalse(is_bot_initiated_codev_merge(pr, 123))
 
     def test_codev_bot_list_does_not_widen_internal_checks(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks that recognizing the meta-codesync bot as co-dev does not also
+        # allow skipping the internal checks.
         "Auto-labeling meta-codesync must not also waive the Phabricator guard."
         pr = self._pr_with_merge_comment(
             "meta-codesync[bot]", "https://github.com/apps/meta-codesync"
@@ -387,6 +456,8 @@ class TestTryMerge(TestCase):
         self.assertFalse(can_skip_internal_checks(pr, 123))
 
     def test_is_bot_initiated_codev_merge_without_author_url(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks co-dev recognition works for a comment built from a paginated node
+        # that has no author url, so it must not depend on that field.
         """Recognition must not depend on author_url. Only `comments(last: 5)`
         selects it; GH_GET_PR_PREV_COMMENTS and the reviews fragment select
         `login` alone, so a merge comment older than the prefetched window comes
@@ -421,6 +492,8 @@ class TestTryMerge(TestCase):
         mock_comment: Any,
         *args: Any,
     ) -> None:
+        # [FUNCTION DOC] Checks an unlabeled co-dev merge gets the not-user-facing label added and
+        # an audit comment posted instead of raising.
         "An unlabeled co-dev merge is auto-labeled instead of raising."
         pr = mock.MagicMock(org="pytorch", project="pytorch", pr_num=123)
         ensure_mergeable_labels(pr, 456, dry_run=False)
@@ -441,6 +514,8 @@ class TestTryMerge(TestCase):
         mock_comment: Any,
         *args: Any,
     ) -> None:
+        # [FUNCTION DOC] Checks that if posting the audit comment fails, the error propagates and
+        # the label is not added.
         """A failed audit comment must not leave the label behind: the label alone
         satisfies has_required_labels, so the retry would silently skip the notice."""
         pr = mock.MagicMock(org="pytorch", project="pytorch", pr_num=123)
@@ -454,6 +529,8 @@ class TestTryMerge(TestCase):
     def test_ensure_mergeable_labels_raises_for_human_merge(
         self, mock_labels: Any, mock_codev: Any, mock_add: Any, *args: Any
     ) -> None:
+        # [FUNCTION DOC] Checks an unlabeled merge not from a co-dev bot raises an error and
+        # adds no label.
         "An unlabeled human-initiated merge still fails the label check."
         pr = mock.MagicMock(org="pytorch", project="pytorch", pr_num=123)
         with self.assertRaises(RuntimeError):
@@ -465,6 +542,7 @@ class TestTryMerge(TestCase):
     def test_ensure_mergeable_labels_noop_when_labeled(
         self, mock_labels: Any, mock_add: Any, *args: Any
     ) -> None:
+        # [FUNCTION DOC] Checks a PR that already has a required label is left untouched.
         "A PR that already has a required label is left untouched."
         pr = mock.MagicMock(org="pytorch", project="pytorch", pr_num=123)
         ensure_mergeable_labels(pr, 456, dry_run=False)
@@ -472,6 +550,7 @@ class TestTryMerge(TestCase):
 
     @mock.patch("trymerge.read_merge_rules", side_effect=mocked_read_merge_rules)
     def test_match_rules(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks a PR satisfies the mocked merge rules (a matching rule is found).
         "Tests that PR passes merge rules"
         pr = GitHubPR("pytorch", "pytorch", 109999)
         repo = DummyGitRepo()
@@ -479,6 +558,8 @@ class TestTryMerge(TestCase):
 
     @mock.patch("trymerge.read_merge_rules", side_effect=mocked_read_merge_rules_raise)
     def test_read_merge_rules_fails(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks an error raised while reading merge rules propagates out
+        # of rule matching.
         "Tests that PR fails to read the merge rules"
         pr = GitHubPR("pytorch", "pytorch", 77700)
         repo = DummyGitRepo()
@@ -490,6 +571,8 @@ class TestTryMerge(TestCase):
         "trymerge.read_merge_rules", side_effect=mocked_read_merge_rules_approvers
     )
     def test_match_rules_approvers(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks a PR missing approvers fails with all candidate rule names listed,
+        # and a PR with proper approvers matches a rule.
         "Tests that PR has the necessary approvers"
         repo = DummyGitRepo()
 
@@ -509,12 +592,15 @@ class TestTryMerge(TestCase):
 
     @mock.patch("trymerge.read_merge_rules", side_effect=mocked_read_merge_rules)
     def test_lint_fails(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks a PR with a failing lint check raises an error in rule matching.
         "Tests that PR fails mandatory lint check"
         pr = GitHubPR("pytorch", "pytorch", 90791)
         repo = DummyGitRepo()
         self.assertRaises(RuntimeError, lambda: find_matching_merge_rule(pr, repo))
 
     def test_get_last_comment(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks the last comment of a PR can be fetched with its author,
+        # editor and text.
         "Tests that last comment can be fetched"
         pr = GitHubPR("pytorch", "pytorch", 71759)
         comment = pr.get_last_comment()
@@ -523,6 +609,8 @@ class TestTryMerge(TestCase):
         self.assertTrue("You've committed this PR" in comment.body_text)
 
     def test_get_author_null(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks the author can be computed when the reply has null fields,
+        # including a PR whose creator is not among the commit authors.
         """Tests that PR author can be computed
         If reply contains NULL
         """
@@ -539,6 +627,8 @@ class TestTryMerge(TestCase):
         self.assertTrue(author is not None)
 
     def test_large_diff(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks a PR with more than 100 changed files can be
+        # fully fetched (pagination).
         "Tests that PR with 100+ files can be fetched"
         pr = GitHubPR("pytorch", "pytorch", 73099)
         self.assertTrue(pr.get_changed_files_count() > 100)
@@ -546,16 +636,20 @@ class TestTryMerge(TestCase):
         self.assertEqual(len(flist), pr.get_changed_files_count())
 
     def test_internal_changes(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks a PR with internal changes is detected.
         "Tests that PR with internal changes is detected"
         pr = GitHubPR("pytorch", "pytorch", 110140)
         self.assertTrue(pr.has_internal_changes())
 
     def test_comments_pagination(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks a PR with more than 50 comments is fully fetched (pagination).
         "Tests that PR with 50+ comments can be fetched"
         pr = GitHubPR("pytorch", "pytorch", 31093)
         self.assertGreater(len(pr.get_comments()), 50)
 
     def test_gql_complexity(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks comments and commit counts can be fetched for a PR with 60+
+        # commits, which used to cause an HTTP error from a too-complex query.
         "Fetch comments and conclusions for PR with 60 commits"
         # Previous version of GrapQL query used to cause HTTP/502 error
         # see https://gist.github.com/malfet/9b93bc7eeddeaf1d84546efc4f0c577f
@@ -568,11 +662,16 @@ class TestTryMerge(TestCase):
 
     @skip("GitHub doesn't keep this data anymore")
     def test_gql_retrieve_checksuites(self, *args: Any) -> None:
+        # [FUNCTION DOC] Skipped test: would check check-suite conclusions count for a PR; GitHub
+        # no longer keeps the data.
+        # KNOWN ISSUE: docstring is copied from the previous test and does not describe it.
         "Fetch comments and conclusions for PR with 60 commits"
         pr = GitHubPR("pytorch", "pytorch", 94787)
         self.assertEqual(len(pr.get_checkrun_conclusions()), 182)
 
     def test_team_members(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks team members can be fetched and a nonexistent team yields an empty
+        # list with a warning.
         "Test fetching team members works"
         dev_infra_team = gh_get_team_members("pytorch", "pytorch-dev-infra")
         self.assertGreater(len(dev_infra_team), 2)
@@ -581,6 +680,8 @@ class TestTryMerge(TestCase):
             self.assertEqual(len(non_existing_team), 0)
 
     def test_get_author_many_commits(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks authors of a PR with 100+ commits are all fetched and an author
+        # address is produced.
         """Tests that authors for all commits can be fetched"""
         pr = GitHubPR("pytorch", "pytorch", 76118)
         authors = pr.get_authors()
@@ -590,6 +691,8 @@ class TestTryMerge(TestCase):
 
     @mock.patch("trymerge.read_merge_rules", side_effect=mocked_read_merge_rules_NE)
     def test_pending_status_check(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks a nonexistent mandatory check yields a missing-checks error
+        # mentioning pending or not yet run.
         """Tests that PR with nonexistent/pending status checks fails with the right reason."""
         pr = GitHubPR("pytorch", "pytorch", 76118)
         repo = DummyGitRepo()
@@ -600,6 +703,8 @@ class TestTryMerge(TestCase):
         )
 
     def test_get_author_many_reviews(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks all reviews of a PR with 100+ reviews are fetched
+        # and approvers found.
         """Tests that all reviews can be fetched"""
         pr = GitHubPR("pytorch", "pytorch", 76123)
         approved_by = pr.get_approved_by()
@@ -609,6 +714,9 @@ class TestTryMerge(TestCase):
         self.assertGreater(len(pr._reviews), 100)
 
     def get_co_authors(self, *args: Any) -> None:
+        # [FUNCTION DOC] Would check co-authors are recognized in authors and in the
+        # generated commit message.
+        # KNOWN ISSUE: the name lacks the test prefix, so the runner never collects it.
         """Tests that co-authors are recognized"""
         pr = GitHubPR("pytorch", "pytorch", 118347)
         authors = pr.get_authors()
@@ -616,6 +724,7 @@ class TestTryMerge(TestCase):
         self.assertIn("Co-authored-by:", pr.gen_commit_message())
 
     def test_get_checkruns_many_runs(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks all 221 check runs of a large PR are fetched by name.
         """Tests that all checkruns can be fetched"""
         pr = GitHubPR("pytorch", "pytorch", 105260)
         conclusions = pr.get_checkrun_conclusions()
@@ -623,6 +732,8 @@ class TestTryMerge(TestCase):
         self.assertTrue("pull / linux-docs / build-docs-cpp-false" in conclusions)
 
     def test_cancelled_gets_ignored(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks a cancelled workflow does not override an existing successful
+        # status for the lint checks.
         """Tests that cancelled workflow does not override existing successful status"""
         pr = GitHubPR("pytorch", "pytorch", 110367)
         conclusions = pr.get_checkrun_conclusions()
@@ -633,6 +744,8 @@ class TestTryMerge(TestCase):
         )
 
     def test_get_review_comment_by_id(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks a comment id that refers to a review (not a plain comment)
+        # is still found.
         """Tests that even if the comment requested was actually a review instead of a simple comment, we can still find it"""
         pr = GitHubPR("pytorch", "pytorch", 107070)
         review_comment_id = 1582767635
@@ -643,6 +756,7 @@ class TestTryMerge(TestCase):
     @mock.patch("trymerge.parse_args", return_value=mock_parse_args(True, False))
     @mock.patch("trymerge.try_revert", side_effect=mock_revert)
     def test_main_revert(self, mock_revert: Any, *args: Any) -> None:
+        # [FUNCTION DOC] Checks main in revert mode calls the revert entry point once.
         trymerge_main()
         mock_revert.assert_called_once()
 
@@ -653,6 +767,8 @@ class TestTryMerge(TestCase):
     def test_main_force(
         self, mock_merge: Any, mock_parse_args: Any, *args: Any
     ) -> None:
+        # [FUNCTION DOC] Checks main in force mode calls merge once with mandatory checks skipped
+        # and ignore_current false.
         trymerge_main()
         mock_merge.assert_called_once_with(
             mock.ANY,
@@ -668,6 +784,8 @@ class TestTryMerge(TestCase):
     @mock.patch("trymerge.gh_remove_label", side_effect=mock_remove_label)
     @mock.patch("trymerge.merge", side_effect=mock_merge)
     def test_main_merge(self, mock_merge: Any, *args: Any) -> None:
+        # [FUNCTION DOC] Checks main in normal mode calls merge once with mandatory
+        # checks not skipped.
         trymerge_main()
         mock_merge.assert_called_once_with(
             mock.ANY,
@@ -680,12 +798,15 @@ class TestTryMerge(TestCase):
 
     @mock.patch("trymerge.read_merge_rules", side_effect=mocked_read_merge_rules)
     def test_revert_rules(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks a revert requested by a collaborator passes validation.
         """Tests that reverts from collaborators are allowed"""
         pr = GitHubPR("pytorch", "pytorch", 79694)
         repo = DummyGitRepo()
         self.assertIsNotNone(validate_revert(repo, pr, comment_id=1189459845))
 
     def test_get_changed_files(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks the list of changed files of a PR has no duplicates (length equals
+        # the reported count) and no error is raised.
         """
         Tests that the list changed files in a PR doesn't include duplicates
         """
@@ -698,16 +819,22 @@ class TestTryMerge(TestCase):
         self.assertEqual(len(changed_files), pr.get_changed_files_count())
 
     def test_revert_codev_abandoned_diff_succeeds(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks reverting a PR whose co-dev diff was abandoned passes validation.
         pr = GitHubPR("pytorch", "pytorch", 100652)
 
         class GitRepoCoDev(DummyGitRepo):
+            # [CLASS DOC] HELPER: Repo double whose commit message is the PR body.
             def commit_message(self, ref: str) -> str:
+                # [FUNCTION DOC] HELPER: Returns the PR body as the commit message for any ref.
                 return pr.get_body()
 
         repo = GitRepoCoDev()
         validate_revert(repo, pr, comment_id=1588195237)
 
     def test_pr_changed_submodule_detection(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks detection of changed submodules and of invalid submodule
+        # updates for a PR reverting a change, one touching ideep (invalid) and an automated
+        # kineto bump (valid).
         # Updates submodule during dev-cycle but reverts it later
         pr = GitHubPR("pytorch", "pytorch", 95045)
         self.assertEqual(pr.get_changed_submodules(), [])
@@ -724,6 +851,8 @@ class TestTryMerge(TestCase):
         self.assertFalse(pr.has_invalid_submodule_updates())
 
     def test_remove_job_name_suffix(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks remove_job_name_suffix strips the shard and runner details from
+        # test job names and leaves other names unchanged.
         test_cases = [
             {
                 "name": "linux-bionic-cuda12.6-py3.10-gcc9-sm86 / test (default, 1, 5, linux.g5.4xlarge.nvidia.gpu)",
@@ -755,6 +884,7 @@ class TestTryMerge(TestCase):
             self.assertEqual(case["expected"], remove_job_name_suffix(case["name"]))
 
     def test_get_merge_base(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks the merge base is fetched once and cached for later calls.
         pr = GitHubPR("pytorch", "pytorch", 104121)
 
         mock_merge_base = "mocked-sha"
@@ -769,6 +899,8 @@ class TestTryMerge(TestCase):
             mocked_gh_fetch_merge_base.assert_called_once()
 
     def test_app_can_revert(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks a revert comment by the revert app is accepted, while a comment by
+        # an impostor with the same displayed login raises a post-comment error.
         pr = GitHubPR("pytorch", "pytorch", 164660)
         repo = DummyGitRepo()
         app_comment_id, impostor_comment_id = 3375785595, 3377647892
@@ -792,7 +924,14 @@ class TestTryMerge(TestCase):
     "trymerge.get_drci_classifications", side_effect=mocked_drci_classifications
 )
 class TestBypassFailures(TestCase):
+    # [CLASS DOC] Tests for classifying failed checks (flaky, broken trunk, unstable, ignore
+    # current) and for how categorize_checks buckets them. Uses cached GraphQL and Dr.CI mocks
+    # with an empty merge base.
     def test_get_classifications(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks classifications of a PR (broken trunk, flaky) and how
+        # categorize_checks buckets them under different failure thresholds.
+        # KNOWN ISSUE: the last block is labeled as threshold 0 but passes 1, so it duplicates
+        # the previous block.
         pr = GitHubPR("pytorch", "pytorch", 109584)
         checks = pr.get_checkrun_conclusions()
         checks = get_classifications(
@@ -861,6 +1000,7 @@ class TestBypassFailures(TestCase):
         self.assertTrue(len(ignorable["BROKEN_TRUNK"]) == 2)
 
     def test_get_classifications_flaky_fullname(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks a flaky failure matched by its full name is ignored as flaky.
         pr = GitHubPR("pytorch", "pytorch", 110362)
         checks = pr.get_checkrun_conclusions()
         checks = get_classifications(
@@ -875,6 +1015,8 @@ class TestBypassFailures(TestCase):
         self.assertTrue(len(ignorable["FLAKY"]) == 1)
 
     def test_get_classifications_invalid_cancel(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks an invalid cancellation is not counted as a failure and the
+        # unstable jobs are bucketed as unstable.
         pr = GitHubPR("pytorch", "pytorch", 110367)
         checks = pr.get_checkrun_conclusions()
         checks = get_classifications(
@@ -891,6 +1033,7 @@ class TestBypassFailures(TestCase):
         self.assertTrue(len(ignorable["UNSTABLE"]) == 3)
 
     def test_get_classifications_similar_failures(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks failures similar to a known flaky one are ignored as flaky.
         pr = GitHubPR("pytorch", "pytorch", 109750)
         checks = pr.get_checkrun_conclusions()
         checks = get_classifications(
@@ -905,6 +1048,8 @@ class TestBypassFailures(TestCase):
         self.assertTrue(len(ignorable["FLAKY"]) == 1)
 
     def test_get_classifications_unstable(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks jobs marked unstable by name or by prior marking are classified
+        # unstable and ignored. Prints the checks as a side effect.
         pr = GitHubPR("pytorch", "pytorch", 104312)
         checks = pr.get_checkrun_conclusions()
         checks = get_classifications(
@@ -950,6 +1095,9 @@ class TestBypassFailures(TestCase):
         self.assertTrue(len(ignorable["UNSTABLE"]) == 1)
 
     def test_get_classifications_broken_trunk(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks broken trunk classification across several PRs: failures on a
+        # different shard, ghstack, retried merge base failures and Dr.CI classification. With a
+        # zero threshold the broken trunk failures count as failed.
         # The mock merge base is the actual value returned by gh_fetch_merge_base
         test_cases = [
             {
@@ -1011,6 +1159,8 @@ class TestBypassFailures(TestCase):
             )
 
     def test_ignore_current(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks ignore-current runs after other classifications: known flaky and
+        # broken trunk failures keep their classification, so no failure is left for it.
         # Test various interactions of the failure classifier to ensure that ignore
         # current checks takes place after other classifications: flaky, unstable,
         # or broken trunk. Only actual new failures should be kept in the list of
@@ -1041,6 +1191,8 @@ class TestBypassFailures(TestCase):
         self.assertTrue(len(ignorable["BROKEN_TRUNK"]) == 2)
 
     def test_get_classifications_wrong_workflow_name(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks a check whose workflow name is the full workflow file path is
+        # still classified (as flaky) like the normal name.
         pr = GitHubPR("pytorch", "pytorch", 123104)
         checks = pr.get_checkrun_conclusions()
 
@@ -1076,6 +1228,8 @@ class TestBypassFailures(TestCase):
         self.assertTrue(len(ignorable["BROKEN_TRUNK"]) == 0)
 
     def test_ignore_failures_older_run_same_workflow(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks failures from an older run of the same workflow are ignored,
+        # leaving only flaky and unstable ignorable ones.
         pr = GitHubPR("pytorch", "pytorch", 129013)
         checks = pr.get_checkrun_conclusions()
         checks = get_classifications(
@@ -1095,6 +1249,8 @@ class TestBypassFailures(TestCase):
 
     @mock.patch("trymerge.read_merge_rules", side_effect=xla_merge_rules)
     def test_dont_ignore_flaky_failures(self, *args: Any) -> None:
+        # [FUNCTION DOC] Regression test for a rule that does not ignore flaky failures: a flaky
+        # failure is classified but still raises an error, with one warning emitted.
         """
         Regression test for https://github.com/pytorch/test-infra/issues/4126
         """
@@ -1110,6 +1266,8 @@ class TestBypassFailures(TestCase):
         )
 
     def test_get_classifications_crcr_l3(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks CRCR_L3 failures get that classification, broken trunk still
+        # works, and CRCR_L3 is ignored regardless of the failure threshold.
         """Test that CRCR L3 failures are classified as CRCR_L3
         and are always non-blocking regardless of the ok_failed_checks_threshold."""
         pr = GitHubPR("pytorch", "pytorch", 100652)
@@ -1152,7 +1310,11 @@ class TestBypassFailures(TestCase):
 @mock.patch("trymerge.gh_fetch_merge_base", return_value="")
 @mock.patch("trymerge.get_drci_classifications", return_value={})
 class TestBypassFailuresOnSandCastle(TestCase):
+    # [CLASS DOC] Tests classification when Dr.CI returns nothing (as in the internal runner
+    # environment), relying on cached GraphQL data only.
     def test_get_classifications(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks flaky and broken trunk failures are still ignorable
+        # without Dr.CI data.
         pr = GitHubPR("pytorch", "pytorch", 111467)
         checks = pr.get_checkrun_conclusions()
         checks = get_classifications(
@@ -1168,6 +1330,8 @@ class TestBypassFailuresOnSandCastle(TestCase):
         self.assertTrue(len(ignorable["BROKEN_TRUNK"]) == 1)
 
     def test_get_classifications_drci_checkrun_not_found(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks that when the Dr.CI check run has no summary, an empty summary, or
+        # is missing, the two failures remain blocking.
         pr = GitHubPR("pytorch", "pytorch", 111467)
 
         # No summary
@@ -1232,7 +1396,10 @@ class TestBypassFailuresOnSandCastle(TestCase):
     "trymerge.get_drci_classifications", side_effect=mocked_drci_classifications
 )
 class TestGitHubPRGhstackDependencies(TestCase):
+    # [CLASS DOC] Tests the commit message generation with ghstack dependency information.
     def test_pr_dependencies(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks the generated commit message for a PR, with the ghstack
+        # description filtered out, has the title, body, resolved link and approvers.
         pr = GitHubPR("pytorch", "pytorch", 106068)
         msg = pr.gen_commit_message(filter_ghstack=True)
         self.assertEqual(
@@ -1243,6 +1410,8 @@ class TestGitHubPRGhstackDependencies(TestCase):
         )
 
     def test_pr_dependencies_ghstack(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks the generated commit message also lists the
+        # ghstack dependency PRs.
         pr0 = GitHubPR("pytorch", "pytorch", 106032)
         pr1 = GitHubPR("pytorch", "pytorch", 106033)
         pr2 = GitHubPR("pytorch", "pytorch", 106034)
@@ -1269,6 +1438,9 @@ class TestGitHubPRGhstackDependencies(TestCase):
         mock_merge_rules: mock.MagicMock,
         *args: Any,
     ) -> None:
+        # [FUNCTION DOC] Skipped test: would check merge_ghstack_into cherry-picks only the needed
+        # ghstack commits and amends their messages.
+        # KNOWN ISSUE: skipped because it depends on a mutable live PR.
         """
         Test that the merge_ghstack_into method works correctly
         """
@@ -1341,6 +1513,8 @@ class TestGitHubPRGhstackDependencies(TestCase):
         _mock_is_closed: mock.MagicMock,
         *args: Any,
     ) -> None:
+        # [FUNCTION DOC] Checks that when a parent PR in the stack fails the merge rule check, the
+        # raised error names the parent PR number and keeps the original error type.
         """
         When a stacked dependency PR fails the merge-rule check, the error
         raised by merge_ghstack_into should identify the failing PR number
@@ -1376,6 +1550,8 @@ class TestGitHubPRGhstackDependencies(TestCase):
         _mock_is_closed: mock.MagicMock,
         *args: Any,
     ) -> None:
+        # [FUNCTION DOC] Checks the wrapped error for a failing parent PR keeps the missing
+        # mandatory checks error type and names the parent PR.
         """The wrapping must preserve MandatoryChecksMissingError so callers
         that catch it specifically (e.g. for retry behavior) keep working."""
         parent_pr = GitHubPR("pytorch", "pytorch", 106034)
@@ -1401,10 +1577,13 @@ class TestGitHubPRGhstackDependencies(TestCase):
 )
 @mock.patch.object(DummyGitRepo, "commit_message")
 class TestRevListToPR(TestCase):
+    # [CLASS DOC] Tests for the helper mapping a revision list to PRs, with
+    # commit messages mocked.
     # Tests for _revlist_to_prs function
     def test__revlist_to_prs_zero_matches(
         self, mock_commit_message: mock.MagicMock, *args: Any
     ) -> None:
+        # [FUNCTION DOC] Checks an error is raised when a commit message mentions zero PRs.
         # If zero PRs are mentioned in the commit message, it should raise an error
         pr_num = 154098
         pr = GitHubPR("pytorch", "pytorch", pr_num)
@@ -1419,6 +1598,7 @@ class TestRevListToPR(TestCase):
     def test__revlist_to_prs_two_prs(
         self, mock_commit_message: mock.MagicMock, *args: Any
     ) -> None:
+        # [FUNCTION DOC] Checks an error is raised when a commit message mentions two PRs.
         # If two PRs are mentioned in the commit message, it should raise an error
         pr_num = 154394
         pr = GitHubPR("pytorch", "pytorch", pr_num)
@@ -1446,9 +1626,12 @@ Pull Request resolved: https://github.com/pytorch/pytorch/pull/154394"""
     "trymerge.get_drci_classifications", side_effect=mocked_drci_classifications
 )
 class TestTimelineFunctions(TestCase):
+    # [CLASS DOC] Tests for the issue timeline helpers and the commit sha lookup at a comment.
     """Tests for the new timeline-related functions"""
 
     def test_sha_from_committed_event(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks extracting the sha from a committed event, and none if
+        # it is absent.
         """Test extracting SHA from committed event"""
         # Based on actual GitHub API format - committed events have "sha" at top level
         event = {
@@ -1464,6 +1647,10 @@ class TestTimelineFunctions(TestCase):
         self.assertIsNone(sha_from_committed_event(event_no_sha))
 
     def test_sha_from_force_push_after(self, *args: Any) -> None:
+        # [FUNCTION DOC] Checks extracting the sha from a force push event, handling the legacy
+        # nested format and the commit id format, and none if absent.
+        # KNOWN ISSUE: an inline comment claims the commit id format returns none, but the
+        # assertion expects the sha.
         """Test extracting SHA from force push event"""
         # NOTE: The current function doesn't handle the actual GitHub API format
         # Real force push events have "commit_id" at top level, but this function
@@ -1497,6 +1684,8 @@ class TestTimelineFunctions(TestCase):
     def test_iter_issue_timeline_until_comment(
         self, mock_gh_fetch_json_list: Any, *args: Any
     ) -> None:
+        # [FUNCTION DOC] Checks timeline iteration yields events up to and including
+        # the target comment.
         """Test timeline iteration until target comment"""
         # Mock timeline data based on actual GitHub API format
         timeline_data = [
@@ -1521,6 +1710,7 @@ class TestTimelineFunctions(TestCase):
     def test_iter_issue_timeline_until_comment_not_found(
         self, mock_gh_fetch_json_list: Any, *args: Any
     ) -> None:
+        # [FUNCTION DOC] Checks timeline iteration yields nothing when the timeline is empty.
         """Test timeline iteration when target comment is not found"""
         # Mock empty timeline
         mock_gh_fetch_json_list.return_value = []
@@ -1532,6 +1722,8 @@ class TestTimelineFunctions(TestCase):
     def test_get_commit_sha_at_comment_commit_after_comment(
         self, mock_iter_timeline: Any, *args: Any
     ) -> None:
+        # [FUNCTION DOC] Checks the commit sha at a comment is the latest commit before the
+        # comment, even if later force pushes exist.
         """Test get_commit_sha_at_comment returns correct SHA after comment"""
         mock_iter_timeline.return_value = [
             {"event": "committed", "sha": "commit1"},
@@ -1547,6 +1739,8 @@ class TestTimelineFunctions(TestCase):
     def test_get_commit_sha_at_comment_force_push_before_comment(
         self, mock_iter_timeline: Any, *args: Any
     ) -> None:
+        # [FUNCTION DOC] Checks a force push before the comment (commit id format)
+        # provides the sha.
         mock_iter_timeline.return_value = [
             {"event": "committed", "sha": "commit1"},
             {"event": "committed", "sha": "commit2"},
@@ -1561,6 +1755,8 @@ class TestTimelineFunctions(TestCase):
     def test_get_commit_sha_at_comment_force_push_before_comment_legacy_mode(
         self, mock_iter_timeline: Any, *args: Any
     ) -> None:
+        # [FUNCTION DOC] Checks a force push before the comment (legacy nested format)
+        # provides the sha.
         mock_iter_timeline.return_value = [
             {"event": "committed", "sha": "commit1"},
             {"event": "committed", "sha": "commit2"},
@@ -1575,6 +1771,7 @@ class TestTimelineFunctions(TestCase):
     def test_get_commit_sha_at_comment_multiple_comments(
         self, mock_iter_timeline: Any, *args: Any
     ) -> None:
+        # [FUNCTION DOC] Checks the sha is looked up correctly for several different comments.
         mock_iter_timeline.return_value = [
             {"event": "committed", "sha": "commit1"},
             {"event": "commented", "id": 100},
@@ -1593,6 +1790,7 @@ class TestTimelineFunctions(TestCase):
     def test_get_commit_sha_at_comment_no_events(
         self, mock_iter_timeline: Any, *args: Any
     ) -> None:
+        # [FUNCTION DOC] Checks none is returned when there are no commit or force push events.
         mock_iter_timeline.return_value = [
             {"event": "commented", "id": 100},
             {"event": "labeled", "label": {"name": "test"}},
@@ -1605,6 +1803,7 @@ class TestTimelineFunctions(TestCase):
     def test_get_commit_sha_at_comment_exception(
         self, mock_iter_timeline: Any, *args: Any
     ) -> None:
+        # [FUNCTION DOC] Checks none is returned when timeline iteration raises an error.
         mock_iter_timeline.side_effect = Exception("API error")
         pr = GitHubPR("pytorch", "pytorch", 77700)
         sha = pr.get_commit_sha_at_comment(100)
@@ -1612,9 +1811,13 @@ class TestTimelineFunctions(TestCase):
 
 
 class TestDockerCiGates(TestCase):
+    # [CLASS DOC] Tests for the docker image merge gates: file detection, build check selection,
+    # topmost docker PR choice and the gating in merge_into.
     """Unit tests for the docker-image merge gates."""
 
     def test_is_docker_affecting_files(self) -> None:
+        # [FUNCTION DOC] Checks docker-affecting path detection: files under the docker directory
+        # count, lookalike prefixes and an empty list do not.
         self.assertTrue(is_docker_affecting_files([".ci/docker/build.sh"]))
         self.assertTrue(
             is_docker_affecting_files(["README.md", ".ci/docker/ubuntu/Dockerfile"])
@@ -1627,7 +1830,9 @@ class TestDockerCiGates(TestCase):
         self.assertFalse(is_docker_affecting_files([]))
 
     def test_get_docker_build_checks(self) -> None:
+        # [FUNCTION DOC] Checks get_docker_build_checks selects only docker-builds checks by name.
         def check(name: str) -> JobCheckState:
+            # [FUNCTION DOC] HELPER: Builds a successful job check state with the given name.
             return JobCheckState(name, "", "SUCCESS", None, None, None, None)
 
         checks = {
@@ -1648,6 +1853,8 @@ class TestDockerCiGates(TestCase):
         )
 
     def test_get_topmost_docker_pr(self) -> None:
+        # [FUNCTION DOC] Checks get_topmost_docker_pr returns the highest PR in the stack that
+        # affects docker, or none if none does.
         lower_docker_pr = mock.MagicMock()
         lower_docker_pr.is_docker_affecting.return_value = True
         middle_pr = mock.MagicMock()
@@ -1675,6 +1882,9 @@ class TestDockerCiGates(TestCase):
         mock_get_ghstack_prs: mock.MagicMock,
         mock_check_docker_builds_ready: mock.MagicMock,
     ) -> None:
+        # [FUNCTION DOC] Checks merge_into on a ghstack PR also checks docker builds of a lower
+        # docker PR before merging, using mocked collaborators and stopping after the gates by
+        # a raised error.
         lower_pr = mock.MagicMock(spec=GitHubPR)
         lower_pr.is_closed.return_value = False
         lower_pr.is_docker_affecting.return_value = True

@@ -1,3 +1,9 @@
+# [MODULE DOC] Unit tests for tryrebase: rebase_onto, rebase_ghstack_onto and
+# additional_rebase_failure_info. Git and GitHub access is mocked (GraphQL via the cached mocks
+# from test_trymerge, GitRepo._run_git and rev_parse, and the comment poster), so the tests assert
+# on the exact git commands issued and the comments posted. Defines helper constants for branches
+# and a fork point SHA. No import-time side effects beyond imports.
+
 from typing import Any
 from unittest import main, mock, TestCase
 
@@ -8,6 +14,7 @@ from tryrebase import additional_rebase_failure_info, rebase_ghstack_onto, rebas
 
 
 def mocked_rev_parse(branch: str) -> str:
+    # [FUNCTION DOC] HELPER: Stand-in for rev_parse that returns the branch name unchanged.
     return branch
 
 
@@ -19,9 +26,14 @@ FORK_POINT = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 
 
 def make_mocked_run_git(push_result: str = "") -> Any:
+    # [FUNCTION DOC] HELPER: Builds a replacement for the git runner. Takes the text a push should
+    # return (default empty) and returns a function that answers merge-base commands with
+    # FORK_POINT and every other git command with that text.
     """_run_git stub: merge-base yields a fork point, everything else push_result."""
 
     def run_git(*args: str) -> str:
+        # [FUNCTION DOC] HELPER: Fake git runner; returns FORK_POINT for
+        # merge-base, push_result otherwise.
         if args and args[0] == "merge-base":
             return FORK_POINT
         return push_result
@@ -30,6 +42,8 @@ def make_mocked_run_git(push_result: str = "") -> Any:
 
 
 class TestRebase(TestCase):
+    # [CLASS DOC] Tests for rebase_onto, rebase_ghstack_onto and the failure-info helper against
+    # PR 31093, with all git and GitHub calls mocked.
     @mock.patch("trymerge.gh_graphql", side_effect=mocked_gh_graphql)
     @mock.patch("gitutils.GitRepo._run_git")
     @mock.patch("gitutils.GitRepo.rev_parse", side_effect=mocked_rev_parse)
@@ -41,6 +55,9 @@ class TestRebase(TestCase):
         mocked_run_git: Any,
         mocked_gql: Any,
     ) -> None:
+        # [FUNCTION DOC] Rebases onto the main branch and checks the sequence of git calls (fetch,
+        # merge-base, rebase with onto and the fork point, forced push to the fork) and the
+        # success comment posted.
         "Tests rebase successfully"
         mocked_run_git.side_effect = make_mocked_run_git()
         pr = GitHubPR("pytorch", "pytorch", 31093)
@@ -75,6 +92,8 @@ class TestRebase(TestCase):
         mocked_run_git: Any,
         mocked_gql: Any,
     ) -> None:
+        # [FUNCTION DOC] Same as test_rebase but targets the viable/strict branch, with the flag
+        # that disables the extra hint set to false; checks git calls and the success comment.
         "Tests rebase to viable/strict successfully"
         mocked_run_git.side_effect = make_mocked_run_git()
         pr = GitHubPR("pytorch", "pytorch", 31093)
@@ -111,6 +130,8 @@ class TestRebase(TestCase):
         mocked_run_git: Any,
         mocked_gql: Any,
     ) -> None:
+        # [FUNCTION DOC] Checks that when the push reports nothing to update, the comment says the
+        # PR was already up to date and does not suggest rebasing against main.
         "Tests branch already up to date"
         mocked_run_git.side_effect = make_mocked_run_git("Everything up-to-date")
         pr = GitHubPR("pytorch", "pytorch", 31093)
@@ -149,6 +170,8 @@ class TestRebase(TestCase):
         mocked_run_git: Any,
         mocked_gql: Any,
     ) -> None:
+        # [FUNCTION DOC] Checks that when the push reports up to date while targeting
+        # viable/strict, the comment suggests trying a rebase against main.
         "Tests branch already up to date again viable/strict"
         pr = GitHubPR("pytorch", "pytorch", 31093)
         repo = GitRepo(get_git_repo_dir(), get_git_remote_name())
@@ -169,6 +192,8 @@ class TestRebase(TestCase):
         mocked_run_git: Any,
         mocked_gql: Any,
     ) -> None:
+        # [FUNCTION DOC] Checks both rebase_onto and rebase_ghstack_onto raise an error mentioning
+        # the same sha when the rebased head equals the target branch.
         "Tests rebase results in same sha"
         pr = GitHubPR("pytorch", "pytorch", 31093)
         repo = GitRepo(get_git_repo_dir(), get_git_remote_name())
@@ -178,6 +203,8 @@ class TestRebase(TestCase):
             rebase_ghstack_onto(pr, repo, MAIN_BRANCH)
 
     def test_additional_rebase_failure_info(self) -> None:
+        # [FUNCTION DOC] Checks that a permission-denied push error produces extra failure info
+        # that explains the likely cause.
         error = (
             "Command `git -C /Users/csl/zzzzzzzz/pytorch push --dry-run -f "
             "https://github.com/Lightning-Sandbox/pytorch.git pull/106089/head:fix/spaces` returned non-zero exit code 128\n"
@@ -200,6 +227,9 @@ class TestRebase(TestCase):
         mocked_run_git: Any,
         mocked_gql: Any,
     ) -> None:
+        # [FUNCTION DOC] Regression test: checks the rebase uses the onto form anchored on the
+        # merge-base fork point, and that the only rebase call has exactly those arguments, so
+        # trunk commits are not replayed onto the PR.
         """#187374: rebase must anchor on the fork point (--onto) and never use
         the 2-arg form, which grafts trunk commits onto the PR."""
         mocked_run_git.side_effect = make_mocked_run_git()
