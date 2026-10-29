@@ -1,3 +1,7 @@
+# [MODULE DOC] Interpreter that evaluates sympy expressions by calling methods of an "analysis"
+# handler object (inductor virtualized-ops style, e.g. ValueRangeAnalysis). Provides a mapping
+# from sympy/torch function classes to handler method names, a helper that runs one node, and
+# the recursive entry point sympy_interp. No import-time side effects beyond creating a logger.
 """
 This is a simple interpreter for Sympy expressions that dispatches to
 classes following the torch._inductor.virtualized calling convention.
@@ -54,6 +58,10 @@ log = logging.getLogger(__name__)
 
 @functools.cache
 def handlers() -> dict[type[sympy.Basic], str]:
+    # [FUNCTION DOC] Returns (cached) the mapping from sympy and torch._sympy function classes
+    # to the name of the analysis method that implements them. Also adds the trig functions
+    # (cos, sin, tan, sinh, cosh, tanh, asin, acos, atan) mapped to their own names. Note
+    # that CleanDiv maps to floordiv and sympy.Pow maps to pow_by_natural.
     # TODO add CeilDiv (it doesn't appear in the index_expr)
 
     # TODO default to some decompositions if the interpreter doesn't have them
@@ -128,6 +136,13 @@ def _run_sympy_handler(
     expr: sympy.Basic,
     index_dtype: torch.dtype = torch.int64,
 ) -> Any:
+    # [FUNCTION DOC] HELPER: Applies the analysis handler matching the sympy node expr to the
+    # already-evaluated child results args. Special cases: Pow with exponent one half calls
+    # sqrt; ToFloat calls to_dtype with float64; rounding/truncation functions get index_dtype
+    # as an extra argument; integral Add uses sym_sum if available. Otherwise the handler name
+    # comes from the class attribute _torch_handler_name or the handlers() table (KeyError if
+    # unknown). Associative ops are folded left over args (error if fewer than two args).
+    # Re-raises NotImplementedError silently; other failures are logged then re-raised.
     # Special cases
     if isinstance(expr, sympy.Pow) and isinstance(
         expr.args[1], sympy.core.numbers.Half
@@ -202,6 +217,11 @@ def sympy_interp(
     index_dtype: torch.dtype = torch.int64,
     missing_handler: Callable[[sympy.Symbol], object] | None = None,
 ) -> Any:
+    # [FUNCTION DOC] Evaluates the sympy expression expr bottom-up using the analysis object.
+    # Boolean atoms, integers and other numbers become analysis.constant with bool, int64 and
+    # double dtype. Symbols are looked up in env; if absent, missing_handler is called when
+    # given, else KeyError is raised. Other nodes evaluate their args recursively and dispatch
+    # via _run_sympy_handler with index_dtype. Returns whatever the analysis produces.
     # Handle base cases
     dtype = None
     if isinstance(expr, BooleanAtom):
