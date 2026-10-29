@@ -1,4 +1,9 @@
 # mypy: ignore-errors
+# [MODULE DOC] Tests for the graph break registry linter (tools.linter.adapters.
+# gb_registry_linter.check_registry_sync): registry synchronization with unimplemented call
+# sites (new, renamed, changed and unchanged entries, hints from imported variables, helper
+# wrapper calls), duplicate detection, and the ban on directly raising Unsupported with its
+# noqa escape hatches. Tests write fixture files to a directory next to this file.
 import json
 import shutil
 import unittest
@@ -13,11 +18,18 @@ from tools.linter.adapters.gb_registry_linter import (
 
 
 class TestGraphBreakRegistryLinter(unittest.TestCase):
+    # [CLASS DOC] Test case for the registry linter. Per-test state set in setUp: a test data
+    # directory beside this file, an empty json registry file inside it and a call site
+    # python file containing one unimplemented call. Each test rewrites these files and
+    # compares lint messages; tearDown deletes the directory.
     """
     Test the graph break registry linter functionality
     """
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Creates the test data directory (next to this file if
+        # missing), writes an empty json object as the registry and writes a call site file
+        # with a single unimplemented call using "testing" for each field.
         script_dir = Path(__file__).resolve()
         self.test_data_dir = script_dir.parent / "graph_break_registry_linter_testdata"
         self.test_data_dir.mkdir(parents=True, exist_ok=True)
@@ -41,10 +53,15 @@ def test(self):
             f.write(callsite_content)
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Recursively deletes the test data directory if it exists.
         if self.test_data_dir.exists():
             shutil.rmtree(self.test_data_dir)
 
     def test_case1_new_gb_type(self):
+        # [FUNCTION DOC] With an empty registry and one call site, asserts exactly one
+        # warning message "Registry sync needed" whose replacement registry has a single
+        # generated id holding the call's fields and whose description says one new type was
+        # added. Applies the replacement and asserts a second check yields no messages.
         """Test Case 1: Adding a completely new gb_type to an empty registry."""
         with open(self.registry_path) as f:
             original_content = f.read()
@@ -92,6 +109,9 @@ def test(self):
         )
 
     def test_case2_rename_gb_type(self):
+        # [FUNCTION DOC] Renames the type in the call site while the registry keeps the old
+        # one; asserts the warning keeps the same id with the new entry listed first and the
+        # old entry retained, with a rename description, and that applying it clears messages.
         """Test Case 2: Renaming a gb_type while keeping other content the same."""
         registry_data = {
             "GB0000": [
@@ -159,6 +179,11 @@ def test(self):
         )
 
     def test_case3_content_change(self):
+        # [FUNCTION DOC] Changes the context, explanation and hints of an existing type in
+        # the call site; asserts the warning keeps the id, puts the new content first and
+        # retains the old, and that applying the fix clears messages.
+        # KNOWN ISSUE: the expected description is "Registry sync needed ()" with an empty
+        # detail list, which looks like an unfinished message but is asserted as is.
         """Test Case 3: Changing the content of an existing gb_type."""
         registry_data = {
             "GB0000": [
@@ -226,6 +251,8 @@ def test(self):
         )
 
     def test_case4_no_changes(self):
+        # [FUNCTION DOC] Asserts no message is produced when the registry already matches
+        # the call site.
         """Test Case 4: Ensuring no message is produced when the registry is in sync."""
         registry_data = {
             "GB0000": [
@@ -246,6 +273,10 @@ def test(self):
         )
 
     def test_case5_new_gbid_on_full_change(self):
+        # [FUNCTION DOC] Replaces the call site content entirely; asserts the replacement
+        # keeps the original entry under its id and adds the new entry under a newly
+        # generated id (order follows the replacement since ids are random), then applies the
+        # fix and asserts no further messages.
         """Test Case 5: A completely new entry should get a new GB ID."""
         registry_data = {
             "GB0000": [
@@ -331,6 +362,10 @@ def test(self):
         )
 
     def test_case6_dynamic_hints_from_variable(self):
+        # [FUNCTION DOC] Creates a temporary hints module and package marker file, and a
+        # call site that unpacks hints from that module's list variable; asserts the linter
+        # resolves the variable into the registry entry's hints, then applies the fix and
+        # asserts no messages. The extra files are removed in a finally block.
         """Test Case 6: Verifies hints can be unpacked from an imported variable."""
         mock_hints_file = self.test_data_dir / "graph_break_hints.py"
         init_py = self.test_data_dir / "__init__.py"
@@ -413,6 +448,9 @@ def test(self):
             init_py.unlink()
 
     def test_case7_duplicate_gb_type_in_registry(self):
+        # [FUNCTION DOC] With the same type under two ids in the registry, asserts a single
+        # error message "Duplicate gb_type in registry" without replacement, naming both ids
+        # and asking for a manual fix.
         """Test Case 7: Detecting duplicate gb_types across different GB IDs in the registry."""
         registry_data = {
             "GB0000": [
@@ -462,6 +500,9 @@ def test(self):
         self.assertEqual(messages, [expected_msg])
 
     def test_case8_forbid_direct_raise_unsupported(self):
+        # [FUNCTION DOC] Asserts directly raising the imported Unsupported exception in a
+        # call site gives one error "Direct raise Unsupported" at the raise line, whose
+        # description tells to use the unimplemented function.
         callsite_content = """from torch._dynamo.exc import Unsupported
 
 def test(self):
@@ -482,6 +523,8 @@ def test(self):
         self.assertIn("Use `unimplemented(...)`", message.description)
 
     def test_case9_forbid_raise_exc_unsupported(self):
+        # [FUNCTION DOC] Asserts raising Unsupported through the exc module attribute is
+        # flagged the same way as the direct import form.
         callsite_content = """from torch._dynamo import exc
 
 def test(self):
@@ -501,6 +544,8 @@ def test(self):
         self.assertEqual(message.name, "Direct raise Unsupported")
 
     def test_case10_allow_noqa_for_direct_raise_unsupported(self):
+        # [FUNCTION DOC] Asserts a trailing registry noqa marker on the raise line
+        # suppresses the direct-raise error.
         callsite_content = """from torch._dynamo.exc import Unsupported
 
 def test(self):
@@ -513,6 +558,8 @@ def test(self):
         self.assertEqual(messages, [])
 
     def test_case10_allow_previous_line_noqa_for_direct_raise_unsupported(self):
+        # [FUNCTION DOC] Asserts a registry noqa marker on the line before the raise also
+        # suppresses the error.
         callsite_content = """from torch._dynamo.exc import Unsupported
 
 def test(self):
@@ -526,6 +573,9 @@ def test(self):
         self.assertEqual(messages, [])
 
     def test_case11_allow_noqa_in_exc_py(self):
+        # [FUNCTION DOC] Writes an exception module file defining Unsupported and two
+        # functions raising it with the noqa marker; asserts no messages, i.e. raises in that
+        # file are exempt (including one whose message suggests it is not allowed).
         callsite_content = """def test(self):
     pass
 """
@@ -549,6 +599,10 @@ def other():
         self.assertEqual(messages, [])
 
     def test_case12_direct_disable_helper(self):
+        # [FUNCTION DOC] Uses a call site where a local helper wraps the unimplemented call
+        # with formatted strings and is invoked with positional and keyword api names;
+        # asserts a registry holding the two expanded entries is in sync, and that editing a
+        # hint text in the call site yields a sync-needed message containing the new text.
         callsite_content = """from torch._dynamo.exc import unimplemented
 
 def test(self):

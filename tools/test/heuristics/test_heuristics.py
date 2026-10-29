@@ -1,4 +1,9 @@
 # For testing specific heuristics
+# [MODULE DOC] Tests for individual target-determination heuristics: historical class
+# failure correlation, edited-by-PR, merge base and changed-file queries, previously
+# failed tests cache parsing, and filepath keyword matching. Uses mocks for git, GitHub
+# and file access. Import-time side effect: temporarily appends the repository root to
+# sys.path for imports, then removes it; defines module constants for patch targets.
 from __future__ import annotations
 
 import io
@@ -45,6 +50,8 @@ HEURISTIC_UTILS = "tools.testing.target_determination.heuristics.utils."
 
 
 def mocked_file(contents: dict[Any, Any]) -> io.IOBase:
+    # [FUNCTION DOC] HELPER: Returns an in-memory text stream holding the JSON encoding of
+    # the given mapping, rewound to the start, to stand in for an opened file.
     file_object = io.StringIO()
     json.dump(contents, file_object)
     file_object.seek(0)
@@ -52,6 +59,8 @@ def mocked_file(contents: dict[Any, Any]) -> io.IOBase:
 
 
 def gen_historical_class_failures() -> dict[str, dict[str, float]]:
+    # [FUNCTION DOC] HELPER: Returns fixture data mapping three file names to mappings of
+    # "test::class" identifiers to correlation scores.
     return {
         "file1": {
             "test1::classA": 0.5,
@@ -86,6 +95,8 @@ ALL_TESTS = [
 
 
 class TestHistoricalClassFailureCorrelation(TestTD):
+    # [CLASS DOC] Tests the historical class failure correlation heuristic with patched
+    # correlation data and changed-file list. Stateless.
     @mock.patch(
         HEURISTIC_CLASS + "_get_historical_test_class_correlations",
         return_value=gen_historical_class_failures(),
@@ -99,6 +110,11 @@ class TestHistoricalClassFailureCorrelation(TestTD):
         historical_class_failures: dict[str, dict[str, float]],
         changed_files: list[str],
     ) -> None:
+        # [FUNCTION DOC] With patched correlations and one changed file, runs the heuristic
+        # over all test names and asserts the resulting scores: class-level runs related
+        # to the changed file get scaled correlation values, the remaining runs (with those
+        # classes excluded) get zero. Note the mock arguments are bound in reverse order
+        # of patching and are unused; the patches only take effect.
         tests_to_prioritize = ALL_TESTS
 
         heuristic = HistoricalClassFailurCorrelation()
@@ -127,11 +143,15 @@ class TestHistoricalClassFailureCorrelation(TestTD):
 
 
 class TestChangedFiles(TestTD):
+    # [CLASS DOC] Tests changed-file and merge-base lookups, with git and GitHub calls
+    # patched. Stateless.
     @mock.patch(EDITED_BY_PR + "query_changed_files", side_effect=RuntimeError)
     def test_edited_by_pr_propagates_changed_files_errors(
         self,
         mock_query_changed_files: Any,
     ) -> None:
+        # [FUNCTION DOC] Asserts that an error raised by the changed-files query is
+        # propagated by the modified-tests lookup, and that the query was called once.
         with self.assertRaises(RuntimeError):
             _get_modified_tests()
 
@@ -155,6 +175,10 @@ class TestChangedFiles(TestTD):
         mock_git_head: Any,
         mock_git_merge_base: Any,
     ) -> None:
+        # [FUNCTION DOC] With both local merge-base attempts (remote base branch, then base
+        # sha) failing, asserts the PR merge base is obtained from the GitHub compare API
+        # using the url-quoted base ref and head sha, and that each helper was called as
+        # expected.
         pr_info: dict[str, object] = {
             "base": {
                 "ref": "gh/bobrenjc93/893/base",
@@ -187,6 +211,9 @@ class TestChangedFiles(TestTD):
         mock_get_merge_base: Any,
         mock_get_pr_number: Any,
     ) -> None:
+        # [FUNCTION DOC] With the local merge-base lookup raising, asserts the changed-file
+        # query falls back to the GitHub PR files listing for the PR number and returns
+        # its result.
         self.assertEqual(
             query_changed_files(),
             ["test/functorch/test_aotdispatch.py"],
@@ -197,6 +224,9 @@ class TestChangedFiles(TestTD):
         mock_query_changed_files_from_github.assert_called_once_with(123)
 
     def test_python_test_file_to_test_name_handles_git_paths(self) -> None:
+        # [FUNCTION DOC] Asserts conversion of file paths to test names keeps only python
+        # files under the test directory (accepting forward and backward slash separators)
+        # and strips the extension.
         self.assertEqual(
             python_test_file_to_test_name(
                 {
@@ -211,8 +241,13 @@ class TestChangedFiles(TestTD):
 
 
 class TestParsePrevTests(TestTD):
+    # [CLASS DOC] Tests parsing of the pytest last-failed cache by get_previous_failures,
+    # with file existence and opening patched. Class attribute
+    # lastfailed_with_multiple_tests_per_file is fixture data.
     @mock.patch("os.path.exists", return_value=False)
     def test_cache_does_not_exist(self, mock_exists: Any) -> None:
+        # [FUNCTION DOC] Asserts that with no cache file present the previous failures
+        # result is an empty set.
         expected_failing_test_files: set[str] = set()
 
         found_tests = get_previous_failures()
@@ -222,6 +257,8 @@ class TestParsePrevTests(TestTD):
     @mock.patch("os.path.exists", return_value=True)
     @mock.patch("builtins.open", return_value=mocked_file({"": True}))
     def test_empty_cache(self, mock_exists: Any, mock_open: Any) -> None:
+        # [FUNCTION DOC] With an existing cache whose only key is an empty string, asserts
+        # the result is an empty set and the file was opened.
         expected_failing_test_files: set[str] = set()
 
         found_tests = get_previous_failures()
@@ -242,6 +279,8 @@ class TestParsePrevTests(TestTD):
         return_value=mocked_file(lastfailed_with_multiple_tests_per_file),
     )
     def test_dedupes_failing_test_files(self, mock_exists: Any, mock_open: Any) -> None:
+        # [FUNCTION DOC] With a cache listing several failing tests across files, asserts
+        # the result is the set of distinct test file names without directory or extension.
         expected_failing_test_files = {"test_car", "test_bar", "test_far"}
         found_tests = get_previous_failures()
 
@@ -249,7 +288,12 @@ class TestParsePrevTests(TestTD):
 
 
 class TestFilePath(TestTD):
+    # [CLASS DOC] Tests the filepath heuristic's keyword extraction and matching
+    # functions. Stateless.
     def test_get_keywords(self) -> None:
+        # [FUNCTION DOC] Asserts keyword extraction from paths: strips directories noise
+        # and the test prefix, and maps related names (e.g. mixed precision) to shared
+        # keywords such as amp.
         self.assertEqual(get_keywords("test/test_car.py"), ["car"])
         self.assertEqual(get_keywords("test/nn/test_amp.py"), ["nn", "amp"])
         self.assertEqual(get_keywords("torch/nn/test_amp.py"), ["nn", "amp"])
@@ -259,6 +303,9 @@ class TestFilePath(TestTD):
         )
 
     def test_match_keywords(self) -> None:
+        # [FUNCTION DOC] Asserts file_matches_keyword is true when the keyword (or a known
+        # alias such as quant for quantization) appears in the test path and false for
+        # unrelated pairs like onnx versus nn.
         self.assertTrue(file_matches_keyword("test/quantization/test_car.py", "quant"))
         self.assertTrue(file_matches_keyword("test/test_quantization.py", "quant"))
         self.assertTrue(file_matches_keyword("test/nn/test_amp.py", "nn"))
@@ -267,7 +314,11 @@ class TestFilePath(TestTD):
         self.assertFalse(file_matches_keyword("test/test_onnx.py", "nn"))
 
     def test_get_keywords_match(self) -> None:
+        # [FUNCTION DOC] Asserts end-to-end relatedness of a changed file to a test file:
+        # true when any keyword of the changed file matches the test path, false otherwise.
         def helper(test_file: str, changed_file: str) -> bool:
+            # [FUNCTION DOC] HELPER: Returns true if any keyword extracted from the changed
+            # file matches the test file path.
             return any(
                 file_matches_keyword(test_file, x) for x in get_keywords(changed_file)
             )

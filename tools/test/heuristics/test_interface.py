@@ -1,3 +1,8 @@
+# [MODULE DOC] Tests for the target-determination heuristics interface: TestPrioritizations
+# (initialization, setting/adding scores at file and class granularity, validation, JSON
+# round trip), AggregatedHeuristics (combining scores, per-test statistics) and TestRun JSON.
+# Also defines the shared TestTD base class reused by other heuristic tests. Import-time side
+# effect: temporarily appends the repository root to sys.path for imports, then removes it.
 from __future__ import annotations
 
 import sys
@@ -17,20 +22,29 @@ sys.path.remove(str(REPO_ROOT))
 
 
 class TestTD(unittest.TestCase):
+    # [CLASS DOC] Base test case for target-determination tests, offering an approximate
+    # score-mapping assertion and a factory of dummy heuristic classes. Stateless.
     def assert_test_scores_almost_equal(
         self, d1: dict[TestRun, float], d2: dict[TestRun, float]
     ) -> None:
+        # [FUNCTION DOC] HELPER: Asserts two mappings from test runs to scores have the
+        # same set of keys and approximately equal values; failure messages name the key.
         # Check that dictionaries are the same, except for floating point errors
         self.assertEqual(set(d1.keys()), set(d2.keys()))
         for k, v in d1.items():
             self.assertAlmostEqual(v, d2[k], msg=f"{k}: {v} != {d2[k]}")
 
     def make_heuristic(self, classname: str) -> Any:
+        # [FUNCTION DOC] HELPER: Creates and returns a new heuristic class with the given
+        # name, derived from a dummy implementation of the heuristic interface.
         # Create a dummy heuristic class
         class Heuristic(interface.HeuristicInterface):
+            # [CLASS DOC] HELPER: Dummy heuristic whose prediction is always empty.
             def get_prediction_confidence(
                 self, tests: list[str]
             ) -> interface.TestPrioritizations:
+                # [FUNCTION DOC] HELPER: Ignores the tests and returns an empty
+                # prioritization with no scores.
                 # Return junk
                 return interface.TestPrioritizations([], {})
 
@@ -38,7 +52,11 @@ class TestTD(unittest.TestCase):
 
 
 class TestTestPrioritizations(TestTD):
+    # [CLASS DOC] Tests the TestPrioritizations score container: construction, set and add
+    # score operations with class-level include/exclude splitting, and validation. Stateless.
     def test_init_none(self) -> None:
+        # [FUNCTION DOC] Asserts construction with no scores records the original tests and
+        # gives every test a default score of zero.
         tests = ["test_a", "test_b"]
         test_prioritizations = interface.TestPrioritizations(tests, {})
         self.assertSetEqual(test_prioritizations._original_tests, set(tests))
@@ -48,6 +66,7 @@ class TestTestPrioritizations(TestTD):
         )
 
     def test_init_set_scores_full_files(self) -> None:
+        # [FUNCTION DOC] Asserts scores given for whole test files at construction are kept.
         tests = ["test_a", "test_b"]
         test_prioritizations = interface.TestPrioritizations(
             tests, {TestRun("test_a"): 0.5, TestRun("test_b"): 0.25}
@@ -59,6 +78,7 @@ class TestTestPrioritizations(TestTD):
         )
 
     def test_init_set_scores_some_full_files(self) -> None:
+        # [FUNCTION DOC] Asserts a test file missing from the given scores defaults to zero.
         tests = ["test_a", "test_b"]
         test_prioritizations = interface.TestPrioritizations(
             tests, {TestRun("test_a"): 0.5}
@@ -70,6 +90,8 @@ class TestTestPrioritizations(TestTD):
         )
 
     def test_init_set_scores_classes(self) -> None:
+        # [FUNCTION DOC] Asserts a score given for an included class of a file adds a
+        # complementary excluded-class entry for the same file with score zero.
         tests = ["test_a", "test_b"]
         test_prioritizations = interface.TestPrioritizations(
             tests, {TestRun("test_a", included=["TestA"]): 0.5}
@@ -85,6 +107,8 @@ class TestTestPrioritizations(TestTD):
         )
 
     def test_init_set_scores_other_class_naming_convention(self) -> None:
+        # [FUNCTION DOC] Asserts the file-double-colon-class naming form is treated the
+        # same as an explicit included class, with the same complementary excluded entry.
         tests = ["test_a", "test_b"]
         test_prioritizations = interface.TestPrioritizations(
             tests, {TestRun("test_a::TestA"): 0.5}
@@ -100,6 +124,7 @@ class TestTestPrioritizations(TestTD):
         )
 
     def test_set_test_score_full_class(self) -> None:
+        # [FUNCTION DOC] Asserts set_test_score on a whole test file replaces its score.
         tests = ["test_a", "test_b"]
         test_prioritizations = interface.TestPrioritizations(tests, {})
         test_prioritizations.set_test_score(TestRun("test_a"), 0.5)
@@ -110,6 +135,10 @@ class TestTestPrioritizations(TestTD):
         )
 
     def test_set_test_score_mix(self) -> None:
+        # [FUNCTION DOC] Applies a sequence of set_test_score calls mixing whole-file,
+        # included-class and excluded-class runs, asserting after each step that the stored
+        # runs are split or merged so classes never overlap and the remainder run keeps the
+        # right score. Finally validates the container.
         tests = ["test_a", "test_b"]
         test_prioritizations = interface.TestPrioritizations(
             tests, {TestRun("test_b"): -0.5}
@@ -175,6 +204,9 @@ class TestTestPrioritizations(TestTD):
         test_prioritizations.validate()
 
     def test_add_test_score_mix(self) -> None:
+        # [FUNCTION DOC] Like the set-score mix test but for add_test_score: asserts that
+        # added scores accumulate on every overlapping class run, with the runs split as
+        # needed and values compared approximately. Finally validates the container.
         tests = ["test_a", "test_b"]
         test_prioritizations = interface.TestPrioritizations(
             tests, {TestRun("test_b"): -0.5}
@@ -262,12 +294,17 @@ class TestTestPrioritizations(TestTD):
 
 
 class TestAggregatedHeuristics(TestTD):
+    # [CLASS DOC] Tests how AggregatedHeuristics sums the scores of several heuristics.
+    # Stateless; the check helper drives each scenario.
     def check(
         self,
         tests: list[str],
         test_prioritizations: list[dict[TestRun, float]],
         expected: dict[TestRun, float],
     ) -> None:
+        # [FUNCTION DOC] HELPER: Registers one freshly named dummy heuristic per given score
+        # mapping on an aggregator for the tests, then asserts the aggregated priorities
+        # equal the expected mapping approximately.
         aggregated_heuristics = interface.AggregatedHeuristics(tests)
         for i, test_prioritization in enumerate(test_prioritizations):
             heuristic = self.make_heuristic(f"H{i}")
@@ -281,6 +318,8 @@ class TestAggregatedHeuristics(TestTD):
         )
 
     def test_get_aggregated_priorities_mix_1(self) -> None:
+        # [FUNCTION DOC] Aggregates a whole-file score, a class score on the same file and
+        # a score on another file; asserts the class run sums both and others stay separate.
         tests = ["test_a", "test_b", "test_c"]
         self.check(
             tests,
@@ -298,6 +337,9 @@ class TestAggregatedHeuristics(TestTD):
         )
 
     def test_get_aggregated_priorities_mix_2(self) -> None:
+        # [FUNCTION DOC] Aggregates heuristics that score overlapping included and excluded
+        # class sets across several files; asserts the resulting class runs carry the summed
+        # scores.
         tests = ["test_a", "test_b", "test_c"]
         self.check(
             tests,
@@ -327,6 +369,8 @@ class TestAggregatedHeuristics(TestTD):
         )
 
     def test_get_aggregated_priorities_mix_3(self) -> None:
+        # [FUNCTION DOC] Aggregates six heuristics with many overlapping class include and
+        # exclude sets on one file; asserts the final per-class scores are the sums.
         tests = ["test_a"]
         self.check(
             tests,
@@ -364,7 +408,12 @@ class TestAggregatedHeuristics(TestTD):
 
 
 class TestAggregatedHeuristicsTestStats(TestTD):
+    # [CLASS DOC] Tests the per-test statistics report (positions and scores per heuristic
+    # and aggregated) built by AggregatedHeuristics. Stateless.
     def test_get_test_stats_with_whole_tests(self) -> None:
+        # [FUNCTION DOC] With two heuristics scoring whole files, asserts the stats of one
+        # test list each heuristic's rank position and score plus the aggregated and
+        # aggregated-trial entries, exactly as expected.
         self.maxDiff = None
         tests = ["test1", "test2", "test3", "test4", "test5"]
         heuristic1 = interface.TestPrioritizations(
@@ -411,6 +460,8 @@ class TestAggregatedHeuristicsTestStats(TestTD):
         self.assertDictEqual(test3_stats, expected_test3_stats)
 
     def test_get_test_stats_only_contains_allowed_types(self) -> None:
+        # [FUNCTION DOC] Asserts the stats mappings for a whole test and a class run contain
+        # only string keys and values of string, number, list or mapping type, recursively.
         self.maxDiff = None
         tests = ["test1", "test2", "test3", "test4", "test5"]
         heuristic1 = interface.TestPrioritizations(
@@ -435,6 +486,9 @@ class TestAggregatedHeuristicsTestStats(TestTD):
         stats5 = aggregator.get_test_stats(TestRun("test5::classA"))
 
         def assert_valid_dict(dict_contents: dict[str, Any]) -> None:
+            # [FUNCTION DOC] HELPER: Recursively asserts that all keys are strings and all
+            # values are strings, numbers, lists or mappings, descending into mappings and
+            # into list items (which are treated as mappings).
             for key, value in dict_contents.items():
                 self.assertTrue(isinstance(key, str))
                 self.assertTrue(
@@ -451,6 +505,9 @@ class TestAggregatedHeuristicsTestStats(TestTD):
         assert_valid_dict(stats5)
 
     def test_get_test_stats_gets_rank_for_test_classes(self) -> None:
+        # [FUNCTION DOC] Asserts stats for an included-class run and the matching
+        # excluded-class run report the correct filter strings, positions and scores for
+        # each heuristic and in aggregate.
         self.maxDiff = None
         tests = ["test1", "test2", "test3", "test4", "test5"]
         heuristic1 = interface.TestPrioritizations(
@@ -522,6 +579,8 @@ class TestAggregatedHeuristicsTestStats(TestTD):
         self.assertDictEqual(stats_exclusive, expected_exclusive)
 
     def test_get_test_stats_works_with_class_granularity_heuristics(self) -> None:
+        # [FUNCTION DOC] Mixes a file-level and a class-level heuristic and asserts that
+        # requesting stats for the class run and for the whole file raises no error.
         tests = ["test1", "test2", "test3", "test4", "test5"]
         heuristic1 = interface.TestPrioritizations(
             tests,
@@ -546,7 +605,10 @@ class TestAggregatedHeuristicsTestStats(TestTD):
 
 
 class TestJsonParsing(TestTD):
+    # [CLASS DOC] Tests JSON serialization round trips of prioritizations and test runs.
     def test_json_parsing_matches_TestPrioritizations(self) -> None:
+        # [FUNCTION DOC] Asserts converting a prioritization to JSON and back preserves the
+        # original test set and the score mapping.
         tests = ["test1", "test2", "test3", "test4", "test5"]
         tp = interface.TestPrioritizations(
             tests,
@@ -564,6 +626,8 @@ class TestJsonParsing(TestTD):
         self.assertDictEqual(tp._test_scores, tp_json_to_tp._test_scores)
 
     def test_json_parsing_matches_TestRun(self) -> None:
+        # [FUNCTION DOC] Asserts a test run with included classes survives a JSON round trip
+        # as an equal object.
         testrun = TestRun("test1", included=["classA", "classB"])
         testrun_json = testrun.to_json()
         testrun_json_to_test = TestRun.from_json(testrun_json)

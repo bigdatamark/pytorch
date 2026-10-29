@@ -1,4 +1,9 @@
 # mypy: ignore-errors
+# [MODULE DOC] Tests for the DocstringLinter adapter: lint output on sample files,
+# grandfather-file workflow, block discovery and naming, report/terse/recursive/summary data
+# shapes (compared to golden files) and decorator detection. Defines paths to testdata files
+# and decorator fixtures at import time; imports the base test case either directly or
+# relatively depending on whether this directory is on sys.path.
 
 import io
 import itertools
@@ -37,14 +42,22 @@ ARGS = "--max-class=4", "--max-def=5", "--min-docstring=16"
 
 
 class TestDocstringLinter(LinterTestCase):
+    # [CLASS DOC] Test case binding the shared linter test machinery to DocstringLinter
+    # (with a large diff display limit); uses golden files next to the testdata inputs.
     LinterClass = DocstringLinter
     maxDiff = 10_240
 
     def test_python_code(self):
+        # [FUNCTION DOC] Runs the standard lint scenario (command line and lintrunner
+        # modes) on the sample python file with the size and docstring thresholds.
         self.lint_test(TEST_FILE, ARGS)
 
     @mock.patch("sys.stdout", new_callable=io.StringIO)
     def test_end_to_end(self, mock_stdout):
+        # [FUNCTION DOC] Exercises the grandfather workflow in a temporary directory: lint
+        # two files and compare the output, rewrite the grandfather file with the report
+        # option, compare its contents, then re-lint to confirm no failures remain in both
+        # text and report forms. Each step's new stdout output is compared to a golden file.
         argv_base = *ARGS, str(TEST_FILE), str(TEST_FILE2)
         report = "--report"
         write = "--write-grandfather"
@@ -52,6 +65,8 @@ class TestDocstringLinter(LinterTestCase):
         out = _next_stdout(mock_stdout)
 
         def run(name, *argv):
+            # [FUNCTION DOC] HELPER: Lints the two files with extra args and compares the
+            # stdout produced since the previous step to the golden file with this name.
             DocstringLinter(argv_base + argv).lint_all()
             self.assertExpected(TEST_FILE2, next(out), name)
 
@@ -72,6 +87,9 @@ class TestDocstringLinter(LinterTestCase):
             run("after.json", grandfather, report)
 
     def test_interface(self):
+        # [FUNCTION DOC] Parses a sample file into blocks and asserts the first and sixth
+        # blocks' full names, start and end lines and last token, and that the full list of
+        # block names matches the expected nested names.
         pf = PythonFile("test", path=TEST_FILE2)
 
         b = pf.blocks[0]
@@ -105,41 +123,57 @@ class TestDocstringLinter(LinterTestCase):
         self.assertEqual(expected, actual)
 
     def test_report(self):
+        # [FUNCTION DOC] Compares the JSON dump of per-block data for the sample file to a
+        # golden report file.
         actual = _dumps(_data())
         self.assertExpected(TEST_FILE, actual, "report.json")
 
     def test_terse(self):
+        # [FUNCTION DOC] Compares the terse form of the block data (not indexed by line) to
+        # a golden file.
         terse = make_terse(_data(), index_by_line=False)
         actual = _dumps(terse)
         self.assertExpected(TEST_FILE, actual, "terse.json")
 
     def test_terse_line(self):
+        # [FUNCTION DOC] Compares the terse form of the block data indexed by line to a
+        # golden file.
         terse = make_terse(_data(), index_by_line=True)
         actual = _dumps(terse)
         self.assertExpected(TEST_FILE, actual, "terse.line.json")
 
     def test_recursive(self):
+        # [FUNCTION DOC] Compares the nested (recursive) form of the block data to a golden
+        # file.
         recursive = make_recursive(_data())
         actual = _dumps(recursive)
         self.assertExpected(TEST_FILE, actual, "recursive.json")
 
     def test_terse_recursive(self):
+        # [FUNCTION DOC] Compares the terse form of the nested block data (not indexed by
+        # line) to a golden file.
         recursive = make_recursive(_data())
         terse = make_terse(recursive, index_by_line=False)
         actual = _dumps(terse)
         self.assertExpected(TEST_FILE, actual, "recursive.terse.json")
 
     def test_terse_line_recursive(self):
+        # [FUNCTION DOC] Compares the terse form of the nested block data indexed by line
+        # to a golden file.
         recursive = make_recursive(_data())
         terse = make_terse(recursive, index_by_line=True)
         actual = _dumps(terse)
         self.assertExpected(TEST_FILE, actual, "recursive.terse.line.json")
 
     def test_file_summary(self):
+        # [FUNCTION DOC] Compares the per-file summary (reporting all blocks) of the sample
+        # data to a golden file.
         actual = _dumps(file_summary(_data(), report_all=True))
         self.assertExpected(TEST_FILE, actual, "single.line.json")
 
     def test_file_names(self):
+        # [FUNCTION DOC] Asserts the full block names found in the block-names sample file,
+        # including bracketed numeric suffixes that disambiguate repeated nested names.
         f = DocstringLinter.make_file(TEST_BLOCK_NAMES)
         actual = [b.full_name for b in f.blocks]
         expected = [
@@ -160,6 +194,10 @@ class TestDocstringLinter(LinterTestCase):
         self.assertEqual(actual, expected)
 
     def test_decorators(self):
+        # [FUNCTION DOC] For each indentation and each decorator scenario, builds a small
+        # program, locates the function definition token and asserts the decorator lines
+        # found above it (continuations flattened, comments and blank lines skipped) match
+        # the expected list. Each combination runs as a subtest.
         tests = itertools.product(INDENTS, DECORATORS.items())
         for indent, (name, (expected, test_inputs)) in tests:
             ind = indent * " "
@@ -174,15 +212,21 @@ class TestDocstringLinter(LinterTestCase):
 
 
 def _dumps(d: dict) -> str:
+    # [FUNCTION DOC] HELPER: Serializes a mapping to JSON with sorted keys, two-space
+    # indent and a trailing newline.
     return json.dumps(d, sort_keys=True, indent=2) + "\n"
 
 
 def _data(file=TEST_FILE):
+    # [FUNCTION DOC] HELPER: Parses a file with the docstring linter and returns the list
+    # of data records of its blocks.
     docstring_file = DocstringLinter.make_file(file)
     return [b.as_data() for b in docstring_file.blocks]
 
 
 def _next_stdout(mock_stdout):
+    # [FUNCTION DOC] HELPER: Generator that on each step yields only the text written to
+    # the mocked stdout since the previous step, tracking the consumed length.
     length = 0
     while True:
         s = mock_stdout.getvalue()

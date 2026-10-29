@@ -1,3 +1,5 @@
+# [MODULE DOC] Tests for tools.alerts.create_alerts: whether JobStatus decides to alert for
+# consecutive failures, and regex-based job name filtering. Defines mock job data constants.
 from __future__ import annotations
 
 from typing import Any
@@ -38,8 +40,11 @@ MOCK_TEST_DATA = [
 
 
 class TestGitHubPR(TestCase):
+    # [CLASS DOC] Test case for the alert-creation helpers. Stateless.
     # Should fail when jobs are ? ? Fail Fail
     def test_alert(self) -> None:
+        # [FUNCTION DOC] Builds a job status from two empty entries followed by two failed
+        # runs and asserts it decides to alert.
         modified_data: list[Any] = [{}]
         modified_data.append({})
         modified_data.extend(MOCK_TEST_DATA)
@@ -48,6 +53,9 @@ class TestGitHubPR(TestCase):
 
     # test filter job names
     def test_job_filter(self) -> None:
+        # [FUNCTION DOC] Asserts filter_job_names keeps all names for an empty or match-all
+        # regex, keeps only matching names for specific patterns, returns nothing when none
+        # match, and raises an error for a malformed regex.
         job_names = [
             "pytorch_linux_xenial_py3_6_gcc5_4_test",
             "pytorch_linux_xenial_py3_6_gcc5_4_test2",

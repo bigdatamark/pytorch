@@ -1,3 +1,7 @@
+# [MODULE DOC] Tests for tools.linter.adapters.generated_shims_version_linter: parsing of
+# the fallback-op dictionaries and the version-gating rules enforced by check_file (missing,
+# wrong, malformed or modified "since" versions). Import-time side effect: appends the
+# repository root to sys.path (never removed).
 import sys
 import tempfile
 import unittest
@@ -15,7 +19,12 @@ from tools.linter.adapters.generated_shims_version_linter import (
 
 
 class TestParseFallbackOps(unittest.TestCase):
+    # [CLASS DOC] Tests parse_fallback_ops, which maps each module-level dictionary name to
+    # its ops and per-version since values. Stateless.
     def test_basic_two_dicts(self):
+        # [FUNCTION DOC] Parses source with two dictionaries and asserts both names are
+        # keys, the same op in both is kept independently, and an entry's first version
+        # holds None or its declared since value.
         src = """
 inductor_fallback_ops = {
     "aten.foo.default": {},
@@ -42,6 +51,8 @@ aten_shimified_ops = {
         )
 
     def test_different_op_versions(self):
+        # [FUNCTION DOC] Parses an op with explicit second and third variants and asserts
+        # the first variant is ungated while the others carry their own since values.
         src = """
 inductor_fallback_ops = {
     "aten.baz.default": {
@@ -61,6 +72,8 @@ aten_shimified_ops = {}
 
 
 class TestGeneratedShimsVersionLinter(unittest.TestCase):
+    # [CLASS DOC] Tests check_file against pairs of current and merge-base sources. The
+    # EMPTY_BASE class attribute is a base source with two empty dictionaries.
     """Test the four rules of the generated shims version linter."""
 
     EMPTY_BASE = """
@@ -69,6 +82,11 @@ aten_shimified_ops = {}
 """
 
     def _check(self, current_src, base_src, current_version=(2, 13, 0)):
+        # [FUNCTION DOC] HELPER: Writes the current source to a temporary python file, runs
+        # check_file on it with the merge-base reader returning base_src (None means the
+        # file did not exist) and the current version patched, and returns the lint messages.
+        # KNOWN ISSUE: the temporary file is created with delete disabled and never removed,
+        # so each call leaks a file.
         """Helper: write current_src to a temp file, run check_file with mocks."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
             f.write(current_src)
@@ -86,6 +104,8 @@ aten_shimified_ops = {}
                 return check_file(temp_file)
 
     def test_missing_version_on_new_op(self):
+        # [FUNCTION DOC] Asserts a newly added op without a since version yields exactly one
+        # message named missing-version-on-new-op.
         current = """
 inductor_fallback_ops = {
     "aten.bad.default": {},
@@ -97,6 +117,8 @@ aten_shimified_ops = {}
         self.assertEqual(msgs[0].name, "missing-version-on-new-op")
 
     def test_missing_version_on_new_variant(self):
+        # [FUNCTION DOC] Asserts adding a new variant to a pre-existing op without a since
+        # version yields one missing-version message that mentions the variant.
         # Op pre-existed (ungated v1 in base); a new v2 is added without `since`.
         base = """
 inductor_fallback_ops = {
@@ -116,6 +138,8 @@ aten_shimified_ops = {}
         self.assertIn("v2", msgs[0].description)
 
     def test_wrong_version_on_new_op(self):
+        # [FUNCTION DOC] Asserts a new op whose since differs from the current version
+        # yields one wrong-version message that names the expected current version.
         current = """
 inductor_fallback_ops = {
     "aten.bad.default": {"since": "TORCH_VERSION_2_10_0"},
@@ -128,6 +152,8 @@ aten_shimified_ops = {}
         self.assertIn("TORCH_VERSION_2_13_0", msgs[0].description)
 
     def test_malformed_version(self):
+        # [FUNCTION DOC] Asserts a since value not in the expected version-name format
+        # yields one malformed-version message.
         current = """
 inductor_fallback_ops = {
     "aten.bad.default": {"since": "TORCH_2_13"},
@@ -139,6 +165,8 @@ aten_shimified_ops = {}
         self.assertEqual(msgs[0].name, "malformed-version")
 
     def test_op_version_modified(self):
+        # [FUNCTION DOC] Asserts changing the since of an existing op yields one
+        # op-version-modified message mentioning both old and new versions.
         base = """
 inductor_fallback_ops = {
     "aten.shipped.default": {"since": "TORCH_VERSION_2_12_0"},
@@ -158,6 +186,8 @@ aten_shimified_ops = {}
         self.assertIn("TORCH_VERSION_2_14_0", msgs[0].description)
 
     def test_new_op_with_correct_since_passes(self):
+        # [FUNCTION DOC] Asserts a new op tagged with the current version produces no
+        # messages.
         current = """
 inductor_fallback_ops = {
     "aten.new_good.default": {"since": "TORCH_VERSION_2_13_0"},
@@ -168,6 +198,7 @@ aten_shimified_ops = {}
         self.assertEqual(msgs, [])
 
     def test_unchanged_file_passes(self):
+        # [FUNCTION DOC] Asserts identical current and base sources produce no messages.
         src = """
 inductor_fallback_ops = {
     "aten.old.default": {},
@@ -181,6 +212,8 @@ aten_shimified_ops = {
         self.assertEqual(msgs, [])
 
     def test_first_time_file_creation(self):
+        # [FUNCTION DOC] With no base file, treats every entry as new and asserts only the
+        # entry lacking a since version is reported (missing-version, naming that op).
         # File didn't exist at merge-base — every entry is new.
         current = """
 inductor_fallback_ops = {
@@ -196,6 +229,9 @@ aten_shimified_ops = {}
         self.assertIn("aten.b.default", msgs[0].description)
 
     def test_collision_keys_checked_independently(self):
+        # [FUNCTION DOC] With the same op key in both dictionaries, bumps the since in only
+        # one and asserts exactly one op-version-modified message (old and new versions
+        # named) is produced, so the dictionaries are checked independently.
         # Same op key in both dicts: bumping the since in one dict should be
         # flagged even though the other dict's entry stays unchanged.
         base = """
