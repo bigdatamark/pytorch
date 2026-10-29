@@ -3,6 +3,13 @@
 
 # ruff: noqa
 # flake8: noqa
+# [MODULE DOC] Dynamo-adapted copy of CPython 3.13 test_tuple: tests tuple construction,
+# truthiness, length, in-place operators, repr, pickling of iterators, lexicographic ordering, GC
+# tracking of tuples, and exact/statistical tuple hash behavior. Reuses the shared sequence tests
+# from seq_tests.CommonTest. Import-time side effects: sets the alias __TestCase, and installs a
+# RedirectImportFinder at the front of sys.meta_path so that imports of test.* helper modules
+# resolve to standalone top-level modules. Hash-statistics tests are disabled by the flags
+# RUN_ALL_HASH_TESTS and JUST_SHOW_HASH_RESULTS. run_tests() runs under __main__.
 
 # Test copied from
 # https://raw.githubusercontent.com/python/cpython/refs/tags/v3.13.5/Lib/test/test_tuple.py
@@ -30,7 +37,16 @@ redirect_imports = (
 )
 
 class RedirectImportFinder(importlib.abc.MetaPathFinder):
+    # [CLASS DOC] HELPER: Import hook that redirects selected "test.*" module names (listed in
+    # redirect_imports) to the same-named top-level modules, so the copied CPython tests find
+    # their support modules. Stateless; only its find_spec is used.
     def find_spec(self, fullname, path, target=None):
+        # [FUNCTION DOC] HELPER: If fullname is one of redirect_imports, strips the "test."
+        # prefix, imports the standalone module, registers it in sys.modules under the original
+        # dotted name (side effect), and returns that module's spec. Returns None for other names,
+        # or when the standalone import fails with an import error, so normal finders continue.
+        # KNOWN ISSUE: relies on importlib.util being already loaded; only importlib.abc is
+        # imported explicitly in this file.
         # Check if the import is the problematic one
         if fullname in redirect_imports:
             try:
@@ -70,15 +86,23 @@ RUN_ALL_HASH_TESTS = False
 JUST_SHOW_HASH_RESULTS = False # if RUN_ALL_HASH_TESTS, just display
 
 class TupleTest(seq_tests.CommonTest):
+    # [CLASS DOC] Tuple-specific tests layered on the shared sequence test suite; type2test is
+    # the builtin tuple. Many tests first call the inherited generic version, then add tuple-
+    # only checks.
     type2test = tuple
 
     def test_getitem_error(self):
+        # [FUNCTION DOC] Indexing an empty tuple with a string raises TypeError with the
+        # expected message.
         t = ()
         msg = "tuple indices must be integers or slices"
         with self.assertRaisesRegex(TypeError, msg):
             t['a']
 
     def test_constructors(self):
+        # [FUNCTION DOC] Runs the inherited constructor tests, then checks tuple() is empty, tuple
+        # of a tuple returns the identical object, and tuples built from lists, strings and a
+        # generator expression.
         super().test_constructors()
         # calling built-in types without argument must return empty
         self.assertEqual(tuple(), ())
@@ -93,11 +117,17 @@ class TupleTest(seq_tests.CommonTest):
                          (1, 3, 5, 7, 9))
 
     def test_keyword_args(self):
+        # [FUNCTION DOC] Passing the keyword argument sequence to tuple raises TypeError
+        # mentioning keyword argument.
         with self.assertRaisesRegex(TypeError, 'keyword argument'):
             tuple(sequence=())
 
     def test_keywords_in_subclass(self):
+        # [FUNCTION DOC] Tuple subclasses: instances keep their type, the sequence keyword is
+        # rejected for a plain subclass, and subclasses with their own __init__ or __new__ accept
+        # an extra keyword argument that is stored on the instance.
         class subclass(tuple):
+            # [CLASS DOC] HELPER: Plain tuple subclass.
             pass
         u = subclass([1, 2])
         self.assertIs(type(u), subclass)
@@ -106,7 +136,10 @@ class TupleTest(seq_tests.CommonTest):
             subclass(sequence=())
 
         class subclass_with_init(tuple):
+            # [CLASS DOC] HELPER: Tuple subclass whose __init__ takes an extra optional argument
+            # and stores it.
             def __init__(self, arg, newarg=None):
+                # [FUNCTION DOC] HELPER: Stores newarg as an attribute of the instance.
                 self.newarg = newarg
         u = subclass_with_init([1, 2], newarg=3)
         self.assertIs(type(u), subclass_with_init)
@@ -114,7 +147,11 @@ class TupleTest(seq_tests.CommonTest):
         self.assertEqual(u.newarg, 3)
 
         class subclass_with_new(tuple):
+            # [CLASS DOC] HELPER: Tuple subclass whose __new__ takes an extra optional argument
+            # and stores it.
             def __new__(cls, arg, newarg=None):
+                # [FUNCTION DOC] HELPER: Builds the tuple from arg via super, sets newarg on it,
+                # returns it.
                 self = super().__new__(cls, arg)
                 self.newarg = newarg
                 return self
@@ -124,17 +161,22 @@ class TupleTest(seq_tests.CommonTest):
         self.assertEqual(u.newarg, 3)
 
     def test_truth(self):
+        # [FUNCTION DOC] Runs the inherited truth test; the empty tuple is falsy and a one-element
+        # tuple is truthy.
         super().test_truth()
         self.assertTrue(not ())
         self.assertTrue((42, ))
 
     def test_len(self):
+        # [FUNCTION DOC] Runs the inherited len test; checks lengths 0, 1 and 3.
         super().test_len()
         self.assertEqual(len(()), 0)
         self.assertEqual(len((0,)), 1)
         self.assertEqual(len((0, 1, 2)), 3)
 
     def test_iadd(self):
+        # [FUNCTION DOC] Runs the inherited in-place add test; augmented add on a tuple yields a
+        # new object rather than mutating the original.
         super().test_iadd()
         u = (0, 1)
         u2 = u
@@ -142,6 +184,8 @@ class TupleTest(seq_tests.CommonTest):
         self.assertTrue(u is not u2)
 
     def test_imul(self):
+        # [FUNCTION DOC] Runs the inherited in-place multiply test; augmented multiply on a tuple
+        # yields a new object rather than mutating the original.
         super().test_imul()
         u = (0, 1)
         u2 = u
@@ -149,8 +193,11 @@ class TupleTest(seq_tests.CommonTest):
         self.assertTrue(u is not u2)
 
     def test_tupleresizebug(self):
+        # [FUNCTION DOC] Regression for a resize bug: a tuple built from a generator of 1000 items
+        # has the right contents.
         # Check that a specific bug in _PyTuple_Resize() is squashed.
         def f():
+            # [FUNCTION DOC] HELPER: Generator yielding the integers 0 to 999.
             for i in range(1000):
                 yield i
         self.assertEqual(list(tuple(f())), list(range(1000)))
@@ -159,7 +206,12 @@ class TupleTest(seq_tests.CommonTest):
     # have deterministic hashes too - and, indeed, the same hashes across
     # platforms with hash codes of the same bit width.
     def test_hash_exact(self):
+        # [FUNCTION DOC] Checks that hashes of specific tuples (empty, nested, with floats) equal
+        # fixed expected values, using the 32-bit or 64-bit expectation depending on the platform
+        # hash width. Fails the test with a message on mismatch.
         def check_one_exact(t, e32, e64):
+            # [FUNCTION DOC] HELPER: Hashes t, picks the 32-bit or 64-bit expected value by the
+            # hash bit width, and fails the test if they differ.
             got = hash(t)
             expected = e32 if support.NHASHBITS == 32 else e64
             if got != expected:
@@ -181,6 +233,13 @@ class TupleTest(seq_tests.CommonTest):
     # - https://bugs.python.org/issue942952
     # - https://bugs.python.org/issue34751
     def test_hash_optional(self):
+        # [FUNCTION DOC] Optional statistical hash-collision tests; returns immediately unless
+        # RUN_ALL_HASH_TESTS is set. Builds many tuple families (small ints, mixed sign, shifted
+        # ints, floats, strings, nested tuples) and checks collision count and pileup against
+        # expected values or a z-score limit. May print results instead of failing when
+        # JUST_SHOW_HASH_RESULTS is set.
+        # KNOWN ISSUE: the final test-case list is created by aliasing the list A and extending it
+        # in place, which also mutates A; harmless here since A is not used afterwards.
         from itertools import product
 
         if not RUN_ALL_HASH_TESTS:
@@ -191,6 +250,11 @@ class TupleTest(seq_tests.CommonTest):
         # those aren't the values we get.  Also if specified, the test
         # fails if z > `zlimit`.
         def tryone_inner(tag, nbins, hashes, expected=None, zlimit=None):
+            # [FUNCTION DOC] HELPER: Given a list of hash codes and the number of bins, computes
+            # expected collision mean and deviation, actual collisions, z-score, and the pileup
+            # (max repeat count minus one). Fails the test if z exceeds zlimit or the (collisions,
+            # pileup) pair differs from expected; prints the report to the original stdout instead
+            # when only showing results.
             from collections import Counter
 
             nballs = len(hashes)
@@ -219,6 +283,10 @@ class TupleTest(seq_tests.CommonTest):
                     self.fail(msg)
 
         def tryone(tag, xs,
+                       # [FUNCTION DOC] HELPER: Hashes every item of xs, then checks the full-
+                       # width hash codes (with the 32-bit or 64-bit expectation) and, on wider
+                       # hashes, the upper and lower 32 bits using the inner checker with the
+                       # supplied expectations and z limit.
                    native32=None, native64=None, hi32=None, lo32=None,
                    zlimit=None):
             NHASHBITS = support.NHASHBITS
@@ -334,6 +402,7 @@ class TupleTest(seq_tests.CommonTest):
                (9, 1), (0, 0), (21, 5), (6, 1))
 
     def test_repr(self):
+        # [FUNCTION DOC] Checks str and repr of an empty and a three-element tuple of type2test.
         l0 = tuple()
         l2 = (0, 1, 2)
         a0 = self.type2test(l0)
@@ -345,12 +414,16 @@ class TupleTest(seq_tests.CommonTest):
         self.assertEqual(repr(a2), "(0, 1, 2)")
 
     def _not_tracked(self, t):
+        # [FUNCTION DOC] HELPER: Runs garbage collection twice, then asserts that tuple t is not
+        # tracked by the collector.
         # Nested tuples can take several collections to untrack
         gc.collect()
         gc.collect()
         self.assertFalse(gc.is_tracked(t), t)
 
     def _tracked(self, t):
+        # [FUNCTION DOC] HELPER: Asserts t is tracked by the garbage collector, and still tracked
+        # after two full collections.
         self.assertTrue(gc.is_tracked(t), t)
         gc.collect()
         gc.collect()
@@ -358,6 +431,8 @@ class TupleTest(seq_tests.CommonTest):
 
     @support.cpython_only
     def test_track_literals(self):
+        # [FUNCTION DOC] CPython-only: tuple literals of immutable items are untracked by the
+        # collector, while literals containing mutable items are always tracked.
         # Test GC-optimization of tuple literals
         x, y, z = 1.5, "a", []
 
@@ -378,6 +453,9 @@ class TupleTest(seq_tests.CommonTest):
         self._tracked((x, y, z))
 
     def check_track_dynamic(self, tp, always_track):
+        # [FUNCTION DOC] HELPER: For constructor tp, checks results built from empty, immutable,
+        # and generator inputs are tracked when always_track is true and untracked otherwise, and
+        # results holding mutable elements are always tracked.
         x, y, z = 1.5, "a", []
 
         check = self._tracked if always_track else self._not_tracked
@@ -399,24 +477,35 @@ class TupleTest(seq_tests.CommonTest):
 
     @support.cpython_only
     def test_track_dynamic(self):
+        # [FUNCTION DOC] CPython-only: tuples built dynamically with tuple follow the
+        # untracking optimization.
         # Test GC-optimization of dynamically constructed tuples.
         self.check_track_dynamic(tuple, False)
 
     @support.cpython_only
     def test_track_subtypes(self):
+        # [FUNCTION DOC] CPython-only: instances of a tuple subclass are always tracked by
+        # the collector.
         # Tuple subtypes must always be tracked
         class MyTuple(tuple):
+            # [CLASS DOC] HELPER: Empty tuple subclass.
             pass
         self.check_track_dynamic(MyTuple, True)
 
     @support.cpython_only
     def test_bug7466(self):
+        # [FUNCTION DOC] CPython-only regression: building a tuple from a generator that triggers
+        # collections midway must not crash while untracking an unfinished tuple.
         # Trying to untrack an unfinished tuple could crash Python
         self._not_tracked(tuple(gc.collect() for i in range(101)))
 
     def test_repr_large(self):
+        # [FUNCTION DOC] Checks repr of a tuple of a million zeros against the joined string, plus
+        # a small case.
         # Check the repr of large list objects
         def check(n):
+            # [FUNCTION DOC] HELPER: Compares repr of a tuple of n zeros against the expected
+            # joined string.
             l = (0,) * n
             s = repr(l)
             self.assertEqual(s,
@@ -425,6 +514,8 @@ class TupleTest(seq_tests.CommonTest):
         check(1000000)
 
     def test_iterator_pickle(self):
+        # [FUNCTION DOC] Pickles an iterator over a tuple for every protocol and checks that its
+        # type and remaining items survive, including after advancing it by one element.
         # Userlist iterators don't support pickling yet since
         # they are based on generators.
         data = self.type2test([4, 5, 6, 7])
@@ -441,6 +532,8 @@ class TupleTest(seq_tests.CommonTest):
             self.assertEqual(self.type2test(it), self.type2test(data)[1:])
 
     def test_reversed_pickle(self):
+        # [FUNCTION DOC] Same as the iterator pickle test but for reversed iterators: round trip
+        # keeps the type and remaining items, also after one step.
         data = self.type2test([4, 5, 6, 7])
         for proto in range(pickle.HIGHEST_PROTOCOL + 1):
             itorg = reversed(data)
@@ -455,14 +548,18 @@ class TupleTest(seq_tests.CommonTest):
             self.assertEqual(self.type2test(it), self.type2test(reversed(data))[1:])
 
     def test_no_comdat_folding(self):
+        # [FUNCTION DOC] Issue 8847: adding a list to a tuple subclass instance raises TypeError.
         # Issue 8847: In the PGO build, the MSVC linker's COMDAT folding
         # optimization causes failures in code that relies on distinct
         # function addresses.
         class T(tuple): pass
+            # [CLASS DOC] HELPER: Empty tuple subclass.
         with self.assertRaises(TypeError):
             [3,] + T((1,2))
 
     def test_lexicographic_ordering(self):
+        # [FUNCTION DOC] Issue 21100: checks shorter-prefix and element-wise lexicographic
+        # ordering of tuples.
         # Issue 21100
         a = self.type2test([1, 2])
         b = self.type2test([1, 2, 0])

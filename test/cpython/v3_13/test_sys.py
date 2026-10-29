@@ -3,6 +3,13 @@
 
 # ruff: noqa
 # flake8: noqa
+# [MODULE DOC] Dynamo-adapted copy of CPython 3.13 test_sys: exercises the sys module (displayhook
+# and excepthook, exit, recursion limit, switch interval, exc_info, frames, stdlib and path
+# settings, flags and version info, size-of checks, monitoring, audit hooks, threads and sub-
+# interpreters, stdlib module names, and similar). Import-time side effects: sets the alias
+# __TestCase, installs a RedirectImportFinder at the front of sys.meta_path, and imports
+# test.support helpers (interpreters may be None). Several tests spawn Python subprocesses.
+# run_tests() runs under __main__.
 
 # Test copied from
 # https://raw.githubusercontent.com/python/cpython/refs/tags/v3.13.5/Lib/test/test_sys.py
@@ -32,7 +39,14 @@ redirect_imports = (
 )
 
 class RedirectImportFinder(importlib.abc.MetaPathFinder):
+    # [CLASS DOC] HELPER: Import hook redirecting selected "test.*" module names (see
+    # redirect_imports) to same-named top-level modules. Stateless; only find_spec is used.
     def find_spec(self, fullname, path, target=None):
+        # [FUNCTION DOC] HELPER: For a name in redirect_imports, imports the module without the
+        # "test." prefix, registers it in sys.modules under the original name (side effect), and
+        # returns its spec; returns None for other names or when that import fails with an
+        # import error.
+        # KNOWN ISSUE: uses importlib.util without importing it explicitly in this file.
         # Check if the import is the problematic one
         if fullname in redirect_imports:
             try:
@@ -83,6 +97,8 @@ import warnings
 
 
 def requires_subinterpreters(meth):
+    # [FUNCTION DOC] HELPER: Decorator that wraps a test method so it is skipped when the
+    # interpreters module could not be imported. Returns the wrapped method.
     """Decorator to skip a test if subinterpreters are not supported."""
     return unittest.skipIf(interpreters is None,
                            'subinterpreters required')(meth)
@@ -91,8 +107,14 @@ def requires_subinterpreters(meth):
 DICT_KEY_STRUCT_FORMAT = 'n2BI2n'
 
 class DisplayHookTest(__TestCase):
+    # [CLASS DOC] Tests for the default display hook sys.__displayhook__ and the
+    # replaceable sys.displayhook.
 
     def test_original_displayhook(self):
+        # [FUNCTION DOC] Original display hook prints the repr of a value to stdout and stores it
+        # in builtins under the underscore name; None prints nothing and leaves it unset; calling
+        # without arguments raises TypeError; with sys.stdout deleted it raises RuntimeError
+        # (stdout restored after).
         dh = sys.__displayhook__
 
         with support.captured_stdout() as out:
@@ -121,6 +143,8 @@ class DisplayHookTest(__TestCase):
 
     @torch._dynamo.error_on_graph_break(False)
     def test_lost_displayhook(self):
+        # [FUNCTION DOC] Deleting sys.displayhook then evaluating an interactive-mode compiled
+        # expression raises RuntimeError; the hook is restored afterwards.
         displayhook = sys.displayhook
         try:
             del sys.displayhook
@@ -131,7 +155,10 @@ class DisplayHookTest(__TestCase):
 
     @torch._dynamo.error_on_graph_break(False)
     def test_custom_displayhook(self):
+        # [FUNCTION DOC] Swaps in a display hook that raises ValueError and checks the error
+        # propagates out of evaluating an interactive-mode expression.
         def baddisplayhook(obj):
+            # [FUNCTION DOC] HELPER: Display hook that always raises ValueError.
             raise ValueError
 
         with support.swap_attr(sys, 'displayhook', baddisplayhook):
@@ -140,14 +167,20 @@ class DisplayHookTest(__TestCase):
 
 
 class ActiveExceptionTests(__TestCase):
+    # [CLASS DOC] Tests of sys.exc_info and sys.exception inside and outside an except block.
     def test_exc_info_no_exception(self):
+        # [FUNCTION DOC] Outside any handler sys.exc_info returns three None values.
         self.assertEqual(sys.exc_info(), (None, None, None))
 
     def test_sys_exception_no_exception(self):
+        # [FUNCTION DOC] Outside any handler sys.exception returns None.
         self.assertEqual(sys.exception(), None)
 
     def test_exc_info_with_exception_instance(self):
+        # [FUNCTION DOC] Inside an except block exc_info reports the exception type, instance
+        # (raised with an argument) and the instance's traceback.
         def f():
+            # [FUNCTION DOC] HELPER: Raises ValueError with the argument 42.
             raise ValueError(42)
 
         try:
@@ -162,7 +195,10 @@ class ActiveExceptionTests(__TestCase):
         self.assertIs(exc_info[2], e.__traceback__)
 
     def test_exc_info_with_exception_type(self):
+        # [FUNCTION DOC] Same as the previous test but the exception is raised from the bare
+        # class; exc_info still holds the class, a created instance and its traceback.
         def f():
+            # [FUNCTION DOC] HELPER: Raises the ValueError class without an argument.
             raise ValueError
 
         try:
@@ -177,7 +213,10 @@ class ActiveExceptionTests(__TestCase):
         self.assertIs(exc_info[2], e.__traceback__)
 
     def test_sys_exception_with_exception_instance(self):
+        # [FUNCTION DOC] Inside an except block sys.exception returns the very exception instance
+        # that was raised.
         def f():
+            # [FUNCTION DOC] HELPER: Raises ValueError with the argument 42.
             raise ValueError(42)
 
         try:
@@ -190,7 +229,10 @@ class ActiveExceptionTests(__TestCase):
         self.assertIs(exc, e)
 
     def test_sys_exception_with_exception_type(self):
+        # [FUNCTION DOC] Same as above for an exception raised from the bare class; sys.exception
+        # returns the instance.
         def f():
+            # [FUNCTION DOC] HELPER: Raises the ValueError class without an argument.
             raise ValueError
 
         try:
@@ -204,9 +246,12 @@ class ActiveExceptionTests(__TestCase):
 
 
 class ExceptHookTest(__TestCase):
+    # [CLASS DOC] Tests for the default exception hook sys.__excepthook__ and sys.excepthook.
 
     @force_not_colorized
     def test_original_excepthook(self):
+        # [FUNCTION DOC] Original excepthook prints the traceback ending in the error line to
+        # captured stderr; calling it with no arguments raises TypeError.
         try:
             raise ValueError(42)
         except ValueError as exc:
@@ -219,6 +264,9 @@ class ExceptHookTest(__TestCase):
 
     @force_not_colorized
     def test_excepthook_bytes_filename(self):
+        # [FUNCTION DOC] bpo-37467: the original excepthook must not crash on a SyntaxError whose
+        # filename is a bytes object; checks the file/line, source text and final message in
+        # stderr, with bytes warnings ignored.
         # bpo-37467: sys.excepthook() must not crash if a filename
         # is a bytes string
         with warnings.catch_warnings():
@@ -236,6 +284,8 @@ class ExceptHookTest(__TestCase):
         self.assertTrue(err.endswith("SyntaxError: msg\n"))
 
     def test_excepthook(self):
+        # [FUNCTION DOC] Calling sys.excepthook with invalid arguments prints a TypeError about
+        # expecting an exception to stderr; unraisable exceptions are captured and not propagated.
         with test.support.captured_output("stderr") as stderr:
             with test.support.catch_unraisable_exception():
                 sys.excepthook(1, '1', 1)
@@ -247,11 +297,20 @@ class ExceptHookTest(__TestCase):
 
 
 class SysModuleTest(__TestCase):
+    # [CLASS DOC] Broad collection of tests of the sys module: exit, intervals, limits, frames,
+    # flags and many other attributes. Provides tearDown that reaps child processes.
 
     def tearDown(self):
+        # [FUNCTION DOC] Reaps any finished child processes left over by subprocess-based tests.
         test.support.reap_children()
 
     def test_exit(self):
+        # [FUNCTION DOC] Checks sys.exit semantics: too many arguments raise TypeError; no
+        # argument gives SystemExit with code None; integer, string, and tuple arguments are
+        # stored on the exception (a one-element tuple is unpacked); exit codes from subprocesses
+        # (0, large and overflowing values mapped to -1/0xff/0xffffffff, 47 via raising
+        # SystemExit); and exit messages written to stderr after flushing, with backslash escaping
+        # of surrogates and the stderr encoding.
         # call with two arguments
         self.assertRaises(TypeError, sys.exit, 42, 42)
 
@@ -307,6 +366,9 @@ class SysModuleTest(__TestCase):
         self.assertEqual(err, b'')
 
         def check_exit_message(code, expected, **env_vars):
+            # [FUNCTION DOC] HELPER: Runs code in a failing subprocess and asserts return code 1,
+            # empty stdout and stderr starting with the expected bytes; extra keyword arguments
+            # become environment variables.
             rc, out, err = assert_python_failure('-c', code, **env_vars)
             self.assertEqual(rc, 1)
             self.assertEqual(out, b'')
@@ -333,6 +395,9 @@ class SysModuleTest(__TestCase):
 
     @support.requires_subprocess()
     def test_exit_codes_under_repl(self):
+        # [FUNCTION DOC] GH-129900: runs the interpreter reading a script from a temporary file
+        # that calls exit functions or raises SystemExit with codes 0 and 123 and checks the
+        # process return code matches. Requires subprocess support.
         # GH-129900: SystemExit, or things that raised it, didn't
         # get their return code propagated by the REPL
         import tempfile
@@ -353,6 +418,8 @@ class SysModuleTest(__TestCase):
                         self.assertEqual(proc.returncode, return_code)
 
     def test_getdefaultencoding(self):
+        # [FUNCTION DOC] getdefaultencoding rejects arguments with TypeError and returns a str
+        # (value not checked since the user could change it).
         self.assertRaises(TypeError, sys.getdefaultencoding, 42)
         # can't check more than the type, as the user might have changed it
         self.assertIsInstance(sys.getdefaultencoding(), str)
@@ -361,6 +428,9 @@ class SysModuleTest(__TestCase):
     # testing sys.setprofile() is done in test_sys_setprofile.py
 
     def test_switchinterval(self):
+        # [FUNCTION DOC] setswitchinterval rejects missing or non-numeric arguments (TypeError)
+        # and non-positive values (ValueError); several valid values round-trip through the getter
+        # and the original value is restored.
         self.assertRaises(TypeError, sys.setswitchinterval)
         self.assertRaises(TypeError, sys.setswitchinterval, "a")
         self.assertRaises(ValueError, sys.setswitchinterval, -1.0)
@@ -376,6 +446,8 @@ class SysModuleTest(__TestCase):
             sys.setswitchinterval(orig)
 
     def test_getrecursionlimit(self):
+        # [FUNCTION DOC] getrecursionlimit returns an int greater than 1 and rejects arguments
+        # with TypeError.
         limit = sys.getrecursionlimit()
         self.assertIsInstance(limit, int)
         self.assertGreater(limit, 1)
@@ -383,6 +455,8 @@ class SysModuleTest(__TestCase):
         self.assertRaises(TypeError, sys.getrecursionlimit, 42)
 
     def test_setrecursionlimit(self):
+        # [FUNCTION DOC] setrecursionlimit sets a new limit readable via the getter, raises
+        # TypeError without arguments and ValueError for negative values; restores the old limit.
         old_limit = sys.getrecursionlimit()
         try:
             sys.setrecursionlimit(10_005)
@@ -394,11 +468,15 @@ class SysModuleTest(__TestCase):
             sys.setrecursionlimit(old_limit)
 
     def test_recursionlimit_recovery(self):
+        # [FUNCTION DOC] Skips under a trace function. For several small limits, sets the limit
+        # and checks that infinite recursion raises RecursionError twice in a row (recovery);
+        # limits too low for the current depth are skipped. Restores the old limit.
         if hasattr(sys, 'gettrace') and sys.gettrace():
             self.skipTest('fatal error if run with a trace function')
 
         old_limit = sys.getrecursionlimit()
         def f():
+            # [FUNCTION DOC] HELPER: Recurses infinitely by calling itself.
             f()
         try:
             for depth in (50, 75, 100, 250, 1000):
@@ -420,6 +498,10 @@ class SysModuleTest(__TestCase):
 
     @test.support.cpython_only
     def test_setrecursionlimit_to_depth(self):
+        # [FUNCTION DOC] CPython-only, issue 25274: setting the recursion limit to one more
+        # than the current depth succeeds, but setting it to exactly the current depth
+        # raises RecursionError with a message saying the limit is too low. Restores the old
+        # limit afterwards.
         # Issue #25274: Setting a low recursion limit must be blocked if the
         # current recursion depth is already higher than limit.
 
@@ -445,9 +527,14 @@ class SysModuleTest(__TestCase):
     @unittest.skipUnless(support.Py_GIL_DISABLED, "only meaningful if the GIL is disabled")
     @threading_helper.requires_working_threading()
     def test_racing_recursion_limit(self):
+        # [FUNCTION DOC] Free-threaded builds only: starts five threads that keep changing the
+        # recursion limit and five that recurse 50 deep, and re-raises any exception captured in
+        # the threads.
         from threading import Thread
         def something_recursive():
+            # [FUNCTION DOC] HELPER: Thread body that runs a 50-level recursive count.
             def count(n):
+                # [FUNCTION DOC] HELPER: Recursively counts down from n, returning n.
                 if n > 0:
                     return count(n - 1) + 1
                 return 0
@@ -455,6 +542,8 @@ class SysModuleTest(__TestCase):
             count(50)
 
         def set_recursion_limit():
+            # [FUNCTION DOC] HELPER: Thread body that sets the recursion limit to each value from
+            # 100 to 199.
             for limit in range(100, 200):
                 sys.setrecursionlimit(limit)
 
@@ -473,6 +562,9 @@ class SysModuleTest(__TestCase):
                 raise cm.exc_value
 
     def test_getwindowsversion(self):
+        # [FUNCTION DOC] Skips unless sys has getwindowsversion. Checks the result has five fields
+        # with expected types, supports named access matching positional access, raises IndexError
+        # past the end, and can still be unpacked into five values.
         # Raise SkipTest if sys doesn't have getwindowsversion attribute
         test.support.get_attribute(sys, "getwindowsversion")
         v = sys.getwindowsversion()
@@ -503,11 +595,15 @@ class SysModuleTest(__TestCase):
         maj, min, buildno, plat, csd = sys.getwindowsversion()
 
     def test_call_tracing(self):
+        # [FUNCTION DOC] call_tracing called with a function and a non-tuple argument
+        # raises TypeError.
         self.assertRaises(TypeError, sys.call_tracing, type, 2)
 
     @unittest.skipUnless(hasattr(sys, "setdlopenflags"),
                          'test needs sys.setdlopenflags()')
     def test_dlopenflags(self):
+        # [FUNCTION DOC] When setdlopenflags exists: getter rejects arguments, setter requires
+        # one, a changed value reads back, and the original flags are restored.
         self.assertTrue(hasattr(sys, "getdlopenflags"))
         self.assertRaises(TypeError, sys.getdlopenflags, 42)
         oldflags = sys.getdlopenflags()
@@ -518,6 +614,9 @@ class SysModuleTest(__TestCase):
 
     @test.support.refcount_test
     def test_refcount(self):
+        # [FUNCTION DOC] Checks getrefcount requires an argument and that the count of None is
+        # unchanged by binding and deleting a global; also checks gettotalrefcount returns an int
+        # when present.
         # n here originally had to be a global in order for this test to pass
         # while tracing with a python function. Tracing used to call
         # PyFrame_FastToLocals, which would add a copy of any locals to the
@@ -539,6 +638,8 @@ class SysModuleTest(__TestCase):
             self.assertIsInstance(sys.gettotalrefcount(), int)
 
     def test_getframe(self):
+        # [FUNCTION DOC] _getframe rejects too many arguments (TypeError) and absurd depth
+        # (ValueError); the frame at depth zero has this test's code object.
         self.assertRaises(TypeError, sys._getframe, 42, 42)
         self.assertRaises(ValueError, sys._getframe, 2000000000)
         self.assertTrue(
@@ -547,6 +648,9 @@ class SysModuleTest(__TestCase):
         )
 
     def test_getframemodulename(self):
+        # [FUNCTION DOC] _getframemodulename: depth zero is this module, depth one is
+        # unittest.case; walks up the stack comparing each frame's module name (or main when None)
+        # and checks it returns None past the stack bottom.
         # Default depth gets ourselves
         self.assertEqual(__name__, sys._getframemodulename())
         self.assertEqual("unittest.case", sys._getframemodulename(1))
@@ -570,6 +674,10 @@ class SysModuleTest(__TestCase):
     @threading_helper.reap_threads
     @threading_helper.requires_working_threading()
     def test_current_frames(self):
+        # [FUNCTION DOC] Starts a thread blocked inside a nested call, then checks
+        # _current_frames: keys are positive ints including the main and worker thread, the main
+        # frame is the current frame, and the worker's stack shows f123 calling g456 on the
+        # expected line. Always releases and joins the thread.
         import threading
         import traceback
 
@@ -581,9 +689,12 @@ class SysModuleTest(__TestCase):
         thread_info = []  # the thread's id
 
         def f123():
+            # [FUNCTION DOC] HELPER: Thread body that calls g456.
             g456()
 
         def g456():
+            # [FUNCTION DOC] HELPER: Records the thread id, signals the entered event, and waits
+            # for the leave event.
             thread_info.append(threading.get_ident())
             entered_g.set()
             leave_g.wait()
@@ -637,6 +748,10 @@ class SysModuleTest(__TestCase):
     @threading_helper.reap_threads
     @threading_helper.requires_working_threading()
     def test_current_exceptions(self):
+        # [FUNCTION DOC] Like the current frames test but for _current_exceptions: a thread
+        # repeatedly raises and handles an exception while waiting; checks keys are thread ids,
+        # the main thread maps to None, and the worker's exception traceback frame shows f123
+        # calling g456 at the raise-handler lines. Releases and joins the thread.
         import threading
         import traceback
 
@@ -648,9 +763,12 @@ class SysModuleTest(__TestCase):
         thread_info = []  # the thread's id
 
         def f123():
+            # [FUNCTION DOC] HELPER: Thread body that calls g456.
             g456()
 
         def g456():
+            # [FUNCTION DOC] HELPER: Records the thread id, then loops raising and catching
+            # ValueError, signaling the raised event, until the leave event is set.
             thread_info.append(threading.get_ident())
             while True:
                 try:
@@ -702,6 +820,11 @@ class SysModuleTest(__TestCase):
             t.join()
 
     def test_attributes(self):
+        # [FUNCTION DOC] Type and value sanity checks for many sys attributes: api_version,
+        # argv, orig_argv, byteorder, float_info, int_info, hash_info (including a probable-
+        # prime check of the modulus and algorithm consistency with the build config), maxsize,
+        # maxunicode, prefixes, version and version_info fields, float_repr_style, and abiflags
+        # on non-Windows.
         self.assertIsInstance(sys.api_version, int)
         self.assertIsInstance(sys.argv, list)
         for arg in sys.argv:
@@ -797,6 +920,9 @@ class SysModuleTest(__TestCase):
             self.assertIsInstance(sys.abiflags, str)
 
     def test_thread_info(self):
+        # [FUNCTION DOC] thread_info has three fields; name and lock are among the allowed
+        # values, and name is platform specific (pthread on Linux/Android/FreeBSD, nt on Windows,
+        # and so on).
         info = sys.thread_info
         self.assertEqual(len(info), 3)
         self.assertIn(info.name, ('nt', 'pthread', 'pthread-stubs', 'solaris', None))
@@ -812,6 +938,7 @@ class SysModuleTest(__TestCase):
 
     @unittest.skipUnless(support.is_emscripten, "only available on Emscripten")
     def test_emscripten_info(self):
+        # [FUNCTION DOC] Emscripten only: _emscripten_info has four fields with expected types.
         self.assertEqual(len(sys._emscripten_info), 4)
         self.assertIsInstance(sys._emscripten_info.emscripten_version, tuple)
         self.assertIsInstance(sys._emscripten_info.runtime, (str, type(None)))
@@ -819,11 +946,15 @@ class SysModuleTest(__TestCase):
         self.assertIsInstance(sys._emscripten_info.shared_memory, bool)
 
     def test_43581(self):
+        # [FUNCTION DOC] Issue 43581: the original stdout and stderr have the same encoding.
         # Can't use sys.stdout, as this is a StringIO object when
         # the test runs under regrtest.
         self.assertEqual(sys.__stdout__.encoding, sys.__stderr__.encoding)
 
     def test_intern(self):
+        # [FUNCTION DOC] intern requires a str argument; a fresh string interns to itself and an
+        # equal copy interns to the first object, with _is_interned checks where available. String
+        # subclasses cannot be interned (TypeError) and are reported as not interned.
         has_is_interned = (test.support.check_impl_detail(cpython=True)
                            or hasattr(sys, '_is_interned'))
         self.assertRaises(TypeError, sys.intern)
@@ -848,7 +979,9 @@ class SysModuleTest(__TestCase):
         # actually interned, we don't want to create the appearance
         # that they are by allowing intern() to succeed.
         class S(str):
+            # [CLASS DOC] HELPER: String subclass with a constant hash value of 123.
             def __hash__(self):
+                # [FUNCTION DOC] HELPER: Returns the constant 123.
                 return 123
 
         self.assertRaises(TypeError, sys.intern, S("abc"))
@@ -858,6 +991,9 @@ class SysModuleTest(__TestCase):
     @support.cpython_only
     @requires_subinterpreters
     def test_subinterp_intern_dynamically_allocated(self):
+        # [FUNCTION DOC] CPython-only: a dynamically allocated string interned here gets a
+        # different object in a fresh sub-interpreter; the sub-interpreter code asserts the ids
+        # differ. Skipped if sub-interpreters are unavailable.
         # Implementation detail: Dynamically allocated strings
         # are distinct between interpreters
         s = "never interned before" + str(random.randrange(0, 10**9))
@@ -880,6 +1016,9 @@ class SysModuleTest(__TestCase):
     @support.cpython_only
     @requires_subinterpreters
     def test_subinterp_intern_statically_allocated(self):
+        # [FUNCTION DOC] CPython-only: for several strings that are statically allocated,
+        # interning in a fresh sub-interpreter yields the same object as here (id compared inside
+        # the sub-interpreter).
         # Implementation detail: Statically allocated strings are shared
         # between interpreters.
         # See Tools/build/generate_global_objects.py for the list
@@ -904,6 +1043,9 @@ class SysModuleTest(__TestCase):
     @support.cpython_only
     @requires_subinterpreters
     def test_subinterp_intern_singleton(self):
+        # [FUNCTION DOC] CPython-only: in a fresh sub-interpreter, zero- and one-character latin-1
+        # strings are singletons, so a rebuilt string has the same id as the outer one; interning
+        # is then checked in the outer interpreter with _is_interned.
         # Implementation detail: singletons are used for 0- and 1-character
         # latin1 strings.
         for s in '', '\n', '_', 'x', '\0', '\N{CEDILLA}', '\xff':
@@ -921,6 +1063,9 @@ class SysModuleTest(__TestCase):
                 self.assertTrue(sys._is_interned(s))
 
     def test_sys_flags(self):
+        # [FUNCTION DOC] sys.flags is truthy, has a field for each expected flag with int type
+        # (bool for dev_mode and safe_path), a repr, exactly that many fields, and utf8_mode is 0,
+        # 1 or 2.
         self.assertTrue(sys.flags)
         attrs = ("debug",
                  "inspect", "interactive", "optimize",
@@ -938,6 +1083,9 @@ class SysModuleTest(__TestCase):
         self.assertIn(sys.flags.utf8_mode, {0, 1, 2})
 
     def assert_raise_on_new_sys_type(self, sys_attr):
+        # [FUNCTION DOC] HELPER: Asserts that the type of the given sys attribute cannot
+        # be instantiated directly, either by calling the type or by its __new__ (both
+        # raise TypeError).
         # Users are intentionally prevented from creating new instances of
         # sys.flags, sys.version_info, and sys.getwindowsversion.
         arg = sys_attr
@@ -948,23 +1096,32 @@ class SysModuleTest(__TestCase):
             attr_type.__new__(attr_type, arg)
 
     def test_sys_flags_no_instantiation(self):
+        # [FUNCTION DOC] Direct creation of a new sys.flags object raises TypeError.
         self.assert_raise_on_new_sys_type(sys.flags)
 
     def test_sys_version_info_no_instantiation(self):
+        # [FUNCTION DOC] Direct creation of a new sys.version_info object raises TypeError.
         self.assert_raise_on_new_sys_type(sys.version_info)
 
     def test_sys_getwindowsversion_no_instantiation(self):
+        # [FUNCTION DOC] Skips unless on Windows; direct creation of a getwindowsversion result
+        # type raises TypeError.
         # Skip if not being run on Windows.
         test.support.get_attribute(sys, "getwindowsversion")
         self.assert_raise_on_new_sys_type(sys.getwindowsversion())
 
     @test.support.cpython_only
     def test_clear_type_cache(self):
+        # [FUNCTION DOC] CPython-only smoke test: calling _clear_type_cache runs without error.
         sys._clear_type_cache()
 
     @force_not_colorized
     @support.requires_subprocess()
     def test_ioencoding(self):
+        # [FUNCTION DOC] Runs subprocesses printing a cent sign under different PYTHONIOENCODING
+        # values: cp424 encodes it, ascii with replace prints a question mark, plain ascii (with
+        # or without trailing colon) fails with a UnicodeEncodeError, and a surrogateescape-only
+        # setting emits the raw byte. Requires subprocess support; colors disabled.
         env = dict(os.environ)
 
         # Test character: cent sign, encoded as 0x4A (ASCII J) in CP424,
@@ -1013,6 +1170,9 @@ class SysModuleTest(__TestCase):
                          'requires FS encoding to match locale')
     @support.requires_subprocess()
     def test_ioencoding_nonascii(self):
+        # [FUNCTION DOC] Where the OS supports non-ASCII file names and filesystem and locale
+        # encodings match: a subprocess with empty PYTHONIOENCODING prints the non-ASCII character
+        # as the filesystem bytes.
         env = dict(os.environ)
 
         env["PYTHONIOENCODING"] = ""
@@ -1026,6 +1186,9 @@ class SysModuleTest(__TestCase):
                      'Test is not venv-compatible')
     @support.requires_subprocess()
     def test_executable(self):
+        # [FUNCTION DOC] sys.executable is an absolute path; a child process started with a
+        # nonexistent argv[0] but an explicit executable reports either an empty executable or the
+        # real one. Skipped in virtual environments.
         # sys.executable should be absolute
         self.assertEqual(os.path.abspath(sys.executable), sys.executable)
 
@@ -1046,12 +1209,15 @@ class SysModuleTest(__TestCase):
         self.assertIn(executable, ["b''", repr(sys.executable.encode("ascii", "backslashreplace"))])
 
     def check_fsencoding(self, fs_encoding, expected=None):
+        # [FUNCTION DOC] HELPER: Asserts the filesystem encoding is not None, is a known codec,
+        # and equals expected when expected is given.
         self.assertIsNotNone(fs_encoding)
         codecs.lookup(fs_encoding)
         if expected:
             self.assertEqual(fs_encoding, expected)
 
     def test_getfilesystemencoding(self):
+        # [FUNCTION DOC] Checks the filesystem encoding is a valid codec, and utf-8 on macOS.
         fs_encoding = sys.getfilesystemencoding()
         if sys.platform == 'darwin':
             expected = 'utf-8'
@@ -1060,6 +1226,9 @@ class SysModuleTest(__TestCase):
         self.check_fsencoding(fs_encoding, expected)
 
     def c_locale_get_error_handler(self, locale, isolated=False, encoding=None):
+        # [FUNCTION DOC] HELPER: Starts a child interpreter under the given locale (utf8 mode off,
+        # optional isolated mode and PYTHONIOENCODING) and returns its output listing the error
+        # handler of stdin, stdout and stderr. The coerce-locale env var is disabled.
         # Force the POSIX locale
         env = os.environ.copy()
         env["LC_ALL"] = locale
@@ -1089,6 +1258,10 @@ class SysModuleTest(__TestCase):
         return stdout
 
     def check_locale_surrogateescape(self, locale):
+        # [FUNCTION DOC] HELPER: Checks the standard stream error handlers under a C-like locale:
+        # surrogateescape for stdin and stdout by default, overridden by an error handler in the
+        # encoding variable, strict when an encoding is forced, unaffected by an empty or colon-
+        # only setting; stderr is always backslashreplace.
         out = self.c_locale_get_error_handler(locale, isolated=True)
         self.assertEqual(out,
                          'stdin: surrogateescape\n'
@@ -1128,13 +1301,20 @@ class SysModuleTest(__TestCase):
 
     @support.requires_subprocess()
     def test_c_locale_surrogateescape(self):
+        # [FUNCTION DOC] Checks stream error handlers under the C locale. Requires
+        # subprocess support.
         self.check_locale_surrogateescape('C')
 
     @support.requires_subprocess()
     def test_posix_locale_surrogateescape(self):
+        # [FUNCTION DOC] Checks stream error handlers under the POSIX locale. Requires
+        # subprocess support.
         self.check_locale_surrogateescape('POSIX')
 
     def test_implementation(self):
+        # [FUNCTION DOC] sys.implementation has name, version, hexversion and cache_tag; the
+        # version prefix and the hexversion value are consistent with the version fields, and the
+        # name is lower case.
         # This test applies to all implementations equally.
 
         levels = {'alpha': 0xA, 'beta': 0xB, 'candidate': 0xC, 'final': 0xF}
@@ -1158,6 +1338,9 @@ class SysModuleTest(__TestCase):
 
     @test.support.cpython_only
     def test_debugmallocstats(self):
+        # [FUNCTION DOC] CPython-only: _debugmallocstats in a subprocess writes to stderr
+        # text depending on freelist and pymalloc build options (empty when neither), and
+        # takes no arguments.
         # Test sys._debugmallocstats()
         from test.support.script_helper import assert_python_ok
         args = ['-c', 'import sys; sys._debugmallocstats()']
@@ -1181,6 +1364,9 @@ class SysModuleTest(__TestCase):
     @unittest.skipUnless(hasattr(sys, "getallocatedblocks"),
                          "sys.getallocatedblocks unavailable on this build")
     def test_getallocatedblocks(self):
+        # [FUNCTION DOC] Checks getallocatedblocks returns an int that is positive when pymalloc
+        # is used, less than the total refcount when available, not increased by a collection, and
+        # stable within 50 across two consecutive collections.
         try:
             import _testinternalcapi
         except ImportError:
@@ -1220,12 +1406,16 @@ class SysModuleTest(__TestCase):
         self.assertIn(c, range(b - 50, b + 50))
 
     def test_is_gil_enabled(self):
+        # [FUNCTION DOC] _is_gil_enabled returns a bool on free-threaded builds and True on
+        # normal builds.
         if support.Py_GIL_DISABLED:
             self.assertIs(type(sys._is_gil_enabled()), bool)
         else:
             self.assertTrue(sys._is_gil_enabled())
 
     def test_is_finalizing(self):
+        # [FUNCTION DOC] is_finalizing is False in normal run; a subprocess whose module-level
+        # object prints it in a destructor at exit must print True.
         self.assertIs(sys.is_finalizing(), False)
         # Don't use the atexit module because _Py_Finalizing is only set
         # after calling atexit callbacks
@@ -1247,6 +1437,8 @@ class SysModuleTest(__TestCase):
         self.assertEqual(stdout.rstrip(), b'True')
 
     def test_issue20602(self):
+        # [FUNCTION DOC] Issue 20602: sys.flags and sys.float_info are still usable (printable)
+        # from a destructor running at interpreter shutdown, checked in a subprocess.
         # sys.flags and sys.float_info were wiped during shutdown.
         code = """if 1:
             import sys
@@ -1262,6 +1454,8 @@ class SysModuleTest(__TestCase):
         self.assertIn(b'sys.float_info', out[1])
 
     def test_sys_ignores_cleaning_up_user_data(self):
+        # [FUNCTION DOC] A destructor of a user object stored on sys, running at shutdown, that
+        # triggers an exception must not produce any output or non-zero exit code.
         code = """if 1:
             import struct, sys
 
@@ -1280,6 +1474,7 @@ class SysModuleTest(__TestCase):
 
     @unittest.skipUnless(sys.platform == "android", "Android only")
     def test_getandroidapilevel(self):
+        # [FUNCTION DOC] Android only: getandroidapilevel returns a positive int.
         level = sys.getandroidapilevel()
         self.assertIsInstance(level, int)
         self.assertGreater(level, 0)
@@ -1287,6 +1482,9 @@ class SysModuleTest(__TestCase):
     @force_not_colorized
     @support.requires_subprocess()
     def test_sys_tracebacklimit(self):
+        # [FUNCTION DOC] Runs scripts raising a ZeroDivisionError two functions deep with several
+        # values of sys.tracebacklimit and checks the resulting stderr traceback. Requires
+        # subprocess support.
         code = """if 1:
             import sys
             def f1():
@@ -1297,6 +1495,8 @@ class SysModuleTest(__TestCase):
             f2()
         """
         def check(tracebacklimit, expected):
+            # [FUNCTION DOC] HELPER: Runs the script with the given traceback limit and checks
+            # stderr against expected.
             p = subprocess.Popen([sys.executable, '-c', code % tracebacklimit],
                                  stderr=subprocess.PIPE)
             out = p.communicate()[1]
@@ -1326,11 +1526,14 @@ class SysModuleTest(__TestCase):
         check(None, traceback)
 
     def test_no_duplicates_in_meta_path(self):
+        # [FUNCTION DOC] The list sys.meta_path contains no duplicate entries.
         self.assertEqual(len(sys.meta_path), len(set(sys.meta_path)))
 
     @unittest.skipUnless(hasattr(sys, "_enablelegacywindowsfsencoding"),
                          'needs sys._enablelegacywindowsfsencoding()')
     def test__enablelegacywindowsfsencoding(self):
+        # [FUNCTION DOC] Windows only: in a subprocess, enabling legacy filesystem encoding makes
+        # the filesystem encoding and errors mbcs and replace.
         code = ('import sys',
                 'sys._enablelegacywindowsfsencoding()',
                 'print(sys.getfilesystemencoding(), sys.getfilesystemencodeerrors())')
@@ -1340,6 +1543,9 @@ class SysModuleTest(__TestCase):
 
     @support.requires_subprocess()
     def test_orig_argv(self):
+        # [FUNCTION DOC] Runs a child interpreter in isolated mode with extra options and an
+        # argument, and checks it prints argv without the interpreter and options and orig_argv as
+        # the complete command line. Requires subprocess support.
         code = textwrap.dedent('''
             import sys
             print(sys.argv)
@@ -1355,11 +1561,16 @@ class SysModuleTest(__TestCase):
                          proc)
 
     def test_module_names(self):
+        # [FUNCTION DOC] stdlib_module_names is a frozenset containing only strings.
         self.assertIsInstance(sys.stdlib_module_names, frozenset)
         for name in sys.stdlib_module_names:
             self.assertIsInstance(name, str)
 
     def test_stdlib_dir(self):
+        # [FUNCTION DOC] Re-imports os fresh and checks _stdlib_dir equals the directory of os
+        # after path normalization.
+        # KNOWN ISSUE: if os has no usable file location the expected value is None and the
+        # normalization of it would fail.
         os = import_helper.import_fresh_module('os')
         marker = getattr(os, '__file__', None)
         if marker and not os.path.exists(marker):
@@ -1370,6 +1581,9 @@ class SysModuleTest(__TestCase):
 
     @unittest.skipUnless(hasattr(sys, 'getobjects'), 'need sys.getobjects()')
     def test_getobjects(self):
+        # [FUNCTION DOC] Needs sys.getobjects (debug builds). With zero limit returns a non-empty
+        # list; with a type filter returns exactly the 100 live instances created; with limit
+        # three returns three.
         # sys.getobjects(0)
         all_objects = sys.getobjects(0)
         self.assertIsInstance(all_objects, list)
@@ -1377,6 +1591,7 @@ class SysModuleTest(__TestCase):
 
         # sys.getobjects(0, MyType)
         class MyType:
+            # [CLASS DOC] HELPER: Empty class whose live instances are counted.
             pass
         size = 100
         my_objects = [MyType() for _ in range(size)]
@@ -1391,6 +1606,8 @@ class SysModuleTest(__TestCase):
 
     @unittest.skipUnless(hasattr(sys, '_stats_on'), 'need Py_STATS build')
     def test_pystats(self):
+        # [FUNCTION DOC] Needs a stats-enabled build. Calls the statistics on, off, clear and dump
+        # functions only to ensure they do not crash; state is not saved or restored.
         # Call the functions, just check that they don't crash
         # Cannot save/restore state.
         sys._stats_on()
@@ -1401,12 +1618,19 @@ class SysModuleTest(__TestCase):
     @test.support.cpython_only
     @unittest.skipUnless(hasattr(sys, 'abiflags'), 'need sys.abiflags')
     def test_disable_gil_abi(self):
+        # [FUNCTION DOC] CPython-only: the letter t appears in sys.abiflags exactly when the GIL
+        # is disabled.
         self.assertEqual('t' in sys.abiflags, support.Py_GIL_DISABLED)
 
 
 @test.support.cpython_only
 class UnraisableHookTest(__TestCase):
+    # [CLASS DOC] CPython-only tests of the default and custom unraisable-exception hook, using C
+    # API test helpers to report unraisable errors.
     def test_original_unraisablehook(self):
+        # [FUNCTION DOC] Using the original unraisablehook, checks stderr reports from
+        # writeunraisable and formatunraisable with and without an object or message: first-line
+        # text, traceback header, and final exception line.
         _testcapi = import_helper.import_module('_testcapi')
         from _testcapi import err_writeunraisable, err_formatunraisable
         obj = hex
@@ -1440,19 +1664,29 @@ class UnraisableHookTest(__TestCase):
             self.assertEqual(lines[-1], 'ValueError: 42')
 
     def test_original_unraisablehook_err(self):
+        # [FUNCTION DOC] bpo-22836: the original hook produces a sensible report when a destructor
+        # raises, both for a plain error and when the exception's string conversion itself fails;
+        # checks the report mentions the destructor, this file, the raise line, exception names,
+        # and ends with newline.
         # bpo-22836: PyErr_WriteUnraisable() should give sensible reports
         class BrokenDel:
+            # [CLASS DOC] HELPER: Class whose destructor raises ValueError.
             def __del__(self):
+                # [FUNCTION DOC] HELPER: Raises ValueError saying del is broken.
                 exc = ValueError("del is broken")
                 # The following line is included in the traceback report:
                 raise exc
 
         class BrokenStrException(Exception):
+            # [CLASS DOC] HELPER: Exception whose string conversion raises another exception.
             def __str__(self):
+                # [FUNCTION DOC] HELPER: Always raises an Exception saying str is broken.
                 raise Exception("str() is broken")
 
         class BrokenExceptionDel:
+            # [CLASS DOC] HELPER: Class whose destructor raises a BrokenStrException.
             def __del__(self):
+                # [FUNCTION DOC] HELPER: Raises a BrokenStrException instance.
                 exc = BrokenStrException()
                 # The following line is included in the traceback report:
                 raise exc
@@ -1480,6 +1714,9 @@ class UnraisableHookTest(__TestCase):
                 self.assertTrue(report.endswith("\n"))
 
     def test_original_unraisablehook_exception_qualname(self):
+        # [FUNCTION DOC] The original hook prints the qualified name of a nested exception class,
+        # and prefixes the module name unless it is builtins or __main__; checked for three
+        # module names.
         # See bpo-41031, bpo-45083.
         # Check that the exception is printed with its qualified name
         # rather than just classname, and the module names appears
@@ -1487,8 +1724,12 @@ class UnraisableHookTest(__TestCase):
         _testcapi = import_helper.import_module('_testcapi')
         from _testcapi import err_writeunraisable
         class A:
+            # [CLASS DOC] HELPER: Container class holding nested classes.
             class B:
+                # [CLASS DOC] HELPER: Nested container class.
                 class X(Exception):
+                    # [CLASS DOC] HELPER: Innermost exception class whose module name is changed
+                    # by the test.
                     pass
 
         for moduleName in 'builtins', '__main__', 'some_module':
@@ -1506,6 +1747,8 @@ class UnraisableHookTest(__TestCase):
                     self.assertIn(moduleName + '.', report)
 
     def test_original_unraisablehook_wrong_type(self):
+        # [FUNCTION DOC] Calling the original unraisablehook with a bare exception instead of an
+        # args object raises TypeError.
         exc = ValueError(42)
         with test.support.swap_attr(sys, 'unraisablehook',
                                     sys.__unraisablehook__):
@@ -1513,11 +1756,19 @@ class UnraisableHookTest(__TestCase):
                 sys.unraisablehook(exc)
 
     def test_custom_unraisablehook(self):
+        # [FUNCTION DOC] A custom hook receives an args object carrying the exception type, value,
+        # traceback, message and object, for both writeunraisable (no message) and
+        # formatunraisable (formatted message, no object). Clears references to break cycles at
+        # the end.
+        # KNOWN ISSUE: the cleanup assigns None to a variable named expected that is never
+        # otherwise used in this test.
         _testcapi = import_helper.import_module('_testcapi')
         from _testcapi import err_writeunraisable, err_formatunraisable
         hook_args = None
 
         def hook_func(args):
+            # [FUNCTION DOC] HELPER: Stores the received args object in the enclosing
+            # hook_args variable.
             nonlocal hook_args
             hook_args = args
 
@@ -1544,9 +1795,12 @@ class UnraisableHookTest(__TestCase):
             hook_args = None
 
     def test_custom_unraisablehook_fail(self):
+        # [FUNCTION DOC] If the custom hook itself raises, stderr reports that the exception was
+        # ignored in the hook, with a traceback and the hook's error message.
         _testcapi = import_helper.import_module('_testcapi')
         from _testcapi import err_writeunraisable
         def hook_func(*args):
+            # [FUNCTION DOC] HELPER: Hook that always raises an Exception saying hook_func failed.
             raise Exception("hook_func failed")
 
         with test.support.captured_output("stderr") as stderr:
@@ -1563,8 +1817,14 @@ class UnraisableHookTest(__TestCase):
 
 @test.support.cpython_only
 class SizeofTest(__TestCase):
+    # [CLASS DOC] CPython-only tests of sys.getsizeof and the memory size of builtin objects.
+    # setUp stores pointer size, digit size, GC header size and managed pre-header size;
+    # check_sizeof is the support helper comparing getsizeof to an expected total.
 
     def setUp(self):
+        # [FUNCTION DOC] Stores the pointer size, long digit size, GC header size and managed
+        # pre-header size (from the internal C API test module) on the instance, then calls the
+        # parent setUp.
         self.P = struct.calcsize('P')
         self.longdigit = sys.int_info.sizeof_digit
         _testinternalcapi = import_helper.import_module("_testinternalcapi")
@@ -1575,6 +1835,8 @@ class SizeofTest(__TestCase):
     check_sizeof = test.support.check_sizeof
 
     def test_gc_head_size(self):
+        # [FUNCTION DOC] Checks that the GC header size is included only for GC-tracked objects:
+        # bool has none, an empty list does.
         # Check that the gc header size is added to objects tracked by the gc.
         vsize = test.support.calcvobjsize
         gc_header_size = self.gc_headsize
@@ -1584,26 +1846,38 @@ class SizeofTest(__TestCase):
         self.assertEqual(sys.getsizeof([]), vsize('Pn') + gc_header_size)
 
     def test_errors(self):
+        # [FUNCTION DOC] getsizeof error handling: a __sizeof__ raising propagates; returning None
+        # or a float raises TypeError, or returns the supplied default; boundary and negative
+        # sizes follow overflow rules (largest allowed value adds GC and pre-header sizes, one
+        # more raises OverflowError, negative raises ValueError or OverflowError).
         class BadSizeof:
+            # [CLASS DOC] HELPER: Class whose __sizeof__ raises ValueError.
             def __sizeof__(self):
+                # [FUNCTION DOC] HELPER: Raises ValueError.
                 raise ValueError
         self.assertRaises(ValueError, sys.getsizeof, BadSizeof())
 
         class InvalidSizeof:
+            # [CLASS DOC] HELPER: Class whose __sizeof__ returns None.
             def __sizeof__(self):
+                # [FUNCTION DOC] HELPER: Returns None.
                 return None
         self.assertRaises(TypeError, sys.getsizeof, InvalidSizeof())
         sentinel = ["sentinel"]
         self.assertIs(sys.getsizeof(InvalidSizeof(), sentinel), sentinel)
 
         class FloatSizeof:
+            # [CLASS DOC] HELPER: Class whose __sizeof__ returns a float.
             def __sizeof__(self):
+                # [FUNCTION DOC] HELPER: Returns the float 4.5.
                 return 4.5
         self.assertRaises(TypeError, sys.getsizeof, FloatSizeof())
         self.assertIs(sys.getsizeof(FloatSizeof(), sentinel), sentinel)
 
         class OverflowSizeof(int):
+            # [CLASS DOC] HELPER: Int subclass whose __sizeof__ returns its own integer value.
             def __sizeof__(self):
+                # [FUNCTION DOC] HELPER: Returns the integer value of the instance.
                 return int(self)
         self.assertEqual(sys.getsizeof(OverflowSizeof(sys.maxsize)),
                          sys.maxsize + self.gc_headsize + self.managed_pre_header_size)
@@ -1615,12 +1889,18 @@ class SizeofTest(__TestCase):
             sys.getsizeof(OverflowSizeof(-sys.maxsize - 1))
 
     def test_default(self):
+        # [FUNCTION DOC] getsizeof of True equals the base size plus one digit, with or without a
+        # default argument.
         size = test.support.calcvobjsize
         self.assertEqual(sys.getsizeof(True), size('') + self.longdigit)
         self.assertEqual(sys.getsizeof(True, -1), size('') + self.longdigit)
 
     @torch._dynamo.error_on_graph_break(False)
     def test_objecttypes(self):
+        # [FUNCTION DOC] Checks exact getsizeof values for many builtin object types defined in
+        # the Objects directory (bool, builtin function, bytearray and iterator, bytes, cell, code
+        # (lower bound), complex, descriptors, empty and populated dicts with string and non-
+        # string keys, dict views and iterators, and further types after this point in the test).
         # check all types defined in Objects/
         calcsize = struct.calcsize
         size = test.support.calcobjsize
@@ -1645,18 +1925,25 @@ class SizeofTest(__TestCase):
         check(b'x' * 10, vsize('n') + 11)
         # cell
         def get_cell():
+            # [FUNCTION DOC] HELPER: Returns a closure over a local variable, used to obtain a
+            # cell and code object.
             x = 42
             def inner():
+                # [FUNCTION DOC] HELPER: Returns the captured variable x.
                 return x
             return inner
         check(get_cell().__closure__[0], size('P'))
         # code
         def check_code_size(a, expected_size):
+            # [FUNCTION DOC] HELPER: Asserts the size of object a is at least expected_size.
             self.assertGreaterEqual(sys.getsizeof(a), expected_size)
         check_code_size(get_cell().__code__, size('6i13P'))
         check_code_size(get_cell.__code__, size('6i13P'))
         def get_cell2(x):
+            # [FUNCTION DOC] HELPER: Like get_cell but takes x as an argument; used for a code
+            # object with a parameter.
             def inner():
+                # [FUNCTION DOC] HELPER: Returns the captured variable x.
                 return x
             return inner
         check_code_size(get_cell2.__code__, size('6i13P') + calcsize('n'))
@@ -1701,6 +1988,8 @@ class SizeofTest(__TestCase):
         # dictionary-itemiterator
         check(iter({}.items()), size('P2nPn'))
         # dictproxy
+        # [CLASS DOC] HELPER: Empty class (one-line definition); its __dict__ view
+        # is size-checked.
         class C(object): pass
         check(C.__dict__, size('P'))
         # BaseException
@@ -1727,24 +2016,33 @@ class SizeofTest(__TestCase):
         check(sys.float_info, vsize('') + self.P * len(sys.float_info))
         # frame
         def func():
+            # [FUNCTION DOC] HELPER: Returns the current frame object.
             return sys._getframe()
         x = func()
         check(x, size('3Pi2c2P7P2ic??2P'))
         # function
+        # [FUNCTION DOC] HELPER: Empty function (one-line definition) whose function object size
+        # is checked.
         def func(): pass
         check(func, size('15Pi'))
         class c():
+            # [CLASS DOC] HELPER: Class holding a static method and a class method, whose wrapper
+            # sizes are checked.
             @staticmethod
             def foo():
+                # [FUNCTION DOC] HELPER: Static method that does nothing.
                 pass
             @classmethod
             def bar(cls):
+                # [FUNCTION DOC] HELPER: Class method that does nothing.
                 pass
             # staticmethod
             check(foo, size('PP'))
             # classmethod
             check(bar, size('PP'))
         # generator
+        # [FUNCTION DOC] HELPER: Generator function (one-line definition) yielding 1, used to get
+        # a generator object.
         def get_gen(): yield 1
         check(get_gen(), size('PP4P4c7P2ic??2P'))
         # iterator
@@ -1786,8 +2084,16 @@ class SizeofTest(__TestCase):
         check(object(), size(''))
         # property (descriptor object)
         class C(object):
+            # [CLASS DOC] HELPER: Class with accessor methods and a property built from them,
+            # whose size is checked.
+            # [FUNCTION DOC] HELPER: Property getter (one-line definition) returning the
+            # private attribute.
             def getx(self): return self.__x
+            # [FUNCTION DOC] HELPER: Property setter (one-line definition) storing the
+            # private attribute.
             def setx(self, value): self.__x = value
+            # [FUNCTION DOC] HELPER: Property deleter (one-line definition) removing the
+            # private attribute.
             def delx(self): del self.__x
             x = property(getx, setx, delx, "")
             check(x, size('5Pi'))
@@ -1845,6 +2151,8 @@ class SizeofTest(__TestCase):
                   '6P'
                   '1PIP'                 # Specializer cache
                   )
+        # [CLASS DOC] HELPER: Empty new-style class (one-line definition) whose type and instance
+        # dict sizes are checked.
         class newstyleclass(object): pass
         # Separate block for PyDictKeysObject with 8 keys and 5 entries
         check(newstyleclass, s + calcsize(DICT_KEY_STRUCT_FORMAT) + 64 + 42*calcsize("2P"))
@@ -1901,36 +2209,51 @@ class SizeofTest(__TestCase):
         check(weakref.proxy(int), expected)
 
     def check_slots(self, obj, base, extra):
+        # [FUNCTION DOC] HELPER: Asserts the size of obj equals the size of its base object plus
+        # the C size of the extra slot layout, adding the GC header size when obj is GC-tracked
+        # but base is not.
         expected = sys.getsizeof(base) + struct.calcsize(extra)
         if gc.is_tracked(obj) and not gc.is_tracked(base):
             expected += self.gc_headsize
         self.assertEqual(sys.getsizeof(obj), expected)
 
     def test_slots(self):
+        # [FUNCTION DOC] For subclasses of bytearray, dict, list, set, frozenset and OrderedDict
+        # that add three __slots__ names, checks each instance's size is the base type's size plus
+        # three pointers.
         # check all subclassable types defined in Objects/ that allow
         # non-empty __slots__
         check = self.check_slots
         class BA(bytearray):
+            # [CLASS DOC] HELPER: bytearray subclass with three slots.
             __slots__ = 'a', 'b', 'c'
         check(BA(), bytearray(), '3P')
         class D(dict):
+            # [CLASS DOC] HELPER: dict subclass with three slots.
             __slots__ = 'a', 'b', 'c'
         check(D(x=[]), {'x': []}, '3P')
         class L(list):
+            # [CLASS DOC] HELPER: list subclass with three slots.
             __slots__ = 'a', 'b', 'c'
         check(L(), [], '3P')
         class S(set):
+            # [CLASS DOC] HELPER: set subclass with three slots.
             __slots__ = 'a', 'b', 'c'
         check(S(), set(), '3P')
         class FS(frozenset):
+            # [CLASS DOC] HELPER: frozenset subclass with three slots.
             __slots__ = 'a', 'b', 'c'
         check(FS(), frozenset(), '3P')
         from collections import OrderedDict
         class OD(OrderedDict):
+            # [CLASS DOC] HELPER: OrderedDict subclass with three slots.
             __slots__ = 'a', 'b', 'c'
         check(OD(x=[]), OrderedDict(x=[]), '3P')
 
     def test_pythontypes(self):
+        # [FUNCTION DOC] Size checks for types defined in the Python directory: an AST node, a
+        # traceback object when one is available, and sys.flags (with a FIXME allowing one
+        # extra pointer).
         # check all types defined in Python/
         size = test.support.calcobjsize
         vsize = test.support.calcvobjsize
@@ -1952,6 +2275,10 @@ class SizeofTest(__TestCase):
         check(sys.flags, vsize('') + self.P * (1 + len(sys.flags)))
 
     def test_asyncgen_hooks(self):
+        # [FUNCTION DOC] Async-generator hooks: defaults are None; setting an invalid finalizer or
+        # first-iteration hook raises TypeError and leaves both unchanged (gh-118473); setting
+        # either hook alone keeps the other, and both access by name and by index work; restoring
+        # the old pair resets to None.
         old = sys.get_asyncgen_hooks()
         self.assertIsNone(old.firstiter)
         self.assertIsNone(old.finalizer)
@@ -1992,6 +2319,9 @@ class SizeofTest(__TestCase):
         self.assertIsNone(cur.finalizer)
 
     def test_changing_sys_stderr_and_removing_reference(self):
+        # [FUNCTION DOC] bpo-43660: a replaced stderr whose write method clears sys.stderr must
+        # not crash the interpreter when an uncaught error is reported; the subprocess must fail
+        # with empty stdout and stderr.
         # If the default displayhook doesn't take a strong reference
         # to sys.stderr the following code can crash. See bpo-43660
         # for more details.
