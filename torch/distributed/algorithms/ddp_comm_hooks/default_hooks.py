@@ -1,4 +1,6 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Generic DDP communication hooks: allreduce averaging, fp16/bf16 compression hooks, and
+# wrappers that add fp16/bf16 compression around any other hook. Exports the five public names in __all__.
 from collections.abc import Callable
 from typing import Any, cast
 
@@ -18,6 +20,8 @@ __all__ = [
 def _allreduce_fut(
     process_group: dist.ProcessGroup, tensor: torch.Tensor
 ) -> torch.futures.Future[torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Divide tensor in place by the group size (WORLD if group is None), then launch an
+    # async all_reduce and return a future resolving to the reduced tensor. Mutates tensor.
     """Average the input gradient tensor by allreduce and returns a future."""
     group_to_use = process_group if process_group is not None else dist.group.WORLD
 
@@ -35,6 +39,8 @@ def _allreduce_fut(
 def allreduce_hook(
     process_group: dist.ProcessGroup, bucket: dist.GradBucket
 ) -> torch.futures.Future[torch.Tensor]:
+    # [FUNCTION DOC] DDP hook that averages the bucket buffer across the process group via allreduce and returns
+    # a future of the result; equivalent to default DDP behavior.
     """
     Call ``allreduce`` using ``GradBucket`` tensors.
 
@@ -59,6 +65,9 @@ def _compress_hook(
     process_group: dist.ProcessGroup,
     bucket: dist.GradBucket,
 ) -> torch.futures.Future[torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Cast the bucket buffer (or first element if given a tuple) to dtype, divide by world
+    # size, allreduce it (functional collective when compiling, else async), then copy the result back in place into
+    # the original buffer. Returns a future (or tensor when compiling) of the decompressed buffer.
     group_to_use = process_group if process_group is not None else dist.group.WORLD
     # pyrefly: ignore [missing-attribute]
     world_size = group_to_use.size()
@@ -71,6 +80,7 @@ def _compress_hook(
     compressed_tensor = buffer.to(dtype).div_(world_size)
 
     def decompress(fut):
+        # [FUNCTION DOC] HELPER: Copy the reduced value (tensor or future result) into the original buffer in place and return it.
         decompressed_tensor = buffer
         # Decompress in place to reduce the peak memory.
         # See: https://github.com/pytorch/pytorch/issues/45968
@@ -97,6 +107,7 @@ def fp16_compress_hook(
     process_group: dist.ProcessGroup,
     bucket: dist.GradBucket,
 ) -> torch.futures.Future[torch.Tensor]:
+    # [FUNCTION DOC] Compression hook: allreduce the bucket in float16 averaged by group size, then cast back in place.
     """
     Compress by casting ``GradBucket`` to ``torch.float16`` divided by process group size.
 
@@ -117,6 +128,7 @@ def bf16_compress_hook(
     process_group: dist.ProcessGroup,
     bucket: dist.GradBucket,
 ) -> torch.futures.Future[torch.Tensor]:
+    # [FUNCTION DOC] Compression hook like the fp16 one but using bfloat16 (experimental; needs NCCL > 2.9.6).
     """
     Warning: This API is experimental, and it requires NCCL version later than 2.9.6.
 
@@ -137,6 +149,8 @@ def bf16_compress_hook(
 def fp16_compress_wrapper(
     hook: Callable[[Any, dist.GradBucket], torch.futures.Future[torch.Tensor]],
 ) -> Callable[[Any, dist.GradBucket], torch.futures.Future[torch.Tensor]]:
+    # [FUNCTION DOC] Return a hook that casts the bucket buffer to float16, runs the wrapped hook, and copies the
+    # result back in place to the original dtype. Takes a hook callable (state, bucket) returning a future.
     """
     Cast input tensor to ``torch.float16``, cast result of hook back to input dtype.
 
@@ -154,12 +168,15 @@ def fp16_compress_wrapper(
     def fp16_compress_wrapper_hook(
         hook_state, bucket: dist.GradBucket
     ) -> torch.futures.Future[torch.Tensor]:
+        # [FUNCTION DOC] HELPER: Replace the bucket buffer with a float16 copy (mutates bucket), run the wrapped
+        # hook, and chain a decompress step. Returns the resulting future.
         # Cast bucket tensor to FP16.
         bucket.set_buffer(bucket.buffer().to(torch.float16))
 
         fut = hook(hook_state, bucket)
 
         def decompress(fut):
+            # [FUNCTION DOC] HELPER: Copy the wrapped hook's result into the bucket buffer in place and return it.
             decompressed_tensor = bucket.buffer()
             # Decompress in place to reduce the peak memory.
             # See: https://github.com/pytorch/pytorch/issues/45968
@@ -175,6 +192,7 @@ def fp16_compress_wrapper(
 def bf16_compress_wrapper(
     hook: Callable[[Any, dist.GradBucket], torch.futures.Future[torch.Tensor]],
 ) -> Callable[[Any, dist.GradBucket], torch.futures.Future[torch.Tensor]]:
+    # [FUNCTION DOC] Like fp16_compress_wrapper but casts to bfloat16 (experimental; needs NCCL > 2.9.6).
     """
     Warning: This API is experimental, and it requires NCCL version later than 2.9.6.
 
@@ -193,12 +211,15 @@ def bf16_compress_wrapper(
     def bf16_compress_wrapper_hook(
         hook_state, bucket: dist.GradBucket
     ) -> torch.futures.Future[torch.Tensor]:
+        # [FUNCTION DOC] HELPER: Replace the bucket buffer with a bfloat16 copy (mutates bucket), run the wrapped
+        # hook, and chain a decompress step. Returns the resulting future.
         # Cast bucket tensor to BF16.
         bucket.set_buffer(bucket.buffer().to(torch.bfloat16))
 
         fut = hook(hook_state, bucket)
 
         def decompress(fut):
+            # [FUNCTION DOC] HELPER: Copy the wrapped hook's result into the bucket buffer in place and return it.
             decompressed_tensor = bucket.buffer()
             # Decompress in place to reduce the peak memory.
             # See: https://github.com/pytorch/pytorch/issues/45968

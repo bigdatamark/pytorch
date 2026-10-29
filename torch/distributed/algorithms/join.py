@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Generic join context manager for uneven inputs in distributed training. Exports JoinHook (main and
+# post hook entry points), Joinable (abstract base for participants) and Join (the context manager that shadows
+# collectives of non-joined processes). Also defines the private _JoinConfig record. No import-time side effects.
 import warnings
 from abc import ABC, abstractmethod
 from types import TracebackType
@@ -12,6 +15,8 @@ __all__ = ["JoinHook", "Joinable", "Join"]
 
 
 class JoinHook:
+# [CLASS DOC] Base class for hooks run by the Join context manager: main_hook (called repeatedly while some process is
+# not joined) and post_hook (called once after all joined, told if this rank was a last joiner). Both default to doing nothing.
     r"""
     This defines a join hook, which provides two entry points in the join context manager.
 
@@ -24,12 +29,14 @@ class JoinHook:
     """
 
     def main_hook(self) -> None:
+        # [FUNCTION DOC] Default no-op main hook; override to shadow one training iteration's collectives.
         r"""Call this hook while there exists a non-joined process to shadow collective communications in a training iteration.
 
         Training iteration i.e., in one forward pass, backward pass, and optimizer step.
         """
 
     def post_hook(self, is_last_joiner: bool) -> None:
+        # [FUNCTION DOC] Default no-op post hook; override to run after all processes joined. is_last_joiner tells if this rank was among the last.
         r"""
         Call hook after all processes have joined.
 
@@ -42,6 +49,8 @@ class JoinHook:
 
 
 class Joinable(ABC):
+# [CLASS DOC] Abstract base for objects usable with Join. Subclasses implement join_hook (returns a JoinHook),
+# join_device and join_process_group (properties). Holds a _join_config set by the Join context manager.
     r"""
     This defines an abstract base class for joinable classes.
 
@@ -54,11 +63,14 @@ class Joinable(ABC):
 
     @abstractmethod
     def __init__(self) -> None:
+        # [FUNCTION DOC] Abstract constructor: calls the parent constructor and installs a disabled join config
+        # (subclasses must call it so notify_join_context works).
         super().__init__()
         self._join_config = _JoinConfig.construct_disabled_join_config()
 
     @abstractmethod
     def join_hook(self, **kwargs) -> JoinHook:
+        # [FUNCTION DOC] Abstract: return the JoinHook for this joinable; kwargs are forwarded from the Join constructor.
         r"""
         Return a :class:`JoinHook` instance for the given :class:`Joinable`.
 
@@ -73,17 +85,20 @@ class Joinable(ABC):
     @property
     @abstractmethod
     def join_device(self) -> torch.device:
+        # [FUNCTION DOC] Abstract property: the device used for join collectives.
         r"""Return the device from which to perform collective communications needed by the join context manager."""
         ...
 
     @property
     @abstractmethod
     def join_process_group(self) -> Any:
+        # [FUNCTION DOC] Abstract property: the process group used for the join context manager's collectives.
         r"""Returns the process group for the collective communications needed by the join context manager itself."""
         ...
 
 
 class _JoinConfig(NamedTuple):
+# [CLASS DOC] HELPER: Named tuple of per-joinable settings for the context manager: enable flag, throw-on-early-termination flag, and whether it is the first joinable.
     r"""This includes all fields needed from a :class:`Joinable` instance for the join context manager side."""
 
     enable: bool
@@ -92,6 +107,7 @@ class _JoinConfig(NamedTuple):
 
     @staticmethod
     def construct_disabled_join_config():
+        # [FUNCTION DOC] HELPER: Return a config with everything disabled, used when not inside a join context.
         r"""Return a :class:`_JoinConfig` instance indicating that join-related logic should be disabled.
 
         e.g. if the caller is not in a join context manager.
@@ -102,6 +118,10 @@ class _JoinConfig(NamedTuple):
 
 
 class Join:
+# [CLASS DOC] Context manager that lets processes with fewer inputs keep participating: on exit it loops, each round
+# shadowing a count all-reduce of non-joined processes and running every hook's main_hook, until none remain; then it
+# runs every hook's post_hook. State: joinables, their hooks, enable flag, throw-on-early-termination flag, and the
+# process group, rank and device taken from the joinables. Entering does nothing (stub); the work happens in exit.
     r"""
     This class defines the generic join context manager, which allows custom hooks to be called after a process joins.
 
@@ -170,6 +190,8 @@ class Join:
         throw_on_early_termination: bool = False,
         **kwargs,
     ):
+        # [FUNCTION DOC] Collect hooks from each joinable (forwarding kwargs), store flags, push configs to joinables
+        # and extract process group/device info. Raises ValueError if joinables is empty.
         if len(joinables) == 0:
             raise ValueError("The join context manager requires at least one joinable")
         self._joinables = joinables
@@ -182,6 +204,7 @@ class Join:
         self._extract_dist_info()
 
     def _set_joinable_configs(self) -> None:
+        # [FUNCTION DOC] HELPER: Give each joinable a config with the shared flags; only the first is marked first. Raises AssertionError if the list is empty.
         r"""Set the :class:`_JoinConfig` of each participating :class:`Joinable`."""
         if len(self._joinables) <= 0:
             raise AssertionError
@@ -195,6 +218,8 @@ class Join:
             is_first_joinable = False
 
     def _extract_dist_info(self) -> None:
+        # [FUNCTION DOC] HELPER: Take the process group and device from the joinables (device of the first); sets the
+        # rank within that group. Raises ValueError if joinables use different process groups.
         r"""
         Extract the process group and device information from the joinables.
 
@@ -233,6 +258,11 @@ class Join:
         value: BaseException | None,
         traceback: TracebackType | None,
     ):
+        # [FUNCTION DOC] On context exit: if disabled or an exception is active, return immediately so it propagates.
+        # Otherwise loop: warn (once) about large input skew past a threshold, shadow the non-joined count all-reduce,
+        # and while some process is still active optionally notify others to terminate (raising RuntimeError) and run all main hooks.
+        # After all joined, run every post hook with a flag telling if this rank was a last joiner.
+        # Side effect: sets the global warnings filter to show warnings once.
         r"""
         Repeatedly runs the main hooks until all processes join; then, runs the post-hooks.
 
@@ -281,12 +311,14 @@ class Join:
             join_hook.post_hook(is_last_joiner)
 
     def _get_num_nonjoined_procs(self):
+        # [FUNCTION DOC] HELPER: All-reduce a zero tensor (shadowing non-joined ranks' ones) and return the resulting count of non-joined processes.
         r"""Return the number of non-joined processes by shadowing an all-reduce in the non-joined processes."""
         num_nonjoined_procs = torch.zeros(1, device=self._device)
         dist.all_reduce(num_nonjoined_procs, group=self._process_group)
         return num_nonjoined_procs.item()
 
     def _notify_procs_to_terminate(self):
+        # [FUNCTION DOC] HELPER: All-reduce a ones tensor to tell other ranks to terminate, then always raise RuntimeError saying this rank exhausted its inputs.
         r"""Schedule an all-reduce to notify non-joined processes to terminate.
 
         Also raise a ``RuntimeError`` indicating that the current process has exhausted its inputs.
@@ -297,6 +329,10 @@ class Join:
 
     @staticmethod
     def notify_join_context(joinable: Joinable):
+        # [FUNCTION DOC] Static: called by a joinable before its per-iteration collectives to announce it has not joined.
+        # Raises AssertionError if the joinable never initialized its config. Returns None unless the joinable is the first
+        # one and enabled; then launches an async all-reduce of ones and returns its work handle. If throw-on-early-termination
+        # is set, also all-reduces a zero tensor synchronously and raises RuntimeError if any rank has already exhausted inputs.
         r"""
         Notifies the join context manager that the calling process has not yet joined.
 

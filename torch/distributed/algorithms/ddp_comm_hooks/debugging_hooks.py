@@ -1,3 +1,4 @@
+# [MODULE DOC] Debugging DDP communication hook: noop_hook, which skips communication to measure allreduce headroom.
 from typing import Any
 
 import torch
@@ -8,6 +9,8 @@ __all__ = ["noop_hook"]
 
 
 def noop_hook(_: Any, bucket: GradBucket) -> torch.futures.Future[torch.Tensor]:
+    # [FUNCTION DOC] Return an already-completed future holding the bucket buffer without any communication
+    # (first arg, the hook state, is ignored). Only for headroom analysis; results are not synchronized.
     """
     Return a future that wraps the input, so it is a no-op that does not incur any communication overheads.
 

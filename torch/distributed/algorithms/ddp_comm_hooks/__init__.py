@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [PACKAGE DOC] Built-in DDP communication hooks package. Imports the debugging, default, optimizer_overlap,
+# powerSGD and quantization hook modules, defines the DDPCommHookType enum (name -> partial that registers
+# the hook on a model) and register_ddp_comm_hook. Exports DDPCommHookType and register_ddp_comm_hook.
 import sys
 from enum import Enum
 from functools import partial
@@ -10,10 +13,12 @@ if sys.version_info >= (3, 11):
     from enum import member
 
     def _enum_member(x):
+        # [FUNCTION DOC] HELPER: On Python 3.11+, wrap a value with enum.member so the partial becomes an enum member rather than a method-like attribute.
         return member(x)
 else:
 
     def _enum_member(x):
+        # [FUNCTION DOC] HELPER: On older Python versions, identity function returning x unchanged.
         return x
 
 
@@ -32,6 +37,7 @@ __all__ = ["DDPCommHookType", "register_ddp_comm_hook"]
 
 
 def _ddp_comm_hook_wrapper(comm_hook, model, state):
+    # [FUNCTION DOC] HELPER: Register comm_hook on the model using state as the hook state. Mutates model.
     model.register_comm_hook(state, comm_hook)
 
 
@@ -42,6 +48,8 @@ def _powerSGD_comm_hook_wrapper(
     matrix_approximation_rank,
     start_powerSGD_iter=1_000,
 ):
+    # [FUNCTION DOC] HELPER: Build a PowerSGDState from the given process group (state), matrix approximation
+    # rank and start iteration, then register comm_hook with it on the model. Mutates model.
     """
     Wrap PowerSGD communication hook.
 
@@ -57,6 +65,10 @@ def _powerSGD_comm_hook_wrapper(
 
 
 class DDPCommHookType(Enum):
+# [CLASS DOC] Enum of built-in DDP comm hook types. Each value is a partial of a wrapper function with the
+# hook fixed; calling the value with model and state registers the hook. Members: ALLREDUCE, FP16_COMPRESS,
+# BF16_COMPRESS, QUANTIZE_PER_TENSOR, QUANTIZE_PER_CHANNEL, POWER_SGD (rank 1, rank 2), BATCHED_POWER_SGD
+# (rank 1, rank 2), NOOP.
     """
     Enumerate ``ddp_comm_hooks`` and ``ddp_comm_hook_wrapper`` communication hook types.
 
@@ -125,6 +137,8 @@ class DDPCommHookType(Enum):
 
 
 def register_ddp_comm_hook(comm_hook_type: DDPCommHookType, model, state=None):
+    # [FUNCTION DOC] Register the hook for comm_hook_type on the DDP model by invoking the enum value with the
+    # model and state (default None). Mutates model; returns None.
     """
     Register ``ddp_comm_hooks`` to DDP model.
 

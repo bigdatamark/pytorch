@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Helpers that wrap collective ops (all_gather, all_to_all, all_to_all_single) with
+# automatic fp16/bfp16 quantization of inputs and dequantization of outputs. Defines the half-precision
+# min/max constants (computed at import), the DQuantType enum, tensor/list (de)quantize helpers and auto_quantize.
 import functools
 from enum import Enum
 
@@ -11,6 +14,8 @@ TORCH_HALF_MAX = torch.finfo(torch.float16).max
 
 
 class DQuantType(Enum):
+# [CLASS DOC] Enum of supported quantization methods for auto_quantize: FP16 and BFP16.
+# KNOWN ISSUE: FP16's value is a one-element tuple while BFP16's is a string, so str() of FP16 returns a tuple.
     """
     Different quantization methods for auto_quantize API are identified here.
 
@@ -21,14 +26,18 @@ class DQuantType(Enum):
     BFP16 = "bfp16"
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Return the enum member's raw value.
         return self.value
 
 
 def _fp32_to_fp16_with_clamp(tensor: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Clamp a float tensor to the float16 representable range and convert to half, avoiding infinities.
     return torch.clamp(tensor, TORCH_HALF_MIN, TORCH_HALF_MAX).half()
 
 
 def _quantize_tensor(tensor, qtype):
+    # [FUNCTION DOC] HELPER: Quantize one tensor by qtype (clamped fp16, or the bfloat16 quantization op).
+    # Raises RuntimeError if input is not a tensor or qtype is unsupported.
     if not isinstance(tensor, torch.Tensor):
         raise RuntimeError(
             f"_quantize_tensor expecting torch.Tensor as input but found {type(tensor)}"
@@ -42,6 +51,8 @@ def _quantize_tensor(tensor, qtype):
 
 
 def _quantize_tensor_list(tensor_list, qtype):
+    # [FUNCTION DOC] HELPER: Quantize every tensor in a list; returns a new list. Raises RuntimeError
+    # if the argument is not a list of tensors.
     if not isinstance(tensor_list, list) or not all(
         isinstance(p, torch.Tensor) for p in tensor_list
     ):
@@ -53,6 +64,10 @@ def _quantize_tensor_list(tensor_list, qtype):
 
 
 def _dequantize_tensor(tensor, qtype, quant_loss=None):
+    # [FUNCTION DOC] HELPER: Convert a quantized tensor back to float. FP16: requires half dtype, returns
+    # float, divided by quant_loss when given. BFP16: calls the bfloat16-to-float op. Raises RuntimeError on
+    # non-tensor input, wrong dtype or unsupported qtype.
+    # KNOWN ISSUE: the BFP16 branch demands a float16 input dtype although BFP16 data is not float16 (quantized via a bfloat16 op).
     if not isinstance(tensor, torch.Tensor):
         raise RuntimeError(
             f"_dequantize_tensor expecting torch.Tensor as input but found {type(tensor)}"
@@ -79,6 +94,9 @@ def _dequantize_tensor(tensor, qtype, quant_loss=None):
 
 
 def _dequantize_tensor_list(tensor_list, qtype, quant_loss=None):
+    # [FUNCTION DOC] HELPER: Dequantize each tensor in a list and return a new list; raises RuntimeError
+    # if not a list of tensors.
+    # KNOWN ISSUE: quant_loss is accepted but not forwarded to the per-tensor dequantization, so it is ignored.
     if not isinstance(tensor_list, list) or not all(
         isinstance(p, torch.Tensor) for p in tensor_list
     ):
@@ -90,6 +108,10 @@ def _dequantize_tensor_list(tensor_list, qtype, quant_loss=None):
 
 
 def auto_quantize(func, qtype, quant_loss=None):
+    # [FUNCTION DOC] Decorator-style factory: returns a wrapper around a collective func (all_gather,
+    # all_to_all or all_to_all_single) that quantizes inputs and output buffers by qtype, runs the
+    # collective, dequantizes results and writes them back into the caller's output tensor list/tensor.
+    # Args: func, qtype (DQuantType), optional quant_loss.
     """
     Quantize the input tensors, choose the precision types, and pass other necessary arguments and then dequantizes the output.
 
@@ -107,6 +129,9 @@ def auto_quantize(func, qtype, quant_loss=None):
 
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
+        # [FUNCTION DOC] Run the quantized collective in place. Reads group, async_op, and (for
+        # all_to_all_single) in_splits/out_splits from keyword args; raises RuntimeError if async_op
+        # is true or func is unsupported. Mutates the output tensors; returns None.
         group = kwargs.get("group")
         async_op = kwargs.get("async_op", False)
         if async_op is True:

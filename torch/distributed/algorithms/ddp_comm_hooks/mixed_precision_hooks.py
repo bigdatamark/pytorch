@@ -1,3 +1,5 @@
+# [MODULE DOC] DDP communication hook support for mixed precision: a state dataclass and a hook that
+# allreduces gradient buckets in the reduce dtype, then upcasts parameters and gradients to full precision.
 from dataclasses import dataclass
 from typing import Any, no_type_check
 
@@ -9,6 +11,9 @@ from torch.distributed.utils import _free_storage
 
 @dataclass
 class _AllreduceUpcastHookState:
+# [CLASS DOC] HELPER: Dataclass state for the allreduce-and-upcast hook: a weak reference to the DDP module
+# (for reducer, process group, mixed precision config), the stream used for upcasts, and a flag recording
+# whether the end-of-backward wait callback was already enqueued this backward pass.
     """
     State to manage DDP mixed precision in backward / gradient communication.
 
@@ -25,6 +30,11 @@ class _AllreduceUpcastHookState:
 def _reducer_allreduce_and_upcast_hook(
     hook_state: _AllreduceUpcastHookState, bucket: dist.GradBucket
 ) -> torch.futures.Future[torch.Tensor]:
+    # [FUNCTION DOC] HELPER: DDP comm hook. Casts the bucket to reduce_dtype if it differs from param_dtype,
+    # runs the reducer allreduce, then on the upcast stream waits for it, divides the buffer by group size,
+    # and sets it as the returned future's result; restores each bucket parameter to its full-precision
+    # copy, frees the mixed-precision storage and casts grads to the param dtype. Enqueues (once per backward)
+    # an autograd callback to sync the stream. Returns a future of the reduced tensor. Mutates params/grads.
     """
     Perform allreduce in precision ``reduce_dtype``, upcast to prepare for optimizer.
 
@@ -61,6 +71,9 @@ def _reducer_allreduce_and_upcast_hook(
 
     # enqueue a callback to wait for this stream at end of backward
     def wait_for_stream_cb():
+        # [FUNCTION DOC] HELPER: End-of-backward callback: makes the current stream wait on the upcast stream,
+        # removes stored post-backward hook handles and state from module parameters, restores full-precision
+        # data for parameters not requiring grad (unless ddp-ignored), and resets the enqueued flag.
         torch.accelerator.current_stream().wait_stream(stream)
         # Remove post-backward hooks since they are re-installed in next
         # iteration, similar to FSDP.

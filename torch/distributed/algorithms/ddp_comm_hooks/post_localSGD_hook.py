@@ -1,4 +1,6 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Post-local-SGD DDP communication hook: a state class and a hook that allreduces globally for the
+# first start_localSGD_iter iterations, then within a subgroup (or not at all). Creates a module logger.
 import logging
 
 import torch
@@ -11,6 +13,8 @@ logger = logging.getLogger(__name__)
 
 
 class PostLocalSGDState:
+# [CLASS DOC] Slots-based state: global process_group, intra-node subgroup, start_localSGD_iter, a flag choosing
+# whether to keep allreducing locally after the switch, and the iteration counter iter (starts at 0).
     r"""
     Store state for all-reducing gradients globally until given step, then locally after.
 
@@ -39,6 +43,7 @@ class PostLocalSGDState:
         start_localSGD_iter,
         post_local_gradient_allreduce=True,
     ):
+        # [FUNCTION DOC] Store the parameters, set the iteration counter to zero, and log when local SGD will start.
         """Initialize state object with given parameters and log when localSGD start."""
         logger.info(
             "Local SGD will be started after %s iterations", start_localSGD_iter
@@ -56,6 +61,8 @@ class PostLocalSGDState:
         self.iter = 0
 
     def maybe_increase_iter(self, bucket):
+        # [FUNCTION DOC] Increment the iteration counter when the bucket is the last one of the iteration; log once the
+        # counter reaches start_localSGD_iter.
         """Track iterations and trigger log message at start of local SGD."""
         # Since bucket 0 is the last bucket to allreduce in an iteration.
         # Only increase `iter` when bucket 0 is processed.
@@ -69,6 +76,10 @@ class PostLocalSGDState:
 def post_localSGD_hook(
     state: PostLocalSGDState, bucket: dist.GradBucket
 ) -> torch.futures.Future[torch.Tensor]:
+    # [FUNCTION DOC] DDP hook: before start_localSGD_iter, allreduce (average) over the global group (WORLD if
+    # None) and advance the counter; afterwards, if post_local_gradient_allreduce is false return an already-done
+    # future with the buffer, else allreduce over the subgroup, creating per-node subgroups on first use and
+    # storing them in state. Returns a future of the reduced tensor.
     """
     Run post-localSGD algorithm.
 

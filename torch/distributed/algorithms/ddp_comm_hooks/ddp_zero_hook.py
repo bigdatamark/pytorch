@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Hooks that overlap a ZeroRedundancyOptimizer step with DDP backward communication. Public API:
+# hook_with_zero_step (optimizer step after the last bucket) and hook_with_zero_step_interleaved (step per bucket).
+# Private helpers perform local steps, broadcast updated bucket parameters, save bucket info and do setup.
+# Defines the module constant _NO_PARAM_UPDATE (None), which marks parameters not to be updated.
 import weakref
 from collections.abc import Callable
 from typing import Any
@@ -24,6 +28,10 @@ def _perform_local_step(
     zero: ZeroRedundancyOptimizer,
     rank: int,
 ):
+    # [FUNCTION DOC] HELPER: Run the ZeRO local optimizer step for the parameters of the bucket assigned to this
+    # rank: builds a gradient list sized to the local optimizer's parameters (no-update marker everywhere), fills in
+    # the bucket's gradient slice at the offset stored for this bucket, then calls the local step. Raises
+    # AssertionError if there is not exactly one param group or the bucket was not assigned to this rank.
     r"""
     Perform a local optimizer step using the gradients provided by ``bucket``.
 
@@ -70,6 +78,9 @@ def _broadcast_bucket(
     bucket_index: int,
     zero: ZeroRedundancyOptimizer,
 ):
+    # [FUNCTION DOC] HELPER: Asynchronously broadcast the updated parameter tensors of a bucket from each rank assigned
+    # to it (ranks sorted for consistent order), appending the broadcast handles to the overlap info. Raises
+    # AssertionError if assignments are missing or empty.
     r"""
     Broadcasts a bucket's parameters.
 
@@ -108,6 +119,8 @@ def _save_ddp_bucket_info(
     bucket: dist.GradBucket,
     zero: ZeroRedundancyOptimizer,
 ):
+    # [FUNCTION DOC] HELPER: Record the bucket's parameters in the overlap info's per-bucket list and, when sharding
+    # buckets, add their total element count to the running total size. Raises AssertionError on an empty bucket.
     r"""
     Save :class:`DistributedDataParallel` gradient bucket information for :class:`ZeroRedundancyOptimizer` instance ``zero``.
 
@@ -142,6 +155,9 @@ def _hook_with_zero_step_setup(
     zero: ZeroRedundancyOptimizer,
     bucket: dist.GradBucket,
 ):
+    # [FUNCTION DOC] HELPER: Shared setup run at the start of each overlapped hook. Does nothing until DDP has rebuilt
+    # its buckets; then advances the overlap status, and either performs the delayed ZeRO initialization (first bucket
+    # right after all info is saved) or saves the bucket info. Mutates the overlap info status.
     r"""
     Encapsulate the setup logic for :func:`hook_with_zero_step` and :func:`hook_with_zero_step_interleaved`.
 
@@ -186,6 +202,10 @@ def hook_with_zero_step(
     zero: ZeroRedundancyOptimizer,
     shard_buckets: bool = False,
 ) -> Callable[[Any, dist.GradBucket], torch.futures.Future[torch.Tensor]]:
+    # [FUNCTION DOC] Wrap a DDP comm hook so that the ZeRO optimizer step runs after the last gradient bucket is
+    # computed, overlapping with outstanding allreduces and broadcasts. Raises ValueError if zero lacks overlap_with_ddp
+    # and RuntimeError on the Gloo backend. When shard_buckets is true, enables bucket sharding in the overlap info.
+    # Returns the wrapped hook function.
     r"""
     Modify ``hook`` to overlap :class:`ZeroRedundancyOptimizer` optimizer step with :class:`DistributedDataParallel` backward pass.
 
@@ -254,6 +274,10 @@ def hook_with_zero_step(
         state: Any,
         bucket: dist.GradBucket,
     ) -> torch.futures.Future[torch.Tensor]:
+        # [FUNCTION DOC] HELPER: Run the original hook, do setup, and return its future early unless ZeRO overlap is
+        # initialized. Records bucket/future for buckets assigned to this rank and validates incremental bucket order
+        # (AssertionError otherwise). On the last bucket, waits each assigned bucket's allreduce, performs the local step,
+        # broadcasts every bucket, waits for broadcasts and clears per-iteration info. Returns the original future.
         r"""
         Return :class:`Future` that runs the optimizer step if this corresponds to the last gradient bucket.
 
@@ -347,6 +371,10 @@ def hook_with_zero_step_interleaved(
     zero: ZeroRedundancyOptimizer,
     shard_buckets: bool = False,
 ) -> Callable[[Any, dist.GradBucket], torch.futures.Future[torch.Tensor]]:
+    # [FUNCTION DOC] Wrap a DDP comm hook so that, as each bucket's allreduce completes, the ZeRO step for that bucket
+    # and its broadcast run, interleaving communication. Same arguments, errors and shard_buckets behavior as
+    # hook_with_zero_step. Returns the wrapped hook function.
+    # KNOWN ISSUE: the docstring says only NCCL is supported while the check only rejects Gloo.
     r"""
     Modify ``hook`` to overlap :class:`ZeroRedundancyOptimizer` optimizer step with :class:`DistributedDataParallel` backward pass
 
@@ -415,6 +443,8 @@ def hook_with_zero_step_interleaved(
         state,
         bucket: dist.GradBucket,
     ) -> torch.futures.Future[torch.Tensor]:
+        # [FUNCTION DOC] HELPER: Run the original hook, do setup, return its future if overlap is not yet
+        # initialized, otherwise chain the per-bucket ZeRO step onto it and return the chained future.
         r"""
         Return :class:`Future` that gives gradient bucket tensor and performs partial :class:`ZeroRedundancyOptimizer` :meth:`step`.
 
@@ -432,6 +462,9 @@ def hook_with_zero_step_interleaved(
             return fut
 
         def zero_step(fut: torch.futures.Future) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: After the bucket's allreduce, record the bucket index, run the local step if this rank
+            # is assigned, broadcast the bucket, and once all buckets were seen wait for broadcasts and clear per-iteration
+            # info. Returns the bucket buffer tensor.
             r"""
             Perform partial :class:`ZeroRedundancyOptimizer` :meth:`step` using gradients in the :class:`DistributedDataParallel`.
 

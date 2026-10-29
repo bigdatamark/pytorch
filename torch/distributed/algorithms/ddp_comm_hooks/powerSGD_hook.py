@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] PowerSGD gradient compression DDP communication hooks. Defines orthogonalization and compression
+# helpers, PowerSGDState (hyperparameters plus per-bucket internal state), powerSGD_hook (per-tensor low-rank
+# compression with allreduce of P and Q factors) and batched_powerSGD_hook (whole bucket as one matrix). Creates a
+# module logger at import. numpy is imported lazily inside PowerSGDState.
 import logging
 import math
 from collections import defaultdict
@@ -17,6 +21,8 @@ logger = logging.getLogger(__name__)
 
 
 def _orthogonalize(matrices, epsilon=0):
+    # [FUNCTION DOC] HELPER: Orthogonalize the columns of a batch of 3D matrices in place (shape batch, rows, cols with
+    # cols <= rows). Uses Gram-Schmidt for rank <= 2 or half-precision dtypes, otherwise in-place QR. Raises AssertionError on bad shape.
     """
     Decide between Gram-Schmidt or QR factorization to orthogonalize a batch of matrices.
 
@@ -43,6 +49,10 @@ def _orthogonalize(matrices, epsilon=0):
 
 
 def _orthogonalize_gram_schmidt(matrices, epsilon=0):
+    # [FUNCTION DOC] HELPER: In-place Gram-Schmidt on each column of a batch of matrices: normalize the column (adding
+    # epsilon to the norm when nonzero) then subtract its projection from the remaining columns.
+    # KNOWN ISSUE: the except branch for a zero-division error is effectively dead since tensor division yields NaN/inf
+    # rather than raising, so the logged advice and the reset to zero never run.
     """
     Apply Gram-Schmidt procedure to orthogonalize a batch of matrices.
 
@@ -78,6 +88,9 @@ def _orthogonalize_gram_schmidt(matrices, epsilon=0):
 def _should_compress(
     num_rows, num_cols, matrix_approximation_rank, min_compression_rate
 ):
+    # [FUNCTION DOC] HELPER: Decide if a 2D tensor is worth compressing. Returns a tuple of (worth compressing flag,
+    # uncompressed element count rows*cols, compressed element count (rows+cols)*rank); worth compressing means the
+    # compressed size times min_compression_rate is below the uncompressed size.
     """
     Recommend if tensor given is worth compressing.
 
@@ -105,6 +118,8 @@ def _should_compress(
 
 
 def _report_compression_stats(bucket, state):
+    # [FUNCTION DOC] HELPER: On the last bucket, once state.iter reaches next_stats_report, log compression stats and
+    # schedule the next report compression_stats_logging_frequency iterations later. Mutates state.
     """Report compression stats at frequency of ``compression_stats_logging_frequency`` specified in PowerSGD state."""
     if bucket.is_last() and state.iter >= state.next_stats_report:
         stats = state.compression_stats()
@@ -120,6 +135,10 @@ def _report_compression_stats(bucket, state):
 
 
 class PowerSGDState:
+# [CLASS DOC] Slots-based holder of PowerSGD hyperparameters (rank, start iteration, min compression rate,
+# orthogonalization epsilon, error feedback, warm start, batching) and internal state (numpy RNG, per-bucket error,
+# P and Q memory dicts keyed by bucket index, iteration counter, compression stat counters). Picklable except for
+# process_group, which is dropped on save and replaced by the default group on load.
     r"""
     Store both the algorithm's hyperparameters and internal state for all gradients during training.
 
@@ -190,6 +209,9 @@ class PowerSGDState:
         compression_stats_logging_frequency=10_000,
         batch_tensors_with_same_shape: bool = False,
     ):
+        # [FUNCTION DOC] Log the config, validate and store hyperparameters, and create the RNG (numpy RandomState seeded
+        # with random_seed), empty error/P/Q dicts, iteration 0 and zeroed stats. Raises ValueError if error feedback or warm
+        # start is on and start_powerSGD_iter <= 1. Logging frequency is clamped to at least 1.
         logger.info(
             "PowerSGD config: matrix_approximation_rank = %s; start_powerSGD_iter = %s; "
             "min_compression_rate = %s; orthogonalization_epsilon = %s; use_error_feedback = %s; warm_start = %s; "
@@ -274,6 +296,7 @@ class PowerSGDState:
         self.batch_tensors_with_same_shape = batch_tensors_with_same_shape
 
     def __getstate__(self):
+        # [FUNCTION DOC] Return a mapping of every slot except process_group to its value for pickling; logs a warning.
         r"""
         Return a ``Dict[str, Any]`` which will be pickled and saved.
 
@@ -290,6 +313,7 @@ class PowerSGDState:
         }
 
     def __setstate__(self, state):
+        # [FUNCTION DOC] Restore attributes from the state mapping and set process_group to the default group (logs a warning).
         r"""
         Take a provided ``state`` and set to this ``PowerSGDState`` instance.
 
@@ -304,6 +328,8 @@ class PowerSGDState:
             setattr(self, slot, value)
 
     def maybe_increase_iter(self, bucket):
+        # [FUNCTION DOC] Increment the iteration counter when the bucket is the last one of an iteration; log when
+        # the counter equals start_powerSGD_iter.
         """Track iterations and trigger log message at start of local SGD."""
         # Since bucket 0 is the last bucket to allreduce in an iteration.
         # Only increase `iter` when bucket 0 is processed.
@@ -314,6 +340,8 @@ class PowerSGDState:
             logger.info("Start to apply PowerSGD after %s iterations.", self.iter)
 
     def compression_stats(self):
+        # [FUNCTION DOC] Return a tuple (compression rate, elements before compression, elements after compression);
+        # the rate is zero when nothing has been compressed.
         r"""
         Return latest compression statistics as tuple.
 
@@ -340,6 +368,13 @@ class PowerSGDState:
 def powerSGD_hook(
     state: PowerSGDState, bucket: dist.GradBucket
 ) -> torch.futures.Future[torch.Tensor]:
+    # [FUNCTION DOC] PowerSGD DDP hook (layer-wise). For the first start_powerSGD_iter iterations it does plain
+    # averaging allreduce. Afterwards: optionally adds stored error feedback to the bucket, splits per-parameter
+    # gradients (viewed as 2D matrices) into those worth compressing and those not; uncompressed ones are concatenated
+    # and allreduced; compressed ones get low-rank factors P and Q (random orthogonal Q initially, reused when warm
+    # start), P = M Q is allreduced and orthogonalized, Q = M^T P is computed and allreduced, and M is rebuilt as P Q^T
+    # in place. Optionally batches same-shape tensors, saves new error feedback, clears factor memory when warm start
+    # is off, and advances the iteration. Mutates the bucket buffer and state; returns a future of the buffer.
     r"""
     Implement PowerSGD algorithm.
 
@@ -502,6 +537,9 @@ def powerSGD_hook(
     # This function decides whether to batch tensors with same shape or not according to the argument,
     # so the following process could share the same code.
     def maybe_batched_tensors_to_compress():
+    # [FUNCTION DOC] HELPER: Generator over compressible matrices grouped by shape; yields each group stacked into a
+    # 3D batch when batching is enabled (a single matrix is just unsqueezed to avoid a copy), otherwise each matrix
+    # unsqueezed to batch size one.
         for tensors in shape_to_tensors.values():
             if state.batch_tensors_with_same_shape:
                 batch_size = len(tensors)
@@ -572,6 +610,8 @@ def powerSGD_hook(
     ).get_future()
 
     def unpack_uncompressed_tensors_and_allreduce_ps(fut):
+    # [FUNCTION DOC] HELPER: After the uncompressed tensors' allreduce completes, average and copy them back into their
+    # original tensors, then allreduce the contiguous P memory and return the (blocking-waited) result.
         uncompressed_tensors_memory = fut.value()[0].div_(world_size)
         idx = 0
         for tensor in uncompressed_tensors:
@@ -590,6 +630,8 @@ def powerSGD_hook(
         )
 
     def compute_qs(fut):
+    # [FUNCTION DOC] HELPER: Store the reduced P memory, orthogonalize every P, compute each Q as the transposed
+    # matrix times P, then allreduce the contiguous Q memory and return the waited result.
         state.p_memory_dict[bucket_index] = fut.value()
         for p in ps:
             _orthogonalize(p, state.orthogonalization_epsilon)
@@ -612,6 +654,9 @@ def powerSGD_hook(
         )
 
     def decompress(fut):
+    # [FUNCTION DOC] HELPER: Store the averaged Q memory, rebuild each compressed matrix as P times Q transposed in place,
+    # copy batched results back to the original tensors, synchronize CUDA if available, record error feedback (copy
+    # minus result) when enabled, clear factor memory when warm start is off, advance the iteration, and return the bucket buffer.
         state.q_memory_dict[bucket_index] = fut.value().div_(world_size)
 
         for p, q, tensor in zip(ps, qs, tensors_to_compress):
@@ -655,6 +700,11 @@ def powerSGD_hook(
 def batched_powerSGD_hook(
     state: PowerSGDState, bucket: dist.GradBucket
 ) -> torch.futures.Future[torch.Tensor]:
+    # [FUNCTION DOC] Simplified PowerSGD DDP hook: compresses the whole flattened bucket as one square matrix. Plain
+    # averaging allreduce for the first start_powerSGD_iter iterations; afterwards the buffer is resized in place and
+    # zero-padded to a square, error feedback is added if enabled, P = M Q is computed and allreduced and orthogonalized,
+    # Q = M^T P is computed and allreduced, and M is rebuilt as P Q^T; the buffer is then truncated to its original
+    # length. Updates compression stats, error and factor memory in state. Returns a future of the buffer.
     r"""
     Implement simplified PowerSGD algorithm.
 
@@ -775,6 +825,8 @@ def batched_powerSGD_hook(
             )
 
         def create_low_rank_tensor(fill_random_values, rng):
+        # [FUNCTION DOC] HELPER: Create a square-side by rank tensor; random normal values (generated on CPU with a
+        # forked RNG seeded from the state RNG, then moved to the device) if requested, else uninitialized.
             """Return a low-rank 2D tensor of square_side_length * matrix_approximation_rank."""
             if fill_random_values:
                 with torch.random.fork_rng(devices=[]):
@@ -815,6 +867,8 @@ def batched_powerSGD_hook(
     ).get_future()
 
     def compute_q(fut):
+    # [FUNCTION DOC] HELPER: Store the reduced P, orthogonalize it, compute Q as the transposed matrix times P,
+    # then allreduce Q and return the waited result.
         state.p_memory_dict[bucket_index] = fut.value()[0]
         _orthogonalize(state.p_memory_dict[bucket_index])
 
@@ -837,6 +891,9 @@ def batched_powerSGD_hook(
         )
 
     def decompress(fut):
+    # [FUNCTION DOC] HELPER: Store the averaged Q, rebuild the matrix as P times Q transposed in place, record error
+    # feedback if enabled, synchronize CUDA if available, clear factor memory when warm start is off, truncate the
+    # buffer to its original length, advance the iteration, and return the buffer.
         state.q_memory_dict[bucket_index] = fut.value().div_(world_size)
         torch.matmul(
             state.p_memory_dict[bucket_index],

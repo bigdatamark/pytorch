@@ -1,21 +1,27 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Experimental DDP communication hooks that quantize gradients to uint8 (per tensor or per channel)
+# and exchange them with allgather, then dequantize and average locally. Includes the quantize/dequantize
+# backends and an allgather output-list helper. No import-time side effects.
 import torch
 import torch.distributed as dist
 from torch import nn
 
 
 def _quantize_per_tensor_backend(x, scale, zero_point):
+    # [FUNCTION DOC] HELPER: Quantize x with a scalar scale and zero point: divide, round, shift, clamp to 0..255, cast to uint8.
     y = torch.round(x / scale) + zero_point
     y = torch.clamp(y, 0, 255).to(torch.uint8)
     return y
 
 
 def _dequantize_per_tensor_backend(y, scale, zero_point):
+    # [FUNCTION DOC] HELPER: Inverse of per-tensor quantization: cast to float32, subtract zero point, multiply by scale.
     x = scale * (y.to(torch.float32) - zero_point)
     return x
 
 
 def _quantize_per_channel_backend(x, scale, zero_point):
+    # [FUNCTION DOC] HELPER: Quantize a 2D tensor row by row with per-row scale and zero point; clamp to 0..255 and return uint8.
     y = torch.zeros(x.size(), device=x.device)
     for i in range(x.size()[0]):
         y[i, :] = torch.round(x[i, :] / scale[i]) + zero_point[i]
@@ -24,6 +30,7 @@ def _quantize_per_channel_backend(x, scale, zero_point):
 
 
 def _dequantize_per_channel_backend(y, scale, zero_point):
+    # [FUNCTION DOC] HELPER: Dequantize a 2D uint8 tensor row by row using per-row scale and zero point; returns float32.
     y = y.to(torch.float32).to(y.device)
     x = torch.zeros_like(y, device=y.device)
     for i in range(x.size()[0]):
@@ -32,6 +39,7 @@ def _dequantize_per_channel_backend(y, scale, zero_point):
 
 
 def _get_allgather_out_list(all_gather_in_list, world_size):
+    # [FUNCTION DOC] HELPER: Return a list of world_size zero tensors matching the shape, device and dtype of the input, used as allgather output buffers.
     out_list = [
         torch.zeros_like(
             all_gather_in_list,
@@ -46,6 +54,10 @@ def _get_allgather_out_list(all_gather_in_list, world_size):
 def quantization_pertensor_hook(
     process_group: dist.ProcessGroup, bucket: dist.GradBucket
 ) -> torch.futures.Future[torch.Tensor]:
+    # [FUNCTION DOC] Experimental DDP hook: computes min/max-observer scale and zero point of the bucket buffer,
+    # allgathers them, quantizes the local buffer to uint8, allgathers the quantized tensors, then dequantizes
+    # each rank's tensor with that rank's parameters and returns their mean as a future. Group defaults to WORLD.
+    # Works only on flattened buffers; slower than allreduce.
     """
     Apply ``torch.quantize_per_tensor`` logic to DDP using ``allgather`` protocol.
 
@@ -85,6 +97,7 @@ def quantization_pertensor_hook(
     ).get_future()
 
     def quantize_and_allgather(fut):
+        # [FUNCTION DOC] HELPER: After scale/zero point exchange, quantize the local buffer with this rank's qparams and allgather it; blocks and returns the gathered result.
         # Store scale and zeros across all workers.
         all_ranks_s_and_z = fut.wait()[0]
         # All workers quantize their own ``GradBucket`` tensors.
@@ -102,6 +115,7 @@ def quantization_pertensor_hook(
         return fut.wait()
 
     def dequantize_and_aggregate(fut):
+        # [FUNCTION DOC] HELPER: Dequantize each rank's gathered tensor with that rank's qparams, sum in float32 and divide by world size.
         all_ranks_quantized_tensor = fut.wait()[0]
 
         aggregated_dequantized_tensor = torch.zeros_like(
@@ -122,6 +136,11 @@ def quantization_pertensor_hook(
 def quantization_perchannel_hook(
     process_group: dist.ProcessGroup, bucket: dist.GradBucket, bucket_size=512
 ) -> torch.futures.Future[torch.Tensor]:
+    # [FUNCTION DOC] Experimental DDP hook like the per-tensor hook but quantizing per channel: the buffer is
+    # zero-padded and reshaped into rows of bucket_size elements, a per-channel observer computes per-row scale and zero
+    # point, which are allgathered along with the quantized rows. Result is dequantized, summed, flattened, trimmed
+    # to the original length and divided by world size. Returns a future.
+    # KNOWN ISSUE: padding adds a full extra row of zeros when the length is already a multiple of bucket_size.
     """
     Apply``torch.quantize_per_channel`` logic to DDP using ``allgather`` protocol.
 
@@ -179,6 +198,7 @@ def quantization_perchannel_hook(
     ).get_future()
 
     def quantize_and_allgather(fut):
+        # [FUNCTION DOC] HELPER: Quantize the local rows with this rank's per-channel qparams and allgather them; blocks and returns the gathered result.
         # Store scale and zeros across all workers.
         all_ranks_s_and_z = fut.wait()[0]
         # All workers quantize their corresponding ``GradBucket`` tensors.
@@ -198,6 +218,7 @@ def quantization_perchannel_hook(
         return fut.wait()
 
     def dequantize_and_aggregate(fut):
+        # [FUNCTION DOC] HELPER: Dequantize every rank's rows with its qparams, sum, flatten, trim to original length and divide by world size.
         all_ranks_quantized_tensor = fut.wait()[0]
 
         aggregated_dequantized_tensor = torch.zeros_like(
