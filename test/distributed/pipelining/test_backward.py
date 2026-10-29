@@ -1,5 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests for the pipelining backward helpers stage_backward,
+# stage_backward_input and stage_backward_weight. Each test runs an MLP-style module and
+# compares gradients against a deep-copied reference module run through ordinary autograd.
+# Tests are device-generic and instantiated for cpu, cuda, hpu and xpu at import time.
 import copy
 
 from model_registry import MLPModule, MultiInterMediateModel
@@ -22,8 +26,13 @@ batch_size = 256
 
 
 class StageBackwardTests(TestCase):
+    # [CLASS DOC] Device-generic TestCase for the split backward helpers; each test takes a
+    # device argument supplied by instantiate_device_type_tests.
     @skipXPUIf(True, "https://github.com/intel/torch-xpu-ops/issues/1682")
     def test_stage_backward(self, device):
+        # [FUNCTION DOC] Checks stage_backward on an MSE loss: the returned input gradient and
+        # every parameter gradient must match a reference module's autograd gradients.
+        # Skipped on XPU (known issue link in the decorator).
         # MLP as a stage module
         mod = MLPModule(d_hid).to(device)
         x = torch.randn(batch_size, d_hid, device=device)
@@ -63,6 +72,8 @@ class StageBackwardTests(TestCase):
                 raise
 
     def test_stage_backward_input(self, device):
+        # [FUNCTION DOC] Checks stage_backward_input computes the input gradient equal to the
+        # reference, and leaves every parameter's grad unset (weight grads are deferred).
         # MLP as a stage module
         mod = MLPModule(d_hid).to(device)
         x = torch.randn(batch_size, d_hid, device=device)
@@ -98,6 +109,8 @@ class StageBackwardTests(TestCase):
             self.assertEqual(p.grad, None)
 
     def test_stage_backward_input_ignores_non_tensor_inputs(self, device):
+        # [FUNCTION DOC] Passes a plain object among the input values to stage_backward_input
+        # and checks its returned gradient is None while the tensor input gets the correct grad.
         mod = MLPModule(d_hid).to(device)
         x = torch.randn(batch_size, d_hid, device=device, requires_grad=True)
         non_tensor_input = object()
@@ -120,6 +133,9 @@ class StageBackwardTests(TestCase):
 
     @skipXPUIf(True, "https://github.com/intel/torch-xpu-ops/issues/1682")
     def test_stage_backward_weight(self, device):
+        # [FUNCTION DOC] Runs stage_backward_input then stage_backward_weight (retaining the
+        # graph) and checks all parameter gradients equal the reference gradients.
+        # Skipped on XPU.
         # MLP as a stage module
         mod = MLPModule(d_hid).to(device)
         x = torch.randn(batch_size, d_hid, device=device)
@@ -161,6 +177,9 @@ class StageBackwardTests(TestCase):
 
     @skipXPUIf(True, "https://github.com/intel/torch-xpu-ops/issues/1682")
     def test_stage_backward_weight_multiple_iters(self, device):
+        # [FUNCTION DOC] Repeats the input-then-weight backward split over 10 microbatch
+        # inputs so gradients accumulate, and compares with the reference accumulated over
+        # the same inputs. Skipped on XPU.
         # MLP as a stage module
         mod = MLPModule(d_hid).to(device)
         inputs = []
@@ -211,6 +230,9 @@ class StageBackwardTests(TestCase):
                 raise
 
     def test_stage_backward_weight_grad_validation(self, device):
+        # [FUNCTION DOC] Subtest-driven check that stage_backward_weight accepts mocked grads
+        # in each param group of various shapes: two tensors, a single tensor, one tensor plus
+        # None, None plus a tensor. Only checks that no error is raised, not values.
         test_cases = [
             (
                 "size == 2",
@@ -260,6 +282,8 @@ class StageBackwardTests(TestCase):
                 stage_backward_weight(mod.parameters(), param_groups)
 
     def test_stage_backward_multi_output_intermediate(self, device):
+        # [FUNCTION DOC] Checks the split backward on a model whose intermediate is a
+        # multi-output autograd function: input and parameter grads match the reference.
         mod = MultiInterMediateModel([d_hid // 2, d_hid // 2]).to(device)
         x = torch.randn(batch_size, d_hid, device=device, requires_grad=True)
 
@@ -287,12 +311,17 @@ class StageBackwardTests(TestCase):
             torch.testing.assert_close(p.grad, ref_p.grad)
 
     def test_stage_backward_weight_shared_weights(self, device):
+        # [FUNCTION DOC] Checks the split backward when one parameter is used twice in the
+        # forward: input and parameter grads must equal the reference.
         class SharedWeightModule(torch.nn.Module):
+        # [CLASS DOC] HELPER: Module with one square weight w applied twice around a relu.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the random d_hid x d_hid parameter w.
                 super().__init__()
                 self.w = torch.nn.Parameter(torch.randn(d_hid, d_hid))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Matmul with w, relu, then matmul with w again.
                 x = torch.matmul(x, self.w)
                 x = torch.relu(x)
                 return torch.matmul(x, self.w)

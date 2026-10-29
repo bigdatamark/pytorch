@@ -1,5 +1,12 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Multi-process (4 rank, 2x2 pp/tp mesh) integration tests for pipeline
+# parallelism combined with tensor parallelism on DTensor activations. Builds an RMSNorm +
+# MLP stack, runs a microbatched reference with DTensor TP, then a pipeline schedule (1F1B,
+# interleaved, ZBV, DualPipeV), and compares per-parameter gradients, plus inference-only
+# equivalence. Tests cover static (pre-supplied DTensor metadata) and dynamic metadata modes
+# and replicate or sequence-sharded TP layouts. Import-time: picks device_type from the
+# current accelerator (else cpu) and the default backend; sets d_hid, batch size, microbatches.
 
 from __future__ import annotations
 
@@ -57,15 +64,21 @@ backend = dist.get_default_backend_for_device(device_type)
 
 
 class RMSNorm(nn.Module):
+    # [CLASS DOC] HELPER: RMS normalization with a learnable per-feature weight (initially
+    # ones) and epsilon eps; computed with a float32 mean of squares.
     def __init__(self, dim: int, eps: float = 1e-6):
+        # [FUNCTION DOC] HELPER: Creates the all-ones weight parameter of size dim; stores eps.
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
         self.eps = eps
 
     def reset_parameters(self) -> None:
+        # [FUNCTION DOC] HELPER: Resets the weight in place to ones.
         torch.nn.init.ones_(self.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Scales x by the reciprocal root mean square over the last
+        # dimension (plus eps), then by the weight. Returns a tensor shaped like x.
         return (
             x
             * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps)
@@ -74,7 +87,10 @@ class RMSNorm(nn.Module):
 
 
 class NormMLP(nn.Module):
+    # [CLASS DOC] HELPER: Transformer-style MLP sublayer: RMSNorm, bias-free Linear up to
+    # 4 times dim, GELU, bias-free Linear back to dim. The unit used as one pipeline stage.
     def __init__(self, dim: int):
+        # [FUNCTION DOC] HELPER: Creates norm, fc1, act and fc2 for width dim.
         super().__init__()
         self.norm = RMSNorm(dim)
         self.fc1 = nn.Linear(dim, 4 * dim, bias=False)
@@ -82,21 +98,29 @@ class NormMLP(nn.Module):
         self.fc2 = nn.Linear(4 * dim, dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Applies norm, fc1, GELU and fc2 in order; returns the result.
         return self.fc2(self.act(self.fc1(self.norm(x))))
 
 
 class NormMLPStack(nn.Module):
+    # [CLASS DOC] HELPER: Sequence of n_layers NormMLP blocks; layer i is pipeline stage i.
     def __init__(self, dim: int, n_layers: int):
+        # [FUNCTION DOC] HELPER: Builds the layers ModuleList of NormMLP(dim).
         super().__init__()
         self.layers = nn.ModuleList([NormMLP(dim) for _ in range(n_layers)])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Runs x through every layer in order and returns it.
         for layer in self.layers:
             x = layer(x)
         return x
 
 
 def apply_tp_replicate(block: NormMLP, tp_mesh: DeviceMesh) -> None:
+    # [FUNCTION DOC] HELPER: Applies tensor parallelism in place to a block over tp_mesh with
+    # replicated activations: fc1 column-parallel, fc2 row-parallel, both with replicated
+    # input/output layouts and DTensor outputs. Then replaces each norm parameter by a
+    # replicated DTensor parameter. Mutates the block; returns None.
     parallelize_module(
         block,
         tp_mesh,
@@ -115,6 +139,9 @@ def apply_tp_replicate(block: NormMLP, tp_mesh: DeviceMesh) -> None:
 
 
 def apply_tp_shard(block: NormMLP, tp_mesh: DeviceMesh) -> None:
+    # [FUNCTION DOC] HELPER: Applies tensor parallelism in place to a block over tp_mesh with
+    # sequence-sharded activations (sharded on dim 1): the norm uses sequence parallel, fc1 is
+    # column-parallel and fc2 is row-parallel, outputs kept as DTensors. Returns None.
     parallelize_module(
         block,
         tp_mesh,
@@ -133,10 +160,14 @@ def apply_tp_shard(block: NormMLP, tp_mesh: DeviceMesh) -> None:
 
 
 def _loss_fn(output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Mean squared error between output and target, as a scalar tensor.
     return (output - target).pow(2).mean()
 
 
 def _requires_multi_gpu(func):
+    # [FUNCTION DOC] HELPER: Decorator wrapping a test function so it needs an NCCL or XCCL
+    # accelerator backend and at least 4 devices (skipped, but reported as pass in sandcastle,
+    # otherwise). Returns the wrapper that calls the function unchanged.
     @requires_accelerator_dist_backend(["nccl", "xccl"])
     @skip_but_pass_in_sandcastle_if(
         torch.accelerator.device_count() < 4,
@@ -144,31 +175,43 @@ def _requires_multi_gpu(func):
     )
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Forwards all arguments to the wrapped test function.
         return func(*args, **kwargs)
 
     return wrapper
 
 
 class DTensorPPIntegrationBase(MultiProcContinuousTest):
+    # [CLASS DOC] Base class for the DTensor pipeline-parallel tests, with world size 4 and a
+    # 2x2 mesh (pp, tp). Provides helpers that build a reference model and a copy, collect
+    # per-stage DTensor metadata, construct PipelineStage objects, run a schedule and compare
+    # gradients or inference output with the reference.
     world_size = 4
 
     @classmethod
     def backend_str(cls) -> str:
+        # [FUNCTION DOC] Returns the module-level distributed backend name for the device.
         return backend
 
     @classmethod
     def device_type(cls) -> str:
+        # [FUNCTION DOC] Returns the module-level device type string (accelerator or cpu).
         return device_type
 
     @property
     def device(self) -> torch.device:
+        # [FUNCTION DOC] Returns the torch device for this rank: the device type indexed by
+        # the process rank.
         return torch.device(device_type, self.rank)
 
     def init_pg(self) -> None:
+        # [FUNCTION DOC] Sets the current CUDA device to this rank's device when the device
+        # type is cuda; does nothing for other device types.
         if device_type == "cuda":
             torch.cuda.set_device(self.device)
 
     def _make_mesh(self) -> DeviceMesh:
+        # [FUNCTION DOC] Creates a 2x2 device mesh with dimensions named pp and tp.
         return init_device_mesh(device_type, (2, 2), mesh_dim_names=("pp", "tp"))
 
     def _build_baseline_and_clones(
@@ -177,6 +220,9 @@ class DTensorPPIntegrationBase(MultiProcContinuousTest):
         tp_mesh: DeviceMesh,
         apply_tp: Callable,
     ) -> tuple[NormMLPStack, NormMLPStack]:
+        # [FUNCTION DOC] Seeds with MODEL_SEED and builds a NormMLPStack with n_layers on this
+        # rank's device, deep-copies it, applies the given TP function to every layer of both
+        # copies over tp_mesh, and returns (reference model, pipeline model).
         torch.manual_seed(MODEL_SEED)
         with torch.device(self.device):
             ref_model = NormMLPStack(d_hid, n_layers)
@@ -191,6 +237,8 @@ class DTensorPPIntegrationBase(MultiProcContinuousTest):
         return ref_model, pp_model
 
     def _make_full_batch_tensors(self) -> tuple[torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC] Seeds and generates a full-batch random input and a target (batch_size
+        # by d_hid, on this device) using INPUT_SEED and TARGET_SEED. Returns (input, target).
         torch.manual_seed(INPUT_SEED)
         input_full = torch.randn(batch_size, d_hid, device=self.device)
         torch.manual_seed(TARGET_SEED)
@@ -208,6 +256,14 @@ class DTensorPPIntegrationBase(MultiProcContinuousTest):
         dict[str, torch.Tensor | None],
         StageStaticMetaMap,
     ]:
+        # [FUNCTION DOC] Runs the reference model without pipelining on n_microbatches chunks
+        # of input_dt/target_dt: each chunk goes forward, loss, backward, so gradients
+        # accumulate; they are then divided by n_microbatches. Forward hooks and tensor grad
+        # hooks capture each layer's input/output and their gradients; after the first
+        # microbatch, empty DTensors with the same metadata are recorded per stage as a tuple
+        # (input, output, input grads, output grads) and the hooks are removed. If
+        # null_boundary_grads, stage 0 input grad and last stage output grad entries are None.
+        # Returns (mapping of parameter name to cloned grad, mapping of stage index to metadata).
         ref_model.zero_grad(set_to_none=True)
 
         input_chunks = torch.tensor_split(input_dt, n_microbatches)
@@ -218,7 +274,10 @@ class DTensorPPIntegrationBase(MultiProcContinuousTest):
         hooks: list[torch.utils.hooks.RemovableHandle] = []
 
         def _make_grad_hook(stage_idx: int, key: str) -> Callable[[torch.Tensor], None]:
+            # [FUNCTION DOC] HELPER: Returns a tensor hook that stores a placement-preserving
+            # clone of the gradient in captured_grads for the given stage and key.
             def _hook(grad: torch.Tensor) -> None:
+                # [FUNCTION DOC] HELPER: Stores a clone of grad under the enclosing stage/key.
                 captured_grads[stage_idx][key] = self._clone_preserving_placement(grad)
 
             return _hook
@@ -232,6 +291,10 @@ class DTensorPPIntegrationBase(MultiProcContinuousTest):
                 *,
                 idx: int = stage_idx,
             ) -> None:
+                # [FUNCTION DOC] HELPER: Forward hook (idx bound per stage) that records the
+                # stage's input and output DTensors in captured_io, resets its grad slots to
+                # None, and registers grad hooks on those that require grad (handles are
+                # appended to the hooks list).
                 stage_input = cast(DTensor, args[0])
                 stage_output = cast(DTensor, output)
                 captured_io[idx] = (stage_input, stage_output)
@@ -311,6 +374,10 @@ class DTensorPPIntegrationBase(MultiProcContinuousTest):
 
     @staticmethod
     def _clone_preserving_placement(grad: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Clones a gradient. A DTensor is cloned by cloning only its
+        # local tensor and rebuilding a DTensor with the same mesh, placements, shape and
+        # stride (no communication check), so Partial placements are kept. Other tensors use
+        # a normal clone.
         """Clone a gradient tensor, preserving DTensor placement.
 
         ``DTensor.clone()`` triggers all-reduce for ``Partial`` placements,
@@ -331,6 +398,9 @@ class DTensorPPIntegrationBase(MultiProcContinuousTest):
         return grad.clone()
 
     def _empty_dt_from(self, dt: DTensor, requires_grad: bool) -> DTensor:
+        # [FUNCTION DOC] HELPER: Builds an uninitialized DTensor with the same metadata
+        # (shape, dtype, placements, global shape and stride) as dt, on this rank's device,
+        # with requires_grad optionally enabled. Used as stage input/output templates.
         meta = _DTensorMeta.from_dtensor(dt)
         empty_local = torch.empty(meta.shape, dtype=meta.dtype, device=self.device)
         result = DTensor.from_local(
@@ -354,6 +424,9 @@ class DTensorPPIntegrationBase(MultiProcContinuousTest):
         tp_mesh: DeviceMesh,
         static_stage_meta: StageStaticMetaMap | None,
     ) -> PipelineStage:
+        # [FUNCTION DOC] Builds the PipelineStage for layer stage_index of pp_model on the pp
+        # group. If static_stage_meta is None, no shapes are given (dynamic mode); otherwise the
+        # stage's recorded input/output args and grads are passed. get_mesh always returns tp_mesh.
         stage_module = pp_model.get_submodule(f"layers.{stage_index}")
         if static_stage_meta is None:
             return PipelineStage(
@@ -388,6 +461,9 @@ class DTensorPPIntegrationBase(MultiProcContinuousTest):
         ref_grad: torch.Tensor,
         param_fqn: str,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Compares gradients. For two DTensors it first asserts their
+        # metadata has no differences, then compares local shards; otherwise compares the
+        # tensors directly with assert_close. Fails with a message naming param_fqn.
         pp_for_compare = pp_grad
         ref_for_compare = ref_grad
 
@@ -414,6 +490,8 @@ class DTensorPPIntegrationBase(MultiProcContinuousTest):
         ref_grads: dict[str, torch.Tensor | None],
         stage_index: int,
     ) -> None:
+        # [FUNCTION DOC] HELPER: For each parameter of the given stage's layer, asserts both
+        # the pipeline grad and the reference grad exist and are close.
         stage_module = pp_model.get_submodule(f"layers.{stage_index}")
         for name, param in stage_module.named_parameters():
             param_fqn = f"layers.{stage_index}.{name}"
@@ -435,6 +513,9 @@ class DTensorPPIntegrationBase(MultiProcContinuousTest):
         pp_size: int,
         num_stages: int,
     ) -> list[int]:
+        # [FUNCTION DOC] HELPER: Returns the stage indices this pp rank owns: the rank itself
+        # for 1F1B, a strided list for interleaved 1F1B, and (rank, mirrored last-rank) for
+        # V-shaped schedules such as ZBV and DualPipeV.
         if schedule_class is Schedule1F1B:
             return [pp_rank]
         if schedule_class is ScheduleInterleaved1F1B:
@@ -448,6 +529,9 @@ class DTensorPPIntegrationBase(MultiProcContinuousTest):
         pp_input: DTensor,
         pp_target: DTensor,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Steps the schedule appropriately for this rank: with input
+        # and target plus a losses list if the rank has both first and last stage, input only
+        # if it has the first, target and losses if it has the last, nothing otherwise.
         has_first = any(stage.is_first for stage in stages)
         has_last = any(stage.is_last for stage in stages)
 
@@ -471,6 +555,12 @@ class DTensorPPIntegrationBase(MultiProcContinuousTest):
         use_static_metadata: bool = True,
         null_boundary_grads: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Core training test. Initializes the device, builds the mesh and
+        # models (2 layers for 1F1B, else 4), distributes input/target over tp_mesh with the
+        # given placements, runs the microbatched reference to get grads and stage metadata,
+        # creates this rank's stages and the schedule, runs one step, and asserts parameter
+        # gradient parity for each owned stage. use_static_metadata selects whether stage
+        # metadata is given; null_boundary_grads is forwarded to the reference run.
         self.init_pg()
 
         mesh = self._make_mesh()
@@ -575,6 +665,10 @@ class DTensorPPIntegrationBase(MultiProcContinuousTest):
         *,
         use_static_metadata: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Core inference test with 2 stages on Schedule1F1B without a loss. It
+        # computes the reference output under no_grad (optionally deriving static metadata via
+        # a reference microbatched run), builds this rank's stage, runs eval under no_grad, and
+        # on the last stage asserts the output is a DTensor close to the reference.
         self.init_pg()
 
         mesh = self._make_mesh()
@@ -669,8 +763,11 @@ class DTensorPPIntegrationBase(MultiProcContinuousTest):
 
 
 class TestDTensorPPModes(DTensorPPIntegrationBase):
+    # [CLASS DOC] Concrete tests over combinations of schedule, TP layout (replicate or
+    # shard) and static versus dynamic metadata, all needing 4+ accelerators.
     @_requires_multi_gpu
     def test_static_mode_replicate(self):
+        # [FUNCTION DOC] Training with 1F1B, replicated TP, static metadata.
         self._run_training_correctness(
             Schedule1F1B,
             apply_tp_replicate,
@@ -679,6 +776,8 @@ class TestDTensorPPModes(DTensorPPIntegrationBase):
 
     @_requires_multi_gpu
     def test_static_mode_none_grad_slots_replicate(self):
+        # [FUNCTION DOC] Training with 1F1B, replicated TP, static metadata and None first-input
+        # and last-output grad slots.
         self._run_training_correctness(
             Schedule1F1B,
             apply_tp_replicate,
@@ -688,6 +787,7 @@ class TestDTensorPPModes(DTensorPPIntegrationBase):
 
     @_requires_multi_gpu
     def test_static_mode_none_grad_slots_shard(self):
+        # [FUNCTION DOC] Training with 1F1B, sharded TP, static metadata and None boundary grads.
         self._run_training_correctness(
             Schedule1F1B,
             apply_tp_shard,
@@ -697,6 +797,7 @@ class TestDTensorPPModes(DTensorPPIntegrationBase):
 
     @_requires_multi_gpu
     def test_static_mode_shard(self):
+        # [FUNCTION DOC] Training with 1F1B, sharded TP, static metadata.
         self._run_training_correctness(
             Schedule1F1B,
             apply_tp_shard,
@@ -705,6 +806,7 @@ class TestDTensorPPModes(DTensorPPIntegrationBase):
 
     @_requires_multi_gpu
     def test_dynamic_mode_inference_only_replicate(self):
+        # [FUNCTION DOC] Inference-only eval with replicated TP in dynamic metadata mode.
         self._run_inference_only_equivalence(
             apply_tp_replicate,
             [Replicate()],
@@ -712,6 +814,7 @@ class TestDTensorPPModes(DTensorPPIntegrationBase):
 
     @_requires_multi_gpu
     def test_static_mode_inference_only_replicate(self):
+        # [FUNCTION DOC] Inference-only eval with replicated TP in static metadata mode.
         self._run_inference_only_equivalence(
             apply_tp_replicate,
             [Replicate()],
@@ -720,6 +823,7 @@ class TestDTensorPPModes(DTensorPPIntegrationBase):
 
     @_requires_multi_gpu
     def test_dynamic_mode_inference_only_shard(self):
+        # [FUNCTION DOC] Inference-only eval with sharded TP in dynamic metadata mode.
         self._run_inference_only_equivalence(
             apply_tp_shard,
             [Shard(1)],
@@ -727,6 +831,7 @@ class TestDTensorPPModes(DTensorPPIntegrationBase):
 
     @_requires_multi_gpu
     def test_static_mode_inference_only_shard(self):
+        # [FUNCTION DOC] Inference-only eval with sharded TP in static metadata mode.
         self._run_inference_only_equivalence(
             apply_tp_shard,
             [Shard(1)],
@@ -735,6 +840,7 @@ class TestDTensorPPModes(DTensorPPIntegrationBase):
 
     @_requires_multi_gpu
     def test_dynamic_mode_replicate(self):
+        # [FUNCTION DOC] Training with 1F1B, replicated TP, dynamic metadata.
         self._run_training_correctness(
             Schedule1F1B,
             apply_tp_replicate,
@@ -744,6 +850,7 @@ class TestDTensorPPModes(DTensorPPIntegrationBase):
 
     @_requires_multi_gpu
     def test_dynamic_mode_shard(self):
+        # [FUNCTION DOC] Training with 1F1B, sharded TP, dynamic metadata.
         self._run_training_correctness(
             Schedule1F1B,
             apply_tp_shard,
@@ -753,6 +860,7 @@ class TestDTensorPPModes(DTensorPPIntegrationBase):
 
     @_requires_multi_gpu
     def test_static_mode_interleaved1f1b_replicate(self):
+        # [FUNCTION DOC] Training with interleaved 1F1B, replicated TP, static metadata.
         self._run_training_correctness(
             ScheduleInterleaved1F1B,
             apply_tp_replicate,
@@ -761,6 +869,7 @@ class TestDTensorPPModes(DTensorPPIntegrationBase):
 
     @_requires_multi_gpu
     def test_static_mode_zbv_zero_bubble_replicate(self):
+        # [FUNCTION DOC] Training with ZBV zero-bubble, replicated TP, static metadata.
         self._run_training_correctness(
             ScheduleZBVZeroBubble,
             apply_tp_replicate,
@@ -769,6 +878,7 @@ class TestDTensorPPModes(DTensorPPIntegrationBase):
 
     @_requires_multi_gpu
     def test_static_mode_dualpipev_replicate(self):
+        # [FUNCTION DOC] Training with DualPipeV, replicated TP, static metadata.
         self._run_training_correctness(
             ScheduleDualPipeV,
             apply_tp_replicate,
@@ -777,6 +887,7 @@ class TestDTensorPPModes(DTensorPPIntegrationBase):
 
     @_requires_multi_gpu
     def test_dynamic_mode_interleaved1f1b_shard(self):
+        # [FUNCTION DOC] Training with interleaved 1F1B, sharded TP, dynamic metadata.
         self._run_training_correctness(
             ScheduleInterleaved1F1B,
             apply_tp_shard,
@@ -786,6 +897,7 @@ class TestDTensorPPModes(DTensorPPIntegrationBase):
 
     @_requires_multi_gpu
     def test_dynamic_mode_zbv_zero_bubble_shard(self):
+        # [FUNCTION DOC] Training with ZBV zero-bubble, sharded TP, dynamic metadata.
         self._run_training_correctness(
             ScheduleZBVZeroBubble,
             apply_tp_shard,
@@ -795,6 +907,7 @@ class TestDTensorPPModes(DTensorPPIntegrationBase):
 
     @_requires_multi_gpu
     def test_dynamic_mode_dualpipev_shard(self):
+        # [FUNCTION DOC] Training with DualPipeV, sharded TP, dynamic metadata.
         self._run_training_correctness(
             ScheduleDualPipeV,
             apply_tp_shard,

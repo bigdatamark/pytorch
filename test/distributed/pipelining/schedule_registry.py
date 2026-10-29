@@ -1,3 +1,6 @@
+# [MODULE DOC] Hand-written schedules for testing torch.distributed.pipelining. Defines
+# shorthand aliases F, B, W, I for forward, full backward, backward-weight and backward-input
+# computation types, and four schedule classes with fixed per-rank action orders.
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
 # This file is a Schedule zoo for testing torch.distributed.pipelining.
@@ -24,6 +27,9 @@ I = _ComputationType.BACKWARD_INPUT
 
 
 class ScheduleVShaped(PipelineScheduleMulti):
+    # [CLASS DOC] Test schedule with 4 stages on 2 ranks in a V shape (rank 0 owns stages 0
+    # and 3, rank 1 owns 1 and 2), one microbatch. pipeline_order gives each rank a list of
+    # actions, with None meaning an idle slot.
     n_stages = 4
     rank_stages = {
         0: [0, 3],
@@ -37,6 +43,9 @@ class ScheduleVShaped(PipelineScheduleMulti):
         loss_fn: Callable | None = None,
         scale_grads: bool = True,
     ):
+        # [FUNCTION DOC] Calls the multi-stage schedule constructor with the stages,
+        # microbatch count, loss function and grad scaling, then sets the fixed
+        # pipeline_order for the V layout and validates it and sets the stage mapping.
         super().__init__(
             stages=stages,
             n_microbatches=n_microbatches,
@@ -73,6 +82,8 @@ class ScheduleVShaped(PipelineScheduleMulti):
 
 
 class ScheduleUnbalanced(PipelineScheduleMulti):
+    # [CLASS DOC] Test schedule with 5 stages over 2 ranks (rank 0: stages 0, 1, 4; rank 1:
+    # stages 2, 3), a single microbatch, with a fixed pipeline_order containing idle slots.
     n_stages = 5
     rank_stages = {
         0: [0, 1, 4],
@@ -86,6 +97,8 @@ class ScheduleUnbalanced(PipelineScheduleMulti):
         loss_fn: Callable | None = None,
         scale_grads: bool = True,
     ):
+        # [FUNCTION DOC] Calls the multi-stage schedule constructor, then sets the fixed
+        # unbalanced pipeline_order and validates it and sets the stage mapping.
         super().__init__(
             stages=stages,
             n_microbatches=n_microbatches,
@@ -123,6 +136,9 @@ class ScheduleUnbalanced(PipelineScheduleMulti):
 
 
 class ScheduleWithW(PipelineScheduleMulti):
+    # [CLASS DOC] Test schedule with 4 stages over 2 ranks (rank 0: 0, 2; rank 1: 1, 3) and
+    # two microbatches that splits backward into input (I) and weight (W) actions, as in
+    # zero-bubble schedules.
     n_stages = 4
     num_microbatches = 2
     rank_stages = {
@@ -138,6 +154,10 @@ class ScheduleWithW(PipelineScheduleMulti):
         enable_zero_bubble: bool = True,
         scale_grads: bool = True,
     ):
+        # [FUNCTION DOC] Calls the multi-stage schedule constructor, sets use_full_backward
+        # to False (required for schedules using W), then sets the two-microbatch
+        # pipeline_order and validates it and sets the stage mapping.
+        # KNOWN ISSUE: the enable_zero_bubble argument is accepted but never used.
         super().__init__(
             stages=stages,
             n_microbatches=n_microbatches,
@@ -185,6 +205,9 @@ class ScheduleWithW(PipelineScheduleMulti):
 
 
 class ScheduleWithReorderedB(_PipelineScheduleRuntime):
+    # [CLASS DOC] Test schedule on the runtime schedule base class with 2 stages (one per
+    # rank) and two microbatches, defined by explicit communication actions in
+    # pipeline_order_with_comms; the backward receives are issued before the backward compute.
     n_stages = 2
     num_microbatches = 2
     rank_stages = {
@@ -199,6 +222,9 @@ class ScheduleWithReorderedB(_PipelineScheduleRuntime):
         loss_fn: Callable | None = None,
         scale_grads: bool = True,
     ):
+        # [FUNCTION DOC] Calls the runtime schedule constructor, then sets
+        # pipeline_order_with_comms: per rank, lists of forward, send/recv and backward
+        # actions for both microbatches. No validation is called here.
         super().__init__(
             stages=stages,
             n_microbatches=n_microbatches,

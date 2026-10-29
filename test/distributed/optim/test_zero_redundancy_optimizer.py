@@ -4,6 +4,13 @@
 #
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
+# [MODULE DOC] Tests for ZeroRedundancyOptimizer (ZeRO sharded optimizer state). Single-rank
+# tests check the optimizer interface (state dict, lr scheduler, step kwargs, constructor
+# validation); multi-rank tests check sharding, param groups, state consolidation,
+# non-default process groups, parity with DDP and a local optimizer, the Join hook for
+# uneven inputs, model parallelism, and overlap with DDP via comm hooks. Import-time:
+# exits the process quietly if torch.distributed is unavailable; detects torchvision
+# (HAS_TORCHVISION) and the device_type of the current accelerator (else cpu).
 
 import copy
 import sys
@@ -64,6 +71,8 @@ device_type = (
 
 @contextmanager
 def deterministic_algorithms(enabled=True):
+# [FUNCTION DOC] HELPER: Context manager that sets deterministic-algorithms mode to the
+# enabled flag on entry and restores the previous mode on exit, even on error.
     prev_state = torch.are_deterministic_algorithms_enabled()
     torch.use_deterministic_algorithms(enabled)
     try:
@@ -73,17 +82,28 @@ def deterministic_algorithms(enabled=True):
 
 
 class TestZeroRedundancyOptimizer(DistributedTestBase):
+    # [CLASS DOC] HELPER: Base test case for the ZeRO tests built on DistributedTestBase. Its
+    # device is the module-level device_type and its default world size is 1.
     @property
     def device(self):
+        # [FUNCTION DOC] HELPER: Returns the device type string used by the tests.
         return device_type
 
     @property
     def world_size(self):
+        # [FUNCTION DOC] HELPER: Returns the default world size of 1 (single process).
         return 1
 
 
 class TestZeroRedundancyOptimizerSingleRank(TestZeroRedundancyOptimizer):
+    # [CLASS DOC] Single-process tests (world size 1) of the ZeroRedundancyOptimizer public
+    # interface; each creates a process group and wraps SGD or AdamW.
     def test_state_dict(self):
+        # [FUNCTION DOC] Takes a step with momentum SGD, consolidates the state to rank 0 and
+        # checks the state dict has param_groups and state with expected hyperparameters, is in
+        # sync with the param_groups attribute, and that loading it into a new optimizer with a
+        # different lr restores the original lr and momentum buffer and continues training with
+        # the expected values.
         """Check that ZeroRedundancyOptimizer exposes the expected state dict
         interface, irrespective of the sharding."""
         self.create_pg(self.device)
@@ -152,6 +172,8 @@ class TestZeroRedundancyOptimizerSingleRank(TestZeroRedundancyOptimizer):
         self.assertEqual(o.param_groups[0]["params"][0].device, x.device)
 
     def test_lr_scheduler(self):
+        # [FUNCTION DOC] Checks a standard StepLR scheduler can drive the ZeRO optimizer: over
+        # 5 iterations the parameter matches one updated by a plain SGD with the same schedule.
         """Check that a normal PyTorch ``lr_scheduler`` is usable with
         ZeroRedundancyOptimizer."""
         self.create_pg(self.device)
@@ -175,12 +197,16 @@ class TestZeroRedundancyOptimizerSingleRank(TestZeroRedundancyOptimizer):
             self.assertEqual(x, x2)
 
     def test_step_with_kwargs(self):
+        # [FUNCTION DOC] Checks step forwards extra positional and keyword arguments to the
+        # wrapped optimizer's step, using an SGD subclass that appends to a list.
         """Check that the ``step(**kwargs)`` interface is properly exposed."""
         self.create_pg(self.device)
         LR = 0.1
 
         class SGDWithStepKWArg(torch.optim.SGD):
             def step(self, closure=None, kwarg=None):
+            # [FUNCTION DOC] HELPER: Runs the normal SGD step then appends 5 to the kwarg list.
+            # KNOWN ISSUE: closure is not forwarded to the parent step.
                 super().step()
                 kwarg.append(5)
 
@@ -197,6 +223,8 @@ class TestZeroRedundancyOptimizerSingleRank(TestZeroRedundancyOptimizer):
         self.assertEqual(x, torch.tensor([0.9], device=self.device))
 
     def test_step_with_extra_inner_key(self):
+        # [FUNCTION DOC] Checks that a key the inner optimizer adds to its param_groups during
+        # step becomes visible through the ZeRO optimizer's own param_groups.
         """Check that ZeroRedundancyOptimizer wrapping an optimizer that adds
         extra keys to ``param_groups`` exposes those keys through ZeRO's own
         ``param_groups``."""
@@ -206,6 +234,8 @@ class TestZeroRedundancyOptimizerSingleRank(TestZeroRedundancyOptimizer):
         class SGDWithNewKey(torch.optim.SGD):
             # Dummy optimizer which adds a new key to the param groups
             def step(self, closure=None):
+            # [FUNCTION DOC] HELPER: Runs the normal SGD step then sets a new_key entry (0.1)
+            # in the first param group.
                 super().step()
                 self.param_groups[0]["new_key"] = 0.1
 
@@ -217,6 +247,8 @@ class TestZeroRedundancyOptimizerSingleRank(TestZeroRedundancyOptimizer):
         self.assertEqual(x, torch.tensor([0.9], device=self.device))
 
     def test_step_without_closure(self):
+        # [FUNCTION DOC] Checks ZeRO works with an inner optimizer whose step takes no
+        # closure argument; the parameter is updated as with SGD.
         """Check that the ``step()`` method (without closure) is handled as
         expected."""
         self.create_pg(self.device)
@@ -224,6 +256,7 @@ class TestZeroRedundancyOptimizerSingleRank(TestZeroRedundancyOptimizer):
 
         class SGDWithoutClosure(torch.optim.SGD):
             def step(self):
+            # [FUNCTION DOC] HELPER: Returns the result of the plain SGD step (no closure).
                 return super().step()
 
         x = torch.tensor([1.0], device=self.device, requires_grad=True)
@@ -237,6 +270,8 @@ class TestZeroRedundancyOptimizerSingleRank(TestZeroRedundancyOptimizer):
         self.assertEqual(x, torch.tensor([0.9], device=self.device))
 
     def test_zero_grad(self):
+        # [FUNCTION DOC] Checks zero_grad on the ZeRO optimizer sets every parameter's grad
+        # to None after a backward pass.
         """Check that the ``zero_grad`` method is properly handled."""
         self.create_pg(self.device)
         LR = 0.01
@@ -252,6 +287,10 @@ class TestZeroRedundancyOptimizerSingleRank(TestZeroRedundancyOptimizer):
         self.assertIsNone(m.bias.grad)
 
     def test_constructor(self):
+        # [FUNCTION DOC] Checks the constructor with different params inputs: empty list gives
+        # ValueError, a tensor or float gives TypeError, a list containing a non-parameter gives
+        # TypeError, while a list of dicts, generator and list work. Then checks that two
+        # parameter groups yield two groups in both the ZeRO and local optimizer.
         """Check the robustness of the ZeroRedundancyOptimizer constructor by
         passing different values for the ``params`` argument."""
         self.create_pg(self.device)
@@ -315,6 +354,8 @@ class TestZeroRedundancyOptimizerSingleRank(TestZeroRedundancyOptimizer):
             )
 
     def test_same_dense_param_type(self):
+        # [FUNCTION DOC] Checks the constructor raises ValueError for sparse parameters or for
+        # mixed dense types (float and double); a limitation of the current implementation.
         """Check that ZeroRedundancyOptimizer raises an exception if the input
         parameters include sparse tensors or different dense types.
 
@@ -338,12 +379,18 @@ class TestZeroRedundancyOptimizerSingleRank(TestZeroRedundancyOptimizer):
 
 
 class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
+    # [CLASS DOC] Multi-process tests of ZeroRedundancyOptimizer. World size is between 2 and
+    # 4 depending on the device count. Covers parity with non-sharded training, sharding of
+    # parameters, state consolidation, join, model parallelism and DDP overlap.
     @property
     def world_size(self):
+        # [FUNCTION DOC] HELPER: Returns the world size: device count clamped to [2, 4].
         return min(4, max(2, torch.get_device_module(self.device).device_count()))
 
     @property
     def context(self):
+        # [FUNCTION DOC] HELPER: Returns a context that sets the current device to this rank
+        # when the device type needs a per-rank device id, else a null context.
         if requires_ddp_rank(self.device):
             return torch.get_device_module(self.device).device(self.rank)
         else:
@@ -355,6 +402,8 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
         model_b: torch.nn.Module,
         message: str = "",
     ) -> None:
+        # [FUNCTION DOC] HELPER: Asserts that all parameters (atol 1e-3, rtol 1e-5) and all
+        # buffers of the two models match pairwise; message is appended to failure text.
         # Check that model parameters match
         for p_a, p_b in zip(model_a.parameters(), model_b.parameters()):
             torch.testing.assert_close(
@@ -374,6 +423,9 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
 
     @skip_if_no_gpu
     def test_step(self):
+        # [FUNCTION DOC] Compares a normal SGD optimizer with ZeRO wrapping SGD on a tiny
+        # linear model with rank-dependent input, after averaging gradients by all-reduce; the
+        # weight and bias must be equal after one step. Requires a GPU.
         """Check that ZeroRedundancyOptimizer properly exposes the ``step()``
         interface."""
         self.create_pg(self.device)
@@ -413,6 +465,9 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
 
     @skip_if_no_gpu
     def test_step_with_closure(self):
+        # [FUNCTION DOC] Checks step with a closure, with and without parameters_as_bucket_view:
+        # the closure recomputes an L1 loss, step returns that loss (equal to the error) and
+        # weights are updated to expected values. Requires a GPU.
         """Check that ZeroRedundancyOptimizer properly exposes the
         ``step(closure)`` interface."""
         self.create_pg(self.device)
@@ -448,6 +503,8 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
                     p.grad.data /= self.world_size
 
                 def closure():
+                # [FUNCTION DOC] HELPER: Zeros grads, computes the L1 loss against the target
+                # and backpropagates, returning the loss.
                     o.zero_grad()
                     output = m(x)
                     loss = loss_fn(output, target)
@@ -462,6 +519,8 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
 
     @skip_if_no_gpu
     def test_lr_scheduler(self):
+        # [FUNCTION DOC] Same check as the single-rank scheduler test, in the multi-rank
+        # setting: StepLR on ZeRO matches StepLR on plain SGD over 5 iterations. Requires a GPU.
         """Check that a normal PyTorch ``lr_scheduler`` is usable with
         ZeroRedundancyOptimizer."""
         self.create_pg(self.device)
@@ -483,6 +542,9 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
             self.assertEqual(x, x2)
 
     def test_sharding(self):
+        # [FUNCTION DOC] Checks that after construction the local inner optimizer holds only a
+        # share of the parameters: the total element count of its params equals the sum of one
+        # size set (relies on sorted-greedy partitioning).
         """
         Check ZeroRedundancyOptimizer's parameter sharding at construction
         time.
@@ -505,6 +567,9 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
         )
 
     def test_add_param_group(self):
+        # [FUNCTION DOC] Checks add_param_group after construction, for all-trainable
+        # parameters (each rank's local share has the same element count) and for a first big
+        # non-trainable parameter; ZeRO and inner optimizer both end with two param groups.
         """Check that ZeroRedundancyOptimizer properly handles adding a new
         parameter group a posteriori and that all ranks get a shard of the
         contained parameters.
@@ -519,6 +584,8 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
 
         # Test with all parameters trainable to begin with
         def all_trainable():
+            # [FUNCTION DOC] HELPER: Scenario with all parameters trainable; adds a group and
+            # checks group counts and per-rank element total.
             params = []
             sizes = [9, 7, 5, 3]
             sizes_world = sizes * self.world_size
@@ -544,6 +611,8 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
 
         # Test a pathological config with a first big non-trainable param
         def some_trainable():
+            # [FUNCTION DOC] HELPER: Scenario where the first (large) parameter is not
+            # trainable; adds a group and checks the group counts.
             params = []
             for size in [100, 3, 5, 2, 6, 4]:
                 params.append(torch.rand(size, 1))
@@ -564,6 +633,9 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
 
     @skip_if_no_gpu
     def test_multiple_param_groups(self):
+        # [FUNCTION DOC] Trains three copies of a model for 3 iterations with AdamW: ZeRO with
+        # both groups at construction, ZeRO with a group added later, and a plain AdamW; all
+        # weights and biases must stay close each iteration. Requires a GPU.
         """
         Check parity between constructing ZeRO with multiple parameter groups
         upfront versus adding parameter groups to ZeRO after construction
@@ -631,6 +703,9 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
 
     @skip_if_no_gpu
     def test_collect_shards(self):
+        # [FUNCTION DOC] After one SGD-with-momentum step, consolidates the optimizer state on
+        # rank 0, checks it has an entry per parameter there, broadcasts it to all ranks and
+        # loads it on every rank without error. Requires a GPU.
         """Check the state consolidation mechanism and the state dict exposed
         by ZeroRedundancyOptimizer."""
         self.create_pg(self.device)
@@ -654,6 +729,8 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
         )
 
         def closure():
+            # [FUNCTION DOC] HELPER: Zeros grads, computes the L1 loss, backpropagates and
+            # returns the loss.
             optimizer.zero_grad()
             output = model(inputs)
             loss = loss_fn(output, target)
@@ -685,6 +762,10 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
         optimizer.load_state_dict(optimizer_state_dict)
 
     def test_nondefault_process_group(self):
+        # [FUNCTION DOC] Checks ZeRO with a process group of the even ranks only (skipped, by
+        # returning early, if world size is below 4; ranks outside the group return). Falls
+        # back to CPU if there are fewer devices than ranks. Trains for 5 epochs with distinct
+        # seeds per rank and checks parameters are identical across group ranks after each step.
         """Check that ZeroRedundancyOptimizer works with a non-default process
         group consisting only of even ranks."""
         # Skip the test if below the minimum world size since then the test is
@@ -729,11 +810,16 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
         loss_fn = torch.nn.L1Loss().to(device)
 
         def check(optimizer):
+            # [FUNCTION DOC] HELPER: Runs EPOCHS steps with a closure that all-reduces the loss
+            # in the subgroup, then gathers each parameter on the reference rank and checks
+            # all ranks hold equal values.
             for _ in range(EPOCHS):
                 target = torch.rand((BATCH_SIZE, OUTPUT_DIM), device=device)
                 inputs = torch.rand((BATCH_SIZE, INPUT_DIM), device=device)
 
                 def closure():
+                    # [FUNCTION DOC] HELPER: Zeros grads, computes the scaled L1 loss, runs
+                    # backward and all-reduces the loss over the subgroup; returns it.
                     optimizer.zero_grad()
                     output = model(inputs)
                     loss = loss_fn(output, target)
@@ -795,6 +881,12 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
         optimizer_class_str: str,
         maximize: bool,
     ):
+        # [FUNCTION DOC] Parameterized over Adam/AdamW/SGD and maximize. Trains a DDP model
+        # with ZeRO and an identical DDP model with the local optimizer for 20 batches, with
+        # rank-dependent buffers, checking equal losses and parameters each step (and
+        # toggling trainability of a parameter in later batches). Then cross-loads state
+        # dicts between local and ZeRO optimizers (via consolidation to rank 0 and broadcast)
+        # and checks parity after another step each time. Requires a GPU.
         """When combined with DDP, check that a local optimizer gives the same
         results as wrapping that optimizer with ZeroRedundancyOptimizer."""
         self.create_pg(self.device)
@@ -861,15 +953,19 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
             )
 
             def check_step():
+            # [FUNCTION DOC] HELPER: Runs one step on random input for the local and sharded
+            # optimizers and checks the losses and models match.
                 input_tensor = torch.rand((BATCH_SIZE, INPUT_DIM)).to(self.device)
 
                 def closure_ddp(input_tensor=input_tensor):
+                # [FUNCTION DOC] HELPER: Closure for the local DDP optimizer; returns abs-sum loss.
                     ddp_optimizer.zero_grad()
                     ddp_loss = ddp_model(input_tensor).abs().sum()
                     ddp_loss.backward()
                     return ddp_loss
 
                 def closure_sharded(input_tensor=input_tensor):
+                # [FUNCTION DOC] HELPER: Closure for the ZeRO optimizer; returns abs-sum loss.
                     sharded_optimizer.zero_grad()
                     sharded_loss = sharded_ddp_model(input_tensor).abs().sum()
                     sharded_loss.backward()
@@ -933,6 +1029,11 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
             check_step()
 
     def _test_zero_join(self, device):
+        # [FUNCTION DOC] HELPER: Checks the ZeRO join hook for training with uneven inputs on
+        # the given device (rank r has r extra inputs). Records gradients and parameters from
+        # DDP on the last rank under join, broadcasts them to all ranks, then replays with ZeRO
+        # under the Join context, where joined ranks keep setting remaining gradients through
+        # a custom Joinable. Parameters must match the DDP trajectory at every iteration.
         """Check that the ZeRO join hook allows training with uneven inputs
         when using the given device."""
         NUM_INPUTS = 3
@@ -1012,17 +1113,26 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
         # A process must still set the remaining gradients after joining, so we
         # define a join hook to do this before the ZeRO join hook
         class _JoinGradInfo:
+            # [FUNCTION DOC] HELPER: Holds remaining gradients (grads list) and a read index.
             def __init__(self, grads):
+                # [FUNCTION DOC] HELPER: Stores the grads list and sets the index to zero.
                 self.grads = grads  # remaining gradients to set (in order)
                 self.index = 0
 
         class _SetGradsJoinHook(JoinHook):
+            # [FUNCTION DOC] HELPER: Join hook that, when its process has joined, supplies the
+            # next saved gradients to the ZeRO optimizer's parameters. Stores a gradient info
+            # object on the optimizer.
             def __init__(self, zero_optim, grads):
+                # [FUNCTION DOC] HELPER: Attaches a gradient-info object to the optimizer,
+                # keeps the optimizer reference, and calls the parent constructor.
                 zero_optim._join_grad_info = _JoinGradInfo(grads)
                 self.zero = zero_optim
                 super().__init__()
 
             def main_hook(self):
+                # [FUNCTION DOC] HELPER: Sets each of the optimizer's parameters to a copy of the
+                # next saved gradient list on the device and advances the index.
                 join_grad_info = self.zero._join_grad_info
                 grads = self.zero._join_grad_info.grads[join_grad_info.index]
                 join_grad_info.index += 1
@@ -1030,10 +1140,15 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
                     p.grad = grad.detach().clone().to(device)
 
         class _GradientSetter(Joinable):
+            # [FUNCTION DOC] HELPER: Joinable that provides a hook setting saved gradients for
+            # a joined process; uses the given device and the world process group.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Calls the parent constructor.
                 super().__init__()
 
             def join_hook(self, **kwargs):
+                # [FUNCTION DOC] HELPER: Requires zero_optim and grads keyword arguments (raises
+                # AssertionError if missing) and returns the gradient-setting join hook.
                 if "zero_optim" not in kwargs:
                     raise AssertionError("Expected 'zero_optim' in kwargs")
                 if "grads" not in kwargs:
@@ -1044,10 +1159,12 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
 
             @property
             def join_device(self):
+                # [FUNCTION DOC] HELPER: Returns the device used for join communication.
                 return device
 
             @property
             def join_process_group(self):
+                # [FUNCTION DOC] HELPER: Returns the world process group.
                 return dist.group.WORLD
 
         num_grads_after_joining = NUM_EPOCHS * (world_size - rank - 1)
@@ -1086,17 +1203,23 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
     @requires_accelerator_dist_backend()
     @skip_if_no_gpu
     def test_zero_join_gpu(self):
+        # [FUNCTION DOC] Runs the ZeRO join check on the GPU device. Requires accelerator
+        # backend and a GPU.
         """Check that the ZeRO join hook allows training with uneven inputs
         on GPU."""
         self._test_zero_join(self.device)
 
     @requires_gloo()
     def test_zero_join_cpu(self):
+        # [FUNCTION DOC] Runs the ZeRO join check on CPU. Requires gloo.
         """Check that the ZeRO join hook allows training with uneven inputs
         on CPU."""
         self._test_zero_join("cpu")
 
     def _test_zero_model_parallel(self, parameters_as_bucket_view: bool, device: str):
+        # [FUNCTION DOC] HELPER: Compares DDP with a model split across two devices per rank
+        # using ZeRO against a local single-device copy with Adam over 2 epochs, checking loss
+        # (rtol 1e-3) and parameters each step. Raises AssertionError if rank is 2 or more.
         # Use two processes each with two GPUs
         if not (self.rank < 2):
             raise AssertionError(f"Expected rank < 2, got {self.rank}")
@@ -1109,6 +1232,7 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
 
         class ModelParallelModel(torch.nn.Module):
             def __init__(self, dev0, dev1):
+            # [FUNCTION DOC] HELPER: Creates net0 on dev0, ReLU, and net1 on dev1.
                 super().__init__()
                 self.dev0 = dev0
                 self.dev1 = dev1
@@ -1117,6 +1241,8 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
                 self.net1 = torch.nn.Linear(10, 5).to(dev1)
 
             def forward(self, x):
+            # [FUNCTION DOC] HELPER: Moves input to dev0, applies net0 and relu, moves to dev1,
+            # applies net1, and returns the output.
                 x = x.to(self.dev0)
                 x = self.relu(self.net0(x))
                 x = x.to(self.dev1)
@@ -1124,12 +1250,14 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
 
         class LocalModel(torch.nn.Module):
             def __init__(self) -> None:
+            # [FUNCTION DOC] HELPER: Creates the same two linear layers and relu on one device.
                 super().__init__()
                 self.net0 = torch.nn.Linear(10, 10)
                 self.relu = torch.nn.ReLU()
                 self.net1 = torch.nn.Linear(10, 5)
 
             def forward(self, x):
+            # [FUNCTION DOC] HELPER: Applies net0, relu and net1 in order; returns the output.
                 return self.net1(self.relu(self.net0(x)))
 
         dev0 = torch.device(2 * self.rank)
@@ -1140,6 +1268,8 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
 
         # Ensure the parameters are the same across the two models
         def copy_param(p):
+        # [FUNCTION DOC] HELPER: Returns a new Parameter holding a detached copy of p moved
+        # to dev0.
             return torch.nn.Parameter(p.detach().clone().to(dev0))
 
         local_model.net0.weight = copy_param(mp_model.net0.weight)
@@ -1162,12 +1292,14 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
             for input in inputs:
 
                 def closure_local():
+                    # [FUNCTION DOC] HELPER: Closure for the local optimizer; returns abs-sum loss.
                     local_optim.zero_grad()
                     local_loss = local_model(input).abs().sum()
                     local_loss.backward()
                     return local_loss
 
                 def closure_ddp():
+                    # [FUNCTION DOC] HELPER: Closure for the ZeRO optimizer; returns abs-sum loss.
                     zero_optim.zero_grad()
                     ddp_loss = ddp_model(input).abs().sum()
                     ddp_loss.backward()
@@ -1207,6 +1339,9 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
         self,
         parameters_as_bucket_view: bool,
     ):
+        # [FUNCTION DOC] Parameterized on parameters_as_bucket_view. Ranks 2 and above return
+        # immediately; creates a 2-process group and runs the model-parallel parity check.
+        # Skipped on HPU and needs at least 4 GPUs.
         """Check that ZeRO works with model parallelism where the model's
         layers are assigned to different devices."""
         if self.rank >= 2:
@@ -1222,6 +1357,11 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
         static_graph,
         **kwargs,
     ):
+        # [FUNCTION DOC] HELPER: For a small MLP (and resnet50 if torchvision is present) checks
+        # that overlapping ZeRO with DDP through the given comm hook constructor gives the same
+        # parameters as DDP plus a local SGD optimizer. Runs warmup iterations (2, or 3 with
+        # static graph) so DDP buckets are rebuilt, runs both setups on identical inputs under
+        # deterministic settings, and asserts parameters are equal and changed from initial.
         SGD_LR = 0.01
         SGD_MOMENTUM = 0.9
         SGD_WEIGHT_DECAY = 0.001
@@ -1387,6 +1527,10 @@ class TestZeroRedundancyOptimizerDistributed(TestZeroRedundancyOptimizer):
         static_graph: bool,
         shard_buckets: bool,
     ):
+        # [FUNCTION DOC] Parameterized over interleaved hook, gradient_as_bucket_view,
+        # static_graph and shard_buckets (use_gpu fixed true). Picks the hook constructor
+        # (zero step or interleaved variant) and runs the overlap parity check with shard_buckets
+        # passed as an extra argument. Skipped on Windows; needs accelerator backend and a GPU.
         """
         Check that overlapping DDP with ZeRO using the given method determined
         by ``hook_constructor`` and ``shard_buckets`` and using the given ZeRO
