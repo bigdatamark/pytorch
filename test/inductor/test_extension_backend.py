@@ -1,4 +1,8 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests Inductor's open device registration using a C++ extension backend: builds a
+# custom cpp device extension, registers a scheduling class and wrapper codegen classes for a
+# private-use device, and checks generated code and numerics. Import time: skips or exits
+# cleanly if the test_torchinductor module raises SkipTest; defines shortcuts to its helpers.
 import os
 import sys
 import tempfile
@@ -61,10 +65,18 @@ TestCase = test_torchinductor.TestCase
 
 @xfailIfS390X
 class BaseExtensionBackendTests(TestCase):
+    # [CLASS DOC] Base class that compiles the extension_device C++ extension once per class
+    # into a temporary build directory and, per test, resets Dynamo, switches the working
+    # directory to this file's folder (extension sources use relative paths) and undoes the
+    # private-use backend renaming at teardown. Class attribute module holds the loaded
+    # extension. Marked expected failure on s390x.
     module = None
 
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Class setup: creates a temporary build directory and loads the C++
+        # extension device source from the extension_backends folder next to this file, with
+        # debug flags and verbose output, storing the loaded module on the class.
         super().setUpClass()
 
         cls._build_dir = tempfile.TemporaryDirectory()
@@ -84,12 +96,17 @@ class BaseExtensionBackendTests(TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] Class teardown: closes the exit stack from the base test case, calls
+        # the parent teardown, then removes the temporary build directory.
         cls._stack.close()
         super().tearDownClass()
 
         cls._build_dir.cleanup()
 
     def setUp(self):
+        # [FUNCTION DOC] Per-test setup: resets Dynamo, runs parent setup, remembers the current
+        # working directory and changes to this file's directory; raises AssertionError if the
+        # extension module failed to load.
         torch._dynamo.reset()
         super().setUp()
 
@@ -101,6 +118,9 @@ class BaseExtensionBackendTests(TestCase):
             raise AssertionError
 
     def tearDown(self):
+        # [FUNCTION DOC] Per-test teardown: parent teardown, Dynamo reset, deletes the attribute
+        # and the sys.modules entry for the renamed private-use backend module if present, then
+        # restores the original working directory.
         super().tearDown()
         torch._dynamo.reset()
 
@@ -115,8 +135,18 @@ class BaseExtensionBackendTests(TestCase):
 
 @unittest.skipIf(IS_FBCODE, "cpp_extension doesn't work in fbcode right now")
 class ExtensionBackendTests(BaseExtensionBackendTests):
+    # [CLASS DOC] Extension backend tests, skipped in fbcode where cpp extensions do not work.
+    # Parametrized tests are instantiated after the class definition.
     @skipIfWindows
     def test_open_device_registration(self):
+        # [FUNCTION DOC] Renames the private-use backend to extension_device, registers the
+        # extension module, and registers scheduling, python wrapper and cpp wrapper codegen
+        # classes plus cpu device op overrides; asserts the lookups return them. Creates tensors
+        # on the custom device, checks the custom op was invoked, then for cpp_wrapper both on
+        # and off compiles a multiply-add function, checks the generated cpp code with FileCheck
+        # (a vectorized load or a scalar load, and the device name) and that results equal the
+        # cpu reference of 5. Skipped on Windows. Mutates global registries and the device-to-
+        # ATen mapping.
         torch.utils.rename_privateuse1_backend("extension_device")
         torch._register_device_module("extension_device", self.module)
 
@@ -152,6 +182,8 @@ class ExtensionBackendTests(BaseExtensionBackendTests):
         self.assertTrue(z.device == device)
 
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Computes a times b plus c; the function compiled in the
+            # test.
             return a * b + c
 
         cpp_utils.DEVICE_TO_ATEN["extension_device"] = "at::kPrivateUse1"
@@ -176,6 +208,10 @@ class ExtensionBackendTests(BaseExtensionBackendTests):
 
     @parametrize("device", ["cpu", "has_cpp_wrapper_extension_device"])
     def test_has_cpp_wrapper_for_device(self, device: str):
+        # [FUNCTION DOC] Parametrized over cpu and a fictitious device name. Calls the lookup
+        # with nothing registered (must not raise), registers a backend without cpp wrapper and
+        # asserts false, then registers with a cpp wrapper and asserts true. Mutates the global
+        # backend registry.
         # Check that calling the function without having registered a backend
         # ourselves doesn't error.
         _ = has_cpp_wrapper_for_device(device)

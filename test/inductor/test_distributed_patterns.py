@@ -1,4 +1,9 @@
 # Owner(s): ["oncall: pt2"]
+# [MODULE DOC] Inductor/Dynamo tests of patterns used by FSDP-style distributed training, run
+# without real distribution: fake all-gather and reduce-scatter via module hooks, storage resize
+# to zero and back, unsafe version-counter manipulation, module backward hooks under compiled
+# autograd, tensor hooks with closures, and returning nn.Parameter from compiled code. Defines a
+# world size constant of 2 and helper builders.
 import dataclasses
 import functools
 
@@ -16,16 +21,31 @@ WORLD_SIZE = 2
 
 
 def init_fake_distributed(device="cpu"):
+    # [FUNCTION DOC] Builds a bias-free linear module (20 to 10) that mimics FSDP with a world
+    # size of 2 and returns it with a random input requiring grad of shape 2 by 20. The module
+    # keeps a sharded and an unsharded weight parameter (unsharded storage is freed to zero).
+    # Registers forward pre and post and backward pre and post hooks that allocate and fill the
+    # unsharded weight by the fake all-gather, swap it in as the weight, then swap the sharded
+    # one back and free storage; the backward post hook also reduce-scatters the gradient into
+    # the sharded weight's grad. Seeds the RNG.
     @torch.no_grad
     def all_gather(t):
+        # [FUNCTION DOC] HELPER: Fake all-gather: concatenates the tensor with itself once per
+        # world size along the first dimension, without grad.
         return torch.cat([t] * WORLD_SIZE, 0)
 
     @torch.no_grad
     def reduce_scatter(t):
+        # [FUNCTION DOC] HELPER: Fake reduce-scatter: returns a copy of the first shard along
+        # dim 0 (size divided by world size); cloned so the output does not alias the input. No
+        # grad.
         # clone since reduce_scatter input and output should not be aliases.
         return t.narrow(0, 0, t.size(0) // WORLD_SIZE).clone()
 
     def fw_pre_hook(mod, inp):
+        # [FUNCTION DOC] HELPER: Forward pre-hook: resizes the unsharded weight storage to full
+        # size, copies the all-gathered sharded weight into it through the fsdp copy op while
+        # preserving the version counter, and installs it as the module weight.
         mod.unsharded_weight.untyped_storage().resize_(
             mod.unsharded_weight.nelement() * mod.unsharded_weight.element_size()
         )
@@ -46,10 +66,15 @@ def init_fake_distributed(device="cpu"):
     #     mod.unsharded_weight = zero-sized allgather
 
     def fw_post_hook(mod, inp, out):
+        # [FUNCTION DOC] HELPER: Forward post-hook: reinstates the sharded weight as the module
+        # weight and frees the unsharded weight storage.
         mod._parameters["weight"] = mod.sharded_weight
         mod.unsharded_weight.untyped_storage().resize_(0)
 
     def bw_pre_hook(mod, gO):
+        # [FUNCTION DOC] HELPER: Backward pre-hook: same unshard sequence as the forward pre-
+        # hook (resize storage, copy all-gathered shard preserving version counter, install as
+        # weight).
         mod.unsharded_weight.untyped_storage().resize_(
             mod.unsharded_weight.nelement() * mod.unsharded_weight.element_size()
         )
@@ -70,6 +95,9 @@ def init_fake_distributed(device="cpu"):
     #     mod.unsharded_weight = zero-sized allgather
 
     def bw_post_hook(mod, gI, gO):
+        # [FUNCTION DOC] HELPER: Backward post-hook: reduce-scatters the current weight
+        # gradient, reinstates the sharded weight, assigns the scattered gradient to its grad,
+        # and frees the unsharded storage.
         grad = mod.weight.grad
         new_grad = reduce_scatter(grad)
         mod._parameters["weight"] = mod.sharded_weight
@@ -92,13 +120,23 @@ def init_fake_distributed(device="cpu"):
 
 
 def init_module_bw_hooks(allow_eager):
+    # [FUNCTION DOC] Builds a 10 by 10 linear module with scalar counter tensors for pre and
+    # post backward hooks and registers full backward pre and post hooks that increment the
+    # counters and return transformed gradients (a sine of shifted gradient). Returns the module
+    # and a random input of shape 2 by 10 requiring grad. Argument allow_eager controls whether
+    # the hooks may run outside compilation. Seeds the RNG.
     def bw_pre_hook(mod, gO):
+        # [FUNCTION DOC] HELPER: Backward pre-hook: asserts it is allowed (eager allowed or
+        # compiling) and that the weight is 10 by 10, bumps the pre counter, and returns the
+        # sine of the output gradient plus 1.2 as a tuple.
         assert allow_eager or torch._dynamo.is_compiling()  # noqa: S101
         assert mod.weight.size() == (10, 10)  # noqa: S101
         mod.hook_count_pre.add_(1)
         return (torch.sin(gO[0] + 1.2),)
 
     def bw_post_hook(mod, gI, gO):
+        # [FUNCTION DOC] HELPER: Backward post-hook: same assertions, bumps the post counter,
+        # and returns the sine of the input gradient plus 3.4 as a tuple.
         assert allow_eager or torch._dynamo.is_compiling()  # noqa: S101
         assert mod.weight.size() == (10, 10)  # noqa: S101
         mod.hook_count_post.add_(1)
@@ -114,6 +152,8 @@ def init_module_bw_hooks(allow_eager):
 
 
 def steps(m, inp):
+    # [FUNCTION DOC] HELPER: Runs four iterations of forward and a backward pass on the sum of
+    # the output; returns the last output.
     for _ in range(4):
         out = m(inp)
         out.sum().backward()
@@ -121,12 +161,20 @@ def steps(m, inp):
 
 
 class DistributedPatternTests(TestCase):
+    # [CLASS DOC] TestCase with tests for the distributed-style patterns above, comparing eager
+    # results to compiled ones.
     def test_intermediate_hook_with_closure(self):
+        # [FUNCTION DOC] Registers a tensor hook capturing a closure variable and a dataclass
+        # object; compares gradients of the eager function with the compiled (full graph) one
+        # run under compiled autograd, for two different objects.
         @dataclasses.dataclass
         class CustomObj:
+            # [CLASS DOC] Dataclass holding one tensor field val.
             val: torch.Tensor
 
         def fn(x, obj):
+            # [FUNCTION DOC] HELPER: Computes a sine, registers a gradient hook adding the
+            # object's value and a closure tensor, then returns the sine of the result.
             y = x.sin()
             closure_var = y + 1
             y.register_hook(lambda grad: grad + obj.val + closure_var)
@@ -154,12 +202,20 @@ class DistributedPatternTests(TestCase):
         self.assertEqual(x1.grad, x3.grad)
 
     def test_intermediate_hook_with_nested_closure(self):
+        # [FUNCTION DOC] Like the closure test but the hooked computation is inside a nested
+        # function called by the traced one; compares eager and compiled gradients for two
+        # objects.
         @dataclasses.dataclass
         class CustomObj:
+            # [CLASS DOC] Dataclass holding one tensor field val.
             val: torch.Tensor
 
         def fn(x, obj):
+            # [FUNCTION DOC] HELPER: Defines and calls an inner function that registers a
+            # gradient hook using the object and a closure tensor; returns its result.
             def run():
+                # [FUNCTION DOC] HELPER: Computes sine, registers the gradient hook, and returns
+                # the sine of the result.
                 y = x.sin()
                 closure_var = y + 1
                 y.register_hook(lambda grad: grad + obj.val + closure_var)
@@ -190,8 +246,13 @@ class DistributedPatternTests(TestCase):
 
     @torch.no_grad()
     def _test_storage_resize_zero(self, device):
+        # [FUNCTION DOC] HELPER: Compiles a function that computes sine of the input, resizes
+        # the input's storage to zero, then returns cosine of the sine; checks the output and
+        # that the storage size became zero. Runs without grad.
         @torch.compile(fullgraph=True)
         def fn(x):
+            # [FUNCTION DOC] HELPER: Computes sine, frees the input storage, returns the cosine
+            # of the intermediate.
             y = torch.sin(x)
             x.untyped_storage().resize_(0)
             return torch.cos(y)
@@ -203,16 +264,24 @@ class DistributedPatternTests(TestCase):
         self.assertEqual(x.untyped_storage().size(), 0)
 
     def test_storage_resize_zero_cpu(self):
+        # [FUNCTION DOC] Runs the storage resize to zero check on cpu.
         self._test_storage_resize_zero("cpu")
 
     @requires_gpu()
     def test_storage_resize_zero_gpu(self):
+        # [FUNCTION DOC] Runs the storage resize to zero check on the GPU; requires a GPU.
         self._test_storage_resize_zero(GPU_TYPE)
 
     @torch.no_grad()
     def _test_storage_resize_nonzero(self, device):
+        # [FUNCTION DOC] HELPER: Compiles a function that writes cosine of sine of x into an
+        # output tensor whose storage has been freed, after resizing it to the input's storage
+        # size; checks storage size and values. The function asserts the output storage starts
+        # at size zero.
         @torch.compile(fullgraph=True)
         def fn(x, out):
+            # [FUNCTION DOC] HELPER: Computes sine, asserts output storage size is zero, resizes
+            # it to the input storage size and copies the cosine in.
             y = torch.sin(x)
             assert out.untyped_storage().size() == 0  # noqa: S101
             out.untyped_storage().resize_(x.untyped_storage().size())
@@ -227,18 +296,27 @@ class DistributedPatternTests(TestCase):
         self.assertEqual(out, expected)
 
     def test_storage_resize_nonzero_cpu(self):
+        # [FUNCTION DOC] Runs the storage resize non-zero check on cpu.
         self._test_storage_resize_nonzero("cpu")
 
     @requires_gpu()
     def test_storage_resize_nonzero_gpu(self):
+        # [FUNCTION DOC] Runs the storage resize non-zero check on the GPU; requires a GPU.
         self._test_storage_resize_nonzero(GPU_TYPE)
 
     @torch.no_grad()
     def test_unsafe_set_version_counter1(self):
+        # [FUNCTION DOC] For several starting versions, compiles with a counting backend a
+        # function that overwrites a tensor in place then restores its version counter via the
+        # unsafe setter; checks the same object is returned, values, the version equal to the
+        # original, and one compiled frame.
         cnt = CompileCounter()
 
         @torch.compile(backend=cnt, fullgraph=True)
         def fn(w, x):
+            # [FUNCTION DOC] HELPER: Overwrites w in place with the sine of x plus one, then
+            # resets its version counter to the recorded one; returns w and the recorded
+            # version.
             x = x.sin()
             v = w._version
             w.copy_(x + 1)
@@ -260,8 +338,13 @@ class DistributedPatternTests(TestCase):
             self.assertEqual(cnt.frame_count, 1)
 
     def test_unsafe_set_version_counter2(self):
+        # [FUNCTION DOC] Compiles with inductor a function that takes the sine of w, then under
+        # no-grad overwrites w and restores the version counter; checks the output, that w was
+        # overwritten, and backward gives the cosine of the new value.
         @torch.compile(backend="inductor", fullgraph=True)
         def fn(w, x):
+            # [FUNCTION DOC] HELPER: Takes the sine of w, then under no-grad copies x into w and
+            # restores w's version counter; returns the sine.
             r = w.sin()
             with torch.no_grad():
                 v = w._version
@@ -281,8 +364,13 @@ class DistributedPatternTests(TestCase):
 
     @torch.no_grad()
     def test_unsafe_preserve_version_counter1(self):
+        # [FUNCTION DOC] Same idea as the first version-counter test but using the preserve-
+        # version-counter context manager with the eager backend; checks the version is
+        # unchanged and values updated.
         @torch.compile(backend="eager", fullgraph=True)
         def fn(w, x):
+            # [FUNCTION DOC] HELPER: Within the preserve-version-counter context, copies sine of
+            # x plus one into w; returns w.
             x = x.sin()
             with torch.autograd._unsafe_preserve_version_counter(w):
                 w.copy_(x + 1)
@@ -299,8 +387,12 @@ class DistributedPatternTests(TestCase):
         self.assertEqual(v1, v2)
 
     def test_unsafe_preserve_version_counter2(self):
+        # [FUNCTION DOC] Inductor-compiled version of the preserve-version-counter check
+        # combined with autograd, comparing output, overwritten value and gradient.
         @torch.compile(backend="inductor", fullgraph=True)
         def fn(w, x):
+            # [FUNCTION DOC] HELPER: Takes the sine of w, then under no-grad and the preserve-
+            # version-counter context copies x into w; returns the sine.
             r = w.sin()
             with torch.no_grad(), torch.autograd._unsafe_preserve_version_counter(w):
                 w.copy_(x)
@@ -317,6 +409,9 @@ class DistributedPatternTests(TestCase):
         self.assertEqual(w1.grad, x1.cos())
 
     def test_module_backward_hooks_eager(self):
+        # [FUNCTION DOC] Compares eager module backward hooks to a compiled module under
+        # compiled autograd with counting backends; checks hook counters, outputs, gradients,
+        # one forward frame with 5 ops, two backward frames and 111 ops in the backward graphs.
         m1, inp1 = init_module_bw_hooks(True)
         out1 = steps(m1, inp1)
 
@@ -342,6 +437,8 @@ class DistributedPatternTests(TestCase):
         )  # Number of ops in the Dynamo-produced graphs
 
     def test_module_backward_hooks_aot(self):
+        # [FUNCTION DOC] Compares eager hooks vs the aot_eager compiled module with an identity
+        # compiled-autograd compiler; checks counters, outputs and gradients.
         m1, inp1 = init_module_bw_hooks(True)
         out1 = steps(m1, inp1)
 
@@ -358,6 +455,8 @@ class DistributedPatternTests(TestCase):
         self.assertEqual(m1.bias.grad, m2.bias.grad)
 
     def test_module_backward_hooks_inductor(self):
+        # [FUNCTION DOC] Compares eager hooks vs the default inductor compile of the module with
+        # inductor compiled autograd; checks counters, outputs and gradients.
         m1, inp1 = init_module_bw_hooks(True)
         out1 = steps(m1, inp1)
 
@@ -374,6 +473,8 @@ class DistributedPatternTests(TestCase):
         self.assertEqual(m1.bias.grad, m2.bias.grad)
 
     def test_module_backward_hooks_multi_layers(self):
+        # [FUNCTION DOC] Two stacked hooked modules in a sequential container, eager vs compiled
+        # with compiled autograd; checks counters of both modules, output, and all gradients.
         a1, inp1 = init_module_bw_hooks(True)
         b1, _ = init_module_bw_hooks(True)
         out1 = steps(torch.nn.Sequential(a1, b1), inp1)
@@ -399,13 +500,19 @@ class DistributedPatternTests(TestCase):
     # TODO(jansel): support bw hooks with graph break
 
     def _assert_same_grad(self, a, b):
+        # [FUNCTION DOC] HELPER: Asserts two tensors have the same type, values, gradients and
+        # requires-grad flag.
         self.assertEqual(type(a), type(b))
         self.assertEqual(a, b)
         self.assertEqual(a.grad, b.grad)
         self.assertEqual(a.requires_grad, b.requires_grad)
 
     def test_nn_param_return1(self):
+        # [FUNCTION DOC] Checks a compiled function that creates a parameter from its input and
+        # returns it with its sine behaves like eager, including gradients.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Wraps the input in a parameter and returns it with its
+            # sine.
             p = torch.nn.Parameter(x)
             return p, p.sin()
 
@@ -421,7 +528,11 @@ class DistributedPatternTests(TestCase):
         self._assert_same_grad(p1, p2)
 
     def test_nn_param_return2(self):
+        # [FUNCTION DOC] Checks returning a parameter created with no grad requirement alongside
+        # an offset of the input matches eager.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Wraps the input in a non-grad parameter; returns it and the
+            # input plus one.
             p = torch.nn.Parameter(x, requires_grad=False)
             return p, x + 1
 
@@ -436,7 +547,12 @@ class DistributedPatternTests(TestCase):
 
     @torch._dynamo.config.patch("graph_break_on_nn_param_ctor", False)
     def test_nn_param_return3(self):
+        # [FUNCTION DOC] With the graph-break-on-parameter-constructor option off, checks
+        # returning a parameter built from an offset input plus its sine matches eager including
+        # gradients.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Builds a parameter from the input plus 123 and returns it
+            # with its sine.
             p = torch.nn.Parameter(x + 123)
             return p, p.sin()
 
@@ -453,7 +569,11 @@ class DistributedPatternTests(TestCase):
 
     @torch._dynamo.config.patch("graph_break_on_nn_param_ctor", False)
     def test_nn_param_return4(self):
+        # [FUNCTION DOC] With the graph-break-on-parameter-constructor option off, checks
+        # returning a non-grad parameter built from an offset input matches eager.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Builds a non-grad parameter from the input plus 123;
+            # returns it and the input plus one.
             p = torch.nn.Parameter(x + 123, requires_grad=False)
             return p, x + 1
 
@@ -468,6 +588,10 @@ class DistributedPatternTests(TestCase):
 
     @torch._functorch.config.patch(recompute_views=True)
     def test_fake_distributed_aot_eager(self):
+        # [FUNCTION DOC] Runs the fake distributed module eagerly and compiled with the
+        # aot_eager backend under compiled autograd (recompute views on); compares weights,
+        # input and output including grads, and expects two backward frames (grad none and not
+        # none).
         m1, inp1 = init_fake_distributed()
         out1 = steps(m1, inp1)
 
@@ -486,6 +610,8 @@ class DistributedPatternTests(TestCase):
     @requires_gpu()
     @torch._functorch.config.patch(recompute_views=True)
     def test_fake_distributed_inductor(self):
+        # [FUNCTION DOC] Same as the aot_eager version but on the GPU with default inductor for
+        # forward and compiled autograd; requires a GPU and compares weight, input and output.
         m1, inp1 = init_fake_distributed(GPU_TYPE)
         out1 = steps(m1, inp1)
 

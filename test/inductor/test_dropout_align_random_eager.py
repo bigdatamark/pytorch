@@ -1,4 +1,10 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] CUDA tests that Inductor-compiled dropout matches eager dropout when the
+# align_random_eager config is on: same seed gives (nearly) identical masks and the same RNG
+# offset advance. Contains module constants, two small model classes, seeding and timing
+# helpers, a standalone parity helper and the test class. Several tests are skipped for CI
+# failures, three primitive random tests are expected failures, and the main block runs only on
+# Linux with CUDA and Triton.
 
 import struct
 import time
@@ -32,7 +38,11 @@ SEQ_LEN = 512
 # Model under test
 # ───────────────────────────────────────────────────────────────
 class LinearBlock(torch.nn.Module):
+    # [CLASS DOC] Feed-forward block: linear to the ffn size, dropout, relu, linear back to the
+    # hidden size, held in a sequential container.
     def __init__(self, hidden_dim: int, ffn_dim: int, dropout: float = DROPOUT_P):
+        # [FUNCTION DOC] Builds the sequential stack with the given dimensions and dropout
+        # probability.
         super().__init__()
         self.net = torch.nn.Sequential(
             torch.nn.Linear(hidden_dim, ffn_dim),
@@ -42,13 +52,18 @@ class LinearBlock(torch.nn.Module):
         )
 
     def forward(self, x: torch.Tensor):
+        # [FUNCTION DOC] Applies the sequential stack to the input and returns the result.
         return self.net(x)
 
 
 class MultiDropoutBlock(torch.nn.Module):
+    # [CLASS DOC] Like the feed-forward block but with three dropout layers (after the first
+    # linear, after relu, and at the end) to stress random-number alignment across several
+    # dropouts.
     """Block with multiple Dropout ops to stress RNG alignment."""
 
     def __init__(self, hidden_dim: int, ffn_dim: int, dropout: float = DROPOUT_P):
+        # [FUNCTION DOC] Builds the stack: linear, dropout, relu, dropout, linear, dropout.
         super().__init__()
         self.net = torch.nn.Sequential(
             torch.nn.Linear(hidden_dim, ffn_dim),
@@ -60,10 +75,14 @@ class MultiDropoutBlock(torch.nn.Module):
         )
 
     def forward(self, x: torch.Tensor):
+        # [FUNCTION DOC] Applies the sequential stack to the input and returns the result.
         return self.net(x)
 
 
 def build_models(dropout: float, *, mode=None, dynamic: bool = False):
+    # [FUNCTION DOC] Builds an eager feed-forward block and a second one with the same weights
+    # copied from the first, compiles the second with the given mode and dynamic flag, and
+    # returns both as a pair.
     eager = LinearBlock(HIDDEN_DIM, FFN_DIM, dropout)
     compiled = LinearBlock(HIDDEN_DIM, FFN_DIM, dropout)
     compiled.load_state_dict(eager.state_dict())
@@ -75,17 +94,24 @@ def build_models(dropout: float, *, mode=None, dynamic: bool = False):
 # Helpers
 # ───────────────────────────────────────────────────────────────
 def _set_seed(base: int = BASE_SEED):
+    # [FUNCTION DOC] HELPER: Seeds the CPU generator and, if CUDA is available, the CUDA
+    # generator with the given base seed (default is the module constant).
     torch.manual_seed(base)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(base)
 
 
 def _sync(x: torch.Tensor):
+    # [FUNCTION DOC] HELPER: Calls CUDA synchronize if the tensor lives on a CUDA device;
+    # otherwise does nothing.
     if x.is_cuda:
         torch.cuda.synchronize()
 
 
 def _timed_run(model, x, backward: bool = False):
+    # [FUNCTION DOC] HELPER: Runs the model on x (optionally followed by a backward pass on the
+    # mean of the squared output) between synchronizations and returns the elapsed wall time in
+    # milliseconds and the output.
     _sync(x)
     t0 = time.time()
     y = model(x)
@@ -96,6 +122,9 @@ def _timed_run(model, x, backward: bool = False):
 
 
 def _cuda_rng_u64_seed_off():
+    # [FUNCTION DOC] HELPER: Reads the CUDA RNG state bytes and returns the seed (first 8 bytes)
+    # and the offset (bytes 8 to 24, which holds 8 bytes) decoded as little-endian unsigned
+    # 64-bit integers.
     """Return (seed, offset) extracted from torch.cuda.get_rng_state()."""
     st = torch.cuda.get_rng_state()
     seed = struct.unpack("<Q", st[0:8].cpu().numpy().tobytes())[0]
@@ -104,11 +133,15 @@ def _cuda_rng_u64_seed_off():
 
 
 def set_seed(seed):
+    # [FUNCTION DOC] HELPER: Seeds both the CPU and the CUDA generators with the given seed.
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
 
 
 def dropout_parity(shape, p=0.3, dtype=torch.float32, seed=1234):
+    # [FUNCTION DOC] HELPER: Resets Dynamo, then runs an eager and a compiled training-mode
+    # dropout on a tensor of ones on the CUDA device, re-seeding before each. Returns whether
+    # the nonzero masks are identical, plus both outputs. Requires CUDA.
     """Returns (masks_equal, eager_out, compiled_out)."""
     DEVICE = torch.device("cuda")
     torch._dynamo.reset()
@@ -134,7 +167,14 @@ def dropout_parity(shape, p=0.3, dtype=torch.float32, seed=1234):
 )
 @config.patch(align_random_eager=True)
 class TestDropoutAlignRandomEager(InductorTestCase):
+    # [CLASS DOC] CUDA dropout alignment tests, skipped unless on Linux with CUDA and Triton and
+    # run with the align_random_eager config patched on. Provides a tolerant mismatch-fraction
+    # assertion.
     def assertSmallMismatchFraction(self, a, b, atol=1e-5, max_fraction=1e-3):
+        # [FUNCTION DOC] Computes the absolute difference of the two tensors, counts elements
+        # exceeding atol, and fails the test if the fraction of such elements exceeds
+        # max_fraction. Tolerates a rare mask bit flip from the Philox conversion that a linear
+        # layer would amplify.
         """Assert that only a small fraction of elements differ significantly.
 
         The Philox uint32→float32 conversion can produce values on opposite
@@ -159,6 +199,9 @@ class TestDropoutAlignRandomEager(InductorTestCase):
         "https://github.com/pytorch/pytorch/issues/190237"
     )
     def test_linear_block_compile_parity_forward(self):
+        # [FUNCTION DOC] For eval and training modes, builds eager and compiled blocks on the
+        # GPU, seeds identically before each forward under no_grad, and checks outputs agree up
+        # to the mismatch fraction. Currently skipped for CI failures (issue 190237).
         device = torch.device(GPU_TYPE)
 
         for training in (False, True):
@@ -192,6 +235,10 @@ class TestDropoutAlignRandomEager(InductorTestCase):
         "https://github.com/pytorch/pytorch/issues/190237"
     )
     def test_linear_block_compile_parity_backward(self):
+        # [FUNCTION DOC] Runs forward and backward (loss is the mean of the squared output) on
+        # eager and compiled blocks with identical seeds, then checks outputs and every
+        # parameter gradient agree up to the mismatch fraction and that gradients exist.
+        # Currently skipped for CI failures (issue 190237).
         device = torch.device(GPU_TYPE)
 
         eager, compiled = build_models(DROPOUT_P)
@@ -224,6 +271,10 @@ class TestDropoutAlignRandomEager(InductorTestCase):
 
     @requires_gpu()
     def test_dropout_mask_parity_and_rng_offset_cuda(self):
+        # [FUNCTION DOC] For float32, float16 and bfloat16 (bf16 skipped if unsupported),
+        # applies eager and compiled dropout to ones from the same seed, and compares mask
+        # mismatch ratio (must be at most 1e-4), that the initial seed equals the base seed, and
+        # that both advance the CUDA RNG offset by the same amount.
         device = torch.device(GPU_TYPE)
         H, W = BATCH * SEQ_LEN, FFN_DIM
 
@@ -271,6 +322,9 @@ class TestDropoutAlignRandomEager(InductorTestCase):
     # ───────────────────────────────────────────────────────────
     @requires_gpu()
     def test_multi_dropout_multi_iterations_parity(self):
+        # [FUNCTION DOC] Over 10 iterations with a different seed each, runs eager and compiled
+        # three-dropout blocks in training mode on random input with identical seeding and
+        # requires the fraction of differing zero patterns of the outputs to be at most 1e-5.
         device = torch.device(GPU_TYPE)
 
         eager = MultiDropoutBlock(HIDDEN_DIM, FFN_DIM, DROPOUT_P).to(device)
@@ -304,6 +358,9 @@ class TestDropoutAlignRandomEager(InductorTestCase):
         "https://github.com/pytorch/pytorch/issues/190237"
     )
     def test_dropout_parity_dynamic_shapes(self):
+        # [FUNCTION DOC] Compiles the block with dynamic shapes and compares to eager for two
+        # sequence lengths with identical seeding, using the mismatch fraction check. Currently
+        # skipped for CI failures (issue 190237).
         device = torch.device(GPU_TYPE)
 
         eager = LinearBlock(HIDDEN_DIM, FFN_DIM, DROPOUT_P).to(device)
@@ -339,6 +396,9 @@ class TestDropoutAlignRandomEager(InductorTestCase):
         "https://github.com/pytorch/pytorch/issues/190237"
     )
     def test_dropout_parity_cudagraphs_reduce_overhead(self):
+        # [FUNCTION DOC] Compiles the block in reduce-overhead mode (CUDA graphs) and compares
+        # one forward with eager under identical seeding. Currently skipped for CI failures
+        # (issue 190237).
         device = torch.device(GPU_TYPE)
 
         eager = LinearBlock(HIDDEN_DIM, FFN_DIM, DROPOUT_P).to(device)
@@ -364,6 +424,9 @@ class TestDropoutAlignRandomEager(InductorTestCase):
     # ───────────────────────────────────────────────────────────
     @requires_gpu()
     def test_inductor_generated_code_contains_dropout(self):
+        # [FUNCTION DOC] Compiles a training-mode block, captures the generated code of one
+        # call, asserts at least one code string was produced, and uses FileCheck to require the
+        # word dropout in the first.
         device = torch.device(GPU_TYPE)
         x = torch.randn(BATCH, SEQ_LEN, HIDDEN_DIM, device=device)
 
@@ -372,6 +435,8 @@ class TestDropoutAlignRandomEager(InductorTestCase):
         compiled = torch.compile(model)
 
         def fn(inp):
+            # [FUNCTION DOC] HELPER: Calls the compiled model on the input; passed to the code
+            # capture utility.
             return compiled(inp)
 
         _, codes = run_and_get_code(fn, x)
@@ -385,6 +450,8 @@ class TestDropoutAlignRandomEager(InductorTestCase):
     # ───────────────────────────────────────────────────────────
     @requires_gpu()
     def test_perf_smoke_cuda(self):
+        # [FUNCTION DOC] Smoke test: times warmed-up eager and compiled evaluation-mode forward
+        # passes and asserts both durations are positive.
         device = torch.device(GPU_TYPE)
         x = torch.randn(BATCH, SEQ_LEN, HIDDEN_DIM, device=device)
 
@@ -408,9 +475,15 @@ class TestDropoutAlignRandomEager(InductorTestCase):
     # Helper for primitive random parity (rand / randn / randint)
     # ───────────────────────────────────────────────────────────
     def _run_primitive_random_parity(self, kind, device, shape):
+        # [FUNCTION DOC] HELPER: Compares eager and compiled random primitives. For kind rand,
+        # randn or randint it defines an eager generator function on the device and shape and
+        # compiles it; raises AssertionError for any other kind. Seeds identically, runs both,
+        # and asserts exact equality.
         if kind == "rand":
 
             def eager():
+                # [FUNCTION DOC] HELPER: Returns a uniform random tensor of the given shape on
+                # the device.
                 return torch.rand(shape, device=device)
 
             compiled = torch.compile(eager)
@@ -418,6 +491,8 @@ class TestDropoutAlignRandomEager(InductorTestCase):
         elif kind == "randn":
 
             def eager():
+                # [FUNCTION DOC] HELPER: Returns a standard normal random tensor of the given
+                # shape on the device.
                 return torch.randn(shape, device=device)
 
             compiled = torch.compile(eager)
@@ -425,6 +500,8 @@ class TestDropoutAlignRandomEager(InductorTestCase):
         elif kind == "randint":
 
             def eager():
+                # [FUNCTION DOC] HELPER: Returns random integers in the range from 0 to the
+                # int32 maximum minus one, of the given shape on the device.
                 return torch.randint(0, 2**31 - 1, shape, device=device)
 
             compiled = torch.compile(eager)
@@ -446,6 +523,8 @@ class TestDropoutAlignRandomEager(InductorTestCase):
     @unittest.expectedFailure
     @requires_gpu()
     def test_primitive_rand_parity(self):
+        # [FUNCTION DOC] Expected failure: checks compiled uniform random output equals eager
+        # exactly.
         device = torch.device(GPU_TYPE)
         shape = (BATCH, SEQ_LEN, HIDDEN_DIM)
         self._run_primitive_random_parity("rand", device, shape)
@@ -453,6 +532,8 @@ class TestDropoutAlignRandomEager(InductorTestCase):
     @unittest.expectedFailure
     @requires_gpu()
     def test_primitive_randn_parity(self):
+        # [FUNCTION DOC] Expected failure: checks compiled normal random output equals eager
+        # exactly.
         device = torch.device(GPU_TYPE)
         shape = (BATCH, SEQ_LEN, HIDDEN_DIM)
         self._run_primitive_random_parity("randn", device, shape)
@@ -460,6 +541,8 @@ class TestDropoutAlignRandomEager(InductorTestCase):
     @unittest.expectedFailure
     @requires_gpu()
     def test_primitive_randint_parity(self):
+        # [FUNCTION DOC] Expected failure: checks compiled random integer output equals eager
+        # exactly.
         device = torch.device(GPU_TYPE)
         shape = (BATCH, SEQ_LEN, HIDDEN_DIM)
         self._run_primitive_random_parity("randint", device, shape)
@@ -469,6 +552,8 @@ class TestDropoutAlignRandomEager(InductorTestCase):
     # ───────────────────────────────────────────────────────────
     @requires_gpu()
     def test_primitive_nn_dropout_parity(self):
+        # [FUNCTION DOC] Applies eager and compiled dropout modules (same state) to ones with
+        # identical seeding and requires exact equality of outputs.
         device = torch.device(GPU_TYPE)
         shape = (BATCH, SEQ_LEN, HIDDEN_DIM)
 
@@ -494,6 +579,9 @@ class TestDropoutAlignRandomEager(InductorTestCase):
     # ───────────────────────────────────────────────────────────
     @requires_gpu()
     def test_large_seed(self):
+        # [FUNCTION DOC] For two seeds above 32 bits, compares eager and compiled dropout masks
+        # via the parity helper in a subtest and requires the masks equal. The comment notes the
+        # seed is packed with a base into one 64-bit integer so large seeds can overflow.
         for seed in [2**33 + 1, 2**40 + 12345]:
             with self.subTest(seed=seed):
                 masks_eq, _, _ = dropout_parity((1024,), seed=seed)

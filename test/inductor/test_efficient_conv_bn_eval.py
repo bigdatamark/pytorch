@@ -1,4 +1,9 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests the Inductor FX pass that fuses a convolution (or linear) with an eval-mode
+# batch norm. Defines two test modules (one pair, and several pairs with multiple users), a test
+# template with regression and sweep tests, and copies it into cpu and GPU classes. Import-time
+# side effects: adds the test directory to the path, imports functorch and filelock, and deletes
+# the template so it is not collected itself.
 import copy
 import importlib
 import itertools
@@ -30,6 +35,8 @@ from inductor.test_torchinductor import (  # @manual=fbcode//caffe2/test/inducto
 
 
 class ConvOp(nn.Module):
+    # [CLASS DOC] Single conv-or-linear followed by a batch norm. Attribute
+    # expected_optimization_count of 1 is the number of fusions the pass should perform.
     expected_optimization_count = 1
 
     def __init__(
@@ -42,6 +49,9 @@ class ConvOp(nn.Module):
         device,
         **kwargs,
     ):
+        # [FUNCTION DOC] Builds the conv module with given in/out channels, bias flag and extra
+        # keyword arguments, and the batch norm module over the output channels, both moved to
+        # the device.
         super().__init__()
         self.conv = conv_class(in_channels, out_channels, bias=use_bias, **kwargs).to(
             device
@@ -49,11 +59,15 @@ class ConvOp(nn.Module):
         self.bn = bn_class(out_channels).to(device)
 
     def forward(self, x):
+        # [FUNCTION DOC] Applies the conv then the batch norm.
         x = self.conv(x)
         return self.bn(x)
 
 
 class MultiUserConvOp(nn.Module):
+    # [CLASS DOC] Three conv plus batch norm pairs with differing reuse: one fusable pair, one
+    # where the conv is applied twice so not fusable, and one where the batch norm is applied
+    # twice. Expected fusion count is 3.
     expected_optimization_count = 3
 
     def __init__(
@@ -66,6 +80,8 @@ class MultiUserConvOp(nn.Module):
         device,
         **kwargs,
     ):
+        # [FUNCTION DOC] Builds three conv layers (first maps in to out channels, others out to
+        # out) and three batch norms, all moved to the device.
         super().__init__()
         self.conv1 = conv_class(in_channels, out_channels, bias=use_bias, **kwargs).to(
             device
@@ -81,6 +97,9 @@ class MultiUserConvOp(nn.Module):
         self.bn3 = bn_class(out_channels).to(device)
 
     def forward(self, x):
+        # [FUNCTION DOC] Runs the three pairs in sequence, with the third batch norm applied a
+        # second time and added to its input as a residual; comments mark which pairs are
+        # fusable.
         # this conv-bn pair can use efficient_conv_bn_eval
         x = self.bn1(self.conv1(input=x))
         # this conv-bn pair cannot use efficient_conv_bn_eval feature
@@ -95,11 +114,21 @@ class MultiUserConvOp(nn.Module):
 
 
 class EfficientConvBNEvalTemplate(TestCase):
+    # [CLASS DOC] Test template (not run directly; copied to device-specific classes, which
+    # supply the device attribute, then deleted from the module).
     @tf32_on_and_off(0.003)
     @inductor_config.patch({"efficient_conv_bn_eval_fx_passes": True})
     def test_functional_batch_norm_defaults(self):
+        # [FUNCTION DOC] Regression test: compiles an eval model calling functional batch norm
+        # with only input, mean and variance, with the fusion pass config on, on the device
+        # given by the device attribute (cpu default); only checks it runs. TF32 tolerance
+        # wrapper applied.
         class Model(torch.nn.Module):
+            # [CLASS DOC] Tiny eval-mode module whose forward calls functional batch norm with
+            # default arguments.
             def forward(self, x, mean, var):
+                # [FUNCTION DOC] Calls functional batch norm with input and running statistics
+                # only.
                 return torch.nn.functional.batch_norm(x, mean, var)
 
         mod = Model().eval()
@@ -119,6 +148,10 @@ class EfficientConvBNEvalTemplate(TestCase):
     @tf32_on_and_off(0.003)
     @inductor_config.patch({"efficient_conv_bn_eval_fx_passes": True})
     def test_fx_graph_batch_norm_defaults(self):
+        # [FUNCTION DOC] Regression test for issue 169011: builds an FX graph with a single
+        # batch norm call with three positional arguments, compiles with inductor, and compares
+        # against the uncompiled graph module. Previously failed an assert about eight node
+        # arguments.
         """Regression test for issue #169011.
 
         Tests that torch.compile handles FX graphs containing F.batch_norm
@@ -162,9 +195,19 @@ class EfficientConvBNEvalTemplate(TestCase):
     @inductor_config.patch({"efficient_conv_bn_eval_fx_passes": True})
     @functorch_config.patch({"enable_autograd_cache": False})
     def test_basic(self):
+        # [FUNCTION DOC] Sweeps all combinations of the two test model classes, bias on or off,
+        # linear plus conv and transposed-conv layers of 1 to 3 dimensions with matching batch
+        # norms, sync batch norm on or off, and decomposition on or off, calling the per-case
+        # helper for each. Autograd cache is disabled.
         def test_conv_bn_eval(
             test_class, use_bias, module, sync_bn, decompose_nn_module
         ):
+            # [FUNCTION DOC] HELPER: For one test class, bias flag, module pair, sync-batch-norm
+            # flag and decompose flag: builds the eager model in eval mode, a deep copy to
+            # compile (optionally converting to sync batch norm, optionally traced with make_fx
+            # at pre-dispatch), runs forward, backward and an SGD step on both, compares outputs
+            # both before and after the update, and asserts the efficient_conv_bn_eval counter
+            # grew by the class's expected count.
             from functorch import make_fx
             from torch._dispatch.python import enable_python_dispatcher
 
@@ -269,6 +312,8 @@ class EfficientConvBNEvalTemplate(TestCase):
 if HAS_CPU and not torch.backends.mps.is_available():
 
     class EfficientConvBNEvalCpuTests(TestCase):
+        # [CLASS DOC] CPU instantiation of the template with device set to cpu; created only if
+        # a CPU is available and MPS is not.
         device = "cpu"
 
     copy_tests(EfficientConvBNEvalTemplate, EfficientConvBNEvalCpuTests, "cpu")
@@ -276,6 +321,8 @@ if HAS_CPU and not torch.backends.mps.is_available():
 if HAS_GPU:
 
     class EfficientConvBNEvalGpuTests(TestCase):
+        # [CLASS DOC] GPU instantiation of the template with device set to the GPU type; created
+        # only if a GPU is available.
         device = GPU_TYPE
 
     copy_tests(EfficientConvBNEvalTemplate, EfficientConvBNEvalGpuTests, GPU_TYPE)
