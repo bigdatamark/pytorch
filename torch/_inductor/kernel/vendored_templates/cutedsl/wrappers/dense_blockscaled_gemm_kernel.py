@@ -1,3 +1,7 @@
+# [MODULE DOC] Cutlass API operator wrappers for the vendored SM100 block-scaled dense GEMM kernel.
+# Defines epilogue ABI helpers (tracing, padding, kind classification), the
+# VendoredDenseBlockScaledGemmKernel operator and its EFC subclass. At import time tries to import
+# the kernel implementation; if present, registers both operators with the CuTeDSL provider.
 """Kernel wrapper for dense_blockscaled_gemm_persistent vendored template."""
 
 from __future__ import annotations
@@ -38,6 +42,11 @@ _ONES_ALPHA: dict = {}
 
 @dataclasses.dataclass(frozen=True)
 class _EpilogueABI:
+    # [CLASS DOC] HELPER: Immutable bundle of the epilogue ABI passed to the block-scaled kernel.
+    # Holds up to four extra input tensors (padded with None), their kind codes (0 unused, 1 full
+    # matrix, 2 per-column/row-vector broadcast along M, 3 per-row broadcast along N), up to three
+    # extra output tensors, the total output count, and the index of the primary (D) output.
+    # Built from GEMM arguments by from_args, choosing compile-time or runtime tensor attributes.
     """Runtime tensors and metadata derived from a traced epilogue signature."""
 
     inputs: tuple
@@ -48,6 +57,9 @@ class _EpilogueABI:
 
     @classmethod
     def from_args(cls, args, tensor_attr: str) -> _EpilogueABI:
+        # [FUNCTION DOC] HELPER: Builds an _EpilogueABI from GEMM arguments. tensor_attr selects which
+        # attribute of each epilogue tensor wrapper is used (compile_time_tensor or runtime_tensor).
+        # Raises NotImplementedError (from the helpers) for unsupported input/output counts or shapes.
         outputs, output_count, primary_output = _epilogue_outputs(args, tensor_attr)
         return cls(
             _epilogue_tensors(args, tensor_attr),
@@ -60,6 +72,8 @@ class _EpilogueABI:
 
 @functools.lru_cache(maxsize=256)
 def _epilogue_signature(epilogue_fn) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    # [FUNCTION DOC] HELPER: Traces the epilogue function (cached, up to 256 entries) and returns a
+    # pair (input names without the accumulator named accum, output names). Imports cutlass lazily.
     from cutlass.operators.fusion import trace_in_out
 
     inputs, outputs = trace_in_out(epilogue_fn)
@@ -70,6 +84,10 @@ def _epilogue_signature(epilogue_fn) -> tuple[tuple[str, ...], tuple[str, ...]]:
 
 
 def _epilogue_tensors(args, attr: str) -> tuple:
+    # [FUNCTION DOC] HELPER: Collects the named epilogue input tensors' attribute attr (after padding
+    # the leading dimension to a multiple of 8 via _epilogue_abi_tensor) into a tuple of length four,
+    # filled with None. Returns four Nones when there is no epilogue.
+    # Raises NotImplementedError if more than four inputs are traced.
     epilogue = getattr(args, "epilogue", None)
     tensors = (
         ()
@@ -85,6 +103,10 @@ def _epilogue_tensors(args, attr: str) -> tuple:
 
 
 def _epilogue_abi_tensor(tensor):
+    # [FUNCTION DOC] HELPER: Returns the wrapper unchanged when the runtime tensor's leading dim is
+    # a multiple of 8; otherwise allocates a zero-uninitialized padded copy (leading dim rounded up
+    # to a multiple of 8) on the same device and dtype, copies the data in and returns a new
+    # TensorWrapper around it. Side effect: allocates device memory on every such call.
     runtime_tensor = tensor.runtime_tensor
     leading = runtime_tensor.shape[0]
     if leading % 8 == 0:
@@ -104,6 +126,11 @@ def _epilogue_abi_tensor(tensor):
 
 
 def _epilogue_tensor_kinds(args) -> tuple[int, ...]:
+    # [FUNCTION DOC] HELPER: Classifies each epilogue input as a kind code: 1 full matrix, 2 vector
+    # broadcast along rows (1-D or second-to-last dim 1), 3 column vector (last dim 1). A 1x1 input
+    # is treated as kind 2 if the output has one column, kind 3 if it has one row. Returns a tuple
+    # padded with zeros to length four (all zeros without an epilogue).
+    # Raises NotImplementedError for scalar inputs when the output is larger than 1x1.
     epilogue = getattr(args, "epilogue", None)
     if epilogue is None:
         return (0, 0, 0, 0)
@@ -130,6 +157,11 @@ def _epilogue_tensor_kinds(args) -> tuple[int, ...]:
 
 
 def _epilogue_outputs(args, attr: str) -> tuple[tuple, int, int]:
+    # [FUNCTION DOC] HELPER: Returns (extra output tensors padded with None to length three, total
+    # output count, index of the primary output). The primary output is the one named D if present,
+    # else the first; the remaining outputs' attribute attr are the extras. Without an epilogue
+    # returns three Nones, count 1, primary 0.
+    # Raises NotImplementedError for zero or more than four outputs, or multiple outputs lacking D.
     epilogue = getattr(args, "epilogue", None)
     if epilogue is None:
         return (None, None, None), 1, 0
@@ -148,6 +180,9 @@ def _epilogue_outputs(args, attr: str) -> tuple[tuple, int, int]:
 
 
 def _ones_alpha():
+    # [FUNCTION DOC] HELPER: Returns a cached per-device TensorWrapper of four float32 ones, used as
+    # an identity global-scale alpha so the kernel signature is the same whether or not a scale is
+    # fused. Keyed by the current CUDA device in the module-level cache; allocates on first use.
     """Cached per-device (4,)-ones alpha TensorWrapper (identity global scale).
 
     The kernel always takes an alpha arg so its signature is consistent across
@@ -167,13 +202,19 @@ def _ones_alpha():
 
 
 def _epilogue_op_scope(cute):
+    # [FUNCTION DOC] HELPER: Builds the global namespace used to evaluate a string epilogue function:
+    # a mapping from names erf, exp, gelu, relu, sigmoid, silu and tanh to cute elementwise
+    # implementations (gelu is the erf form, silu is x times sigmoid).
     def relu(x):
+        # [FUNCTION DOC] HELPER: Elementwise max of x and zero.
         return cute.math.max(x, cute.full_like(x, 0.0))
 
     def sigmoid(x):
+        # [FUNCTION DOC] HELPER: Elementwise logistic function.
         return 1.0 / (1.0 + cute.math.exp(-x))
 
     def gelu(x):
+        # [FUNCTION DOC] HELPER: Elementwise exact (erf based) GELU.
         return 0.5 * x * (1.0 + cute.math.erf(x * 0.7071067811865476))
 
     return {
@@ -196,12 +237,20 @@ except ImportError:
 
 
 class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
+    # [CLASS DOC] Cutlass API operator wrapping the vendored SM100 persistent block-scaled dense GEMM
+    # kernel (MXF8/MXF4/NVF4 inputs). Holds the kernel implementation object (impl), scale-factor
+    # vector size, MMA tiler and cluster shape. Provides compile, run and support-check hooks plus
+    # class methods that enumerate valid operand/design metadata and generate operator instances.
     """Wrapper for vendored dense blockscaled GEMM template for SM100 GPUs."""
 
     supported_args_type = GemmArguments
     designed_for_min_cc = 100
 
     def __init__(self, metadata: OperatorMetadata):
+        # [FUNCTION DOC] Initializes from operator metadata: takes the scale-factor vector size from the
+        # last element of A's scale mode, tile (M, N) and cluster (M, N) from the design, and constructs the
+        # vendored kernel implementation. The environment variable TORCHINDUCTOR_NVGEMM_PREFETCH equal to
+        # 1 enables the kernel's prefetch option. Fails if the implementation import was unavailable.
         super().__init__(metadata)
 
         self.sf_vec_size = metadata.operands.A.mode[-1]
@@ -224,6 +273,10 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
 
     @staticmethod
     def _major_modes(args):
+        # [FUNCTION DOC] HELPER: Static. From the strides of A, B and out (arguments or operand metadata),
+        # returns three pairs: A major mode (K-major with tag k, else MN-major tag m), B major mode (K with
+        # tag k, else MN with tag n) and output layout (row-major tag n, else column-major tag m).
+        # The unit-stride position in the last two dims decides each choice.
         """Extract major modes from arguments or operand metadata."""
         import cutlass.utils as utils
         from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
@@ -248,6 +301,13 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
     def _compile(
         self, args: GemmArguments, target_sm: TargetSm | None = None
     ) -> CompiledArtifact:
+        # [FUNCTION DOC] Compiles the kernel for the given arguments and returns a CompiledArtifact.
+        # Uses a fake stream and the maximum active clusters for the cluster shape. Always passes an alpha
+        # tensor (ones when the arguments have none). The epilogue op is identity by default, else the
+        # epilogue function; a string is parsed for its first function definition and executed with the
+        # epilogue scope (side effect: runs arbitrary source text). When local reduction output or
+        # feeds-main is requested, extra reduction arguments (group, axis, type, source, feeds-main flag,
+        # reduction output) are appended to the compile call. target_sm is forwarded.
         import cutlass.cute as cute
 
         stream = cute.runtime.make_fake_stream()
@@ -266,6 +326,7 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
             alpha = _ones_alpha()
 
         def epilogue_op(v):
+            # [FUNCTION DOC] HELPER: Identity epilogue used when the arguments carry no epilogue.
             return v
 
         if getattr(args, "epilogue", None) is not None:
@@ -339,6 +400,11 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
         stream,
         workspace=None,
     ) -> None:
+        # [FUNCTION DOC] Executes a compiled kernel. Converts the stream to a CUDA stream (wrapping a raw
+        # integer handle in an external torch stream), builds the runtime epilogue ABI under that stream,
+        # defaults alpha to ones, and invokes cute_run with A, B, their scale tensors, out, stream, alpha,
+        # epilogue inputs and extra outputs, and the local reduction output tensor (None if absent).
+        # The argument order must stay consistent with _compile. workspace is unused. Returns nothing.
         import torch
 
         stream = to_cuda_stream(stream)
@@ -392,6 +458,12 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
     def _supports(
         self, args: GemmArguments, target_sm: TargetSm | None = None
     ) -> Status:
+        # [FUNCTION DOC] Checks whether the arguments are supported. For local reduction requests validates
+        # that the axis is 0 or 1, the group size is greater than 1 and not above the limit (the tile N
+        # extent for axis 1, else 16), and divides the selected dimension; the reduction output must have
+        # the reduced shape and be contiguous Float32. Then verifies that scale-factor element counts for A
+        # and B match the expected count for their mode and swizzle. Returns Status.fail with a message on
+        # any violation, else Status.success. target_sm is unused.
         # Match the upstream block-scaled operator: validate scale-factor element
         # counts via ScaledOperand.numel_scale for the operand's mode/swizzle,
         # rather than re-inferring the layout (the old _infer_scale_swizzle_impl
@@ -451,6 +523,9 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
 
     @staticmethod
     def _is_valid_dtype_combo(ab_dtype, sf_dtype, sf_vec_size, out_dtype) -> bool:
+        # [FUNCTION DOC] HELPER: Static predicate for allowed (input dtype, scale dtype, scale vector
+        # size, output dtype) combinations: inputs fp4 e2m1 or fp8; vec size 16 or 32; scale e8m0 or
+        # e4m3 (e4m3 only with 16); fp8 inputs need 32; output fp32, fp16, bf16 or fp8.
         """Validate dtype/scale-factor/vec-size combinations.
 
         Matches constraints from the upstream kernel:
@@ -488,6 +563,8 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
 
     @staticmethod
     def _is_valid_layouts(ab_dtype, a_major, b_major) -> bool:
+        # [FUNCTION DOC] HELPER: Static predicate; fp4 inputs require both A and B K-major, other
+        # dtypes accept any layout.
         """Float4E2M1FN (MXF4/NVF4) requires row-major (K-major) A and B."""
         import cutlass
 
@@ -497,6 +574,8 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
 
     @staticmethod
     def _valid_operands(operands: GemmOperandsMetadata, sf_vec_size: int) -> bool:
+        # [FUNCTION DOC] HELPER: Static predicate over operand metadata: A and B dtypes equal, their scale
+        # dtypes equal, float32 accumulator, valid dtype combination, and valid major-mode layouts.
         import cutlass
 
         if operands.A.dtype != operands.B.dtype:
@@ -527,6 +606,10 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
 
     @staticmethod
     def _metadata_operand_combinations() -> Generator[GemmOperandsMetadata, None, None]:
+        # [FUNCTION DOC] HELPER: Static generator yielding operand metadata for every combination of input
+        # dtype, scale dtype, scale mode (1x16, 1x32), output dtype and row/column-major strides of A, B and
+        # out that pass the dtype and layout checks. Divisibility constraints assume 16-byte alignment;
+        # swizzle is fixed at 32x4x4 and accumulator at float32.
         import cutlass
 
         ab_dtypes = [cutlass.Float8E5M2, cutlass.Float8E4M3FN, cutlass.Float4E2M1FN]
@@ -545,9 +628,11 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
         alignment_bytes = 16
 
         def major_str_a(stride):
+            # [FUNCTION DOC] HELPER: Returns k for a row-major A stride, else m.
             return "k" if stride == row_major else "m"
 
         def major_str_b(stride):
+            # [FUNCTION DOC] HELPER: Returns n for a row-major B stride, else k.
             return "n" if stride == row_major else "k"
 
         for ab_dtype, sf_dtype, scale_mode, out_dtype in itertools.product(
@@ -613,6 +698,11 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
 
     @classmethod
     def _valid_metadata(cls, metadata: OperatorMetadata) -> bool:
+        # [FUNCTION DOC] HELPER: Class method deciding whether operator metadata is acceptable: all but
+        # the last scale-mode entries are 1, operands valid, design is an SM100 design, cluster dims
+        # positive powers of two with product at most 16 and each at most 4, tile M in 128/256 and tile N
+        # in 64/128/192/256, 256-wide M requires an even cluster M, and an epilogue is allowed only for
+        # classes whose name contains EFC.
         scale_vec = metadata.operands.A.mode
 
         if len(scale_vec) > 1:
@@ -663,6 +753,11 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
         target_sm: TargetSm | None = None,
         args=None,
     ) -> list[VendoredDenseBlockScaledGemmKernel]:
+        # [FUNCTION DOC] Class method generating operator instances. Returns an empty list if target_sm is
+        # given and not compute capability 100, 101 or 103, or if epilogue_args is given. Otherwise
+        # enumerates operand combinations crossed with tile shapes (M 128/256, N 64/128/192/256) and
+        # cluster shapes (1/2/4 each), builds a descriptive operator name, keeps those that pass
+        # _valid_metadata and metadata_filter (if given), and instantiates cls for each. Logs the count.
         if target_sm is not None and target_sm.cc not in [100, 101, 103]:
             return []
         if epilogue_args is not None:
@@ -735,6 +830,8 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
 
 
 class VendoredDenseBlockScaledGemmEFC(VendoredDenseBlockScaledGemmKernel):
+    # [CLASS DOC] Variant of the block-scaled kernel operator whose name contains EFC, which makes
+    # _valid_metadata accept metadata carrying an epilogue. Adds no state or methods.
     """Block-scaled provider variant using the kernel's unary epilogue hook."""
 
     supported_args_type = GemmArguments

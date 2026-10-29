@@ -1,9 +1,18 @@
+# [MODULE DOC] Geometry helpers shared by NVGEMM reduction kernels written in CuTeDSL.
+# Exports get_lane_warp_layouts (derives lane and warp layouts of an epilogue tiled copy)
+# and partition_for_epilogue (thin forwarder to the vendored quack sm90 helper).
+# No import-time side effects; cutlass and quack are imported lazily inside the functions.
 """CuTeDSL geometry helpers shared by NVGEMM reduction kernels."""
 
 __all__ = ["get_lane_warp_layouts", "partition_for_epilogue"]
 
 
 def get_lane_warp_layouts(tiled_copy, reference_src=True):
+    # [FUNCTION DOC] Computes, for a tiled copy, which lane and which warp owns each (m, n)
+    # element of the epilogue tile. Uses the source thread-value layout when reference_src
+    # is true, otherwise the destination one. Inverts that layout, restricts it to the tile
+    # extent, then composes with a lane-index and a warp-index mapping over the copy's warps.
+    # Returns a pair (lane_layout_mn, warp_layout_mn). Imports cutlass/quack lazily.
     """Derive two-dimensional lane and warp layouts for an epilogue copy."""
     import cutlass.cute as cute
 
@@ -35,6 +44,8 @@ def get_lane_warp_layouts(tiled_copy, reference_src=True):
 
 
 def partition_for_epilogue(*args, **kwargs):
+    # [FUNCTION DOC] HELPER: Lazily imports and forwards all arguments to the quack sm90_utils
+    # partition_for_epilogue function and returns its result unchanged.
     from torch._vendor.quack.sm90_utils import partition_for_epilogue as partition
 
     return partition(*args, **kwargs)

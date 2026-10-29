@@ -1,3 +1,8 @@
+# [MODULE DOC] Vendored NVIDIA CuTeDSL Blackwell (SM100) persistent dense GEMM with a customizable
+# epilogue fusion configuration (EFC), extended with grouped local reduction support for Inductor
+# NVGEMM. Main content is PersistentDenseGemmEFCKernel (host setup, device kernel with warp
+# specialization, TMA, tmem accumulators, epilogue copy helpers, stage and grid computation).
+# Requires the cutlass, cutlass.cute and cuda bindings packages at import time; no other side effects.
 # Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 # ruff: noqa: S101
@@ -289,6 +294,14 @@ Complete Examples
 
 
 class PersistentDenseGemmEFCKernel:
+    # [CLASS DOC] Persistent batched dense GEMM kernel for Blackwell (SM100) with a user supplied
+    # epilogue described through EFC (epilogue fusion configuration). Stores accumulator/epilogue
+    # dtypes, MMA tiler, cluster shape, CTA group choice, the warp-role ids (epilogue warps 0-3, MMA
+    # warp 4, TMA load warp 5, epilogue-load warp 6), barrier ids and shared memory capacity, plus the
+    # EFC object. Key methods: __init__, _setup_attributes (derive shapes, stages, layouts),
+    # __call__ (host side jit setup and launch), kernel (device code), the epilogue copy/partition
+    # helpers, compute_stages, _compute_grid, compute_num_tmem_alloc_cols. Also supports grouped local
+    # reductions over the output tile (reduction group/axis/type/source) used by NVGEMM.
     """Base class for batched GEMM with custom epilogue fusion using EFC.
 
     This class provides the core infrastructure for persistent batched GEMM operations
@@ -352,6 +365,10 @@ class PersistentDenseGemmEFCKernel:
         cluster_shape_mn: tuple[int, int],
         epilogue_function_configuration: typing.Callable,
     ):
+        # [FUNCTION DOC] Records configuration only; no GPU work. Stores dtypes, 2-CTA flag, cluster
+        # shape and MMA tiler (K added later), selects CTA group two or one, sets warp role ids, thread
+        # count (seven warps' worth, 32 threads each), named barrier ids and the architecture's shared
+        # memory capacity, and builds the EFC helper from the epilogue function configuration.
         """Initializes the configuration for a Blackwell dense GEMM kernel with EFC.
 
         This configuration includes several key aspects:
@@ -429,6 +446,8 @@ class PersistentDenseGemmEFCKernel:
         self.efc = common_efc.EFC(self, epilogue_function_configuration)
 
     def _create_tiled_mma(self):
+        # [FUNCTION DOC] HELPER: Builds the tiled MMA for the A/B dtypes, major modes, accumulator dtype,
+        # CTA group and first two MMA tiler dims, using shared memory as the A operand source.
         """Make a tiled MMA atom with given data type, leading dimension, CTA
         group and MMA tile shape. Use SMEM operand source for A.
         """
@@ -443,6 +462,12 @@ class PersistentDenseGemmEFCKernel:
         )
 
     def _setup_attributes(self):
+        # [FUNCTION DOC] HELPER: Derives all input-dependent configuration and stores it on self: the tiled
+        # MMA, MMA tiler K (instruction K times four), CTA tile shape (halved in M for 2-CTA), cluster
+        # layout and A/B multicast counts and flags, epilogue subtile, local-reduction cross-warp flag and
+        # shared memory row/column/byte sizing, pipeline stage counts (compute_stages), staged A/B shared
+        # memory layouts, the EFC shared memory layouts and tensor memory column count.
+        # Emits debug logs of each value.
         """Set up configurations that are dependent on GEMM inputs
 
         This method configures various attributes based on the input tensor properties
@@ -587,6 +612,13 @@ class PersistentDenseGemmEFCKernel:
         local_reduce_finalize: cutlass.Constexpr,
         *supplemental_parameters,
     ):
+        # [FUNCTION DOC] Host-side jit entry point. Steps: add a leading batch mode to inputs, set up
+        # attributes, build TMA load/store atoms and tensors, compute the grid, define shared storage,
+        # launch the kernel on the stream. a and b are GEMM inputs, max_active_clusters bounds the
+        # persistent grid, local_reduce_* arguments configure optional grouped reductions and feeds, and
+        # supplemental_parameters are epilogue tensors and scalars.
+        # Raises TypeError for dtypes incompatible with the MMA instruction and an assertion error for
+        # out-of-bounds tiles when TMA store is disabled.
         """Execute the GEMM operation in steps:
         - Setup static attributes before smem/grid/tma computation
         - Setup TMA load/store atoms and tensors
@@ -609,6 +641,8 @@ class PersistentDenseGemmEFCKernel:
         """
 
         def add_batch_mode(tensor: cute.Tensor) -> cute.Tensor:
+            # [FUNCTION DOC] HELPER: Returns a view of the tensor with a size-1 batch mode prepended so
+            # its rank is three.
             return cute.make_tensor(
                 tensor.iterator,
                 cute.prepend(tensor.layout, cute.make_layout(1), up_to_rank=3),
@@ -907,6 +941,21 @@ class PersistentDenseGemmEFCKernel:
         local_reduce_secondary_feed_tensor: cute.Tensor,
         supplemental_parameters: tuple,
     ):
+        # [FUNCTION DOC] Device kernel (warp specialized, persistent). Unpacks EFC parameters, prefetches TMA
+        # descriptors, allocates shared storage (A/B/C/accumulator mbarriers, tmem holder, staged A and B,
+        # and a float32 scratch for cross-warp local reductions) and creates the A/B, accumulator and
+        # epilogue-load pipelines. Then each warp role loops over tiles from a static persistent scheduler:
+        # TMA warp loads A/B k-tiles into staged smem; MMA warp (leader CTA) accumulates into tensor memory
+        # per tile and commits the accumulator stage; epilogue warps wait for the accumulator, copy tmem
+        # subtiles to registers, optionally compute grouped local reductions along M (axis 0, via warp
+        # shuffles and smem) or along N (axis 1, within or across epilogue subtiles), write reduction
+        # outputs and optional feed tensors (global stores with bounds checks), apply the reduction result
+        # back to the accumulator when it feeds the main output, run the EFC epilogue computation, stage
+        # written tensors in smem and TMA-store them; the epilogue-load warp loads the EFC input subtiles.
+        # Finally tensor memory is freed and the store pipeline drained. Returns nothing.
+        # Asserts that reduction type/source and group sizes are supported.
+        # KNOWN ISSUE: the axis-0 branch rebinds warp_idx from the thread index; it equals the original
+        # value for epilogue warps, so the later store-warp check still works.
         """GPU device kernel performing the Persistent batched GEMM computation."""
         # Process the variadic parameters.
         self.efc.kernel.unpack_parameters(supplemental_parameters)
@@ -947,6 +996,10 @@ class PersistentDenseGemmEFCKernel:
         # Define shared storage for kernel
         @cute.struct
         class SharedStorage:
+            # [CLASS DOC] HELPER: Shared memory struct declared inside the kernel. Fields: mbarrier ranges for
+            # A/B full/empty, accumulator full/empty and C (epilogue load) full/empty stages, a tmem dealloc
+            # mbarrier, a tmem pointer holder, 1024-byte aligned staged A and B buffers, and a 16-byte aligned
+            # float32 local-reduction scratch (one element unless cross-warp reduction is enabled).
             ab_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage]
             ab_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage]
             acc_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage]
@@ -2383,6 +2436,10 @@ class PersistentDenseGemmEFCKernel:
         tCgC: cute.Tensor,
         epi_tile: cute.Tile,
     ) -> tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
+        # [FUNCTION DOC] Builds the tensor-memory-to-register tiled copy for the epilogue and partitions
+        # tensors. Takes the epilogue thread index, the tmem accumulator tensor, the reference output
+        # (global) tensor and the epilogue tile. Returns (tiled copy, partitioned tmem accumulator with
+        # stage mode, register tensor sized for one subtile in the accumulator dtype).
         """Make tiledCopy for tensor memory load, then use it to partition tensor memory (source) and register array (destination)."""
         # Make tiledCopy for tensor memory load
         copy_atom_t2r = sm100_utils.get_tmem_load_op(
@@ -2426,6 +2483,11 @@ class PersistentDenseGemmEFCKernel:
         tidx: cutlass.Int32,
         sC: cute.Tensor,
     ) -> tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
+        # [FUNCTION DOC] Builds a shared-memory-to-register tiled copy matching the t2r copy layout.
+        # Returns (tiled s2r copy, register tensor retiled to it, shared memory tensor partitioned as
+        # destination layout). tTR_rC is the register tensor to retile, tidx the epilogue thread index.
+        # KNOWN ISSUE: the partition of sC uses the destination partitioning call although the docstring
+        # and name call it the source; apparently unused by this file's kernel.
         """Make tiledCopy for shared memory load, then use it to partition register array (destination) and shared memory (source).
 
         :param tiled_copy_t2r: The tiled copy operation for tmem to register copy(t2r)
@@ -2461,6 +2523,11 @@ class PersistentDenseGemmEFCKernel:
         sC: cute.Tensor,
         dtype: type[cutlass.Numeric],
     ) -> tuple[cute.CopyAtom, cute.Tensor, cute.Tensor]:
+        # [FUNCTION DOC] Partitions shared memory and global memory tensors for a TMA store. atom is the
+        # TMA copy atom, gC_mnl the global tensor, sC the staged smem tensor. Returns (atom, smem
+        # partition, global partition).
+        # KNOWN ISSUE: the docstring describes a non-TMA path and a documented dtype parameter; the code
+        # only implements the TMA path, ignores tidx and dtype, and returns no register tensor.
         """Make tiledCopy for global memory store, then use it to:
         - partition register array (source) and global memory (destination) for non-TMA store version;
         - partition shared memory (source) and global memory (destination) for TMA store version.
@@ -2507,6 +2574,10 @@ class PersistentDenseGemmEFCKernel:
         return tma_atom_c, bSG_sC, bSG_gC
 
     def compute_stages(self) -> None:
+        # [FUNCTION DOC] Sets num_acc_stage, num_c_stage and num_d_stage to 2 each, asks the EFC for its
+        # smem contribution, then chooses num_ab_stage as the number of A+B stages fitting in smem after
+        # reserving 2048 bytes plus reduction scratch and the C and D bytes. Remaining smem is added to
+        # num_d_stage. Raises MemoryError if no A/B stage fits. Logs the results.
         """Compute and set the number of stages for A/B/C/D operands.
 
         Uses instance attributes to compute and assign:
@@ -2570,6 +2641,9 @@ class PersistentDenseGemmEFCKernel:
         cluster_shape_mn: tuple[int, int],
         max_active_clusters: cutlass.Constexpr,
     ) -> tuple[utils.PersistentTileSchedulerParams, tuple[int, int, int]]:
+        # [FUNCTION DOC] Static. Divides output tensor d by the CTA tile (M, N) to get the CTA counts, builds
+        # persistent tile scheduler params with the cluster shape (L cluster dim 1) and derives the launch
+        # grid for the given maximum active clusters. Returns (scheduler params, grid). Debug printing only.
         """Use persistent tile scheduler to compute the grid size for the output tensor D.
 
         :param d: The output tensor D
@@ -2605,6 +2679,9 @@ class PersistentDenseGemmEFCKernel:
         return tile_sched_params, grid
 
     def compute_num_tmem_alloc_cols(self) -> None:
+        # [FUNCTION DOC] Computes the number of tensor memory columns needed for the staged accumulator
+        # via the cutlass utils helper (from a fake accumulator fragment with the stage mode appended)
+        # and stores it in num_tmem_alloc_cols. Logs the value.
         """Compute and set the number of tensor memory allocation columns.
 
         This method uses the instance attributes computed during setup to
