@@ -1,5 +1,14 @@
 # Owner(s): ["module: inductor"]
 
+# [MODULE DOC] Tests that torch.compile of optimizer steps (all optimizers in the shared
+# optimizer database that have a known kernel count) matches eager results and generates the
+# expected number of inductor kernels, with and without learning-rate schedulers, tensor learning
+# rates and closures. Also holds recompile tests, foreach codegen tests, a foreach_map Adam test,
+# and bitwise-equality tests that run with eager-numerics configs. At import time it builds a
+# database of generated test configurations, attaches generated test methods to
+# CompiledOptimizerTests (including bitwise variants for GPU capturable cases), instantiates
+# device-type tests for the parity class, and tries to import check helpers from
+# test_torchinductor, exiting quietly on skip or import errors when run as a script.
 import random
 import sys
 import types
@@ -75,6 +84,10 @@ from torch.testing._internal.triton_utils import requires_gpu, requires_gpu_and_
 
 
 def get_inputs(optim):
+    # [FUNCTION DOC] HELPER: Walks the optimizer parameter groups and collects, per parameter,
+    # the step counter, the parameter, and the exp_avg and exp_avg_sq state tensors. Gradients
+    # are gathered into a local list but not returned. Returns the four lists (steps, params,
+    # exp_avgs, exp_avg_sqs). Raises KeyError if the optimizer state lacks those entries.
     steps = []
     params = []
     grads = []
@@ -93,10 +106,17 @@ def get_inputs(optim):
 
 
 def update_exp_avg_sq(exp_avg_sq, grad, beta2):
+    # [FUNCTION DOC] HELPER: Returns a new tensor equal to the second-moment average scaled by
+    # beta2 plus the squared gradient scaled by one minus beta2 (Adam second moment update). Does
+    # not mutate inputs.
     return exp_avg_sq.mul(beta2).addcmul(grad, grad, value=1 - beta2)
 
 
 def update_param(param, step, exp_avg, exp_avg_sq, beta1, beta2, lr, eps):
+    # [FUNCTION DOC] HELPER: Computes the Adam-style updated parameter from step, first and
+    # second moment tensors, beta1, beta2, lr and eps: bias corrections from the step, a negative
+    # step size, and a denominator built from the square root of the second moment. Returns the
+    # new parameter tensor without mutating inputs.
     bias_correction1 = 1 - torch.pow(beta1, step)
     bias_correction2 = (1 - torch.pow(beta2, step)).sqrt()
     step_size = (lr / bias_correction1).neg()
@@ -115,6 +135,13 @@ def foreach_map_adam(
     lr=1e-3,
     eps=1e-8,
 ):
+    # [FUNCTION DOC] HELPER: Adam step written with the foreach_map higher-order op, under
+    # no_grad. Takes lists of steps, params, exp_avgs, exp_avg_sqs and hyperparameters.
+    # Increments the steps through a mapped add and copies them back in place, computes updated
+    # first and second moments and the updated params with one mapped call each (the op cannot
+    # return several outputs), then copies the results into the moment and param lists in place.
+    # The mapped add for weight decay (when non-zero) has its result discarded, so it has no
+    # effect on the update. Returns None.
     with torch.no_grad():
         grads = [param.grad for param in params]
         # update step
@@ -172,6 +199,11 @@ LR_SCHEDULER_TO_KWARGS = {
 
 
 def create_scheduler(scheduler, optim):
+    # [FUNCTION DOC] HELPER: Builds a learning-rate scheduler of the given class for the
+    # optimizer from a deep copy of the stored default kwargs. If the kwargs list sub-schedulers,
+    # they are replaced by two ConstantLR and one LambdaLR schedulers made recursively.
+    # ChainedScheduler is constructed from kwargs only; every other class receives the optimizer
+    # first. Does not mutate the shared kwargs mapping.
     kwargs = deepcopy(LR_SCHEDULER_TO_KWARGS[scheduler])
     if "schedulers" in kwargs:
         kwargs["schedulers"] = [
@@ -186,6 +218,8 @@ def create_scheduler(scheduler, optim):
 
 
 class KernelCounts(NamedTuple):
+    # [CLASS DOC] Named tuple holding the expected generated kernel counts for one optimizer
+    # class: one for the multi-tensor (foreach) path and one for the single-tensor path.
     multitensor: int
     singletensor: int
 
@@ -284,6 +318,16 @@ KERNEL_COUNTS = {
 
 
 def build_opt_kwarg_db():
+    # [FUNCTION DOC] HELPER: Builds the list of generated test configurations. For every
+    # optimizer database entry whose class has a known kernel count, for the cpu device and the
+    # GPU device, and for each optimizer input set (skipping differentiable and fused variants),
+    # it derives a test name from the class name, the non-default kwargs, tensor lr or betas
+    # markers and the device, adds the device and a kernel count (an override by name, else the
+    # multi-tensor count when foreach is on and the device is the GPU, else the single-tensor
+    # count), and drops entries with no kernel count or with fused set. Entries with a tensor lr
+    # are repeated for every scheduler class with the scheduler name appended; others use no
+    # scheduler. Returns a list of tuples of optimizer class, test name, kwargs and scheduler
+    # class.
     compiled_opt_db = []
     for optim_info in optim_db:
         if optim_info.optim_cls not in KERNEL_COUNTS:
@@ -363,6 +407,8 @@ except (unittest.SkipTest, ImportError) as e:
 
 
 def call_scheduler(scheduler):
+    # [FUNCTION DOC] HELPER: Advances a scheduler by one step; ReduceLROnPlateau needs a metric
+    # so it is stepped with a constant value, others are stepped with no arguments.
     if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
         scheduler.step(1.0)  # we won't reduce the metric over two iters anyway
     else:
@@ -370,6 +416,12 @@ def call_scheduler(scheduler):
 
 
 def compile_opt(opt_compiled, closure=None, fullgraph=True):
+    # [FUNCTION DOC] HELPER: Prepares an optimizer for compiled stepping. Applies the dynamo
+    # torch patcher, unwraps the step method twice to skip the differentiable-grad wrapper
+    # (avoiding a graph break), marks the optimizer as already called to silence scheduler
+    # warnings, and returns an inductor-compiled zero-argument function that calls the raw step
+    # (with the closure when given). Fullgraph mode is controlled by the argument. Mutates the
+    # optimizer's called flag and global patch state.
     # run the patcher so that step has the expected structure
     torch._dynamo.eval_frame.TorchPatcher.patch()
 
@@ -387,11 +439,14 @@ def compile_opt(opt_compiled, closure=None, fullgraph=True):
     if closure is not None:
 
         def fn():
+            # [FUNCTION DOC] HELPER: calls the unwrapped step function with the optimizer and the
+            # closure.
             step_fn(opt_compiled, closure)
 
     else:
 
         def fn():
+            # [FUNCTION DOC] HELPER: calls the unwrapped step function with the optimizer only.
             step_fn(opt_compiled)
 
     return torch.compile(fn, backend="inductor", fullgraph=fullgraph)
@@ -407,6 +462,11 @@ def check_optim(
     atol=None,
     rtol=None,
 ):
+    # [FUNCTION DOC] HELPER: Asserts the eager and compiled parameter lists are equal and that
+    # the per-parameter optimizer state matches, using the test case's assertEqual (self is the
+    # test case, not a method receiver). Uses looser tolerances for Adadelta and NAdam. KNOWN
+    # ISSUE: the atol and rtol arguments are overwritten with None at the start, so caller-
+    # supplied tolerances are ignored.
     params_eager = list(params_eager)
     params_compiled = list(params_compiled)
     # Note on tolerances:
@@ -448,8 +508,20 @@ def make_test(
     device=GPU_TYPE,
     **kwargs,
 ):
+    # [FUNCTION DOC] HELPER: Factory returning a test function for one optimizer configuration.
+    # The returned test (config patched for a low fusion memory threshold, and wrapped to require
+    # a GPU when the device is the GPU) is described in its own block. Arguments: optimizer
+    # class, optional closure, optional scheduler class, expected kernel count (an int or a
+    # checker function), device and optimizer kwargs.
     @config.patch("score_fusion_memory_threshold", 1)
     def test_fn(self):
+        # [FUNCTION DOC] HELPER: Generated test body. Optionally enables cudagraphs (cuda device,
+        # not Adagrad or SGD), moves tensor lr and betas to the device, builds two identical two-
+        # layer models with gradients, an eager and a compiled optimizer (plus schedulers whose
+        # last epoch is forced to one), runs two steps of each under no_grad, compares results
+        # with check_optim, verifies cudagraphs ran if enabled, and checks the generated kernel
+        # count (exact match, or via the checker function) when the class flag allows it. Resets
+        # dynamo and inductor metrics first and closes its context stack at the end.
         stack = ExitStack()
         try:
             # https://github.com/pytorch/pytorch/issues/118715 for capturable Adagrad support
@@ -536,9 +608,17 @@ def make_test(
 
 
 def make_recompile_test(optim_cls, closure=None, kernel_count=2, **kwargs):
+    # [FUNCTION DOC] HELPER: Factory returning a GPU-only test function that checks recompilation
+    # behavior of an optimizer step. Arguments: optimizer class, optional closure (unused),
+    # expected kernel count (may be None) and optimizer kwargs.
     @config.patch("score_fusion_memory_threshold", 1)
     @requires_gpu
     def test_fn(self):
+        # [FUNCTION DOC] HELPER: Generated test body. Compiles the step, runs four steps
+        # expecting no recompile, then perturbs state (change lr for SGD, replace the Adagrad sum
+        # tensor, replace the Adam exp_avg tensor, else clear all state) and steps again to force
+        # a recompile. If kernel counting is on and a count is given, asserts the generated
+        # kernel count equals twice the count.
         torch._dynamo.reset()
         torch._inductor.metrics.reset()
         input = torch.ones([10, 10], device=GPU_TYPE)
@@ -594,11 +674,21 @@ def make_recompile_test(optim_cls, closure=None, kernel_count=2, **kwargs):
 
 
 class CompiledOptimizerParityTests(TestCase):
+    # [CLASS DOC] Test case that compares compiled and eager optimizer behavior across the
+    # optimizer database. Its device-generic test is instantiated per device (excluding cpu) by
+    # the module-level instantiation call.
     @skipCUDAIf(not has_triton(), "torch.compile with cuda requires triton")
     @skipXPUIf(not has_triton(), "torch.compile with xpu requires triton")
     @optims(optim_db, dtypes=[torch.float32])
     @parametrize("use_closure", [True, False])
     def test_correctness(self, device, dtype, optim_info, use_closure):
+        # [FUNCTION DOC] Device-generic test: for each optimizer in the database (float32), with
+        # and without a closure, builds identical eager and compiled models and optimizers for
+        # every optimizer input set (skipping differentiable), and for each scheduler class when
+        # the lr is a tensor. Seeds all RNGs, converts gradients to sparse for SparseAdam, runs
+        # two eager steps and two compiled steps, and compares params and state with check_optim.
+        # Returns early when the optimizer requires a closure but none is used. Skipped without
+        # triton.
         torch.get_device_module(device).manual_seed_all(0)
         torch.manual_seed(0)
         random.seed(0)
@@ -654,7 +744,13 @@ class CompiledOptimizerParityTests(TestCase):
 
                     @torch.compile()
                     def fn():
+                        # [FUNCTION DOC] HELPER: Compiled function that defines a closure computing
+                        # the loss, backpropagating (and sparsifying grads if required), steps the
+                        # compiled optimizer with it and then advances the scheduler if any.
                         def closure():
+                            # [FUNCTION DOC] HELPER: Closure for the compiled optimizer: forward,
+                            # sum, backward on the compiled model; converts grads to sparse
+                            # when the optimizer only supports sparse grads; returns the loss.
                             loss = model_compiled(input).sum()
                             loss.backward()
                             if optim_info.only_supports_sparse_grads:
@@ -667,6 +763,9 @@ class CompiledOptimizerParityTests(TestCase):
                             call_scheduler(scheduler_compiled)
 
                     def closure_eager():
+                        # [FUNCTION DOC] HELPER: Closure for the eager optimizer: forward, sum and
+                        # backward on the eager model, converting grads to sparse when needed,
+                        # returning the loss.
                         loss = model_eager(input).sum()
                         loss.backward()
                         if optim_info.only_supports_sparse_grads:
@@ -683,6 +782,8 @@ class CompiledOptimizerParityTests(TestCase):
 
                     @torch.compile()
                     def fn():
+                        # [FUNCTION DOC] HELPER: Compiled function that steps the compiled
+                        # optimizer and then the scheduler if any.
                         opt_compiled.step()
                         if scheduler_cls:
                             call_scheduler(scheduler_compiled)
@@ -706,27 +807,37 @@ class CompiledOptimizerParityTests(TestCase):
 
 
 class CompiledOptimizerTests(TestCase):
+    # [CLASS DOC] Test case holding generated per-optimizer compile tests (attached after class
+    # creation by module-level loops) plus handwritten tests. Class attributes alias the model-
+    # check helpers and a flag that enables kernel count assertions. Setup and teardown reset
+    # dynamo and inductor metrics.
     check_model_gpu = check_model_gpu
     check_model_cpu = check_model
     check_kernel_count = True
 
     def setUp(self):
+        # [FUNCTION DOC] Runs the base setup, then resets dynamo and inductor metrics.
         super().setUp()
         torch._dynamo.reset()
         torch._inductor.metrics.reset()
 
     def tearDown(self):
+        # [FUNCTION DOC] Runs the base teardown, then resets dynamo and inductor metrics.
         super().tearDown()
         torch._dynamo.reset()
         torch._inductor.metrics.reset()
 
     def check_cudagraphs_ran(self):
+        # [FUNCTION DOC] HELPER: Asserts that cudagraph trees ran for device zero: the tree
+        # manager exists and asking it for a new graph id yields one.
         # We run the zeroth device currently
         manager = torch._inductor.cudagraph_trees.get_container(0).tree_manager
         self.assertIsNotNone(manager)
         self.assertEqual(manager.new_graph_id().id, 1)
 
     def test_create_scheduler_does_not_mutate_kwargs(self):
+        # [FUNCTION DOC] Checks that creating ChainedScheduler and SequentialLR schedulers does
+        # not modify the shared default kwargs mapping.
         for scheduler_cls in (ChainedScheduler, SequentialLR):
             expected_kwargs = deepcopy(LR_SCHEDULER_TO_KWARGS[scheduler_cls])
             model = torch.nn.Linear(1, 1)
@@ -759,12 +870,19 @@ class CompiledOptimizerTests(TestCase):
     @skipIfWindows
     @requires_gpu
     def test_static_address_finalizer(self):
+        # [FUNCTION DOC] Skipped on Windows and without a GPU. Checks that compiling an Adam step
+        # does not keep a parameter alive: the garbage collector is disabled, a parameter
+        # reference is taken inside a nested function, and after that function returns the weak
+        # reference must be dead. Re-enables gc at the end.
         import gc
 
         gc.disable()
         p_ref = None
 
         def fn():
+            # [FUNCTION DOC] HELPER: Builds a linear module with gradients, an Adam optimizer,
+            # compiles a step function under no_grad and runs it, then stores a weak reference to
+            # the last parameter in the enclosing scope and checks it is still alive.
             nonlocal p_ref
             mod = torch.nn.Linear(10, 10, device=GPU_TYPE, bias=False)
             for p in mod.parameters():
@@ -773,6 +891,7 @@ class CompiledOptimizerTests(TestCase):
             opt = torch.optim.Adam(mod.parameters(), lr=0.1)
 
             def fn():
+                # [FUNCTION DOC] HELPER: Runs one optimizer step.
                 opt.step()
 
             with torch.set_grad_enabled(False):
@@ -787,7 +906,13 @@ class CompiledOptimizerTests(TestCase):
         gc.enable()
 
     def test_guard_on_none_grads(self):
+        # [FUNCTION DOC] Checks guards on None gradients with the eager backend: a training loop
+        # with Adam where gradients are set to None on one iteration (so step does nothing) must
+        # give the same list of recorded step values compiled and uncompiled.
         def training_loop():
+            # [FUNCTION DOC] HELPER: Runs six iterations of zero grad, optional forward and
+            # backward (skipped on iteration three), and Adam step on a small network, recording
+            # the first parameter's step state each time. Returns the list.
             input = torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5, 0.6]).reshape(3, 2)
 
             model = torch.nn.Sequential(
@@ -822,6 +947,9 @@ class CompiledOptimizerTests(TestCase):
     # Basic shampoo test to verify we support compiling the various ops without error
     @requires_gpu
     def test_basic_shampoo(self):
+        # [FUNCTION DOC] Smoke test (GPU) that a simplified Shampoo-style update built from
+        # foreach ops compiles and gives the same result as eager on transposed slices of a
+        # buffer with random gradients.
         param_buf = torch.rand((1024, 128))
         param_buf_c = param_buf.detach().clone()
 
@@ -836,6 +964,10 @@ class CompiledOptimizerTests(TestCase):
         # we also don't compile it regardless
         @torch.no_grad()
         def shampoo_functional_basic(params):
+            # [FUNCTION DOC] HELPER: Functional Shampoo-like step under no_grad: weight decay,
+            # preconditioner update, momentum, bias corrections, preconditioning, a decay term
+            # and the parameter update, all with foreach ops, mutating the given params. Returns
+            # params, preconditioners and grads.
             step = 1
             weight_decay = 0.1
             grads = [p.grad for p in params]
@@ -891,16 +1023,23 @@ class CompiledOptimizerTests(TestCase):
 
     @requires_gpu
     def test_closure_graph_break(self):
+        # [FUNCTION DOC] Checks (GPU) that a closure which sets gradients causes a graph break
+        # but still yields the same parameter as eager when an AdamW step is run through a
+        # function compiled with the eager backend.
         param = torch.rand(
             2, 3, dtype=torch.float32, device=GPU_TYPE, requires_grad=True
         )
         param_c = param.detach().clone().requires_grad_(True)
 
         def closure():
+            # [FUNCTION DOC] HELPER: Sets the gradient of the first parameter to twos and returns
+            # it.
             param.grad = torch.ones_like(param) * 2
             return param.grad
 
         def closure_c():
+            # [FUNCTION DOC] HELPER: Sets the gradient of the cloned parameter to twos and
+            # returns it.
             param_c.grad = torch.ones_like(param_c) * 2
             return param_c.grad
 
@@ -908,6 +1047,7 @@ class CompiledOptimizerTests(TestCase):
         optimizer_c = torch.optim.AdamW([param_c])
 
         def loop(opt, c):
+            # [FUNCTION DOC] HELPER: Calls the optimizer step with the closure.
             opt.step(c)
 
         compiled_loop = torch.compile(loop, backend="eager")
@@ -918,6 +1058,8 @@ class CompiledOptimizerTests(TestCase):
         self.assertEqual(param, param_c)
 
     def test_get_value_on_static_address(self):
+        # [FUNCTION DOC] Checks that the optimizer _get_value helper compiles on a tensor marked
+        # as a static address (with guard) and returns an equal tensor.
         from torch._dynamo.decorators import mark_static_address
         from torch.optim.optimizer import _get_value
 
@@ -934,6 +1076,8 @@ class CompiledOptimizerTests(TestCase):
     # that the time taken is within an expected range
     @requires_gpu
     def test_compile_time_smoketest(self):
+        # [FUNCTION DOC] Smoke test (GPU): compiles a foreach add of two hundred small tensors
+        # and asserts the wall time of the first call is under ninety seconds.
         import time
 
         xs = [torch.ones(2, 2, device=GPU_TYPE) for _ in range(100)]
@@ -941,6 +1085,7 @@ class CompiledOptimizerTests(TestCase):
 
         @torch.compile
         def fn(xs, ys):
+            # [FUNCTION DOC] HELPER: Returns the foreach add of two tensor lists.
             return torch._foreach_add(xs, ys)
 
         start = time.perf_counter()
@@ -952,9 +1097,16 @@ class CompiledOptimizerTests(TestCase):
     @requires_gpu_and_triton
     @skipIfRocm(msg="ROCm Triton compile time regresses on joined foreach bodies")
     def test_foreach_shared_body_codegen(self):
+        # [FUNCTION DOC] Checks triton code generation for a mixed-size foreach add (GPU, triton,
+        # not ROCm). For two size sets, with a fresh cache and mixed-size combo kernels enabled,
+        # the compiled result must match eager and generate exactly one foreach kernel with two
+        # loads and one store, with a shared pointer variable assigned from both the first and
+        # third input pointers, and with the last load of it appearing after the last branch
+        # condition for that size set.
         from torch._inductor.utils import fresh_cache, run_and_get_code
 
         def fn(xs, ys):
+            # [FUNCTION DOC] HELPER: Returns the foreach add of two tensor lists.
             return torch._foreach_add(xs, ys)
 
         for sizes, last_branch in (
@@ -990,9 +1142,16 @@ class CompiledOptimizerTests(TestCase):
 
     @requires_gpu_and_triton
     def test_foreach_optimizer_shared_body_correctness(self):
+        # [FUNCTION DOC] Checks correctness of a compiled momentum-style foreach update on three
+        # tensors of different sizes (GPU, triton): params and momentum match the eager
+        # reference, and the generated foreach kernels use the shared argument variable except on
+        # ROCm, where none may.
         from torch._inductor.utils import fresh_cache, run_and_get_code
 
         def opt_step(params, grads, momentum):
+            # [FUNCTION DOC] HELPER: Scales momentum by 0.9, adds gradients scaled by 0.1, then
+            # adds momentum scaled by minus 0.01 to params, all in place with foreach ops.
+            # Returns params and momentum.
             torch._foreach_mul_(momentum, 0.9)
             torch._foreach_add_(momentum, grads, alpha=0.1)
             torch._foreach_add_(params, momentum, alpha=-0.01)
@@ -1020,6 +1179,9 @@ class CompiledOptimizerTests(TestCase):
 
     @requires_gpu_and_triton
     def test_S429861(self):
+        # [FUNCTION DOC] Only checks that a function from an external repro module compiles
+        # without error using inputs parsed from its saved graph, under a fresh cache (GPU,
+        # triton). Imports the repro module relatively or absolutely.
         # Just verify we can compile this function without error
         try:
             from . import s429861_repro
@@ -1039,6 +1201,10 @@ class CompiledOptimizerTests(TestCase):
 
     @requires_gpu_and_triton
     def test_foreach_map_adam(self):
+        # [FUNCTION DOC] Checks (GPU, triton) that an Adam step expressed with the foreach_map
+        # helper, compiled, produces the same parameters as the real capturable foreach Adam
+        # optimizer after a warm-up step, and that exactly two kernels are generated. Uses ten
+        # large parameters with random gradients.
         params = [
             torch.rand(
                 1000, 1000, dtype=torch.float32, device=GPU_TYPE, requires_grad=True
@@ -1064,9 +1230,13 @@ class CompiledOptimizerTests(TestCase):
 
         @torch.compile()
         def foreach_map_adam_step():
+            # [FUNCTION DOC] HELPER: Compiled function that runs the foreach_map Adam step on the
+            # captured state lists.
             foreach_map_adam(*inps)
 
         def loop():
+            # [FUNCTION DOC] HELPER: Runs the compiled foreach_map step and then the reference
+            # optimizer step.
             foreach_map_adam_step()
             optimizer_ref.step()
 
@@ -1081,6 +1251,9 @@ class CompiledOptimizerTests(TestCase):
 @skipIfRocm(msg="ROCm may have different numerical behavior")
 @requires_gpu_and_triton
 class CompiledOptimizerBitwiseTests(TestCase):
+    # [CLASS DOC] Test case (skipped on ROCm, needs GPU and triton) asserting compiled optimizer
+    # results are bitwise identical to eager when precision-related config options are enabled. A
+    # static helper does the comparison; generated tests are attached at module level.
     """
     Tests that compiled optimizers produce bitwise identical results to eager
     when precision configs are enabled.
@@ -1103,6 +1276,9 @@ class CompiledOptimizerBitwiseTests(TestCase):
         }
     )
     def test_foreach_lerp_scalar_high_weight_bitwise(self):
+        # [FUNCTION DOC] Checks (with the precision configs on) that compiled foreach lerp with a
+        # scalar weight is bitwise equal (zero tolerance) to eager for several weights and dtype
+        # pairs, including mixed float32 and float64 and half precision.
         cases = [
             (0.9, (torch.float32, torch.float32)),
             (0.1, (torch.float32, torch.float32)),
@@ -1115,6 +1291,8 @@ class CompiledOptimizerBitwiseTests(TestCase):
             with self.subTest(weight=weight, dtypes=dtypes):
 
                 def fn(start, end):
+                    # [FUNCTION DOC] HELPER: Returns the foreach lerp of the two tensor lists
+                    # with the loop's scalar weight.
                     return torch._foreach_lerp(start, end, weight)
 
                 torch.manual_seed(42)
@@ -1138,6 +1316,12 @@ class CompiledOptimizerBitwiseTests(TestCase):
         num_steps=10,
         **optim_kwargs,
     ):
+        # [FUNCTION DOC] HELPER: Static helper. Resets dynamo and metrics, seeds, builds two
+        # identical models with gradients, an eager and a compiled optimizer, runs the given
+        # number of steps of each under no_grad, and after each step asserts all parameters are
+        # bitwise equal (zero tolerances). Afterwards asserts every tensor entry of optimizer
+        # state is bitwise equal. Finally, if a kernel count is given and the test case enables
+        # counting, checks the generated kernel count (via a checker function or equality).
         """Helper to test optimizer bitwise equality."""
         torch._dynamo.reset()
         torch._inductor.metrics.reset()
@@ -1207,6 +1391,9 @@ for optim_cls, name, kwargs, scheduler_cls in COMPILED_OPT_KWARG_DB:
 
 
 def _make_bitwise_test(optim_cls, kernel_count=None, **optim_kwargs):
+    # [FUNCTION DOC] HELPER: Factory returning a bitwise test for an optimizer class and kwargs.
+    # The returned test is skipped on ROCm and XPU, needs GPU and triton, and runs with config
+    # patched for precision parity.
     @skipIfRocm(msg="ROCm may have different numerical behavior")
     @skipIfXpu(msg="AttributeError, torch-xpu-ops: #2999")
     @requires_gpu_and_triton
@@ -1219,6 +1406,9 @@ def _make_bitwise_test(optim_cls, kernel_count=None, **optim_kwargs):
         }
     )
     def test_fn(self):
+        # [FUNCTION DOC] HELPER: Generated test body; delegates to the static bitwise helper of
+        # CompiledOptimizerBitwiseTests with the test case, optimizer class, kernel count and
+        # optimizer kwargs.
         CompiledOptimizerBitwiseTests._test_optimizer_bitwise(
             self, optim_cls, kernel_count=kernel_count, **optim_kwargs
         )

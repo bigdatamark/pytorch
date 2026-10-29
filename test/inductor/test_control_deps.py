@@ -1,5 +1,11 @@
 # Owner(s): ["module: inductor"]
 
+# [MODULE DOC] Tests for inductor control dependency support: the preserve_node_ordering pass
+# that wraps nodes in control_deps higher-order-op calls, interaction with nested args, auto-
+# functionalized ops and triton kernels, stream record/wait event handling, the reinplace helper
+# for ordering-only uses, and OrderingBarrier IR nodes. Most tests need a GPU. Defines a skip
+# decorator for CUDA with triton. The main block runs the tests with the filelock requirement
+# only on Linux with a GPU and triton.
 import unittest
 
 import torch
@@ -20,16 +26,29 @@ requires_cuda_triton = unittest.skipUnless(HAS_CUDA_AND_TRITON, "requires CUDA")
 
 
 class TestControlDeps(InductorTestCase):
+    # [CLASS DOC] Inductor test case grouping control_deps tests: custom post-grad passes that
+    # add ordering dependencies, then checks on generated code, scheduler behavior and IR nodes.
     @config.patch(reorder_for_locality=False)
     @requires_gpu()
     def test_control_deps_prevents_fusion(self):
+        # [FUNCTION DOC] Checks that a user post-grad pass adding control dependencies (mm after
+        # add, mul after mm) keeps those ops from being fused: generated code shows a kernel
+        # run, then an extern mm call, then another kernel run, and results match eager.
+        # Requires a GPU; locality reordering is disabled.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compile; computes an add on a, a matmul of b
+            # with itself, and a multiply, returning the matmul and multiply results.
             c = a + 1
             d = b @ b
             e = c * 2
             return d, e
 
         def add_control_deps(graph):
+            # [FUNCTION DOC] HELPER: post-grad pass. Expects exactly three call_function nodes
+            # (add, mm, mul) and raises AssertionError otherwise, makes mm depend on add and mul
+            # depend on mm via preserve_node_ordering, then verifies two control_deps nodes exist
+            # and that all fake values (including inside the subgraphs) have the 256 by 256
+            # shape. Returns the graph.
             nodes = [n for n in graph.nodes if n.op == "call_function"]
             if len(nodes) != 3:
                 raise AssertionError(f"Expected 3 nodes, got {len(nodes)}")
@@ -90,12 +109,18 @@ class TestControlDeps(InductorTestCase):
     @config.patch(allow_buffer_reuse=False)
     @requires_gpu()
     def test_control_deps_do_not_extend_buffer_lifetime(self):
+        # [FUNCTION DOC] Checks that a control dependency does not extend a buffer lifetime: with
+        # buffer reuse disabled, a chain of four matmuls where the last depends on the first
+        # still deletes the first buffer right after its single use, as seen in the generated
+        # code. Results match eager. Requires a GPU.
         """
         Control deps should not extend buffer lifetimes - buf0/buf1 should be
         deleted before the 4th matmul, not kept alive by the control dependency.
         """
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compile; a chain of four matmuls, each of the
+            # previous result with b.
             # Chain of 4 matmuls: mm0 -> mm1 -> mm2 -> mm3
             mm0 = a @ b
             mm1 = mm0 @ b
@@ -104,6 +129,9 @@ class TestControlDeps(InductorTestCase):
             return mm3
 
         def add_control_deps(graph):
+            # [FUNCTION DOC] HELPER: post-grad pass. Requires exactly four mm nodes (raises
+            # AssertionError otherwise) and adds a control dependency of the last mm on the first
+            # through preserve_node_ordering. Returns the graph.
             from torch.utils._ordered_set import OrderedSet
 
             mm_nodes = graph.find_nodes(
@@ -137,9 +165,14 @@ class TestControlDeps(InductorTestCase):
     @config.patch(reorder_for_locality=False)
     @requires_gpu()
     def test_control_deps_with_nested_args(self):
+        # [FUNCTION DOC] Checks control_deps on a node with nested args (a concatenation taking a
+        # list of tensors): the pass makes the cat depend on an add and a single control_deps
+        # node results; the compiled output matches eager. Requires a GPU.
         """Test control_deps with operations that have nested args (e.g., torch.cat)."""
 
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: function under compile; adds one to a, doubles b,
+            # concatenates along dim 0, then adds c.
             x = a + 1
             y = b * 2
             # torch.cat has nested args: (List[Tensor], dim)
@@ -148,6 +181,9 @@ class TestControlDeps(InductorTestCase):
             return z
 
         def add_control_deps(graph):
+            # [FUNCTION DOC] HELPER: post-grad pass. Requires exactly one cat node whose first
+            # arg is a list or tuple, makes it depend on the first add node, and verifies exactly
+            # one control_deps node exists; raises AssertionError otherwise. Returns the graph.
             from torch.utils._ordered_set import OrderedSet
 
             # Find the cat node which has nested args
@@ -201,6 +237,11 @@ class TestControlDeps(InductorTestCase):
 
     @config.patch(enable_auto_functionalized_v2=True)
     def test_control_deps_with_auto_functionalized_v2(self):
+        # [FUNCTION DOC] Checks that control_deps works on an auto_functionalized_v2 node: inside
+        # a scoped custom library fragment it defines an in-place add-one op with a fake
+        # implementation, compiles a function using it with a pass that makes the op depend on a
+        # multiply, and verifies the control_deps subgraph contains the auto-functionalized node.
+        # Compiled result and the mutated input match eager. The library is cleaned up on exit.
         with torch.library._scoped_library("control_deps_auto_func", "FRAGMENT") as lib:
             lib.define(
                 "add_one_(Tensor(a!) x) -> Tensor",
@@ -208,6 +249,8 @@ class TestControlDeps(InductorTestCase):
             )
 
             def add_one_impl(x):
+                # [FUNCTION DOC] HELPER: eager implementation of the in-place op: adds one to the
+                # input in place and returns a clone.
                 x.add_(1.0)
                 return x.clone()
 
@@ -215,14 +258,23 @@ class TestControlDeps(InductorTestCase):
 
             @torch.library.register_fake("control_deps_auto_func::add_one_", lib=lib)
             def add_one_fake(x):
+                # [FUNCTION DOC] HELPER: fake (meta) implementation of the op, returning a clone
+                # of the input.
                 return x.clone()
 
             def fn(x):
+                # [FUNCTION DOC] HELPER: function under compile; doubles x, calls the in-place op
+                # on x and adds the doubled value to the result.
                 y = x * 2
                 z = torch.ops.control_deps_auto_func.add_one_(x)
                 return z + y
 
             def add_control_deps(graph):
+                # [FUNCTION DOC] HELPER: post-grad pass. Requires exactly one
+                # auto_functionalized_v2 node and one mul node, makes the former depend on the
+                # latter, then verifies one control_deps node whose subgraph attribute holds
+                # exactly one nested auto_functionalized_v2 node. Raises AssertionError on any
+                # mismatch. Returns the graph.
                 from torch.utils._ordered_set import OrderedSet
 
                 auto_func_nodes = graph.find_nodes(
@@ -285,10 +337,16 @@ class TestControlDeps(InductorTestCase):
 
     @requires_gpu()
     def test_control_deps_with_triton_kernel(self):
+        # [FUNCTION DOC] Checks control_deps around a triton kernel wrapper: a pass makes the
+        # first functional triton kernel node depend on the first mul node; the compiled output
+        # equals eager. Requires a GPU and triton imports.
         """Test control_deps with triton_kernel_wrapper_mutation."""
         import triton
         import triton.language as tl
 
+        # [FUNCTION DOC] HELPER: triton kernel adding two input vectors elementwise into an
+        # output vector, one block per program id, with masking for the tail beyond the element
+        # count.
         @triton.jit
         def add_kernel(
             in_ptr0,
@@ -306,6 +364,9 @@ class TestControlDeps(InductorTestCase):
             tl.store(out_ptr + offsets, x + y, mask=mask)
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: function under compile; doubles x, launches the add kernel
+            # on x and y into a zero tensor with block size 16, and returns that output plus the
+            # doubled value.
             z = x * 2
             output = torch.zeros_like(x)
             n_elements = output.numel()
@@ -314,6 +375,10 @@ class TestControlDeps(InductorTestCase):
             return output + z
 
         def add_control_deps(graph):
+            # [FUNCTION DOC] HELPER: post-grad pass. Requires at least one functional triton
+            # kernel wrapper node and one mul node (raises AssertionError otherwise) and makes
+            # the first kernel depend on the first mul via preserve_node_ordering. Returns the
+            # graph.
             from torch.utils._ordered_set import OrderedSet
 
             # Find triton_kernel_wrapper_mutation nodes
@@ -348,6 +413,12 @@ class TestControlDeps(InductorTestCase):
             torch.testing.assert_close(result, expected)
 
     def test_wait_event_threads_record_event_passthroughs(self):
+        # [FUNCTION DOC] Builds an FX graph by hand: a reload add tagged as backward on side
+        # stream 19, a record_event, other compute on stream 0, a wait_event, and a consumer
+        # using the reload and the other compute. After wrap_all_sync_nodes_with_control_deps,
+        # checks the consumer's first arg is an item extracted from a control_deps node whose
+        # subgraph contains the wait_event call and not the record_event call. Covers wait_event
+        # threading record_event passthroughs. No GPU needed.
         """wait_event must thread record_event's passthroughs to consumers.
 
         Regression test for the backward reload pattern:
@@ -434,6 +505,10 @@ class TestControlDeps(InductorTestCase):
 
     @requires_gpu()
     def test_control_deps_orders_void_op_across_nested_calls(self):
+        # [FUNCTION DOC] Regression test: compiles a function with two streams and an event
+        # record/wait, capturing void (no layout) op names and the additional buffer deps via a
+        # pre-fusion custom pass. Asserts at least one compile, at least one void op, and that
+        # some void op name appears among the referenced additional deps. Requires a GPU.
         """record_event's void op must be named as an additional_buffer_dep
         of the subsequent wait_event's operations after Inductor lowering.
 
@@ -451,6 +526,8 @@ class TestControlDeps(InductorTestCase):
         from torch._inductor.virtualized import V
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: function under compile; computes on stream one then records
+            # an event, then on stream two computes, waits on the event and multiplies results.
             s1 = torch.Stream(device=GPU_TYPE)
             s2 = torch.Stream(device=GPU_TYPE)
             e = torch.Event()
@@ -466,6 +543,9 @@ class TestControlDeps(InductorTestCase):
         captured: list[dict] = []
 
         def capture(nodes):
+            # [FUNCTION DOC] HELPER: pre-fusion pass. Appends to the enclosing captured list the
+            # names of graph operations that are buffers with no layout, and all names referenced
+            # in additional buffer deps. Returns the nodes unchanged.
             void_names = {
                 op.get_name()
                 for op in V.graph.operations
@@ -505,6 +585,10 @@ class TestControlDeps(InductorTestCase):
         )
 
     def test_reinplace_not_blocked_by_control_deps_ordering_dep(self):
+        # [FUNCTION DOC] Checks the reinplace helper that decides whether a use is ordering-only:
+        # true when the value is only in the first arg group of a control_deps call, false when
+        # it is also passed through or only passed through, and false for a non-control_deps
+        # node. Graph built by hand; no execution.
         """Views in control_deps' ordering-only deps should not block reinplacing.
 
         When a tensor appears only in control_deps' additional_deps (args[0])
@@ -539,6 +623,10 @@ class TestControlDeps(InductorTestCase):
 
     @requires_gpu()
     def test_control_deps_passthrough_creates_ordering_barrier(self):
+        # [FUNCTION DOC] Checks that pass-through values in control_deps lead to OrderingBarrier
+        # IR nodes: at least one exists, each has the ordering-only flag set, and their source
+        # buffer names are not in the graph's mutated buffers. Compiles a stream and event
+        # function, results match eager. Requires a GPU.
         """Pass-through values in control_deps create OrderingBarrier nodes.
 
         Verifies that OrderingBarrier:
@@ -552,6 +640,10 @@ class TestControlDeps(InductorTestCase):
         captured: list[dict] = []
 
         def capture(nodes):
+            # [FUNCTION DOC] HELPER: pre-fusion pass. Collects OrderingBarrier operations and
+            # appends to the enclosing list a record with the barriers, their first mutation
+            # names, their ordering-only flags and a set of the graph's mutated buffers. Returns
+            # the nodes unchanged.
             barriers = [
                 op for op in V.graph.operations if isinstance(op, ir.OrderingBarrier)
             ]
@@ -566,6 +658,8 @@ class TestControlDeps(InductorTestCase):
             return nodes
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: function under compile; adds one on a side stream with an
+            # event record, waits for the event on the current stream, then doubles the result.
             s = torch.Stream(device=GPU_TYPE)
             e = torch.Event()
             with s:
@@ -598,6 +692,9 @@ class TestControlDeps(InductorTestCase):
 
     @requires_gpu()
     def test_ordering_barrier_is_nop(self):
+        # [FUNCTION DOC] Checks that OrderingBarrier IR nodes are no-ops: for every captured
+        # barrier, should_allocate is false and is_no_op is true, and at least one barrier
+        # exists. Compiles a stream and event function, results match eager. Requires a GPU.
         """OrderingBarrier must not allocate or generate code.
 
         Verifies should_allocate() and is_no_op() on the actual IR node.
@@ -608,6 +705,9 @@ class TestControlDeps(InductorTestCase):
         captured: list[dict] = []
 
         def capture(nodes):
+            # [FUNCTION DOC] HELPER: pre-fusion pass. Collects OrderingBarrier operations and
+            # appends to the enclosing list the results of their allocation and no-op queries.
+            # Returns the nodes unchanged.
             barriers = [
                 op for op in V.graph.operations if isinstance(op, ir.OrderingBarrier)
             ]
@@ -620,6 +720,8 @@ class TestControlDeps(InductorTestCase):
             return nodes
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: function under compile; adds one on a side stream with an
+            # event record, waits for the event on the current stream, then doubles the result.
             s = torch.Stream(device=GPU_TYPE)
             e = torch.Event()
             with s:
@@ -654,6 +756,11 @@ class TestControlDeps(InductorTestCase):
 
     @requires_cuda_triton
     def test_bidirectional_stream_sync_correctness(self):
+        # [FUNCTION DOC] Regression test for bidirectional stream synchronization using real CUDA
+        # streams and events: two streams exchange events while computing multiplies and an add;
+        # the compiled result must equal eager. Guards against ordering dependencies being keyed
+        # by buffer name instead of operation name, which previously allowed wrong scheduling.
+        # Needs CUDA and triton.
         """Regression: passthrough OrderingBarrier must be ordered after all subgraph ops.
 
         Bidirectional stream sync exposes a bug where additional_buffer_deps was
@@ -665,6 +772,9 @@ class TestControlDeps(InductorTestCase):
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: function under compile; stream one doubles x and records an
+            # event, stream two waits, adds one and records a second event, stream one waits and
+            # doubles again; both streams are synchronized before returning.
             s1 = torch.cuda.Stream()
             s2 = torch.cuda.Stream()
             event_s1 = torch.cuda.Event()
