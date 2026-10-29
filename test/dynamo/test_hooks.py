@@ -1,4 +1,10 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests dynamo support for autograd hooks: tensor register_hook (lambda, local,
+# global and closure hooks, handles returned or removed), hooks on intermediates, post-
+# accumulate-grad hooks, nn.Module forward hooks and guards, interaction with compiled
+# autograd, aot_eager and inductor backends, and autograd-cache behavior. Defines module-level
+# hook functions and a global handle variable. At import time instantiates device-specific
+# test classes for accelerators (including xpu) by calling instantiate_device_type_tests.
 
 import contextlib
 import functools
@@ -20,18 +26,23 @@ from torch.utils.hooks import RemovableHandle
 
 
 def compiler_fn(gm):
+    # [FUNCTION DOC] HELPER: Compiler callback for compiled autograd; compiles the given graph
+    # module with the inductor backend, full graph and dynamic shapes, and returns the result.
     return torch.compile(gm, backend="inductor", fullgraph=True, dynamic=True)
 
 
 def global_hook_0(grad):
+    # [FUNCTION DOC] HELPER: Gradient hook that returns the gradient multiplied by four.
     return grad * 4
 
 
 def global_hook_1(grad):
+    # [FUNCTION DOC] HELPER: Gradient hook that returns the gradient divided by two.
     return grad / 2
 
 
 def global_hook_2(grad):
+    # [FUNCTION DOC] HELPER: Gradient hook that returns the gradient multiplied by three.
     return grad * 3
 
 
@@ -39,13 +50,24 @@ h0 = None
 
 
 class ClassWithVal:
+    # [CLASS DOC] HELPER: Simple holder with one attribute val, used as a closure or partial
+    # argument captured by hooks in guard and recompile tests.
     def __init__(self, val):
+        # [FUNCTION DOC] HELPER: Stores the given value as the attribute val.
         self.val = val
 
 
 class HooksTests(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Main test case for hook support in dynamo. Each test compiles a function or
+    # module that registers hooks, runs backward and checks gradient values, frame counts,
+    # recompilation, generated graph text, or errors, often comparing against eager results.
     def test_tensor_only_register_hook_in_graph_lambda(self):
+        # [FUNCTION DOC] Compiled function only registers a lambda hook (doubling gradients)
+        # on its input and returns it. Backward gives doubled gradients and no frame is
+        # compiled (frame count zero).
         def fn(x):
+            # [FUNCTION DOC] HELPER: Registers a gradient-doubling lambda hook on x and
+            # returns x.
             x.register_hook(lambda grad: grad * 2)
             return x
 
@@ -58,7 +80,12 @@ class HooksTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(cnts.frame_count, 0)
 
     def test_tensor_register_hook_in_graph_lambda(self):
+        # [FUNCTION DOC] Registers a lambda hook (doubling) on the input inside a function
+        # that also squares two other tensors. Checks doubled gradients and one compiled
+        # frame.
         def fn(x, y, z):
+            # [FUNCTION DOC] HELPER: Registers a doubling hook on x and returns x with squares
+            # of y and z.
             x.register_hook(lambda grad: grad * 2)
             return x, y * y, z * z
 
@@ -71,7 +98,12 @@ class HooksTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(cnts.frame_count, 1)
 
     def test_tensor_register_hook_in_graph_break_handle_lambda(self):
+        # [FUNCTION DOC] Registers a doubling hook, keeps its handle, does some tensor work,
+        # removes the handle, then registers a tripling hook. Checks the gradient reflects
+        # only the tripling hook and that one frame was compiled.
         def fn(x, y, z):
+            # [FUNCTION DOC] HELPER: Registers and removes a doubling hook, then registers a
+            # tripling hook, returning x, y squared and z squared.
             handle = x.register_hook(lambda grad: grad * 2)
             z = z * z
             handle.remove()
@@ -87,7 +119,12 @@ class HooksTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(cnts.frame_count, 1)
 
     def test_tensor_register_hook_multi_handle_return(self):
+        # [FUNCTION DOC] Returns the hook handle twice (under two names) from the compiled
+        # function. Checks doubled gradients, one frame, handles not none and equal to each
+        # other.
         def fn(x, y, z):
+            # [FUNCTION DOC] HELPER: Registers a doubling hook and returns tensors plus the
+            # handle and an alias of it.
             handle = x.register_hook(lambda grad: grad * 2)
             h2 = handle
             z = z * z
@@ -105,7 +142,12 @@ class HooksTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(h2, h)
 
     def test_tensor_register_hook_repeated_handle_return(self):
+        # [FUNCTION DOC] Returns the same handle object twice. Checks doubled gradients, one
+        # frame, that the handle is a RemovableHandle and that both returned handles are the
+        # identical object.
         def fn(x, y, z):
+            # [FUNCTION DOC] HELPER: Registers a doubling hook and returns tensors plus the
+            # handle twice.
             handle = x.register_hook(lambda grad: grad * 2)
             h2 = handle  # noqa: F841
             z = z * z
@@ -122,10 +164,15 @@ class HooksTests(torch._dynamo.test_case.TestCase):
         self.assertIs(h2, h)
 
     def test_removed_handle_return(self):
+        # [FUNCTION DOC] Registers a hook, removes its handle twice inside a full-graph
+        # function and returns the handle twice. Checks the gradient is unchanged (hook
+        # removed), one frame, the handle is a RemovableHandle and identical for both returns.
         cnt = torch._dynamo.testing.CompileCounter()
 
         @torch.compile(backend=cnt, fullgraph=True)
         def fn(x, y, z):
+            # [FUNCTION DOC] HELPER: Registers a doubling hook, removes it two times, and
+            # returns tensors plus the handle twice.
             handle = x.register_hook(lambda grad: grad * 2)
             z = z * z
             handle.remove()
@@ -141,7 +188,12 @@ class HooksTests(torch._dynamo.test_case.TestCase):
         self.assertIs(h2, h)
 
     def test_tensor_register_hook_repeated_handle_not_local(self):
+        # [FUNCTION DOC] Stores the hook handle as an attribute of a module passed in,
+        # compiled with a full graph. Checks doubled gradients, one frame and that the
+        # attribute is no longer none.
         def fn(x, y, z, mod):
+            # [FUNCTION DOC] HELPER: Registers a doubling hook and stores the handle on the
+            # module argument; returns x and squares of y and z.
             mod.handle = x.register_hook(lambda grad: grad * 2)
             z = z * z
             return x, y * y, z
@@ -162,10 +214,14 @@ class HooksTests(torch._dynamo.test_case.TestCase):
         self.assertNotEqual(mod.handle, None)
 
     def test_tensor_only_register_hook_in_graph_local(self):
+        # [FUNCTION DOC] Registers a locally defined hook function (doubling) on the input
+        # only; checks doubled gradients and zero compiled frames.
         def local_hook(grad):
+            # [FUNCTION DOC] HELPER: Gradient hook that doubles the gradient.
             return grad * 2
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Registers the local hook on x and returns x.
             x.register_hook(local_hook)
             return x
 
@@ -178,8 +234,14 @@ class HooksTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(cnts.frame_count, 0)
 
     def test_tensor_only_register_hook_in_graph_local_inner(self):
+        # [FUNCTION DOC] Defines a hook inside the compiled function and registers it on both
+        # the input and an intermediate product; backward from one output element. Checks
+        # doubled gradient on that element and one compiled frame.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Defines a doubling hook, registers it on x and on x
+            # squared, returns both.
             def local_hook(grad):
+                # [FUNCTION DOC] HELPER: Gradient hook that doubles the gradient.
                 return grad * 2
 
             z = x * x
@@ -196,10 +258,15 @@ class HooksTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(cnts.frame_count, 1)
 
     def test_tensor_register_hook_in_graph_local(self):
+        # [FUNCTION DOC] Registers a module-local doubling hook function inside a function
+        # that also squares other tensors. Checks doubled gradients and one frame.
         def local_hook(grad):
+            # [FUNCTION DOC] HELPER: Gradient hook that doubles the gradient.
             return grad * 2
 
         def fn(x, y, z):
+            # [FUNCTION DOC] HELPER: Registers the local hook on x and returns x with squares
+            # of y and z.
             x.register_hook(local_hook)
             return x, y * y, z * z
 
@@ -212,13 +279,20 @@ class HooksTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(cnts.frame_count, 1)
 
     def test_tensor_register_hook_in_graph_break_handle_local(self):
+        # [FUNCTION DOC] Registers a doubling local hook, does tensor work, removes the
+        # handle, registers a tripling hook. Checks the gradient is tripled (the first hook
+        # has no effect).
         def local_hook(grad):
+            # [FUNCTION DOC] HELPER: Gradient hook that doubles the gradient.
             return grad * 2
 
         def local_hook2(grad):
+            # [FUNCTION DOC] HELPER: Gradient hook that triples the gradient.
             return grad * 3
 
         def fn(x, y, z):
+            # [FUNCTION DOC] HELPER: Registers and removes the first hook, registers the
+            # second, returns x, y squared and z squared.
             handle = x.register_hook(local_hook)
             z = z * z
             handle.remove()
@@ -234,7 +308,11 @@ class HooksTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(v.grad, torch.tensor([3.0, 6.0, 9.0]))
 
     def test_tensor_register_global_hook(self):
+        # [FUNCTION DOC] Registers the module-level hook (times four) on the input. Checks
+        # gradients are four times the incoming gradient and one frame.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Registers the global times-four hook and returns x and x
+            # squared.
             x.register_hook(global_hook_0)
             return x, x * x
 
@@ -247,7 +325,11 @@ class HooksTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(cnts.frame_count, 1)
 
     def test_tensor_register_multiple_hooks(self):
+        # [FUNCTION DOC] Registers three module-level hooks (times four, divided by two, times
+        # three) in order. Checks the gradient is six times the incoming one and one frame.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Registers the three global hooks on x and returns x and x
+            # squared.
             x.register_hook(global_hook_0)  # * 4
             x.register_hook(global_hook_1)  # / 2
             x.register_hook(global_hook_2)  # * 3
@@ -262,7 +344,12 @@ class HooksTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(cnts.frame_count, 1)
 
     def test_tensor_register_multiple_hooks_handles_in_list(self):
+        # [FUNCTION DOC] Returns the handles of three registered hooks, runs backward
+        # (gradient six times), removes all handles, runs backward again and checks the
+        # gradient grows only by the unhooked amount. One frame is compiled.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Registers the three global hooks and returns x, x squared
+            # and the three handles.
             h0 = x.register_hook(global_hook_0)  # * 4
             h1 = x.register_hook(global_hook_1)  # / 2
             h2 = x.register_hook(global_hook_2)  # * 3
@@ -285,7 +372,13 @@ class HooksTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(cnts.frame_count, 1)
 
     def test_tensor_register_global_hooks_handles_in_list(self):
+        # [FUNCTION DOC] Stores a hook handle in the module-level global variable h0 from
+        # compiled code. Checks the global is set, the hook applies (times four), removing the
+        # handle stops it, and the frame count is zero (marked not yet implemented in the
+        # test).
         def fn(x):
+            # [FUNCTION DOC] HELPER: Declares h0 global, stores the registered hook handle in
+            # it, returns x and x squared. Side effect: assigns the global.
             global h0
             h0 = x.register_hook(global_hook_0)  # * 4
             return x, x * x
@@ -308,7 +401,11 @@ class HooksTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(cnts.frame_count, 0)
 
     def test_hook_on_intermediate(self):
+        # [FUNCTION DOC] Registers a plus-one hook on an intermediate tensor in a full-graph
+        # eager-backend function; checks the input gradient equals eager's.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Doubles x, registers a plus-one hook on the result, and
+            # returns its sum.
             y = x * 2
             y.register_hook(lambda grad: grad + 1)
             return y.sum()
@@ -325,10 +422,18 @@ class HooksTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(x_compiled.grad, x_eager.grad)
 
     def test_hook_on_intermediate_with_container(self):
+        # [FUNCTION DOC] Hook on an intermediate that is also stored into a list and
+        # dictionary and read back after being appended. Compares the compiled gradient with
+        # eager, checks it equals ten everywhere, and compares the recorded graph code with an
+        # inline expected string showing that the hook-registration higher-order op output is
+        # returned and used in later computation.
         glb_list = []
         glb_dict = {}
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Doubles x, stores it in the enclosing list and
+            # dictionary, reads it back (a is three times it, b is it unchanged), registers a
+            # plus-one hook on y, and returns the sum of a and b.
             y = x * 2
             glb_list.append(y)
             glb_dict["tensor"] = y
@@ -377,7 +482,11 @@ def forward(self, L_x_ : torch.Tensor):
         )
 
     def test_hook_on_intermediate_used_before_and_after(self):
+        # [FUNCTION DOC] Uses an intermediate both before and after registering a doubling
+        # hook on it; checks compiled and eager input gradients match.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Computes uses of y before and after hook registration and
+            # returns the sum of the combination.
             y = x * 2
             z = y + 1  # Use y BEFORE hook
             y.register_hook(lambda g: g * 2)
@@ -396,14 +505,21 @@ def forward(self, L_x_ : torch.Tensor):
         self.assertEqual(x_eager.grad, x_compiled.grad)
 
     def test_hook_on_intermediate_with_higher_order_op(self):
+        # [FUNCTION DOC] Registers a doubling hook on an intermediate and then passes it into
+        # a conditional higher-order op with two branches; checks compiled and eager gradients
+        # match.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Registers the hook, builds a conditional op over whether
+            # x sums positive, and returns the sum of its result.
             y = x * 2
             y.register_hook(lambda g: g * 2)
 
             def true_fn(t):
+                # [FUNCTION DOC] HELPER: Branch that adds one.
                 return t + 1
 
             def false_fn(t):
+                # [FUNCTION DOC] HELPER: Branch that subtracts one.
                 return t - 1
 
             z = torch.cond(x.sum() > 0, true_fn, false_fn, (y,))
@@ -421,7 +537,11 @@ def forward(self, L_x_ : torch.Tensor):
         self.assertEqual(x_eager.grad, x_compiled.grad)
 
     def test_hook_on_intermediate_returns_none(self):
+        # [FUNCTION DOC] Hook that returns none (leaves gradient unchanged). Checks compiled
+        # and eager gradients agree and are all two.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Doubles x, registers a hook returning none, returns the
+            # sum.
             y = x * 2
             y.register_hook(lambda g: None)
             return y.sum()
@@ -439,7 +559,14 @@ def forward(self, L_x_ : torch.Tensor):
         self.assertEqual(x_compiled.grad, torch.full_like(x_compiled, 2.0))
 
     def test_hook_has_side_effect(self):
+        # [FUNCTION DOC] Same body as the before-and-after-hook test: uses an intermediate
+        # before and after a doubling hook registration and compares compiled to eager
+        # gradients.
+        # KNOWN ISSUE: duplicates test_hook_on_intermediate_used_before_and_after and does not
+        # exercise anything about side effects despite its name.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Uses y before and after hook registration and returns the
+            # sum of the combination.
             y = x * 2
             z = y + 1  # Use y BEFORE hook
             y.register_hook(lambda g: g * 2)
@@ -458,12 +585,19 @@ def forward(self, L_x_ : torch.Tensor):
         self.assertEqual(x_eager.grad, x_compiled.grad)
 
     def test_hook_bwd_inside_side_effects(self):
+        # [FUNCTION DOC] Hook that appends its gradient to an enclosing list (side effect
+        # inside the backward hook). Expects compiling and calling the function to raise
+        # Unsupported with a message about an unsafe side effect.
         global_list = []
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Doubles x, defines and registers a hook that mutates the
+            # enclosing list, returns the sum of y plus x.
             y = x * 2
 
             def _hook(grad):
+                # [FUNCTION DOC] HELPER: Appends the gradient to the enclosing list and
+                # returns the gradient doubled.
                 global_list.append(grad)
                 return grad * 2
 
@@ -485,7 +619,12 @@ def forward(self, L_x_ : torch.Tensor):
             _ = compiled_fn(x_compiled)
 
     def test_hook_on_intermediate_from_split(self):
+        # [FUNCTION DOC] Registers a plus-one hook on one chunk of a split input after the
+        # chunks were concatenated. Checks compiled and eager gradients match and compares the
+        # recorded graph code against an inline expected text.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Splits x, concatenates the pieces, registers a plus-one
+            # hook on the first piece, and returns the sum of both.
             splits = x.split(2)
             result = torch.cat(splits)  # use splits before register_hook
             y = splits[0]
@@ -527,10 +666,16 @@ def forward(self, L_x_ : torch.Tensor):
         )
 
     def test_intermediary_hooks(self):
+        # [FUNCTION DOC] Registers a doubling hook on an intermediate in a full-graph
+        # function. Checks the compiled output matches eager and the gradient on the input is
+        # two.
         def simple_hook(g):
+            # [FUNCTION DOC] HELPER: Gradient hook that doubles the gradient.
             return g * 2
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Adds one, registers the hook on the result, adds one
+            # again and returns it.
             y = x + 1
             y.register_hook(simple_hook)
             z = y + 1
@@ -545,11 +690,19 @@ def forward(self, L_x_ : torch.Tensor):
         self.assertEqual(out.grad, torch.Tensor([2.0]))
 
     def test_intermediary_hooks_same_on_aot_eager(self):
+        # [FUNCTION DOC] Two partial-wrapped hooks on an intermediate in a module. Runs eager,
+        # aot module simplified, and dynamo with aot_eager under compiled autograd; checks
+        # outputs and input gradients agree across all three.
         def my_hook(grad, *, k=0):
+            # [FUNCTION DOC] HELPER: Hook adding a keyword-only constant k to the gradient.
             return grad + k
 
         class MyMod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module registering two partial hooks (adding three and four)
+            # on an intermediate and returning a tuple with the tripled intermediate.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Doubles x, registers two partial hooks, triples the
+                # result and returns it in a tuple.
                 y = x.mul(2)
                 hook1 = functools.partial(my_hook, k=3)
                 hook2 = functools.partial(my_hook, k=4)
@@ -580,16 +733,26 @@ def forward(self, L_x_ : torch.Tensor):
         self.assertEqual(x0.grad, x2.grad)
 
     def test_input_hooks_same(self):
+        # [FUNCTION DOC] For each of the eager, aot_eager and inductor backends, registers a
+        # partial hook on the module's input inside forward; runs eager, aot module simplified
+        # and dynamo (with compiled autograd for backward). Checks outputs and input gradients
+        # agree.
         backends = ["eager", "aot_eager", "inductor"]
         for backend in backends:
 
             def my_hook(grad, *, k=0):
+                # [FUNCTION DOC] HELPER: Hook adding a keyword-only constant k to the
+                # gradient.
                 return grad + k
 
             hook = functools.partial(my_hook, k=3)
 
             class MyMod(torch.nn.Module):
+                # [CLASS DOC] HELPER: Module registering the enclosing partial hook on its
+                # input, then multiplying by two and three; returns a tuple.
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Registers the hook on x, multiplies by two then
+                    # three, returns a tuple.
                     x.register_hook(hook)
                     y = x.mul(2)
                     z = y.mul(3)
@@ -617,11 +780,19 @@ def forward(self, L_x_ : torch.Tensor):
             self.assertEqual(x0.grad, x2.grad)
 
     def test_intermediary_hooks_same_on_inductor(self):
+        # [FUNCTION DOC] Same as the aot_eager intermediary hooks test but with the inductor
+        # backend for the dynamo run: eager, aot module simplified and compiled autograd
+        # outputs and gradients must agree.
         def my_hook(grad, *, k=0):
+            # [FUNCTION DOC] HELPER: Hook adding a keyword-only constant k to the gradient.
             return grad + k
 
         class MyMod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module registering two partial hooks (adding three and four)
+            # on an intermediate and returning a tuple with the tripled intermediate.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Doubles x, registers two partial hooks, triples the
+                # result and returns it in a tuple.
                 y = x.mul(2)
                 hook1 = functools.partial(my_hook, k=3)
                 hook2 = functools.partial(my_hook, k=4)
@@ -652,10 +823,18 @@ def forward(self, L_x_ : torch.Tensor):
         self.assertEqual(x0.grad, x2.grad)
 
     def test_complex_state_mutation_in_intermediary_hooks_same_on_inductor(self):
+        # [FUNCTION DOC] Two hooks sharing a stateful object whose counter alternates between
+        # squaring and doubling the gradient. Checks eager leaves the count at two, then the
+        # inductor-compiled run with compiled autograd gives the same output and gradient and
+        # the count reaches four.
         class SomePyClass:
+            # [CLASS DOC] HELPER: Holds a counter; each call to do_stuff squares the gradient
+            # on even counts and doubles it on odd counts, then increments the counter.
             count = 0
 
             def do_stuff(self, grad):
+                # [FUNCTION DOC] HELPER: Returns the gradient squared or doubled depending on
+                # the parity of the counter, then increments the counter (mutates state).
                 if self.count % 2 == 0:
                     r = grad * grad
                 else:
@@ -664,10 +843,15 @@ def forward(self, L_x_ : torch.Tensor):
                 return r
 
         def complex_state_touching_hook(grad, *, obj):
+            # [FUNCTION DOC] HELPER: Hook delegating to the state object do_stuff method.
             return obj.do_stuff(grad)
 
         class MyMod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module registering two partial hooks bound to the passed
+            # state object on an intermediate.
             def forward(self, x, obj):
+                # [FUNCTION DOC] HELPER: Doubles x, registers two hooks using obj, triples the
+                # result and returns a tuple.
                 y = x.mul(2)
                 hook1 = functools.partial(complex_state_touching_hook, obj=obj)
                 hook2 = functools.partial(complex_state_touching_hook, obj=obj)
@@ -698,11 +882,21 @@ def forward(self, L_x_ : torch.Tensor):
     def test_complex_state_mutation_in_intermediary_hooks_same_on_inductor_with_graph_break(
         self,
     ):
+        # [FUNCTION DOC] Like the state-mutation test but the object method also stores the
+        # gradient as a string and prints (graph break). With inductor and compiled autograd,
+        # expects backward to raise Unsupported mentioning repr on tensor; afterwards the
+        # counter stays at the two from the eager run.
         class SomePyClass:
+            # [CLASS DOC] HELPER: Holds a string attribute and a counter; its method
+            # stringifies the gradient, applies square or double by counter parity, prints,
+            # increments the counter.
             grad_as_str = "None"
             count = 0
 
             def write_grad_as_str_and_do_stuff(self, grad):
+                # [FUNCTION DOC] HELPER: Records the gradient string, computes square or
+                # double by parity, prints a message, increments the counter and returns the
+                # result.
                 self.grad_as_str = str(grad)
                 if self.count % 2 == 0:
                     r = grad * grad
@@ -713,10 +907,15 @@ def forward(self, L_x_ : torch.Tensor):
                 return r
 
         def complex_state_touching_hook(grad, *, obj):
+            # [FUNCTION DOC] HELPER: Hook delegating to the state object method.
             return obj.write_grad_as_str_and_do_stuff(grad)
 
         class MyMod(torch.nn.Module):
+            # [FUNCTION DOC] HELPER: Module registering two partial hooks bound to the passed
+            # state object.
             def forward(self, x, obj):
+                # [FUNCTION DOC] HELPER: Doubles x, registers two hooks using obj, triples the
+                # result and returns a tuple.
                 y = x.mul(2)
                 hook1 = functools.partial(complex_state_touching_hook, obj=obj)
                 hook2 = functools.partial(complex_state_touching_hook, obj=obj)
@@ -744,11 +943,20 @@ def forward(self, L_x_ : torch.Tensor):
     def test_register_hook_partial_guarding(
         self,
     ):
+        # [FUNCTION DOC] Compiles a module whose hook is a partial bound to an object with a
+        # val attribute, calling with different objects under compiled autograd. Expects only
+        # one frame compiled overall across objects holding tensor values and an object
+        # holding an integer.
         def some_hook(grad, *, obj):
+            # [FUNCTION DOC] HELPER: Hook adding the object's val to the gradient.
             return grad + obj.val
 
         class MyMod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module registering a partial hook bound to the passed object
+            # on an intermediate.
             def forward(self, x, obj):
+                # [FUNCTION DOC] HELPER: Doubles x, registers the hook, triples the result and
+                # returns a tuple.
                 y = x.mul(2)
                 hook1 = functools.partial(some_hook, obj=obj)
                 y.register_hook(hook1)
@@ -772,7 +980,12 @@ def forward(self, L_x_ : torch.Tensor):
             self.assertEqual(cnt.frame_count, 1)
 
     def test_hook_with_closure(self):
+        # [FUNCTION DOC] Hook on the input as a lambda closing over an object value. Compares
+        # gradients against eager for two objects under compiled autograd; expects one forward
+        # frame and one backward frame (no recompile for different objects).
         def fn(x, obj):
+            # [FUNCTION DOC] HELPER: Applies sine, registers a hook adding the object's val to
+            # the input gradient, applies sine again.
             y = x.sin()
             x.register_hook(lambda grad: grad + obj.val)
             z = y.sin()
@@ -803,8 +1016,14 @@ def forward(self, L_x_ : torch.Tensor):
         self.assertEqual(x1.grad, x3.grad)
 
     def test_hook_with_nested_closure(self):
+        # [FUNCTION DOC] Hook closing over a tensor created in a nested function. Compares
+        # gradients with eager under compiled autograd and expects one forward frame and one
+        # backward frame.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Calls an inner function and returns its result.
             def run():
+                # [FUNCTION DOC] HELPER: Applies sine, registers a hook adding that
+                # intermediate to the gradient of x, applies sine again.
                 y = x.sin()
                 x.register_hook(lambda grad: grad + y)
                 z = y.sin()
@@ -829,7 +1048,12 @@ def forward(self, L_x_ : torch.Tensor):
         self.assertEqual(x0.grad, x1.grad)
 
     def test_intermediate_hook_with_closure_eager(self):
+        # [FUNCTION DOC] Like the input closure test but the hook is registered on an
+        # intermediate with eager forward counting; compared with eager across two objects,
+        # one forward and one backward frame.
         def fn(x, obj):
+            # [FUNCTION DOC] HELPER: Applies sine, registers a closure hook on it, applies
+            # sine again.
             y = x.sin()
             y.register_hook(lambda grad: grad + obj.val)
             z = y.sin()
@@ -860,7 +1084,12 @@ def forward(self, L_x_ : torch.Tensor):
         self.assertEqual(x1.grad, x3.grad)
 
     def test_intermediate_hook_with_closure_aot(self):
+        # [FUNCTION DOC] Closure hook on an intermediate with the aot_eager backend and
+        # compiled autograd compiled by a counting backend. Gradients match eager for two
+        # objects, and only one backward frame is compiled.
         def fn(x, obj):
+            # [FUNCTION DOC] HELPER: Applies sine, registers a closure hook on it, applies
+            # sine again.
             y = x.sin()
             y.register_hook(lambda grad: grad + obj.val)
             z = y.sin()
@@ -889,14 +1118,24 @@ def forward(self, L_x_ : torch.Tensor):
         self.assertEqual(x1.grad, x3.grad)
 
     def test_no_recompile_on_hook_identity_change(self):
+        # [FUNCTION DOC] Registers a function as hook twice, compiles with aot_eager, then
+        # rebinds the enclosing hook name to a different function and calls again. Checks only
+        # one frame compiled both times and gradients equal eager's.
         def my_hook(grad, k=0):
+            # [FUNCTION DOC] HELPER: Hook adding a default-valued constant to the gradient.
             return grad + k
 
         def my_hook2(grad):
+            # [FUNCTION DOC] HELPER: Hook doubling the gradient; later substituted for the
+            # first hook.
             return grad * 2
 
         class MyMod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module registering the enclosing hook function twice on an
+            # intermediate and returning a tuple.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Doubles x, registers the enclosing hook twice,
+                # triples the result, returns a tuple.
                 y = x.mul(2)
                 y.register_hook(my_hook)
                 y.register_hook(my_hook)
@@ -929,13 +1168,20 @@ def forward(self, L_x_ : torch.Tensor):
             self.assertEqual(x0.grad, x1.grad)
 
     def test_functools_arg_vary(self):
+        # [FUNCTION DOC] Compiles a function using a partial hook with constant one, then
+        # rebinds the enclosing partial to constant two and checks the second gradient is
+        # twice the first under compiled autograd.
         def pre_hook(grad, *, k):
+            # [FUNCTION DOC] HELPER: Hook multiplying the gradient by the keyword-only factor
+            # k.
             return grad * k
 
         hook = functools.partial(pre_hook, k=1)
 
         @torch.compile(backend="eager", fullgraph=True)
         def h(x):
+            # [FUNCTION DOC] HELPER: Compiled function registering the enclosing hook partial
+            # on an intermediate and returning it tripled.
             y = x.mul(2)
             y.register_hook(hook)
             return y.mul(3)
@@ -951,17 +1197,28 @@ def forward(self, L_x_ : torch.Tensor):
             self.assertEqual(orig_grad * 2, x.grad)
 
     def test_post_acc_grad_hook(self):
+        # [FUNCTION DOC] Post-accumulate-grad hook that multiplies the tensor in place by its
+        # gradient and scales the gradient by five. Runs once eagerly, then compiled across
+        # eager, aot_eager and inductor backends with and without compiled backward. All runs
+        # must give the same tensor and gradient values, with one frame for compiled runs.
         def hook(input_t):
+            # [FUNCTION DOC] HELPER: Multiplies the tensor in place by its gradient and then
+            # multiplies the gradient in place by five.
             input_t.mul_(input_t.grad)
             input_t.grad.mul_(5)
 
         def reg_and_mul(x, y):
+            # [FUNCTION DOC] HELPER: Registers the post-accumulate hook on x and returns x
+            # times y.
             x.register_post_accumulate_grad_hook(hook)
             return x * y
 
         cnts = None
 
         def test_fn(fn):
+            # [FUNCTION DOC] HELPER: Calls the function on module-level x and y, backward on x
+            # with a given gradient, then checks the frame count (if a counter exists), the
+            # tensor values and gradient. Uses enclosing x, y and cnts variables.
             fn(x, y)
             b = torch.tensor([2.0, 2.0, 2.0], requires_grad=True)
             x.backward(b)
@@ -999,13 +1256,19 @@ def forward(self, L_x_ : torch.Tensor):
                     test_fn(compiled_fn)
 
     def test_recompile(self):
+        # [FUNCTION DOC] Registers a post-accumulate hook that doubles the gradient in place
+        # on a leaf and, under compiled autograd with error on recompile enabled, runs five
+        # backward passes with a changing input, clearing the gradient each time. Passes if no
+        # recompile occurs.
         def hook(param):
+            # [FUNCTION DOC] HELPER: Doubles the parameter's gradient in place.
             param.grad *= 2
 
         x = torch.ones(10)
         x.requires_grad = True
 
         def run(input):
+            # [FUNCTION DOC] HELPER: Returns the leaf tensor times the input.
             return x * input
 
         x.register_post_accumulate_grad_hook(hook)
@@ -1019,13 +1282,22 @@ def forward(self, L_x_ : torch.Tensor):
                     run(i).sum().backward()
 
     def test_no_recompile_on_same_hook(self):
+        # [FUNCTION DOC] Ten linear layers, each with a forward pre-hook calling the same
+        # function and each compiled with one counting backend. Running the model once must
+        # compile only one frame in total.
         cnts = torch._dynamo.testing.CompileCounter()
 
         def fw_hook(inp):
+            # [FUNCTION DOC] HELPER: Forward-hook helper returning a tuple whose single
+            # element is the first input plus one.
             return (inp[0] + 1,)
 
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module holding a list of ten compiled linear layers with
+            # pre-hooks.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Builds ten linear layers, registers a pre-hook on
+                # each, compiles each with the counting backend and appends it.
                 super().__init__()
                 self.layers = torch.nn.ModuleList()
                 for _ in range(10):
@@ -1035,6 +1307,7 @@ def forward(self, L_x_ : torch.Tensor):
                     self.layers.append(layer)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Passes x through each layer in order.
                 for l in self.layers:
                     x = l(x)
                 return x
@@ -1047,14 +1320,21 @@ def forward(self, L_x_ : torch.Tensor):
 
     @torch._dynamo.config.patch(skip_nnmodule_hook_guards=False)
     def test_nnmodule_hook_guards(self):
+        # [FUNCTION DOC] With module-hook guards enabled by config, compiles a function
+        # calling a module, then registers a forward hook doubling the output. Compiled result
+        # must equal eager and a second frame must be compiled (guard failure on hook
+        # addition).
         # Compile a model and then apply a hook
 
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with one linear layer.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(16, 16)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer.
                 return self.linear(x)
 
         cnts = torch._dynamo.testing.CompileCounter()
@@ -1062,6 +1342,7 @@ def forward(self, L_x_ : torch.Tensor):
         mod = Mod()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Calls the enclosing module on x.
             return mod(x)
 
         opt_fn = torch.compile(fn, backend=cnts)
@@ -1071,6 +1352,7 @@ def forward(self, L_x_ : torch.Tensor):
 
         # Register a hook
         def forward_hook(self, inputs, out):
+            # [FUNCTION DOC] HELPER: Forward hook doubling the module's output.
             return out * 2
 
         mod.register_forward_hook(forward_hook)
@@ -1082,12 +1364,18 @@ def forward(self, L_x_ : torch.Tensor):
 
     @torch._dynamo.config.patch(wrap_top_frame=True)
     def test_wrap_top_frame_with_hooks(self):
+        # [FUNCTION DOC] With the wrap-top-frame option on, compiles a module with a forward
+        # pre-hook two ways, by compiling the module and by compiling in place. Each result
+        # must equal eager and compile one frame.
         class ToyModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with one bias-free linear layer.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the linear layer.
                 super().__init__()
                 self.net1 = torch.nn.Linear(18, 18, bias=False)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer.
                 return self.net1(x)
 
         mod = ToyModel()
@@ -1111,13 +1399,21 @@ def forward(self, L_x_ : torch.Tensor):
         self.assertEqual(cnts.frame_count, 1)
 
     def test_global_module_forward_pre_hook(self):
+        # [FUNCTION DOC] Registers a global forward pre-hook counting calls, runs the module
+        # eagerly (count one), then runs a compiled copy expecting a UserWarning about global
+        # hooks and the counter to reach three. Compiled output must equal eager. Removes the
+        # hook in a final cleanup step.
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward subtracts one.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns x minus one.
                 return x - 1
 
         counter = 0
 
         def hook(mod, args):
+            # [FUNCTION DOC] HELPER: Increments the enclosing counter and returns the
+            # arguments unchanged.
             nonlocal counter
             counter += 1
             return args
@@ -1141,13 +1437,20 @@ def forward(self, L_x_ : torch.Tensor):
             hook_handle.remove()
 
     def test_register_hook_on_intermediate_stride_dependent(self):
+        # [FUNCTION DOC] Hook branching on whether the gradient is contiguous; expects
+        # compiling with aot_eager and a full graph to raise Unsupported because gradient
+        # properties are unknown at trace time.
         def hook(grad):
+            # [FUNCTION DOC] HELPER: Returns sine of the gradient if contiguous, otherwise
+            # cosine.
             if grad.is_contiguous():
                 return grad.sin()
             else:
                 return grad.cos()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Doubles x, registers the stride-dependent hook, returns
+            # the sum.
             y = x * 2
             y.register_hook(hook)
             return y.sum()
@@ -1160,12 +1463,21 @@ def forward(self, L_x_ : torch.Tensor):
 
 
 class HooksTestsDevice(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Device-parameterized tests of autograd-cache behavior with hooks;
+    # instantiated per accelerator at import time.
     @skipIfRocm(msg="pytorch/pytorch/issues/190414")
     @onlyAccelerator
     def test_register_hook_on_intermediate_autograd_cache(self, device):
+        # [FUNCTION DOC] Skipped on ROCm and only runs on accelerators. Enables the autograd
+        # cache, compiles and runs a function with an intermediate hook twice (resetting
+        # dynamo between), and asserts that no autograd cache bypass was counted. Always
+        # disables the cache setting at the end. Mutates global config and the shared
+        # counters.
         from torch._dynamo.utils import counters
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Doubles x, registers a lambda hook halving the gradient,
+            # returns the sum.
             y = x * 2
             y.register_hook(lambda g: g * 0.5)
             return y.sum()
@@ -1190,14 +1502,22 @@ class HooksTestsDevice(torch._dynamo.test_case.TestCase):
 
     @onlyAccelerator
     def test_register_hook_on_intermediate_autograd_cache_different_hooks(self, device):
+        # [FUNCTION DOC] Accelerator-only. With the autograd cache on, compiles two functions
+        # that differ only in the hook (times one half versus times three). The second must
+        # not reuse the first's cache entry: its gradient is six, and no cache bypass is
+        # recorded. Resets the cache setting afterwards.
         from torch._dynamo.utils import counters
 
         def fn_a(x):
+            # [FUNCTION DOC] HELPER: Doubles x, registers a hook halving the gradient, returns
+            # the sum.
             y = x * 2
             y.register_hook(lambda g: g * 0.5)
             return y.sum()
 
         def fn_b(x):
+            # [FUNCTION DOC] HELPER: Doubles x, registers a hook tripling the gradient,
+            # returns the sum.
             y = x * 2
             y.register_hook(lambda g: g * 3.0)
             return y.sum()

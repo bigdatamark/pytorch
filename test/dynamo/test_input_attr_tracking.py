@@ -1,4 +1,9 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests dynamo's tracking of attributes set or read on input tensors and on user
+# objects. Covers tensor-valued and constant attributes attached to input tensors (whether
+# they are lifted to graph inputs), guard behavior when an assigned attribute changes type,
+# many attribute reads and writes with and without graph breaks, reconstruction of attributes
+# after inlining, and assigning to the data of tensors. No import-time side effects.
 import torch
 import torch._dynamo
 import torch._dynamo.test_case
@@ -12,8 +17,16 @@ from torch._dynamo.testing import (
 
 
 class TestInputAttrTracking(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Test case with one test per attribute scenario. Tests compile small
+    # functions with a capturing backend, a compile counter or the eager backend and compare
+    # against eager results, graph placeholder counts, frame counts and operation counts.
     def test_tensor_property_on_tensor(self):
+        # [FUNCTION DOC] Reads a tensor-valued attribute that was set on an input tensor
+        # outside the compiled function; checks the compiled result matches eager and that the
+        # captured graph has two placeholders, i.e. the attribute tensor is lifted to a graph
+        # input.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Multiplies the input by its attached attribute.
             return x * x.y
 
         x_ = torch.randn([2, 2])
@@ -25,6 +38,8 @@ class TestInputAttrTracking(torch._dynamo.test_case.TestCase):
         graph = None
 
         def grab_graph_backend(gm, inps):
+            # [FUNCTION DOC] HELPER: Backend that stores the graph module in the enclosing
+            # variable and returns it unchanged for execution.
             nonlocal graph
             graph = gm
             return gm
@@ -42,7 +57,12 @@ class TestInputAttrTracking(torch._dynamo.test_case.TestCase):
         self.assertEqual(placeholder_cnt, 2)
 
     def test_tensor_property_assigned_on_tensor(self):
+        # [FUNCTION DOC] Assigns a tensor argument as an attribute on another input tensor
+        # inside the compiled function and multiplies them; checks results match eager and the
+        # graph has two placeholders (the attribute value is already an input).
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Sets the attribute on the first argument to the second
+            # argument and returns their product.
             x.y = y
             return x * x.y
 
@@ -54,6 +74,8 @@ class TestInputAttrTracking(torch._dynamo.test_case.TestCase):
         graph = None
 
         def grab_graph_backend(gm, inps):
+            # [FUNCTION DOC] HELPER: Backend that stores the graph module in the enclosing
+            # variable and returns it unchanged for execution.
             nonlocal graph
             graph = gm
             return gm
@@ -71,7 +93,11 @@ class TestInputAttrTracking(torch._dynamo.test_case.TestCase):
         self.assertEqual(placeholder_cnt, 2)
 
     def test_const_property_on_tensor(self):
+        # [FUNCTION DOC] Reads an integer attribute attached to an input tensor outside the
+        # compiled function; checks the result matches eager and the graph has only one
+        # placeholder, so the constant is not lifted to an input.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Multiplies the input by its attached attribute.
             return x * x.y
 
         x_ = torch.randn([2, 2])
@@ -83,6 +109,8 @@ class TestInputAttrTracking(torch._dynamo.test_case.TestCase):
         graph = None
 
         def grab_graph_backend(gm, inps):
+            # [FUNCTION DOC] HELPER: Backend that stores the graph module in the enclosing
+            # variable and returns it unchanged for execution.
             nonlocal graph
             graph = gm
             return gm
@@ -100,7 +128,12 @@ class TestInputAttrTracking(torch._dynamo.test_case.TestCase):
         self.assertEqual(placeholder_cnt, 1)
 
     def test_const_property_assigned_on_tensor(self):
+        # [FUNCTION DOC] Assigns an integer argument as an attribute on an input tensor inside
+        # the compiled function (eager backend, full graph) and checks the result matches
+        # eager.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Sets the attribute on the first argument to the second
+            # argument and returns the tensor times that attribute.
             x.y = y
             return x * x.y
 
@@ -114,7 +147,12 @@ class TestInputAttrTracking(torch._dynamo.test_case.TestCase):
         self.assertEqual(eager_result, compile_result)
 
     def test_guards_correctly_property_assigned_on_tensor_type_change(self):
+        # [FUNCTION DOC] Compiles with the eager backend and a full graph, calls with an
+        # integer then with a tensor as the assigned attribute value, and checks both results
+        # equal the input times that value, showing guards handle the type change.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Sets the attribute on the first argument to the second
+            # argument and returns their product.
             x.y = y
             return x * x.y
 
@@ -129,7 +167,12 @@ class TestInputAttrTracking(torch._dynamo.test_case.TestCase):
         self.assertEqual(compile_result_tensor, x_ * y)
 
     def test_guards_correctly_property_assigned_on_tensor_type_change_inductor(self):
+        # [FUNCTION DOC] Same type-change scenario as the eager-backend variant but compiled
+        # with the inductor backend: an integer then a tensor assigned as an attribute, each
+        # result checked against the input times the value.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Sets the attribute on the first argument to the second
+            # argument and returns their product.
             x.y = y
             return x * x.y
 
@@ -144,7 +187,13 @@ class TestInputAttrTracking(torch._dynamo.test_case.TestCase):
         self.assertEqual(compile_result_tensor, x_ * y)
 
     def test_complex_attr_access_without_graph_breaks(self):
+        # [FUNCTION DOC] Sets two attributes on each tensor in a list, then reads them back
+        # and accumulates products, compiled with full graph. Asserts the result matches
+        # eager, one frame, and nine operations.
         def fn(x, y, z):
+            # [FUNCTION DOC] HELPER: For each tensor in the list sets attribute y to the
+            # tensor y and attribute z to y times z; then multiplies the attributes of all
+            # tensors together and returns both products.
             for t in x:
                 t.y = y
                 t.z = y * z
@@ -189,7 +238,13 @@ class TestInputAttrTracking(torch._dynamo.test_case.TestCase):
         # output         output  output                   ((mul_7, mul_8, mul, mul_1, mul_2),)  {}
 
     def test_complex_attr_access_with_graph_breaks(self):
+        # [FUNCTION DOC] Same as the full-graph variant but with a print call between the
+        # attribute writes and reads, compiled without full graph. Asserts the result matches
+        # eager, two frames (a graph break), and nine operations in total.
         def fn(x, y, z):
+            # [FUNCTION DOC] HELPER: Sets attributes on each tensor in the list, prints a
+            # message (forcing a graph break), then multiplies the attributes together and
+            # returns both products.
             for t in x:
                 t.y = y
                 t.z = y * z
@@ -245,11 +300,19 @@ class TestInputAttrTracking(torch._dynamo.test_case.TestCase):
         # output         output   output                   ((mul_4, mul_5),)  {}
 
     def test_complex_attr_access_with_inline_reconstruct(self):
+        # [FUNCTION DOC] Sets an integer attribute on three input tensors, calls an inlined
+        # function that prints and sums the attributes, and scales two tensors by the sum;
+        # compiled without full graph. Asserts matching results, one frame and two operations.
         def inline_test_fn(x, y, z):
+            # [FUNCTION DOC] HELPER: Prints a message and returns the sum of attribute a on
+            # the three arguments.
             print("f")
             return x.a + y.a + z.a
 
         def fn(x, y, z):
+            # [FUNCTION DOC] HELPER: Sets attribute a to 1, 2 and 3 on the three tensors,
+            # calls the inlined helper to get their sum, then returns the first two tensors
+            # multiplied by it.
             x.a = 1
             y.a = 2
             z.a = 3
@@ -283,7 +346,15 @@ class TestInputAttrTracking(torch._dynamo.test_case.TestCase):
         # output         output  output                   ((mul_1, mul),)  {}
 
     def test_set_data_on_input_tensor(self):
+        # [FUNCTION DOC] Assigns the data of one input tensor (different shape) to another
+        # input inside a fully compiled function and multiplies them. Checks the result
+        # matches eager, one frame, five operations, and that the normalized printed graph
+        # matches the expected inline text, which uses the get-data-attribute call and the
+        # shallow-copy-data op with grad disabled around it.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Sets the data of the first tensor to the data of the
+            # second; returns their product if their sizes are equal (always true after the
+            # assignment), otherwise the square of the second.
             x.data = y.data
             if x.size() == y.size():
                 return x * y
@@ -332,7 +403,13 @@ class GraphModule(torch.nn.Module):
 
     # See [Note: set_data_on_scoped_tensor] This does not actually get captured in the graph yet.
     def test_set_data_on_scoped_tensor(self):
+        # [FUNCTION DOC] Creates a local tensor, assigns an input tensor's data to it and
+        # multiplies them, compiled without full graph. Asserts the result matches eager, two
+        # frames and three operations (this data assignment on a scoped tensor currently
+        # causes a graph break per the referenced note).
         def fn(x):
+            # [FUNCTION DOC] HELPER: Creates a zero tensor, sets its data to the input's data,
+            # then returns their product if sizes match, else the input.
             z = torch.zeros([4, 4])
             z.data = x.data
             if x.size() == z.size():
@@ -354,12 +431,22 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(counter.op_count, 3)
 
     def test_set_data_on_user_defined_class_input_tensor(self):
+        # [FUNCTION DOC] Compiles a bound method of a user-defined object that sets attributes
+        # derived from enclosing-scope tensors, with a full graph, and compares to the same
+        # method run eagerly on another object. Asserts one frame and three operations.
         class MyUserDefinedClass:
+            # [CLASS DOC] HELPER: Simple object storing two tensors in attributes x and y and
+            # offering a method that sets two more attributes.
             def __init__(self, x, y):
+                # [FUNCTION DOC] HELPER: Stores the two arguments on the instance as x and y.
                 self.x = x
                 self.y = y
 
             def do_some_setattr_stuff(self):
+                # [FUNCTION DOC] HELPER: Sets attribute z to the product and attribute a to
+                # the sum of the enclosing-scope tensors x and y, and returns their product.
+                # KNOWN ISSUE: uses the enclosing variables x and y, not the instance
+                # attributes, though the values are the same tensors in this test.
                 self.z = x * y
                 self.a = x + x
                 return self.z * self.a
