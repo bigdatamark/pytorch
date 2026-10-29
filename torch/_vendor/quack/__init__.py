@@ -1,3 +1,7 @@
+# [PACKAGE DOC] Vendored subset of the quack CuTeDSL kernel library. On import it applies
+# two CuTeDSL workaround patches (ELF section fix and MLIR threading fix) before any compile.
+# Exports lazily (via module attribute lookup) the rmsnorm function; unknown names raise
+# AttributeError. Also defines __version__ and __upstream_sha__.
 """Vendored subset of the quack library (https://github.com/Dao-AILab/quack).
 
 The pinned upstream commit is recorded in ``__upstream_sha__`` below and is
@@ -25,6 +29,9 @@ cute_dsl_elf_fix.patch()
 cute_dsl_mlir_threading.patch()
 
 def __getattr__(name):
+    # [FUNCTION DOC] Lazy module attribute hook: for the name rmsnorm, imports and returns the
+    # rmsnorm function from the rmsnorm submodule (deferring heavy imports); any other name
+    # raises AttributeError.
     if name == "rmsnorm":
         from .rmsnorm import rmsnorm
 

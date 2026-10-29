@@ -4,6 +4,12 @@
 # matching the parent's tensor metadata, and compiles with COMPILE_ONLY=True.
 # Stays alive to process multiple configs (amortizes import overhead).
 
+# [MODULE DOC] Subprocess entry point for parallel autotune pre-compilation. Protocol: 4-byte
+# little-endian length prefix followed by a pickle, on stdin (tasks) and stdout (replies).
+# Replies are "READY" at startup, then "OK" or an error string prefixed "ERR:" per task.
+# Import-time side effect: increments the cache module's compile-only depth counter for the
+# whole process lifetime. Run via main() when executed as a script.
+
 import importlib
 import os
 import pickle
@@ -26,6 +32,10 @@ _WATCHDOG_POLL_SECS = 60.0
 
 
 def _install_parent_watchdog() -> None:
+    # [FUNCTION DOC] HELPER: Reads the parent pid from the environment variable
+    # QUACK_COMPILE_WORKER_PARENT_PID; if absent or not an integer, returns without effect.
+    # Otherwise ignores SIGINT and starts a daemon thread that every poll interval checks the
+    # current parent pid and kills this process with SIGKILL if it changed (parent died).
     """Self-terminate if the spawning parent process dies.
 
     Without this, a worker whose parent died (segfault, OOM-kill, the
@@ -58,6 +68,7 @@ def _install_parent_watchdog() -> None:
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
     def _poll():
+        # [FUNCTION DOC] HELPER: Watchdog loop: sleeps, then SIGKILLs this process when the parent pid differs from the original. Never returns.
         while True:
             time.sleep(_WATCHDOG_POLL_SECS)
             # ``os.getppid()`` returns 1 (init) once the original parent
@@ -105,6 +116,8 @@ _dtype_map = {
 
 
 def _make_fake_tensor(meta):
+    # [FUNCTION DOC] HELPER: Builds an uninitialized CUDA tensor from a metadata mapping with
+    # shape, stride and dtype-name keys (dtype looked up in the dtype map; unknown name raises KeyError).
     shape = meta["shape"]
     stride = meta["stride"]
     dtype = _dtype_map[meta["dtype"]]
@@ -112,6 +125,9 @@ def _make_fake_tensor(meta):
 
 
 def _deserialize_precompile_value(value):
+    # [FUNCTION DOC] HELPER: Recursively walks mappings, tuples and lists; any mapping tagged
+    # as tensor metadata becomes a fake tensor, other containers are rebuilt with converted
+    # members, and all other values are returned unchanged.
     if isinstance(value, dict):
         if value.get(_TENSOR_META_TAG):
             return _make_fake_tensor(value)
@@ -124,6 +140,9 @@ def _deserialize_precompile_value(value):
 
 
 def _recv(stream):
+    # [FUNCTION DOC] HELPER: Reads a 4-byte length header then that many bytes and unpickles
+    # them. Returns None on short header (EOF) or a zero length (shutdown signal).
+    # Note: unpickles data from stdin, so the peer must be trusted.
     """Read a length-prefixed pickled message. Returns None on EOF."""
     header = stream.read(4)
     if len(header) < 4:
@@ -136,6 +155,7 @@ def _recv(stream):
 
 
 def _send(stream, msg):
+    # [FUNCTION DOC] HELPER: Pickles msg, writes a 4-byte length header and the payload to the stream, and flushes.
     """Write a length-prefixed pickled message."""
     data = pickle.dumps(msg)
     stream.write(struct.pack("<I", len(data)))
@@ -144,6 +164,11 @@ def _send(stream, msg):
 
 
 def main():
+    # [FUNCTION DOC] Worker main loop. Installs the parent watchdog, sends "READY", then for each
+    # received task (function module, qualified name, args, kwargs, config kwargs) imports and
+    # caches the target function (unwrapping its fn attribute if present), converts tensor
+    # metadata to fake CUDA tensors under the compile-only fake-tensor mode, calls the function
+    # and replies "OK", or "ERR:" plus the message if any exception occurs. Exits on EOF.
     # Install the watchdog before doing any work so an orphaned worker that
     # gets stuck in ``cute.compile`` self-terminates within the poll window.
     _install_parent_watchdog()

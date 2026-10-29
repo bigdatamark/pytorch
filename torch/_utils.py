@@ -1,4 +1,12 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Grab-bag of internal utilities: legacy tensor/storage type conversion and device
+# transfer, unpickling rebuild functions for tensors (dense, sparse, quantized, nested, meta,
+# wrapper subclass, parameters), flatten/unflatten and chunking of tensor lists, exception wrapping
+# across threads, device-index and accelerator discovery, class properties, lazy seed tracking,
+# callback registry, pickle compatibility name maps for the weights-only unpickler, FX-aware memory
+# snapshot augmentation, and c10-synchronized environment variable access with an os.environ hook.
+# Import-time side effects: defines module-level state (pending sparse-tensor list, logger,
+# name mapping tables extended with Python 2 exception names); installs no hooks by itself.
 import _compat_pickle
 import copyreg
 import functools
@@ -21,6 +29,7 @@ import torch
 
 
 def _type(self, dtype=None, non_blocking=False, **kwargs):
+    # [FUNCTION DOC] HELPER: Implementation of the legacy storage/tensor type method. With no dtype returns the dotted class name string of self. With a dtype (class or dotted-name string, imported on demand) returns self if it is already that type; otherwise converts: sparse to sparse converts values and indices separately, mixing sparse and dense raises RuntimeError; dense uses a new object of the target type copied from self, optionally non-blocking. The deprecated async keyword is accepted via the helper; other keywords raise TypeError.
     """Returns the type if `dtype` is not provided, else casts this object to
     the specified type.
 
@@ -61,6 +70,7 @@ def _type(self, dtype=None, non_blocking=False, **kwargs):
 
 
 def _to(self, device, non_blocking=False):
+    # [FUNCTION DOC] HELPER: Returns self if already on the device. For a CPU target returns an untyped storage of the same byte count (pinned when non_blocking and the source is on an accelerator device) copied from self. For other devices requires the device module to exist (else AssertionError); copies sparse data via indices and values when the device module has a sparse namespace, raises AssertionError for sparse otherwise, and for dense creates an untyped storage on the device and copies into it.
     """Returns a copy of this object in device memory.
 
     If this object is already on the correct device, then no copy is performed
@@ -112,6 +122,7 @@ def _to(self, device, non_blocking=False):
 
 
 def _get_async_or_non_blocking(function_name, non_blocking, kwargs):
+    # [FUNCTION DOC] HELPER: Resolves the non_blocking flag from legacy keyword arguments. Returns the default when no extra kwargs; if the only kwarg is async, warns about deprecation and returns its value; any other kwargs raise TypeError naming the function and the offending argument.
     """Return the non-blocking flag given the function name and kwargs.
 
     Args:
@@ -130,6 +141,7 @@ def _get_async_or_non_blocking(function_name, non_blocking, kwargs):
 
 
 def _get_restore_location(device):
+    # [FUNCTION DOC] HELPER: Applies the thread-local serialization map_location to a device. No map_location returns the device; a mapping returns the mapped value (or the device if missing); a string or device is returned directly; a callable map_location raises RuntimeError (unsupported for these rebuild paths).
     """Return the map_location location.
 
     Used for rebuild functions where the tensor device is distinct from the storage
@@ -194,12 +206,14 @@ def _get_restore_location(device):
 # TODO: Once we decide to break serialization FC, `storage` no longer needs to
 # be a TypedStorage
 def _rebuild_tensor(storage, storage_offset, size, stride):
+    # [FUNCTION DOC] HELPER: Builds a tensor sharing the given storage: makes an empty tensor with the storage dtype and device, then points it at the underlying untyped storage with the given offset, size and stride. Returns the tensor.
     # first construct a tensor with the correct dtype/device
     t = torch.empty((0,), dtype=storage.dtype, device=storage._untyped_storage.device)
     return t.set_(storage._untyped_storage, storage_offset, size, stride)
 
 
 def get_tensor_metadata(tensor):
+    # [FUNCTION DOC] Returns the serializable metadata mapping of a tensor (flags such as conj and neg bits). Raises AssertionError if the argument is not a tensor.
     # Tensor's Metadata for serializing.
     # Currently, this only returns a dict[string, bool] specifying whether
     # `conj` or `neg` bit is set.
@@ -209,6 +223,7 @@ def get_tensor_metadata(tensor):
 
 
 def set_tensor_metadata(tensor, metadata):
+    # [FUNCTION DOC] Applies a metadata mapping (as produced by get_tensor_metadata) onto a tensor in place. Raises AssertionError if metadata is not a dict or tensor is not a tensor.
     # See `get_tensor_metadata` above
     if not isinstance(metadata, dict):
         raise AssertionError(f"expected dict, got {type(metadata).__name__}")
@@ -218,6 +233,7 @@ def set_tensor_metadata(tensor, metadata):
 
 
 def _restore_device_fake_mode(tensor):
+    # [FUNCTION DOC] HELPER: When a fake tensor mode is active and the tensor's storage records a fake device, sets the tensor's fake device to that device after applying the map_location mapping. Returns the tensor.
     if torch._guards.detect_fake_mode(None) is not None:
         if tensor.untyped_storage()._fake_device is not None:
             device = _get_restore_location(tensor.untyped_storage()._fake_device)
@@ -236,6 +252,7 @@ def _rebuild_tensor_v2(
     backward_hooks,
     metadata=None,
 ):
+    # [FUNCTION DOC] HELPER: Unpickling entry point for tensors: rebuilds from storage, offset, size, stride; sets requires_grad; applies optional metadata; assigns the (expected empty) backward hooks for backward compatibility; restores fake device. Returns the tensor.
     tensor = _rebuild_tensor(storage, storage_offset, size, stride)
     tensor.requires_grad = requires_grad
     if metadata:
@@ -260,6 +277,7 @@ def _rebuild_tensor_v3(
     dtype,
     metadata=None,
 ):
+    # [FUNCTION DOC] HELPER: Like the v2 rebuild but takes an explicit dtype (allowing a dtype different from the storage's typed view) and creates the empty tensor with that dtype and requires_grad directly. Applies metadata, hooks and fake-device restore. Returns the tensor.
     t = torch.empty(
         (0,),
         dtype=dtype,
@@ -288,6 +306,7 @@ _sparse_tensors_to_validate: list["torch.Tensor"] = []
 # to Pickler semantics, we have to use the same (non-validating) function for
 # unpickling sparse tensors, regardless of the caller.
 def _validate_loaded_sparse_tensors(weights_only=False):
+    # [FUNCTION DOC] HELPER: Validates, in bulk, the sparse tensors collected in the module-level pending list during unpickling. Returns immediately if the list is empty. With weights_only it always validates (and warns about cost); otherwise only when the global sparse invariant checking is enabled. Dispatches validation by layout (COO or the four compressed layouts, pinning check off); other layouts raise NotImplementedError. The pending list is always cleared afterwards.
     # In weights_only mode we always validate: malformed sparse indices can
     # cause out-of-bounds reads later (e.g. in to_dense()), and an untrusted
     # checkpoint must not be able to slip those through. Otherwise we fall back
@@ -352,6 +371,7 @@ def _validate_loaded_sparse_tensors(weights_only=False):
 
 
 def _rebuild_sparse_tensor(layout, data):
+    # [FUNCTION DOC] HELPER: Unpickling entry point for sparse tensors. COO data is (indices, values, size[, coalesced flag]) with the old 3-tuple form accepted; compressed layouts take (compressed indices, plain indices, values, size). Creates the tensor without invariant checks, appends it to the pending-validation list, and returns it. Unknown layouts raise NotImplementedError.
     """
     Rebuilds a sparse tensor from its sparse storage representation.
 
@@ -394,10 +414,12 @@ def _rebuild_sparse_tensor(layout, data):
 
 
 def _rebuild_nested_tensor(buffer, sizes, strides, storage_offsets):
+    # [FUNCTION DOC] HELPER: Rebuilds a nested tensor as a view over a buffer using the given sizes, strides and storage offsets.
     return torch._nested_view_from_buffer(buffer, sizes, strides, storage_offsets)
 
 
 def _rebuild_device_tensor_from_cpu_tensor(data, dtype, device, requires_grad):
+    # [FUNCTION DOC] HELPER: Maps the device through map_location, moves the CPU data to the given dtype and device, sets requires_grad, and returns it.
     device = _get_restore_location(device)
     tensor = data.to(dtype=dtype, device=device)
     tensor.requires_grad = requires_grad
@@ -405,6 +427,7 @@ def _rebuild_device_tensor_from_cpu_tensor(data, dtype, device, requires_grad):
 
 
 def _rebuild_device_tensor_from_numpy(data, dtype, device, requires_grad):
+    # [FUNCTION DOC] HELPER: Maps the device through map_location, converts the numpy array to a tensor on the given dtype and device, sets requires_grad, and returns it.
     device = _get_restore_location(device)
     tensor = torch.from_numpy(data).to(dtype=dtype, device=device)
     tensor.requires_grad = requires_grad
@@ -416,6 +439,7 @@ _rebuild_xla_tensor = _rebuild_device_tensor_from_numpy
 
 
 def _rebuild_meta_tensor_no_storage(dtype, size, stride, requires_grad):
+    # [FUNCTION DOC] HELPER: Creates a storage-less tensor on the meta device with the given dtype, size, stride and requires_grad.
     return torch.empty_strided(
         size, stride, dtype=dtype, device="meta", requires_grad=requires_grad
     )
@@ -431,6 +455,7 @@ def _rebuild_wrapper_subclass(
     device,
     requires_grad,
 ):
+    # [FUNCTION DOC] HELPER: Maps the device through map_location and creates a wrapper-subclass tensor of class cls with the given size, stride, dtype, offset, layout and requires_grad (no real storage).
     device = _get_restore_location(device)
     return torch.Tensor._make_wrapper_subclass(
         cls,
@@ -455,6 +480,7 @@ def _rebuild_qtensor(
     requires_grad,
     backward_hooks,
 ):
+    # [FUNCTION DOC] HELPER: Rebuilds a quantized tensor from storage and quantizer parameters. Per-tensor affine uses scale and zero point. Per-channel schemes validate the axis range and that scales and zero points both have length equal to the size along the axis (ValueError otherwise, to guard against untrusted checkpoints), converting list inputs to tensors of the appropriate dtype. Unknown schemes raise RuntimeError. Then points the tensor at the storage, sets requires_grad and the legacy hooks, and returns it.
     qscheme = quantizer_params[0]
     if qscheme == torch.per_tensor_affine:
         _, scale, zero_point = quantizer_params
@@ -516,6 +542,7 @@ def _rebuild_qtensor(
 
 
 def _rebuild_parameter(data, requires_grad, backward_hooks):
+    # [FUNCTION DOC] HELPER: Creates a Parameter from data and requires_grad, assigns the legacy backward hooks, and returns it.
     param = torch.nn.Parameter(data, requires_grad)
     # NB: This line exists only for backwards compatibility; the
     # general expectation is that backward_hooks is an empty
@@ -526,6 +553,7 @@ def _rebuild_parameter(data, requires_grad, backward_hooks):
 
 
 def _rebuild_parameter_with_state(data, requires_grad, backward_hooks, state):
+    # [FUNCTION DOC] HELPER: Like the parameter rebuild but also restores saved Python object state (attributes and slots) onto the parameter. Returns it.
     param = torch.nn.Parameter(data, requires_grad)
     # NB: This line exists only for backwards compatibility; the
     # general expectation is that backward_hooks is an empty
@@ -538,6 +566,7 @@ def _rebuild_parameter_with_state(data, requires_grad, backward_hooks, state):
 
 
 def _get_obj_state(obj):
+    # [FUNCTION DOC] HELPER: Returns the picklable state of a Python object: the result of its state hook if it has one; otherwise a pair of attribute mapping and slot-value mapping when it has slots, else its attribute mapping.
     # Get the state of the python subclass
     # This loosely mimics the function on the object class but since Tensor do not inherit
     # from it, we cannot call that function directly
@@ -565,6 +594,7 @@ def _get_obj_state(obj):
 
 
 def _set_obj_state(obj, state):
+    # [FUNCTION DOC] HELPER: Restores state produced by the state getter onto obj. A tuple state must have exactly two items (attribute mapping, slots mapping) else RuntimeError; sets each non-empty mapping entry as an attribute. Returns obj.
     if isinstance(state, tuple):
         if not len(state) == 2:
             raise RuntimeError(f"Invalid serialized state: {state}")
@@ -587,6 +617,7 @@ def _set_obj_state(obj, state):
 
 
 def _import_dotted_name(name):
+    # [FUNCTION DOC] HELPER: Imports the first component of a dotted name and resolves the remaining components as attributes; returns the final object. Errors from import or attribute lookup propagate.
     components = name.split(".")
     obj = __import__(components[0])
     for component in components[1:]:
@@ -595,6 +626,7 @@ def _import_dotted_name(name):
 
 
 def _flatten_dense_tensors(tensors):
+    # [FUNCTION DOC] HELPER: Concatenates dense tensors of the same type into one contiguous 1D buffer via the native helper; returns the buffer.
     """Flatten dense tensors into a contiguous 1D buffer. Assume tensors are of
     same dense type.
 
@@ -612,6 +644,7 @@ def _flatten_dense_tensors(tensors):
 
 
 def _flatten_sparse_tensors(tensors):
+    # [FUNCTION DOC] HELPER: Flattens the indices of all sparse tensors into one 1D buffer and their values into another; returns the (indices, values) pair.
     """Flatten sparse tensors into two contiguous 1D buffers, one of indices and
     one of values. Assume tensors are of same sparse type.
 
@@ -632,6 +665,7 @@ def _flatten_sparse_tensors(tensors):
 
 
 def _unflatten_dense_tensors(flat, tensors):
+    # [FUNCTION DOC] HELPER: Returns views of the flat buffer shaped like each of the given tensors (inverse of the dense flatten).
     """View a flat buffer using the sizes of tensors. Assume that tensors are of
     same dense type, and that flat is given by _flatten_dense_tensors.
 
@@ -648,6 +682,7 @@ def _unflatten_dense_tensors(flat, tensors):
 
 
 def _unflatten_sparse_tensors(flat, tensors):
+    # [FUNCTION DOC] HELPER: Splits the (flat indices, flat values) pair back into per-tensor indices and values using the reference sparse tensors' shapes, and builds a new sparse tensor of each reference's type with its size. Returns a tuple of them.
     """View flat buffer (containing indices and values) using the sizes of
     tensors. Assume that tensors are of same sparse type, and that flat is given
     by _flatten_sparse_tensors.
@@ -676,6 +711,7 @@ def _unflatten_sparse_tensors(flat, tensors):
 
 
 def _reorder_tensors_as(tensors, ordered_tensors):
+    # [FUNCTION DOC] HELPER: Given tensors grouped by type (as produced by chunking), returns a tuple reordered to follow the type sequence of ordered_tensors; consumes each type's tensors in their existing order. Raises StopIteration if a type runs out.
     """Assume that tensors are of same order as ordered_tensors within their
     types, e.g., from _take_tensors. Reorder them to be of same order as
     ordered_tensors.
@@ -698,6 +734,7 @@ def _reorder_tensors_as(tensors, ordered_tensors):
 
 
 def _take_tensors(tensors, size_limit):
+    # [FUNCTION DOC] HELPER: Generator grouping tensors into chunks of the same type whose total byte size stays within size_limit (sparse tensors counted as indices plus values bytes). Yields a full chunk when adding the next tensor would exceed the limit (a chunk always holds at least one tensor), then yields remaining partial chunks at the end. Order is preserved only within each type.
     """Group tensors into chunks. This generator yields a chunk at each time,
     each containing tensors of same type up to certain byte limit in total size.
 
@@ -733,6 +770,7 @@ def _take_tensors(tensors, size_limit):
 
 
 def render_call(fn, args, kwargs):
+    # [FUNCTION DOC] Returns a string rendering of a call: the resolved function name (or its string form) followed by the repr of args and keyword args, with tensor printing suppressed to summaries (threshold and edge items zero).
     str_fn = torch.overrides.resolve_name(fn)
     if str_fn is None:
         str_fn = str(fn)
@@ -755,18 +793,22 @@ def render_call(fn, args, kwargs):
 
 
 class KeyErrorMessage(str):
+    # [CLASS DOC] HELPER: String subclass whose repr is the string itself, so KeyError messages print readably instead of quoted/escaped.
     r"""str subclass that returns itself in repr"""
 
     __slots__ = ()
 
     def __repr__(self):
+        # [FUNCTION DOC] HELPER: Returns self unchanged (no quoting).
         return self
 
 
 class ExceptionWrapper:
+    # [CLASS DOC] Captures an exception's type and formatted traceback text (not the traceback object, avoiding reference cycles) plus a location phrase, so it can be sent across threads or processes and re-raised. Attributes: exc_type, exc_msg, where.
     r"""Wraps an exception plus traceback to communicate across threads"""
 
     def __init__(self, exc_info=None, where="in background"):
+        # [FUNCTION DOC] Records the exception type and the formatted traceback text from the given exc_info triple, or from the currently handled exception when None; stores the where phrase.
         # It is important that we don't store exc_info, see
         # NOTE [ Python Traceback Reference Cycle Problem ]
         if exc_info is None:
@@ -777,6 +819,7 @@ class ExceptionWrapper:
         self.where = where
 
     def reraise(self):
+        # [FUNCTION DOC] Raises, in the current thread, an exception of the original type with a message of the form 'Caught <type> <where>' followed by the original traceback text. KeyError messages use a readable-repr wrapper. Types with a message attribute are constructed with a message keyword. If the type cannot be constructed from a single message, raises RuntimeError with that message instead. Never returns normally.
         r"""Reraises the wrapped exception in the current thread"""
         # Format a message such as: "Caught ValueError in DataLoader worker
         # process 2. Original Traceback:", followed by the traceback.
@@ -804,6 +847,7 @@ class ExceptionWrapper:
 
 
 def cpu_count() -> int | None:
+    # [FUNCTION DOC] Returns the number of CPUs usable by this process (affinity-aware where supported), else the total CPU count, which may be None.
     """Return the number of CPUs available to the current process.
 
     Prefers ``os.sched_getaffinity`` (respects cgroups / taskset) and
@@ -817,6 +861,7 @@ def cpu_count() -> int | None:
 
 
 def _get_available_device_type():
+    # [FUNCTION DOC] HELPER: Returns the first available accelerator type name checking in order cuda, mps, xpu, mtia, then a registered private-use backend; None when none is available.
     if torch.cuda.is_available():
         return "cuda"
     if torch.backends.mps.is_available():
@@ -834,6 +879,7 @@ def _get_available_device_type():
 
 
 def _get_device_attr(get_member):
+    # [FUNCTION DOC] HELPER: Applies the getter function to the runtime module of the available accelerator type and returns its result; returns None when no accelerator is available.
     device_type = _get_available_device_type()
     if device_type and device_type.lower() == "cuda":
         return get_member(torch.cuda)
@@ -850,21 +896,25 @@ def _get_device_attr(get_member):
 
 
 def _get_current_device_index():
+    # [FUNCTION DOC] HELPER: Returns the current device index of the available accelerator type, or None if none.
     # current device index
     return _get_device_attr(lambda m: m.current_device())
 
 
 def _get_all_device_indices():
+    # [FUNCTION DOC] HELPER: Returns the list of all device indices of the available accelerator type (None if no accelerator).
     # all device index
     return _get_device_attr(lambda m: list(range(m.device_count())))
 
 
 def _get_devices_properties(device_ids):
+    # [FUNCTION DOC] HELPER: Returns a list of device property objects for each given device index on the available accelerator. KNOWN ISSUE: with no accelerator each entry is None.
     # all device properties
     return [_get_device_attr(lambda m: m.get_device_properties(i)) for i in device_ids]
 
 
 def get_current_device_index() -> int:
+    # [FUNCTION DOC] Returns the current CUDA device index, or -1 when no CUDA devices exist. Scriptable counterpart of the generic current-device helper.
     r"""Checks if there are CUDA devices available and
     returns the device index of the current default CUDA device.
     Returns -1 in case there are no CUDA devices available.
@@ -880,6 +930,7 @@ def _get_device_index(
     optional: bool = False,
     allow_cpu: bool = False,
 ) -> int:
+    # [FUNCTION DOC] HELPER: Normalizes a device spec to an integer index. Strings become devices; CPU devices raise ValueError unless allow_cpu (then -1); device objects give their index; integers are returned as is. If no index results: when optional, returns the current device index (scripting-aware), otherwise raises ValueError. Note a device object without index yields no index and so follows the same path.
     r"""Gets the device index from :attr:`device`, which can be a torch.device
     object, a Python integer, or ``None``.
 
@@ -923,6 +974,7 @@ def _get_device_index(
 
 
 def _handle_complex(tensor):
+    # [FUNCTION DOC] HELPER: Returns a real-valued view of a complex tensor, or the tensor itself otherwise; uninitialized lazy parameters are passed through without querying complexity.
     """
     Returns a real view of a tensor if complex dtype else just the tensor
     need to check if a UninitializedParameter because otherwise checking is_complex is an error for a LazyModule
@@ -936,6 +988,7 @@ def _handle_complex(tensor):
 
 
 def _element_size(dtype):
+    # [FUNCTION DOC] HELPER: Returns bytes per element of a dtype: complex via bit width divided by 4, floating via width divided by 8, bool is 1, other integers via width divided by 8. Raises RuntimeError if not a dtype.
     """
     Returns the element size for a dtype, in bytes
     """
@@ -954,16 +1007,20 @@ def _element_size(dtype):
 
 
 class _ClassPropertyDescriptor:
+    # [CLASS DOC] HELPER: Descriptor that exposes a class-level property: on attribute access it binds the stored getter to the owner class and calls it. Attribute: fget. A setter is not supported.
     def __init__(self, fget, fset=None):
+        # [FUNCTION DOC] HELPER: Stores the getter; the setter argument is accepted but ignored.
         self.fget = fget
 
     def __get__(self, instance, owner=None):
+        # [FUNCTION DOC] HELPER: Resolves the owner (type of the instance if not given), binds the getter and returns its call result.
         if owner is None:
             owner = type(instance)
         return self.fget.__get__(instance, owner)()
 
 
 def classproperty(func):
+    # [FUNCTION DOC] Decorator turning a function into a class-level read-only property; wraps it as a class method unless it already is a class or static method. Returns the descriptor.
     if not isinstance(func, (classmethod, staticmethod)):
         func = classmethod(func)
     return _ClassPropertyDescriptor(func)
@@ -977,11 +1034,13 @@ if TYPE_CHECKING:
         category=FutureWarning,
     )
     def is_compiling() -> bool:
+        # [FUNCTION DOC] Type-checking-only variant, deprecated: returns whether torch.compile or export tracing is active.
         return torch.compiler.is_compiling()
 
 else:
 
     def is_compiling() -> bool:
+        # [FUNCTION DOC] Deprecated: emits a warning pointing to the compiler namespace function, then returns whether torch.compile or export tracing is active (the warning is manual because TorchScript lacks the deprecation decorator).
         """
         Indicates whether we are tracing/compiling with torch.compile() or torch.export().
         """
@@ -994,6 +1053,7 @@ else:
 
 
 def _functionalize_sync(t):
+    # [FUNCTION DOC] HELPER: Syncs a functionalized tensor. For a Python functional tensor, temporarily removes any active functional dispatch mode so it does not intercept view ops during the sync, syncs the inner tensor, and restores the mode in a finally block; otherwise syncs the tensor directly.
     # This code lives in python instead of C++ since conditioning on a certain python subclass
     # is much more of a pain in C++.
     from torch._subclasses.functional_tensor import FunctionalTensor
@@ -1025,6 +1085,7 @@ def _functionalize_sync(t):
 
 @functools.lru_cache(2)
 def _get_device_module(device_type: str):
+    # [FUNCTION DOC] HELPER: Cached (size 2). Returns the torch submodule named after the device type; raises RuntimeError if there is none.
     device_module = getattr(torch, device_type, None)
     if device_module is None:
         raise RuntimeError(
@@ -1034,8 +1095,11 @@ def _get_device_module(device_type: str):
 
 
 def _dummy_type(name: str) -> type:
+    # [FUNCTION DOC] HELPER: Creates a placeholder class of the given name whose construction always fails with RuntimeError (used when a backend type is unavailable).
     def get_err_fn(is_init: bool):
+        # [FUNCTION DOC] HELPER: Returns an error-raising function configured for either the initializer or the allocator, differing in how the class name is obtained.
         def err_fn(obj, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Always raises RuntimeError saying the dummy base class cannot be instantiated.
             if is_init:
                 class_name = obj.__class__.__name__
             else:
@@ -1050,26 +1114,32 @@ def _dummy_type(name: str) -> type:
 
 
 class _LazySeedTracker:
+    # [CLASS DOC] HELPER: Remembers the latest queued manual_seed_all and manual_seed callbacks (with tracebacks) and their relative order, since seeding is memoryless. Attributes: manual_seed_all_cb, manual_seed_cb, call_order.
     # Since seeding is memory-less, only track the latest seed.
     # Note: `manual_seed_all` followed by `manual_seed` overwrites
     # the seed on current device. We track the order of **latest**
     # calls between these two API.
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Initializes both callbacks to None and an empty call order.
         self.manual_seed_all_cb = None
         self.manual_seed_cb = None
         self.call_order = []
 
     def queue_seed_all(self, cb, traceback):
+        # [FUNCTION DOC] HELPER: Stores the latest all-devices seed callback and traceback and places it last in the call order.
         self.manual_seed_all_cb = (cb, traceback)  # pyrefly: ignore [bad-assignment]
         # update seed_all to be latest
         self.call_order = [self.manual_seed_cb, self.manual_seed_all_cb]
 
     def queue_seed(self, cb, traceback):
+        # [FUNCTION DOC] HELPER: Stores the latest current-device seed callback and traceback and places it last in the call order.
+        # KNOWN ISSUE: the call order list can contain None for a never-queued kind; callers must skip those.
         self.manual_seed_cb = (cb, traceback)  # pyrefly: ignore [bad-assignment]
         # update seed to be latest
         self.call_order = [self.manual_seed_all_cb, self.manual_seed_cb]
 
     def get_calls(self) -> list:
+        # [FUNCTION DOC] HELPER: Returns the ordered list of pending seed calls.
         return self.call_order
 
 
@@ -1078,14 +1148,18 @@ P = ParamSpec("P")
 
 
 class CallbackRegistry(Generic[P]):
+    # [CLASS DOC] Simple named registry of callbacks sharing one signature. Attributes: name (used in log messages) and callback_list (in registration order).
     def __init__(self, name: str):
+        # [FUNCTION DOC] Stores the name and creates an empty callback list.
         self.name = name
         self.callback_list: list[Callable[P, None]] = []
 
     def add_callback(self, cb: Callable[P, None]) -> None:
+        # [FUNCTION DOC] Appends a callback to the registry.
         self.callback_list.append(cb)
 
     def fire_callbacks(self, *args: P.args, **kwargs: P.kwargs) -> None:
+        # [FUNCTION DOC] Calls every registered callback in order with the given arguments; an exception in a callback is logged (not raised) and the remaining callbacks still run.
         for cb in self.callback_list:
             try:
                 cb(*args, **kwargs)
@@ -1096,6 +1170,7 @@ class CallbackRegistry(Generic[P]):
 
 
 def try_import(module_name: str) -> ModuleType | None:
+    # [FUNCTION DOC] Returns the module with the given name if already imported; otherwise, if it can be found, creates it from its spec, registers it in the module table, executes it and returns it; returns None if not found. Raises AssertionError if the spec has no loader. Side effect: registers the module before executing it.
     # Implementation based on
     # https://docs.python.org/3/library/importlib.html#checking-if-a-module-can-be-imported
     if (module := sys.modules.get(module_name, None)) is not None:
@@ -1175,6 +1250,7 @@ def _chunk_or_narrow_cat(
     narrow_dim: int,
     cat_dim: int = 0,
 ) -> "torch.Tensor":
+    # [FUNCTION DOC] HELPER: Splits the tensor into num_chunks along narrow_dim and concatenates them along cat_dim. When distributed is available, tracing is active and the tensor has free unbacked symbolic sizes, uses equal-size narrow slices (floor division) instead of chunk to stay symbolic safe; otherwise uses chunk. Returns the new tensor.
     """
     Splits tensor along narrow_dim into num_chunks and concatenates along cat_dim.
     Uses torch.chunk in eager mode, but torch.narrow under tracing to be unbacked-symint safe.
@@ -1198,6 +1274,7 @@ def _chunk_or_narrow_cat(
 def _maybe_view_chunk_cat(
     res: "torch.Tensor", group_size: int, gather_dim: int
 ) -> "torch.Tensor":
+    # [FUNCTION DOC] HELPER: Equivalent to splitting the result of an all-gather (stacked on dim 0) into group_size chunks and concatenating them along gather_dim. Returns res unchanged when gather_dim is 0. If dim 0 size equals group_size and all dims between 0 and gather_dim have size 1 (decided with guard-or-false, so unknown symbolic sizes take the slow path), returns a reshaped view with dim 0 folded into gather_dim; otherwise falls back to the chunk-and-cat helper (a copy).
     """
     This is intuitively the same as torch.cat(torch.chunk(res, group_size,
     dim=0), dim=gather_dim), but returns a view if data movement is not
@@ -1264,6 +1341,7 @@ def _maybe_view_chunk_cat(
 
 
 class _Frame(TypedDict):
+    # [CLASS DOC] HELPER: Typed dictionary for one stack frame in a memory snapshot: filename, line, name, plus optional FX node op, name, target and original trace added by augmentation.
     """Frame information from memory profiler snapshots."""
 
     filename: str
@@ -1277,6 +1355,7 @@ class _Frame(TypedDict):
 
 
 class _Block(TypedDict):
+    # [CLASS DOC] HELPER: Typed dictionary for one allocator block in a snapshot: size, requested size, address, state and its frames.
     """Memory block information."""
 
     size: int
@@ -1287,6 +1366,7 @@ class _Block(TypedDict):
 
 
 class _Segment(TypedDict):
+    # [CLASS DOC] HELPER: Typed dictionary for one allocator segment in a snapshot: address, sizes, stream, type and its blocks.
     """Memory segment information."""
 
     address: int
@@ -1299,6 +1379,7 @@ class _Segment(TypedDict):
 
 
 class _TraceEntry(TypedDict):
+    # [CLASS DOC] HELPER: Typed dictionary for one memory history trace event: action, optional address, frames, size, stream and optional free device memory.
     """Memory trace entry information."""
 
     action: str
@@ -1310,6 +1391,7 @@ class _TraceEntry(TypedDict):
 
 
 class _Snapshot(TypedDict):
+    # [CLASS DOC] HELPER: Typed dictionary for a whole memory snapshot: list of segments and optional per-device trace lists.
     """Memory snapshot structure."""
 
     segments: list[_Segment]
@@ -1317,6 +1399,7 @@ class _Snapshot(TypedDict):
 
 
 def _augment_frames(frames: list[_Frame]) -> int:
+    # [FUNCTION DOC] HELPER: For each frame whose filename looks like an FX generated module file and is found in the FX metadata registry, maps its line (minus the prologue offset) to a graph node and writes the node op, name, target (as text) and, when present, the original stack trace into the frame in place. Frames lacking a filename, line, or any matching metadata are skipped. Returns the number of augmented frames.
     """
     Augment a list of frames with FX debug information. For each frame corresponding
     to an FX-generated Python file, this function attaches additional FX node
@@ -1383,6 +1466,8 @@ def _augment_frames(frames: list[_Frame]) -> int:
 def _augment_memory_snapshot_stack_traces(
     snapshot: str | _Snapshot,
 ) -> _Snapshot:
+    # [FUNCTION DOC] HELPER: Accepts a snapshot dictionary or a path to a pickled snapshot (loaded from disk; unpickling untrusted files is unsafe) and augments every frame in segment blocks and device traces in place using the in-process FX metadata registry, so it only works in the process that compiled the graphs. Returns the snapshot dictionary.
+    # # KNOWN ISSUE: the docstring claims an fx_node_info field is added, but only op, name, target and original trace fields are written.
     """
     Augment a memory snapshot with original source stack traces from FX metadata.
 
@@ -1423,6 +1508,7 @@ def _augment_memory_snapshot_stack_traces(
 
 
 def _is_privateuse1_backend_available():
+    # [FUNCTION DOC] HELPER: Returns true when the registered private-use backend module exists and its availability check returns true; falsy otherwise (may return None or False).
     """
     Determines whether the privateuse1 backend is registered and available.
 
@@ -1437,6 +1523,7 @@ def _is_privateuse1_backend_available():
 
 
 def getenv(name: str) -> "str | None":
+    # [FUNCTION DOC] Reads an environment variable through torch's C++ environment access (shared mutex with C++ code); returns its value or None if unset.
     """Read an environment variable through torch's serialized env access.
 
     Prefer this over :func:`os.getenv` when torch is loaded: it shares c10's
@@ -1453,6 +1540,7 @@ def getenv(name: str) -> "str | None":
 
 
 def setenv(name: str, value: str, overwrite: bool = True) -> None:
+    # [FUNCTION DOC] Sets an environment variable through torch's C++ environment access; when overwrite is false an existing value is left unchanged.
     """Set an environment variable through torch's serialized env access.
 
     Prefer this over assigning to :data:`os.environ` when torch is loaded: it
@@ -1470,6 +1558,7 @@ def setenv(name: str, value: str, overwrite: bool = True) -> None:
 
 
 def unsetenv(name: str) -> None:
+    # [FUNCTION DOC] Removes an environment variable through torch's C++ environment access.
     """Remove an environment variable through torch's serialized env access.
 
     The counterpart to :func:`setenv`; shares c10's environment mutex.
@@ -1487,14 +1576,17 @@ _original_os_unsetenv: "Callable[..., None] | None" = None
 
 
 def _torch_putenv(key: "str | bytes", value: "str | bytes") -> None:
+    # [FUNCTION DOC] HELPER: Replacement for the operating system put-environment call: decodes key and value (filesystem decoding) and forwards to the torch setenv with overwrite.
     setenv(os.fsdecode(key), os.fsdecode(value))
 
 
 def _torch_unsetenv(key: "str | bytes") -> None:
+    # [FUNCTION DOC] HELPER: Replacement for the operating system unset-environment call: decodes the key and forwards to the torch unsetenv.
     unsetenv(os.fsdecode(key))
 
 
 def install_os_environ_hook() -> None:
+    # [FUNCTION DOC] Saves the original os putenv and unsetenv functions in module globals and replaces them with the torch-routed versions so that environment mutations go through the c10 mutex. Idempotent: does nothing if already installed. Global side effect on the os module.
     """Route ``os.environ`` mutations through torch's serialized env access.
 
     CPython's ``os.environ.__setitem__`` / ``__delitem__`` call the module-level
@@ -1517,6 +1609,7 @@ def install_os_environ_hook() -> None:
 
 
 def remove_os_environ_hook() -> None:
+    # [FUNCTION DOC] Restores the saved original os putenv and unsetenv functions and clears the saved globals; does nothing if the hook is not installed.
     """Undo :func:`install_os_environ_hook`; a no-op if it was not installed."""
     global _original_os_putenv, _original_os_unsetenv
     if _original_os_putenv is None or _original_os_unsetenv is None:

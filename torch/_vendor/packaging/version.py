@@ -1,6 +1,10 @@
 # This file is dual licensed under the terms of the Apache License, Version
 # 2.0, and the BSD License. See the LICENSE file in the root of this repository
 # for complete details.
+# [MODULE DOC] Vendored PEP 440 version parsing and comparison. Provides parse, the Version class,
+# the InvalidVersion error, the unanchored VERSION_PATTERN regular expression string, and private
+# helpers that normalize pre/post/dev/local segments and compute the comparison key. The only
+# import-time work is defining types and compiling a regular expression.
 """
 .. testsetup::
 
@@ -43,6 +47,7 @@ class _Version(NamedTuple):
 
 
 def parse(version: str) -> "Version":
+    # [FUNCTION DOC] Parses a version string into a Version object; raises InvalidVersion if the string is not a valid PEP 440 version.
     """Parse the given version string.
 
     >>> parse('1.0.dev1')
@@ -55,6 +60,7 @@ def parse(version: str) -> "Version":
 
 
 class InvalidVersion(ValueError):
+    # [CLASS DOC] Error type raised when a version string cannot be parsed; carries only the message.
     """Raised when a version string is not a valid version.
 
     >>> Version("invalid")
@@ -65,45 +71,53 @@ class InvalidVersion(ValueError):
 
 
 class _BaseVersion:
+    # [CLASS DOC] HELPER: Base class providing hashing and rich comparison between versions using the sort key attribute set by subclasses; comparisons with non-version objects return NotImplemented.
     _key: Tuple[Any, ...]
 
     def __hash__(self) -> int:
+        # [FUNCTION DOC] HELPER: Hash of the comparison key.
         return hash(self._key)
 
     # Please keep the duplicated `isinstance` check
     # in the six comparisons hereunder
     # unless you find a way to avoid adding overhead function calls.
     def __lt__(self, other: "_BaseVersion") -> bool:
+        # [FUNCTION DOC] HELPER: Less-than on comparison keys; NotImplemented for non-version operands.
         if not isinstance(other, _BaseVersion):
             return NotImplemented
 
         return self._key < other._key
 
     def __le__(self, other: "_BaseVersion") -> bool:
+        # [FUNCTION DOC] HELPER: Less-or-equal on comparison keys; NotImplemented for non-version operands.
         if not isinstance(other, _BaseVersion):
             return NotImplemented
 
         return self._key <= other._key
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] HELPER: Equality on comparison keys; NotImplemented for non-version operands.
         if not isinstance(other, _BaseVersion):
             return NotImplemented
 
         return self._key == other._key
 
     def __ge__(self, other: "_BaseVersion") -> bool:
+        # [FUNCTION DOC] HELPER: Greater-or-equal on comparison keys; NotImplemented for non-version operands.
         if not isinstance(other, _BaseVersion):
             return NotImplemented
 
         return self._key >= other._key
 
     def __gt__(self, other: "_BaseVersion") -> bool:
+        # [FUNCTION DOC] HELPER: Greater-than on comparison keys; NotImplemented for non-version operands.
         if not isinstance(other, _BaseVersion):
             return NotImplemented
 
         return self._key > other._key
 
     def __ne__(self, other: object) -> bool:
+        # [FUNCTION DOC] HELPER: Inequality on comparison keys; NotImplemented for non-version operands.
         if not isinstance(other, _BaseVersion):
             return NotImplemented
 
@@ -157,6 +171,9 @@ flags set.
 
 
 class Version(_BaseVersion):
+    # [CLASS DOC] PEP 440 version: parses a string into epoch, release tuple, pre, post, dev and local
+    # parts (stored in an immutable named tuple) and a normalized sort key. Supports ordering, hashing,
+    # string round-trip, and read-only property accessors. Invalid input raises InvalidVersion.
     """This class abstracts handling of a project's versions.
 
     A :class:`Version` instance is comparison aware and can be compared and
@@ -184,6 +201,8 @@ class Version(_BaseVersion):
     _key: CmpKey
 
     def __init__(self, version: str) -> None:
+        # [FUNCTION DOC] Matches the string (surrounding whitespace allowed, case-insensitive) against the
+        # version regex; raises InvalidVersion on mismatch. Otherwise stores the parsed parts and builds the comparison key.
         """Initialize a Version object.
 
         :param version:
@@ -222,6 +241,7 @@ class Version(_BaseVersion):
         )
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Returns the angle-bracket Version representation wrapping the normalized string.
         """A representation of the Version that shows all internal state.
 
         >>> Version('1.0.0')
@@ -230,6 +250,8 @@ class Version(_BaseVersion):
         return f"<Version('{self}')>"
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Builds the normalized version string: optional epoch with bang, dotted release, pre
+        # letters and number, dot-post number, dot-dev number, and plus-local suffix.
         """A string representation of the version that can be rounded-tripped.
 
         >>> str(Version("1.0a5"))
@@ -264,6 +286,7 @@ class Version(_BaseVersion):
 
     @property
     def epoch(self) -> int:
+        # [FUNCTION DOC] Property: epoch number (0 if absent).
         """The epoch of the version.
 
         >>> Version("2.0.0").epoch
@@ -275,6 +298,7 @@ class Version(_BaseVersion):
 
     @property
     def release(self) -> Tuple[int, ...]:
+        # [FUNCTION DOC] Property: tuple of integers of the release segment, trailing zeros kept.
         """The components of the "release" segment of the version.
 
         >>> Version("1.2.3").release
@@ -291,6 +315,7 @@ class Version(_BaseVersion):
 
     @property
     def pre(self) -> Optional[Tuple[str, int]]:
+        # [FUNCTION DOC] Property: pre-release as a (letter, number) pair, or None.
         """The pre-release segment of the version.
 
         >>> print(Version("1.2.3").pre)
@@ -306,6 +331,7 @@ class Version(_BaseVersion):
 
     @property
     def post(self) -> Optional[int]:
+        # [FUNCTION DOC] Property: post-release number, or None if absent.
         """The post-release number of the version.
 
         >>> print(Version("1.2.3").post)
@@ -317,6 +343,7 @@ class Version(_BaseVersion):
 
     @property
     def dev(self) -> Optional[int]:
+        # [FUNCTION DOC] Property: development release number, or None if absent.
         """The development number of the version.
 
         >>> print(Version("1.2.3").dev)
@@ -328,6 +355,7 @@ class Version(_BaseVersion):
 
     @property
     def local(self) -> Optional[str]:
+        # [FUNCTION DOC] Property: local version segments joined by dots, or None if absent.
         """The local version segment of the version.
 
         >>> print(Version("1.2.3").local)
@@ -342,6 +370,7 @@ class Version(_BaseVersion):
 
     @property
     def public(self) -> str:
+        # [FUNCTION DOC] Property: normalized version string with any local segment removed.
         """The public portion of the version.
 
         >>> Version("1.2.3").public
@@ -355,6 +384,7 @@ class Version(_BaseVersion):
 
     @property
     def base_version(self) -> str:
+        # [FUNCTION DOC] Property: epoch (if nonzero) plus release segment only, no pre/post/dev/local.
         """The "base version" of the version.
 
         >>> Version("1.2.3").base_version
@@ -380,6 +410,7 @@ class Version(_BaseVersion):
 
     @property
     def is_prerelease(self) -> bool:
+        # [FUNCTION DOC] Property: true if the version has a dev or pre-release part.
         """Whether this version is a pre-release.
 
         >>> Version("1.2.3").is_prerelease
@@ -397,6 +428,7 @@ class Version(_BaseVersion):
 
     @property
     def is_postrelease(self) -> bool:
+        # [FUNCTION DOC] Property: true if the version has a post-release part.
         """Whether this version is a post-release.
 
         >>> Version("1.2.3").is_postrelease
@@ -408,6 +440,7 @@ class Version(_BaseVersion):
 
     @property
     def is_devrelease(self) -> bool:
+        # [FUNCTION DOC] Property: true if the version has a dev part.
         """Whether this version is a development release.
 
         >>> Version("1.2.3").is_devrelease
@@ -419,6 +452,7 @@ class Version(_BaseVersion):
 
     @property
     def major(self) -> int:
+        # [FUNCTION DOC] Property: first release number, or 0 if missing.
         """The first item of :attr:`release` or ``0`` if unavailable.
 
         >>> Version("1.2.3").major
@@ -428,6 +462,7 @@ class Version(_BaseVersion):
 
     @property
     def minor(self) -> int:
+        # [FUNCTION DOC] Property: second release number, or 0 if missing.
         """The second item of :attr:`release` or ``0`` if unavailable.
 
         >>> Version("1.2.3").minor
@@ -439,6 +474,7 @@ class Version(_BaseVersion):
 
     @property
     def micro(self) -> int:
+        # [FUNCTION DOC] Property: third release number, or 0 if missing.
         """The third item of :attr:`release` or ``0`` if unavailable.
 
         >>> Version("1.2.3").micro
@@ -452,6 +488,10 @@ class Version(_BaseVersion):
 def _parse_letter_version(
     letter: Optional[str], number: Union[str, bytes, SupportsInt, None]
 ) -> Optional[Tuple[str, int]]:
+    # [FUNCTION DOC] HELPER: Normalizes a pre/post/dev (letter, number) pair. With a letter: missing number
+    # becomes 0, letter is lowercased and alternate spellings are canonicalized (alpha to a, beta to b,
+    # c/pre/preview to rc, rev/r to post). With only a number: treated as an implicit post release.
+    # Returns (letter, int) or None when neither is given. Non-numeric number raises ValueError.
 
     if letter:
         # We consider there to be an implicit 0 in a pre-release if there is
@@ -489,6 +529,8 @@ _local_version_separators = re.compile(r"[\._-]")
 
 
 def _parse_local_version(local: Optional[str]) -> Optional[LocalType]:
+    # [FUNCTION DOC] HELPER: Splits a local version string on dot, underscore or dash; numeric parts become
+    # integers, others are lowercased. Returns a tuple, or None if input is None.
     """
     Takes a string like abc.1.twelve and turns it into ("abc", 1, "twelve").
     """
@@ -508,6 +550,10 @@ def _cmpkey(
     dev: Optional[Tuple[str, int]],
     local: Optional[LocalType],
 ) -> CmpKey:
+    # [FUNCTION DOC] HELPER: Builds the sortable key (epoch, release with trailing zeros stripped, pre, post,
+    # dev, local) using infinity sentinels so that dev-only sorts before pre-releases, final releases
+    # sort after pre-releases, absent post sorts before present, absent dev sorts after present, and
+    # local segments follow PEP 440 ordering (absent local first, numeric above alphanumeric).
 
     # When we compare a release version, we want to compare it with all of the
     # trailing zeros removed. So we'll use a reverse the list, drop all the now

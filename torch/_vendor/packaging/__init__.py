@@ -2,6 +2,10 @@
 # 2.0, and the BSD License. See the LICENSE file in the root of this repository
 # for complete details.
 
+# [PACKAGE DOC] Vendored copy of the pypa "packaging" library (version 23.2).
+# Exports only metadata module-level strings (title, summary, uri, version,
+# author, email, license, copyright); the useful code lives in the version and
+# _structures submodules. No import-time side effects.
 __title__ = "packaging"
 __summary__ = "Core utilities for Python packages"
 __uri__ = "https://github.com/pypa/packaging"
