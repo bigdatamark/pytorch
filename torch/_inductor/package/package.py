@@ -1,3 +1,6 @@
+# [MODULE DOC] Compile, package and load AOTInductor artifacts. Provides compile_so (build .so from generated
+# cpp/consts files), package_aoti (save into a PT2 archive) and load_package (load a compiled model runner,
+# with a fallback for outdated archives). Imports delegate to torch.export.pt2_archive; no import-time side effects.
 import io
 import json
 import logging
@@ -22,7 +25,13 @@ AOTI_PACKAGE_DEVICE_ERROR = "Cannot load AOTInductor package for device"
 
 
 def compile_so(aoti_dir: str, aoti_files: list[str], so_path: str) -> str:
+    # [FUNCTION DOC] Compiles AOTI-generated files into a shared library. Finds the .cpp and constants .o files in
+    # aoti_files, builds the cpp into an object using flags from the *_compile_flags.json file, then links it with
+    # the constants object into a .so under so_path using *_linker_flags.json. If a serialized weights .bin is listed,
+    # appends it to the .so after padding to a 16384-byte boundary. Returns the .so path. Raises RuntimeError if a
+    # required file suffix is missing. Side effects: runs compiler/linker, writes files.
     def get_aoti_file_with_suffix(suffix: str) -> str:
+        # [FUNCTION DOC] HELPER: returns the first path in aoti_files ending with suffix; raises RuntimeError if none.
         for file in aoti_files:
             if file.endswith(suffix):
                 return file
@@ -84,6 +93,8 @@ def package_aoti(
     archive_file: FileLike,
     aoti_files: AOTI_FILES,
 ) -> FileLike:
+    # [FUNCTION DOC] Saves AOTInductor generated files (a directory path or a mapping of model name to path) into a
+    # PT2 archive at archive_file by delegating to package_pt2. Returns the archive file-like/path.
     """
     Saves the AOTInductor generated files to the PT2Archive format.
 
@@ -107,6 +118,13 @@ def load_package(
     num_runners: int = 1,
     device_index: int = -1,
 ) -> AOTICompiledModel:
+    # [FUNCTION DOC] Loads a compiled model runner for model_name from a PT2 archive (path or file-like object).
+    # First tries load_pt2; raises RuntimeError if the model is absent, re-raises device-mismatch errors, and for
+    # other RuntimeErrors logs a warning and falls back to the legacy AOTIModelPackageLoader (file-like inputs are
+    # first copied to a temporary .pt2 file). Args control single-threaded mode, runner count and device index.
+    # Returns an AOTICompiledModel.
+    # KNOWN ISSUE: the model-not-found RuntimeError is raised inside the try block, so it is caught and silently
+    # triggers the legacy fallback instead of propagating.
     try:
         pt2_contents = load_pt2(
             path,

@@ -1,3 +1,7 @@
+# [MODULE DOC] Defines the OutputCode abstraction: the serializable, cacheable callable Inductor produces,
+# plus implementations CompiledFxGraph (Python wrapper), CompiledAOTI (AOTInductor .so), MockFXGraphCacheOutput
+# and RegionalOutputCode, and cudagraph/input-alignment post-compile helpers. No import-time side effects
+# beyond creating the module logger.
 """
 This provides an abstract class which parametrizes over an "output code" concept
 for Inductor.  Intuitively, this represents the compiled callable which Inductor
@@ -83,6 +87,9 @@ if TYPE_CHECKING:
     _BoxedCallable: TypeAlias = Callable[[Sequence[InputType]], object]
 
     class CompiledFnRunner(Protocol):
+        # [CLASS DOC] HELPER: Typing-only protocol (under TYPE_CHECKING) for the runner object emitted by the Python
+        # wrapper under graph_partition: exposes the list of partition callables and recursively_apply_fns, which
+        # rewrites every partition in place.
         """Runner emitted by the Python wrapper when graph_partition is on.
 
         codegen writes a Runner class (see codegen/wrapper.py) whose partitions
@@ -100,6 +107,9 @@ log = logging.getLogger(__name__)
 
 @dataclasses.dataclass
 class OutputCode:
+    # [CLASS DOC] Abstract base for Inductor compiled output. Holds optional remote-cache key, cache debug lines and
+    # end-to-end compile time (all set after construction). Subclasses implement calling with a boxed input list,
+    # prepare_for_serialization, post_compile and set_triton_bundle; base versions raise NotImplementedError.
     # TODO: Remove underscores here
 
     # None if the output is not remote cacheable
@@ -112,9 +122,11 @@ class OutputCode:
     _time_taken_ns: int | None = dataclasses.field(default=None, init=False)
 
     def __call__(self, inputs: Sequence[Any]) -> Any:
+        # [FUNCTION DOC] Run the compiled code on a sequence of inputs. Abstract: raises NotImplementedError.
         raise NotImplementedError(type(self))
 
     def prepare_for_serialization(self) -> None:
+        # [FUNCTION DOC] Make the object picklable (drop unserializable callables). Abstract: raises NotImplementedError.
         raise NotImplementedError(type(self))
 
     def post_compile(
@@ -123,10 +135,12 @@ class OutputCode:
         constants: CompiledFxGraphConstants,
         graph_kwargs: _CompileFxKwargs,
     ) -> None:
+        # [FUNCTION DOC] Post-processing after compile or cache load (cudagraphs, alignment, etc.). Abstract: raises NotImplementedError.
         raise NotImplementedError(type(self))
 
     # TODO: Get rid of this
     def set_triton_bundle(self, triton_bundle: Any) -> None:
+        # [FUNCTION DOC] Attach a triton bundle to this output. Abstract: raises NotImplementedError.
         raise NotImplementedError(type(self))
 
 
@@ -138,6 +152,8 @@ _StrideExprStr: TypeAlias = str
 # we can select one element from that dimension and write to it
 # to achieve writing to all values of that dimension of the input tensor
 def get_expanded_dims(t: torch.Tensor) -> list[int]:
+    # [FUNCTION DOC] Returns the indices of dimensions of tensor t that are expanded (stride 0 with size not 1),
+    # or None when t is not a tensor. Used to avoid overlapping-memory writes in copy_.
     if not isinstance(t, torch.Tensor):
         # pyrefly: ignore [bad-return]
         return None
@@ -145,6 +161,8 @@ def get_expanded_dims(t: torch.Tensor) -> list[int]:
 
 
 def index_expanded_dims(t: torch.Tensor, expanded_dims: list[int]) -> torch.Tensor:
+    # [FUNCTION DOC] Returns t narrowed to a single element along each listed expanded dimension (via slice),
+    # so writing to the result covers every value of those dims exactly once.
     for expanded_dim in expanded_dims:
         t = torch.ops.aten.slice(t, expanded_dim, 0, 1)
     return t
@@ -155,6 +173,9 @@ def index_expanded_dims(t: torch.Tensor, expanded_dims: list[int]) -> torch.Tens
 # self-overlaps and a regular strided copy_ would be ambiguous: the overlap
 # pattern reproduces in dst because the underlying bytes are copied verbatim.
 def copy_strided_storage_(dst: torch.Tensor, src: torch.Tensor) -> None:
+    # [FUNCTION DOC] Bytewise copy of src's reachable strided storage extent into dst, starting at each tensor's
+    # offset, so a self-overlapping dst reproduces src's overlap pattern. Requires equal dtype, size and stride and
+    # non-negative strides, else raises AssertionError. Returns early for empty tensors. Mutates dst storage.
     if dst.dtype != src.dtype:
         raise AssertionError(f"dtype mismatch: dst={dst.dtype} src={src.dtype}")
     if tuple(dst.size()) != tuple(src.size()):
@@ -182,6 +203,10 @@ def maybe_handle_backward_generation(
     compiled_graph: CompiledFxGraph,
     boxed_forward_device_index: BoxedDeviceIndex | None,
 ) -> None:
+    # [FUNCTION DOC] For a backward graph under cudagraph trees, wraps compiled_graph.current_callable so the
+    # cudagraph manager (looked up from the forward device index) is told backward is running before each call.
+    # Does nothing for forward graphs. Raises AssertionError if the callable, device index or manager is missing.
+    # Mutates compiled_graph.current_callable.
     if compiled_graph.current_callable is None:
         raise AssertionError("compiled_graph.current_callable must not be None")
     is_backward = compiled_graph.fx_kwargs["is_backward"]
@@ -204,6 +229,7 @@ def maybe_handle_backward_generation(
             raise AssertionError("CUDAGraph manager must not be None")
 
         def compiled_artifact(new_inputs: Sequence[InputType]) -> object:
+        # [FUNCTION DOC] HELPER: Marks the cudagraph manager as running backward, then calls the original callable.
             manager.set_to_running_backward()  # type: ignore[union-attr]
             return compiled_graph_callable(new_inputs)
 
@@ -215,6 +241,9 @@ def prepare_cudagraph_post_compile(
     example_inputs: Sequence[InputType],
     boxed_forward_device_index: BoxedDeviceIndex | None,
 ) -> None:
+    # [FUNCTION DOC] Pre-cudagraph setup: when cudagraph trees are off, forces specialization of symbolic int
+    # inputs (so graphs are valid); for non-inference forward graphs records the first device index into the boxed
+    # forward device index. Mutates the boxed index; no return value.
     if not config.triton.cudagraph_trees:
         # Force specialize all inputs so that CUDA graphs will work
         for t in example_inputs:
@@ -234,6 +263,10 @@ def cudagraph_post_compile(
     constants: dict[str, torch.Tensor | type],
     boxed_forward_device_index: BoxedDeviceIndex | None,
 ) -> None:
+    # [FUNCTION DOC] Applies cudagraphs to a whole compiled graph if allowed. If the compiler bisector disables it,
+    # or cached failure reasons exist, disables the boxed cudagraphs flag, handles backward generation and logs a
+    # skip counter. Otherwise gathers tensor constants and metadata and replaces current_callable with the result of
+    # the configured cudagraph policy or the default cudagraphify. Raises AssertionError on missing state.
     """
     Checks for any reasons not to run cudagraphs and then
     runs it on compiled_graph.
@@ -335,6 +368,10 @@ def cudagraph_partition_post_compile(
     constants: dict[str, torch.Tensor | type],
     boxed_forward_device_index: BoxedDeviceIndex | None,
 ) -> None:
+    # [FUNCTION DOC] Graph-partition variant of cudagraph application. Disables cudagraphs (and handles backward
+    # generation) on bisector request, cached failure reasons, or no partitions. Otherwise builds per-partition
+    # metadata from partition_maps, creates one cudagraphify function per partition and applies them all through
+    # compiled_graph.recursively_apply_fns. Raises AssertionError if required state is missing.
     """
     Cudagraphify each partition function, which first prepares the necessary
     metadata and then applies the cudagraphify function to each partition.
@@ -434,6 +471,9 @@ def maybe_realign_inputs(
     inputs_to_check: Sequence[int],
     mutated_inputs_idxs: OrderedSet[int],
 ) -> None:
+    # [FUNCTION DOC] If cudagraphs did not run, wraps current_callable so inputs in inputs_to_check are realigned.
+    # When alignment is deferred into generated code, only mutated inputs are wrapped (for writeback). Mutates
+    # compiled_graph.current_callable; raises AssertionError if it is None while a wrapper is needed.
     """
     Realigns input strides from inputs_to_check if
     we didn't end up running cudagraphs. Mutates
@@ -468,6 +508,8 @@ def maybe_realign_inputs(
 
 
 class CompiledFxGraphConstants:
+    # [CLASS DOC] Strategy object that returns a compiled graph's constants by reading them directly off the saved
+    # CompiledFxGraph, merged with opaque value type classes. Counterpart of CompiledFxGraphConstantsWithGm.
     """Wrapper class that unwraps constants from a compiled fx graph. This
     version of the class only supports directly grabbing the saved constants off of
     a CompiledFxGraph.
@@ -486,12 +528,16 @@ class CompiledFxGraphConstants:
     """
 
     def unwrap(self, g: CompiledFxGraph) -> dict[str, torch.Tensor | type]:
+        # [FUNCTION DOC] Returns a mapping of constants name to tensor or class: the graph's saved constants plus its
+        # opaque value type classes. Raises AssertionError if g.constants is None.
         if g.constants is None:
             raise AssertionError("g.constants must not be None")
         return {**g.constants, **g.opaque_value_type_classes}
 
 
 class CompiledFxGraphConstantsWithGm(CompiledFxGraphConstants):
+    # [CLASS DOC] Constants strategy for freezing: looks up frozen parameters by their original names on a supplied
+    # GraphModule (stored in attribute gm) and merges them with saved constants and opaque value type classes.
     """
     This version of CompiledFxGraphConstants, instead of grabbing constants
     directly saved on CompiledFxGraphs, will just grab their names. Then, it takes
@@ -501,9 +547,12 @@ class CompiledFxGraphConstantsWithGm(CompiledFxGraphConstants):
     """
 
     def __init__(self, gm: torch.fx.GraphModule) -> None:
+        # [FUNCTION DOC] Stores the GraphModule used later to look up frozen parameter values.
         self.gm = gm
 
     def unwrap(self, g: CompiledFxGraph) -> dict[str, torch.Tensor | type]:
+        # [FUNCTION DOC] Returns a mapping combining the graph's own constants, frozen parameters fetched from self.gm
+        # by original attribute name, and opaque value type classes.
         frozen_params = {
             name: getattr(self.gm, orig_name)
             for name, orig_name in g.frozen_param_names.items()
@@ -514,6 +563,11 @@ class CompiledFxGraphConstantsWithGm(CompiledFxGraphConstants):
 
 @dataclasses.dataclass
 class CompiledFxGraph(OutputCode):
+    # [CLASS DOC] OutputCode for a compiled FX graph via the Python wrapper; the object serialized to disk for the
+    # FX graph cache. Holds the callable (cleared on serialization), generated source, cache key, device info,
+    # mutation info, constants (or frozen param names), output strides, metrics and counter deltas, guards
+    # expression, cudagraph info, partition maps and a metadata-stripped copy of the graph. Key methods:
+    # post_compile, prepare_for_serialization, write_to_disk, after_deserialization.
     """
     Class holding a compiled FX graph. This is the object serialized on disk
     to support FxGraph caching.
@@ -592,6 +646,13 @@ class CompiledFxGraph(OutputCode):
         inductor_provenance_mapping_str: str | None = None,
         inductor_provenance_stack_traces_str: str | None = None,
     ) -> None:
+        # [FUNCTION DOC] Builds the record from a finished GraphLowering and the source GraphModule. Copies cache key,
+        # source code (read from graph.cache_path if set), device and mutation sets, constants (splitting frozen
+        # params into a name mapping), strides and metrics. If cudagraphs are requested, evaluates disabling reasons
+        # (lowering reason, input mutation, storage mutation, forced disable, non-tensor inputs), records stack
+        # traces and placeholder info in cudagraph_info, and may disable the boxed cudagraphs flag. Sets the boxed call
+        # flag, captures autotune compile context, and optionally deep-copies the graph with metadata cleared. Reads
+        # the cache file; mutates the cudagraphs flag and counters.
         self.current_callable = current_callable
         self.compiled_fn_runner = compiled_fn_runner
         self.recursively_apply_fns = (
@@ -764,6 +825,8 @@ class CompiledFxGraph(OutputCode):
             self._original_gm = gm_copy
 
     def __del__(self) -> None:
+        # [FUNCTION DOC] Destructor: when a compiled fn runner exists, deletes its partitions attribute so
+        # cudagraphified partition functions can be freed.
         if self.compiled_fn_runner is not None:
             # For torch._inductor.config.graph_partition = True,
             # self.compiled_fn_runner.partitions hold cudagraphified functions
@@ -773,6 +836,8 @@ class CompiledFxGraph(OutputCode):
             del self.compiled_fn_runner.partitions
 
     def _set_compile_context_for_autotune_cache(self) -> None:
+        # [FUNCTION DOC] HELPER: Saves the current compile context only if an autotune cache bundler has an active
+        # compile for it; otherwise stores None.
         compile_context_for_autotune_cache = CompileContext.try_get()
         self._compile_context = (
             compile_context_for_autotune_cache
@@ -783,6 +848,11 @@ class CompiledFxGraph(OutputCode):
         )
 
     def __call__(self, inputs: Sequence[Any]) -> Any:
+        # [FUNCTION DOC] Executes the compiled graph on a boxed list of inputs and returns its outputs. Optionally
+        # records graph execution order for debugging, restores the saved compile context during the call, wraps in a
+        # profiler record function when profiling, and always finishes runtime metrics and ends the autotune cache
+        # bundler compile afterward, clearing the saved context if the compile is no longer active. Raises
+        # AssertionError if current_callable is None.
         if self.current_callable is None:
             raise AssertionError("self.current_callable must not be None")
 
@@ -845,6 +915,12 @@ class CompiledFxGraph(OutputCode):
         constants: CompiledFxGraphConstants,
         graph_kwargs: _CompileFxKwargs,
     ) -> None:
+        # [FUNCTION DOC] Post-processing run after compile or cache load (not saved in cache). If a user partition
+        # wrapper is configured under graph_partition, applies it to each partition and returns. Otherwise sets
+        # tracing-context output strides, optionally disables cudagraphs per policy or cached reason, runs the
+        # whole-graph or partition cudagraph post-compile, realigns inputs, lazily deserializes the stored original
+        # graph, and optionally wraps current_callable to dispatch via the inductor_compiled_code higher-order op when
+        # in torch dispatch mode. Raises AssertionError on missing required kwargs. Mutates self and the cudagraphs flag.
         """
         Run a set of post processing steps after loading from the cache. These involve:
          - Setting the tracing context output strides
@@ -981,6 +1057,8 @@ class CompiledFxGraph(OutputCode):
             )
 
             def wrapped_callable(inputs):
+            # [FUNCTION DOC] HELPER: Calls the compiled-code higher-order op (with region name if any) when in torch
+            # dispatch mode, else calls the original callable with the boxed inputs.
                 if is_in_torch_dispatch_mode():
                     kwargs = (
                         {"name": self.compile_region_name}
@@ -994,9 +1072,12 @@ class CompiledFxGraph(OutputCode):
             self.current_callable = wrapped_callable
 
     def set_triton_bundle(self, triton_bundle: Any) -> None:
+        # [FUNCTION DOC] Stores the triton bundle on this object.
         self._triton_bundle = triton_bundle
 
     def prepare_for_serialization(self) -> None:
+        # [FUNCTION DOC] Prepares for pickling: clears the compile context, callable, recursion function and runner, and
+        # replaces the original graph module with its pickled bytes (GraphPickler, no ops filter). Mutates self.
         # We can't really serialize callables that may be C++/Triton/etc.,
         # so we serialize their PyCodeCache disk cache location instead.
         # TODO: This could be better if we're ever able to serialize compiled
@@ -1016,6 +1097,8 @@ class CompiledFxGraph(OutputCode):
         # so it doesn't need to be cleared
 
     def write_to_disk(self) -> str:
+        # [FUNCTION DOC] Ensures the generated Python source exists on disk at the cache path for cache_key (written
+        # atomically, creating dirs, and bumping a counter if it was missing). Returns the artifact path.
         from torch._dynamo.utils import counters
         from torch._inductor.codecache import get_path, write_atomic
 
@@ -1029,6 +1112,9 @@ class CompiledFxGraph(OutputCode):
         return artifact_path
 
     def after_deserialization(self, constants: CompiledFxGraphConstants) -> str:
+        # [FUNCTION DOC] Restores the callable after loading from cache: writes source to disk, loads it through
+        # PyCodeCache with constants from the given strategy, and sets current_callable, recursively_apply_fns and the
+        # runner. Logs and re-raises OSError on load failure. Returns the artifact path.
         from torch._dynamo.utils import dynamo_timed
         from torch._inductor.codecache import PyCodeCache
 
@@ -1059,6 +1145,9 @@ class CompiledFxGraph(OutputCode):
 
 @dataclasses.dataclass
 class CompiledAOTI(OutputCode):
+    # [CLASS DOC] OutputCode for an AOTInductor compiled artifact. Holds filename (a path, list of files/weights, or a
+    # GraphModule), device_type, the loaded callable and cached file bytes for serialization. The callable is
+    # created in __post_init__ when libtorch linking and autograd-for-aot are enabled.
     """
     Class holding an AOTInductor compiled so.
     """
@@ -1069,6 +1158,10 @@ class CompiledAOTI(OutputCode):
     _cached_files: dict[str, bytes] = dataclasses.field(default_factory=dict)
 
     def __post_init__(self):
+        # [FUNCTION DOC] Creates the model runner callable for the .so when linking libtorch is enabled. Returns early
+        # (no callable) on macOS/Windows, windows cross-target, cpp-only packaging, or when autograd for AOT is off. A
+        # GraphModule filename is used directly. Otherwise builds a CUDA, XPU or CPU container runner and uses its run
+        # method; raises RuntimeError for unsupported device types. Also rewrites missing cached files to disk.
         if not config.aot_inductor.link_libtorch:
             return
 
@@ -1134,11 +1227,14 @@ class CompiledAOTI(OutputCode):
                     f.write(self._cached_files[file])
 
     def __call__(self, inputs: Sequence[Any]) -> Any:
+        # [FUNCTION DOC] Calls the loaded AOTI callable with the inputs; raises RuntimeError if not loaded.
         if self.current_callable is None:
             raise RuntimeError("AOTInductor compiled so is not loaded")
         return self.current_callable(inputs)
 
     def prepare_for_serialization(self) -> None:
+        # [FUNCTION DOC] Clears the callable and stores the bytes of each file named by filename (a string or list)
+        # into the cached files mapping. Reads files from disk.
         self.current_callable = None
         self._cached_files = {}
         filenames: list[str] = []
@@ -1151,6 +1247,7 @@ class CompiledAOTI(OutputCode):
                 self._cached_files[name] = f.read()
 
     def __getstate__(self):
+        # [FUNCTION DOC] Pickle support: returns a copy of the instance state with the callable removed.
         state = self.__dict__.copy()
         state["current_callable"] = None
         return state
@@ -1161,18 +1258,22 @@ class CompiledAOTI(OutputCode):
         constants: CompiledFxGraphConstants,
         graph_kwargs: _CompileFxKwargs,
     ) -> None:
+        # [FUNCTION DOC] Reloads the callable via __post_init__ if it is not loaded yet; arguments are unused.
         if self.current_callable is None:
             self.__post_init__()
 
     def set_triton_bundle(self, triton_bundle: Any) -> None:
+        # [FUNCTION DOC] No-op: AOTI output does not use triton bundles.
         pass
 
 
 @dataclasses.dataclass
 class MockFXGraphCacheOutput(OutputCode):
+    # [CLASS DOC] HELPER: Test/mock OutputCode that simply wraps a callable gm and calls it with the boxed inputs.
     gm: Any = None
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Sets the boxed call flag.
         self._boxed_call = True
 
     def post_compile(
@@ -1181,17 +1282,23 @@ class MockFXGraphCacheOutput(OutputCode):
         constants: CompiledFxGraphConstants,
         graph_kwargs: _CompileFxKwargs,
     ) -> None:
+        # [FUNCTION DOC] HELPER: No-op.
         pass
 
     def __call__(self, inputs: Sequence[Any]) -> Any:
+        # [FUNCTION DOC] HELPER: Calls the wrapped gm with the inputs and returns the result.
         return self.gm(inputs)
 
     def set_triton_bundle(self, triton_bundle: Any) -> None:
+        # [FUNCTION DOC] HELPER: No-op.
         pass
 
 
 @dataclasses.dataclass
 class RegionalOutputCode(OutputCode):
+    # [CLASS DOC] OutputCode for regional inductor results: holds a GraphModule (mixing compiled and eager regions),
+    # or after serialization its GraphPickler bytes plus recorded dynamo-disable wrappers and the op/metadata
+    # filters. Deserialization requires a fake mode found in the example inputs at post_compile.
     """
     OutputCode for regional inductor compilation results.
 
@@ -1221,6 +1328,8 @@ class RegionalOutputCode(OutputCode):
             _node_metadata_key_filter_safe
         ),
     ):
+        # [FUNCTION DOC] Stores the graph module and serialization filters, marks boxed calling, and detects whether the
+        # inner module uses a boxed code generator. Raises AssertionError if the module is not a GraphModule.
         """
         Args:
             graph_module: The torch.fx.GraphModule returned by regional_inductor
@@ -1240,6 +1349,8 @@ class RegionalOutputCode(OutputCode):
         self._node_metadata_key_filter = node_metadata_key_filter
 
     def __call__(self, inputs: list[Any]) -> Any:
+        # [FUNCTION DOC] Runs the graph module on the input list (passed whole if boxed, else unpacked). Raises
+        # RuntimeError if the module is not loaded.
         """
         Execute the regional compiled graph.
 
@@ -1261,12 +1372,16 @@ class RegionalOutputCode(OutputCode):
 
     @property
     def graph(self):
+        # [FUNCTION DOC] Property: the fx graph of the underlying (unwrapped) GraphModule.
         _, module = self._unwrap_graph_module()
         return module.graph
 
     def _unwrap_graph_module(
         self,
     ) -> tuple[list[tuple[Callable, dict[str, Any]]], torch.fx.GraphModule]:
+        # [FUNCTION DOC] HELPER: Unwraps an optional dynamo OptimizedModule (recording a dynamo disable wrapper entry
+        # with its reason and wrapping flag) and returns the list of wrappers and the inner GraphModule. Raises
+        # AssertionError if the dynamo context is not a disable context or the inner module is not a GraphModule.
         module = self._graph_module
         serialized_wrappers = []
         if isinstance(module, torch._dynamo.OptimizedModule):
@@ -1290,6 +1405,10 @@ class RegionalOutputCode(OutputCode):
         constants: CompiledFxGraphConstants,
         graph_kwargs: _CompileFxKwargs,
     ) -> None:
+        # [FUNCTION DOC] If the module is already loaded, does nothing. Otherwise deserializes the stored bytes with
+        # GraphPickler using the fake mode detected from example_inputs, recompiles, reapplies recorded wrappers in
+        # reverse order and stores the module. Raises AssertionError if nothing was serialized and RuntimeError if no
+        # fake mode is found.
         """
         Post-compile processing for regional inductor.
 
@@ -1322,9 +1441,12 @@ class RegionalOutputCode(OutputCode):
         self._graph_module = gm
 
     def set_triton_bundle(self, triton_bundle: Any) -> None:
+        # [FUNCTION DOC] No-op: regional inductor does not use triton bundles.
         """Regional inductor doesn't use triton bundles directly."""
 
     def prepare_for_serialization(self) -> None:
+        # [FUNCTION DOC] If a module is loaded, unwraps it, serializes it to bytes via GraphPickler with the configured
+        # filters, and clears the live module so standard pickle works.
         """
         Prepare for serialization by converting the GraphModule to bytes.
 

@@ -1,3 +1,5 @@
+# [MODULE DOC] Holds build_package_contents, a string with the source of a helper script that compiles
+# the AOTInductor files found next to it into a shared library via compile_so. No import-time side effects.
 build_package_contents = """
 import os
 from pathlib import Path
