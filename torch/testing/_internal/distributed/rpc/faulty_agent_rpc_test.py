@@ -1,5 +1,12 @@
 # mypy: allow-untyped-defs
 
+# [MODULE DOC]
+# Tests RPC and RRef behavior under the faulty TensorPipe agent: which messages are failed or
+# delayed, RRef creation errors when remote calls are dropped or time out, and RPC timeout
+# semantics (per-call, default and zero timeouts). Defines small module-level helpers (a sleeping
+# function, a scripted add, an RRef adder) used as RPC targets. The scripted helper is
+# compiled at import time.
+
 import time
 
 import torch
@@ -17,24 +24,37 @@ from torch.testing._internal.distributed.rpc.rpc_agent_test_fixture import (
 
 
 def my_sleep_func(seconds=1):
+    # [FUNCTION DOC] HELPER: RPC target that sleeps for the given seconds, then returns a
+    # scalar tensor equal to one.
     time.sleep(seconds)
     return torch.mul(torch.tensor(1), torch.tensor(1))
 
 
 @torch.jit.script
 def my_script_func(tensor):
+    # [FUNCTION DOC] HELPER: Scripted RPC target returning the tensor added to itself.
     return torch.add(tensor, tensor)
 
 
 def add_rref_to_value(rref, value):
+    # [FUNCTION DOC] HELPER: RPC target that fetches the RRef value to the local worker and
+    # returns it plus the given value.
     return rref.to_here() + value
 
 
 class FaultyAgentRpcTest(RpcAgentTestFixture):
+    # [CLASS DOC]
+    # Test case run with the faulty agent fixture. The dist_init arguments faulty_messages and
+    # messages_to_delay choose which message types are dropped or delayed for each test.
+    # Stateless; most tests run only on rank 0 and target the next worker or itself.
     # no faulty_messages defined so this fails all retryable messages - see
     # faulty_rpc_agent_test_fixture.py for the list of retryable messages.
     @dist_init(messages_to_delay={})
     def test_check_failed_messages(self):
+        # [FUNCTION DOC]
+        # With default failing messages and no delays, rank 0 creates a remote tensor add on one
+        # worker and passes the RRef to a remote call on another, then checks the fetched value
+        # equals the sum. Finally deletes all user RRefs explicitly to ensure clean shutdown.
         if self.rank == 0:
             dst_worker_b = worker_name((self.rank + 1) % self.world_size)
             dst_worker_c = worker_name((self.rank + 2) % self.world_size)
@@ -54,6 +74,9 @@ class FaultyAgentRpcTest(RpcAgentTestFixture):
 
     @dist_init
     def test_verify_backend_options(self):
+        # [FUNCTION DOC]
+        # Checks the fixture exposes the faulty backend with 8 threads, 3 failed sends, 4
+        # failing message types, 2 delayed message types and the default RPC timeout.
         self.assertEqual(
             self.rpc_backend, rpc.backend_registry.BackendType.FAULTY_TENSORPIPE
         )
@@ -67,6 +90,9 @@ class FaultyAgentRpcTest(RpcAgentTestFixture):
 
     @dist_init(faulty_messages=["RREF_FORK_REQUEST", "RREF_CHILD_ACCEPT"])
     def test_custom_faulty_messages(self):
+        # [FUNCTION DOC]
+        # Checks that the failing messages passed to dist_init replace the defaults in the
+        # backend options.
         self.assertEqual(
             {"RREF_FORK_REQUEST", "RREF_CHILD_ACCEPT"},
             set(self.rpc_backend_options.messages_to_fail),
@@ -74,15 +100,23 @@ class FaultyAgentRpcTest(RpcAgentTestFixture):
 
     @dist_init(faulty_messages=[])
     def test_no_faulty_messages(self):
+        # [FUNCTION DOC]
+        # Checks that an empty failing-message list yields no failing messages in the options.
         self.assertEqual(len(self.rpc_backend_options.messages_to_fail), 0)
 
     @dist_init(messages_to_delay={"SCRIPT_CALL": 1.5})
     def test_custom_messages_to_delay(self):
+        # [FUNCTION DOC]
+        # Checks that the delay mapping passed to dist_init replaces the default in the options.
         self.assertEqual(
             self.rpc_backend_options.messages_to_delay, {"SCRIPT_CALL": 1.5}
         )
 
     def _test_remote_message_dropped_pickle(self, dst=None):
+        # [FUNCTION DOC] HELPER: Rank 0 only. Issues a remote call whose creation message is
+        # dropped (destination defaults to the next rank), flushes pending futures, then checks
+        # that serializing the RRef and sending it as an RPC argument both raise an error
+        # mentioning RRef creation.
         if self.rank != 0:
             return
         dst_rank = dst if dst is not None else (self.rank + 1) % self.world_size
@@ -103,13 +137,19 @@ class FaultyAgentRpcTest(RpcAgentTestFixture):
 
     @dist_init(faulty_messages=["PYTHON_REMOTE_CALL"])
     def test_remote_message_dropped_pickle(self):
+        # [FUNCTION DOC] Runs the dropped-remote-call pickle check against another worker.
         self._test_remote_message_dropped_pickle()
 
     @dist_init(faulty_messages=["PYTHON_REMOTE_CALL"])
     def test_remote_message_dropped_pickle_to_self(self):
+        # [FUNCTION DOC] Runs the dropped-remote-call pickle check with the destination being
+        # the calling worker itself.
         self._test_remote_message_dropped_pickle(self.rank)
 
     def _test_remote_message_dropped_timeout(self, func, args, dst=None):
+        # [FUNCTION DOC] HELPER: Rank 0 only. Creates a remote call of func with args whose
+        # creation message is dropped, flushes pending futures, and checks that fetching the
+        # value raises an error mentioning RRef creation. Destination defaults to the next rank.
         if self.rank != 0:
             return
 
@@ -130,29 +170,41 @@ class FaultyAgentRpcTest(RpcAgentTestFixture):
 
     @dist_init(faulty_messages=["SCRIPT_REMOTE_CALL"])
     def test_builtin_remote_message_dropped_timeout(self):
+        # [FUNCTION DOC] Dropped-creation check for a builtin op (tensor add) on another worker.
         func = torch.add
         args = (torch.tensor(1), torch.tensor(1))
         self._test_remote_message_dropped_timeout(func, args)
 
     @dist_init(faulty_messages=["SCRIPT_REMOTE_CALL"])
     def test_builtin_remote_message_dropped_timeout_to_self(self):
+        # [FUNCTION DOC] Dropped-creation check for a builtin op with the local worker as target.
         func = torch.add
         args = (torch.tensor(1), torch.tensor(1))
         self._test_remote_message_dropped_timeout(func, args, dst=0)
 
     @dist_init(faulty_messages=["PYTHON_REMOTE_CALL"])
     def test_udf_remote_message_dropped_timeout(self):
+        # [FUNCTION DOC] Dropped-creation check for a Python function on another worker.
         func = my_sleep_func
         args = (2,)
         self._test_remote_message_dropped_timeout(func, args)
 
     @dist_init(faulty_messages=["PYTHON_REMOTE_CALL"])
     def test_udf_remote_message_dropped_timeout_to_self(self):
+        # [FUNCTION DOC] Dropped-creation check for a Python function targeting the local
+        # worker.
         func = my_sleep_func
         args = (2,)
         self._test_remote_message_dropped_timeout(func, args, dst=0)
 
     def _test_remote_message_delay_timeout(self, func, args, dst=None):
+        # [FUNCTION DOC] HELPER: Rank 0 only. Issues a remote call with a tiny timeout while the
+        # creation message is delayed; checks that the creation future raises a timeout error and
+        # that fetching the value then reports an RRef creation error. When the target is another
+        # worker, also checks that a fetch with a tiny timeout on a slow remote call raises a
+        # timeout, then waits until the owner has confirmed pending owners and forks so shutdown
+        # does not race with user deletes.
+        # KNOWN ISSUE: the comment says 10 ms timeout but the value used is 0.001 seconds (1 ms).
         if self.rank != 0:
             return
         # Test the case where remote message is eventually processed on the owner,
@@ -196,12 +248,14 @@ class FaultyAgentRpcTest(RpcAgentTestFixture):
 
     @dist_init(faulty_messages=[], messages_to_delay={"PYTHON_REMOTE_CALL": 2})
     def test_udf_remote_message_delay_timeout(self):
+        # [FUNCTION DOC] Delay-timeout check for a Python function on another worker.
         func = my_sleep_func
         args = (2,)
         self._test_remote_message_delay_timeout(func, args)
 
     @dist_init(faulty_messages=[], messages_to_delay={"PYTHON_REMOTE_CALL": 2})
     def test_udf_remote_message_delay_timeout_to_self(self):
+        # [FUNCTION DOC] Delay-timeout check for a Python function with the local worker as target.
         func = my_sleep_func
         args = (1,)
         self._test_remote_message_delay_timeout(func, args, dst=0)
@@ -211,6 +265,7 @@ class FaultyAgentRpcTest(RpcAgentTestFixture):
         messages_to_delay={"SCRIPT_REMOTE_CALL": 2, "SCRIPT_RREF_FETCH_CALL": 1},
     )
     def test_remote_message_builtin_delay_timeout(self):
+        # [FUNCTION DOC] Delay-timeout check for a builtin op on another worker.
         func = torch.add
         args = (torch.tensor(1), torch.tensor(1))
         self._test_remote_message_delay_timeout(func, args)
@@ -220,6 +275,7 @@ class FaultyAgentRpcTest(RpcAgentTestFixture):
         messages_to_delay={"SCRIPT_REMOTE_CALL": 2, "SCRIPT_RREF_FETCH_CALL": 1},
     )
     def test_remote_message_builtin_delay_timeout_to_self(self):
+        # [FUNCTION DOC] Delay-timeout check for a builtin op with the local worker as target.
         func = torch.add
         args = (torch.tensor(1), torch.tensor(1))
         self._test_remote_message_delay_timeout(func, args, dst=0)
@@ -229,6 +285,7 @@ class FaultyAgentRpcTest(RpcAgentTestFixture):
         messages_to_delay={"SCRIPT_REMOTE_CALL": 2, "SCRIPT_RREF_FETCH_CALL": 1},
     )
     def test_remote_message_script_delay_timeout(self):
+        # [FUNCTION DOC] Delay-timeout check for a scripted function on another worker.
         func = my_script_func
         args = (torch.tensor(1),)
         self._test_remote_message_delay_timeout(func, args)
@@ -238,12 +295,17 @@ class FaultyAgentRpcTest(RpcAgentTestFixture):
         messages_to_delay={"SCRIPT_REMOTE_CALL": 2, "SCRIPT_RREF_FETCH_CALL": 1},
     )
     def test_remote_message_script_delay_timeout_to_self(self):
+        # [FUNCTION DOC] Delay-timeout check for a scripted function targeting the local
+        # worker.
         func = my_script_func
         args = (torch.tensor(1),)
         self._test_remote_message_delay_timeout(func, args, dst=0)
 
     @dist_init(faulty_messages=[], messages_to_delay={"SCRIPT_RREF_FETCH_CALL": 1})
     def test_rref_to_here_timeout(self):
+        # [FUNCTION DOC]
+        # Rank 0 only. With RRef fetch calls delayed, fetching with a 0.01s timeout must raise a
+        # timeout error; a following fetch without timeout must succeed.
         if self.rank != 0:
             return
 
@@ -260,6 +322,11 @@ class FaultyAgentRpcTest(RpcAgentTestFixture):
 
     @dist_init(faulty_messages=[])
     def test_rpc_builtin_timeout(self):
+        # [FUNCTION DOC]
+        # With the default delays, checks builtin RPC timeouts on the next worker: a 1s explicit
+        # timeout raises for sync and async calls, the default timeout lets delayed calls
+        # finish, a new tiny default raises, and a zero timeout runs to completion. Resets the
+        # global default RPC timeout at the end.
         next_rank = (self.rank + 1) % self.world_size
         dst_worker = worker_name(next_rank)
         expected_error = self.get_timeout_error_regex()
@@ -304,6 +371,9 @@ class FaultyAgentRpcTest(RpcAgentTestFixture):
 
     @dist_init(faulty_messages=[], messages_to_delay={"SCRIPT_CALL": 1.5})
     def test_rpc_script_timeout(self):
+        # [FUNCTION DOC]
+        # Same timeout scenarios as the builtin test, but calling a scripted function with
+        # script calls delayed 1.5s. Resets the global default RPC timeout at the end.
         next_rank = (self.rank + 1) % self.world_size
         dst_worker = worker_name(next_rank)
         expected_error = self.get_timeout_error_regex()

@@ -1,5 +1,12 @@
 # mypy: allow-untyped-defs
 
+# [MODULE DOC]
+# Test mixins (not unittest cases by themselves) for TorchScript integration with RPC: RRef
+# APIs and typing in script, Future typing, local RRefs of script classes and modules, rpc_async,
+# rpc_sync and remote called from script, async_execution, callbacks, and profiling /
+# record_function with RPC. The mixins are combined with a backend fixture in JitRpcTest and
+# the classes preceding it. Many helpers are scripted functions or classes compiled at import time.
+
 import io
 import time
 from typing import Any
@@ -26,47 +33,67 @@ from torch.testing._internal.distributed.rpc.rpc_agent_test_fixture import (
 
 
 def rref_isinstance(rref, cls_to_check):
+    # [FUNCTION DOC] HELPER: Returns whether the owner-local value of the RRef is an instance of
+    # the given class (only valid on the owner).
     return isinstance(rref.local_value(), cls_to_check)
 
 
 def sleep(t):
+    # [FUNCTION DOC] HELPER: RPC target that blocks the calling thread for t seconds.
     time.sleep(t)
 
 
 def rpc_return_rref(dst):
+    # [FUNCTION DOC] HELPER: Creates and returns an RRef owned by worker dst holding a 2x2 ones
+    # tensor plus one (a remote tensor add).
     return rpc.remote(dst, torch.add, args=(torch.ones(2, 2), 1))
 
 
 @torch.jit.script
 def rref_local_value(rref: RRef[Tensor]) -> Tensor:
+    # [FUNCTION DOC] HELPER: Scripted function returning the owner-local value of the RRef;
+    # raises if called on a non-owner.
     return rref.local_value()
 
 
 @torch.jit.script
 def list_create() -> list[int]:
+    # [FUNCTION DOC] HELPER: Scripted function returning a new list of the integers one to three.
     global_list = [1, 2, 3]
     return global_list
 
 
 @torch.jit.script
 def rref_list_mutate(rref: RRef[list[int]]) -> None:
+    # [FUNCTION DOC] HELPER: Scripted function run on the owner that appends 4, 5 and 6 to the
+    # RRef's list through local_value, to_here and to_here with a timeout, showing all three
+    # access the same list object. Mutates the owner's list; returns nothing.
     rref.local_value().append(4)
     rref.to_here().append(5)
     rref.to_here(5.0).append(6)
 
 
 def return_value(value: int) -> int:
+    # [FUNCTION DOC] HELPER: Identity function on an integer, used as an RPC target.
     return value
 
 
 class RRefAPITest:
+    # [CLASS DOC]
+    # Mixin of tests for RRef methods used from TorchScript (is_owner, local_value, to_here,
+    # confirmed-user checks, list mutation). Uses self.rank, self.world_size and assertion
+    # helpers from the combined test class; stateless.
     @dist_init
     def test_rref_is_owner(self):
+        # [FUNCTION DOC]
+        # Creates an RRef owned by the next worker and checks that the scripted is_owner call
+        # returns false on the creator.
         dst_worker_name = worker_name((self.rank + 1) % self.world_size)
         rref_var = rpc_return_rref(dst_worker_name)
 
         @torch.jit.script
         def rref_tensor_is_owner(rref_var: RRef[Tensor]) -> bool:
+            # [FUNCTION DOC] HELPER: Scripted wrapper returning whether this worker owns the RRef.
             return rref_var.is_owner()
 
         res = rref_tensor_is_owner(rref_var)
@@ -74,6 +101,10 @@ class RRefAPITest:
 
     @dist_init
     def test_rref_local_value(self):
+        # [FUNCTION DOC]
+        # Rank 0 only. Calling the scripted local_value on a non-owner must raise an error saying
+        # it cannot be called on a non-owner RRef; running it on the owner via RPC returns the
+        # tensor value.
         if self.rank != 0:
             return
 
@@ -90,6 +121,9 @@ class RRefAPITest:
 
     @dist_init
     def test_local_rref_local_value(self):
+        # [FUNCTION DOC]
+        # Rank 0 only. Creates a remote call targeting the local worker (so the worker owns the
+        # RRef) and checks the scripted local_value returns the integer five.
         if self.rank != 0:
             return
 
@@ -100,6 +134,8 @@ class RRefAPITest:
         self.assertEqual(ret, 5)
 
     def _create_rref(self):
+        # [FUNCTION DOC] HELPER: Creates and returns an RRef owned by the worker two ranks ahead
+        # (modulo world size), holding a 2x2 zeros tensor plus one.
         owner_rank = (self.rank + 2) % self.world_size
         return rpc.remote(
             worker_name(owner_rank), torch.add, args=(torch.zeros(2, 2), 1)
@@ -107,6 +143,9 @@ class RRefAPITest:
 
     @dist_init
     def test_user_rrefs_confirmed(self):
+        # [FUNCTION DOC]
+        # Passes an RRef owned elsewhere to the next worker via rpc_sync and checks the scripted
+        # confirmation query there returns true.
         dst_rank = (self.rank + 1) % self.world_size
         rref = self._create_rref()
         ret = rpc.rpc_sync(
@@ -116,6 +155,9 @@ class RRefAPITest:
 
     @dist_init
     def test_user_rrefs_confirmed_remote(self):
+        # [FUNCTION DOC]
+        # Same as the rpc_sync confirmation test but the query is issued through remote and the
+        # resulting RRef is fetched; expects true.
         dst_rank = (self.rank + 1) % self.world_size
         rref = self._create_rref()
         ret_rref = rpc.remote(
@@ -125,6 +167,9 @@ class RRefAPITest:
 
     @dist_init
     def test_rref_list_mutate(self):
+        # [FUNCTION DOC]
+        # Creates a remote list RRef, has the owner append through three accessors, and checks
+        # the fetched list holds one through six.
         dst = worker_name((self.rank + 1) % self.world_size)
         list_rref = rpc.remote(dst, list_create)
 
@@ -134,27 +179,34 @@ class RRefAPITest:
 
 @torch.jit.script
 def no_arg():
+    # [FUNCTION DOC] HELPER: Scripted function with no arguments returning zero.
     return 0
 
 
 @torch.jit.script
 def one_arg(value):
+    # [FUNCTION DOC] HELPER: Scripted function returning its argument plus one.
     return value + 1
 
 
 @torch.jit.script
 def script_add_ones(x):
+    # [FUNCTION DOC] HELPER: Scripted function adding a one-element ones tensor to x.
     return torch.add(x, torch.ones(1))
 
 
 @torch.jit.script
 def script_add_ones_with_record_function(x, block: str):
+    # [FUNCTION DOC] HELPER: Scripted add of ones to x executed inside a record_function scope
+    # named by block, so the profiler records an event with that name.
     with record_function(block):
         return torch.add(x, torch.ones(1))
 
 
 @torch.jit.script
 def record_function_on_caller_rpc_async(dst_worker_name: str, block: str) -> Tensor:
+    # [FUNCTION DOC] HELPER: Scripted function that, inside a record_function scope named block,
+    # issues two async RPC adds to dst_worker_name and returns the sum of both results.
     t: Tensor = torch.ones(1)
     with record_function(block):
         fut1 = rpc.rpc_async(dst_worker_name, script_add_ones, (t,))
@@ -168,6 +220,8 @@ def record_function_on_caller_rpc_async(dst_worker_name: str, block: str) -> Ten
 
 @torch.jit.script
 def script_fork_wait_udf(tensor):
+    # [FUNCTION DOC] HELPER: Scripted function forking the add-ones function, waiting, and
+    # returning the result.
     fut = torch.jit._fork(script_add_ones, tensor)
     x = torch.jit._wait(fut)
     return x
@@ -175,16 +229,20 @@ def script_fork_wait_udf(tensor):
 
 @torch.jit.script
 def rref_to_here(rref_var: RRef[Tensor]) -> Tensor:
+    # [FUNCTION DOC] HELPER: Scripted function fetching the RRef's tensor value to this worker.
     return rref_var.to_here()
 
 
 @torch.jit.script
 def return_rref(rref_var: RRef[Tensor]) -> RRef[Tensor]:
+    # [FUNCTION DOC] HELPER: Scripted identity function on an RRef.
     return rref_var
 
 
 @torch.jit.script
 def script_raise_func(value):
+    # [FUNCTION DOC] HELPER: Scripted function that raises a value error when the tensor has
+    # exactly two elements, otherwise returns the tensor plus one.
     if value.numel() == 2:
         raise ValueError("Expected error")
     return value + 1
@@ -192,6 +250,8 @@ def script_raise_func(value):
 
 @torch.jit.script
 def script_fork_wait_throw(invalue):
+    # [FUNCTION DOC] HELPER: Scripted function forking the raising function and waiting, so the
+    # error propagates at the wait. Returns the forked result when no error occurs.
     fut = torch.jit._fork(script_raise_func, invalue)
     value = torch.jit._wait(fut)
     return value
@@ -201,6 +261,9 @@ def script_fork_wait_throw(invalue):
 def call_rpc_with_profiling(
     record: torch.classes.profiler._RecordFunction, dst_worker_name: str
 ) -> Tensor:
+    # [FUNCTION DOC] HELPER: Scripted function that issues an async RPC of the plus-one function
+    # to dst_worker_name, attaches the end callbacks of the given record-function object to
+    # the future, waits and returns the result.
     # Call rpc_async from within ScriptFunction and ensure that we can attach
     # profiling callbacks. Note that handle here is a Tensor representation of
     # RecordFunction.
@@ -214,6 +277,8 @@ def call_rpc_with_profiling(
 def call_rpc_torchscript_with_record_function(
     dst_worker_name: str, block: str
 ) -> Tensor:
+    # [FUNCTION DOC] HELPER: Scripted function making an async RPC to a remote scripted function
+    # that itself runs inside a record_function scope named block; waits and returns the result.
     fut = rpc.rpc_async(
         dst_worker_name, script_add_ones_with_record_function, (torch.tensor(1), block)
     )
@@ -222,6 +287,8 @@ def call_rpc_torchscript_with_record_function(
 
 @torch.jit.script
 def call_fork_with_profiling(record: torch.classes.profiler._RecordFunction) -> Tensor:
+    # [FUNCTION DOC] HELPER: Scripted function that forks the plus-one function, attaches the
+    # record-function end callbacks to the future, waits and returns the result.
     # Call fork from within ScriptFunction and ensure that we can attach profiling
     # callbacks to the resulting future. Note that handle here is a Tensor
     # representation of RecordFunction.
@@ -232,7 +299,11 @@ def call_fork_with_profiling(record: torch.classes.profiler._RecordFunction) -> 
 
 
 class MyScriptModuleWithRRefs(torch.jit.ScriptModule):
+    # [CLASS DOC] HELPER:
+    # Script module holding a list of four RRefs, each to a remote 2x2 tensor of twos; forward
+    # fetches them and adds them onto a 2x2 ones tensor.
     def __init__(self, dst_worker):
+        # [FUNCTION DOC] HELPER: Creates four remote RRefs on dst_worker and stores them in a list.
         super().__init__()
         self.rrefs = []
         for _ in range(4):
@@ -240,6 +311,7 @@ class MyScriptModuleWithRRefs(torch.jit.ScriptModule):
 
     @torch.jit.script_method
     def forward(self) -> Tensor:
+        # [FUNCTION DOC] HELPER: Returns 2x2 ones plus the fetched value of every stored RRef.
         res_tensor = torch.ones(2, 2)
         for rref in self.rrefs:
             res_tensor += rref.to_here()
@@ -249,17 +321,27 @@ class MyScriptModuleWithRRefs(torch.jit.ScriptModule):
 
 @torch.jit.ignore
 def rref_python_annotation(rref_var: RRef[Tensor]) -> RRef[Tensor]:
+    # [FUNCTION DOC] HELPER: Python-only (ignored by the compiler) identity on an RRef whose
+    # signature carries an RRef type annotation.
     return rref_var
 
 
 @torch.jit.script
 def rref_script_annotation(rref_var: RRef[Tensor]) -> Tensor:
+    # [FUNCTION DOC] HELPER: Scripted function that passes the RRef through the ignored Python
+    # function and fetches its value.
     return rref_python_annotation(rref_var).to_here()
 
 
 class RRefTypingTest:
+    # [CLASS DOC]
+    # Mixin of tests that RRef typed arguments and return values work with scripted functions,
+    # script modules holding RRefs, and Python annotations. Stateless.
     @dist_init
     def test_rref_as_arg_and_return(self):
+        # [FUNCTION DOC]
+        # Creates a local RRef, then checks passing it to a scripted function and getting it back,
+        # both through rpc_sync and remote, yields values equal to the local plus-one result.
         n = self.rank + 1
         dst_rank = n % self.world_size
         local_ret = one_arg(torch.ones(2, 2))
@@ -285,6 +367,9 @@ class RRefTypingTest:
 
     @dist_init
     def test_my_script_module_with_rrefs(self):
+        # [FUNCTION DOC]
+        # Builds the script module with four remote RRefs and checks its forward returns a 2x2
+        # tensor filled with nine.
         n = self.rank + 1
         dst_rank = n % self.world_size
 
@@ -294,6 +379,9 @@ class RRefTypingTest:
 
     @dist_init
     def test_rref_python_annotation(self):
+        # [FUNCTION DOC]
+        # Checks a scripted function can use an ignored Python function with RRef annotations
+        # and fetch the value, expecting a 2x2 tensor of twos.
         n = self.rank + 1
         dst_rank = n % self.world_size
         rref_var = rpc_return_rref(worker_name(dst_rank))
@@ -303,8 +391,14 @@ class RRefTypingTest:
 
 
 class FutureTypingTest:
+    # [CLASS DOC]
+    # Mixin of tests for passing RPC futures between Python and TorchScript. Stateless.
     @dist_init
     def test_future_passed_between_python_and_jit(self):
+        # [FUNCTION DOC]
+        # Checks a Python-created RPC future can be waited on inside a scripted function, and a
+        # future created inside script can be returned to Python and waited there; both give
+        # the expected sum tensor.
         dst_rank = (self.rank + 1) % self.world_size
         inputs = (torch.tensor([1, 1]), torch.tensor([2, 2]))
         ret_fut = rpc.rpc_async(worker_name(dst_rank), two_args_two_kwargs, args=inputs)
@@ -312,6 +406,7 @@ class FutureTypingTest:
 
         @torch.jit.script
         def future_wait_in_script(fut: Future[Tensor]) -> Tensor:
+            # [FUNCTION DOC] HELPER: Scripted function that waits on the given future.
             return fut.wait()
 
         self.assertEqual(future_wait_in_script(ret_fut), expected_res)
@@ -320,6 +415,7 @@ class FutureTypingTest:
         def future_return_to_python(
             dst_rank: int, inputs: tuple[Tensor, Tensor]
         ) -> Future[Tensor]:
+            # [FUNCTION DOC] HELPER: Scripted function returning an unwaited RPC future.
             return rpc.rpc_async(f"worker{dst_rank}", two_args_two_kwargs, inputs)
 
         fut_res = future_return_to_python(dst_rank, inputs)
@@ -327,6 +423,9 @@ class FutureTypingTest:
 
     @dist_init
     def test_future_python_annotation(self):
+        # [FUNCTION DOC]
+        # Rank 0 only. Checks a scripted function can call an ignored Python function annotated
+        # to return a future, wait on it, and get the expected tensor sum.
         if self.rank != 0:
             return
 
@@ -337,11 +436,15 @@ class FutureTypingTest:
 
         @torch.jit.ignore
         def python_return_future() -> Future[Tensor]:
+            # [FUNCTION DOC] HELPER: Python-only function starting an async RPC tensor add on the
+            # next worker and returning its future.
             fut = rpc.rpc_async(dst_worker_name, torch.add, (input_0, input_1), {})
             return fut
 
         @torch.jit.script
         def script_use_future() -> Tensor:
+            # [FUNCTION DOC] HELPER: Scripted function that calls the Python future provider
+            # and waits on the future.
             fut = python_return_future()
             return fut.wait()
 
@@ -351,55 +454,82 @@ class FutureTypingTest:
 
 @torch.jit.script
 class MyScriptClass:
+    # [CLASS DOC] HELPER:
+    # Scripted (TorchScript) class wrapping one integer attribute a, used as RRef content.
     def __init__(self, a: int):
+        # [FUNCTION DOC] HELPER: Stores the integer a.
         self.a = a
 
     def get_value(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns the stored integer.
         return self.a
 
 
 @torch.jit.interface
 class MyModuleInterface(torch.nn.Module):
+    # [CLASS DOC] HELPER:
+    # TorchScript interface declaring a forward method that returns a tensor and takes no
+    # inputs; implemented by MyScriptModule and used as the RRef type hint.
     def forward(self) -> Tensor:
+        # [FUNCTION DOC] HELPER: Interface method declaration with no body.
         # pyre-ignore[7]: Pyre and torch.jit.interface don't mix well
         pass
 
 
 class MyScriptModule(torch.jit.ScriptModule):
+    # [CLASS DOC] HELPER:
+    # Script module holding a tensor a of ones with length equal to the given rank. It
+    # implements the module interface through forward; custom_func is an extra method.
     def __init__(self, rank):
+        # [FUNCTION DOC] HELPER: Stores a ones tensor of length rank as attribute a.
         super().__init__()
         self.a = torch.ones(rank)
 
     @torch.jit.script_method
     def forward(self) -> Tensor:
+        # [FUNCTION DOC] HELPER: Returns the stored tensor.
         return self.a
 
     @torch.jit.script_method
     def custom_func(self) -> Tensor:
+        # [FUNCTION DOC] HELPER: Returns the stored tensor (extra method beyond the interface).
         return self.a
 
 
 def owner_create_rref_my_script_class(a):
+    # [FUNCTION DOC] HELPER: Run on the owner; wraps a new scripted class instance in a local RRef.
     return rpc.RRef(MyScriptClass(a))
 
 
 def owner_create_rref_my_script_module(a):
+    # [FUNCTION DOC] HELPER: Run on the owner; wraps a new script module in a local RRef with the
+    # module interface as type hint (required for script modules).
     return rpc.RRef(MyScriptModule(a), type_hint=MyModuleInterface)
 
 
 @torch.jit.script
 def script_rref_get_value_my_script_class(rref: RRef[MyScriptClass]) -> int:
+    # [FUNCTION DOC] HELPER: Scripted function fetching the class instance from the RRef and
+    # returning its integer value.
     return rref.to_here().get_value()
 
 
 @torch.jit.script
 def script_rref_run_forward_my_script_module(rref: RRef[MyModuleInterface]) -> Tensor:
+    # [FUNCTION DOC] HELPER: Scripted function fetching the module from the RRef and returning
+    # the result of its forward.
     return rref.to_here().forward()
 
 
 class LocalRRefTest:
+    # [CLASS DOC]
+    # Mixin of tests for local RRefs that hold scripted classes or script modules, created in
+    # Python and used from Python or script, locally or across RPC. Stateless.
     @dist_init
     def test_create_local_script_class_rref_in_py(self):
+        # [FUNCTION DOC]
+        # Rank 0 only. Creates a local RRef of the scripted class and checks the fetched value
+        # equals the rank.
         if self.rank != 0:
             return
 
@@ -410,6 +540,10 @@ class LocalRRefTest:
 
     @dist_init
     def test_create_local_script_module_rref_in_py(self):
+        # [FUNCTION DOC]
+        # Rank 0 only. Creates a local RRef of a script module with the interface type hint and
+        # checks forward gives ones of length rank; creating it without a type hint must raise
+        # an error requiring the module interface hint.
         if self.rank != 0:
             return
 
@@ -430,6 +564,10 @@ class LocalRRefTest:
 
     @dist_init
     def test_return_local_script_class_rref_in_py_and_use_in_script(self):
+        # [FUNCTION DOC]
+        # Rank 0 only. Has the next worker create a local RRef of the scripted class, then uses
+        # it on the owner through a scripted function called via rpc_async, both from plain
+        # Python and from a scripted caller; both must return the rank value.
         if self.rank != 0:
             return
 
@@ -441,6 +579,8 @@ class LocalRRefTest:
         )
 
         def use_rref_on_owner(rref: RRef[MyScriptClass]) -> int:
+            # [FUNCTION DOC] HELPER: Runs the class value getter on the RRef owner through an
+            # async RPC (owner given by worker info) and returns the integer.
             args = (rref,)
             kwargs: dict[str, Any] = {}
             fut = rpc.rpc_async(
@@ -460,6 +600,10 @@ class LocalRRefTest:
 
     @dist_init
     def test_return_local_script_module_rref_in_py_and_use_in_script(self):
+        # [FUNCTION DOC]
+        # Rank 0 only. Like the script class variant, but the owner creates a script module RRef
+        # with the interface hint and the scripted forward is run on the owner; the result must
+        # be ones of length rank, from both Python and scripted callers.
         if self.rank != 0:
             return
 
@@ -471,6 +615,8 @@ class LocalRRefTest:
         )
 
         def use_rref_on_owner(rref: RRef[MyModuleInterface]) -> Tensor:
+            # [FUNCTION DOC] HELPER: Runs the module forward on the RRef owner (addressed by owner
+            # name) through an async RPC and returns the tensor.
             args = (rref,)
             kwargs: dict[str, Any] = {}
             fut = rpc.rpc_async(
@@ -493,6 +639,8 @@ class LocalRRefTest:
 
 
 def python_function():
+    # [FUNCTION DOC] HELPER: Plain Python (not scripted) function returning zero; used to show
+    # that scripts cannot call Python functions remotely.
     return 0
 
 
@@ -503,6 +651,8 @@ def two_args_two_kwargs(
     first_kwarg=torch.tensor([3, 3]),
     second_kwarg=torch.tensor([4, 4]),
 ):
+    # [FUNCTION DOC] HELPER: Scripted RPC target returning the sum of two positional and two
+    # keyword tensors (keyword defaults are 3s and 4s).
     return first_arg + second_arg + first_kwarg + second_kwarg
 
 
@@ -515,11 +665,15 @@ def assorted_types_args_kwargs(
     str_kwarg: str = "str_kwarg",
     int_kwarg: int = 2,
 ):
+    # [FUNCTION DOC] HELPER: Scripted RPC target taking tensor, string and integer positional
+    # args and keyword args with defaults. Returns a tuple: tensors added, strings concatenated,
+    # integers added.
     return tensor_arg + tensor_kwarg, str_arg + str_kwarg, int_arg + int_kwarg
 
 
 @torch.jit.script
 def raise_script():
+    # [FUNCTION DOC] HELPER: Scripted function that always raises a runtime error.
     raise RuntimeError("Expected error")
 
 
@@ -527,6 +681,8 @@ def raise_script():
 def script_rpc_async_call(
     dst_worker_name: str, args: tuple[Tensor, Tensor], kwargs: dict[str, Tensor]
 ):
+    # [FUNCTION DOC] HELPER: Scripted async RPC of the two-args-two-kwargs function; waits for
+    # and returns the result.
     fut = rpc.rpc_async(dst_worker_name, two_args_two_kwargs, args, kwargs)
     ret = fut.wait()
     return ret
@@ -536,6 +692,7 @@ def script_rpc_async_call(
 def script_rpc_sync_call(
     dst_worker_name: str, args: tuple[Tensor, Tensor], kwargs: dict[str, Tensor]
 ):
+    # [FUNCTION DOC] HELPER: Scripted blocking RPC of the same function; returns the result.
     res = rpc.rpc_sync(dst_worker_name, two_args_two_kwargs, args, kwargs)
     return res
 
@@ -544,14 +701,23 @@ def script_rpc_sync_call(
 def script_rpc_remote_call(
     dst_worker_name: str, args: tuple[Tensor, Tensor], kwargs: dict[str, Tensor]
 ):
+    # [FUNCTION DOC] HELPER: Scripted remote call of the same function; fetches and returns the
+    # RRef value.
     rref_res = rpc.remote(dst_worker_name, two_args_two_kwargs, args, kwargs)
     return rref_res.to_here()
 
 
 class JitRpcOpTest:
+    # [CLASS DOC]
+    # Mixin of tests for calling functions remotely from TorchScript with rpc_async, rpc_sync
+    # and remote: keyword defaults, mixed argument types, missing or extra arguments, and
+    # unsupported or failing targets. Stateless.
     # Call functions remotely from Script.
     @dist_init
     def test_all_kwargs_are_populated_by_defaults(self):
+        # [FUNCTION DOC]
+        # Rank 0 only. For each scripted call flavor, passing no kwargs must use both defaults,
+        # giving all tens.
         if self.rank != 0:
             return
 
@@ -570,6 +736,9 @@ class JitRpcOpTest:
 
     @dist_init
     def test_some_kwargs_are_populated_by_defaults(self):
+        # [FUNCTION DOC]
+        # Rank 0 only. Passing only the first kwarg must default the second; expects all nines
+        # for every call flavor.
         if self.rank != 0:
             return
 
@@ -588,6 +757,9 @@ class JitRpcOpTest:
 
     @dist_init
     def test_no_kwargs_are_populated_by_defaults(self):
+        # [FUNCTION DOC]
+        # Rank 0 only. Passing both kwargs overrides all defaults; expects all eights for every
+        # call flavor.
         if self.rank != 0:
             return
 
@@ -608,6 +780,9 @@ class JitRpcOpTest:
 
     @dist_init
     def test_args_and_kwargs_contain_different_types(self):
+        # [FUNCTION DOC]
+        # Rank 0 only. Scripted async RPC with tensor, string and integer positional and keyword
+        # arguments (kwargs typed as a mapping to Any); checks the returned tuple of sums.
         if self.rank != 0:
             return
 
@@ -617,6 +792,8 @@ class JitRpcOpTest:
         def script_rpc_async_call_with_assorted_types(
             dst_worker_name: str,
         ):
+            # [FUNCTION DOC] HELPER: Scripted async RPC of the assorted-types function with
+            # fixed args and kwargs; waits and returns the tuple result.
             args = (torch.tensor([1, 1]), "str_arg", 1)
             # Must annotate the value type as `Any`, because JIT type inference
             # does not support multiple types when defining a Dict.
@@ -639,6 +816,9 @@ class JitRpcOpTest:
 
     @dist_init
     def test_kwargs_not_passed(self):
+        # [FUNCTION DOC]
+        # Rank 0 only. Scripted async RPC passing an empty args tuple and no kwargs to a
+        # no-argument function; expects zero.
         if self.rank != 0:
             return
 
@@ -648,6 +828,8 @@ class JitRpcOpTest:
         def script_rpc_async_call_without_kwargs_passed(
             dst_worker_name: str,
         ):
+            # [FUNCTION DOC] HELPER: Scripted async RPC with empty args and no kwargs; returns
+            # the result.
             args = ()
             fut = rpc.rpc_async(dst_worker_name, no_arg, args)
             ret = fut.wait()
@@ -658,6 +840,9 @@ class JitRpcOpTest:
 
     @dist_init
     def test_args_kwargs_are_neither_passed(self):
+        # [FUNCTION DOC]
+        # Rank 0 only. Scripted async RPC passing neither args nor kwargs to a no-argument
+        # function; expects zero.
         if self.rank != 0:
             return
 
@@ -667,6 +852,7 @@ class JitRpcOpTest:
         def script_rpc_async_call_without_args_kwargs_passed(
             dst_worker_name: str,
         ):
+            # [FUNCTION DOC] HELPER: Scripted async RPC with no args or kwargs; returns result.
             fut = rpc.rpc_async(dst_worker_name, no_arg)
             ret = fut.wait()
             return ret
@@ -676,6 +862,9 @@ class JitRpcOpTest:
 
     @dist_init
     def test_less_than_needed_args_are_specified(self):
+        # [FUNCTION DOC]
+        # Rank 0 only. Compiling a script that passes too few positional args must fail at
+        # scripting time with an error naming the missing argument.
         if self.rank != 0:
             return
 
@@ -686,6 +875,8 @@ class JitRpcOpTest:
             def script_rpc_async_call_with_less_args(
                 dst_worker_name: str,
             ):
+                # [FUNCTION DOC] HELPER: Script expected to fail compilation: passes one
+                # positional arg where two are required.
                 args = (torch.tensor([1, 1]),)
                 kwargs = {}
                 fut = rpc.rpc_async(dst_worker_name, two_args_two_kwargs, args, kwargs)
@@ -694,6 +885,9 @@ class JitRpcOpTest:
 
     @dist_init
     def test_more_than_needed_args_are_specified(self):
+        # [FUNCTION DOC]
+        # Rank 0 only. Compiling a script that passes five positional args to a function taking
+        # at most four must fail at scripting time with a too-many-arguments error.
         if self.rank != 0:
             return
 
@@ -707,6 +901,8 @@ class JitRpcOpTest:
             def script_rpc_async_call_with_more_args(
                 dst_worker_name: str,
             ):
+                # [FUNCTION DOC] HELPER: Script expected to fail compilation: passes five
+                # positional args to a function accepting at most four.
                 args = (
                     torch.tensor([1, 1]),
                     torch.tensor([2, 2]),
@@ -721,6 +917,10 @@ class JitRpcOpTest:
 
     @dist_init
     def test_unexepected_kwarg_is_specified(self):
+        # [FUNCTION DOC]
+        # Rank 0 only. A script passing an unknown keyword compiles, but running it must raise
+        # an unknown keyword argument error (kwarg matching happens at execution time).
+        # KNOWN ISSUE: method name misspells "unexpected".
         if self.rank != 0:
             return
 
@@ -731,6 +931,8 @@ class JitRpcOpTest:
         def script_rpc_async_call_with_unexpected_kwarg(
             dst_worker_name: str,
         ):
+            # [FUNCTION DOC] HELPER: Scripted async RPC passing an unknown keyword argument;
+            # raises at execution.
             args = (torch.tensor([1, 1]), torch.tensor([2, 2]))
             kwargs = {"third_kwarg": torch.tensor([1, 1])}
             fut = rpc.rpc_async(dst_worker_name, two_args_two_kwargs, args, kwargs)
@@ -745,6 +947,9 @@ class JitRpcOpTest:
 
     @dist_init
     def test_call_python_function_remotely_from_script_not_supported(self):
+        # [FUNCTION DOC]
+        # Rank 0 only. A script that targets a plain Python function through rpc_async must
+        # raise an error about an undefined function when run.
         if self.rank != 0:
             return
 
@@ -752,6 +957,7 @@ class JitRpcOpTest:
 
         @torch.jit.script
         def rpc_async_call_remote_py_function_in_torchscript(dst_worker_name: str):
+            # [FUNCTION DOC] HELPER: Scripted async RPC of a Python-only function; fails at run.
             args = ()
             kwargs = {}
             fut = rpc.rpc_async(dst_worker_name, python_function, args, kwargs)
@@ -766,6 +972,9 @@ class JitRpcOpTest:
 
     @dist_init
     def test_call_script_function_that_raises_remotely_from_script(self):
+        # [FUNCTION DOC]
+        # Rank 0 only. A script that remotely runs a script function which raises must surface
+        # an error containing the expected message on wait.
         if self.rank != 0:
             return
 
@@ -778,6 +987,7 @@ class JitRpcOpTest:
         def rpc_async_call_remote_raising_torchscript_in_torchscript(
             dst_worker_name: str,
         ):
+            # [FUNCTION DOC] HELPER: Scripted async RPC of the always-raising script function.
             args = ()
             kwargs = {}
             fut = rpc.rpc_async(dst_worker_name, raise_script, args, kwargs)
@@ -792,6 +1002,9 @@ class JitRpcOpTest:
 
     @dist_init
     def test_call_script_function_that_not_exists_remotely_from_script(self):
+        # [FUNCTION DOC]
+        # Rank 0 only. A script function defined only inside the test is not registered on the
+        # remote worker, so calling it remotely must raise an undefined function error naming it.
         if self.rank != 0:
             return
 
@@ -799,12 +1012,14 @@ class JitRpcOpTest:
 
         @torch.jit.script
         def nonexisting_script():
+            # [FUNCTION DOC] HELPER: Scripted function returning zero, local to the test.
             return 0
 
         @torch.jit.script
         def rpc_async_call_remote_nonexisting_torchscript_in_torchscript(
             dst_worker_name: str,
         ):
+            # [FUNCTION DOC] HELPER: Scripted async RPC of the test-local script function.
             args = ()
             kwargs = {}
             fut = rpc.rpc_async(dst_worker_name, nonexisting_script, args, kwargs)
@@ -822,11 +1037,15 @@ class JitRpcOpTest:
 
 @torch.jit.ignore
 def my_script_module_init(rank: int) -> MyModuleInterface:
+    # [FUNCTION DOC] HELPER: Python-only (ignored by the compiler) factory building a script
+    # module for the given rank, usable as the module interface type from script.
     return MyScriptModule(rank)
 
 
 @torch.jit.script
 def construct_my_script_module(rank: int) -> MyModuleInterface:
+    # [FUNCTION DOC] HELPER: Scripted function that constructs the script module via the
+    # ignored Python factory.
     return my_script_module_init(rank)
 
 
@@ -834,38 +1053,50 @@ def construct_my_script_module(rank: int) -> MyModuleInterface:
 def run_ref_script_module(
     ref_script_module: RRef[MyModuleInterface], t: Tensor
 ) -> Tensor:
+    # [FUNCTION DOC] HELPER: Scripted function that fetches the module from the RRef and returns
+    # its forward output plus t.
     module = ref_script_module.to_here()
     return module.forward() + t
 
 
 @torch.jit.script
 def script_check_rref_confirmed(rref: RRef[Tensor]) -> bool:
+    # [FUNCTION DOC] HELPER: Scripted function returning whether the owner has confirmed the RRef.
     return rref.confirmed_by_owner()
 
 
 @torch.jit.script
 def save_rref(rref_var: RRef[Tensor], fname: str) -> None:
+    # [FUNCTION DOC] HELPER: Scripted function saving the RRef to file fname; writes a file and
+    # raises when JIT RRef pickling is not enabled.
     torch.save(rref_var, fname)
 
 
 @torch.jit.script
 def script_add(x: Tensor, y: Tensor) -> Tensor:
+    # [FUNCTION DOC] HELPER: Scripted elementwise sum of two tensors.
     return x + y
 
 
 @rpc.functions.async_execution
 @torch.jit.script
 def async_add(to: str, x: Tensor, y: Tensor) -> Future[Tensor]:
+    # [FUNCTION DOC] HELPER: Async-execution scripted function returning a future from an async
+    # RPC of the add function to worker to.
     return rpc.rpc_async(to, script_add, (x, y))
 
 
 @rpc.functions.async_execution
 @torch.jit.script
 def async_wrong_type() -> Tensor:
+    # [FUNCTION DOC] HELPER: Async-execution function that wrongly returns a tensor instead of a
+    # future; used to trigger the return type error.
     return torch.zeros(2)
 
 
 def load_script_module_with_pickled_rref(pickled_script_module):
+    # [FUNCTION DOC] HELPER: RPC target that loads a script module from the given bytes, calls
+    # it and returns its output.
     f = io.BytesIO(pickled_script_module)
     m = torch.jit.load(f)
     return m()
@@ -879,8 +1110,15 @@ class JitRpcTest(
     FutureTypingTest,
     RpcAgentTestFixture,
 ):
+    # [CLASS DOC]
+    # Main JIT RPC test case: composes the RRef, local RRef, op and future mixins with the
+    # agent fixture and adds tests for script functions and modules over RPC, JIT RRef pickling,
+    # callbacks on futures, profiling, and async_execution. Stateless.
     @dist_init
     def test_torchscript_function(self):
+        # [FUNCTION DOC]
+        # Checks a script function gives the same result locally, via rpc_sync, via remote and via
+        # remote to the same worker.
         dst_worker_name = worker_name((self.rank + 1) % self.world_size)
         local_ret = one_arg(torch.ones(2, 2))
         ret = rpc.rpc_sync(dst_worker_name, one_arg, args=(torch.ones(2, 2),))
@@ -895,6 +1133,9 @@ class JitRpcTest(
 
     @dist_init
     def test_torchscript_function_exception(self):
+        # [FUNCTION DOC]
+        # Passing too many arguments to a script function over rpc_sync or remote must raise an
+        # error saying it expected at most a given number of arguments.
         dst_worker_name = worker_name((self.rank + 1) % self.world_size)
         with self.assertRaisesRegex(RuntimeError, r"one_arg\(\) expected at most"):
             rpc.rpc_sync(dst_worker_name, one_arg, args=(10, 20))
@@ -904,6 +1145,11 @@ class JitRpcTest(
 
     @dist_init
     def test_torchscript_functions_not_supported(self):
+        # [FUNCTION DOC]
+        # Creates a local script module, then initializes a process group and barriers so module
+        # creation does not race with server threads. Checks rpc_sync accepts a script class like
+        # a Python callable, while sending a script module method raises a pickling type error.
+        # Side effect: initializes the default process group.
         dst_worker_name = worker_name((self.rank + 1) % self.world_size)
 
         my_local_script_module = MyScriptModule(self.rank)
@@ -927,6 +1173,11 @@ class JitRpcTest(
 
     @dist_init
     def test_remote_script_module(self):
+        # [FUNCTION DOC]
+        # Sets the global flag that ignores RRef leaks at shutdown (side effect, never reset),
+        # creates a script module remotely, passes its RRef to the owner where forward result
+        # plus ones is checked, and checks sending the RRef from the owner to itself raises an
+        # error about script module RRefs not sendable from the owner.
         # TODO, need more investigation
         # there is rref leak when shutting down, suspect it is because
         # ref as arg is passed to pybind boundary, and the ref is not garbage
@@ -964,6 +1215,10 @@ class JitRpcTest(
 
     @dist_init
     def test_create_script_module_on_remote(self):
+        # [FUNCTION DOC]
+        # Checks a script module built remotely by rpc_sync comes back as a script module that
+        # runs forward; with remote, the owner holds a script module, remote forward and
+        # custom method calls work, and fetching it to this worker yields a working module.
         dst_name = worker_name((self.rank + 1) % self.world_size)
         # Construct on remote end with rpc_sync
         created_script_module = rpc.rpc_sync(
@@ -1000,6 +1255,10 @@ class JitRpcTest(
 
     @dist_init
     def test_load_script_module_with_pickled_rref(self):
+        # [FUNCTION DOC]
+        # Saves a script module holding RRefs to a buffer with JIT RRef pickling temporarily
+        # enabled, loads and runs it on the next worker, and checks the output equals running an
+        # equivalent module locally. Toggles the global JIT RRef pickle switch (on, then off).
         dst_name = worker_name((self.rank + 1) % self.world_size)
         m1 = MyScriptModuleWithRRefs(dst_name)
         m2 = MyScriptModuleWithRRefs(dst_name)
@@ -1018,6 +1277,9 @@ class JitRpcTest(
 
     @dist_init
     def test_rref_jit_pickle_not_supported(self):
+        # [FUNCTION DOC]
+        # Saving an RRef through JIT outside an RPC call must raise an error saying RRef JIT
+        # pickling is only allowed inside RPC calls. Uses a temporary file.
         n = self.rank + 1
         dst_rank = n % self.world_size
         rref_var = rpc_return_rref(worker_name(dst_rank))
@@ -1031,6 +1293,9 @@ class JitRpcTest(
 
     @dist_init
     def test_remote_script_throw(self):
+        # [FUNCTION DOC]
+        # A remote call to a raising script function must make the RRef fetch raise an error
+        # with the expected message.
         rref = rpc.remote(
             worker_name((self.rank + 1) % self.world_size),
             script_raise_func,
@@ -1041,6 +1306,8 @@ class JitRpcTest(
 
     @dist_init
     def test_remote_script_udf(self):
+        # [FUNCTION DOC]
+        # A remote call to a script function that forks and waits must fetch a tensor of twos.
         rref = rpc.remote(
             worker_name((self.rank + 1) % self.world_size),
             script_fork_wait_udf,
@@ -1050,6 +1317,8 @@ class JitRpcTest(
 
     @dist_init
     def test_async_script_udf(self):
+        # [FUNCTION DOC]
+        # An async RPC to the fork-and-wait script function must resolve to a tensor of twos.
         future = rpc.rpc_async(
             worker_name((self.rank + 1) % self.world_size),
             script_fork_wait_udf,
@@ -1059,7 +1328,10 @@ class JitRpcTest(
 
     @dist_init
     def test_callback_simple(self):
+        # [FUNCTION DOC]
+        # Chains one then-callback adding one on an async RPC future; expects twos plus one.
         def callback(fut):
+            # [FUNCTION DOC] HELPER: Returns the waited future value plus one.
             return fut.wait() + 1
 
         future = rpc.rpc_async(
@@ -1071,9 +1343,13 @@ class JitRpcTest(
 
     @dist_init
     def test_callback_chain(self):
+        # [FUNCTION DOC]
+        # Chains twenty then-callbacks, each adding one, onto an async RPC future; expects the
+        # plus-one result plus twenty.
         n = self.rank + 1
 
         def callback(fut):
+            # [FUNCTION DOC] HELPER: Returns the waited future value plus one.
             return fut.wait() + 1
 
         fut = rpc.rpc_async(
@@ -1088,9 +1364,14 @@ class JitRpcTest(
 
     @dist_init
     def test_add_done_callback(self):
+        # [FUNCTION DOC]
+        # Registers a done callback that stores double the result, adds a later then-callback to
+        # ensure the first has run, and checks the stored value is four times ones.
         callback_called = None
 
         def callback(fut):
+            # [FUNCTION DOC] HELPER: Stores double the waited future value in the enclosing
+            # variable.
             nonlocal callback_called
             callback_called = fut.wait() * 2
 
@@ -1112,6 +1393,8 @@ class JitRpcTest(
 
     @dist_init
     def test_async_script_throw(self):
+        # [FUNCTION DOC]
+        # An async RPC to a raising script function must raise the expected error on wait.
         future = rpc.rpc_async(
             worker_name((self.rank + 1) % self.world_size),
             script_fork_wait_throw,
@@ -1122,7 +1405,12 @@ class JitRpcTest(
 
     @dist_init
     def test_callback_with_exception(self):
+        # [FUNCTION DOC]
+        # A then-callback on a failing RPC future observes the original error, then raises a
+        # new error; waiting on the chained future must raise the new error.
         def callback(fut):
+            # [FUNCTION DOC] HELPER: Asserts waiting raises the expected error, then raises
+            # another runtime error.
             with self.assertRaisesRegex(Exception, ".*Expected error.*"):
                 fut.wait()
             raise RuntimeError("Another expected error")
@@ -1138,6 +1426,10 @@ class JitRpcTest(
 
     @dist_init
     def test_call_rpc_with_profiling(self):
+        # [FUNCTION DOC]
+        # Rank 0 only. Under the legacy profiler, runs a script that attaches the end callbacks of
+        # a record-function event to an RPC future, then checks the recorded function event name
+        # contains the qualified name of the remote script function.
         # Ensures that we can call torch.ops.profiler._call_end_callbacks_on_jit_fut on a jit
         # future from within a script function that calls rpc_async
         if self.rank == 0:
@@ -1162,6 +1454,10 @@ class JitRpcTest(
 
     @dist_init
     def test_rpc_async_jit_profiled(self):
+        # [FUNCTION DOC]
+        # Rank 0 only. Profiles a scripted rpc_async call and checks exactly one local event for
+        # the target function exists with the expected async-JIT profiling key, and inspects
+        # the remote events recorded.
         # Tests that rpc_async calls made from within a TorchScript function are
         # profiled.
         if self.rank == 0:
@@ -1207,6 +1503,10 @@ class JitRpcTest(
 
     @dist_init
     def test_record_function_on_caller_rpc_async(self):
+        # [FUNCTION DOC]
+        # Rank 0 only. Profiles a script that makes two async RPCs inside a record_function
+        # scope; checks one scope event and two RPC events exist, and the scope's total CPU
+        # time exceeds each RPC event's time (not the sum, since the calls overlap).
         if self.rank == 0:
             dst_rank = (self.rank + 1) % self.world_size
             dst_worker_name = worker_name(dst_rank)
@@ -1244,6 +1544,12 @@ class JitRpcTest(
 
     @dist_init
     def test_rpc_torchscript_record_function(self):
+        # [FUNCTION DOC]
+        # Rank 0 only. Profiles an RPC to a script function that uses a record_function scope
+        # remotely; finds the remote event whose name combines the profiling key, the remote
+        # op marker and the scope name and inspects its CPU children.
+        # KNOWN ISSUE: the final assertion passes a generator expression to a truth check, so it
+        # is always true and does not actually verify that a child event is an add op.
         # tests that torchscript functions can be profiled using with
         # record_function(...) over RPC.
         REMOTE_OP_STR = "#remote_op: "
@@ -1277,6 +1583,10 @@ class JitRpcTest(
             self.assertTrue("aten::add" in child.name for child in remote_children)
 
     def test_record_function_jit_end_callbacks_with_fork(self):
+        # [FUNCTION DOC]
+        # Not wrapped by dist_init (no RPC used). In eager mode, forks a sleeping function and
+        # attaches the record_function end callbacks to the JIT future; checks the profiled
+        # event is named foo and its CPU time is at least the sleep interval.
         # Ensures that we can call rf._call_end_callbacks_on_future on a jit
         # future in python eager mode with torch.jit.fork
         sleep_interval = 1
@@ -1294,6 +1604,10 @@ class JitRpcTest(
         self.assertGreaterAlmostEqual(sleep_event.cpu_time * 1e-6, sleep_interval)
 
     def test_call_fork_in_jit_with_profiling(self):
+        # [FUNCTION DOC]
+        # Not wrapped by dist_init (no RPC used). Runs a script that forks and attaches the end
+        # callbacks of a record_function event to the future; checks the profiler recorded an
+        # event named foo.
         # Ensures that we can call torch.ops.profiler._call_end_callbacks_on_jit_fut on a jit
         # future from within a script function with torch.jit.fork
         with _profile() as prof, torch.autograd.profiler.record_function("foo") as rf:
@@ -1305,6 +1619,9 @@ class JitRpcTest(
 
     @dist_init
     def test_async_function_simple(self):
+        # [FUNCTION DOC]
+        # An rpc_sync to an async-execution script function that itself forwards the add to a
+        # third worker must return the sum, twos.
         dst1 = worker_name((self.rank + 1) % self.world_size)
         dst2 = worker_name((self.rank + 2) % self.world_size)
 
@@ -1315,6 +1632,9 @@ class JitRpcTest(
 
     @dist_init
     def test_async_function_wrong_return_type(self):
+        # [FUNCTION DOC]
+        # An async-execution function returning a tensor instead of a future must make rpc_sync
+        # raise an error saying async functions must return a future.
         with self.assertRaisesRegex(
             RuntimeError,
             "Async functions must return an IValue of Future type, but got Tensor",
@@ -1325,6 +1645,9 @@ class JitRpcTest(
 
     @dist_init
     def test_async_function_wrong_decorator_order(self):
+        # [FUNCTION DOC]
+        # Applying the script decorator on top of the async-execution decorator must make
+        # compilation raise an error (the exact message is intentionally not checked).
         # @torch.jit.script complains about undefined value rpc. Error is shown
         # below. The reason for not checking error string is to avoid making
         # JIT error handling code depend on RPC tests, as we don't have any
@@ -1343,10 +1666,14 @@ class JitRpcTest(
             def async_wrong_decorator_order(
                 to: str, x: Tensor, y: Tensor
             ) -> Future[Tensor]:
+                # [FUNCTION DOC] HELPER: Function with the wrong decorator order; compilation
+                # fails so this body is never run.
                 return rpc.rpc_async(to, script_add, (x, y))
 
     @dist_init
     def test_async_function_remote(self):
+        # [FUNCTION DOC]
+        # Same as the simple async-execution test but via remote; the fetched value is twos.
         dst1 = worker_name((self.rank + 1) % self.world_size)
         dst2 = worker_name((self.rank + 2) % self.world_size)
 
@@ -1357,6 +1684,9 @@ class JitRpcTest(
 
     @dist_init
     def test_async_function_remote_multi(self):
+        # [FUNCTION DOC]
+        # Issues twenty remote async-execution adds with increasing offsets and checks each fetched
+        # result equals ones plus the offset.
         dst1 = worker_name((self.rank + 1) % self.world_size)
         dst2 = worker_name((self.rank + 2) % self.world_size)
 
@@ -1373,6 +1703,9 @@ class JitRpcTest(
 
     @dist_init
     def test_async_function_wrong_return_type_remote(self):
+        # [FUNCTION DOC]
+        # Remote variant of the wrong return type test: fetching the RRef must raise the error
+        # saying async functions must return a future.
         rref = rpc.remote(
             worker_name((self.rank + 1) % self.world_size), async_wrong_type
         )
