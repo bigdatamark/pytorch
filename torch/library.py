@@ -1,4 +1,12 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Public Python API for registering operators and kernels with the dispatcher (torch.library).
+# Provides the Library class (a wrapper over a C++ dispatcher library fragment, DEF, or IMPL), and
+# functional registration helpers: define, impl, register_kernel, register_autocast, register_fake,
+# register_autograd, register_torch_dispatch, register_vmap, get_ctx, get_kernel, opcheck. It also
+# re-exports custom_op, triton_op, wrap_triton and infer_schema from torch._library.
+# Module-level state tracks registered (namespace/op/dispatch key) kernels and defined ops so that
+# Library cleanup can undo them, and keeps anonymous Library objects alive.
+# Import-time side effects: none beyond creating the module-level sets and lists.
 import contextlib
 import functools
 import inspect
@@ -58,6 +66,7 @@ _reserved_namespaces = ["prim"]
 
 
 def fallthrough_kernel():
+    # [FUNCTION DOC] Placeholder kernel passed to Library.impl to register a fallthrough. Takes no arguments and always raises NotImplementedError if actually called.
     """
     A dummy function to pass to ``Library.impl`` in order to register a fallthrough.
     """
@@ -65,6 +74,10 @@ def fallthrough_kernel():
 
 
 def _validate_out_schema(schema: "str | torch._C.FunctionSchema") -> None:
+    # [FUNCTION DOC] HELPER: Check that a schema (string or parsed schema) can carry the out tag.
+    # Requires at least one mutable argument, all mutable arguments keyword-only and Tensor typed, and
+    # one return per mutable argument that is a mutable alias of the matching argument, in order.
+    # Raises ValueError describing the first violated rule. No side effects.
     """Validate that a schema has valid out semantics, i.e., it can be tagged with torch.Tag.out.
 
     Requirements:
@@ -136,6 +149,10 @@ def _validate_out_schema(schema: "str | torch._C.FunctionSchema") -> None:
 
 
 def _validate_inplace_schema(schema: "str | torch._C.FunctionSchema") -> None:
+    # [FUNCTION DOC] HELPER: Check that a schema (string or parsed schema) can carry the inplace tag.
+    # Requires the first positional argument to be a mutable Tensor, exactly one return that is a
+    # Tensor mutably aliasing it, and no other mutable arguments. Raises ValueError on the first
+    # violated rule. No side effects.
     """Validate that a schema has valid inplace semantics, i.e., it can be tagged with torch.Tag.inplace.
 
     Requirements:
@@ -210,6 +227,13 @@ def _validate_inplace_schema(schema: "str | torch._C.FunctionSchema") -> None:
 
 
 class Library:
+    # [CLASS DOC] Wrapper around a C++ dispatcher library object for one namespace, used to define
+    # operators and register kernels from Python. Created with a namespace, a kind (DEF, IMPL or
+    # FRAGMENT) and an optional default dispatch key; DEF and FRAGMENT are rejected for reserved
+    # namespaces. State: m (the C++ handle, None once destroyed), ns, kind, dispatch_key, the sets of
+    # op definitions and kernel keys it registered, and a list of registration handles. A weakref
+    # finalizer undoes all registrations when the object is collected; _destroy does the same eagerly.
+    # Key methods: define, impl, fallback, register_symm_mem_args, and private fake/dispatch helpers.
     """
     A class to create libraries that can be used to register new operators or
     override operators in existing libraries from Python.
@@ -229,6 +253,10 @@ class Library:
     """
 
     def __init__(self, ns, kind, dispatch_key=""):
+        # [FUNCTION DOC] Create the underlying C++ library for namespace ns with the given kind and dispatch key,
+        # recording the calling file and line number. Raises ValueError for an unsupported kind or for
+        # DEF/FRAGMENT on a reserved namespace. Initializes bookkeeping sets and registers a weakref
+        # finalizer (not __del__) that unregisters everything and clears caches when the object dies.
         from torch.fx.operator_schemas import _SCHEMA_TO_SIGNATURE_CACHE
 
         if kind not in ("IMPL", "DEF", "FRAGMENT"):
@@ -267,9 +295,17 @@ class Library:
         )
 
     def __repr__(self):
+        # [FUNCTION DOC] Return a string describing the library kind, namespace and dispatch key.
+        # KNOWN ISSUE: the returned text ends with a stray closing angle bracket with no opening one.
         return f"Library(kind={self.kind}, ns={self.ns}, dispatch_key={self.dispatch_key})>"
 
     def define(self, schema, alias_analysis="", *, tags=()):
+        # [FUNCTION DOC] Define a new operator from a schema string in this library's namespace.
+        # Validates alias_analysis (only empty, FROM_SCHEMA or CONSERVATIVE allowed, else RuntimeError),
+        # normalizes tags to a tuple, and validates the schema for the out and inplace tags (ValueError).
+        # Calls into C++ to define the op, refreshes an already existing torch.ops packet so the new
+        # overload is visible, and records the qualified name in the library and global definition sets.
+        # Returns the operator name from C++. Raises AssertionError if the library was destroyed.
         r"""Defines a new operator and its semantics in the ns namespace.
 
         Args:
@@ -328,6 +364,11 @@ class Library:
         return result
 
     def _register_fake(self, op_name, fn, _stacklevel=1, *, allow_override=True):
+        # [FUNCTION DOC] HELPER: Register a Python fake (meta) implementation for op_name in this library.
+        # Finds the caller module via the stack level, and (except for torchvision callers) wraps the
+        # function so a one-time check verifies the C++ set_python_module declaration matches the caller.
+        # Registers on the op's registry entry and stores the handle for later cleanup.
+        # Args include allow_override, which controls whether an existing fake impl may be replaced.
         r"""Registers the fake impl for an operator defined in the library."""
 
         source = torch._library.utils.get_source(_stacklevel + 1)
@@ -357,6 +398,9 @@ class Library:
         self._registration_handles.append(handle)
 
     def _register_torch_dispatch_rule(self, op_name, torch_dispatch_class, fn):
+        # [FUNCTION DOC] HELPER: Register a torch_dispatch rule for an operator and a dispatch class (a Tensor
+        # subclass or a TorchDispatchMode) on the operator's registry entry, and keep the handle so it is
+        # removed when the library is destroyed.
         r"""Registers a torch_dispatch rule for the given operator and torch_dispatch_class.
 
         This allows for open registration to specify the behavior between the operator
@@ -379,6 +423,9 @@ class Library:
         self._registration_handles.append(handle)
 
     def _resolve_op_name(self, op_name, api_name):
+        # [FUNCTION DOC] HELPER: Turn a string or OpOverload into an operator name string. For an OpOverload
+        # the schema name plus a dot and the overload name (if non-empty) is returned. Raises RuntimeError
+        # mentioning api_name for any other type.
         """Resolve op_name (str or OpOverload) to a name string."""
         if isinstance(op_name, str):
             return op_name
@@ -395,6 +442,10 @@ class Library:
             )
 
     def _impl_with_aoti_compile(self, op_name, dispatch_key=""):
+        # [FUNCTION DOC] HELPER: Register the AOTI-compiled implementation of an operator for a dense dispatch key.
+        # Defaults the key to the library's key, requires it to include the Dense key set (AssertionError
+        # otherwise), raises RuntimeError if a Python kernel was already registered for the same
+        # namespace/op/key, then calls the C++ handle and records the key in the global and per-library sets.
         r"""Register the operator to use the AOTI-compiled implementation.
 
         Args:
@@ -441,6 +492,12 @@ class Library:
     def impl(
         self, op_name, fn, dispatch_key="", *, with_keyset=False, allow_override=True
     ):
+        # [FUNCTION DOC] Register a Python function as the kernel for an operator and dispatch key.
+        # Requires fn to be callable (TypeError); the key defaults to the library's key. If allow_override is
+        # false and a Python kernel already exists for the same namespace/op/key, raises RuntimeError.
+        # Refuses Meta kernels for ops that already have a CompositeImplicitAutograd kernel (RuntimeError).
+        # Calls the C++ handle (empty key means CompositeImplicitAutograd), optionally passing the dispatch
+        # keyset as the first argument, and records the key in the global and per-library sets.
         r"""Registers the function implementation for an operator defined in the library.
 
         Args:
@@ -516,6 +573,9 @@ class Library:
         self._op_impls.add(key)
 
     def register_symm_mem_args(self, op_name, arg_names):
+        # [FUNCTION DOC] Declare which argument names of an operator need symmetric memory allocation, so that
+        # Inductor can allocate them in peer-to-peer accessible memory. Resolves the qualified name, then
+        # registers the argument names on the op's registry entry and stores the handle for cleanup.
         r"""Registers which arguments require symmetric memory allocation for an operator.
 
         This method allows operators to declaratively specify which arguments need
@@ -549,6 +609,10 @@ class Library:
         self._registration_handles.append(handle)
 
     def fallback(self, fn, dispatch_key="", *, with_keyset=False):
+        # [FUNCTION DOC] Register fn as the fallback kernel for a dispatch key. Only valid on a library for the
+        # global namespace "_" (RuntimeError otherwise). The key defaults to the library's key and must be
+        # non-empty; AssertionError if empty or if the library was destroyed. fn may be the fallthrough
+        # kernel; with_keyset passes the dispatch keyset as the first argument.
         r"""Registers the function implementation as the fallback for the given key.
 
         This function only works for a library with global namespace ("_").
@@ -586,6 +650,9 @@ class Library:
         self.m.fallback(dispatch_key, fn, with_keyset)
 
     def _register_effectful_op(self, op_name: str, effect: EffectType | None):
+        # [FUNCTION DOC] HELPER: Register an effect type (or None) for an operator through the higher-order-ops
+        # effects registry and keep the returned handle for cleanup.
+        # KNOWN ISSUE: the docstring mentions OpOverload but the annotation says str only.
         """
         Registers an effect to an operator. This is used to register an op that
         has side effects that is not capturable by the schema.
@@ -602,6 +669,10 @@ class Library:
         self._registration_handles.append(handle)
 
     def _destroy(self):
+        # [FUNCTION DOC] HELPER: Eagerly tear down the library: reset the C++ handle and clear it, destroy all
+        # registration handles, remove this library's kernel keys from the global set, and clear cached
+        # torch.ops entries for its definitions. After this, define/impl raise AssertionError.
+        # KNOWN ISSUE: global definition set is not updated here, unlike in the finalizer path.
         if self.m is not None:
             self.m.reset()
         self.m = None
@@ -614,6 +685,10 @@ class Library:
 
 
 def _clear_torch_ops_cache(op_defs):
+    # [FUNCTION DOC] HELPER: For each qualified op name (namespace::name), delete the cached attribute from the
+    # torch.ops namespace object and its directory list so it is recomputed on next access. Skips
+    # malformed names, unknown namespaces and uncached names; avoids attribute lookups that could hit C++
+    # during interpreter shutdown.
     # Delete the cached torch.ops.ns.foo if it was registered.
     # Otherwise, accessing it leads to a segfault, or to enumerations
     # over the namespace (e.g. _collect_all_valid_cia_ops) tripping on
@@ -654,6 +729,11 @@ def _del_library(
     m,
     schema_to_signature_cache,
 ):
+    # [FUNCTION DOC] HELPER: Finalizer body for a Library. Drops signature-cache entries for its defined ops,
+    # removes its kernel keys and definitions from the global sets, destroys registration handles, resets
+    # the C++ handle if present, and clears cached torch.ops entries. Mutates the passed collections.
+    # KNOWN ISSUE: op names are qualified (namespace::name) but cache keys are split on a dot only, so
+    # the signature cache entries likely never match; an op name with two dots would raise ValueError.
     for op_def in op_defs:
         name = op_def
         overload_name = ""
@@ -678,6 +758,9 @@ def _del_library(
 
 @contextlib.contextmanager
 def _scoped_library(*args, **kwargs):
+    # [FUNCTION DOC] HELPER: Context manager that creates a Library from the given arguments, yields it, and
+    # always calls its _destroy on exit. Used for temporary registrations (mainly tests).
+    # KNOWN ISSUE: if Library construction raises, the cleanup in the finally block fails on an unbound name.
     try:
         lib = Library(*args, **kwargs)
         yield lib
@@ -693,6 +776,11 @@ NAMELESS_SCHEMA = re.compile(r"\(.*\) -> .*")
 
 @functools.singledispatch
 def define(qualname, schema, *, lib=None, tags=()):
+    # [FUNCTION DOC] Define a new operator from a qualified name and a schema without the name (single
+    # dispatch default for non-Library first arguments). Raises ValueError if qualname is not a string or
+    # the schema does not look like arguments followed by an arrow and returns. Uses the given lib, or
+    # creates a FRAGMENT library for the namespace and keeps it alive in a module-level list.
+    # Applies the given tags. Returns None.
     r"""Defines a new operator.
 
     In PyTorch, defining an op (short for "operator") is a two step-process:
@@ -760,11 +848,15 @@ def define(qualname, schema, *, lib=None, tags=()):
 
 @define.register
 def _(lib: Library, schema, alias_analysis=""):
+    # [FUNCTION DOC] Legacy form of define, dispatched when the first argument is a Library. Returns a
+    # decorator that defines the schema on the library and registers the decorated function as its
+    # implementation, returning the function unchanged. Kept for backward compatibility.
     """The old torch.library.define.
     We're keeping this around for BC reasons
     """
 
     def wrap(f):
+        # [FUNCTION DOC] HELPER: Decorator body: define the operator on the library, register f as its kernel, return f.
         name = lib.define(schema, alias_analysis)
         lib.impl(name, f)
         return f
@@ -809,6 +901,10 @@ def impl(
     *,
     lib: Library | None = None,
 ) -> object:
+    # [FUNCTION DOC] Register an implementation for one or more device types (or dispatch keys) of an
+    # operator named by qualname. Usable directly with func or as a decorator when func is None. The
+    # type "default" registers for all devices. Optionally ties the registration to lib. Delegates to the
+    # internal implementation without disabling dynamo tracing.
     """Register an implementation for a device type for this operator.
 
     You may pass "default" for ``types`` to register this implementation as the
@@ -877,9 +973,12 @@ if not TYPE_CHECKING:
     def _(
         lib: Library, name: str, dispatch_key: str = ""
     ) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
+        # [FUNCTION DOC] Legacy form of impl dispatched when the first argument is a Library: returns a decorator
+        # that registers the function on that library under the given name and dispatch key and returns it.
         """Legacy torch.library.impl API. Kept around for BC"""
 
         def wrap(f: Callable[_P, _T]) -> Callable[_P, _T]:
+            # [FUNCTION DOC] HELPER: Decorator body: register f on the library and return it unchanged.
             lib.impl(name, f, dispatch_key)
             return f
 
@@ -916,6 +1015,11 @@ def _impl(
     lib: Library | None = None,
     disable_dynamo: bool = False,
 ) -> Callable[[Callable[..., object]], None] | None:
+    # [FUNCTION DOC] HELPER: Shared implementation of impl and register_kernel. Normalizes types to a set of
+    # dispatch keys (dispatch key names pass through, device types are mapped to keys). If func is given,
+    # registers it immediately and returns None; otherwise returns a decorator doing the same. Registration
+    # uses lib or a new kept-alive FRAGMENT library for the namespace. If disable_dynamo is true each
+    # kernel is wrapped so dynamo does not trace into it.
     # See impl()
     if isinstance(types, str):
         types = (types,)
@@ -934,6 +1038,7 @@ def _impl(
             keys.add(_device_type_to_key(typ))
 
     def register_(func: Callable[..., object]) -> None:
+        # [FUNCTION DOC] HELPER: Register func for every computed key on the chosen library, optionally wrapped to disable dynamo.
         namespace, _ = torch._library.utils.parse_namespace(qualname)
 
         if lib is None:
@@ -945,6 +1050,7 @@ def _impl(
 
             @torch._disable_dynamo
             def func_no_dynamo(*args, **kwargs):
+                # [FUNCTION DOC] HELPER: Call the wrapped func with all arguments; marked so dynamo skips tracing it.
                 return func(*args, **kwargs)
 
             for key in keys:
@@ -961,6 +1067,8 @@ def _impl(
 
 
 def _device_type_to_key(device_type: str) -> str:
+    # [FUNCTION DOC] HELPER: Map a device type string to a dispatch key name. "default" maps to
+    # CompositeExplicitAutograd (an approximation); others use the C++ device-to-key mapping.
     if device_type == "default":
         # This is technically not correct, because although all device_type
         # DispatchKeys are included in CompositeExplicitAutograd,
@@ -976,6 +1084,8 @@ def _device_type_to_key(device_type: str) -> str:
     category=FutureWarning,
 )
 def impl_abstract(qualname, func=None, *, lib=None, _stacklevel=1):
+    # [FUNCTION DOC] Deprecated alias of register_fake (emits a FutureWarning). Adjusts the stack level when
+    # func is given so the fake impl records the right caller, then forwards all arguments.
     r"""This API was renamed to :func:`torch.library.register_fake` in PyTorch 2.4.
     Please use that instead.
     """
@@ -992,6 +1102,9 @@ _op_identifier = Union[
 def _resolve_op_for_registration(
     op: _op_identifier, registration_name: str
 ) -> str | CustomOpDef:
+    # [FUNCTION DOC] HELPER: Normalize an op argument for registration. Accepts a string, OpOverload or
+    # CustomOpDef (ValueError otherwise); an OpOverload becomes its qualified name. Returns the CustomOpDef
+    # if the name belongs to one, else the string.
     if not isinstance(op, (str, OpOverload, CustomOpDef)):
         raise ValueError(
             f"{registration_name}({op}): got unexpected type for op: {type(op)}"
@@ -1007,6 +1120,7 @@ def _resolve_op_for_registration(
 
 
 def _library_for_registration(namespace: str, lib: Library | None) -> Library:
+    # [FUNCTION DOC] HELPER: Return the given Library, or create a FRAGMENT library for the namespace and keep it alive.
     if lib is not None:
         return lib
     use_lib = Library(namespace, "FRAGMENT")
@@ -1022,6 +1136,11 @@ def register_kernel(
     *,
     lib: Library | None = None,
 ):
+    # [FUNCTION DOC] Register an implementation of an op for given device types (None means all, mapped to
+    # CompositeExplicitAutograd). Usable as a decorator when func is None. For a CustomOpDef, delegates
+    # to its own register_kernel. Otherwise registers through the shared internal path with dynamo
+    # disabled for the kernel. Returns the decorator, or None when func is supplied.
+    # KNOWN ISSUE: the docstring text for lib is cut off mid-sentence.
     """Register an implementation for a device type for this operator.
 
     Some valid device_types are: "cpu", "cuda", "xla", "mps", "ipu", "xpu".
@@ -1081,6 +1200,11 @@ def register_autocast(
     *,
     lib: Library | None = None,
 ):
+    # [FUNCTION DOC] Register an autocast rule for a custom op on a device type: under autocast, floating
+    # point tensor inputs are cast to cast_inputs and the op runs with autocast disabled. Raises
+    # ValueError if the device type does not support autocast. For a CustomOpDef, delegates. Otherwise
+    # overrides any existing Python kernel for the autocast key and registers a keyset-aware kernel on the
+    # library. Kwargs are not supported (AssertionError).
     r"""Register an autocast dispatch rule for this custom op.
 
     Valid ``device_type`` values include any device type that supports autocast.
@@ -1132,7 +1256,10 @@ def register_autocast(
     autocast_dispatch_key = getattr(torch._C.DispatchKey, autocast_key)
 
     def _maybe_override_py_impl(op: torch._ops.OpOverload, dispatch_key):
+        # [FUNCTION DOC] HELPER: Return a decorator that registers a Python kernel for the op and dispatch key,
+        # first removing any existing Python kernel for that key.
         def inner(kernel):
+            # [FUNCTION DOC] HELPER: Remove an existing Python kernel for the key, then register kernel via py_impl.
             if op.has_kernel_for_dispatch_key(dispatch_key):
                 op.py_kernels.pop(dispatch_key)
             return op.py_impl(dispatch_key)(kernel)
@@ -1141,6 +1268,8 @@ def register_autocast(
 
     @_maybe_override_py_impl(_op, autocast_dispatch_key)
     def _autocast_py_impl(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Python autocast kernel: rejects kwargs (AssertionError), excludes the autocast key
+        # from dispatch, casts the positional args and calls the op.
         if len(kwargs) != 0:
             raise AssertionError("Custom ops do not support kwargs yet.")
         with torch._C._ExcludeDispatchKeyGuard(
@@ -1149,6 +1278,8 @@ def register_autocast(
             return _op(*_cast(args, device_type, cast_inputs))
 
     def kernel(_, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: C++-registered autocast kernel; ignores the keyset argument, rejects kwargs
+        # (AssertionError), and forwards positional args to the Python autocast implementation.
         if len(kwargs) != 0:
             raise AssertionError("Custom ops do not support kwargs yet.")
         return _autocast_py_impl(*args, **kwargs)
@@ -1165,6 +1296,10 @@ def register_fake(
     _stacklevel: int = 1,
     allow_override: bool = True,
 ):
+    # [FUNCTION DOC] Register a FakeTensor (meta) implementation for an operator. Usable as a decorator when
+    # func is None. For a CustomOpDef, delegates to its register_fake. Otherwise registers via a library
+    # (given or a new fragment), recording the caller's stack level and allow_override, and returns func.
+    # KNOWN ISSUE: the docstring lists the first parameter as op_name but the parameter is op.
     r"""Register a FakeTensor implementation ("fake impl") for this operator.
 
     Also sometimes known as a "meta kernel", "abstract impl".
@@ -1266,6 +1401,7 @@ def register_fake(
     stacklevel = _stacklevel
 
     def register(func):
+        # [FUNCTION DOC] HELPER: Register func as the fake impl through the library and return func.
         namespace, op_name = torch._library.utils.parse_namespace(op)
         use_lib = _library_for_registration(namespace, lib)
         use_lib._register_fake(
@@ -1286,6 +1422,10 @@ def _register_effectful_op(
     *,
     lib: Library | None = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Declare an effect type (or None for no effect) for an operator so compile passes
+    # do not reorder it. Raises ValueError for an unsupported op type. Registers on the CustomOpDef if one
+    # exists, and always also registers through a library (given or new fragment).
+    # KNOWN ISSUE: the docstring names the parameter op_name but it is op, and lib is undocumented.
     r"""
     To specify that an operator has side-effects, we must register an effect
     type for the operator. This will prevent graph passes in torch.compile from
@@ -1327,6 +1467,10 @@ def register_autograd(
     setup_context: Callable | None = None,
     lib=None,
 ) -> None:
+    # [FUNCTION DOC] Register a backward formula (and optional setup_context) for an op. For a CustomOpDef,
+    # delegates. Otherwise looks up the op and raises RuntimeError for out-tagged or non-functional ops and
+    # NotImplementedError for ops with keyword-only Tensor args. Builds the autograd kernel and registers it
+    # for the Autograd key on a library, passing the dispatch keyset. Returns None.
     r"""Register a backward formula for this custom op.
 
     In order for an operator to work with autograd, you need to register
@@ -1451,6 +1595,9 @@ def register_torch_dispatch(
     *,
     lib: Library | None = None,
 ):
+    # [FUNCTION DOC] Register a torch_dispatch rule for an op and a Tensor subclass or TorchDispatchMode.
+    # Usable as a decorator when func is None. For a CustomOpDef, delegates. Otherwise registers the rule
+    # via a library and returns func (or the decorator).
     r"""Registers a torch_dispatch rule for the given operator and ``torch_dispatch_class``.
 
     This allows for open registration to specify the behavior between the operator
@@ -1500,6 +1647,7 @@ def register_torch_dispatch(
         return op.register_torch_dispatch(torch_dispatch_class, func)
 
     def register(func):
+        # [FUNCTION DOC] HELPER: Register func as the torch_dispatch rule and return func.
         namespace, op_name = torch._library.utils.parse_namespace(op)
         use_lib = _library_for_registration(namespace, lib)
         use_lib._register_torch_dispatch_rule(op_name, torch_dispatch_class, func)
@@ -1518,6 +1666,11 @@ def register_vmap(
     *,
     lib=None,
 ):
+    # [FUNCTION DOC] Register a vmap rule for a custom op so torch.vmap can batch it. For a CustomOpDef,
+    # delegates. Otherwise raises NotImplementedError if the schema has keyword-only Tensor args, and
+    # registers a wrapper for the FuncTorchBatched key that calls the vmap helper with the functorch
+    # interpreter. Usable as a decorator when func is None.
+    # KNOWN ISSUE: the inner register function returns None, so decorator use rebinds the decorated name to None.
     r"""Register a vmap implementation to support :func:`torch.vmap` for this custom op.
 
     This API may be used as a decorator (see examples).
@@ -1610,6 +1763,8 @@ def register_vmap(
         )
 
     def register(func):
+        # [FUNCTION DOC] HELPER: Create or reuse the library, then register a keyset-aware wrapper that runs func
+        # under the current functorch interpreter. Returns None.
         nonlocal lib
 
         namespace, opname = torch._library.utils.parse_namespace(qualname)
@@ -1621,6 +1776,7 @@ def register_vmap(
         from torch._functorch.pyfunctorch import retrieve_current_functorch_interpreter
 
         def wrapped_func(keyset, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Kernel for the batched key: fetch the current functorch interpreter and call the vmap helper.
             interpreter = retrieve_current_functorch_interpreter()
             return custom_function_call_vmap_helper(
                 # pyrefly: ignore[bad-argument-type]
@@ -1643,9 +1799,14 @@ def register_vmap(
 # m.set_python_module(module, ...) call and that the module is the
 # same as the module that called torch.library.register_fake.
 def _check_pystubs_once(func, qualname, actual_module_name):
+    # [FUNCTION DOC] HELPER: Wrap a fake impl so that on its first call it verifies that an op defined in C++
+    # has a matching set_python_module declaration naming the module that registered the fake impl.
+    # Raises RuntimeError if the declaration is missing (when required) or names a different module.
+    # Ops defined in Python skip the check. Later calls forward directly.
     checked = False
 
     def inner(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Run the one-time module check (see the enclosing function), then call func with the given arguments.
         nonlocal checked
         if checked:
             return func(*args, **kwargs)
@@ -1694,6 +1855,8 @@ def _check_pystubs_once(func, qualname, actual_module_name):
 # This is done via us setting the global_ctx_getter function every time a fake
 # implementation is invoked.
 def get_ctx() -> "torch._library.fake_impl.FakeImplCtx":
+    # [FUNCTION DOC] Return the current fake-impl context object from the global getter. Only valid while a
+    # fake impl is running; used to create unbacked sizes for data-dependent shapes.
     """get_ctx() returns the current AbstractImplCtx object.
 
     Calling ``get_ctx()`` is only valid inside of an fake impl
@@ -1705,6 +1868,10 @@ def get_ctx() -> "torch._library.fake_impl.FakeImplCtx":
 def get_kernel(
     op: _op_identifier, dispatch_key: str | torch.DispatchKey
 ) -> torch._C._SafeKernelFunction:
+    # [FUNCTION DOC] Return the computed kernel (a boxed callable wrapper) for an op and dispatch key.
+    # Raises ValueError for an unsupported op type or an unknown dispatch key name; strings are looked up
+    # among DispatchKey members and an OpOverload is converted to its name.
+    # KNOWN ISSUE: the docstring says a CustomOpDef is accepted, but the code rejects it with ValueError.
     """Returns the computed kernel for a given operator and dispatch key.
 
     This function retrieves the kernel that would be executed for a given
@@ -1794,6 +1961,10 @@ def opcheck(
     atol=None,
     rtol=None,
 ) -> dict[str, str]:
+    # [FUNCTION DOC] Test that an operator is registered correctly by delegating to the testing helper in
+    # torch.testing._internal.optests (imported lazily). Runs the chosen test utilities (schema, autograd
+    # registration, faketensor, aot dispatch dynamic) on the given args and kwargs with optional tolerances.
+    # Returns a mapping from test name to result; raises on the first failure if raise_exception is set.
     """Given an operator and some sample arguments, tests if the operator is
     registered correctly.
 
