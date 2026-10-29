@@ -1,4 +1,16 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Dispatch table of jagged-layout NestedTensor (NJT) implementations of aten ops.
+# Each op is implemented by unwrapping the NJT to its packed "_values" buffer, applying the dense op,
+# and re-wrapping the result with the original offsets/lengths/ragged_idx metadata. Outer (NJT) dims
+# are mapped to inner (values) dims, where the batch dim and ragged dim both collapse into packed dim 0
+# (or ragged_idx - 1).
+# Main contents: dim-wrapping helpers, check_schema argument validation, register_func /
+# register_jagged_func decorators filling JAGGED_OPS_TABLE, lookup_jagged (table lookup plus generic
+# pointwise fallback), jagged_torch_function (torch-function-level overrides), and many per-op handlers.
+# Import-time side effects: populates JAGGED_OPS_TABLE; at the end opens a scoped aten IMPL library and
+# registers the _nested_get_jagged_dummy handler for CPU, CUDA and Meta.
+# KNOWN ISSUE: the scoped library context exits right after the three registrations; scoped libraries
+# are normally torn down on exit, so the registrations may not persist (verify intent).
 import functools
 import operator
 from typing import *  # noqa: F403
@@ -17,6 +29,10 @@ JAGGED_OPS_TABLE: Dict[Any, Any] = {}
 
 
 def _get_padding_value(dtype, padding_type):
+    # [FUNCTION DOC] HELPER: Returns the sentinel padding value used when reducing min/max over padded data.
+    # Args: dtype and padding_type ("max" or anything else meaning min). Floating dtypes get the finite
+    # largest or lowest value of the dtype; other dtypes get positive or negative infinity, which the
+    # C++ side clamps to the dtype range. No side effects.
     if dtype.is_floating_point:
         return (
             torch.finfo(dtype).max if padding_type == "max" else torch.finfo(dtype).min
@@ -28,6 +44,11 @@ def _get_padding_value(dtype, padding_type):
 
 
 def _outer_to_inner_dim(ndim, dim, ragged_dim, canonicalize=False):
+    # [FUNCTION DOC] HELPER: Maps an outer (NJT) dim, or a tuple/list of dims, to values-space dims.
+    # Dim 0 (batch) maps to ragged_dim - 1; any other dim maps to dim - 1. For a sequence input, returns a
+    # sequence of the same type with duplicates removed (batch and ragged can both map to the same inner dim).
+    # If canonicalize is true, negative dims are wrapped first (not forwarded in the sequence recursion).
+    # Raises AssertionError if a scalar dim is out of range for ndim.
     from torch._prims_common import canonicalize_dims
 
     if isinstance(dim, (tuple, list)):
@@ -58,6 +79,11 @@ def _wrap_jagged_dim(
     allow_ragged_dim=False,
     allow_batch_dim=False,
 ):
+    # [FUNCTION DOC] HELPER: Validates and wraps a single outer dim for an NJT op.
+    # Canonicalizes dim against ndim; raises RuntimeError naming op_name if it is the ragged dim (unless
+    # allow_ragged_dim) or the batch dim (unless allow_batch_dim). Returns the inner (values) dim if
+    # convert_to_inner_dim, else the wrapped outer dim. If allow_batch_dim, returns a pair of
+    # (dim, whether the op acts on the batch dim) instead.
     from torch._prims_common import canonicalize_dims
 
     wrapped = canonicalize_dims(ndim, dim)
@@ -79,6 +105,10 @@ def _wrap_jagged_dim(
 
 
 def _wrap_jagged_dims(ndim, dims, op_name, ragged_idx=1):
+    # [FUNCTION DOC] HELPER: Wraps a list/tuple of outer dims for reduction-like ops.
+    # Canonicalizes each dim and returns a 4-tuple: tuple of deduplicated inner dims, whether the batch dim
+    # is included, whether the ragged dim (ragged_idx) is included, and whether any other dim is included.
+    # Raises AssertionError if dims is not a tuple or list.
     """
     For NestedTensor operators,
     wraps dimensions to non-negative values,
@@ -108,6 +138,14 @@ def _wrap_jagged_dims(ndim, dims, op_name, ragged_idx=1):
 
 
 def check_schema(schema_str: str, func, *args, **kwargs) -> None:
+    # [FUNCTION DOC] Validates the arguments of a jagged op against a comma-separated schema string.
+    # Each schema entry is "name: type" where type is one of t (dense tensor), jt (contiguous NJT with
+    # ragged_idx 1 and no lengths), jt_all (any NJT) or any; a trailing question mark marks it optional,
+    # and a final "..." entry permits extra unchecked args. Only positional args are checked.
+    # Raises ValueError on wrong arg count, missing required arg or type mismatch, AssertionError on an
+    # unknown type name. Returns None.
+    # KNOWN ISSUE: the failure description table only has an entry for the optional dense tensor type, so a
+    # failed check on an optional jt, jt_all or any argument would raise KeyError instead of ValueError.
     named_arg_types = schema_str.split(", ")
     num_optional_args = [x.endswith("?") for x in named_arg_types].count(True)
     min_args = len(named_arg_types) - num_optional_args
@@ -151,6 +189,7 @@ def check_schema(schema_str: str, func, *args, **kwargs) -> None:
         _check_fn = arg_type_check_fns[normalized_arg_type]
 
         def check_fn(x, is_optional=is_optional):
+            # [FUNCTION DOC] HELPER: Applies the type check for the current schema entry, accepting None when optional.
             if is_optional:
                 return x is None or _check_fn(x)
             else:
@@ -174,6 +213,8 @@ def check_schema(schema_str: str, func, *args, **kwargs) -> None:
 def check_ragged_dim_same(
     func, a: NestedTensor, a_name: str, b: NestedTensor, b_name: str
 ) -> None:
+    # [FUNCTION DOC] Raises RuntimeError if two NJTs differ in the size of their ragged dim.
+    # Used to ensure two NJTs share the same offsets structure. Returns None.
     # Calling into .shape here
     if a._size[a._ragged_idx] != b._size[b._ragged_idx]:
         raise RuntimeError(
@@ -185,6 +226,9 @@ def check_ragged_dim_same(
 # returns True if the raggedness-relevant portions of the NT shape
 # match those of the specified size
 def raggedness_matches(nt, size):
+    # [FUNCTION DOC] Returns True if the raggedness-relevant leading part of the NJT shape matches size.
+    # Compares the NJT's _size up to and including the ragged dim against size; an entry of -1 in size
+    # matches anything. No side effects.
     end = nt._ragged_idx + 1
     nt_ragged = nt._size[:end]
     size_ragged = size[:end]
@@ -194,6 +238,8 @@ def raggedness_matches(nt, size):
 
 
 def squeeze_leading_ones(t):
+    # [FUNCTION DOC] HELPER: Squeezes all leading size-1 dims off a dense tensor and returns it.
+    # Used so a dense operand can broadcast against the values buffer of an NJT (see the note below).
     # Note: [ Squeezing leading ones ]
     #
     # Squeeze leading ones from t.
@@ -218,16 +264,24 @@ def squeeze_leading_ones(t):
 
 
 def register_func(tables, aten_ops, schema_str):
+    # [FUNCTION DOC] Builds a decorator that registers a jagged op handler for one or more aten ops.
+    # Args: tables (a table or list of tables, each a mapping from op to callable), aten_ops (an op or list
+    # of ops) and schema_str (see check_schema). The decorated function is returned unchanged; for each
+    # op and table, a wrapper that first validates arguments with check_schema and then calls the
+    # handler with the op prepended is stored. Mutates the given tables.
     if not isinstance(aten_ops, list):
         aten_ops = [aten_ops]
     if not isinstance(tables, list):
         tables = [tables]
 
     def wrapper(func):
+        # [FUNCTION DOC] HELPER: Decorator body that installs wrapped handlers for every op in every table.
         for aten_op in aten_ops:
 
             def get_inner(aten_op):
+                # [FUNCTION DOC] HELPER: Binds one aten op so each wrapper closure refers to its own op.
                 def inner(*args, **kwargs):
+                    # [FUNCTION DOC] HELPER: Validates args against the schema, then calls the handler with the bound aten op.
                     check_schema(schema_str, func, *args, **kwargs)
                     return func(aten_op, *args, **kwargs)
 
@@ -244,6 +298,10 @@ register_jagged_func = functools.partial(register_func, JAGGED_OPS_TABLE)
 
 
 def lookup_jagged(func, *args, **kwargs) -> Callable | None:
+    # [FUNCTION DOC] Finds the jagged implementation for an aten op, or returns None if there is none.
+    # First consults JAGGED_OPS_TABLE. Otherwise, for pointwise-tagged ops, rejects nested-int arguments with
+    # RuntimeError, counts tensor args, and returns a partial of jagged_unary_pointwise (one tensor arg,
+    # after schema validation) or jagged_binary_pointwise (two tensor args). Other cases return None.
     dispatch_func = JAGGED_OPS_TABLE.get(func, None)
     if dispatch_func is not None:
         return dispatch_func
@@ -285,6 +343,8 @@ def lookup_jagged(func, *args, **kwargs) -> Callable | None:
 
 
 def extract_kwargs(arg):
+    # [FUNCTION DOC] HELPER: Returns the metadata keyword arguments (offsets, lengths, metadata cache, ragged_idx) of an NJT.
+    # Used to construct a new NJT sharing the same ragged structure.
     kwargs = {
         "offsets": arg.offsets(),
         "lengths": arg.lengths(),
@@ -295,6 +355,9 @@ def extract_kwargs(arg):
 
 
 def jagged_unary_pointwise(func, *args, **kwargs):
+    # [FUNCTION DOC] Generic pointwise handler for ops with a single NJT tensor argument.
+    # Finds the one NJT among args, applies func to its values (other args passed through unchanged) and
+    # returns a new NJT with the same ragged metadata.
     # assume if we get here that there is a single NJT input in the args
     njt = next(arg for arg in args if isinstance(arg, NestedTensor))
     return NestedTensor(
@@ -304,6 +367,12 @@ def jagged_unary_pointwise(func, *args, **kwargs):
 
 
 def jagged_binary_pointwise(func, *args, **kwargs):
+    # [FUNCTION DOC] Generic pointwise handler for binary ops where at least one operand is an NJT.
+    # NJT with NJT: if raggedness matches, applies func on the two values buffers, else raises RuntimeError.
+    # NJT with dense: broadcasts directly against values when the dense operand (after squeezing leading
+    # ones) has at least two fewer dims; if dims are equal, requires matching batch size, converts the dense
+    # operand to an NJT via padding/expand and nested_from_padded and recurses; otherwise raises
+    # RuntimeError. Raises NotImplementedError if the dense operand has more dims than the NJT.
     a, b = args[0], args[1]
     if not (isinstance(a, NestedTensor) or isinstance(b, NestedTensor)):
         raise AssertionError("At least one of the arguments must be a NestedTensor")
@@ -383,6 +452,12 @@ def jagged_binary_pointwise(func, *args, **kwargs):
 
 
 def jagged_torch_function(func, *args, **kwargs):
+    # [FUNCTION DOC] Torch-function-level overrides for ops that are CompositeImplicit or special for NJTs.
+    # Handles scaled_dot_product_attention (via the jagged SDPA), apply_ (in place on values), flatten
+    # (rewritten as a reshape), share_memory_ and is_shared (applied to each component tensor of the
+    # NJT), and rms_norm (validates that normalization does not cover the ragged dim, then runs the op
+    # with torch function disabled). Raises ValueError for rms_norm over the ragged dim and
+    # NotImplementedError for any other function. May mutate the NJT in place for apply_ and share_memory_.
     # SDPA has special kernels that handle nested tensors.
     # Dispatch to the correct implementation here
     if func is torch._C._nn.scaled_dot_product_attention:
@@ -396,6 +471,7 @@ def jagged_torch_function(func, *args, **kwargs):
     if func.__name__ == "flatten":
 
         def _flatten_sig(input, start_dim=0, end_dim=-1) -> None:
+            # [FUNCTION DOC] HELPER: Signature stub used only to normalize flatten arguments.
             pass
 
         _, new_kwargs = normalize_function(  # type: ignore[misc]
@@ -462,6 +538,7 @@ def jagged_torch_function(func, *args, **kwargs):
     if func.__name__ == "rms_norm":
 
         def _rms_norm_sig(input, normalized_shape, weight=None, eps=None) -> None:
+            # [FUNCTION DOC] HELPER: Signature stub used only to normalize rms_norm arguments.
             pass
 
         _, new_kwargs = normalize_function(  # type: ignore[misc]
@@ -497,6 +574,10 @@ def jagged_torch_function(func, *args, **kwargs):
     "self: jt_all",
 )
 def tensor_attr_supported_getter(func, *args, **kwargs):
+    # [FUNCTION DOC] Handler for NJT attribute getters (size, dim, numel, stride, storage offset, contiguity).
+    # Returns False for is_non_overlapping_and_dense, the stored symbolic size for sym_size, the number of
+    # dims for dim, the jagged numel for numel/sym_numel, the stored strides for sym_stride, and the
+    # storage offset of the values buffer for sym_storage_offset.
     if func is torch.ops.aten.is_non_overlapping_and_dense.default:
         return False
 
@@ -518,6 +599,7 @@ def tensor_attr_supported_getter(func, *args, **kwargs):
 
 @register_jagged_func(torch.ops.prim.layout.default, "self: jt_all")
 def prim_layout_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Returns the jagged layout object for prim layout queries on an NJT.
     return torch.jagged
 
 
@@ -526,6 +608,9 @@ def prim_layout_default(func, *args, **kwargs):
     "self: jt_all",
 )
 def tensor_attr_unsupported_getter(func, *args, **kwargs) -> None:
+    # [FUNCTION DOC] Handler that rejects direct calls to the aten size op on an NJT.
+    # Raises RuntimeError telling the user to call the size method on the tensor; returns None otherwise.
+    # KNOWN ISSUE: for any op other than aten size it silently returns None, but only size is registered.
     if func is torch.ops.aten.size.default:
         raise RuntimeError(
             "NestedTensor does not support directly calling torch.ops.aten.size; "
@@ -535,6 +620,9 @@ def tensor_attr_unsupported_getter(func, *args, **kwargs) -> None:
 
 @register_jagged_func(torch.ops.aten.is_contiguous.default, "self: jt_all")
 def is_contiguous_general(func, *args, **kwargs):
+    # [FUNCTION DOC] Contiguity check for an NJT with an optional memory format.
+    # Returns False if the NJT has lengths (holes), True for preserve_format, otherwise defers to the
+    # memory-format contiguity check on the values buffer. Also registered for the memory_format overload.
     from torch._prims_common import is_contiguous_for_memory_format
 
     _, new_kwargs = normalize_function(  # type: ignore[misc]
@@ -563,6 +651,9 @@ register_jagged_func(
     torch.ops.aten.sym_is_contiguous.default, "self: jt_all, memory_format: any?"
 )
 def sym_is_contiguous_general(func, *args, **kwargs):
+    # [FUNCTION DOC] Symbolic contiguity check for an NJT with an optional memory format.
+    # Returns False if the NJT has lengths, True for preserve_format, otherwise defers to the symbolic
+    # contiguity op on the values buffer.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -586,6 +677,10 @@ def sym_is_contiguous_general(func, *args, **kwargs):
     torch.ops.aten.clone.default, "input: jt_all, memory_format: any?"
 )
 def clone_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Clones an NJT.
+    # If the NJT has lengths (holes) and the memory format is contiguous, copies the components into a new
+    # contiguous NJT built from the unbound list (raises AssertionError if ragged_idx is not 1; the new NJT
+    # gets a fresh ragged structure). Otherwise clones the values and reuses the ragged metadata.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -613,6 +708,7 @@ def clone_default(func, *args, **kwargs):
 
 @register_jagged_func(torch.ops.aten.linear.default, "input: jt, weight: t, bias: t?")
 def linear_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Linear layer on an NJT input: applies linear to the values buffer and re-wraps with the input's metadata.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -627,6 +723,11 @@ def linear_default(func, *args, **kwargs):
     "self: jt, grad_output: jt, weight: t, output_mask: any",
 )
 def linear_backward_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Backward of linear for an NJT input and NJT grad_output.
+    # Returns (grad_input, grad_weight, grad_bias) as selected by output_mask, with None for unselected.
+    # grad_input is an NJT; the weight grad is computed from the values flattened to 2D; the bias grad is
+    # the sum over all leading dims of the grad_output values (a clone when 1D). Raises RuntimeError if the
+    # two NJTs differ in ragged size.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -665,6 +766,7 @@ def linear_backward_default(func, *args, **kwargs):
 
 @register_jagged_func(torch.ops.aten.to.dtype, "input: jt_all, dtype: any")
 def to_dtype(func, *args, **kwargs):
+    # [FUNCTION DOC] Converts the NJT dtype by converting its values and re-wrapping with the same metadata.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -676,6 +778,11 @@ def to_dtype(func, *args, **kwargs):
 
 @register_jagged_func(torch.ops.aten._to_copy.default, "self: jt_all")
 def to_copy_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Copy-converts an NJT to a different device/dtype without changing layout.
+    # Drops the layout kwarg, converts values, offsets and lengths (to the new device), and registers the
+    # new offsets/lengths tensor as sharing the original nested-int identity (via the symint registry, or
+    # the nested_int_memo attribute for fake/functional tensors). Returns a new NJT.
+    # Side effect: mutates the global nested-int registry.
     from .nested_tensor import _tensor_symint_registry
 
     _, new_kwargs = normalize_function(  # type: ignore[misc]
@@ -720,6 +827,10 @@ def to_copy_default(func, *args, **kwargs):
     torch.ops.aten.copy_.default, "self: jt_all, src: jt_all, non_blocking: any?"
 )
 def copy_default(func, *args, **kwargs):
+    # [FUNCTION DOC] In-place copy_ from one NJT into another.
+    # If the sizes differ, falls back to per-component copy_ after checking component shapes match
+    # (raises RuntimeError otherwise). Then copies the values buffers directly (avoiding detach so the
+    # mutation stays in the graph) and returns the destination NJT. Mutates the destination.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -764,6 +875,10 @@ register_jagged_func(torch.ops.aten.detach.default, "self: jt_all")(
     "self: jt_all",
 )
 def like_factory_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Handler for like-style factories (empty/ones/zeros/rand/randn/full/randint _like) on an NJT.
+    # Builds new values with strided layout via the op, moves offsets/lengths to the values' device, and
+    # returns a new NJT. If the device changed, registers the new offsets/lengths as sharing the original
+    # nested-int identity (global registry side effect, or nested_int_memo for fake/functional tensors).
     from torch._subclasses.fake_tensor import is_fake_tensor
 
     _, new_kwargs = normalize_function(  # type: ignore[misc]
@@ -827,6 +942,7 @@ register_jagged_func(
 
 @register_jagged_func(torch.ops.aten.zero_.default, "self: jt_all")
 def zero__default(func, *args, **kwargs):
+    # [FUNCTION DOC] In-place zero_ on an NJT: zeros the values buffer and returns the same NJT.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -840,6 +956,11 @@ def zero__default(func, *args, **kwargs):
     torch.ops.aten._softmax.default, "self: jt_all, dim: any, half_to_float: any"
 )
 def _softmax_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Softmax over a dim of an NJT.
+    # Raises RuntimeError if dim is a tuple, if it is the batch dim, if it is the ragged dim with
+    # ragged_idx > 1, or if it is the ragged dim with lengths present. Softmax over the ragged dim is done
+    # by converting values to padded dense (padding with negative infinity), applying softmax, and converting
+    # back to jagged. Other dims apply the op directly on values. Returns an NJT.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -915,6 +1036,9 @@ def _softmax_default(func, *args, **kwargs):
     torch.ops.aten._log_softmax.default, "self: jt_all, dim: any, half_to_float: any"
 )
 def _log_softmax_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Log-softmax over a dim of an NJT.
+    # Raises RuntimeError if dim is a tuple, the batch dim or the ragged dim. Otherwise applies the op
+    # to the values buffer with the inner dim and returns an NJT with the same metadata.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -956,6 +1080,7 @@ def _log_softmax_default(func, *args, **kwargs):
     "grad_output: jt, output: jt, dim: any, input_dtype: any",
 )
 def _softmax_backward(func, *args, **kwargs):
+    # [FUNCTION DOC] Backward of softmax for NJTs: applies the op on grad_output and output values and re-wraps with grad_output's metadata.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -970,6 +1095,7 @@ def _softmax_backward(func, *args, **kwargs):
     torch.ops.aten.native_dropout.default, "self: jt, float: any, train: any?"
 )
 def native_dropout_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Dropout on an NJT: applies native_dropout to the values and returns the (output, mask) pair, each wrapped as an NJT with the input's metadata.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -987,6 +1113,7 @@ def native_dropout_default(func, *args, **kwargs):
     "grad_output: jt, mask: jt, scale: any",
 )
 def native_dropout_backward_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Backward of native_dropout for NJTs: applies the op on the grad_output and mask values and re-wraps with grad_output's metadata.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -1003,11 +1130,13 @@ def native_dropout_backward_default(func, *args, **kwargs):
     "self: jt_all, dim: any, keepdim: any?, dtype: any?",
 )
 def prod_dim_int(func, *args, **kwargs):
+    # [FUNCTION DOC] Product reduction over dims of an NJT; delegates to the generic reduction helper with identity element 1.
     return _apply_reduction(func, "prod", 1, *args, **kwargs)
 
 
 @register_jagged_func(torch.ops.aten.prod.default, "self: jt_all, dtype: any?")
 def prod_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Full product of all NJT elements: applies prod to the values buffer and returns a dense result.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -1021,6 +1150,9 @@ def prod_default(func, *args, **kwargs):
     torch.ops.aten.split.Tensor, "self: jt, split_size: any, dim: any?"
 )
 def split_tensor(func, *args, **kwargs):
+    # [FUNCTION DOC] Splits an NJT by chunk size along a non-batch, non-ragged dim.
+    # Maps the dim to values space (RuntimeError for batch or ragged dim), splits the values, and returns a
+    # tuple of NJTs sharing the input's ragged metadata.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -1041,6 +1173,9 @@ def split_tensor(func, *args, **kwargs):
     torch.ops.aten.split_with_sizes.default, "self: jt, split_sizes: any, dim: any?"
 )
 def split_with_sizes_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Splits an NJT into pieces of given sizes along a non-batch, non-ragged dim.
+    # Maps the dim to values space (RuntimeError for batch or ragged dim) and returns a list of NJTs with
+    # the input's ragged metadata.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -1061,6 +1196,9 @@ def split_with_sizes_default(func, *args, **kwargs):
     torch.ops.aten.narrow.default, "self: jt, dim: any, start: any, length: any"
 )
 def narrow(func, *args, **kwargs):
+    # [FUNCTION DOC] Narrow on a non-batch, non-ragged dim of an NJT.
+    # Maps the dim to values space (RuntimeError for batch or ragged dim), narrows the values and re-wraps
+    # with the same ragged metadata.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -1078,6 +1216,10 @@ def narrow(func, *args, **kwargs):
 
 @register_jagged_func(torch.ops.aten.chunk.default, "self: jt, chunks: any, dim: any?")
 def chunk_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Chunks an NJT into pieces along a dim, which may be the batch dim.
+    # For the batch dim, chunks the per-component lengths, rebuilds offsets for each chunk, splits the values
+    # accordingly and returns a list of NJTs; the number of chunks may differ from the request, matching dense
+    # behavior. For other dims (not ragged), chunks the values and returns NJTs sharing the input's metadata.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -1120,6 +1262,11 @@ def chunk_default(func, *args, **kwargs):
 
 @register_jagged_func(torch.ops.aten.unbind.int, "self: jt_all, dim: any?")
 def unbind_int(func, *args, **kwargs):
+    # [FUNCTION DOC] Unbinds an NJT along the batch dim into a sequence of dense tensors.
+    # Raises RuntimeError for any dim other than 0 or for a non-positive ragged_idx when lengths exist.
+    # Without lengths, splits the values along the ragged dim by the offset differences (returns a tuple).
+    # With lengths (holes), narrows the values by per-component offset and length (returns a list). Reads
+    # offsets/lengths into Python scalars (a device sync) and emits compile-time size checks.
     # Note that this specializes on the length of the offsets
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
@@ -1136,6 +1283,10 @@ def unbind_int(func, *args, **kwargs):
     ragged_idx = inp._ragged_idx
 
     def _torch_check(_lengths: list[int], _offsets: list[int] | None = None) -> None:
+        # [FUNCTION DOC] HELPER: Emits symbolic-shape assertions tying lengths and offsets to the ragged dim size.
+        # Checks each length is non-negative and at most the ragged size, the lengths sum is bounded, and when
+        # offsets are given that offset plus length stays within the ragged size and offsets are in range.
+        # Used so torch.compile can reason about the unbind results. Returns None.
         # This torch._check are needed for torch.compile
         # symbolic shapes processing.
         # offsets and lengths are symbolic variables during compilation,
@@ -1193,6 +1344,8 @@ def unbind_int(func, *args, **kwargs):
 
 @register_jagged_func(torch.ops.aten.squeeze.dim, "self: jt, dim: any")
 def squeeze_dim(func, *args, **kwargs):
+    # [FUNCTION DOC] Squeezes a non-batch, non-ragged dim of an NJT by squeezing the values; re-wraps with the same metadata.
+    # Raises RuntimeError for batch or ragged dim.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -1208,6 +1361,9 @@ def squeeze_dim(func, *args, **kwargs):
 
 @register_jagged_func(torch.ops.aten.unsqueeze.default, "self: jt_all, dim: any")
 def unsqueeze_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Unsqueezes an NJT at a given outer dim (the ragged dim is allowed, batch dim is not).
+    # Maps the dim to values space, unsqueezes the values, and increments ragged_idx in the output
+    # metadata if the new dim lands before the ragged dim.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -1231,6 +1387,9 @@ def unsqueeze_default(func, *args, **kwargs):
 
 @register_jagged_func(torch.ops.aten.cat.default, "tensors: any, dim: any?")
 def cat_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Concatenates NJTs (dense tensors are expanded to match the first NJT) along a non-batch, non-ragged dim.
+    # Raises AssertionError if no input is nested; raises RuntimeError for batch or ragged dim. Concatenates
+    # the values buffers and wraps with the first tensor's ragged metadata.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -1257,6 +1416,12 @@ def cat_default(func, *args, **kwargs):
 
 @register_jagged_func(torch.ops.aten.matmul.default, "self: any, other: any")
 def matmul_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Matrix multiply involving NJTs.
+    # Supported cases: NJT x dense (padded path when dims equal, or direct on values when the dense is 2D
+    # and the ragged dim is not among the last two), dense x NJT (symmetric), and NJT x NJT (values-wise
+    # when both are above 3D with matching raggedness, or an unbind-and-stack path for the
+    # (B, D, j) x (B, j, E) reduction over the ragged dim with dense output). Any other combination raises
+    # RuntimeError. Padded paths convert to padded dense, run the op, and convert back via nested_from_padded.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -1265,11 +1430,13 @@ def matmul_default(func, *args, **kwargs):
     other = new_kwargs.pop("other")
 
     def _unbind_impl(a, b):
+        # [FUNCTION DOC] HELPER: Computes the op per component pair of two unbound NJTs and returns the list.
         return [
             func(a_comp, b_comp) for (a_comp, b_comp) in zip(a.unbind(), b.unbind())
         ]
 
     def _padded_impl(a, b):
+        # [FUNCTION DOC] HELPER: Pads the NJT operand to dense (zero fill, padded to its max sequence length or an upper bound), applies the op against the dense operand, and converts the result back to an NJT with the NJT's offsets.
         if a.is_nested:
             nt = a
         else:
@@ -1367,6 +1534,8 @@ def matmul_default(func, *args, **kwargs):
 
 @register_jagged_func(torch.ops.aten.bmm.default, "self: jt_all, mat2: any")
 def bmm_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Batched matmul for an NJT input and a mat2 operand.
+    # Raises ValueError unless both are 3D, then delegates to the matmul handler.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -1386,6 +1555,9 @@ def bmm_default(func, *args, **kwargs):
     torch.ops.aten.expand.default, "self: jt_all, size: any, implicit: any?"
 )
 def expand_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Expands an NJT to a larger shape without touching the batch or ragged dims.
+    # Raises AssertionError for implicit expand and RuntimeError if the raggedness of the target size does
+    # not match. Expands the values buffer (using -1 for the ragged dim) and re-wraps with the same metadata.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -1404,6 +1576,7 @@ def expand_default(func, *args, **kwargs):
 
 @register_jagged_func(torch.ops.aten.expand_as.default, "self: t, other: jt")
 def expand_as_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Expands a dense tensor to the shape of an NJT: expands the dense tensor to the other's values and wraps it with that NJT's metadata.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -1416,6 +1589,8 @@ def expand_as_default(func, *args, **kwargs):
 
 @register_jagged_func(torch.ops.aten.broadcast_to.default, "self: jt_all, size: any")
 def broadcast_to(func, *args, **kwargs):
+    # [FUNCTION DOC] Broadcasts an NJT to a size with at most as many dims, left-padding the size with ones and delegating to expand.
+    # Raises ValueError if the target size has more dims than the NJT.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -1434,6 +1609,10 @@ def broadcast_to(func, *args, **kwargs):
 
 @register_jagged_func(torch.ops.aten.broadcast_tensors.default, "tensors: any")
 def broadcast_tensors(func, *args, **kwargs):
+    # [FUNCTION DOC] Broadcasts a list of tensors where at least one is an NJT.
+    # Raises ValueError for an empty list, or for a dense tensor whose dim is not smaller than the broadcast
+    # shape. A single tensor is returned as-is. NJTs are broadcast via broadcast_to; dense tensors are
+    # broadcast to the values shape of the first NJT and wrapped with its metadata. Returns a tuple.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -1468,6 +1647,7 @@ def broadcast_tensors(func, *args, **kwargs):
     torch.ops.aten.where.self, "condition: jt_all, self: any, other: any"
 )
 def where_self(func, *args, **kwargs):
+    # [FUNCTION DOC] Elementwise where with an NJT condition: broadcasts condition, self and other together, then applies the op on the values buffers and re-wraps with the condition's metadata.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -1487,6 +1667,7 @@ def where_self(func, *args, **kwargs):
 
 @register_jagged_func(torch.ops.aten._pin_memory.default, "self: jt, device: any?")
 def _pin_memory_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Pins the memory of an NJT's values and re-wraps with the same metadata.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -1498,6 +1679,7 @@ def _pin_memory_default(func, *args, **kwargs):
 
 @register_jagged_func(torch.ops.aten.is_pinned.default, "self: jt, device: any?")
 def is_pinned_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Returns whether the NJT's values buffer is pinned.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -1511,10 +1693,19 @@ def is_pinned_default(func, *args, **kwargs):
     torch.ops.aten.is_same_size.default, "self: jt_all, other: jt_all"
 )
 def is_same_size_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Returns whether two NJTs have equal (symbolic) sizes.
     return args[0]._size == args[1]._size
 
 
 def _apply_reduction(func, func_name, identity_element, *args, **kwargs):
+    # [FUNCTION DOC] HELPER: Generic reduction of an NJT over dims, shared by sum, prod, mean, any, all, min, max, etc.
+    # Args: func (the aten op), func_name (for error messages), identity_element (padding value used when
+    # reducing over the ragged dim), then the op's arguments. Full reduction (dim None or empty) reduces
+    # the values and unsqueezes if keepdim. Reducing the ragged dim together with batch reduces the values
+    # directly (dense result). Reducing the ragged dim alone converts to a padded dense tensor filled with
+    # the identity element and reduces that. Reducing only non-batch dims returns an NJT, adjusting
+    # ragged_idx for dims removed before it. Raises RuntimeError for ragged plus non-batch dims, batch
+    # without ragged, or ragged on an NJT with holes.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -1622,6 +1813,7 @@ def _apply_reduction(func, func_name, identity_element, *args, **kwargs):
 
 @register_jagged_func(torch.ops.aten.sum.default, "self: jt_all, dtype: any?")
 def sum_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Full sum of all NJT elements: sums the values buffer and returns a dense result.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -1636,6 +1828,7 @@ def sum_default(func, *args, **kwargs):
     "self: jt_all, dim: any?, keepdim: any?, dtype: any?",
 )
 def sum_dim_IntList(func, *args, **kwargs):
+    # [FUNCTION DOC] Sum over dims of an NJT; delegates to the generic reduction helper with identity element 0.
     return _apply_reduction(func, "sum", 0, *args, **kwargs)
 
 
@@ -1643,6 +1836,11 @@ def sum_dim_IntList(func, *args, **kwargs):
     torch.ops.aten.transpose.int, "self: jt_all, dim0: any, dim1: any"
 )
 def transpose_int(func, *args, **kwargs):
+    # [FUNCTION DOC] Transposes two dims of an NJT.
+    # If either dim is the ragged dim, the other dim becomes the new ragged_idx and the values are
+    # transposed in inner space; raises ValueError if the other dim is the batch dim. Otherwise transposes the
+    # corresponding inner dims of the values, raising RuntimeError for batch or ragged dim handled by dim
+    # wrapping. Returns an NJT.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -1686,6 +1884,10 @@ def transpose_int(func, *args, **kwargs):
 
 @register_jagged_func(torch.ops.aten.permute.default, "self: jt_all, dims: any")
 def permute_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Permutes the dims of an NJT.
+    # Raises ValueError if the number of dims differs, dims are duplicated, the NJT has lengths, or the
+    # batch dim is not first. The new ragged_idx is the position of the old ragged dim in the permutation;
+    # the values are permuted with the corresponding inner dims. Returns an NJT.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -1730,6 +1932,10 @@ def permute_default(func, *args, **kwargs):
     "self: jt_all, size: any",
 )
 def view_default(func, *args, **kwargs):
+    # [FUNCTION DOC] View of an NJT as a new size (also used for unsafe view).
+    # Raises RuntimeError if ragged_idx is not 1 and the size differs, if the size has fewer than 3 dims or
+    # its raggedness does not match. Builds the inner size by keeping the values' ragged-dim size and
+    # taking other sizes from the target, then views the values (preserving inference mode) and re-wraps.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -1762,6 +1968,7 @@ def view_default(func, *args, **kwargs):
     #    inner_size[3] = outer_size[4]
     #    inner_size[4] = outer_size[5]
     def get_inner_size(inner_idx):
+        # [FUNCTION DOC] HELPER: Returns the inner (values) size at an index: the actual values size at the ragged position, otherwise the target outer size shifted by one.
         nonlocal inp, size
         if inner_idx == inp._ragged_idx - 1:
             return inp._values.size(inner_idx)
@@ -1781,6 +1988,13 @@ def view_default(func, *args, **kwargs):
     "input: jt_all, normalized_shape: any, weight: any?, bias: any?, eps: any",
 )
 def native_layer_norm_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Layer norm on an NJT; returns (output, mean, rstd-like std) tuple.
+    # Raises RuntimeError for NJTs with 2 or fewer dims, for normalizing over the batch dim, or for
+    # normalizing over the ragged dim when lengths exist. When the normalized shape includes the ragged size,
+    # converts to padded dense with a mask, computes per-batch mean and variance over the masked region and
+    # normalizes, then converts back to jagged. Otherwise applies native_layer_norm to the values.
+    # KNOWN ISSUE: the check for the ragged dim tests whether the ragged size appears among the normalized
+    # shape sizes by value, so an unrelated trailing dim with an equal size is treated as ragged.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -1882,6 +2096,8 @@ def native_layer_norm_default(func, *args, **kwargs):
     "grad_out: jt, input: jt, normalized_shape: any, mean: any, rstd: any, weight: any?, bias: any?, output_mask: any",
 )
 def native_layer_norm_backward_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Backward of native_layer_norm for NJTs.
+    # Applies the op on the values of grad_out and input; returns (grad_input as NJT or None, grad_gamma, grad_beta).
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -1896,6 +2112,10 @@ def native_layer_norm_backward_default(func, *args, **kwargs):
 
 @register_jagged_func(torch.ops.aten.select.int, "self: jt_all, dim: any, index: any")
 def select_int(func, *args, **kwargs):
+    # [FUNCTION DOC] Select an index along a dim of an NJT.
+    # On the batch dim, unbinds and returns the indexed dense component. Otherwise raises ValueError if the
+    # NJT has lengths, selects on the inner values (RuntimeError for the ragged dim) and re-wraps as an NJT,
+    # decrementing ragged_idx when the selected dim lies before the ragged dim.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -1928,6 +2148,8 @@ def select_int(func, *args, **kwargs):
     "self: jt, dim: any?, start: any?, end: any?, step: any?",
 )
 def slice_tensor(func, *args, **kwargs):
+    # [FUNCTION DOC] Slices an NJT along a non-batch, non-ragged dim by slicing the values and re-wrapping with the same metadata.
+    # Raises RuntimeError for batch or ragged dim.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -1949,6 +2171,14 @@ def slice_tensor(func, *args, **kwargs):
     "input: jt_all, indices: any, values: t, accumulate: any?",
 )
 def index_put_(func, *args, **kwargs):
+    # [FUNCTION DOC] index_put and in-place index_put_ for NJTs.
+    # Raises AssertionError if there are more indices than dims. If the ragged dim is not covered by the
+    # indices, requires a contiguous NJT (RuntimeError otherwise), pads to dense, applies the op and converts
+    # back (the in-place variant copies into the values and returns the input). Otherwise asserts
+    # asynchronously that ragged indices are in range, combines batch indices with offsets into indices on
+    # the values buffer, and applies the op there (in place variant mutates the values attribute).
+    # KNOWN ISSUE: the bounds check compares ragged indices against the lengths vector directly rather than
+    # the length of the batch element selected by the batch index, which looks incorrect.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -2042,6 +2272,7 @@ def index_put_(func, *args, **kwargs):
     "dilation: any, transposed: any, output_padding: any, groups: any",
 )
 def convolution_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Convolution on an NJT input: applies convolution to the values buffer and re-wraps with the input's metadata.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -2055,6 +2286,12 @@ def convolution_default(func, *args, **kwargs):
     torch.ops.aten.mean.dim, "self: jt_all, dim: any?, keepdim: any?, dtype: any?"
 )
 def mean_dim(func, *args, **kwargs):
+    # [FUNCTION DOC] Mean over dims of an NJT.
+    # When reducing the ragged dim without the batch dim, computes a sum with kept dims and divides by the
+    # per-component lengths (squeezing afterwards unless keepdim); raises AssertionError if a non-batch dim is
+    # also reduced. Otherwise defers to the generic reduction helper with a dummy padding value.
+    # KNOWN ISSUE: it passes the dim argument straight to dim wrapping, which raises AssertionError for a
+    # None dim, although the generic reduction helper supports full reductions.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -2097,6 +2334,7 @@ def mean_dim(func, *args, **kwargs):
 
 @register_jagged_func(torch.ops.aten.mean.default, "self: jt_all, dtype: any?")
 def mean_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Full mean of all NJT elements: applies mean to the values buffer and returns a dense result.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -2108,11 +2346,13 @@ def mean_default(func, *args, **kwargs):
 
 @register_jagged_func(torch.ops.aten.any.dims, "self: jt_all, dim: any?, keepdim: any?")
 def any_dims(func, *args, **kwargs):
+    # [FUNCTION DOC] Any over dims of an NJT; delegates to the generic reduction helper with identity element False.
     return _apply_reduction(func, "any", False, *args, **kwargs)
 
 
 @register_jagged_func(torch.ops.aten.any.dim, "self: jt_all, dim: any, keepdim: any?")
 def any_dim(func, *args, **kwargs):
+    # [FUNCTION DOC] Any over a single dim: wraps dim in a list and redispatches to the dims overload.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -2124,11 +2364,13 @@ def any_dim(func, *args, **kwargs):
 
 @register_jagged_func(torch.ops.aten.all.dims, "self: jt_all, dim: any?, keepdim: any?")
 def all_dims(func, *args, **kwargs):
+    # [FUNCTION DOC] All over dims of an NJT; delegates to the generic reduction helper with identity element True.
     return _apply_reduction(func, "all", True, *args, **kwargs)
 
 
 @register_jagged_func(torch.ops.aten.all.dim, "self: jt_all, dim: any, keepdim: any?")
 def all_dim(func, *args, **kwargs):
+    # [FUNCTION DOC] All over a single dim: wraps dim in a list and redispatches to the dims overload.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -2148,6 +2390,7 @@ def all_dim(func, *args, **kwargs):
     "self: jt_all",
 )
 def all_any_max_min_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Full reductions (all, any, max, min) of an NJT: applies the op to the values buffer and returns a dense result.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -2162,6 +2405,7 @@ def all_any_max_min_default(func, *args, **kwargs):
     "self: jt_all",
 )
 def _is_true_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Internal all-true / any-true checks on an NJT: applies the op to the values buffer.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -2172,6 +2416,7 @@ def _is_true_default(func, *args, **kwargs):
 
 @register_jagged_func(torch.ops.aten.min.dim, "self: jt_all, dim: any, keepdim: any?")
 def min_dim(func, *args, **kwargs):
+    # [FUNCTION DOC] Min over a dim with indices for an NJT; uses the dtype's maximum sentinel as padding in the generic reduction helper.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -2183,6 +2428,7 @@ def min_dim(func, *args, **kwargs):
 
 @register_jagged_func(torch.ops.aten.max.dim, "self: jt_all, dim: any, keepdim: any?")
 def max_dim(func, *args, **kwargs):
+    # [FUNCTION DOC] Max over a dim with indices for an NJT; uses the dtype's minimum sentinel as padding in the generic reduction helper.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -2196,6 +2442,7 @@ def max_dim(func, *args, **kwargs):
     torch.ops.aten.amin.default, "self: jt_all, dim: any?, keepdim: any?"
 )
 def amin_default(func, *args, **kwargs):
+    # [FUNCTION DOC] amin over dims of an NJT; uses the dtype's maximum sentinel as padding in the generic reduction helper.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -2209,6 +2456,7 @@ def amin_default(func, *args, **kwargs):
     torch.ops.aten.amax.default, "self: jt_all, dim: any?, keepdim: any?"
 )
 def amax_default(func, *args, **kwargs):
+    # [FUNCTION DOC] amax over dims of an NJT; uses the dtype's minimum sentinel as padding in the generic reduction helper.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -2222,6 +2470,7 @@ def amax_default(func, *args, **kwargs):
     torch.ops.aten.argmin.default, "self: jt_all, dim: any?, keepdim: any?"
 )
 def argmin_default(func, *args, **kwargs):
+    # [FUNCTION DOC] argmin over dims of an NJT via the generic reduction helper with the dtype's maximum sentinel as padding.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -2235,6 +2484,7 @@ def argmin_default(func, *args, **kwargs):
     torch.ops.aten.argmax.default, "self: jt_all, dim: any?, keepdim: any?"
 )
 def argmax_default(func, *args, **kwargs):
+    # [FUNCTION DOC] argmax over dims of an NJT via the generic reduction helper with the dtype's minimum sentinel as padding.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -2249,6 +2499,10 @@ def argmax_default(func, *args, **kwargs):
     "grad: jt_all, dim: any, indices: jt_all, sizes: any, keepdim: any",
 )
 def value_selecting_reduction_backward_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Backward of value-selecting reductions (max/min with indices) for NJTs.
+    # Unwraps grad and indices to their values, locates the nested-int entry in the saved sizes to find
+    # the ragged position, converts dim and sizes to values space (replacing the ragged size by the
+    # values size) and calls the op, returning an NJT with the indices' metadata and the ragged_idx set.
     from torch.fx.experimental.symbolic_shapes import is_nested_int
 
     _, new_kwargs = normalize_function(  # type: ignore[misc]
@@ -2282,6 +2536,9 @@ def value_selecting_reduction_backward_default(func, *args, **kwargs):
 
 @register_jagged_func(torch.ops.aten.stack.default, "tensors: any, dim: any?")
 def stack_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Stacks NJTs along a new dim.
+    # Raises RuntimeError if any input is not an NJT or if dims or nested structure differ from the first.
+    # Stacks the values buffers at the wrapped inner dim and wraps with the first tensor's metadata.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -2316,6 +2573,7 @@ def stack_default(func, *args, **kwargs):
     "weight: t, indices: jt, padding_idx: any?, scale_grad_by_freq: any?, sparse: any?",
 )
 def embedding_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Embedding lookup with NJT indices: looks up the indices' values in the dense weight and re-wraps with the indices' metadata.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -2334,6 +2592,7 @@ def embedding_default(func, *args, **kwargs):
     "grad_output: jt, indices: jt, num_weights: any, padding_idx: any, scale_grad_by_freq: any",
 )
 def embedding_dense_backward_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Backward of embedding for NJT grad_output and indices: returns the dense weight gradient computed from the values buffers.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -2351,6 +2610,8 @@ def embedding_dense_backward_default(func, *args, **kwargs):
     "self: jt_all",
 )
 def values_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Returns the NJT's values buffer, detached.
+    # The detach avoids exposing the internal view to autograd; inference mode handling is a TODO.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -2364,6 +2625,9 @@ def values_default(func, *args, **kwargs):
 
 @register_jagged_func(torch.ops.aten.all.default, "self: jt_all")
 def all_default(func, *args, **kwargs):
+    # [FUNCTION DOC] All elements true check on an NJT: applies the op to the values buffer.
+    # KNOWN ISSUE: aten all default is also registered by the multi-op handler above; this later
+    # registration silently overrides it in the table.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -2378,6 +2642,11 @@ def all_default(func, *args, **kwargs):
     "self: jt_all, padding: any, output_size: any?",
 )
 def to_padded_tensor_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Converts an NJT to a dense padded tensor.
+    # Raises RuntimeError for NJTs with holes. Uses output_size entry at the ragged dim, or the stored max
+    # sequence length, or the values length as the padded length. Transposes/flattens values to 2D as the
+    # jagged-to-padded kernel needs, casts bool CUDA values to half and back, then restores the original
+    # trailing shape and the ragged position. Returns the dense tensor filled with padding.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -2441,6 +2710,10 @@ def to_padded_tensor_default(func, *args, **kwargs):
     "padded: t, offsets: t, dummy: jt, ragged_idx: any?, min_seqlen: any?, max_seqlen: any?, sum_S: any?",
 )
 def _nested_from_padded_tensor_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Builds an NJT from a padded dense tensor and offsets.
+    # Transposes and reshapes the padded tensor to 3D (ragged dim second), runs the padded-to-jagged kernel
+    # with sum_S as the total length (bool CUDA via half), restores trailing dims and ragged position, and
+    # returns an NJT with the offsets, ragged_idx and optional min/max seqlen stored in its metadata cache.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -2498,6 +2771,8 @@ def _nested_from_padded_tensor_default(func, *args, **kwargs):
     "values: t, offsets: t, dummy: jt_all, lengths: t?, ragged_idx: any?, min_seqlen: t?, max_seqlen: t?",
 )
 def _nested_view_from_jagged_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Creates an NJT as a view of given values, offsets and optional lengths, ragged_idx and min/max seqlen.
+    # Puts any provided min/max seqlen into the metadata cache. Returns the new NJT.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -2527,6 +2802,7 @@ def _nested_view_from_jagged_default(func, *args, **kwargs):
 
 @register_jagged_func(torch.ops.aten._nested_get_offsets.default, "self: jt_all")
 def _nested_get_offsets(func, *args, **kwargs):
+    # [FUNCTION DOC] Returns the offsets tensor of an NJT.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -2537,6 +2813,7 @@ def _nested_get_offsets(func, *args, **kwargs):
 
 @register_jagged_func(torch.ops.aten._nested_get_lengths.default, "self: jt_all")
 def _nested_get_lengths(func, *args, **kwargs):
+    # [FUNCTION DOC] Returns the lengths tensor of an NJT, or None if it has no holes.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -2547,6 +2824,7 @@ def _nested_get_lengths(func, *args, **kwargs):
 
 @register_jagged_func(torch.ops.aten._nested_get_ragged_idx.default, "self: jt_all")
 def _nested_get_ragged_idx(func, *args, **kwargs):
+    # [FUNCTION DOC] Returns the ragged_idx of an NJT.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -2557,6 +2835,7 @@ def _nested_get_ragged_idx(func, *args, **kwargs):
 
 @register_jagged_func(torch.ops.aten._nested_get_min_seqlen.default, "self: jt_all")
 def _nested_get_min_seqlen(func, *args, **kwargs):
+    # [FUNCTION DOC] Returns the cached min sequence length of an NJT, or None if not cached.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -2567,6 +2846,7 @@ def _nested_get_min_seqlen(func, *args, **kwargs):
 
 @register_jagged_func(torch.ops.aten._nested_get_max_seqlen.default, "self: jt_all")
 def _nested_get_max_seqlen(func, *args, **kwargs):
+    # [FUNCTION DOC] Returns the cached max sequence length of an NJT, or None if not cached.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -2578,6 +2858,10 @@ def _nested_get_max_seqlen(func, *args, **kwargs):
 # If a section of the Nested Tensor is fully masked out we still retain the section with a length of 0
 @register_jagged_func(torch.ops.aten.masked_select.default, "self: jt, mask: any")
 def masked_select_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Masked select for a 2D NJT with an NJT mask of the same shape.
+    # Raises RuntimeError for more than 2 dims or a shape mismatch. Selects the values with the mask values
+    # and recomputes offsets from the cumulative count of selected elements, so fully masked components keep
+    # length zero. Returns an NJT.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -2606,6 +2890,7 @@ def masked_select_default(func, *args, **kwargs):
     "grad_output: t, self: jt_all, dim: any, index: any",
 )
 def _nested_select_backward_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Backward of NJT select: returns a dense-zeros NJT-shaped tensor with grad_output copied into the selected slice.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -2621,6 +2906,7 @@ def _nested_select_backward_default(func, *args, **kwargs):
 
 @register_jagged_func(torch.ops.aten.record_stream.default, "self: jt_all, s: any")
 def record_stream_default(func, *args, **kwargs) -> None:
+    # [FUNCTION DOC] Records a stream on the NJT's values, offsets and lengths (when present) so they live until the stream finishes. Returns None.
     inp = args[0]
     stream = args[1]
     # ensure all components live until stream computation completes
@@ -2639,6 +2925,9 @@ def record_stream_default(func, *args, **kwargs) -> None:
     "self: jt_all, size: any, dtype: any?, layout: any?, device: any?, pin_memory: any?",
 )
 def new_empty_default(func, *args, **kwargs):
+    # [FUNCTION DOC] new_empty / new_zeros / new_ones for an NJT.
+    # Only an empty size is supported, in which case the op is applied to the values buffer and a dense tensor
+    # is returned; any other size raises RuntimeError.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -2663,6 +2952,9 @@ def new_empty_default(func, *args, **kwargs):
     "self: jt_all, ...",
 )
 def activation_backward(func, *args, **kwargs):
+    # [FUNCTION DOC] Backward of pointwise activations when arguments include NJTs.
+    # Unwraps every NJT argument to its values, applies the op, and wraps the result with the metadata of
+    # the first NJT (assumed to be grad_output).
     # first NJT arg is expected to be grad_output
     grad_output = next(arg for arg in args if isinstance(arg, NestedTensor))
     return NestedTensor(
@@ -2676,6 +2968,7 @@ def activation_backward(func, *args, **kwargs):
 
 @register_jagged_func(torch.ops.aten.fill.Scalar, "self: jt_all, value: any")
 def fill_Scalar(func, *args, **kwargs):
+    # [FUNCTION DOC] Out-of-place fill of an NJT: fills a copy of the values and re-wraps with the same metadata.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -2687,6 +2980,7 @@ def fill_Scalar(func, *args, **kwargs):
 
 @register_jagged_func(torch.ops.aten.fill_.Scalar, "self: jt_all, value: any")
 def fill__Scalar(func, *args, **kwargs):
+    # [FUNCTION DOC] In-place fill of an NJT: fills the values buffer and returns the same NJT. Mutates the input.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -2699,6 +2993,7 @@ def fill__Scalar(func, *args, **kwargs):
 
 @register_jagged_func(torch.ops.aten.frexp.Tensor, "self: jt_all")
 def frexp_Tensor(func, *args, **kwargs):
+    # [FUNCTION DOC] frexp of an NJT: returns (mantissa, exponent) NJTs sharing the input's ragged metadata.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -2717,6 +3012,9 @@ def frexp_Tensor(func, *args, **kwargs):
     "grad: any, self: any, other: any, mask: any",
 )
 def matmul_backward_default(func, *args, **kwargs):
+    # [FUNCTION DOC] Backward of matmul computed from the grad and operands with matmul and transposes.
+    # Returns (None, None) if grad is None; otherwise returns (grad_self, grad_other), each computed only
+    # when its mask entry is set and None otherwise.
     _, new_kwargs = normalize_function(  # type: ignore[misc]
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -2743,6 +3041,7 @@ def matmul_backward_default(func, *args, **kwargs):
 # Make the dummy available on the C++ side.
 @register_jagged_func(torch.ops.aten._nested_get_jagged_dummy.default, "self: any")
 def _nested_get_jagged_dummy(func, *args, **kwargs):
+    # [FUNCTION DOC] Returns the shared dummy NJT view used on the C++ side; takes no meaningful arguments.
     from torch.nested._internal.nested_tensor import _nt_view_dummy
 
     return _nt_view_dummy()
