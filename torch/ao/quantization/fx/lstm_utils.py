@@ -1,3 +1,6 @@
+# [MODULE DOC] Helpers for the custom-module flow of quantizable LSTM in FX graph mode quantization:
+# one builds an observed quantizable LSTM with per-op observers assigned to its inner cell ops, the
+# other converts an observed LSTM into a reference quantized LSTM. No import-time side effects.
 import copy
 import operator
 from typing import Any, TYPE_CHECKING
@@ -31,6 +34,15 @@ def _get_lstm_with_individually_observed_parts(
     hidden_state_obs_ctr: _PartialWrapper | None = None,
     split_gates: bool = False,
 ) -> torch.ao.nn.quantizable.LSTM:
+    # [FUNCTION DOC] Build an observed quantizable LSTM from a float LSTM. Creates the quantizable LSTM
+    # with the same hyperparameters and qconfig, replaces each layer via the layer from_float
+    # conversion, builds a QConfigMapping whose gate submodules use sigmoid/tanh observers when given,
+    # and runs prepare_fx on each forward cell. Then, because functional add/mul ops cannot be
+    # configured in FX mode, walks the cell graph counting add and mul calls and replaces the
+    # observer after selected ops (by op kind and occurrence index; the table differs when
+    # split_gates is set) with instances of the corresponding observer constructors, skipping None.
+    # Raises an error if a cell is not a Module or a matched op has other than one user.
+    # Returns the quantizable LSTM; only the forward direction cells are processed.
     """
     Return an observed `torch.ao.nn.quantizable.LSTM` created from a `torch.nn.LSTM`
     with specific observers or fake quantizes assigned to the inner ops or submodules.
@@ -63,6 +75,8 @@ def _get_lstm_with_individually_observed_parts(
     """
 
     def make_qconfig(obs_ctr: _PartialWrapper) -> QConfig:
+        # [FUNCTION DOC] HELPER: build a QConfig using obs_ctr for activations and the default weight
+        # fake quantize if obs_ctr yields a fake quantize, otherwise the default weight observer.
         """
         Make a QConfig with fixed qparams observers or fake quantizes.
         """
@@ -169,6 +183,12 @@ def _get_reference_quantized_lstm_module(
     observed_lstm: torch.ao.nn.quantizable.LSTM,
     backend_config: BackendConfig | None = None,
 ) -> torch.ao.nn.quantized.LSTM:
+    # [FUNCTION DOC] Convert an observed quantizable LSTM into a reference quantized LSTM. Creates the
+    # quantized LSTM with the same hyperparameters; for each layer deep-copies the observed forward
+    # cell, converts it with convert_to_reference_fx, then manually removes the quantize nodes on
+    # the input x and hidden state items and the dequantize nodes feeding the output tuple (custom
+    # modules expect quantized inputs/outputs), eliminates dead code, recompiles and installs the
+    # cell. Raises an error if conversion does not yield a GraphModule. Returns the quantized LSTM.
     """
     Return a `torch.ao.nn.quantized.LSTM` created from a `torch.ao.nn.quantizable.LSTM`
     with observers or fake quantizes inserted through `prepare_fx`, e.g. from

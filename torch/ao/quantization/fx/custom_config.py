@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Custom configuration objects for FX graph-mode quantization: PrepareCustomConfig,
+# ConvertCustomConfig and FuseCustomConfig (fluent setters, repr, and legacy dict conversion), plus
+# the StandaloneModuleConfigEntry dataclass and the string keys used by the legacy dictionary format.
+# No import-time side effects beyond defining constants.
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -35,6 +39,9 @@ PRESERVED_ATTRIBUTES_DICT_KEY = "preserved_attributes"
 
 @dataclass
 class StandaloneModuleConfigEntry:
+    # [CLASS DOC] Dataclass holding per-standalone-module settings for prepare: qconfig_mapping
+    # (None means inherit the parent's), example_inputs tuple, prepare_custom_config (may be None) and
+    # backend_config (None means inherit the parent's).
     # qconfig_mapping for the prepare function called in the submodule,
     # None means use qconfig from parent qconfig_mapping
     qconfig_mapping: QConfigMapping | None
@@ -44,6 +51,10 @@ class StandaloneModuleConfigEntry:
 
 
 class PrepareCustomConfig:
+    # [CLASS DOC] Configuration for prepare_fx / prepare_qat_fx. Attributes: standalone module settings
+    # keyed by name and by class, float-to-observed custom module mapping per quant type, lists of
+    # non-traceable module names and classes, input/output quantized indexes and preserved attribute
+    # names. Setters return self for chaining and overwrite previous values.
     """
     Custom configuration for :func:`~torch.ao.quantization.quantize_fx.prepare_fx` and
     :func:`~torch.ao.quantization.quantize_fx.prepare_qat_fx`.
@@ -64,6 +75,7 @@ class PrepareCustomConfig:
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Create an empty config with all mappings and lists empty.
         self.standalone_module_names: dict[str, StandaloneModuleConfigEntry] = {}
         self.standalone_module_classes: dict[type, StandaloneModuleConfigEntry] = {}
         self.float_to_observed_mapping: dict[QuantType, dict[type, type]] = {}
@@ -74,6 +86,7 @@ class PrepareCustomConfig:
         self.preserved_attributes: list[str] = []
 
     def __repr__(self):
+        # [FUNCTION DOC] Return a string with the class name and only the non-empty attributes.
         dict_nonempty = {k: v for k, v in self.__dict__.items() if len(v) > 0}
         return f"PrepareCustomConfig({dict_nonempty})"
 
@@ -85,6 +98,8 @@ class PrepareCustomConfig:
         prepare_custom_config: PrepareCustomConfig | None,
         backend_config: BackendConfig | None,
     ) -> PrepareCustomConfig:
+        # [FUNCTION DOC] Register (or overwrite) the standalone module settings for module_name, stored as a
+        # StandaloneModuleConfigEntry. Returns self.
         """
         Set the configuration for running a standalone module identified by ``module_name``.
 
@@ -105,6 +120,8 @@ class PrepareCustomConfig:
         prepare_custom_config: PrepareCustomConfig | None,
         backend_config: BackendConfig | None,
     ) -> PrepareCustomConfig:
+        # [FUNCTION DOC] Register (or overwrite) the standalone module settings for module_class, stored as a
+        # StandaloneModuleConfigEntry. Returns self.
         """
         Set the configuration for running a standalone module identified by ``module_class``.
 
@@ -123,6 +140,8 @@ class PrepareCustomConfig:
         observed_class: type,
         quant_type: QuantType = QuantType.STATIC,
     ) -> PrepareCustomConfig:
+        # [FUNCTION DOC] Map a custom float class to its observed class for the given quant type. Raises
+        # ValueError if quant_type is not static. Mutates the mapping and returns self.
         """
         Set the mapping from a custom float module class to a custom observed module class.
 
@@ -141,6 +160,7 @@ class PrepareCustomConfig:
     def set_non_traceable_module_names(
         self, module_names: list[str]
     ) -> PrepareCustomConfig:
+        # [FUNCTION DOC] Replace the list of non-traceable module names. Returns self.
         """
         Set the modules that are not symbolically traceable, identified by name.
         """
@@ -150,6 +170,7 @@ class PrepareCustomConfig:
     def set_non_traceable_module_classes(
         self, module_classes: list[type]
     ) -> PrepareCustomConfig:
+        # [FUNCTION DOC] Replace the list of non-traceable module classes. Returns self.
         """
         Set the modules that are not symbolically traceable, identified by class.
         """
@@ -157,6 +178,7 @@ class PrepareCustomConfig:
         return self
 
     def set_input_quantized_indexes(self, indexes: list[int]) -> PrepareCustomConfig:
+        # [FUNCTION DOC] Replace the list of graph input indexes that are quantized. Returns self.
         """
         Set the indexes of the inputs of the graph that should be quantized.
         Inputs are otherwise assumed to be in fp32 by default instead.
@@ -165,6 +187,7 @@ class PrepareCustomConfig:
         return self
 
     def set_output_quantized_indexes(self, indexes: list[int]) -> PrepareCustomConfig:
+        # [FUNCTION DOC] Replace the list of graph output indexes that are quantized. Returns self.
         """
         Set the indexes of the outputs of the graph that should be quantized.
         Outputs are otherwise assumed to be in fp32 by default instead.
@@ -173,6 +196,7 @@ class PrepareCustomConfig:
         return self
 
     def set_preserved_attributes(self, attributes: list[str]) -> PrepareCustomConfig:
+        # [FUNCTION DOC] Replace the list of attribute names preserved on the graph module. Returns self.
         """
         Set the names of the attributes that will persist in the graph module even if they are not used in
         the model's ``forward`` method.
@@ -185,6 +209,11 @@ class PrepareCustomConfig:
     def from_dict(
         cls, prepare_custom_config_dict: dict[str, Any]
     ) -> PrepareCustomConfig:
+        # [FUNCTION DOC] Legacy: build a PrepareCustomConfig from a dictionary using the module-level keys.
+        # Standalone module entries are 5-tuples whose qconfig, child config and backend config may be
+        # objects, dicts (converted) or None; float-to-observed entries are keyed by quant type name.
+        # Missing keys default to empty. Raises ValueError for entries of an unsupported type.
+        # Returns the new config.
         """
         Create a ``PrepareCustomConfig`` from a dictionary with the following items:
 
@@ -208,6 +237,8 @@ class PrepareCustomConfig:
         """
 
         def _get_qconfig_mapping(obj: Any, dict_key: str) -> QConfigMapping | None:
+        # [FUNCTION DOC] HELPER: return obj if it is a QConfigMapping or None, convert a dict into one,
+        # otherwise raise ValueError naming dict_key.
             """
             Convert the given object into a QConfigMapping if possible, else throw an exception.
             """
@@ -222,6 +253,8 @@ class PrepareCustomConfig:
         def _get_prepare_custom_config(
             obj: Any, dict_key: str
         ) -> PrepareCustomConfig | None:
+            # [FUNCTION DOC] HELPER: return obj if it is a PrepareCustomConfig or None, convert a dict into one,
+            # otherwise raise ValueError naming dict_key.
             """
             Convert the given object into a PrepareCustomConfig if possible, else throw an exception.
             """
@@ -234,6 +267,8 @@ class PrepareCustomConfig:
             )
 
         def _get_backend_config(obj: Any, dict_key: str) -> BackendConfig | None:
+        # [FUNCTION DOC] HELPER: return obj if it is a BackendConfig or None, convert a dict into one,
+        # otherwise raise ValueError naming dict_key.
             """
             Convert the given object into a BackendConfig if possible, else throw an exception.
             """
@@ -318,12 +353,16 @@ class PrepareCustomConfig:
         return conf
 
     def to_dict(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Convert to the legacy dictionary format described by from_dict. Only non-empty
+        # attributes are included; standalone entries become 5-tuples (key, qconfig dict or None, example
+        # inputs, child config dict or None, backend config); quant types are converted to their names.
         """
         Convert this ``PrepareCustomConfig`` to a dictionary with the items described in
         :func:`~torch.ao.quantization.fx.custom_config.PrepareCustomConfig.from_dict`.
         """
 
         def _make_tuple(key: Any, e: StandaloneModuleConfigEntry):
+        # [FUNCTION DOC] HELPER: turn a standalone module entry and its key into the legacy 5-tuple.
             qconfig_dict = e.qconfig_mapping.to_dict() if e.qconfig_mapping else None
             prepare_custom_config_dict = (
                 e.prepare_custom_config.to_dict() if e.prepare_custom_config else None
@@ -372,6 +411,8 @@ class PrepareCustomConfig:
 
 
 class ConvertCustomConfig:
+    # [CLASS DOC] Configuration for convert_fx. Attributes: observed-to-quantized custom module mapping
+    # per quant type and preserved attribute names. Setters return self for chaining.
     """
     Custom configuration for :func:`~torch.ao.quantization.quantize_fx.convert_fx`.
 
@@ -383,10 +424,12 @@ class ConvertCustomConfig:
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Create an empty config.
         self.observed_to_quantized_mapping: dict[QuantType, dict[type, type]] = {}
         self.preserved_attributes: list[str] = []
 
     def __repr__(self):
+        # [FUNCTION DOC] Return a string with the class name and only the non-empty attributes.
         dict_nonempty = {k: v for k, v in self.__dict__.items() if len(v) > 0}
         return f"ConvertCustomConfig({dict_nonempty})"
 
@@ -396,6 +439,8 @@ class ConvertCustomConfig:
         quantized_class: type,
         quant_type: QuantType = QuantType.STATIC,
     ) -> ConvertCustomConfig:
+        # [FUNCTION DOC] Map a custom observed class to its quantized class for the given quant type
+        # (any quant type is accepted). Mutates the mapping and returns self.
         """
         Set the mapping from a custom observed module class to a custom quantized module class.
 
@@ -408,6 +453,7 @@ class ConvertCustomConfig:
         return self
 
     def set_preserved_attributes(self, attributes: list[str]) -> ConvertCustomConfig:
+        # [FUNCTION DOC] Replace the list of attribute names preserved on the graph module. Returns self.
         """
         Set the names of the attributes that will persist in the graph module even if they are not used in
         the model's ``forward`` method.
@@ -420,6 +466,9 @@ class ConvertCustomConfig:
     def from_dict(
         cls, convert_custom_config_dict: dict[str, Any]
     ) -> ConvertCustomConfig:
+        # [FUNCTION DOC] Legacy: build a ConvertCustomConfig from a dictionary holding a nested mapping from
+        # quant type name to observed/quantized class mapping and a preserved attributes list. Missing keys
+        # default to empty. Returns the new config.
         """
         Create a ``ConvertCustomConfig`` from a dictionary with the following items:
 
@@ -449,6 +498,8 @@ class ConvertCustomConfig:
         return conf
 
     def to_dict(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Convert to the legacy dictionary format; only non-empty attributes are included and
+        # quant types are converted to their names.
         """
         Convert this ``ConvertCustomConfig`` to a dictionary with the items described in
         :func:`~torch.ao.quantization.fx.custom_config.ConvertCustomConfig.from_dict`.
@@ -469,6 +520,7 @@ class ConvertCustomConfig:
 
 
 class FuseCustomConfig:
+    # [CLASS DOC] Configuration for fuse_fx. Only attribute: preserved attribute names. Setter returns self.
     """
     Custom configuration for :func:`~torch.ao.quantization.quantize_fx.fuse_fx`.
 
@@ -480,13 +532,16 @@ class FuseCustomConfig:
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Create an empty config.
         self.preserved_attributes: list[str] = []
 
     def __repr__(self):
+        # [FUNCTION DOC] Return a string with the class name and only the non-empty attributes.
         dict_nonempty = {k: v for k, v in self.__dict__.items() if len(v) > 0}
         return f"FuseCustomConfig({dict_nonempty})"
 
     def set_preserved_attributes(self, attributes: list[str]) -> FuseCustomConfig:
+        # [FUNCTION DOC] Replace the list of attribute names preserved on the graph module. Returns self.
         """
         Set the names of the attributes that will persist in the graph module even if they are not used in
         the model's ``forward`` method.
@@ -497,6 +552,8 @@ class FuseCustomConfig:
     # TODO: remove this
     @classmethod
     def from_dict(cls, fuse_custom_config_dict: dict[str, Any]) -> FuseCustomConfig:
+        # [FUNCTION DOC] Legacy: build a FuseCustomConfig from a dictionary; uses only the preserved
+        # attributes entry (default empty). Returns the new config.
         """
         Create a ``ConvertCustomConfig`` from a dictionary with the following items:
 
@@ -511,6 +568,8 @@ class FuseCustomConfig:
         return conf
 
     def to_dict(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Convert to the legacy dictionary; includes the preserved attributes entry only if
+        # non-empty.
         """
         Convert this ``FuseCustomConfig`` to a dictionary with the items described in
         :func:`~torch.ao.quantization.fx.custom_config.ConvertCustomConfig.from_dict`.

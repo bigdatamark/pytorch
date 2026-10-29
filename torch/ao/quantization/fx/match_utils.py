@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Pattern matching of FX graph nodes against quantization patterns. Provides _is_match,
+# which tests one node against a (possibly nested) pattern, and _find_matches, which walks a graph
+# in reverse and builds a map from node name to match info (including custom and standalone
+# modules). Defines the _MatchResult type aliases. No public exports.
 import sys
 from collections.abc import Callable, Iterable
 from typing import Any
@@ -29,6 +33,14 @@ _MatchResultWithQConfig = tuple[
 # decorators are applied in the reverse order we see. Also when we match the nodes in the graph with these patterns,
 # we'll start from the last node of the graph and traverse back.
 def _is_match(modules, node, pattern, max_uses=sys.maxsize):
+    # [FUNCTION DOC] HELPER: return True if node matches pattern. A pattern is a leaf (module class,
+    # function, method name string, or other target value) or a tuple of a head followed by argument
+    # subpatterns. MatchAllNode subclasses match anything; a node equal to the pattern matches.
+    # Otherwise the node must be a Node with at most max_uses users, and its op/target must fit the
+    # head (module type before parametrization looked up in modules; function target identity; method
+    # name; getattr patterns also compare the attribute name). Argument subpatterns must match the
+    # node args one-to-one in count, each with max_uses of 1. Raises an error if a getattr pattern
+    # does not have exactly two elements.
     """Matches a node in fx against a pattern"""
     if isinstance(pattern, tuple):
         self_match, *arg_matches = pattern
@@ -87,6 +99,13 @@ def _find_matches(
     standalone_module_classes: list[type] | None = None,
     custom_module_classes: list[Any] | None = None,
 ) -> dict[str, _MatchResult]:
+    # [FUNCTION DOC] Match graph nodes to quantization patterns. Walks nodes in reverse order, trying
+    # patterns in dict order; the first match builds a handler instance (given the matched nodes,
+    # modules and root node getter) and records every matched node name in the result mapping as
+    # (last node, matched node pattern, pattern, handler). Afterwards adds entries for call_module
+    # nodes whose module type is in custom_module_classes (custom-module handler) and for standalone
+    # modules (by name, class, or already observed), with pattern None. None lists default to empty.
+    # Raises an error if modules is None. Returns the node name to match tuple mapping.
     """
     Matches the nodes in the input graph to quantization patterns, and
     outputs the information needed to quantize them in future steps.
@@ -124,6 +143,9 @@ def _find_matches(
     def _recursive_record_node_in_match_map(
         last_node, match_map, node_pattern, matched_node_pattern, pattern, match_value
     ):
+        # [FUNCTION DOC] HELPER: recursively walk a nested node pattern and, for each Node found, set
+        # its name in match_map to (last_node, matched_node_pattern, pattern, match_value). Non-node,
+        # non-iterable entries are ignored. Mutates match_map.
         if isinstance(node_pattern, Node):
             match_map[node_pattern.name] = (
                 last_node,
@@ -141,6 +163,11 @@ def _find_matches(
 
     # TODO: 1. merge with fuse matcher 2. document the code
     def record_match(pattern, node, last_node, matched_node_pattern, match_map):
+        # [FUNCTION DOC] HELPER: recursively build the matched node pattern. For a tuple pattern, records
+        # the head node and matches argument subpatterns against node args (skipped for getattr),
+        # then appends the result to matched_node_pattern: as one nested tuple when the pattern has a
+        # single argument, otherwise spliced as individual entries; for a leaf pattern appends the node.
+        # KNOWN ISSUE: if the argument subpatterns produce no entries, indexing the first entry fails.
         if isinstance(pattern, tuple):
             s, *args = pattern
             is_single_arg = len(args) == 1
@@ -206,6 +233,8 @@ def _find_matches(
             )
 
     def is_standalone_module(node_target: str, modules: dict[str, torch.nn.Module]):
+        # [FUNCTION DOC] HELPER: true if node_target is a listed standalone module name or its module's
+        # type is a listed standalone class. Raises an error if modules is None.
         if modules is None:
             raise AssertionError("modules must not be None")
         return (
