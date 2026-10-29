@@ -1,5 +1,10 @@
 # Owner(s): ["module: dynamo"]
 
+# [MODULE DOC] Dynamo tests for tuple and list methods, operators and dunder protocol. Defines
+# small helper classes for remove and sort, the TupleTests class which is parameterized by a
+# sequence type, and ListTests that reuses it for list and adds list mutation tests, including
+# compiled tests that mutate a module level list. Defines a module global list used by those
+# tests. Running the file calls the dynamo run_tests entry point.
 # TODO: move set tests from test_functions.py/test_misc.py to this file
 
 
@@ -14,24 +19,37 @@ lst = []
 
 
 class AlwaysEqualForListRemove:
+    # [CLASS DOC] HELPER: Fixture whose equality comparison always reports true, used to check
+    # list remove uses the stored item comparison.
     def __eq__(self, other):
+        # [FUNCTION DOC] HELPER: Equality hook that ignores the other operand and returns true.
         return True
 
 
 class NeverEqualForListRemove:
+    # [CLASS DOC] HELPER: Fixture whose equality comparison always reports false.
     def __eq__(self, other):
+        # [FUNCTION DOC] HELPER: Equality hook that ignores the other operand and returns false.
         return False
 
 
 class CmpKeyForListSort:
+    # [CLASS DOC] HELPER: Sort key wrapper holding a value v. Its less-than hook compares the
+    # values modulo three, so sorting by it groups numbers by remainder.
     def __init__(self, v):
+        # [FUNCTION DOC] HELPER: Stores the given value in the attribute v.
         self.v = v
 
     def __lt__(self, other):
+        # [FUNCTION DOC] HELPER: Less-than hook. Returns true when the remainder of this value
+        # modulo three is smaller than that of the other object's value.
         return self.v % 3 < other.v % 3
 
 
 class TupleTests(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Dynamo tests for tuple methods, binary operators and dunder methods. The class
+    # attribute thetype selects the sequence type (tuple here); ListTests subclasses it with list
+    # so all of these tests also run for lists. Fixture turns on enable_trace_unittest.
     # Tuple methods
     # + count
     # + index
@@ -45,22 +63,37 @@ class TupleTests(torch._dynamo.test_case.TestCase):
     thetype = tuple
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Fixture setup. Remembers the dynamo enable_trace_unittest config
+        # value in an instance attribute, turns the flag on so unittest assertions can be traced
+        # inside dynamo, then calls the parent setUp.
         self.old = torch._dynamo.config.enable_trace_unittest
         torch._dynamo.config.enable_trace_unittest = True
         super().setUp()
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Fixture teardown. Restores the saved enable_trace_unittest config
+        # value and returns the result of the parent tearDown.
         torch._dynamo.config.enable_trace_unittest = self.old
         return super().tearDown()
 
     def assertEqual(self, a, b):
+        # [FUNCTION DOC] Overrides the TestCase equality assertion with a simple version that
+        # asserts the two operands compare equal using the equality operator; on failure the
+        # message shows both values. Returns the result of the assertTrue call.
         return self.assertTrue(a == b, lambda msg: f"{msg}\n{a} != {b}")
 
     def assertNotEqual(self, x, y, msg=None, *, atol=None, rtol=None, **kwargs):
+        # [FUNCTION DOC] Overrides the not-equal assertion with a simple version asserting the
+        # operands compare unequal; the extra tolerance arguments are accepted but ignored. On
+        # failure the message shows both values.
         return self.assertTrue(x != y, lambda msg: f"{msg}\n{x} == {y}")
 
     @make_dynamo_test
     def test_count(self):
+        # [FUNCTION DOC] Test decorated with make_dynamo_test, so it runs once eagerly and once
+        # compiled by dynamo. Checks count on a sequence built from five characters: counts single
+        # matches, returns zero for a two character item, and wrong argument counts raise
+        # TypeError.
         p = self.thetype("abcab")
         self.assertEqual(p.count("a"), 2)
         self.assertEqual(p.count("ab"), 0)
@@ -71,6 +104,9 @@ class TupleTests(torch._dynamo.test_case.TestCase):
 
     @make_dynamo_test
     def test_index(self):
+        # [FUNCTION DOC] Test decorated with make_dynamo_test, so it runs once eagerly and once
+        # compiled by dynamo. Checks index returns the position of a present item, raises
+        # ValueError for a missing item, and raises TypeError when called without an argument.
         p = self.thetype("abc")
         self.assertEqual(p.index("a"), 0)
         self.assertRaises(ValueError, p.index, "e")
@@ -80,6 +116,11 @@ class TupleTests(torch._dynamo.test_case.TestCase):
 
     @make_dynamo_test
     def test_binop_imul(self):
+        # [FUNCTION DOC] Test decorated with make_dynamo_test, so it runs once eagerly and once
+        # compiled by dynamo. Checks the multiply dunder method returns a new object of the same
+        # type with the contents repeated twice, leaves the original unchanged, and raises
+        # TypeError for a missing argument or a float factor. Note the test name says in-place
+        # multiply but this version tests plain multiplication; ListTests overrides it.
         p = self.thetype([1, 2, 3])
         r = p.__mul__(2)
         self.assertIsInstance(r, self.thetype)
@@ -94,6 +135,10 @@ class TupleTests(torch._dynamo.test_case.TestCase):
 
     @make_dynamo_test
     def test_binop_add(self):
+        # [FUNCTION DOC] Test decorated with make_dynamo_test, so it runs once eagerly and once
+        # compiled by dynamo. Checks the add operator and the add dunder method concatenate two
+        # sequences into the same type, and that a missing argument or a dict operand raises
+        # TypeError.
         p, q = map(self.thetype, ["abc", "bcd"])
         self.assertIsInstance(p + q, self.thetype)
         self.assertEqual(p + q, self.thetype("abcbcd"))
@@ -107,6 +152,10 @@ class TupleTests(torch._dynamo.test_case.TestCase):
 
     @make_dynamo_test
     def test_cmp_eq(self):
+        # [FUNCTION DOC] Test decorated with make_dynamo_test, so it runs once eagerly and once
+        # compiled by dynamo. Checks equality: the operator and the eq dunder method treat equal
+        # contents as equal, different contents as not equal, and a missing argument raises
+        # TypeError.
         p, q, r = map(self.thetype, ["ab", "abc", "ab"])
         self.assertTrue(p == p)
         self.assertTrue(p == r)
@@ -120,6 +169,9 @@ class TupleTests(torch._dynamo.test_case.TestCase):
 
     @make_dynamo_test
     def test_cmp_ne(self):
+        # [FUNCTION DOC] Test decorated with make_dynamo_test, so it runs once eagerly and once
+        # compiled by dynamo. Checks inequality through the operator and the ne dunder method on
+        # sequences of different content, and TypeError for a missing argument.
         p, q = map(self.thetype, ["ab", "abc"])
         self.assertTrue(p != q)
         self.assertNotEqual(p, q)
@@ -130,6 +182,10 @@ class TupleTests(torch._dynamo.test_case.TestCase):
 
     @make_dynamo_test
     def test_cmp_less_than(self):
+        # [FUNCTION DOC] Test decorated with make_dynamo_test, so it runs once eagerly and once
+        # compiled by dynamo. Checks lexicographic less-than: a shorter prefix is less than the
+        # longer sequence through the operator and the lt dunder method, the reverse is false, and
+        # a missing argument raises TypeError.
         p, q = map(self.thetype, ["ab", "abc"])
         self.assertTrue(p < q)
         self.assertTrue(p.__lt__(q))
@@ -140,6 +196,10 @@ class TupleTests(torch._dynamo.test_case.TestCase):
 
     @make_dynamo_test
     def test_cmp_greater_than(self):
+        # [FUNCTION DOC] Test decorated with make_dynamo_test, so it runs once eagerly and once
+        # compiled by dynamo. Checks greater-than through the operator and the gt dunder method
+        # for a longer sequence against its prefix, the reverse is false, and a missing argument
+        # raises TypeError.
         p, q = map(self.thetype, ["ab", "abc"])
         self.assertTrue(q > p)
         self.assertTrue(q.__gt__(p))
@@ -150,6 +210,10 @@ class TupleTests(torch._dynamo.test_case.TestCase):
 
     @make_dynamo_test
     def test_cmp_less_than_or_equal(self):
+        # [FUNCTION DOC] Test decorated with make_dynamo_test, so it runs once eagerly and once
+        # compiled by dynamo. Checks less-or-equal through the operator and the le dunder method
+        # for a prefix against the longer sequence, the reverse is false, and a missing argument
+        # raises TypeError.
         p, q = map(self.thetype, ["ab", "abc"])
         self.assertTrue(p <= q)
         self.assertTrue(p.__le__(q))
@@ -160,6 +224,9 @@ class TupleTests(torch._dynamo.test_case.TestCase):
 
     @make_dynamo_test
     def test_cmp_greater_than_or_equal(self):
+        # [FUNCTION DOC] Test decorated with make_dynamo_test, so it runs once eagerly and once
+        # compiled by dynamo. Checks greater-or-equal through the operator and the ge dunder
+        # method, the reverse is false, and a missing argument raises TypeError.
         p, q = map(self.thetype, ["ab", "abc"])
         self.assertTrue(q >= p)
         self.assertTrue(q.__ge__(p))
@@ -170,6 +237,10 @@ class TupleTests(torch._dynamo.test_case.TestCase):
 
     @make_dynamo_test
     def test___getitem__(self):
+        # [FUNCTION DOC] Test decorated with make_dynamo_test, so it runs once eagerly and once
+        # compiled by dynamo. Checks the getitem dunder method returns the element at an index,
+        # raises IndexError for an out of range index, and raises TypeError for zero or two
+        # arguments.
         p = self.thetype("abc")
         self.assertEqual(p.__getitem__(2), "c")
         self.assertRaises(IndexError, p.__getitem__, 10)
@@ -180,6 +251,9 @@ class TupleTests(torch._dynamo.test_case.TestCase):
 
     @make_dynamo_test
     def test___contains__(self):
+        # [FUNCTION DOC] Test decorated with make_dynamo_test, so it runs once eagerly and once
+        # compiled by dynamo. Checks the contains dunder method reports membership, returns a real
+        # bool, and raises TypeError for zero or two arguments.
         p = self.thetype("abc")
         self.assertTrue(p.__contains__("a"))
         self.assertIsInstance(p.__contains__("c"), bool)
@@ -190,6 +264,9 @@ class TupleTests(torch._dynamo.test_case.TestCase):
 
     @make_dynamo_test
     def test___iter__(self):
+        # [FUNCTION DOC] Test decorated with make_dynamo_test, so it runs once eagerly and once
+        # compiled by dynamo. Checks the iter dunder method yields an iterator whose first item is
+        # the only element, and that taking the iterator of an iterator again still works.
         p = self.thetype([1])
         it = p.__iter__()
         self.assertEqual(next(it), 1)
@@ -198,12 +275,18 @@ class TupleTests(torch._dynamo.test_case.TestCase):
 
     @make_dynamo_test
     def test_list_mul_constant_tuple(self):
+        # [FUNCTION DOC] Test decorated with make_dynamo_test, so it runs once eagerly and once
+        # compiled by dynamo. Multiplies a list holding one constant tuple by two and checks the
+        # result is a list with two references to that tuple.
         tree = (1, 2)
         result = [tree] * 2
         self.assertEqual(result, [tree, tree])
 
 
 class ListTests(TupleTests):
+    # [CLASS DOC] Dynamo tests for list specific methods (append, copy, clear, extend, insert,
+    # pop, remove, reverse, sort, in-place operators, setitem and delitem). Sets thetype to list
+    # and inherits every TupleTests test, so the shared tests also run on lists.
     # List methods
     # + append
     # + copy
@@ -226,6 +309,9 @@ class ListTests(TupleTests):
 
     @make_dynamo_test
     def test_append(self):
+        # [FUNCTION DOC] Test decorated with make_dynamo_test, so it runs once eagerly and once
+        # compiled by dynamo. Checks append returns None, adds the item at the end, and raises
+        # TypeError for zero or two arguments.
         p = self.thetype("abc")
         self.assertIsNone(p.append("d"))
         self.assertEqual(p, ["a", "b", "c", "d"])
@@ -236,6 +322,9 @@ class ListTests(TupleTests):
 
     @make_dynamo_test
     def test_copy(self):
+        # [FUNCTION DOC] Test decorated with make_dynamo_test, so it runs once eagerly and once
+        # compiled by dynamo. Checks copy returns a list equal to the original and that an extra
+        # argument raises TypeError.
         p = self.thetype("abc")
         self.assertEqual(p.copy(), p)
 
@@ -244,6 +333,9 @@ class ListTests(TupleTests):
 
     @make_dynamo_test
     def test_clear(self):
+        # [FUNCTION DOC] Test decorated with make_dynamo_test, so it runs once eagerly and once
+        # compiled by dynamo. Checks clear returns None and empties the list so its length is
+        # zero, and that an extra argument raises TypeError.
         p = self.thetype("abc")
         self.assertIsNone(p.clear())
         self.assertEqual(p, [])
@@ -254,6 +346,9 @@ class ListTests(TupleTests):
 
     @make_dynamo_test
     def test_extend(self):
+        # [FUNCTION DOC] Test decorated with make_dynamo_test, so it runs once eagerly and once
+        # compiled by dynamo. Checks extend returns None and appends all items of another list,
+        # raises TypeError for a non-iterable and for wrong argument counts.
         p, q = map(self.thetype, ["ab", "cd"])
         self.assertIsNone(p.extend(q))
         self.assertEqual(p, self.thetype("abcd"))
@@ -267,6 +362,9 @@ class ListTests(TupleTests):
 
     @make_dynamo_test
     def test_insert(self):
+        # [FUNCTION DOC] Test decorated with make_dynamo_test, so it runs once eagerly and once
+        # compiled by dynamo. Checks insert returns None and puts the item at the given index, and
+        # raises TypeError with zero, one or three arguments.
         p = self.thetype("abc")
         self.assertIsNone(p.insert(1, "ef"))
         self.assertEqual(p, ["a", "ef", "b", "c"])
@@ -278,6 +376,10 @@ class ListTests(TupleTests):
 
     @make_dynamo_test
     def test_pop(self):
+        # [FUNCTION DOC] Test decorated with make_dynamo_test, so it runs once eagerly and once
+        # compiled by dynamo. Checks pop with no argument removes the last item, pop with an index
+        # removes that item, an out of range index raises IndexError, and two arguments raise
+        # TypeError.
         p = self.thetype("abcd")
         self.assertEqual(p.pop(), "d")
         self.assertEqual(p.pop(1), "b")
@@ -289,6 +391,9 @@ class ListTests(TupleTests):
 
     @make_dynamo_test
     def test_remove(self):
+        # [FUNCTION DOC] Test decorated with make_dynamo_test, so it runs once eagerly and once
+        # compiled by dynamo. Checks remove returns None and deletes the first matching item,
+        # raises ValueError when not found, and TypeError for zero or two arguments.
         p = self.thetype("abad")
         self.assertIsNone(p.remove("a"))
         self.assertEqual(p, ["b", "a", "d"])
@@ -300,12 +405,18 @@ class ListTests(TupleTests):
 
     @make_dynamo_test
     def test_remove_uses_item_richcompare(self):
+        # [FUNCTION DOC] Test decorated with make_dynamo_test, so it runs once eagerly and once
+        # compiled by dynamo. Checks remove uses the stored item's equality: a list holding an
+        # always-equal object has it removed when given a never-equal object.
         p = [AlwaysEqualForListRemove()]
         self.assertIsNone(p.remove(NeverEqualForListRemove()))
         self.assertEqual(p, [])
 
     @make_dynamo_test
     def test_remove_matches_identity_before_richcompare(self):
+        # [FUNCTION DOC] Test decorated with make_dynamo_test, so it runs once eagerly and once
+        # compiled by dynamo. Checks remove matches on identity before equality: the same never-
+        # equal object that is stored is still removed.
         item = NeverEqualForListRemove()
         p = [item]
         self.assertIsNone(p.remove(item))
@@ -313,6 +424,9 @@ class ListTests(TupleTests):
 
     @make_dynamo_test
     def test_reverse(self):
+        # [FUNCTION DOC] Test decorated with make_dynamo_test, so it runs once eagerly and once
+        # compiled by dynamo. Checks reverse returns None and reverses the list in place, and that
+        # an extra argument raises TypeError.
         p = self.thetype("abcd")
         self.assertIsNone(p.reverse())
         self.assertEqual(p, self.thetype("dcba"))
@@ -322,15 +436,24 @@ class ListTests(TupleTests):
 
     @make_dynamo_test
     def test_sort(self):
+        # [FUNCTION DOC] Test decorated with make_dynamo_test, so it runs once eagerly and once
+        # compiled by dynamo. Checks sort returns None and orders a list of characters ascending
+        # in place.
         p = self.thetype("dbca")
         self.assertIsNone(p.sort())
         self.assertEqual(p, self.thetype("abcd"))
 
     @make_dynamo_test
     def test_sort_cmp_to_key(self):
+        # [FUNCTION DOC] Test decorated with make_dynamo_test, so it runs once eagerly and once
+        # compiled by dynamo. Checks sort with a key built by cmp_to_key from a reversed
+        # comparison function, in descending then (with reverse true) ascending order.
         from functools import cmp_to_key
 
         def revcmp(a, b):
+            # [FUNCTION DOC] HELPER: Three way comparison for reversed order; returns a positive,
+            # zero or negative integer from comparing the arguments, negated relative to normal
+            # ordering.
             return (a < b) - (a > b)
 
         p = self.thetype([1, 3, 2])
@@ -341,6 +464,10 @@ class ListTests(TupleTests):
 
     @make_dynamo_test
     def test_sort_user_defined_lt(self):
+        # [FUNCTION DOC] Test decorated with make_dynamo_test, so it runs once eagerly and once
+        # compiled by dynamo. Sorts with the CmpKeyForListSort key, which uses a user defined
+        # less-than hook comparing remainders modulo three, and checks both normal and reversed
+        # order results.
         p = self.thetype([3, 4, 5])
         p.sort(key=CmpKeyForListSort)
         self.assertEqual(p, self.thetype([3, 4, 5]))
@@ -349,11 +476,18 @@ class ListTests(TupleTests):
 
     @make_dynamo_test
     def test_sort_modified_during_sort(self):
+        # [FUNCTION DOC] Test decorated with make_dynamo_test, so it runs once eagerly and once
+        # compiled by dynamo. Sorts with a comparison function that appends to the list while
+        # sorting; checks that ValueError is raised and that the appended items are discarded,
+        # leaving the sorted original items.
         from functools import cmp_to_key
 
         p = self.thetype([1, 3, 2])
 
         def selfmodifying(a, b):
+            # [FUNCTION DOC] HELPER: Comparison function that appends the value four to the
+            # captured list p as a side effect, then returns a three way comparison result of its
+            # arguments.
             p.append(4)
             return (a > b) - (a < b)
 
@@ -363,10 +497,16 @@ class ListTests(TupleTests):
 
     @make_dynamo_test
     def test_sort_empty_during_sort(self):
+        # [FUNCTION DOC] Test decorated with make_dynamo_test, so it runs once eagerly and once
+        # compiled by dynamo. Sorts with a key function that records the list length each time it
+        # is called; checks the list sorts correctly and every recorded size is zero, showing that
+        # the list appears empty during sorting.
         p = self.thetype([1, 3, 2])
         sizes = []
 
         def key(x):
+            # [FUNCTION DOC] HELPER: Key function. Appends the current length of the captured list
+            # p to the captured list sizes and returns its argument unchanged.
             sizes.append(len(p))
             return x
 
@@ -376,6 +516,10 @@ class ListTests(TupleTests):
 
     @make_dynamo_test
     def test_binop_imul(self):
+        # [FUNCTION DOC] Test decorated with make_dynamo_test, so it runs once eagerly and once
+        # compiled by dynamo. Checks in-place multiply: the imul dunder method and the augmented
+        # operator extend the same list by repetition, return a list, and a missing argument or
+        # float factor raises TypeError.
         p = self.thetype([1, 2, 3])
         r = p.__imul__(2)
         self.assertIsInstance(r, self.thetype)
@@ -393,11 +537,18 @@ class ListTests(TupleTests):
         self.assertRaises(TypeError, p.__imul__, 2.2)
 
     def test_binop_imul_global_list(self):
+        # [FUNCTION DOC] Not decorated with make_dynamo_test. Assigns a module global list, then
+        # compiles with the eager backend and full graph a function that applies in-place multiply
+        # by two and by three to the global and returns the sine of its input. Checks the output
+        # matches and the global ends up repeated six times.
         global lst
         lst = self.thetype(["a", "b"])
 
         @torch.compile(backend="eager", fullgraph=True)
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compiled function. Multiplies the module global list in place
+            # by two via the operator and by three via the imul dunder method, then returns the
+            # sine of the input tensor.
             global lst
             lst *= 2
             lst.__imul__(3)
@@ -409,6 +560,12 @@ class ListTests(TupleTests):
 
     @make_dynamo_test
     def test_binop_iadd(self):
+        # [FUNCTION DOC] Test decorated with make_dynamo_test, so it runs once eagerly and once
+        # compiled by dynamo. Checks in-place add: the iadd dunder method returns the same
+        # extended list, the augmented operator accepts a string and extends with its characters,
+        # and a missing argument raises TypeError. KNOWN ISSUE: the last check calls the add
+        # dunder method rather than the in-place one, so the comment about concatenating the same
+        # type tests plain add.
         p, q = map(self.thetype, ["abc", "bcd"])
         r = p.__iadd__(q)
         self.assertIsInstance(r, self.thetype)
@@ -426,11 +583,17 @@ class ListTests(TupleTests):
         self.assertRaises(TypeError, p.__add__, dict.fromkeys(q))
 
     def test_binop_iadd_global_list(self):
+        # [FUNCTION DOC] Not decorated with make_dynamo_test. Sets a module global to an empty
+        # list, compiles with the eager backend and full graph a function that extends it in place
+        # twice, and checks the output and that the global equals the list a, b.
         global lst
         lst = self.thetype([])
 
         @torch.compile(backend="eager", fullgraph=True)
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compiled function. Applies in-place add of a one item list to
+            # the module global via the operator, then via the iadd dunder method, and returns the
+            # sine of the input tensor.
             global lst
             lst += ["a"]
             lst.__iadd__(["b"])
@@ -441,11 +604,17 @@ class ListTests(TupleTests):
         self.assertEqual(lst, ["a", "b"])
 
     def test_binop_delitem_global_list(self):
+        # [FUNCTION DOC] Not decorated with make_dynamo_test. Sets a module global to a three item
+        # list, compiles with the eager backend and full graph a function that deletes the item at
+        # index one from the global, and checks the output and that the global is left with the
+        # first and last items.
         global lst
         lst = self.thetype(["a", "b", "c"])
 
         @torch.compile(backend="eager", fullgraph=True)
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compiled function. Deletes the element at index one of the
+            # module global list and returns the sine of the input tensor.
             global lst
             del lst[1]
             return x.sin()
@@ -456,6 +625,10 @@ class ListTests(TupleTests):
 
     @make_dynamo_test
     def test___setitem__(self):
+        # [FUNCTION DOC] Test decorated with make_dynamo_test, so it runs once eagerly and once
+        # compiled by dynamo. Checks the setitem dunder method returns None and replaces an
+        # element, slice assignment of an empty list clears the list, and wrong argument counts
+        # raise TypeError.
         p = self.thetype("abc")
         self.assertIsNone(p.__setitem__(2, "a"))
         self.assertEqual(p, self.thetype("aba"))
@@ -470,6 +643,10 @@ class ListTests(TupleTests):
 
     @make_dynamo_test
     def test___delitem__(self):
+        # [FUNCTION DOC] Test decorated with make_dynamo_test, so it runs once eagerly and once
+        # compiled by dynamo. Checks the delitem dunder method returns None for an integer index
+        # and for a slice, raises ValueError for a slice step of zero, and raises TypeError for a
+        # missing argument, a float index or two arguments.
         p = self.thetype("abcdef")
         self.assertIsNone(p.__delitem__(1))
         self.assertEqual(p, self.thetype("acdef"))
@@ -487,6 +664,12 @@ class ListTests(TupleTests):
 
     @make_dynamo_test
     def test___setitem___slice_non_iterable(self):
+        # [FUNCTION DOC] Test decorated with make_dynamo_test, so it runs once eagerly and once
+        # compiled by dynamo. Checks the error message when assigning a non-iterable to a slice.
+        # Computes from sys.version_info whether this interpreter has the old CPython behavior
+        # (before 3.10.20, 3.11.15 and 3.12.5) which says that an iterable is needed; otherwise
+        # (and always for extended slices with a step) the message says an iterable must be
+        # assigned to an extended slice. Finally checks a valid slice assignment works.
         # ref: https://github.com/python/cpython/pull/120442 (gh-120384),
         # which fixed an array-out-of-bounds crash by moving the
         # PySequence_Fast check ahead of the step==1 branch in
