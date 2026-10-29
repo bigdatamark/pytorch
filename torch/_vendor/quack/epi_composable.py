@@ -1,4 +1,7 @@
 # Copyright (c) 2025, Tri Dao.
+# [MODULE DOC] ComposableEpiMixin: builds GEMM epilogue hook methods and the EpilogueParams dataclass from a class-level tuple of
+# EpiOp objects (_epi_ops), delegating smem sizing, smem layout, TMA atoms and per-tile device hooks to each op. Contains
+# _make_epi_params and ComposableEpiMixin. No import-time side effects beyond imports.
 """ComposableEpiMixin: composes EpiOps into epilogue hook methods.
 
 Subclasses declare _epi_ops as a class-level tuple of EpiOp instances — the
@@ -43,6 +46,9 @@ from .epi_ops import EpiContext, EpiSmemBytes, Scalar
 
 
 def _make_epi_params(epi_ops, extra_fields, bases):
+    # [FUNCTION DOC] HELPER: Create the EpilogueParams dataclass (named EpilogueParams, with the given base classes) from every op's
+    # param_fields plus extra_fields, each a (name, type, default) triple. Fields without a default (MISSING) come first, then those
+    # with defaults. Returns the new dataclass type.
     """Build EpilogueParams dataclass from epi_ops + extra fields.
 
     Required fields (default=MISSING) are placed first, then optional fields.
@@ -58,6 +64,11 @@ def _make_epi_params(epi_ops, extra_fields, bases):
 
 
 class ComposableEpiMixin:
+    # [CLASS DOC] Mixin for GEMM classes that declares the epilogue as the class-level tuple _epi_ops (with optional
+    # _extra_param_fields and _epi_param_bases for EpilogueParams). Provides host hooks (resolve_epi_m_major, epi_smem_bytes,
+    # epi_get_smem_struct, epi_get_smem_tensors, epi_get_tma_atoms), device hooks (epi_begin, epi_begin_loop, epi_tile_load_*,
+    # epi_end_loop, epi_end) that loop over ops. Per-instance _epi_ops is shadowed with only active (non-None arg) ops after
+    # _epi_ops_to_params_dict runs; consumers should use .get(name) on the returned dicts.
     """Base mixin that composes EpiOps into the standard epilogue hooks."""
 
     _epi_ops = ()
@@ -65,6 +76,8 @@ class ComposableEpiMixin:
     _epi_param_bases = (ParamsBase,)  # Base classes for the auto-generated EpilogueParams
 
     def __init_subclass__(cls, **kwargs):
+        # [FUNCTION DOC] HELPER: On subclass creation, if the subclass has non-empty _epi_ops and does not define EpilogueParams in its own
+        # class dict, auto-generate and set EpilogueParams via _make_epi_params.
         super().__init_subclass__(**kwargs)
         if cls._epi_ops:
             # Auto-generate EpilogueParams if not explicitly defined on this class
@@ -76,6 +89,8 @@ class ComposableEpiMixin:
     # --- Host-side: args → params ---
 
     def _filter_epi_ops(self, args):
+        # [FUNCTION DOC] HELPER: Set an instance attribute _epi_ops to the tuple of class-level ops whose same-named attribute on args is not
+        # None. Mutates self.
         """Shadow `_epi_ops` with an instance-level tuple of only the ops whose
         arg is non-None. Called automatically by `_epi_ops_to_params_dict`, so
         subclass `epi_to_underlying_arguments` methods don't need to invoke it
@@ -86,6 +101,8 @@ class ComposableEpiMixin:
         )
 
     def _epi_ops_to_params_dict(self, args):
+        # [FUNCTION DOC] Filter the ops to active ones (see _filter_epi_ops), then merge each active op's to_params result for args into one
+        # dict, which is returned. Subclasses add custom fields and build EpilogueParams from it. Side effect: shadows _epi_ops on self.
         """Filter `_epi_ops` to active ops, then merge each op's to_params into
         a single dict. Subclasses call this from epi_to_underlying_arguments,
         add custom fields, then construct self.EpilogueParams(**d). Filtering
@@ -99,6 +116,8 @@ class ComposableEpiMixin:
         return d
 
     def resolve_epi_m_major(self, args):
+        # [FUNCTION DOC] Decide whether the epilogue is M-major: sum each active op's epi_m_major_score (ops filtered inline from args since
+        # this runs before epi_to_underlying_arguments) and return True when the total is non-negative.
         # Runs inside _setup_attributes, before epi_to_underlying_arguments,
         # because epi_m_major drives epi_tile / smem layout choices that
         # epi_to_underlying_arguments later consumes. self._epi_ops is still
@@ -115,6 +134,8 @@ class ComposableEpiMixin:
 
     @classmethod
     def epi_smem_bytes(cls, args, cta_tile_shape_mnk, epi_tile, warp_shape_mnk=None):
+        # [FUNCTION DOC] Classmethod: total the shared-memory byte requirement of all active ops (args attribute non-None) for the given CTA
+        # tile shape, epilogue tile and optional warp shape, accumulating into an EpiSmemBytes. Used to size pipeline stages.
         # Runs inside _compute_stages, before epi_to_underlying_arguments,
         # because the AB/epi stage counts (and therefore epi_c_stage) depend
         # on the epi smem budget that this returns; epi_to_underlying_arguments
@@ -129,6 +150,8 @@ class ComposableEpiMixin:
         return result
 
     def epi_get_smem_struct(self, params):
+        # [FUNCTION DOC] Build the shared-storage struct type for the epilogue from each active op's smem_struct_field, sorted by size ascending
+        # to limit alignment padding. Returns a zero-length Int32 placeholder range when no op contributes any smem.
         fields = []
         for op in self._epi_ops:
             result = op.smem_struct_field(self, params)
@@ -144,6 +167,7 @@ class ComposableEpiMixin:
         # Sort smallest-to-largest so smaller fields pack ahead of larger
         # higher-aligned fields, reducing smem wasted to alignment padding.
         def _field_bytes(name_ftype):
+            # [FUNCTION DOC] HELPER: Sort key giving the byte size of a cute struct containing the single (name, type) field.
             wrapper = type("_F", (), {"__annotations__": {name_ftype[0]: name_ftype[1]}})
             return cute.struct(wrapper).size_in_bytes()
 
@@ -153,6 +177,7 @@ class ComposableEpiMixin:
         return cute.struct(EpiSharedStorage)
 
     def epi_get_smem_tensors(self, params, storage):
+        # [FUNCTION DOC] Return a dict mapping op name to the op's smem tensor taken from storage.epi, for all active ops except Scalar ops.
         return {
             op.name: op.get_smem_tensor(self, params, storage.epi)
             for op in self._epi_ops
@@ -160,6 +185,7 @@ class ComposableEpiMixin:
         }
 
     def epi_get_tma_atoms(self, params, *, loc=None, ip=None):
+        # [FUNCTION DOC] Return a flat list of the TMA atoms contributed by all active ops (loc and ip are unused).
         atoms = []
         for op in self._epi_ops:
             atoms.extend(op.tma_atoms(self, params))
@@ -181,6 +207,9 @@ class ComposableEpiMixin:
         tidx,
         tRS_rD_layout=None,
     ):
+        # [FUNCTION DOC] Device-side epilogue start: build an EpiContext from the tiling, copy, barrier and thread arguments, call each active
+        # op's begin, and return a dict of results keyed by op name. If any op needs an async fence, commits and waits on cp.async groups
+        # and syncs on the epilogue barrier before returning.
         ctx = EpiContext(
             self,
             epi_tile,
@@ -211,6 +240,7 @@ class ComposableEpiMixin:
         return results
 
     def epi_begin_loop(self, params, epi_tensors, epi_coord):
+        # [FUNCTION DOC] Per-subtile start: return a dict mapping op name to that op's begin_loop result for its tensors and the epi_coord.
         return {
             op.name: op.begin_loop(self, epi_tensors[op.name], epi_coord) for op in self._epi_ops
         }
@@ -223,6 +253,7 @@ class ComposableEpiMixin:
         varlen_manager,
         epi_pipeline,
     ):
+        # [FUNCTION DOC] Return a tuple of global-to-shared copy functions, one per active tile-load op (ops where is_tile_load is true).
         return tuple(
             op.load_g2s_copy_fn(
                 self,
@@ -238,6 +269,7 @@ class ComposableEpiMixin:
 
     @cute.jit
     def epi_tile_load_s2r(self, params, epi_tensors, stage_idx):
+        # [FUNCTION DOC] Device-side: for each active op, load its shared-memory data into registers for the given pipeline stage index.
         for op in self._epi_ops:
             op.load_s2r(self, getattr(params, op.name), epi_tensors[op.name], stage_idx)
 
@@ -254,6 +286,7 @@ class ComposableEpiMixin:
         varlen_manager,
         tidx,
     ):
+        # [FUNCTION DOC] Device-side: call each active op's end_loop with its params and tensors after processing a subtile. Returns nothing.
         for op in self._epi_ops:
             op.end_loop(
                 self,
@@ -280,6 +313,7 @@ class ComposableEpiMixin:
         varlen_manager,
         tidx,
     ):
+        # [FUNCTION DOC] Device-side: call each active op's end hook once all subtiles of the tile are done. Returns nothing.
         for op in self._epi_ops:
             op.end(
                 self,

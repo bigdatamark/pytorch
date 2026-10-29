@@ -1,4 +1,8 @@
 # Copyright (c) 2025-2026, QuACK team.
+# [MODULE DOC] CuTe DSL copy helpers for QuACK GEMM/epilogue kernels: register/shared/global tiled-copy builders, converting copies
+# (including stochastic rounding), ragged-tensor construction for TMA, position-independent swizzle partitioning, shared-memory
+# load/store atom and copy-function factories for operands A and C and the epilogue, plus PTX wrappers (bulk reduce-add, TMA
+# descriptor address, TMA gather, cluster/mbarrier helpers, etc.). Import-time side effects: none beyond imports and constants.
 
 from typing import Optional, Type, Tuple, Callable, Sequence
 from functools import partial
@@ -35,6 +39,8 @@ def cvt_copy(
     ip=None,
     **kwargs,
 ) -> None:
+    # [FUNCTION DOC] Copy a register tensor src to dst with a tiled copy, converting the element type first when src and dst differ and optionally
+    # retiling src to the copy's layout; forwards pred and extra kwargs to cute.copy. Asserts src lives in register memory. Returns nothing.
     assert isinstance(src.iterator, cute.Pointer) and src.memspace == cute.AddressSpace.rmem
     if const_expr(src.element_type != dst.element_type):
         src_cvt = cute.make_rmem_tensor_like(src, dst.element_type)
@@ -56,6 +62,8 @@ def sr_cvt_copy(
     loc=None,
     ip=None,
 ) -> None:
+    # [FUNCTION DOC] Like cvt_copy but converts FP32 register values to BF16 with stochastic rounding (seeded by seed and the thread index) and then
+    # copies to dst with the tiled copy. Asserts src is in register memory. Returns nothing.
     """Like cvt_copy but uses stochastic rounding for FP32 -> BF16 conversion."""
     assert isinstance(src.iterator, cute.Pointer) and src.memspace == cute.AddressSpace.rmem
     from .rounding import convert_f32_to_bf16_sr
@@ -71,6 +79,7 @@ def sr_cvt_copy(
 
 @dsl_user_op
 def load_s2r(src: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
+    # [FUNCTION DOC] Copy a (shared-memory) tensor into a freshly allocated register tensor of the same shape and type, vectorized. Returns the register tensor.
     dst = cute.make_rmem_tensor_like(src, src.element_type, loc=loc, ip=ip)
     cute.autovec_copy(src, dst, loc=loc, ip=ip)
     return dst
@@ -78,6 +87,7 @@ def load_s2r(src: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
 
 @dsl_user_op
 def contiguous(src: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
+    # [FUNCTION DOC] Copy src into a new register tensor of the same shape and element type with a vectorized copy. Returns the register tensor.
     dst = cute.make_rmem_tensor(src.shape, src.element_type, loc=loc, ip=ip)
     cute.autovec_copy(src, dst, loc=loc, ip=ip)
     return dst
@@ -92,6 +102,8 @@ def load_s2r_retile(
     loc=None,
     ip=None,
 ) -> cute.Tensor:
+    # [FUNCTION DOC] Copy src through a tiled copy into registers: allocates a register tensor of dst_shape, or uses dst_shape directly when it is a
+    # tensor, copying into its retiled view. Returns the destination register tensor.
     # Will also accept dst_shape being a tensor, in which case we write into that tensor
     if const_expr(not isinstance(dst_shape, cute.Tensor)):
         dst = cute.make_rmem_tensor(dst_shape, src.element_type, loc=loc, ip=ip)
@@ -105,6 +117,8 @@ def load_s2r_retile(
 def load_t2r(
     thr_copy: cute.ThrCopy, shape: cute.Shape, src: cute.Tensor, *, loc=None, ip=None
 ) -> cute.Tensor:
+    # [FUNCTION DOC] Copy from a tensor (e.g. tensor memory) into a new register tensor shaped like the thread's partition of an identity tensor of
+    # the given shape, using a thread copy. Returns the register tensor.
     cDst = cute.make_identity_tensor(shape)
     dst = cute.make_rmem_tensor(thr_copy.partition_D(cDst).shape, src.element_type, loc=loc, ip=ip)
     cute.copy(thr_copy, src, dst, loc=loc, ip=ip)
@@ -115,6 +129,8 @@ def load_t2r(
 def get_copy_atom(
     dtype: Type[cutlass.Numeric], num_copy_elems: int, is_async: bool = False, *, loc=None, ip=None
 ) -> cute.CopyAtom:
+    # [FUNCTION DOC] Build a copy atom for dtype: async global-to-shared (cp.async) if is_async else universal copy, with bits per copy equal to
+    # min(128, num_copy_elems * dtype width). Returns the atom.
     num_copy_bits = const_expr(min(128, num_copy_elems * dtype.width))
     copy_op = cpasync.CopyG2SOp() if is_async else cute.nvgpu.CopyUniversalOp()
     return cute.make_copy_atom(copy_op, dtype, num_bits_per_copy=num_copy_bits)
@@ -131,6 +147,8 @@ def copy(
     ip=None,
     **kwargs,
 ) -> None:
+    # [FUNCTION DOC] Copy src to dst choosing the atom from the element type and the first-mode extent of src.shape (async when is_async);
+    # forwards pred and extra kwargs. Returns nothing.
     num_copy_elems = src.shape[0][0]
     copy_atom = get_copy_atom(src.element_type, num_copy_elems, is_async)
     cute.copy(copy_atom, src, dst, pred=pred, loc=loc, ip=ip, **kwargs)
@@ -139,6 +157,8 @@ def copy(
 def tiled_copy_1d(
     dtype: Type[cutlass.Numeric], num_threads: int, num_copy_elems: int = 1, is_async: bool = False
 ) -> cute.TiledCopy:
+    # [FUNCTION DOC] Build a 1D tiled copy: one atom copying num_copy_elems elements, thread layout of num_threads, value layout of num_copy_elems.
+    # Uses async global-to-shared copy when is_async. Returns the TiledCopy.
     num_copy_bits = num_copy_elems * dtype.width
     copy_op = cpasync.CopyG2SOp() if is_async else cute.nvgpu.CopyUniversalOp()
     copy_atom = cute.make_copy_atom(copy_op, dtype, num_bits_per_copy=num_copy_bits)
@@ -154,6 +174,8 @@ def tiled_copy_2d(
     num_copy_elems: int = 1,
     is_async: bool = False,
 ) -> cute.TiledCopy:
+    # [FUNCTION DOC] Build a 2D tiled copy with threads arranged row-wise (threads_per_row per row, row-major order) and num_copy_elems values per thread
+    # along the row. Asserts num_threads is divisible by threads_per_row. Returns the TiledCopy.
     num_copy_bits = num_copy_elems * dtype.width
     copy_op = cpasync.CopyG2SOp() if is_async else cute.nvgpu.CopyUniversalOp()
     copy_atom = cute.make_copy_atom(copy_op, dtype, num_bits_per_copy=num_copy_bits)
@@ -168,6 +190,8 @@ def tiled_copy_2d(
 
 @cute.jit
 def predicate_k(tAcA: cute.Tensor, limit: Int32) -> cute.Tensor:
+    # [FUNCTION DOC] Build a register boolean predicate tensor over the k dimension only: entry for each value and k index is true when the k
+    # coordinate from the coordinate tensor tAcA is less than limit. Returns the predicate tensor (mn dimension is handled by the caller).
     # Only compute predicates for the "k" dimension. For the mn dimension, we will use "if"
     tApA = cute.make_rmem_tensor(
         cute.make_layout(
@@ -249,6 +273,9 @@ def create_ragged_tensor_for_tma(
     loc=None,
     ip=None,
 ) -> cute.Tensor:
+    # [FUNCTION DOC] Turn tensor T into a higher-rank tensor whose ragged_dim has size BIG_INT so TMA bounds checking can enforce per-sequence lengths.
+    # With ptr_shift, adds one dimension and shifts the pointer back (rank <= 4 asserted); otherwise adds two wraparound dimensions with
+    # adjusted strides and no pointer shift (rank <= 3 asserted). Negative ragged_dim counts from the end. Returns the new tensor.
     rank = cute.rank(T)
     if ragged_dim < 0:
         ragged_dim += rank
@@ -285,6 +312,8 @@ def offset_ragged_tensor(
     loc=None,
     ip=None,
 ) -> cute.Tensor:
+    # [FUNCTION DOC] Select the sequence at (offset, length) from a tensor made by create_ragged_tensor_for_tma: computes the ragged-dim coordinate
+    # (big size minus length) and the extra-dimension index, returning an offset view of T. Asserts the rank matches the ptr_shift mode.
     rank = cute.rank(T)
     if ragged_dim < 0:
         ragged_dim += rank
@@ -304,18 +333,22 @@ def offset_ragged_tensor(
 
 
 def swizzle_int(ptr_int: Int32, b: int, m: int, s: int) -> Int32:
+    # [FUNCTION DOC] Apply a swizzle (b bits, base m, shift s) to an integer address: xor the address with the masked bits shifted right by s. Returns the result.
     bit_msk = (1 << b) - 1
     yyy_msk = bit_msk << (m + s)
     return ptr_int ^ ((ptr_int & yyy_msk) >> s)
 
 
 def swizzle_ptr(ptr: cute.Pointer):
+    # [FUNCTION DOC] Return a new pointer whose address is the swizzled integer address, using the swizzle parameters from the pointer type.
     swz = ptr.type.swizzle_type
     ptr_int = swizzle_int(ptr.toint(), swz.num_bits, swz.num_base, swz.num_shift)
     return cute.make_ptr(ptr.dtype, ptr_int, ptr.memspace, assumed_align=ptr.alignment)
 
 
 def as_position_independent_swizzle_tensor(tensor: cute.Tensor) -> cute.Tensor:
+    # [FUNCTION DOC] Rewrite a swizzled shared-memory tensor so the swizzle lives in an explicit layout (recast from byte to element units) over a
+    # non-swizzled pointer. Returns the new tensor.
     outer = tensor.layout
     width = tensor.element_type.width
     swizzle_type = tensor.iterator.type.swizzle_type
@@ -330,6 +363,8 @@ def as_position_independent_swizzle_tensor(tensor: cute.Tensor) -> cute.Tensor:
 
 
 def partition_D_position_independent(thr_copy: cute.ThrCopy, tensor: cute.Tensor) -> cute.Tensor:
+    # [FUNCTION DOC] Partition tensor for destination with a thread copy, applying the swizzle to the pointer and using the position-independent layout.
+    # Returns the partitioned tensor.
     return cute.make_tensor(
         swizzle_ptr(thr_copy.partition_D(tensor).iterator),
         thr_copy.partition_D(as_position_independent_swizzle_tensor(tensor)).layout,
@@ -337,6 +372,7 @@ def partition_D_position_independent(thr_copy: cute.ThrCopy, tensor: cute.Tensor
 
 
 def partition_S_position_independent(thr_copy: cute.ThrCopy, tensor: cute.Tensor) -> cute.Tensor:
+    # [FUNCTION DOC] Same as partition_D_position_independent but for source partitioning.
     return cute.make_tensor(
         swizzle_ptr(thr_copy.partition_S(tensor).iterator),
         thr_copy.partition_S(as_position_independent_swizzle_tensor(tensor)).layout,
@@ -351,6 +387,8 @@ def sm90_get_smem_load_op(
     loc=None,
     ip=None,
 ) -> cute.CopyAtom:
+    # [FUNCTION DOC] Choose the smem load copy atom for an SM90-style epilogue: for 16-bit elements an ldmatrix atom (transposed when the layout is
+    # M-major), otherwise a universal copy. Raises TypeError if elem_ty_c is not a Numeric type. Returns the atom.
     """
     Selects the largest vectorized smem load atom available subject to constraint of gmem layout.
 
@@ -381,6 +419,8 @@ def get_smem_store_atom(
     transpose: bool = False,
     major_mode_size: Optional[int] = None,
 ) -> cute.CopyAtom:
+    # [FUNCTION DOC] Choose the smem store atom: universal copy before SM90 or for non-16-bit types, else stmatrix with 4, 2 or 1 matrices depending on
+    # major_mode_size divisibility. Reads the active DSL arch. Returns the atom.
     arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
     if const_expr(arch < Arch.sm_90 or element_type.width != 16):
         return cute.make_copy_atom(
@@ -405,6 +445,8 @@ def get_smem_load_atom(
     transpose: bool = False,
     major_mode_size: Optional[int] = None,
 ) -> cute.CopyAtom:
+    # [FUNCTION DOC] Choose the smem load atom: universal copy before SM90 or for non-16-bit types, else ldmatrix with 4, 2 or 1 matrices depending on
+    # major_mode_size divisibility. Reads the active DSL arch. Returns the atom.
     arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
     if const_expr(arch < Arch.sm_90 or element_type.width != 16):
         return cute.make_copy_atom(
@@ -432,6 +474,9 @@ def get_smem_store_C(
     position_independent=False,
     major_mode_size: Optional[int] = None,
 ) -> Tuple[Callable, cute.TiledCopy, cute.Tensor]:
+    # [FUNCTION DOC] Prepare register-to-smem stores of the C tile: builds the store atom and tiled copy for tiled_mma, partitions sC for thread tidx
+    # (optionally position independent). Returns (copy function, thread copy, partitioned sC); the copy function converts, retiles and
+    # writes to the whole partition or a given pipeline stage.
     dtype = sC.element_type
     copy_atom = get_smem_store_atom(dtype, transpose, major_mode_size=major_mode_size)
     tiled_copy = cute.make_tiled_copy_C(copy_atom, tiled_mma)
@@ -442,6 +487,7 @@ def get_smem_store_C(
         tRS_sC = partition_D_position_independent(thr_copy, sC)
 
     def copy_fn(src: cute.Tensor, dst_idx: Optional[Int32] = None, **new_kwargs):
+        # [FUNCTION DOC] HELPER: Copy src into the partitioned smem tensor, selecting stage dst_idx when given; forwards extra kwargs.
         dst_tensor = tRS_sC if const_expr(dst_idx is None) else tRS_sC[None, None, None, dst_idx]
         cvt_copy(tiled_copy, src, dst_tensor, retile=True, **new_kwargs)
 
@@ -455,6 +501,8 @@ def get_smem_load_C(
     transpose: bool = False,
     position_independent=False,
 ) -> Tuple[Callable, cute.TiledCopy, cute.Tensor]:
+    # [FUNCTION DOC] Prepare smem-to-register loads of the C tile with a load atom and the tiled MMA's C layout. Returns (copy function, thread copy,
+    # partitioned sC); the copy function loads a given stage (or all) into a register tensor of the retiled shape.
     dtype = sC.element_type
     copy_atom = get_smem_load_atom(dtype, transpose)
     tiled_copy = cute.make_tiled_copy_C(copy_atom, tiled_mma)
@@ -468,6 +516,7 @@ def get_smem_load_C(
     tRS_shape = thr_copy_RS.partition_S(cute.make_identity_tensor(sC.shape[:2])).shape
 
     def copy_fn(src_idx: Optional[Int32] = None, **new_kwargs):
+        # [FUNCTION DOC] HELPER: Load from the partitioned smem tensor (stage src_idx when given) into registers; returns the register tensor.
         src_tensor = tSR_sC if const_expr(src_idx is None) else tSR_sC[None, None, None, src_idx]
         return load_s2r_retile(tiled_copy, src_tensor, dst_shape=tRS_shape, **new_kwargs)
 
@@ -477,6 +526,8 @@ def get_smem_load_C(
 def epilog_smem_copy_atom(
     tiled_mma: cute.TiledMma, epi_tile: cute.Shape, transpose: bool = False
 ) -> cute.TiledCopy:
+    # [FUNCTION DOC] Build the C-layout tiled-copy atom for the epilogue: universal Float16 copy before SM90, otherwise stmatrix (4 matrices if the
+    # second epi_tile extent is divisible by 16, else 2). Returns the tiled copy atom.
     arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
     if const_expr(arch < Arch.sm_90):
         copy_atom_C = cute.make_copy_atom(
@@ -501,6 +552,9 @@ def get_smem_store_epi(
     transpose: bool = False,
     position_independent=False,
 ) -> Tuple[Callable, cute.TiledCopy, cute.Tensor, cute.Tensor]:
+    # [FUNCTION DOC] Prepare epilogue register-to-smem stores: builds the tiled copy from the atom and epilogue tile, partitions sC when present
+    # (optionally position independent), and allocates the accumulator-typed register tensor. Returns (copy function or None when sC is
+    # None, thread copy, partitioned sC, register tensor).
     dtype = sC.element_type if const_expr(sC is not None) else cutlass.Float16
     copy_atom = get_smem_store_atom(dtype, transpose)
     tiled_copy_C_atom = epilog_smem_copy_atom(tiled_mma, epi_tile)
@@ -518,6 +572,7 @@ def get_smem_store_epi(
     tRS_rC = cute.make_rmem_tensor(tRS_rC_shape, tiled_mma.op.acc_dtype)
 
     def copy_fn(src: cute.Tensor, dst_idx: Int32, **new_kwargs):
+        # [FUNCTION DOC] HELPER: Convert and copy src to the smem partition at pipeline stage dst_idx.
         cvt_copy(tiled_copy, src, tRS_sC[None, None, None, dst_idx], **new_kwargs)
 
     return copy_fn if const_expr(sC is not None) else None, thr_copy, tRS_sC, tRS_rC
@@ -526,6 +581,8 @@ def get_smem_store_epi(
 def get_smem_store_A(
     tiled_mma: cute.TiledMma, sA: cute.Tensor, tidx: Int32, position_independent=False
 ) -> Tuple[Callable, cute.TiledCopy, cute.Tensor]:
+    # [FUNCTION DOC] Prepare register-to-smem stores of operand A (transposed when A is MN-major). Returns (copy function taking src and a stage index,
+    # thread copy, partitioned sA).
     dtype = sA.element_type
     transpose = tiled_mma.op.a_major_mode == cute.nvgpu.OperandMajorMode.MN
     copy_atom = get_smem_store_atom(dtype, transpose)
@@ -537,6 +594,7 @@ def get_smem_store_A(
         tRS_sA = partition_D_position_independent(thr_copy, sA)
 
     def copy_fn(src: cute.Tensor, dst_idx: Int32, **new_kwargs):
+        # [FUNCTION DOC] HELPER: Convert, retile and copy src into the smem A partition at stage dst_idx.
         cvt_copy(tiled_copy, src, tRS_sA[None, None, None, dst_idx], retile=True, **new_kwargs)
 
     return copy_fn, thr_copy, tRS_sA
@@ -549,6 +607,8 @@ def get_smem_load_A(
     with_dst_tensor: bool = False,
     position_independent=False,
 ) -> Tuple[Callable, cute.TiledCopy, cute.Tensor]:
+    # [FUNCTION DOC] Prepare smem-to-register loads of operand A. Returns (copy function, thread copy, partitioned sA); the copy function takes a stage
+    # index and, if with_dst_tensor is set, a destination tensor to fill instead of allocating registers.
     dtype = sA.element_type
     transpose = tiled_mma.op.a_major_mode == cute.nvgpu.OperandMajorMode.MN
     copy_atom = get_smem_load_atom(dtype, transpose)
@@ -561,11 +621,13 @@ def get_smem_load_A(
     tRS_shape = tiled_mma.partition_shape_A(sA.shape[:2])
 
     def copy_fn(src_idx: Int32, **new_kwargs):
+        # [FUNCTION DOC] HELPER: Load stage src_idx of the A partition into a new register tensor of the MMA partition shape.
         return load_s2r_retile(
             tiled_copy, tSR_sA[None, None, None, src_idx], dst_shape=tRS_shape, **new_kwargs
         )
 
     def copy_fn_w_dst_tensor(src_idx: Int32, dst: cute.Tensor, **new_kwargs):
+        # [FUNCTION DOC] HELPER: Load stage src_idx of the A partition into the provided destination tensor.
         return load_s2r_retile(tiled_copy, tSR_sA[None, None, None, src_idx], dst, **new_kwargs)
 
     return copy_fn if not with_dst_tensor else copy_fn_w_dst_tensor, thr_copy, tSR_sA
@@ -580,6 +642,8 @@ def cpasync_reduce_bulk_add_f32(
     loc=None,
     ip=None,
 ):
+    # [FUNCTION DOC] Issue the PTX bulk asynchronous reduce-add of store_bytes bytes of FP32 from shared memory into global memory (bulk group).
+    # Side effects: memory write via inline assembly. Returns nothing.
     smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip).ir_value()
     # cache_hint = cutlass.Int64(0x14F0000000000000)  # EVICT_LAST
     llvm.inline_asm(
@@ -597,6 +661,7 @@ def cpasync_reduce_bulk_add_f32(
 
 @dsl_user_op
 def get_tma_desc_addr(tma_atom: cute.CopyAtom, *, loc=None, ip=None) -> cute.Pointer:
+    # [FUNCTION DOC] Return a pointer to the TMA descriptor embedded in a TMA copy atom (generic address, 128-byte aligned) for use with custom PTX.
     """
     Get the address of the TMA descriptor embedded in a TMA Copy Atom.
 
@@ -629,6 +694,9 @@ def tma_gather4_load(
     loc=None,
     ip=None,
 ) -> None:
+    # [FUNCTION DOC] Issue the Blackwell TMA gather4 load of four rows (row_indices) at column col_idx from a 2D tensor into shared memory, completing on
+    # the mbarrier; with num_cta above 1 the barrier address peer bit is cleared so CTA0's barrier is updated. Raises ValueError unless exactly 4
+    # row indices are given; asserts multicast is unsupported (multicast_mask must be None). Emits inline PTX with side effects. Returns nothing.
     """
     Perform TMA gather4 load from global memory to shared memory.
 
@@ -733,6 +801,8 @@ def cpasync_bulk_get_copy_fn(
     single_stage: bool = False,
     **kwargs,
 ) -> Callable:
+    # [FUNCTION DOC] Return a function that copies bulk (non-tensor-map) global to shared data using the bulk async copy atom, with the stage mode grouped
+    # unless single_stage. The returned function takes (src_idx, dst_idx, tma_bar_ptr) or just tma_bar_ptr when single_stage, and runs the copy from one elected thread.
     group_rank_src = const_expr(cute.rank(src_tensor) - (1 if not single_stage else 0))
     group_rank_dst = const_expr(cute.rank(dst_tensor) - (1 if not single_stage else 0))
     # ((atom_v, rest_v), STAGE), ((atom_v, rest_v), RestK)
@@ -740,6 +810,7 @@ def cpasync_bulk_get_copy_fn(
     dst = cute.group_modes(dst_tensor, 0, group_rank_dst)
 
     def copy_bulk(src_idx, dst_idx, tma_bar_ptr: cute.Pointer, **new_kwargs):
+        # [FUNCTION DOC] HELPER: Bulk-copy one stage slice of src to dst completing on the barrier; executed by one elected thread.
         atom = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), src.element_type)
         with cute.arch.elect_one():
             cute.copy(
@@ -752,6 +823,7 @@ def cpasync_bulk_get_copy_fn(
             )
 
     def copy_bulk_single_stage(tma_bar_ptr: cute.Pointer, **new_kwargs):
+        # [FUNCTION DOC] HELPER: Bulk-copy the whole single-stage src to dst completing on the barrier; executed by one elected thread.
         atom = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), src.element_type)
         with cute.arch.elect_one():
             cute.copy(atom, src, dst, mbar_ptr=tma_bar_ptr, **new_kwargs, **kwargs)
@@ -773,6 +845,9 @@ def tma_get_copy_fn(
     ip=None,
     **kwargs,
 ) -> Callable:
+    # [FUNCTION DOC] Partition smem and gmem tensors for a TMA atom (direction decided by whether src is smem), optionally dropping zero-stride modes.
+    # Returns (copy function, smem partition, gmem partition); the copy function takes (src_idx, dst_idx) or no index when single_stage and
+    # forwards extra kwargs to cute.copy.
     src_is_smem = const_expr(
         isinstance(src_tensor.iterator, cute.Pointer)
         and src_tensor.memspace == cute.AddressSpace.smem
@@ -797,12 +872,14 @@ def tma_get_copy_fn(
 
     @dsl_user_op
     def copy_tma(src_idx, dst_idx, *, loc=None, ip=None, **new_kwargs):
+        # [FUNCTION DOC] HELPER: Issue the TMA copy of stage slices src_idx to dst_idx.
         cute.copy(
             atom, src[None, src_idx], dst[None, dst_idx], **new_kwargs, **kwargs, loc=loc, ip=ip
         )
 
     @dsl_user_op
     def copy_tma_single_stage(*, loc=None, ip=None, **new_kwargs):
+        # [FUNCTION DOC] HELPER: Issue the TMA copy of the whole single-stage tensors.
         cute.copy(atom, src, dst, **new_kwargs, **kwargs, loc=loc, ip=ip)
 
     return (copy_tma if const_expr(not single_stage) else copy_tma_single_stage), s, g
@@ -813,6 +890,8 @@ def s2t_get_copy_fn(
     dst_tensor: cute.Tensor,
     cta_group: tcgen05.CtaGroup,
 ) -> Callable:
+    # [FUNCTION DOC] Build a shared-memory to tensor-memory copy (tcgen05 Cp4x32x128b atom) for the given CTA group. Asserts equal element types.
+    # Returns a function copy_s2t(stage_idx) that copies one stage of the smem-descriptor source to the tmem destination.
     """
     Make tiledCopy for smem to tmem load, then return a copy function over stages.
 
@@ -835,6 +914,7 @@ def s2t_get_copy_fn(
 
     @dsl_user_op
     def copy_s2t(stage_idx, *, loc=None, ip=None, **new_kwargs):
+        # [FUNCTION DOC] HELPER: Copy the stage_idx slice of the partitioned smem source into tmem.
         # Stage slice of partitioned source tensor: ((ATOM_V, REST_V), Rest_Tiler, MMA_MN, MMA_K)
         stage_coord = (None, None, None, None, stage_idx)
         cute.copy(
@@ -845,7 +925,10 @@ def s2t_get_copy_fn(
 
 
 def tma_producer_copy_fn(copy: Callable, pipeline: cutlass.pipeline.PipelineAsync):
+    # [FUNCTION DOC] Wrap a copy function for use by a producer: returns a function taking a source index and pipeline producer state that calls the
+    # copy with the state's index as destination and the pipeline's producer barrier pointer.
     def copy_fn(src_idx, producer_state: cutlass.pipeline.PipelineState, **new_kwargs):
+        # [FUNCTION DOC] HELPER: Call the wrapped copy using producer_state.index and the pipeline barrier for that state.
         copy(
             src_idx=src_idx,
             dst_idx=producer_state.index,
@@ -857,10 +940,13 @@ def tma_producer_copy_fn(copy: Callable, pipeline: cutlass.pipeline.PipelineAsyn
 
 
 def chain_tma_producer_copy_fns(copy_fns: Sequence[Optional[Callable]]):
+    # [FUNCTION DOC] Combine several optional producer copy functions into one that calls each non-None function in order with the same arguments.
+    # Returns None if all entries are None.
     if not any(fn is not None for fn in copy_fns):
         return None
 
     def copy_fn(src_idx, producer_state: cutlass.pipeline.PipelineState, **new_kwargs):
+        # [FUNCTION DOC] HELPER: Call each non-None chained copy function.
         for fn in copy_fns:
             if const_expr(fn is not None):
                 fn(src_idx=src_idx, producer_state=producer_state, **new_kwargs)
@@ -877,6 +963,9 @@ def gather_m_get_copy_fn(
     limit_m: Int32,
     limit_k: Int32,
 ) -> Callable:
+    # [FUNCTION DOC] Build a cp.async copy function for A when M rows are gathered through an index tensor (A is k-major). Pre-reads the row index for each
+    # row this thread loads (using zero for out-of-bound rows) and row predicates from limit_m and limit_k. Returns copy_fn(src_idx, dst_idx,
+    # pred) that copies the gathered rows of one K tile into smem stage dst_idx, optionally predicating on K. Asserts a single load per row.
     tile_M, tile_K = cute.size(sA, mode=[0]), cute.size(sA, mode=[1])
     tAsA = partition_D_position_independent(thr_copy_A, sA)
     # k-major
@@ -912,6 +1001,7 @@ def gather_m_get_copy_fn(
     mA_k = cute.logical_divide(mA, (None, tile_K))
 
     def copy_fn(src_idx, dst_idx, pred: cutlass.Constexpr[bool] = False):
+        # [FUNCTION DOC] HELPER: Copy the K tile src_idx of the gathered rows into smem stage dst_idx, with K predication when pred is set.
         tApA_k = None
         if const_expr(pred):
             tApA_k = cute.make_rmem_tensor(cols_per_thread, Boolean)
@@ -945,6 +1035,9 @@ def gather_k_get_copy_fn(
     limit_m: Int32,
     limit_k: Int32,
 ) -> Callable:
+    # [FUNCTION DOC] Build cp.async copy machinery for A when K columns are gathered through an index tensor in gmem or smem (m-major A). Returns
+    # (copy_fn, prefetch function): the prefetch function (gmem or smem variant) reads the K indices of a tile ahead of time; copy_fn copies the
+    # gathered columns using those indices into smem stage dst_idx. Asserts the index tensor is in gmem or smem.
     gAIdx, sAIdx = None, None
     if const_expr(gsAIdx.memspace == cute.AddressSpace.gmem):
         gAIdx = gsAIdx
@@ -985,6 +1078,7 @@ def gather_k_get_copy_fn(
     )[None, (tidx % threads_per_col, None), None]  # ((8, 1), 2, K)
 
     def prefetch_from_gmem_fn(src_idx, pred: bool = False) -> Tuple[cute.Tensor, cute.Tensor]:
+        # [FUNCTION DOC] HELPER: Read the K indices of tile src_idx from global memory, marking out-of-bound ones with -1 when pred. Returns (index tensor, K predicate).
         # Prefetch mAIdx early, even before smem is free
         tApA_k = None
         if const_expr(pred):
@@ -1008,6 +1102,7 @@ def gather_k_get_copy_fn(
     def prefetch_from_smem_fn(
         a_prefetch_pipeline, src_idx, dst_idx, a_prefetch_consumer_state, pred: bool = False
     ) -> Tuple[cute.Tensor, cute.Tensor]:
+        # [FUNCTION DOC] HELPER: Wait on the prefetch pipeline, read the K indices of stage dst_idx from smem, release the pipeline, and return (index tensor, K predicate).
         tApA_k = None
         if const_expr(pred):
             tApA_k = cute.make_rmem_tensor(cols_per_thread, Boolean)
@@ -1028,6 +1123,7 @@ def gather_k_get_copy_fn(
     def copy_fn(
         src_idx, dst_idx, k_idx_tApA_k: Tuple[cute.Tensor, cute.Tensor], pred: bool = False
     ):
+        # [FUNCTION DOC] HELPER: Copy the gathered columns identified by k_idx into smem stage dst_idx, skipping rows outside limit_m and optionally predicating on K.
         k_idx, tApA_k = k_idx_tApA_k
         tApA_k_pred = None
         if const_expr(pred):
@@ -1058,6 +1154,8 @@ def gather_m_get_tma_copy_fn(
     num_warps: int,
     num_cta: int = 1,
 ) -> Callable:
+    # [FUNCTION DOC] Build a TMA gather4 copy function for gathered M rows: loads row indices from smem into registers per warp, then each elected thread issues
+    # gather4 loads of four rows at a time. Asserts tile_M is a multiple of 4. Returns copy_fn(src_idx, dst_idx, tma_bar_ptr).
     tile_M = cute.size(sAIdx, mode=[0])
     tile_K = cute.size(sA[None, None, 0]) // tile_M
     assert tile_M % 4 == 0
@@ -1078,6 +1176,7 @@ def gather_m_get_tma_copy_fn(
     tma_gather4_load_fn = partial(tma_gather4_load, tma_desc_ptr, num_cta=cta_group)
 
     def copy_fn(src_idx, dst_idx, tma_bar_ptr: cute.Pointer):
+        # [FUNCTION DOC] HELPER: Issue gather4 loads for K tile src_idx into smem stage dst_idx, signalling the given mbarrier.
         tSR_sA_cur = tSR_sA[None, None, None, dst_idx]
         col_idx = tile_K * src_idx
         for m in cutlass.range(cute.size(tSR_rAIdx, mode=[1]), unroll_full=True):
@@ -1099,6 +1198,9 @@ def gather_k_get_tma_copy_fn(
     num_warps: int,
     num_cta: int = 1,
 ) -> Tuple[Callable, Callable]:
+    # [FUNCTION DOC] Build TMA gather4 machinery for gathering K columns (M-major A). Asserts tile K is a multiple of 4. Returns (copy_fn, prefetch function): the
+    # prefetch waits on the index pipeline, loads the 4-wide K indices from smem to registers and releases the pipeline; copy_fn issues gather4
+    # loads with those indices as rows and col_idx (plus M offsets) as the column.
     """Build a copy function for TMA gather4 in K dimension (M-major A).
 
     Each gather4 instruction loads 4 K-columns × tile_M contiguous M-elements.
@@ -1132,6 +1234,7 @@ def gather_k_get_tma_copy_fn(
         dst_idx,
         a_prefetch_consumer_state,
     ) -> cute.Tensor:
+        # [FUNCTION DOC] HELPER: Wait for the index pipeline, load the K indices of stage dst_idx into registers, release the pipeline, and return them.
         a_prefetch_pipeline.consumer_wait(a_prefetch_consumer_state)
         tSR_rAIdx = load_s2r(tSR_sAIdx[None, None, dst_idx])
         cute.arch.sync_warp()
@@ -1140,6 +1243,7 @@ def gather_k_get_tma_copy_fn(
         return tSR_rAIdx
 
     def copy_fn(src_idx, dst_idx, tSR_rAIdx, tma_bar_ptr: cute.Pointer):
+        # [FUNCTION DOC] HELPER: Issue gather4 loads for each group of four K indices and each M chunk into smem stage dst_idx using the given barrier.
         # Issue gather4: col_idx = M position, row_indices = 4 K positions
         tSR_sA_cur = tSR_sA[None, None, None, dst_idx]
         gather_dim = cute.size(tSR_sA_cur, mode=[2, 0])  # Typically 64
@@ -1171,6 +1275,8 @@ def store(
     loc=None,
     ip=None,
 ):
+    # [FUNCTION DOC] Store one scalar value through the pointer with cute.arch.store, optionally unconditional (pred None) or skipped when pred is false,
+    # with cache operator cop. Side effect: memory write. Returns nothing.
     """Store a scalar value via cute.arch.store.
 
     ptr:  cute.Pointer (any address space).
@@ -1197,6 +1303,8 @@ def store_v2(
     loc=None,
     ip=None,
 ):
+    # [FUNCTION DOC] Pack v0 and v1 into a 2-element vector and store it through the pointer (must be aligned for the vector width), optionally predicated,
+    # with cache operator cop. Side effect: memory write. Returns nothing.
     """Vectorized store of 2 elements via cute.arch.store.
 
     Packs v0, v1 into an MLIR <2 x T> vector.
@@ -1225,6 +1333,8 @@ def store_v4(
     loc=None,
     ip=None,
 ):
+    # [FUNCTION DOC] Pack v0..v3 into a 4-element vector and store it through the pointer (must be aligned for the vector width), optionally predicated,
+    # with cache operator cop. Side effect: memory write. Returns nothing.
     """Vectorized store of 4 elements via cute.arch.store.
 
     Packs v0–v3 into an MLIR <4 x T> vector.

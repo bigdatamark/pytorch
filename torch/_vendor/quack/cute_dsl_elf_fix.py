@@ -14,12 +14,18 @@
 #
 # Drop this file once the upstream PR lands in the CuTeDSL release quack pins.
 
+# [MODULE DOC] Monkey patch (upstream NVIDIA/cutlass#3161 workaround) for CuTeDSL object files with duplicate .text ELF
+# sections of conflicting flags. Contains _fix_elf_dup_text_flags (rewrites flags of the extra .text sections) and patch()
+# (replaces ExternalBinaryModule.__init__ so such objects load via JitLink). The patch is installed only when patch() is called.
 import struct
 
 _PATCHED = False
 
 
 def _fix_elf_dup_text_flags(data: bytes) -> bytes:
+    # [FUNCTION DOC] HELPER: Take raw bytes of an ELF64 little-endian object file; find every section named .text and set the flags
+    # of all but the first to ALLOC|EXECINSTR. Returns new bytes, or the input unchanged for non-ELF64-LE data, a missing/invalid
+    # section table, or when at most one .text section exists. Does not mutate the input.
     if len(data) < 64 or data[4] != 2 or data[5] != 1:  # ELF64 LE only
         return data
     e_shoff = struct.unpack_from("<Q", data, 40)[0]
@@ -46,6 +52,9 @@ def _fix_elf_dup_text_flags(data: bytes) -> bytes:
 
 
 def patch() -> None:
+    # [FUNCTION DOC] Install the workaround by replacing ExternalBinaryModule.__init__ (keeping the original on __wrapped__).
+    # Idempotent via a module flag; silently does nothing if the cutlass DSL modules cannot be imported. Side effect: mutates a
+    # class in the cutlass package globally.
     """Install the ELF duplicate-.text flags workaround. Idempotent."""
     global _PATCHED
     if _PATCHED:
@@ -60,6 +69,10 @@ def patch() -> None:
     orig_init = cls.__init__
 
     def patched_init(self, file_path: str, enable_tvm_ffi: bool = False) -> None:
+        # [FUNCTION DOC] HELPER: Replacement __init__ for ExternalBinaryModule. Collects shared libs from the load provider, reads the
+        # object file (or adds a .so path to the shared libs), and when not using tvm-ffi uses JitLink; when tvm-ffi is enabled and an
+        # object file was read, fixes duplicate .text flags and forces JitLink. Builds self.engine. Raises DSLRuntimeError if the
+        # file cannot be read; asserts a load provider exists.
         # Mirror of upstream __init__ (cutlass.base_dsl.export.external_binary_module)
         # with the PR #3161 fix inserted between useJitLink selection and
         # engine construction.
