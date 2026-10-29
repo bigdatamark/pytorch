@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [PACKAGE DOC] Public entry point of torch.distributed. Reports availability of the
+# distributed build, initializes the c10d C++ bindings at import time (raises RuntimeError
+# on failure), and exposes the error classes (DistError and subclasses), the c10d
+# primitives (stores, ProcessGroup, Reducer, comm hooks, debug level), DeviceMesh,
+# init_device_mesh, rendezvous helpers and everything from distributed_c10d.
+# When the build lacks distributed support only stub ProcessGroup/GroupName are installed.
+# Import-time side effects: sets the debug level from the environment.
 import contextlib
 import logging
 import sys
@@ -16,6 +23,8 @@ log = logging.getLogger(__name__)
 
 
 def is_available() -> bool:
+    # [FUNCTION DOC] Returns True if this PyTorch build has the c10d distributed bindings
+    # (detected by the presence of the _c10d_init attribute on torch._C). No side effects.
     """
     Return ``True`` if the distributed package is available.
 
@@ -33,6 +42,8 @@ _spmd_types_available: bool | None = None
 
 
 def _is_spmd_types_available() -> bool:
+    # [FUNCTION DOC] HELPER: Returns whether the optional spmd_types package can be found.
+    # The result is cached in the module-level _spmd_types_available on first call.
     """Check if the spmd_types package is installed."""
     import importlib.util
 
@@ -43,6 +54,8 @@ def _is_spmd_types_available() -> bool:
 
 
 def _spmd_no_typecheck():
+    # [FUNCTION DOC] HELPER: Returns a context manager that disables spmd_types type
+    # checking when spmd_types is installed, otherwise a do-nothing context manager.
     """
     Return a spmd_types no_typecheck context, or a no-op if not installed.
     """
@@ -53,6 +66,7 @@ def _spmd_no_typecheck():
 
     @contextlib.contextmanager
     def no_typecheck():
+        # [FUNCTION DOC] HELPER: Fallback context manager that does nothing.
         yield
 
     return no_typecheck()
@@ -96,6 +110,9 @@ if is_available():
     )
 
     def _make_distributed_pdb():
+        # [FUNCTION DOC] HELPER: Builds a debugger instance usable inside multiprocessing
+        # children. Its interaction step temporarily replaces stdin with the terminal
+        # device file and restores the original stdin afterwards. pdb is imported lazily.
         """
         Supports using PDB from inside a multiprocessing child process.
 
@@ -107,7 +124,11 @@ if is_available():
         import pdb
 
         class _DistributedPdb(pdb.Pdb):
+            # [CLASS DOC] HELPER: Pdb subclass that reads debugger input from the
+            # terminal device instead of the (possibly redirected) process stdin.
             def interaction(self, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: Runs the normal pdb interaction with stdin
+                # swapped to the terminal device; always restores the previous stdin.
                 _stdin = sys.stdin
                 try:
                     with open("/dev/stdin") as sys.stdin:
@@ -120,6 +141,14 @@ if is_available():
     _breakpoint_cache: dict[int, typing.Any] = {}
 
     def breakpoint(rank: int = 0, skip: int = 0, timeout_s=3600):
+        # [FUNCTION DOC] Opens a debugger on one rank while the other ranks wait at a barrier.
+        # Args: rank is the rank that stops; skip ignores that many earlier hits (counted per
+        # call-site key derived from the current exception traceback text, which is a weak
+        # key); timeout_s, if not None, sets every known process group's timeout to that many
+        # seconds so the debug session is not interrupted. Returns early when skipping.
+        # Side effects: mutates the module-level breakpoint counter cache, changes group
+        # timeouts, and runs a barrier with meta-dispatch TLS and Python dispatch disabled,
+        # restoring the TLS state afterwards.
         """
         Set a breakpoint, but only on a single rank.  All other ranks will wait for you to be
         done with the breakpoint before continuing.
@@ -203,6 +232,8 @@ else:
     # We cannot define stubs directly because they confuse pyre
 
     class _Stub:
+        # [CLASS DOC] HELPER: Empty placeholder type standing in for ProcessGroup and
+        # GroupName when distributed support is not built.
         pass
 
     sys.modules["torch.distributed"].GroupName = _Stub  # type: ignore[attr-defined]

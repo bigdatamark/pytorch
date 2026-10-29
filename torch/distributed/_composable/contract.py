@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Implements the contract decorator for composable distributed APIs: it stores
+# per-module state and a registry of applied APIs in module attribute dicts under random
+# unique keys, enforces single application per module, and verifies FQNs are unchanged.
+# Import-time side effect: generates the random STATE_KEY and REGISTRY_KEY.
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable
@@ -17,6 +21,8 @@ _P = ParamSpec("_P")
 
 
 def generate_state_key(string="__composable_api_state_key"):
+    # [FUNCTION DOC] Returns the given prefix joined with a fresh random UUID text, giving a
+    # unique attribute key.
     return f"{string}_{str(uuid.uuid4())}"
 
 
@@ -29,6 +35,8 @@ REGISTRY_KEY = generate_state_key()
 # is combined with reentrant activation checkpointing and error out with a clear
 # message.
 class RegistryItem:
+    # [CLASS DOC] Empty marker object recorded in a module's registry per applied composable
+    # API (one instance shared by all modules passed in one call); room for future shared info.
     pass
 
 
@@ -37,6 +45,8 @@ _M = TypeVar("_M", nn.Module, list[nn.Module])
 
 
 class _ContractFn(Protocol, Generic[_P, _T, _TState]):
+    # [CLASS DOC] HELPER: Typing protocol for a function decorated by contract: callable like
+    # the original and exposing a state method that returns its per-module state object.
     def __call__(self, *args: _P.args, **kwargs: _P.kwargs) -> _T: ...
 
     def state(self, module: nn.Module) -> _TState: ...
@@ -48,6 +58,15 @@ def contract(
     [Callable[Concatenate[_M, _P], _M]],
     _ContractFn[Concatenate[_M, _P], _M, _TState],
 ]:
+    # [FUNCTION DOC] Decorator factory taking a state class (default _State) and returning a
+    # decorator. The decorated function becomes a wrapper that, per call, collects the input
+    # module(s) (root modules only when a sequence is given), creates one shared state and
+    # registry item, records them in each module's attribute dict, runs the function, then
+    # checks that parameter, buffer and module FQNs (and their order) are unchanged.
+    # Wrapper raises AssertionError if the API was already applied to a module, if stored
+    # dicts are corrupted, or if the module count changed; RuntimeError on FQN changes.
+    # A None return from the function is treated as the input module. The wrapper gains a
+    # state attribute that returns the state stored for a module (or None).
     r"""
     Decorate a function as a composable distributed API, where the first
     argument of the function must be an :class:`nn.Module` instance or sequence
@@ -93,12 +112,16 @@ def contract(
     def inner(
         func: Callable[Concatenate[_M, _P], _M],
     ) -> _ContractFn[Concatenate[_M, _P], _M, _TState]:
+        # [FUNCTION DOC] HELPER: The actual decorator; wraps func with the FQN-checking
+        # wrapper and attaches the state accessor, returning the wrapper.
         @wraps(func)
         def wrapper(
             module: _M,
             *args: _P.args,
             **kwargs: _P.kwargs,
         ) -> _M:
+            # [FUNCTION DOC] HELPER: See contract. Registers state and registry entries,
+            # calls func, validates unchanged FQNs and returns func's result (or the input).
             inp_module = module
             modules: list[nn.Module]
             if isinstance(module, nn.Module):
@@ -176,6 +199,10 @@ def contract(
                 )
 
             def check_fqn(orig_fqns: list[str], new_fqns: list[str], check_key: str):
+                # [FUNCTION DOC] HELPER: Returns silently if the two name lists are equal;
+                # otherwise raises RuntimeError reporting added/removed names, or an order change.
+                # KNOWN ISSUE: the order-change message prints the (empty) difference sets
+                # instead of the original and new FQN lists.
                 if orig_fqns == new_fqns:
                     return
 
@@ -229,6 +256,8 @@ def contract(
             return updated
 
         def get_state(module: nn.Module) -> _State:
+            # [FUNCTION DOC] HELPER: Returns the state object stored for this API (func) on
+            # the module, or None; creates an empty state mapping on the module if absent.
             return module.__dict__.setdefault(  # type: ignore[call-overload]
                 STATE_KEY,
                 {},  # TODO(@yhcharles): this is a temporary fix, need a better way
@@ -242,6 +271,8 @@ def contract(
 
 
 def _get_registry(module: nn.Module) -> dict[str, RegistryItem] | None:
+    # [FUNCTION DOC] HELPER: Returns the mapping of applied composable API names to registry
+    # items for the module, or None if none were applied.
     r"""
     Get an ``OrderedDict`` of composable APIs that have been applied to the
     ``module``, indexed by the API name. If no API has been applied, then this

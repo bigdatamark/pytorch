@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] FSDP-based replicate: reuses the fully_shard machinery (FSDPState, param groups)
+# with a replicate-only mesh to hold full parameters on every rank and all-reduce gradients.
+# Defines _ReplicateState, the replicate API (contract-decorated), ReplicateModule and
+# validation helpers. Import-time side effect: creates a class cache and a logger.
 from __future__ import annotations
 
 import logging
@@ -42,6 +46,8 @@ logger = logging.getLogger("torch.distributed._composable.replicate_with_fsdp")
 
 
 class _ReplicateStateContext(FSDPStateContext["_ReplicateState"]):
+    # [CLASS DOC] HELPER: Typed FSDPStateContext shared across replicate states; lets call
+    # sites tell replicate and FSDP contexts apart.
     """
     State shared across Replicate states.
 
@@ -53,6 +59,8 @@ class _ReplicateStateContext(FSDPStateContext["_ReplicateState"]):
 
 
 def _get_module_replicate_state(module: nn.Module) -> _ReplicateState | None:
+    # [FUNCTION DOC] HELPER: Returns the module's composable state if it is a _ReplicateState,
+    # otherwise None.
     state = _get_module_state(module)
     if isinstance(state, _ReplicateState):
         return state
@@ -60,13 +68,17 @@ def _get_module_replicate_state(module: nn.Module) -> _ReplicateState | None:
 
 
 class _ReplicateState(FSDPState):
+    # [CLASS DOC] HELPER: FSDPState specialization for replicate: named Replicate, owns a
+    # _ReplicateStateContext, and finds neighbor states only among replicate states.
     _state_name: str = "Replicate"
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Initializes the base state and installs a fresh replicate context.
         super().__init__()
         self._state_ctx = _ReplicateStateContext()
 
     def _get_state_for_module(self, module: nn.Module) -> FSDPState | None:
+        # [FUNCTION DOC] HELPER: Looks up the replicate state of the module (None if absent).
         return _get_module_replicate_state(module)
 
     def init(
@@ -76,6 +88,7 @@ class _ReplicateState(FSDPState):
         mp_policy: MixedPrecisionPolicy,
         auto_reshard_after_forward: bool = False,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Delegates to the base FSDPState init with the same arguments.
         super().init(modules, device, mp_policy, auto_reshard_after_forward)
 
 
@@ -115,6 +128,14 @@ def replicate(
     ignored_params: set[nn.Parameter] | None = None,
     dp_mesh_dims: DataParallelMeshDims | None = None,
 ):
+    # [FUNCTION DOC] Replicates a module (or list of modules) using the FSDP machinery and
+    # returns it (the argument). Validates the module (RuntimeError if already fully_shard
+    # managed) and mesh: default one-dim mesh named replicate if none given; with
+    # dp_mesh_dims the mesh info must be replicate-only (ValueError otherwise), else the mesh
+    # must be one-dimensional (ValueError). Gathers modules, parameters (excluding
+    # ignored_params), initializes the state and param group with the mixed precision and offload
+    # policies, and swaps module classes to a ReplicateModule-derived class.
+    # Logs API usage as a side effect.
     r"""Replicates a module
 
     Args:
@@ -179,12 +200,15 @@ def replicate(
 
 
 class ReplicateModule(FSDPModule):
+    # [CLASS DOC] FSDPModule mixin applied to replicated modules (class named Replicate plus the
+    # original). Overrides the MRO index where the original class sits (3).
     # Index in MRO where the original class is found.
     # For Replicate: [Replicate<Orig>, ReplicateModule, FSDPModule, Orig, ...] -> index 3
     _orig_cls_mro_index: int = 3
 
 
 def is_composable_with_replicate(module: nn.Module) -> bool:
+    # [FUNCTION DOC] True unless fully_shard has already been applied to the module.
     registry = _get_registry(module)
     if registry is None:
         return True
@@ -192,6 +216,8 @@ def is_composable_with_replicate(module: nn.Module) -> bool:
 
 
 def _validate_module(module: nn.Module) -> None:
+    # [FUNCTION DOC] HELPER: Raises RuntimeError if fully_shard is already applied; then runs the
+    # shared module validation labeled replicate.
     if not is_composable_with_replicate(module):
         raise RuntimeError(
             "Cannot apply `replicate()` on a Module already managed by `fully_shard`"
@@ -200,5 +226,6 @@ def _validate_module(module: nn.Module) -> None:
 
 
 def _validate_mesh(mesh: DeviceMesh) -> None:
+    # [FUNCTION DOC] HELPER: Raises ValueError unless the mesh is one-dimensional.
     if mesh.ndim != 1:
         raise ValueError(f"replicate expects a 1D DeviceMesh but got {mesh}")

@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Composable (module-structure-preserving) activation checkpointing: defines
+# the checkpoint API, built with the contract decorator, which installs forward pre/post
+# hooks that run non-reentrant checkpointing from torch.utils.checkpoint.
 from collections.abc import Generator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any
@@ -15,6 +18,9 @@ from .contract import _State, contract
 
 @contextmanager
 def _no_hook(module: nn.Module, user_ctx: AbstractContextManager | None = None):
+    # [FUNCTION DOC] HELPER: Context manager used during recomputation. Enters the optional
+    # user context, then temporarily sets the module's checkpoint enable_hook flag to False
+    # (so hooks do not recurse) and restores the previous value on exit, even on error.
     r"""
     Disable hooks installed by checkpoint to avoid unintentional recursion
     during backward recomputation.
@@ -30,12 +36,22 @@ def _no_hook(module: nn.Module, user_ctx: AbstractContextManager | None = None):
 
 
 class _CheckpointState(_State):
+    # [CLASS DOC] HELPER: Per-module state for composable checkpoint. enable_hook (default
+    # False) gates the hooks; _ac_generator holds the live non-reentrant checkpoint
+    # generator between the forward pre-hook and forward hook, or None.
     enable_hook: bool = False
     _ac_generator: Generator[None, None, None] | None
 
 
 @contract(_CheckpointState)
 def checkpoint(module: nn.Module, **kwargs) -> nn.Module:
+    # [FUNCTION DOC] Applies activation checkpointing to module in place and returns it.
+    # Keyword options popped from kwargs: use_reentrant (True raises NotImplementedError),
+    # preserve_rng_state (default True), context_fn, determinism_check, debug, early_stop;
+    # any leftover keyword raises ValueError. Logs API usage, sets the module's state
+    # enable_hook to True, and registers a forward pre-hook (starts a checkpoint generator
+    # when hooks are enabled) and an always-called, prepended forward hook (exhausts the
+    # generator, raising RuntimeError if it is not exhausted, then clears it).
     r"""
     This is a composable activation checkpointing API. Unlike functional
     activation checkpointing APIs, this one does not require changing model
@@ -89,9 +105,15 @@ def checkpoint(module: nn.Module, **kwargs) -> nn.Module:
     def forward_pre_hook(
         module: nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any]
     ) -> None:
+        # [FUNCTION DOC] HELPER: Forward pre-hook. When enabled for the module, creates the
+        # non-reentrant checkpoint generator, stores it in the module state and advances it
+        # once so the forward runs under checkpointing.
         if checkpoint.state(module).enable_hook:
 
             def context_fns():
+                # [FUNCTION DOC] HELPER: Returns the pair of forward and recompute contexts;
+                # uses the user's context_fn pair if given (wrapping the recompute one with
+                # the hook-disabling context) else a null context and hook-disabling context.
                 if user_context_fns is not None:
                     ctx1, ctx2 = user_context_fns()
                     return ctx1, _no_hook(module, ctx2)
@@ -112,6 +134,9 @@ def checkpoint(module: nn.Module, **kwargs) -> nn.Module:
             next(gen)
 
     def forward_hook(module: nn.Module, inputs: tuple[Any, ...], output: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Forward post-hook. If enabled, advances the stored generator
+        # to completion (raises AssertionError if none stored, RuntimeError if it yields again).
+        # Always clears the stored generator. Returns None (output is left unchanged).
         if checkpoint.state(module).enable_hook:
             try:
                 gen = checkpoint.state(module)._ac_generator

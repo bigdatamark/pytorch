@@ -1,3 +1,5 @@
+# [MODULE DOC] Registry mapping nn.Module instances to the composable-API state object that
+# manages them (weak on both sides), with insert and lookup helpers.
 import weakref
 from typing import cast
 
@@ -5,6 +7,8 @@ import torch.nn as nn
 
 
 class _State:
+    # [CLASS DOC] HELPER: Empty base class for per-module composable API state; a module
+    # may itself be a _State subclass or be mapped to one in the registry.
     pass
 
 
@@ -14,6 +18,8 @@ _module_state_mapping: weakref.WeakKeyDictionary[
 
 
 def _insert_module_state(module: nn.Module, state: _State) -> None:
+    # [FUNCTION DOC] HELPER: Records a weak reference to state for module in the global
+    # registry. Raises AssertionError if the module is already registered.
     global _module_state_mapping
     if module in _module_state_mapping:
         raise AssertionError(f"Inserting {module} more than once.")
@@ -21,6 +27,9 @@ def _insert_module_state(module: nn.Module, state: _State) -> None:
 
 
 def _get_module_state(module: nn.Module) -> _State | None:
+    # [FUNCTION DOC] HELPER: Returns module itself if it is a _State, else the registered
+    # state, else None if unregistered. Raises AssertionError if the registered state was
+    # already garbage collected.
     """
     Return the ``_State`` in ``model``.
 
