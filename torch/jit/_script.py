@@ -1,3 +1,15 @@
+# [MODULE DOC] TorchScript scripting frontend (torch.jit.script and related machinery).
+# Defines the script() entry point and its implementation, the ScriptModule /
+# RecursiveScriptModule / RecursiveScriptClass Python wrappers around C++ jit objects,
+# the ScriptMeta metaclass, interface() and overload compilation helpers, script-dict and
+# script-list constructors, and an internal line profiler wrapper.
+# Import-time side effects: creates the global type trace store, patches graph_for onto
+# torch._C.ScriptMethod and ScriptFunction, sets ScriptFunction doc/name/module and makes it
+# unpicklable, defines Attribute (a namedtuple when jit is enabled, else a pass-through),
+# builds the ScriptModule classes (or trivial stand-ins when jit is disabled), copies
+# RecursiveScriptModule methods onto ScriptModule, replaces non-allowlisted nn.Module methods
+# on RecursiveScriptModule with failing stubs, sets the CompilationUnit module, and registers
+# several builtins (unwrap_optional, is_scripting, has_torch_function variants).
 """TorchScript.
 
 This module contains functionality to support the JIT's scripting frontend, notably:
@@ -77,6 +89,8 @@ set_module(ScriptFunction, "torch.jit")
 # Throws an error if a jit function is pickled.
 # Helps to avoid Python crashes for Python versions 3.9.5 + when protocol 0 or 1 is given as an argument.
 def _reduce(cls):
+    # [FUNCTION DOC] HELPER: Installed as __reduce__ on ScriptFunction; always raises a pickle error
+    # because script functions cannot be pickled. Takes the instance, returns nothing.
     raise pickle.PickleError("ScriptFunction cannot be pickled")
 
 
@@ -88,6 +102,8 @@ if _enabled:
 else:
 
     def Attribute(value, type):  # type: ignore[no-redef]
+        # [FUNCTION DOC] HELPER: Stand-in for Attribute when jit is disabled; ignores the type and
+        # returns the value unchanged.
         return value
 
 
@@ -168,18 +184,23 @@ Attribute.__doc__ = """
 
 
 def _get_type_trace_db():
+    # [FUNCTION DOC] HELPER: Private accessor returning the module-global type trace store (the
+    # database of call traces collected for profile-directed typing).
     # This is a private API. Use of this for external purposes is discouraged.
     return type_trace_db
 
 
 # Gets a function from the name of a method on a type
 def _get_function_from_type(cls, name):
+    # [FUNCTION DOC] HELPER: Return the attribute called name from cls, or None if it is absent.
     return getattr(cls, name, None)
 
 
 # ScriptClasses must be new-style classes because we construct them using their
 # __new__ method.
 def _is_new_style_class(cls):
+    # [FUNCTION DOC] HELPER: Return True if cls looks like a new-style class (has an instance
+    # dictionary or slots). Falls through and returns None if cls has no class attribute.
     if hasattr(cls, "__class__"):
         return "__dict__" in dir(cls) or hasattr(cls, "__slots__")
 
@@ -200,25 +221,37 @@ def _is_new_style_class(cls):
 
 
 class OrderedDictWrapper:
+    # [CLASS DOC] HELPER: Dict-like view over a C++ container of parameters/buffers (held in _c) that
+    # stands in for the OrderedDicts of nn.Module. Supports lookup, containment, listing and
+    # assignment to existing names only; deletion and adding new names are forbidden.
     def __init__(self, _c):
+        # [FUNCTION DOC] HELPER: Store the wrapped C++ dict-like object as _c.
         self._c = _c
 
     def keys(self):
+        # [FUNCTION DOC] HELPER: Return a list of the names in the wrapped container.
         return [k for k, v in self.items()]
 
     def values(self):
+        # [FUNCTION DOC] HELPER: Return a list of the values in the wrapped container.
         return [v for k, v in self.items()]
 
     def __len__(self):
+        # [FUNCTION DOC] HELPER: Return the number of entries in the wrapped container.
         return len(self.values())
 
     def __delitem__(self, k):
+        # [FUNCTION DOC] HELPER: Always raises RuntimeError; entries cannot be deleted from a script module.
         raise RuntimeError("cannot delete methods or parameters of a script module")
 
     def items(self):
+        # [FUNCTION DOC] HELPER: Return the (name, value) pairs of the wrapped C++ container.
         return self._c.items()
 
     def __setitem__(self, k, v):
+        # [FUNCTION DOC] HELPER: Set an existing entry in the C++ container; raises RuntimeError if the
+        # name is not already present (no new parameters after construction).
+        # KNOWN ISSUE: the error message opens a quote before the name but never closes it.
         if k not in self:
             raise RuntimeError(
                 f"Can't add a new parameter after ScriptModule construction. Tried to add '{k}"
@@ -226,16 +259,22 @@ class OrderedDictWrapper:
         self._c.setattr(k, v)
 
     def __contains__(self, k):
+        # [FUNCTION DOC] HELPER: Return whether the wrapped container has an entry with this name.
         return self._c.contains(k)
 
     def __getitem__(self, k):
+        # [FUNCTION DOC] HELPER: Return the entry for name from the C++ container; raises KeyError if absent.
         if k not in self:
             raise KeyError(k)
         return self._c.getattr(k)
 
 
 class OrderedModuleDict(OrderedDictWrapper):
+    # [CLASS DOC] HELPER: Wrapper for the submodule dictionary of a script module. Backed by a C++
+    # ModuleDict but also keeps a Python dict (_python_modules) so the same Python wrapper object
+    # is returned on every lookup; this dict holds both script and Python-only modules.
     def __init__(self, module, python_dict):
+        # [FUNCTION DOC] HELPER: Build the C++ ModuleDict view for module and remember python_dict.
         super().__init__(torch._C.ModuleDict(module))
         # contains _both_ script modules and non-script python-only modules
 
@@ -246,13 +285,17 @@ class OrderedModuleDict(OrderedDictWrapper):
         self._python_modules = python_dict
 
     def items(self):
+        # [FUNCTION DOC] HELPER: Return the items of the Python-side module dict (not the C++ one).
         r = self._python_modules.items()
         return r
 
     def __contains__(self, k):
+        # [FUNCTION DOC] HELPER: Return whether the name is a key of the Python-side module dict.
         return k in self._python_modules
 
     def __setitem__(self, k, v):
+        # [FUNCTION DOC] HELPER: Replace a submodule with a new ScriptModule, updating both the C++
+        # module and the Python dict. Raises RuntimeError if the new value is not a ScriptModule.
         # Cases where sub-module can be re-assigned after ScriptModule construction
         # 1. If the attr is a module interface type, it's guaranteed that the module is
         #    not inlined in the graph, so it's safe to swap a new ScriptModule in.
@@ -272,6 +315,7 @@ class OrderedModuleDict(OrderedDictWrapper):
             )
 
     def __getitem__(self, k):
+        # [FUNCTION DOC] HELPER: Return the Python wrapper stored for the submodule name (KeyError if absent).
         return self._python_modules[k]
 
 
@@ -284,7 +328,16 @@ class OrderedModuleDict(OrderedDictWrapper):
 #     parameters are initialized _before_ the script compiler resolve references to
 #     `self.param` or `self.module`.
 class ScriptMeta(type):
+    # [CLASS DOC] Metaclass for user subclasses of ScriptModule. At class creation it collects
+    # script methods (ScriptMethodStub values) and constants from base classes and the class body,
+    # removing the stubs from the class attributes, and (unless _disable_script_meta is set) wraps
+    # __init__ so that after the user's init runs the module is compiled into a backing script
+    # module. State: per-class _methods mapping and _constants_set.
     def __init__(cls, name, bases, attrs):
+        # [FUNCTION DOC] Initialize a ScriptModule subclass. Aggregates script methods and constants
+        # from bases (in reverse order) and from this class's attributes, deleting the stubs from the
+        # class. For built-in types flagged with _disable_script_meta it only calls the parent
+        # initializer. Otherwise replaces __init__ with a wrapper that compiles the module afterwards.
         # Aggregate all the ScriptMethods and constants from superclasses
         cls._methods: dict[str, Any] = {}
         cls._constants_set = set(getattr(cls, "__constants__", ()))
@@ -311,6 +364,11 @@ class ScriptMeta(type):
 
         @functools.wraps(original_init)
         def init_then_script(self, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Replacement __init__. Runs the original init, then, only if this is
+            # exactly the declared class (not a subclass instance), compiles the methods through
+            # create_script_module and stores the result as _actual_script_module. Share of the cached type
+            # is disabled if init added methods. Finally deletes Python attributes, submodule entries and
+            # the _parameters/_buffers/_modules dicts that would shadow the scripted versions.
             num_methods = len(cls._methods)
             original_init(self, *args, **kwargs)
             added_methods_in_init = len(cls._methods) > num_methods
@@ -318,6 +376,8 @@ class ScriptMeta(type):
             if type(self) is cls:
 
                 def make_stubs(module):
+                    # [FUNCTION DOC] HELPER: Return the list of method stubs to compile for module: the sorted
+                    # stubs registered on its class if it has any, otherwise methods inferred from the module.
                     cls = type(module)
                     if hasattr(cls, "_methods"):
                         return [v for k, v in sorted(cls._methods.items())]
@@ -346,15 +406,24 @@ class ScriptMeta(type):
 
 
 class _CachedForward:
+    # [CLASS DOC] HELPER: Non-data descriptor installed as the forward attribute of ScriptModule. On
+    # first access it looks up forward through the instance attribute machinery.
     def __get__(self, obj, cls):
+    # [FUNCTION DOC] HELPER: Descriptor getter; returns the forward method obtained via the instance
+    # attribute lookup.
         return self.__getattr__("forward")  # type: ignore[attr-defined]
 
 
 class ScriptWarning(Warning):
+    # [CLASS DOC] Warning category for TorchScript warnings. No added behavior.
     pass
 
 
 def script_method(fn):
+    # [FUNCTION DOC] Decorator marking a method of a ScriptModule subclass for compilation. Emits a
+    # FutureWarning (deprecated; unsupported on Python 3.14+). If jit is disabled returns fn
+    # unchanged. Otherwise captures a resolution callback from two frames up, parses fn into an
+    # AST and returns a ScriptMethodStub for the metaclass to compile.
     if sys.version_info >= (3, 14):
         warnings.warn(
             "`torch.jit.script_method` is not supported in Python 3.14+ and may break. "
@@ -386,16 +455,23 @@ def script_method(fn):
 
 
 class ConstMap:
+    # [CLASS DOC] HELPER: Read-only attribute-style access to a mapping of constant names to values.
     def __init__(self, const_mapping: Mapping[str, Any]) -> None:
+        # [FUNCTION DOC] HELPER: Store the constants mapping.
         self.const_mapping = const_mapping
 
     def __getattr__(self, attr: str) -> Any:
+        # [FUNCTION DOC] HELPER: Return the constant with the given name; raises KeyError if absent.
         return self.const_mapping[attr]
 
 
 def unpackage_script_module(
     importer: PackageImporter, script_module_id: str
 ) -> torch.nn.Module:
+    # [FUNCTION DOC] Load a ScriptModule from a torch.package archive; called as persistent_load by
+    # the PackageImporter's unpickler. Args: importer and the script module id. Raises RuntimeError
+    # if the importer was created from a directory rather than an archive file. Returns the module
+    # wrapped as a Python script module.
     """
     Call by ``torch.package.PackageImporter``'s Pickler's ``persistent_load`` function.
 
@@ -450,6 +526,9 @@ if _enabled:
     ]
 
     class RecursiveScriptClass:
+        # [CLASS DOC] Python wrapper around a C++ ScriptObject (an instance of a TorchScript class).
+        # Forwards attribute get/set and magic methods to the C++ object; properties of the C++ object
+        # are exposed through _props. Cannot be pickled. Defined only when jit is enabled.
         """Wrapper for a TorchScript class instance for use in Python.
 
         An analogue of RecursiveScriptModule for regular objects that are not modules.
@@ -464,6 +543,9 @@ if _enabled:
         """
 
         def __init__(self, cpp_class):
+            # [FUNCTION DOC] Wrap cpp_class: store it as _c and build _props from its properties (name to
+            # property built from getter/setter). Uses an _initializing flag in the instance dict so that
+            # attribute access during construction bypasses forwarding.
             super().__init__()
             self.__dict__["_initializing"] = True
             self._c = cpp_class
@@ -477,6 +559,8 @@ if _enabled:
             self.__dict__["_initializing"] = False
 
         def __getattr__(self, attr: str) -> Any:
+            # [FUNCTION DOC] Look up attr: property getter if attr is a known property, else the attribute
+            # of the C++ object. During initialization defers to the parent implementation.
             if self.__dict__.get("_initializing"):
                 return super().__getattr__(attr)  # type: ignore[misc]
 
@@ -486,6 +570,8 @@ if _enabled:
             return getattr(self._c, attr)
 
         def __setattr__(self, attr: str, value: Any) -> None:
+            # [FUNCTION DOC] Set attr: property setter if attr is a known property, else set it on the C++
+            # object. During initialization defers to the parent implementation.
             if self.__dict__.get("_initializing"):
                 return super().__setattr__(attr, value)
 
@@ -499,6 +585,8 @@ if _enabled:
         def forward_magic_method(
             self, method_name: str, *args: Any, **kwargs: Any
         ) -> Any:
+            # [FUNCTION DOC] Call the C++ object's method named method_name with the given arguments.
+            # Raises TypeError if the C++ class defines no such method.
             if not self._c._has_method(method_name):
                 raise TypeError
 
@@ -506,9 +594,12 @@ if _enabled:
             return self_method(*args, **kwargs)
 
         def __getstate__(self):
+            # [FUNCTION DOC] Always raises PickleError; script class instances cannot be pickled.
             raise pickle.PickleError("ScriptClasses cannot be pickled")
 
         def __iadd__(self, other: Self) -> Self:
+            # [FUNCTION DOC] In-place add: uses the class's __iadd__ if defined, otherwise falls back to
+            # __add__. Returns the result.
             if self._c._has_method("__iadd__"):
                 return self.forward_magic_method("__iadd__", other)
             else:
@@ -517,6 +608,10 @@ if _enabled:
     for method_name in _magic_methods:
 
         def method_template(self, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Template installed on RecursiveScriptClass for each magic method name;
+            # forwards the call to forward_magic_method.
+            # KNOWN ISSUE: method_name is looked up when called, not when defined (late binding), so every
+            # installed magic method forwards using the last name in the list.
             return self.forward_magic_method(method_name, *args, **kwargs)
 
         setattr(RecursiveScriptClass, method_name, method_template)
@@ -530,6 +625,10 @@ if _enabled:
     # which always throws an exception.
 
     class ScriptModule(Module, metaclass=ScriptMeta):
+        # [CLASS DOC] Base class of script modules, a Module wrapper around a C++ jit module. Uses
+        # ScriptMeta so user subclasses are compiled after init. Delegates attribute reads/writes to
+        # the compiled _actual_script_module once it exists; forward is a cached descriptor. Also
+        # receives copies of RecursiveScriptModule methods.
         r"""Wrapper for C++ torch::jit::Module with methods, attributes, and parameters.
 
         A wrapper around C++ ``torch::jit::Module``. ``ScriptModule``\s
@@ -546,16 +645,22 @@ if _enabled:
         ]
 
         def __init__(self) -> None:
+            # [FUNCTION DOC] Initialize the underlying Module.
             super().__init__()
 
         forward: Callable[..., Any] = _CachedForward()  # type: ignore[assignment]
 
         def __getattr__(self, attr: str) -> Any:
+            # [FUNCTION DOC] Attribute fallback: before compilation uses the parent lookup, afterwards
+            # reads from the backing script module.
             if "_actual_script_module" not in self.__dict__:
                 return super().__getattr__(attr)
             return getattr(self._actual_script_module, attr)
 
         def __setattr__(self, attr: str, value: Any) -> None:
+            # [FUNCTION DOC] Set attribute. Before compilation, unwraps an Attribute into its value and
+            # records its type in the class annotations (created on the specific class if missing), then
+            # sets normally. After compilation, sets the attribute on the backing script module.
             if "_actual_script_module" not in self.__dict__:
                 # Unwrap torch.jit.Attribute into a regular setattr + record
                 # the provided type in __annotations__.
@@ -577,6 +682,9 @@ if _enabled:
             setattr(self._actual_script_module, attr, value)
 
         def define(self, src):
+            # [FUNCTION DOC] Compile the source text of a method definition into the module. After
+            # compilation, defers to the backing module's define; during init, parses the source and
+            # registers a method stub (using the caller's scope for name resolution) to compile later.
             if "_actual_script_module" in self.__dict__:
                 # If we have completed initialization, just defer to the
                 # backing RecursiveScriptModule to eagerly compile the provided
@@ -599,9 +707,13 @@ if _enabled:
             self._methods[ast.name().name] = ScriptMethodStub(rcb, ast, None)
 
         def _replicate_for_data_parallel(self):
+            # [FUNCTION DOC] Return the data-parallel replica made by the backing script module.
             return self._actual_script_module._replicate_for_data_parallel()
 
         def __reduce_package__(self, exporter: PackageExporter):
+            # [FUNCTION DOC] Support saving inside a torch.package archive. Gets a unique id from the
+            # exporter, serializes the C++ module with it, and returns the loader function and its id
+            # argument for use at load time.
             """Save a ScriptModule inside of a ``torch.package`` archive.
 
             Called by ``torch.package.PackageExporter``'s Pickler's ``persistent_id`` when
@@ -616,6 +728,10 @@ if _enabled:
             return (unpackage_script_module, (script_module_id,))
 
     class RecursiveScriptModule(ScriptModule):
+        # [CLASS DOC] Script module created from a C++ module (by scripting, tracing or loading); this is
+        # the class that holds the real state in _c. Subclasses ScriptModule only to preserve isinstance
+        # checks. Parameters, buffers and submodules are replaced by C++-backed views; magic methods
+        # are forwarded to the scripted methods. Construct through _construct, not directly.
         # XXX: RecursiveScriptModule inherits from ScriptModule for the sole
         # reason that it retains the existing isinstance(ScriptModule)
         # behavior.
@@ -646,6 +762,8 @@ if _enabled:
         _disable_script_meta = True
 
         def __init__(self, cpp_module):
+            # [FUNCTION DOC] Store the C++ module as _c, run base init with the initializing flag set, and
+            # delete the training attribute so the C++ module's version is used.
             self.__dict__["_initializing"] = True
             self._c = cpp_module
             super().__init__()
@@ -656,6 +774,8 @@ if _enabled:
 
         @staticmethod
         def _construct(cpp_module, init_fn):
+            # [FUNCTION DOC] Static factory: create a RecursiveScriptModule around cpp_module, run init_fn
+            # on it, finalize it (swap in the C++-backed state) and return it.
             """
             Construct a RecursiveScriptModule that's ready for use.
 
@@ -680,6 +800,8 @@ if _enabled:
 
         @staticmethod
         def _finalize_scriptmodule(script_module):
+            # [FUNCTION DOC] HELPER: Replace the parameter, buffer and module dicts of script_module with
+            # C++-backed wrappers and clear its initializing flag.
             script_module._parameters = OrderedDictWrapper(
                 torch._C.ParameterDict(script_module._c)
             )
@@ -692,6 +814,9 @@ if _enabled:
             script_module._initializing = False
 
         def _reconstruct(self, cpp_module):
+            # [FUNCTION DOC] HELPER: Rebuild this instance around a new C++ module: re-run init, copy the
+            # concrete type, wrap submodules, parameters and buffers, and drop cached script methods from
+            # the instance dict.
             """
             Re-construct an instance of RecursiveScriptModule using an instance of a C++ module.
 
@@ -725,11 +850,13 @@ if _enabled:
 
         @property
         def graph(self):
+            # [FUNCTION DOC] Property: the graph of the forward method.
             r"""Return a string representation of the internal graph for the ``forward`` method."""
             return self._c._get_method("forward").graph
 
         @property
         def inlined_graph(self):
+            # [FUNCTION DOC] Property: the forward graph with function and method calls inlined.
             r"""
             Return a string representation of the internal graph for the ``forward`` method.
 
@@ -739,6 +866,7 @@ if _enabled:
 
         @property
         def code(self):
+            # [FUNCTION DOC] Property: pretty-printed code of the forward graph.
             r"""
             Return a pretty-printed representation (as valid Python syntax) of the internal graph for the ``forward`` method.
 
@@ -747,6 +875,7 @@ if _enabled:
 
         @property
         def code_with_constants(self):
+            # [FUNCTION DOC] Property: tuple of the forward code and a ConstMap of its constants.
             r"""Return a tuple.
 
             Returns a tuple of:
@@ -761,6 +890,8 @@ if _enabled:
             return (r[0], ConstMap(r[1]))
 
         def save(self, f, **kwargs):
+            # [FUNCTION DOC] Save the module to a file path (the argument is converted to a string); extra
+            # keyword arguments go to the C++ save. Returns the C++ result.
             r"""Save with a file-like object.
 
             save(f, _extra_files={})
@@ -776,6 +907,8 @@ if _enabled:
             https://docs.pytorch.org/executorch/stable/getting-started.html"
         )
         def _save_for_lite_interpreter(self, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Deprecated. Warns, then saves the lite-interpreter (mobile) version of
+            # the module through the C++ module.
             r"""Add (or update) the bytecode session to the script model.
 
             _save_for_lite_interpreter(f)
@@ -801,6 +934,7 @@ if _enabled:
             https://docs.pytorch.org/executorch/stable/getting-started.html"
         )
         def _save_to_buffer_for_lite_interpreter(self, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Deprecated. Warns, then returns the lite-interpreter serialized bytes.
             warnings.warn(
                 "Lite Interpreter is deprecated. Please consider switching to ExecuTorch. \
                 https://docs.pytorch.org/executorch/stable/getting-started.html",
@@ -810,25 +944,34 @@ if _enabled:
             return self._c._save_to_buffer_for_mobile(*args, **kwargs)
 
         def save_to_buffer(self, *args: Any, **kwargs: Any) -> Any:
+            # [FUNCTION DOC] Serialize the module to an in-memory buffer via the C++ module.
             return self._c.save_to_buffer(*args, **kwargs)
 
         def get_debug_state(self, *args: Any, **kwargs: Any) -> Any:
+            # [FUNCTION DOC] Return the C++ module's debug state; extra arguments are ignored.
             return self._c.get_debug_state()
 
         def extra_repr(self) -> str:
+            # [FUNCTION DOC] Return the extra representation string showing the original name.
             return f"original_name={self.original_name}"
 
         def graph_for(self, *args: Any, **kwargs: Any) -> Any:
+            # [FUNCTION DOC] Return the graph for forward specialized to the given inputs.
             return self.forward.graph_for(self, *args, **kwargs)  # type: ignore[attr-defined]
 
         @property
         def original_name(self):
+            # [FUNCTION DOC] Property: name of the C++ type, or empty string if it matches the Python type.
+            # KNOWN ISSUE: the check compares a type object to a string by identity, so it is never true
+            # and the C++ type name is always returned.
             # pyrefly: ignore [unnecessary-comparison]
             if type(self) is str(self._c._type().name()):
                 return ""
             return str(self._c._type().name())
 
         def define(self, src):
+            # [FUNCTION DOC] Compile source text defining methods into this module, resolving names in the
+            # caller's scope.
             # We use frames_up=1 to get to the proper surrounding scope. The stack
             # will look like:
             # 0. createResolutionCallback
@@ -841,6 +984,9 @@ if _enabled:
             self._c._define(self._concrete_type, src, rcb)
 
         def __getattr__(self, attr: str) -> Any:
+            # [FUNCTION DOC] Attribute lookup. Raises RuntimeError if the object was never initialized. Looks
+            # up submodules first, then C++ attributes, then methods (caching the method in the instance
+            # dict), and falls back to the parent lookup.
             if "_initializing" not in self.__dict__:
                 raise RuntimeError(
                     "ScriptModule has not been initialized, did you forget to call super's init?"
@@ -865,6 +1011,9 @@ if _enabled:
             return super().__getattr__(attr)
 
         def __setattr__(self, attr: str, value: Any) -> None:
+            # [FUNCTION DOC] Attribute assignment. Routes to submodule replacement, C++ attribute set, or
+            # the parent for plain Python attributes. Raises AttributeError when mutating a TorchScript
+            # constant.
             if self._initializing:
                 return super().__setattr__(attr, value)
 
@@ -892,9 +1041,11 @@ if _enabled:
                 return super().__setattr__(attr, value)
 
         def __copy__(self) -> Self:
+            # [FUNCTION DOC] Shallow copy: wraps a shallow copy of the C++ module.
             return torch.jit._recursive.wrap_cpp_module(copy.copy(self._c))
 
         def __deepcopy__(self, memo: dict[int, Any] | None) -> Self:
+            # [FUNCTION DOC] Deep copy: wraps a deep copy of the C++ module using memo.
             return torch.jit._recursive.wrap_cpp_module(copy.deepcopy(self._c, memo))
 
         # Python magic methods do method lookups on an object's class type, instead of looking up
@@ -904,6 +1055,8 @@ if _enabled:
         def forward_magic_method(
             self, method_name: str, *args: Any, **kwargs: Any
         ) -> Any:
+            # [FUNCTION DOC] Call the scripted magic method method_name on this module. Raises
+            # NotImplementedError if the method is just the class default (not overridden by the module).
             self_method = getattr(self, method_name)
             if getattr(self_method, "__func__", None) == getattr(
                 RecursiveScriptModule, method_name
@@ -912,20 +1065,26 @@ if _enabled:
             return self_method(*args, **kwargs)
 
         def __iter__(self) -> Iterator[Any]:
+            # [FUNCTION DOC] Iterate via the scripted __iter__ method.
             return self.forward_magic_method("__iter__")
 
         def __getitem__(self, idx: int) -> Any:
+            # [FUNCTION DOC] Index via the scripted __getitem__ method.
             return self.forward_magic_method("__getitem__", idx)
 
         def __len__(self):
+            # [FUNCTION DOC] Length via the scripted __len__ method.
             return self.forward_magic_method("__len__")
 
         def __contains__(self, key):
+            # [FUNCTION DOC] Membership test via the scripted __contains__ method.
             return self.forward_magic_method("__contains__", key)
 
         # dir is defined by the base nn.Module, so instead of throwing if
         # it is not overridden, we call into the nn.Module __dir__ method
         def __dir__(self) -> Sequence[str]:
+            # [FUNCTION DOC] Return the attribute names; uses the scripted __dir__ if overridden, else the
+            # base Module behavior.
             self_method = self.__dir__
             if (
                 self_method.__func__  # type: ignore[attr-defined]
@@ -938,6 +1097,8 @@ if _enabled:
         # is defined then returns true for classes. Since __iter__() on this
         # class throws if it isn't overridden, we define __bool__ to preserve default behavior
         def __bool__(self):
+            # [FUNCTION DOC] Truth value: True unless the scripted module overrides __bool__, in which case
+            # that method's result is returned.
             self_method = self.__bool__
             if (
                 self_method.__func__  # type: ignore[attr-defined]
@@ -947,9 +1108,12 @@ if _enabled:
             return self_method()
 
         def _replicate_for_data_parallel(self):
+            # [FUNCTION DOC] HELPER: Create a replica for data parallel by wrapping the C++ module's
+            # replicated copy in a fresh RecursiveScriptModule with an empty init function.
             # we have to initialize ScriptModule properly so that
             # it works with pybind11
             def init_fn(script_module):
+                # [FUNCTION DOC] HELPER: Intentionally does nothing.
                 # Don't do anything here, we'll initialize the ScriptModule below
                 return
 
@@ -975,6 +1139,8 @@ if _enabled:
         setattr(ScriptModule, name, item)
 
     def _get_methods(cls):
+        # [FUNCTION DOC] HELPER: Return the list of (name, function) members of cls that are functions
+        # or methods.
         import inspect
 
         # In Python 3 unbound methods are functions, but in Python 2 they are methods
@@ -1023,7 +1189,9 @@ if _enabled:
     }
 
     def _make_fail(name):
+        # [FUNCTION DOC] HELPER: Build a method replacement that raises an error naming the method.
         def fail(self, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Always raises RuntimeError saying the named method is unsupported on ScriptModules.
             raise RuntimeError(name + " is not supported on ScriptModules")
 
         return fail
@@ -1042,18 +1210,29 @@ if _enabled:
 else:
     # TODO MAKE SURE THAT DISABLING WORKS
     class RecursiveScriptClass:  # type: ignore[no-redef]
+        # [CLASS DOC] HELPER: Placeholder used when jit is disabled; no behavior.
         pass
 
     class ScriptModule(torch.nn.Module):  # type: ignore[no-redef]
+        # [CLASS DOC] HELPER: Placeholder ScriptModule used when jit is disabled; a plain Module subclass.
         def __init__(self, arg=None):
+            # [FUNCTION DOC] HELPER: Call the base Module init; arg is ignored.
             super().__init__()
 
     class RecursiveScriptModule(ScriptModule):  # type: ignore[no-redef]
+        # [CLASS DOC] HELPER: Placeholder RecursiveScriptModule used when jit is disabled.
         def __init__(self, arg=None):
+            # [FUNCTION DOC] HELPER: Call the base init; arg is ignored.
             super().__init__()
 
 
 def call_prepare_scriptable_func_impl(obj, memo):
+    # [FUNCTION DOC] HELPER: Recursively apply __prepare_scriptable__ to obj and its non-script
+    # submodules. Non-modules are returned unchanged. memo maps object ids to already prepared
+    # objects to handle cycles. Mutates submodule dicts in place. Returns the prepared object.
+    # KNOWN ISSUE: the final loop assigns every value to the instance dict under the stale loop
+    # variable name from the previous loop, rather than the matching key; the result is wrong
+    # (all values go under the last attribute name).
     if not isinstance(obj, torch.nn.Module):
         return obj
 
@@ -1096,11 +1275,13 @@ def call_prepare_scriptable_func_impl(obj, memo):
 
 
 def call_prepare_scriptable_func(obj):
+    # [FUNCTION DOC] Prepare obj (and nested modules) via __prepare_scriptable__ using a fresh memo.
     memo: dict[int, torch.nn.Module] = {}
     return call_prepare_scriptable_func_impl(obj, memo)
 
 
 def create_script_dict(obj):
+    # [FUNCTION DOC] Create a ScriptDict holding the data from the Python dict obj.
     """
     Create a ``torch._C.ScriptDict`` instance with the data from ``obj``.
 
@@ -1117,6 +1298,8 @@ def create_script_dict(obj):
 
 
 def create_script_list(obj, type_hint=None):
+    # [FUNCTION DOC] Create a ScriptList holding the data from the Python list obj.
+    # KNOWN ISSUE: type_hint is accepted but unused; the docstring calls obj a dict although it is a list.
     """
     Create a ``torch._C.ScriptList`` instance with the data from ``obj``.
 
@@ -1141,6 +1324,14 @@ def _script_impl(
     _rcb=None,
     example_inputs: list[tuple] | dict[Callable, list[tuple]] | None = None,
 ):
+    # [FUNCTION DOC] HELPER: Implementation of script. Warns if optimize is given (no effect). Returns
+    # already-scripted objects unchanged. If example_inputs is given, runs the eager object under
+    # MonkeyType to fill the global type trace store (raises ValueError for bad input format; warns
+    # if MonkeyType is missing). Then dispatches: modules are compiled recursively, dicts and lists
+    # become ScriptDict/ScriptList, classes are registered (errors for nn.Module subclasses,
+    # non-new-style classes, or inheritance; enums returned as is), functions are compiled (using
+    # and filling the function cache), and other objects are turned into script class instances.
+    # Side effects: rebinds the global type trace store, updates compilation caches.
     global type_trace_db
 
     if optimize is not None:
@@ -1280,6 +1471,11 @@ def script(
     _rcb: Callable[[str], Any] | None = None,
     example_inputs: list[tuple] | dict[Callable, list[tuple]] | None = None,
 ) -> Any:
+    # [FUNCTION DOC] Public entry point to compile a function, module, class, dict or list to
+    # TorchScript. Emits a deprecation FutureWarning. If jit is disabled returns obj unchanged.
+    # Otherwise calls the implementation with the frame offset adjusted, logs usage only for the
+    # outermost call (tracked by the global toplevel flag, restored afterwards), and returns the
+    # scripted object.
     r"""Script the function.
 
     Scripting a function or ``nn.Module`` will inspect the source code, compile
@@ -1519,6 +1715,8 @@ def script(
 
 
 def _check_overload_defaults(impl_defaults, overload_defaults, loc):
+    # [FUNCTION DOC] HELPER: Check that each default on an overload matches the implementation's
+    # default; raises a frontend error at loc if one is missing or differs.
     for name, overload_value in overload_defaults.items():
         if name not in impl_defaults or impl_defaults[name] != overload_value:
             raise torch.jit.frontend.FrontendError(
@@ -1530,6 +1728,9 @@ def _check_overload_defaults(impl_defaults, overload_defaults, loc):
 
 
 def _compile_function_with_overload(overload_fn, qual_name, impl_fn):
+    # [FUNCTION DOC] HELPER: Compile one overload declaration together with the implementation
+    # function and return the compiled function. Validates the overload defaults against the
+    # implementation first.
     overload_decl = get_jit_def(overload_fn, overload_fn.__name__).decl()
     overload_signature = torch.jit.annotations.get_signature(
         overload_fn, None, None, inspect.ismethod(overload_fn)
@@ -1553,6 +1754,10 @@ def _compile_function_with_overload(overload_fn, qual_name, impl_fn):
 
 
 def _get_overloads(obj):
+    # [FUNCTION DOC] HELPER: Return the compiled overloads for obj. Compiles any pending registered
+    # overloads (raising RuntimeError if the function itself is in the pending list, i.e. has no
+    # implementation), appends them to cached ones, caches the result and clears the pending
+    # registry.
     # check for cached compiled fns
     existing_compiled_fns = _try_get_jit_cached_overloads(obj)
     qual_name = _qualified_name(obj)
@@ -1580,6 +1785,8 @@ def _get_overloads(obj):
 
 
 def _check_directly_compile_overloaded(obj):
+    # [FUNCTION DOC] HELPER: Raise RuntimeError if obj has overloads, since an overloaded function
+    # cannot be compiled directly.
     qual_name = _qualified_name(obj)
     if _jit_internal._get_fn_overloads(qual_name) or _try_get_jit_cached_overloads(obj):
         raise RuntimeError(
@@ -1672,9 +1879,15 @@ def interface(obj: _T) -> _T:
     )
     obj.__torch_script_interface__ = mangled_classname
     return obj
+    # [FUNCTION DOC] Decorator turning a class or module into a TorchScript interface type. Warns
+    # (deprecated). Raises RuntimeError if obj is not a class, not new-style, or uses inheritance
+    # (other than a direct Module subclass). Compiles the interface and sets the interface name
+    # attribute on obj. Returns obj.
 
 
 def _recursive_compile_class(obj, loc):
+    # [FUNCTION DOC] HELPER: Compile and register the class obj for scripting, resolving names via
+    # its class methods. Records a call stack for error reporting. Returns the result of registration.
     _qual_name = _qualified_name(obj)
     # We're starting a new compilation, so update the error call stack in
     # case it fails
@@ -1688,22 +1901,30 @@ set_module(CompilationUnit, "torch.jit")
 
 
 def pad(s: str, padding: int, offset: int = 0, char: str = " "):
+    # [FUNCTION DOC] HELPER: Left-pad string s with fill characters up to the width padding (plus
+    # offset extra characters); no padding if s is already as wide as padding. Returns the string.
     if padding >= len(s):
         padding -= len(s)
     return "".join([char for _ in range(padding + offset)]) + s
 
 
 class _ScriptProfileColumn:
+    # [CLASS DOC] HELPER: One column of the profiler table, with a header, alignment, offset and a
+    # mapping from line number to cell value.
     def __init__(self, header: str, alignment: int = 4, offset: int = 0):
+        # [FUNCTION DOC] HELPER: Store header, alignment, offset and an empty row mapping.
         self.header = header
         self.alignment = alignment
         self.offset = offset
         self.rows: dict[int, Any] = {}
 
     def add_row(self, lineno: int, value: Any):
+        # [FUNCTION DOC] HELPER: Set the cell value for a line number.
         self.rows[lineno] = value
 
     def materialize(self):
+        # [FUNCTION DOC] HELPER: Convert the column to strings and pad them to a common width rounded
+        # up to the alignment. Returns the padded header and a list of (line number, padded cell).
         max_length = len(self.header)
         rows: list[tuple[int, str]] = []
         for key, value in self.rows.items():
@@ -1722,11 +1943,15 @@ class _ScriptProfileColumn:
 
 
 class _ScriptProfileTable:
+    # [CLASS DOC] HELPER: Table of profiler columns over a range of source lines; renders to text.
     def __init__(self, cols: list[_ScriptProfileColumn], source_range: list[int]):
+        # [FUNCTION DOC] HELPER: Store the columns and the list of source line numbers.
         self.cols = cols
         self.source_range = source_range
 
     def dump_string(self):
+        # [FUNCTION DOC] HELPER: Render a header, a separator line, and one row per source line, joining
+        # column cells (blank where a column has no value). Returns the text.
         outputs: list[str] = []
         cells: list[tuple[str, dict[int, str]]] = []
         header_buffer = ""
@@ -1750,16 +1975,23 @@ class _ScriptProfileTable:
 
 
 class _ScriptProfile:
+    # [CLASS DOC] HELPER: Python wrapper around the C++ script profiler; collects per-line hit counts
+    # and time and prints them as a table.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Create the underlying C++ profile object.
         self.profile = classes.profiling._ScriptProfile()
 
     def enable(self):
+        # [FUNCTION DOC] HELPER: Start profiling.
         self.profile.enable()
 
     def disable(self):
+        # [FUNCTION DOC] HELPER: Stop profiling.
         self.profile.disable()
 
     def dump_string(self) -> str:
+        # [FUNCTION DOC] HELPER: Build a text table per profiled source (line number, hits, time in ns,
+        # dedented source line) and return them joined by blank lines.
         outputs: list[str] = []
         for source_stats in self.profile._dump_stats():
             source_ref = source_stats.source()
@@ -1790,10 +2022,13 @@ class _ScriptProfile:
         return "\n\n".join(outputs)
 
     def dump(self):
+        # [FUNCTION DOC] HELPER: Print the profile table text.
         print(self.dump_string())
 
 
 def _unwrap_optional(x):
+    # [FUNCTION DOC] HELPER: Registered as the unwrap-optional builtin; raises AssertionError for
+    # None, otherwise returns x.
     if x is None:
         raise AssertionError("Unwrapping null optional")
     return x

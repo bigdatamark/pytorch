@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Save/load support for TorchScript modules (torch.jit.save, torch.jit.load) plus
+# flatbuffer save/load/info helpers and map_location validation. Not imported directly; exposed
+# through torch.jit. No import-time side effects beyond imports.
 """Serialization.
 
 This module contains functionality for serializing TorchScript modules, notably:
@@ -21,6 +24,10 @@ from torch.serialization import validate_cuda_device
 
 
 def save(m, f, _extra_files=None) -> None:
+    # [FUNCTION DOC] Save script module m to f (a path or a file-like object with write). Emits a
+    # FutureWarning (deprecated; unsupported on Python 3.14+) and logs usage. For paths the module
+    # saves itself to the file; otherwise it is serialized to a buffer and written to f. _extra_files
+    # maps file names to contents stored alongside (defaults to empty). Returns nothing.
     r"""
     Save an offline version of this module for use in a separate process.
 
@@ -101,6 +108,12 @@ def save(m, f, _extra_files=None) -> None:
 
 
 def load(f, map_location=None, _extra_files=None, _restore_shapes=False):
+    # [FUNCTION DOC] Load a script module or function from f (path or readable file-like object). Emits
+    # a FutureWarning (deprecated). Raises ValueError if a path does not exist or is a directory, or
+    # if map_location is invalid. Imports the IR module through the C++ loader into a new
+    # compilation unit, filling _extra_files with the stored extra files, wraps it in a Python script
+    # module, logs usage and returns it.
+    # # KNOWN ISSUE: the TODO in the code notes that this loses ConstSequential status and similar.
     r"""
     Load a :class:`ScriptModule` or :class:`ScriptFunction` previously saved with :func:`torch.jit.save <torch.jit.save>`.
 
@@ -214,6 +227,9 @@ def load(f, map_location=None, _extra_files=None, _restore_shapes=False):
 
 
 def validate_map_location(map_location=None):
+    # [FUNCTION DOC] Normalize map_location: a string becomes a device, None and devices pass through;
+    # any other type raises ValueError. A CUDA device is additionally validated (may raise). Returns
+    # the normalized value.
     if isinstance(map_location, str):
         map_location = torch.device(map_location)
     elif not (map_location is None or isinstance(map_location, torch.device)):
@@ -229,6 +245,8 @@ def validate_map_location(map_location=None):
 
 
 def jit_module_from_flatbuffer(f):
+    # [FUNCTION DOC] Load a script module from a flatbuffer file path or a readable file-like object
+    # (its bytes are read) and return it wrapped as a Python script module.
     if isinstance(f, (str, os.PathLike)):
         f = os.fspath(f)
         return wrap_cpp_module(torch._C._load_jit_module_from_file(f))
@@ -237,6 +255,10 @@ def jit_module_from_flatbuffer(f):
 
 
 def save_jit_module_to_flatbuffer(m, f, _extra_files=None) -> None:
+    # [FUNCTION DOC] Save script module m in flatbuffer format. If f is a path the C++ saver writes the
+    # file; otherwise the bytes are written to f. _extra_files maps names to contents (defaults to
+    # empty). Returns nothing.
+    # # KNOWN ISSUE: the docstring says f is only a string path, but file-like objects are also accepted.
     r"""
     Save an offline version of this module for use in a separate process.
 
@@ -287,6 +309,9 @@ def save_jit_module_to_flatbuffer(m, f, _extra_files=None) -> None:
 
 
 def get_flatbuffer_module_info(path_or_file):
+    # [FUNCTION DOC] Read all bytes from a path or file-like object and return the metadata dict that the
+    # C++ flatbuffer inspector produces (bytecode and operator versions, function and type names,
+    # operator argument counts).
     r"""Get some information regarding a model file in flatbuffer format.
 
     Args:
