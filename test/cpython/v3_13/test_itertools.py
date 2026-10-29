@@ -7,6 +7,16 @@
 # Test copied from
 # https://raw.githubusercontent.com/python/cpython/refs/tags/v3.13.5/Lib/test/test_itertools.py
 
+# [MODULE DOC] Dynamo-patched copy of the CPython 3.13 itertools test suite. Defines
+# shared helpers (test callables, predicates, pickling copiers, sequence wrapper classes
+# that misbehave in specific ways) and several CPythonTestCase classes: TestBasicOps
+# (per-function behavior, pickling, tuple reuse, overflow), TestExamples (documentation
+# examples), TestPurePythonRoughEquivalents (recipes versus built-ins), TestGC
+# (reference cycles), TestVariousIteratorArgs (odd iterable arguments),
+# LengthTransparency, RegressionTests and SubclassWithKwargsTest. Import time work:
+# builds the picklecopiers list and wraps random helpers with torch._dynamo.disable.
+# Running the file calls run_tests.
+
 import torch
 import torch._dynamo.test_case
 from torch._dynamo.test_case import CPythonTestCase
@@ -41,12 +51,19 @@ import gc
 import warnings
 
 def pickle_deprecated(testfunc):
+    # [FUNCTION DOC] HELPER: Decorator for pickling tests. Returns a wrapper that runs
+    # the test three times: once expecting a DeprecationWarning, once with those
+    # warnings ignored, and once with warnings turned into errors where the test must
+    # raise DeprecationWarning, AssertionError or SystemError.
     """ Run the test three times.
     First, verify that a Deprecation Warning is raised.
     Second, run normally but with DeprecationWarnings temporarily disabled.
     Third, run with warnings promoted to errors.
     """
     def inner(self):
+        # [FUNCTION DOC] HELPER: The wrapper returned by pickle_deprecated; takes the
+        # test case instance and drives the wrapped test under the three warning
+        # regimes. Raises if the wrapped test misbehaves in any regime.
         with self.assertWarns(DeprecationWarning):
             testfunc(self)
         with warnings.catch_warnings():
@@ -64,79 +81,121 @@ minsize = -maxsize-1
 
 @torch._dynamo.disable
 def choice(*args):
+    # [FUNCTION DOC] HELPER: Dynamo-disabled wrapper returning random.choice of the
+    # given arguments, so random calls are not traced.
     return random.choice(*args)
 
 @torch._dynamo.disable
 def randrange(*args):
+    # [FUNCTION DOC] HELPER: Dynamo-disabled wrapper returning random.randrange of the
+    # given arguments.
     return random.randrange(*args)
 
 def lzip(*args):
+    # [FUNCTION DOC] HELPER: Returns the list of tuples produced by zip over the
+    # arguments.
     return list(zip(*args))
 
 def onearg(x):
+    # [FUNCTION DOC] HELPER: Test function of one argument; returns twice its input.
     'Test function of one argument'
     return 2*x
 
 def errfunc(*args):
+    # [FUNCTION DOC] HELPER: Test function that ignores its arguments and always raises
+    # ValueError.
     'Test function that raises an error'
     raise ValueError
 
 def gen3():
+    # [FUNCTION DOC] HELPER: Generator yielding 0, 1, 2 once; a non-restartable source.
     'Non-restartable source sequence'
     for i in (0, 1, 2):
         yield i
 
 def isEven(x):
+    # [FUNCTION DOC] HELPER: Predicate returning true when x is even.
     'Test predicate'
     return x%2==0
 
 def isOdd(x):
+    # [FUNCTION DOC] HELPER: Predicate returning true when x is odd, using remainder
+    # equal to one (so negative odd numbers give false).
     'Test predicate'
     return x%2==1
 
 def tupleize(*args):
+    # [FUNCTION DOC] HELPER: Returns all positional arguments as a tuple.
     return args
 
 def irange(n):
+    # [FUNCTION DOC] HELPER: Generator yielding the integers 0 up to n minus one.
     for i in range(n):
         yield i
 
 class StopNow:
+    # [CLASS DOC] HELPER: Stateless iterable emulating an empty iterator; its iterator
+    # is itself and next always raises StopIteration.
     'Class emulating an empty iterable.'
     def __iter__(self):
+        # [FUNCTION DOC] HELPER: Returns self.
         return self
     def __next__(self):
+        # [FUNCTION DOC] HELPER: Always raises StopIteration.
         raise StopIteration
 
 def take(n, seq):
+    # [FUNCTION DOC] HELPER: Returns the first n items of seq as a list, consuming that
+    # much of the iterable (works on infinite ones).
     'Convenience function for partially consuming a long of infinite iterable'
     return list(islice(seq, n))
 
 def prod(iterable):
+    # [FUNCTION DOC] HELPER: Returns the product of all items of the iterable, starting
+    # from 1.
     return reduce(operator.mul, iterable, 1)
 
 def fact(n):
+    # [FUNCTION DOC] HELPER: Returns n factorial as the product of the integers 1
+    # through n.
     'Factorial'
     return prod(range(1, n+1))
 
 # root level methods for pickling ability
 def _testR(r):
+    # [FUNCTION DOC] HELPER: Module-level (picklable) function returning the first
+    # element of r.
     return r[0]
 
 def _testR2(r):
+    # [FUNCTION DOC] HELPER: Module-level (picklable) function returning the third
+    # element of r.
     return r[2]
 
 def underten(x):
+    # [FUNCTION DOC] HELPER: Picklable predicate, true when x is less than 10.
     return x<10
 
 picklecopiers = [lambda s, proto=proto: pickle.loads(pickle.dumps(s, proto))
                  for proto in range(pickle.HIGHEST_PROTOCOL + 1)]
 
 class TestBasicOps(__TestCase):
+    # [CLASS DOC] Main test case for each function in itertools: argument validation,
+    # outputs against known results and pure Python reference versions,
+    # copy/deepcopy/pickle round trips, tuple-reuse implementation details and overflow
+    # behavior. No instance state; uses module-level helpers.
 
     def pickletest(self, protocol, it, stop=4, take=1, compare=None):
+        # [FUNCTION DOC] HELPER: Asserts that pickling an iterator at a given protocol
+        # gives an equal one, also after consuming take items. Expands iterators
+        # (recursively, up to stop items each) into lists to compare original and copy;
+        # optionally compares to an expected sequence compare. Raises a failure on
+        # mismatch.
         """Test that an iterator is the same after pickling, also when part-consumed"""
         def expand(it, i=0):
+            # [FUNCTION DOC] HELPER: Expands an iterable into a list of at most stop
+            # items, recursing into nested iterables (strings and non-iterables are
+            # returned as is). Raises RuntimeError if nesting goes deeper than 10.
             # Recursively expand iterables, within sensible bounds
             if i > 10:
                 raise RuntimeError("infinite recursion encountered")
@@ -177,6 +236,11 @@ class TestBasicOps(__TestCase):
 
     @pickle_deprecated
     def test_accumulate(self):
+        # [FUNCTION DOC] Tests accumulate: default addition across
+        # int/complex/Decimal/Fraction and strings, empty and single inputs, bad
+        # argument counts, custom binary functions (min, max, mul), the initial argument
+        # including None, and pickling at all protocols. Marked to also run under the
+        # deprecation-warning wrapper.
         self.assertEqual(list(accumulate(range(10))),               # one positional arg
                           [0, 1, 3, 6, 10, 15, 21, 28, 36, 45])
         self.assertEqual(list(accumulate(iterable=range(10))),      # kw arg
@@ -212,6 +276,10 @@ class TestBasicOps(__TestCase):
             list(accumulate([10, 20], 100))
 
     def test_batched(self):
+        # [FUNCTION DOC] Tests batched: tuple batches of size n with a short final
+        # batch, strict mode raising ValueError on an incomplete batch, TypeError for
+        # missing, extra or wrong-type arguments, ValueError for n of zero or negative,
+        # and a sweep over inputs checking order, no loss and batch sizes.
         self.assertEqual(list(batched('ABCDEFG', 3)),
                              [('A', 'B', 'C'), ('D', 'E', 'F'), ('G',)])
         self.assertEqual(list(batched('ABCDEFG', 2)),
@@ -254,8 +322,13 @@ class TestBasicOps(__TestCase):
                         batches.append(last_batch)
 
     def test_chain(self):
+        # [FUNCTION DOC] Tests chain against a pure Python reference: concatenation of
+        # strings, empty input, partial consumption of infinite iterables via take, and
+        # TypeError for non-iterable arguments.
 
         def chain2(*iterables):
+            # [FUNCTION DOC] HELPER: Pure Python generator version of chain that yields
+            # every element of every iterable in order.
             'Pure python version in the docs'
             for it in iterables:
                 for element in it:
@@ -269,6 +342,9 @@ class TestBasicOps(__TestCase):
             self.assertRaises(TypeError, list,c(2, 3))
 
     def test_chain_from_iterable(self):
+        # [FUNCTION DOC] Tests chain.from_iterable: results for lists of strings, empty,
+        # partial take, TypeError for non-iterable items, and laziness over an infinite
+        # repeat of ranges.
         self.assertEqual(list(chain.from_iterable(['abc', 'def'])), list('abcdef'))
         self.assertEqual(list(chain.from_iterable(['abc'])), list('abc'))
         self.assertEqual(list(chain.from_iterable([''])), [])
@@ -278,6 +354,9 @@ class TestBasicOps(__TestCase):
 
     @pickle_deprecated
     def test_chain_reducible(self):
+        # [FUNCTION DOC] Tests that chain supports deepcopy and pickle round trips,
+        # including after one item was consumed, and still raises TypeError on non-
+        # iterables; also runs the pickletest protocol check.
         for oper in [copy.deepcopy] + picklecopiers:
             it = chain('abc', 'def')
             self.assertEqual(list(oper(it)), list('abcdef'))
@@ -292,6 +371,9 @@ class TestBasicOps(__TestCase):
 
     @pickle_deprecated
     def test_chain_setstate(self):
+        # [FUNCTION DOC] Tests chain.__setstate__: rejects wrong shapes (empty tuple,
+        # list, int, tuple with non-iterator, wrong second item) with TypeError, and
+        # accepts one or two iterators, the second being yielded first.
         self.assertRaises(TypeError, chain().__setstate__, ())
         self.assertRaises(TypeError, chain().__setstate__, [])
         self.assertRaises(TypeError, chain().__setstate__, 0)
@@ -306,6 +388,11 @@ class TestBasicOps(__TestCase):
 
     @pickle_deprecated
     def test_combinations(self):
+        # [FUNCTION DOC] Tests combinations: argument errors (missing r, extra args,
+        # non-iterable pool, negative r), r larger than n gives empty, exact outputs
+        # with copies and pickles also after partial consumption, and a sweep for n up
+        # to 6 checking count, uniqueness, lexicographic order and subsequence property,
+        # equality with three pure Python implementations, plus pickling.
         self.assertRaises(TypeError, combinations, 'abc')       # missing r argument
         self.assertRaises(TypeError, combinations, 'abc', 2, 1) # too many arguments
         self.assertRaises(TypeError, combinations, None)        # pool is not iterable
@@ -329,6 +416,8 @@ class TestBasicOps(__TestCase):
                              [(0,1,3), (0,2,3), (1,2,3)])
 
         def combinations1(iterable, r):
+            # [FUNCTION DOC] HELPER: Pure Python reference generating r-length
+            # combinations with an index list incremented in lexicographic order.
             'Pure python version shown in the docs'
             pool = tuple(iterable)
             n = len(pool)
@@ -348,6 +437,8 @@ class TestBasicOps(__TestCase):
                 yield tuple(pool[i] for i in indices)
 
         def combinations2(iterable, r):
+            # [FUNCTION DOC] HELPER: Reference combinations built by filtering
+            # permutations of indices that are already sorted.
             'Pure python version shown in the docs'
             pool = tuple(iterable)
             n = len(pool)
@@ -356,6 +447,8 @@ class TestBasicOps(__TestCase):
                     yield tuple(pool[i] for i in indices)
 
         def combinations3(iterable, r):
+            # [FUNCTION DOC] HELPER: Reference combinations built by filtering
+            # combinations_with_replacement of indices to those with no repeats.
             'Pure python version from cwr()'
             pool = tuple(iterable)
             n = len(pool)
@@ -386,17 +479,26 @@ class TestBasicOps(__TestCase):
 
     @support.bigaddrspacetest
     def test_combinations_overflow(self):
+        # [FUNCTION DOC] Decorated for big address space tests only. Checks combinations
+        # with a huge r raises OverflowError or MemoryError.
         with self.assertRaises((OverflowError, MemoryError)):
             combinations("AA", 2**29)
 
         # Test implementation detail:  tuple re-use
     @support.impl_detail("tuple reuse is specific to CPython")
     def test_combinations_tuple_reuse(self):
+        # [FUNCTION DOC] CPython implementation detail: the same tuple object is reused
+        # between next calls while it is not retained by the caller; checks one distinct
+        # id when iterated and several when listed.
         self.assertEqual(len(set(map(id, combinations('abcde', 3)))), 1)
         self.assertNotEqual(len(set(map(id, list(combinations('abcde', 3))))), 1)
 
     @pickle_deprecated
     def test_combinations_with_replacement(self):
+        # [FUNCTION DOC] Tests combinations_with_replacement analogously to
+        # combinations: argument errors, exact outputs with copy/pickle, sweep over
+        # sizes checking count formula, uniqueness, order, relation to plain
+        # combinations and to two pure Python implementations, and pickling.
         cwr = combinations_with_replacement
         self.assertRaises(TypeError, cwr, 'abc')       # missing r argument
         self.assertRaises(TypeError, cwr, 'abc', 2, 1) # too many arguments
@@ -413,6 +515,8 @@ class TestBasicOps(__TestCase):
 
 
         def cwr1(iterable, r):
+            # [FUNCTION DOC] HELPER: Reference combinations with replacement using an
+            # index list where a trailing run is reset to the incremented value.
             'Pure python version shown in the docs'
             # number items returned:  (n+r-1)! / r! / (n-1)! when n>0
             pool = tuple(iterable)
@@ -431,6 +535,8 @@ class TestBasicOps(__TestCase):
                 yield tuple(pool[i] for i in indices)
 
         def cwr2(iterable, r):
+            # [FUNCTION DOC] HELPER: Reference version filtering the cartesian product
+            # of index ranges to non-decreasing index tuples.
             'Pure python version shown in the docs'
             pool = tuple(iterable)
             n = len(pool)
@@ -439,6 +545,9 @@ class TestBasicOps(__TestCase):
                     yield tuple(pool[i] for i in indices)
 
         def numcombs(n, r):
+            # [FUNCTION DOC] HELPER: Expected number of combinations with replacement: 1
+            # or 0 when the pool is empty (depending on r), otherwise a factorial
+            # formula.
             if not n:
                 return 0 if r else 1
             return fact(n+r-1) / fact(r)/ fact(n-1)
@@ -474,22 +583,33 @@ class TestBasicOps(__TestCase):
 
     @support.bigaddrspacetest
     def test_combinations_with_replacement_overflow(self):
+        # [FUNCTION DOC] Big address space only. Checks combinations_with_replacement
+        # with an enormous r raises OverflowError or MemoryError.
         with self.assertRaises((OverflowError, MemoryError)):
             combinations_with_replacement("AA", 2**30)
 
         # Test implementation detail:  tuple re-use
     @support.impl_detail("tuple reuse is specific to CPython")
     def test_combinations_with_replacement_tuple_reuse(self):
+        # [FUNCTION DOC] CPython-only check of tuple reuse for
+        # combinations_with_replacement: one id while iterating, several once collected
+        # in a list.
         cwr = combinations_with_replacement
         self.assertEqual(len(set(map(id, cwr('abcde', 3)))), 1)
         self.assertNotEqual(len(set(map(id, list(cwr('abcde', 3))))), 1)
 
     def test_permutations(self):
+        # [FUNCTION DOC] Tests permutations: r larger than n empty, exact small output,
+        # sweep over n up to 4 checking count, uniqueness, order, element membership and
+        # agreement with two pure Python versions, plus r defaulting to the pool size
+        # (None or omitted).
         self.assertEqual(list(permutations('abc', 32)), [])     # r > n
         self.assertEqual(list(permutations(range(3), 2)),
                                            [(0,1), (0,2), (1,0), (1,2), (2,0), (2,1)])
 
         def permutations1(iterable, r=None):
+            # [FUNCTION DOC] HELPER: Reference permutations using indices and cycle
+            # counters; r defaults to the pool size, returns nothing if r exceeds it.
             'Pure python version shown in the docs'
             pool = tuple(iterable)
             n = len(pool)
@@ -514,6 +634,8 @@ class TestBasicOps(__TestCase):
                     return
 
         def permutations2(iterable, r=None):
+            # [FUNCTION DOC] HELPER: Reference permutations filtering the product of
+            # index ranges to tuples with no repeated index.
             'Pure python version shown in the docs'
             pool = tuple(iterable)
             n = len(pool)
@@ -541,15 +663,23 @@ class TestBasicOps(__TestCase):
 
     @support.bigaddrspacetest
     def test_permutations_overflow(self):
+        # [FUNCTION DOC] Big address space only. Checks permutations with an enormous r
+        # raises OverflowError or MemoryError.
         with self.assertRaises((OverflowError, MemoryError)):
             permutations("A", 2**30)
 
     @support.impl_detail("tuple reuse is specific to CPython")
     def test_permutations_tuple_reuse(self):
+        # [FUNCTION DOC] CPython-only check of tuple reuse for permutations (one id
+        # while iterating, many when listed).
         self.assertEqual(len(set(map(id, permutations('abcde', 3)))), 1)
         self.assertNotEqual(len(set(map(id, list(permutations('abcde', 3))))), 1)
 
     def test_combinatorics(self):
+        # [FUNCTION DOC] Checks relationships among product,
+        # combinations_with_replacement, permutations and combinations for small sizes:
+        # output sizes, sorted unique tuples, and each is derivable by filtering another
+        # (for example combinations are the sorted permutations).
         # Test relationships between product(), permutations(),
         # combinations() and combinations_with_replacement().
 
@@ -584,6 +714,12 @@ class TestBasicOps(__TestCase):
 
     @pickle_deprecated
     def test_compress(self):
+        # [FUNCTION DOC] Tests compress: keyword and positional use, all-zero and all-
+        # one selectors, unequal lengths, a large lazy case, TypeError for bad
+        # arguments, and copy, deepcopy and pickle behavior also after one item is
+        # consumed.
+        # KNOWN ISSUE: the last argument error check repeats the second-argument None
+        # call instead of passing too many arguments.
         self.assertEqual(list(compress(data='ABCDEF', selectors=[1,0,1,0,1,1])), list('ACEF'))
         self.assertEqual(list(compress('ABCDEF', [1,0,1,0,1,1])), list('ACEF'))
         self.assertEqual(list(compress('ABCDEF', [0,0,0,0,0,0])), list(''))
@@ -618,6 +754,10 @@ class TestBasicOps(__TestCase):
 
     @pickle_deprecated
     def test_count(self):
+        # [FUNCTION DOC] Tests count with default step: starting values (negative, large
+        # near the machine maximum, float, complex, Decimal, Fraction, huge ints), repr
+        # text changing after next, type preservation, copy, deepcopy and pickle, and
+        # that an enormous step does not leave an error set.
         self.assertEqual(lzip('abc',count()), [('a', 0), ('b', 1), ('c', 2)])
         self.assertEqual(lzip('abc',count(3)), [('a', 3), ('b', 4), ('c', 5)])
         self.assertEqual(take(2, lzip('abc',count(3))), [('a', 3), ('b', 4)])
@@ -678,6 +818,10 @@ class TestBasicOps(__TestCase):
 
     @pickle_deprecated
     def test_count_with_step(self):
+        # [FUNCTION DOC] Tests count with a step: positional and keyword forms, zero,
+        # negative and fractional steps, steps beyond the machine range, huge ints, repr
+        # (step of integer one is suppressed but float one is shown), type of successive
+        # values, and pickling across many start/step combinations.
         self.assertEqual(lzip('abc',count(2,3)), [('a', 2), ('b', 5), ('c', 8)])
         self.assertEqual(lzip('abc',count(start=2,step=3)),
                          [('a', 2), ('b', 5), ('c', 8)])
@@ -754,12 +898,17 @@ class TestBasicOps(__TestCase):
 
     @threading_helper.requires_working_threading()
     def test_count_threading(self, step=1):
+        # [FUNCTION DOC] Needs working threading. Starts ten threads each calling next
+        # 10000 times on one shared count with the given step, joins them, and asserts
+        # the next value equals the total number of calls times the step.
         # this test verifies multithreading consistency, which is
         # mostly for testing builds without GIL, but nice to test anyway
         count_to = 10_000
         num_threads = 10
         c = count(step=step)
         def counting_thread():
+            # [FUNCTION DOC] HELPER: Thread body calling next on the shared counter
+            # count_to times.
             for i in range(count_to):
                 next(c)
         threads = []
@@ -772,9 +921,12 @@ class TestBasicOps(__TestCase):
         self.assertEqual(next(c), count_to * num_threads * step)
 
     def test_count_with_step_threading(self):
+        # [FUNCTION DOC] Runs the threading count test with a step of 5.
         self.test_count_threading(step=5)
 
     def test_cycle(self):
+        # [FUNCTION DOC] Tests cycle: repeating a string, empty input gives empty, non-
+        # iterable raises TypeError, and cycling a one-shot generator caches its items.
         self.assertEqual(take(10, cycle('abc')), list('abcabcabca'))
         self.assertEqual(list(cycle('')), [])
         # self.assertRaises(TypeError, cycle)
@@ -783,6 +935,10 @@ class TestBasicOps(__TestCase):
 
     @pickle_deprecated
     def test_cycle_copy_pickle(self):
+        # [FUNCTION DOC] Tests cycle copy and pickle: deepcopy and pickle at every
+        # protocol after consuming items continue from the right place, pickletest round
+        # trip, and cycles over partially and fully consumed source iterators resume
+        # correctly. Shallow copy is deliberately not tested.
         # check copy, deepcopy, pickle
         c = cycle('abc')
         self.assertEqual(next(c), 'a')
@@ -820,6 +976,11 @@ class TestBasicOps(__TestCase):
 
     @pickle_deprecated
     def test_cycle_unpickle_compat(self):
+        # [FUNCTION DOC] Loads 20 hard-coded pickle byte strings (protocols 0 to 4,
+        # several state encodings) produced by older Python versions for a cycle over a
+        # partly consumed list, and checks each unpickles to a cycle whose next ten
+        # items are 2, 3, 1, 2, 3, 1, 2, 3, 1, 2. Uses a plain assert for the count of
+        # cases.
         testcases = [
             b'citertools\ncycle\n(c__builtin__\niter\n((lI1\naI2\naI3\natRI1\nbtR((lI1\naI0\ntb.',
             b'citertools\ncycle\n(c__builtin__\niter\n(](K\x01K\x02K\x03etRK\x01btR(]K\x01aK\x00tb.',
@@ -852,6 +1013,10 @@ class TestBasicOps(__TestCase):
 
     @pickle_deprecated
     def test_cycle_setstate(self):
+        # [FUNCTION DOC] Tests cycle.__setstate__ in both modes (state holds only
+        # consumed values with flag 0, or all seen values with flag 1) yielding the same
+        # infinite sequence, and TypeError for a non-tuple state, a non-list first
+        # element, a non-int flag, or malformed tuples.
         # Verify both modes for restoring state
 
         # Mode 0 is efficient.  It uses an incompletely consumed input
@@ -889,6 +1054,12 @@ class TestBasicOps(__TestCase):
 
     @pickle_deprecated
     def test_groupby(self):
+        # [FUNCTION DOC] Tests groupby: argument handling (empty input, key, bad types),
+        # grouping with a key function, pickled and nested groupby, skipping inner
+        # groups, using inner groups after the outer iterator advanced (they are empty),
+        # shell-like sort/uniq pipelines on a word, and propagation of exceptions from
+        # iteration, equality comparison and the key function on both outer and inner
+        # objects.
         # Check whether it accepts arguments correctly
         self.assertEqual([], list(groupby([])))
         self.assertEqual([], list(groupby([], key=id)))
@@ -980,12 +1151,19 @@ class TestBasicOps(__TestCase):
 
         # iter.__next__ failure
         class ExpectedError(Exception):
+            # [CLASS DOC] HELPER: Marker exception raised deliberately by the fixtures
+            # in this test.
             pass
         def delayed_raise(n=0):
+            # [FUNCTION DOC] HELPER: Generator yielding the string yo n times and then
+            # raising ExpectedError.
             for i in range(n):
                 yield 'yo'
             raise ExpectedError
         def gulp(iterable, keyp=None, func=list):
+            # [FUNCTION DOC] HELPER: Groups the iterable with the optional key function
+            # and returns a list of func applied to each group (list by default),
+            # forcing consumption of every group.
             return [func(g) for k, g in groupby(iterable, keyp)]
 
         # iter.__next__ failure on outer object
@@ -995,7 +1173,10 @@ class TestBasicOps(__TestCase):
 
         # __eq__ failure
         class DummyCmp:
+            # [CLASS DOC] HELPER: Object whose equality always raises ExpectedError,
+            # used to test error propagation from key comparison.
             def __eq__(self, dst):
+                # [FUNCTION DOC] HELPER: Always raises ExpectedError.
                 raise ExpectedError
         s = [DummyCmp(), DummyCmp(), None]
 
@@ -1006,6 +1187,9 @@ class TestBasicOps(__TestCase):
 
         # keyfunc failure
         def keyfunc(obj):
+            # [FUNCTION DOC] HELPER: Key function that returns the object while the skip
+            # counter attribute on the function is positive (decrementing it), then
+            # raises ExpectedError.
             if keyfunc.skip > 0:
                 keyfunc.skip -= 1
                 return obj
@@ -1019,6 +1203,9 @@ class TestBasicOps(__TestCase):
         self.assertRaises(ExpectedError, gulp, [None, None], keyfunc)
 
     def test_filter(self):
+        # [FUNCTION DOC] Tests the built-in filter with a predicate, None and bool, and
+        # lazily over an infinite count. The TypeError, copy and pickle checks are
+        # commented out because dynamo raises its own exceptions or lacks support.
         self.assertEqual(list(filter(isEven, range(6))), [0,2,4])
         self.assertEqual(list(filter(None, [0,1,0,2,0])), [1,2])
         self.assertEqual(list(filter(bool, [0,1,0,2,0])), [1,2])
@@ -1048,6 +1235,9 @@ class TestBasicOps(__TestCase):
         #     self.pickletest(proto, c)
 
     def test_filterfalse(self):
+        # [FUNCTION DOC] Tests filterfalse: complement of filter for predicates, None
+        # and bool, laziness over infinite input, TypeError for bad arguments or non-
+        # callable predicate when iterated, and pickling at all protocols.
         self.assertEqual(list(filterfalse(isEven, range(6))), [1,3,5])
         self.assertEqual(list(filterfalse(None, [0,1,0,2,0])), [0,0,0])
         self.assertEqual(list(filterfalse(bool, [0,1,0,2,0])), [0,0,0])
@@ -1061,6 +1251,9 @@ class TestBasicOps(__TestCase):
             self.pickletest(proto, filterfalse(isEven, range(6)))
 
     def test_zip(self):
+        # [FUNCTION DOC] Tests the built-in zip: pairing against a helper, truncation to
+        # the shortest input, laziness with an infinite count, no arguments, and tuple
+        # conversion of pairs. The TypeError checks are commented out.
         # XXX This is rather silly now that builtin zip() calls zip()...
         ans = [(x,y) for x, y in zip('abc',count())]
         self.assertEqual(ans, [('a', 0), ('b', 1), ('c', 2)])
@@ -1079,6 +1272,10 @@ class TestBasicOps(__TestCase):
     @support.impl_detail("tuple reuse is specific to CPython")
     @pickle_deprecated
     def test_zip_tuple_reuse(self):
+        # [FUNCTION DOC] CPython implementation detail: zip reuses its result tuple (one
+        # id when consumed, distinct ids when listed). Also checks copy, deepcopy and
+        # pickle give the same pairs, including after one item consumed, and runs
+        # pickletest.
         ids = list(map(id, zip('abc', 'def')))
         self.assertEqual(min(ids), max(ids))
         ids = list(map(id, list(zip('abc', 'def'))))
@@ -1105,6 +1302,10 @@ class TestBasicOps(__TestCase):
             self.pickletest(proto, zip('abc', count()))
 
     def test_ziplongest(self):
+        # [FUNCTION DOC] Tests zip_longest on mixed-length inputs with default None fill
+        # and a fillvalue, with and without an empty keyword mapping, laziness with
+        # infinite input, zero or one arguments, and pair conversion. The TypeError
+        # checks are commented out.
         for args in [
                 ['abc', range(6)],
                 [range(6), 'abc'],
@@ -1148,6 +1349,8 @@ class TestBasicOps(__TestCase):
 
     @support.impl_detail("tuple reuse is specific to CPython")
     def test_zip_longest_tuple_reuse(self):
+        # [FUNCTION DOC] CPython implementation detail: zip_longest reuses the result
+        # tuple; one id when iterated, distinct ids when collected.
         ids = list(map(id, zip_longest('abc', 'def')))
         self.assertEqual(min(ids), max(ids))
         ids = list(map(id, list(zip_longest('abc', 'def'))))
@@ -1155,6 +1358,8 @@ class TestBasicOps(__TestCase):
 
     @pickle_deprecated
     def test_zip_longest_pickling(self):
+        # [FUNCTION DOC] Runs the pickletest round trip for zip_longest with equal and
+        # unequal lengths, a fillvalue and an empty first input at every protocol.
         for proto in range(pickle.HIGHEST_PROTOCOL + 1):
             self.pickletest(proto, zip_longest("abc", "def"))
             self.pickletest(proto, zip_longest("abc", "defgh"))
@@ -1162,10 +1367,16 @@ class TestBasicOps(__TestCase):
             self.pickletest(proto, zip_longest("", "defgh"))
 
     def test_zip_longest_bad_iterable(self):
+        # [FUNCTION DOC] Checks that an exception raised by an input's __iter__ during
+        # zip_longest construction propagates unchanged (the same TypeError object).
         exception = TypeError()
 
         class BadIterable:
+            # [CLASS DOC] HELPER: Iterable whose __iter__ raises a captured exception
+            # object.
             def __iter__(self):
+                # [FUNCTION DOC] HELPER: Raises the exception stored in the enclosing
+                # test.
                 raise exception
 
         with self.assertRaises(TypeError) as cm:
@@ -1174,16 +1385,27 @@ class TestBasicOps(__TestCase):
         self.assertIs(cm.exception, exception)
 
     def test_bug_7244(self):
+        # [FUNCTION DOC] Regression for bug 7244: zip_longest must treat StopIteration
+        # from custom iterators normally (terminating, with the fill value used after
+        # the shorter one ends) and must not swallow a RuntimeError raised by an
+        # iterator; prints are captured.
 
         class Repeater:
+            # [CLASS DOC] HELPER: Iterator similar to repeat: yields o up to t times
+            # then raises the exception e it was given. Its iterator is itself.
             # this class is similar to itertools.repeat
             def __init__(self, o, t, e):
+                # [FUNCTION DOC] HELPER: Stores the value, converts the count to int and
+                # stores the exception to raise.
                 self.o = o
                 self.t = int(t)
                 self.e = e
             def __iter__(self): # its iterator is itself
+                # [FUNCTION DOC] HELPER: Returns self.
                 return self
             def __next__(self):
+                # [FUNCTION DOC] HELPER: Returns the value while the remaining count is
+                # positive (decrementing it), otherwise raises the stored exception.
                 if self.t > 0:
                     self.t -= 1
                     return self.o
@@ -1195,6 +1417,9 @@ class TestBasicOps(__TestCase):
         r1 = Repeater(1, 3, StopIteration)
         r2 = Repeater(2, 4, StopIteration)
         def run(r1, r2):
+            # [FUNCTION DOC] HELPER: Collects the pairs from zip_longest of two
+            # iterators with fill 0, printing each pair under captured stdout, and
+            # returns the list.
             result = []
             for i, j in zip_longest(r1, r2, fillvalue=0):
                 with support.captured_output('stdout'):
@@ -1214,6 +1439,9 @@ class TestBasicOps(__TestCase):
         self.assertRaises(RuntimeError, next, it)
 
     def test_pairwise(self):
+        # [FUNCTION DOC] Tests pairwise: empty and one-element input, sliding pairs on
+        # strings and 10000 ranges, and TypeError for no arguments, extra arguments,
+        # keyword use and non-iterables.
         self.assertEqual(list(pairwise('')), [])
         self.assertEqual(list(pairwise('a')), [])
         self.assertEqual(list(pairwise('ab')),
@@ -1233,12 +1461,25 @@ class TestBasicOps(__TestCase):
             pairwise(None)                                  # non-iterable argument
 
     def test_pairwise_reenter(self):
+        # [FUNCTION DOC] Tests that pairwise copes with its input iterator re-entering
+        # the pairwise iterator itself during next, for several combinations of call
+        # numbers at which the re-entry occurs; the nested results (pairs containing
+        # pairs) are asserted exactly.
         def check(reenter_at, expected):
+            # [FUNCTION DOC] HELPER: Builds a pairwise over an iterator that re-enters
+            # it on the given call numbers and asserts the produced items equal the
+            # expected list.
             class I:
+                # [CLASS DOC] HELPER: Iterator counting calls to next; on call numbers
+                # listed in reenter_at it returns the next item of the outer pairwise
+                # iterator, otherwise a fresh single-item list holding the call count.
                 count = 0
                 def __iter__(self):
+                    # [FUNCTION DOC] HELPER: Returns self.
                     return self
                 def __next__(self):
+                    # [FUNCTION DOC] HELPER: Increments the call count and either re-
+                    # enters the outer iterator or returns a one-item list of the count.
                     self.count +=1
                     if self.count in reenter_at:
                         return next(it)
@@ -1283,12 +1524,24 @@ class TestBasicOps(__TestCase):
         ])
 
     def test_pairwise_reenter2(self):
+        # [FUNCTION DOC] Tests pairwise when the source re-enters it during the very
+        # first call and then ends after a maximum number of items; the list of results
+        # for different maximums is asserted (no pairs for up to three items).
         def check(maxcount, expected):
+            # [FUNCTION DOC] HELPER: Builds a pairwise over an iterator limited to
+            # maxcount calls and asserts the full list equals expected.
             class I:
+                # [CLASS DOC] HELPER: Iterator that stops after maxcount items, re-
+                # enters the pairwise iterator on its first call (returning its next
+                # item or None) and yields one-item lists of the count afterwards.
                 count = 0
                 def __iter__(self):
+                    # [FUNCTION DOC] HELPER: Returns self.
                     return self
                 def __next__(self):
+                    # [FUNCTION DOC] HELPER: Raises StopIteration past maxcount;
+                    # otherwise increments the count and returns the re-entrant result
+                    # on call one or a one-item list of the count.
                     if self.count >= maxcount:
                         raise StopIteration
                     self.count +=1
@@ -1305,6 +1558,11 @@ class TestBasicOps(__TestCase):
         check(4, [(([2], [3]), [4])])
 
     def test_product(self):
+        # [FUNCTION DOC] Tests product: zero, one, many and empty iterables with and
+        # without repeat, size of a large product, and agreement with two pure Python
+        # implementations for 100 random combinations of argument types (strings,
+        # ranges, dict, set, tuple), including when the arguments are one-shot
+        # iterators.
         for args, result in [
             ([], [()]),                     # zero iterables
             (['ab'], [('a',), ('b',)]),     # one iterable
@@ -1320,6 +1578,9 @@ class TestBasicOps(__TestCase):
         self.assertEqual(len(list(product(*[range(7)]*6))), 7**6)
 
         def product1(*args, **kwds):
+            # [FUNCTION DOC] HELPER: Reference cartesian product advancing indices right
+            # to left; the keyword repeat multiplies the pools; empty pool gives
+            # nothing, no pools gives one empty tuple.
             pools = list(map(tuple, args)) * kwds.get('repeat', 1)
             n = len(pools)
             if n == 0:
@@ -1342,6 +1603,9 @@ class TestBasicOps(__TestCase):
                     return
 
         def product2(*iterables, repeat=1):
+            # [FUNCTION DOC] HELPER: Reference cartesian product from the docs, built by
+            # repeatedly extending a list of partial results; raises ValueError for a
+            # negative repeat.
             'Pure python version used in docs'
             if repeat < 0:
                 raise ValueError('repeat argument cannot be negative')
@@ -1367,16 +1631,23 @@ class TestBasicOps(__TestCase):
 
     @support.bigaddrspacetest
     def test_product_overflow(self):
+        # [FUNCTION DOC] Big address space only. Checks product with a large number of
+        # iterables and an enormous repeat raises OverflowError or MemoryError.
         with self.assertRaises((OverflowError, MemoryError)):
             product(*(['ab']*2**5), repeat=2**25)
 
     @support.impl_detail("tuple reuse is specific to CPython")
     def test_product_tuple_reuse(self):
+        # [FUNCTION DOC] CPython-only check of tuple reuse for product (one id when
+        # iterated, many when listed).
         self.assertEqual(len(set(map(id, product('abc', 'def')))), 1)
         self.assertNotEqual(len(set(map(id, list(product('abc', 'def'))))), 1)
 
     @pickle_deprecated
     def test_product_pickling(self):
+        # [FUNCTION DOC] Checks copy and deepcopy of product objects give the same
+        # results and that pickletest passes for every protocol, over empty, single and
+        # multiple iterables.
         # check copy, deepcopy, pickle
         for args, result in [
             ([], [()]),                     # zero iterables
@@ -1393,6 +1664,9 @@ class TestBasicOps(__TestCase):
 
     @pickle_deprecated
     def test_product_issue_25021(self):
+        # [FUNCTION DOC] Regression for issue 25021: restoring product state with an
+        # index beyond the tuple length must clamp it (next gives the last element
+        # combination), and an empty pool in the state yields immediate StopIteration.
         # test that indices are properly clamped to the length of the tuples
         p = product((1, 2),(3,))
         p.__setstate__((0, 0x1000))  # will access tuple element 1 if not clamped
@@ -1404,6 +1678,11 @@ class TestBasicOps(__TestCase):
 
     @pickle_deprecated
     def test_repeat(self):
+        # [FUNCTION DOC] Tests repeat (decorated for deprecation-warning runs): keyword
+        # arguments, finite and infinite use, zero or negative times give empty,
+        # TypeError for wrong arguments, repr with and without a count (a finished
+        # repeat shows a count of zero), and copy, deepcopy and pickle round trips of a
+        # partly consumed repeat.
         self.assertEqual(list(repeat(object='a', times=3)), ['a', 'a', 'a'])
         self.assertEqual(lzip(range(3),repeat('a')),
                          [(0, 'a'), (1, 'a'), (2, 'a')])
@@ -1430,6 +1709,8 @@ class TestBasicOps(__TestCase):
             self.pickletest(proto, repeat(object='a', times=10))
 
     def test_repeat_with_negative_times(self):
+        # [FUNCTION DOC] Checks that repr of repeat normalizes a negative times count to
+        # zero for positional and keyword forms.
         self.assertEqual(repr(repeat('a', -1)), "repeat('a', 0)")
         self.assertEqual(repr(repeat('a', -2)), "repeat('a', 0)")
         self.assertEqual(repr(repeat('a', times=-1)), "repeat('a', 0)")
@@ -1437,6 +1718,10 @@ class TestBasicOps(__TestCase):
 
     @pickle_deprecated
     def test_map(self):
+        # [FUNCTION DOC] Tests the built-in map with multiple iterables (stops at
+        # shortest), infinite inputs, no iterables, TypeError for bad callables or
+        # argument counts, ValueError propagation, and copy, deepcopy and pickle round
+        # trips.
         self.assertEqual(list(map(operator.pow, range(3), range(1,7))),
                          [0**1, 1**2, 2**3])
         self.assertEqual(list(map(tupleize, 'abc', range(5))),
@@ -1468,6 +1753,10 @@ class TestBasicOps(__TestCase):
 
     # @pickle_deprecated
     def test_starmap(self):
+        # [FUNCTION DOC] Tests starmap: unpacking argument tuples from zip, infinite
+        # sources, empty input, an iterator as the argument tuple, and errors from a
+        # non-callable or a raising function. Several TypeError, copy and pickle checks
+        # are commented out for dynamo.
         self.assertEqual(list(starmap(operator.pow, zip(range(3), range(1,7)))),
                          [0**1, 1**2, 2**3])
         self.assertEqual(take(3, starmap(operator.pow, zip(count(), count(1)))),
@@ -1496,6 +1785,12 @@ class TestBasicOps(__TestCase):
 
     @pickle_deprecated
     def test_islice(self):
+        # [FUNCTION DOC] Tests islice: agreement with range for many start/stop/step
+        # forms, stopping when the source ends, None arguments, exact number of items
+        # consumed from the source, invalid arguments (wrong count, negative, zero step,
+        # non-integers) raising TypeError or ValueError, copy/deepcopy/pickle, release
+        # of the source reference once exhausted (weakref check) and acceptance of
+        # objects implementing index.
         for args in [          # islice(args) should agree with range(args)
                 (10, 20, 3),
                 (10, 3, 20),
@@ -1579,9 +1874,14 @@ class TestBasicOps(__TestCase):
         # Issue #30537: islice can accept integer-like objects as
         # arguments
         class IntLike(object):
+            # [CLASS DOC] HELPER: Wrapper around an int exposing it through the integer-
+            # conversion protocol, used to verify islice accepts integer-like arguments.
             def __init__(self, val):
+                # [FUNCTION DOC] HELPER: Stores the wrapped integer.
                 self.val = val
             def __index__(self):
+                # [FUNCTION DOC] HELPER: Returns the wrapped integer for integer
+                # conversion.
                 return self.val
         self.assertEqual(list(islice(range(100), IntLike(10))), list(range(10)))
         self.assertEqual(list(islice(range(100), IntLike(10), IntLike(50))),
@@ -1591,6 +1891,9 @@ class TestBasicOps(__TestCase):
 
     # @pickle_deprecated
     def test_takewhile(self):
+        # [FUNCTION DOC] Tests takewhile: stops at the first false predicate result,
+        # empty input, TypeError for bad arguments or non-callable predicate, exhaustion
+        # afterward. The ValueError, copy and pickle checks are commented out.
         data = [1, 3, 5, 20, 2, 4, 6, 8]
         self.assertEqual(list(takewhile(underten, data)), [1, 3, 5])
         self.assertEqual(list(takewhile(underten, [])), [])
@@ -1612,6 +1915,9 @@ class TestBasicOps(__TestCase):
 
     # @pickle_deprecated
     def test_dropwhile(self):
+        # [FUNCTION DOC] Tests dropwhile: skips items while the predicate is true then
+        # yields everything, empty input, TypeError for bad arguments or a non-callable
+        # predicate. The remaining error, copy and pickle checks are commented out.
         data = [1, 3, 5, 20, 2, 4, 6, 8]
         self.assertEqual(list(dropwhile(underten, data)), [20, 2, 4, 6, 8])
         self.assertEqual(list(dropwhile(underten, [])), [])
@@ -1630,6 +1936,12 @@ class TestBasicOps(__TestCase):
 
     @pickle_deprecated
     def test_tee(self):
+        # [FUNCTION DOC] Tests tee: empty input, fully and non-interleaved consumption,
+        # deallocating the leading or trailing copy, random interleaving, argument
+        # validation, constructing a tee object from an iterable, multi-way lagged
+        # splits, valid and invalid n, independence of tee objects, tee_new, weak
+        # reference support, and copy, partially consumed copy, deepcopy and pickle of
+        # tee objects.
         n = 200
 
         a, b = tee([])        # test empty iterator
@@ -1780,6 +2092,9 @@ class TestBasicOps(__TestCase):
             self.pickletest(proto, b, compare=ans)
 
     def test_tee_dealloc_segfault(self):
+        # [FUNCTION DOC] Regression for gh-115874: runs a subprocess that stores a tee
+        # object in a module at exit to check interpreter shutdown does not segfault;
+        # asserts the subprocess exits cleanly.
         # gh-115874: segfaults when accessing module state in tp_dealloc.
         script = (
             "import typing, copyreg, itertools; "
@@ -1790,6 +2105,10 @@ class TestBasicOps(__TestCase):
     # Issue 13454: Crash when deleting backward iterator from tee()
     @skipIfTorchDynamo("infinite loop in torch dynamo")
     def test_tee_del_backward(self):
+        # [FUNCTION DOC] Regression for issue 13454: exhausts the forward tee of a very
+        # long repeat and then deletes the backward one (must not crash). Skipped under
+        # dynamo because of an infinite loop; cleans up both names if an exception
+        # occurs and re-raises.
         forward, backward = tee(repeat(None, 20000000))
         try:
             any(forward)  # exhaust the iterator
@@ -1799,11 +2118,18 @@ class TestBasicOps(__TestCase):
             raise
 
     def test_tee_reenter(self):
+        # [FUNCTION DOC] Checks that a source iterator whose first next call asks for an
+        # item from the sibling tee object makes next raise RuntimeError mentioning tee.
         class I:
+            # [CLASS DOC] HELPER: Iterator whose first next call fetches from the second
+            # tee object (re-entering tee) and later calls return nothing.
             first = True
             def __iter__(self):
+                # [FUNCTION DOC] HELPER: Returns self.
                 return self
             def __next__(self):
+                # [FUNCTION DOC] HELPER: On the first call returns next of the sibling
+                # tee (triggering re-entry); afterwards returns None.
                 first = self.first
                 self.first = False
                 if first:
@@ -1815,12 +2141,21 @@ class TestBasicOps(__TestCase):
 
     @threading_helper.requires_working_threading()
     def test_tee_concurrent(self):
+        # [FUNCTION DOC] Needs working threading. Starts a thread that blocks inside the
+        # source iterator while holding one tee, then asserts that using the other tee
+        # from the main thread raises RuntimeError mentioning tee; always releases the
+        # blocked thread and joins it.
         start = threading.Event()
         finish = threading.Event()
         class I:
+            # [CLASS DOC] HELPER: Iterator whose next sets the start event and blocks
+            # until the finish event is set.
             def __iter__(self):
+                # [FUNCTION DOC] HELPER: Returns self.
                 return self
             def __next__(self):
+                # [FUNCTION DOC] HELPER: Signals the start event, then waits on the
+                # finish event, returning None.
                 start.set()
                 finish.wait()
 
@@ -1836,6 +2171,10 @@ class TestBasicOps(__TestCase):
             thread.join()
 
     def test_StopIteration(self):
+        # [FUNCTION DOC] Checks that next on a fresh empty iterator raises StopIteration
+        # for every itertools type and the filter-like built-ins, including when the
+        # source is the always-empty StopNow helper and for tee, islice and a zero-count
+        # repeat.
         self.assertRaises(StopIteration, next, zip())
 
         for f in (chain, cycle, zip, groupby):
@@ -1860,6 +2199,9 @@ class TestBasicOps(__TestCase):
 
     @support.cpython_only
     def test_combinations_result_gc(self):
+        # [FUNCTION DOC] CPython-only regression for bpo-42536: after garbage collection
+        # untracked the reused result tuple of combinations, the tuple returned by the
+        # next step must be tracked again.
         # bpo-42536: combinations's tuple-reuse speed trick breaks the GC's
         # assumptions about what can be untracked. Make sure we re-track result
         # tuples whenever we reuse them.
@@ -1873,6 +2215,8 @@ class TestBasicOps(__TestCase):
 
     @support.cpython_only
     def test_combinations_with_replacement_result_gc(self):
+        # [FUNCTION DOC] CPython-only: same GC re-tracking check for the result tuple of
+        # combinations_with_replacement.
         # Ditto for combinations_with_replacement.
         it = combinations_with_replacement([None, []], 1)
         next(it)
@@ -1881,6 +2225,7 @@ class TestBasicOps(__TestCase):
 
     @support.cpython_only
     def test_permutations_result_gc(self):
+        # [FUNCTION DOC] CPython-only: same GC re-tracking check for permutations.
         # Ditto for permutations.
         it = permutations([None, []], 1)
         next(it)
@@ -1889,6 +2234,7 @@ class TestBasicOps(__TestCase):
 
     @support.cpython_only
     def test_product_result_gc(self):
+        # [FUNCTION DOC] CPython-only: same GC re-tracking check for product.
         # Ditto for product.
         it = product([None, []])
         next(it)
@@ -1897,6 +2243,7 @@ class TestBasicOps(__TestCase):
 
     @support.cpython_only
     def test_zip_longest_result_gc(self):
+        # [FUNCTION DOC] CPython-only: same GC re-tracking check for zip_longest.
         # Ditto for zip_longest.
         it = zip_longest([[]])
         gc.collect()
@@ -1904,6 +2251,7 @@ class TestBasicOps(__TestCase):
 
     @support.cpython_only
     def test_pairwise_result_gc(self):
+        # [FUNCTION DOC] CPython-only: same GC re-tracking check for pairwise.
         # Ditto for pairwise.
         it = pairwise([None, None])
         gc.collect()
@@ -1911,6 +2259,9 @@ class TestBasicOps(__TestCase):
 
     @support.cpython_only
     def test_immutable_types(self):
+        # [FUNCTION DOC] CPython-only. For each itertools type (including the private
+        # grouper and tee helper types) checks that assigning a new attribute on the
+        # type raises TypeError mentioning immutable; reported per type via subTest.
         from itertools import _grouper, _tee, _tee_dataobject
         dataset = (
             accumulate,
@@ -1943,12 +2294,17 @@ class TestBasicOps(__TestCase):
 
 
 class TestExamples(__TestCase):
+    # [CLASS DOC] Tests that the examples in the itertools documentation produce the
+    # documented results, plus pickle and copy checks for accumulate. No state.
 
     def test_accumulate(self):
+        # [FUNCTION DOC] Checks accumulate of 1 to 5 gives running sums.
         self.assertEqual(list(accumulate([1,2,3,4,5])), [1, 3, 6, 10, 15])
 
     @pickle_deprecated
     def test_accumulate_reducible(self):
+        # [FUNCTION DOC] Checks accumulate can be copied, deep-copied and pickled at
+        # every protocol, both fresh and after one item has been consumed.
         # check copy, deepcopy, pickle
         data = [1, 2, 3, 4, 5]
         accumulated = [1, 3, 6, 10, 15]
@@ -1965,6 +2321,9 @@ class TestExamples(__TestCase):
 
     @pickle_deprecated
     def test_accumulate_reducible_none(self):
+        # [FUNCTION DOC] Regression for issue 25718: accumulate whose running total is
+        # None (with the identity-test operator) survives pickling, copy and deepcopy
+        # after the first item, yielding true then false.
         # Issue #25718: total is None
         it = accumulate([None, None, None], operator.is_)
         self.assertEqual(next(it), None)
@@ -1975,68 +2334,94 @@ class TestExamples(__TestCase):
         self.assertEqual(list(copy.copy(it)), [True, False])
 
     def test_chain(self):
+        # [FUNCTION DOC] Checks chain of two strings joins to one string.
         self.assertEqual(''.join(chain('ABC', 'DEF')), 'ABCDEF')
 
     def test_chain_from_iterable(self):
+        # [FUNCTION DOC] Checks chain.from_iterable of a list of two strings.
         self.assertEqual(''.join(chain.from_iterable(['ABC', 'DEF'])), 'ABCDEF')
 
     def test_combinations(self):
+        # [FUNCTION DOC] Checks the documented combinations outputs for four letters
+        # taken two at a time and for range(4) taken three at a time.
         self.assertEqual(list(combinations('ABCD', 2)),
                          [('A','B'), ('A','C'), ('A','D'), ('B','C'), ('B','D'), ('C','D')])
         self.assertEqual(list(combinations(range(4), 3)),
                          [(0,1,2), (0,1,3), (0,2,3), (1,2,3)])
 
     def test_combinations_with_replacement(self):
+        # [FUNCTION DOC] Checks the documented combinations_with_replacement output for
+        # three letters, two at a time.
         self.assertEqual(list(combinations_with_replacement('ABC', 2)),
                          [('A','A'), ('A','B'), ('A','C'), ('B','B'), ('B','C'), ('C','C')])
 
     def test_compress(self):
+        # [FUNCTION DOC] Checks the documented compress example selects letters A, C, E,
+        # F.
         self.assertEqual(list(compress('ABCDEF', [1,0,1,0,1,1])), list('ACEF'))
 
     def test_count(self):
+        # [FUNCTION DOC] Checks count starting at 10 sliced to five items.
         self.assertEqual(list(islice(count(10), 5)), [10, 11, 12, 13, 14])
 
     def test_cycle(self):
+        # [FUNCTION DOC] Checks cycle over four letters sliced to twelve items.
         self.assertEqual(list(islice(cycle('ABCD'), 12)), list('ABCDABCDABCD'))
 
     def test_dropwhile(self):
+        # [FUNCTION DOC] Checks dropwhile with a less-than-five predicate leaves the
+        # tail starting at 6.
         self.assertEqual(list(dropwhile(lambda x: x<5, [1,4,6,4,1])), [6,4,1])
 
     def test_groupby(self):
+        # [FUNCTION DOC] Checks groupby keys and group contents for runs of repeated
+        # letters.
         self.assertEqual([k for k, g in groupby('AAAABBBCCDAABBB')],
                          list('ABCDAB'))
         self.assertEqual([(list(g)) for k, g in groupby('AAAABBBCCD')],
                          [list('AAAA'), list('BBB'), list('CC'), list('D')])
 
     def test_filter(self):
+        # [FUNCTION DOC] Checks filter keeps the odd numbers below ten.
         self.assertEqual(list(filter(lambda x: x%2, range(10))), [1,3,5,7,9])
 
     def test_filterfalse(self):
+        # [FUNCTION DOC] Checks filterfalse keeps the even numbers below ten.
         self.assertEqual(list(filterfalse(lambda x: x%2, range(10))), [0,2,4,6,8])
 
     def test_map(self):
+        # [FUNCTION DOC] Checks map with pow over two tuples.
         self.assertEqual(list(map(pow, (2,3,10), (5,2,3))), [32, 9, 1000])
 
     def test_islice(self):
+        # [FUNCTION DOC] Checks islice with stop only, start and stop, open stop, and a
+        # step of two.
         self.assertEqual(list(islice('ABCDEFG', 2)), list('AB'))
         self.assertEqual(list(islice('ABCDEFG', 2, 4)), list('CD'))
         self.assertEqual(list(islice('ABCDEFG', 2, None)), list('CDEFG'))
         self.assertEqual(list(islice('ABCDEFG', 0, None, 2)), list('ACEG'))
 
     def test_zip(self):
+        # [FUNCTION DOC] Checks zip truncates to the shorter of two inputs.
         self.assertEqual(list(zip('ABCD', 'xy')), [('A', 'x'), ('B', 'y')])
 
     def test_zip_longest(self):
+        # [FUNCTION DOC] Checks zip_longest pads the shorter input with the given fill
+        # value.
         self.assertEqual(list(zip_longest('ABCD', 'xy', fillvalue='-')),
                          [('A', 'x'), ('B', 'y'), ('C', '-'), ('D', '-')])
 
     def test_permutations(self):
+        # [FUNCTION DOC] Checks the documented permutations for letters (r=2) and for
+        # range(3) with default r.
         self.assertEqual(list(permutations('ABCD', 2)),
                          list(map(tuple, 'AB AC AD BA BC BD CA CB CD DA DB DC'.split())))
         self.assertEqual(list(permutations(range(3))),
                          [(0,1,2), (0,2,1), (1,0,2), (1,2,0), (2,0,1), (2,1,0)])
 
     def test_product(self):
+        # [FUNCTION DOC] Checks the documented product examples: two strings, and
+        # range(2) with repeat 3.
         self.assertEqual(list(product('ABCD', 'xy')),
                          list(map(tuple, 'Ax Ay Bx By Cx Cy Dx Dy'.split())))
         self.assertEqual(list(product(range(2), repeat=3)),
@@ -2044,20 +2429,33 @@ class TestExamples(__TestCase):
                          (1,0,0), (1,0,1), (1,1,0), (1,1,1)])
 
     def test_repeat(self):
+        # [FUNCTION DOC] Checks repeat of 10 three times.
         self.assertEqual(list(repeat(10, 3)), [10, 10, 10])
 
     def test_stapmap(self):
+        # [FUNCTION DOC] Checks starmap with pow over argument tuples. (Name is
+        # misspelled as stapmap in the source.)
         self.assertEqual(list(starmap(pow, [(2,5), (3,2), (10,3)])),
                          [32, 9, 1000])
 
     def test_takewhile(self):
+        # [FUNCTION DOC] Checks takewhile with a less-than-five predicate.
         self.assertEqual(list(takewhile(lambda x: x<5, [1,4,6,4,1])), [1,4])
 
 
 class TestPurePythonRoughEquivalents(__TestCase):
+    # [CLASS DOC] Tests that pure Python recipes from the documentation (batched,
+    # islice, tee) behave like the corresponding C implementations. Holds no state.
 
     def test_batched_recipe(self):
+        # [FUNCTION DOC] Compares itertools.batched with a pure Python recipe over many
+        # strings, None, and batch sizes including invalid ones (negative, zero, None);
+        # for each pair both must either give equal lists or raise the same exception
+        # type. Reported per case via subTest.
         def batched_recipe(iterable, n):
+            # [FUNCTION DOC] HELPER: Pure Python batched: raises ValueError if n is
+            # below one, otherwise yields tuples of up to n items taken from an iterator
+            # until empty.
             "Batch data into tuples of length n. The last batch may be shorter."
             # batched('ABCDEFG', 3) --> ABC DEF G
             if n < 1:
@@ -2083,6 +2481,11 @@ class TestPurePythonRoughEquivalents(__TestCase):
 
     @staticmethod
     def islice(iterable, *args):
+        # [FUNCTION DOC] HELPER: Static pure Python islice recipe taking an iterable and
+        # slice arguments (start, stop, step with None defaulting to 0, a huge maximum
+        # and 1). Yields the selected elements, and consumes the source up to the start
+        # or stop position afterwards so the source ends in the same state as the real
+        # islice.
         s = slice(*args)
         start, stop, step = s.start or 0, s.stop or sys.maxsize, s.step or 1
         it = iter(range(start, stop, step))
@@ -2105,6 +2508,10 @@ class TestPurePythonRoughEquivalents(__TestCase):
 
     @skipIfTorchDynamo("infinite loop in torch dynamo")
     def test_islice_recipe(self):
+        # [FUNCTION DOC] Skipped under dynamo (infinite loop). Checks the pure Python
+        # islice recipe on stop-only, start-stop, open-ended and stepped slices, the
+        # number of items consumed from the source, and that a stepped slice leaves the
+        # source in a predictable position.
         self.assertEqual(list(self.islice('ABCDEFG', 2)), list('AB'))
         self.assertEqual(list(self.islice('ABCDEFG', 2, 4)), list('CD'))
         self.assertEqual(list(self.islice('ABCDEFG', 2, None)), list('CDEFG'))
@@ -2123,10 +2530,18 @@ class TestPurePythonRoughEquivalents(__TestCase):
 
 
     def test_tee_recipe(self):
+        # [FUNCTION DOC] Runs the tee behavior checks (interleaving, dealloc of
+        # leading/trailing copy, random interleaving, argument checks, multi-way split,
+        # independence, weak references, and the long repeat exhaustion case) against a
+        # pure Python tee recipe defined inline. Copy tests that do not apply to the
+        # recipe are disabled behind a false condition.
 
         # Begin tee() recipe ###########################################
 
         def tee(iterable, n=2):
+            # [FUNCTION DOC] HELPER: Recipe version of tee: raises ValueError for
+            # negative n, returns an empty tuple for zero, otherwise returns n linked
+            # recipe iterators built from the source.
             if n < 0:
                 raise ValueError
             if n == 0:
@@ -2138,8 +2553,15 @@ class TestPurePythonRoughEquivalents(__TestCase):
             return tuple(result)
 
         class _tee:
+            # [CLASS DOC] HELPER: Pure Python tee iterator. Holds the shared source
+            # iterator and a two-slot link cell (value, next link) forming a singly
+            # linked chain so several copies read the same data independently.
+            # Constructing from another copy shares its iterator and current link.
 
             def __init__(self, iterable):
+                # [FUNCTION DOC] HELPER: Builds an iterator from the argument; if it is
+                # already a recipe tee, shares its iterator and link, otherwise starts a
+                # fresh empty link cell.
                 it = iter(iterable)
                 if isinstance(it, _tee):
                     self.iterator = it.iterator
@@ -2149,9 +2571,13 @@ class TestPurePythonRoughEquivalents(__TestCase):
                     self.link = [None, None]
 
             def __iter__(self):
+                # [FUNCTION DOC] HELPER: Returns self.
                 return self
 
             def __next__(self):
+                # [FUNCTION DOC] HELPER: Returns the value stored in the current link,
+                # first fetching it from the source (raising StopIteration at the end)
+                # and creating the next link if needed, then advances to the next link.
                 link = self.link
                 if link[1] is None:
                     link[0] = next(self.iterator)
@@ -2289,58 +2715,99 @@ class TestPurePythonRoughEquivalents(__TestCase):
 
 
 class TestGC(__TestCase):
+    # [CLASS DOC] Checks that itertools iterators participate in cycle garbage
+    # collection: each test builds a reference cycle through an iterator and a container
+    # and relies on the test harness cycle detection. No state.
 
     def makecycle(self, iterator, container):
+        # [FUNCTION DOC] HELPER: Appends the iterator to the container, advances the
+        # iterator once, then deletes local names; used to create a reference cycle that
+        # the garbage collector must reclaim.
         container.append(iterator)
         next(iterator)
         del container, iterator
 
     def test_accumulate(self):
+        # [FUNCTION DOC] GC test: builds a reference cycle through accumulate over a
+        # list containing the list a using makecycle, which must be collectable by the
+        # garbage collector.
         a = []
         self.makecycle(accumulate([1,2,a,3]), a)
 
     def test_batched(self):
+        # [FUNCTION DOC] GC test: builds a reference cycle through batched (size 2) over
+        # a list containing a using makecycle, which must be collectable by the garbage
+        # collector.
         a = []
         self.makecycle(batched([1,2,a,3], 2), a)
 
     def test_chain(self):
+        # [FUNCTION DOC] GC test: builds a reference cycle through chain of a itself
+        # using makecycle, which must be collectable by the garbage collector.
         a = []
         self.makecycle(chain(a), a)
 
     def test_chain_from_iterable(self):
+        # [FUNCTION DOC] GC test: builds a reference cycle through chain.from_iterable
+        # over a list containing a using makecycle, which must be collectable by the
+        # garbage collector.
         a = []
         self.makecycle(chain.from_iterable([a]), a)
 
     def test_combinations(self):
+        # [FUNCTION DOC] GC test: builds a reference cycle through combinations (r=3)
+        # over a list containing a using makecycle, which must be collectable by the
+        # garbage collector.
         a = []
         self.makecycle(combinations([1,2,a,3], 3), a)
 
     def test_combinations_with_replacement(self):
+        # [FUNCTION DOC] GC test: builds a reference cycle through
+        # combinations_with_replacement (r=3) over a list containing a using makecycle,
+        # which must be collectable by the garbage collector.
         a = []
         self.makecycle(combinations_with_replacement([1,2,a,3], 3), a)
 
     def test_compress(self):
+        # [FUNCTION DOC] GC test: builds a reference cycle through compress over letters
+        # with a selector pattern, data from strings using makecycle, which must be
+        # collectable by the garbage collector.
         a = []
         self.makecycle(compress('ABCDEF', [1,0,1,0,1,0]), a)
 
     def test_count(self):
+        # [FUNCTION DOC] GC test: builds a reference cycle through count using an int
+        # subclass instance that has a class attribute referencing a, for both start and
+        # step using makecycle, which must be collectable by the garbage collector.
         a = []
         Int = type('Int', (int,), dict(x=a))
         self.makecycle(count(Int(0), Int(1)), a)
 
     def test_cycle(self):
+        # [FUNCTION DOC] GC test: builds a reference cycle through cycle over a list
+        # holding a twice using makecycle, which must be collectable by the garbage
+        # collector.
         a = []
         self.makecycle(cycle([a]*2), a)
 
     def test_dropwhile(self):
+        # [FUNCTION DOC] GC test: builds a reference cycle through dropwhile with bool
+        # over a list containing a using makecycle, which must be collectable by the
+        # garbage collector.
         a = []
         self.makecycle(dropwhile(bool, [0, a, a]), a)
 
     def test_groupby(self):
+        # [FUNCTION DOC] GC test: builds a reference cycle through groupby over a list
+        # holding a twice with an identity key using makecycle, which must be
+        # collectable by the garbage collector.
         a = []
         self.makecycle(groupby([a]*2, lambda x:x), a)
 
     def test_issue2246(self):
+        # [FUNCTION DOC] Regression for issue 2246: iterates groupby with a key function
+        # whose attribute dictionary collects the group objects, creating a cycle
+        # through the grouper iterator that must be collectable.
         # Issue 2246 -- the _grouper iterator was not included in GC
         n = 10
         keyfunc = lambda x: x
@@ -2348,126 +2815,197 @@ class TestGC(__TestCase):
             keyfunc.__dict__.setdefault('x',[]).append(j)
 
     def test_filter(self):
+        # [FUNCTION DOC] GC test: builds a reference cycle through filter with an always
+        # true predicate over a list holding a twice using makecycle, which must be
+        # collectable by the garbage collector.
         a = []
         self.makecycle(filter(lambda x:True, [a]*2), a)
 
     def test_filterfalse(self):
+        # [FUNCTION DOC] GC test: builds a reference cycle through filterfalse over a
+        # itself with an always false predicate using makecycle, which must be
+        # collectable by the garbage collector.
         a = []
         self.makecycle(filterfalse(lambda x:False, a), a)
 
     def test_zip(self):
+        # [FUNCTION DOC] GC test: builds a reference cycle through zip of lists holding
+        # a using makecycle, which must be collectable by the garbage collector.
         a = []
         self.makecycle(zip([a]*2, [a]*3), a)
 
     def test_zip_longest(self):
+        # [FUNCTION DOC] GC test: zip_longest cycles through lists holding a, both with
+        # the default fill and with a fill value list that holds a.
         a = []
         self.makecycle(zip_longest([a]*2, [a]*3), a)
         b = [a, None]
         self.makecycle(zip_longest([a]*2, [a]*3, fillvalue=b), a)
 
     def test_map(self):
+        # [FUNCTION DOC] GC test: builds a reference cycle through map with identity
+        # over a list holding a twice using makecycle, which must be collectable by the
+        # garbage collector.
         a = []
         self.makecycle(map(lambda x:x, [a]*2), a)
 
     def test_islice(self):
+        # [FUNCTION DOC] GC test: builds a reference cycle through islice of a list
+        # holding a with stop None using makecycle, which must be collectable by the
+        # garbage collector.
         a = []
         self.makecycle(islice([a]*2, None), a)
 
     def test_pairwise(self):
+        # [FUNCTION DOC] GC test: builds a reference cycle through pairwise over a list
+        # holding a five times using makecycle, which must be collectable by the garbage
+        # collector.
         a = []
         self.makecycle(pairwise([a]*5), a)
 
     def test_permutations(self):
+        # [FUNCTION DOC] GC test: builds a reference cycle through permutations (r=3)
+        # over a list containing a using makecycle, which must be collectable by the
+        # garbage collector.
         a = []
         self.makecycle(permutations([1,2,a,3], 3), a)
 
     def test_product(self):
+        # [FUNCTION DOC] GC test: builds a reference cycle through product (repeat=3)
+        # over a list containing a using makecycle, which must be collectable by the
+        # garbage collector.
         a = []
         self.makecycle(product([1,2,a,3], repeat=3), a)
 
     def test_repeat(self):
+        # [FUNCTION DOC] GC test: builds a reference cycle through repeat of a using
+        # makecycle, which must be collectable by the garbage collector.
         a = []
         self.makecycle(repeat(a), a)
 
     def test_starmap(self):
+        # [FUNCTION DOC] GC test: builds a reference cycle through starmap with a tuple-
+        # returning function over argument tuples holding a using makecycle, which must
+        # be collectable by the garbage collector.
         a = []
         self.makecycle(starmap(lambda *t: t, [(a,a)]*2), a)
 
     def test_takewhile(self):
+        # [FUNCTION DOC] GC test: builds a reference cycle through takewhile with bool
+        # over a list containing a using makecycle, which must be collectable by the
+        # garbage collector.
         a = []
         self.makecycle(takewhile(bool, [1, 0, a, a]), a)
 
 def R(seqn):
+    # [FUNCTION DOC] HELPER: Regular generator yielding each item of the given sequence.
     'Regular generator'
     for i in seqn:
         yield i
 
 class G:
+    # [CLASS DOC] HELPER: Sequence wrapper supporting only item access by index (old-
+    # style iteration protocol); raises the underlying IndexError at the end.
     'Sequence using __getitem__'
     def __init__(self, seqn):
+        # [FUNCTION DOC] HELPER: Stores the wrapped sequence.
         self.seqn = seqn
     def __getitem__(self, i):
+        # [FUNCTION DOC] HELPER: Returns the item of the wrapped sequence at index i.
         return self.seqn[i]
 
 class I:
+    # [CLASS DOC] HELPER: Sequence wrapper implementing the iterator protocol directly:
+    # it is its own iterator and walks the sequence with an index attribute, stopping at
+    # the end.
     'Sequence using iterator protocol'
     def __init__(self, seqn):
+        # [FUNCTION DOC] HELPER: Stores the sequence and a zero position counter.
         self.seqn = seqn
         self.i = 0
     def __iter__(self):
+        # [FUNCTION DOC] HELPER: Returns self.
         return self
     def __next__(self):
+        # [FUNCTION DOC] HELPER: Returns the next item and advances the position; raises
+        # StopIteration at the end.
         if self.i >= len(self.seqn): raise StopIteration
         v = self.seqn[self.i]
         self.i += 1
         return v
 
 class Ig:
+    # [CLASS DOC] HELPER: Sequence wrapper whose iter method is a generator over the
+    # stored sequence (iterator protocol through a generator).
     'Sequence using iterator protocol defined with a generator'
     def __init__(self, seqn):
+        # [FUNCTION DOC] HELPER: Stores the sequence and a position counter (unused by
+        # iteration).
         self.seqn = seqn
         self.i = 0
     def __iter__(self):
+        # [FUNCTION DOC] HELPER: Generator yielding every item of the stored sequence.
         for val in self.seqn:
             yield val
 
 class X:
+    # [CLASS DOC] HELPER: Defective iterable that has a next method but neither iter nor
+    # getitem, so it cannot be iterated; used to check TypeError.
     'Missing __getitem__ and __iter__'
     def __init__(self, seqn):
+        # [FUNCTION DOC] HELPER: Stores the sequence and a position counter.
         self.seqn = seqn
         self.i = 0
     def __next__(self):
+        # [FUNCTION DOC] HELPER: Returns the next item and advances; raises
+        # StopIteration at the end (never reachable through normal iteration since the
+        # class lacks an iter method).
         if self.i >= len(self.seqn): raise StopIteration
         v = self.seqn[self.i]
         self.i += 1
         return v
 
 class N:
+    # [CLASS DOC] HELPER: Defective iterator: its iter returns itself but it has no next
+    # method, so iteration raises TypeError.
     'Iterator missing __next__()'
     def __init__(self, seqn):
+        # [FUNCTION DOC] HELPER: Stores the sequence and a position counter.
         self.seqn = seqn
         self.i = 0
     def __iter__(self):
+        # [FUNCTION DOC] HELPER: Returns self.
         return self
 
 class E:
+    # [CLASS DOC] HELPER: Iterator whose next always raises ZeroDivisionError, used to
+    # test exception propagation.
     'Test propagation of exceptions'
     def __init__(self, seqn):
+        # [FUNCTION DOC] HELPER: Stores the sequence and a position counter.
         self.seqn = seqn
         self.i = 0
     def __iter__(self):
+        # [FUNCTION DOC] HELPER: Returns self.
         return self
     def __next__(self):
+        # [FUNCTION DOC] HELPER: Always raises ZeroDivisionError by dividing by zero.
         3 // 0
 
 class E2:
+    # [CLASS DOC] HELPER: Iterator that yields items normally but raises
+    # ZeroDivisionError on the third call (after two items).
     'Test propagation of exceptions after two iterations'
     def __init__(self, seqn):
+        # [FUNCTION DOC] HELPER: Stores the sequence and a position counter.
         self.seqn = seqn
         self.i = 0
     def __iter__(self):
+        # [FUNCTION DOC] HELPER: Returns self.
         return self
     def __next__(self):
+        # [FUNCTION DOC] HELPER: Raises ZeroDivisionError once two items were returned,
+        # otherwise returns the next item and advances.
         if self.i == 2:
             raise ZeroDivisionError
         v = self.seqn[self.i]
@@ -2475,22 +3013,36 @@ class E2:
         return v
 
 class S:
+    # [CLASS DOC] HELPER: Iterator that stops immediately: next always raises
+    # StopIteration, ignoring the sequence.
     'Test immediate stop'
     def __init__(self, seqn):
+        # [FUNCTION DOC] HELPER: Ignores the sequence argument.
         pass
     def __iter__(self):
+        # [FUNCTION DOC] HELPER: Returns self.
         return self
     def __next__(self):
+        # [FUNCTION DOC] HELPER: Always raises StopIteration.
         raise StopIteration
 
 def L(seqn):
+    # [FUNCTION DOC] HELPER: Builds a multi-level iterator chain: chain over map
+    # identity over generator R over Ig over G wrapping the sequence.
     'Test multiple tiers of iterators'
     return chain(map(lambda x:x, R(Ig(G(seqn)))))
 
 
 class TestVariousIteratorArgs(__TestCase):
+    # [CLASS DOC] Checks each itertools function against the helper iterable classes
+    # (index-only, iterator protocol, generator, multi-tier, empty, failing, non-
+    # iterable) for correct results and error behavior (TypeError, ZeroDivisionError
+    # propagation). No state.
 
     def test_accumulate(self):
+        # [FUNCTION DOC] Checks accumulate on running sums for each good helper class,
+        # empty on the immediate-stop class, TypeError for a non-iterable, and that
+        # errors from the failing helpers propagate.
         s = [1,2,3,4,5]
         r = [1,3,6,10,15]
         n = len(s)
@@ -2502,6 +3054,10 @@ class TestVariousIteratorArgs(__TestCase):
         self.assertRaises(ZeroDivisionError, list, accumulate(E(s)))
 
     def test_batched(self):
+        # [FUNCTION DOC] Checks batched of a five-letter string with size 2 across the
+        # good helper iterables, empty result for the immediate-stop one, TypeError for
+        # non-iterable helpers, and ZeroDivisionError propagation from failing
+        # iterators.
         s = 'abcde'
         r = [('a', 'b'), ('c', 'd'), ('e',)]
         n = 2
@@ -2515,6 +3071,9 @@ class TestVariousIteratorArgs(__TestCase):
         self.assertRaises(ZeroDivisionError, list, batched(E2(s), 4))
 
     def test_chain(self):
+        # [FUNCTION DOC] Checks chain over several sequences and each good helper class
+        # equals direct listing (also doubled), TypeError for the defective classes and
+        # ZeroDivisionError propagation.
         for s in ("123", "", range(1000), ('do', 1.2), range(2000,2200,5)):
             for g in (G, I, Ig, S, L, R):
                 self.assertEqual(list(chain(g(s))), list(g(s)))
@@ -2524,6 +3083,9 @@ class TestVariousIteratorArgs(__TestCase):
             self.assertRaises(ZeroDivisionError, list, chain(E(s)))
 
     def test_compress(self):
+        # [FUNCTION DOC] Checks compress with an always-true selector reproduces the
+        # data from each good helper class; TypeError for defective ones,
+        # ZeroDivisionError propagates.
         for s in ("123", "", range(1000), ('do', 1.2), range(2000,2200,5)):
             n = len(s)
             for g in (G, I, Ig, S, L, R):
@@ -2533,12 +3095,18 @@ class TestVariousIteratorArgs(__TestCase):
             self.assertRaises(ZeroDivisionError, list, compress(E(s), repeat(1)))
 
     def test_product(self):
+        # [FUNCTION DOC] Checks product raises TypeError at construction for defective
+        # iterables and ZeroDivisionError for the failing iterator (product consumes its
+        # inputs eagerly).
         for s in ("123", "", range(1000), ('do', 1.2), range(2000,2200,5)):
             self.assertRaises(TypeError, product, X(s))
             self.assertRaises(TypeError, product, N(s))
             self.assertRaises(ZeroDivisionError, product, E(s))
 
     def test_cycle(self):
+        # [FUNCTION DOC] Checks cycle over each helper iterable repeats it three times
+        # (first three lengths via islice), TypeError for defective ones,
+        # ZeroDivisionError propagation.
         for s in ("123", "", range(1000), ('do', 1.2), range(2000,2200,5)):
             for g in (G, I, Ig, S, L, R):
                 tgtlen = len(s) * 3
@@ -2550,6 +3118,8 @@ class TestVariousIteratorArgs(__TestCase):
             self.assertRaises(ZeroDivisionError, list, cycle(E(s)))
 
     def test_groupby(self):
+        # [FUNCTION DOC] Checks the keys of groupby over each good helper class equal
+        # the items, TypeError for defective ones, ZeroDivisionError propagation.
         for s in (range(10), range(0), range(1000), (7,11), range(2000,2200,5)):
             for g in (G, I, Ig, S, L, R):
                 self.assertEqual([k for k, sb in groupby(g(s))], list(g(s)))
@@ -2558,6 +3128,9 @@ class TestVariousIteratorArgs(__TestCase):
             self.assertRaises(ZeroDivisionError, list, groupby(E(s)))
 
     def test_filter(self):
+        # [FUNCTION DOC] Checks filter with the even predicate matches a list
+        # comprehension for every helper class; TypeError for defective ones and
+        # ZeroDivisionError propagation.
         for s in (range(10), range(0), range(1000), (7,11), range(2000,2200,5)):
             for g in (G, I, Ig, S, L, R):
                 self.assertEqual(list(filter(isEven, g(s))),
@@ -2567,6 +3140,10 @@ class TestVariousIteratorArgs(__TestCase):
             self.assertRaises(ZeroDivisionError, list, filter(isEven, E(s)))
 
     def test_filterfalse(self):
+        # [FUNCTION DOC] Checks filterfalse with the even predicate gives the odd items
+        # for every helper class; TypeError and ZeroDivisionError behavior as for
+        # filter. (Uses the odd predicate which equals the complement only for non-
+        # negative inputs.)
         for s in (range(10), range(0), range(1000), (7,11), range(2000,2200,5)):
             for g in (G, I, Ig, S, L, R):
                 self.assertEqual(list(filterfalse(isEven, g(s))),
@@ -2576,6 +3153,8 @@ class TestVariousIteratorArgs(__TestCase):
             self.assertRaises(ZeroDivisionError, list, filterfalse(isEven, E(s)))
 
     def test_zip(self):
+        # [FUNCTION DOC] Checks zip over one and two copies of each helper iterable
+        # against a list-based helper, and TypeError/ZeroDivisionError behavior.
         for s in ("123", "", range(1000), ('do', 1.2), range(2000,2200,5)):
             for g in (G, I, Ig, S, L, R):
                 self.assertEqual(list(zip(g(s))), lzip(g(s)))
@@ -2585,6 +3164,9 @@ class TestVariousIteratorArgs(__TestCase):
             self.assertRaises(ZeroDivisionError, list, zip(E(s)))
 
     def test_ziplongest(self):
+        # [FUNCTION DOC] Checks zip_longest over one and two copies of each helper
+        # iterable matches zip (equal lengths), plus TypeError and ZeroDivisionError
+        # behavior.
         for s in ("123", "", range(1000), ('do', 1.2), range(2000,2200,5)):
             for g in (G, I, Ig, S, L, R):
                 self.assertEqual(list(zip_longest(g(s))), list(zip(g(s))))
@@ -2594,6 +3176,9 @@ class TestVariousIteratorArgs(__TestCase):
             self.assertRaises(ZeroDivisionError, list, zip_longest(E(s)))
 
     def test_map(self):
+        # [FUNCTION DOC] Checks map with a unary function and with a two-argument power
+        # function over each helper class, TypeError for defective inputs,
+        # ZeroDivisionError propagation.
         for s in (range(10), range(0), range(100), (7,11), range(20,50,5)):
             for g in (G, I, Ig, S, L, R):
                 self.assertEqual(list(map(onearg, g(s))),
@@ -2605,6 +3190,9 @@ class TestVariousIteratorArgs(__TestCase):
             self.assertRaises(ZeroDivisionError, list, map(onearg, E(s)))
 
     def test_islice(self):
+        # [FUNCTION DOC] Checks islice with start 1 and step 2 over each helper class;
+        # the TypeError checks for defective inputs are commented out, ZeroDivisionError
+        # propagation is still asserted.
         for s in ("12345", "", range(1000), ('do', 1.2), range(2000,2200,5)):
             for g in (G, I, Ig, S, L, R):
                 self.assertEqual(list(islice(g(s),1,None,2)), list(g(s))[1::2])
@@ -2613,6 +3201,8 @@ class TestVariousIteratorArgs(__TestCase):
             self.assertRaises(ZeroDivisionError, list, islice(E(s), 10))
 
     def test_pairwise(self):
+        # [FUNCTION DOC] Checks pairwise equals zip of a sequence with itself shifted by
+        # one for each helper class; TypeError and ZeroDivisionError behavior.
         for s in ("123", "", range(1000), ('do', 1.2), range(2000,2200,5)):
             for g in (G, I, Ig, S, L, R):
                 seq = list(g(s))
@@ -2624,6 +3214,9 @@ class TestVariousIteratorArgs(__TestCase):
             self.assertRaises(ZeroDivisionError, list, pairwise(E(s)))
 
     def test_starmap(self):
+        # [FUNCTION DOC] Checks starmap with power over pairs built from each helper
+        # class; the TypeError checks are commented out, ZeroDivisionError propagation
+        # is asserted using the last pair list from the loop.
         for s in (range(10), range(0), range(100), (7,11), range(20,50,5)):
             for g in (G, I, Ig, S, L, R):
                 ss = lzip(s, s)
@@ -2634,6 +3227,9 @@ class TestVariousIteratorArgs(__TestCase):
             self.assertRaises(ZeroDivisionError, list, starmap(operator.pow, E(ss)))
 
     def test_takewhile(self):
+        # [FUNCTION DOC] Checks takewhile with the even predicate against a manual loop
+        # for each helper class; ZeroDivisionError propagation asserted, TypeError
+        # checks commented out.
         for s in (range(10), range(0), range(1000), (7,11), range(2000,2200,5)):
             for g in (G, I, Ig, S, L, R):
                 tgt = []
@@ -2646,6 +3242,9 @@ class TestVariousIteratorArgs(__TestCase):
             self.assertRaises(ZeroDivisionError, list, takewhile(isEven, E(s)))
 
     def test_dropwhile(self):
+        # [FUNCTION DOC] Checks dropwhile with the odd predicate against a manual loop
+        # for each helper class; ZeroDivisionError propagation asserted, TypeError
+        # checks commented out.
         for s in (range(10), range(0), range(1000), (7,11), range(2000,2200,5)):
             for g in (G, I, Ig, S, L, R):
                 tgt = []
@@ -2658,6 +3257,9 @@ class TestVariousIteratorArgs(__TestCase):
             self.assertRaises(ZeroDivisionError, list, dropwhile(isOdd, E(s)))
 
     def test_tee(self):
+        # [FUNCTION DOC] Checks both copies from tee over each helper class list the
+        # full data, TypeError for defective ones, and ZeroDivisionError when the first
+        # copy of a failing source is consumed.
         for s in ("123", "", range(1000), ('do', 1.2), range(2000,2200,5)):
             for g in (G, I, Ig, S, L, R):
                 it1, it2 = tee(g(s))
@@ -2668,28 +3270,46 @@ class TestVariousIteratorArgs(__TestCase):
             self.assertRaises(ZeroDivisionError, list, tee(E(s))[0])
 
 class LengthTransparency(__TestCase):
+    # [CLASS DOC] Tests that itertools.repeat reports its remaining length through the
+    # length hint protocol. No state.
 
     def test_repeat(self):
+        # [FUNCTION DOC] Checks length_hint of repeat equals the given count (50, 0),
+        # and falls back to the supplied default when no count was given.
         self.assertEqual(operator.length_hint(repeat(None, 50)), 50)
         self.assertEqual(operator.length_hint(repeat(None, 0)), 0)
         self.assertEqual(operator.length_hint(repeat(None), 12), 12)
 
     def test_repeat_with_negative_times(self):
+        # [FUNCTION DOC] Checks length_hint of repeat with a negative count (positional
+        # or keyword) is zero.
         self.assertEqual(operator.length_hint(repeat(None, -1)), 0)
         self.assertEqual(operator.length_hint(repeat(None, -2)), 0)
         self.assertEqual(operator.length_hint(repeat(None, times=-1)), 0)
         self.assertEqual(operator.length_hint(repeat(None, times=-2)), 0)
 
 class RegressionTests(__TestCase):
+    # [CLASS DOC] Regression tests for historical itertools bugs (mutating result
+    # tuples, early exception delivery, recursion in chains, groupby crashes). No state.
 
     def test_sf_793826(self):
+        # [FUNCTION DOC] Regression sf 793826: calls a function on a zip result tuple
+        # that is later mutated by the zip machinery, and checks the saved copy of the
+        # tuple's content matches the tuple object afterwards. Writes the module global
+        # T as a side effect.
         # Fix Armin Rigo's successful efforts to wreak havoc
 
         def mutatingtuple(tuple1, f, tuple2):
+            # [FUNCTION DOC] HELPER: Builds a zip over a mapped generator, calls f with
+            # the first result tuple while the tuple is still being reused, and then
+            # triggers refilling it with the second tuple's values.
             # this builds a tuple t which is a copy of tuple1,
             # then calls f(t), then mutates t to be equal to tuple2
             # (needs len(tuple1) == len(tuple2)).
             def g(value, first=[1]):
+                # [FUNCTION DOC] HELPER: Mapped function that on its first call clears a
+                # list marker and invokes f on the next zip result, then returns the
+                # value unchanged.
                 if first:
                     del first[:]
                     f(next(z))
@@ -2701,6 +3321,8 @@ class RegressionTests(__TestCase):
             next(z)
 
         def f(t):
+            # [FUNCTION DOC] HELPER: Stores the tuple in the global T and copies its
+            # content into the enclosing list first.
             global T
             T = t
             first[:] = list(T)
@@ -2712,10 +3334,15 @@ class RegressionTests(__TestCase):
 
 
     def test_sf_950057(self):
+        # [FUNCTION DOC] Regression sf 950057: chain and cycle must raise an exception
+        # from an input generator immediately, not when switching sources; checks the
+        # history list records only steps 0 and 1 in each case.
         # Make sure that chain() and cycle() catch exceptions immediately
         # rather than when shifting between input sources
 
         def gen1():
+            # [FUNCTION DOC] HELPER: Generator recording steps in the history list,
+            # yielding 1, then raising AssertionError.
             hist.append(0)
             yield 1
             hist.append(1)
@@ -2723,6 +3350,8 @@ class RegressionTests(__TestCase):
             hist.append(2)
 
         def gen2(x):
+            # [FUNCTION DOC] HELPER: Generator recording step 3, yielding 2 and
+            # recording step 4 on resumption; the argument is unused.
             hist.append(3)
             yield 2
             hist.append(4)
@@ -2743,6 +3372,9 @@ class RegressionTests(__TestCase):
     @support.requires_resource('cpu')
     @slowTest
     def test_long_chain_of_empty_iterables(self):
+        # [FUNCTION DOC] Slow, CPU-resource test: chain.from_iterable over ten million
+        # empty generators must reach the end with StopIteration without hitting
+        # recursion limits.
         # Make sure itertools.chain doesn't run into recursion limits when
         # dealing with long chains of empty iterables. Even with a high
         # number this would probably only fail in Py_DEBUG mode.
@@ -2751,7 +3383,11 @@ class RegressionTests(__TestCase):
             next(it)
 
     def test_issue30347_1(self):
+        # [FUNCTION DOC] Regression for issue 30347: consuming a groupby group from
+        # inside the key function must not crash.
         def f(n):
+            # [FUNCTION DOC] HELPER: Key function that exhausts the current group when n
+            # is 5 and returns whether n differs from 6.
             if n == 5:
                 list(b)
             return n != 6
@@ -2759,10 +3395,17 @@ class RegressionTests(__TestCase):
             list(b)  # shouldn't crash
 
     def test_issue30347_2(self):
+        # [FUNCTION DOC] Regression for issue 30347: a key whose equality advances the
+        # group iterator during comparison must not crash while consuming groups.
         class K:
+            # [CLASS DOC] HELPER: Key wrapper whose equality advances the outer group
+            # iterator on its first comparison and always returns true.
             def __init__(self, v):
+                # [FUNCTION DOC] HELPER: Ignores the value.
                 pass
             def __eq__(self, other):
+                # [FUNCTION DOC] HELPER: Counts comparisons in the enclosing counter; on
+                # the first one calls next on the group iterator, and returns true.
                 nonlocal i
                 i += 1
                 if i == 1:
@@ -2775,7 +3418,15 @@ class RegressionTests(__TestCase):
 
 
 class SubclassWithKwargsTest(__TestCase):
+    # [CLASS DOC] Tests that itertools classes that can be subclassed accept keyword
+    # arguments in subclasses only when the subclass defines them. No state.
     def test_keywords_in_subclass(self):
+        # [FUNCTION DOC] For a table of itertools classes with arguments and expected
+        # prefix output, checks (a) a plain subclass behaves like the base and rejects
+        # an unknown keyword with TypeError, (b) a subclass defining init with a keyword
+        # stores it (skipped for repeat, zip, compress which take keywords themselves),
+        # (c) a subclass defining new with a keyword stores it. Count is excluded
+        # because it cannot be subclassed. Reported via subTest.
         # count is not subclassable...
         testcases = [
             (repeat, (1, 2), [1, 1]),
@@ -2794,6 +3445,7 @@ class SubclassWithKwargsTest(__TestCase):
         for cls, args, result in testcases:
             with self.subTest(cls):
                 class subclass(cls):
+                    # [CLASS DOC] HELPER: Trivial subclass of the class under test.
                     pass
                 u = subclass(*args)
                 self.assertIs(type(u), subclass)
@@ -2809,7 +3461,11 @@ class SubclassWithKwargsTest(__TestCase):
                 continue
             with self.subTest(cls):
                 class subclass_with_init(cls):
+                    # [CLASS DOC] HELPER: Subclass adding an init that accepts and
+                    # stores a keyword argument newarg.
                     def __init__(self, *args, newarg=None):
+                        # [FUNCTION DOC] HELPER: Stores the keyword newarg; ignores
+                        # other arguments (they are consumed by the base new).
                         self.newarg = newarg
                 u = subclass_with_init(*args, newarg=3)
                 self.assertIs(type(u), subclass_with_init)
@@ -2819,7 +3475,12 @@ class SubclassWithKwargsTest(__TestCase):
         for cls, args, result in testcases:
             with self.subTest(cls):
                 class subclass_with_new(cls):
+                    # [CLASS DOC] HELPER: Subclass overriding new to accept a newarg
+                    # keyword, forward the remaining arguments to the base new and store
+                    # newarg.
                     def __new__(cls, *args, newarg=None):
+                        # [FUNCTION DOC] HELPER: Creates the instance via the base new
+                        # with positional args only, stores newarg on it, returns it.
                         self = super().__new__(cls, *args)
                         self.newarg = newarg
                         return self
