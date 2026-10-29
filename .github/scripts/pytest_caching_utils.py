@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Helpers to upload and download the pytest cache of a CI job to or from S3 so that tests that
+# failed in earlier runs are run first. Contains the PRIdentifier and GithubRepo types, S3 key
+# construction, and merging of the lastfailed file and the additional previous failures list
+# across shard caches. Constants: bucket gha-artifacts, cache key prefix, temp folder names.
+# Import time side effects: none besides imports from file_io_utils.
 import hashlib
 import os
 from pathlib import Path
@@ -30,20 +36,31 @@ UNZIPPED_CACHES = "unzipped-caches"
 # Since the pr identifier can be based on include user defined text (like a branch name)
 # we hash it to sanitize the input and avoid corner cases
 class PRIdentifier(str):
+    # [CLASS DOC]
+    # String subclass holding the md5 hex digest of the value given at construction, so that
+    # user controlled text (such as a branch name) becomes a safe fixed-form identifier.
+    # Immutable, no extra attributes.
     __slots__ = ()
 
     def __new__(cls, value: str) -> "PRIdentifier":
+        # [FUNCTION DOC] Returns a new instance whose string value is the md5 hex digest of the
+        # utf-8 encoded input.
         md5 = hashlib.md5(value.encode("utf-8"), usedforsecurity=False).hexdigest()
         return super().__new__(cls, md5)
 
 
 class GithubRepo(NamedTuple):
+    # [CLASS DOC]
+    # Named tuple (owner, name) identifying a GitHub repository; prints as owner/name.
     owner: str
     name: str
 
     # Create a Repo from a string like "owner/repo"
     @classmethod
     def from_string(cls, repo_string: str) -> "GithubRepo":
+        # [FUNCTION DOC] Creates a GithubRepo from text of the form owner/name. Raises
+        # ValueError if there is no slash (and, through tuple unpacking, if there is
+        # more than one).
         if "/" not in repo_string:
             raise ValueError(
                 f"repo_string must be of the form 'owner/repo', not {repo_string}"
@@ -53,6 +70,7 @@ class GithubRepo(NamedTuple):
         return cls(owner, name)
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Returns the repository as owner/name text.
         return f"{self.owner}/{self.name}"
 
 
@@ -67,6 +85,13 @@ def upload_pytest_cache(
     temp_dir: Path,
     bucket: str = BUCKET,
 ) -> None:
+    # [FUNCTION DOC] Zips the pytest cache dir and uploads it to S3 under a key built from the
+    # repo, PR identifier, job identifier, sha, test config and shard, keeping the zip file
+    # extension. An empty bucket falls back to the default bucket. Raises ValueError if
+    # pr_identifier is not a PRIdentifier. Side effects: writes the zip under the temp dir and
+    # uploads to S3.
+    # KNOWN ISSUE: the docstring describes merging with previous caches and a job argument, but
+    #     this function only zips and uploads; merging happens on download.
     """
     Uploads the pytest cache to S3, merging it with any previous caches from previous runs of the same job.
     In particular, this keeps all the failed tests across all runs of this job in the cache, so that
@@ -102,6 +127,11 @@ def download_pytest_cache(
     temp_dir: Path,
     bucket: str = BUCKET,
 ) -> None:
+    # [FUNCTION DOC] Downloads every cache zip stored under the key prefix for this PR and job
+    # (all shards), unzips each into a random folder under the temp dir and merges it into
+    # dest_cache_dir. An empty bucket falls back to the default bucket. Raises ValueError if
+    # pr_identifier is not a PRIdentifier. Side effects: network access, files written under the
+    # temp dir and dest dir.
     """
     Downloads the pytest cache from S3. The goal is to detect any tests that have failed in the past
     and run them first, so that the dev can get faster feedback on them.
@@ -146,6 +176,9 @@ def _get_s3_key_prefix(
     test_config: str = "",
     shard: str = "",
 ) -> str:
+    # [FUNCTION DOC] HELPER: Returns the S3 key prefix (no extension) of the form cache prefix /
+    # owner / name / PR identifier / sanitized job identifier, followed by the sha, sanitized
+    # test config and shard for each of those that is non-empty.
     """
     The prefix to any S3 object key for a pytest cache. It's only a prefix though, not a full path to an object.
     For example, it won't include the file extension.
@@ -165,6 +198,10 @@ def _get_s3_key_prefix(
 def _merge_pytest_caches(
     pytest_cache_dir_to_merge_from: Path, pytest_cache_dir_to_merge_into: Path
 ) -> None:
+    # [FUNCTION DOC] HELPER: Merges one unzipped pytest cache into another. Copies the static
+    # support files (gitignore, cache dir tag, readme) only if present in the source and missing
+    # in the destination, then merges the lastfailed file and the additional failures file.
+    # Mutates the destination folder.
     # LASTFAILED_FILE_PATH is the only file we actually care about in the cache
     # since it contains all the tests that failed.
     #
@@ -201,6 +238,9 @@ def _merge_pytest_caches(
 
 
 def _merge_lastfailed_files(source_pytest_cache: Path, dest_pytest_cache: Path) -> None:
+    # [FUNCTION DOC] HELPER: Merges the lastfailed json file of the source cache into the
+    # destination. Does nothing if the source file is missing; copies it if the destination file
+    # is missing; otherwise writes the merged content to the destination file.
     # Simple cases where one of the files doesn't exist
     source_lastfailed_file = source_pytest_cache / LASTFAILED_FILE_PATH
     dest_lastfailed_file = dest_pytest_cache / LASTFAILED_FILE_PATH
@@ -223,6 +263,9 @@ def _merge_lastfailed_files(source_pytest_cache: Path, dest_pytest_cache: Path) 
 def _merged_lastfailed_content(
     from_lastfailed: dict[str, bool], to_lastfailed: dict[str, bool]
 ) -> dict[str, bool]:
+    # [FUNCTION DOC] HELPER: Returns to_lastfailed with all keys of from_lastfailed added
+    # (existing values win). Removes the empty-string placeholder key when more than one entry
+    # remains. Mutates and returns the to_lastfailed mapping.
     """
     The lastfailed files are dictionaries where the key is the test identifier.
     Each entry's value appears to always be `true`, but let's not count on that.
@@ -245,6 +288,10 @@ def _merged_lastfailed_content(
 def _merge_additional_failures_files(
     source_pytest_cache: Path, dest_pytest_cache: Path
 ) -> None:
+    # [FUNCTION DOC] HELPER: Merges the previous failures additional json file (a list) of the
+    # source cache into the destination: skipped if the source is missing, copied if the
+    # destination is missing, otherwise the destination becomes the de-duplicated union (order
+    # not preserved).
     # Simple cases where one of the files doesn't exist
     source_lastfailed_file = (
         source_pytest_cache / TD_HEURISTIC_PREVIOUSLY_FAILED_ADDITIONAL

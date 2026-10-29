@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Command line entry point to upload or download a job's pytest cache to or from S3 through the
+# helpers in pytest_caching_utils. Defines the fallback temp directory TEMP_DIR. Run as a
+# script; no import time side effects besides imports.
 import argparse
 import sys
 from pathlib import Path
@@ -14,6 +18,10 @@ TEMP_DIR = "./tmp"  # a backup location in case one isn't provided
 
 
 def parse_args() -> argparse.Namespace:
+    # [FUNCTION DOC] Builds and runs the argument parser. Exactly one of upload and download is
+    # required, plus cache_dir, pr_identifier and job_identifier; sha, test_config and shard are
+    # required only when upload appears in the process arguments; repo, temp_dir and bucket are
+    # optional. Returns the parsed namespace.
     parser = argparse.ArgumentParser(
         description="Upload this job's the pytest cache to S3"
     )
@@ -67,6 +75,12 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point. Builds the PR identifier and GithubRepo from the arguments and
+    # picks the temp dir (argument or TEMP_DIR). In upload mode skips with a message if the
+    # cache dir does not exist, otherwise uploads the cache. In download mode downloads into the
+    # cache dir. Prints the arguments; network and filesystem side effects.
+    # KNOWN ISSUE: repo is optional but is parsed unconditionally; behavior without it depends
+    #     on GithubRepo.from_string handling of None.
     args = parse_args()
 
     pr_identifier = PRIdentifier(args.pr_identifier)

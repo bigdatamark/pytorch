@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 
+# [MODULE DOC]
+# Git helper utilities for the GitHub CI scripts: a thin GitRepo wrapper around the git command
+# line, a GitCommit record, parsing of "git show --format=fuller" output, glob pattern to regex
+# conversion, ghstack branch sync checks and a retry decorator. Import time side effects: none
+# beyond defining a type variable and a compiled regex.
+
 from __future__ import annotations
 
 import os
@@ -18,16 +24,22 @@ RE_GITHUB_URL_MATCH = re.compile("^https://.*@?github.com/(.+)/(.+)$")
 
 
 def get_git_remote_name() -> str:
+    # [FUNCTION DOC] HELPER: Returns the git remote name from env var GIT_REMOTE_NAME,
+    # default origin.
     return os.getenv("GIT_REMOTE_NAME", "origin")
 
 
 def get_git_repo_dir() -> str:
+    # [FUNCTION DOC] HELPER: Returns env var GIT_REPO_DIR, default the repo root (two levels
+    # above this file).
     from pathlib import Path
 
     return os.getenv("GIT_REPO_DIR", str(Path(__file__).resolve().parents[2]))
 
 
 def fuzzy_list_to_dict(items: list[tuple[str, str]]) -> dict[str, list[str]]:
+    # [FUNCTION DOC] Converts a list of key/value pairs into a mapping from key to the list of
+    # all its values, keeping duplicate keys (values stay in input order). Pure function.
     """
     Converts list to dict preserving elements with duplicate keys
     """
@@ -38,6 +50,9 @@ def fuzzy_list_to_dict(items: list[tuple[str, str]]) -> dict[str, list[str]]:
 
 
 def _check_output(items: list[str], encoding: str = "utf-8") -> str:
+    # [FUNCTION DOC] HELPER: Runs a command (list of args) with stdout and stderr merged and
+    # returns the decoded text. On non-zero exit prints stdout/stderr and raises RuntimeError
+    # whose message embeds the command, exit code and captured output.
     from subprocess import CalledProcessError, check_output, STDOUT
 
     try:
@@ -57,6 +72,9 @@ def _check_output(items: list[str], encoding: str = "utf-8") -> str:
 
 
 class GitCommit:
+    # [CLASS DOC]
+    # Plain record of one git commit: commit_hash, author, author_date, title, body and an
+    # optional commit_date. The membership test checks whether text occurs in the title or body.
     commit_hash: str
     title: str
     body: str
@@ -73,6 +91,7 @@ class GitCommit:
         body: str,
         commit_date: datetime | None = None,
     ) -> None:
+        # [FUNCTION DOC] Stores the given commit fields as attributes; no validation.
         self.commit_hash = commit_hash
         self.author = author
         self.author_date = author_date
@@ -81,13 +100,20 @@ class GitCommit:
         self.body = body
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Returns the title followed by the commit hash in parentheses.
         return f"{self.title} ({self.commit_hash})"
 
     def __contains__(self, item: Any) -> bool:
+        # [FUNCTION DOC] Returns True if the given text occurs in the commit body or title.
         return item in self.body or item in self.title
 
 
 def parse_fuller_format(lines: str | list[str]) -> GitCommit:
+    # [FUNCTION DOC] Parses git show output in fuller format with unix dates into a GitCommit.
+    # Accepts a string (split on newlines) or a list of lines. Drops a Merge line at position 2
+    # if present (this mutates a caller supplied list). Raises AssertionError if there are fewer
+    # than 8 lines or the header lines (commit, Author, AuthorDate, Commit, CommitDate, blank)
+    # are misplaced. Title is line 7; body is the remaining lines joined by newlines.
     """
     Expect commit message generated using `--format=fuller --date=unix` format, i.e.:
         commit <sha1>
@@ -141,23 +167,37 @@ def parse_fuller_format(lines: str | list[str]) -> GitCommit:
 
 
 class GitRepo:
+    # [CLASS DOC]
+    # Wrapper that runs git commands via the git command line in a given repo directory. State:
+    # repo_dir, remote name and a debug flag that echoes each command. Methods cover rev-list,
+    # branch queries, checkout, fetch, ref lookup, patch ids, cherry-pick, revert, branch
+    # diffs, push with retry, remote url parsing and commit message editing. Failures of git
+    # surface as RuntimeError.
     def __init__(self, path: str, remote: str = "origin", debug: bool = False) -> None:
+        # [FUNCTION DOC] Stores repo_dir, remote and debug; no git command is run.
         self.repo_dir = path
         self.remote = remote
         self.debug = debug
 
     def _run_git(self, *args: Any) -> str:
+        # [FUNCTION DOC] HELPER: Runs git against the repo dir, echoing the command when debug
+        # is set, and returns the output text. Raises RuntimeError on failure.
         if self.debug:
             print(f"+ git -C {self.repo_dir} {' '.join(args)}")
         return _check_output(["git", "-C", self.repo_dir] + list(args))
 
     def revlist(self, revision_range: str) -> list[str]:
+        # [FUNCTION DOC] Returns the list of commit hashes in the revision range (limited to the
+        # current directory path), or an empty list.
         rc = self._run_git("rev-list", revision_range, "--", ".").strip()
         return rc.split("\n") if len(rc) > 0 else []
 
     def branches_containing_ref(
         self, ref: str, *, include_remote: bool = True
     ) -> list[str]:
+        # [FUNCTION DOC] Returns names of branches containing the ref (remote branches
+        # by default, local ones if include_remote is False), stripped of whitespace, or
+        # an empty list.
         rc = (
             self._run_git("branch", "--remote", "--contains", ref)
             if include_remote
@@ -166,6 +206,8 @@ class GitRepo:
         return [x.strip() for x in rc.split("\n") if x.strip()] if len(rc) > 0 else []
 
     def current_branch(self) -> str | None:
+        # [FUNCTION DOC] Returns the short name of the current branch, or None in
+        # detached HEAD state.
         try:
             return self._run_git("symbolic-ref", "--short", "HEAD").strip()
         except RuntimeError:
@@ -173,12 +215,19 @@ class GitRepo:
             return None
 
     def checkout(self, branch: str) -> None:
+        # [FUNCTION DOC] Checks out the given branch.
         self._run_git("checkout", branch)
 
     def create_branch_and_checkout(self, branch: str) -> None:
+        # [FUNCTION DOC] Creates the given branch from HEAD and checks it out.
         self._run_git("checkout", "-b", branch)
 
     def fetch(self, ref: str | None = None, branch: str | None = None) -> None:
+        # [FUNCTION DOC] Fetches from the remote. With no ref and no branch fetches
+        # everything; with only a ref fetches that ref; with both fetches the ref into the
+        # local branch name.
+        # KNOWN ISSUE: with only a branch given the ref is None and a literal None
+        #     ref is passed on.
         if branch is None and ref is None:
             self._run_git("fetch", self.remote)
         elif branch is None:
@@ -187,18 +236,27 @@ class GitRepo:
             self._run_git("fetch", self.remote, f"{ref}:{branch}")
 
     def show_ref(self, name: str) -> str:
+        # [FUNCTION DOC] Returns the hash a ref name resolves to. Raises RuntimeError if the
+        # name resolves to several different hashes (ambiguous).
         refs = self._run_git("show-ref", "-s", name).strip().split("\n")
         if not all(refs[i] == refs[0] for i in range(1, len(refs))):
             raise RuntimeError(f"reference {name} is ambiguous")
         return refs[0]
 
     def rev_parse(self, name: str) -> str:
+        # [FUNCTION DOC] Returns the verified full hash of a revision name; raises
+        # RuntimeError if invalid.
         return self._run_git("rev-parse", "--verify", name).strip()
 
     def get_merge_base(self, from_ref: str, to_ref: str) -> str:
+        # [FUNCTION DOC] Returns the merge-base hash of two refs.
         return self._run_git("merge-base", from_ref, to_ref).strip()
 
     def patch_id(self, ref: str | list[str]) -> list[tuple[str, str]]:
+        # [FUNCTION DOC] Returns stable patch ids as a list of (patch id, commit hash) pairs for
+        # one ref or a list of refs (joined with spaces and run through a shell). An empty list
+        # gives an empty result.
+        # KNOWN ISSUE: refs are interpolated into a shell command line without quoting.
         is_list = isinstance(ref, list)
         if is_list:
             if len(ref) == 0:
@@ -210,25 +268,39 @@ class GitRepo:
         return [cast(tuple[str, str], x.split(" ", 1)) for x in rc.split("\n")]
 
     def commits_resolving_gh_pr(self, pr_num: int) -> list[str]:
+        # [FUNCTION DOC] Returns hashes of commits whose message contains the "Pull Request
+        # resolved" line for the given PR number of this repo (owner and name from
+        # gh_owner_and_name), or an empty list.
         owner, name = self.gh_owner_and_name()
         msg = f"Pull Request resolved: https://github.com/{owner}/{name}/pull/{pr_num}"
         rc = self._run_git("log", "--format=%H", "--grep", msg).strip()
         return rc.split("\n") if len(rc) > 0 else []
 
     def get_commit(self, ref: str) -> GitCommit:
+        # [FUNCTION DOC] Returns the GitCommit for a ref by parsing git show output in
+        # fuller format.
         return parse_fuller_format(
             self._run_git("show", "--format=fuller", "--date=unix", "--shortstat", ref)
         )
 
     def cherry_pick(self, ref: str) -> None:
+        # [FUNCTION DOC] Cherry-picks the ref onto the current branch, recording the
+        # source commit.
         self._run_git("cherry-pick", "-x", ref)
 
     def revert(self, ref: str) -> None:
+        # [FUNCTION DOC] Reverts the ref without opening an editor.
         self._run_git("revert", "--no-edit", ref)
 
     def compute_branch_diffs(
         self, from_branch: str, to_branch: str
     ) -> tuple[list[str], list[str]]:
+        # [FUNCTION DOC] Returns two lists of commit hashes: commits only in from_branch and
+        # commits only in to_branch since their merge base. Commits with equal patch ids on both
+        # sides are removed; when the counts differ, pairs of same patch id commits are popped
+        # and removed, raising RuntimeError if title or author date differ (except for a
+        # hardcoded list of known commits on pytorch/pytorch). Also drops a hardcoded set of
+        # excluded commits for pytorch/pytorch. Can be slow when the merge base is far away.
         """
         Returns list of commits that are missing in each other branch since their merge base
         Might be slow if merge base is between two branches is pretty far off
@@ -289,6 +361,9 @@ class GitRepo:
         return (from_commits, to_commits)
 
     def cherry_pick_commits(self, from_branch: str, to_branch: str) -> None:
+        # [FUNCTION DOC] Cherry-picks, oldest first, every commit missing from to_branch onto
+        # it, then returns to the original branch. Raises AssertionError when HEAD is detached.
+        # Prints progress. Does not push.
         orig_branch = self.current_branch()
         if orig_branch is None:
             raise AssertionError("Must be on a branch to cherry pick commits")
@@ -304,6 +379,10 @@ class GitRepo:
         self.checkout(orig_branch)
 
     def push(self, branch: str, dry_run: bool, retry: int = 3) -> None:
+        # [FUNCTION DOC] Pushes the branch to the remote (a dry run if dry_run). On RuntimeError
+        # it prints, fetches and rebases onto the remote branch, then retries.
+        # KNOWN ISSUE: the loop has no break, so a successful push is repeated for every retry.
+        # KNOWN ISSUE: after the final failed attempt no error is raised to the caller.
         for cnt in range(retry):
             try:
                 if dry_run:
@@ -316,12 +395,18 @@ class GitRepo:
                 self._run_git("rebase", f"{self.remote}/{branch}")
 
     def head_hash(self) -> str:
+        # [FUNCTION DOC] Returns the hash of HEAD.
         return self._run_git("show-ref", "--hash", "HEAD").strip()
 
     def remote_url(self) -> str:
+        # [FUNCTION DOC] Returns the url of the remote as printed by git, including the trailing
+        # newline (not stripped).
         return self._run_git("remote", "get-url", self.remote)
 
     def gh_owner_and_name(self) -> tuple[str, str]:
+        # [FUNCTION DOC] Returns (owner, name) parsed from the url in env var GIT_REMOTE_URL,
+        # or the remote url if unset. Raises RuntimeError if the url does not match the
+        # github https form.
         url = os.getenv("GIT_REMOTE_URL", None)
         if url is None:
             url = self.remote_url()
@@ -331,18 +416,26 @@ class GitRepo:
         return cast(tuple[str, str], rc.groups())
 
     def commit_message(self, ref: str) -> str:
+        # [FUNCTION DOC] Returns the full message of the commit at ref.
         return self._run_git("log", "-1", "--format=%B", ref)
 
     def amend_commit_message(self, msg: str) -> None:
+        # [FUNCTION DOC] Amends HEAD with the given message (rewrites history; no push).
         self._run_git("commit", "--amend", "-m", msg)
 
     def diff(self, from_ref: str, to_ref: str | None = None) -> str:
+        # [FUNCTION DOC] Returns the diff text of a single commit (ref against its parent) when
+        # to_ref is None, otherwise the diff between from_ref and to_ref.
         if to_ref is None:
             return self._run_git("diff", f"{from_ref}^!")
         return self._run_git("diff", f"{from_ref}..{to_ref}")
 
 
 def clone_repo(username: str, password: str, org: str, project: str) -> GitRepo:
+    # [FUNCTION DOC] Clones the github project org/project with the given credentials embedded
+    # in the url into a new temporary directory and returns a GitRepo for it. Raises
+    # RuntimeError if the clone fails. Side effects: creates the temp directory (never removed)
+    # and network access.
     path = tempfile.mkdtemp()
     _check_output(
         [
@@ -356,19 +449,27 @@ def clone_repo(username: str, password: str, org: str, project: str) -> GitRepo:
 
 
 class PeekableIterator(Iterator[str]):
+    # [CLASS DOC]
+    # Character iterator over a string that supports looking at the next character without
+    # consuming it. State: the string and the index of the last consumed character.
     def __init__(self, val: str) -> None:
+        # [FUNCTION DOC] Stores the string and sets the position before the first character.
         self._val = val
         self._idx = -1
 
     def peek(self) -> str | None:
+        # [FUNCTION DOC] Returns the next character without consuming it, or None at the end.
         if self._idx + 1 >= len(self._val):
             return None
         return self._val[self._idx + 1]
 
     def __iter__(self) -> PeekableIterator:
+        # [FUNCTION DOC] Returns itself.
         return self
 
     def __next__(self) -> str:
+        # [FUNCTION DOC] Consumes and returns the next character; raises
+        # StopIteration at the end.
         rc = self.peek()
         if rc is None:
             raise StopIteration
@@ -377,6 +478,12 @@ class PeekableIterator(Iterator[str]):
 
 
 def patterns_to_regex(allowed_patterns: list[str]) -> Any:
+    # [FUNCTION DOC] Converts a list of glob-like patterns into one compiled regular expression
+    # that matches any of them. A single star matches any characters except slash, a double star
+    # matches any characters; dot and plus are escaped; the question mark is not translated.
+    # Raises AssertionError if a pattern contains braces, parens, brackets or backslash.
+    # KNOWN ISSUE: the docstring says a question mark matches one character, but it is copied
+    #     into the regex unchanged, where it makes the previous character optional.
     """
     pattern is glob-like, i.e. the only special sequences it has are:
       - ? - matches single character
@@ -412,6 +519,7 @@ def patterns_to_regex(allowed_patterns: list[str]) -> Any:
 
 
 def _shasum(value: str) -> str:
+    # [FUNCTION DOC] HELPER: Returns the hex sha256 digest of the utf-8 encoded string.
     import hashlib
 
     m = hashlib.sha256()
@@ -420,6 +528,8 @@ def _shasum(value: str) -> str:
 
 
 def is_commit_hash(ref: str) -> bool:
+    # [FUNCTION DOC] Returns True if the ref parses as a hexadecimal number, else False.
+    # KNOWN ISSUE: any hex-looking name (for example a branch called dead) counts as a hash.
     "True if ref is hexadecimal number, else false"
     try:
         int(ref, 16)
@@ -431,6 +541,10 @@ def is_commit_hash(ref: str) -> bool:
 def are_ghstack_branches_in_sync(
     repo: GitRepo, head_ref: str, base_ref: str | None = None
 ) -> bool:
+    # [FUNCTION DOC] Returns True if the diff of the ghstack orig branch against its parent
+    # equals the diff between base and head. head_ref ends with /head; orig and base names are
+    # derived from it (base_ref may be passed, and is used as is if it looks like a commit
+    # hash). Runs git diffs.
     """Checks that diff between base and head is the same as diff between orig and its parent"""
     orig_ref = re.sub(r"/head$", "/orig", head_ref)
     if base_ref is None:
@@ -448,9 +562,14 @@ def are_ghstack_branches_in_sync(
 def retries_decorator(
     rc: Any = None, num_retries: int = 3
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    # [FUNCTION DOC] Returns a decorator that calls the wrapped function up to num_retries
+    # times, printing a message on each exception and swallowing it. If all attempts fail it
+    # returns the value rc.
     def decorator(f: Callable[..., T]) -> Callable[..., T]:
+        # [FUNCTION DOC] HELPER: Wraps f with the retry loop; preserves f's metadata.
         @wraps(f)
         def wrapper(*args: list[Any], **kwargs: dict[str, Any]) -> T:
+            # [FUNCTION DOC] HELPER: Calls f; if every attempt fails returns rc.
             for idx in range(num_retries):
                 try:
                     return f(*args, **kwargs)

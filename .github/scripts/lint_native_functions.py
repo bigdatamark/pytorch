@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+# [MODULE DOC]
+# Lint script (run as a program) that checks native_functions.yaml round-trips unchanged through
+# ruamel.yaml with preserved quotes, wide lines and True/False booleans. Import time side
+# effects: reads aten/src/ATen/native/native_functions.yaml relative to the repo root, loads and
+# dumps it, and on mismatch prints a banner to stderr, writes a unified diff to stdout and exits
+# with status 1. Exits normally (0) when the file is already canonical.
+
 """
 Verify that it is possible to round-trip native_functions.yaml via ruamel under some
 configuration.  Keeping native_functions.yaml consistent in this way allows us to
@@ -23,6 +30,8 @@ import ruamel.yaml  # type: ignore[import]
 
 
 def fn(base: str) -> str:
+    # [FUNCTION DOC] HELPER: Returns the path of native_functions.yaml under the given base as a
+    # string (base is joined using the path operator on a Path).
     return str(base / Path("aten/src/ATen/native/native_functions.yaml"))
 
 

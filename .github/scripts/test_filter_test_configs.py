@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
 
+# [MODULE DOC]
+# Unit tests for filter_test_configs: label fetching, test matrix filtering by test-config
+# labels and selected configs, periodic mode expansion, removal and unstable marking of jobs
+# listed in the disabled/unstable jobs data, the misc task outputs written to the GitHub
+# output file, parsing of re-enabled issue numbers from PR bodies, and counting of ghstack
+# entries below the current PR. Defines two large fixtures: MOCKED_DISABLED_UNSTABLE_JOBS (job
+# key to issue info list with workflow, platform and job parts) and MOCKED_PR_INFO (a GitHub
+# issue api response with three labels, one empty named). Network access and subprocess calls
+# are mocked in the tests.
+
 import json
 import os
 import tempfile
@@ -224,28 +234,45 @@ MOCKED_PR_INFO = {
 
 
 class TestConfigFilter(TestCase):
+    # [CLASS DOC]
+    # Test case holding all tests of filter_test_configs. setUp sets a dummy GITHUB_TOKEN and
+    # clears GITHUB_OUTPUT; tearDown removes the GITHUB_OUTPUT file if a test set one. Most
+    # tests loop over lists of cases with an input matrix and expected json text.
     def setUp(self) -> None:
+        # [FUNCTION DOC] Sets env var GITHUB_TOKEN to a dummy value and removes GITHUB_OUTPUT
+        # from the environment if present.
         os.environ["GITHUB_TOKEN"] = "GITHUB_TOKEN"
         if os.getenv("GITHUB_OUTPUT"):
             del os.environ["GITHUB_OUTPUT"]
 
     def tearDown(self) -> None:
+        # [FUNCTION DOC] Deletes the file named by env var GITHUB_OUTPUT if set. The env var
+        # itself is not cleared here.
+        # KNOWN ISSUE: only the last output file of a test is removed; files from earlier loop
+        #     iterations of the misc tasks test are leaked.
         if os.getenv("GITHUB_OUTPUT"):
             os.remove(str(os.getenv("GITHUB_OUTPUT")))
 
     @mock.patch("filter_test_configs.download_json")
     def test_get_labels(self, mock_download_json: Any) -> None:
+        # [FUNCTION DOC] Checks that get_labels returns the names of non empty labels from the
+        # mocked PR info (the empty name is dropped).
         mock_download_json.return_value = MOCKED_PR_INFO
         labels = get_labels(pr_number=12345)
         self.assertSetEqual({"open source", "foo"}, labels)
 
     @mock.patch("filter_test_configs.download_json")
     def test_get_labels_failed(self, mock_download_json: Any) -> None:
+        # [FUNCTION DOC] Checks that get_labels returns an empty result when the download
+        # returns nothing.
         mock_download_json.return_value = {}
         labels = get_labels(pr_number=54321)
         self.assertFalse(labels)
 
     def test_filter(self) -> None:
+        # [FUNCTION DOC] Checks filter with test-config prefixed labels: a matrix lacking the
+        # requested config gives an empty include list, a label without the prefix is not a
+        # match, and a match keeps only that config.
         mocked_labels = {f"{PREFIX}cfg", "ciflow/trunk", "plain-cfg"}
         testcases = [
             {
@@ -272,6 +299,8 @@ class TestConfigFilter(TestCase):
             self.assertEqual(case["expected"], json.dumps(filtered_test_matrix))
 
     def test_filter_with_test_config_label(self) -> None:
+        # [FUNCTION DOC] Checks filter with a test-config label present: unmatched matrix gives
+        # an empty include list and a matching config is the only one kept.
         mocked_labels = {f"{PREFIX}cfg", "ciflow/trunk"}
 
         testcases = [
@@ -294,6 +323,9 @@ class TestConfigFilter(TestCase):
             self.assertEqual(case["expected"], json.dumps(filtered_test_matrix))
 
     def test_filter_selected_test_configs(self) -> None:
+        # [FUNCTION DOC] Checks filter_selected_test_configs with comma separated selections
+        # (stripped and lowercased): empty selection keeps all, no match gives empty include,
+        # and any match keeps the matching entries.
         testcases = [
             {
                 "test_matrix": '{include: [{config: "default"}]}',
@@ -339,6 +371,10 @@ class TestConfigFilter(TestCase):
             self.assertEqual(case["expected"], json.dumps(filtered_test_matrix))
 
     def test_set_periodic_modes(self) -> None:
+        # [FUNCTION DOC] Checks that set_periodic_modes multiplies the matrix: the number of
+        # output entries equals input entries times the number of supported modes whose
+        # condition holds for the job name (cases: empty matrix, plain, CUDA and ROCm job names,
+        # empty and missing job name).
         testcases: list[dict[str, str]] = [
             {
                 "job_name": "a CI job",
@@ -385,6 +421,9 @@ class TestConfigFilter(TestCase):
             )
 
     def test_set_periodic_modes_gpu_runner(self) -> None:
+        # [FUNCTION DOC] Checks that a job whose name lacks cuda but whose runner is an NVIDIA
+        # GPU runner still gets the rerun_disabled_tests mode, producing 2 entries from 2
+        # input entries.
         """Job name without 'cuda' but runner indicates a CUDA job (e.g. inductor-unittest)."""
         test_matrix = yaml.safe_load(
             "{include: ["
@@ -402,6 +441,11 @@ class TestConfigFilter(TestCase):
 
     @mock.patch("filter_test_configs.download_json")
     def test_remove_disabled_jobs(self, mock_download_json: Any) -> None:
+        # [FUNCTION DOC] Checks remove_disabled_jobs with the mocked disabled job data: build,
+        # test and build-and-test jobs of matching workflow and platform get their matrix
+        # emptied; a disabled test config removes only that config; invalid names, other
+        # workflows or platforms leave the matrix as is; binary jobs are handled for both build
+        # and test jobs.
         mock_download_json.return_value = MOCKED_DISABLED_UNSTABLE_JOBS
 
         testcases = [
@@ -522,6 +566,9 @@ class TestConfigFilter(TestCase):
 
     @mock.patch("filter_test_configs.download_json")
     def test_mark_unstable_jobs(self, mock_download_json: Any) -> None:
+        # [FUNCTION DOC] Checks mark_unstable_jobs with the mocked data: matching jobs or
+        # configs get the unstable key set to unstable while non matching names, workflows and
+        # platforms are unchanged.
         mock_download_json.return_value = MOCKED_DISABLED_UNSTABLE_JOBS
 
         testcases = [
@@ -642,6 +689,13 @@ class TestConfigFilter(TestCase):
 
     @mock.patch("subprocess.check_output")
     def test_perform_misc_tasks(self, mocked_subprocess: Any) -> None:
+        # [FUNCTION DOC] Checks perform_misc_tasks (subprocess output mocked to empty bytes) by
+        # writing to a temp GITHUB_OUTPUT file for many cases and comparing the full output
+        # text: keep-going, verbose test logs, showlocals, no test timeout, no TD and TD
+        # distributed flags from labels or PR body markers, the unstable flag for unstable jobs
+        # or all unstable configs, and the re-enabled issue numbers parsed from the PR body.
+        # KNOWN ISSUE: each case leaves a temp file with delete disabled; only the
+        #     last is removed.
         def _gen_expected_string(
             keep_going: bool = False,
             ci_verbose_test_logs: bool = False,
@@ -652,6 +706,8 @@ class TestConfigFilter(TestCase):
             is_unstable: bool = False,
             reenabled_issues: str = "",
         ) -> str:
+            # [FUNCTION DOC] HELPER: Builds the expected GitHub output text with one name=value
+            # line per flag, in the fixed order from keep-going to reenabled-issues.
             return (
                 f"keep-going={keep_going}\n"
                 f"ci-verbose-test-logs={ci_verbose_test_logs}\n"
@@ -790,6 +846,9 @@ class TestConfigFilter(TestCase):
 
     # test variations of close in PR_BODY
     def test_parse_reenabled_issues(self) -> None:
+        # [FUNCTION DOC] Checks parse_reenabled_issues: closes, fixes and resolves keywords in
+        # all tense and case variations with hash numbers or issue links, odd spacing, malformed
+        # text giving an empty list, and a None body giving an empty list.
         pr_body = "closes #123 Close #143 ClOsE #345 closed #10283"
         self.assertEqual(
             parse_reenabled_issues(pr_body), ["123", "143", "345", "10283"]
@@ -834,6 +893,9 @@ class TestConfigFilter(TestCase):
         self.assertEqual(parse_reenabled_issues(pr_body), [])
 
     def test_get_ghstack_below_count(self) -> None:
+        # [FUNCTION DOC] Checks get_ghstack_below_count: 0 for empty or non ghstack text, and
+        # the number of entries below the marker line for the top, middle and bottom of a 4
+        # entry stack (3, 1, 0).
         # Not a ghstack body.
         self.assertEqual(get_ghstack_below_count(""), 0)
         self.assertEqual(get_ghstack_below_count("just a regular PR"), 0)

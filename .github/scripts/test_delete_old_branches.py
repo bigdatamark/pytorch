@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Unit tests for delete_old_tags in the delete_old_branches script. Git and the delete helper
+# are mocked. Import time side effect: sets env var GITHUB_TOKEN to a dummy value before the
+# module under test is imported.
 import os
 import unittest
 from datetime import datetime
@@ -12,9 +16,15 @@ from delete_old_branches import delete_old_tags
 @patch("delete_old_branches.delete_branch")
 @patch("gitutils.GitRepo._run_git")
 class TestDeleteTag(unittest.TestCase):
+    # [CLASS DOC]
+    # Tests of tag deletion with the delete helper and git command runner mocked out (the class
+    # decorators pass the git mock first and the delete mock second to each test).
     def test_delete_tag(
         self, mock_run_git: "MagicMock", mock_delete_tag: "MagicMock"
     ) -> None:
+        # [FUNCTION DOC] For tags matching the ciflow branch, ciflow commit sha and trunk sha
+        # forms, checks that a tag whose commit date is 8 days old is deleted (delete called
+        # once) and one 6 days old is kept.
         for tag in [
             "ciflow/branch/12345",
             "ciflow/commitsha/1234567890abcdef1234567890abcdef12345678",
@@ -39,6 +49,8 @@ class TestDeleteTag(unittest.TestCase):
     def test_do_not_delete_tag(
         self, mock_run_git: "MagicMock", mock_delete_tag: "MagicMock"
     ) -> None:
+        # [FUNCTION DOC] Checks that tags not matching the known name patterns are never
+        # deleted, even when 8 days old.
         for tag in [
             "ciflow/doesntseemtomatch",
             "trunk/doesntseemtomatch",

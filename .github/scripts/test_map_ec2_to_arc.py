@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+# [MODULE DOC]
+# Tests for map_ec2_to_arc.py that run it as a subprocess with a matrix and optional prefix,
+# parse the printed test-matrix json and compare mapped runner labels. Can be run by pytest
+# or directly as a script, in which case all functions named test_ are run in sorted order
+# and the process exits with status 1 if any fails. Constant SCRIPT is the path of the
+# script under test.
+
 
 import json
 import os
@@ -14,6 +21,9 @@ SCRIPT = Path(__file__).resolve().parent / "map_ec2_to_arc.py"
 def run(
     matrix: str, prefix: str = "", github_output: str | None = None
 ) -> subprocess.CompletedProcess:
+    # [FUNCTION DOC] HELPER: Runs the script under the current Python with the matrix argument,
+    # adding the prefix option if given. Sets the GITHUB_OUTPUT env var to the given path, or
+    # removes it if None. Returns the completed process with captured text output.
     cmd = [sys.executable, str(SCRIPT)]
     if prefix:
         cmd += ["--prefix", prefix]
@@ -29,6 +39,8 @@ def run(
 
 
 def parse_output(stdout: str) -> dict:
+    # [FUNCTION DOC] HELPER: Returns the json parsed from the first stdout line starting with
+    # the Setting test-matrix marker; raises ValueError if no such line exists.
     """Extract the JSON matrix from the 'Setting test-matrix=...' line."""
     prefix = "Setting test-matrix="
     for line in stdout.splitlines():
@@ -38,11 +50,14 @@ def parse_output(stdout: str) -> dict:
 
 
 def check(condition: bool, msg: str = "") -> None:
+    # [FUNCTION DOC] HELPER: Raises AssertionError with the message when the condition is false.
     if not condition:
         raise AssertionError(msg)
 
 
 def test_basic_matrix():
+    # [FUNCTION DOC] Checks that two EC2 runners map to the expected ARC labels
+    # without a prefix.
     matrix = """{ include: [
       { config: "default", shard: 1, num_shards: 1, runner: "linux.4xlarge" },
       { config: "openreg", shard: 1, num_shards: 1, runner: "linux.2xlarge" },
@@ -55,6 +70,8 @@ def test_basic_matrix():
 
 
 def test_matrix_with_prefix():
+    # [FUNCTION DOC] Checks that the mt- prefix is stripped before mapping and added back
+    # to ARC labels.
     matrix = """{ include: [
       { config: "default", shard: 1, num_shards: 7, runner: "mt-linux.4xlarge" },
       { config: "default", shard: 2, num_shards: 7, runner: "mt-linux.4xlarge" },
@@ -75,6 +92,7 @@ def test_matrix_with_prefix():
 
 
 def test_matrix_without_prefix_when_none_present():
+    # [FUNCTION DOC] Checks that a GPU runner without any prefix maps to the A10G ARC label.
     matrix = """{ include: [
       { config: "default", shard: 1, num_shards: 1, runner: "linux.g5.4xlarge.nvidia.gpu" },
     ]}"""
@@ -85,6 +103,8 @@ def test_matrix_without_prefix_when_none_present():
 
 
 def test_unknown_runner_fails():
+    # [FUNCTION DOC] Checks that an unknown runner exits with status 1 and reports no
+    # ARC runner found.
     matrix = """{ include: [
       { config: "default", shard: 1, num_shards: 1, runner: "bogus.runner" },
     ]}"""
@@ -94,6 +114,10 @@ def test_unknown_runner_fails():
 
 
 def test_prefix_not_present_on_runner():
+    # [FUNCTION DOC] Checks the mapping when a prefix is given but the runner label lacks it:
+    # the mapped label still gets the prefix added.
+    # KNOWN ISSUE: the docstring says the raw label is used, but the test asserts the
+    #     prefixed mapped label.
     """When --prefix is given but a runner doesn't have it, the raw label is used."""
     matrix = """{ include: [
       { config: "default", shard: 1, num_shards: 1, runner: "linux.4xlarge" },
@@ -105,6 +129,8 @@ def test_prefix_not_present_on_runner():
 
 
 def test_preserves_non_runner_fields():
+    # [FUNCTION DOC] Checks that fields other than runner (config, shard, num_shards)
+    # are preserved.
     matrix = """{ include: [
       { config: "default", shard: 3, num_shards: 7, runner: "linux.large" },
     ]}"""
@@ -118,6 +144,7 @@ def test_preserves_non_runner_fields():
 
 
 def test_empty_include_passes_through():
+    # [FUNCTION DOC] Checks that a matrix with an empty include list is output unchanged.
     matrix = """{ include: [] }"""
     result = run(matrix)
     check(result.returncode == 0, result.stderr)
@@ -126,11 +153,14 @@ def test_empty_include_passes_through():
 
 
 def test_empty_string_passes_through():
+    # [FUNCTION DOC] Checks that an empty matrix string exits successfully.
     result = run("")
     check(result.returncode == 0, result.stderr)
 
 
 def test_mixed_runners():
+    # [FUNCTION DOC] Checks mapping of several different runner types (x86, GPU, arm)
+    # in one matrix.
     matrix = """{ include: [
       { config: "default", shard: 1, num_shards: 1, runner: "linux.4xlarge" },
       { config: "gpu", shard: 1, num_shards: 1, runner: "linux.g5.4xlarge.nvidia.gpu" },
@@ -151,6 +181,8 @@ def test_mixed_runners():
 
 
 def test_passthrough_runner_no_prefix():
+    # [FUNCTION DOC] Checks that ROCm and XPU passthrough runners keep their labels even
+    # with a prefix.
     """Passthrough runners (ROCm, XPU) should not get the OSDC prefix."""
     matrix = """{ include: [
       { config: "default", shard: 1, num_shards: 3, runner: "linux.rocm.gpu.2" },
@@ -167,6 +199,8 @@ def test_passthrough_runner_no_prefix():
 
 
 def test_github_output_file():
+    # [FUNCTION DOC] Checks that with GITHUB_OUTPUT set to a temp file, the script writes a
+    # test-matrix entry with the mapped runner there. The temp file is always removed.
     """When GITHUB_OUTPUT is set, the script writes test-matrix to that file."""
     matrix = """{ include: [
       { config: "default", shard: 1, num_shards: 1, runner: "linux.2xlarge" },
@@ -189,6 +223,7 @@ def test_github_output_file():
 
 
 def test_h100_forces_mt_prefix_when_no_prefix():
+    # [FUNCTION DOC] Checks that an H100 runner without prefix gets the mt- prefix.
     matrix = """{ include: [
       { config: "default", shard: 1, num_shards: 1, runner: "linux.aws.h100" },
     ]}"""
@@ -199,6 +234,8 @@ def test_h100_forces_mt_prefix_when_no_prefix():
 
 
 def test_h100_forces_mt_prefix_overriding_lf():
+    # [FUNCTION DOC] Checks that an H100 runner under the lf- prefix is forced to
+    # the mt- prefix.
     matrix = """{ include: [
       { config: "default", shard: 1, num_shards: 1, runner: "lf-linux.aws.h100" },
     ]}"""
@@ -212,6 +249,7 @@ def test_h100_forces_mt_prefix_overriding_lf():
 
 
 def test_h100_with_mt_prefix_idempotent():
+    # [FUNCTION DOC] Checks that an H100 runner already under mt- ends with a single mt- prefix.
     matrix = """{ include: [
       { config: "default", shard: 1, num_shards: 1, runner: "mt-linux.aws.h100" },
     ]}"""
@@ -222,6 +260,8 @@ def test_h100_with_mt_prefix_idempotent():
 
 
 def test_b200_passthrough_regardless_of_prefix():
+    # [FUNCTION DOC] Checks that B200 runners are passed through with their original labels
+    # (prefix removed) even when the lf- prefix is given.
     """B200 stays on the EC2 runners until OSDC has capacity."""
     matrix = """{ include: [
       { config: "default", shard: 1, num_shards: 1, runner: "lf-linux.dgx.b200" },
@@ -238,6 +278,7 @@ def test_b200_passthrough_regardless_of_prefix():
 
 
 def test_non_h100_keeps_lf_prefix():
+    # [FUNCTION DOC] Regression check that a non H100 runner keeps the lf- prefix.
     """Regression guard: non-H100/B200 runners must not be forced to mt-."""
     matrix = """{ include: [
       { config: "default", shard: 1, num_shards: 1, runner: "lf-linux.4xlarge" },
@@ -249,6 +290,7 @@ def test_non_h100_keeps_lf_prefix():
 
 
 def test_h100_multi_gpu_variants_force_mt():
+    # [FUNCTION DOC] Checks that multi GPU H100 variants (4 and 8) map to mt- prefixed labels.
     matrix = """{ include: [
       { config: "default", shard: 1, num_shards: 1, runner: "lf-linux.aws.h100.4" },
       { config: "default", shard: 1, num_shards: 1, runner: "lf-linux.aws.h100.8" },

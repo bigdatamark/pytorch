@@ -1,5 +1,15 @@
 # flake8: noqa: G004
 
+# [MODULE DOC]
+# Script run by GitHub workflows to decide which runner fleet label prefix a job uses. It reads
+# the first comment of a GitHub issue holding a yaml settings block of experiments (separated by
+# a line of three dashes from a list of per-user opt-ins), evaluates which experiments apply to
+# the requesting users, branch, workflow and rollout percentages, and writes the label prefix
+# (Meta fleet by default, Linux Foundation fleet when the lf experiment is on, canary variant
+# for the canary repo) and the amd-sandbox prefix to the GitHub output file. Any failure falls
+# back to the Meta prefix. Import time side effects: reads env var GITHUB_OUTPUT and configures
+# a colored stream handler and the module logger at INFO level.
+
 """
 This runner determinator is used to determine which set of runners to run a
 GitHub job on. It uses the first comment of a GitHub issue (by default
@@ -97,6 +107,12 @@ AMD_SANDBOX_LABEL_PREFIX = "amd-sandbox-"
 
 
 class Experiment(NamedTuple):
+    # [CLASS DOC]
+    # Settings of one experiment: rollout_perc (percentage of runs enabled for users who have
+    # not opted in), all_branches (also enable on main-like branches), default (enabled when no
+    # explicit eligible list is given) and workflows (comma separated allow list with optional
+    # minus prefixed exclusions; ALL or empty means every workflow). Field names are the keys
+    # accepted in the yaml.
     rollout_perc: float = (
         0  # Percentage of workflows to experiment on when user is not opted-in.
     )
@@ -118,6 +134,9 @@ class Experiment(NamedTuple):
 
 
 class RunnerPrefixResult(NamedTuple):
+    # [CLASS DOC]
+    # Result of runner prefix selection: prefix is the shared label prefix, amd_sandbox_prefix
+    # is the separate prefix for the amd-sandbox experiment (empty when not enabled).
     prefix: str
     # Dedicated prefix for the amd-sandbox experiment, exposed via its own output
     # (amd-sandbox-label-type) instead of being folded into ``prefix``.
@@ -125,6 +144,8 @@ class RunnerPrefixResult(NamedTuple):
 
 
 class Settings(NamedTuple):
+    # [CLASS DOC]
+    # Parsed rollout settings: a mapping from experiment name to Experiment (empty by default).
     """
     Settings for the experiments that can be opted into.
     """
@@ -133,6 +154,9 @@ class Settings(NamedTuple):
 
 
 class ColorFormatter(logging.Formatter):
+    # [CLASS DOC]
+    # Logging formatter that wraps each message in an ANSI color for its level (yellow for
+    # warnings, red for errors and critical, reset otherwise).
     """Color codes the log messages based on the log level"""
 
     COLORS = {
@@ -144,6 +168,9 @@ class ColorFormatter(logging.Formatter):
     }
 
     def format(self, record: LogRecord) -> str:
+        # [FUNCTION DOC] Wraps the record message in the ANSI color for its level and resets
+        # afterwards, then formats it. Mutates the record message in place, so colors would
+        # stack if a record is formatted twice.
         log_color = self.COLORS.get(record.levelname, "\033[0m")  # Default to reset
         record.msg = f"{log_color}{record.msg}\033[0m"
         return super().format(record)
@@ -158,6 +185,9 @@ log.setLevel(logging.INFO)
 
 
 def set_github_output(key: str, value: str) -> None:
+    # [FUNCTION DOC] Writes key=value to the file named by GITHUB_OUTPUT (appending) and logs
+    # it. If the env var was empty at import time, logs a warning and prints the deprecated set-
+    # output command instead.
     """
     Defines outputs of the github action that invokes this script
     """
@@ -175,12 +205,19 @@ def set_github_output(key: str, value: str) -> None:
 
 
 def _str_comma_separated_to_set(value: str) -> frozenset[str]:
+    # [FUNCTION DOC] HELPER: Parses comma separated text into a frozenset of stripped,
+    # non-empty names.
     return frozenset(
         filter(lambda itm: itm != "", map(str.strip, value.strip(" \n\t").split(",")))
     )
 
 
 def parse_args() -> Any:
+    # [FUNCTION DOC] Defines and parses the command line: required github-token, github-repo,
+    # github-issue, github-actor, github-issue-owner, github-branch and github-ref-type;
+    # optional github-issue-repo (default pytorch/test-infra), eligible-experiments and opt-out-
+    # experiments (comma separated sets), pr-number and workflow-name. Returns the namespace;
+    # exits on invalid arguments.
     parser = ArgumentParser("Get dynamic rollout settings")
     parser.add_argument("--github-token", type=str, required=True, help="GitHub token")
     parser.add_argument(
@@ -250,11 +287,14 @@ def parse_args() -> Any:
 
 
 def get_gh_client(github_token: str) -> Github:  # type: ignore[no-any-unimported]
+    # [FUNCTION DOC] Returns a PyGithub client authenticated with the given token.
     auth = Auth.Token(github_token)
     return Github(auth=auth)
 
 
 def get_issue(gh: Github, repo: str, issue_num: int) -> Issue:  # type: ignore[no-any-unimported]
+    # [FUNCTION DOC] HELPER: Returns the issue with the given number from the given repo (name)
+    # using the client.
     repo = gh.get_repo(repo)
     return repo.get_issue(number=issue_num)
 
@@ -262,6 +302,12 @@ def get_issue(gh: Github, repo: str, issue_num: int) -> Issue:  # type: ignore[n
 def get_potential_pr_author(
     github_token: str, repo: str, username: str, ref_type: str, ref_name: str
 ) -> str:
+    # [FUNCTION DOC] Returns the login to treat as the workflow requester. For a tag created by
+    # the pytorch-bot account named ciflow/<name>/<pr number>, returns the author login of that
+    # PR (fetched from GitHub); otherwise returns the given username. Raises a generic Exception
+    # if the PR lookup fails.
+    # KNOWN ISSUE: the error message refers to the repository variable, which is unbound if
+    #     fetching the repo itself failed, so a NameError can mask the real error.
     # If the trigger was a new tag added by a bot, this is a ciflow case
     # Fetch the actual username from the original PR. The PR number is
     # embedded in the tag name: ciflow/<name>/<pr-number>
@@ -289,6 +335,9 @@ def get_potential_pr_author(
 
 
 def is_exception_branch(branch: str) -> bool:
+    # [FUNCTION DOC] Returns True if the first path component of the branch is main,
+    # nightly, release or landchecks (branches that are excluded from experiments unless
+    # all_branches is set).
     """
     Branches that get opted out of experiments by default, until they're explicitly enabled.
     """
@@ -301,6 +350,8 @@ def is_exception_branch(branch: str) -> bool:
 
 
 def load_yaml(yaml_text: str) -> Any:
+    # [FUNCTION DOC] HELPER: Parses yaml text safely and returns the data; logs and re-
+    # raises yaml errors.
     try:
         data = yaml.safe_load(yaml_text)
         return data
@@ -310,6 +361,9 @@ def load_yaml(yaml_text: str) -> Any:
 
 
 def extract_settings_user_opt_in_from_text(rollout_state: str) -> tuple[str, str]:
+    # [FUNCTION DOC] Splits the rollout issue text on the three dash separator and returns
+    # (settings text, user opt-in text). Without a separator the settings are empty and
+    # everything is user text. Only the first two parts are used if there are more separators.
     """
     Extracts the text with settings, if any, and the opted in users from the rollout state.
 
@@ -326,6 +380,9 @@ def extract_settings_user_opt_in_from_text(rollout_state: str) -> tuple[str, str
 
 
 class UserExperimentConfig(NamedTuple):
+    # [CLASS DOC]
+    # One experiment a user opted into: name (a leading minus means opt-out) and rollout_perc,
+    # the percentage of runs for which it applies (default 100).
     """
     Per-user experiment configuration parsed from the opt-in line.
     """
@@ -335,12 +392,17 @@ class UserExperimentConfig(NamedTuple):
 
 
 class UserOptins(dict[str, list[UserExperimentConfig]]):
+    # [CLASS DOC]
+    # Mapping from user name (without the at sign) to the list of UserExperimentConfig entries
+    # parsed from the opt-in text.
     """
     Dictionary of users with a list of experiment configs they have opted into
     """
 
 
 def parse_workflow_list(workflows: str) -> set[str]:
+    # [FUNCTION DOC] Returns the set of non-empty, stripped names from the comma separated
+    # workflows setting.
     """
     Parse the per-experiment ``workflows`` setting into a set of allowlisted
     workflow names. Empty entries are ignored.
@@ -349,6 +411,13 @@ def parse_workflow_list(workflows: str) -> set[str]:
 
 
 def parse_user_opt_in_from_text(user_optin_text: str) -> UserOptins:
+    # [FUNCTION DOC] Parses the opt-in text, one user per line, into UserOptins. Lines (stripped
+    # of whitespace and dashes at the ends) that do not start with an at sign are ignored.
+    # Entries after the user name are experiments; name:percentage sets a per-user rollout
+    # (invalid numbers default to 100 with a warning, out of range values are clamped to
+    # 0..100); minus prefixed entries are opt-outs.
+    # KNOWN ISSUE: the docstring says a hash prefix opts a user out of everything, but lines
+    #     starting with a hash are skipped as invalid and no such handling exists.
     """
     Parse the user opt-in text into a key value pair of username and the list of features they have opted into
 
@@ -398,6 +467,9 @@ def parse_user_opt_in_from_text(user_optin_text: str) -> UserOptins:
 
 
 def is_valid_experiment_name(experiment_name: str) -> bool:
+    # [FUNCTION DOC] Returns True if the name is alphanumeric with optional inner underscores or
+    # dashes (no spaces, not starting or ending with a special character); otherwise logs an
+    # error, returns False.
     """
     Check if the experiment name is valid.
     A valid name:
@@ -419,6 +491,10 @@ def is_valid_experiment_name(experiment_name: str) -> bool:
 
 
 def parse_settings_from_text(settings_text: str) -> Settings:
+    # [FUNCTION DOC] Parses the yaml settings text (backticks and whitespace stripped) into
+    # Settings holding an Experiment per valid experiment name; unknown fields are dropped with
+    # a warning and invalid names skipped. Any error is logged and an empty Settings is
+    # returned; empty text gives empty Settings.
     """
     Parse the experiments from the issue body into a list of ExperimentSettings
     """
@@ -456,6 +532,8 @@ def parse_settings_from_text(settings_text: str) -> Settings:
 
 
 def parse_settings(rollout_state: str) -> Settings:
+    # [FUNCTION DOC] Returns the Settings parsed from the settings part of the
+    # rollout issue text.
     """
     Parse settings, if any, from the rollout state.
 
@@ -469,6 +547,7 @@ def parse_settings(rollout_state: str) -> Settings:
 
 
 def parse_users(rollout_state: str) -> UserOptins:
+    # [FUNCTION DOC] Returns the UserOptins parsed from the user part of the rollout issue text.
     """
     Parse users from the rollout state.
 
@@ -480,6 +559,8 @@ def parse_users(rollout_state: str) -> UserOptins:
 def get_user_experiment_config(
     user: str, user_optins: UserOptins, experiment_name: str
 ) -> UserExperimentConfig | None:
+    # [FUNCTION DOC] Returns the user's UserExperimentConfig for the named experiment, or None
+    # if the user did not opt into it.
     """
     Get a user's experiment config if they are opted in.
     Returns None if the user is not opted into the experiment.
@@ -491,6 +572,7 @@ def get_user_experiment_config(
 
 
 def is_user_opted_in(user: str, user_optins: UserOptins, experiment_name: str) -> bool:
+    # [FUNCTION DOC] Returns True if the user has an opt-in entry for the experiment.
     """
     Check if a user is opted into an experiment
     """
@@ -498,6 +580,8 @@ def is_user_opted_in(user: str, user_optins: UserOptins, experiment_name: str) -
 
 
 def is_user_opted_out(user: str, user_optins: UserOptins, experiment_name: str) -> bool:
+    # [FUNCTION DOC] Returns True if the user has a minus prefixed entry for the experiment
+    # (opt-out wins; a warning is logged if the user is also opted in).
     """
     Check if a user explicitly opted out of an experiment
     """
@@ -526,6 +610,15 @@ def get_runner_prefix(
     is_canary: bool = False,
     workflow_name: str = "",
 ) -> RunnerPrefixResult:
+    # [FUNCTION DOC] Decides the runner label prefix. Goes through each experiment in the
+    # settings and skips it for exception branches (unless all_branches), opted-out experiments,
+    # experiments not in the eligible list (or non default ones when no list is given), and when
+    # any requestor opted out. It is enabled if some requestor opted in (using the minimum per-
+    # user percentage with a random draw, 100 meaning always), else per workflow allow list and
+    # exclusions then the experiment rollout percentage with a random draw. Enabled amd-sandbox
+    # sets the separate prefix; lf selects the Linux Foundation prefix; others have no effect.
+    # Without lf the Meta prefix (canary variant if is_canary) is used. Returns
+    # RunnerPrefixResult. Logs decisions; uses randomness.
     settings = parse_settings(rollout_state)
     user_optins = parse_users(rollout_state)
 
@@ -668,6 +761,9 @@ def get_runner_prefix(
 
 
 def get_rollout_state_from_issue(github_token: str, repo: str, issue_num: int) -> str:
+    # [FUNCTION DOC] Returns the text of the first comment of the issue (stripped of surrounding
+    # whitespace), which holds the rollout configuration. Network access; raises if the issue
+    # has no comments.
     """
     Gets the first comment of the issue, which contains the desired rollout state.
 
@@ -679,6 +775,9 @@ def get_rollout_state_from_issue(github_token: str, repo: str, issue_num: int) -
 
 
 def download_json(url: str, headers: dict[str, str], num_retries: int = 3) -> Any:
+    # [FUNCTION DOC] HELPER: Fetches the url with the headers (5 second timeout) and returns the
+    # parsed json, retrying up to num_retries times on any error. Returns an empty dict when all
+    # attempts fail.
     for _ in range(num_retries):
         try:
             req = Request(url=url, headers=headers)
@@ -693,6 +792,8 @@ def download_json(url: str, headers: dict[str, str], num_retries: int = 3) -> An
 
 @cache
 def get_pr_info(github_repo: str, github_token: str, pr_number: int) -> dict[str, Any]:
+    # [FUNCTION DOC] Returns the json of the GitHub issue (PR) from the REST API, or an empty
+    # dict on failure (logged). Results are cached per argument tuple.
     """
     Dynamically get PR information
     """
@@ -714,6 +815,8 @@ def get_pr_info(github_repo: str, github_token: str, pr_number: int) -> dict[str
 
 
 def get_labels(github_repo: str, github_token: str, pr_number: int) -> set[str]:
+    # [FUNCTION DOC] Returns the set of label names currently on the PR, from the
+    # cached PR info.
     """
     Dynamically get the latest list of labels from the pull request
     """
@@ -724,6 +827,12 @@ def get_labels(github_repo: str, github_token: str, pr_number: int) -> set[str]:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point. Parses arguments and starts from the Meta prefix. If a PR
+    # number is given and the PR has the no-runner-experiments label, adds lf to the opted-out
+    # experiments. Reads the rollout state from the issue, resolves the requester, and computes
+    # the prefixes with the issue owner and requester as workflow requestors. Any exception is
+    # logged and the Meta defaults are kept. Always writes the label-type and amd-sandbox-
+    # label-type outputs.
     args = parse_args()
 
     runner_label_prefix = META_LABEL_PREFIX
