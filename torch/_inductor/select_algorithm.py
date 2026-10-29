@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Template-based autotuning machinery for Inductor: Triton template kernels and algorithm selection.
+# Defines TritonTemplateKernel (code generation for a templated Triton kernel), TritonTemplate and
+# TritonTemplateCaller (render, compile, benchmark and cache template choices), ExternKernelChoice /
+# ExternKernelCaller (aten/extern fallbacks), AlgorithmSelectorCache (benchmarks all candidate choices,
+# caches the winner, handles prologue/epilogue fusion benchmarking) and the autotune_select_algorithm entry points.
+# Import-time side effects: creates module globals (VERIFY, PRINT_AUTOTUNE, DEBUG, extern_kernels) and a module logger.
 import contextlib
 import dataclasses
 import functools
@@ -119,6 +125,7 @@ if TYPE_CHECKING:
 
 
 class KernelNamespace:
+    # [CLASS DOC] HELPER: Empty namespace object; extern_kernels is an instance on which generated wrapper code looks up extern kernel callables.
     pass
 
 
@@ -130,17 +137,22 @@ WORKSPACE_ARG_PLACEHOLDER = "ws_placeholder"
 
 @dataclasses.dataclass
 class BenchmarkTensors:
+    # [CLASS DOC] Plain dataclass holding the list of input tensors and the (optional) output tensor used to benchmark one choice.
     """Represents a set of inputs and outputs for autotuning with a template"""
 
     input_tensors: list[torch.Tensor]
     output_tensor: torch.Tensor | None
 
     def unpack(self):
+        # [FUNCTION DOC] Returns the pair (input tensors, output tensor).
         return self.input_tensors, self.output_tensor
 
 
 @dataclasses.dataclass
 class AutotuneArgs:
+    # [CLASS DOC] Dataclass bundling the benchmark inputs shared by all choices during autotuning.
+    # Keeps two BenchmarkTensors views of the same buffers: triton (base pointers, no offset for sliced tensors)
+    # and extern (inputs for aten/extern kernels, keeping offsets), plus an optional expected reference output.
     """During autotuning, we need to pass the same inputs to all choices.
     Note:
         Since we typically have a mix of external choices and triton choices, we create
@@ -154,6 +166,7 @@ class AutotuneArgs:
     expected: torch.Tensor | None = None
 
     def get_benchmark_tensors(self, extern=False) -> BenchmarkTensors:
+        # [FUNCTION DOC] Returns the extern tensors if extern is true, otherwise the triton tensors.
         """Returns the inputs and output tensors for a given choice."""
         bench_tensors = self.extern if extern else self.triton
         return bench_tensors
@@ -167,6 +180,7 @@ class AutotuneArgs:
         out_extern: torch.Tensor,
         expected: torch.Tensor | None = None,
     ) -> Self:
+        # [FUNCTION DOC] Classmethod factory building an AutotuneArgs from separate triton/extern input lists and outputs plus optional expected output.
         """Factory method to create AutotuneInputs from separate inputs/outputs"""
         return cls(
             triton=BenchmarkTensors(example_inputs, out),
@@ -175,12 +189,16 @@ class AutotuneArgs:
         )
 
     def verify(self, **kwargs):
+        # [FUNCTION DOC] Compares the extern output tensor against the expected tensor with assert_close, forwarding kwargs (tolerances); raises on mismatch.
         """Verify the correctness of the benchmarking results"""
 
         torch.testing.assert_close(self.extern.output_tensor, self.expected, **kwargs)
 
 
 class PartialRender:
+    # [CLASS DOC] Holds rendered template code that still contains placeholder strings plus a mapping of placeholder key to a hook function.
+    # Hooks produce text that is substituted after the whole template is rendered. A hook entry set to None means it was already finalized.
+    # Key methods: finalize_hook (one key), finalize_remaining (all still-active), finalize_all (every key, errors on repeats), code (final text).
     """
     Some parts of a template need to be generated at the end, but
     inserted into the template at the start.  This allows doing a bunch
@@ -190,6 +208,7 @@ class PartialRender:
     HookFn = Callable[[], str]
 
     def __init__(self, code: str, replacement_hooks: dict[str, HookFn | None]) -> None:
+        # [FUNCTION DOC] Stores the code string and the replacement hook mapping.
         super().__init__()
         self._code: str = code
         self.replacement_hooks: dict[str, PartialRender.HookFn | None] = (
@@ -198,6 +217,7 @@ class PartialRender:
 
     @property
     def code(self) -> str:
+        # [FUNCTION DOC] Property returning the fully rendered code; raises AssertionError if any hook is still active (not finalized).
         """
         The fully rendered code. Will **error** if any hooks have yet to be
         finalized.
@@ -212,6 +232,11 @@ class PartialRender:
         return self._code
 
     def _replace_placeholder(self, hook_key: str, result: str) -> str:
+        # [FUNCTION DOC] HELPER: Substitutes a placeholder key in the stored code with a hook result and returns the new text (does not store it).
+        # Returns the code unchanged if the key is absent. An empty/blank result removes every line holding only the placeholder.
+        # For a whole-line placeholder with a non-empty result whose lines are all unindented, the placeholder indent is applied to every
+        # non-empty result line; otherwise the placeholder is replaced textually (indent only affects the first line). Inline placeholders
+        # are replaced textually on that line.
         """Replace all occurrences of a placeholder in the code with the hook result.
 
         During Jinja template rendering, hooks like ``def_kernel()``,
@@ -300,6 +325,9 @@ class PartialRender:
         return "\n".join(new_lines)
 
     def finalize_hook(self, hook_key: str, strict: bool = True) -> None:
+        # [FUNCTION DOC] Runs the hook registered for hook_key and substitutes its result into the code, then marks the hook as finalized (None).
+        # Args: hook_key; strict (if true an unknown key raises RuntimeError, else it is silently ignored).
+        # Raises AssertionError if the hook was already finalized.
         """
         Finalize a hook by name.
 
@@ -323,6 +351,7 @@ class PartialRender:
         self.replacement_hooks[hook_key] = None
 
     def finalize_remaining(self) -> str:
+        # [FUNCTION DOC] Finalizes every hook that is still active (skips already finalized ones) and returns the final code.
         """
         Finalize the remaining active hooks. This function can be used in cases
         where the caller uses `finalize_hook` rather than `finalize_all`.
@@ -336,6 +365,7 @@ class PartialRender:
         return self.code
 
     def finalize_all(self) -> str:
+        # [FUNCTION DOC] Finalizes every hook in the mapping and returns the final code; raises AssertionError if any hook was already finalized.
         """
         Finalize all active hooks.
 
@@ -353,6 +383,10 @@ class PartialRender:
 
 @dataclasses.dataclass()
 class SubgraphInfo:
+    # [CLASS DOC] Dataclass holding the per-subgraph state needed while lowering a subgraph inside a Triton template.
+    # Fields: body, compute, indexing_code, loads and stores code buffers; template_mask and template_out_shape; ops_handler and cse;
+    # optional range_trees, range_tree_nodes and numels (only copied when not None); and root_var_renames (original range-tree
+    # variable name to renamed prologue variable name).
     body: IndentedBuffer
     template_mask: str | None = None
     template_out_shape: str | tuple[str] | None = None
@@ -374,6 +408,7 @@ class SubgraphInfo:
     root_var_renames: dict[str, str] = dataclasses.field(default_factory=dict)
 
     def __post_init__(self):
+        # [FUNCTION DOC] HELPER: Records the names of the fields that are only copied over when not None.
         self.only_copy_if_non_none_fields = (
             "range_trees",
             "range_tree_nodes",
@@ -382,12 +417,17 @@ class SubgraphInfo:
         )
 
     def to_dict(self):
+        # [FUNCTION DOC] Returns a shallow dict mapping each dataclass field name to its current value.
         return {
             field.name: getattr(self, field.name) for field in dataclasses.fields(self)
         }
 
 
 class ModificationWrapper(V.WrapperHandler):  # type: ignore[name-defined]
+    # [CLASS DOC] Ops handler wrapper used while generating code for template subgraphs (score/mask modifications).
+    # Intercepts load and store so that fixed inputs (precomputed values) are substituted instead of loaded from memory, and other
+    # buffers are loaded through the kernel with their index expressions.
+    # State: kernel, fixed_inputs (name to value), mask, input_shapes, input_dtypes.
     """Handles placeholder substitutions during subgraph processing."""
 
     def __init__(
@@ -399,6 +439,9 @@ class ModificationWrapper(V.WrapperHandler):  # type: ignore[name-defined]
         input_shapes: dict[str, tuple[str, ...]] | None = None,
         input_dtypes: dict[str, torch.dtype | str] | None = None,
     ):
+        # [FUNCTION DOC] Initializes the wrapper around the current ops handler. Args: kernel, subgraph_number (used for the name), fixed_inputs,
+        # mask string, optional input_shapes and input_dtypes (their keys must be a subset of fixed_inputs keys).
+        # Raises AssertionError if shape or dtype keys are not among the fixed inputs.
         super().__init__(V.ops)
         self.name = f"PlaceholderSubstitution_{subgraph_number}"
         self.kernel = kernel
@@ -418,6 +461,9 @@ class ModificationWrapper(V.WrapperHandler):  # type: ignore[name-defined]
             )
 
     def load(self, name: str, index: sympy.Expr):
+        # [FUNCTION DOC] Handles a load. For a name not in fixed_inputs, registers the buffer as a kernel input and emits a Triton load of
+        # it at the processed index (upcast to float32 for half types when configured), returning the CSE variable.
+        # For a fixed input, returns a CSE variable holding the fixed value in parentheses with its known shape and dtype.
         """Handle loading from tensor or fixed input."""
         if name not in self.fixed_inputs:
             index_str = self._process_indexing(index)
@@ -450,9 +496,12 @@ class ModificationWrapper(V.WrapperHandler):  # type: ignore[name-defined]
         )
 
     def _index_dtype(self) -> torch.dtype:
+        # [FUNCTION DOC] HELPER: Returns int64 if the kernel index dtype is 64-bit Triton, else int32.
         return torch.int64 if self.kernel.index_dtype == "tl.int64" else torch.int32
 
     def _normalize_input_dtype(self, dtype: torch.dtype | str) -> torch.dtype:
+        # [FUNCTION DOC] HELPER: Converts a fixed-input dtype spec to a torch dtype: passes torch dtypes through, maps the string "index" to the
+        # kernel index dtype, otherwise raises AssertionError.
         if isinstance(dtype, torch.dtype):
             return dtype
         if dtype == "index":
@@ -460,6 +509,8 @@ class ModificationWrapper(V.WrapperHandler):  # type: ignore[name-defined]
         raise AssertionError(f"Unexpected fixed input dtype: {dtype}")
 
     def _fixed_input_dtype(self, name: str) -> torch.dtype:
+        # [FUNCTION DOC] HELPER: Determines the dtype of a fixed input: explicit input_dtypes entry first, then the dtype of a CSE variable value
+        # (or of a CSE variable looked up by a string value), and otherwise bool for bools and float32 for everything else.
         if name in self.input_dtypes:
             return self._normalize_input_dtype(self.input_dtypes[name])
 
@@ -477,6 +528,7 @@ class ModificationWrapper(V.WrapperHandler):  # type: ignore[name-defined]
         return torch.float32
 
     def indirect_indexing(self, index_var: str, size, check, wrap_neg=True):
+        # [FUNCTION DOC] Converts an indirect index variable into a symbolic index symbol named after the variable; size, check and wrap_neg are ignored.
         """Convert index variable to symbolic form."""
         return sympy_index_symbol(str(index_var))
 
@@ -484,6 +536,8 @@ class ModificationWrapper(V.WrapperHandler):  # type: ignore[name-defined]
     def store(
         self, name: str, index: sympy.Expr, value: CSEVariable, mode: StoreMode = None
     ) -> str:
+        # [FUNCTION DOC] Emits an atomic add store (used by flex attention backward for captured buffers) and returns the generated code string.
+        # Raises AssertionError if no mask is set or if mode is not atomic_add. Registers the buffer as a kernel input.
         """Currently only supports stores for atomic adds coming from scatter nodes
         This is used by flex_attention's backwards grad for captured buffers, see
         zeros_and_scatter lowering
@@ -498,12 +552,16 @@ class ModificationWrapper(V.WrapperHandler):  # type: ignore[name-defined]
         return f"tl.atomic_add({buf_name} + {index_str}, {value}, {self.mask}, sem='relaxed')"
 
     def _add_kernel_input(self, name: str) -> str:
+        # [FUNCTION DOC] HELPER: Registers a buffer as an input of the kernel and returns its argument name.
         return self.kernel.args.input(name)
 
     def _process_indexing(self, index: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Renames and converts a sympy index expression to kernel expression text.
         return self.kernel.kexpr(self.kernel.rename_indexing(index))
 
     def _broadcast_index(self, index: sympy.Expr, shape: str) -> str:
+        # [FUNCTION DOC] HELPER: Returns code text that broadcasts the index expression to the given shape string.
+        # Single-element block shapes are reshaped to scalar then broadcast; shapeless constant indices use a full fill; otherwise a plain broadcast.
         index = sympy.sympify(index)
         index_str = self._process_indexing(index)
         index_shape = TritonSymbols.get_block_shape(index)
@@ -526,6 +584,8 @@ RecordedEventsType = list[tuple[str, list[Any], dict[str, Any]]]
 
 
 class TritonTemplateKernel(TritonKernel):
+    # [CLASS DOC] TritonKernel subclass that generates code for templated Triton kernels (see Triton template files).
+    # Supports subgraphs, workspace args, TMA load/store, warp specialization options, and prologue/epilogue fusion hooks.
     """
     A specialized kernel class for Triton templates that handles code generation
     for templated Triton kernels.
@@ -563,6 +623,12 @@ class TritonTemplateKernel(TritonKernel):
         always_freeze_layout: bool = False,
         index_dtype_override: str | None = None,
     ) -> None:
+        # [FUNCTION DOC] Builds the template kernel. Sizes the kernel as a single flat "x" dimension (numel of the output) or, when TMA load/store
+        # is requested, a 2D x/y tiling (raises AssertionError if the output is not 2D) and reorders pointwise range trees to match.
+        # Stores the input/output nodes, defines, num_stages/num_warps, grid function, meta dict, call sizes, warp specialization counts,
+        # prefix/suffix arg counts, epilogue function, subgraphs, optional workspace arg (appended to the kernel args), prologue-fusion
+        # bookkeeping sets, per-subgraph code buffers (swapped in by set_subgraph_body), record/replay state for cached code generation
+        # (cached_replay_events, frozen_layouts_cnt), and flags such as always_freeze_layout and index dtype override.
         tma_2d = tma_store or tma_load_for_template_epilogue
         if tma_store:
             pass
@@ -702,14 +768,19 @@ class TritonTemplateKernel(TritonKernel):
 
     @property
     def index_dtype(self) -> str:
+        # [FUNCTION DOC] Property returning the index dtype string: the override if one was given, otherwise the TritonKernel default.
         if self._index_dtype_override is not None:
             return self._index_dtype_override
         return super().index_dtype
 
     def _gen_tmp_var(self) -> str:
+        # [FUNCTION DOC] HELPER: Returns a fresh unique temporary variable name from an internal counter.
         return f"_tmp_var{next(self.tmp_var_ctr)}"
 
     def input_dependent_preserved_state(self) -> str:
+        # [FUNCTION DOC] Returns a string snapshot of the kernel state that depends on input names (input buffers, size vars, workspace args,
+        # prologue-supported inputs, frozen layout count). Used to detect whether a call changed input-dependent state. Output buffers are
+        # intentionally excluded since they never need replaying.
         # Not adding self.args.output_buffers on purpose. But we do not need to reproduce it on a cache hit.
         # (never accessed).
         return repr(
@@ -723,8 +794,13 @@ class TritonTemplateKernel(TritonKernel):
         )
 
     def record_input_dependent_tracked_event(self) -> Callable[..., Any]:
+        # [FUNCTION DOC] Returns a decorator factory used to wrap template helper functions. The wrapped function compares the input-dependent
+        # state before and after the call and, if it changed, appends (function name, args, kwargs) to cached_replay_events so the call can be
+        # replayed on a code-cache hit. Raises AssertionError if state changed while cached_replay_events is None.
         def decorator(fn) -> Callable[..., Any]:
+            # [FUNCTION DOC] HELPER: Decorator that wraps fn with the state-change recording wrapper.
             def wrapper(*args, **kwargs) -> Any:
+                # [FUNCTION DOC] HELPER: Calls fn, records the call for replay if the input-dependent state changed, and returns fn's result.
                 pre_state = self.input_dependent_preserved_state()
                 result = fn(*args, **kwargs)
                 post_state = self.input_dependent_preserved_state()
@@ -739,11 +815,16 @@ class TritonTemplateKernel(TritonKernel):
         return decorator
 
     def replay_cached_events(self, events: RecordedEventsType) -> None:
+        # [FUNCTION DOC] Replays recorded (method name, args, kwargs) events on this kernel by calling each named method in order; used on a cache hit.
         for f, args, kwargs in events:
             getattr(self, f)(*args, **kwargs)
 
     @contextlib.contextmanager
     def set_subgraph_body(self, body_name: str):
+        # [FUNCTION DOC] Context manager that temporarily installs the named subgraph body's state (body, compute, loads, stores, cse, range trees,
+        # masks, ops handler, etc.) onto the kernel. Fields that are None and listed as only-copy-if-non-None are skipped. If the body has an ops
+        # handler it is wrapped around the current handler for the duration. On exit the (possibly mutated) state is saved back into the subgraph
+        # body entry and the previous kernel state is restored. Raises AssertionError for an unknown body name.
         if not all(
             hasattr(self, field.name) for field in dataclasses.fields(SubgraphInfo)
         ):
@@ -781,6 +862,8 @@ class TritonTemplateKernel(TritonKernel):
 
     @contextlib.contextmanager
     def create_subgraph_body(self, body_name: str, clear_cse: bool = False):
+        # [FUNCTION DOC] Context manager that registers a new empty subgraph body (optionally with a cloned CSE) and enters set_subgraph_body for it.
+        # Raises AssertionError if body_name already exists.
         if body_name in self.subgraph_bodies:
             raise AssertionError(f"subgraph body {body_name} already exists")
         self.subgraph_bodies[body_name] = SubgraphInfo(
@@ -790,6 +873,8 @@ class TritonTemplateKernel(TritonKernel):
             yield
 
     def _make_independent_subgraph(self, subgraph_name, numel, **extra_fields):
+        # [FUNCTION DOC] HELPER: Registers a subgraph body with freshly constructed range trees over a flat numel (plus a reduction placeholder) and
+        # a cloned CSE, plus any extra SubgraphInfo fields. Used by external template backends for epilogue/prologue hooks needing independent range tree state.
         """Create a subgraph with fresh independent range trees.
 
         Used by external template backends for epilogue/prologue hooks
@@ -819,6 +904,9 @@ class TritonTemplateKernel(TritonKernel):
         mask: str | None,
         xindex_name: str = "xindex",
     ) -> sympy.Expr:
+        # [FUNCTION DOC] HELPER: Shared setup for store_output, epilogue hooks and load_input. Names the range tree entries from indices, builds the
+        # contiguous index expression from the lengths and symbols, emits an assignment of it to xindex_name in the body, renames the matching
+        # range tree entry and re-keys range_tree_nodes, and sets template_mask and template_indices. Returns the contiguous index expression.
         """Set up range trees, contiguous index, mask, and template indices.
 
         Common boilerplate shared by store_output, _setup_epilogue_hook,
@@ -851,9 +939,12 @@ class TritonTemplateKernel(TritonKernel):
     def _make_codegen_hook(
         self, subgraph_name: str, indent_width: int = 0
     ) -> Callable[[], str]:
+        # [FUNCTION DOC] HELPER: Returns a hook (no-arg callable) that, when called, generates the subgraph body code under set_subgraph_body,
+        # invalidates the CSE, and returns the stripped text (re-indented by indent_width if nonzero).
         """Create a hook closure that codegen's a subgraph body."""
 
         def hook():
+            # [FUNCTION DOC] HELPER: Generates and returns the code text of the subgraph body (see _make_codegen_hook).
             with self.set_subgraph_body(subgraph_name):
                 self.codegen_body()
                 self.cse.invalidate(OrderedSet())
@@ -867,9 +958,12 @@ class TritonTemplateKernel(TritonKernel):
         return hook
 
     def need_numel_args(self):
+        # [FUNCTION DOC] Returns False: template kernels never need numel arguments.
         return False
 
     def estimate_kernel_num_bytes(self):
+        # [FUNCTION DOC] Estimates the total bytes moved by the kernel as the sum over input nodes and the output node of element count times dtype
+        # size; in-place args are counted twice (read and write). Uses optimization hints for symbolic sizes with fallback 0.
         """
         Estimate the total number of bytes this kernel takes.
         For in/out nodes, sizes are counted twice: once for reading and
@@ -885,6 +979,8 @@ class TritonTemplateKernel(TritonKernel):
         return sum(num_bytes)
 
     def estimate_flops(self) -> int:
+        # [FUNCTION DOC] Estimates the flop count by looking through the origin FX nodes of the inputs for the first one whose flops can be
+        # counted, returning an integer (via optimization hint for symbolic values); returns 0 if none.
         for node in self.input_nodes:
             for fx_node in node._current_origins:
                 f = count_flops_fx(fx_node)
@@ -895,6 +991,10 @@ class TritonTemplateKernel(TritonKernel):
         return 0
 
     def jit_lines(self):
+        # [FUNCTION DOC] Returns the decorator text for the generated kernel. With use_jit it is just the jit decorator. Otherwise builds the
+        # triton_meta (signature, device, constants, configs, AMD options such as matrix_instr_nonkdim/waves_per_eu/kpack, tlx options),
+        # stores/updates self.triton_meta, builds inductor_meta (kernel name placeholder, common meta, grid args, optional bandwidth/flop info,
+        # config args) and returns the template heuristics decorator plus jit decorator as a string. Side effect: mutates self.triton_meta.
         """Render decorators and metadata for the generated Triton template."""
         if self.use_jit:
             return "@triton.jit"
@@ -978,7 +1078,10 @@ class TritonTemplateKernel(TritonKernel):
         """
 
     def gen_argdefs(self):
+        # [FUNCTION DOC] Template hook: registers (allowing overwrite) a deferred "<ARGDEFS>" placeholder that is later replaced by the comma-joined
+        # kernel argument definitions; returns the placeholder text.
         def hook():
+            # [FUNCTION DOC] HELPER: Computes the comma-joined full argument names once all args are known.
             # python_argdefs() cannot be run until after the rest of the template lazily adds more args
             arg_defs, *_ = self.args.python_argdefs()
             return f"{', '.join(x.full_name() for x in arg_defs)}"
@@ -986,9 +1089,14 @@ class TritonTemplateKernel(TritonKernel):
         return self._register_hook("<ARGDEFS>", hook, allow_overwriting=True)
 
     def gen_defines(self):
+        # [FUNCTION DOC] Template hook returning the stored defines text.
         return self.defines
 
     def def_kernel(self, *argnames):
+        # [FUNCTION DOC] Template hook that defines the kernel. Takes one name per non-prefix/suffix input node; registers inputs (skipping removed
+        # buffers and prologue-fused inputs), records named input nodes, emits per-name rename lines (adding the layout offset when nonzero),
+        # optionally marks all inputs prologue-supported, and registers a deferred "<DEF_KERNEL>" hook that emits imports, decorator, def line, defines,
+        # renames and prologue code. Returns the placeholder. Raises AssertionError for non-str names or a count mismatch.
         """
         Hook called from template code to generate function def and
         needed args.
@@ -1052,6 +1160,7 @@ class TritonTemplateKernel(TritonKernel):
             self.args.input(input_node.get_name())
 
         def hook():
+            # [FUNCTION DOC] HELPER: Builds the full kernel definition text once the final argument list is known.
             # python_argdefs() cannot be run until after the rest of the template lazily adds more args
             arg_defs, *_ = self.args.python_argdefs()
             code = IndentedBuffer()
@@ -1069,6 +1178,9 @@ class TritonTemplateKernel(TritonKernel):
         return self._register_hook("<DEF_KERNEL>", hook)
 
     def size(self, name: str | None, index: int):
+        # [FUNCTION DOC] Template hook returning the size of dimension index of the named input (or of the output when name is None) as expression
+        # text, registering dynamic size args as needed. With 64-bit indexing wraps the value in a full-tensor constant of the index dtype.
+        # Raises AssertionError if index is not an int or name is not a str/None.
         """
         Hook called from template code to get the size of an arg.
         Will add needed args to pass it in if it is dynamic.
@@ -1089,6 +1201,8 @@ class TritonTemplateKernel(TritonKernel):
         return result
 
     def stride(self, name, index=None):
+        # [FUNCTION DOC] Template hook returning stride text for the named input (output if name is None; may freeze the input layout). With an
+        # int index returns that stride; otherwise a comma-joined list of all strides. Raises AssertionError for a non-str name.
         """
         Hook called from template code to get the stride of an arg.
         Will add needed args to pass it in if it is dynamic.
@@ -1105,6 +1219,8 @@ class TritonTemplateKernel(TritonKernel):
         return ", ".join([texpr(self.rename_indexing(i)) for i in val])
 
     def _get_subgraph(self, subgraph_number: int):
+        # [FUNCTION DOC] HELPER: Returns subgraph number subgraph_number from self.subgraphs after validating types, range and that the body is
+        # empty; raises AssertionError on any violation.
         if not isinstance(subgraph_number, int):
             raise AssertionError(
                 f"expected subgraph_number to be int, got {type(subgraph_number)}"
@@ -1122,6 +1238,8 @@ class TritonTemplateKernel(TritonKernel):
         return self.subgraphs[subgraph_number]
 
     def _handle_scatter_graph(self, scatter_graph):
+        # [FUNCTION DOC] HELPER: Generates the store code for a single scatter ComputedBuffer (zeros_and_scatter lowering) and returns the store
+        # output. Raises AssertionError if scatter_graph is not a ComputedBuffer.
         """Handle processing for a single scatter graph.
 
         Args:
@@ -1133,6 +1251,7 @@ class TritonTemplateKernel(TritonKernel):
             )
 
         def contiguous_strides(x):
+            # [FUNCTION DOC] HELPER: Maps a multi-dim index to a flat offset by summing index times the scatter graph strides.
             # We always create a fresh contiguous grad for scattering into
             return sum(
                 x_i * stride for x_i, stride in zip(x, scatter_graph.get_stride())
@@ -1151,6 +1270,10 @@ class TritonTemplateKernel(TritonKernel):
         input_dtypes: dict[str, torch.dtype | str] | None = None,
         **fixed_inputs,
     ) -> str:
+        # [FUNCTION DOC] Template hook that generates code for a modification subgraph (e.g. flex attention score_mod/mask_mod). Creates a uniquely
+        # named subgraph body, runs the subgraph under a ModificationWrapper ops handler (fixed_inputs substituted for loads), and handles
+        # scatter-list subgraphs. If output_name is given writes an assignment of the result to it; otherwise emits scatter stores (and out must be None).
+        # Returns the generated body text and invalidates the CSE. Raises AssertionError on bad subgraph type or output_name usage.
         """This creates a modification function for a subgraph.
         To use this inside a template, the first argument should specify which subgraph to codegen for
 
@@ -1222,6 +1345,8 @@ class TritonTemplateKernel(TritonKernel):
         indent_width: int = 4,
         index_shape: tuple[str] | None = None,
     ):
+        # [FUNCTION DOC] Template hook that loads an input with optional preprocessing/masking, supporting prologue fusion: marks the input as
+        # prologue-supported, builds range trees for its flat size and returns a deferred placeholder replaced later by generated load code.
         """Loads an input and applies any necessary preprocessing or masking.
 
         Args:
@@ -1291,6 +1416,9 @@ class TritonTemplateKernel(TritonKernel):
             template_mask = self.template_mask
 
             class StoreOutputSubstitution(V.WrapperHandler):  # type: ignore[name-defined]
+            # [CLASS DOC] HELPER: Local ops handler used while loading a prologue input. Its store method records the stored buffer name and value in
+            # the kernel CSE store cache and, for prologue-fused inputs, emits a masked (and dtype-converted) assignment of the value, broadcast to the
+            # index shape, to the load output variable.
                 name = "StoreOutputSubstitution"
 
                 def store(
@@ -1300,6 +1428,8 @@ class TritonTemplateKernel(TritonKernel):
                     value: "CSEVariable",
                     mode: "StoreMode" = None,
                 ):
+                    # [FUNCTION DOC] HELPER: Records the store; for prologue-fused inputs re-applies the template mask (unless the buffer preserves zero and other is 0),
+                    # converts to the buffer dtype if needed, and writes the broadcast assignment into the kernel compute buffer.
                     V.kernel.store_buffer_names.add(name)
                     V.kernel.cse.store_cache[name] = value
                     if name in V.kernel.prologue_fused_inputs:
@@ -1377,6 +1507,8 @@ class TritonTemplateKernel(TritonKernel):
         hook_key = f"<LOAD_INPUT_{input_name}>"
 
         def hook():
+        # [FUNCTION DOC] HELPER: Generates the load body text for a prologue input: invalidates the CSE, generates the subgraph body, appends the
+        # load line unless the input is prologue-fused, and returns the stripped (optionally indented) text.
             with self.set_subgraph_body(hook_key):
                 self.cse.invalidate(OrderedSet())
                 self.codegen_body()
@@ -1403,6 +1535,9 @@ class TritonTemplateKernel(TritonKernel):
         num_dims: int,
         block_name: str | None = None,
     ) -> list[str]:
+        # [FUNCTION DOC] HELPER: Returns two source lines that compute an offset from the TMA index and an index tensor of block_name (or block_size)
+        # elements shaped to broadcast along dimension dim of num_dims. If block_name is given, records a constexpr for it in the prologue (raises
+        # AssertionError if the same name was already used with a different block size).
         """
         Generate the logic to compute the regular tl.load index from the provided
         tma index. This is used to ensure variables can support fusions.
@@ -1449,6 +1584,7 @@ class TritonTemplateKernel(TritonKernel):
         shape_val: str,
         output_name: str,
     ) -> str:
+        # [FUNCTION DOC] HELPER: Returns the source line assigning output_name the comparison of index_name against the upper bound shape_val.
         """
         Generate the mask logic to feed to fusions for mask. The expectation
         is that if we have X/Y there will be a variable named xmask and ymask.
@@ -1473,6 +1609,11 @@ class TritonTemplateKernel(TritonKernel):
         val_shape: tuple[str] | None = None,
         block_indexing: bool = False,
     ):
+        # [FUNCTION DOC] Template hook that stores the final output and later splices in epilogue fusions. Validates argument types (raises AssertionError
+        # otherwise), creates a numbered subgraph body, and computes output indices either from block (TMA) offsets (2D only, no mask; builds intermediate
+        # index and mask lines and renames range trees) or from contiguous indices. Loads extra prefix/suffix inputs, applies the manual epilogue function,
+        # emulates unfused numerics when accumulator and output dtypes differ with fused epilogues, and stores the result via the ops handler
+        # (TMA mode if tma_store). Returns a deferred hook placeholder. Side effects: freezes input layouts and increments frozen_layouts_cnt.
         """Stores the final output and appends any epilogue fusions if the buffer hasn't been optimized away.
 
         Args:
@@ -1710,6 +1851,7 @@ class TritonTemplateKernel(TritonKernel):
         *,
         allow_overwriting: bool = False,
     ) -> str:
+        # [FUNCTION DOC] HELPER: Registers hook_fn under hook_name in render_hooks and returns hook_name. Raises AssertionError on duplicates unless allow_overwriting.
         """
         Register a hook function with a name.
 
@@ -1731,6 +1873,7 @@ class TritonTemplateKernel(TritonKernel):
         return hook_name
 
     def _register_extra_template_env_fns(self, *fns: Callable[..., Any]):
+        # [FUNCTION DOC] HELPER: Appends extra functions that are exposed in the template environment during the initial render.
         """
         Register some extra functions to expose when performing the initial
         template render, so that they're in scope to by used by jinja
@@ -1748,6 +1891,9 @@ class TritonTemplateKernel(TritonKernel):
         self.extra_template_env_fns.extend(fns)
 
     def render(self, template, kwargs, record_input_dependent_tracked_event=False):
+        # [FUNCTION DOC] Renders the Jinja template with the kernel hook functions (def_kernel, size, stride, store_output, load_input, make_load,
+        # modification, gen_argdefs, gen_defines and extras) plus kwargs, and returns a PartialRender over the text and the registered hooks.
+        # If record_input_dependent_tracked_event is true, resets cached_replay_events and wraps each hook function so input-dependent state changes are recorded.
         if record_input_dependent_tracked_event:
             self.cached_replay_events = []
 
@@ -1776,6 +1922,8 @@ class TritonTemplateKernel(TritonKernel):
         )
 
     def make_load(self, name, indices, mask):
+        # [FUNCTION DOC] Optional template helper returning code text for a masked load of the named input using its strides (freezing layout if needed)
+        # and the given indices; raises AssertionError on wrong argument types or index/stride length mismatch.
         """
         Optional helper called from template code to generate the code
         needed to load from a tensor.
@@ -1810,6 +1958,8 @@ class TritonTemplateKernel(TritonKernel):
         tma_compatibility_checker: TMACompatibilityChecker | None = None,
         mask_constant_index=False,
     ):
+        # [FUNCTION DOC] Overrides TritonKernel.indexing, delegating to the parent with the template mask and template output shape.
+        # KNOWN ISSUE: the dense_indexing, copy_shape and override_mask arguments are ignored (dense_indexing forced False, the others replaced by template state).
         """
         Override the default indexing to use our custom mask and force
         dense indexing.
@@ -1827,9 +1977,12 @@ class TritonTemplateKernel(TritonKernel):
         )
 
     def codegen_range_tree(self):
+        # [FUNCTION DOC] No-op override that disables the default range tree codegen.
         pass  # ignore default codegen
 
     def additional_call_args_and_types(self):
+        # [FUNCTION DOC] Computes extra call arguments for the grid: with a SymbolicGridFn evaluates it on symbolic call sizes, or if all call sizes are
+        # integers evaluates the grid function on them; returns (grid args, their types), or empty tuples otherwise. Raises AssertionError unless 0 or 3 values are returned.
         if isinstance(self.grid_fn, SymbolicGridFn):
             grid_args = self.grid_fn.sympy_call(*self.call_sizes, self.meta)
             if len(grid_args) not in (0, 3):
@@ -1845,6 +1998,9 @@ class TritonTemplateKernel(TritonKernel):
     def call_kernel(
         self, name: str, node: ir.IRNode | None = None, deallocate_ws: bool = True
     ):
+        # [FUNCTION DOC] Emits the kernel launch into the wrapper code: gathers call args, appends grid arguments (or an inline grid call when the grid is
+        # not symbolic; raises AssertionError under cpp_wrapper in that case), allocates/deallocates the workspace if any, generates the kernel call, and
+        # invokes _emit_post_kernel_code.
         wrapper = V.graph.wrapper_code
         _, call_args, _, arg_types = self.args.python_argdefs()
 
@@ -1884,10 +2040,12 @@ class TritonTemplateKernel(TritonKernel):
             wrapper.generate_workspace_deallocation(self.workspace_arg)
 
     def _emit_post_kernel_code(self, wrapper, kernel_name: str) -> None:
+        # [FUNCTION DOC] HELPER: Hook for subclasses to emit code after the kernel call and before workspace deallocation; does nothing here.
         """Hook for subclasses to emit code after kernel call, before workspace dealloc."""
         pass  # noqa: PIE790
 
     def kernel_benchmark_extra_args(self) -> list[str]:
+        # [FUNCTION DOC] Returns the grid values (computed with optimization hints of call sizes) as strings, used as extra benchmark args.
         # Grid args are only used for benchmarking, not correctness
         return [
             str(x)
@@ -1897,6 +2055,10 @@ class TritonTemplateKernel(TritonKernel):
         ]
 
     def get_stride_and_maybe_freeze_layout(self, node) -> list[int]:
+        # [FUNCTION DOC] Returns the stride list of a template input node. Realizes the input first. For an unfrozen flexible layout (not a reinterpret view):
+        # freezes it immediately when aten gemm fallback is unavailable or always_freeze_layout is set; otherwise computes the strides it would have
+        # if frozen and records them as a graph-level layout constraint (raises AssertionError if a different constraint already exists) and returns those
+        # strides without freezing. Otherwise returns the node's current strides.
         """
         Get the stride of an input node for template code generation, with deferred
         layout freezing:
@@ -1944,6 +2106,8 @@ class TritonTemplateKernel(TritonKernel):
     def _compute_fusion_metadata(
         self, scheduling, epilogue_nodes, prologue_nodes, buf_name_to_prologue_group
     ):
+        # [FUNCTION DOC] HELPER: Default fusion routing before render: every subgraph gets all epilogue nodes, no unfused epilogues, and no prologue source tracking.
+        # Sets _epilogue_nodes_by_subgraph, _unfused_epilogues and _prologue_sources on the kernel. Overridden by subclasses for per-output routing.
         """Prepare epilogue/prologue routing before render().
 
         Default: trivial routing — all epilogues broadcast to every subgraph,
@@ -1966,6 +2130,10 @@ class TritonTemplateKernel(TritonKernel):
         prologue_preserves_zero_mask_fn,
         render,
     ) -> str:
+        # [FUNCTION DOC] Generates the complete template source with fused prologues and epilogues and returns it as a string.
+        # Computes fusion metadata, renders the template, then within the kernel context generates each epilogue node into its store subgraph and
+        # the prologues into their load subgraphs. After the subclass hook _finalize_partial_render, finalizes hooks in order (<DEF_KERNEL> under the
+        # template node origins, <ARGDEFS>, each load input, each store subgraph, then all remaining) with the kernel handler set.
         """Generate template source code with fused prologues and epilogues.
 
         Returns the final source code string.
@@ -2026,6 +2194,9 @@ class TritonTemplateKernel(TritonKernel):
     def codegen_prologues_in_subgraphs(
         self, buf_name_to_prologue_group, prologue_preserves_zero_mask_fn
     ):
+        # [FUNCTION DOC] Generates prologue node code inside each named input's load subgraph body. Upcasting to float32 is disabled when all prologue
+        # nodes can codegen without upcasts. Records zero-mask-preserving fused inputs (single-buffer single-node groups accepted by the callback)
+        # and invalidates the CSE afterwards. Inputs without a prologue group are skipped.
         """Run prologue codegen in each load-input subgraph body."""
         for input_name, buffer in self.named_input_nodes.items():
             subgraph_name = f"<LOAD_INPUT_{input_name}>"
@@ -2056,6 +2227,7 @@ class TritonTemplateKernel(TritonKernel):
     def _finalize_partial_render(
         self, partial_code: str | PartialRender
     ) -> str | PartialRender:
+        # [FUNCTION DOC] HELPER: Hook that lets subclasses replace the PartialRender before hooks are finalized; the default returns it unchanged.
         """Hook to intercept or replace the PartialRender before hook finalization.
 
         Called after Inductor has populated subgraph buffers (epilogue stores,
@@ -2068,6 +2240,11 @@ class TritonTemplateKernel(TritonKernel):
 
 
 class ExternalTritonTemplateKernel(TritonTemplateKernel):
+    # [CLASS DOC] TritonTemplateKernel variant for external template backends such as Helion, driven by a TemplateBuffer.
+    # Captures epilogue/prologue fusion into subgraph buffers, uses dummy kernel parameters (no grid/warps), obtains the final source and
+    # call info from the template buffer, and implements call_kernel and emit_kernel_override to emit the fused kernel.
+    # State: _template_buffer, extra inputs map, prologue source/variable maps, epilogue index and keep-store maps, extra store targets,
+    # kernel imports, call preamble/args, unfused epilogues and a scheduling reference.
     """TritonTemplateKernel variant for external template backends (e.g. Helion).
 
     Orchestrates prologue/epilogue fusion by running Inductor's codegen ops
@@ -2084,14 +2261,20 @@ class ExternalTritonTemplateKernel(TritonTemplateKernel):
     """
 
     def __init__(self, template_buffer: "ir.TemplateBuffer") -> None:
+        # [FUNCTION DOC] Initializes the base kernel with dummy values and an output node proxy exposing size, layout and name of the template
+        # buffer, and initializes all external-backend state (see the class doc) to empty values.
         class _RealOutputNode:
+        # [CLASS DOC] HELPER: Minimal output node proxy that reports the size, layout and name of the enclosing template buffer.
             def get_size(self) -> list:
+            # [FUNCTION DOC] HELPER: Returns the template buffer size as a list.
                 return list(template_buffer.get_size())
 
             def get_layout(self):
+            # [FUNCTION DOC] HELPER: Returns the template buffer layout.
                 return template_buffer.get_layout()
 
             def get_name(self) -> str:
+            # [FUNCTION DOC] HELPER: Returns the template buffer name.
                 return template_buffer.get_name()
 
         # Pass dummy values for TritonTemplateKernel params that are only
@@ -2135,6 +2318,9 @@ class ExternalTritonTemplateKernel(TritonTemplateKernel):
     def _finalize_partial_render(
         self, partial_code: str | PartialRender
     ) -> str | PartialRender:
+        # [FUNCTION DOC] HELPER: Runs every registered render hook to capture its output and passes the outputs to the template buffer's
+        # finalize step. If that returns nothing, the original PartialRender is kept. Otherwise stores the result's imports, call preamble and call
+        # args, freezes the hooks to the captured outputs, clears the subgraph code buffers, and returns a new PartialRender over the result source.
         # Capture hook outputs.
         hook_outputs: dict[str, str] = {}
         with V.set_kernel_handler(self):
@@ -2165,11 +2351,16 @@ class ExternalTritonTemplateKernel(TritonTemplateKernel):
         return PartialRender(result.source, self.render_hooks)
 
     def get_unfused_epilogues(self) -> list[Any]:
+        # [FUNCTION DOC] Returns the list of epilogue scheduler nodes that could not be fused into the kernel.
         return self._unfused_epilogues
 
     def _compute_fusion_metadata(
         self, scheduling, epilogue_nodes, prologue_nodes, buf_name_to_prologue_group
     ):
+        # [FUNCTION DOC] HELPER: Computes fusion metadata for the external backend before render: stores the scheduling reference, finds eligible
+        # epilogues, maps subgraph index to its single epilogue node, computes unfused epilogues (excluding multi-output nodes), and prologue
+        # source buffers per input buffer. Also pre-registers store target outputs, and builds the output-param to epilogue index map, the set of
+        # output params that must keep their store, and extra store targets; buffers removable through fusion are added to removed_buffers.
         """Compute fusion metadata for external backends.
 
         Determines eligible epilogues/prologues, builds epilogue specs,
@@ -2262,6 +2453,9 @@ class ExternalTritonTemplateKernel(TritonTemplateKernel):
                     self._epilogue_keep_store.add(output_param)
 
     def _setup_fusion_hooks(self):
+        # [FUNCTION DOC] HELPER: Called during render (inside the kernel context after fusion metadata is computed). Marks prologue buffers
+        # (registering as stored, or removed if they have no sources), sets up an epilogue hook for each fusable output and a prologue hook
+        # for each named input, and registers a no-op <DEF_KERNEL> hook.
         """Set up epilogue/prologue render hooks and mark prologue buffers.
 
         Must be called during render() (inside V.kernel context), after
@@ -2294,6 +2488,9 @@ class ExternalTritonTemplateKernel(TritonTemplateKernel):
         self.render_hooks["<DEF_KERNEL>"] = lambda: ""
 
     def _find_eligible_epilogues(self, epilogue_nodes, output_param_mapping):
+        # [FUNCTION DOC] HELPER: Finds epilogue nodes fusable into the template. A node qualifies if it is not a multi-output node and reads exactly
+        # one buffer that is one of the template outputs. Returns a list of (node, output buffer, output param, store target or None) tuples,
+        # and registers any other buffers they read as extra kernel inputs named by a running index.
         """Compute fusion eligibility and register extra inputs.
 
         Returns list of eligible epilogue tuples:
@@ -2337,6 +2534,10 @@ class ExternalTritonTemplateKernel(TritonTemplateKernel):
         return epilogues
 
     def _setup_epilogue_hook(self, output_buf=None, output_param=None):
+        # [FUNCTION DOC] HELPER: Registers the render hook for one epilogue store subgraph. With no output buffer, registers an empty subgraph and
+        # an empty hook. Otherwise creates an independent subgraph over the output size, sets up contiguous index state, template output
+        # variable names and a CSE store cache entry for the output buffer (float32 block-shaped variable), maps the buffer to its output param
+        # (raises AssertionError if the param is None), and registers a codegen hook.
         store_idx = next(self.store_output_ctr)
         subgraph_name = self._get_store_output_subgraph_name(store_idx)
         if output_buf is None:
@@ -2393,6 +2594,10 @@ class ExternalTritonTemplateKernel(TritonTemplateKernel):
         self.render_hooks[subgraph_name] = self._make_codegen_hook(subgraph_name)
 
     def _setup_prologue_hook(self, input_name, prologue_sources=None):
+        # [FUNCTION DOC] HELPER: Registers the load hook for one named template input with a prologue. Does nothing if the input or its prologue
+        # sources are unknown. Records the primary source buffer and extra inputs, computes unique renamed prologue variables, creates an
+        # independent subgraph whose store handler captures the computed value into a result variable, and registers a hook that generates the
+        # subgraph body and renames the range-tree root variables with a word-boundary text substitution.
         ir_node = self._template_buffer._named_inputs.get(input_name)
         if ir_node is None:
             return
@@ -2428,7 +2633,9 @@ class ExternalTritonTemplateKernel(TritonTemplateKernel):
         }
 
         class _CaptureStoreHandler(V.WrapperHandler):  # type: ignore[name-defined]
+        # [CLASS DOC] HELPER: Ops handler for prologue subgraphs whose store only records the stored value as the prologue result variable instead of storing.
             def store(self, name, index, value, mode=None):
+            # [FUNCTION DOC] HELPER: Marks the buffer as stored, caches the value, and writes an assignment of the value to the result variable.
                 V.kernel.store_buffer_names.add(name)
                 V.kernel.cse.store_cache[name] = value
                 V.kernel.compute.writeline(f"{result_var} = {value}")
@@ -2441,6 +2648,8 @@ class ExternalTritonTemplateKernel(TritonTemplateKernel):
         )
 
         def hook(_name=subgraph_name, _input=input_name, _self=self):
+        # [FUNCTION DOC] HELPER: Generates the subgraph body text for this prologue input and returns it with root variable names (xindex, xmask)
+        # renamed to unique prologue names and trailing whitespace stripped.
             with _self.set_subgraph_body(_name):
                 _self.codegen_body()
                 _self.cse.invalidate(OrderedSet())
@@ -2456,6 +2665,9 @@ class ExternalTritonTemplateKernel(TritonTemplateKernel):
         self.render_hooks[f"<LOAD_INPUT_{input_name}>"] = hook
 
     def call_kernel(self, name, node=None, deallocate_ws=True):
+        # [FUNCTION DOC] Emits the call for the fused external kernel: writes the preamble lines, a call assigning the kernel result to the
+        # template buffer name using the stored call args, unpacks surviving multi-output children by index from the result, and then codegens
+        # every unfused epilogue node through the saved scheduling reference.
         """Emit the kernel call, multi-output unpacking, and unfused epilogues."""
         tb = self._template_buffer
         wrapper = V.graph.wrapper_code
@@ -2483,6 +2695,8 @@ class ExternalTritonTemplateKernel(TritonTemplateKernel):
         kernel_path,
         get_kernel_metadata,
     ):
+        # [FUNCTION DOC] Writes the generated source into the wrapper header: a kernel path/metadata comment, backend imports, standard Inductor runtime imports,
+        # and the source code. Returns True to signal that the default emission is overridden.
         origins, detailed = get_kernel_metadata(node_schedule, wrapper)
         wrapper.header.writeline(f"# kernel path: {kernel_path}\n{origins}\n{detailed}")
         for imp in self._kernel_imports:
@@ -2502,6 +2716,7 @@ class ExternalTritonTemplateKernel(TritonTemplateKernel):
 @functools.cache
 def _jinja2_env():
     try:
+    # [FUNCTION DOC] HELPER: Cached factory for a Jinja environment with strict undefined variables; returns None if jinja2 is not installed.
         import jinja2
 
         return jinja2.Environment(
@@ -2512,6 +2727,8 @@ def _jinja2_env():
 
 
 class GenerateAndLoadResult(NamedTuple):
+    # [CLASS DOC] NamedTuple returned by TritonTemplate.generate_and_load: loaded module, extra descriptor string, input call args,
+    # prologue-supported input names, kernel args sizevars keys, and the kernel options dict.
     """
     Return type of TritonTemplate.generate_and_load.
     """
@@ -2525,6 +2742,7 @@ class GenerateAndLoadResult(NamedTuple):
 
 
 class GeneratedCodeCacheEntry(NamedTuple):
+    # [CLASS DOC] NamedTuple cache entry for generated template code: source code, extra string, and the recorded replay events.
     code: str
     extra: str
     events: list[Any]
@@ -2533,6 +2751,8 @@ class GeneratedCodeCacheEntry(NamedTuple):
 def template_subgraph_index_dtype_nodes(
     subgraphs: Sequence[Any] | None,
 ) -> tuple[ir.IRNode, ...]:
+    # [FUNCTION DOC] Walks the given template subgraphs (arbitrarily nested lists/tuples, None entries skipped) and returns a tuple of the distinct
+    # graph buffers (IRNode) read or written by them, in first-seen order. Used to decide whether 32-bit index math suffices.
     """Return graph buffers referenced by template subgraphs for index-width selection."""
     if subgraphs is None:
         return ()
@@ -2558,6 +2778,9 @@ def template_subgraph_index_dtype_nodes(
 
 
 class GeneratedCodeCache:
+    # [CLASS DOC] In-memory cache of generated template code keyed by a string describing the template inputs and options.
+    # Values are GeneratedCodeCacheEntry (code, extra, replay events). Keys are None (uncacheable) in several conditions; lookups update
+    # hit/miss counters in the dynamo counters.
     """
     Cache for generated code. The cache key is a string representation of the input nodes,
     number of stages, number of warps, and call sizes. The cache value is a tuple of the
@@ -2565,12 +2788,15 @@ class GeneratedCodeCache:
     """
 
     def __init__(self, *args, **kwargs):
+        # [FUNCTION DOC] Creates the empty cache dictionary; accepts and ignores any arguments.
         self._cache: dict[str, GeneratedCodeCacheEntry] = {}
 
     def cache_clear(self) -> None:
+        # [FUNCTION DOC] Removes all cached entries.
         self._cache.clear()
 
     def __repr__(self):
+        # [FUNCTION DOC] Returns the representation of the underlying cache dictionary.
         return repr(self._cache)
 
     def make_key(
@@ -2595,7 +2821,12 @@ class GeneratedCodeCache:
         hint_override: int | None = None,
         triton_meta: TritonMeta | None = None,
     ) -> str | None:
+        # [FUNCTION DOC] Builds the cache key string from the template inputs and options, or returns None when caching is not allowed: flexible output
+        # or input layouts, subgraphs, a workspace argument, or no epilogue function hash (the identity epilogue gets the hash "identity";
+        # raises AssertionError if a hash was passed with the identity function). The key includes input layouts, stages, warps, prefix/suffix args,
+        # call sizes, output layout, warp-spec counts, tma flags, kwargs, hint override and triton meta.
         def layout_key(layout: ir.Layout) -> str:
+            # [FUNCTION DOC] HELPER: Returns a representation of a layout's size, stride, dtype, device and offset; raises AssertionError for a FlexibleLayout.
             if isinstance(layout, ir.FlexibleLayout):
                 raise AssertionError("layout must not be a FlexibleLayout")
             return repr(
@@ -2609,6 +2840,7 @@ class GeneratedCodeCache:
             )
 
         def has_flexible_layout() -> bool:
+            # [FUNCTION DOC] HELPER: Returns True if the output layout or any input layout is a FlexibleLayout.
             if isinstance(layout, ir.FlexibleLayout):
                 return True
 
@@ -2655,6 +2887,7 @@ class GeneratedCodeCache:
         )
 
     def get_entry(self, cache_key: str | None) -> GeneratedCodeCacheEntry | None:
+        # [FUNCTION DOC] Returns the cached entry for the key (None if key is None or absent), incrementing the generated module cache hit or miss counter.
         if cache_key is None:
             return None
 
@@ -2672,6 +2905,7 @@ class GeneratedCodeCache:
         extra: str,
         events: list[Any],
     ) -> None:
+        # [FUNCTION DOC] Stores a GeneratedCodeCacheEntry built from code, extra and events under the key; does nothing if the key is None.
         if cache_key is None:
             return
         entry = GeneratedCodeCacheEntry(code, extra, events)
@@ -2679,6 +2913,11 @@ class GeneratedCodeCache:
 
 
 class TritonTemplate(KernelTemplate):
+    # [CLASS DOC] A KernelTemplate that generates Triton kernels from a Jinja source string and wraps them as autotune choices.
+    # Class state: kernel_type (kernel class used for rendering, overridable), index_counter (unique kernel name suffix counter),
+    # all_templates (registry of templates by name), test_cache flag. Instance state: grid function, compiled Jinja template, debug flag,
+    # per-template generated-code cache, and flags for prologue-loads-all-inputs and always-freeze-layout.
+    # Key methods: generate_and_load (render and import code), generate (build a TritonTemplateCaller), maybe_append_choice.
     """
     A Triton template is a template that can be used to generate a Triton kernel.
     """
@@ -2698,6 +2937,9 @@ class TritonTemplate(KernelTemplate):
         prologue_loads_all_inputs=False,
         always_freeze_layout: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Initializes the template with a name and a hash of the source, compiles the Jinja template, registers it in all_templates
+        # (raises AssertionError if a different template with the same name exists; same-source re-registration is tolerated) and creates a code
+        # cache that is cleared on fresh cache. Stores grid, debug flag and caching/layout flags.
         super().__init__(name, hash=hashlib.sha256(source.encode("utf-8")).hexdigest())
         self.grid = grid
         self.template = self._template_from_string(source)
@@ -2727,12 +2969,15 @@ class TritonTemplate(KernelTemplate):
 
     @property
     def uid(self) -> str:
+        # [FUNCTION DOC] Property returning the unique id string: triton:: followed by the template name.
         # unique by prefixing with triton
         return f"triton::{self.name}"
 
     def maybe_append_choice(
         self, choices: list[Any], **kwargs: Any
     ) -> NotImplementedError | None:
+        # [FUNCTION DOC] Tries to generate a choice (with code caching) and append it to choices. Returns None on success (also when generation
+        # produced no choice), or the NotImplementedError instance (after logging) if the template does not support the inputs.
         """
         Maybe generates a new ChoiceCaller and appends it into existing choices.
         Returns None if success, otherwise returns the error.
@@ -2779,6 +3024,11 @@ class TritonTemplate(KernelTemplate):
         transpose_discontiguous_tensor_descriptors_override: bool | None = None,
         triton_meta: TritonMeta | None = None,
     ) -> GenerateAndLoadResult | None:
+        # [FUNCTION DOC] Renders the template source with a TritonTemplateKernel and loads it as a module in this process. Chooses 32-bit or 64-bit
+        # index dtype from the output layout size and the buffers touched. Optionally uses the generated-code cache (replaying recorded events on a
+        # hit; in test or debug mode regenerates and compares the result, raising AssertionError on mismatch). Returns a GenerateAndLoadResult
+        # (module, extra string, input call args, prologue-supported inputs, size variable keys, kernel options) or None on ZeroDivisionError during
+        # rendering. Raises AssertionError if jinja2 is unavailable. Side effects: writes the module via PyCodeCache; may print code when debug is set.
         """Generate the python code and load it into the current process"""
         caching_enabled = (
             generate_with_caching
@@ -2861,6 +3111,7 @@ class TritonTemplate(KernelTemplate):
             )
 
         def make_kernel():
+        # [FUNCTION DOC] HELPER: Constructs a fresh template kernel (non-jit) from the shared kernel options, to be used as a context manager.
             return self.kernel_type(
                 kernel_name=kernel_name,
                 output_node=fake_out,
@@ -2875,7 +3126,9 @@ class TritonTemplate(KernelTemplate):
             )
 
         def generate_code(kernel) -> tuple[str, str] | None:
+        # [FUNCTION DOC] HELPER: Renders the template with the given kernel and returns (code, extra string), or None on ZeroDivisionError.
             def make_extra() -> str:
+            # [FUNCTION DOC] HELPER: Builds the sorted kwargs / stages / warps (and warp-spec) description string used as part of the cache key for the loaded module.
                 extra_parts = [
                     f"{kwarg}={repr(kwargs[kwarg])}" for kwarg in sorted(kwargs.keys())
                 ]
@@ -2909,6 +3162,8 @@ class TritonTemplate(KernelTemplate):
             return code, extra
 
         def maybe_test_cache(code: str, extra: str, kernel):
+        # [FUNCTION DOC] HELPER: When test_cache or debug is on, regenerates the code with a fresh kernel and raises AssertionError if code,
+        # extra, input buffers, prologue-supported inputs or size variables differ from the cached results.
             if self.test_cache or self.debug:
                 with (
                     patch.object(V.graph, "get_dtype", self._fake_get_dtype(fake_out)),
@@ -3001,6 +3256,11 @@ class TritonTemplate(KernelTemplate):
         triton_meta: TritonMeta | None = None,
         **kwargs,
     ):
+        # [FUNCTION DOC] Generates a TritonTemplateCaller for the given inputs and output layout. Patches kwargs to disable TF32 when CUDA lacks
+        # support, defaults call sizes to the layout size, calls generate_and_load (returning None if that returns None), checks that the call args
+        # start with the unique input names (AssertionError otherwise), computes the benchmark request (CPU or GPU variant) with grid, extra size
+        # args and workspace metadata, and wraps all into a choice caller with a unique kernel hash name. Parameters mirror the template options
+        # (stages, warps, warp spec, prefix/suffix args, epilogue, subgraphs, mutated inputs, workspace, TMA flags, triton meta, hint override).
         """This function generates a TritonTemplateCaller
 
         Args:
@@ -3104,6 +3364,8 @@ class TritonTemplate(KernelTemplate):
         options = result.kernel_options
 
         def make_kernel_render(out_node, hint_override: int | None = None):
+        # [FUNCTION DOC] HELPER: Creates a new kernel (with a fresh uniquely named workspace arg if any) for the given output node and a partial
+        # render callable bound to the template and kwargs; returns (kernel, render).
             if result is None:
                 raise AssertionError("result must not be None")
             # Create a new unique name for the workspace arg buffer for each render
@@ -3225,6 +3487,10 @@ class TritonTemplate(KernelTemplate):
 
 
 class ExternKernelChoice:
+    # [CLASS DOC] Describes an external (aten/python/C++) kernel that can take part in autotuning as a choice.
+    # Each instance registers itself by name in the class-level _registry and sets the kernel callable on the extern_kernels namespace so
+    # generated code can reference it; lookup returns an existing one. State: name, cpp kernel name, has_out_variant, op_overload,
+    # use_fallback_kernel, kernel_creator, src_hash (None) and gm (None). bind creates an ExternKernelCaller; maybe_append_choice mirrors the template interface.
     """Represents an external kernel that can participate in autotuning.
 
     Each instance is registered as a singleton by name in ``_registry`` and
@@ -3246,6 +3512,8 @@ class ExternKernelChoice:
         use_fallback_kernel: bool = False,
         kernel_creator: Callable[..., ir.ExternKernel] | None = None,
     ) -> None:
+        # [FUNCTION DOC] Registers the extern kernel under name (default: the callable's name) on the extern_kernels namespace and in the registry.
+        # Raises AssertionError if kernel is not callable or if a different kernel is already registered under that name (same callable re-registration is tolerated).
         super().__init__()
         name = name or kernel.__name__
         if not callable(kernel):
@@ -3274,16 +3542,20 @@ class ExternKernelChoice:
 
     @classmethod
     def lookup(cls, name: str) -> Optional["ExternKernelChoice"]:
+        # [FUNCTION DOC] Classmethod returning the registered ExternKernelChoice with this name, or None.
         return cls._registry.get(name)
 
     def to_callable(self) -> Callable[..., Any]:
+        # [FUNCTION DOC] Returns the kernel callable registered on extern_kernels under this name.
         return getattr(extern_kernels, self.name)
 
     def call_name(self):
+        # [FUNCTION DOC] Returns the dotted name string used by generated code to call the kernel.
         return f"extern_kernels.{self.name}"
 
     @functools.cache  # noqa: B019
     def hash_key(self):
+        # [FUNCTION DOC] Cached (per instance) hash string derived from the name, function name, module and source text (when retrievable).
         fn = self.to_callable()
         parts = [
             self.name,
@@ -3303,6 +3575,8 @@ class ExternKernelChoice:
         ordered_kwargs_for_cpp_kernel=(),
         **kwargs,
     ):
+        # [FUNCTION DOC] Creates an ExternKernelCaller for the given input nodes and layout, forwarding kwargs.
+        # Side effect: stores ordered_kwargs_for_cpp_kernel on this choice (read later by ExternKernelCaller.output_node); it is not initialized in the constructor.
         self.ordered_kwargs_for_cpp_kernel = ordered_kwargs_for_cpp_kernel
         return ExternKernelCaller(
             self,
@@ -3314,10 +3588,12 @@ class ExternKernelChoice:
 
     @property
     def uid(self) -> str:
+        # [FUNCTION DOC] Property returning the unique id string: aten:: followed by the kernel name.
         # unique by prefixing with aten
         return f"aten::{self.name}"
 
     def choice_or_none(self, **kwargs: Any) -> ChoiceCaller | None:
+        # [FUNCTION DOC] Returns a single generated ChoiceCaller for the kwargs (via maybe_append_choice) or None if generation failed.
         """
         Maybe generates a new ChoiceCaller and returns it, or None if generation fails.
 
@@ -3332,6 +3608,8 @@ class ExternKernelChoice:
     def maybe_append_choice(
         self, choices: list[Any], **kwargs: Any
     ) -> NotImplementedError | None:
+        # [FUNCTION DOC] Template-interface convenience: binds a caller from required input_nodes and layout kwargs (other kwargs are forwarded)
+        # and appends it to choices; always returns None. Raises AssertionError if input_nodes or layout is missing.
         # convenience function to match the Template interface, so that
         # templates and ExternKernelChoice can be treated the same when
         # generating choice callers
@@ -3346,6 +3624,10 @@ class ExternKernelChoice:
 
 
 class TritonTemplateCaller(ir.TritonTemplateCallerBase):
+    # [CLASS DOC] ChoiceCaller for a generated Triton template kernel.
+    # State: make_kernel_render (callable producing a kernel and render function), bmreq (benchmark request), log_info dict (autotune log fields,
+    # with backend/stages/warps added), mutated inputs, workspace arg, allowed prologue inputs, hint override, and n_regs (set by precompile).
+    # It benchmarks and precompiles through bmreq and produces the IR output node (TritonTemplateBuffer wrapped in a TensorBox).
     """
     Represents a ChoiceCaller for a TritonTemplate
     """
@@ -3364,6 +3646,8 @@ class TritonTemplateCaller(ir.TritonTemplateCallerBase):
         allowed_prologue_inps: OrderedSet[str] | None = None,
         hint_override: int | None = None,
     ) -> None:
+        # [FUNCTION DOC] Stores the render factory, benchmark request, log info (augmented with backend, num_stages and num_warps), mutated inputs,
+        # workspace arg, allowed prologue inputs (empty set by default), hint override, and initial n_regs of None.
         super().__init__(name, input_nodes, layout, description)
         self.make_kernel_render = make_kernel_render
         self.bmreq: TritonBenchmarkRequest = bmreq
@@ -3387,6 +3671,8 @@ class TritonTemplateCaller(ir.TritonTemplateCallerBase):
         self.n_regs = None
 
     def benchmark(self, *args, out):
+        # [FUNCTION DOC] Benchmarks the kernel with the given args and output tensor and returns the time. Uses profiling-based benchmarking when
+        # configured and cudagraph benchmarking is off; otherwise the request benchmark with the cudagraph flag set. Raises AssertionError if bmreq is None.
         if self.bmreq is None:
             raise AssertionError("self.bmreq must not be None")
         if (
@@ -3399,6 +3685,7 @@ class TritonTemplateCaller(ir.TritonTemplateCallerBase):
         return self.bmreq.benchmark(*args, out=out)
 
     def precompile(self):
+        # [FUNCTION DOC] Precompiles the kernel through the benchmark request and records its register count in n_regs. Raises AssertionError if bmreq is None.
         if self.bmreq is None:
             raise AssertionError("self.bmreq must not be None")
         self.bmreq.precompile()
@@ -3406,12 +3693,15 @@ class TritonTemplateCaller(ir.TritonTemplateCallerBase):
         self.n_regs = self.bmreq.n_regs
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Returns a string with the module path and description.
         return f"TritonTemplateCaller({self.bmreq.module_path}, {self.description})"
 
     def call_name(self):
+        # [FUNCTION DOC] Returns the dotted name string used by generated code: template_kernels followed by the choice name.
         return f"template_kernels.{self.name}"
 
     def hash_key(self):
+        # [FUNCTION DOC] Returns a hash key combining the base name (without trailing index) and the module cache key.
         return "-".join(
             [
                 self.name.rsplit("_", 1)[0],
@@ -3420,6 +3710,8 @@ class TritonTemplateCaller(ir.TritonTemplateCallerBase):
         )
 
     def output_node(self):
+        # [FUNCTION DOC] Builds a TritonTemplateBuffer from this choice's layout, inputs, render factory, mutated and allowed prologue inputs,
+        # copies the ktc annotation if present, and returns it wrapped in a TensorBox.
         buffer = ir.TritonTemplateBuffer(
             layout=self.layout,
             inputs=self.input_nodes,
@@ -3433,13 +3725,17 @@ class TritonTemplateCaller(ir.TritonTemplateCallerBase):
         return ir.TensorBox.create(buffer)
 
     def info_dict(self) -> dict[str, PrimitiveInfoType | list[PrimitiveInfoType]]:
+        # [FUNCTION DOC] Returns the log_info dict that is written to the autotune log.
         """Information returned here is logged to the autotune log file when that is enabled."""
         return self.log_info
 
     def get_make_kernel_render(self):
+        # [FUNCTION DOC] Returns the stored kernel/render factory.
         return self.make_kernel_render
 
     def autoheuristic_id(self):
+        # [FUNCTION DOC] Builds an autoheuristic identifier string from the tile shape (parsed from the logged tile_shape string, with block M, K, N),
+        # num_stages and num_warps. Raises KeyError if tile_shape is missing from log_info.
         type_name = "triton"
         info = self.info_dict()
         # TODO(AlnisM): Does tile_shape always exist?
@@ -3454,6 +3750,9 @@ class TritonTemplateCaller(ir.TritonTemplateCallerBase):
 
 
 class ExternKernelCaller(ChoiceCaller):
+    # [CLASS DOC] ChoiceCaller for an ExternKernelChoice with fixed kwargs.
+    # State: choice, kwargs, has_out_variant, gm, and bmreq (a CPU or GPU extern benchmark request chosen from the output layout device or
+    # the first non-CPU input device; tensor metas are built for GPU). Produces an IR node (fallback kernel, kernel_creator output, or extern kernel out/alloc).
     """
     Caller for external kernel implementations
     """
@@ -3467,6 +3766,8 @@ class ExternKernelCaller(ChoiceCaller):
         *,
         has_out_variant=True,
     ) -> None:
+        # [FUNCTION DOC] Initializes from the choice, input nodes and layout, determines the device, builds tensor meta (failure on GPU is only logged as a warning),
+        # and creates the appropriate extern benchmark request.
         super().__init__(choice.name, input_nodes, layout, description="")
         self.choice = choice
         self.kwargs = kwargs or {}
@@ -3521,9 +3822,11 @@ class ExternKernelCaller(ChoiceCaller):
         )
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Returns a string naming the underlying call.
         return f"ExternKernelCaller({self.choice.call_name()})"
 
     def benchmark(self, *args, out):
+        # [FUNCTION DOC] Benchmarks via the benchmark request, setting its cudagraph flag first; returns the time. Raises AssertionError if bmreq is None.
         if self.bmreq is None:
             raise AssertionError("self.bmreq must not be None")
         # pyrefly: ignore[missing-attribute]
@@ -3531,6 +3834,8 @@ class ExternKernelCaller(ChoiceCaller):
         return self.bmreq.benchmark(*args, out=out)
 
     def benchmark_collective(self, *args, out):
+        # [FUNCTION DOC] Runs the kernel once (no timing, used by collective benchmarking with external synchronization). Does nothing for empty outputs;
+        # passes out as keyword only if the kernel has an out variant.
         """
         Called by benchmark_collective_choice, only run once, timing handled externally with barrier sync.
         """
@@ -3544,10 +3849,12 @@ class ExternKernelCaller(ChoiceCaller):
             algo(*args)
 
     def to_callable(self):
+        # [FUNCTION DOC] Returns the callable of the benchmark request.
         # pyrefly: ignore [missing-attribute]
         return self.bmreq.to_callable()
 
     def hash_key(self):
+        # [FUNCTION DOC] Returns a hash key from the choice name, sorted kwargs and the choice hash key.
         return "-".join(
             [
                 self.choice.name,
@@ -3560,6 +3867,8 @@ class ExternKernelCaller(ChoiceCaller):
         )
 
     def output_node(self):
+        # [FUNCTION DOC] Creates the IR node for this choice: fallback kernel (requires op_overload, else AssertionError), a custom kernel_creator result, or an
+        # extern kernel with or without an out variant. Copies the ktc annotation if present and returns the node wrapped in a TensorBox.
         if self.choice.use_fallback_kernel:
             if self.choice.op_overload is None:
                 raise AssertionError(
@@ -3588,6 +3897,7 @@ class ExternKernelCaller(ChoiceCaller):
         return ir.TensorBox.create(inner)
 
     def info_dict(self) -> dict[str, PrimitiveInfoType | list[PrimitiveInfoType]]:
+        # [FUNCTION DOC] Returns a dict describing the choice for the autotune log (backend extern and call name).
         """Information returned here is logged to the autotune log file when that is enabled."""
         return {
             "backend": "extern",
@@ -3595,11 +3905,14 @@ class ExternKernelCaller(ChoiceCaller):
         }
 
     def autoheuristic_id(self):
+        # [FUNCTION DOC] Returns an autoheuristic identifier string based on the choice name.
         return f"extern_{self.choice.name}"
 
 
 @functools.cache
 def get_mm_log_filename() -> str | None:
+    # [FUNCTION DOC] Cached: returns the matmul autotune log file name from the TORCHINDUCTOR_MM_LOGGING_FILE environment variable (".json" appended
+    # when the name lacks "json"), or None when unset.
     mm_file_name = os.environ.get("TORCHINDUCTOR_MM_LOGGING_FILE", None)
     if not mm_file_name:
         return None
@@ -3612,6 +3925,7 @@ def get_mm_log_filename() -> str | None:
 
 @functools.cache
 def get_flex_attention_log_filename() -> str | None:
+    # [FUNCTION DOC] Cached: returns the flex attention log file name from the TORCHINDUCTOR_FLEX_ATTENTION_LOGGING_FILE environment variable with a .json suffix, or None.
     flex_attention_file_name = os.environ.get(
         "TORCHINDUCTOR_FLEX_ATTENTION_LOGGING_FILE", None
     )
@@ -3623,6 +3937,7 @@ def get_flex_attention_log_filename() -> str | None:
 
 @functools.cache
 def get_conv_log_filename() -> str | None:
+    # [FUNCTION DOC] Cached: returns the conv log file name from the TORCHINDUCTOR_CONV_LOGGING_FILE environment variable with a .json suffix, or None.
     conv_file_name = os.environ.get("TORCHINDUCTOR_CONV_LOGGING_FILE", None)
     if not conv_file_name:
         return None
@@ -3631,6 +3946,8 @@ def get_conv_log_filename() -> str | None:
 
 
 def append_to_log(filename, data):
+    # [FUNCTION DOC] Appends a data record to a JSON list file under an inter-process file lock (lock file derived from the name). Starts a new list if the
+    # file is missing or invalid JSON. Side effect: rewrites the file with indent 4.
     lock_file = filename.replace(".json", ".lock")
     lock = FileLock(lock_file)
     with lock:
@@ -3647,7 +3964,10 @@ def append_to_log(filename, data):
 
 
 class DataProcessorChoiceCallerWrapper:
+    # [CLASS DOC] Wraps a ChoiceCaller so benchmark inputs/outputs and the produced IR node are pre-/post-processed. Unknown attributes are forwarded
+    # to the wrapped caller. State: wrapped caller, preprocessor (maps args and output; identity if None) and postprocessor (identity if None).
     def __init__(self, wrapped, preprocessor, postprocessor) -> None:
+        # [FUNCTION DOC] Stores the wrapped caller and the pre/post processors, substituting identity functions for None.
         self._wrapped = wrapped
         if preprocessor is not None:
             self._preprocessor = preprocessor
@@ -3659,9 +3979,12 @@ class DataProcessorChoiceCallerWrapper:
             self._postprocessor = lambda x: x
 
     def __getattr__(self, name):
+        # [FUNCTION DOC] Forwards unknown attribute lookups to the wrapped caller.
         return getattr(self._wrapped, name)
 
     def benchmark(self, *args, out) -> float:
+        # [FUNCTION DOC] Preprocesses args and output, benchmarks the wrapped caller, postprocesses the output, copies it back into the original output
+        # tensor if it is a different object, and returns the benchmark result.
         new_args, new_out = self._preprocessor(args, out)
         result = self._wrapped.benchmark(*new_args, out=new_out)
         new_out = self._postprocessor(new_out)
@@ -3670,14 +3993,18 @@ class DataProcessorChoiceCallerWrapper:
         return result
 
     def output_node(self) -> ir.TensorBox:
+        # [FUNCTION DOC] Returns the wrapped caller's output node passed through the postprocessor.
         result = self._wrapped.output_node()
         return self._postprocessor(result)
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Returns a string showing the wrapped caller.
         return f"DataProcessorChoiceCallerWrapper({self._wrapped})"
 
 
 class DataProcessorTemplateWrapper:
+    # [CLASS DOC] Wraps a kernel template class instance so that its inputs are preprocessed on creation and the generated choices are wrapped in
+    # DataProcessorChoiceCallerWrapper (e.g. reorder/filter inputs or prepack weights). Unknown attributes are forwarded to the wrapped template.
     """
     A wrapper class for a kernel template.
 
@@ -3695,6 +4022,9 @@ class DataProcessorTemplateWrapper:
         postprocessor,
         **kwargs,
     ) -> None:
+        # [FUNCTION DOC] Instantiates the wrapped template class with kwargs after applying the preprocessor to input_nodes and layout. Raises AssertionError if
+        # input_nodes or layout is missing from kwargs.
+        # KNOWN ISSUE: the preprocessor is called even when it is None (although an identity fallback is stored), which would raise TypeError.
         if preprocessor is not None:
             self._preprocessor = preprocessor
         else:
@@ -3714,34 +4044,43 @@ class DataProcessorTemplateWrapper:
         self._wrapped = wrapped_template_cls(**kwargs)
 
     def __getattr__(self, name):
+        # [FUNCTION DOC] Forwards unknown attribute lookups to the wrapped template.
         return getattr(self._wrapped, name)
 
     def maybe_append_choice(self, choices, **kwargs):
+        # [FUNCTION DOC] Calls the wrapped template class's maybe_append_choice with this wrapper as self, so generated choices are wrapped.
         return type(self._wrapped).maybe_append_choice(self, choices, **kwargs)
 
     def generate(self, **kwargs):
+        # [FUNCTION DOC] Generates a choice with the wrapped template and returns it wrapped with the pre/post processors.
         choice_caller = self._wrapped.generate(**kwargs)
         return DataProcessorChoiceCallerWrapper(
             choice_caller, self._preprocessor, self._postprocessor
         )
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Returns a string showing the wrapped template.
         return f"DataProcessorTemplateWrapper({self._wrapped})"
 
 
 class ErrorFromChoice(RuntimeError):
+    # [CLASS DOC] RuntimeError raised when a choice fails; the message includes the choice and a description of its inputs. Keeps the choice as an attribute.
     def __init__(self, msg, choice: ChoiceCaller, inputs_str) -> None:
+        # [FUNCTION DOC] Builds the error message from msg, the choice and inputs_str and stores the choice.
         msg += f"\nFrom choice {choice}\n{inputs_str}"
         super().__init__(msg)
         self.choice = choice
 
 
 class NoValidChoicesError(RuntimeError):
+    # [CLASS DOC] RuntimeError raised when no valid autotune choices remain.
     pass
 
 
 @functools.cache
 def get_num_workers() -> int:
+    # [FUNCTION DOC] Cached: returns the number of compile workers. Uses TORCHINDUCTOR_COMPILE_THREADS if set; otherwise the CPU count (divided by
+    # GPU count in fbcode when GPUs are present). Raises AssertionError if the CPU count is zero.
     if "TORCHINDUCTOR_COMPILE_THREADS" in os.environ:
         return int(os.environ["TORCHINDUCTOR_COMPILE_THREADS"])
 
@@ -3761,12 +4100,14 @@ def get_num_workers() -> int:
 
 
 def create_inputs_key(input_nodes) -> str:
+    # [FUNCTION DOC] Returns a string representation of the list of per-input keys for the input nodes (see AlgorithmSelectorCache.key_of).
     return repr([AlgorithmSelectorCache.key_of(x) for x in input_nodes])
 
 
 def create_precompile_key(
     name: str, inputs_key: str, choices: list[ChoiceCaller]
 ) -> str:
+    # [FUNCTION DOC] Returns a precompile cache key string: name, inputs key, float32 matmul precision and each choice's kernel hash key, joined by colons.
     return ":".join(
         [
             name,
@@ -3779,16 +4120,19 @@ def create_precompile_key(
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class PrecompileFunction:
+    # [CLASS DOC] Frozen dataclass wrapping a zero-argument precompile callable together with its cache key; calling it runs the wrapped function and returns its timings dict.
     """Callable precompile wrapper that carries its cache key for scoped cleanup."""
 
     fn: Callable[[], dict[ChoiceCaller, float]]
     precompile_key: str | None = None
 
     def __call__(self) -> dict[ChoiceCaller, float]:
+        # [FUNCTION DOC] Calls the wrapped function and returns its mapping of choices to times.
         return self.fn()
 
 
 def _benchmark_request_for_choice(choice: ChoiceCaller) -> Any | None:
+    # [FUNCTION DOC] HELPER: Returns the benchmark request of a choice (the private attribute if set, else the public attribute from the instance dict, else None).
     bmreq = getattr(choice, "_bmreq", None)
     if bmreq is not None:
         return bmreq
@@ -3824,6 +4168,7 @@ PreprocessingFunction = Callable[[list[ChoiceCaller]], list[ChoiceCaller]]
 
 
 def filter_choices_by_name_regex(choices: list[ChoiceCaller]) -> list[ChoiceCaller]:
+    # [FUNCTION DOC] Preprocessing function: when the test config autotune_choice_name_regex is set, keeps only choices whose name matches it (regex search); otherwise returns choices unchanged.
     """Filter choices based on autotune_choice_name_regex config."""
     if config.test_configs.autotune_choice_name_regex is not None:
         return [
@@ -3838,6 +4183,7 @@ def filter_choices_by_name_regex(choices: list[ChoiceCaller]) -> list[ChoiceCall
 
 
 def filter_choices_by_desc_regex(choices: list[ChoiceCaller]) -> list[ChoiceCaller]:
+    # [FUNCTION DOC] Preprocessing function: when the test config autotune_choice_desc_regex is set, keeps only choices whose description matches it (regex search); otherwise returns choices unchanged.
     """Filter choices based on autotune_choice_desc_regex config."""
     if config.test_configs.autotune_choice_desc_regex is not None:
         return [
@@ -3854,6 +4200,9 @@ def filter_choices_by_desc_regex(choices: list[ChoiceCaller]) -> list[ChoiceCall
 def _classify_kernel_operation(
     name: str, choices: list[ChoiceCaller], input_nodes
 ) -> str:
+    # [FUNCTION DOC] HELPER: Classifies an autotuned op as "mm", "conv", "flex" or "other" for logging. Order of evidence: template choice names
+    # (known mm templates, convolution templates, names starting with flex_), extern choice names (mm family, names containing conv), input
+    # rank heuristics (two 2D or two 3D inputs give mm; two 4D inputs with equal channel dim give conv), then exact lowercase op name matching.
     """
     Classify the operation type for logging and filtering purposes.
     Returns one of: "mm", "conv", "flex", or "other"
@@ -3948,6 +4297,13 @@ def _classify_kernel_operation(
 
 
 class AlgorithmSelectorCache(PersistentCache):
+    # [CLASS DOC] Persistent cache and driver for algorithm selection (autotuning) of GEMM, convolution, flex attention and similar ops.
+    # Calling the instance with a list of ChoiceCallers picks the best by precompiling and benchmarking them (or defers selection with a
+    # MultiTemplateBuffer). Keyed on input characteristics, not on the output layout.
+    # State: precompile_cache (shared precompile function per key), prescreening_cache (deterministic candidate sets), feedback_saver_fns
+    # (callbacks after benchmarking), preprocessing_fns (choice list transformations; default name/description regex filters).
+    # Class attribute FLEX_ATTENTION_TUNABLE_KEYS lists flex attention config keys that are logged. Static helpers such as key_of and
+    # log_results are defined further below.
     """
     A persistent cache for algorithm selection results used in autotuning of GEMMs
     and convolutions.
@@ -3978,6 +4334,8 @@ class AlgorithmSelectorCache(PersistentCache):
     )
 
     def __init__(self, *args, **kwargs) -> None:
+        # [FUNCTION DOC] Initializes the persistent cache, creates the empty precompile, prescreening, feedback and preprocessing registries,
+        # registers the default preprocessing functions and registers this cache to be cleared when a fresh Inductor cache is requested.
         super().__init__(*args, **kwargs)
 
         # the autotuning will get occur in the scheduler, so there is
@@ -3998,6 +4356,7 @@ class AlgorithmSelectorCache(PersistentCache):
         clear_on_fresh_cache(self)
 
     def _register_default_preprocessing_fns(self):
+        # [FUNCTION DOC] HELPER: Registers the default preprocessing functions (name regex filter, description regex filter). Separate method so they can be restored after user ones are cleared.
         """Register default preprocessing functions."""
         # Note: broken out into its own function so that we can avoid clearing
         # them (i.e. so we can restore them after clearing user provided ones)
@@ -4005,10 +4364,12 @@ class AlgorithmSelectorCache(PersistentCache):
         self.add_preprocessing_fn(filter_choices_by_desc_regex)
 
     def cache_clear(self) -> None:
+        # [FUNCTION DOC] Clears the precompile cache and prescreening cache.
         self.precompile_cache.clear()
         self.prescreening_cache.clear()
 
     def pick_deterministic_choice(self, choices: list[ChoiceCaller]) -> ChoiceCaller:
+        # [FUNCTION DOC] Returns the first ExternKernelCaller among choices if any, else the first choice; used in deterministic mode. Raises AssertionError if fewer than 2 choices.
         if len(choices) < 2:
             raise AssertionError(f"expected at least 2 choices, got {len(choices)}")
         externs = [
@@ -4038,6 +4399,15 @@ class AlgorithmSelectorCache(PersistentCache):
         min_speedup_threshold: float = 1.0,  # Only pick non-fallback if faster by this ratio
         benchmark_with_cudagraphs: bool = False,  # Use CUDA graphs for ExternKernelCaller benchmarking
     ):
+        # [FUNCTION DOC] Selects the best algorithm among choices and returns (IR output node, chosen ChoiceCaller). Steps: apply preprocessing
+        # functions and the cudagraph benchmarking flag; disable deferred multi-template selection when custom input generators are given or for
+        # non-Triton CPU backends; raise a no-valid-choices error when empty; if there is a single non-CUTLASS choice or deterministic mode is on,
+        # return it directly; otherwise build the inputs key and precompile function. When multi-template is requested under max-autotune, returns a
+        # TensorBox over a MultiTemplateBuffer with a lazy timings function (pipelined subprocess autotuning or in-process, dropping Triton choices slower
+        # than the best extern) and returns None as the choice. Otherwise runs do_autotuning, falls back to the first extern (or first) choice for empty
+        # timings or all-infinite timings, applies min_speedup_threshold in favor of the fallback kernel, allows the choices handler to override the best,
+        # and optionally forces a non-fallback choice for tests. Args also include layout, input_gen_fns, precompilation timeout, best_config_future, is_collective.
+        # Raises AssertionError when benchmarking epilogues with pipelined autotuning.
         from .codegen.cutlass.kernel import CUTLASSTemplateCaller
 
         # Run preprocessing functions on choices
@@ -4120,6 +4490,8 @@ class AlgorithmSelectorCache(PersistentCache):
                     precompile_future = None
 
                 def get_timings(hint_override: int | None = None):
+                # [FUNCTION DOC] HELPER: Lazy timings function for pipelined autotuning. Waits for the precompile future (falling back to extern kernels when
+                # Triton choices have no valid choice), then collects results from the subprocess autotuner and logs them. Raises AssertionError if hint_override is set.
                     if hint_override:
                         raise AssertionError(
                             "Hint not supported with pipelined autotuning"
@@ -4153,6 +4525,7 @@ class AlgorithmSelectorCache(PersistentCache):
             else:
 
                 def get_timings(hint_override: int | None = None):
+                # [FUNCTION DOC] HELPER: Lazy timings function for in-process autotuning: autotunes the choices matching hint_override and removes Triton choices slower than the fastest extern choice. Returns the timings dict.
                     filtered_choices = [
                         c
                         for c in choices
@@ -4266,6 +4639,7 @@ class AlgorithmSelectorCache(PersistentCache):
         elif min_speedup_threshold > 1.0:
 
             def is_fallback(c: ChoiceCaller) -> bool:
+                # [FUNCTION DOC] HELPER: Returns True if the choice is an extern caller whose choice uses the fallback kernel.
                 return isinstance(c, ExternKernelCaller) and getattr(
                     c.choice, "use_fallback_kernel", False
                 )
@@ -4291,6 +4665,7 @@ class AlgorithmSelectorCache(PersistentCache):
         if config.test_configs.force_custom_op_decomposition:
 
             def is_fallback(c: ChoiceCaller) -> bool:
+                # [FUNCTION DOC] HELPER: Returns True if the choice is an extern caller whose choice uses the fallback kernel.
                 return isinstance(c, ExternKernelCaller) and getattr(
                     c.choice, "use_fallback_kernel", False
                 )
@@ -4315,6 +4690,9 @@ class AlgorithmSelectorCache(PersistentCache):
         is_collective=False,
         precompile_key: str | None = None,
     ):
+        # [FUNCTION DOC] Benchmarks all choices through the benchmark function (in-process or subprocess) and returns a dict mapping choice to time.
+        # Increments the autotune counter. In a finally block evicts the choices' loaded modules from PyCodeCache and drops the entry for
+        # precompile_key from the precompile cache.
         counters["inductor"]["select_algorithm_autotune"] += 1
         # TODO(nmacchioni): remove this layer of abstraction
         # construct `benchmark_fn` which should pick between in-process and sub-process autotuning
@@ -4366,6 +4744,8 @@ class AlgorithmSelectorCache(PersistentCache):
         is_collective=False,
         precompile_key: str | None = None,
     ):
+        # [FUNCTION DOC] Runs benchmark under an autotuning timing context (dynamo_timed) with metadata from the inputs, optionally logging choice stats
+        # when configured, and returns the benchmark results dict.
         log.debug("Starting autotuning")
 
         with dynamo_timed(
@@ -4402,6 +4782,15 @@ class AlgorithmSelectorCache(PersistentCache):
         best_config_future=None,
         is_collective=False,
     ):
+        # [FUNCTION DOC] Runs the full autotuning pipeline for the choices and returns a dict mapping each surviving choice to its time (or an empty
+        # dict for collectives where any choice failed). Steps: run the precompile function (timed unless pipelined autotuning), drop choices that
+        # failed to compile (raises the no-valid-choices error if none remain), optionally prescreen candidates and prune the rest, and in pipelined
+        # mode start the async autotuner and return None. Optionally narrows choices to those whose description contains the important keys of a
+        # best_config awaited from best_config_future. Then looks up or runs autotuning through the cache, raises NoValidChoicesError if every timing
+        # is non-finite (for collectives returns an empty dict if any is non-finite), logs results when something was autotuned or debug/trace is on,
+        # and calls each registered feedback function with timings and a lazy profiler-based re-benchmark function.
+        # KNOWN ISSUE: the best_config filter comprehension has a trailing loop over important_keys, so each matching choice appears once per key (duplicated).
+        # KNOWN ISSUE: the docstring describes hint_override as a choice selector for tests; the code uses it as a size hint override for benchmark shapes/lookups.
         """Execute the autotuning process for kernel algorithm selection.
 
         This method orchestrates the complete autotuning pipeline including precompilation,
@@ -4540,6 +4929,7 @@ class AlgorithmSelectorCache(PersistentCache):
         has_autotuned: bool = False
 
         def track_has_autotuned(choices):
+        # [FUNCTION DOC] HELPER: Cache-miss benchmark callback; sets the has_autotuned flag and runs autotune on the given choices.
             nonlocal has_autotuned
             has_autotuned = True
             return self.autotune(
@@ -4595,6 +4985,7 @@ class AlgorithmSelectorCache(PersistentCache):
             )
 
         def profiler_bench_function(choices_override=None):
+        # [FUNCTION DOC] HELPER: Re-benchmarks choices (all, or the override list) with profiler-based timing in-process, bypassing caches; passed to feedback functions as a thunk.
             # we're not running through the normal caching autotuner method here because we want to avoid returning
             # the cached value.
             # Avoid benchmarking in a separate process because it's not easy to signal to the TuningProcess that we
@@ -4625,6 +5016,7 @@ class AlgorithmSelectorCache(PersistentCache):
         return timings
 
     def create_no_valid_choices(self, name: str, reason: str) -> NoValidChoicesError:
+        # [FUNCTION DOC] Builds a NoValidChoicesError whose message includes the reason and advises adding ATEN to the gemm (or conv for convolution) backends config.
         backend_config = (
             "max_autotune_gemm_backends"
             if name != "convolution"
@@ -4643,12 +5035,19 @@ class AlgorithmSelectorCache(PersistentCache):
         inputs_key: str,
         precompilation_timeout_seconds: int | None = 60 * 60,
     ) -> Callable[[], dict[ChoiceCaller, float]]:
+        # [FUNCTION DOC] Returns a zero-argument function that precompiles the choices and yields a dict of choice to precompile seconds (a PrecompileFunction).
+        # Returns a no-op (empty dict) when the timeout is None or non-positive, there are no workers, running on Python 3.11.0-3.11.8, or all timings are already cached.
+        # Reuses a cached function by precompile key. Otherwise submits each distinct choice (by kernel hash) to a thread pool, to the async Triton process pool
+        # for GPU Triton choices, or to the NV universal gemm subprocess pool when enough such choices exist (skipped to lazy compile otherwise, or on pool failure).
+        # The returned function waits for futures (with timeout), marks failed or timed out choices as failed, logs exceptions, and shuts down the executor.
+        # Side effects: registers the function in precompile_cache and increments precompile counters.
         """
         Returns a function that precompiles the given choices.
         """
         log.debug("Starting precompilation")
 
         def no_op(*args, **kwargs) -> dict[ChoiceCaller, float]:
+        # [FUNCTION DOC] HELPER: Precompile function that ignores its arguments and returns an empty dict.
             return {}
 
         if (
@@ -4709,6 +5108,7 @@ class AlgorithmSelectorCache(PersistentCache):
         # here to avoid this issue.
 
         def precompile_with_captured_stdout(choice) -> tuple[None, int]:
+        # [FUNCTION DOC] HELPER: Precompiles one choice with stdout/stderr restored afterwards; returns (None, elapsed microseconds) to match the async triton compile result shape.
             log.debug("Precompiling choice with captured stdout: %s", choice)
             start_ns = time.time_ns()
             with restore_stdout_stderr():
@@ -4719,6 +5119,7 @@ class AlgorithmSelectorCache(PersistentCache):
             return None, elapsed_ns // 1000
 
         def on_complete(future):
+        # [FUNCTION DOC] HELPER: Done-callback that records the elapsed seconds of successful precompile futures in elapsed_times.
             if not future.exception():
                 _, precompile_elapsed_us = future.result()
                 elapsed_seconds = precompile_elapsed_us / 1e6
@@ -4845,6 +5246,8 @@ class AlgorithmSelectorCache(PersistentCache):
         @functools.cache
         @restore_stdout_stderr()
         def wait_on_futures() -> dict[ChoiceCaller, float]:
+        # [FUNCTION DOC] HELPER: Cached (runs once) wait for all precompilation futures. On exceptions marks the choice failed and counts it; on timeout marks unfinished
+        # choices failed with a TimeoutError. Logs collected exceptions, shuts down the executor unless pipelined, and returns a dict of choice to precompile seconds.
             """Wait for all precompilation futures to complete.
 
             Returns:
@@ -4931,6 +5334,11 @@ class AlgorithmSelectorCache(PersistentCache):
         input_gen_fns: dict[int, Callable[[ir.Buffer], torch.Tensor]] | None,
         hint_override: int | None = None,
     ) -> AutotuneArgs:
+        # [FUNCTION DOC] Classmethod building AutotuneArgs for benchmarking the choices. Generates example input tensors per unique input name (using input_gen_fns
+        # or random example values), a separate set for the extern choice (special handling for addmm bias which is rebuilt from identical rows), and an output
+        # tensor. Extern inputs are strided views over the base tensor with sizes/strides/offset from size hints (or from the generated tensor); base storage is
+        # reallocated when too small to avoid illegal memory access (float4 packed types use random bytes). If VERIFY is set, runs the first choice to compute the expected output.
+        # Raises AssertionError if the extern choice input count differs from input_nodes.
         """
         Factory method to create AutotuneArgs from a list of ChoiceCallers.
         """
@@ -4948,6 +5356,8 @@ class AlgorithmSelectorCache(PersistentCache):
         }
 
         def addmm_unique_example_inputs_extern():
+        # [FUNCTION DOC] HELPER: Builds extra example inputs for the extern addmm choice: for each extern input not already present, makes the 2D example rows
+        # identical and derives the 1D bias from the first row (or a fresh example when empty); returns the merged mapping of name to tensor.
             additional_example_inputs = {}
             for input_node, extern_node in zip(input_nodes, extern_input_nodes):
                 extern_name = extern_node.get_name()
@@ -5100,12 +5510,16 @@ class AlgorithmSelectorCache(PersistentCache):
 
     @staticmethod
     def _is_extern(choice: ChoiceCaller) -> bool:
+        # [FUNCTION DOC] HELPER: Static; True if the choice is an ExternKernelCaller or SubgraphChoiceCaller (i.e. not a generated template).
         return isinstance(choice, (ExternKernelCaller, SubgraphChoiceCaller))
 
     @classmethod
     def benchmark_choice(
         cls, choice: ChoiceCaller, autotune_args: AutotuneArgs
     ) -> float:
+        # [FUNCTION DOC] Classmethod: benchmarks one choice with the extern or Triton tensors from autotune_args. Zeroes the output, runs the choice benchmark,
+        # synchronizes the device of the first GPU input (default cuda) to surface errors, and when VERIFY is set and an expected output exists, compares the
+        # outputs. Returns the time. In a finally block calls the benchmark request cleanup function if present.
         benchmark_tensors = autotune_args.get_benchmark_tensors(cls._is_extern(choice))
         inputs, output = benchmark_tensors.unpack()
         output.zero_()
@@ -5140,6 +5554,8 @@ class AlgorithmSelectorCache(PersistentCache):
         process_group,
         timeout,
     ) -> float:
+        # [FUNCTION DOC] HELPER: Classmethod running nruns collective benchmark iterations of a choice, used for warmup and timing. First does an async barrier
+        # (raises TimeoutError on timeout), then per run synchronizes CUDA, records start/end events around benchmark_collective, and sums elapsed milliseconds. Returns the total time in ms.
         """
         Single function for benchmarking collective operations.
         Used for both warmup and actual benchmarking.
@@ -5177,6 +5593,9 @@ class AlgorithmSelectorCache(PersistentCache):
         choice: ChoiceCaller,
         autotune_args: AutotuneArgs,
     ) -> float:
+        # [FUNCTION DOC] Classmethod benchmarking a choice for a collective op with cross-rank synchronization. Runs warmup and timed runs on the default process group,
+        # averages the per-run time, averages it across ranks with an all-reduce (timeout from config), and returns the time in ms. Any exception is logged and
+        # returns infinity so every rank skips the choice consistently.
         """
         Benchmark a choice for collective operations with cross-rank synchronization.
         This method ensures all ranks synchronize before benchmarking
@@ -5260,6 +5679,12 @@ class AlgorithmSelectorCache(PersistentCache):
         autotune_args: AutotuneArgs,
         is_collective: bool = False,
     ) -> dict[ChoiceCaller, float]:
+        # [FUNCTION DOC] Classmethod benchmarking a list of choices and returning a dict of choice to time. CUTLASS choices are reordered last when present
+        # so ATen/Triton timings are collected first. Collective mode falls back to regular benchmarking if distributed is not initialized. Per-choice failures
+        # (CUDA compile errors, NotImplementedError, RuntimeError with hints, Triton OutOfResources) give infinity timings; an AssertionError (incorrect
+        # result) is re-raised with the choice named; other errors propagate. After a collective failure all remaining choices get infinity and the loop stops;
+        # after a CUTLASS failure with a valid non-CUTLASS timing, remaining CUTLASS choices are marked infinity.
+        # KNOWN ISSUE: the CUDA compile error log call uses a format placeholder but passes no argument, so the error text is not included in the log.
         """
         Benchmark a list of choices and return timing dict.
         """
@@ -5271,6 +5696,7 @@ class AlgorithmSelectorCache(PersistentCache):
         if any(isinstance(c, CUTLASSTemplateCaller) for c in choices):
 
             def choice_priority(c: ChoiceCaller) -> int:
+            # [FUNCTION DOC] HELPER: Sort key: extern callers first (0), other choices such as Triton (1), CUTLASS last (2).
                 if isinstance(c, ExternKernelCaller):
                     return 0  # ATen/cuBLAS first
                 elif isinstance(c, CUTLASSTemplateCaller):
@@ -5391,6 +5817,7 @@ class AlgorithmSelectorCache(PersistentCache):
         hint_override: int | None = None,
         is_collective=False,
     ) -> dict[ChoiceCaller, float]:
+        # [FUNCTION DOC] Classmethod: builds the benchmark inputs for the choices (get_inputs) and benchmarks all choices in this process via benchmark_choices; returns the timings dict.
         inputs = cls.get_inputs(
             choices, input_nodes, layout, input_gen_fns, hint_override=hint_override
         )
@@ -5409,6 +5836,8 @@ class AlgorithmSelectorCache(PersistentCache):
         input_gen_fns: dict[int, Callable[[ir.Buffer], torch.Tensor]] | None,
         hint_override: int | None = None,
     ):
+        # [FUNCTION DOC] Classmethod: benchmarks extern/ATen choices in the current process and the others (Triton before CUTLASS) in the tuning subprocess pool;
+        # returns the merged dict of choice to time.
         from . import autotune_process
         from .codegen.cutlass.kernel import CUTLASSTemplateCaller
 
@@ -5439,6 +5868,8 @@ class AlgorithmSelectorCache(PersistentCache):
         hint_override: int | None = None,
         is_collective=False,
     ):
+        # [FUNCTION DOC] Classmethod returning a benchmark callable (taking the choices) bound to the other arguments: in-process for collectives, subprocess when
+        # autotune_in_subproc is set or any CUTLASS choice exists, otherwise in-process. Prints the number of tuning requests when DEBUG is set.
         from .codegen.cutlass.kernel import CUTLASSTemplateCaller
 
         if DEBUG:
@@ -5482,6 +5913,9 @@ class AlgorithmSelectorCache(PersistentCache):
         inputs_key: str,
         prescreen_cache: dict[str, OrderedSet[str]],
     ) -> list[ChoiceCaller]:
+        # [FUNCTION DOC] Static: decides which choices are prescreened before full autotuning. Returns the cached prescreening winners (matched by hash key) when
+        # the cache has an entry for name and inputs key. Otherwise, if CUTLASS prescreening is enabled with several swizzle options, picks CUTLASS choices with swizzle 2;
+        # returns an empty list if fewer than 10 such candidates, else the ATen extern choices followed by the candidates.
         """
         Figure out what choices need to be prescreened before autotuning with runtime
         params.
@@ -5547,6 +5981,9 @@ class AlgorithmSelectorCache(PersistentCache):
         inputs_key: str,
         prescreen_cache: dict[str, OrderedSet[str]],
     ) -> list[ChoiceCaller]:
+        # [FUNCTION DOC] Static: prunes choices after prescreening. If a cached entry exists, keeps all non-CUTLASS choices and the CUTLASS choices whose kernel hash is among the
+        # candidates. Otherwise sorts the candidates by time, optionally logs the top timings, keeps the best max(sqrt(n)/4, 8) candidates (inf-time ones are
+        # dropped), records the winners' hash keys in prescreen_cache, loads the DLL of kept CUTLASS candidates, and returns the choices without the pruned candidates.
         """
         Prune the choices after prescreening.
         """
@@ -5631,6 +6068,8 @@ class AlgorithmSelectorCache(PersistentCache):
     def maybe_log_mm_results(
         name: str, input_nodes: list[ir.IRNode], timings: dict[ChoiceCaller, float]
     ) -> None:
+        # [FUNCTION DOC] Static: appends matmul autotuning results (M, K, N shape key, per-choice cublas/triton info and kernel type) to the mm log file when
+        # the environment configured one and the op classifies as mm with at least two inputs. Side effect: writes the JSON log file.
         """Log matrix multiplication autotuning results."""
         mm_filename = get_mm_log_filename()
         if not mm_filename:
@@ -5649,6 +6088,7 @@ class AlgorithmSelectorCache(PersistentCache):
         N = input_nodes[-1].get_size()[-1]
 
         def get_choice_info(choice):
+        # [FUNCTION DOC] HELPER: Returns a dict describing one choice for the mm log (cublas time for extern, or tile sizes and launch settings for Triton), or None for other types.
             if isinstance(choice, ExternKernelCaller):
                 return {"type": "cublas", "time": timings[choice]}
 
@@ -5686,6 +6126,8 @@ class AlgorithmSelectorCache(PersistentCache):
     def maybe_log_conv_results(
         name: str, input_nodes: list[ir.IRNode], timings: dict[ChoiceCaller, float]
     ) -> None:
+        # [FUNCTION DOC] Static: appends convolution autotuning results (input and weight shapes, per-choice time, backend and serializable info fields, kernel type) to the conv log
+        # file when configured and the op classifies as conv with at least two inputs. Side effect: writes the JSON log file.
         """Log convolution autotuning results."""
         conv_filename = get_conv_log_filename()
         if not conv_filename:
@@ -5704,6 +6146,7 @@ class AlgorithmSelectorCache(PersistentCache):
         w_size = input_nodes[1].get_size()
 
         def get_conv_choice_info(choice):
+        # [FUNCTION DOC] HELPER: Returns a dict with time, backend and info fields (non-JSON-serializable values converted to strings) for a choice present in timings, else None.
             if choice not in timings:
                 return None
             info = choice.info_dict()
@@ -5745,6 +6188,8 @@ class AlgorithmSelectorCache(PersistentCache):
     def get_flex_attention_choice_info(
         choice: ChoiceCaller, timings: dict[ChoiceCaller, float]
     ) -> dict[str, Any]:
+        # [FUNCTION DOC] Static: returns a log dict for a flex attention choice: type extern plus time for extern callers; for Triton template callers type triton, time, and the
+        # flex attention tunable keys present in its info. Raises AssertionError for any other choice type.
         if isinstance(choice, torch._inductor.select_algorithm.ExternKernelCaller):
             return {"type": "extern", "time": timings[choice]}
 
@@ -5770,6 +6215,7 @@ class AlgorithmSelectorCache(PersistentCache):
 
     @staticmethod
     def _flex_attention_log_dim(dim: int | torch.SymInt | sympy.Expr) -> int:
+        # [FUNCTION DOC] HELPER: Static; converts a flex attention dimension (int, SymInt or sympy expression) to a concrete int, using size hints for symbolic values. Raises TypeError for other types.
         if isinstance(dim, torch.SymInt):
             dim = dim.node.expr
 
@@ -5787,6 +6233,7 @@ class AlgorithmSelectorCache(PersistentCache):
     def _flex_attention_log_shape(
         size: Sequence[int | torch.SymInt | sympy.Expr],
     ) -> str:
+        # [FUNCTION DOC] HELPER: Static; formats a list of dimensions as a bracketed comma-separated string of concrete integers.
         dims = [AlgorithmSelectorCache._flex_attention_log_dim(dim) for dim in size]
         return f"[{', '.join(map(str, dims))}]"
 
@@ -5794,6 +6241,9 @@ class AlgorithmSelectorCache(PersistentCache):
     def maybe_log_flex_attention_results(
         name: str, input_nodes: list[ir.IRNode], timings: dict[ChoiceCaller, float]
     ) -> None:
+        # [FUNCTION DOC] Static: appends flex attention autotuning results to the flex attention log file when configured and the op name is flex_attention or flex_decoding
+        # with at least three inputs. Derives batch, heads, sequence lengths and head dims from the 4D (or 5D decode) query/key/value sizes, classifies the kernel as
+        # forward, backward or decode, and writes the query/key/value shapes and per-choice info (sorted by time, merged with the shape info). Side effect: writes the JSON log file.
         """Log flex attention autotuning choices when logging is enabled."""
         flex_attention_filename = get_flex_attention_log_filename()
         # Support both flex_attention and flex_decoding
@@ -5882,6 +6332,9 @@ class AlgorithmSelectorCache(PersistentCache):
         hint_override: int | None = None,
         is_collective: bool = False,
     ):
+        # [FUNCTION DOC] Static: reports autotuning results. For collective ops prints all timings on rank 0 as warnings. Always forwards to the debug logger; then, if max autotune
+        # printing is enabled and a nonzero number of choices is displayed, writes mm/conv/flex attention JSON logs and prints the op sizes, strides, dtypes, the top-k choices with
+        # time and relative speed, and the benchmarking, precompile and prescreening durations to stderr. Side effects: stderr output and log files.
         """Log the autotuning results, currently only handles mm and flex. Log Collective op autotuning result"""
         if is_collective and timings:
             import torch.distributed as dist
@@ -5975,6 +6428,8 @@ class AlgorithmSelectorCache(PersistentCache):
 
     @staticmethod
     def benchmark_example_value(node, hint_override: int | None = None):
+        # [FUNCTION DOC] Static: converts an IR buffer (or layout) into a concrete example tensor for benchmarking using size hints. Unwraps views to the base buffer, generates a
+        # strided tensor with the allocation size, and restores the original dtype if unwrapping lost a dtype view.
         """
         Convert an ir.Buffer into a concrete torch.Tensor we can use for
         benchmarking.
@@ -6021,6 +6476,8 @@ class AlgorithmSelectorCache(PersistentCache):
     def generate_example_value(
         size, stride, device, dtype, extra_size, allocation_size=None
     ):
+        # [FUNCTION DOC] Static: creates a random strided tensor of given size, stride, device and dtype with extra storage offset, preserving the global RNG state.
+        # If allocation_size differs from size, creates it with the allocation size and takes a strided view of size.
         # preserve rng states to avoid the rand_strided call below changes
         # the rng states for the real model code.
         with preserve_rng_state():
@@ -6043,6 +6500,8 @@ class AlgorithmSelectorCache(PersistentCache):
 
     @staticmethod
     def key_of(node):
+        # [FUNCTION DOC] Static: returns a tuple key for a buffer: device type, dtype string, hinted sizes, hinted strides (honoring layout constraints) and hinted offset.
+        # Used to key cached autotuning results.
         """
         Extract the pieces of an ir.Buffer that we should invalidate cached
         autotuning results on.
@@ -6059,15 +6518,19 @@ class AlgorithmSelectorCache(PersistentCache):
         )
 
     def add_feedback_saver(self, fn: FeedbackFunction):
+        # [FUNCTION DOC] Registers a feedback callback that is called after benchmarking with timings and context.
         self.feedback_saver_fns.append(fn)
 
     def clear_feedback_savers(self):
+        # [FUNCTION DOC] Removes all registered feedback callbacks.
         self.feedback_saver_fns = []
 
     def add_preprocessing_fn(self, fn: PreprocessingFunction):
+        # [FUNCTION DOC] Appends a choice preprocessing function, applied in registration order before autotuning.
         self.preprocessing_fns.append(fn)
 
     def clear_preprocessing_fns(self, clear_defaults: bool = False):
+        # [FUNCTION DOC] Clears all preprocessing functions; unless clear_defaults is true re-registers the default regex filters.
         """Clear preprocessing functions.
 
         Args:
@@ -6083,6 +6546,7 @@ _ALGORITHM_SELECTOR_CACHE: AlgorithmSelectorCache | None = None
 
 
 def get_algorithm_selector_cache() -> AlgorithmSelectorCache:
+    # [FUNCTION DOC] Returns the process-wide AlgorithmSelectorCache, creating it on first use (mutates the module global).
     """Get the global algorithm selector cache, creating it if it doesn't exist."""
     global _ALGORITHM_SELECTOR_CACHE
     if _ALGORITHM_SELECTOR_CACHE is None:
@@ -6091,6 +6555,8 @@ def get_algorithm_selector_cache() -> AlgorithmSelectorCache:
 
 
 def autotune_select_algorithm(*args, **kwargs):
+    # [FUNCTION DOC] Entry point for algorithm selection: gets the global cache and calls it with the arguments. Defaults return_multi_template to true when benchmark_epilogue_fusion
+    # or pipeline_max_autotune_gemm is enabled and precompilation_timeout_seconds to the config value. Returns whatever the cache call returns (node, choice).
     cache = get_algorithm_selector_cache()
 
     if "return_multi_template" not in kwargs:
@@ -6108,11 +6574,13 @@ def autotune_select_algorithm(*args, **kwargs):
 def add_feedback_saver(
     fn: FeedbackFunction,
 ):
+    # [FUNCTION DOC] Module-level wrapper registering a feedback function on the global cache.
     cache = get_algorithm_selector_cache()
     cache.add_feedback_saver(fn)
 
 
 def clear_feedback_savers():
+    # [FUNCTION DOC] Module-level wrapper clearing all feedback functions of the global cache.
     """Clear all feedback saver functions."""
     cache = get_algorithm_selector_cache()
     cache.clear_feedback_savers()
@@ -6121,6 +6589,7 @@ def clear_feedback_savers():
 def add_preprocessing_fn(
     fn: PreprocessingFunction,
 ):
+    # [FUNCTION DOC] Module-level wrapper adding a choice preprocessing function to the global cache.
     """Add a preprocessing function to be applied to choices before autotuning.
 
     Preprocessing functions are called sequentially in the order they were registered,
@@ -6143,6 +6612,7 @@ def add_preprocessing_fn(
 
 
 def clear_preprocessing_fns(clear_defaults: bool = False):
+    # [FUNCTION DOC] Module-level wrapper clearing the preprocessing functions of the global cache (optionally including defaults).
     """Clear preprocessing functions at module level.
 
     Args:
@@ -6154,6 +6624,8 @@ def clear_preprocessing_fns(clear_defaults: bool = False):
 
 
 def realize_inputs(*args):
+    # [FUNCTION DOC] Realizes IR inputs for template use. With one argument realizes it and, if it has a tensor output, requires stride 1 layout; scalar IR is returned as is.
+    # With several arguments returns the list of realized inputs.
     if len(args) == 1:
         realized = ir.ExternKernel.realize_input(args[0])
         # Shape scalars are represented as scalar IR, e.g. ShapeAsConstantBuffer.
@@ -6165,6 +6637,7 @@ def realize_inputs(*args):
 
 
 def should_use_layout_constraints(node):
+    # [FUNCTION DOC] Returns True if the node has an owning, non-view layout whose buffer name has a recorded layout constraint in the graph.
     # View has its own fixed layout that is not constrained
     if (
         getattr(node, "layout", None) is not None
@@ -6177,12 +6650,15 @@ def should_use_layout_constraints(node):
 
 
 def get_strides_with_layout_constraints(node):
+    # [FUNCTION DOC] Returns the stride recorded in the graph layout constraints for the node if one applies, else the node's own stride.
     if should_use_layout_constraints(node):
         return V.graph.buffer_layout_constraints[node.get_name()].stride
     return node.get_stride()
 
 
 class SymbolicGridFn:
+    # [CLASS DOC] Wrapper around a grid function allowing both integer and sympy inputs. Detects which of the keyword parameters cdiv, min, max the function
+    # declares and supplies integer implementations when called normally or sympy implementations through sympy_call.
     """
     Wrapper around a grid function that allows either int or sympy inputs.
 
@@ -6192,6 +6668,7 @@ class SymbolicGridFn:
     """
 
     def __init__(self, fn: Callable[..., tuple[Any, Any, Any]]):
+        # [FUNCTION DOC] Stores the function and builds the integer and sympy keyword argument maps for the helper parameters (cdiv, min, max) found in its signature.
         self.fn = fn
         self.kwargs_int = {}
         self.kwargs_sym = {}
@@ -6206,13 +6683,16 @@ class SymbolicGridFn:
                 self.kwargs_sym[name] = fn_sym
 
     def __call__(self, *args, **kwargs) -> tuple[int, int, int]:
+        # [FUNCTION DOC] Calls the grid function with the integer helper implementations; returns a tuple of three grid values.
         return self.fn(*args, **kwargs, **self.kwargs_int)
 
     def sympy_call(self, *args, **kwargs):
+        # [FUNCTION DOC] Calls the grid function with the sympy helper implementations (symbolic grid computation).
         return self.fn(*args, **kwargs, **self.kwargs_sym)
 
 
 def _autotune_metadata(input_nodes):
+    # [FUNCTION DOC] HELPER: Builds a dict of autotune metadata strings (strides, dtypes, shapes, offsets, and hinted strides/shapes) for the input nodes.
     """Helper function to extract autotune metadata from input nodes."""
     return {
         "autotune_strides": ", ".join([str(n.get_stride()) for n in input_nodes]),
@@ -6246,6 +6726,8 @@ def _autotune_metadata(input_nodes):
 def _log_autotune_choices_stats(
     event_name: str, timings: dict[ChoiceCaller, float]
 ) -> None:
+    # [FUNCTION DOC] HELPER: Summarizes autotune results (choice counts, best kernel, its description and time, position and time of the best Triton kernel) as JSON, attaches it to
+    # the chromium event logger under event_name and writes it to stderr. Does nothing for empty timings.
     """Helper function to extract autotune metadata from benchmark results."""
     if not timings:
         return None
@@ -6291,6 +6773,8 @@ def _log_autotune_choices_stats(
 def _log_autotune_exceptions(
     exceptions: list[tuple[ChoiceCaller, BaseException]],
 ) -> None:
+    # [FUNCTION DOC] HELPER: Logs precompile exceptions to the chromium event logger when the current compile event is a template precompiling event. For each choice records choice
+    # type, description, message, exception type, and for out-of-memory errors the required memory and hardware limit. Silently ignores any logging failure.
     """Log autotune exceptions to chromium event logger."""
     if not exceptions:
         return
