@@ -1,4 +1,10 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests for the legacy save_state_dict/load_state_dict API with the
+# FileSystemWriter/FileSystemReader storage: plain tensors (no_dist), ShardedTensor
+# save/load, resharding on load across sharding specs, byte objects, sharded<->plain tensor
+# switching, and plan caching. Defines a state-dict comparison helper and small models.
+# Import-time side effects: picks the accelerator device type and default backend; exits
+# the process (status 0) when running under dev-asan.
 
 import os
 import shutil
@@ -65,6 +71,12 @@ def assert_state_dict_equal(
     state_dict_1: dict[str, torch.Tensor],
     state_dict_2: dict[str, torch.Tensor],
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Asserts through the test case that both state dicts have the
+    # same size and key set, then compares values per key: ShardedTensor local shards are
+    # compared pairwise and plain tensors with an exact-equality check. Returns True when
+    # all checks pass; failures surface as assertion errors from the test case.
+    # KNOWN ISSUE: the lambda passed as the assertTrue message is not called as a string
+    # builder by unittest, so the key-specific message is probably never shown.
     self.assertEqual(
         len(state_dict_1), len(state_dict_2), "state_dict must be the same size"
     )
@@ -94,7 +106,10 @@ def assert_state_dict_equal(
 
 
 class MyTestModule(torch.nn.Module):
+    # [CLASS DOC] HELPER: Small module with two Linear layers and an EmbeddingBag, used to
+    # produce a state dict of plain tensors.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates linear_1 (5->5), linear_2 (5->1) and emb (5x10).
         super().__init__()
         self.linear_1 = torch.nn.Linear(5, 5)
         self.linear_2 = torch.nn.Linear(5, 1)
@@ -103,10 +118,14 @@ class MyTestModule(torch.nn.Module):
 
 # The ShardedModels are borrowed from test/distributed/_sharded_tensor/test_sharded_tensor.py
 class MyShardedModel3(torch.nn.Module):
+    # [CLASS DOC] HELPER: Module holding a single random 10x20 ShardedTensor laid out by the
+    # given sharding spec (no RRefs).
     def __init__(
         self,
         spec: ShardingSpec,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Creates the sharded_tensor attribute via sharded_tensor.rand
+        # with the spec and size 10x20.
         super().__init__()
         self.sharded_tensor: ShardedTensor = sharded_tensor.rand(
             spec, 10, 20, init_rrefs=False
@@ -114,7 +133,11 @@ class MyShardedModel3(torch.nn.Module):
 
 
 class TestDistributedStateDictSaveLoad(TestCase):
+    # [CLASS DOC] Single-process tests of save/load with the no_dist option.
     def test_read_write_only_tensor(self) -> None:
+        # [FUNCTION DOC] Saves a plain-tensor state dict to a temp directory without a
+        # process group (default layout, then single_file_per_rank), loads into a freshly
+        # initialized module state dict, and checks it differs before and matches after.
         with tempfile.TemporaryDirectory() as path:
             state_dict_to_save = MyTestModule().state_dict()
 
@@ -167,8 +190,11 @@ class TestDistributedStateDictSaveLoad(TestCase):
 
 
 class TestDistributedStateDictSaveLoadWithSharedTensor(ShardedTensorTestBase):
+    # [CLASS DOC] Two-rank test of save/load round trip for a sharded model, parametrized
+    # over storage extensions.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 2, the number of ranks for these tests.
         return 2
 
     @with_comms(init_rpc=False, backend=backend)
@@ -176,6 +202,10 @@ class TestDistributedStateDictSaveLoadWithSharedTensor(ShardedTensorTestBase):
     @requires_accelerator_dist_backend()
     @parametrize("extensions", [None, [Rot13Example()], [ZStandard()]])
     def test_read_write_shard_tensor(self, extensions) -> None:
+        # [FUNCTION DOC] Rank 0's temp directory is broadcast to all ranks. Saves a
+        # ShardedTensor-containing model state dict via FileSystemWriter (with the given
+        # extension list), loads it into a second model using a reader with the test
+        # extension registry, and verifies values differ before and match after loading.
         paths = [tempfile.mkdtemp()]
         dist.broadcast_object_list(paths)
 
@@ -224,16 +254,23 @@ class TestDistributedStateDictSaveLoadWithSharedTensor(ShardedTensorTestBase):
 
 
 class TestDistributedReshardOnLoad(ShardedTensorTestBase):
+    # [CLASS DOC] Two-rank tests that save with one sharding layout and load with another
+    # (different chunk/enumerable specs, row vs column sharding, sharded vs plain tensors).
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 2, the number of ranks for these tests.
         return 2
 
     def get_file_path(self) -> str:
+        # [FUNCTION DOC] HELPER: Rank 0 creates a temporary directory and broadcasts its
+        # path to every rank; returns that shared path.
         paths = [tempfile.mkdtemp()] if dist.get_rank() == 0 else [None]
         dist.broadcast_object_list(paths)
         return paths[0]
 
     def load_tensor(self, tensor: ShardedTensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Gathers a ShardedTensor onto rank 0 (a zero tensor on the
+        # first accelerator) and returns it there; other ranks pass no output and get None.
         res = (
             torch.zeros(tensor.shape, device=f"{device_type}:0")
             if dist.get_rank() == 0
@@ -246,6 +283,10 @@ class TestDistributedReshardOnLoad(ShardedTensorTestBase):
     @skip_if_lt_x_gpu(2)
     @requires_accelerator_dist_backend()
     def test_load_with_different_shard_plan(self) -> None:
+        # [FUNCTION DOC] For every ordered pair of distinct sharding specs (two chunk specs,
+        # two enumerable specs over a 10x20 tensor), recreates the directory, saves a model
+        # with the first spec, loads into a model with the second, gathers both tensors on
+        # rank 0 and asserts they are close.
         path = self.get_file_path()
 
         # We hardcode the assumption of how many shards are around
@@ -361,6 +402,8 @@ class TestDistributedReshardOnLoad(ShardedTensorTestBase):
     @skip_if_lt_x_gpu(2)
     @requires_accelerator_dist_backend()
     def test_load_rowwise_to_colwise(self) -> None:
+        # [FUNCTION DOC] Saves a model sharded along dim 0 and loads into one sharded along
+        # dim 1, then gathers both on rank 0 and asserts the full tensors are close.
         path = self.get_file_path()
         self.assertEqual(self.world_size, dist.get_world_size())
 
@@ -412,6 +455,8 @@ class TestDistributedReshardOnLoad(ShardedTensorTestBase):
     @skip_if_lt_x_gpu(2)
     @requires_accelerator_dist_backend()
     def test_save_load_bytes(self) -> None:
+        # [FUNCTION DOC] Saves a state dict of non-tensor objects (a list and a string),
+        # loads into a dict with different values, and asserts the originals are restored.
         path = self.get_file_path()
 
         state_dict_to_save = {"bytes0": [1], "bytes1": "string"}
@@ -431,6 +476,10 @@ class TestDistributedReshardOnLoad(ShardedTensorTestBase):
     @skip_if_lt_x_gpu(2)
     @requires_accelerator_dist_backend()
     def test_switch_between_sharded_tensor_to_tensor(self) -> None:
+        # [FUNCTION DOC] For each pair of 1D sharding specs, saves a sharded tensor plus a
+        # replicated tensor, then loads the sharded entry into a plain tensor and the
+        # replicated entry into a sharded tensor. On rank 0, asserts that both gathered
+        # results match what was saved.
         path = self.get_file_path()
         tensor_size = 32
 
@@ -515,8 +564,10 @@ class TestDistributedReshardOnLoad(ShardedTensorTestBase):
 
 
 class TestDistributedStateDictSaveLoadWithCaching(ShardedTensorTestBase):
+    # [CLASS DOC] Two-rank test of repeated saves using a planner with plan caching enabled.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 2, the number of ranks for these tests.
         return 2
 
     @with_comms(init_rpc=False, backend=backend)
@@ -524,6 +575,9 @@ class TestDistributedStateDictSaveLoadWithCaching(ShardedTensorTestBase):
     @requires_accelerator_dist_backend()
     @with_temp_dir
     def test_read_write_shard_tensor(self) -> None:
+        # [FUNCTION DOC] Saves and reloads a sharded model state dict twice using a default
+        # save planner with plan caching enabled (the second save reuses the writer and a
+        # new planner), verifying each time that a fresh model matches after loading.
         # pyre-fixme [28]: Unexpected keyword argument `dim` to call `dist._sharding_spec.api.ChunkShardingSpec.__init__`.
         spec = ChunkShardingSpec(
             dim=0,

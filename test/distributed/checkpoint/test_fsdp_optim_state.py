@@ -1,4 +1,8 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Multi-GPU tests for checkpointing FSDP optimizer state: verifies that the
+# state-dict get/set helpers forward a custom FSDP process group, and that a sharded
+# optimizer state dict saved with DCP can be loaded back with
+# load_sharded_optimizer_state_dict and matches the pre-save state.
 
 import torch
 import torch.distributed as dist
@@ -23,14 +27,22 @@ from torch.testing._internal.distributed.checkpoint_utils import with_temp_dir
 
 
 class FsdpOptimStateCheckpoint(DTensorTestBase):
+    # [CLASS DOC] Test case for FSDP optimizer-state checkpointing; models scale their
+    # layer widths with the world size so dim 0 can be sharded across all ranks.
     def _create_model(self):
+        # [FUNCTION DOC] HELPER: Builds a three-block MLP (Linear+ReLU each) whose layer
+        # widths are world_size, 2x and 3x world_size, with an input width of 8, and moves
+        # it to the test device. The model has a forward and a random 8x8 input helper.
         # make weight tensor dim_0 as large as the world size for scaling test
         layer1_weight_dim = self.world_size
         layer2_weight_dim = self.world_size * 2
         layer3_weight_dim = self.world_size * 3
 
         class TestDummyModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Sequential-style MLP of net1, net2, net3 blocks that
+            # remembers its device type for generating inputs.
             def __init__(self, device_type) -> None:
+                # [FUNCTION DOC] HELPER: Stores the device type and builds the three blocks.
                 super().__init__()
                 self.device_type = device_type
                 self.net1 = nn.Sequential(nn.Linear(8, layer1_weight_dim), nn.ReLU())
@@ -42,9 +54,11 @@ class FsdpOptimStateCheckpoint(DTensorTestBase):
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Passes x through net1, net2, net3 in order.
                 return self.net3(self.net2(self.net1(x)))
 
             def get_input(self):
+                # [FUNCTION DOC] HELPER: Returns a random 8x8 tensor on the stored device.
                 return torch.rand(8, 8, device=self.device_type)
 
         model = TestDummyModel(self.device_type).to(self.device_type)
@@ -52,12 +66,19 @@ class FsdpOptimStateCheckpoint(DTensorTestBase):
 
     @property
     def backend(self):
+        # [FUNCTION DOC] HELPER: Returns a backend string using gloo for CPU and the default
+        # backend of the test device type for the accelerator.
         curr_backend = dist.get_default_backend_for_device(self.device_type)
         return f"cpu:gloo,{self.device_type}:{curr_backend}"
 
     @skip_if_lt_x_gpu(2)
     @with_comms
     def test_get_set_state_dict_forwards_fsdp_process_group(self):
+        # [FUNCTION DOC] Wraps a model in FSDP with a custom process group, takes one Adam
+        # step, then temporarily replaces FSDP's optimizer state-dict save and load static
+        # methods with wrappers that record the group keyword argument. Calls get_state_dict
+        # and set_state_dict and asserts both received the custom group. The originals are
+        # restored and the group destroyed in a finally block. Needs 2+ GPUs.
         custom_pg = dist.new_group(ranks=list(range(self.world_size)))
 
         model = self._create_model()
@@ -73,10 +94,14 @@ class FsdpOptimStateCheckpoint(DTensorTestBase):
         orig_load = FSDP.optim_state_dict_to_load
 
         def wrapped_save(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Records the group keyword argument in the seen mapping
+            # and delegates to the original optimizer state dict function.
             seen["save_group"] = kwargs.get("group")
             return orig_save(*args, **kwargs)
 
         def wrapped_load(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Records the group keyword argument in the seen mapping
+            # and delegates to the original optimizer-state-to-load function.
             seen["load_group"] = kwargs.get("group")
             return orig_load(*args, **kwargs)
 
@@ -111,6 +136,12 @@ class FsdpOptimStateCheckpoint(DTensorTestBase):
     @with_temp_dir
     @parametrize("pass_planner", [True, False])
     def test_load_sharded_optimizer_state_dict(self, pass_planner) -> None:
+        # [FUNCTION DOC] Trains one Adam step on an FSDP model, saves the model and its
+        # sharded optimizer state dict with DCP, then loads the model into a fresh FSDP
+        # model and the optimizer state via load_sharded_optimizer_state_dict (with a
+        # default load planner or none, per pass_planner). Converts it back with
+        # optim_state_dict_to_load, loads it into the new optimizer, and asserts per-param
+        # states equal the pre-save ones (allclose for ShardedTensor). Needs 2+ GPUs.
         CHECKPOINT_DIR = self.temp_dir
         planner = dcp.DefaultLoadPlanner() if pass_planner else None
 

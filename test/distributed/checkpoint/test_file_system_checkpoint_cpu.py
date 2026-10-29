@@ -1,4 +1,9 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] CPU/gloo variant of the file-system checkpoint tests: save/load with
+# FileSystemWriter/Reader parametrized over writer thread counts, with Rot13 and ZStandard
+# storage extensions, a Stateful blob object, sharded tensors, resharding on load, byte
+# objects and sharded<->plain tensor switching. Import-time side effect: exits the process
+# (status 0) under dev-asan; defines the thread count set used for parametrization.
 
 import sys
 import tempfile
@@ -60,6 +65,11 @@ def assert_state_dict_equal(
     state_dict_1: dict[str, torch.Tensor],
     state_dict_2: dict[str, torch.Tensor],
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Asserts both state dicts have equal length and key sets, then
+    # per key compares ShardedTensor local shards pairwise, plain tensors by exact
+    # equality, and Stateful objects by equality. Returns True if no assertion fails.
+    # KNOWN ISSUE: the lambda passed as the assertTrue message is never evaluated into a
+    # string by unittest, so the per-key message is probably not shown.
     self.assertEqual(
         len(state_dict_1), len(state_dict_2), "state_dict must be the same size"
     )
@@ -91,7 +101,10 @@ def assert_state_dict_equal(
 
 
 class MyTestModule(torch.nn.Module):
+    # [CLASS DOC] HELPER: Small module (two Linear layers, one EmbeddingBag) whose state
+    # dict supplies plain tensors for the tests.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates linear_1 (5->5), linear_2 (5->1) and emb (5x10).
         super().__init__()
         self.linear_1 = torch.nn.Linear(5, 5)
         self.linear_2 = torch.nn.Linear(5, 1)
@@ -100,10 +113,12 @@ class MyTestModule(torch.nn.Module):
 
 # The ShardedModels are borrowed from test/distributed/_sharded_tensor/test_sharded_tensor.py
 class MyShardedModel3(torch.nn.Module):
+    # [CLASS DOC] HELPER: Module holding one random 10x20 ShardedTensor laid out by a spec.
     def __init__(
         self,
         spec: ShardingSpec,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Builds the sharded_tensor attribute with the spec, 10x20.
         super().__init__()
         self.sharded_tensor: ShardedTensor = sharded_tensor.rand(
             spec, 10, 20, init_rrefs=False
@@ -111,25 +126,37 @@ class MyShardedModel3(torch.nn.Module):
 
 
 class BlobState:
+    # [CLASS DOC] HELPER: Minimal Stateful object whose state is a mapping with one key,
+    # "blob", holding a bytes value; compares equal to another BlobState with equal state.
     def __init__(self, value: IO[bytes]) -> Any:
+        # [FUNCTION DOC] HELPER: Stores a mapping with the single entry "blob" -> value.
+        # KNOWN ISSUE: the return annotation is Any rather than None.
         self.state = {"blob": value}
 
     def state_dict(self) -> dict[str, Any]:
+        # [FUNCTION DOC] HELPER: Returns the internal state mapping itself (not a copy).
         return self.state
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        # [FUNCTION DOC] HELPER: Replaces the internal state with the given mapping.
         self.state = state_dict
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] HELPER: True only if other is a BlobState with an equal state.
         return isinstance(other, BlobState) and self.state == other.state
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: Returns a string showing the blob value.
         return f"BlobState({self.state['blob']})"
 
 
 class TestDistributedStateDictSaveLoad(TestCase):
+    # [CLASS DOC] Single-process (no_dist) save/load test, parametrized by thread count.
     @parametrize("thread_count", _THREAD_COUNTS)
     def test_read_write_only_tensor(self, thread_count) -> None:
+        # [FUNCTION DOC] Saves a plain-tensor state dict with a FileSystemWriter using the
+        # given thread count, loads it into a new module state dict without a process
+        # group, and checks the dicts differ before loading and match afterward.
         with tempfile.TemporaryDirectory() as path:
             state_dict_to_save = MyTestModule().state_dict()
 
@@ -157,8 +184,12 @@ class TestDistributedStateDictSaveLoad(TestCase):
 
 
 class TestDistributedStateDictSaveLoadRot13(TestCase):
+    # [CLASS DOC] Tests save/load through the Rot13 example storage extension.
     @parametrize("thread_count", _THREAD_COUNTS)
     def test_read_write_tensor_and_blob(self, thread_count) -> None:
+        # [FUNCTION DOC] Saves module tensors plus a BlobState with the Rot13 extension via
+        # the save API, then loads with a reader holding the test extension registry (the
+        # extension is discovered from checkpoint metadata) and verifies equality.
         with tempfile.TemporaryDirectory() as path:
             state_dict_to_save = MyTestModule().state_dict()
             state_dict_to_save["test_blob"] = BlobState(b"SomeBlobForTesting")
@@ -193,8 +224,12 @@ class TestDistributedStateDictSaveLoadRot13(TestCase):
 
 
 class TestDistributedStateDictSaveLoadZStandard(TestCase):
+    # [CLASS DOC] Tests save/load through the ZStandard compression extension.
     @parametrize("thread_count", _THREAD_COUNTS)
     def test_read_write_only_tensor(self, thread_count) -> None:
+        # [FUNCTION DOC] Saves module tensors plus a BlobState with the ZStandard extension,
+        # loads with a default reader and verifies equality after loading. Despite the name,
+        # it also covers a non-tensor blob object.
         with tempfile.TemporaryDirectory() as path:
             state_dict_to_save = MyTestModule().state_dict()
             state_dict_to_save["test_blob"] = BlobState(b"SomeBlobForTesting")
@@ -226,13 +261,18 @@ class TestDistributedStateDictSaveLoadZStandard(TestCase):
 
 
 class TestDistributedStateDictSaveLoadWithSharedTensor(ShardedTensorTestBase):
+    # [CLASS DOC] Two-rank gloo test of sharded-tensor model save/load round trip.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 2, the number of ranks for these tests.
         return 2
 
     @with_comms(init_rpc=False, backend="gloo")
     @parametrize("thread_count", _THREAD_COUNTS)
     def test_read_write_shard_tensor(self, thread_count) -> None:
+        # [FUNCTION DOC] Broadcasts a temp directory from rank 0, saves a sharded model
+        # state dict with the given writer thread count, loads into a second model, and
+        # asserts values differ before and match after loading.
         paths = [tempfile.mkdtemp()]
         dist.broadcast_object_list(paths)
 
@@ -279,16 +319,23 @@ class TestDistributedStateDictSaveLoadWithSharedTensor(ShardedTensorTestBase):
 
 
 class TestDistributedReshardOnLoad(ShardedTensorTestBase):
+    # [CLASS DOC] Two-rank gloo tests of loading checkpoints saved with a different
+    # sharding layout, or switching between sharded and plain tensors.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 2, the number of ranks for these tests.
         return 2
 
     def get_file_path(self) -> str:
+        # [FUNCTION DOC] HELPER: Rank 0 makes a temp directory and broadcasts its path;
+        # every rank returns that path.
         paths = [tempfile.mkdtemp()] if dist.get_rank() == 0 else [None]
         dist.broadcast_object_list(paths)
         return paths[0]
 
     def load_tensor(self, tensor: ShardedTensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Gathers a ShardedTensor to rank 0 into a CPU zero tensor and
+        # returns it there; other ranks return None.
         res = torch.zeros(tensor.shape, device="cpu") if dist.get_rank() == 0 else None
         tensor.gather(out=res)
         return res
@@ -296,6 +343,10 @@ class TestDistributedReshardOnLoad(ShardedTensorTestBase):
     @with_comms(init_rpc=False, backend="gloo")
     @parametrize("thread_count", _THREAD_COUNTS)
     def test_load_with_different_shard_plan(self, thread_count) -> None:
+        # [FUNCTION DOC] For every ordered pair of distinct sharding specs (chunk and
+        # enumerable, over a 10x20 tensor), saves a model with the first and loads into one
+        # with the second, then compares gathered full tensors on rank 0. Unlike the GPU
+        # version it does not clear the directory between iterations.
         path = self.get_file_path()
 
         # We hardcode the assumption of how many shards are around
@@ -407,6 +458,10 @@ class TestDistributedReshardOnLoad(ShardedTensorTestBase):
     @with_comms(init_rpc=False, backend="gloo")
     @parametrize("thread_count", _THREAD_COUNTS)
     def test_load_rowwise_to_colwise(self, thread_count) -> None:
+        # [FUNCTION DOC] Saves a model sharded on dim 0, loads into one sharded on dim 1,
+        # and asserts the gathered tensors are close on rank 0.
+        # KNOWN ISSUE: moves the models with a cuda call even though this is a gloo/CPU
+        # test, so it needs CUDA despite the CPU-oriented setup.
         path = self.get_file_path()
         self.assertEqual(self.world_size, dist.get_world_size())
 
@@ -453,6 +508,8 @@ class TestDistributedReshardOnLoad(ShardedTensorTestBase):
     @with_comms(init_rpc=False, backend="gloo")
     @parametrize("thread_count", _THREAD_COUNTS)
     def test_save_load_bytes(self, thread_count) -> None:
+        # [FUNCTION DOC] Saves a state dict of a list and a string, loads into a dict with
+        # different values, and asserts the saved values are restored.
         path = self.get_file_path()
 
         state_dict_to_save = {"bytes0": [1], "bytes1": "string"}
@@ -471,6 +528,10 @@ class TestDistributedReshardOnLoad(ShardedTensorTestBase):
     @with_comms(init_rpc=False, backend="gloo")
     @parametrize("thread_count", _THREAD_COUNTS)
     def test_switch_between_sharded_tensor_to_tensor(self, thread_count) -> None:
+        # [FUNCTION DOC] For each pair of 1D sharding specs, saves a sharded tensor and a
+        # rank-0-broadcast replicated tensor, then loads the sharded entry into a plain
+        # tensor and the replicated entry into a sharded tensor; rank 0 asserts both
+        # gathered results match.
         path = self.get_file_path()
         tensor_size = 32
 

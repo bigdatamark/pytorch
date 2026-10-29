@@ -1,4 +1,9 @@
 # Owner(s): ["oncall: distributed checkpointing"]
+# [MODULE DOC] End-to-end tests for the HuggingFace safetensors checkpoint storage: single
+# rank save/load (including multithreaded and empty-dict loads), loading a hand-made
+# block-quantized checkpoint, distributed save with consolidation into one file, and DTensor
+# resharding across placements and meshes. Most tests skip when safetensors is missing.
+# Defines module-level placement lists (including all distinct 2D pairs).
 
 import importlib
 import json
@@ -30,7 +35,10 @@ CHECKPOINT_DIR = "checkpoint"
 
 
 class MyTestModule(torch.nn.Module):
+    # [CLASS DOC] HELPER: Small module (two Linear layers, one EmbeddingBag) whose state
+    # dict supplies tensors for the safetensors tests.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates linear_1 (5->5), linear_2 (5->1), emb (5x10).
         super().__init__()
         self.linear_1 = torch.nn.Linear(5, 5)
         self.linear_2 = torch.nn.Linear(5, 1)
@@ -38,8 +46,12 @@ class MyTestModule(torch.nn.Module):
 
 
 class TestSingleRankSaveLoad(TestCase):
+    # [CLASS DOC] Single-process tests of HuggingFace storage writer/reader round trips.
     @with_temp_dir
     def test_save(self) -> None:
+        # [FUNCTION DOC] Saves a module state dict with HuggingFaceStorageWriter, reads the
+        # resulting single safetensors file with the safetensors library, and asserts keys
+        # and tensor values match. Prints a message and returns if safetensors is missing.
         try:
             from safetensors.torch import load_file
         except ImportError:
@@ -67,6 +79,9 @@ class TestSingleRankSaveLoad(TestCase):
 
     @with_temp_dir
     def test_load(self) -> None:
+        # [FUNCTION DOC] Writes a state dict to a safetensors file with the safetensors
+        # library, loads it into another module's state dict with HuggingFaceStorageReader,
+        # and asserts values match. Returns early if safetensors is missing.
         try:
             from safetensors.torch import save_file
         except ImportError:
@@ -96,6 +111,9 @@ class TestSingleRankSaveLoad(TestCase):
 
     @with_temp_dir
     def test_load_into_empty_dict(self) -> None:
+        # [FUNCTION DOC] Writes a safetensors file, then reconstructs a state dict using only
+        # the reader (no target dict) via the key-based loader, and asserts keys and values
+        # match. Returns early if safetensors is missing.
         try:
             from safetensors.torch import save_file
         except ImportError:
@@ -123,6 +141,9 @@ class TestSingleRankSaveLoad(TestCase):
 
     @with_temp_dir
     def test_load_with_multiple_threads(self) -> None:
+        # [FUNCTION DOC] Saves a state dict split across two safetensors files by an
+        # fqn-to-file-index mapping, loads it with a reader using two threads, and asserts
+        # keys and values match. Returns early if safetensors is not installed.
         if importlib.util.find_spec("safetensors") is None:
             print("safetensors not installed")
             return
@@ -163,6 +184,11 @@ class TestSingleRankSaveLoad(TestCase):
 
     @with_temp_dir
     def test_quantized_checkpoint_loading(self) -> None:
+        # [FUNCTION DOC] Builds three float tensors, halves each as a fake quantized weight
+        # with a companion inverse-scale tensor of 2.0 per 128x128 block, writes them to a
+        # safetensors file with an index json, and loads with the quantized reader (float32
+        # target, block size 128, two threads). Asserts shapes, dtypes and values match the
+        # originals within tolerance. Returns early if safetensors is missing.
         """Test end-to-end saving a quantizaed checkpoint and loading it."""
         try:
             from safetensors.torch import save_file
@@ -275,10 +301,15 @@ class TestSingleRankSaveLoad(TestCase):
 
 
 class TestDistributedHFSafetensorsConsolidation(DTensorTestBase):
+    # [CLASS DOC] Multi-GPU test of distributed safetensors save with consolidation.
     @with_comms
     @with_temp_dir
     @skip_if_lt_x_gpu(2)
     def test_consolidate_to_one_file(self) -> None:
+        # [FUNCTION DOC] Builds a row-sharded 4x4 DTensor from per-rank slices, saves it with
+        # HuggingFaceStorageWriter in distributed mode with consolidation, and on rank 0 reads
+        # the single consolidated safetensors file and asserts it holds exactly the dtensor
+        # key with the full global tensor. Skips if safetensors is missing; needs 2+ GPUs.
         if importlib.util.find_spec("safetensors") is None:
             print("safetensors not installed")
             return
@@ -352,6 +383,8 @@ for p1 in TWO_D_PLACEMENTS:
 
 @instantiate_parametrized_tests
 class TestDTensorReshardPlacementChange(DTensorTestBase):
+    # [CLASS DOC] Tests saving DTensors to HuggingFace storage and loading them with a
+    # different placement on the same mesh shape.
     """
     Test DCP reshard for DTensor with placements changes and without world_size change and mesh_tensor change.
     """
@@ -360,6 +393,10 @@ class TestDTensorReshardPlacementChange(DTensorTestBase):
     @skip_if_lt_x_gpu(2)
     @with_temp_dir
     def test_1d_to_1d_reshard_placement_change(self) -> None:
+        # [FUNCTION DOC] For each Replicate<->Shard(0) pair on a 1D mesh, saves a 4x4 DTensor
+        # with a distributed HuggingFaceStorageWriter, loads into a zero DTensor with the new
+        # placement via HuggingFaceStorageReader, and checks the full tensor and the
+        # round trip to the original placement. Skips without safetensors; needs 2+ GPUs.
         if importlib.util.find_spec("safetensors") is None:
             print("safetensors not installed")
             return
@@ -418,6 +455,9 @@ class TestDTensorReshardPlacementChange(DTensorTestBase):
     @skip_if_lt_x_gpu(4)
     @with_temp_dir
     def test_2d_to_2d_reshard_placement_change(self) -> None:
+        # [FUNCTION DOC] Same as the 1D test on a (2, world_size/2) mesh across every ordered
+        # pair of distinct 2D placements, using the distributed HuggingFace writer and the
+        # default save planner. Skips without safetensors; needs 4+ GPUs.
         if importlib.util.find_spec("safetensors") is None:
             print("safetensors not installed")
             return
@@ -469,6 +509,8 @@ class TestDTensorReshardPlacementChange(DTensorTestBase):
 
 
 class TestDTensorReshardMeshChange(DTensorTestBase):
+    # [CLASS DOC] Tests HuggingFace storage loads into DTensors whose mesh dimensionality
+    # differs from the save-time mesh, plus an empty-shard case.
     """
     Test DCP reshard for DTensor with placements changes and mesh_tensor change.
     """
@@ -477,6 +519,9 @@ class TestDTensorReshardMeshChange(DTensorTestBase):
     @with_temp_dir
     @skip_if_lt_x_gpu(2)
     def test_1d_to_2d_reshard_mesh_change(self) -> None:
+        # [FUNCTION DOC] Saves a 4x4 DTensor on a 1D mesh (Shard(0) or Replicate), then for
+        # each 2D placement loads into a zero DTensor on a 2D mesh and compares the fully
+        # replicated result with the global tensor. Skips without safetensors; 2+ GPUs.
         if importlib.util.find_spec("safetensors") is None:
             print("safetensors not installed")
             return
@@ -528,6 +573,9 @@ class TestDTensorReshardMeshChange(DTensorTestBase):
     @with_temp_dir
     @skip_if_lt_x_gpu(4)
     def test_2d_to_1d_reshard_mesh_change(self) -> None:
+        # [FUNCTION DOC] Saves on a 2D mesh with each 2D placement and loads into 1D-mesh
+        # DTensors (Shard(0) or Replicate), comparing the replicated result with the global
+        # tensor. Skips without safetensors; needs 4+ GPUs.
         if importlib.util.find_spec("safetensors") is None:
             print("safetensors not installed")
             return
@@ -580,6 +628,9 @@ class TestDTensorReshardMeshChange(DTensorTestBase):
     @with_temp_dir
     @skip_if_lt_x_gpu(2)
     def test_dtensor_checkpoint_resharding_with_empty_shard(self):
+        # [FUNCTION DOC] Saves a one-element tensor sharded across all ranks (most shards
+        # empty) with the distributed HuggingFace writer, then loads it into a 2D mesh with
+        # Shard(0) on both dims. Passes if no error is raised. Skips without safetensors.
         """
         Test dtensor checkpoint resharding with dtensor containing empty shards.
         """

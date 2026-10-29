@@ -1,4 +1,9 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests for the fsspec-based checkpoint storage (FsspecWriter/FsspecReader and
+# the FileSystem abstraction): an FSDP model and optimizer round trip, overwrite semantics,
+# cleanup of partially written streams on failure, and graceful behavior when the stream has
+# no file descriptor (in-memory filesystem). Defines a local with_temp_dir decorator.
+# Import-time side effect: picks the accelerator device type and its default backend.
 
 import shutil
 import tempfile
@@ -41,6 +46,11 @@ BACKEND = torch.distributed.get_default_backend_for_device(device_type)
 def with_temp_dir(
     func: Callable | None = None,
 ) -> Callable | None:
+    # [FUNCTION DOC] HELPER: Decorator factory used bare on a test method. Raises
+    # AssertionError if no function is given; otherwise returns a wrapper that creates a
+    # temp directory on rank 0 (or when no process group exists), broadcasts its path to
+    # all ranks, stores it as the test's temp_dir attribute, runs the test, and finally
+    # removes the directory on rank 0, ignoring errors. Prints the directory it creates.
     """
     Wrapper to initialize temp directory for distributed checkpoint.
     """
@@ -49,6 +59,9 @@ def with_temp_dir(
 
     @wraps(func)
     def wrapper(self, *args: tuple[object], **kwargs: dict[str, Any]) -> None:
+        # [FUNCTION DOC] HELPER: Sets up the shared temp_dir (rank 0 creates and broadcasts
+        # it), calls the wrapped test with the given arguments, and always cleans up the
+        # directory afterward on rank 0.
         # Only create temp_dir when rank is 0 (or no pg)
         if not dist.is_initialized() or dist.get_rank() == 0:
             temp_dir = tempfile.mkdtemp()
@@ -72,7 +85,9 @@ def with_temp_dir(
 
 
 class MyTestModule(torch.nn.Module):
+    # [CLASS DOC] HELPER: Four-stage MLP (8->16->32->64->8) used as the FSDP test model.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates net1 to net4 (Linear and ReLU stages).
         super().__init__()
         self.net1 = nn.Sequential(nn.Linear(8, 16), nn.ReLU())
         self.net2 = nn.Sequential(nn.Linear(16, 32), nn.ReLU())
@@ -80,12 +95,15 @@ class MyTestModule(torch.nn.Module):
         self.net4 = nn.Sequential(nn.ReLU(), nn.Linear(64, 8))
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Runs x through net1, net2, net3, net4 in order.
         return self.net4(self.net3(self.net2(self.net1(x))))
 
 
 class TestFSSpec(ShardedTensorTestBase):
+    # [CLASS DOC] Two-rank tests of DCP save/load through FsspecWriter and FsspecReader.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 2, the number of ranks for these tests.
         return 2
 
     @with_comms(backend=BACKEND, init_rpc=False)
@@ -93,6 +111,11 @@ class TestFSSpec(ShardedTensorTestBase):
     @skip_if_lt_x_gpu(2)
     @with_temp_dir
     def test_fsspec(self):
+        # [FUNCTION DOC] Trains one Adam step on an FSDP model, saves the sharded model and
+        # optimizer state dicts with FsspecWriter, checks a second FSDP model differs, then
+        # loads the model with FsspecReader and the optimizer via
+        # load_sharded_optimizer_state_dict, and asserts parameters and the Adam first and
+        # second moment buffers of the first state entry match. Needs 2+ GPUs.
         CHECKPOINT_DIR = self.temp_dir
 
         model = FSDP(MyTestModule().to(device_type))
@@ -154,6 +177,8 @@ class TestFSSpec(ShardedTensorTestBase):
                     self.assertEqual(n_p1[1], n_p2[1])
 
         def opt_at(opt, idx):
+            # [FUNCTION DOC] HELPER: Returns the idx-th per-parameter state mapping of the
+            # optimizer, in state insertion order.
             return list(iter(opt.state.values()))[idx]
 
         # Adam lazily creates its state
@@ -167,6 +192,10 @@ class TestFSSpec(ShardedTensorTestBase):
     @skip_if_lt_x_gpu(2)
     @with_temp_dir
     def test_overwrite(self):
+        # [FUNCTION DOC] Saves one tensor with overwrite disabled, saves another to the same
+        # location with overwrite enabled, loads and asserts the second value is returned,
+        # then asserts a further save with overwrite disabled raises CheckpointException
+        # mentioning that the checkpoint already exists. Needs 2+ GPUs.
         t1, t2 = torch.randn(10), torch.randn(10)
 
         dcp.save(
@@ -190,8 +219,11 @@ class TestFSSpec(ShardedTensorTestBase):
 
 
 class TestFileSystem(TestCase):
+    # [CLASS DOC] Single-process tests of the fsspec-backed FileSystem helper and writer.
     @with_temp_dir
     def test_remove_on_fail(self):
+        # [FUNCTION DOC] Verifies create_stream cleanup: a file opened for writing is removed
+        # when the body raises OSError, while a file opened for reading that raises is kept.
         fs = FileSystem()
         path = fs.init_path(self.temp_dir)
 
@@ -214,6 +246,10 @@ class TestFileSystem(TestCase):
 
     @patch("os.sync")
     def test_fsspec_without_fileno_support(self, mock_os_sync):
+        # [FUNCTION DOC] With os.sync mocked, saves a tensor with FsspecWriter to the fsspec
+        # memory filesystem (no file descriptor support) without a process group, while
+        # spying on the in-memory file flush. Asserts flush was called, the checkpoint loads
+        # back with equal values, and os.sync was called at most twice.
         """
         fsspec's "memory://" protocol simulates cloud storage
         by not supporting .fileno() and raising io.UnsupportedOperation.

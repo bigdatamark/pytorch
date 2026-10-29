@@ -1,4 +1,7 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Multi-GPU test that converts a checkpoint between parallelism layouts: a
+# model's FSDP sharded state dict is saved with DCP and loaded into a tensor-parallel
+# (DTensor) version of the same model.
 import torch
 import torch.distributed.checkpoint as dist_cp
 from torch.distributed._shard.sharded_tensor import ShardedTensor
@@ -24,10 +27,15 @@ from torch.testing._internal.distributed.checkpoint_utils import with_temp_dir
 
 # TODO: modularize this test and add test for checkpoint conversion in both direction.
 class TestFsdpTpCheckpointConversion(DTensorTestBase):
+    # [CLASS DOC] Test case for FSDP to tensor-parallel checkpoint conversion.
     @with_comms
     @skip_if_lt_x_gpu(2)
     @with_temp_dir
     def test_fsdp_to_tp(self):
+        # [FUNCTION DOC] Saves the sharded state dict of an FSDP-wrapped MLP, builds a
+        # tensor-parallel MLP (column-wise net1, row-wise net2) and perturbs it with one SGD
+        # step, asserts its full tensors differ from the FSDP ones (after gathering), loads
+        # the checkpoint into the TP state dict, and asserts they then match. Needs 2+ GPUs.
         CHECKPOINT_DIR = self.temp_dir
 
         model = MLPModule(self.device_type).to(self.rank)
