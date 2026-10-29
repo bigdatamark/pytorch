@@ -1,7 +1,16 @@
+# [MODULE DOC] Script that checks the error messages raised by invalid storage constructor
+# arguments and storage methods (wrong argument types, bad offsets and sizes, bad index or value
+# types, invalid resize and fill arguments). Every check runs at import time; a failure raises
+# an assertion error and the printed messages are meant to be compared with expected output.
 import torch
 
 
 def check_error(desc, fn, *required_substrings):
+    # [FUNCTION DOC] HELPER: Call the given callable and require that it raises an exception. On
+    # failure the first argument of the exception is taken as the message, a separator, the
+    # description and the message are printed, and each required substring must occur in the
+    # message or an assertion error is raised. If the callable does not raise, an assertion
+    # error naming the description is raised. Returns None on success.
     try:
         fn()
     except Exception as e:
@@ -63,6 +72,8 @@ check_error("Invalid index type", lambda: torch.FloatStorage(10)["first item"], 
 
 
 def assign():
+    # [FUNCTION DOC] HELPER: Try to assign a string to a slice of a float storage of size ten.
+    # The storage assignment is expected to raise a type error, which the caller verifies.
     torch.FloatStorage(10)[1:-1] = "1"
 
 

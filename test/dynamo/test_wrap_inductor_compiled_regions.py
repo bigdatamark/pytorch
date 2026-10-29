@@ -1,4 +1,9 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests for the option that wraps inductor compiled regions in a higher-order
+# operator so that dispatch modes (DebugMode and selective activation checkpointing) can see
+# them. Covers visibility in DebugMode, defaults, per-compilation scope, cache interaction, flex
+# attention, selective checkpointing policies, fake and proxy tensor modes, and release of boxed
+# inputs. Most tests need CUDA and triton. Importing only defines a helper and a test class.
 
 import functools
 import unittest
@@ -24,12 +29,23 @@ from torch.utils.checkpoint import (
 def count_ops(
     gm, args, freq=None, freq_ge=None, op=None, freqs=None, freqs_ge=None, ops=None
 ):
+    # [FUNCTION DOC] HELPER: Count graph nodes matching ops in a graph module and check the
+    # counts. A single op, freq or freq_ge argument overrides the corresponding list argument
+    # (a list passed as the single op raises AssertionError). If expected exact frequencies
+    # are given, each op must occur exactly that many times; otherwise the freqs_ge list is
+    # required and each op must occur at least that many times. A node matches by target
+    # equality or through the rng state wrapper operators. Raises AssertionError with a
+    # message naming the graph on mismatch. Returns the graph module unchanged, so it can
+    # serve as a compiler callback.
     """
     Count operations in a graph module.
     Used to verify SAC behavior by counting ops in forward/backward graphs.
     """
 
     def match_rng_op(node, op):
+        # [FUNCTION DOC] HELPER: Return True if the node is one of the rng state higher-order
+        # operators (save, run-with, graphsafe run-with) whose wrapped op argument equals op;
+        # the position of that argument differs by operator name. Otherwise return False.
         if isinstance(node.target, torch._ops.HigherOrderOperator):
             if node.name == "run_and_save_rng_state":
                 return node.args[0] == op
@@ -72,10 +88,16 @@ def count_ops(
 
 
 class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Test case for compiling with the wrap option enabled: checks the higher-order
+    # operator is visible to DebugMode only when enabled, correctness and gradients, caching
+    # behavior, and integration with flex attention and selective checkpointing. Holds no state.
     """Tests for wrap_inductor_compiled_regions option"""
 
     @requires_cuda_and_triton
     def test_wrap_enabled_visible_in_debug_mode(self):
+        # [FUNCTION DOC] Compile a matmul with the wrap option on and run it under DebugMode.
+        # Checks that the debug string mentions the compiled code operator and the result equals
+        # eager matmul. Needs CUDA.
         """Test that compiled regions are wrapped when option is enabled"""
 
         @torch.compile(
@@ -84,6 +106,8 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
             fullgraph=True,
         )
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Compile target: return the matrix product of
+            # the two arguments.
             return torch.matmul(x, y)
 
         x = torch.randn(4, 4, device="cuda")
@@ -103,6 +127,8 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
 
     @requires_cuda_and_triton
     def test_wrap_name_visible_in_debug_mode(self):
+        # [FUNCTION DOC] Like the enabled test but compiles with a region name; checks the debug
+        # string contains both the compiled code operator and the given name. Needs CUDA.
         """Test that named compiled regions surface their name in DebugMode"""
 
         @torch.compile(
@@ -112,6 +138,8 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
             name="flex_attention",
         )
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Compile target: return the matrix product of
+            # the two arguments.
             return torch.matmul(x, y)
 
         x = torch.randn(4, 4, device="cuda")
@@ -130,6 +158,9 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
 
     @requires_cuda_and_triton
     def test_wrap_disabled_not_visible_in_debug_mode(self):
+        # [FUNCTION DOC] Compile a matmul with the wrap option off and run under DebugMode.
+        # Checks the operator name does not appear in the debug string while the result is still
+        # correct. Needs CUDA.
         """Test that compiled regions are not wrapped when option is disabled"""
 
         @torch.compile(
@@ -138,6 +169,8 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
             fullgraph=True,
         )
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Compile target: return the matrix product of
+            # the two arguments.
             return torch.matmul(x, y)
 
         x = torch.randn(4, 4, device="cuda")
@@ -157,10 +190,15 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
 
     @requires_cuda_and_triton
     def test_wrap_default_disabled(self):
+        # [FUNCTION DOC] Compile a matmul without passing the option and check the operator
+        # does not appear in DebugMode output, i.e. wrapping is off by default; result is
+        # correct. Needs CUDA.
         """Test that wrapping is disabled by default"""
 
         @torch.compile(backend="inductor", fullgraph=True)
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Compile target: return the matrix product of
+            # the two arguments.
             return torch.matmul(x, y)
 
         x = torch.randn(4, 4, device="cuda")
@@ -180,6 +218,9 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
 
     @requires_cuda_and_triton
     def test_wrap_with_backward(self):
+        # [FUNCTION DOC] Compile a matmul with wrapping on and inputs requiring grad; run
+        # forward and backward under DebugMode. Checks the operator is visible and that result
+        # and both input gradients match an eager computation on cloned inputs. Needs CUDA.
         """Test that wrapping works correctly with backward pass"""
 
         @torch.compile(
@@ -188,6 +229,8 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
             fullgraph=True,
         )
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Compile target: return the matrix product of
+            # the two arguments.
             return torch.matmul(x, y)
 
         x = torch.randn(4, 4, device="cuda", requires_grad=True)
@@ -220,6 +263,9 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
 
     @requires_cuda_and_triton
     def test_wrap_with_multiple_ops(self):
+        # [FUNCTION DOC] Compile a function with a matmul, relu and add under wrapping and
+        # check the operator is visible in DebugMode and the result matches the eager
+        # computation. Needs CUDA.
         """Test wrapping with a function that has multiple operations"""
 
         @torch.compile(
@@ -228,6 +274,8 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
             fullgraph=True,
         )
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Compile target: matmul, then relu, then add the first
+            # input; return the result.
             a = torch.matmul(x, y)
             b = torch.relu(a)
             c = b + x
@@ -252,6 +300,9 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
 
     @requires_cuda_and_triton
     def test_wrap_option_type_validation(self):
+        # [FUNCTION DOC] Check type validation of the option: boolean true and false are
+        # accepted and the compiled functions run; a string value must raise a RuntimeError
+        # whose message contains the text unexpected type. Needs CUDA.
         """Test that wrap_inductor_compiled_regions validates type correctly"""
 
         # Should accept bool
@@ -260,6 +311,8 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
             options={"wrap_inductor_compiled_regions": True},
         )
         def fn_true(x):
+            # [FUNCTION DOC] HELPER: Compile target for the accepted true option: return the
+            # input plus one.
             return x + 1
 
         @torch.compile(
@@ -267,6 +320,8 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
             options={"wrap_inductor_compiled_regions": False},
         )
         def fn_false(x):
+            # [FUNCTION DOC] HELPER: Compile target for the accepted false option: return the
+            # input plus one.
             return x + 1
 
         x = torch.randn(4, device="cuda")
@@ -281,12 +336,17 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
                 options={"wrap_inductor_compiled_regions": "true"},
             )
             def fn_invalid(x):
+                # [FUNCTION DOC] HELPER: Compile target decorated with an invalid string option;
+                # it is never run because applying the decorator is expected to raise.
                 return x + 1
 
         self.assertIn("Unexpected type", str(cm.exception))
 
     @requires_cuda_and_triton
     def test_wrap_per_compilation(self):
+        # [FUNCTION DOC] Check the option is per compilation: one function compiled with
+        # wrapping and one without, run in separate DebugMode contexts; only the first shows the
+        # operator. Needs CUDA.
         """Test that wrap option is per-compilation, not global"""
 
         @torch.compile(
@@ -295,6 +355,8 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
             fullgraph=True,
         )
         def fn_wrapped(x, y):
+            # [FUNCTION DOC] HELPER: Compile target: return the matrix product of the two
+            # arguments. Compiled with wrapping on.
             return torch.matmul(x, y)
 
         @torch.compile(
@@ -303,6 +365,8 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
             fullgraph=True,
         )
         def fn_not_wrapped(x, y):
+            # [FUNCTION DOC] HELPER: Compile target: return the matrix product of the two
+            # arguments. Compiled with wrapping off.
             return torch.matmul(x, y)
 
         x = torch.randn(4, 4, device="cuda")
@@ -323,6 +387,11 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
     @inductor_config.patch("fx_graph_remote_cache", False)
     @functorch_config.patch({"enable_autograd_cache": True})
     def test_wrap_with_cache(self):
+        # [FUNCTION DOC] With FX graph cache and autograd cache enabled and the remote cache
+        # disabled, clear all caches and counters, compile a matmul with wrapping on and call it
+        # twice, resetting dynamo and the code cache in between. Checks the operator is visible
+        # in DebugMode on both the cache miss and the cache hit, the autograd cache miss and hit
+        # counters, and correct results. Needs CUDA.
         """
         Test that wrap_inductor_compiled_regions works correctly with caching.
         Verify that the wrapper is properly applied when loading from cache by
@@ -332,6 +401,8 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
         from torch._functorch._aot_autograd.autograd_cache import AOTAutogradCache
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Compile target: return the matrix product of
+            # the two arguments.
             return torch.matmul(x, y)
 
         x = torch.randn(4, 4, device="cuda")
@@ -403,6 +474,11 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
     @inductor_config.patch("fx_graph_remote_cache", False)
     @functorch_config.patch({"enable_autograd_cache": True})
     def test_wrap_config_affects_cache_key(self):
+        # [FUNCTION DOC] Same cache configuration as the cache test. Shows the wrap option
+        # is part of the cache key: wrapped compile misses then hits; switching the option
+        # off causes a new miss, then a hit. Checks counters after each step, all four
+        # results against eager, and that only the wrapped version shows the operator in
+        # DebugMode. Needs CUDA.
         """
         Test that wrap_inductor_compiled_regions is part of the cache key.
         Changing this option should cause a cache miss because it produces
@@ -411,6 +487,8 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
         from torch._functorch._aot_autograd.autograd_cache import AOTAutogradCache
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Compile target: return the matrix product of
+            # the two arguments.
             return torch.matmul(x, y)
 
         x = torch.randn(4, 4, device="cuda")
@@ -492,9 +570,14 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
 
     @requires_cuda_and_triton
     def test_flex_attention_with_wrapper_basic(self):
+        # [FUNCTION DOC] Run flex attention with a causal score modification under wrapped
+        # compilation, check the output shape, and compare with a wrap-disabled compilation
+        # within tolerance. Needs CUDA.
         """Test that flex_attention works with wrap_inductor_compiled_regions=True"""
 
         def causal_score_mod(score, b, h, q_idx, k_idx):
+            # [FUNCTION DOC] HELPER: Score modification function for causal attention: keep the
+            # score where the query index is at least the key index, else minus infinity.
             return torch.where(q_idx >= k_idx, score, float("-inf"))
 
         @torch.compile(
@@ -503,6 +586,8 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
             fullgraph=True,
         )
         def fn(q, k, v):
+            # [FUNCTION DOC] HELPER: Compile target: run flex attention with the
+            # causal score modification.
             return flex_attention(q, k, v, score_mod=causal_score_mod)
 
         B, H, S, D = 2, 4, 128, 64
@@ -521,6 +606,8 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
             fullgraph=True,
         )
         def fn_unwrapped(q, k, v):
+            # [FUNCTION DOC] HELPER: Compile target without wrapping: run flex attention with
+            # the causal score modification.
             return flex_attention(q, k, v, score_mod=causal_score_mod)
 
         output_unwrapped = fn_unwrapped(q, k, v)
@@ -528,9 +615,13 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
 
     @requires_cuda_and_triton
     def test_flex_attention_wrapper_visible_in_debug_mode(self):
+        # [FUNCTION DOC] Compile flex attention with wrapping on and off, run each under
+        # DebugMode, and check the operator name appears only for the wrapped one. Needs CUDA.
         """Test that inductor_compiled_code HOP is visible to DebugMode when wrapper is enabled"""
 
         def score_mod(score, b, h, q_idx, k_idx):
+            # [FUNCTION DOC] HELPER: Score modification function for attention: return the score
+            # unchanged, ignoring the batch, head and index arguments.
             return score
 
         @torch.compile(
@@ -539,6 +630,8 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
             fullgraph=True,
         )
         def fn_wrapped(q, k, v):
+            # [FUNCTION DOC] HELPER: Wrapped compile target: run flex attention with the
+            # local score modification.
             return flex_attention(q, k, v, score_mod=score_mod)
 
         @torch.compile(
@@ -547,6 +640,8 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
             fullgraph=True,
         )
         def fn_unwrapped(q, k, v):
+            # [FUNCTION DOC] HELPER: Unwrapped compile target: run flex attention with the
+            # local score modification.
             return flex_attention(q, k, v, score_mod=score_mod)
 
         B, H, S, D = 2, 4, 128, 64
@@ -578,9 +673,14 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
 
     @requires_cuda_and_triton
     def test_flex_attention_wrapper_with_backward(self):
+        # [FUNCTION DOC] Run forward and backward through wrapped flex attention with
+        # grad-requiring half precision inputs, check gradients exist, and compare the gradients
+        # with those from an unwrapped compilation within tolerance. Needs CUDA.
         """Test that wrapper works correctly with backward pass"""
 
         def score_mod(score, b, h, q_idx, k_idx):
+            # [FUNCTION DOC] HELPER: Score modification function: add a constant 0.1
+            # to the score.
             return score + 0.1
 
         @torch.compile(
@@ -589,6 +689,8 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
             fullgraph=True,
         )
         def fn(q, k, v):
+            # [FUNCTION DOC] HELPER: Wrapped compile target: run flex attention with the
+            # local score modification.
             return flex_attention(q, k, v, score_mod=score_mod)
 
         B, H, S, D = 2, 4, 128, 64
@@ -623,6 +725,8 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
             fullgraph=True,
         )
         def fn_unwrapped(q, k, v):
+            # [FUNCTION DOC] HELPER: Unwrapped compile target: run flex attention with the
+            # local score modification.
             return flex_attention(q, k, v, score_mod=score_mod)
 
         output2 = fn_unwrapped(q2, k2, v2)
@@ -638,19 +742,29 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
     @inductor_config.patch("fx_graph_remote_cache", False)
     @functorch_config.patch({"enable_autograd_cache": True})
     def test_flex_attention_wrapper_with_cache(self):
+        # [FUNCTION DOC] Cache variant for flex attention: with caches enabled, compile with
+        # wrapping and run twice (rebuilding the compiled function after a dynamo reset). Checks
+        # the operator is visible both times, the miss then hit counters, and that both results
+        # are close. Needs CUDA.
         """Test that wrapper works correctly with caching"""
         from torch._functorch._aot_autograd.autograd_cache import AOTAutogradCache
 
         def score_mod(score, b, h, q_idx, k_idx):
+            # [FUNCTION DOC] HELPER: Score modification function for attention: return the score
+            # unchanged, ignoring the batch, head and index arguments.
             return score
 
         def make_compiled_fn():
+            # [FUNCTION DOC] HELPER: Build and return a freshly compiled, wrapped function
+            # running flex attention.
             @torch.compile(
                 backend="inductor",
                 options={"wrap_inductor_compiled_regions": True},
                 fullgraph=True,
             )
             def fn(q, k, v):
+                # [FUNCTION DOC] HELPER: Compile target: run flex attention with the
+                # local score modification.
                 return flex_attention(q, k, v, score_mod=score_mod)
 
             return fn
@@ -704,6 +818,11 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
 
     @requires_cuda_and_triton
     def test_flex_attention_with_sac_must_save(self):
+        # [FUNCTION DOC] Selective checkpointing with a policy that must-saves the flex
+        # attention higher-order operator. Compiles through aot autograd with compilers that
+        # assert the forward graph has the operator once and the backward graph has none, using
+        # the min-cut partitioner, with the wrap config patched on. Runs forward and backward
+        # and checks gradients exist. Needs CUDA.
         """
         Test that SAC policy MUST_SAVE for flex_attention_hop
         prevents recomputation during backward when used with wrapper.
@@ -713,18 +832,27 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
         """
 
         def score_mod(score, b, h, q_idx, k_idx):
+            # [FUNCTION DOC] HELPER: Score modification function for attention: return the score
+            # unchanged, ignoring the batch, head and index arguments.
             return score
 
         # SAC policy: MUST_SAVE flex_attention_hop
         def policy_fn(ctx, op, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Checkpoint policy: must-save for the flex attention
+            # operator, prefer recompute otherwise.
             if op == flex_attention_hop:
                 return CheckpointPolicy.MUST_SAVE
             return CheckpointPolicy.PREFER_RECOMPUTE
 
         def gn(q, k, v):
+            # [FUNCTION DOC] HELPER: Checkpointed region: run attention on q, k, v with the
+            # local score modification function and return the output.
             return flex_attention(q, k, v, score_mod=score_mod)
 
         def fn(q, k, v):
+            # [FUNCTION DOC] HELPER: Wrap the attention region in non-reentrant
+            # checkpointing whose context function is built from the local policy function,
+            # and return the output.
             context_fn = functools.partial(
                 create_selective_checkpoint_contexts, policy_fn
             )
@@ -788,6 +916,10 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
 
     @requires_cuda_and_triton
     def test_flex_attention_with_sac_prefer_recompute(self):
+        # [FUNCTION DOC] Like the must-save test but the policy prefers recompute for every
+        # operator, so the backward graph is expected to contain the flex attention operator
+        # once; forward also once. Runs forward and backward under wrapping config and checks
+        # gradients exist. Needs CUDA.
         """
         Test that SAC policy PREFER_RECOMPUTE for flex_attention_hop
         causes recomputation during backward when used with wrapper.
@@ -797,19 +929,28 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
         """
 
         def score_mod(score, b, h, q_idx, k_idx):
+            # [FUNCTION DOC] HELPER: Score modification function for attention: return the score
+            # unchanged, ignoring the batch, head and index arguments.
             return score
 
         # SAC policy: PREFER_RECOMPUTE flex_attention_hop
         def policy_fn(ctx, op, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Checkpoint policy: prefer recompute for every operator
+            # (both branches agree).
             if op == flex_attention_hop:
                 # this would be very weird IRL fwiw, just testing
                 return CheckpointPolicy.PREFER_RECOMPUTE
             return CheckpointPolicy.PREFER_RECOMPUTE
 
         def gn(q, k, v):
+            # [FUNCTION DOC] HELPER: Checkpointed region: run attention on q, k, v with the
+            # local score modification function and return the output.
             return flex_attention(q, k, v, score_mod=score_mod)
 
         def fn(q, k, v):
+            # [FUNCTION DOC] HELPER: Wrap the attention region in non-reentrant
+            # checkpointing whose context function is built from the local policy function,
+            # and return the output.
             context_fn = functools.partial(
                 create_selective_checkpoint_contexts, policy_fn
             )
@@ -873,6 +1014,10 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
 
     @requires_cuda_and_triton
     def test_sac_outer_compile_inner_basic(self):
+        # [FUNCTION DOC] Checkpoint an eager function that calls a wrapped compiled matmul, with
+        # a policy that must-saves the compiled code operator. Under DebugMode runs forward and
+        # backward, checks the operator is visible, and compares output and gradients with
+        # eager. Needs CUDA.
         """
         Test SAC(compile(foo)) pattern - SAC on eager code with inner compiled region.
 
@@ -890,10 +1035,14 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
             fullgraph=True,
         )
         def inner_compiled_matmul(x, y):
+            # [FUNCTION DOC] HELPER: Wrapped compile target: return the matrix product of
+            # the two arguments.
             return torch.matmul(x, y)
 
         # SAC policy: save matmul operations
         def policy_fn(ctx, op, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Checkpoint policy: must-save for the compiled code
+            # operator, prefer recompute otherwise.
             # When the compiled region is wrapped in inductor_compiled_code HOP,
             # SAC should be able to see it and apply policy
             from torch._higher_order_ops.wrap import inductor_compiled_code
@@ -904,6 +1053,8 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
 
         # Eager checkpointed function that calls compiled code
         def checkpointed_fn(x, y):
+            # [FUNCTION DOC] HELPER: Eager checkpointed region: call the compiled matmul, apply
+            # relu and return it.
             # This compiled call should be wrapped in inductor_compiled_code HOP
             a = inner_compiled_matmul(x, y)
             b = torch.relu(a)
@@ -953,6 +1104,10 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
 
     @requires_cuda_and_triton
     def test_sac_outer_compile_inner_name_visible_to_policy(self):
+        # [FUNCTION DOC] Check a checkpoint policy can read the region name: a named wrapped
+        # compile is called inside a checkpointed eager function; the policy records the name
+        # keyword whenever it sees the compiled code operator. Asserts the name is seen and
+        # output and gradients match eager.
         """Test that SAC policies can inspect torch.compile region names"""
 
         @torch.compile(
@@ -962,11 +1117,15 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
             name="flex_attention",
         )
         def inner_compiled_matmul(x, y):
+            # [FUNCTION DOC] HELPER: Named, wrapped compile target: return the matrix product of
+            # the two arguments.
             return torch.matmul(x, y)
 
         seen_region_names = []
 
         def policy_fn(ctx, op, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Checkpoint policy: record the name keyword of each compiled
+            # code operator seen into a list in the enclosing test; always prefer recompute.
             from torch._higher_order_ops.wrap import inductor_compiled_code
 
             if op == inductor_compiled_code:
@@ -974,6 +1133,8 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
             return CheckpointPolicy.PREFER_RECOMPUTE
 
         def checkpointed_fn(x, y):
+            # [FUNCTION DOC] HELPER: Eager checkpointed region: call the compiled matmul
+            # and apply relu.
             a = inner_compiled_matmul(x, y)
             return torch.relu(a)
 
@@ -1007,6 +1168,10 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
 
     @requires_cuda_and_triton
     def test_wrap_no_dispatch_mode_no_hop_invoked(self):
+        # [FUNCTION DOC] Patch the operator in the output code module with a recording wrapper.
+        # Without a dispatch mode the result must be correct and, if the wrapper was called at
+        # all, its mode keyword is None. Under DebugMode a second compiled function must call
+        # the operator. Needs CUDA.
         """
         Test that without TorchDispatchMode, the HOP is NOT invoked.
 
@@ -1030,6 +1195,8 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
                 fullgraph=True,
             )
             def fn(x, y):
+            # [FUNCTION DOC] HELPER: Compile target: return the matrix product of the two
+            # arguments. Compiled with wrapping on.
                 return torch.matmul(x, y)
 
             x = torch.randn(4, 4, device="cuda")
@@ -1055,6 +1222,8 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
                 fullgraph=True,
             )
             def fn2(x, y):
+            # [FUNCTION DOC] HELPER: Compile target: return the matrix product of the two
+            # arguments. Compiled with wrapping on.
                 return torch.matmul(x, y)
 
             x2 = torch.randn(4, 4, device="cuda")
@@ -1070,6 +1239,10 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
 
     @requires_cuda_and_triton
     def test_sac_outer_compile_inner_flex_attention(self):
+        # [FUNCTION DOC] Eager checkpoint region calling flex attention while the inductor wrap
+        # config is patched on, with a policy that must-saves the compiled code and flex
+        # attention operators. Runs forward and backward, checks gradients exist and that output
+        # and gradients match a non-checkpointed run within tolerance. Needs CUDA.
         """
         Test SAC(compile(foo)) with flex_attention - the key motivating use case.
 
@@ -1078,10 +1251,14 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
         """
 
         def score_mod(score, b, h, q_idx, k_idx):
+            # [FUNCTION DOC] HELPER: Score modification function for attention: return the score
+            # unchanged, ignoring the batch, head and index arguments.
             return score
 
         # Policy: save the compiled flex_attention region
         def policy_fn(ctx, op, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Checkpoint policy: must-save for the compiled code or flex
+            # attention operator, else prefer recompute.
             from torch._higher_order_ops.wrap import inductor_compiled_code
 
             # When flex_attention is compiled with wrapping, its compiled kernel
@@ -1095,6 +1272,8 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
 
         # Eager function that calls flex_attention (which internally compiles)
         def checkpointed_flex_fn(q, k, v):
+            # [FUNCTION DOC] HELPER: Eager checkpointed region: run flex attention with the
+            # local score modification and return it.
             # flex_attention internally uses torch.compile, so with
             # wrap_inductor_compiled_regions enabled, its compiled regions
             # should be wrapped in the HOP
@@ -1152,6 +1331,9 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
         torch.testing.assert_close(v.grad, v2.grad, rtol=1e-3, atol=1e-3)
 
     def test_fake_tensor_mode_works(self):
+        # [FUNCTION DOC] Compile a linear model under FakeTensorMode with the wrap config on and
+        # check the result has shape four by four, i.e. the fake tensor fallback using the
+        # stored FX graph works.
         """Test that running compiled code inside FakeTensorMode works with FX graph fallback"""
         from torch._subclasses.fake_tensor import FakeTensorMode
 
@@ -1169,6 +1351,10 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
                 self.assertEqual(result.shape, (4, 4))
 
     def test_proxy_tensor_mode_works(self):
+        # [FUNCTION DOC] Trace a wrapper that calls the compiled code operator on an
+        # InductorCompiledCallable with make_fx. Checks the traced graph has a call node for the
+        # operator whose first argument is an integer side table index, and that running the
+        # traced graph gives input plus one. Resets the side table first.
         """Test that running compiled code inside ProxyTensorMode works with FX graph fallback"""
         from torch._higher_order_ops.wrap import (
             inductor_code_side_table,
@@ -1182,7 +1368,10 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
 
         # Create a simple FX graph
         class SimpleModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Tiny module whose forward adds one to its input, traced to
+            # provide an FX graph.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return the input plus one.
                 return x + 1
 
         model = SimpleModel()
@@ -1191,12 +1380,16 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
         # Create an InductorCompiledCallable
         # The compiled callable should match FX graph's output convention
         def simple_compiled(inputs):
+            # [FUNCTION DOC] HELPER: Stand-in compiled function taking a list of inputs; return
+            # the first input plus one.
             return inputs[0] + 1
 
         callable_obj = InductorCompiledCallable(simple_compiled, gm)
 
         # Wrapper that uses the HOP
         def wrapper(x):
+            # [FUNCTION DOC] HELPER: Call the compiled code operator on the callable object with
+            # a one element input list.
             return inductor_compiled_code(callable_obj, [x])
 
         inp = torch.randn(4, 4)
@@ -1222,6 +1415,10 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
         torch.testing.assert_close(result, expected)
 
     def test_hop_call_releases_boxed_inputs_before_dispatch_returns(self):
+        # [FUNCTION DOC] Check the operator releases its boxed input list reference before the
+        # compiled callable runs: the callable clears the list and records whether the held
+        # object is still alive via a weak reference; the expected record is a single False.
+        # Resets the side table around the test.
         from torch._higher_order_ops.wrap import (
             inductor_code_side_table,
             inductor_compiled_code,
@@ -1229,11 +1426,16 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
         )
 
         class Holder:
+            # [CLASS DOC] HELPER: Empty class whose instance is used as a weakly
+            # referenced input object.
             pass
 
         alive_during_call = []
 
         def compiled_callable(inputs):
+            # [FUNCTION DOC] HELPER: Compiled callable stand-in: take a weak reference to the
+            # first input, clear the list, record whether the object is still alive, and return
+            # a tuple holding an empty tensor.
             holder_ref = weakref.ref(inputs[0])
             inputs.clear()
             alive_during_call.append(holder_ref() is not None)
@@ -1244,6 +1446,9 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
         callable_idx = inductor_code_side_table.add_callable(callable_obj)
 
         def call_with_moved_input():
+            # [FUNCTION DOC] HELPER: Create a holder object in a list, drop the local name,
+            # and call the operator with the registered callable index and that list,
+            # returning its result.
             holder = Holder()
             inputs = [holder]
             holder = None
@@ -1257,6 +1462,11 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
         self.assertEqual(alive_during_call, [False])
 
     def test_hop_fx_codegen_releases_boxed_input_before_dispatch(self):
+        # [FUNCTION DOC] Trace two chained operator calls (forward then backward style) with
+        # make_fx and check the generated code: two operator nodes, the second with boxed
+        # argument indices equal to one, a line assigning the boxed list, and a call using it.
+        # Then run the graph with lifetime tracking on and expect the boxed objects not alive
+        # during the second call. Resets the side table.
         from torch._higher_order_ops.wrap import (
             inductor_code_side_table,
             inductor_compiled_code,
@@ -1268,9 +1478,15 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
         track_lifetime = False
 
         def fw_callable(inputs):
+            # [FUNCTION DOC] HELPER: Forward stand-in: return a tuple of the first input plus
+            # one and plus two.
             return (inputs[0] + 1, inputs[0] + 2)
 
         def bw_callable(inputs):
+            # [FUNCTION DOC] HELPER: Backward stand-in: if lifetime tracking is on, clear the
+            # input list and record whether the first object is alive via a weak reference,
+            # returning an empty tensor tuple; otherwise return a tuple with the sum of the
+            # first two inputs.
             if track_lifetime:
                 holder_ref = weakref.ref(inputs[0])
                 inputs.clear()
@@ -1283,6 +1499,9 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
         bw_callable_obj = InductorCompiledCallable(bw_callable)
 
         def wrapper(x):
+            # [FUNCTION DOC] HELPER: Call the operator with the forward callable named
+            # minimal_fw, then with the backward callable on both outputs, named minimal_bw, and
+            # return the second result.
             out = inductor_compiled_code(fw_callable_obj, [x], name="minimal_fw")
             return inductor_compiled_code(
                 bw_callable_obj,
@@ -1314,6 +1533,11 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
 
     @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA")
     def test_hop_codegen_releases_multiple_boxed_inputs_before_dispatch(self):
+        # [FUNCTION DOC] Memory check with several saved tensors: trace a forward and backward
+        # operator pair, then run the graph several times on CUDA with eight MiB tensors. Inside
+        # the backward callable, after clearing the inputs, memory in use must be under a
+        # quarter of one saved tensor and peak memory under the saved total plus half a tensor.
+        # Skipped without CUDA.
         from torch._higher_order_ops.wrap import (
             inductor_code_side_table,
             inductor_compiled_code,
@@ -1332,14 +1556,21 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
         track_memory = False
 
         def cleanup():
+            # [FUNCTION DOC] HELPER: Empty the CUDA cache and reset peak memory statistics.
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
 
         def fw_callable(inputs):
+            # [FUNCTION DOC] HELPER: Forward stand-in: return a tuple of the input plus one
+            # and plus two.
             x = inputs[0]
             return (x + 1, x + 2)
 
         def bw_callable(inputs):
+            # [FUNCTION DOC] HELPER: Backward stand-in: when memory tracking is on, clear the
+            # inputs, record the live memory above the baseline, allocate and free a scratch
+            # tensor and record the peak above baseline, returning a tuple with a scalar tensor;
+            # otherwise return a tuple with the sum of two inputs.
             if track_memory:
                 inputs.clear()
                 live_before_scratch.append(
@@ -1358,6 +1589,8 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
         bw = InductorCompiledCallable(bw_callable)
 
         def wrapper(x):
+            # [FUNCTION DOC] HELPER: Call the forward operator, then the backward operator on a
+            # list built from the saved outputs; return the backward result.
             out = inductor_compiled_code(fw, [x], name="minimal_fw")
             return inductor_compiled_code(
                 bw,
@@ -1389,6 +1622,12 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
 
     @unittest.skipIf(not torch.distributed.is_available(), "requires torch.distributed")
     def test_sac_cached_value_fifo_mismatch(self):
+        # [FUNCTION DOC] Regression test for an issue where one shared first-in-first-out queue
+        # for compiled code operator calls returned the wrong cached value when recompute
+        # skipped a cached region. Sets up a fake single rank process group and mesh, runs a
+        # checkpoint with a must-save policy over a function using a global cache plus two
+        # compiled functions on a DTensor, then backward. Passes if no error is raised; always
+        # destroys the process group. Skipped without distributed.
         """
         Regression test for https://github.com/pytorch/pytorch/issues/175258
 
@@ -1415,10 +1654,15 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
 
             @torch.compile(dynamic=False, fullgraph=True)  # noqa: UNSPECIFIED_BACKEND
             def compute_int_stuff(n):
+                # [FUNCTION DOC] HELPER: Compile target: return an int32 range of
+                # the given length.
                 return torch.arange(n, dtype=torch.int32)
 
             @torch.compile(dynamic=False, fullgraph=True)  # noqa: UNSPECIFIED_BACKEND
             def compute_float(q, cached_ints):
+                # [FUNCTION DOC] HELPER: Compile target: scale the local part of the DTensor by
+                # the sum of the integer cached values converted to float and rewrap as a
+                # DTensor with the same mesh and placements.
                 ql = q.to_local()
                 out = ql * cached_ints.float().sum()
                 return DTensor.from_local(
@@ -1428,6 +1672,9 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
             _cache: dict = {}
 
             def outer_fn(x):
+                # [FUNCTION DOC] HELPER: Checkpointed region: fill the enclosing cache with the
+                # int result on first call only, so recompute skips it, then run the float
+                # compile target with the cached value.
                 # Forward: cache miss, compute_int_stuff runs as inductor_compiled_code.
                 # Recompute: cache hit, compute_int_stuff is skipped; only compute_float
                 # runs. With a single shared FIFO queue this would pop the int-tensor
@@ -1437,6 +1684,8 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
                 return compute_float(x, _cache["data"])
 
             def policy_fn(ctx, op, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: Checkpoint policy: must-save for the operator named
+                # inductor_compiled_code, else prefer recompute.
                 if isinstance(op, torch._ops.HigherOrderOperator):
                     if op.name() == "inductor_compiled_code":
                         return CheckpointPolicy.MUST_SAVE

@@ -1,7 +1,15 @@
 # Owner(s): ["oncall: export"]
+# [MODULE DOC] Utilities that generate random test programs as Python source text for export and
+# unflatten testing: a random DAG generator, a Block class for building indented code, and
+# generator classes that emit chains of nested module classes which call each other and
+# optionally access constants or mutate buffers. Nothing runs at import time.
 
 
 def random_dag(n: int):
+    # [FUNCTION DOC] Build a random directed acyclic graph on n nodes numbered from zero.
+    # Returns a mapping from each node to a list of later nodes (larger numbers) it has an edge
+    # to; each possible forward edge is included independently with probability one half. Uses
+    # the global random module, so results are not reproducible unless the caller seeds it.
     """
     Util to generate a random DAG with n nodes.
 
@@ -22,17 +30,23 @@ def random_dag(n: int):
 
 
 class Block:
+    # [CLASS DOC] Accumulator for generated source text, kept as a list of string
+    # fragments in the private code attribute. Lines are added with new_line and nested
+    # blocks with new_block.
     """
     Util to generate a block of Python-formatted code.
     """
 
     def __init__(self):
+        # [FUNCTION DOC] Start with an empty list of code fragments.
         self._code = []
 
     def __repr__(self):
+        # [FUNCTION DOC] Return all accumulated fragments concatenated into one string.
         return "".join(self._code)
 
     def new_line(self, line: str):
+        # [FUNCTION DOC] Append the given line followed by a newline character to the block.
         """
         Add a new line of code. The line is automatically suffixed
         with a newline character.
@@ -40,6 +54,11 @@ class Block:
         self._code.append(line + "\n")
 
     def new_block(self, block: "Block"):
+        # [FUNCTION DOC] Append every fragment of another block to this one, each prefixed with
+        # two spaces (indenting the nested code by one level).
+        # KNOWN ISSUE: the docstring says a tab character is used but the code uses two spaces.
+        # Because the prefix is added to each fragment, a fragment holding several lines would
+        # only be indented on its first line; the generators only add single-line fragments.
         """
         Add a new block of code. All lines in the new block are
         automatically prefixed by a tab character.
@@ -48,6 +67,9 @@ class Block:
 
 
 class TestGenerator:
+    # [CLASS DOC] Abstract base for generators of one test program. Subclasses supply test_name
+    # (a base name) and test_body (an iterable of Block objects forming the function body). The
+    # private count attribute counts how many tests were generated so that names stay unique.
     """
     Abstract base class for generating test code.
 
@@ -58,13 +80,20 @@ class TestGenerator:
     """
 
     def __init__(self):
+        # [FUNCTION DOC] Initialize the counter of generated tests to zero.
         self._count = 0
 
     def _generate_test_name(self):
+        # [FUNCTION DOC] HELPER: Increment the counter and return the subclass test name
+        # followed by an underscore and the new counter value.
         self._count += 1
         return f"{self.test_name()}_{self._count}"
 
     def generate_test(self):
+        # [FUNCTION DOC] Produce the source text of one test: a function definition with a
+        # freshly numbered name, whose body is every block yielded by test_body, followed by a
+        # line that calls the function. Returns the text as a string. Increments the counter, so
+        # each call gives a distinct name.
         test_name = self._generate_test_name()
 
         code = Block()
@@ -75,13 +104,20 @@ class TestGenerator:
         return str(code)
 
     def test_name(self):
+        # [FUNCTION DOC] Abstract: subclasses return the base test name.
+        # Raises NotImplementedError here.
         raise NotImplementedError
 
     def test_body(self):
+        # [FUNCTION DOC] Abstract: subclasses return an iterable of Block objects.
+        # Raises NotImplementedError here.
         raise NotImplementedError
 
 
 class NNModuleGenerator:
+    # [CLASS DOC] Abstract base for generators of module class source text. Subclasses implement
+    # gen_init_body and gen_forward_body, each taking the module index and returning a Block;
+    # gen_nn_module combines them into a class definition. Holds no state of its own.
     """
     Abstract base class for generating a nn.Module.
 
@@ -92,13 +128,23 @@ class NNModuleGenerator:
     """
 
     def gen_init_body(self, i: int):
+        # [FUNCTION DOC] Abstract: return a Block with the body of the init method of module
+        # number i. Raises NotImplementedError here.
         raise NotImplementedError
 
     def gen_forward_body(self, i: int):
+        # [FUNCTION DOC] Abstract: return a Block with the body of the forward method of module
+        # number i. Raises NotImplementedError here.
         raise NotImplementedError
 
     def gen_nn_module(self, i: int):
+        # [FUNCTION DOC] Return a Block holding the class definition of a torch module class
+        # named with prefix N and index i, deriving from the torch module base class. Its init
+        # method takes the body from gen_init_body and its forward method (taking x) takes the
+        # body from gen_forward_body.
         def gen_nn_module_body():
+            # [FUNCTION DOC] HELPER: Build the Block with the init and forward method
+            # definitions and their nested bodies for module index i of the enclosing call.
             code = Block()
             code.new_line("def __init__(self):")
             code.new_block(self.gen_init_body(i))
@@ -113,6 +159,10 @@ class NNModuleGenerator:
 
 
 class Unflatten(TestGenerator):
+    # [CLASS DOC] Test generator for unflatten: emits a chain of nested module classes whose
+    # calls form a random DAG, then a main section that exports the top module, unflattens the
+    # exported program and asserts both the exported module and unflattened module match eager
+    # results. State: n, the number of modules.
     """
     Generates test that unflattens a model with several nn.Modules that call
     each other. The modules are generated by calling the nn_module_generator()
@@ -123,17 +173,29 @@ class Unflatten(TestGenerator):
     """
 
     def __init__(self, n: int):
+        # [FUNCTION DOC] Store the number of modules n after running the parent initializer.
         super().__init__()
         self.n = n
 
     def nn_module_generator(self):
+        # [FUNCTION DOC] Return a module generator object for this test. The returned object (an
+        # instance of a locally defined subclass) draws a random DAG of calls between the n
+        # modules; module i owns module i plus one as a child attribute (except the last one)
+        # and its forward calls the descendants chosen by the DAG, then returns x plus one.
         class GenNNModule(NNModuleGenerator):
+            # [CLASS DOC] HELPER: Module generator holding the number of modules n and calls, a
+            # random DAG saying which later modules each module's forward calls.
             def __init__(self, n: int):
+                # [FUNCTION DOC] HELPER: Initialize the base class, remember n and draw the
+                # random call DAG.
                 super().__init__()
                 self.n = n
                 self.calls = random_dag(self.n)
 
             def gen_init_body(self, i: int):
+                # [FUNCTION DOC] HELPER: Return a Block with an init body that calls the
+                # super init and, unless this is the last module, creates the next module as
+                # a child attribute.
                 code = Block()
                 code.new_line("super().__init__()")
                 if i < self.n - 1:
@@ -141,7 +203,14 @@ class Unflatten(TestGenerator):
                 return code
 
             def gen_forward_body(self, i: int):
+                # [FUNCTION DOC] HELPER: Return a Block with a forward body that, for each
+                # descendant j chosen by the call DAG for module i, calls the child at the
+                # dotted path to j on x plus one and assigns the result to x, and finally
+                # returns x plus one.
                 def path(i, j):
+                    # [FUNCTION DOC] HELPER: Return the dotted attribute path from module i to
+                    # descendant j, going through each intermediate child. Recursive; assumes j
+                    # is greater than i.
                     if i + 1 == j:
                         return f"n{j}"
                     else:
@@ -156,10 +225,22 @@ class Unflatten(TestGenerator):
         return GenNNModule(self.n)
 
     def test_name(self):
+        # [FUNCTION DOC] Return the base test name: the class name and n joined
+        # by an underscore.
         return f"{self.__class__.__name__}_{self.n}"
 
     def test_body(self):
+        # [FUNCTION DOC] Generator yielding the pieces of the test body. First yields one Block
+        # per module class, from the last module down to module zero (so children are defined
+        # before parents), then a main Block that runs eager, exports with the module call
+        # signature preserved for each descendant path of module zero, unflattens, and asserts
+        # both outputs are close to eager.
+        # KNOWN ISSUE: the preserved path string built for the export call concatenates quoted
+        # paths, each ending in a comma, inside one pair of parentheses, which gives a single
+        # string rather than a tuple of paths, and an empty tuple when n is one.
         def path(i, j):
+            # [FUNCTION DOC] HELPER: Return the dotted attribute path from module i to
+            # descendant j. Recursive.
             if i + 1 == j:
                 return f"n{j}"
             else:
@@ -172,6 +253,8 @@ class Unflatten(TestGenerator):
         fqns = "".join(f"'{path(0, j)},'" for j in range(1, self.n))
 
         def gen_main():
+            # [FUNCTION DOC] HELPER: Build the Block for the main section: define the input,
+            # compute the eager output, export, unflatten, and assert both results match eager.
             code = Block()
             code.new_line("inp = (torch.ones(1),)")
             code.new_line("eager = N0()(*inp)")
@@ -188,6 +271,9 @@ class Unflatten(TestGenerator):
 
 
 class ConstantUnflatten(Unflatten):
+    # [CLASS DOC] Unflatten test variant where each module also owns a constant tensor
+    # and a second random DAG says which descendants' constants its forward adds to x
+    # before the calls.
     """
     Generates test that unflattens a model with several nn.Modules that call
     each other and access constants. The modules are generated by calling the
@@ -195,14 +281,24 @@ class ConstantUnflatten(Unflatten):
     """
 
     def nn_module_generator(self):
+        # [FUNCTION DOC] Return a module generator object for the constant test. Each module in
+        # it gets a constant tensor attribute; its forward first adds the constants of
+        # access-DAG descendants to x, then calls call-DAG descendants, and returns x plus one.
         class GenNNModule(NNModuleGenerator):
+            # [CLASS DOC] HELPER: Module generator with two random DAGs: accesses (constant
+            # reads) and calls.
             def __init__(self, n):
+                # [FUNCTION DOC] HELPER: Initialize the base class, remember n and draw the
+                # access and call DAGs.
                 super().__init__()
                 self.n = n
                 self.accesses = random_dag(self.n)
                 self.calls = random_dag(self.n)
 
             def gen_init_body(self, i: int):
+                # [FUNCTION DOC] HELPER: Return a Block with an init body: super init, a
+                # constant tensor attribute of ones, and, unless this is the last module, the
+                # next module as a child attribute.
                 code = Block()
                 code.new_line("super().__init__()")
                 code.new_line("self.const = torch.ones(1)")
@@ -211,7 +307,11 @@ class ConstantUnflatten(Unflatten):
                 return code
 
             def gen_forward_body(self, i: int):
+                # [FUNCTION DOC] HELPER: Return a Block with a forward body that adds
+                # descendants' constants to x, calls descendants, and returns x plus one.
                 def path(i, j):
+                    # [FUNCTION DOC] HELPER: Return the dotted attribute path from module i to
+                    # descendant j. Recursive.
                     if i + 1 == j:
                         return f"n{j}"
                     else:
@@ -229,6 +329,9 @@ class ConstantUnflatten(Unflatten):
 
 
 class BufferUnflatten(Unflatten):
+    # [CLASS DOC] Unflatten test variant where each module owns a buffer; random DAGs choose
+    # which descendants' buffers are read, which modules are called, and which buffers are
+    # mutated in place.
     """
     Generates test that unflattens a model with several nn.Modules that call
     each other and access and mutate buffers. The modules are generated by
@@ -236,8 +339,15 @@ class BufferUnflatten(Unflatten):
     """
 
     def nn_module_generator(self):
+        # [FUNCTION DOC] Return a module generator object for the buffer test. Each module gets
+        # a buffer of ones; forward reads descendant buffers into x, calls descendants, mutates
+        # descendant buffers by adding one in place, then returns x plus one.
         class GenNNModule(NNModuleGenerator):
+            # [CLASS DOC] HELPER: Module generator with three random DAGs: accesses,
+            # mutations and calls.
             def __init__(self, n):
+                # [FUNCTION DOC] HELPER: Initialize the base class, remember n and draw the
+                # access, mutation and call DAGs.
                 super().__init__()
                 self.n = n
                 self.accesses = random_dag(self.n)
@@ -245,6 +355,9 @@ class BufferUnflatten(Unflatten):
                 self.calls = random_dag(self.n)
 
             def gen_init_body(self, i: int):
+                # [FUNCTION DOC] HELPER: Return a Block with an init body: super init, a
+                # buffer of ones, and, unless this is the last module, the next module as
+                # a child attribute.
                 code = Block()
                 code.new_line("super().__init__()")
                 code.new_line("self.buf = torch.nn.Buffer(torch.ones(1))")
@@ -253,7 +366,11 @@ class BufferUnflatten(Unflatten):
                 return code
 
             def gen_forward_body(self, i: int):
+                # [FUNCTION DOC] HELPER: Return a Block with a forward body: read buffers, call
+                # descendants, mutate buffers in place, then return x plus one.
                 def path(i, j):
+                    # [FUNCTION DOC] HELPER: Return the dotted attribute path from module i to
+                    # descendant j. Recursive.
                     if i + 1 == j:
                         return f"n{j}"
                     else:

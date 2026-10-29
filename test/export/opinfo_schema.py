@@ -1,4 +1,8 @@
 # Owner(s): ["oncall: export"]
+# [MODULE DOC] Test that runs operator database entries in eager mode under the pre-dispatch
+# level of the schema check mode, to find ops whose schemas claim to be functional but actually
+# alias or mutate. Defines the checking mode and a device generic test class, which is
+# instantiated at import time for float and int dtypes.
 
 import torch
 from torch._dispatch.python import enable_python_dispatcher
@@ -22,6 +26,10 @@ test_classes = {}
 
 
 class PreDispatchSchemaCheckMode(SchemaCheckMode):
+    # [CLASS DOC] Dispatch mode extending the schema check mode, with its dispatch key set
+    # to the pre-dispatch key. It re-raises schema violations only when the op's schema
+    # does not itself admit aliasing or mutation, since such ops may decompose into
+    # functional ones later.
     """
     Dispatch mode built on top of SchemaCheckMode that checks for incorrect op schemas
     for PreDispatch IR. This is meant to run ops in eager mode on concrete inputs, to
@@ -33,11 +41,20 @@ class PreDispatchSchemaCheckMode(SchemaCheckMode):
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Set the dispatch key of this mode to the pre-dispatch key, then run
+        # the parent initializer.
         self._dispatch_key = torch._C.DispatchKey.PreDispatch
         super().__init__()
 
     def _may_alias_or_mutate(self, func, types, args, kwargs):
+        # [FUNCTION DOC] HELPER: Re-run the op to decide whether its schema admits aliasing or
+        # mutation. The arguments are normalized to keyword form and recorded in a schema info
+        # object, the op is executed, and outputs are unwrapped from tensor subclasses. Returns
+        # True if any output may alias any input position or any input is mutable by the schema,
+        # else False. This executes the op a second time.
         def unwrap(e):
+            # [FUNCTION DOC] HELPER: Return the inner element of a tensor subclass instance, or
+            # the object itself if it is not a subclass instance or has no such attribute.
             if isinstance(e, torch.Tensor) and type(e) is not torch.Tensor:
                 try:
                     return e.elem
@@ -72,6 +89,12 @@ class PreDispatchSchemaCheckMode(SchemaCheckMode):
 
     # creating this just so we have access to the offending op
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        # [FUNCTION DOC] Dispatch hook. Delegates to the parent implementation; if that raises
+        # a runtime error and the op schema does not admit aliasing or mutation, the error
+        # message is replaced by one naming the op and explaining it is not functional, and the
+        # error is re-raised.
+        # KNOWN ISSUE: when the error is swallowed because the schema admits aliasing or
+        # mutation, the function returns None instead of an op result.
         try:
             return super().__torch_dispatch__(func, types, args=args, kwargs=kwargs)
         except RuntimeError as e:
@@ -90,8 +113,13 @@ class PreDispatchSchemaCheckMode(SchemaCheckMode):
 
 
 class TestOpInfo(TestCase):
+    # [CLASS DOC] Device generic test case holding the operator database schema check test.
     @ops(op_db, allowed_dtypes=(torch.float, torch.int))
     def test_schema_check_op(self, device, dtype, op):
+        # [FUNCTION DOC] Take the first sample input of the operator for the given device and
+        # dtype (no gradient), and run the operator on it inside the python dispatcher and the
+        # pre-dispatch schema check mode. Passes if no error is raised. Only float and int
+        # dtypes are allowed.
         sample_inputs_itr = op.sample_inputs(device, dtype, requires_grad=False)
         inputs = next(sample_inputs_itr)
         args = [inputs.input] + list(inputs.args)
