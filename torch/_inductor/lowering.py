@@ -1,3 +1,10 @@
+# [MODULE DOC] Core of Inductor lowering: translates ATen/prim FX graph nodes into Inductor IR.
+# Holds the global registries (lowerings, user_lowerings, fallbacks, needs_realized_inputs,
+# foreach_ops, layout-constraint table) and the register_lowering decorator machinery that wraps
+# each lowering with argument broadcasting, type promotion and IR validation. Then defines
+# lowerings for pointwise, reduction, view, indexing, scatter, pooling, collective and other ops.
+# Import-time side effects: populates the registries, registers lowerings and fallbacks, and
+# imports submodules for additional lowerings at the end.
 from __future__ import annotations
 
 import contextlib
@@ -148,6 +155,8 @@ _SAVED_FOR_BACKWARDS_OUTPUT_DESC_TYPES = (
 
 
 def cur_node_has_non_foreach_users() -> bool:
+    # [FUNCTION DOC] HELPER: Return True if the current graph node has any user whose users include a
+    # non-foreach call_function node; False otherwise. Reads V.graph.current_node.
     for node in V.graph.current_node.users:
         for user in node.users:
             if not (user.op == "call_function" and (user.target in foreach_ops)):
@@ -162,6 +171,11 @@ def cur_node_has_non_foreach_users() -> bool:
 def group_foreach_args(
     arg_pairs: Iterable[Any],
 ) -> defaultdict[tuple[Any, bool], list[tuple[int, Any]]]:
+    # [FUNCTION DOC] HELPER: Group foreach arguments by (device, use_foreach flag). arg_pairs is an
+    # iterable whose items are either iterables of args or single values. Returns a mapping from
+    # (device, bool) to a list of (original index, args) tuples. use_foreach is true when inputs are
+    # static or config.combo_kernel_foreach_dynamic_shapes is set. Raises an error if an item has no
+    # TensorBox to take a device from.
     out = defaultdict(list)
     unpack_args = False
     for i, args in enumerate(arg_pairs):
@@ -185,6 +199,8 @@ def group_foreach_args(
 
 
 def maybe_layout_constraints(fn: Callable[..., Any]) -> Callable[..., Any] | None:
+    # [FUNCTION DOC] Return the layout-constraint function for an op, or None. Only OpOverloads have
+    # constraints: a layout tag on the op takes priority, otherwise the explicit registry is consulted.
     """Get layout constraints. Returns None if there are no layout constraints."""
     if not isinstance(fn, torch._ops.OpOverload):
         # Only OpOverloads have layout constraints.
@@ -201,6 +217,8 @@ def maybe_layout_constraints(fn: Callable[..., Any]) -> Callable[..., Any] | Non
 def tag_to_layout_constraint(
     tag: torch._C.Tag,
 ) -> Callable[..., tuple[Any, Any]] | None:
+    # [FUNCTION DOC] HELPER: Map a layout-constraint tag to its constraint function (exact strides,
+    # contiguous strides, fixed stride order) or None for flexible layout. Raises an error for unknown tags.
     if tag == torch._C.Tag.needs_exact_strides:
         return constrain_to_fake_tensors
     if tag == torch._C.Tag.needs_contiguous_strides:  # type: ignore[attr-defined]
@@ -213,11 +231,15 @@ def tag_to_layout_constraint(
 
 
 def assert_nyi(cond: bool, msg: str) -> None:
+    # [FUNCTION DOC] HELPER: Raise NotImplementedError saying inductor does not support msg when cond is false.
     if not cond:
         raise NotImplementedError(f"inductor does not support {msg}")
 
 
 def add_needs_realized_inputs(fn):
+    # [FUNCTION DOC] HELPER: Mark an op (or each op in a list/set/tuple, recursively) as needing realized
+    # inputs by adding it to needs_realized_inputs; for an overload packet all its overloads are added.
+    # Mutates global state. Returns a list only for the collection case, else None.
     if isinstance(fn, (list, set, tuple, OrderedSet)):  # noqa: set_linter
         return [add_needs_realized_inputs(x) for x in fn]
     needs_realized_inputs.add(fn)
@@ -229,6 +251,8 @@ def add_layout_constraint(
     fn: torch._ops.OpOverloadPacket | torch._ops.OpOverload,
     constraint: Callable[..., tuple[Any, Any]],
 ) -> None:
+    # [FUNCTION DOC] HELPER: Register a layout constraint function for an op; for an overload packet
+    # it is registered for every overload. Mutates the layout-constraint registry.
     if isinstance(fn, torch._ops.OpOverloadPacket):
         for overload in fn.op_overloads():
             _maybe_layout_constraints[overload] = constraint
@@ -281,6 +305,8 @@ DTYPE_ID_LOOKUP = {
 
 
 def decode_dtype(dtype: int | torch.dtype) -> torch.dtype:
+    # [FUNCTION DOC] HELPER: Convert an integer dtype id to a torch dtype using DTYPE_ID_LOOKUP; non-int
+    # inputs are returned unchanged. Raises an error if the id is not in the table.
     if not isinstance(dtype, int):
         return dtype
     if dtype not in DTYPE_ID_LOOKUP:
@@ -291,6 +317,8 @@ def decode_dtype(dtype: int | torch.dtype) -> torch.dtype:
 
 
 def is_integer_type(x: Any) -> TypeGuard[TensorBox | IRNode | sympy.Expr | int]:
+    # [FUNCTION DOC] HELPER: True if x is an integer-valued thing: a tensor/IR node of integer or bool
+    # dtype, a sympy expression known to be integer, or a Python int.
     if isinstance(x, (TensorBox, IRNode)):
         return is_integer_dtype(x.get_dtype()) or is_boolean_dtype(x.get_dtype())
     elif isinstance(x, sympy.Expr):
@@ -300,6 +328,7 @@ def is_integer_type(x: Any) -> TypeGuard[TensorBox | IRNode | sympy.Expr | int]:
 
 
 def is_boolean_type(x: Any) -> TypeGuard[TensorBox | IRNode | bool]:
+    # [FUNCTION DOC] HELPER: True if x is a boolean: a tensor/IR node with bool dtype or a Python bool.
     if isinstance(x, (TensorBox, IRNode)):
         return is_boolean_dtype(x.get_dtype())
     else:
@@ -311,7 +340,12 @@ def get_promoted_dtype(
     type_promotion_kind: ELEMENTWISE_TYPE_PROMOTION_KIND,
     return_compute_dtype: bool = False,
 ) -> torch.dtype:
+    # [FUNCTION DOC] HELPER: Compute the dtype that results from elementwise type promotion of args
+    # (IR tensors, numbers or sympy values) under type_promotion_kind. Returns the compute dtype if
+    # return_compute_dtype is set, else the result dtype.
     def construct_input(inp: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Turn an arg into something usable for type promotion: numbers and sympy
+        # values pass through, IR tensors become a placeholder tensor of the same rank and dtype.
         if isinstance(inp, (Number, sympy.Basic)):
             return inp
         else:
@@ -327,6 +361,8 @@ def get_promoted_dtype(
 
 
 def get_overloads(aten_fn):
+    # [FUNCTION DOC] HELPER: Normalize aten_fn to a list and append every overload of any overload
+    # packet in it that does not already have a lowering. Returns the list.
     if not isinstance(aten_fn, (list, tuple)):
         aten_fn = [aten_fn]
     else:
@@ -344,6 +380,7 @@ def get_overloads(aten_fn):
 def in_namespace(
     op: Any | torch._ops.OpOverloadPacket | torch._ops.OpOverload, namespace: str
 ) -> bool:
+    # [FUNCTION DOC] HELPER: True if op is an overload packet or overload whose qualified name contains namespace.
     if isinstance(op, torch._ops.OpOverloadPacket):
         return namespace in op._qualified_op_name
     elif isinstance(op, torch._ops.OpOverload):
@@ -352,6 +389,8 @@ def in_namespace(
 
 
 def maybe_copy_cpu_scalar(x: TensorBox, device: torch.device) -> TensorBox:
+    # [FUNCTION DOC] Copy a single-element CPU scalar tensor (a reinterpret view with concrete size 0 or
+    # one element) to the target device when its device differs; otherwise return x unchanged.
     """
     Copy cpu scalar if doesn't not match with given `device`
     """
@@ -378,6 +417,11 @@ def transform_args(
     type_promotion_kind: ELEMENTWISE_TYPE_PROMOTION_KIND | None,
     convert_input_to_bool: bool,
 ) -> tuple[list[Any], dict[str, Any]]:
+    # [FUNCTION DOC] Prepare args and kwargs for a lowering. Only TensorBox values are transformed.
+    # When type promotion or bool conversion is requested, computes the promoted (or bool) dtype,
+    # moves CPU scalars to the common device, and converts tensors/constants to that dtype. When
+    # broadcast is set, broadcasts all tensors to a common shape and expands constants to it.
+    # Returns the new (args, kwargs); returns inputs unchanged if there are no tensors.
     """
     Transforms arguments for broadcasting and type promotion
     """
@@ -417,6 +461,7 @@ def transform_args(
 
         # sometimes args are an immutable list so we can't mutate them
         def promote(arg: Any) -> Any:
+            # [FUNCTION DOC] HELPER: Cast a TensorBox to the promoted dtype, rebuild a Constant with that dtype and device, pass other values through.
             if isinstance(arg, TensorBox):
                 return to_dtype(arg, dtype)
             elif isinstance(arg, ir.Constant):
@@ -456,6 +501,9 @@ def transform_args(
 def _register_foreach_lowering(
     aten_fn: torch._ops.OpOverload, decomp_fn: Callable[..., Any]
 ) -> Callable[..., Any]:
+    # [FUNCTION DOC] HELPER: Register decomp_fn as the lowering for a foreach aten op (all overloads):
+    # wraps it to validate the produced IR, records the overloads in foreach_ops and lowerings.
+    # Returns the wrapped function.
     """
     Add a foreach lowering to lowerings dict.
 
@@ -469,6 +517,7 @@ def _register_foreach_lowering(
 
     @functools.wraps(decomp_fn)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Call the foreach lowering and validate the IR it returns.
         out = decomp_fn(*args, **kwargs)
         validate_ir(out)
         return out
@@ -487,6 +536,10 @@ def _register_lowering(
     convert_input_to_bool: bool,
     lowering_dict: dict[Callable[..., Any] | str, Callable[..., Any]],
 ):
+    # [FUNCTION DOC] HELPER: Register decomp_fn as lowering for aten_fn (all overloads) in lowering_dict.
+    # The wrapper unpacks a single list/tuple argument, rejects out= kwargs unless all ops are
+    # fallbacks or c10d functional ops, applies transform_args (broadcast, type promotion, bool
+    # conversion), calls decomp_fn, validates the IR, and returns it. Returns the wrapper.
     """
     Add a lowering to lowerings dict
 
@@ -500,6 +553,8 @@ def _register_lowering(
 
     @functools.wraps(decomp_fn)
     def wrapped(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Wrapper that normalizes arguments via transform_args, calls the lowering, and validates the output IR.
+        # Raises an error if out= is passed for non-fallback ops.
         args: list[Any] = list(args)
         kwargs: dict[str, Any] = dict(kwargs)
         unpacked = False
@@ -541,6 +596,8 @@ def register_lowering(
     convert_input_to_bool=False,
     lowering_dict=lowerings,
 ) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
+    # [FUNCTION DOC] Decorator factory: returns a partial of _register_lowering configured with the given
+    # op(s), broadcast, type promotion kind (default DEFAULT), bool conversion and target dict.
     """
     Shim to support decorator syntax.
     """
@@ -555,6 +612,9 @@ def register_lowering(
 
 
 def broadcast_symbolic_shapes(a, b):
+    # [FUNCTION DOC] Broadcast two symbolic shapes. Aligns from the right, treating size-one dims as
+    # broadcastable, otherwise requires equal sizes via sizevars (may add guards) and prefers the
+    # simpler expression. Returns the broadcast shape as a tuple.
     """
     Broadcasting logic based on symbolic shapes.
 
@@ -587,6 +647,11 @@ def promote_constants(
     round_scalar_constants: bool = False,
     round_scalars_to_tensor_dtype: bool = False,
 ) -> Sequence[_T | BaseView | BaseConstant]:
+    # [FUNCTION DOC] Convert raw Python scalars and sympy expressions in inputs into IR constants.
+    # If no input is a scalar/sympy value, inputs are returned unchanged. If all are scalars, each becomes a
+    # Constant/IndexingConstant of the overridden or promoted dtype. Otherwise scalars become constants
+    # of the first tensor's dtype expanded to its size, optionally rounded to fp16/bf16 to mimic eager.
+    # Raises an error if both override_return_dtype and type_promotion_kind are given.
     """Convert raw Python scalars and sympy expressions in inputs to IR constants.
 
     When a tensor input is present, scalars become Constants of the tensor's
@@ -616,6 +681,7 @@ def promote_constants(
         )
 
         def const_func(x):
+            # [FUNCTION DOC] HELPER: Wrap a scalar as a Constant (or an IndexingConstant for sympy expressions) with the promoted dtype on the default device.
             if isinstance(x, sympy.Basic):
                 return ir.IndexingConstant(
                     index=x, dtype=dtype, device=decode_device(None)
@@ -672,6 +738,8 @@ def promote_constants(
 
 
 def _add_with_alpha_fma(a, b, alpha):
+    # [FUNCTION DOC] HELPER: Build a Pointwise node computing a + alpha * b with a fused multiply-add
+    # (fma(b, alpha, a)) in the promoted dtype, to match eager CUDA rounding. alpha may be a number or sympy expression.
     """Compute a + alpha * b using FMA for CUDA floating-point precision."""
     dtype = get_promoted_dtype(
         a,
@@ -682,6 +750,7 @@ def _add_with_alpha_fma(a, b, alpha):
     b_loader = b.make_loader()
 
     def inner_fn(idx):
+        # [FUNCTION DOC] HELPER: Load a and b at idx and return fma of b, the alpha constant and a.
         a_val = a_loader(idx)
         b_val = b_loader(idx)
         if isinstance(alpha, sympy.Basic):
@@ -699,6 +768,8 @@ def _add_with_alpha_fma(a, b, alpha):
 
 
 def _has_saved_lowp_output_use(node: torch.fx.Node | None) -> bool:
+    # [FUNCTION DOC] HELPER: True if the fx node has a non-output user and is also an output that
+    # the AOT descriptors mark as saved-for-backward; False for None or otherwise.
     if node is None:
         return False
 
@@ -739,10 +810,18 @@ def make_pointwise(
     triton_fallback: Callable[..., _T] | None = None,
     round_scalars_to_tensor_dtype: bool = False,
 ) -> Callable[..., TensorBox | _T]:
+    # [FUNCTION DOC] Wrap an elementwise ops function fn into a lowering that builds a Pointwise IR node
+    # (define-by-run). Options: fixed output dtype/device, alternative fn for bool outputs, alpha support
+    # (optionally via FMA on CUDA floats), a triton fallback used for triton-backed inputs, and rounding of
+    # scalars to tensor dtype. Returns the callable taking IR inputs.
     """Wraps a pointwise fn and returns a function representing the pointwise in
     the define-by-run IR."""
 
     def inner(*inputs: Any, alpha=None) -> TensorBox | _T:  # noqa: docstring_linter
+        # [FUNCTION DOC] HELPER: Lowering body: dispatch to triton_fallback if applicable, promote scalar constants,
+        # apply alpha by multiplying the last input (or FMA path), then create a Pointwise node over the first
+        # input's size. Optionally emulates fp16/bf16 rounding casts for precision-emulation configs. Picks the
+        # GPU device among inputs if any. Raises an error on alpha misuse or ndim mismatch.
         if triton_fallback is not None and any(
             isinstance(inp, IRNode) and is_triton(inp) for inp in inputs
         ):
@@ -810,6 +889,8 @@ def make_pointwise(
         ) and dtype in low_pr_fp
 
         def inner_fn(index):
+            # [FUNCTION DOC] HELPER: Pointwise inner function: load each input at index, apply fn (or the bool override), and optionally
+            # round through low precision dtypes. Raises an error if the index rank differs from ranges.
             if len(index) != len(ranges):
                 raise AssertionError(f"wrong ndim {index} {ranges}")
             if dtype == torch.bool and override_fn_when_input_bool is not None:
@@ -863,7 +944,13 @@ def make_foreach_pointwise(
     allow_alpha: bool = False,
     scalar_kwarg: str = "alpha",
 ) -> Callable[..., list[foreach_node_t]]:
+    # [FUNCTION DOC] HELPER: Lift a pointwise lowering pw_fn to foreach ops over lists of tensors. Returns a callable
+    # that accepts list or scalar inputs, broadcasts scalars to list length, groups entries by device, applies pw_fn
+    # per element and returns a list of outputs. scalar_kwarg names the keyword receiving alpha/value.
     def inner(*inputs: list[list[TensorBox]], alpha=1, value=1) -> list[foreach_node_t]:
+        # [FUNCTION DOC] HELPER: Foreach wrapper body. Extracts the scalar (alpha, or value which may be a trailing positional),
+        # decides whether outputs must be realized (no users, inplace foreach, or non-foreach users), then runs the grouped loop.
+        # Raises an error if no input is a list.
         # For ops like addcmul/addcdiv, the scalar `value` arrives as a
         # positional arg (not keyword) due to the ATen schema. Extract it
         # from the end of inputs if present.
@@ -907,6 +994,7 @@ def make_foreach_pointwise(
         groups = group_foreach_args(zip(*broadcast_inputs))
 
         def apply_fn(args) -> foreach_node_t:
+            # [FUNCTION DOC] HELPER: Apply pw_fn to one element's args, passing the scalar keyword when alpha is allowed.
             if allow_alpha:
                 return pw_fn(*args, **{scalar_kwarg: scalar_val})
             else:
@@ -923,6 +1011,9 @@ def foreach_group_loop(
     apply_fn: Callable[..., foreach_node_t],
     realize_outputs: bool,
 ) -> list[foreach_node_t]:
+    # [FUNCTION DOC] HELPER: Apply apply_fn to every grouped element, storing results by original index. When the
+    # backend supports foreach, grouping uses foreach and realize_outputs is set, outputs are realized and
+    # registered as a horizontally fusable operation list. Returns the list of outputs; raises an error if any is missing.
     """
     Common loop over grouped foreach arguments.
 
@@ -959,11 +1050,14 @@ def foreach_group_loop(
 def to_dtype(
     x: TensorBox, dtype: torch.dtype, copy: bool = False, use_compute_types: bool = True
 ):
+    # [FUNCTION DOC] Convert x to dtype via a pointwise node. If dtypes match returns x (or a clone when copy is set).
+    # use_compute_types controls whether intermediate compute-type promotion is used; for fp16/bf16 without it the result is upcast back to compute type.
     src_dtype = x.get_dtype()
     if src_dtype == dtype:
         return clone(x) if copy else x
 
     def _to_dtype(x):
+        # [FUNCTION DOC] HELPER: Pointwise body doing the dtype conversion, with a compute-type upcast after a raw low-precision cast.
         result = ops.to_dtype(
             x,
             dtype,
@@ -990,9 +1084,11 @@ _FLOAT8_E8M0FNU_TO_FLOAT_DTYPES = (
 
 
 def _float8_e8m0fnu_to_dtype(x: TensorBox, dtype: torch.dtype) -> TensorBox:
+    # [FUNCTION DOC] HELPER: Convert a float8_e8m0fnu tensor to a float dtype by bitcasting to uint8 and building float32 bits from the exponent.
     x_u8 = to_dtype_bitcast(x, torch.uint8)
 
     def _to_float(value):
+        # [FUNCTION DOC] HELPER: Map E8M0 byte to float32 bits (shift into exponent; 0 maps to 2^-127, 255 to NaN) and cast to the target dtype.
         # E8M0's exponent bits map directly to FP32; only encodings 0 and 255
         # need special handling for 2^-127 and NaN, respectively.
         value_i32 = ops.to_dtype(value, torch.int32)
@@ -1017,6 +1113,9 @@ def _float8_e8m0fnu_to_dtype(x: TensorBox, dtype: torch.dtype) -> TensorBox:
 
 @register_lowering(torch._higher_order_ops._foreach_map, type_promotion_kind=None)
 def _foreach_map(subgraph, *args, **kwargs):
+    # [FUNCTION DOC] Lowering for the foreach_map higher-order op. Runs the user subgraph through PointwiseSubgraphLowering to
+    # inline it into the main graph, groups the resulting outputs by device, realizes them and registers them as a
+    # horizontally fusable operation list when foreach is supported. Returns the list of outputs.
     """
     This lowers an invocation of foreach_map
     The way this works is that an arbitrary N-arg func is provided by the user, looped over by the
@@ -1064,6 +1163,9 @@ def _foreach_map(subgraph, *args, **kwargs):
 
 @register_lowering(prims.convert_element_type, type_promotion_kind=None)
 def _convert_element_type(x: TensorBox, dtype: torch.dtype):
+    # [FUNCTION DOC] Lowering for prims.convert_element_type. Complex conversions use an in-place copy into an empty tensor
+    # (or a fallback kernel for empty tensors); float8_e8m0fnu to float uses a special path; otherwise delegates to to_dtype
+    # with a copy, honoring the precision-emulation config for fp16/bf16.
     if dtype.is_complex or x.get_dtype().is_complex:
         if x.get_size():
             # Decompose since aa aten fallback is more friendly for c++ codegen.
@@ -1090,11 +1192,14 @@ def _convert_element_type(x: TensorBox, dtype: torch.dtype):
 
 
 def to_dtype_bitcast(x: TensorBox, dtype: torch.dtype, *, copy=False):
+    # [FUNCTION DOC] Reinterpret x's bits as dtype. Same dtype returns x (or a clone). Equal bit widths give a DtypeView;
+    # different widths fall back to the eager view.dtype kernel on a contiguous input.
     x_dtype = x.get_dtype()
     if x_dtype == dtype:
         return clone(x) if copy else x
 
     def _get_primitive_bitwidth(dtype):
+        # [FUNCTION DOC] HELPER: Return the bit width of a dtype (bool counts as 8).
         if dtype.is_floating_point:
             return torch.finfo(dtype).bits
         elif dtype == torch.bool:
@@ -1115,6 +1220,7 @@ def to_dtype_bitcast(x: TensorBox, dtype: torch.dtype, *, copy=False):
 
 @register_lowering(aten.view.dtype, type_promotion_kind=None)
 def _view_dtype(x: TensorBox, dtype: torch.dtype):
+    # [FUNCTION DOC] Lowering for aten.view.dtype: complex dtypes use a ComplexView; others delegate to to_dtype_bitcast.
     if dtype.is_complex or x.get_dtype().is_complex:
         return TensorBox.create(
             ir.ComplexView.create(torch.ops.aten.view.dtype, x, dtype)
@@ -1123,6 +1229,7 @@ def _view_dtype(x: TensorBox, dtype: torch.dtype):
 
 
 def to_device(x: TensorBox, device: torch.device, *, copy=False, non_blocking=False):
+    # [FUNCTION DOC] Move x to device. Returns x (or a clone if copy) when already there; otherwise creates a DeviceCopy node.
     device = decode_device(device)
     if x.get_device() == device:
         return clone(x) if copy else x
@@ -1131,6 +1238,7 @@ def to_device(x: TensorBox, device: torch.device, *, copy=False, non_blocking=Fa
 
 @register_lowering(prims.device_put, type_promotion_kind=None)
 def _device_put(x: TensorBox, device: torch.device, non_blocking=False):
+    # [FUNCTION DOC] Lowering for prims.device_put; always copies via to_device.
     return to_device(x, device, copy=True, non_blocking=non_blocking)
 
 
@@ -1147,6 +1255,9 @@ def register_pointwise(
     triton_fallback=None,
     round_scalars_to_tensor_dtype=False,
 ):
+    # [FUNCTION DOC] Register a pointwise lowering for aten_fn that maps to the backend op named name (default the function name).
+    # Registers dtype propagation rules, builds the lowering with make_pointwise, registers it for the aten op and, if a prim of the
+    # same name exists, for that too. Returns the lowering function.
     """A pointwise function that maps ops.{name} to inputs"""
     name = name or aten_fn.__name__
     fn = ops_wrapper(name)
@@ -1192,6 +1303,8 @@ register_op_dtype_propagation_rules(
 
 @register_lowering(aten.ldexp, broadcast=True, type_promotion_kind=None)
 def ldexp_lowering(x: TensorBox, n: TensorBox):
+    # [FUNCTION DOC] Lowering for aten.ldexp. Uses native ldexp when x is floating and n is an integer; otherwise computes
+    # x * 2**n in float32 (integer x) or x's dtype using pow.
     ldexp_fn = ops_wrapper("ldexp")
 
     x_dtype = x.get_dtype()
@@ -1203,6 +1316,7 @@ def ldexp_lowering(x: TensorBox, n: TensorBox):
     if x_is_float and n_is_int:
         # Use native ldexp
         def compute_ldexp(x, n):
+            # [FUNCTION DOC] HELPER: Pointwise body calling the native ldexp op.
             return ldexp_fn(x, n)
 
         return make_pointwise(compute_ldexp)(x, n)
@@ -1211,6 +1325,7 @@ def ldexp_lowering(x: TensorBox, n: TensorBox):
         out_dtype = torch.float32 if is_integer_type(x) else x_dtype
 
         def compute_fallback(x, n):
+            # [FUNCTION DOC] HELPER: Pointwise body computing x times 2 raised to n, with n converted to the output dtype.
             n_out_type = ops.to_dtype(n, out_dtype)
             two = ops.constant(2.0, out_dtype)
             pow_result = ops.pow(two, n_out_type)
@@ -1223,14 +1338,19 @@ def ldexp_lowering(x: TensorBox, n: TensorBox):
 
 
 def register_frexp():
+    # [FUNCTION DOC] HELPER: Register the lowering for aten.frexp (and the prim of the same name if present). Builds two
+    # pointwise functions, one for the mantissa and one for the int32 exponent, and a combined lowering returning both.
+    # Returns the combined lowering. Called once at import.
     """A pointwise function that maps ops.frexp to inputs"""
     name = "frexp"
     frexp = ops_wrapper("frexp")
 
     def frexp0(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Pointwise body returning the mantissa (first result) of the frexp op.
         return frexp(*args, **kwargs)[0]  # type: ignore[index]
 
     def frexp1(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Pointwise body returning the exponent (second result) of the frexp op.
         return frexp(*args, **kwargs)[1]  # type: ignore[index]
 
     pw_fns = [
@@ -1239,6 +1359,7 @@ def register_frexp():
     ]
 
     def fn(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Return the (mantissa, exponent) pair of IR tensors for the given inputs.
         return pw_fns[0](*args, **kwargs), pw_fns[1](*args, **kwargs)
 
     fn = register_lowering(
@@ -1262,6 +1383,8 @@ def register_foreach_pointwise(
     allow_alpha=False,
     scalar_kwarg="alpha",
 ):
+    # [FUNCTION DOC] HELPER: Register a foreach lowering for aten_fn built from a per-tensor pointwise lowering,
+    # with optional alpha/value scalar kwarg handling. Returns the registered lowering.
     fn = make_foreach_pointwise(
         pointwise_lowering_fn, allow_alpha=allow_alpha, scalar_kwarg=scalar_kwarg
     )
@@ -1271,7 +1394,10 @@ def register_foreach_pointwise(
 
 @register_lowering(aten.where, broadcast=False, type_promotion_kind=None)
 def where(cond, a, b):
+    # [FUNCTION DOC] Lowering for aten.where. Converts python scalar branches to constants like the other branch, promotes the
+    # two value branches to a common dtype, broadcasts tensors, expands constants, and builds a pointwise select node.
     def fn(*args):
+        # [FUNCTION DOC] HELPER: Pointwise body calling the where op.
         return ops.where(*args)
 
     if isinstance(a, (float, int)):
@@ -1296,6 +1422,8 @@ def where(cond, a, b):
 
 @register_lowering(aten.broadcast_tensors, broadcast=False, type_promotion_kind=None)
 def broadcast_tensors(*inputs):
+    # [FUNCTION DOC] Lowering for aten.broadcast_tensors. Computes the common symbolic broadcast shape and expands each input
+    # whose shape differs. A single list/tuple argument is unpacked. Returns the inputs unchanged for a single tensor, else a list.
     if len(inputs) == 1:
         if isinstance(inputs[0], (list, tuple)):
             return broadcast_tensors(*inputs[0])
@@ -1320,6 +1448,7 @@ def broadcast_tensors(*inputs):
 
 @register_lowering([aten.alias, aten.detach, aten.detach_, aten.lift, prims.view_of])
 def nop(x):
+    # [FUNCTION DOC] No-op lowering (alias, detach, lift, view_of): returns x; autograd handles semantics.
     return x  # AOT autograd handles this for us
 
 
@@ -1329,6 +1458,8 @@ if hasattr(aten, "lift_fresh"):
 
 @register_lowering(aten.squeeze, type_promotion_kind=None)
 def squeeze(x, dim=None):
+    # [FUNCTION DOC] Lowering for aten.squeeze. With no dim, squeezes all size-one dims through a SqueezeView. With dims (int or
+    # sequence), guards them to ints, canonicalizes, and removes those that are known to be size one via a view. Returns x if nothing changes.
     if not (isinstance(x, TensorBox)):
         raise AssertionError("expected: isinstance(x, TensorBox)")
     if dim is None:
@@ -1353,11 +1484,13 @@ def squeeze(x, dim=None):
 
 @register_lowering(aten.squeeze_copy, type_promotion_kind=None)
 def squeeze_copy(x, dim=None):
+    # [FUNCTION DOC] Lowering for aten.squeeze_copy: squeeze then clone.
     return clone(squeeze(x, dim))
 
 
 @register_lowering([aten.squeeze_])
 def squeeze_(x, dim=None):
+    # [FUNCTION DOC] Lowering for in-place squeeze_: squeezes and rebinds x's underlying data to the result, mutating the TensorBox. Returns x.
     val = squeeze(x, dim)
     if not (isinstance(x, TensorBox)):
         raise AssertionError("expected: isinstance(x, TensorBox)")
@@ -1369,6 +1502,7 @@ def squeeze_(x, dim=None):
 
 @register_lowering(aten.isinf)
 def isinf(x):
+    # [FUNCTION DOC] Lowering for aten.isinf: all-False bool tensor for integer inputs, else a pointwise isinf producing bool.
     if is_integer_type(x):
         return full_like(x, False, dtype=torch.bool)
     fn = ops_wrapper("isinf")
@@ -1377,6 +1511,7 @@ def isinf(x):
 
 @register_lowering(aten.isnan)
 def isnan(x):
+    # [FUNCTION DOC] Lowering for aten.isnan: all-False bool tensor for integer inputs, else a pointwise isnan producing bool.
     if is_integer_type(x):
         return full_like(x, False, dtype=torch.bool)
     fn = ops_wrapper("isnan")
@@ -1385,6 +1520,7 @@ def isnan(x):
 
 @register_lowering(aten.ceil)
 def ceil(x):
+    # [FUNCTION DOC] Lowering for aten.ceil: clone for integer inputs, otherwise pointwise ceil.
     if is_integer_type(x):
         return clone(x)
     fn = ops_wrapper("ceil")
@@ -1393,6 +1529,7 @@ def ceil(x):
 
 @register_lowering(aten.floor)
 def floor(x):
+    # [FUNCTION DOC] Lowering for aten.floor: clone for integer inputs, otherwise pointwise floor.
     if is_integer_type(x):
         return clone(x)
     fn = ops_wrapper("floor")
@@ -1401,6 +1538,7 @@ def floor(x):
 
 @register_lowering(aten.round.default)
 def round(x):
+    # [FUNCTION DOC] Lowering for aten.round: clone for integer inputs, otherwise pointwise round.
     if is_integer_type(x):
         return clone(x)
     else:
@@ -1410,6 +1548,7 @@ def round(x):
 
 @register_lowering(aten.trunc)
 def trunc(x):
+    # [FUNCTION DOC] Lowering for aten.trunc: clone for integer inputs, otherwise pointwise trunc.
     if is_integer_type(x):
         return clone(x)
     fn = ops_wrapper("trunc")
@@ -1418,6 +1557,9 @@ def trunc(x):
 
 @register_lowering(aten.expand, type_promotion_kind=None)
 def expand(x, sizes, *, implicit=False):
+    # [FUNCTION DOC] Lowering for aten.expand. The implicit flag is ignored. Constants become an ExpandView directly; tensors
+    # must be TensorBox with list/tuple sizes (else an error is raised). Returns x if sizes are equal. For static sizes it marks
+    # reuse on the input (graph-level reuse in deterministic modes) so the expanded input may be realized, then returns an ExpandView.
     # `implicit` is autograd-internal metadata (see aten::expand schema); it
     # does not affect the produced tensor, so the lowering ignores it. Without
     # this kwarg the lowering rejects graphs produced by dynamo autograd where
@@ -1457,6 +1599,7 @@ def expand(x, sizes, *, implicit=False):
 
 @register_lowering(prims.broadcast_in_dim, type_promotion_kind=None)
 def broadcast_in_dim(a, shape, broadcast_dimensions):
+    # [FUNCTION DOC] Lowering for prims.broadcast_in_dim: unsqueezes a at every dim not listed in broadcast_dimensions and expands to shape.
     s = list(shape)
     for broadcast_dimension in broadcast_dimensions:
         s[broadcast_dimension] = -1
@@ -1471,11 +1614,15 @@ def broadcast_in_dim(a, shape, broadcast_dimensions):
 
 @register_lowering(aten.expand_as, type_promotion_kind=None)
 def expand_as(x, y):
+    # [FUNCTION DOC] Lowering for aten.expand_as: expand x to the size of y.
     return expand(x, y.get_size())
 
 
 @register_lowering(aten.repeat)
 def repeat(x, repeats):
+    # [FUNCTION DOC] Lowering for aten.repeat. Left-pads dims with one if repeats is longer. A zero repeat yields an empty tensor;
+    # repeats only over size-one dims reduce to a cloned expand; otherwise builds a Pointwise that indexes the input with modular
+    # indexing per repeated dim and marks the input reuse. Raises an error on rank mismatch.
     old_size = list(x.get_size())
     if len(repeats) > len(old_size):
         old_size = [sympy.S.One] * (len(repeats) - len(old_size)) + old_size
@@ -1499,6 +1646,7 @@ def repeat(x, repeats):
     x_loader: Callable[[Any], Any]
 
     def inner_fn(index):
+        # [FUNCTION DOC] HELPER: Map an output index to the input index (modulo old size, or zero for size-one dims) and load it.
         if len(index) != len(repeats):
             raise AssertionError("expected: len(index) == len(repeats)")
         index = list(index)
@@ -1536,6 +1684,7 @@ def repeat(x, repeats):
 @register_lowering(aten.view, type_promotion_kind=None)
 @register_lowering(aten.reshape, type_promotion_kind=None)
 def view(x: ir.IRNode, sizes: Sequence[sympy.Expr]) -> TensorBox:
+    # [FUNCTION DOC] Lowering for aten.view/reshape/_unsafe_view: wraps the node (or raw IR node) in a View with the given sizes and returns a TensorBox.
     # post-mm_args operands are raw ReinterpretView/StorageBox nodes, and taking
     # .data on those would drop the view itself
     data = x.data if isinstance(x, TensorBox) else x
@@ -1544,6 +1693,7 @@ def view(x: ir.IRNode, sizes: Sequence[sympy.Expr]) -> TensorBox:
 
 @register_lowering(aten.permute, type_promotion_kind=None)
 def permute(x, dims):
+    # [FUNCTION DOC] Lowering for aten.permute: returns a PermuteView of x with dims. Raises an error if x is not a TensorBox or dims not a list/tuple.
     if not (isinstance(x, TensorBox)):
         raise AssertionError("expected: isinstance(x, TensorBox)")
     if not (isinstance(dims, (list, tuple))):
@@ -1554,6 +1704,9 @@ def permute(x, dims):
 # Note: logic in this function need to be always synchronized with
 # slice_forward in fake implementation.
 def _register_unbacked_slice_size_bindings(dim, start, end, step, size):
+    # [FUNCTION DOC] HELPER: For a slice on dim, look through the current FX node's unbacked symbol bindings to find
+    # the symbol for the output size and for the storage offset. If the size symbol exists, registers a DynamicSliceSize buffer and
+    # operation for it. Returns (sym_size, sym_storage), each possibly None. Must stay in sync with the fake slice implementation.
     """Register DynamicSliceSize for any unbacked size bindings on the current FX node.
 
     Unbacked symbols may have been allocated at trace time of the slice
@@ -1596,6 +1749,8 @@ def _register_unbacked_slice_size_bindings(dim, start, end, step, size):
 
 
 def _compute_slice_index(index, size, default=None):
+    # [FUNCTION DOC] HELPER: Resolve a slice start/end index against size with python semantics (negative wrap, clamp to [0, size]).
+    # Returns default if index is None, an expression when the position can be proven, or a Min/Max expression for partial knowledge; None if undeterminable.
     if index is None:
         return default
 
@@ -1620,6 +1775,7 @@ def _compute_slice_index(index, size, default=None):
 
 
 def _clamp_slice_end_to_start(end, start):
+    # [FUNCTION DOC] HELPER: Return end clamped to be at least start, using static knowledge when available or a Max expression.
     if V.graph.sizevars.statically_known_geq(end, start):
         return end
     if V.graph.sizevars.statically_known_leq(end, start):
@@ -1629,6 +1785,9 @@ def _clamp_slice_end_to_start(end, start):
 
 @register_lowering(aten.slice, type_promotion_kind=None)
 def slice_(x, dim=0, start=0, end=sys.maxsize, step=1, clamp=True):
+    # [FUNCTION DOC] Lowering for aten.slice. Returns x for a statically known no-op slice. Resolves start/end indices; when both are
+    # known creates a SliceView (registering unbacked size bindings). When start or end is unbacked, creates extern buffers for the
+    # size/storage offset symbols and builds an as_strided view instead. Raises an error on inconsistent unbacked bindings.
     """
     Lowers a slice call, creating ExternKernels for the output size & storage offset symbols,
     if the indices are unbacked and appropriate semantics aren't known.
@@ -1757,6 +1916,9 @@ def as_strided(
     *,
     storage_offset_relative_to_input_storage=True,
 ):
+    # [FUNCTION DOC] Lowering for aten.as_strided. Realizes the input (unwrapping any view while keeping its dtype/device), then returns a
+    # ReinterpretView over the storage with a FixedLayout of the requested size, stride and offset. Explicit offsets are made relative to a graph
+    # input's own storage offset. Raises NotImplementedError if the input cannot be realized to storage and layout.
     explicit_storage_offset = (
         storage_offset is not None and storage_offset_relative_to_input_storage
     )
@@ -1802,6 +1964,7 @@ def as_strided(
 
 @register_lowering(aten.as_strided_, type_promotion_kind=None)
 def as_strided_(x, size, stride, storage_offset=None):
+    # [FUNCTION DOC] Lowering for in-place as_strided_: rebinds x's data to the strided view and returns x.
     if not (isinstance(x, TensorBox)):
         raise AssertionError("expected: isinstance(x, TensorBox)")
     x.data = as_strided(x, size, stride, storage_offset).data
@@ -1810,11 +1973,15 @@ def as_strided_(x, size, stride, storage_offset=None):
 
 @register_lowering(aten.as_strided_copy, type_promotion_kind=None)
 def as_strided_copy(x, size, stride, storage_offset=None):
+    # [FUNCTION DOC] Lowering for aten.as_strided_copy: as_strided then clone.
     result = as_strided(x, size, stride, storage_offset)
     return clone(result)
 
 
 def pointwise_cat(inputs, dim=0):
+    # [FUNCTION DOC] Concatenate inputs along dim as a single Pointwise node. For every output index, each input is loaded under a mask
+    # on the dim coordinate (shifted by the input's start offset) and the results are chained with select ops. Returns a Pointwise with
+    # size equal to the first input's with the dim extent set to the sum; device and dtype come from the first input.
     # (inclusive, exclusive)
     inputs_ranges: list[tuple[sympy.Expr, sympy.Expr]] = []
     prev_end = 0
@@ -1825,6 +1992,7 @@ def pointwise_cat(inputs, dim=0):
     inputs_loaders = [inp.make_loader() for inp in inputs]
 
     def inner_fn(idx):
+        # [FUNCTION DOC] HELPER: For one output index, build a masked load per input and combine them with nested where ops chosen by range of the dim coordinate.
         idx_dim = ops.index_expr(idx[dim], torch.int64)
 
         masks = []
@@ -1893,6 +2061,8 @@ def quantized_decomposed_quantize_per_channel(
     quant_max: int,
     dtype: torch.dtype,
 ) -> TensorBox:
+    # [FUNCTION DOC] Lowering for quantized_decomposed.quantize_per_channel. Requires 1-D scales and zero_points, float32 input (bf16 is upcast)
+    # and a valid axis, else raises an error. Output is a Pointwise computing round(input / scale) + zero_point, clamped to [quant_min, quant_max], cast to dtype.
     if len(scales.get_size()) != 1:
         raise AssertionError("expect scales 1 dim")
     if len(zero_points.get_size()) != 1:
@@ -1912,6 +2082,7 @@ def quantized_decomposed_quantize_per_channel(
     zero_points_loader = zero_points.make_loader()
 
     def inner_fn(idx):
+        # [FUNCTION DOC] HELPER: Quantize one element using the per-channel scale and zero point selected by the axis coordinate.
         channel_idx = (idx[axis],)
 
         input = input_loader(idx)
@@ -1937,10 +2108,13 @@ def quantized_decomposed_quantize_per_channel(
 
 
 def _assert_async(cond, msg):
+    # [FUNCTION DOC] HELPER: Lower an async device assertion. Realizes cond, casts it to bool and creates a realized Pointwise whose body emits
+    # a device assert with msg (forcing realization). Returns the realized assertion op.
     cond.realize()
     cond = to_dtype(cond, torch.bool)
 
     def inner_fn(index):
+        # [FUNCTION DOC] HELPER: Emit the device_assert_async op on the condition value at index.
         with ir.ComputedBuffer.force_realize():
             return ops.device_assert_async(cond.make_loader()(index), msg)
 
@@ -1956,11 +2130,13 @@ def _assert_async(cond, msg):
 
 @register_lowering(aten._assert_async.msg)
 def lower_assert_async(cond, msg):
+    # [FUNCTION DOC] Lowering for aten._assert_async.msg: delegates to _assert_async.
     return _assert_async(cond, msg)
 
 
 @register_lowering(aten._functional_assert_async.msg)
 def lower_assert_functional_async(cond, msg):
+    # [FUNCTION DOC] Lowering for aten._functional_assert_async.msg: delegates to _assert_async.
     return _assert_async(cond, msg)
 
 
@@ -1978,6 +2154,8 @@ def quantized_decomposed_dequantize_per_channel(
     *,
     out_dtype: torch.dtype | None = None,
 ) -> TensorBox:
+    # [FUNCTION DOC] Lowering for quantized_decomposed.dequantize_per_channel. Validates 1-D scales/zero_points, input dtype equal to dtype and axis range
+    # (raises an error otherwise). Output is a Pointwise computing (input - zero_point) * scale in float32, cast to out_dtype (default float32).
     if len(scales.get_size()) != 1:
         raise AssertionError("expect scales 1 dim")
     if len(zero_points.get_size()) != 1:
@@ -1997,6 +2175,7 @@ def quantized_decomposed_dequantize_per_channel(
     zero_points_loader = zero_points.make_loader()
 
     def inner_fn(idx):
+        # [FUNCTION DOC] HELPER: Dequantize one element with the per-channel scale and zero point chosen by the axis coordinate.
         channel_idx = (idx[axis],)
 
         input = input_loader(idx)
@@ -2030,6 +2209,8 @@ def quantized_decomposed_quantize_per_tensor_default(
     quant_max: int,
     dtype: torch.dtype,
 ) -> TensorBox:
+    # [FUNCTION DOC] Lowering for quantized_decomposed.quantize_per_tensor.default (python float scale and int zero point). Requires float32 input
+    # (bf16 upcast). Output is a Pointwise of round(input / scale) + zero_point clamped to the quant range, cast to dtype.
     if input.get_dtype() == torch.bfloat16:
         input = to_dtype(input, torch.float32)
     if input.get_dtype() != torch.float32:
@@ -2040,6 +2221,7 @@ def quantized_decomposed_quantize_per_tensor_default(
     input_loader = input.make_loader()
 
     def inner_fn(idx, scale, zero_point):
+        # [FUNCTION DOC] HELPER: Quantize one element using the scalar scale and zero point bound by partial application.
         input = input_loader(idx)
         inv_scale, zero_point = _create_constants(
             1.0 / scale, zero_point, dtype=torch.float32
@@ -2072,6 +2254,8 @@ def quantized_decomposed_dequantize_per_tensor_default(
     *,
     out_dtype: torch.dtype | None = None,
 ) -> TensorBox:
+    # [FUNCTION DOC] Lowering for quantized_decomposed.dequantize_per_tensor.default. Requires input dtype to equal dtype (raises an error otherwise).
+    # Output Pointwise is (input - zero_point) * scale computed in float32 and cast to out_dtype (default float32).
     if input.get_dtype() != dtype:
         raise AssertionError(
             f"Expecting input to have dtype {dtype}, but got dtype: {input.get_dtype()}"
@@ -2083,6 +2267,7 @@ def quantized_decomposed_dequantize_per_tensor_default(
     input_loader = input.make_loader()
 
     def inner_fn(idx, scale, zero_point):
+        # [FUNCTION DOC] HELPER: Dequantize one element with the scalar scale and zero point.
         input = input_loader(idx)
         scale, zero_point = _create_constants(scale, zero_point, dtype=torch.float32)
         val = ops.sub(ops.to_dtype(input, torch.float32), zero_point) * scale
@@ -2110,6 +2295,8 @@ def quantized_decomposed_quantize_per_tensor_tensor(
     quant_max: int,
     dtype: torch.dtype,
 ) -> TensorBox:
+    # [FUNCTION DOC] Lowering for quantized_decomposed.quantize_per_tensor.tensor with scalar-tensor scale and zero point (0-d or single-element, else raises an error).
+    # Requires float32 input (bf16 upcast). On CPU uses fused multiply-add and round-to-int; elsewhere round then clamp to the quant range. Output cast to dtype.
     if input.get_dtype() == torch.bfloat16:
         input = to_dtype(input, torch.float32)
     if input.get_dtype() != torch.float32:
@@ -2134,6 +2321,7 @@ def quantized_decomposed_quantize_per_tensor_tensor(
     device = input.get_device()
 
     def inner_fn(idx):
+        # [FUNCTION DOC] HELPER: Load the scalar scale/zero point (as float32), then quantize one element using the CPU or generic path.
         input = input_loader(idx)
         _scale = scale_loader((0,) if len(scale.get_size()) == 1 else ())
         _zero_point = zero_point_loader((0,) if len(scale.get_size()) == 1 else ())
@@ -2170,6 +2358,8 @@ def quantized_decomposed_dequantize_per_tensor_tensor(
     *,
     out_dtype: torch.dtype | None = None,
 ) -> TensorBox:
+    # [FUNCTION DOC] Lowering for quantized_decomposed.dequantize_per_tensor.tensor with scalar-tensor scale and zero point (validated, else raises an error) and
+    # input dtype equal to dtype. Output Pointwise is (input - zero_point) * scale in float32 cast to out_dtype (default float32).
     if not (
         len(scale.get_size()) == 0
         or (len(scale.get_size()) == 1 and scale.get_size()[0] == 1)
@@ -2193,6 +2383,7 @@ def quantized_decomposed_dequantize_per_tensor_tensor(
     zero_point_loader = zero_point.make_loader()
 
     def inner_fn(idx):
+        # [FUNCTION DOC] HELPER: Load scalar scale/zero point as float32 and dequantize one element.
         input = input_loader(idx)
         _scale = scale_loader((0,) if len(scale.get_size()) == 1 else ())
         _zero_point = zero_point_loader((0,) if len(scale.get_size()) == 1 else ())
@@ -2213,6 +2404,8 @@ def quantized_decomposed_dequantize_per_tensor_tensor(
 
 
 def _cat_inputs_recombine_reduction(inputs: list[TensorBox], dim: int) -> str | None:
+    # [FUNCTION DOC] HELPER: Detect the pattern where all cat inputs derive from one reduction buffer whose output numel matches the cat output and whose
+    # FX consumers all feed into the cat. Returns that buffer's name (so it is excluded from the reduction-fusion check) or None. Relies on FX origins of IR nodes.
     """If all cat inputs share a common upstream reduction buffer whose
     only consumers feed into this cat, return its name so it can be
     excluded from the can_fuse_reduction check.
@@ -2293,6 +2486,11 @@ def _cat_inputs_recombine_reduction(inputs: list[TensorBox], dim: int) -> str | 
 
 @register_lowering(aten.cat)
 def cat(inputs, dim=0):
+    # [FUNCTION DOC] Lowering for aten.cat. CPU uint8/int8 inputs go to an eager fallback (channels-last for 4-D). A single input is cloned; 1-D empty
+    # inputs are dropped like ATen. Inputs are promoted to a common dtype. Chooses between pointwise_cat (fusing producers into the concat) and
+    # ConcatKernel (realize inputs into one buffer): ConcatKernel is used on CPU, with too many inputs, with reduction producers, or when inputs have
+    # other pointwise consumers; pointwise_cat is used when forced by config or when it fuses with pointwise users or all inputs need copies anyway.
+    # Returns a TensorBox.
     """Lower aten.cat, choosing between pointwise_cat and ConcatKernel."""
     cpu_device = inputs[0].get_device().type == "cpu"
     if cpu_device and all(
@@ -2312,6 +2510,7 @@ def cat(inputs, dim=0):
     # ATen's cat skips 1-D empty tensors (cat_should_skip_tensor) during
     # dimension validation and concatenation. Replicate that here.
     def _cat_should_skip(t):
+        # [FUNCTION DOC] HELPER: True if t is a 1-D tensor statically known to have zero elements, which ATen's cat ignores.
         size = t.get_size()
         return len(size) == 1 and V.graph.sizevars.statically_known_equals(size[0], 0)
 
@@ -2331,6 +2530,7 @@ def cat(inputs, dim=0):
     inputs = [to_dtype(inp, dtype) for inp in inputs]
 
     def unwrap_tensor(x: TensorBox | ir.StorageBox) -> ir.IRNode:
+        # [FUNCTION DOC] HELPER: Peel TensorBox/StorageBox/view wrappers and return the underlying IR node.
         if isinstance(x, TensorBox):
             if isinstance(x.data, ir.BaseView):
                 return x.data.unwrap_view()
@@ -2343,9 +2543,11 @@ def cat(inputs, dim=0):
         return x
 
     def is_reduction(t):
+        # [FUNCTION DOC] HELPER: True if t is a computed buffer wrapping a Reduction.
         return isinstance(t, ir.ComputedBuffer) and isinstance(t.data, ir.Reduction)
 
     def can_fuse_reduction(t, exclude: OrderedSet[str] = OrderedSet()):
+        # [FUNCTION DOC] HELPER: Recursively test whether t is, or is a pointwise chain reading from, a reduction buffer (ignoring buffers named in exclude).
         if isinstance(t, (TensorBox, ir.StorageBox)):
             return can_fuse_reduction(unwrap_tensor(t), exclude)
         return (
@@ -2367,6 +2569,8 @@ def cat(inputs, dim=0):
     fusable_reduction = any(can_fuse_reduction(t, exclude) for t in inputs)
 
     def should_lower_cat_input(x) -> bool:
+        # [FUNCTION DOC] HELPER: Decide whether a cat input is worth fusing into a pointwise cat: true if it is storage that cannot be realized into the
+        # concat buffer without a copy, or an unrealized Pointwise; false otherwise.
         # Unrealized inputs will not be storage and layouts, and we don't want to realize
         # them in case we want to fuse
         if ir.is_storage_and_layout(x):
@@ -2390,6 +2594,7 @@ def cat(inputs, dim=0):
         return TensorBox(ir.ConcatKernel.create(inputs, dim))
 
     def op_count(x):
+        # [FUNCTION DOC] HELPER: Estimate the op count of x by summing its pointwise inner-function ops and those of the pointwise buffers it reads (0 for direct memory reads).
         if isinstance(x, (TensorBox, ir.StorageBox)):
             return op_count(unwrap_tensor(x))
 
@@ -2408,6 +2613,7 @@ def cat(inputs, dim=0):
     MAX_SIMPLE_OP_COUNT = 2
 
     def additional_pointwise_ops(op: torch._ops.OpOverload):
+        # [FUNCTION DOC] HELPER: True for ops (cat, constant_pad_nd) treated as pointwise-like users when deciding whether to fuse.
         return op in (aten.cat.default, aten.constant_pad_nd.default)
 
     if len(inputs) <= config.max_complex_pointwise_cat_inputs or (
@@ -2432,6 +2638,8 @@ def cat(inputs, dim=0):
         # reads. Also skip when input is an unrealized Pointwise with
         # multiple consumers to avoid recomputation (e.g. pad-as-cat).
         def any_input_has_multi_consumers() -> bool:
+            # [FUNCTION DOC] HELPER: True if any FX input of the current cat node has other pointwise consumers, or is an unrealized Pointwise with
+            # several consumers, in which case recomputation would occur and ConcatKernel is preferred. False if no current node or inputs have a single user.
             current_node = V.current_node
             if current_node is None:
                 return False
@@ -2447,6 +2655,7 @@ def cat(inputs, dim=0):
                 input_nodes = [n for n, skip in zip(input_nodes, skip_mask) if not skip]
 
             def is_unrealized_pointwise(x):
+                # [FUNCTION DOC] HELPER: True if the unwrapped IR node is a Pointwise (not realized).
                 if isinstance(x, (TensorBox, ir.StorageBox)):
                     return is_unrealized_pointwise(unwrap_tensor(x))
                 return isinstance(x, ir.Pointwise)
@@ -2479,6 +2688,8 @@ def cat(inputs, dim=0):
 
 @register_lowering(aten.diagonal, type_promotion_kind=None)
 def diagonal(input, offset: int = 0, dim1: int = 0, dim2: int = 1):
+    # [FUNCTION DOC] Lowering for aten.diagonal. Canonicalizes dims (must differ), computes the diagonal length (guarding on the sign of offset),
+    # and returns a GenericView with the two dims removed and a trailing diagonal dim, mapping indices to the original with the offset added.
     original_shape = input.get_size()
     num_dims = len(original_shape)
     dim1 = canonicalize_dim(idx=dim1, rank=num_dims)
@@ -2516,6 +2727,7 @@ def diagonal(input, offset: int = 0, dim1: int = 0, dim2: int = 1):
     sizes.append(diag_size)
 
     def reindexer(idx):
+        # [FUNCTION DOC] HELPER: Map a diagonal-view index to the original index: the last coordinate feeds both diagonal dims (plus offsets), others pass through in order.
         diag_idx = idx[-1]
         original_idx = [0] * len(original_shape)
         cur_dim = 0
@@ -2537,11 +2749,13 @@ def diagonal(input, offset: int = 0, dim1: int = 0, dim2: int = 1):
 
 @register_lowering(aten.diagonal_copy, type_promotion_kind=None)
 def diagonal_copy(input, offset: int = 0, dim1: int = 0, dim2: int = 1):
+    # [FUNCTION DOC] Lowering for aten.diagonal_copy: diagonal then clone.
     return clone(diagonal(input, offset, dim1, dim2))
 
 
 @register_lowering(aten.diagonal_scatter, type_promotion_kind=None)
 def diagonal_scatter(input, src, offset: int = 0, dim1: int = 0, dim2: int = 1):
+    # [FUNCTION DOC] Lowering for aten.diagonal_scatter: clones input, mutates the diagonal view of the clone to hold src, returns the clone.
     output = clone(input)
     target = diagonal(output, offset, dim1, dim2)
     mutate_to(target, src)
@@ -2550,6 +2764,9 @@ def diagonal_scatter(input, src, offset: int = 0, dim1: int = 0, dim2: int = 1):
 
 @register_lowering(aten.select, type_promotion_kind=None)
 def select(x, dim, idx):
+    # [FUNCTION DOC] Lowering for aten.select. Normalizes the index when its sign is known: unbacked indices become an as_strided view,
+    # others a slice followed by squeeze. When the sign is unknown (unbacked), uses a DynamicSelectStorageOffset buffer bound to the
+    # node's unbacked symbol and as_strided. Raises an error if the unbacked bindings are missing or not exactly one.
     idx = sympy.expand(idx)
     size = sympy.expand(x.get_size()[dim])
     actual_index = None
@@ -2629,6 +2846,8 @@ def select(x, dim, idx):
 
 @register_lowering(aten.split, type_promotion_kind=None)
 def split(x, sizes, dim=0):
+    # [FUNCTION DOC] Lowering for aten.split. An int/SymInt size is turned into chunk sizes (last may be smaller); negative size or zero size with
+    # non-empty dim raises RuntimeError; an empty dim returns one empty slice. Returns a list of slices along dim.
     dim = _validate_dim(x, dim, 0)
     sizes_ = sizes
 
@@ -2671,11 +2890,13 @@ def split(x, sizes, dim=0):
 
 @register_lowering(aten.split_with_sizes, type_promotion_kind=None)
 def split_with_sizes(x, sizes, dim=0):
+    # [FUNCTION DOC] Lowering for aten.split_with_sizes: delegates to split.
     return split(x, sizes, dim)
 
 
 @register_lowering(aten.unbind, type_promotion_kind=None)
 def unbind(x, dim=0):
+    # [FUNCTION DOC] Lowering for aten.unbind: guards the dim size to an int and returns a list of select results for each index.
     dim = _validate_dim(x, dim, 0)
     x_size = V.graph.sizevars.guard_int(x.get_size()[dim])
     result = [select(x, dim, i) for i in range(x_size)]
@@ -2684,6 +2905,8 @@ def unbind(x, dim=0):
 
 @register_lowering(aten.unfold, type_promotion_kind=None)
 def unfold(x, dimension, size, step):
+    # [FUNCTION DOC] Lowering for aten.unfold. Scalars use a slice of an unsqueezed tensor. Otherwise checks size and step against the dim, marks
+    # reuse on the input, and returns a GenericView whose last dim is the window and whose unfolded dim is the number of windows.
     sizes = x.get_size()
     ndim = len(sizes)
     dim = canonicalize_dim(ndim, dimension)
@@ -2705,6 +2928,7 @@ def unfold(x, dimension, size, step):
     out_size = [*sizes[:dim], new_dim_size, *sizes[dim + 1 :], size]
 
     def reindexer(idx):
+        # [FUNCTION DOC] HELPER: Map unfold view index to the input index: window position plus window index times step.
         dim_idx = idx[-1] + idx[dim] * step
         return (*idx[:dim], dim_idx, *idx[dim + 1 : -1])
 
@@ -2713,6 +2937,7 @@ def unfold(x, dimension, size, step):
 
 @register_lowering(aten.unsqueeze, type_promotion_kind=None)
 def unsqueeze(x, dim):
+    # [FUNCTION DOC] Lowering for aten.unsqueeze: inserts a size-one dim at dim (validated with offset 1) via view.
     dim = _validate_dim(x, dim, 1)
     new_shape = list(x.get_size())
     new_shape.insert(dim, sympy.S.One)
@@ -2721,6 +2946,7 @@ def unsqueeze(x, dim):
 
 @register_lowering(aten.unsqueeze_, type_promotion_kind=None)
 def unsqueeze_(x, dim):
+    # [FUNCTION DOC] Lowering for in-place unsqueeze_: rebinds x's data to the unsqueezed view and returns x.
     val = unsqueeze(x, dim)
     if not (isinstance(x, TensorBox)):
         raise AssertionError("expected: isinstance(x, TensorBox)")
@@ -2731,6 +2957,7 @@ def unsqueeze_(x, dim):
 
 
 def _validate_dim(x, dim, offset=0):
+    # [FUNCTION DOC] HELPER: Evaluate dim to a concrete int, wrap negatives using ndim plus offset, and return it. Raises an error if out of range.
     dim = V.graph.sizevars.shape_env.evaluate_expr(sympy.sympify(dim))
     ndim = len(x.get_size())
     if dim < 0:
@@ -2742,6 +2969,7 @@ def _validate_dim(x, dim, offset=0):
 
 @register_lowering(aten.glu)
 def glu(x, dim=-1):
+    # [FUNCTION DOC] Lowering for aten.glu: splits x in half along dim (size guarded) and returns first half times sigmoid of the second half.
     dim = _validate_dim(x, dim, 0)
     # TODO: don't guard on static shape here
     new_len = V.graph.sizevars.guard_int(x.get_size()[dim]) // 2
@@ -2752,11 +2980,15 @@ def glu(x, dim=-1):
 
 
 def fallback_handler(kernel, add_to_fallback_set=True):
+    # [FUNCTION DOC] Create a lowering that calls a kernel through an extern FallbackKernel. Optionally records kernel in the fallbacks set (side effect). The
+    # returned handler wraps IR outputs for lowering and is flagged as a fallback handler.
     if add_to_fallback_set:
         fallbacks.add(kernel)
 
     def handler(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Create the FallbackKernel for the given args and wrap resulting IR nodes as tensor boxes.
         def wrap_tensors(x):
+            # [FUNCTION DOC] HELPER: Wrap IR nodes for lowering; pass others through.
             return x.wrap_for_lowering() if isinstance(x, ir.IRNode) else x
 
         return pytree.tree_map(
@@ -2771,6 +3003,7 @@ def fallback_handler(kernel, add_to_fallback_set=True):
 
 @functools.cache
 def _warn_complex_not_supported():
+    # [FUNCTION DOC] HELPER: Emit (once, cached) a warning that complex operators are not code-generated.
     warnings.warn(
         "Torchinductor does not support code generation for complex operators. Performance may be worse than eager."
     )
@@ -2779,6 +3012,8 @@ def _warn_complex_not_supported():
 # There are some types (CPU) which we accept as input but not as
 # output.
 def unsupported_input_tensor(t: torch.Tensor, node=None):
+    # [FUNCTION DOC] Return True if inductor cannot read or write tensor t: complex (also emits a one-time warning), meta, sparse, unsupported fp8,
+    # and float8_e8m0fnu except for views/bitcasts/memory movement/supported conversions determined from the FX node. Without a node, unsupported fp8 types return True.
     "Do not support reading or writing to this tensor"
     if t.is_complex():
         # Complex views are supported with IR ComplexView
@@ -2846,6 +3081,8 @@ def unsupported_input_tensor(t: torch.Tensor, node=None):
 
 
 def unsupported_output_tensor(t: torch.Tensor, node=None):
+    # [FUNCTION DOC] Return True if inductor cannot write tensor t (reading may still work): unsupported inputs, unsupported fp8, or CPU tensors when cpp codegen is disabled.
+    # Complex outputs of view.dtype/convert_element_type nodes are allowed.
     "Do not support writing tensor but can read from it"
     supported_complex_views = (
         aten.view.dtype,
@@ -2861,6 +3098,8 @@ def unsupported_output_tensor(t: torch.Tensor, node=None):
 
 
 def fallback_node_due_to_unsupported_type(node: torch.fx.Node, allow_cpu_inputs=True):
+    # [FUNCTION DOC] Decide whether an FX node must use a fallback kernel because an input or output tensor has an unsupported type. Placeholders,
+    # view_as_complex and lift_fresh_copy are never forced to fall back. Inputs are checked for read support and the node's output for write support.
     # Custom fallback lowering
     if node.target is aten.view_as_complex.default:
         return False
@@ -2873,6 +3112,7 @@ def fallback_node_due_to_unsupported_type(node: torch.fx.Node, allow_cpu_inputs=
         return False
 
     def check_skip_condition(inp_out_node, is_output):
+        # [FUNCTION DOC] HELPER: Check a node's fake-tensor metadata leaves with the input or output support predicate; True if any is unsupported.
         if not isinstance(inp_out_node, torch.fx.Node):
             return False
 
@@ -2907,6 +3147,10 @@ def make_fallback(
     override_decomp=False,
     get_decomp_fn=None,
 ):
+    # [FUNCTION DOC] Register an extern fallback lowering for op (an overload, overload packet or higher-order op). Raises an error if a
+    # decomposition also exists (unless override_decomp), and in CI if a decomposition exists for the op (disabling dynamo suppress_errors first and logging a warning);
+    # raises RuntimeError for unsupported op types. For each overload it marks inputs as needing realization, records the optional layout constraint,
+    # and registers a fallback handler lowering. Mutates global registries.
     check_decomps = get_decomp_fn() if get_decomp_fn is not None else decompositions
     if op in check_decomps and not override_decomp:
         raise AssertionError(f"both a fallback and a decomp for same op: {op}")
@@ -2939,6 +3183,7 @@ def make_fallback(
         )
 
     def register_fallback(op_overload):
+        # [FUNCTION DOC] HELPER: Register one op overload as a fallback: realized inputs, optional layout constraint, and a fallback_handler lowering without type promotion.
         add_needs_realized_inputs(op_overload)
         if layout_constraint is not None:
             add_layout_constraint(op_overload, layout_constraint)
@@ -2956,6 +3201,7 @@ def make_fallback(
 
 
 def philox_rand_offset(shape):
+    # [FUNCTION DOC] Compute the Philox RNG offset increment for a random op of the given shape: a scalar int64 tensor equal to the number of elements.
     """
     TorchInductor offset calculation differs from PyTorch eager offset
     calculation for random ops (tl.rand vs torch.rand). In future, we should
@@ -2969,6 +3215,8 @@ def philox_rand_offset(shape):
 
 @register_lowering(torch.ops.rngprims.philox_rand, type_promotion_kind=None)
 def philox_rand(size, seed, offset, stride, device, dtype):
+    # [FUNCTION DOC] Lowering for rngprims.philox_rand. Builds a Pointwise generating uniform random values from the seed and offset scalar tensors (cast to int32)
+    # plus the contiguous position of each element, cast to dtype. stride is unused. Returns a pair (random values node, offset increment tensor).
     # stride arg is optional and will be used in future for distributed random
     # ops. Currently, its unused.
     random_pos = ir.FixedLayout(
@@ -2981,6 +3229,7 @@ def philox_rand(size, seed, offset, stride, device, dtype):
     offset_loader = offset.make_loader()
 
     def inner_fn(index):
+        # [FUNCTION DOC] HELPER: Generate one random value from the seed and offset-adjusted linear position.
         # Both seed and offset in the philox_rand op are tensors.
         # torch seed and offsets are of type int64, but tl.rand accepts int32
         seed_index_expr = ops.to_dtype(seed_loader([]), torch.int32)
@@ -3008,6 +3257,7 @@ def philox_rand(size, seed, offset, stride, device, dtype):
 
 @register_lowering(aten.native_dropout, type_promotion_kind=None)
 def native_dropout(x, p, train):
+    # [FUNCTION DOC] Lowering for aten.native_dropout. Only valid with fallback_random, in which case it creates a fallback kernel; otherwise raises an error since random ops are replaced earlier.
     if config.fallback_random:
         return pytree.tree_map(
             TensorBox.create,
@@ -3019,6 +3269,8 @@ def native_dropout(x, p, train):
 
 @register_lowering(aten.bernoulli_, type_promotion_kind=None)
 def bernoulli_(x, *args):
+    # [FUNCTION DOC] Lowering for in-place bernoulli_. Allowed only with fallback_random or on CPU (else raises an error). Realizes x and creates an in-place Bernoulli fallback kernel
+    # (float or tensor probability overload). Returns x.
     if not (config.fallback_random or x.get_device() == torch.device("cpu")):
         raise AssertionError(
             "this should be handled in decomps unless config.fallback_random or the device is CPU"
@@ -3035,6 +3287,7 @@ def bernoulli_(x, *args):
 
 @register_lowering(aten.bernoulli.p, type_promotion_kind=None)
 def bernoulli_p(x, *args):
+    # [FUNCTION DOC] Lowering for aten.bernoulli.p: same restrictions as bernoulli_; clones x and applies bernoulli_ to the clone.
     if not (config.fallback_random or x.get_device() == torch.device("cpu")):
         raise AssertionError(
             "this should be handled in decomps unless config.fallback_random or the device is CPU"
@@ -3045,15 +3298,18 @@ def bernoulli_p(x, *args):
 # This shouldn't be called in general
 @register_lowering(aten._foobar)
 def _foobar(_):
+    # [FUNCTION DOC] HELPER: Test placeholder lowering that always raises an error; not expected to be called.
     raise AssertionError
 
 
 @functools.lru_cache(1)
 def _warn_triton_random(salt):
+    # [FUNCTION DOC] HELPER: Log (once per salt, cached) that triton random is used and may differ from eager.
     log.info("using triton random, expect difference from eager")
 
 
 def warn_triton_random():
+    # [FUNCTION DOC] HELPER: Emit the triton-random log message at most once per graph, keyed by graph creation time.
     # only warn once per graph
     _warn_triton_random(V.graph.creation_time)
 
@@ -3080,6 +3336,8 @@ make_fallback(torch.ops.streams.wait_stream.default)
 
 @register_lowering(aten.rand)
 def rand(*args, **kwargs):
+    # [FUNCTION DOC] Lowering for aten.rand. Uses the eager fallback for an explicit generator, or when fallback_random is set or pin_memory is requested;
+    # otherwise raises an error since random ops should already have been replaced.
     if kwargs.get("generator") is not None:
         return fallback_rand_generator(*args, **kwargs)
     elif config.fallback_random or kwargs.get("pin_memory"):
@@ -3090,6 +3348,7 @@ def rand(*args, **kwargs):
 
 @register_lowering(aten.randn)
 def randn(*args, **kwargs):
+    # [FUNCTION DOC] Lowering for aten.randn. Same behavior as rand: fallback for generator, fallback_random or pin_memory; otherwise raises an error.
     if kwargs.get("generator") is not None:
         return fallback_randn_generator(*args, **kwargs)
     elif config.fallback_random or kwargs.get("pin_memory"):
@@ -3100,24 +3359,29 @@ def randn(*args, **kwargs):
 
 @register_lowering(inductor_prims.force_stride_order, type_promotion_kind=None)
 def inductor_force_stride_order(input_tensor, stride):
+    # [FUNCTION DOC] Lowering for inductor_prims.force_stride_order: requires the input to have the stride order implied by the given stride.
     stride_order = ir.get_stride_order(stride, V.graph.sizevars.shape_env)
     return ir.ExternKernel.require_stride_order(input_tensor, stride_order)
 
 
 @register_lowering(inductor_prims.seed, type_promotion_kind=None)
 def inductor_seed(device: torch.device):
+    # [FUNCTION DOC] Lowering for inductor_prims.seed; always raises an error since it must be eliminated by the seed creation pass.
     raise AssertionError("should be handled in fuse_seed_creation_pass()")
 
 
 @register_lowering(inductor_prims.seeds, type_promotion_kind=None)
 def inductor_seeds(count, device):
+    # [FUNCTION DOC] Lowering for inductor_prims.seeds: warns about triton random and returns a RandomSeeds node with count seeds on the device.
     warn_triton_random()
     return TensorBox.create(ir.RandomSeeds(count, decode_device(device)))
 
 
 @register_lowering(inductor_prims.lookup_seed, type_promotion_kind=None)
 def inductor_lookup_seed(seeds, index):
+    # [FUNCTION DOC] Lowering for inductor_prims.lookup_seed: returns a scalar Pointwise that loads the seed at index from the seeds buffer.
     def inner_fn(_):
+        # [FUNCTION DOC] HELPER: Load the seed value at the closed-over index, ignoring the iteration index.
         return ops.load_seed(seeds.get_name(), index)
 
     return Pointwise.create(
@@ -3129,6 +3393,7 @@ def inductor_lookup_seed(seeds, index):
 
 
 def get_threads_per_round(device: torch.device):
+    # [FUNCTION DOC] Return the number of threads in one round on a device: SM count times max threads per SM for CUDA (current device if no index), else a fixed CPU grain size (32768).
     if not isinstance(device, torch.device):
         device = torch.device(device)
 
@@ -3157,6 +3422,9 @@ def inductor_random(
     offset: int = 0,
     align_dtype: torch.dtype = torch.float32,
 ):
+    # [FUNCTION DOC] Lowering for inductor_prims.random (rand or randn). Requires fallback_random off and mode rand or randn (else raises an error). Builds a float32 Pointwise
+    # whose values come from the seed and contiguous element position (plus offset); with align_random_eager on CUDA it emulates eager Philox usage with
+    # threads-per-round and vector width (8 for half types, else 4). The result is realized and returned.
     if config.fallback_random:
         raise AssertionError("expected: not config.fallback_random")
     if mode not in ("rand", "randn"):
@@ -3173,6 +3441,7 @@ def inductor_random(
         threads_per_round = get_threads_per_round(device)
 
         def _vec_from_dtype(dt: torch.dtype) -> int:
+            # [FUNCTION DOC] HELPER: Vector width for eager-aligned random: 8 for fp16/bf16, otherwise 4.
             if dt in (torch.float16, torch.bfloat16):
                 return 8
             return 4
@@ -3180,6 +3449,7 @@ def inductor_random(
         vec = _vec_from_dtype(align_dtype)
 
         def inner_fn(index):
+            # [FUNCTION DOC] HELPER: Eager-aligned random value from the seed and base offset stored in the seed buffer.
             rng_seed = seed_loader([0])
             base_offset = seed_loader([1])
             return ops.rand_eager(
@@ -3192,6 +3462,7 @@ def inductor_random(
     else:
 
         def inner_fn(index):
+            # [FUNCTION DOC] HELPER: Random value (rand or randn per mode) from the scalar seed and element position.
             return getattr(ops, mode)(
                 seed_loader([]),
                 ops.index_expr(random_pos(index), torch.int32),
@@ -3215,6 +3486,7 @@ make_fallback(inductor_prims.rand_eager_offsets)
 def inductor_randint(
     low: int, high: int, size: list[int], seed: TensorBox, *, offset: int = 0
 ):
+    # [FUNCTION DOC] Lowering for inductor_prims.randint: requires fallback_random off; returns an int64 Pointwise of random integers in [low, high) from the seed and element position plus offset.
     if config.fallback_random:
         raise AssertionError("expected: not config.fallback_random")
     size = [*size]
@@ -3226,6 +3498,7 @@ def inductor_randint(
     seed_loader = seed.make_loader()
 
     def inner_fn(index):
+        # [FUNCTION DOC] HELPER: Generate one random int64 in the range using the seed and position.
         return ops.randint64(
             seed_loader([]),
             ops.index_expr(random_pos(index), torch.int32),
@@ -3242,6 +3515,7 @@ def inductor_randint(
 
 
 def _boundaries_helper(tb: TensorBox) -> tuple[str, sympy.Expr, sympy.Expr, sympy.Expr]:
+    # [FUNCTION DOC] HELPER: Return (buffer name, last-dim size, layout storage size, last stride) describing a boundaries tensor for the bucketize op.
     size = tb.get_size()
     stride = tb.get_stride()
     return (
@@ -3253,18 +3527,21 @@ def _boundaries_helper(tb: TensorBox) -> tuple[str, sympy.Expr, sympy.Expr, symp
 
 
 def _realize_bucketize_lookup_tensor(tb: TensorBox) -> TensorBox:
+    # [FUNCTION DOC] HELPER: Realize a bucketize lookup tensor into a named strided buffer so codegen can reference it.
     # ops.bucketize needs a named strided tensor.  realize_input() also replays
     # affine views over newly-realized inputs as ReinterpretViews when possible.
     return TensorBox(ir.ExternKernel.realize_input(tb))
 
 
 def _sorter_helper(tb: TensorBox) -> tuple[str, sympy.Expr]:
+    # [FUNCTION DOC] HELPER: Return (buffer name, last-dim stride) for a sorter tensor.
     return tb.get_name(), tb.get_stride()[-1]
 
 
 def _bucketize_indices(
     tb: TensorBox, index: Sequence[sympy.Expr], index_dtype: torch.dtype
 ) -> Any:
+    # [FUNCTION DOC] HELPER: Compute the flattened offset of the sequence row selected by all but the last index coordinate (including layout offset). Returns a plain int when it is a constant with empty index, else an index expression of index_dtype.
     strides = tb.get_stride()
     flattened_index = tb.get_layout().offset + sum(
         (s * i for s, i in zip(strides[:-1], index[:-1])), sympy.S.Zero
@@ -3284,6 +3561,8 @@ def searchsorted(
     side: str | None = None,
     sorter: TensorBox | None = None,
 ) -> TensorBox:
+    # [FUNCTION DOC] Lowering for aten.searchsorted.Tensor. Falls back to the eager kernel if any of sorted_sequence, values or sorter lacks bucketize backend support.
+    # Otherwise side == right overrides right, tensors are realized, and a Pointwise using the bucketize op (optionally with a sorter) is built over the values' shape with int32 or int64 output. The result is realized to avoid recomputation.
     validate_bucketize = lambda tb: V.graph.has_feature(  # noqa: E731
         tb, BackendFeature.BUCKETIZE
     )
@@ -3320,6 +3599,7 @@ def searchsorted(
     if len(sorted_sequence.get_size()) == 1:
 
         def inner_fn(idx):
+            # [FUNCTION DOC] HELPER: 1-D sequence case: bucketize a value against the whole sequence.
             val = values_loader(idx)
             return ops.bucketize(
                 val,
@@ -3338,11 +3618,13 @@ def searchsorted(
     else:
 
         def inner_fn(idx):
+            # [FUNCTION DOC] HELPER: N-D sequence case: bucketize a value against the sequence row selected by the leading index coordinates.
             val = values_loader(idx)
 
             # Get index to the beginning of the sorted sequence within a flattened
             # version of the array.
             def get_flattened_index(tb: TensorBox):
+                # [FUNCTION DOC] HELPER: Flattened row offset of a tensor for the current index.
                 return _bucketize_indices(tb, idx, index_dtype)
 
             return ops.bucketize(
@@ -3378,6 +3660,8 @@ def bucketize(
     out_int32: bool = False,
     right: bool = False,
 ):
+    # [FUNCTION DOC] Lowering for aten.bucketize.Tensor. Boundaries must be 1-D (else raises an error). Falls back to eager if unsupported by the backend; otherwise
+    # builds a Pointwise bucketize op against the realized boundaries with int32 or int64 output and realizes the result to avoid recomputing the binary search after broadcasts.
     if len(boundaries.get_size()) != 1:
         raise AssertionError("expected: len(boundaries.get_size()) == 1")
 
@@ -3398,6 +3682,7 @@ def bucketize(
     index_dtype = torch.int32 if out_int32 else torch.int64
 
     def inner_fn(index):
+        # [FUNCTION DOC] HELPER: Bucketize one loaded value against the boundaries.
         val = input_loader(index)
         indices = ops.bucketize(
             val,
@@ -3429,12 +3714,14 @@ def bucketize(
 
 
 def _is_tensor_irnode(x):
+    # [FUNCTION DOC] HELPER: True for IR nodes representing tensors (excludes non-tensor objects and opaque multi-outputs).
     return isinstance(x, ir.IRNode) and not isinstance(
         x, (ir.NonTensorObj, ir.OpaqueMultiOutput)
     )
 
 
 def require_dense(_, *args, **kwargs):
+    # [FUNCTION DOC] Layout constraint: require stride-1 (dense) layout on every tensor IR node among args and kwargs. Returns (args, kwargs). First parameter (node) is unused.
     args, kwargs = pytree.tree_map_only(
         _is_tensor_irnode, ir.ExternKernel.require_stride1, (args, kwargs)
     )
@@ -3442,6 +3729,7 @@ def require_dense(_, *args, **kwargs):
 
 
 def require_contiguous(_, *args, **kwargs):
+    # [FUNCTION DOC] Layout constraint: require contiguous layout on every tensor IR node in args and kwargs; returns (args, kwargs).
     args, kwargs = pytree.tree_map_only(
         _is_tensor_irnode,
         ir.ExternKernel.require_contiguous,
@@ -3451,6 +3739,7 @@ def require_contiguous(_, *args, **kwargs):
 
 
 def require_contiguous_strides(_, *args, **kwargs):
+    # [FUNCTION DOC] Layout constraint: require contiguous strides on every tensor IR node in args and kwargs; returns (args, kwargs).
     # TODO: combine this with require_contiguous after
     # https://github.com/pytorch/pytorch/pull/148235 lands.
     args, kwargs = pytree.tree_map_only(
@@ -3462,6 +3751,7 @@ def require_contiguous_strides(_, *args, **kwargs):
 
 
 def require_channels_last(_, *args, **kwargs):
+    # [FUNCTION DOC] Layout constraint: require channels-last layout on every tensor IR node in args and kwargs; returns (args, kwargs).
     args, kwargs = pytree.tree_map_only(
         _is_tensor_irnode,
         ir.ExternKernel.require_channels_last,
@@ -3471,6 +3761,7 @@ def require_channels_last(_, *args, **kwargs):
 
 
 def constrain_to_fake_tensor(arg, fake_arg):
+    # [FUNCTION DOC] HELPER: Recursively require exact strides equal to those of the fake tensor arg for IR nodes, descending into dicts, tuples and lists; script objects and None pass through.
     if fake_arg is None:
         return arg
     if isinstance(fake_arg, FakeScriptObject) or is_custom_class_obj(fake_arg):
@@ -3487,6 +3778,7 @@ def constrain_to_fake_tensor(arg, fake_arg):
 
 
 def constrain_to_fake_tensors(args, kwargs, fake_args, fake_kwargs):
+    # [FUNCTION DOC] Layout constraint: apply exact-stride constraints from the fake args/kwargs to each arg and kwarg; returns (args, kwargs).
     args = tuple(
         constrain_to_fake_tensor(arg, fake_arg)
         for arg, fake_arg in zip(args, fake_args)
@@ -3496,12 +3788,15 @@ def constrain_to_fake_tensors(args, kwargs, fake_args, fake_kwargs):
 
 
 def constrain_to_fx_strides(fx_node, *args, **kwargs):
+    # [FUNCTION DOC] Layout constraint: for tensor IR args, require the stride order of the corresponding FX node's fake value, recursing through dicts and sequences. Returns (args, kwargs).
     def get_fake_val(fx_arg):
+        # [FUNCTION DOC] HELPER: Return the fake value metadata of an FX node, or the argument itself if not a node.
         if isinstance(fx_arg, torch.fx.Node):
             return fx_arg.meta.get("val")
         return fx_arg
 
     def apply_constraint(arg, fx_arg):
+        # [FUNCTION DOC] HELPER: Apply the stride-order constraint to one argument against its FX counterpart, recursing into containers; mismatched types pass through unchanged.
         fake_val = get_fake_val(fx_arg)
         if _is_tensor_irnode(arg):
             if not isinstance(fake_val, torch.Tensor):
@@ -3530,6 +3825,7 @@ def constrain_to_fx_strides(fx_node, *args, **kwargs):
 
 
 def constrain_to_fx_strides_if_fallback_random(fx_node, *args, **kwargs):
+    # [FUNCTION DOC] Layout constraint that applies constrain_to_fx_strides only when config.fallback_random is on; otherwise returns args and kwargs unchanged.
     if not config.fallback_random:
         return args, kwargs
     return constrain_to_fx_strides(fx_node, *args, **kwargs)
@@ -3544,9 +3840,14 @@ add_layout_constraint(
 
 
 def sdpa_constraint(fx_node, *args, **kwargs):
+    # [FUNCTION DOC] Layout constraint for scaled-dot-product-attention fallbacks. For every tensor IR argument, picks the stride order of the fake value (forced contiguous
+    # when the last dim is not the fastest, and (3,1,2,0) for efficient-attention-backward out/grad args), optionally caches results in the graph per (argument id, name, order),
+    # and applies a constraint: non-CUDA/XPU simply requires the stride order; CUDA/XPU additionally keeps 8-aligned tensors, pads strides of the efficient-attention bias to
+    # alignment (allowing zero-stride expanded dims), and otherwise requires the stride order. Returns (args, kwargs).
     """Apply stride constraints to SDPA inputs, ensuring dense last dimension."""
 
     def apply_constraint(idx, arg, fx_arg):
+        # [FUNCTION DOC] HELPER: Constrain one SDPA argument (idx is its position, -1 for kwargs) against its FX node: computes the target stride order, consults/updates the sdpa constraint cache when enabled, and delegates to the inner constraint logic.
         if not _is_tensor_irnode(arg):
             return arg
 
@@ -3599,6 +3900,9 @@ def sdpa_constraint(fx_node, *args, **kwargs):
         return result
 
     def _apply_constraint_inner(idx, arg, meta_val, meta_stride_expr, stride_order):
+        # [FUNCTION DOC] HELPER: Apply the SDPA stride constraint to a tensor. Non-GPU: require stride order. GPU: return arg for non 3-D/4-D tensors; realize and match insignificant strides when the
+        # tensor is aligned to 8; pad strides for the efficient attention bias (dense last dim); match strides for views whose base is aligned; else require the stride order.
+        # KNOWN ISSUE: the second check on is_aligned_tensor after the first identical early return is unreachable, and the same duplicate check appears twice more, so those branches are dead code.
         if not (meta_val.is_cuda or meta_val.is_xpu):
             return ir.ExternKernel.require_stride_order(arg, stride_order)
 
@@ -3688,6 +3992,7 @@ def sdpa_constraint(fx_node, *args, **kwargs):
             )
 
         def is_aligned(x):
+            # [FUNCTION DOC] HELPER: True if the tensor is non-scalar and its last dim size is statically a multiple of the alignment (8).
             size = x.get_size()
             if len(size) == 0:
                 return False
@@ -3877,6 +4182,8 @@ make_fallback(aten._to_sparse)
 
 @register_lowering(aten._to_dense.default, type_promotion_kind=None)
 def _to_dense(x, dtype=None, masked_grad=None):
+    # [FUNCTION DOC] Lowering for aten._to_dense. Realizes the input and routes the op through a FallbackKernel with a MultiOutput describing a single contiguous dense output of dtype
+    # (default the input dtype). Raises an error if the realized input has no device. Returns a TensorBox of the output.
     x = ir.ExternKernel.realize_input(x)
     size = x.get_size()
     device = x.get_device()
@@ -3885,6 +4192,7 @@ def _to_dense(x, dtype=None, masked_grad=None):
     output_dtype = dtype if dtype is not None else x.get_dtype()
 
     def unflatten_args(tensor_args, non_tensor_args):
+        # [FUNCTION DOC] HELPER: Rebuild the call arguments for the fallback kernel from tensor and non-tensor args.
         return [tensor_args[0], *non_tensor_args], {}
 
     # cpp_wrapper has no direct AOTI C shim for _to_dense, so route through the
@@ -3984,6 +4292,8 @@ make_fallback(aten._weight_norm_interface_backward.default, require_contiguous)
 # For example, fp16.copy_(fp32) should **not** promote the first input's dtype.
 @register_lowering(aten.copy, type_promotion_kind=None)
 def copy(self, src, non_blocking=False):
+    # [FUNCTION DOC] Lowering for aten.copy (no type promotion). Non-IR sources become tensors of self's dtype/device. src is moved to self's device and dtype, expanded to self's
+    # size when shapes differ, and cloned. If self is pinned, the result is realized as pinned. Returns the new value.
     if not isinstance(src, ir.IRNode):
         src = tensor(src, dtype=self.get_dtype(), device=self.get_device())
     x = src
@@ -4006,6 +4316,7 @@ def copy(self, src, non_blocking=False):
 
 @register_lowering(aten.clone)
 def clone(x, *, memory_format=None):
+    # [FUNCTION DOC] Lowering for aten.clone: a Pointwise copy of x using its loader; memory_format is ignored so layout can be decided later.
     # Don't materialize the layout here based on memory_format,
     # as we want to give the scheduler opportunity to perform layout optimization.
     # Let the downstream op handle the input stride as needed.
@@ -4018,11 +4329,13 @@ def clone(x, *, memory_format=None):
 
 
 def _realize_as_pinned(result):
+    # [FUNCTION DOC] HELPER: Realize result and mark its layout as pinned memory.
     result.realize()
     result.data.data.get_layout().is_pinned = True
 
 
 def clone_preserve_reinterpret_view(x):
+    # [FUNCTION DOC] Clone x while preserving any chain of ReinterpretView layouts: the views are unwrapped, the base cloned, and the view layouts re-applied in reverse order. Returns a TensorBox.
     reinterpret_view_layouts = []
     if isinstance(x, TensorBox) and isinstance(x.data, ir.ReinterpretView):
         x = x.data  # unwrap TensorBox
@@ -4044,6 +4357,7 @@ def clone_preserve_reinterpret_view(x):
 
 
 def lift_fresh_copy(x):
+    # [FUNCTION DOC] Lowering for aten.lift_fresh_copy: clone x, and mark the clone pinned if the input layout is pinned. Registered when the aten op exists.
     result = clone(x)
     input_layout = x.maybe_get_layout()
     if input_layout is not None and input_layout.is_pinned:
@@ -4067,7 +4381,9 @@ def iota(
     device,
     requires_grad,
 ):
+    # [FUNCTION DOC] Lowering for prims.iota: a 1-D Pointwise of length elements with value start plus step times the index in dtype on the decoded device.
     def fn(index):
+        # [FUNCTION DOC] HELPER: Compute the iota value for index.
         return ops.index_expr(step * index[0] + start, dtype=dtype)
 
     return Pointwise.create(
@@ -4090,6 +4406,7 @@ def arange_start_step(
     pin_memory=None,
     requires_grad=False,
 ):
+    # [FUNCTION DOC] Lowering for aten.arange.start_step: requires dtype (raises an error if None); length is ceil((end - start) / step); delegates to iota, default device cpu.
     if dtype is None:
         raise AssertionError("expected: dtype is not None")
     length = ceildiv(end - start, step)
@@ -4105,6 +4422,8 @@ def arange_start_step(
 
 @register_lowering(aten.select_scatter, type_promotion_kind=None)
 def select_scatter(x, src, dim: int, index: int):
+    # [FUNCTION DOC] Lowering for aten.select_scatter: casts src to x's dtype; wraps negative index; uses an eager fallback when the index sign is unknown (unbacked);
+    # otherwise checks bounds and returns a Pointwise selecting the expanded src where the coordinate on dim equals index, else x.
     src = to_dtype(src, x.get_dtype())
     x_loader = x.make_loader()
     dim = _validate_dim(x, dim, 0)
@@ -4122,6 +4441,7 @@ def select_scatter(x, src, dim: int, index: int):
     src_loader = src.make_loader()
 
     def inner_fn(idx):
+        # [FUNCTION DOC] HELPER: Choose src or x at idx based on equality of the dim coordinate with the select index.
         return ops.where(
             ops.eq(
                 ops.index_expr(idx[dim], torch.int32),
@@ -4141,6 +4461,9 @@ def select_scatter(x, src, dim: int, index: int):
 
 @register_lowering(aten.slice_scatter, type_promotion_kind=None)
 def slice_scatter(x, src, dim=0, start=None, end=None, step=1):
+    # [FUNCTION DOC] Lowering for aten.slice_scatter: returns x with the strided slice along dim replaced by src. src is cast to x's dtype. With unbacked bounds, indices are resolved (or
+    # the eager fallback is used if undeterminable); otherwise start/end are normalized. Checks src shape matches the slice (raises an error on rank mismatch), expands src, and builds a
+    # Pointwise that selects src inside the slice (masked by start, end and step) and x outside; a full-range slice just reads src.
     """Lower slice_scatter with exact source shape checks."""
     src = to_dtype(src, x.get_dtype())
     x_loader = x.make_loader()
@@ -4177,6 +4500,7 @@ def slice_scatter(x, src, dim=0, start=None, end=None, step=1):
     src_loader = src.make_loader()
 
     def inner_fn(idx):
+        # [FUNCTION DOC] HELPER: Pick src (at the slice-relative index) where the dim coordinate lies within [start, end) on the step grid, else x. Full-range step-1 slices return src directly.
         if start == 0 and end == dim_size and step == 1:
             # selecting every element is the same as just src.clone()
             return src_loader(idx)
@@ -4232,6 +4556,7 @@ def slice_scatter(x, src, dim=0, start=None, end=None, step=1):
 
 
 def _unwrap(x):
+    # [FUNCTION DOC] HELPER: Return the first leaf element of nested non-empty lists/tuples, else x itself.
     if isinstance(x, (list, tuple)) and len(x) > 0:
         return _unwrap(x[0])
     return x
@@ -4239,6 +4564,9 @@ def _unwrap(x):
 
 @register_lowering([torch.tensor, aten.scalar_tensor, prims.scalar_tensor])
 def tensor(data, *, dtype=None, device=None, layout=None, pin_memory=False):
+    # [FUNCTION DOC] Lowering for torch.tensor / scalar_tensor. Only strided layout (jagged treated as strided) is supported (else NotImplementedError). dtype defaults to int64 for integer data or the default float dtype.
+    # Sympy and python scalars become 0-d constants (fp16/bf16 values are rounded), short lists (up to 8) become a binary-search select over the index, and larger data is added as a graph tensor constant.
+    # Pinned memory results are realized as pinned. Returns an IR tensor.
     # Match eager/meta scalar_tensor behavior; NJT handles scalar broadcasting.
     if layout == torch.jagged:
         layout = torch.strided
@@ -4255,6 +4583,7 @@ def tensor(data, *, dtype=None, device=None, layout=None, pin_memory=False):
     if isinstance(data, sympy.Basic):
 
         def inner_fn(index):
+            # [FUNCTION DOC] HELPER: Produce the sympy expression value cast to dtype, rounding through low precision for fp16/bf16.
             result = ops.index_expr(data, dtype)
             if _truncate_fp:
                 result = ops.to_dtype(result, dtype, use_compute_types=False)
@@ -4266,6 +4595,7 @@ def tensor(data, *, dtype=None, device=None, layout=None, pin_memory=False):
             data = torch.tensor(data, dtype=dtype).item()
 
         def inner_fn(index):
+            # [FUNCTION DOC] HELPER: Produce the constant scalar value.
             return ops.constant(data, dtype)
 
     elif len(data) == 0 or isinstance(data[0], (float, int)) and len(data) <= 8:
@@ -4273,7 +4603,9 @@ def tensor(data, *, dtype=None, device=None, layout=None, pin_memory=False):
         ranges.append(sympy.Integer(len(data)))
 
         def inner_fn(index):
+            # [FUNCTION DOC] HELPER: Select element data[index[0]] via a nested where over index comparisons; empty data yields zero.
             def binary_search(start, end):
+                # [FUNCTION DOC] HELPER: Recursive bisection producing a constant for single entries and a where on the midpoint otherwise.
                 if start >= end:
                     raise AssertionError("expected: start < end")
                 if end - start == 1:
@@ -4312,6 +4644,7 @@ def tensor(data, *, dtype=None, device=None, layout=None, pin_memory=False):
 
 @register_lowering(torch.as_tensor)
 def as_tensor(data, dtype=None, device=None):
+    # [FUNCTION DOC] Lowering for torch.as_tensor: for an IR tensor applies optional dtype and device conversions and returns it; otherwise builds a tensor from data.
     if isinstance(data, TensorBox):
         if dtype is not None:
             data = to_dtype(data, dtype)
@@ -4323,11 +4656,14 @@ def as_tensor(data, dtype=None, device=None):
 
 @register_lowering(torch.LongTensor)
 def long_tensor(data):
+    # [FUNCTION DOC] Lowering for torch.LongTensor: builds an int64 tensor from data.
     return tensor(data, dtype=torch.int64)
 
 
 @register_lowering(aten._local_scalar_dense)
 def _local_scalar_dense(data):
+    # [FUNCTION DOC] Lowering for aten._local_scalar_dense (item). Looks up the single unbacked symbol binding of the current node, registers a DynamicScalar buffer that generates the item call, and returns the
+    # node's value as a sympy expression (not a tensor). Raises an error if the unbacked bindings are missing or not exactly one. Side effect: registers a buffer and operation.
     # This is interesting!  Most lowerings return tensors, so you can just
     # return the buffer you allocated and it will get used (or not used, if
     # it's dead.)  But _local_scalar_dense (aka item) returns an int,
@@ -4375,6 +4711,7 @@ def _local_scalar_dense(data):
 
 @register_lowering(aten._assert_scalar)
 def _assert_scalar(data, msg):
+    # [FUNCTION DOC] Lowering for aten._assert_scalar: no-op returning None; runtime asserts are generated elsewhere at codegen time.
     # NB: These will be handled at codegen time
     # Not sure if we are guaranteed to be able to serve out truth from the
     # deferred_runtime_asserts, TODO: try this assert out
@@ -4387,10 +4724,13 @@ def _assert_scalar(data, msg):
 def _assert_tensor_metadata(
     a, size=None, stride=None, dtype=None, *, device=None, layout=None
 ):
+    # [FUNCTION DOC] Lowering for aten._assert_tensor_metadata: no-op returning None.
     return None
 
 
 def _full(fill_value, device, dtype, size):
+    # [FUNCTION DOC] HELPER: Build a Pointwise of the given size and dtype filled with fill_value, which may be a python scalar, sympy expression, a constant IR value, or a 0-d IR tensor
+    # (its single value is broadcast). Raises an error if a tensor fill value is not 0-d.
     value = fill_value
     if not isinstance(fill_value, (int, float)) and hasattr(value, "value"):
         value = value.value
@@ -4398,11 +4738,13 @@ def _full(fill_value, device, dtype, size):
     if isinstance(value, (int, float)):
 
         def inner_fn(index):
+            # [FUNCTION DOC] HELPER: Return the constant value.
             return ops.constant(value, dtype)
 
     elif isinstance(value, sympy.Basic):
 
         def inner_fn(index):
+            # [FUNCTION DOC] HELPER: Return the sympy expression value as an index expression.
             return ops.index_expr(value, dtype)
 
     else:
@@ -4411,6 +4753,7 @@ def _full(fill_value, device, dtype, size):
         value_loader = value.make_loader()
 
         def inner_fn(index):
+            # [FUNCTION DOC] HELPER: Return the 0-d tensor value loaded without indices.
             return value_loader([])
 
     return Pointwise.create(
@@ -4422,10 +4765,12 @@ def _full(fill_value, device, dtype, size):
 
 
 def full_like(x, fill_value, **kwargs):
+    # [FUNCTION DOC] HELPER: Implement full_like: create a tensor like x filled with fill_value, forwarding keyword arguments.
     return create_tensor_like(tensor_constructor(fill_value))(x, **kwargs)
 
 
 def tensor_constructor(fill_value):
+    # [FUNCTION DOC] HELPER: Build a creator for tensors filled with fill_value (zeros, ones, full), taking sizes and tensor options.
     # torch.zeros, torch.ones, etc
     def inner(
         *size,
@@ -4435,6 +4780,8 @@ def tensor_constructor(fill_value):
         pin_memory=False,
         memory_format=None,
     ):
+        # [FUNCTION DOC] HELPER: Create a filled tensor. Only strided layout and no memory_format are supported (NotImplementedError otherwise). Sizes may be given as varargs or one sequence;
+        # SymInt sizes raise an error (sizes must already be sympy). Result is pinned if requested.
         assert_nyi(layout in (None, torch.strided), f"layout={layout}")
         assert_nyi(not memory_format, "memory_format")
         device = decode_device(device)
@@ -4466,6 +4813,7 @@ def empty(
     pin_memory=None,
     memory_format=None,
 ):
+    # [FUNCTION DOC] Lowering for torch.empty/aten.empty: normalizes the size argument and delegates to empty_strided with no strides.
     device = decode_device(device)
     if len(size) == 1 and isinstance(size[0], (list, tuple, torch.Size)):
         size = tuple(size[0])
@@ -4475,6 +4823,7 @@ def empty(
 
 
 def create_tensor_like(creation_fn):
+    # [FUNCTION DOC] HELPER: Turn a creation function into its X_like variant (for example zeros_like built from zeros) that copies size, dtype and device from a reference tensor.
     """
     Shim to convert X_like(...) into X(...).  For example zeros_like() into zeros().
     """
@@ -4482,6 +4831,7 @@ def create_tensor_like(creation_fn):
     def _constant_like(
         x, *, dtype=None, device=None, layout=None, pin_memory=False, memory_format=None
     ):
+        # [FUNCTION DOC] HELPER: Create a tensor shaped like x via creation_fn; dtype defaults to x's, device to x's. pin_memory and non-strided layouts are not supported (NotImplementedError).
         assert_nyi(not pin_memory, "pin_memory")
         assert_nyi(layout in (None, torch.strided), f"layout={layout}")
         if dtype is None:
@@ -4498,6 +4848,7 @@ def create_tensor_like(creation_fn):
 
 
 def constant_like(fill_value):
+    # [FUNCTION DOC] HELPER: Build a like-creator filling with fill_value.
     return create_tensor_like(tensor_constructor(fill_value))
 
 
@@ -4507,9 +4858,11 @@ zeros_like = create_tensor_like(tensor_constructor(0))
 
 
 def new_constant(fill_value):
+    # [FUNCTION DOC] HELPER: Build the new_zeros/new_ones/new_full style lowering for fill_value.
     def _new_constant(
         x, size, *, dtype=None, layout=None, device=None, pin_memory=None
     ):
+        # [FUNCTION DOC] HELPER: Create a filled tensor of the given size list/tuple with dtype/device defaulting to x's. pin_memory and non-strided layouts are not supported.
         if not (isinstance(size, (list, tuple))):
             raise AssertionError("expected: isinstance(size, (list, tuple))")
         assert_nyi(not pin_memory, "pin_memory")
@@ -4525,6 +4878,7 @@ def new_constant(fill_value):
 
 @register_lowering(aten.new_empty)
 def new_empty(x, size, *, dtype=None, layout=None, device=None, pin_memory=None):
+    # [FUNCTION DOC] Lowering for aten.new_empty: empty_strided of the given size with dtype and device defaulting to x's.
     if dtype is None:
         dtype = x.get_dtype()
     if device is None:
@@ -4543,6 +4897,8 @@ def new_empty(x, size, *, dtype=None, layout=None, device=None, pin_memory=None)
 def empty_strided(
     size, stride, *, dtype=None, layout=None, device=None, pin_memory=None
 ):
+    # [FUNCTION DOC] Lowering for aten.empty_strided. Size must be list/tuple and stride list/tuple/None (else raises an error); only strided layout. Creates a realized zero-range computed buffer
+    # (so it becomes a no-op scheduler node) and then gives it a fixed layout with the requested (or contiguous) strides and pinned flag. Returns the pointwise node.
     if not (isinstance(size, (list, tuple))):
         raise AssertionError("expected: isinstance(size, (list, tuple))")
     if not (isinstance(stride, (list, tuple, type(None)))):
@@ -4579,6 +4935,7 @@ def empty_strided(
 def new_empty_strided(
     x, size, stride, *, dtype=None, layout=None, device=None, pin_memory=None
 ):
+    # [FUNCTION DOC] Lowering for aten.new_empty_strided: empty_strided with dtype and device defaulting to x's.
     if dtype is None:
         dtype = x.get_dtype()
     if device is None:
@@ -4595,6 +4952,7 @@ def new_empty_strided(
 
 @register_lowering(prims.copy_strided.default)
 def copy_strided(x, stride):
+    # [FUNCTION DOC] Lowering for prims.copy_strided: derives the stride order from the strides (via size hints) and requires x to have that order.
     stride = V.graph.sizevars.guarding_hints_or_throw(stride)
     stride_order = sorted(range(len(stride)), key=stride.__getitem__)
     return ir.ExternKernel.require_stride_order(x, stride_order)
@@ -4602,6 +4960,7 @@ def copy_strided(x, stride):
 
 @register_lowering([torch.full, aten.full])
 def full(size, fill_value, **kwargs):
+    # [FUNCTION DOC] Lowering for torch/aten full: raises an error if dtype is missing (decomposition should supply it), else creates a tensor filled with fill_value.
     if kwargs.get("dtype") is None:
         raise AssertionError("dtype should be handled by decomposition")
     return tensor_constructor(fill_value)(size, **kwargs)
@@ -4611,6 +4970,7 @@ def full(size, fill_value, **kwargs):
 def _efficientzerotensor(
     size, *, dtype=None, layout=None, device=None, pin_memory=False
 ):
+    # [FUNCTION DOC] Lowering for aten._efficientzerotensor: creates a scalar zero constant (outside any dispatch modes) and returns it expanded to size. Only strided layout is supported.
     assert_nyi(layout in (None, torch.strided), f"layout={layout}")
     dtype = torch.get_default_dtype() if dtype is None else decode_dtype(dtype)
     with torch.utils._python_dispatch._disable_current_modes():
@@ -4620,6 +4980,8 @@ def _efficientzerotensor(
 
 @register_lowering(aten.gather, type_promotion_kind=None)
 def gather(x, dim, index, sparse_grad=False):
+    # [FUNCTION DOC] Lowering for aten.gather. Empty index yields a new empty tensor of the index shape. 0-d inputs are expanded to one element. Builds a Pointwise over the index shape
+    # that replaces the coordinate on dim with the (bounds-checked, non-wrapping) index value and loads from x. sparse_grad is ignored. Raises an error if x is not a TensorBox.
     # sparse_grad doesn't affect forward computation,
     # and backward tracing is taken care of by AOT Autograd
     if not (isinstance(x, TensorBox)):
@@ -4640,6 +5002,7 @@ def gather(x, dim, index, sparse_grad=False):
     index_loader = index.make_loader()
 
     def fn(idx):
+        # [FUNCTION DOC] HELPER: Load x with the dim coordinate replaced by the gathered index.
         idx = list(idx)
         gather_idx = ops.indirect_indexing(index_loader(idx), size[dim], wrap_neg=False)
         if len(idx) == 0:
@@ -4658,6 +5021,9 @@ def gather(x, dim, index, sparse_grad=False):
 
 @register_lowering(aten.embedding, type_promotion_kind=None)
 def embedding(weight, indices, padding_idx=-1, scale_grad_by_freq=False, sparse=False):
+    # [FUNCTION DOC] Lowering for aten.embedding. Sparse gradients use the eager fallback. Otherwise weight and indices must be TensorBoxes with integer indices (raises an error otherwise); builds a
+    # Pointwise over indices shape plus embedding dims that looks up weight rows by index. padding_idx and scale_grad_by_freq do not affect the forward pass.
+    # KNOWN ISSUE: the later check that raises an error if sparse is set is unreachable because sparse returns earlier.
     if sparse:
         return fallback_handler(aten.embedding.default)(
             weight, indices, padding_idx, scale_grad_by_freq, sparse
@@ -4679,6 +5045,7 @@ def embedding(weight, indices, padding_idx=-1, scale_grad_by_freq=False, sparse=
     new_size = [*indices.get_size(), *weight_size[1:]]
 
     def fn(idx):
+        # [FUNCTION DOC] HELPER: Look up the weight row selected by the index at the leading coordinates, keeping the embedding-dim coordinates.
         if len(idx) != len(new_size):
             raise AssertionError(f"{idx} != {new_size}")
         var_index = indices_loader(idx[:indices_ndim])
@@ -4696,6 +5063,8 @@ def embedding(weight, indices, padding_idx=-1, scale_grad_by_freq=False, sparse=
 
 
 def check_and_broadcast_indices(indices, device):
+    # [FUNCTION DOC] HELPER: Validate and broadcast index tensors for advanced indexing. Raises an error if any index is not an integer or bool/uint8 type, NotImplementedError for bool/uint8 indices
+    # or indices on another device; requires at least one non-None index. Returns (indices with non-None entries broadcast together, positions of the non-None entries).
     if not (
         all(
             i.get_dtype() in (torch.int64, torch.int32, torch.bool, torch.uint8)
@@ -4736,6 +5105,9 @@ def index_output_size_and_inner_fn(
     check,
     wrap_neg=True,
 ):
+    # [FUNCTION DOC] HELPER: Compute the output shape and index mapping function for advanced (tensor) indexing. Output dims are the non-indexed dims with the broadcast index shape inserted at
+    # the first indexed position (or at the front if the tensor indices are non-consecutive, as in eager). Returns (output_size, fn) where fn maps an output index to the input index list (bounds-checked
+    # indirect indexing for indexed dims, wrapping negatives if wrap_neg) and, if x_loader is given, loads from x.
     # Note that behavior of indexing differs when there are non consecutive
     # tensors. In this case, the tensor index is pulled to the beginning.
     #
@@ -4762,6 +5134,8 @@ def index_output_size_and_inner_fn(
         )
 
     def fn(idx):
+        # [FUNCTION DOC] HELPER: Map an output index to an input index: unindexed dims copy the matching output coordinates, indexed dims use their index tensor loaders on the broadcast coordinates.
+        # Raises an error on inconsistent lengths or missing loaders.
         if len(idx) != len(output_size):
             raise AssertionError("expected: len(idx) == len(output_size)")
         if len(indices_loaders) != len(indexed_size):
@@ -4803,6 +5177,7 @@ def index_output_size_and_inner_fn(
 
 
 def index_impl(x, indices, check):
+    # [FUNCTION DOC] HELPER: Build a Pointwise gather-by-indices node for x using index_impl_helper (check controls bounds checking).
     output_size, inner_fn, _ = index_impl_helper(x, indices, check)
 
     return Pointwise.create(
@@ -4814,6 +5189,8 @@ def index_impl(x, indices, check):
 
 
 def index_impl_helper(x, indices, check, wrap_neg=True):
+    # [FUNCTION DOC] HELPER: Prepare advanced indexing of x. Validates indices, broadcasts them, and returns (output_size, inner_fn loading x, index_inner_fn mapping output index to input index).
+    # Raises an error if indices is not a list/tuple or has no tensor, and IndexError when indexing a zero-size dim with non-empty indices under check.
     if not (isinstance(indices, (list, tuple))):
         raise AssertionError("expected: isinstance(indices, (list, tuple))")
     x_loader = x.make_loader()
@@ -4847,6 +5224,7 @@ def index_impl_helper(x, indices, check, wrap_neg=True):
     )
 
     def inner_fn(idx):
+        # [FUNCTION DOC] HELPER: Load x at the input index computed from the output index.
         return x_loader(index_inner_fn(idx))
 
     return output_size, inner_fn, index_inner_fn
@@ -4854,6 +5232,7 @@ def index_impl_helper(x, indices, check, wrap_neg=True):
 
 @register_lowering(aten.index, type_promotion_kind=None)
 def index(x, indices):
+    # [FUNCTION DOC] Lowering for aten.index with bounds checks. Falls back to the eager kernel (after realizing x) if the index cannot be lowered, such as boolean indices.
     try:
         return index_impl(x, indices, check=True)
     except NotImplementedError:
@@ -4866,6 +5245,7 @@ def index(x, indices):
 
 @register_lowering(aten._unsafe_index, type_promotion_kind=None)
 def _unsafe_index(x, indices):
+    # [FUNCTION DOC] Lowering for aten._unsafe_index: indexing without bounds checks.
     return index_impl(x, indices, check=False)
 
 
@@ -4879,6 +5259,7 @@ def _unsafe_index(x, indices):
 # https://github.com/pytorch/torchdynamo/issues/1863
 @register_lowering(aten.index_put, type_promotion_kind=None)
 def index_put(x, indices, values, accumulate=False):
+    # [FUNCTION DOC] Lowering for aten.index_put (out of place): index_put_ on a clone, with checks, without realizing values. Kept as a lowering because it introduces mutation.
     return index_put_impl_(
         clone(x), indices, values, accumulate, check=True, may_realize=False
     )
@@ -4886,12 +5267,14 @@ def index_put(x, indices, values, accumulate=False):
 
 @register_lowering(aten._unsafe_index_put)
 def _unsafe_index_put(x, indices, values, accumulate=False):
+    # [FUNCTION DOC] Lowering for aten._unsafe_index_put: clone then index_put_ without bounds checks.
     return index_put_impl_(
         clone(x), indices, values, accumulate, check=False, may_realize=False
     )
 
 
 def index_put_as_masked_fill(self, indices, value, accumulate):
+    # [FUNCTION DOC] HELPER: Implement index_put with a single boolean mask and single value as a masked fill: moves value to self's device, adds self if accumulating, and mutates self to where(mask, value, self).
     if value.get_device() != self.get_device():
         value = to_device(value, self.get_device())
     if accumulate:
@@ -4900,6 +5283,8 @@ def index_put_as_masked_fill(self, indices, value, accumulate):
 
 
 def index_put_fallback(self, indices, values, accumulate):
+    # [FUNCTION DOC] HELPER: Lower index_put_ to the eager IndexPutFallback kernel and return self. If the node uses boolean indexing that is CUDA-graph-unsafe (and graph partitioning is off),
+    # records a reason on the graph disabling cudagraphs, including the stack trace if available.
     from .utils import _fx_node_is_input_dependent_cudagraph_unsafe
 
     op_overload = getattr(aten.index_put_, V.graph.current_node.target._overloadname)  # type: ignore[union-attr]
@@ -4924,6 +5309,7 @@ def index_put_fallback(self, indices, values, accumulate):
 
 @register_lowering(aten.index_put_, type_promotion_kind=None)
 def index_put_(self, indices, values, accumulate=False):
+    # [FUNCTION DOC] Lowering for aten.index_put_ with bounds checks; may realize values to avoid overlap hazards.
     return index_put_impl_(
         self, indices, values, accumulate, check=True, may_realize=True
     )
@@ -4931,15 +5317,20 @@ def index_put_(self, indices, values, accumulate=False):
 
 @register_lowering(inductor_prims._unsafe_index_put_, type_promotion_kind=None)
 def _unsafe_index_put_(self, indices, values, accumulate=False):
+    # [FUNCTION DOC] Lowering for the unsafe in-place index_put_ (no bounds checks).
     return index_put_impl_(
         self, indices, values, accumulate, check=False, may_realize=True
     )
 
 
 def index_put_impl_(self, indices, values, accumulate, check, may_realize=False):
+    # [FUNCTION DOC] HELPER: Core in-place index_put. Optionally realizes values if they overlap self (unless indices come from randperm). Uses a masked fill for single boolean index with a single value,
+    # the eager fallback for deterministic mode, boolean indices, atomic-add-limited GPU dtypes, or unsupported indices. Otherwise broadcasts indices, expands values to the indexed shape,
+    # and registers a Scatter (atomic add if accumulating) as a mutation of self. 0-d inputs are viewed as one element and restored. Returns self.
     if may_realize:
 
         def indice_slice_from_randperm(indice):
+            # [FUNCTION DOC] HELPER: True if the index tensor is a view of an extern randperm kernel result, which guarantees unique indices.
             # Refer to: https://github.com/pytorch/pytorch/pull/139366#discussion_r1825424660
             # For this specific pattern, indices is unique as coming from torch.randperm.
             # However, as the content of the indices is unknown, we have to check this specific pattern.
@@ -5072,6 +5463,7 @@ fallback__unsafe_masked_index_put_accumulate = fallback_handler(
 
 @register_lowering(aten._unsafe_masked_index, type_promotion_kind=None)
 def _unsafe_masked_index(self, mask, indices, fill):
+    # [FUNCTION DOC] Lowering for aten._unsafe_masked_index: gathers self at indices (no bounds check, no negative wrapping) where the mask is true and uses fill elsewhere, as a Pointwise.
     ranges, _, _unsafe_index_fn = index_impl_helper(
         self, indices, check=False, wrap_neg=False
     )
@@ -5079,6 +5471,7 @@ def _unsafe_masked_index(self, mask, indices, fill):
     self_loader = self.make_loader()
 
     def inner_fn(idx):
+        # [FUNCTION DOC] HELPER: Convert the mask to bool and load the indexed value under it, else fill.
         if mask.dtype != torch.bool:
             mask_val = ops.to_dtype(mask_loader(idx), torch.bool)
         else:
@@ -5095,6 +5488,7 @@ def _unsafe_masked_index(self, mask, indices, fill):
 
 @register_lowering(aten._unsafe_masked_index_put_accumulate, type_promotion_kind=None)
 def _unsafe_masked_index_put_accumulate(x, mask, indices, values):
+    # [FUNCTION DOC] Lowering for aten._unsafe_masked_index_put_accumulate: zeroes masked-out values, clamps indices into range, and accumulates with an unsafe index_put on a clone of x.
     masked_value = where(mask, values, 0)
     shape = x.get_size()
     clamped_indices = [
@@ -5108,11 +5502,13 @@ def _unsafe_masked_index_put_accumulate(x, mask, indices, values):
 
 @make_pointwise
 def clamp(a, min, max):
+    # [FUNCTION DOC] Pointwise clamp lowering: elementwise max(min, min(max, a)).
     return ops.maximum(min, ops.minimum(max, a))
 
 
 @register_lowering(aten.as_strided_scatter, type_promotion_kind=None)
 def as_strided_scatter(self, src, size, stride, storage_offset=None):
+    # [FUNCTION DOC] Lowering for aten.as_strided_scatter: clones self, copies src into a strided view of the clone, and returns the clone.
     output = clone(self)
     output_view = as_strided(output, size, stride, storage_offset)
     copy_(output_view, src)
@@ -5121,6 +5517,7 @@ def as_strided_scatter(self, src, size, stride, storage_offset=None):
 
 @register_lowering(aten.scatter, type_promotion_kind=None)
 def scatter(x, dim: int, index, src, **kwargs):
+    # [FUNCTION DOC] Lowering for aten.scatter: scatter_ applied to a clone of x.
     return scatter_(clone(x), dim, index, src, **kwargs)
 
 
@@ -5134,6 +5531,7 @@ def scatter_fallback(
     reduce: str | None = None,
     include_self: bool = True,
 ):
+    # [FUNCTION DOC] HELPER: If the backend policy requires it for this op, reduce mode and dtypes, emit a ScatterFallback kernel and return self; otherwise return None.
     src_is_tensor = isinstance(src, TensorBox)
     if use_scatter_fallback(
         op_overload,
@@ -5160,6 +5558,8 @@ def scatter_fallback(
 
 @register_lowering(aten.scatter_, type_promotion_kind=None)
 def scatter_(self, dim: int, index, src, *, reduce: str | None = None):
+    # [FUNCTION DOC] Lowering for in-place scatter_. reduce must be None, add or multiply (else raises an error). With no reduce tries the eager fallback; otherwise maps add to sum and multiply to prod
+    # and delegates to scatter_reduce_.
     if reduce not in (None, "add", "multiply"):
         raise AssertionError('expected: reduce in (None, "add", "multiply")')
     if reduce is None:
@@ -5179,21 +5579,27 @@ def scatter_(self, dim: int, index, src, *, reduce: str | None = None):
 
 @register_lowering(aten.scatter_add, type_promotion_kind=None)
 def scatter_add(x, dim: int, index, src):
+    # [FUNCTION DOC] Lowering for aten.scatter_add: scatter_add_ on a clone.
     return scatter_add_(clone(x), dim, index, src)
 
 
 @register_lowering(aten.scatter_add_, type_promotion_kind=None)
 def scatter_add_(x, dim: int, index, src):
+    # [FUNCTION DOC] Lowering for in-place scatter_add_: scatter_reduce_ with sum.
     return scatter_reduce_(x, dim, index, src, "sum")
 
 
 @register_lowering(aten.scatter_reduce, type_promotion_kind=None)
 def scatter_reduce(x, dim: int, index, src, reduction_type, **kwargs):
+    # [FUNCTION DOC] Lowering for aten.scatter_reduce: scatter_reduce_ on a clone.
     return scatter_reduce_(clone(x), dim, index, src, reduction_type, **kwargs)
 
 
 @register_lowering(aten.scatter_reduce_, type_promotion_kind=None)
 def scatter_reduce_(self, dim: int, index, src, reduce, *, include_self: bool = True):
+    # [FUNCTION DOC] Lowering for in-place scatter_reduce_. Validates reduce (raises an error for unsupported modes). Numbers become filled tensors; uses the eager fallback when required; otherwise
+    # treats 0-d inputs as one element, returns early on empty index, requires an integer index, realizes self, and registers a Scatter mutation (atomic add for sum; other reductions are not supported
+    # natively and trip an assertion). If include_self is false, first zeroes the target elements. Returns self.
     if reduce not in (None, "sum", "prod", "mean", "amax", "amin"):
         raise AssertionError(
             'expected: reduce in (None, "sum", "prod", "mean", "amax", "amin")'
@@ -5248,6 +5654,7 @@ def scatter_reduce_(self, dim: int, index, src, reduce, *, include_self: bool = 
     src_loader = src.make_loader() if isinstance(src, TensorBox) else None
 
     def output_indexer(idx):
+        # [FUNCTION DOC] HELPER: Map an index position to the output position by replacing the dim coordinate with the (non-wrapping) loaded index.
         # self is captured from the end of the function, so it may have 0 dim
         shape = self.get_size()
         ndim = len(shape)
@@ -5258,6 +5665,7 @@ def scatter_reduce_(self, dim: int, index, src, reduce, *, include_self: bool = 
         return indirect_idx
 
     def fn(idx):
+        # [FUNCTION DOC] HELPER: Value to scatter: loaded from src, or the scalar src constant.
         if src_loader:
             return src_loader(idx)
         else:
@@ -5266,6 +5674,7 @@ def scatter_reduce_(self, dim: int, index, src, reduce, *, include_self: bool = 
             return ops.constant(src, self.get_dtype())
 
     def backend_reduce_str(reduce):
+        # [FUNCTION DOC] HELPER: Map reduce kind to the scatter mode: sum becomes atomic_add, None stays None, anything else raises an error.
         if reduce == "sum":
             return "atomic_add"
         else:
@@ -5327,6 +5736,8 @@ def upsample_nearestnd(
     n: int = 2,
     exact: bool = False,
 ):
+    # [FUNCTION DOC] HELPER: Nearest-neighbor upsampling over the last n dims. Hints x for realization, computes inverse scales from input/output sizes (or provided scales), and builds a Pointwise
+    # that maps each output coordinate to floor(scale * coordinate), with a 0.5 offset in exact mode, as a bounds-unchecked indirect index. Returns a TensorBox. Raises an error if scales_x has the wrong length.
     x.realize_hint()  # elements are reused
     x_loader = x.make_loader()
     i_sizes = x.get_size()[-n:]
@@ -5343,6 +5754,7 @@ def upsample_nearestnd(
             inv_scales[i] = 1.0 / scale
 
     def scale_fn(x, scale, size):
+        # [FUNCTION DOC] HELPER: Map an output coordinate to an input index with the nearest or nearest-exact formula in float32.
         # Nearest Exact: input_index = round(scale * (output_index + 0.5) - 0.5)
         #                            = floor(scale * (output_index + 0.5))
         # Nearest: input_index = floor(scale * output_index)
@@ -5354,6 +5766,7 @@ def upsample_nearestnd(
         return ops.indirect_indexing(x, size, check=False)
 
     def fn(idx):
+        # [FUNCTION DOC] HELPER: Load x at batch coordinates and scaled spatial coordinates.
         x = idx[-n:]
         b = idx[:-n]
         return x_loader(
@@ -5370,11 +5783,13 @@ def upsample_nearestnd(
 
 @register_lowering(aten.upsample_nearest1d.default)
 def upsample_nearest1d(x, output_size, scales: float | None = None):
+    # [FUNCTION DOC] Lowering for aten.upsample_nearest1d: nearest upsampling over one spatial dim.
     return upsample_nearestnd(x, output_size, (scales,), n=1)
 
 
 @register_lowering(aten._upsample_nearest_exact1d.default)
 def _upsample_nearest_exact1d(x, output_size, scales: float | None = None):
+    # [FUNCTION DOC] Lowering for aten._upsample_nearest_exact1d: exact-mode nearest upsampling over one spatial dim.
     return upsample_nearestnd(x, output_size, (scales,), n=1, exact=True)
 
 
@@ -5382,6 +5797,7 @@ def _upsample_nearest_exact1d(x, output_size, scales: float | None = None):
 def upsample_nearest2d(
     x, output_size, scales_h: float | None = None, scales_w: float | None = None
 ):
+    # [FUNCTION DOC] Lowering for aten.upsample_nearest2d: nearest upsampling over two spatial dims with optional scales.
     return upsample_nearestnd(x, output_size, (scales_h, scales_w), n=2)
 
 
@@ -5389,6 +5805,7 @@ def upsample_nearest2d(
 def _upsample_nearest_exact2d(
     x, output_size, scales_h: float | None = None, scales_w: float | None = None
 ):
+    # [FUNCTION DOC] Lowering for aten._upsample_nearest_exact2d: exact-mode nearest upsampling over two spatial dims.
     return upsample_nearestnd(x, output_size, (scales_h, scales_w), n=2, exact=True)
 
 
@@ -5400,6 +5817,7 @@ def upsample_nearest3d(
     scales_h: float | None = None,
     scales_w: float | None = None,
 ):
+    # [FUNCTION DOC] Lowering for aten.upsample_nearest3d: nearest upsampling over three spatial dims with optional scales.
     return upsample_nearestnd(x, output_size, (scales_d, scales_h, scales_w), n=3)
 
 
@@ -5411,22 +5829,26 @@ def _upsample_nearest_exact3d(
     scales_h: float | None = None,
     scales_w: float | None = None,
 ):
+    # [FUNCTION DOC] Lowering for aten._upsample_nearest_exact3d: exact-mode nearest upsampling over three spatial dims.
     return upsample_nearestnd(
         x, output_size, (scales_d, scales_h, scales_w), n=3, exact=True
     )
 
 
 def _create_constants(*args, dtype):
+    # [FUNCTION DOC] HELPER: Return a tuple of ops constants of the given dtype, one per argument.
     return tuple(ops.constant(a, dtype) for a in args)
 
 
 @register_lowering(prims.rev.default)
 def rev(x, dims):
+    # [FUNCTION DOC] Lowering for prims.rev: reverses x along the given (already canonical) dims via a Pointwise that mirrors those coordinates.
     # note - dims pre-canonicalized
     x_loader = x.make_loader()
     sizes = x.get_size()
 
     def loader(idx):
+        # [FUNCTION DOC] HELPER: Mirror the index on each reversed dim and load from x; raises an error on rank mismatch.
         idx = list(idx)
         if len(idx) != len(sizes):
             raise AssertionError("expected: len(idx) == len(sizes)")
@@ -5446,6 +5868,9 @@ def rev(x, dims):
 def inplace_constant_pad_nd(
     x: TensorBox, padding: Sequence[int], fill_value: float
 ) -> TensorBox | None:
+    # [FUNCTION DOC] HELPER: Try to implement a 2-D right-pad of the last dim in place: if the padded width fits within the existing row stride, resize the buffer (via an as_strided view of the larger padded size),
+    # fill the padding columns, record the padded size on the graph, and bump a counter. Returns the resized view, or None whenever it does not apply (padding fusable with the consumer, non-2-D, left/top/bottom padding,
+    # unrealizable input, non-unit inner stride, or insufficient row stride). Realizes and freezes the layout of x as a side effect.
     """
     This optimization changes the semantics of padding from 'clone'
     style to 'view' style.
@@ -5455,6 +5880,7 @@ def inplace_constant_pad_nd(
     """
 
     def _padding_can_be_fused():
+        # [FUNCTION DOC] HELPER: Conservative check whether the pad could fuse into its consumer; False only when the single user is a matmul-like op (mm/addmm), where in-place padding saves bandwidth.
         """
         Conservatively check if padding can be fused with downstream op.
         1. if the downstream op is a sum, then there is little benefit to
@@ -5542,6 +5968,8 @@ def inplace_constant_pad_nd(
 def _pad_as_cat(
     x: TensorBox, padding: Sequence[int], fill_value: float
 ) -> TensorBox | None:
+    # [FUNCTION DOC] HELPER: Rewrite a single-dimension non-negative right-pad as concatenation of x with a constant-filled tensor along that dim. Returns None for symbolic padding, left padding, trimming, multi-dim padding, no padding, or CPU.
+    # Increments a counter on success. Returns the cat result.
     """Decompose right-pad into cat([x, fill], dim) and delegate to cat lowering.
 
     The cat lowering already has heuristics for choosing between pointwise_cat
@@ -5594,6 +6022,8 @@ def _pad_as_cat(
 
 @register_lowering(aten.constant_pad_nd, type_promotion_kind=None)
 def constant_pad_nd(x, padding, fill_value=0):
+    # [FUNCTION DOC] Lowering for aten.constant_pad_nd. Padding length must be even (raises an error otherwise). All-zero padding is a clone. Tries in-place padding (when enabled), then pad-as-cat, and otherwise builds a Pointwise over the padded
+    # shape that loads from x at the shifted index under a range mask and uses the fill value outside. Padding is given in reverse dim order as (low, high) pairs.
     if len(padding) % 2 != 0:
         raise AssertionError("expected: (len(padding) % 2) == 0")
     if all(p == 0 for p in padding):
@@ -5629,6 +6059,7 @@ def constant_pad_nd(x, padding, fill_value=0):
     fill_value = dtype_to_type(x.get_dtype())(fill_value)
 
     def mask(index):
+        # [FUNCTION DOC] HELPER: Combine low/high range masks over the padded dims and load x under that mask, else fill value.
         mask = []
         for idx, (low, high), length in zip(index[n:], bounds, mask_sizes):
             if low != 0:
@@ -5639,6 +6070,7 @@ def constant_pad_nd(x, padding, fill_value=0):
         return ops.masked(mask, lambda: x_loader(index), fill_value)
 
     def offset_fn(index):
+        # [FUNCTION DOC] HELPER: Shift the padded index by the low padding (precomputed) and evaluate the masked load.
         new_index = list(index[:n])
         for idx, (low, _high) in zip(index[n:], bounds_precomp):
             new_index.append(idx - low)
@@ -5656,6 +6088,7 @@ def constant_pad_nd(x, padding, fill_value=0):
 
 
 def range_mask_low(i: sympy.Expr, low: sympy.Expr | int):
+    # [FUNCTION DOC] HELPER: Mask that is true when index i is greater than or equal to low.
     return ops.ge(
         ops.index_expr(i, torch.int64),
         ops.index_expr(sympy.Integer(low), torch.int64),
@@ -5663,6 +6096,7 @@ def range_mask_low(i: sympy.Expr, low: sympy.Expr | int):
 
 
 def range_mask_high(i: sympy.Expr, high: sympy.Expr):
+    # [FUNCTION DOC] HELPER: Mask that is true when index i is less than high.
     return ops.lt(
         ops.index_expr(i, torch.int64),
         ops.index_expr(high, torch.int64),
@@ -5670,6 +6104,7 @@ def range_mask_high(i: sympy.Expr, high: sympy.Expr):
 
 
 def range_mask(i: sympy.Expr, high: sympy.Expr, low: sympy.Expr):
+    # [FUNCTION DOC] HELPER: Mask that is true when i lies within [low, high).
     return ops.and_(
         range_mask_low(i, low),
         range_mask_high(i, high),
@@ -5679,12 +6114,15 @@ def range_mask(i: sympy.Expr, high: sympy.Expr, low: sympy.Expr):
 def constant_boundary_condition(
     x, fill_value, padding=None, pad_fill_value=1.0, dim=None
 ):
+    # [FUNCTION DOC] HELPER: Build a loader over x that returns fill_value outside the spatial bounds of the last dim dims (extended by padding if given), and inside the padding region returns the value from a nested boundary loader with pad_fill_value;
+    # inside the bounds loads x.
     h = x.get_size()[-dim:]
     x_loader = x.make_loader()
     # pyrefly: ignore [unsupported-operation]
     padding_h = padding or [0] * dim
 
     def load(index):
+        # [FUNCTION DOC] HELPER: Apply the bounds mask to the index and load the proper value.
         prefix = index[:-dim]
         ih = index[-dim:]
 
@@ -5709,6 +6147,8 @@ def constant_boundary_condition(
 
 
 def pooling_size(x, i, kernel_size, stride, padding, ceil_mode, *, dilation=None):
+    # [FUNCTION DOC] HELPER: Compute pooling output length for spatial dim i from input size x and kernel, stride, padding and dilation. In ceil mode the alternate size is used if the last window starts within input/padding
+    # and differs from floor mode. Returns (output size, effective ceil_mode flag; False when ceil mode has no effect).
     if dilation is None:
         dilation = [1] * len(padding)
 
@@ -5739,6 +6179,7 @@ def pooling_size(x, i, kernel_size, stride, padding, ceil_mode, *, dilation=None
 
 
 def should_fallback_max_pool_with_indices(kernel_size, *, n_dim):
+    # [FUNCTION DOC] HELPER: True if the max-pool window (product of kernel sizes) exceeds 25 elements, in which case the eager fallback is preferred.
     kernel_size = pad_listlike(kernel_size, n_dim)
     window_size = functools.reduce(operator.mul, kernel_size)
     return window_size > 25
@@ -5747,6 +6188,8 @@ def should_fallback_max_pool_with_indices(kernel_size, *, n_dim):
 def max_pool_checks(
     x, kernel_size, stride, padding, dilation, n_dim, *, assert_fallback=None
 ):
+    # [FUNCTION DOC] HELPER: Normalize max-pool parameters (scalar defaults expanded, stride defaulting to kernel size, list-like padded to n_dim) and validate ranks (raises an error on mismatch). Returns
+    # (kernel_size, stride, padding, dilation, use_fallback). If assert_fallback is given, raises an error if the computed fallback decision differs.
     if padding == 0:
         padding = [0] * n_dim
     if dilation == 1:
@@ -5790,6 +6233,8 @@ def _max_pool_with_offsets(
     *,
     n_dim,
 ):
+    # [FUNCTION DOC] HELPER: Compute max pooling as two Reductions over the pooling window: max values and argmax window offsets (int64). Uses boundary masks with the dtype minimum when padding, ceil mode or dilation apply.
+    # Realizes each result only if the reduction was not unrolled. Returns (values, offsets).
     x.realize_hint()
     batch = x.shape[:-n_dim]
     dhw = x.shape[-n_dim:]
@@ -5817,6 +6262,7 @@ def _max_pool_with_offsets(
         x_loader = x.make_loader()
 
     def fn_inner(idx, reduction_idx):
+        # [FUNCTION DOC] HELPER: Map output coordinates plus window offsets to input coordinates (stride, dilation, padding) and load.
         prefix = idx[:-n_dim]
         bh = idx[-n_dim:]
         ih = [
@@ -5864,6 +6310,8 @@ def _low_memory_max_pool_with_offsets(
     dilation,
     ceil_mode=False,
 ):
+    # [FUNCTION DOC] Lowering for the low-memory max pool prim. Verifies via max_pool_checks that the non-fallback path applies, computes values and offsets with reduction unrolling up to 25 elements,
+    # and returns (values, offsets cast to int8).
     n_dim = len(kernel_size)
 
     # assert we are not on a fallback path, the inductor decomp should have guaranteed this
@@ -5899,11 +6347,13 @@ def _pool_offsets_to_indices(
         torch._inductor.virtualized.OpsValue,
     ],
 ) -> TensorBox:
+    # [FUNCTION DOC] HELPER: Convert pooling window offsets (flat position within the window) to flattened input indices: unflatten the offset to window coordinates, map to input coordinates with increments_to_index, and flatten against the trailing input size. Returns an int64 Pointwise.
     n_dim = len(kernel_size)
     offsets_loader = offsets.make_loader()
     window_size = sympy.sympify(functools.reduce(operator.mul, kernel_size))
 
     def offsets_to_indices(idx):
+        # [FUNCTION DOC] HELPER: Convert one loaded offset to a flattened input index.
         offset = offsets_loader(idx)
         offset_sympy = ops.indirect_indexing(offset, window_size)
         reduction_idx = inductor_prims._flattened_index_to_nd(offset_sympy, kernel_size)
@@ -5927,10 +6377,12 @@ def _pool_offsets_to_indices(
 def _low_memory_max_pool_offsets_to_indices(
     offsets, kernel_size, input_size, stride, padding, dilation
 ):
+    # [FUNCTION DOC] Lowering for the max-pool offsets-to-indices prim: computes input indices from window offsets using stride, padding and dilation.
     # TODO: Generalize to other max pooling flavors
     n_dim = len(kernel_size)
 
     def increments_to_index(idx, reduction_idx):
+        # [FUNCTION DOC] HELPER: Input coordinates for output coordinates plus window offsets.
         bh = idx[-n_dim:]
         return [
             (bh[i] * stride[i]) + (reduction_idx[i] * dilation[i]) - padding[i]
@@ -5951,6 +6403,7 @@ def _max_pool_with_indices(
     ceil_mode,
     n_dim,
 ):
+    # [FUNCTION DOC] HELPER: Max pooling returning (values, indices): validates arguments, computes values and offsets, then converts offsets to flat input indices.
     kernel_size, stride, padding, dilation, _ = max_pool_checks(
         x, kernel_size, stride, padding, dilation, n_dim=n_dim
     )
@@ -5981,6 +6434,7 @@ def max_pool2d_with_indices(
     dilation=1,
     ceil_mode=False,
 ):
+    # [FUNCTION DOC] Lowering for aten.max_pool2d_with_indices (used when the low-memory decomposition is not applied): 2-D max pool returning (values, indices).
     return _max_pool_with_indices(
         x, kernel_size, stride, padding, dilation, ceil_mode, n_dim=2
     )
@@ -5996,6 +6450,7 @@ def max_pool3d_with_indices(
     dilation=1,
     ceil_mode=False,
 ):
+    # [FUNCTION DOC] Lowering for aten.max_pool3d_with_indices (used when the low-memory decomposition is not applied): 3-D max pool returning (values, indices).
     return _max_pool_with_indices(
         x, kernel_size, stride, padding, dilation, ceil_mode, n_dim=3
     )
@@ -6011,6 +6466,9 @@ fallback_max_pool2d_with_indices_backward = fallback_handler(
 def max_pool2d_with_indices_backward(
     grad_output, x, kernel_size, stride, padding, dilation, ceil_mode, indices
 ):
+    # [FUNCTION DOC] Lowering for aten.max_pool2d_with_indices_backward. Uses the eager fallback on XPU, for dilation other than 1, or when the number of pooled windows covering an input element exceeds 25. Otherwise normalizes parameters,
+    # validates ranks (raises an error), and builds a Pointwise over the input shape that, for each input element, scans the bounded set of covering output windows and sums grad_output where the stored index equals the element's flat position.
+    # Result is forced channels-last if x or grad_output is channels-last.
     if x.get_device().type == "xpu":
         return fallback_max_pool2d_with_indices_backward(
             grad_output, x, kernel_size, stride, padding, dilation, ceil_mode, indices
@@ -6095,6 +6553,7 @@ def max_pool2d_with_indices_backward(
     indices_size = indices.get_size()
 
     def fn(idx):
+        # [FUNCTION DOC] HELPER: For one input position, loop over the fixed window grid of candidate output positions, clamp their indices, and accumulate gradient where the pooled index matches the position and the window is in range.
         *prefix, h, w = idx
         index_test = ops.index_expr(h * width + w, torch.int32)
         h = h + padding[0]
@@ -6167,9 +6626,11 @@ def max_pool2d_with_indices_backward(
 
 
 def pad_adaptive_loader(x, pad_val=0.0):
+    # [FUNCTION DOC] HELPER: Return a loader for adaptive pooling windows that yields x at start plus increment, or pad_val when that position is past the window end.
     x_loader = x.make_loader()
 
     def load(prefix, increments, start_indices, end_indices):
+        # [FUNCTION DOC] HELPER: Masked load of one window element given the prefix index, increments and the window start and end indices per spatial dim.
         ih, iw = increments
         h_start_index, w_start_index = start_indices
         h_end_index, w_end_index = end_indices
@@ -6195,6 +6656,7 @@ def pad_adaptive_loader(x, pad_val=0.0):
 
 
 def compute_indices_adaptive_pooling(start_index, end_index, h_in, w_in, h_out, w_out):
+    # [FUNCTION DOC] HELPER: Bind output and input dims to the start/end index functions for height and width; returns (h start fn, h end fn, w start fn, w end fn).
     h_start_index = functools.partial(start_index, out_dim=h_out, inp_dim=h_in)
     h_end_index = functools.partial(end_index, out_dim=h_out, inp_dim=h_in)
 
@@ -6207,6 +6669,7 @@ def compute_indices_adaptive_pooling(start_index, end_index, h_in, w_in, h_out, 
 def _adaptive_pooling_fn(
     start_index, end_index, kernel_maxes, in_sizes, out_sizes, pooling_fn
 ):
+    # [FUNCTION DOC] HELPER: Build an index function for 2-D adaptive pooling that, for an output position, loops over the maximum window size, loads each element via loader and combines them with pooling_fn (add, maximum). Returns that function of (idx, loader).
     h_in, w_in = in_sizes
     h_out, w_out = out_sizes
 
@@ -6220,6 +6683,7 @@ def _adaptive_pooling_fn(
     )
 
     def fn(idx, loader):
+        # [FUNCTION DOC] HELPER: Reduce all window elements for output position idx with the pooling function.
         *prefix, bh, bw = idx
 
         h_start_index = h_start_index_fn(bh)
@@ -6247,6 +6711,7 @@ def _adaptive_pooling_fn(
 
 def _adaptive_pooling_fn_with_idx(
     start_index, end_index, kernel_maxes, in_sizes, out_sizes, pooling_fn
+# [FUNCTION DOC] HELPER: Like the adaptive pooling function builder but tracks the flat input index of the maximum element and returns that index (int64) instead of the value.
 ):
     h_in, w_in = in_sizes
     h_out, w_out = out_sizes
@@ -6261,6 +6726,7 @@ def _adaptive_pooling_fn_with_idx(
     )
 
     def fn(idx, loader):
+        # [FUNCTION DOC] HELPER: Return the flat index of the maximum element in the window for output position idx.
         *prefix, bh, bw = idx
 
         h_start_index = h_start_index_fn(bh)
@@ -6305,6 +6771,8 @@ fallback_adaptive_avg_pool2d = fallback_handler(
 
 @register_lowering(aten._adaptive_avg_pool2d)
 def _adaptive_avg_pool2d(x, output_size):
+    # [FUNCTION DOC] Lowering for aten._adaptive_avg_pool2d. Requires a TensorBox and a 2-element output size (raises an error otherwise). Empty outputs give an empty tensor; int64 raises RuntimeError; equal sizes clone;
+    # evenly divisible sizes use avg_pool2d; windows larger than 25 elements use the eager fallback; otherwise a Pointwise computes window sum divided by the count of in-range elements.
     if not (isinstance(x, TensorBox)):
         raise AssertionError("expected: isinstance(x, TensorBox)")
     if len(output_size) != 2:
@@ -6349,9 +6817,11 @@ def _adaptive_avg_pool2d(x, output_size):
     w_kernel_max = V.graph.sizevars.guard_int(w_kernel_max)
 
     def start_index(index, out_dim, inp_dim):
+        # [FUNCTION DOC] HELPER: Start of the adaptive window for an output index: floor(index * inp / out).
         return FloorDiv((index * inp_dim), out_dim)
 
     def end_index(index, out_dim, inp_dim):
+        # [FUNCTION DOC] HELPER: End of the adaptive window for an output index: ceil((index + 1) * inp / out).
         return FloorDiv((index + 1) * inp_dim + out_dim - 1, out_dim)
 
     fn_sum = _adaptive_pooling_fn(
@@ -6366,6 +6836,7 @@ def _adaptive_avg_pool2d(x, output_size):
     ones_loader = pad_adaptive_loader(ones_like(x))
 
     def fn(idx):
+        # [FUNCTION DOC] HELPER: Average = window sum over input divided by window sum over ones (valid element count).
         return ops.truediv(
             fn_sum(idx, pad_adaptive_loader(x)), fn_sum(idx, ones_loader)
         )
@@ -6387,6 +6858,8 @@ fallback_adaptive_max_pool2d = fallback_handler(
 
 @register_lowering(aten.adaptive_max_pool2d)
 def adaptive_max_pool2d(x, output_size):
+    # [FUNCTION DOC] Lowering for aten.adaptive_max_pool2d returning (values, indices). int64 raises RuntimeError; empty outputs return empty tensors; evenly divisible sizes raise ValueError (a decomposition handles them);
+    # windows larger than 25 use the eager fallback; otherwise two Pointwise nodes compute the max value and flat argmax index over adaptive windows with negative-infinity padding.
     if x.get_dtype() == torch.int64:
         # not supported in eager
         raise RuntimeError("adaptive_max_pool2d not implemented for Long")
@@ -6425,9 +6898,11 @@ def adaptive_max_pool2d(x, output_size):
         return fallback_adaptive_max_pool2d(x, output_size)
 
     def start_index(index, out_dim, inp_dim):
+        # [FUNCTION DOC] HELPER: Start of the adaptive window: floor(index * inp / out).
         return FloorDiv((index * inp_dim), out_dim)
 
     def end_index(index, out_dim, inp_dim):
+        # [FUNCTION DOC] HELPER: End of the adaptive window: ceil((index + 1) * inp / out).
         return FloorDiv((index + 1) * inp_dim + out_dim - 1, out_dim)
 
     inner_func_max_val = _adaptive_pooling_fn(
@@ -6449,9 +6924,11 @@ def adaptive_max_pool2d(x, output_size):
     )
 
     def inner_fn_max_val(idx):
+        # [FUNCTION DOC] HELPER: Max value over the adaptive window at idx.
         return inner_func_max_val(idx, pad_adaptive_loader(x, float("-inf")))
 
     def inner_fn_max_idx(idx):
+        # [FUNCTION DOC] HELPER: Flat index of the max element over the adaptive window at idx.
         return inner_func_max_idx(idx, pad_adaptive_loader(x, float("-inf")))
 
     rv = Pointwise.create(
@@ -6470,12 +6947,15 @@ def adaptive_max_pool2d(x, output_size):
 
 
 def _fractional_pooling_offsets(samples, in_sz, out_sz, kernel_sz, dim, ndims):
+    # [FUNCTION DOC] HELPER: Build a loader giving, for output position i along spatial dim, the start offset of the fractional pooling window computed from the random samples:
+    # trunc((i + sample) * alpha) - trunc(sample * alpha) with alpha = (in - kernel) / (out - 1), and the last output position pinned at in - kernel. Indexes the samples tensor by batch and channel from the prefix.
     out_sz = out_sz[dim]
     in_sz = in_sz[dim]
     kernel_sz = kernel_sz[dim]
     samples_loader = samples.make_loader()
 
     def load(prefix, i):
+        # [FUNCTION DOC] HELPER: Look up the random sample for this prefix and dim (handling 3-D and 4-D input prefix layouts) and compute the window start as an indirect index bounded by the input size.
         # Handle indexing for samples tensor correctly for different input dimensions
         # samples tensor always has shape (N, C, 2) for fractional_max_pool2d where:
         # - N=1 for 3D inputs (C,H,W), N=batch_size for 4D inputs (N,C,H,W)
@@ -6515,15 +6995,19 @@ def _fractional_pooling_offsets(samples, in_sz, out_sz, kernel_sz, dim, ndims):
 
 @register_lowering(aten.fractional_max_pool2d)
 def fractional_max_pool2d(x, kernel_size, output_size, random_samples):
+    # [FUNCTION DOC] Lowering for aten.fractional_max_pool2d: delegates to the n-dimensional implementation with two spatial dims.
     return _fractional_max_pool(x, kernel_size, output_size, random_samples, n_dim=2)
 
 
 @register_lowering(aten.fractional_max_pool3d)
 def fractional_max_pool3d(x, kernel_size, output_size, random_samples):
+    # [FUNCTION DOC] Lowering for aten.fractional_max_pool3d: delegates to the n-dimensional implementation with three spatial dims.
     return _fractional_max_pool(x, kernel_size, output_size, random_samples, n_dim=3)
 
 
 def _fractional_max_pool(x, kernel_size, output_size, random_samples, n_dim):
+    # [FUNCTION DOC] HELPER: Fractional max pooling over the last n_dim dims. Window starts come from random samples; builds max and argmax Reductions over the kernel window (unrolled up to 25 elements), realizing each if still a reduction, and converts the
+    # argmax offsets to flat input indices. Returns (values, indices).
     x.realize_hint()
     batch, inp_dhw = x.shape[:-n_dim], x.shape[-n_dim:]
 
@@ -6543,10 +7027,12 @@ def _fractional_max_pool(x, kernel_size, output_size, random_samples, n_dim):
         x_loader = x.make_loader()
 
         def fn_inner(idx, reduction_idx):
+            # [FUNCTION DOC] HELPER: Load the input element for an output position plus window offsets.
             prefix = idx[:-n_dim]
             return x_loader([*prefix, *increments_to_index(idx, reduction_idx)])
 
         def increments_to_index(idx, reduction_idx):
+            # [FUNCTION DOC] HELPER: Map output coordinates and window offsets to input coordinates using the fractional window start offsets.
             prefix = idx[:-n_dim]
             bdhw = idx[-n_dim:]
             return [
@@ -6597,6 +7083,8 @@ def _fractional_max_pool(x, kernel_size, output_size, random_samples, n_dim):
 def upsample_nearest2d_backward(
     x, output_size=None, input_size=None, scales_h=None, scales_w=None
 ):
+    # [FUNCTION DOC] Lowering for aten.upsample_nearest2d_backward. Divisible sizes reduce to avg_pool2d with divisor 1 (a sum); otherwise a Pointwise over the input shape sums, with ceil-based window bounds, all
+    # output-gradient elements mapped to each input pixel using the adaptive pooling machinery with zero padding. output_size, scales_h and scales_w are not used; input_size is required.
     x.realize_hint()
 
     *_batch, inp_h, inp_w = x.get_size()
@@ -6615,9 +7103,11 @@ def upsample_nearest2d_backward(
     w_kernel_max = ceildiv(inp_w, out_w)
 
     def start_index(index, out_dim, inp_dim):
+        # [FUNCTION DOC] HELPER: Window start for an output index: ceil(index * inp / out).
         return CeilDiv(index * inp_dim, sympy.sympify(out_dim))
 
     def end_index(index, out_dim, inp_dim):
+        # [FUNCTION DOC] HELPER: Window end for an output index, equal to the start of the next index.
         return start_index((index + 1), out_dim, inp_dim)
 
     fn_sum = _adaptive_pooling_fn(
@@ -6630,6 +7120,7 @@ def upsample_nearest2d_backward(
     )
 
     def fn(idx):
+        # [FUNCTION DOC] HELPER: Sum the gradient window for an input position.
         return fn_sum(idx, pad_adaptive_loader(x))
 
     rv = Pointwise.create(
@@ -6653,6 +7144,7 @@ def avg_pool2d(
     count_include_pad=True,
     divisor_override=None,
 ):
+    # [FUNCTION DOC] Lowering for aten.avg_pool2d: delegates to the n-d average pooling with two spatial dims.
     return _avg_poolnd(
         x,
         kernel_size,
@@ -6675,6 +7167,7 @@ def avg_pool3d(
     count_include_pad=True,
     divisor_override=None,
 ):
+    # [FUNCTION DOC] Lowering for aten.avg_pool3d: delegates to the n-d average pooling with three spatial dims.
     return _avg_poolnd(
         x,
         kernel_size,
@@ -6704,6 +7197,9 @@ def _avg_poolnd(
     divisor_override,
     dim,
 ):
+    # [FUNCTION DOC] HELPER: Average pooling over the last dim dims. Stride defaults to the kernel size and padding to zero. Validates ranks (raises an error). Uses the eager fallback for big windows (over 25 elements) whose stride differs from the kernel.
+    # Otherwise sums the window with a Reduction (unrolled for windows up to 25), using a zero boundary condition if padding or ceil mode applies, then divides by the divisor override, the window size, or a per-position valid count (honoring
+    # count_include_pad). Computation is in the compute dtype; result cast to the input dtype.
     if not stride:
         stride = kernel_size
     if not padding:
@@ -6751,6 +7247,7 @@ def _avg_poolnd(
     )
 
     def fn_inner(idx, reduction_idx):
+        # [FUNCTION DOC] HELPER: Map output coordinates plus window offsets to input coordinates and load.
         prefix = idx[:-dim]
         bh = idx[-dim:]
         ih = reduction_idx
@@ -6808,6 +7305,7 @@ def _avg_poolnd(
     else:
 
         def fn_count(idx):
+            # [FUNCTION DOC] HELPER: Number of elements in the pooling window at an output position (clipped to padded or real bounds depending on count_include_pad), as a product over dims.
             bh = idx[-dim:]
 
             divide_factors = []
@@ -6848,6 +7346,8 @@ def avg_pool2d_backward(
     count_include_pad,
     divisor_override=None,
 ):
+    # [FUNCTION DOC] Lowering for aten.avg_pool2d_backward. Validates arguments (zero divisor or wrong ranks raise an error), falls back to eager when the number of windows covering an input element exceeds 25, otherwise builds a Pointwise over the input
+    # shape that sums grad_output values of covering windows each divided by its scale (divisor override, kernel area, or valid count when padding is excluded), masked to in-range windows.
     if divisor_override is not None and divisor_override == 0:
         raise AssertionError("divisor must be not zero")
     if not stride:
@@ -6909,6 +7409,7 @@ def avg_pool2d_backward(
         )
 
     def compute_pool_size_without_padding(ph, pw):
+        # [FUNCTION DOC] HELPER: Valid (non-padding) element count of the pooling window at output position (ph, pw), as an ops value.
         """
         This computes the scaling factor that we will divide an element
         by when `count_include_pad=False`
@@ -6937,6 +7438,7 @@ def avg_pool2d_backward(
         return divide_factor
 
     def fn(idx):
+        # [FUNCTION DOC] HELPER: Accumulate the scaled gradient contributions of all windows covering input position (h, w).
         *prefix, h, w = idx
         h = h + padding[0]
         w = w + padding[1]
@@ -7027,6 +7529,8 @@ def avg_pool3d_backward(
     count_include_pad,
     divisor_override=None,
 ):
+    # [FUNCTION DOC] Lowering for aten.avg_pool3d_backward. Same approach as the 2-D version over depth, height and width: validates arguments (raises an error), falls back to eager when more than 125 windows may cover an element,
+    # otherwise builds a Pointwise summing scaled grad_output over covering windows.
     if divisor_override is not None and divisor_override == 0:
         raise AssertionError("divisor must be not zero")
     if not stride:
@@ -7091,6 +7595,7 @@ def avg_pool3d_backward(
         )
 
     def compute_pool_size_without_padding(pd, ph, pw):
+        # [FUNCTION DOC] HELPER: Valid (non-padding) element count of the 3-D pooling window at output position (pd, ph, pw), as an ops value.
         stride_d, stride_h, stride_w = (ops.constant(s, torch.int32) for s in stride)
         pad_d, pad_h, pad_w = (ops.constant(p, torch.int32) for p in padding)
         kernel_d, kernel_h, kernel_w = (
@@ -7128,6 +7633,7 @@ def avg_pool3d_backward(
         return divide_factor
 
     def fn(idx):
+        # [FUNCTION DOC] HELPER: Accumulate the scaled gradient contributions of all windows covering input position (d, h, w).
         *prefix, d, h, w = idx
         d, h, w = (v + pad for v, pad in zip([d, h, w], padding))
 
@@ -7225,6 +7731,8 @@ def avg_pool3d_backward(
 
 
 def _validate_reduction_axis(x, axis):
+    # [FUNCTION DOC] HELPER: Normalize a reduction axis spec (int, sequence, or empty meaning all dims) to a list of non-negative dims for x. For 0-d inputs only empty, 0 or -1 are allowed and an empty list is returned. Raises an error for invalid or duplicate axes.
+    # KNOWN ISSUE: the second part of the bounds check mentioning a zero-length size is unreachable because 0-d inputs return earlier.
     size = x.get_size()
     if isinstance(axis, int):
         axis = [axis]
@@ -7250,6 +7758,9 @@ def _validate_reduction_axis(x, axis):
 def _make_reduction_inner(
     x, *, axis, keepdims, dtype, override_return_dtype, reduction_type=None
 ):
+    # [FUNCTION DOC] HELPER: Compute the keyword arguments for creating a Reduction over x: optionally casts x to dtype, validates the axes, splits dims into kept and reduced, and builds a loader mapping (kept index, reduction index) to the input index
+    # (keepdims inserts size-one output dims). For arg-reductions over several dims on supported backends with transposed or non-contiguous layouts the loader returns a (value, logical row-major index) pair. Returns a mapping with device, dst_dtype,
+    # src_dtype, inner_fn, ranges and reduction_ranges.
     if dtype is not None:
         x = to_dtype(x, dtype)
     size = x.get_size()
@@ -7296,6 +7807,7 @@ def _make_reduction_inner(
             )
 
     def loader(index, reduction_index):
+        # [FUNCTION DOC] HELPER: Reassemble the full input index from kept and reduced coordinates, load the value, and for logical-index arg-reductions also return the row-major flat index over the reduced dims. Raises an error on length mismatches.
         if len(reduction_index) != len(reduced_idx):
             raise AssertionError("expected: len(reduction_index) == len(reduced_idx)")
         if keepdims:
@@ -7349,7 +7861,10 @@ def make_reduction(
     *,
     strict_sum: bool = False,
 ) -> Callable[..., TensorBox]:
+    # [FUNCTION DOC] Create a reduction lowering for reduction_type, optionally forcing an output dtype and strict_sum. The lowering takes (x, axis, keepdims, dtype), converts bool inputs of argmax/argmin to int32, builds a Reduction node from
+    # _make_reduction_inner and realizes it if it was not unrolled. Returns the lowering function.
     def inner(x, axis=None, keepdims=False, *, dtype=None) -> TensorBox:
+        # [FUNCTION DOC] HELPER: The lowering body: reduce x along axis with the configured reduction type and return the resulting TensorBox.
         # For argmax/argmin on boolean tensors, cast to int32 first to ensure
         # correct comparison. Boolean comparisons can produce incorrect indices
         # on multiple backends (Triton, CPU, etc.).
@@ -7384,7 +7899,9 @@ def make_reduction(
 def make_arg_with_value_reduction(
     reduction_type: ReductionType,
 ) -> Callable[..., Sequence[TensorBox]]:
+    # [FUNCTION DOC] Create a lowering for reductions that return both an arg index and a value (argmax/argmin with value). The result comes from ArgReduction.create using the shared reduction inner function. Returns the lowering function.
     def inner(x, axis=None, keepdims=False) -> Sequence[TensorBox]:
+        # [FUNCTION DOC] HELPER: The lowering body: reduce x along axis and return the sequence of outputs.
         kwargs = _make_reduction_inner(
             x,
             axis=axis,
@@ -7401,6 +7918,7 @@ def make_arg_with_value_reduction(
 
 
 def _make_scan_inner(x, *, axis, dtype):
+    # [FUNCTION DOC] HELPER: Compute keyword arguments for a scan over x along axis: optionally casts to dtype, validates the dim, and returns device, dtypes, inner function loaders, size and axis.
     if dtype is not None:
         x = to_dtype(x, dtype)
     axis = _validate_dim(x, axis)
@@ -7416,6 +7934,7 @@ def _make_scan_inner(x, *, axis, dtype):
 
 @register_lowering(aten.mean)
 def mean(x, axis=None, keepdim=False, *, dtype=None):
+    # [FUNCTION DOC] Lowering for aten.mean: optional dtype cast, computes in float32 for half types, sums over the axes and divides by the number of reduced elements (a symbolic constant expanded to the output shape), then casts back to the original dtype.
     if dtype is not None:
         x = to_dtype(x, dtype)
     size = x.get_size()
@@ -7432,6 +7951,7 @@ def mean(x, axis=None, keepdim=False, *, dtype=None):
 
 
 def var_mean_sum_(x, axis, correction, keepdim, return_mean):
+    # [FUNCTION DOC] HELPER: Two-pass variance: computes the mean, sums squared deviations, and divides by max(count - correction, 0) (correction defaults to 1). Returns a tuple of (variance,) or (variance, mean); the mean is realized if returned.
     if correction is None:
         correction = 1
 
@@ -7458,6 +7978,8 @@ def var_mean_sum_(x, axis, correction, keepdim, return_mean):
 
 
 def use_two_step_variance(x, axis, keepdim, input_dtype):
+    # [FUNCTION DOC] HELPER: Decide whether to use the two-step variance algorithm instead of Welford. Requires a statically known reduction size not larger than a backend-specific threshold (CPU config, CUDA triton for fp16/bf16 with a minimum size
+    # and without reduction splitting, otherwise the unroll threshold) and more than one output element. Returns a bool.
     # The two-step algorithm can be faster for non-split reductions because
     # Welford does more work per element. Preserve the old tiny-reduction
     # two-step path, keep Welford for the rest of the small reductions where
@@ -7508,6 +8030,7 @@ def use_two_step_variance(x, axis, keepdim, input_dtype):
 
 
 def var_mean_welford_(x, axis, *, correction, keepdim, return_mean):
+    # [FUNCTION DOC] HELPER: Variance via a Welford reduction. Computes mean and M2, realizes M2, and scales it by 1 / max(count - correction, 0) (correction defaults to 1) with a pointwise node. Returns (variance,) or (variance, mean).
     if correction is None:
         correction = 1
 
@@ -7532,11 +8055,13 @@ def var_mean_welford_(x, axis, *, correction, keepdim, return_mean):
     rnumel = sympy_product(size[i] for i in axis)
 
     def get_constant_or_index_expr(x, dtype):
+        # [FUNCTION DOC] HELPER: Return an ops constant for numbers, or an index expression converted to dtype for non-numeric sympy expressions.
         if isinstance(x, sympy.Expr) and not x.is_number:
             return ops.to_dtype(ops.index_expr(x, torch.int64), dtype)
         return ops.constant(x, dtype)
 
     def scale_fn(data):
+        # [FUNCTION DOC] HELPER: Divide M2 by max(0, N - correction).
         c = get_constant_or_index_expr(correction, dtype)
         N = get_constant_or_index_expr(rnumel, dtype)
         zero = ops.constant(0, dtype)
@@ -7551,6 +8076,8 @@ def var_mean_welford_(x, axis, *, correction, keepdim, return_mean):
 
 
 def var_mean_helper_(x, *, axis, correction, keepdim, return_mean):
+    # [FUNCTION DOC] HELPER: Shared implementation of var and var_mean: computes in the compute dtype, chooses the two-step or Welford algorithm (Welford unless MTIA disables it or the heuristic prefers two-step), and casts outputs back to the input dtype.
+    # Returns the variance alone or (variance, mean) depending on return_mean.
     out_dtype = x.get_dtype()
     compute_dtype = get_computation_dtype(out_dtype)
     x = to_dtype(x, compute_dtype, copy=False)
@@ -7577,6 +8104,7 @@ def var_mean_helper_(x, *, axis, correction, keepdim, return_mean):
 
 @register_lowering([aten.var, prims.var])
 def var_(x, axis=None, *, correction=None, keepdim=False):
+    # [FUNCTION DOC] Lowering for aten.var and prims.var: variance without the mean.
     return var_mean_helper_(
         x, axis=axis, correction=correction, keepdim=keepdim, return_mean=False
     )
@@ -7584,12 +8112,14 @@ def var_(x, axis=None, *, correction=None, keepdim=False):
 
 @register_lowering(aten.var_mean)
 def var_mean(x, axis=None, *, correction=None, keepdim=False):
+    # [FUNCTION DOC] Lowering for aten.var_mean: returns (variance, mean).
     return var_mean_helper_(
         x, axis=axis, correction=correction, keepdim=keepdim, return_mean=True
     )
 
 
 def pow_recursive(x, y, dtype):
+    # [FUNCTION DOC] HELPER: Raise ops value x to an integer power y using repeated squaring; negative powers take the reciprocal first, zero gives a constant one.
     if y < 0:
         return pow_recursive(ops.reciprocal(x), -y, dtype)
     if y == 0:
@@ -7606,6 +8136,7 @@ def pow_recursive(x, y, dtype):
 
 @make_pointwise
 def pow_native(a, b):
+    # [FUNCTION DOC] Pointwise body for a native pow op.
     return ops.pow(a, b)
 
 
@@ -7620,6 +8151,8 @@ fallback_pow_tensor_scalar = fallback_handler(
 
 @register_lowering(aten.pow, broadcast=True)
 def pow(a, b):
+    # [FUNCTION DOC] Lowering for aten.pow. Integer-valued float exponents are converted to ints, 0.5 uses sqrt, 1 clones. Small fixed integer exponents (magnitude below 32, or non-negative for integer dtypes) are expanded into multiplications. A base of 1
+    # gives ones and base 2 with float exponent uses exp2. Integer dtypes otherwise use eager fallbacks; the rest use a native pow Pointwise.
     if isinstance(b, float) and b.is_integer():
         return pow(a, int(b))
     elif isinstance(b, float) and b == 0.5:
@@ -7639,6 +8172,7 @@ def pow(a, b):
         loader = a.make_loader()
 
         def fn(idx):
+            # [FUNCTION DOC] HELPER: Load the base and raise it to the fixed integer exponent.
             return pow_recursive(loader(idx), b, a.get_dtype())
 
         return Pointwise.create(
@@ -7668,6 +8202,8 @@ def pow(a, b):
 
 
 def mutate_to(changed, val, unsafe_alias=False):
+    # [FUNCTION DOC] Make changed take the value val (in-place mutation semantics). Non-storage values are first copied through a Pointwise. If changed is a plain computed storage (not an input, module buffer, or no-op kernel), its data pointer is swung to val
+    # (realized). Otherwise val is realized into the changed buffer through a mutation layout, optionally permitting aliasing. Returns changed.
     if isinstance(changed, TensorBox):
         changed_data = changed.data
     else:
@@ -7708,11 +8244,13 @@ def mutate_to(changed, val, unsafe_alias=False):
 
 @register_lowering(aten.fill_)
 def fill_(x, fill_value):
+    # [FUNCTION DOC] Lowering for aten.fill_: mutate x to a tensor filled with fill_value.
     return mutate_to(x, full_like(x, fill_value))
 
 
 @register_lowering(aten.copy_, type_promotion_kind=None)
 def copy_(dst, src, non_blocking=False):
+    # [FUNCTION DOC] Lowering for aten.copy_: returns dst unchanged if src is dst; otherwise moves src to dst's device and dtype, expands to dst's shape, and mutates dst to hold it.
     if dst is src:
         # dst.copy_(dst) can happen from the reinplacing pass
         return dst
@@ -7724,20 +8262,24 @@ def copy_(dst, src, non_blocking=False):
 
 @make_pointwise
 def floordiv(a, b):
+    # [FUNCTION DOC] Pointwise body for floor division on integer values.
     return ops.floordiv(a, b)
 
 
 @make_pointwise
 def truncdiv(a, b):
+    # [FUNCTION DOC] Pointwise body for truncating division on integer values.
     return ops.truncdiv(a, b)
 
 
 @make_pointwise
 def _div_rn(a, b):
+    # [FUNCTION DOC] Pointwise body for IEEE round-to-nearest division.
     return ops.div_rn(a, b)
 
 
 def _floor_div_floating(a, b):
+    # [FUNCTION DOC] HELPER: Floor division for floating operands with eager-matching edge cases: floor of the round-nearest quotient, NaN when a is infinite and b nonzero, and -1 when a is finite nonzero and b is infinite with differing signs. Either operand may be a python scalar.
     # Either operand may be a python scalar (e.g. torch.floor_divide(scalar,
     # tensor)); constant_like needs a tensor for dtype/device/size, so seed the
     # constants from whichever operand is a tensor.
@@ -7747,6 +8289,7 @@ def _floor_div_floating(a, b):
     zero = constant_like(0.0)(ref)
 
     def fn(a, b, nan, neg_one, zero):
+        # [FUNCTION DOC] HELPER: Pointwise body implementing the floating floor division with infinity corrections.
         quotient = ops.div_rn(a, b)
         result = ops.floor(quotient)
         a_is_inf = ops.isinf(a)
@@ -7773,6 +8316,7 @@ def _floor_div_floating(a, b):
 
 @register_lowering(aten.div, broadcast=True)
 def div_mode(a, b, rounding_mode=None):
+    # [FUNCTION DOC] Lowering for aten.div with rounding_mode. floor: integer operands use floor division, otherwise the floating version; trunc: integer truncating division or trunc of the true quotient; none: true division. Both-boolean operands raise an error for floor/trunc.
     both_integer = is_integer_type(a) and is_integer_type(b)
     both_boolean = is_boolean_type(a) and is_boolean_type(b)
 
@@ -7799,6 +8343,7 @@ def div_mode(a, b, rounding_mode=None):
 
 @register_lowering([aten.mul], broadcast=True)
 def mul(a, b):
+    # [FUNCTION DOC] Lowering for aten.mul: logical and for two booleans, otherwise a pointwise multiply.
     both_bool = is_boolean_type(a) and is_boolean_type(b)
     if both_bool:
         return logical_and(a, b)
@@ -7808,6 +8353,7 @@ def mul(a, b):
 
 
 def get_constant_value(x: ir.IRNode) -> ir.Constant | None:
+    # [FUNCTION DOC] HELPER: Try to resolve an IR node to a Constant: unwrap boxes and views; for pointwise-like Loops evaluate the inner function with a constant-extracting handler and return the constant if the output is one. Returns None otherwise.
     """Try convert an arbitrary IR node into an ir.Constant value"""
 
     # First try unwrapping the IRNode to see if it is already an ir.Constant
@@ -7844,6 +8390,7 @@ def get_constant_value(x: ir.IRNode) -> ir.Constant | None:
 #   integer inputs and true division for floating and complex inputs.
 @register_lowering([prims.div], broadcast=True)
 def div_prim(a, b):
+    # [FUNCTION DOC] Lowering for prims.div (C-style division): integer or bool operands use truncating division. Otherwise, for non-CPU devices, division by a constant becomes multiplication by the reciprocal (infinity with sign for zero); else true division pointwise.
     is_integral = all(is_boolean_type(x) or is_integer_type(x) for x in [a, b])
 
     if is_integral:
@@ -7861,6 +8408,7 @@ def div_prim(a, b):
         return mul(a, reciprocal)
 
     def fn(*args):
+        # [FUNCTION DOC] HELPER: Pointwise body for true division.
         return ops.truediv(*args)
 
     return make_pointwise(fn)(a, b)
@@ -7872,6 +8420,7 @@ def div_prim(a, b):
     type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
 )
 def div(a, b):
+    # [FUNCTION DOC] Lowering for aten.true_divide and div.Tensor: promotes scalar constants with int-to-float promotion and applies prims.div.
     a, b = promote_constants(
         (a, b), type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT
     )
@@ -7880,22 +8429,27 @@ def div(a, b):
 
 @register_lowering([aten.fmod, prims.fmod], broadcast=True)
 def fmod(a, b):
+    # [FUNCTION DOC] Lowering for fmod: integer or bool inputs use the integer modulus op, otherwise the floating fmod op, as a pointwise.
     is_integral = is_boolean_type(a) or is_integer_type(a)
 
     if is_integral:
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Pointwise body using the integer mod op.
             return ops.mod(a, b)
 
     else:
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Pointwise body using the floating fmod op.
             return ops.fmod(a, b)
 
     return make_pointwise(fn)(a, b)
 
 
 def _strict_sum_layout_eligible(axis, dtype) -> bool:
+    # [FUNCTION DOC] HELPER: Decide whether the current aten.sum.dim_IntList node should use the strict-ordered sum. Requires strict numerics config, triton reduction ordering support, no dtype override, a single reduce dim, a floating CUDA (non-ROCm) triton input,
+    # and a statically known input layout where the reduced dim has unit stride (or is size one) and the remaining non-trivial dims have collapsible strides greater than one. Returns a bool; False when there is no current node.
     current_node = V.graph.current_node
     if (
         current_node is None
@@ -7962,6 +8516,7 @@ def _strict_sum_layout_eligible(axis, dtype) -> bool:
 
 @register_lowering([aten.sum, prims.sum])
 def sum_(x, axis=None, keepdims=False, *, dtype=None):
+    # [FUNCTION DOC] Lowering for aten.sum/prims.sum: integer and bool inputs sum into int64 when no dtype is given; uses a sum reduction with the strict-order flag from the layout check. Returns the reduced TensorBox.
     strict_sum = _strict_sum_layout_eligible(axis, dtype)
     if (
         is_integer_dtype(x.get_dtype()) or is_boolean_dtype(x.get_dtype())
@@ -7981,6 +8536,7 @@ fallback_cummin = fallback_handler(aten.cummin.default)
 
 @register_lowering(aten.cumsum)
 def cumsum(x, axis=None, dtype=None):
+    # [FUNCTION DOC] Lowering for aten.cumsum: integer/bool default to int64; 0-d input only allows axis 0 or -1 (else raises an error) and returns a cast copy. Otherwise a Scan with an add combine; if the scan cannot be generated, falls back to the eager kernel.
     if (
         is_integer_dtype(x.get_dtype()) or is_boolean_dtype(x.get_dtype())
     ) and dtype is None:
@@ -7993,6 +8549,7 @@ def cumsum(x, axis=None, dtype=None):
         return to_dtype(x, dtype, copy=True)
 
     def combine_fn(a_tuple, b_tuple):
+        # [FUNCTION DOC] HELPER: Scan combine function: elementwise add of the single carried values.
         (a,) = a_tuple
         (b,) = b_tuple
         return (ops.add(a, b),)
@@ -8006,6 +8563,7 @@ def cumsum(x, axis=None, dtype=None):
 
 @register_lowering(aten.cumprod)
 def cumprod(x, axis=None, dtype=None):
+    # [FUNCTION DOC] Lowering for aten.cumprod: same structure as cumsum with a multiply combine function and eager fallback.
     if (
         is_integer_dtype(x.get_dtype()) or is_boolean_dtype(x.get_dtype())
     ) and dtype is None:
@@ -8018,6 +8576,7 @@ def cumprod(x, axis=None, dtype=None):
         return to_dtype(x, dtype, copy=True)
 
     def combine_fn(a_tuple, b_tuple):
+        # [FUNCTION DOC] HELPER: Scan combine function: elementwise multiply of the single carried values.
         (a,) = a_tuple
         (b,) = b_tuple
         return (ops.mul(a, b),)
@@ -8031,7 +8590,9 @@ def cumprod(x, axis=None, dtype=None):
 
 @register_lowering(aten.logcumsumexp)
 def logcumsumexp(x, dim):
+    # [FUNCTION DOC] Lowering for aten.logcumsumexp: 0-d input clones (dim must be 0 or -1); otherwise a Scan with a numerically stable log-add-exp combine, falling back to eager if the scan is unavailable.
     def log_add_exp_helper(a_tuple, b_tuple):
+        # [FUNCTION DOC] HELPER: Scan combine function computing log(exp(a) + exp(b)) stably using the maximum and log1p, handling equal infinities.
         (a,) = a_tuple
         (b,) = b_tuple
         min_v = ops.minimum(a, b)
@@ -8054,6 +8615,7 @@ def logcumsumexp(x, dim):
 
 @register_lowering(aten.cummax, type_promotion_kind=None)
 def cummax(x, axis=None):
+    # [FUNCTION DOC] Lowering for aten.cummax returning (values, indices). 0-d input returns a clone and an empty index tensor. Otherwise a two-output Scan carrying value and int64 index with an argmax combine (ties go to the later element); eager fallback if the scan is unavailable.
     if len(x.get_size()) == 0:
         if axis not in [0, -1]:
             raise AssertionError("expected: axis in [0, -1]")
@@ -8078,6 +8640,7 @@ def cummax(x, axis=None):
 
 @register_lowering(aten.cummin, type_promotion_kind=None)
 def cummin(x, axis=None):
+    # [FUNCTION DOC] Lowering for aten.cummin returning (values, indices): same as cummax with an argmin combine.
     if len(x.get_size()) == 0:
         if axis not in [0, -1]:
             raise AssertionError("expected: axis in [0, -1]")
@@ -8102,6 +8665,7 @@ def cummin(x, axis=None):
 
 @register_lowering(aten.prod)
 def prod(x, axis=None, keepdims=False, *, dtype=None):
+    # [FUNCTION DOC] Lowering for aten.prod: integer/bool inputs accumulate into int64; uses a prod reduction.
     if (
         is_integer_dtype(x.get_dtype()) or is_boolean_dtype(x.get_dtype())
     ) and dtype is None:
@@ -8112,6 +8676,7 @@ def prod(x, axis=None, keepdims=False, *, dtype=None):
 
 
 def _current_node_uses_all_tuple_outputs(indices: tuple[int, ...]) -> bool:
+    # [FUNCTION DOC] HELPER: True if every listed tuple output index of the current node is consumed by a getitem user (or if usage cannot be determined, such as no current node or a non-getitem user).
     current_node = V.graph.current_node
     if current_node is None:
         return True
@@ -8134,12 +8699,14 @@ def _current_node_uses_all_tuple_outputs(indices: tuple[int, ...]) -> bool:
 
 @register_lowering(aten.any)
 def reduce_any(x, dim=None, keepdim=False):
+    # [FUNCTION DOC] Lowering for aten.any: casts to bool and applies an any reduction.
     x = to_dtype(x, torch.bool)
     return make_reduction("any")(x, axis=dim, keepdims=keepdim)
 
 
 @register_lowering(aten.max, type_promotion_kind=None)
 def reduce_max(x, dim=None, keepdim=False):
+    # [FUNCTION DOC] Lowering for aten.max. With no dim returns the full max reduction. With a dim returns (values, indices): on triton for non-bool inputs it uses a fused arg-with-value reduction when both outputs are used, or separate value and arg reductions; otherwise separate max and argmax reductions.
     if dim is not None:
         if is_triton(x) and x.get_dtype() != torch.bool:
             if _current_node_uses_all_tuple_outputs((0, 1)):
@@ -8158,6 +8725,7 @@ def reduce_max(x, dim=None, keepdim=False):
 
 @register_lowering(aten.min, type_promotion_kind=None)
 def reduce_min(x, dim=None, keepdim=False):
+    # [FUNCTION DOC] Lowering for aten.min: same structure as max using min and argmin reductions.
     if dim is not None:
         if is_triton(x) and x.get_dtype() != torch.bool:
             if _current_node_uses_all_tuple_outputs((0, 1)):
@@ -8201,6 +8769,8 @@ sort_fallback = fallback_handler(aten.sort.stable, add_to_fallback_set=False)
 
 @register_lowering(aten.sort.stable, type_promotion_kind=None)
 def sort_stable(x, *, stable=None, dim=-1, descending=False):
+    # [FUNCTION DOC] Lowering for aten.sort.stable returning (values, int64 indices). 0-d input returns a clone with zero index. Uses an index iota of int16 (int32 if decompose_sort_ops is on) broadcast along the sort dim; falls back to the eager sort when the dim
+    # may be too large for the index dtype or the sort IR node cannot be generated. Otherwise creates a Sort node.
     if stable is None:
         stable = False
 
@@ -8251,6 +8821,7 @@ def sort_stable(x, *, stable=None, dim=-1, descending=False):
 
 @register_lowering(aten.sort.default, type_promotion_kind=None)
 def sort(x, dim=-1, descending=False):
+    # [FUNCTION DOC] Lowering for aten.sort.default: unstable sort via sort_stable.
     return sort_stable(x, stable=False, dim=dim, descending=descending)
 
 
@@ -8271,6 +8842,7 @@ mode_fallback = fallback_handler(aten.mode.default, add_to_fallback_set=False)
 
 @register_lowering(aten.median.default, type_promotion_kind=None)
 def median_default(self):
+    # [FUNCTION DOC] Lowering for aten.median.default: uses the eager fallback unless sort decomposition is enabled, in which case flattens, sorts, and selects the element at position (numel - 1) // 2.
     if not config.triton.decompose_sort_ops:
         return median_fallback(self)
     size = self.get_size()
@@ -8283,6 +8855,7 @@ def median_default(self):
 
 @register_lowering(aten.median.dim, type_promotion_kind=None)
 def median_dim(self, dim, keepdim=False):
+    # [FUNCTION DOC] Lowering for aten.median.dim returning (values, indices): eager fallback unless sort decomposition is enabled; otherwise stable sort along dim and select position (n - 1) // 2 (lower median), optionally keeping the dim.
     if not config.triton.decompose_sort_ops:
         return median_dim_fallback(self, dim, keepdim)
     shape = self.get_size()
@@ -8303,6 +8876,8 @@ def median_dim(self, dim, keepdim=False):
 
 @register_lowering(aten.mode.default, type_promotion_kind=None)
 def mode_default(self, dim=-1, keepdim=False):
+    # [FUNCTION DOC] Lowering for aten.mode: eager fallback unless sort decomposition is enabled. Otherwise sorts along dim, marks run boundaries where the sorted value changes, propagates the last boundary with a running maximum to get each position's run length,
+    # and picks the position of the first longest run (argmax) to gather mode value and index. 0-d input returns a clone and zero index. Returns (values, indices), squeezed unless keepdim.
     """Lower aten.mode via sort-based decomposition or fallback."""
     if not config.triton.decompose_sort_ops:
         return mode_fallback(self, dim, keepdim)
@@ -8328,6 +8903,7 @@ def mode_default(self, dim=-1, keepdim=False):
     positions_loader0 = positions.make_loader()
 
     def prev_pos_fn(idx):
+        # [FUNCTION DOC] HELPER: Position minus one clamped at zero, used to look at the previous sorted element.
         return ops.maximum(
             ops.sub(positions_loader0(idx), ops.constant(1, torch.int64)),
             ops.constant(0, torch.int64),
@@ -8349,6 +8925,7 @@ def mode_default(self, dim=-1, keepdim=False):
 
     # is_boundary = (sorted != shifted) | (position == 0)
     def is_boundary_fn(idx):
+        # [FUNCTION DOC] HELPER: True where the sorted value differs from the previous one or at position zero.
         return ops.or_(
             ops.ne(sorted_loader(idx), shifted_loader(idx)),
             ops.eq(positions_loader(idx), ops.constant(0, torch.int64)),
@@ -8366,6 +8943,7 @@ def mode_default(self, dim=-1, keepdim=False):
     positions_loader2 = positions.make_loader()
 
     def boundary_pos_fn(idx):
+        # [FUNCTION DOC] HELPER: Position where a run boundary occurs, else -1.
         return ops.where(
             is_boundary_loader(idx),
             positions_loader2(idx),
@@ -8387,6 +8965,7 @@ def mode_default(self, dim=-1, keepdim=False):
     last_boundary_loader = last_boundary.make_loader()
 
     def run_len_fn(idx):
+        # [FUNCTION DOC] HELPER: Run length so far: position minus last boundary position plus one.
         return ops.add(
             ops.sub(positions_loader3(idx), last_boundary_loader(idx)),
             ops.constant(1, torch.int64),
@@ -8413,6 +8992,7 @@ def mode_default(self, dim=-1, keepdim=False):
 
 @register_lowering(aten.topk.default, type_promotion_kind=None)
 def topk(self, k, dim=-1, largest=True, sorted=True):
+    # [FUNCTION DOC] Lowering for aten.topk: eager fallback unless sort decomposition is enabled; otherwise a stable sort along dim (descending if largest) and the first k entries of values and indices. 0-d input returns a clone and zero index. The sorted flag is ignored.
     if not config.triton.decompose_sort_ops:
         return topk_fallback(self, k, dim, largest, sorted)
     shape = self.get_size()
@@ -8430,6 +9010,7 @@ def topk(self, k, dim=-1, largest=True, sorted=True):
 
 @register_lowering(aten.kthvalue.default, type_promotion_kind=None)
 def kthvalue(self, k, dim=-1, keepdim=False):
+    # [FUNCTION DOC] Lowering for aten.kthvalue: eager fallback unless sort decomposition is enabled; otherwise stable sort along dim and select the (k-1)th entry (k is 1-based) of values and indices, optionally keeping the dim.
     if not config.triton.decompose_sort_ops:
         return kthvalue_fallback(self, k, dim, keepdim)
     shape = self.get_size()
@@ -8448,6 +9029,7 @@ def kthvalue(self, k, dim=-1, keepdim=False):
 
 
 def register_pointwise_numeric(op, name=None, triton_fallback=None):
+    # [FUNCTION DOC] HELPER: Register a pointwise lowering with int-to-float type promotion and an optional triton fallback.
     return register_pointwise(
         op,
         name=name,
@@ -8457,6 +9039,7 @@ def register_pointwise_numeric(op, name=None, triton_fallback=None):
 
 
 def register_pointwise_numeric_ldf64(op: torch._ops.OpOverloadPacket):
+    # [FUNCTION DOC] HELPER: Register an int-to-float pointwise lowering for an op that needs libdevice fp64 support; records that requirement for the op name.
     register_op_requires_libdevice_fp64(op.__name__)
     return register_pointwise(
         op,
@@ -8477,6 +9060,8 @@ sub = register_pointwise(aten.sub, allow_alpha=True, round_scalars_to_tensor_dty
 
 @register_lowering(aten.addcmul, broadcast=True)
 def addcmul(self, tensor1, tensor2, *, value=1):
+    # [FUNCTION DOC] Lowering for aten.addcmul: self + value * tensor1 * tensor2 as a Pointwise in the promoted dtype. On CUDA/XPU floating types uses fused multiply-add matching eager order (product rounded first with mul_rn, then fma with value);
+    # value of one uses a single fma. Other dtypes use plain multiply and add. value may be a number or a sympy expression.
     """
     Computes self + value * tensor1 * tensor2 using FMA for better precision.
 
@@ -8511,6 +9096,7 @@ def addcmul(self, tensor1, tensor2, *, value=1):
     )
 
     def inner_fn(idx):
+        # [FUNCTION DOC] HELPER: Compute self + value * (t1 * t2) for one element using the fma or plain arithmetic path.
         self_val = self_loader(idx)
         t1_val = t1_loader(idx)
         t2_val = t2_loader(idx)
@@ -8550,6 +9136,7 @@ def addcmul(self, tensor1, tensor2, *, value=1):
 
 @register_lowering(aten.addcdiv, broadcast=True)
 def addcdiv(self, tensor1, tensor2, *, value=1):
+    # [FUNCTION DOC] Lowering for aten.addcdiv: self + value * (tensor1 / tensor2) in the int-to-float promoted dtype. Uses round-nearest division on CUDA/XPU floating types and fma when value is not one; value of one adds the quotient; other dtypes use true division and plain arithmetic.
     """
     Computes self + value * (tensor1 / tensor2) using FMA for better precision.
 
@@ -8586,6 +9173,7 @@ def addcdiv(self, tensor1, tensor2, *, value=1):
     )
 
     def inner_fn(idx):
+        # [FUNCTION DOC] HELPER: Compute self + value * (t1 / t2) for one element using the fma or plain arithmetic path.
         self_val = self_loader(idx)
         t1_val = t1_loader(idx)
         t2_val = t2_loader(idx)
@@ -8692,6 +9280,7 @@ register_op_dtype_propagation_rules(
 
 @register_lowering(aten.remainder, broadcast=True)
 def remainder(a, b):
+    # [FUNCTION DOC] Lowering for aten.remainder: promotes scalar constants (rounded to low-precision tensor dtype) and applies the pointwise remainder op.
     a, b = promote_constants((a, b), round_scalar_constants=True)
     fn = ops_wrapper("remainder")
     return make_pointwise(fn)(a, b)
@@ -8703,6 +9292,7 @@ register_pointwise(aten.ceil)
 
 @register_lowering(aten.signbit)
 def signbit(x):
+    # [FUNCTION DOC] Lowering for aten.signbit: all-False bool tensor for bool and unsigned integer dtypes, otherwise a pointwise signbit producing bool.
     if x.get_dtype() in (
         torch.bool,
         torch.uint8,
@@ -8745,12 +9335,14 @@ from .codegen.common import BackendFeature, pointwise_overrides_data
 
 
 def _get_pointwise_overrides(ns, name):
+    # [FUNCTION DOC] HELPER: Generator yielding (op, type promotion kind, triton fallback) triples for the pointwise override named name in namespace ns, one per overload of a packet. Yields nothing if the op does not exist in the namespace.
     data = pointwise_overrides_data[name]
     op = getattr(ns, data.name, None)
     if op is None:
         return
 
     def make_triton_fallback(op):
+        # [FUNCTION DOC] HELPER: Return an eager fallback handler for the op when the override data has no triton implementation; otherwise returns None (no fallback).
         if data.triton is None:
             return fallback_handler(op)
 
@@ -8823,10 +9415,12 @@ foreach_copy = register_foreach_pointwise(aten._foreach_copy, copy)
 # reinplacing epilogue copies improves compile time
 # by removing extra buffers sent to the scheduler.
 def register_foreach_inplace(aten_op, outplace_aten_op, outplace_op):
+    # [FUNCTION DOC] HELPER: Register the in-place foreach op aten_op as the out-of-place lowering followed by mutation of each list element in place (aliasing allowed). Records the in-place/out-of-place pairing in global tables and registers the foreach lowering.
     inplaceable_foreach_ops[outplace_aten_op] = aten_op
     inplace_foreach_ops.add(aten_op)
 
     def fn(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Run the out-of-place foreach lowering and mutate each input list element with its result; returns the mutated list.
         results = outplace_op(*args, **kwargs)
         mut_results = []
         for arg, result in zip(args[0], results):
@@ -8871,8 +9465,10 @@ register_foreach_inplace(
 
 
 def register_inplace(aten_op, outplace_op):
+    # [FUNCTION DOC] HELPER: Register an in-place lowering for aten_op: computes the out-of-place result, casts it to the first argument's dtype, mutates the first argument with it. Returns the lowering.
     @register_lowering(aten_op, type_promotion_kind=None)
     def fn(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: In-place lowering body: compute the result with the out-of-place op, cast to the destination dtype, mutate and return args[0].
         result = outplace_op(*args, **kwargs)
         result = to_dtype(result, args[0].get_dtype())
         return mutate_to(args[0], result)
@@ -8914,6 +9510,7 @@ register_inplace(aten.__ixor__, aten.__xor__)
 
 @register_lowering(aten.sym_constrain_range)
 def sym_constrain_range(a, min=None, max=None):
+    # [FUNCTION DOC] Lowering for aten.sym_constrain_range: no-op returning None.
     return None
 
 
@@ -8923,6 +9520,7 @@ def _record_symbolic_input_source(
     expr: sympy.Expr,
     kind: Literal["size", "stride"],
 ) -> None:
+    # [FUNCTION DOC] HELPER: If expr is a plain sympy symbol and tensor is a graph input buffer, remember on the graph (first registration wins) which input name, kind (size or stride) and dim define that symbol. Otherwise does nothing.
     if not isinstance(expr, sympy.Symbol) or not isinstance(tensor, TensorBox):
         return
 
@@ -8940,6 +9538,7 @@ def _record_symbolic_input_source(
 
 @register_lowering(aten.sym_size.int)
 def sym_size(a, dim):
+    # [FUNCTION DOC] Lowering for aten.sym_size.int: returns the sympy expression of the node's symbolic value (recording the symbolic input source) or the int when static.
     val = V.graph.current_node.meta["val"]
     if isinstance(val, torch.SymInt):
         expr = val.node.expr
@@ -8951,6 +9550,7 @@ def sym_size(a, dim):
 
 @register_lowering(aten.sym_stride.int)
 def sym_stride(a, dim):
+    # [FUNCTION DOC] Lowering for aten.sym_stride.int: returns the sympy expression of the node's symbolic value (recording the source) or the int when static.
     val = V.graph.current_node.meta["val"]
     if isinstance(val, torch.SymInt):
         expr = val.node.expr
@@ -8962,10 +9562,12 @@ def sym_stride(a, dim):
 
 @register_lowering(aten.sym_numel)
 def sym_numel(a):
+    # [FUNCTION DOC] Lowering for aten.sym_numel: returns the element count of the tensor.
     return a.get_numel()
 
 
 def _unwrap_symbolic_magic_arg(x):
+    # [FUNCTION DOC] HELPER: Convert symbolic values to their sympy expressions and python numbers to sympy numbers; leave other values unchanged.
     if isinstance(x, SymTypes):
         return x.node.expr
     if isinstance(x, (int, float, bool)):
@@ -8977,6 +9579,8 @@ for method, func in magic_methods.items():
 
     @register_lowering(method_to_operator(method))
     def wrapped(*args, _func=func, **kwargs):
+        # [FUNCTION DOC] HELPER: Lowering for a symbolic magic method (arithmetic or comparison on symbolic numbers). Returns the node's metadata symbolic expression when present; if any argument is symbolic or sympy, applies the method to unwrapped sympy values;
+        # otherwise applies it to the plain values.
         node = V.graph.current_node
         meta_val = node.meta.get("val") if node is not None else None
         if isinstance(meta_val, SymTypes):
@@ -8994,6 +9598,7 @@ for method, func in magic_methods.items():
 
 @register_lowering(torch.sym_sum)
 def sym_sum(*args):
+    # [FUNCTION DOC] Lowering for torch.sym_sum: accepts one list/tuple or varargs and returns the sympy sum.
     # sym_sum can be called as sym_sum([a, b]) or sym_sum(a, b).
     # Normalize to a flat list before summing.
     if len(args) == 1 and isinstance(args[0], (list, tuple)):
@@ -9003,17 +9608,20 @@ def sym_sum(*args):
 
 @register_lowering(aten._foobar)
 def foobar(self, *args, **kwargs):
+    # [FUNCTION DOC] HELPER: Debug lowering that always raises NotImplementedError.
     raise NotImplementedError("Helpful for debugging")
 
 
 @register_lowering(torch.ops._inductor_test.realize)
 def _realize(x):
+    # [FUNCTION DOC] HELPER: Test lowering that forces realization of x and returns a clone.
     x.realize()
     return clone(x)
 
 
 @register_lowering(torch.ops.inductor.resize_storage_bytes_)
 def resize_storage_bytes_(variable, new_size):
+    # [FUNCTION DOC] Lowering for inductor resize_storage_bytes_: realizes the variable, creates a ResizeStorageBytes node, and returns the variable.
     variable.realize()
     ir.ResizeStorageBytes(variable, new_size)
     return variable
@@ -9021,6 +9629,7 @@ def resize_storage_bytes_(variable, new_size):
 
 @register_lowering(torch.ops.aten.set_.source_Tensor)
 def set__source_tensor(self, source_tensor):
+    # [FUNCTION DOC] Lowering for aten.set_.source_Tensor: realizes both tensors and returns a SetSourceTensorKernel result.
     self.realize()
     source_tensor.realize()
     return TensorBox.create(ir.SetSourceTensorKernel(self, source_tensor))
@@ -9028,6 +9637,7 @@ def set__source_tensor(self, source_tensor):
 
 @register_lowering(torch.ops.aten.shallow_copy_data_.default)
 def shallow_copy_data_(self, source_tensor):
+    # [FUNCTION DOC] Lowering for aten.shallow_copy_data_: realizes both tensors and returns a ShallowCopyDataKernel result.
     self.realize()
     source_tensor.realize()
     return TensorBox.create(ir.ShallowCopyDataKernel(self, source_tensor))
@@ -9037,6 +9647,7 @@ if hasattr(torch.ops.fsdp, "copy_"):
 
     @register_lowering(torch.ops.fsdp.copy_.default)
     def fsdp_copy_(dst, src):
+        # [FUNCTION DOC] Lowering for fsdp.copy_: like copy_, returns dst if src is dst; otherwise moves src to dst's device, dtype and shape and mutates dst. Defined only if the op exists.
         if dst is src:
             # dst.copy_(dst) can happen from the reinplacing pass
             return dst
@@ -9048,6 +9659,8 @@ if hasattr(torch.ops.fsdp, "copy_"):
 
 @register_lowering(torch.ops.aten.resize)
 def resize(x, size, *, memory_format=None):
+    # [FUNCTION DOC] Lowering for aten.resize. Requires a TensorBox and list/tuple size (raises an error otherwise); preserve_format raises RuntimeError and channels-last needs 4 or 5 dims. Existing elements are kept in storage order (a flat view; overlapping inputs use a
+    # logical flat view); new elements are filled with an uninitialized-memory value (NaN, max int or True under deterministic fill mode, else zero). An empty input yields a filled tensor. Returns a Pointwise with the requested memory format strides.
     if not (isinstance(x, TensorBox)):
         raise AssertionError("expected: isinstance(x, TensorBox)")
     if not (isinstance(size, (list, tuple))):
@@ -9103,6 +9716,7 @@ def resize(x, size, *, memory_format=None):
     out_indexer = ir.FixedLayout(device, dtype, size, out_stride).make_indexer()
 
     def inner_fn(idx):
+        # [FUNCTION DOC] HELPER: Load the flat source element if the output position is within the old element count, else the uninitialized fill value.
         flat_index = out_indexer(idx)
         flat_index_expr = ops.index_expr(flat_index, torch.int64)
         limit = ops.index_expr(old_numel, torch.int64)
@@ -9131,6 +9745,7 @@ def triton_kernel_wrap_(
     kwargs,
     launch_kwargs=None,
 ):
+    # [FUNCTION DOC] Lowering for the triton kernel wrapper mutation higher-order op: fetches constant args from the kernel side table and registers a UserDefinedTritonKernel node with the grid, descriptors and merged kernel arguments. Returns a mapping of the tensor arguments that the kernel may mutate.
     from torch._higher_order_ops.triton_kernel_wrap import kernel_side_table
 
     constant_args = kernel_side_table.get_constant_args(constant_args_idx)
@@ -9148,6 +9763,7 @@ def triton_kernel_wrap_(
 def cond(
     pred, true_fn, false_fn, operands
 ) -> list[ir.TensorBox | ir.ShapeAsConstantBuffer]:
+    # [FUNCTION DOC] Lowering for torch.cond: if any operand is on triton, records a reason that disables cudagraphs. Creates a Switch node over [false_fn, true_fn] (the predicate converts to index 0 or 1) and returns the outputs as TensorBoxes.
     # TODO: when graph_partition is enabled, skip - partitioning handles control flow
     # we run into memory cleanup issue
     if any(isinstance(x, IRNode) and is_triton(x) for x in [pred, *operands]):
@@ -9165,6 +9781,7 @@ def cond(
 
 @register_lowering(torch.ops.higher_order.switch, type_promotion_kind=None)
 def switch(index, branches, operands) -> list[ir.TensorBox | ir.ShapeAsConstantBuffer]:
+    # [FUNCTION DOC] Lowering for torch.switch: always records a reason that disables cudagraphs; creates a Switch node over the branches and returns the outputs as TensorBoxes.
     # TODO: cudagraph support for torch.switch is not yet implemented; always disable.
     msg = "control flow operator: torch.switch."
     if stack_trace := V.graph.current_node.meta.get("stack_trace", None):
@@ -9177,6 +9794,7 @@ def switch(index, branches, operands) -> list[ir.TensorBox | ir.ShapeAsConstantB
 
 @register_lowering(torch.ops.higher_order.while_loop, type_promotion_kind=None)
 def while_loop(cond_fn, body_fn, carried_inputs, additional_inputs, stack_output=False):
+    # [FUNCTION DOC] Lowering for torch.while_loop: when graph partitioning is off and any input is on triton, records a reason disabling cudagraphs. Creates a WhileLoop node (optionally stacking outputs) and returns the wrapped outputs; raises an error if the result is not a sequence.
     # TODO: when graph_partition is enabled, skip - partitioning handles control flow
     # we run into memory cleanup issue
     if not config.graph_partition and any(
@@ -9203,6 +9821,7 @@ register_lowering(
 
 @register_lowering(torch.ops.higher_order.invoke_subgraph, type_promotion_kind=None)
 def invoke_subgraph(subgraph_fn: ir.Subgraph, identifier: str, *operands):
+    # [FUNCTION DOC] Lowering for invoke_subgraph: creates an InvokeSubgraph node for the subgraph and operands and returns outputs as TensorBoxes. The identifier is unused.
     result = ir.InvokeSubgraph.create(subgraph_fn, *operands)
     return list(map(TensorBox.create, result))  # type: ignore[call-overload]
 
@@ -9211,6 +9830,8 @@ _MISSING = object()
 
 
 def process_subgraph_nodes(graph_module: torch.fx.GraphModule, args: list[Any]):
+    # [FUNCTION DOC] HELPER: Execute a subgraph's FX nodes through the current graph lowering. Placeholders bind to the given args, other nodes run via run_node (temporarily setting the current node and restoring it), and the output node's value is returned.
+    # Raises an error if a node is already in the environment, and RuntimeError if there is no output node.
     """Process nodes from a FX graph by executing them through V.graph.
 
     This is a common pattern for executing a subgraph's nodes:
@@ -9253,6 +9874,8 @@ from torch._inductor.fx_passes.control_dependencies import control_deps
 
 @register_lowering(control_deps, type_promotion_kind=None)
 def control_deps_op_lowering(additional_deps, subgraph_fn, *args):
+    # [FUNCTION DOC] Lowering for control_deps. Realizes all dependency IR nodes (and recorded names of void ops from earlier control_deps nodes), runs the subgraph via process_subgraph_nodes, records names of void-layout ops created, adds each dependency as an additional buffer
+    # dependency of every operation created in the subgraph, and for pass-through values (inputs also returned) adds an ordering barrier depending on the subgraph's buffers. Returns the subgraph output. Raises an error if there are no dependencies or arg counts mismatch.
     """
     Lower control_deps_op by ensuring dependencies are realized and tracking them.
 
@@ -9370,6 +9993,8 @@ def control_deps_op_lowering(additional_deps, subgraph_fn, *args):
 
 @register_lowering(torch._higher_order_ops.invoke_quant, type_promotion_kind=None)
 def invoke_quant_tracer(subgraph_fn: ir.Subgraph, *operands, scheme=None):
+    # [FUNCTION DOC] Lowering for the invoke_quant higher-order op. Requires quant_options on the current node (raises an error otherwise). Runs the subgraph nodes through the graph lowering (placeholders bound to operands); at the output node realizes every output,
+    # records their operation names as invoke_quant ops (and as low-precision codegen ops when the options request it), and returns the output.
     output = None
     quant_options = V.graph.current_node.meta.get("quant_options", None)
     if quant_options is None:
@@ -9400,6 +10025,8 @@ def invoke_quant_tracer(subgraph_fn: ir.Subgraph, *operands, scheme=None):
 
 @register_lowering(associative_scan_op, type_promotion_kind=None)
 def associative_scan(combine_fn: ir.Subgraph, xs, additional_inputs: tuple[Any, ...]):
+    # [FUNCTION DOC] Lowering for the associative_scan higher-order op (pointwise combine mode). Raises RuntimeError if any input's device lacks scan support, if lifted additional inputs do not match or are unsupported (non-numeric or used by the combine graph). Lowers the combine
+    # subgraph to a pointwise function over leaf values of both operands plus additional inputs, then creates a Scan over the first dim of the inputs with no eager fallback. Returns the scan outputs; raises RuntimeError if code cannot be generated.
     from .subgraph_lowering import InputDescriptor, lower_pointwise_subgraph
 
     # combine_mode="pointwise" codegen requires a backend with scan support
@@ -9445,6 +10072,7 @@ def associative_scan(combine_fn: ir.Subgraph, xs, additional_inputs: tuple[Any, 
     lowered_combine_fn = lower_pointwise_subgraph(combine_fn, subgraph_inputs)
 
     def wrapped_combine_fn(lhs, rhs):
+        # [FUNCTION DOC] HELPER: Combine two carried tuples by flattening them and calling the lowered subgraph with the additional inputs.
         return lowered_combine_fn(
             *pytree.tree_leaves(lhs),
             *pytree.tree_leaves(rhs),
@@ -9466,16 +10094,20 @@ def associative_scan(combine_fn: ir.Subgraph, xs, additional_inputs: tuple[Any, 
 
 @register_lowering(torch.ops.prims._sink_tokens.default)
 def _sink_tokens(tokens):
+    # [FUNCTION DOC] Lowering for prims._sink_tokens: no-op returning None.
     return None
 
 
 @register_lowering(torch.ops.prims._make_token.default)
 def _make_token():
+    # [FUNCTION DOC] Lowering for prims._make_token: no-op returning None.
     return None
 
 
 @register_lowering(torch.ops.higher_order.with_effects, type_promotion_kind=None)
 def with_effects(token, op, *args, **kwargs):
+    # [FUNCTION DOC] Lowering for with_effects: lowers the wrapped op directly (using its registered lowering, realizing results, or an eager fallback kernel), then marks every newly created operation as having side effects and chains it after the previous operation with the same effect type
+    # (resolving the effect of invoke_subgraph from the tracing cache). Raises an error if no operations were created or multiple effects are found. Returns the token followed by the op results, shaped by the op schema (a warning is logged and a list output assumed if the schema is unavailable).
     """
     We lower the operator directly, and then we add StarDep dependencies to all
     the newly created nodes in the graph.
@@ -9515,6 +10147,7 @@ def with_effects(token, op, *args, **kwargs):
     else:
 
         def wrap_tensors(x):
+            # [FUNCTION DOC] HELPER: Wrap IR nodes for lowering; pass other values through.
             return x.wrap_for_lowering() if isinstance(x, ir.IRNode) else x
 
         result = pytree.tree_map(
@@ -9543,6 +10176,7 @@ def with_effects(token, op, *args, **kwargs):
     try:
 
         def convert_ir_to_value(a):
+            # [FUNCTION DOC] HELPER: Convert an IR value to a concrete value for schema lookup: torch-bind objects to their value, tensor boxes to their example tensor when available, otherwise unchanged.
             if isinstance(a, ir.TorchBindObject):
                 return a.get_value()
             elif isinstance(a, TensorBox):
@@ -9591,6 +10225,7 @@ register_symm_mem_lowerings()
 
 @register_lowering(inductor_prims.prepare_softmax_online, type_promotion_kind=None)
 def prepare_softmax_online(x, dim):
+    # [FUNCTION DOC] Lowering for prepare_softmax_online: for a statically known reduction size at least the unroll threshold, creates an online softmax reduction returning (max, sum of exp). Otherwise computes amax, the exponentials, and their sum with ordinary reductions. Returns (max, sum) keeping the reduced dim.
     """
     Lowering inductor_prims.prepare_softmax_online to compute max/sum with
     online softmax reductions when profitable.
@@ -9617,6 +10252,8 @@ def prepare_softmax_online(x, dim):
 
 @register_lowering(inductor_prims.cvt_e8m0_rceil, type_promotion_kind=None)
 def cvt_e8m0_rceil_lowering(inp):
+    # [FUNCTION DOC] Lowering for cvt_e8m0_rceil: converts float values to the e8m0 format with round-toward-positive using inline PTX. Requires NVIDIA SM100 or later (NotImplementedError otherwise) and float32, float16 or bfloat16 input (ValueError otherwise); lower precision is upcast to float32.
+    # Returns a uint8 tensor.
     """
     Lowering for cvt_e8m0_rceil. Uses PTX cvt.rp.satfinite.ue8m0x2.f32 on NVIDIA SM100+.
 
@@ -9659,12 +10296,14 @@ def cvt_e8m0_rceil_lowering(inp):
 def lower_inline_asm_elementwise(
     *inputs, asm_str, constraints, dtype, is_pure=True, pack=1
 ):
+    # [FUNCTION DOC] Lowering for the inline_asm_elementwise higher-order op: broadcasts the inputs and builds a Pointwise that applies the inline assembly string with the given constraints, output dtype, purity and packing, upcasting fp16/bf16 results to float32 for fusion.
     inputs = broadcast_tensors(*inputs)
 
     input_dtypes = tuple(inp.get_dtype() for inp in inputs)
     loaders = [inp.make_loader() for inp in inputs]
 
     def inner_fn(idx):
+        # [FUNCTION DOC] HELPER: Load all inputs at idx and apply the inline assembly elementwise op.
         vals = tuple(loader(idx) for loader in loaders)
         result = ops.inline_asm_elementwise(
             *vals,
@@ -9710,6 +10349,7 @@ quantized_lowerings.register_woq_mm_ops()
 
 @contextlib.contextmanager
 def force_fallback(op: torch._ops.OpOverload):
+    # [FUNCTION DOC] HELPER: Context manager (for tests) that forces op to use an eager fallback kernel lowering. Requires an OpOverload (raises an error otherwise); on exit restores the previous lowering or removes the registered one.
     """
     A context manager to force fallback an op. Used in unit test
     for FallbackKernel.
