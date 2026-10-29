@@ -1,5 +1,13 @@
 # mypy: ignore-errors
 
+# [MODULE DOC]
+# Test data for autocast (automatic mixed precision) tests. Defines AutocastTestLists (CUDA,
+# float16 oriented) and AutocastCPUTestLists (CPU, bfloat16/float16 oriented), which build
+# categorized lists of operator names paired with example arguments, and TestAutocast, a
+# TestCase base class with a helper that runs one op under autocast and compares the result
+# with a manual cast control. Imports TEST_WITH_ROCM and TestCase from common_utils; no
+# import-time side effects.
+
 import collections
 
 import torch
@@ -8,7 +16,18 @@ from torch.testing._internal.common_utils import TestCase
 
 
 class AutocastTestLists:
+    # [CLASS DOC] Container of CUDA autocast test inputs. The constructor populates instance
+    # attributes that are lists of tuples (op name, argument tuple, and optionally extra
+    # keyword arguments / expected dtype / skip flag): torch_expect_builtin_promote,
+    # methods_expect_builtin_promote, torch_fp16, torch_fp32, torch_need_autocast_promote,
+    # nn_fp16, nn_fp32, linalg_fp16, methods_fp16, methods_fp32 and banned. Each attribute
+    # name matches a test_autocast_<name> test in the CUDA tests. Holds no other state.
     def _rnn_cell_args(self, n, num_chunks, is_lstm, dev, dtype):
+        # [FUNCTION DOC] HELPER: Builds the argument tuple for an RNN-style cell op: an input
+        # matrix, a hidden state (a pair for LSTM, a single matrix otherwise), and four weight
+        # and bias tensors sized by num_chunks (gate count) times n. All tensors are random
+        # float32 on device dev; the dtype argument is unused.
+        # KNOWN ISSUE: the dtype parameter is ignored; float32 is hard-coded.
         input = (torch.randn((n, n), device=dev, dtype=torch.float32),)
 
         hx = ((torch.randn((n, n), device=dev, dtype=torch.float32),
@@ -25,6 +44,10 @@ class AutocastTestLists:
 
     # Supplies ops and arguments for test_autocast_* in test/test_cuda.py
     def __init__(self, dev):
+        # [FUNCTION DOC] Creates random float16 and float32 tensors of small size on device dev
+        # and uses them to populate the categorized op lists described on the class. Some
+        # entries carry a trailing skip flag that is true on ROCm (cudnn conv ops). Mutates
+        # only self; consumes the global RNG.
         super().__init__()
         n = 8
         # Utility arguments, created as one-element tuples
@@ -240,8 +263,16 @@ class AutocastTestLists:
 
 
 class AutocastCPUTestLists:
+    # [CLASS DOC] Container of CPU autocast test inputs. The constructor populates list
+    # attributes: torch_expect_builtin_promote, methods_expect_builtin_promote, torch_16,
+    # torch_fp32, nn_16, nn_fp32 and torch_need_autocast_promote. Entries are tuples of op
+    # name, argument tuple(s) (bfloat16 and float16 variants where relevant), and optionally
+    # keyword arguments or expected dtype. Holds no other state.
     # Supplies ops and arguments for test_autocast_* in test/test_cpu.py
     def __init__(self, dev):
+        # [FUNCTION DOC] Creates random bfloat16, float16 and float32 tensors on device dev and
+        # uses them to populate the CPU op lists described on the class. Mutates only self;
+        # consumes the global RNG.
         super().__init__()
         n = 8
         # Utility arguments, created as one-element tuples
@@ -374,7 +405,12 @@ class AutocastCPUTestLists:
 
 
 class TestAutocast(TestCase):
+    # [CLASS DOC] Base test case providing shared autocast checking helpers for device-specific
+    # autocast tests. Stateless; defines no tests itself.
     def args_maybe_kwargs(self, op_with_args):
+        # [FUNCTION DOC] Normalizes an op description tuple into (op name, args, kwargs). If
+        # the tuple has two entries, kwargs is an empty mapping; otherwise the third entry is
+        # used. Pure function.
         if len(op_with_args) == 2:
             return op_with_args[0], op_with_args[1], {}
         else:
@@ -391,8 +427,18 @@ class TestAutocast(TestCase):
         add_kwargs=None,
         amp_dtype=torch.bfloat16,
     ):
+        # [FUNCTION DOC] HELPER: Runs operator named op on args under autocast for the given
+        # device type and dtype amp_dtype, via the module function (if module has it) and the
+        # Tensor method (if it exists), and asserts autocast is enabled inside and disabled
+        # outside. Asserts the output dtype equals out_type (default run_as_type), that at least
+        # one variant exists, that both variants agree, and that the result exactly equals a
+        # control computed with autocast disabled on args manually cast to run_as_type.
+        # add_kwargs are passed as extra keyword arguments. Failures raise test assertion errors.
         # helper to cast args
         def cast(val, to_type):
+            # [FUNCTION DOC] HELPER: Recursively converts floating-point tensors in val
+            # (including inside iterables, preserving container type) to to_type; other values
+            # are returned unchanged.
             if isinstance(val, torch.Tensor):
                 return val.to(to_type) if val.is_floating_point() else val
             elif isinstance(val, collections.abc.Iterable):
@@ -435,6 +481,9 @@ class TestAutocast(TestCase):
             # Accounts for ops that return Tensors, iterables, and other non-Tensors.
             # For example, lstm_cell returns a tuple and equal returns bool.
             def compare(first, second):
+                # [FUNCTION DOC] HELPER: Returns True if first and second match exactly:
+                # tensors via exact equality, iterables element-wise (recursively, stopping at
+                # the shorter one), anything else via plain equality.
                 if isinstance(first, torch.Tensor):
                     return torch.equal(first, second)
                 elif isinstance(first, collections.abc.Iterable):

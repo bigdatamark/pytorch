@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Tensor creation utilities for tests. Defines module-level lists of dtype categories
+# (integral, floating, 8-bit floating, complex, and unions of these), a helper that fills a
+# tensor with uniform random values, and the public make_tensor function, which builds a
+# random tensor of a given shape, dtype and device with optional value range, layout and
+# gradient settings. No import-time side effects beyond building the dtype lists.
 """
 This module contains tensor creation utilities.
 """
@@ -34,6 +40,9 @@ _FLOATING_OR_COMPLEX_TYPES = [*_FLOATING_TYPES, *_COMPLEX_TYPES]
 
 
 def _uniform_random_(t: torch.Tensor, low: float, high: float) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Fills tensor t in place with uniform random values in the range
+    # from low to high and returns t. When the range width reaches the dtype's largest finite
+    # value, it samples from the halved range and doubles the result to avoid overflow.
     # uniform_ requires to-from <= std::numeric_limits<scalar_t>::max()
     # Work around this by scaling the range before and after the PRNG
     if high - low >= torch.finfo(t.dtype).max:
@@ -53,6 +62,19 @@ def make_tensor(
     exclude_zero: bool = False,
     memory_format: torch.memory_format | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Builds a random tensor with the given shape (varargs, or a single sequence),
+    # dtype and device. Values are uniform in [low, high), with dtype-dependent defaults, and
+    # bounds are clamped to the dtype's finite range. Bool and integral dtypes use random
+    # integers, floating and complex dtypes use uniform sampling, 8-bit float dtypes are sampled
+    # in float32 and cast. noncontiguous returns a strided view of a tensor twice as wide in the
+    # last dimension (ignored for fewer than two elements); memory_format clones into that
+    # format; exclude_zero replaces zeros with one or the dtype's smallest normal number.
+    # requires_grad is only applied to floating and complex dtypes.
+    # Raises ValueError if noncontiguous and memory_format are both given, if requires_grad is
+    # set for bool or integral dtypes, or for invalid low/high (NaN, low above high, interval
+    # outside the dtype range); raises TypeError for unsupported dtypes. Uses the global RNG.
+    # KNOWN ISSUE: the docstring says low equal to high is deprecated and removed in 2.3, but
+    # the code only warns (FutureWarning) for floating/complex dtypes and still proceeds.
     r"""Creates a tensor with the given :attr:`shape`, :attr:`device`, and :attr:`dtype`, and filled with
     values uniformly drawn from ``[low, high)``.
 
@@ -133,12 +155,18 @@ def make_tensor(
         default_low: float,
         default_high: float,
     ) -> tuple[float, float]:
+        # [FUNCTION DOC] HELPER: Resolves the user's low/high against defaults, validates them and
+        # clamps them to the dtype-supported interval. Raises ValueError for NaN bounds, low not
+        # below high, or an interval entirely outside the supported range; warns (FutureWarning)
+        # when low equals high for floating or complex dtypes. For bool and integral dtypes both
+        # bounds are rounded up to integers. Returns the (low, high) pair.
         """
         Modifies (and raises ValueError when appropriate) low and high values given by the user (input_low, input_high)
         if required.
         """
 
         def clamp(a: float, l: float, h: float) -> float:
+            # [FUNCTION DOC] HELPER: Returns a limited to the closed range from l to h.
             return min(max(a, l), h)
 
         low = low if low is not None else default_low

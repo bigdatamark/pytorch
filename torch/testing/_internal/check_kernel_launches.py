@@ -1,5 +1,13 @@
 # mypy: ignore-errors
 
+# [MODULE DOC]
+# Static checker that finds CUDA kernel launches (the triple-angle-bracket launch syntax) in
+# .cu and .cuh files that are not immediately followed by a launch-check macro statement.
+# Exports check_code_for_cuda_kernel_launches (check a source string) and
+# check_cuda_kernel_launches (scan the torch source tree). Defines two module-level regexes and
+# an empty exclusion list of filename suffixes. Run as a script, it exits nonzero if any
+# unchecked launch is found. No import-time side effects.
+
 import os
 import re
 import sys
@@ -45,6 +53,9 @@ has_check = re.compile(
 )
 
 def find_matching_paren(s: str, startpos: int) -> int:
+    # [FUNCTION DOC] HELPER: Given string s and the position of an opening parenthesis, scans
+    # forward counting nesting depth and returns the index one past the matching closing
+    # parenthesis. Raises IndexError if no matching close is found. Pure function.
     """Given a string "prefix (unknown number of characters) suffix"
     and the position of the first `(` returns the index of the character
     1 past the `)`, accounting for paren nesting
@@ -62,6 +73,8 @@ def find_matching_paren(s: str, startpos: int) -> int:
 
 
 def should_exclude_file(filename) -> bool:
+    # [FUNCTION DOC] HELPER: Returns True if filename ends with any suffix in the module-level
+    # exclude_files list, otherwise False.
     for exclude_suffix in exclude_files:
         if filename.endswith(exclude_suffix):
             return True
@@ -69,6 +82,12 @@ def should_exclude_file(filename) -> bool:
 
 
 def check_code_for_cuda_kernel_launches(code, filename=None):
+    # [FUNCTION DOC] Counts kernel launches in the source string code that lack the launch-check
+    # statement right after them. Prefixes each line with its line number, finds launch starts
+    # with a regex, locates the end of each launch by paren matching, and tests the following
+    # statement. For each offender, prints the filename (a placeholder if None) and numbered
+    # context to stderr. Returns the count of unchecked launches.
+    # KNOWN ISSUE: the regex named has_check actually matches when the check is MISSING.
     """Checks code for CUDA kernel launches without cuda error checks.
 
     Args:
@@ -100,6 +119,9 @@ def check_code_for_cuda_kernel_launches(code, filename=None):
 
 
 def check_file(filename):
+    # [FUNCTION DOC] Returns the number of unchecked kernel launches in the file at filename.
+    # Returns 0 without reading if the name does not end in .cu or .cuh or is excluded; otherwise
+    # reads the file and delegates to check_code_for_cuda_kernel_launches (which prints to stderr).
     """Checks a file for CUDA kernel launches without cuda error checks
 
     Args:
@@ -119,6 +141,12 @@ def check_file(filename):
 
 
 def check_cuda_kernel_launches():
+    # [FUNCTION DOC] Walks the source tree two directories above this file's parent (the
+    # directory holding the torch package), skipping the build and torch/include directories,
+    # and checks every file. Returns the total number of unchecked launches; if any, prints a
+    # summary and the list of offending files to stderr.
+    # KNOWN ISSUE: a comment says the walk goes up to "caffe2", but the walked directory is
+    # actually the torch package directory itself.
     """Checks all pytorch code for CUDA kernel launches without cuda error checks
 
     Returns:
