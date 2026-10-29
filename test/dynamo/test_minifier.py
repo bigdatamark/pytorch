@@ -1,5 +1,12 @@
 # Owner(s): ["module: dynamo"]
 
+# [MODULE DOC] Tests for the Dynamo minifier and repro generation. MinifierTests runs generated
+# programs through the full minifier flow using testing-only backends that fail on relu, and
+# checks the minified output; TestAutocastDeviceDetection checks that repro helpers build
+# autocast contexts for the tensors' device type; ReproGenerationTests checks generated repro
+# source for quantized modules and unconvertible module reprs. Device-generic classes
+# (MinifierTests, TestAutocastDeviceDetection) are expanded per device at import time via
+# instantiate_device_type_tests with XPU allowed.
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -14,7 +21,13 @@ from torch.testing._internal.common_utils import skipIfNNModuleInlined
 
 
 class MinifierTests(MinifierTestBase):
+    # [CLASS DOC] Device-generic minifier tests, built on MinifierTestBase which supplies the
+    # full-flow runner. Tests pass a device argument. Methods starting with an underscore are
+    # shared helpers; the rest are test cases covering compile, runtime and accuracy errors after
+    # Dynamo, mixed cpu/device modules and graph minification.
     def test_decode_subprocess_output_handles_non_utf8_bytes(self):
+        # [FUNCTION DOC] Check that the subprocess output decoder replaces an invalid non-UTF-8
+        # byte with the Unicode replacement character instead of raising.
         self.assertEqual(
             _decode_subprocess_output(b"readable output\xb1continues"),
             "readable output\ufffdcontinues",
@@ -22,6 +35,11 @@ class MinifierTests(MinifierTestBase):
 
     # Test that compile, runtime, and accuracy errors after dynamo can be repro'd
     def _test_after_dynamo(self, device, backend, expected_error):
+        # [FUNCTION DOC] HELPER: Build a program that compiles a function with the given backend
+        # (ten sine ops, one relu, ten cosine ops) on a random 20x20 tensor on the device, and
+        # run the full minifier flow expecting the named error. Uses a testing-only backend and
+        # runs the program through the full minifier flow (test run, minifier launcher, repro
+        # run) in non-isolated mode with the repro-after stage set to dynamo.
         run_code = f"""\
 @torch.compile(backend={backend!r})
 def inner(x):
@@ -37,21 +55,30 @@ inner(torch.randn(20, 20, device="{device}"))
         self._run_full_test(run_code, "dynamo", expected_error, isolate=False)
 
     def test_after_dynamo_compile_error(self, device):
+        # [FUNCTION DOC] Run the after-dynamo flow with the relu compile-error backend, expecting
+        # ReluCompileError.
         self._test_after_dynamo(
             device, "relu_compile_error_TESTING_ONLY", "ReluCompileError"
         )
 
     def test_after_dynamo_runtime_error(self, device):
+        # [FUNCTION DOC] Run the after-dynamo flow with the relu runtime-error backend, expecting
+        # ReluRuntimeError.
         self._test_after_dynamo(
             device, "relu_runtime_error_TESTING_ONLY", "ReluRuntimeError"
         )
 
     def test_after_dynamo_accuracy_error(self, device):
+        # [FUNCTION DOC] Run the after-dynamo flow with the relu accuracy-error backend,
+        # expecting AccuracyError.
         self._test_after_dynamo(
             device, "relu_accuracy_error_TESTING_ONLY", "AccuracyError"
         )
 
     def test_after_dynamo_non_leaf_compile_error(self, device):
+        # [FUNCTION DOC] Run the full minifier flow on a program with a trivial add function
+        # whose input requires grad and is non-leaf, using the non-leaf compile-error backend,
+        # expecting TestingOnlyCompileError (non-isolated, after dynamo).
         run_code = f"""\
 @torch.compile(backend="non_leaf_compile_error_TESTING_ONLY")
 def inner(x):
@@ -65,8 +92,13 @@ inner(torch.randn(20, 20, requires_grad=True, device="{device}") + 1)
 
     # Ensure that the testing backends pass when relu is not present.
     def _test_after_dynamo_backend_passes(self, device, backend):
+        # [FUNCTION DOC] HELPER: Compile a function with the given testing backend that has only
+        # sine and cosine ops (no relu) and call it once on a random tensor on the device. Passes
+        # if no error is raised, showing these backends only fail when relu is present.
         @torch.compile(backend=backend)
         def inner(x):
+            # [FUNCTION DOC] HELPER: Compiled function applying sine ten times then cosine ten
+            # times to its input.
             for _ in range(10):
                 x = torch.sin(x)
             for _ in range(10):
@@ -76,16 +108,22 @@ inner(torch.randn(20, 20, requires_grad=True, device="{device}") + 1)
         inner(torch.randn(20, 20, device=device))
 
     def test_after_dynamo_compile_backend_passes(self, device):
+        # [FUNCTION DOC] Check the relu compile-error backend does not fail on a relu-free
+        # function.
         self._test_after_dynamo_backend_passes(
             device, "relu_compile_error_TESTING_ONLY"
         )
 
     def test_after_dynamo_runtime_backend_passes(self, device):
+        # [FUNCTION DOC] Check the relu runtime-error backend does not fail on a relu-free
+        # function.
         self._test_after_dynamo_backend_passes(
             device, "relu_runtime_error_TESTING_ONLY"
         )
 
     def test_after_dynamo_accuracy_backend_passes(self, device):
+        # [FUNCTION DOC] Check the relu accuracy-error backend does not fail on a relu-free
+        # function.
         self._test_after_dynamo_backend_passes(
             device, "relu_accuracy_error_TESTING_ONLY"
         )
@@ -93,6 +131,10 @@ inner(torch.randn(20, 20, requires_grad=True, device="{device}") + 1)
     # Test that a module with mixed cpu/device parts  with an error after dynamo can be repro'd
     @skipIfNNModuleInlined()
     def test_cpu_device_module_after_dynamo(self, device):
+        # [FUNCTION DOC] Skipped when nn modules are inlined. Run the full minifier flow on a
+        # generated program with a module mixing device and cpu submodules, parameters and
+        # buffers, compiled with the relu compile-error backend, expecting ReluCompileError, then
+        # compare the minified module source against an expected golden string.
         backend_name = "relu_compile_error_TESTING_ONLY"
         run_code = f"""\
 device = "{device}"
@@ -163,6 +205,10 @@ class Repro(torch.nn.Module):
 
     # Test if we can actually get a minified graph
     def test_if_graph_minified(self, device):
+        # [FUNCTION DOC] Run the full minifier flow on a program with twenty sine ops, one relu,
+        # twenty cosine ops under the relu compile-error backend, expecting ReluCompileError,
+        # then check the repro module source is minimized to a module whose forward takes one
+        # input and applies relu.
         backend_name = "relu_compile_error_TESTING_ONLY"
         run_code = f"""\
 @torch.compile(backend={backend_name!r})
@@ -193,9 +239,15 @@ class Repro(torch.nn.Module):
 
 
 class TestAutocastDeviceDetection(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Test case checking that the after-dynamo repro entry points (minify and run)
+    # create an autocast context using the device type of the input tensors rather than a fixed
+    # device type. Tests run per device and skip on CPU.
     def _make_options(
         self, accuracy="", autocast=False, backend="eager", only_fwd=True
     ):
+        # [FUNCTION DOC] HELPER: Build an argparse namespace with accuracy, autocast, backend and
+        # only_fwd fields, defaulting to no accuracy mode, autocast off, the eager backend and
+        # forward-only.
         import argparse
 
         return argparse.Namespace(
@@ -206,6 +258,10 @@ class TestAutocastDeviceDetection(torch._dynamo.test_case.TestCase):
         )
 
     def test_repro_minify_autocast_uses_tensor_device(self, device):
+        # [FUNCTION DOC] Skips on CPU. Runs repro_minify on an identity graph module with a
+        # tensor on the device, patching argument loading, backend lookup, optimize and
+        # torch.amp.autocast. Asserts autocast is called exactly once with the device type and
+        # enabled false.
         if torch.device(device).type == "cpu":
             self.skipTest("device detection only meaningful for non-CPU devices")
 
@@ -216,6 +272,8 @@ class TestAutocastDeviceDetection(torch._dynamo.test_case.TestCase):
         options = self._make_options()
 
         def fake_compiler(gm, example_inputs, compiler_name=None):
+            # [FUNCTION DOC] HELPER: Fake compiler for the patched backend lookup; ignores the
+            # example inputs and name and returns the module's forward method.
             return gm.forward
 
         mock_autocast = MagicMock()
@@ -234,6 +292,10 @@ class TestAutocastDeviceDetection(torch._dynamo.test_case.TestCase):
         mock_autocast.assert_called_once_with(torch.device(device).type, enabled=False)
 
     def test_repro_run_accuracy_branch_autocast_uses_tensor_device(self, device):
+        # [FUNCTION DOC] Skips on CPU. Runs repro_run with the accuracy option set to strict on
+        # an identity graph module with a tensor on the device, patching argument loading,
+        # optimize, the model comparison (always true) and torch.amp.autocast. Asserts autocast
+        # is called exactly once with the device type and enabled false.
         if torch.device(device).type == "cpu":
             self.skipTest("device detection only meaningful for non-CPU devices")
 
@@ -261,7 +323,17 @@ instantiate_device_type_tests(TestAutocastDeviceDetection, globals(), allow_xpu=
 
 
 class ReproGenerationTests(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Test case for the source text generated for repro scripts by the after-dynamo
+    # and after-aot generators. Tests cover quantized fake-quant and QAT fused modules and
+    # unconvertible module reprs.
     def test_after_dynamo_repro_uses_constructor_for_fake_quant_with_child_repr(self):
+        # [FUNCTION DOC] Generate a Dynamo repro string for a graph holding a default QAT fused
+        # moving-average fake-quant module that has extra parameter and buffer, both with and
+        # without a save directory. Checks the code constructs the module directly, contains no
+        # child repr, base64, weights_only or saved module file references, writes no saved
+        # module files, compiles and executes, and that the rebuilt module has the same quant
+        # range and reduce_range but not the extra parameter or buffer and runs on a random
+        # input.
         from torch._dynamo.repro.after_dynamo import generate_dynamo_fx_repro_string
         from torch.ao.quantization import FusedMovingAvgObsFakeQuantize
 
@@ -317,6 +389,8 @@ class ReproGenerationTests(torch._dynamo.test_case.TestCase):
                     self.assertEqual(mod(torch.randn(2))[0].shape, (2,))
 
     def test_after_dynamo_repro_preserves_fake_quant_buffer_device(self):
+        # [FUNCTION DOC] Move a fake-quant module to the meta device, convert the graph module
+        # with NNModuleToString and check the output text contains a move to meta.
         from torch._dynamo.debug_utils import NNModuleToString
 
         graph = torch.fx.Graph()
@@ -334,6 +408,11 @@ class ReproGenerationTests(torch._dynamo.test_case.TestCase):
         self.assertIn('.to("meta")', code)
 
     def test_after_dynamo_repro_uses_constructor_for_qat_fused_module(self):
+        # [FUNCTION DOC] For the fbgemm, x86 and qnnpack backends, build a QAT fused conv-bn-relu
+        # module with that qconfig, generate a Dynamo repro string and check it constructs the
+        # fused module, refers to the default QAT qconfig for the mapped backend (x86 maps to
+        # fbgemm), has no child reprs, base64 or weights_only text, compiles and executes, and
+        # that the rebuilt module has the right type and output shape.
         from torch._dynamo.repro.after_dynamo import generate_dynamo_fx_repro_string
 
         for backend, expected_backend in (
@@ -387,6 +466,9 @@ class ReproGenerationTests(torch._dynamo.test_case.TestCase):
                 self.assertEqual(mod(torch.randn(2, 3, 8, 8))[0].shape, (2, 4, 4, 4))
 
     def test_after_dynamo_repro_rejects_custom_qat_qconfig(self):
+        # [FUNCTION DOC] Check that generating a Dynamo repro string for a fused QAT conv module
+        # with a custom (non-default) qconfig raises AssertionError saying the module cannot be
+        # converted.
         from torch._dynamo.repro.after_dynamo import generate_dynamo_fx_repro_string
 
         qconfig = torch.ao.quantization.QConfig(
@@ -410,13 +492,20 @@ class ReproGenerationTests(torch._dynamo.test_case.TestCase):
             generate_dynamo_fx_repro_string(gm, [torch.randn(2, 3, 8, 8)], "eager")
 
     def test_after_aot_repro_falls_back_for_unconvertible_module_repr(self):
+        # [FUNCTION DOC] Check generate_compiler_repro_string in the after-aot generator falls
+        # back to the module's own repr text when the repr is not convertible: the generated code
+        # contains the submodule assigned from that repr text.
         from torch._dynamo.repro.after_aot import generate_compiler_repro_string
 
         class UnsupportedModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Pass-through module (forward returns its input) whose repr is a
+            # fixed text that cannot be converted to a constructor.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return the input unchanged.
                 return x
 
             def __repr__(self):
+                # [FUNCTION DOC] HELPER: Return the fixed text for the module repr.
                 return "<lambda>()"
 
         graph = torch.fx.Graph()

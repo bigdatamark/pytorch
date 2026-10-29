@@ -1,4 +1,13 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests for the torch logging system as exercised through Dynamo and Inductor.
+# Defines helpers that normalize log text (shape guards, global-state guard, log line prefixes,
+# rank prefixes), small functions used as compile targets, and factories that build logging tests
+# for a given record-count expectation. LoggingTests checks per-artifact record counts, recompile
+# hints, side-effect logs, trace-source and trace-call logs, guard logs, custom formatting, log
+# registration and subprocess-based TORCH_LOGS behavior. At import time it creates module-level
+# flags for GPU/distributed availability and the current accelerator device type, and attaches
+# one generated single-record test to LoggingTests for each registered logging artifact that is
+# not in the exclusion set.
 import contextlib
 import functools
 import logging
@@ -52,6 +61,11 @@ device_type = (
 
 
 def munge_shape_guards(s: str) -> str:
+    # [FUNCTION DOC] Normalize a guard log message so shape guards can be compared with golden
+    # text. Picks a regular expression for the shape-guard line prefix depending on whether C++
+    # symbolic shape guards are enabled, rewrites source location fragments to a placeholder and
+    # the prefix to a fixed marker, and returns only the lines that contained a shape guard,
+    # joined by newlines.
     SHAPE_GUARD_REGEX = (
         r"[| ]* \+- SYMBOLIC_SHAPE_GUARD:"
         if torch._dynamo.config.enable_cpp_symbolic_shape_guards
@@ -59,6 +73,9 @@ def munge_shape_guards(s: str) -> str:
     )
 
     def munge(s):
+        # [FUNCTION DOC] HELPER: Apply two substitutions to one line: replace location fragments
+        # (file, line number and function) with a fixed placeholder, then replace the shape-guard
+        # prefix. Returns the rewritten text and the number of prefix replacements.
         s = re.sub(r"[^ ]+:\d+ in [^ ]+", "#:# in #", s)
         return re.subn(SHAPE_GUARD_REGEX, "+- __SHAPE_GUARD__:", s)
 
@@ -67,6 +84,11 @@ def munge_shape_guards(s: str) -> str:
 
 
 def munge_global_state_json(text):
+    # [FUNCTION DOC] Reduce the global-state guard line of a guard log to a stable form. Finds
+    # the line starting at the global-state marker; returns an empty string if absent. Otherwise
+    # repeatedly replaces innermost bracketed lists with a quoted placeholder, then replaces
+    # numeric, boolean and quoted-string values that follow a colon with the same placeholder,
+    # and returns that line.
     import re
 
     match = re.search(r"\+- GLOBAL_STATE:.*", text)
@@ -90,6 +112,9 @@ LOG_PREFIX_PATTERNS = [
 
 
 def normalize_log_line(line: str) -> str:
+    # [FUNCTION DOC] Strip trailing whitespace from a formatted log line, then remove the first
+    # matching known log prefix (rank tag, level/name tag, glog-style timestamp prefix, or short
+    # level prefix) and leading whitespace. At most one pattern is applied. Returns the line.
     line = line.rstrip()
     for pattern in LOG_PREFIX_PATTERNS:
         stripped, count = pattern.subn("", line, count=1)
@@ -100,10 +125,15 @@ def normalize_log_line(line: str) -> str:
 
 
 def normalize_rank_prefix(output: str) -> str:
+    # [FUNCTION DOC] Return the output unchanged if it already contains a rank tag. Otherwise
+    # rewrite each line-leading prefix made of upper-case level, a name and a colon into a rank-
+    # zero tag, dropping the original prefix, and return the result.
     if "[rank" in output:
         return output
 
     def repl(match):
+        # [FUNCTION DOC] HELPER: Regex replacement callback: returns the preserved line start
+        # group followed by the rank-zero tag.
         prefix = match.group(1)
         return f"{prefix}[rank0]: "
 
@@ -111,23 +141,31 @@ def normalize_rank_prefix(output: str) -> str:
 
 
 def example_fn(a):
+    # [FUNCTION DOC] HELPER: Compile target: multiplies the input by a 1000 by 1000 tensor of
+    # ones, adds another such tensor, and returns the result.
     output = a.mul(torch.ones(1000, 1000))
     output = output.add(torch.ones(1000, 1000))
     return output
 
 
 def dynamo_error_fn(a):
+    # [FUNCTION DOC] HELPER: Compile target that fails at trace time: multiplies by a 1000 by
+    # 1000 ones tensor, then adds a 10 by 10 ones tensor, which cannot broadcast against the
+    # first.
     output = a.mul(torch.ones(1000, 1000))
     output = output.add(torch.ones(10, 10))
     return output
 
 
 def inductor_error_fn(a):
+    # [FUNCTION DOC] HELPER: Compile target that rounds its input elementwise and returns it.
     output = torch.round(a)
     return output
 
 
 def inductor_schedule_fn(a):
+    # [FUNCTION DOC] HELPER: Compile target: adds a 1000 by 1000 ones tensor created on the
+    # current accelerator device type (or cpu) to the input and returns the result.
     output = a.add(torch.ones(1000, 1000, device=device_type))
     return output
 
@@ -136,8 +174,15 @@ ARGS = (torch.ones(1000, 1000, requires_grad=True),)
 
 
 def multi_record_test(num_records, **kwargs):
+    # [FUNCTION DOC] HELPER: Factory returning a logging test method. The keyword arguments are
+    # the log settings; the generated test compiles the example function with the inductor
+    # backend, runs it on the module-level arguments and asserts that exactly num_records log
+    # records were gathered.
     @make_logging_test(**kwargs)
     def fn(self, records):
+        # [FUNCTION DOC] HELPER: Generated test body: receives the test case and gathered records
+        # list, compiles and runs the example function, and asserts the record count equals the
+        # expected value.
         fn_opt = torch.compile(example_fn, backend="inductor")
         fn_opt(*ARGS)
         self.assertEqual(len(records), num_records)
@@ -146,8 +191,13 @@ def multi_record_test(num_records, **kwargs):
 
 
 def within_range_record_test(num_records_lower, num_records_higher, **kwargs):
+    # [FUNCTION DOC] HELPER: Factory like the exact-count one, but the generated test asserts
+    # that the number of gathered records lies in the inclusive range between the given lower and
+    # upper bounds.
     @make_logging_test(**kwargs)
     def fn(self, records):
+        # [FUNCTION DOC] HELPER: Generated test body: compiles and runs the example function with
+        # the inductor backend and asserts the record count is within the inclusive bounds.
         fn_opt = torch.compile(example_fn, backend="inductor")
         fn_opt(*ARGS)
         self.assertGreaterEqual(len(records), num_records_lower)
@@ -157,10 +207,16 @@ def within_range_record_test(num_records_lower, num_records_higher, **kwargs):
 
 
 def single_record_test(**kwargs):
+    # [FUNCTION DOC] HELPER: Shortcut for the exact-count factory with one expected record.
     return multi_record_test(1, **kwargs)
 
 
 class LoggingTests(LoggingTestCase):
+    # [CLASS DOC] Main logging test case, built on LoggingTestCase (record gathering helpers).
+    # Many tests are produced by make_logging_test, which runs the body once with settings from
+    # the environment variable and once through the set_logs API. Some tests are class attributes
+    # built by the record-count factories, and extra single-record tests are attached at import
+    # time for every remaining logging artifact.
     test_bytecode = multi_record_test(2, bytecode=True)
     test_output_code = multi_record_test(3, output_code=True)
     test_aot_graphs = multi_record_test(3, aot_graphs=True)
@@ -168,6 +224,8 @@ class LoggingTests(LoggingTestCase):
     @requires_gpu
     @make_logging_test(schedule=True)
     def test_schedule(self, records):
+        # [FUNCTION DOC] Requires GPU. With schedule logging, compiles the schedule target with
+        # inductor, runs it, and asserts more than zero and fewer than five records.
         fn_opt = torch.compile(inductor_schedule_fn, backend="inductor")
         fn_opt(torch.ones(1000, 1000, device=device_type))
         self.assertGreater(len(records), 0)
@@ -176,6 +234,9 @@ class LoggingTests(LoggingTestCase):
     @requires_gpu
     @make_logging_test(fusion=True)
     def test_fusion(self, records):
+        # [FUNCTION DOC] Requires GPU. With fusion logging, compiles and runs the schedule target
+        # and asserts the record count is positive and below eight times one plus the loop-
+        # ordering-after-fusion config value.
         fn_opt = torch.compile(inductor_schedule_fn, backend="inductor")
         fn_opt(torch.ones(1000, 1000, device=device_type))
         self.assertGreater(len(records), 0)
@@ -188,6 +249,9 @@ class LoggingTests(LoggingTestCase):
     @requires_cuda_and_triton
     @make_logging_test(cudagraphs=True)
     def test_cudagraphs(self, records):
+        # [FUNCTION DOC] Requires CUDA and Triton. With cudagraphs logging, compiles the schedule
+        # target in reduce-overhead mode, runs it and asserts the record count is positive and
+        # below eight.
         fn_opt = torch.compile(mode="reduce-overhead")(inductor_schedule_fn)  # noqa: UNSPECIFIED_BACKEND
         fn_opt(torch.ones(1000, 1000, device=device_type))
         self.assertGreater(len(records), 0)
@@ -195,16 +259,31 @@ class LoggingTests(LoggingTestCase):
 
     @make_logging_test(recompiles=True)
     def test_recompiles(self, records):
+        # [FUNCTION DOC] With recompile logging, compiles a chain of four nested functions (the
+        # innermost loops over zipped lists accumulating products into the input) with the eager
+        # backend, calls it with lists of different length to force a recompile, then replaces
+        # quoted file paths in the joined messages and asserts the expected user stack trace
+        # excerpt appears.
+        # KNOWN ISSUE: the expected excerpt hard-codes source line numbers of this file, so any
+        # insertion of lines above (including comments) shifts them and the assertion would fail
+        # unless the numbers are updated.
         def outmost_fn(x, ys, zs):
+            # [FUNCTION DOC] HELPER: Calls the next function in the chain with the same
+            # arguments.
             return outer_fn(x, ys, zs)
 
         def outer_fn(x, ys, zs):
+            # [FUNCTION DOC] HELPER: Calls the next function in the chain with the same
+            # arguments.
             return fn(x, ys, zs)
 
         def fn(x, ys, zs):
+            # [FUNCTION DOC] HELPER: Calls the innermost function with the same arguments.
             return inner(x, ys, zs)
 
         def inner(x, ys, zs):
+            # [FUNCTION DOC] HELPER: Adds the elementwise product of each pair from the two lists
+            # to the input tensor in place and returns it.
             for y, z in zip(ys, zs):
                 x += y * z
             return x
@@ -238,14 +317,22 @@ class LoggingTests(LoggingTestCase):
 
     @make_logging_test(recompiles=True)
     def test_recompiles_closure_variable_hint(self, records):
+        # [FUNCTION DOC] With recompile logging, compiles a function calling a closure; calls it
+        # with two closures differing in the second captured value, and asserts the recompile log
+        # contains a hint naming the guarded closure variable n2.
         def make_cl(n1, n2):
+            # [FUNCTION DOC] HELPER: Builds and returns a closure that adds both captured numbers
+            # to its input.
             def inner(x):
+                # [FUNCTION DOC] HELPER: Returns the input plus the two captured numbers.
                 return x + n1 + n2
 
             return inner
 
         @torch.compile(backend="eager")
         def fn(cl, x):
+            # [FUNCTION DOC] HELPER: Compiled function (eager backend) that calls the given
+            # closure on x.
             return cl(x)
 
         fn(make_cl(0, 1), torch.ones(3))
@@ -258,25 +345,40 @@ class LoggingTests(LoggingTestCase):
 
     @make_logging_test(recompiles=True)
     def test_recompiles_nested_closure_variable_hint(self, records):
+        # [FUNCTION DOC] With recompile logging, builds a mask holder whose function captures
+        # another function that captures a value, compiles a function calling it and calls it
+        # with two holders whose innermost captured values differ. Asserts the recompile log has
+        # a hint guarding on inner_val and includes the nested closure cell path text.
         # block_mask.mask_mod.__closure__[0].cell_contents.__closure__[0].cell_contents
         def make_inner_fn(inner_val):
+            # [FUNCTION DOC] HELPER: Builds a closure that adds the captured value to its input.
             def inner(x):
+                # [FUNCTION DOC] HELPER: Returns the input plus the captured value.
                 return x + inner_val
 
             return inner
 
         def make_outer_fn(outer_val, inner_fn):
+            # [FUNCTION DOC] HELPER: Builds a closure that applies the given inner function and
+            # scales the result by the captured outer value.
             def outer(x):
+                # [FUNCTION DOC] HELPER: Returns the inner function applied to the input,
+                # multiplied by the captured outer value.
                 return inner_fn(x) * outer_val
 
             return outer
 
         class BlockMask:
+            # [CLASS DOC] HELPER: Simple holder storing a mask function in the attribute
+            # mask_mod.
             def __init__(self, mask_mod):
+                # [FUNCTION DOC] HELPER: Stores the given function as mask_mod.
                 self.mask_mod = mask_mod
 
         @torch.compile(backend="eager")
         def fn(block_mask, x):
+            # [FUNCTION DOC] HELPER: Compiled function (eager backend) that applies the holder's
+            # mask function to x.
             return block_mask.mask_mod(x)
 
         # inner_fn captures inner_val, outer captures (outer_val, inner_fn)
@@ -295,24 +397,36 @@ class LoggingTests(LoggingTestCase):
 
     @make_logging_test(recompiles=True)
     def test_recompiles_closure_variable_attribute_hint(self, records):
+        # [FUNCTION DOC] With recompile logging, compiles a function calling a closure whose
+        # captured object is a callable with a scale attribute; calls it with two scales to force
+        # a recompile, and asserts the log hint names the closure variable transform followed by
+        # the scale attribute.
         # Test when guard is on an attribute of the closure cell contents
         # e.g., block_mask.mask_mod.__closure__[0].cell_contents.__code__
         # The hint should still show which closure variable is involved
         class Transform:
+            # [CLASS DOC] HELPER: Callable object multiplying its input by the stored scale.
             def __init__(self, scale):
+                # [FUNCTION DOC] HELPER: Stores scale on the instance.
                 self.scale = scale
 
             def __call__(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input multiplied by the scale.
                 return x * self.scale
 
         def make_fn(transform):
+            # [FUNCTION DOC] HELPER: Builds a closure that applies the captured transform to its
+            # input.
             def fn(x):
+                # [FUNCTION DOC] HELPER: Returns the captured transform applied to the input.
                 return transform(x)
 
             return fn
 
         @torch.compile(backend="eager")
         def outer(inner_fn, x):
+            # [FUNCTION DOC] HELPER: Compiled function (eager backend) that calls the given
+            # function on x.
             return inner_fn(x)
 
         outer(make_fn(Transform(2)), torch.ones(3))
@@ -328,6 +442,9 @@ class LoggingTests(LoggingTestCase):
     @skipIfTorchDynamo("too slow")
     @make_logging_test(dynamo=logging.DEBUG)
     def test_dynamo_debug_default_off_artifacts(self, records):
+        # [FUNCTION DOC] Skipped under Dynamo. With dynamo logging at debug level, compiles and
+        # runs the example function with inductor and asserts no records come from the bytecode
+        # or output-code artifact loggers, i.e. those artifacts are off by default.
         fn_opt = torch.compile(example_fn, backend="inductor")
         fn_opt(torch.ones(1000, 1000))
         self.assertEqual(len([r for r in records if ".__bytecode" in r.name]), 0)
@@ -335,13 +452,18 @@ class LoggingTests(LoggingTestCase):
 
     @make_logging_test(hierarchical_compile=True)
     def test_hierarchical_compile(self, records):
+        # [FUNCTION DOC] With hierarchical compile logging, compiles a function calling a
+        # function marked as a compile region, runs it twice with inductor and asserts at least
+        # one record was logged.
         from torch._higher_order_ops.invoke_subgraph import mark_compile_region
 
         @mark_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Compile region function: doubles its input.
             return x * 2
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Calls the compile region function on x.
             return gn(x)
 
         fn_opt = torch.compile(fn, backend="inductor")
@@ -351,6 +473,10 @@ class LoggingTests(LoggingTestCase):
 
     @make_logging_test()
     def test_dynamo_error(self, records):
+        # [FUNCTION DOC] With default logging settings, compiles the failing dynamo target with
+        # inductor, ignores the resulting exception, finds the single record containing the
+        # won't-convert text and compares its normalized message to a golden string describing
+        # the fake-tensor broadcast failure.
         try:
             fn_opt = torch.compile(dynamo_error_fn, backend="inductor")
             fn_opt(*ARGS)
@@ -382,10 +508,17 @@ from user code:
 
     @make_logging_test()
     def test_inductor_error(self, records):
+        # [FUNCTION DOC] Patches the inductor lowerings so every lowering whose name contains
+        # round raises AssertionError, compiles and runs the rounding target (exceptions
+        # swallowed), then compares the normalized won't-convert record to a golden string
+        # describing the lowering exception, and finally closes the patch stack.
+        # KNOWN ISSUE: the patch stack is closed only at the end of the test, not in a finally
+        # block, so a failing assertion leaves the lowerings patched.
         exitstack = contextlib.ExitStack()
         import torch._inductor.lowering
 
         def throw(x):
+            # [FUNCTION DOC] HELPER: Replacement lowering that always raises AssertionError.
             raise AssertionError
 
         # inject an error in the lowerings
@@ -432,8 +565,16 @@ Found from :
     @requires_cuda_and_triton
     @make_logging_test(ddp_graphs=True)
     def test_ddp_graphs(self, records):
+        # [FUNCTION DOC] Requires distributed and CUDA with Triton. With ddp graphs logging, sets
+        # the master address and port environment variables (not restored) and starts a one-
+        # process gloo group, wraps a toy model in DistributedDataParallel on the first CUDA
+        # device with a small bucket size, compiles it with inductor and runs one forward pass,
+        # destroys the group, then asserts exactly four records came from the ddp graphs logger.
         class ToyModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Toy model: a sequential stack of two 1024 by 1024 linear layers
+            # kept in the layers attribute.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Builds the two-layer linear stack.
                 super().__init__()
                 self.layers = torch.nn.Sequential(
                     torch.nn.Linear(1024, 1024),
@@ -441,6 +582,7 @@ Found from :
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the layer stack to the input.
                 return self.layers(x)
 
         os.environ["MASTER_ADDR"] = "localhost"
@@ -459,6 +601,9 @@ Found from :
     # does not register it and result in duplicated records
     @make_settings_test("torch._dynamo.output_graph")
     def test_open_registration_with_registered_parent(self, records):
+        # [FUNCTION DOC] With only the settings string naming the output-graph logger, logs one
+        # info message on that same logger and asserts exactly one record is gathered, i.e.
+        # logging to an already registered logger is not duplicated.
         logger = logging.getLogger("torch._dynamo.output_graph")
         logger.info("hi")
         self.assertEqual(len(records), 1)
@@ -467,6 +612,9 @@ Found from :
     # logger registers it and sets handlers properly
     @make_settings_test("torch.utils")
     def test_open_registration(self, records):
+        # [FUNCTION DOC] With the settings string naming the torch.utils logger (not registered
+        # as an artifact), logs one info message to it and asserts exactly one record, showing
+        # unregistered loggers are opened and given handlers.
         logger = logging.getLogger("torch.utils")
         logger.info("hi")
         self.assertEqual(len(records), 1)
@@ -475,12 +623,18 @@ Found from :
     # logger registers it and sets handlers properly
     @make_logging_test(modules={"torch.utils": logging.INFO})
     def test_open_registration_python_api(self, records):
+        # [FUNCTION DOC] Same as the previous open-registration test but configured through the
+        # module-level mapping of the set_logs API with the info level, asserting one gathered
+        # record.
         logger = logging.getLogger("torch.utils")
         logger.info("hi")
         self.assertEqual(len(records), 1)
 
     @make_settings_test("torch._logging")
     def test_directory_based_logging(self, records):
+        # [FUNCTION DOC] With the settings string naming the torch._logging package logger, logs
+        # one message on the package and one on a submodule, asserts at least two records, and
+        # that both loggers have handlers or propagate to a parent.
         # Test that the package itself can log
         logger = logging.getLogger("torch._logging")
         logger.info("package log")
@@ -498,6 +652,9 @@ Found from :
 
     @make_logging_test(all=logging.DEBUG, dynamo=logging.INFO)
     def test_all(self, _):
+        # [FUNCTION DOC] With all logging at debug and dynamo at info, checks every registered
+        # logger name: names that start with any dynamo logger name must have effective level
+        # info, all others debug. The gathered records argument is unused.
         registry = torch._logging._internal.log_registry
 
         dynamo_qnames = registry.log_alias_to_log_qnames["dynamo"]
@@ -520,8 +677,12 @@ Found from :
 
     @make_logging_test(graph_breaks=True)
     def test_graph_breaks(self, records):
+        # [FUNCTION DOC] With graph break logging, compiles a function that forces a graph break
+        # with inductor, runs it and asserts exactly one record.
         @torch.compile(backend="inductor")
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compiled function that calls the graph break marker and then
+            # adds one.
             torch._dynamo.graph_break()
             return x + 1
 
@@ -531,10 +692,15 @@ Found from :
 
     @make_logging_test(side_effects=True)
     def test_side_effects(self, records):
+        # [FUNCTION DOC] With side-effect logging, compiles a function that appends to an input
+        # list and asserts one record whose normalized message matches a golden text naming the
+        # mutated list and the call stack of the append.
         my_list = [1, 2, 3]
 
         @torch.compile(backend="eager")
         def fn(x, lst):
+            # [FUNCTION DOC] HELPER: Compiled function appending four to the list and returning x
+            # plus the list length.
             lst.append(4)
             return x + len(lst)
 
@@ -555,14 +721,20 @@ Mutating object of type list (source name: L['lst'])
 
     @make_logging_test(side_effects=True)
     def test_side_effects_nested_calls(self, records):
+        # [FUNCTION DOC] With side-effect logging, mutates an input list once in a nested inner
+        # call and once in the outer compiled function; asserts one record whose golden text
+        # shows both mutation stacks separated by a divider.
         outer_list = [1]
 
         def inner(lst):
+            # [FUNCTION DOC] HELPER: Appends two to the list and returns its length.
             lst.append(2)
             return len(lst)
 
         @torch.compile(backend="eager")
         def outer(x, my_list):
+            # [FUNCTION DOC] HELPER: Compiled function that calls the inner helper, appends three
+            # to the list and returns a sum.
             result = inner(my_list)
             my_list.append(3)
             return x + result + len(my_list)
@@ -593,10 +765,15 @@ Mutating object of type list (source name: L['my_list'])
 
     @make_logging_test(side_effects=True)
     def test_side_effects_multiple_mutations_same_object(self, records):
+        # [FUNCTION DOC] With side-effect logging, applies four mutations (two appends, an
+        # extend, a pop) to one list and asserts a single record whose golden text lists four
+        # stacks separated by dividers.
         my_list = [1, 2, 3]
 
         @torch.compile(backend="eager")
         def fn(x, lst):
+            # [FUNCTION DOC] HELPER: Compiled function performing the four list mutations and
+            # returning x plus the list length.
             lst.append(4)
             lst.append(5)
             lst.extend([6, 7])
@@ -641,10 +818,15 @@ Mutating object of type list (source name: L['lst'])
 
     @make_logging_test(side_effects=True)
     def test_side_effects_dict_mutations(self, records):
+        # [FUNCTION DOC] With side-effect logging, assigns two new keys in an input dict inside a
+        # compiled function and asserts one record with a golden text listing both assignment
+        # stacks.
         my_dict = {"a": 1}
 
         @torch.compile(backend="eager")
         def fn(x, d):
+            # [FUNCTION DOC] HELPER: Compiled function setting two keys in the dict and returning
+            # x plus its length.
             d["b"] = 2
             d["c"] = 3
             return x + len(d)
@@ -673,8 +855,13 @@ Mutating object of type dict (source name: L['d'])
 
     @make_logging_test(side_effects=True)
     def test_side_effects_attribute_mutations(self, records):
+        # [FUNCTION DOC] With side-effect logging, sets attributes on an input object three times
+        # (one attribute twice) inside a compiled function and asserts one record with a golden
+        # text containing three mutation stacks.
         class MyClass:
+            # [CLASS DOC] HELPER: Plain object with integer attributes value and count.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Sets value to ten and count to zero.
                 self.value = 10
                 self.count = 0
 
@@ -682,6 +869,8 @@ Mutating object of type dict (source name: L['d'])
 
         @torch.compile(backend="eager")
         def fn(x, o):
+            # [FUNCTION DOC] HELPER: Compiled function assigning the object's attributes and
+            # returning a sum.
             o.value = 20
             o.count = 1
             o.count = 2
@@ -718,10 +907,14 @@ Mutating object of type MyClass (source name: L['o'])
 
     @make_logging_test(side_effects=True)
     def test_side_effects_local_list_no_log(self, records):
+        # [FUNCTION DOC] With side-effect logging, a list created and mutated inside the compiled
+        # region must not be logged: asserts zero records.
         """Test that lists created inside compiled region don't log side effects."""
 
         @torch.compile(backend="eager")
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compiled function building a local list, appending to it and
+            # returning x plus its length.
             my_list = [1, 2, 3]  # Created inside compiled region
             my_list.append(4)
             return x + len(my_list)
@@ -733,14 +926,22 @@ Mutating object of type MyClass (source name: L['o'])
 
     @make_logging_test(side_effects=True)
     def test_side_effects_local_object_with_log(self, records):
+        # [FUNCTION DOC] With side-effect logging, an object created inside the compiled region
+        # and returned is mutated; asserts one record whose golden text says the object was
+        # created in the compile region and shows the constructor assignment stack and the later
+        # assignment stack.
         """Test that returned objects created inside compiled region still log attribute mutations."""
 
         class MyClass:
+            # [CLASS DOC] HELPER: Plain object whose initializer sets value to ten.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Sets value to ten.
                 self.value = 10
 
         @torch.compile(backend="eager")
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compiled function creating the object, changing its value,
+            # and returning a sum and the object.
             obj = MyClass()  # Created inside compiled region
             obj.value = 20
             return x + obj.value, obj
@@ -771,17 +972,27 @@ Mutating object of type MyClass (source: created in torch.compile region)
 
     @make_logging_test(side_effects=True)
     def test_side_effects_nn_module_buffer(self, records):
+        # [FUNCTION DOC] With side-effect logging, compiles a module whose forward adds to a
+        # registered buffer in place and asserts one record with a golden text naming the
+        # module's buffer dictionary as the mutated object.
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a random 2 by 2 buffer whose forward increments the
+            # buffer in place and returns the input plus it.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Initializes the base module and registers the random
+                # buffer named buf.
                 super().__init__()
                 self.register_buffer("buf", torch.rand(2, 2))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Adds one to the buffer in place and returns the input
+                # plus the buffer.
                 self.buf += 1
                 return x + self.buf
 
         @torch.compile(backend="eager")
         def fn(mod, x):
+            # [FUNCTION DOC] HELPER: Compiled function calling the module on x.
             return mod(x)
 
         fn(Mod(), torch.ones(1))
@@ -804,10 +1015,14 @@ Mutating object of type dict (source name: L['mod']._buffers)
     @make_logging_test(side_effects=True)
     @torch._dynamo.config.patch(side_effect_replay_policy="silent")
     def test_side_effects_silent_config(self, records):
+        # [FUNCTION DOC] With side-effect logging and the replay policy config patched to silent,
+        # compiles a function appending to an input list and asserts nothing is logged.
         my_list = [1, 2, 3]
 
         @torch.compile(backend="eager")
         def fn(x, lst):
+            # [FUNCTION DOC] HELPER: Compiled function appending to the list and returning x plus
+            # its length.
             lst.append(4)
             return x + len(lst)
 
@@ -817,11 +1032,16 @@ Mutating object of type dict (source name: L['mod']._buffers)
 
     @make_logging_test(side_effects=True)
     def test_side_effects_logs_fullgraph_graph_break(self, records):
+        # [FUNCTION DOC] With side-effect logging, a full-graph compile whose function mutates a
+        # list and then forces a graph break must raise the Unsupported error; asserts the side
+        # effect was still logged (at least one record, first mentioning mutation of a list).
         """Test that side effects are logged even when fullgraph=True causes an error."""
         my_list = [1, 2, 3]
 
         @torch.compile(backend="eager", fullgraph=True)
         def fn(x, lst):
+            # [FUNCTION DOC] HELPER: Compiled full-graph function appending to the list, hitting
+            # a graph break marker and returning a sum.
             lst.append(4)
             # Force a graph break after the side effect
             torch._dynamo.graph_break()
@@ -836,15 +1056,23 @@ Mutating object of type dict (source name: L['mod']._buffers)
 
     @make_logging_test(side_effects=True)
     def test_side_effects_logged_on_fullgraph_side_effect_error(self, records):
+        # [FUNCTION DOC] With side-effect logging, a full-graph compile appends to a list then
+        # calls a checkpointed function that mutates another list, which makes tracing raise
+        # Unsupported with an unsafe-side-effect higher-order-op message; asserts that message
+        # and that the earlier list mutation was logged.
         tracked_list = []
         hop_list = []
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Appends one to the captured list and returns the sine of the
+            # input.
             hop_list.append(1)
             return x.sin()
 
         @torch.compile(backend="eager", fullgraph=True)
         def model(x, lst):
+            # [FUNCTION DOC] HELPER: Compiled full-graph function that appends to the list and
+            # calls a non-reentrant checkpoint of the helper.
             lst.append(1)
             return torch.utils.checkpoint.checkpoint(fn, x, use_reentrant=False)
 
@@ -859,6 +1087,9 @@ Mutating object of type dict (source name: L['mod']._buffers)
 
     @make_settings_test("torch._dynamo.utils")
     def test_dump_compile_times(self, records):
+        # [FUNCTION DOC] With logging for the dynamo utils logger, compiles and runs the example
+        # function and calls the compile-times dump directly (not the exit hook); asserts exactly
+        # one record mentioning TorchDynamo compilation metrics.
         fn_opt = torch.compile(example_fn, backend="inductor")
         fn_opt(torch.ones(1000, 1000))
         # This function runs during exit via atexit.register.
@@ -874,6 +1105,12 @@ Mutating object of type dict (source name: L['mod']._buffers)
 
     @make_logging_test(dynamo=logging.INFO)
     def test_custom_format_exc(self, records):
+        # [FUNCTION DOC] With dynamo logging at info, logs an exception, an info record with
+        # exception info, and an info record with stack info; asserts three records, then formats
+        # them with the logger's torch handler and checks the first two contain a traceback and
+        # the third a stack section.
+        # KNOWN ISSUE: the handler loop variable remains set after the loop even if no torch
+        # handler was found, so the not-None assertion cannot detect that.
         dynamo_log = logging.getLogger(torch._dynamo.__name__)
         try:
             raise RuntimeError("foo")
@@ -894,6 +1131,10 @@ Mutating object of type dict (source name: L['mod']._buffers)
 
     @make_logging_test(dynamo=logging.INFO)
     def test_custom_format(self, records):
+        # [FUNCTION DOC] With dynamo logging at info, logs one message on the dynamo logger and
+        # one on a custom artifact logger, asserts two records, formats them with the torch
+        # handler and checks that the line normalizer reduces both (and a sample CI-style
+        # prefixed line) to the plain message.
         dynamo_log = logging.getLogger(torch._dynamo.__name__)
         test_log = torch._logging.getArtifactLogger(
             torch._dynamo.__name__, "custom_format_test_artifact"
@@ -921,6 +1162,10 @@ Mutating object of type dict (source name: L['mod']._buffers)
 
     @make_logging_test(dynamo=logging.INFO)
     def test_multiline_format(self, records):
+        # [FUNCTION DOC] With dynamo logging at info, logs three messages containing newlines
+        # (plain, formatted argument, and mixed), asserts three records, formats each and checks
+        # that after normalizing each line and dropping empty lines the lines equal the expected
+        # word lists.
         dynamo_log = logging.getLogger(torch._dynamo.__name__)
         dynamo_log.info("test\ndynamo")
         dynamo_log.info("%s", "test\ndynamo")
@@ -951,7 +1196,12 @@ Mutating object of type dict (source name: L['mod']._buffers)
 
     @make_logging_test(trace_source=True)
     def test_trace_source_if_stmt(self, records):
+        # [FUNCTION DOC] With trace-source logging, compiles a function with a data-dependent
+        # branch; checks that a source line of the taken branch appears in the records and that
+        # of the other branch does not.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns the input doubled if its sum is positive, otherwise
+            # tripled.
             if x.sum() > 0:
                 return x * 2
             return x * 3
@@ -973,15 +1223,21 @@ Mutating object of type dict (source name: L['mod']._buffers)
 
     @make_logging_test(trace_source=True)
     def test_trace_source_nested(self, records):
+        # [FUNCTION DOC] With trace-source logging, compiles a function chain of three calls;
+        # checks the source lines appear and that inline depth is absent for the outer function
+        # and one and two for the callees.
         def fn1(x):
+            # [FUNCTION DOC] HELPER: Calls the second function and doubles the result.
             x = fn2(x)
             return x * 2
 
         def fn2(x):
+            # [FUNCTION DOC] HELPER: Calls the third function and triples the result.
             x = fn3(x)
             return x * 3
 
         def fn3(x):
+            # [FUNCTION DOC] HELPER: Returns the input times four.
             return x * 4
 
         fn_opt = torch.compile(fn1, backend="eager")
@@ -1007,18 +1263,26 @@ Mutating object of type dict (source name: L['mod']._buffers)
 
     @make_logging_test(trace_source=True)
     def test_trace_source_cond(self, records):
+        # [FUNCTION DOC] With trace-source logging, compiles a function calling a conditional
+        # operator inside nested calls; checks that source lines of both branches appear and that
+        # each is logged at inline depth three.
         from functorch.experimental.control_flow import cond
 
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: True branch: input doubled.
             return x * 2
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: False branch: input tripled.
             return x * 3
 
         def inner(pred, x):
+            # [FUNCTION DOC] HELPER: Applies the conditional operator to the predicate and input
+            # with the two branches.
             return cond(pred, true_fn, false_fn, [x])
 
         def outer(pred, x):
+            # [FUNCTION DOC] HELPER: Calls the inner function.
             return inner(pred, x)
 
         fn_opt = torch.compile(outer, backend="eager")
@@ -1040,9 +1304,16 @@ Mutating object of type dict (source name: L['mod']._buffers)
 
     @make_logging_test(trace_source=True)
     def test_trace_source_funcname(self, records):
+        # [FUNCTION DOC] With trace-source logging, compiles a function containing a nested
+        # function that builds a tuple from a generator expression; checks that some record
+        # mentions the generator name together with the qualified name of the nested function.
         # NOTE: list comprehensions are inlined in 3.12, so test with tuples
         def fn1():
+            # [FUNCTION DOC] HELPER: Outer function: returns the result of calling the nested
+            # function.
             def fn2():
+                # [FUNCTION DOC] HELPER: Returns a tuple of five ones tensors built from a
+                # generator expression.
                 if True:
                     return tuple(torch.ones(3, 3) for _ in range(5))
                 return None
@@ -1061,6 +1332,9 @@ Mutating object of type dict (source name: L['mod']._buffers)
         self.assertTrue(found_funcname)
 
     def test_flex_gemm_log_levels(self):
+        # [FUNCTION DOC] Parses the settings text for the flex gemm artifact with and without a
+        # plus prefix; asserts its logger gets level info for the plain form and debug for the
+        # plus form and that neither adds artifact names.
         from torch._logging._internal import _parse_log_settings
 
         log_name = "torch._inductor.kernel.flex_gemm.debug"
@@ -1073,10 +1347,16 @@ Mutating object of type dict (source name: L['mod']._buffers)
         self.assertEqual(verbose.artifact_names, set())
 
     def test_invalid_artifact_flag(self):
+        # [FUNCTION DOC] Asserts that calling the set_logs API with an invalid integer value for
+        # an artifact flag raises ValueError.
         with self.assertRaises(ValueError):
             torch._logging.set_logs(aot_graphs=5)
 
     def test_invalid_artifact_flag_error_msg(self):
+        # [FUNCTION DOC] Starts a Python subprocess importing torch with an unknown name in the
+        # TORCH_LOGS environment variable; asserts stderr is short (under fifty lines), the fifth
+        # line from the end is the help hint, and the fourth from the end is the valid-settings
+        # header.
         env = dict(os.environ)
         env["TORCH_LOGS"] = "not_an_existing_log_artifact_should_error"
         _, stderr = self.run_process_no_exception(
@@ -1101,6 +1381,9 @@ Mutating object of type dict (source name: L['mod']._buffers)
     @requires_distributed()
     @skipIfWindows(msg="TODO: (xuhancn), Can't reproduce locally")
     def test_distributed_rank_logging(self):
+        # [FUNCTION DOC] Requires distributed; skipped on Windows. Runs a subprocess with dynamo
+        # logging, a fake process group (rank zero of two) and one dynamo info message; asserts
+        # the normalized stderr contains the rank tag and the message.
         env = dict(os.environ)
         env["TORCH_LOGS"] = "dynamo"
         _, stderr = self.run_process_no_exception(
@@ -1124,7 +1407,13 @@ print("arf")
     @skipIfNotPy311
     @make_logging_test(trace_call=True)
     def test_trace_call(self, records):
+        # [FUNCTION DOC] Skipped before Python 3.11. With trace-call logging, compiles a function
+        # with two multiplications and a matrix multiplication, asserts three records, and
+        # compares the last two lines of each message (source line and caret markers) to golden
+        # strings.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Returns the matrix product of the input x doubled and y
+            # tripled.
             return (x * 2) @ (y * 3)
 
         fn_opt = torch.compile(fn, backend="eager")
@@ -1157,7 +1446,12 @@ print("arf")
     @skipIfNotPy311
     @make_logging_test(trace_call=True)
     def test_trace_call_prefix(self, records):
+        # [FUNCTION DOC] Skipped before Python 3.11. With trace-call logging, normalizes the
+        # first record keeping carets and compares to a golden text with the trace prefix naming
+        # the multiplication, file, function and qualified test name.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Returns the matrix product of the input x doubled and y
+            # tripled.
             return (x * 2) @ (y * 3)
 
         fn_opt = torch.compile(fn, backend="eager")
@@ -1175,10 +1469,15 @@ TRACE FX call mul from test_logging.py:N in fn (LoggingTests.test_trace_call_pre
     @skipIfNotPy311
     @make_logging_test(trace_call=True)
     def test_trace_call_inline_call(self, records):
+        # [FUNCTION DOC] Skipped before Python 3.11. With trace-call logging, compiles a function
+        # calling a helper twice; asserts three records and checks the first two last-two-line
+        # excerpts; the third is not checked because newer Python versions drop the carets.
         def g(x):
+            # [FUNCTION DOC] HELPER: Returns the input doubled.
             return x * 2
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Applies the doubling helper twice.
             return g(g(x))
 
         fn_opt = torch.compile(f, backend="eager")
@@ -1212,7 +1511,11 @@ TRACE FX call mul from test_logging.py:N in fn (LoggingTests.test_trace_call_pre
     @skipIfNotPy311
     @make_logging_test(trace_call=True)
     def test_trace_call_graph_break(self, records):
+        # [FUNCTION DOC] Skipped before Python 3.11. With trace-call logging, compiles a function
+        # with a graph break between two multiplications; asserts three records and checks the
+        # first and last excerpts.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Doubles x, forces a graph break, then triples the result.
             x = x * 2
             torch._dynamo.graph_break()
             return x * 3
@@ -1239,10 +1542,17 @@ TRACE FX call mul from test_logging.py:N in fn (LoggingTests.test_trace_call_pre
 
     @make_logging_test(guards=True, recompiles=True)
     def test_guards_recompiles(self, records):
+        # [FUNCTION DOC] With guards and recompile logging, compiles a function over lists with
+        # the eager backend, calls it with lists of different length, and asserts the joined
+        # messages contain a guard on the first element of the second list and a length guard on
+        # the first list.
         def fn(x, ys, zs):
+            # [FUNCTION DOC] HELPER: Calls the inner helper.
             return inner(x, ys, zs)
 
         def inner(x, ys, zs):
+            # [FUNCTION DOC] HELPER: Adds the elementwise product of paired list items to the
+            # input in place.
             for y, z in zip(ys, zs):
                 x += y * z
             return x
@@ -1268,8 +1578,13 @@ TRACE FX call mul from test_logging.py:N in fn (LoggingTests.test_trace_call_pre
 
     @make_logging_test(guards=True)
     def test_guards_sloc(self, records):
+        # [FUNCTION DOC] With guards logging, compiles a dynamic-shape function with a size-
+        # dependent branch and a concatenation, runs it, finds the guard manager record, and
+        # compares the normalized shape guard lines to a golden string.
         @torch.compile(dynamic=True, backend="eager")
         def f(x, y, z):
+            # [FUNCTION DOC] HELPER: Compiled function: triples x and, if its length is divisible
+            # by three, adds the concatenation of y and z, else doubles.
             x = x * 3
             if x.size(0) % 3 == 0:
                 return x + torch.cat([y, z])
@@ -1290,8 +1605,12 @@ TRACE FX call mul from test_logging.py:N in fn (LoggingTests.test_trace_call_pre
 
     @make_logging_test(guards=True)
     def test_guards_polyfill_sloc(self, records):
+        # [FUNCTION DOC] With guards logging, compiles a dynamic-shape function using an any call
+        # over a size comparison and compares the normalized shape guards to a golden string.
         @torch.compile(dynamic=True, backend="eager")
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Compiled function returning whether the size of x equals
+            # twice the size of y, via any.
             return any([x.size(0) == y.size(0) * 2])
 
         f(torch.randn(6), torch.randn(3))
@@ -1306,8 +1625,13 @@ TRACE FX call mul from test_logging.py:N in fn (LoggingTests.test_trace_call_pre
 
     @make_logging_test(guards=True)
     def test_guards_sloc_vr(self, records):
+        # [FUNCTION DOC] With guards logging, compiles a dynamic-shape function with range and
+        # equality checks on sizes, and compares the normalized shape guards (a combined range
+        # guard and an equality guard) to a golden string.
         @torch.compile(dynamic=True, backend="eager")
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Compiled function asserting size bounds and an equality
+            # relation through the check API, then returning a true tensor.
             torch._check(x.size(0) > 5)
             torch._check(x.size(0) < 30)
             torch._check(x.size(0) == y.size(0) * 2)
@@ -1325,8 +1649,11 @@ TRACE FX call mul from test_logging.py:N in fn (LoggingTests.test_trace_call_pre
 
     @make_logging_test(guards=True)
     def test_global_state_guard_logging(self, records):
+        # [FUNCTION DOC] With guards logging, compiles a trivial function, finds the guard
+        # manager record and compares the normalized global-state guard line to a golden string.
         @torch.compile(backend="eager")
         def f(x):
+            # [FUNCTION DOC] HELPER: Compiled function adding one.
             return x + 1
 
         f(torch.randn(3))
@@ -1339,8 +1666,12 @@ TRACE FX call mul from test_logging.py:N in fn (LoggingTests.test_trace_call_pre
 
     @make_logging_test(cudagraph_static_inputs=True)
     def test_cudagraph_static_inputs(self, records):
+        # [FUNCTION DOC] With cudagraph static input logging, compiles in reduce-overhead mode a
+        # function on an input marked as a static address, and asserts the record count is
+        # positive and below four.
         @torch.compile(mode="reduce-overhead")  # noqa: UNSPECIFIED_BACKEND
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compiled function adding one.
             return x + 1
 
         x = torch.ones(2, 2)
@@ -1352,6 +1683,9 @@ TRACE FX call mul from test_logging.py:N in fn (LoggingTests.test_trace_call_pre
     @make_logging_test(perf_hints=True)
     @requires_gpu
     def test_optimizer_non_static_param(self, records):
+        # [FUNCTION DOC] With perf hint logging and GPU required, builds two parameters with
+        # gradients and an Adam optimizer, compiles its step in reduce-overhead mode, runs it,
+        # and asserts one or two records.
         params = [torch.randn(10, 10, device=device_type) for _ in range(2)]
         for param in params:
             param.grad = torch.zeros_like(param)
@@ -1365,9 +1699,13 @@ TRACE FX call mul from test_logging.py:N in fn (LoggingTests.test_trace_call_pre
     @requires_gpu
     @unittest.skipIf(not SM90OrLater, "requires H100+ GPU")
     def test_autotuning(self, records):
+        # [FUNCTION DOC] With autotuning logging, requires GPU and a Hopper-class or newer
+        # device. Compiles a matrix multiply with max-autotune without cudagraphs inside a fresh
+        # cache and asserts the record count is positive and below forty.
         with torch._inductor.utils.fresh_cache():
 
             def f(a, b):
+                # [FUNCTION DOC] HELPER: Returns the matrix product of a and b.
                 return torch.mm(a, b)
 
             f = torch.compile(f, mode="max-autotune-no-cudagraphs")  # noqa: UNSPECIFIED_BACKEND
@@ -1380,15 +1718,22 @@ TRACE FX call mul from test_logging.py:N in fn (LoggingTests.test_trace_call_pre
 
     @make_logging_test(graph_region_expansion=True)
     def test_graph_region_expansion(self, records):
+        # [FUNCTION DOC] With graph region expansion logging, patches the node-tracking config
+        # on, extracts the graph and region tracker from a function with repeated sub-
+        # computations, asks the tracker for identical regions and asserts at least one record.
         with torch._dynamo.config.patch("track_nodes_for_deduplication", True):
 
             def inner_fn(x, y):
+                # [FUNCTION DOC] HELPER: Returns the sum of the sums of x plus one and y plus
+                # two.
                 x0 = x + 1
                 y0 = y + 2
                 z = x0.sum() + y0.sum()
                 return z
 
             def fn(x, y):
+                # [FUNCTION DOC] HELPER: Calls the shared computation three times, with a sine in
+                # between, and returns a product of results.
                 o0 = inner_fn(x, y)
                 o1 = torch.sin(o0)
                 o2 = inner_fn(x, o1)
@@ -1404,7 +1749,13 @@ TRACE FX call mul from test_logging.py:N in fn (LoggingTests.test_trace_call_pre
     @skipIfTorchDynamo("too slow")
     @make_logging_test(**torch._logging.DEFAULT_LOGGING)
     def test_default_logging(self, records):
+        # [FUNCTION DOC] Skipped under Dynamo. With the library default logging settings,
+        # compiles a branching function with prints, runs it for two input shapes, and asserts
+        # records from the graph break, recompile, symbolic shape and guard loggers and a record
+        # containing a source line.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Applies sine or cosine depending on the sign of the sum,
+            # prints a string, and returns the result plus one.
             if a.sum() < 0:
                 a = torch.sin(a)
             else:
@@ -1425,6 +1776,11 @@ TRACE FX call mul from test_logging.py:N in fn (LoggingTests.test_trace_call_pre
         )
 
     def test_logs_out(self):
+        # [FUNCTION DOC] Runs a subprocess that compiles a small function with TORCH_LOGS for
+        # dynamo and TORCH_LOGS_OUT pointing to a closed temporary file; asserts that the file
+        # content equals the subprocess stderr after normalizing empty lines.
+        # KNOWN ISSUE: the class-wide maxDiff is set to unlimited and is restored only if the
+        # comparison raises, not after success.
         import tempfile
 
         with tempfile.NamedTemporaryFile(delete=True) as tmp:
@@ -1469,14 +1825,22 @@ fn(torch.randn(5))
 
     @make_settings_test("torch._dynamo.eval_frame")
     def test_log_traced_frames(self, records):
+        # [FUNCTION DOC] Clears the Dynamo thread-local state, compiles and runs a function with
+        # a nested function containing a graph break and another compiled function, explicitly
+        # invokes the traced-frames logger, and compares the normalized record to a golden list
+        # of frame names.
         torch._dynamo.eval_frame.clear_dynamo_tls()
 
         # Test program
         @torch.compile(backend="eager")
         def foo():
+            # [FUNCTION DOC] HELPER: Compiled function that creates a ones tensor and returns the
+            # result of calling a nested function and that function.
             x = torch.ones([10])
 
             def bar():
+                # [FUNCTION DOC] HELPER: Adds the tensor to itself, forces a graph break,
+                # multiplies and returns the result.
                 y = x + x
                 torch._dynamo.graph_break()
                 z = y * x
@@ -1492,6 +1856,7 @@ fn(torch.randn(5))
 
         @torch.compile  # noqa: UNSPECIFIED_BACKEND
         def baz(x):
+            # [FUNCTION DOC] HELPER: Compiled function adding one.
             return x + 1
 
         baz(torch.ones(3))
@@ -1516,7 +1881,11 @@ TorchDynamo attempted to trace the following frames: [
 
     @make_logging_test(dynamo=logging.DEBUG)
     def test_skip_reason_logging(self, records):
+        # [FUNCTION DOC] With dynamo debug logging, compiles a function with Dynamo disabled by
+        # config; finds the first skipping record and asserts it mentions that tracing is
+        # disabled and the function name.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns the input plus one.
             return x + 1
 
         x = torch.randn(5)
@@ -1531,13 +1900,20 @@ TorchDynamo attempted to trace the following frames: [
 
     @make_logging_test(dynamo=logging.DEBUG)
     def test_skip_reason_logging_dispatch_mode(self, records):
+        # [FUNCTION DOC] With dynamo debug logging, compiles a function under a pass-through
+        # torch dispatch mode; asserts the first skipping record mentions a non-infra dispatch
+        # mode and the function name.
         from torch.utils._python_dispatch import TorchDispatchMode
 
         class SkipMode(TorchDispatchMode):
+            # [CLASS DOC] HELPER: Torch dispatch mode that forwards each call unchanged.
             def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                # [FUNCTION DOC] HELPER: Calls the intercepted function with the given arguments
+                # and returns its result.
                 return func(*args, **kwargs)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns the input plus one.
             return x + 1
 
         x = torch.randn(5)
@@ -1554,8 +1930,13 @@ TorchDynamo attempted to trace the following frames: [
     @torch._inductor.config.patch("force_disable_caches", True)
     @make_logging_test(autotuning_inputs=True)
     def test_autotuning_inputs(self, records):
+        # [FUNCTION DOC] Requires GPU; caches disabled. With autotuning input logging, compiles a
+        # function in max-autotune mode and asserts the autotuning-inputs logger produced records
+        # mentioning kernel inputs with shape, dtype and stride text.
         @torch.compile(mode="max-autotune")  # noqa: UNSPECIFIED_BACKEND
         def f(x):
+            # [FUNCTION DOC] HELPER: Compiled function returning the row sums of the input
+            # doubled plus one.
             return (x * 2.0 + 1.0).sum(dim=1)
 
         f(torch.randn(2048, 4096, device=device_type))
@@ -1572,9 +1953,14 @@ TorchDynamo attempted to trace the following frames: [
     @torch._inductor.config.patch("force_disable_caches", True)
     @make_logging_test(inductor=logging.DEBUG)
     def test_autotuning_inputs_off_by_default(self, records):
+        # [FUNCTION DOC] Requires GPU; caches disabled. With inductor debug logging only,
+        # compiles the same max-autotune function and asserts the autotuning-inputs logger
+        # produces no records (artifact off by default).
         # off_by_default: must stay silent even with the parent inductor log at DEBUG
         @torch.compile(mode="max-autotune")  # noqa: UNSPECIFIED_BACKEND
         def f(x):
+            # [FUNCTION DOC] HELPER: Compiled function returning the row sums of the input
+            # doubled plus one.
             return (x * 2.0 + 1.0).sum(dim=1)
 
         f(torch.randn(2048, 4096, device=device_type))
@@ -1584,17 +1970,23 @@ TorchDynamo attempted to trace the following frames: [
 
 
 class PartitionedScatterLoggingTests(LoggingTestCase):
+    # [CLASS DOC] Test case dedicated to the partitioned scatter logging artifact.
     """
     Dedicated tests for the partitioned_scatter TORCH_LOGS artifact.
     """
 
     @make_logging_test(partitioned_scatter=True)
     def test_partitioned_scatter(self, records):
+        # [FUNCTION DOC] With partitioned scatter logging, compiles an accumulating index_put on
+        # a zero vector with inductor (full graph) while the partitioned-scatter config flags are
+        # forced on, and asserts at least one record was emitted.
         from torch._inductor import config as inductor_config
 
         N, n = 8192, 8
 
         def f(out, idx, vals):
+            # [FUNCTION DOC] HELPER: Accumulates values into the output at the given indices and
+            # returns the result.
             return out.index_put([idx], vals, accumulate=True)
 
         with inductor_config.patch(
