@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [PACKAGE DOC] Package for DebugMode, a TorchDispatchMode that records operator calls, module
+# annotations, DTensor redistributions and Triton kernel launches into a log. Re-exports the call
+# record types, DebugMode, DebugInterpreter, get_active_debug_mode and the tensor hashing helpers.
+# Public API (__all__) is only DebugMode and get_active_debug_mode. Importing has no side effects.
 """
 DebugMode: a debugging TorchDispatchMode that intercepts and logs runtime calls.
 

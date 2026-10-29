@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Implementation of DebugMode, a TorchDispatchMode that logs operator calls (plus
+# optional torch function calls, nn.Module entries, profiler record functions, DTensor
+# redistributions, Triton kernels and annotations) into an ordered list of call records and can
+# render, hash-compare, serialize and deserialize that log. Also defines DebugInterpreter (runs
+# compiled fx graphs node by node so metadata can enrich the log), the custom annotate operator,
+# and a module-level active-mode counter. Import-time side effects: registers the custom operator
+# debug_mode_ops::annotate and its fake implementation with the library.
 """
 DebugMode is a debugging TorchDispatchMode that intercepts and logs runtime calls
 to a hierarchical string dump. It logs real tensor, DTensor, and optionally FakeTensor
@@ -97,6 +104,11 @@ _annotate_decorated = False
 
 
 def _ensure_annotate_decorated():
+    # [FUNCTION DOC] HELPER: One-time lazy setup (guarded by a module flag) that wraps the
+    # DebugMode annotate method for dynamo, marks the annotate operator as side-effectful so it
+    # is not eliminated as dead code, and registers a no-op inductor lowering that warns once.
+    # Side effects: mutates the DebugMode class, a global registry of side-effectful functions,
+    # and the lowering registry.
     """
     Lazily apply dont_skip_tracing decorator to DebugMode._annotate, to avoid circular import/initialization issues.
     """
@@ -114,6 +126,8 @@ def _ensure_annotate_decorated():
 
         @register_lowering(torch.ops.debug_mode_ops.annotate)
         def _annotate_lowering(tag: str) -> None:
+            # [FUNCTION DOC] HELPER: Inductor lowering for the annotate operator; warns once that
+            # annotation does nothing under the inductor backend and returns None.
             warning_once(log, 'DebugMode._annotate() is a no-op for backend="inductor"')
             return None
 
@@ -122,16 +136,23 @@ def _ensure_annotate_decorated():
 
 @torch.library.custom_op("debug_mode_ops::annotate", mutates_args=())
 def _annotate(tag: str) -> None:
+    # [FUNCTION DOC] HELPER: Custom operator whose eager body does nothing; the active DebugMode
+    # intercepts it during dispatch and logs the tag as an annotation. Returns None.
     # This is special-cased in DebugMode.__torch_dispatch__
     return None
 
 
 @_annotate.register_fake
 def _annotate_fake(tag: str) -> None:
+    # [FUNCTION DOC] HELPER: Fake (meta) implementation of the annotate operator; returns None.
     return None
 
 
 class DebugInterpreter(torch.fx.Interpreter):
+    # [CLASS DOC] Interpreter that executes a compiled region node by node while a DebugMode is
+    # active. State: mode (the active DebugMode), base_nn_module_stack (module stack at region
+    # entry) and backend name. Logs enter and exit annotations around the region, keeps the
+    # mode's nn.Module stack in sync with node metadata, and overrides stack traces from nodes.
     """
     Interpreter class for running aot_eager compiled regions when DebugMode is active,
     instead of using the compiled code. This gives us access to fx.Node metadata to decorate
@@ -141,6 +162,9 @@ class DebugInterpreter(torch.fx.Interpreter):
     """
 
     def __init__(self, module, backend):
+        # [FUNCTION DOC] Look up the active DebugMode (raises RuntimeError if none), remember the
+        # current module stack as the baseline, and append an "enter" annotation for the region
+        # to the mode's log.
         super().__init__(module)
         self.mode = get_active_debug_mode()
         if self.mode is None:
@@ -158,6 +182,10 @@ class DebugInterpreter(torch.fx.Interpreter):
         )
 
     def run_node(self, n: torch.fx.Node) -> Any:
+        # [FUNCTION DOC] Execute one graph node. Raises RuntimeError if no mode is set. For
+        # non-placeholder, non-output nodes, syncs the module stack from node metadata when
+        # nn.Module recording is on, and, when stack trace recording is on and the node has a
+        # stack trace, runs the node under that trace override. Returns the node result.
         if self.mode is None:
             raise RuntimeError("No DebugMode is currently active")
 
@@ -181,6 +209,11 @@ class DebugInterpreter(torch.fx.Interpreter):
             return super().run_node(n)
 
     def run(self, *args, **kwargs):
+        # [FUNCTION DOC] Run the whole graph on the positional arguments and return the result.
+        # Afterwards pops any module entries the region left on the mode's stack, then appends an
+        # "exit" annotation. Raises RuntimeError if no mode is set.
+        # KNOWN ISSUE: keyword arguments are accepted but silently ignored (only positional
+        # arguments are forwarded to the base run).
         if self.mode is None:
             raise RuntimeError("No DebugMode is currently active")
         result = super().run(*args)
@@ -204,6 +237,13 @@ class DebugInterpreter(torch.fx.Interpreter):
 
 
 class DebugMode(TorchDispatchMode):
+    # [CLASS DOC] Dispatch mode that records an ordered log (operators) of call records and
+    # renders it as an indented string. Configured by keyword-only flags (record torch function,
+    # fake tensor, real tensor, local tensor calls; tensor attributes; nn.Module entries; stack
+    # traces; outputs; tensor ids; profiler contexts; interpreter for compiled regions). State:
+    # operators list, call_depth, tensor id tracker, ignored record-function counter, current
+    # module stack and optional fx stack trace override. Maintains a global active-mode count
+    # while entered. Key methods: reset, debug_string, hash and compare helpers, serialization.
     def __init__(
         self,
         *,
@@ -220,6 +260,10 @@ class DebugMode(TorchDispatchMode):
         record_localtensor=True,
         run_compile_with_interpreter=False,
     ) -> None:
+        # [FUNCTION DOC] Store the recording options (see attribute comments below), import the
+        # distributed tensor package, run the one-time annotate setup, mark the mode as
+        # supporting higher-order operators, set up module tracking if requested, and reset the
+        # log state. All arguments are keyword-only; no errors raised directly.
         super().__init__()
         import torch.distributed.tensor  # noqa: F401
 
@@ -277,6 +321,8 @@ class DebugMode(TorchDispatchMode):
         self.reset()
 
     def reset(self) -> None:
+        # [FUNCTION DOC] Clear the log and all per-run state: call list, depth, tensor ids,
+        # output info, ignored record-function count, module stack and fx stack trace.
         self.operators = []
         self.call_depth = 0
         self._tensor_memo = TensorIdTracker()
@@ -286,6 +332,8 @@ class DebugMode(TorchDispatchMode):
         self.fx_stack_trace = None
 
     def _track_op_output(self, op_index, result) -> None:
+        # [FUNCTION DOC] HELPER: Remember the result object for the operator log index in the
+        # output info mapping.
         """Assign IDs to output tensors and store in output_info"""
         self._output_info[op_index] = result
 
@@ -294,9 +342,15 @@ class DebugMode(TorchDispatchMode):
     # With this, DebugMode will not take effect on torch.compile
     @classmethod
     def ignore_compile_internals(cls) -> bool:
+        # [FUNCTION DOC] Always returns true so torch.compile ignores this mode instead of
+        # forcing the eager backend.
         return True
 
     def _record_call(self, call) -> None:
+        # [FUNCTION DOC] HELPER: Append a call to the log, unless inductor benchmarking is in
+        # progress or the call is a profiler record-function operator. Stringifies arguments
+        # immediately unless original args are kept, and stamps the call with the fx stack trace
+        # override when one is set.
         if _utils._IN_INDUCTOR_BENCHMARK:
             return
 
@@ -313,6 +367,8 @@ class DebugMode(TorchDispatchMode):
         self.operators.append(call)
 
     def _record_call_output(self, call, output) -> None:
+        # [FUNCTION DOC] HELPER: If output recording is on, store the stringified output on the
+        # call.
         if not self.record_output:
             return
         call.stringify_output(
@@ -322,6 +378,8 @@ class DebugMode(TorchDispatchMode):
         )
 
     def __torch_function__(self, func, types, args=(), kwargs=None):
+        # [FUNCTION DOC] Log the torch function call, run it one nesting level deeper, record its
+        # output, and return the result. The depth is restored even if the call raises.
         if kwargs is None:
             kwargs = {}
 
@@ -339,6 +397,9 @@ class DebugMode(TorchDispatchMode):
             self.call_depth -= 1
 
     def _maybe_record_function(self, tag):
+        # [FUNCTION DOC] HELPER: Handle entering a profiler record function. Tags that look like
+        # autotuner, benchmarker or compile internals are skipped and counted as ignored;
+        # otherwise an annotation is logged and the call depth is increased.
         # filter out tags that appear noisy, or aren't runtime-related
         if any(
             tag.startswith(prefix)
@@ -360,6 +421,9 @@ class DebugMode(TorchDispatchMode):
         self.call_depth += 1
 
     def _maybe_exit_record_function(self):
+        # [FUNCTION DOC] HELPER: Handle leaving a profiler record function: consume one ignored
+        # entry if any are pending, otherwise decrease call depth. Raises AssertionError if the
+        # ignored counter is negative.
         if self.ignored_record_functions < 0:
             raise AssertionError(
                 f"ignored_record_functions is negative: {self.ignored_record_functions}"
@@ -370,6 +434,12 @@ class DebugMode(TorchDispatchMode):
             self.call_depth -= 1
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        # [FUNCTION DOC] Intercept a dispatched operator. Tracks profiler record function enter
+        # and exit; handles the annotate operator by logging it and returning None; for DTensor
+        # types logs the call and returns NotImplemented so the subclass runs it. Otherwise logs
+        # fake, local, async collective or plain real tensor calls according to flags, runs
+        # pre-log hooks, executes the op, records the output, runs record and log hooks, and
+        # returns the result. Raises AssertionError on unexpected argument counts.
         if kwargs is None:
             kwargs = {}
 
@@ -460,6 +530,10 @@ class DebugMode(TorchDispatchMode):
         return result
 
     def __enter__(self):
+        # [FUNCTION DOC] Activate the mode: increment the global active count, optionally push
+        # onto the torch function stack, enter the dispatch mode, enter the module tracker if
+        # enabled, and enable autograd anomaly detection (no nan check) for stack traces if
+        # enabled. Returns self.
         global _ACTIVE_DEBUG_MODE_COUNT
         _ACTIVE_DEBUG_MODE_COUNT += 1
         if self.record_torchfunction:
@@ -478,6 +552,9 @@ class DebugMode(TorchDispatchMode):
 
     # pyrefly: ignore [bad-override]
     def __exit__(self, *args):
+        # [FUNCTION DOC] Deactivate the mode: decrement the global active count, exit the dispatch
+        # mode, exit the module tracker, pop the torch function stack and exit anomaly detection
+        # for the features that were enabled. Returns None.
         global _ACTIVE_DEBUG_MODE_COUNT
         _ACTIVE_DEBUG_MODE_COUNT -= 1
         super().__exit__(*args)
@@ -490,6 +567,8 @@ class DebugMode(TorchDispatchMode):
 
     @contextlib.contextmanager
     def set_fx_stack_trace(self, stack_trace):
+        # [FUNCTION DOC] Context manager that sets the fx stack trace override for calls logged
+        # inside the block and clears it (to None, not to a previous value) on exit.
         self.fx_stack_trace = stack_trace
         try:
             yield
@@ -497,6 +576,8 @@ class DebugMode(TorchDispatchMode):
             self.fx_stack_trace = None
 
     def _enter_nn_module_call(self, fqn, header):
+        # [FUNCTION DOC] HELPER: Log an annotation for entering a module with the given qualified
+        # name and header, push the name on the module stack and increase call depth.
         call = _AnnotateCall(
             fqn, header, self.call_depth + 1, stack=self.record_stack_trace
         )
@@ -505,21 +586,27 @@ class DebugMode(TorchDispatchMode):
         self.call_depth += 1
 
     def _exit_nn_module_call(self):
+        # [FUNCTION DOC] HELPER: Decrease call depth and pop the last name off the module stack.
         self.call_depth -= 1
         self.current_nn_module_stack.pop()
 
     def module_tracker_setup(self) -> None:
+        # [FUNCTION DOC] Create the module tracker and register user hooks that log a module
+        # entry before each module forward and unwind it afterwards. Replaces any existing
+        # tracker.
         from torch.distributed._tools.mod_tracker import ModTracker
 
         self.module_tracker = ModTracker()
 
         # module pre-fw hook: record module call
         def pre_fw_hook(module, input) -> None:
+            # [FUNCTION DOC] HELPER: Look up the module name from the tracker and log entering it.
             fqn = self.module_tracker._get_mod_name(module)  # type: ignore[attribute, union-attr]
             self._enter_nn_module_call(fqn, "nn.Mod")
 
         # module post-fw hook: decrement call depth
         def post_fw_hook(module, input, output) -> None:
+            # [FUNCTION DOC] HELPER: Log leaving the module (decrease depth, pop module stack).
             self._exit_nn_module_call()
 
         self.module_tracker.register_user_hooks(pre_fw_hook, post_fw_hook)
@@ -530,6 +617,12 @@ class DebugMode(TorchDispatchMode):
         nn_module_stack: dict[str, tuple[str, Any]] | None,
         fwd_nn_module_stack: dict[str, tuple[str, Any]] | None,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Reconcile the tracked module stack with the module stack
+        # metadata of a node: exit modules no longer present, log entries for new modules in
+        # sorted order, then set the tracked stack to the base stack plus the node's modules.
+        # Raises AssertionError if both stack mappings are non-empty or call depth goes negative.
+        # KNOWN ISSUE: set difference ignores ordering and repeated names, and exited modules are
+        # popped from the end of the stack regardless of which module actually exited.
         """
         Called when DebugInterpreter observes nn_module_stack or fwd_nn_module_stack metadata
         from executing the compiled GraphModule.
@@ -578,6 +671,9 @@ class DebugMode(TorchDispatchMode):
         transform_info_str: str | None = None,
         is_explicit: bool = False,
     ):
+        # [FUNCTION DOC] Context manager that logs a redistribution call for the argument with
+        # source and destination placements (or a transform trace string), runs the body one
+        # level deeper, and restores depth on exit even on error. Side effect: appends to the log.
         try:
             self._record_call(
                 _RedistributeCall(
@@ -596,6 +692,9 @@ class DebugMode(TorchDispatchMode):
             self.call_depth -= 1
 
     def record_output_placements(self, output_spec) -> None:
+        # [FUNCTION DOC] If output recording is on, log a line with the output placements: specs
+        # in the given (possibly nested) structure are formatted, then the structure is converted
+        # to text. Side effect: appends an output placement call to the log.
         """Record output placements for a DTensor op as a separate line."""
         if not self.record_output:
             return
@@ -610,12 +709,19 @@ class DebugMode(TorchDispatchMode):
     def record_triton_kernel(
         self, kernel_name: str, kwargs: dict[str, Any]
     ) -> _TritonKernelCall:
+        # [FUNCTION DOC] Log a Triton kernel launch one level deeper: create the call, stringify
+        # (and optionally pre-hash) its kwargs, append it and return it so the caller can finalize
+        # it after launch. Does not honor the inductor-benchmark suppression used by other calls.
         call = _TritonKernelCall(kernel_name, kwargs, self.call_depth + 1)
         call.stringify_args(self.record_tensor_attributes)
         self.operators.append(call)
         return call
 
     def debug_string(self, show_stack_trace: bool | None = None) -> str:
+        # [FUNCTION DOC] Render the whole log as text, one line per call indented by call depth.
+        # If stack trace display is on (argument, else the mode setting), a comment line with a
+        # one-line user-code summary of the call's forward or regular stack trace is inserted
+        # whenever it changes. Runs with torch function dispatch disabled. Returns the string.
         """
         show_stack_trace: option to display one-line stack trace summaries above groups
                         of operations (similar to gm.print_readable() style).
@@ -677,6 +783,9 @@ class DebugMode(TorchDispatchMode):
         log_hook: Callable | None = None,
         pre_log_hook: Callable | None = None,
     ):
+        # [FUNCTION DOC] Static context manager that appends the given hooks to the global hook
+        # lists for the duration of the block, then pops them (the last entry of each list) on
+        # exit. Global state is mutated; hooks must return None or a mapping.
         """
         Allows installing post-hooks on arguments to intercepted __torch_dispatch__ calls;
         hook signatures are expected as (func, types, args, kwargs, result),
@@ -708,11 +817,16 @@ class DebugMode(TorchDispatchMode):
     @staticmethod
     @contextlib.contextmanager
     def record_outputs():
+        # [FUNCTION DOC] Static context manager that stores cloned tensor outputs of every
+        # dispatched op (and Triton kernel) in each call's record under the output key. Sets a
+        # global triton-recording flag and installs a record hook; the flag is restored on exit.
         """
         Hook for storing cloned output tensors in .record["output"].
         """
 
         def dispatch_hook(func, types, args, kwargs, result):
+            # [FUNCTION DOC] HELPER: Record hook returning a mapping with the output key holding
+            # the result with every tensor cloned.
             out = tree_map(
                 lambda x: x.clone() if isinstance(x, torch.Tensor) else x, result
             )
@@ -731,6 +845,13 @@ class DebugMode(TorchDispatchMode):
     def log_tensor_hashes(
         hash_fn: Callable | str | list[str] = "norm", hash_inputs: bool = False
     ):
+        # [FUNCTION DOC] Static context manager that logs hashes of tensor outputs (and inputs,
+        # captured before execution, if requested) of each dispatched op and Triton kernel. The
+        # hash function is a callable, a name (norm or hash tensor) or a list of names giving
+        # tuples. Raises NotImplementedError for any other type and AssertionError for an unknown
+        # name. Sets global triton hash functions and installs log hooks; both restored on exit.
+        # KNOWN ISSUE: if setup fails before the try block, nothing is restored; inside it, the
+        # input hash restore relies on a variable only set when inputs are hashed.
         """
         Installs hook for tensor hash logging.
 
@@ -746,6 +867,8 @@ class DebugMode(TorchDispatchMode):
         """
 
         def hash_fn_option(hash_type):
+            # [FUNCTION DOC] HELPER: Map a hash name to a scalar-returning hash function (norm or
+            # hash tensor). Raises AssertionError for any other name.
             if not isinstance(hash_type, str) or hash_type not in [
                 "norm",
                 "hash_tensor",
@@ -770,11 +893,16 @@ class DebugMode(TorchDispatchMode):
             )
 
         def _tree_hash(obj):
+            # [FUNCTION DOC] HELPER: Replace each tensor in the nested structure with its hash;
+            # non-tensor leaves become None.
             return tree_map(
                 lambda x: fn(x) if isinstance(x, torch.Tensor) else None, obj
             )
 
         def _dispatch_pre_log_hook(func, types, args, kwargs, call):
+            # [FUNCTION DOC] HELPER: Pre-execution hook. Skips ops whose name mentions empty or
+            # profiler. If input hashing is on, returns a mapping with the input hash tree unless
+            # it contains no tensors; otherwise None.
             """Pre-hook to capture input hashes before operation executes"""
             if "empty" in str(func) or "profiler" in str(func):
                 return None
@@ -787,6 +915,9 @@ class DebugMode(TorchDispatchMode):
             return None
 
         def _dispatch_post_hook(func, types, args, kwargs, result):
+            # [FUNCTION DOC] HELPER: Post-execution log hook. Skips ops whose name mentions empty
+            # or profiler. Returns a mapping with the output hash tree, or None if the result has
+            # no tensors.
             """Post-hook to capture output hashes after operation executes"""
             if "empty" in str(func) or "profiler" in str(func):
                 return None
@@ -817,6 +948,9 @@ class DebugMode(TorchDispatchMode):
     @staticmethod
     @contextlib.contextmanager
     def _benchmarking_inductor():
+        # [FUNCTION DOC] HELPER: Static context manager that sets the global inductor-benchmark
+        # flag so calls are not logged, and sets it back to false (not to its prior value) on
+        # exit.
         """
         Context manager for disabling logging during inductor benchmarking,
         so logs don't contain all kernels launched from autotuning.
@@ -829,10 +963,15 @@ class DebugMode(TorchDispatchMode):
 
     @property
     def logs(self):
+        # [FUNCTION DOC] Property returning a shallow copy of the list of recorded calls.
         return list(self.operators)
 
     @staticmethod
     def save_logs(logs: list, destination: str | os.PathLike | IO[str]) -> None:
+        # [FUNCTION DOC] Serialize the calls to JSON with a format name and version, writing to a
+        # path (opened as UTF-8 text) or an open text file, with a trailing newline. Raises
+        # TypeError or ValueError for unsupported values (non-finite floats are encoded
+        # specially). Side effect: file I/O.
         """
         Save DebugMode logs to a JSON file so they can be loaded and compared in
         another Python process.
@@ -856,6 +995,10 @@ class DebugMode(TorchDispatchMode):
 
     @staticmethod
     def load_logs(source: str | os.PathLike | IO[str]) -> list:
+        # [FUNCTION DOC] Read JSON from a path or text file and rebuild the list of call records.
+        # Raises ValueError if the top level is not a mapping, the format name or version differs
+        # from what save_logs writes, the logs entry is not a list, or any call is malformed.
+        # Side effect: file I/O.
         """
         Load logs saved by DebugMode.save_logs().
 
@@ -891,12 +1034,16 @@ class DebugMode(TorchDispatchMode):
         return [_deserialize_debug_call(call) for call in logs]
 
     def _handle_annotate(self, tag):
+        # [FUNCTION DOC] HELPER: Append an annotation call with the tag and the annotate header at
+        # the current depth.
         """Handles DebugMode._annotate()"""
         call = _AnnotateCall(tag, "annotate", self.call_depth, self.record_stack_trace)
         self.operators.append(call)
 
     @staticmethod
     def _annotate(tag: Any) -> None:
+        # [FUNCTION DOC] HELPER: Static method that calls the annotate custom operator so the
+        # active DebugMode, if any, logs the tag. Returns None.
         """
         If an active DebugMode exists, adds an "[annotate] <tag>" entry to the logs. Useful for contextualizing logs.
         Implemented with a custom op.
@@ -907,6 +1054,12 @@ class DebugMode(TorchDispatchMode):
     def check_hash_mismatches(
         logs1: list, logs2: list, compare_inputs: bool = False
     ) -> list[dict]:
+        # [FUNCTION DOC] Compare two logs pairwise. First require equal length, call type, call
+        # name and call depth (and equal redistribute rendering or triton kwargs strings), raising
+        # ValueError otherwise. Then, for triton kernels and op calls, compare output hashes (and
+        # input hashes if requested), requiring presence in both or neither (ValueError). Returns
+        # a list of mappings describing each differing hash. Other call types are skipped.
+        # KNOWN ISSUE: hash-presence error messages for regular ops say "triton kernel".
         """
         Compares tensor hashes between two DebugMode runs, for checking run-to-run numerical divergence.
 
@@ -998,6 +1151,8 @@ class DebugMode(TorchDispatchMode):
                     )
 
                 def compare_triton_hashes(hashes1, hashes2, is_input):
+                    # [FUNCTION DOC] HELPER: Require identical argument names (AssertionError
+                    # otherwise); append a difference entry per argument whose hash differs.
                     if set(hashes1.keys()) != set(hashes2.keys()):  # type: ignore[union-attr]
                         raise AssertionError(
                             f"hash key mismatch: {set(hashes1.keys())} vs {set(hashes2.keys())}"
@@ -1056,7 +1211,11 @@ class DebugMode(TorchDispatchMode):
             elif isinstance(log1, _OpCall):
 
                 def compare_op_hashes(hashes1, hashes2, is_input):
+                    # [FUNCTION DOC] HELPER: Walk both hash trees together and append a
+                    # difference entry (with the tree path) for every leaf whose hashes differ.
                     def _helper(keypath, hash1, hash2):
+                        # [FUNCTION DOC] HELPER: Leaf comparison; on mismatch appends an entry with
+                        # path, both hashes and their relative difference.
                         if hash1 != hash2:
                             difference_info.append(
                                 {
@@ -1110,6 +1269,10 @@ class DebugMode(TorchDispatchMode):
 
 
 def get_active_debug_mode() -> DebugMode | None:
+    # [FUNCTION DOC] Return the innermost DebugMode on the dispatch mode stack, or None if none
+    # is active. Skips the stack walk when the global active count is zero.
+    # KNOWN ISSUE: the loop breaks at the first match, so it returns whichever DebugMode the
+    # stack iteration yields first, which depends on the iteration order of the stack helper.
     # Fast path: if no DebugMode is active, skip the stack walk
     if _ACTIVE_DEBUG_MODE_COUNT == 0:
         return None
