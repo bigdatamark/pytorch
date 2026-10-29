@@ -1,3 +1,10 @@
+# [MODULE DOC] Test-infrastructure helpers that decorate OpInfo entries with MPS-specific
+# expected failures and skips. Defines three modifiers: mps_ops_modifier (forward op tests),
+# mps_ops_grad_modifier (gradient tests) and mps_ops_error_inputs_modifier (error-input
+# tests). Real implementations are defined only if the MPS backend is available at import
+# time (checked once on import); otherwise only a pass-through mps_ops_modifier exists and
+# the grad and error-input modifiers are not defined. Imports MACOS_VERSION to gate
+# version-dependent failures.
 import unittest
 from collections.abc import Sequence
 
@@ -15,6 +22,16 @@ if torch.backends.mps.is_available():
         xfail_exclusion: list[str] | None = None,
         sparse: bool = False,
     ) -> Sequence[OpInfo]:
+        # [FUNCTION DOC] Annotates OpInfos so the generic op tests run correctly on MPS.
+        # Args: ops (sequence of OpInfo), device_type (device the decorators apply to),
+        # xfail_exclusion (op keys, name plus variant name, exempt from the xfail tables;
+        # defaults to empty), sparse (also expects the sparse-only unimplemented ops to fail
+        # and skips complex128). Local tables hold supported complex ops, unimplemented,
+        # undefined and on-MPS expected failures, macOS-version-gated failures, and skips.
+        # Appends skip/expectedFailure decorators to each op, mutating it; ops absent from
+        # the supported-complex set are expected to fail for complex32/complex64. Returns ops.
+        # KNOWN ISSUE: several keys in the tables look like concatenated name and variant
+        # (for example "normfro"), relying on the key being name plus variant_test_name.
         if xfail_exclusion is None:
             xfail_exclusion = []
 
@@ -757,6 +774,9 @@ if torch.backends.mps.is_available():
         }
 
         def addDecorator(op: OpInfo, d: DecorateInfo) -> None:
+            # [FUNCTION DOC] HELPER: Sets the decorator's device_type to the enclosing
+            # device_type (when not None) and appends it to the op's decorators tuple.
+            # Mutates both the decorator record and the op; returns nothing.
             if device_type is not None:
                 d.device_type = device_type
 
@@ -850,6 +870,13 @@ if torch.backends.mps.is_available():
         return ops
 
     def mps_ops_grad_modifier(ops: Sequence[OpInfo]) -> Sequence[OpInfo]:
+        # [FUNCTION DOC] Annotates OpInfos for the MPS gradient tests. Local tables map op key
+        # (name plus variant name) to dtype lists (None meaning all dtypes): an xfail table,
+        # a skip table, a macOS-before-15 xfail table (matrix_exp) and an MPS-only xfail
+        # table. Adds expected-failure or skip decorators to matching ops, mutating them in
+        # place, and returns the same sequence.
+        # KNOWN ISSUE: the skip table uses the bare unittest.skip as the decorator rather than
+        # a skip call with a reason, so it is not a proper decorator factory call.
         XFAILLIST_GRAD = {
             # Unimplemented ops
             "_chunk_cat": [torch.float16, torch.float32],
@@ -951,6 +978,8 @@ if torch.backends.mps.is_available():
         }
 
         def addDecorator(op: OpInfo, d: DecorateInfo) -> None:
+            # [FUNCTION DOC] HELPER: Appends one decorator record to the op's decorators
+            # tuple (replacing the tuple, so the op is mutated in place). Returns nothing.
             op.decorators = op.decorators + (d,)
 
         for op in ops:
@@ -984,6 +1013,10 @@ if torch.backends.mps.is_available():
         return ops
 
     def mps_ops_error_inputs_modifier(ops: Sequence[OpInfo]) -> Sequence[OpInfo]:
+        # [FUNCTION DOC] Marks MPS error-input tests as expected failures for ops in a local
+        # set of names where the MPS backend does not raise the error CPU raises (or has a
+        # tensor dimension limit of 16). The key is op name plus variant name. Mutates each
+        # matching op's decorators (no dtype restriction) and returns the same sequence.
         # Error input samples do not take a dtype argument.
         XFAILLIST = {
             # Exceptions are not raised
@@ -1000,6 +1033,8 @@ if torch.backends.mps.is_available():
         }
 
         def addDecorator(op: OpInfo, d: DecorateInfo) -> None:
+            # [FUNCTION DOC] HELPER: Appends one decorator record to the op's decorators
+            # tuple (replacing the tuple, so the op is mutated in place). Returns nothing.
             op.decorators = op.decorators + (d,)
 
         for op in ops:
@@ -1016,4 +1051,7 @@ else:
         xfail_exclusion: list[str] | None = None,
         sparse: bool = False,
     ) -> Sequence[OpInfo]:
+        # [FUNCTION DOC] Fallback used when the MPS backend is unavailable: returns the given
+        # ops unchanged, with no decorators added. Accepts the same arguments as the real
+        # modifier (all ignored). No side effects, never raises.
         return ops
