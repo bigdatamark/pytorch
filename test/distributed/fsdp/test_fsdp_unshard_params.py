@@ -1,4 +1,10 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests for FSDP.summon_full_params (unsharding parameters): writeback semantics,
+# parameter data/shape/device/dtype exposure, reshard behavior around forward/backward, recurse,
+# named_parameters and named_buffers, with_grads, submodule unsharding, the NO_SHARD single-rank
+# case, and the errors raised for unsupported usage. Import-time side effects: sets a module-level
+# device_type from get_devtype; exits the process if distributed is unavailable or dev-asan is on.
+# Several tests rely on FSDP internals (flat_param, handles).
 import contextlib
 import itertools
 import math
@@ -52,6 +58,9 @@ if TEST_WITH_DEV_DBG_ASAN:
 
 
 class TestUnshardParamsBase(FSDPTestContinuous):
+    # [CLASS DOC] Shared base for the unshard-params tests. Holds the common subtest bodies
+    # and config generators (writeback and param-data checks) reused by the sharded and
+    # NO_SHARD test classes.
     """
     This contains any methods common to both the sharded and non-sharded cases.
     """
@@ -62,6 +71,13 @@ class TestUnshardParamsBase(FSDPTestContinuous):
         check_outer: bool,
         **fsdp_kwargs: dict[str, Any],
     ):
+        # [FUNCTION DOC] HELPER: Wraps a two-layer linear model with an inner and an outer
+        # FSDP using the given kwargs, writes a rank-dependent value into the sharded
+        # outer or inner parameter (per check_outer), zeroes all parameters inside
+        # summon_full_params with the given writeback, then checks the first element: it
+        # must be zero if writeback is set, or if the strategy is NO_SHARD without
+        # parameter offload; otherwise it must keep the rank-dependent value. Also checks
+        # that all parameters are on CPU when params are offloaded.
         model = nn.Sequential(
             nn.Linear(5, 5, bias=False, device=device_type.type),
             nn.Linear(5, 3, bias=False, device=device_type.type),
@@ -107,6 +123,9 @@ class TestUnshardParamsBase(FSDPTestContinuous):
                 self.assertEqual(param.device, cpu_device)
 
     def _get_test_unshard_params_writeback_config(self) -> dict[str, list[Any]]:
+        # [FUNCTION DOC] HELPER: Returns the subtest option grid (mapping of argument name
+        # to value list) for the writeback test: writeback, check_outer, mixed precision
+        # (fp16 or none), cpu offload on/off, and use_orig_params.
         return {
             "writeback": [True, False],
             "check_outer": [True, False],
@@ -126,6 +145,14 @@ class TestUnshardParamsBase(FSDPTestContinuous):
         mixed_precision: MixedPrecision | None,
         use_orig_params: bool,
     ):
+        # [FUNCTION DOC] HELPER: Compares a non-FSDP deterministic nested model against an
+        # FSDP-wrapped copy whose root is not FSDP, inside summon_full_params with the
+        # given rank0_only and offload_to_cpu. On participating ranks, parameter shapes,
+        # dtypes (even with mixed precision) and values must match, devices must match
+        # except FSDP-managed params on CPU when offloading, and all must be nn.Parameter.
+        # On other ranks under rank0_only, each flat parameter must still have its sharded
+        # (or unpadded unsharded for non-sharded strategies) size. Finally asserts more
+        # than one FSDP root exists after lazy init.
         local_model = NestedWrappedModule.init(
             self.process_group,
             FSDPInitMode.NO_FSDP,
@@ -199,6 +226,9 @@ class TestUnshardParamsBase(FSDPTestContinuous):
         self.assertGreater(num_fsdp_roots, 1)
 
     def _get_test_unshard_params_param_data_config(self) -> dict[str, list[Any]]:
+        # [FUNCTION DOC] HELPER: Returns the subtest option grid for the param-data test:
+        # rank0_only, offload_to_cpu, cpu_offload, mixed_precision and use_orig_params
+        # value lists.
         return {
             "rank0_only": [False, True],
             "offload_to_cpu": [False, True],
@@ -212,12 +242,19 @@ class TestUnshardParamsBase(FSDPTestContinuous):
 
 
 class TestUnshardParams(TestUnshardParamsBase):
+    # [CLASS DOC] Two-rank tests of summon_full_params on FSDP models: writeback, param data,
+    # singleton parameter writeback, reshard behavior, recurse, named_parameters/buffers
+    # parity, with_grads (compared to DDP) and submodule unsharding. Mostly driven by
+    # run_subtests.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] Property: number of ranks, fixed at 2.
         return 2
 
     @skip_if_lt_x_gpu(2)
     def test_unshard_params_writeback(self):
+        # [FUNCTION DOC] Runs the writeback subtest body over the shared writeback option
+        # grid. Needs 2 GPUs.
         """Tests the ``writeback`` argument (using default for all others)."""
         self.run_subtests(
             self._get_test_unshard_params_writeback_config(),
@@ -226,6 +263,8 @@ class TestUnshardParams(TestUnshardParamsBase):
 
     @skip_if_lt_x_gpu(2)
     def test_unshard_params_param_data(self):
+        # [FUNCTION DOC] Runs the param-data subtest body over the shared option grid.
+        # Needs 2 GPUs.
         """
         Tests that parameters are exposed correctly for ``recurse=True`` and
         all other argument configs for a non-FSDP root module.
@@ -237,6 +276,11 @@ class TestUnshardParams(TestUnshardParamsBase):
 
     @skip_if_lt_x_gpu(2)
     def test_unshard_singleton_param_writeback(self):
+        # [FUNCTION DOC] Wraps a one-element linear layer in FSDP so the flat parameter
+        # has a single element (rank 0 holds data, other ranks hold padding). Writes a
+        # rank-dependent value, zeroes the flat parameter inside summon_full_params with
+        # writeback, and checks that rank 0 sees zero while other ranks keep their value,
+        # i.e. padding writes are not persisted. Uses FSDP internals.
         """
         Tests ``writeback=True`` for a singleton parameter, which includes
         testing that writing to padding does not persist.
@@ -263,6 +307,9 @@ class TestUnshardParams(TestUnshardParamsBase):
     @unittest.skipIf(TEST_WITH_ROCM, "https://github.com/pytorch/pytorch/issues/159348")
     @skip_if_lt_x_gpu(2)
     def test_unshard_params_respects_reshard(self):
+        # [FUNCTION DOC] Runs the reshard-behavior subtest body over rank0_only,
+        # offload_to_cpu, mixed precision and use_orig_params. Skipped on ROCm (issue
+        # 159348). Needs 2 GPUs.
         """
         Tests that unsharding parameters respects the expected reshard behavior
         between forward and backward as well as after backward.
@@ -289,6 +336,12 @@ class TestUnshardParams(TestUnshardParamsBase):
         mixed_precision: MixedPrecision | None,
         use_orig_params: bool,
     ):
+        # [FUNCTION DOC] HELPER: Checks that summon_full_params leaves the unsharded
+        # storage of the outer and inner flat parameters as it was: after forward the root
+        # stays unsharded and the non-root is resharded; after backward both are
+        # resharded. Mixed precision is the exception: the forced full precision
+        # invalidates the root unsharded storage, so zero size is expected there. Reads
+        # the padded full-param storage size of the flat parameters. Uses FSDP internals.
         """NOTE: This method depends on FSDP internals."""
         fsdp_kwargs = {
             "mixed_precision": mixed_precision,
@@ -311,6 +364,8 @@ class TestUnshardParams(TestUnshardParamsBase):
         )
 
         def _get_unsharded_storage_size(flat_param: FlatParameter):
+        # [FUNCTION DOC] HELPER: Returns the element count of the flat parameter padded
+        # full-parameter storage (zero when resharded).
             return flat_param._full_param_padded.storage().size()
 
         # Validate the expected behavior: the root does not reshard after
@@ -360,6 +415,8 @@ class TestUnshardParams(TestUnshardParamsBase):
 
     @skip_if_lt_x_gpu(2)
     def test_unshard_params_recurse(self):
+        # [FUNCTION DOC] Runs the recurse subtest body over recurse, unshard_outer, mixed
+        # precision and use_orig_params. Needs 2 GPUs.
         """Tests the ``recurse`` argument (using default for all others)."""
         self.run_subtests(
             {
@@ -378,6 +435,12 @@ class TestUnshardParams(TestUnshardParamsBase):
         mixed_precision: MixedPrecision | None,
         use_orig_params: bool,
     ):
+        # [FUNCTION DOC] HELPER: Builds a nested FSDP model (inner linear 5x5, outer
+        # linear 5x3), computes the expected sharded and unsharded element counts (rounded
+        # up for padding and, with use_orig_params, for divisibility by world size), and
+        # checks the flat parameter sizes before and inside summon_full_params on the
+        # model or its first submodule with the given recurse. The inner is unsharded if
+        # recurse is set or the outer is not being unsharded. Uses internals.
         """NOTE: This method depends on FSDP internals."""
         fsdp_kwargs = {
             "mixed_precision": mixed_precision,
@@ -429,6 +492,8 @@ class TestUnshardParams(TestUnshardParamsBase):
 
     @skip_if_lt_x_gpu(2)
     def test_named_parameters_and_buffers(self):
+        # [FUNCTION DOC] Runs the named parameters/buffers subtest body over prefix and
+        # recurse values. Needs 2 GPUs.
         """
         Tests that ``named_parameters()`` and ``named_buffers()`` for a
         top-level FSDP-wrapped model matches their behavior for the equivalent
@@ -440,6 +505,10 @@ class TestUnshardParams(TestUnshardParamsBase):
         )
 
     def _test_named_parameters_and_buffers(self, prefix: str, recurse: bool):
+        # [FUNCTION DOC] HELPER: Inside summon_full_params of a top-level FSDP model,
+        # checks that named_parameters and named_buffers called with the given prefix and
+        # recurse yield the same names and values as a plain non-FSDP model of the same
+        # architecture (both get an extra buffer).
         model = NestedWrappedModule.init(
             self.process_group,
             FSDPInitMode.NO_FSDP,
@@ -471,6 +540,9 @@ class TestUnshardParams(TestUnshardParamsBase):
 
     @skip_if_lt_x_gpu(2)
     def test_with_grads_core(self):
+        # [FUNCTION DOC] Runs the with_grads core subtest body over writeback,
+        # offload_to_cpu, sharding strategy (full shard, shard grad op, no shard) and
+        # use_orig_params true. Needs 2 GPUs.
         """
         Tests the core usage of``with_grads=True`` by comparing against DDP as
         the unsharded equivalent.
@@ -496,11 +568,22 @@ class TestUnshardParams(TestUnshardParamsBase):
         sharding_strategy: ShardingStrategy,
         use_orig_params: bool,
     ):
+        # [FUNCTION DOC] HELPER: Compares FSDP gradients seen inside summon_full_params
+        # with with_grads against a DDP model, both after backward and between forward and
+        # backward. Configurations that are unsupported (not use_orig_params, or
+        # offload_to_cpu) must raise NotImplementedError. Gradient edits made inside the
+        # context (scaled by 2) must persist only if writeback is set, or for NO_SHARD
+        # without CPU offload; the DDP grads are scaled in the same case for parity.
         def _check_grads(
             ddp_model: DDP,
             fsdp_model: FSDP,
             old_fsdp_grads: list[torch.Tensor] | None,
         ):
+            # [FUNCTION DOC] HELPER: Inside summon_full_params with with_grads,
+            # asserts each FSDP parameter gradient matches the DDP gradient (and is
+            # non-zero), doubles the FSDP gradients, then checks the doubled values
+            # persisted or the old ones remain depending on writeback and strategy;
+            # doubles DDP grads when they persisted. Raises on mismatch.
             """
             Checks that writes to the FSDP parameters' gradients persist or do
             not persist depending on ``writeback`` and the sharding strategy.
@@ -546,6 +629,8 @@ class TestUnshardParams(TestUnshardParamsBase):
                     param.grad *= WRITEBACK_FACTOR
 
         def _get_error_context(is_supported: bool):
+            # [FUNCTION DOC] HELPER: Returns a no-op context when the configuration is
+            # supported, otherwise a context that expects NotImplementedError.
             return (
                 contextlib.nullcontext()
                 if is_supported
@@ -553,6 +638,8 @@ class TestUnshardParams(TestUnshardParamsBase):
             )  # some configs are not implemented yet
 
         def _get_fsdp_grads(fsdp_model: FSDP, is_supported: bool):
+            # [FUNCTION DOC] HELPER: Returns a list of cloned non-None parameter
+            # gradients when supported, else None.
             if is_supported:
                 return [
                     param.grad.clone()
@@ -605,6 +692,8 @@ class TestUnshardParams(TestUnshardParamsBase):
 
     @skip_if_lt_x_gpu(2)
     def test_with_grads_none_grads(self):
+        # [FUNCTION DOC] Runs the none-grads subtest body over the three sharding
+        # strategies. Needs 2 GPUs.
         """
         Tests that if all ranks' ``FlatParameter`` has ``None`` gradient, then
         each original parameter sees ``None`` gradient as well.
@@ -621,6 +710,9 @@ class TestUnshardParams(TestUnshardParamsBase):
         )
 
     def _test_with_grads_none_grads(self, sharding_strategy: ShardingStrategy):
+        # [FUNCTION DOC] HELPER: With a recursively wrapped model before any backward,
+        # checks every flat parameter gradient is None and then that every original
+        # parameter gradient is also None inside summon_full_params with with_grads.
         fsdp_model = TransformerWithSharedParams.init(
             self.process_group,
             FSDPInitMode.RECURSIVE,
@@ -642,6 +734,9 @@ class TestUnshardParams(TestUnshardParamsBase):
 
     @skip_if_lt_x_gpu(2)
     def test_unshard_submodule(self):
+        # [FUNCTION DOC] Wraps each nested Sequential in its own FSDP and unshards only
+        # the first one: its parameter names must not contain the flat parameter name and
+        # it must expose more than one original parameter. Needs 2 GPUs.
         model = nn.Sequential(
             nn.Sequential(nn.Linear(16, 16), nn.Linear(16, 16)),
             nn.Sequential(nn.Linear(16, 16), nn.Linear(16, 16)),
@@ -655,12 +750,16 @@ class TestUnshardParams(TestUnshardParamsBase):
 
 
 class TestUnshardParamsNoShard(TestUnshardParamsBase):
+    # [CLASS DOC] Single-rank (world size 1, no real sharding) variant of the unshard-params tests.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] Property: number of ranks, fixed at 1.
         return 1
 
     @skip_if_lt_x_gpu(1)
     def test_unshard_params_writeback_no_shard(self):
+        # [FUNCTION DOC] Runs the writeback subtest body over the shared writeback option
+        # grid on one rank.
         """Tests the ``writeback`` argument (using default for all others)."""
         self.run_subtests(
             self._get_test_unshard_params_writeback_config(),
@@ -669,6 +768,9 @@ class TestUnshardParamsNoShard(TestUnshardParamsBase):
 
     @skip_if_lt_x_gpu(1)
     def test_unshard_params_param_data_no_shard(self):
+        # [FUNCTION DOC] Runs the param-data subtest body over the shared option grid on
+        # one rank, with offload_to_cpu restricted to false because it is unsupported with
+        # NO_SHARD.
         """
         Tests that parameters are exposed correctly for ``recurse=True`` and
         all other argument configs for a non-FSDP root module.
@@ -684,18 +786,30 @@ class TestUnshardParamsNoShard(TestUnshardParamsBase):
 
 
 class TestUnshardParamsErrors(TestUnshardParamsBase):
+    # [CLASS DOC] Two-rank tests checking the errors raised by invalid summon_full_params
+    # usage.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] Property: number of ranks, fixed at 2.
         return 2
 
     @skip_if_lt_x_gpu(2)
     def test_unshard_params_from_forward_raises(self):
+        # [FUNCTION DOC] Defines a module whose forward calls summon_full_params; running
+        # it under FSDP must raise an AssertionError saying manual unshard is not allowed
+        # during forward/backward. Needs 2 GPUs.
         class MyModule(nn.Module):
+            # [CLASS DOC] HELPER: Test module with one parameter whose forward enters
+            # summon_full_params on the module passed in, to trigger the forward-time
+            # error.
             def __init__(self) -> None:
+            # [FUNCTION DOC] HELPER: Creates a single zero parameter of length 5.
                 super().__init__()
                 self.a = nn.Parameter(torch.zeros(5))
 
             def forward(self, fsdp_module):
+            # [FUNCTION DOC] HELPER: Enters and leaves summon_full_params on the given
+            # FSDP module; returns nothing.
                 with fsdp_module.summon_full_params(fsdp_module):
                     pass
 
@@ -707,10 +821,15 @@ class TestUnshardParamsErrors(TestUnshardParamsBase):
 
     @skip_if_lt_x_gpu(2)
     def test_unshard_params_from_backward_raises(self):
+        # [FUNCTION DOC] Registers a backward hook on the output that calls
+        # summon_full_params; backward must raise an AssertionError that manual unshard is
+        # not allowed during forward/backward.
         model = FSDP(nn.Linear(2, 1, device=device_type.type))
         output = model(torch.ones(2, device=device_type.type))
 
         def invalid_backward_hook(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Backward hook that enters summon_full_params on the
+        # model, which is the invalid call under test.
             with FSDP.summon_full_params(model):
                 pass
 
@@ -723,6 +842,8 @@ class TestUnshardParamsErrors(TestUnshardParamsBase):
 
     @skip_if_lt_x_gpu(2)
     def test_rank0_only_with_writeback_raises(self):
+        # [FUNCTION DOC] Checks that summon_full_params with rank0_only and writeback
+        # together raises NotImplementedError mentioning it is not supported.
         nested_wrapped_module = NestedWrappedModule.init(
             self.process_group,
             FSDPInitMode.RECURSIVE,
@@ -736,6 +857,10 @@ class TestUnshardParamsErrors(TestUnshardParamsBase):
 
     @skip_if_lt_x_gpu(2)
     def test_offload_to_cpu_no_shard_raises(self):
+        # [FUNCTION DOC] Wraps a nested model with NO_SHARD and calls summon_full_params
+        # with rank0_only and writeback, expecting NotImplementedError. KNOWN ISSUE:
+        # despite the name, the call does not pass offload_to_cpu, so it duplicates the
+        # rank0_only plus writeback test and does not test CPU offload with NO_SHARD.
         nested_wrapped_module = NestedWrappedModule.init(
             self.process_group,
             FSDPInitMode.RECURSIVE,

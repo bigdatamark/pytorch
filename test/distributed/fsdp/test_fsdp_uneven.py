@@ -1,4 +1,9 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Test that FSDP gives correct forward output and one-step SGD weight update when a
+# parameter cannot be divided evenly across ranks (3x3 linear weight sharded over the world size).
+# Import-time side effects: exits the process if distributed is unavailable or dev-asan is on;
+# sets a module-level device_type from get_devtype; and instantiates device-specific test classes
+# for cuda, hpu and xpu.
 
 import sys
 
@@ -28,7 +33,15 @@ device_type = torch.device(get_devtype())
 
 
 class TestUnevenParamShard(FSDPTestContinuous):
+    # [CLASS DOC] Multi-process FSDP test case for uneven parameter sharding. Has a helper
+    # computing non-FSDP reference results and one test comparing FSDP against them.
     def _get_ref_results(self, device, model, input, my_lr):
+        # [FUNCTION DOC] HELPER: Computes reference results without FSDP, under no-grad.
+        # Returns a pair: this rank's forward output (its input row times the transposed
+        # weight) and the expected transposed weight after one SGD step, where the
+        # gradient is the sum of the first world_size input rows averaged over the world
+        # size. The device argument is unused; the module-level device_type is used
+        # instead.
         with torch.no_grad():
             # Compute one iteration local output.
             weight = model.weight.T.clone().to(device_type)
@@ -43,6 +56,10 @@ class TestUnevenParamShard(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(2)
     def test_one_iteration(self, device):
+        # [FUNCTION DOC] Runs one training step of a bias-free 3x3 linear layer wrapped in
+        # FSDP (forward, backward on the summed output, SGD step, zero grad), then gathers
+        # full params and asserts the output matches this rank's reference output and the
+        # gathered weight matches the reference updated weight. Needs at least 2 GPUs.
         """Test FSDP with uneven divide of parameter shards."""
         model = Linear(3, 3, bias=False)
         input = torch.rand(self.world_size, 3)

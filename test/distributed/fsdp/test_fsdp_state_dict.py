@@ -1,4 +1,12 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests for FSDP state dict handling: full, local (flattened) and sharded state dict
+# types. Covers save/load round trips with activation checkpoint wrappers, shared parameters and
+# modules, rank0-only plus CPU offload, fp16 and mixed precision, buffers, ignored modules,
+# skipped modules, loading into plain local modules, key names, torch.save/load, multi-backend
+# process groups, world size one, empty ranks, config type errors, and 4-GPU local state dict
+# resharding. Import-time side effects: exits the process if distributed is unavailable or dev-
+# asan is on; defines module constants (shapes, state dict type name mapping) and device_type from
+# the current accelerator (or cpu); registers parametrized tests for TestFSDPStateDict.
 
 import io
 import itertools
@@ -101,6 +109,10 @@ device_type = acc.type if (acc := torch.accelerator.current_accelerator()) else 
 
 
 class Model(Module):
+    # [CLASS DOC] HELPER: Small model with an inner linear (4x4) and outer linear (4x5),
+    # optionally with FSDP wrapping the inner one, with persistent and non-persistent buffers
+    # on both, ignored-module and fp16 mixed precision options. The forward applies the inner
+    # layer twice on the same input.
     def __init__(
         self,
         wrap_fsdp,
@@ -109,6 +121,10 @@ class Model(Module):
         mixed_precision=False,
         process_group=None,
     ):
+        # [FUNCTION DOC] HELPER: Builds the layers. Inner is wrapped in FSDP when
+        # requested (optionally ignoring itself and using fp16 mixed precision for params,
+        # reduce and buffers, on the given process group). When register_buffers is set,
+        # adds a persistent buffer and a non-persistent buffer to both layers.
         super().__init__()
         self.inner = Linear(*INNER_SHAPE)
         if register_buffers:
@@ -137,6 +153,8 @@ class Model(Module):
             )
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Runs the inner layer twice on the input, sums the two
+        # results and applies the outer layer.
         # Forward twice.
         i = self.inner(x)
         j = self.inner(x)
@@ -144,7 +162,13 @@ class Model(Module):
 
 
 class TestDummyModel(torch.nn.Module):
+    # [CLASS DOC] HELPER: Seeded small model with shared pieces: net3 is the same module as
+    # net2, and shared_parameter is the same parameter as random_parameter. Used to check
+    # shared state dict entries.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Seeds the RNG with 0, then builds two linear+relu blocks,
+        # the aliasing net3 and shared_parameter, and an uninitialized parameter of 10
+        # elements.
         super().__init__()
         torch.manual_seed(0)
         self.net1 = nn.Sequential(nn.Linear(8, 16), nn.ReLU())
@@ -154,21 +178,35 @@ class TestDummyModel(torch.nn.Module):
         self.shared_parameter = self.random_parameter
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies net1, then net2, then net3 (the same module as
+        # net2) to the input.
         return self.net3(self.net2(self.net1(x)))
 
     def get_input(self):
+        # [FUNCTION DOC] HELPER: Returns a random 8x8 input tensor on the test device.
         return torch.rand(8, 8, device=device_type)
 
 
 class TestFSDPStateDict(FSDPTest):
+    # [CLASS DOC] Two-GPU test case for FSDP state_dict and load_state_dict across the full,
+    # local and sharded state dict types. Holds model factory helpers (simple, nested, multi-
+    # buffer, non-FSDP root), a state dict context helper, comparison helpers and the tests
+    # that use them.
     @property
     def world_size(self):
+        # [FUNCTION DOC] Property: number of ranks, the smaller of the accelerator count
+        # and 2.
         return min(torch.accelerator.device_count(), 2)
 
     def _broadcast_state_dict(self, state_dict):
+        # [FUNCTION DOC] HELPER: Broadcasts the given state dict from rank 0 to all ranks
+        # via the shared test utility and returns the result.
         return _broadcast_state_dict(self.rank, state_dict)
 
     def _state_compare(self, model, model_new, assert_fn, state_generator="parameters"):
+        # [FUNCTION DOC] HELPER: Gets the lists of parameters (or buffers) of both models,
+        # asserts their lengths match, then applies the given assertion function to the
+        # two lists.
         state_base = list(getattr(model, state_generator)())
         state_new = list(getattr(model_new, state_generator)())
         # Regardless of `assert_fn`, the number of parameters should be the same
@@ -178,6 +216,11 @@ class TestFSDPStateDict(FSDPTest):
     def _compare_models(
         self, model, model_new, assert_fn, check_fp16=False, check_buffers=True
     ):
+        # [FUNCTION DOC] HELPER: Inside summon_full_params of both models, compares
+        # parameters (and buffers when either model has buffers and check_buffers is set)
+        # with the given assertion function, which must be assertEqual or assertNotEqual
+        # (raises AssertionError otherwise). With check_fp16, also asserts all parameters
+        # of the new model are float16.
         if assert_fn not in (self.assertEqual, self.assertNotEqual):
             raise AssertionError(
                 f"Expected assert_fn in (self.assertEqual, self.assertNotEqual), got {assert_fn}"
@@ -200,6 +243,11 @@ class TestFSDPStateDict(FSDPTest):
     def _get_simple_nested_model(
         self, *fsdp_args, wrap=True, checkpoint_wrap=False, **fsdp_kwargs
     ):
+        # [FUNCTION DOC] HELPER: Returns a model of two bias-free 10x10 linears. With wrap
+        # set, the first linear is wrapped in FSDP and the pair is wrapped in FSDP again,
+        # passing along the given FSDP arguments; with checkpoint_wrap, the linears and
+        # the sequence get checkpoint wrappers before FSDP. Without wrap, returns the
+        # plain sequence.
         if wrap:
             lin1 = nn.Linear(10, 10, bias=False).to(device_type)
             lin2 = nn.Linear(10, 10, bias=False).to(device_type)
@@ -218,6 +266,9 @@ class TestFSDPStateDict(FSDPTest):
         return model
 
     def _get_simple_model(self, *fsdp_args, checkpoint_wrap=False, **fsdp_kwargs):
+        # [FUNCTION DOC] HELPER: Returns a single bias-free 10x10 linear on the device
+        # wrapped in FSDP with the given arguments, with a checkpoint wrapper applied
+        # underneath when requested.
         lin = nn.Linear(10, 10, bias=False).to(device_type)
         if checkpoint_wrap:
             lin = checkpoint_wrapper(lin)
@@ -227,6 +278,11 @@ class TestFSDPStateDict(FSDPTest):
     def _get_multibuffer_nested_model(
         self, *fsdp_args, wrap=True, checkpoint_wrap=False, **fsdp_kwargs
     ):
+        # [FUNCTION DOC] HELPER: Like the simple nested model but with a batch norm layer
+        # between two linears. The linear FSDP uses the given mixed precision (popped from
+        # kwargs); the batch norm FSDP uses float32 for everything when mixed precision
+        # was given, otherwise none. Optional checkpoint wrapping and wrap switch behave
+        # as in the simple nested model.
         full_p = torch.float32
         lin_mp = fsdp_kwargs.pop("mixed_precision", None)
         bn_mp = (
@@ -259,14 +315,23 @@ class TestFSDPStateDict(FSDPTest):
         return model
 
     def _get_non_fsdp_root_module(self, *fsdp_args, wrap=True, **fsdp_kwargs):
+        # [FUNCTION DOC] HELPER: Builds a container module whose root is not FSDP: a plain
+        # linear followed by two independently built nested models (FSDP wrapped unless
+        # wrap is false). Returns it.
         class FSDPContainer(nn.Module):
+            # [CLASS DOC] HELPER: Module chaining a plain linear and two sub-models in
+            # order.
             def __init__(self, fsdp_1, fsdp_2):
+                # [FUNCTION DOC] HELPER: Creates the plain bias-free 10x10 linear
+                # and stores the two sub-models.
                 super().__init__()
                 self.non_fsdp_lin = nn.Linear(10, 10, bias=False).to(device_type)
                 self.fsdp_1 = fsdp_1
                 self.fsdp_2 = fsdp_2
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the plain linear, then the first
+                # and second sub-models.
                 x = self.non_fsdp_lin(x)
                 x = self.fsdp_1(x)
                 x = self.fsdp_2(x)
@@ -283,6 +348,11 @@ class TestFSDPStateDict(FSDPTest):
         state_dict_type: str,
         state_dict_rank0_and_offload: bool,
     ):
+        # [FUNCTION DOC] HELPER: Returns the context manager from FSDP.state_dict_type for
+        # the model with the state dict type named by the string (full, local or sharded)
+        # and a matching config. The flag sets rank0_only and offload_to_cpu for the full
+        # config, and offload_to_cpu for the others. Raises ValueError for an unsupported
+        # type name.
         _state_dict_type = STATE_DICT_MAPPING[state_dict_type]
         if state_dict_type == "state_dict":
             config = FullStateDictConfig(
@@ -304,6 +374,10 @@ class TestFSDPStateDict(FSDPTest):
     def _validate_state_dict_contents(
         self, model, fsdp_state_dict, state_dict_rank0_and_offload, ignore_keys=None
     ):
+        # [FUNCTION DOC] HELPER: When the rank0-and-offload flag is set: on rank 0 asserts
+        # the state dict is non-empty and every entry (except ignored keys) is on CPU; on
+        # other ranks asserts the state dict is empty if the model is an FSDP instance.
+        # Does nothing otherwise.
         if state_dict_rank0_and_offload:
             if self.rank == 0:
                 self.assertNotEqual(fsdp_state_dict, {})
@@ -335,11 +409,18 @@ class TestFSDPStateDict(FSDPTest):
     def test_fsdp_state_dict_with_activation_checkpoint(
         self, state_dict_type, checkpoint_wrap, rank0_only_and_offload
     ):
+        # [FUNCTION DOC] Saves a state dict of a simple or nested FSDP model, then loads
+        # it into a freshly built and zeroed model, with checkpoint wrappers applied to
+        # the source, destination or both (before or after FSDP wrapping, via activation
+        # checkpointing). Checks models differ before loading and match after a strict
+        # load, broadcasting from rank 0 when rank0 only is used. Needs 2 GPUs.
         """Tests saving the state dict, zeroing a target model's parameters, and
         loading the state dict, where the source and target models may have a
         checkpoint wrapper."""
 
         def apply_ac_to_linears(model) -> None:
+            # [FUNCTION DOC] HELPER: Applies non-reentrant activation checkpointing to
+            # every linear submodule of the model.
             non_reentrant_wrapper = partial(
                 checkpoint_wrapper,
                 offload_to_cpu=False,
@@ -385,6 +466,11 @@ class TestFSDPStateDict(FSDPTest):
         state_dict_type: str,
         rank0_only_and_offload: bool,
     ):
+        # [FUNCTION DOC] Builds a transformer with shared params twice, wrapping layers
+        # with FSDP manually, once with a checkpoint wrapper inside each FSDP. Saves both
+        # state dicts, asserts the keys are identical, loads each back, and compares the
+        # models. Returns early for sharded state dict with rank0 and offload
+        # (unsupported). Needs 2 GPUs.
         """
         Tests saving and loading a state dict for a model manually wrapped with
         ``FSDP(CheckpointWrapper(module))``, where the ``CheckpointWrapper`` is
@@ -443,6 +529,10 @@ class TestFSDPStateDict(FSDPTest):
     @skip_if_lt_x_gpu(2)
     @parametrize("state_dict_type", _SUPPORTED_STATE_DICT_IMPLS)
     def test_state_dict_with_shared_parameters(self, state_dict_type):
+        # [FUNCTION DOC] Wraps a shared-parameter transformer with a policy on encoder and
+        # decoder layers, saves its state dict and loads it into a second zeroed model
+        # (including buffers); only checks that saving and loading raise no error. Needs 2
+        # GPUs.
         auto_wrap_policy = ModuleWrapPolicy(
             {TransformerEncoderLayer, TransformerDecoderLayer}
         )
@@ -466,6 +556,11 @@ class TestFSDPStateDict(FSDPTest):
     @skip_if_lt_x_gpu(2)
     @parametrize("use_orig_params", [False, True])
     def test_state_dict_rank0_offload_save_load_flow(self, use_orig_params: bool):
+        # [FUNCTION DOC] Emulates a rank0-only checkpoint flow: saves a full state dict to
+        # CPU on rank 0 only from an FSDP model with nonzero tensors, loads it into a
+        # plain model on rank 0 only (other ranks differ), wraps it with FSDP with
+        # sync_module_states, and checks that all ranks agree and match the original
+        # model. Parametrized on use_orig_params. Needs 2 GPUs.
         """Tests saving a model checkpoint only on rank 0 and loading it only
         on rank 0 with ``sync_module_states=True`` to emulate the workflow to
         avoid redundant CPU memory usage."""
@@ -545,6 +640,11 @@ class TestFSDPStateDict(FSDPTest):
         state_dict_rank0_and_offload: bool,
         use_orig_params: bool,
     ):
+        # [FUNCTION DOC] Saves a state dict from a root-less, nested or simple FSDP model
+        # (with optional fp16, CPU offload and rank0 offload), validates contents and
+        # dtype, loads it into a zeroed copy and checks models match. Returns early for
+        # combinations that are not supported (rank0 offload with non-full types, or
+        # use_orig_params with local state dict). Needs 2 GPUs.
         """
         Tests that we can save a state_dict and load it into a blank model
         with various configs such as fp16 and cpu offload and parameters
@@ -644,6 +744,10 @@ class TestFSDPStateDict(FSDPTest):
         state_dict_rank0_and_offload: bool,
         use_orig_params: bool,
     ):
+        # [FUNCTION DOC] Like the basic save/load test but for a model with linear and
+        # batch norm buffers, optionally with fp16 mixed precision: saves the state dict,
+        # validates it, loads it into a zeroed copy and checks that parameters and buffers
+        # match. Unsupported combinations return early. Needs 2 GPUs.
         """
         Tests that we can save a state_dict and load it for modules with persistent buffers, including
         in the context of non-default mixed precision, different ``state_dict_type`` s and CPU offloading.
@@ -701,6 +805,11 @@ class TestFSDPStateDict(FSDPTest):
     def test_save_and_load_after_forward_state_dict(
         self, state_dict_type, mixed_precision, state_dict_rank0_and_offload
     ):
+        # [FUNCTION DOC] Trains a nested model for six steps (optionally with fp16 mixed
+        # precision), checks the loss dtype and that parameters changed, saves a copy of
+        # the state dict (cloning the tensors), checks the saved dtype is float32, zeroes
+        # the model, loads the state dict and checks the full parameters equal the trained
+        # ones. Returns early for rank0 offload with non-full types. Needs 2 GPUs.
         """
         Test that saving after some training results in params being updated as
         expected.
@@ -768,6 +877,9 @@ class TestFSDPStateDict(FSDPTest):
         wrap_ddp: bool = True,
         register_buffers: bool = False,
     ):
+        # [FUNCTION DOC] HELPER: Seeds the RNG and builds the test Model on the device.
+        # Wraps in FSDP if wrap_fsdp is set, else in DistributedDataParallel if wrap_ddp
+        # is set, else returns the plain model.
         # keep everything deterministic for input data
         torch.manual_seed(0)
 
@@ -780,6 +892,8 @@ class TestFSDPStateDict(FSDPTest):
 
     @staticmethod
     def _state_dict(model: Module, state_dict_type: str):
+        # [FUNCTION DOC] HELPER: Static. Returns the model state dict under the given type
+        # name; raises ValueError for an unknown name.
         try:
             enum_val = STATE_DICT_MAPPING[state_dict_type]
         except KeyError as e:
@@ -792,6 +906,9 @@ class TestFSDPStateDict(FSDPTest):
     def _load_state_dict(
         model: Module, state_dict_type: str, state_dict: dict[str, Any]
     ):
+        # [FUNCTION DOC] HELPER: Static. Strict-loads the state dict into the model under
+        # the given type name and returns the load result; raises ValueError for an
+        # unknown name.
         try:
             enum_val = STATE_DICT_MAPPING[state_dict_type]
         except KeyError as e:
@@ -803,6 +920,10 @@ class TestFSDPStateDict(FSDPTest):
     def _dist_train(
         self, wrap_fsdp: bool, state_dict_type: str = "", move_to_cpu: bool = False
     ):
+        # [FUNCTION DOC] HELPER: Trains the test model with SGD for three steps on random
+        # data (FSDP wrapped or DDP wrapped). For FSDP, saves the state dict (optionally
+        # moving tensors to CPU), loads it into a zeroed blank FSDP model and returns its
+        # full parameters; otherwise returns the parameter list of the DDP model.
         # TODO: Move this test to common_fsdp.
         model = self._initialize_model(wrap_fsdp)
         optim = SGD(model.parameters(), lr=0.1)
@@ -838,6 +959,8 @@ class TestFSDPStateDict(FSDPTest):
     @skip_if_lt_x_gpu(2)
     @parametrize("state_dict_type", _SUPPORTED_STATE_DICT_IMPLS)
     def test_state_dict_save_load_flow(self, state_dict_type):
+        # [FUNCTION DOC] Runs the save/load flow subtest for the given state dict type
+        # with and without moving the saved tensors to CPU. Needs 2 GPUs.
         self.run_subtests(
             {"move_to_cpu": [True, False]},
             self._test_state_dict_save_load_flow,
@@ -845,6 +968,8 @@ class TestFSDPStateDict(FSDPTest):
         )
 
     def _test_state_dict_save_load_flow(self, state_dict_type, move_to_cpu):
+        # [FUNCTION DOC] HELPER: Asserts that parameters from FSDP training followed by a
+        # state dict save and load equal parameters from the DDP training.
         fsdp_params = self._dist_train(
             wrap_fsdp=True,
             state_dict_type=state_dict_type,
@@ -856,6 +981,9 @@ class TestFSDPStateDict(FSDPTest):
     @skip_if_lt_x_gpu(2)
     @parametrize("state_dict_type", _SUPPORTED_STATE_DICT_IMPLS)
     def test_fsdp_state_dict_keys(self, state_dict_type):
+        # [FUNCTION DOC] Checks key names of the state dict: for local state dict only the
+        # flat parameter names (root and inner), for full and sharded the same keys as an
+        # unwrapped local model. Needs 2 GPUs.
         state_dict = self._state_dict(self._initialize_model(True), state_dict_type)
         if state_dict_type == "local_state_dict":
             self.assertEqual({FLAT_PARAM, f"inner.{FLAT_PARAM}"}, state_dict.keys())
@@ -877,6 +1005,10 @@ class TestFSDPStateDict(FSDPTest):
         state_dict_rank0_and_offload,
         fsdp_root,
     ):
+        # [FUNCTION DOC] Trains an FSDP (or non-FSDP-root) model, takes a full or sharded
+        # state dict (optionally rank0 and offload), validates it, loads it strictly into
+        # a zeroed non-FSDP model and checks the parameters equal the trained FSDP ones.
+        # Returns early for rank0 offload with sharded type. Needs 2 GPUs.
         """
         Tests that FSDP's state_dict can be loaded into a local model.
         """
@@ -950,9 +1082,19 @@ class TestFSDPStateDict(FSDPTest):
     @parametrize("state_dict_type", _SUPPORTED_STATE_DICT_IMPLS)
     @parametrize("double_nest", [True])
     def test_state_dict_skip_module(self, state_dict_type, double_nest):
+        # [FUNCTION DOC] Wraps a SkipModel while temporarily removing one inner linear so
+        # FSDP skips it, then checks the state dict keys (full and sharded, rank 0) equal
+        # those of the unwrapped model, loads it into a second FSDP and into a local model
+        # and compares parameters. Needs 2 GPUs.
+        # KNOWN ISSUE: a TODO notes skipped parameters should be excluded from
+        # FSDP.state_dict but this is not asserted.
         torch.accelerator.set_device_index(self.rank)
 
         def _create_module(wrap_fsdp=True):
+            # [FUNCTION DOC] HELPER: Builds a SkipModel (optionally under an FSDP wrap
+            # context), removes the skipped linear attribute, wraps the rest,
+            # reattaches the linear, and returns the wrapped module along with the
+            # names of parameters that belong to the skipped linear.
             LINEAR_SKIP = "linear_skip"
             ctx = enable_wrap(wrapper_cls=FSDP) if wrap_fsdp else nullcontext()
             with ctx:
@@ -1021,6 +1163,9 @@ class TestFSDPStateDict(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_wrong_state_dict_config(self):
+        # [FUNCTION DOC] Checks that setting a full state dict type with a local state
+        # dict config raises a RuntimeError mentioning the expected config type. Needs 2
+        # GPUs.
         model = FSDP(Model(wrap_fsdp=True).to(device_type))
         with self.assertRaisesRegex(RuntimeError, "Expected state_dict_config of type"):
             with model.state_dict_type(
@@ -1036,6 +1181,11 @@ class TestFSDPStateDict(FSDPTest):
     def test_state_dict_with_ignored_modules(
         self, state_dict_type, prefix, ignore_inner, mixed_precision
     ):
+        # [FUNCTION DOC] Wraps a model with ignored modules (outer, optionally inner) and
+        # optional fp16 mixed precision, saves the state dict with an optional key prefix,
+        # and checks that ignored parameters and all buffers are not cloned (same data
+        # pointer), buffers stay float32, the state dict loads into an unwrapped model,
+        # and a second save keeps the same data pointers. Needs 2 GPUs.
         # Initialize an FSDP-wrapped model with an ignored module that includes
         # both parameters and a buffer
         model = Model(
@@ -1130,6 +1280,9 @@ class TestFSDPStateDict(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_state_dict_type(self):
+        # [FUNCTION DOC] Checks that entering and leaving the state_dict_type context
+        # restores the default (full) state dict type on every FSDP submodule. Needs 2
+        # GPUs.
         module = SkipModel(double_nest=True)
         with enable_wrap(wrapper_cls=FSDP):
             fsdp = wrap(module)
@@ -1140,13 +1293,22 @@ class TestFSDPStateDict(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_local_state_dict_with_empty_ranks(self):
+        # [FUNCTION DOC] Uses a one-element parameter so that on world size 2 one rank has
+        # an empty shard. With local state dict, saves a state dict, changes the
+        # parameter, loads it back and checks the original value returns. Needs 2 GPUs.
         class Model(Module):
+            # [CLASS DOC] HELPER: Module with a one-element scalar parameter whose
+            # forward returns the parameter.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates a one-element tensor and a
+                # parameter holding it.
                 super().__init__()
                 self.my_tensor = torch.full((1,), 3.1415926)
                 self.my_parameter = nn.Parameter(self.my_tensor)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Ignores the input and returns the
+                # parameter.
                 return self.my_parameter
 
         model = FSDP(Model().to(device_type))
@@ -1166,6 +1328,10 @@ class TestFSDPStateDict(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_torch_save_load(self):
+        # [FUNCTION DOC] Saves a local state dict to an in-memory buffer with torch.save
+        # and reloads it with safe globals for the sharded tensor classes, then checks
+        # every entry equals the original (comparing local shards for sharded tensors).
+        # Needs 2 GPUs.
         model = Model(wrap_fsdp=True).to(device_type)
         with FSDP.state_dict_type(model, StateDictType.LOCAL_STATE_DICT):
             state_dict = model.state_dict()
@@ -1197,6 +1363,8 @@ class TestFSDPStateDict(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_shared_module_and_shared_parameter(self):
+        # [FUNCTION DOC] Checks that a full state dict of a model with a shared parameter
+        # and a shared module holds equal values for the aliased entries. Needs 2 GPUs.
         model = FSDP(TestDummyModel().to(device_type))
         with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT):
             state_dict = model.state_dict()
@@ -1208,6 +1376,9 @@ class TestFSDPStateDict(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_full_state_dict_missing_unexpected_keys_cleaned(self):
+        # [FUNCTION DOC] Removes one key and adds an unexpected key to a state dict and
+        # loads it non-strictly, checking exactly one missing and one unexpected key are
+        # reported and neither contains the FSDP internal prefix. Needs 2 GPUs.
         model = self._get_simple_nested_model()
         sd = model.state_dict()
         # Create a missing key
@@ -1226,6 +1397,10 @@ class TestFSDPStateDict(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_sharded_load_multi_backend_pg(self):
+        # [FUNCTION DOC] Creates a process group that spans cpu via gloo and the device
+        # backend, builds a transformer in it, saves a sharded state dict, zeroes
+        # parameters, optionally moves the state dict to CPU, loads it and checks
+        # parameters are restored. Needs 2 GPUs.
         auto_wrap_policy = ModuleWrapPolicy(
             {TransformerEncoderLayer, TransformerDecoderLayer}
         )
@@ -1265,6 +1440,9 @@ class TestFSDPStateDict(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_world_size_one(self):
+        # [FUNCTION DOC] Creates a single-rank process group per rank, builds a model on
+        # it, and saves and loads a sharded state dict without error, then barriers on the
+        # default group. Needs 2 GPUs.
         my_pg = None
         for i in range(self.world_size):
             pg = dist.new_group(ranks=[i])
@@ -1284,12 +1462,20 @@ class TestFSDPStateDict(FSDPTest):
 
 
 class TestFSDPStateDict4GPUs(FSDPTest):
+    # [CLASS DOC] Four-GPU test case for state dict behavior that needs more ranks than the
+    # main test case (local state dict resharding).
     @property
     def world_size(self):
+        # [FUNCTION DOC] Property: number of ranks, all accelerator devices.
         return torch.accelerator.device_count()
 
     @skip_if_lt_x_gpu(4)
     def test_local_state_dict_reshard(self):
+        # [FUNCTION DOC] Trains one step on 4 ranks, takes a local (sharded flat
+        # parameter) state dict, and mimics resharding to 2 ranks by all-gathering each
+        # sharded tensor and re-chunking it over a new 2-rank group. Loads this into a
+        # model on the new group and checks that the full state dicts of the original and
+        # resharded models are equal on ranks 0 and 1. Needs 4 GPUs.
         """
         This test demonstrates the ability to do resharding when using
         local_state_dict. Although we do not recommend users to use

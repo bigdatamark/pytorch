@@ -1,4 +1,11 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests combining tensor parallelism (DTensor based TP) with FSDP on a 2-D device
+# mesh (data parallel x tensor parallel). Compares an FSDP-only model to a TP+FSDP model on
+# forward output, gradients and post-step output; checks communication counts and absence of NaN
+# gradients for a TP model with a custom RMSNorm; and checks sync_module_states on DTensor
+# parameters and buffers. Defines a small model and helpers. Import-time side effects: exits the
+# process if distributed is unavailable or dev-asan is on; sets module-level device_type to the
+# current accelerator type or cpu.
 import copy
 import sys
 from collections import OrderedDict
@@ -52,7 +59,12 @@ device_type = acc.type if (acc := torch.accelerator.current_accelerator()) else 
 
 
 class SimpleModel(torch.nn.Module):
+    # [CLASS DOC] Small three-linear-layer model (net1, relu, net2, net3) used as the
+    # reference for TP sharding tests. net1 and net2 are the layers sharded by TP; net3 is
+    # left unsharded.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates the layers: net1 (5 to 8), a ReLU, net2 (8 to 4)
+        # and net3 (4 to 12).
         super().__init__()
         self.net1 = torch.nn.Linear(5, 8)
         self.relu = torch.nn.ReLU()
@@ -60,23 +72,37 @@ class SimpleModel(torch.nn.Module):
         self.net3 = torch.nn.Linear(4, 12)
 
     def forward(self, x):
+        # [FUNCTION DOC] Runs the input through net1, relu, net2 and net3 in order and
+        # returns the result.
         return self.net3(self.net2(self.relu(self.net1(x))))
 
     @staticmethod
     def get_sharded_param_names() -> list[str]:
+        # [FUNCTION DOC] HELPER: Returns the names of parameters that tensor parallelism
+        # shards: net1 weight and bias, and net2 weight.
         return ["net1.weight", "net1.bias", "net2.weight"]
 
     @staticmethod
     def get_non_sharded_param_names() -> list[str]:
+        # [FUNCTION DOC] HELPER: Returns the names of parameters TP does not shard: net3
+        # weight and bias.
         return ["net3.weight", "net3.bias"]
 
 
 def distribute_rmsnorm(module, device_mesh):
+    # [FUNCTION DOC] HELPER: Applies distribute_module to the given module on the device mesh
+    # with hooks that convert the local input into a DTensor sharded on dimension 0 and
+    # convert the output back to a local tensor. Returns the module returned by
+    # distribute_module.
     def prepare_input_fn(mod, inputs, device_mesh):
+        # [FUNCTION DOC] HELPER: Input hook: wraps the first input as a DTensor sharded on
+        # dim 0 over the mesh.
         shard_tensor = DTensor.from_local(inputs[0], device_mesh, [Shard(0)])
         return shard_tensor
 
     def prepare_output_fn(mod, outputs, device_mesh):
+        # [FUNCTION DOC] HELPER: Output hook: returns the local tensor of the DTensor
+        # output.
         return outputs.to_local()
 
     return distribute_module(
@@ -85,12 +111,21 @@ def distribute_rmsnorm(module, device_mesh):
 
 
 class TestTPFSDPIntegration(FSDPTestContinuous):
+    # [CLASS DOC] Four-GPU test case for TP+FSDP integration. Provides helpers for building
+    # parameter size and sharding info, sub process groups, TP gradient syncing and gradient
+    # flattening, plus tests comparing against FSDP-only training, communication counts, and
+    # module state sync.
     def _get_params_and_sharding_info(
         self,
         model: SimpleModel,
         sharded_param_names: list[str],
         tensor_parallel_size: int,
     ) -> tuple[dict[str, int], dict[str, tuple[torch.Size, int]]]:
+        # [FUNCTION DOC] HELPER: For a SimpleModel (raises AssertionError for other
+        # types), returns two ordered mappings: parameter name to local element count
+        # (divided by the TP size for sharded names) and, for sharded names only,
+        # parameter name to a pair of full size and shard dimension (0 for net1
+        # parameters, 1 otherwise).
         """ """
         if type(model) is not SimpleModel:
             raise AssertionError(
@@ -110,6 +145,10 @@ class TestTPFSDPIntegration(FSDPTestContinuous):
         return param_name_to_numel, param_name_to_sharding_info
 
     def _get_sub_pgs(self, tensor_parallel_size: int):
+        # [FUNCTION DOC] HELPER: Builds a 2-D device mesh with the world size arranged as
+        # rows of the given TP size and returns the mesh, the process group along dim 0
+        # (FSDP group) and the group along dim 1 (TP group). Ranks within a row are TP
+        # peers, columns are FSDP peers. Creates groups.
         """
         Generates TP and FSDP subprocess groups. ``tensor_parallel_size`` gives
         the TP process group size.
@@ -136,6 +175,12 @@ class TestTPFSDPIntegration(FSDPTestContinuous):
         param_name_to_numel: dict[str, int],
         non_sharded_param_names: list[str],
     ) -> None:
+        # [FUNCTION DOC] HELPER: Averages gradients of TP-replicated (non-sharded)
+        # parameters over the TP group by hand. Requires the model to be a single top-
+        # level FSDP; raises AssertionError otherwise. For each flat parameter it builds a
+        # mask of the elements belonging to sharded parameters, all-reduces a copy of the
+        # gradient over the TP group, writes the reduced values into the unmasked elements
+        # of the gradient in place, then divides the whole gradient by the TP size.
         """
         Syncs the tensor parallel parameters' gradients following the data
         parallel paradigm where gradients are averaged over ranks (in this
@@ -186,6 +231,12 @@ class TestTPFSDPIntegration(FSDPTestContinuous):
         fsdp_pg: dist.ProcessGroup | None,
         sharded_param_names: list[str] | None,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Returns all unsharded gradients as one flat tensor,
+        # identical on every rank. Gathers each rank's flattened local gradients (zeros
+        # for missing grads) over the FSDP group; without TP that is the result. With TP,
+        # splits per parameter and all-gathers the sharded parameters' pieces over the TP
+        # group, concatenating along the shard dimension before flattening. Assumes fixed
+        # parameter ordering. Collective communication on both groups.
         """
         Returns all unsharded gradients as a single flattened tensor. This
         returns the same value on all ranks.
@@ -233,6 +284,8 @@ class TestTPFSDPIntegration(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(4)
     def test_fsdp_tp_integration(self):
+        # [FUNCTION DOC] Runs the integration subtest over cpu offload, sharding strategy
+        # (default or shard grad op) and use_orig_params. Needs 4 GPUs.
         self.run_subtests(
             {
                 "cpu_offload": [
@@ -248,6 +301,11 @@ class TestTPFSDPIntegration(FSDPTestContinuous):
     def _test_fsdp_tp_integration(
         self, cpu_offload, sharding_strategy, use_orig_params
     ):
+        # [FUNCTION DOC] HELPER: Trains an FSDP-only model on a 1-D mesh and a TP+FSDP
+        # copy on a 2-D mesh (TP size 2, column/row-wise parallel on net1/net2), checking:
+        # equal outputs, equal gradients after syncing TP grads and gathering, and equal
+        # outputs on a fresh input after one SGD step with the same learning rate. Raises
+        # AssertionError if the TP weights are not DTensors.
         """
         Tests training for TP + FSDP integration by comparing an FSDP-only
         model with a TP + FSDP model.
@@ -362,6 +420,11 @@ class TestTPFSDPIntegration(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(4)
     def test_fsdp_tp_extension_grad(self):
+        # [FUNCTION DOC] Applies TP to a model with an MLP plus custom RMSNorm, wraps with
+        # FSDP on the data parallel mesh, runs forward and backward under comm debug mode,
+        # and checks the collective counts (7 total: 2 reduce-scatter, 2 all-gather, 1
+        # all-reduce for TP; 1 all-gather base and 1 reduce-scatter base for FSDP) and
+        # that no gradient has NaN. Needs 4 GPUs.
         """
         Tests TP + FSDP extension with correct gradient (i.e. no ACT)
         """
@@ -370,12 +433,18 @@ class TestTPFSDPIntegration(FSDPTestContinuous):
         )
 
         class TestModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Model with an MLP and an RMSNorm layer applied
+            # before it.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the MLP module and a 10-wide
+                # RMSNorm.
                 super().__init__()
                 self.mlp = MLPModule(device_type)
                 self.mlp_norm = RMSNormPython(10)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the norm and then the MLP to the
+                # input.
                 return self.mlp(self.mlp_norm(x))
 
         model = TestModel().to(self.rank)
@@ -417,6 +486,13 @@ class TestTPFSDPIntegration(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(4)
     def test_fsdp_tp_sync_module_state(self):
+        # [FUNCTION DOC] Builds a model with a DTensor parameter and buffer that are
+        # replicated over the TP mesh but have different random values per rank, verifies
+        # they differ across the DP group, wraps with FSDP with sync_module_states, and
+        # verifies inside summon_full_params that the local tensors are equal across the
+        # DP group. Needs 4 GPUs.
+        # KNOWN ISSUE: the model forward refers to an attribute named buffer while the
+        # registered buffer is named buf; forward is never called so the bug is latent.
         mesh_2d = init_device_mesh(
             device_type, (self.world_size // 2, 2), mesh_dim_names=["dp", "tp"]
         )
@@ -427,7 +503,12 @@ class TestTPFSDPIntegration(FSDPTestContinuous):
         torch.manual_seed(mesh_2d.get_rank())
 
         class TestModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Model holding a replicated DTensor parameter and a
+            # replicated DTensor buffer created from random local data.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates random 8x8 local tensors, wraps
+                # them as TP-replicated DTensors and stores them as a parameter
+                # and a buffer.
                 super().__init__()
                 replicated_dt = DTensor.from_local(
                     torch.randn(8, 8), tp_mesh, [Replicate()], run_check=False
@@ -439,11 +520,18 @@ class TestTPFSDPIntegration(FSDPTestContinuous):
                 self.buf = torch.nn.Buffer(replicated_buffer_dt)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Intended forward adding parameter and
+                # buffer plus one. KNOWN ISSUE: reads an attribute named buffer
+                # that does not exist (the buffer is named buf).
                 return self.param + self.buffer + 1
 
         model = TestModel()
 
         def assert_local_shard_across_ranks(local_tensor, group, check_equal=True):
+            # [FUNCTION DOC] HELPER: All-gathers the local tensor over the group and
+            # asserts all gathered tensors are equal to the first one (or all
+            # different from it when check_equal is false; any equal tensor fails the
+            # check).
             gathered_tensors = [
                 torch.empty_like(local_tensor) for _ in range(group.size())
             ]

@@ -1,4 +1,8 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Test for FSDP module traversal: checks that FSDP.fsdp_modules returns the nested
+# FSDP-wrapped submodules (all of them, or only the top-level ones with root_only). Import-time
+# side effects: exits the process if torch.distributed is unavailable or the dev-asan mode is on;
+# instantiates device-specific test classes for cuda, hpu and xpu.
 import sys
 
 import torch
@@ -27,8 +31,13 @@ if TEST_WITH_DEV_DBG_ASAN:
 
 
 class TestTraversal(FSDPTestContinuous):
+    # [CLASS DOC] Multi-process FSDP test case holding the traversal test. It only defines a
+    # custom world_size and one test method; the process group comes from the base class.
     @property
     def world_size(self):
+        # [FUNCTION DOC] Number of ranks to launch: 2 by default, but when an accelerator
+        # is present and has fewer than 2 devices, returns the actual device count instead
+        # (the test then skips itself via the GPU-count decorator).
         if torch.torch.accelerator.is_available():
             gpu_cnt = torch.accelerator.device_count()
             if gpu_cnt < 2:
@@ -37,6 +46,11 @@ class TestTraversal(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(2)
     def test_fsdp_modules(self):
+        # [FUNCTION DOC] Builds a recursively FSDP-wrapped nested test model with the
+        # device placed before wrapping, then checks FSDP.fsdp_modules. By default it must
+        # return the wrapped submodule "1", its wrapped child "0", and submodule "2", in
+        # that order. With root_only set it must return only "1" and "2" (nested child
+        # excluded).
         nested_wrapped_module = NestedWrappedModule.init(
             self.process_group,
             FSDPInitMode.RECURSIVE,
