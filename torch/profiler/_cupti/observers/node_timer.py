@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Per-graph-node activity timing observer. Defines _TIMED_FIELDS (activity kind
+# to its START/END/GRAPH_NODE_ID/STREAM_ID field ids for kernel, memcpy, memcpy2, memset) and
+# NodeTimerObserver, which buffers the raw spans the monitor delivers and exposes them as flat
+# numpy columns (drain) or grouped by region name (drain_annotated). Import-time side effect:
+# imports the cupti package (ActivityKind), so the module fails to import without it.
+# KNOWN ISSUE: the docstring says graph-node naming is "on by default", but the default
+# ObserverAnnotationSettings has no graph resolver (None), so nothing is named unless enabled.
 """Always-on per-graph-node activity-duration observer.
 
 The smallest real consumer of the monitor: registers for one or more activity
@@ -99,6 +106,13 @@ _EXTERNAL = int(ActivityKind.EXTERNAL_CORRELATION)
 
 
 class NodeTimerObserver(CuptiMonitorObserver):
+    # [CLASS DOC] Observer that records per-activity (graph_node_id, start, end, stream) spans
+    # for the selected kinds (kernel by default; memcpy, memcpy2, memset optional). State: the
+    # kinds tuple, a lock, a list of raw span chunks (plus correlation ids when eager naming is
+    # on) and a list of external-correlation chunks, both appended by the monitor worker thread
+    # and swapped out under the lock by _take. Key methods: drain (flat columns, resets),
+    # drain_annotated (spans bucketed by region name, resets). Unavailable if registration
+    # with the monitor failed; then nothing is ever delivered.
     """Buffers raw per-activity ``(graph_node_id, start_ns, end_ns, stream_id)`` spans the
     monitor delivers; :meth:`drain` returns them as flat numpy columns. Construct with
     ``annotations=ObserverAnnotationSettings(...)`` and :meth:`drain_annotated` returns
@@ -110,6 +124,11 @@ class NodeTimerObserver(CuptiMonitorObserver):
         *,
         annotations: ObserverAnnotationSettings | None = None,
     ) -> None:
+        # [FUNCTION DOC] Args: kinds is an iterable of activity kinds to time (default only the
+        # concurrent kernel kind); annotations configures region naming. Raises ValueError if
+        # any kind is not in the timed-fields table. Adds memcpy implicitly when memcpy2 is
+        # requested without it. Initializes the lock and empty buffers, builds the per-kind
+        # field selection, and registers with the monitor last via the base constructor.
         self._kinds: tuple[int, ...] = (
             tuple(kinds) if kinds is not None else (ActivityKind.CONCURRENT_KERNEL,)
         )
@@ -140,6 +159,11 @@ class NodeTimerObserver(CuptiMonitorObserver):
         super().__init__(fields, annotations=annotations)
 
     def _on_activities(self, columns: dict[Any, dict[int, Any]]) -> None:
+        # [FUNCTION DOC] Worker-thread callback. For each delivered kind: external-correlation
+        # columns become (external id, correlation id) chunks (external ids resolved to the
+        # enclosing named region when eager naming is on); timed kinds become (graph node,
+        # start, end, stream, correlation or none) chunks, skipped if any field column is
+        # missing. Appends the chunks to the buffers under the lock. Returns nothing.
         # Worker thread: just stash the columns (cheap append); grouping/joining
         # happens after drain, off this hot path.
         spans: list[tuple[Any, Any, Any, Any, Any]] = []
@@ -174,6 +198,10 @@ class NodeTimerObserver(CuptiMonitorObserver):
                 self._ext_chunks.extend(exts)
 
     def _resolve_named_ancestor(self, eid_col):
+        # [FUNCTION DOC] HELPER: Map a column of external ids to, for each, the innermost
+        # enclosing id (via the monitor's active-id chain) that has a pushed annotation name,
+        # else the id itself. Returns the input unchanged if no names are registered or there
+        # is no monitor; otherwise a new array of the input dtype. Reads the annotation names.
         """Map each (innermost) external id to the innermost ENCLOSING id that names a
         region, via the monitor's active-id chain -- so a kernel nested below a named
         region (e.g. a collective inside it) still resolves to that region. Resolved
@@ -195,12 +223,18 @@ class NodeTimerObserver(CuptiMonitorObserver):
         )
 
     def _take(self) -> tuple[list, list]:
+        # [FUNCTION DOC] HELPER: Atomically (under the lock) swap out and return the span
+        # chunks and external-correlation chunks buffered so far, leaving both empty.
         with self._lock:
             chunks, self._chunks = self._chunks, []
             ext_chunks, self._ext_chunks = self._ext_chunks, []
         return chunks, ext_chunks
 
     def drain(self, flush: bool = False) -> tuple[Any, Any, Any, Any]:
+        # [FUNCTION DOC] Return and clear the buffered spans as four parallel numpy arrays:
+        # graph node id (unsigned 64), start ns (signed 64), end ns (signed 64), stream id
+        # (unsigned 64); four empty arrays if nothing is buffered. If flush is true, first asks
+        # the monitor to flush CUPTI buffers. External-correlation chunks are discarded.
         """Return the raw per-activity spans delivered since the last call as four
         parallel numpy columns ``(graph_node_id, start_ns, end_ns, stream_id)`` (dtypes
         ``<u8, <i8, <i8, <u8``), and reset. Empty -> four length-0 arrays.
@@ -235,6 +269,14 @@ class NodeTimerObserver(CuptiMonitorObserver):
         return gnode, start, end, stream
 
     def drain_annotated(self, flush: bool = False) -> dict[str, list[tuple[int, int]]]:
+        # [FUNCTION DOC] Return and clear the buffered spans grouped by region name, as a
+        # mapping from name to a list of (start ns, end ns); unnamed spans go under the empty
+        # string, and an empty mapping is returned if nothing is buffered. Names come first
+        # from the graph resolver on the graph node id, then (if eager naming is on) from the
+        # correlation id to external id to pushed name join for spans still unnamed. Also
+        # clears the pushed annotation names. flush behaves as in drain.
+        # KNOWN ISSUE: with eager naming on, a span chunk whose correlation column was absent
+        # holds none, and concatenating the correlation columns would then fail.
         """Resolve the spans delivered since the last call to region names and
         return ``{name: [(start_ns, end_ns), ...]}`` (and reset). Each span is named
         graph-first, eager-fallback: the graph resolver on ``graph_node_id`` for

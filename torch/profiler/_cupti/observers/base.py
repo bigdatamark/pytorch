@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Base machinery for observers of the shared CUPTI activity monitor. Defines the
+# resolver type aliases (graph annotation, lane, dependency), the default graph annotation
+# resolver, the frozen ObserverAnnotationSettings dataclass, and CuptiMonitorObserver, which
+# registers activity kinds with the monitor, tracks availability, manages graph-destroy hooks,
+# and offers annotation push/pop and clock passthroughs. Import-time side effects: none beyond
+# defining names (monitor and cuda modules are imported lazily inside functions).
 """Base class for CUPTI activity-monitor observers.
 
 An observer registers the activity kinds it wants with the shared CUPTI monitor and, on
@@ -47,6 +53,9 @@ GraphDependencyResolver = Callable[[int], "list[int] | None"]
 
 
 def default_graph_annotation_resolver(graph_node_id: int) -> Any | None:
+    # [FUNCTION DOC] Look up the registered annotation for a CUDA-graph node id in the kernel
+    # annotation registry of torch.cuda. Returns None for id 0 (eager), when the registry
+    # cannot be imported or read (any error is swallowed), or when the id is unregistered.
     """Default resolver: map a CUDA-graph node id to its registered annotation, or None when
     it has none."""
     if graph_node_id == 0:
@@ -62,6 +71,10 @@ def default_graph_annotation_resolver(graph_node_id: int) -> Any | None:
 
 @dataclass(frozen=True)
 class ObserverAnnotationSettings:
+    # [CLASS DOC] Immutable configuration for how an observer names regions. Fields: optional
+    # graph annotation resolver (node id to name), eager-annotation flag (adds external
+    # correlation and runtime kinds), optional lane resolver (node id to display lane), and a
+    # flag to record graph node dependencies. Defaults disable everything.
     """How an observer attributes activity to named regions. Each source enforces its own
     fields when enabled (folded into the selection) and contributes nothing when disabled.
 
@@ -88,6 +101,12 @@ class ObserverAnnotationSettings:
 
 
 class CuptiMonitorObserver:
+    # [CLASS DOC] Base class for monitor observers. State: cached (functools.cache) graph
+    # annotation, lane and dependency resolvers; shared graph dependency, event-record and
+    # host-function maps; eager flag; requested activity kinds; monitor handle and registration
+    # handle (None when unavailable); a lock-guarded external id to name map; and the graph
+    # destroy hook handles. Invariant: registration happens last in __init__, so state is ready
+    # before the worker thread delivers. Subclasses implement _on_activities; close unregisters.
     """Base for observers backed by the shared CUPTI monitor.
 
     Subclasses set up state, then call ``super().__init__(activities)`` with the kinds they
@@ -110,28 +129,39 @@ class CuptiMonitorObserver:
     # when a graph is destroyed, bounding growth in long runs.
     @property
     def _annotation_resolver(self) -> GraphAnnotationResolver | None:
+        # [FUNCTION DOC] HELPER: Property getter returning the cached (memoized) graph
+        # annotation resolver, or None when disabled.
         return self._annotation_resolver_cached
 
     @_annotation_resolver.setter
     def _annotation_resolver(self, fn: GraphAnnotationResolver | None) -> None:
+        # [FUNCTION DOC] HELPER: Property setter; stores fn wrapped in a memoizing cache, or
+        # None if fn is None.
         self._annotation_resolver_cached = (
             functools.cache(fn) if fn is not None else None
         )
 
     @property
     def _lane_resolver(self) -> LaneResolver | None:
+        # [FUNCTION DOC] HELPER: Property getter returning the cached lane resolver, or None.
         return self._lane_resolver_cached
 
     @_lane_resolver.setter
     def _lane_resolver(self, fn: LaneResolver | None) -> None:
+        # [FUNCTION DOC] HELPER: Property setter; stores fn wrapped in a memoizing cache, or
+        # None if fn is None.
         self._lane_resolver_cached = functools.cache(fn) if fn is not None else None
 
     @property
     def _dependency_resolver(self) -> GraphDependencyResolver | None:
+        # [FUNCTION DOC] HELPER: Property getter returning the cached dependency resolver, or
+        # None.
         return self._dependency_resolver_cached
 
     @_dependency_resolver.setter
     def _dependency_resolver(self, fn: GraphDependencyResolver | None) -> None:
+        # [FUNCTION DOC] HELPER: Property setter; stores fn wrapped in a memoizing cache, or
+        # None if fn is None.
         self._dependency_resolver_cached = (
             functools.cache(fn) if fn is not None else None
         )
@@ -142,6 +172,13 @@ class CuptiMonitorObserver:
         *,
         annotations: ObserverAnnotationSettings | None = None,
     ) -> None:
+        # [FUNCTION DOC] Args: activities is a set of kinds or a mapping of kind to field ids;
+        # annotations optionally configures naming. Sets up the dependency maps (shared by
+        # reference with the process-global recorder, which it arms, when dependency recording
+        # is on), the resolvers and eager flag, augments the request with graph-node and eager
+        # fields as needed, then registers with the monitor. Any registration or import failure
+        # is swallowed, leaving the observer unavailable. Registers graph-destroy hooks when
+        # available. Side effects: may arm the recorder, registers with the global monitor.
         record_deps = annotations is not None and annotations.record_graph_dependencies
         # Graph node->node dependency map (graph_node_id -> predecessor graph_node_ids), read
         # by our dependency resolver. When recording, share the process-global recorder's map
@@ -210,12 +247,16 @@ class CuptiMonitorObserver:
             self._register_graph_destroy_hooks()
 
     def _make_dependency_resolver(self) -> GraphDependencyResolver:
+        # [FUNCTION DOC] HELPER: Build a resolver function over the shared dependency map
+        # (captured by reference, not self, so the observer is not pinned). Returns it.
         """A resolver over the shared graph dependency map: graph_node_id -> predecessor
         graph_node_ids (None when the node has none). Captures the map, not self, so the
         cached resolver never pins the observer."""
         deps = self._graph_dependencies
 
         def resolve(graph_node_id: int) -> list[int] | None:
+            # [FUNCTION DOC] HELPER: Return the predecessor node ids recorded for the node, or
+            # None for id 0 or an unknown node.
             if graph_node_id == 0:
                 return None
             return deps.get(graph_node_id)
@@ -224,10 +265,17 @@ class CuptiMonitorObserver:
 
     @property
     def available(self) -> bool:
+        # [FUNCTION DOC] Property: true when registration with the monitor succeeded and has
+        # not been closed.
         """True when the monitor was available and this observer registered."""
         return self._obs is not None
 
     def _register_graph_destroy_hooks(self) -> None:
+        # [FUNCTION DOC] HELPER: For each installed resolver (annotation, dependency, lane)
+        # register a graph-destroy hook that purges the resolver's backing store for the
+        # destroyed graph ids (annotation registry or the dependency, event-record and host
+        # function maps; none for lane) and clears the resolver cache. Handles are stored for
+        # removal in close. Hooks capture no self reference.
         """Register a graph-destroy hook per installed graph-node resolver. Each hook
         purges its backing store (the annotation module registry, or this observer's own
         dependency map) and clears its resolver cache (cache_clear is global per resolver
@@ -248,6 +296,8 @@ class CuptiMonitorObserver:
         host_fns = self._graph_host_fns
 
         def purge_deps(ids: set[int]) -> None:
+            # [FUNCTION DOC] HELPER: Delete every entry of the dependency, event-record and
+            # host-function maps whose key's upper 32 bits (the graph id) are in ids.
             for key in [k for k in deps if k >> 32 in ids]:
                 del deps[key]
             for key in [k for k in event_record_events if k >> 32 in ids]:
@@ -256,7 +306,11 @@ class CuptiMonitorObserver:
                 del host_fns[key]
 
         def add(cache: Any, purge: Any) -> None:
+            # [FUNCTION DOC] HELPER: Register one destroy hook that runs the optional purge
+            # callable on the destroyed ids and clears the given cache; keep its handle.
             def hook(ids: set[int]) -> None:
+                # [FUNCTION DOC] HELPER: Destroy callback; purge backing data for ids if a
+                # purge callable was given, then clear the whole resolver cache.
                 if purge is not None:
                     purge(ids)
                 cache.cache_clear()
@@ -271,12 +325,19 @@ class CuptiMonitorObserver:
             add(self._lane_resolver_cached, None)
 
     def _on_activities(self, columns: dict[Any, dict[int, Any]]) -> None:
+        # [FUNCTION DOC] Abstract worker-thread hook receiving a mapping of activity kind to a
+        # mapping of field id to column. Subclasses must override; base raises
+        # NotImplementedError.
         """Worker-thread hook: ``{ActivityKind: {field_id: column}}`` demuxed by the
         monitor and sliced to this observer's selection. Implemented by subclasses."""
         raise NotImplementedError
 
     @staticmethod
     def _with_eager_fields(activities: Any) -> dict[int, set[int]]:
+        # [FUNCTION DOC] HELPER: Static. Return a new kind-to-field-set mapping from a
+        # kind-to-fields mapping, adding each kind's correlation id field where defined, plus
+        # the external correlation kind (external id, correlation id) and the runtime kind
+        # (correlation id). Requires a mapping, not a plain set. Imports the cupti package.
         """Augment a field map for the eager join: add each kind's CORRELATION_ID plus the
         EXTERNAL_CORRELATION and RUNTIME records (CUPTI only emits the former when RUNTIME
         is enabled; RUNTIME is just the carrier). Expects a ``{kind: fields}`` map."""
@@ -300,6 +361,8 @@ class CuptiMonitorObserver:
 
     @staticmethod
     def _with_graph_fields(activities: Any) -> dict[int, set[int]]:
+        # [FUNCTION DOC] HELPER: Static. Return a new kind-to-field-set mapping with each GPU
+        # op kind's graph node id field added where defined. Requires a mapping.
         """Augment a field map so the graph resolver can name nodes: add each GPU-op kind's
         GRAPH_NODE_ID. Collection-free (it's a normal record field, no extra kinds, stays on
         the vectorized path). Expects a ``{kind: fields}`` map."""
@@ -315,6 +378,9 @@ class CuptiMonitorObserver:
         return aug
 
     def push_annotation(self, name: str) -> int | None:
+        # [FUNCTION DOC] Push a global external correlation id on the monitor and remember
+        # name for it (under the lock). Returns the id, or None if the monitor is unavailable
+        # or gave no id. Side effect: mutates the monitor's id stack and the name map.
         """Push a global external-correlation id (mapped here to ``name``) so activity
         until the pop is attributed via ``correlation_id -> external_id -> name``. Eager
         only. No-op returning None when the monitor is unavailable."""
@@ -327,6 +393,8 @@ class CuptiMonitorObserver:
         return ext_id
 
     def pop_annotation(self) -> int | None:
+        # [FUNCTION DOC] Pop the most recent external correlation id from the monitor and
+        # return what it returns; None if the monitor is unavailable. The name map is kept.
         """Pop the most recent external-correlation id (balances push_annotation)."""
         if not self.available or self._monitor is None:
             return None
@@ -334,6 +402,8 @@ class CuptiMonitorObserver:
 
     @contextlib.contextmanager
     def annotate(self, name: str) -> Iterator[int | None]:
+        # [FUNCTION DOC] Context manager: pushes an annotation, yields its id (or None), and
+        # always pops on exit, even if the body raises.
         """Context-manager form of push_annotation/pop_annotation."""
         ext_id = self.push_annotation(name)
         try:
@@ -342,6 +412,8 @@ class CuptiMonitorObserver:
             self.pop_annotation()
 
     def annotation_names(self, *, reset: bool = False) -> dict[int, str]:
+        # [FUNCTION DOC] Return a copy of the external id to name map taken under the lock;
+        # if reset is true, also replace the stored map with an empty one.
         """Snapshot of the ``external_id -> name`` map pushed so far; pass
         ``reset=True`` to also clear it (e.g. when closing a window)."""
         with self._ann_lock:
@@ -351,22 +423,29 @@ class CuptiMonitorObserver:
         return snapshot
 
     def now_ns(self) -> int:
+        # [FUNCTION DOC] Current unix-epoch nanoseconds from the monitor; 0 if no monitor.
         """Current time on the same unix-epoch clock as record timestamps --
         passthrough to the monitor."""
         return self._monitor.now_unix_ns() if self._monitor is not None else 0
 
     def now_record_ns(self) -> int:
+        # [FUNCTION DOC] Current value of CUPTI's native record clock from the monitor; 0 if
+        # no monitor.
         """Current value of CUPTI's native record clock -- the unconverted timebase of
         decoded record START/END. Use this to stamp a window boundary compared against
         raw record timestamps (see NodeTimerObserver bucketing). 0 if unavailable."""
         return self._monitor.now_record_ns() if self._monitor is not None else 0
 
     def convert_time(self, value: int) -> int:
+        # [FUNCTION DOC] Convert one CUPTI-clock timestamp to unix-epoch ns via the monitor;
+        # returns value unchanged if there is no monitor.
         """Convert a CUPTI-clock timestamp to unix-epoch ns -- passthrough to the
         monitor (identity if clock alignment is unavailable)."""
         return self._monitor.convert_time(value) if self._monitor is not None else value
 
     def convert_time_array(self, values: Any) -> Any:
+        # [FUNCTION DOC] Vectorized timestamp conversion of a whole column via the monitor;
+        # returns values unchanged if there is no monitor.
         """Vectorized :meth:`convert_time` over a whole column -- passthrough to the
         monitor (identity if clock alignment is unavailable)."""
         if self._monitor is None:
@@ -374,6 +453,8 @@ class CuptiMonitorObserver:
         return self._monitor.convert_time_array(values)
 
     def close(self) -> None:
+        # [FUNCTION DOC] Remove all graph-destroy hooks, then unregister from the monitor and
+        # drop the registration handle. Idempotent. Side effects: mutates monitor registry.
         """Unregister from the monitor. Idempotent."""
         for handle in self._destroy_hook_handles:
             handle.remove()

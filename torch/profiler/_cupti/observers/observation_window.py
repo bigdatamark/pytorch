@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Window-finalization machinery for CUPTI monitor observers: a daemon poll thread
+# (_PollThread) and a mixin (WindowFinalizerMixin) that queues window boundaries stamped in the
+# CUPTI record clock and finalizes each once delivered records cover it. Subclasses supply the
+# collect / watermark / finalize hooks. Import-time side effect: creates the module logger only.
 """Shared window-finalization machinery for CUPTI monitor observers.
 
 An observer that publishes per *window* (a span ended by a boundary -- a training step or
@@ -25,15 +29,23 @@ logger = logging.getLogger(__name__)
 
 
 class _PollThread(threading.Thread):
+    # [CLASS DOC] HELPER: Daemon thread that repeatedly calls a no-argument callback at a fixed
+    # interval until stop() sets its event. State: callback, interval in seconds, stop event.
+    # An exception raised by the callback is logged and the loop continues.
     """Daemon thread that calls ``fn`` every ``interval_s`` until stopped."""
 
     def __init__(self, fn: Callable[[], None], interval_s: float, name: str) -> None:
+        # [FUNCTION DOC] HELPER: Create a named daemon thread (not started) that will call fn
+        # every interval_s seconds. Stores fn, the interval, and a fresh stop event.
         super().__init__(name=name, daemon=True)
         self._fn = fn
         self._interval_s = interval_s
         self._stop_event = threading.Event()
 
     def run(self) -> None:
+        # [FUNCTION DOC] HELPER: Thread body. Waits on the stop event for one interval, then
+        # calls the callback; repeats until the event is set. Callback exceptions are logged
+        # (logger.exception) and swallowed so one failed cycle does not kill the poller.
         while not self._stop_event.wait(self._interval_s):
             try:
                 self._fn()
@@ -41,10 +53,18 @@ class _PollThread(threading.Thread):
                 logger.exception("CUPTI window poll cycle failed")
 
     def stop(self) -> None:
+        # [FUNCTION DOC] HELPER: Signal the loop to exit by setting the stop event. Does not
+        # join the thread; the caller does that.
         self._stop_event.set()
 
 
 class WindowFinalizerMixin:
+    # [CLASS DOC] Mixin for CuptiMonitorObserver subclasses that publish per window. State
+    # (set by _init_observation_window): lock, FIFO deque of (window_id, boundary_ns), next
+    # window id, poll interval/thread/name, auto-start flag. Invariant: boundaries are queued
+    # in increasing clock order and each is finalized exactly once, oldest first, when the
+    # watermark of delivered records reaches it (or unconditionally at teardown). Abstract
+    # hooks: _collect_delivered, _window_watermark_ns, _finalize_window.
     """Boundary queue + background poller + cover-and-finalize loop. See the module
     docstring. Subclasses call :meth:`_init_observation_window` in ``__init__`` and implement
     ``_collect_delivered`` / ``_window_watermark_ns`` / ``_finalize_window``."""
@@ -56,6 +76,9 @@ class WindowFinalizerMixin:
         thread_name: str = "cupti-window-poller",
         auto_start_poller: bool = True,
     ) -> None:
+        # [FUNCTION DOC] Initialize mixin state: lock, empty boundary queue, window id counter
+        # at zero, poll interval (milliseconds clamped to at least 1, stored in seconds), no
+        # poll thread yet, thread name, and the auto-start flag. Starts nothing and does no I/O.
         # auto_start_poller=False: never spin up the poll thread; the consumer finalizes
         # synchronously via _stop_observation_window (e.g. a synchronous export).
         self._auto_start_poller = auto_start_poller
@@ -69,6 +92,10 @@ class WindowFinalizerMixin:
         self._poll_thread_name = thread_name
 
     def mark_boundary(self) -> int:
+        # [FUNCTION DOC] Stamp the current record-clock time as a window boundary, assign the
+        # next window id, and append (id, boundary) to the queue under the lock. Lazily creates
+        # and starts the poll thread on first use unless auto-start is disabled. Returns the
+        # window id. Does not flush CUPTI.
         """Stamp the native record clock as a window boundary and queue it for finalization
         once delivered records cover it. Returns the window id. Lazily starts the poller on
         the first call (unless auto_start_poller is False). Does NOT flush -- the caller
@@ -86,6 +113,10 @@ class WindowFinalizerMixin:
         return window_id
 
     def _poll_once(self, drain_all: bool = False, *, sync: bool = False) -> None:
+        # [FUNCTION DOC] HELPER: One poll cycle. Calls the collect hook, reads the watermark,
+        # then under the lock pops every queued boundary at or below the watermark (all of
+        # them if drain_all), and finalizes each popped window outside the lock in queue
+        # order. Args: drain_all forces finalization of everything; sync is passed to collect.
         """One poll cycle: collect delivered records, then finalize every queued boundary
         they now cover. ``drain_all`` (teardown) finalizes every remaining boundary
         regardless of watermark. ``sync`` sync-flushes CUPTI in the collect (only safe on
@@ -102,6 +133,10 @@ class WindowFinalizerMixin:
             self._finalize_window(window_id, boundary)
 
     def _stop_observation_window(self, *, sync: bool = True) -> None:
+        # [FUNCTION DOC] Stop and join the poll thread (5 second timeout), clear it, then run a
+        # final drain-all poll so remaining windows are finalized. Idempotent. sync selects
+        # whether the final collect sync-flushes CUPTI. Side effects: joins a thread, may call
+        # the subclass finalize hook for each remaining window.
         """Stop the poller and finalize whatever remains. Idempotent. ``sync`` (default)
         sync-flushes CUPTI in the final drain -- correct on the monitor-flusher thread (e.g.
         teardown on the training thread). ``sync=False`` finalizes only naturally-delivered
@@ -114,6 +149,8 @@ class WindowFinalizerMixin:
         self._poll_once(drain_all=True, sync=sync)
 
     def _boundary_clock_ns(self) -> int:
+        # [FUNCTION DOC] HELPER: Return the clock value used to stamp a boundary: the native
+        # CUPTI record clock via now_record_ns. Must be the same timebase as the watermark.
         """Clock a boundary is stamped in -- must match :meth:`_window_watermark_ns`.
         Default: CUPTI's native record clock (matches raw START/END). Override to a
         converted clock if the subclass stores records converted (convert the boundary the
@@ -126,10 +163,18 @@ class WindowFinalizerMixin:
         def now_record_ns(self) -> int: ...
 
     def _collect_delivered(self, *, sync: bool) -> None:
+        # [FUNCTION DOC] Abstract hook: subclass pulls newly delivered records into its own
+        # buffers (optionally sync-flushing CUPTI when sync is true). Base raises
+        # NotImplementedError.
         raise NotImplementedError
 
     def _window_watermark_ns(self) -> int:
+        # [FUNCTION DOC] Abstract hook: return the maximum record start time delivered so far,
+        # in the record clock. Boundaries at or below it are considered covered. Base raises
+        # NotImplementedError.
         raise NotImplementedError
 
     def _finalize_window(self, window_id: int, boundary_ns: int) -> None:
+        # [FUNCTION DOC] Abstract hook: publish the window identified by window_id that ended
+        # at boundary_ns. Called outside the lock, in order. Base raises NotImplementedError.
         raise NotImplementedError

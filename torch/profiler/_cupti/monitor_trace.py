@@ -1,4 +1,15 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Exports a CUPTI monitor trace window (columnar numpy data of GPU kernels,
+# copies, memsets, CUDA runtime/driver calls, syncs, overhead, counters) merged with a Kineto
+# CPU trace. Public entry point: merge_trace_window_into_chrome_trace, which reads the Kineto
+# trace (optionally gzipped), then writes either a Chrome-trace JSON (optionally gzipped; path
+# ending .gz) or, when the output path contains .pftrace, a Perfetto-native trace encoded by
+# the native encoder in torch._C._profiler._cupti_monitor. Contents: Chrome event builders
+# (_trace_window_entries, GPU user annotation synthesis, graph dependency flow arrows),
+# CBID-to-name tables and filters, GPU counter builders (environment, PM sampling, cycles),
+# and the pftrace assembly (_window_to_pftrace, render stages, event id assignment).
+# Import-time side effects: imports numpy, torch, and the external cupti package (import fails
+# if absent); tries to import orjson and falls back to the stdlib json module.
 from __future__ import annotations
 
 import gzip
@@ -109,12 +120,17 @@ _DRIVER_FLOW_NAMES = {
 
 
 def _default_base_ns() -> int:
+    # [FUNCTION DOC] HELPER: Return the current time rounded down to a multiple of the
+    # roughly three month constant, expressed in nanoseconds. Used when the Kineto trace has
+    # no base time. Reads the wall clock.
     # Fallback trace base time (ns) when the trace has no baseTimeNanoseconds:
     # round "now" down to a _TRIMONTH_SECONDS boundary, matching Kineto.
     return (int(_time.time()) // _TRIMONTH_SECONDS) * _TRIMONTH_SECONDS * 1_000_000_000
 
 
 def _as_float(value: object, default: float = 0.0) -> float:
+    # [FUNCTION DOC] HELPER: Convert value to a float; return default if the conversion raises
+    # a type or value error.
     try:
         return float(cast(int | float | str, value))
     except (TypeError, ValueError):
@@ -122,12 +138,16 @@ def _as_float(value: object, default: float = 0.0) -> float:
 
 
 def _sanitize_tid(tid: int) -> int:
+    # [FUNCTION DOC] HELPER: Make a thread/stream id non-negative: the most negative signed
+    # 64-bit value maps to 0, any other value to its absolute value.
     if tid == -(1 << 63):
         return 0
     return abs(tid)
 
 
 def _export_tid(tid):
+    # [FUNCTION DOC] HELPER: Sanitize integer ids for export; non-integer ids (such as string
+    # lane names) pass through unchanged.
     if isinstance(tid, int):
         return _sanitize_tid(tid)
     return tid
@@ -141,6 +161,8 @@ def _metadata_event(
     arg_key: str,
     arg_value,
 ) -> dict[str, object]:
+    # [FUNCTION DOC] HELPER: Build a Chrome trace metadata event (phase M) with the given
+    # name, timestamp in microseconds, pid, sanitized tid, and a single argument pair.
     return {
         "ph": "M",
         "name": name,
@@ -152,6 +174,11 @@ def _metadata_event(
 
 
 def _annotation_to_args(args: dict[str, object], annotation: object) -> None:
+    # [FUNCTION DOC] HELPER: Merge an annotation into the args mapping in place. None is
+    # ignored. A string is parsed as JSON; if parsing fails it is stored under the key
+    # annotation. A decoded list is stored re-serialized as a JSON string under annotation; a
+    # decoded mapping has its entries copied in with string keys; any other decoded value is
+    # stored under annotation as is.
     if annotation is None:
         return
     try:
@@ -169,6 +196,9 @@ def _annotation_to_args(args: dict[str, object], annotation: object) -> None:
 
 
 def _load_cbid_names(enum_cls) -> dict[int, str]:
+    # [FUNCTION DOC] HELPER: Build a mapping from callback id value to API name from an enum
+    # class, stripping a trailing version suffix (an underscore, v, and digits) from member
+    # names. Later members with the same value overwrite earlier ones.
     names: dict[int, str] = {}
     for name, member in enum_cls.__members__.items():
         normalized = name
@@ -181,6 +211,8 @@ def _load_cbid_names(enum_cls) -> dict[int, str]:
 
 
 def _runtime_cbid_name(cbid: int) -> str:
+    # [FUNCTION DOC] HELPER: Name of a CUDA runtime API callback id, lazily building and
+    # caching the global table on first use; unknown ids give a generic cbid_N name.
     global _RUNTIME_CBID_NAMES
     if _RUNTIME_CBID_NAMES is None:
         _RUNTIME_CBID_NAMES = _load_cbid_names(Runtime_api_trace_cbid)
@@ -188,6 +220,8 @@ def _runtime_cbid_name(cbid: int) -> str:
 
 
 def _driver_cbid_name(cbid: int) -> str:
+    # [FUNCTION DOC] HELPER: Same as the runtime variant but for CUDA driver API callback ids,
+    # with its own lazily built global cache.
     global _DRIVER_CBID_NAMES
     if _DRIVER_CBID_NAMES is None:
         _DRIVER_CBID_NAMES = _load_cbid_names(Driver_api_trace_cbid)
@@ -195,18 +229,25 @@ def _driver_cbid_name(cbid: int) -> str:
 
 
 def _runtime_is_registered(name: str) -> bool:
+    # [FUNCTION DOC] HELPER: True unless the runtime API name is in the blocklist of noisy
+    # calls (device get/set, last error, event create/destroy).
     return name not in _RUNTIME_BLOCKLIST
 
 
 def _runtime_requires_flow(name: str) -> bool:
+    # [FUNCTION DOC] HELPER: True if a runtime call should start a flow arrow: launches,
+    # graph launch, stream/device sync, stream wait event, or any memcpy/memset call.
     return name in _RUNTIME_FLOW_NAMES or name.startswith(("cudaMemcpy", "cudaMemset"))
 
 
 def _driver_is_registered(name: str) -> bool:
+    # [FUNCTION DOC] HELPER: True only for the allowlisted driver calls (kernel launches and
+    # virtual memory management calls).
     return name in _DRIVER_REGISTERED
 
 
 def _driver_requires_flow(name: str) -> bool:
+    # [FUNCTION DOC] HELPER: True for driver kernel launch calls, which start a flow arrow.
     return name in _DRIVER_FLOW_NAMES
 
 
@@ -221,6 +262,12 @@ def _graph_dependency_flow_events(
     *,
     base_ns: int,
 ) -> list[dict[str, object]]:
+    # [FUNCTION DOC] HELPER: Build start/finish flow event pairs for CUDA graph node
+    # dependency arrows. Args: node_rows of (correlation id, graph node id, device, lane, start
+    # ns, end ns); graph_deps mapping node id to predecessor ids; base_ns time origin. Nodes
+    # are grouped per correlation id (one replay) and an arrow runs from each predecessor's end
+    # to the successor's start, with unique flow ids from a high base. Returns an empty list
+    # when there are no dependencies; timestamps are clamped to zero or more microseconds.
     """Chrome flow (s/f) events drawing CUDA-graph node->node dependency arrows in the JSON
     export. ``node_rows`` is (correlation_id, graph_node_id, device, tid, start_ns, end_ns) per
     graphed op as displayed (tid is the resolver lane). Dependencies (graph_deps: node_id ->
@@ -298,12 +345,15 @@ _RUNTIME_LAUNCH_NAMES = {
 
 
 def _runtime_is_eager_launch(name: str) -> bool:
+    # [FUNCTION DOC] HELPER: True for eager kernel launch names and any memcpy/memset call.
     return name in _RUNTIME_LAUNCH_NAMES or name.startswith(
         ("cudaMemcpy", "cudaMemset")
     )
 
 
 def _runtime_is_launch(name: str) -> bool:
+    # [FUNCTION DOC] HELPER: True for calls that link to GPU work in the pftrace: eager
+    # launches or a graph launch.
     # The set for the gpu_correlation channel link: eager launches plus cudaGraphLaunch
     # (links to the replayed kernels; gpu_correlation is a per-selection details link, so the
     # fan-out does not spiderweb).
@@ -316,6 +366,14 @@ def _trace_window_entries(
     base_ns: int,
     cpu_thread_by_external_id: dict[int, tuple[int, int]] | None = None,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    # [FUNCTION DOC] Convert a columnar trace window into Chrome trace events. Args: the
+    # window mapping (columns per activity kind, thread resource map, graph dependencies,
+    # event-record handles), base_ns time origin, and an optional external id to CPU
+    # (pid, tid) map. Returns (metadata events, trace events). Emits GPU op events with launch
+    # flow endpoints (moved to logical lanes when a lane column exists), graph dependency
+    # arrows, runtime/driver API events on their CPU threads, overhead events (dropping the
+    # trailing buffer request), sync events with wait-on joins, process/thread metadata, and
+    # GPU user annotation spans. Pure with respect to inputs apart from building new objects.
     # Columnar: each kind is a dict of named numpy columns. Events are built by bulk-
     # converting the columns to lists once (tolist) and zipping, not boxing per record.
     columns = cast("dict[str, dict[str, Any]]", trace_window.get("columns", {}))
@@ -325,6 +383,8 @@ def _trace_window_entries(
     )
 
     def _col(kind_str: str):
+        # [FUNCTION DOC] HELPER: Return the column mapping for an activity kind, or None if it
+        # is absent, empty, or has zero rows.
         c = columns.get(kind_str)
         return c if c and len(next(iter(c.values()))) else None
 
@@ -363,6 +423,9 @@ def _trace_window_entries(
     def _runtime_thread_id(
         process_id: int, correlation_id: int, normalized_thread_id: int
     ) -> int:
+        # [FUNCTION DOC] HELPER: Pick the CPU thread id for a runtime/driver record: the
+        # thread linked via the correlation id when it belongs to the same process, otherwise
+        # the process's thread resource map entry for the normalized id, otherwise that id.
         # normalized_thread_id: the raw CUPTI threadId reduced to signed 32-bit, vectorized
         # at the call site (ctypes.c_int32 per record is otherwise the hot cost).
         linked = cpu_thread_by_correlation_id.get(correlation_id)
@@ -918,6 +981,12 @@ def _gpu_user_annotation_events(
     *,
     base_ns: int,
 ) -> list[dict[str, object]]:
+    # [FUNCTION DOC] Synthesize GPU-side user annotation spans (Chrome complete events). For
+    # each GPU op linked via external correlation to a named region, the op's device/stream
+    # span is widened to cover all its ops, and one event per (region, device, stream) is
+    # produced, slightly padded. Returns an empty list when there are no annotations or
+    # external correlations. Spans on capture streams left with no displayed GPU work (all ops
+    # moved to logical lanes) are dropped. Output is sorted by (region id, device, stream).
     user_annotations = trace_window.get("user_annotations", {})
     if not isinstance(user_annotations, dict) or not user_annotations:
         return []
@@ -1015,6 +1084,11 @@ def _gpu_user_annotation_events(
 
 
 def _nest_track_slices(groups: list, track_uuids: set) -> None:
+    # [FUNCTION DOC] HELPER: Mutates the end-time arrays of the slice groups in place so the
+    # slices on the given track ids nest properly. Gathers slices on those tracks across all
+    # groups, sorts by track, start ascending, end descending, and with a per-track stack
+    # truncates an open slice's end to the start of a later partially overlapping slice. Does
+    # nothing when there are no tracks or no matching slices. Only the end values change.
     """Make each track's slices nest, so Perfetto can pair them.
 
     Perfetto's TrackEvent model pairs SLICE_BEGIN/SLICE_END per track with a stack, so a
@@ -1142,6 +1216,8 @@ _COMPUTE_ARGS = (
 # names would collide with that numeric expectation and crash the plugin. (device == the
 # render stage's gpu_id and stream == the lane, so this is detail-panel only.)
 def _lower_node_id(c: dict):
+    # [FUNCTION DOC] HELPER: From a column mapping, return the graph node id column masked to
+    # its low 32 bits, or None if the column is absent.
     # graphNodeId packs the graph id in its upper 32 bits (emitted separately as "graph id");
     # keep only the lower 32-bit node id, matching the chrome export.
     gnid = c.get("graph_node_id")
@@ -1168,6 +1244,9 @@ _LAUNCH_DIMS = ("grid_x", "grid_y", "grid_z", "block_x", "block_y", "block_z")
 
 
 def _process_name() -> str:
+    # [FUNCTION DOC] HELPER: Name of the current process: contents of the Linux process comm
+    # file (stripped) or python if empty; falls back to the executable basename (or python) if
+    # the file cannot be opened. Reads a file.
     try:
         with open("/proc/self/comm") as f:
             return f.read().strip() or "python"
@@ -1176,6 +1255,9 @@ def _process_name() -> str:
 
 
 def _gpu_panel_const_extra(gpu: np.ndarray) -> list[tuple[str, str]]:
+    # [FUNCTION DOC] HELPER: Build the trace-wide string key/value pairs for the GPU panel:
+    # arch (sm_ plus compute capability of the first device in the column, or the current
+    # CUDA device if empty; skipped on any error), process_id, and process_name.
     """Trace-wide string args the GPU Compute panel reads off each kernel slice
     (extract_arg 'arch'/'process_id'/'process_name'): the traced device's arch
     (compute capability) plus the owning process. Constant across the trace, so
@@ -1195,6 +1277,11 @@ def _gpu_panel_const_extra(gpu: np.ndarray) -> list[tuple[str, str]]:
 def _merge_annotation_metadata(
     annotation: Any, metadata: Any, extra: dict[str, Any] | None = None
 ) -> str | None:
+    # [FUNCTION DOC] HELPER: Merge a graph annotation (list of mappings, mapping, or string),
+    # a collective metadata blob (JSON text, bytes or mapping), and extra entries into one JSON
+    # object string. Later sources override earlier keys; a string annotation is kept under the
+    # key annotation only if not already set. Bad metadata JSON is ignored. Returns None if the
+    # merged mapping is empty.
     """Merge a row's graph annotation(s) and collective-metadata blob into one JSON object whose
     top-level fields the native encoder spreads onto the render stage as extra_data -- the
     pftrace analog of the chrome path's per-arg spread (``_annotation_to_args``). ``annotation``
@@ -1231,6 +1318,8 @@ def _merge_annotation_metadata(
 
 
 def _lists_to_csr(lists: list, dtype) -> tuple:
+    # [FUNCTION DOC] HELPER: Flatten a list of sequences into compressed row form. Returns an
+    # int32 offsets array of length n plus one and a flat array of the given dtype.
     """Flatten a list-of-lists into a CSR: an int32 offsets array (length n + 1) and a flat
     values array of ``dtype``; slice i is values[offsets[i]:offsets[i + 1]]."""
     lengths = np.fromiter((len(x) for x in lists), dtype=np.int32, count=len(lists))
@@ -1243,6 +1332,9 @@ def _lists_to_csr(lists: list, dtype) -> tuple:
 
 
 def _render_stage_cols(render_columns: dict) -> list:
+    # [FUNCTION DOC] HELPER: List the render stages (kind, iid, name, category, columns) in
+    # the fixed stage order whose columns exist and have at least one row. Defines the shared
+    # row order for event id assignment and render stage building.
     """Authoritative surviving-stage selection: ``(ks, iid, name, cat, c)`` for each stage in
     ``_RENDER_STAGES`` order whose column is present and nonempty. Row ordering across the render
     stages is defined once here, so ``_assign_render_event_ids`` and ``_build_render_stages``
@@ -1257,6 +1349,11 @@ def _render_stage_cols(render_columns: dict) -> list:
 
 
 def _assign_render_event_ids(render_columns: dict, graph_deps: dict) -> tuple | None:
+    # [FUNCTION DOC] HELPER: Give every render-stage row a unique event id (one-based, in
+    # stage order) and derive launch links and dependency waits. Returns None if there are no
+    # rows; else (event ids, mapping of correlation id to event id arrays, wait offsets, wait
+    # ids). With dependencies, non-root graph nodes are left out of the launch links and each
+    # graphed row's waits list the event ids of its predecessors within the same correlation.
     """Assign a unique event_id per GPU render-stage row and derive the host-launch link and the
     graph node->node dependency arrows. Iterates :func:`_render_stage_cols` (which defines the
     render-stage row order shared with :func:`_build_render_stages`), so ``event_id[i]`` aligns
@@ -1336,6 +1433,14 @@ def _build_render_stages(
     event_id: Any,
     event_wait: tuple,
 ):
+    # [FUNCTION DOC] HELPER: Assemble the native GPU render stage payload from GPU op columns.
+    # Args: columns by kind, graphics process id, mutable name interning map and table (kernel
+    # names are added), per-row event ids, and the (offsets, ids) wait CSR. Returns None if
+    # no rows, else a tuple of specs (stages plus one hardware queue per stream lane), graphics
+    # contexts, stage columns, extra data columns, kernel launch data, interned kernel and
+    # argument tables, constant panel extras, and the per-row metadata blob CSR. Graphed ops move
+    # to resolver lanes; ends are clamped so same-lane ops (except annotations) do not overlap.
+    # Side effect: extends the name interning structures.
     """Build the GpuRenderStageEvent payload (gpu_specs, gfx_contexts, stage_cols, extra,
     launch, tables) for the native GPU Render Stages hardware-queue lanes, or None if there are
     no GPU ops. Each GPU op becomes one event on a (gpu_id, hardware-queue) lane tagged by stage
@@ -1553,6 +1658,10 @@ _ENV_COUNTERS = (
 
 
 def _build_gpu_counters(env: dict | None, active_devices: set):
+    # [FUNCTION DOC] Build counter series from sampled environment records (power, temperature,
+    # SM clock, memory clock, fan speed) restricted to active devices (all if the set is
+    # empty). Returns None if no data; else (specs of local id and name, gpu ids, timestamps,
+    # counter ids, float values). Counters with no samples are skipped.
     """Build the GpuCounterEvent payload from the sampled environment column:
     (specs, gpu_id[], ts[], counter_id[], value[]) or None. specs = [(counter_id, name), ...];
     the viewer renders these under "GPU / Counters / <gpu>" (sibling of Hardware Queues), keyed
@@ -1608,6 +1717,9 @@ _PM_METRIC_LABELS = {
 
 
 def _pm_label(metric: str) -> str:
+    # [FUNCTION DOC] HELPER: Friendly display name for a PM metric: look up the part before the
+    # first dot; unknown bases return the raw metric name; percent-of-peak rollups get a (%)
+    # suffix.
     base, _, rollup = metric.partition(".")
     friendly = _PM_METRIC_LABELS.get(base)
     if friendly is None:
@@ -1616,6 +1728,10 @@ def _pm_label(metric: str) -> str:
 
 
 def _build_pm_counters(pm: dict | None, active_devices: set):
+    # [FUNCTION DOC] Build counter series from PM sampling columns: every column other than
+    # the start time and device id is a metric, labeled by _pm_label, with samples restricted
+    # to active devices (all if empty). Returns None when there is no data or no sample passes;
+    # otherwise the same tuple shape as the environment builder.
     """Build the GpuCounterEvent payload from PM-sampling columns (start_ns/device_id plus one
     value column per metric, keyed by the CUPTI metric name): same tuple shape as
     :func:`_build_gpu_counters`. The metric columns are self-describing, so each is assigned a
@@ -1665,6 +1781,8 @@ _CYCLE_COUNTER = (0, "Cycles (Current Kernel)")
 
 
 def _device_clocks_hz(env: dict | None) -> dict[int, float]:
+    # [FUNCTION DOC] HELPER: Median SM clock per device in hertz from environment records of
+    # the speed kind (low 32 bits of the data are megahertz). Empty mapping if none.
     """Median SM clock (Hz) per device from the sampled ENVIRONMENT SPEED records
     (environment_kind==1; smClock is the low u32 of the union, in MHz)."""
     if not env or not len(env.get("start_ns", ())):
@@ -1681,6 +1799,10 @@ def _device_clocks_hz(env: dict | None) -> dict[int, float]:
 
 
 def _build_cycle_counters(kernel: dict | None, env: dict | None, active_devices: set):
+    # [FUNCTION DOC] Derive one elapsed-cycles sample per kernel (duration in seconds times the
+    # device median SM clock) at the kernel start, for kernels on active devices with a known
+    # clock. Returns None if kernels or clocks are missing or nothing qualifies; else the
+    # counter tuple plus a compute group id list and an integer-valued id list.
     """Per-kernel Cycles (gpc__cycles_elapsed = duration * clock) for the GPU Compute panel,
     derived as scalar math from each kernel's duration (activity record) and the device SM clock
     (env counter). One sample per kernel at its start, so every kernel gets an exact value (no
@@ -1718,6 +1840,10 @@ def _build_cycle_counters(kernel: dict | None, env: dict | None, active_devices:
 
 
 def _merge_counters(*parts):
+    # [FUNCTION DOC] Combine counter payloads (skipping None) into one: renumber each part's
+    # local counter ids onto a single increasing sequence, remap its id column and any compute
+    # group and integer-valued id lists, and concatenate the arrays. Returns None if no
+    # parts; else (specs, gpu ids, timestamps, counter ids, values, compute group, int ids).
     """Concatenate GpuCounterEvent payloads (the tuples from the per-source builders) into a single
     payload for the encoder. Each source uses its own local descriptor ids; here they are assigned
     onto a single monotonic sequence (0, 1, 2, ...) so ids are globally unique by construction, and
@@ -1759,6 +1885,8 @@ def _merge_counters(*parts):
 
 
 def _active_devices(columns: dict) -> set:
+    # [FUNCTION DOC] HELPER: Set of device ids appearing in the kernel, memcpy, or memset
+    # columns.
     """Devices that ran GPU work this window (so idle GPUs get no counters)."""
     active: set = set()
     for ks in ("kernel", "gpu_memcpy", "gpu_memset"):
@@ -1769,6 +1897,8 @@ def _active_devices(columns: dict) -> set:
 
 
 def _gpu_counter_process(device_id: int) -> str:
+    # [FUNCTION DOC] HELPER: String process id labeling the counter row for a device
+    # ("GPU N Counters").
     """String "pid" for a device's GPU counter row. A string pid makes Perfetto label the process
     row with the string verbatim ("GPU N Counters", no numeric suffix -- the same way kineto's
     "Spans"/"Traces" rows work) and keeps it a distinct process: an integer pid would show its
@@ -1777,6 +1907,10 @@ def _gpu_counter_process(device_id: int) -> str:
 
 
 def _build_chrome_counters(counters, base_ns: int) -> list[dict]:
+    # [FUNCTION DOC] Turn merged counter payload (or None) into Chrome counter events, one per
+    # sample with a known counter name, under a per-device string process; ids flagged
+    # integer-valued are emitted as ints, others as floats. Returns process sort index
+    # metadata events (one per device seen) followed by the counter events; empty if None.
     """Emit the merged GPU counter payload as chrome-trace "C" (counter) events -- one per
     sample -- in a per-device "GPU N Counters" process row, separate from the device's kernel/
     stream work (the JSON counterpart of the .pftrace "GPU / Counters / <gpu>" tracks)."""
@@ -1819,6 +1953,9 @@ def _build_chrome_counters(counters, base_ns: int) -> list[dict]:
 def _gpu_annotation_render_column(
     trace_window: dict, base_ns: int
 ) -> dict[str, Any] | None:
+    # [FUNCTION DOC] HELPER: Convert the synthesized GPU user annotation events into a
+    # render-stage style column mapping (start and end ns, device, stream, name). Returns None
+    # when there are no annotations.
     """Synthetic ``gpu_annotation`` render-stage column for the pftrace GPU hardware queues,
     built from the columnar window via the same synthesizer as the chrome gpu_user_annotation
     events -- so it lands on the kernels' capture stream, never a reassigned logical lane.
@@ -1847,6 +1984,13 @@ def _window_to_pftrace(
     output_path: str,
     compression_level: int = 1,
 ) -> None:
+    # [FUNCTION DOC] Encode the window plus the Kineto CPU events into a Perfetto-native trace
+    # file at output_path. Args: parsed Kineto trace mapping, window, base_ns origin, output
+    # path, gzip compression level. Builds process/thread tracks, CPU slices with args, runtime
+    # and driver slices linked to GPU render stages, overhead and sync slices, nests GPU stream
+    # slices, interns names and categories, builds render stages and counters, then calls the
+    # native encoder and writes its bytes. Side effects: writes the file; raises whatever the
+    # encoder or file open raises.
     """Encode the monitor's columnar window straight to a Perfetto-native trace (.pftrace),
     concatenated with the Kineto CPU events -- NO chrome-dict materialization. Full parity with
     the chrome path's per-event args, ac2g flows, and collective metadata, emitted as
@@ -1866,19 +2010,27 @@ def _window_to_pftrace(
     gpu_track_uuids: set = set()  # stream tracks to nest post-assembly (serial slices)
 
     def _col(ks):
+        # [FUNCTION DOC] HELPER: Column mapping for a kind, or None if absent or empty.
         c = columns.get(ks)
         return c if c and len(next(iter(c.values()))) else None
 
     def pid_int(pid):
+        # [FUNCTION DOC] HELPER: Descriptor integer for an id: integers are masked to
+        # non-negative 31 bits; other ids (strings) get stable small numbers from a counter.
         # int32 descriptor id (cosmetic); map any id to a stable NON-negative value.
         if isinstance(pid, int):
             return pid & 0x7FFFFFFF
         return pid_ints.setdefault(pid, len(pid_ints) + 1)
 
     def add_track(uuid, parent, is_proc, pid, tid, name):
+        # [FUNCTION DOC] HELPER: Append a track descriptor (uuid, parent uuid, process flag,
+        # integer pid, integer tid, name string) to the tracks list.
         tracks.append((uuid, parent, is_proc, pid_int(pid), pid_int(tid), str(name)))
 
     def track_for(pid, tid, proc_label="", thr_label=""):
+        # [FUNCTION DOC] HELPER: Get or create the thread track uuid for (pid, tid), creating
+        # the parent process track first if needed. Names prefer Kineto metadata names, then
+        # the given labels, then the ids. Returns the thread track uuid.
         if ("p", pid) not in uuids:
             uuids[("p", pid)] = len(uuids) + 1
             add_track(
@@ -1903,6 +2055,10 @@ def _window_to_pftrace(
         return uuids[key]
 
     def gpu_uuids(pid_arr, tid_arr, proc_fmt, thr_fmt, is_gpu=True):
+        # [FUNCTION DOC] HELPER: Map whole pid and tid columns to track uuids. Unique pairs are
+        # packed into one key, each registered via track_for (with formatted labels, tid
+        # sign-extended), and mapped back. When is_gpu is true the tracks are recorded for
+        # later slice nesting. Returns a uint64 array aligned with the input.
         # (pid, tid) -> uuid for whole columns: unique pairs (packed into one int64 key) each
         # register a track; map back via the inverse index (no per-event Python). is_gpu marks
         # GPU stream tracks (serial slices) for the post-assembly overlap nesting.
@@ -1922,6 +2078,8 @@ def _window_to_pftrace(
         return ids[inv]
 
     def int_anno(key, col, skip_zero=False, present=None):
+        # [FUNCTION DOC] HELPER: Package an integer annotation column as a tuple (key, int64
+        # column, skip-zero flag, optional uint8 presence mask or None).
         # present: optional per-slice uint8 mask (emit the int only where set).
         return (
             key,
@@ -1931,6 +2089,8 @@ def _window_to_pftrace(
         )
 
     def json_anno(blobs):
+        # [FUNCTION DOC] HELPER: Encode per-slice blobs (text, bytes or None) into a
+        # compressed-row pair: int32 offsets and one joined bytes buffer; None becomes empty.
         # blobs: per-slice str/bytes/None -> a CSR (offsets, buffer) varlen column; empty None.
         enc = [
             b"" if b is None else (b if isinstance(b, bytes) else b.encode())
@@ -1954,6 +2114,10 @@ def _window_to_pftrace(
         gpu_corr=None,
         cats=None,
     ):
+        # [FUNCTION DOC] HELPER: Append a slice group (start, end, track uuid arrays, names,
+        # integer/string/array/json annotation lists, optional flow ids, optional per-slice
+        # launched event id lists stored in compressed-row form, optional category strings) to
+        # the groups list, converting arrays to fixed dtypes.
         # cats: per-slice category strings (or None), interned into category_iids so
         # the viewer distinguishes cpu_op / cuda_runtime / cuda_driver / user_annotation.
         groups.append(
@@ -2338,6 +2502,16 @@ def merge_trace_window_into_chrome_trace(
     trace_name: str | None = None,
     pftrace_compression_level: int = 1,
 ) -> None:
+    # [FUNCTION DOC] Public entry point. Read the Kineto trace (gzip if the path ends .gz;
+    # JSON via orjson when present) and write the merged trace to output_path. If the output
+    # path contains .pftrace, delegate to the Perfetto-native writer and return. Otherwise
+    # replace the Kineto profiler span events, insert the window's metadata after the leading
+    # metadata events, append the GPU/API events and counters, add fresh span and window
+    # marker events computed from the duration events, set the trace name (trace_name or the
+    # output path), and write JSON (gzip level 1 if path ends .gz). Raises RuntimeError if no
+    # duration events exist. Side effects: reads and writes files.
+    # KNOWN ISSUE: the filtering of original events and metadata scan call a mapping method on
+    # every event, so a non-mapping entry would raise even though earlier loops guard for it.
     cpu_trace_path = str(cpu_trace_path)
     output_path = str(output_path)
     input_opener = gzip.open if cpu_trace_path.endswith(".gz") else open
