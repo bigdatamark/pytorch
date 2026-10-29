@@ -1,3 +1,9 @@
+# [MODULE DOC] Build script for the torch_test_cpp_extension test package. At import time it
+# chooses compiler flags per platform, then conditionally builds extension modules: always
+# the cpp, maia and rng C++ extensions; CUDA, torch_library, cublas and cusolver modules when
+# CUDA/ROCm is available; mps when MPS is available; sycl when XPU and ninja are enabled
+# (USE_NINJA=1); cuda_dlink with ninja and CUDA on non-Windows. Then calls setup, registering
+# the torch.backends autoload entry point.
 import os
 import sys
 

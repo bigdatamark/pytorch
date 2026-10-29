@@ -1,5 +1,9 @@
 # Owner(s): ["module: cpp"]
 
+# [MODULE DOC] Test that the python_agnostic example extension wheel is truly Python
+# agnostic (abi3 wheel name, no libtorch_python dependency, no unresolved Python symbols).
+# Instantiated for cuda and xpu only. Building the wheel happens in setUpClass.
+
 import os
 import shutil
 import subprocess
@@ -19,8 +23,14 @@ from torch.testing._internal.common_utils import (
 
 
 class TestPythonAgnostic(TestCase):
+    # [CLASS DOC] Builds the extension wheel once and inspects the artifacts. State:
+    # extension_root (the extension directory) and dist_dir (its dist folder).
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Sets extension_root and dist_dir, deletes any existing dist directory,
+        # and builds the wheel with the build module without isolation in the extension root.
+        # Raises RuntimeError if the build exits nonzero. Side effects: removes and creates
+        # directories, runs a subprocess.
         # Wipe the dist dir if it exists
         cls.extension_root = Path(__file__).parent.parent
         cls.dist_dir = os.path.join(cls.extension_root, "dist")
@@ -39,6 +49,11 @@ class TestPythonAgnostic(TestCase):
     )
     @unittest.skipIf(not IS_LINUX, "test requires linux tools ldd and nm")
     def test_extension_is_python_agnostic(self, device):
+        # [FUNCTION DOC] Requires CUDA or XPU and Linux. Checks exactly one wheel exists in
+        # dist and its name has the cp39-abi3 tag; checks exactly one built shared library
+        # exists, that ldd output does not mention torch_python, and that the undefined
+        # symbols from nm contain no Python-prefixed names. Runs ldd and nm subprocesses.
+        # KNOWN ISSUE: the Python-symbol check matches any substring "Py", not just a prefix.
         # For this test, run_test.py will call `python -m build --wheel --no-isolation` in the
         # cpp_extensions/python_agnostic_extension folder, where the extension and
         # setup calls specify py_limited_api to `True`. To approximate that the

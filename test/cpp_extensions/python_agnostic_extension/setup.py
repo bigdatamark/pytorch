@@ -3,6 +3,11 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+# [MODULE DOC] Build script for the python_agnostic example extension. Defines a custom
+# clean command and an extension factory choosing CUDA (.cu sources) or SYCL/XPU (.sycl
+# sources) under python_agnostic/csrc, built with the limited Python API (abi3, cp39).
+# Calls setup at import time (it is meant to be run as a script).
+
 import distutils.command.clean
 import shutil
 from pathlib import Path
@@ -18,7 +23,12 @@ CSRC_DIR = ROOT_DIR / "python_agnostic" / "csrc"
 
 
 class clean(distutils.command.clean.clean):
+    # [CLASS DOC] HELPER: Setuptools clean command that also deletes built shared libraries
+    # and the build, dist and egg-info directories. Stateless.
     def run(self):
+        # [FUNCTION DOC] HELPER: Runs the default clean, then removes every .so file under the
+        # package directory and the build, dist and egg-info directories (errors ignored for
+        # directories). Side effect: deletes files and directories on disk.
         # Run default behavior first
         distutils.command.clean.clean.run(self)
 
@@ -37,6 +47,10 @@ class clean(distutils.command.clean.clean):
 
 
 def get_extension():
+    # [FUNCTION DOC] HELPER: Returns a one-element list with the python_agnostic._C extension.
+    # Uses a CUDA extension with .cu sources if CUDA is available, else a SYCL extension with
+    # .sycl sources if XPU is available, else raises AssertionError. Sources are sorted and
+    # the limited API flag is enabled.
     extra_compile_args = {
         "cxx": ["-fdiagnostics-color=always"],
     }

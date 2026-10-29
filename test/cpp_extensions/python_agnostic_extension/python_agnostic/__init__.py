@@ -1,3 +1,9 @@
+# [PACKAGE DOC] python_agnostic: example extension built against the limited Python API.
+# Importing it loads the compiled _C shared library next to this file (exactly one must
+# exist), imports the ops submodule that defines the ultra_norm operator, and then runs a
+# self-check on a CUDA or XPU device comparing ultra_norm against a plain norm. Raises
+# AssertionError if the library is missing/ambiguous, no CUDA/XPU device exists, or the
+# result differs. Exports ops (ultra_norm).
 from pathlib import Path
 
 import torch

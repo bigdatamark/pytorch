@@ -1,5 +1,12 @@
 # Owner(s): ["module: PrivateUse1"]
 
+# [MODULE DOC] Tests for the PrivateUse1 device-type test infrastructure as used by the
+# openreg backend: bypassing onlyCUDA/onlyOn restrictions, OpInfo op_overrides and
+# op_allowlist, per-test and dtype-aware exclusions, and the distributed backend hook.
+# At import time it temporarily sets PrivateUse1TestBase test configs and instantiates the
+# device-generic test classes for the openreg device only; each class verifies in
+# tearDownClass that the expected variants did or did not run.
+
 import unittest
 from collections import defaultdict
 from contextlib import contextmanager
@@ -20,6 +27,9 @@ from torch.testing._internal.opinfo.core import DecorateInfo, OpInfo
 
 
 class TestBypassDeviceRestrictions(TestCase):
+    # [CLASS DOC] Checks that a backend opting in through bypass_device_restrictions can run
+    # tests gated by onlyCUDA and onlyOn. State: executed_count, a class-level counter of
+    # executed test bodies, verified to equal two in tearDownClass.
     """Verify that PrivateUse1 backends can run tests decorated with @onlyCUDA.
 
     PrivateUse1TestBase sets bypass_device_restrictions = False by default.
@@ -33,6 +43,8 @@ class TestBypassDeviceRestrictions(TestCase):
     executed_count = 0
 
     def setUp(self):
+        # [FUNCTION DOC] Sets the instance flag that opts in to bypassing device restrictions
+        # (shadowing the base class default of False), then runs the base setUp.
         # Explicitly opt-in: instance attribute shadows the False default on
         # PrivateUse1TestBase so @onlyOn-based decorators allow this test to run.
         self.bypass_device_restrictions = True
@@ -40,6 +52,8 @@ class TestBypassDeviceRestrictions(TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] Raises AssertionError unless exactly two test bodies executed (the
+        # onlyCUDA and onlyOn tests), then calls the base tearDownClass.
         expected_runs = 2
         actual_runs = cls.executed_count
         if actual_runs != expected_runs:
@@ -52,16 +66,23 @@ class TestBypassDeviceRestrictions(TestCase):
 
     @onlyCUDA
     def test_bypass_only_cuda(self, device):
+        # [FUNCTION DOC] Gated by onlyCUDA but must run on openreg; increments the executed
+        # counter and checks the device type is openreg.
         type(self).executed_count += 1
         self.assertEqual(torch.device(device).type, "openreg")
 
     @onlyOn(["cuda"])
     def test_bypass_only_on(self, device):
+        # [FUNCTION DOC] Gated by onlyOn for cuda but must run on openreg; increments the
+        # executed counter and checks the device type is openreg.
         type(self).executed_count += 1
         self.assertEqual(torch.device(device).type, "openreg")
 
 
 def _make_dummy_op(name, **kwargs):
+    # [FUNCTION DOC] HELPER: Builds an OpInfo with the given name, an identity op, float32 and
+    # float64 dtypes and a sample generator that yields no samples; extra keyword arguments
+    # (for example decorators) are passed to OpInfo.
     return OpInfo(
         name,
         op=lambda x: x,
@@ -92,6 +113,9 @@ op_combined_unsupported = _make_dummy_op("op_combined_unsupported")
 
 @contextmanager
 def _temp_test_configs(obj, **configs):
+    # [FUNCTION DOC] HELPER: Context manager that applies the given test configs to obj via
+    # its set_test_configs method and restores the previous values (None if unset) on exit,
+    # even if the body raises. Side effect: mutates obj's configuration temporarily.
     backup = {k: getattr(obj, k, None) for k in configs}
     obj.set_test_configs(**configs)
     try:
@@ -101,6 +125,9 @@ def _temp_test_configs(obj, **configs):
 
 
 class TestDeviceTypeOpenReg(TestCase):
+    # [CLASS DOC] Exercises op_overrides (skip, expected failure, dtype-specific skip,
+    # precision override) on dummy OpInfos. State: _executed, a class-level mapping from op
+    # name to the number of test bodies that ran, checked in tearDownClass.
     # Track which test variants actually executed so we can assert on them in
     # tearDownClass and catch silent regressions (e.g. accidentally skipping
     # all op variants or executing too few/many).
@@ -108,6 +135,10 @@ class TestDeviceTypeOpenReg(TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] Raises AssertionError unless op_normal and op_precision ran, op_skip
+        # and op_xfail bodies never ran, and op_skip_f32 ran exactly once (float64 only); then
+        # calls the base tearDownClass.
+        # KNOWN ISSUE: the op_skip_f32 failure message lacks a space between its two parts.
         should_run = ("op_normal", "op_precision")
         should_not_run = ("op_skip", "op_xfail")
         for op_name in should_run:
@@ -125,6 +156,10 @@ class TestDeviceTypeOpenReg(TestCase):
 
     @ops([op_normal, op_skip, op_skip_f32, op_xfail, op_precision])
     def test_op(self, device, dtype, op):
+        # [FUNCTION DOC] Op-parametrized body. For op_skip and op_xfail it fails deliberately
+        # (they must be skipped or expected-fail by overrides). For op_precision with float32
+        # it checks the effective precision is the op_overrides value, not the OpInfo one.
+        # Otherwise it increments the per-op execution counter.
         if op.name in ("op_skip", "op_xfail"):
             self.fail(f"{op.name} deliberately fails")
         if op.name == "op_precision" and dtype == torch.float32:
@@ -140,6 +175,8 @@ class TestDeviceTypeOpenReg(TestCase):
 
     @ops([op_normal])
     def test_op_narrow_ops(self, device, dtype, op):
+        # [FUNCTION DOC] Runs with only op_normal exposed to confirm that extra op_overrides
+        # keys naming ops absent from this list do not raise a KeyError. Body is empty.
         """Verify that having extra entries in op_overrides that are NOT present in
         the @ops list does not raise a KeyError (safety check in _apply_op_overrides).
 
@@ -151,10 +188,14 @@ class TestDeviceTypeOpenReg(TestCase):
 
 
 class TestSkippedSpecificTestCases(TestCase):
+    # [CLASS DOC] Verifies per-test exclusion: one test is excluded for openreg and one runs.
+    # State: executed_count, a class-level counter that must equal one in tearDownClass.
     executed_count = 0
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] Raises AssertionError unless exactly one test body executed, then
+        # calls the base tearDownClass.
         expected_runs = 1
         if cls.executed_count != expected_runs:
             raise AssertionError(
@@ -164,25 +205,38 @@ class TestSkippedSpecificTestCases(TestCase):
         super().tearDownClass()
 
     def test_runs(self, device):
+        # [FUNCTION DOC] Non-excluded test: increments the counter and checks the device type
+        # is openreg.
         type(self).executed_count += 1
         self.assertEqual(torch.device(device).type, "openreg")
 
     def test_skipped(self, device):
+        # [FUNCTION DOC] Excluded for openreg via test_exclusions, so it should never be
+        # instantiated; if it runs it increments the counter and then fails deliberately.
         type(self).executed_count += 1
         self.assertEqual(torch.device(device).type, "openreg")
         self.fail("This test should not be instantiated for openreg")
 
 
 class TestSkippedWholeTestClass(TestCase):
+    # [CLASS DOC] Verifies whole-class exclusion: all members are excluded for openreg, so no
+    # test should be instantiated.
     def test_skipped_class_member(self, device):
+        # [FUNCTION DOC] Must never run for openreg; fails deliberately if it does.
         self.fail("This class should not be instantiated for openreg")
 
 
 class TestDtypeAwareExclusions(TestCase):
+    # [CLASS DOC] Verifies dtype-specific exclusions of dtype-parametrized tests. State:
+    # executed_dtypes, a class-level mapping from test name to the list of dtypes (or dtype
+    # tuples) that actually ran, compared against the expected mapping in tearDownClass.
     executed_dtypes: dict = defaultdict(list)
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] Raises AssertionError unless the recorded dtypes equal the expected
+        # mapping (float64 only for the single dtype test, one float64/int64 tuple for the
+        # tuple test, nothing for the fully excluded test), then calls the base tearDownClass.
         expected = {
             "test_dtype_filter": [torch.float64],
             "test_dtype_tuple_filter": [(torch.float64, torch.int64)],
@@ -196,21 +250,30 @@ class TestDtypeAwareExclusions(TestCase):
 
     @dtypes(torch.float32, torch.float64)
     def test_dtype_filter(self, device, dtype):
+        # [FUNCTION DOC] Float32 is excluded for openreg, so only float64 runs; records the
+        # dtype and checks the device type is openreg.
         self.assertEqual(torch.device(device).type, "openreg")
         type(self).executed_dtypes["test_dtype_filter"].append(dtype)
 
     @dtypes(torch.float32, torch.float64)
     def test_all_dtypes_excluded(self, device, dtype):
+        # [FUNCTION DOC] Every dtype variant is excluded for openreg, so this must never run;
+        # fails deliberately if it does.
         self.assertEqual(torch.device(device).type, "openreg")
         self.fail("This method should not have any dtype variants for openreg")
 
     @dtypes((torch.float64, torch.int32), (torch.float64, torch.int64))
     def test_dtype_tuple_filter(self, device, dtypes):
+        # [FUNCTION DOC] Tuple-dtype variants where int32 is excluded, so only the
+        # float64/int64 pair runs; records the tuple and checks the device type is openreg.
         self.assertEqual(torch.device(device).type, "openreg")
         type(self).executed_dtypes["test_dtype_tuple_filter"].append(dtypes)
 
 
 class TestSupportedOpsWithOverrides(TestCase):
+    # [CLASS DOC] Verifies op_allowlist filtering combined with op_overrides. State:
+    # _executed_combined, a class-level mapping from op name to execution count; the
+    # supported op must run, the overridden-skip op and the non-allowlisted op must not.
     """Verify that op_allowlist filtering works together with op_overrides.
 
     op_allowlist filters which ops generate variants.
@@ -221,6 +284,8 @@ class TestSupportedOpsWithOverrides(TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] Raises AssertionError unless the supported op ran and neither the
+        # skipped op nor the non-allowlisted op ran, then calls the base tearDownClass.
         # op_combined_supported should run (it's in op_allowlist, no skip decorator)
         if cls._executed_combined["op_combined_supported"] == 0:
             raise AssertionError("op_combined_supported should have run")
@@ -236,6 +301,7 @@ class TestSupportedOpsWithOverrides(TestCase):
 
     @ops([op_combined_supported, op_combined_skip, op_combined_unsupported])
     def test_combined_filter(self, device, dtype, op):
+        # [FUNCTION DOC] Increments the execution counter for the op being tested.
         type(self)._executed_combined[op.name] += 1
 
 
@@ -303,7 +369,11 @@ with _temp_test_configs(
 
 @unittest.skipIf(not dist.is_available(), "Distributed not available, skipping tests")
 class TestDistributedBackendHook(TestCase):
+    # [CLASS DOC] Skipped when torch.distributed is unavailable. Checks the test base class
+    # reports the distributed backend associated with the openreg device.
     def test_distributed_backend_for_openreg(self, device):
+        # [FUNCTION DOC] Asserts the instantiated class's distributed_backend hook returns
+        # "occl".
         self.assertEqual(type(self).distributed_backend(), "occl")
 
 

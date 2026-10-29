@@ -1,9 +1,18 @@
+# [MODULE DOC] Windows-only helper that preloads the extension's DLLs from the package lib
+# directory so the native module can import. No import-time side effects beyond imports.
 import ctypes
 import glob
 import os
 
 
 def _load_dll_libraries() -> None:
+    # [FUNCTION DOC] HELPER: Loads every DLL under the package "lib" directory via kernel32.
+    # Adds the directory to the DLL search path, tries LoadLibraryEx with safe flags first and
+    # falls back to prepending the directory to PATH (once) and plain LoadLibrary. Takes no
+    # arguments, returns nothing; raises an OS error naming the DLL on load failure (except
+    # error 126 on the first attempt, which triggers the fallback). Mutates the PATH
+    # environment variable, the process error mode (restored at the end) and DLL search dirs.
+    # KNOWN ISSUE: the error mode is not restored if an error is raised mid-loop.
     openreg_dll_path = os.path.join(os.path.dirname(__file__), "lib")
 
     kernel32 = ctypes.WinDLL("kernel32.dll", use_last_error=True)
