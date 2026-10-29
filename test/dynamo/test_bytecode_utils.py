@@ -1,4 +1,9 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests for torch._dynamo bytecode_transformation and bytecode_analysis: linetable
+# and position round-tripping, jump offsets, exception table encode/parse/compute/propagate,
+# dead-code removal, bytecode_from_template, and the bytecode hook. Many tests are gated by
+# Python version (3.10 vs 3.11+ vs 3.12+). No import-time side effects besides imports;
+# run_tests is invoked under the main guard.
 
 import collections
 import dis
@@ -12,6 +17,10 @@ from torch._dynamo.testing import skipIfNotPy311, skipIfNotPy312
 
 
 def coalesced_co_lines(code):
+    # [FUNCTION DOC] HELPER: Return the code object's co_lines() entries as a list of (start,
+    # end, lineno) tuples, merging adjacent entries that have the same line number and touch
+    # (previous end equals next start). Used to compare linetables without the benign
+    # non-coalesced differences the assembler can emit.
     # co_lines() entries are not guaranteed to be maximally coalesced: our
     # linetable assembler can emit adjacent entries with the same line number
     # (e.g. around EXTENDED_ARG) that CPython's compiler would fold into one.
@@ -27,9 +36,18 @@ def coalesced_co_lines(code):
 
 
 class BytecodeTests(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Test case (dynamo TestCase) with checks on bytecode assembly and
+    # transformation utilities: linetable writers, jump offsets, exception-table handling,
+    # template bytecode extraction and analysis regressions.
     @skipIfNotPy311
     def test_linetable_311_writer1(self):
+        # [FUNCTION DOC] Reassemble a simple function's cleaned instructions with
+        # clean_and_assemble_instructions and assert the new code's co_positions equal the
+        # original's, and that coalesced co_lines match. Python 3.11+ only.
+        # Nested fn is the function under test; g is an undefined global that is never called.
         def fn():
+            # [FUNCTION DOC] HELPER: Sample function with several locals and an f-string; never
+            # called, only its code object is inspected.
             a = 10
             b = 20
             # prevent LOAD_FAST_LOAD_FAST in 3.13 by wrapping b with g()
@@ -52,6 +70,11 @@ class BytecodeTests(torch._dynamo.test_case.TestCase):
 
     @skipIfNotPy311
     def test_linetable_311_writer2(self):
+        # [FUNCTION DOC] Build a function via exec with many local assignments (forcing
+        # EXTENDED_ARG) and an attribute-method call, reassemble it, and assert EXTENDED_ARG and
+        # the LOAD_METHOD/LOAD_ATTR opcode survive in the instruction list. Then assert the
+        # reassembled code's co_positions match the per-instruction positions (repeated by
+        # instruction size). Python 3.11+ only.
         """
         test large ops (LOAD_METHOD) and EXTENDED_ARGS
         fn_str is in the form:
@@ -107,7 +130,11 @@ def fn():
         "linetable test for Python 3.10",
     )
     def test_linetable_310_writer(self):
+        # [FUNCTION DOC] On Python 3.10 only, assemble the instructions of a simple function
+        # with bytecode_transformation.assemble and assert the resulting linetable equals the
+        # original co_linetable.
         def fn():
+            # [FUNCTION DOC] HELPER: Sample function whose bytecode is assembled; never called.
             a = 10
             b = 20
             c = a + b
@@ -119,12 +146,18 @@ def fn():
         self.assertTrue(result[1] == fn.__code__.co_linetable)
 
     def test_if_tensor_is_none(self):
+        # [FUNCTION DOC] Compile a function that tests a value against None (is / is not) with
+        # the eager backend and fullgraph, and assert the result is 6 when called with None and
+        # a tensor. On 3.11+ also assert cleaned_instructions yields no opcode whose name
+        # contains _NONE (the new None-jump opcodes are not supported).
         """
         Python 3.11 adds new jump instructions that check if
         TOS is None. We do not support these instructions.
         """
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Function under compile; multiplies z by 2 if x is None and
+            # by 3 if y is not None, returns z.
             z = 1
             if x is None:
                 z *= 2
@@ -142,10 +175,21 @@ def fn():
 
     @skipIfNotPy311
     def test_py311_jump_offset(self):
+        # [FUNCTION DOC] For each of forward/backward jump opcodes and two targets, assemble a
+        # hand-built instruction list (including large LOAD_GLOBAL instructions) and check the
+        # final jump instruction's direction is as expected (FORWARD or BACKWARD in its name).
+        # Then install the code on a dummy function, call it, and also call it through
+        # torch.compile with the eager backend; both must return the expected constant. Python
+        # 3.11+ only.
         new_inst = bytecode_transformation.create_instruction
         consts = (None, 1, 2, 3, 4)
 
         def create_test_code(jump_opname, target_idx):
+            # [FUNCTION DOC] HELPER: Build and assemble an instruction list with a RESUME, a
+            # forward jump to the jump instruction under test, and two return-value targets; the
+            # jump_opname jumps to the target selected by target_idx. Returns the (instructions,
+            # code) pair from clean_and_assemble_instructions using a fixed ordered mapping of
+            # code options.
             targets = [
                 new_inst("LOAD_CONST", argval=1),
                 new_inst("LOAD_CONST", argval=3),
@@ -231,6 +275,8 @@ def fn():
             # run the code and check result
 
             def dummy_fn():
+            # [FUNCTION DOC] HELPER: Empty placeholder function whose __code__ is replaced by
+            # the assembled code.
                 pass
 
             dummy_fn.__code__ = code
@@ -240,6 +286,9 @@ def fn():
             self.assertEqual(dummy_opt(), test[3])
 
     def test_exception_table_encode_varint(self):
+        # [FUNCTION DOC] Round-trip two integers through encode_exception_table_varint and
+        # decode_exception_table_varint (decoding from a byte iterator until StopIteration) and
+        # assert the decoded list equals the inputs.
         # these numbers have no real meaning to them
         nums = [
             0b111_101010_000000,
@@ -261,7 +310,12 @@ def fn():
 
     @skipIfNotPy311
     def test_exception_table_parsing(self):
+        # [FUNCTION DOC] Parse a function's co_exceptiontable with parse_exception_table and
+        # reassemble it with assemble_exception_table; assert the bytes are identical to the
+        # original. Python 3.11+ only.
         def fn():
+            # [FUNCTION DOC] HELPER: Function with nested try/with/except/finally; only its
+            # exception table is used.
             try:
                 with a():
                     b()
@@ -280,7 +334,12 @@ def fn():
 
     @skipIfNotPy311
     def test_exception_table_e2e(self):
+        # [FUNCTION DOC] Run transform_code_object with a no-op transformation on a function
+        # containing try/with/except/finally and assert the resulting exception table equals the
+        # original. Python 3.11+ only.
         def fn():
+            # [FUNCTION DOC] HELPER: Function with nested try/with/except/finally; only its code
+            # is used.
             try:
                 with a():
                     b()
@@ -292,6 +351,7 @@ def fn():
             f()
 
         def nothing(*args):
+            # [FUNCTION DOC] HELPER: No-op transformation callback that ignores its arguments.
             pass
 
         code, _ = bytecode_transformation.transform_code_object(fn.__code__, nothing)
@@ -299,15 +359,21 @@ def fn():
 
     @skipIfNotPy311
     def test_exception_table_e2e_2(self):
+        # [FUNCTION DOC] Same as the end-to-end exception table round trip, but for a function
+        # whose try region ends with a large instruction (LOAD_GLOBAL); asserts the exception
+        # table is unchanged after a no-op transform_code_object. Python 3.11+ only.
         # last instructions of an exn_table entry is a large instruction
         # i.e., LOAD_GLOBAL a
         def fn():
+            # [FUNCTION DOC] HELPER: Function returning a global inside try/except; only its
+            # code is used.
             try:
                 return a
             except Exception:
                 pass
 
         def nothing(*args):
+            # [FUNCTION DOC] HELPER: No-op transformation callback that ignores its arguments.
             pass
 
         code, _ = bytecode_transformation.transform_code_object(fn.__code__, nothing)
@@ -315,6 +381,10 @@ def fn():
 
     @skipIfNotPy311
     def test_exception_table_entry_propagation(self):
+        # [FUNCTION DOC] Create ten NOP instructions, attach overlapping exception table entries
+        # to some of them, run propagate_inst_exn_table_entries, and assert every instruction
+        # ends up with an entry whose target is the expected instruction (the innermost covering
+        # entry's target). Python 3.11+ only.
         insts = []
         for _ in range(10):
             insts.append(bytecode_transformation.create_instruction("NOP"))
@@ -344,6 +414,10 @@ def fn():
 
     @skipIfNotPy311
     def test_compute_exception_table_nested(self):
+        # [FUNCTION DOC] Create twenty NOP instructions with nested and disjoint exception table
+        # entries, run update_offsets and compute_exception_table, and assert the resulting
+        # table has the expected nine entries with start, end and target equal to the expected
+        # instruction indices times two (instruction size). Python 3.11+ only.
         insts = []
         for _ in range(20):
             insts.append(bytecode_transformation.create_instruction("NOP"))
@@ -392,6 +466,11 @@ def fn():
 
     @skipIfNotPy311
     def test_remove_dead_code_with_exn_table_entries(self):
+        # [FUNCTION DOC] Build instructions where an exception-table range's start and end
+        # markers are in dead code (after an unconditional jump), propagate entries, run
+        # remove_dead_code, and assert the dead instructions are removed, the targets remain
+        # (five instructions left), and the recomputed table has a single entry with start 2,
+        # end 4, target 6. Python 3.11+ only.
         create_instruction = bytecode_transformation.create_instruction
         target1 = create_instruction("NOP")
         target2 = create_instruction("NOP")
@@ -425,7 +504,13 @@ def fn():
         self.assertEqual(tab[0].target, 6)
 
     def test_bytecode_from_template(self):
+        # [FUNCTION DOC] Call bytecode_from_template on a function with a varname_map renaming
+        # locals/globals and assert every instruction has no starts_line, loaded names are not
+        # the original mapped names, non-global loads have no arg, and no RETURN instructions
+        # remain.
         def fn(d1):
+            # [FUNCTION DOC] HELPER: Template function; iterates d1.items() and stores into
+            # global d2, never called.
             for k, v in d1.items():
                 d2[k] = v
 
@@ -445,11 +530,17 @@ def fn():
 
     @skipIfNotPy311
     def test_bytecode_from_template_noprefix(self):
+        # [FUNCTION DOC] Assert that for a closure function the plain disassembly contains
+        # RESUME and COPY_FREE_VARS but the instructions from bytecode_from_template do not
+        # (prefix instructions removed). Python 3.11+ only.
         # Test that 3.11+ prefix instructions are removed
         def gen_fn():
+            # [FUNCTION DOC] HELPER: Factory returning a closure that reads a free variable.
             cl = None
 
             def fn():
+            # [FUNCTION DOC] HELPER: Closure returning its free variable; the code under
+            # inspection.
                 return cl
 
             return fn
@@ -467,9 +558,13 @@ def fn():
         self.assertNotIn("COPY_FREE_VARS", names)
 
     def test_bytecode_from_template_noreturn1(self):
+        # [FUNCTION DOC] With noprefix False, assert a function with multiple returns converts
+        # to the same number of instructions where each RETURN becomes a jump targeting a final
+        # NOP appended instruction (the last return becomes the NOP).
         # Test that functions with multiple returns will have their
         # returns replaced with jumps to the end
         def fn():
+            # [FUNCTION DOC] HELPER: Template function with two return statements.
             if x:
                 return y
             z = 3
@@ -494,8 +589,13 @@ def fn():
     # In 3.8, `fn` ends with a RETURN_VALUE.
     @skipIfNotPy311
     def test_bytecode_from_template_noreturn2(self):
+        # [FUNCTION DOC] For a function that ends with a raise (no final return), assert
+        # bytecode_from_template with noprefix False appends a NOP, keeps the final raise
+        # instruction before it, and turns each RETURN into a jump to the NOP. Python 3.11+
+        # only.
         # Test function that doesn't end with RETURN_VALUE
         def fn():
+            # [FUNCTION DOC] HELPER: Template function with two returns and a trailing raise.
             if x:
                 return x
             if x:
@@ -517,8 +617,12 @@ def fn():
     @unittest.skipIf(sys.version_info >= (3, 14), "3.14+ removed RETURN_CONST")
     @skipIfNotPy312
     def test_bytecode_from_template_noreturn_const(self):
+        # [FUNCTION DOC] For Python 3.12 and 3.13, assert RETURN_CONST instructions in the
+        # template are replaced by LOAD_CONST followed by a jump to the final NOP (except the
+        # final one, which is followed directly by the NOP).
         # Test 3.12+ RETURN_CONST
         def fn():
+            # [FUNCTION DOC] HELPER: Template function with two constant returns.
             if x:
                 return 1
             return 0
@@ -543,9 +647,15 @@ def fn():
             insts_i += 1
 
     def test_bytecode_analysis_jump_backward_no_interrupt(self):
+        # [FUNCTION DOC] Regression test: compile with the eager backend a function that
+        # graph-breaks and then runs a no_grad block with try/except handlers, so bytecode_analysis
+        # analyzes the remainder (JUMP_BACKWARD_NO_INTERRUPT must be treated as terminal in
+        # 3.13+). Asserts the result is correct.
         # bytecode_analysis fails if JUMP_BACKWARD_NO_INTERRUPT is not terminal in 3.13+
         @torch.compile(backend="eager")
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compiled function that graph-breaks, then adds 1 to x
+            # inside a no_grad try/except.
             # graph break causes bytecode_analysis to analyze the rest of this function
             torch._dynamo.graph_break()
             with torch.no_grad():
@@ -561,6 +671,11 @@ def fn():
 
     # https://github.com/pytorch/pytorch/issues/160471
     def test_extended_args_starts_line(self):
+        # [FUNCTION DOC] Regression test for issue 160471: build via exec a function with 300
+        # additions of large constants (producing an EXTENDED_ARG that has starts_line set),
+        # assert such an instruction exists, then run transform_code_object with a callback that
+        # checks an instruction with starts_line 301 exists. Fails the test if either is
+        # missing.
         # NOTE: need to LOAD_CONST i before LOAD_FAST x
         # in order to get an EXTENDED_ARG with starts_line set
         # NOTE: 3.14+ introduced LOAD_SMALL_INT, so integers need to be >= 256
@@ -580,6 +695,9 @@ def fn():
             )
 
         def transformations(instructions, _):
+            # [FUNCTION DOC] HELPER: Transformation callback that scans for an instruction with
+            # starts_line 301 (failing the test if absent) and returns the instruction list
+            # unchanged.
             for inst in instructions:
                 if inst.starts_line == 301:
                     break
@@ -591,11 +709,19 @@ def fn():
 
 
 class BytecodeHookTests(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Test case for the bytecode hook registration API in convert_frame.
     def test_bytecode_hook(self):
+        # [FUNCTION DOC] Register a bytecode hook that prints the original and generated code
+        # and returns the new code, compile a simple function with the eager backend and call it
+        # with tensors of ten sizes, then always remove the hook handle. Calls
+        # torch._dynamo.reset first.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Function compiled by the test; computes a - b * 10.
             return a - b * 10
 
         def hook(code, out_code):
+            # [FUNCTION DOC] HELPER: Bytecode hook that prints both code objects and returns the
+            # first argument.
             print(code)
             print(out_code)
             return code
