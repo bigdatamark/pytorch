@@ -1,4 +1,10 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests for DTensor operator sharding strategies: einsum dimension parsing and
+# strategy generation, the redistribute cost model, reduction/norm/loss single-dim
+# strategy helpers, OpSpec/OpSchema meta properties, custom strategy registration through
+# op_strategy_context, and the error for ops without a registered strategy. Import time
+# side effects: registers custom ops in the mylib and testlib namespaces (with autograd
+# or fake implementations) and creates local-tensor variants of two test classes.
 
 import itertools
 import random
@@ -52,11 +58,16 @@ except ImportError:
 
 
 def extract_tensor_meta(t) -> TensorMeta:
+    # HELPER: Builds a TensorMeta from a real tensor, using its shape, stride and dtype.
     return TensorMeta(t.shape, t.stride(), t.dtype)
 
 
 class TestEinsumDims(TestCase):
+    # [CLASS DOC] Pure-Python tests of the einsum equation parser: checks how EinsumDims
+    # classifies labels into batch, contracting, lhs-only and rhs-only output dimensions.
     def test_batch_dims(self):
+        # [FUNCTION DOC] For an equation where all labels appear in both inputs and the output,
+        # all labels are batch dims and the other three groups are empty.
         equation = "abc,abc->abc"
         input_dims, output_dim = EinsumDims.parse_equation(equation)
         edims = EinsumDims.parse_dims(input_dims, output_dim)
@@ -67,6 +78,8 @@ class TestEinsumDims(TestCase):
         self.assertEqual(edims.rhs_out_only_dims, [])
 
     def test_mm_dims(self):
+        # [FUNCTION DOC] Matrix-multiply equation: k is contracting, m is lhs-only, n is rhs-only,
+        # and there are no batch dims.
         equation = "mk,kn->mn"
         input_dims, output_dim = EinsumDims.parse_equation(equation)
         edims = EinsumDims.parse_dims(input_dims, output_dim)
@@ -77,6 +90,8 @@ class TestEinsumDims(TestCase):
         self.assertEqual(edims.rhs_out_only_dims, ["n"])
 
     def test_bmm_dims(self):
+        # [FUNCTION DOC] Batched matmul equations with one and two leading batch labels: the
+        # batch dims are the shared leading labels; k, m and n classify as in a plain matmul.
         equation = "bmk,bkn->bmn"
         input_dims, output_dim = EinsumDims.parse_equation(equation)
         edims = EinsumDims.parse_dims(input_dims, output_dim)
@@ -96,6 +111,9 @@ class TestEinsumDims(TestCase):
         self.assertEqual(edims.rhs_out_only_dims, ["n"])
 
     def test_free_dims(self):
+        # [FUNCTION DOC] Equations where the second input has fewer dims: labels in both inputs
+        # and the output are batch dims, and labels present only in one input and the output
+        # become that side's output-only dims, including an unusual output label ordering.
         equation = "abc,ab->abc"
         input_dims, output_dim = EinsumDims.parse_equation(equation)
         edims = EinsumDims.parse_dims(input_dims, output_dim)
@@ -116,45 +134,58 @@ class TestEinsumDims(TestCase):
 
 
 class TestEinsumStrategies(DTensorOpTestBase):
+    # [CLASS DOC] Tests that gen_einsum_strategies enumerates the expected number of
+    # sharding strategies on a 4-rank device mesh (1D and 2D) for several equations.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Property returning the world size of 4 ranks for this test class.
         return 4
 
     def test_mm_1d_mesh(self):
+        # [FUNCTION DOC] Matmul on a 1D mesh yields 4 strategies.
         mesh = self.build_device_mesh()
 
         all_strats = gen_einsum_strategies("mk,kn->mn", mesh)
         self.assertEqual(len(all_strats.strategies), 4)
 
     def test_mm_2d_mesh(self):
+        # [FUNCTION DOC] Matmul on a 2x2 mesh yields 16 strategies.
         mesh = DeviceMesh(self.device_type, torch.arange(self.world_size).reshape(2, 2))
 
         all_strats = gen_einsum_strategies("mk,kn->mn", mesh)
         self.assertEqual(len(all_strats.strategies), 16)
 
     def test_bmm_1d_mesh(self):
+        # [FUNCTION DOC] Batched matmul on a 1D mesh yields 5 strategies.
         mesh = self.build_device_mesh()
 
         all_strats = gen_einsum_strategies("bmk,bkn->bmn", mesh)
         self.assertEqual(len(all_strats.strategies), 5)
 
     def test_bmm_diffinndim_2d_mesh(self):
+        # [FUNCTION DOC] Equation whose lhs has an extra batch dim relative to the rhs, on a 2x2
+        # mesh, yields 25 strategies.
         mesh = DeviceMesh(self.device_type, torch.arange(self.world_size).reshape(2, 2))
         all_strats = gen_einsum_strategies("bmk,kn->bmn", mesh)
         self.assertEqual(len(all_strats.strategies), 25)
 
     def test_bmm_diffoutndim_2d_mesh(self):
+        # [FUNCTION DOC] Equation with a lower-rank output than the lhs (matrix-vector style),
+        # on a 2x2 mesh, yields 16 strategies.
         mesh = DeviceMesh(self.device_type, torch.arange(self.world_size).reshape(2, 2))
         all_strats = gen_einsum_strategies("bmk,k->bm", mesh)
         self.assertEqual(len(all_strats.strategies), 16)
 
     def test_bmm_2d_mesh(self):
+        # [FUNCTION DOC] Batched matmul on a 2x2 mesh yields 25 strategies.
         mesh = DeviceMesh(self.device_type, torch.arange(self.world_size).reshape(2, 2))
 
         all_strats = gen_einsum_strategies("bmk,bkn->bmn", mesh)
         self.assertEqual(len(all_strats.strategies), 25)
 
     def test_pointwise_1d_mesh(self):
+        # [FUNCTION DOC] Pointwise equations on a 1D mesh, with and without a broadcast operand,
+        # each yield 5 strategies.
         mesh = self.build_device_mesh()
 
         simple_strats = gen_einsum_strategies("abcd,abcd->abcd", mesh)
@@ -164,6 +195,8 @@ class TestEinsumStrategies(DTensorOpTestBase):
         self.assertEqual(len(broadcast_strats.strategies), 5)
 
     def test_linearity_1d_mesh(self):
+        # [FUNCTION DOC] With the linearity option enabled, the pointwise equation on a 1D mesh
+        # yields 6 strategies.
         mesh = self.build_device_mesh()
 
         all_strats = gen_einsum_strategies("abcd,abcd->abcd", mesh, linearity=True)
@@ -171,11 +204,18 @@ class TestEinsumStrategies(DTensorOpTestBase):
 
 
 class TestCostModel(DTensorOpTestBase):
+    # [CLASS DOC] Tests of redistribute_cost and strategy selection on a 4-rank mesh:
+    # relative costs of collectives, infinite cost for unsupported transitions, and that
+    # sharding propagation finds no-redistribution strategies for mm, bmm and t.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Property returning the world size of 4 ranks for this test class.
         return 4
 
     def test_redistribute_cost_mesh_1d(self):
+        # [FUNCTION DOC] On a 1D mesh checks that redistributing a spec to itself costs 0, that
+        # shard-to-replicate equals partial-to-shard, that partial-to-replicate plus one is below
+        # the sum of those two costs, and that shard-to-partial has infinite cost.
         mesh_1d = self.build_device_mesh()
         shard_placement = (Shard(0),)
         replica_placement = (Replicate(),)
@@ -209,6 +249,8 @@ class TestCostModel(DTensorOpTestBase):
         self.assertEqual(cost, float("inf"))
 
     def test_redistribute_cost_strided_shard(self):
+        # [FUNCTION DOC] A _StridedShard source spec to replicate has infinite cost, while a
+        # replicated source to a _StridedShard target costs 0.0 (replicated short-circuit).
         """_StridedShard specs get inf cost (shard_order is None bail-out)."""
         mesh_1d = self.build_device_mesh()
 
@@ -228,6 +270,10 @@ class TestCostModel(DTensorOpTestBase):
         self.assertEqual(redistribute_cost(replica_spec, strided_shard_spec), 0.0)
 
     def test_addmm_partial_redistribute(self):
+        # [FUNCTION DOC] Runs addmm on a sharded bias, Partial mat1 and column-sharded mat2
+        # across 4 CPU ranks. Inputs come from a seeded local Generator so all ranks hold identical
+        # global values. Asserts the output placement is Shard(1) and that its full tensor equals
+        # the plain addmm of the global tensors.
         mesh = DeviceMesh("cpu", torch.arange(self.world_size))
         # bias/mat1/mat2 are the GLOBAL (unsharded) tensors, distributed below;
         # the final assert checks full_tensor() against the global addmm. Every
@@ -257,6 +303,8 @@ class TestCostModel(DTensorOpTestBase):
         self.assertEqual(dist_out.full_tensor(), torch.addmm(bias, mat1, mat2))
 
     def test_redistribute_cost_mesh_2d(self):
+        # [FUNCTION DOC] On a 2x2 mesh checks same-spec cost is 0 and that partial-to-replicate
+        # costs more than both shard-to-replicate and partial-to-shard.
         mesh_2d = DeviceMesh(
             self.device_type, torch.arange(self.world_size).reshape(2, 2)
         )
@@ -289,6 +337,8 @@ class TestCostModel(DTensorOpTestBase):
         self.assertTrue(allreduce_cost > reduce_scatter_cost)
 
     def test_mm_strategies(self):
+        # [FUNCTION DOC] For four lhs/rhs placement combinations of mm on a 1D mesh, builds an
+        # OpSchema and runs non-cached sharding propagation; asserts no redistribution is needed.
         mesh = self.build_device_mesh()
         lhs_tensor = torch.randn(6, 8)
         rhs_tensor = torch.randn(8, 12)
@@ -317,6 +367,10 @@ class TestCostModel(DTensorOpTestBase):
             self.assertFalse(output_sharding.needs_redistribute)
 
     def test_t_prunes_unproven_unbacked_strided_shard_candidates(self):
+        # [FUNCTION DOC] Uses a fake tensor mode with an unbacked symbolic split factor to check
+        # that t's strategy (allow_unbacked_sharding false) does not consider the unproven
+        # _StridedShard on dim 1 shardable, while propagation from _StridedShard on dim 0 succeeds
+        # without redistribution and produces a _StridedShard on dim 1 with the same split factor.
         from torch._subclasses.fake_tensor import FakeTensorMode
         from torch.distributed.tensor._ops.utils import is_tensor_shardable
         from torch.fx.experimental.symbolic_shapes import ShapeEnv
@@ -369,6 +423,8 @@ class TestCostModel(DTensorOpTestBase):
         )
 
     def test_bmm_strategies(self):
+        # [FUNCTION DOC] Same as the mm test but for bmm with five placement combinations:
+        # non-cached sharding propagation must need no redistribution for each.
         mesh = self.build_device_mesh()
         lhs_tensor = torch.randn(8, 6, 8)
         rhs_tensor = torch.randn(8, 8, 12)
@@ -398,6 +454,8 @@ class TestCostModel(DTensorOpTestBase):
             self.assertFalse(output_sharding.needs_redistribute)
 
     def test_redistribute_cost_partial_to_different_partial_is_infinite(self):
+        # [FUNCTION DOC] Asserts redistributing from a sum Partial to an avg Partial on a 1D mesh
+        # has infinite cost.
         """Test that redistributing from Partial("sum") to Partial("avg") has infinite cost.
 
         Converting between different Partial types (e.g., sum -> avg) is not supported,
@@ -415,6 +473,8 @@ class TestCostModel(DTensorOpTestBase):
         self.assertEqual(cost, float("inf"))
 
     def test_redistribute_cost_with_order(self):
+        # [FUNCTION DOC] On a 2x2 mesh, compares the cost of gathering over mesh dim 0 versus
+        # mesh dim 1 from a doubly-sharded source; asserts the dim 0 cost is strictly greater.
         mesh_2d = DeviceMesh(
             self.device_type, torch.arange(self.world_size).reshape(2, 2)
         )
@@ -447,7 +507,11 @@ class TestCostModel(DTensorOpTestBase):
 
 
 class TestReductionStrategy(TestCase):
+    # [CLASS DOC] Tests common_reduction_strategy. Each test initializes a fake process
+    # group with 4 ranks in setUp and destroys it in tearDown.
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Sets world_size to 4 and initializes the fake process group
+        # backend (rank 0) with a FakeStore.
         super().setUp()
         self.world_size = 4
         store = FakeStore()
@@ -456,16 +520,23 @@ class TestReductionStrategy(TestCase):
         )
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Runs base teardown and destroys the default process group.
         super().tearDown()
         torch.distributed.destroy_process_group()
 
     def _make_spec(self, mesh: DeviceMesh, placements):
+        # [FUNCTION DOC] HELPER: Builds a DTensorSpec for an 8x8 float32 tensor on the given
+        # mesh with the given placements.
         tensor_meta = TensorMeta(
             shape=torch.Size([8, 8]), stride=(8, 1), dtype=torch.float32
         )
         return DTensorSpec(mesh, tuple(placements), tensor_meta)
 
     def test_common_reduction_strategy_uses_per_strategy_linearity(self):
+        # [FUNCTION DOC] Feeds a strategy with a Partial avg spec and a Shard/Shard spec into
+        # the sum reduction over dim 0, and checks the second result keeps its input placements and
+        # outputs Partial sum on mesh dim 0 and Shard(0) on mesh dim 1; i.e. linearity is judged
+        # per input strategy rather than from the first one.
         mesh = DeviceMesh("cpu", torch.arange(self.world_size).reshape(2, 2))
         partial_avg_spec = self._make_spec(mesh, (Partial("avg"), Replicate()))
         sharded_spec = self._make_spec(mesh, (Shard(0), Shard(1)))
@@ -491,6 +562,8 @@ class TestReductionStrategy(TestCase):
 # reference: https://docs.pytorch.org/docs/stable/library.html#torch.library.register_autograd
 @torch.library.custom_op("mylib::numpy_sin", mutates_args=())
 def numpy_sin(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    # HELPER: Custom op body: computes elementwise sin of x plus sin of y through numpy on
+    # CPU and returns the result on x's device.
     x_np = x.cpu().numpy()
     y_np = y.cpu().numpy()
     out_np = np.sin(x_np) + np.sin(y_np)
@@ -498,17 +571,20 @@ def numpy_sin(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 def setup_context(ctx, inputs, output):
+    # HELPER: Autograd setup_context for the custom op: saves both inputs for backward.
     (x, y) = inputs
     ctx.save_for_backward(x, y)
 
 
 def backward(ctx, grad):
+    # HELPER: Autograd backward for the custom op: returns grad times cos of each input.
     (x, y) = ctx.saved_tensors
     return grad * x.cos(), grad * y.cos()
 
 
 @numpy_sin.register_fake
 def _fw(x, y):
+    # HELPER: Fake implementation: returns an empty tensor shaped like x.
     return torch.empty_like(x)
 
 
@@ -522,6 +598,8 @@ torch.library.register_autograd(
 def numpy_tuple_sin(
     x: torch.Tensor, y: list[torch.Tensor], z: torch.Tensor
 ) -> torch.Tensor:
+    # HELPER: Custom op body taking a tensor, a list of tensors and a tensor: sums numpy sin
+    # of all of them and returns the result on x's device.
     x_np = x.cpu().numpy()
     y_np = [i.cpu().numpy() for i in y]
     z_np = z.cpu().numpy()
@@ -531,17 +609,21 @@ def numpy_tuple_sin(
 
 
 def setup_tuple_context(ctx, inputs, output):
+    # HELPER: Autograd setup_context for the list-input custom op: saves x, the list and z.
     (x, y, z) = inputs
     ctx.save_for_backward(x, y, z)
 
 
 def tuple_backward(ctx, grad):
+    # HELPER: Autograd backward for the list-input op: returns grad times cos for x, a list of
+    # the same for each y entry, and for z.
     (x, y, z) = ctx.saved_tensors
     return grad * x.cos(), [grad * i.cos() for i in y], grad * z.cos()
 
 
 @numpy_tuple_sin.register_fake
 def _fw_tuple(x, y, z):
+    # HELPER: Fake implementation: returns an empty tensor shaped like x.
     return torch.empty_like(x)
 
 
@@ -551,6 +633,10 @@ torch.library.register_autograd(
 
 
 def detect_exists_identical_opspec(*args, op, mesh, strategy_function) -> bool:
+    # HELPER: Builds, for each tensor argument, every combination of Replicate/Shard(dim)
+    # placements over the mesh dims (shuffled), wraps them as OpStrategy inputs, runs the
+    # given strategy function under op_strategy_context and returns True when the string forms
+    # of all produced OpSpecs are distinct (no duplicates).
     """
     Given sample input args, detect if identical OpSpecs exists under the same
     OpStrategy.
@@ -598,12 +684,22 @@ def detect_exists_identical_opspec(*args, op, mesh, strategy_function) -> bool:
 
 
 class DistTensorReplicateStrategyRegistrationTest(DTensorTestBase):
+    # [CLASS DOC] Tests registering a replicate-everything strategy for custom ops via
+    # op_strategy_context, for a plain tensor op and an op taking a list of tensors.
     @with_comms
     @patch("torch.distributed.tensor._sharding_prop._select_min_cost_strategy")
     def test_replicate_strategy_placement(self, mock_select_strategy):
+        # [FUNCTION DOC] Patches the strategy selector to record per-input redistribute costs,
+        # runs the custom op on 2D-mesh-sharded inputs under the replicate strategy and checks: the
+        # number of all-gather calls equals world size, recorded costs equal the cost of going to
+        # fully replicated, the result matches the non-distributed output, output placements are
+        # replicated, and the strategy yields no duplicate OpSpecs.
         costs_from__select_strategy = []
 
         def mock_select_func(strategy, op_schema=None):
+            # HELPER: Stand-in for the strategy selector: with one strategy it records and returns
+            # its redistribute costs; otherwise appends each OpSpec cost (raising AssertionError if
+            # unset) and returns the strategy with minimal total cost.
             """function copied from _select_strategy but with cost capturing"""
             nonlocal costs_from__select_strategy
             if len(strategy.strategies) == 1:
@@ -664,6 +760,9 @@ class DistTensorReplicateStrategyRegistrationTest(DTensorTestBase):
 
     @with_comms
     def test_tuple_replicate_strategy_placement(self):
+        # [FUNCTION DOC] Registers the replicate strategy with needs_pytree schema info for the
+        # list-input custom op, runs it on differently sharded DTensors and checks the full tensor
+        # equals the local result with Replicate placements on both mesh dims.
         mesh = init_device_mesh(self.device_type, (2, self.world_size // 2))
         test_op = torch.ops.mylib.numpy_tuple_sin
         with op_strategy_context(
@@ -688,8 +787,12 @@ class DistTensorReplicateStrategyRegistrationTest(DTensorTestBase):
 
 
 class TestStrategyHashing(DTensorTestBase):
+    # [CLASS DOC] Tests that strategy caching distinguishes calls differing in non-tensor args.
     @with_comms
     def test_call_with_different_nontensor_args(self):
+        # [FUNCTION DOC] Under the replicate strategy for sort, sorts a sharded DTensor along dim 0
+        # and then dim 1 without supplying schema info, and again along dim 1 in a fresh context;
+        # asserts the dim 1 results from both contexts agree.
         mesh = self.build_device_mesh()
         global_tensor = torch.tensor(
             [
@@ -711,12 +814,17 @@ class TestStrategyHashing(DTensorTestBase):
 
 
 class TestStrategyOperation(DTensorTestBase):
+    # [CLASS DOC] Tests lifecycle of operator strategy registration, with a 2-rank world.
     @property
     def world_size(self):
+        # [FUNCTION DOC] HELPER: Property returning the world size of 2 ranks for this test class.
         return 2
 
     @with_comms
     def test_cache_clean(self):
+        # [FUNCTION DOC] Runs the custom op on DTensors inside op_strategy_context, then outside
+        # it and expects NotImplementedError saying no sharding strategy is registered, showing the
+        # registration and propagation cache were cleaned up.
         mesh = self.build_device_mesh()
         test_op = torch.ops.mylib.numpy_sin
         x = torch.randn(2, device=self.device_type)
@@ -744,7 +852,11 @@ TestStrategyHashingWithLocalTensor = create_local_tensor_test_class(
 
 
 class TestOpSchemaMetaProperties(TestCase):
+    # [CLASS DOC] Tests OpSchema meta properties and several single-dim strategy helper
+    # functions, using a fake process group with 8 ranks set up per test.
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Sets world_size to 8 and initializes the fake process group
+        # backend (rank 0) with a FakeStore.
         super().setUp()
         self.world_size = 8
         store = FakeStore()
@@ -753,10 +865,14 @@ class TestOpSchemaMetaProperties(TestCase):
         )
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Runs base teardown and destroys the default process group.
         super().tearDown()
         torch.distributed.destroy_process_group()
 
     def test_args_meta_mixed_opstrategy_and_tuplestrategy(self):
+        # [FUNCTION DOC] Builds an OpSchema whose positional args are an OpStrategy, a
+        # TupleStrategy and an OpStrategy; checks args_meta has three entries: a TensorMeta,
+        # a tuple of two TensorMetas, and a TensorMeta, with the expected shapes.
         """Test args_meta with both OpStrategy and TupleStrategy"""
         # Create a simple mesh
         mesh = DeviceMesh("cpu", torch.arange(4))
@@ -825,6 +941,9 @@ class TestOpSchemaMetaProperties(TestCase):
         self.assertEqual(args_meta[2].shape, torch.Size([20, 30]))
 
     def test_kwargs_meta_mixed(self):
+        # [FUNCTION DOC] Builds an OpSchema with keyword args mixing strategies and plain values;
+        # checks kwargs_meta has four entries, mapping strategies to TensorMeta (or tuple of them)
+        # and passing the plain values through unchanged.
         """Test kwargs_meta with mixed types"""
         # Create a simple mesh
         mesh = DeviceMesh("cpu", torch.arange(4))
@@ -882,6 +1001,9 @@ class TestOpSchemaMetaProperties(TestCase):
         self.assertEqual(kwargs_meta["alpha"], 1.0)
 
     def test_max_min_dim_single_dim_strategy(self):
+        # [FUNCTION DOC] Checks max_min_dim_single_dim_strategy for max.dim and min.dim: only the
+        # non-reduced dim is shardable, yielding one strategy; the output dim index is 0 in both
+        # cases and the input dim is 0 or 1 depending on the reduced dim.
         """max.dim/min.dim only allow sharding on non-reduction dims."""
         from torch.distributed.tensor._ops._math_ops import (
             max_min_dim_single_dim_strategy,
@@ -913,6 +1035,9 @@ class TestOpSchemaMetaProperties(TestCase):
         self.assertEqual(input_plc.dim, 1)
 
     def test_foreach_max_single_dim_strategy(self):
+        # [FUNCTION DOC] Checks linear_reduction_single_dim_strategy for foreach max: three
+        # strategies, Partial max with input sharded on dim 0 and dim 1, and a pure Partial max
+        # pair.
         from torch.distributed.tensor._ops._math_ops import (
             linear_reduction_single_dim_strategy,
         )
@@ -933,6 +1058,9 @@ class TestOpSchemaMetaProperties(TestCase):
         self.assertEqual(strategies[2], [Partial("max"), Partial("max")])
 
     def test_var_mean_single_dim_strategy(self):
+        # [FUNCTION DOC] Checks std_var_single_dim_strategy for var_mean reducing dim 1: one
+        # strategy with outputs and input sharded on dim 0, three placements for the functional
+        # overload and five when the out variant supplies two output metas.
         from torch.distributed.tensor._ops._math_ops import std_var_single_dim_strategy
 
         input_meta = TensorMeta(
@@ -969,6 +1097,10 @@ class TestOpSchemaMetaProperties(TestCase):
         self.assertEqual(out1.dim, 0)
 
     def test_nll_loss_forward_single_dim_strategy(self):
+        # [FUNCTION DOC] Checks nll_loss_forward_single_dim_strategy for 2d forward: with no
+        # reduction and a weight, two strategies of five placements (replicated total weight and
+        # weight); with sum reduction and no weight, outputs are Partial sum; with mean reduction
+        # no strategy is returned.
         from torch.distributed.tensor._ops._math_ops import (
             nll_loss_forward_single_dim_strategy,
             Reduction,
@@ -1030,6 +1162,9 @@ class TestOpSchemaMetaProperties(TestCase):
         self.assertEqual(strategies, [])
 
     def test_nll_loss_backward_single_dim_strategy(self):
+        # [FUNCTION DOC] Checks nll_loss_backward_single_dim_strategy: with no reduction,
+        # three strategies with replicated weight and total weight; with sum reduction and no
+        # weight, five strategies where total weight is replicated or Partial sum.
         from torch.distributed.tensor._ops._math_ops import (
             nll_loss_backward_single_dim_strategy,
             Reduction,
@@ -1119,6 +1254,9 @@ class TestOpSchemaMetaProperties(TestCase):
         self.assertEqual(total_weight, Partial("sum"))
 
     def test_layer_norm_fwd_single_dim_strategy(self):
+        # [FUNCTION DOC] Checks layer_norm_single_dim_strategy: normalizing the last dim leaves
+        # one shardable dim (dim 0) with replicated weight and bias; omitting bias drops one
+        # placement; normalizing over all dims gives no strategies.
         """layer_norm produces sharding rules for each outer dim."""
         from torch.distributed.tensor._ops._math_ops import (
             layer_norm_single_dim_strategy,
@@ -1164,6 +1302,8 @@ class TestOpSchemaMetaProperties(TestCase):
         self.assertEqual(len(strategies), 0)
 
     def test_rms_norm_fwd_single_dim_strategy(self):
+        # [FUNCTION DOC] Checks rms_norm_single_dim_strategy: one strategy sharding output, rrms
+        # and input on dim 0 with replicated weight; without a weight each rule has three entries.
         """rms_norm produces sharding rules for each outer dim."""
         from torch.distributed.tensor._ops._math_ops import rms_norm_single_dim_strategy
 
@@ -1197,6 +1337,10 @@ class TestOpSchemaMetaProperties(TestCase):
         self.assertEqual(len(strategies[0]), 3)
 
     def test_layer_norm_bwd_single_dim_strategy(self):
+        # [FUNCTION DOC] Checks layer_norm_bwd_single_dim_strategy: with all mask outputs on,
+        # input grad is sharded and weight/bias grads are Partial (nine entries); absent weight and
+        # bias gives None grads (seven entries); output mask can independently turn off any grad
+        # while weight and bias inputs stay Replicate.
         """layer_norm backward produces correct output/input placements."""
         from torch.distributed.tensor._ops._math_ops import (
             layer_norm_bwd_single_dim_strategy,
@@ -1301,6 +1445,9 @@ class TestOpSchemaMetaProperties(TestCase):
         self.assertIsNone(rule[2])  # d_bias masked off
 
     def test_rms_norm_bwd_single_dim_strategy(self):
+        # [FUNCTION DOC] Checks rms_norm_bwd_single_dim_strategy: input grad sharded and weight
+        # grad Partial with weight present; None weight grad without weight or when masked off;
+        # input grad can be masked independently.
         """rms_norm backward produces correct output/input placements."""
         from torch.distributed.tensor._ops._math_ops import (
             rms_norm_bwd_single_dim_strategy,
@@ -1385,6 +1532,9 @@ class TestOpSchemaMetaProperties(TestCase):
         self.assertIsInstance(rule[1], Partial)  # d_weight reduced
 
     def test_grid_sampler_bwd_single_dim_strategy(self):
+        # [FUNCTION DOC] Checks grid_sampler_backward_strategy honors the output mask for
+        # grad_input (None when masked off) while the grid gradient is always sharded on dim 0
+        # regardless of the second mask entry.
         """grid_sampler backward respects the native output_mask contract."""
         from torch.distributed.tensor._ops._math_ops import (
             grid_sampler_backward_strategy,
@@ -1433,6 +1583,8 @@ class TestOpSchemaMetaProperties(TestCase):
         self.assertEqual(rule[1].dim, 0)  # grad_grid ignores output_mask[1]
 
     def test_batch_norm_bwd_single_dim_strategy(self):
+        # [FUNCTION DOC] Checks batch_norm_backward_strategy output mask handling: masked-off
+        # grads are None, grad_input shards on the channel dim and weight/bias grads on dim 0.
         """batch_norm backward respects output_mask."""
         from torch.distributed.tensor._ops._math_ops import batch_norm_backward_strategy
 
@@ -1492,6 +1644,8 @@ class TestOpSchemaMetaProperties(TestCase):
         self.assertIsNone(rule[2])  # grad_bias masked off
 
     def test_constant_pad_nd_allows_shard_on_non_padded_dim(self):
+        # [FUNCTION DOC] Asserts constant_pad_nd's single-dim strategy offers sharding on the
+        # non-padded dim 0 of an 8x4 input when only dim 1 is padded.
         """constant_pad_nd should allow sharding on non-padded dims."""
         from torch.distributed.tensor._ops._matrix_ops import (
             constant_pad_nd_single_dim_strategy,
@@ -1511,6 +1665,8 @@ class TestOpSchemaMetaProperties(TestCase):
         self.assertIn(0, shard_dims)
 
     def test_constant_pad_nd_bans_shard_on_padded_dim(self):
+        # [FUNCTION DOC] Asserts constant_pad_nd's single-dim strategy never shards the padded
+        # dim 1 of an 8x4 input.
         """constant_pad_nd should ban sharding on padded dims."""
         from torch.distributed.tensor._ops._matrix_ops import (
             constant_pad_nd_single_dim_strategy,
@@ -1530,9 +1686,13 @@ class TestOpSchemaMetaProperties(TestCase):
 
 
 class TestOpSpecMesh(TestCase):
+    # [CLASS DOC] Tests how OpSpec.mesh finds the device mesh when output or input specs
+    # contain None entries, and string formatting of an all-None OpStrategy. Uses a fake
+    # 4-rank process group per test.
     """Tests for OpSpec.mesh property handling of None specs."""
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Initializes a fake process group with 4 ranks and a FakeStore.
         super().setUp()
         store = FakeStore()
         torch.distributed.init_process_group(
@@ -1540,10 +1700,13 @@ class TestOpSpecMesh(TestCase):
         )
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Runs base teardown and destroys the default process group.
         super().tearDown()
         torch.distributed.destroy_process_group()
 
     def _make_spec(self, placements):
+        # [FUNCTION DOC] HELPER: Builds a DTensorSpec on a 4-rank CPU mesh for an 8x16 float32
+        # tensor with the given placements.
         mesh = DeviceMesh("cpu", torch.arange(4))
         tm = TensorMeta(
             shape=torch.Size([8, 16]),
@@ -1553,16 +1716,19 @@ class TestOpSpecMesh(TestCase):
         return DTensorSpec(mesh, placements, tm)
 
     def test_mesh_from_single_output_spec(self):
+        # [FUNCTION DOC] Mesh is derived from a single output spec (shape of 4).
         spec = self._make_spec((Replicate(),))
         op_spec = OpSpec(output_specs=spec, input_specs=(spec,))
         self.assertEqual(op_spec.mesh.shape, (4,))
 
     def test_mesh_from_tuple_output_specs(self):
+        # [FUNCTION DOC] Mesh is derived from a tuple of output specs.
         spec = self._make_spec((Shard(0),))
         op_spec = OpSpec(output_specs=(spec, spec), input_specs=(spec,))
         self.assertEqual(op_spec.mesh.shape, (4,))
 
     def test_mesh_from_tuple_output_specs_with_leading_none(self):
+        # [FUNCTION DOC] Mesh is taken from the first non-None entry when the first output is None.
         """When the first output spec is None, mesh should come from the
         next non-None entry."""
         spec = self._make_spec((Replicate(),))
@@ -1570,12 +1736,14 @@ class TestOpSpecMesh(TestCase):
         self.assertEqual(op_spec.mesh.shape, (4,))
 
     def test_mesh_from_input_specs_when_output_is_none(self):
+        # [FUNCTION DOC] With None output specs, mesh falls back to the input specs.
         """When output_specs is None, mesh should come from input_specs."""
         spec = self._make_spec((Shard(0),))
         op_spec = OpSpec(output_specs=None, input_specs=(spec,))
         self.assertEqual(op_spec.mesh.shape, (4,))
 
     def test_mesh_from_input_specs_with_leading_none(self):
+        # [FUNCTION DOC] With None outputs, mesh comes from the first non-None input spec.
         """When output_specs is None and input_specs has leading None entries,
         mesh should come from the first non-None input spec."""
         spec = self._make_spec((Replicate(),))
@@ -1583,6 +1751,7 @@ class TestOpSpecMesh(TestCase):
         self.assertEqual(op_spec.mesh.shape, (4,))
 
     def test_mesh_from_input_specs_when_tuple_output_all_none(self):
+        # [FUNCTION DOC] A tuple of all-None outputs falls back to the input specs like None.
         """When output_specs is a tuple of all None, mesh should fall through
         to input_specs — same behavior as output_specs=None."""
         spec = self._make_spec((Shard(0),))
@@ -1590,6 +1759,8 @@ class TestOpSpecMesh(TestCase):
         self.assertEqual(op_spec.mesh.shape, (4,))
 
     def test_mesh_raises_when_all_specs_none(self):
+        # [FUNCTION DOC] When all output and input specs are None, accessing mesh raises
+        # AssertionError mentioning that the mesh cannot be determined.
         """When both output_specs and all input_specs are None, mesh should
         raise AssertionError."""
         op_spec = OpSpec(output_specs=None, input_specs=(None, None))
@@ -1597,6 +1768,8 @@ class TestOpSpecMesh(TestCase):
             _ = op_spec.mesh
 
     def test_op_strategy_str_handles_all_specs_none(self):
+        # [FUNCTION DOC] Regression test: str of an OpStrategy whose only OpSpec has all-None
+        # specs gives the string OpStrategy[(None) -> None] without raising.
         """Regression test for https://github.com/pytorch/pytorch/issues/182370."""
         op_strategy = OpStrategy([OpSpec(output_specs=None, input_specs=(None,))])
 
@@ -1604,6 +1777,9 @@ class TestOpSpecMesh(TestCase):
 
 
 class TestExpandToFullMeshOpStrategy(TestCase):
+    # [CLASS DOC] Tests expand_to_full_mesh_op_strategy assigns the right tensor_meta to
+    # input specs, particularly when the placement lists contain None output entries. Uses a fake
+    # 4-rank process group per test.
     """Tests for expand_to_full_mesh_op_strategy function.
 
     These tests verify that tensor_meta is correctly assigned to input/output specs,
@@ -1612,6 +1788,8 @@ class TestExpandToFullMeshOpStrategy(TestCase):
     """
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Sets world_size to 4 and initializes a fake process group with a
+        # FakeStore (kept on the instance).
         from torch.testing._internal.distributed.fake_pg import FakeStore
 
         super().setUp()
@@ -1622,12 +1800,16 @@ class TestExpandToFullMeshOpStrategy(TestCase):
         )
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Runs base teardown and destroys the default process group.
         super().tearDown()
         torch.distributed.destroy_process_group()
 
     def _create_op_strategy_with_tensor_meta(
         self, mesh: DeviceMesh, shape: tuple, dtype: torch.dtype
     ) -> OpStrategy:
+        # [FUNCTION DOC] HELPER: Builds an OpStrategy with one OpSpec whose input and output spec
+        # is fully replicated over the mesh, with contiguous strides computed from the shape and
+        # the given dtype, and a redistribute cost of 0.0.
         """Create an OpStrategy with tensor_meta for testing."""
         placements = tuple(Replicate() for _ in range(mesh.ndim))
         strides = []
@@ -1645,6 +1827,9 @@ class TestExpandToFullMeshOpStrategy(TestCase):
         return OpStrategy([op_spec])
 
     def test_expand_strategy_with_none_in_outputs(self):
+        # [FUNCTION DOC] With a None output entry in the placement list and distinct input shapes
+        # (different value head dim), checks the expanded strategy's input specs get their own
+        # tensor_meta rather than shifted ones.
         """Test that None entries in outputs don't shift input tensor_meta assignment.
 
         This test simulates SDPA backward where grad_bias output is None when
@@ -1724,6 +1909,8 @@ class TestExpandToFullMeshOpStrategy(TestCase):
         self.assertEqual(input_specs[3].tensor_meta.shape[-1], d_v)  # value
 
     def test_expand_strategy_without_none_in_outputs(self):
+        # [FUNCTION DOC] With no None entries, the expanded strategy has two input specs with
+        # the original 10x20 and 10x30 shapes.
         """Test that expand_to_full_mesh_op_strategy works correctly without None entries."""
         from torch.distributed.tensor._ops.utils import expand_to_full_mesh_op_strategy
 
@@ -1769,6 +1956,8 @@ class TestExpandToFullMeshOpStrategy(TestCase):
         self.assertEqual(input_specs[1].tensor_meta.shape, torch.Size([10, 30]))
 
     def test_expand_strategy_with_multiple_nones_in_outputs(self):
+        # [FUNCTION DOC] With several None output entries, input specs still get the matching
+        # tensor_meta shapes (5x10 and 5x20).
         """Test handling of multiple None entries in outputs."""
         from torch.distributed.tensor._ops.utils import expand_to_full_mesh_op_strategy
 
@@ -1820,24 +2009,29 @@ class TestExpandToFullMeshOpStrategy(TestCase):
 # Define a dummy op for testing unsupported DTensor ops
 @torch.library.custom_op("testlib::unsupported_add", mutates_args=())
 def unsupported_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    # HELPER: Dummy custom op body returning x plus y; no DTensor strategy is registered.
     """A dummy op that has no DTensor sharding strategy registered."""
     return x + y
 
 
 @unsupported_add.register_fake
 def _unsupported_add_fake(x, y):
+    # HELPER: Fake implementation: returns an empty tensor shaped like x.
     return torch.empty_like(x)
 
 
 # Define a dummy op similar to torch.cat that takes a list of tensors
 @torch.library.custom_op("testlib::unsupported_cat", mutates_args=())
 def unsupported_cat(tensors: list[torch.Tensor], dim: int = 0) -> torch.Tensor:
+    # HELPER: Dummy cat-like custom op body returning the concatenation of the tensors on dim.
     """A dummy cat-like op that has no DTensor sharding strategy registered."""
     return torch.cat(tensors, dim=dim)
 
 
 @unsupported_cat.register_fake
 def _unsupported_cat_fake(tensors, dim=0):
+    # HELPER: Fake implementation: raises ValueError for an empty list, otherwise returns an
+    # empty tensor whose size along dim is the sum over the inputs, other dims from the first.
     # Return a tensor with concatenated shape
     if len(tensors) == 0:
         raise ValueError("Expected at least one tensor")
@@ -1848,7 +2042,11 @@ def _unsupported_cat_fake(tensors, dim=0):
 
 
 class TestUnsupportedDTensorOp(TestCase):
+    # [CLASS DOC] Tests the error raised for ops with no registered DTensor strategy; uses a
+    # fake 4-rank process group per test.
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Sets world_size to 4 and initializes the fake process group
+        # backend (rank 0) with a FakeStore.
         super().setUp()
         self.world_size = 4
         store = FakeStore()
@@ -1857,10 +2055,13 @@ class TestUnsupportedDTensorOp(TestCase):
         )
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Runs base teardown and destroys the default process group.
         super().tearDown()
         torch.distributed.destroy_process_group()
 
     def test_unsupported_op_error(self):
+        # [FUNCTION DOC] Expects NotImplementedError naming the operator and saying no sharding
+        # strategy is registered, for both the two-tensor add op and the list-input cat op.
         """Test that running an unsupported op on DTensor raises NotImplementedError with appropriate message."""
         mesh = DeviceMesh("cpu", torch.arange(self.world_size))
         x = torch.randn(8, 16)

@@ -1,4 +1,9 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Numerics tests comparing torch.optim optimizers (Adam, AdamW, SGD, Adagrad,
+# RMSprop, Adadelta, NAdam, RAdam, Adamax, ASGD) on a plain MLP against the same optimizer on
+# a DTensor-sharded copy, plus a mixed-mesh fused AdamW test and a sharding-propagation cache
+# leak test. Defines module-level shard, input and output functions for distribute_module and
+# creates a local-tensor variant of the test class at import time.
 
 from copy import deepcopy
 
@@ -27,6 +32,10 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 
 # shard function to do full sharding on all parameters of a module
 def shard_fn(name, module, device_mesh):
+    # HELPER: distribute_module partition function: for each nn.Linear module, replaces every
+    # parameter with a Parameter wrapping a DTensor sharded on dim 0 over the mesh, registers a
+    # gradient hook redistributing grads to Shard(0) (clearing Partial), and re-registers it.
+    # Other module types are left untouched. Mutates the module in place.
     if isinstance(module, nn.Linear):
         for name, param in module.named_parameters():
             dist_param = torch.nn.Parameter(
@@ -41,6 +50,8 @@ def shard_fn(name, module, device_mesh):
 
 # prepare input
 def input_fn(mod, inputs, device_mesh):
+    # HELPER: distribute_module input function: shards the first forward input on dim 0 over
+    # the mesh and returns the DTensor.
     # split the input tensor to be sharded input
     dist_inp = distribute_tensor(inputs[0], device_mesh, [Shard(0)])
     return dist_inp
@@ -48,12 +59,18 @@ def input_fn(mod, inputs, device_mesh):
 
 # prepare output to be local torch.Tensor
 def output_fn(mod, outputs, device_mesh):
+    # HELPER: distribute_module output function: raises AssertionError if the output is not
+    # a DTensor; otherwise redistributes it to Replicate on every mesh dim and returns the
+    # local tensor.
     if not isinstance(outputs, DTensor):
         raise AssertionError(f"Expected DTensor, got {type(outputs)}")
     return outputs.redistribute(placements=[Replicate()] * device_mesh.ndim).to_local()
 
 
 class TestDTensorOptimizer(DTensorTestBase):
+    # [CLASS DOC] Compares DTensor-sharded optimizer steps with single-device ones for several
+    # optimizer types and configurations on a 1D mesh (and one mixed 1D/2D mesh case), and
+    # checks the sharding-propagation cache does not grow across AdamW steps.
     def _assert_optimizer(
         self,
         mesh,
@@ -66,6 +83,10 @@ class TestDTensorOptimizer(DTensorTestBase):
         rtol: float = 1.3e-6,
         atol: float = 1e-5,
     ):
+        # HELPER: Runs two iterations on both the reference model and the distributed model:
+        # zero_grad (set_to_none on even iterations), forward on the same input, backward on summed
+        # output and optimizer step; then asserts each distributed parameter's full tensor equals
+        # the reference parameter within the given rtol and atol. The mesh argument is unused.
         for iter_idx in range(2):
             # run forward/backward/optim for original model
             optim.zero_grad(set_to_none=(iter_idx % 2 == 0))
@@ -88,12 +109,17 @@ class TestDTensorOptimizer(DTensorTestBase):
                 self.assertEqual(p1, p2, atol=atol, rtol=rtol)
 
     def test_optimizer_foreach_supported_types_include_DTensor(self):
+        # [FUNCTION DOC] Asserts DTensor is registered in the optimizer's foreach-supported types.
         from torch.optim.optimizer import _foreach_supported_types
 
         self.assertTrue(DTensor in _foreach_supported_types)
 
     @with_comms
     def test_adam_1d_sharding(self):
+        # [FUNCTION DOC] For many Adam configs (foreach off/on, weight decay, amsgrad, maximize,
+        # fused with float or tensor learning rates), builds an MLP and a sharded deep copy,
+        # creates an optimizer for each with the same config and compares them via
+        # _assert_optimizer using a ones input.
         mesh = self.build_device_mesh()
 
         # lr as a Tensor is not supported for capturable=False and foreach=True
@@ -153,6 +179,8 @@ class TestDTensorOptimizer(DTensorTestBase):
 
     @with_comms
     def test_adamw_1d_sharding(self):
+        # [FUNCTION DOC] Same as the Adam test but for AdamW, with betas and eps variants in the
+        # configs, including fused configs with float or tensor learning rates.
         mesh = self.build_device_mesh()
 
         # lr as a Tensor is not supported for capturable=False and foreach=True
@@ -229,6 +257,8 @@ class TestDTensorOptimizer(DTensorTestBase):
 
     @with_comms
     def test_sgd_1d_sharding(self):
+        # [FUNCTION DOC] Compares SGD (momentum, dampening, nesterov, weight decay, maximize,
+        # foreach on and off) between the plain and sharded MLP.
         mesh = self.build_device_mesh()
 
         sgd_configs = [
@@ -269,6 +299,8 @@ class TestDTensorOptimizer(DTensorTestBase):
 
     @with_comms
     def test_adagrad_1d_sharding(self):
+        # [FUNCTION DOC] Compares Adagrad (lr decay, weight decay, initial accumulator, eps,
+        # maximize, mostly foreach disabled) between the plain and sharded MLP.
         mesh = self.build_device_mesh()
 
         adagrad_configs = [
@@ -325,6 +357,8 @@ class TestDTensorOptimizer(DTensorTestBase):
 
     @with_comms
     def test_RMSprop_1d_sharding(self):
+        # [FUNCTION DOC] Compares RMSprop (alpha, eps, weight decay, momentum, centered, maximize;
+        # foreach disabled except for the last config) between the plain and sharded MLP.
         mesh = self.build_device_mesh()
 
         RMSprop_configs = [
@@ -392,6 +426,8 @@ class TestDTensorOptimizer(DTensorTestBase):
 
     @with_comms
     def test_adadelta_1d_sharding(self):
+        # [FUNCTION DOC] Compares Adadelta (rho, eps, weight decay, maximize, foreach on and off)
+        # between the plain and sharded MLP.
         mesh = self.build_device_mesh()
 
         adadelta_configs = [
@@ -436,6 +472,8 @@ class TestDTensorOptimizer(DTensorTestBase):
 
     @with_comms
     def test_nadam_1d_sharding(self):
+        # [FUNCTION DOC] Compares NAdam (betas, eps, weight decay, decoupled weight decay)
+        # between the plain and sharded MLP.
         mesh = self.build_device_mesh()
 
         nadam_configs = [
@@ -473,6 +511,8 @@ class TestDTensorOptimizer(DTensorTestBase):
 
     @with_comms
     def test_radam_1d_sharding(self):
+        # [FUNCTION DOC] Compares RAdam (betas, eps, weight decay, decoupled weight decay)
+        # between the plain and sharded MLP.
         mesh = self.build_device_mesh()
 
         radam_configs = [
@@ -513,6 +553,8 @@ class TestDTensorOptimizer(DTensorTestBase):
 
     @with_comms
     def test_adamax_1d_sharding(self):
+        # [FUNCTION DOC] Compares Adamax (betas, eps, weight decay, maximize, foreach on and off)
+        # between the plain and sharded MLP.
         mesh = self.build_device_mesh()
 
         adamax_configs = [
@@ -557,6 +599,9 @@ class TestDTensorOptimizer(DTensorTestBase):
 
     @with_comms
     def test_asgd_1d_sharding(self):
+        # [FUNCTION DOC] Compares ASGD (lambd, alpha, t0, weight decay, maximize, foreach on and
+        # off) between the plain and sharded MLP, using looser tolerances (atol 1.3e-5, rtol 1e-4).
+        # KNOWN ISSUE: a TODO in the code notes ASGD needs higher tolerances for unknown reasons.
         mesh = self.build_device_mesh()
 
         asgd_configs = [
@@ -614,6 +659,11 @@ class TestDTensorOptimizer(DTensorTestBase):
 
     @with_comms
     def test_admaw_fused_across_meshes(self):
+        # [FUNCTION DOC] Builds a 2D mesh and its flattened 1D mesh. For each AdamW config, shards
+        # net1 of an MLP on the flattened mesh with shard_fn and net2 on the 2D mesh (replicated on
+        # x, sharded on y) with local helpers, then compares the optimizer on the mixed-mesh copy
+        # against the plain model via _assert_optimizer.
+        # KNOWN ISSUE: the test name has a typo (admaw instead of adamw).
         mesh_shape = (2, self.world_size // 2)
         mesh_2d = init_device_mesh(
             self.device_type, mesh_shape, mesh_dim_names=("x", "y")
@@ -680,6 +730,8 @@ class TestDTensorOptimizer(DTensorTestBase):
 
         # shard function to do full sharding on all parameters of a module
         def _shard_fn_2d(name, module, device_mesh):
+            # HELPER: Like shard_fn but for a 2D mesh: shards Linear parameters as Replicate on the
+            # first and Shard(0) on the second mesh dim, with a gradient hook restoring that layout.
             if isinstance(module, nn.Linear):
                 for name, param in module.named_parameters():
                     dist_param = torch.nn.Parameter(
@@ -695,6 +747,8 @@ class TestDTensorOptimizer(DTensorTestBase):
 
         # prepare input
         def _input_fn_2d(mod, inputs, device_mesh):
+            # HELPER: Wraps the first input as a DTensor on the 2D mesh with Replicate and Shard(0)
+            # placements from the local tensor, without running consistency checks.
             # split the input tensor to be sharded input on a 2d mesh
             dist_inp = DTensor.from_local(
                 inputs[0], device_mesh, [Replicate(), Shard(0)], run_check=False
@@ -724,6 +778,10 @@ class TestDTensorOptimizer(DTensorTestBase):
     @with_comms
     @parametrize("foreach", [True, False])
     def test_adamw_sharding_cache_no_leak(self, foreach):
+        # [FUNCTION DOC] Parametrized by foreach. Shards an MLP's parameters on dim 0 over a 1D
+        # mesh, runs 3 warmup training steps with AdamW and then 10 more, and asserts the DTensor
+        # sharding propagator cache miss count does not change after warmup, i.e. step-varying
+        # scalar arguments do not create new cache entries.
         """Step-varying scalar args (like AdamW's bias corrections) must not
         cause unbounded growth of the DTensor sharding propagation cache.
 
@@ -747,6 +805,8 @@ class TestDTensorOptimizer(DTensorTestBase):
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, foreach=foreach)
 
         def run_step():
+            # HELPER: One training step: builds a random sharded input, runs forward, backward on
+            # the summed output, optimizer step and zero_grad.
             inp = distribute_tensor(
                 torch.randn(8, 10, device=self.device_type), mesh, [Shard(0)]
             )

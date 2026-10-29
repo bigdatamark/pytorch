@@ -1,4 +1,7 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests for DTensor placement types (Shard, _StridedShard, Partial, Replicate):
+# type predicates, equality, constructor rules, tensor splitting helpers and behavior with
+# unbacked symbolic sizes under a fake tensor mode.
 import copy
 import itertools
 
@@ -29,7 +32,10 @@ from torch.testing._internal.common_utils import run_tests, TestCase
 
 # Basic functionality test for Placement types.
 class PlacementTypesTestCase(TestCase):
+    # [CLASS DOC] Test case covering basic placement behavior and symbolic-shape handling.
     def test_type_identification(self):
+        # [FUNCTION DOC] Checks is_shard, is_partial and is_replicate for each placement kind,
+        # before and after a deep copy; _StridedShard reports none of the three.
         shard = Shard(3)
         strided_shard = _StridedShard(dim=3, split_factor=7)
         partial_sum = Partial("sum")
@@ -52,6 +58,8 @@ class PlacementTypesTestCase(TestCase):
                 self.assertEqual(placement.is_replicate(), is_replicate)
 
     def test_equality(self):
+        # [FUNCTION DOC] Checks each placement equals itself and differs from placements of other
+        # kinds, dims, split factors or reduce ops (each equivalence class has one member).
         equivalence_classes = (
             (Shard(3),),
             (Shard(4),),
@@ -77,11 +85,16 @@ class PlacementTypesTestCase(TestCase):
                     self.assertNotEqual(lhs, rhs)
 
     def test_strided_shard_kwonly_argument(self):
+        # [FUNCTION DOC] Checks _StridedShard rejects a positional split factor with TypeError
+        # while the keyword form is accepted.
         with self.assertRaises(TypeError):
             _StridedShard(3, 4)
         _StridedShard(3, split_factor=4)
 
     def test_select_split_tensor_matches_split_tensor(self):
+        # [FUNCTION DOC] For dims 0 and 1 and several size and chunk-count combinations (even,
+        # uneven, fewer elements than chunks), checks _select_split_tensor for each index returns a
+        # tensor equal to the corresponding entry of _split_tensor without padding.
         """
         Test that _select_split_tensor produces the same result as indexing
         into _split_tensor. This validates that any alternative implementation
@@ -133,6 +146,8 @@ class PlacementTypesTestCase(TestCase):
                     )
 
     def test_select_split_tensor_symint_with_padding_raises(self):
+        # [FUNCTION DOC] Checks _select_split_tensor with an unbacked SymInt index and padding
+        # enabled raises GuardOnDataDependentSymNode.
         """
         Test that _select_split_tensor raises GuardOnDataDependentSymNode when
         called with a SymInt index and with_padding=True.
@@ -160,6 +175,8 @@ class PlacementTypesTestCase(TestCase):
             )
 
     def test_hinted_unbacked_even_shard_skips_padding(self):
+        # [FUNCTION DOC] In a fake mode, with an unbacked size hinted as 8 and 4 chunks, checks
+        # _maybe_pad_tensor and _maybe_unpad_tensor leave shapes unchanged (padding is skipped).
         fake_mode = FakeTensorMode(allow_non_fake_inputs=True, shape_env=ShapeEnv())
         shard = Shard(0)
 
@@ -176,6 +193,9 @@ class PlacementTypesTestCase(TestCase):
         self.assertEqual(unpadded.shape, full_tensor.shape)
 
     def test_hinted_unbacked_even_chunk_preserves_symbolic_shard_size(self):
+        # [FUNCTION DOC] With a hinted unbacked symbolic size, checks _custom_chunk into 8 chunks
+        # returns 8 chunks whose sizes equal the symbolic size divided by 8 and depend only on the
+        # same unbacked symbols as the original batch symbol.
         fake_mode = FakeTensorMode(allow_non_fake_inputs=True, shape_env=ShapeEnv())
 
         with fake_mode:
@@ -196,6 +216,9 @@ class PlacementTypesTestCase(TestCase):
             )
 
     def test_strided_shard_preserves_symbolic_split_factor(self):
+        # [FUNCTION DOC] Checks a _StridedShard built with an unbacked symbolic split factor keeps
+        # the symbol (free symbols, hint of 4, integer value 4), adds no shape env replacements,
+        # and records a deferred runtime assert that the symbol equals 4.
         fake_mode = FakeTensorMode(allow_non_fake_inputs=True, shape_env=ShapeEnv())
 
         with fake_mode:
@@ -217,6 +240,8 @@ class PlacementTypesTestCase(TestCase):
         self.assertIn(sympy.Eq(split_factor.node.expr, 4), deferred_asserts)
 
     def test_unbacked_even_fallback_hint_requires_override(self):
+        # [FUNCTION DOC] Checks _hint_proves_even_shard is False for an unbacked size with no
+        # override and True after an optimization hint of 8 is set for 4 shards.
         fake_mode = FakeTensorMode(allow_non_fake_inputs=True, shape_env=ShapeEnv())
 
         with fake_mode:
@@ -227,6 +252,9 @@ class PlacementTypesTestCase(TestCase):
             self.assertTrue(_hint_proves_even_shard(dim_size, 4))
 
     def test_hinted_unbacked_shardability_adds_runtime_check(self):
+        # [FUNCTION DOC] Checks is_tensor_shardable on a shape with an unbacked dim raises
+        # GuardOnDataDependentSymNode without a hint, and returns True once a hint of 16 is
+        # overridden.
         fake_mode = FakeTensorMode(allow_non_fake_inputs=True, shape_env=ShapeEnv())
         mesh = DeviceMesh("cpu", torch.arange(4), _init_backend=False, _rank=0)
         spec = DTensorSpec(mesh, (Shard(1),))
@@ -241,6 +269,9 @@ class PlacementTypesTestCase(TestCase):
             self.assertTrue(is_tensor_shardable((2, dim_size), spec))
 
     def test_strided_shard_unbacked_local_size_avoids_chunk_guard(self):
+        # [FUNCTION DOC] Checks _StridedShard.local_shard_size_and_offset on an unbacked size with
+        # two chunks returns a local size still containing unbacked symbols and an empty offset
+        # list.
         fake_mode = FakeTensorMode(allow_non_fake_inputs=True, shape_env=ShapeEnv())
 
         with fake_mode:
@@ -259,6 +290,8 @@ class PlacementTypesTestCase(TestCase):
         self.assertEqual(offsets, [])
 
     def test_strided_shard_split_tensor_uses_unbacked_safe_chunking(self):
+        # [FUNCTION DOC] Checks _StridedShard._split_tensor on an unbacked dim with two chunks
+        # returns two shards, no pad sizes, and a first shard size with unbacked symbols.
         fake_mode = FakeTensorMode(allow_non_fake_inputs=True, shape_env=ShapeEnv())
 
         with fake_mode:
