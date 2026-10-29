@@ -1,4 +1,10 @@
 # mypy: ignore-errors
+# [MODULE DOC] Helpers for RPC and distributed tests: a decorator (dist_init) that sets up and
+# shuts down RPC around a multi-process test method, polling utilities that wait for node
+# failure, pending RRef futures/users to flush, or expected owner and fork counts on a rank, plus
+# small helpers for process group init, worker naming and profiler event lookup. Import-time side
+# effect: if the distributed package is unavailable, prints a message to stderr and exits the
+# whole process with status 0.
 
 import re
 import sys
@@ -25,6 +31,14 @@ def dist_init(
     faulty_messages=None,
     messages_to_delay=None,
 ):
+    # [FUNCTION DOC] Decorator for test methods of multi-process RPC test cases. Usable bare or
+    # with options (then it returns a partial awaiting the method). The wrapped method, per
+    # process, disables the RRef leak ignore flag, sets the worker id to the rank, configures
+    # fault injection with faulty_messages and messages_to_delay, and, if setup_rpc is true,
+    # initializes RPC (longer timeouts under TSAN), runs the test, then shuts RPC down gracefully
+    # according to clean_shutdown. Returns the test's return value.
+    # Side effects: sets global RPC api and constants state.
+    # KNOWN ISSUE: if the test raises, RPC shutdown is skipped (no try/finally).
     """
     We use this decorator for setting up and tearing down state since
     MultiProcessTestCase runs each `test*` method in a separate process and
@@ -54,6 +68,8 @@ def dist_init(
 
     @wraps(old_test_method)
     def new_test_method(self, *arg, **kwargs):
+        # [FUNCTION DOC] Wrapper built by dist_init; see dist_init for the sequence of steps.
+        # Passes all arguments to the original test method and returns its result.
         # Setting _ignore_rref_leak to make sure OwnerRRefs are properly deleted
         # in tests.
         import torch.distributed.rpc.api as api
@@ -88,10 +104,16 @@ def dist_init(
 
 
 def noop() -> None:
+    # [FUNCTION DOC] HELPER: Does nothing; used as a trivial RPC target to probe a worker.
     pass
 
 
 def wait_until_node_failure(rank: int, expected_error_regex: str = ".*") -> str:
+    # [FUNCTION DOC] Repeatedly sends a synchronous RPC calling a no-op on the worker of the given
+    # rank, pausing a short time after each success, until a call raises an error whose message
+    # matches the regular expression; returns that error message string. Never times out.
+    # KNOWN ISSUE: an error that does not match the regex is swallowed and the loop retries
+    # immediately with no sleep (busy loop); the loop never ends if the node never fails.
     """
     Loops until an RPC to the given rank fails. This is used to
     indicate that the node has failed in unit tests.
@@ -110,6 +132,9 @@ def wait_until_node_failure(rank: int, expected_error_regex: str = ".*") -> str:
 
 
 def wait_until_pending_futures_and_users_flushed(timeout: int = 20) -> None:
+    # [FUNCTION DOC] Polls the local RRef context debug info every short interval until both the
+    # pending futures count and the pending users count are zero, then returns None. Raises
+    # ValueError with the remaining counts if more than timeout seconds elapse first.
     """
     The RRef protocol holds forkIds of rrefs in a map until those forks are
     confirmed by the owner. The message confirming the fork may arrive after
@@ -136,6 +161,10 @@ def wait_until_pending_futures_and_users_flushed(timeout: int = 20) -> None:
 
 
 def get_num_owners_and_forks() -> tuple[str, str]:
+    # [FUNCTION DOC] Reads the local RRef context debug info and returns the pair (number of owner
+    # RRefs, number of forks) exactly as stored there. Callable remotely as an RPC target.
+    # KNOWN ISSUE: values are reported as strings by the debug info, so callers must convert them
+    # to integers before comparing.
     """
     Retrieves number of OwnerRRefs and forks on this node from
     _rref_context_get_debug_info.
@@ -149,6 +178,10 @@ def get_num_owners_and_forks() -> tuple[str, str]:
 def wait_until_owners_and_forks_on_rank(
     num_owners: int, num_forks: int, rank: int, timeout: int = 20
 ) -> None:
+    # [FUNCTION DOC] Polls (once per second, via RPC with a short timeout) the worker of the given
+    # rank for its owner RRef and fork counts until they equal num_owners and num_forks, then
+    # returns None. Raises ValueError reporting expected and observed counts after timeout
+    # seconds. Used to confirm RRefs were deleted.
     """
     Waits until timeout for num_forks and num_owners to exist on the rank. Used
     to ensure proper deletion of RRefs in tests.
@@ -171,6 +204,9 @@ def wait_until_owners_and_forks_on_rank(
 
 
 def initialize_pg(init_method, rank: int, world_size: int) -> None:
+    # [FUNCTION DOC] HELPER: If no default process group exists yet, creates one with the gloo
+    # backend using the given init method, rank and world size (needed by tests that use
+    # barriers). Does nothing when a group is already initialized. Side effect: global state.
     # This is for tests using `dist.barrier`.
     if not dist.is_initialized():
         dist.init_process_group(
@@ -182,10 +218,16 @@ def initialize_pg(init_method, rank: int, world_size: int) -> None:
 
 
 def worker_name(rank: int) -> str:
+    # [FUNCTION DOC] HELPER: Returns the RPC worker name for a rank, the string worker followed by
+    # the rank number.
     return f"worker{rank}"
 
 
 def get_function_event(function_events, partial_event_name):
+    # [FUNCTION DOC] Returns the first profiler event in function_events whose name contains the
+    # substring partial_event_name. Raises IndexError if no event matches.
+    # KNOWN ISSUE: the docstring names the second argument event_name, but the real name is
+    # partial_event_name.
     """
     Returns the first event that matches partial_event_name in the provided
     function_events. These function_events should be the output of

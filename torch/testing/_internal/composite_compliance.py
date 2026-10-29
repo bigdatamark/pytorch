@@ -1,4 +1,11 @@
 # mypy: ignore-errors
+# [MODULE DOC] Utilities for checking that operators are composite compliant, meaning composite
+# operators only use dispatcher-visible operations and never touch storage or metadata directly.
+# Contents: a factory building a wrapper tensor subclass plus dispatch mode that polices this
+# (forbidding item, set_, resize_ and mismatched in-place use, checking metadata consistency),
+# helpers enumerating every combination of wrapped and plain arguments, and four checkers:
+# check_all_permutations, check_with_mode, check_backward_formula and check_forward_ad_formula,
+# which compare results against plain-tensor runs. No import-time side effects.
 
 import torch
 from torch import Tensor
@@ -15,6 +22,10 @@ import re
 
 
 def check_attr_consistency(wrapper_tensor, metadata_name, metadata_accessor):
+    # [FUNCTION DOC] HELPER: Compares one piece of metadata between a wrapper tensor and its inner
+    # tensor using the given accessor function. Returns None if equal; otherwise raises
+    # RuntimeError saying the named metadata was modified without going through the dispatcher (not
+    # composite compliant).
     elem = wrapper_tensor.elem
     metadata_wrapper_tensor = metadata_accessor(wrapper_tensor)
     metadata_elem = metadata_accessor(elem)
@@ -26,6 +37,9 @@ def check_attr_consistency(wrapper_tensor, metadata_name, metadata_accessor):
         f"going through the PyTorch dispatcher.")
 
 def check_metadata_consistency(wrapper_tensor, CCT):
+    # [FUNCTION DOC] HELPER: If wrapper_tensor is an instance of the CCT class, checks that shape,
+    # dtype, device, element count, strides and storage offset agree with its inner tensor, raising
+    # RuntimeError on the first mismatch. Non-wrapper values are ignored. Returns None.
     # CCT: CompositeCompliantTensor class which is generated using generate_cct
     if not isinstance(wrapper_tensor, CCT):
         return
@@ -41,6 +55,8 @@ def check_metadata_consistency(wrapper_tensor, CCT):
         check_attr_consistency(wrapper_tensor, metadata_name, metadata_accessor)
 
 def is_view_fn(func):
+    # [FUNCTION DOC] HELPER: Returns true if the operator overload's packet name is in a fixed list
+    # of view operators (reshaping, slicing, splitting, alias and similar), else false.
     return func.overloadpacket.__name__ in {
         'as_strided',
         'detach',
@@ -81,6 +97,9 @@ def is_view_fn(func):
 # manually populated from native_functions that have inplace_view: True.
 # In the future we will probably be able to grab that list directly
 def is_inplace_view_fn(func):
+    # [FUNCTION DOC] HELPER: Returns true if the operator overload's packet name is in a fixed,
+    # manually maintained set of in-place view operators (for example detach_, squeeze_, t_,
+    # transpose_, unsqueeze_), else false.
     return func.overloadpacket.__name__ in {
         'as_strided_',
         'detach_',
@@ -95,6 +114,9 @@ def is_inplace_view_fn(func):
 
 # Introspection please save us
 def is_inplace(func):
+    # [FUNCTION DOC] HELPER: Guesses by name whether an operator overload is in-place: dunder names
+    # starting with i (for example in-place arithmetic dunders) are in-place, other dunder names
+    # are not, and any other name is in-place if it ends with an underscore.
     name = func.overloadpacket.__name__
     if re.match('__i.+__', name):
         return True
@@ -104,6 +126,11 @@ def is_inplace(func):
 
 
 def generate_cct_and_mode(autograd_view_consistency=True):
+    # [FUNCTION DOC] Factory returning a pair: a newly generated CompositeCompliantTensor wrapper
+    # subclass and an instance of its dispatch mode. With autograd_view_consistency true, results
+    # of view operators are made to alias the input storage (needed by autograd checks); forward AD
+    # tests pass false because set_ does not work with it. The returned class is local to this
+    # call, so each call yields distinct classes.
     # This function returns a new class CompositeCompliantTensor
     # The two arguments control the behaviour described below.
 
@@ -114,12 +141,23 @@ def generate_cct_and_mode(autograd_view_consistency=True):
     #   we disable it by setting alias to False.
 
     class CompositeCompliantTensor(torch.Tensor):
+        # [CLASS DOC] HELPER: Wrapper tensor subclass holding a real tensor in its elem attribute,
+        # with metadata mirrored from it but a storage that must never be read directly. Used to
+        # detect composite operators that touch data or metadata without dispatching. Also stores
+        # the mode that created it. Dispatch re-enters that mode, and mixing different modes raises
+        # an error.
         elem: torch.Tensor
 
         __slots__ = ['elem']
 
         @staticmethod
         def __new__(cls, elem, mode, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Creates the wrapper for elem under the given mode. Raises
+            # AssertionError if elem is already a wrapper. If elem requires grad, the wrapper keeps
+            # a detached storage-clone copy (so shared test inputs are not affected) and takes over
+            # requires_grad; otherwise it keeps elem itself. Raises AssertionError if the strides
+            # differ, copies the conjugate and negation bits from the inner tensor, records the
+            # mode, and returns the wrapper.
             if type(elem) is cls:
                 raise AssertionError(
                     "Wrapping a CompositeCompliantTensor in a CompositeCompliantTensor is not supported"
@@ -170,10 +208,16 @@ def generate_cct_and_mode(autograd_view_consistency=True):
             return r
 
         def __repr__(self):
+            # [FUNCTION DOC] HELPER: Returns a string showing the inner tensor inside the
+            # text CompositeCompliantTensor(...).
             return f"CompositeCompliantTensor({self.elem})"
 
         @classmethod
         def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+            # [FUNCTION DOC] HELPER: Dispatch hook for the wrapper class: collects the modes of all
+            # wrapper tensors among the arguments, raises RuntimeError if they are not all the same
+            # mode (multiple modes are not implemented), then runs the operator again inside the
+            # first mode, which does the real unwrapping work. Returns that result.
             all_args = pytree.arg_tree_leaves(*args, **(kwargs or {}))
             modes = tuple(e.mode for e in all_args if isinstance(e, CompositeCompliantTensor))
             if not all_same_mode(modes):
@@ -182,11 +226,28 @@ def generate_cct_and_mode(autograd_view_consistency=True):
                 return func(*args, **kwargs)
 
     class CompositeCompliantTensorMode(TorchDispatchMode):
+        # [CLASS DOC] HELPER: Dispatch mode paired with the generated wrapper class. While active,
+        # it intercepts every operator: it rejects forbidden calls, unwraps wrapper arguments, runs
+        # the operator on the inner tensors, wraps tensor results back into wrappers, patches
+        # aliasing for view operators, applies in-place view metadata changes, and verifies
+        # metadata consistency of arguments and results.
         def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            # [FUNCTION DOC] HELPER: Handles one intercepted operator call and returns its
+            # (re-wrapped) result. Raises RuntimeError for scalar extraction (.item), for set_ or
+            # resize_ calls, and for an in-place operation whose written-to first argument is a
+            # plain tensor while other arguments are wrappers; also raises on any metadata
+            # inconsistency found at the end. Side effects: for view operators (when view
+            # consistency is enabled) the result wrappers are set to alias the inputs' storage, and
+            # for in-place view operators the same call is applied to the input wrappers' metadata,
+            # both with dispatch disabled.
             def unwrap(e):
+                # [FUNCTION DOC] HELPER: Returns the inner tensor of a wrapper, or the value
+                # unchanged if it is not a wrapper.
                 return e.elem if isinstance(e, CompositeCompliantTensor) else e
 
             def wrap(e):
+                # [FUNCTION DOC] HELPER: Wraps a tensor value into a wrapper of this mode, or
+                # returns non-tensor values unchanged.
                 return CompositeCompliantTensor(e, self) if isinstance(e, torch.Tensor) else e
 
             if func is torch.ops.aten._local_scalar_dense.default:
@@ -261,6 +322,11 @@ def generate_cct_and_mode(autograd_view_consistency=True):
     return CompositeCompliantTensor, CompositeCompliantTensorMode()
 
 def is_tensorlist(lst):
+    # [FUNCTION DOC] HELPER: Returns true if lst is a non-empty list or tuple whose elements are
+    # all tensors, false otherwise. Intended to raise RuntimeError for mixed lists of tensors and
+    # other things.
+    # KNOWN ISSUE: the mixed-list check repeats the all-tensors test instead of testing for at
+    # least one tensor, so the error is unreachable and mixed lists silently return false.
     if not isinstance(lst, list) and not isinstance(lst, tuple):
         return False
     if len(lst) == 0:
@@ -276,10 +342,14 @@ def is_tensorlist(lst):
 
 
 def maybe_map(fn, should_map, arg):
+    # [FUNCTION DOC] HELPER: Returns fn applied to arg when should_map is true, else arg unchanged.
     return fn(arg) if should_map else arg
 
 
 def wrap(arg, CCT, cct_mode):
+    # [FUNCTION DOC] HELPER: Wraps a tensor in the wrapper class under the given mode, or wraps
+    # every element of a tensor list and returns a list. Raises RuntimeError for any other kind
+    # of input.
     # CCT: CompositeCompliantTensor class which is generated using generate_cct_and_mode
     if isinstance(arg, torch.Tensor):
         return CCT(arg, cct_mode)
@@ -299,6 +369,11 @@ def wrap(arg, CCT, cct_mode):
 # NB: Yes, this is exponential. No, we don't care too much because PyTorch ops
 # don't accept that many input Tensors.
 def generate_subclass_choices(flat_args, CCT, cct_mode):
+    # [FUNCTION DOC] HELPER: Generator over all ways to wrap the tensor-like entries of a flat
+    # argument list: each tensor or tensor list is independently either kept plain or wrapped
+    # (non-tensor entries are never wrapped), so n tensor-like entries give 2 to the power n
+    # combinations. Yields pairs of the resulting argument list and a tuple of booleans telling
+    # which entries were wrapped.
     # CCT: CompositeCompliantTensor class which is generated using generate_cct_and_mode
     is_tensor_likes = [isinstance(arg, torch.Tensor) or is_tensorlist(arg) for arg in flat_args]
     subclass_options = [[False, True] if is_tensor_like else [False] for is_tensor_like in is_tensor_likes]
@@ -314,6 +389,10 @@ def generate_subclass_choices(flat_args, CCT, cct_mode):
 # a regular Tensor or a Tensor Subclass. This iterator iterates through
 # all of those options.
 def generate_subclass_choices_args_kwargs(args, kwargs, CCT, cct_mode):
+    # [FUNCTION DOC] HELPER: Generator over all wrap/no-wrap combinations for positional and
+    # keyword arguments: flattens the keyword values, enumerates combinations over positional plus
+    # flat keyword values, and yields four items: new positional arguments, new keyword arguments,
+    # and the wrapped-flags for each in the same structures.
     # CCT: CompositeCompliantTensor class which is generated using generate_cct_and_mode
     flat_kwargs, spec = tree_flatten(kwargs)
     flat_args_kwargs = list(args) + list(flat_kwargs)
@@ -326,6 +405,9 @@ def generate_subclass_choices_args_kwargs(args, kwargs, CCT, cct_mode):
 
 
 def raise_composite_compliance_error(err, additional_info=''):
+    # [FUNCTION DOC] HELPER: Always raises RuntimeError, chained from err, with a message that the
+    # composite compliance check failed, includes additional_info (details of which arguments were
+    # wrapped) and points to the ATen native README section on how to resolve it.
     raise RuntimeError(
         "Composite compliance check failed with "
         "the above error.\n"
@@ -348,6 +430,13 @@ def raise_composite_compliance_error(err, additional_info=''):
 # If some composite operation does any non-compliant behavior,
 # CompositeCompliantTensor will raise an error.
 def check_all_permutations(op, args, kwargs, assert_equal_fn):
+    # [FUNCTION DOC] Test helper: runs op on the plain arguments to get the expected result, then
+    # runs it for every combination of wrapping tensor arguments (positional and keyword) in the
+    # wrapper class, comparing the unwrapped result to the expected one with assert_equal_fn. A
+    # RuntimeError raised by op is re-raised as a composite compliance error listing which
+    # arguments were wrapped. Returns None.
+    # KNOWN ISSUE: only RuntimeError is translated; the equality check itself is outside the
+    # try block.
     CCT, cct_mode = generate_cct_and_mode()
     expected = op(*args, **kwargs)
     for choice in generate_subclass_choices_args_kwargs(args, kwargs, CCT, cct_mode):
@@ -376,6 +465,8 @@ def check_all_permutations(op, args, kwargs, assert_equal_fn):
             )
 
         def unwrap(e):
+            # [FUNCTION DOC] HELPER: Returns the inner tensor of a wrapper of this call's class,
+            # else the value unchanged.
             return e.elem if isinstance(e, CCT) else e
 
         assert_equal_fn(tree_map(unwrap, actual), expected)
@@ -393,9 +484,16 @@ def check_all_permutations(op, args, kwargs, assert_equal_fn):
 # Composite does any non-compliant behavior,
 # CompositeCompliantTensor will raise an error.
 def check_with_mode(op, args, kwargs, assert_equal_fn):
+    # [FUNCTION DOC] Test helper: runs op on plain arguments for the expected result, then with
+    # every tensor argument wrapped and the wrapper's dispatch mode active (so tensors created
+    # inside the op, such as via factory functions, are also wrappers). A RuntimeError becomes a
+    # composite compliance error. Compares the unwrapped result with the expected one using
+    # assert_equal_fn. Returns None.
     CCT, cct_mode = generate_cct_and_mode()
 
     def wrap(e):
+        # [FUNCTION DOC] HELPER: Wraps a tensor argument in the wrapper class with this call's
+        # mode; other values pass through.
         return CCT(e, cct_mode) if isinstance(e, torch.Tensor) else e
 
     expected = op(*args, **kwargs)
@@ -410,11 +508,14 @@ def check_with_mode(op, args, kwargs, assert_equal_fn):
         raise_composite_compliance_error(err)
 
     def unwrap(e):
+        # [FUNCTION DOC] HELPER: Returns the inner tensor of a wrapper, else the value unchanged.
         return e.elem if isinstance(e, CCT) else e
 
     assert_equal_fn(tree_map(unwrap, actual), expected)
 
 def gather_leaf_tensors(args, kwargs):
+    # [FUNCTION DOC] HELPER: Returns the list of tensors with requires_grad set among all flattened
+    # positional and keyword arguments, in order, ignoring non-tensors.
     leaf_tensors = []
     args, _args_spec = tree_flatten(args)
     kwargs, _kwargs_spec = tree_flatten(kwargs)
@@ -428,6 +529,11 @@ def gather_leaf_tensors(args, kwargs):
 
 
 def compute_expected_grads(op, args, kwargs, output_process_fn_grad=None, gradcheck_wrapper=None):
+    # [FUNCTION DOC] HELPER: Computes reference gradients: runs op (through gradcheck_wrapper if
+    # given), optionally post-processes the output with output_process_fn_grad, keeps tensor
+    # outputs that require grad, and returns the gradients of those outputs with respect to the
+    # leaf tensors of the arguments using all-ones output gradients (unused inputs give None; graph
+    # retained). Raises AssertionError if there are no differentiable outputs or no leaf tensors.
     if gradcheck_wrapper is None:
         results = op(*args, **kwargs)
     else:
@@ -460,6 +566,18 @@ def compute_expected_grads(op, args, kwargs, output_process_fn_grad=None, gradch
 def check_backward_formula(op: Callable, args, kwargs,
                            output_process_fn_grad=None,
                            gradcheck_wrapper=None, assert_equal_fn=None):
+                               # [FUNCTION DOC] Test helper: checks that the backward formula is
+                               # composite compliant. Computes reference gradients on plain inputs,
+                               # then for every combination of wrapping inputs and, nested within
+                               # it, the all-ones output gradients, reruns forward and backward and
+                               # compares the unwrapped gradients to the reference with
+                               # assert_equal_fn (NaNs treated as equal). RuntimeError in forward
+                               # or backward is re-raised as a composite compliance error
+                               # describing the wrapping. Raises AssertionError if no leaf tensor
+                               # or no differentiable output exists. Op is any callable, not only
+                               # an OpInfo.
+                               # KNOWN ISSUE: assert_equal_fn defaults to None and is called
+                               # unconditionally, so it must be supplied.
     CCT, cct_mode = generate_cct_and_mode()
 
     expected = compute_expected_grads(op, args, kwargs, output_process_fn_grad, gradcheck_wrapper)
@@ -508,6 +626,8 @@ def check_backward_formula(op: Callable, args, kwargs,
                 )
 
             def unwrap(e):
+                # [FUNCTION DOC] HELPER: Returns the inner tensor of a wrapper, else the
+                # value unchanged.
                 return e.elem if isinstance(e, CCT) else e
 
             assert_equal_fn(tuple(map(unwrap, actual)), expected, equal_nan=True)
@@ -520,9 +640,22 @@ def check_backward_formula(op: Callable, args, kwargs,
 # this means we can apply check_forward_ad_formula to things that aren't OpInfos
 # while debugging.
 def check_forward_ad_formula(op: Callable, args, kwargs, gradcheck_wrapper=None, assert_equal_fn=None):
+    # [FUNCTION DOC] Test helper: checks that the forward AD formula is composite compliant.
+    # Builds random tangents for inputs that require grad, then makes dual tensors and computes
+    # reference primal and tangent outputs from plain inputs inside a dual level. Then for every
+    # combination of wrapping the primals and (nested) of wrapping the tangents, reruns op on dual
+    # tensors and compares the unwrapped primals and tangents to the references with
+    # assert_equal_fn (NaNs treated as equal). RuntimeError is re-raised as a composite compliance
+    # error describing the wrapping. The wrapper class is created without view aliasing, which
+    # forward AD does not support.
+    # KNOWN ISSUE: assert_equal_fn defaults to None and is called unconditionally, so it must
+    # be supplied.
     CCT, cct_mode = generate_cct_and_mode(autograd_view_consistency=False)
 
     def maybe_tangent(t):
+        # [FUNCTION DOC] HELPER: Returns a random tangent shaped like t if t is a tensor requiring
+        # grad, a list of random tangents (or None entries for elements not requiring grad) for a
+        # tensor list, else None. Raises AssertionError if t is already a wrapper.
         if type(t) is CCT:
             raise AssertionError("Expected type(t) is not CCT")
         # Generate `tangent` tensor
@@ -540,6 +673,10 @@ def check_forward_ad_formula(op: Callable, args, kwargs, gradcheck_wrapper=None,
 
     with fwAD.dual_level():
         def maybe_make_dual(dual):
+            # [FUNCTION DOC] HELPER: Takes a pair (primal, tangent) and returns a dual tensor made
+            # from the detached primal and the tangent when the primal is a tensor requiring grad;
+            # for a tensor list returns a tuple with duals where a tangent exists and the original
+            # element otherwise; any other primal is returned unchanged.
             # Returns dual tensor if primal is a tensor/tensor subclass
             # with requires_grad set.
             primal, tangent = dual
@@ -551,6 +688,9 @@ def check_forward_ad_formula(op: Callable, args, kwargs, gradcheck_wrapper=None,
             return primal
 
         def compute_expected_grad(args, tangent_args, kwargs, tangent_kwargs):
+            # [FUNCTION DOC] HELPER: Builds dual-tensor positional and keyword arguments from
+            # the primals and tangents and returns op (through gradcheck_wrapper if given)
+            # applied to them.
             op_args = tuple(map(maybe_make_dual, zip(args, tangent_args, strict=True)))
             op_kwargs = {k: maybe_make_dual((v, tangent_kwargs[k])) for k, v in kwargs.items()}
 
@@ -599,6 +739,8 @@ def check_forward_ad_formula(op: Callable, args, kwargs, gradcheck_wrapper=None,
                     )
 
                 def unwrap(e):
+                    # [FUNCTION DOC] HELPER: Returns the inner tensor of a wrapper, else the
+                    # value unchanged.
                     return e.elem if isinstance(e, CCT) else e
 
                 actual = tree_map(fwAD.unpack_dual, actual)
