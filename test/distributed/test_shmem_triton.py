@@ -1,6 +1,14 @@
 # Owner(s): ["oncall: distributed"]
 # To run:
 # python test/distributed/test_shmem_triton.py
+# [MODULE DOC] Multi-process tests for the SHMEM (NVSHMEM or rocSHMEM) Triton device API in
+# torch.distributed._symmetric_memory._shmem_triton: put, get, put with signal, wait_until,
+# signal_wait_until, fence, quiet, barrier_all, sync_all, alltoall, broadcast and reductions.
+# Holds a set of small Triton kernels wrapping the backend functions and one
+# MultiProcContinuousTest class using symmetric memory tensors. Import-time side effects: if
+# CUDA is not built, the SHMEM backend is unavailable or the platform lacks symmetric memory
+# support, prints a message and exits the process with status 0 before importing Triton; then
+# resolves the backend module into shmem_backend and device_type (cuda) and device_module.
 
 import sys
 
@@ -44,6 +52,9 @@ shmem_backend = shmem_triton.get_shmem_backend_module()
 
 
 def requires_h100():
+# [FUNCTION DOC] Returns a skip decorator (skip but pass in sandcastle) that skips tests when
+# not running on ROCm and the GPU is not an H100, with the message that NVSHMEM Triton tests
+# require H100.
     return skip_but_pass_in_sandcastle_if(
         (not TEST_WITH_ROCM) and not IS_H100,
         "NVSHMEM Triton tests require H100.",
@@ -57,6 +68,8 @@ device_module = torch.get_device_module(device_type)
 # Shared Triton JIT kernels
 
 
+# [FUNCTION DOC] HELPER: Triton kernel: one program that does a blocking put of nelems
+# elements from src to dest on remote PE pe via the backend.
 @requires_shmem
 @triton.jit
 def my_put_kernel(
@@ -68,6 +81,9 @@ def my_put_kernel(
     shmem_backend.put(dest, src, nelems, pe)
 
 
+# [FUNCTION DOC] HELPER: Triton kernel: one program that gets nelems elements from the remote
+# PE pe source into dest. If the constexpr nbi is true it uses the non-blocking get followed
+# by quiet, otherwise the blocking get.
 @requires_shmem
 @triton.jit
 def my_get_kernel(
@@ -84,6 +100,9 @@ def my_get_kernel(
         shmem_backend.get(dest, src, nelems, pe)
 
 
+# [FUNCTION DOC] HELPER: Triton kernel: copies size_bytes from src to dst on the peer and then
+# atomically updates the signal variable there with sig_val using sig_op (put with signal at
+# block scope).
 @requires_shmem
 @triton.jit
 def my_putmem_signal_block_kernel(
@@ -100,12 +119,17 @@ def my_putmem_signal_block_kernel(
     )
 
 
+# [FUNCTION DOC] HELPER: Triton kernel: blocks until the 64-bit signal variable satisfies the
+# comparison cmp_op against cmp_val.
 @requires_shmem
 @triton.jit
 def my_signal_wait_until_kernel(signal, cmp_op, cmp_val):
     shmem_backend.signal_wait_until(signal, cmp_op, cmp_val)
 
 
+# [FUNCTION DOC] HELPER: Triton kernel: performs a signal operation (sig_op with the given
+# value) on the signal address at the peer PE.
+# KNOWN ISSUE: not used by any test in this file.
 @requires_shmem
 @triton.jit
 def my_signal_op_kernel(
@@ -117,6 +141,8 @@ def my_signal_op_kernel(
     shmem_backend.signal_op(sig_addr, signal, sig_op, peer)
 
 
+# [FUNCTION DOC] HELPER: Triton kernel: blocks until the 32-bit symmetric variable ivar
+# satisfies comparison cmp_op against cmp_val.
 @requires_shmem
 @triton.jit
 def my_wait_until_kernel(
@@ -127,12 +153,16 @@ def my_wait_until_kernel(
     shmem_backend.wait_until(ivar, cmp_op, cmp_val)
 
 
+# [FUNCTION DOC] HELPER: Triton kernel: issues a single fence with no other work.
 @requires_shmem
 @triton.jit
 def my_fence_kernel():
     shmem_backend.fence()
 
 
+# [FUNCTION DOC] HELPER: Triton kernel: put of src1 to dst1, fence, put of src2 to dst2,
+# fence, then put of one element from flag_src to flag_dst, all targeting the same peer. The
+# fences order the data before the flag.
 @requires_shmem
 @triton.jit
 def my_put_with_fence_kernel(
@@ -157,6 +187,9 @@ def my_put_with_fence_kernel(
     shmem_backend.put(flag_dst, flag_src, 1, peer)
 
 
+# [FUNCTION DOC] HELPER: Triton kernel: put of nelems from src to dst on the peer, then quiet
+# (waits for completion), then put of one element flag_src to flag_dst, so the flag arrives
+# only after the data is complete.
 @requires_shmem
 @triton.jit
 def my_put_with_quiet_kernel(
@@ -176,6 +209,10 @@ def my_put_with_quiet_kernel(
     shmem_backend.put(flag_dst, flag_src, 1, peer)
 
 
+# [FUNCTION DOC] HELPER: Triton kernel: full device-side barrier test body, to be launched
+# cooperatively. PE 0 stores 42 as int32 in src and puts it to every other PE's dst, all PEs
+# call barrier_all, then every PE other than 0 loads its dst value and stores that value plus
+# one.
 @requires_shmem
 @triton.jit
 def my_barrier_test_kernel(
@@ -211,12 +248,17 @@ def my_barrier_test_kernel(
         tl.store(p_dst, received + 1)
 
 
+# [FUNCTION DOC] HELPER: Triton kernel: one program that calls barrier_all.
+# KNOWN ISSUE: not used by any test in this file.
 @requires_shmem
 @triton.jit
 def my_barrier_all_kernel():
     shmem_backend.barrier_all()
 
 
+# [FUNCTION DOC] HELPER: Triton kernel: each PE stores its PE number plus 100 as int32 in
+# local_data, calls sync_all, then gets nelems from local_data on the next PE (wrapping
+# around) into remote_data. Launched cooperatively.
 @requires_shmem
 @triton.jit
 def my_sync_test_kernel(
@@ -245,6 +287,8 @@ def my_sync_test_kernel(
     # because sync_all() made those local stores visible
 
 
+# [FUNCTION DOC] HELPER: Triton kernel: all-to-all over the team handle where each PE sends
+# nelems_per_pe elements to every PE from src into dst.
 @requires_shmem
 @triton.jit
 def my_alltoall_kernel(
@@ -256,6 +300,8 @@ def my_alltoall_kernel(
     shmem_backend.alltoall(team_handle, dst, src, nelems_per_pe)
 
 
+# [FUNCTION DOC] HELPER: Triton kernel: broadcast of nelems elements from pe_root source into
+# dst on every PE of the team.
 @requires_shmem
 @triton.jit
 def my_broadcast_kernel(
@@ -268,6 +314,8 @@ def my_broadcast_kernel(
     shmem_backend.broadcast(team_handle, dst, src, nelems, pe_root)
 
 
+# [FUNCTION DOC] HELPER: Triton kernel: team reduction of nreduce elements from source_tensor
+# into dest_tensor using the constexpr operation name (sum, min, max or prod).
 @requires_shmem
 @triton.jit
 def my_reduce_kernel(
@@ -282,7 +330,14 @@ def my_reduce_kernel(
 
 @instantiate_parametrized_tests
 class SHMEMTritonTest(MultiProcContinuousTest):
+    # [CLASS DOC] Continuous multi-process test class (instantiated with parametrized tests)
+    # for the SHMEM Triton kernels. Every test sets the device and the NVSHMEM symmetric
+    # memory backend, creates symmetric tensors with rendezvous over the default group,
+    # launches kernels on the ranks and checks the results; most tests assume exactly two
+    # ranks.
     def _init_device(self) -> None:
+        # [FUNCTION DOC] HELPER: Sets the current CUDA device to this rank's device (comment
+        # says the run hangs without it) and selects NVSHMEM as the symmetric memory backend.
         # TODO: relieve this (seems to hang if without)
         device_module.set_device(self.device)
         # Set NVSHMEM as SymmMem backend
@@ -290,11 +345,16 @@ class SHMEMTritonTest(MultiProcContinuousTest):
 
     @property
     def device(self) -> torch.device:
+        # [FUNCTION DOC] Property: the CUDA device whose index equals this process's rank.
         return torch.device(device_type, self.rank)
 
     @requires_triton()
     @requires_h100()
     def test_triton_put(self) -> None:
+        # [FUNCTION DOC] Two-rank test (symmetric memory, requires Triton and an H100 unless
+        # ROCm). Rank 0 puts a 5-element int64 buffer (values 420 through 424) into rank 1's
+        # destination with the put kernel, between barriers; rank 1 checks it received that
+        # data.
         torch.manual_seed(42 + self.rank)
         self._init_device()
 
@@ -347,6 +407,10 @@ class SHMEMTritonTest(MultiProcContinuousTest):
     @requires_h100()
     @parametrize("nbi", [False, True])  # Test both blocking and nonblocking interfaces
     def test_triton_get(self, nbi: bool) -> None:
+        # [FUNCTION DOC] Two-rank test (symmetric memory, requires Triton and an H100 unless
+        # ROCm). Parametrized by nbi (blocking vs non-blocking get). Rank 1 gets an int8
+        # buffer of 7s from rank 0 and checks it; rank 0 does no check. There is no barrier
+        # between setup and the get.
         torch.manual_seed(42 + self.rank)
         self._init_device()
 
@@ -385,6 +449,9 @@ class SHMEMTritonTest(MultiProcContinuousTest):
     @requires_triton()
     @requires_h100()
     def test_triton_get_ring(self) -> None:
+        # [FUNCTION DOC] Every rank gets an int8 buffer from the rank to its left in a ring
+        # (rank minus one, modulo world size) after a barrier, and checks it holds that rank's
+        # value.
         torch.manual_seed(42 + self.rank)
         self._init_device()
 
@@ -425,6 +492,10 @@ class SHMEMTritonTest(MultiProcContinuousTest):
     @requires_triton()
     @requires_h100()
     def test_triton_put_signal_set(self) -> None:
+        # [FUNCTION DOC] Two-rank test (symmetric memory, requires Triton and an H100 unless
+        # ROCm). Rank 0 uses put-with-signal (set operation, value 1) to write 8 int8 bytes
+        # into rank 1 and set rank 1's signal pad flag; rank 1 waits for the flag to equal 1
+        # and checks data and flag.
         torch.manual_seed(42 + self.rank)
         self._init_device()
 
@@ -481,6 +552,10 @@ class SHMEMTritonTest(MultiProcContinuousTest):
     @requires_triton()
     @requires_h100()
     def test_triton_put_signal_add(self) -> None:
+        # [FUNCTION DOC] Two-rank test (symmetric memory, requires Triton and an H100 unless
+        # ROCm). Same as the signal set test but uses the add operation (code 1 on ROCm, 5 on
+        # NVSHMEM) with value 16; rank 1 waits until the flag equals 16 and checks the data
+        # and flag.
         torch.manual_seed(42 + self.rank)
         self._init_device()
 
@@ -537,6 +612,10 @@ class SHMEMTritonTest(MultiProcContinuousTest):
     @requires_triton()
     @requires_h100()
     def test_triton_wait_until(self) -> None:
+        # [FUNCTION DOC] Two-rank test (symmetric memory, requires Triton and an H100 unless
+        # ROCm). Rank 0 waits in the wait_until kernel for a 32-bit flag to equal 42; rank 1
+        # puts 42 into rank 0's flag; rank 0 checks it.
+        # KNOWN ISSUE: the comment says an int64 flag but the tensor is int32.
         torch.manual_seed(42 + self.rank)
         self._init_device()
 
@@ -584,6 +663,9 @@ class SHMEMTritonTest(MultiProcContinuousTest):
     @requires_triton()
     @requires_h100()
     def test_triton_signal_wait_until(self) -> None:
+        # [FUNCTION DOC] Producer-consumer test on two ranks: rank 0 puts 8 int8 bytes of 123
+        # into rank 1 with a put-with-signal (set to 1); rank 1 waits on the signal then
+        # checks the data and the signal pad value. Does not seed the random generator.
         self._init_device()
         group_name = dist.distributed_c10d._get_default_group().group_name
         rank = self.rank
@@ -643,6 +725,10 @@ class SHMEMTritonTest(MultiProcContinuousTest):
     @requires_triton()
     @requires_h100()
     def test_triton_fence(self) -> None:
+        # [FUNCTION DOC] Two-rank test (symmetric memory, requires Triton and an H100 unless
+        # ROCm). Rank 0 runs the fence kernel (two data puts and a flag put, separated by
+        # fences); rank 1 waits for the flag then checks both destination buffers and the
+        # flag.
         """
         Rank 0 performs two put operations into Rank 1's buffers with a fence
         between them, followed by another fence and a flag update. Rank 1 waits
@@ -714,6 +800,10 @@ class SHMEMTritonTest(MultiProcContinuousTest):
     @requires_triton()
     @requires_h100()
     def test_triton_quiet(self) -> None:
+        # [FUNCTION DOC] Two-rank test (symmetric memory, requires Triton and an H100 unless
+        # ROCm). Rank 1 runs the quiet kernel (put data, quiet, put flag) toward rank 0; rank
+        # 0 waits for the flag to equal 42 then checks the data. Barriers surround the
+        # exchange.
         torch.manual_seed(42 + self.rank)
         self._init_device()
         group_name = dist.distributed_c10d._get_default_group().group_name
@@ -762,6 +852,9 @@ class SHMEMTritonTest(MultiProcContinuousTest):
     @requires_triton()
     @requires_h100()
     def test_triton_barrier(self) -> None:
+        # [FUNCTION DOC] Launches the barrier test kernel cooperatively with one CTA on each
+        # rank, then a barrier. Rank 0 must end with 42 in its source tensor and every other
+        # rank with 43 in its destination.
         torch.manual_seed(42 + self.rank)
         self._init_device()
         group_name = dist.distributed_c10d._get_default_group().group_name
@@ -795,6 +888,9 @@ class SHMEMTritonTest(MultiProcContinuousTest):
     @requires_triton()
     @requires_h100()
     def test_triton_sync(self) -> None:
+        # [FUNCTION DOC] Launches the sync_all test kernel cooperatively and checks each
+        # rank's local value equals rank plus 100 and the value fetched from the next rank
+        # equals next rank plus 100.
         torch.manual_seed(42 + self.rank)
         self._init_device()
 
@@ -838,6 +934,10 @@ class SHMEMTritonTest(MultiProcContinuousTest):
     @requires_triton()
     @requires_h100()
     def test_triton_alltoall(self) -> None:
+        # [FUNCTION DOC] Skipped on ROCm multiprocess runs. Each rank fills a source buffer
+        # with value rank times 100 plus destination index (2 int64 per peer), runs all-to-all
+        # on team 0 cooperatively, and checks that the chunk from rank i holds i times 100
+        # plus its own rank.
         torch.manual_seed(42 + self.rank)
         self._init_device()
         group_name = dist.distributed_c10d._get_default_group().group_name
@@ -884,6 +984,9 @@ class SHMEMTritonTest(MultiProcContinuousTest):
     @requires_triton()
     @requires_h100()
     def test_triton_broadcast(self) -> None:
+        # [FUNCTION DOC] Skipped on ROCm multiprocess runs. Root rank 0 holds values 100
+        # through 103 (others hold -1), runs broadcast on team 0 cooperatively, and every rank
+        # checks its destination equals the root's values.
         torch.manual_seed(42 + self.rank)
         self._init_device()
         group_name = dist.distributed_c10d._get_default_group().group_name
@@ -951,6 +1054,11 @@ class SHMEMTritonTest(MultiProcContinuousTest):
         ],
     )
     def test_triton_sum_reduce(self, dtype) -> None:
+        # [FUNCTION DOC] Skipped on ROCm multiprocess runs; parametrized over several integer
+        # and floating dtypes (not float64, which is commented out as not close). Each rank's
+        # source holds (rank + 1) times (index + 1) for three elements; the cooperative reduce
+        # kernel with operation sum on team 0 must give the sum over ranks, checked on every
+        # rank.
         torch.manual_seed(42 + self.rank)
         self._init_device()
         group_name = dist.distributed_c10d._get_default_group().group_name
@@ -1012,6 +1120,10 @@ class SHMEMTritonTest(MultiProcContinuousTest):
         ],
     )
     def test_triton_minmax_reduce(self, dtype) -> None:
+        # [FUNCTION DOC] Skipped on ROCm multiprocess runs; parametrized over eight dtypes
+        # including float64. Each rank contributes 10 + 5 times rank and 20 - 15 times rank;
+        # runs min and max reductions on team 0 and checks against min and max computed over
+        # all ranks.
         torch.manual_seed(42 + self.rank)
         self._init_device()
         group_name = dist.distributed_c10d._get_default_group().group_name
@@ -1097,6 +1209,12 @@ class SHMEMTritonTest(MultiProcContinuousTest):
         ],
     )
     def test_triton_prod_reduce(self, dtype) -> None:
+        # [FUNCTION DOC] Skipped on ROCm multiprocess runs; parametrized over several dtypes
+        # (no unsigned, no float64). Rank values are small (1 or 2 patterns) to avoid
+        # overflow; the product reduction on team 0 is checked against the product computed on
+        # the host from the same pattern.
+        # KNOWN ISSUE: the host expectation loop reuses the name rank as its loop variable,
+        # shadowing this rank's value.
         torch.manual_seed(42 + self.rank)
         self._init_device()
         group_name = dist.distributed_c10d._get_default_group().group_name

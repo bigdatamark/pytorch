@@ -1,4 +1,9 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Test that a C++ custom op compiled with load_inline can tell a ProcessGroup
+# passed in as an opaque capsule value apart from a string, another capsule type, an int and a
+# tensor. Defines a minimal Python ProcessGroup subclass and one test case; no import-time
+# side effects beyond imports. The test is skipped if distributed is unavailable or under
+# Dynamo.
 
 import unittest
 
@@ -13,20 +18,35 @@ from torch.testing._internal.common_utils import (
 
 
 class DummyProcessGroup(dist.ProcessGroup):
+    # [CLASS DOC] Minimal ProcessGroup subclass for the test. Forwards rank and world size to
+    # the base class and reports a fixed backend name; has no communication behavior.
     """Minimal ProcessGroup for testing."""
 
     def __init__(self, rank: int = 0, world_size: int = 1):
+        # [FUNCTION DOC] HELPER: Construct the base ProcessGroup with the given rank (default
+        # 0) and world size (default 1).
         super().__init__(rank, world_size)
 
     def getBackendName(self) -> str:
+        # [FUNCTION DOC] HELPER: Return the constant backend name string for this dummy group.
         return "dummy-jit-test"
 
 
 @unittest.skipIf(not dist.is_available(), "requires distributed")
 @skipIfTorchDynamo("JIT/C++ extension test")
 class TestProcessGroupCapsule(TestCase):
+    # [CLASS DOC] Single-test case class checking capsule discrimination for ProcessGroup
+    # objects in C++ operators. Skipped when distributed is unavailable or under TorchDynamo.
     @scoped_load_inline
     def test_processgroup_capsule_discrimination(self, load_inline):
+        # [FUNCTION DOC] Compile inline C++ that registers three ops in a test library: one
+        # classifying a generic value (string 0, ProcessGroup capsule 1, other capsule 2, int
+        # 3, tensor 4, anything else -1), one returning a tensor of rank and size from a
+        # ProcessGroup capsule (error if the capsule is not a ProcessGroup), and one creating
+        # a non-ProcessGroup capsule. Then, with a dummy group of rank 2 and size 8, asserts
+        # each classification, that the group info is (2, 8), and that passing the other
+        # capsule to the info op raises RuntimeError. Side effect: builds and loads an
+        # extension, registering the ops globally for the process.
         """Test C++ can distinguish string vs ProcessGroup vs other capsule types."""
         cpp_source = """
 #include <torch/extension.h>

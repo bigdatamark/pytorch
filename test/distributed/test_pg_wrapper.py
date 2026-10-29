@@ -1,4 +1,11 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Multi-process tests for the c10d process group wrapper, which checks that all
+# ranks issue matching collectives (op type, tensor shape, dtype, device, sequence number) and
+# reports a diff when they do not. Defines an abstract test mixin plus a Gloo-backed suite and
+# an accelerator (NCCL/XCCL) suite. At import it exits the process silently if c10d is
+# unavailable, and computes the module globals device_type (current accelerator or cpu) and
+# backend (default backend for it). The main block refuses to run if CUDA/XPU was already
+# initialized in the parent, then calls run_tests.
 
 import os
 import sys
@@ -38,11 +45,25 @@ backend = c10d.get_default_backend_for_device(device_type)
 
 
 class AbstractProcessGroupWrapperTest(MultiProcessTestCase):
+    # [CLASS DOC] Abstract MultiProcessTestCase holding backend-independent checks for the
+    # process group wrapper. Subclasses must provide _create_wrapper_pg(with_new_group,
+    # timeout) returning a wrapped group. Shared helpers cover hang detection, op mismatch,
+    # shape mismatch and coalesced-allgather op mismatch. Not collected on its own for real
+    # work; setUp spawns the worker processes.
     def setUp(self):
+        # [FUNCTION DOC] Run the base multi-process setUp, then spawn the worker processes.
         super().setUp()
         self._spawn_processes()
 
     def _validate_error(self, exception, op_type, rank, tensor, verify_diff=True):
+        # [FUNCTION DOC] HELPER: Assert that an exception raised by the wrapper describes a
+        # collective mismatch. Checks the message contains op_type; unless op_type is BARRIER,
+        # also checks it contains the tensor shape, the device (only the device type when the
+        # tensor lives on the accelerator), the C++ dtype name (Float for float dtypes, Long
+        # for int dtypes, otherwise fails the test), a SequenceNumber entry, and, when
+        # verify_diff is true, the text 'Collectives differ in the following'. The rank
+        # argument is accepted but unused.
+        # KNOWN ISSUE: the rank parameter is never used in the checks.
         err = str(exception)
         self.assertTrue(
             op_type in err,
@@ -83,6 +104,11 @@ class AbstractProcessGroupWrapperTest(MultiProcessTestCase):
                 )
 
     def _test_collective_hang(self, wrapper_pg, use_accel=False):
+        # [FUNCTION DOC] HELPER: Hang detection check. Every rank except rank 1 issues an
+        # allreduce that rank 1 never issues, and must get a RuntimeError. Rank 0 expects a
+        # message naming rank 1 as failing the monitored barrier; other ranks expect a pointer
+        # to rank 0 logs. The pattern also accepts Gloo connection closed/reset errors. When
+        # use_accel is true the tensor is moved to the device whose index equals the rank.
         # All ranks besides 1 call allreduce and wrapper_pg should detect a hang
         # and report an issue with rank 1.
         faulty_rank = 1
@@ -104,6 +130,11 @@ class AbstractProcessGroupWrapperTest(MultiProcessTestCase):
                 wrapper_pg.allreduce([tensor])
 
     def _test_collectives_op_mismatch(self, wrapper_pg, use_accel=False):
+        # [FUNCTION DOC] HELPER: Op mismatch check on wrapper_pg. First runs 500 allreduces
+        # and waits for all of them. Then three mismatching rounds are run, each expected to
+        # raise RuntimeError whose text is validated per rank: allreduce on rank 0 vs reduce
+        # elsewhere; reduce on rank 0 vs barrier elsewhere; broadcast on rank 0 vs allgather
+        # elsewhere. use_accel moves the tensor to the device indexed by the rank.
         tensor = torch.randn(20, 10)
         if use_accel:
             tensor = tensor.to(self.rank)
@@ -159,6 +190,12 @@ class AbstractProcessGroupWrapperTest(MultiProcessTestCase):
         )
 
     def _test_collective_shape_mismatch(self, wrapper_pg, use_accel=False):
+        # [FUNCTION DOC] HELPER: Shape mismatch check. Starts with a barrier. Then expects
+        # RuntimeError from allreduce when the second dimension differs across ranks, when the
+        # number of dimensions differs (rank 0 has an extra one), and from scatter (root rank
+        # 0) when the output/input sizes differ between root and other ranks. Each error is
+        # validated with _validate_error for op type ALLREDUCE or SCATTER. use_accel places
+        # tensors on the device indexed by the rank.
         wrapper_pg.barrier()
         dim = 2 if self.rank == 0 else 10
         tensor = torch.randn(20, dim)
@@ -219,6 +256,12 @@ class AbstractProcessGroupWrapperTest(MultiProcessTestCase):
     def _test_allgather_into_tensor_coalesced_op_mismatch(
         self, wrapper_pg, use_accel=False
     ):
+        # [FUNCTION DOC] HELPER: Regression check that the coalesced allgather path runs the
+        # wrapper collective checks. Rank 0 runs allgather_into_tensor_coalesced while other
+        # ranks run reduce_scatter_tensor_coalesced, and every rank must get a RuntimeError
+        # naming its own op type, the SequenceNumber and the 'Collectives differ in the
+        # following' text. Shapes are not checked because these ops fingerprint with empty
+        # tensors.
         # Verify runCollectiveChecks is actually invoked for the coalesced
         # allgather path by triggering an op type mismatch across ranks: rank 0
         # runs allgather_into_tensor_coalesced while the other ranks run
@@ -258,7 +301,17 @@ if not TEST_WITH_DEV_DBG_ASAN:
     @requires_gloo()
     @requires_accelerator_dist_backend(["nccl", "xccl"])
     class ProcessGroupNCCLWrapperTest(AbstractProcessGroupWrapperTest):
+        # [CLASS DOC] Accelerator-backend (NCCL or XCCL) variant of the wrapper tests, run
+        # with 2 processes. Requires gloo plus an accelerator backend. Builds either a wrapper
+        # around a hand-built backend group or a new_group (which is wrapped automatically
+        # under debug level DETAIL) and runs the shared mismatch checks plus NCCL-specific
+        # base-op and forwarding tests. Only defined when ASAN dev-debug is not enabled.
         def setUp(self):
+            # [FUNCTION DOC] Skip the abstract class's setUp (the call goes straight to the
+            # grandparent), spawn the processes, then set the async error handling env var to
+            # 1 in the parent environment.
+            # KNOWN ISSUE: the env var is set after the worker processes are spawned, so the
+            # children may not see it.
             super(AbstractProcessGroupWrapperTest, self).setUp()
             self._spawn_processes()
             # TORCH_NCCL_BLOCKING_WAIT overrides TORCH_NCCL_ASYNC_ERROR_HANDLING hence tests
@@ -267,9 +320,15 @@ if not TEST_WITH_DEV_DBG_ASAN:
 
         @property
         def world_size(self) -> int:
+            # [FUNCTION DOC] Property: the world size is always 2.
             return 2
 
         def _create_wrapper_pg(self, with_new_group=False, timeout=10.0):
+            # [FUNCTION DOC] HELPER: Initialize the default process group with a file store
+            # and the accelerator backend, using the timeout in seconds. With with_new_group a
+            # new group is returned. Otherwise a ProcessGroupXCCL (xpu) or ProcessGroupNCCL is
+            # built directly and wrapped with the process group wrapper factory. Returns the
+            # group.
             store = c10d.FileStore(self.file_name, self.world_size)
             c10d.init_process_group(
                 backend=backend,
@@ -307,6 +366,8 @@ if not TEST_WITH_DEV_DBG_ASAN:
         @requires_accelerator_dist_backend(["nccl", "xccl"])
         @skip_if_lt_x_gpu(2)
         def test_collective_hang(self):
+            # [FUNCTION DOC] Test: with a 2 second timeout, the hang check must report a
+            # failure on the faulty rank.
             pg = self._create_wrapper_pg(timeout=2.0)
             self._test_collective_hang(pg)
 
@@ -317,6 +378,8 @@ if not TEST_WITH_DEV_DBG_ASAN:
         @skip_if_lt_x_gpu(2)
         @with_dist_debug_levels(levels=["DETAIL"])
         def test_collectives_op_mismatch_debug_mode(self):
+            # [FUNCTION DOC] Test (debug level DETAIL, new group): runs the shared op mismatch
+            # check on the accelerator, then the NCCL-only base op mismatch check.
             pg = self._create_wrapper_pg(with_new_group=True)
             self._test_collectives_op_mismatch(pg, use_accel=True)
             self._test_nccl_only_op_mismatch(pg)
@@ -325,6 +388,8 @@ if not TEST_WITH_DEV_DBG_ASAN:
         @skip_if_lt_x_gpu(2)
         @with_dist_debug_levels(levels=["OFF"])
         def test_collectives_op_mismatch(self):
+            # [FUNCTION DOC] Test (debug level OFF, explicitly wrapped group): same op
+            # mismatch checks as the DETAIL variant.
             pg = self._create_wrapper_pg(with_new_group=False)
             self._test_collectives_op_mismatch(pg, use_accel=True)
             self._test_nccl_only_op_mismatch(pg)
@@ -333,6 +398,8 @@ if not TEST_WITH_DEV_DBG_ASAN:
         @skip_if_lt_x_gpu(2)
         @with_dist_debug_levels(levels=["DETAIL"])
         def test_collective_shape_mismatch_debug_mode_detail(self):
+            # [FUNCTION DOC] Test (debug level DETAIL, new group): runs the shared shape
+            # mismatch check, then the NCCL-only shape mismatch check.
             pg = self._create_wrapper_pg(with_new_group=True)
             self._test_collective_shape_mismatch(pg, use_accel=True)
             self._test_nccl_only_shape_mismatch(pg)
@@ -341,11 +408,17 @@ if not TEST_WITH_DEV_DBG_ASAN:
         @skip_if_lt_x_gpu(2)
         @with_dist_debug_levels(levels=["OFF"])
         def test_collective_shape_mismatch_debug_mode_off(self):
+            # [FUNCTION DOC] Test (debug level OFF, explicitly wrapped group): same shape
+            # mismatch checks as the DETAIL variant, despite the name saying debug mode off.
             pg = self._create_wrapper_pg(with_new_group=False)
             self._test_collective_shape_mismatch(pg, use_accel=True)
             self._test_nccl_only_shape_mismatch(pg)
 
         def _test_nccl_only_op_mismatch(self, wrapper_pg):
+            # [FUNCTION DOC] HELPER: Expect RuntimeError when rank 0 calls the private
+            # allgather base while other ranks call the private reduce-scatter base on the
+            # accelerator; validates the error names ALLGATHER_BASE or REDUCE_SCATTER_BASE and
+            # describes the input.
             device = f"{device_type}:{self.rank}"
             with self.assertRaisesRegex(RuntimeError, ".*") as cm:
                 output = torch.zeros(4 + self.rank, device=device)
@@ -364,6 +437,11 @@ if not TEST_WITH_DEV_DBG_ASAN:
             )
 
         def _test_nccl_only_shape_mismatch(self, wrapper_pg):
+            # [FUNCTION DOC] HELPER: Expect RuntimeError from the private reduce-scatter base
+            # when the input size is not world-size times the output size, first with a
+            # fixed-size output and wrong input, then with per-rank differing input size.
+            # Errors are validated for op REDUCE_SCATTER_BASE without requiring the collective
+            # diff text.
             device = f"{device_type}:{self.rank}"
             with self.assertRaisesRegex(RuntimeError, ".*") as cm:
                 output = torch.zeros(4 + self.rank, device=device)
@@ -394,6 +472,9 @@ if not TEST_WITH_DEV_DBG_ASAN:
         @skip_if_lt_x_gpu(2)
         @with_dist_debug_levels(levels=["DETAIL"])
         def test_coalescing_manager_debug_mode_detail(self):
+            # [FUNCTION DOC] Test (DETAIL): starting and ending coalescing on the wrapped
+            # group around one allreduce must not crash. Sets the accelerator device index to
+            # the rank first.
             """
             Tests that coalescing manager w/TORCH_DISTRIBUTED_DEBUG
             does not crash: https://github.com/pytorch/pytorch/issues/109520
@@ -409,6 +490,11 @@ if not TEST_WITH_DEV_DBG_ASAN:
         @skip_if_lt_x_gpu(2)
         @with_dist_debug_levels(levels=["DETAIL"])
         def test_reduce_scatter_tensor_coalesced_debug_mode(self):
+            # [FUNCTION DOC] Test (DETAIL): runs reduce_scatter_tensor_coalesced on a wrapped
+            # group with two output shapes and checks each output equals the sum over ranks of
+            # (rank + 1). Uses CUDA device calls directly.
+            # KNOWN ISSUE: uses torch.cuda rather than the accelerator API, unlike the rest of
+            # the class, so it would fail on XPU.
             torch.cuda.set_device(self.rank)
             pg = self._create_wrapper_pg(with_new_group=True)
             dev = torch.cuda.current_device()
@@ -432,6 +518,9 @@ if not TEST_WITH_DEV_DBG_ASAN:
         @skip_if_lt_x_gpu(2)
         @with_dist_debug_levels(levels=["DETAIL"])
         def test_allgather_into_tensor_coalesced_debug_mode(self):
+            # [FUNCTION DOC] Test (DETAIL): runs allgather_into_tensor_coalesced on a wrapped
+            # group with two input shapes and checks each output holds rank r's constant (r +
+            # 1) in its r-th slice. Uses CUDA device calls directly.
             """
             Tests that allgather_into_tensor_coalesced correctly invokes
             runCollectiveChecks in ProcessGroupWrapper. Previously this was the
@@ -464,6 +553,8 @@ if not TEST_WITH_DEV_DBG_ASAN:
         @skip_if_lt_x_gpu(2)
         @with_dist_debug_levels(levels=["DETAIL"])
         def test_allgather_into_tensor_coalesced_op_mismatch_debug_mode(self):
+            # [FUNCTION DOC] Test (DETAIL): sets the CUDA device and runs the coalesced
+            # allgather op mismatch check on the accelerator.
             """
             Verify runCollectiveChecks detects a collective mismatch on the
             coalesced allgather path.
@@ -481,6 +572,9 @@ if not TEST_WITH_DEV_DBG_ASAN:
             lambda: False,
         )
         def test_debug_level_detail_no_gloo(self):
+            # [FUNCTION DOC] Test (DETAIL, gloo availability patched to false): creating the
+            # wrapped group must raise an assertion error saying the wrapper is unsupported
+            # without the Gloo backend.
             with self.assertRaisesRegex(
                 AssertionError, "ProcessGroupWrapper unsupported without GLOO backend"
             ):
@@ -490,6 +584,11 @@ if not TEST_WITH_DEV_DBG_ASAN:
         @skip_if_lt_x_gpu(2)
         @with_dist_debug_levels(levels=["DETAIL"])
         def test_wrapper_forwards_nccl_methods(self):
+            # [FUNCTION DOC] Test (DETAIL, NCCL only): checks that the wrapper forwards
+            # backend-specific properties and methods to the wrapped group (splitting,
+            # coalescing and time estimate support, tensor alloc support, error, options,
+            # eager connect), and when tensor allocation is supported also the memory
+            # allocator and allocate_tensor returning a tensor of the requested size.
             """
             Tests that ProcessGroupWrapper correctly forwards NCCL-specific
             utility methods to the wrapped backend. See issue #173538.
@@ -531,6 +630,9 @@ if not TEST_WITH_DEV_DBG_ASAN:
         @skip_if_lt_x_gpu(2)
         @with_dist_debug_levels(levels=["DETAIL"])
         def test_wrapper_forwards_bound_device_id(self):
+            # [FUNCTION DOC] Test (DETAIL, NCCL only): init_process_group with a device_id
+            # must yield a default group whose backend for that device is a wrapper whose
+            # wrapped group has bound_device_id equal to that device.
             """
             Tests that ProcessGroupWrapper propagates bound_device_id to the
             wrapped backend when init_process_group is called with device_id.
@@ -558,7 +660,13 @@ if not TEST_WITH_DEV_DBG_ASAN:
             lambda: False,
         )
         def test_new_group_no_gloo(self):
+            # [FUNCTION DOC] Test: with gloo availability patched to false, creating a new
+            # group must succeed without ever evaluating isinstance against the wrapper class;
+            # the patched isinstance raises NameError if it does.
             def patched_isinstance(obj, clazz):
+                # [FUNCTION DOC] HELPER: Replacement isinstance used by the test: raises
+                # NameError when the class checked is the wrapper type, otherwise defers to
+                # the real isinstance.
                 if clazz is _ProcessGroupWrapper:
                     raise NameError
                 else:
@@ -577,7 +685,13 @@ if not TEST_WITH_DEV_DBG_ASAN:
 
 @requires_gloo()
 class ProcessGroupGlooWrapperTest(AbstractProcessGroupWrapperTest):
+    # [CLASS DOC] Gloo-backed variant of the wrapper tests (requires gloo). Builds either a
+    # new gloo group or a manually wrapped ProcessGroupGloo over loopback, and runs the shared
+    # hang, op mismatch, shape mismatch checks on CPU and (with 4 GPUs) on accelerator
+    # tensors, plus coalesced collective checks.
     def opts(self, threads=2, timeout=10.0):
+        # [FUNCTION DOC] HELPER: Build Gloo options with the given thread count and timeout
+        # (seconds), using a single loopback device. Returns the options object.
         opts = c10d.ProcessGroupGloo._Options()
         opts._timeout = timeout
         opts._devices = [create_device(interface=LOOPBACK)]
@@ -585,6 +699,9 @@ class ProcessGroupGlooWrapperTest(AbstractProcessGroupWrapperTest):
         return opts
 
     def _create_wrapper_pg(self, with_new_group=False, timeout=10.0):
+        # [FUNCTION DOC] HELPER: Initialize the default gloo group on a file store. With
+        # with_new_group returns a new gloo group; otherwise builds a ProcessGroupGloo with
+        # the options helper and wraps it using the wrapper factory. Returns the group.
         store = c10d.FileStore(self.file_name, self.world_size)
         c10d.init_process_group(
             backend="gloo", rank=self.rank, world_size=self.world_size, store=store
@@ -606,6 +723,8 @@ class ProcessGroupGlooWrapperTest(AbstractProcessGroupWrapperTest):
         return pg
 
     def test_collective_hang(self):
+        # [FUNCTION DOC] Test: with a 2 second timeout, the hang check must report the faulty
+        # rank.
         pg = self._create_wrapper_pg(timeout=2.0)
         self._test_collective_hang(pg)
 
@@ -614,21 +733,27 @@ class ProcessGroupGlooWrapperTest(AbstractProcessGroupWrapperTest):
     # combined after that is resolved.
     @with_dist_debug_levels(levels=["DETAIL"])
     def test_collectives_op_mismatch_debug_mode(self):
+        # [FUNCTION DOC] Test (DETAIL, new group): shared op mismatch check on CPU tensors.
         pg = self._create_wrapper_pg(with_new_group=True)
         self._test_collectives_op_mismatch(pg)
 
     @with_dist_debug_levels(levels=["OFF"])
     def test_collectives_op_mismatch(self):
+        # [FUNCTION DOC] Test (OFF, explicitly wrapped): shared op mismatch check on CPU
+        # tensors.
         pg = self._create_wrapper_pg(with_new_group=False)
         self._test_collectives_op_mismatch(pg)
 
     @with_dist_debug_levels(levels=["DETAIL"])
     def test_collective_shape_mismatch_debug_mode(self):
+        # [FUNCTION DOC] Test (DETAIL, new group): shared shape mismatch check on CPU tensors.
         pg = self._create_wrapper_pg(with_new_group=True)
         self._test_collective_shape_mismatch(pg)
 
     @with_dist_debug_levels(levels=["OFF"])
     def test_collective_shape_mismatch_debug_mode_off(self):
+        # [FUNCTION DOC] Test (OFF, explicitly wrapped): shared shape mismatch check on CPU
+        # tensors.
         pg = self._create_wrapper_pg(with_new_group=False)
         self._test_collective_shape_mismatch(pg)
 
@@ -636,6 +761,8 @@ class ProcessGroupGlooWrapperTest(AbstractProcessGroupWrapperTest):
     @unittest.skipIf(TEST_XPU, "XPU does not support gloo backend")
     @with_dist_debug_levels(levels=["DETAIL"])
     def test_collectives_op_mismatch_cuda_debug_mode(self):
+        # [FUNCTION DOC] Test (needs 4 GPUs, skipped on XPU, DETAIL): op mismatch check with
+        # accelerator tensors over gloo.
         pg = self._create_wrapper_pg(with_new_group=True)
         self._test_collectives_op_mismatch(pg, use_accel=True)
 
@@ -643,6 +770,8 @@ class ProcessGroupGlooWrapperTest(AbstractProcessGroupWrapperTest):
     @unittest.skipIf(TEST_XPU, "XPU does not support gloo backend")
     @with_dist_debug_levels(levels=["OFF"])
     def test_collectives_op_mismatch_cuda(self):
+        # [FUNCTION DOC] Test (needs 4 GPUs, skipped on XPU, OFF): op mismatch check with
+        # accelerator tensors over gloo.
         pg = self._create_wrapper_pg(with_new_group=False)
         self._test_collectives_op_mismatch(pg, use_accel=True)
 
@@ -650,17 +779,24 @@ class ProcessGroupGlooWrapperTest(AbstractProcessGroupWrapperTest):
     @unittest.skipIf(TEST_XPU, "XPU does not support gloo backend")
     @with_dist_debug_levels(levels=["DETAIL"])
     def test_collective_shape_mismatch_cuda_debug_mode(self):
+        # [FUNCTION DOC] Test (needs 4 GPUs, skipped on XPU, DETAIL): shape mismatch check
+        # with accelerator tensors over gloo.
         pg = self._create_wrapper_pg(with_new_group=True)
         self._test_collective_shape_mismatch(pg, use_accel=True)
 
     @skip_if_lt_x_gpu(4)
     @with_dist_debug_levels(levels=["OFF"])
     def test_collective_shape_mismatch_cuda(self):
+        # [FUNCTION DOC] Test (needs 4 GPUs, OFF): shape mismatch check with accelerator
+        # tensors over gloo.
+        # KNOWN ISSUE: unlike the sibling cuda tests it lacks the XPU skip decorator.
         pg = self._create_wrapper_pg(with_new_group=False)
         self._test_collective_shape_mismatch(pg, use_accel=True)
 
     @with_dist_debug_levels(levels=["DETAIL"])
     def test_reduce_scatter_tensor_coalesced_debug_mode(self):
+        # [FUNCTION DOC] Test (DETAIL): reduce_scatter_tensor_coalesced on CPU tensors with
+        # two shapes; each output must equal the sum over ranks of (rank + 1).
         pg = self._create_wrapper_pg(with_new_group=True)
 
         out_shapes = [(2, 2), (3, 3)]
@@ -676,6 +812,8 @@ class ProcessGroupGlooWrapperTest(AbstractProcessGroupWrapperTest):
 
     @with_dist_debug_levels(levels=["DETAIL"])
     def test_allgather_into_tensor_coalesced_debug_mode(self):
+        # [FUNCTION DOC] Test (DETAIL): allgather_into_tensor_coalesced on CPU tensors with
+        # two shapes; each output must hold rank r's constant (r + 1) in its r-th slice.
         """
         Tests that allgather_into_tensor_coalesced correctly invokes
         runCollectiveChecks in ProcessGroupWrapper (Gloo backend).
@@ -702,6 +840,8 @@ class ProcessGroupGlooWrapperTest(AbstractProcessGroupWrapperTest):
 
     @with_dist_debug_levels(levels=["DETAIL"])
     def test_allgather_into_tensor_coalesced_op_mismatch_debug_mode(self):
+        # [FUNCTION DOC] Test (DETAIL): runs the coalesced allgather op mismatch check on CPU
+        # tensors.
         """
         Verify runCollectiveChecks detects a collective mismatch on the
         coalesced allgather path (Gloo backend).
