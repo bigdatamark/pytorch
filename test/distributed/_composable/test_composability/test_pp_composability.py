@@ -1,4 +1,12 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests composing pipeline parallelism (PipelineStage and schedules) with other
+# parallelisms on 8 ranks: pipeline plus distributed checkpoint FQN checks, 3D parallelism (data
+# parallel via fully_shard, tensor parallel, pipeline), and pipeline plus the FSDP-style
+# replicate() including numerics and gradient parity against reference models. Defines two small
+# MLP modules and one parametrized multi-process test class. Import-time side effects: chooses
+# module-level device_type from the current accelerator (cpu if none) and backend as the default
+# backend for that device; registers parametrized tests at the end.
+
 import copy
 from typing import TYPE_CHECKING
 
@@ -57,13 +65,16 @@ backend = torch.distributed.get_default_backend_for_device(device_type)
 
 # MLP Layer
 class MLPModule(torch.nn.Module):
+    # [CLASS DOC] HELPER: MLP block of Linear(d_hid, d_hid), ReLU and Linear(d_hid, d_hid).
     def __init__(self, d_hid: int):
+        # [FUNCTION DOC] HELPER: Creates net1, relu and net2 for the given hidden size.
         super().__init__()
         self.net1 = torch.nn.Linear(d_hid, d_hid)
         self.relu = torch.nn.ReLU()
         self.net2 = torch.nn.Linear(d_hid, d_hid)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies net1, relu, net2 in order and returns the result.
         x = self.net1(x)
         x = self.relu(x)
         x = self.net2(x)
@@ -71,13 +82,19 @@ class MLPModule(torch.nn.Module):
 
 
 class MLPModuleEven(torch.nn.Module):
+    # [CLASS DOC] HELPER: MLP block with three Linear layers (d_hid to d_hid twice, then d_hid to
+    # 2*d_hid) each followed by relu. The unsharded output is twice the input width, so stacking
+    # these only works when net3 is column-sharded by tensor parallel over 2 ranks.
     def __init__(self, d_hid: int):
+        # [FUNCTION DOC] HELPER: Creates net1, net2 (d_hid to d_hid) and net3 (d_hid to 2*d_hid).
         super().__init__()
         self.net1 = nn.Linear(d_hid, d_hid)
         self.net2 = nn.Linear(d_hid, d_hid)
         self.net3 = nn.Linear(d_hid, d_hid * 2)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies net1, net2, net3 each followed by relu and returns the
+        # result.
         x = F.relu(self.net1(x))
         x = F.relu(self.net2(x))
         x = F.relu(self.net3(x))
@@ -85,36 +102,54 @@ class MLPModuleEven(torch.nn.Module):
 
 
 class ComposabilityTest(MultiProcContinuousTest):
+    # [CLASS DOC] Eight-rank continuous multi-process test class (backend from the module-level
+    # backend, device type from device_type) for pipeline parallelism composed with checkpointing,
+    # FSDP, tensor parallelism and replicate. Each test needs 8+ accelerators and a distributed
+    # backend. The rank doubles as the device index.
     @classmethod
     def backend_str(cls) -> str:
+        # [FUNCTION DOC] Returns the process group backend chosen at import time.
         # Testing with NCCL backend
         return backend
 
     @classmethod
     def device_type(cls) -> str:
+        # [FUNCTION DOC] Returns the module-level device type string.
         return device_type
 
     world_size = 8
 
     @property
     def device(self):
+        # [FUNCTION DOC] Returns the device index for this process, equal to its rank.
         return self.rank
 
     @requires_accelerator_dist_backend()
     @skip_but_pass_in_sandcastle_if(not at_least_x_gpu(8), "Test requires 8+ GPUs")
     @skip_if_lt_x_gpu(8)
     def test_pp_and_dcp(self):
+        # [FUNCTION DOC] Gives each rank one of eight MLP layers as a pipeline chunk with an
+        # Adam optimizer, saves them with distributed checkpointing (inside a temp directory
+        # fixture), reads the checkpoint back without a plan of the target, and asserts every
+        # parameter name of the chunk appears in the saved model state, i.e. FQNs are preserved.
         """
         Test that pipeline parallelism and distributed checkpointing can be used together and
         with saved correct FQNs
         """
 
         class AppState(Stateful):
+            # [CLASS DOC] HELPER: Stateful wrapper for a model and optimizer whose state_dict
+            # returns the model and optimizer state under "model" and "optim", and whose
+            # load_state_dict applies them.
             def __init__(self, model, optimizer):
+                # [FUNCTION DOC] HELPER: Stores the model and optimizer.
                 self.model = model
                 self.optimizer = optimizer
 
             def state_dict(self):
+                # [FUNCTION DOC] HELPER: Returns a mapping with the model state dict and
+                # optimizer state dict obtained from get_state_dict, under keys "model" and
+                # "optim".
                 # this line automatically manages FSDP FQN's, as well as sets the default state dict type to FSDP.SHARDED_STATE_DICT
                 model_state_dict, optimizer_state_dict = get_state_dict(
                     self.model, self.optimizer
@@ -122,6 +157,8 @@ class ComposabilityTest(MultiProcContinuousTest):
                 return {"model": model_state_dict, "optim": optimizer_state_dict}
 
             def load_state_dict(self, state_dict):
+                # [FUNCTION DOC] HELPER: Applies the model and optim entries of state_dict to
+                # the model and optimizer using set_state_dict.
                 # sets our state dicts on the model and optimizer, now that we've loaded
                 set_state_dict(
                     self.model,
@@ -131,7 +168,12 @@ class ComposabilityTest(MultiProcContinuousTest):
                 )
 
         class PPModelChunk(nn.Module):
+            # [CLASS DOC] HELPER: Module holding the layers of a ModuleDict whose string keys
+            # lie in the range from start_index to end_index, keeping the original key names so
+            # FQNs match the full model.
             def __init__(self, layers: nn.ModuleDict, start_index: int, end_index: int):
+                # [FUNCTION DOC] HELPER: Builds a ModuleDict with only the layers whose index is
+                # in the half-open range between start_index and end_index.
                 super().__init__()
                 # Filter layers based on start_index and end_index
                 self.layers = nn.ModuleDict(
@@ -139,6 +181,8 @@ class ComposabilityTest(MultiProcContinuousTest):
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the held layers in order to x and returns the
+                # result.
                 for layer in self.layers.values():
                     x = layer(x)
                 return x
@@ -161,6 +205,10 @@ class ComposabilityTest(MultiProcContinuousTest):
         # perform work in a temp dir that is cleaned up after the test
         @with_temp_dir
         def _dcp_test(self):
+            # [FUNCTION DOC] HELPER: Wrapped by the temp-dir fixture, which sets temp_dir on the
+            # test. Saves the pp_model/optimizer state with dcp, loads it back into a plain dict
+            # without a target, and asserts each pp_model parameter name is in the loaded model
+            # state.
             state_dict = {"app": AppState(pp_model, opt)}
             dcp.save(state_dict, checkpoint_id=self.temp_dir)
             # temp checkpoint
@@ -204,6 +252,12 @@ class ComposabilityTest(MultiProcContinuousTest):
         ],
     )
     def test_3d_with_tp_dp_pp(self, ScheduleClass, MixedPrecisionParam):
+        # [FUNCTION DOC] Parametrized over schedule class and mixed precision param dtype.
+        # Builds a (dp, pp, tp) device mesh with pp and tp sizes 2, splits eight MLPModuleEven
+        # layers over pipeline stages (1 stage per rank for single-stage schedules, 2
+        # otherwise), applies tensor parallel then fully_shard to each stage, runs five training
+        # steps of the schedule with AdamW and a dummy sum loss. It only checks that everything
+        # runs; no numerics are asserted.
         torch.accelerator.set_device_index(self.device)
         dim = 8
         tp_size = 2
@@ -226,10 +280,15 @@ class ComposabilityTest(MultiProcContinuousTest):
 
         # dummy loss needed just to force backwards to run in schedule step
         def loss_fn(y, target):
+            # [FUNCTION DOC] HELPER: Dummy loss returning the sum of y; target is ignored.
+            # Exists only to force backward in the schedule step.
             return y.sum()
 
         # Apply DP to stage module
         def apply_fsdp(partial_model):
+            # [FUNCTION DOC] HELPER: Applies fully_shard (dp mesh, mixed precision with the
+            # test's param dtype and fp32 reduce, no reshard after forward) to every layer, then
+            # to the whole stage module, and returns the result.
             # apply FSDP
             mp_policy = MixedPrecisionPolicy(
                 param_dtype=MixedPrecisionParam,
@@ -249,6 +308,9 @@ class ComposabilityTest(MultiProcContinuousTest):
             model: nn.Module,
             tp_mesh: DeviceMesh,
         ):
+            # [FUNCTION DOC] HELPER: Applies a tensor parallel plan (net1 colwise, net2 rowwise,
+            # net3 colwise) to each layer of the model over tp_mesh in place and returns the
+            # model.
             parallelize_plan = {
                 "net1": ColwiseParallel(),
                 "net2": RowwiseParallel(),
@@ -347,6 +409,11 @@ class ComposabilityTest(MultiProcContinuousTest):
         ],
     )
     def test_replicate_pp(self, ScheduleClass, MixedPrecisionParam):
+        # [FUNCTION DOC] Parametrized over schedule class and param dtype. Splits MLP layers
+        # into pipeline stages on a (replicate, pp) mesh, applies replicate with a mixed
+        # precision policy to one copy and only a dtype cast to a reference copy, steps both
+        # pipelines, and on the last stage asserts the microbatch losses are equal. Both sets of
+        # optimizers (AdamW) are stepped for five iterations.
         torch.accelerator.set_device_index(self.device)
         dim = 8
         pp_size = 2
@@ -369,10 +436,14 @@ class ComposabilityTest(MultiProcContinuousTest):
 
         # dummy loss needed just to force backwards to run in schedule step
         def loss_fn(y, target):
+            # [FUNCTION DOC] HELPER: Dummy loss returning the sum of y; target is ignored.
             return y.sum()
 
         # Apply DP to stage module
         def apply_replicate(partial_model):
+            # [FUNCTION DOC] HELPER: Applies replicate with the dp mesh and a mixed precision
+            # policy (test's param dtype, fp32 reduce) to each layer and then to the whole
+            # module; returns the result.
             # apply replicate
             mp_policy = MixedPrecisionPolicy(
                 param_dtype=MixedPrecisionParam,
@@ -389,6 +460,8 @@ class ComposabilityTest(MultiProcContinuousTest):
 
         # Apply same precision to reference model (without replicate)
         def apply_same_precision(partial_model):
+            # [FUNCTION DOC] HELPER: Casts the module to the test's param dtype unless it is
+            # float32, and returns it.
             if MixedPrecisionParam != torch.float32:
                 # Cast to same precision as pipeline model
                 partial_model = partial_model.to(dtype=MixedPrecisionParam)
@@ -524,6 +597,12 @@ class ComposabilityTest(MultiProcContinuousTest):
         ],
     )
     def test_replicate_pp_grads(self, ScheduleClass):
+        # [FUNCTION DOC] Parametrized over schedule class. Builds pipeline stages with replicate
+        # applied on a (replicate, pp) mesh and a reference Sequential model that simulates
+        # microbatches through all stages on every rank, all-reducing its grads over the
+        # replicate group. For five iterations with inputs broadcast from rank 0, runs both,
+        # compares last-stage average loss with the reference loss and compares local gradients
+        # of pipeline parameters with the reference gradients (tolerances 1e-4 / 1e-5).
         torch.accelerator.set_device_index(self.device)
         dim = 8
         pp_size = 2
@@ -547,10 +626,16 @@ class ComposabilityTest(MultiProcContinuousTest):
 
         # dummy loss needed just to force backwards to run in schedule step
         def loss_fn(y, target):
+            # [FUNCTION DOC] HELPER: Dummy loss returning the sum of y; target is ignored.
             return y.sum()
 
         # Simulate microbatch processing for reference model
         def simulate_stage_forward_backward(model, inputs, labels):
+            # [FUNCTION DOC] HELPER: Reference forward/backward: splits inputs (and labels if
+            # given) into the test's microbatch count, runs each through all layers of the model
+            # in order, computes the dummy loss and backpropagates each microbatch. Returns the
+            # mean microbatch loss. Calls the loss with a None label on non-last stages.
+            # Accumulates grads in the model.
             """Simulate forward and backward passes through stages for microbatch processing"""
             batch_size, _ = inputs.shape
             total_loss = 0
@@ -594,6 +679,8 @@ class ComposabilityTest(MultiProcContinuousTest):
 
         # Apply replicate to stage module
         def apply_replicate(partial_model):
+            # [FUNCTION DOC] HELPER: Applies replicate over the dp mesh to every layer and then
+            # the whole module; returns the replicated module.
             for layer_id in range(len(partial_model)):
                 replicate(
                     partial_model[layer_id],
@@ -603,6 +690,10 @@ class ComposabilityTest(MultiProcContinuousTest):
             return dp_model
 
         def pipelined_models_parameters(start_layer, model):
+            # [FUNCTION DOC] HELPER: Records the named parameters of each child layer of model
+            # into the enclosing pipeline_model_parameter_dict (defined later in the test) under
+            # the key made of the global layer index, starting at start_layer, and the local
+            # parameter name.
             layer_idx = start_layer
 
             for layer in model.children():
@@ -614,6 +705,10 @@ class ComposabilityTest(MultiProcContinuousTest):
         def check_gradient_parity(
             pipeline_model_parameter_dict, ref_model_parameter_dict
         ):
+            # [FUNCTION DOC] HELPER: For each recorded pipeline parameter, raises AssertionError
+            # if it is missing in the reference parameter mapping; if it has a gradient,
+            # compares its local shard with the reference gradient using assert_close, raising
+            # if the reference has none.
             for parameter in pipeline_model_parameter_dict:
                 if parameter not in ref_model_parameter_dict:
                     raise AssertionError(
@@ -695,6 +790,9 @@ class ComposabilityTest(MultiProcContinuousTest):
 
         # Helper function to simulate all-reduce for reference model gradients
         def simulate_all_reduce_grads(model, group):
+            # [FUNCTION DOC] HELPER: For each parameter with a gradient, divides the grad in
+            # place by the group size and then all-reduces (sums) it over the group, emulating
+            # replicate's gradient averaging.
             """Simulate all-reduce operation on gradients like replicate does"""
             for param in model.parameters():
                 if param.grad is not None:

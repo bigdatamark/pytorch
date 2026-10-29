@@ -1,5 +1,14 @@
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC] Tests composing FSDP (both fully_shard and legacy FullyShardedDataParallel) with
+# tensor parallelism on 2D (dp, tp) device meshes on 4 ranks, plus a DDP plus TP integration
+# check. Covers training parity against replicate/DDP references, CPU offload with TP,
+# checkpoint save/resume with dcp, and model and optimizer state dict behavior (sharded and full
+# state dicts, load, set). Defines two small helper models. Import-time side effects: sets
+# module-level device_type from the current accelerator (cpu if none) and curr_backend as the
+# default backend for that device; registers parametrized tests for TestNew2dParallelStateDict
+# at the end.
+
 import copy
 import functools
 import io
@@ -74,7 +83,12 @@ curr_backend = dist.get_default_backend_for_device(device_type)
 
 
 class SimpleModel(nn.Module):
+    # [CLASS DOC] HELPER: Small MLP-like model (Linear 5 to 8, ReLU module, Linear 8 to 4,
+    # Linear 4 to 12) with names net1, net2, net3 used by tensor parallel plans; forward applies
+    # relu after all three linears. get_input returns a random 4x5 tensor on the device.
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Creates net1 (5 to 8), a ReLU module, net2 (8 to 4) and net3 (4
+        # to 12).
         super().__init__()
         self.net1 = nn.Linear(5, 8)
         self.relu = nn.ReLU()
@@ -82,17 +96,27 @@ class SimpleModel(nn.Module):
         self.net3 = nn.Linear(4, 12)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies net1, net2, net3, each followed by relu, and returns
+        # the result.
         x = F.relu(self.net1(x))
         x = F.relu(self.net2(x))
         x = F.relu(self.net3(x))
         return x
 
     def get_input(self):
+        # [FUNCTION DOC] HELPER: Returns a random 4x5 float tensor on the module-level device
+        # type.
         return torch.rand(4, 5, device=device_type)
 
 
 class SimpleModelUneven(nn.Module):
+    # [CLASS DOC] HELPER: Model like SimpleModel but with sizes not evenly divisible (5 to 10 to
+    # 15 to 30 to 5) across four Linear layers net1..net4, used to test uneven sharding. The
+    # constructor seeds the global RNG with 0 so weights are deterministic.
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Seeds the RNG with 0 (side effect: global seed), then creates
+        # net1 (5 to 10), net2 (10 to 15), net3 (15 to 30), net4 (30 to 5) and an unused ReLU
+        # module.
         super().__init__()
         torch.manual_seed(0)
         self.net1 = nn.Linear(5, 10)
@@ -102,6 +126,8 @@ class SimpleModelUneven(nn.Module):
         self.net4 = nn.Linear(30, 5)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies relu after net1, net2, net3 and no activation after
+        # net4.
         x = F.relu(self.net1(x))
         x = F.relu(self.net2(x))
         x = F.relu(self.net3(x))
@@ -109,10 +135,17 @@ class SimpleModelUneven(nn.Module):
         return x
 
     def get_input(self):
+        # [FUNCTION DOC] HELPER: Returns a random 4x5 float tensor on the module-level device
+        # type.
         return torch.rand(4, 5, device=device_type)
 
 
 class TestFullyShard2DTraining(FSDPTestContinuous):
+    # [CLASS DOC] Four-rank continuous tests of fully_shard on a (dp=2, tp=2) mesh composed with
+    # tensor parallel: training parity against references, the transformer with sharding
+    # placement overrides, CPU offload, and checkpoint resume. Class-body statements define
+    # module globals c10d_ops and funcol (the c10d and c10d_functional op namespaces) at class
+    # creation.
     global c10d_ops
     global funcol
     c10d_ops = torch.ops.c10d
@@ -121,6 +154,9 @@ class TestFullyShard2DTraining(FSDPTestContinuous):
     world_size = 4
 
     def init_global_mesh(self) -> DeviceMesh:
+        # [FUNCTION DOC] Builds a (dp, tp) device mesh named "dp" and "tp". dp size is 2 when
+        # the world size exceeds 2, else 1, and tp takes the rest of the ranks. Returns the
+        # mesh.
         # Prefer to test with >=4 GPUs, but for 2 GPUs, use 2-way TP
         dp_size = 2 if self.world_size > 2 else 1
         return init_device_mesh(
@@ -132,6 +168,9 @@ class TestFullyShard2DTraining(FSDPTestContinuous):
     @skip_if_rocm_arch_multiprocess(MI200_ARCH)
     @skip_if_lt_x_gpu(4)
     def test_train_parity_2d_mlp(self):
+        # [FUNCTION DOC] Builds the global mesh and runs the 2D MLP parity subtests over
+        # reshard_after_forward, activation checkpointing and mlp_dim (3, 16, 17). Skipped on
+        # ROCm MI200 and with fewer than 4 GPUs.
         global_mesh = self.init_global_mesh()
         self.run_subtests(
             {
@@ -149,6 +188,10 @@ class TestFullyShard2DTraining(FSDPTestContinuous):
         use_activation_checkpointing: bool,
         mlp_dim: int,
     ):
+        # [FUNCTION DOC] HELPER: Builds an MLPStack, a reference copy wrapped with the legacy
+        # replicate over the dp group, and a model parallelized with tp and fully_shard on the
+        # dp mesh with Adam optimizers. Trains 10 iterations on per-dp-rank inputs, alternating
+        # set_to_none on zero_grad, and asserts reference and model losses are equal.
         dp_mesh, tp_mesh = global_mesh["dp"], global_mesh["tp"]
         dp_pg = dp_mesh.get_group()  # used for `replicate()`
 
@@ -179,12 +222,20 @@ class TestFullyShard2DTraining(FSDPTestContinuous):
     @skip_if_lt_x_gpu(4)
     @xfailIf(TEST_XPU)  # https://github.com/intel/torch-xpu-ops/issues/1881
     def test_train_parity_2d_transformer(self):
+        # [FUNCTION DOC] Runs the 2D transformer parity subtests with and without a custom shard
+        # placement function. Needs 4 GPUs; expected to fail on XPU.
         self.run_subtests(
             {"use_shard_placement_fn": [False, True]},
             self._test_train_parity_2d_transformer,
         )
 
     def _test_train_parity_2d_transformer(self, use_shard_placement_fn: bool):
+        # [FUNCTION DOC] HELPER: Builds a 3-layer Transformer without dropout, a reference copy
+        # and a parallelized model (tensor parallel with sequence parallel, then fully_shard per
+        # layer and the whole model over the dp mesh, optionally with a shard_placement_fn).
+        # Checks full parameters match initially, then for 5 steps checks losses, gradients
+        # (reference grads averaged over dp) including the pos_embeddings weight placement being
+        # Shard, and final parameter equality.
         torch.manual_seed(42)
         model_args = ModelArgs(n_layers=3, dropout_p=0.0)
         model = Transformer(model_args)
@@ -198,6 +249,10 @@ class TestFullyShard2DTraining(FSDPTestContinuous):
         model = Transformer.parallelize(model, global_mesh["tp"], use_seq_parallel=True)
 
         def _shard_placement_fn(param: nn.Parameter) -> Shard | None:
+            # [FUNCTION DOC] HELPER: Shard placement override: for a DTensor parameter returns a
+            # Shard on the mirrored dimension (ndim - 1 - existing shard dim), raising
+            # AssertionError if that is negative; for any other parameter returns Shard on dim
+            # 0.
             if isinstance(param, DTensor):
                 for placement in param.placements:
                     if isinstance(placement, Shard):
@@ -261,6 +316,11 @@ class TestFullyShard2DTraining(FSDPTestContinuous):
     @skip_if_lt_x_gpu(4)
     @xfailIf(TEST_XPU)  # https://github.com/pytorch/pytorch/issues/156782
     def test_tp_with_fsdp_offloading(self):
+        # [FUNCTION DOC] Parallelizes an MLPStack with TP over all ranks, a size-1 dp mesh and
+        # CPU offload. Asserts parameters live on CPU and, using comm debug counts per
+        # forward/backward, that only all-reduce collectives occur (forward one per MLP,
+        # backward one fewer) with no all-gather or reduce-scatter calls; losses match the
+        # reference over 10 steps. Needs 4 GPUs.
         global_mesh = init_device_mesh(
             device_type, (1, self.world_size), mesh_dim_names=("dp", "tp")
         )
@@ -321,6 +381,9 @@ class TestFullyShard2DTraining(FSDPTestContinuous):
     @xfailIf(TEST_XPU)  # https://github.com/intel/torch-xpu-ops/issues/1881
     @with_temp_dir
     def test_train_parity_2d_transformer_checkpoint_resume(self):
+        # [FUNCTION DOC] Runs the checkpoint-resume parity test over sequence parallel,
+        # model/optimizer reuse, Adam vs AdamW, with foreach False. Wrapped by the temp-dir
+        # fixture. Skipped on Linux and ROCm per the issue link, needs 4 GPUs.
         """
         Tests train parity of a 2D transformer without checkpointing against a
         2D transformer with a checkpoint save/load.
@@ -345,9 +408,16 @@ class TestFullyShard2DTraining(FSDPTestContinuous):
         optimizer_class: type[torch.optim.Optimizer],
         foreach: bool,
     ):
+        # [FUNCTION DOC] HELPER: Trains a baseline for two steps; trains a second model one
+        # step, saves sharded model and optimizer state with dcp, then either zeroes the model
+        # and optimizer state in place or builds fresh ones, asserts the next loss differs,
+        # loads the checkpoint, asserts the optimizer has state, and asserts the following step
+        # loss equals the baseline's second.
         def train_step(
             _model: nn.Module, _optim: torch.optim.Optimizer, _inp: torch.Tensor
         ) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: One training step: forward sum loss, backward, optimizer
+            # step, zero grads; returns the loss.
             loss = _model(_inp).sum()
             loss.backward()
             _optim.step()
@@ -355,6 +425,9 @@ class TestFullyShard2DTraining(FSDPTestContinuous):
             return loss
 
         def parallelize(_model: Transformer, mesh: DeviceMesh, use_seq_parallel: bool):
+            # [FUNCTION DOC] HELPER: Applies tensor parallel (with optional sequence parallel)
+            # to the transformer, then fully_shard to each layer and the whole model over the dp
+            # mesh; returns it.
             _model = Transformer.parallelize(_model, mesh["tp"], use_seq_parallel)
             for layer in _model.layers:
                 fully_shard(layer, mesh=mesh["dp"])
@@ -429,15 +502,23 @@ class TestFullyShard2DTraining(FSDPTestContinuous):
 
 
 class TestFullyShard2DStateDict(DTensorContinuousTestBase):
+    # [CLASS DOC] Four-rank DTensor-based continuous test of full state dict set and load for
+    # fully_shard plus TP models.
     world_size = 4
 
     @property
     def backend(self):
+        # [FUNCTION DOC] Returns a backend spec string using gloo for cpu and the default
+        # backend for the device type (needed for CPU offload).
         # need to specify gloo backend for testing cpu offload
         return f"cpu:gloo,{device_type}:{curr_backend}"
 
     @skip_if_lt_x_gpu(4)
     def test_fully_shard_tp_2d_set_full_state_dict(self):
+        # [FUNCTION DOC] Applies TP and fully_shard to SimpleModel, takes a step, saves copies
+        # of sharded model/optimizer state dicts, gets full (cpu offloaded, broadcast from rank
+        # 0) state dicts, sets them back, and asserts the sharded state dicts are unchanged.
+        # Needs 4 GPUs.
         dummy_model = SimpleModel().to(device_type)
         mesh_2d = init_device_mesh(
             device_type,
@@ -481,9 +562,15 @@ class TestFullyShard2DStateDict(DTensorContinuousTestBase):
 
 
 class Test2dFSDP1ParallelIntegration(DTensorContinuousTestBase):
+    # [CLASS DOC] Four-rank tests that DDP over a TP-parallelized module matches plain DDP on an
+    # MLP module.
     world_size = 4
 
     def init_model(self, device_type, model_parallel_size=2):
+        # [FUNCTION DOC] Builds two identically-seeded MLPModules; the first is wrapped in DDP,
+        # the second is parallelized with a TP plan (net1 colwise, net2 rowwise) on a (world //
+        # tp, tp) mesh, passed through the DDP pre-transform and wrapped in DDP over the dp
+        # group. Returns the pair and the dp group.
         torch.manual_seed(0)
         model = MLPModule(device_type)
         torch.manual_seed(0)
@@ -511,6 +598,9 @@ class Test2dFSDP1ParallelIntegration(DTensorContinuousTestBase):
         return model, twod_model, dp_pg
 
     def _check_module(self, m1, m2, check_grad=False):
+        # [FUNCTION DOC] HELPER: For each parameter of m2, asserts it exists by name in m1
+        # (printing names if not), optionally switches to the gradients, converts DTensors to a
+        # local replicated tensor, and asserts equality with the m1 value.
         named_parameters = dict(m1.named_parameters())
         for name, param_m2 in m2.named_parameters():
             if name not in named_parameters:
@@ -529,6 +619,9 @@ class Test2dFSDP1ParallelIntegration(DTensorContinuousTestBase):
 
     @skip_if_lt_x_gpu(4)
     def test_2d_ddp_integration_functionality(self) -> None:
+        # [FUNCTION DOC] Runs the plain DDP and TP+DDP models on the same inputs, asserting
+        # equal outputs, equal gradients after backward and equal parameters after a step, then
+        # equal outputs for a second batch. Needs 4 GPUs.
         model, twod_model, dp_pg = self.init_model(self.device_type)
         optim = torch.optim.Adam(model.parameters(), lr=3e-5)
         twod_optim = torch.optim.Adam(twod_model.parameters(), lr=3e-5)
@@ -563,9 +656,14 @@ class Test2dFSDP1ParallelIntegration(DTensorContinuousTestBase):
 # TODO: add additional tests for multi_param_group, optim_in_backward,
 # and fsdp_nested.
 class TestNew2dParallelTraining(DTensorContinuousTestBase):
+    # [CLASS DOC] Four-rank tests of legacy FSDP wrapping a TP-parallelized module on a 2D mesh:
+    # extension setup and end-to-end training parity.
     world_size = 4
 
     def _compare_params(self, m1, m2):
+        # [FUNCTION DOC] HELPER: Under summon_full_params for both FSDP modules, compares
+        # parameters by position (names must match as a substring), skipping net2.bias off rank
+        # 0, redistributing DTensors to replicated, and asserting closeness.
         with FSDP.summon_full_params(m1):
             with FSDP.summon_full_params(m2):
                 for n_p1, n_p2 in zip(m1.named_parameters(), m2.named_parameters()):
@@ -584,6 +682,8 @@ class TestNew2dParallelTraining(DTensorContinuousTestBase):
 
     @skip_if_lt_x_gpu(4)
     def test_2d_fsdp_state_enable_extension(self):
+        # [FUNCTION DOC] Wraps SimpleModel with FSDP over the dp submesh of a 2D mesh and
+        # asserts its FSDP state uses the DTensorExtensions extension. Needs 4 GPUs.
         mesh_2d = init_device_mesh(
             self.device_type, (2, self.world_size // 2), mesh_dim_names=("dp", "tp")
         )
@@ -599,6 +699,10 @@ class TestNew2dParallelTraining(DTensorContinuousTestBase):
         use_orig_params=False,
         recompute_activation=False,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Trains an FSDP-only model and an FSDP-over-dp plus TP model
+        # (net1 colwise, net2 rowwise, optionally with input resharding) for 5 steps with the
+        # same inputs per TP group, asserting equal outputs, parameter names and parameters
+        # before and after.
         torch.manual_seed(0)
         model = SimpleModel().to(f"{device_type}:{self.rank}")
         model = FSDP(model, use_orig_params=use_orig_params)
@@ -659,14 +763,20 @@ class TestNew2dParallelTraining(DTensorContinuousTestBase):
 
     @skip_if_lt_x_gpu(4)
     def test_2d_e2e_training_default(self):
+        # [FUNCTION DOC] Runs the end-to-end 2D training test with defaults (use_orig_params
+        # False).
         self._test_2d_e2e_training()
 
     @skip_if_lt_x_gpu(4)
     def test_2d_e2e_training_use_orig_params(self):
+        # [FUNCTION DOC] Runs the end-to-end 2D training test with use_orig_params True.
         self._test_2d_e2e_training(use_orig_params=True)
 
     @skip_if_lt_x_gpu(4)
     def test_2d_e2e_training_not_use_orig_params(self):
+        # [FUNCTION DOC] Runs the end-to-end 2D training test with use_orig_params False and no
+        # activation recompute; the recompute variant is disabled (see the TODO about
+        # input_reshard).
         # TODO: need to revisit input_reshard API about why it failed multi-gpu tests.
         # self._test_2d_e2e_training(recompute_activation=True)
         self._test_2d_e2e_training(recompute_activation=False)
@@ -675,15 +785,21 @@ class TestNew2dParallelTraining(DTensorContinuousTestBase):
 # TODO: update all state dict unit tests to use distributed.checkpoint.state_dict,
 # and consolidate all the state_dict test in test.distributed.checkpoint.
 class TestNew2dParallelStateDict(DTensorContinuousTestBase):
+    # [CLASS DOC] Four-rank tests of legacy FSDP plus TP state dicts, sharded and optimizer, for
+    # even and uneven models, and the FSDP1 plus TP full state dict workaround.
     world_size = 4
 
     @property
     def backend(self):
+        # [FUNCTION DOC] Returns a backend spec string using gloo for cpu and the default
+        # backend for the device type (needed for CPU offload).
         # need to specify gloo backend for testing cpu offload
         return f"cpu:gloo,{device_type}:{curr_backend}"
 
     @skip_if_lt_x_gpu(4)
     def test_fsdp_2d_extension(self):
+        # [FUNCTION DOC] Asserts the FSDP state of a TP+FSDP model with a dp submesh has a
+        # DTensorExtensions extension and that one on a 1D mesh has none. Needs 4 GPUs.
         """
         Test whether _fsdp_extension from FSDPstate has been set correctly.
         """
@@ -716,6 +832,10 @@ class TestNew2dParallelStateDict(DTensorContinuousTestBase):
     @skip_if_lt_x_gpu(4)
     @parametrize("is_even_sharded_model", [True, False])
     def test_2d_state_dict(self, is_even_sharded_model):
+        # [FUNCTION DOC] Parametrized over even and uneven models. Compares a plain model's
+        # state dict with the sharded state dict of the same model under TP+FSDP: same keys,
+        # DTensor values with two placements, outer placement Shard(0) on the full mesh, and
+        # values equal once fully replicated.
         simple_model = SimpleModel if is_even_sharded_model else SimpleModelUneven
 
         # Create a model without wrapper
@@ -771,6 +891,9 @@ class TestNew2dParallelStateDict(DTensorContinuousTestBase):
     @skip_if_lt_x_gpu(4)
     @parametrize("is_even_sharded_model", [True, False])
     def test_2d_load_state_dict(self, is_even_sharded_model):
+        # [FUNCTION DOC] Parametrized over even and uneven models. Saves the sharded state dict
+        # of a TP+FSDP model to a buffer, trains a step to change it, loads the saved dict back,
+        # and asserts keys, local tensors, meshes and placements equal the saved reference.
         simple_model = SimpleModel if is_even_sharded_model else SimpleModelUneven
 
         torch.manual_seed(0)
@@ -825,6 +948,13 @@ class TestNew2dParallelStateDict(DTensorContinuousTestBase):
     @skip_if_lt_x_gpu(4)
     @parametrize("is_even_sharded_model", [True, False])
     def test_2d_optim_state_dict(self, is_even_sharded_model):
+        # [FUNCTION DOC] Parametrized over even and uneven models. Compares optimizer state
+        # (after one step) of a plain model with that of a TP+FSDP model, gathering DTensor
+        # states to full tensors; then steps again, sets the optimizer state dict back from the
+        # saved copy and compares it with the reference including placements and meshes.
+        # KNOWN ISSUE: the final comparison reads the new states from the same dict object that
+        # was set from, which has not been re-fetched, so it may not check the optimizer's
+        # actual state.
         simple_model = SimpleModel if is_even_sharded_model else SimpleModelUneven
 
         # Create a model without wrapper
@@ -912,6 +1042,12 @@ class TestNew2dParallelStateDict(DTensorContinuousTestBase):
     @skip_if_lt_x_gpu(4)
     @with_temp_dir
     def test_fsdp1_tp_2d_set_full_state_dict(self):
+        # [FUNCTION DOC] Workaround test for loading a full state dict into a FSDP1 plus TP 2D
+        # model: saves full model and optimizer state of a 1D FSDP model with dcp, loads it into
+        # the default sharded state dicts of a 2D model, sets them, and asserts the 1D model's
+        # full state dicts match the reference. Wrapped by the temp-dir fixture. Needs 4 GPUs.
+        # KNOWN ISSUE: the final check re-reads state from the 1D model, not the 2D model, so it
+        # does not verify the load into the 2D model.
         """
         This is a workaround for loading full state dict into a FSDP1+TP 2D model.
         Since named_parameters() in FSDP1 does not return DTensor, we don't have the information to shard the full_state_dict

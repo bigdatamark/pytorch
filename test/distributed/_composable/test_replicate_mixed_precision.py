@@ -1,5 +1,13 @@
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC] Tests for mixed precision (MixedPrecisionPolicy) with the FSDP-style replicate()
+# from torch.distributed._composable.replicate_with_fsdp. Training-parity tests compare
+# replicated models against reference models that emulate bf16/fp16 compute with fp32 optimizer
+# steps and manually reduced gradients, checking param/reduce dtypes, jvp/vmap inputs and
+# gradient accumulation. A multi-thread class checks forward-input casting, norm-module
+# behavior, reduce dtype clamping and dataclass inputs. Import-time side effect: sets
+# module-level device_type from get_devtype.
+
 import copy
 import dataclasses
 import functools
@@ -41,6 +49,11 @@ device_type = torch.device(get_devtype())
 
 
 class TestReplicateMixedPrecisionTraining(FSDPTestContinuous):
+    # [CLASS DOC] Two-rank continuous multi-process tests of replicate() under mixed precision
+    # training. Each test builds a reference model (plain Adam, manual casting and all-reduce)
+    # and a replicated model, trains both and asserts losses are equal and parameters match
+    # (check_sharded_parity). Reduce-scatter dtypes are verified through a patched
+    # reduce_scatter_single.
     world_size = 2
 
     def _init_models_and_optims(
@@ -48,6 +61,11 @@ class TestReplicateMixedPrecisionTraining(FSDPTestContinuous):
         param_dtype: torch.dtype | None,
         reduce_dtype: torch.dtype | None,
     ):
+        # [FUNCTION DOC] HELPER: Seeds 42 and builds a three-layer MLP stack. Returns
+        # (ref_model, ref_optim, model, optim): ref_model is a device copy trained with Adam (lr
+        # 0.01); model has replicate applied to each MLP and then to the whole stack with a
+        # MixedPrecisionPolicy of the given param_dtype and reduce_dtype, with its own Adam
+        # (foreach).
         torch.manual_seed(42)
         model = nn.Sequential(*[MLP(16, torch.device("cpu")) for _ in range(3)])
         ref_model = copy.deepcopy(model).to(device_type)
@@ -70,6 +88,8 @@ class TestReplicateMixedPrecisionTraining(FSDPTestContinuous):
     @skip_if_lt_x_gpu(2)
     @requires_nccl_version((2, 10), "Need NCCL 2.10+ for bf16 collectives")
     def test_compute_dtype(self):
+        # [FUNCTION DOC] Runs the compute-dtype check for bfloat16 and float16 param dtypes
+        # through run_subtests. Needs 2 GPUs and NCCL 2.10+, and ROCm 7.0+ on ROCm.
         self.run_subtests(
             {
                 "param_dtype": [torch.bfloat16, torch.float16],
@@ -81,6 +101,12 @@ class TestReplicateMixedPrecisionTraining(FSDPTestContinuous):
         self,
         param_dtype: torch.dtype,
     ):
+        # [FUNCTION DOC] HELPER: For the given param_dtype (no reduce dtype), trains the
+        # replicated model and a reference copy cast to that dtype for 10 iterations. Asserts
+        # the reduce-scatter output dtype equals param_dtype. The reference grads are divided by
+        # the gradient divide factors and reduced via reduce-scatter plus all-gather, then moved
+        # to an fp32 model for the optimizer step and copied back. Asserts equal loss and
+        # sharded parity each iteration.
         ref_model, ref_optim, model, optim = self._init_models_and_optims(
             param_dtype=param_dtype,
             reduce_dtype=None,
@@ -89,6 +115,8 @@ class TestReplicateMixedPrecisionTraining(FSDPTestContinuous):
         orig_reduce_scatter = dist.reduce_scatter_single
 
         def assert_fn(output: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Asserts the reduce-scatter output tensor has dtype
+            # param_dtype.
             self.assertEqual(output.dtype, param_dtype)
 
         reduce_scatter = functools.partial(
@@ -139,8 +167,18 @@ class TestReplicateMixedPrecisionTraining(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(2)
     def test_input_jvp(self):
+        # [FUNCTION DOC] Trains replicated models with cast_forward_inputs and bf16 params
+        # through vmap and torch.func.jvp. Compares vmap outputs with a bf16 reference for a
+        # three-input MLP and for one returning a (tensor, scalar) pair, checks loss and one
+        # step, then runs 5 iterations of a jvp-based loss (including the tangent) with input
+        # grads required, comparing outputs, tangents, losses and parameters against the
+        # reference. Needs 2 GPUs.
         class ThreeInputMLP(nn.Module):
+            # [CLASS DOC] HELPER: MLP taking three inputs (z, t, r); concatenates them, then
+            # applies in_proj, relu and out_proj.
             def __init__(self, dim: int) -> None:
+                # [FUNCTION DOC] HELPER: Creates in_proj (dim+2 to dim) and out_proj (dim to
+                # dim).
                 super().__init__()
                 self.in_proj = nn.Linear(dim + 2, dim)
                 self.out_proj = nn.Linear(dim, dim)
@@ -148,13 +186,19 @@ class TestReplicateMixedPrecisionTraining(FSDPTestContinuous):
             def forward(
                 self, z: torch.Tensor, t: torch.Tensor, r: torch.Tensor
             ) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Concatenates z, t, r on the last dim and returns
+                # out_proj of relu of in_proj.
                 x = torch.cat((z, t, r), dim=-1)
                 return self.out_proj(torch.relu(self.in_proj(x)))
 
         class MixedOutputMLP(ThreeInputMLP):
+            # [CLASS DOC] HELPER: ThreeInputMLP variant whose forward also returns the sum of
+            # the out_proj weight as a second output.
             def forward(
                 self, z: torch.Tensor, t: torch.Tensor, r: torch.Tensor
             ) -> tuple[torch.Tensor, torch.Tensor]:
+                # [FUNCTION DOC] HELPER: Returns the parent forward output and the out_proj
+                # weight sum.
                 return super().forward(z, t, r), self.out_proj.weight.sum()
 
         torch.manual_seed(42)
@@ -173,6 +217,10 @@ class TestReplicateMixedPrecisionTraining(FSDPTestContinuous):
         replicate_fn = functools.partial(replicate, mesh=mesh, mp_policy=mp_policy)
 
         def init_model(model_cls):
+            # [FUNCTION DOC] HELPER: Builds model_cls(dim), an fp32 device reference with Adam
+            # (lr 0.001) and a bf16 copy of it, then applies replicate to in_proj, out_proj and
+            # the whole model with the test's policy (via mesh). Returns model, optim,
+            # ref_model, ref_optim, ref_model_bf16.
             model = model_cls(dim)
             ref_model = copy.deepcopy(model).to(device_type.type)
             ref_optim = torch.optim.Adam(ref_model.parameters(), lr=1e-3)
@@ -184,6 +232,9 @@ class TestReplicateMixedPrecisionTraining(FSDPTestContinuous):
             return model, optim, ref_model, ref_optim, ref_model_bf16
 
         def reduce_ref_grads_and_step(ref_model, ref_model_bf16, ref_optim) -> None:
+            # [FUNCTION DOC] HELPER: Upcasts the bf16 reference grads to fp32, all-reduces them,
+            # averages by world size, assigns them to the fp32 reference, steps its optimizer,
+            # and copies the updated values back into the bf16 model.
             for param in ref_model_bf16.parameters():
                 param.grad.data = param.grad.to(torch.float32)
                 dist.all_reduce(param.grad)
@@ -298,10 +349,15 @@ class TestReplicateMixedPrecisionTraining(FSDPTestContinuous):
     @skip_if_lt_x_gpu(2)
     @requires_nccl_version((2, 10), "Need NCCL 2.10+ for bf16 collectives")
     def test_reduce_dtype(self):
+        # [FUNCTION DOC] Runs the fp32-reduce and bf16-reduce checks in order. Needs 2 GPUs and
+        # NCCL 2.10+.
         self._test_reduce_dtype_fp32_reduce()
         self._test_reduce_dtype_bf16_reduce()
 
     def _test_reduce_dtype_fp32_reduce(self):
+        # [FUNCTION DOC] HELPER: With bf16 params and fp32 reduce dtype, trains for 10
+        # iterations, asserting reduce-scatter outputs are fp32; the bf16 reference all-reduces
+        # fp32 grads and averages. Asserts equal loss and parity each iteration.
         param_dtype, reduce_dtype = torch.bfloat16, torch.float32
         ref_model, ref_optim, model, optim = self._init_models_and_optims(
             param_dtype=param_dtype,
@@ -311,6 +367,8 @@ class TestReplicateMixedPrecisionTraining(FSDPTestContinuous):
         orig_reduce_scatter = dist.reduce_scatter_single
 
         def assert_fn(output: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Asserts the reduce-scatter output dtype equals
+            # reduce_dtype.
             self.assertEqual(output.dtype, reduce_dtype)
 
         reduce_scatter = functools.partial(
@@ -349,6 +407,10 @@ class TestReplicateMixedPrecisionTraining(FSDPTestContinuous):
     def _test_reduce_dtype_bf16_reduce(
         self,
     ):
+        # [FUNCTION DOC] HELPER: With fp32 params and bf16 reduce dtype, trains for 10
+        # iterations, asserting reduce-scatter outputs are bf16; the fp32 reference casts grads
+        # to bf16, averages them via functional reduce-scatter then all-gather on the default
+        # group, and upcasts. Asserts equal loss and parity each iteration.
         param_dtype, reduce_dtype = torch.float32, torch.bfloat16
         ref_model, ref_optim, model, optim = self._init_models_and_optims(
             param_dtype=param_dtype,
@@ -358,6 +420,8 @@ class TestReplicateMixedPrecisionTraining(FSDPTestContinuous):
         orig_reduce_scatter = dist.reduce_scatter_single
 
         def assert_fn(output: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Asserts the reduce-scatter output dtype equals
+            # reduce_dtype.
             self.assertEqual(output.dtype, reduce_dtype)
 
         reduce_scatter = functools.partial(
@@ -393,6 +457,8 @@ class TestReplicateMixedPrecisionTraining(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(2)
     def test_grad_acc_with_reduce_dtype(self):
+        # [FUNCTION DOC] Runs gradient accumulation with a reduce dtype with and without
+        # reshard_after_forward, via run_subtests. Needs 2 GPUs.
         """
         Tests that gradient accumulation without reduce-scatter when using
         bf16 compute and fp32 reduction accumulates the unsharded gradients in
@@ -404,6 +470,11 @@ class TestReplicateMixedPrecisionTraining(FSDPTestContinuous):
         )
 
     def _test_grad_acc_with_reduce_dtype(self, reshard_after_forward: bool):
+        # [FUNCTION DOC] HELPER: With bf16 compute and fp32 reduce, runs 4 microbatches per
+        # iteration for 10 iterations, disabling gradient sync and (conditionally) resharding
+        # except on the last microbatch. A bf16 compute reference accumulates grads into an fp32
+        # reference, which is all-reduced on the last microbatch. Asserts losses are bf16 and
+        # equal, reduce-scatter outputs are fp32, and parity holds.
         torch.manual_seed(42)
         param_dtype, reduce_dtype = (torch.bfloat16, torch.float32)
         mp_policy = MixedPrecisionPolicy(
@@ -423,6 +494,8 @@ class TestReplicateMixedPrecisionTraining(FSDPTestContinuous):
         orig_reduce_scatter = dist.reduce_scatter_single
 
         def assert_fn(output: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Asserts the reduce-scatter output dtype equals
+            # reduce_dtype.
             self.assertEqual(output.dtype, reduce_dtype)
 
         reduce_scatter = functools.partial(
@@ -483,12 +556,20 @@ class TestReplicateMixedPrecisionTraining(FSDPTestContinuous):
 
 
 class TestReplicateMixedPrecisionCasts(FSDPTestMultiThread):
+    # [CLASS DOC] Multi-thread (world size 2) tests of how replicate() with MixedPrecisionPolicy
+    # casts forward inputs, handles norm module buffers, clamps the reduce dtype, and handles
+    # dataclass inputs.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] Returns the fixed world size, 2.
         return 2
 
     @skip_if_lt_x_gpu(1)
     def test_float16_on_one_submodule(self):
+        # [FUNCTION DOC] Uses SaveForwardInputsModel to record each module's input dtype.
+        # Subtests: fp16 on child c2 (root and c1 see fp32, c2 sees fp16); fp16 on c2 with its
+        # input casting disabled (all see fp32); fp16 on c1 with output dtype fp32 (c1 sees
+        # fp16, others fp32). Needs 1 GPU.
         x = torch.zeros(2, 100, device=device_type)
 
         # Subtest 1: use fp16 on the second child submodule -- does not require
@@ -543,31 +624,49 @@ class TestReplicateMixedPrecisionCasts(FSDPTestMultiThread):
 
     @skip_if_lt_x_gpu(1)
     def test_submodules_with_external_inputs(self):
+        # [FUNCTION DOC] Runs the external-input check with submodule input casting disabled and
+        # enabled.
         self.run_subtests(
             {"enable_submodule_cast": [False, True]},
             self._test_submodules_with_external_inputs,
         )
 
     def _test_submodules_with_external_inputs(self, enable_submodule_cast: bool):
+        # [FUNCTION DOC] HELPER: Builds a model with a child that also receives an external fp32
+        # tensor y created in the parent forward, and applies fp16 policies. Asserts the model
+        # and child x inputs are fp16, and y is fp16 only if enable_submodule_cast is true, else
+        # fp32.
         class ToyModule(nn.Module):
+            # [CLASS DOC] HELPER: Child module with a Linear layer that records its x and y
+            # inputs into a shared dictionary.
             def __init__(self, forward_inputs: dict[str, torch.Tensor]) -> None:
+                # [FUNCTION DOC] HELPER: Creates Linear layer l and stores the shared
+                # forward_inputs dictionary.
                 super().__init__()
                 self.l = nn.Linear(100, 100)
                 self.forward_inputs = forward_inputs
 
             def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Records x and y in the dictionary and returns l applied
+                # to x only.
                 self.forward_inputs["l2_input_x"] = x
                 self.forward_inputs["l2_input_y"] = y
                 return self.l(x)
 
         class ToyModel(nn.Module):
+            # [CLASS DOC] HELPER: Parent module with Linear l1 and a ToyModule child l2; forward
+            # creates an external fp32 ones tensor and passes it to l2 along with l1(x).
             def __init__(self, forward_inputs: dict[str, torch.Tensor]) -> None:
+                # [FUNCTION DOC] HELPER: Creates l1, the l2 child and stores the shared
+                # forward_inputs dictionary.
                 super().__init__()
                 self.l1 = nn.Linear(100, 100)
                 self.l2 = ToyModule(forward_inputs)
                 self.forward_inputs = forward_inputs
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Records x, builds an external fp32 y of ones, and
+                # returns l2 on l1(x), y.
                 self.forward_inputs["model_input_x"] = x
                 y = torch.ones(
                     2, 100, device=device_type.type, dtype=torch.float32
@@ -598,17 +697,28 @@ class TestReplicateMixedPrecisionCasts(FSDPTestMultiThread):
     @skip_if_lt_x_gpu(1)
     @requires_nccl_version((2, 10), "Need NCCL 2.10+ for bf16 collectives")
     def test_norm_modules_bf16(self):
+        # [FUNCTION DOC] Runs the norm module checks with a bf16 param dtype. Needs 1 GPU and
+        # NCCL 2.10+.
         mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16)
         self._test_norm_modules(mp_policy)
 
     @skip_if_lt_x_gpu(1)
     @skipIfRocmArch(MI300_ARCH)  # https://github.com/pytorch/pytorch/issues/182988
     def test_norm_modules_fp16(self):
+        # [FUNCTION DOC] Runs the norm module checks with an fp16 param dtype; skipped on ROCm
+        # MI300.
         mp_policy = MixedPrecisionPolicy(param_dtype=torch.float16)
         self._test_norm_modules(mp_policy)
 
     def _test_norm_modules(self, mp_policy: MixedPrecisionPolicy):
+        # [FUNCTION DOC] HELPER: Applies replicate with mp_policy to Linear/LayerNorm,
+        # Linear/BatchNorm1d and Conv/BatchNorm2d stacks, running forward and backward.
+        # BatchNorm2d with fp32 buffers is expected to fail with RuntimeError about running_mean
+        # type (except on HPU); it succeeds after casting its buffers to the param dtype, or
+        # when the norm gets a policy with only output_dtype.
         def inner(model: nn.Module, x: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Runs forward, asserts the output dtype equals the policy
+            # param_dtype, and runs backward on the sum.
             # Run forward and backward to check for no type mismatch errors
             z = model(x)
             self.assertEqual(z.dtype, mp_policy.param_dtype)
@@ -659,6 +769,9 @@ class TestReplicateMixedPrecisionCasts(FSDPTestMultiThread):
 
     @skip_if_lt_x_gpu(1)
     def test_clamp_reduce_dtype(self):
+        # [FUNCTION DOC] Builds a bf16-initialized model with a bf16 reduce dtype policy,
+        # converts the model to fp32, and asserts reduce-scatter outputs are still bf16 (the
+        # reduce dtype is not clamped). Needs 1 GPU.
         # Initialize the model directly in bf16
         init_dtype = torch.bfloat16
         model = nn.Sequential(
@@ -692,16 +805,26 @@ class TestReplicateMixedPrecisionCasts(FSDPTestMultiThread):
 
     @skip_if_lt_x_gpu(1)
     def test_dataclass_input(self):
+        # [FUNCTION DOC] Checks replicate with a casting policy works when the forward argument
+        # is a dataclass holding a tensor, by running forward and backward.
+        # KNOWN ISSUE: the input is moved with a hard-coded cuda call instead of the device
+        # type.
         @dataclasses.dataclass
         class Input:
+            # [CLASS DOC] HELPER: Dataclass wrapping a single tensor field x.
             x: torch.Tensor
 
         class Model(nn.Module):
+            # [CLASS DOC] HELPER: Module with one 10x10 Linear layer applied to the x field of
+            # an Input.
             def __init__(self, *args, **kwargs) -> None:
+                # [FUNCTION DOC] HELPER: Forwards arguments to the base class and creates Linear
+                # layer _layer.
                 super().__init__(*args, **kwargs)
                 self._layer = nn.Linear(10, 10)
 
             def forward(self, input: Input):
+                # [FUNCTION DOC] HELPER: Returns the layer applied to the input's x tensor.
                 return self._layer(input.x)
 
         mp_policy = MixedPrecisionPolicy(

@@ -1,5 +1,14 @@
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC] Tests for the composable replicate() API
+# (torch.distributed._composable.replicate), which wraps a module with DDP-style gradient
+# synchronization. Contains a thread-based test of state_dict parity with the local module, a
+# multi-process gloo test class comparing replicated training against local large-batch training
+# (and testing device_id, ignored_modules and argument moving), and a subclass checking
+# interplay with fully_shard. Import-time side effects: computes the module-level device_type
+# from the current accelerator (cpu if none) and its device_module. Most multi-process tests are
+# skipped on Linux through issue-linked skip decorators.
+
 import unittest
 from copy import deepcopy
 
@@ -28,26 +37,36 @@ device_module = torch.get_device_module(device_type)
 
 
 class Net(nn.Module):
+    # [CLASS DOC] HELPER: Tiny model of three chained 2x2 Linear layers fc1, fc2, fc3.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates the three 2x2 Linear layers.
         super().__init__()
         self.fc1 = nn.Linear(2, 2)
         self.fc2 = nn.Linear(2, 2)
         self.fc3 = nn.Linear(2, 2)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies fc1, fc2, fc3 in order and returns the result.
         return self.fc3(self.fc2(self.fc1(x)))
 
 
 class ReplicateStateDictTest(MultiThreadedTestCase):
+    # [CLASS DOC] Multi-threaded (4 ranks, set by world_size) tests that replicate() leaves
+    # state_dict keys and values identical to those of an unwrapped copy of the model.
     @property
     def world_size(self):
+        # [FUNCTION DOC] Returns the fixed world size, 4, for the threaded test case.
         return 4
 
     def setUp(self):
+        # [FUNCTION DOC] Runs the base setUp and then spawns the per-rank threads for the test.
         super().setUp()
         self._spawn_threads()
 
     def _check_state_dict_parity(self, sd_1, sd_2):
+        # [FUNCTION DOC] HELPER: Asserts two state dicts have the same keys in the same order
+        # and equal values, comparing by position. Zip silently truncates, so differing lengths
+        # are not detected.
         for k1, k2 in zip(sd_1.keys(), sd_2.keys()):
             self.assertEqual(k1, k2)
 
@@ -55,6 +74,8 @@ class ReplicateStateDictTest(MultiThreadedTestCase):
             self.assertEqual(v1, v2)
 
     def test_replicate_single_module_save_load(self):
+        # [FUNCTION DOC] Applies replicate to a whole deep copy of Net and checks its state_dict
+        # matches that of the original.
         """
         Tests that replicate() on a single module state_dict
         matches local module state_dict.
@@ -66,6 +87,8 @@ class ReplicateStateDictTest(MultiThreadedTestCase):
         self._check_state_dict_parity(local_sd, ddp_sd)
 
     def test_replicate_non_root_multiple_save_load(self):
+        # [FUNCTION DOC] Applies replicate separately to fc1, fc2 and fc3 of a deep copy of Net
+        # and checks its state_dict matches the original model's.
         """
         Tests the replicate() on multiple submodules matches
         local module state_dict.
@@ -82,23 +105,36 @@ class ReplicateStateDictTest(MultiThreadedTestCase):
 
 
 class ReplicateTest(MultiProcContinuousTest):
+    # [CLASS DOC] Multi-process (world size 2, gloo backend, cpu device type) continuous test class
+    # for replicate(). Checks training parity with local training, device_id handling, moving args
+    # to the device, ignored modules and constructor kwargs. Most tests are skipped on Linux.
     world_size = 2
 
     @classmethod
     def backend_str(cls) -> str:
+        # [FUNCTION DOC] Returns the process-group backend name, "gloo".
         return "gloo"
 
     @classmethod
     def device_type(cls) -> str:
+        # [FUNCTION DOC] Returns the device type for the continuous test, "cpu".
         return "cpu"
 
     def _compare_module(self, mod, replicate_mod):
+        # [FUNCTION DOC] HELPER: Trains a local model on the global batch and a replicated model
+        # on each rank's slice (one sample per rank) for two iterations with plain SGD (lr 1)
+        # steps, asserting the parameter counts and values match within tolerance each
+        # iteration. The global input is reshuffled with a seeded permutation after each
+        # iteration. Side effects: zeroes grads.
         local_batch_size = 1
         global_batch_size = self.world_size * local_batch_size
         input = torch.randn(global_batch_size, 2)
         target = torch.randn(global_batch_size, 2)
 
         def step_model(model, input, target):
+            # [FUNCTION DOC] HELPER: One training step: sets train mode, computes mse loss
+            # against the target (moved to the output device), backpropagates, subtracts each
+            # grad from its parameter under no_grad, and clears the grads.
             model.train()
             output = model(input)
             loss = F.mse_loss(output, target.to(output.device))
@@ -133,6 +169,8 @@ class ReplicateTest(MultiProcContinuousTest):
 
     @unittest.skipIf(IS_LINUX, "https://github.com/pytorch/pytorch/issues/180205")
     def test_replicate_single_module(self):
+        # [FUNCTION DOC] Checks that replicate on a single deep-copied module trains
+        # equivalently to the local model.
         model = Net()
         replicate_model = replicate(deepcopy(model))
         self._compare_module(model, replicate_model)
@@ -143,12 +181,20 @@ class ReplicateTest(MultiProcContinuousTest):
     @skip_if_lt_x_gpu(2)
     @unittest.skipIf(TEST_XPU, "XPU does not support gloo backend")
     def test_replicate_move_args_kwargs_to_device(self):
+        # [FUNCTION DOC] Checks replicate with a device_id moves CPU positional and keyword
+        # tensor inputs to the device so forward and backward run without error; needs 2
+        # accelerators.
         class MyNet(nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward optionally multiplies input by a
+            # keyword-only matrix before one Linear layer.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates one 2x2 Linear layer a.
                 super().__init__()
                 self.a = nn.Linear(2, 2)
 
             def forward(self, inp, *, kwarg=None):
+                # [FUNCTION DOC] HELPER: If kwarg is given, matrix-multiplies the input by it;
+                # then applies a.
                 if kwarg is not None:
                     inp = inp @ kwarg
                 return self.a(inp)
@@ -164,6 +210,9 @@ class ReplicateTest(MultiProcContinuousTest):
     @skip_if_lt_x_gpu(2)
     @unittest.skipIf(TEST_XPU, "XPU does not support gloo backend")
     def test_replicate_ignore_module(self):
+        # [FUNCTION DOC] Checks that with fc1 passed in ignored_modules, fc1 gradients differ
+        # across ranks (not synchronized) while fc2 and fc3 gradients are all-gathered equal.
+        # Needs 2 accelerators; seeds make inputs differ per rank.
         torch.accelerator.set_device_index(self.rank)
         # Seed ensures diff input and thus different local grads across ranks.
         torch.manual_seed(self.rank)
@@ -195,6 +244,8 @@ class ReplicateTest(MultiProcContinuousTest):
         IS_LINUX or TEST_WITH_ROCM, "https://github.com/pytorch/pytorch/issues/180127"
     )
     def test_replicate_multi_module(self):
+        # [FUNCTION DOC] Checks replicate applied separately to each of fc1, fc2, fc3 trains
+        # equivalently to the local model.
         model = Net()
         replicate_model = deepcopy(model)
         replicate(replicate_model.fc1)
@@ -204,6 +255,8 @@ class ReplicateTest(MultiProcContinuousTest):
 
     @unittest.skipIf(IS_LINUX, "https://github.com/pytorch/pytorch/issues/180265")
     def test_replicate_with_kwargs(self):
+        # [FUNCTION DOC] Checks replicate accepts DDP kwargs (bucket_cap_mb,
+        # gradient_as_bucket_view) and still trains equivalently to the local model.
         model = Net()
         replicate_model = replicate(
             deepcopy(model), bucket_cap_mb=1, gradient_as_bucket_view=True
@@ -214,6 +267,9 @@ class ReplicateTest(MultiProcContinuousTest):
     @skip_if_lt_x_gpu(2)
     @unittest.skipIf(TEST_XPU, "XPU does not support gloo backend")
     def test_replicate_device_id(self):
+        # [FUNCTION DOC] Checks the device_ids of the underlying DDP object, created at first
+        # forward: None for a cpu device_id, and [0] for a device given as torch.device or as an
+        # int. Needs 2 accelerators.
         model = Net()
         model_cuda = deepcopy(model).to(device_type)
         model_cuda2 = deepcopy(model_cuda)
@@ -240,6 +296,8 @@ class ReplicateTest(MultiProcContinuousTest):
 
     @unittest.skipIf(IS_LINUX, "https://github.com/pytorch/pytorch/issues/176155")
     def test_replicate_wrong_device_id_type(self):
+        # [FUNCTION DOC] Checks replicate raises RuntimeError mentioning device_id must be int
+        # or torch.device when given a list.
         model = Net()
         with self.assertRaisesRegex(
             RuntimeError, "Expected device_id to be int or torch.device"
@@ -248,12 +306,21 @@ class ReplicateTest(MultiProcContinuousTest):
 
 
 class ReplicateFullyShardInit(ReplicateTest):
+    # [CLASS DOC] Subclass of ReplicateTest (so it also re-runs those tests) adding a test that
+    # replicate can be applied on top of fully_shard.
     @unittest.skipIf(IS_LINUX, "https://github.com/pytorch/pytorch/issues/179810")
     @skip_if_lt_x_gpu(2)
     @unittest.skipIf(TEST_XPU, "XPU does not support gloo backend")
     def test_replicate_fully_shard_init(self):
+        # [FUNCTION DOC] Applies fully_shard to each linear and to the container, then replicate
+        # to the whole ToyModel, asserting weights are DTensors before and after a forward that
+        # triggers lazy init. Needs 2 accelerators.
         class ToyModel(nn.Module):
+            # [CLASS DOC] HELPER: Model of a three-Linear Sequential followed by a projection,
+            # no bias.
             def __init__(self, dim: int):
+                # [FUNCTION DOC] HELPER: Builds bias-free dim x dim Linear layers: three in
+                # linears plus proj.
                 super().__init__()
                 self.linears = nn.Sequential(
                     nn.Linear(dim, dim, bias=False),
@@ -263,6 +330,8 @@ class ReplicateFullyShardInit(ReplicateTest):
                 self.proj = nn.Linear(dim, dim, bias=False)
 
             def forward(self, x: torch.Tensor):
+                # [FUNCTION DOC] HELPER: Applies linears and then proj to x and returns the
+                # result.
                 y = self.linears(x)
                 y = self.proj(y)
                 return y
