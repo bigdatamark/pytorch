@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Lowers a quantized FX reference model (dequantize - reference op - quantize patterns) to the native backend (fbgemm/qnnpack) quantized modules and ops.
+# Defines node classifiers (fixed-qparams, default, copy, tensor-shape, other ops), lookup tables mapping reference modules/functionals to quantized versions,
+# graph passes that rewrite the patterns in place, weight prepack folding (fold_weight), and the driver _lower_to_native_backend.
+# Import-time side effects: only builds module-level constant mappings; the quantized ops are looked up from torch.ops.quantized.
 import operator
 from collections.abc import Callable
 from typing import Any
@@ -43,6 +47,9 @@ QOP_TO_ARG_NAMES_TO_SKIP: dict[Callable[..., Any], list[str]] = {
 
 
 def _is_node_in_list(node, modules, func_list, method_list, module_type_list):
+    # [FUNCTION DOC] HELPER: Checks a node against lists of functions, method names and module types.
+    # Returns a 3-tuple of booleans (is call_function in func_list, is call_method in method_list, is call_module whose module type is in module_type_list).
+    # Looks up the module in the modules mapping by the node target name (raises a key error if a call_module target is missing).
     is_call_function = node.op == "call_function" and node.target in func_list
     is_call_method = node.op == "call_method" and node.target in method_list
     is_call_module = (
@@ -52,6 +59,8 @@ def _is_node_in_list(node, modules, func_list, method_list, module_type_list):
 
 
 def is_fixed_qparams_node(node, modules):
+    # [FUNCTION DOC] Classifies whether a node is a fixed-qparams op (hardsigmoid, sigmoid, tanh, softmax) as function, method or module call.
+    # Returns the 3-tuple of booleans from _is_node_in_list.
     func_list = [
         torch.nn.functional.hardsigmoid,
         torch.nn.functional.sigmoid,
@@ -76,6 +85,8 @@ def is_fixed_qparams_node(node, modules):
 
 
 def is_default_node(node, modules):
+    # [FUNCTION DOC] Classifies whether a node is a "default" op (elu, hardswish, instance/layer norm, leaky relu, dropout, prelu, batch norm, conv transpose reference modules, etc).
+    # Returns the 3-tuple of booleans (function, method, module) from _is_node_in_list.
     func_list = [
         torch.nn.functional.elu,
         torch.nn.functional.hardswish,
@@ -107,6 +118,8 @@ def is_default_node(node, modules):
 
 
 def is_copy_node(node, modules):
+    # [FUNCTION DOC] Classifies whether a node is a "copy" op that passes quantization params through (pooling, relu, hardtanh, interpolate, clamp, mean, flatten, etc).
+    # Returns the 3-tuple of booleans (function, method, module) from _is_node_in_list.
     func_list = [
         torch.adaptive_avg_pool1d,
         torch.nn.functional.adaptive_avg_pool2d,
@@ -155,6 +168,8 @@ def is_copy_node(node, modules):
 
 
 def is_general_tensor_shape_node(node, modules):
+    # [FUNCTION DOC] Classifies whether a node is a general tensor shape op (reshape, view, permute, squeeze, transpose, size, shape, identity, pixel shuffle, etc).
+    # Returns the 3-tuple of booleans (function, method, module) from _is_node_in_list.
     func_list = [
         torch.narrow,
         torch.transpose,
@@ -192,6 +207,8 @@ def is_general_tensor_shape_node(node, modules):
 
 
 def is_other_node(node, modules):
+    # [FUNCTION DOC] Classifies whether a node is an "other" op; currently only torch.cat as a function call.
+    # Returns the 3-tuple of booleans (function, method, module).
     func_list = [
         torch.cat,
     ]
@@ -201,6 +218,8 @@ def is_other_node(node, modules):
 
 
 def is_special_pattern_node(node, modules):
+    # [FUNCTION DOC] Combines all the classifiers (fixed qparams, default, copy, tensor shape, other) with a logical or per kind.
+    # Returns a 3-tuple of booleans (is function, is method, is module) that is true if any classifier matched that kind of call.
     res_function, res_method, res_module = False, False, False
     for checker in [
         is_fixed_qparams_node,
@@ -217,6 +236,7 @@ def is_special_pattern_node(node, modules):
 
 
 def is_dequantize_node(node):
+    # [FUNCTION DOC] Returns True if the argument is an fx Node that is a call_method of dequantize; non-Node values give False.
     return (
         isinstance(node, Node)
         and node.op == "call_method"
@@ -225,6 +245,8 @@ def is_dequantize_node(node):
 
 
 def is_getattr_tensor_metadata_node(node):
+    # [FUNCTION DOC] Returns True if the node is a call_function of getattr whose second argument is the string shape.
+    # Raises an index error if the node has fewer than two args and is a getattr call.
     return (
         node.op == "call_function"
         and node.target is getattr
@@ -233,10 +255,12 @@ def is_getattr_tensor_metadata_node(node):
 
 
 def is_get_tensor_info_node(node):
+    # [FUNCTION DOC] Returns True if the node is a call_method of shape or size.
     return node.op == "call_method" and node.target in ["shape", "size"]
 
 
 def should_skip_lowering(op: torch.fx.node.Node, qconfig_map: dict[str, QConfigAny]):
+    # [FUNCTION DOC] Returns True if the qconfig_map has an entry for the op name and that qconfig is None, meaning the op must not be lowered; otherwise False.
     """
     Return True if the op is configured with a None qconfig, False otherwise.
     Note: maybe need to generalize this to also check for the dtype, and we
@@ -416,6 +440,8 @@ ORIGINAL_WEIGHTS_LOOKUP = "original_weights_lookup"
 
 
 def _save_packed_weight(self, destination, prefix, keep_vars):
+    # [FUNCTION DOC] HELPER: State dict hook installed on the lowered GraphModule: for every attribute whose name contains _packed_weight and holds a ScriptObject (prepacked weight),
+    # stores it in the destination mapping under the prefix plus attribute name. Mutates destination; keep_vars is unused; returns nothing.
     for attr_name in dir(self):
         if "_packed_weight" in attr_name and isinstance(
             getattr(self, attr_name), torch._C.ScriptObject
@@ -434,6 +460,8 @@ def _load_packed_weight(
     unexpected_keys,
     error_msgs,
 ):
+    # [FUNCTION DOC] HELPER: Load-state-dict pre-hook: for every state_dict key starting with _packed_weight whose value is a ScriptObject, sets it as an attribute on the module
+    # and then removes those keys from the state_dict (mutated in place) so normal loading does not see them. Other arguments are unused; returns nothing.
     attrs_to_pop = []
     for attr_name in state_dict:
         if attr_name.startswith("_packed_weight") and isinstance(
@@ -452,6 +480,11 @@ def fold_weight(
     node_name_to_scope: dict[str, tuple[str, type]],
     keep_original_weights: bool = False,
 ) -> GraphModule:
+    # [FUNCTION DOC] Folds weight prepacking into the graph. For each call to a weight prepack op, collects its producer chain, builds a small GraphModule from it and runs it to get the packed weight.
+    # Builds a new graph where the prepack node is replaced with a get_attr to a new attribute (named from the scope path plus _packed_weight_) on the model and the folded producer nodes are dropped.
+    # Registers the save/load packed weight state dict hooks on the new GraphModule. If keep_original_weights is true, stores the original (unpacked) weight and bias per packed attribute
+    # in an attribute named original_weights_lookup on the module. Returns the new GraphModule.
+    # KNOWN ISSUE: the original weights lookup is keyed with a counter assuming the folding order of the first and second loops match; it relies on node order.
     """
     Trace back from the weight node util we hit getattr, reconstruct the
     graph module with the traced nodes and run the graph module to pack the
@@ -491,6 +524,7 @@ def fold_weight(
     env: dict[Any, Any] = {}
 
     def load_arg(a):
+        # [FUNCTION DOC] HELPER: Maps the nodes in an argument structure to their copies in the new graph via the env mapping (looked up by node name).
         return map_arg(a, lambda node: env[node.name])
 
     for node in quantized_model.graph.nodes:
@@ -540,6 +574,7 @@ def fold_weight(
 
 
 def _get_module(node: Node, modules: dict[str, nn.Module]) -> nn.Module | None:
+    # [FUNCTION DOC] HELPER: Returns the module for a call_module node whose target is found in the modules mapping; otherwise returns None.
     """
     Return the `torch.nn.Module` that corresponds to the specified node's target.
     If no such node exists, return None.
@@ -557,6 +592,10 @@ def _match_static_pattern(
     matching_modules_or_ops: list[Callable],
     dequantize_node_arg_indices: list[int],
 ) -> tuple[Node, Node, Node] | tuple[None, None, None]:
+    # [FUNCTION DOC] HELPER: Matches the pattern dequantize - reference node (optionally wrapped in a relu) - quantize_per_tensor ending at the given node.
+    # Returns a 3-tuple (quantize node, relu node or None, reference node), or (None, None, None) when there is no match: the node is not quantize, the qconfig is None,
+    # the reference node is not one of the given modules or functions, or an arg at a dequantize index is a Node but not a dequantize, or no dequantize matched.
+    # Raises an error if the quantize input (or relu input) is not a Node or a dequantize index exceeds the reference node args length.
     """
     Match the pattern (dequantize - ref node - quantize) against the node provided.
 
@@ -639,6 +678,10 @@ def _match_static_pattern_with_two_inputs(
     qconfig_map: dict[str, QConfigAny],
     matching_modules_or_ops: list[Callable],
 ) -> tuple[Node, Node] | tuple[None, None]:
+    # [FUNCTION DOC] HELPER: Matches dequantize (two inputs) - reference module - quantize_per_tensor ending at the given node; only call_module references are supported.
+    # Returns a 2-tuple (quantize node, reference node) or (None, None) if the qconfig is None, the module type is not listed, or the node does not have exactly two args that are both dequantize nodes.
+    # Raises an error if the quantize input is not a Node.
+    # KNOWN ISSUE: the docstring starts with a stray drawing fragment line and does not describe the two-input requirement.
     """
                       (dequantize \
     Match the pattern (dequantize - ref node - quantize) against the node provided.
@@ -696,6 +739,10 @@ def _match_static_pattern_with_two_inputs(
 def _lower_static_weighted_ref_module(
     model: GraphModule, qconfig_map: dict[str, QConfigAny]
 ):
+    # [FUNCTION DOC] HELPER: Rewrites static dequantize - reference module (including fused modules) - quantize patterns into the quantized module, in place on the model graph.
+    # Creates the quantized module from the reference module using the output scale and zero point attributes of the quantize node, replaces the module on its parent,
+    # routes the reference node input around the dequantize node, and erases the quantize, scale and zero point nodes. Fused modules are skipped if the inner module is not the expected reference class.
+    # Raises an error if the matched nodes are not of the expected kinds.
     """
     Traverse the graph and find dequantize - ref module - quantize patterns
     and replace them with the quantized version of the ref module.
@@ -763,6 +810,9 @@ def _lower_static_weighted_ref_module(
 def _lower_static_weighted_ref_module_with_two_inputs(
     model: GraphModule, qconfig_map: dict[str, QConfigAny]
 ):
+    # [FUNCTION DOC] HELPER: Same as the static module lowering, but for fused modules whose reference node has two dequantize inputs (conv add patterns).
+    # Replaces the module with the quantized fused module, removes the dequantize inputs, and erases the quantize, scale and zero point nodes. Unlisted or mismatched inner modules are skipped.
+    # Mutates the model graph in place; raises an error if the matched node structure is unexpected.
     """
     Traverse the graph and find patterns
     dequantize   dequantize
@@ -837,6 +887,9 @@ def _lower_static_weighted_ref_module_with_two_inputs(
 
 
 def _lower_dynamic_weighted_ref_module(model: GraphModule):
+    # [FUNCTION DOC] HELPER: Rewrites quantize_per_tensor_dynamic - dequantize - reference module patterns (linear, RNN cells, LSTM, GRU, linear relu) into dynamically quantized modules, in place.
+    # Only int8 (quint8/qint8) or float16 activation dtypes are handled. Replaces the module on its parent and connects the module input to the input of the dynamic quantize node.
+    # The now dead dynamic quantize and dequantize nodes are left for later dead code elimination.
     """
     Traverse the graph and find quantize_per_tensor_dynamic - dequantize - ref_module patterns
     and replace them with the dynamically quantized version of the ref module.
@@ -884,6 +937,7 @@ def _lower_dynamic_weighted_ref_module(model: GraphModule):
 
 
 def _lower_weight_only_weighted_ref_module(model: GraphModule):
+    # [FUNCTION DOC] HELPER: Replaces reference embedding and embedding bag modules with weight only quantized modules via from_reference, in place on the parent module. Does not change graph nodes.
     """
     Traverse the graph and find ref_module patterns
     and replace them with the weight only quantized version of the ref module.
@@ -912,6 +966,11 @@ def _lower_weight_only_weighted_ref_module(model: GraphModule):
 def _lower_static_weighted_ref_functional(
     model: GraphModule, qconfig_map: dict[str, QConfigAny]
 ):
+    # [FUNCTION DOC] HELPER: Rewrites static dequantize - functional (linear, conv, conv transpose) - quantize patterns into quantized functional ops with prepacked weights, in place.
+    # Requires the weight to be a dequantize of a quantize_per_tensor/per_channel node; otherwise the node is skipped. Builds the prepack op call (choosing by op and weight dtype,
+    # converting conv1d int stride/padding/dilation to tuples, reordering conv transpose dilation and groups, renaming bias to B for linear), then retargets the functional node to the quantized op
+    # (relu fused variant when a relu was matched) with args input, packed weight, output scale and zero point, and erases the quantize and fused relu nodes.
+    # Raises a value error for an unsupported op.
     """
     Traverse the graph and replace functional reference patterns with their quantized versions.
     """
@@ -1018,6 +1077,11 @@ def _lower_static_weighted_ref_functional(
 def _lower_dynamic_weighted_ref_functional(
     model: GraphModule, qconfig_map: dict[str, QConfigAny]
 ):
+    # [FUNCTION DOC] HELPER: Rewrites dynamic quantize - dequantize - functional (linear, conv) patterns, optionally followed by relu, into dynamic quantized ops with prepacked weights, in place.
+    # Walks the graph in reverse so larger patterns (with relu) match first. Chooses the quantized op by the (activation dtype, weight dtype) pair; unknown pairs print a message and are skipped.
+    # Creates a prepack node before the functional node, retargets the node to the dynamic op (reduce range arg only for int8), and erases the relu node if present.
+    # Raises a value error for an unsupported op.
+    # KNOWN ISSUE: skips when the relu variant of the dynamic op is None (conv), so dynamic conv is never lowered here even without relu.
     """
     Traverse the graph and replace functional reference patterns with their dynamically
     quantized versions.
@@ -1147,6 +1211,9 @@ def _lower_dynamic_weighted_ref_functional(
 
 
 def _lower_quantized_binary_op(model: GraphModule, qconfig_map: dict[str, QConfigAny]):
+    # [FUNCTION DOC] HELPER: Rewrites dequantize - add/mul/matmul - quantize (optionally followed by relu) patterns into quantized binary ops (relu fused variants when a relu follows), in place.
+    # Removes the dequantize inputs, appends the output scale and zero point args when both inputs were dequantized (tensor-tensor case), creates the new node preserving metadata after the quantize node,
+    # and erases the quantize, relu and original op nodes. Raises an error if no dequantize input is found or the op is not supported.
     binary_ops_to_lower: list[Callable] = [
         operator.add,
         torch.add,
@@ -1219,6 +1286,12 @@ def _lower_quantized_binary_op(model: GraphModule, qconfig_map: dict[str, QConfi
 
 
 def special_pattern_replacement(model: GraphModule):
+    # [FUNCTION DOC] Handles special patterns (fixed qparams, default, copy, tensor shape ops and cat) of the form dequantize - op - quantize_per_tensor (or a cast to float16), modifying the graph in place and returning the model.
+    # Skips float16 casts of fixed-qparams and default ops. For listed module types preceded by quantize, swaps in the quantized module built from the reference using the output scale and zero point.
+    # Reroutes the op input around the dequantize node(s) and removes the quantize node; for default function ops, creates a quantized operator call taking output scale and zero point kwargs,
+    # otherwise erases the now unused scale and zero point nodes.
+    # Raises an error if the op has no args or kwargs or its first input is not a Node or sequence.
+    # KNOWN ISSUE: the loop variable n is reused in an inner loop over qparams, and the first kwarg value is assumed to be the input when there are no args.
     modules = dict(model.named_modules(remove_duplicate=False))
     for n in model.graph.nodes:
         q_node = n
@@ -1353,6 +1426,8 @@ def special_pattern_replacement(model: GraphModule):
 
 
 def _lower_getattr_tensor_metadta_op(model: GraphModule):
+    # [FUNCTION DOC] HELPER: Modifies the graph in place: for getattr shape nodes whose input is a dequantize call, uses the dequantize input directly so the dequantize can be skipped.
+    # KNOWN ISSUE: the function name has a typo (metadta) and the docstring describes tensor shape ops generally.
     """Modified the graph of the model inplace, to skip extra dequantize op before
     the general tensor shape ops when possible
     """
@@ -1368,6 +1443,7 @@ def _lower_getattr_tensor_metadta_op(model: GraphModule):
 
 
 def _lower_get_tensor_info_op(model: GraphModule):
+    # [FUNCTION DOC] HELPER: Modifies the graph in place: for shape or size method calls whose input is a dequantize call, uses the dequantize input directly so the dequantize can be skipped.
     """Modified the graph of the model inplace, to skip extra dequantize op before
     the general tensor shape ops when possible
     """
@@ -1389,6 +1465,9 @@ def _lower_to_native_backend(
     node_name_to_scope: dict[str, tuple[str, type]],
     keep_original_weights: bool = False,
 ) -> GraphModule:
+    # [FUNCTION DOC] Driver that lowers a quantized reference GraphModule to the native backend. Runs in order: static module, static two-input module, dynamic module, weight only module,
+    # static functional, dynamic functional, binary op lowering, tensor metadata ops, special patterns, dead code elimination, weight folding (fold_weight), dead code elimination,
+    # then recompiles the module and lints the graph. Takes the qconfig map, node-name-to-scope mapping and keep_original_weights flag. Returns the lowered GraphModule.
     """Lower a quantized reference model (with reference quantized operator patterns)
     to the native backend in PyTorch (fbgemm/qnnpack), both backends shares the same
     operator signature so they can be lowered with the same function

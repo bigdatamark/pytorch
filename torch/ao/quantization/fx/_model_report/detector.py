@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Detectors for the FX model report tool. Each detector decides where observers should be inserted in a prepared model and, after calibration,
+# produces a text report plus a dictionary of statistics and a per-module DetectorQConfigInfo describing suggested qconfig changes.
+# Contains DetectorQConfigInfo (suggestion container), DetectorBase (abstract interface) and PerChannelDetector, DynamicStaticDetector, InputWeightEqualizationDetector and OutlierDetector.
+# Defines the dictionary key constants (target_node, observer_to_insert, is_post_observer, observer_args) used for observer insert points. No import-time side effects besides definitions.
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any
@@ -39,6 +43,9 @@ DETECTOR_OBS_ARGS_KEY = "observer_args"
 
 # Mapping related code
 class DetectorQConfigInfo:
+    # [CLASS DOC] Holds the qconfig-related suggestions of detectors for one module, identified by module_fqn.
+    # Attributes: module_fqn, is_activation_dynamic (default False), is_weight_per_channel (default False), is_equalization_recommended (default False).
+    # Methods turn the flags into a concrete QConfig or EqualizationQConfig.
     r"""
     This class contains the QConfig information for a single module.
     The list of variables / values this contains can grow depending on the
@@ -53,6 +60,7 @@ class DetectorQConfigInfo:
     """
 
     def __init__(self, module_fqn: str):
+        # [FUNCTION DOC] Stores the module fqn and initializes all recommendation flags to False.
         super().__init__()
         self.module_fqn = module_fqn
 
@@ -65,6 +73,10 @@ class DetectorQConfigInfo:
         self.is_equalization_recommended = False
 
     def generate_quantization_qconfig(self, module: torch.nn.Module) -> QConfig:
+        # [FUNCTION DOC] Builds a valid QConfig for the module from the flags. Tries, in priority order, (dynamic, per channel), (dynamic only), (per channel only) combinations of
+        # activation observer (dynamic quant observer or default observer) and weight observer (per channel or default weight observer), and uses the first one that passes the qconfig validity assertion for the module.
+        # Falls back to default_qconfig if none is valid. Returns the QConfig; no side effects.
+        # KNOWN ISSUE: the fallback pair (False, False) is never tried explicitly, and the comment on the last combination says dynamic though it tries per channel only.
         r"""
         Args:
             module (torch.nn.Module) The module we are generating
@@ -111,6 +123,7 @@ class DetectorQConfigInfo:
         return module_qconfig
 
     def generate_equalization_qconfig(self) -> EqualizationQConfig:
+        # [FUNCTION DOC] Returns the default equalization qconfig; the module is assumed valid because only valid modules get this option.
         r"""
         This returns the equalization configuration for a module.
 
@@ -128,6 +141,8 @@ class DetectorQConfigInfo:
 
 # Adding base class for detectors
 class DetectorBase(ABC):
+    # [CLASS DOC] Abstract base class for all detectors. Subclasses implement choosing observer insert points, naming the detector, producing qconfig info and generating a report.
+    # Also provides the helper to locate the graph node for a module fqn. Holds detector_config_info, initially None.
     r"""Base Detector Module
     Any detector class should derive from this class.
 
@@ -139,11 +154,13 @@ class DetectorBase(ABC):
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Initializes the detector_config_info attribute to None.
         super().__init__()
         self.detector_config_info = None
 
     @abstractmethod
     def determine_observer_insert_points(self, model) -> dict:
+        # [FUNCTION DOC] Abstract. Given a model, returns a mapping from unique observer fqn to a dictionary with the target node, observer to insert, post-observer flag and observer args.
         r"""
         Args
             model (nn.Module or subclass): model to find observer insertion points
@@ -154,10 +171,12 @@ class DetectorBase(ABC):
 
     @abstractmethod
     def get_detector_name(self) -> str:
+        # [FUNCTION DOC] Abstract. Returns the string name of the detector.
         r"""Returns the name of the current detector"""
 
     @abstractmethod
     def get_qconfig_info(self, model) -> dict[str, DetectorQConfigInfo]:
+        # [FUNCTION DOC] Abstract. Returns a mapping from module fqn to the DetectorQConfigInfo that can be used to generate a qconfig for that module.
         r"""Returns the DetectorQConfigInfo for each module_fqn relevant
         Args
             model (nn.Module or subclass): model to find observer insertion points
@@ -169,6 +188,8 @@ class DetectorBase(ABC):
     def _get_targeting_node(
         self, prepared_fx_model: GraphModule, target_fqn: str
     ) -> torch.fx.node.Node:
+        # [FUNCTION DOC] HELPER: Finds the graph node whose target equals target_fqn in the prepared model graph. If not found, strips the last dotted component of the fqn and searches again (handles fused modules),
+        # repeating up to the top level. Raises a value error when no dot remains and nothing was found. Returns the Node.
         r"""
         Takes in a GraphModule and the target_fqn and finds the node whose target is this fqn.
 
@@ -207,6 +228,7 @@ class DetectorBase(ABC):
 
     @abstractmethod
     def generate_detector_report(self, model) -> tuple[str, dict[str, Any]]:
+        # [FUNCTION DOC] Abstract. Returns a tuple of a string report with suggested improvements and a dictionary of data collected for the report.
         r"""
         Args
             model (nn.Module or subclass): model to find observer insertion points
@@ -218,6 +240,9 @@ class DetectorBase(ABC):
 
 
 class PerChannelDetector(DetectorBase):
+    # [CLASS DOC] Detects Linear and Conv modules (including QAT versions) for which per channel weight quantization is supported by the chosen backend, and whether the qconfig already uses it.
+    # State: backend_chosen and supported_modules (set of module types for that backend). Class constants hold the report dictionary keys and the supported module table for fbgemm, qnnpack, onednn and x86.
+    # Inserts no observers; it only inspects module qconfigs.
     r"""This class is used to detect if any Linear or Conv layers in a model utilize per_channel quantization.
     Only Linear and Conv layers can use per_channel as of now so only these two are currently checked.
 
@@ -279,6 +304,9 @@ class PerChannelDetector(DetectorBase):
     }
 
     def __init__(self, backend: str = torch.backends.quantized.engine):
+        # [FUNCTION DOC] Stores the backend (default is the current quantized engine at definition time) and looks up its supported module types.
+        # Raises a value error if the backend has no entry in the supported modules table.
+        # KNOWN ISSUE: the default backend is evaluated once at import time, not when the detector is created.
         super().__init__()
 
         # store the backend information
@@ -294,10 +322,12 @@ class PerChannelDetector(DetectorBase):
             )
 
     def get_detector_name(self) -> str:
+        # [FUNCTION DOC] Returns the name per_channel_detector.
         r"""returns the string name of this detector"""
         return "per_channel_detector"
 
     def get_qconfig_info(self, model) -> dict[str, DetectorQConfigInfo]:
+        # [FUNCTION DOC] Runs the per channel helper and returns a mapping from fqn to a DetectorQConfigInfo whose is_weight_per_channel flag is set to whether per channel is supported for that module.
         r"""Returns the DetectorQConfigInfo for each module_fqn relevant
         Args
             model (nn.Module or subclass): model to find observer insertion points
@@ -325,6 +355,7 @@ class PerChannelDetector(DetectorBase):
         return module_fqn_to_detector_qconfig_info
 
     def determine_observer_insert_points(self, model: nn.Module) -> dict:
+        # [FUNCTION DOC] Returns an empty dictionary since this detector inserts no observers.
         r"""
         There is no observers inserted for the PerChannelDetector.
 
@@ -333,6 +364,10 @@ class PerChannelDetector(DetectorBase):
         return {}
 
     def _detect_per_channel_helper(self, model: nn.Module):
+        # [FUNCTION DOC] HELPER: Walks all named modules; for modules of a supported type reads the weight observer or fake quant created from the module qconfig and decides whether it is per channel
+        # (has a channel axis and, for fake quant, is_per_channel is set; any observer with a channel axis counts). Returns a mapping from fqn to a dictionary with supported, used and backend entries.
+        # Raises an error if a supported module has no QConfig instance or its weight factory does not produce a FakeQuantize or ObserverBase.
+        # KNOWN ISSUE: a supported module without a qconfig attribute raises an attribute error.
         r"""
         determines if per_channel quantization is supported in modules and submodules.
 
@@ -399,6 +434,8 @@ class PerChannelDetector(DetectorBase):
         return per_channel_info
 
     def generate_detector_report(self, model: nn.Module) -> tuple[str, dict[str, Any]]:
+        # [FUNCTION DOC] Builds the report: lists each module for which per channel is supported but not used, followed by instructions to use a per channel weight observer, or a message that nothing more can be done.
+        # Returns a tuple of the report string and the per module info dictionary. Raises what the helper raises.
         r"""Checks if any Linear or Conv layers in the model utilize per_channel quantization.
         Only Linear and Conv layers can use per_channel as of now so only these two are currently checked.
 
@@ -445,6 +482,9 @@ class PerChannelDetector(DetectorBase):
 
 
 class DynamicStaticDetector(DetectorBase):
+    # [CLASS DOC] Decides, for supported modules (Linear now, convs planned), whether dynamic or static quantization is better, using the ModelReportObserver ratio of average batch range to epoch range
+    # (statistic S) before and after the module compared to a tolerance (default 0.5). S above the tolerance is stationary, otherwise non-stationary; non-stationary output suggests dynamic quantization.
+    # State: tolerance and useful_observer_fqns (set, currently unused). Class constants name the observers and the result dictionary keys.
     r"""
     Determines whether dynamic or static quantization is more appropriate for a given module.
 
@@ -494,6 +534,7 @@ class DynamicStaticDetector(DetectorBase):
     DEFAULT_DYNAMIC_STATIC_FUTURE_SUPPORTED = {nn.Conv1d, nn.Conv2d, nn.Conv3d}
 
     def __init__(self, tolerance=0.5):
+        # [FUNCTION DOC] Stores the tolerance and creates an empty set of useful observer fqns.
         super().__init__()
 
         # set tolerance level and initialize a set to keep track of useful fqn locations
@@ -503,6 +544,8 @@ class DynamicStaticDetector(DetectorBase):
     def determine_observer_insert_points(
         self, prepared_fx_model: GraphModule
     ) -> dict[str, dict[str, Any]]:
+        # [FUNCTION DOC] For every supported module in the prepared model, creates a pre-observer entry (observing the node args) and a post-observer entry (observing the node output), each with a new ModelReportObserver.
+        # Returns a mapping from observer fqn to a dictionary with target node, observer, post flag and observer args. Nodes are located via _get_targeting_node, which can raise a value error.
         r"""
         Determines where observers need to be inserted for the Dynamic vs Static detector.
         For this detector, we want to place observers on either side of linear layers in the model.
@@ -555,10 +598,12 @@ class DynamicStaticDetector(DetectorBase):
         return obs_fqn_to_info
 
     def get_detector_name(self) -> str:
+        # [FUNCTION DOC] Returns the name dynamic_vs_static_detector.
         r"""returns the string name of this detector"""
         return "dynamic_vs_static_detector"
 
     def get_qconfig_info(self, model) -> dict[str, DetectorQConfigInfo]:
+        # [FUNCTION DOC] Generates the dynamic or static info and returns a mapping from fqn to a DetectorQConfigInfo with is_activation_dynamic set to the dynamic recommendation.
         r"""Returns the DetectorQConfigInfo for each module_fqn relevant
         Args
             model (nn.Module or subclass): model to find observer insertion points
@@ -586,6 +631,7 @@ class DynamicStaticDetector(DetectorBase):
         return module_fqn_to_detector_qconfig_info
 
     def _is_supported(self, module: nn.Module, insert: bool = False) -> bool:
+        # [FUNCTION DOC] HELPER: Returns whether the module is of a currently or future supported type (Linear or Conv). When insert is False, it additionally requires both the pre and post report observers to be attached to the module.
         r"""Returns whether the given module is supported for observers
 
         Args
@@ -618,6 +664,8 @@ class DynamicStaticDetector(DetectorBase):
             return supported and has_obs
 
     def _generate_dict_info(self, model: GraphModule) -> dict[str, Any]:
+        # [FUNCTION DOC] HELPER: For each supported module with observers attached, reads the batch-to-epoch ratio of the pre and post observers and builds a dictionary with tolerance, dynamic recommendation
+        # (post statistic at or below tolerance), both statistics, both stationary/non-stationary labels, and whether the module type is currently supported. Returns a mapping from fqn to this dictionary.
         r"""
         Helper function for generate_detector_report that does the generation of the dictionary.
         This process is done as specified in generate_detector_report documentation
@@ -693,6 +741,9 @@ class DynamicStaticDetector(DetectorBase):
     def generate_detector_report(
         self, model: GraphModule
     ) -> tuple[str, dict[str, Any]]:
+        # [FUNCTION DOC] Generates the info dictionary and a text report with a suggestion (dynamic or static) and reasoning per module, adding the future-support note for unsupported dynamic modules
+        # and a recommendation to add a dynamic per tensor quantize layer when the input is non-stationary but the output is stationary. If no module qualifies, notes that no applicable layers exist.
+        # Returns a tuple of the report string and the info dictionary.
         r"""
         Determines whether dynamic or static quantization is more appropriate for a given module.
 
@@ -814,6 +865,10 @@ class DynamicStaticDetector(DetectorBase):
 
 
 class InputWeightEqualizationDetector(DetectorBase):
+    # [CLASS DOC] Determines whether input-weight equalization would help Linear and Conv modules (and QAT versions). For each channel it computes s_c = sqrt(weight range ratio) / sqrt(input range ratio)
+    # and recommends equalization for the channel when s_c lies between ratio_threshold and its inverse. State: ratio_threshold (strictly between 0 and 1), ch_axis (default 1).
+    # Inserts one ModelReportObserver before each supported module; class constants define prefixes, keys and the 0.4 default fraction of channels needed to recommend equalization.
+    # KNOWN ISSUE: the docstring says recommendation happens when s_c is at or beyond the threshold, but the code recommends when s_c is within the interval from the threshold to its inverse.
     r"""
     Determines whether input-weight equalization can help improve quantization for certain modules.
 
@@ -883,6 +938,8 @@ class InputWeightEqualizationDetector(DetectorBase):
     DEFAULT_RECOMMEND_INPUT_WEIGHT_CHANNEL_RATIO = 0.4
 
     def __init__(self, ratio_threshold: float, ch_axis: int = 1):
+        # [FUNCTION DOC] Validates that ratio_threshold is strictly between 0 and 1 (raises a value error otherwise) and stores ratio_threshold and ch_axis.
+        # KNOWN ISSUE: does not call the base class initializer, so detector_config_info is never set.
         # ensure passed in inputs are valid
         if ratio_threshold <= 0 or ratio_threshold >= 1:
             raise ValueError("Make sure threshold is > 0 and < 1")
@@ -892,6 +949,7 @@ class InputWeightEqualizationDetector(DetectorBase):
         self.ch_axis: int = ch_axis
 
     def _is_supported(self, module: nn.Module, insert: bool = False) -> bool:
+        # [FUNCTION DOC] HELPER: Returns whether the module type is exactly one of the supported types. When insert is False, it also requires the pre-observer attribute to be present.
         r"""Returns whether the given module is supported for observers
 
         Args
@@ -912,6 +970,8 @@ class InputWeightEqualizationDetector(DetectorBase):
             return is_supported_type and has_obs
 
     def get_qconfig_info(self, model) -> dict[str, DetectorQConfigInfo]:
+        # [FUNCTION DOC] Computes input and weight range info, comparison statistics and the info dictionary, then returns a mapping from fqn to a DetectorQConfigInfo whose is_equalization_recommended is set.
+        # KNOWN ISSUE: the stored value is the per channel list of recommendations from the dictionary, not a single boolean, despite the bool annotation.
         r"""Returns the DetectorQConfigInfo for each module_fqn relevant
         Args
             model (nn.Module or subclass): model to find observer insertion points
@@ -955,6 +1015,7 @@ class InputWeightEqualizationDetector(DetectorBase):
     def determine_observer_insert_points(
         self, prepared_fx_model: GraphModule
     ) -> dict[str, dict[str, Any]]:
+        # [FUNCTION DOC] For each supported module, creates a pre-observer entry using a ModelReportObserver with the detector channel axis, observing the target node args. Returns a mapping from observer fqn to the insert info dictionary.
         r"""Determines where observers need to be inserted for the Input Weight Equalization Detector.
         For this detector, we want to place observers in front of supported layers.
 
@@ -997,10 +1058,12 @@ class InputWeightEqualizationDetector(DetectorBase):
         return obs_fqn_to_info
 
     def get_detector_name(self) -> str:
+        # [FUNCTION DOC] Returns the name input_weight_equalization_detector.
         r"""Returns the name of this detector"""
         return "input_weight_equalization_detector"
 
     def _extract_input_info(self, model: GraphModule) -> dict[str, dict]:
+        # [FUNCTION DOC] HELPER: For each supported module with a pre-observer, reads per channel max/min tracked by the observer and computes global max/min. Returns a mapping from fqn to a dictionary keyed with the input activation prefix.
         r"""
         Takes in a calibrated GraphModule and then finds the relevant observers.
         It then extracts the input information for each observer returns it
@@ -1034,6 +1097,8 @@ class InputWeightEqualizationDetector(DetectorBase):
         return input_info
 
     def _extract_weight_info(self, model: GraphModule) -> dict[str, dict]:
+        # [FUNCTION DOC] HELPER: For each supported module with a pre-observer, computes per channel min/max of the weight along ch_axis (permuting that axis to the front and flattening the rest) and the global max/min.
+        # Returns a mapping from fqn to a dictionary keyed with the weight prefix.
         r"""
         Takes in a calibrated GraphModule and then finds the relevant observers.
         It then extracts the weight information for each layer an observer is attached to.
@@ -1089,6 +1154,8 @@ class InputWeightEqualizationDetector(DetectorBase):
     def _calculate_range_ratio(
         self, info_dict: dict, info_str: str, module_fqn: str
     ) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Computes per channel range divided by global range for either the input or weight info (chosen by info_str). Returns a tensor of ratios per channel.
+        # Raises a value error if the global range is zero (constant value channel).
         r"""
         Takes in an info dict and calculates the s_c matrix.
 
@@ -1129,6 +1196,8 @@ class InputWeightEqualizationDetector(DetectorBase):
     def _generate_comparison_values(
         self, input_info: dict, weight_info: dict
     ) -> dict[str, torch.Tensor]:
+        # [FUNCTION DOC] HELPER: For each module in the input info, computes s_c per channel from the weight and input range ratios, repeating the weight ratios when the input has a multiple of the weight channel count (grouping).
+        # Returns a mapping from fqn to a one dimensional tensor. Raises a key error if the weight info lacks the module, and an assertion error if input channels are not divisible by weight channels.
         r"""
         Takes in the information on the min and max values of the inputs and weights and:
             Calculates the comp stat for each channel: s_c = sqrt(w_c/W)/sqrt(i_c/I)
@@ -1184,6 +1253,8 @@ class InputWeightEqualizationDetector(DetectorBase):
     def _generate_dict_info(
         self, input_info: dict, weight_info: dict, comp_stats: dict
     ) -> dict[str, dict]:
+        # [FUNCTION DOC] HELPER: Builds the per module result dictionary: per channel recommendation list, comparison metric tensor, threshold, channel axis, plus the merged input and weight info dictionaries.
+        # Returns a mapping from fqn to this dictionary.
         r"""
         Helper function for generate_detector_report that does the generation of the dictionary.
         This process is done as specified in generate_detector_report documentation
@@ -1241,6 +1312,8 @@ class InputWeightEqualizationDetector(DetectorBase):
     def generate_detector_report(
         self, model: GraphModule
     ) -> tuple[str, dict[str, Any]]:
+        # [FUNCTION DOC] Computes the input and weight info, comparison stats and info dictionary, and writes a text report per module saying whether to use equalization, based on whether the fraction of channels recommended reaches 0.4.
+        # Returns a tuple of the report string and the info dictionary. Raises errors from the helpers (zero range, missing weight info).
         r"""
         Determines whether input weight equalization is appropriate for a given module.
 
@@ -1346,6 +1419,9 @@ class InputWeightEqualizationDetector(DetectorBase):
 
 
 class OutlierDetector(DetectorBase):
+    # [CLASS DOC] Detects outliers in activation data before leaf modules using the ModelReportObserver percentile ratio p_r (100th percentile over a reference percentile, averaged across batches) per channel.
+    # A channel is an outlier if p_r exceeds ratio_threshold (default 3.5); results are also flagged as sufficient if the share of batches used is at least fraction_batches_used_threshold (default 0.95).
+    # State: ratio_threshold, reference_percentile (0.975), fraction_batches_used_threshold, ch_axis. It also reports channels having constant value batches. Inserts a pre-observer before every leaf module.
     r"""
     Determines whether there are significant outliers in activation data around a certain layer.
 
@@ -1419,6 +1495,8 @@ class OutlierDetector(DetectorBase):
         fraction_batches_used_threshold: float = 0.95,
         ch_axis: int = 1,
     ):
+        # [FUNCTION DOC] Stores the thresholds and axis. Raises an assertion error if reference_percentile or fraction_batches_used_threshold is not within 0 and 1.
+        # KNOWN ISSUE: ratio_threshold is not validated although documented as at least 1, and the base initializer is not called.
         # initialize the variables of interest
         self.ratio_threshold = ratio_threshold
 
@@ -1437,10 +1515,12 @@ class OutlierDetector(DetectorBase):
         self.ch_axis = ch_axis
 
     def get_detector_name(self) -> str:
+        # [FUNCTION DOC] Returns the name outlier_detector.
         r"""Returns the name of this detector"""
         return "outlier_detector"
 
     def _supports_insertion(self, module: nn.Module) -> bool:
+        # [FUNCTION DOC] HELPER: Returns whether the module can have an observer inserted: it has no child modules and is not an activation post process (observer) itself.
         r"""Returns whether the given module is supported for observers insertion
 
         Any module that doesn't have children and isn't an observer itself is supported
@@ -1456,6 +1536,7 @@ class OutlierDetector(DetectorBase):
         return num_children == 0 and not _is_activation_post_process(module)
 
     def get_qconfig_info(self, model) -> dict[str, DetectorQConfigInfo]:
+        # [FUNCTION DOC] Returns an empty dictionary; this detector does not currently suggest qconfig changes.
         r"""Returns the DetectorQConfigInfo for each module_fqn relevant
         Args
             model (nn.Module or subclass): model to find observer insertion points
@@ -1467,6 +1548,7 @@ class OutlierDetector(DetectorBase):
         return {}
 
     def _supports_report_gen(self, module: nn.Module) -> bool:
+        # [FUNCTION DOC] HELPER: Returns whether the module has the model report pre-observer attribute.
         r"""Returns whether the given module is supported for report generation
 
         Any module that has a model report pre-observer is supported
@@ -1481,6 +1563,8 @@ class OutlierDetector(DetectorBase):
     def determine_observer_insert_points(
         self, prepared_fx_model: GraphModule
     ) -> dict[str, dict[str, Any]]:
+        # [FUNCTION DOC] For each leaf module of the prepared model, creates a pre-observer entry with a ModelReportObserver configured with the channel axis and reference percentile as comp percentile.
+        # Returns a mapping from observer fqn to the insert info dictionary.
         r"""Determines where observers need to be inserted for the Outlier Detector.
 
         For this detector, we want to place observers in front of supported layers.
@@ -1529,6 +1613,8 @@ class OutlierDetector(DetectorBase):
         counted_batches: torch.Tensor,
         total_batches: int,
     ) -> dict[str, list[bool]]:
+        # [FUNCTION DOC] HELPER: From average percentile ratios, counted batches per channel and total batch count, returns a dictionary with a list of outlier flags (ratio above threshold) and a list of sufficiency flags
+        # (counted batches over total batches at least the fraction threshold).
         r"""
         Gives info on whether the percentile ratios calculated would be considered outliers
         Also gives information on whether the collected data is statistically significant to make this claim
@@ -1567,6 +1653,9 @@ class OutlierDetector(DetectorBase):
         return outlier_dict
 
     def _generate_info_dict(self, model: GraphModule) -> dict[str, dict]:
+        # [FUNCTION DOC] HELPER: For each module with a pre-observer, collects observer data (percentile ratios, batches tracked, constant channel counts, max values) and returns a mapping from fqn to a dictionary with the outlier results.
+        # Side effect: negative ratios are made positive and ratios below 1 are inverted in place in the observer average_percentile_ratio tensor.
+        # KNOWN ISSUE: ratio_val is a view captured before modification, so a negative ratio is negated and then the flip check still uses the old negative value, and the inversion uses the old value (a negative ratio ends up as the inverse of the negative value).
         r"""
         Helper function for generate_detector_report that does the generation of the dictionary.
         This process is done as specified in generate_detector_report documentation
@@ -1643,6 +1732,9 @@ class OutlierDetector(DetectorBase):
     def generate_detector_report(
         self, model: GraphModule
     ) -> tuple[str, dict[str, Any]]:
+        # [FUNCTION DOC] Builds the info dictionary and a text report listing, per module and channel, outliers with their max values and channels having constant value batches, followed by a note recommending stationary data checks,
+        # or a message that no outliers were found. Returns a tuple of the report string and the info dictionary.
+        # KNOWN ISSUE: the docstring says it determines input weight equalization, which is a copy-paste error.
         r"""
         Determines whether input weight equalization is appropriate for a given module.
 
