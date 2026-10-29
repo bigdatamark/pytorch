@@ -1,4 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
+# [MODULE DOC] DTensor sharding strategies for random sampling ops. Registers a
+# single-dim strategy for the in-place/elementwise random ops (normal_, uniform_,
+# native_dropout, bernoulli, log_normal_, exponential_, geometric_) where the output
+# follows the input sharding, and one for multinomial where only batch dims shard.
+# Import-time side effect: registers these strategies with the single-dim registry.
 import torch
 from torch._ops import OpOverload
 from torch.distributed.tensor._dtensor_spec import TensorMeta
@@ -18,6 +23,11 @@ def _random_inplace_single_dim_strategy(
     args_schema: ArgsType,
     kwargs_schema: KwargsType,
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] HELPER: Builds sharding rules for random ops with one tensor input whose
+    # outputs follow the input. Reads the first argument's TensorMeta (raises AssertionError
+    # if it is not one). For each input dim, emits one rule sharding that dim on the input and
+    # on every tensor output (count taken from the op schema returns). No Partial or
+    # replicate rules are produced. Returns the list of rules.
     """Single-dim strategy for in-place random ops (single tensor input, output follows input).
 
     No Partial inputs: random sampling on partial tensors is undefined.
@@ -59,6 +69,10 @@ def multinomial_single_dim_strategy(
     args_schema: ArgsType,
     kwargs_schema: KwargsType,
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Single-dim strategy for multinomial. Takes the first argument's TensorMeta
+    # (raises AssertionError otherwise). For every dim except the last (categories), emits a
+    # rule sharding that dim on both output and input; the last dim cannot be sharded because
+    # it maps to the num_samples dim. Returns the list of rules.
     """Single-dim strategy for multinomial.
 
     multinomial(self, num_samples, ...) -> Tensor

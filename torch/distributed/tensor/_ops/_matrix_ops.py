@@ -1,5 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # implement matrix related ops for distributed tensor
+# [MODULE DOC] DTensor sharding strategies for matrix-style ops: transpose (t), einsum-based
+# strategy generation for dot/mm/addmm/bmm/baddbmm/_scaled_mm, scaled dot product attention
+# (flash, efficient, cudnn; forward and backward), constant_pad_nd and grouped_mm.
+# Import-time side effect: registers all these single-dim strategies with the registry.
 
 
 import copy
@@ -41,6 +45,10 @@ aten = torch.ops.aten
 def transpose_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Strategy for aten.t. Input must be a TensorMeta (AssertionError otherwise). For
+    # ndim <= 1 shards dim d on input and output; for 2D emits shard dim 1 -> 0 and 0 -> 1
+    # (output dim, input dim swapped). Also emits Partial rules for sum, avg, max, min that pass
+    # through unchanged. Returns the rule list.
     input_meta = args_schema[0]
     if not isinstance(input_meta, TensorMeta):
         raise AssertionError(f"Expected TensorMeta, got {type(input_meta)}")
@@ -64,6 +72,10 @@ def _scaled_mm_scale_placement(
     scale_shape: torch.Size,
     contracting_dim: int,
 ) -> Placement | _ShardingPlaceholder | None:
+    # [FUNCTION DOC] HELPER: Derives the placement of a _scaled_mm scale operand from its data
+    # operand placement. Single-element scale: Replicate. Scale with ndim other than 1: same as
+    # data placement. 1D blockwise scale: a shard on the contracting dim yields None (invalid);
+    # a shard on another dim maps to shard of dim 0; Replicate or Partial map to Replicate.
     """
     Derive scale placement from data operand placement for _scaled_mm.
 
@@ -105,6 +117,15 @@ def gen_single_dim_einsum_strategies(
     *,
     bias_shape: torch.Size | None = None,
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Generates single-mesh-dim sharding rules for a two-input einsum equation
+    # (parsed into batch, contracting, lhs-only and rhs-only dims). Rules, each as output
+    # then inputs: shard a batch dim everywhere; shard a contracting dim on both inputs giving
+    # Partial output; shard an lhs-free or rhs-free dim on that input and output with the
+    # other input Replicate; per-input linearity (one input Partial for each linear reduce op,
+    # other Replicate); and, if there are no contracting or free dims, all-Partial rules.
+    # If bias_shape is given, a bias placement (derived from the output placement with
+    # broadcast handling: padded or size-1 bias dims become Replicate) is inserted after the
+    # output. Returns the list of rules.
     """
     Generate a strategy list for the ops that follow einsum style notation.
 
@@ -164,6 +185,9 @@ def gen_single_dim_einsum_strategies(
     def _derive_bias_placement(
         output_placement: Placement | _ShardingPlaceholder,
     ) -> Placement | _ShardingPlaceholder:
+        # [FUNCTION DOC] HELPER: Maps an output placement to the bias placement: a shard on an output
+        # dim becomes a shard of the matching bias dim, or Replicate if that dim is broadcast;
+        # other placements are copied. Copies the placement when there is no bias.
         """Derive bias placement from output placement, accounting for broadcast."""
         if broadcast_dims_map is None:
             return copy.copy(output_placement)
@@ -182,6 +206,8 @@ def gen_single_dim_einsum_strategies(
     def _maybe_add_bias(
         placement_list: list[Placement | _ShardingPlaceholder],
     ) -> list[Placement | _ShardingPlaceholder]:
+        # [FUNCTION DOC] HELPER: Returns the rule unchanged without bias; otherwise inserts the
+        # derived bias placement right after the output placement.
         """Insert bias placement after output if bias_shape is provided."""
         if bias_shape is None:
             return placement_list
@@ -270,6 +296,7 @@ def gen_single_dim_einsum_strategies(
 def dot_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Strategy for aten.dot: einsum rules for the equation "i,i->".
     return gen_single_dim_einsum_strategies("i,i->")
 
 
@@ -277,6 +304,7 @@ def dot_single_dim_strategy(
 def mm_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Strategy for aten.mm: einsum rules for "mk,kn->mn".
     return gen_single_dim_einsum_strategies("mk,kn->mn")
 
 
@@ -284,6 +312,8 @@ def mm_single_dim_strategy(
 def addmm_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Strategy for aten.addmm: einsum rules for "mk,kn->mn" with a bias placement
+    # derived from the bias (first arg) shape. Raises AssertionError if the first arg is not a TensorMeta.
     bias_meta = args_schema[0]
     if not isinstance(bias_meta, TensorMeta):
         raise AssertionError
@@ -294,6 +324,7 @@ def addmm_single_dim_strategy(
 def bmm_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Strategy for aten.bmm: einsum rules for "bmk,bkn->bmn".
     return gen_single_dim_einsum_strategies("bmk,bkn->bmn")
 
 
@@ -301,6 +332,8 @@ def bmm_single_dim_strategy(
 def baddbmm_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Strategy for aten.baddbmm: einsum rules for "bmk,bkn->bmn" with a bias placement
+    # derived from the bias (first arg) shape. Raises AssertionError if the first arg is not a TensorMeta.
     bias_meta = args_schema[0]
     if not isinstance(bias_meta, TensorMeta):
         raise AssertionError
@@ -311,6 +344,11 @@ def baddbmm_single_dim_strategy(
 def scaled_mm_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Strategy for aten._scaled_mm. Takes the two scale arg metas (must be TensorMeta;
+    # bias and scale_result must be None, else AssertionError). Starts from the mm einsum rules and
+    # appends a placement for each scale derived from its data operand placement; rules where a
+    # scale placement cannot be derived (contracting-dim shard of a 1D blockwise scale) are dropped.
+    # Returns the filtered rule list.
     scale_self_meta = args_schema[2]
     scale_mat2_meta = args_schema[3]
     if not isinstance(scale_self_meta, TensorMeta):
@@ -342,6 +380,13 @@ def scaled_mm_single_dim_strategy(
 def _scaled_dot_product_flash_attention_base_strategies(
     op_schema: OpSchema,
 ) -> list[PlacementList]:
+    # [FUNCTION DOC] HELPER: Builds the base (non context-parallel) per-mesh-dim placement lists for
+    # flash attention forward over the op strategy inputs. Each list covers 12 slots:
+    # outputs (output, logsumexp, cum_seq_q, cum_seq_k, max_q, max_k, rng_state, unused,
+    # debug mask) then q, k, v; unused slots are None. Returns three lists: full
+    # replication, shard on heads dim 1, shard on batch dim 0 (debug mask sharded the same
+    # way only when return_debug_mask is set, else Replicate). Raises AssertionError if
+    # the query arg is not an OpStrategy.
     """Helper that returns list of base placement strategies (without CP)."""
     return_debug_mask = len(op_schema.args_schema) >= 6 and op_schema.args_schema[5]
     q_input_strategy = op_schema.args_schema[0]
@@ -424,6 +469,11 @@ def _scaled_dot_product_flash_attention_base_strategies(
 def scaled_dot_product_flash_attention_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder | None]]:
+    # [FUNCTION DOC] Single-dim strategy for flash attention forward. Requires a TensorMeta query
+    # (AssertionError otherwise). Returns two rules over the 12 output/input slots: shard
+    # heads dim 1 and shard batch dim 0 on output, logsumexp, q, k, v; rng_state is
+    # Replicate, other slots None; the debug mask follows the shard only when
+    # return_debug_mask (arg 5) is true, else Replicate.
     q_meta = args_schema[0]
     if not isinstance(q_meta, TensorMeta):
         raise AssertionError(f"Expected TensorMeta, got {type(q_meta)}")
@@ -471,6 +521,12 @@ def scaled_dot_product_flash_attention_single_dim_strategy(
 def _scaled_dot_product_flash_attention_backward_base_strategies(
     op_schema: OpSchema,
 ) -> list[PlacementList]:
+    # [FUNCTION DOC] HELPER: Builds base (non context-parallel) placement lists for flash attention
+    # backward from the op strategy args. Counts tensor inputs; returns three lists: all
+    # Replicate (3 outputs plus all inputs), shard heads dim 1, and shard batch dim 0 over
+    # grads, grad_out, q, k, v, output, logsumexp, with Replicate for the remaining tensor
+    # inputs (cum_seq and philox values). Raises AssertionError if q (arg 1) is not an
+    # OpStrategy.
     """Helper that returns list of base placement strategies (without CP)."""
     q_input_strategy = op_schema.args_schema[1]
     if not isinstance(q_input_strategy, OpStrategy):
@@ -543,6 +599,10 @@ def _scaled_dot_product_flash_attention_backward_base_strategies(
 def scaled_dot_product_flash_attention_backward_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Single-dim strategy for flash attention backward. Counts TensorMeta args; raises
+    # AssertionError if fewer than 6. Returns two rules (shard dim 1 over heads, shard dim
+    # 0 over batch) covering grad_q/k/v, grad_out, q, k, v, output, logsumexp, with
+    # Replicate for the remaining tensor inputs.
     num_tensor_inputs = sum(isinstance(arg, TensorMeta) for arg in args_schema)
     if num_tensor_inputs < 6:
         raise AssertionError(
@@ -584,6 +644,13 @@ def scaled_dot_product_flash_attention_backward_single_dim_strategy(
 def constant_pad_nd_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Strategy for constant_pad_nd. Requires TensorMeta input and a list or tuple pad
+    # (AssertionError otherwise). Pad entries come in left/right pairs from the last dim
+    # backwards; dims with any possibly non-zero padding cannot be sharded. Emits shard
+    # rules for every non-padded dim (output and input same dim). Adds Partial rules for
+    # avg, max, min (idempotent for a constant fill), and also sum when there is no
+    # padding or the fill value is zero. Symbolic sizes are treated conservatively via
+    # guard_or_false.
     # Allow sharding on non-padded dimensions; ban sharding on dims
     # that have non-zero padding (where the pad value must be inserted).
     input_meta = args_schema[0]
@@ -629,6 +696,11 @@ def constant_pad_nd_single_dim_strategy(
 def _scaled_dot_product_efficient_attention_base_strategies(
     op_schema: OpSchema,
 ) -> list[PlacementList]:
+    # [FUNCTION DOC] HELPER: Builds base (non context-parallel) placement lists for efficient attention
+    # forward. Slots: output, logsumexp, philox_seed, philox_offset (None), q, k, v, plus
+    # attn_bias if present. Returns lists for full replication, shard heads dim 1 and
+    # shard batch dim 0; logsumexp is sharded only if compute_log_sumexp is true, else
+    # Replicate. Raises AssertionError if q is not an OpStrategy.
     """Helper that returns list of base placement strategies (without CP)."""
     q_input_strategy = op_schema.args_schema[0]
     if not isinstance(q_input_strategy, OpStrategy):
@@ -710,6 +782,10 @@ def _scaled_dot_product_efficient_attention_base_strategies(
 def scaled_dot_product_efficient_attention_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder | None]]:
+    # [FUNCTION DOC] Single-dim strategy for efficient attention forward. Requires TensorMeta q
+    # (AssertionError otherwise). Returns two rules, shard heads dim 1 and shard batch dim
+    # 0, over output, logsumexp (sharded only if compute_log_sumexp is set, else
+    # Replicate), None for philox slots, q, k, v and attn_bias when present.
     q_meta = args_schema[0]
     if not isinstance(q_meta, TensorMeta):
         raise AssertionError(f"Expected TensorMeta, got {type(q_meta)}")
@@ -754,6 +830,11 @@ def scaled_dot_product_efficient_attention_single_dim_strategy(
 def _scaled_dot_product_efficient_attention_backward_base_strategies(
     op_schema: OpSchema,
 ) -> list[PlacementList]:
+    # [FUNCTION DOC] HELPER: Builds base (non context-parallel) placement lists for efficient attention
+    # backward. Output slots are grad_q, grad_k, grad_v, grad_bias (None unless attn_bias
+    # is present), then inputs grad_out, q, k, v, optional attn_bias, output, logsumexp,
+    # and two Replicate philox slots. Returns lists for full replication, shard heads dim
+    # 1 and shard batch dim 0. Raises AssertionError if q is not an OpStrategy.
     """Helper that returns list of base placement strategies (without CP)."""
     q_input_strategy = op_schema.args_schema[1]
     if not isinstance(q_input_strategy, OpStrategy):
@@ -835,6 +916,10 @@ def _scaled_dot_product_efficient_attention_backward_base_strategies(
 def scaled_dot_product_efficient_attention_backward_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder | None]]:
+    # [FUNCTION DOC] Single-dim strategy for efficient attention backward. Has_attn_bias is derived from
+    # arg 4 being non-None. Returns two rules (shard heads dim 1, shard batch dim 0) over
+    # grad_q/k/v, grad_bias (None if no bias), grad_out, q, k, v, optional attn_bias,
+    # output, logsumexp, and Replicate for the two philox values.
     has_attn_bias = args_schema[4] is not None
 
     num_heads_dim_sharding: list[Placement | _ShardingPlaceholder | None] = [
@@ -885,6 +970,14 @@ def scaled_dot_product_efficient_attention_backward_single_dim_strategy(
 def _scaled_dot_product_cudnn_attention_base_strategies(
     op_schema: OpSchema,
 ) -> list[PlacementList]:
+    # [FUNCTION DOC] HELPER: Builds base (non context-parallel) placement lists for cudnn attention
+    # forward from the op strategy args (query, key, value, attn_bias, compute_log_sumexp,
+    # then optional dropout_p, is_causal, return_debug_mask, scale). Returns lists for
+    # full replication, shard heads dim 1 and shard batch dim 0 over 12 slots (output,
+    # logsumexp, cum_seq and max slots None, philox slots None, debug mask, q, k, v) plus
+    # attn_bias when present. Logsumexp is sharded only if compute_log_sumexp is set, else
+    # Replicate; the debug mask is Replicate (replicated case) or None/sharded depending
+    # on return_debug_mask. Raises AssertionError if query is not an OpStrategy.
     """Helper that returns list of base placement strategies (without CP)."""
     (
         query_strategy,  # query
@@ -983,6 +1076,11 @@ def _scaled_dot_product_cudnn_attention_base_strategies(
 def scaled_dot_product_cudnn_attention_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder | None]]:
+    # [FUNCTION DOC] Single-dim strategy for cudnn attention forward. Requires TensorMeta query
+    # (AssertionError otherwise). Returns two rules, shard heads dim 1 and shard batch dim
+    # 0, over output, logsumexp (sharded only if compute_log_sumexp, else Replicate), None
+    # for cum_seq/max/philox slots, debug mask (sharded only when return_debug_mask, else
+    # None), q, k, v, and attn_bias when present.
     query_meta = args_schema[0]
     if not isinstance(query_meta, TensorMeta):
         raise AssertionError(f"Expected TensorMeta, got {type(query_meta)}")
@@ -1044,6 +1142,14 @@ def scaled_dot_product_cudnn_attention_single_dim_strategy(
 def _scaled_dot_product_cudnn_attention_backward_base_strategies(
     op_schema: OpSchema,
 ) -> list[PlacementList]:
+    # [FUNCTION DOC] HELPER: Builds base (non context-parallel) placement lists for cudnn attention
+    # backward. Raises AssertionError if fewer than 15 args or if q (arg 1) is not an
+    # OpStrategy. Outputs are dq, dk, dv; inputs are grad_out, q, k, v, output, logsumexp,
+    # two Replicate philox slots, attn_bias (sharded if present else None) and None for
+    # cum_seq/max/dropout/causal slots. Returns lists for full replication, shard heads
+    # dim 1 and shard batch dim 0.
+    # KNOWN ISSUE: has_scale is computed as a condition anded with a constant false, so it
+    # is always false and the optional scale slot is never added.
     """Helper that returns list of base placement strategies (without CP)."""
     if len(op_schema.args_schema) < 15:
         raise AssertionError(
@@ -1147,6 +1253,12 @@ def _scaled_dot_product_cudnn_attention_backward_base_strategies(
 def scaled_dot_product_cudnn_attention_backward_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder | None]]:
+    # [FUNCTION DOC] Single-dim strategy for cudnn attention backward. Raises AssertionError if fewer
+    # than 15 args, if the first six are not TensorMeta, or if philox, attn_bias, or
+    # cum_seq args have unexpected types. Philox args that are TensorMeta get Replicate;
+    # cum_seq args that are TensorMeta get None; attn_bias gets a shard when it is a
+    # TensorMeta. Returns two rules, shard heads dim 1 and shard batch dim 0, over
+    # grad_q/k/v, grad_out, q, k, v, output, logsumexp followed by those extras.
     if len(args_schema) < 15:
         raise AssertionError(f"Expected at least 15 args, got {len(args_schema)}")
 
@@ -1220,7 +1332,14 @@ def _valid_grouped_mm_strides(
     input_specs: list[DTensorSpec],
     output_specs: DTensorSpec | tuple[DTensorSpec | None, ...],
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Full-mesh strategy filter for grouped_mm. For the first two input specs,
+    # computes the local (per-rank) shape and stride from the global meta, mesh and
+    # placements, then checks both operands have a stride layout valid for grouped_mm (one
+    # of the last two dims contiguous, the other stride aligned to 16 bytes). Returns True
+    # only if both are valid. Raises AssertionError if a spec has no TensorMeta.
     def local_meta(spec: DTensorSpec) -> TensorMeta:
+        # [FUNCTION DOC] HELPER: Builds a TensorMeta with the per-rank local shape and stride of the
+        # DTensorSpec (same dtype). Raises AssertionError if the spec lacks a TensorMeta.
         if not isinstance(spec.tensor_meta, TensorMeta):
             raise AssertionError(f"Expected TensorMeta, got {type(spec.tensor_meta)}")
         meta: TensorMeta = spec.tensor_meta
@@ -1231,6 +1350,10 @@ def _valid_grouped_mm_strides(
         return TensorMeta(torch.Size(local_shape), local_stride, meta.dtype)
 
     def check_valid_strides(meta: TensorMeta) -> bool:
+        # [FUNCTION DOC] HELPER: Returns True if the meta stride layout is acceptable for grouped_mm:
+        # either the second-last dim stride is 1 and the last stride is large enough and a
+        # multiple of the 16-byte element alignment, or the mirrored case; otherwise
+        # False. Mirrors the check in the meta registration.
         # copied from `_meta_grouped_mm_common` in meta_registrations.py
         end_dim = len(meta.shape) - 1
         alignment = 16 // meta.dtype.itemsize
@@ -1257,6 +1380,11 @@ def _valid_grouped_mm_strides(
 def grouped_mm_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder | None]]:
+    # [FUNCTION DOC] Single-dim strategy for aten._grouped_mm (registered with the stride filter).
+    # Requires TensorMeta mat1 and mat2 (AssertionError otherwise) and no bias. An
+    # optional offsets tensor (arg 2) gets a trailing Replicate. Always allows Partial
+    # output with one Partial and one Replicate operand. Then adds shard rules depending
+    # on whether mat1 and mat2 are 2D or 3D (four combinations). Returns the rule list.
     mat1_meta = args_schema[0]
     if not isinstance(mat1_meta, TensorMeta):
         raise AssertionError(f"Expected TensorMeta, got {type(mat1_meta)}")

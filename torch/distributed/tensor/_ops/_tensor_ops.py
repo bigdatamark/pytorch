@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] DTensor sharding strategies for tensor manipulation ops: single-input
+# pass-through ops, dtype copy, equal, like/new factories, bucketize, select/slice and their
+# backward and scatter variants, scatter/gather, stack, cat, index family, split, unbind, eye,
+# roll, flip and fft. Most are single-dim strategies (rows of output then input placements,
+# with pass-through Partial rules); stack and unbind remain full op strategies.
+# Import-time side effect: registers all these strategies with the registries.
 # Copyright (c) Meta Platforms, Inc. and affiliates
 from collections.abc import Callable, Sequence, Sized
 from typing import cast
@@ -65,6 +71,10 @@ _PARTIAL_PASS_THROUGH_REDUCE_OPS = ("sum", "avg", "min", "max")
 def propagate_single_input_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Strategy for ops with one tensor input and an output of the same layout (clone,
+    # contiguous, detach, alias, fill_, view dtype, zero_, view_of). Returns one rule per
+    # input dim sharding that dim on input and output, plus pass-through Partial rules for
+    # sum, avg, min, max. Registered with unbacked and uneven sharding allowed.
     """Propagate placements for ops with one tensor input.
 
     This is the single-dim form of the old one-to-one OpStrategy: a sharded
@@ -86,6 +96,10 @@ def _partial_needs_reduce_for_dtype_cast(
     src_dtype: torch.dtype,
     target_dtype: torch.dtype | None,
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Returns True when a pending Partial reduction does not commute with a dtype
+    # cast and must be reduced first. False if no target dtype or same dtype. True when
+    # casting to bool. False for max and min otherwise. For sum and avg, True only when
+    # casting from a floating dtype to a non floating dtype.
     """Return True when reduce_op does not commute with the dtype cast."""
     if target_dtype is None or src_dtype == target_dtype:
         return False
@@ -105,6 +119,9 @@ def _partial_needs_reduce_for_dtype_cast(
 def _to_copy_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Strategy for _to_copy. Shards each input dim identically on input and output. Adds a
+    # pass-through Partial rule for each of sum, avg, min, max unless the optional target
+    # dtype keyword makes that reduction not commute with the cast.
     input_meta = cast(TensorMeta, args_schema[0])
     src_dtype = input_meta.dtype
     target_dtype = cast(torch.dtype | None, kwargs_schema.get("dtype", None))
@@ -129,6 +146,9 @@ def _to_copy_single_dim_strategy(
 def equal_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Strategy for equal and is_same_size. Returns one shard rule per dim up to the
+    # smaller rank, requiring both operands to be sharded identically. Partial inputs and
+    # scalar operands get no rule and fall back to the implicit Replicate rule.
     """Require both tensor operands to use the same non-partial layout.
 
     equal/is_same_size compare corresponding local shards, so mismatched
@@ -183,6 +203,11 @@ register_single_dim_strategy(
 def create_like_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Strategy for ones_like, rand_like, randn_like, zeros_like, full_like, randint_like
+    # (stacked registrations with different static-argument counts). Shards each input dim
+    # on output and input (and an out kwarg tensor, other tensor kwargs Replicate). A
+    # Partial input of any reduce op maps to a Replicate output so generated values are
+    # not reduced.
     # These factory-like ops create tensors with the input shape but with
     # content independent of the input. Sharding can follow the input, but a
     # Partial input maps to a Replicate output so generated values are not
@@ -218,6 +243,11 @@ def create_like_single_dim_strategy(
 def new_factory_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Strategy for new_empty, new_full, new_ones, new_zeros, new_empty_strided. When the
+    # requested shape equals the input shape, shards propagate to the output; otherwise
+    # the output is Replicate with the input sharded. Partial inputs pass through as
+    # Partial only for the uninitialized new_empty variants with equal shape; otherwise
+    # the output is Replicate.
     # Replicated output is always legal and is inserted by the single-dim
     # infra. If input and output have the same shape, sharded inputs can also
     # propagate to the new tensor.
@@ -254,6 +284,11 @@ def new_factory_single_dim_strategy(
 def bucketize_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Strategy for bucketize with rows output, input, boundaries. Rules: shard input and
+    # output on any dim with boundaries Replicate; shard boundaries on dim 0 with
+    # Replicate input giving Partial sum output; Partial max or min input with Replicate
+    # boundaries giving the same Partial output. Raises AssertionError if input is not a
+    # TensorMeta.
     """Bucketize returns indices into a sorted boundary tensor.
 
     Three families of strategies:
@@ -289,6 +324,10 @@ def bucketize_single_dim_strategy(
 def select_int_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Strategy for select on an int dim. Normalizes the selected dim; for every other
+    # input dim emits a shard rule whose output dim is shifted left by one when after the
+    # selected dim. Adds pass-through Partial rules. The selected dim itself gets no shard
+    # rule.
     """Forward all shardings except the selected dimension.
 
     select removes selected_dim. A shard before that dim keeps its output dim;
@@ -318,6 +357,9 @@ def select_int_single_dim_strategy(
 def select_backward_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Strategy for select_backward (inverse of select). For each gradient dim emits a
+    # shard rule whose output dim is shifted right by one when at or after the inserted
+    # dim, plus pass-through Partial rules.
     """Inverse of select: insert the selected dimension into the output layout."""
     grad_meta = cast(TensorMeta, args_schema[0])
     input_sizes = cast(Sequence[object], args_schema[1])
@@ -343,6 +385,11 @@ def select_backward_single_dim_strategy(
 def slice_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Strategy for slice. Parses dim, start, end, step with defaults (raises
+    # AssertionError on wrong types), clamps end, normalizes negatives when statically
+    # known. Shard rules are emitted for all dims except the sliced one, unless the slice
+    # is statically known to be the full range with step 1, in which case every dim can
+    # shard. Adds pass-through Partial rules.
     """Forward shardings except on the sliced dimension.
 
     A nontrivial slice changes offsets along slice_dim, so a local shard on
@@ -396,6 +443,9 @@ def slice_single_dim_strategy(
 def slice_backward_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Strategy for slice_backward. Validates arg types (AssertionError otherwise), then
+    # shards every gradient dim except the original sliced dim, plus pass-through Partial
+    # rules.
     """Forward grad shardings except along the original sliced dimension."""
     grad_output_meta = args_schema[0]
     input_sizes = args_schema[1]
@@ -426,6 +476,9 @@ def slice_backward_single_dim_strategy(
 def slice_scatter_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Strategy for slice_scatter with rows output, input, src. Shards all dims except the
+    # scatter dim identically on all three; adds pass-through Partial rules for matching
+    # Partial placements. Raises AssertionError on invalid arg types.
     """Let input, src, and output follow each other off the scatter dimension.
 
     slice_scatter replaces a slice of self with src. Non-slice dimensions have
@@ -475,6 +528,10 @@ def select_scatter_single_dim_strategy(
     args_schema: ArgsType,
     kwargs_schema: KwargsType,
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Strategy for select_scatter with rows output, self, src. For each dim other than the
+    # selected one, shards output and self at that dim and src at the dim shifted down by
+    # one if after the selected dim. No Partial rules. Raises AssertionError if self is
+    # not a TensorMeta.
     input_meta = args_schema[0]
     if not isinstance(input_meta, TensorMeta):
         raise AssertionError(f"Expected TensorMeta, got {type(input_meta)}")
@@ -504,6 +561,10 @@ def diagonal_scatter_single_dim_strategy(
     args_schema: ArgsType,
     kwargs_schema: KwargsType,
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Strategy for diagonal_scatter with rows output, self, src. Reads dim1 and dim2
+    # (defaults 0 and 1), normalizes them; for each other dim, shards output and self at
+    # it and src at that dim minus the number of removed dims before it. No Partial rules.
+    # Raises AssertionError if self is not a TensorMeta.
     input_meta = args_schema[0]
     if not isinstance(input_meta, TensorMeta):
         raise AssertionError(f"Expected TensorMeta, got {type(input_meta)}")
@@ -534,6 +595,8 @@ def diagonal_scatter_single_dim_strategy(
 def local_scalar_dense_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Strategy for _local_scalar_dense. Returns no rules, so only the implicit Replicate
+    # fallback applies.
     """Only allow replication on the input; the output is a local scalar."""
     return []
 
@@ -550,6 +613,10 @@ def local_scalar_dense_single_dim_strategy(
 def scatter_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Strategy for scatter value and src overloads, rows output, input, index (plus src if
+    # a tensor). The scatter dim stays replicated; another axis is sharded on all operands
+    # only if input, index (and src) have equal sizes there and equal ranks. Raises
+    # AssertionError on invalid arg types.
     """Sharding strategy for scatter/scatter_ value and src overloads.
 
     scatter writes along the dim argument, so that tensor axis must stay
@@ -601,6 +668,9 @@ def scatter_single_dim_strategy(
 def scatter_add_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Strategy for scatter_add with rows output, input, index, src. Shards every non-
+    # scatter dim where input and index sizes match (and ranks are equal) on all four
+    # tensors. Raises AssertionError on invalid arg types.
     """Shard scatter_add only on non-scatter axes with aligned sizes.
 
     Placement rows are [output, input, index, src]. The scatter axis stays
@@ -630,6 +700,10 @@ def scatter_add_single_dim_strategy(
 def gather_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Strategy for gather with rows output, input, index. Emits: a mask-partial output and
+    # index with the input sharded on the gather dim, only if the index has size 1 there;
+    # index sharded on the gather dim with Replicate input; and shard rules for each non-
+    # gather dim when ranks match. Raises AssertionError on invalid arg types.
     """Sharding strategy for gather with rows [output, input, index]."""
     input_meta, dim, index_meta = args_schema[:3]
     if not isinstance(input_meta, TensorMeta):
@@ -673,6 +747,14 @@ def _derive_follow_placements_from_tuple_strategy(
     op: torch._ops.OpOverload,
     tuple_strategy: TupleStrategy,
 ) -> Sequence[Placement]:
+    # [FUNCTION DOC] HELPER: Computes the per-mesh-dim placements that all operands of a tuple strategy
+    # (used by stack) should follow. Iterates over every child strategy and every
+    # candidate output spec, folding each into the running placements via the merge
+    # helper. Raises AssertionError if a child is not an OpStrategy or no placements were
+    # found; raises ValueError if children are on different meshes. Returns the list of
+    # followed placements.
+    # KNOWN ISSUE: the second check for follow_placements being None inside the loop is
+    # unreachable because the first-iteration branch continues just before it.
     """
     derive the placements to follow from the tuple strategy, mainly used by
     aten.stack, where each operand have the same shape, and correspondingly
@@ -682,6 +764,11 @@ def _derive_follow_placements_from_tuple_strategy(
     def merge_placement(
         cur_placement: Placement, new_placement: Placement
     ) -> Placement:
+        # [FUNCTION DOC] HELPER: Merges the current followed placement with a new operand placement by
+        # priority Partial, then Shard, then Replicate. Equal placements return unchanged;
+        # Partial vs shard follows the shard; two different Partials or two different
+        # shards fall back to Replicate; Partial or shard vs Replicate keeps the non-
+        # Replicate current one; current Replicate follows the new one.
         # semantic if we already have a follow placement, we
         # check each placement for the current arg placement
         # to see if we want to merge/adjust the placement to follow
@@ -745,6 +832,12 @@ def _derive_follow_placements_from_tuple_strategy(
 
 @register_op_strategy(aten.stack.default, RuntimeSchemaInfo(1, needs_pytree=True))
 def stack_strategy(op_schema: OpSchema) -> StrategyType:
+    # [FUNCTION DOC] Op strategy (not single-dim, because of NormPartial) for stack. Requires a tuple
+    # strategy of OpStrategy children (AssertionError otherwise). Normalizes the stack dim
+    # against input ndim plus one, derives common placements via the follow helper, builds
+    # one OpSpec where every input uses those placements and the output placements have
+    # shard dims shifted past the inserted dim, with redistribute costs from each child.
+    # Returns an OpStrategy with that single option.
     # We keep stack as an OpStrategy because .stack is used w/ NormPartial, and its
     # impossible to include every NormPartial rules as there are infinite possibilities
     # with ord. Future changes to infra could be made, but we prefer to deprecate
@@ -806,6 +899,10 @@ def stack_strategy(op_schema: OpSchema) -> StrategyType:
 def cat_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Strategy for cat. Requires a list or tuple of TensorMeta (AssertionError otherwise,
+    # also on empty list or differing ndim among non-empty inputs). Legacy empty 1-D
+    # tensors (size 0) stay Replicate. Emits shard rules for every dim except the cat dim
+    # (output plus each input) and pass-through Partial rules for sum, avg, min, max.
     """Forward cat input placements except along the concatenation dimension.
 
     Concatenation changes only cat_dim; sharding there needs redistribution, so
@@ -825,6 +922,8 @@ def cat_single_dim_strategy(
         input_list = tuple(input_list)
 
     def is_legacy_cat_empty(meta: TensorMeta) -> bool:
+        # [FUNCTION DOC] HELPER: True if the meta is 1-D with a statically known length of zero (legacy
+        # empty tensor allowed in cat).
         return len(meta.shape) == 1 and statically_known_true(meta.shape[0] == 0)
 
     num_inputs = len(input_list)
@@ -869,6 +968,11 @@ def cat_single_dim_strategy(
 def index_select_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Strategy for index_select with rows output, values, index. Requires TensorMeta
+    # values and an int dim (AssertionError otherwise). Rules: shard values on any non-
+    # indexed dim with Replicate index; shard the index on dim 0 giving output sharded on
+    # the indexed dim with Replicate values; pass-through Partial values with Replicate
+    # index.
     values_meta, dim, index_meta = args_schema
     if not isinstance(values_meta, TensorMeta):
         raise AssertionError(f"Expected TensorMeta, got {type(values_meta)}")
@@ -902,6 +1006,13 @@ def index_select_single_dim_strategy(
 def index_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Strategy for advanced indexing (index.Tensor) with rows output, values, then one
+    # slot per non-None index tensor. Raises AssertionError on invalid arg types. Computes
+    # where the broadcast index dims land in the output (at the first indexed dim if
+    # indexed dims are consecutive, else at the front). Rules: shard a non-indexed values
+    # dim (indices Replicate); shard the broadcast dim on every index tensor with size
+    # above 1 along it (others Replicate, values Replicate), skipping dims where all are
+    # size 1; Partial values for linear reduce ops with Replicate indices.
     values_meta, multi_indices_meta = args_schema
     if not isinstance(values_meta, TensorMeta):
         raise AssertionError(f"Expected TensorMeta, got {type(values_meta)}")
@@ -926,6 +1037,9 @@ def index_single_dim_strategy(
     insert_dim = indexed_dims[0] if all_consecutive else 0
 
     def values_dim_to_output_dim(d: int) -> int:
+        # [FUNCTION DOC] HELPER: Maps a dimension of the values tensor (not indexed) to its position in
+        # the index result, accounting for inserted broadcast dims and removed indexed
+        # dims.
         if d < insert_dim:
             return d
         return d + broadcast_ndim - sum(1 for idx_dim in indexed_dims if d > idx_dim)
@@ -984,6 +1098,13 @@ def index_single_dim_strategy(
 def index_put_single_dim_strategy(
     op: OpOverload, args: ArgsType, kwargs: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Strategy for index_put, index_put_ and _index_put_impl_ with rows output, self, one
+    # Replicate per non-None index tensor, then values. Self may be sharded only on non-
+    # indexed dims; the matching values dim is sharded too, except Replicate when that
+    # values dim is broadcast (size 1) or absent. Values dim mapping depends on whether
+    # indexed dims are contiguous (broadcast block replaces them in place) or not
+    # (broadcast block goes first). Also adds one all-Partial rule (default reduction) for
+    # output, self and values with Replicate indices.
     """Single-dim sharding strategy for index_put(self, indices, values).
 
     Strategy format: [output, input, *indices, value]
@@ -1094,6 +1215,9 @@ def _index_dim_strategy(
     shard_row: Callable[[int], list[Placement | _ShardingPlaceholder]],
     partial_rules: list[list[Placement | _ShardingPlaceholder]] | None = None,
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] HELPER: Shared builder for index ops. Normalizes the dim arg, calls the row factory
+    # for every dim of self except the indexed one, then appends any extra Partial rules.
+    # Returns the list of rules.
     """Common strategy for index ops that shard on all dims except the indexed dim.
 
     Args:
@@ -1119,6 +1243,9 @@ def _index_dim_strategy(
 def index_fill_scalar_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Strategy for index_fill with a scalar value: shard every dim except the indexed dim
+    # on result and self with Replicate value; Partial avg, max, min pass through
+    # (idempotent reductions only; sum would scale the fill value).
     # index_fill(self, dim, index, value) — fills self[..., index, ...] with scalar value.
     # Partial rules: each rank fills with the same scalar v, then reduces.
     # Only idempotent reduces work: avg(v,v,...,v)=v, max(v,v,...,v)=v, min(v,v,...,v)=v.
@@ -1141,6 +1268,9 @@ def index_fill_scalar_single_dim_strategy(
 def index_fill_tensor_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Strategy for index_fill with a 0-d tensor value: shard every dim except the indexed
+    # dim on result and self, with Replicate index and value; all pass-through Partial
+    # reductions are allowed with Partial value and Replicate index.
     # index_fill(self, dim, index, value) — fills self[..., index, ...] with 0-d tensor value.
     # Partial rules: each rank fills with its partial value v_i, then reduces.
     # All reduce ops work because reduce(v_0, ..., v_{n-1}) = V (the global value)
@@ -1167,6 +1297,9 @@ def index_fill_tensor_single_dim_strategy(
 def index_reduce_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Strategy for index_reduce: shard every dim except the indexed dim on result, self
+    # and source with Replicate index. No Partial rules, since its reduce names do not
+    # match Partial reduce ops.
     # index_reduce(self, dim, index, source, reduce) — reduces source into self at index positions.
     # No partial rules: reduce ops are "mean"/"amax"/"amin"/"prod", which don't match
     # any Partial reduce op names ("avg"/"max"/"min"/"product"/"sum").
@@ -1193,6 +1326,11 @@ def index_reduce_single_dim_strategy(
 def split_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Strategy for split, split_with_sizes and split_with_sizes_copy. Requires TensorMeta
+    # input (AssertionError otherwise). Works out the number of outputs from the split
+    # size (equal chunks with a smaller remainder) or the sections list. Shards every dim
+    # except the split dim identically on all outputs and the input; adds pass-through
+    # Partial rules across all outputs and the input.
     """Forward all shardings except the split dimension.
 
     Splitting a sharded split_dim would require each output chunk to know
@@ -1208,6 +1346,9 @@ def split_single_dim_strategy(
     dim = normalize_dim(split_dim, input_ndim)
 
     def size_split(N, i) -> list:
+        # [FUNCTION DOC] HELPER: Returns the chunk sizes for splitting length N into chunks of size i,
+        # with a smaller last chunk if not divisible. Raises AssertionError if i is not
+        # positive.
         # Last chunk will be smaller if the tensor size N
         # along the given dimension dim is not divisible by i.
         if not i > 0:
@@ -1238,6 +1379,12 @@ def split_single_dim_strategy(
 #       and remove this xfail item
 @register_op_strategy(aten.unbind.int, schema_info=RuntimeSchemaInfo(1))
 def gen_unbind_strategy(op_schema: OpSchema) -> StrategyType:
+    # [FUNCTION DOC] Op strategy for unbind. For each input strategy, raises RuntimeError if the unbind
+    # dim is sharded; otherwise builds an OpSpec with one output spec per slice, whose
+    # placements have shard dims shifted for the removed dim, and zero redistribute cost.
+    # Raises AssertionError if the input is not an OpStrategy. Returns an OpStrategy.
+    # KNOWN ISSUE: the RuntimeError is built with two comma separated arguments instead of
+    # one concatenated message, so its text is a tuple-like pair.
     """Forward all shardings except the unbind dimension."""
     input_strategy = op_schema.args_schema[0]
     if not isinstance(input_strategy, OpStrategy):
@@ -1286,6 +1433,9 @@ def gen_unbind_strategy(op_schema: OpSchema) -> StrategyType:
 def eye_out_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Strategy for eye with an out tensor. Validates that the out kwarg is a TensorMeta
+    # (AssertionError otherwise) and returns no rules, so only all-Replicate is possible,
+    # because sharded diagonals need global offsets.
     """Strategy for torch.eye(..., out=...).
 
     Sharded eye needs global index offsets to place the diagonal correctly.
@@ -1302,6 +1452,8 @@ def eye_out_single_dim_strategy(
 def _pass_through_partials(
     num_inputs: int = 1,
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] HELPER: Returns rules where output and every input are the same Partial for each of
+    # sum, avg, max, min (num_inputs inputs).
     """Pass-through strategies for all supported reduce ops."""
     return [[Partial(op)] * (1 + num_inputs) for op in ("sum", "avg", "max", "min")]
 
@@ -1309,6 +1461,8 @@ def _pass_through_partials(
 def _shard_inactive_dims(
     ndim: int, active_dims: set[int], num_inputs: int = 1
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] HELPER: Returns one rule per dim not in active_dims, sharding that dim on the output
+    # and all num_inputs inputs.
     """Single-dim strategies: shard on dims the op doesn't touch."""
     strategies: list[list[Placement | _ShardingPlaceholder]] = []
     for d in range(ndim):
@@ -1321,6 +1475,9 @@ def _shard_inactive_dims(
 def roll_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Strategy for roll. Requires TensorMeta input (AssertionError otherwise). The rolled
+    # dims (all dims if the dims arg is empty or missing) cannot be sharded; other dims
+    # shard on output and input; pass-through Partial rules are added.
     input_meta = args_schema[0]
     if not isinstance(input_meta, TensorMeta):
         raise AssertionError(f"Expected TensorMeta, got {type(input_meta)}")
@@ -1337,6 +1494,9 @@ def roll_single_dim_strategy(
 def flip_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Strategy for flip. Requires TensorMeta input (AssertionError otherwise). Flipped
+    # dims cannot be sharded; other dims shard on output and input; pass-through Partial
+    # rules are added.
     input_meta = args_schema[0]
     if not isinstance(input_meta, TensorMeta):
         raise AssertionError(f"Expected TensorMeta, got {type(input_meta)}")
@@ -1353,6 +1513,9 @@ def flip_single_dim_strategy(
 def fft_single_dim_strategy(
     op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Strategy for _fft_c2c, _fft_r2c, _fft_c2r. Requires TensorMeta input (AssertionError
+    # otherwise). Transformed dims (arg 1) cannot be sharded; other dims shard on output
+    # and input; pass-through Partial rules are added.
     input_meta = args_schema[0]
     if not isinstance(input_meta, TensorMeta):
         raise AssertionError(f"Expected TensorMeta, got {type(input_meta)}")

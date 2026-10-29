@@ -1,4 +1,10 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
+# [MODULE DOC] DTensor sharding strategies for pointwise ops. Defines the factory for the
+# common single-dim pointwise strategy (shard any broadcast output dim, plus optional extra
+# Partial rules), the rule tables for additive, multiplicative, division and scalar-linear
+# ops, lists of monotonic/linear/extra pointwise ops, and discovery of pointwise ops by tag.
+# Import-time side effects: registers single-dim strategies for all those ops (including
+# foreach and fused optimizer ops) and fills the module-level set of specially registered ops.
 from collections.abc import Callable
 
 import torch
@@ -25,6 +31,10 @@ def _common_pointwise_single_dim_strategy(
 ) -> Callable[
     [OpOverload, ArgsType, KwargsType], list[list[Placement | _ShardingPlaceholder]]
 ]:
+    # [FUNCTION DOC] HELPER: Factory returning a single-dim strategy function for pointwise ops.
+    # Arg partial_extra_rules: optional list of placement rules (output(s) then tensor args)
+    # appended to the shard rules; only rules whose length equals outputs plus tensor args
+    # are kept. Returns the strategy callable (see nested strategy).
     """Factory for single-dim strategies that add partial placement rules.
 
     Returns strategies shaped [output, *args] only.  Tensor kwarg placements
@@ -37,6 +47,11 @@ def _common_pointwise_single_dim_strategy(
         args_schema: ArgsType,
         kwargs_schema: KwargsType,
     ) -> list[list[Placement | _ShardingPlaceholder]]:
+        # [FUNCTION DOC] HELPER: Builds rules for a pointwise op. Computes the broadcast shape of
+        # all tensor args; for each output dim emits a rule sharding that dim on every output
+        # (tensor count from the schema returns) and on each tensor arg whose dim maps to it,
+        # or Replicate for args where that dim was broadcast. Then appends the extra partial
+        # rules with matching length. Returns the rule list. Raises if shapes do not broadcast.
         tensor_arg_metas: list[TensorMeta] = [
             arg for arg in args_schema if isinstance(arg, TensorMeta)
         ]
@@ -81,6 +96,7 @@ def _common_pointwise_single_dim_strategy(
 
 
 def _is_list_op(op: OpOverload) -> bool:
+    # [FUNCTION DOC] HELPER: Returns True if the op name marks a foreach, amp foreach or fused op.
     """Returns True if op is a foreach, amp_foreach, or fused op."""
     name = op.name()
     return name.startswith(("aten::_foreach_", "aten::_amp_foreach_", "aten::_fused_"))
@@ -102,6 +118,13 @@ def _register_single_dim_pointwise(
     partial_extra_rules: list[list[Placement]] | None = None,
     static_argnum: int = 0,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Registers a pointwise single-dim strategy for one op. If extra
+    # partial rules are given, records the op as specially registered so tag discovery skips it.
+    # Wraps the common strategy to append placements for tensor kwargs (output placement for
+    # "out", Replicate otherwise). Schema info: pytree flattening for list/fused ops, else
+    # static_argnum with "out" as static kwarg. Fused ops mark the state_steps arg as
+    # possibly on a different mesh. Side effect: registers with the strategy registry
+    # (uneven and unbacked sharding allowed). Returns nothing.
     if partial_extra_rules is not None:
         _specially_registered_ops.add(op)
     inner_fn = _common_pointwise_single_dim_strategy(
@@ -117,6 +140,9 @@ def _register_single_dim_pointwise(
         kwargs: KwargsType,
         _fn: Callable = inner_fn,
     ) -> list[list[Placement | _ShardingPlaceholder]]:
+        # [FUNCTION DOC] HELPER: Runs the common strategy, then for each rule appends one
+        # placement per tensor kwarg (in kwargs order): the output placement for "out", else
+        # Replicate. Returns rules unchanged when there are no tensor kwargs.
         strategies = _fn(op, args, kwargs)
         kw_names = [k for k, v in kwargs.items() if isinstance(v, TensorMeta)]
         if not kw_names:
@@ -554,6 +580,8 @@ _extra_pointwise_ops: list[OpOverload] = [
 
 
 def _get_pointwise_ops_from_tag() -> list[OpOverload]:
+    # [FUNCTION DOC] HELPER: Scans aten and prims op namespaces and returns every overload
+    # carrying the pointwise tag.
     """
     Auto-discover pointwise ops via torch.Tag.pointwise, from ops.aten, ops.prims.
     """
@@ -581,6 +609,8 @@ for op in pointwise_ops:
 
 
 def register_inductor_prims() -> None:
+    # [FUNCTION DOC] Lazily registers the default pointwise strategy for the inductor fma prim
+    # (called after inductor prims exist). Side effect: registry update. Returns nothing.
     """Register DTensor sharding strategies for inductor prims ops.
 
     Called lazily because inductor prims are created via make_prim() in
