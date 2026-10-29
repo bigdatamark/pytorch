@@ -1,4 +1,8 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests for inductor kernel metadata parsing helpers in the metrics module. Defines
+# a sample Triton reduction kernel source string (with the GPU type substituted in) used by
+# parsing tests, and a test class that also compiles tiny GPU programs to check atomic-add
+# counting and the bandwidth estimate. The main block runs only when a GPU is available.
 import torch
 from torch._inductor import config, metrics
 from torch._inductor.test_case import run_tests, TestCase
@@ -54,22 +58,34 @@ def triton_red_fused_add_sum_2(in_out_ptr0, in_ptr0, xnumel, rnumel, XBLOCK : tl
 
 
 class TestMetrics(TestCase):
+    # [CLASS DOC] Tests the private parsing helpers of the inductor metrics module: stripping
+    # decorators, counting kernel arguments and source patterns, reduction hint extraction,
+    # atomic add detection and the kernel gigabyte estimate. Relies on the module-level sample
+    # kernel string for the pure-text tests.
     def test_parse_proper_kernel_fn_code(self):
+        # [FUNCTION DOC] Checks that decorator stripping on the sample kernel returns source
+        # text that begins at the function definition.
         proper_kernel_fn_code = metrics._parse_proper_kernel_fn_code(example_kernel)
         if not proper_kernel_fn_code.startswith("def "):
             raise AssertionError
 
     def test_count_args(self):
+        # [FUNCTION DOC] Checks that the argument counter returns six for the sample kernel
+        # signature (four pointer or size arguments plus two constexpr block sizes).
         proper_kernel_fn_code = metrics._parse_proper_kernel_fn_code(example_kernel)
         self.assertEqual(6, metrics._count_args(proper_kernel_fn_code))
 
     def test_count_pattern(self):
+        # [FUNCTION DOC] Checks substring counts on the stripped sample kernel: two loads, one
+        # store and one loop.
         proper_kernel_fn_code = metrics._parse_proper_kernel_fn_code(example_kernel)
         self.assertEqual(2, metrics._count_pattern(proper_kernel_fn_code, "tl.load"))
         self.assertEqual(1, metrics._count_pattern(proper_kernel_fn_code, "tl.store"))
         self.assertEqual(1, metrics._count_pattern(proper_kernel_fn_code, "for "))
 
     def test_parse_reduction_hint(self):
+        # [FUNCTION DOC] Checks that the sample kernel is classified as a reduction by source
+        # and that the parsed reduction hint is the inner hint.
         kernel_category = get_kernel_category_by_source_code(example_kernel)
         self.assertEqual("reduction", kernel_category)
         self.assertEqual(
@@ -79,8 +95,14 @@ class TestMetrics(TestCase):
     @config.patch("fx_graph_remote_cache", False)
     @config.patch("partitioned_scatter_enabled", False)
     def test_atomic_add(self):
+        # [FUNCTION DOC] Compiles an in-place index_put with accumulation on GPU tensors (random
+        # float data, int32 indices, remote FX cache and partitioned scatter disabled), collects
+        # the defined kernel sources, and checks exactly one kernel was generated and it
+        # contains exactly one atomic add.
         @torch.compile
         def f(lhs, index, rhs):
+            # [FUNCTION DOC] HELPER: Compiled function that does an accumulating in-place
+            # index_put of rhs into lhs at index and returns the result.
             return lhs.index_put_([index], rhs, accumulate=True)
 
         lhs = torch.randn(1024, device=GPU_TYPE)
@@ -99,8 +121,14 @@ class TestMetrics(TestCase):
     @config.patch("fx_graph_remote_cache", False)
     @config.patch("benchmark_kernel", True)
     def test_kernel_args_num_gb(self):
+        # [FUNCTION DOC] Compiles an add-one function over 250 million float elements on the GPU
+        # with kernel benchmarking enabled and the remote FX cache off, collects the kernel
+        # sources, and checks the single kernel reports a pointwise bandwidth figure of 2.0
+        # gigabytes (one read plus one write of 1 GB each). Needs enough free GPU memory (large
+        # tensor test guard).
         @torch.compile
         def f(x):
+            # [FUNCTION DOC] HELPER: Compiled function returning its input plus one.
             return x + 1
 
         x = torch.randn(int(25e7), device=GPU_TYPE)

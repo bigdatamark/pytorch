@@ -1,4 +1,8 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests for the AOTI minifier support utilities: the export wrapper that returns
+# None for graphs export cannot handle (or raises a wrapped error), and the module-to-string
+# conversion used to emit repro scripts, including nested conditional branch submodules. No
+# import-time side effects.
 from unittest.mock import patch
 
 import torch
@@ -14,9 +18,16 @@ from torch.testing._internal.common_utils import run_tests, TestCase
 
 
 class MinifierUtilsTests(TestCase):
+    # [CLASS DOC] Test case covering export_for_aoti_minifier error classification and
+    # NNModuleToString/get_module_string serialization.
     def test_invalid_output_user_error_classification(self):
+        # [FUNCTION DOC] With the export call mocked to raise a user error of invalid-output
+        # type, checks that the export wrapper in strict mode with skip_export_error False
+        # swallows it and returns None.
         class SimpleModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Trivial module whose forward adds one to its input.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input plus one.
                 return x + 1
 
         with patch(
@@ -35,12 +46,20 @@ class MinifierUtilsTests(TestCase):
             self.assertTrue(gm is None)
 
     def test_invalid_output(self):
+        # [FUNCTION DOC] Builds a graph by symbolic tracing a module whose forward returns a
+        # submodule instead of a tensor, then checks the export wrapper returns None for both
+        # strict and non-strict export (an illegal output is treated as a non-failing graph).
         class SimpleModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with one 2x2 linear layer whose forward returns that layer
+            # rather than a tensor, giving an invalid graph output.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the linear submodule.
                 super().__init__()
                 self.linear = torch.nn.Linear(2, 2)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the linear submodule itself (not a tensor),
+                # producing an invalid output.
                 # return a graph module
                 return self.linear
 
@@ -53,8 +72,14 @@ class MinifierUtilsTests(TestCase):
             self.assertTrue(gm is None)
 
     def test_non_exportable(self):
+        # [FUNCTION DOC] Feeds a sum module two tensors (wrong arity) so export fails, then for
+        # strict and non-strict export checks that skip_export_error True gives None (and prints
+        # the result), while skip_export_error False raises AOTIMinifierError.
         class SimpleModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward returns the sum of the input; used with
+            # mismatched inputs to force an export failure.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the sum of all elements of the input.
                 return x.sum()
 
         model = SimpleModel()
@@ -73,11 +98,20 @@ class MinifierUtilsTests(TestCase):
                 )
 
     def test_convert_module_to_string(self):
+        # [FUNCTION DOC] Exports a module containing a conditional on a scalar read from a
+        # tensor (non-strict), converts the unchecked module to repro source text, and compares
+        # it with an expected string showing both branch classes as commented-out source plus
+        # the main Repro class.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward reads a scalar from the flag tensor and runs
+            # a conditional where both branches clone the input.
             def forward(self, x, flag):
+                # [FUNCTION DOC] HELPER: Extracts the flag as a Python number and returns
+                # the result of a conditional that clones x in either branch.
                 flag = flag.item()
 
                 def true_fn(x):
+                    # [FUNCTION DOC] HELPER: Branch body returning a clone of x.
                     return x.clone()
 
                 return torch.cond(flag > 0, true_fn, true_fn, [x])
@@ -137,10 +171,16 @@ class MinifierUtilsTests(TestCase):
         )
 
     def test_cond_subgraph_roundtrips(self):
+        # [FUNCTION DOC] Traces a conditional with sin and cos branches using make_fx,
+        # serializes it with NNModuleToString, checks branch bodies appear and no empty
+        # lambda placeholder remains, then executes the generated source and verifies the
+        # rebuilt Repro module matches the traced graph for both predicate values.
         # torch.cond attaches its branches as nested GraphModule submodules.
         # NNModuleToString.convert must serialize them as real nested classes
         # that reconstruct -- not the invalid, body-less `<lambda>()` placeholder.
         def fn(pred, x):
+            # [FUNCTION DOC] HELPER: Function applying a conditional that returns the sine of x if
+            # pred is true, otherwise the cosine.
             return torch.cond(pred, lambda x: x.sin(), lambda x: x.cos(), (x,))
 
         pred = torch.tensor(False)

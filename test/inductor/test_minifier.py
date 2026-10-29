@@ -1,4 +1,11 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] End-to-end tests for the inductor minifier, run in-process-isolated subprocesses
+# via the shared minifier test base. Each test injects a deliberate relu bug (compile error,
+# accuracy error) through testing-only inductor config for the CPU or Triton backend, runs a
+# generated program, then checks the minifier and repro scripts reproduce the error. Covers
+# compile and accuracy errors after AOT autograd, constants, strict versus default accuracy,
+# disk offload, and AOTInductor packaging with flat and dict plus keyword inputs. The main block
+# skips macOS and ASAN.
 import unittest
 from unittest.mock import patch
 
@@ -13,8 +20,14 @@ from torch.testing._internal.triton_utils import requires_gpu
 
 
 class MinifierTests(MinifierTestBase):
+    # [CLASS DOC] Minifier test cases built on the shared minifier test base; every test builds
+    # program source text, hands it to the full-flow runner without subprocess isolation, and
+    # compares errors or minified graphs.
     # Test that compile and accuracy errors after aot can be repro'd (both CPU and CUDA)
     def _test_after_aot(self, device, expected_error):
+        # [FUNCTION DOC] HELPER: Runs the after-AOT minifier flow for a tiny compiled function
+        # (relu then cos on a 20 by 20 tensor on the given device), expecting the given error
+        # name in the output. Not isolated.
         # NB: The program is intentionally quite simple, just enough to
         # trigger one minification step, no more (dedicated minifier tests
         # should exercise minifier only)
@@ -32,25 +45,35 @@ inner(torch.randn(20, 20).to("{device}"))
     @unittest.skipIf(IS_JETSON, "Fails on Jetson")
     @inductor_config.patch("cpp.inject_relu_bug_TESTING_ONLY", "compile_error")
     def test_after_aot_cpu_compile_error(self):
+        # [FUNCTION DOC] With the CPU relu bug set to produce a compile error, checks the
+        # minifier flow reports a C++ compile error. Skipped on Jetson.
         self._test_after_aot("cpu", "CppCompileError")
 
     @unittest.skipIf(IS_JETSON, "Fails on Jetson")
     @inductor_config.patch("cpp.inject_relu_bug_TESTING_ONLY", "accuracy")
     def test_after_aot_cpu_accuracy_error(self):
+        # [FUNCTION DOC] With the CPU relu bug set to produce wrong results, checks the minifier
+        # flow reports an accuracy error. Skipped on Jetson.
         self._test_after_aot("cpu", "AccuracyError")
 
     @requires_gpu
     @inductor_config.patch("triton.inject_relu_bug_TESTING_ONLY", "compile_error")
     def test_after_aot_gpu_compile_error(self):
+        # [FUNCTION DOC] With the Triton relu bug producing a compile error, checks the flow
+        # reports a syntax error on the GPU device. Requires a GPU.
         self._test_after_aot(GPU_TYPE, "SyntaxError")
 
     @requires_gpu
     @inductor_config.patch("triton.inject_relu_bug_TESTING_ONLY", "accuracy")
     def test_after_aot_gpu_accuracy_error(self):
+        # [FUNCTION DOC] With the Triton relu bug producing wrong results, checks the flow
+        # reports an accuracy error on the GPU device. Requires a GPU.
         self._test_after_aot(GPU_TYPE, "AccuracyError")
 
     @inductor_config.patch("cpp.inject_relu_bug_TESTING_ONLY", "accuracy")
     def test_constant_in_graph(self):
+        # [FUNCTION DOC] Compiles a function adding a constant tensor to relu of the input with
+        # the CPU accuracy bug on, and checks that an accuracy error is still found after AOT.
         run_code = """\
 @torch.compile()
 def inner(x):
@@ -63,6 +86,11 @@ inner(torch.randn(2))
     @requires_gpu
     @patch.object(config, "joint_graph_constant_folding", False)
     def test_rmse_improves_over_atol(self):
+        # [FUNCTION DOC] Uses a half-precision subtraction on the GPU, with joint graph constant
+        # folding disabled, where the compiled result differs slightly from eager. With the fp64
+        # comparison disabled it expects an accuracy error (using strict accuracy so the
+        # minifier proceeds); with the default fp64 comparison it expects no error at all,
+        # showing the root-mean-square check is more tolerant than absolute tolerance.
         # From https://twitter.com/itsclivetime/status/1651135821045719041?s=20
         run_code = """
 @torch.compile()
@@ -93,6 +121,10 @@ inner(torch.tensor(655 * 100, dtype=torch.half, device='GPU_TYPE'))
     @inductor_config.patch("cpp.inject_relu_bug_TESTING_ONLY", "accuracy")
     @inductor_config.patch("cpp.inject_log1p_bug_TESTING_ONLY", "accuracy")
     def test_accuracy_vs_strict_accuracy(self):
+        # [FUNCTION DOC] With CPU relu and log1p accuracy bugs on, compiles a function with
+        # log1p, a boolean mask doubly negated, relu and a where. Strict accuracy mode must
+        # minify to a graph containing only log1p; default mode must minify to a graph
+        # containing only relu. Compares the minified repro module text with expected strings.
         run_code = """
 @torch.compile()
 def inner(x):
@@ -147,6 +179,9 @@ class Repro(torch.nn.Module):
 
     @inductor_config.patch("cpp.inject_relu_bug_TESTING_ONLY", "accuracy")
     def test_offload_to_disk(self):
+        # [FUNCTION DOC] Smoke test: with the CPU relu accuracy bug on, minifies a chain of sin,
+        # sin, cos, relu with the offload-to-disk option. Only checks that an accuracy error is
+        # found; does not measure memory.
         # Just a smoketest, this doesn't actually test that memory
         # usage went down.  Test case is carefully constructed to hit
         # delta debugging.
@@ -171,6 +206,10 @@ inner(torch.randn(20, 20))
 
     # Test that compile errors in AOTInductor can be repro'd (both CPU and CUDA)
     def _test_aoti(self, device, expected_error):
+        # [FUNCTION DOC] HELPER: Runs the AOTInductor minifier flow for a small exported module
+        # (linear, relu, sigmoid on 8 by 10 inputs) packaged with aoti_compile_and_package under
+        # no-grad mode on the given device, expecting the given error name. Returns the result
+        # object from the runner.
         # NB: The program is intentionally quite simple, just enough to
         # trigger one minification step, no more (dedicated minifier tests
         # should exercise minifier only)
@@ -203,6 +242,9 @@ with torch.no_grad():
 
     # Test that compile errors in AOTInductor can be repro'd (both CPU and CUDA)
     def _test_aoti_unflattened_inputs(self, device, expected_error):
+        # [FUNCTION DOC] HELPER: Like the plain AOTInductor helper but the module takes a
+        # dictionary of two tensors positionally plus a keyword-only tensor, exercising
+        # unflattened inputs and keyword arguments. Returns the runner result.
         # NB: The program is intentionally quite simple, just enough to
         # trigger one minification step, no more (dedicated minifier tests
         # should exercise minifier only)
@@ -241,6 +283,9 @@ with torch.no_grad():
         )
 
     def _aoti_check_relu_repro(self, res):
+        # [FUNCTION DOC] HELPER: Asserts the result exists and has an exported program path,
+        # loads that program, and compares its generated forward code with the expected text,
+        # which holds only a relu on the linear output.
         if res is None:
             raise AssertionError("res is None")
         ep_file_path = res.get_exported_program_path()
@@ -262,6 +307,8 @@ def forward(self, linear_default):
         "compile_error",
     )
     def test_aoti_cpu_compile_error(self):
+        # [FUNCTION DOC] AOTI on CPU with the compile-error bug injected: expects a C++ compile
+        # error and a minified graph containing only relu. Skipped on Jetson.
         res = self._test_aoti("cpu", "CppCompileError")
         self._aoti_check_relu_repro(res)
 
@@ -271,6 +318,8 @@ def forward(self, linear_default):
         "compile_error",
     )
     def test_aoti_cpu_compile_error_unflatten(self):
+        # [FUNCTION DOC] Same as the CPU compile-error AOTI test but with dictionary and keyword
+        # inputs. Skipped on Jetson.
         res = self._test_aoti_unflattened_inputs("cpu", "CppCompileError")
         self._aoti_check_relu_repro(res)
 
@@ -280,6 +329,8 @@ def forward(self, linear_default):
         "compile_error",
     )
     def test_aoti_gpu_compile_error(self):
+        # [FUNCTION DOC] AOTI on the GPU with the Triton compile-error bug: expects a syntax
+        # error and a relu-only minified graph. Requires a GPU.
         res = self._test_aoti(GPU_TYPE, "SyntaxError")
         self._aoti_check_relu_repro(res)
 
@@ -289,18 +340,24 @@ def forward(self, linear_default):
         "compile_error",
     )
     def test_aoti_gpu_compile_error_unflatten(self):
+        # [FUNCTION DOC] Same as the GPU compile-error AOTI test but with dictionary and keyword
+        # inputs. Requires a GPU.
         res = self._test_aoti_unflattened_inputs(GPU_TYPE, "SyntaxError")
         self._aoti_check_relu_repro(res)
 
     @unittest.skipIf(IS_JETSON, "Fails on Jetson")
     @inductor_config.patch("cpp.inject_relu_bug_TESTING_ONLY", "accuracy")
     def test_aoti_cpu_accuracy_error(self):
+        # [FUNCTION DOC] AOTI on CPU with the accuracy bug: expects an accuracy error and a
+        # relu-only minified graph. Skipped on Jetson.
         res = self._test_aoti("cpu", "AccuracyError")
         self._aoti_check_relu_repro(res)
 
     @requires_gpu
     @inductor_config.patch("triton.inject_relu_bug_TESTING_ONLY", "accuracy")
     def test_aoti_gpu_accuracy_error(self):
+        # [FUNCTION DOC] AOTI on the GPU with the Triton accuracy bug: expects an accuracy error
+        # and a relu-only minified graph. Requires a GPU.
         res = self._test_aoti(GPU_TYPE, "AccuracyError")
         self._aoti_check_relu_repro(res)
 
