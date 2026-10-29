@@ -1,3 +1,16 @@
+# [MODULE DOC] Translation validation for symbolic-shape guards using the Z3
+# SMT solver (optional dependency). Guards produced from SymPy expressions are
+# checked against "ground truth" expressions built from unoptimized FX nodes: the
+# validator asserts source expressions and checks that the target (guard)
+# expressions are implied by them, raising ValidationException otherwise.
+# Main contents: Python-semantics Z3 operation helpers, FX-to-Z3 and
+# SymPy-to-Z3 translators, TranslationValidator, bisect (finds a minimal failing
+# event), and the ValidationException/BisectValidationException types.
+# Import-time behavior: tries to import z3; if unavailable, sets a flag recording
+# that and exports only the config helpers and exception classes (the Z3-based
+# classes are then undefined). At the end of import it checks that z3 is
+# installed whenever translation validation is configured on, raising
+# AssertionError otherwise. Uses a module logger.
 import builtins
 import functools
 import logging
@@ -64,10 +77,19 @@ try:
     #
     #   - Collect a chain of the same operations into one
     def z3str(e: z3.ExprRef) -> str:
+        # [FUNCTION DOC] Render a Z3 expression as a compact prefix-notation
+        # string for error messages. Simplifies first; renames some operators
+        # (negated comparisons become the opposite comparison, power becomes pow),
+        # flattens chains of add/multiply, drops int/real conversions (a
+        # converted division is shown as integer division), and prints variables
+        # by name. Raises AssertionError for non-expressions or malformed
+        # negations, and ValueError for non-application expressions.
         if not z3.is_expr(e):
             raise AssertionError(f"unsupported expression type: {e}")
 
         def get_args_str(e: z3.ExprRef) -> list[str]:
+            # [FUNCTION DOC] HELPER: Strings of all arguments of e, each rendered
+            # with z3str.
             return [z3str(e.arg(i)) for i in range(e.num_args())]
 
         # First, we simplify the given expression.
@@ -95,6 +117,8 @@ try:
             # This is safe, since they are associative.
 
             def collect_str_args(e: z3.ExprRef) -> list[str]:
+                # [FUNCTION DOC] HELPER: Flatten nested applications of the same
+                # operator (add or multiply) into one list of argument strings.
                 if not (z3.is_app(e) and e.decl().kind() == kind):
                     return [z3str(e)]
                 else:
@@ -156,8 +180,14 @@ try:
     def _bitwise_op(
         bitwise_func: Callable[..., Any], bool_func: Callable[..., Any] | None
     ) -> Callable[..., Any]:
+        # [FUNCTION DOC] HELPER: Build a method implementing a bitwise operation on
+        # Z3 integers. If bool_func is given and all arguments are booleans, use
+        # it; otherwise convert the integers to 64-bit vectors, apply
+        # bitwise_func, and convert back to an integer.
         @functools.wraps(bitwise_func)
         def wrapper(self: "_Z3Ops", *args: z3.ExprRef) -> Any:
+            # [FUNCTION DOC] HELPER: The generated method; self is unused.
+            # Returns the Z3 expression for the operation on args.
             if bool_func is not None and all(
                 isinstance(arg, z3.BoolRef) for arg in args
             ):
@@ -175,6 +205,11 @@ try:
     # the (Python) semantics we are relying on in Z3.
     @dataclass
     class _Z3Ops:
+        # [CLASS DOC] HELPER: Z3 implementations of the Python numeric semantics
+        # (division, floor, ceil, trunc, min, max, mod, pow, sqrt, abs, rounding,
+        # bitwise ops) that differ from Z3's own. State: the validator, to which
+        # side conditions (non-zero divisor, non-negative sqrt argument, and so
+        # on) are added as assertions.
         # Validator used for adding assertions as needed.
         # e.g. div(a, b) requires b != 0.
         validator: "TranslationValidator"
@@ -185,22 +220,31 @@ try:
         # Returns a real expression from 'x'.
         @staticmethod
         def to_real(x: z3.ArithRef) -> z3.ArithRef:
+            # [FUNCTION DOC] HELPER: x if already real, else converted to real.
             return x if x.is_real() else z3.ToReal(x)
 
         # Returns an integer expression from 'x'.
         @staticmethod
         def to_int(x: z3.ArithRef) -> z3.ArithRef:
+            # [FUNCTION DOC] HELPER: x if already an integer, else converted with
+            # Z3's floor-style conversion.
             return x if x.is_int() else z3.ToInt(x)
 
         def sym_sum(self, args: z3.ArithRef) -> z3.ArithRef:
+            # [FUNCTION DOC] Sum of the given sequence of Z3 terms (starting from
+            # integer zero).
             return sum(args)  # pyrefly: ignore [no-matching-overload]
 
         # Implements Python division semantics.
         def div(self, numerator: z3.ArithRef, denominator: z3.ArithRef) -> z3.ArithRef:
+            # [FUNCTION DOC] True (real) division. Side effect: adds the assertion
+            # that the denominator is non-zero to the validator. Returns the real
+            # quotient.
             self.validator.add_assertion(denominator != 0)  # type: ignore[arg-type]
             return _Z3Ops.to_real(numerator) / _Z3Ops.to_real(denominator)
 
         def floor(self, number: z3.ArithRef) -> z3.ArithRef:
+            # [FUNCTION DOC] Round toward negative infinity, as an integer.
             # Z3 ToInt function rounds a real number towards negative infinity.
             return _Z3Ops.to_int(number)
 
@@ -209,6 +253,9 @@ try:
         def floordiv(
             self, numerator: z3.ArithRef, denominator: z3.ArithRef
         ) -> z3.ArithRef:
+            # [FUNCTION DOC] Python floor division: floor of the true quotient (also
+            # asserts a non-zero denominator via div). The result is real-typed if
+            # either operand is real, else an integer.
             cast_result_to_real = numerator.is_real() or denominator.is_real()
             result = _Z3Ops.to_int(self.div(numerator, denominator))
             # Since the 'result' is already an integer, we just have to check
@@ -216,28 +263,40 @@ try:
             return _Z3Ops.to_real(result) if cast_result_to_real else result
 
         def ceil(self, number: z3.ArithRef) -> z3.ArithRef:
+            # [FUNCTION DOC] Round toward positive infinity: floor of the number if
+            # it is whole, otherwise floor plus one (conditional expression).
             return z3.If(self.floor(number) < number, self.floor(number + 1), number)  # type: ignore[return-value]
 
         def trunc(self, number: z3.ArithRef) -> z3.ArithRef:
+            # [FUNCTION DOC] Round toward zero: floor for non-negative numbers,
+            # ceil for negative ones.
             return z3.If(number >= 0, self.floor(number), self.ceil(number))  # type: ignore[return-value]
 
         def max(self, a: z3.ArithRef, b: z3.ArithRef) -> z3.ArithRef:
+            # [FUNCTION DOC] Larger of a and b as a conditional Z3 expression.
             return z3.If(a > b, a, b)  # type: ignore[return-value]
 
         def min(self, a: z3.ArithRef, b: z3.ArithRef) -> z3.ArithRef:
+            # [FUNCTION DOC] Smaller of a and b as a conditional Z3 expression.
             return z3.If(a < b, a, b)  # type: ignore[return-value]
 
         # Python semantics for 'Mod' is defined as: p % q = p - floordiv(p, q) * q
         # It should work with both integer and reals.
         def mod(self, p: z3.ArithRef, q: z3.ArithRef) -> z3.ArithRef:
+            # [FUNCTION DOC] Python modulo: p minus floor division of p by q times
+            # q. Works for integers and reals; asserts q is non-zero (via div).
             return p - self.floordiv(p, q) * q
 
         def pow(self, base: z3.ArithRef, exp: z3.ArithRef) -> z3.ArithRef:
+            # [FUNCTION DOC] base raised to exp. Side effect: asserts that the base
+            # is non-zero or the exponent positive (to avoid undefined results).
             # Z3 can't handle complex numbers very well.
             self.validator.add_assertion(z3.Or(base != 0, exp > 0))  # type: ignore[arg-type]
             return base**exp
 
         def sqrt(self, number: z3.ArithRef) -> z3.ArithRef:
+            # [FUNCTION DOC] Square root of the number taken as a real, computed as
+            # a power of one half. Side effect: asserts the number is non-negative.
             # Square-root:
             # 1. Only work with reals
             number = _Z3Ops.to_real(number)
@@ -247,9 +306,13 @@ try:
             return number**0.5
 
         def abs(self, number: z3.ArithRef) -> z3.ArithRef:
+            # [FUNCTION DOC] Absolute value.
             return z3.Abs(number)
 
         def round_to_int(self, number: z3.ArithRef) -> z3.ArithRef:
+            # [FUNCTION DOC] Round half to even, as Python does. Uses round-half-up
+            # (floor of number plus one half) except when the number modulo two is
+            # exactly one half, where it uses round-half-down instead.
             # Python's builtin 'round' implements the 'round half to even' strategy
             # See https://en.wikipedia.org/wiki/Rounding#Rounding_half_to_even
             # z3 has an equivalent z3.fpRoundToIntegral(z3.RoundNearestTiesToEven(), ...), but this only applies to
@@ -280,6 +343,14 @@ try:
     def z3op(
         op: Callable[..., Any], validator: "TranslationValidator"
     ) -> Callable[..., Any]:
+        # [FUNCTION DOC] Return a Z3-compatible replacement for the Python/torch
+        # callable op. Known operators map to Z3 implementations of their Python
+        # semantics (bound to the validator so they can add side-condition
+        # assertions); unknown ones are used as is, with arguments lifted into
+        # Z3 values. torch._assert is returned unchanged as a marker. Lifting
+        # converts bool/int/float and sympy numbers, raising ValueError for
+        # other types; a single list or tuple argument is lifted element-wise.
+        # Operations in the boolean set also convert ints to booleans.
         # Operations that have booleans as their argument.
         # This is needed because the argument of some FX nodes were
         # literal integers, instead of booleans. So, whenever this flag
@@ -289,7 +360,12 @@ try:
 
         # Lifts the function into 'z3.ExprRef' domain.
         def lift(func: Callable[..., _R]) -> Callable[..., _R]:
+            # [FUNCTION DOC] HELPER: Wrap func so its arguments are first converted
+            # to Z3 values (see wrap) before the call.
             def wrap(a: object) -> z3.ExprRef:
+                # [FUNCTION DOC] HELPER: Return a unchanged if already a Z3
+                # arithmetic/boolean expression; else convert bool, int, float or
+                # sympy Integer/Float to the Z3 value. Raises ValueError otherwise.
                 if isinstance(a, (z3.ArithRef, z3.BoolRef)):
                     return a
                 # Convert it into a Z3 value, if it is some of the supported
@@ -304,6 +380,8 @@ try:
 
             @functools.wraps(func)
             def wrapper(*args: object) -> Any:
+                # [FUNCTION DOC] HELPER: Lift the arguments (or the elements of a
+                # single list/tuple argument, passed on as one tuple) and call func.
                 # Lifts the arguments into a list of Z3 inhabitants.
                 if len(args) == 1 and isinstance(args[0], (list, tuple)):
                     wrapped_args = (tuple(wrap(a) for a in args[0]),)
@@ -355,9 +433,15 @@ try:
     # it adds the Z3 expression corresponding to the argument as validator
     # input.
     class PopulateValidator(torch.fx.Interpreter):
+        # [CLASS DOC] FX interpreter that executes a guard-building graph with Z3
+        # semantics. Placeholders become Z3 variables of the validator; call nodes
+        # run lifted Z3 versions of their targets; torch._assert nodes register
+        # their argument as a source expression of the validator.
         def __init__(
             self, graph: torch.fx.Graph, validator: "TranslationValidator"
         ) -> None:
+            # [FUNCTION DOC] Store the validator and initialize the interpreter on
+            # a graph module built from graph, with garbage collection of values.
             # Reference to the translation validator.
             self.validator = validator
 
@@ -368,12 +452,20 @@ try:
         def placeholder(
             self, target: Target, args: tuple[Argument, ...], kwargs: dict[str, Any]
         ) -> Any:
+            # [FUNCTION DOC] Return the validator's Z3 variable for the sympy symbol
+            # stored in the current node's metadata. Raises KeyError if the
+            # metadata has no symbol entry.
             symbol = fx_traceback.get_current_meta()["symbol"]
             return self.validator.z3var(symbol)
 
         def call_function(
             self, target: Target, args: tuple[Argument, ...], kwargs: dict[str, Any]
         ) -> Any:
+            # [FUNCTION DOC] For a normal target, run it through the lifted Z3
+            # version and return the result. For torch._assert, register its single
+            # argument as a source expression of the validator and return None.
+            # Raises AssertionError if the assert call does not have exactly one
+            # argument.
             if target is not torch._assert:
                 # Lift and runs the node target function
                 return super().call_function(z3op(target, self.validator), args, kwargs)  # type: ignore[arg-type]
@@ -392,16 +484,26 @@ try:
     # SymPy expression being translated must be already mapped to a Z3
     # integer variable.
     class SympyToZ3:
+        # [CLASS DOC] Operation handler used with sympy_interp to translate SymPy
+        # expressions into Z3 expressions. Provides one method per supported
+        # operation (constants, casts, division flavors, pow, mod, rounding) and
+        # forwards comparison/arithmetic names to the operator module through
+        # attribute lookup. State: the validator and a Z3 ops helper. All free
+        # variables must already be defined in the validator.
         OPERATOR_HANDLES = {"add", "mul", "eq", "ne", "lt", "gt", "le", "ge"}
 
         def __init__(
             self,
             validator: "TranslationValidator",
         ) -> None:
+            # [FUNCTION DOC] Store the validator and create the Z3 ops helper
+            # bound to it.
             self._validator = validator
             self._ops = _Z3Ops(self._validator)
 
         def constant(self, value: int | float | bool, dtype: torch.dtype) -> z3.ExprRef:
+            # [FUNCTION DOC] Z3 literal for value: integer for int64, real for
+            # double, boolean for bool. Raises ValueError for other dtypes.
             # TODO: Probably OK to relax this and allow lower precision
             if dtype is torch.int64:
                 return z3.IntVal(int(value))
@@ -412,53 +514,78 @@ try:
             raise ValueError(f"unsupported dtype (SympyToZ3): {dtype}")
 
         def to_dtype(self, x: z3.ArithRef, dtype: torch.dtype) -> z3.ArithRef:
+            # [FUNCTION DOC] Convert x to a Z3 real when dtype is float64. Raises
+            # NotImplementedError for any other dtype.
             if dtype == torch.float64:
                 return z3.ToReal(x)
             raise NotImplementedError(f"to_dtype {dtype} NYI")
 
         def trunc_to_int(self, x: z3.ArithRef, dtype: torch.dtype) -> z3.ArithRef:
+            # [FUNCTION DOC] Convert x to an integer with Z3's conversion; dtype is
+            # ignored.
+            # KNOWN ISSUE: Z3's conversion floors (rounds toward negative
+            # infinity), which differs from truncation for negative values.
             return z3.ToInt(x)
 
         def round_to_int(self, x: z3.ArithRef, dtype: torch.dtype) -> z3.ArithRef:
+            # [FUNCTION DOC] Round half to even via the shared ops helper; dtype
+            # is ignored.
             return self._ops.round_to_int(x)
 
         def int_truediv(
             self, numerator: z3.ArithRef, denominator: z3.ArithRef
         ) -> z3.ArithRef:
+            # [FUNCTION DOC] True division of integers; asserts non-zero denominator.
             return self._ops.div(numerator, denominator)
 
         def truediv(
             self, numerator: z3.ArithRef, denominator: z3.ArithRef
         ) -> z3.ArithRef:
+            # [FUNCTION DOC] True division; asserts non-zero denominator.
             return self._ops.div(numerator, denominator)
 
         def floordiv(
             self, numerator: z3.ArithRef, denominator: z3.ArithRef
         ) -> z3.ArithRef:
+            # [FUNCTION DOC] Python floor division via the shared ops helper.
             return self._ops.floordiv(numerator, denominator)
 
         def div(self, numerator: z3.ArithRef, denominator: z3.ArithRef) -> z3.ArithRef:
+            # [FUNCTION DOC] Handler for the generic division op; implemented as
+            # floor division.
             return self._ops.floordiv(numerator, denominator)
 
         def pow(self, base: z3.ArithRef, exp: z3.ArithRef) -> z3.ArithRef:
+            # [FUNCTION DOC] Power via the shared ops helper (adds its side-condition
+            # assertion).
             return self._ops.pow(base, exp)
 
         def pow_by_natural(self, base: z3.ArithRef, exp: z3.ArithRef) -> z3.ArithRef:
+            # [FUNCTION DOC] Power with natural exponent; same as pow.
             return self._ops.pow(base, exp)
 
         def mod(self, p: z3.ArithRef, q: z3.ArithRef) -> z3.ArithRef:
+            # [FUNCTION DOC] Python modulo via the shared ops helper.
             return self._ops.mod(p, q)
 
         def python_mod(self, p: z3.ArithRef, q: z3.ArithRef) -> z3.ArithRef:
+            # [FUNCTION DOC] Python modulo; same as mod.
             return self._ops.mod(p, q)
 
         def ceil_to_int(self, x: z3.ArithRef, dtype: torch.dtype) -> z3.ArithRef:
+            # [FUNCTION DOC] Ceiling of x; dtype is ignored.
             return self._ops.ceil(x)
 
         def floor_to_int(self, x: z3.ArithRef, dtype: torch.dtype) -> z3.ArithRef:
+            # [FUNCTION DOC] Floor of x; dtype is ignored.
             return self._ops.floor(x)
 
         def __getattr__(self, name: str) -> Any:
+            # [FUNCTION DOC] Fallback handler lookup for operation names without a
+            # method: logical, bitwise, shift, floor, ceil, minimum and maximum map
+            # to Z3 or ops-helper callables; the arithmetic and comparison names
+            # in OPERATOR_HANDLES map to the operator module functions. Raises
+            # AttributeError for any other name.
             REPLACEMENT = {
                 "and_": z3.And,
                 "or_": z3.Or,
@@ -480,6 +607,9 @@ try:
             raise AttributeError(f"unhandled operator: {name}")
 
         def run(self, expr: sympy.Basic) -> z3.ExprRef:
+            # [FUNCTION DOC] Translate a SymPy expression to a Z3 expression by
+            # interpreting it with this object as the operation handler and the
+            # validator's symbol-to-variable mapping as the environment.
             return sympy_interp(self, self._validator.symbols, expr)  # type: ignore[arg-type]
 
     # Dynamo guards translation validator.
@@ -497,7 +627,15 @@ try:
     # i.e. whether there is an assignment of the free variables where the opposite
     # happens: target is TRUE, but source is FALSE.
     class TranslationValidator:
+        # [CLASS DOC] Collects Z3 versions of guards and checks their soundness.
+        # State: symbols (SymPy symbol to Z3 variable), source expressions (the
+        # unoptimized guards), target expressions (the guards actually checked),
+        # and extra assertions constraining both. validate asks the solver whether
+        # the target can hold while the source fails, and raises
+        # ValidationException if so.
         def __init__(self) -> None:
+            # [FUNCTION DOC] Create empty symbol table and empty sets of source
+            # expressions, target expressions and assertions.
             log.debug("new instance")
 
             # Mapping of SymPy symbols to Z3 variables.
@@ -519,12 +657,19 @@ try:
 
         # Retrieves the corresponding Z3 variable.
         def z3var(self, symbol: sympy.Symbol) -> z3.ExprRef:
+            # [FUNCTION DOC] Return the Z3 variable registered for symbol. Raises
+            # AssertionError if it was never added.
             if symbol not in self.symbols:
                 raise AssertionError(f"Z3 variable not found for: {symbol}")
             return self.symbols[symbol]
 
         # Create a variable in Z3 of 'type' for 'symbol', if it doesn't already exist.
         def add_var(self, symbol: sympy.Symbol, type: type) -> z3.ExprRef:
+            # [FUNCTION DOC] Register a Z3 variable for symbol using the Python type
+            # (int, float or bool map to Z3 integer, real, boolean), or return the
+            # existing one. For a symbol assumed positive, also adds a target
+            # expression requiring it to be greater than zero. Mutates the symbol
+            # table. Raises RuntimeError for unsupported types.
             if symbol in self.symbols:
                 return self.symbols[symbol]
 
@@ -549,6 +694,8 @@ try:
 
         # Checks whether all symbols were already added.
         def _check_freesymbols(self, e: sympy.Basic) -> None:
+            # [FUNCTION DOC] HELPER: Verify every free symbol of e is a SymPy symbol
+            # with a registered Z3 variable. Raises AssertionError otherwise.
             for s in e.free_symbols:
                 if not isinstance(s, sympy.Symbol):
                     raise AssertionError(f"Expected sympy.Symbol, got {type(s)}")
@@ -557,17 +704,27 @@ try:
                 self.z3var(s)
 
         def to_z3_boolean_expr(self, e: sympy.Basic) -> z3.BoolRef:
+            # [FUNCTION DOC] Translate a SymPy expression to Z3 with SympyToZ3.
+            # Raises AssertionError if the result is not a boolean expression.
             z3expr = SympyToZ3(self).run(e)
             if not isinstance(z3expr, z3.BoolRef):
                 raise AssertionError(f"expected boolean expression. Got: {z3expr}")
             return z3expr
 
         def add_source_expr(self, e: z3.BoolRef) -> None:
+            # [FUNCTION DOC] Record e (already a Z3 boolean) as a source guard,
+            # logging newly seen ones at debug level. Mutates the source set.
             if e not in self._source_exprs:
                 log.debug("add source guard: %s", z3str(e))
             self._source_exprs.add(e)
 
         def add_target_expr(self, e: "sympy.logic.boolalg.Boolean") -> None:
+            # [FUNCTION DOC] Check e's free symbols are registered, translate the
+            # SymPy boolean to Z3, and record it as a target guard. Raises
+            # AssertionError for unknown symbols or non-boolean results.
+            # KNOWN ISSUE: the "already present" debug-log check compares the
+            # SymPy expression against the set of Z3 expressions, so it is always
+            # true and every call is logged as new.
             self._check_freesymbols(e)
             z3expr = self.to_z3_boolean_expr(e)
             if e not in self._target_exprs:
@@ -575,6 +732,10 @@ try:
             self._target_exprs.add(z3expr)
 
         def add_assertion(self, e: z3.BoolRef | sympy.Basic) -> None:
+            # [FUNCTION DOC] Record a boolean constraint assumed to hold for both
+            # source and target. A SymPy expression is first checked for known
+            # symbols and translated to Z3. Raises AssertionError if the result
+            # is not a Z3 boolean.
             if isinstance(e, sympy.Basic):
                 self._check_freesymbols(e)
                 ref = self.to_z3_boolean_expr(e)
@@ -587,10 +748,21 @@ try:
             self._assertions.add(ref)
 
         def validate(self) -> None:
+            # [FUNCTION DOC] Run the soundness check under a Dynamo timing scope.
+            # Raises ValidationException if the target guards can hold while a
+            # source guard fails.
             with dynamo_timed("TranslationValidator.validate"):
                 return self._validate()
 
         def _validate(self) -> None:
+            # [FUNCTION DOC] HELPER: Do nothing if there are no source or target
+            # expressions. Otherwise ask a non-linear real arithmetic solver, with
+            # the configured timeout, whether all assertions plus target
+            # expressions plus the negated conjunction of the sources are
+            # satisfiable. Satisfiable: raise ValidationException with the model
+            # and the failing source expressions. Unknown (timeout): log a
+            # warning. Unsatisfiable: success. Raises AssertionError for any other
+            # solver result.
             if len(self._source_exprs) == 0 or len(self._target_exprs) == 0:
                 # If there are no source/target expressions, there's nothing we really
                 # wish to prove. So, we just return.
@@ -676,6 +848,9 @@ from torch.fx.experimental import _config as config
 
 
 def translation_validation_enabled() -> bool:
+    # [FUNCTION DOC] True when Z3 is available and the translation_validation
+    # config flag is on. Raises AssertionError if the flag is on but Z3 is
+    # missing (checked on every call).
     # Checks every time this function is called, in case the Dynamo
     # option is set, but Z3 is not installed.
     _assert_z3_installed_if_tv_set()
@@ -683,10 +858,14 @@ def translation_validation_enabled() -> bool:
 
 
 def translation_validation_timeout() -> int:
+    # [FUNCTION DOC] The configured solver timeout for translation validation
+    # (config value, passed to the Z3 solver; milliseconds in Z3).
     return config.translation_validation_timeout
 
 
 def _assert_z3_installed_if_tv_set() -> None:
+    # [FUNCTION DOC] HELPER: Raise AssertionError if translation validation is
+    # configured on but Z3 is not installed; otherwise do nothing.
     if not (_HAS_Z3 or not config.translation_validation):
         raise AssertionError(
             "translation validation requires Z3 package. Please, either install "
@@ -695,16 +874,25 @@ def _assert_z3_installed_if_tv_set() -> None:
 
 
 class ValidationException(TorchDynamoException):
+    # [CLASS DOC] Raised when translation validation finds a counterexample.
+    # State: msg (short fixed message) and details (text with the Z3 model,
+    # assertions, target expressions and failed source expressions). Prints as
+    # the message followed by the details.
     def __init__(
         self, model: Any, assertions: Any, target_exprs: Any, failed_source_exprs: Any
     ) -> None:
+        # [FUNCTION DOC] Build the details text from the Z3 model, assertions,
+        # target expressions and failed source expressions (each rendered with
+        # z3str, sorted, one per line). Raises AssertionError if Z3 is missing.
         if not _HAS_Z3:
             raise AssertionError("Z3 is required")
 
         def symbolstr(sym: Any) -> str:
+            # [FUNCTION DOC] HELPER: Text "symbol: value" using the model's value.
             return f"{sym}: {model[sym]}"
 
         def joinlines(xs: Any) -> str:
+            # [FUNCTION DOC] HELPER: One indented arrow-prefixed line per item.
             return "\n".join(f"  ==> {x}" for x in xs)
 
         model_str = joinlines(sorted(map(symbolstr, model)))
@@ -727,10 +915,14 @@ Failed Source Expressions:
 {failed_source_exprs_str}"""
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] The message, a blank line, then the details.
         return f"{self.msg}\n\n{self.details}"
 
 
 class BisectValidationException(TorchDynamoException):
+    # [CLASS DOC] Raised by bisect: a validation failure localized to a specific
+    # action (evaluating an expression or adding a runtime assert). State: msg
+    # and details (the failing node followed by the original details).
     def __init__(
         self,
         validation_exc: ValidationException,
@@ -738,6 +930,9 @@ class BisectValidationException(TorchDynamoException):
         failed_action: str,
         traced_node: torch.fx.Node,
     ) -> None:
+        # [FUNCTION DOC] Build the message naming the failed action and SymPy
+        # expression, and details showing the formatted traced node plus the
+        # wrapped ValidationException's details.
         self.msg = f"translation validation failed when {failed_action}: {expr}"
         self.details = f"""\
 Failure occurred while running node:
@@ -746,6 +941,7 @@ Failure occurred while running node:
 {validation_exc.details}"""
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] The message, a blank line, then the details.
         return f"{self.msg}\n\n{self.details}"
 
 
@@ -762,6 +958,14 @@ _assert_z3_installed_if_tv_set()
 # might be silently happening. This function tries to nail down exactly at which
 # point things went wrong from a validation perspective.
 def bisect(shape_env: "ShapeEnv") -> None:
+    # [FUNCTION DOC] Check whether producing guards for shape_env fails
+    # validation. If not, log success and return. If it fails and bisection is
+    # off (events not recorded or disabled by config), re-raise that
+    # ValidationException. Otherwise binary-search the recorded torch._assert
+    # nodes, replaying shape-env events up to each, to find the earliest one
+    # whose replay fails, then raise BisectValidationException describing that
+    # event (evaluating an expression or adding a runtime assert). Always raises
+    # when validation fails; raises AssertionError on inconsistent event data.
     from torch.fx.experimental.recording import (
         FakeTensorMeta,
         replay_shape_env_events,
@@ -777,6 +981,8 @@ def bisect(shape_env: "ShapeEnv") -> None:
 
     # Retrieves the ShapeEnvEvent associated with node.
     def get_node_event(node: torch.fx.Node) -> ShapeEnvEvent:
+        # [FUNCTION DOC] HELPER: The recorded shape-env event referenced by the
+        # node's metadata. Raises AssertionError if the metadata key is missing.
         if SHAPEENV_EVENT_KEY not in node.meta:
             raise AssertionError("SHAPEENV_EVENT_KEY not in node.meta")
         return events[node.meta[SHAPEENV_EVENT_KEY]]
@@ -786,6 +992,8 @@ def bisect(shape_env: "ShapeEnv") -> None:
     #
     # This is needed so as not to simplify a symbolic expression using a ShapeEnv
     # "from the future", where it may have a different set of replacements.
+    # [FUNCTION DOC] HELPER: Typing overload stubs for new_with_shape_env (the
+    # next three overloads and the implementation below carry the behavior).
     @overload
     def new_with_shape_env(shape_env: ShapeEnv, fake: int) -> int: ...
 
@@ -805,6 +1013,11 @@ def bisect(shape_env: "ShapeEnv") -> None:
     def new_with_shape_env(
         shape_env: ShapeEnv, fake: int | torch.SymInt | torch.SymFloat | FakeTensorMeta
     ) -> int | torch.SymInt | torch.SymFloat | FakeTensorMeta:
+        # [FUNCTION DOC] HELPER: Copy of fake whose symbolic values refer to the
+        # given shape_env. Ints are returned as is; SymInt and SymFloat get a node
+        # rebound to shape_env; tensor metadata is rebuilt with each size, stride
+        # and storage offset converted recursively. Raises AssertionError for
+        # other types.
         if isinstance(fake, int):
             return fake
         if isinstance(fake, torch.SymInt):
@@ -824,6 +1037,9 @@ def bisect(shape_env: "ShapeEnv") -> None:
     def check_shapeenv_fails(
         shape_env: ShapeEnv, tracked_fakes: list["TrackedFake"] | None
     ) -> ValidationException | None:
+        # [FUNCTION DOC] HELPER: Call produce_guards on shape_env with the tracked
+        # fakes rebound to it. Returns the ValidationException if one is raised,
+        # else None. Raises AssertionError if tracked_fakes is None.
         if tracked_fakes is None:
             raise AssertionError("tracked_fakes is None")
         try:
@@ -843,6 +1059,9 @@ def bisect(shape_env: "ShapeEnv") -> None:
     # Checks whether the ShapeEnv reconstructed by replaying the events until
     # node is created fails when produce_guards is called.
     def check_node_fails(node: torch.fx.Node) -> ValidationException | None:
+        # [FUNCTION DOC] HELPER: Rebuild a shape environment by replaying recorded
+        # events up to and including the node's event, lint its graph, and report
+        # whether guard production then fails validation (the exception or None).
         number = node.meta[SHAPEENV_EVENT_KEY]
         # Reconstruct shape_env until the event at event_number.
         shape_env = replay_shape_env_events(events[: number + 1])

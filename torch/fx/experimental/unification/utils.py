@@ -1,3 +1,7 @@
+# [MODULE DOC] Small utilities for the unification package: hashability test,
+# transitive dict lookup, exception-expectation helpers (raises, xfail),
+# topological sort (_toposort, reverse_dict), and freeze for making containers
+# hashable. No import-time side effects.
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, TypeVar
@@ -15,6 +19,7 @@ __all__ = ["hashable", "transitive_get", "raises", "reverse_dict", "xfail", "fre
 
 
 def hashable(x: object) -> bool:
+    # [FUNCTION DOC] True if x can be hashed, False if hashing raises TypeError.
     try:
         hash(x)
         return True
@@ -23,6 +28,9 @@ def hashable(x: object) -> bool:
 
 
 def transitive_get(key: object, d: dict[Var, object]) -> object:
+    # [FUNCTION DOC] Repeatedly look up key in d while the current value is
+    # hashable and present as a key; return the final value. Loops forever if d
+    # contains a cycle (for example a variable bound to itself indirectly).
     """Transitive dict.get
     >>> d = {1: 2, 2: 3, 3: 4}
     >>> d.get(1)
@@ -39,6 +47,9 @@ def raises(
     err: type[BaseException],
     lamda: Callable[[], object],  # codespell:ignore lamda
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Call the zero-argument callable; return True if it
+    # raises err (or a subclass), False if it returns normally. Other exceptions
+    # propagate.
     try:
         lamda()  # codespell:ignore lamda
         return False
@@ -49,6 +60,12 @@ def raises(
 # Taken from theano/theano/gof/sched.py
 # Avoids licensing issues because this was written by Matthew Rocklin
 def _toposort(edges: dict[_T, Iterable[_T]]) -> list[_T]:
+    # [FUNCTION DOC] HELPER: Kahn topological sort. edges maps a node to the nodes
+    # that depend on it; returns nodes ordered so each precedes its dependents.
+    # Starts from nodes with no incoming edges (picked in set order, so ties are
+    # not deterministic). Raises ValueError("Input has cycles") on cycles.
+    # KNOWN ISSUE: nodes appearing only as dependents (not keys of edges) are
+    # never emitted unless they also have a key.
     """Topological sort algorithm by Kahn [1] - O(nodes + vertices)
     inputs:
         edges - a dict of the form {a: {b, c}} where b and c depend on a
@@ -82,6 +99,9 @@ def _toposort(edges: dict[_T, Iterable[_T]]) -> list[_T]:
 
 
 def reverse_dict(d: dict[_T, Iterable[_T]]) -> dict[_T, tuple[_T, ...]]:
+    # [FUNCTION DOC] Invert a dependency mapping: for each value found in any
+    # key's iterable, map it to a tuple of the keys that listed it. Keys with
+    # empty iterables do not appear in the result. Order follows dict iteration.
     """Reverses direction of dependence dict.
 
     >>> d = {"a": (1, 2), "b": (2, 3), "c": ()}
@@ -103,6 +123,10 @@ def reverse_dict(d: dict[_T, Iterable[_T]]) -> dict[_T, tuple[_T, ...]]:
 
 
 def xfail(func: Callable[[], object]) -> None:
+    # [FUNCTION DOC] HELPER: Intended to assert that func fails. Calls func and
+    # always returns None.
+    # KNOWN ISSUE: the "XFailed test passed" exception is raised inside the try
+    # block and is swallowed by the broad except, so this never raises.
     try:
         func()
         raise Exception("XFailed test passed")  # pragma:nocover  # noqa: TRY002
@@ -111,6 +135,9 @@ def xfail(func: Callable[[], object]) -> None:
 
 
 def freeze(d: object) -> object:
+    # [FUNCTION DOC] Recursively convert containers to hashable form: dict to
+    # frozenset of frozen items, set to frozenset, tuple/list to tuple; other
+    # values are returned unchanged. Pure.
     """Freeze container to hashable form
     >>> freeze(1)
     1

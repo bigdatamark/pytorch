@@ -1,3 +1,7 @@
+# [MODULE DOC] Public entry point of the multipledispatch implementation: the
+# dispatch decorator factory and the ismethod heuristic. Holds a module-level
+# global_namespace mapping function names to Dispatcher objects (used when no
+# namespace is given). Exports dispatch and ismethod.
 from __future__ import annotations
 
 import inspect
@@ -22,6 +26,12 @@ _Ts = TypeVarTuple("_Ts")
 def dispatch(
     *types: Unpack[_Ts], **kwargs: Any
 ) -> Callable[[Callable[..., _T]], Callable[..., _T]]:
+    # [FUNCTION DOC] Return a decorator that registers the decorated function for
+    # the given positional argument types. Only the namespace keyword is used
+    # (default global_namespace); other keywords are ignored. The decorator
+    # finds or creates a Dispatcher named after the function (in the namespace,
+    # or, for methods, in the caller's local scope), adds the implementation, and
+    # returns the dispatcher. Mutates the namespace.
     """Dispatch function on the types of the inputs
     Supports dispatch on all non-keyword arguments.
     Collects implementations based on the function name.  Ignores namespaces.
@@ -65,6 +75,10 @@ def dispatch(
     types_tuple: tuple[type, ...] = tuple(types)  # type: ignore[arg-type]
 
     def _df(func: Callable[..., _T]) -> Callable[..., _T]:
+        # [FUNCTION DOC] HELPER: Register func with its dispatcher and return the
+        # dispatcher. Methods (first parameter named self) look the dispatcher up
+        # in the defining frame's locals via frame inspection, creating a
+        # MethodDispatcher if absent; plain functions use the namespace mapping.
         name = func.__name__
 
         if ismethod(func):
@@ -84,6 +98,8 @@ def dispatch(
 
 
 def ismethod(func: Callable[..., object]) -> bool:
+    # [FUNCTION DOC] Heuristic: True if func has a parameter named self. Needed
+    # because methods look like plain functions while the class body runs.
     """Is func a method?
     Note that this has to work as the method is defined but before the class is
     defined.  At this stage methods look like functions.

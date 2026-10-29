@@ -1,3 +1,7 @@
+# [MODULE DOC] Helper utilities for the multipledispatch implementation:
+# exception check (raises), expansion of tuple-of-types signatures
+# (expand_tuples), ordered topological sort (_toposort, reverse_dict), ordered
+# groupby, and type name formatting (typename). No import-time side effects.
 from __future__ import annotations
 
 from collections import OrderedDict
@@ -17,6 +21,8 @@ def raises(
     err: type[BaseException],
     lamda: Callable[[], object],  # codespell:ignore lamda
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Call the zero-argument callable; True if it raises
+    # err (or subclass), False if it returns normally; other errors propagate.
     try:
         lamda()  # codespell:ignore lamda
         return False
@@ -25,6 +31,10 @@ def raises(
 
 
 def expand_tuples(L: Sequence[type | tuple[type, ...]]) -> list[tuple[type, ...]]:
+    # [FUNCTION DOC] Expand a signature whose entries may be tuples of
+    # alternatives into the list of all concrete signatures (cartesian product,
+    # first position varying slowest). An empty input gives a list holding one
+    # empty tuple. Recursive.
     """
     >>> expand_tuples([1, (2, 3)])
     [(1, 2), (1, 3)]
@@ -44,6 +54,10 @@ def expand_tuples(L: Sequence[type | tuple[type, ...]]) -> list[tuple[type, ...]
 # Taken from theano/theano/gof/sched.py
 # Avoids licensing issues because this was written by Matthew Rocklin
 def _toposort(edges: Mapping[_T, Iterable[_T]]) -> list[_T]:
+    # [FUNCTION DOC] HELPER: Kahn topological sort; edges maps a node to the
+    # nodes that depend on it. Returns nodes with dependencies after their
+    # prerequisites, deterministically (ordered dicts; the most recently added
+    # ready node is taken first). Raises ValueError("Input has cycles") on cycles.
     """Topological sort algorithm by Kahn [1] - O(nodes + vertices)
     inputs:
         edges - a dict of the form {a: {b, c}} where b and c depend on a
@@ -78,6 +92,9 @@ def _toposort(edges: Mapping[_T, Iterable[_T]]) -> list[_T]:
 def reverse_dict(
     d: Mapping[_T, Iterable[_T]],
 ) -> OrderedDict[_T, tuple[_T, ...]]:
+    # [FUNCTION DOC] Invert a dependency mapping: each value found in any key's
+    # iterable maps to a tuple of the keys listing it. Keys with empty iterables
+    # are absent. Order follows first insertion.
     """Reverses direction of dependence dict.
 
     >>> d = {"a": (1, 2), "b": (2, 3), "c": ()}
@@ -103,6 +120,8 @@ def reverse_dict(
 def groupby(
     func: Callable[[_T], object], seq: Iterable[_T]
 ) -> OrderedDict[object, list[_T]]:
+    # [FUNCTION DOC] Group items of seq by func(item) into an ordered mapping of
+    # key to list of items, preserving first-seen key order and item order.
     """Group a collection by a key function
     >>> names = ["Alice", "Bob", "Charlie", "Dan", "Edith", "Frank"]
     >>> groupby(len, names)  # doctest: +SKIP
@@ -124,6 +143,8 @@ def groupby(
 
 
 def typename(type: type | tuple[type, ...]) -> str:
+    # [FUNCTION DOC] Return the name of a type; for a tuple of types, the names
+    # joined by commas in parentheses (a one-element tuple gives just that name).
     """Get the name of `type`.
     Parameters
     ----------

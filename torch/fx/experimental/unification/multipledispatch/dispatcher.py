@@ -1,3 +1,10 @@
+# [MODULE DOC] Core of the multiple-dispatch machinery. Dispatcher stores
+# implementations keyed by tuples of types (with optional trailing variadic),
+# orders them from most to least specific, caches lookups per argument-type
+# tuple, and calls the best match (falling back to less specific ones when an
+# implementation raises MDNotImplementedError). Also contains MethodDispatcher
+# (descriptor for methods), deprecated ordering toggles, variadic matching
+# helpers, and signature/warning text formatting. No import-time side effects.
 from __future__ import annotations
 
 import inspect
@@ -34,12 +41,16 @@ __all__ = [
 
 
 class MDNotImplementedError(NotImplementedError):
+    # [CLASS DOC] Raised by an implementation to signal that the dispatcher
+    # should try the next less specific matching implementation.
     """A NotImplementedError for multiple dispatch"""
 
 
 def ambiguity_warn(
     dispatcher: Dispatcher, ambiguities: set[tuple[tuple[type, ...], tuple[type, ...]]]
 ) -> None:
+    # [FUNCTION DOC] Emit an AmbiguityWarning whose text lists the ambiguous
+    # signature pairs of the dispatcher and suggested disambiguating signatures.
     """Raise warning when ambiguity is detected.
 
     Parameters
@@ -62,6 +73,8 @@ def ambiguity_warn(
     category=FutureWarning,
 )
 def halt_ordering() -> None:
+    # [FUNCTION DOC] Deprecated no-op kept for compatibility; emits a
+    # FutureWarning when called (via the deprecated decorator).
     """Deprecated interface to temporarily disable ordering."""
 
 
@@ -71,12 +84,21 @@ def halt_ordering() -> None:
     category=FutureWarning,
 )
 def restart_ordering(on_ambiguity: Callable[..., None] = ambiguity_warn) -> None:
+    # [FUNCTION DOC] Deprecated no-op kept for compatibility; the on_ambiguity
+    # argument is ignored. Emits a FutureWarning when called.
     """Deprecated interface to temporarily resume ordering."""
 
 
 def variadic_signature_matches_iter(
     types: tuple[type, ...], full_signature: tuple[type, ...]
 ) -> Generator[bool, None, None]:
+    # [FUNCTION DOC] HELPER: Generator yielding one boolean per input type saying
+    # whether it matches the corresponding signature element (a variadic element
+    # is reused for all remaining types), then a final boolean: True if the
+    # signature ended on a variadic, False if signature elements were left over.
+    # Raises AssertionError if the signature runs out on a non-variadic element.
+    # Raises StopIteration-derived errors (RuntimeError in a generator) if types
+    # outnumber a signature that has no trailing variadic.
     """Check if a set of input types matches a variadic signature.
 
     Notes
@@ -121,6 +143,8 @@ def variadic_signature_matches_iter(
 def variadic_signature_matches(
     types: tuple[type, ...], full_signature: tuple[type, ...]
 ) -> bool:
+    # [FUNCTION DOC] True if every check from variadic_signature_matches_iter
+    # passes. Raises AssertionError if full_signature is empty.
     # No arguments always matches a variadic signature
     if not full_signature:
         raise AssertionError("full_signature is empty")
@@ -128,6 +152,12 @@ def variadic_signature_matches(
 
 
 class Dispatcher:
+    # [CLASS DOC] Callable holding implementations keyed by tuples of types.
+    # State (slots): name; funcs, mapping signature to function; _cache, mapping
+    # a tuple of runtime argument types to the resolved function (cleared on
+    # add); _ordering, lazily computed specificity order (deleted on add); doc,
+    # optional extra documentation. Calling it picks the most specific matching
+    # implementation by argument types.
     """Dispatch methods based on type signature
     Use ``dispatch`` to add implementations
     Examples
@@ -149,6 +179,8 @@ class Dispatcher:
     __slots__ = "__name__", "name", "funcs", "_ordering", "_cache", "doc"
 
     def __init__(self, name: str, doc: str | None = None) -> None:
+        # [FUNCTION DOC] Initialize name, empty implementation table, optional doc
+        # text and empty lookup cache. The ordering is computed lazily.
         self.name = self.__name__ = name
         self.funcs: dict[tuple[type, ...], Callable[..., object]] = {}
         self.doc = doc
@@ -158,6 +190,9 @@ class Dispatcher:
     def register(
         self, *types: type, **kwargs: object
     ) -> Callable[[Callable[..., _T]], Callable[..., _T]]:
+        # [FUNCTION DOC] Return a decorator that adds the decorated function to
+        # this dispatcher for the given types (extra kwargs are forwarded to add)
+        # and returns the function itself, so decorators can be stacked.
         """register dispatcher with new implementation
         >>> # xdoctest: +SKIP
         >>> f = Dispatcher("f")
@@ -180,6 +215,9 @@ class Dispatcher:
         """
 
         def _df(func: Callable[..., _T]) -> Callable[..., _T]:
+            # [FUNCTION DOC] HELPER: Add func under the captured types; return func.
+            # KNOWN ISSUE: add accepts no keyword arguments, so non-empty kwargs
+            # given to register would raise TypeError here.
             self.add(types, func, **kwargs)  # type: ignore[call-arg]
             return func
 
@@ -189,6 +227,8 @@ class Dispatcher:
     def get_func_params(
         cls, func: Callable[..., object]
     ) -> Iterable[inspect.Parameter] | None:
+        # [FUNCTION DOC] Return the parameters of func from its signature (all
+        # of them). Returns None if inspect lacks signature support.
         if hasattr(inspect, "signature"):
             sig = inspect.signature(func)
             return sig.parameters.values()
@@ -197,6 +237,8 @@ class Dispatcher:
     def get_func_annotations(
         cls, func: Callable[..., object]
     ) -> tuple[type, ...] | None:
+        # [FUNCTION DOC] Return the annotations of func's positional parameters as
+        # a tuple, or None if there are no parameters or any is unannotated.
         """get annotations of function positional parameters"""
         params = cls.get_func_params(func)
         if params:
@@ -215,6 +257,12 @@ class Dispatcher:
                 return annotations
 
     def add(self, signature: tuple[type, ...], func: Callable[..., object]) -> None:
+        # [FUNCTION DOC] Register func for signature. An empty signature falls back
+        # to func's parameter annotations. Tuple entries (unions) are expanded
+        # into several signatures. A one-element list entry in last position
+        # becomes a variadic type. Stores the function, clears the lookup cache
+        # and invalidates the cached ordering. Raises TypeError for non-type
+        # entries, a non-last variadic, or a variadic list without exactly one item.
         """Add new types/method pair to dispatcher
         >>> # xdoctest: +SKIP
         >>> D = Dispatcher("add")
@@ -281,6 +329,8 @@ class Dispatcher:
 
     @property
     def ordering(self) -> list[tuple[type, ...]]:
+        # [FUNCTION DOC] Property: the cached specificity ordering of signatures,
+        # computed (with ambiguity warnings) on first access after a change.
         try:
             return self._ordering
         except AttributeError:
@@ -289,6 +339,9 @@ class Dispatcher:
     def reorder(
         self, on_ambiguity: Callable[..., None] = ambiguity_warn
     ) -> list[tuple[type, ...]]:
+        # [FUNCTION DOC] Recompute and store the signature ordering. If ambiguous
+        # signature pairs exist, call on_ambiguity with the dispatcher and the
+        # pairs (default emits a warning). Returns the ordering.
         self._ordering = od = ordering(self.funcs)
         amb = ambiguities(self.funcs)
         if amb:
@@ -296,6 +349,10 @@ class Dispatcher:
         return od
 
     def __call__(self, *args: object, **kwargs: object) -> object:
+        # [FUNCTION DOC] Look up (and cache) the implementation for the runtime
+        # types of args and call it with args and kwargs. If it raises
+        # MDNotImplementedError, try the remaining matches in order. Raises
+        # NotImplementedError if there is no match or all matches decline.
         types = tuple(type(arg) for arg in args)
         try:
             func = self._cache[types]
@@ -324,11 +381,15 @@ class Dispatcher:
             ) from e
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Short text naming the dispatcher (also used as repr).
         return f"<dispatched {self.name}>"
 
     __repr__ = __str__
 
     def dispatch(self, *types: type) -> Callable[..., object] | None:
+        # [FUNCTION DOC] Return the implementation for the given argument types:
+        # an exact signature match if present, else the first entry of
+        # dispatch_iter; None if nothing matches.
         """Determine appropriate implementation for this type signature
         This method is internal.  Users should call this object as a function.
         Implementation resolution occurs within the ``__call__`` method.
@@ -357,6 +418,10 @@ class Dispatcher:
     def dispatch_iter(
         self, *types: type
     ) -> Generator[Callable[..., object], None, None]:
+        # [FUNCTION DOC] Generator over all implementations whose signature
+        # matches the given types, in specificity order. Fixed-length signatures
+        # need equal length and per-position subclass relations; signatures ending
+        # in a variadic use the variadic matching rules.
         n = len(types)
         for signature in self.ordering:
             if len(signature) == n and all(map(issubclass, types, signature)):
@@ -371,6 +436,8 @@ class Dispatcher:
         "`resolve()` is deprecated, use `dispatch(*types)`", category=FutureWarning
     )
     def resolve(self, types: tuple[type, ...]) -> Callable[..., object] | None:
+        # [FUNCTION DOC] Deprecated alias for dispatch taking the types as one
+        # tuple; emits a FutureWarning.
         """Determine appropriate implementation for this type signature
         .. deprecated:: 0.4.4
             Use ``dispatch(*types)`` instead
@@ -378,9 +445,15 @@ class Dispatcher:
         return self.dispatch(*types)
 
     def __getstate__(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Pickle support: state is only the name and the
+        # implementation table (the cache, ordering and doc are not saved).
         return {"name": self.name, "funcs": self.funcs}
 
     def __setstate__(self, d: dict[str, Any]) -> None:
+        # [FUNCTION DOC] Restore name and implementations from d, recompute the
+        # ordering (without ambiguity warnings) and reset the cache.
+        # KNOWN ISSUE: the doc and __name__ slots are not restored, so accessing
+        # them on an unpickled dispatcher raises AttributeError.
         self.name = d["name"]
         self.funcs = d["funcs"]
         self._ordering = ordering(self.funcs)
@@ -388,6 +461,10 @@ class Dispatcher:
 
     @property
     def __doc__(self):  # type: ignore[override]
+        # [FUNCTION DOC] Property building documentation text: a header with the
+        # name, the optional doc, then each implementation's docstring under an
+        # "Inputs" heading (least specific first), then a list of signatures
+        # whose functions lack docstrings. Returns the joined string.
         docs = [f"Multiply dispatched method: {self.name}"]
 
         if self.doc:
@@ -410,30 +487,48 @@ class Dispatcher:
         return "\n\n".join(docs)
 
     def _help(self, *args: object) -> str | None:
+        # [FUNCTION DOC] HELPER: Docstring of the implementation chosen for the
+        # types of args.
+        # KNOWN ISSUE: if no implementation matches, dispatch returns None and
+        # the result is the generic docstring of None rather than an error.
         return self.dispatch(*map(type, args)).__doc__
 
     def help(self, *args: object, **kwargs: object) -> None:
+        # [FUNCTION DOC] Print (to stdout) the docstring of the implementation
+        # that would handle args. kwargs are ignored.
         """Print docstring for the function corresponding to inputs"""
         print(self._help(*args))
 
     def _source(self, *args: object) -> str:
+        # [FUNCTION DOC] HELPER: Source text of the implementation chosen for the
+        # types of args. Raises TypeError if none matches.
         func = self.dispatch(*map(type, args))
         if not func:
             raise TypeError("No function found")
         return source(func)
 
     def source(self, *args: object, **kwargs: object) -> None:
+        # [FUNCTION DOC] Print (to stdout) the source of the implementation that
+        # would handle args. kwargs are ignored. Raises TypeError if none matches.
         """Print source code for the function corresponding to inputs"""
         print(self._source(*args))
 
 
 def source(func: Callable[..., object]) -> str:
+    # [FUNCTION DOC] Return a string with the file path of func followed by its
+    # source code. May raise OSError or TypeError for objects without source.
     s = f"File: {inspect.getsourcefile(func)}\n\n"
     s = s + inspect.getsource(func)
     return s
 
 
 class MethodDispatcher(Dispatcher):
+    # [CLASS DOC] Dispatcher usable as a class attribute (descriptor). Extra
+    # slots obj and cls record the instance and owner from the last attribute
+    # access; the instance is passed as the first argument to the implementation.
+    # Signatures exclude the self parameter when reading annotations.
+    # KNOWN ISSUE: obj and cls are stored on the shared dispatcher, so this is
+    # not safe across instances used concurrently or interleaved.
     """Dispatch methods based on type signature
     See Also:
         Dispatcher
@@ -445,16 +540,24 @@ class MethodDispatcher(Dispatcher):
     def get_func_params(
         cls, func: Callable[..., object]
     ) -> Iterator[inspect.Parameter] | None:
+        # [FUNCTION DOC] Like the base version but skips the first parameter
+        # (self). Returns None if inspect lacks signature support.
         if hasattr(inspect, "signature"):
             sig = inspect.signature(func)
             return itl.islice(sig.parameters.values(), 1, None)
 
     def __get__(self, instance: object | None, owner: type) -> MethodDispatcher:
+        # [FUNCTION DOC] Descriptor hook: remember the accessing instance and
+        # owner class on this dispatcher (mutation) and return the dispatcher.
         self.obj = instance
         self.cls = owner
         return self
 
     def __call__(self, *args: object, **kwargs: object) -> object:
+        # [FUNCTION DOC] Find the implementation for the runtime types of args
+        # and call it with the remembered instance first, then args and kwargs.
+        # Raises NotImplementedError if no signature matches. Unlike the base
+        # class it does not cache or fall back on MDNotImplementedError.
         types = tuple(type(arg) for arg in args)
         func = self.dispatch(*types)
         if not func:
@@ -465,6 +568,7 @@ class MethodDispatcher(Dispatcher):
 
 
 def str_signature(sig: Iterable[type]) -> str:
+    # [FUNCTION DOC] Comma-separated names of the types in sig.
     """String representation of type signature
     >>> str_signature((int, float))
     'int, float'
@@ -473,6 +577,9 @@ def str_signature(sig: Iterable[type]) -> str:
 
 
 def warning_text(name: str, amb: set[tuple[tuple[type, ...], tuple[type, ...]]]) -> str:
+    # [FUNCTION DOC] Build the ambiguity warning message for function name: list
+    # each ambiguous signature pair, then suggest a disambiguating dispatch
+    # declaration per pair using super_signature.
     """The text for ambiguity warnings"""
     text = f"\nAmbiguities exist in dispatched function {name}\n\n"
     text += "The following signatures may result in ambiguous behavior:\n"

@@ -1,3 +1,8 @@
+# [MODULE DOC] Vendored subset of the toolz dictionary utilities used by the
+# unification code: merging, mapping and filtering dict keys/values/items,
+# non-mutating assoc/dissoc, nested update/get, plus groupby and first helpers.
+# Functions return new containers built with an optional factory type (default
+# dict) and do not mutate their inputs. No import-time side effects.
 from __future__ import annotations
 
 import collections
@@ -35,6 +40,9 @@ __all__ = [
 
 
 def _get_factory(f: Callable[..., object], kwargs: dict[str, object]) -> type:
+    # [FUNCTION DOC] HELPER: Pop the optional "factory" entry (default dict) from
+    # kwargs and return it. Raises TypeError naming function f if any other
+    # keyword remains. Mutates kwargs.
     factory: type = kwargs.pop("factory", dict)  # type: ignore[assignment]
     if kwargs:
         raise TypeError(
@@ -44,6 +52,10 @@ def _get_factory(f: Callable[..., object], kwargs: dict[str, object]) -> type:
 
 
 def merge(*dicts: Mapping[object, object], **kwargs: object) -> object:
+    # [FUNCTION DOC] Merge mappings into one new container (factory kwarg,
+    # default dict); later mappings override earlier keys. A single non-mapping
+    # argument is treated as an iterable of mappings. Raises TypeError on
+    # unknown keyword arguments.
     """Merge a collection of dictionaries
 
     >>> merge({1: "one"}, {2: "two"})
@@ -70,6 +82,10 @@ def merge(*dicts: Mapping[object, object], **kwargs: object) -> object:
 def merge_with(
     func: Callable[..., object], *dicts: Mapping[object, object], **kwargs: object
 ) -> object:
+    # [FUNCTION DOC] Merge mappings, collecting every value seen for a key into a
+    # list (in argument order), then replace each list with func applied to it.
+    # Accepts the same single-iterable form and factory kwarg as merge. Raises
+    # TypeError on unknown keyword arguments.
     """Merge dictionaries and apply function to combined values
 
     A key may occur in more than one dict, and all values mapped from the key
@@ -101,6 +117,8 @@ def merge_with(
 def valmap(
     func: Callable[[_V], _V2], d: Mapping[_K, _V], factory: type = dict
 ) -> dict[_K, _V2]:
+    # [FUNCTION DOC] Return a new mapping (built by factory) with the same keys
+    # and func applied to each value.
     """Apply function to values of dictionary
 
     >>> bills = {"Alice": [20, 15, 30], "Bob": [10, 35]}
@@ -119,6 +137,8 @@ def valmap(
 def keymap(
     func: Callable[[_K], _K2], d: Mapping[_K, _V], factory: type = dict
 ) -> dict[_K2, _V]:
+    # [FUNCTION DOC] Return a new mapping (built by factory) with func applied to
+    # each key and the values kept. Colliding new keys: the later one wins.
     """Apply function to keys of dictionary
 
     >>> bills = {"Alice": [20, 15, 30], "Bob": [10, 35]}
@@ -137,6 +157,8 @@ def keymap(
 def itemmap(
     func: Callable[[tuple[_K, _V]], object], d: Mapping[_K, _V], factory: type = dict
 ) -> dict[object, object]:
+    # [FUNCTION DOC] Return a new mapping (built by factory) from applying func
+    # to each (key, value) pair; func must return a pair usable to update a dict.
     """Apply function to items of dictionary
 
     >>> accountids = {"Alice": 10, "Bob": 20}
@@ -155,6 +177,8 @@ def itemmap(
 def valfilter(
     predicate: Callable[[_V], bool], d: Mapping[_K, _V], factory: type = dict
 ) -> dict[_K, _V]:
+    # [FUNCTION DOC] Return a new mapping (built by factory) containing only the
+    # items whose value satisfies predicate.
     """Filter items in dictionary by value
 
     >>> iseven = lambda x: x % 2 == 0
@@ -177,6 +201,8 @@ def valfilter(
 def keyfilter(
     predicate: Callable[[_K], bool], d: Mapping[_K, _V], factory: type = dict
 ) -> dict[_K, _V]:
+    # [FUNCTION DOC] Return a new mapping (built by factory) containing only the
+    # items whose key satisfies predicate.
     """Filter items in dictionary by key
 
     >>> iseven = lambda x: x % 2 == 0
@@ -199,6 +225,8 @@ def keyfilter(
 def itemfilter(
     predicate: Callable[[tuple[_K, _V]], bool], d: Mapping[_K, _V], factory: type = dict
 ) -> dict[_K, _V]:
+    # [FUNCTION DOC] Return a new mapping (built by factory) containing only the
+    # items for which predicate, called with the (key, value) pair, is true.
     """Filter items in dictionary by item
 
     >>> def isvalid(item):
@@ -225,6 +253,8 @@ def itemfilter(
 def assoc(
     d: Mapping[_K, _V], key: object, value: object, factory: type = dict
 ) -> dict[_K, _V]:
+    # [FUNCTION DOC] Copy d into a new container (factory), set key to value, and
+    # return it. The input is not modified. Used by unify to extend substitutions.
     """Return a new dict with new key value pair
 
     New dict has d[key] set to value. Does not modify the initial dictionary.
@@ -241,6 +271,10 @@ def assoc(
 
 
 def dissoc(d: Mapping[object, object], *keys: object, **kwargs: object) -> object:
+    # [FUNCTION DOC] Return a new container (factory kwarg) equal to d without
+    # the given keys; missing keys are ignored. Chooses copy-then-delete when few
+    # keys are removed, otherwise rebuilds from the remaining keys. Raises
+    # TypeError on unknown keyword arguments.
     """Return a new dict with the given key(s) removed.
 
     New dict has d[key] deleted for each supplied key.
@@ -275,6 +309,9 @@ def assoc_in(
     value: object,
     factory: type = dict,
 ) -> object:
+    # [FUNCTION DOC] Return a copy of nested mapping d with the location named by
+    # keys set to value, creating intermediate mappings as needed. Implemented
+    # via update_in with a constant function. Input is not mutated.
     """Return a new dict with new, potentially nested, key value pair
 
     >>> purchase = {
@@ -297,6 +334,10 @@ def update_in(
     default: object = None,
     factory: type = dict,
 ) -> object:
+    # [FUNCTION DOC] Return a copy of nested mapping d where the value at the key
+    # path is replaced by func(old value), or func(default) if the path is
+    # missing (creating nested mappings). Only the containers along the path are
+    # copied. Raises StopIteration if keys is empty.
     """Update value in a (potentially) nested dictionary
 
     inputs:
@@ -361,6 +402,9 @@ def get_in(
     default: object = None,
     no_default: bool = False,
 ) -> object:
+    # [FUNCTION DOC] Follow the sequence of keys/indices through nested coll and
+    # return the final item. On KeyError, IndexError or TypeError returns
+    # default, or re-raises that error when no_default is true.
     """Returns coll[i0][i1]...[iX] where [i0, i1, ..., iX]==keys.
 
     If coll[i0][i1]...[iX] cannot be found, returns ``default``, unless
@@ -405,6 +449,10 @@ def get_in(
 
 
 def getter(index: object) -> Callable[..., object]:
+    # [FUNCTION DOC] HELPER: Build an accessor from index. A one-element list
+    # gives a function returning a one-tuple, a longer list gives an item getter
+    # returning a tuple, an empty list gives a function returning an empty tuple,
+    # and any other value gives a plain item getter.
     if isinstance(index, list):
         if len(index) == 1:
             index = index[0]
@@ -418,6 +466,9 @@ def getter(index: object) -> Callable[..., object]:
 
 
 def groupby(key: object, seq: Iterable[object]) -> dict[object, list[object]]:
+    # [FUNCTION DOC] Group items of seq into a dict mapping key value to the list
+    # of items (original order kept). A non-callable key is converted with getter
+    # so items are grouped by that index/member.
     """Group a collection by a key function
 
     >>> names = ["Alice", "Bob", "Charlie", "Dan", "Edith", "Frank"]
@@ -459,6 +510,7 @@ def groupby(key: object, seq: Iterable[object]) -> dict[object, list[object]]:
 
 
 def first(seq: Iterable[_T]) -> _T:
+    # [FUNCTION DOC] Return the first element of seq. Raises StopIteration if empty.
     """The first element in a sequence
 
     >>> first("ABC")

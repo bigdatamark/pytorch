@@ -1,3 +1,9 @@
+# [MODULE DOC] Signature conflict analysis for multiple dispatch. Signatures are
+# tuples of types (the last may be a variadic type). Provides specificity
+# (supercedes), compatibility (consistent), ambiguity detection (ambiguous,
+# ambiguities), a disambiguating signature (super_signature), and the
+# precedence graph/topological ordering (edge, ordering). Defines
+# AmbiguityWarning. Pure functions; no import-time side effects.
 from __future__ import annotations
 
 import operator
@@ -24,10 +30,19 @@ __all__ = [
 
 
 class AmbiguityWarning(Warning):
+    # [CLASS DOC] Warning category emitted when two registered signatures are
+    # ambiguous (neither strictly more specific). Adds no state or behavior.
     pass
 
 
 def supercedes(a: tuple[type, ...], b: tuple[type, ...]) -> bool:
+    # [FUNCTION DOC] True if signature a is consistent with and at least as
+    # specific as b. Shorter a only supercedes b when a is empty and b is a lone
+    # variadic. Equal lengths: every type in a is a subclass of the matching type
+    # in b. Longer a: walk both, letting a trailing variadic absorb the rest.
+    # Raises AssertionError if a variadic is not in last position.
+    # KNOWN ISSUE: the docstring says "strictly" but equal signatures also
+    # return True.
     """A is consistent and strictly more specific than B"""
     if len(a) < len(b):
         # only case is if a is empty and b is variadic
@@ -64,6 +79,11 @@ def supercedes(a: tuple[type, ...], b: tuple[type, ...]) -> bool:
 
 
 def consistent(a: tuple[type, ...], b: tuple[type, ...]) -> bool:
+    # [FUNCTION DOC] True if some argument list could satisfy both a and b. An
+    # empty signature is consistent with another only if that one is empty or
+    # starts with a variadic. Equal lengths: each pair of types must be related
+    # by subclassing in either direction. Different lengths: walk both with
+    # variadics absorbing extra items and require a variadic end to cover the rest.
     """It is possible for an argument list to satisfy both A and B"""
 
     # Need to check for empty args
@@ -101,6 +121,7 @@ def consistent(a: tuple[type, ...], b: tuple[type, ...]) -> bool:
 
 
 def ambiguous(a: tuple[type, ...], b: tuple[type, ...]) -> bool:
+    # [FUNCTION DOC] True if a and b are consistent but neither supercedes the other.
     """A is consistent with B but neither is strictly more specific"""
     return consistent(a, b) and not (supercedes(a, b) or supercedes(b, a))
 
@@ -108,6 +129,9 @@ def ambiguous(a: tuple[type, ...], b: tuple[type, ...]) -> bool:
 def ambiguities(
     signatures: Iterable[tuple[type, ...]],
 ) -> set[tuple[tuple[type, ...], tuple[type, ...]]]:
+    # [FUNCTION DOC] Return the set of ambiguous signature pairs, each reported
+    # once (ordered by hash), excluding pairs resolved by some third signature
+    # that supercedes both.
     """All signature pairs such that A is ambiguous with B"""
     signatures = list(map(tuple, signatures))
     return {
@@ -121,6 +145,10 @@ def ambiguities(
 
 
 def super_signature(signatures: Sequence[tuple[type, ...]]) -> list[type]:
+    # [FUNCTION DOC] Build a signature that would resolve ambiguity among the
+    # given equal-length signatures: for each position take the most-derived
+    # type (the one with the longest method resolution order). Raises
+    # AssertionError if lengths differ or the sequence is empty-indexing fails.
     """A signature that would break ambiguities"""
     n = len(signatures[0])
     if not all(len(s) == n for s in signatures):
@@ -134,6 +162,8 @@ def edge(
     b: tuple[type, ...],
     tie_breaker: Callable[[tuple[type, ...]], int] = hash,
 ) -> bool:
+    # [FUNCTION DOC] True if a must be checked before b: a supercedes b and either
+    # b does not supercede a or tie_breaker ranks a higher.
     """A should be checked before B
     Tie broken by tie_breaker, defaults to ``hash``
     """
@@ -145,6 +175,9 @@ def edge(
 
 
 def ordering(signatures: Iterable[tuple[type, ...]]) -> list[tuple[type, ...]]:
+    # [FUNCTION DOC] Build the edge graph over all signature pairs, ensure every
+    # signature is a node, and return its topological order (most specific
+    # first). Raises ValueError if the graph has cycles.
     """A sane ordering of signatures to check, first to last
     Topological sort of edges as given by ``edge`` and ``supercedes``
     """
