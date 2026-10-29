@@ -1,4 +1,12 @@
 # Owner(s): ["module: c10d"]
+# [MODULE DOC] Multi-process tests for torch.distributed._symmetric_memory (symm_mem) and the
+# _SymmetricMemory C++ binding. Covers allocation, rendezvous (including via a process-group
+# allgather and torchcomms), signal pads, barrier/put_signal/wait_signal, get, custom all-
+# reduce, reduce-scatter, multicast all-gather, fused AsyncTP matmul ops, Inductor lowering of
+# symm_mem ops, MemPool reuse, and external NCCL comm registration. Test classes use
+# MultiProcContinuousTest or MultiProcessTestCase and need 2 or 4 CUDA GPUs with P2P access.
+# Import-time side effects: defines test_contexts, device_type and device_module globals; no
+# process groups are created.
 
 import itertools
 import json
@@ -70,6 +78,10 @@ test_contexts = [nullcontext, _test_mode]
 
 @contextmanager
 def _enable_multicast_for_test(test_case: TestCase, device_index: int):
+    # [FUNCTION DOC] HELPER: Context manager used by multicast tests. Temporarily removes the
+    # environment variable TORCH_SYMM_MEM_DISABLE_MULTICAST, skips the test through
+    # test_case.skipTest when the CUDA device index lacks multicast support, and on exit
+    # restores the variable only if it was previously set.
     old_disable_multicast = os.environ.pop("TORCH_SYMM_MEM_DISABLE_MULTICAST", None)
     try:
         if not _SymmetricMemory.has_multicast_support(DeviceType.CUDA, device_index):
@@ -81,6 +93,9 @@ def _enable_multicast_for_test(test_case: TestCase, device_index: int):
 
 
 def _lc_ag_output_shape(shape: tuple[int, ...], world_size: int) -> tuple[int, ...]:
+    # [FUNCTION DOC] HELPER: Returns the expected output shape of an all-gather of a tensor with
+    # the given shape: a scalar shape gives a one-element shape of world_size, otherwise dim 0
+    # is multiplied by world_size.
     if len(shape) == 0:
         return (world_size,)
     return (shape[0] * world_size, *shape[1:])
@@ -94,15 +109,26 @@ device_module = torch.get_device_module(device_type)
 @instantiate_parametrized_tests
 @requires_cuda_p2p_access()
 class SymmetricMemoryTest(MultiProcContinuousTest):
+    # [CLASS DOC] Core symmetric memory tests running in persistent worker processes
+    # (MultiProcContinuousTest, so a failure may skip later tests). Covers
+    # has_multicast_support, is_symm_mem_tensor, backend lookup, signal pad size get/set, large
+    # and stream-ordered allocation, rendezvous variants, low contention all-gather and reduce-
+    # scatter ops, subgroups, symm_mem.get and dispatcher TorchBind use. Needs P2P-capable CUDA
+    # GPUs; most tests need at least 2.
     @property
     def device(self) -> torch.device:
+        # [FUNCTION DOC] HELPER: Returns the CUDA device whose index is this process rank.
         return torch.device(device_type, self.rank)
 
     def _init_process(self):
+        # [FUNCTION DOC] HELPER: Per-test setup: sets the current CUDA device to this rank's
+        # device and seeds the torch RNG with 42 plus the rank.
         torch.cuda.set_device(self.device)
         torch.manual_seed(42 + self.rank)
 
     def test_has_multicast_support(self) -> None:
+        # [FUNCTION DOC] Checks that _SymmetricMemory.has_multicast_support returns False
+        # (rather than raising) for the CPU device type.
         # validate that has_multicast_support() returns "false" instead of throwing
         self.assertFalse(_SymmetricMemory.has_multicast_support(DeviceType.CPU, 0))
         # NOTE: DeviceType.CUDA is implicitly tested through @requires_multicast_support
@@ -113,6 +139,8 @@ class SymmetricMemoryTest(MultiProcContinuousTest):
     )
     @skip_if_lt_x_gpu(2)
     def test_is_symm_mem_tensor(self) -> None:
+        # [FUNCTION DOC] Checks symm_mem.is_symm_mem_tensor is False for a CPU tensor and a
+        # regular CUDA tensor, and True for a tensor from symm_mem.empty.
         # CPU tensor -> False (no allocator registered for CPU)
         t_cpu = torch.empty(1024)
         self.assertFalse(symm_mem.is_symm_mem_tensor(t_cpu))
@@ -130,6 +158,8 @@ class SymmetricMemoryTest(MultiProcContinuousTest):
     )
     @skip_if_lt_x_gpu(2)
     def test_get_backend(self) -> None:
+        # [FUNCTION DOC] Checks symm_mem.get_backend returns a non-None backend for both a
+        # torch.device and the string cuda.
         backend = symm_mem.get_backend(torch.device("cuda"))
         self.assertIsNotNone(backend)
         backend = symm_mem.get_backend("cuda")
@@ -138,6 +168,9 @@ class SymmetricMemoryTest(MultiProcContinuousTest):
     @skip_if_rocm_multiprocess
     @skip_if_lt_x_gpu(2)
     def test_cuda_nvlink_connectivity_detection(self) -> None:
+        # [FUNCTION DOC] Calls the private _detect_dma_connectivity for CUDA with nvlink and
+        # checks the returned device type, connection type, and that the connectivity matrix is
+        # square with side equal to the CUDA device count.
         from torch._C._distributed_c10d import _detect_dma_connectivity
 
         connectivity = _detect_dma_connectivity(DeviceType.CUDA, "nvlink")
@@ -152,6 +185,8 @@ class SymmetricMemoryTest(MultiProcContinuousTest):
     )
     @skip_if_lt_x_gpu(2)
     def test_get_signal_pad_size(self) -> None:
+        # [FUNCTION DOC] Checks get_signal_pad_size returns a positive int equal to the C++
+        # _SymmetricMemory.signal_pad_size value.
         # Test that get_signal_pad_size returns a positive integer
         signal_pad_size = symm_mem.get_signal_pad_size()
         self.assertIsInstance(signal_pad_size, int)
@@ -166,6 +201,8 @@ class SymmetricMemoryTest(MultiProcContinuousTest):
     )
     @skip_if_lt_x_gpu(2)
     def test_set_signal_pad_size(self) -> None:
+        # [FUNCTION DOC] Sets the signal pad size to 1 MiB, checks both the Python getter and
+        # the C++ attribute reflect it, then restores the original size and checks that.
         # Save the original signal pad size
         original_size = symm_mem.get_signal_pad_size()
 
@@ -186,6 +223,10 @@ class SymmetricMemoryTest(MultiProcContinuousTest):
     )
     @skip_if_lt_x_gpu(2)
     def test_set_signal_pad_size_with_allocation(self) -> None:
+        # [FUNCTION DOC] Doubles the signal pad size, allocates and rendezvous a symm_mem
+        # tensor, and checks the handle's signal_pad_size equals it and the local signal pad has
+        # size/4 uint32 elements and can be written. Restores the original size at the end (not
+        # in a finally block, so a failure leaves the changed size).
         """Test that custom signal pad size is actually used in allocations."""
         self._init_process()
 
@@ -220,6 +261,8 @@ class SymmetricMemoryTest(MultiProcContinuousTest):
         not PLATFORM_SUPPORTS_SYMM_MEM, "SymmMem is not supported on this ROCm arch"
     )
     def test_large_alloc(self) -> None:
+        # [FUNCTION DOC] Allocates a 2 GiB uint8 tensor with symm_mem.empty and checks its byte
+        # size.
         t = symm_mem.empty(2 * 1024**3, dtype=torch.uint8, device="cuda")
         self.assertEqual(t.numel() * t.element_size(), 2 * 1024**3)
 
@@ -228,6 +271,11 @@ class SymmetricMemoryTest(MultiProcContinuousTest):
     )
     @skip_if_lt_x_gpu(2)
     def test_alloc_rendezvous_on_current_stream(self) -> None:
+        # [FUNCTION DOC] Regression test: under a user CUDA stream, runs symm_mem.empty,
+        # rendezvous and a barrier under the profiler, exports a chrome trace to a temp dir, and
+        # checks that the Memset and Memcpy GPU events before the barrier ran on the same stream
+        # as the barrier kernel. Skipped unless the symm_mem backend is CUDA; on ROCm no
+        # memset/memcpy events are required.
         # Regression test for https://github.com/pytorch/pytorch/issues/181086:
         # the memset issued by empty() and the memcpys issued by the first
         # rendezvous() must follow the caller's current stream instead of
@@ -290,6 +338,9 @@ class SymmetricMemoryTest(MultiProcContinuousTest):
     @skip_if_lt_x_gpu(2)
     @skip_if_rocm_ver_atleast_multiprocess([7, 14])
     def test_get_signal_pad(self) -> None:
+        # [FUNCTION DOC] Tests handle.get_signal_pad: local pad pointer matches signal_pad_ptrs,
+        # default dtype is uint32 covering the whole pad, optional sizes and dtype (uint64)
+        # change numel and dtype, and writing the data buffer does not corrupt the signal pad.
         self._init_process()
 
         t = symm_mem.empty(1, device="cuda")
@@ -333,6 +384,12 @@ class SymmetricMemoryTest(MultiProcContinuousTest):
     )
     @requires_cuda
     def test_allow_overlapping_devices(self) -> None:
+        # [FUNCTION DOC] Sets the environment variable TORCH_SYMM_MEM_ALLOW_OVERLAPPING_DEVICES
+        # to 1, allocates on cuda:0 in every rank, rendezvous and checks rank, world size and
+        # that each rank's buffer is accessible (own rank maps to the same pointer). Finally
+        # sets the variable to 0.
+        # KNOWN ISSUE: the variable is reset to 0 at the end, not restored to its prior value or
+        # in a finally block, so a failure leaves it enabled.
         os.environ["TORCH_SYMM_MEM_ALLOW_OVERLAPPING_DEVICES"] = "1"
         t = symm_mem.empty(64, device="cuda:0")
         symm_mem_hdl = symm_mem.rendezvous(t, group=dist.group.WORLD)
@@ -355,6 +412,11 @@ class SymmetricMemoryTest(MultiProcContinuousTest):
     @skip_if_lt_x_gpu(2)
     @skip_if_rocm_ver_atleast_multiprocess([7, 14])
     def test_rendezvous_via_pg_allgather(self) -> None:
+        # [FUNCTION DOC] Enables use_pg_for_symm_mem_rendezvous on the world group, resets the
+        # NCCL flight recorder, and does a rendezvous. Inspects the dumped NCCL trace to check
+        # the count of _all_gather_base entries lies in the expected range (larger when
+        # multicast is present) and broadcast entries only occur with multicast, then verifies
+        # peer buffer contents with barriers. Always resets the flag in a finally block.
         import pickle
 
         self._init_process()
@@ -410,6 +472,11 @@ class SymmetricMemoryTest(MultiProcContinuousTest):
     @skip_if_lt_x_gpu(2)
     @skip_if_rocm_ver_atleast_multiprocess([7, 14])
     def test_rendezvous_custom_backend(self) -> None:
+        # [FUNCTION DOC] Registers a stub backend wrapping NCCL (extended API, cuda only) via
+        # dist.Backend.register_backend, creates a group with cpu:gloo,cuda:ncclx_stub, and
+        # checks PG-based rendezvous works (an NCCL _all_gather_base appears in the trace) and
+        # peer buffers hold the peer ranks. Guards against a crash when the default backend type
+        # is undefined. Side effect: registers the global backend name ncclx_stub.
         # Simulate the ncclx multi-backend setup.  NCCLXStub wraps NCCL
         # (CUDA-only, like ncclx) and registers via extended_api=True.
         # When new_group() is called with "cpu:gloo,cuda:ncclx_stub",
@@ -425,6 +492,10 @@ class SymmetricMemoryTest(MultiProcContinuousTest):
         from torch._C._distributed_c10d import _DistributedBackendOptions, NCCLXStub
 
         def create_ncclx_stub(dist_opts: _DistributedBackendOptions, pg_options=None):
+            # [FUNCTION DOC] HELPER: Backend creator for the ncclx_stub test backend: builds an
+            # NCCLXStub from the store, group rank and size in dist_opts (default
+            # ProcessGroupNCCL options if none), enables PG-based symm_mem rendezvous on it, and
+            # returns it.
             if pg_options is None:
                 pg_options = dist.ProcessGroupNCCL.Options()
             backend = NCCLXStub(
@@ -475,6 +546,9 @@ class SymmetricMemoryTest(MultiProcContinuousTest):
     @skip_if_lt_x_gpu(2)
     @skip_if_rocm_ver_atleast_multiprocess([7, 14])
     def test_pg_rendezvous_abort_after(self) -> None:
+        # [FUNCTION DOC] Creates a NCCL group with use_pg_for_symm_mem_rendezvous in its
+        # options, does a rendezvous and verified barrier round trip, aborts the group, then
+        # checks the peer buffers are still readable with the same contents.
         self._init_process()
 
         opts = dist.ProcessGroupNCCL.Options()
@@ -503,6 +577,10 @@ class SymmetricMemoryTest(MultiProcContinuousTest):
     @skip_if_rocm_ver_atleast_multiprocess([7, 14])
     @parametrize("symm_mem_input", [True, False])
     def test_low_contention_all_gather(self, symm_mem_input: bool) -> None:
+        # [FUNCTION DOC] Runs the low contention all-gather op on a (64, 64) float tensor filled
+        # with the rank, from either a symm_mem tensor or a regular tensor depending on
+        # symm_mem_input, waits on the result and checks the output shape and that chunk r
+        # equals r.
         self._init_process()
 
         if symm_mem_input:
@@ -527,6 +605,10 @@ class SymmetricMemoryTest(MultiProcContinuousTest):
     def _run_lc_ag_ce_multicast_correctness(
         self, symm_mem_input: bool, shape: tuple[int, ...]
     ) -> None:
+        # [FUNCTION DOC] HELPER: Shared body of the CE multicast all-gather tests. Under
+        # _enable_multicast_for_test, builds the rank-filled input of the given shape (symm_mem
+        # or regular per symm_mem_input), runs _low_contention_all_gather_ce_multicast, and
+        # checks output shape and that chunk r equals r.
         self._init_process()
 
         with _enable_multicast_for_test(self, self.device.index):
@@ -563,6 +645,8 @@ class SymmetricMemoryTest(MultiProcContinuousTest):
     def test_low_contention_all_gather_ce_multicast(
         self, symm_mem_input: bool, shape: tuple[int, ...]
     ) -> None:
+        # [FUNCTION DOC] Parametrized over input kind and shape; delegates to the shared
+        # multicast all-gather correctness helper.
         self._run_lc_ag_ce_multicast_correctness(symm_mem_input, shape)
 
     @skipIf(
@@ -574,6 +658,10 @@ class SymmetricMemoryTest(MultiProcContinuousTest):
     def test_low_contention_all_gather_ce_multicast_out(
         self, shape: tuple[int, ...]
     ) -> None:
+        # [FUNCTION DOC] Tests the out variant of the CE multicast all-gather. Real run: result
+        # aliases the symm_mem out tensor and holds each rank's value per chunk. Meta run:
+        # output shape/dtype/device match the out tensor. A meta out tensor with a wrong dim 0
+        # raises RuntimeError mentioning expected out shape.
         self._init_process()
 
         with _enable_multicast_for_test(self, self.device.index):
@@ -628,6 +716,10 @@ class SymmetricMemoryTest(MultiProcContinuousTest):
     def test_low_contention_reduce_scatter(
         self, reduce_op: str, symm_mem_input: bool
     ) -> None:
+        # [FUNCTION DOC] Fills chunk r of the input with r, runs low contention reduce-scatter
+        # with sum or avg and checks output shape (rows divided by world size) and value (rank
+        # times world size for sum, rank for avg). Input is a symm_mem tensor or regular tensor
+        # per symm_mem_input.
         self._init_process()
 
         if symm_mem_input:
@@ -662,6 +754,10 @@ class SymmetricMemoryTest(MultiProcContinuousTest):
     )
     @skip_if_lt_x_gpu(4)
     def test_subgroup(self) -> None:
+        # [FUNCTION DOC] With 4+ GPUs, splits ranks into two halves, rendezvous the same tensor
+        # on the world group and own half subgroup, and checks handle rank and world size for
+        # each, then reads a peer buffer through each handle and checks values come from the
+        # peer in that group.
         self._init_process()
 
         ranks = list(range(self.world_size))
@@ -701,6 +797,10 @@ class SymmetricMemoryTest(MultiProcContinuousTest):
     )
     @skip_if_lt_x_gpu(2)
     def test_get(self) -> None:
+        # [FUNCTION DOC] Tests symm_mem.get: full copy from peer 1 into rank 0, offset copy of a
+        # sub-region, writing into a view leaves the rest untouched, and ValueError cases for
+        # non-contiguous destination, negative offset, offset past buffer, and invalid peer.
+        # Only rank 0 performs gets; barriers separate the phases.
         self._init_process()
         group_name = dist.group.WORLD.group_name
 
@@ -779,6 +879,9 @@ class SymmetricMemoryTest(MultiProcContinuousTest):
     @skip_if_lt_x_gpu(2)
     @skip_if_rocm_ver_atleast_multiprocess([7, 14])
     def test_dispatcher_torchbind_symmetric_memory(self) -> None:
+        # [FUNCTION DOC] Calls the private ops symm_mem._rendezvous (returns a TorchBind
+        # SymmetricMemory) and symm_mem._barrier (takes it) to exercise dispatcher schemas with
+        # that type. No result checks.
         self._init_process()
         group_name = dist.group.WORLD.group_name
 
@@ -803,11 +906,19 @@ class SymmetricMemoryTest(MultiProcContinuousTest):
 @instantiate_parametrized_tests
 @requires_cuda_p2p_access()
 class AsyncTPTest(MultiProcContinuousTest):
+    # [CLASS DOC] AsyncTP tests: compare the fused all-gather/matmul and matmul/reduce-scatter
+    # ops (including scaled fp8, native and multimem variants) against fallback implementations.
+    # Kept apart from core symm_mem tests so those still give signal when AsyncTP fails. Skipped
+    # on ROCm; needs P2P GPUs, mostly 2.
     @property
     def device(self) -> torch.device:
+        # [FUNCTION DOC] HELPER: Returns the CUDA device whose index is this process rank.
         return torch.device(device_type, self.rank)
 
     def _init_process(self):
+        # [FUNCTION DOC] HELPER: Per-test setup: sets the CUDA device, seeds with 42 plus rank,
+        # and turns on deterministic algorithms (warn mode) and fill_uninitialized_memory so
+        # results are reproducible.
         torch.cuda.set_device(self.device)
         torch.manual_seed(42 + self.rank)
         torch.use_deterministic_algorithms(True)
@@ -820,6 +931,9 @@ class AsyncTPTest(MultiProcContinuousTest):
     @skip_if_lt_x_gpu(2)
     @parametrize("gather_dim", [0, 1, 2])
     def test_fused_all_gather_matmul(self, gather_dim: int) -> None:
+        # [FUNCTION DOC] For a gather_dim, compares the fused_all_gather_matmul op with its
+        # fallback on a sharded A and three B matrices: all-gathered outputs must be close with
+        # equal strides, and each matmul output close.
         self._init_process()
 
         BATCH = 8
@@ -872,6 +986,12 @@ class AsyncTPTest(MultiProcContinuousTest):
     def test_fused_all_gather_matmul_native(
         self, symm_mem_input: bool, is_b_row_major: bool
     ) -> None:
+        # [FUNCTION DOC] Enables the native AsyncTP path by environment variable, runs
+        # fused_all_gather_matmul on a bf16 shard (symm_mem or regular) and row or column major
+        # B under the profiler, checks a PersistentAsyncInputScheduler kernel ran, and compares
+        # to the fallback. Resets the variable to 0 at the end.
+        # KNOWN ISSUE: the environment variable is set to 0 at the end, not restored or in
+        # finally.
         os.environ["TORCH_SYMM_MEM_ENABLE_NATIVE_ASYNC_TP"] = "1"
         self._init_process()
 
@@ -923,6 +1043,9 @@ class AsyncTPTest(MultiProcContinuousTest):
     @skip_if_lt_x_gpu(2)
     @requires_multicast_support()
     def test_multimem_all_gather_matmul(self) -> None:
+        # [FUNCTION DOC] Runs fused_all_gather_matmul with return_A False for bf16 data under
+        # the profiler, checks a multimem_all_gather_kernel ran, and compares outputs with the
+        # fallback.
         self._init_process()
 
         # See _should_use_multimem_all_gather_matmul() for the algo
@@ -970,6 +1093,12 @@ class AsyncTPTest(MultiProcContinuousTest):
     def test_fused_all_gather_scaled_matmul(
         self, gather_dim: int, scale_mode: str
     ) -> None:
+        # [FUNCTION DOC] Compares fused_all_gather_scaled_matmul with its fallback for fp8
+        # inputs under tensor-wise, row-wise-replicated and row-wise-sharded scaling: gathered
+        # output and each matmul output must be close (as float32) with equal strides and
+        # dtypes.
+        # KNOWN ISSUE: the else branch for an unexpected gather_dim raises an error that reports
+        # scale_mode instead of gather_dim.
         self._init_process()
 
         BATCH = 8
@@ -1053,6 +1182,8 @@ class AsyncTPTest(MultiProcContinuousTest):
     @skip_if_lt_x_gpu(2)
     @parametrize("scatter_dim", [0, 1, 2])
     def test_fused_matmul_reduce_scatter(self, scatter_dim: int) -> None:
+        # [FUNCTION DOC] Compares fused_matmul_reduce_scatter (avg) with its fallback for a
+        # scatter_dim: outputs must be close with equal strides.
         self._init_process()
 
         BATCH = 8
@@ -1082,6 +1213,9 @@ class AsyncTPTest(MultiProcContinuousTest):
 
     @skip_if_lt_x_gpu(2)
     def test_fused_matmul_reduce_scatter_bfloat16_custom_reduce(self) -> None:
+        # [FUNCTION DOC] Compares the bf16 fused_matmul_reduce_scatter with its fallback
+        # eagerly, then also under CUDA graph capture and replay (where the fused reducer is
+        # chosen), using loose tolerances and checking strides.
         self._init_process()
 
         M = 64
@@ -1129,6 +1263,9 @@ class AsyncTPTest(MultiProcContinuousTest):
     def test_fused_scaled_matmul_reduce_scatter(
         self, scatter_dim: int, rowwise: bool
     ) -> None:
+        # [FUNCTION DOC] Runs fused_scaled_matmul_reduce_scatter on fp8 data with rowwise or
+        # tensor-wise scales once normally and once under the _test_mode context, then checks
+        # the two outputs are equal with equal strides.
         self._init_process()
 
         BATCH = 8
@@ -1180,6 +1317,9 @@ class AsyncTPTest(MultiProcContinuousTest):
     )
     @parametrize("dim", [0, 1, 2])
     def test_optimal_layout(self, dim: int) -> None:
+        # [FUNCTION DOC] Checks restride_A_shard_for_fused_all_gather_matmul and
+        # restride_A_for_fused_matmul_reduce_scatter return a tensor equal to the input whose
+        # given dim moved to the front is contiguous. Needs no process group.
         t = torch.rand(8, 64, 32, 16)
 
         x = restride_A_shard_for_fused_all_gather_matmul(t, dim)
@@ -1203,19 +1343,29 @@ class AsyncTPTest(MultiProcContinuousTest):
 @instantiate_parametrized_tests
 @requires_cuda_p2p_access()
 class SymmMemEmptySetDeviceTest(MultiProcessTestCase):
+    # [CLASS DOC] Tests empty_strided_p2p with and without the user setting the CUDA device
+    # first. Uses MultiProcessTestCase (fresh processes per test, since set_device persists),
+    # world size is the CUDA device count. Helpers allocate, rendezvous and exchange data
+    # between ranks.
     def setUp(self) -> None:
+        # [FUNCTION DOC] HELPER: Calls the parent setUp and spawns the worker processes.
         super().setUp()
         self._spawn_processes()
 
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns the number of CUDA devices as the world size.
         return device_module.device_count()
 
     @property
     def device(self) -> torch.device:
+        # [FUNCTION DOC] HELPER: Returns the CUDA device whose index is this process rank.
         return torch.device(device_type, self.rank)
 
     def _init_process(self, set_device: bool):
+        # [FUNCTION DOC] HELPER: Optionally sets the CUDA device, then initializes the NCCL
+        # process group using a FileStore at self.file_name, and seeds the RNG with 42 plus
+        # rank.
         if set_device:
             torch.cuda.set_device(self.device)
         store = dist.FileStore(self.file_name, self.world_size)
@@ -1228,6 +1378,8 @@ class SymmMemEmptySetDeviceTest(MultiProcessTestCase):
         torch.manual_seed(42 + self.rank)
 
     def _get_test_alloc_args(self):
+        # [FUNCTION DOC] HELPER: Returns the tuple (shape (64, 64), stride (64, 1), float32,
+        # device) for allocation.
         shape = (64, 64)
         stride = (64, 1)
         dtype = torch.float32
@@ -1235,6 +1387,9 @@ class SymmMemEmptySetDeviceTest(MultiProcessTestCase):
         return (shape, stride, dtype, device)
 
     def _verify_symmetric_memory(self, symm_mem_hdl):
+        # [FUNCTION DOC] HELPER: Checks a symm_mem handle: world size, buffer view at offset 0
+        # covering the whole storage, then a signal/data exchange where rank 0 waits for rank
+        # 1's signal and sees 42 and then, after barriers, sees 43.
         self.assertEqual(symm_mem_hdl.world_size, self.world_size)
 
         buf = symm_mem_hdl.get_buffer(
@@ -1268,6 +1423,8 @@ class SymmMemEmptySetDeviceTest(MultiProcessTestCase):
     @skip_if_rocm_ver_atleast_multiprocess([7, 14])
     @parametrize("set_device", [True, False])
     def test_empty_strided_p2p(self, set_device: bool) -> None:
+        # [FUNCTION DOC] Checks an ordinary tensor has no rendezvous, allocates with
+        # empty_strided_p2p, rendezvous, frees the tensor, and verifies the handle still works.
         self._init_process(set_device)
         group_name = dist.group.WORLD.group_name
 
@@ -1290,6 +1447,9 @@ class SymmMemEmptySetDeviceTest(MultiProcessTestCase):
     @skip_if_rocm_ver_atleast_multiprocess([7, 14])
     @parametrize("set_device", [True, False])
     def test_empty_strided_p2p_persistent(self, set_device: bool) -> None:
+        # [FUNCTION DOC] Checks persistent allocation by alloc_id: a second allocation with the
+        # same live id raises RuntimeError; after freeing the first, reallocation succeeds with
+        # the same data pointer and the handle works.
         self._init_process(set_device)
         group_name = dist.group.WORLD.group_name
 
@@ -1326,19 +1486,27 @@ class SymmMemEmptySetDeviceTest(MultiProcessTestCase):
 # MultiProcessTestCase instead of MultiProcContinuousTest.
 @requires_cuda_p2p_access()
 class SymmMemNegativeTest(MultiProcessTestCase):
+    # [CLASS DOC] Error handling tests for symmetric memory (device timeouts, out of range
+    # channels and ranks). Uses MultiProcessTestCase because a process restart is often needed
+    # after a test; the world size is the CUDA device count.
     def setUp(self) -> None:
+        # [FUNCTION DOC] HELPER: Calls the parent setUp and spawns the worker processes.
         super().setUp()
         self._spawn_processes()
 
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns the number of CUDA devices as the world size.
         return device_module.device_count()
 
     @property
     def device(self) -> torch.device:
+        # [FUNCTION DOC] HELPER: Returns the CUDA device whose index is this process rank.
         return torch.device(device_type, self.rank)
 
     def _init_process(self):
+        # [FUNCTION DOC] HELPER: Sets the CUDA device, initializes the NCCL process group using
+        # a FileStore and seeds the RNG with 42 plus rank.
         torch.cuda.set_device(self.device)
         store = dist.FileStore(self.file_name, self.world_size)
         dist.init_process_group(
@@ -1357,6 +1525,9 @@ class SymmMemNegativeTest(MultiProcessTestCase):
     @skip_if_rocm_multiprocess
     @skip_if_lt_x_gpu(2)
     def test_barrier_timeout(self) -> None:
+        # [FUNCTION DOC] Rank 0 calls barrier with a 1000 ms timeout and expects RuntimeError at
+        # synchronize while other ranks only synchronize. Ends with os._exit(0) since the device
+        # trap leaves the process unusable.
         self._init_process()
 
         t = symm_mem.empty(1, device="cuda")
@@ -1383,6 +1554,9 @@ class SymmMemNegativeTest(MultiProcessTestCase):
     @skip_if_rocm_multiprocess
     @skip_if_lt_x_gpu(2)
     def test_put_signal_timeout(self) -> None:
+        # [FUNCTION DOC] Rank 0 puts a signal to rank 1 twice (second with a 1000 ms timeout)
+        # and expects RuntimeError; other ranks only synchronize. Ends with os._exit(0) since
+        # the device trap leaves the process unusable.
         self._init_process()
 
         t = symm_mem.empty(1, device="cuda")
@@ -1412,6 +1586,9 @@ class SymmMemNegativeTest(MultiProcessTestCase):
     @skip_if_rocm_multiprocess
     @skip_if_lt_x_gpu(2)
     def test_wait_signal_timeout(self) -> None:
+        # [FUNCTION DOC] Rank 0 waits for a signal from rank 1 with a 1000 ms timeout and
+        # expects RuntimeError; other ranks only synchronize. Ends with os._exit(0) since the
+        # device trap leaves the process unusable.
         self._init_process()
 
         t = symm_mem.empty(1, device="cuda")
@@ -1433,6 +1610,9 @@ class SymmMemNegativeTest(MultiProcessTestCase):
     @skip_if_rocm_multiprocess
     @skip_if_lt_x_gpu(2)
     def test_barrier_channel_out_of_bounds(self) -> None:
+        # [FUNCTION DOC] Checks barrier with a channel equal to the maximum (signal pad slots
+        # divided by world size) raises RuntimeError about the maximum supported channel, while
+        # the last valid channel is accepted when more than one channel exists.
         self._init_process()
 
         t = symm_mem.empty(64, device="cuda")
@@ -1454,6 +1634,9 @@ class SymmMemNegativeTest(MultiProcessTestCase):
     @skip_if_rocm_multiprocess
     @skip_if_lt_x_gpu(2)
     def test_put_wait_signal_channel_out_of_bounds(self) -> None:
+        # [FUNCTION DOC] Checks put_signal and wait_signal reject a channel equal to the maximum
+        # with RuntimeError, and that the last valid channel works in a ring exchange of a
+        # signal.
         self._init_process()
 
         t = symm_mem.empty(64, device="cuda")
@@ -1479,6 +1662,8 @@ class SymmMemNegativeTest(MultiProcessTestCase):
     @skip_if_rocm_multiprocess
     @skip_if_lt_x_gpu(2)
     def test_put_wait_signal_rank_out_of_bounds(self) -> None:
+        # [FUNCTION DOC] Checks put_signal, wait_signal and get_signal_pad raise RuntimeError
+        # (message about range starting at 0) for ranks -1 and world_size.
         self._init_process()
 
         t = symm_mem.empty(64, device="cuda")
@@ -1499,11 +1684,17 @@ class SymmMemNegativeTest(MultiProcessTestCase):
 @instantiate_parametrized_tests
 @requires_cuda_p2p_access()
 class SymmMemCollectiveTest(MultiProcContinuousTest):
+    # [CLASS DOC] Tests for symmetric memory collectives: multimem all-reduce, one-shot and two-
+    # shot all-reduce, reduce-scatter, multimem all-gather. Needs 4 GPUs; multimem tests also
+    # need multicast support. Helpers verify outputs against all-gathered inputs.
     @property
     def device(self) -> torch.device:
+        # [FUNCTION DOC] HELPER: Returns the CUDA device whose index is this process rank.
         return torch.device(device_type, self.rank)
 
     def _init_process(self):
+        # [FUNCTION DOC] HELPER: Per-test setup: sets the CUDA device and seeds with 42 plus
+        # rank.
         torch.cuda.set_device(self.device)
         torch.manual_seed(42 + self.rank)
 
@@ -1515,6 +1706,10 @@ class SymmMemCollectiveTest(MultiProcContinuousTest):
     def test_multimem_all_reduce(
         self, dtype: torch.dtype, size_bytes: int, align_bytes: int
     ) -> None:
+        # [FUNCTION DOC] Takes an aligned slice of a symm_mem tensor of the given byte size and
+        # alignment, fills it with random data, runs multimem_all_reduce_ in place with sum, and
+        # checks that memory before and after the slice stayed zero and the result is a valid
+        # all-reduce.
         self._init_process()
         group_name = dist.group.WORLD.group_name
 
@@ -1548,6 +1743,9 @@ class SymmMemCollectiveTest(MultiProcContinuousTest):
     def test_multimem_one_shot_all_reduce(
         self, dtype: torch.dtype, size_bytes: int, align_bytes: int
     ) -> None:
+        # [FUNCTION DOC] Runs multimem_one_shot_all_reduce with sum on a random symm_mem input
+        # and checks it is close to the sum of the all-gathered inputs. Expected to fail on
+        # SM100 or later.
         self._init_process()
         group_name = dist.group.WORLD.group_name
 
@@ -1574,6 +1772,9 @@ class SymmMemCollectiveTest(MultiProcContinuousTest):
     def test_multimem_one_shot_reduce_out(
         self, dtype: torch.dtype, size_bytes: int
     ) -> None:
+        # [FUNCTION DOC] Runs multimem_one_shot_reduce_out to root rank 0 with sum and on the
+        # root checks the output is close to the sum of the all-gathered inputs. Expected to
+        # fail on SM100 or later.
         self._init_process()
         group_name = dist.group.WORLD.group_name
 
@@ -1601,6 +1802,9 @@ class SymmMemCollectiveTest(MultiProcContinuousTest):
     )
     @skip_if_lt_x_gpu(4)
     def test_one_shot_all_reduce(self) -> None:
+        # [FUNCTION DOC] Loops over dtype, size, copy or not, and offset; runs
+        # one_shot_all_reduce (or the _copy variant with a separate local input) with sum on
+        # symm_mem data and verifies the result with the shared all-reduce checker.
         self._init_process()
         group_name = dist.group.WORLD.group_name
 
@@ -1635,6 +1839,9 @@ class SymmMemCollectiveTest(MultiProcContinuousTest):
     @skip_if_lt_x_gpu(4)
     @skip_if_rocm_ver_atleast_multiprocess([7, 14])
     def test_two_shot_all_reduce(self) -> None:
+        # [FUNCTION DOC] Loops over dtype, size and in place or out variants of
+        # two_shot_all_reduce with sum on an aligned slice of a symm_mem tensor, checks memory
+        # outside the slice is untouched, and verifies the result.
         self._init_process()
         group_name = dist.group.WORLD.group_name
 
@@ -1670,6 +1877,9 @@ class SymmMemCollectiveTest(MultiProcContinuousTest):
             self._verify_all_reduce_result(inp, res if inplace else out)
 
     def _verify_all_reduce_result(self, inp, res):
+        # [FUNCTION DOC] HELPER: Checks an all-reduce result: all ranks hold identical results,
+        # and the result is close (loose tolerance) to the sum of all ranks' inputs. Uses
+        # all_gather_single on group 0.
         gathered_res = all_gather_single(res, 0, "0").view(self.world_size, -1)
         # Verify that the results across ranks are identical
         self.assertEqual(
@@ -1687,6 +1897,9 @@ class SymmMemCollectiveTest(MultiProcContinuousTest):
     )
     @skip_if_lt_x_gpu(4)
     def test_reduce_scatter(self) -> None:
+        # [FUNCTION DOC] Loops over dtype, size and split_last_dim; runs reduce_scatter_out on
+        # an aligned slice of a symm_mem tensor, checks memory outside the slice is untouched
+        # and verifies the scattered output with the reduce-scatter checker.
         self._init_process()
         group_name = dist.group.WORLD.group_name
 
@@ -1726,6 +1939,9 @@ class SymmMemCollectiveTest(MultiProcContinuousTest):
     )
     @skip_if_lt_x_gpu(4)
     def test_reduce_scatter_corner_cases(self) -> None:
+        # [FUNCTION DOC] Reduce scatter corner cases: an empty input works, and an input whose
+        # size (or last dim when splitting last dim) is not divisible by world size raises
+        # RuntimeError mentioning divisible.
         self._init_process()
         dtype = torch.bfloat16
         group_name = dist.group.WORLD.group_name
@@ -1746,6 +1962,8 @@ class SymmMemCollectiveTest(MultiProcContinuousTest):
             torch.ops.symm_mem.reduce_scatter_out(res, group_name, True, out)
 
     def _verify_reduce_scatter_result(self, inp, res):
+        # [FUNCTION DOC] HELPER: Checks reduce-scatter output: every rank's output must be close
+        # (loose tolerance) to its slice (along the last dim) of the sum over all ranks' inputs.
         gathered_res = all_gather_single(res, 0, "0").view(self.world_size, *res.shape)
         gathered_inps = all_gather_single(inp, 0, "0").view(self.world_size, *inp.shape)
         sum_inps = gathered_inps.sum(0)
@@ -1762,6 +1980,8 @@ class SymmMemCollectiveTest(MultiProcContinuousTest):
     @requires_multicast_support()
     @parametrize("align_bytes", [4, 8, 16])
     def test_multimem_all_gather(self, align_bytes: int) -> None:
+        # [FUNCTION DOC] Runs multimem_all_gather_out into an aligned symm_mem tensor and checks
+        # it equals the standard functional all-gather result.
         self._init_process()
         group_name = dist.group.WORLD.group_name
 
@@ -1788,15 +2008,24 @@ class SymmMemCollectiveTest(MultiProcContinuousTest):
 @instantiate_parametrized_tests
 @requires_cuda_p2p_access()
 class SymmetricMemoryTestCudaGraph(MultiProcContinuousTest):
+    # [CLASS DOC] Tests the CE multicast all-gather out op under CUDA graph capture and replay.
+    # Needs multicast support and at least 2 GPUs.
     @property
     def device(self) -> torch.device:
+        # [FUNCTION DOC] HELPER: Returns the CUDA device whose index is this process rank.
         return torch.device(device_type, self.rank)
 
     def _init_process(self):
+        # [FUNCTION DOC] HELPER: Per-test setup: sets the CUDA device and seeds with 42 plus
+        # rank.
         torch.cuda.set_device(self.device)
         torch.manual_seed(42 + self.rank)
 
     def _run_low_contention_all_gather_ce_multicast_cuda_graph(self) -> None:
+        # [FUNCTION DOC] HELPER: Allocates a symm_mem output, warms up the op on a side stream,
+        # then captures into a CUDA graph an in-place add of 1 to the input, a delay on rank 0
+        # and the op, replays 4 times and checks each chunk equals the rank plus the accumulated
+        # input increment.
         group_name = dist.group.WORLD.group_name
         inp = torch.full((64, 64), self.rank, dtype=torch.float32, device=self.device)
         out = symm_mem.empty(
@@ -1808,6 +2037,8 @@ class SymmetricMemoryTestCudaGraph(MultiProcContinuousTest):
         symm_mem.rendezvous(out, group=group_name)
 
         def run_op() -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Calls the CE multicast all-gather out op on the input and
+            # the preallocated out tensor and returns the result.
             return torch.ops.symm_mem._low_contention_all_gather_ce_multicast_out(
                 inp, group_name, out
             )
@@ -1848,6 +2079,7 @@ class SymmetricMemoryTestCudaGraph(MultiProcContinuousTest):
     @skip_if_lt_x_gpu(2)
     @requires_multicast_support()
     def test_low_contention_all_gather_ce_multicast_cuda_graph(self) -> None:
+        # [FUNCTION DOC] Runs the CUDA graph all-gather helper under _enable_multicast_for_test.
         self._init_process()
 
         with _enable_multicast_for_test(self, self.device.index):
@@ -1857,13 +2089,20 @@ class SymmetricMemoryTestCudaGraph(MultiProcContinuousTest):
 @instantiate_parametrized_tests
 @requires_cuda_p2p_access()
 class LoweringTest(MultiProcContinuousTest):
+    # [CLASS DOC] Tests Inductor lowering of symm_mem collectives under torch.compile: one-shot
+    # all-reduce lowering, communication buffer reuse and planned outputs, extern kernel out
+    # variants, custom op symm_mem arguments and the low contention all-gather FX pass. Uses
+    # generated code inspection with FileCheck plus numeric comparisons.
     def _init_process(self) -> None:
+        # [FUNCTION DOC] HELPER: Per-test setup: sets the CUDA device, seeds with 42 plus rank,
+        # and turns on the Inductor collective auto_select config.
         torch.cuda.set_device(self.device)
         torch.manual_seed(42 + self.rank)
         torch._inductor.config._collective.auto_select = True
 
     @property
     def device(self) -> torch.device:
+        # [FUNCTION DOC] HELPER: Returns the CUDA device whose index is this process rank.
         return torch.device(device_type, self.rank)
 
     @skip("Fails with 'one_shot_all_reduce' not found in AOT graph, TODO: fix")
@@ -1871,10 +2110,15 @@ class LoweringTest(MultiProcContinuousTest):
     @skip_if_lt_x_gpu(2)
     @fresh_cache()
     def test_lowering_one_shot_all_reduce(self):
+        # [FUNCTION DOC] Currently skipped. Compiles four functions around functional all_reduce
+        # (after add, on a slice, on an input, after a matmul), checks generated code uses or
+        # avoids one_shot_all_reduce as expected and results match eager.
         self._init_process()
         arg = torch.rand(4, 4, device=self.device)
 
         def func_0(x):
+            # [FUNCTION DOC] HELPER: Adds 1, all-reduces with sum on group 0 and waits for the
+            # result.
             x = x + 1
             x = torch.ops._c10d_functional.all_reduce(x, "sum", "0")
             return torch.ops._c10d_functional.wait_tensor(x)
@@ -1891,6 +2135,8 @@ class LoweringTest(MultiProcContinuousTest):
 
         # All-reduce on a slice view
         def func_1(x):
+            # [FUNCTION DOC] HELPER: Adds 1, slices off the first two rows, all-reduces and
+            # waits.
             x = x + 1
             x = x[2:]
             x = torch.ops._c10d_functional.all_reduce(x, "sum", "0")
@@ -1908,6 +2154,7 @@ class LoweringTest(MultiProcContinuousTest):
 
         # All-reduce on input
         def func_2(x):
+            # [FUNCTION DOC] HELPER: All-reduces the input directly and waits for the result.
             x = torch.ops._c10d_functional.all_reduce(x, "sum", "0")
             return torch.ops._c10d_functional.wait_tensor(x)
 
@@ -1922,6 +2169,8 @@ class LoweringTest(MultiProcContinuousTest):
 
         # All-reduce on matmul output
         def func_3(x):
+            # [FUNCTION DOC] HELPER: Squares the input with a matrix multiply, all-reduces and
+            # waits.
             x = x @ x
             x = torch.ops._c10d_functional.all_reduce(x, "sum", "0")
             return torch.ops._c10d_functional.wait_tensor(x)
@@ -1940,6 +2189,11 @@ class LoweringTest(MultiProcContinuousTest):
     @skip_if_lt_x_gpu(2)
     @fresh_inductor_cache()
     def test_comm_buffer_reuse(self):
+        # [FUNCTION DOC] Checks Inductor p2p buffer allocation count: two simultaneously live
+        # all-reduce inputs need two empty_strided_p2p allocations, while a chain where one is
+        # freed before the next is created reuses it (one p2p allocation and at least one
+        # regular CUDA allocation). Also compares compiled outputs with eager versions that
+        # allocate symm_mem outputs by hand.
         self._init_process()
 
         N = 8
@@ -1949,6 +2203,8 @@ class LoweringTest(MultiProcContinuousTest):
         w3 = torch.rand(N, N, device=self.device)
 
         def func_no_reuse(x, w1, w2):
+            # [FUNCTION DOC] HELPER: Two matmuls whose results are both all-reduced with
+            # one_shot_all_reduce (two live comm buffers); returns the sum.
             a = torch.mm(x, w1)
             b = torch.mm(a, w2)
             # Both `a` and `b` need comm buffers that are live simultaneously
@@ -1957,6 +2213,8 @@ class LoweringTest(MultiProcContinuousTest):
             return a + b
 
         def func_no_reuse_eager(x, w1, w2):
+            # [FUNCTION DOC] HELPER: Eager version of the no-reuse function with matmul outputs
+            # explicitly allocated by symm_mem.empty.
             # we need to allocate the output tensors here
             # because eager path would not allocate the output tensors as symm_mem tensors automatically
             mm1_out = symm_mem.empty(N, N, device=self.device)
@@ -1991,6 +2249,8 @@ class LoweringTest(MultiProcContinuousTest):
         )
 
         def func_reuse(x, w1, w2, w3):
+            # [FUNCTION DOC] HELPER: Matmul, all-reduce, matmul, matmul, all-reduce, so the
+            # first comm buffer can be reused for the last result; returns the last all-reduce.
             a = torch.mm(x, w1)
             # First all_reduce uses a comm buffer
             a = torch.ops.symm_mem.one_shot_all_reduce(a, "sum", "0")
@@ -2001,6 +2261,8 @@ class LoweringTest(MultiProcContinuousTest):
             return c
 
         def func_reuse_eager(x, w1, w2, w3):
+            # [FUNCTION DOC] HELPER: Eager version of the reuse function using one symm_mem
+            # buffer for both all-reduced matmul outputs.
             # we need to allocate the output tensors here
             # because eager path would not allocate the output tensors as symm_mem tensors automatically
             mm1_out = symm_mem.empty(N, N, device=self.device)
@@ -2042,6 +2304,9 @@ class LoweringTest(MultiProcContinuousTest):
     @skip_if_lt_x_gpu(2)
     @fresh_inductor_cache()
     def test_output_buffer_reuse(self):
+        # [FUNCTION DOC] Compiles three repeated matmul plus one_shot_all_reduce layers and
+        # checks the generated code has exactly 3 one_shot_all_reduce_out calls, at least 6 out=
+        # keyword uses, and at least 2 buffer reuse markers.
         """
         Verify that symm_mem ops are lowered via ExternKernelOut
         (should_allocate()=True) so output buffers are visible to Inductor.
@@ -2057,6 +2322,8 @@ class LoweringTest(MultiProcContinuousTest):
 
         # Multi-layer TP pattern: mm -> allreduce, repeated 3 times.
         def func(x, w1, w2, w3):
+            # [FUNCTION DOC] HELPER: Three repeated pairs of matmul followed by
+            # one_shot_all_reduce with sum.
             x = torch.mm(x, w1)
             x = torch.ops.symm_mem.one_shot_all_reduce(x, "sum", "0")
             x = torch.mm(x, w2)
@@ -2093,6 +2360,9 @@ class LoweringTest(MultiProcContinuousTest):
     @skip_if_lt_x_gpu(2)
     @fresh_inductor_cache()
     def test_output_buffer_reuse_copy_variant(self):
+        # [FUNCTION DOC] Compiles a matmul followed by one_shot_all_reduce_copy into a symm_mem
+        # buffer and checks the generated code calls the _copy_out variant with an out=
+        # argument.
         """
         Verify that one_shot_all_reduce_copy is also lowered via
         ExternKernelOut through the manual out variant registry.
@@ -2110,6 +2380,8 @@ class LoweringTest(MultiProcContinuousTest):
         w = torch.rand(N, N, device=self.device)
 
         def func(symm_buffer, local_input, w):
+            # [FUNCTION DOC] HELPER: Matmul of local_input and w, then one_shot_all_reduce_copy
+            # into symm_buffer.
             x = torch.mm(local_input, w)
             return torch.ops.symm_mem.one_shot_all_reduce_copy(
                 symm_buffer, x, "sum", "0"
@@ -2134,11 +2406,16 @@ class LoweringTest(MultiProcContinuousTest):
     @requires_multicast_support()
     @fresh_inductor_cache()
     def test_low_contention_all_gather_planned_output_codegen(self):
+        # [FUNCTION DOC] Compiles the CE multicast all-gather and checks generated code
+        # allocates with empty_strided_p2p with alloc_id, calls the out variant with out=, and
+        # the compiled result has the right shape and chunk values.
         self._init_process()
 
         with _enable_multicast_for_test(self, self.device.index):
 
             def func(x):
+                # [FUNCTION DOC] HELPER: Calls the CE multicast all-gather op on the input with
+                # group name 0.
                 return torch.ops.symm_mem._low_contention_all_gather_ce_multicast(
                     x, "0"
                 )
@@ -2158,6 +2435,10 @@ class LoweringTest(MultiProcContinuousTest):
                 self.assertTrue(chunks[r].eq(r).all())
 
     def _make_lc_ag_out_graph(self, num_collectives: int) -> torch.fx.Graph:
+        # [FUNCTION DOC] HELPER: Builds an FX graph with num_collectives groups of nodes:
+        # placeholders x and out, a functional all_gather_into_tensor_out call writing to out,
+        # an unrelated mm, and wait_tensor on out; sets example values in node meta and outputs
+        # the tuple of wait nodes. Returns the graph.
         graph = torch.fx.Graph()
         waits = []
         for i in range(num_collectives):
@@ -2183,6 +2464,9 @@ class LoweringTest(MultiProcContinuousTest):
         return graph
 
     def _run_lc_ag_pass_test(self, graph: torch.fx.Graph) -> None:
+        # [FUNCTION DOC] HELPER: Applies replace_collectives_with_low_contention to the graph
+        # with the module's symm_mem and multicast checks forced to True and the min-bytes and
+        # CE multicast config patched. Restores the original functions in a finally block.
         from torch._inductor.fx_passes import low_contention_collectives as lc
 
         old_enable_symm_mem = lc._enable_symm_mem
@@ -2204,6 +2488,9 @@ class LoweringTest(MultiProcContinuousTest):
     @skip_if_rocm_multiprocess
     @skip_if_lt_x_gpu(2)
     def test_low_contention_all_gather_out_rewrite_preserves_out(self) -> None:
+        # [FUNCTION DOC] Builds a one-collective graph, runs the low contention pass, and checks
+        # the all_gather_into_tensor_out node was replaced by the CE multicast out op that
+        # reuses the original out node as its third argument.
         self._init_process()
 
         graph = self._make_lc_ag_out_graph(num_collectives=1)
@@ -2225,6 +2512,8 @@ class LoweringTest(MultiProcContinuousTest):
     @skip_if_lt_x_gpu(2)
     @fresh_inductor_cache()
     def test_external_allocation_fallback(self):
+        # [FUNCTION DOC] Compiles one_shot_all_reduce on a regular tensor and checks Inductor
+        # inserts a copy to a p2p allocation, and the result matches an eager dist.all_reduce.
         """
         When the input is not pre-allocated in symmetric memory, Inductor
         auto-inserts an identity copy to P2P.  Verify codegen + correctness.
@@ -2234,6 +2523,7 @@ class LoweringTest(MultiProcContinuousTest):
         N = 8
 
         def func_input_direct(x):
+            # [FUNCTION DOC] HELPER: One_shot_all_reduce with sum over group 0 of the input.
             return torch.ops.symm_mem.one_shot_all_reduce(x, "sum", "0")
 
         x_input = torch.rand(N, N, device=self.device)
@@ -2261,6 +2551,9 @@ class LoweringTest(MultiProcContinuousTest):
     @skip_if_lt_x_gpu(2)
     @fresh_inductor_cache()
     def test_comm_buffer_inplace_prevention(self):
+        # [FUNCTION DOC] Compiles matmul, pointwise multiply, one_shot_all_reduce; checks code
+        # uses a p2p allocation and an out variant all-reduce (no in-place reuse of regular
+        # buffer for the p2p pointwise result) and the result matches eager.
         """Verify scheduler correctly handles inplace for CommBufferLayout buffers."""
         self._init_process()
 
@@ -2271,6 +2564,7 @@ class LoweringTest(MultiProcContinuousTest):
         # mm (ExternKernelOut, regular CUDA) -> pointwise (CommBufferLayout) -> allreduce
         # Should not in-places pointwise mul(P2P) into mm's buffer(regular).
         def func(x, w):
+            # [FUNCTION DOC] HELPER: Matmul, multiply by 2, one_shot_all_reduce with sum.
             y = torch.mm(x, w)
             z = y * 2
             return torch.ops.symm_mem.one_shot_all_reduce(z, "sum", "0")
@@ -2306,6 +2600,10 @@ class LoweringTest(MultiProcContinuousTest):
     @skip_if_lt_x_gpu(2)
     @fresh_inductor_cache()
     def test_custom_op_symm_mem_realization(self):
+        # [FUNCTION DOC] Defines a custom library op with registered symm_mem args for its
+        # input, Meta and CUDA kernels (the CUDA one raises ValueError if the input is not a
+        # symm_mem tensor), compiles a function calling it, and checks the generated code has
+        # exactly one empty_strided_p2p call. Creates a library named test_symm_realize.
         """Test that torch.compile allocates symm_mem for custom ops with registered symm_mem_args."""
         self._init_process()
 
@@ -2321,10 +2619,14 @@ class LoweringTest(MultiProcContinuousTest):
 
         @torch.library.impl(lib, "my_collective", "Meta")
         def meta_impl(input, reduce_op, group_name):
+            # [FUNCTION DOC] HELPER: Meta kernel of the custom op: returns an empty tensor like
+            # the input.
             return torch.empty_like(input)
 
         @torch.library.impl(lib, "my_collective", "CUDA")
         def cuda_impl(input, reduce_op, group_name):
+            # [FUNCTION DOC] HELPER: CUDA kernel of the custom op: raises ValueError if the
+            # input is not a symm_mem tensor, otherwise returns a clone of it.
             if not symm_mem.is_symm_mem_tensor(input):
                 raise ValueError(
                     f"Expected input to be a symmetric memory tensor, but got {type(input)}"
@@ -2332,6 +2634,8 @@ class LoweringTest(MultiProcContinuousTest):
             return input.clone()
 
         def func(x):
+            # [FUNCTION DOC] HELPER: Adds 1 to the input and calls the custom collective op with
+            # sum.
             x = x + 1
             return torch.ops.test_symm_realize.my_collective(x, "sum", group_name)
 
@@ -2344,11 +2648,16 @@ class LoweringTest(MultiProcContinuousTest):
 
 
 class SymmMemSingleProcTest(TestCase):
+    # [CLASS DOC] Single-process tests of low level _SymmetricMemory stream_write_value32 and
+    # memset32 on CUDA.
     @requires_cuda
     @skipIf(
         not PLATFORM_SUPPORTS_SYMM_MEM, "SymmMem is not supported on this ROCm arch"
     )
     def test_stream_write_value32(self):
+        # [FUNCTION DOC] Sets elements of a uint32 tensor one at a time with
+        # stream_write_value32 and checks against a lower triangular pattern; a negative offset
+        # or a value above uint32 range raises RuntimeError.
         tensor = torch.zeros(4, dtype=torch.uint32, device="cuda")
         expect = torch.tril(torch.ones(4, 4, device="cuda")).to(torch.uint32)
 
@@ -2367,6 +2676,10 @@ class SymmMemSingleProcTest(TestCase):
     )
     @requires_cuda
     def test_memset32(self):
+        # [FUNCTION DOC] Tests memset32 on a 64 element uint32 symm_mem tensor: sets a range and
+        # checks the rest stays zero; checks RuntimeError messages for non-flat or non-uint32
+        # input, negative offset, value out of range, non-positive count and offset plus count
+        # past the end; full range and last element writes succeed.
         t = _SymmetricMemory.empty_strided_p2p(
             (64,),
             (1,),
@@ -2423,11 +2736,17 @@ class SymmMemSingleProcTest(TestCase):
 @instantiate_parametrized_tests
 @requires_cuda_p2p_access()
 class SymmMemPoolTest(MultiProcContinuousTest):
+    # [CLASS DOC] Tests symm_mem MemPool: tensors allocated inside torch.cuda.use_mem_pool of
+    # symm_mem.get_mem_pool can be used with symm_mem ops, recycled allocations keep a clean
+    # signal pad, and storage is reused for same-size allocations.
     @property
     def device(self) -> torch.device:
+        # [FUNCTION DOC] HELPER: Returns the CUDA device whose index is this process rank.
         return torch.device(device_type, self.rank)
 
     def _init_process(self):
+        # [FUNCTION DOC] HELPER: Per-test setup: sets the CUDA device and seeds with 42 plus
+        # rank.
         torch.cuda.set_device(self.device)
         torch.manual_seed(42 + self.rank)
 
@@ -2437,6 +2756,8 @@ class SymmMemPoolTest(MultiProcContinuousTest):
     )
     @skip_if_lt_x_gpu(2)
     def test_mempool_tensor_factory(self):
+        # [FUNCTION DOC] Creates an arange tensor in the symm_mem MemPool, rendezvous it and
+        # checks one_shot_all_reduce gives the input times world size.
         self._init_process()
         group_name = dist.group.WORLD.group_name
 
@@ -2462,6 +2783,8 @@ class SymmMemPoolTest(MultiProcContinuousTest):
     @skip_if_lt_x_gpu(2)
     @skip_if_rocm_ver_atleast_multiprocess([7, 14])
     def test_mempool_compute_ops(self):
+        # [FUNCTION DOC] Computes a matmul inside the symm_mem MemPool and checks
+        # one_shot_all_reduce of the result equals the eager matmul times world size.
         self._init_process()
         group_name = dist.group.WORLD.group_name
 
@@ -2481,6 +2804,9 @@ class SymmMemPoolTest(MultiProcContinuousTest):
         self.assertEqual(y, expected)
 
     def _mempool_barrier_roundtrip(self, mempool, numel, dtype, group_name):
+        # [FUNCTION DOC] HELPER: Allocates a tensor in the given MemPool, rendezvous it, fills
+        # it with the rank, runs barriers with a 60 s timeout around reading each peer's buffer
+        # (checked equal to the peer rank), and returns the tensor and handle.
         # Allocate a symmetric tensor from the pool, then run a bounded
         # barrier / buffer round-trip. A polluted signal pad would deadlock the
         # CAS barrier, so timeout_ms makes a regression fail cleanly.
@@ -2501,6 +2827,9 @@ class SymmMemPoolTest(MultiProcContinuousTest):
     )
     @skip_if_lt_x_gpu(2)
     def test_mempool_recycled_alloc_signal_pad(self):
+        # [FUNCTION DOC] Regression test for signal pad pollution: does the barrier round trip
+        # on a pool allocation, frees it, and repeats with the same size so the recycled region
+        # must still work.
         # Regression test for the signal-pad pollution bug: the symmetric
         # allocator (ncclMemAlloc / cuMemCreate) does not zero memory, so a
         # fresh allocation whose region is recycled from a previously-used block
@@ -2525,6 +2854,7 @@ class SymmMemPoolTest(MultiProcContinuousTest):
     )
     @skip_if_lt_x_gpu(2)
     def test_mempool_large_alloc_barrier(self):
+        # [FUNCTION DOC] Runs the barrier round trip on a large (4M float) pool allocation.
         # alloc() only zeros the signal pad, not the whole (much larger) data
         # buffer. Confirm the signaling protocol still initializes correctly on
         # a large allocation: run a barrier / buffer round-trip and check data.
@@ -2540,6 +2870,8 @@ class SymmMemPoolTest(MultiProcContinuousTest):
     )
     @skip_if_lt_x_gpu(2)
     def test_mempool_storage_reuse(self):
+        # [FUNCTION DOC] Allocates in the MemPool, frees, allocates the same size again and
+        # checks the data pointers are equal.
         """MemPool with no_split=True returns the same VA for same-size allocs."""
         self._init_process()
 
@@ -2568,6 +2900,8 @@ class SymmMemPoolTest(MultiProcContinuousTest):
     )
     @skip_if_lt_x_gpu(2)
     def test_symm_mem_empty_storage_reuse(self):
+        # [FUNCTION DOC] Allocates twice with empty_strided_p2p using the same alloc_id, freeing
+        # in between, and checks the same data pointer is returned.
         """symm_mem.empty() reuses storage across alloc/free cycles via the MemPool."""
         self._init_process()
 
@@ -2599,6 +2933,7 @@ class SymmMemPoolTest(MultiProcContinuousTest):
 @instantiate_parametrized_tests
 @requires_cuda_p2p_access()
 class TorchCommsCudaSymmMemTest(MultiProcContinuousTest):
+    # [CLASS DOC] CUDA symm_mem rendezvous with a torchcomms-backed NCCL process group.
     """CUDA symm_mem rendezvous against a torchcomms-backed PG.
 
     Builds a torchcomms comm, wraps it in _BackendWrapper, registers it as
@@ -2608,6 +2943,7 @@ class TorchCommsCudaSymmMemTest(MultiProcContinuousTest):
 
     @property
     def device(self) -> torch.device:
+        # [FUNCTION DOC] HELPER: Returns the CUDA device whose index is this process rank.
         return torch.device("cuda", self.rank)
 
     @requires_nccl()
@@ -2619,6 +2955,11 @@ class TorchCommsCudaSymmMemTest(MultiProcContinuousTest):
     @skip_if_lt_x_gpu(2)
     @parametrize("use_pg_for_rendezvous", [True, False])
     def test_cuda_symm_mem_rendezvous_nccl(self, use_pg_for_rendezvous: bool) -> None:
+        # [FUNCTION DOC] Creates a torchcomms backed process group with setup_torchcomms_pg
+        # (store path from TORCHCOMM_STORE_PATH or a temp path), sets
+        # use_pg_for_symm_mem_rendezvous as parametrized, allocates and rendezvous a symm_mem
+        # tensor by group name, and checks rank, world size and peer buffer contents around
+        # barriers.
         torch.cuda.set_device(self.device)
         suffix = f"usepg_{use_pg_for_rendezvous}"
         group_name = f"torchcomms_cuda_symm_mem_nccl_{suffix}"
@@ -2653,6 +2994,9 @@ class TorchCommsCudaSymmMemTest(MultiProcContinuousTest):
 @skipIf(TEST_WITH_ROCM, "NCCL symmetric memory is not supported on ROCm")
 @skipIf(not PLATFORM_SUPPORTS_SYMM_MEM, "SymmMem is not supported on this ROCm arch")
 class ExternalNcclCommRegistrationTest(TestCase):
+    # [CLASS DOC] Tests register_external_nccl_comm and NcclCommRegistration against a real
+    # single rank NCCL communicator created via ctypes. Requires CUDA, NCCL symm-mem device
+    # support.
     """Tests for the external NCCL comm registration API
     (``register_external_nccl_comm`` and the ``NcclCommRegistration`` handle
     from ``torch.distributed._symmetric_memory._nccl``), exercised against a
@@ -2665,6 +3009,10 @@ class ExternalNcclCommRegistrationTest(TestCase):
     """
 
     def _make_real_comm(self, device_index: int = 0) -> int:
+        # [FUNCTION DOC] HELPER: Creates a one rank ncclComm on the device through ctypes
+        # (libnccl.so.2, ncclCommInitAll), registers its destruction as test cleanup, and
+        # returns the pointer as an int. Skips the test if the C++ registration hook, the
+        # library or comm creation is unavailable.
         """Create a real 1-rank ncclComm on ``device_index`` and return its
         pointer as an int. The comm is destroyed at test teardown."""
         import ctypes
@@ -2704,6 +3052,9 @@ class ExternalNcclCommRegistrationTest(TestCase):
         return comm.value
 
     def test_register_unregister_real_comm(self) -> None:
+        # [FUNCTION DOC] Registers a real comm and checks the returned NcclCommRegistration is
+        # active with the group name and device; unregister deactivates, and a second unregister
+        # is a no-op.
         comm_ptr = self._make_real_comm()
         reg = register_external_nccl_comm("ext_nccl_reg_basic", comm_ptr, "cuda:0")
         self.assertIsInstance(reg, NcclCommRegistration)
@@ -2716,6 +3067,8 @@ class ExternalNcclCommRegistrationTest(TestCase):
         reg.unregister()  # idempotent: second call is a no-op, must not raise
 
     def test_register_holds_and_drops_comm_ref(self) -> None:
+        # [FUNCTION DOC] Checks that passing a source comm object keeps a reference on the
+        # registration and unregister drops it.
         # When a source comm object is passed, the handle keeps a strong ref
         # to it (so a stray `del comm` can't dangle the registered pointer)
         # and releases it on unregister.
@@ -2729,6 +3082,8 @@ class ExternalNcclCommRegistrationTest(TestCase):
         self.assertIsNone(reg._comm)
 
     def test_context_manager_real_comm(self) -> None:
+        # [FUNCTION DOC] Checks the registration works as a context manager: enter returns
+        # itself and is active, exit unregisters.
         comm_ptr = self._make_real_comm()
         reg = register_external_nccl_comm("ext_nccl_reg_cm", comm_ptr, "cuda:0")
         with reg as entered:
@@ -2738,6 +3093,8 @@ class ExternalNcclCommRegistrationTest(TestCase):
         self.assertFalse(reg._active)
 
     def test_register_null_pointer_raises(self) -> None:
+        # [FUNCTION DOC] Checks registering a null comm pointer raises RuntimeError (skipped if
+        # the C++ hook is missing).
         # The registration helper rejects a null comm pointer before touching
         # the registry (C++ TORCH_CHECK).
         try:

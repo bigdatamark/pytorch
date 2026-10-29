@@ -1,4 +1,8 @@
 # Owner(s): ["module: distributions"]
+# [MODULE DOC] pytest tests for torch.distributions.constraints. EXAMPLES lists matrix
+# constraints with expected check results; CONSTRAINTS lists constraint objects/factories
+# with their arguments. Tests check constraint.check, biject_to and transform_to on CPU and
+# (when CUDA is present) GPU. No import-time side effects beyond building the lists.
 
 import pytest
 
@@ -83,6 +87,10 @@ CONSTRAINTS = [
 
 
 def build_constraint(constraint_fn, args, is_cuda=False):
+    # [FUNCTION DOC] HELPER: Instantiates a constraint. With empty args the constraint_fn is
+    # returned as is (it is already a constraint instance). Otherwise each list argument is
+    # converted to a double tensor (CUDA if is_cuda) and non-list arguments pass through
+    # unchanged, then constraint_fn is called with them and the result returned.
     if not args:
         return constraint_fn
     t = torch.cuda.DoubleTensor if is_cuda else torch.DoubleTensor
@@ -100,6 +108,9 @@ def build_constraint(constraint_fn, args, is_cuda=False):
     ],
 )
 def test_constraint(constraint_fn, result, value, is_cuda):
+    # [FUNCTION DOC] Parametrized over EXAMPLES and CPU/CUDA. Converts value to a double
+    # tensor and raises AssertionError if the all-reduced result of constraint_fn.check
+    # differs from the expected boolean result.
     t = torch.cuda.DoubleTensor if is_cuda else torch.DoubleTensor
     if constraint_fn.check(t(value)).all() != result:
         raise AssertionError(
@@ -120,6 +131,11 @@ def test_constraint(constraint_fn, result, value, is_cuda):
     ],
 )
 def test_biject_to(constraint_fn, args, is_cuda):
+    # [FUNCTION DOC] Parametrized over CONSTRAINTS and CPU/CUDA. Builds the constraint and
+    # calls biject_to; skips the test if that raises NotImplementedError. Raises
+    # AssertionError unless the transform is bijective, maps random double input (6x6 for
+    # corr_cholesky, else 5x5) into the constraint, is inverted by t.inv (allclose), and
+    # log_abs_det_jacobian has the batch shape of the input (event dims of the domain removed).
     constraint = build_constraint(constraint_fn, args, is_cuda=is_cuda)
     try:
         t = biject_to(constraint)
@@ -169,6 +185,10 @@ def test_biject_to(constraint_fn, args, is_cuda):
     ],
 )
 def test_transform_to(constraint_fn, args, is_cuda):
+    # [FUNCTION DOC] Parametrized over CONSTRAINTS and CPU/CUDA. Builds the constraint, gets
+    # transform_to(constraint), applies it to random double input (6x6 for corr_cholesky,
+    # else 5x5) and raises AssertionError if the output violates the constraint or if
+    # applying the transform to the pseudo-inverse of the output does not reproduce it.
     constraint = build_constraint(constraint_fn, args, is_cuda=is_cuda)
     t = transform_to(constraint)
     if constraint_fn is constraints.corr_cholesky:
