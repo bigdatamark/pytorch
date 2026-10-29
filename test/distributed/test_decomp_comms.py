@@ -1,4 +1,10 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Unit tests for the decomp_gram_matrix_all_gather FX pass from inductor's
+# decomp_comms. Each test traces a function that all-gathers a shard and computes Gram-style
+# matmuls (Muon or Shampoo like patterns), using fake tensors and make_fx, then runs the pass
+# and counts all_gather, all_reduce and split nodes in the graph. Import time: defines aten and
+# c10d functional op namespaces; the tests need an accelerator with a GPU build and an nccl or
+# xccl backend.
 """
 Unit tests for decomp_gram_matrix_all_gather FX pass.
 
@@ -28,14 +34,23 @@ c10d = torch.ops._c10d_functional
 
 
 def _count_ops(graph: fx.Graph, target) -> int:  # type: ignore[type-arg]
+    # [FUNCTION DOC] HELPER: Returns the number of call_function nodes in the FX graph whose target
+    # is exactly the given op.
     return sum(1 for n in graph.nodes if n.op == "call_function" and n.target is target)
 
 
 @requires_accelerator_dist_backend(["nccl", "xccl"])
 @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
 class TestDecompGramMatrixAllGather(InductorTestCase):
+    # [CLASS DOC] Tests for the decomp_gram_matrix_all_gather pass. The class initializes a fake
+    # process group of world size 2 (rank 0) once and tears it down at the end; tests use the
+    # group name 0 and device cuda. Covers positive transformations and cases where the pass
+    # must leave the graph unchanged.
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Class-level setup: calls the base setup, creates a fake process group
+        # with a FakeStore (rank 0, world size 2) and records cuda as the test device on the
+        # class. Side effect: initializes the default process group.
         super().setUpClass()
         from torch.testing._internal.distributed.fake_pg import FakeStore
 
@@ -45,10 +60,16 @@ class TestDecompGramMatrixAllGather(InductorTestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] Class-level teardown: calls the base teardown and destroys the default
+        # process group.
         super().tearDownClass()
         dist.destroy_process_group()
 
     def test_muon_newton_schulz(self):
+        # [FUNCTION DOC] Traces a Muon-style Newton-Schulz step over a gathered shard (64 by 32,
+        # gathered 128 by 32, transposed before the Gram matmuls) and asserts that the pass
+        # removes the all_gather and the split, and introduces at least ns_steps all_reduce
+        # nodes (one per Gram matmul, plus norm reduction).
         """
         Rigi Muon optimizer pattern with initial transpose (rows > cols).
 
@@ -64,6 +85,10 @@ class TestDecompGramMatrixAllGather(InductorTestCase):
         ns_steps = 5
 
         def muon_step(x_shard):
+            # [FUNCTION DOC] HELPER: Traced function: all-gathers the shard, waits, applies an
+            # identity slice, normalizes in bfloat16, transposes, runs the iterative Newton-Schulz
+            # matmul updates, transposes back, scales, splits by the shard size and returns the
+            # first chunk.
             gathered = c10d.all_gather_into_tensor.default(
                 x_shard, world_size, group_name
             )
@@ -121,6 +146,10 @@ class TestDecompGramMatrixAllGather(InductorTestCase):
         self.assertEqual(_count_ops(traced.graph, aten.split.Tensor), 0)
 
     def test_no_slice_gathered_consumed_directly(self):
+        # [FUNCTION DOC] Traces a variant where the wait output feeds the computation directly
+        # (no slice, and multiple users of the wait: norm and divide). Asserts the precondition
+        # of no slice nodes, then that the pass still removes the all_gather and split and adds
+        # all_reduce nodes.
         """
         Resilient anchor: when inductor folds the FSDP no-op identity slice
         (even sharding), the gathered tensor is consumed straight off the
@@ -133,6 +162,9 @@ class TestDecompGramMatrixAllGather(InductorTestCase):
         ns_steps = 3
 
         def muon_no_slice(x_shard):
+            # [FUNCTION DOC] HELPER: Traced function: all-gathers and waits, normalizes the waited
+            # tensor directly without a slice, transposes, runs Gram-style matmul updates,
+            # transposes back, splits by the shard size and returns the first chunk.
             gathered = c10d.all_gather_into_tensor.default(
                 x_shard, world_size, group_name
             )
@@ -174,11 +206,18 @@ class TestDecompGramMatrixAllGather(InductorTestCase):
         self.assertEqual(_count_ops(traced.graph, aten.split.Tensor), 0)
 
     def test_no_transform_unsafe_entry_region(self):
+        # [FUNCTION DOC] Builds three traced graphs where the entry region is unsafe (the waited
+        # tensor has a side user, a column-dimension slice, or an unsupported amax reduction)
+        # and asserts that after the pass the all_gather is still present and no all_reduce was
+        # added.
         group_name = "0"
         world_size = 2
         ns_steps = 3
 
         def finish(X, x_shard):
+            # [FUNCTION DOC] HELPER: Shared tail of the traced functions: transposes, runs
+            # matmul updates for ns_steps iterations, transposes back, splits by the shard
+            # size and returns the first chunk.
             X = aten.transpose.int(X, -2, -1)
             for _ in range(ns_steps):
                 A = aten.mm.default(X, aten.transpose.int(X, -2, -1))
@@ -187,6 +226,9 @@ class TestDecompGramMatrixAllGather(InductorTestCase):
             return operator.getitem(aten.split.Tensor(X, x_shard.shape[0], 0), 0)
 
         def side_user(x_shard):
+            # [FUNCTION DOC] HELPER: Traced function whose waited gathered tensor has an additional
+            # side consumer (a multiply) besides the main chain; returns the main result and the
+            # side value.
             gathered = c10d.all_gather_into_tensor.default(
                 x_shard, world_size, group_name
             )
@@ -195,6 +237,8 @@ class TestDecompGramMatrixAllGather(InductorTestCase):
             return finish(waited, x_shard), side
 
         def column_slice(x_shard):
+            # [FUNCTION DOC] HELPER: Traced function that slices the gathered tensor along
+            # dimension 1 (columns 0 to 16) before the shared tail computation.
             gathered = c10d.all_gather_into_tensor.default(
                 x_shard, world_size, group_name
             )
@@ -202,6 +246,9 @@ class TestDecompGramMatrixAllGather(InductorTestCase):
             return finish(aten.slice.Tensor(waited, 1, 0, 16), x_shard)
 
         def unsupported_reduction(x_shard):
+            # [FUNCTION DOC] HELPER: Traced function that subtracts a per-column amax
+            # reduction over dimension 0 of the waited tensor before the shared tail
+            # computation.
             gathered = c10d.all_gather_into_tensor.default(
                 x_shard, world_size, group_name
             )
@@ -222,6 +269,9 @@ class TestDecompGramMatrixAllGather(InductorTestCase):
             self.assertEqual(_count_ops(traced.graph, c10d.all_reduce.default), 0)
 
     def test_shampoo_preconditioner(self):
+        # [FUNCTION DOC] Traces a Shampoo-like iterative preconditioner (3 iterations of
+        # permute-based Gram matmul) over the gathered shard. Asserts that the pass removes the
+        # all_gather and split and produces exactly one all_reduce per iteration.
         """
         Shampoo-like optimizer with iterative preconditioner (3 iterations).
         G.T @ G right Kronecker factor via aten.permute.
@@ -232,6 +282,10 @@ class TestDecompGramMatrixAllGather(InductorTestCase):
         n_iters = 3
 
         def shampoo_step(g_shard):
+            # [FUNCTION DOC] HELPER: Traced function: all-gathers and waits, slices the full
+            # range, runs the coupled iteration with a permuted transpose Gram matmul each
+            # step, multiplies by the permuted result, splits by the shard size and returns
+            # the first chunk.
             gathered = c10d.all_gather_into_tensor.default(
                 g_shard, world_size, group_name
             )
@@ -267,6 +321,8 @@ class TestDecompGramMatrixAllGather(InductorTestCase):
         self.assertEqual(_count_ops(traced.graph, aten.split.Tensor), 0)
 
     def test_no_transform_without_gram(self):
+        # [FUNCTION DOC] Traces a graph with a matmul against an independent weight (not a Gram
+        # pattern) and asserts the pass leaves the all_gather and adds no all_reduce.
         """
         Pass must NOT transform when no Gram mm is detected.
         mm(X, W) with independent W is not a Gram pattern.
@@ -275,6 +331,9 @@ class TestDecompGramMatrixAllGather(InductorTestCase):
         world_size = 2
 
         def no_gram(x_shard, weight):
+            # [FUNCTION DOC] HELPER: Traced function taking a shard and a weight: all-gathers,
+            # waits, slices, multiplies by the weight, splits by the shard size and returns the
+            # first chunk.
             gathered = c10d.all_gather_into_tensor.default(
                 x_shard, world_size, group_name
             )
@@ -301,6 +360,9 @@ class TestDecompGramMatrixAllGather(InductorTestCase):
         self.assertEqual(_count_ops(traced.graph, c10d.all_reduce.default), 0)
 
     def test_no_transform_non_decomposable_shape(self):
+        # [FUNCTION DOC] Traces Gram matmuls on a square gathered tensor (64 by 64, so the Gram
+        # output size depends on the gathered dimension) and asserts the pass does not
+        # transform: the all_gather remains and no all_reduce appears.
         """
         mm(X, X.T) where X is (N, N) square: Gram output (N, N) depends
         on the gathered dim, so the decomposition is NOT shape-correct.
@@ -311,6 +373,9 @@ class TestDecompGramMatrixAllGather(InductorTestCase):
         ns_steps = 3
 
         def square_gram(x_shard):
+            # [FUNCTION DOC] HELPER: Traced function: all-gathers, waits, slices, runs matmul
+            # updates with a square Gram product for ns_steps iterations, splits by the shard size
+            # and returns the first chunk.
             gathered = c10d.all_gather_into_tensor.default(
                 x_shard, world_size, group_name
             )
@@ -341,6 +406,9 @@ class TestDecompGramMatrixAllGather(InductorTestCase):
         self.assertEqual(_count_ops(traced.graph, c10d.all_reduce.default), 0)
 
     def test_no_transform_single_gram_mm(self):
+        # [FUNCTION DOC] Traces a graph with a single Gram matmul (below the minimum count of 2
+        # named in the docstring) and asserts that the pass leaves the all_gather in place and
+        # adds no all_reduce.
         """
         Single Gram mm doesn't meet the _MIN_GRAM_MMS=2 threshold.
         Pass must not transform (likely forward/backward, not iterative optimizer).
@@ -349,6 +417,8 @@ class TestDecompGramMatrixAllGather(InductorTestCase):
         world_size = 2
 
         def single_gram(x_shard):
+            # [FUNCTION DOC] HELPER: Traced function: all-gathers, waits, slices, computes one Gram
+            # matmul and a product with it, splits by the shard size and returns the first chunk.
             gathered = c10d.all_gather_into_tensor.default(
                 x_shard, world_size, group_name
             )
@@ -376,6 +446,10 @@ class TestDecompGramMatrixAllGather(InductorTestCase):
         self.assertEqual(_count_ops(traced.graph, c10d.all_reduce.default), 0)
 
     def test_padded_shard_trimming(self):
+        # [FUNCTION DOC] Traces an FSDP-padded case (padded shard of 64 rows, 60 unpadded rows
+        # per rank, slice to 120 rows). Asserts the pass removes the all_gather, adds all_reduce
+        # nodes, and inserts exactly one slice on the placeholder whose end argument is 60,
+        # trimming the shard.
         """
         FSDP padding: the shard is padded for divisibility, but the gathered
         tensor is sliced down to the unpadded total before the Gram compute
@@ -391,6 +465,9 @@ class TestDecompGramMatrixAllGather(InductorTestCase):
         gathered_unpadded = unpadded_per_rank * world_size
 
         def padded_step(x_shard):
+            # [FUNCTION DOC] HELPER: Traced function: all-gathers and waits, slices to the unpadded
+            # total row count, transposes, runs matmul updates, transposes back, splits into
+            # unpadded per-rank chunks and returns the first.
             gathered = c10d.all_gather_into_tensor.default(
                 x_shard, world_size, group_name
             )
@@ -440,6 +517,8 @@ class TestDecompGramMatrixAllGather(InductorTestCase):
         self.assertEqual(len(trim_slices), 1, "pass should insert a shard-trim slice")
 
     def test_no_transform_multiple_consumed_getitems(self):
+        # [FUNCTION DOC] Traces a graph where two getitems of the split are both consumed, and
+        # asserts the pass bails out: the all_gather remains and no all_reduce is added.
         """
         When the split feeds multiple consumed getitems (e.g. several ranks'
         shards used in the same graph), collapsing the split into a single
@@ -452,6 +531,9 @@ class TestDecompGramMatrixAllGather(InductorTestCase):
         ns_steps = 3
 
         def multi_user_step(x_shard):
+            # [FUNCTION DOC] HELPER: Traced function: gather, wait, slice, transpose, matmul
+            # updates, transpose back, split by the shard size, then returns the sum of the first
+            # two chunks.
             gathered = c10d.all_gather_into_tensor.default(
                 x_shard, world_size, group_name
             )
