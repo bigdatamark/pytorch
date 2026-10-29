@@ -1,9 +1,14 @@
+# [MODULE DOC] Inlines local C++ include directives into a single source text. Offers
+# read_file and embed_headers; running as a script prints the embedded result for a file
+# given on the command line.
 from collections.abc import Sequence
 from pathlib import Path
 from re import match as _match
 
 
 def read_file(fname: Path | str) -> list[str]:
+    # [FUNCTION DOC] Reads a UTF-8 text file and returns its lines (newlines kept).
+    # Raises OSError if the file cannot be opened.
     with open(fname, encoding="utf-8") as f:
         return f.readlines()
 
@@ -11,6 +16,10 @@ def read_file(fname: Path | str) -> list[str]:
 def _embed_headers(
     content: list[str], include_dirs: list[Path], processed_files: set[str]
 ) -> str:
+    # [FUNCTION DOC] HELPER: Recursively replaces include lines whose target exists in one
+    # of the include directories with that file's content, blanks lines for once-guard
+    # pragmas and for already-embedded files, and returns the joined text. Mutates the
+    # content list and the processed-files set. Unresolvable includes are left as is.
     for line_idx, cur_line in enumerate(content):
         # Eliminate warning: `#pragma once in main file`
         if cur_line.startswith("#pragma once"):
@@ -37,6 +46,9 @@ def _embed_headers(
 def embed_headers(
     fname: str, include_dirs: Sequence[str] | Sequence[Path] | str | None = None
 ) -> str:
+    # [FUNCTION DOC] Returns the text of the given file with local includes recursively
+    # inlined. include_dirs may be None (repository root and its aten source dir), one
+    # path, or a sequence of paths. The starting file counts as already processed.
     if include_dirs is None:
         base_dir = Path(__file__).parent.parent.parent
         include_dirs = [base_dir, base_dir / "aten" / "src"]

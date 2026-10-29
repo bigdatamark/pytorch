@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+
+# [MODULE DOC] Helpers for using context managers as decorators: a wrapper that applies a
+# context manager around each step of a generator, a general decorating function, and base
+# classes that turn a context manager into a decorator (with or without parentheses).
 # Extra utilities for working with context managers that should have been
 # in the standard library but are not
 
@@ -19,6 +23,10 @@ F = TypeVar("F", bound=FuncType)
 
 
 def _wrap_generator(ctx_factory, func):
+    # [FUNCTION DOC] HELPER: Given a factory producing context managers and a generator
+    # function, returns a generator function that enters a fresh context around every resume
+    # of the wrapped generator (start, send, throw, close) and forwards values, thrown errors
+    # and the final return value. Exits the context on each suspension at a yield.
     """
     Wrap each generator invocation with the context manager factory.
 
@@ -28,6 +36,9 @@ def _wrap_generator(ctx_factory, func):
 
     @functools.wraps(func)
     def generator_context(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Generator that drives the wrapped generator, entering the
+        # context for each step, relaying yielded values and requests; closes or throws into
+        # the inner generator as needed; returns the inner generator's return value.
         gen = func(*args, **kwargs)
 
         # Generators are suspended and unsuspended at `yield`, hence we
@@ -72,6 +83,10 @@ def _wrap_generator(ctx_factory, func):
 
 
 def context_decorator(ctx, func):
+    # [FUNCTION DOC] Returns func wrapped so each call runs inside the context given by ctx
+    # (a reusable context manager, or a factory called on every use). Generator functions
+    # get per-step wrapping. Raises AssertionError if ctx is both callable and a context
+    # manager, and RuntimeError if func is a class.
     """
     Like contextlib.ContextDecorator.
 
@@ -99,6 +114,7 @@ def context_decorator(ctx, func):
     if not callable(ctx):
 
         def ctx_factory():
+            # [FUNCTION DOC] HELPER: Returns the captured context manager object itself.
             return ctx
 
     else:
@@ -119,6 +135,8 @@ def context_decorator(ctx, func):
 
     @functools.wraps(func)
     def decorate_context(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Calls the wrapped function inside a new context and returns
+        # its result.
         # pyrefly: ignore [bad-context-manager]
         with ctx_factory():
             return func(*args, **kwargs)
@@ -127,9 +145,15 @@ def context_decorator(ctx, func):
 
 
 class _DecoratorContextManager:
+    # [CLASS DOC] HELPER: Base class for context managers usable as decorators. Subclasses
+    # implement enter and exit and may override clone when their constructor takes
+    # parameters; each decorated call uses a fresh clone.
     """Allow a context manager to be used as a decorator."""
 
     def __call__(self, orig_func: F) -> F:
+        # [FUNCTION DOC] Decorates a function with a clone of this manager. A class argument
+        # triggers a FutureWarning (deprecated) and is wrapped through a function calling it.
+        # Returns the decorated callable.
         if inspect.isclass(orig_func):
             warnings.warn(
                 "Decorating classes is deprecated and will be disabled in "
@@ -146,17 +170,23 @@ class _DecoratorContextManager:
         return cast(F, context_decorator(self.clone, func))
 
     def __enter__(self) -> None:
+        # [FUNCTION DOC] Abstract; subclasses must override. Raises NotImplementedError.
         raise NotImplementedError
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        # [FUNCTION DOC] Abstract; subclasses must override. Raises NotImplementedError.
         raise NotImplementedError
 
     def clone(self):
+        # [FUNCTION DOC] Returns a new instance of the same class built with no arguments.
         # override this method if your children class takes __init__ parameters
         return self.__class__()
 
 
 class _NoParamDecoratorContextManager(_DecoratorContextManager):
+    # [CLASS DOC] HELPER: Decorator-capable context manager that can be applied directly
+    # to a function without parentheses; constructing with a function returns the
+    # decorated function, constructing with nothing returns a manager instance.
     """Allow a context manager to be used as a decorator without parentheses."""
 
     @overload
@@ -165,6 +195,8 @@ class _NoParamDecoratorContextManager(_DecoratorContextManager):
     def __new__(cls, orig_func: None = None) -> Self: ...
 
     def __new__(cls, orig_func: F | None = None) -> Self | F:  # type: ignore[misc]
+        # [FUNCTION DOC] With no function returns a normal new instance; with a function
+        # returns that function decorated by a fresh instance.
         if orig_func is None:
             return super().__new__(cls)
         return cls()(orig_func)

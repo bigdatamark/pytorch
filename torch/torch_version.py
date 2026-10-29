@@ -1,3 +1,6 @@
+# [MODULE DOC] Defines TorchVersion, a str subclass comparable with Version objects, strings
+# and tuples, and exposes the module-level version as a TorchVersion. At import it installs
+# the rich comparison methods on TorchVersion and builds the version object.
 from collections.abc import Iterable
 from typing import Any
 
@@ -9,6 +12,9 @@ __all__ = ["TorchVersion"]
 
 
 class TorchVersion(str):
+    # [CLASS DOC] Version string that behaves as a str but whose comparison operators
+    # (installed after the class body) parse both sides as versions, falling back to plain
+    # string comparison if parsing fails. Has no instance state (empty slots).
     """A string with magic powers to compare to both Version and iterables!
     Prior to 1.10.0 torch.__version__ was stored as a str and so many did
     comparisons against torch.__version__ as if it were a str. In order to not
@@ -30,6 +36,9 @@ class TorchVersion(str):
 
     # fully qualified type names here to appease mypy
     def _convert_to_version(self, inp: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Converts a Version (kept as is), a string, or an iterable
+        # of parts (joined with dots) into a Version. Raises InvalidVersion for other types
+        # or unparsable text.
         if isinstance(inp, Version):
             return inp
         elif isinstance(inp, str):
@@ -46,6 +55,9 @@ class TorchVersion(str):
             raise InvalidVersion(inp)
 
     def _cmp_wrapper(self, cmp: Any, method: str) -> bool:
+        # [FUNCTION DOC] HELPER: Applies the named comparison method of Version to this
+        # string and the converted other operand and returns the boolean. On InvalidVersion
+        # falls back to the str comparison of the same name; other errors propagate.
         try:
             return getattr(Version(self), method)(self._convert_to_version(cmp))
         except BaseException as e:

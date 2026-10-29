@@ -1,5 +1,10 @@
 # mypy: allow-untyped-defs
 
+# [PACKAGE DOC] Package of miscellaneous torch utilities. Imports and re-exports the
+# backcompat, collect_env, data, deterministic and hooks subpackages plus the privateuse1
+# backend registration helpers, C++ backtrace getter and ThroughputBenchmark. Defines
+# set_module, swap_tensors and the cmake_prefix_path string (computed at import).
+
 import copyreg
 import os.path as _osp
 import weakref
@@ -21,6 +26,8 @@ from torch.utils.throughput_benchmark import ThroughputBenchmark
 
 
 def set_module(obj, mod):
+    # [FUNCTION DOC] Sets the module name attribute of obj to mod (mutates obj). Raises
+    # TypeError if mod is not a string.
     """
     Set the module attribute on a python object for a given object for nicer printing
     """
@@ -33,6 +40,11 @@ cmake_prefix_path = _osp.join(_osp.dirname(_osp.dirname(__file__)), "share", "cm
 
 
 def swap_tensors(t1, t2):
+    # [FUNCTION DOC] Swaps the contents of two tensors in place so each object keeps its
+    # identity: class, instance dict, slots and the underlying native tensor. Raises
+    # RuntimeError if either has weakrefs, the slot sets differ, or the use count is not
+    # 1 (or 2 for a leaf with a gradient accumulation node). In the leaf case, the
+    # accumulation node gets a pre-hook that raises on later backward (poisoning).
     """
     This function swaps the content of the two Tensor objects.
     At a high level, this will make t1 have the content of t2 while preserving
@@ -51,11 +63,14 @@ def swap_tensors(t1, t2):
         raise RuntimeError("Cannot swap t1 and t2 if they have different slots")
 
     def swap_attr(name):
+        # [FUNCTION DOC] HELPER: Exchanges the named attribute between t1 and t2.
         tmp = getattr(t1, name)
         setattr(t1, name, (getattr(t2, name)))
         setattr(t2, name, tmp)
 
     def error_pre_hook(grad_outputs):
+        # [FUNCTION DOC] HELPER: Pre-hook for a poisoned gradient accumulation node; always
+        # raises RuntimeError explaining backward after a swap is unsupported.
         raise RuntimeError(
             "Trying to execute AccumulateGrad node that was poisoned by swap_tensors "
             "this can happen when you try to run backward on a tensor that was swapped. "
@@ -66,6 +81,9 @@ def swap_tensors(t1, t2):
         )
 
     def check_use_count(t, name="t1"):
+        # [FUNCTION DOC] HELPER: Verifies tensor t is not referenced elsewhere. A count of 2
+        # on a leaf tensor is accepted and the gradient accumulation node is poisoned with
+        # the error hook; otherwise raises RuntimeError mentioning name.
         use_count = t._use_count()
         error_str = (
             f"Expected use_count of {name} to be 1 or 2 with an AccumulateGrad node but got {use_count} "

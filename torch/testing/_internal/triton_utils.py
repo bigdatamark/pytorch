@@ -1,5 +1,13 @@
 # mypy: ignore-errors
 
+# [MODULE DOC] Shared fixtures for tests of Triton integration: unittest skip decorators
+# (requires_cuda_and_triton, requires_xpu_and_triton, requires_gpu_and_triton, requires_gpu)
+# built from capability flags, and, only when Triton is importable, a library of small jit
+# and autotuned kernels (elementwise add/sub/mul, TMA descriptor variants, block pointers,
+# inline assembly, docstring edge cases), a config generator and a descriptor shim.
+# Importing evaluates the capability flags and, if Triton exists, imports torch and triton
+# and defines (but does not run) all kernels.
+
 import unittest
 
 from torch.testing._internal.inductor_utils import (
@@ -30,6 +38,9 @@ if has_triton():
     import torch
 
     def _get_strange_configs() -> list[triton.Config]:
+        # [FUNCTION DOC] HELPER: Returns two autotune configs for the matmul-style kernel
+        # with unusual tile sizes (one small, one large); on AMD builds each also carries
+        # extra AMD-specific tuning options.
         if torch.version.hip:
             configs = [
                 triton.Config(
@@ -93,6 +104,8 @@ if has_triton():
         n_elements,
         BLOCK_SIZE: "tl.constexpr",
     ):
+        # [FUNCTION DOC] HELPER: Triton kernel; each program adds a block of the two input
+        # buffers elementwise and stores into the output, masking indices past n_elements.
         pid = tl.program_id(axis=0)
         block_start = pid * BLOCK_SIZE
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
@@ -110,6 +123,8 @@ if has_triton():
         n_elements,
         BLOCK_SIZE: "tl.constexpr",
     ):
+        # [FUNCTION DOC] HELPER: Triton kernel computing the elementwise difference of the
+        # first and second input per block, masked by n_elements.
         pid = tl.program_id(axis=0)
         block_start = pid * BLOCK_SIZE
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
@@ -128,6 +143,8 @@ if has_triton():
         ARGS_PASSED: "tl.constexpr",
         BLOCK_SIZE: "tl.constexpr",
     ):
+        # [FUNCTION DOC] HELPER: Triton kernel that adds both inputs when the compile-time
+        # flag equals the text for two arguments, else copies only the first input.
         pid = tl.program_id(axis=0)
         block_start = pid * BLOCK_SIZE
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
@@ -150,6 +167,10 @@ if has_triton():
         ARGS_PASSED: "tl.constexpr",
         BLOCK_SIZE: "tl.constexpr",
     ):
+        # [FUNCTION DOC] HELPER: Triton kernel like the optional-param add, but the first
+        # input and output are indexed with a runtime stride (may equal 1) and the second
+        # input may be absent (None) when the flag says only one argument is passed.
+        # KNOWN ISSUE: the second input is indexed without the stride, unlike the first.
         pid = tl.program_id(axis=0)
         block_start = pid * BLOCK_SIZE
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
@@ -179,6 +200,8 @@ if has_triton():
         n_elements,
         BLOCK_SIZE: "tl.constexpr",
     ):
+        # [FUNCTION DOC] HELPER: Autotuned elementwise add kernel; autotuner tries four
+        # block-size/stage/warp configs (no key). Body matches the plain add kernel.
         pid = tl.program_id(axis=0)
         block_start = pid * BLOCK_SIZE
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
@@ -205,6 +228,8 @@ if has_triton():
         n_elements,
         BLOCK_SIZE: "tl.constexpr",
     ):
+        # [FUNCTION DOC] HELPER: Autotuned elementwise subtract kernel with the same four
+        # configs as the autotuned add kernel.
         pid = tl.program_id(axis=0)
         block_start = pid * BLOCK_SIZE
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
@@ -228,6 +253,9 @@ if has_triton():
         BLOCK_SIZE: "tl.constexpr",
         out_ptr,
     ):
+        # [FUNCTION DOC] HELPER: Autotuned elementwise add kernel whose output pointer
+        # parameter comes after the compile-time block size, to exercise parameter-order
+        # handling. Single config.
         # out_ptr is after an autotuned param that's declared as tl.constexpr.
         # This param ordering can create bugs if not handled correctly.
         pid = tl.program_id(axis=0)
@@ -266,6 +294,9 @@ if has_triton():
         BLOCK_SIZE_X: "tl.constexpr",
         BLOCK_SIZE_Y: "tl.constexpr",
     ):
+        # [FUNCTION DOC] HELPER: Autotuned 2D kernel; per tile it loads the input at a
+        # position and at its transposed-index position (with sizes x_elements and
+        # y_elements), adds them and stores to the first position. Masked at the bounds.
         xoffset = tl.program_id(0) * BLOCK_SIZE_X
         xindex = xoffset + tl.arange(0, BLOCK_SIZE_X)[:, None]
         xmask = xindex < x_elements
@@ -280,6 +311,8 @@ if has_triton():
         tl.store(out_ptr + (x1 + (x_elements * y0)), tmp2, xmask & ymask)
 
     def _dummy_early_config_prune(configs, *_, **__):
+        # [FUNCTION DOC] HELPER: Pruning hook for the autotuner that returns all configs
+        # unchanged and ignores other arguments.
         return configs
 
     @triton.autotune(
@@ -300,6 +333,8 @@ if has_triton():
         n_elements,
         BLOCK_SIZE: "tl.constexpr",
     ):
+        # [FUNCTION DOC] HELPER: Elementwise add kernel whose autotuner uses options (warmup,
+        # repetitions, config pruning hook) that tooling may not support.
         pid = tl.program_id(axis=0)
         block_start = pid * BLOCK_SIZE
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
@@ -318,6 +353,8 @@ if has_triton():
         scaling_factor,
         BLOCK_SIZE: "tl.constexpr",
     ):
+        # [FUNCTION DOC] HELPER: Triton kernel storing the sum of the two inputs multiplied
+        # by a scalar scaling factor, masked by n_elements.
         pid = tl.program_id(axis=0)
         block_start = pid * BLOCK_SIZE
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
@@ -334,6 +371,8 @@ if has_triton():
         out_desc_ptr,
         BLOCK_SIZE: "tl.constexpr",
     ):
+        # [FUNCTION DOC] HELPER: Triton kernel adding two 1D float32 blocks fetched through
+        # descriptors of the experimental TMA interface and storing through the output descriptor.
         pid = tl.program_id(axis=0)
         offset = pid * BLOCK_SIZE
 
@@ -366,6 +405,8 @@ if has_triton():
         BLOCK_SIZE_X: "tl.constexpr",
         BLOCK_SIZE_Y: "tl.constexpr",
     ):
+        # [FUNCTION DOC] HELPER: 2D version of the experimental-descriptor add kernel; each
+        # program handles one float32 tile located by its two program indices.
         pid_x = tl.program_id(axis=0)
         pid_y = tl.program_id(axis=1)
         offset_x = pid_x * BLOCK_SIZE_X
@@ -399,6 +440,8 @@ if has_triton():
         out_desc_ptr,
         BLOCK_SIZE: "tl.constexpr",
     ):
+        # [FUNCTION DOC] HELPER: 1D add kernel using the tensor-descriptor load and store
+        # interface; block shape comes from the descriptors.
         pid = tl.program_id(axis=0)
         offset = pid * BLOCK_SIZE
 
@@ -427,6 +470,8 @@ if has_triton():
         BLOCK_SIZE_X: "tl.constexpr",
         BLOCK_SIZE_Y: "tl.constexpr",
     ):
+        # [FUNCTION DOC] HELPER: 2D add kernel using the tensor-descriptor load and store
+        # interface, one tile per program.
         pid_x = tl.program_id(axis=0)
         pid_y = tl.program_id(axis=1)
         offset_x = pid_x * BLOCK_SIZE_X
@@ -459,6 +504,9 @@ if has_triton():
         workspace,
         BLOCK_SIZE: "tl.constexpr",
     ):
+        # [FUNCTION DOC] HELPER: Kernel that builds three experimental TMA descriptors on
+        # the device inside a scratch workspace buffer (spaced 128 bytes apart) for inputs a,
+        # b and output c of shape m by n, then adds one float32 tile of a and b into c.
         a_desc_ptr = workspace
         b_desc_ptr = workspace + 128
         c_desc_ptr = workspace + 256
@@ -527,6 +575,9 @@ if has_triton():
         workspace,  # unused but left here to match the old API kernel
         BLOCK_SIZE: "tl.constexpr",
     ):
+        # [FUNCTION DOC] HELPER: Same computation as the old-interface on-device kernel but
+        # creates row-major tensor descriptors with the new in-kernel constructor; the
+        # workspace argument is unused.
         # Create tensor descriptors using the new API
         a_desc = tl.make_tensor_descriptor(
             base=a_ptr,
@@ -579,6 +630,8 @@ if has_triton():
         n_elements,
         BLOCK_SIZE: "tl.constexpr",
     ):
+        # [FUNCTION DOC] HELPER: Triton kernel writing twice the input into the output,
+        # masked by n_elements.
         pid = tl.program_id(axis=0)
         block_start = pid * BLOCK_SIZE
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
@@ -593,6 +646,7 @@ if has_triton():
         n_elements,
         BLOCK_SIZE: "tl.constexpr",
     ):
+        # [FUNCTION DOC] HELPER: Triton kernel doubling a buffer in place, masked by n_elements.
         pid = tl.program_id(axis=0)
         block_start = pid * BLOCK_SIZE
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
@@ -603,6 +657,8 @@ if has_triton():
 
     @triton.jit
     def zero_negs(x):
+        # [FUNCTION DOC] HELPER: Jit helper returning the value where it is non-negative
+        # and zero elsewhere.
         return tl.where(x >= 0, x, 0)
 
     @triton.jit
@@ -613,6 +669,9 @@ if has_triton():
         BLOCK_SIZE: "tl.constexpr",
         ACTIVATION: "tl.constexpr",
     ):
+        # [FUNCTION DOC] HELPER: Kernel calling other kernels depending on a compile-time
+        # name: the in-place doubling kernel or the add kernel (both on the input buffer),
+        # then copies the input block to the output. Tests nested kernel calls.
         pid = tl.program_id(axis=0)
         block_start = pid * BLOCK_SIZE
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
@@ -633,6 +692,8 @@ if has_triton():
         X_BLOCK_SIZE: "tl.constexpr",
         Y_BLOCK_SIZE: "tl.constexpr",
     ):
+        # [FUNCTION DOC] HELPER: Kernel copying a 2D tile from the input to the output with
+        # separate row strides, multiplying values by two.
         xid = tl.program_id(axis=0)
         yid = tl.program_id(axis=1)
         x_start = xid * X_BLOCK_SIZE
@@ -648,6 +709,8 @@ if has_triton():
     def inline_asm_kernel_is_pure_true(
         X, Y, Z, n: "tl.constexpr", BLOCK: "tl.constexpr"
     ):
+        # [FUNCTION DOC] HELPER: Kernel applying an inline PTX funnel-shift instruction to
+        # two loaded blocks and a constant shift amount, marked side-effect free (pure).
         x = tl.load(X + tl.arange(0, BLOCK))
         y = tl.load(Y + tl.arange(0, BLOCK))
         s = tl.full([BLOCK], n, tl.int32)
@@ -665,6 +728,8 @@ if has_triton():
     def inline_asm_kernel_is_pure_false(
         X, Y, Z, n: "tl.constexpr", BLOCK: "tl.constexpr"
     ):
+        # [FUNCTION DOC] HELPER: Same as the pure inline-assembly kernel but the assembly is
+        # declared as possibly having side effects (not pure).
         x = tl.load(X + tl.arange(0, BLOCK))
         y = tl.load(Y + tl.arange(0, BLOCK))
         s = tl.full([BLOCK], n, tl.int32)
@@ -686,6 +751,8 @@ if has_triton():
         n_elements,
         BLOCK_SIZE: tl.constexpr,
     ):
+        # [FUNCTION DOC] HELPER: 1D add kernel using block pointers for both inputs and the
+        # output, with boundary checking on the single dimension.
         pid = tl.program_id(axis=0)
         block_start = pid * BLOCK_SIZE
         x = tl.load(
@@ -731,6 +798,8 @@ if has_triton():
         n_elements,
         BLOCK_SIZE: tl.constexpr,
     ):
+        # [FUNCTION DOC] HELPER: Copy kernel via block pointers over a column-shaped 2D view
+        # (n_elements rows, one column) with boundary checking on the first dimension.
         pid = tl.program_id(axis=0)
         block_start = pid * BLOCK_SIZE
         x = tl.load(
@@ -768,6 +837,8 @@ if has_triton():
         n_elements,
         BLOCK_SIZE: "tl.constexpr",
     ):
+        # [FUNCTION DOC] HELPER: Elementwise add kernel that calls the load and store
+        # functions imported directly by name from the language module.
         pid = tl.program_id(axis=0)
         block_start = pid * BLOCK_SIZE
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
@@ -785,6 +856,8 @@ if has_triton():
         n_elements,
         BLOCK_SIZE: "tl.constexpr",
     ):
+        # [FUNCTION DOC] HELPER: Kernel with a data-independent branch on the program index:
+        # program zero stores the sum of inputs, all other programs store the product.
         pid = tl.program_id(axis=0)
         block_start = pid * BLOCK_SIZE
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
@@ -805,6 +878,8 @@ if has_triton():
         n_elements,
         BLOCK_SIZE: "tl.constexpr",
     ):
+        # [FUNCTION DOC] HELPER: Kernel that atomically accumulates the sum of the inputs
+        # into the output buffer (read-modify-write), masked by n_elements.
         pid = tl.program_id(axis=0)
         block_start = pid * BLOCK_SIZE
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
@@ -822,6 +897,8 @@ if has_triton():
         n_elements,
         BLOCK_SIZE: "tl.constexpr",
     ):
+        # [FUNCTION DOC] HELPER: Kernel storing the sum of the inputs four times to the same
+        # output: twice in a counted loop and twice in a countdown while loop. Exercises loops.
         pid = tl.program_id(axis=0)
         block_start = pid * BLOCK_SIZE
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
@@ -845,6 +922,8 @@ if has_triton():
         out_ptr,
         BLOCK_SIZE: "tl.constexpr",
     ):
+        # [FUNCTION DOC] HELPER: Elementwise add kernel with the output pointer declared
+        # after the element count, to test non-standard parameter order.
         pid = tl.program_id(axis=0)
         block_start = pid * BLOCK_SIZE
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
@@ -892,6 +971,10 @@ if has_triton():
         BLOCK_SIZE_K: tl.constexpr,
         GROUP_SIZE_M: tl.constexpr,
     ):
+        # [FUNCTION DOC] HELPER: Autotuned simplified grouped matmul kernel used to test
+        # unusual configs: the row count is read from device memory; when it is zero, tiles
+        # with large row blocks assume 4096 rows and run, while small-block configs return
+        # early (so the bad config is fast). Output is half precision.
         # This is a simplified matmul from Triton tutorial.
         pid = tl.program_id(axis=0)
         M = tl.load(M_ptr)
@@ -933,6 +1016,8 @@ if has_triton():
 
     @triton.jit
     def kernel_with_docstring_double_quotes(out_ptr, numel, BLOCK_SIZE: tl.constexpr):
+        # [FUNCTION DOC] HELPER: Kernel filling the output with ones, masked by numel; its
+        # docstring contains triple double quotes to test that codegen sanitizes docstrings.
         """
         This kernel contains a triple-quote docstring w/ double quotes.
         Make sure that codegen sanitizes the docstring.
@@ -944,6 +1029,8 @@ if has_triton():
 
     @triton.jit
     def kernel_with_docstring_single_quotes(out_ptr, numel, BLOCK_SIZE: tl.constexpr):
+        # [FUNCTION DOC] HELPER: Same fill-with-ones kernel, but the docstring uses triple
+        # single quotes and mentions double quotes inside.
         '''
         This kernel contains a triple-quote docstring w/ single quotes
         Make sure that codegen sanitizes the docstring.
@@ -956,6 +1043,8 @@ if has_triton():
 
     @triton.jit
     def kernel_with_backslash_in_docstring(out_ptr, numel, BLOCK_SIZE: tl.constexpr):
+        # [FUNCTION DOC] HELPER: Same fill-with-ones kernel whose docstring contains
+        # backslash escape sequences, to test escaping in generated code.
         """Docstring with literal backslash escapes: \n \t \\"""
         pid = tl.program_id(axis=0)
         offsets = tl.arange(0, BLOCK_SIZE) + pid * BLOCK_SIZE
@@ -966,6 +1055,9 @@ if has_triton():
     def kernel_inline_asm_double_quotes(
         in_ptr, out_ptr, numel, BLOCK_SIZE: tl.constexpr
     ):
+        # [FUNCTION DOC] HELPER: Kernel applying a multi-line NVIDIA assembly snippet
+        # (cosine then exponential approximation) to loaded floats; the snippet is a
+        # triple double quoted string. Stores masked by numel.
         pid = tl.program_id(axis=0)
         offsets = tl.arange(0, BLOCK_SIZE) + pid * BLOCK_SIZE
         data = tl.load(in_ptr + offsets, mask=offsets < numel)
@@ -988,6 +1080,8 @@ if has_triton():
     def kernel_inline_asm_single_quotes(
         in_ptr, out_ptr, numel, BLOCK_SIZE: tl.constexpr
     ):
+        # [FUNCTION DOC] HELPER: Same as the double-quoted inline-assembly kernel but the
+        # snippet uses triple single quotes and contains a comment line.
         pid = tl.program_id(axis=0)
         offsets = tl.arange(0, BLOCK_SIZE) + pid * BLOCK_SIZE
         data = tl.load(in_ptr + offsets, mask=offsets < numel)
@@ -1011,6 +1105,8 @@ if has_triton():
     def kernel_inline_asm_rocm_double_quotes(
         in_ptr, out_ptr, numel, BLOCK_SIZE: tl.constexpr
     ):
+        # [FUNCTION DOC] HELPER: AMD variant of the inline-assembly kernel (sine then
+        # exponential instructions) using a triple double quoted string.
         pid = tl.program_id(axis=0)
         offsets = tl.arange(0, BLOCK_SIZE) + pid * BLOCK_SIZE
         data = tl.load(in_ptr + offsets, mask=offsets < numel)
@@ -1031,6 +1127,9 @@ if has_triton():
     def kernel_inline_asm_rocm_single_quotes(
         in_ptr, out_ptr, numel, BLOCK_SIZE: tl.constexpr
     ):
+        # [FUNCTION DOC] HELPER: Intended single-quote variant of the AMD assembly kernel.
+        # KNOWN ISSUE: despite its name it uses triple double quotes, identical to the
+        # double-quote variant.
         pid = tl.program_id(axis=0)
         offsets = tl.arange(0, BLOCK_SIZE) + pid * BLOCK_SIZE
         data = tl.load(in_ptr + offsets, mask=offsets < numel)
@@ -1056,6 +1155,8 @@ if has_triton():
         add_xy,  # boolean param
         BLOCK_SIZE: "tl.constexpr",
     ):
+        # [FUNCTION DOC] HELPER: Kernel storing the sum of the inputs if the boolean runtime
+        # argument is true, otherwise just the first input.
         pid = tl.program_id(axis=0)
         block_start = pid * BLOCK_SIZE
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
@@ -1077,6 +1178,8 @@ if has_triton():
         n_elements,
         BLOCK_SIZE: "tl.constexpr",
     ):
+        # [FUNCTION DOC] HELPER: Kernel that stores the sum of the inputs where a boolean
+        # tensor (loaded as integers) is set, and just the first input elsewhere.
         """Kernel that loads a bool tensor and uses it as a mask."""
         pid = tl.program_id(axis=0)
         block_start = pid * BLOCK_SIZE
@@ -1092,6 +1195,10 @@ if has_triton():
     def create_tensor_descriptor_shim(
         tensor, block_sizes: list[int], new_api: bool = True
     ):
+        # [FUNCTION DOC] HELPER: Builds a TMA descriptor for a tensor and block sizes: a
+        # tensor-descriptor object with the new interface, or, with the old one, a 1D or 2D
+        # experimental descriptor from data pointer, sizes, block sizes and element size.
+        # Raises AssertionError if the old path gets more than two block sizes (or zero).
         if new_api:
             return triton.tools.tensor_descriptor.TensorDescriptor.from_tensor(
                 tensor, block_sizes

@@ -1,3 +1,9 @@
+# [MODULE DOC] Machinery for module-level configuration objects. A config module declares
+# plain values, Config declarations and nested classes; install_config_module converts that
+# module in place into a ConfigModule whose settings support thread-local (context variable)
+# overrides, environment variable overrides, justknobs, aliases, deprecation warnings,
+# patching, save/load, hashing and code generation. Importing has no side effects beyond
+# defining the helpers; installing mutates the target module.
 import contextlib
 import copy
 import functools
@@ -38,6 +44,10 @@ _UNSET_SENTINEL = object()
 
 @dataclass(kw_only=True)
 class _Config(Generic[T]):
+    # [CLASS DOC] HELPER: Immutable-style record describing one config declaration: default
+    # value (or unset marker), optional justknob, force/default environment variable names,
+    # value type, alias target and deprecation info. Created by Config and consumed by the
+    # installer. Invariant: an alias excludes default, justknob and env names.
     """Represents a config with richer behaviour than just a default value.
     ::
         i.e.
@@ -87,6 +97,8 @@ class _Config(Generic[T]):
     deprecation_message: str | None = None
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC] Normalizes the two environment name fields to lists (or None) and
+        # raises AssertionError if an alias is combined with default, justknob or env names.
         self.env_name_default = _Config.string_or_list_of_string_to_list(
             self.env_name_default
         )
@@ -110,6 +122,8 @@ class _Config(Generic[T]):
     def string_or_list_of_string_to_list(
         val: str | list[str] | None,
     ) -> list[str] | None:
+        # [FUNCTION DOC] HELPER: Returns None for None, a one-item list for a string, the
+        # list itself for a list; raises AssertionError for any other type.
         if val is None:
             return None
         if isinstance(val, str):
@@ -150,6 +164,8 @@ else:
         deprecated: bool = False,
         deprecation_message: str | None = None,
     ) -> _Config[T]:
+        # [FUNCTION DOC] Declares a config entry (at runtime; type checkers see it returning
+        # the value type). Packs all arguments into a _Config record without other effects.
         return _Config(
             default=default,
             justknob=justknob,
@@ -164,6 +180,8 @@ else:
 
 
 def _read_env_variable(name: str) -> bool | str | None:
+    # [FUNCTION DOC] HELPER: Reads an environment variable: returns true for 1, false for 0,
+    # the raw string for any other value, and None if unset.
     value = os.environ.get(name)
     if value == "1":
         return True
@@ -173,6 +191,13 @@ def _read_env_variable(name: str) -> bool | str | None:
 
 
 def install_config_module(module: ModuleType) -> None:
+    # [FUNCTION DOC] Converts the given module in place into a config module. Walks its
+    # public attributes (skipping dunder names, modules, functions, typing objects and Config
+    # class references): plain values and Config declarations become registered entries and
+    # are removed from the module; nested classes become sub-config proxies. Then attaches
+    # the entry mapping, the keys marked compile-ignored in source comments, a subclass
+    # instance type, and four context variables used for hash and dictionary caches. Raises
+    # AssertionError for unsupported values or subconfig classes defined in another module.
     """
     Converts a module-level config into a `ConfigModule()`.
 
@@ -180,6 +205,8 @@ def install_config_module(module: ModuleType) -> None:
     """
 
     class ConfigModuleInstance(ConfigModule):
+        # [CLASS DOC] HELPER: Per-module subclass of ConfigModule so that its bypass key set
+        # (internal cache variables and annotations) is specific to installed modules.
         # __annotations__ is written to by Sphinx autodoc
         _bypass_keys = {
             "_hash_dirty_var",
@@ -194,6 +221,9 @@ def install_config_module(module: ModuleType) -> None:
         dest: ModuleType | SubConfigProxy,
         prefix: str,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Recursively registers entries from the source module or
+        # class into the shared mapping under dotted names built from prefix, and replaces
+        # nested classes with proxies on dest. Raises AssertionError for unsupported values.
         """Walk the module structure and move everything to module._config"""
         type_hints = inspect.get_annotations(source)
         for key, value in list(source.__dict__.items()):
@@ -268,6 +298,9 @@ COMPILE_IGNORED_MARKER = "@compile_ignored"
 
 # Gets all the keys (i.e. assignments) with a @compile_ignored comment
 def get_assignments_with_compile_ignored_comments(module: ModuleType) -> set[str]:
+    # [FUNCTION DOC] Tokenizes the module source and returns the names of assignments that
+    # appear on the line directly after a comment containing the compile-ignored marker.
+    # Raises AssertionError if a marker comment is left unused. Reads source from disk.
     source_code = inspect.getsource(module)
     assignments = set()
 
@@ -309,6 +342,10 @@ _GetDictCacheKey = tuple[tuple[str, ...], tuple[str, ...], bool]
 
 @dataclass
 class _ConfigEntry:
+    # [CLASS DOC] HELPER: Runtime state of one installed config: default, value type, a
+    # context variable holding the thread-local user override (unset marker if none),
+    # justknob, environment values read once at install time, alias, a hide flag used
+    # by the mock patch workaround, and deprecation info with a warned-once flag.
     # The default value specified in the configuration
     default: Any
     # The type of the configuration value
@@ -340,6 +377,11 @@ class _ConfigEntry:
     _deprecation_warned: bool = False
 
     def __init__(self, config: _Config, name: str) -> None:
+        # [FUNCTION DOC] Builds an entry from a _Config declaration and its dotted name:
+        # infers the value type from the default when not given, creates the override
+        # variable, and reads force and default environment variables (first set wins).
+        # Raises AssertionError if a justknob default is not boolean or env-backed configs
+        # are not (optional) bool or str.
         self.default = config.default
         self.value_type = (
             config.value_type if config.value_type is not None else type(self.default)
@@ -384,6 +426,11 @@ class _ConfigEntry:
 
 
 class ConfigModule(ModuleType):
+    # [CLASS DOC] Module type that backs an installed config module. Attribute reads resolve
+    # in order: alias, forced env value, thread-local override, default env value, justknob,
+    # default (mutable defaults are copied into the override on first read). Writes set the
+    # thread-local override, mark caches dirty and warn on deprecated keys. State is the
+    # entry mapping plus context variables for the hash cache and the dictionary cache.
     # NOTE: This should be kept in sync with _config_typing.pyi.
 
     # The actual configuration settings.  E.g., torch._dynamo.config.debug
@@ -402,11 +449,15 @@ class ConfigModule(ModuleType):
     _get_dict_cache_var: ContextVar[dict[_GetDictCacheKey, dict[str, Any]]]
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Always raises NotImplementedError: instances come only from the
+        # install function.
         raise NotImplementedError(
             f"use {__name__}.install_config_module(sys.modules[__name__])"
         )
 
     def _warn_if_deprecated(self, name: str, config: _ConfigEntry) -> None:
+        # [FUNCTION DOC] HELPER: Emits a FutureWarning once per entry if it is deprecated,
+        # including the optional message, then marks the entry as warned.
         """Issue deprecation warning for config if not already warned."""
         if config.deprecated and not config._deprecation_warned:
             import warnings
@@ -419,6 +470,10 @@ class ConfigModule(ModuleType):
             config._deprecation_warned = True
 
     def __setattr__(self, name: str, value: object) -> None:
+        # [FUNCTION DOC] Sets an internal bypass attribute directly; otherwise sets a
+        # config: writes through to the alias target if aliased, else stores the
+        # thread-local override, marks hash and dictionary caches dirty and unhides the
+        # entry. Warns if deprecated. Raises AttributeError for unknown names.
         if name in self._bypass_keys:
             super().__setattr__(name, value)
         elif name not in self._config:
@@ -441,6 +496,9 @@ class ConfigModule(ModuleType):
                     config.hide = False
 
     def __getattr__(self, name: str) -> Any:
+        # [FUNCTION DOC] Returns the effective value of a config using the precedence order
+        # described on the class; may warn if deprecated and may import an alias module.
+        # Raises AttributeError for unknown or hidden names.
         try:
             config = self._config[name]
 
@@ -480,6 +538,9 @@ class ConfigModule(ModuleType):
             raise AttributeError(f"{self.__name__}.{name} does not exist") from e
 
     def __delattr__(self, name: str) -> None:
+        # [FUNCTION DOC] Clears the thread-local override for a config and hides it so that
+        # mock patching sees it as deleted; marks caches dirty. A later write unhides it.
+        # Raises KeyError for unknown names.
         self._hash_dirty_var.set(True)
         self._mark_get_dict_dirty(name)
         # must support delete because unittest.mock.patch deletes
@@ -490,6 +551,9 @@ class ConfigModule(ModuleType):
     def _get_alias_module_and_name(
         self, entry: _ConfigEntry
     ) -> tuple[ModuleType, str] | None:
+        # [FUNCTION DOC] HELPER: For an aliased entry, imports the module part of the alias
+        # path and returns it with the final attribute name; returns None if not aliased.
+        # Raises AttributeError if the module cannot be imported.
         alias = entry.alias
         if alias is None:
             return None
@@ -501,6 +565,8 @@ class ConfigModule(ModuleType):
         return module, constant_name
 
     def _get_alias_val(self, entry: _ConfigEntry) -> Any:
+        # [FUNCTION DOC] HELPER: Returns the current value of the alias target, or the unset
+        # marker if the entry is not an alias.
         data = self._get_alias_module_and_name(entry)
         if data is None:
             return _UNSET_SENTINEL
@@ -509,6 +575,8 @@ class ConfigModule(ModuleType):
         return constant_value
 
     def _set_alias_val(self, entry: _ConfigEntry, val: Any) -> None:
+        # [FUNCTION DOC] HELPER: Sets the alias target attribute to val. Raises
+        # AssertionError if the entry has no alias.
         data = self._get_alias_module_and_name(entry)
         if data is None:
             raise AssertionError(
@@ -520,6 +588,9 @@ class ConfigModule(ModuleType):
     _GET_DICT_DIRTY_KEYS_CAP = 16
 
     def _mark_get_dict_dirty(self, name: str) -> None:
+        # [FUNCTION DOC] HELPER: Records the key as changed for the dictionary cache of the
+        # current context; if more keys than the cap changed, marks the cache fully dirty.
+        # Does nothing when already fully dirty.
         dirty = self._get_dict_dirty_keys_var.get()
         if dirty is None:
             return
@@ -528,6 +599,9 @@ class ConfigModule(ModuleType):
             self._get_dict_dirty_keys_var.set(None)
 
     def _is_default(self, name: str) -> bool:
+        # [FUNCTION DOC] HELPER: Returns whether the config has no effective change: no user
+        # override (or one equal to the default for mutable types) and no env value that
+        # differs from the default. Raises KeyError for unknown names.
         """
         Returns true if the config is at its default value.
         configs overridden by the env are not considered default.
@@ -558,6 +632,11 @@ class ConfigModule(ModuleType):
         skip_default: bool = False,
         readonly_values: bool = False,
     ) -> dict[str, Any]:
+        # [FUNCTION DOC] HELPER: Builds a mapping of config name to current value, skipping
+        # aliases, ignored keys and prefixes, and (optionally) defaults. Values are deep
+        # copied unless immutable. With readonly_values it reuses a per-context cache and
+        # only recomputes keys marked dirty; otherwise recomputes everything. Does not
+        # trigger deprecation warnings or alias resolution.
         """Export a dictionary of current configuration keys and values.
 
         This function is designed to provide a single point which handles
@@ -648,9 +727,12 @@ class ConfigModule(ModuleType):
         return config
 
     def get_type(self, config_name: str) -> type:
+        # [FUNCTION DOC] Returns the value type of the named config. Raises KeyError if unknown.
         return self._config[config_name].value_type
 
     def save_config(self) -> bytes:
+        # [FUNCTION DOC] Returns the current config values as a pickled mapping (protocol 2),
+        # excluding keys listed in the optional ignore attribute of the module.
         """Convert config to a pickled blob"""
         ignored_keys = getattr(self, "_save_config_ignore", [])
         return pickle.dumps(
@@ -661,6 +743,10 @@ class ConfigModule(ModuleType):
     def save_config_portable(
         self, *, ignore_private_configs: bool = True, readonly_values: bool = False
     ) -> dict[str, Any]:
+        # [FUNCTION DOC] Returns a mapping of config values suitable for cache keys,
+        # excluding private names (optional) and names with prefixes from an optional module
+        # attribute. For keys listed as factories, replaces a non-null value by the uuid of
+        # a new instance; raises RuntimeError if the instance has no uuid method.
         """Convert config to portable format"""
         prefixes = []
         if ignore_private_configs:
@@ -685,6 +771,11 @@ class ConfigModule(ModuleType):
         return config
 
     def codegen_config(self) -> str:
+        # [FUNCTION DOC] Returns source text of assignment statements, one per non-default
+        # config, that reproduce the current settings, preceded by needed import lines.
+        # Callables and collections of callables are written by qualified name, partials of
+        # importable callables with simple arguments are reconstructed, and anything
+        # unsupported becomes an explanatory comment line; other values use their repr.
         """Convert config to Python statements that replicate current config.
         This does NOT include config settings that are at default values.
         """
@@ -693,6 +784,8 @@ class ConfigModule(ModuleType):
         imports = set()
 
         def get_module_name(func: Callable, add_dot: bool) -> str:
+            # [FUNCTION DOC] HELPER: Returns the module name of a callable, empty for
+            # builtins, with a trailing dot if requested and non-empty.
             module_name = func.__module__
             if module_name == "builtins":
                 module_name = ""
@@ -701,18 +794,26 @@ class ConfigModule(ModuleType):
             return module_name
 
         def add_import(func: Callable) -> None:
+            # [FUNCTION DOC] HELPER: Adds the callable's module to the import set unless empty.
             module_name = get_module_name(func, False)
             if module_name:
                 imports.add(module_name)
 
         def list_of_callables_to_string(v: list | set) -> list[str]:
+            # [FUNCTION DOC] HELPER: Returns the qualified-name strings of the callables.
             return [f"{get_module_name(item, True)}{item.__name__}" for item in v]
 
         def importable_callable(v: Any) -> bool:
+            # [FUNCTION DOC] HELPER: Returns whether v is callable and has module and name
+            # attributes.
             # functools.partial has no attributes below but is a callable
             return callable(v) and hasattr(v, "__module__") and hasattr(v, "__name__")
 
         def importable_ref(func: Any) -> tuple[str, str] | None:
+            # [FUNCTION DOC] HELPER: If func can be re-imported by module and qualified name
+            # (valid identifiers, not main or local, and resolving back to the same object),
+            # returns the reference text and the module to import (empty for builtins);
+            # otherwise, including on any error, returns None.
             try:
                 module_name = getattr(func, "__module__", None)
                 qualname = getattr(func, "__qualname__", None)
@@ -743,6 +844,9 @@ class ConfigModule(ModuleType):
                 return None
 
         def serialize_partial_arg(val: Any) -> str:
+            # [FUNCTION DOC] HELPER: Returns the repr of a literal-like value (none, bool,
+            # int, str, bytes, finite float, or list/tuple/dict of such, checked
+            # recursively). Raises ValueError for any other type.
             if type(val) in (type(None), bool, int, str, bytes) or (
                 type(val) is float and math.isfinite(val)
             ):
@@ -762,6 +866,10 @@ class ConfigModule(ModuleType):
             return repr(val)
 
         def get_partial_line(mod, k, v) -> str:  # type: ignore[no-untyped-def]
+            # [FUNCTION DOC] HELPER: Returns an assignment line rebuilding a plain partial
+            # object from its function, positional and keyword arguments, and registers the
+            # needed imports. Returns a comment line if it is a partial subclass, the function
+            # is not importable, or the arguments cannot be serialized.
             if type(v) is not functools.partial:
                 return f"# {mod}.{k} omitted: unsupported partial subclass"
             func_info = importable_ref(v.func)
@@ -783,6 +891,9 @@ class ConfigModule(ModuleType):
             return f"{mod}.{k} = {expression}"
 
         def get_config_line(mod, k, v) -> str:  # type: ignore[no-untyped-def]
+            # [FUNCTION DOC] HELPER: Returns the assignment line for config k of module
+            # mod and value v, handling partials, callables and collections of callables
+            # (registering imports); other values use their repr.
             """
             Return a string version of the config line.
             Handle v when v is a callable, or a list/dict of callables. Add import statements for callables if necessary.
@@ -824,6 +935,9 @@ class ConfigModule(ModuleType):
         return "\n".join(lines)
 
     def get_hash(self) -> bytes:
+        # [FUNCTION DOC] Returns an MD5 digest of the sorted configuration items excluding
+        # compile-ignored keys. Cached per context and recomputed after any change.
+        # Raises AssertionError if the cache is unexpectedly empty after recomputation.
         """Hashes the configs that are not compile_ignored"""
         if self._hash_dirty_var.get() or self._hash_cache_var.get() is None:
             dict_to_hash = self._get_dict(
@@ -850,6 +964,7 @@ class ConfigModule(ModuleType):
         category=FutureWarning,
     )
     def to_dict(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Deprecated alias (FutureWarning) for the config copy getter.
         return self.get_config_copy()
 
     @deprecated(
@@ -859,9 +974,13 @@ class ConfigModule(ModuleType):
         category=FutureWarning,
     )
     def shallow_copy_dict(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Deprecated alias (FutureWarning) for the config copy getter.
         return self.get_config_copy()
 
     def load_config(self, maybe_pickled_config: bytes | dict[str, Any]) -> None:
+        # [FUNCTION DOC] Applies saved settings, given as a mapping or pickled bytes, by
+        # setting each known key (thread-local override); unknown keys only trigger a
+        # one-time warning. Unpickling untrusted bytes is unsafe.
         """Restore from a prior call to save_config() or shallow_copy_dict()"""
         if not isinstance(maybe_pickled_config, dict):
             config = pickle.loads(maybe_pickled_config)
@@ -876,9 +995,12 @@ class ConfigModule(ModuleType):
                 warn_once(f"key {k} with value {v} is not understood by this config")
 
     def get_config_copy(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Returns a fresh mapping of all current non-alias config values.
         return self._get_dict()
 
     def get_serializable_config_copy(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Like the config copy getter but omits keys listed in the module's
+        # optional ignore attribute.
         return self._get_dict(ignored_keys=getattr(self, "_save_config_ignore", []))
 
     def patch(
@@ -887,6 +1009,14 @@ class ConfigModule(ModuleType):
         arg2: Any = None,
         **kwargs: dict[str, Any],
     ) -> "ContextDecorator":
+        # [FUNCTION DOC] Returns a decorator / context manager that temporarily sets configs
+        # (thread-local). Accepts a key and value, a mapping, or keyword arguments, but not a
+        # mix; otherwise raises AssertionError. On entry saves prior values (nesting and
+        # reuse supported through a stack) and applies changes, restoring on failure; on
+        # exit restores prior values.
+        # KNOWN ISSUE: the docstring example mapping uses a comma instead of a colon after
+        # the second key. Also a falsy second positional value such as None is treated as
+        # absent.
         """
         Decorator and/or context manager to make temporary changes to a config.  Note that patched settings are thread-local.
 
@@ -935,7 +1065,10 @@ class ConfigModule(ModuleType):
         config = self
 
         class ConfigPatch(ContextDecorator):
+            # [CLASS DOC] HELPER: Applies the captured changes to the enclosing config on
+            # entry and reverts them on exit, using a per-context stack of prior values.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Stores the changes and creates the prior-value stack.
                 self.changes = changes
                 self._prior: ContextVar[tuple[dict[str, Any], ...]] = ContextVar(
                     f"{config.__name__}.ConfigPatch[{id(self)}]",
@@ -943,6 +1076,9 @@ class ConfigModule(ModuleType):
                 )
 
             def __enter__(self) -> None:
+                # [FUNCTION DOC] HELPER: Records current values of the changed keys (raises
+                # on unknown key), pushes them on the stack and sets the new values; if
+                # setting fails, pops the stack and re-raises.
                 prior: dict[str, Any] = {}
                 for key in self.changes:
                     # KeyError on invalid entry
@@ -957,6 +1093,8 @@ class ConfigModule(ModuleType):
                     raise
 
             def __exit__(self, exc_type, exc_val, exc_tb):  # type: ignore[no-untyped-def]
+                # [FUNCTION DOC] HELPER: Pops the latest prior values and restores them.
+                # Raises AssertionError if there is nothing to pop. Does not suppress errors.
                 prior_stack = self._prior.get()
                 if not prior_stack:
                     raise AssertionError(
@@ -970,6 +1108,10 @@ class ConfigModule(ModuleType):
         return ConfigPatch()
 
     def _make_closure_patcher(self, **changes: dict[str, Any]) -> Any:
+        # [FUNCTION DOC] HELPER: Returns a function that, when called, applies the keyword
+        # changes as overrides (marking caches dirty) and returns a function that restores
+        # the prior overrides. Skips deprecation and validation checks for speed.
+        # KNOWN ISSUE: the docstring refers to a public name without the leading underscore.
         """
         A lower-overhead version of patch() for things on the critical path.
 
@@ -990,6 +1132,8 @@ class ConfigModule(ModuleType):
         config = self._config
 
         def change() -> Callable[[], None]:
+            # [FUNCTION DOC] HELPER: Records current overrides, applies the new ones and
+            # returns the revert function.
             prior = {k: config[k].user_override.get() for k in changes}
             for k, v in changes.items():
                 config[k].user_override.set(v)
@@ -997,6 +1141,7 @@ class ConfigModule(ModuleType):
                 self._mark_get_dict_dirty(k)
 
             def revert() -> None:
+                # [FUNCTION DOC] HELPER: Restores the recorded overrides.
                 for k, v in prior.items():
                     config[k].user_override.set(v)
                     self._hash_dirty_var.set(True)
@@ -1008,23 +1153,35 @@ class ConfigModule(ModuleType):
 
 
 class ContextDecorator(contextlib.ContextDecorator):
+    # [CLASS DOC] Base for config patch objects: a standard context decorator that also can
+    # decorate a test case class, entering at class setup and exiting at class teardown.
     """
     Same as contextlib.ContextDecorator, but with support for
     `unittest.TestCase`
     """
 
     def __enter__(self) -> None:
+        # [FUNCTION DOC] Abstract; raises NotImplementedError.
         raise NotImplementedError("NYI")
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> NoReturn:  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Abstract; raises NotImplementedError.
         raise NotImplementedError("NYI")
 
     def __call__(self, func: Callable[[Any], Any]) -> Any:
+        # [FUNCTION DOC] Decorates a function normally. For a unittest test case class,
+        # returns a subclass (same name, qualified name and module) that enters this
+        # context in class setup and exits it in class teardown, or immediately if setup
+        # fails.
         if isinstance(func, type) and issubclass(func, unittest.TestCase):
 
             class _TestCase(func):  # type: ignore[valid-type, misc]
+                # [CLASS DOC] HELPER: Subclass of the decorated test case that wraps class
+                # setup and teardown in this context.
                 @classmethod
                 def setUpClass(cls) -> None:
+                    # [FUNCTION DOC] HELPER: Enters the context, then runs the parent setup;
+                    # exits the context and re-raises if parent setup fails.
                     self.__enter__()
                     try:
                         super().setUpClass()
@@ -1034,6 +1191,8 @@ class ContextDecorator(contextlib.ContextDecorator):
 
                 @classmethod
                 def tearDownClass(cls) -> None:
+                    # [FUNCTION DOC] HELPER: Runs the parent teardown, then always exits
+                    # the context.
                     try:
                         super().tearDownClass()
                     finally:
@@ -1049,27 +1208,36 @@ class ContextDecorator(contextlib.ContextDecorator):
 
 
 class SubConfigProxy:
+    # [CLASS DOC] Attribute proxy for a nested config group: holds the owning config module
+    # and a dotted prefix, and forwards get, set and delete of attributes to the owner with
+    # the prefix added. Has no entries of its own.
     """
     Shim to redirect to main config.
     `config.triton.cudagraphs` maps to _config["triton.cudagraphs"]
     """
 
     def __init__(self, config: object, prefix: str) -> None:
+        # [FUNCTION DOC] Stores the owner and prefix, bypassing the forwarding setter.
         # `super().__setattr__` to bypass custom `__setattr__`
         super().__setattr__("_config", config)
         super().__setattr__("_prefix", prefix)
 
     def __setattr__(self, name: str, value: object) -> None:
+        # [FUNCTION DOC] Sets the prefixed config on the owner.
         return self._config.__setattr__(self._prefix + name, value)
 
     def __getattr__(self, name: str) -> Any:
+        # [FUNCTION DOC] Returns the value of the prefixed config from the owner.
         return self._config.__getattr__(self._prefix + name)
 
     def __delattr__(self, name: str) -> None:
+        # [FUNCTION DOC] Deletes (hides) the prefixed config on the owner.
         return self._config.__delattr__(self._prefix + name)
 
 
 def get_tristate_env(name: str, default: Any = None) -> bool | None:
+    # [FUNCTION DOC] Reads an environment variable: true for 1, false for 0, otherwise the
+    # given default (also when unset or any other text).
     value = os.environ.get(name)
     if value == "1":
         return True
@@ -1079,7 +1247,11 @@ def get_tristate_env(name: str, default: Any = None) -> bool | None:
 
 
 def inherit_fields_from(parent_cls):
+    # [FUNCTION DOC] Returns a class decorator that copies the parent class's public (not
+    # underscore-prefixed) attributes onto the decorated class unless it already defines
+    # them; mutates and returns the decorated class.
     def wrapper(child_cls):
+        # [FUNCTION DOC] HELPER: Performs the attribute copy and returns the child class.
         for k, v in parent_cls.__dict__.items():
             # copy fields that are not private and not overridden
             if not k.startswith("_") and k not in child_cls.__dict__:

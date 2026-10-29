@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+
+# [MODULE DOC] Content-addressed on-disk store for storages (and name-addressed tensors),
+# with a fast, non-cryptographic, device-dependent hash computed with a compiled kernel, or
+# SHA-1 on request. Provides lazy_compile, hash_storage_kernel, hash_storage and the writer
+# and reader classes. No format compatibility guarantee. Importing the module has no
+# side effects beyond imports; compilation happens lazily on first kernel call.
 # This module provides a FAST (on GPU) content addressable store for storages
 # (and tensors on top of them) with VERY WEAK portability guarantees (e.g.,
 # don't expect CPU/CUDA to address to the same hash, don't expect it to be
@@ -43,14 +49,21 @@ from torch.multiprocessing.reductions import StorageWeakRef
 
 
 def lazy_compile(**compile_kwargs):
+    # [FUNCTION DOC] Decorator factory taking compile keyword options and returning a
+    # decorator. The decorated function, on its first call, is compiled with those options,
+    # replaces its own module-level name by the compiled version (global state mutation),
+    # and is then called. The module-level replacement only works for module-level functions.
     """Lazily wrap a function with torch.compile on the first call
 
     This avoids eagerly importing dynamo.
     """
 
     def decorate_fn(fn):
+        # [FUNCTION DOC] HELPER: Returns the first-call compile hook wrapping fn.
         @functools.wraps(fn)
         def compile_hook(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Compiles fn, rebinds fn's name in this module to the
+            # compiled function, and returns the compiled call result.
             compiled_fn = torch.compile(fn, **compile_kwargs)
             globals()[fn.__name__] = functools.wraps(fn)(compiled_fn)
             return compiled_fn(*args, **kwargs)
@@ -66,6 +79,10 @@ def lazy_compile(**compile_kwargs):
 # it would be good to apply it here.
 @lazy_compile(dynamic=True)
 def hash_storage_kernel(x):
+    # [FUNCTION DOC] Compiled kernel: given a 32-bit integer tensor, draws two random
+    # integer tensors of the same shape (from the device generator), forms a multiply-add
+    # universal hash of each element, and returns the xor-reduction as one 32-bit value.
+    # Results depend on generator state and device, so are not stable across devices.
     # The randint calls are carefully written to hit things we
     # have lowerings for in inductor.  Lack of unsigned 32-bit integer
     # is a pain.
@@ -92,6 +109,12 @@ def hash_storage_kernel(x):
 # SHA-1 if stable_hash=True, otherwise it will consistent for a single
 # process run but not necessarily across processes.
 def hash_storage(storage: torch.UntypedStorage, *, stable_hash: bool = False) -> str:
+    # [FUNCTION DOC] Returns a hex digest of the storage bytes. With stable_hash, or when
+    # compilation is unsupported for the device, copies to CPU and returns the SHA-1.
+    # Otherwise seeds the device default generator with zero, pads and views the bytes as
+    # 32-bit ints, runs the kernel five times and packs the results; the generator state is
+    # saved and restored. Raises AssertionError for device types other than cpu, cuda, mps
+    # or xpu.
     import torch._dynamo
     from torch._dynamo.utils import is_compile_supported
 
@@ -139,6 +162,9 @@ def hash_storage(storage: torch.UntypedStorage, *, stable_hash: bool = False) ->
 
 
 class ContentStoreWriter:
+    # [CLASS DOC] Writes storages (named by hash) and tensors (named by path) under a root
+    # directory. State: the root location, the stable-hash flag, and the set of storage
+    # hashes already written by this instance. Single-writer only.
     # Structure:
     #   storages/
     #     00/
@@ -146,12 +172,16 @@ class ContentStoreWriter:
     #   tensors/
     #     name
     def __init__(self, loc: str, stable_hash: bool = False) -> None:
+        # [FUNCTION DOC] Records the root directory and hashing mode; no I/O is done yet.
         self.loc: str = loc
         self.seen_storage_hashes: set[str] = set()
         self.stable_hash = stable_hash
 
     # TODO: offer some sort of non-blocking API to speed things up
     def write_storage(self, storage: torch.UntypedStorage) -> str:
+        # [FUNCTION DOC] Hashes the storage and saves it in the storages subfolder (created
+        # if needed) unless the hash was seen or the file already exists. Returns the hash.
+        # KNOWN ISSUE: when the file already exists the hash is not added to the seen set.
         h = hash_storage(storage, stable_hash=self.stable_hash)
         if h in self.seen_storage_hashes:
             return h
@@ -167,6 +197,9 @@ class ContentStoreWriter:
         return h
 
     def compute_tensor_metadata(self, t: torch.Tensor, h=None):
+        # [FUNCTION DOC] Returns a tuple describing the tensor: dtype, storage hash
+        # (computed if h is not given), storage offset, shape tuple, strides, and extra
+        # tensor metadata. Does not write anything.
         if h is None:
             h = hash_storage(t.untyped_storage(), stable_hash=self.stable_hash)
         return (
@@ -179,6 +212,9 @@ class ContentStoreWriter:
         )
 
     def write_tensor(self, name: str, t: torch.Tensor) -> None:
+        # [FUNCTION DOC] Stores the tensor's storage, then saves its metadata tuple at the
+        # given relative name under the tensors folder (parent folders created). Overwrites
+        # an existing entry. Does not save requires_grad or gradient data.
         storage = t.untyped_storage()
         h = self.write_storage(storage)
         # TODO: Support more advanced snapshotting of requires_grad/grad/etc
@@ -190,7 +226,12 @@ class ContentStoreWriter:
 
 
 class ContentStoreReader:
+    # [CLASS DOC] Reads storages and tensors from a store directory. Optionally keeps a
+    # cache, per target device, of weak references to storages already loaded so that
+    # repeated reads share memory while the storage is alive.
     def __init__(self, loc: str, *, cache=True) -> None:
+        # [FUNCTION DOC] Records the root directory; with cache enabled creates the
+        # per-device weak reference cache.
         self.loc = loc
         self.storage_cache: (
             dict[torch.device | None, dict[str, StorageWeakRef]] | None
@@ -199,6 +240,10 @@ class ContentStoreReader:
             self.storage_cache = defaultdict(dict)
 
     def read_storage(self, h: str, *, device=None) -> torch.UntypedStorage:
+        # [FUNCTION DOC] Returns the storage with hash h, mapped to the optional device. Uses
+        # a live cached storage if present, else loads from disk (weights-only load) and
+        # caches a weak reference. Raises AssertionError if the load yields nothing; file
+        # errors propagate.
         if device is not None:
             device = torch.device(device)
         ws = (
@@ -225,12 +270,17 @@ class ContentStoreReader:
         return s
 
     def read_tensor_metadata(self, name: str):
+        # [FUNCTION DOC] Loads and returns the metadata tuple saved for the tensor name.
+        # Raises FileNotFoundError if missing.
         fn = os.path.join(self.loc, "tensors", name)
         if not os.path.exists(fn):
             raise FileNotFoundError(fn)
         return torch.load(fn, weights_only=True)
 
     def read_tensor(self, name: str, *, device=None) -> torch.Tensor:
+        # [FUNCTION DOC] Rebuilds the named tensor: reads its metadata and storage, creates
+        # an empty tensor on the storage's device, points it at the storage with the saved
+        # offset, size and stride, restores extra metadata and returns it.
         dtype, h, storage_offset, size, stride, metadata = self.read_tensor_metadata(
             name
         )

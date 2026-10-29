@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+
+# [MODULE DOC] Small testing helpers usable from public testing APIs without optional
+# dependencies: a seeded op wrapper and a context manager that preserves RNG state.
 import contextlib
 
 import torch
@@ -10,6 +13,10 @@ import torch
 
 
 def wrapper_set_seed(op, *args, **kwargs):
+    # [FUNCTION DOC] Calls the given op with the remaining arguments after seeding the
+    # global RNG with a fixed value, inside a scope that restores RNG state afterwards.
+    # For lazy-device tensor outputs it flushes the lazy graph inside that scope. Returns
+    # the op's output. Side effect: temporarily changes RNG state.
     """Wrapper to set seed manually for some functions like dropout
     See: https://github.com/pytorch/pytorch/pull/62315#issuecomment-896143189 for more details.
     """
@@ -27,6 +34,9 @@ def wrapper_set_seed(op, *args, **kwargs):
 
 @contextlib.contextmanager
 def freeze_rng_state():
+    # [FUNCTION DOC] Context manager that saves the CPU RNG state and, if an accelerator is
+    # available, its RNG state on entry, and restores both on exit even after an error.
+    # Dispatch modes and functorch are disabled while saving/restoring. Yields nothing.
     # no_dispatch needed for test_composite_compliance
     # Some OpInfos use freeze_rng_state for rng determinism, but
     # test_composite_compliance overrides dispatch for all torch functions
