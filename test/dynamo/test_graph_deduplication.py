@@ -1,4 +1,11 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests for Dynamo's graph deduplication, which replaces repeated regions of the
+# traced graph with a shared subgraph invoked through the invoke_subgraph higher-order
+# operator. Covers single and multiple repeated regions, dependent regions, input mutation and
+# aliasing, cycle detection in a graph, stable topological sorting with extra dependencies
+# (autocast ordering, output node placement, mutation ordering), tuple returns and inputs, and
+# static address parameters. Most tests compare printed graphs with expected strings. Import
+# time has no side effects.
 import contextlib
 
 import torch
@@ -13,11 +20,17 @@ from torch.utils._ordered_set import OrderedSet
 
 
 def graph_str(gm):
+    # [FUNCTION DOC] HELPER: Return the printed readable text of a graph module, normalized
+    # (comments, trailing spaces and repeated blank lines removed), for snapshot comparison.
     return normalize_gm(gm.print_readable(print_output=False))
 
 
 class GraphDededuplicationTests(TestCase):
+    # [CLASS DOC] Tests for graph deduplication. Each test runs with the deduplication config
+    # option turned on through an ExitStack set up in setUp.
     def setUp(self):
+        # [FUNCTION DOC] Run base setup, then create an ExitStack and enter a config patch
+        # enabling graph deduplication.
         super().setUp()
         self.exit_stack = contextlib.ExitStack()
         self.exit_stack.enter_context(
@@ -25,14 +38,23 @@ class GraphDededuplicationTests(TestCase):
         )
 
     def tearDown(self):
+        # [FUNCTION DOC] Close the ExitStack (restoring the config) and then run
+        # base teardown.
         self.exit_stack.close()
         super().tearDown()
 
     def run_and_return_graphs(self, fn, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Compile and run the function with the AOT recording backend
+        # and return the first three items of the result: the output, the dynamo graphs and
+        # the forward graphs.
         return extract_graph(fn, *args, **kwargs)[0:3]
 
     def run_and_get_simple_graph(self):
+        # [FUNCTION DOC] HELPER: Compile a tiny function (two additions, two sums, a final
+        # addition) on 10x10 and 10x20 inputs without grad and return its first forward graph.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Adds 1 to x, 2 to y and returns the
+            # sum of the two reductions.
             x0 = x + 1
             y0 = y + 2
             z = x0.sum() + y0.sum()
@@ -45,13 +67,23 @@ class GraphDededuplicationTests(TestCase):
         return fw_graphs[0]
 
     def test_single_subgraph(self):
+        # [FUNCTION DOC] A repeated inner function called three times is deduplicated into one
+        # subgraph; checks compiled output graphs and forward graphs against expected strings
+        # and runs backward.
+        # KNOWN ISSUE: the boolean result of the allclose check is discarded, so the
+        # comparison against the eager result is never actually asserted.
         def inner_fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Computes x plus 1 and y plus 2, sums
+            # both and adds the sums.
             x0 = x + 1
             y0 = y + 2
             z = x0.sum() + y0.sum()
             return z
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Calls the inner function three times
+            # (once with sin of y as second argument), combines results by multiplication and
+            # returns the product.
             _o0 = inner_fn(x, y)
             o1 = torch.sin(y)
             o2 = inner_fn(x, o1)
@@ -149,7 +181,14 @@ class GraphModule(torch.nn.Module):
         )
 
     def test_single_subgraph2(self):
+        # [FUNCTION DOC] The same inner function used twice in series (with a cosine in
+        # between) is deduplicated into one subgraph; checks printed dynamo and forward graphs
+        # and runs backward.
+        # KNOWN ISSUE: the boolean result of the allclose check is discarded, so the
+        # comparison against the eager result is never actually asserted.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Function under test. Adds 2, applies the inner function,
+            # takes the cosine, applies the inner function again and returns the sine.
             x0 = x + 2
             o = inner_fn(x0)
             o = torch.cos(o)
@@ -157,6 +196,8 @@ class GraphModule(torch.nn.Module):
             return torch.sin(o)
 
         def inner_fn(x):
+            # [FUNCTION DOC] HELPER: Function under test. Multiplies by 7 and adds 1 and 2
+            # in place.
             o = x * 7
             o += 1
             o += 2
@@ -247,19 +288,30 @@ class GraphModule(torch.nn.Module):
         )
 
     def test_multiple_subgraphs(self):
+        # [FUNCTION DOC] Two different repeated inner functions each deduplicate into their
+        # own subgraph; checks printed graphs and runs backward.
+        # KNOWN ISSUE: the boolean result of the allclose check is discarded, so the
+        # comparison against the eager result is never actually asserted.
         def inner_fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Adds 1 to x and 2 to y and returns
+            # the sum of their reductions.
             x1 = x + 1
             y1 = y + 2
             z = x1.sum() + y1.sum()
             return z
 
         def inner_fn2(a, b):
+            # [FUNCTION DOC] HELPER: Function under test. Adds 2 to a, 3 to b and multiplies a
+            # by the sum of cosine of b.
             a0 = a + 2
             b0 = b + 3
             c = a0 * b0.cos().sum()
             return c
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Calls both inner functions several
+            # times, mixing results through sine, product and addition, and returns the
+            # combined result.
             x0 = torch.cos(x)
             y0 = torch.sin(y)
             o1 = inner_fn2(x0, y0)
@@ -411,13 +463,21 @@ class GraphModule(torch.nn.Module):
         )
 
     def test_dependent_subgraphs(self):
+        # [FUNCTION DOC] Two calls where the second consumes the first's output are
+        # deduplicated; checks the forward graph string and runs backward.
+        # KNOWN ISSUE: the boolean result of the allclose check is discarded, so the
+        # comparison against the eager result is never actually asserted.
         def inner_fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Adds 1 to x and 2 to y and returns
+            # the sum of their reductions.
             x0 = x + 1
             y0 = y + 2
             z = x0.sum() + y0.sum()
             return z
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Calls the inner function with x and
+            # y, then with x and the first result, returning the second result.
             o0 = inner_fn(x, y)
             o1 = inner_fn(x, o0)
             return o1
@@ -472,7 +532,14 @@ class GraphModule(torch.nn.Module):
         )
 
     def test_input_mutation(self):
+        # [FUNCTION DOC] Two calls of a function that mutates its inputs in place: only the
+        # reductions form the shared subgraph, the in-place adds stay in the outer graph and
+        # the mutation is written back with a copy; checks the forward graph string.
+        # KNOWN ISSUE: the boolean result of the allclose check is discarded, so the
+        # comparison against the eager result is never actually asserted.
         def inner_fn2(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Adds in place one plus x to x and
+            # one plus y to y, and returns the sum of the reductions.
             x0 = x + 1
             y0 = y + 1
             x.add_(x0)
@@ -480,6 +547,8 @@ class GraphModule(torch.nn.Module):
             return x.sum() + y.sum()
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Calls the mutating function on the
+            # sine of x with y, and on clones of the same, returning the sum.
             x0 = torch.sin(x)
             o2 = inner_fn2(x0, y)
             o3 = inner_fn2(x0.clone(), y.clone())
@@ -545,16 +614,26 @@ class <lambda>(torch.nn.Module):
         )
 
     def test_input_aliasing(self):
+        # [FUNCTION DOC] Repeated functions with view-only (aliasing) outputs are not
+        # deduplicated, while the multiplying function is; checks the forward graph string.
+        # KNOWN ISSUE: the boolean result of the allclose check is discarded, so the
+        # comparison against the eager result is never actually asserted.
         def inner_fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Creates a view of x with its own
+            # shape and a view of that, returning the second view.
             x0 = x.view(x.size())
             return x0.view(x.size())
 
         def inner_fn2(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Doubles both inputs and returns the
+            # sum of their reductions.
             x = x * 2
             y = y * 2
             return x.sum() + y.sum()
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Calls each inner function twice and
+            # combines results by addition of views and sums.
             o0 = inner_fn(x, y)
             o1 = inner_fn(x, y)
             o2 = inner_fn2(x, y)
@@ -612,13 +691,20 @@ class <lambda>(torch.nn.Module):
         )
 
     def test_cycle_detection_no_cycle(self):
+        # [FUNCTION DOC] Cycle detection on an unmodified simple graph reports that no cycle
+        # was detected.
         mod = self.run_and_get_simple_graph()
         self.assertExpectedInline(
             _detect_cycles(mod.graph, {}), """no cycle detected"""
         )
 
     def test_cycle_detection_single_node(self):
+        # [FUNCTION DOC] Rewires the first addition to depend on a later node and gives an
+        # extra dependency map entry for that later node on itself; cycle detection reports
+        # the expected path.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Adds 1 to x, 2 to y and returns the
+            # sum of reductions.
             x0 = x + 1
             y0 = y + 2
             z = x0.sum() + y0.sum()
@@ -639,7 +725,11 @@ class <lambda>(torch.nn.Module):
         )
 
     def test_cycle_detection_two_node(self):
+        # [FUNCTION DOC] As the single node test but the extra dependency map has two entries
+        # pointing at each other; cycle detection reports the expected path.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Adds 1 to x, 2 to y and returns the
+            # sum of reductions.
             x0 = x + 1
             y0 = y + 2
             z = x0.sum() + y0.sum()
@@ -663,7 +753,11 @@ class <lambda>(torch.nn.Module):
         )
 
     def test_cycle_detection_arg_and_additional_deps(self):
+        # [FUNCTION DOC] Cycle created by an argument edge, plus an extra dependency entry;
+        # cycle detection reports the expected path.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Adds 1 to x, 2 to y and returns the
+            # sum of reductions.
             x0 = x + 1
             y0 = y + 2
             z = x0.sum() + y0.sum()
@@ -684,6 +778,8 @@ class <lambda>(torch.nn.Module):
         )
 
     def test_cycle_detection_simple(self):
+        # [FUNCTION DOC] Argument edge rewired to create a cycle in the simple graph, no extra
+        # dependencies; cycle detection reports the expected path.
         mod = self.run_and_get_simple_graph()
         add_node = next(n for n in mod.graph.nodes if n.name == "add")
         add_2 = next(n for n in mod.graph.nodes if n.name == "add_2")
@@ -695,16 +791,25 @@ class <lambda>(torch.nn.Module):
         )
 
     def test_cycle_detection_complex(self):
+        # [FUNCTION DOC] Rewires the first invoke_subgraph node to depend on a later add
+        # node in a graph with deduplicated regions; cycle detection reports the expected
+        # longer path.
         def inner_fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Creates a view of x and a view of
+            # that, returning the second.
             x0 = x.view(x.size())
             return x0.view(x.size())
 
         def inner_fn2(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Doubles x and y and returns the sum
+            # of their reductions.
             x = x * 2
             y = y * 2
             return x.sum() + y.sum()
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Calls each inner function twice and
+            # combines the results.
             o0 = inner_fn(x, y)
             o1 = inner_fn(x, y)
             o2 = inner_fn2(x, y)
@@ -730,21 +835,31 @@ class <lambda>(torch.nn.Module):
         )
 
     def test_autocast_ordering(self):
+        # [FUNCTION DOC] Inserts enter and exit autocast nodes into a deduplicated graph,
+        # computes extra dependencies, moves the autocast nodes, then checks the printed graph
+        # before and after a stable topological sort with the dependencies (the nodes end up
+        # around the second sum).
         from torch._dynamo.graph_deduplication import (
             _populate_additional_deps,
             _stable_topological_sort,
         )
 
         def inner_fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Creates a view of x and a view of
+            # that, returning the second.
             x0 = x.view(x.size())
             return x0.view(x.size())
 
         def inner_fn2(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Doubles x and y and returns the sum
+            # of their reductions.
             x = x * 2
             y = y * 2
             return x.sum() + y.sum()
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Calls each inner function twice and
+            # combines the results.
             o0 = inner_fn(x, y)
             o1 = inner_fn(x, y)
             o2 = inner_fn2(x, y)
@@ -760,6 +875,8 @@ class <lambda>(torch.nn.Module):
         mod = fw_graphs[0]
 
         def get_node(name):
+            # [FUNCTION DOC] HELPER: Return the first graph node whose name equals the given
+            # name; raises StopIteration if none exists.
             return next(n for n in mod.graph.nodes if n.name == name)
 
         sum_1 = get_node("sum_1")
@@ -859,18 +976,28 @@ class <lambda>(torch.nn.Module):
         )
 
     def test_output_nodes_last(self):
+        # [FUNCTION DOC] Moves the output node to a mid-graph position (after the node named
+        # sum_2) and checks that a stable topological sort without extra dependencies puts it
+        # back last.
+        # KNOWN ISSUE: the variable is named add_2 although it holds the node named sum_2.
         from torch._dynamo.graph_deduplication import _stable_topological_sort
 
         def inner_fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Creates a view of x and a view of
+            # that, returning the second.
             x0 = x.view(x.size())
             return x0.view(x.size())
 
         def inner_fn2(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Doubles x and y and returns the sum
+            # of their reductions.
             x = x * 2
             y = y * 2
             return x.sum() + y.sum()
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Calls each inner function twice and
+            # combines the results.
             o0 = inner_fn(x, y)
             o1 = inner_fn(x, y)
             o2 = inner_fn2(x, y)
@@ -967,18 +1094,29 @@ class <lambda>(torch.nn.Module):
         )
 
     def test_mutation_ordering(self):
+        # [FUNCTION DOC] Traces a function with in-place mutations between repeated regions,
+        # checks the generated code, moves the mutation nodes around, and checks that a stable
+        # sort using the module's recorded extra dependencies restores the original order of
+        # the mutations relative to subgraph calls.
         from torch._dynamo.graph_deduplication import _stable_topological_sort
 
         def inner_fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Creates a view of x and a view of
+            # that, returning the second.
             x0 = x.view(x.size())
             return x0.view(x.size())
 
         def inner_fn2(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Doubles x and y and returns the sum
+            # of their reductions.
             x = x * 2
             y = y * 2
             return x.sum() + y.sum()
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Computes views, mutates x by adding
+            # itself in place, uses the doubling function, mutates y by multiplying in place,
+            # uses the doubling function again and combines the results.
             o0 = inner_fn(x, y)
             o1 = inner_fn(x, y)
             x.add_(x)
@@ -995,9 +1133,12 @@ class <lambda>(torch.nn.Module):
         graph, _ = extract_graph_and_tracker(fn, x_clone, y_clone)
 
         def graph_code(graph):
+            # [FUNCTION DOC] HELPER: Return the Python source text generated for the graph.
             return graph.python_code("self").src
 
         def get_node(name):
+            # [FUNCTION DOC] HELPER: Return the first graph node whose name equals the given
+            # name; raises StopIteration if none exists.
             return next(n for n in graph.nodes if n.name == name)
 
         self.assertExpectedInline(
@@ -1098,16 +1239,25 @@ def forward(self, L_x_ : torch.Tensor, L_y_ : torch.Tensor):
         )
 
     def test_tuple_return(self):
+        # [FUNCTION DOC] A deduplicated region whose function returns a tuple from an
+        # allow-in-graph function compiles under fullgraph with the eager backend; results
+        # equal eager.
         @allow_in_graph
         def tuple_return(x, y):
+            # [FUNCTION DOC] HELPER: Allow-in-graph function returning its two arguments as
+            # a tuple.
             return x, y
 
         def inner_fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Computes x doubled plus one and y
+            # doubled plus one, then returns the tuple function applied to them.
             x0 = x + x + 1
             y0 = y + y + 1
             return tuple_return(x0, y0)
 
         def fn(x0, x1, x2, y0, y1, y2):
+            # [FUNCTION DOC] HELPER: Function under test. Applies the inner function to three
+            # pairs and returns the three results.
             x0 = inner_fn(x0, y0)
             x1 = inner_fn(x1, y1)
             x2 = inner_fn(x2, y2)
@@ -1120,16 +1270,23 @@ def forward(self, L_x_ : torch.Tensor, L_y_ : torch.Tensor):
         self.assertEqual(result_compiled, result_eager)
 
     def test_tuple_inputs(self):
+        # [FUNCTION DOC] With deduplication off but node tracking on, tuple-valued split
+        # inputs are removed from the duplicates map and graph deduplication is applied
+        # manually with a mock output graph; checks the resulting graph string.
         with (
             torch._dynamo.config.patch("use_graph_deduplication", False),
             torch._dynamo.config.patch("track_nodes_for_deduplication", True),
         ):
 
             def inner(x, y):
+                # [FUNCTION DOC] HELPER: Function under test. Splits x in two and returns the
+                # sum of the halves and y.
                 x0, x1 = torch.split(x, 5)
                 return x0 + x1 + y
 
             def fn(x, y):
+                # [FUNCTION DOC] HELPER: Function under test. Calls the inner function four
+                # times and returns the sum of all outputs' reductions.
                 o1 = inner(x, y)
                 o2 = inner(x, y)
                 o3 = inner(x, y)
@@ -1141,12 +1298,18 @@ def forward(self, L_x_ : torch.Tensor, L_y_ : torch.Tensor):
             )
 
             class MockOutputGraph:
+                # [CLASS DOC] HELPER: Minimal stand-in for an output graph exposing the traced
+                # graph, the region tracker and an empty fake root module.
                 def __init__(self):
+                    # [FUNCTION DOC] HELPER: Store the captured graph and tracker and create
+                    # an empty fake root module for nn modules.
                     self.graph = graph
                     self.region_tracker = tracker
                     self.nn_modules = FakeRootModule({})
 
                 def install_subgraph(self, name, subgraph):
+                    # [FUNCTION DOC] HELPER: Accept a subgraph name and module and return an
+                    # empty string without installing anything.
                     return ""
 
             splits = [
@@ -1196,10 +1359,15 @@ graph():
             )
 
     def test_param_transfer_to_submodule(self):
+        # [FUNCTION DOC] Parameters marked as static addresses can be passed into deduplicated
+        # regions without error; only runs the compiled function.
         def inner_fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Returns x plus y plus y plus x.
             return x + y + y + x
 
         def fn(x0, x1, x2, y0, y1, y2):
+            # [FUNCTION DOC] HELPER: Function under test. Applies the inner function to three
+            # pairs and returns the sum of the reductions.
             x0 = inner_fn(x0, y0)
             x1 = inner_fn(x1, y1)
             x2 = inner_fn(x2, y2)

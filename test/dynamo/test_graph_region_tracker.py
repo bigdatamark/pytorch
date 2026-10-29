@@ -1,4 +1,8 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests for the graph region tracker, which finds identical regions (repeated
+# sequences of nodes) in a traced graph and tracks which node arguments are mutated. Tests
+# compare the string form of the identical region groups, mutation tracking map and duplicate
+# map with expected strings. Import time has no side effects.
 import contextlib
 
 import torch
@@ -10,7 +14,11 @@ from torch.utils._pytree import tree_map
 
 
 class GraphRegionTrackerTests(TestCase):
+    # [CLASS DOC] Tests for region tracking. setUp turns on the config for tracking nodes for
+    # deduplication through an ExitStack and tearDown restores it.
     def setUp(self):
+        # [FUNCTION DOC] Run base setup, then create an ExitStack and enter a config patch
+        # that enables tracking nodes for deduplication.
         super().setUp()
         self.exit_stack = contextlib.ExitStack()
         self.exit_stack.enter_context(
@@ -18,27 +26,39 @@ class GraphRegionTrackerTests(TestCase):
         )
 
     def tearDown(self):
+        # [FUNCTION DOC] Close the ExitStack (restoring the config) and then run
+        # base teardown.
         self.exit_stack.close()
         super().tearDown()
 
     def get_result(self, fn, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Trace the function, ask the tracker for identical regions in
+        # the graph, convert nodes to names and return the string form of the region groups.
         graph, region_tracker = extract_graph_and_tracker(fn, *args, **kwargs)
         region_groups = region_tracker.get_identical_regions(graph)
         region_groups = tree_map(lambda n: n.name, region_groups)
         return str(region_groups)
 
     def get_mutation_tracking(self, fn, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Trace the function and return the string form of the
+        # tracker's map from node to mutated argument positions.
         _, region_tracker = extract_graph_and_tracker(fn, *args, **kwargs)
         return str(region_tracker.node_to_mutated_arg_positions)
 
     def test_get_regions_single_region_group(self):
+        # [FUNCTION DOC] A repeated inner function called three times yields one group of
+        # three regions of five nodes each, checked against an expected string.
         def inner_fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Adds 1 to x and 2 to y and returns
+            # the sum of their reductions.
             x0 = x + 1
             y0 = y + 2
             z = x0.sum() + y0.sum()
             return z
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Calls the inner function with
+            # different second arguments (including sine of y), multiplies and adds results.
             o0 = inner_fn(x, y)
             o1 = torch.sin(y)
             o2 = inner_fn(x, o1)
@@ -56,19 +76,27 @@ class GraphRegionTrackerTests(TestCase):
         )
 
     def test_get_regions_multiple_region_groups(self):
+        # [FUNCTION DOC] Two different repeated functions produce two separate region groups;
+        # checks the expected region string.
         def inner_fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Adds 1 to x and 2 to y and returns
+            # the sum of their reductions.
             x1 = x + 1
             y1 = y + 2
             z = x1.sum() + y1.sum()
             return z
 
         def inner_fn2(a, b):
+            # [FUNCTION DOC] HELPER: Function under test. Adds 2 and 3 in place to both inputs
+            # and multiplies a by the sum of cosine of b.
             a += 2
             b += 3
             c = a * b.cos().sum()
             return c
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Calls the two inner functions
+            # several times with sine and cosine inputs and combines results.
             x0 = torch.cos(x)
             y0 = torch.sin(y)
             o1 = inner_fn2(x0, y0)
@@ -89,10 +117,15 @@ class GraphRegionTrackerTests(TestCase):
         )
 
     def test_no_single_node_regions(self):
+        # [FUNCTION DOC] Regions consisting of a single node are not reported; the expected
+        # result is an empty list.
         def inner_fn(x):
+            # [FUNCTION DOC] HELPER: Function under test. Returns x plus one.
             return x + 1
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Function under test. Calls the inner function three times
+            # and adds the results.
             o0 = inner_fn(x)
             o1 = inner_fn(x)
             o2 = inner_fn(x)
@@ -101,19 +134,27 @@ class GraphRegionTrackerTests(TestCase):
         self.assertExpectedInline(self.get_result(fn, torch.ones(10, 10)), """[]""")
 
     def test_mismatched_arg_shapes(self):
+        # [FUNCTION DOC] Calls whose arguments have mismatching shapes yield shorter regions;
+        # checks the expected groups.
         def inner_fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Adds 1 to x and 2 to y and returns
+            # the sum of their reductions.
             x1 = x + 1
             y1 = y + 2
             z = x1.sum() + y1.sum()
             return z
 
         def inner_fn2(a, b):
+            # [FUNCTION DOC] HELPER: Function under test. Adds 2 and 3 in place to both inputs
+            # and multiplies a by the sum of cosine of b.
             a += 2
             b += 3
             c = a * b.cos().sum()
             return c
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Calls the inner functions with
+            # differently shaped arguments and combines the results.
             x0 = torch.cos(x)
             y0 = torch.sin(y)
             o1 = inner_fn2(x0, y0)
@@ -134,12 +175,18 @@ class GraphRegionTrackerTests(TestCase):
         )
 
     def test_mismatched_dtypes(self):
+        # [FUNCTION DOC] Calls with different dtypes (one with bfloat16 inputs) are left out
+        # of the groups; four float calls remain in one group.
         def inner_fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Multiplies x by one, adds one to y
+            # and returns x plus the sum of y.
             x1 = x * 1
             y1 = y + 1
             return x1 + y1.sum()
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Calls the inner function four times
+            # with floats and once with bfloat16 conversions, then combines results.
             x0 = torch.sin(x)
             y0 = torch.cos(y)
             o0 = inner_fn(x0, y0)
@@ -160,11 +207,18 @@ class GraphRegionTrackerTests(TestCase):
         )
 
     def test_nested_args(self):
+        # [FUNCTION DOC] Arguments given as lists of tensors are handled; the float calls form
+        # one group while the bfloat16 call is excluded.
         def inner_fn(xs, ys):
+            # [FUNCTION DOC] HELPER: Function under test. Adds two lists of tensors
+            # elementwise with the foreach add and returns the first output plus the sum of
+            # the second.
             out = torch._foreach_add(xs, ys)
             return out[0] + out[1].sum()
 
         def fn(x, y, z):
+            # [FUNCTION DOC] HELPER: Function under test. Calls the inner function four times
+            # with float lists and once with bfloat16 conversions, then combines results.
             x0 = torch.sin(x)
             y0 = torch.cos(y)
             z0 = torch.sin(z)
@@ -191,12 +245,22 @@ class GraphRegionTrackerTests(TestCase):
 
     @recover_orig_fp32_precision
     def test_mismatched_global_state(self):
+        # [FUNCTION DOC] Calls made under different global state (grad mode, inference mode,
+        # saved tensor hooks, default dtype, deterministic algorithms, matmul precision flags)
+        # are put in separate groups. Loops over several context managers or toggle function
+        # pairs and checks the same expected groups each time. The fp32 precision flags are
+        # restored afterwards.
         def inner_fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Multiplies x by one, adds one to y
+            # and returns x plus the sum of y.
             x1 = x * 1
             y1 = y + 1
             return x1 + y1.sum()
 
         def fn(x, y, c):
+            # [FUNCTION DOC] HELPER: Function under test. Calls the inner function twice, then
+            # changes global state (a pair of functions in a tuple or a context manager),
+            # calls it twice more and sums the four results.
             x0 = torch.sin(x)
             y0 = torch.cos(y)
             o4 = inner_fn(x0, y0)
@@ -213,12 +277,18 @@ class GraphRegionTrackerTests(TestCase):
             return o0 + o2 + o4 + o5
 
         def create_toggle_fns(property):
+            # [FUNCTION DOC] HELPER: Return two functions for the matmul backend property of
+            # the given name: one sets it to the opposite of its value at creation, one
+            # restores the original.
             old_value = getattr(torch.backends.cuda.matmul, property)
 
             def toggle_property():
+                # [FUNCTION DOC] HELPER: Set the property to the opposite of the
+                # original value.
                 setattr(torch.backends.cuda.matmul, property, not old_value)
 
             def reset_property():
+                # [FUNCTION DOC] HELPER: Set the property back to the original value.
                 setattr(torch.backends.cuda.matmul, property, old_value)
 
             return toggle_property, reset_property
@@ -226,9 +296,11 @@ class GraphRegionTrackerTests(TestCase):
         old_dtype = torch.get_default_dtype()
 
         def set_default_dtype_bfloat16():
+            # [FUNCTION DOC] HELPER: Set the default dtype to bfloat16.
             torch.set_default_dtype(torch.bfloat16)
 
         def reset_default_dtype():
+            # [FUNCTION DOC] HELPER: Restore the default dtype saved when the test started.
             torch.set_default_dtype(old_dtype)
 
         for ctx in [
@@ -255,7 +327,12 @@ class GraphRegionTrackerTests(TestCase):
             )
 
     def test_mutation_tracking_simple(self):
+        # [FUNCTION DOC] In-place operations on inputs and intermediates are recorded in the
+        # mutation tracking map with the mutated argument position zero.
         def fn(x, y, z):
+            # [FUNCTION DOC] HELPER: Function under test. Applies sin and cos, mutates z
+            # with an in-place sine and y0 with an in-place add of z, returning the sum
+            # of reductions.
             x0 = torch.sin(x)
             y0 = torch.cos(y)
             z.sin_()
@@ -273,7 +350,10 @@ class GraphRegionTrackerTests(TestCase):
         )
 
     def test_mutation_tracking_setitem(self):
+        # [FUNCTION DOC] An item assignment is recorded as mutating argument position zero.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Function under test. Adds 1 to x, assigns 3 to element 0
+            # of the result and returns it.
             y = x + 1
             y[0] = 3
             return y
@@ -284,12 +364,18 @@ class GraphRegionTrackerTests(TestCase):
         )
 
     def test_mutation_tracking_allow_in_graph(self):
+        # [FUNCTION DOC] A mutating allow-in-graph function and an in-place sine are both
+        # recorded in the mutation tracking map.
         @torch._dynamo.allow_in_graph
         def fn_mut(x, y):
+            # [FUNCTION DOC] HELPER: Allow-in-graph function adding y into x in place and
+            # returning the sum of reductions.
             x.add_(y)
             return x.sum() + y.sum()
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Calls the mutating function on the
+            # sum of x and y, applies in-place sine and returns x plus the call result.
             z = x + y
             o0 = fn_mut(z, y)
             z.sin_()
@@ -305,11 +391,18 @@ class GraphRegionTrackerTests(TestCase):
         )
 
     def test_non_tensor_arg_hashing(self):
+        # [FUNCTION DOC] Calls whose non-tensor arguments (convolution stride tuples) differ
+        # are not grouped together; the matching calls form one group.
         def inner(x, w, t):
+            # [FUNCTION DOC] HELPER: Function under test. Doubles x via addition and applies a
+            # convolution with the given weight and parameters.
             y = x + x
             return torch.conv2d(y, w, None, *t)
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Calls the inner function three times
+            # with one set of convolution parameters and once with another, returning the sum
+            # of reductions.
             o1 = inner(x, y, ((1, 1), (0, 0), (1, 1), 1))
             o2 = inner(x, y, ((1, 1), (0, 0), (1, 1), 1))
             o3 = inner(x, y, ((1, 1), (0, 0), (1, 1), 1))
@@ -326,6 +419,8 @@ class GraphRegionTrackerTests(TestCase):
         )
 
     def test_region_sorting(self):
+        # [FUNCTION DOC] Sorts regions by the order of a reference region and checks the
+        # result: every region is permuted consistently with the rank mapping.
         from torch._dynamo.graph_region_tracker import _sort_with_ref_region
 
         index_to_rank = {0: 0, 2: 1, 1: 2}
@@ -334,13 +429,20 @@ class GraphRegionTrackerTests(TestCase):
         self.assertExpectedInline(regions, """[[0, 2, 1], [1, 0, 2]]""")
 
     def test_no_duplicate_tracking(self):
+        # [FUNCTION DOC] The tracker's duplicate map is checked against an expected string
+        # after tracing, then tracking an already tracked node again is done to check it does
+        # not fail or add the node twice.
         def inner_fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Adds 1 to x and 2 to y and returns
+            # the sum of their reductions.
             x0 = x + 1
             y0 = y + 2
             z = x0.sum() + y0.sum()
             return z
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test. Calls the inner function with
+            # different second arguments, multiplies and adds results.
             o0 = inner_fn(x, y)
             o1 = torch.sin(y)
             o2 = inner_fn(x, o1)
