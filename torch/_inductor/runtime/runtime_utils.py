@@ -1,3 +1,9 @@
+# [MODULE DOC] Small utilities shared by Inductor runtime and generated kernels: integer/power-of-2
+# math, byte counting, Triton config hashing/validation, tensor metadata assertions, colored
+# bandwidth strings, Triton cache-key conversion, MPS shader compilation, and Pallas (JAX)
+# padding/tiling/block-spec helpers for GPU, CPU and TPU.
+# Import-time side effects: tries to import colorama (sets HAS_COLORAMA), and re-exports
+# cache-dir helpers and the dynamo compilation callback that other files rely on.
 from __future__ import annotations
 
 import functools
@@ -25,19 +31,25 @@ if TYPE_CHECKING:
 
 
 def conditional_product(*args: int) -> int:
+    # [FUNCTION DOC] Multiply together all truthy (non-zero) arguments, skipping zeros.
+    # Raises TypeError if no argument is truthy (reduce of an empty sequence).
     return functools.reduce(operator.mul, [x for x in args if x])
 
 
 def ceildiv(number: int, denom: int) -> int:
+    # [FUNCTION DOC] Integer ceiling division of number by denom (via negated floor division).
     return -(number // -denom)
 
 
 def is_power_of_2(n: int) -> bool:
+    # [FUNCTION DOC] True if n is a positive power of two (bit trick on n and n minus one).
     """Returns whether n = 2 ** m for some integer m."""
     return n > 0 and n & n - 1 == 0
 
 
 def next_power_of_2(n: int) -> int:
+    # [FUNCTION DOC] Smallest power of two >= n; returns 1 for n <= 0. A sympy Integer is converted
+    # to a Python int first.
     """Return the smallest power of 2 greater than or equal to n"""
     if isinstance(n, sympy.Integer):
         n = int(n)
@@ -47,12 +59,17 @@ def next_power_of_2(n: int) -> int:
 
 
 def last_power_of_2(n: int) -> int:
+    # [FUNCTION DOC] Largest power of two <= n, derived from next_power_of_2. For n <= 0 this
+    # returns 1 (not <= n).
     """Return the largest power of 2 less than or equal to n"""
     next_pow2 = next_power_of_2(n)
     return next_pow2 // 2 if next_pow2 > n else next_pow2
 
 
 def get_num_bytes(*args: torch.Tensor, num_in_out_args: int = 0) -> int:
+    # [FUNCTION DOC] Total bytes (element count times element size) over the tensor arguments;
+    # non-tensor arguments are ignored. The first num_in_out_args positional arguments are
+    # counted twice (read and write). Returns an int.
     """
     Return the total number of bytes the arguments of tensor type takes.
 
@@ -69,6 +86,8 @@ def get_num_bytes(*args: torch.Tensor, num_in_out_args: int = 0) -> int:
 
 
 def triton_config_to_hashable(cfg: Config) -> Hashable:
+    # [FUNCTION DOC] Return a tuple of the config's sorted kwargs items plus num_warps and num_stages
+    # entries, usable as a dictionary key to identify the config.
     """
     Convert triton config to a tuple that can uniquely identify it. We can use
     the return value as a dictionary key.
@@ -83,6 +102,8 @@ def triton_config_to_hashable(cfg: Config) -> Hashable:
 
 
 def validate_triton_config(cfg: Config) -> None:
+    # [FUNCTION DOC] Raise AssertionError if the config has a non-None pre_hook, since pre-hooks are
+    # not serialized and would be lost when loaded from cache. Otherwise returns nothing.
     # [Note: Triton pre_hook in inductor]
     # pre-hook is a lambda function, which we don't attempt to serialize.
     # right now, if a pre-hook is attached to the config, it will not be saved;
@@ -99,6 +120,9 @@ def assert_tensor_metadata(
     expected_dtype: torch.dtype,
     op_name: str | None = None,
 ) -> None:
+    # [FUNCTION DOC] Check a tensor against expected dtype, size and stride; a None tensor is accepted.
+    # Raises RuntimeError on dtype mismatch (message hints at a wrong fake kernel for a custom
+    # op and names op_name if given); size/stride mismatch is raised by the dynamo guards helper.
     if tensor is None:
         return
     if tensor.dtype != expected_dtype:
@@ -124,12 +148,16 @@ def create_bandwidth_info_str(
     suffix: str = "",
     color: bool = True,
 ) -> str:
+    # [FUNCTION DOC] Format a one-line bandwidth report with milliseconds, gigabytes and GB/s between
+    # prefix and suffix. When color is enabled and the kernel is slow (over 0.012 ms and under
+    # 650 GB/s) the line is wrapped in red text.
     info_str = f"{prefix}{ms:.3f}ms    \t{num_gb:.3f} GB \t {gb_per_s:7.2f}GB/s{suffix}"
     slow = ms > 0.012 and gb_per_s < 650
     return red_text(info_str) if color and slow else info_str
 
 
 def get_max_y_grid() -> int:
+    # [FUNCTION DOC] Return the maximum CUDA grid size in the y dimension (65535).
     return 65535
 
 
@@ -145,32 +173,41 @@ except ModuleNotFoundError:
 if HAS_COLORAMA:
 
     def _color_text(msg: str, color: str) -> str:
+        # [FUNCTION DOC] HELPER: Wrap msg in the colorama foreground code for the named color
+        # (upper-cased lookup) followed by a reset code. Raises AttributeError for unknown colors.
         # pyrefly: ignore [missing-attribute]
         return getattr(colorama.Fore, color.upper()) + msg + colorama.Fore.RESET
 
 else:
 
     def _color_text(msg: str, color: str) -> str:
+        # [FUNCTION DOC] HELPER: Fallback when colorama is missing; returns msg unchanged.
         return msg
 
 
 def green_text(msg: str) -> str:
+    # [FUNCTION DOC] Return msg colored green (unchanged if colorama is unavailable).
     return _color_text(msg, "green")
 
 
 def yellow_text(msg: str) -> str:
+    # [FUNCTION DOC] Return msg colored yellow (unchanged if colorama is unavailable).
     return _color_text(msg, "yellow")
 
 
 def red_text(msg: str) -> str:
+    # [FUNCTION DOC] Return msg colored red (unchanged if colorama is unavailable).
     return _color_text(msg, "red")
 
 
 def blue_text(msg: str) -> str:
+    # [FUNCTION DOC] Return msg colored blue (unchanged if colorama is unavailable).
     return _color_text(msg, "blue")
 
 
 def get_first_attr(obj: Any, *attrs: str) -> Any:
+    # [FUNCTION DOC] Return the value of the first named attribute that obj has, checked in order.
+    # Raises AssertionError if none of the attributes exist.
     """
     Return the first available attribute or throw an exception if none is present.
     """
@@ -185,6 +222,9 @@ dynamo_timed = torch._dynamo.utils.dynamo_timed  # type: ignore[has-type]
 
 
 def triton_hash_to_path_key(key: str) -> str:
+    # [FUNCTION DOC] Convert a Triton cache hash to the form used in Triton's cache path names.
+    # Tries Triton's base64 converter, then its base32 converter, and falls back to returning
+    # the key unchanged if neither can be imported (any exception is swallowed).
     # In early versions of Triton, the hash is directly used in the path name.
     # Later, the hash is converted to base64 before being used in the path name.
     # Later, the base64 conversion was replaced to the base32
@@ -207,6 +247,9 @@ def triton_hash_to_path_key(key: str) -> str:
 
 
 def compile_mps_shader(source: str) -> Any:
+    # [FUNCTION DOC] Compile Metal shader source with the MPS backend and return the library object.
+    # On SyntaxError, re-raises SyntaxError whose message includes the full source and the
+    # compiler message.
     """
     Compiles shader source but raise more actionable error message when needed
     """
@@ -219,6 +262,10 @@ def compile_mps_shader(source: str) -> Any:
 def compile_mps_shaders(
     kernels: list[tuple[str, str, list[str]]],
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] Compile several Metal kernels as one library: collect the sorted unique headers,
+    # emit one include line per header, concatenate all kernel sources, compile once, and return
+    # a mapping from each kernel name to the corresponding compiled function in the library.
+    # Raises SyntaxError (from compile_mps_shader) on compile failure.
     """Compile a batch of Metal kernels into one library.
 
     Args:
@@ -238,6 +285,9 @@ def compile_mps_shaders(
 
 
 def torch_dtype_to_jax_runtime(dtype: torch.dtype) -> Any:
+    # [FUNCTION DOC] Map a torch dtype to the corresponding JAX numpy dtype object (float, int, uint8,
+    # bool and complex types supported). Imports jax lazily.
+    # Raises ValueError for unsupported dtypes.
     """
     Map PyTorch dtype to actual JAX dtype object at runtime.
 
@@ -272,6 +322,9 @@ def torch_dtype_to_jax_runtime(dtype: torch.dtype) -> Any:
 
 
 def torch_dtype_to_jax(dtype: torch.dtype) -> str:
+    # [FUNCTION DOC] Return the source text of the JAX numpy dtype expression for a torch dtype
+    # (the jnp prefix plus the dtype name; bool maps to the underscore-suffixed bool name).
+    # Raises ValueError for unsupported dtypes.
     """
     Map PyTorch dtype to JAX dtype expression string.
 
@@ -292,6 +345,8 @@ def torch_dtype_to_jax(dtype: torch.dtype) -> str:
 
 
 def pallas_gpu_pad_inputs(inputs: list[Any], alignment: int = 128) -> list[Any]:
+    # [FUNCTION DOC] Flatten each JAX array to 1D and zero-pad its end so the length is a multiple of
+    # alignment (already-aligned arrays are just flattened). Returns the list of flat arrays.
     """Flatten and pad each input JAX array to a multiple of alignment."""
     import jax.numpy as jnp  # pyrefly: ignore [import-error, missing-import]
 
@@ -312,6 +367,10 @@ def pallas_gpu_align_output_specs(
     out_dtypes: tuple[Any, ...],
     alignment: int = 128,
 ) -> tuple[tuple[Any, ...], list[bool]]:
+    # [FUNCTION DOC] For each output shape/dtype pair, build a JAX ShapeDtypeStruct: outputs with at most
+    # one element keep their shape and are flagged scalar; others become a 1D struct whose length
+    # is the element count rounded up to a multiple of alignment. Returns (tuple of specs,
+    # list of scalar flags).
     """Build aligned output ShapeDtypeStruct specs for GPU kernels.
 
     Returns (aligned_specs, is_scalar_output) where is_scalar_output[i] is True
@@ -338,6 +397,10 @@ def pallas_gpu_unpad_results(
     orig_shapes: tuple[Any, ...],
     is_scalar_output: list[bool] | None = None,
 ) -> Any:
+    # [FUNCTION DOC] Undo pallas_gpu_align_output_specs padding: wrap a non-tuple result into a tuple,
+    # then for each result keep scalar-flagged ones as is, and otherwise slice the leading
+    # original element count and reshape to the original shape. Returns a single value if
+    # there is one result, else a tuple.
     """Remove padding from GPU kernel results and reshape to original shapes.
 
     If is_scalar_output is None, all outputs are treated as non-scalar.
@@ -366,6 +429,10 @@ _TPU_ALIGN_SECOND_LAST = 8
 def _pallas_tile_size(
     dim: int, alignment: int, max_tile: int = 1024, is_tpu: bool = False
 ) -> int:
+    # [FUNCTION DOC] HELPER: Choose a tile size for one dimension. Zero-size dims give the alignment on
+    # TPU else 1. On TPU the tile is rounded UP to a multiple of alignment (min of max_tile and
+    # dim, at least alignment). Otherwise small dims (<= alignment) use the full dim and larger
+    # ones use the largest multiple of alignment not above min(max_tile, dim).
     """Pick the largest aligned tile size <= max_tile for *dim*.
 
     If *dim* is already <= alignment the full dimension is used (no tiling
@@ -394,6 +461,10 @@ def _pallas_tile_size(
 
 
 def pallas_permute(x, perm):
+    # [FUNCTION DOC] Permute the axes of JAX array x by the tuple perm, avoiding a Mosaic TPU bug.
+    # For 2 or fewer dims it calls the library permute; an identity permutation returns x.
+    # Otherwise it loops over the smallest output dimension, takes static slices, recursively
+    # permutes each slice with the reduced permutation, and stacks the results.
     """Permute array x according to perm, working around Mosaic TPU bugs.
 
     Mosaic's jnp.permute_dims produces corrupted output for certain 3D+
@@ -455,6 +526,14 @@ def pallas_compute_tiling(
     permutations: list[tuple[int, ...]] | None = None,
     max_grid_product: int | None = None,
 ) -> tuple[tuple[int, ...], tuple[int, ...], dict[int, int]]:
+    # [FUNCTION DOC] Compute a tiling for a Pallas kernel over ref_shape. Only the last two tileable dims
+    # (excluding the last skip_last_n) are tiled, using TPU-style alignment (128 for the
+    # last physical dim, 8 for second-to-last), also honoring alignment needs of any input
+    # permutations. exact_only restricts to evenly dividing tiles unless alignment allows
+    # masked remainders. If transpose is set, tiles are shrunk (to aligned divisors,
+    # proportionally across dims) to bound estimated padded VMEM use. If max_grid_product is
+    # set, tiles are enlarged to reduce the grid product. Returns (tile shape, grid tuple,
+    # mapping from tiled axis to grid position); scalars give an empty tile, grid of one, empty map.
     """Compute tile shape, grid and axis→grid-dim mapping for CPU/TPU.
 
     Always uses TPU-compatible alignment (last dim multiple of 128,
@@ -499,9 +578,14 @@ def pallas_compute_tiling(
     # output dim must also satisfy _TPU_ALIGN_LAST.  Compute the
     # strictest alignment across all buffers.
     def _input_align(input_ax: int, input_nd: int) -> int:
+        # [FUNCTION DOC] HELPER: Required alignment for an axis of an input with input_nd dims: 128 for
+        # its last axis, otherwise 8.
         return _TPU_ALIGN_LAST if input_ax == input_nd - 1 else _TPU_ALIGN_SECOND_LAST
 
     def _align(ax: int) -> int:
+        # [FUNCTION DOC] HELPER: Strictest alignment for output axis ax: the output-side requirement
+        # (128 for the last axis, else 8) maxed with the requirement of the input axis it maps to
+        # under each permutation of matching rank.
         out_align = _TPU_ALIGN_LAST if ax == nd - 1 else _TPU_ALIGN_SECOND_LAST
         if permutations:
             for perm in permutations:
@@ -512,6 +596,11 @@ def pallas_compute_tiling(
         return out_align
 
     def _can_tile_ax(ax: int, dim: int, t: int) -> bool:
+        # [FUNCTION DOC] HELPER: Whether tile size t is acceptable for axis ax of size dim. Tiles at or above
+        # the dim are allowed (padding). When exact_only is set and t does not divide dim, allowed
+        # only because the aligned axes support masked remainders.
+        # KNOWN ISSUE: _align always returns 128 or 8, so the alignment checks are always true
+        # and the False returns are unreachable; every tile size is accepted.
         """Check if tiling dim to t is valid."""
         if t >= dim:
             # For TPU padding, we allow tiles >= dimension for the aligned axes
@@ -716,6 +805,12 @@ def pallas_make_block_spec(
     permutation: tuple[int, ...] | None = None,
     is_output: bool = False,
 ) -> Any:
+    # [FUNCTION DOC] Build a Pallas BlockSpec for a buffer given the tiling of the reference shape.
+    # Scalars get a single-element block. Tiled reference axes are mapped to buffer axes by:
+    # an alignment offset search when the buffer has more dims (reduction input), the given
+    # permutation when ranks match, or right-alignment otherwise (with left-alignment fallback
+    # for outputs with fewer dims). A buffer axis is tiled only if its size equals the reference
+    # axis size; all others stay full. The index map yields grid indices for tiled axes, else 0.
     """Build a ``pl.BlockSpec`` for *buf_shape* given tiling of *ref_shape*.
 
     Lower-ndim buffers are right-aligned with the reference shape (numpy
@@ -806,6 +901,10 @@ def _make_index_map(
     buf_nd: int,
     n_grid: int,
 ) -> Any:
+    # [FUNCTION DOC] HELPER: Return an index map function for a BlockSpec. The map takes the grid indices
+    # and returns a tuple of int32 values, one per buffer axis: the grid index for tiled axes
+    # (from tiled_pairs) and zero elsewhere. With no grid or a single untiled grid dim it
+    # returns a map of all zeros. int32 values are created inside the map to satisfy JAX/Mosaic.
     """Return an index_map callable for ``pl.BlockSpec``.
 
     *tiled_pairs* is a list of ``(buf_axis, grid_dim)`` indicating which
@@ -825,6 +924,8 @@ def _make_index_map(
         return lambda _i: tuple(jnp.int32(0) for _ in range(buf_nd))
 
     def index_map(*grid_args):
+        # [FUNCTION DOC] HELPER: Return a tuple of int32 block indices, one per buffer axis, taking the
+        # grid argument mapped to that axis if tiled and zero otherwise.
         return tuple(
             jnp.int32(grid_args[mapping[d]]) if d in mapping else jnp.int32(0)
             for d in range(buf_nd)
@@ -834,12 +935,15 @@ def _make_index_map(
 
 
 def pallas_ensure_nonzero_rank(x: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] Reshape a 0-dim tensor to shape (1,); tensors with rank >= 1 are returned as is.
     if len(x.shape) == 0:
         return x.reshape((1,))
     return x
 
 
 def pallas_make_block_spec_non_tiled(shape: tuple[int, ...]) -> Any:
+    # [FUNCTION DOC] Build a Pallas BlockSpec covering the whole buffer (shape (1,) for scalars) whose
+    # index map returns the single grid index, as int32, for every axis.
     import jax.numpy as jnp  # pyrefly: ignore [import-error, missing-import]
     from jax.experimental import (  # pyrefly: ignore [import-error, missing-import]
         pallas as pl,

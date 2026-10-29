@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Halide-expression helpers for Philox-based random number generation used by
+# Inductor's Halide backend: counter-based Philox rounds, uniform/normal/integer samplers.
+# Tries to import halide as hl at import time; if absent, hl and the Philox u32 constants are None.
+# All functions build Halide expressions (not concrete values) and require hl to be available.
 import math
 
 
@@ -22,6 +26,9 @@ else:
 
 
 def _pair_uniform_to_normal(u1, u2):
+    # [FUNCTION DOC] HELPER: Box-Muller transform. Takes two uniform float expressions in [0, 1),
+    # clamps the first to at least 1e-7 to avoid log of zero, and returns a pair of
+    # independent standard-normal float32 expressions (radius*cos, radius*sin).
     """Box-Muller transform"""
     u1 = hl.max(hl.f32(1.0e-7), u1)
     th = hl.f32(math.tau) * u2
@@ -30,6 +37,10 @@ def _pair_uniform_to_normal(u1, u2):
 
 
 def _uint_to_uniform_float(x):
+    # [FUNCTION DOC] HELPER: Convert a 32-bit (signed or unsigned) integer expression to a float64
+    # expression in [0, 1). Reinterprets as Int32, maps negatives to their bitwise complement
+    # (so values are non-negative), then multiplies by about 2^-31.
+    # Raises AssertionError if the input type is not UInt(32) or Int(32).
     """
     Numerically stable function to convert a random uint into a random float uniformly sampled in [0, 1).
     """
@@ -47,7 +58,12 @@ def _uint_to_uniform_float(x):
 
 
 def philox_impl(c0, c1, c2, c3, k0, k1, n_rounds):
+    # [FUNCTION DOC] Run the Philox4x32 counter-based generator for n_rounds rounds (a Python-level
+    # unrolled loop) on four 32-bit counter expressions and two 32-bit key expressions.
+    # Each round mixes counters with high/low products of the round constants and then bumps
+    # the keys by the key constants. Returns the four transformed counter expressions.
     def umulhi(a, b):
+        # [FUNCTION DOC] HELPER: High 32 bits of the 64-bit product of two 32-bit expressions, as UInt(32).
         a = hl.cast(hl.UInt(64), a)
         b = hl.cast(hl.UInt(64), b)
         return hl.cast(hl.UInt(32), ((a * b) >> 32) & hl.u64(0xFFFFFFFF))
@@ -67,6 +83,9 @@ def philox_impl(c0, c1, c2, c3, k0, k1, n_rounds):
 
 
 def halide_philox(seed, c0, c1, c2, c3, n_rounds):
+    # [FUNCTION DOC] Split a 64-bit seed into low and high 32-bit keys and run philox_impl with the
+    # given 32-bit counters. Returns four 32-bit random expressions.
+    # Raises AssertionError if c0 is not a 32-bit type.
     seed = hl.cast(hl.UInt(64), seed)
 
     if c0.type().bits() != 32:
@@ -79,12 +98,16 @@ def halide_philox(seed, c0, c1, c2, c3, n_rounds):
 
 
 def randint4x(seed, offset, n_rounds):
+    # [FUNCTION DOC] Generate four random 32-bit integer expressions for a seed and offset
+    # (offset cast to UInt32 as the first counter, other counters zero).
     offset = hl.cast(hl.UInt(32), offset)
     _0 = hl.u32(0)
     return halide_philox(seed, offset, _0, _0, _0, n_rounds)
 
 
 def rand4x(seed, offset, n_rounds=PHILOX_N_ROUNDS_DEFAULT):
+    # [FUNCTION DOC] Like randint4x but converts each of the four outputs to a uniform float in [0, 1).
+    # Returns a 4-tuple of float expressions.
     i1, i2, i3, i4 = randint4x(seed, offset, n_rounds)
     u1 = _uint_to_uniform_float(i1)
     u2 = _uint_to_uniform_float(i2)
@@ -94,16 +117,23 @@ def rand4x(seed, offset, n_rounds=PHILOX_N_ROUNDS_DEFAULT):
 
 
 def randint(seed, offset, n_rounds=PHILOX_N_ROUNDS_DEFAULT):
+    # [FUNCTION DOC] Return the first of the four Philox random 32-bit integer expressions.
     ret, _, _, _ = randint4x(seed, offset, n_rounds)
     return ret
 
 
 def rand(seed, offset, n_rounds=PHILOX_N_ROUNDS_DEFAULT):
+    # [FUNCTION DOC] Return a uniform float expression in [0, 1) derived from the first Philox output.
     source = randint(seed, offset, n_rounds)
     return _uint_to_uniform_float(source)
 
 
 def rand_eager_kernel(seed, offset_blocks, tid, VEC, n_rounds=PHILOX_N_ROUNDS_DEFAULT):
+    # [FUNCTION DOC] Emulate eager-mode (CUDA-style) uniform float generation per thread id.
+    # The thread id is split into a subsequence (tid // VEC), a block-of-4 index and a lane (tid % 4);
+    # the 64-bit offset block plus block index and the subsequence become the four 32-bit counters.
+    # Philox outputs are selected by lane and mapped to a float32 in (0, 1] as one minus
+    # (value * 2^-32 + half step). Returns a float32 expression.
     inv = hl.cast(hl.Float(32), 1.0 / 4294967296.0)  # 2^-32
     half = hl.cast(hl.Float(32), 0.5) * inv
 
@@ -138,6 +168,8 @@ def rand_eager_kernel(seed, offset_blocks, tid, VEC, n_rounds=PHILOX_N_ROUNDS_DE
 
 
 def randn(seed, offset):
+    # [FUNCTION DOC] Standard-normal float expression: uses the first two Philox outputs as uniforms
+    # and returns only the first Box-Muller value (the second is discarded).
     i1, i2, _, _ = randint4x(seed, offset, PHILOX_N_ROUNDS_DEFAULT)
     u1 = _uint_to_uniform_float(i1)
     u2 = _uint_to_uniform_float(i2)
@@ -146,6 +178,9 @@ def randn(seed, offset):
 
 
 def randint64(seed, offset, low, high):
+    # [FUNCTION DOC] Random Int64 expression in [low, high): combines the first two Philox outputs into
+    # a 64-bit value, takes it modulo (high - low) as unsigned, and adds low.
+    # KNOWN ISSUE: modulo reduction introduces slight bias for ranges not dividing 2^64.
     r0, r1, _r2, _r3 = randint4x(seed, offset, PHILOX_N_ROUNDS_DEFAULT)
     r0 = hl.cast(hl.UInt(64), r0)
     r1 = hl.cast(hl.UInt(64), r1)

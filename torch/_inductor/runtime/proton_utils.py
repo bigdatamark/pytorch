@@ -1,3 +1,7 @@
+# [MODULE DOC] Post-processing of Triton Proton profiler Chrome trace files: read (gzipped or plain)
+# JSON traces, split events into kernel invocations by time gaps, regroup per-warp tracks by SM
+# or into per-CTA occupancy slots, normalize timestamps, and write gzipped traces.
+# Main entry point: process_proton_trace. No import-time side effects.
 """
 Utilities for post-processing Triton Proton profiling trace files.
 
@@ -15,12 +19,16 @@ from torch.utils._ordered_set import OrderedSet
 
 
 def _write_trace(path: str, data: dict[str, Any]) -> None:
+    # [FUNCTION DOC] HELPER: Serialize data as JSON into a gzip-compressed text file at path
+    # (overwrites; I/O errors propagate).
     """Write trace data to a gzipped JSON file."""
     with gzip.open(path, "wt", encoding="utf-8") as f:
         json.dump(data, f)
 
 
 def _read_trace(path: str) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Load JSON from path, decompressing when the name ends in .gz.
+    # Returns the parsed mapping; file or parse errors propagate.
     """Read trace data from a JSON file (gzipped or not)."""
     if path.endswith(".gz"):
         with gzip.open(path, "rt", encoding="utf-8") as f:
@@ -31,6 +39,9 @@ def _read_trace(path: str) -> dict[str, Any]:
 
 
 def _get_base_name(trace_path: str) -> str:
+    # [FUNCTION DOC] HELPER: File name of trace_path without directory and without the first matching
+    # known suffix (.trace.json.gz, .chrome_trace, .json.gz, .json); if none matches, the
+    # last extension is stripped.
     """Get the base name of a trace file, stripping known extensions."""
     base_name = os.path.basename(trace_path)
     for ext in [".trace.json.gz", ".chrome_trace", ".json.gz", ".json"]:
@@ -40,6 +51,10 @@ def _get_base_name(trace_path: str) -> str:
 
 
 def _group_events_by_sm(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Mutates events in place so all CTAs on one SM share one process track.
+    # For events whose pid matches an optional prefix plus core id plus CTA id, pid becomes
+    # prefix plus core, and tid becomes CTA id plus the old tid. Other events are unchanged.
+    # Returns the same list.
     """
     Group events so all CTAs on the same SM share one track.
 
@@ -67,6 +82,12 @@ def _group_events_by_sm(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _group_events_per_cta_occupancy(
     events: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Collapse warp events into one complete event per CTA (earliest start to
+    # latest end of its events) and pack CTAs of each SM greedily into slots so that CTAs
+    # sharing a slot do not overlap. Only events whose pid matches the core/CTA pattern are used.
+    # Returns a NEW list: process_name and thread_name metadata events (numeric pid/tid
+    # assigned in order of first appearance, thread names like slotN) followed by CTA events.
+    # The input events are not modified.
     """
     Process warp events into CTA-level events with slot assignment.
 
@@ -195,6 +216,8 @@ def _group_events_per_cta_occupancy(
 def _apply_grouping(
     events: list[dict[str, Any]], group_by_sm: bool, per_cta_occupancy: bool
 ) -> list[dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Dispatch: per-CTA occupancy grouping takes priority, else group-by-SM,
+    # else return events unchanged.
     """Apply grouping transformation to events."""
     if per_cta_occupancy:
         return _group_events_per_cta_occupancy(events)
@@ -207,6 +230,9 @@ def _split_events_by_invocation(
     events: list[dict[str, Any]],
     gap_threshold_ns: float = 1000.0,
 ) -> list[list[dict[str, Any]]]:
+    # [FUNCTION DOC] HELPER: Sort events by start time and start a new group whenever an event begins
+    # more than gap_threshold_ns after the latest end seen so far. Returns a list of non-empty
+    # event lists (empty list for empty input).
     """Split events into separate invocations based on time gaps."""
     if not events:
         return []
@@ -229,6 +255,9 @@ def _split_events_by_invocation(
 def _normalize_timestamps(
     events: list[dict[str, Any]], scale_factor: float = 1.0
 ) -> list[dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Mutates complete ("X") events in place: subtract the minimum start time
+    # among them from every start, then multiply starts and durations by scale_factor.
+    # Non-complete events (metadata) are untouched. Returns the same list.
     """Normalize timestamps to start at 0 and optionally scale."""
     if not events:
         return events
@@ -257,6 +286,11 @@ def process_proton_trace(
     gap_threshold_ns: float = 1000.0,
     per_cta_occupancy: bool = True,
 ) -> list[str]:
+    # [FUNCTION DOC] Read a Proton Chrome trace, split its events into invocations by time gaps, apply
+    # the chosen grouping to each, then write one complete gzipped trace (metadata events
+    # deduplicated by name/pid/tid) and, if split_invocations, one normalized and scaled
+    # trace per invocation. Creates output_dir (default: the input's directory) if needed.
+    # Returns the list of written paths, complete trace first. I/O errors propagate.
     """
     Process a proton trace file with various transformations.
 

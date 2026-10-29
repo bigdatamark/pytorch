@@ -1,3 +1,8 @@
+# [MODULE DOC] Statically launched Triton kernels: wrappers that parse a compiled Triton kernel's
+# metadata (cubin/hsaco/zebin, argument type signature, scratch needs) so it can be loaded and
+# launched through a precompiled C++ launcher without per-kernel C++ codegen. Provides the
+# base class, CUDA/HIP and XPU subclasses, and a device-type factory function.
+# No import-time side effects beyond imports.
 import functools
 import os
 from functools import cached_property
@@ -11,6 +16,10 @@ from .triton_helpers import get_constexprs
 
 @functools.lru_cache(None)
 def _tma_arg_helpers():
+    # [FUNCTION DOC] HELPER: Cached; lazily imports Triton's nvidia tensor-descriptor argument builder and
+    # TensorDescriptor class and returns (make_arg, TensorDescriptor), where make_arg expands
+    # a descriptor into a tensor map plus shape and stride values. Raises ImportError if Triton
+    # lacks these modules.
     """Cached (make_arg, TensorDescriptor) for host-side TMA arg expansion.
     make_arg(arg, metadata) -> [CUtensorMap, *shape, *strides]; the nvidia
     backend's make_tensordesc_arg ignores its third arg, so we pass None."""
@@ -18,12 +27,20 @@ def _tma_arg_helpers():
     from triton.tools.tensor_descriptor import TensorDescriptor
 
     def make_arg(arg, metadata):
+        # [FUNCTION DOC] HELPER: Call Triton's tensor-descriptor argument builder with the third (unused) argument
+        # set to nothing; returns the expanded argument list.
         return make_tensordesc_arg(arg, metadata, None)
 
     return make_arg, TensorDescriptor
 
 
 class StaticallyLaunchedTritonKernel:
+    # [CLASS DOC] Base class holding the launch-relevant data of a Triton CompiledKernel: name, cubin path or
+    # raw bytes, num_warps, shared memory, a compact argument type string (arg_tys), scratch
+    # flags, tensor-descriptor metadata, and the loaded function/module handles (single device)
+    # or per-device dicts (device_agnostic mode). Subclasses supply the C++ launcher
+    # (C_impl) and current-device lookup. Lifecycle: construct, load_kernel, run, close.
+    # Picklable via __getstate__, which drops loaded handles and the cubin path.
     """
     Parses the metadata of a CompiledKernel from Triton into a structure that can
     launch the cuda kernel directly. Only works for triton kernels compiled to cubin.
@@ -52,9 +69,17 @@ class StaticallyLaunchedTritonKernel:
 
     @cached_property
     def C_impl(self):
+        # [FUNCTION DOC] Cached property: the C++ launcher class for the backend. Abstract here; always
+        # raises NotImplementedError.
         raise NotImplementedError
 
     def __init__(self, kernel: CompiledKernel) -> None:
+        # [FUNCTION DOC] Extract launch data from a Triton CompiledKernel: function name, cubin path, argument
+        # names, declared constexprs, hash, warps, shared memory, scratch-argument flags
+        # (global and profile), tensor-descriptor metadata, and the argument type string.
+        # Initializes unloaded state (no function/module, not device-agnostic).
+        # Raises NotImplementedError if launch enter/exit hooks are set, if a scratch size is
+        # positive, or if num_ctas is not 1.
         # pyrefly: ignore [missing-attribute]
         self.name = kernel.src.fn.__name__
         # pyrefly: ignore [missing-attribute]
@@ -82,6 +107,8 @@ class StaticallyLaunchedTritonKernel:
             launch_exit = triton_knobs.runtime.launch_exit_hook
 
         def hook_is_empty(hook: Any) -> bool:
+            # [FUNCTION DOC] HELPER: True if the hook is None or a Triton hook chain with no registered calls;
+            # any other hook counts as non-empty.
             if hook is None:
                 return True
             if (
@@ -105,6 +132,8 @@ class StaticallyLaunchedTritonKernel:
         )
 
         def needs_scratch_arg(scratch_name: str, param_name: str) -> bool:
+            # [FUNCTION DOC] HELPER: True if the kernel metadata has the named scratch-size field (so an extra
+            # scratch argument must be passed). Raises NotImplementedError if its size is positive.
             # pyrefly: ignore [missing-attribute]
             if hasattr(kernel.metadata, param_name):
                 # pyrefly: ignore [missing-attribute]
@@ -152,6 +181,10 @@ class StaticallyLaunchedTritonKernel:
             )
 
     def reload_cubin_from_raw(self, filepath: str) -> str:
+        # [FUNCTION DOC] Ensure a cubin file path exists: if cubin_path is unset, write the retained raw
+        # bytes to filepath (creating directories) and record it. Returns the cubin path.
+        # Raises AssertionError if both path and raw bytes are unset.
+        # KNOWN ISSUE: if cubin_path is already set the file is not rewritten even if missing.
         """
         If the cubin file triton generated gets deleted under us, we can
         reload it from the raw cubin file.
@@ -166,6 +199,9 @@ class StaticallyLaunchedTritonKernel:
         return self.cubin_path
 
     def _agnostic_cubin_path(self) -> str:
+        # [FUNCTION DOC] HELPER: For device-agnostic kernels, return a usable cubin path, rewriting the file
+        # from the retained raw bytes if it was removed. Raises AssertionError if the path or
+        # raw bytes are missing and the file does not exist.
         # The cubin bytes are device-agnostic, so the same file loads onto any device.
         # Keep it available (the single-device path frees it after one load) and rewrite
         # from the retained raw bytes if the file was removed under us.
@@ -181,6 +217,11 @@ class StaticallyLaunchedTritonKernel:
         return self.cubin_path
 
     def load_kernel(self, device: int) -> None:
+        # [FUNCTION DOC] Load the cubin onto the given device through the C++ launcher. In device-agnostic mode,
+        # loads once per device and stores module and function in per-device dicts (cubin kept).
+        # Otherwise loads once (no-op if already loaded), stores module/function, records
+        # register and spill counts, then clears cubin path and raw bytes. Raises AssertionError
+        # if the cubin path is missing in single-device mode.
         if self.device_agnostic:
             if device in self.functions:
                 return
@@ -206,9 +247,12 @@ class StaticallyLaunchedTritonKernel:
         self.cubin_raw = None
 
     def _current_device(self) -> int:
+        # [FUNCTION DOC] HELPER: Index of the current device for the backend. Abstract; raises NotImplementedError.
         raise NotImplementedError
 
     def close(self) -> None:
+        # [FUNCTION DOC] Release loaded state: clear the function/module handles and per-device dicts first,
+        # then unload every module (single and per-device) via the C++ launcher.
         # Clear Python-visible handles first so repeated cleanup is harmless even if
         # the driver reports an error while unloading.
         modules = list(self.modules.values())
@@ -222,6 +266,7 @@ class StaticallyLaunchedTritonKernel:
             self.C_impl._unload_kernel(mod)
 
     def __del__(self) -> None:
+        # [FUNCTION DOC] HELPER: Destructor; calls close and swallows any exception.
         try:
             self.close()
         except Exception:
@@ -230,6 +275,9 @@ class StaticallyLaunchedTritonKernel:
     @staticmethod
     @functools.lru_cache
     def type_mappings() -> dict[str, str]:
+        # [FUNCTION DOC] Cached static method: mapping from Triton scalar type names (integers, unsigned
+        # integers, floating types) to single-character launcher type codes (fp16 and bf16 map
+        # to the 32-bit float code). TMA descriptor types are not included.
         return {
             "i1": "i",
             "i8": "b",
@@ -250,6 +298,9 @@ class StaticallyLaunchedTritonKernel:
         }
 
     def extract_type(self, ty: str) -> str:
+        # [FUNCTION DOC] Convert one Triton signature type string to its launcher type code: pointers (leading
+        # star) become the object code, scalars use type_mappings. Raises NotImplementedError
+        # for TMA descriptor types and KeyError for unknown scalar types.
         """
         Takes a triton type from CompiledKernel.signature and
         converts it into a single char encoding. _StaticCudaLauncher
@@ -263,6 +314,12 @@ class StaticallyLaunchedTritonKernel:
         return StaticallyLaunchedTritonKernel.type_mappings()[ty]
 
     def _expand_tensordesc_type(self, ty: str) -> str:
+        # [FUNCTION DOC] HELPER: Expand a tensor-descriptor signature entry into the type codes of the
+        # kernel parameters it lowers to. Parses the rank from the serialized type string, consumes the next
+        # entry of the descriptor metadata (advancing the descriptor counter), and returns:
+        # either a tensor-map code (when metadata is present) or a pointer plus 2x rank 64-bit values
+        # plus two 32-bit flags, followed by rank 32-bit shape codes and rank 64-bit stride codes.
+        # Raises NotImplementedError if the type string cannot be parsed.
         """Expand a tensordesc<dtype[shape]> signature entry into the per-arg
         type chars triton lowers it to (mirrors nvidia driver expand_signature):
         nvTmaDesc path -> CUtensorMap + shape(i32) + strides(i64); host-decomposed
@@ -300,7 +357,14 @@ class StaticallyLaunchedTritonKernel:
         return "".join(chars)
 
     def arg_ty_from_signature(self, src: ASTSource) -> str:
+        # [FUNCTION DOC] Build the launcher type string from an ASTSource's signature, in argument index
+        # order, skipping constexpr arguments and any argument listed in the source's constants.
+        # Tensor-descriptor arguments are expanded and set the has-tensordesc flag. Side effects:
+        # sets full_constexprs (all constant indices) and resets the descriptor counter.
+        # Raises NotImplementedError for unsupported types.
         def index_key(i: Any) -> int:
+            # [FUNCTION DOC] HELPER: Normalize a signature/constants key to an argument index: names are looked
+            # up in the function's argument names, tuples use their first element, ints pass through.
             if isinstance(i, str):
                 # pyrefly: ignore [missing-attribute]
                 return src.fn.arg_names.index(i)
@@ -341,6 +405,9 @@ class StaticallyLaunchedTritonKernel:
         return "".join(params)
 
     def __getstate__(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Pickle support: copy of instance state with loaded function/module handles (single
+        # and per-device) cleared and cubin_path set to none, since these are not valid across
+        # processes.
         # Remove objects that are no longer valid for pickling
         state = self.__dict__.copy()
         state["function"] = None
@@ -353,6 +420,9 @@ class StaticallyLaunchedTritonKernel:
         return state
 
     def _expand_tma_args(self, args: tuple[object, ...]) -> tuple[object, ...]:
+        # [FUNCTION DOC] HELPER: Replace each host-side TensorDescriptor argument with its expanded flat
+        # parameters (tensor map, shape, strides) using the per-descriptor metadata in order;
+        # other arguments pass through. Returns a new tuple.
         """Expand host-side TMA TensorDescriptor args into the flat kernel params
         (CUtensorMap + shape + strides) so they match the expanded type string."""
         make_tensordesc_arg, TensorDescriptor = _tma_arg_helpers()
@@ -377,6 +447,12 @@ class StaticallyLaunchedTritonKernel:
         stream: int,
         *args: Unpack[tuple[object, ...]],
     ) -> None:
+        # [FUNCTION DOC] Launch the loaded kernel on the stream with the given 3D grid and positional args
+        # (hot path). Picks the function for the current device (loading on demand) in
+        # device-agnostic mode, expands tensor-descriptor args if present, and appends None
+        # scratch arguments: always two on ROCm, otherwise one per enabled scratch flag.
+        # Raises AssertionError if the kernel was not loaded or the argument count differs from the
+        # type string length.
         """Actually run the kernel at runtime. This function is the hot codepath."""
 
         if self.device_agnostic:
@@ -459,13 +535,18 @@ class StaticallyLaunchedTritonKernel:
 
 
 class StaticallyLaunchedCudaKernel(StaticallyLaunchedTritonKernel):
+    # [CLASS DOC] CUDA and ROCm (HIP) implementation using the static CUDA launcher from torch's C
+    # extension; keeps the cubin or hsaco bytes in cubin_raw.
     @cached_property
     def C_impl(self):
+        # [FUNCTION DOC] Cached property: the C++ static CUDA launcher class.
         from torch._C import _StaticCudaLauncher
 
         return _StaticCudaLauncher
 
     def __init__(self, kernel: CompiledKernel) -> None:
+        # [FUNCTION DOC] Store the kernel's binary (hsaco for ROCm, else cubin) as cubin_raw, then run the base
+        # initializer. Raises RuntimeError if neither binary is in the kernel's assembly outputs.
         # pyrefly: ignore [missing-attribute]
         if "hsaco" in kernel.asm:
             # pyrefly: ignore [missing-attribute]
@@ -482,24 +563,33 @@ class StaticallyLaunchedCudaKernel(StaticallyLaunchedTritonKernel):
         super().__init__(kernel)
 
     def _current_device(self) -> int:
+        # [FUNCTION DOC] HELPER: Index of the current CUDA device.
         import torch
 
         return torch.cuda.current_device()
 
 
 class StaticallyLaunchedXpuKernel(StaticallyLaunchedTritonKernel):
+    # [CLASS DOC] Intel XPU implementation using the static XPU launcher; the loaded kernel is a single
+    # capsule object (no separate module handle) and the binary is the zebin.
     @cached_property
     def C_impl(self):
+        # [FUNCTION DOC] Cached property: the C++ static XPU launcher class.
         from torch._C import _StaticXpuLauncher
 
         return _StaticXpuLauncher
 
     def __init__(self, kernel: CompiledKernel) -> None:
+        # [FUNCTION DOC] Store the kernel's zebin (or none) as cubin_raw, then run the base initializer.
         # pyrefly: ignore [missing-attribute]
         self.cubin_raw = kernel.asm.get("zebin", None)
         super().__init__(kernel)
 
     def load_kernel(self, device: int) -> None:
+        # [FUNCTION DOC] XPU variant of loading: the launcher returns only a function capsule (plus register and
+        # spill counts). Device-agnostic mode loads once per device into the functions dict;
+        # otherwise loads once, sets module to none, and clears cubin path and raw bytes.
+        # Raises AssertionError if the cubin path is missing in single-device mode.
         # The XPU static launcher returns a PyCapsule for the loaded SYCL kernel,
         # not a separate module/function pair like the CUDA/HIP launcher.
         if self.device_agnostic:
@@ -527,11 +617,14 @@ class StaticallyLaunchedXpuKernel(StaticallyLaunchedTritonKernel):
         self.cubin_raw = None
 
     def _current_device(self) -> int:
+        # [FUNCTION DOC] HELPER: Index of the current XPU device.
         import torch
 
         return torch.xpu.current_device()
 
     def close(self) -> None:
+        # [FUNCTION DOC] Drop all references (module, function, per-device dicts) so capsule destructors
+        # release the kernel; no explicit unload call is made.
         self.module = None
         # Drop the PyCapsule references so their destructors can release sycl::kernel.
         self.function = None
@@ -542,6 +635,9 @@ class StaticallyLaunchedXpuKernel(StaticallyLaunchedTritonKernel):
 def statically_launched_kernel_by_device(
     kernel: CompiledKernel, device_type: str = "cuda"
 ) -> StaticallyLaunchedTritonKernel:
+    # [FUNCTION DOC] Factory: build the static launcher wrapper for a compiled kernel by device type
+    # (cuda or hip gives the CUDA class, xpu gives the XPU class).
+    # Raises NotImplementedError for other device types.
     if device_type in ("cuda", "hip"):
         return StaticallyLaunchedCudaKernel(kernel)
     elif device_type == "xpu":

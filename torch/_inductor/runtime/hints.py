@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Shared hint enums, size limits, and metadata types for Inductor's Triton/Halide
+# runtime: block-size maximums/defaults, ReductionHint/TileHint/HeuristicType/AutotuneHint enums,
+# DeviceProperties, TritonMeta/InductorMeta typed dicts, and Halide input/meta specs.
+# Import-time side effects: if the triton package is available it is imported, and an
+# AttrsDescriptorWrapper factory matching the installed Triton version is defined; otherwise a
+# namedtuple fallback with the same name is defined.
 from __future__ import annotations
 
 import collections
@@ -35,6 +41,9 @@ TRITON_DEFAULT_RSPLIT_SIZE = 1
 def native_matmul_block_numel(
     kwargs: typing.Mapping[str, int], r0_block: int | None = None
 ) -> int:
+    # [FUNCTION DOC] Number of elements in a native-matmul tile: product of XBLOCK, YBLOCK, ZBLOCK
+    # (each defaulting to 1 when missing) and the reduction block, which is r0_block if given,
+    # otherwise R0_BLOCK from kwargs (default 1).
     return (
         kwargs.get("XBLOCK", 1)
         * kwargs.get("YBLOCK", 1)
@@ -44,10 +53,14 @@ def native_matmul_block_numel(
 
 
 def native_matmul_persistent_rblock(r0_block: int) -> int:
+    # [FUNCTION DOC] Return the reduction block size raised to at least TRITON_DOT_MIN_BLOCK (16),
+    # the minimum Triton dot operand size.
     return max(r0_block, TRITON_DOT_MIN_BLOCK)
 
 
 class ReductionHint(Enum):
+    # [CLASS DOC] Enum describing the memory layout pattern of a reduction (INNER, OUTER,
+    # OUTER_TINY, DEFAULT) used by heuristics to choose block sizes.
     INNER = 0
     OUTER = 1
     OUTER_TINY = 2
@@ -55,6 +68,7 @@ class ReductionHint(Enum):
 
 
 class TileHint(Enum):
+    # [CLASS DOC] Enum hinting whether 2D tiling should be square (SQUARE) or the default policy.
     SQUARE = 0
     DEFAULT = 1
 
@@ -74,6 +88,10 @@ if has_triton_package():
             equal_to_1=None,
             pointer_range_32=None,
         ):
+            # [FUNCTION DOC] Build a Triton 3.2-style AttrsDescriptor from the divisibility-by-16 and
+            # equal-to-1 argument sets (pointer_range_32 is ignored). Returns the descriptor.
+            # Raises AssertionError if the resulting divisibility or equal_to property values
+            # are not 16 and 1 respectively.
             # Prepare the arguments for AttrsDescriptor
             kwargs = {
                 "tt.divisibility": divisible_by_16,
@@ -103,6 +121,8 @@ if has_triton_package():
             equal_to_1=None,
             pointer_range_32=None,
         ):
+            # [FUNCTION DOC] Build a Triton 3.0-style AttrsDescriptor directly from the divisible_by_16
+            # and equal_to_1 sets (pointer_range_32 is ignored). Returns the descriptor.
             # Prepare the arguments for AttrsDescriptor
             kwargs = {
                 "divisible_by_16": divisible_by_16,
@@ -123,6 +143,10 @@ if has_triton_package():
             equal_to_1=None,
             pointer_range_32=None,
         ):
+            # [FUNCTION DOC] Build a plain mapping from a one-element argument-index tuple to a list of
+            # attribute pairs: divisibility 16 for indices in divisible_by_16 and pointer range 32
+            # for indices in pointer_range_32 (both are merged when an index is in both).
+            # equal_to_1 is ignored. Returns the mapping.
             # pyrefly: ignore [not-iterable]
             # Build attr dict merging divisibility and pointer_range per arg index,
             # since a single arg can carry both attributes.
@@ -146,6 +170,8 @@ else:
 
 
 class HeuristicType(Enum):
+    # [CLASS DOC] Enum of kernel heuristic categories that select autotuning config generation:
+    # PERSISTENT_REDUCTION, POINTWISE, REDUCTION, SPLIT_SCAN, TEMPLATE, USER_AUTOTUNE, FIXED.
     PERSISTENT_REDUCTION = auto()
     POINTWISE = auto()
     REDUCTION = auto()
@@ -156,6 +182,9 @@ class HeuristicType(Enum):
 
 
 class AutotuneHint(Enum):
+    # [CLASS DOC] Enum of extra autotuning hints emitted by Triton codegen (currently only
+    # ONE_ELEMENT_PER_THREAD). The repr is overridden to the str form so that generated
+    # kernel source containing a set of hints is valid code.
     ONE_ELEMENT_PER_THREAD = 0
 
     # Triton codegen tries to codegen set of AutotuneHints.
@@ -166,6 +195,9 @@ class AutotuneHint(Enum):
 
 
 class DeviceProperties(typing.NamedTuple):
+    # [CLASS DOC] Immutable snapshot of device properties (type, index, multiprocessor count,
+    # compute capability, and optional major, registers per multiprocessor, thread limits,
+    # warp size) usable without importing torch. Built via the cached create() classmethod.
     """Copy device properties into a data structure not requiring torch to be imported"""
 
     type: str  # type: ignore[assignment]
@@ -180,6 +212,8 @@ class DeviceProperties(typing.NamedTuple):
 
     @property
     def warp_size_or_default(self) -> int:
+        # [FUNCTION DOC] Property: the reported warp size if set; otherwise 32 for non-cuda/hip devices.
+        # Raises RuntimeError if the device type is cuda or hip and warp_size is missing.
         if self.warp_size is not None:
             return self.warp_size
         if self.type in ("cuda", "hip"):
@@ -189,6 +223,11 @@ class DeviceProperties(typing.NamedTuple):
     @classmethod
     @functools.cache
     def create(cls, device) -> DeviceProperties:
+        # [FUNCTION DOC] Cached classmethod (results memoized per device argument): query the device
+        # interface for the device's properties and compute capability and build a DeviceProperties.
+        # A cuda device on a ROCm build is reported as type hip. If multi_processor_count is
+        # missing, xpu uses gpu_subslice_count and mtia uses 64; other devices re-raise AttributeError.
+        # max_threads_per_block defaults to 1024; other optional fields default to None.
         import torch
         from torch._dynamo.device_interface import get_interface_for_device
 
@@ -224,6 +263,8 @@ class DeviceProperties(typing.NamedTuple):
 
 
 def get_warp_size(device) -> int:
+    # [FUNCTION DOC] Return the warp/wave size for a device via the cached DeviceProperties.
+    # Raises RuntimeError for cuda/hip devices that do not report a warp size.
     """Return the wave/warp size in threads for the given device.
 
     Reads from torch.cuda.get_device_properties(device).warp_size via the cached
@@ -235,6 +276,8 @@ def get_warp_size(device) -> int:
 
 
 class TritonMeta(typing.TypedDict, total=False):
+    # [CLASS DOC] Typed dict (all keys optional) of metadata passed from Triton codegen to the runtime
+    # launcher: signature, device, constants, configs and launch/backend options.
     """Metadata bag threaded from Triton codegen into the runtime launcher.
 
     total=False because the key set is populated incrementally across codegen
@@ -265,6 +308,9 @@ class TritonMeta(typing.TypedDict, total=False):
 
 
 class InductorMeta(typing.TypedDict, total=False):
+    # [CLASS DOC] Typed dict (all keys optional) of kernel config and heuristics metadata: global config
+    # snapshot, per-kernel stats, kernel identity, and runtime-injected entries. Consumers read
+    # it with defaults.
     """The inductor kernel-config / heuristics metadata bag.
 
     Produced on the codegen side (TritonKernel.inductor_meta_common /
@@ -357,6 +403,8 @@ class InductorMeta(typing.TypedDict, total=False):
 
 
 class HalideInputSpec(typing.NamedTuple):
+    # [CLASS DOC] Describes one Halide kernel argument: C type string, name, and for buffers the
+    # shape/stride expressions, offset and alias target. A spec with no shape is a scalar.
     ctype: str
     name: str
     shape: list[str] | None = None
@@ -365,11 +413,16 @@ class HalideInputSpec(typing.NamedTuple):
     alias_of: str | None = None
 
     def bindings_type(self) -> str:
+        # [FUNCTION DOC] C type for the bindings layer: half and bfloat16 pointers become 16-bit
+        # unsigned integer pointers (half is not defined there); other types are unchanged.
         if self.ctype in ("at::Half*", "at::BFloat16*"):
             return "uint16_t*"  # half not defined
         return self.ctype
 
     def halide_type(self) -> str:
+        # [FUNCTION DOC] C++ expression text for the Halide element type: explicit 16-bit float or
+        # bfloat type for half/bfloat16 pointers, otherwise the type-of form of the C type
+        # with pointer markers removed.
         if self.ctype == "at::Half*":
             return "halide_type_t(halide_type_float, 16)"  # half not defined
         if self.ctype == "at::BFloat16*":
@@ -377,13 +430,17 @@ class HalideInputSpec(typing.NamedTuple):
         return f"halide_type_of<{self.ctype.replace('*', '')}>()"
 
     def is_scalar(self) -> bool:
+        # [FUNCTION DOC] True when no shape is given (scalar argument).
         return self.shape is None
 
     def is_buffer(self) -> bool:
+        # [FUNCTION DOC] True when a shape is given (buffer argument).
         return self.shape is not None
 
 
 class HalideMeta(typing.NamedTuple):
+    # [CLASS DOC] Metadata for compiling a Halide kernel: argument specs, target string, optional
+    # autoscheduler name and flags, and optional CUDA device index.
     argtypes: list[HalideInputSpec]
     target: str
     scheduler: str | None = None
@@ -391,6 +448,9 @@ class HalideMeta(typing.NamedTuple):
     cuda_device: int | None = None
 
     def args(self) -> list[str]:
+        # [FUNCTION DOC] Build generator command-line arguments: target, optional autoscheduler, and
+        # one autoscheduler.<flag>=<value> entry per scheduler flag.
+        # Raises AssertionError if flags are given without a scheduler.
         """Command line args to pass to halide generator"""
         args = [f"target={self.target}"]
         if self.scheduler:
@@ -403,4 +463,5 @@ class HalideMeta(typing.NamedTuple):
         return args
 
     def is_cuda(self) -> bool:
+        # [FUNCTION DOC] True when a CUDA device index is set.
         return self.cuda_device is not None
