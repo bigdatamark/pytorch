@@ -1,3 +1,6 @@
+# [MODULE DOC] CI smoke script for a two-layer RNN on CPU only (Windows ARM64 variant).
+# Runs at import time (no main guard): builds the RNN and random input and initial hidden
+# state, then runs one forward pass. Failures raise an uncaught exception. Prints nothing.
 r"""
 It's used to check basic rnn features with cpu-only.
 For example, it would throw exception if missing some components are missing

@@ -1,3 +1,6 @@
+# [MODULE DOC] HELPER: Utilities shared by the Windows CD scripts: shell quoting, writing an
+# env file of export lines for a parent bash to source (with PATH converted to POSIX form via
+# cygpath), and a retrying file download. Import-time effect: compiles one regex only.
 """Helpers shared between the Windows CD Python scripts.
 
 build_env_setup.py and build_install_deps.py both hand env back to a
@@ -25,12 +28,18 @@ _BASH_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def shell_quote(value: str) -> str:
+    # [FUNCTION DOC] HELPER: Returns the string unchanged if it is non-empty and made only of
+    # letters, digits and a few safe punctuation characters; otherwise wraps it in single
+    # quotes, escaping embedded single quotes, so bash reads it back verbatim. Pure function.
     if value and all(c.isalnum() or c in "_-./:=" for c in value):
         return value
     return "'" + value.replace("'", "'\\''") + "'"
 
 
 def _to_posix_path_list(windows_path_list: str) -> str:
+    # [FUNCTION DOC] HELPER: Converts a semicolon-separated Windows path list to a
+    # colon-separated POSIX list by running the cygpath tool once. Empty input is returned
+    # as is. Raises CalledProcessError if cygpath fails (or OSError if it is missing).
     """Convert a Windows `;`-separated path list to POSIX `:`-separated.
 
     vcvarsall.bat (and other cmd-side env-setup scripts) write PATH in
@@ -55,6 +64,10 @@ def _to_posix_path_list(windows_path_list: str) -> str:
 
 
 def write_env_exports(env: dict[str, str], path: Path | None) -> None:
+    # [FUNCTION DOC] Writes one export line per environment entry to the file at path, for
+    # a bash script to source. Does nothing if path is None. Entries whose names are not
+    # valid bash identifiers are skipped; a PATH value containing a semicolon is converted
+    # to POSIX form first; values are shell-quoted. Overwrites the file (side effect).
     """Write `export KEY=VALUE` lines for build.sh to source.
 
     PATH is converted from Windows-format (`;`-separated, backslashes)
@@ -87,6 +100,10 @@ def write_env_exports(env: dict[str, str], path: Path | None) -> None:
 
 
 def download(url: str, dest: Path, attempts: int = 5) -> None:
+    # [FUNCTION DOC] Streams the url to the file dest in 1 MiB chunks, printing progress.
+    # On any exception it sleeps with exponentially growing delay and retries, up to
+    # attempts tries; after the last failure it exits the process with an error message.
+    # Overwrites dest. Returns nothing.
     """Stream `url` to `dest`, retrying with exponential backoff."""
     for attempt in range(1, attempts + 1):
         try:

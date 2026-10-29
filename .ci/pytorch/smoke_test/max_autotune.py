@@ -1,3 +1,7 @@
+# [MODULE DOC] Smoke test script adapted from the PyTorch MNIST example: trains and evaluates
+# a small CNN on MNIST (downloaded to a data directory) with the model compiled in
+# max-autotune mode, printing CUDA-event timings per epoch. Requires torchvision and a CUDA
+# device for timing. Import-time: only imports.
 import argparse
 
 from torchvision import datasets, transforms
@@ -10,7 +14,11 @@ from torch.optim.lr_scheduler import StepLR
 
 
 class Net(nn.Module):
+    # [CLASS DOC] HELPER: MNIST classifier. State: two convolution layers, two dropout layers
+    # and two linear layers (flattened size 9216 assumes 28x28 single-channel input). Output
+    # is per-class log probabilities for 10 classes.
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Creates the layers; takes no arguments.
         super(Net, self).__init__()  # noqa: UP008
         self.conv1 = nn.Conv2d(1, 32, 3, 1)
         self.conv2 = nn.Conv2d(32, 64, 3, 1)
@@ -20,6 +28,9 @@ class Net(nn.Module):
         self.fc2 = nn.Linear(128, 10)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Runs two convolutions with relu, max pooling, dropout,
+        # flatten, two linear layers and a log softmax. Input: batch of 1x28x28 images;
+        # returns a batch of 10 log probabilities.
         x = self.conv1(x)
         x = F.relu(x)
         x = self.conv2(x)
@@ -36,6 +47,10 @@ class Net(nn.Module):
 
 
 def train(args, model, device, train_loader, optimizer, epoch):
+    # [FUNCTION DOC] HELPER: Runs one training epoch over the loader: forward, negative
+    # log-likelihood loss, backward and optimizer step per batch, printing progress every
+    # log-interval batches; with the dry-run option it stops after the first logged batch.
+    # Mutates model parameters; returns nothing.
     model.train()
     for batch_idx, (data, target) in enumerate(train_loader):
         data, target = data.to(device), target.to(device)
@@ -55,6 +70,8 @@ def train(args, model, device, train_loader, optimizer, epoch):
 
 
 def test(model, device, test_loader):
+    # [FUNCTION DOC] HELPER: Evaluates the model without gradients over the loader and prints
+    # average loss and accuracy. Returns nothing.
     model.eval()
     test_loss = 0
     correct = 0
@@ -80,6 +97,8 @@ def test(model, device, test_loader):
 
 
 def timed(fn):
+    # [FUNCTION DOC] HELPER: Calls fn with no arguments between two CUDA timing events,
+    # synchronizes, and returns (fn result, elapsed seconds). Requires CUDA.
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
@@ -90,6 +109,11 @@ def timed(fn):
 
 
 def main():
+    # [FUNCTION DOC] Entry point. Parses training options, picks CUDA, MPS or CPU, enables
+    # TF32 matmul, builds MNIST loaders (downloads data), compiles the model with
+    # max-autotune, trains and evaluates for the requested epochs printing timings, steps
+    # a learning-rate scheduler, and optionally saves the weights to a file.
+    # KNOWN ISSUE: the epochs option defaults to 4 but its help text says 14.
     # Training settings
     parser = argparse.ArgumentParser(description="PyTorch MNIST Example")
     parser.add_argument(

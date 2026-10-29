@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Windows wheel-build step: a command-line wrapper that invokes the python
+# build frontend to produce a wheel into a given output directory. Environment setup is
+# done by sibling scripts. No import-time side effects.
 """Build a PyTorch wheel on Windows.
 
 Expects vcvarsall env (PATH/LIB/INCLUDE), GPU env (USE_CUDA, CUDA_PATH,
@@ -23,6 +26,10 @@ from pathlib import Path
 
 
 def main() -> None:
+    # [FUNCTION DOC] Parses one positional argument, the output directory, creates it
+    # (with parents) if missing, then runs the build module in a subprocess to build a
+    # wheel without build isolation into that directory. Raises CalledProcessError if the
+    # build fails. No return value.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output_dir", type=Path)
     args = parser.parse_args()

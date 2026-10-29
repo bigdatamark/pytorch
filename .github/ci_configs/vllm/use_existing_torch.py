@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# [MODULE DOC] Script run inside a vLLM checkout that edits the requirements files and
+# pyproject.toml in place, deleting lines that pin torch, torchvision or torchaudio so the
+# already installed torch build is used. Matches whole package names, or optionally only
+# known line prefixes. No import-time side effects beyond compiling a regex.
 
 import argparse
 import glob
@@ -29,6 +33,11 @@ _TORCH_PKG_RE = re.compile(
 
 
 def main(argv):
+    # [FUNCTION DOC] Parses the optional prefix-only flag from argv, then for each
+    # requirements text/in file under the current directory plus pyproject.toml that exists
+    # and mentions torch, rewrites it without the torch-family requirement lines, printing
+    # each removed line. In prefix mode only lines beginning with a known prefix are
+    # removed; otherwise a regex on the package name is used. Mutates files; returns None.
     parser = argparse.ArgumentParser(
         description="Strip torch lib requirements to use installed version."
     )

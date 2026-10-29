@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# [MODULE DOC] CI script that finds documentation source files moved or deleted relative to
+# a base git ref and checks that docs/source/redirects.py has redirect entries for them.
+# Reports missing ones, and with the auto-fix option appends entries for moved files to that
+# file; exits nonzero if redirects are missing or deleted files need manual handling.
+# No import-time side effects.
 """
 Check for moved/deleted doc files and optionally auto-update redirects.py.
 
@@ -24,12 +29,17 @@ from pathlib import Path
 
 
 def run_git(args: list[str]) -> str:
+    # [FUNCTION DOC] HELPER: Runs git with the given arguments and returns stripped standard
+    # output. The exit status is ignored, so failures yield empty or partial output.
     """Run a git command and return stdout."""
     result = subprocess.run(["git"] + args, capture_output=True, text=True)
     return result.stdout.strip()
 
 
 def get_doc_changes(base_ref: str) -> list[tuple[str, str, str | None]]:
+    # [FUNCTION DOC] Runs a git name-status diff with rename detection between the base ref
+    # and HEAD limited to rst and md files directly under docs/source, and returns the
+    # renames and deletions as (status, old path, new path or None) tuples.
     """
     Get moved/deleted doc files between base_ref and HEAD.
 
@@ -67,6 +77,8 @@ def get_doc_changes(base_ref: str) -> list[tuple[str, str, str | None]]:
 
 
 def path_to_key(path: str) -> str:
+    # [FUNCTION DOC] HELPER: Converts a docs source path to its redirect key by removing the
+    # docs/source prefix and the rst or md extension. Pure function.
     """
     Convert a file path to a redirect key.
 
@@ -77,6 +89,8 @@ def path_to_key(path: str) -> str:
 
 
 def path_to_url(path: str) -> str:
+    # [FUNCTION DOC] HELPER: Converts a docs source path to the relative HTML page address by
+    # removing the docs/source prefix and replacing the rst or md extension with html.
     """
     Convert a file path to an HTML URL for redirects.
 
@@ -86,6 +100,10 @@ def path_to_url(path: str) -> str:
 
 
 def parse_existing_redirects(redirects_file: Path) -> dict[str, str]:
+    # [FUNCTION DOC] Parses the redirects file as syntax tree (without executing it), finds
+    # the assignment to the name redirects whose value is a dictionary literal and returns
+    # the entries whose key and value are both constants. Returns an empty mapping if no such
+    # assignment exists. Raises OSError or SyntaxError if the file cannot be read or parsed.
     """
     Parse redirects.py and return the existing redirects dictionary.
 
@@ -112,6 +130,9 @@ def find_missing_redirects(
     changes: list[tuple[str, str, str | None]],
     existing: dict[str, str],
 ) -> list[tuple[str, str | None]]:
+    # [FUNCTION DOC] For each change, computes the old path's redirect key and, if it is not
+    # already in the existing mapping, records (key, new page address or None for deletions).
+    # Returns the list of missing entries in input order. Pure function.
     """
     Find file changes that don't have corresponding redirects.
 
@@ -130,6 +151,10 @@ def find_missing_redirects(
 def update_redirects_file(
     redirects_file: Path, new_entries: list[tuple[str, str]]
 ) -> None:
+    # [FUNCTION DOC] Rewrites the redirects file in place, inserting a comment line and one
+    # line per (key, address) entry just before the last line that consists only of a
+    # closing brace. Prints a confirmation. Exits the process with status 1 if no such line
+    # exists. Entries are written as double-quoted strings without escaping.
     """
     Add new redirect entries to redirects.py.
 
@@ -162,6 +187,11 @@ def update_redirects_file(
 
 
 def main() -> None:
+    # [FUNCTION DOC] Command-line entry point with options for base ref, redirects file path
+    # and auto-fix. Exits 1 if the redirects file is missing. Returns normally if there are
+    # no moved or deleted docs or all have redirects. In auto-fix mode it appends entries for
+    # moves (exiting 1 if deletions still need manual entries); otherwise it prints a report
+    # with suggested additions and exits 1.
     parser = argparse.ArgumentParser(
         description="Check for missing doc redirects and optionally auto-fix"
     )

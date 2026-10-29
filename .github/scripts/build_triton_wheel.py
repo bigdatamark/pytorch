@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Script that builds a Triton wheel for CI: clones the Triton (or Intel XPU
+# backend) repository, checks out a release branch or pinned commit, rewrites the package
+# version, builds a wheel with setup.py and copies it into the current directory. Reads pin
+# and version files under .ci/docker. Import-time: only computes script and repo paths.
 
 from __future__ import annotations
 
@@ -15,6 +19,9 @@ REPO_DIR = SCRIPT_DIR.parent.parent
 
 
 def read_triton_pin(device: str = "cuda") -> str:
+    # [FUNCTION DOC] Returns the stripped contents of the pinned Triton commit file in the
+    # docker commit-pins directory: the XPU file for device xpu, otherwise the default one.
+    # Raises OSError if the file is missing.
     triton_file = "triton.txt"
     if device == "xpu":
         triton_file = "triton-xpu.txt"
@@ -23,6 +30,9 @@ def read_triton_pin(device: str = "cuda") -> str:
 
 
 def read_triton_version(device: str = "cuda") -> str:
+    # [FUNCTION DOC] Returns the stripped Triton version string from the docker directory
+    # (XPU-specific file for device xpu, otherwise the default one). Raises OSError if the
+    # file is missing.
     triton_version_file = "triton_version.txt"
     if device == "xpu":
         triton_version_file = "triton_xpu_version.txt"
@@ -31,6 +41,9 @@ def read_triton_version(device: str = "cuda") -> str:
 
 
 def check_and_replace(inp: str, src: str, dst: str) -> str:
+    # [FUNCTION DOC] HELPER: Returns inp with every occurrence of src replaced by dst.
+    # Raises RuntimeError if src does not occur in inp.
+    # KNOWN ISSUE: the error message has a stray dollar sign before the searched text.
     """Checks that `src` can be found in `input` and replaces it with `dst`"""
     if src not in inp:
         raise RuntimeError(f"Can't find ${src} in the input")
@@ -40,6 +53,11 @@ def check_and_replace(inp: str, src: str, dst: str) -> str:
 def patch_init_py(
     path: Path, *, version: str, expected_version: str | None = None
 ) -> None:
+    # [FUNCTION DOC] HELPER: Rewrites the version assignment in the given Triton package
+    # init file in place, replacing the expected old version with the new version. Raises
+    # RuntimeError if the old assignment is not found.
+    # KNOWN ISSUE: when expected_version is not given it is read for the default cuda
+    # device, not for the device actually being built.
     if not expected_version:
         expected_version = read_triton_version()
     with open(path) as f:
@@ -61,6 +79,13 @@ def build_triton(
     release: bool = False,
     with_clang_ldd: bool = False,
 ) -> Path:
+    # [FUNCTION DOC] Builds a Triton wheel and returns its path in the current directory.
+    # Sets build job count from MAX_JOBS or the usable CPU count (and XPU link jobs), clones
+    # the device-specific repo into a temporary directory, checks out the release branch
+    # (release mode) or the given commit, sets wheel-name environment variables, patches the
+    # version, runs ROCm packaging when device is rocm, builds with setup.py and copies the
+    # wheel to the current directory (ROCm wheels are then patched). Subprocess failures raise
+    # CalledProcessError. KNOWN ISSUE: the py_version argument is never used.
     env = os.environ.copy()
     # Default to the CPUs available to this process: os.sched_getaffinity respects
     # cgroup/cpuset limits (e.g. inside an OSDC container), unlike os.cpu_count()
@@ -150,6 +175,11 @@ def build_triton(
 
 
 def main() -> None:
+    # [FUNCTION DOC] Command-line entry point. Parses release, device, commit hash, version
+    # and clang-lld options, defaults the version and commit from the pin files, and calls
+    # the wheel build. The wheel path result is discarded.
+    # KNOWN ISSUE: the device choice aarch64 is accepted but read_triton_pin/version and the
+    # build treat it like cuda; the clang flag name is spelled ldd rather than lld.
     from argparse import ArgumentParser
 
     parser = ArgumentParser("Build Triton binaries")

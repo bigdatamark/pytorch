@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# [MODULE DOC] CI script that cherry picks an already merged PR onto a release branch: creates
+# a local branch, runs git cherry-pick, pushes it, opens a PR against the release branch,
+# and comments on the original PR and on matching release tracker issues. Failures are
+# reported as a PR comment unless in dry-run mode. Imports sibling CI helper modules.
 
 from __future__ import annotations
 
@@ -23,6 +27,9 @@ RELEASE_BRANCH_REGEX = re.compile(r"release/(?P<version>.+)")
 
 
 def parse_args() -> Any:
+    # [FUNCTION DOC] HELPER: Parses command-line options (target release branch, acting user,
+    # classification category, PR number, optional fixed issue, dry-run flag) and returns the
+    # namespace. Invalid usage makes the parser exit.
     from argparse import ArgumentParser
 
     parser = ArgumentParser("cherry pick a landed PR onto a release branch")
@@ -51,6 +58,10 @@ def parse_args() -> Any:
 
 
 def get_merge_commit_sha(repo: GitRepo, pr: GitHubPR) -> str | None:
+    # [FUNCTION DOC] Returns the commit hash recorded for the PR if the PR is closed,
+    # otherwise None (unmerged PRs are refused by the caller).
+    # KNOWN ISSUE: it tests only that the PR is closed, which is also true for PRs closed
+    # without merging.
     """
     Return the merge commit SHA iff the PR has been merged. For simplicity, we
     will only cherry pick PRs that have been merged into main
@@ -60,6 +71,9 @@ def get_merge_commit_sha(repo: GitRepo, pr: GitHubPR) -> str | None:
 
 
 def get_release_version(onto_branch: str) -> str | None:
+    # [FUNCTION DOC] HELPER: Returns the version part of a branch named like release/VERSION,
+    # or an empty string if the branch name does not match.
+    # KNOWN ISSUE: the return annotation allows None, but the code returns an empty string.
     """
     Return the release version if the target branch is a release branch
     """
@@ -70,6 +84,9 @@ def get_release_version(onto_branch: str) -> str | None:
 def get_tracker_issues(
     org: str, project: str, onto_branch: str
 ) -> list[dict[str, Any]]:
+    # [FUNCTION DOC] Returns the open-tracker issues (labelled release tracker) whose title
+    # contains the release version of the target branch. Returns an empty list if the branch
+    # is not a release branch or no tracker issues exist. Queries the GitHub API.
     """
     Find the tracker issue from the repo. The tracker issue needs to have the title
     like [VERSION] Release Tracker following the convention on PyTorch
@@ -96,6 +113,11 @@ def cherry_pick(
     fixes: str,
     dry_run: bool = False,
 ) -> None:
+    # [FUNCTION DOC] Cherry picks the commit onto a new branch off the release branch and
+    # pushes it, opens the release PR (skipped in dry-run), comments on each matching tracker
+    # issue, then comments on the original PR with the result and recommendations. Always
+    # checks the originally checked-out branch back out afterwards. Errors from git or the
+    # GitHub API propagate.
     """
     Create a local branch to cherry pick the commit and submit it as a pull request
     """
@@ -157,6 +179,10 @@ def cherry_pick(
 def create_cherry_pick_branch(
     github_actor: str, repo: GitRepo, pr: GitHubPR, commit_sha: str, onto_branch: str
 ) -> str:
+    # [FUNCTION DOC] Checks out the release branch, updates submodules, creates a branch named
+    # from the PR number and sanitized actor name, applies the commit with cherry-pick -x (no
+    # conflict resolution) and pushes the branch for real, even in dry-run. Returns the branch
+    # name; git failures raise.
     """
     Create a local branch and cherry pick the commit. Return the name of the local
     cherry picking branch.
@@ -184,6 +210,10 @@ def submit_pr(
     cherry_pick_branch: str,
     onto_branch: str,
 ) -> str:
+    # [FUNCTION DOC] Creates a pull request from the cherry-pick branch to the release branch
+    # through the GitHub API, reusing the original PR title and body (or a default message),
+    # and returns its web address. Raises RuntimeError on an HTTP error or a response with no
+    # address.
     """
     Submit the cherry pick PR and return the link to the PR
     """
@@ -223,6 +253,9 @@ def submit_pr(
 def post_pr_comment(
     org: str, project: str, pr_num: int, msg: str, dry_run: bool = False
 ) -> list[dict[str, Any]]:
+    # [FUNCTION DOC] Posts a comment titled with the PR number and containing msg on the PR;
+    # when the GH_RUN_URL environment variable is set, appends a collapsible block linking to
+    # the workflow run. Returns the API result; in dry-run mode the helper only prints.
     """
     Post a comment on the PR itself to point to the cherry picking PR when success
     or print the error when failure
@@ -258,6 +291,11 @@ def post_tracker_issue_comment(
     fixes: str,
     dry_run: bool = False,
 ) -> list[dict[str, Any]]:
+    # [FUNCTION DOC] Posts a comment on a tracker issue listing the original PR link, the
+    # release branch PR and the criteria category (classification and fixes text joined).
+    # Returns the API result.
+    # KNOWN ISSUE: the declared return type is a list but the caller treats the result as a
+    # mapping; with an empty fixes value the category line ends with a dangling separator.
     """
     Post a comment on the tracker issue (if any) to record the cherry pick
     """
@@ -277,6 +315,9 @@ def post_tracker_issue_comment(
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point. Parses arguments, locates the git repo and the PR, requires
+    # the PR to be merged (else raises RuntimeError internally), and runs the cherry pick.
+    # On RuntimeError, posts the error as a PR comment, or re-raises it in dry-run mode.
     args = parse_args()
     pr_num = args.pr_num
 

@@ -1,3 +1,9 @@
+# [MODULE DOC] Smoke tests run against an installed PyTorch binary wheel in CI. Checks the
+# torch (and optionally torchvision/torchaudio) versions against the release matrix or the
+# nightly date, CUDA/cuDNN/NCCL versions and GPU init, conv2d, linalg, SDPA, torch.compile,
+# NVSHMEM, and runs the companion libraries' own smoke tests. Import-time side effects: reads
+# MATRIX_* / GPU_ARCH_VERSION / TARGET_OS environment variables into module globals, defines
+# the MODULES table and imports torch. The main block runs everything; failures raise errors.
 from __future__ import annotations
 
 import argparse
@@ -51,6 +57,8 @@ MODULES = [
 
 
 def get_modules_for_package(package: str) -> list:
+    # [FUNCTION DOC] HELPER: Returns the companion module descriptors to test for a package
+    # selector: all of them for all, only torchvision for torch_torchvision, else an empty list.
     if package == "all":
         return MODULES
     elif package == "torch_torchvision":
@@ -60,13 +68,19 @@ def get_modules_for_package(package: str) -> list:
 
 
 class Net(nn.Module):
+    # [CLASS DOC] HELPER: Small CNN used as the model for the max-autotune compile smoke test.
+    # State: two convolutions and one linear layer mapping 28x28 single-channel input to one
+    # value per sample.
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Creates the two convolution layers and the linear layer.
         super().__init__()
         self.conv1 = nn.Conv2d(1, 32, 3, 1)
         self.conv2 = nn.Conv2d(32, 64, 3, 1)
         self.fc1 = nn.Linear(9216, 1)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies both convolutions, max pooling, flatten and the
+        # linear layer; returns a tensor with one column. Expects a batch of 1x28x28 inputs.
         x = self.conv1(x)
         x = self.conv2(x)
         x = F.max_pool2d(x, 2)
@@ -76,6 +90,8 @@ class Net(nn.Module):
 
 
 def load_json_from_basedir(filename: str):
+    # [FUNCTION DOC] HELPER: Reads and parses a JSON file located under the base directory
+    # (the .ci directory's parent). Raises ImportError if the file is missing or invalid.
     try:
         with open(BASE_DIR / filename) as fptr:
             return json.load(fptr)
@@ -86,10 +102,14 @@ def load_json_from_basedir(filename: str):
 
 
 def read_release_matrix():
+    # [FUNCTION DOC] HELPER: Returns the parsed release matrix JSON (expected versions by
+    # package name).
     return load_json_from_basedir("release_matrix.json")
 
 
 def test_numpy():
+    # [FUNCTION DOC] Checks that a numpy array converts to a torch tensor. If numpy is not
+    # installed it prints a skip message instead of failing.
     try:
         import numpy as np
 
@@ -100,6 +120,12 @@ def test_numpy():
 
 
 def check_version(package: str) -> None:
+    # [FUNCTION DOC] Validates installed versions. The expected stable version comes from the
+    # release matrix when RELEASE_VERSION is set, else from MATRIX_STABLE_VERSION. For the
+    # nightly channel it delegates to the date check. Otherwise requires torch's version to
+    # start with the expected one and, with a release version, the same for torchvision and
+    # torchaudio as selected by package. Raises RuntimeError on mismatch; prints a skip
+    # message if no expected version is known.
     release_version = os.getenv("RELEASE_VERSION")
     # if release_version is specified, use it to validate the packages
     if release_version:
@@ -137,6 +163,10 @@ def check_version(package: str) -> None:
 
 
 def check_nightly_binaries_date(package: str) -> None:
+    # [FUNCTION DOC] Parses the dev date stamp from the torch version (and from companion
+    # module versions when selected) and raises RuntimeError if a binary is too old.
+    # KNOWN ISSUE: the age limit is applied inconsistently: torch fails at three or more days
+    # old, while the companion modules fail only above three days.
     from datetime import datetime
 
     format_dt = "%Y%m%d"
@@ -164,6 +194,9 @@ def check_nightly_binaries_date(package: str) -> None:
 
 
 def test_cuda_runtime_errors_captured() -> None:
+    # [FUNCTION DOC] Triggers a device-side assertion with a zero tensor on the GPU and
+    # requires that a RuntimeError mentioning CUDA is raised. Re-raises other RuntimeErrors;
+    # raises RuntimeError if no error occurs. Leaves the CUDA context in an error state.
     cuda_exception_missed = True
     try:
         print("Testing test_cuda_runtime_errors_captured")
@@ -180,6 +213,10 @@ def test_cuda_runtime_errors_captured() -> None:
 
 
 def test_cuda_gds_errors_captured() -> None:
+    # [FUNCTION DOC] Skips on Windows and CUDA older than 12.6. Otherwise tries to open a
+    # temporary file through the GPUDirect Storage wrapper and expects a RuntimeError saying
+    # the file handle registration failed; on CUDA 13.2 and newer, successful registration
+    # (compatibility mode) is the expected outcome. Raises RuntimeError on unexpected results.
     major_version = int(torch.version.cuda.split(".")[0])
     minor_version = int(torch.version.cuda.split(".")[1])
 
@@ -215,6 +252,8 @@ def test_cuda_gds_errors_captured() -> None:
 
 
 def find_pypi_package_version(package: str) -> str | None:
+    # [FUNCTION DOC] HELPER: Returns the version of the first installed distribution whose
+    # name starts with the given prefix, or None if there is none.
     from importlib import metadata
 
     dists = metadata.distributions()
@@ -225,6 +264,9 @@ def find_pypi_package_version(package: str) -> str | None:
 
 
 def get_expected_cudnn_version_linux(cuda_version: str) -> str | None:
+    # [FUNCTION DOC] HELPER: Reads the binary build matrix script in the repo and returns the
+    # major.minor.patch cuDNN version pinned for the given CUDA version, using a regular
+    # expression. Returns None (with a warning) if the file or entry is missing.
     """Parse expected cuDNN version from generate_binary_build_matrix.py for Linux.
 
     Reads PYTORCH_EXTRA_INSTALL_REQUIREMENTS and extracts the cudnn version
@@ -251,6 +293,9 @@ def get_expected_cudnn_version_linux(cuda_version: str) -> str | None:
 
 
 def get_expected_cudnn_version_windows(cuda_version: str) -> str | None:
+    # [FUNCTION DOC] HELPER: Reads the Windows CUDA install batch file and returns the
+    # expected cuDNN version in the block for the given CUDA version (dots removed), via a
+    # regular expression. Returns None (with a warning) if the file or entry is missing.
     """Parse expected cuDNN version from cuda_install.bat for Windows.
 
     Reads the batch file and extracts EXPECTED_CUDNN_VERSION for the given
@@ -278,6 +323,9 @@ def get_expected_cudnn_version_windows(cuda_version: str) -> str | None:
 
 
 def check_cudnn_version(cuda_version: str, actual_cudnn_version: str) -> None:
+    # [FUNCTION DOC] Looks up the expected cuDNN version for the platform (Linux or Windows)
+    # and requires the loaded version string to start with it. Raises RuntimeError on
+    # mismatch; prints and returns on unsupported platforms or when no expectation is found.
     """Validate cuDNN version matches expected version from build config files."""
     if sys.platform in ["linux", "linux2"]:
         expected = get_expected_cudnn_version_linux(cuda_version)
@@ -308,6 +356,8 @@ def check_cudnn_version(cuda_version: str, actual_cudnn_version: str) -> None:
 
 
 def cudnn_to_version_str(cudnn_version: int) -> str:
+    # [FUNCTION DOC] HELPER: Converts the integer cuDNN version code into a dotted
+    # major.minor.patch string by digit grouping. Pure function.
     patch = int(cudnn_version % 10)
     minor = int((cudnn_version / 100) % 100)
     major = int((cudnn_version / 10000) % 10000)
@@ -317,6 +367,9 @@ def cudnn_to_version_str(cudnn_version: int) -> str:
 def compare_pypi_to_torch_versions(
     package: str, pypi_version: str, torch_version: str
 ) -> None:
+    # [FUNCTION DOC] Requires the package version installed from PyPI to start with the
+    # version torch reports for the same library. Raises RuntimeError if the PyPI version is
+    # missing (None) or does not match; otherwise prints a confirmation.
     if pypi_version is None:
         raise RuntimeError(f"Can't find {package} in PyPI for Torch: {torch_version}")
     if pypi_version.startswith(torch_version):
@@ -333,6 +386,13 @@ def smoke_test_cuda(
     torch_compile_check: str,
     pypi_pkg_check: str,
 ) -> None:
+    # [FUNCTION DOC] Main CUDA and compile checks. Raises if a CUDA build is expected but CUDA
+    # is not available; prints companion libraries' CUDA versions; runs the compile smoke test
+    # when enabled on supported OS and Python versions; and when CUDA is available checks the
+    # CUDA version against the expected one, initializes CUDA, lists devices, compares cuDNN
+    # runtime and compile versions and the build-config version, prints the NCCL version on
+    # Linux, compares PyPI cuDNN/NCCL versions if enabled, and optionally tests that CUDA
+    # runtime errors are captured. Raises RuntimeError on any mismatch.
     if not torch.cuda.is_available() and is_cuda_system:
         raise RuntimeError(f"Expected CUDA {gpu_arch_ver}. However CUDA is not loaded.")
 
@@ -412,6 +472,10 @@ def smoke_test_cuda(
 
 
 def smoke_test_conv2d() -> None:
+    # [FUNCTION DOC] Builds several Conv2d layers and runs one on random CPU input; on CUDA
+    # systems also runs a layer under autocast and repeats the convolution for half, single
+    # and double precision. Raises AssertionError if an output is None.
+    # KNOWN ISSUE: the first Conv2d is immediately overwritten and never used.
     import torch.nn as nn
 
     print("Testing smoke_test_conv2d")
@@ -448,6 +512,9 @@ def smoke_test_conv2d() -> None:
 
 
 def test_linalg(device="cpu") -> None:
+    # [FUNCTION DOC] Runs singular value decompositions (reduced, full and batched) on random
+    # matrices on the given device and checks the output shapes, raising AssertionError on a
+    # mismatch; on cuda also runs a batched decomposition for single and double precision.
     print(f"Testing smoke_test_linalg on {device}")
     A = torch.randn(5, 3, device=device)
     U, S, Vh = torch.linalg.svd(A, full_matrices=False)
@@ -485,6 +552,8 @@ def test_linalg(device="cpu") -> None:
 
 
 def test_sdpa(device="cpu", dtype=torch.float16) -> None:
+    # [FUNCTION DOC] Runs scaled dot product attention with random inputs and a random
+    # additive mask on the device and dtype, and raises AssertionError if the output has NaN.
     """Regression test for https://github.com/pytorch/pytorch/issues/167602
     Without nvrtc_builtins on CuDNN-9.13 on CUDA-13 fails with ` No valid execution plans built.`
     """
@@ -497,9 +566,14 @@ def test_sdpa(device="cpu", dtype=torch.float16) -> None:
 
 
 def smoke_test_compile(device: str = "cpu") -> None:
+    # [FUNCTION DOC] Compiles a small sin-plus-cos function for three float dtypes and checks
+    # it matches eager results; on cpu requires a vectorized instruction set to be detected
+    # (RuntimeError otherwise). Then resets the compiler state, sets high matmul precision
+    # (global side effect) and compiles the Net model with max-autotune on random input.
     supported_dtypes = [torch.float16, torch.float32, torch.float64]
 
     def foo(x: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Returns the elementwise sine plus cosine of x.
         return torch.sin(x) + torch.cos(x)
 
     for dtype in supported_dtypes:
@@ -529,6 +603,9 @@ def smoke_test_compile(device: str = "cpu") -> None:
 
 
 def smoke_test_nvshmem() -> None:
+    # [FUNCTION DOC] Skips without CUDA or on Windows. Otherwise checks that the build exposes
+    # NVSHMEM support: absence is tolerated for torch older than 2.9 and raises RuntimeError
+    # for newer versions. Prints whether NVSHMEM is available at run time.
     if not torch.cuda.is_available() or target_os == "windows":
         print("Windows platform or CUDA is not available, skipping NVSHMEM test")
         return
@@ -554,6 +631,10 @@ def smoke_test_nvshmem() -> None:
 
 
 def smoke_test_modules(package: str):
+    # [FUNCTION DOC] For each companion module of the package selector, clones its repository
+    # (shallow) into the current directory if absent, then runs its smoke test script in a
+    # shell subprocess with the platform's python command and prints the output. Raises
+    # RuntimeError, including captured output, if cloning or the test fails.
     cwd = os.getcwd()
     for module in get_modules_for_package(package):
         if module["repo"]:
@@ -588,6 +669,9 @@ def smoke_test_modules(package: str):
 
 
 def parse_args():
+    # [FUNCTION DOC] HELPER: Parses options: package selector, and enabled/disabled switches
+    # for runtime error check, torch compile check and PyPI package check (all default to
+    # enabled; package defaults to all). Returns the namespace.
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--package",
@@ -621,6 +705,10 @@ def parse_args():
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point. Prints torch version and parallel info, requires OpenMP
+    # support (RuntimeError otherwise), then runs version, conv2d, linalg, numpy and SDPA
+    # checks (plus GPU variants on CUDA systems), companion module tests, CUDA/compile checks,
+    # the NVSHMEM check, and wheel platform tag and macOS minimum OS checks.
     options = parse_args()
     print(f"torch: {torch.__version__}")
     print(torch.__config__.parallel_info())

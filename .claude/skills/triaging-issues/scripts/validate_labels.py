@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Claude Code PreToolUse hook for the issue-triage skill. Reads hook JSON from
+# standard input, filters the requested labels (forbidden, unknown, redundant), merges the
+# rest with the labels already on the issue and replies on standard output with an allow
+# decision carrying rewritten tool input, or exits with status 2 to block. Import-time:
+# reads the debug log path and defines label lists and file locations.
+# KNOWN ISSUE: the docstring names the update_issue tool, but the code never checks the tool
+# name, so it applies to whatever tool the hook is configured for.
 """
 PreToolUse hook to validate and sanitize labels during triage.
 
@@ -55,6 +62,8 @@ REDUNDANT_PAIRS = [
 
 
 def debug_log(msg: str, to_stderr: bool = False):
+    # [FUNCTION DOC] HELPER: Appends a timestamped line to the debug log file (write errors
+    # ignored) and echoes it to stderr when asked to or when the verbose variable is set.
     timestamp = datetime.now().isoformat()
     formatted = f"[{timestamp}] [PreToolUse] {msg}"
     try:
@@ -67,6 +76,9 @@ def debug_log(msg: str, to_stderr: bool = False):
 
 
 def is_forbidden(label: str) -> bool:
+    # [FUNCTION DOC] HELPER: Returns true if the label, compared case-insensitively, matches
+    # any forbidden regular expression (searched anywhere in the label) or equals a
+    # forbidden exact name. Pure function.
     label_lower = label.lower()
     for pattern in FORBIDDEN_PATTERNS:
         if re.search(pattern, label_lower):
@@ -75,6 +87,9 @@ def is_forbidden(label: str) -> bool:
 
 
 def _load_labels_from_file(path: Path) -> set[str]:
+    # [FUNCTION DOC] HELPER: Reads a JSON file and returns the set of label names from its
+    # labels list. Raises RuntimeError if the file is missing, unreadable, not valid JSON,
+    # or has entries without a name.
     try:
         with open(path) as f:
             data = json.load(f)
@@ -95,6 +110,9 @@ def _load_labels_from_file(path: Path) -> set[str]:
 
 
 def load_valid_labels() -> set[str]:
+    # [FUNCTION DOC] Returns the set of all label names allowed for triage: those in the main
+    # labels file plus, if that file exists, those in the distributed labels file. Raises
+    # RuntimeError (from the loader) if a file cannot be read or parsed.
     labels = _load_labels_from_file(LABELS_FILE)
     if DISTRIBUTED_LABELS_FILE.exists():
         labels |= _load_labels_from_file(DISTRIBUTED_LABELS_FILE)
@@ -102,6 +120,8 @@ def load_valid_labels() -> set[str]:
 
 
 def strip_redundant(labels: list[str]) -> tuple[list[str], list[str]]:
+    # [FUNCTION DOC] Drops the general label of each specific/general pair when both appear
+    # in the list. Returns (labels kept in original order, sorted list of removed labels).
     labels_set = set(labels)
     to_remove = set()
     for specific, general in REDUNDANT_PAIRS:
@@ -111,6 +131,9 @@ def strip_redundant(labels: list[str]) -> tuple[list[str], list[str]]:
 
 
 def fetch_existing_labels(owner: str, repo: str, issue_number: int) -> list[str]:
+    # [FUNCTION DOC] Runs the gh CLI (15 second timeout) to view the issue and returns the
+    # names of the labels currently on it. Raises RuntimeError on a nonzero exit, and
+    # TimeoutExpired or JSON errors propagate to the caller.
     result = subprocess.run(
         [
             "gh",
@@ -137,6 +160,9 @@ def fetch_existing_labels(owner: str, repo: str, issue_number: int) -> list[str]
 
 
 def allow_with_updated_input(tool_input: dict, merged_labels: list[str]) -> None:
+    # [FUNCTION DOC] Prints to standard output a hook response that allows the tool call
+    # with a copy of the input whose labels are replaced by merged_labels, then exits the
+    # process with status 0. Never returns.
     updated = dict(tool_input)
     updated["labels"] = merged_labels
     json.dump(
@@ -153,6 +179,11 @@ def allow_with_updated_input(tool_input: dict, merged_labels: list[str]) -> None
 
 
 def main():
+    # [FUNCTION DOC] Hook entry point. Reads hook JSON from standard input. With no labels
+    # requested, exits 0 (allow unchanged). Otherwise requires an issue number, strips
+    # forbidden labels (adding the triage review label for a human), unknown labels and
+    # redundant ones, exits 2 if nothing is left, else merges with the issue's existing
+    # labels and emits the rewritten input. Any error exits 2 after printing to stderr.
     try:
         data = json.load(sys.stdin)
         debug_log(f"Hook invoked with data: {json.dumps(data, indent=2)}")

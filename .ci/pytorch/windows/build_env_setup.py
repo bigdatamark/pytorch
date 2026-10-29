@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Windows CD environment setup. Depending on the GPU_ARCH_TYPE environment
+# variable (cpu, cuda or xpu) installs toolchain pieces (CUDA toolkit, MAGMA, sccache,
+# Intel oneAPI), captures the environment produced by the Visual Studio vcvarsall script, and
+# writes the combined variables as export lines to the --env-out file for a parent bash. Defines
+# build-environment constants and per-CUDA-version architecture tables. Import-time side
+# effect: prepends this directory to the module search path.
 """GPU/toolchain environment setup for Windows manywheel/wheel CD builds.
 
 Mirrors the Linux `.ci/manywheel/build_env_setup.py` pattern: install heavy
@@ -85,6 +91,10 @@ RANDOMTEMP_URL = "https://github.com/peterjc123/randomtemp-rust/releases/downloa
 
 
 def find_vcvarsall(vc_year: str) -> Path:
+    # [FUNCTION DOC] Returns the path of the Visual Studio vcvarsall batch script. Uses the
+    # VS15VCVARSALL variable if it names an existing file; otherwise runs vswhere to find
+    # installations in the version range for the given year (2019 or newer) and returns the
+    # first with the script. Exits the process with a message if vswhere or the script is missing.
     """Locate vcvarsall.bat via vswhere.exe.
 
     Mirrors the discovery in torch.utils.cpp_extension._jit._get_vc_env
@@ -132,6 +142,11 @@ def find_vcvarsall(vc_year: str) -> Path:
 
 
 def _capture_cmd_env(command: str, fail_prefix: str) -> dict[str, str]:
+    # [FUNCTION DOC] HELPER: Runs the command line under the Windows command interpreter with
+    # Unicode output, parses the printed variable listing as NAME=VALUE lines (skipping
+    # pseudo-variables), and returns only entries that are new or differ from the current
+    # process environment. Exits the process with the given failure prefix and output if
+    # the command fails.
     """Run `command` under `cmd /u /c`, capture env, return diff vs current env.
 
     `cmd /u` forces UTF-16LE output so non-ASCII paths in localized Windows
@@ -163,6 +178,9 @@ def _capture_cmd_env(command: str, fail_prefix: str) -> dict[str, str]:
 
 
 def capture_vcvars_env(vcvarsall: Path, args: str) -> dict[str, str]:
+    # [FUNCTION DOC] Runs the vcvarsall script with the given argument string and returns the
+    # environment variables it adds or changes (compiler paths, LIB, INCLUDE, PATH, ...) as
+    # a mapping. Exits the process if the script fails.
     """Capture the env diff produced by `vcvarsall.bat <args>`.
 
     Mirrors torch.utils.cpp_extension._jit._get_vc_env (gh-180707).
@@ -176,6 +194,9 @@ def capture_vcvars_env(vcvarsall: Path, args: str) -> dict[str, str]:
 
 
 def source_oneapi_vars(scripts: list[Path]) -> dict[str, str]:
+    # [FUNCTION DOC] Runs the existing scripts from the given list chained in one command
+    # shell and returns the environment variables they add or change. Missing scripts are
+    # ignored; exits the process if none exist or the chain fails. Prints a summary count.
     """Source Intel oneAPI vars.bat scripts and return the env diff.
 
     Windows analog of the Linux source_oneapi_env helper. Chains the env
@@ -192,6 +213,9 @@ def source_oneapi_vars(scripts: list[Path]) -> dict[str, str]:
 
 
 def install_cuda_toolkit() -> None:
+    # [FUNCTION DOC] HELPER: Runs the legacy CUDA install batch script (via the command
+    # interpreter, from the script directory), installing toolkit, cuDNN and related files.
+    # Raises CalledProcessError if it fails. Relies on CUDA_VERSION from the environment.
     """Run the legacy internal/cuda_install.bat which downloads + installs
     the CUDA toolkit, cuDNN, ZLIB, and the GPU driver DLLs.
 
@@ -206,6 +230,10 @@ def install_cuda_toolkit() -> None:
 
 
 def find_cuda_path(dotted_version: str) -> Path:
+    # [FUNCTION DOC] Returns the CUDA toolkit root for a dotted version such as 12.6: the
+    # directory named by the matching CUDA_PATH_V environment variable if it contains the
+    # compiler, else the standard install location if it does. Exits the process with a
+    # message when neither has the compiler.
     """Find the CUDA install root for the requested dotted version.
 
     Mirrors cuda_config.bat: respect CUDA_PATH_V{ver} if set, else fall
@@ -226,6 +254,9 @@ def find_cuda_path(dotted_version: str) -> Path:
 
 
 def find_nvtoolsext() -> Path:
+    # [FUNCTION DOC] Returns the NVTX (NvToolsExt) install directory: the NVTOOLSEXT_PATH
+    # variable's value if it contains the expected library, else the standard location if
+    # it does. Exits the process with a message if neither is found.
     """Mirror internal/check_nvtx.bat. NVTX is required for CUDA wheels."""
     pre_set = os.environ.get("NVTOOLSEXT_PATH")
     if pre_set and (Path(pre_set) / "lib" / "x64" / "nvToolsExt64_1.lib").is_file():
@@ -240,6 +271,10 @@ def find_nvtoolsext() -> Path:
 
 
 def install_magma(cuda_prefix: str, build_type: str) -> Path:
+    # [FUNCTION DOC] Removes any stale extracted directory and archive for the given CUDA
+    # prefix and build type, downloads the matching MAGMA archive and extracts it with 7z
+    # into the script directory. Returns the extracted directory. Raises CalledProcessError
+    # if extraction fails; download failure exits the process.
     """Download + extract the pre-built MAGMA archive into WIN_CI_DIR.
 
     Mirrors the MAGMA block in the legacy build_pytorch.bat. Returns the
@@ -265,6 +300,9 @@ def install_magma(cuda_prefix: str, build_type: str) -> Path:
 
 
 def setup_sccache(tmp_bin: Path) -> dict[str, str]:
+    # [FUNCTION DOC] Unless USE_SCCACHE is 0 (then returns an empty mapping), creates tmp_bin,
+    # downloads the sccache executables into it and returns environment entries that route
+    # compiler calls through sccache-cl, set its idle timeout and put tmp_bin first on PATH.
     """Download sccache + sccache-cl and return env wiring host compilation
     through them. Mirrors the USE_SCCACHE!=0 branch of check_opts.bat.
 
@@ -286,6 +324,11 @@ def setup_sccache(tmp_bin: Path) -> dict[str, str]:
 
 
 def setup_nvcc_wrapper(tmp_bin: Path, cuda_path: Path) -> dict[str, str]:
+    # [FUNCTION DOC] Unless USE_SCCACHE is 0 (then returns an empty mapping), downloads the
+    # randomtemp tool, writes a wrapper batch file in tmp_bin that runs nvcc through it and
+    # sccache, prints the file, and returns environment entries pointing CMake's CUDA
+    # compiler settings (forward-slash paths) and launcher at them.
+    # KNOWN ISSUE: it assumes tmp_bin already exists (created by the sccache setup).
     """Write the randomtemp+sccache NVCC wrapper batch file and return the
     env that points CMake's CUDA rule at it.
 
@@ -312,12 +355,18 @@ def setup_nvcc_wrapper(tmp_bin: Path, cuda_path: Path) -> dict[str, str]:
 
 
 def prepend_path(*entries: Path | str) -> str:
+    # [FUNCTION DOC] HELPER: Returns the current PATH value with the given entries placed in
+    # front, joined by semicolons. Does not modify the environment.
     """Build a Windows PATH (`;`-separated) prepending entries to the current PATH."""
     current = os.environ.get("PATH", "")
     return ";".join((*[str(e) for e in entries], current))
 
 
 def setup_cuda() -> dict[str, str]:
+    # [FUNCTION DOC] Configures a CUDA build from the CUDA_VERSION (and DEBUG) environment
+    # variables: exits on unsupported versions, installs the toolkit, locates CUDA and NVTX,
+    # installs MAGMA, sets up sccache and the nvcc wrapper, and returns the environment
+    # mapping (flags, paths, architecture list, MAGMA home, PATH, compiler wrapper settings).
     cuda_version = os.environ.get("CUDA_VERSION", "")
     arch_list = TORCH_CUDA_ARCH_LIST_TABLE.get(cuda_version)
     if not arch_list:
@@ -354,6 +403,9 @@ def setup_cuda() -> dict[str, str]:
 
 
 def install_xpu_bundle() -> None:
+    # [FUNCTION DOC] HELPER: Runs the legacy XPU install batch script (via the command
+    # interpreter, from the script directory) to install the Intel bundle. Raises
+    # CalledProcessError if it fails.
     """Run the legacy internal/xpu_install.bat which downloads + installs
     the Intel Deep Learning Essentials bundle.
 
@@ -365,6 +417,11 @@ def install_xpu_bundle() -> None:
 
 
 def setup_xpu(vs_install_dir: Path) -> dict[str, str]:
+    # [FUNCTION DOC] Installs the XPU bundle, locates its root (XPU_BUNDLE_ROOT or the default
+    # oneAPI folder; exits if missing), copies static settings plus Visual Studio install
+    # directory variables into the process environment (side effect), sources the oneAPI
+    # compiler and ocloc scripts and returns the static settings merged with the environment
+    # changes those scripts made.
     install_xpu_bundle()
 
     xpu_root = Path(
@@ -404,6 +461,11 @@ def setup_xpu(vs_install_dir: Path) -> dict[str, str]:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point. Reads GPU_ARCH_TYPE and VC_YEAR, builds the environment
+    # mapping starting from the common settings, finds vcvarsall, applies the cpu, cuda or xpu
+    # setup (exits on other values), prepends the Python MKL prefix to the CMake prefix path,
+    # updates the process environment, captures the vcvarsall changes on top, and writes all
+    # as export lines to the --env-out file if given.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--env-out",

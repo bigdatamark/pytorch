@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Windows CI helper that runs small "python -c" checks against the installed
+# torch (import, MKL, and with USE_CUDA=1 also CUDA tensors, magma, cuDNN). Defines the
+# COMMON_TESTS and GPU_TESTS lists of (description, code string) pairs; the main block runs
+# them in order and exits with the failing child's return code. No import-time side effects.
 
 import os
 import subprocess
@@ -33,6 +37,10 @@ GPU_TESTS = [
 
 
 if __name__ == "__main__":
+    # Script entry: picks the test list from the USE_CUDA environment variable (GPU tests
+    # only when it equals 1), runs each snippet in a child python process and prints its
+    # description and command. On failure, if the Windows cdb debugger exists it reruns the
+    # command under it to get a traceback, then exits with the original return code.
     if "USE_CUDA" in os.environ and os.environ["USE_CUDA"] == "1":
         TESTS = COMMON_TESTS + GPU_TESTS
     else:

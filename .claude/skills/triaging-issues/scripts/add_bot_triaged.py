@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Claude Code PostToolUse hook for the issue-triage skill. Reads the hook JSON
+# from standard input and adds the bot-triaged label to the issue named in it via the gh
+# CLI. Always exits 0 so it never blocks the agent. Import-time: reads two environment
+# variables to set the debug log path.
 """
 PostToolUse hook to automatically add the bot-triaged label after any issue mutation.
 
@@ -21,6 +25,8 @@ BOT_TRIAGED_LABEL = "bot-triaged"
 
 
 def debug_log(msg: str):
+    # [FUNCTION DOC] HELPER: Appends a timestamped line to the debug log file (errors writing
+    # it are ignored) and, if the verbose environment variable is set, echoes it to stderr.
     """Append a debug message to the log file and stderr (for CI visibility)."""
     timestamp = datetime.now().isoformat()
     formatted = f"[{timestamp}] [PostToolUse] {msg}"
@@ -34,6 +40,10 @@ def debug_log(msg: str):
 
 
 def main():
+    # [FUNCTION DOC] Hook entry point. Parses JSON from standard input, takes owner, repo
+    # and issue_number from its tool input, and if all are present runs the gh CLI to add
+    # the label (its result is only logged). Every path, including JSON and unexpected
+    # errors, ends by exiting with status 0.
     try:
         data = json.load(sys.stdin)
         debug_log(f"Hook invoked with data: {json.dumps(data, indent=2)}")

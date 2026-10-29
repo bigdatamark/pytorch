@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Claude Code PreToolUse hook for the issue-triage skill. Compares the repo and
+# issue number of a requested GitHub mutation (hook JSON on standard input) with the trusted
+# target from the GITHUB_REPOSITORY and TRIAGE_ISSUE_NUMBER environment variables, and exits
+# with status 2 (block) on any mismatch or error. Import-time: reads the debug log path.
 """Block issue mutations outside the workflow's trusted triage target."""
 
 import json
@@ -13,6 +17,8 @@ ISSUE_ENV = "TRIAGE_ISSUE_NUMBER"
 
 
 def debug_log(message: str) -> None:
+    # [FUNCTION DOC] HELPER: Appends a timestamped line to the debug log file (OS errors
+    # ignored) and echoes it to stderr when the verbose environment variable is set.
     """Record target-validation decisions for workflow diagnostics."""
     timestamp = datetime.now().isoformat()
     formatted = f"[{timestamp}] [TargetPreToolUse] {message}"
@@ -26,6 +32,9 @@ def debug_log(message: str) -> None:
 
 
 def expected_target() -> tuple[str, str, int]:
+    # [FUNCTION DOC] HELPER: Reads the repository (owner/repo form) and issue number from the
+    # environment and returns (owner, repo, issue number). Raises RuntimeError if the
+    # repository is malformed or the issue number is not a positive integer.
     """Load and validate the target supplied by the trusted workflow."""
     repository = os.environ.get(REPOSITORY_ENV, "")
     issue_number = os.environ.get(ISSUE_ENV, "")
@@ -42,6 +51,9 @@ def expected_target() -> tuple[str, str, int]:
 
 
 def requested_target(tool_input: dict) -> tuple[str, str, int]:
+    # [FUNCTION DOC] HELPER: Pulls owner, repo and issue_number from the tool input mapping
+    # and returns (owner, repo, issue number as int). Raises RuntimeError if owner or repo is
+    # missing or not a non-empty string, or the issue number is not digits (booleans rejected).
     """Extract the repository and issue targeted by an MCP mutation."""
     owner = tool_input.get("owner")
     repo = tool_input.get("repo")
@@ -57,6 +69,10 @@ def requested_target(tool_input: dict) -> tuple[str, str, int]:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Hook entry point. Reads hook JSON from standard input, rejects any
+    # issue_write call whose method is not update, then compares requested and expected
+    # targets. On any failure it logs, prints a message to stderr and exits with status 2;
+    # on a match it returns normally (exit 0, allowed).
     """Allow only mutations aimed at the workflow-selected issue."""
     try:
         data = json.load(sys.stdin)

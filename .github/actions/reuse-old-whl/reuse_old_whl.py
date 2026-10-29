@@ -1,3 +1,9 @@
+# [MODULE DOC] CI script deciding whether a build can reuse a wheel built earlier on the
+# merge base commit. Checks branch name, changed files, a force-rebuild PR label, a global
+# config issue and the availability of an old artifact on S3; if reusable it downloads the
+# artifact, swaps in the current python sources and version strings, repackages the wheel and
+# sets a GitHub Actions output. Always emits a metric. Import-time: temporarily edits the
+# module search path to import the metrics helper.
 from __future__ import annotations
 
 import argparse
@@ -25,6 +31,9 @@ FORCE_REBUILD_LABEL = "ci-force-rebuild"
 
 @lru_cache
 def get_merge_base() -> str:
+    # [FUNCTION DOC] Returns (cached) the git merge base commit hash of HEAD and origin main.
+    # If that equals HEAD itself, it uses the parent of HEAD instead. Prints the result.
+    # Raises CalledProcessError if a git command fails.
     merge_base = subprocess.check_output(
         ["git", "merge-base", "HEAD", "origin/main"],
         text=True,
@@ -44,6 +53,7 @@ def get_merge_base() -> str:
 
 @lru_cache
 def get_head_sha() -> str:
+    # [FUNCTION DOC] HELPER: Returns (cached) the full commit hash of HEAD from git.
     sha = subprocess.check_output(
         ["git", "rev-parse", "HEAD"],
         text=True,
@@ -53,6 +63,9 @@ def get_head_sha() -> str:
 
 
 def is_main_branch() -> bool:
+    # [FUNCTION DOC] HELPER: Intended to tell whether HEAD is the merge base (main branch).
+    # KNOWN ISSUE: always returns false (the real check is commented out) and the function
+    # is not called anywhere in this file.
     return False
     # Testing on main branch for now
     # print(
@@ -62,6 +75,9 @@ def is_main_branch() -> bool:
 
 
 def query_github_api(url: str) -> Any:
+    # [FUNCTION DOC] HELPER: Sends an authenticated GET to the url using the token from the
+    # GITHUB_TOKEN environment variable and returns the decoded JSON body. Raises KeyError
+    # if the token is unset. The HTTP status is not checked, so error bodies are returned.
     headers = {
         "Accept": "application/vnd.github.v3+json",
         "Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
@@ -72,6 +88,9 @@ def query_github_api(url: str) -> Any:
 
 @lru_cache
 def check_labels_for_pr() -> bool:
+    # [FUNCTION DOC] Returns (cached) true if any pull request associated with the HEAD
+    # commit carries the force-rebuild label, looked up through the GitHub API. Prints what
+    # it finds.
     # Check if the current commit is part of a PR and if it has the
     # FORCE_REBUILD_LABEL
     head_sha = get_head_sha()
@@ -91,6 +110,8 @@ def check_labels_for_pr() -> bool:
 
 
 def check_issue_open() -> bool:
+    # [FUNCTION DOC] Returns true if the CI config issue (number 153759) is open, which is
+    # the switch to force everyone to rebuild. Queries the GitHub API and prints the state.
     # Check if issue #153759 is open.  This is the config issue for quickly
     # forcing everyone to build
     url = "https://api.github.com/repos/pytorch/pytorch/issues/153759"
@@ -104,6 +125,9 @@ def check_issue_open() -> bool:
 
 
 def get_workflow_id(run_id: str) -> str | None:
+    # [FUNCTION DOC] Looks up the workflow run with the given id through the GitHub API and
+    # returns its workflow id, or None if the response has no such field.
+    # KNOWN ISSUE: the annotation says string but the API returns a number.
     # Get the workflow ID that corresponds to the file for the run ID
     url = f"https://api.github.com/repos/pytorch/pytorch/actions/runs/{run_id}"
     response = query_github_api(url)
@@ -116,6 +140,9 @@ def get_workflow_id(run_id: str) -> str | None:
 
 
 def ok_changed_file(file: str) -> bool:
+    # [FUNCTION DOC] HELPER: Returns true if a changed path is safe for wheel reuse: a python
+    # file under torch (excluding the C++ sources directory), a python file under test, or a
+    # markdown or rst file under docs. Pure function.
     # Return true if the file is in the list of allowed files to be changed to
     # reuse the old whl
     if (
@@ -132,6 +159,9 @@ def ok_changed_file(file: str) -> bool:
 
 
 def check_changed_files(sha: str) -> bool:
+    # [FUNCTION DOC] Compares the given commit with HEAD using git. Returns false if any file
+    # under torch was deleted or any changed file is not allowed by the file filter; true
+    # otherwise. Prints each decision. Raises CalledProcessError if git fails.
     # Return true if all the changed files are in the list of allowed files to
     # be changed to reuse the old whl
 
@@ -180,6 +210,11 @@ def check_changed_files(sha: str) -> bool:
 
 
 def find_old_whl(workflow_id: str, build_environment: str, sha: str) -> bool:
+    # [FUNCTION DOC] Lists main-branch runs of the workflow for the given commit and, for
+    # each run, tries to download its build artifact archive for the build environment from
+    # S3. On the first success writes it to the file artifacts.zip in the current directory
+    # and returns true. Returns false if the environment is unset, no runs exist, or none
+    # has the archive. Network errors are printed and skipped.
     # Find the old whl on s3 and download it to artifacts.zip
     if build_environment is None:
         print("BUILD_ENVIRONMENT is not set.")
@@ -213,6 +248,11 @@ def find_old_whl(workflow_id: str, build_environment: str, sha: str) -> bool:
 
 
 def unzip_artifact_and_replace_files() -> None:
+    # [FUNCTION DOC] Unpacks artifacts.zip into an artifacts directory and, for each wheel
+    # there, unpacks it, copies the current torch python tree over it, rewrites the old git
+    # version suffix to the HEAD short hash in the version file, metadata files and names,
+    # then rebuilds the wheel and finally recreates artifacts.zip in the current directory.
+    # Runs external unzip, zip, mv and rm tools; failures raise CalledProcessError.
     # Unzip the artifact and replace files
     subprocess.check_output(
         ["unzip", "-o", "artifacts.zip", "-d", "artifacts"],
@@ -232,12 +272,17 @@ def unzip_artifact_and_replace_files() -> None:
         new_version = f"+git{head_sha[:7]}"
 
         def rename_to_new_version(file: str | Path) -> None:
+            # [FUNCTION DOC] HELPER: Moves the file or directory to the same path with the
+            # old version suffix replaced by the new one (uses the enclosing loop values).
             # Rename file with old_version to new_version
             subprocess.check_output(
                 ["mv", file, str(file).replace(old_version, new_version)]
             )
 
         def change_content_to_new_version(file: str | Path) -> None:
+            # [FUNCTION DOC] HELPER: Rewrites a text file in place replacing the old version
+            # suffix with the new one; directories are skipped. Non-text files would raise a
+            # decoding error.
             # Check if is a file
             if os.path.isdir(file):
                 return
@@ -307,6 +352,8 @@ def unzip_artifact_and_replace_files() -> None:
 
 
 def set_output() -> None:
+    # [FUNCTION DOC] Publishes the GitHub Actions output reuse=true by appending to the file
+    # named by GITHUB_OUTPUT, or by printing the legacy set-output command if unset.
     print("Setting output reuse=true")
     if os.getenv("GITHUB_OUTPUT"):
         with open(str(os.getenv("GITHUB_OUTPUT")), "a") as env:
@@ -316,6 +363,9 @@ def set_output() -> None:
 
 
 def parse_args() -> argparse.Namespace:
+    # [FUNCTION DOC] HELPER: Parses command-line options: required run id and build
+    # environment, optional github ref. Returns the namespace.
+    # KNOWN ISSUE: the help text for the run id option says "Workflow ID".
     parser = argparse.ArgumentParser(description="Check for old whl files.")
     parser.add_argument("--run-id", type=str, required=True, help="Workflow ID")
     parser.add_argument(
@@ -329,6 +379,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def can_reuse_whl(args: argparse.Namespace) -> tuple[bool, str]:
+    # [FUNCTION DOC] Decides whether an old wheel may be reused. Returns (false, reason) for
+    # release, tag or nightly refs, disallowed changed files, a force-rebuild label, the open
+    # config issue, a missing workflow id, or no old artifact found; else (true, reason) after
+    # downloading the artifact as a side effect of the lookup.
     if args.github_ref and any(
         args.github_ref.startswith(x)
         for x in [
@@ -366,6 +420,8 @@ def can_reuse_whl(args: argparse.Namespace) -> tuple[bool, str]:
 
 
 if __name__ == "__main__":
+    # Script entry: parses arguments, decides on reuse, and if reusable rewrites the
+    # downloaded artifact and sets the output; always emits a metric with the decision.
     args = parse_args()
 
     reuse_whl, reason = can_reuse_whl(args)

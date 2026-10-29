@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Windows CI script that installs build-time dependencies: a pinned numpy, a
+# fixed list of pip packages, and libuv extracted into the running Python prefix; it can
+# run spin clean first. Writes libuv_ROOT to an optional env file for a parent bash.
+# Import-time side effect: prepends this directory to the module search path.
 """Install build-time dependencies for a PyTorch Windows wheel build.
 
 Windows analog of `.ci/manywheel/build_install_deps.py`. Replaces the
@@ -59,6 +63,9 @@ LIBUV_URL = "https://s3.amazonaws.com/ossci-windows/libuv-1.40.0-h8ffe710_0.tar.
 
 
 def retry(cmd: list[str], delays: tuple[int, ...] = (1, 2, 4, 8)) -> None:
+    # [FUNCTION DOC] HELPER: Runs the command (list of arguments) and returns on success. On
+    # a nonzero exit it sleeps for each delay in turn and retries; after the final failure
+    # it exits the process with the last return code.
     """Run cmd, retrying with backoff on failure (mirrors the Linux helper)."""
     last_rc = 0
     for delay in (0, *delays):
@@ -72,10 +79,14 @@ def retry(cmd: list[str], delays: tuple[int, ...] = (1, 2, 4, 8)) -> None:
 
 
 def pip_install(*args: str) -> None:
+    # [FUNCTION DOC] HELPER: Runs pip install with the given extra arguments using the
+    # current interpreter, with retry on failure (may exit the process).
     retry([sys.executable, "-m", "pip", "install", *args])
 
 
 def numpy_pin() -> str:
+    # [FUNCTION DOC] HELPER: Returns the numpy version string to install for the running
+    # Python (looked up by its cpMAJORMINOR tag in the pin table, else the default).
     tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
     for prefix, version in NUMPY_PINS:
         if tag.startswith(prefix):
@@ -84,6 +95,10 @@ def numpy_pin() -> str:
 
 
 def install_libuv(workdir: Path, python_prefix: Path) -> Path:
+    # [FUNCTION DOC] HELPER: Downloads the libuv tarball into workdir, decompresses it with
+    # 7z, extracts it with tar into python_prefix (created if needed) and returns the
+    # Library directory beneath it. Exits the process if that directory is missing;
+    # raises CalledProcessError if 7z or tar fails.
     """Curl + 7z + tar extract libuv into the running Python's prefix.
 
     Mirrors setup_build.bat lines 24-28. Returns libuv_ROOT.
@@ -106,6 +121,9 @@ def install_libuv(workdir: Path, python_prefix: Path) -> Path:
 
 
 def preinstall_cp315_build_deps() -> list[str]:
+    # [FUNCTION DOC] HELPER: Only on Python 3.15, pip-installs a pinned old Cython plus
+    # setuptools and wheel and returns the no-build-isolation flag list so later installs
+    # use them; on other versions returns an empty list and installs nothing.
     """Pin Cython < 3.3.0 for cp315 sdist builds. See pytorch/pytorch#194618."""
     if sys.version_info[:2] != (3, 15):
         return []
@@ -114,6 +132,10 @@ def preinstall_cp315_build_deps() -> list[str]:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point. Parses the optional env-out file path, installs numpy and
+    # the fixed pip packages, runs spin clean from the repo root unless SKIP_SETUP_CLEAN is
+    # set, installs libuv, writes the libuv_ROOT export to the env file and prints status.
+    # Subprocess failures raise or exit the process.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env-out", type=Path)
     args = parser.parse_args()
