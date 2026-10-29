@@ -8,6 +8,14 @@
 # 1. Run this file directly with `python test_c10d_ops_nccl.py`
 # 2. Use multi-process launcher, e.g. `torchrun --standalone --nproc-per-node 2 test_c10d_ops_nccl.py`
 
+# [MODULE DOC] Positive (no abort or destroy) tests of c10d collectives and point-to-point
+# operations on the legacy NCCL process group, all in one class run by the continuous multi-
+# process harness, which builds the default group once and runs each test on every rank.
+# Covers empty tensors, broadcast, reduce, all_reduce (including sparse, float8, average,
+# premul sum and unsupported bitwise ops), all_gather variants, gather, scatter,
+# reduce_scatter variants, barrier, send/recv, CUDA graph capture and watchdog behavior, and
+# premul sum reduce ops. Import-time side effects: exits the process with status 0 if c10d
+# or NCCL is unavailable, or under dev-asan.
 import math
 import os
 import sys
@@ -47,24 +55,40 @@ if TEST_WITH_DEV_DBG_ASAN:
 
 
 class ProcessGroupNCCLOpTest(MultiProcContinuousTest):
+    # [CLASS DOC] All NCCL op tests, using the default group of the harness (self.pg, backend
+    # nccl, world size from the harness). Tests find their GPUs through rank_to_GPU and are
+    # skipped (but reported as passing in sandcastle) when fewer than two GPUs exist. Most tests
+    # exercise the raw group API (work objects with options structures) rather than the functional
+    # dist API.
     @classmethod
     def backend_str(cls) -> str:
+        # [FUNCTION DOC] HELPER: Class method naming the process group backend used by the
+        # harness; returns nccl.
         return "nccl"
 
     @classmethod
     def opts(cls, high_priority_stream=False):
+        # [FUNCTION DOC] HELPER: Class method building stock NCCL options whose high
+        # priority stream flag is set from the argument (default off); returned to the
+        # harness for group creation.
         opts = c10d.ProcessGroupNCCL.Options()
         opts.is_high_priority_stream = high_priority_stream
         return opts
 
     @property
     def rank_to_GPU(self):
+        # [FUNCTION DOC] HELPER: Property returning the mapping from each rank to its list of GPU
+        # indices, computed by the common multi-GPU helper for this world size.
         # return rank to GPU map
         return init_multigpu_helper(self.world_size, "nccl")
 
     @requires_nccl()
     @skip_but_pass_in_sandcastle_if(not TEST_MULTIGPU, "NCCL test requires 2+ GPUs")
     def test_empty_tensors(self):
+        # [FUNCTION DOC] Runs broadcast, allreduce and reduce on a one-element list holding an
+        # empty float tensor on this rank's first GPU, then allgather and reduce_scatter with
+        # lists of empty tensors, waiting each work. Asserts every tensor remains empty and no
+        # call fails.
         pg = self.pg
         local_device_idx = self.rank_to_GPU[self.rank][0]
 
@@ -101,9 +125,17 @@ class ProcessGroupNCCLOpTest(MultiProcContinuousTest):
     @requires_nccl()
     @skip_but_pass_in_sandcastle_if(not TEST_MULTIGPU, "NCCL test requires 2+ GPUs")
     def test_broadcast_ops(self):
+        # [FUNCTION DOC] For each rank as root, broadcasts a one-element tensor (checks every rank
+        # ends with the root's rank value), then tests multiple tensors per rank (one per local
+        # GPU): the root's tensors are replaced with a square tensor of size root plus one filled
+        # with root plus one, each local tensor index is tried as root tensor, and all tensors on
+        # all ranks must equal the expected one.
         pg = self.pg
 
         def broadcast(xs, rootRank, rootTensor):
+            # [FUNCTION DOC] HELPER: Broadcasts the tensor list through the group with the given
+            # root rank and root tensor index in the options, waits for completion, and returns
+            # the same list.
             opts = c10d.BroadcastOptions()
             opts.rootRank = rootRank
             opts.rootTensor = rootTensor
@@ -137,6 +169,10 @@ class ProcessGroupNCCLOpTest(MultiProcContinuousTest):
     @requires_nccl()
     @skip_but_pass_in_sandcastle_if(not TEST_MULTIGPU, "NCCL test requires 2+ GPUs")
     def test_sparse_allreduce_ops(self):
+        # [FUNCTION DOC] Builds a 2 by 3 sparse COO tensor on the rank's device and all-reduces
+        # it; expects the result as a dense tensor equal to twice the input (the expected values
+        # assume two ranks). A RuntimeError saying NCCL does not support sparse all_reduce is
+        # swallowed so the test passes on builds without it; any other error is re-raised.
         pg = self.pg
 
         indices = torch.tensor([[0, 1]])
@@ -164,10 +200,17 @@ class ProcessGroupNCCLOpTest(MultiProcContinuousTest):
     @requires_nccl()
     @skip_but_pass_in_sandcastle_if(not TEST_MULTIGPU, "NCCL test requires 2+ GPUs")
     def test_allreduce_ops(self):
+        # [FUNCTION DOC] Checks all_reduce for SUM (n(n+1)/2 over the world size n), AVG when NCCL
+        # is 2.10 or newer, premul sum with scalar and tensor factors for half, float, double and
+        # bfloat16 when NCCL is 2.11.1 or newer, PRODUCT (factorial of the world size), MIN (1)
+        # and MAX (world size), and asserts the bitwise ops BAND, BOR and BXOR raise ValueError
+        # saying they cannot be used with NCCL.
         pg = self.pg
         local_device_id = self.rank_to_GPU[self.rank][0]
 
         def allreduce(tensors, op):
+            # [FUNCTION DOC] HELPER: Runs the group allreduce on the tensor list with the given
+            # reduce op in the options and waits for completion; results are in place.
             opts = c10d.AllreduceOptions()
             opts.reduceOp = op
             work = pg.allreduce(tensors, opts)
@@ -252,6 +295,10 @@ class ProcessGroupNCCLOpTest(MultiProcContinuousTest):
         not PLATFORM_SUPPORTS_FP8, "Float8 requires sm >= 90"
     )
     def test_allreduce_float8(self):
+        # [FUNCTION DOC] Skipped when running on Linux (the decorator references an issue link),
+        # when NCCL is older than 2.24, with fewer than two GPUs, or when the platform has no
+        # float8 support. All-reduces 1024 ones of type float8 e4m3fn through the functional API
+        # and asserts the result equals the world size.
         device = torch.device("cuda", self.rank_to_GPU[self.rank][0])
 
         numel = 1024
@@ -268,6 +315,10 @@ class ProcessGroupNCCLOpTest(MultiProcContinuousTest):
     @requires_nccl()
     @skip_but_pass_in_sandcastle_if(not TEST_MULTIGPU, "NCCL test requires 2+ GPUs")
     def test_alltoall_ops_with_cudafree_race(self):
+        # [FUNCTION DOC] Sets the current device, creates many temporary tensors, then ten times
+        # starts an all_to_all_single of 1000 by 1000 float tensors, frees cached CUDA memory
+        # (which triggers cudaFree) before waiting, and finally synchronizes. Only checks that
+        # nothing crashes or hangs; output values are not verified.
         pg = self.pg
         opts = c10d.AllToAllOptions()
         local_device = f"cuda:{self.rank_to_GPU[self.rank][0]}"
@@ -293,6 +344,11 @@ class ProcessGroupNCCLOpTest(MultiProcContinuousTest):
     @requires_nccl()
     @skip_but_pass_in_sandcastle_if(not TEST_MULTIGPU, "NCCL test requires 2+ GPUs")
     def test_allreduce_in_cudagraph(self):
+        # [FUNCTION DOC] Warms up with one all_reduce of a one-element tensor (value must
+        # equal the world size). Twice captures a graph containing an all_reduce and a
+        # broadcast from rank 0; capture must not change the value; replays the graph twice
+        # and expects the value to be multiplied by the world size on each replay, which is
+        # verified after the second replay.
         local_device_idx = self.rank_to_GPU[self.rank][0]
         # This device setting is needed by the CUDAGraph API to understand on
         # which device to find the current stream
@@ -324,6 +380,10 @@ class ProcessGroupNCCLOpTest(MultiProcContinuousTest):
     @requires_nccl()
     @skip_but_pass_in_sandcastle_if(not TEST_MULTIGPU, "NCCL test requires 2+ GPUs")
     def test_nccl_watchdog_cudagraph(self):
+        # [FUNCTION DOC] Skipped on ROCm. Ten times: runs 30 eager all_reduce calls on a one-
+        # element tensor, captures a graph with in-place adds and three all_reduce calls, and
+        # replays it 100 times. Passes if the watchdog does not crash when event queries are
+        # disallowed during capture. No values are checked.
         # test that the watchdog does not crash graphs with disallowed event query
         pg = self.pg
         rank = self.rank_to_GPU[self.rank][0]
@@ -350,6 +410,12 @@ class ProcessGroupNCCLOpTest(MultiProcContinuousTest):
     )
     @skip_but_pass_in_sandcastle_if(not TEST_MULTIGPU, "NCCL test requires 2+ GPUs")
     def test_nccl_cudagraph_multisegment(self):
+        # [FUNCTION DOC] Needs NCCL 2.29 or newer. Turns on expandable segments, runs three eager
+        # all_gather_single calls of a large tensor filled with rank plus one and checks the
+        # output sum, then captures one all_gather_single into a CUDA graph, replays it and checks
+        # the sum again. Verifies multisegment memory works in graphs.
+        # KNOWN ISSUE: the allocator setting is turned back to false at the end of the test only
+        # on success (no cleanup block), and the original value is not restored.
         # Prior to NCCL 2.29, this would cause an Invalid Memory Access (IMA)
         # because NCCL didn't properly handle multisegment memory in graphs.
         local_device_idx = self.rank_to_GPU[self.rank][0]
@@ -382,10 +448,18 @@ class ProcessGroupNCCLOpTest(MultiProcContinuousTest):
     @requires_nccl()
     @skip_but_pass_in_sandcastle_if(not TEST_MULTIGPU, "NCCL test requires 2+ GPUs")
     def test_reduce_ops(self):
+        # [FUNCTION DOC] For each root rank: reduces tensors holding rank plus one to that root
+        # and checks the root has n(n+1)/2 while others keep their input; asserts BAND, BOR and
+        # BXOR raise ValueError saying they cannot be used with NCCL; and, when NCCL is 2.11.1 or
+        # newer, compares a premul sum reduce (scalar and tensor factors) against a plain sum of
+        # inputs pre-multiplied by the factor, checking at the root.
         pg = self.pg
         local_device_id = self.rank_to_GPU[self.rank][0]
 
         def reduce(xs, rootRank, rootTensor, op=None):
+            # [FUNCTION DOC] HELPER: Runs the group reduce on the tensor list with the given root
+            # rank and root tensor index, setting the reduce op in the options only when one is
+            # provided, and waits for completion.
             opts = c10d.ReduceOptions()
             opts.rootRank = rootRank
             opts.rootTensor = rootTensor
@@ -447,10 +521,15 @@ class ProcessGroupNCCLOpTest(MultiProcContinuousTest):
     @requires_nccl()
     @skip_but_pass_in_sandcastle_if(not TEST_MULTIGPU, "NCCL test requires 2+ GPUs")
     def test_allgather_ops(self):
+        # [FUNCTION DOC] Builds one 2 by 2 tensor filled with 2 per local GPU and output lists
+        # filled with -1 (one entry per GPU per rank), runs the list-style allgather, and asserts
+        # every output entry equals the 2-filled expected tensor.
         pg = self.pg
         local_device_ids = self.rank_to_GPU[self.rank]
 
         def allgather(output_ts, input_ts):
+            # [FUNCTION DOC] HELPER: Runs the group allgather with the given output lists and
+            # input tensors, and returns the result of waiting for the work.
             work = pg.allgather(output_ts, input_ts)
             return work.wait()
 
@@ -477,10 +556,14 @@ class ProcessGroupNCCLOpTest(MultiProcContinuousTest):
     @requires_nccl()
     @skip_but_pass_in_sandcastle_if(not TEST_MULTIGPU, "NCCL test requires 2+ GPUs")
     def test_allgather_base_ops(self):
+        # [FUNCTION DOC] Each rank contributes a one-element tensor holding its rank;
+        # all_gather_single into a world-size tensor must equal the sequence of ranks in order.
         pg = self.pg
         local_device_id = self.rank_to_GPU[self.rank][0]
 
         def allgather_base(output_t, input_t):
+            # [FUNCTION DOC] HELPER: Runs the group all_gather_single on the output and input
+            # tensors and waits for completion.
             work = pg.all_gather_single(output_t, input_t)
             work.wait()
 
@@ -499,10 +582,15 @@ class ProcessGroupNCCLOpTest(MultiProcContinuousTest):
     @requires_nccl()
     @skip_but_pass_in_sandcastle_if(not TEST_MULTIGPU, "NCCL test requires 2+ GPUs")
     def test_allgather_base_basics(self):
+        # [FUNCTION DOC] Asserts all_gather_single raises ValueError when the output size is not
+        # world size times the input size, and TypeError when the output dtype differs from the
+        # input dtype (that case also has a mis-sized output, so the type check must be reported).
         pg = self.pg
         local_device_id = self.rank_to_GPU[self.rank][0]
 
         def allgather_base(output_t, input_t):
+            # [FUNCTION DOC] HELPER: Runs the group all_gather_single on the output and input
+            # tensors and waits for completion.
             work = pg.all_gather_single(output_t, input_t)
             work.wait()
 
@@ -532,11 +620,17 @@ class ProcessGroupNCCLOpTest(MultiProcContinuousTest):
     @requires_nccl()
     @skip_but_pass_in_sandcastle_if(not TEST_MULTIGPU, "NCCL test requires 2+ GPUs")
     def test_gather_ops(self):
+        # [FUNCTION DOC] For each root rank, gathers one-element tensors holding the sender's rank
+        # into per-GPU output lists (filled with -1) at the root, and the root asserts the lists
+        # equal the ranks in order.
         pg = self.pg
         local_device_ids = self.rank_to_GPU[self.rank]
         num_gpus = len(local_device_ids)
 
         def gather(output_t, input_t, rootRank):
+            # [FUNCTION DOC] HELPER: Sets the root rank in the options; the root calls the group
+            # gather with its output lists and the input tensors, other ranks pass an empty output
+            # list; then waits for the work.
             opts = c10d.GatherOptions()
             opts.rootRank = rootRank
             if rootRank == self.rank:
@@ -567,11 +661,16 @@ class ProcessGroupNCCLOpTest(MultiProcContinuousTest):
     @requires_nccl()
     @skip_but_pass_in_sandcastle_if(not TEST_MULTIGPU, "NCCL test requires 2+ GPUs")
     def test_gather_stress(self):
+        # [FUNCTION DOC] Repeats the gather test across 1000 prepared sets of input and output
+        # tensors for each root rank, with the root verifying the output after each call.
         pg = self.pg
         local_device_ids = self.rank_to_GPU[self.rank]
         num_gpus = len(local_device_ids)
 
         def gather(output_t, input_t, rootRank):
+            # [FUNCTION DOC] HELPER: Sets the root rank in the options; the root calls the group
+            # gather with its output lists and the input tensors, other ranks pass an empty output
+            # list; then waits for the work.
             opts = c10d.GatherOptions()
             opts.rootRank = rootRank
             if rootRank == self.rank:
@@ -609,6 +708,10 @@ class ProcessGroupNCCLOpTest(MultiProcContinuousTest):
     @requires_nccl()
     @skip_but_pass_in_sandcastle_if(not TEST_MULTIGPU, "NCCL test requires 2+ GPUs")
     def test_gather_checks(self):
+        # [FUNCTION DOC] Asserts argument validation of the group gather: a root rank of -1 or
+        # equal to the world size raises ValueError (invalid root rank), passing an integer
+        # instead of an options object raises TypeError (incompatible function arguments), and an
+        # empty input tensor list raises RuntimeError from the dispatcher (no tensor arguments).
         pg = self.pg
         device_id = self.rank_to_GPU[self.rank][0]
 
@@ -645,11 +748,17 @@ class ProcessGroupNCCLOpTest(MultiProcContinuousTest):
     @requires_nccl()
     @skip_but_pass_in_sandcastle_if(not TEST_MULTIGPU, "NCCL test requires 2+ GPUs")
     def test_scatter_ops(self):
+        # [FUNCTION DOC] For each root rank, scatters per-GPU lists of tensors (element r
+        # holds the value r) from the root and asserts the output on every rank equals that
+        # rank's own value.
         pg = self.pg
         local_device_ids = self.rank_to_GPU[self.rank]
         num_gpus = len(local_device_ids)
 
         def scatter(output_t, input_t, rootRank):
+            # [FUNCTION DOC] HELPER: Sets the root rank in the options; the root calls the group
+            # scatter with its output and input lists, other ranks pass an empty input list; then
+            # waits for the work.
             opts = c10d.ScatterOptions()
             opts.rootRank = rootRank
             if rootRank == self.rank:
@@ -680,11 +789,16 @@ class ProcessGroupNCCLOpTest(MultiProcContinuousTest):
     @requires_nccl()
     @skip_but_pass_in_sandcastle_if(not TEST_MULTIGPU, "NCCL test requires 2+ GPUs")
     def test_scatter_stress(self):
+        # [FUNCTION DOC] Repeats the scatter test across 1000 prepared sets of tensors for each
+        # root rank, verifying the output after each call.
         pg = self.pg
         local_device_ids = self.rank_to_GPU[self.rank]
         num_gpus = len(local_device_ids)
 
         def scatter(output_t, input_t, rootRank):
+            # [FUNCTION DOC] HELPER: Sets the root rank in the options; the root calls the group
+            # scatter with its output and input lists, other ranks pass an empty input list; then
+            # waits for the work.
             opts = c10d.ScatterOptions()
             opts.rootRank = rootRank
             if rootRank == self.rank:
@@ -722,6 +836,10 @@ class ProcessGroupNCCLOpTest(MultiProcContinuousTest):
     @requires_nccl()
     @skip_but_pass_in_sandcastle_if(not TEST_MULTIGPU, "NCCL test requires 2+ GPUs")
     def test_scatter_checks(self):
+        # [FUNCTION DOC] Asserts argument validation of the group scatter: a root rank of -1 or
+        # equal to the world size raises ValueError (invalid root rank), an integer instead of an
+        # options object raises TypeError, and an empty output list raises RuntimeError from the
+        # dispatcher (no tensor arguments).
         pg = self.pg
         local_device_ids = self.rank_to_GPU[self.rank]
         num_gpus = len(local_device_ids)
@@ -764,10 +882,15 @@ class ProcessGroupNCCLOpTest(MultiProcContinuousTest):
     @requires_nccl()
     @skip_but_pass_in_sandcastle_if(not TEST_MULTIGPU, "NCCL test requires 2+ GPUs")
     def test_reduce_scatter_base_basics(self):
+        # [FUNCTION DOC] Asserts reduce_scatter_single raises ValueError when the input size is
+        # not output size times world size, and TypeError when input and output dtypes differ (the
+        # dtype case also has a mis-sized output).
         pg = self.pg
         local_device_id = self.rank_to_GPU[self.rank][0]
 
         def reduce_scatter_base(output_t, input_t):
+            # [FUNCTION DOC] HELPER: Runs the group reduce_scatter_single on the output and input
+            # tensors and waits for completion.
             work = pg.reduce_scatter_single(output_t, input_t)
             work.wait()
 
@@ -797,6 +920,9 @@ class ProcessGroupNCCLOpTest(MultiProcContinuousTest):
     @requires_nccl()
     @skip_but_pass_in_sandcastle_if(not TEST_MULTIGPU, "NCCL test requires 2+ GPUs")
     def test_reduce_scatter_v(self):
+        # [FUNCTION DOC] Uneven reduce_scatter through the functional API: every rank supplies a
+        # list of ones tensors of sizes 0..world size minus 1, and rank r receives a tensor of
+        # size r that must equal the world size in every element.
         device = torch.device("cuda", self.rank_to_GPU[self.rank][0])
         # A list of tensors with different sizes
         input_list = [torch.ones(i, device=device) for i in range(self.world_size)]
@@ -810,6 +936,9 @@ class ProcessGroupNCCLOpTest(MultiProcContinuousTest):
     @requires_nccl()
     @skip_but_pass_in_sandcastle_if(not TEST_MULTIGPU, "NCCL test requires 2+ GPUs")
     def test_all_gather_v(self):
+        # [FUNCTION DOC] Uneven all_gather through the functional API: rank r contributes a tensor
+        # of size r filled with r, and every rank must receive the list of tensors of sizes
+        # 0..world size minus 1 with those values.
         device = torch.device("cuda", self.rank_to_GPU[self.rank][0])
         # A list of tensors with different sizes
         output_list = [torch.zeros(i, device=device) for i in range(self.world_size)]
@@ -823,11 +952,18 @@ class ProcessGroupNCCLOpTest(MultiProcContinuousTest):
     @requires_nccl()
     @skip_but_pass_in_sandcastle_if(not TEST_MULTIGPU, "NCCL test requires 2+ GPUs")
     def test_reduce_scatter_ops(self):
+        # [FUNCTION DOC] Using lists-of-lists inputs where rank r holds the values r+1, r+2, ...
+        # (one per destination), checks SUM, MIN, MAX and PRODUCT results for each local GPU
+        # against closed-form expected values. Then repeats the four ops with a single output
+        # tensor and a flat list of inputs, and when NCCL is 2.11.1 or newer compares premul sum
+        # (scalar and tensor factor) against a plain sum of pre-scaled inputs.
         pg = self.pg
         local_device_ids = self.rank_to_GPU[self.rank]
         num_gpus = len(local_device_ids)
 
         def reduce_scatter(outputs, input_lists, op):
+            # [FUNCTION DOC] HELPER: Runs the group reduce_scatter with the given outputs, input
+            # lists and reduce op set in the options, and waits for completion.
             opts = c10d.ReduceScatterOptions()
             opts.reduceOp = op
             work = pg.reduce_scatter(outputs, input_lists, opts)
@@ -934,10 +1070,15 @@ class ProcessGroupNCCLOpTest(MultiProcContinuousTest):
     @requires_nccl()
     @skip_but_pass_in_sandcastle_if(not TEST_MULTIGPU, "NCCL test requires 2+ GPUs")
     def test_reduce_scatter_base_ops(self):
+        # [FUNCTION DOC] Each rank supplies the sequence 0..world size minus 1 as input and a one-
+        # element output; after reduce_scatter_single the output must equal the rank times the
+        # world size.
         pg = self.pg
         local_device_id = self.rank_to_GPU[self.rank][0]
 
         def reduce_scatter_base(output_t, input_t):
+            # [FUNCTION DOC] HELPER: Runs the group reduce_scatter_single on the output and input
+            # tensors and waits for completion.
             work = pg.reduce_scatter_single(output_t, input_t)
             work.wait()
 
@@ -960,6 +1101,10 @@ class ProcessGroupNCCLOpTest(MultiProcContinuousTest):
         not PLATFORM_SUPPORTS_FP8, "Float8 requires sm >= 90"
     )
     def test_reduce_scatter_float8(self):
+        # [FUNCTION DOC] Skipped on Linux, with NCCL older than 2.24, with fewer than two GPUs, or
+        # without float8 platform support. Reduce-scatters ones of type float8 e5m2 (world size
+        # times 1024 elements into 1024) through the functional API and asserts each output
+        # element equals the world size.
         device = torch.device("cuda", self.rank_to_GPU[self.rank][0])
 
         numel = 1024
@@ -978,6 +1123,9 @@ class ProcessGroupNCCLOpTest(MultiProcContinuousTest):
 
     @skip_but_pass_in_sandcastle_if(not TEST_MULTIGPU, "NCCL test requires 2+ GPUs")
     def test_reduce_scatter_bfloat16(self):
+        # [FUNCTION DOC] Reduce-scatters ones of type bfloat16 (world size times 1024 elements
+        # into 1024) through the functional API and asserts each output element equals the world
+        # size. Needs at least two GPUs but has no NCCL availability decorator.
         device = torch.device("cuda", self.rank_to_GPU[self.rank][0])
 
         numel = 1024
@@ -998,10 +1146,16 @@ class ProcessGroupNCCLOpTest(MultiProcContinuousTest):
     @requires_nccl()
     @skip_but_pass_in_sandcastle_if(not TEST_MULTIGPU, "NCCL test requires 2+ GPUs")
     def test_barrier(self):
+        # [FUNCTION DOC] Starts all_reduce works on tensor lists spanning 1 up to the number
+        # of local GPUs, calls the group barrier and waits for it, and then asserts every
+        # tensor equals its value times the world size, showing the barrier ordered after
+        # the prior works.
         pg = self.pg
         local_device_ids = self.rank_to_GPU[self.rank]
 
         def allreduce(tensors):
+            # [FUNCTION DOC] HELPER: Starts the group allreduce on the tensors with default
+            # options and returns the work without waiting.
             opts = c10d.AllreduceOptions()
             work = pg.allreduce(tensors, opts)
             return work
@@ -1033,6 +1187,9 @@ class ProcessGroupNCCLOpTest(MultiProcContinuousTest):
     @requires_nccl()
     @skip_but_pass_in_sandcastle_if(not TEST_MULTIGPU, "NCCL test requires 2+ GPUs")
     def test_send_recv(self):
+        # [FUNCTION DOC] Seeds the random generator so both ranks create the same 10 by 10 tensor;
+        # rank 0 sends it to rank 1, which receives into a fresh random tensor and asserts
+        # equality. Other ranks do nothing.
         device = self.rank_to_GPU[self.rank][0]
 
         # Generate the same random tensor
@@ -1048,6 +1205,8 @@ class ProcessGroupNCCLOpTest(MultiProcContinuousTest):
     @requires_nccl()
     @skip_but_pass_in_sandcastle_if(not TEST_MULTIGPU, "NCCL test requires 2+ GPUs")
     def test_send_recv_complex(self):
+        # [FUNCTION DOC] Same as the send/recv test but with a complex float tensor: rank 0 sends,
+        # rank 1 receives and compares.
         device = self.rank_to_GPU[self.rank][0]
 
         # Generate the same random tensor
@@ -1063,6 +1222,8 @@ class ProcessGroupNCCLOpTest(MultiProcContinuousTest):
     @requires_nccl()
     @skip_but_pass_in_sandcastle_if(not TEST_MULTIGPU, "NCCL test requires 2+ GPUs")
     def test_send_recv_object_list(self):
+        # [FUNCTION DOC] Rank 0 sends a list of objects (value 99) to rank 1 with the device
+        # argument, and rank 1 receives into its own list and asserts the first element is 99.
         device = self.rank_to_GPU[self.rank][0]
 
         val = 99 if self.rank == 0 else None
@@ -1076,12 +1237,18 @@ class ProcessGroupNCCLOpTest(MultiProcContinuousTest):
     @requires_nccl()
     @skip_but_pass_in_sandcastle_if(not TEST_MULTIGPU, "NCCL test requires 2+ GPUs")
     def test_tensor_register_hook(self):
+        # [FUNCTION DOC] Sets the environment variable that enables the tensor register allocator
+        # hook, runs an all_gather_single of each rank id into a world-size tensor and asserts it
+        # equals the ranks in order, then removes the variable. Side effect: the variable is
+        # removed only if the test reaches the end.
         os.environ["TORCH_NCCL_USE_TENSOR_REGISTER_ALLOCATOR_HOOK"] = "1"
 
         pg = self.pg
         local_device_id = self.rank_to_GPU[self.rank][0]
 
         def allgather_base(output_t, input_t):
+            # [FUNCTION DOC] HELPER: Runs the group all_gather_single on the output and input
+            # tensors and waits for completion.
             work = pg.all_gather_single(output_t, input_t)
             work.wait()
 
@@ -1103,6 +1270,11 @@ class ProcessGroupNCCLOpTest(MultiProcContinuousTest):
     @requires_nccl()
     @skip_but_pass_in_sandcastle_if(not TEST_MULTIGPU, "NCCL test requires 2+ GPUs")
     def test_reduce_op_premul_sum(self):
+        # [FUNCTION DOC] Skipped if NCCL is older than 2.11.1. Checks the PREMUL_SUM reduce op
+        # with scalar and tensor factors for half, float and double in all_reduce, reduce (every
+        # root) and reduce_scatter against closed-form expected values, then asserts
+        # PREMUL_SUM(2.0) yields a ReduceOp, two equal ones compare equal, and the PREMUL_SUM enum
+        # value is 8.
         if torch.cuda.nccl.version() < (2, 11, 1):
             self.skipTest("NCCL 2.11.1+ is required for PREMUL_SUM")
 
@@ -1110,12 +1282,16 @@ class ProcessGroupNCCLOpTest(MultiProcContinuousTest):
         local_device_id = self.rank_to_GPU[self.rank][0]
 
         def allreduce(tensors, op):
+            # [FUNCTION DOC] HELPER: Runs the group allreduce on the tensor list with the given
+            # reduce op and waits for completion.
             opts = c10d.AllreduceOptions()
             opts.reduceOp = op
             work = pg.allreduce(tensors, opts)
             work.wait()
 
         def reduce(tensors, op, root=0):
+            # [FUNCTION DOC] HELPER: Runs the group reduce on the tensor list with the given
+            # reduce op and root rank (default 0) and waits for completion.
             opts = c10d.ReduceOptions()
             opts.reduceOp = op
             opts.rootRank = root
@@ -1123,6 +1299,8 @@ class ProcessGroupNCCLOpTest(MultiProcContinuousTest):
             work.wait()
 
         def reduce_scatter(output, input_lists, op):
+            # [FUNCTION DOC] HELPER: Runs the group reduce_scatter with the given output, input
+            # lists and reduce op, and waits for completion.
             opts = c10d.ReduceScatterOptions()
             opts.reduceOp = op
             work = pg.reduce_scatter(output, input_lists, opts)

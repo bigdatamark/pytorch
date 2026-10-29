@@ -1,5 +1,10 @@
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC] Backend-parameterized ProcessGroup API tests: rank normalization in
+# new_group, group and work sequence numbers, collective timing, group init order, work
+# registry cleanup, async work lifetime, stream-ordered wait, and work result/future APIs.
+# AbstractProcessGroupTest is instantiated once per entry of C10D_BACKENDS. Import-time
+# side effects: exits with status 0 if torch.distributed is unavailable.
 import math
 import sys
 
@@ -23,7 +28,15 @@ from torch.testing._internal.common_utils import get_cycles_per_ms, run_tests
 
 
 class AbstractProcessGroupTest(C10dBackendTest):
+    # [CLASS DOC] Backend-agnostic tests of ProcessGroup and Work behavior on a two-rank
+    # group. Capability flags (sequence numbers, timing, work results, etc.) injected by
+    # instantiate_backend_tests decide which tests are skipped for a backend.
     def test_new_group_rank_normalization(self):
+        # [FUNCTION DOC] Creates a group from a tensor of all ranks and checks the reported
+        # group ranks are the plain list of ints; a broadcast from rank 0 zeroes every
+        # rank's tensor. Also asserts that a float tensor of ranks raises TypeError (ranks
+        # must be a sequence of integers) and that a duplicate rank given as a mix of int
+        # and tensor raises ValueError.
         self._init_pg()
 
         ranks = torch.arange(self.world_size)
@@ -43,6 +56,10 @@ class AbstractProcessGroupTest(C10dBackendTest):
             dist.new_group(ranks=[0, torch.tensor(0)])
 
     def test_sequence_numbers(self):
+        # [FUNCTION DOC] Skipped if the backend lacks sequence numbers. Checks the default
+        # group sequence number starts at 0 and increments by one per all_reduce (3 calls),
+        # and that a new subgroup has its own counter (0 then 1 after one all_reduce) while
+        # the default group's counter stays at 3.
         if not self.supports_sequence_numbers:
             self.skipTest(f"{self.backend_name} does not support sequence numbers")
         self._init_pg()
@@ -61,6 +78,10 @@ class AbstractProcessGroupTest(C10dBackendTest):
         self.assertEqual(default_pg._get_sequence_number_for_group(), 3)
 
     def test_work_sequence_number(self):
+        # [FUNCTION DOC] Skipped if the backend does not report work sequence numbers. Three
+        # async all_reduce calls on the default group must return work whose sequence
+        # number is 1, 2, 3 (matching the group counter); then an async all_reduce on a new
+        # subgroup must report sequence number 1.
         if not self.supports_work_sequence_number:
             self.skipTest(f"{self.backend_name} does not report work seq numbers")
         self._init_pg()
@@ -79,6 +100,10 @@ class AbstractProcessGroupTest(C10dBackendTest):
         work.wait()
 
     def test_work_duration(self):
+        # [FUNCTION DOC] Skipped if collective timing is unsupported. A work completed
+        # before timing is enabled must raise RuntimeError when its duration is queried.
+        # After enabling collectives timing on the default group, a new all_reduce work
+        # (after wait and a CUDA synchronize on cuda) must report a positive finite duration.
         if not self.supports_collectives_timing:
             self.skipTest(f"{self.backend_name} does not support collectives timing")
         self._init_pg()
@@ -101,6 +126,10 @@ class AbstractProcessGroupTest(C10dBackendTest):
         self.assertTrue(math.isfinite(duration))
 
     def test_different_group_initialization_order(self):
+        # [FUNCTION DOC] Creates a full-world group and then a singleton group containing
+        # rank 0 (on cuda sets the device to 0 first). Rank 0 runs an all_reduce on the
+        # singleton and checks the tensor is unchanged; all ranks then meet at a barrier on
+        # the full group. Verifies group creation order does not hang or break.
         self._init_pg()
         if self.device_type == "cuda":
             torch.cuda.set_device(0)
@@ -113,6 +142,9 @@ class AbstractProcessGroupTest(C10dBackendTest):
         dist.barrier(group=full_group)
 
     def test_wait_unregisters_work(self):
+        # [FUNCTION DOC] Within the context allowing in-flight collectives as graph input,
+        # asserts the global work registry is empty, holds one entry after an async
+        # all_reduce, and is empty again after wait on that work.
         self._init_pg()
         with _functional_collectives.allow_inflight_collective_as_graph_input_ctx():
             tensor = torch.ones(1, device=self.device)
@@ -123,6 +155,10 @@ class AbstractProcessGroupTest(C10dBackendTest):
             self.assertEqual(torch._C._distributed_c10d._get_work_registry_size(), 0)
 
     def test_async_work_lifetime(self):
+        # [FUNCTION DOC] Issues an async all_reduce, drops the work handle, and after a
+        # barrier asserts the tensor holds the sum over ranks of (rank + 1). Then repeats
+        # with the input tensor and the work both deleted, expecting only a clean barrier
+        # (no crash), proving the collective keeps its buffers alive.
         self._init_pg()
         tensor = torch.full((4,), float(self.rank + 1), device=self.device)
         work = dist.all_reduce(tensor, async_op=True)
@@ -138,6 +174,10 @@ class AbstractProcessGroupTest(C10dBackendTest):
         dist.barrier()
 
     def test_work_wait_is_stream_ordered(self):
+        # [FUNCTION DOC] Skipped on non-cuda backends. Warms up, then sleeps the current
+        # stream about 250 ms and issues an async all_reduce; after wait returns, asserts
+        # the current stream is still busy (query false), showing wait only orders the
+        # current stream rather than blocking the host. Then synchronizes.
         if self.device_type != "cuda":
             self.skipTest(f"{self.backend_name} does not use CUDA")
         self._init_pg()
@@ -152,6 +192,9 @@ class AbstractProcessGroupTest(C10dBackendTest):
         torch.cuda.synchronize()
 
     def test_work_result_future(self):
+        # [FUNCTION DOC] Skipped if the backend lacks work results. Waits on the future
+        # result of an async all_reduce, expecting it converts to WorkResult.SUCCESS, and
+        # asserts the work reports completed.
         if not self.supports_work_result:
             self.skipTest(f"{self.backend_name} does not report work results")
         self._init_pg()
@@ -163,6 +206,8 @@ class AbstractProcessGroupTest(C10dBackendTest):
         self.assertTrue(work.is_completed())
 
     def test_work_future(self):
+        # [FUNCTION DOC] Waits on the future from an async all_reduce and asserts the tensor
+        # holds the sum over ranks of (rank + 1).
         self._init_pg()
         tensor = torch.full((4,), float(self.rank + 1), device=self.device)
         work = dist.all_reduce(tensor, async_op=True)
