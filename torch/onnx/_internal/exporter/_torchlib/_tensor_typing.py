@@ -1,3 +1,7 @@
+# [MODULE DOC] HELPER: Type aliases and constrained TypeVars (built from onnxscript tensor
+# types) used to annotate torchlib op implementations: TensorType, IntType, RealType and
+# TypeVars such as TTensor, TFloat, TInt, TReal. Unsigned types beyond UINT8 are omitted.
+# Import-time side effects: only creates the aliases and type variables.
 """Typings for function definitions."""
 
 from __future__ import annotations

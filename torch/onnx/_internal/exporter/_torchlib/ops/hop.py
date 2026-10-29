@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# torchlib ONNX implementations of PyTorch higher-order operators: cond (ONNX If), scan
+# (ONNX Scan), while_loop (ONNX Loop) and invoke_subgraph (a direct function call node).
+# Also defines call_op, a helper that records a node on the current tracer. Importing the
+# module registers the four implementations (no_compile) in the torchlib registry.
 """Implementation for higher-order operators."""
 
 from __future__ import annotations
@@ -21,6 +26,11 @@ def call_op(
     _domain: str = "",
     **kwargs: int | float | str | bool | ir.Graph | ir.TensorProtocol | Sequence[int],
 ) -> Sequence[ir.Value]:
+    # [FUNCTION DOC] HELPER: Creates a node of op_type in domain _domain, using positional
+    # args as inputs and keyword args as attributes, and appends it to the current tracer
+    # node list (AssertionError if no tracer is active). Trailing None inputs are dropped,
+    # None-valued attributes filtered out, the node version is the tracer opset version,
+    # and the node has _num_outputs outputs. Returns those outputs.
     """Call an operator with the given arguments and keyword arguments.
 
     Arguments are always inputs, while keyword arguments are attributes.
@@ -68,6 +78,11 @@ def higher_order_cond(
     false_func: ir.Function,
     inputs: Sequence[ir.Value],
 ) -> Sequence[ir.Value]:
+    # [FUNCTION DOC]
+    # Exports the cond higher-order op as an ONNX If node. Each branch becomes a subgraph
+    # with a single node calling the corresponding branch function on the shared inputs;
+    # branch node outputs are renamed with the function name to avoid duplicate output
+    # names (a runtime complaint). Returns the If outputs; output count follows true_func.
     then_node = ir.Node(
         true_func.domain, true_func.name, inputs, num_outputs=len(true_func.outputs)
     )
@@ -103,6 +118,13 @@ def higher_order_scan(
     additional_inputs: Sequence[ir.Value] | None,
     reverse: bool = False,
 ) -> Sequence[ir.Value]:
+    # [FUNCTION DOC]
+    # Exports the scan higher-order op as an ONNX Scan node. The body subgraph has fresh
+    # inputs mirroring the initial carried values (same shape) and the scanned inputs
+    # (shape minus the leading sequence axis), and one node calling body_func with those
+    # plus any additional inputs. Outputs are renamed to avoid duplicate names. The reverse
+    # flag sets all scan input and output directions to reversed. Returns the Scan outputs
+    # (carried finals followed by stacked scan outputs).
     """https://github.com/pytorch/pytorch/blob/66ac724b56e6c37a534f3e066423ef2f41d7477f/torch/_higher_order_ops/scan.py#L109"""
     subgraph_inputs = [
         *[
@@ -165,6 +187,15 @@ def higher_order_while_loop(
     carried_inputs: Sequence[ir.Value | int | float],
     additional_inputs: Sequence[ir.Value],
 ) -> Sequence[ir.Value]:
+    # [FUNCTION DOC]
+    # Exports the while_loop higher-order op as an ONNX Loop node with no trip count.
+    # Carried inputs may be values, Python ints (become int64 scalars) or floats (become
+    # float32 scalars, via constant nodes outside the loop); any other type raises
+    # NotImplementedError. The loop body subgraph runs body_func and then cond_func on the
+    # updated values and returns the new condition plus carried values. The initial
+    # condition is computed by calling cond_func on the initial inputs. Raises
+    # AssertionError if cond_func does not have exactly one output. Returns the Loop outputs.
+    # KNOWN ISSUE: a bool carried input is an int instance, so it is typed as int64 here.
     """Implementation of while_loop using ONNX Loop operator.
 
     The ONNX Loop operator implements a generic looping construct with the signature:
@@ -339,6 +370,11 @@ def higher_order_invoke_subgraph(
     identifier: str | None,
     *operands: ir.Value,
 ) -> Sequence[ir.Value]:
+    # [FUNCTION DOC]
+    # Exports invoke_subgraph as a call node to the given function (not inlined). Side
+    # effect: stores the identifier (as a string, even if None) in the function metadata
+    # under a package-specific key so downstream passes can avoid inlining. Returns the
+    # call node outputs, one per function output.
     """Export invoke_subgraph HOP by creating a direct function call.
 
     This preserves the function as a separate entity in the ONNX graph

@@ -2,6 +2,13 @@
 # mypy: disable-error-code="misc,arg-type,type-arg,valid-type,assignment,return-value,type-var,operator,no-untyped-def,index"
 # pyrefly: ignore-errors
 # ruff: noqa: TC001
+# [MODULE DOC]
+# torchlib ONNX implementations of aten neural-network ops for newer opsets: gelu (opset
+# 20), group_norm (21), rms_norm (23) and scaled_dot_product_attention (23), plus private
+# helpers that build the fallback attention graph (scale, causal mask, key/value head
+# repetition, masked and unmasked attention). Importing registers the public ops.
+# KNOWN ISSUE: the module docstring says these are operators "under the core module",
+# which is wrong for this nn module.
 
 from __future__ import annotations
 
@@ -30,6 +37,9 @@ def aten_gelu_opset20(
     self: TReal,
     approximate: str = "none",
 ) -> TReal:
+    # [FUNCTION DOC]
+    # Emits the native opset 20 Gelu node, passing the approximate mode string ("none" or
+    # "tanh") through as the attribute. Returns the activation output.
     """gelu(Tensor self, *, str approximate="none") -> Tensor"""
     return op20.Gelu(self, approximate=approximate)
 
@@ -43,6 +53,11 @@ def aten_group_norm(
     eps: float = 1e-05,
     cudnn_enabled: bool = True,
 ) -> TFloat:
+    # [FUNCTION DOC]
+    # Emits opset 21 GroupNormalization. ONNX requires per-channel scale and bias, so a
+    # missing weight is replaced by ones and a missing bias by zeros, sized from the
+    # channel dimension (dim 1) of the input and typed like the input. Returns the output.
+    # The cudnn_enabled argument is accepted but unused.
     """group_norm(Tensor input, int num_groups, Tensor? weight=None, Tensor? bias=None, float eps=1e-05, bool cudnn_enabled=True) -> Tensor"""
 
     c = op21.Shape(input, start=1, end=2)
@@ -62,6 +77,12 @@ def aten_rms_norm(
     weight: TFloat | None = None,
     eps: float | None = None,
 ) -> TFloat:
+    # [FUNCTION DOC]
+    # Emits opset 23 RMSNormalization over the trailing len(normalized_shape) dimensions
+    # (negative axis). A missing eps defaults to the float32 machine epsilon; a missing
+    # weight is replaced by a tensor of ones. Returns the normalized output.
+    # KNOWN ISSUE: the default weight is created with the full shape of the input rather
+    # than the normalized shape, and the default eps ignores the input dtype.
     """rms_norm(Tensor input, SymInt[] normalized_shape, Tensor? weight=None, float? eps=None) -> Tensor"""
 
     # Default eps value if not provided
@@ -97,6 +118,16 @@ def aten_scaled_dot_product_attention_23(
     scale: float | None = None,
     enable_gqa: bool = False,
 ) -> TFloat:
+    # [FUNCTION DOC]
+    # Exports SDPA for 4D query, key, value. With dropout_p equal to zero it emits the
+    # opset 23 Attention op (first output only) after validating head counts for MHA or
+    # GQA/MQA. Otherwise it builds an equivalent graph: default scale from the embedding
+    # size, an optional causal mask, key/value head repetition for GQA, then the no-mask or
+    # float-mask attention helper. Raises AssertionError if is_causal is combined with a
+    # mask, if inputs are not 4D, or if head counts are inconsistent.
+    # KNOWN ISSUE: the dropout path adds attn_mask directly, so a boolean mask is not
+    # converted to an additive float mask there; and the helpers' dropout call does not
+    # supply a training mode input, so dropout is a no-op at inference semantics.
     """scaled_dot_product_attention(Tensor query, Tensor key, Tensor value, Tensor? attn_mask=None, float dropout_p=0.0, bool is_causal=False, *, float? scale=None, bool enable_gqa=False) -> Tensor
 
     Reference:
@@ -184,6 +215,10 @@ def aten_scaled_dot_product_attention_23(
 def _attention_repeat_kv_for_group_query(
     query: TFloat, key: TFloat, value: TFloat, op: Opset
 ) -> tuple[TFloat, TFloat]:
+    # [FUNCTION DOC] HELPER: Repeats key and value heads (interleaved) so their head count
+    # matches the query for grouped-query attention, using unsqueeze, expand and reshape on
+    # dynamic shapes. Returns (expanded_key, expanded_value). Raises AssertionError unless
+    # query heads exceed and are a multiple of the (equal) key and value head counts.
     """Expand key and value for group query attention.
 
     repeat_interleave is applied on key and value to match the number of heads in query.
@@ -245,6 +280,8 @@ def _attention_repeat_kv_for_group_query(
 
 
 def _attention_scale(query: TFloat, op: Opset) -> TFloat:
+    # [FUNCTION DOC] HELPER: Builds nodes computing one over the square root of the last
+    # query dimension, cast to the query dtype. Returns the (1-element) scale value.
     """Calculate the scale factor for the attention result.
 
     Args:
@@ -263,6 +300,9 @@ def _attention_scale(query: TFloat, op: Opset) -> TFloat:
 
 
 def _causal_attention_mask(query: TFloat, key: TFloat, op: Opset) -> TFloat:
+    # [FUNCTION DOC] HELPER: Builds an additive causal mask of shape target length by
+    # source length (from dynamic shapes): zero on and below the diagonal, negative
+    # infinity above, cast to the query dtype. Returns the mask value.
     """Create a causal mask for the given query and key tensors.
 
     Equivalent to::
@@ -309,6 +349,10 @@ def _aten_scaled_dot_product_attention_no_mask_onnx(
     dropout_p: float,
     op: Opset,
 ) -> TFloat:
+    # [FUNCTION DOC] HELPER: Attention without a mask. Transposes the last two key axes via
+    # reshape to 3D, transpose, reshape back; scales query and key each by the square root
+    # of scale; softmax over the last axis of their matmul; applies dropout; then matmul
+    # with value. Returns the attention output.
     # Swap the last two axes of key
     key_last_dim = op.Shape(key, start=-1)
     key_second_last_dim = op.Shape(key, start=-2, end=-1)
@@ -348,6 +392,9 @@ def _aten_scaled_dot_product_attention_float_mask_onnx(
     dropout_p: float,
     op: Opset,
 ) -> TFloat:
+    # [FUNCTION DOC] HELPER: Same as the no-mask variant but adds the additive float
+    # attn_mask to the scaled query-key product before the softmax. Returns the output.
+    # KNOWN ISSUE: unlike the no-mask variant, the key scale is not cast to the key dtype.
     # Swap the last two axes of key
     key_last_dim = op.Shape(key, start=-1)
     key_second_last_dim = op.Shape(key, start=-2, end=-1)

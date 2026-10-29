@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Test helper for the ONNX exporter. Exports one public function, assert_onnx_program, that
+# compares the outputs of an ONNXProgram with those of its source ExportedProgram.
+# No import-time side effects beyond imports.
 """Test utilities for ONNX export."""
 
 from __future__ import annotations
@@ -25,6 +29,16 @@ def assert_onnx_program(
     strategy: str | None = "TorchExportNonStrictStrategy",
     backend: Literal["onnxruntime", "reference"] = "onnxruntime",
 ) -> None:
+    # [FUNCTION DOC]
+    # Verifies numerical agreement between an ONNXProgram and its ExportedProgram.
+    # Optionally checks the recorded capture strategy name first. Runs the torch module on
+    # the given or default example inputs, flattens outputs, drops None outputs, wraps
+    # non-tensor outputs as tensors and views complex outputs as real. Then evaluates the
+    # ONNX program with the onnxruntime or reference backend and compares the output
+    # tuples with assert_close (NaNs equal, device ignored, given rtol and atol).
+    # Raises ValueError for a strategy mismatch, a missing ExportedProgram, missing example
+    # inputs, or an unknown backend; assert_close raises on numerical mismatch.
+    # Side effect: executes the model on both runtimes.
     """Assert that the ONNX model produces the same output as the PyTorch ExportedProgram.
 
     Args:

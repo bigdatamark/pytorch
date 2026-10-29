@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Numerical verification of an exported ONNX program against its source ExportedProgram.
+# Public API: VerificationInfo (per-value difference statistics) and verify_onnx_program
+# (compare final outputs, or every intermediate node value). Private helpers compare
+# tensors, map graph value names, and an FX interpreter that checks each node as it runs.
+# Import-time side effect: creates a module logger.
 from __future__ import annotations
 
 
@@ -25,6 +31,11 @@ logger = logging.getLogger(__name__)
 
 @dataclasses.dataclass
 class VerificationInfo:
+    # [CLASS DOC]
+    # Dataclass record of how one value differs between expected (torch) and actual (ONNX)
+    # results: name, maximum absolute and relative difference, histograms of both
+    # difference tensors (counts and bin edges) and the two dtypes. Built with from_tensors
+    # and exported to plain data with asdict.
     """Verification information for a value in the ONNX program.
 
     This class contains the maximum absolute difference, maximum relative difference,
@@ -63,6 +74,11 @@ class VerificationInfo:
         expected: torch.Tensor | float | int | bool,
         actual: torch.Tensor | float | int | bool,
     ) -> VerificationInfo:
+        # [FUNCTION DOC]
+        # Class constructor from two values. Python scalars are converted to tensors. Computes
+        # max absolute and relative differences and elementwise difference tensors via the
+        # comparison helper, then histograms both with fixed bin edges from zero up to one
+        # million. Returns a VerificationInfo with the dtypes of the converted inputs.
         """Create a VerificationInfo object from two tensors.
 
         Args:
@@ -98,6 +114,9 @@ class VerificationInfo:
         )
 
     def asdict(self) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Returns a plain mapping of the fields: histograms become lists of counts and bin
+        # edges (as nested lists) and dtypes become strings. No side effects.
         """Convert the VerificationInfo object to a dictionary.
 
         Returns:
@@ -124,6 +143,13 @@ def _compare_tensors(
     expected: torch.Tensor,
     actual: torch.Tensor,
 ) -> tuple[float, float, torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Compares two tensors on the CPU (detached). If either is empty,
+    # returns infinity for both maxima and infinite scalar difference tensors. Booleans are
+    # cast to float32 and a complex expected tensor is viewed as real. Returns (max absolute
+    # difference, max relative difference, absolute difference tensor, relative difference
+    # tensor), where relative difference divides by the absolute expected value plus 1e-7.
+    # KNOWN ISSUE: shapes are assumed broadcast-compatible (a mismatch raises from torch),
+    # a bool actual with non-bool expected is not converted, and NaNs are not special-cased.
     # Move tensors to the same device
     expected = expected.detach().cpu()
     actual = actual.detach().cpu()
@@ -151,6 +177,15 @@ def verify_onnx_program(
     kwargs: dict[str, Any] | None = None,
     compare_intermediates: bool = False,
 ) -> list[VerificationInfo]:
+    # [FUNCTION DOC]
+    # Checks an ONNX program against its ExportedProgram. Uses default example inputs when
+    # neither args nor kwargs is given. Raises ValueError if the program has no exported
+    # program or no example inputs are available. Without intermediates it runs the torch
+    # module and the ONNX program, pairs outputs with graph output names and returns one
+    # VerificationInfo per output. With compare_intermediates it runs the verification
+    # interpreter and returns infos for every matched node value (outputs included).
+    # KNOWN ISSUE: outputs are paired by position with silent truncation to the shortest,
+    # and None or complex torch outputs are not adapted as the testing helper does.
     """Verify the ONNX model by comparing the values with the expected values from ExportedProgram.
 
     Args:
@@ -213,6 +248,9 @@ def verify_onnx_program(
 
 
 def _create_value_mapping(graph: ir.Graph) -> dict[str, ir.Value]:
+    # [FUNCTION DOC] HELPER: Builds a mapping from value name to value for the graph
+    # initializers, named inputs and named node outputs (unnamed values are skipped).
+    # Subgraph values are not included. Returns the mapping.
     """Return a dictionary mapping names to values in the graph.
 
     The mapping does not include values from subgraphs.
@@ -239,6 +277,10 @@ def _create_value_mapping(graph: ir.Graph) -> dict[str, ir.Value]:
 
 
 class _VerificationInterpreter(torch.fx.Interpreter):
+    # [CLASS DOC] HELPER: FX interpreter over the exported module that, after executing each
+    # function-call node, computes the same-named value from the ONNX program and records a
+    # VerificationInfo. State: the ONNX program, a name-to-value map of its graph, the
+    # current flat args, and the verification_infos list (reset on every run).
     """Interpreter for verifying converted ONNX model accuracy by comparing intermediate values.
 
     To compare models, first initialize the interpreter with an ONNX program.
@@ -264,6 +306,9 @@ class _VerificationInterpreter(torch.fx.Interpreter):
     """
 
     def __init__(self, onnx_program: torch.onnx.ONNXProgram) -> None:
+        # [FUNCTION DOC] HELPER: Stores the program, builds the value-name mapping of its
+        # graph and initializes empty args and results. Interprets the exported module.
+        # Raises ValueError if the program has no exported program.
         """Initialize the _VerificationInterpreter with an ONNX program.
 
         Args:
@@ -286,6 +331,9 @@ class _VerificationInterpreter(torch.fx.Interpreter):
         initial_env: dict[torch.fx.Node, Any] | None = None,
         enable_io_processing: bool = True,
     ) -> Any:
+        # [FUNCTION DOC] HELPER: Clears previous results, remembers the input args for ONNX
+        # evaluation, then runs the base interpreter. Returns the module result; fills
+        # verification_infos as a side effect.
         """Run the interpreter with the given input arguments.
 
         This method executes the model and populates the :attr:`verification_infos` attribute
@@ -308,6 +356,11 @@ class _VerificationInterpreter(torch.fx.Interpreter):
         )
 
     def run_node(self, n: torch.fx.Node) -> Any:
+        # [FUNCTION DOC] HELPER: Executes the node normally. For function-call nodes whose
+        # name exists in the ONNX graph, computes that value from the ONNX program on the
+        # saved args (failures are logged as warnings and the node is skipped), appends a
+        # VerificationInfo and logs it (warning if max abs diff exceeds 0.01 or max rel diff
+        # exceeds 0.1, else info). Always returns the original node result.
         result = super().run_node(n)
         if n.op != "call_function":
             return result

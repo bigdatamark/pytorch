@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# torchlib implementations of the onnx_symbolic custom ops (single-output and multi-output),
+# which let users emit an arbitrary ONNX node. Contains the helper that records the node on
+# the current tracer and two onnx_impl registrations (no_compile) done at import time.
+# KNOWN ISSUE: the docstring below says "higher-order operators", but this module
+# implements the symbolic ONNX op wrappers, not higher-order ops (those are in hop.py).
 """Implementation for higher-order operators."""
 
 from __future__ import annotations
@@ -26,6 +32,11 @@ def _call_symbolic_op(
     version: int | None,
     metadata_props: dict[str, str] | None,
 ) -> Sequence[ir.Value]:
+    # [FUNCTION DOC] HELPER: Builds one ONNX node of the given op_type and domain and
+    # appends it to the current tracer node list (the tracer must be set, else
+    # AssertionError). Trailing None args are dropped, None-valued attributes are filtered
+    # out, num outputs equals len(dtypes), and each output dtype is set from dtypes (graph
+    # builder shapes are left alone). Returns the node outputs.
     """Call an operator with the given arguments and keyword arguments.
 
     Arguments are always inputs, while keyword arguments are attributes.
@@ -90,6 +101,12 @@ def onnx_symbolic_symbolic(
     domain: str = "",
     version: int | None = None,
 ) -> ir.Value:
+    # [FUNCTION DOC]
+    # Implements the single-output symbolic custom op. Decodes the flattened attribute
+    # arrays (keys, types, positions, ints, floats, strings) into a mapping, builds one
+    # node of op_type in the given domain/version with the metadata props zipped from keys
+    # and values, with one output of dtype onnx_dtype, and returns that output. The shape
+    # argument is ignored; the graph builder sets shapes.
     del shape  # Unused. The shapes are set by the graph builder
     encoded = _symbolic_impl.EncodedAttrs(
         attr_keys=list(attr_keys),
@@ -129,6 +146,10 @@ def onnx_symbolic_symbolic_multi_out(
     domain: str = "",
     version: int | None = None,
 ) -> Sequence[ir.Value]:
+    # [FUNCTION DOC]
+    # Multi-output variant of the symbolic custom op: same attribute decoding and node
+    # construction, but the node has one output per entry of onnx_dtypes and all outputs
+    # are returned. The shapes argument is ignored; the graph builder sets shapes.
     del shapes  # Unused. The shapes are set by the graph builder
     encoded = _symbolic_impl.EncodedAttrs(
         attr_keys=list(attr_keys),

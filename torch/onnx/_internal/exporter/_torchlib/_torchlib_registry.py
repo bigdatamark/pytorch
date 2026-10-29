@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Registry of ONNX implementations of torch ops. Provides the onnx_impl decorator, which
+# optionally compiles or wraps a function with onnxscript and appends an OnnxDecompMeta
+# record to a module-level list, and get_torchlib_ops, which imports the ops subpackage
+# to trigger registration and returns all records. Import-time side effects: creates the
+# empty registry list and a logger.
+# KNOWN ISSUE: the logger is created with the literal string "__name__" rather than the
+# module name, so log records are attributed to a logger named "__name__".
 """Registry for aten functions."""
 
 from __future__ import annotations
@@ -35,6 +43,14 @@ def onnx_impl(
     no_compile: bool = False,
     private: bool = False,
 ) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
+    # [FUNCTION DOC]
+    # Decorator factory. target is one torch op overload or a tuple of them; a packet
+    # raises TypeError immediately. The returned decorator leaves the function as is when
+    # no_compile is set, otherwise compiles it with onnxscript (script) or wraps it as a
+    # traced function when trace_only is set, both against the torchlib domain opset v1.
+    # Unless private is set, appends one OnnxDecompMeta per target to the global registry
+    # (carrying is_complex, opset_introduced, and skip_signature_inference from no_compile).
+    # Returns the processed function, so decorated names stay usable.
     """Register an ONNX implementation of a torch op."""
 
     if isinstance(target, torch._ops.OpOverloadPacket):
@@ -47,6 +63,9 @@ def onnx_impl(
     def wrapper(
         func: Callable[_P, _R],
     ) -> Callable[_P, _R]:
+        # [FUNCTION DOC] HELPER: The decorator returned by onnx_impl; compiles or wraps func
+        # as configured, registers it for each target unless private, and returns the
+        # processed function. Mutates the module-level registry list.
         processed_func: Any
         if no_compile:
             processed_func = func
@@ -86,6 +105,10 @@ def onnx_impl(
 
 
 def get_torchlib_ops() -> tuple[_registration.OnnxDecompMeta, ...]:
+    # [FUNCTION DOC]
+    # Imports the ops subpackage so all op modules run their registration decorators, then
+    # returns a snapshot tuple of every registered OnnxDecompMeta. Raises AssertionError
+    # if the registry is still empty. Side effect: first call imports the op modules.
     # Trigger op registration
     from torch.onnx._internal.exporter._torchlib import ops
 

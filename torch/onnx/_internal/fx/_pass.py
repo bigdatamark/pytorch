@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Shared infrastructure for FX graph passes in the FX-based ONNX exporter: the abstract
+# Transform base class, PackageInfo and GraphModuleOnnxMeta metadata records, and helpers
+# that render FX graphs as a table or a full-context unified diff. No import-time side
+# effects beyond imports.
 from __future__ import annotations
 
 import abc
@@ -22,17 +27,29 @@ if TYPE_CHECKING:
 
 @dataclasses.dataclass
 class PackageInfo:
+    # [CLASS DOC]
+    # Dataclass identifying the Python package that defined an op or module: package name,
+    # optional version and optional commit hash (never filled in currently). Used to build
+    # ONNX domain strings.
     package_name: str
     version: str | None
     commit_hash: str | None
 
     def to_onnx_domain_string(self) -> str:
+        # [FUNCTION DOC]
+        # Returns a dot-joined domain string starting with "pkg" followed by the package
+        # name, version and commit hash, skipping any that are empty or None.
         return ".".join(
             filter(None, ("pkg", self.package_name, self.version, self.commit_hash))
         )
 
     @classmethod
     def from_python_class(cls, python_class_name: type | str) -> PackageInfo:
+        # [FUNCTION DOC]
+        # Builds a PackageInfo from a class or a dotted module name. A class is replaced
+        # by its module name; the top-level package is imported and its version attribute
+        # (if any) recorded. The commit hash is always None. Side effect: imports the
+        # package; an unimportable name raises ImportError.
         if isinstance(python_class_name, type):
             python_class_name = python_class_name.__module__
         package_name = python_class_name.split(".")[0]
@@ -45,11 +62,16 @@ class PackageInfo:
 
 @dataclasses.dataclass
 class GraphModuleOnnxMeta:
+    # [CLASS DOC] Dataclass holding ONNX-related metadata for a graph module; currently only
+    # the PackageInfo of the originating package.
     package_info: PackageInfo
 
 
 @contextlib.contextmanager
 def _patch_difflib_sequence_matcher_init():
+    # [FUNCTION DOC] HELPER: Context manager that temporarily replaces the SequenceMatcher
+    # constructor in the difflib module so autojunk is always disabled, and restores the
+    # original on exit (even on error). Global side effect: not thread safe while active.
     """Context patching `difflib.SequenceMatcher` for fx readable graph.
 
     Under this context, the `autojunk` argument of `difflib.SequenceMatcher` will always
@@ -67,6 +89,8 @@ def _patch_difflib_sequence_matcher_init():
     original_init = difflib.SequenceMatcher.__init__
 
     def patched_init(self, isjunk=None, a="", b="", autojunk=True) -> None:
+        # [FUNCTION DOC] HELPER: Calls the original constructor, forcing autojunk off and
+        # ignoring the caller supplied autojunk value.
         original_init(self, isjunk, a, b, autojunk=False)
 
     difflib.SequenceMatcher.__init__ = patched_init  # type: ignore[assignment]
@@ -77,6 +101,9 @@ def _patch_difflib_sequence_matcher_init():
 
 
 def _unified_diff(a: str, b: str) -> str:
+    # [FUNCTION DOC] HELPER: Returns the unified diff of two strings split into lines, with
+    # unlimited context so the whole text is shown and autojunk disabled via the patch
+    # context manager. Returns the text "<no diff>" when the inputs are identical.
     """Return a string containing the unified diff of two strings.
 
     This function calls a patched version of `difflib.unified_diff` with `autojunk` set
@@ -133,10 +160,17 @@ def _transform_diagnose_call_message_formatter(
     *args: Any,
     **kwargs: Any,
 ) -> str:
+    # [FUNCTION DOC] HELPER: Message formatter for a diagnostic call wrapper; ignores the
+    # wrapped function and arguments and returns a text naming the Transform subclass
+    # being run.
     return f"Running {self.__class__.__name__} pass. "
 
 
 def maybe_fx_graph_tabular(graph: torch.fx.Graph) -> str | None:
+    # [FUNCTION DOC]
+    # Captures what the graph tabular print writes to standard output and returns it as a
+    # string; returns None when the optional tabulate dependency is missing (ImportError).
+    # Side effect: temporarily redirects standard output.
     """Return the Graph nodes in tabular format. Equivalent to stdout of `graph.print_tabular()`.
     If `tabulate` is not installed, return `None`.
 
@@ -156,6 +190,11 @@ def maybe_fx_graph_tabular(graph: torch.fx.Graph) -> str | None:
 
 
 class Transform(abc.ABC):
+    # [CLASS DOC]
+    # Abstract base for FX graph passes. Holds the module to transform and the fake tensor
+    # mode detected from node metadata (None if none). Subclasses implement the abstract
+    # _run; the public run delegates to it and may mutate the module or return a new one.
+    # Passes that change the model signature need input/output adapt steps elsewhere.
     """Base class for FX graph transformations to be used by FX-ONNX exporter.
 
     Similar to `FX Interpreter <https://pytorch.org/docs/stable/fx.html#torch.fx.Interpreter>`_,
@@ -193,6 +232,7 @@ class Transform(abc.ABC):
         self,
         module: torch.fx.GraphModule,
     ) -> None:
+        # [FUNCTION DOC] Stores the module and detects its fake tensor mode.
         """Initialize the transform.
 
         Args:
@@ -202,6 +242,9 @@ class Transform(abc.ABC):
         self.fake_mode = self._detect_fake_mode()
 
     def _detect_fake_mode(self) -> fake_tensor.FakeTensorMode | None:
+        # [FUNCTION DOC] HELPER: Collects the val metadata of every graph node and asks dynamo
+        # to detect a fake mode from them, with any active fake mode temporarily unset.
+        # Returns the mode or None.
         """Detect fake mode from the graph.
 
         Scan through all nodes in graph and their meta['val'] to detect fake mode.
@@ -213,6 +256,9 @@ class Transform(abc.ABC):
     def _maybe_fakefy_args(
         self, fake_mode: fake_tensor.FakeTensorMode | None, *args: Any
     ) -> tuple[Any, ...]:
+        # [FUNCTION DOC] HELPER: Returns the args unchanged when fake_mode is None; otherwise
+        # converts each tensor argument to a fake tensor in that mode (cached conversions
+        # are reused) and passes non-tensors through, returning a tuple.
         if fake_mode is None:
             return args
         # NB: This should hit the cache if tensors were fakefied before.
@@ -221,10 +267,14 @@ class Transform(abc.ABC):
             fake_mode.from_tensor(t) if isinstance(t, torch.Tensor) else t for t in args
         )
 
+    # [FUNCTION DOC] HELPER: Abstract hook that subclasses implement to execute the pass on
+    # self.module with the given args and kwargs and return the resulting GraphModule.
     @abc.abstractmethod
     def _run(self, *args, **kwargs) -> torch.fx.GraphModule: ...
 
     def run(self, *args, **kwargs) -> torch.fx.GraphModule:
+        # [FUNCTION DOC] Public entry point: forwards args and kwargs to the subclass _run
+        # and returns its GraphModule (either the mutated self.module or a new one).
         """Run the transform on `self.module`.
 
         Note that this method may or may not mutate `self.module`, and the returned
