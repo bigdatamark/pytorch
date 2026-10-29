@@ -1,5 +1,13 @@
 # Owner(s): ["module: inductor"]
 # ruff: noqa: F841
+# [MODULE DOC] Inductor regression tests that run on a GPU (CUDA, or XPU where noted): minified
+# repros of past bugs plus checks on generated Triton code.
+# The only test class is CudaReproTests; the file ends with a main block that runs the tests when
+# GPU and Triton are available and ASAN is off.
+# Import-time side effects: on ROCm it sets the layout optimization config and the MIOpen NHWC
+# environment variable; it reads DO_PERF_TEST from the environment; it raises a skip (or exits
+# quietly when run as a script) if triton or test_torchinductor cannot be imported; it picks
+# device_type from the current accelerator, falling back to cpu.
 
 import copy
 import functools
@@ -73,6 +81,9 @@ from torch.testing._internal.inductor_utils import skipCUDAIf
 
 
 def _strip_triton_static_asserts(code):
+    # [FUNCTION DOC] HELPER: Return the given generated source text with every line that mentions
+    # a Triton static assert removed, so FileCheck patterns are not confused by those lines. Lines
+    # are re-joined with newlines.
     return "\n".join(
         line for line in code.splitlines() if "tl.static_assert" not in line
     )
@@ -110,14 +121,23 @@ device_type = (
 
 @instantiate_parametrized_tests
 class CudaReproTests(TestCase):
+    # [CLASS DOC] Main collection of GPU inductor repro tests. The class attribute device is the
+    # detected accelerator type and common is the model checking helper from test_torchinductor
+    # (compares compiled and eager results). Each test builds a small model or function, compiles
+    # it with inductor, and compares against eager or inspects generated code. Decorated so
+    # parametrized tests are instantiated.
     device = device_type
     common = check_model_cuda
 
     def test_mm_out_dtype_compile(self):
+        # [FUNCTION DOC] Compile a matrix multiply that requests a float32 output from float16
+        # inputs and check the compiled result has the same dtype and values as eager.
         a = torch.randn(1, 3, device=device_type, dtype=torch.float16)
         b = torch.randn(3, 2, device=device_type, dtype=torch.float16)
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Matrix multiply of the two arguments with an explicit float32
+            # output dtype.
             return torch.mm(x, y, out_dtype=torch.float32)
 
         compiled = torch.compile(fn, backend="inductor", fullgraph=True)
@@ -128,7 +148,12 @@ class CudaReproTests(TestCase):
 
     @unittest.skipIf(not TEST_CUDA, "requires CUDA")
     def test_frexp_non_finite(self):
+        # [FUNCTION DOC] Check that frexp on infinity, negative infinity and NaN gives the same
+        # mantissa and exponent under the inductor backend as in eager (NaN treated as equal).
+        # Skipped without CUDA.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return the frexp decomposition (mantissa, exponent) of the
+            # input.
             return torch.frexp(x)
 
         x = torch.tensor(
@@ -143,6 +168,10 @@ class CudaReproTests(TestCase):
         self.assertEqual(actual_exponent, expected_exponent)
 
     def test_index_put_issue(self):
+        # [FUNCTION DOC] Regression test for an index_put accumulation graph: traces a hand-
+        # written aten forward with make_fx, compiles it with compile_fx_inner on ones-filled GPU
+        # inputs (plus a leading dummy scalar for the self argument) and runs it. Passes if
+        # compilation and execution do not raise.
         def forward(
             self,
             arg76_1,
@@ -151,6 +180,10 @@ class CudaReproTests(TestCase):
             _to_copy_default_67,
             zeros,
         ):
+            # [FUNCTION DOC] HELPER: Traced graph body. Sums one input over dim 0, reshapes it,
+            # selects between it and a filler tensor using a mask, then does an accumulating
+            # index_put into a clone of the zeros input at the given indices. Returns a one-
+            # element tuple. The self argument is unused.
             sum_sym_int_19 = torch.ops.aten.sum(_to_copy_default_67, [0], True)
             view_default_57 = torch.ops.aten.view.default(sum_sym_int_19, [512, 768])
             where_self = torch.ops.aten.where.self(
@@ -178,8 +211,17 @@ class CudaReproTests(TestCase):
         compiled(inps)
 
     def test_view_replay_padding_issue_163328(self):
+        # [FUNCTION DOC] Compile a ReproModule copy with fullgraph and reduce-overhead mode and
+        # assert that both output tensors match eager with the same weights. Seeds the RNG first.
         class ReproModule(nn.Module):
+            # [CLASS DOC] HELPER: Module with two linear layers (16 inputs to 240 outputs each)
+            # used to produce a base tensor reshaped in two different ways.
+            # [FUNCTION DOC] Regression test (issue 163328) for view replay with padded strides
+            # under cudagraph mode: compares compiled and eager outputs of a module whose two
+            # reshaped views come from one concatenated tensor.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Create the two linear layers and store the sizes: 120
+                # output points and 2 trailing positions that go to the second linear.
                 super().__init__()
                 self.num_points_out = 120
                 self.lc_num = 2
@@ -188,6 +230,10 @@ class CudaReproTests(TestCase):
                 self.linear_lc = nn.Linear(input_channels, self.num_points_out * 2)
 
             def forward(self, x: torch.Tensor):
+                # [FUNCTION DOC] HELPER: Split the input along dim 1 into a main part and the last
+                # two entries, flatten each to 2D, run each through its own linear, concatenate
+                # the results along dim 1 and return a mapping with two different reshapes of the
+                # result (5D and 3D) under the keys ten0 and ten1.
                 bs, num_lat, num_lon, channels = x.shape
                 index = num_lat - self.lc_num
 
@@ -219,6 +265,11 @@ class CudaReproTests(TestCase):
         self.assertEqual(compiled_out["ten1"], eager_out["ten1"])
 
     def test_effn_attn_bias_padding(self):
+        # [FUNCTION DOC] Check that an expanded attention bias passed to the efficient SDPA op is
+        # padded so its last dim stride is 1 (needed for alignment) while the broadcast head dim
+        # keeps stride 0. Runs the compiled op, uses FileCheck on the generated code for the
+        # expected stride pattern, and compares the first two outputs against eager using a fully
+        # materialized bias (the remaining outputs are RNG related and skipped).
         batch_size, num_heads, seq_len, head_dim = 2, 32, 512, 128
 
         def fn(
@@ -227,6 +278,9 @@ class CudaReproTests(TestCase):
             value: torch.Tensor,
             input_tensor: torch.Tensor,  # This will be our starting point
         ):
+            # [FUNCTION DOC] HELPER: Expand the bias to the full head and sequence shape and call
+            # the efficient scaled dot product attention op with log-sumexp, no dropout and no
+            # causal mask. Returns that op's result tuple.
             # Input tensor should be [2, 1, 8192, 1] with appropriate strides
             bias = torch.ops.aten.expand(
                 input_tensor, [2, 32, seq_len, seq_len]
@@ -272,6 +326,11 @@ class CudaReproTests(TestCase):
     @skipIfXpu(msg="RuntimeError, not target, torch-xpu-ops: 2697")
     @skipIfRocmArch(MI350_ARCH)
     def test_effn_attn_bias_padding_misaligned(self):
+        # [FUNCTION DOC] For three sequence lengths around 1008 (misaligned versus 8), compile
+        # bf16 efficient-attention SDPA with a boolean mask and check the padded bias has an
+        # expanded dim, only a single strided buffer allocation appears in the generated code, and
+        # the output matches eager. Resets dynamo each iteration. Skipped on XPU and on ROCm MI350
+        # because of known mismatches.
         seqlen_start = 1008
 
         for offset in range(-1, 2):
@@ -294,6 +353,8 @@ class CudaReproTests(TestCase):
             inputs = [q, k, v, mask]
 
             def f(q, k, v, mask):
+                # [FUNCTION DOC] HELPER: Scaled dot product attention restricted to the efficient
+                # attention backend with the given boolean mask and no dropout.
                 with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
                     return F.scaled_dot_product_attention(
                         q, k, v, attn_mask=mask, dropout_p=0.0
@@ -316,6 +377,10 @@ class CudaReproTests(TestCase):
         "Does not support mem_eff_attention",
     )
     def test_mha_mem_eff_attention_backward_large_batch_compile(self):
+        # [FUNCTION DOC] Regression test for compiled MultiheadAttention backward with a very
+        # large batch (65536) and a key padding mask using fp16 on GPU. Compares outputs and the
+        # input gradients of the compiled and eager modules, with looser tolerances on XPU.
+        # Skipped when memory-efficient attention is not supported.
         torch.manual_seed(0)
 
         eager = nn.MultiheadAttention(
@@ -367,6 +432,9 @@ class CudaReproTests(TestCase):
         self.assertEqual(compiled_kv.grad, eager_kv.grad, **tol_kwargs)
 
     def test_input_channels_last(self):
+        # [FUNCTION DOC] Check a conv model with a channels_last input: first via the common
+        # checker, then verify that a compiled call returns an output that is still channels_last
+        # contiguous.
         m = torch.nn.Sequential(
             torch.nn.Conv2d(3, 3, 1, 1),
             ToTuple(),
@@ -385,14 +453,22 @@ class CudaReproTests(TestCase):
 
         @torch.compile()
         def foo(m, inp):
+            # [FUNCTION DOC] HELPER: Compiled wrapper that just calls the model on the input.
             return m(inp)
 
         self.assertTrue(foo(m, inp)[0].is_contiguous(memory_format=torch.channels_last))
 
     # https://github.com/pytorch/torchdynamo/issues/1681#issuecomment-1283433527
     def test_unspec_inputs_interop(self):
+        # [FUNCTION DOC] Regression test (torchdynamo issue 1681) for mixing a GPU tensor with odd
+        # strides and a CPU zero-dim int64 input: traces a small aten module with make_fx,
+        # compiles it with compile_fx_inner and runs it. Passes if no exception is raised.
         class Repro(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module returning a permuted unsqueezed view of the first input
+            # and the second input plus one.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Unsqueeze x at dim 4 and permute to move the last two
+                # dims, add 1 to y, and return both in a list.
                 unsqueeze = torch.ops.aten.unsqueeze.default(x, 4)
                 permute = torch.ops.aten.permute.default(unsqueeze, [0, 1, 2, 4, 3])
                 add = torch.ops.aten.add.Tensor(y, 1)
@@ -412,7 +488,11 @@ class CudaReproTests(TestCase):
         IS_FBCODE, "RuntimeError: Triton Error [CUDA]: invalid device context"
     )
     def test_backward_context(self):
+        # [FUNCTION DOC] Compile a trivial multiply and run backward through it, checking that the
+        # backward pass works with the device context set up by inductor. Skipped in fbcode
+        # because of an invalid device context error.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Multiply the input by 3.
             return x * 3
 
         x = torch.randn(4, device=device_type, requires_grad=True)
@@ -423,7 +503,12 @@ class CudaReproTests(TestCase):
 
     @config.patch(fallback_random=True)
     def test_dtype_factory_issue(self):
+        # [FUNCTION DOC] Regression test with fallback_random enabled: traces a graph that creates
+        # a random normal tensor with explicit device and compiles it with compile_fx_inner.
+        # Raises AssertionError if the output is not on the expected device type.
         def forward():
+            # [FUNCTION DOC] HELPER: Create a normal random tensor of fixed shape on the device
+            # and return it unsqueezed on the last dim in a tuple.
             randn = torch.ops.aten.randn.default(
                 [12, 64, 1, 64],
                 dtype=torch.float32,
@@ -443,11 +528,19 @@ class CudaReproTests(TestCase):
     @config.patch({"triton.cudagraphs": True})
     @dynamo_config.patch(automatic_dynamic_shapes=True)
     def test_no_device_idx_repro_cudagraphs(self):
+        # [FUNCTION DOC] Regression test for cudagraphs when output creation ops carry an explicit
+        # device index: runs the Repro module through the common checker with triton cudagraphs
+        # and automatic dynamic shapes enabled.
         class Repro(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with no inputs that returns two constant filled tensors,
+            # an int64 zeros and a float32 ones, of shape 8 by 512 on the device.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Plain parent initialization, no state.
                 super().__init__()
 
             def forward(self):
+                # [FUNCTION DOC] HELPER: Return a tuple of the int64 zeros tensor followed by the
+                # float32 ones tensor, both created with explicit device index 0.
                 full = torch.ops.aten.full.default(
                     [8, 512],
                     1,
@@ -471,8 +564,11 @@ class CudaReproTests(TestCase):
     @config.patch({"triton.cudagraphs": True})
     @dynamo_config.patch(automatic_dynamic_shapes=True)
     def test_expanded_inputs_cudagraphs(self):
+        # [FUNCTION DOC] Check that compiled addition of two expanded (stride 0) inputs under
+        # triton cudagraphs gives the same result as eager.
         @torch.compile(backend="inductor")
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Add the two inputs, compiled with the inductor backend.
             return x + y
 
         inputs = (
@@ -487,11 +583,16 @@ class CudaReproTests(TestCase):
         assume_static_by_default=False,
     )
     def test_dynamic_to_static_cudagraphs(self):
+        # [FUNCTION DOC] With cudagraphs enabled and dynamic shapes, loop over cudagraph_trees off
+        # and on, compile a function returning a sum and its first dim size, and call it with 5 by
+        # 5 then 6 by 6 inputs; checks both results match eager, including the integer size.
         for b in [False, True]:
             with config.patch({"triton.cudagraph_trees": b}):
 
                 @torch.compile(backend="inductor")
                 def fn(x, y):
+                    # [FUNCTION DOC] HELPER: Return the sum of x and y together with the size of
+                    # its first dimension.
                     r = x + y
                     return r, r.size(0)
 
@@ -508,7 +609,12 @@ class CudaReproTests(TestCase):
                 self.assertTrue(same(fn(*inputs), (inputs[0] + inputs[1], 6)))
 
     def _test_split_reduction_impl(self, x):
+        # [FUNCTION DOC] HELPER: Shared body for the split reduction tests: compile a global max
+        # reduction, run it on the input collecting the generated code, and check against eager.
+        # If DO_PERF_TEST is set, also benchmark compiled versus eager on GPU and print the
+        # timings.
         def max(x):
+            # [FUNCTION DOC] HELPER: Global maximum of the input.
             return torch.max(x)
 
         max_c = torch.compile(max)
@@ -522,12 +628,16 @@ class CudaReproTests(TestCase):
             print(f"compile {ms_c=:.03f}, eager {ms_eager=:.03f}")
 
     def test_split_reduction_transposed(self):
+        # [FUNCTION DOC] Run the split reduction check on a large bf16 tensor whose layout is
+        # transposed (a contiguous transpose of a contiguous transpose).
         x = torch.randn(4096, 8192, dtype=torch.bfloat16, device=device_type)
         x = x.t().contiguous().t()
 
         self._test_split_reduction_impl(x)
 
     def test_split_reduction_channels_last(self):
+        # [FUNCTION DOC] Run the split reduction check on a large bf16 tensor reshaped to 4 dims
+        # and converted to channels_last memory format.
         x = torch.randn(4096, 8192, dtype=torch.bfloat16, device=device_type)
         x = x.reshape([256, 256, 256, 2]).to(memory_format=torch.channels_last)
 
@@ -535,14 +645,27 @@ class CudaReproTests(TestCase):
 
     @tf32_on_and_off(0.001)
     def test_split_with_sizes_reshape_cat_cantsplit_regression(self):
+        # [FUNCTION DOC] Regression test for a split_with_sizes followed by reshapes and a cat,
+        # where the split could not be done as views. Compiles a module with embedding, linear and
+        # conv under no_grad and compares against eager. Run with tf32 both on and off using a
+        # tolerance of 0.001.
         class Repro(nn.Module):
+            # [CLASS DOC] HELPER: Module combining an embedding lookup, a linear, and a conv. The
+            # last time step of the linear output is concatenated with the flattened conv output,
+            # split into three chunks of widths 32, 64 and the rest, each reshaped to 3D, and
+            # concatenated along dim 1.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Create the embedding (128 by 32), linear (32 to 96) and
+                # conv (3 to 16 channels, 3 by 3, padding 1) layers.
                 super().__init__()
                 self.embedding = nn.Embedding(num_embeddings=128, embedding_dim=32)
                 self.linear = nn.Linear(32, 96)
                 self.conv = nn.Conv2d(3, 16, 3, padding=1)
 
             def forward(self, x, indices):
+                # [FUNCTION DOC] HELPER: Compute the combined tensor, split it with
+                # split_with_sizes along dim 1, reshape the three parts to batch by k by 8, and
+                # return their concatenation along dim 1.
                 embedded = self.embedding(indices)
                 linear_out = self.linear(embedded)
                 conv_out = self.conv(x)
@@ -578,11 +701,21 @@ class CudaReproTests(TestCase):
 
     @config.patch({"emulate_precision_casts": True})
     def test_bool_emulate_low_precision(self):
+        # [FUNCTION DOC] Regression test with emulate_precision_casts: builds a boolean mask on
+        # the GPU from a CPU float tensor, expands it to a large square and uses it in a where
+        # between float16 zero and negative infinity; asserts compiled output equals eager. Note
+        # it also assigns the config option directly on the inductor config module (not restored
+        # afterwards) in addition to the decorator patch.
+        # KNOWN ISSUE: the direct assignment to the config module leaks into later tests because
+        #   it is not undone, only the decorator patch is restored.
         from torch import device
 
         inf = float("inf")
 
         def forward():
+            # [FUNCTION DOC] HELPER: Graph body without inputs: make a ones float32 CPU tensor,
+            # move it to the device, cast to bool, unsqueeze and expand to 1536 by 1536, then use
+            # where to choose 0.0 where true and negative infinity elsewhere in float16.
             full_1 = torch.ops.aten.full.default(
                 [6, 6],
                 1,
@@ -632,7 +765,12 @@ class CudaReproTests(TestCase):
 
     @config.patch({"emulate_precision_casts": True})
     def test_emulate_low_precision(self):
+        # [FUNCTION DOC] With emulate_precision_casts enabled, compile gelu times ten in bf16
+        # forward and backward, and check each generated kernel (after stripping static asserts)
+        # shows two down-cast then up-cast pairs matching eager's rounding, and the result equals
+        # eager.
         def foo(x):
+            # [FUNCTION DOC] HELPER: GELU of the input multiplied by 10.0.
             return torch.nn.functional.gelu(x) * 10.0
 
         inp = torch.rand(
@@ -654,9 +792,13 @@ class CudaReproTests(TestCase):
     # TODO: Abstract this out, test more extensively
     @torch._dynamo.config.patch(assume_static_by_default=False)
     def test_dynamic_shapes(self):
+        # [FUNCTION DOC] Compile a cos, view, sin function with dynamic shapes on and check that
+        # calling with sizes 32 then 16 compiles only once (frame count 1) and the output matches
+        # eager. Resets dynamo before and after.
         torch._dynamo.reset()  # Needed since everywhere else uses "inductor"
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Cosine, reshape to the same shape, then sine.
             return x.cos().view(x.shape).sin()
 
         cnts = torch._dynamo.testing.CompileCounterWithBackend("inductor")
@@ -676,8 +818,11 @@ class CudaReproTests(TestCase):
     @config.patch({"triton.cudagraphs": True, "size_asserts": False})
     @dynamo_config.patch(automatic_dynamic_shapes=True)
     def test_expanded_inputs_cudagraphs_no_size_asserts(self):
+        # [FUNCTION DOC] Same as the expanded inputs cudagraph test but with size_asserts disabled
+        # in the inductor config.
         @torch.compile(backend="inductor")
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Add the two inputs, compiled with the inductor backend.
             return x + y
 
         inputs = (
@@ -690,14 +835,22 @@ class CudaReproTests(TestCase):
     @config.patch({"triton.cudagraphs": True})
     @dynamo_config.patch(automatic_dynamic_shapes=True)
     def test_inplace_updates_cudagraphs(self):
+        # [FUNCTION DOC] With cudagraph trees disabled and plain cudagraphs enabled, train a
+        # linear-weight module for two iterations comparing the gradients of an eager copy and a
+        # compiled one, and after each step add 1 to every parameter of both so parameter updates
+        # are visible to the graph.
         class Repro(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with one parameter of shape 10 by 20 that matrix-
+            # multiplies the input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the weight parameter with random values.
                 super().__init__()
                 self.weight1 = torch.nn.Parameter(
                     torch.randn(10, 20, requires_grad=True)
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Matrix multiply the input by the weight and return it.
                 x = torch.matmul(x, self.weight1)
                 return x
 
@@ -724,7 +877,13 @@ class CudaReproTests(TestCase):
 
     # https://github.com/pytorch/torchdynamo/issues/1850
     def test_inductor_output_aliases_intermediate(self):
+        # [FUNCTION DOC] Placeholder for torchdynamo issue 1850 (output aliasing an intermediate).
+        # The compiled path is commented out as broken; the test only runs eager and mutates its
+        # output, so it effectively tests nothing about inductor.
+        # KNOWN ISSUE: the compiled call and comparison are commented out, so foo_opt is created
+        #   but never called.
         def foo(x):
+            # [FUNCTION DOC] HELPER: Return the transpose of the input added to itself.
             out = x + x
             return out.t()
 
@@ -740,14 +899,23 @@ class CudaReproTests(TestCase):
         # self.assertEqual(out_ref, out)
 
     def test_accuracy_issue1(self):
+        # [FUNCTION DOC] Accuracy repro: a linear plus split plus cross entropy model with an
+        # ignore index of 128 is compared between eager and compiled using same_two_models under
+        # autocast disabled. Raises AssertionError if the models differ.
         class Repro(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with one linear (768 to 2, with bias) whose first output
+            # column is used as logits for a cross entropy loss against clamped start positions.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(
                     in_features=768, out_features=2, bias=True
                 )
 
             def forward(self, start_positions: torch.Tensor, x: torch.Tensor):
+                # [FUNCTION DOC] HELPER: Apply the linear to x, take the first column, clamp the
+                # positions to the range 0 to 128, and return the mean cross entropy with ignore
+                # index 128.
                 linear = self.linear(x)
                 split = linear.split(1, dim=-1)
                 getitem = split[0]
@@ -777,7 +945,12 @@ class CudaReproTests(TestCase):
 
     @config.patch(allow_buffer_reuse=False)
     def test_issue103461(self):
+        # [FUNCTION DOC] Regression test (issue 103461) with buffer reuse disabled: variance and
+        # mean over dim 2 with keepdim, returning only the mean, compiled with fullgraph must
+        # equal eager.
         def forward(add_1):
+            # [FUNCTION DOC] HELPER: Return the mean from var_mean with correction 0 over dim 2,
+            # keeping the dim.
             var_mean = torch.ops.aten.var_mean.correction(
                 add_1, [2], correction=0, keepdim=True
             )
@@ -790,7 +963,12 @@ class CudaReproTests(TestCase):
         self.assertEqual(actual, correct)
 
     def test_full_copy(self):
+        # [FUNCTION DOC] Compile a function that adds a CPU float64 tensor to a GPU-created zeros
+        # tensor copied to the CPU, and check it matches eager (tests a full node being copied
+        # across devices).
         def forward(x):
+            # [FUNCTION DOC] HELPER: Create a zeros float64 tensor on the device, move it to the
+            # CPU and add it to x.
             full_10 = torch.ops.aten.full.default(
                 [204, 204, 28],
                 0,
@@ -807,6 +985,11 @@ class CudaReproTests(TestCase):
         self.assertEqual(actual, correct)
 
     def test_autotune_inplace_kernel(self):
+        # [FUNCTION DOC] Verify that autotuning an in-place Triton kernel does not corrupt its
+        # in/out buffer when several configs are benchmarked. A CachingAutotuner is built manually
+        # with two block-size configs and saving the cache forced off, the kernel is run on two
+        # copies of the data, and the results are compared; raises AssertionError if they differ.
+        # Picks the XPU or CUDA raw stream getter by availability.
         """
         This UT tests autotune on an inplace kernel. The autotune should not contaminate
         the input buffers when tuning with multiple configs. For more details, refer to
@@ -823,7 +1006,14 @@ class CudaReproTests(TestCase):
         from torch._inductor.utils import triton_version_uses_attrs_dict
 
         def autotune(configs, meta):
+            # [FUNCTION DOC] HELPER: Build a decorator factory that, given the configs and
+            # metadata, wraps a Triton function in a CachingAutotuner with pointwise heuristic
+            # type, mutated arg in_out_ptr0 and memory optimization on. Adds XBLOCK as a constexpr
+            # to the signature when this Triton version puts constexprs there (mutates the meta
+            # mapping).
             def decorator(fn):
+                # [FUNCTION DOC] HELPER: Wrap the given Triton function in a CachingAutotuner
+                # built from the enclosing configs and metadata and return it.
                 if triton_version_uses_attrs_dict():
                     # Newer versions of Triton puts constexpr in signature
                     # Ref: https://github.com/pytorch/pytorch/pull/145051
@@ -862,6 +1052,9 @@ class CudaReproTests(TestCase):
                 "constants": {},
             },
         )
+        # [FUNCTION DOC] HELPER: Triton kernel that adds the second input to the first input in
+        # place, element by element, with a mask for the tail; each program handles XBLOCK
+        # elements.
         @triton.jit
         def kernel(in_out_ptr0, in_ptr0, xnumel, XBLOCK: tl.constexpr):
             pid = tl.program_id(0)
@@ -886,10 +1079,15 @@ class CudaReproTests(TestCase):
             raise AssertionError("failed autotune with inplace kernel")
 
     def test_sort_stride_issue(self):
+        # [FUNCTION DOC] Regression test (from detectron2 maskrcnn) for a false error in size
+        # asserts when sorting a tensor with a zero stride; compiles a descending sort with
+        # fullgraph and runs it on a rand_strided input.
         # This minified testcase comes from detectron2_maskrcnn_r_50_fpn
         # There was a false error from our size_assert code
         @torch.compile(fullgraph=True)
         def forward(pred_objectness_logits_3_: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Sort the input descending along dim 1 and return the sorted
+            # values.
             sort_3 = pred_objectness_logits_3_.sort(descending=True, dim=1)
             getitem_12 = sort_3[0]
             return getitem_12
@@ -904,10 +1102,15 @@ class CudaReproTests(TestCase):
             raise AssertionError
 
     def test_scalar_triton_index(self):
+        # [FUNCTION DOC] Regression test (torchdynamo issue 1515): indexing a float tensor with an
+        # int64 index tensor of zeros used to produce bad Triton code that crashed Triton. Checks
+        # the compiled result matches eager; raises AssertionError otherwise.
         # The indirect indexing via a scalar like below used to lead to
         # bad triton code that made triton segfault when compiling.
         # See https://github.com/pytorch/torchdynamo/issues/1515
         def fn(a):
+            # [FUNCTION DOC] HELPER: Build 16 int64 zeros and use them to gather from the input,
+            # returning a one-element tuple.
             zero = torch.zeros((16,), device=a.device, dtype=torch.int64)
             return (a[zero],)
 
@@ -918,7 +1121,13 @@ class CudaReproTests(TestCase):
             raise AssertionError
 
     def test_indirect_indexing_dense_mask(self):
+        # [FUNCTION DOC] Compile a graph using not-equal, sum, subtract, unsqueeze, gather,
+        # squeeze and multiply on int64 zero inputs (indirect indexing with a dense mask) and
+        # raise AssertionError if the result differs from eager.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Count non-one entries per row of x, subtract one, use that as
+            # a gather index into x, and multiply the squeezed gathered value with y. Returns a
+            # tuple.
             ne = torch.ops.aten.ne.Scalar(x, 1)
             sum_1 = torch.ops.aten.sum.dim_IntList(ne, [1])
             sub = torch.ops.aten.sub.Tensor(sum_1, 1)
@@ -936,7 +1145,10 @@ class CudaReproTests(TestCase):
             raise AssertionError
 
     def test_simplify_dims(self):
+        # [FUNCTION DOC] Run the common checker on a pointwise add of one to a strided slice of a
+        # 5D tensor, exercising dimension simplification of non-contiguous inputs.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Add one to the input and return it in a tuple.
             return (a + 1,)
 
         self.common(
@@ -945,8 +1157,16 @@ class CudaReproTests(TestCase):
 
     @config.patch(permute_fusion=True)
     def test_permute_fusion(self):
+        # [FUNCTION DOC] With permute_fusion enabled, compare eager and compiled outputs of a
+        # module doing a permute, a reshape (unused) and a batched matmul on two large strided
+        # float32 GPU tensors that require grad. Asserts the results are the same.
         class Repro(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that permutes the first input and batch-matmuls it with
+            # the second input; it also builds an unused reshape. Returns a one-element tuple.
             def forward(self, view, reshape_2):
+                # [FUNCTION DOC] HELPER: Permute view to swap dims 1 and 2, build a reshape to
+                # shape with 642 columns (not used in the result), and return the batched matmul
+                # of the permuted tensor with reshape_2 in a tuple.
                 permute = view.permute(0, 2, 1)
                 view = None
                 reshape = torch.reshape(permute, (-1, 642))
@@ -971,7 +1191,12 @@ class CudaReproTests(TestCase):
 
     @config.patch({"triton.autotune_pointwise": True})
     def test_inplace_add_alpha_autotune(self):
+        # [FUNCTION DOC] With pointwise autotuning on, compile a traced in-place add with alpha
+        # 0.55 into a zero tensor, where the other operand is channels_last, and check the in-
+        # place result matches eager (raises AssertionError otherwise).
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: In-place add of y scaled by alpha 0.55 to x using the aten
+            # overload; returns x in a tuple.
             aten.add_.Tensor(x, y, alpha=0.55)
             return (x,)
 
@@ -990,7 +1215,11 @@ class CudaReproTests(TestCase):
 
     @config.patch({"triton.autotune_pointwise": True})
     def test_inplace_buffer_autotune(self):
+        # [FUNCTION DOC] With pointwise autotuning on, run the common checker (low precision check
+        # off) on a matmul whose result is unsqueezed twice and added to a channels_last tensor,
+        # which exercises in-place buffer reuse under autotune.
         def foo(x, y, z):
+            # [FUNCTION DOC] HELPER: Matmul x and y, add two leading unit dims, and add z.
             a = x @ y
             return a.unsqueeze(0).unsqueeze(0) + z
 
@@ -1007,12 +1236,19 @@ class CudaReproTests(TestCase):
 
     @skipIfXpu(msg="TypeError, torch-xpu-ops: 3004")
     def test_memory_history_inductor(self):
+        # [FUNCTION DOC] Check that with memory history recording on, the allocator snapshot taken
+        # after running a compiled function contains the name of a Python function called inside
+        # the compiled region (so stack traces are recorded). Recording is always turned off at
+        # the end, and the cache is emptied first. Skipped on XPU.
         def called_inside_compile(x, w, b):
+            # [FUNCTION DOC] HELPER: Affine map of x by w and b followed by sigmoid; used to
+            # appear in the recorded stack trace.
             a = x @ w + b
             return torch.sigmoid(a)
 
         @torch.compile
         def fn(x, w, b):
+            # [FUNCTION DOC] HELPER: Apply the inner helper twice in a row, compiled.
             x = called_inside_compile(x, w, b)
             return called_inside_compile(x, w, b)
 
@@ -1021,6 +1257,8 @@ class CudaReproTests(TestCase):
         x = torch.rand(3, device=device_type)
 
         def record_memory_history(value: bool):
+            # [FUNCTION DOC] HELPER: Turn allocator memory history recording on or off using the
+            # XPU module when XPU is available, otherwise the CUDA module.
             if torch.xpu.is_available():
                 torch.xpu.memory._record_memory_history(value)
             else:
@@ -1039,12 +1277,26 @@ class CudaReproTests(TestCase):
         self.assertTrue("called_inside_compile" in snapshot)
 
     def test_negative_arange_dynamic_shapes(self):
+        # [FUNCTION DOC] Regression test from alibi relative position encodings: compiles with
+        # dynamic shapes a model that builds an arange with a negative step from float bounds and
+        # feeds a transformer decoder layer. Compares forward outputs for eight growing decoder
+        # input lengths with same_two_models and raises AssertionError on any mismatch.
         # Repro from alibi relative encodings
         def sign(x):
+            # [FUNCTION DOC] HELPER: Elementwise sign of a number or tensor, computed as the
+            # difference of the greater-than-zero and less-than-zero booleans.
             return (x > 0) - (x < 0)
 
         class Repro(torch.nn.Module):
+            # [CLASS DOC] HELPER: Decoder-style module with 16 heads. It holds a registered buffer
+            # of per-head scales (a geometric progression built from an arange with a negative
+            # step), an embedding of size 1024 by 256, a pre-norm transformer decoder layer and a
+            # linear head. The forward builds a causal mask from padding and adds a relative-
+            # position bias.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Compute the scales buffer from log2 bounds using a float
+                # arange of step (end minus start) over (heads minus one) with a sign-adjusted
+                # epsilon, shaped for 16 heads, and create the embedding, decoder layer and head.
                 super().__init__()
                 nheads = 16
                 start = math.log2(0.5)
@@ -1065,6 +1317,11 @@ class CudaReproTests(TestCase):
                 self.head = nn.Linear(256, 1024)
 
             def forward(self, enc_out: torch.Tensor, dec_in: torch.Tensor):
+                # [FUNCTION DOC] HELPER: Build a lower-triangular padding mask from the token ids,
+                # a relative position matrix from two aranges, scale it by the per-head scales and
+                # make it lower triangular in place, add head 0 of the bias to the mask, then
+                # embed, run the decoder layer with enc_out as memory and the mask as target mask,
+                # and return the head's logits.
                 padmask = dec_in == 0
                 dec_mask = padmask.unsqueeze(-1) == padmask.unsqueeze(-2)
                 dec_mask = dec_mask.to(dtype=torch.float32)
@@ -1102,7 +1359,12 @@ class CudaReproTests(TestCase):
                 raise AssertionError("Inductor with dynamic shapes failed")
 
     def test_issue97695_1input(self):
+        # [FUNCTION DOC] Regression test (issue 97695) for a concat of a single addmm result:
+        # checks the traced and compiled graph via compile_fx_inner, and a fullgraph compile of
+        # the original function, each match the eager result; raises AssertionError otherwise.
         def fn(arg3_1, relu, permute_1):
+            # [FUNCTION DOC] HELPER: Compute an addmm and concatenate that single result along dim
+            # 1; returns a one-element tuple.
             addmm_1 = torch.ops.aten.addmm.default(arg3_1, relu, permute_1)
             cat_2 = torch.ops.aten.cat.default([addmm_1], 1)
             return (cat_2,)
@@ -1126,13 +1388,24 @@ class CudaReproTests(TestCase):
             raise AssertionError
 
     def test_issue_103924(self):
+        # [FUNCTION DOC] Regression test (issue 103924): a module that divides by a ones vector
+        # with a trailing dim added and applies softmax along dim 1 must match eager when
+        # compiled.
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a softmax over dim 1 that divides its input rows by
+            # a ones vector (one per sample) before the softmax. The temperature attribute is
+            # stored but unused.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Store temperature 1 (unused) and create the softmax
+                # layer.
                 super().__init__()
                 self.temperature = 1
                 self.layer = torch.nn.Softmax(dim=1)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Create a ones vector of float length n_samples with the
+                # input's dtype and device, divide each row of x by it and return the softmax
+                # along dim 1.
                 n_samples, _ = x.shape
                 y = 1.0 * torch.ones(n_samples, dtype=x.dtype, device=x.device)
                 inp = x / y[..., None]
@@ -1144,7 +1417,11 @@ class CudaReproTests(TestCase):
         self.assertEqual(opt_m(x), m(x))
 
     def test_issue97695_2input(self):
+        # [FUNCTION DOC] Same as the single-input case but concatenating two addmm results; only a
+        # fullgraph compile versus eager comparison is made, raising AssertionError on mismatch.
         def fn(arg3_1, arg3_2, relu, permute_1):
+            # [FUNCTION DOC] HELPER: Compute two addmm results sharing the same matrix operands
+            # and concatenate them along dim 1; returns a tuple.
             addmm_1 = torch.ops.aten.addmm.default(arg3_1, relu, permute_1)
             addmm_2 = torch.ops.aten.addmm.default(arg3_2, relu, permute_1)
             cat_2 = torch.ops.aten.cat.default([addmm_1, addmm_2], 1)
@@ -1164,6 +1441,9 @@ class CudaReproTests(TestCase):
             raise AssertionError
 
     def test_scatter_index_not_wrapped(self):
+        # [FUNCTION DOC] Compile scatter_reduce with sum reduction and check the generated code
+        # has a device assertion that the index is within bounds (without wrapping negative
+        # numbers) immediately followed by an atomic add, and that the result equals eager.
         src = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], device=self.device)
         index = torch.tensor([0, 1, 0, 1, 2, 0], device=self.device)
         input = torch.tensor([1.0, 2.0, 3.0, 4.0], device=self.device)
@@ -1180,7 +1460,10 @@ class CudaReproTests(TestCase):
         )
 
     def test_normalize_norm_leq_one(self):
+        # [FUNCTION DOC] Check that normalizing a vector whose norm is just below 4 gives an
+        # output with norm no greater than one, when compiled.
         def fn(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Normalize the input along the last dim.
             return torch.nn.functional.normalize(x, dim=-1)
 
         inp = torch.tensor(
@@ -1195,7 +1478,12 @@ class CudaReproTests(TestCase):
         )
 
     def test_libdevice_routing(self):
+        # [FUNCTION DOC] Check which math functions inductor routes through libdevice in generated
+        # code: exp for float64 and float32 (not the Triton math wrapper), log when eager-numerics
+        # libdevice use is on, and sigmoid for float64 which uses exp. Each result is also
+        # compared to eager.
         def foo(x):
+            # [FUNCTION DOC] HELPER: Exponential of the input.
             return x.exp()
 
         inp = torch.ones(64, device=device_type).to(torch.float64)
@@ -1210,6 +1498,8 @@ class CudaReproTests(TestCase):
         self.assertEqual(foo(inp), out)
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: Natural logarithm of the input. This replaces the earlier
+            # local helper of the same name.
             return x.log()
 
         inp = torch.ones(64, device=device_type, dtype=torch.float32)
@@ -1219,6 +1509,8 @@ class CudaReproTests(TestCase):
         self.assertEqual(foo(inp), out)
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: Sigmoid of the input. This replaces the earlier local helper
+            # of the same name.
             return x.sigmoid()
 
         inp = torch.ones(64, device=device_type).to(torch.float64)
@@ -1227,8 +1519,13 @@ class CudaReproTests(TestCase):
         self.assertEqual(foo(inp), out)
 
     def test_uint_view_copy(self):
+        # [FUNCTION DOC] Check that a compiled in-place copy of a uint16 tensor into a bf16 tensor
+        # viewed as uint16 matches the eager result.
         @torch.compile
         def view_copy(target, source):
+            # [FUNCTION DOC] HELPER: Check the target is bf16 and source is uint16, then copy
+            # source into the uint16 view of target (mutates target). The checks use plain assert
+            # statements.
             assert target.dtype == torch.bfloat16  # noqa: S101
             assert source.dtype == torch.uint16  # noqa: S101
             target.view(torch.uint16).copy_(source)
@@ -1241,7 +1538,13 @@ class CudaReproTests(TestCase):
         self.assertEqual(out, target.view(torch.uint16))
 
     def test_embedding_var_mean(self):
+        # [FUNCTION DOC] Regression test: traces a graph with cumsum position ids, an embedding
+        # lookup and variance and mean over the last dim, compiles it with compile_fx_inner, runs
+        # it once and synchronizes the accelerator. Passes if nothing raises.
         def forward(arg0_1):
+            # [FUNCTION DOC] HELPER: Build position ids from ones via cumsum and multiplication,
+            # add 2, look up rows in the embedding table arg0_1, then return the variance, the
+            # mean and the ids as a list.
             full = torch.ops.aten.full.default(
                 [1, 2048],
                 1,
@@ -1272,10 +1575,15 @@ class CudaReproTests(TestCase):
         torch.accelerator.synchronize()
 
     def test_deterministic_algorithms(self):
+        # [FUNCTION DOC] Check that, under deterministic algorithms mode, an indexed in-place
+        # accumulation of 10000 values into a single slot gives bitwise identical results over 11
+        # repeated runs of the compiled function.
         N = 10000
 
         @torch.compile
         def fn(idx, values):
+            # [FUNCTION DOC] HELPER: Make a one-element zeros tensor and add the values into it at
+            # the given indices with an accumulating indexed assignment; returns it.
             x = torch.zeros(1, device=device_type)
             x[idx] += values
             return x
@@ -1292,12 +1600,18 @@ class CudaReproTests(TestCase):
 
     # https://github.com/pytorch/pytorch/issues/96406
     def test_linear_cpu_input(self):
+        # [FUNCTION DOC] Regression test (issue 96406): a linear model fed a CPU input that moves
+        # it to the device inside forward passes the common checker under no_grad in eval mode.
         class Model(nn.Module):
+            # [CLASS DOC] HELPER: Module with a single 4 by 4 linear layer that first moves its
+            # input to the device.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the linear layer.
                 super().__init__()
                 self.linear = nn.Linear(4, 4)
 
             def forward(self, data):
+                # [FUNCTION DOC] HELPER: Move the data to the device and apply the linear layer.
                 data = data.to(device_type)
                 return self.linear(data)
 
@@ -1307,12 +1621,19 @@ class CudaReproTests(TestCase):
 
     @config.patch({"fallback_random": True, "triton.cudagraphs": True})
     def test_xlnet_lm_stride_repro(self):
+        # [FUNCTION DOC] Regression test with fallback_random and cudagraphs: compile a gelu then
+        # dropout module on a large 3D input and run backward. The comment notes inductor's
+        # predicted layout for the saved activation differs from the real strides, which is
+        # harmless. Passes if no exception is raised.
         class Repro(nn.Module):
+            # [CLASS DOC] HELPER: Module applying a gelu followed by dropout with probability 0.1.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the dropout layer.
                 super().__init__()
                 self.dropout = nn.Dropout(p=0.1, inplace=False)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply gelu to x and then dropout.
                 y = torch._C._nn.gelu(x)
                 return self.dropout(y)
 
@@ -1325,8 +1646,14 @@ class CudaReproTests(TestCase):
         y.sum().backward()
 
     def test_lookup_seed_backward(self):
+        # [FUNCTION DOC] Run a compiled dropout-like graph that uses the inductor seed lookup and
+        # random primitives, followed by layer-norm-like mean subtraction, on zero inputs. Passes
+        # if it compiles and runs.
         @torch.compile(fullgraph=True)
         def forward(inductor_seeds, mul_4, view_15):
+            # [FUNCTION DOC] HELPER: Look up seed number 2, generate a random tensor of shape 2 by
+            # 512 by 768, mask by greater than 0.1, scale by about 1.111, add the third argument
+            # and subtract the per-row mean over the last dim; returns a tuple.
             inductor_lookup_seed_2 = torch.ops.prims.inductor_lookup_seed.default(
                 inductor_seeds, 2
             )
@@ -1350,14 +1677,23 @@ class CudaReproTests(TestCase):
         forward(buf0, buf1, buf2)
 
     def test_issue100806(self):
+        # [FUNCTION DOC] Regression test (issue 100806): a model of two linears, a concat along
+        # dim 1, a view, a slice and a relu is compiled under no_grad in eval mode and compared to
+        # eager.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with linear layers 10 to 20 and 20 to 30 followed by a
+            # duplicate concat, a view to groups of two rows, selection of the second group and
+            # relu.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create two linear layers and a relu.
                 super().__init__()
                 self.linear1 = torch.nn.Linear(10, 20)
                 self.linear2 = torch.nn.Linear(20, 30)
                 self.relu = torch.nn.ReLU()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply both linears, concatenate x with itself along dim
+                # 1, view as rows of 2 by 30, take index 1 along the middle dim, and apply relu.
                 x = self.linear1(x)
                 x = self.linear2(x)
                 x = torch.cat((x, x), dim=1)
@@ -1380,7 +1716,11 @@ class CudaReproTests(TestCase):
             self.assertEqual(res1, res2)
 
     def test_issue103481(self):
+        # [FUNCTION DOC] Regression test (issue 103481) for a mean over the last four dims of a 6D
+        # tensor with keepdim, added to a zero-dim tensor; compiled result must equal eager. The
+        # note says it fails only with six dims.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Mean over dims 2 to 5 keeping dims, plus y.
             # NOTE: 6 dimensions is important! does not fail for 5 dimensions
             mean = torch.mean(x, [2, 3, 4, 5], keepdim=True)
             add = mean + y
@@ -1398,12 +1738,15 @@ class CudaReproTests(TestCase):
     @config.patch({"triton.dense_indexing": True})
     @dynamo_config.patch(automatic_dynamic_shapes=True)
     def test_bucketize_dynamic_dense(self):
+        # [FUNCTION DOC] Check bucketize works with dense indexing enabled and dynamic shapes
+        # (formerly the offsets size was handled wrongly) by comparing to eager.
         """
         Make sure that ops.bucketize() can handle dense_indexing, which previously
         caused issues due to incorrect handling of the size of offsets.
         """
 
         def fn(values, offsets):
+            # [FUNCTION DOC] HELPER: Bucketize values by the sorted boundaries.
             return torch.bucketize(values, offsets)
 
         values = torch.rand((64, 64), device=device_type)
@@ -1427,6 +1770,10 @@ class CudaReproTests(TestCase):
         }
     )
     def test_bucketize_epilogue(self):
+        # [FUNCTION DOC] Regression test (issue 148764): bucketize used as an epilogue of a matmul
+        # with max-autotune on the Triton backend must generate valid code. Autotune failures are
+        # made fatal and compile threads set to one so failures are not swallowed. Compares to
+        # eager. Skipped without a big GPU.
         """
         See https://github.com/pytorch/pytorch/issues/148764.
         Make sure that when torch.bucketize appears as an epilogue, the codegen is valid.
@@ -1442,6 +1789,8 @@ class CudaReproTests(TestCase):
         """
 
         def fn(x: torch.Tensor, y: torch.Tensor, buckets: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Matrix multiply x and y, then bucketize the result using the
+            # buckets.
             z = torch.mm(x, y)
             return torch.bucketize(z, buckets)
 
@@ -1457,7 +1806,11 @@ class CudaReproTests(TestCase):
         self.assertEqual(expected, actual)
 
     def test_float64_constants(self):
+        # [FUNCTION DOC] Check that float64 constants (values 0.1 and 0.2 multiplied by a huge
+        # constant) are emitted exactly: compiled result equals eager with zero tolerance.
         def fn():
+            # [FUNCTION DOC] HELPER: Create a float64 tensor of two distinct values (distinct so
+            # they are not constant folded) and multiply it by 2e50.
             # NOTE: tensors of all the same value are constant folded, so we
             # need a tensor with two distinct values
             a = torch.tensor([1 / 10, 2 / 10], dtype=torch.float64, device=device_type)
@@ -1469,7 +1822,13 @@ class CudaReproTests(TestCase):
         self.assertEqual(expect, actual, atol=0, rtol=0)
 
     def test_issue104759(self):
+        # [FUNCTION DOC] Regression test (issue 104759): a traced graph of slice scatters,
+        # permutes, views and a batched matmul on strided fp16 inputs is compiled with
+        # compile_fx_inner and compared with eager; raises AssertionError if different.
         def fn(arg7_1, add_1, permute_2, select_scatter, slice_8):
+            # [FUNCTION DOC] HELPER: Large aten graph body doing two slice_scatter operations,
+            # several view and permute steps, scaling by about 0.7071 and a final batched matmul;
+            # returns a one-element tuple.
             slice_scatter_4 = torch.ops.aten.slice_scatter.default(
                 permute_2, select_scatter, 0, 1, 9223372036854775807
             )
@@ -1545,7 +1904,12 @@ class CudaReproTests(TestCase):
 
     @config.patch({"triton.cudagraphs": True})
     def test_index_put_inplace_cudagraph(self):
+        # [FUNCTION DOC] With triton cudagraphs enabled, compile an in-place index_put on a
+        # boolean tensor and call it twice to catch cudagraph replay problems, then compare with
+        # eager.
         def fn(x, y, z):
+            # [FUNCTION DOC] HELPER: Replace x with zeros of the same shape, then do an in-place
+            # accumulating index_put at the given indices with values z and return it.
             x = torch.zeros_like(x)
             return x.index_put_([y], z, True)
 
@@ -1566,9 +1930,14 @@ class CudaReproTests(TestCase):
     @config.patch({"triton.cudagraphs": True})
     @config.patch({"fx_graph_cache": True})
     def test_index_put_cudagraph(self):
+        # [FUNCTION DOC] Same as the in-place variant but with the out-of-place index_put, with fx
+        # graph caching on. It repeats twice, resetting dynamo and collecting garbage in between
+        # so the second iteration tests the cache path.
         for _ in range(2):
 
             def fn(x, y, z):
+                # [FUNCTION DOC] HELPER: Replace x with zeros of the same shape and return an
+                # accumulating out-of-place index_put at indices y with values z.
                 x = torch.zeros_like(x)
                 return x.index_put([y], z, True)
 
@@ -1592,8 +1961,17 @@ class CudaReproTests(TestCase):
         not PLATFORM_SUPPORTS_FLASH_ATTENTION, "flash attention not supported"
     )
     def test_flash_attention_dynamic(self):
+        # [FUNCTION DOC] Check that compiling an attention model with dynamic shapes and the flash
+        # backend yields only two frames across three different sequence lengths (512, 513, 514),
+        # i.e. a recompile once to become dynamic and no more. Skipped if flash attention is
+        # unsupported.
         class Model(nn.Module):
+            # [CLASS DOC] HELPER: Module with three 1024 by 1024 linear layers producing queries,
+            # keys and values reshaped to 8 heads of 128, then computes scaled dot product
+            # attention.
             def __init__(self, *args, **kwargs) -> None:
+                # [FUNCTION DOC] HELPER: Pass extra arguments to the parent initializer and create
+                # the three projection layers.
                 super().__init__(*args, **kwargs)
 
                 self.q = nn.Linear(1024, 1024)
@@ -1601,6 +1979,9 @@ class CudaReproTests(TestCase):
                 self.v = nn.Linear(1024, 1024)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Project x to queries, keys and values, split to 8 heads,
+                # move heads before the sequence dim and return their scaled dot product
+                # attention.
                 batch_size, seq_len, _ = x.size()
 
                 queries = self.q(x).view(batch_size, seq_len, 8, 128).transpose(2, 1)
@@ -1633,7 +2014,11 @@ class CudaReproTests(TestCase):
 
     @config.patch({"triton.cudagraphs": True})
     def test_index_put_no_fallback_cudagraph(self):
+        # [FUNCTION DOC] Like the other cudagraph index_put tests but with int32 data: compile,
+        # call twice, and compare to eager (checks there is no fallback to a non-Triton kernel).
         def fn(x, y, z):
+            # [FUNCTION DOC] HELPER: Replace x with zeros of the same shape and return an
+            # accumulating out-of-place index_put.
             x = torch.zeros_like(x)
             return x.index_put([y], z, True)
 
@@ -1658,6 +2043,11 @@ class CudaReproTests(TestCase):
         emulate_precision_casts_on_saved_tensors=True,
     )
     def test_saved_lowp_checkpoint_truncates_subsequent_uses(self, lowp_dtype):
+        # [FUNCTION DOC] Parametrized over bf16 and fp16. With emulation of casts on saved tensors
+        # on and general emulation off, a selective-checkpoint function that must save the sigmoid
+        # output must be bitwise equal to eager and the generated code must contain a down cast to
+        # the low precision dtype (so later uses of the saved value use the truncated value).
+        # Needs CUDA or XPU.
         from torch.utils.checkpoint import (
             checkpoint,
             CheckpointPolicy,
@@ -1668,6 +2058,8 @@ class CudaReproTests(TestCase):
         lowp_name = str(lowp_dtype).removeprefix("torch.")
 
         def policy(ctx, op, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Checkpoint policy that always saves the sigmoid result and
+            # prefers recomputing everything else.
             if op == torch.ops.aten.sigmoid.default:
                 return CheckpointPolicy.MUST_SAVE
             return CheckpointPolicy.PREFER_RECOMPUTE
@@ -1675,10 +2067,13 @@ class CudaReproTests(TestCase):
         context_fn = functools.partial(create_selective_checkpoint_contexts, policy)
 
         def g(x):
+            # [FUNCTION DOC] HELPER: Sigmoid of x multiplied by itself.
             y = torch.sigmoid(x)
             return y * y
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Run the helper g under non-reentrant checkpointing with the
+            # selective checkpoint context.
             return checkpoint(g, x, use_reentrant=False, context_fn=context_fn)
 
         opt_fn = torch.compile(fn, backend="inductor", fullgraph=True)
@@ -1699,6 +2094,11 @@ class CudaReproTests(TestCase):
     def test_emulate_precision_casts_preserves_explicit_precision_cast(
         self, lowp_dtype
     ):
+        # [FUNCTION DOC] Parametrized over bf16 and fp16. With emulate_precision_casts on, an
+        # explicit cast of a matmul result to low precision and back to float32 must be kept:
+        # compiled output equals eager, the code contains the explicit convert node marker and a
+        # Triton down cast to the low precision type. Seeds CPU and device RNGs. Raises SkipTest
+        # for fp16 on XPU (upstream Triton XPU folds the cast).
         if TEST_XPU and lowp_dtype is torch.float16:
             # To be enabled once triton-xpu emits a constrained fptrunc for
             # `arith.truncf f32 -> f16`, so the fp32 -> fp16 -> fp32 barrier
@@ -1716,6 +2116,8 @@ class CudaReproTests(TestCase):
         w = torch.randn(32, 32, device=device_type, dtype=torch.float32)
 
         def fn(x, w):
+            # [FUNCTION DOC] HELPER: Matmul x and w, round the result to the low precision dtype
+            # and back to float32, multiply by its sigmoid, and sum over dim 1.
             x = torch.matmul(x, w)
             x = x.to(lowp_dtype).float()
             x = x * torch.sigmoid(x)
@@ -1732,12 +2134,16 @@ class CudaReproTests(TestCase):
     @torch._inductor.config.patch(emulate_precision_casts=True)
     @torch._inductor.config.patch(pattern_matcher=False)
     def test_emulate_precision_casts_convert_element_type(self):
+        # [FUNCTION DOC] With emulate_precision_casts on and the pattern matcher off, a float32 to
+        # bf16 to float32 round trip compiled with dynamic shapes must equal eager (the rounding
+        # must not be optimized away).
         torch.manual_seed(0)
         torch.cuda.manual_seed_all(0) if TEST_CUDA else torch.xpu.manual_seed_all(0)
 
         x = torch.rand(1000, device=device_type, dtype=torch.float32)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Cast x to bf16 and back to float32 and return it.
             x_bf16 = x.to(torch.bfloat16)
             x_fp32_casted = x_bf16.to(torch.float32)
             return x_fp32_casted
@@ -1751,7 +2157,11 @@ class CudaReproTests(TestCase):
     @unittest.skipIf(not TEST_CUDA, "requires CUDA")
     @torch._inductor.config.patch(emulate_precision_casts=True)
     def test_emulate_precision_casts_promoted_lowp_cuda(self):
+        # [FUNCTION DOC] With emulate_precision_casts on (CUDA only), adding a float16 copy of
+        # 70000.0 to the float32 original must overflow to infinity as in eager, and the generated
+        # code must contain a Triton cast to float16.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Cast x to float16 and add the float32 x.
             y = x.to(torch.float16)
             return y + x
 
@@ -1766,6 +2176,9 @@ class CudaReproTests(TestCase):
 
     @torch._inductor.config.patch(emulate_precision_casts=True)
     def test_emulate_precision_casts_norm_rounding(self):
+        # [FUNCTION DOC] With emulate_precision_casts on, compare eager and compiled (dynamic)
+        # results for the norm of a bf16 vector and that norm plus a float32 scalar, to verify
+        # rounding of the intermediate norm.
         torch.manual_seed(0)
         torch.cuda.manual_seed_all(0)
 
@@ -1773,6 +2186,7 @@ class CudaReproTests(TestCase):
         scalar = torch.rand([], device=device_type, dtype=torch.float32)
 
         def fn(inp, scale):
+            # [FUNCTION DOC] HELPER: Return the norm of inp and the norm plus scale as a tuple.
             y = inp.norm()
             return y, y + scale
 
@@ -1785,6 +2199,10 @@ class CudaReproTests(TestCase):
 
     @torch._inductor.config.patch(emulate_precision_casts=True)
     def test_emulate_precision_casts_min_pow_chain(self):
+        # [FUNCTION DOC] With emulate_precision_casts on and scalar output capture enabled,
+        # compile a graph mixing fp16, bf16 and fp32 inputs (min, sum, repeated subtraction,
+        # chained pow) with dynamic shapes and compare both outputs against eager with a loose
+        # tolerance (larger on XPU). Inputs require grad but no backward is run.
         torch.manual_seed(0)
         torch.cuda.manual_seed_all(0) if TEST_CUDA else torch.xpu.manual_seed_all(0)
 
@@ -1808,6 +2226,9 @@ class CudaReproTests(TestCase):
             )
 
             def fn(a0, a1, a2, a3):
+                # [FUNCTION DOC] HELPER: Take the min over dim 2 and sum over the new dim 2 of a0,
+                # subtract a2 once and a3 three times from a1, add the two, and apply four nested
+                # pow operations to produce a second result; returns both results as a tuple.
                 t1 = a0.min(dim=2).values
                 t2 = t1.sum(dim=2)
                 t6 = ((((a1) - a2) - a3) - a3) - a3
@@ -1840,6 +2261,9 @@ class CudaReproTests(TestCase):
 
     @torch._inductor.config.patch(emulate_precision_casts=True)
     def test_emulate_precision_casts_mean_ratio_chain(self):
+        # [FUNCTION DOC] With emulate_precision_casts on, compile a graph of bf16, fp16 and fp32
+        # inputs combining a mean over pairs, a view, relu and mean, and chained divisions, and
+        # compare to eager with loose tolerances (rtol 0.05, atol 0.1). Seeds the RNG with 12345.
         torch.manual_seed(12345)
         torch.cuda.manual_seed_all(12345)
 
@@ -1881,6 +2305,10 @@ class CudaReproTests(TestCase):
             )
 
             def fn(a0, a1, a2, a3, a4, a5):
+                # [FUNCTION DOC] HELPER: Average a0 in pairs to a 379 by 165 tensor, subtract a2
+                # twice, a3 and a4 from a1 and view it as 379 by 165, average the relu of a5 over
+                # dim 0, then divide the pair average by those terms in sequence and return the
+                # result.
                 t2 = a0.view(379, 165, 2).mean(dim=2)
                 t7 = ((((a1) - a2) - a3) - a2) - a4
                 t8 = t7.view(379, 165)
@@ -1907,6 +2335,11 @@ class CudaReproTests(TestCase):
 
     @torch._inductor.config.patch(emulate_precision_casts=True)
     def test_dont_inplace_disjoint_accesses(self):
+        # [FUNCTION DOC] With emulate_precision_casts on, compile a traced rms-norm plus rotary-
+        # embedding style graph with three matmuls sharing one input; the generated code must not
+        # reuse an input buffer in place (no in-out pointer arguments), since earlier a disjoint-
+        # access inplace reuse caused large errors. Inputs are built by parsing the annotations,
+        # and outputs are compared to eager with atol 0.01 and rtol 2.
         # TODO - would not need mms if we could annotate donated buffer..
         def forward(
             arg0_1: f"bf16[2048, 2048][2048, 1]{device_type}:0",
@@ -1918,6 +2351,11 @@ class CudaReproTests(TestCase):
             arg6_1: f"f32[4096, 128][128, 1]{device_type}:0",
             arg7_1: f"f32[4096, 128][128, 1]{device_type}:0",
         ):
+            # [FUNCTION DOC] HELPER: Printed fx graph body. Three linear projections of arg1_1 by
+            # arg0_1, arg2_1 and arg3_1 give three tensors; the first two are rms-normalized
+            # (float32) with weights arg4_1 and arg5_1, then rotary embedded using the cos and sin
+            # tables arg6_1 and arg7_1; all three are viewed into heads of 128 and permuted.
+            # Returns the three results as a tuple.
             permute = torch.ops.aten.permute.default(arg0_1, [1, 0])
             arg0_1 = None
             view = torch.ops.aten.view.default(arg1_1, [32768, 2048])
@@ -2086,6 +2524,9 @@ class CudaReproTests(TestCase):
 
     # https://github.com/pytorch/pytorch/issues/104937
     def test_linear_with_zero_infeature_size(self):
+        # [FUNCTION DOC] Regression test (issue 104937): a bias linear layer with zero input and
+        # output features applied to a zero-width input must give the same result compiled and in
+        # eager.
         m = nn.Linear(in_features=0, out_features=0, bias=True).to(device_type)
         x = torch.rand(1, 1, 0, device=device_type)
         expect = m(x)
@@ -2095,6 +2536,9 @@ class CudaReproTests(TestCase):
 
     @config.patch(fallback_random=True)
     def test_multi_output_layout_fallback(self):
+        # [FUNCTION DOC] With fallback_random on, check an in-place randomized leaky relu module
+        # compiled gives the same output as eager when both start from the same frozen RNG state
+        # (the compiled one runs under a freeze_rng_state block).
         mod = nn.RReLU(lower=3.2350976, upper=8.4220314, inplace=True)
         inp = torch.rand([4, 4]).to(device_type)
         m = torch.compile(mod)
@@ -2107,8 +2551,11 @@ class CudaReproTests(TestCase):
         self.assertEqual(o1, o2)
 
     def test_sorted_masks(self):
+        # [FUNCTION DOC] Check that the generated code for a pointwise add followed by a row sum
+        # loads with both the reduction mask and the x mask, in that order.
         @torch.compile()
         def foo(x, y):
+            # [FUNCTION DOC] HELPER: Sum of x plus y over dim 1.
             return (x + y).sum(dim=1)
 
         x = torch.rand([255, 255], device=device_type)
@@ -2120,8 +2567,12 @@ class CudaReproTests(TestCase):
         )
 
     def test_cat_int8_one_kernel(self):
+        # [FUNCTION DOC] For uint8 and int8, compile a concatenation of four 256 by 256 tensors
+        # plus one, and check the output equals eager, there is no leftover cat call in the code,
+        # and exactly one kernel launch.
         @torch.compile()
         def cat(inps):
+            # [FUNCTION DOC] HELPER: Concatenate the list along dim 0 and add one.
             return torch.cat(inps) + 1
 
         for dtype in [torch.uint8, torch.int8]:
@@ -2138,10 +2589,17 @@ class CudaReproTests(TestCase):
 
     @config.patch("triton.use_block_ptr", True)
     def test_selecsls42b_misaligned_address(self):
+        # [FUNCTION DOC] Regression test (Triton issue 2836) for a misaligned-address crash with
+        # block pointers enabled: runs a compiled batch-norm-backward style graph with a bool mask
+        # and expanded fp16 input, then synchronizes the device so any kernel error surfaces.
         # https://github.com/triton-lang/triton/issues/2836
 
         @torch.compile(fullgraph=True)
         def fn(arg207_1, arg208_1, convert_element_type_40, expand, full, mul_3):
+            # [FUNCTION DOC] HELPER: Graph body of batch norm backward style math: divide the
+            # expanded tensor by 16, select with the boolean mask, convert to float32, compute
+            # per-channel sums over dims 0, 2, 3 and use them to produce the final subtraction
+            # result. Returns a one-element tuple.
             div = torch.ops.aten.div.Scalar(expand, 16)
             where = torch.ops.aten.where.self(arg207_1, full, div)
             convert_element_type_43 = torch.ops.prims.convert_element_type.default(
@@ -2179,9 +2637,14 @@ class CudaReproTests(TestCase):
         torch.accelerator.synchronize()  # shake out Triton Error [CUDA]: misaligned address
 
     def test_mutated_aligned_tensor(self):
+        # [FUNCTION DOC] Check in-place mutation through a compiled function when the input is a
+        # slice that may be misaligned: with dynamic shapes off, call on slices dropping the last
+        # and then the first element, and check the compiled function's return and the original
+        # tensor's contents stay consistent with the eager run on a cloned copy.
         t = torch.rand(4096, device=device_type, dtype=torch.float16)
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: Add one in place to x and return it.
             return x.add_(1)
 
         foo_c = torch.compile(dynamic=False)(foo)
@@ -2197,12 +2660,19 @@ class CudaReproTests(TestCase):
         self.assertEqual(t, t_orig)
 
     def test_non_commutative_scan_op(self):
+        # [FUNCTION DOC] Check that associative_scan with a non-commutative combine function (a
+        # linear recurrence over two sequences, float64) matches a sequential baseline loop;
+        # compares the second output.
         from torch._higher_order_ops.associative_scan import associative_scan
 
         a = torch.randn(1024, 8192, dtype=torch.float64, device=device_type)
         b = torch.randn(1024, 8192, dtype=torch.float64, device=device_type)
 
         def baseline(v, u):
+            # [FUNCTION DOC] HELPER: Sequential reference for the recurrence: start with the first
+            # column of b, then for each next column compute the previous result times a plus b,
+            # and stack along dim 1. Uses the outer a and b tensors, not its arguments beyond the
+            # width of v.
             A = []
             A.append(b[:, 0])
             for i in range(1, v.shape[1]):
@@ -2210,12 +2680,17 @@ class CudaReproTests(TestCase):
             return torch.stack(A, dim=1)
 
         def combine_fn(i, j):
+            # [FUNCTION DOC] HELPER: Combine two pairs of the recurrence: returns the product of
+            # the first parts and the second part of the left pair times the first part of the
+            # right pair plus the second part of the right pair.
             ia, ib = i
             ja, jb = j
             return ia * ja, ib * ja + jb
 
         @torch.compile
         def compiled_scan(a, b):
+            # [FUNCTION DOC] HELPER: Scan over the last dim with the combine function and return
+            # only the second tensor.
             return associative_scan(combine_fn, (a, b), dim=-1)[1]
 
         out1 = baseline(a, b)
@@ -2223,15 +2698,21 @@ class CudaReproTests(TestCase):
         self.assertEqual(out1, out2)
 
     def test_associative_scan_dynamic_ndim(self):
+        # [FUNCTION DOC] Check associative_scan lowering with an add combine on 1D dynamic, 2D
+        # static and 2D dynamic inputs against cumsum, then with a multiply combine along dim 1 of
+        # a clamped 3D dynamic input against eager scan. Compiler state is reset before each
+        # compile. Skipped unless the device is CUDA.
         if device_type != "cuda":
             raise unittest.SkipTest("associative_scan pointwise lowering requires CUDA")
 
         from torch._higher_order_ops.associative_scan import associative_scan
 
         def add_combine(a, b):
+            # [FUNCTION DOC] HELPER: Add combine function.
             return a + b
 
         def scan_dim0(x):
+            # [FUNCTION DOC] HELPER: Associative scan with add along dim 0.
             return associative_scan(add_combine, x, dim=0)
 
         x1 = torch.randn(7, device=device_type)
@@ -2249,9 +2730,11 @@ class CudaReproTests(TestCase):
         self.assertEqual(torch.cumsum(x2, 0), compiled_dynamic(x2))
 
         def mul_combine(a, b):
+            # [FUNCTION DOC] HELPER: Multiply combine function.
             return a * b
 
         def scan_dim1(x):
+            # [FUNCTION DOC] HELPER: Associative scan with multiply along dim 1.
             return associative_scan(mul_combine, x, dim=1)
 
         x3 = torch.randn(2, 9, 5, device=device_type).clamp(-2, 2)
@@ -2260,8 +2743,12 @@ class CudaReproTests(TestCase):
         self.assertEqual(scan_dim1(x3), compiled_3d(x3))
 
     def test_dynamic_persistent_reductions(self):
+        # [FUNCTION DOC] Check that dynamic-shape reductions whose size is bounded by an assert
+        # (inner dim at most 1024, outer dim at most 64) use a persistent reduction, i.e. the
+        # generated code contains no looped reduction offset. Checks results against eager too.
         @torch.compile(dynamic=True)
         def inner_reduce(x):
+            # [FUNCTION DOC] HELPER: Assert the inner size is at most 1024 and sum over dim 1.
             assert x.shape[1] <= 1024  # noqa: S101
             return x.sum(1)
 
@@ -2272,6 +2759,7 @@ class CudaReproTests(TestCase):
 
         @torch.compile(dynamic=True)
         def outer_reduce(x):
+            # [FUNCTION DOC] HELPER: Assert the outer size is at most 64 and sum over dim 0.
             assert x.shape[0] <= 64  # noqa: S101
             return x.sum(0)
 
@@ -2289,10 +2777,17 @@ class CudaReproTests(TestCase):
         }
     )
     def test_persistent_reduction_selection_uses_tiling_scores(self):
+        # [FUNCTION DOC] Check that with tiled reductions and nd tiling off, a silu-times-up
+        # followed by grouped absolute max (group size 128) over a bf16 input compiles into
+        # exactly one persistent reduction kernel with the inner reduction hint and no looped
+        # reduction. The compiled value also equals eager. Skipped unless CUDA.
         if device_type != "cuda":
             raise unittest.SkipTest("requires CUDA")
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Split the columns of x in two halves, multiply silu of the
+            # first by the second in float32, group into chunks of 128 and return the max absolute
+            # value per group.
             hidden = x.shape[1] // 2
             group_size = 128
             gate = x[:, :hidden].to(torch.float32)
@@ -2327,6 +2822,13 @@ class CudaReproTests(TestCase):
     def test_persistent_reduction_cse_reindexed_epilogue(
         self, use_block_ptr, dynamic_batch
     ):
+        # [FUNCTION DOC] Parametrized over block pointer usage and dynamic batch. Compiles an
+        # fp8-style quantization epilogue (silu-gate product, per-group max scale, clamp, cast,
+        # in-place copies into outputs) and compares both outputs to eager, including a second
+        # batch size when dynamic. Checks the code has a single persistent reduction kernel, that
+        # two loads from the first input use block pointers or plain pointer loads depending on
+        # the parameter, and that at most one libdevice exp appears (common subexpression reuse).
+        # Skipped unless CUDA.
         if device_type != "cuda":
             raise unittest.SkipTest("requires CUDA")
 
@@ -2336,6 +2838,10 @@ class CudaReproTests(TestCase):
         min_fp8_scale = 1.0 / (fp8_max * 512.0)
 
         def fn(out, x, scales_out, scale_ub):
+            # [FUNCTION DOC] HELPER: Compute silu-gated group max scales, clamp them to the upper
+            # bound and a minimum, quantize the grouped values by dividing by scales, clamp to the
+            # fp8 range and cast to the output dtype, then copy the scales and result into the
+            # given output buffers (mutates scales_out and out).
             hidden = x.shape[1] // 2
             group_size = 128
             gate = x[:, :hidden].to(torch.float32)
@@ -2398,15 +2904,24 @@ class CudaReproTests(TestCase):
         self.assertLessEqual(persistent_code.count("libdevice.exp"), 1)
 
     def test_scaled_dot_product_efficient_attention_backward(self):
+        # [FUNCTION DOC] Regression test: compile a small attention module with a mask on length-1
+        # inputs and run backward through the efficient SDPA path. Passes if no exception is
+        # raised.
         from torch import nn, Tensor
 
         class SelfAttention(nn.Module):
+            # [CLASS DOC] HELPER: Simplified BERT-style self attention: three linear projections
+            # to query, key and value, reshaped into heads, then scaled dot product attention with
+            # an attention mask and dropout only in training mode. Stores head count, head size
+            # and dropout probability.
             def __init__(
                 self,
                 num_attention_heads: int = 12,
                 hidden_size: int = 768,
                 attention_probs_dropout_prob: float = 0.1,
             ):
+                # [FUNCTION DOC] HELPER: Store the head count and head size (hidden size divided
+                # by heads), create the three linear layers and keep the dropout probability.
                 super().__init__()
 
                 self.num_attention_heads = num_attention_heads
@@ -2419,6 +2934,8 @@ class CudaReproTests(TestCase):
                 self.dropout_prob = attention_probs_dropout_prob
 
             def transpose_for_scores(self, x: Tensor) -> Tensor:
+                # [FUNCTION DOC] HELPER: Reshape x so the last dim is split into heads and head
+                # size, then permute to put heads before the sequence dim.
                 new_x_shape = x.size()[:-1] + (
                     self.num_attention_heads,
                     self.attention_head_size,
@@ -2426,6 +2943,9 @@ class CudaReproTests(TestCase):
                 return x.view(new_x_shape).permute(0, 2, 1, 3)
 
             def forward(self, hidden_states: Tensor, attention_mask: Tensor) -> Tensor:
+                # [FUNCTION DOC] HELPER: Project hidden_states to query, key and value layers,
+                # split into heads and return scaled dot product attention using attention_mask,
+                # with dropout only when training.
                 query_layer = self.transpose_for_scores(self.query(hidden_states))
                 key_layer = self.transpose_for_scores(self.key(hidden_states))
                 value_layer = self.transpose_for_scores(self.value(hidden_states))
@@ -2468,11 +2988,17 @@ class CudaReproTests(TestCase):
         "Does not support mem_eff_attention",
     )
     def test_mem_eff_attention_backward_non_16_aligned_head_dim(self):
+        # [FUNCTION DOC] For non-causal and causal attention with head dim 20 (not a multiple of
+        # 16), compare forward value and input gradients of eager and compiled SDPA forced onto
+        # the efficient attention backend. Resets dynamo and seeds the RNG each iteration. Skipped
+        # without mem-efficient attention support.
         for is_causal in (False, True):
             torch._dynamo.reset()
             torch.manual_seed(0)
 
             def fn(q, k, v):
+                # [FUNCTION DOC] HELPER: Scaled dot product attention using the loop's causal
+                # flag, summed to a scalar.
                 return F.scaled_dot_product_attention(
                     q, k, v, is_causal=is_causal
                 ).sum()
@@ -2504,6 +3030,9 @@ class CudaReproTests(TestCase):
                 self.assertEqual(actual_input.grad, expected_input.grad)
 
     def test_non_contiguous_unaligned_input_indices(self):
+        # [FUNCTION DOC] Unit test of the helper that removes unaligned indices from the static
+        # input index list: a sliced tensor (offset by one row) is dropped from the list, while
+        # aligned ones are kept.
         from torch._inductor.compile_fx import remove_unaligned_input_idxs
 
         inputs = [
@@ -2525,7 +3054,12 @@ class CudaReproTests(TestCase):
     @skipIfCachingAllocatorDisabled
     @config.patch("triton.cudagraphs", True)
     def test_unused_cpu_input_cudagraphs(self):
+        # [FUNCTION DOC] With cudagraphs enabled, lower a traced pointwise function that has an
+        # unused CPU input and check that cudagraphs are not disabled (no disable reason), the
+        # graph's device types is only the accelerator, and the compiled output matches eager.
+        # Skipped on XPU or if the caching allocator is disabled.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Apply sin four times and cos to x and add one; y is unused.
             return x.sin().sin().sin().sin().cos() + 1
 
         fx_graph = torch.fx.symbolic_trace(fn)
@@ -2538,14 +3072,22 @@ class CudaReproTests(TestCase):
         self.assertEqual(compiled_fn(*inp), fn(*inp))
 
     def test_epilogue_fusion_with_view(self):
+        # [FUNCTION DOC] Compile a conv, flatten and linear model with max-autotune on device
+        # index 0 inside a fresh inductor cache, and compare with eager on a random 32 by 3 by 64
+        # by 64 input (tolerance 1e-3). Exercises epilogue fusion with a view.
         class ToyModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Toy model with a conv layer (3 to 64 channels, 3 by 3, padding
+            # 1), a linear layer with 262144 inputs and 100 outputs and a relu.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the conv, linear and relu layers.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1)
                 self.linear = torch.nn.Linear(262144, 100)
                 self.relu = torch.nn.ReLU()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply the conv, flatten all dims after the batch dim,
+                # then linear and relu.
                 x = self.conv(x)
                 x = x.view(x.size(0), -1)
                 return self.relu(self.linear(x))
@@ -2564,8 +3106,13 @@ class CudaReproTests(TestCase):
     @skipIfCachingAllocatorDisabled
     @config.patch("triton.cudagraphs", True)
     def test_cpu_index(self):
+        # [FUNCTION DOC] With cudagraphs enabled, check that indexing a GPU tensor with a CPU
+        # arange index does not disable cudagraphs and that only the accelerator appears in the
+        # graph device types, for the forward with and without grad and for the backward graph.
+        # Skipped on XPU or if the caching allocator is disabled.
         @torch.compile(fullgraph=True)
         def fn(x):
+            # [FUNCTION DOC] HELPER: Index x with the first 32 integers created on the CPU.
             return x[torch.arange(32)]
 
         result, (graph,) = run_and_get_graph_lowering(
@@ -2585,6 +3132,9 @@ class CudaReproTests(TestCase):
 
     @unittest.skipIf(IS_FBCODE, "Not runnable in fbcode")
     def test_triton_interpret(self):
+        # [FUNCTION DOC] Run a small compiled add in a subprocess that has the Triton interpreter
+        # environment variable set and check it exits with success (output values are not
+        # compared). Skipped in fbcode.
         import subprocess
 
         script = f"""
@@ -2603,7 +3153,15 @@ foo(torch.rand([256], device=\"{device_type}\"))
         subprocess.run([sys.executable, "-c", script], check=True)
 
     def test_reflection_pad_loop_order(self):
+        # [FUNCTION DOC] Check that two reflection pads added together compile into one pointwise
+        # kernel which iterates in contiguous order (no tiling): extracts the first kernel from
+        # the generated code (static asserts stripped) and compares it with an expected text, and
+        # checks the result against eager.
+        # KNOWN ISSUE: the expected kernel text is a hard-coded golden string, so it is sensitive
+        #   to codegen changes.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Reflection-pad both inputs by 5 on every side of the last two
+            # dims and add them.
             a = torch.nn.functional.pad(x, (5, 5, 5, 5), mode="reflect")
             b = torch.nn.functional.pad(y, (5, 5, 5, 5), mode="reflect")
             return a + b
@@ -2641,6 +3199,11 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
     @skipCUDAIf(not SM80OrLater, "uses bfloat16 which requires SM >= 80")
     @skipCUDAIf(not SM90OrLater, "needs at least 6 GiB of GPU memory headroom")
     def test_chunked_unrolled_slice_gather_int32_overflow(self):
+        # [FUNCTION DOC] Regression test for an int32 index miscompile: an unrolled loop over
+        # chunks of a bf16 projection with a gather (cross-entropy-like log-sum-exp) fused in one
+        # kernel produced an index that overflows 32 bits and caused illegal memory access. Runs
+        # compiled without dynamic shapes, synchronizes, and checks results are close to eager
+        # (loose tolerance). Needs SM80 and SM90 level GPUs.
         # Regression for an int32-indexing miscompile when an unrolled chunked
         # loop containing a per-chunk F.linear and a gather gets fused into one
         # pointwise kernel. Per-chunk buffer storage individually fits in int32,
@@ -2655,6 +3218,9 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
         bias = torch.zeros(V_, device=device_type, dtype=torch.bfloat16)
 
         def fwd(x, targets, W, bias):
+            # [FUNCTION DOC] HELPER: For each chunk of 2048 rows, compute logits with the shared
+            # weight plus bias, then the log-sum-exp minus the logit at the target index, written
+            # into the matching slice of a float32 output buffer. Returns the buffer.
             seqlen = x.shape[-2]
             out = torch.empty(x.shape[:-1], device=x.device, dtype=torch.float32)
             for start in range(0, seqlen, CHUNKSZ):
@@ -2684,7 +3250,12 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
         self.assertTrue(torch.allclose(eager, compiled, atol=1e-2, rtol=1e-2))
 
     def test_int64_index_intermediate(self):
+        # [FUNCTION DOC] Check that splitting a huge bf16 tensor into eight pieces and
+        # concatenating them gives the same result as eager, both with and without marking dim 0
+        # dynamic (intermediate indices need 64-bit).
         def foo(inp):
+            # [FUNCTION DOC] HELPER: View the input as 3D with an 8192 by 8192 tail, split along
+            # dim 1 into eight chunks of 1024, concatenate them along dim 0 and return it.
             view_23 = torch.ops.aten.view.default(inp, [-1, 8192, 8192])
             split_1 = torch.ops.aten.split.Tensor(view_23, 1024, 1)
             view_23 = None
@@ -2725,11 +3296,16 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
         not SM90OrLater, "uses bfloat16 atomic add instrs which requires SM >= 90"
     )
     def test_float8_e8m0fnu(self):
+        # [FUNCTION DOC] Check float8 e8m0 handling: a round trip cast float32 to e8m0 and back
+        # must match eager; then a uint8 tensor plus one viewed as e8m0 and flattened must match
+        # eager and not produce a reshape call in the generated code. Skipped below SM90.
         device = device_type
         dtype = torch.float8_e8m0fnu
         hp_dtype = torch.float32  # and torch.bfloat16
 
         def foo(x0):
+            # [FUNCTION DOC] HELPER: Cast x to the float8 e8m0 type, then back to the high
+            # precision dtype (float32).
             x1 = x0.to(dtype)
             x2 = x1.to(hp_dtype)
             return x2
@@ -2745,6 +3321,9 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
         dtype = torch.float8_e8m0fnu
 
         def foo(x0):
+            # [FUNCTION DOC] HELPER: Add one to x, reinterpret the bytes as the float8 e8m0 type
+            # and flatten to 256 elements. This replaces the earlier local helper of the same
+            # name.
             x1 = x0 + 1
             x2 = x1.view(dtype).view([16 * 16])
             return x2
@@ -2768,7 +3347,11 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
         not SM90OrLater, "uses bfloat16 atomic add instrs which requires SM >= 90"
     )
     def test_atomic_add_bfloat16(self):
+        # [FUNCTION DOC] Check that the backward of a compiled index_select on bf16 with many
+        # repeated indices uses an atomic add in Triton and that the forward result equals eager.
+        # Only runs in fbcode on SM90 or later.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Select rows of x along dim 0 using the indices y.
             return torch.index_select(x, 0, y)
 
         x = torch.randn(
@@ -2786,12 +3369,20 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
         self.assertEqual(f(x_ref, y_ref), out)
 
     def test_red_dtype_mismatch(self):
+        # [FUNCTION DOC] Regression test for a reduction dtype mismatch: a graph ending in a max
+        # over an int64 iota (with unused embedding and view ops before it) must match eager,
+        # tested with persistent reductions on and off. Resets dynamo each iteration.
+        # KNOWN ISSUE: when the loop turns persistent reductions off in the global inductor config
+        #   it never restores it, so the setting leaks into later tests.
         for per in (True, False):
             torch._dynamo.reset()
             if not per:
                 torch._inductor.config.triton.persistent_reductions = False
 
             def f(arg0_1, arg1_1):
+                # [FUNCTION DOC] HELPER: Graph body that builds some unused embedding views and
+                # returns only the maximum of an int64 iota of length 36 viewed as one row.
+                # Returns a one-element tuple.
                 embedding = torch.ops.aten.embedding.default(arg1_1, arg0_1)
                 view = torch.ops.aten.view.default(embedding, [64, 3072])
                 unsqueeze = torch.ops.aten.unsqueeze.default(view, 0)
@@ -2827,7 +3418,11 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
         "bfloat16 atomic add is supported in fbcode, so we won't fallback",
     )
     def test_index_add_fallback(self):
+        # [FUNCTION DOC] Check that outside fbcode the backward of a compiled bf16 index_select
+        # falls back to the index_add kernel instead of Triton atomics, and the forward result
+        # matches eager. Needs SM90 or later.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Select rows of x along dim 0 using the indices y.
             return torch.index_select(x, 0, y)
 
         x = torch.randn(
@@ -2852,7 +3447,11 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
         "bfloat16 atomic add is supported in fbcode, so we won't fallback",
     )
     def test_index_add_fallback_direct(self):
+        # [FUNCTION DOC] Compare compiled and eager index_add of bf16 rows at distinct random
+        # indices (outside fbcode, SM90 or later).
         def f(x, idx, src):
+            # [FUNCTION DOC] HELPER: Return x with the source rows added at the given indices
+            # along dim 0.
             return torch.index_add(x, 0, idx, src)
 
         x = torch.randn(16, 256, dtype=torch.bfloat16, device=device_type)
@@ -2865,10 +3464,14 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
 
     @requires_multigpu()
     def test_not_initializing_wrong_device(self):
+        # [FUNCTION DOC] Check that compiling and running forward and backward of a matmul on
+        # device 1 does not allocate more memory on device 0 than before (peak active bytes).
+        # Requires multiple GPUs.
         device_stats = torch.cuda.memory_stats("cuda:0")
 
         @torch.compile()
         def foo(x, y):
+            # [FUNCTION DOC] HELPER: Matrix multiply of x and y.
             return x @ y
 
         x = torch.rand([256, 256], device="cuda:1", requires_grad=True)
@@ -2888,6 +3491,10 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
         }
     )
     def test_3d_tiling(self):
+        # [FUNCTION DOC] With nd tiling preferred and up to three tiles, add two strided views of
+        # a 5D tensor and check the result equals the plain sum and the generated code uses a
+        # third tile dimension (znumel). The block pointer and tile count variables are defined
+        # but not used.
         full_size, view_size, num_block_pointers, num_tiles = (
             (5, 5, 5, 5, 5),
             (3, 3, 5, 3, 5),
@@ -2897,6 +3504,8 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
         GPU_TYPE = device_type
 
         def get_input() -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Create a random 5 by 5 by 5 by 5 by 5 tensor on the device
+            # and return a strided view of shape 3, 3, 5, 3, 5 using the full tensor's strides.
             device = torch.device(GPU_TYPE)
             full = torch.randn(full_size).to(device)
             return torch.as_strided(full, view_size, full.stride())
@@ -2910,6 +3519,10 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
 
     @unittest.skipIf(config.is_fbcode(), "Dependence on functorch.einops")
     def test_repeated_masked_load(self):
+        # [FUNCTION DOC] Check that chunked nearest interpolation of a permuted, rearranged fp16
+        # tensor (repeated masked loads) gives the eager result and that Dynamo records exactly
+        # one unique graph. Clears the shared counters first and requires the Dynamo stats counter
+        # to exist. Skipped in fbcode.
         counters.clear()
 
         target_size = (8, 2)
@@ -2921,6 +3534,9 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
         x = rearrange(x, "b c t h w -> b c t (h w)")
 
         def interpolate_chunked(x):
+            # [FUNCTION DOC] HELPER: Split x into two chunks along dim 1, interpolate each (as
+            # float32, nearest mode, to size 8 by 2) and cast back to the original dtype, then
+            # concatenate along dim 1.
             chunks = x.chunk(chunks=mem_eff_temporal_upsampling_interp_chunks, dim=1)
             r = []
             for t in chunks:
@@ -2948,6 +3564,9 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
         )
 
     def test_max_autotune_nograd(self):
+        # [FUNCTION DOC] Regression test (issue 155688): compile a model with default and with
+        # max-autotune modes under no_grad and check both outputs match (previously max-autotune
+        # raised a TypeError about a symbolic Identity not being a number).
         """
         https://github.com/pytorch/pytorch/issues/155688
         Smallest repro for max-autotune not working with no_grad
@@ -2957,7 +3576,11 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
         """
 
         class ToyModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Model made of five linear layers (inputs 4 to 8 wide, one output
+            # each). Each step applies a linear and relu to the running tensor and concatenates
+            # the result as an extra column.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Create the list of five linear layers.
                 super().__init__()
 
                 self.linear_layers = nn.ModuleList(
@@ -2971,6 +3594,8 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: For each layer, apply the layer and relu to x and append
+                # the result to x as a new column; return the final wider tensor.
                 for layer in self.linear_layers:
                     x2 = layer(x)
                     x2 = F.relu(x2)
@@ -2992,15 +3617,24 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
 
     @tf32_on_and_off(0.005)
     def test_adaptive_avg_pool3d_issue_157248(self):
+        # [FUNCTION DOC] Regression test (issue 157248) for wrong results when a conv output is
+        # unsqueezed to 5D and passed to adaptive average pooling in 3D. For five input sizes,
+        # compares eager and inductor-compiled outputs under no_grad in eval mode, using subTest
+        # per size. Runs with tf32 on and off at tolerance 0.005.
         """Test for GitHub issue #157248: Conv2d-unsqueeze-AdaptiveAvgPool3d produces incorrect results"""
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Model with a 3 to 16 channel conv, followed by adding a dim at
+            # position 1 and adaptive average pooling to 4 by 4 by 4.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Create the conv and pooling layers.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1)
                 self.adaptive_pool = torch.nn.AdaptiveAvgPool3d((4, 4, 4))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply the conv, add a dim at position 1 (which produced
+                # zero strides before the fix) and apply the pooling.
                 x = self.conv(x)
                 # This specific unsqueeze position was problematic due to zero strides
                 x = x.unsqueeze(1)
@@ -3049,8 +3683,18 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
     def test_searchsorted_stride_permutations(
         self, quantiles_shape, quantiles_strides, batch_size
     ):
+        # [FUNCTION DOC] Parametrized over shapes and strides of the sorted boundaries (including
+        # transposed and 3D layouts) with batch size 16. Builds the boundaries as a strided view
+        # of random data, sorts along dim 0, then checks a compiled fullgraph module that does a
+        # transposed search gives the same result as eager under no_grad.
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module holding the transposed sorted boundaries as a frozen
+            # parameter; forward runs a sorted search of the transposed input and transposes the
+            # result back.
             def __init__(self, quantiles: torch.Tensor) -> None:
+                # [FUNCTION DOC] HELPER: Check there is at least one boundary row (raises
+                # AssertionError otherwise), transpose the boundaries and store them as a
+                # parameter that does not require grad.
                 super().__init__()
                 if quantiles.shape[0] <= 0:
                     raise AssertionError(
@@ -3060,6 +3704,8 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
                 self.q = torch.nn.Parameter(quantiles, requires_grad=False)
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Search the transposed x in the stored boundaries and
+                # return the transposed indices.
                 return torch.searchsorted(self.q, x.T).T
 
         torch.manual_seed(42)
@@ -3091,9 +3737,15 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
         self.assertEqual(eager, compiled)
 
     def test_identity_load(self):
+        # [FUNCTION DOC] Check that an index expression stays an identity-like load in compiled
+        # code involving int32 and int64 concatenation and an arange: the code must contain the
+        # expected simplified index pattern and the output equals eager.
         device = device_type
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Concatenate x without its first column with y plus a
+            # constant, then combine with the last element as a third dim, add an arange and
+            # reshape to a single row of 65536.
             y2 = torch.cat(
                 [
                     x[:, 1:],
@@ -3131,10 +3783,19 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
         "dtype instead of float32, tripping Inductor's fake kernel metadata check"
     )
     def test_qwen2_7b_sdpa_input_alignment_requires_recompile(self):
+        # [FUNCTION DOC] Regression test for a Qwen2 7B repro: forward and backward of efficient
+        # SDPA with a padded, expanded attention bias must remain correct with dynamic shapes when
+        # a later call has a sequence length (6102) not divisible by 8, which requires a recompile
+        # for alignment. Compares compiled against eager for both lengths. Skipped on XPU due to a
+        # fake kernel metadata mismatch.
         # SDPA constraints ensures inputs have alignment (8).
         device = device_type
 
         def forward(q_proj, k_proj, attn_mask):
+            # [FUNCTION DOC] HELPER: Build queries, repeated keys and values from projection
+            # inputs, create an additive bias from the boolean mask (zeros and negative infinity)
+            # padded to a multiple of 8 and expanded over heads, run the efficient SDPA forward
+            # and then its backward with a zero gradient. Returns the backward outputs.
             scale = 0.08838834764831845  # 1/sqrt(128)
 
             B = attn_mask.size(0)
@@ -3235,12 +3896,16 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
 
     @config.patch({"eager_numerics.division_rounding": True})
     def test_truediv_emulate_division_rounding(self):
+        # [FUNCTION DOC] With division rounding emulation on, compare compiled division of 11 by 7
+        # for all combinations of float16, bf16, float32 and float64 operand dtypes against eager,
+        # comparing the exact decimal value of the results. Resets dynamo each iteration.
         from decimal import Decimal
 
         y, x = 7.0, 11.0
 
         @torch.compile
         def compiled_divide(x, y):
+            # [FUNCTION DOC] HELPER: True division x over y.
             return x / y
 
         for y_dtype in [torch.float16, torch.bfloat16, torch.float32, torch.float64]:
@@ -3263,6 +3928,10 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
     @config.patch({"eager_numerics.division_rounding": False})
     @xfailIfROCm
     def test_truediv_base_not_bitwise_equivalent(self):
+        # [FUNCTION DOC] With division rounding emulation off, a float32 division of 11 by 7
+        # compiled by inductor gives a different value from eager and the generated code does not
+        # use the round-to-nearest division intrinsic. Expected to fail on ROCm and skipped on
+        # XPU.
         from decimal import Decimal
 
         y, x = 7.0, 11.0
@@ -3283,12 +3952,15 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
 
     @config.patch({"eager_numerics.disable_ftz": True})
     def test_disabling_ftz_yields_subnormals(self):
+        # [FUNCTION DOC] With flush-to-zero disabled, check that a compiled float32 power of 2.0
+        # to the -127 gives a positive (subnormal) result.
         from decimal import Decimal
 
         x = -127.0
         x_ten = torch.tensor([x], dtype=torch.float32, device=device_type)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Two raised to the power x.
             return 2.0**x
 
         compile_out = torch.compile(fn)(x_ten)
@@ -3300,12 +3972,15 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
     @skipIfRocm(msg="ROCm preserves subnormals by default")
     @config.patch({"eager_numerics.disable_ftz": False})
     def test_not_disabling_ftz_yields_zero(self):
+        # [FUNCTION DOC] With flush-to-zero not disabled, check that a compiled float32 power of
+        # 2.0 to the -128 flushes to exactly zero. Skipped on XPU and ROCm.
         from decimal import Decimal
 
         x = -128.0
         x_ten = torch.tensor([x], dtype=torch.float32, device=device_type)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Two raised to the power x.
             return 2.0**x
 
         compile_out = torch.compile(fn)(x_ten)
@@ -3315,6 +3990,11 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
 
     @unittest.skipUnless(HAS_GPU, "requires GPU")
     def test_fused_slice_scatter_int32_const_overflow(self):
+        # [FUNCTION DOC] End-to-end repro of an int32 address-constant overflow in a fused
+        # slice_scatter backward plus matmul backward kernel over ten large inputs (9.5 million
+        # rows). Asserts the sizes match the three triggering conditions, skips if the GPU lacks
+        # the estimated free memory, then compiles the model without dynamic shapes, runs forward
+        # and backward and always frees the tensors and empties the cache afterwards. Needs GPU.
         # End-to-end repro for the int32 address-constant overflow guarded
         # by SIMDKernelFeatures.any_index_expr_overflows_int32.
         # On unfixed builds the fused backward kernel raises
@@ -3344,7 +4024,13 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
             )
 
         class SliceConcatDense(nn.Module):
+            # [CLASS DOC] HELPER: Module with one square bias-free linear per column width;
+            # forward slices a fixed row range from each input, concatenates the slices along
+            # columns, applies each linear to its column block and returns the sum of all outputs
+            # as a scalar.
             def __init__(self, widths):
+                # [FUNCTION DOC] HELPER: Store the widths and create one square linear without
+                # bias per width.
                 super().__init__()
                 self.widths = widths
                 self.linears = nn.ModuleList(
@@ -3352,6 +4038,9 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
                 )
 
             def forward(self, inputs):
+                # [FUNCTION DOC] HELPER: Slice the same row range from every input, concatenate
+                # along dim 1, apply each linear to its own block of columns and return the total
+                # sum as a scalar.
                 sliced = [t[slice_begin:slice_end, :] for t in inputs]
                 cat = torch.cat(sliced, dim=1)
                 out = cat.new_zeros(())
@@ -3386,8 +4075,11 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
         {"triton.use_block_ptr": True, "triton.codegen_upcast_to_fp32": False}
     )
     def test_float16_reduction_with_int_output(self):
+        # [FUNCTION DOC] With block pointers on and upcast to float32 off, a compiled argmax over
+        # an fp16 input must not generate any conversion to float16, since the output is int64.
         @torch.compile
         def fn(input: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Index of the maximum along dim 0.
             return torch.argmax(input, dim=0)
 
         input = torch.randn(20, 20, device=device_type, dtype=torch.float16)
@@ -3398,10 +4090,13 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
 
     @config.patch("eager_numerics.division_rounding", True)
     def test_reciprocal_precision_rounding(self):
+        # [FUNCTION DOC] With division rounding emulation on, check a compiled reciprocal of
+        # float32 values matches eager through the common checker.
         # Test that reciprocal matches eager when division_rounding is enabled.
         # This requires OpDecompositions.reciprocal to use float32 constant so
         # that div_rn can be applied (the dtype check requires both operands float32).
         def fn(x):
+            # [FUNCTION DOC] HELPER: Reciprocal of x.
             return torch.reciprocal(x)
 
         x = torch.randn(1000, device=device_type, dtype=torch.float32) + 0.1
@@ -3411,10 +4106,17 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
     @skipIfRocm(msg="PTX atan codegen is CUDA-specific")
     @skipIfXpu(msg="PTX atan codegen is CUDA-specific")
     def test_atan_special_psi_eager_parity(self):
+        # [FUNCTION DOC] On CUDA only, check that compiled atan on special values (infinities,
+        # NaN, signed zeros and a value that triggered a 1 ULP difference) is bitwise identical to
+        # eager, and that a compiled atan followed by an in-place psi (digamma) is close to eager
+        # and uses the approximate reciprocal instruction in the generated code.
         def atan_fn(x):
+            # [FUNCTION DOC] HELPER: Arctangent of x.
             return torch.ops.aten.atan(x)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Apply atan, then write the psi function of that result into
+            # the same tensor via the out argument and return it.
             out = atan_fn(x)
             return torch.ops.aten.special_psi(out, out=out)
 
@@ -3453,8 +4155,12 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
         self.assertTrue(any("rcp.approx.ftz.f32" in src for src in code))
 
     def test_vector_norm_negative_dim_size_one(self):
+        # [FUNCTION DOC] Regression test (issue 182181): vector norm over negative dims when those
+        # dims have size one, via the tensor method and the linalg function, for one and two dims;
+        # each compared to eager with the common checker.
         # Regression test for https://github.com/pytorch/pytorch/issues/182181
         def fn(x):
+            # [FUNCTION DOC] HELPER: Norm over the last dim.
             return x.norm(dim=-1)
 
         x = torch.rand(8, 3, 1, device=device_type)
@@ -3462,6 +4168,7 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
 
         # Multiple negative dims, all size 1
         def fn2(x):
+            # [FUNCTION DOC] HELPER: Norm over the last two dims.
             return x.norm(dim=(-2, -1))
 
         y = torch.rand(8, 1, 1, device=device_type)
@@ -3469,11 +4176,13 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
 
         # torch.linalg.vector_norm directly
         def fn3(x):
+            # [FUNCTION DOC] HELPER: Vector norm over the last dim using the linalg function.
             return torch.linalg.vector_norm(x, dim=-1)
 
         self.common(fn3, [x])
 
         def fn4(x):
+            # [FUNCTION DOC] HELPER: Vector norm over the last two dims using the linalg function.
             return torch.linalg.vector_norm(x, dim=(-2, -1))
 
         self.common(fn4, [y])
