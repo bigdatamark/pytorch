@@ -1,5 +1,15 @@
 # mypy: allow-untyped-decorators
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Parametrization framework for nn.Module tensors: lets a parameter or buffer be replaced by
+# a computed value derived from one or more underlying "original" tensors through a chain of
+# modules. Main contents: the cached context manager (a per-access value cache), the
+# ParametrizationList container, register_parametrization / remove_parametrizations,
+# is_parametrized, type_before_parametrizations, transfer_parametrizations_and_params, and
+# private helpers that swap the module class for a dynamically created subclass and attach a
+# property per parametrized name. Module-level state: a cache-enabled depth counter and a
+# cache mapping (module id, tensor name) to computed values. No import-time side effects
+# beyond defining names and that state.
 import collections
 import copyreg
 from collections.abc import Sequence
@@ -32,6 +42,10 @@ _cache: dict[tuple[int, str], Tensor | None] = {}
 
 @contextmanager
 def cached():
+    # [FUNCTION DOC] Context manager enabling the parametrization value cache. Increments the
+    # global nesting counter on entry (so nesting is allowed); on exit decrements it, and when
+    # it reaches zero replaces the global cache with an empty mapping, discarding all values.
+    # The cache is cleared even if the body raises. Not thread-safe (global state).
     r"""Context manager that enables the caching system within parametrizations registered with :func:`register_parametrization`.
 
     The value of the parametrized objects is computed and cached the first time
@@ -74,6 +88,8 @@ def cached():
 
 
 def _register_parameter_or_buffer(module, name, X) -> None:
+    # [FUNCTION DOC] HELPER: Register X on module under name as a parameter if it is a Parameter,
+    # otherwise as a buffer. Mutates the module.
     if isinstance(X, Parameter):
         module.register_parameter(name, X)
     else:
@@ -81,6 +97,11 @@ def _register_parameter_or_buffer(module, name, X) -> None:
 
 
 def _maybe_set(dest: Tensor, src: Tensor) -> None:
+    # [FUNCTION DOC] HELPER: Make dest take the value of src while keeping dest's identity (so
+    # optimizers keep tracking it). If the swap-on-conversion future flag is on or dest is a
+    # traceable wrapper subclass, swap the tensors' contents (wrapping src in a Parameter
+    # with dest's requires_grad if dest is a Parameter and src is not); otherwise set dest
+    # to src's storage. Mutates dest; returns nothing.
     should_swap = (
         get_swap_module_params_on_conversion() or is_traceable_wrapper_subclass(dest)
     )
@@ -93,6 +114,13 @@ def _maybe_set(dest: Tensor, src: Tensor) -> None:
 
 
 class ParametrizationList(ModuleList):
+    # [CLASS DOC] Container (a ModuleList) of the parametrization modules registered on one tensor
+    # of a host module, plus the underlying unconstrained tensors. State: unsafe flag,
+    # is_tensor (whether the first parametrization's inverse produced a single tensor),
+    # ntensors, and registered tensors named original (single) or original0, original1, ...
+    # (several; reference-type opaque objects are also allowed). Invariant: when not unsafe,
+    # calling it reproduces the original dtype and shape. forward applies the chain in order;
+    # right_inverse pushes a value back through the chain into the originals.
     r"""A sequential container that holds and manages the original parameters or buffers of a parametrized :class:`torch.nn.Module`.
 
     It is the type of ``module.parametrizations[tensor_name]`` when ``module[tensor_name]``
@@ -126,6 +154,14 @@ class ParametrizationList(ModuleList):
         original: Tensor | Parameter,
         unsafe: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Build the list from the given modules and the tensor being parametrized.
+        # Under no grad, applies each module's right_inverse (last to first; a missing one or one
+        # raising NotImplementedError counts as identity) to get the new original value(s).
+        # A single tensor must keep dtype and device and is copied into the original tensor
+        # (identity preserved) and registered as original; a sequence is registered as
+        # original0, original1, ... (Parameters keep requires_grad; opaque objects are stored
+        # as attributes). Unless unsafe, runs forward once and checks tensor type, dtype and
+        # shape. Raises ValueError for empty modules or any failed check.
         # We require this because we need to treat differently the first parametrization
         # This should never throw, unless this class is used from the outside
         if len(modules) == 0:
@@ -253,6 +289,12 @@ class ParametrizationList(ModuleList):
                 )
 
     def right_inverse(self, value: Tensor) -> None:
+        # [FUNCTION DOC] Assign value to the parametrized tensor: under no grad, pass it through
+        # each
+        # module's right_inverse from last to first, then copy the result into original (single
+        # tensor case) or into original0, original1, ... (sequence case, replacing opaque
+        # objects). Raises RuntimeError if a module lacks right_inverse, ValueError on wrong
+        # result type, dtype or length. Mutates the original tensors in place; returns nothing.
         r"""Call the ``right_inverse`` methods of the parametrizations in the inverse registration order.
 
         Then, it stores the result in ``self.original`` if ``right_inverse`` outputs one tensor
@@ -324,6 +366,9 @@ class ParametrizationList(ModuleList):
                     )
 
     def forward(self) -> Tensor:
+        # [FUNCTION DOC] Compute the parametrized tensor: feed the original tensor(s) to the first
+        # module, then pass the result through the remaining modules in index order. Takes no
+        # arguments; returns the final value. Raises RuntimeError when scripting.
         if torch.jit.is_scripting():
             raise RuntimeError("Parametrization is not working with scripting.")
         # Unpack the originals for the first parametrization
@@ -342,6 +387,10 @@ class ParametrizationList(ModuleList):
 
 
 def _inject_new_class(module: Module) -> None:
+    # [FUNCTION DOC] HELPER: Replace the class of module (in place) with a dynamically created
+    # subclass named with a Parametrized prefix whose pickling-state hook raises (only
+    # state_dict serialization is supported) and which keeps deepcopy working by adding a
+    # default deepcopy method when the original class has none.
     r"""Set up a module to be parametrized.
 
     This works by substituting the class of the module by a class
@@ -353,6 +402,9 @@ def _inject_new_class(module: Module) -> None:
     cls = module.__class__
 
     def default_deepcopy(self, memo):
+        # [FUNCTION DOC] HELPER: Standard deep copy emulation: return the memoized copy if present;
+        # otherwise create an empty instance, memoize it, deep copy the attribute dictionary
+        # and any slots into it, and return it.
         # Just emulate a standard deepcopy procedure when __deepcopy__ doesn't exist in the current class.
         obj = memo.get(id(self), None)
         if obj is not None:
@@ -368,6 +420,8 @@ def _inject_new_class(module: Module) -> None:
         return replica
 
     def getstate(self):
+        # [FUNCTION DOC] HELPER: Always raises RuntimeError: parametrized modules cannot be pickled
+        # directly; use state_dict.
         raise RuntimeError(
             "Serialization of parametrized modules is only "
             "supported through state_dict(). See:\n"
@@ -391,6 +445,11 @@ def _inject_new_class(module: Module) -> None:
 
 
 def _inject_property(module: Module, tensor_name: str) -> None:
+    # [FUNCTION DOC] HELPER: Attach to the (already parametrized) class of module a property named
+    # tensor_name. The getter evaluates the parametrization list (through the cache when
+    # caching is active; raises RuntimeError when scripting or tracing with caching); the
+    # setter calls the list's right_inverse. Raises AssertionError if the module already
+    # has an attribute of that name. Mutates the class, affecting all instances.
     r"""Injects a property into module[tensor_name].
 
     It assumes that the class in the module has already been modified from its
@@ -408,6 +467,8 @@ def _inject_property(module: Module, tensor_name: str) -> None:
 
     @torch.jit.unused
     def get_cached_parametrization(parametrization) -> Tensor:
+        # [FUNCTION DOC] HELPER: Return the cached value for this module and tensor name, computing
+        # and storing it in the global cache on a miss.
         global _cache
         key = (id(module), tensor_name)
         tensor = _cache.get(key)
@@ -417,6 +478,10 @@ def _inject_property(module: Module, tensor_name: str) -> None:
         return tensor
 
     def get_parametrized(self) -> Tensor:
+        # [FUNCTION DOC] HELPER: Property getter: return the parametrized tensor, from the cache if
+        # caching is enabled (RuntimeError when tracing or scripting), else freshly computed.
+        # KNOWN ISSUE: the inner scripting check under caching is unreachable because
+        # scripting already raised at the top of the function.
         if torch.jit.is_scripting():
             raise RuntimeError("Parametrization is not working with scripting.")
         parametrization = self.parametrizations[tensor_name]
@@ -440,6 +505,8 @@ def _inject_property(module: Module, tensor_name: str) -> None:
             return parametrization()
 
     def set_original(self, value: Tensor) -> None:
+        # [FUNCTION DOC] HELPER: Property setter: store value into the originals through the list's
+        # right_inverse. Raises RuntimeError when scripting.
         if torch.jit.is_scripting():
             raise RuntimeError("Parametrization is not working with scripting.")
         self.parametrizations[tensor_name].right_inverse(value)
@@ -454,6 +521,13 @@ def register_parametrization(
     *,
     unsafe: bool = False,
 ) -> Module:
+    # [FUNCTION DOC] Register parametrization on the named parameter or buffer of module (in
+    # place) and return the module. If already parametrized, optionally (unless unsafe) check
+    # that forward and right_inverse preserve dtype and shape, then append to the existing list
+    # (OR-ing the unsafe flag). Otherwise build a new list from the original tensor, delete
+    # the plain attribute, swap in the parametrized class and a parametrizations mapping on
+    # first use, add the property and store the list. The parametrization is put in the host's
+    # training mode first. Raises ValueError for a missing name or failed checks.
     r"""Register a parametrization to a tensor in a module.
 
     Assume that ``tensor_name="weight"`` for simplicity. When accessing ``module.weight``,
@@ -672,6 +746,8 @@ def register_parametrization(
 
 
 def is_parametrized(module: Module, tensor_name: str | None = None) -> bool:
+    # [FUNCTION DOC] Return True if module has parametrizations: for the given tensor_name if
+    # provided, otherwise for any tensor. False when there is no parametrizations mapping.
     r"""Determine if a module has a parametrization.
 
     Args:
@@ -698,6 +774,14 @@ def remove_parametrizations(
     tensor_name: str,
     leave_parametrized: bool = True,
 ) -> Module:
+    # [FUNCTION DOC] Remove all parametrizations on tensor_name and return module. With
+    # leave_parametrized, the current computed value is written into the original tensor
+    # (single-tensor case, keeping identity; subclass failures are re-raised with advice) or
+    # becomes a new tensor/Parameter (multi-tensor case); without it, the original tensor is
+    # restored (ValueError for multi-tensor). Then deletes the property and list, re-registers
+    # the tensor, and restores the original class when nothing else is parametrized.
+    # Raises ValueError if the tensor is not parametrized.
+    # KNOWN ISSUE: the subclass error message concatenates sentences without separating spaces.
     r"""Remove the parametrizations on a tensor in a module.
 
     - If ``leave_parametrized=True``, ``module[tensor_name]`` will be set to
@@ -797,6 +881,8 @@ def remove_parametrizations(
 
 
 def type_before_parametrizations(module: Module) -> type:
+    # [FUNCTION DOC] Return the class module had before parametrization (the base of the injected
+    # subclass), or its plain type if it is not parametrized.
     r"""Return the module type before parametrizations were applied and if not, then it returns the module type.
 
     Args:
@@ -813,6 +899,11 @@ def transfer_parametrizations_and_params(
     to_module: Module,
     tensor_name: str | None = None,
 ) -> Module:
+    # [FUNCTION DOC] Copy parametrizations (and their underlying tensors) from from_module to
+    # to_module and return to_module. Does nothing if from_module is not parametrized. For
+    # each selected name (one, or all): create a Parameter on to_module if missing, register
+    # each of the source parametrization modules (shared, not copied) on it, then assign the
+    # original tensor or original0, original1, ... from the source. Mutates to_module.
     r"""Transfer parametrizations and the parameters they parametrize from :attr:`from_module` to :attr:`to_module`.
 
     If :attr:`tensor_name` is specified, only transfers the specified parameter, otherwise

@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Ready-made parametrizations built on torch.nn.utils.parametrize: orthogonal/unitary
+# constraints (matrix exponential, Cayley map or Householder reflectors), weight
+# normalization (magnitude/direction split) and spectral normalization (power method).
+# Public API (__all__): orthogonal, spectral_norm, weight_norm. Each public function
+# registers a private Module subclass as a parametrization on a module's tensor.
+# No import-time side effects beyond defining the names.
 from enum import auto, Enum
 
 import torch
@@ -12,6 +19,10 @@ __all__ = ["orthogonal", "spectral_norm", "weight_norm"]
 
 
 def _is_orthogonal(Q, eps=None):
+    # [FUNCTION DOC] HELPER: Return whether the columns of Q (last two dims, possibly batched)
+    # are orthonormal, by comparing the conjugate-transpose product with the identity
+    # within an absolute tolerance scaled by row count and dtype epsilon.
+    # KNOWN ISSUE: the eps argument is ignored; it is always overwritten by the computed value.
     n, k = Q.size(-2), Q.size(-1)
     Id = torch.eye(k, dtype=Q.dtype, device=Q.device)
     # A reasonable eps, but not too large
@@ -20,6 +31,9 @@ def _is_orthogonal(Q, eps=None):
 
 
 def _make_orthogonal(A):
+    # [FUNCTION DOC] HELPER: Orthogonalize a tall matrix (or batch) via a QR factorization and
+    # return the Q factor, with each column sign-adjusted so the diagonal of R is real
+    # and non-negative (a deterministic choice). Does not mutate A.
     """Assume that A is a tall matrix.
 
     Compute the Q factor s.t. A = QR (A may be complex) and diag(R) is real and non-negative.
@@ -32,17 +46,29 @@ def _make_orthogonal(A):
 
 
 class _OrthMaps(Enum):
+    # [CLASS DOC] HELPER: Enumeration of the supported maps from an unconstrained tensor to an
+    # orthogonal one: matrix_exp, cayley and householder.
     matrix_exp = auto()
     cayley = auto()
     householder = auto()
 
 
 class _Orthogonal(Module):
+    # [CLASS DOC] HELPER: Parametrization module mapping an unconstrained tensor to an orthogonal
+    # (or unitary) matrix or batch of matrices, using the chosen _OrthMaps map.
+    # State: shape (shape of the original weight), orthogonal_map, and optionally a
+    # buffer named base (an n x n orthogonal matrix) when trivialization is enabled; the
+    # presence of the attribute base is what signals trivialization. Key methods:
+    # forward (build Q) and right_inverse (find an unconstrained tensor giving a target Q).
     base: Tensor
 
     def __init__(
         self, weight, orthogonal_map: _OrthMaps, *, use_trivialization=True
     ) -> None:
+        # [FUNCTION DOC] HELPER: Store the weight shape and the chosen map; if use_trivialization
+        # is
+        # set, register an empty (None) buffer named base to be filled by right_inverse.
+        # Raises ValueError for the householder map on a complex weight.
         super().__init__()
 
         # Note [Householder complex]
@@ -68,6 +94,13 @@ class _Orthogonal(Module):
             self.register_buffer("base", None)
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Map an unconstrained tensor X of shape (..., n, k) to an
+        # orthogonal
+        # tensor of the same shape. Wide inputs are transposed first. The matrix_exp and
+        # cayley maps use the lower triangle to build a skew-symmetric matrix and apply the
+        # exponential or Cayley retraction; householder builds reflectors from the strictly
+        # lower triangle, with the diagonal signs taken from X. If base exists, the result is
+        # left-multiplied by it. Returns the orthogonal tensor; no mutation of X.
         n, k = X.size(-2), X.size(-1)
         transposed = n < k
         if transposed:
@@ -119,6 +152,14 @@ class _Orthogonal(Module):
 
     @torch.autograd.no_grad()
     def right_inverse(self, Q: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Given a target tensor Q (shape must equal the stored shape),
+        # return
+        # an unconstrained tensor whose forward image is the orthogonalized Q. Without
+        # trivialization only the householder map is supported (via a QR-style reflector
+        # decomposition); with trivialization, Q is orthogonalized (completed with random
+        # columns if non-square), stored in the base buffer (side effect), and a tensor of
+        # negative identity is returned. Raises ValueError on shape mismatch and
+        # NotImplementedError for matrix_exp or cayley without trivialization. Runs without grad.
         if Q.shape != self.shape:
             raise ValueError(
                 f"Expected a matrix or batch of matrices of shape {self.shape}. "
@@ -197,6 +238,11 @@ def orthogonal(
     *,
     use_trivialization: bool = True,
 ) -> Module:
+    # [FUNCTION DOC] Register an orthogonal/unitary parametrization on the named tensor of module
+    # (in place) and return the same module. orthogonal_map names the map (matrix_exp,
+    # cayley or householder); when None it is matrix_exp for square or complex weights and
+    # householder otherwise. Raises ValueError if the attribute is not a tensor, has fewer
+    # than two dimensions, or the map name is unknown. Registration is unsafe (unchecked).
     r"""Apply an orthogonal or unitary parametrization to a matrix or a batch of matrices.
 
     Letting :math:`\mathbb{K}` be :math:`\mathbb{R}` or :math:`\mathbb{C}`, the parametrized
@@ -314,19 +360,28 @@ def orthogonal(
 
 
 class _WeightNorm(Module):
+    # [CLASS DOC] HELPER: Parametrization splitting a weight into a magnitude tensor (original0)
+    # and a direction tensor (original1). State: dim, the dimension kept when computing
+    # norms (None is stored as -1). forward recombines them; right_inverse splits a weight.
     def __init__(
         self,
         dim: int | None = 0,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Store the norm dimension; None is converted to -1 (norm over the
+        # whole tensor).
         super().__init__()
         if dim is None:
             dim = -1
         self.dim = dim
 
     def forward(self, weight_g, weight_v):
+        # [FUNCTION DOC] HELPER: Recombine magnitude weight_g and direction weight_v into a weight
+        # whose norm (except along dim) equals weight_g, using the fused weight-norm op.
         return torch._weight_norm(weight_v, weight_g, self.dim)
 
     def right_inverse(self, weight):
+        # [FUNCTION DOC] HELPER: Split weight into a pair: the 2-norm over all dims except dim
+        # (magnitude) and the weight itself (direction). Returns the pair (g, v).
         weight_g = torch.norm_except_dim(weight, 2, self.dim)
         weight_v = weight
 
@@ -334,6 +389,11 @@ class _WeightNorm(Module):
 
 
 def weight_norm(module: Module, name: str = "weight", dim: int = 0):
+    # [FUNCTION DOC] Apply weight normalization to the named tensor of module in place: registers
+    # a weight-norm parametrization (two underlying tensors, original0 magnitude and
+    # original1 direction) and a load-state-dict pre-hook that renames legacy keys with
+    # suffixes _g and _v to the new parametrization key names. Returns the module.
+    # Side effects: mutates module parametrizations and hooks.
     r"""Apply weight normalization to a parameter in the given module.
 
     .. math::
@@ -388,6 +448,9 @@ def weight_norm(module: Module, name: str = "weight", dim: int = 0):
         unexpected_keys,
         error_msgs,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Load-state-dict pre-hook: if the state dict (mutated in place) has
+        # legacy keys for the magnitude and direction of the weight, move their values under
+        # the parametrization original0 and original1 keys. Returns nothing.
         g_key = f"{prefix}{name}_g"
         v_key = f"{prefix}{name}_v"
         if g_key in state_dict and v_key in state_dict:
@@ -401,6 +464,11 @@ def weight_norm(module: Module, name: str = "weight", dim: int = 0):
 
 
 class _SpectralNorm(Module):
+    # [CLASS DOC] HELPER: Parametrization dividing a weight by an estimate of its largest singular
+    # value. State: dim (normalized, non-negative), eps, n_power_iterations and, for
+    # weights with more than one dimension, buffers _u and _v (approximate singular
+    # vectors) updated by the power method in training mode. 1-D weights are simply
+    # L2-normalized. Key methods: forward, right_inverse (identity), _power_method.
     def __init__(
         self,
         weight: torch.Tensor,
@@ -408,6 +476,9 @@ class _SpectralNorm(Module):
         dim: int = 0,
         eps: float = 1e-12,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Validate dim (IndexError if out of range) and n_power_iterations
+        # (ValueError if not positive), normalize negative dim. For ndim above one, create
+        # random normalized _u and _v buffers and warm them up with 15 power iterations.
         super().__init__()
         ndim = weight.ndim
         if dim >= ndim or dim < -ndim:
@@ -439,6 +510,8 @@ class _SpectralNorm(Module):
             self._power_method(weight_mat, 15)
 
     def _reshape_weight_to_matrix(self, weight: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Reshape a weight of two or more dims to a 2-D matrix: move dim to
+        # the front (if not already) and flatten the rest. Raises AssertionError for 1-D.
         # Precondition
         if weight.ndim <= 1:
             raise AssertionError(
@@ -455,6 +528,11 @@ class _SpectralNorm(Module):
 
     @torch.autograd.no_grad()
     def _power_method(self, weight_mat: torch.Tensor, n_power_iterations: int) -> None:
+        # [FUNCTION DOC] HELPER: Run the given number of power iterations on weight_mat,
+        # updating the
+        # _u and _v buffers in place (so replicas share updates) with normalized
+        # matrix-vector products. Runs without grad. Raises AssertionError if the input has
+        # one or fewer dims.
         # See original note at torch/nn/utils/spectral_norm.py
         # NB: If `do_power_iteration` is set, the `u` and `v` vectors are
         #     updated in power iteration **in-place**. This is very important
@@ -510,6 +588,10 @@ class _SpectralNorm(Module):
             )
 
     def forward(self, weight: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Return the weight divided by its estimated spectral norm. A 1-D
+        # weight is just L2-normalized. Otherwise the weight is reshaped to a matrix, the power
+        # method runs first when in training mode (mutating _u and _v), and sigma is computed
+        # from cloned copies of _u and _v (so repeated forwards can be backpropagated).
         if weight.ndim == 1:
             # Faster and more exact path, no need to approximate anything
             return F.normalize(weight, dim=0, eps=self.eps)
@@ -527,6 +609,7 @@ class _SpectralNorm(Module):
             return weight / sigma
 
     def right_inverse(self, value: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Identity: return the assigned value unchanged (no check).
         # we may want to assert here that the passed value already
         # satisfies constraints
         return value
@@ -539,6 +622,10 @@ def spectral_norm(
     eps: float = 1e-12,
     dim: int | None = None,
 ) -> Module:
+    # [FUNCTION DOC] Register a spectral-normalization parametrization on the named tensor of
+    # module (in place) and return the module. If dim is None it defaults to 1 for transposed
+    # convolution modules and 0 otherwise. Raises ValueError if the attribute is not a
+    # tensor; the parametrization constructor may raise for invalid dim or iteration count.
     r"""Apply spectral normalization to a parameter in the given module.
 
     .. math::
