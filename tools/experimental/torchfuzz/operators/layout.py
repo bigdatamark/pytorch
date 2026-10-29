@@ -1,3 +1,6 @@
+# [MODULE DOC] Fuzzer operators for tensor layout/shape ops (view, reshape, flatten, squeeze,
+# unsqueeze, split, expand, cat, stack, chunk). Each operator inverts a requested output spec
+# into input specs and emits one line of generated code. No import-time side effects.
 """Tensor layout operator implementations."""
 
 import random
@@ -7,26 +10,35 @@ from torchfuzz.tensor_fuzzer import fuzz_tensor_size, Spec, TensorSpec
 
 
 class LayoutOperatorBase(Operator):
+    # [CLASS DOC] Base class for layout operators; they all only produce tensors. Stateless.
     """Base class for tensor layout operations."""
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Returns True when the output spec is a TensorSpec, False for scalars.
         """All layout operations can only produce tensor outputs."""
         return isinstance(output_spec, TensorSpec)
 
 
 class ViewOperator(LayoutOperatorBase):
+    # [CLASS DOC] Operator for the tensor view method: reinterprets a contiguous input with a
+    # new shape. Stateless; fuzz_inputs_specs derives input specs from the output spec, codegen
+    # emits code.
     """Operator for tensor.view() operation."""
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Register the operator under the name view.
         """Initialize ViewOperator."""
         super().__init__("view")
 
     @property
     def torch_op_name(self) -> str | None:
+        # [FUNCTION DOC] Returns the torch name of the op: torch.Tensor.view.
         """Return the torch operation name."""
         return "torch.Tensor.view"
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Returns True for tensor specs with at least one dimension (scalars
+        # rejected because the input element count cannot be guaranteed to be one).
         """ViewOperator can produce tensor outputs but not scalars due to element count constraints."""
         if not isinstance(output_spec, TensorSpec):
             return False
@@ -34,6 +46,11 @@ class ViewOperator(LayoutOperatorBase):
         return len(output_spec.size) > 0
 
     def fuzz_inputs_specs(self, output_spec: Spec) -> list[Spec]:
+        # [FUNCTION DOC] Builds a single contiguous-stride input spec holding exactly as many
+        # elements as the output. Starts from a random fuzzed size and rewrites its last
+        # dimension (or falls back to a flat size) to match the element count; zero-element
+        # outputs yield a zero-sized input. Raises ValueError if output_spec is not a
+        # TensorSpec. Uses the random module.
         """Generate input spec for view operation."""
         if not isinstance(output_spec, TensorSpec):
             raise ValueError("ViewOperator can only produce TensorSpec outputs")
@@ -86,6 +103,8 @@ class ViewOperator(LayoutOperatorBase):
     def codegen(
         self, output_name: str, input_names: list[str], output_spec: Spec
     ) -> str:
+        # [FUNCTION DOC] Emits code calling contiguous then view with the output shape on the
+        # first input. Raises ValueError if output_spec is not a TensorSpec.
         """Generate code for view operation."""
         if not isinstance(output_spec, TensorSpec):
             raise ValueError("ViewOperator can only produce TensorSpec outputs")
@@ -96,18 +115,24 @@ class ViewOperator(LayoutOperatorBase):
 
 
 class ReshapeOperator(LayoutOperatorBase):
+    # [CLASS DOC] Operator for torch.reshape: changes shape keeping the element count.
+    # Stateless; fuzz_inputs_specs derives input specs from the output spec, codegen emits code.
     """Operator for torch.reshape() operation."""
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Register the operator under the name reshape.
         """Initialize ReshapeOperator."""
         super().__init__("reshape")
 
     @property
     def torch_op_name(self) -> str | None:
+        # [FUNCTION DOC] Returns the torch name of the op: torch.reshape.
         """Return the torch operation name."""
         return "torch.reshape"
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Returns True for tensor specs with at least one dimension; scalars
+        # are rejected.
         """ReshapeOperator can produce tensor outputs but not scalars due to element count constraints."""
         if not isinstance(output_spec, TensorSpec):
             return False
@@ -115,6 +140,9 @@ class ReshapeOperator(LayoutOperatorBase):
         return len(output_spec.size) > 0
 
     def fuzz_inputs_specs(self, output_spec: Spec) -> list[Spec]:
+        # [FUNCTION DOC] Builds one input spec with the same element count as the output, using
+        # the same size derivation as the view operator but with a random valid stride from
+        # fuzz_valid_stride. Raises ValueError if output_spec is not a TensorSpec.
         """Generate input spec for reshape operation."""
         if not isinstance(output_spec, TensorSpec):
             raise ValueError("ReshapeOperator can only produce TensorSpec outputs")
@@ -162,6 +190,8 @@ class ReshapeOperator(LayoutOperatorBase):
     def codegen(
         self, output_name: str, input_names: list[str], output_spec: Spec
     ) -> str:
+        # [FUNCTION DOC] Emits code calling reshape on the first input with the output shape.
+        # Raises ValueError if output_spec is not a TensorSpec.
         """Generate code for reshape operation."""
         if not isinstance(output_spec, TensorSpec):
             raise ValueError("ReshapeOperator can only produce TensorSpec outputs")
@@ -171,18 +201,24 @@ class ReshapeOperator(LayoutOperatorBase):
 
 
 class FlattenOperator(LayoutOperatorBase):
+    # [CLASS DOC] Operator for torch.flatten: collapses all dimensions into one. Stateless;
+    # fuzz_inputs_specs derives input specs from the output spec, codegen emits code.
     """Operator for torch.flatten() operation."""
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Register the operator under the name flatten.
         """Initialize FlattenOperator."""
         super().__init__("flatten")
 
     @property
     def torch_op_name(self) -> str | None:
+        # [FUNCTION DOC] Returns the torch name of the op: torch.flatten.
         """Return the torch operation name."""
         return "torch.flatten"
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Returns True only for 1-D tensor specs, since flatten always collapses
+        # every dimension.
         """Flatten can only produce 1D tensors when using torch.flatten() without start_dim."""
         if not isinstance(output_spec, TensorSpec):
             return False
@@ -190,6 +226,13 @@ class FlattenOperator(LayoutOperatorBase):
         return len(output_spec.size) == 1
 
     def fuzz_inputs_specs(self, output_spec: Spec) -> list[Spec]:
+        # [FUNCTION DOC] Builds one multi-dimensional input spec whose element count equals
+        # the output's, with a random valid stride. Fuzzes a size with at least two dimensions
+        # and adjusts its last dimension (or falls back to a flat size) to match the count;
+        # zero-element outputs give a zero-sized input. Raises ValueError if output_spec is
+        # not a TensorSpec.
+        # KNOWN ISSUE: the branch for non-1-D outputs is unreachable because can_produce only
+        # accepts 1-D outputs.
         """Generate input spec for flatten operation."""
         if not isinstance(output_spec, TensorSpec):
             raise ValueError("FlattenOperator can only produce TensorSpec outputs")
@@ -253,6 +296,8 @@ class FlattenOperator(LayoutOperatorBase):
     def codegen(
         self, output_name: str, input_names: list[str], output_spec: Spec
     ) -> str:
+        # [FUNCTION DOC] Emits code calling flatten on the first input with no start or end
+        # dimension. Raises ValueError if output_spec is not a TensorSpec.
         """Generate code for flatten operation."""
         if not isinstance(output_spec, TensorSpec):
             raise ValueError("FlattenOperator can only produce TensorSpec outputs")
@@ -263,18 +308,24 @@ class FlattenOperator(LayoutOperatorBase):
 
 
 class SqueezeOperator(LayoutOperatorBase):
+    # [CLASS DOC] Operator for torch.squeeze: removes all size-1 dimensions. Stateless;
+    # fuzz_inputs_specs derives input specs from the output spec, codegen emits code.
     """Operator for torch.squeeze() operation."""
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Register the operator under the name squeeze.
         """Initialize SqueezeOperator."""
         super().__init__("squeeze")
 
     @property
     def torch_op_name(self) -> str | None:
+        # [FUNCTION DOC] Returns the torch name of the op: torch.squeeze.
         """Return the torch operation name."""
         return "torch.squeeze"
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Returns True for tensor specs that have no size-1 dimension (squeeze
+        # would remove them).
         """SqueezeOperator can only produce tensors WITHOUT singleton dimensions."""
         if not isinstance(output_spec, TensorSpec):
             return False
@@ -282,6 +333,9 @@ class SqueezeOperator(LayoutOperatorBase):
         return 1 not in output_spec.size
 
     def fuzz_inputs_specs(self, output_spec: Spec) -> list[Spec]:
+        # [FUNCTION DOC] Builds one input spec equal to the output size with a single size-1
+        # dimension inserted at a random position, with a random valid stride. Raises ValueError
+        # if output_spec is not a TensorSpec. Uses the random module.
         """Generate input spec for squeeze operation."""
         if not isinstance(output_spec, TensorSpec):
             raise ValueError("SqueezeOperator can only produce TensorSpec outputs")
@@ -306,6 +360,8 @@ class SqueezeOperator(LayoutOperatorBase):
     def codegen(
         self, output_name: str, input_names: list[str], output_spec: Spec
     ) -> str:
+        # [FUNCTION DOC] Emits code calling squeeze with no dimension argument on the
+        # first input.
         """Generate code for squeeze operation."""
         # Always use squeeze() without dim specification to be safe
         # Since we control input generation to add exactly one singleton dimension,
@@ -315,18 +371,24 @@ class SqueezeOperator(LayoutOperatorBase):
 
 
 class UnsqueezeOperator(LayoutOperatorBase):
+    # [CLASS DOC] Operator for torch.unsqueeze: inserts a size-1 dimension. Stateless;
+    # fuzz_inputs_specs derives input specs from the output spec, codegen emits code.
     """Operator for torch.unsqueeze() operation."""
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Register the operator under the name unsqueeze.
         """Initialize UnsqueezeOperator."""
         super().__init__("unsqueeze")
 
     @property
     def torch_op_name(self) -> str | None:
+        # [FUNCTION DOC] Returns the torch name of the op: torch.unsqueeze.
         """Return the torch operation name."""
         return "torch.unsqueeze"
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Returns True for tensor specs that contain at least one
+        # size-1 dimension.
         """Unsqueeze produces tensors with at least one singleton dimension."""
         if not isinstance(output_spec, TensorSpec):
             return False
@@ -334,6 +396,9 @@ class UnsqueezeOperator(LayoutOperatorBase):
         return 1 in output_spec.size
 
     def fuzz_inputs_specs(self, output_spec: Spec) -> list[Spec]:
+        # [FUNCTION DOC] Builds one input spec by removing the last size-1 dimension from the
+        # output size, with a random valid stride (empty size and stride if nothing remains).
+        # Raises ValueError if output_spec is not a TensorSpec or has no size-1 dimension.
         """Generate input spec for unsqueeze operation."""
         if not isinstance(output_spec, TensorSpec):
             raise ValueError("UnsqueezeOperator can only produce TensorSpec outputs")
@@ -380,6 +445,9 @@ class UnsqueezeOperator(LayoutOperatorBase):
     def codegen(
         self, output_name: str, input_names: list[str], output_spec: Spec
     ) -> str:
+        # [FUNCTION DOC] Emits code calling unsqueeze on the first input at the position of the
+        # last size-1 output dimension (the dimension fuzz_inputs_specs removed); falls back to
+        # the last dimension. Raises ValueError if output_spec is not a TensorSpec.
         """Generate code for unsqueeze operation."""
         if not isinstance(output_spec, TensorSpec):
             raise ValueError("UnsqueezeOperator can only produce TensorSpec outputs")
@@ -402,18 +470,23 @@ class UnsqueezeOperator(LayoutOperatorBase):
 
 
 class SplitOperator(LayoutOperatorBase):
+    # [CLASS DOC] Operator for torch.split: produces the first chunk of an equal-size split.
+    # Stateless; fuzz_inputs_specs derives input specs from the output spec, codegen emits code.
     """Operator for torch.split() operation."""
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Register the operator under the name split.
         """Initialize SplitOperator."""
         super().__init__("split")
 
     @property
     def torch_op_name(self) -> str | None:
+        # [FUNCTION DOC] Returns the torch name of the op: torch.split.
         """Return the torch operation name."""
         return "torch.split"
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Returns True for tensor specs with at least one dimension.
         """Split can produce any tensor output."""
         if not isinstance(output_spec, TensorSpec):
             return False
@@ -421,6 +494,10 @@ class SplitOperator(LayoutOperatorBase):
         return len(output_spec.size) > 0
 
     def _get_split_params(self, output_spec: TensorSpec) -> tuple[int, int]:
+        # [FUNCTION DOC] HELPER: Deterministically picks the split dimension and the chunk count
+        # (2 to 4) with a random generator seeded from the output size and dtype, so input
+        # fuzzing and codegen agree. Returns (split_dim, num_chunks). Fails on a scalar spec (no
+        # dimension to choose).
         """Get consistent split parameters based on output spec.
 
         This method uses the output_spec to deterministically choose split parameters,
@@ -437,6 +514,9 @@ class SplitOperator(LayoutOperatorBase):
         return split_dim, num_chunks
 
     def fuzz_inputs_specs(self, output_spec: Spec) -> list[Spec]:
+        # [FUNCTION DOC] Builds one input spec equal to the output size with the split dimension
+        # multiplied by the chunk count, with a random valid stride. Raises ValueError for non-
+        # tensor or 0-d specs.
         """Generate input spec for split operation."""
         if not isinstance(output_spec, TensorSpec):
             raise ValueError("SplitOperator can only produce TensorSpec outputs")
@@ -468,6 +548,11 @@ class SplitOperator(LayoutOperatorBase):
     def codegen(
         self, output_name: str, input_names: list[str], output_spec: Spec
     ) -> str:
+        # [FUNCTION DOC] Emits code that splits the first input with the output's size along
+        # the split dimension as chunk size and takes the first chunk. Raises ValueError if not
+        # a TensorSpec.
+        # KNOWN ISSUE: a zero-sized split dimension would give a zero split size, which
+        # torch rejects.
         """Generate code for split operation."""
         if not isinstance(output_spec, TensorSpec):
             raise ValueError("SplitOperator can only produce TensorSpec outputs")
@@ -482,18 +567,24 @@ class SplitOperator(LayoutOperatorBase):
 
 
 class ExpandOperator(LayoutOperatorBase):
+    # [CLASS DOC] Operator for broadcasting a tensor to a larger shape with expand. Stateless;
+    # fuzz_inputs_specs derives input specs from the output spec, codegen emits code.
     """Operator for torch.expand() operation."""
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Register the operator under the name expand.
         """Initialize ExpandOperator."""
         super().__init__("expand")
 
     @property
     def torch_op_name(self) -> str | None:
+        # [FUNCTION DOC] Returns the torch name of the op: torch.expand.
+        # KNOWN ISSUE: torch has no function torch.expand; expand is only a Tensor method.
         """Return the torch operation name."""
         return "torch.expand"
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Returns True for tensor specs with at least one dimension.
         """Expand can produce any tensor output."""
         if not isinstance(output_spec, TensorSpec):
             return False
@@ -501,6 +592,10 @@ class ExpandOperator(LayoutOperatorBase):
         return len(output_spec.size) > 0
 
     def fuzz_inputs_specs(self, output_spec: Spec) -> list[Spec]:
+        # [FUNCTION DOC] Builds one input spec with equal or fewer trailing dimensions than the
+        # output, where each dimension equals the output's or (with probability 0.6 when the
+        # output dimension exceeds one) is 1 for broadcasting; random valid stride. Raises
+        # ValueError if not a TensorSpec. Uses the random module.
         """Generate input spec for expand operation."""
         if not isinstance(output_spec, TensorSpec):
             raise ValueError("ExpandOperator can only produce TensorSpec outputs")
@@ -542,6 +637,8 @@ class ExpandOperator(LayoutOperatorBase):
     def codegen(
         self, output_name: str, input_names: list[str], output_spec: Spec
     ) -> str:
+        # [FUNCTION DOC] Emits code calling expand on the first input with the output shape.
+        # Raises ValueError if output_spec is not a TensorSpec.
         """Generate code for expand operation."""
         if not isinstance(output_spec, TensorSpec):
             raise ValueError("ExpandOperator can only produce TensorSpec outputs")
@@ -551,18 +648,23 @@ class ExpandOperator(LayoutOperatorBase):
 
 
 class CatOperator(LayoutOperatorBase):
+    # [CLASS DOC] Operator for torch.cat: concatenates 2 to 4 tensors along one dimension.
+    # Stateless; fuzz_inputs_specs derives input specs from the output spec, codegen emits code.
     """Operator for torch.cat() operation."""
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Register the operator under the name cat.
         """Initialize CatOperator."""
         super().__init__("cat")
 
     @property
     def torch_op_name(self) -> str | None:
+        # [FUNCTION DOC] Returns the torch name of the op: torch.cat.
         """Return the torch operation name."""
         return "torch.cat"
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Returns True for tensor specs with at least one dimension.
         """Cat can produce any tensor output."""
         if not isinstance(output_spec, TensorSpec):
             return False
@@ -570,6 +672,9 @@ class CatOperator(LayoutOperatorBase):
         return len(output_spec.size) > 0
 
     def _get_cat_params(self, output_spec: TensorSpec) -> tuple[int, int]:
+        # [FUNCTION DOC] HELPER: Deterministically picks the concatenation dimension and number
+        # of inputs (2 to 4) from a random generator seeded with the output size and dtype.
+        # Returns (cat_dim, num_tensors).
         """Get consistent cat parameters based on output spec.
 
         This method uses the output_spec to deterministically choose cat parameters,
@@ -586,6 +691,10 @@ class CatOperator(LayoutOperatorBase):
         return cat_dim, num_tensors
 
     def fuzz_inputs_specs(self, output_spec: Spec) -> list[Spec]:
+        # [FUNCTION DOC] Builds a list of input specs whose sizes along the cat dimension add up
+        # to the output's size there (the remainder goes to the last tensor, others get random
+        # positive sizes, or 0 when nothing remains); other dimensions match. Strides are random
+        # valid strides. Raises ValueError for non-tensor or 0-d specs.
         """Generate input specs for cat operation."""
         if not isinstance(output_spec, TensorSpec):
             raise ValueError("CatOperator can only produce TensorSpec outputs")
@@ -644,6 +753,8 @@ class CatOperator(LayoutOperatorBase):
     def codegen(
         self, output_name: str, input_names: list[str], output_spec: Spec
     ) -> str:
+        # [FUNCTION DOC] Emits code concatenating all input names along the dimension chosen by
+        # _get_cat_params. Raises ValueError if output_spec is not a TensorSpec.
         """Generate code for cat operation."""
         if not isinstance(output_spec, TensorSpec):
             raise ValueError("CatOperator can only produce TensorSpec outputs")
@@ -657,18 +768,24 @@ class CatOperator(LayoutOperatorBase):
 
 
 class StackOperator(LayoutOperatorBase):
+    # [CLASS DOC] Operator for torch.stack: stacks equal-shaped tensors along a new dimension.
+    # Stateless; fuzz_inputs_specs derives input specs from the output spec, codegen emits code.
     """Operator for torch.stack() operation."""
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Register the operator under the name stack.
         """Initialize StackOperator."""
         super().__init__("stack")
 
     @property
     def torch_op_name(self) -> str | None:
+        # [FUNCTION DOC] Returns the torch name of the op: torch.stack.
         """Return the torch operation name."""
         return "torch.stack"
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Returns True for tensor specs with at least one dimension, no zero-
+        # sized dimension, and every dimension at most 4 (to keep generated graphs small).
         """Stack can produce any tensor output with at least one dimension."""
         if not isinstance(output_spec, TensorSpec):
             return False
@@ -682,6 +799,8 @@ class StackOperator(LayoutOperatorBase):
         )
 
     def _get_stack_params(self, output_spec: TensorSpec) -> int:
+        # [FUNCTION DOC] HELPER: Deterministically picks the stack dimension from a random
+        # generator seeded with the output size and dtype. Returns the dimension index.
         """Get consistent stack dimension based on output spec.
 
         This method uses the output_spec to deterministically choose stack parameters,
@@ -697,6 +816,10 @@ class StackOperator(LayoutOperatorBase):
         return stack_dim
 
     def fuzz_inputs_specs(self, output_spec: Spec) -> list[Spec]:
+        # [FUNCTION DOC] Builds as many identical-shape input specs as the output's size on
+        # the stack dimension (capped at 4); the shape is the output size with that
+        # dimension removed, each with a random valid stride. Raises ValueError for non-
+        # tensor or 0-d specs.
         """Generate input specs for stack operation."""
         if not isinstance(output_spec, TensorSpec):
             raise ValueError("StackOperator can only produce TensorSpec outputs")
@@ -735,6 +858,8 @@ class StackOperator(LayoutOperatorBase):
     def codegen(
         self, output_name: str, input_names: list[str], output_spec: Spec
     ) -> str:
+        # [FUNCTION DOC] Emits code stacking all input names along the dimension chosen by
+        # _get_stack_params. Raises ValueError if output_spec is not a TensorSpec.
         """Generate code for stack operation."""
         if not isinstance(output_spec, TensorSpec):
             raise ValueError("StackOperator can only produce TensorSpec outputs")
@@ -748,18 +873,23 @@ class StackOperator(LayoutOperatorBase):
 
 
 class ChunkOperator(LayoutOperatorBase):
+    # [CLASS DOC] Operator for torch.chunk: produces the first chunk of an even split.
+    # Stateless; fuzz_inputs_specs derives input specs from the output spec, codegen emits code.
     """Operator for torch.chunk() operation."""
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Register the operator under the name chunk.
         """Initialize ChunkOperator."""
         super().__init__("chunk")
 
     @property
     def torch_op_name(self) -> str | None:
+        # [FUNCTION DOC] Returns the torch name of the op: torch.chunk.
         """Return the torch operation name."""
         return "torch.chunk"
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Returns True for tensor specs with at least one dimension.
         """Chunk can produce any tensor output."""
         if not isinstance(output_spec, TensorSpec):
             return False
@@ -767,6 +897,9 @@ class ChunkOperator(LayoutOperatorBase):
         return len(output_spec.size) > 0
 
     def _get_chunk_params(self, output_spec: TensorSpec) -> tuple[int, int]:
+        # [FUNCTION DOC] HELPER: Deterministically picks the chunk dimension and chunk count (2
+        # to 4) from a random generator seeded with the output size and dtype. Returns
+        # (chunk_dim, num_chunks).
         """Get consistent chunk parameters based on output spec.
 
         This method uses the output_spec to deterministically choose chunk parameters,
@@ -783,6 +916,9 @@ class ChunkOperator(LayoutOperatorBase):
         return chunk_dim, num_chunks
 
     def fuzz_inputs_specs(self, output_spec: Spec) -> list[Spec]:
+        # [FUNCTION DOC] Builds one input spec equal to the output size with the chunk dimension
+        # multiplied by the chunk count, with a random valid stride. Raises ValueError for non-
+        # tensor or 0-d specs.
         """Generate input spec for chunk operation."""
         if not isinstance(output_spec, TensorSpec):
             raise ValueError("ChunkOperator can only produce TensorSpec outputs")
@@ -813,6 +949,9 @@ class ChunkOperator(LayoutOperatorBase):
     def codegen(
         self, output_name: str, input_names: list[str], output_spec: Spec
     ) -> str:
+        # [FUNCTION DOC] Emits code chunking the first input into the chosen number of chunks
+        # along the chosen dimension and taking the first one. Raises ValueError if output_spec
+        # is not a TensorSpec.
         """Generate code for chunk operation."""
         if not isinstance(output_spec, TensorSpec):
             raise ValueError("ChunkOperator can only produce TensorSpec outputs")

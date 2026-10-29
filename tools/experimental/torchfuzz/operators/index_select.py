@@ -1,20 +1,29 @@
+# [MODULE DOC] Fuzzer operator for torch.index_select: picks rows of an input tensor by an index
+# tensor. Defines IndexSelectOperator; no import-time side effects.
 import torch
 from torchfuzz.operators.base import Operator
 from torchfuzz.tensor_fuzzer import Spec, TensorSpec
 
 
 class IndexSelectOperator(Operator):
+    # [CLASS DOC] Operator that produces a tensor via index_select along dimension 0. Stateless;
+    # inputs are a data tensor and a 1-D long index tensor. Implements can_produce,
+    # fuzz_inputs_specs and codegen.
     """Operator for selecting elements from a tensor along a dimension using indices."""
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Register the operator under the name index_select.
         super().__init__("index_select")
 
     @property
     def torch_op_name(self) -> str | None:
+        # [FUNCTION DOC] Returns the fully qualified torch function name used for this operator.
         """Return the torch operation name."""
         return "torch.index_select"
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Returns True only for tensor specs with at least one dimension; false for
+        # scalar specs and 0-dimensional tensors.
         """Index select can produce tensors of various shapes, but not 0-dimensional tensors."""
         if not isinstance(output_spec, TensorSpec):
             return False
@@ -22,6 +31,11 @@ class IndexSelectOperator(Operator):
         return len(output_spec.size) > 0
 
     def fuzz_inputs_specs(self, output_spec: Spec, num_inputs: int = 3) -> list[Spec]:
+        # [FUNCTION DOC] Builds input specs [data tensor, index tensor] for a given output spec.
+        # The data tensor matches the output but with dimension 0 enlarged by 2 (contiguous
+        # strides) and the same dtype; the index tensor is 1-D long with
+        # length equal to the output size along dimension 0. Selection dim is fixed to 0.
+        # Raises ValueError if output_spec is not a TensorSpec. num_inputs is ignored.
         """Generate input specs for index_select operation.
 
         torch.index_select(input, dim, index) returns a tensor with:
@@ -77,6 +91,11 @@ class IndexSelectOperator(Operator):
     def codegen(
         self, output_name: str, input_names: list[str], output_spec: Spec
     ) -> str:
+        # [FUNCTION DOC] Emits source lines computing the selection: the index input is reduced
+        # modulo the data tensor size along dim 0 (keeping indices valid), then index_select is
+        # applied and assigned to output_name. Uses the index passed as a graph input instead of
+        # random generation so that runs on different devices agree. Raises ValueError if there
+        # are not exactly two input names or output_spec is not a TensorSpec.
         """Generate code for index_select.
 
         Creates appropriate indices to select from the input tensor.

@@ -1,3 +1,8 @@
+# [MODULE DOC] Fuzzer operators for torch.nn.functional ops and activations: embedding, linear,
+# relu, softmax, dropout, layer_norm, rms_norm, gelu, sigmoid, tanh, batch_norm, group_norm,
+# leaky_relu, elu, silu, scaled_dot_product_attention and multi_head_attention_forward. Also
+# defines a float-dtype predicate. Most operators accept only float dtypes, and their codegen
+# casts inputs to the output dtype. No import-time side effects.
 """Neural network functional operator implementations."""
 
 import math
@@ -10,6 +15,8 @@ from torchfuzz.tensor_fuzzer import Spec, TensorSpec
 
 
 def is_float_dtype(dtype: torch.dtype) -> bool:
+    # [FUNCTION DOC] HELPER: Returns True if the dtype is float16, bfloat16, float32
+    # or float64.
     """Check if dtype is a floating point type."""
     return dtype in [
         torch.float32,
@@ -20,17 +27,23 @@ def is_float_dtype(dtype: torch.dtype) -> bool:
 
 
 class EmbeddingOperator(Operator):
+    # [CLASS DOC] Operator for embedding lookup: a weight table plus integer indices. Stateless.
     """Operator for torch.nn.functional.embedding."""
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Register the operator under the
+        # name torch.nn.functional.embedding.
         super().__init__("torch.nn.functional.embedding")
 
     @property
     def torch_op_name(self) -> str | None:
+        # [FUNCTION DOC] Returns the torch function name torch.nn.functional.embedding.
         """Return the torch operation name."""
         return "torch.nn.functional.embedding"
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Returns True for tensor specs with at least one dimension and a
+        # float dtype.
         """Embedding can produce tensor outputs with floating point dtypes."""
         if not isinstance(output_spec, TensorSpec):
             return False
@@ -41,6 +54,10 @@ class EmbeddingOperator(Operator):
         return is_float_dtype(output_spec.dtype)
 
     def fuzz_inputs_specs(self, output_spec: Spec) -> list[Spec]:
+        # [FUNCTION DOC] Treats the last output dimension as the embedding size and the rest as
+        # the index shape. Returns a weight spec (random vocabulary of 150 to 500 rows by
+        # embedding size, output dtype) and an int64 index spec with a contiguous stride. Raises
+        # ValueError for non-tensor or 0-d specs. Uses the random module.
         """Generate input specs for embedding operation.
 
         Embedding requires:
@@ -78,6 +95,8 @@ class EmbeddingOperator(Operator):
         return [weight_spec, input_spec]
 
     def _calculate_stride(self, size):
+        # [FUNCTION DOC] HELPER: Returns contiguous strides for a size (empty tuple for an
+        # empty size).
         """Calculate stride for a given size."""
         if not size:
             return ()
@@ -91,6 +110,10 @@ class EmbeddingOperator(Operator):
     def codegen(
         self, output_name: str, input_names: list[str], output_spec: Spec
     ) -> str:
+        # [FUNCTION DOC] Emits a line calling embedding with the index input converted to int64
+        # and clamped into the valid row range of the weight, so out-of-range values are safe.
+        # Input order is weight then indices. Raises ValueError unless there are exactly two
+        # input names.
         """Generate code for embedding operation."""
         if len(input_names) != 2:
             raise ValueError("Embedding requires exactly 2 inputs: weight and input")
@@ -102,17 +125,23 @@ class EmbeddingOperator(Operator):
 
 
 class LinearOperator(Operator):
+    # [CLASS DOC] Operator for a linear layer with optional bias. Stateless.
     """Operator for torch.nn.functional.linear."""
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Register the operator under the
+        # name torch.nn.functional.linear.
         super().__init__("torch.nn.functional.linear")
 
     @property
     def torch_op_name(self) -> str | None:
+        # [FUNCTION DOC] Returns the torch function name torch.nn.functional.linear.
         """Return the torch operation name."""
         return "torch.nn.functional.linear"
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Returns True for tensor specs with at least one dimension and a
+        # float dtype.
         """Linear can produce tensor outputs with floating point dtypes."""
         if not isinstance(output_spec, TensorSpec):
             return False
@@ -122,6 +151,11 @@ class LinearOperator(Operator):
         return is_float_dtype(output_spec.dtype)
 
     def fuzz_inputs_specs(self, output_spec: Spec) -> list[Spec]:
+        # [FUNCTION DOC] Treats the last output dimension as out_features. Picks a random
+        # in_features from 8 to 256 and returns an input spec (leading dims plus in_features,
+        # contiguous), a weight spec (out_features by in_features) and, with probability 0.5, a
+        # bias spec. Dtype is the output dtype. Raises ValueError for non-tensor or 0-d specs.
+        # Uses the random module.
         """Generate input specs for linear operation.
 
         Linear transformation: y = xW^T + b
@@ -167,6 +201,8 @@ class LinearOperator(Operator):
             return [input_spec, weight_spec]
 
     def _calculate_stride(self, size):
+        # [FUNCTION DOC] HELPER: Returns contiguous strides for a size (empty tuple for an
+        # empty size).
         """Calculate stride for a given size."""
         if not size:
             return ()
@@ -180,6 +216,9 @@ class LinearOperator(Operator):
     def codegen(
         self, output_name: str, input_names: list[str], output_spec: Spec
     ) -> str:
+        # [FUNCTION DOC] Emits a line calling linear with each input cast to the output dtype;
+        # takes two names (input, weight) or three (plus bias). Raises ValueError for any other
+        # count or a non-TensorSpec output.
         """Generate code for linear operation."""
         if not isinstance(output_spec, TensorSpec):
             raise ValueError("LinearOperator can only produce TensorSpec outputs")
@@ -200,23 +239,31 @@ class LinearOperator(Operator):
 
 
 class ReLUOperator(Operator):
+    # [CLASS DOC] Elementwise relu operator: one input spec identical to the output
+    # spec. Stateless.
     """Operator for torch.nn.functional.relu."""
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Register the operator under the name torch.nn.functional.relu.
         super().__init__("torch.nn.functional.relu")
 
     @property
     def torch_op_name(self) -> str | None:
+        # [FUNCTION DOC] Returns the torch function name torch.nn.functional.relu.
         """Return the torch operation name."""
         return "torch.nn.functional.relu"
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Returns True for tensor specs with float dtype (float16, bfloat16,
+        # float32, float64).
         """ReLU can produce tensor outputs with floating point dtypes."""
         if not isinstance(output_spec, TensorSpec):
             return False
         return is_float_dtype(output_spec.dtype)
 
     def fuzz_inputs_specs(self, output_spec: Spec) -> list[Spec]:
+        # [FUNCTION DOC] Returns one input spec with the same size, stride and dtype as the
+        # output. Raises ValueError if output_spec is not a TensorSpec.
         """Generate input specs for ReLU operation.
 
         ReLU is element-wise, so input shape matches output shape.
@@ -234,6 +281,8 @@ class ReLUOperator(Operator):
     def codegen(
         self, output_name: str, input_names: list[str], output_spec: Spec
     ) -> str:
+        # [FUNCTION DOC] Emits a line applying relu to the single input. Raises ValueError if
+        # the number of input names is not exactly one.
         """Generate code for ReLU operation."""
         if len(input_names) != 1:
             raise ValueError("ReLU requires exactly 1 input")
@@ -243,17 +292,22 @@ class ReLUOperator(Operator):
 
 
 class SoftmaxOperator(Operator):
+    # [CLASS DOC] Elementwise softmax operator. Stateless.
     """Operator for torch.nn.functional.softmax."""
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Register the operator under the
+        # name torch.nn.functional.softmax.
         super().__init__("torch.nn.functional.softmax")
 
     @property
     def torch_op_name(self) -> str | None:
+        # [FUNCTION DOC] Returns the torch function name torch.nn.functional.softmax.
         """Return the torch operation name."""
         return "torch.nn.functional.softmax"
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Returns True for float tensor specs with at least one dimension.
         """Softmax can produce tensor outputs with floating point dtypes."""
         if not isinstance(output_spec, TensorSpec):
             return False
@@ -263,6 +317,8 @@ class SoftmaxOperator(Operator):
         return is_float_dtype(output_spec.dtype)
 
     def fuzz_inputs_specs(self, output_spec: Spec) -> list[Spec]:
+        # [FUNCTION DOC] Returns one input spec with the same size, stride and dtype as the
+        # output. Raises ValueError if output_spec is not a TensorSpec.
         """Generate input specs for softmax operation.
 
         Softmax is element-wise along a dimension, input shape matches output shape.
@@ -280,6 +336,8 @@ class SoftmaxOperator(Operator):
     def codegen(
         self, output_name: str, input_names: list[str], output_spec: Spec
     ) -> str:
+        # [FUNCTION DOC] Emits a line applying softmax to the single input along the last
+        # dimension. Raises ValueError if the number of input names is wrong.
         """Generate code for softmax operation."""
         if len(input_names) != 1:
             raise ValueError("Softmax requires exactly 1 input")
@@ -290,23 +348,31 @@ class SoftmaxOperator(Operator):
 
 
 class DropoutOperator(Operator):
+    # [CLASS DOC] Elementwise dropout operator. Stateless.
     """Operator for torch.nn.functional.dropout."""
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Register the operator under the
+        # name torch.nn.functional.dropout.
         super().__init__("torch.nn.functional.dropout")
 
     @property
     def torch_op_name(self) -> str | None:
+        # [FUNCTION DOC] Returns the torch function name torch.nn.functional.dropout.
         """Return the torch operation name."""
         return "torch.nn.functional.dropout"
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Returns True for tensor specs with float dtype (float16, bfloat16,
+        # float32, float64).
         """Dropout can produce tensor outputs with floating point dtypes."""
         if not isinstance(output_spec, TensorSpec):
             return False
         return is_float_dtype(output_spec.dtype)
 
     def fuzz_inputs_specs(self, output_spec: Spec) -> list[Spec]:
+        # [FUNCTION DOC] Returns one input spec with the same size, stride and dtype as the
+        # output. Raises ValueError if output_spec is not a TensorSpec.
         """Generate input specs for dropout operation.
 
         Dropout is element-wise, input shape matches output shape.
@@ -324,6 +390,9 @@ class DropoutOperator(Operator):
     def codegen(
         self, output_name: str, input_names: list[str], output_spec: Spec
     ) -> str:
+        # [FUNCTION DOC] Emits a line applying dropout to the single input with probability 0.1
+        # and training disabled, making it deterministic (an identity). Raises ValueError if the
+        # number of input names is wrong.
         """Generate code for dropout operation."""
         if len(input_names) != 1:
             raise ValueError("Dropout requires exactly 1 input")
@@ -334,17 +403,23 @@ class DropoutOperator(Operator):
 
 
 class LayerNormOperator(Operator):
+    # [CLASS DOC] Operator for layer normalization over the last dimension, with optional weight
+    # and bias. Stateless.
     """Operator for torch.nn.functional.layer_norm."""
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Register the operator under the
+        # name torch.nn.functional.layer_norm.
         super().__init__("torch.nn.functional.layer_norm")
 
     @property
     def torch_op_name(self) -> str | None:
+        # [FUNCTION DOC] Returns the torch function name torch.nn.functional.layer_norm.
         """Return the torch operation name."""
         return "torch.nn.functional.layer_norm"
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Returns True for float tensor specs with at least one dimension.
         """LayerNorm can produce tensor outputs with floating point dtypes."""
         if not isinstance(output_spec, TensorSpec):
             return False
@@ -354,6 +429,10 @@ class LayerNormOperator(Operator):
         return is_float_dtype(output_spec.dtype)
 
     def fuzz_inputs_specs(self, output_spec: Spec) -> list[Spec]:
+        # [FUNCTION DOC] Returns an input spec equal to the output spec, then with probability
+        # 0.7 a weight spec over the last dimension and, only if a weight was added, with
+        # probability 0.7 a bias spec; all in the output dtype with stride one. Raises
+        # ValueError for non-tensor or 0-d specs. Uses the random module.
         """Generate input specs for layer_norm operation.
 
         LayerNorm normalizes over the last dimensions specified by normalized_shape.
@@ -399,6 +478,10 @@ class LayerNormOperator(Operator):
     def codegen(
         self, output_name: str, input_names: list[str], output_spec: Spec
     ) -> str:
+        # [FUNCTION DOC] Emits a line calling layer_norm over the last dimension with inputs
+        # cast to the output dtype; one, two or three names mean input, input with weight,
+        # or input with weight and bias. Raises ValueError for another count or a non-
+        # TensorSpec output.
         """Generate code for layer_norm operation."""
         if len(input_names) < 1 or len(input_names) > 3:
             raise ValueError(
@@ -427,21 +510,27 @@ class LayerNormOperator(Operator):
 
 
 class RMSNormOperator(Operator):
+    # [CLASS DOC] Operator for RMS normalization over the last dimension with optional weight.
+    # Sampling weight attribute is 5.0.
     """Operator for torch.nn.functional.rms_norm (Root Mean Square Normalization).
 
     RMSNorm is commonly used in modern LLMs like LLaMA. It normalizes by the RMS of the input.
     """
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Register under the name torch.nn.functional.rms_norm and set
+        # the weight attribute to 5.0.
         super().__init__("torch.nn.functional.rms_norm")
         self.weight = 5.0
 
     @property
     def torch_op_name(self) -> str | None:
+        # [FUNCTION DOC] Returns the torch function name torch.nn.functional.rms_norm.
         """Return the torch operation name."""
         return "torch.nn.functional.rms_norm"
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Returns True for float tensor specs with at least one dimension.
         """RMSNorm can produce tensor outputs with floating point dtypes."""
         if not isinstance(output_spec, TensorSpec):
             return False
@@ -451,6 +540,9 @@ class RMSNormOperator(Operator):
         return is_float_dtype(output_spec.dtype)
 
     def fuzz_inputs_specs(self, output_spec: Spec) -> list[Spec]:
+        # [FUNCTION DOC] Returns an input spec equal to the output spec and, with probability
+        # 0.7, a weight spec over the last dimension (output dtype, stride one). Raises
+        # ValueError for non-tensor or 0-d specs. Uses the random module.
         """Generate input specs for RMSNorm operation.
 
         RMSNorm requires:
@@ -484,6 +576,9 @@ class RMSNormOperator(Operator):
     def codegen(
         self, output_name: str, input_names: list[str], output_spec: Spec
     ) -> str:
+        # [FUNCTION DOC] Emits a line calling rms_norm over the last dimension with inputs cast
+        # to the output dtype; one name is the input, two add a weight. Raises ValueError for
+        # another count or a non-TensorSpec output.
         """Generate code for RMSNorm operation."""
         if len(input_names) < 1 or len(input_names) > 2:
             raise ValueError("RMSNorm requires 1-2 inputs: input, optional weight")
@@ -505,23 +600,30 @@ class RMSNormOperator(Operator):
 
 
 class GELUOperator(Operator):
+    # [CLASS DOC] Elementwise gelu operator. Stateless.
     """Operator for torch.nn.functional.gelu (Gaussian Error Linear Unit)."""
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Register the operator under the name torch.nn.functional.gelu.
         super().__init__("torch.nn.functional.gelu")
 
     @property
     def torch_op_name(self) -> str | None:
+        # [FUNCTION DOC] Returns the torch function name torch.nn.functional.gelu.
         """Return the torch operation name."""
         return "torch.nn.functional.gelu"
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Returns True for tensor specs with float dtype (float16, bfloat16,
+        # float32, float64).
         """GELU can produce tensor outputs with floating point dtypes."""
         if not isinstance(output_spec, TensorSpec):
             return False
         return is_float_dtype(output_spec.dtype)
 
     def fuzz_inputs_specs(self, output_spec: Spec) -> list[Spec]:
+        # [FUNCTION DOC] Returns one input spec with the same size, stride and dtype as the
+        # output. Raises ValueError if output_spec is not a TensorSpec.
         """Generate input specs for GELU operation.
 
         GELU is element-wise, so input shape matches output shape.
@@ -538,6 +640,9 @@ class GELUOperator(Operator):
     def codegen(
         self, output_name: str, input_names: list[str], output_spec: Spec
     ) -> str:
+        # [FUNCTION DOC] Emits a line applying gelu to the single input with the approximate
+        # mode chosen at random between none and tanh (drawn from the global random module at
+        # code generation time). Raises ValueError if the number of input names is wrong.
         """Generate code for GELU operation."""
         if len(input_names) != 1:
             raise ValueError("GELU requires exactly 1 input")
@@ -548,23 +653,30 @@ class GELUOperator(Operator):
 
 
 class SigmoidOperator(Operator):
+    # [CLASS DOC] Elementwise sigmoid operator. Stateless.
     """Operator for torch.sigmoid."""
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Register the operator under the name torch.sigmoid.
         super().__init__("torch.sigmoid")
 
     @property
     def torch_op_name(self) -> str | None:
+        # [FUNCTION DOC] Returns the torch function name torch.sigmoid.
         """Return the torch operation name."""
         return "torch.sigmoid"
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Returns True for tensor specs with float dtype (float16, bfloat16,
+        # float32, float64).
         """Sigmoid can produce tensor outputs with floating point dtypes."""
         if not isinstance(output_spec, TensorSpec):
             return False
         return is_float_dtype(output_spec.dtype)
 
     def fuzz_inputs_specs(self, output_spec: Spec) -> list[Spec]:
+        # [FUNCTION DOC] Returns one input spec with the same size, stride and dtype as the
+        # output. Raises ValueError if output_spec is not a TensorSpec.
         """Generate input specs for sigmoid operation.
 
         Sigmoid is element-wise, so input shape matches output shape.
@@ -581,6 +693,8 @@ class SigmoidOperator(Operator):
     def codegen(
         self, output_name: str, input_names: list[str], output_spec: Spec
     ) -> str:
+        # [FUNCTION DOC] Emits a line applying sigmoid to the single input. Raises ValueError if
+        # the number of input names is wrong.
         """Generate code for sigmoid operation."""
         if len(input_names) != 1:
             raise ValueError("Sigmoid requires exactly 1 input")
@@ -590,23 +704,30 @@ class SigmoidOperator(Operator):
 
 
 class TanhOperator(Operator):
+    # [CLASS DOC] Elementwise tanh operator. Stateless.
     """Operator for torch.tanh."""
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Register the operator under the name torch.tanh.
         super().__init__("torch.tanh")
 
     @property
     def torch_op_name(self) -> str | None:
+        # [FUNCTION DOC] Returns the torch function name torch.tanh.
         """Return the torch operation name."""
         return "torch.tanh"
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Returns True for tensor specs with float dtype (float16, bfloat16,
+        # float32, float64).
         """Tanh can produce tensor outputs with floating point dtypes."""
         if not isinstance(output_spec, TensorSpec):
             return False
         return is_float_dtype(output_spec.dtype)
 
     def fuzz_inputs_specs(self, output_spec: Spec) -> list[Spec]:
+        # [FUNCTION DOC] Returns one input spec with the same size, stride and dtype as the
+        # output. Raises ValueError if output_spec is not a TensorSpec.
         """Generate input specs for tanh operation.
 
         Tanh is element-wise, so input shape matches output shape.
@@ -623,6 +744,8 @@ class TanhOperator(Operator):
     def codegen(
         self, output_name: str, input_names: list[str], output_spec: Spec
     ) -> str:
+        # [FUNCTION DOC] Emits a line applying tanh to the single input. Raises ValueError if
+        # the number of input names is wrong.
         """Generate code for tanh operation."""
         if len(input_names) != 1:
             raise ValueError("Tanh requires exactly 1 input")
@@ -632,17 +755,24 @@ class TanhOperator(Operator):
 
 
 class BatchNormOperator(Operator):
+    # [CLASS DOC] Operator for batch normalization in inference mode with running statistics and
+    # optional weight and bias. Stateless.
     """Operator for torch.nn.functional.batch_norm."""
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Register the operator under the
+        # name torch.nn.functional.batch_norm.
         super().__init__("torch.nn.functional.batch_norm")
 
     @property
     def torch_op_name(self) -> str | None:
+        # [FUNCTION DOC] Returns the torch function name torch.nn.functional.batch_norm.
         """Return the torch operation name."""
         return "torch.nn.functional.batch_norm"
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Returns True for float tensor specs with at least two dimensions and a
+        # nonzero channel (second) dimension.
         """BatchNorm can produce tensor outputs with floating point dtypes."""
         if not isinstance(output_spec, TensorSpec):
             return False
@@ -655,6 +785,11 @@ class BatchNormOperator(Operator):
         return is_float_dtype(output_spec.dtype)
 
     def fuzz_inputs_specs(self, output_spec: Spec) -> list[Spec]:
+        # [FUNCTION DOC] Returns an input spec equal to the output spec, running mean and
+        # running variance specs over the channel dimension, then with probability 0.7 a weight
+        # spec and (only after a weight) with probability 0.7 a bias spec; all in the output
+        # dtype. Raises ValueError for non-tensor specs or fewer than two dimensions. Uses the
+        # random module.
         """Generate input specs for batch_norm operation.
 
         BatchNorm requires:
@@ -709,6 +844,10 @@ class BatchNormOperator(Operator):
     def codegen(
         self, output_name: str, input_names: list[str], output_spec: Spec
     ) -> str:
+        # [FUNCTION DOC] Emits a line calling batch_norm with training disabled; running mean
+        # and variance are detached (they must not require grad) and all inputs are cast to the
+        # output dtype. Three to five names mean input, running mean, running variance, optional
+        # weight, optional bias. Raises ValueError for another count or a non-TensorSpec output.
         """Generate code for batch_norm operation."""
         if len(input_names) < 3 or len(input_names) > 5:
             raise ValueError(
@@ -739,17 +878,23 @@ class BatchNormOperator(Operator):
 
 
 class GroupNormOperator(Operator):
+    # [CLASS DOC] Operator for group normalization with optional weight and bias. Stateless.
     """Operator for torch.nn.functional.group_norm."""
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Register the operator under the
+        # name torch.nn.functional.group_norm.
         super().__init__("torch.nn.functional.group_norm")
 
     @property
     def torch_op_name(self) -> str | None:
+        # [FUNCTION DOC] Returns the torch function name torch.nn.functional.group_norm.
         """Return the torch operation name."""
         return "torch.nn.functional.group_norm"
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Returns True for float tensor specs with at least two dimensions where
+        # the batch size times the product of the spatial sizes exceeds one.
         """GroupNorm can produce tensor outputs with floating point dtypes."""
         if not isinstance(output_spec, TensorSpec):
             return False
@@ -770,6 +915,10 @@ class GroupNormOperator(Operator):
         return is_float_dtype(output_spec.dtype)
 
     def fuzz_inputs_specs(self, output_spec: Spec) -> list[Spec]:
+        # [FUNCTION DOC] Returns an input spec equal to the output spec, then with probability
+        # 0.7 a weight spec over the channel (second) dimension and, only after a weight, with
+        # probability 0.7 a bias spec; all in the output dtype. Raises ValueError for non-tensor
+        # specs or fewer than two dimensions. Uses the random module.
         """Generate input specs for group_norm operation.
 
         GroupNorm requires:
@@ -813,6 +962,11 @@ class GroupNormOperator(Operator):
     def codegen(
         self, output_name: str, input_names: list[str], output_spec: Spec
     ) -> str:
+        # [FUNCTION DOC] Emits a line calling group_norm with inputs cast to the output dtype
+        # and a group count equal to the first of 32, 16, 8, 4, 2, 1 that divides the channel
+        # count. One to three names mean input, optional weight, optional bias. Raises
+        # ValueError for another count or a non-TensorSpec output.
+        # KNOWN ISSUE: the fallback group count branch is unreachable because 1 always divides.
         """Generate code for group_norm operation."""
         if len(input_names) < 1 or len(input_names) > 3:
             raise ValueError(
@@ -843,23 +997,31 @@ class GroupNormOperator(Operator):
 
 
 class LeakyReLUOperator(Operator):
+    # [CLASS DOC] Elementwise leaky_relu operator. Stateless.
     """Operator for torch.nn.functional.leaky_relu."""
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Register the operator under the
+        # name torch.nn.functional.leaky_relu.
         super().__init__("torch.nn.functional.leaky_relu")
 
     @property
     def torch_op_name(self) -> str | None:
+        # [FUNCTION DOC] Returns the torch function name torch.nn.functional.leaky_relu.
         """Return the torch operation name."""
         return "torch.nn.functional.leaky_relu"
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Returns True for tensor specs with float dtype (float16, bfloat16,
+        # float32, float64).
         """LeakyReLU can produce tensor outputs with floating point dtypes."""
         if not isinstance(output_spec, TensorSpec):
             return False
         return is_float_dtype(output_spec.dtype)
 
     def fuzz_inputs_specs(self, output_spec: Spec) -> list[Spec]:
+        # [FUNCTION DOC] Returns one input spec with the same size, stride and dtype as the
+        # output. Raises ValueError if output_spec is not a TensorSpec.
         """Generate input specs for LeakyReLU operation.
 
         LeakyReLU is element-wise, so input shape matches output shape.
@@ -876,6 +1038,9 @@ class LeakyReLUOperator(Operator):
     def codegen(
         self, output_name: str, input_names: list[str], output_spec: Spec
     ) -> str:
+        # [FUNCTION DOC] Emits a line applying leaky_relu to the single input with a random
+        # negative slope between 0.001 and 0.5 rounded to 4 digits (drawn at code generation
+        # time). Raises ValueError if the number of input names is wrong.
         """Generate code for LeakyReLU operation."""
         if len(input_names) != 1:
             raise ValueError("LeakyReLU requires exactly 1 input")
@@ -886,23 +1051,30 @@ class LeakyReLUOperator(Operator):
 
 
 class ELUOperator(Operator):
+    # [CLASS DOC] Elementwise elu operator. Stateless.
     """Operator for torch.nn.functional.elu (Exponential Linear Unit)."""
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Register the operator under the name torch.nn.functional.elu.
         super().__init__("torch.nn.functional.elu")
 
     @property
     def torch_op_name(self) -> str | None:
+        # [FUNCTION DOC] Returns the torch function name torch.nn.functional.elu.
         """Return the torch operation name."""
         return "torch.nn.functional.elu"
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Returns True for tensor specs with float dtype (float16, bfloat16,
+        # float32, float64).
         """ELU can produce tensor outputs with floating point dtypes."""
         if not isinstance(output_spec, TensorSpec):
             return False
         return is_float_dtype(output_spec.dtype)
 
     def fuzz_inputs_specs(self, output_spec: Spec) -> list[Spec]:
+        # [FUNCTION DOC] Returns one input spec with the same size, stride and dtype as the
+        # output. Raises ValueError if output_spec is not a TensorSpec.
         """Generate input specs for ELU operation.
 
         ELU is element-wise, so input shape matches output shape.
@@ -919,6 +1091,9 @@ class ELUOperator(Operator):
     def codegen(
         self, output_name: str, input_names: list[str], output_spec: Spec
     ) -> str:
+        # [FUNCTION DOC] Emits a line applying elu to the single input with a random alpha
+        # between 0.1 and 3.0 rounded to 4 digits (drawn at code generation time). Raises
+        # ValueError if the number of input names is wrong.
         """Generate code for ELU operation."""
         if len(input_names) != 1:
             raise ValueError("ELU requires exactly 1 input")
@@ -929,23 +1104,30 @@ class ELUOperator(Operator):
 
 
 class SiLUOperator(Operator):
+    # [CLASS DOC] Elementwise silu operator. Stateless.
     """Operator for torch.nn.functional.silu (Sigmoid Linear Unit, also known as Swish)."""
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Register the operator under the name torch.nn.functional.silu.
         super().__init__("torch.nn.functional.silu")
 
     @property
     def torch_op_name(self) -> str | None:
+        # [FUNCTION DOC] Returns the torch function name torch.nn.functional.silu.
         """Return the torch operation name."""
         return "torch.nn.functional.silu"
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Returns True for tensor specs with float dtype (float16, bfloat16,
+        # float32, float64).
         """SiLU can produce tensor outputs with floating point dtypes."""
         if not isinstance(output_spec, TensorSpec):
             return False
         return is_float_dtype(output_spec.dtype)
 
     def fuzz_inputs_specs(self, output_spec: Spec) -> list[Spec]:
+        # [FUNCTION DOC] Returns one input spec with the same size, stride and dtype as the
+        # output. Raises ValueError if output_spec is not a TensorSpec.
         """Generate input specs for SiLU operation.
 
         SiLU is element-wise, so input shape matches output shape.
@@ -962,6 +1144,8 @@ class SiLUOperator(Operator):
     def codegen(
         self, output_name: str, input_names: list[str], output_spec: Spec
     ) -> str:
+        # [FUNCTION DOC] Emits a line applying silu to the single input. Raises ValueError if
+        # the number of input names is wrong.
         """Generate code for SiLU operation."""
         if len(input_names) != 1:
             raise ValueError("SiLU requires exactly 1 input")
@@ -971,17 +1155,23 @@ class SiLUOperator(Operator):
 
 
 class ScaledDotProductAttentionOperator(Operator):
+    # [CLASS DOC] Operator for scaled dot product attention. Stateless.
     """Operator for torch.nn.functional.scaled_dot_product_attention."""
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Register the operator under the
+        # name torch.nn.functional.scaled_dot_product_attention.
         super().__init__("torch.nn.functional.scaled_dot_product_attention")
 
     @property
     def torch_op_name(self) -> str | None:
+        # [FUNCTION DOC] Returns the torch function name
+        # torch.nn.functional.scaled_dot_product_attention.
         """Return the torch operation name."""
         return "torch.nn.functional.scaled_dot_product_attention"
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Returns True for float tensor specs with at least three dimensions.
         """Scaled dot product attention can produce tensor outputs with floating point dtypes."""
         if not isinstance(output_spec, TensorSpec):
             return False
@@ -991,6 +1181,8 @@ class ScaledDotProductAttentionOperator(Operator):
         return is_float_dtype(output_spec.dtype)
 
     def fuzz_inputs_specs(self, output_spec: Spec) -> list[Spec]:
+        # [FUNCTION DOC] Returns three identical specs (query, key, value), each equal to the
+        # output spec. Raises ValueError for non-tensor specs or fewer than three dimensions.
         """Generate input specs for scaled_dot_product_attention.
 
         SDPA requires:
@@ -1026,6 +1218,9 @@ class ScaledDotProductAttentionOperator(Operator):
     def codegen(
         self, output_name: str, input_names: list[str], output_spec: Spec
     ) -> str:
+        # [FUNCTION DOC] Emits a line calling scaled_dot_product_attention with query, key and
+        # value cast to the output dtype. Raises ValueError unless there are exactly three
+        # input names.
         """Generate code for scaled_dot_product_attention operation."""
         if len(input_names) != 3:
             raise ValueError("SDPA requires exactly 3 inputs: query, key, value")
@@ -1037,17 +1232,25 @@ class ScaledDotProductAttentionOperator(Operator):
 
 
 class MultiHeadAttentionForwardOperator(Operator):
+    # [CLASS DOC] Operator for multi-head attention forward with a combined input projection and
+    # no biases. Stateless.
     """Operator for torch.nn.functional.multi_head_attention_forward."""
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Register the operator under the
+        # name torch.nn.functional.multi_head_attention_forward.
         super().__init__("torch.nn.functional.multi_head_attention_forward")
 
     @property
     def torch_op_name(self) -> str | None:
+        # [FUNCTION DOC] Returns the torch function name
+        # torch.nn.functional.multi_head_attention_forward.
         """Return the torch operation name."""
         return "torch.nn.functional.multi_head_attention_forward"
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Returns True for float tensor specs with at least three dimensions and
+        # no zero-sized dimension.
         """Multi-head attention forward can produce tensor outputs with floating point dtypes."""
         if not isinstance(output_spec, TensorSpec):
             return False
@@ -1060,6 +1263,14 @@ class MultiHeadAttentionForwardOperator(Operator):
         return is_float_dtype(output_spec.dtype)
 
     def fuzz_inputs_specs(self, output_spec: Spec) -> list[Spec]:
+        # [FUNCTION DOC] Treats the first three output dims as sequence, batch and embedding
+        # sizes and returns five specs: query, key and value equal to the output spec, a
+        # combined input projection weight (3 times embedding by embedding) and an output
+        # projection weight (embedding by embedding), all in the output dtype. Raises ValueError
+        # for non-tensor specs or fewer than three dimensions.
+        # KNOWN ISSUE: the docstring describes optional biases but none are generated. For
+        # outputs with more than three dims the embedding size here is the third dim while
+        # codegen uses the last dim.
         """Generate input specs for multi_head_attention_forward.
 
         MHA requires:
@@ -1128,6 +1339,7 @@ class MultiHeadAttentionForwardOperator(Operator):
         return cast(list[Spec], specs)
 
     def _calculate_stride(self, size):
+        # [FUNCTION DOC] HELPER: Returns contiguous strides for a size; unused by this class.
         """Calculate stride for a given size."""
         if not size:
             return ()
@@ -1141,6 +1353,11 @@ class MultiHeadAttentionForwardOperator(Operator):
     def codegen(
         self, output_name: str, input_names: list[str], output_spec: Spec
     ) -> str:
+        # [FUNCTION DOC] Emits a call to multi_head_attention_forward (attention weights not
+        # computed, eval mode, no dropout, no biases) taking the output's last dimension as
+        # embedding size and the largest of 8, 4, 2, 1 dividing it as head count; inputs are
+        # cast to the output dtype and the first result is assigned to output_name. Raises
+        # ValueError unless there are exactly five input names.
         """Generate code for multi_head_attention_forward operation."""
         if len(input_names) != 5:
             raise ValueError(

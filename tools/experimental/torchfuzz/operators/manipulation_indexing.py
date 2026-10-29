@@ -1,4 +1,10 @@
 # pyre-strict
+# [MODULE DOC] Fuzzer operators for shape-preserving manipulation ops: conj_physical, fill, flip
+# and masked_fill. Random choices (scalar value, flip dims) are drawn during input-spec
+# generation, stashed on the operator and consumed (then cleared) in codegen. Also holds a
+# helper producing random scalar literals per dtype. No import-time side effects.
+# KNOWN ISSUE: the text above claims codegen asserts that stashed values are present; the code
+# does not check this.
 """Tensor manipulation & indexing Operator subclasses.
 
 Models torch ops in the "Tensor Manipulation & Indexing" category
@@ -40,6 +46,11 @@ from torchfuzz.tensor_fuzzer import Spec, TensorSpec
 
 
 def _random_scalar_for_dtype(dtype: torch.dtype) -> object:
+    # [FUNCTION DOC] HELPER: Returns a random Python scalar suited to a dtype using the
+    # global random module: a bool for bool, for float dtypes minus infinity (10 percent),
+    # infinity (5 percent) or a uniform value in -10 to 10 rounded to 4 digits, a small
+    # signed or unsigned integer for integer dtypes. Raises ValueError for any other dtype.
+    # KNOWN ISSUE: the docstring omits the infinity outcomes for float dtypes.
     """Return a random Python scalar literal appropriate for ``dtype``.
 
     Uses the global ``random`` module so ``--seed`` reproduces.
@@ -84,6 +95,8 @@ def _random_scalar_for_dtype(dtype: torch.dtype) -> object:
 
 
 class ConjPhysicalOperator(Operator):
+    # [CLASS DOC] Elementwise conj_physical on one tensor of the same size/stride/dtype as the
+    # output; excludes bool outputs. Stateless.
     """Single-tensor elementwise complex conjugate.
 
     For real-valued inputs this is a no-op; for complex-valued inputs
@@ -92,16 +105,22 @@ class ConjPhysicalOperator(Operator):
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Register under the name torch.conj_physical.
         super().__init__("torch.conj_physical")
 
     @property
     def torch_op_name(self) -> str:
+        # [FUNCTION DOC] Returns the registered operator name, which is the torch function
+        # called in generated code.
         return self.name
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Returns True for tensor specs whose dtype is not bool.
         return isinstance(output_spec, TensorSpec) and output_spec.dtype != torch.bool
 
     def fuzz_inputs_specs(self, output_spec: Spec) -> list[Spec]:
+        # [FUNCTION DOC] Returns one input spec identical to the output spec (same size, stride
+        # and dtype). Raises AssertionError if output_spec is not a TensorSpec.
         if not isinstance(output_spec, TensorSpec):
             raise AssertionError(f"expected TensorSpec, got {type(output_spec)}")
         return [
@@ -118,10 +137,14 @@ class ConjPhysicalOperator(Operator):
         input_names: list[str],
         output_spec: Spec,
     ) -> str:
+        # [FUNCTION DOC] Emits a line applying conj_physical to the single input.
         return f"{output_name} = torch.conj_physical({input_names[0]})"
 
 
 class FillOperator(Operator):
+    # [CLASS DOC] Operator for torch.fill: output is a copy of the input filled with one
+    # random scalar. State: _value holds the scalar drawn in fuzz_inputs_specs and is cleared
+    # by codegen.
     """Single-tensor torch.fill -- copy of input filled with a scalar.
 
     Picks a random scalar at fuzz_inputs_specs time keyed by output
@@ -131,17 +154,25 @@ class FillOperator(Operator):
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Register under the name torch.fill and initialize the stashed
+        # value to none.
         super().__init__("torch.fill")
         self._value: object | None = None
 
     @property
     def torch_op_name(self) -> str:
+        # [FUNCTION DOC] Returns the registered operator name, which is the torch function
+        # called in generated code.
         return self.name
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Returns True for any tensor spec.
         return isinstance(output_spec, TensorSpec)
 
     def fuzz_inputs_specs(self, output_spec: Spec) -> list[Spec]:
+        # [FUNCTION DOC] Draws and stashes a random scalar for the output dtype, then returns
+        # one input spec identical to the output spec. Raises AssertionError if output_spec is
+        # not a TensorSpec.
         if not isinstance(output_spec, TensorSpec):
             raise AssertionError(f"expected TensorSpec, got {type(output_spec)}")
         self._value = _random_scalar_for_dtype(output_spec.dtype)
@@ -159,6 +190,9 @@ class FillOperator(Operator):
         input_names: list[str],
         output_spec: Spec,
     ) -> str:
+        # [FUNCTION DOC] Emits a line filling the input with the stashed scalar rendered as a
+        # literal, then clears the stash. Side effect: resets the stored value to none.
+        # KNOWN ISSUE: the leading comment mentions an is-not-none check that is not performed.
         # is not None -- NOT truthiness -- falsy stash values
         # (0, 0.0, False) are valid draws.
         val = scalar_repr(self._value)
@@ -167,6 +201,9 @@ class FillOperator(Operator):
 
 
 class FlipOperator(Operator):
+    # [CLASS DOC] Operator for torch.flip: reverses element order along a random non-empty
+    # subset of dims. State: _dims holds the chosen dims from fuzz_inputs_specs and is cleared
+    # by codegen.
     """torch.flip(input, dims) -- reverse element order along dims.
 
     Picks a random non-empty subset of dims at fuzz_inputs_specs time
@@ -185,17 +222,25 @@ class FlipOperator(Operator):
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Register under the name torch.flip and initialize the stashed
+        # dims to none.
         super().__init__("torch.flip")
         self._dims: tuple[int, ...] | None = None
 
     @property
     def torch_op_name(self) -> str:
+        # [FUNCTION DOC] Returns the registered operator name, which is the torch function
+        # called in generated code.
         return self.name
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Returns True for tensor specs with at least one dimension.
         return isinstance(output_spec, TensorSpec) and len(output_spec.size) >= 1
 
     def fuzz_inputs_specs(self, output_spec: Spec) -> list[Spec]:
+        # [FUNCTION DOC] Chooses a random count of dims and a sorted random subset, stashes it,
+        # then returns one input spec identical to the output. Raises AssertionError if
+        # output_spec is not a TensorSpec.
         if not isinstance(output_spec, TensorSpec):
             raise AssertionError(f"expected TensorSpec, got {type(output_spec)}")
         ndim = len(output_spec.size)
@@ -215,6 +260,10 @@ class FlipOperator(Operator):
         input_names: list[str],
         output_spec: Spec,
     ) -> str:
+        # [FUNCTION DOC] Emits a line flipping the input along the stashed dims, then clears the
+        # stash. Side effect: resets the stored dims to none.
+        # KNOWN ISSUE: the leading comment mentions an is-not-none check that is not performed;
+        # if codegen runs without fuzz_inputs_specs the generated dims would be none.
         # is not None -- NOT truthiness -- empty tuples would be falsy
         # if a future maintainer ever extends the random range.
         out = f"{output_name} = torch.flip({input_names[0]}, dims={self._dims!r})"
@@ -223,6 +272,9 @@ class FlipOperator(Operator):
 
 
 class MaskedFillOperator(Operator):
+    # [CLASS DOC] Operator for torch.masked_fill: a value tensor plus a bool mask, filled with
+    # one random scalar. State: _value holds the scalar drawn in fuzz_inputs_specs and is
+    # cleared by codegen.
     """torch.masked_fill(input, mask, value) -- replace masked elements.
 
     Two tensor inputs (the value tensor + a same-shape bool mask) and
@@ -241,17 +293,26 @@ class MaskedFillOperator(Operator):
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Register under the name torch.masked_fill and initialize the
+        # stashed value to none.
         super().__init__("torch.masked_fill")
         self._value: object | None = None
 
     @property
     def torch_op_name(self) -> str:
+        # [FUNCTION DOC] Returns the registered operator name, which is the torch function
+        # called in generated code.
         return self.name
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Returns True for any tensor spec.
         return isinstance(output_spec, TensorSpec)
 
     def fuzz_inputs_specs(self, output_spec: Spec) -> list[Spec]:
+        # [FUNCTION DOC] Draws and stashes a random scalar for the output dtype and returns two
+        # specs: the input (same as output) and a bool mask that, with probability 0.3, gets a
+        # random broadcastable shape instead of the output size; the mask is contiguous. Raises
+        # AssertionError if output_spec is not a TensorSpec.
         if not isinstance(output_spec, TensorSpec):
             raise AssertionError(f"expected TensorSpec, got {type(output_spec)}")
         self._value = _random_scalar_for_dtype(output_spec.dtype)
@@ -278,6 +339,10 @@ class MaskedFillOperator(Operator):
         input_names: list[str],
         output_spec: Spec,
     ) -> str:
+        # [FUNCTION DOC] Emits a line calling masked_fill with the input, the mask and the
+        # stashed scalar literal, then clears the stash. Side effect: resets the stored value
+        # to none.
+        # KNOWN ISSUE: the leading comment mentions an is-not-none check that is not performed.
         # is not None -- NOT truthiness -- falsy stash values
         # (0, 0.0, False) are valid draws.
         val = scalar_repr(self._value)

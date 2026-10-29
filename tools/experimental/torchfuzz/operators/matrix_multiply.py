@@ -1,3 +1,6 @@
+# [MODULE DOC] Fuzzer operators for matrix multiplication: mm, addmm, bmm and matmul. Each picks
+# a random inner dimension (1 to 16) when inverting an output spec into input specs, and its
+# code generator casts inputs to the output dtype. No import-time side effects.
 """Matrix multiplication operator implementations."""
 
 import random
@@ -12,12 +15,20 @@ from torchfuzz.tensor_fuzzer import Spec, TensorSpec
 
 
 class MatrixMultiplyOperatorBase(Operator):
+    # [CLASS DOC] Base for matrix multiply operators; shared can_produce (tensors with at least
+    # two dims and a non-integer, non-bool dtype) and dtype helper. Subclasses set a sampling
+    # weight attribute.
     """Base class for matrix multiplication operations."""
 
     def __init__(self, name: str):
+        # [FUNCTION DOC] HELPER: Register the operator under the given name.
         super().__init__(name)
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Returns True for tensor specs with at least two dimensions whose dtype
+        # is not bool or a signed integer type.
+        # KNOWN ISSUE: unsigned integer dtypes are not excluded despite the comment
+        # about integers.
         """Matrix multiply operations can produce float/complex tensors of dimension >= 2."""
         if not isinstance(output_spec, TensorSpec):
             return False
@@ -39,23 +50,30 @@ class MatrixMultiplyOperatorBase(Operator):
         return True
 
     def _get_compatible_dtype(self, output_dtype):
+        # [FUNCTION DOC] HELPER: Returns a two-entry list holding the output dtype twice (dtypes
+        # for the two matrix inputs).
         """Get a compatible dtype for matrix multiplication."""
         return [output_dtype, output_dtype]
 
 
 class MMOperator(MatrixMultiplyOperatorBase):
+    # [CLASS DOC] Operator for torch.mm on 2-D tensors; sampling weight attribute is 5.0.
     """Operator for matrix multiplication (torch.mm)."""
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Register under the name mm and set the weight attribute to 5.0.
         super().__init__("mm")
         self.weight = 5.0
 
     @property
     def torch_op_name(self) -> str | None:
+        # [FUNCTION DOC] Returns the torch function name torch.mm.
         """Return the torch operation name."""
         return "torch.mm"
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Returns True for 2-D tensor specs of non-bool, non-signed-
+        # integer dtype.
         """MM requires exactly 2D tensors."""
         if not isinstance(output_spec, TensorSpec):
             return False
@@ -77,6 +95,9 @@ class MMOperator(MatrixMultiplyOperatorBase):
         return True
 
     def fuzz_inputs_specs(self, output_spec: Spec) -> list[Spec]:
+        # [FUNCTION DOC] For an output of m by n, picks a random inner size k and returns specs
+        # for inputs m by k and k by n, both contiguous with the output dtype. Raises ValueError
+        # if not a 2-D TensorSpec.
         """Generate input specs for matrix multiplication."""
         if not isinstance(output_spec, TensorSpec):
             raise ValueError("MMOperator can only produce TensorSpec outputs")
@@ -109,6 +130,9 @@ class MMOperator(MatrixMultiplyOperatorBase):
     def codegen(
         self, output_name: str, input_names: list[str], output_spec: Spec
     ) -> str:
+        # [FUNCTION DOC] Emits a line calling torch.mm on the two inputs. The generated code
+        # casts every input to the output dtype before the call (when the output spec is a
+        # TensorSpec). Raises ValueError on a wrong number of input names.
         """Generate code for matrix multiplication."""
         if len(input_names) != 2:
             raise ValueError("torch.mm requires exactly 2 inputs")
@@ -129,18 +153,25 @@ class MMOperator(MatrixMultiplyOperatorBase):
 
 
 class AddmmOperator(MatrixMultiplyOperatorBase):
+    # [CLASS DOC] Operator for torch.addmm (bias plus product) on 2-D tensors; sampling weight
+    # attribute is 5.0.
     """Operator for additive matrix multiplication (torch.addmm)."""
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Register under the name addmm and set the weight attribute
+        # to 5.0.
         super().__init__("addmm")
         self.weight = 5.0
 
     @property
     def torch_op_name(self) -> str | None:
+        # [FUNCTION DOC] Returns the torch function name torch.addmm.
         """Return the torch operation name."""
         return "torch.addmm"
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Returns True for 2-D tensor specs of non-bool, non-signed-
+        # integer dtype.
         """Addmm requires exactly 2D tensors."""
         if not isinstance(output_spec, TensorSpec):
             return False
@@ -162,6 +193,10 @@ class AddmmOperator(MatrixMultiplyOperatorBase):
         return True
 
     def fuzz_inputs_specs(self, output_spec: Spec) -> list[Spec]:
+        # [FUNCTION DOC] For an output of m by n, picks a random inner size k and returns
+        # specs for the bias (m by n), first matrix (m by k) and second matrix (k by n),
+        # all contiguous with the output dtype. Raises ValueError if the output is not a
+        # 2-D TensorSpec.
         """Generate input specs for additive matrix multiplication."""
         if not isinstance(output_spec, TensorSpec):
             raise ValueError("AddmmOperator can only produce TensorSpec outputs")
@@ -201,6 +236,9 @@ class AddmmOperator(MatrixMultiplyOperatorBase):
     def codegen(
         self, output_name: str, input_names: list[str], output_spec: Spec
     ) -> str:
+        # [FUNCTION DOC] Emits a line calling torch.addmm on the three inputs (bias first). The
+        # generated code casts every input to the output dtype before the call (when the output
+        # spec is a TensorSpec). Raises ValueError on a wrong number of input names.
         """Generate code for additive matrix multiplication."""
         if len(input_names) != 3:
             raise ValueError("torch.addmm requires exactly 3 inputs")
@@ -222,18 +260,24 @@ class AddmmOperator(MatrixMultiplyOperatorBase):
 
 
 class BmmOperator(MatrixMultiplyOperatorBase):
+    # [CLASS DOC] Operator for torch.bmm on 3-D tensors; sampling weight attribute is 5.0.
     """Operator for batch matrix multiplication (torch.bmm)."""
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Register under the name bmm and set the weight attribute
+        # to 5.0.
         super().__init__("bmm")
         self.weight = 5.0
 
     @property
     def torch_op_name(self) -> str | None:
+        # [FUNCTION DOC] Returns the torch function name torch.bmm.
         """Return the torch operation name."""
         return "torch.bmm"
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Returns True for 3-D tensor specs of non-bool, non-signed-
+        # integer dtype.
         """Batch matrix multiply requires 3D tensors."""
         if not isinstance(output_spec, TensorSpec):
             return False
@@ -255,6 +299,9 @@ class BmmOperator(MatrixMultiplyOperatorBase):
         return True
 
     def fuzz_inputs_specs(self, output_spec: Spec) -> list[Spec]:
+        # [FUNCTION DOC] For an output of b by m by n, picks a random inner size k and returns
+        # specs for inputs b by m by k and b by k by n, contiguous with the output dtype. Raises
+        # ValueError if the output is not a 3-D TensorSpec.
         """Generate input specs for batch matrix multiplication."""
         if not isinstance(output_spec, TensorSpec):
             raise ValueError("BmmOperator can only produce TensorSpec outputs")
@@ -287,6 +334,9 @@ class BmmOperator(MatrixMultiplyOperatorBase):
     def codegen(
         self, output_name: str, input_names: list[str], output_spec: Spec
     ) -> str:
+        # [FUNCTION DOC] Emits a line calling torch.bmm on the two inputs. The generated code
+        # casts every input to the output dtype before the call (when the output spec is a
+        # TensorSpec). Raises ValueError on a wrong number of input names.
         """Generate code for batch matrix multiplication."""
         if len(input_names) != 2:
             raise ValueError("torch.bmm requires exactly 2 inputs")
@@ -307,18 +357,25 @@ class BmmOperator(MatrixMultiplyOperatorBase):
 
 
 class MatmulOperator(MatrixMultiplyOperatorBase):
+    # [CLASS DOC] Operator for torch.matmul on outputs of one or more dimensions; sampling
+    # weight attribute is 500.0, much higher than the other matrix operators.
     """Operator for general matrix multiplication (torch.matmul)."""
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Register under the name matmul and set the weight attribute
+        # to 500.0.
         super().__init__("matmul")
         self.weight = 500.0
 
     @property
     def torch_op_name(self) -> str | None:
+        # [FUNCTION DOC] Returns the torch function name torch.matmul.
         """Return the torch operation name."""
         return "torch.matmul"
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Returns True for tensor specs with at least one dimension and non-bool,
+        # non-signed-integer dtype.
         """Matmul can handle various tensor dimensions >= 1."""
         if not isinstance(output_spec, TensorSpec):
             return False
@@ -340,6 +397,12 @@ class MatmulOperator(MatrixMultiplyOperatorBase):
         return True
 
     def fuzz_inputs_specs(self, output_spec: Spec) -> list[Spec]:
+        # [FUNCTION DOC] Builds two input specs by output rank. 1-D output: randomly either
+        # vector by matrix or matrix by vector. 2-D output: m by k and k by n. Higher rank: the
+        # batch dims are kept and inputs are batch by m by k and batch by k by n. k is random
+        # from 1 to 16; strides are contiguous; dtype is the output dtype. Raises ValueError if
+        # output_spec is not a TensorSpec.
+        # KNOWN ISSUE: a 0-d output is not rejected here; can_produce prevents it upstream.
         """Generate input specs for general matrix multiplication."""
         if not isinstance(output_spec, TensorSpec):
             raise ValueError("MatmulOperator can only produce TensorSpec outputs")
@@ -418,6 +481,9 @@ class MatmulOperator(MatrixMultiplyOperatorBase):
     def codegen(
         self, output_name: str, input_names: list[str], output_spec: Spec
     ) -> str:
+        # [FUNCTION DOC] Emits a line calling torch.matmul on the two inputs. The generated code
+        # casts every input to the output dtype before the call (when the output spec is a
+        # TensorSpec). Raises ValueError on a wrong number of input names.
         """Generate code for general matrix multiplication."""
         if len(input_names) != 2:
             raise ValueError("torch.matmul requires exactly 2 inputs")
