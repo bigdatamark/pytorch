@@ -1,3 +1,6 @@
+# [MODULE DOC] Autograd Functions used by DataParallel: Broadcast, ReduceAddCoalesced, Gather and
+# Scatter, each defined as the backward of another, wrapping the comm module primitives.
+# Also holds a lazily built per-device cache of background copy streams (_streams).
 import warnings
 from itertools import chain
 
@@ -8,8 +11,15 @@ from torch.nn.parallel import comm
 
 
 class Broadcast(Function):
+    # [CLASS DOC] Autograd Function that copies input tensors to several GPUs; its backward is a
+    # coalesced reduce-add of the gradients onto the source device (ReduceAddCoalesced).
     @staticmethod
     def forward(ctx, target_gpus, *inputs):
+        # [FUNCTION DOC] Broadcast the input tensors to each target GPU via coalesced broadcast.
+        # Args: ctx, target_gpus (device list), *inputs (non-CPU tensors). Returns a flat tuple of
+        # copies, grouped by device. Raises AssertionError for CPU inputs. Saves device info on
+        # ctx, handles complex tensors via real views, and marks outputs of inputs not requiring
+        # grad non-differentiable.
         if not all(i.device.type != "cpu" for i in inputs):
             raise AssertionError("Broadcast function not implemented for CPU tensors")
         target_gpus = [_get_device_index(x, True) for x in target_gpus]
@@ -37,6 +47,8 @@ class Broadcast(Function):
 
     @staticmethod
     def backward(ctx, *grad_outputs):
+        # [FUNCTION DOC] Sum gradients from all replicas back onto the original device by applying
+        # ReduceAddCoalesced. Returns None for target_gpus plus the reduced gradients.
         grads = ReduceAddCoalesced.apply(
             ctx.input_device, ctx.num_inputs, *grad_outputs
         )
@@ -45,8 +57,14 @@ class Broadcast(Function):
 
 
 class ReduceAddCoalesced(Function):
+    # [CLASS DOC] Autograd Function that sums per-device gradient lists onto a destination device;
+    # its backward broadcasts the result back to the devices the gradients came from.
     @staticmethod
     def forward(ctx, destination, num_inputs, *grads):
+        # [FUNCTION DOC] Reduce-add the flat grads (grouped per device, num_inputs per device) onto
+        # destination using the coalesced comm primitive. Complex tensors are viewed as real for
+        # the reduction and converted back. Returns a tuple of summed tensors; remembers the source
+        # devices on ctx.
         ctx.target_gpus = [
             grads[i].get_device() for i in range(0, len(grads), num_inputs)
         ]
@@ -73,6 +91,8 @@ class ReduceAddCoalesced(Function):
 
     @staticmethod
     def backward(ctx, *grad_outputs):
+        # [FUNCTION DOC] Broadcast the gradients to the saved source devices; returns None for the
+        # destination and num_inputs arguments followed by the broadcast results.
         return (
             None,
             None,
@@ -80,8 +100,14 @@ class ReduceAddCoalesced(Function):
 
 
 class Gather(Function):
+    # [CLASS DOC] Autograd Function that gathers tensors from several GPUs onto one device (or CPU)
+    # along a dimension; its backward scatters the gradient to the original devices (Scatter).
     @staticmethod
     def forward(ctx, target_device, dim, *inputs):
+        # [FUNCTION DOC] Gather inputs along dim onto target_device (an int index, device, or the
+        # string cpu). Raises AssertionError for CPU inputs. If all inputs are 0-dim and dim is 0,
+        # they are viewed as 1-element vectors and a warning is emitted. Saves input devices and
+        # sizes on ctx. Complex outputs are re-viewed as complex. Returns the gathered tensor.
         if not all(i.device.type != "cpu" for i in inputs):
             raise AssertionError("Gather function not implemented for CPU tensors")
         if target_device == "cpu":
@@ -115,6 +141,9 @@ class Gather(Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        # [FUNCTION DOC] Scatter grad_output back to the input devices with the saved sizes and
+        # dim. If scalars were unsqueezed in forward, each piece is indexed down to 0-dim. Returns
+        # None for the first two forward arguments followed by the per-input gradients.
         scattered_grads = Scatter.apply(
             ctx.input_gpus, ctx.input_sizes, ctx.dim, grad_output
         )
@@ -124,8 +153,15 @@ class Gather(Function):
 
 
 class Scatter(Function):
+    # [CLASS DOC] Autograd Function that splits a tensor along a dim across target GPUs; its
+    # backward gathers the gradients onto the input's device (CPU is represented by -1).
     @staticmethod
     def forward(ctx, target_gpus, chunk_sizes, dim, input):
+        # [FUNCTION DOC] Scatter input into chunks (optionally with given chunk_sizes) over
+        # target_gpus. When the input is on CPU and an accelerator is available, copies use
+        # background streams and the main streams then wait on them and record the outputs; this is
+        # the side effect on stream state. Complex tensors are handled via real views. Returns a
+        # tuple of per-device tensors.
         target_gpus = [_get_device_index(x, True) for x in target_gpus]
         ctx.dim = dim
         ctx.input_device = input.get_device() if input.device.type != "cpu" else -1
@@ -152,6 +188,8 @@ class Scatter(Function):
 
     @staticmethod
     def backward(ctx, *grad_output):
+        # [FUNCTION DOC] Gather the per-device gradients onto the input's original device; returns
+        # None for the three non-tensor forward arguments followed by the gathered gradient.
         return None, None, None, Gather.apply(ctx.input_device, ctx.dim, *grad_output)
 
 
@@ -160,6 +198,10 @@ _streams: list[torch.Stream | None] | None = None
 
 
 def _get_stream(device: torch.device):
+    # [FUNCTION DOC] HELPER: Return the cached background copy stream for an accelerator device,
+    # creating it lazily (mutating the module global _streams). Returns None for CPU devices or
+    # when no accelerator is available. Raises AssertionError if the device type differs from the
+    # current accelerator type.
     """Get a background stream for copying between CPU and target device."""
     global _streams
     if device.type == "cpu" or not torch.accelerator.is_available():

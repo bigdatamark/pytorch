@@ -1,4 +1,6 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Defines DataParallel, the single-process multi-GPU module wrapper, and its
+# functional form data_parallel, plus a GPU balance check. Exports DataParallel and data_parallel.
 import operator
 import warnings
 from collections.abc import Sequence
@@ -22,6 +24,8 @@ __all__ = ["DataParallel", "data_parallel"]
 
 
 def _check_balance(device_ids: Sequence[int | torch.device]) -> None:
+    # [FUNCTION DOC] HELPER: Warn (via a warning) if the GPUs in device_ids differ by more than 25
+    # percent in total memory or, failing that, in multiprocessor count. Returns None.
     imbalance_warn = """
     There is an imbalance between your GPUs. You may want to exclude GPU {} which
     has less than 75% of the memory or cores of GPU {}. You can do so by setting
@@ -31,6 +35,9 @@ def _check_balance(device_ids: Sequence[int | torch.device]) -> None:
     dev_props = _get_devices_properties(device_ids)
 
     def warn_imbalance(get_prop) -> bool:
+        # [FUNCTION DOC] HELPER: Compare one device property across devices; if the minimum is
+        # below 75 percent of the maximum, emit a warning naming the weak and strong GPU and return
+        # True, else False.
         values = [get_prop(props) for props in dev_props]
         min_pos, min_val = min(enumerate(values), key=operator.itemgetter(1))
         max_pos, max_val = max(enumerate(values), key=operator.itemgetter(1))
@@ -52,6 +59,11 @@ T = TypeVar("T", bound=Module)
 
 
 class DataParallel(Module, Generic[T]):
+    # [CLASS DOC] Module wrapper that replicates a module over device_ids, scatters inputs along
+    # dim, runs replicas in parallel threads and gathers outputs onto output_device. State: module,
+    # device_ids, output_device, dim, src_device_obj. With no usable accelerator (or mps) it is a
+    # pass-through with empty device_ids. Overridable hooks: replicate, scatter, parallel_apply,
+    # gather.
     r"""Implements data parallelism at the module level.
 
     This container parallelizes the application of the given :attr:`module` by
@@ -140,6 +152,12 @@ class DataParallel(Module, Generic[T]):
         output_device: int | torch.device | None = None,
         dim: int = 0,
     ) -> None:
+        # [FUNCTION DOC] Configure the wrapper. device_ids defaults to all devices and
+        # output_device to the first id. Records the source device, checks GPU balance for cuda,
+        # and moves the module to the single device if only one is used. Raises RuntimeError if no
+        # devices are found. Logs API usage.
+        # KNOWN ISSUE: in the no-accelerator path dim, output_device and src_device_obj are not
+        # set.
         super().__init__()
         torch._C._log_api_usage_once("torch.nn.parallel.DataParallel")
         device_type = _get_available_device_type()
@@ -170,6 +188,10 @@ class DataParallel(Module, Generic[T]):
             self.module.to(self.src_device_obj)
 
     def forward(self, *inputs: Any, **kwargs: Any) -> Any:
+        # [FUNCTION DOC] Run the wrapped module. Pass-through if device_ids is empty. Otherwise
+        # verifies all parameters and buffers live on the source device (RuntimeError if not),
+        # scatters inputs, runs directly for one device, else replicates, applies in parallel and
+        # gathers. Returns the gathered output.
         with torch.autograd.profiler.record_function("DataParallel.forward"):
             if not self.device_ids:
                 return self.module(*inputs, **kwargs)
@@ -197,6 +219,8 @@ class DataParallel(Module, Generic[T]):
             return self.gather(outputs, self.output_device)
 
     def replicate(self, module: T, device_ids: Sequence[int | torch.device]) -> list[T]:
+        # [FUNCTION DOC] Replicate module onto device_ids; detach is enabled when grad mode is off.
+        # Returns the list of replicas.
         return replicate(module, device_ids, not torch.is_grad_enabled())
 
     def scatter(
@@ -205,16 +229,22 @@ class DataParallel(Module, Generic[T]):
         kwargs: dict[str, Any] | None,
         device_ids: Sequence[int | torch.device],
     ) -> Any:
+        # [FUNCTION DOC] Scatter positional inputs and keyword arguments over device_ids along dim.
+        # Returns the per-device inputs and kwargs.
         return scatter_kwargs(inputs, kwargs, device_ids, dim=self.dim)
 
     def parallel_apply(
         self, replicas: Sequence[T], inputs: Sequence[Any], kwargs: Any
     ) -> list[Any]:
+        # [FUNCTION DOC] Apply each replica to its inputs and kwargs in parallel on the matching
+        # devices; returns the list of outputs.
         return parallel_apply(
             replicas, inputs, kwargs, self.device_ids[: len(replicas)]
         )
 
     def gather(self, outputs: Any, output_device: int | torch.device) -> Any:
+        # [FUNCTION DOC] Gather per-device outputs onto output_device along dim and return the
+        # result.
         return gather(outputs, output_device, dim=self.dim)
 
 
@@ -226,6 +256,11 @@ def data_parallel(
     dim: int = 0,
     module_kwargs: Any | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Functional form of DataParallel: evaluate module on inputs across device_ids
+    # and return the gathered output on output_device. Non-tuple inputs are wrapped in a tuple.
+    # Raises RuntimeError if no device type or devices are found, or if module state is off the
+    # first device. Single-device runs call the module directly.
+    # KNOWN ISSUE: the docstring mentions -1 for CPU output_device but no special handling is seen.
     r"""Evaluate module(input) in parallel across the GPUs given in device_ids.
 
     This is the functional version of the DataParallel module.

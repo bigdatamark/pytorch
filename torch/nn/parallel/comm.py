@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Public multi-GPU communication primitives: broadcast, broadcast_coalesced,
+# reduce_add, reduce_add_coalesced, scatter and gather. Thin wrappers over torch._C ops and NCCL
+# that normalize devices and complex tensors. No import-time side effects.
 import warnings
 
 import torch
@@ -14,6 +17,9 @@ from torch.cuda import nccl
 
 
 def broadcast(tensor, devices=None, *, out=None):
+    # [FUNCTION DOC] Broadcast a tensor to the given devices, or into the preallocated out tensors;
+    # exactly one of devices and out must be given, else RuntimeError. Returns a tuple of copies
+    # when devices is used. Complex tensors are handled via real views.
     r"""Broadcasts a tensor to specified GPU devices.
 
     Args:
@@ -48,6 +54,9 @@ def broadcast(tensor, devices=None, *, out=None):
 
 
 def broadcast_coalesced(tensors, devices, buffer_size=10485760):
+    # [FUNCTION DOC] Broadcast a sequence of tensors to the devices in chunks of at most
+    # buffer_size bytes, flattening each chunk for efficiency. Returns a tuple of per-device tuples
+    # of tensors.
     """Broadcast a sequence of tensors to the specified GPUs.
 
     Small tensors are first coalesced into a buffer to reduce the number of synchronizations.
@@ -68,6 +77,10 @@ def broadcast_coalesced(tensors, devices, buffer_size=10485760):
 
 
 def reduce_add(inputs, destination=None):
+    # [FUNCTION DOC] Sum same-shaped GPU tensors onto destination (default current device), which
+    # must hold one of the inputs. Raises AssertionError for CPU inputs, ValueError on size
+    # mismatch, and RuntimeError if no input is on destination. Uses NCCL when available, else
+    # sequential copies and adds. A single input is returned as is. Returns the summed tensor.
     """Sum tensors from multiple GPUs.
 
     All inputs should have matching shapes, dtype, and layout. The output tensor
@@ -122,6 +135,10 @@ def reduce_add(inputs, destination=None):
 
 
 def reduce_add_coalesced(inputs, destination=None, buffer_size=10485760):
+    # [FUNCTION DOC] Sum per-GPU lists of tensors onto destination, flattening dense tensors into
+    # chunks of at most buffer_size bytes; sparse tensors are reduced individually. Returns a tuple
+    # of summed tensors in the original order.
+    # KNOWN ISSUE: a TODO notes the single-input, already-on-destination case is not shortcut.
     """Sum tensors from multiple GPUs.
 
     Small tensors are first coalesced into a buffer to reduce the number
@@ -169,6 +186,10 @@ def reduce_add_coalesced(inputs, destination=None, buffer_size=10485760):
 
 
 def scatter(tensor, devices=None, chunk_sizes=None, dim=0, streams=None, *, out=None):
+    # [FUNCTION DOC] Split tensor into chunks along dim and send them to devices (with optional
+    # chunk_sizes and copy streams), or into the out tensors; with out, devices and chunk_sizes
+    # must be unset or RuntimeError is raised. Returns a tuple of chunks. Complex tensors use real
+    # views.
     """Scatters tensor across multiple GPUs.
 
     Args:
@@ -220,6 +241,10 @@ def scatter(tensor, devices=None, chunk_sizes=None, dim=0, streams=None, *, out=
 
 
 def gather(tensors, dim=0, destination=None, *, out=None):
+    # [FUNCTION DOC] Concatenate tensors from different devices along dim onto destination (device,
+    # index, or cpu; default current device), or into the out tensor, in which case destination
+    # must be unset (RuntimeError otherwise). A destination of -1 for CPU is deprecated and emits a
+    # FutureWarning. Returns the gathered tensor.
     r"""Gathers tensors from multiple GPU devices.
 
     Args:

@@ -1,4 +1,6 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Upsampling modules: Upsample (configurable via interpolate) and the deprecated
+# UpsamplingNearest2d and UpsamplingBilinear2d convenience subclasses.
 
 import torch.nn.functional as F
 from torch import Tensor
@@ -11,6 +13,9 @@ __all__ = ["Upsample", "UpsamplingNearest2d", "UpsamplingBilinear2d"]
 
 
 class Upsample(Module):
+    # [CLASS DOC] Module wrapping the interpolate function. State: size, scale_factor (stored as
+    # float or tuple of floats), mode, align_corners, recompute_scale_factor. forward upsamples
+    # input.
     r"""Upsamples a given multi-channel 1D (temporal), 2D (spatial) or 3D (volumetric) data.
 
     The input data is assumed to be of the form
@@ -156,6 +161,8 @@ class Upsample(Module):
         align_corners: bool | None = None,
         recompute_scale_factor: bool | None = None,
     ) -> None:
+        # [FUNCTION DOC] Store the configuration; scale_factor is converted to float (or tuple of
+        # floats), and falsy scale_factor becomes None. Records the class name in name.
         super().__init__()
         self.name = type(self).__name__
         self.size = size
@@ -168,6 +175,8 @@ class Upsample(Module):
         self.recompute_scale_factor = recompute_scale_factor
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Upsample input with the interpolate function using the stored settings;
+        # returns the resized tensor.
         """
         Runs the forward pass.
         """
@@ -181,12 +190,16 @@ class Upsample(Module):
         )
 
     def __setstate__(self, state):
+        # [FUNCTION DOC] Unpickling hook: defaults recompute_scale_factor to True for old
+        # checkpoints that lack it, then defers to the base class.
         if "recompute_scale_factor" not in state:
             state["recompute_scale_factor"] = True
 
         super().__setstate__(state)
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] Return the repr string fragment: scale_factor if set, else size, plus the
+        # mode.
         """
         Return the extra representation of the module.
         """
@@ -199,6 +212,8 @@ class Upsample(Module):
 
 
 class UpsamplingNearest2d(Upsample):
+    # [CLASS DOC] Deprecated Upsample subclass fixed to nearest mode, taking only size and
+    # scale_factor.
     r"""Applies a 2D nearest neighbor upsampling to an input signal composed of several input channels.
 
     To specify the scale, it takes either the :attr:`size` or the :attr:`scale_factor`
@@ -244,10 +259,12 @@ class UpsamplingNearest2d(Upsample):
         size: _size_2_t | None = None,
         scale_factor: _ratio_2_t | None = None,
     ) -> None:
+        # [FUNCTION DOC] Initialize the base Upsample with mode nearest.
         super().__init__(size, scale_factor, mode="nearest")
 
 
 class UpsamplingBilinear2d(Upsample):
+    # [CLASS DOC] Deprecated Upsample subclass fixed to bilinear mode with align_corners enabled.
     r"""Applies a 2D bilinear upsampling to an input signal composed of several input channels.
 
     To specify the scale, it takes either the :attr:`size` or the :attr:`scale_factor`
@@ -295,4 +312,5 @@ class UpsamplingBilinear2d(Upsample):
         size: _size_2_t | None = None,
         scale_factor: _ratio_2_t | None = None,
     ) -> None:
+        # [FUNCTION DOC] Initialize the base Upsample with mode bilinear and align_corners True.
         super().__init__(size, scale_factor, mode="bilinear", align_corners=True)

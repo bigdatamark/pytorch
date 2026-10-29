@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Small helpers for nn modules: n-tuple argument normalizers (_single, _pair, _triple,
+# _quadruple), padding reversal, size defaulting, and a state_dict prefix stripper.
+# Only consume_prefix_in_state_dict_if_present is public. No import-time side effects beyond
+# building the tuple parsers.
 import collections
 from itertools import repeat
 from typing import Any
@@ -8,7 +12,12 @@ __all__ = ["consume_prefix_in_state_dict_if_present"]
 
 
 def _ntuple(n, name="parse"):
+    # [FUNCTION DOC] HELPER: Factory returning a parser function that expands a scalar into an
+    # n-tuple. The returned function is renamed to the given name for readable reprs and
+    # tracebacks.
     def parse(x):
+        # [FUNCTION DOC] HELPER: If x is iterable it is converted to a tuple unchanged in length (n
+        # is not enforced); otherwise x is repeated n times into a tuple.
         if isinstance(x, collections.abc.Iterable):
             return tuple(x)
         return tuple(repeat(x, n))
@@ -24,6 +33,9 @@ _quadruple = _ntuple(4, "_quadruple")
 
 
 def _reverse_repeat_tuple(t, n):
+    # [FUNCTION DOC] HELPER: Reverse the sequence t and repeat each element n times, returning a
+    # tuple. Converts per-dimension padding into the last-dim-first order expected by the pad
+    # function.
     r"""Reverse the order of `t` and repeat each element for `n` times.
 
     This can be used to translate padding arg used by Conv and Pooling modules
@@ -33,6 +45,9 @@ def _reverse_repeat_tuple(t, n):
 
 
 def _list_with_default(out_size: list[int], defaults: list[int]) -> list[int]:
+    # [FUNCTION DOC] HELPER: Fill unspecified (None) entries of out_size from the trailing entries
+    # of defaults. An int or SymInt out_size is returned as is. Raises ValueError if defaults is
+    # not strictly longer than out_size. Returns a new list.
     import torch
 
     if isinstance(out_size, (int, torch.SymInt)):
@@ -49,6 +64,11 @@ def consume_prefix_in_state_dict_if_present(
     state_dict: dict[str, Any],
     prefix: str,
 ) -> None:
+    # [FUNCTION DOC] Strip a leading prefix (for example from a DataParallel or DDP wrapper) from
+    # every key of state_dict in place, and likewise from the keys of its _metadata mapping if
+    # present. Keys without the prefix are untouched. Returns None. Metadata keys that are empty
+    # are skipped; a metadata key equal to the prefix without dots is also renamed (to an empty
+    # name).
     r"""Strip the prefix in state_dict in place, if any.
 
     .. note::

@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Transformer building blocks: Transformer, TransformerEncoder/Decoder and their layer
+# classes (post-norm or pre-norm), plus helpers for causal masks, layer cloning, activation lookup
+# and causal-mask detection. No import-time side effects.
 import copy
 import warnings
 from collections.abc import Callable
@@ -31,6 +34,8 @@ def _generate_square_subsequent_mask(
     device: torch.device | None = None,
     dtype: torch.dtype | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC] HELPER: Build an sz by sz float mask with negative infinity above the diagonal
+    # and zero elsewhere (causal mask) on the given device and dtype.
     r"""Generate a square causal mask for the sequence.
 
     The masked positions are filled with float('-inf'). Unmasked positions are filled with float(0.0).
@@ -42,6 +47,8 @@ def _generate_square_subsequent_mask(
 
 
 def _get_seq_len(src: Tensor, batch_first: bool) -> int | None:
+    # [FUNCTION DOC] HELPER: Return the sequence length of src, or None for nested tensors. Two-dim
+    # input is unbatched (length is first dim); otherwise the position depends on batch_first.
     if src.is_nested:
         return None
     else:
@@ -56,6 +63,9 @@ def _get_seq_len(src: Tensor, batch_first: bool) -> int | None:
 
 
 class Transformer(Module):
+    # [CLASS DOC] Full encoder-decoder transformer. State: encoder, decoder (custom or default
+    # stacks), d_model, nhead, batch_first. Parameters with more than one dim use Xavier uniform
+    # init.
     r"""A basic transformer layer.
 
 
@@ -117,6 +127,9 @@ class Transformer(Module):
         device=None,
         dtype=None,
     ) -> None:
+        # [FUNCTION DOC] Build the encoder and decoder (default layers with layer norm, or the
+        # supplied custom modules), initialize parameters, and record d_model, nhead and
+        # batch_first. Logs API usage.
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         torch._C._log_api_usage_once(f"torch.nn.modules.{self.__class__.__name__}")
@@ -192,6 +205,9 @@ class Transformer(Module):
         tgt_is_causal: bool | None = None,
         memory_is_causal: bool = False,
     ) -> Tensor:
+        # [FUNCTION DOC] Encode src then decode tgt against the memory with the given masks and
+        # causal hints. Raises RuntimeError if batch sizes of src and tgt differ (batched input) or
+        # feature size is not d_model. Returns the decoder output tensor.
         r"""Take in and process masked source/target sequences.
 
         .. note::
@@ -304,6 +320,8 @@ class Transformer(Module):
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ) -> Tensor:
+        # [FUNCTION DOC] Static helper returning a square causal float mask of size sz (negative
+        # infinity above the diagonal) on the given device and dtype.
         r"""Generate a square causal mask for the sequence.
 
         The masked positions are filled with float('-inf'). Unmasked positions are filled with float(0.0).
@@ -311,6 +329,8 @@ class Transformer(Module):
         return _generate_square_subsequent_mask(sz, dtype=dtype, device=device)
 
     def _reset_parameters(self) -> None:
+        # [FUNCTION DOC] HELPER: Xavier-uniform initialize every parameter that has more than one
+        # dimension.
         r"""Initialize parameters in the transformer model."""
         for p in self.parameters():
             if p.dim() > 1:
@@ -318,6 +338,8 @@ class Transformer(Module):
 
 
 class TransformerEncoder(Module):
+    # [CLASS DOC] Stack of N cloned encoder layers with optional final norm. State: layers,
+    # num_layers, norm, enable_nested_tensor, use_nested_tensor, mask_check.
     r"""TransformerEncoder is a stack of N encoder layers.
 
     This TransformerEncoder layer implements the original architecture described
@@ -360,6 +382,9 @@ class TransformerEncoder(Module):
         enable_nested_tensor: bool = True,
         mask_check: bool = True,
     ) -> None:
+        # [FUNCTION DOC] Clone encoder_layer num_layers times and store options. Determines whether
+        # the nested tensor fast path is allowed; if not (wrong layer type, norm_first, non
+        # batch_first, odd attention settings, etc.) it warns and sets use_nested_tensor False.
         super().__init__()
         torch._C._log_api_usage_once(f"torch.nn.modules.{self.__class__.__name__}")
         self.layers = _get_clones(encoder_layer, num_layers)
@@ -413,6 +438,10 @@ class TransformerEncoder(Module):
         src_key_padding_mask: Tensor | None = None,
         is_causal: bool | None = None,
     ) -> Tensor:
+        # [FUNCTION DOC] Run src through all layers, then the optional norm. Canonicalizes the
+        # mask, decides whether the sparsity fast path (padded input converted to a nested tensor)
+        # applies based on a list of conditions, and detects causal masks. Converts back to a
+        # padded tensor afterwards. Returns the encoded tensor.
         r"""Pass the input through the encoder layers in turn.
 
         Args:
@@ -556,6 +585,8 @@ class TransformerEncoder(Module):
 
 
 class TransformerDecoder(Module):
+    # [CLASS DOC] Stack of N cloned decoder layers with optional final norm. State: layers,
+    # num_layers, norm.
     r"""TransformerDecoder is a stack of N decoder layers.
 
     This TransformerDecoder layer implements the original architecture described
@@ -592,6 +623,8 @@ class TransformerDecoder(Module):
         num_layers: int,
         norm: Module | None = None,
     ) -> None:
+        # [FUNCTION DOC] Clone decoder_layer num_layers times and store the optional norm. Logs API
+        # usage.
         super().__init__()
         torch._C._log_api_usage_once(f"torch.nn.modules.{self.__class__.__name__}")
         self.layers = _get_clones(decoder_layer, num_layers)
@@ -609,6 +642,9 @@ class TransformerDecoder(Module):
         tgt_is_causal: bool | None = None,
         memory_is_causal: bool = False,
     ) -> Tensor:
+        # [FUNCTION DOC] Pass tgt and memory through every decoder layer with the given masks,
+        # detecting a causal tgt mask when no hint is given, then apply the optional norm. Returns
+        # the output.
         r"""Pass the inputs (and mask) through the decoder layer in turn.
 
         Args:
@@ -661,6 +697,9 @@ class TransformerDecoder(Module):
 
 
 class TransformerEncoderLayer(Module):
+    # [CLASS DOC] Single encoder layer: self-attention then feed-forward, each with dropout,
+    # residual and layer norm (before or after according to norm_first). State: self_attn,
+    # linear1/2, dropouts, norm1/2, activation, activation_relu_or_gelu (1 relu, 2 gelu, 0 other).
     r"""TransformerEncoderLayer is made up of self-attn and feedforward network.
 
     This TransformerEncoderLayer implements the original architecture described
@@ -756,6 +795,8 @@ class TransformerEncoderLayer(Module):
         device=None,
         dtype=None,
     ) -> None:
+        # [FUNCTION DOC] Create sublayers; string activations are mapped to relu or gelu, and a
+        # code is stored for fast-path use.
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.self_attn = MultiheadAttention(
@@ -792,6 +833,8 @@ class TransformerEncoderLayer(Module):
         self.activation = activation
 
     def __setstate__(self, state):
+        # [FUNCTION DOC] Unpickling hook: restore the default activation (relu) if missing in old
+        # state.
         super().__setstate__(state)
         if not hasattr(self, "activation"):
             self.activation = F.relu
@@ -803,6 +846,9 @@ class TransformerEncoderLayer(Module):
         src_key_padding_mask: Tensor | None = None,
         is_causal: bool = False,
     ) -> Tensor:
+        # [FUNCTION DOC] Apply self-attention and feed-forward blocks to src (pre-norm or post-
+        # norm) using a fused fast path when inference conditions hold (otherwise the standard
+        # path). Returns the output tensor of the same shape.
         r"""Pass the input through the encoder layer.
 
         Args:
@@ -965,6 +1011,8 @@ class TransformerEncoderLayer(Module):
         key_padding_mask: Tensor | None,
         is_causal: bool = False,
     ) -> Tensor:
+        # [FUNCTION DOC] HELPER: Self-attention block without returned weights, followed by
+        # dropout1.
         x = self.self_attn(
             x,
             x,
@@ -978,11 +1026,16 @@ class TransformerEncoderLayer(Module):
 
     # feed forward block
     def _ff_block(self, x: Tensor) -> Tensor:
+        # [FUNCTION DOC] HELPER: Feed-forward block (linear, activation, dropout, linear) followed
+        # by dropout2.
         x = self.linear2(self.dropout(self.activation(self.linear1(x))))
         return self.dropout2(x)
 
 
 class TransformerDecoderLayer(Module):
+    # [CLASS DOC] Single decoder layer: self-attention, cross-attention over memory, then feed-
+    # forward, each with dropout, residual and layer norm. State: self_attn, multihead_attn,
+    # linear1/2, norm1/2/3, dropout1/2/3, activation, norm_first.
     r"""TransformerDecoderLayer is made up of self-attn, multi-head-attn and feedforward network.
 
     This TransformerDecoderLayer implements the original architecture described
@@ -1041,6 +1094,7 @@ class TransformerDecoderLayer(Module):
         device=None,
         dtype=None,
     ) -> None:
+        # [FUNCTION DOC] Create the sublayers; a string activation is mapped to relu or gelu.
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.self_attn = MultiheadAttention(
@@ -1079,6 +1133,8 @@ class TransformerDecoderLayer(Module):
             self.activation = activation
 
     def __setstate__(self, state):
+        # [FUNCTION DOC] Unpickling hook: set the default activation (relu) if missing, then defer
+        # to base.
         if "activation" not in state:
             state["activation"] = F.relu
         super().__setstate__(state)
@@ -1094,6 +1150,8 @@ class TransformerDecoderLayer(Module):
         tgt_is_causal: bool = False,
         memory_is_causal: bool = False,
     ) -> Tensor:
+        # [FUNCTION DOC] Apply self-attention, cross-attention over memory and feed-forward blocks
+        # to tgt, pre-norm or post-norm according to norm_first. Returns the output tensor.
         r"""Pass the inputs (and mask) through the decoder layer.
 
         Args:
@@ -1159,6 +1217,7 @@ class TransformerDecoderLayer(Module):
         key_padding_mask: Tensor | None,
         is_causal: bool = False,
     ) -> Tensor:
+        # [FUNCTION DOC] HELPER: Masked self-attention block without weights, followed by dropout1.
         x = self.self_attn(
             x,
             x,
@@ -1179,6 +1238,8 @@ class TransformerDecoderLayer(Module):
         key_padding_mask: Tensor | None,
         is_causal: bool = False,
     ) -> Tensor:
+        # [FUNCTION DOC] HELPER: Cross-attention of x over mem without weights, followed by
+        # dropout2.
         x = self.multihead_attn(
             x,
             mem,
@@ -1192,16 +1253,21 @@ class TransformerDecoderLayer(Module):
 
     # feed forward block
     def _ff_block(self, x: Tensor) -> Tensor:
+        # [FUNCTION DOC] HELPER: Feed-forward block followed by dropout3.
         x = self.linear2(self.dropout(self.activation(self.linear1(x))))
         return self.dropout3(x)
 
 
 def _get_clones(module, N):
+    # [FUNCTION DOC] HELPER: Return a ModuleList of N deep copies of module.
+    # KNOWN ISSUE: the FIXME comment about deepcopy on nn.Module is stale.
     # FIXME: copy.deepcopy() is not defined on nn.module
     return ModuleList([copy.deepcopy(module) for i in range(N)])
 
 
 def _get_activation_fn(activation: str) -> Callable[[Tensor], Tensor]:
+    # [FUNCTION DOC] HELPER: Map the strings relu or gelu to the functional activation; raises
+    # RuntimeError for any other name.
     if activation == "relu":
         return F.relu
     elif activation == "gelu":
@@ -1215,6 +1281,10 @@ def _detect_is_causal_mask(
     is_causal: bool | None = None,
     size: int | None = None,
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Return whether mask is causal. A non-None is_causal hint is returned
+    # as is. Otherwise, when mask exists, compare it to a generated causal mask of the given size
+    # (default mask rows) and return True only on exact size and value match; None mask gives
+    # False.
     """Return whether the given attention mask is causal.
 
     Warning:
