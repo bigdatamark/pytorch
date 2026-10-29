@@ -1,5 +1,11 @@
 # mypy: allow-untyped-defs
 # mypy: disable-error-code=arg-type
+# [MODULE DOC]
+# TorchScript exporter symbolic functions for ONNX opset 14: hardswish, tril and triu (Trilu),
+# reshape, batch_norm with training mode support, quantized hardswish, and
+# scaled_dot_product_attention built from primitive ops, plus two private helpers for the
+# attention scale and the causal mask. Import-time side effects: registers the handlers in the
+# global symbolic registry for opset 14.
 """This file exports ONNX ops for opset 14.
 
 Note [ONNX operators that are added/updated in opset 14]
@@ -47,16 +53,24 @@ _onnx_symbolic = functools.partial(registration.onnx_symbolic, opset=14)
 @_onnx_symbolic("aten::hardswish")
 @symbolic_helper.parse_args("v")
 def hardswish(g: jit_utils.GraphContext, self):
+    # [FUNCTION DOC]
+    # Symbolic for hardswish: emits the HardSwish op on the input.
     return g.op("HardSwish", self)
 
 
 @_onnx_symbolic("aten::tril")
 def tril(g: jit_utils.GraphContext, self, diagonal, out=None):
+    # [FUNCTION DOC]
+    # Symbolic for tril: emits Trilu with the lower triangle selected and diagonal as the offset
+    # input. The out argument is ignored.
     return g.op("Trilu", self, diagonal, upper_i=0)
 
 
 @_onnx_symbolic("aten::triu")
 def triu(g: jit_utils.GraphContext, self, diagonal, out=None):
+    # [FUNCTION DOC]
+    # Symbolic for triu: emits Trilu with the upper triangle selected and diagonal as the offset
+    # input. The out argument is ignored.
     return g.op("Trilu", self, diagonal, upper_i=1)
 
 
@@ -64,6 +78,9 @@ def triu(g: jit_utils.GraphContext, self, diagonal, out=None):
 @symbolic_helper.quantized_args(True)
 @symbolic_helper.parse_args("v", "v")
 def reshape(g: jit_utils.GraphContext, self, shape):
+    # [FUNCTION DOC]
+    # Symbolic for reshape (quantization aware). Delegates to the shared reshape helper with
+    # allowzero disabled, so zero dims copy the input dim.
     # NOTE: Due to bug in ORT https://github.com/microsoft/onnxruntime/issues/10664
     #       Reshape export cannot utilize the new allowzero attribute introduced in opset 14.
     return symbolic_helper._reshape_helper(g, self, shape, allowzero=0)
@@ -83,6 +100,13 @@ def batch_norm(
     eps,
     cudnn_enabled,
 ):
+    # [FUNCTION DOC]
+    # Symbolic for batch_norm using BatchNormalization. Under autocast with mixed input dtypes and
+    # export opset below 15, reports the op as unsupported for this opset. Checks the training
+    # mode flag (warns or errors per the helper), then emits the op with epsilon, momentum
+    # converted to one minus momentum, and the training flag. In inference returns one output;
+    # in training takes three outputs, copies running stat types onto the updated stats, and
+    # returns only the normalized result.
     if (
         torch.is_autocast_enabled()
         and not symbolic_helper.args_have_same_dtype(
@@ -126,6 +150,9 @@ def batch_norm(
 
 @_onnx_symbolic("quantized::hardswish")
 def quantized_hardswish(g: jit_utils.GraphContext, x, op_scale, op_zero_point):
+    # [FUNCTION DOC]
+    # Symbolic for quantized hardswish: dequantizes the input, applies hardswish, and requantizes
+    # the output with the given scale and zero point. Returns the quantized value.
     x, _, _, _ = symbolic_helper.dequantize_helper(g, x)
 
     output = hardswish(g, x)
@@ -150,6 +177,17 @@ def scaled_dot_product_attention(
     scale: torch._C.Value | None = None,
     enable_gqa: bool = False,
 ):
+    # [FUNCTION DOC]
+    # Symbolic for scaled_dot_product_attention built from primitive ops. Raises an error if
+    # is_causal is combined with an explicit mask, or if enable_gqa is set. Computes the default
+    # scale when absent and a causal mask when requested, transposes the last two axes of key,
+    # scales query and key each by the square root of the scale, multiplies, adds the mask (a bool
+    # mask is turned into zero or minus infinity, float, half and bfloat16 masks are added
+    # directly, other types raise a value error), applies softmax over the last axis, replaces NaN
+    # (fully masked rows) with zero for bool masks, optionally applies Dropout, and multiplies by
+    # value. Returns the attention output.
+    # KNOWN ISSUE: Dropout is emitted with a dropout ratio but the op in this form does not take
+    # the training flag, so it may be inactive in the exported model.
     if is_causal and not symbolic_helper._is_none(attn_mask):
         raise AssertionError("is_causal and attn_mask cannot be set at the same time")
     if enable_gqa:
@@ -228,6 +266,9 @@ def scaled_dot_product_attention(
 def _attention_scale(
     g: jit_utils.GraphContext, query: torch._C.Value
 ) -> torch._C.Value:
+    # [FUNCTION DOC] HELPER: Builds graph ops for the default attention scale, one over the square
+    # root of the last dim of query, computed in the query dtype from the runtime shape. Returns
+    # a one-element tensor value.
     """Calculate the scale factor for the attention result.
 
     Args:
@@ -264,6 +305,10 @@ def _attention_scale(
 def _causal_attention_mask(
     g: jit_utils.GraphContext, query: torch._C.Value, key: torch._C.Value
 ) -> torch._C.Value:
+    # [FUNCTION DOC] HELPER: Builds graph ops for a causal attention mask from the runtime
+    # target and source lengths (second-to-last dims of query and key). Creates a ones matrix,
+    # keeps its lower triangle with Trilu, then maps zero entries to minus infinity and the rest
+    # to zero. Returns the float mask value.
     """Create a causal mask for the given query and key tensors.
 
     Equivalent to::

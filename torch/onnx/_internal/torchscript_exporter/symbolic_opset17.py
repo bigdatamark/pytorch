@@ -1,5 +1,10 @@
 # mypy: allow-untyped-defs
 # mypy: disable-error-code=arg-type
+# [MODULE DOC]
+# TorchScript exporter symbolic functions for ONNX opset 17: layer_norm (LayerNormalization),
+# its quantized variant, and stft (STFT op with window preparation, batching and
+# normalization), with one private helper for window padding sizes. Import-time side effects:
+# registers the handlers in the global symbolic registry for opset 17.
 """This file exports ONNX ops for opset 17.
 
 Note [ONNX Operators that are added/updated in opset 17]
@@ -50,6 +55,11 @@ def layer_norm(
     eps: float,
     cudnn_enable: bool,
 ):
+    # [FUNCTION DOC]
+    # Symbolic for layer_norm via LayerNormalization. The normalization axis is the negative
+    # length of normalized_shape. When weight or bias is none, substitutes a constant of ones or
+    # zeros of normalized_shape in the input dtype (float if unknown). Emits the op with epsilon
+    # and axis attributes; cudnn_enable is ignored.
     # normalized_shape: input shape from an expected input of size
     # axis: The first normalization dimension.
     # layer_norm normalizes on the last D dimensions,
@@ -86,6 +96,9 @@ def quantized_layer_norm(
     op_scale,
     op_zero_point,
 ):
+    # [FUNCTION DOC]
+    # Symbolic for quantized layer_norm: dequantizes x, applies layer_norm, then requantizes with
+    # the given scale and zero point. Returns the quantized value.
     x, _, _, _ = symbolic_helper.dequantize_helper(g, x)
 
     output = layer_norm(g, x, normalized_shape, weight, bias, eps, False)
@@ -94,6 +107,8 @@ def quantized_layer_norm(
 
 
 def _compute_edge_sizes(n_fft, window_size):
+    # [FUNCTION DOC] HELPER: Returns the left and right zero padding sizes that center a window of
+    # window_size inside n_fft; left is half the difference rounded down, right is the remainder.
     """Helper function to compute the sizes of the edges (left and right)
     of a given window centered within an FFT size."""
     left = (n_fft - window_size) // 2
@@ -115,6 +130,15 @@ def stft(
     return_complex: bool | None = False,
     align_to_window: bool | None = None,
 ) -> _C.Value:
+    # [FUNCTION DOC]
+    # Symbolic for stft via the STFT op. Raises a symbolic value error for complex output, an
+    # align_to_window option, a signal rank that is unknown or above 2, or a window longer than
+    # n_fft; raises an assertion error when a given window size mismatches win_length or n_fft.
+    # A rank 1 signal gets a batch dim added and removed afterwards. A given window shorter than
+    # n_fft is zero padded on both sides; a missing window is built as a constant (rectangular or
+    # centered ones of win_length). The window is cast to the signal type, the result is
+    # transposed to match torch layout, and divided by the square root of n_fft if normalized.
+    # Hop length defaults to a quarter of n_fft. Returns the result value.
     """Associates `torch.stft` with the `STFT` ONNX operator.
     Note that torch.stft calls _VF.stft, without centering or padding options.
     Hence, this function does not contain these two arguments.

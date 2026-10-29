@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# TorchScript exporter symbolic functions for ONNX opset 8. Block-lists operators unsupported in
+# opset 8 (nonzero, where, scatter, erf, arange, any, all, ...), and provides Upsample based
+# interpolation, integer-to-float casting wrappers for comparison, matmul, Gemm and Flatten ops,
+# ConstantFill based factory functions (zeros, ones, full, empty and their like variants),
+# and repeat via Tile. Import-time side effects: registers all handlers in the global symbolic
+# registry for opset 8, including the block-list stubs.
 """
 Note [ONNX operators that are added/updated from opset 8 to opset 9]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -97,7 +104,14 @@ for block_listed_op in block_listed_operators:
     decorate=[symbolic_helper._apply_params("upsample_trilinear3d", 5, "linear")],
 )
 def _interpolate(name, dim, interpolate_mode):
+    # [FUNCTION DOC] HELPER: Factory registered for the upsample_nearest/linear aten ops. Given
+    # the op name, number of spatial plus batch/channel dims and interpolation mode, returns a
+    # symbolic function that emits an Upsample op. The returned function is parameterized per op.
     def symbolic_fn(g, input, output_size, *args):
+        # [FUNCTION DOC] HELPER: Builds Upsample for one interpolate variant. Reports unimplemented
+        # when align_corners is true or output_size is a dynamic value. If scales are not given,
+        # computes them as 1.0 for the first two dims and output size over input size for the
+        # rest (requires static input sizes). Emits a warning via the interpolate helper.
         scales, align_corners = symbolic_helper._get_interpolate_attributes(
             g, interpolate_mode, args
         )
@@ -134,6 +148,11 @@ def __interpolate(
     recompute_scale_factor,
     antialias,
 ):
+    # [FUNCTION DOC]
+    # Symbolic for the interpolate op in opset 8. Reports unimplemented if align_corners is true
+    # or if scale_factor or size is a dynamic graph value. Otherwise computes scales and mode
+    # with the shared helper and emits an Upsample op. The antialias and
+    # recompute_scale_factor arguments are ignored.
     align_corners = symbolic_helper._maybe_get_const(align_corners, "b")
     if not symbolic_helper._is_none(align_corners) and align_corners:
         return symbolic_helper._unimplemented("interpolate", "align_corners == True")
@@ -158,6 +177,12 @@ def __interpolate(
 #       issue for "cast" operators. Some symbolic functions depend on shape information of input tensor, which
 #       is lost after casting.
 def _try_cast_integer_to_float(g: jit_utils.GraphContext, *args):
+    # [FUNCTION DOC] HELPER: Casts all given values to float when the first value has a known
+    # non-floating scalar type. Returns a tuple of the original scalar type name (or none when no
+    # cast happened) followed by the possibly cast values. If the first type is unknown, warns
+    # that integer inputs may give a wrong model and returns the values uncast with none.
+    # Note: a half or double first input is treated as floating and not cast.
+    # KNOWN ISSUE: when unknown type, the returned old type is none, same as the no-cast case.
     floating_scalar_types = {
         _type_utils.JitScalarType.HALF,
         _type_utils.JitScalarType.FLOAT,
@@ -190,12 +215,17 @@ def _try_cast_integer_to_float(g: jit_utils.GraphContext, *args):
 
 
 def _cast_to_type(g: jit_utils.GraphContext, input, to_type):
+    # [FUNCTION DOC] HELPER: Emits a Cast op converting input to the ONNX type mapped from the
+    # given torch type name; returns input unchanged if to_type is none.
     if to_type is None:
         return input
     return g.op("Cast", input, to_i=symbolic_helper.cast_pytorch_to_onnx[to_type])
 
 
 def _comparison_operator(g: jit_utils.GraphContext, input, other, op_name):
+    # [FUNCTION DOC] HELPER: Shared body of gt and lt. Converts other to a scalar if constant
+    # and matches its scalar type to input, casts both to float if input is integer, and emits
+    # the named comparison op (Greater or Less). The result is not cast back to the old type.
     other = symbolic_helper._maybe_get_scalar(other)
     other = symbolic_helper._if_scalar_type_as(other, input)
     _, input, other = _try_cast_integer_to_float(g, input, other)
@@ -206,16 +236,24 @@ def _comparison_operator(g: jit_utils.GraphContext, input, other, op_name):
 #       integer input type not supported in opset8. Cast to float if possible.
 @_onnx_symbolic("aten::gt")
 def gt(g: jit_utils.GraphContext, input, other):
+    # [FUNCTION DOC]
+    # Symbolic for greater-than; emits Greater after float casting of integer inputs.
     return _comparison_operator(g, input, other, "Greater")
 
 
 @_onnx_symbolic("aten::lt")
 def lt(g: jit_utils.GraphContext, input, other):
+    # [FUNCTION DOC]
+    # Symbolic for less-than; emits Less after float casting of integer inputs.
     return _comparison_operator(g, input, other, "Less")
 
 
 @_onnx_symbolic("aten::bmm")
 def bmm(g: jit_utils.GraphContext, self, other):
+    # [FUNCTION DOC]
+    # Symbolic for batched matrix multiply. If the scalar type of self is known, casts integer
+    # inputs to float, emits MatMul and casts the result back to the original type; otherwise
+    # emits MatMul directly.
     if symbolic_helper._try_get_scalar_type(self):
         old_type, self, other = _try_cast_integer_to_float(g, self, other)
         return _cast_to_type(g, g.op("MatMul", self, other), old_type)
@@ -225,11 +263,18 @@ def bmm(g: jit_utils.GraphContext, self, other):
 
 @_onnx_symbolic("aten::matmul")
 def matmul(g: jit_utils.GraphContext, self, other):
+    # [FUNCTION DOC]
+    # Symbolic for matmul; simply reuses the bmm handler.
     return bmm(g, self, other)
 
 
 @_onnx_symbolic("aten::prelu")
 def prelu(g: jit_utils.GraphContext, self, weight):
+    # [FUNCTION DOC]
+    # Symbolic for prelu. If self has rank above 2, unsqueezes the weight on axes 1 up to rank
+    # minus 2 so it broadcasts; if both are scalars and weight has shape of one element, squeezes
+    # weight. Then emits PRelu, with integer-to-float casting and cast back when the scalar type
+    # of self is known.
     self_rank = symbolic_helper._get_tensor_rank(self)
     weight_sizes = symbolic_helper._get_tensor_sizes(weight)
     if self_rank is not None and self_rank > 2:
@@ -246,6 +291,10 @@ def prelu(g: jit_utils.GraphContext, self, weight):
 
 @_onnx_symbolic("aten::mm")
 def mm(g: jit_utils.GraphContext, self, other):
+    # [FUNCTION DOC]
+    # Symbolic for matrix multiply using Gemm with a zero bias (beta 0, alpha 1). Raises a
+    # symbolic value error if the scalar type of the inputs is unknown. Integer inputs are cast to
+    # float (including the zero bias) and the result is cast back.
     # Create a dummy C tensor. Only needed for API purposes, the value is
     # since beta = 0
     scalar_type = symbolic_helper._try_get_scalar_type(self, other)
@@ -273,6 +322,10 @@ def mm(g: jit_utils.GraphContext, self, other):
 @_onnx_symbolic("aten::addmm")
 @symbolic_helper.parse_args("v", "v", "v", "t", "t")
 def addmm(g: jit_utils.GraphContext, self, mat1, mat2, beta, alpha):
+    # [FUNCTION DOC]
+    # Symbolic for addmm, emitted as Gemm of mat1 and mat2 with self as bias and beta and alpha
+    # as float attributes. If the scalar type is known, integer inputs are cast to float and the
+    # result cast back.
     if symbolic_helper._try_get_scalar_type(self):
         old_type, self, mat1, mat2 = _try_cast_integer_to_float(g, self, mat1, mat2)
         return _cast_to_type(
@@ -300,6 +353,11 @@ def addmm(g: jit_utils.GraphContext, self, mat1, mat2, beta, alpha):
 
 @_onnx_symbolic("aten::flatten")
 def flatten(g: jit_utils.GraphContext, input, start_dim, end_dim):
+    # [FUNCTION DOC]
+    # Symbolic for flatten. When the result is 2D (flatten from dim 1 to the last dim, or from
+    # dim 0 to the second to last dim) emits the ONNX Flatten op with the matching axis, casting
+    # integer inputs to float and back when the type is known. Other cases fall back to the
+    # opset 9 flatten. Negative end_dim is normalized using the input rank.
     start_dim_i = symbolic_helper._get_const(start_dim, "i", "start_dim")
     end_dim_i = symbolic_helper._get_const(end_dim, "i", "end_dim")
 
@@ -328,6 +386,9 @@ def flatten(g: jit_utils.GraphContext, input, start_dim, end_dim):
 
 
 def _constant_fill(g: jit_utils.GraphContext, sizes, dtype: int, const_value):
+    # [FUNCTION DOC] HELPER: Emits a ConstantFill op taking sizes as the output shape, filled with
+    # const_value. The dtype defaults to float when none. For non-floating dtypes the fill is done
+    # in float and then cast to the requested type, since ConstantFill only handles floats.
     if dtype is None:
         scalar_type = _type_utils.JitScalarType.FLOAT
     else:
@@ -362,6 +423,8 @@ def empty(
     pin_memory=False,
     memory_format=None,
 ):
+    # [FUNCTION DOC]
+    # Symbolic for empty; implemented as zeros (memory_format ignored).
     return zeros(g, sizes, dtype, layout, device, pin_memory)
 
 
@@ -376,12 +439,17 @@ def empty_like(
     pin_memory=False,
     memory_format=None,
 ):
+    # [FUNCTION DOC]
+    # Symbolic for empty_like; implemented as zeros_like (memory_format ignored).
     return zeros_like(g, input, dtype, layout, device, pin_memory)
 
 
 @_onnx_symbolic("aten::zeros")
 @symbolic_helper.parse_args("v", "i", "v", "v", "v")
 def zeros(g: jit_utils.GraphContext, sizes, dtype, layout, device, pin_memory=False):
+    # [FUNCTION DOC]
+    # Symbolic for zeros: constant fill with value 0 of the given shape and dtype. Layout, device
+    # and pin_memory are ignored.
     # NOTE: no way to set device and layout in ONNX, so we ignore it
     return _constant_fill(g, sizes, dtype, 0)
 
@@ -397,6 +465,8 @@ def zeros_like(
     pin_memory=False,
     memory_format=None,
 ):
+    # [FUNCTION DOC]
+    # Symbolic for zeros_like: constant fill of 0 using the runtime shape of input.
     shape = g.op("Shape", input)
     return _constant_fill(g, shape, dtype, 0)
 
@@ -404,6 +474,8 @@ def zeros_like(
 @_onnx_symbolic("aten::ones")
 @symbolic_helper.parse_args("v", "i", "v", "v", "v")
 def ones(g: jit_utils.GraphContext, sizes, dtype, layout, device, pin_memory=False):
+    # [FUNCTION DOC]
+    # Symbolic for ones: constant fill with value 1 of the given shape and dtype.
     return _constant_fill(g, sizes, dtype, 1)
 
 
@@ -418,6 +490,8 @@ def ones_like(
     pin_memory=False,
     memory_format=None,
 ):
+    # [FUNCTION DOC]
+    # Symbolic for ones_like: constant fill of 1 using the runtime shape of input.
     shape = g.op("Shape", input)
     return _constant_fill(g, shape, dtype, 1)
 
@@ -426,6 +500,10 @@ def ones_like(
 def full(
     g: jit_utils.GraphContext, sizes, value, dtype, layout, device, pin_memory=False
 ):
+    # [FUNCTION DOC]
+    # Symbolic for full. If the fill value is a dynamic graph value, builds zeros of the shape
+    # and adds the value to them; otherwise does a constant fill with the constant value and the
+    # constant dtype.
     const_value = symbolic_helper._maybe_get_const(value, "t")
     if symbolic_helper._is_value(const_value):
         tmp = zeros(g, sizes, dtype, layout, device)
@@ -447,12 +525,18 @@ def full_like(
     pin_memory=False,
     memory_format=None,
 ):
+    # [FUNCTION DOC]
+    # Symbolic for full_like: constant fill with fill_value using the runtime shape of input.
     shape = g.op("Shape", input)
     return _constant_fill(g, shape, dtype, fill_value)
 
 
 @_onnx_symbolic("aten::repeat")
 def repeat(g: jit_utils.GraphContext, self, repeats):
+    # [FUNCTION DOC]
+    # Symbolic for repeat via the Tile op. Converts a non-value repeats list to a constant
+    # tensor and determines the number of repeat dims. If self has a fully known shape and
+    # repeats has more dims, reshapes self with leading ones so ranks match. Returns Tile.
     if not symbolic_helper._is_value(repeats):
         repeats = g.op("Constant", value_t=torch.LongTensor(repeats))
     if symbolic_helper._is_packed_list(repeats):

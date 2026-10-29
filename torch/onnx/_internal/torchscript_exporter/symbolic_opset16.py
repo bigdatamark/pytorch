@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# TorchScript exporter symbolic functions for ONNX opset 16: grid_sampler (GridSample),
+# scatter_add and scatter_reduce (ScatterElements with a reduction attribute, the latter wrapped
+# in If blocks to handle rank-0 inputs). Import-time side effects: registers the handlers in the
+# global symbolic registry for opset 16.
 """This file exports ONNX ops for opset 16.
 
 Note [ONNX Operators that are added/updated in opset 16]
@@ -58,6 +63,10 @@ def grid_sampler(
     padding_mode_enum,
     align_corners,
 ):
+    # [FUNCTION DOC]
+    # Symbolic for grid_sampler. Reports unsupported for 5D volumetric input. Otherwise maps the
+    # integer mode and padding mode enums to their names via the functional module tables
+    # (raises an error for unknown enums) and emits a GridSample op with the align_corners flag.
     # Check the input and grid tensor rank beforehand.
     if symbolic_helper._get_tensor_rank(input) == 5:
         return symbolic_helper._onnx_unsupported("GridSample with 5D volumetric input")
@@ -78,6 +87,12 @@ def grid_sampler(
 @_onnx_symbolic("aten::scatter_add")
 @symbolic_helper.parse_args("v", "i", "v", "v")
 def scatter_add(g: jit_utils.GraphContext, self, dim, index, src):
+    # [FUNCTION DOC]
+    # Symbolic for scatter_add via ScatterElements with the add reduction. Reports unimplemented
+    # if index and src differ in rank. If src and index shapes differ or are dynamic, slices src
+    # to the index shape. For a scalar src whose type differs from self, casts it to the type of
+    # self first. Returns the ScatterElements output.
+    # KNOWN ISSUE: the rank check calls length on the sizes, which fails if sizes are unknown.
     src_type = _type_utils.JitScalarType.from_value(
         src, _type_utils.JitScalarType.UNDEFINED
     )
@@ -133,6 +148,13 @@ def scatter_reduce(
     reduce: str,
     include_self: bool,
 ):
+    # [FUNCTION DOC]
+    # Symbolic for scatter_reduce via ScatterElements. Raises an exporter error for the mean
+    # reduction or when include_self is false. Maps sum, prod, amin and amax to the add, mul, min
+    # and max reductions. Rank-0 inputs are reshaped to one dim inside an If block (and the
+    # result squeezed back in a second If), since ScatterElements needs rank of at least one.
+    # Returns the final result value.
+    # KNOWN ISSUE: the mapping has a mean entry that is unreachable because mean raises earlier.
     if reduce == "mean":
         raise errors.OnnxExporterError(
             "ONNX does not support mean reduction for scatter_reduce"

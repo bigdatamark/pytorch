@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# TorchScript exporter symbolic functions for ONNX opset 7. Registers handlers for max and min
+# that warn about missing multidirectional broadcasting, and registers a "not supported" stub
+# for every operator in the block list (scan, expand, meshgrid, adaptive/with-indices pooling).
+# Import-time side effects: creates the opset-7 registration decorator and registers all the
+# handlers in the global symbolic registry.
 """
 Note [ONNX operators that are added/updated from opset 7 to opset 8]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -43,6 +49,11 @@ block_listed_operators = (
 # torch.max(x, dim, keepdim) and torch.max(x, y)
 @_onnx_symbolic("aten::max")
 def max(g: jit_utils.GraphContext, self, dim_or_y=None, keepdim=None):
+    # [FUNCTION DOC]
+    # Symbolic for aten max. Delegates to the opset 9 max with the same arguments. When called in
+    # the two-tensor form (no keepdim, second argument given) it first emits a warning that
+    # opset 7 lacks multidirectional broadcasting, so mismatched shapes may give a wrong model.
+    # Returns the value produced by the opset 9 handler.
     # torch.max(input, other)
     if keepdim is None and dim_or_y is not None:
         warnings.warn(
@@ -56,6 +67,10 @@ def max(g: jit_utils.GraphContext, self, dim_or_y=None, keepdim=None):
 
 @_onnx_symbolic("aten::min")
 def min(g: jit_utils.GraphContext, self, dim_or_y=None, keepdim=None):
+    # [FUNCTION DOC]
+    # Symbolic for aten min. Same as the max handler: warns about missing multidirectional
+    # broadcasting for the two-tensor form, then delegates to the opset 9 min and returns
+    # its result.
     # torch.min(input, other)
     if keepdim is None and dim_or_y is not None:
         warnings.warn(

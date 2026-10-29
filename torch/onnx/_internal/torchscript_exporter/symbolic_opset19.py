@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Placeholder module for ONNX opset 19 symbolic functions of the TorchScript exporter. It only
+# carries a note listing operators added or updated in opset 19 and exports an empty list; no
+# symbolic functions are registered and there are no import-time side effects.
 """This file exports ONNX ops for opset 19.
 
 Note [ONNX Operators that are added/updated in opset 19]

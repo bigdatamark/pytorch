@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# TorchScript exporter symbolic functions for ONNX opset 13. Covers softmax and log_softmax with
+# dtype casts, frobenius_norm, the split family (split, tensor_split, unbind, unsafe_chunk,
+# where, nonzero_numpy) using Split/Slice/SplitToSequence, fake quantization, sum reductions
+# with optional dtype, unflatten, tile, repeat_interleave, diagonal, and the quantized linear,
+# conv and conv_transpose ops built by dequantize, float op, requantize. Import-time side
+# effects: registers all handlers in the global symbolic registry for opset 13.
 # EDITING THIS FILE? READ THIS FIRST!
 # see Note [Edit Symbolic Files] in README.md
 
@@ -25,6 +32,10 @@ _onnx_symbolic = functools.partial(registration.onnx_symbolic, opset=13)
 @_onnx_symbolic("aten::softmax")
 @symbolic_helper.parse_args("v", "i", "none")
 def softmax(g: jit_utils.GraphContext, input, dim, dtype=None):
+    # [FUNCTION DOC]
+    # Symbolic for softmax over axis dim via the Softmax op. If a non-constant-none dtype is
+    # given, reads it as a constant integer and casts the result to that ONNX type. Returns the
+    # graph value.
     softmax = g.op("Softmax", input, axis_i=dim)
     if dtype and dtype.node().kind() != "prim::Constant":
         parsed_dtype = symbolic_helper._get_const(dtype, "i", "dtype")
@@ -38,6 +49,9 @@ def softmax(g: jit_utils.GraphContext, input, dim, dtype=None):
 @_onnx_symbolic("aten::log_softmax")
 @symbolic_helper.parse_args("v", "i", "none")
 def log_softmax(g: jit_utils.GraphContext, input, dim, dtype=None):
+    # [FUNCTION DOC]
+    # Symbolic for log_softmax over axis dim via LogSoftmax, with the same optional dtype cast of
+    # the result as the softmax handler. Returns the graph value.
     return_op = g.op("LogSoftmax", input, axis_i=dim)
     if dtype and dtype.node().kind() != "prim::Constant":
         parsed_dtype = symbolic_helper._get_const(dtype, "i", "dtype")
@@ -50,6 +64,10 @@ def log_softmax(g: jit_utils.GraphContext, input, dim, dtype=None):
 @_onnx_symbolic("aten::frobenius_norm")
 @symbolic_helper.parse_args("v", "v", "i")
 def frobenius_norm(g: jit_utils.GraphContext, self, dim=None, keepdim=False):
+    # [FUNCTION DOC]
+    # Symbolic for the Frobenius norm. If dim is a constant empty list, emits ReduceL2 over all
+    # elements without keeping dims. Otherwise squares the input, sums over dim with the
+    # keepdim flag, and takes the square root.
     dim_val = symbolic_helper._maybe_get_const(dim, "is")
     if not symbolic_helper._is_value(dim_val) and len(dim_val) == 0:
         return g.op("ReduceL2", self, keepdims_i=0)
@@ -61,6 +79,14 @@ def frobenius_norm(g: jit_utils.GraphContext, self, dim=None, keepdim=False):
 @_onnx_symbolic("aten::split")
 @symbolic_helper.parse_args("v", "v", "i", "i")
 def split(g: jit_utils.GraphContext, self, split_size_or_sizes, dim, _outputs=None):
+    # [FUNCTION DOC]
+    # Symbolic for split along dim. When the split spec is dynamic, emits SplitToSequence; with an
+    # unknown output count returns the sequence, with a packed list of the same length as the
+    # outputs builds one Slice per output, otherwise extracts each output with SequenceAt. When
+    # static: a tensor of sizes becomes a Split op; an integer size is expanded to a list of
+    # equal chunks plus a leftover chunk, using the known dim size (or size times outputs if
+    # unknown). Raises a symbolic value error if the dim size and output count are both unknown.
+    # Returns one value or a list of values.
     if not symbolic_helper._is_split_static(split_size_or_sizes, _outputs):
         split_out = g.op("SplitToSequence", self, split_size_or_sizes, axis_i=dim)
         if _outputs is None:
@@ -119,6 +145,8 @@ def split(g: jit_utils.GraphContext, self, split_size_or_sizes, dim, _outputs=No
 
 @_onnx_symbolic("aten::split_with_sizes")
 def split_with_sizes(g: jit_utils.GraphContext, self, split_sizes, dim, _outputs=None):
+    # [FUNCTION DOC]
+    # Symbolic for split_with_sizes; forwards to the split handler.
     return split(g, self, split_sizes, dim, _outputs)
 
 
@@ -126,6 +154,8 @@ def split_with_sizes(g: jit_utils.GraphContext, self, split_sizes, dim, _outputs
 def unsafe_split(
     g: jit_utils.GraphContext, self, split_size_or_sizes, dim, _outputs=None
 ):
+    # [FUNCTION DOC]
+    # Symbolic for unsafe_split; forwards to the split handler.
     return split(g, self, split_size_or_sizes, dim, _outputs)
 
 
@@ -133,6 +163,8 @@ def unsafe_split(
 def unsafe_split_with_sizes(
     g: jit_utils.GraphContext, self, split_sizes, dim, _outputs=None
 ):
+    # [FUNCTION DOC]
+    # Symbolic for unsafe_split_with_sizes; forwards to the split_with_sizes handler.
     return split_with_sizes(g, self, split_sizes, dim, _outputs)
 
 
@@ -141,6 +173,13 @@ def unsafe_split_with_sizes(
 def tensor_split(
     g: jit_utils.GraphContext, self, indices_or_sections, dim, _outputs=None
 ):
+    # [FUNCTION DOC]
+    # Symbolic for tensor_split along dim. Static case: a tensor of indices becomes Slice ops
+    # between consecutive indices (needs a known output count, else raises an assertion error);
+    # an integer section count becomes a Split with sizes where the first remainder chunks are one
+    # larger. Dynamic 1-D indices: a Loop slices pieces into a sequence, then appends the last
+    # slice. Dynamic scalar sections: computes the split sizes with graph arithmetic and emits
+    # SplitToSequence or Split. Raises a symbolic value error when sizes are unknown.
     axis = g.op("Constant", value_t=torch.tensor(dim, dtype=torch.long))
     axis = opset11.unsqueeze(g, axis, 0)
     const_1 = g.op("Constant", value_t=torch.tensor(1, dtype=torch.long))
@@ -279,6 +318,10 @@ def tensor_split(
 @_onnx_symbolic("aten::unbind")
 @symbolic_helper.parse_args("v", "i", "i")
 def unbind(g: jit_utils.GraphContext, self, dim=0, _outputs=None):
+    # [FUNCTION DOC]
+    # Symbolic for unbind along dim. With an unknown output count, emits SplitToSequence with
+    # unit pieces and no kept dim. Otherwise splits into unit pieces, squeezes dim from each, and
+    # returns the list (a single output is wrapped in a list first).
     if _outputs is None:
         return g.op(
             "SplitToSequence",
@@ -301,12 +344,18 @@ def unbind(g: jit_utils.GraphContext, self, dim=0, _outputs=None):
 @_onnx_symbolic("aten::nonzero_numpy")
 # Emitted from `torch.nonzero(x, as_tuple=True)`
 def nonzero_numpy(g: jit_utils.GraphContext, input, _outputs=None):
+    # [FUNCTION DOC]
+    # Symbolic for the tuple form of nonzero: unbinds the nonzero index matrix along dim 1.
     return unbind(g, opset9.nonzero(g, input), 1, _outputs=_outputs)
 
 
 @_onnx_symbolic("aten::where")
 @symbolic_helper.parse_args("v", "v", "v", "i")
 def where(g: jit_utils.GraphContext, condition, self=None, other=None, _outputs=None):
+    # [FUNCTION DOC]
+    # Symbolic for where. Casts a non-bool condition to bool. With no self argument, behaves
+    # like the single-argument form: computes nonzero indices and unbinds them along dim 1.
+    # Otherwise emits the Where op on condition, self and other.
     # Assumes that torch.where's first argument takes only Bool and Byte tensors.
     if not symbolic_helper._is_bool(condition):
         condition = g.op("Cast", condition, to_i=_C_onnx.TensorProtoDataType.BOOL)
@@ -330,6 +379,11 @@ def fake_quantize_per_channel_affine(
     quant_min=-128,
     quant_max=127,
 ):
+    # [FUNCTION DOC]
+    # Symbolic for per-channel fake quantization, as QuantizeLinear then DequantizeLinear along
+    # axis. Raises a symbolic value error unless the (min, max) pair is (0, 255), (-128, 127) or
+    # (0, 127). Zero point is cast to uint8 when min is 0, else int8; for the (0, 127) case the
+    # quantized value is clipped to at most 127. Returns the dequantized value.
     # NOTE: (0, 127) is allowed as special case. PyTorch restricts activations to be in the range (0, 127).
     #   https://github.com/pytorch/pytorch/blob/b34b192d6b97325c9f78e5995c48c8498ede34bd/torch/ao/quantization/observer.py#L1422
     if (quant_min, quant_max) not in [(0, 255), (-128, 127), (0, 127)]:
@@ -364,6 +418,11 @@ def fake_quantize_per_tensor_affine(
     quant_min=-128,
     quant_max=127,
 ):
+    # [FUNCTION DOC]
+    # Symbolic for per-tensor fake quantization, as QuantizeLinear then DequantizeLinear. Same
+    # (min, max) validation, zero point casting and (0, 127) clipping as the per-channel
+    # version, and also casts scale to float if it is not already float. Returns the dequantized
+    # value.
     # NOTE: (0, 127) is allowed as special case. PyTorch restricts activations to be in the range (0, 127).
     #   https://github.com/pytorch/pytorch/blob/b34b192d6b97325c9f78e5995c48c8498ede34bd/torch/ao/quantization/observer.py#L1422
     if (quant_min, quant_max) not in [(0, 255), (-128, 127), (0, 127)]:
@@ -393,7 +452,12 @@ def fake_quantize_per_tensor_affine(
 
 
 def _reduce_op_symbolic(onnx_op_name):
+    # [FUNCTION DOC] HELPER: Returns a symbolic function for a reduce op taking axes as an input.
+    # The returned function reduces over all dims when dim is none, else emits the named op with
+    # dim as the axes input and keepdim read as a constant.
     def symbolic(g, self, dim=None, keepdim=None):
+        # [FUNCTION DOC] HELPER: Casts the input if the reduce op needs it, then emits the
+        # reduction (all-reduce path when dim is none). Returns the graph value.
         self = symbolic_helper._maybe_cast_reduce_op_input(g, self)
         if dim is None:
             # all-reduce path
@@ -410,12 +474,19 @@ def _reduce_op_symbolic(onnx_op_name):
     decorate=[symbolic_helper._apply_params("ReduceSum", "sum")],
 )
 def _reduce_with_dtype(onnx_op, name):
+    # [FUNCTION DOC] HELPER: Factory registered for sum. Builds a reduce symbolic for the given
+    # ONNX op and returns an overloaded function chosen by argument count: the no-dim form or
+    # the dim form, each accepting an optional dtype.
     symbolic = _reduce_op_symbolic(onnx_op)
 
     @symbolic_helper._overload_by_arg_count
     def reduce(g, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Returns the pair of overload implementations (no dim, with dim).
         @symbolic_helper.parse_args("v", "none")
         def reduce_nodim(g, self, dtype):
+            # [FUNCTION DOC] HELPER: Reduces over all dims. If dtype is a constant, casts the
+            # input to it first and casts the result back if its type differs; if dtype is a
+            # non-constant value reports unimplemented. Returns the reduced value.
             dtype_onnx = None
             if dtype.node().kind() == "onnx::Constant":
                 dtype = symbolic_helper._get_const(dtype, "i", "dtype")
@@ -434,6 +505,8 @@ def _reduce_with_dtype(onnx_op, name):
 
         @symbolic_helper.parse_args("v", "v", "i", "none")
         def reduce_dim(g, self, dim, keepdim, dtype):
+            # [FUNCTION DOC] HELPER: Same as the no-dim form but reduces over the given dim with
+            # the keepdim flag.
             dtype_onnx = None
             if dtype.node().kind() == "onnx::Constant":
                 dtype = symbolic_helper._get_const(dtype, "i", "dtype")
@@ -460,6 +533,11 @@ def _reduce_with_dtype(onnx_op, name):
 # NOTE: Supporting aten::unflatten before opset13 needs helper function to adjust ONNX op changes in Concat, Slice, ...
 @_onnx_symbolic("aten::unflatten")
 def unflatten(g: jit_utils.GraphContext, input, dim, unflattened_size):
+    # [FUNCTION DOC]
+    # Symbolic for unflatten. Requires a known input rank (otherwise reports unimplemented).
+    # Normalizes a possibly negative dim by adding the rank and taking the modulus, then builds the
+    # new shape by concatenating the dims before dim, the given unflattened sizes, and the dims
+    # after dim, and reshapes the input to it.
     input_dim = symbolic_helper._get_tensor_rank(input)
     if input_dim is None:
         return symbolic_helper._unimplemented(
@@ -504,6 +582,13 @@ def unflatten(g: jit_utils.GraphContext, input, dim, unflattened_size):
 @_onnx_symbolic("aten::unsafe_chunk")
 @symbolic_helper.parse_args("v", "i", "i", "i")
 def unsafe_chunk(g: jit_utils.GraphContext, self, chunks, dim, _outputs=None):
+    # [FUNCTION DOC]
+    # Symbolic for unsafe_chunk. With an unknown output count, emits SplitToSequence with unit
+    # pieces. Otherwise needs a known dim size (reports unimplemented if unknown), computes the
+    # chunk size as the ceiling of size over chunks, builds a list of equal chunks plus a
+    # leftover, and emits a constant-sized Split.
+    # KNOWN ISSUE: the unknown-output path ignores the chunks argument and splits into pieces of
+    # size one, which differs from chunk semantics.
     if _outputs is None:
         return g.op(
             "SplitToSequence",
@@ -531,6 +616,10 @@ def unsafe_chunk(g: jit_utils.GraphContext, self, chunks, dim, _outputs=None):
 
 @_onnx_symbolic("aten::tile")
 def tile(g: jit_utils.GraphContext, self, dims):
+    # [FUNCTION DOC]
+    # Symbolic for tile. Compares ranks at graph run time: if dims is shorter than the input
+    # rank, left-pads dims with ones (inside an If); if dims is longer, reshapes the input with
+    # extra leading ones (inside a second If). Casts dims to int64 and emits Tile.
     self_shape = g.op("Shape", self)
     self_rank = g.op("Size", self_shape)
     dims_rank = g.op("Size", dims)
@@ -588,6 +677,14 @@ def tile(g: jit_utils.GraphContext, self, dims):
 def repeat_interleave(
     g: jit_utils.GraphContext, self, repeats, dim=None, output_size=None
 ):
+    # [FUNCTION DOC]
+    # Symbolic for repeat_interleave. Raises a symbolic value error when the rank or size of
+    # repeats, or the input size, is unknown. With no dim, flattens the input and uses dim 0;
+    # negative dim is normalized. A scalar or single-element repeats uses the single value
+    # helper. If the dim size or repeats are not static, builds a Loop that splits input and
+    # repeats along dim, expands and reshapes each piece, collects them in a sequence and
+    # concatenates it; if both are static with several repeats, delegates to the opset 9 version.
+    # The output_size argument is ignored.
     repeats_dim = symbolic_helper._get_tensor_rank(repeats)
     repeats_sizes = symbolic_helper._get_tensor_sizes(repeats)
     input_sizes = symbolic_helper._get_tensor_sizes(self)
@@ -728,6 +825,13 @@ def repeat_interleave(
 @_onnx_symbolic("aten::diagonal")
 @symbolic_helper.parse_args("v", "i", "i", "i")
 def diagonal(g: jit_utils.GraphContext, self, offset, dim1, dim2):
+    # [FUNCTION DOC]
+    # Symbolic for diagonal. Requires a known input rank (otherwise reports unimplemented, after
+    # already emitting some mask ops). Moves dim1 and dim2 to the end, multiplies by an identity
+    # mask shifted by offset and sums over the last dim to isolate diagonal values, then
+    # computes the diagonal length and gather indices from the offset. An If on whether the
+    # length is nonzero chooses between a GatherND of the diagonal and an empty zeros tensor
+    # (diagonal overrun). Returns the If output.
     rank = symbolic_helper._get_tensor_rank(self)
     # Replace negative indexing when rank is known
     if rank is not None:
@@ -852,6 +956,10 @@ def diagonal(g: jit_utils.GraphContext, self, offset, dim1, dim2):
 def quantized_linear(
     g: jit_utils.GraphContext, q_input, q_weight, bias, op_scale, op_zero_point
 ):
+    # [FUNCTION DOC]
+    # Symbolic for quantized linear: dequantizes input and weight, requantizes the bias using
+    # their scales and dequantizes it, applies the opset 9 linear, and quantizes the output
+    # with op_scale and op_zero_point. Returns the quantized value.
     input, input_scale, _, _ = symbolic_helper.dequantize_helper(g, q_input)
     weight, weight_scale, _, axis = symbolic_helper.dequantize_helper(g, q_weight)
     q_bias = symbolic_helper.requantize_bias_helper(
@@ -868,6 +976,9 @@ def quantized_linear(
 def quantized_linear_relu(
     g: jit_utils.GraphContext, q_input, q_weight, bias, op_scale, op_zero_point
 ):
+    # [FUNCTION DOC]
+    # Symbolic for quantized linear followed by relu: same as quantized linear, with a relu
+    # applied to the float output before quantizing.
     input, input_scale, _, _ = symbolic_helper.dequantize_helper(g, q_input)
     weight, weight_scale, _, axis = symbolic_helper.dequantize_helper(g, q_weight)
     q_bias = symbolic_helper.requantize_bias_helper(
@@ -894,6 +1005,9 @@ def quantized_conv1d_relu(
     op_scale,
     op_zero_point,
 ):
+    # [FUNCTION DOC]
+    # Symbolic for quantized conv1d with relu: dequantizes input and weight, requantizes and
+    # dequantizes the bias, applies the opset 9 conv1d then relu, and quantizes the output.
     input, input_scale, _, _ = symbolic_helper.dequantize_helper(g, q_input)
     weight, weight_scale, _, axis = symbolic_helper.dequantize_helper(g, q_weight)
     q_bias = symbolic_helper.requantize_bias_helper(
@@ -920,6 +1034,9 @@ def quantized_conv2d_relu(
     op_scale,
     op_zero_point,
 ):
+    # [FUNCTION DOC]
+    # Symbolic for quantized conv2d with relu: dequantizes input and weight, requantizes and
+    # dequantizes the bias, applies the opset 9 conv2d then relu, and quantizes the output.
     input, input_scale, _, _ = symbolic_helper.dequantize_helper(g, q_input)
     weight, weight_scale, _, axis = symbolic_helper.dequantize_helper(g, q_weight)
     q_bias = symbolic_helper.requantize_bias_helper(
@@ -946,6 +1063,9 @@ def quantized_conv3d_relu(
     op_scale,
     op_zero_point,
 ):
+    # [FUNCTION DOC]
+    # Symbolic for quantized conv3d with relu: dequantizes input and weight, requantizes and
+    # dequantizes the bias, applies the opset 9 conv3d then relu, and quantizes the output.
     input, input_scale, _, _ = symbolic_helper.dequantize_helper(g, q_input)
     weight, weight_scale, _, axis = symbolic_helper.dequantize_helper(g, q_weight)
     q_bias = symbolic_helper.requantize_bias_helper(
@@ -972,6 +1092,9 @@ def quantized_conv1d(
     op_scale,
     op_zero_point,
 ):
+    # [FUNCTION DOC]
+    # Symbolic for quantized conv1d: dequantizes input and weight, requantizes and dequantizes
+    # the bias, applies the opset 9 conv1d, and quantizes the output.
     input, input_scale, _, _ = symbolic_helper.dequantize_helper(g, q_input)
     weight, weight_scale, _, axis = symbolic_helper.dequantize_helper(g, q_weight)
     q_bias = symbolic_helper.requantize_bias_helper(
@@ -997,6 +1120,9 @@ def quantized_conv2d(
     op_scale,
     op_zero_point,
 ):
+    # [FUNCTION DOC]
+    # Symbolic for quantized conv2d: dequantizes input and weight, requantizes and dequantizes
+    # the bias, applies the opset 9 conv2d, and quantizes the output.
     input, input_scale, _, _ = symbolic_helper.dequantize_helper(g, q_input)
     weight, weight_scale, _, axis = symbolic_helper.dequantize_helper(g, q_weight)
     q_bias = symbolic_helper.requantize_bias_helper(
@@ -1022,6 +1148,9 @@ def quantized_conv3d(
     op_scale,
     op_zero_point,
 ):
+    # [FUNCTION DOC]
+    # Symbolic for quantized conv3d: dequantizes input and weight, requantizes and dequantizes
+    # the bias, applies the opset 9 conv3d, and quantizes the output.
     input, input_scale, _, _ = symbolic_helper.dequantize_helper(g, q_input)
     weight, weight_scale, _, axis = symbolic_helper.dequantize_helper(g, q_weight)
     q_bias = symbolic_helper.requantize_bias_helper(
@@ -1048,6 +1177,10 @@ def quantized_conv_transpose1d(
     op_scale,
     op_zero_point,
 ):
+    # [FUNCTION DOC]
+    # Symbolic for quantized conv_transpose1d: dequantizes input and weight, requantizes and
+    # dequantizes the bias, applies a float transposed convolution, and quantizes the output.
+    # KNOWN ISSUE: calls the opset 9 conv_transpose2d handler rather than a 1d one.
     input, input_scale, _, _ = symbolic_helper.dequantize_helper(g, q_input)
     weight, weight_scale, _, axis = symbolic_helper.dequantize_helper(g, q_weight)
     q_bias = symbolic_helper.requantize_bias_helper(
@@ -1076,6 +1209,9 @@ def quantized_conv_transpose2d(
     op_scale,
     op_zero_point,
 ):
+    # [FUNCTION DOC]
+    # Symbolic for quantized conv_transpose2d: dequantizes input and weight, requantizes and
+    # dequantizes the bias, applies the opset 9 conv_transpose2d, and quantizes the output.
     input, input_scale, _, _ = symbolic_helper.dequantize_helper(g, q_input)
     weight, weight_scale, _, axis = symbolic_helper.dequantize_helper(g, q_weight)
     q_bias = symbolic_helper.requantize_bias_helper(
@@ -1104,6 +1240,9 @@ def quantized_conv_transpose3d(
     op_scale,
     op_zero_point,
 ):
+    # [FUNCTION DOC]
+    # Symbolic for quantized conv_transpose3d: dequantizes input and weight, requantizes and
+    # dequantizes the bias, applies the opset 9 conv_transpose3d, and quantizes the output.
     input, input_scale, _, _ = symbolic_helper.dequantize_helper(g, q_input)
     weight, weight_scale, _, axis = symbolic_helper.dequantize_helper(g, q_weight)
     q_bias = symbolic_helper.requantize_bias_helper(
