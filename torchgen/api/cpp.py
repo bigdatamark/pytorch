@@ -1,3 +1,9 @@
+# [MODULE DOC] Translates JIT schemas to the public C++ API (what users call as at::add and
+# friends). Provides function naming, mapping of schema types to named C++ types for
+# arguments and returns, return-name selection, conversion of schema default values to C++
+# expressions, and construction of Binding lists (tensor options collapsed into one options
+# argument unless the faithful form is requested). Also defines the JIT_TO_CPP_DEFAULT
+# table of literal translations. No import-time side effects beyond defining that table.
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -78,6 +84,9 @@ def name(
     faithful_name_for_out_overloads: bool = False,
     symint_overload: bool = False,
 ) -> str:
+    # [FUNCTION DOC] Returns the C++ API function name: the base operator name, with a
+    # symint suffix if requested, and an out suffix for out variants (an outf suffix when
+    # the faithful out-overload name is requested). Pure.
     name = str(func.name.name)
     if symint_overload:
         name += "_symint"
@@ -100,6 +109,11 @@ def valuetype_type(
     mutable: bool = True,
     symint: bool = False,
 ) -> NamedCType | None:
+    # [FUNCTION DOC] Maps a "value type" (same form for arguments and returns) to a named
+    # C++ type, or returns None if the type is not a value type (tensor, scalar, or a list
+    # other than a fixed-size bool list). SymInt maps to the symbolic or long type per the
+    # symint flag; optionals wrap the element mapping; fixed-size bool lists become arrays.
+    # Raises an error for a bool list without a size or for an unrecognized type.
     if isinstance(t, BaseType):
         if t.name in (BaseTy.Tensor, BaseTy.Scalar):
             return None
@@ -138,6 +152,15 @@ def argumenttype_type(
     remove_non_owning_ref_types: bool = False,
     symint: bool = False,
 ) -> NamedCType:
+    # [FUNCTION DOC] Maps a schema type occurring in an argument to a named C++ argument
+    # type. Value types go through the value type mapping first; tensors and scalars
+    # become const references (a mutable reference for mutable tensors unless the local
+    # const-ref flag is set); optionals, int and SymInt lists, tensor lists and other lists
+    # have special cases. With remove_non_owning_ref_types, owning types are returned
+    # (vector instead of array reference, value instead of const reference). Raises an
+    # error for unrecognized types.
+    # KNOWN ISSUE: the generic optional and list fallbacks recurse without passing
+    # remove_non_owning_ref_types, so that flag is lost for nested element types.
     # If it's a value type, do the value type translation
     r = valuetype_type(
         t,
@@ -224,6 +247,7 @@ def argumenttype_type(
 
 # Translate a JIT argument into its C++ type
 def argument_type(a: Argument, *, binds: ArgName, symint: bool = False) -> NamedCType:
+    # [FUNCTION DOC] Returns the named C++ type of an Argument, mutable if it is written to.
     return argumenttype_type(a.type, mutable=a.is_write, symint=symint, binds=binds)
 
 
@@ -233,6 +257,11 @@ def argument_type(a: Argument, *, binds: ArgName, symint: bool = False) -> Named
 # e.g. a function with a return type of 'void' has 0 return names,
 # and a function with a return type of 'std::tuple' has >1 return name.
 def returntype_type(t: Type, *, mutable: bool, symint: bool = False) -> CType:
+    # [FUNCTION DOC] Maps a single (non-multi) return schema type to a C++ type (an unnamed
+    # CType). Value types are mapped with SymInt always respected (the symint argument is
+    # ignored). Mutable tensors return a reference (const or mutable per local flag), other
+    # tensors by value; lists become vectors; optional tensors become optionals. Raises an
+    # error for mutable lists, fixed-size lists, or any unsupported type.
     # placeholder is ignored
     # NB: symint is ALWAYS respected for return types.  So symint argument
     # here is IGNORED
@@ -275,11 +304,14 @@ def returntype_type(t: Type, *, mutable: bool, symint: bool = False) -> CType:
 
 # Translation of a single return to its C++ type
 def return_type(r: Return, *, symint: bool = False) -> CType:
+    # [FUNCTION DOC] Returns the C++ type of one Return, mutable if it is written to.
     return returntype_type(r.type, mutable=r.is_write, symint=symint)
 
 
 # Translation of a full (possibly multi) return from JIT to its C++ type
 def returns_type(rs: Sequence[Return], *, symint: bool = False) -> CType:
+    # [FUNCTION DOC] Returns the C++ type for all returns: void for none, the single return
+    # type for one, and a tuple of the per-return types for several.
     if len(rs) == 0:
         return BaseCType(voidT)
     elif len(rs) == 1:
@@ -289,6 +321,11 @@ def returns_type(rs: Sequence[Return], *, symint: bool = False) -> CType:
 
 
 def return_names(f: NativeFunction, *, fallback_name: str = "result") -> Sequence[str]:
+    # [FUNCTION DOC] Returns one C++ variable name per return of a native function. Inplace
+    # functions name their single return self; out functions use the matching out argument
+    # name; explicitly named returns keep their name (suffixed with return if it collides
+    # with an argument name); otherwise fallback_name is used, indexed from zero when there
+    # are several returns. Raises an error for an inplace function with multiple returns.
     returns: list[str] = []
     for i, r in enumerate(f.func.returns):
         # If we have an inplace function, the return argument is
@@ -334,6 +371,12 @@ JIT_TO_CPP_DEFAULT = {
 
 # Convert a JIT default into C++ expression representing the default
 def default_expr(d: str, t: Type, *, symint: bool) -> str:
+    # [FUNCTION DOC] Converts a schema default value string to a C++ expression for the
+    # given type. Optional tensor None becomes empty braces; string defaults are re-quoted
+    # with double quotes and escapes adjusted; optional None becomes nullopt; bracketed list
+    # defaults become brace initializers; a digit default for a SymInt list becomes a SymInt
+    # construction when symint is set; other values use the literal translation table or
+    # pass through. Raises ValueError for an unsized list type whose default is not bracketed.
     if d == "None" and str(t) == "Tensor?":
         return "{}"
     if isinstance(t, BaseType) and t.name is BaseTy.str:
@@ -387,9 +430,17 @@ def argument(
     symint: bool = False,
     has_tensor_options: bool,
 ) -> list[Binding]:
+    # [FUNCTION DOC] Builds the Bindings for one schema argument in the C++ API. A plain
+    # argument yields one Binding with a C++ default unless excluded by cpp_no_default_args
+    # (memory_format is marked possibly redundant when tensor options exist). Tensor options
+    # expand to four faithful bindings, or collapse into a single options binding with a
+    # default depending on the member defaults. A self argument yields nothing for methods
+    # (implicit this), else its inner argument. Raises an error if options is in
+    # cpp_no_default_args.
     def sub_argument(
         a: Argument | TensorOptionsArguments | SelfArgument,
     ) -> list[Binding]:
+        # [FUNCTION DOC] HELPER: Recursive call of argument with the same settings.
         return argument(
             a,
             cpp_no_default_args=cpp_no_default_args,
@@ -459,6 +510,9 @@ def arguments(
     method: bool,
     cpp_no_default_args: set[str],
 ) -> list[Binding]:
+    # [FUNCTION DOC] Returns Bindings for all arguments of a schema. Faithful order puts
+    # non-out arguments first then out arguments, and strips defaults; the non-faithful
+    # (public) order puts out arguments first and keeps defaults.
     args: list[Argument | TensorOptionsArguments | SelfArgument] = []
     if faithful:
         args.extend(arguments.non_out)

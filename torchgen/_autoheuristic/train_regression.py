@@ -1,4 +1,10 @@
 # mypy: ignore-errors
+# [MODULE DOC] Training script for AutoHeuristic regression-tree heuristics. Defines
+# AHTrainRegressionTree, which learns a decision tree regressor predicting a per-choice
+# score from AutoHeuristic logs and emits a Python heuristic class file. Requires numpy,
+# pandas, scipy, scikit-learn and the sibling train module (imported as a top-level name).
+# Import-time side effect: installs two global warning filters that silence pandas
+# deprecation warnings. Running as a script builds the base trainer and generates a heuristic.
 
 import warnings
 
@@ -24,6 +30,11 @@ warnings.filterwarnings(
 
 
 class AHTrainRegressionTree(AHTrain):
+    # [CLASS DOC] Trainer that learns a regression tree scoring each (input, choice) pair
+    # (higher means a better choice) and writes the tree out as generated heuristic code.
+    # Stateless itself; relies on AHTrain for log parsing, categorical handling, dataset
+    # loading and file writing. Key methods: main (full pipeline), get_df, custom_train_test_split,
+    # train_and_evaluate_models (grid search), evaluate_model, dt_to_python (codegen).
     """
     This class is responsible for generating a heuristic by using data collected with AutoHeuristic. It will learn a
     regression tree that predicts a score that represents how well a specific choice will perform given an input.
@@ -32,6 +43,7 @@ class AHTrainRegressionTree(AHTrain):
     """
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Delegates to the base trainer constructor; adds no state.
         super().__init__()
 
     def main(
@@ -43,6 +55,12 @@ class AHTrainRegressionTree(AHTrain):
         save_dot=False,
         ranking=False,
     ):
+        # [FUNCTION DOC] Runs the whole pipeline: loads and filters the log into a dataframe,
+        # splits it into train/val/test, adds user-supplied extra datasets, grid-searches
+        # tree depth and leaf size, prints result tables (overall and per dataset, sorted by
+        # correct count), then generates the heuristic source file named after
+        # heuristic_name. Side effects: console output and a written heuristic file.
+        # KNOWN ISSUE: save_dot and ranking parameters are accepted but never used.
         """
         Main function that trains a decision tree and generates a heuristic.
         """
@@ -83,6 +101,13 @@ class AHTrainRegressionTree(AHTrain):
         )
 
     def get_df(self, log_path, cat_feature2cats=None, nrows=None, apply_filters=False):
+        # [FUNCTION DOC] Parses the log (optionally limited to nrows rows) and returns a tuple
+        # of (processed dataframe, choices, categorical feature to categories mapping,
+        # dummy column to original column/value mapping, metadata). For each input and
+        # choice it computes count, median feedback and relative std; with apply_filters it
+        # drops unstable measurements and inputs with fewer than two valid choices. Per input
+        # it adds winner, speedup (max/min time) and target (mean time / choice time).
+        # Then adds new features and one-hot encodes categorical features, including choice.
         """
         Parses the log file and processes the data into a dataframe that can be used for training.
         """
@@ -97,8 +122,15 @@ class AHTrainRegressionTree(AHTrain):
             min_count_measurements=3,
             max_relative_std=5,
         ):
+            # [FUNCTION DOC] HELPER: Aggregates raw measurements per (features, choice) into
+            # count, median time and relative std, optionally filters unstable data (count
+            # below min_count_measurements, relative std above max_relative_std, inputs with
+            # fewer than two choices left), then per input computes winner, speedup and target.
+            # Returns the resulting dataframe with a fresh index.
             # Calculate statistics for each input and choice combination
             def calculate_stats(group):
+                # [FUNCTION DOC] HELPER: Returns a series with measurement count, median
+                # feedback and relative std in percent (infinite if the mean is zero).
                 count = len(group)
                 mean = group[FEEDBACK_COL].mean()
                 std = group[FEEDBACK_COL].std()
@@ -133,6 +165,9 @@ class AHTrainRegressionTree(AHTrain):
 
             # Compute the winner and ratios for each input
             def get_winner_and_speedups(group):
+                # [FUNCTION DOC] HELPER: For one input's rows, sets winner (fastest choice),
+                # speedup (slowest/fastest median time) and target (mean time divided by the
+                # row's time) and returns the feature, choice and new columns. Mutates group.
                 mean_time = group["median_execution_time"].mean()
                 winner = group.loc[group["median_execution_time"].idxmin(), CHOICE_COL]
                 min_time = group["median_execution_time"].min()
@@ -171,6 +206,11 @@ class AHTrainRegressionTree(AHTrain):
     def custom_train_test_split(
         self, df, test_size=0.2, val_size=0.25, random_state=42
     ):
+        # [FUNCTION DOC] Splits by unique input (grouping rows of the same input across
+        # choices) into test (test_size), then val (val_size of the remainder) and train,
+        # with a fixed random seed. Returns (train, val, test dataframes, feature column
+        # names). Side effect: temporarily adds an input_id column to df (left on the
+        # caller's dataframe); returned frames do not contain it.
         """
         Splits the dataframe into train, val, and test sets.
         Also adds other datasets, specified by the user, to the train set.
@@ -229,6 +269,13 @@ class AHTrainRegressionTree(AHTrain):
         min_samples_leafs,
         threshold=0.99,
     ):
+        # [FUNCTION DOC] Grid search over tree depth and minimum leaf size. For each model
+        # fit on the train set, derives a safe threshold from the val set (the largest
+        # confidence ratio among wrong predictions), evaluates every dataset with it, and
+        # keeps the model with the most correct val predictions. Returns (results
+        # dataframe, best model, its threshold). Prints progress.
+        # KNOWN ISSUE: if there are no wrong predictions the safe threshold is NaN, so no
+        # prediction is ever marked unsure; also best_model stays None if no val data exists.
         """
         Does a grid search over max_depths, min_samples_leafs, and returns the best model.
         """
@@ -290,11 +337,19 @@ class AHTrainRegressionTree(AHTrain):
         return (pd.DataFrame(results), best_model, best_model_threshold)
 
     def evaluate_model(self, model, df, feature_columns, choice_columns, threshold):
+        # [FUNCTION DOC] Evaluates the tree on a dataframe, per input. Predicts a score for
+        # each choice, picks the best, and answers unsure if the ratio of best to second-best
+        # score is not above threshold. Returns a mapping with counts of correct, wrong and
+        # unsure inputs, total, max and geometric-mean speedup over wrong predictions (NaN if
+        # none) and the largest confidence ratio among wrong predictions.
         """
         Custom evaluation function that evaluates a learned decision tree.
         """
 
         def predict_winner(group):
+            # [FUNCTION DOC] HELPER: Predicts the winner for one input group and returns a
+            # series with predicted winner (or unsure), top-to-second prediction ratio, actual
+            # winner, correctness (true, false or the string unsure) and the group speedup.
             predictions = model.predict(group[feature_columns + choice_columns])
 
             # Find the index of the maximum prediction (best choice)
@@ -375,6 +430,11 @@ class AHTrainRegressionTree(AHTrain):
         threshold,
         unsafe_leaves=None,
     ):
+        # [FUNCTION DOC] Generates the heuristic source: a boilerplate class, a predict method
+        # and a nested if/else body mirroring the fitted tree (categorical dummy columns test
+        # for inequality with their value, others compare with the split threshold; leaves
+        # return the predicted value), then writes it to file under heuristic_name. Raises an
+        # error if a categorical split threshold is not 0.5. Side effect: file write.
         tree_ = dt.tree_
         feature_name = [
             feature_names[i] if i != -1 else "undefined!" for i in tree_.feature
@@ -398,6 +458,11 @@ class AHTrainRegressionTree(AHTrain):
         lines.append(fn_def)
 
         def dt_to_python(node, depth):
+            # [FUNCTION DOC] HELPER: Recursively appends source lines for a tree node at the
+            # given nesting depth: a condition with left subtree, else, right subtree for
+            # internal nodes, or the leaf return line. Mutates lines. Raises an error for a
+            # categorical split with a non-0.5 threshold.
+            # KNOWN ISSUE: local variable threshold shadows the outer confidence threshold.
             indent = "    " * (depth + 1)
             if tree_.feature[node] != -2:
                 name = feature_name[node]
@@ -425,6 +490,8 @@ class AHTrainRegressionTree(AHTrain):
         self.write_heuristic_to_file(lines, heuristic_name)
 
     def handle_leaf(self, tree_, node, indent, unsafe_leaves):
+        # [FUNCTION DOC] Returns the source line for a leaf: a return of the tree's predicted
+        # value at that node. unsafe_leaves is unused here (kept for the base interface).
         """
         Generates the code for a leaf node. This is just the value predicted by the regression tree.
         """
@@ -432,11 +499,18 @@ class AHTrainRegressionTree(AHTrain):
         return f"{indent}return {str(value)}"
 
     def gen_predict_fn_def(self):
+        # [FUNCTION DOC] Returns the generated predict method signature line, which takes a
+        # context and returns a float score.
         return "def predict(self, context: AHContext) -> float:"
 
     def codegen_boilerplate(
         self, heuristic_name, opt_name, threshold, shared_memory, device_capa, classes
     ):
+        # [FUNCTION DOC] Returns the text of the generated module header: lint-suppression
+        # comments, imports, a regression heuristic class named heuristic_name with the
+        # precondition (from shared_memory and device_capa), get_feedback (sets the choice in
+        # the context and calls predict), the confidence threshold and the optimization name.
+        # The classes argument is unused.
         """
         Generates the boilerplate code for the generated heuristic. This includes things like imports, class definition,
         etc.
@@ -471,6 +545,8 @@ class {heuristic_name}(LearnedHeuristicRegression):
         return boiler_plate
 
 
+# KNOWN ISSUE: the script entry point builds the base AHTrain rather than
+# AHTrainRegressionTree, so running this file does not use the regression logic above.
 if __name__ == "__main__":
     train = AHTrain()
     train.generate_heuristic()

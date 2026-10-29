@@ -1,3 +1,10 @@
+# [MODULE DOC] Lazy tensor codegen API: translates native function schemas into the
+# schema form used for lazy IR nodes. Provides the configurable lazy Value C++ type
+# (getValueT/setValueT, must be set before use), type conversion from schema types to lazy
+# C++ types, type predicates, LazyArgument (derived per-argument properties),
+# LazyIrProperties (mutually exclusive codegen flag groups), and LazyIrSchema (positional
+# and keyword lazy arguments, generator argument, naming helpers, filtered views).
+# Import-time effect: defines module global _valueT (initially unset) and tensorListValueT.
 from __future__ import annotations
 
 from typing import Any
@@ -48,6 +55,8 @@ _valueT: BaseCppType | None = None
 # have different IR representations.  (Though, arguably, after unification they
 # shouldn't!)
 def getValueT() -> BaseCppType:
+    # [FUNCTION DOC] Returns the configured lazy Value C++ type from module global state.
+    # Raises NotImplementedError if setValueT has not been called yet.
     global _valueT
     if not _valueT:
         raise NotImplementedError(
@@ -58,6 +67,7 @@ def getValueT() -> BaseCppType:
 
 
 def setValueT(val: BaseCppType) -> None:
+    # [FUNCTION DOC] Sets the module global lazy Value C++ type used by all conversions.
     global _valueT
     _valueT = val
 
@@ -70,6 +80,13 @@ tensorListValueT = BaseCppType("torch::lazy", "Value")
 def process_ir_type(
     typ: Type, properties: LazyIrProperties, *, symint: bool
 ) -> BaseCType | VectorCType | OptionalCType | ListCType:
+    # [FUNCTION DOC] Converts a schema type to its lazy IR C++ type. Tensors (and Scalars
+    # unless treated as constants, and SymInt when symint is set) become the lazy Value
+    # type; other base types map to their plain C++ types; optionals wrap the element;
+    # tensor lists become the list Value type, optional tensor lists a list of optional
+    # Values, SymInt lists a vector of long, other lists a vector of the converted element.
+    # Raises an error for unsupported base types or unrecognized types; reads the global
+    # Value type (may raise NotImplementedError if unset).
     """
     This function takes a type from NativeFunctions and converts it for use with
     lazy tensor codegen.
@@ -150,6 +167,10 @@ def process_ir_type(
 # Invariant: passed typ should be an *owning* CType (e.g., we will report
 # that ArrayRef<Value> is NOT a value type)
 def isValueType(typ: CType, properties: LazyIrProperties | None = None) -> bool:
+    # [FUNCTION DOC] True if an already converted (owning) C++ type is Value-like: the lazy
+    # Value, SymInt, or Scalar (the latter only when scalars are not treated as constants),
+    # looking through optional, list and vector wrappers. A vector of SymInt is reported as
+    # not a value type. Reads the global Value type.
     """
     Given a type, determine if it is a Value-like type.  This is equivalent to
     being Tensor-like, but assumes the type has already been transformed.
@@ -172,10 +193,13 @@ def isValueType(typ: CType, properties: LazyIrProperties | None = None) -> bool:
 
 
 def isSymIntType(typ: Type) -> bool:
+    # [FUNCTION DOC] True if the schema type is exactly the SymInt base type.
     return isinstance(typ, BaseType) and typ.name == BaseTy.SymInt
 
 
 def isWrappedScalarType(typ: Type) -> bool:
+    # [FUNCTION DOC] True if the schema type is Scalar, looking through optional and list
+    # wrappers; such arguments are wrapped into lazy Values.
     """
     Given a type, determine if it is a c10::scalar which we will wrap in a lazy Value.
     Since we literally change the type from scalarT to valueT, information is lost.
@@ -192,6 +216,7 @@ def isWrappedScalarType(typ: Type) -> bool:
 
 # TODO: dedupe with Type.is_generator_like
 def isGeneratorType(typ: Type) -> bool:
+    # [FUNCTION DOC] True if the schema type is Generator, optionally wrapped in an optional.
     if isinstance(typ, BaseType):
         return typ.name == BaseTy.Generator
     elif isinstance(typ, (OptionalType)):
@@ -202,6 +227,12 @@ def isGeneratorType(typ: Type) -> bool:
 # This class caches a few derived properties computed from an Argument
 # and LazyIrProperties
 class LazyArgument:
+    # [CLASS DOC] Caches derived lazy-codegen properties of one schema Argument: name,
+    # original type, converted lazy C++ type, and flags for optional, generator, wrapped
+    # scalar, symint-or-optional-symint, and lazy-value-ness. Built once in the constructor
+    # and read-only afterwards (lazy_type raises if the type is unset).
+    # KNOWN ISSUE: is_optional is assigned in the constructor but not declared with the
+    # other class-level attribute annotations.
     name: str
     orig_type: Type
     lazy_type_: CType | None
@@ -219,6 +250,9 @@ class LazyArgument:
     def __init__(
         self, arg: Argument, properties: LazyIrProperties, *, symint: bool
     ) -> None:
+        # [FUNCTION DOC] Computes and stores all derived fields for the argument using the
+        # given properties and symint setting. May raise from process_ir_type for
+        # unsupported types, or NotImplementedError if the lazy Value type is unset.
         self.name = arg.name
         self.orig_type = arg.type
         self.symint = symint
@@ -237,6 +271,7 @@ class LazyArgument:
 
     @property
     def lazy_type(self) -> CType:
+        # [FUNCTION DOC] Returns the converted lazy C++ type; raises an error if unset.
         if self.lazy_type_ is None:
             raise AssertionError(
                 f"Attempted to access lazy_type for invalid argument {self.name}"
@@ -245,6 +280,12 @@ class LazyArgument:
 
 
 class LazyIrProperties:
+    # [CLASS DOC] Set of boolean codegen flags for a lazy IR node, grouped into mutually
+    # exclusive groups listed in Properties. State is a mapping from each group to the name
+    # of its single active flag (or none), held in the instance dict under properties.
+    # Flags are read and written as attributes: reading gives whether that flag is the
+    # active one in its group; writing true activates it (replacing the group's previous
+    # flag), writing false clears the group. Unknown names raise on write.
     """Collection of properties for an IR node
 
     The property groups are listed below. Each group is mutually
@@ -277,6 +318,8 @@ class LazyIrProperties:
     )
 
     def __init__(self, *default_properties: str) -> None:
+        # [FUNCTION DOC] Creates the group-to-active-flag mapping with every group empty,
+        # then activates each named default flag. Raises KeyError for an unknown flag name.
         properties: dict[tuple[str, ...], str | None] = dict.fromkeys(
             LazyIrProperties.Properties
         )
@@ -285,6 +328,9 @@ class LazyIrProperties:
             setattr(self, p, True)
 
     def __getattr__(self, key: str) -> Any:
+        # [FUNCTION DOC] Returns True if key is a known flag and is the active one in its
+        # group, else False; for names that are not flags, falls back to normal attribute
+        # lookup (which raises AttributeError if missing).
         properties = self.__dict__["properties"]
         for values in LazyIrProperties.Properties:
             if key in values:
@@ -293,6 +339,9 @@ class LazyIrProperties:
         return self.__getattribute__(key)
 
     def __setattr__(self, key: str, value: Any) -> Any:
+        # [FUNCTION DOC] Sets a flag: a truthy value makes it the active flag of its group
+        # (deactivating the group's other flags), a falsy value clears the whole group.
+        # Mutates the properties mapping. Raises KeyError for a name that is not a flag.
         properties = self.__dict__["properties"]
         for values in LazyIrProperties.Properties:
             if key in values:
@@ -309,6 +358,13 @@ class LazyIrProperties:
 #
 # TODO: This is not idiomatic with how other torchgen APIs transform on schema.
 class LazyIrSchema:
+    # [CLASS DOC] Schema of a lazy IR node derived from a native FunctionSchema: operator
+    # name, returns, original func, symint setting, codegen properties, positional and
+    # keyword LazyArguments (generator arguments get recorded separately in generator_arg
+    # but also stay in keyword args), and optional opkind. Provides naming properties and
+    # filtered views of arguments (values vs scalars, positional vs keyword).
+    # KNOWN ISSUE: the class-level default properties object is one shared instance, so
+    # instances created without explicit properties share (and may mutate) the same flags.
     # The name of the operator this function schema describes.
     name: OperatorName
 
@@ -343,6 +399,11 @@ class LazyIrSchema:
         *,
         symint: bool,
     ) -> None:
+        # [FUNCTION DOC] Builds the schema from a FunctionSchema. Optional properties replace
+        # the shared defaults. Positional args are pre-self, self, post-self; keyword args
+        # are pre-tensor-options kwargs, expanded tensor options, post kwargs, and out args.
+        # A generator-typed keyword argument is also stored in generator_arg. Raises an error
+        # if more than one generator argument exists.
         if properties:
             self.properties = properties
 
@@ -393,6 +454,8 @@ class LazyIrSchema:
 
     @property
     def node_name(self) -> str:
+        # [FUNCTION DOC] Returns the camel-case IR node name from the operator name and
+        # overload name (underscore-separated words capitalized and joined).
         """
         Return camel-case version of op in node.
 
@@ -405,10 +468,13 @@ class LazyIrSchema:
 
     @property
     def aten_name(self) -> str:
+        # [FUNCTION DOC] Returns the ATen operator name as a string (without overload).
         return str(self.name.name)
 
     @property
     def base_name(self) -> str:
+        # [FUNCTION DOC] Returns the base operator name (no inplace or double-underscore
+        # decoration) as a string.
         return f"{self.name.name.base}"
 
     def filtered_args(
@@ -419,6 +485,12 @@ class LazyIrSchema:
         scalars: bool = True,
         generator: bool = True,
     ) -> list[LazyArgument]:
+        # [FUNCTION DOC] Returns a filtered list of arguments, positional first then keyword,
+        # preserving order. Flags choose positional and keyword groups; values keeps lazy
+        # value arguments, scalars keeps non-value arguments, generator keeps generator
+        # arguments. Returns an empty list if neither values nor scalars is requested.
+        # KNOWN ISSUE: when only values is requested the generator flag is ignored; value
+        # arguments never include generators in practice.
         # This function maintains the sorted order of arguments but provides different filtered views.
         # Some parts of the code care about kwargs vs args (TS lowerings),
         # other parts care about whether they need to wrap the arg in a lazy value or leave it alone.
@@ -447,24 +519,28 @@ class LazyIrSchema:
 
     @property
     def positional_values(self) -> list[LazyArgument]:
+        # [FUNCTION DOC] Positional arguments that are lazy values.
         return self.filtered_args(
             positional=True, keyword=False, values=True, scalars=False
         )
 
     @property
     def positional_scalars(self) -> list[LazyArgument]:
+        # [FUNCTION DOC] Positional arguments that are not lazy values (generators included).
         return self.filtered_args(
             positional=True, keyword=False, values=False, scalars=True
         )
 
     @property
     def keyword_values(self) -> list[LazyArgument]:
+        # [FUNCTION DOC] Keyword arguments that are lazy values.
         return self.filtered_args(
             positional=False, keyword=True, values=True, scalars=False
         )
 
     @property
     def keyword_scalars(self) -> list[LazyArgument]:
+        # [FUNCTION DOC] Keyword arguments that are not lazy values (generators included).
         return self.filtered_args(
             positional=False, keyword=True, values=False, scalars=True
         )

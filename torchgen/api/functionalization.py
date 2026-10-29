@@ -1,3 +1,9 @@
+# [MODULE DOC] Translates JIT schemas to the APIs used when generating ViewMeta
+# specializations for the functionalization pass. Defines shared Binding constants
+# (base, mutated_view, out_index, reapply_views, has_symbolic_inputs, inverse_return_mode)
+# plus helpers producing class names, forward/reverse op names, return type, and the
+# constructor/attribute/lambda argument lists. Follows the dispatcher API. Import-time
+# effect: builds the module-level Binding objects and the InverseReturnModeT C++ type.
 from __future__ import annotations
 
 from torchgen.api import dispatcher
@@ -93,6 +99,8 @@ inverse_return_mode_binding = Binding(
 
 # Name of the `ViewMeta` specialization class created.
 def classname(func: FunctionSchema, with_namespace: bool = False) -> str:
+    # [FUNCTION DOC] Returns the generated ViewMeta subclass name: the unambiguous operator
+    # name plus a ViewMeta suffix, optionally prefixed by the functionalization namespace.
     namespace = "at::functionalization::" if with_namespace else ""
     return f"{namespace}{func.name.unambiguous_name()}_ViewMeta"
 
@@ -105,6 +113,11 @@ def name(
     include_namespace: bool,
     reapply_views: bool | None = None,
 ) -> str:
+    # [FUNCTION DOC] Returns the name of the operation called inside forward or reverse.
+    # Reverse: the view inverse function name (reapply_views is ignored). Forward: the
+    # at::_ops call entry for the view op when reapply_views is true, else for its
+    # view_copy op. Raises an error if reapply_views is None for forward, if
+    # include_namespace is false for forward, or if the group has no view_copy for forward.
     if reapply_views is None:
         # reapply_views is only important for the fwd lambda,
         # since we always plumb the runtime "reapply_views" argument into the reverse function.
@@ -126,6 +139,9 @@ def name(
 
 
 def reverse_name(f: NativeFunction, include_namespace: bool) -> str:
+    # [FUNCTION DOC] Returns the view inverse function name for a native function: the
+    # unambiguous name plus an inverse suffix, qualified with the FunctionalInverses
+    # class namespace for call sites and unqualified for declarations.
     # for the reverse: we plumb the "reapply_views" flag into that function and support
     # both copy and non-copy variants. (We could avoid doing that, but that would require
     # writing out twice as many view inverse functions).
@@ -138,6 +154,8 @@ def reverse_name(f: NativeFunction, include_namespace: bool) -> str:
 
 
 def returns_type(func: FunctionSchema) -> CType:
+    # [FUNCTION DOC] Returns the lambda return type, always a single tensor type. Raises an
+    # error if the schema has no returns or any return is not tensor-like.
     # Assertion: all view ops return tensor-like outputs
     if len(func.returns) < 1:
         raise AssertionError("Expected at least one return value")
@@ -151,6 +169,8 @@ def returns_type(func: FunctionSchema) -> CType:
 
 # Checks whether `func` might return more than one value.
 def is_multi_output(func: FunctionSchema) -> bool:
+    # [FUNCTION DOC] True if the schema has more than one return, or a single list-like
+    # return. Pure.
     return len(func.returns) > 1 or (
         len(func.returns) == 1 and func.returns[0].type.is_list_like() is not None
     )
@@ -158,6 +178,8 @@ def is_multi_output(func: FunctionSchema) -> bool:
 
 # `ViewMeta` specialization constructor parameters.
 def base_ctor_arguments(func: FunctionSchema) -> list[Binding]:
+    # [FUNCTION DOC] Returns the base-class constructor Bindings: always the
+    # has_symbolic_inputs flag, plus the out_index binding for multi-output ops.
     # All specializations are parematerized by `has_symbolic_inputs` flag.
     arguments = [has_symbolic_inputs_binding]
 
@@ -174,6 +196,8 @@ def base_ctor_arguments(func: FunctionSchema) -> list[Binding]:
 # Values needed specifically by this specialization, that the base class does not need.
 # Same as the class' attributes, but non-owning.
 def extra_ctor_arguments(func: FunctionSchema) -> list[Binding]:
+    # [FUNCTION DOC] Returns the specialization-only constructor Bindings: the class
+    # attributes in their non-owning form.
     return attributes(func, owning=False)
 
 
@@ -182,6 +206,10 @@ def extra_ctor_arguments(func: FunctionSchema) -> list[Binding]:
 # Essential data for calling the instance's `forward` and `reverse functions. You can
 # think of them as values that should be captured from the functionalization kernel.
 def attributes(func: FunctionSchema, owning: bool = True) -> list[Binding]:
+    # [FUNCTION DOC] Returns the member-data Bindings captured by a ViewMeta specialization:
+    # reapply_views, inverse_return_mode, then every argument after the first (self) as a
+    # dispatcher binding; owning controls whether non-owning reference types are removed.
+    # Raises an error if the first argument is not a Tensor.
     args = func.arguments.flat_all
     if args[0].type != BaseType(BaseTy.Tensor):
         raise AssertionError(f"Expected first arg to be Tensor, got {args[0].type}")
@@ -193,6 +221,10 @@ def attributes(func: FunctionSchema, owning: bool = True) -> list[Binding]:
 
 
 def op_arguments(func: FunctionSchema, is_reverse: bool) -> list[Binding]:
+    # [FUNCTION DOC] Returns the lambda parameter Bindings. The self argument is replaced by
+    # base; reverse also takes mutated_view and inverse_return_mode, plus out_index for
+    # multi-output ops, before the remaining dispatcher bindings. Raises an error if the
+    # first argument is not a Tensor.
     args = func.arguments.flat_all
     if args[0].type != BaseType(BaseTy.Tensor):
         raise AssertionError(f"Expected first arg to be Tensor, got {args[0].type}")

@@ -1,3 +1,6 @@
+# [MODULE DOC] Naming helper for structured-kernel meta functions. Meta functions follow the
+# dispatcher calling convention but take no mutable arguments and return tensor metadata
+# rather than tensors. Only a name computation is provided; no import-time side effects.
 from torchgen.model import NativeFunctionsGroup
 
 
@@ -9,5 +12,8 @@ from torchgen.model import NativeFunctionsGroup
 
 
 def name(g: NativeFunctionsGroup) -> str:
+    # [FUNCTION DOC] Returns the meta function name for a native functions group: the full
+    # operator name (with overload) of the functional variant, with dots replaced by
+    # underscores. Pure; no side effects.
     # use the overload name from the functional version
     return str(g.functional.func.name).replace(".", "_")

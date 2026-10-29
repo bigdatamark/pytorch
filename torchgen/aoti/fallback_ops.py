@@ -1,3 +1,9 @@
+# [MODULE DOC] Data-only module listing operators exposed through the AOTInductor C shim.
+# inductor_fallback_ops maps a fully qualified operator-overload name to a metadata mapping
+# (empty, or a "since" version tag, or versioned entries with new_args and since) used by
+# torchgen to generate c_shim headers. aten_shimified_ops has the same shape for ops used
+# by the stable ABI (these go through the dispatcher). Entries may be added but never
+# removed (ABI compatibility). No import-time side effects beyond building the two dicts.
 # Be extra careful when you edit this file, because it affects AOTInductor ABI compatibility. See
 # https://github.com/pytorch/pytorch/blob/7e86a7c0155295539996e0cf422883571126073e/torchgen/gen.py#L2424-L2436
 # for details.

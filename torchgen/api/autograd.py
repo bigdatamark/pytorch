@@ -1,3 +1,12 @@
+# [MODULE DOC] Data model and helpers for the autograd codegen. Defines frozen dataclasses
+# describing derivative information read from derivatives.yaml (SavedAttribute, Derivative,
+# ForwardDerivative, DifferentiabilityInfo, DifferentiableInput/Output,
+# NativeFunctionWithDifferentiabilityInfo), predicates on that info (uses_ident and
+# friends), the dispatch strategy choice for VariableType, and logic that derives
+# DifferentiabilityInfo for _foreach_ functions from their non-foreach reference function
+# (gen_foreach_derivativeinfo, with sets of special-cased foreach names), matching of infos
+# to native functions (match_differentiability_info) and differentiable output selection.
+# No import-time side effects beyond defining these names.
 from __future__ import annotations
 
 import re
@@ -29,6 +38,9 @@ if TYPE_CHECKING:
 # we could save `other.scalar_type()` instead of the entire `other` tensor.
 @dataclass(frozen=True)
 class SavedAttribute:
+    # [CLASS DOC] Immutable record of a value saved for backward: nctype (name and C++ type
+    # of the saved attribute, name suffixed when derived) and expr (C++ expression that
+    # reads the value at save time, such as a scalar type of an input).
     # The NamedCType holds the updated name and cpp type of the attribute
     # for the name, Suffix is appended if it's derived property, e.g.: `other_scalar_type`
     nctype: NamedCType
@@ -42,6 +54,10 @@ class SavedAttribute:
 # or more tensors.
 @dataclass(frozen=True)
 class Derivative:
+    # [CLASS DOC] Immutable record of one backward formula computing gradients for one or
+    # more inputs: the rewritten formula (arguments replaced by saved attributes), the
+    # original formula, names of inputs it differentiates, saved inputs and outputs it
+    # references, and the named gradients it uses.
     # The formula string (legit C++ expression).
     # Note that expressions against input arguments have been replaced with the
     # corresponding saved attributes.
@@ -70,6 +86,10 @@ class Derivative:
 # for one tensor.
 @dataclass(frozen=True)
 class ForwardDerivative:
+    # [CLASS DOC] Immutable record of one forward-mode formula for one or more outputs: the
+    # formula (special keywords already expanded), output names and types, inputs whose
+    # forward gradient or primal is required (or none), whether the original self value is
+    # needed (in-place ops only), and whether the out-of-place formula is reused.
     # The formula string (legit C++ expression).
     # Note that special keywords such as "linear" or "element_wise" have been
     # replaced by the automatically generated formula.
@@ -101,6 +121,13 @@ class ForwardDerivative:
 # Represents differentiability info for a NativeFunction.
 @dataclass(frozen=True)
 class DifferentiabilityInfo:
+    # [CLASS DOC] Immutable differentiability information for one NativeFunction, as read
+    # from derivatives.yaml: base name, matching function, generated autograd op name (only
+    # set when derivatives exist), backward and forward derivatives, unions of saved inputs
+    # and outputs, named gradient availability and use (used is a subset of available),
+    # differentiable argument bindings, non-differentiable argument names, and the raw
+    # output differentiability data with its conditions. Key members: has_derivatives and
+    # create_view_copy_from_view_derivative.
     # The base name read from derivatives.yaml.
     name: str
 
@@ -167,6 +194,7 @@ class DifferentiabilityInfo:
 
     @property
     def has_derivatives(self) -> bool:
+        # [FUNCTION DOC] True if at least one argument has a derivative.
         return len(self.args_with_derivatives) > 0
 
     # Generates a new DifferentiabilityInfo using the exact same set of derivative information,
@@ -177,6 +205,10 @@ class DifferentiabilityInfo:
     def create_view_copy_from_view_derivative(
         self, g: NativeFunctionsViewGroup
     ) -> DifferentiabilityInfo | None:
+        # [FUNCTION DOC] Builds the info for the view_copy variant of a view op group by
+        # reusing all derivative data but renaming: the base name gets a copy suffix (the
+        # overload part is kept), the function becomes the view_copy function, and the op
+        # name (if any) gets a copy suffix. Returns None if the group has no view_copy.
         if g.view_copy is None:
             return None
         f = g.view_copy
@@ -208,6 +240,8 @@ class DifferentiabilityInfo:
 
 
 def uses_ident(info: DifferentiabilityInfo | None, ident: str) -> bool:
+    # [FUNCTION DOC] True if any backward formula of the info mentions the identifier as a
+    # whole word (regex match); False for missing info.
     if info is None:
         return False
     for derivative in info.derivatives:
@@ -218,10 +252,12 @@ def uses_ident(info: DifferentiabilityInfo | None, ident: str) -> bool:
 
 
 def uses_retain_variables(info: DifferentiabilityInfo | None) -> bool:
+    # [FUNCTION DOC] True if any backward formula references retain_variables.
     return uses_ident(info, "retain_variables")
 
 
 def uses_single_grad(info: DifferentiabilityInfo | None) -> bool:
+    # [FUNCTION DOC] True if any backward formula references the single grad identifier.
     return uses_ident(info, "grad")
 
 
@@ -232,6 +268,8 @@ def uses_single_grad(info: DifferentiabilityInfo | None) -> bool:
 # - It can represent SelfArgument or regular Argument but not TensorOptionsArgument;
 @dataclass(frozen=True)
 class DifferentiableInput:
+    # [CLASS DOC] Immutable record of a differentiable input (self or regular argument,
+    # never tensor options) for autograd codegen: name, schema type and C++ type string.
     name: str
     type: Type
 
@@ -249,6 +287,9 @@ class DifferentiableInput:
 #   and are only used in the context of the autograd codegen;
 @dataclass(frozen=True)
 class DifferentiableOutput:
+    # [CLASS DOC] Immutable record of a differentiable output for autograd codegen: always
+    # named (using the C++ return naming), with schema type and C++ type string; filtered
+    # by output_differentiability from derivatives.yaml when specified.
     name: str
     type: Type
 
@@ -258,6 +299,8 @@ class DifferentiableOutput:
 
 @dataclass(frozen=True)
 class NativeFunctionWithDifferentiabilityInfo:
+    # [CLASS DOC] Immutable pairing of a NativeFunction with its differentiability info per
+    # dispatch key (or none) and its forward derivatives per dispatch key (or none).
     func: NativeFunction
     info: dict[str, DifferentiabilityInfo] | None
     fw_derivatives: dict[str, Sequence[ForwardDerivative]] | None
@@ -265,6 +308,11 @@ class NativeFunctionWithDifferentiabilityInfo:
 
 # TODO: Update comment below since it is out of date.
 def dispatch_strategy(fn: NativeFunctionWithDifferentiabilityInfo) -> str:
+    # [FUNCTION DOC] Chooses how generated autograd code calls the implementation. Returns
+    # use_derived if the function is abstract or any dispatch key's info has derivatives,
+    # else use_type (assumed to be implemented via differentiable functions). Pure.
+    # KNOWN ISSUE: the docstring describes an older design (CPUDoubleType/VariableType); the
+    # existing TODO above already notes it is out of date.
     """How are we going to call the underlying implementation of a
     declaration?  There are two strategies:
         - use_derived: we want to call the implementation on CPUDoubleType
@@ -314,6 +362,7 @@ def dispatch_strategy(fn: NativeFunctionWithDifferentiabilityInfo) -> str:
 
 
 def is_foreach_func(f: NativeFunction) -> bool:
+    # [FUNCTION DOC] True if the function's base name starts with the foreach prefix.
     return f.func.name.name.base.startswith("_foreach_")
 
 
@@ -345,6 +394,11 @@ def is_reference_for_foreach(
     f: NativeFunction,
     function_schema: FunctionSchema,
 ) -> bool:
+    # [FUNCTION DOC] True if function_schema is the non-foreach reference for foreach
+    # function f: base names match after removing the foreach prefix; the reference is not
+    # in-place (except for the special-cased zero); non-out argument counts are equal (unless
+    # f is in the skip list, since alpha is unsupported); and each reference argument type
+    # equals the foreach argument type or its element type.
     return (
         f.func.name.name.base.split("_foreach_")[-1] == function_schema.name.name.base
         and (
@@ -377,6 +431,18 @@ def gen_foreach_derivativeinfo(
     ],
     dispatch_key: str = "Default",
 ) -> tuple[DifferentiabilityInfo | None, bool]:
+    # [FUNCTION DOC] Finds the reference (non-foreach) info for a foreach function in the
+    # functional table (and, for in-place zero, the non-functional table) at the dispatch
+    # key. Returns (None, False) if none; (existing info, False) for in-place functions;
+    # otherwise builds a new info for the out-of-place foreach function and returns it with
+    # True. Building maps reference argument names to foreach names, rewrites formulas to
+    # index per-tensor gradients, results and list inputs, rebuilds saved inputs/outputs
+    # (result must be the only saved output), argument bindings and forward derivatives.
+    # Raises RuntimeError if a saved output other than result is used.
+    # KNOWN ISSUE: formula rewriting uses plain substring replacement of grad and result,
+    # which can also hit longer identifiers; the RuntimeError has an empty message; the
+    # reference schema used after the search loops relies on the loop variable leaking;
+    # saved inputs and outputs are deduplicated through a set, so their order is arbitrary.
     """Generate DifferentiabilityInfo for out-place foreach function, return the existing one for in-place.
 
     The second return value indicates whether the info is generated in this function.
@@ -593,6 +659,18 @@ def match_differentiability_info(
     native_functions: list[NativeFunction],
     differentiability_infos: dict[FunctionSchema, dict[str, DifferentiabilityInfo]],
 ) -> list[NativeFunctionWithDifferentiabilityInfo]:
+    # [FUNCTION DOC] Pairs every native function with its differentiability info and forward
+    # derivatives. Info lookup: exact schema match; else the functional variant by signature
+    # (not for foreach); else the mutable variant's info for generated out-of-place variants
+    # (rejected if saved inputs mention self); else generated foreach info. For in-place
+    # functions with a single forward derivative the formula is rewritten (original self
+    # replacement, result renamed to self, optional direct in-place form or copy into the
+    # existing forward grad). Raises an error for an unsupported mutable-to-functional reuse,
+    # strides in an in-place self derivative, a manual formula using original self, or more
+    # than one in-place forward derivative. Side effect: may add generated foreach infos into
+    # the passed differentiability_infos mapping.
+    # KNOWN ISSUE: the forward derivative rewrite for in-place ops happens inside a loop over
+    # dispatch keys but reuses the same variables; fine for the single Default key in practice.
     """Sets the "derivative" key on declarations to matching autograd function
     In-place functions will use the out-of-place derivative definition if there
     is no in-place specific derivative.
@@ -612,6 +690,9 @@ def match_differentiability_info(
     def find_info(
         f: NativeFunction,
     ) -> tuple[dict[str, DifferentiabilityInfo] | None, bool]:
+        # [FUNCTION DOC] HELPER: Returns (info per dispatch key or none, whether it was an
+        # exact schema match) for one native function using the lookup order described above;
+        # generated out variants get none. Raises an error for unsupported cases.
         # Don't bother matching info to generated out= variants
         if "generated" in f.tags and f.func.kind() == SchemaKind.out:
             return None, False
@@ -733,7 +814,10 @@ def match_differentiability_info(
                 formula = fw_info.formula
 
                 def replace_self_with_original_self(formula: str, postfix: str) -> str:
+                    # [FUNCTION DOC] HELPER: Replaces whole-word self with the given postfix
+                    # by original_self with the same postfix in the formula text.
                     def repl(m: re.Match[str]) -> str:
+                        # [FUNCTION DOC] HELPER: Rebuilds a match with original_self inserted.
                         return f"{m.group(1)}original_self{postfix}{m.group(2)}"
 
                     return re.sub(IDENT_REGEX.format(f"self{postfix}"), repl, formula)
@@ -755,6 +839,7 @@ def match_differentiability_info(
 
                 # replace "result" from the formula by "self_p"
                 def repl(m: re.Match[str]) -> str:
+                    # [FUNCTION DOC] HELPER: Rebuilds a match of result as self_p.
                     return f"{m.group(1)}self_p{m.group(2)}"
 
                 formula = re.sub(IDENT_REGEX.format("result"), repl, formula)
@@ -789,6 +874,9 @@ def match_differentiability_info(
                         #   Avoid: self_t.op1(args) + self_t.op2(args)
                         #   Avoid: self_t.op1(other_p.op2(arg)) + self_t.op2(args)
                         def check_parens_nest_level_gt_zero(s: str) -> bool:
+                            # [FUNCTION DOC] HELPER: True if the text, taken as the inside of
+                            # a call's parentheses, never closes the outer parenthesis early
+                            # (so the whole formula is one method call on self_t).
                             level = 1
                             for ch in s:
                                 if ch == ")":
@@ -849,6 +937,8 @@ def match_differentiability_info(
 def is_differentiable(
     name: str, type: Type, info: DifferentiabilityInfo | None
 ) -> bool:
+    # [FUNCTION DOC] True if the type is tensor-like and the name is not listed as
+    # non-differentiable in the info (when info is given).
     return type.is_tensor_like() and (
         info is None or name not in info.non_differentiable_arg_names
     )
@@ -857,6 +947,12 @@ def is_differentiable(
 def gen_differentiable_outputs(
     fn: NativeFunctionWithDifferentiabilityInfo, key: str = "Default"
 ) -> list[DifferentiableOutput]:
+    # [FUNCTION DOC] Returns the differentiable outputs of a function for a dispatch key.
+    # Builds all outputs (C++ return names, types, SymInt-aware C++ type strings). If
+    # output_differentiability is specified, keeps the flagged outputs; otherwise keeps the
+    # tensor-like, differentiable ones, truncated to the first when formulas use the single
+    # grad. Raises RuntimeError if the flag list length differs from the output count or if
+    # an in-place op marks an output non-differentiable.
     f = fn.func
     info = fn.info[key] if fn.info else None
     outputs: list[DifferentiableOutput] = [

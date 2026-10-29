@@ -1,3 +1,8 @@
+# [MODULE DOC] Translates JIT schemas to the native:: kernel C++ API. Mostly mirrors the
+# C++ API but with a few argument-type special cases (Tensor?, Tensor?[], Scalar, Scalar?
+# taken by const reference), and keeps tensor options split into dtype, layout, device and
+# pin_memory bindings. Provides name, type and Binding construction helpers. SymInt aware.
+# No import-time side effects.
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -49,6 +54,8 @@ if TYPE_CHECKING:
 
 
 def name(func: FunctionSchema) -> str:
+    # [FUNCTION DOC] Returns the native kernel name: the base operator name, with an
+    # out suffix for out variants, then an underscore plus the overload name if present.
     name = str(func.name.name)
     # TODO: delete this!
     if func.is_out_fn():
@@ -61,6 +68,10 @@ def name(func: FunctionSchema) -> str:
 def argumenttype_type(
     t: Type, *, mutable: bool, binds: ArgName, symint: bool
 ) -> NamedCType:
+    # [FUNCTION DOC] Maps a schema type to a named C++ type for native kernels. Optional
+    # tensor, optional tensor list, Scalar and optional Scalar become const references
+    # (optional tensor is a mutable reference when mutable and the local const-ref flag is
+    # off). All other types delegate to the C++ API mapping. Pure.
     if str(t) == "Tensor?":
         tensor_type: OptionalCType = OptionalCType(BaseCType(tensorT))
         if mutable and not local.use_const_ref_for_mutable_tensors():
@@ -79,10 +90,14 @@ def argumenttype_type(
 
 
 def returns_type(rs: Sequence[Return], *, symint: bool) -> CType:
+    # [FUNCTION DOC] Returns the C++ return type for a sequence of returns; identical to
+    # the C++ API result.
     return cpp.returns_type(rs, symint=symint)
 
 
 def argument_type(a: Argument, *, binds: ArgName, symint: bool) -> NamedCType:
+    # [FUNCTION DOC] Returns the named native C++ type for an Argument, treating it as
+    # mutable when the argument is written to.
     return argumenttype_type(a.type, mutable=a.is_write, binds=binds, symint=symint)
 
 
@@ -92,6 +107,11 @@ def argument(
     is_out: bool,
     symint: bool,
 ) -> list[Binding]:
+    # [FUNCTION DOC] Builds the Bindings for one schema argument. A plain argument gives
+    # one Binding (defaults only for non-out variants and when the schema has a default);
+    # a self argument is unwrapped; tensor options expand to four optional bindings
+    # (dtype, layout, device, pin_memory) sharing the same default ("{}" for non-out).
+    # Raises via assert_never on an unexpected argument kind.
     # Ideally, we NEVER default native functions.  However, there are a number
     # of functions that call native:: directly and rely on the defaulting
     # existing.  So for BC, we generate defaults for non-out variants (but not
@@ -151,6 +171,8 @@ def argument(
 
 
 def arguments(func: FunctionSchema, *, symint: bool) -> list[Binding]:
+    # [FUNCTION DOC] Returns the flattened Bindings for all arguments of a schema, with
+    # non-out arguments first and out arguments last.
     args: list[Argument | TensorOptionsArguments | SelfArgument] = []
     args.extend(func.arguments.non_out)
     args.extend(func.arguments.out)
