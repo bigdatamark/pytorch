@@ -1,3 +1,7 @@
+# [MODULE DOC] Python access to ATen's TensorIterator build pipeline. Defines TensorIterator (a read-only view of a built iterator)
+# and factory shortcuts mirroring the C++ named constructors (binary, unary, comparison, nullary, reduce).
+# Operands are registered in a fixed canonical order (outputs, inputs, const inputs). Imports the C extension types;
+# no other import-time side effects.
 """Python access to ATen's TensorIterator build pipeline.
 
 :class:`TensorIterator` builds an iterator from a set of operands and flags
@@ -56,6 +60,9 @@ __all__ = [
 
 
 class TensorIterator:
+    # [CLASS DOC] Wraps a built C++ TensorIterator held in the private _impl attribute. Constructor keyword arguments mirror
+    # the TensorIteratorConfig knobs; building happens once in the constructor and the object is then read-only.
+    # Exposes shape, dtype, device, stride and operand-count information after coalescing and reordering.
     """A built TensorIterator. Read-only view of the build-pipeline result.
 
     Constructor kwargs mirror ``at::TensorIteratorConfig``; defaults match
@@ -138,6 +145,10 @@ class TensorIterator:
         static_shape: Sequence[int] | None = None,
         squash_dims: Sequence[int] = (),
     ) -> None:
+        # [FUNCTION DOC] Builds a spec from the operand lists and boolean flags, optionally sets static dtype, device and shape
+        # (squash_dims is applied only when a static shape is given), then builds the native iterator and stores it.
+        # None lists become empty lists; an output of None asks the iterator to allocate it. Errors from the build
+        # (shape, dtype, device or overlap checks) propagate from the C extension.
         spec = _CTensorIteratorSpec()
         spec.outputs = list(outputs) if outputs is not None else []
         spec.inputs = list(inputs) if inputs is not None else []
@@ -167,6 +178,7 @@ class TensorIterator:
 
     @property
     def ndim(self) -> int:
+        # [FUNCTION DOC] Number of iteration dimensions after coalescing.
         return self._impl.ndim
 
     @property
@@ -177,34 +189,42 @@ class TensorIterator:
         reachable; copy via ``tuple(it.shape)`` if you need a snapshot
         you can outlive the iterator with. Hot-path readers (dispatch
         conditionals) get index access without an allocation."""
+        # [FUNCTION DOC] Returns the post-coalesce iteration shape as a zero-copy int64 memoryview tied to this iterator's lifetime.
         return self._impl.shape
 
     @property
     def numel(self) -> int:
+        # [FUNCTION DOC] Total number of elements iterated.
         return self._impl.numel
 
     @property
     def ntensors(self) -> int:
+        # [FUNCTION DOC] Total number of operands (outputs plus inputs).
         return self._impl.ntensors
 
     @property
     def ninputs(self) -> int:
+        # [FUNCTION DOC] Number of input operands.
         return self._impl.ninputs
 
     @property
     def noutputs(self) -> int:
+        # [FUNCTION DOC] Number of output operands.
         return self._impl.noutputs
 
     @property
     def is_contiguous(self) -> bool:
+        # [FUNCTION DOC] True if all operands are contiguous in the iteration layout.
         return self._impl.is_contiguous
 
     @property
     def is_trivial_1d(self) -> bool:
+        # [FUNCTION DOC] True if the iteration is trivially one-dimensional.
         return self._impl.is_trivial_1d
 
     @property
     def common_dtype(self) -> torch.dtype | None:
+        # [FUNCTION DOC] Returns the inferred common computation dtype, or None if inference produced none.
         """The inferred computation dtype, or ``None`` if no single dtype
         was inferred. Populated whenever TensorIterator can resolve a
         common dtype -- under promotion flags, or when every input
@@ -213,6 +233,7 @@ class TensorIterator:
         return self._impl.common_dtype
 
     def tensor(self, index: int) -> torch.Tensor:
+        # [FUNCTION DOC] Returns the operand tensor at the given index (outputs first, then inputs); may be a promoted or cast temporary.
         """Return the iterator's current operand at ``index``.
 
         Note: under ``promote_inputs_to_common_dtype`` /
@@ -223,22 +244,27 @@ class TensorIterator:
         return self._impl.tensor(index)
 
     def input(self, index: int = 0) -> torch.Tensor:
+        # [FUNCTION DOC] Returns the input operand at the given index (default 0).
         """Return the iterator's current input. See :meth:`tensor` for the
         promoted-temporary caveat."""
         return self._impl.input(index)
 
     def output(self, index: int = 0) -> torch.Tensor:
+        # [FUNCTION DOC] Returns the output operand at the given index (default 0).
         """Return the iterator's current output. See :meth:`tensor` for the
         cast-temporary caveat."""
         return self._impl.output(index)
 
     def dtype(self, index: int = 0) -> torch.dtype:
+        # [FUNCTION DOC] Returns the dtype of the operand at the given index (default 0).
         return self._impl.dtype(index)
 
     def device(self, index: int = 0) -> torch.device:
+        # [FUNCTION DOC] Returns the device of the operand at the given index (default 0).
         return self._impl.device(index)
 
     def strides(self, index: int) -> memoryview:
+        # [FUNCTION DOC] Returns the operand's byte strides as a zero-copy int64 memoryview.
         """Per-operand strides in bytes (post reorder/coalesce), as a
         zero-copy ``memoryview`` of ``int64`` elements. The view holds a
         reference to this iterator and keeps it alive for as long as the
@@ -247,6 +273,7 @@ class TensorIterator:
         return self._impl.strides(index)
 
     def element_strides(self, index: int) -> tuple[int, ...]:
+        # [FUNCTION DOC] Returns the operand's strides in element units as a freshly allocated tuple (allocates on every call).
         """Per-operand strides in elements (byte stride / element size).
 
         Allocates a fresh tuple on every call. Don't use on a hot path:
@@ -255,6 +282,7 @@ class TensorIterator:
         return self._impl.element_strides(index)
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Returns the repr of the underlying native iterator.
         return repr(self._impl)
 
 
@@ -266,6 +294,8 @@ class TensorIterator:
 def binary_op(
     out: torch.Tensor | None, a: torch.Tensor, b: torch.Tensor
 ) -> TensorIterator:
+    # [FUNCTION DOC] Builds an iterator for a binary op: CPU scalars allowed, inputs promoted to a common dtype, result cast to
+    # the output dtype with safe-casting enforced. out may be None to allocate.
     """Equivalent of ``at::TensorIterator::binary_op``."""
     return TensorIterator(
         outputs=[out],
@@ -280,6 +310,7 @@ def binary_op(
 def binary_float_op(
     out: torch.Tensor | None, a: torch.Tensor, b: torch.Tensor
 ) -> TensorIterator:
+    # [FUNCTION DOC] Like binary_op but integer inputs are also promoted to floating point.
     """Equivalent of ``at::TensorIterator::binary_float_op``."""
     return TensorIterator(
         outputs=[out],
@@ -295,6 +326,8 @@ def binary_float_op(
 def comparison_op(
     out: torch.Tensor | None, a: torch.Tensor, b: torch.Tensor
 ) -> TensorIterator:
+    # [FUNCTION DOC] Builds an iterator for a comparison op. If out is None the output dtype is forced to bool; otherwise a cast
+    # back to out's dtype is requested unless out is already bool.
     """Equivalent of ``at::TensorIterator::comparison_op``.
 
     When ``out`` is ``None``, the output dtype is forced to bool. When ``out``
@@ -315,11 +348,13 @@ def comparison_op(
 
 
 def unary_op(out: torch.Tensor | None, a: torch.Tensor) -> TensorIterator:
+    # [FUNCTION DOC] Builds a plain single-input iterator with default flags. out may be None to allocate.
     """Equivalent of ``at::TensorIterator::unary_op``."""
     return TensorIterator(outputs=[out], const_inputs=[a])
 
 
 def unary_float_op(out: torch.Tensor | None, a: torch.Tensor) -> TensorIterator:
+    # [FUNCTION DOC] Unary iterator with promotion to a common dtype, integer-to-float promotion, output cast and safe casting.
     """Equivalent of ``at::TensorIterator::unary_float_op``."""
     return TensorIterator(
         outputs=[out],
@@ -332,6 +367,7 @@ def unary_float_op(out: torch.Tensor | None, a: torch.Tensor) -> TensorIterator:
 
 
 def nullary_op(out: torch.Tensor) -> TensorIterator:
+    # [FUNCTION DOC] Builds an iterator with only an output (no dtype check, no resize). Raises TypeError if out is None.
     """Equivalent of ``at::TensorIterator::nullary_op``.
 
     Unlike the binary/unary factories, ``out`` must be a defined tensor;
@@ -354,6 +390,9 @@ def reduce_op(
     *,
     out2: torch.Tensor | None = None,
 ) -> TensorIterator:
+    # [FUNCTION DOC] Builds a reduction iterator; outputs must be pre-allocated (no resize or allocation). With out2, validates that
+    # out, out2 and a share a device and that out and out2 have identical dim, sizes and strides, raising RuntimeError otherwise;
+    # that path skips dtype promotion. Without out2, inputs are promoted to a common dtype.
     """Equivalent of ``at::TensorIterator::reduce_op``.
 
     Pass ``out2`` for the two-output reduction overload (e.g. ``min`` returning

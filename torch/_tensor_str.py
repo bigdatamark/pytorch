@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Implements the text repr of tensors: global print options (PRINT_OPTS, set/get/context-manager APIs),
+# element formatting (_Formatter), recursive nested-list rendering with summarization, and the entry points
+# _str / _str_intern used by Tensor repr. Import time creates the global PRINT_OPTS instance only.
 import contextlib
 import dataclasses
 import math
@@ -11,6 +14,8 @@ from torch import inf
 
 @dataclasses.dataclass
 class __PrinterOptions:
+    # [CLASS DOC] HELPER: Dataclass holding the global print settings: precision, threshold (element count that triggers
+    # summarization), edgeitems, linewidth and sci_mode (None means auto-select).
     precision: int = 4
     threshold: float = 1000
     edgeitems: int = 3
@@ -30,6 +35,10 @@ def set_printoptions(
     profile=None,
     sci_mode=None,
 ):
+    # [FUNCTION DOC] Updates the global PRINT_OPTS. A profile (default, short, full) first resets precision, threshold,
+    # edgeitems and linewidth to preset values; unknown profile names are silently ignored. Then each non-None argument overrides
+    # its field. sci_mode is always assigned, so omitting it resets it to automatic.
+    # Side effect: mutates global state; returns nothing.
     r"""Set options for printing. Items shamelessly taken from NumPy
 
     Args:
@@ -96,6 +105,7 @@ def set_printoptions(
 
 
 def get_printoptions() -> dict[str, Any]:
+    # [FUNCTION DOC] Returns the current print options as a plain dictionary suitable for passing back to set_printoptions.
     r"""Gets the current options for printing, as a dictionary that
     can be passed as ``**kwargs`` to set_printoptions().
     """
@@ -104,6 +114,8 @@ def get_printoptions() -> dict[str, Any]:
 
 @contextlib.contextmanager
 def printoptions(**kwargs):
+    # [FUNCTION DOC] Context manager: saves current options, applies the given keyword options via set_printoptions, yields,
+    # and restores the saved options on exit even if the body raises. Note sci_mode is restored too.
     r"""Context manager that temporarily changes the print options.  Accepted
     arguments are same as :func:`set_printoptions`."""
     old_kwargs = get_printoptions()
@@ -115,6 +127,8 @@ def printoptions(**kwargs):
 
 
 def tensor_totype(t):
+    # [FUNCTION DOC] HELPER: Converts a tensor to double for formatting math, or to float on devices lacking double
+    # (MPS, MAIA, XPU without fp64). Returns the converted tensor.
     dtype = (
         torch.float
         if (
@@ -128,7 +142,14 @@ def tensor_totype(t):
 
 
 class _Formatter:
+    # [CLASS DOC] HELPER: Computes how the elements of one tensor should be formatted: whether it is floating, whether
+    # all values are integers (int_mode), whether scientific notation applies (sci_mode) and the maximum rendered width.
+    # Filled in at construction; format and width are then used per element.
     def __init__(self, tensor):
+        # [FUNCTION DOC] HELPER: Scans the tensor (flattened) to choose int_mode, sci_mode and max_width. Non-floating dtypes use the
+        # widest string form. For floats only non-zero finite values are considered; with none, defaults are kept and it returns early.
+        # Sci mode is chosen when the max/min ratio exceeds 1000, max exceeds 1e8 or min is below 1e-4, unless PRINT_OPTS.sci_mode
+        # forces it. Special-cases float4 (viewed as uint8) and float8_e8m0fnu (converted to float).
         self.floating_dtype = tensor.dtype.is_floating_point
         self.int_mode = True
         self.sci_mode = False
@@ -209,9 +230,12 @@ class _Formatter:
                         self.max_width = max(self.max_width, len(value_str))
 
     def width(self):
+        # [FUNCTION DOC] HELPER: Returns the computed maximum element width.
         return self.max_width
 
     def format(self, value):
+        # [FUNCTION DOC] HELPER: Formats one value as a string left-padded to max_width: scientific, integer-with-trailing-dot (not for
+        # inf or nan), fixed-point with configured precision, or plain string for non-floating dtypes.
         if self.floating_dtype:
             if self.sci_mode:
                 ret = f"{{:{self.max_width}.{PRINT_OPTS.precision}e}}".format(value)
@@ -227,6 +251,8 @@ class _Formatter:
 
 
 def _scalar_str(self, formatter1, formatter2=None):
+# [FUNCTION DOC] HELPER: Renders a 0-dim tensor. With a second formatter (complex) combines real and imaginary parts with a sign
+# and a j suffix; otherwise formats the single item with the first formatter.
     if formatter2 is not None:
         real_str = _scalar_str(self.real, formatter1)
         imag_str = (_scalar_str(self.imag, formatter2) + "j").lstrip()
@@ -241,6 +267,9 @@ def _scalar_str(self, formatter1, formatter2=None):
 
 def _vector_str(self, indent, summarize, formatter1, formatter2=None):
     # length includes spaces and comma between elements
+# [FUNCTION DOC] HELPER: Renders a 1-dim tensor as a bracketed, comma separated string wrapped to the line width using the
+# given indent. When summarizing, shows only edgeitems at each end with an ellipsis (or just an ellipsis if edgeitems is 0).
+# A float4 tensor is viewed as uint8 first. Complex values use both formatters.
     element_length = formatter1.width() + 2
     if formatter2 is not None:
         # width for imag_formatter + an extra j for complex
@@ -251,6 +280,7 @@ def _vector_str(self, indent, summarize, formatter1, formatter2=None):
     )
 
     def _val_formatter(val, formatter1=formatter1, formatter2=formatter2):
+    # [FUNCTION DOC] HELPER: Formats one element; for complex values formats real and imaginary parts and joins them with a sign.
         if formatter2 is not None:
             real_str = formatter1.format(val.real)
             imag_str = (formatter2.format(val.imag) + "j").lstrip()
@@ -293,6 +323,8 @@ def _vector_str(self, indent, summarize, formatter1, formatter2=None):
 # For complex tensors, formatter1 and formatter2 are the formatters for tensor.real
 # and tensor.imag respectively
 def _tensor_str_with_formatter(self, indent, summarize, formatter1, formatter2=None):
+# [FUNCTION DOC] HELPER: Recursively renders a tensor of any rank: 0-dim and 1-dim delegate to scalar/vector renderers; higher
+# ranks render each slice along dim 0 (summarized with an ellipsis when long) joined by commas and blank lines per rank.
     dim = self.dim()
 
     if dim == 0:
@@ -330,6 +362,9 @@ def _tensor_str_with_formatter(self, indent, summarize, formatter1, formatter2=N
 
 
 def _tensor_str(self, indent):
+# [FUNCTION DOC] HELPER: Builds the content string for a tensor: empty gives brackets, large tensors are summarized, zero/neg/conj bits
+# are resolved, float8 types are cast to half, and formatters are created (separate real and imaginary for complex)
+# before delegating to the recursive renderer.
     if self.numel() == 0:
         return "[]"
 
@@ -369,6 +404,9 @@ def _tensor_str(self, indent):
 
 
 def _add_suffixes(tensor_str, suffixes, indent, force_newline):
+# [FUNCTION DOC] HELPER: Appends suffix strings (device, dtype, etc.) and the closing parenthesis to the tensor text, putting each
+# suffix on a new indented line when forced or when it would exceed the line width. Returns the joined string.
+# KNOWN ISSUE: last_line_len is computed with a plus 1 offset, which looks like an approximation of the current line length.
     tensor_strs = [tensor_str]
     last_line_len = len(tensor_str) - tensor_str.rfind("\n") + 1
     for suffix in suffixes:
@@ -385,6 +423,8 @@ def _add_suffixes(tensor_str, suffixes, indent, force_newline):
 
 
 def get_summarized_data(self):
+# [FUNCTION DOC] Returns a reduced tensor containing only the edge items of each dimension (recursively) so formatters see just
+# the values that will be printed. Returns the tensor itself when small, an empty tensor if edgeitems is 0 for rank 2+.
     dim = self.dim()
     if dim == 0:
         return self
@@ -406,6 +446,11 @@ def get_summarized_data(self):
 
 
 def _str_intern(inp, *, tensor_contents=None):
+# [FUNCTION DOC] HELPER: Builds the full repr string of a tensor. Handles functorch wrappers, picks prefix (tensor, nested_tensor,
+# subclass name), collects suffixes (device, size, nnz, dtype, layout, grad_fn or requires_grad, tangent), and renders contents
+# for sparse COO, sparse compressed, quantized, nested, functional, meta/fake and strided tensors. tensor_contents, if given,
+# replaces the generated contents. Non-plain Parameter subclasses are wrapped as Parameter. Moves xla, lazy, ipu, mtia tensors
+# to cpu first. Forward-AD primal is used for printing.
     if torch._C._functorch.is_functorch_wrapped_tensor(inp):
         return _functorch_wrapper_str_intern(inp, tensor_contents=tensor_contents)
     is_plain_tensor = type(inp) is torch.Tensor or type(inp) is torch.nn.Parameter
@@ -587,6 +632,8 @@ def _str_intern(inp, *, tensor_contents=None):
         if not custom_contents_provided:
 
             def indented_str(s, indent):
+                # [FUNCTION DOC] HELPER: Indents every line of a string by two spaces.
+                # KNOWN ISSUE: the indent argument is ignored; a fixed two-space indent is always used.
                 return "\n".join(f"  {line}" for line in s.split("\n"))
 
             strs = ",\n".join(
@@ -681,6 +728,9 @@ def _str_intern(inp, *, tensor_contents=None):
 
 
 def _functorch_wrapper_str_intern(tensor, *, tensor_contents=None):
+# [FUNCTION DOC] HELPER: Renders functorch wrapper tensors (BatchedTensor, GradTrackingTensor, FunctionalTensor) showing level
+# and the indented repr of the wrapped value. Syncs functional tensors first. Raises AssertionError for invalid level or bdim,
+# and ValueError for unknown wrapper kinds.
     level = torch._C._functorch.maybe_get_level(tensor)
     if level == -1:
         raise AssertionError("expected functorch level to be >= 0, got -1")
@@ -710,6 +760,8 @@ def _functorch_wrapper_str_intern(tensor, *, tensor_contents=None):
 
 
 def _str(self, *, tensor_contents=None):
+# [FUNCTION DOC] HELPER: Entry point for tensor repr: runs _str_intern with grad mode and Python dispatch modes disabled
+# (and functorch disabled) so printing does not trace or record operations. Returns the string.
     with torch.no_grad(), torch.utils._python_dispatch._disable_current_modes():
         guard = torch._C._DisableFuncTorch()  # noqa: F841
         return _str_intern(self, tensor_contents=tensor_contents)
