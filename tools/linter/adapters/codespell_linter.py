@@ -4,6 +4,11 @@
 #   "codespell[toml]==2.4.1",
 # ]
 # ///
+# [MODULE DOC] Lintrunner adapter that runs codespell on files in a process pool with the
+# repository dictionary of accepted words, and also validates the dictionary itself (no
+# duplicates, case-insensitively sorted, no forbidden words). Prints JSON error messages.
+# Import-time side effects: none beyond defining constants (REPO_ROOT, DICTIONARY path,
+# forbidden words, 1 GB size cap).
 from __future__ import annotations
 
 import argparse
@@ -30,6 +35,7 @@ MAX_FILE_SIZE: int = 1024 * 1024 * 1024  # 1GB in bytes
 
 
 class LintSeverity(str, Enum):
+    # [CLASS DOC] String enum of lintrunner severities: error, warning, advice, disabled.
     ERROR = "error"
     WARNING = "warning"
     ADVICE = "advice"
@@ -37,6 +43,9 @@ class LintSeverity(str, Enum):
 
 
 class LintMessage(NamedTuple):
+    # [CLASS DOC] Immutable record of one lintrunner finding: path, line, char, code, severity,
+    # name, original text, replacement text and description (several may be None). Printed
+    # as a JSON object via its dict conversion.
     path: str | None
     line: int | None
     char: int | None
@@ -54,6 +63,9 @@ def format_error_message(
     *,
     message: str | None = None,
 ) -> LintMessage:
+    # [FUNCTION DOC] Build an error-severity "spelling error" LintMessage for the file without
+    # line or column. If no message is given but an exception is, the description names the
+    # exception class and text and advises fixing the error or adding words to the dictionary.
     if message is None and error is not None:
         message = (
             f"Failed due to {error.__class__.__name__}:\n{error}\n"
@@ -74,6 +86,10 @@ def format_error_message(
 
 
 def run_codespell(path: Path) -> str:
+    # [FUNCTION DOC] Run codespell as a module under the current interpreter on the file with
+    # the repository ignore-words dictionary, from the temp directory (to avoid codespell
+    # reading a repo pyproject). Returns combined output on success; raises ValueError carrying
+    # the output when codespell exits non-zero (i.e. misspellings found).
     try:
         return subprocess.check_output(
             [
@@ -101,6 +117,10 @@ def run_codespell(path: Path) -> str:
 
 
 def check_file(filename: str) -> list[LintMessage]:
+    # [FUNCTION DOC] Spell-check one file. Files above the size cap give a warning and are
+    # skipped; a size lookup failure gives an error message. Otherwise codespell is run and
+    # any failure (including misspellings) becomes a single spelling error message; success
+    # returns an empty list.
     path = Path(filename).absolute()
 
     # Check if file is too large
@@ -143,6 +163,10 @@ def check_file(filename: str) -> list[LintMessage]:
 
 
 def check_dictionary(filename: str) -> list[LintMessage]:
+    # [FUNCTION DOC] Validate the dictionary file: lines must be unique, sorted
+    # case-insensitively, and contain no forbidden word (in original or lower case). The first
+    # violated rule, or any read error, is returned as a single error message; otherwise an
+    # empty list.
     """Check the dictionary file for duplicates."""
     path = Path(filename).absolute()
     try:
@@ -170,6 +194,8 @@ def check_dictionary(filename: str) -> list[LintMessage]:
 
 
 def _default_num_workers() -> int | None:
+    # [FUNCTION DOC] HELPER: worker count default. Returns the MAX_JOBS environment value when
+    # it is a positive integer, otherwise the CPU count (which may be None).
     # Forks one process per file batch, so respect MAX_JOBS to cap parallelism.
     max_jobs = os.environ.get("MAX_JOBS")
     if max_jobs and max_jobs.isdigit() and int(max_jobs) > 0:
@@ -178,6 +204,10 @@ def _default_num_workers() -> int | None:
 
 
 def main() -> None:
+    # [FUNCTION DOC] CLI entry point. Parses verbose flag, worker count and file names,
+    # configures logging to stderr, then in a process pool spell-checks every file and also
+    # validates the dictionary file. Prints each lint message as JSON to stdout; unexpected
+    # exceptions are logged with the target name and re-raised.
     parser = argparse.ArgumentParser(
         description="Check files for spelling mistakes using codespell.",
         fromfile_prefix_chars="@",

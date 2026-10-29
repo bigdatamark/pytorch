@@ -4,6 +4,10 @@
 #   "cmakelint==1.4.1",
 # ]
 # ///
+# [MODULE DOC] Lintrunner adapter that runs cmakelint with a given config file on CMake files
+# in parallel threads and prints one JSON error message per reported line to stdout.
+# Run as a script; the commented block above declares the cmakelint dependency. No
+# import-time side effects beyond imports and constants.
 from __future__ import annotations
 
 import argparse
@@ -22,6 +26,7 @@ LINTER_CODE = "CMAKE"
 
 
 class LintSeverity(str, Enum):
+    # [CLASS DOC] String enum of lintrunner severities: error, warning, advice, disabled.
     ERROR = "error"
     WARNING = "warning"
     ADVICE = "advice"
@@ -29,6 +34,9 @@ class LintSeverity(str, Enum):
 
 
 class LintMessage(NamedTuple):
+    # [CLASS DOC] Immutable record of one lintrunner finding: path, line, char, code, severity,
+    # name, original text, replacement text and description (several may be None). Printed
+    # as a JSON object via its dict conversion.
     path: str | None
     line: int | None
     char: int | None
@@ -56,6 +64,9 @@ RESULTS_RE: re.Pattern[str] = re.compile(
 def run_command(
     args: list[str],
 ) -> subprocess.CompletedProcess[bytes]:
+    # [FUNCTION DOC] Run the command list with captured output and no exit status check; return
+    # the CompletedProcess. Logs command and elapsed milliseconds at debug level; OSError from
+    # process launch propagates.
     logging.debug("$ %s", " ".join(args))
     start_time = time.monotonic()
     try:
@@ -72,6 +83,10 @@ def check_file(
     filename: str,
     config: str,
 ) -> list[LintMessage]:
+    # [FUNCTION DOC] Run cmakelint with the given config on one file. Returns one error message
+    # (line number, no column) per output line matching the result pattern; the bracketed
+    # check name is used as the message name. If the tool cannot be launched (OSError) returns
+    # a single command-failed error without location. Exit status is not checked.
     try:
         proc = run_command(
             ["cmakelint", f"--config={config}", filename],
@@ -107,6 +122,8 @@ def check_file(
     ]
 
 
+# Script entry: parses the config path and file names, lints all files in a thread pool and
+# prints each message as JSON; unexpected exceptions are logged and re-raised.
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="cmakelint runner",

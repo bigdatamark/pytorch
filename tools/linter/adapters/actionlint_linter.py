@@ -1,3 +1,6 @@
+# [MODULE DOC] Lintrunner adapter that runs the actionlint binary on GitHub workflow files in
+# parallel threads and prints one JSON lint message per finding to stdout. Run as a script
+# with a required binary path and file list; nothing runs at import time except imports.
 from __future__ import annotations
 
 import argparse
@@ -17,6 +20,7 @@ LINTER_CODE = "ACTIONLINT"
 
 
 class LintSeverity(str, Enum):
+    # [CLASS DOC] String enum of lintrunner severities: error, warning, advice, disabled.
     ERROR = "error"
     WARNING = "warning"
     ADVICE = "advice"
@@ -24,6 +28,9 @@ class LintSeverity(str, Enum):
 
 
 class LintMessage(NamedTuple):
+    # [CLASS DOC] Immutable record of one lintrunner finding: path, line, char, code, severity,
+    # name, original text, replacement text and description (several may be None). Printed
+    # as a JSON object via its dict conversion.
     path: str | None
     line: int | None
     char: int | None
@@ -51,6 +58,9 @@ RESULTS_RE: re.Pattern[str] = re.compile(
 def run_command(
     args: list[str],
 ) -> subprocess.CompletedProcess[bytes]:
+    # [FUNCTION DOC] Run the command list, capturing output (no check, no timeout), and
+    # return the CompletedProcess. Logs the command and elapsed milliseconds at debug level;
+    # OSError from process launch propagates.
     logging.debug("$ %s", " ".join(args))
     start_time = time.monotonic()
     try:
@@ -67,6 +77,11 @@ def check_file(
     binary: str,
     file: str,
 ) -> list[LintMessage]:
+    # [FUNCTION DOC] Run actionlint on one file, suppressing three known-benign messages
+    # (runs-on mapping, freethreaded input of setup-python, workflow_dispatch input limit).
+    # Returns one error message per line of output matching the result regex (file, line,
+    # char, message, bracketed code). If the binary cannot be launched (OSError) returns a
+    # single command-failed error without location. Exit status is not checked.
     try:
         proc = run_command(
             [
@@ -113,6 +128,9 @@ def check_file(
     ]
 
 
+# [FUNCTION DOC] Script entry (module level, not a function): parses the binary path and file
+# names, prints a JSON error and exits 0 if the binary is missing, otherwise lints all files
+# in a thread pool and prints each message as JSON; unexpected errors are logged and re-raised.
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="actionlint runner",

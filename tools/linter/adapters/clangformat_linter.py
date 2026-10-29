@@ -1,3 +1,7 @@
+# [MODULE DOC] Lintrunner adapter that runs clang-format on files in parallel threads and
+# reports a format message (original and replacement text) for every file whose formatted
+# output differs. Prints JSON lines to stdout. Defines IS_WINDOWS (platform flag); no other
+# import-time side effects.
 from __future__ import annotations
 
 import argparse
@@ -17,6 +21,8 @@ IS_WINDOWS: bool = os.name == "nt"
 
 
 def _default_num_workers() -> int | None:
+    # [FUNCTION DOC] HELPER: worker count default. Returns the MAX_JOBS environment value when
+    # it is a positive integer, otherwise the CPU count (which may be None).
     # clang-format must respect MAX_JOBS to cap parallelism.
     max_jobs = os.environ.get("MAX_JOBS")
     if max_jobs and max_jobs.isdigit() and int(max_jobs) > 0:
@@ -25,6 +31,7 @@ def _default_num_workers() -> int | None:
 
 
 class LintSeverity(str, Enum):
+    # [CLASS DOC] String enum of lintrunner severities: error, warning, advice, disabled.
     ERROR = "error"
     WARNING = "warning"
     ADVICE = "advice"
@@ -32,6 +39,9 @@ class LintSeverity(str, Enum):
 
 
 class LintMessage(NamedTuple):
+    # [CLASS DOC] Immutable record of one lintrunner finding: path, line, char, code, severity,
+    # name, original text, replacement text and description (several may be None). Printed
+    # as a JSON object via its dict conversion.
     path: str | None
     line: int | None
     char: int | None
@@ -44,6 +54,8 @@ class LintMessage(NamedTuple):
 
 
 def as_posix(name: str) -> str:
+    # [FUNCTION DOC] HELPER: on Windows replace backslashes with forward slashes in name;
+    # on other platforms return name unchanged.
     return name.replace("\\", "/") if IS_WINDOWS else name
 
 
@@ -52,6 +64,9 @@ def _run_command(
     *,
     timeout: int,
 ) -> subprocess.CompletedProcess[bytes]:
+    # [FUNCTION DOC] HELPER: run the command once with captured output, a timeout, and
+    # check enabled (shell mode on Windows so batch scripts are found). Logs command and
+    # elapsed time at debug level. Raises TimeoutExpired or CalledProcessError on failure.
     logging.debug("$ %s", " ".join(args))
     start_time = time.monotonic()
     try:
@@ -73,6 +88,10 @@ def run_command(
     retries: int,
     timeout: int,
 ) -> subprocess.CompletedProcess[bytes]:
+    # [FUNCTION DOC] Run the command, retrying only on timeout up to the given number of
+    # retries with a one second sleep and a warning log between attempts. Returns the
+    # CompletedProcess; re-raises TimeoutExpired once retries are exhausted. Other errors
+    # (CalledProcessError, OSError) propagate immediately.
     remaining_retries = retries
     while True:
         try:
@@ -96,6 +115,11 @@ def check_file(
     retries: int,
     timeout: int,
 ) -> list[LintMessage]:
+    # [FUNCTION DOC] Format one file with clang-format and compare against its current bytes.
+    # Returns an empty list if identical; a single warning with original and replacement text
+    # if different (the tool writes the formatted result to stdout; the file is not modified).
+    # A timeout yields a timeout error message; OSError or a failing exit yields an advice
+    # level command-failed message including the command, stderr and stdout.
     try:
         with open(filename, "rb") as f:
             original = f.read()
@@ -171,6 +195,11 @@ def check_file(
 
 
 def main() -> None:
+    # [FUNCTION DOC] CLI entry point. Parses binary path, retries (default 3), timeout
+    # (default 90 s), verbose flag, worker count and file names; configures logging to stderr.
+    # If the binary path does not exist prints a JSON init-error and exits with status 0.
+    # Otherwise checks all files in a thread pool and prints each lint message as JSON on
+    # stdout; unexpected exceptions are logged and re-raised.
     parser = argparse.ArgumentParser(
         description="Format files with clang-format.",
         fromfile_prefix_chars="@",

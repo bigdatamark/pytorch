@@ -1,3 +1,6 @@
+# [MODULE DOC] Lintrunner adapter that reports an error for each given file that has the
+# executable permission bit set. Run as a script with file names; prints one JSON lint
+# message per offending file to stdout. No import-time side effects beyond imports.
 """
 EXEC: Ensure that source files are not executable.
 """
@@ -17,6 +20,7 @@ LINTER_CODE = "EXEC"
 
 
 class LintSeverity(str, Enum):
+    # [CLASS DOC] String enum of lintrunner severities: error, warning, advice, disabled.
     ERROR = "error"
     WARNING = "warning"
     ADVICE = "advice"
@@ -24,6 +28,9 @@ class LintSeverity(str, Enum):
 
 
 class LintMessage(NamedTuple):
+    # [CLASS DOC] Immutable record of one lintrunner finding: path, line, char, code, severity,
+    # name, original text, replacement text and description (several may be None). Printed
+    # as a JSON object via its dict conversion.
     path: str | None
     line: int | None
     char: int | None
@@ -36,6 +43,8 @@ class LintMessage(NamedTuple):
 
 
 def check_file(filename: str) -> LintMessage | None:
+    # [FUNCTION DOC] Test whether the current user can execute the file. Returns an error
+    # message (executable-permissions, advising removal of the permission) if so, else None.
     is_executable = os.access(filename, os.X_OK)
     if is_executable:
         return LintMessage(

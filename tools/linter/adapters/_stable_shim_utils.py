@@ -1,3 +1,9 @@
+# [MODULE DOC] Shared machinery for the stable-shim linters: lint message types, matchers
+# that find identifiers (exported functions, typedefs, using aliases, structs/classes,
+# dynamic-version calls) in C/C++ header lines, a preprocessor tracker that records the
+# TORCH_FEATURE_VERSION block each line sits in, and git/version helpers.
+# Import-time side effects: computes REPO_ROOT, inserts it at the front of sys.path and
+# imports parse_version from tools.setup_helpers.gen_version_header.
 """
 Shared utilities for stable-shim linters.
 
@@ -31,6 +37,7 @@ from tools.setup_helpers.gen_version_header import parse_version
 
 
 class LintSeverity(str, Enum):
+    # [CLASS DOC] String enum of lintrunner severities: error, warning, advice, disabled.
     ERROR = "error"
     WARNING = "warning"
     ADVICE = "advice"
@@ -38,6 +45,9 @@ class LintSeverity(str, Enum):
 
 
 class LintMessage(NamedTuple):
+    # [CLASS DOC] Immutable record of one lintrunner finding: path, line, char, code, severity,
+    # name, original text, replacement text and description (location and text fields may be
+    # None). Serialized to JSON lines by the adapters.
     path: str | None
     line: int | None
     char: int | None
@@ -50,6 +60,8 @@ class LintMessage(NamedTuple):
 
 
 class IdentifierUse(NamedTuple):
+    # [CLASS DOC] Pair of an identifier name and the (major, minor, patch) version of the
+    # enclosing version block, or None when the use is outside any version block.
     """
     An identifier (name of function, typedef, class etc) that is used at a particular version.
     """
@@ -59,6 +71,9 @@ class IdentifierUse(NamedTuple):
 
 
 class MultilineMatcher(NamedTuple):
+    # [CLASS DOC] Matcher spanning several lines: accumulation starts at a line matching
+    # start_pattern and ends at a match of end_pattern; handler then turns the accumulated
+    # text and current block version into a list of IdentifierUse.
     """
     Identifier matching using a start and end pattern, and a handler to extract the
     identifieruse from the accumulated buffer.
@@ -76,6 +91,8 @@ class MultilineMatcher(NamedTuple):
 
 
 class IdentifierMatcher(NamedTuple):
+    # [CLASS DOC] Single-line matcher: any line matching pattern (outside an active
+    # multiline match) yields the fixed identifier name stored in the identifier field.
     """
     Matcher that just searches for the pattern in each line, these patterns are not
     searched for when a multiline matcher is active.
@@ -86,6 +103,9 @@ class IdentifierMatcher(NamedTuple):
 
     @staticmethod
     def word(word: str):
+        # [FUNCTION DOC] Static factory: build an IdentifierMatcher whose pattern matches the
+        # given word on word boundaries (the word is regex-escaped) and whose identifier is
+        # the word itself.
         return IdentifierMatcher(
             pattern=rf"\b{re.escape(word)}\b",
             identifier=word,
@@ -95,6 +115,10 @@ class IdentifierMatcher(NamedTuple):
 def extract_factory(
     pattern,
 ) -> Callable[[str, tuple[int, int, int] | None], list[IdentifierUse]]:
+    # [FUNCTION DOC] Build a MultilineMatcher handler from a regex pattern with one capture
+    # group. The returned extractor searches the buffer (dot matches newlines) and returns a
+    # one-element list with the captured identifier and the current version; if there is no
+    # match it raises ValueError (start/end patterns and the regex disagree).
     """
     Default handler that uses a single pattern and is expected to just find a single match.
     It uses re.DOTALL to compile the regex pattern provided.
@@ -102,6 +126,9 @@ def extract_factory(
     p = re.compile(pattern, flags=re.DOTALL)
 
     def extractor(buffer: str, current_version: tuple[int, int, int] | None):
+        # [FUNCTION DOC] HELPER: Handler closure over the compiled pattern; see
+        # extract_factory. Returns the first group of the first match tagged with
+        # current_version, or raises ValueError when nothing matches.
         identifier = p.search(buffer)
 
         if identifier:
@@ -159,6 +186,11 @@ MULTILINE_MATCHERS = [
 
 
 def dynamic_call_parser(buffer: str, current_version: tuple[int, int, int] | None):
+    # [FUNCTION DOC] Handler for dynamic-version call macros whose name embeds a version
+    # (major, minor, patch). Strips spaces and newlines from the buffer, parses the version
+    # and the first two macro arguments. Returns two IdentifierUse entries: the dynamic
+    # lookup identifier at the macro's version and the fallback identifier at the current
+    # block version. Raises RuntimeError if the macro pattern is not found.
     pattern = r"TORCH_DYNAMIC_VERSION_CALL_(\d+)_(\d+)_(\d+)\(([^,]+),([^,\)]+)"
     buffer_without_space = buffer.replace(" ", "").replace("\n", "")
     res = re.findall(pattern, buffer_without_space)
@@ -184,6 +216,10 @@ DYNAMIC_VERSION_CALL_IDENTIFIER_MATCHER = MultilineMatcher(
 
 
 class MatcherAccumulator:
+    # [CLASS DOC] Stateful line-by-line scanner. Holds compiled multiline and single-line
+    # matchers, a text buffer for the active multiline matcher, the persistent scope version
+    # and the identifiers found on the latest line. Feed lines with process_line, set the
+    # block version with set_scope_version, read results with identifiers_used.
     """
     This class accumulates into a buffer whenever one of the start patterns of the matchers
     is encountered. When the end pattern is found it triggers the handler to extract the
@@ -195,6 +231,8 @@ class MatcherAccumulator:
     """
 
     def __init__(self, matchers: list[MultilineMatcher | IdentifierMatcher]):
+        # [FUNCTION DOC] Split the given matchers by type, compiling their regex patterns,
+        # clear the scope version and reset accumulation state. Other types are ignored.
         self._multi_line_matchers = []
         self._identifier_matchers = []
 
@@ -220,6 +258,8 @@ class MatcherAccumulator:
         self._reset_accumulation()
 
     def _reset_accumulation(self):
+        # [FUNCTION DOC] HELPER: clear buffer, end-found flag, active matcher and found
+        # identifiers. The scope version is deliberately kept.
         """
         Resets the internal state such that new start patterns are sought.
         """
@@ -229,6 +269,8 @@ class MatcherAccumulator:
         self._found_identifiers = []
 
     def set_scope_version(self, scope_version: tuple[int, int, int] | None):
+        # [FUNCTION DOC] Store the version of the enclosing version block (or None); it is
+        # attached to identifiers found on later lines.
         """
         Function called whenever the outer version 'scope' we're parsing from
         changes, this is provided to the handler.
@@ -239,6 +281,12 @@ class MatcherAccumulator:
         self,
         line: str,
     ) -> bool:
+        # [FUNCTION DOC] Consume one source line. If the previous match finished, reset first.
+        # If no multiline matcher is active, try each start pattern (first hit wins, line is
+        # trimmed to the match start). While active, drop text after a double slash, cut the
+        # line at the end-pattern match, append to the buffer, and on completion call the
+        # handler to fill the found identifiers. Otherwise apply every single-line matcher.
+        # Returns True if a multiline matcher is active after this line (state is mutated).
         """
         Processes a single line, searches for start and end token and strips out single-line comments.
 
@@ -290,6 +338,8 @@ class MatcherAccumulator:
         return self._active_multiline_matcher is not None
 
     def identifiers_used(self) -> list[IdentifierUse]:
+        # [FUNCTION DOC] Return the identifiers found by the most recent process_line call
+        # (empty if none; the internal list is returned, not a copy).
         """
         Returns identifiers found.
         """
@@ -297,6 +347,12 @@ class MatcherAccumulator:
 
 
 class PreprocessorTracker:
+    # [CLASS DOC] Tracks C/C++ preprocessor nesting and comment state while lines are fed in.
+    # State: a stack of (is_version_block, version) entries, the current version_of_block,
+    # an in-block-comment flag, the version regex, and an internal MatcherAccumulator that
+    # finds identifiers on code lines. Key methods: process_line, identifiers_used.
+    # KNOWN ISSUE: the inline comment says the version tuple is (major, minor) but it holds
+    # three integers (major, minor, patch).
     """
     Helper class to track preprocessor directives and version blocks.
 
@@ -312,6 +368,9 @@ class PreprocessorTracker:
     """
 
     def __init__(self, matchers):
+        # [FUNCTION DOC] Set up empty directive stack, no current version, not in a block
+        # comment, the regex for version conditions in if/elif lines, and the accumulator
+        # built from the given matchers.
         """Initialize the preprocessor tracker."""
         # Stack of (is_version_block, version_tuple) tuples
         # is_version_block: True if this is a TORCH_FEATURE_VERSION >= TORCH_VERSION_X_Y_0 block
@@ -332,6 +391,14 @@ class PreprocessorTracker:
         self._identifier_accumulator = MatcherAccumulator(matchers)
 
     def process_line(self, line: str) -> bool:
+        # [FUNCTION DOC] Update tracker state for one line. Block-comment lines and line
+        # comments return True and are skipped. Conditional directives push/pop the stack and
+        # update version_of_block (a version if/elif sets it; else/elif clear it; endif
+        # restores the nearest enclosing version block). Other lines go to the accumulator
+        # with the current version and return False.
+        # KNOWN ISSUE: else and elif clear version_of_block even when an outer version block
+        # still encloses them, and a line containing the block comment opener is treated as
+        # a comment line even if code precedes it.
         """
         Process a line and update the preprocessor state.
 
@@ -432,6 +499,8 @@ class PreprocessorTracker:
         return False
 
     def identifiers_used(self) -> list[IdentifierUse]:
+        # [FUNCTION DOC] Return identifiers found on the last code line from the accumulator
+        # (an empty list if it reports None).
         found = self._identifier_accumulator.identifiers_used()
         return found if found is not None else []
 
@@ -444,6 +513,10 @@ def run_with_retries(
     attempts: int = 3,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    # [FUNCTION DOC] Run cmd as a subprocess (cwd, env, per-attempt timeout; captured text
+    # output) up to attempts times, sleeping 1, 2, ... seconds (doubling) between failures.
+    # Returns the first CompletedProcess with exit code 0; raises RuntimeError containing the
+    # last stderr/stdout (or timeout note) when all attempts fail.
     """Run a command until it succeeds or the retry limit is exhausted."""
     last_err = ""
     for attempt in range(attempts):
@@ -471,6 +544,10 @@ def run_with_retries(
 def run_git_object_command(
     args: list[str], *, cwd: Path = REPO_ROOT
 ) -> subprocess.CompletedProcess[str]:
+    # [FUNCTION DOC] Run a git command with lazy fetching disabled and a 5 second timeout;
+    # return the result on success. On failure or timeout, retry via run_with_retries (3
+    # attempts, 120 s timeout) with lazy fetching allowed. Raises RuntimeError describing
+    # both failures if the retry also fails.
     """Run an object-reading Git command.
 
     If on a partial clone, only if the first local attempt fails, retry 3
@@ -509,6 +586,10 @@ def run_git_object_command(
 def read_file_at_revision(
     revision: str, filename: str | Path, *, cwd: Path = REPO_ROOT
 ) -> str | None:
+    # [FUNCTION DOC] Read a file's text at a git revision. Makes the path repo-relative (raises
+    # RuntimeError if outside the repository), lists it with the tree command; returns None if
+    # absent. Raises RuntimeError if the listing has not exactly one entry or it is not a
+    # blob; otherwise returns the blob content.
     """Return file contents at `revision`, or None if that path did not exist."""
     path = Path(filename)
     if not path.is_absolute():
@@ -541,6 +622,9 @@ def read_file_at_revision(
 
 @functools.cache
 def merge_base_with_main() -> str:
+    # [FUNCTION DOC] Cached (once per process). Ask git offline (no lazy fetch, 5 s timeout)
+    # for the merge-base of HEAD and the origin/main remote-tracking ref; return the commit
+    # hash. Raises RuntimeError with fetch instructions on timeout, failure or empty output.
     """
     Return the merge-base of HEAD and the already-fetched origin/main ref.
 
@@ -574,6 +658,8 @@ def merge_base_with_main() -> str:
 
 
 def get_current_version() -> tuple[int, int, int]:
+    # [FUNCTION DOC] Read version.txt at the repo root and parse it into a (major, minor,
+    # patch) tuple. Raises RuntimeError if the file is missing.
     """
     Get the current PyTorch version from version.txt. Returns (major, minor, patch) tuple.
     """

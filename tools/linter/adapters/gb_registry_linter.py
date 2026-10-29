@@ -1,5 +1,11 @@
 # mypy: ignore-errors
-
+# [MODULE DOC] Lintrunner adapter that keeps the dynamo graph break registry JSON in sync with
+# the graph-break calls found in the dynamo source tree. Reports direct raises of the
+# Unsupported exception, gb_types reused with different content, gb_types duplicated across
+# registry ids, and (with original and replacement text so lintrunner can auto-apply) a
+# needed registry update. Import-time side effects: patches the standard library ast
+# line-splitting helper with a cache when it exists, and puts the repo root first on sys.path
+# before importing the registry helpers from tools.dynamo.
 from __future__ import annotations
 
 import argparse
@@ -35,6 +41,7 @@ LINTER_CODE = "GB_REGISTRY"
 
 
 class LintSeverity(str, Enum):
+    # [CLASS DOC] String enum of lintrunner severities: error, warning, advice, disabled.
     ERROR = "error"
     WARNING = "warning"
     ADVICE = "advice"
@@ -42,6 +49,9 @@ class LintSeverity(str, Enum):
 
 
 class LintMessage(NamedTuple):
+    # [CLASS DOC] Immutable record of one lintrunner finding: path, line, char, code, severity,
+    # name, original text, replacement text and description (several may be None). Printed
+    # as a JSON object via its dict conversion.
     path: str | None
     line: int | None
     char: int | None
@@ -54,6 +64,9 @@ class LintMessage(NamedTuple):
 
 
 def _is_noqa_suppressed(source_lines: list[str], lineno: int) -> bool:
+    # [FUNCTION DOC] HELPER: True if the 1-based line ends with the suppression marker for this
+    # linter, or the line directly above consists only of that marker; False otherwise,
+    # including for out-of-range line numbers.
     if lineno <= 0 or lineno > len(source_lines):
         return False
     if source_lines[lineno - 1].rstrip().endswith(f"# noqa: {LINTER_CODE}"):
@@ -64,6 +77,8 @@ def _is_noqa_suppressed(source_lines: list[str], lineno: int) -> bool:
 
 
 def _is_forbidden_raise(node: ast.Raise) -> bool:
+    # [FUNCTION DOC] HELPER: True if the raise statement raises a call whose callee is a plain
+    # name or attribute named Unsupported; False for bare raises, non-calls or other names.
     if not isinstance(node.exc, ast.Call):
         return False
     if isinstance(node.exc.func, ast.Name):
@@ -76,6 +91,9 @@ def _is_forbidden_raise(node: ast.Raise) -> bool:
 def _collect_forbidden_unsupported_raises(
     dynamo_dir: Path,
 ) -> list[tuple[Path, int, int]]:
+    # [FUNCTION DOC] HELPER: parse every Python file under the directory (files with syntax
+    # errors are skipped) and collect (path, line, 1-based column) of each forbidden raise of
+    # Unsupported not suppressed by a noqa marker. Reads files; propagates read errors.
     forbidden_raises: list[tuple[Path, int, int]] = []
 
     for py_file in dynamo_dir.rglob("*.py"):
@@ -99,6 +117,8 @@ def _collect_forbidden_unsupported_raises(
 def _collect_all_calls(
     dynamo_dir: Path,
 ) -> dict[str, list[tuple[dict[str, Any], Path]]]:
+    # [FUNCTION DOC] HELPER: scan all Python files under the directory for graph-break calls
+    # (via the shared finder) and group them by gb_type into lists of (call info, file path).
     """Return mapping *gb_type → list[(call_info, file_path)]* for all occurrences."""
     gb_type_calls: dict[str, list[tuple[dict[str, Any], Path]]] = {}
 
@@ -115,6 +135,8 @@ def _collect_all_calls(
 def _create_registry_entry(
     gb_type: str, context: str, explanation: str, hints: list[str]
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: build a registry entry mapping with keys Gb_type, Context,
+    # Explanation and Hints (a missing hints list becomes empty).
     """Create a registry entry with consistent format."""
     return {
         "Gb_type": gb_type,
@@ -129,6 +151,12 @@ def _update_registry_with_changes(
     calls: dict[str, tuple[dict[str, Any], Path]],
     renames: dict[str, str] | None = None,
 ) -> dict:
+    # [FUNCTION DOC] HELPER: compute the new registry mapping (id to list of entries, newest
+    # first) without mutating the input. Renames prepend an entry with the new gb_type copying
+    # the old content; calls whose content differs from the latest entry prepend an updated
+    # entry; unknown gb_types get fresh ids and are all inserted together at one random
+    # position (to limit merge conflicts), or appended if the registry is empty. Uses
+    # randomness, so output order is not deterministic.
     """Calculate what the updated registry should look like."""
     renames = renames or {}
     updated_registry = dict(registry)
@@ -215,6 +243,13 @@ def _update_registry_with_changes(
 
 
 def check_registry_sync(dynamo_dir: Path, registry_path: Path) -> list[LintMessage]:
+    # [FUNCTION DOC] Run all registry checks. Stage 1: error for each direct raise of
+    # Unsupported. Stage 2: error per gb_type used several times with differing content (then
+    # returns early). Stage 3: loads the registry; error per gb_type that appears under
+    # multiple ids (then returns early). Stage 4: detects renames (new gb_type whose content
+    # matches an existing entry), new gb_types and changed content; if any, adds one warning
+    # carrying the current file text and the regenerated JSON text as replacement. Returns
+    # the message list; reads the registry file and source tree.
     """Check registry sync and return lint messages."""
     lint_messages = []
 
@@ -391,6 +426,9 @@ def check_registry_sync(dynamo_dir: Path, registry_path: Path) -> list[LintMessa
     return lint_messages
 
 
+# Script entry: parses the dynamo directory and registry path options (defaulting to the
+# repo's dynamo folder and its graph break registry file), runs check_registry_sync and
+# prints each message as JSON.
 if __name__ == "__main__":
     script_dir = Path(__file__).resolve()
     repo_root = script_dir.parents[3]

@@ -5,6 +5,12 @@
 #   "tomli==2.2.1 ; python_version < '3.11'",
 # ]
 # ///
+# [MODULE DOC] Lintrunner adapter that enforces that no file requires a newer minimum CMake
+# than the root CMakeLists.txt declares. Checks CMake files (cmake_minimum_required lines),
+# pyproject build-system requirements and requirements text files for CMake pins, using a
+# process pool, and prints JSON error messages. Import-time side effects: reads the root
+# CMakeLists.txt to compute CMAKE_MINIMUM_VERSION (raises RuntimeError if the declaration is
+# missing, or OSError if the file is unreadable).
 from __future__ import annotations
 
 import argparse
@@ -40,6 +46,9 @@ CMAKE_MINIMUM_REQUIRED_PATTERN = re.compile(
 
 
 def _root_cmake_minimum_version() -> Version:
+    # [FUNCTION DOC] HELPER: scan the root CMakeLists.txt line by line and return the version
+    # of the first minimum-required declaration as a Version. Raises RuntimeError if there
+    # is none; file read errors propagate.
     # The root CMakeLists.txt is the single source of truth for the minimum
     # CMake version -- scikit-build-core reads the same cmake_minimum_required
     # to decide which CMake to provision. Every other file is validated against
@@ -56,6 +65,7 @@ CMAKE_MINIMUM_VERSION = _root_cmake_minimum_version()
 
 
 class LintSeverity(str, Enum):
+    # [CLASS DOC] String enum of lintrunner severities: error, warning, advice, disabled.
     ERROR = "error"
     WARNING = "warning"
     ADVICE = "advice"
@@ -63,6 +73,9 @@ class LintSeverity(str, Enum):
 
 
 class LintMessage(NamedTuple):
+    # [CLASS DOC] Immutable record of one lintrunner finding: path, line, char, code, severity,
+    # name, original text, replacement text and description (several may be None). Printed
+    # as a JSON object via its dict conversion.
     path: str | None
     line: int | None
     char: int | None
@@ -81,6 +94,9 @@ def format_error_message(
     line: int | None = None,
     message: str | None = None,
 ) -> LintMessage:
+    # [FUNCTION DOC] Build an error-severity LintMessage for the file (optional line, no
+    # column) named "CMake minimum version". If no message text is given but an exception is
+    # given, the description becomes a failure text with the exception class name and text.
     if message is None and error is not None:
         message = f"Failed due to {error.__class__.__name__}:\n{error}"
     return LintMessage(
@@ -97,6 +113,9 @@ def format_error_message(
 
 
 def check_cmake(path: Path) -> list[LintMessage]:
+    # [FUNCTION DOC] Scan a CMake file for minimum-required declarations; at the first one whose
+    # version is greater than the root minimum, return a single error with its line number.
+    # Returns an empty list otherwise. File read errors propagate (not caught here).
     # The root CMakeLists.txt defines CMAKE_MINIMUM_VERSION, so it trivially
     # satisfies this check; every other cmake file must not require a newer
     # CMake than the environment provides.
@@ -124,6 +143,9 @@ def check_requirement(
     *,
     line: int | None = None,
 ) -> LintMessage | None:
+    # [FUNCTION DOC] Check one parsed requirement. Ignores anything not named cmake. For the
+    # first exact-match or at-least specifier whose version (trailing wildcard removed) is
+    # below the root minimum, returns an error message (with optional line); else None.
     if requirement.name.lower() != "cmake":
         return None
 
@@ -145,6 +167,10 @@ def check_requirement(
 
 
 def check_pyproject(path: Path) -> list[LintMessage]:
+    # [FUNCTION DOC] Parse a pyproject TOML file and check each build-system requires entry with
+    # check_requirement; returns the messages found. A parse or read error yields one error
+    # message; a file of unexpected shape (no build-system table or requires list) yields an
+    # empty list. Messages carry no line number.
     try:
         pyproject = tomllib.loads(path.read_text(encoding="utf-8"))
     except (tomllib.TOMLDecodeError, OSError) as err:
@@ -168,6 +194,9 @@ def check_pyproject(path: Path) -> list[LintMessage]:
 
 
 def check_requirements(path: Path) -> list[LintMessage]:
+    # [FUNCTION DOC] Check a requirements-style text file line by line, skipping blank, comment
+    # and option lines and lines that fail to parse as requirements. Returns the messages
+    # from check_requirement with line numbers; a read error yields a single error message.
     try:
         with path.open(encoding="utf-8") as f:
             lines = f.readlines()
@@ -191,6 +220,9 @@ def check_requirements(path: Path) -> list[LintMessage]:
 
 
 def check_file(filename: str) -> list[LintMessage]:
+    # [FUNCTION DOC] Dispatch by lower-cased base name: CMake files (CMakeLists and cmake
+    # modules or templates) go to check_cmake, pyproject.toml to check_pyproject, names
+    # matching requirements text patterns to check_requirements; others give an empty list.
     path = Path(filename).absolute()
     basename = path.name.lower()
     if basename in ("cmakelists.txt", "cmakelists.txt.in") or basename.endswith(
@@ -207,6 +239,9 @@ def check_file(filename: str) -> list[LintMessage]:
 
 
 def main() -> None:
+    # [FUNCTION DOC] CLI entry point. Parses verbose flag and file names, configures logging to
+    # stderr, checks all files in a process pool and prints each lint message as JSON to
+    # stdout; unexpected exceptions are logged with the file name and re-raised.
     parser = argparse.ArgumentParser(
         description="Check consistency of cmake minimum version in requirement files.",
         fromfile_prefix_chars="@",

@@ -14,6 +14,11 @@
 #   "setuptools<82",
 # ]
 # ///
+# [MODULE DOC] Lintrunner adapter that runs flake8 (with an optional plugins path) once over
+# all given files, retrying when flake8 reports a linting timeout, and converts each output
+# line into a JSON lint message with a severity (command line overrides, else a prefix based
+# default) and a documentation link. Constants hold the sets of rule codes that have
+# documentation pages. No import-time side effects beyond defining constants.
 from __future__ import annotations
 
 import argparse
@@ -32,6 +37,7 @@ IS_WINDOWS: bool = os.name == "nt"
 
 
 class LintSeverity(str, Enum):
+    # [CLASS DOC] String enum of lintrunner severities: error, warning, advice, disabled.
     ERROR = "error"
     WARNING = "warning"
     ADVICE = "advice"
@@ -39,6 +45,9 @@ class LintSeverity(str, Enum):
 
 
 class LintMessage(NamedTuple):
+    # [CLASS DOC] Immutable record of one lintrunner finding: path, line, char, code, severity,
+    # name, original text, replacement text and description (several may be None). Printed
+    # as a JSON object via its dict conversion.
     path: str | None
     line: int | None
     char: int | None
@@ -51,6 +60,8 @@ class LintMessage(NamedTuple):
 
 
 def as_posix(name: str) -> str:
+    # [FUNCTION DOC] HELPER: on Windows replace backslashes with forward slashes in name;
+    # on other platforms return name unchanged.
     return name.replace("\\", "/") if IS_WINDOWS else name
 
 
@@ -126,6 +137,9 @@ RESULTS_RE: re.Pattern[str] = re.compile(
 
 
 def _test_results_re() -> None:
+    # [FUNCTION DOC] HELPER: doctest holder with no executable body; its docstring examples
+    # show how the result pattern splits flake8 output lines into file, line, optional
+    # column, code and message. Does nothing when called.
     """
     >>> def t(s):
     ...     return RESULTS_RE.search(s).groupdict()
@@ -152,6 +166,11 @@ def _run_command(
     *,
     extra_env: dict[str, str] | None,
 ) -> subprocess.CompletedProcess[str]:
+    # [FUNCTION DOC] HELPER: run the command once with captured UTF-8 text output and check
+    # enabled. Logs the command (prefixed with the extra environment settings) and elapsed
+    # time at debug level. Raises CalledProcessError on non-zero exit.
+    # KNOWN ISSUE: extra_env is only logged; it is never passed to the subprocess, so the
+    # plugins path setting has no effect on the child process.
     logging.debug(
         "$ %s",
         " ".join(
@@ -177,6 +196,10 @@ def run_command(
     extra_env: dict[str, str] | None,
     retries: int,
 ) -> subprocess.CompletedProcess[str]:
+    # [FUNCTION DOC] Run the command, retrying (with a one second sleep and a warning log)
+    # only when the failure output starts with flake8's linting-timed-out marker, up to the
+    # retry count. Returns the CompletedProcess; re-raises CalledProcessError for other
+    # failures or when retries are exhausted.
     remaining_retries = retries
     while True:
         try:
@@ -198,6 +221,9 @@ def run_command(
 
 
 def get_issue_severity(code: str) -> LintSeverity:
+    # [FUNCTION DOC] Default severity for a flake8 code by prefix: advice for style, complexity,
+    # comprehension, unused-import, star-import, bugbear opinionated and type-note codes;
+    # error for undefined name and syntax error; warning for everything else.
     # "B901": `return x` inside a generator
     # "B902": Invalid first argument to a method
     # "B903": __slots__ efficiency
@@ -244,6 +270,9 @@ def get_issue_severity(code: str) -> LintSeverity:
 
 
 def get_issue_documentation_url(code: str) -> str:
+    # [FUNCTION DOC] Return the documentation URL for the code: a per-rule flake8rules page, the
+    # comprehensions plugin rules page, or the bugbear warnings list depending on which set
+    # contains the code; an empty string if unknown.
     if code in DOCUMENTED_IN_FLAKE8RULES:
         return f"https://www.flake8rules.com/rules/{code}.html"
 
@@ -262,6 +291,11 @@ def check_files(
     severities: dict[str, LintSeverity],
     retries: int,
 ) -> list[LintMessage]:
+    # [FUNCTION DOC] Run flake8 (via the current interpreter, exit status forced to zero) over
+    # all filenames in one invocation. Returns one message per parsed output line, with the
+    # description carrying the text and a documentation link, a column only when non-negative,
+    # and severity from the override map or the default by code. If launching fails or the
+    # command fails, returns a single command-failed error with command, stderr and stdout.
     try:
         proc = run_command(
             [sys.executable, "-mflake8", "--exit-zero"] + filenames,
@@ -318,6 +352,11 @@ def check_files(
 
 
 def main() -> None:
+    # [FUNCTION DOC] CLI entry point. Parses plugins path, repeatable code:severity overrides,
+    # retries (default 3), verbose flag and file names; configures logging to stderr. Resolves
+    # the plugins path to a real path and builds the severity map (raises AssertionError on a
+    # malformed override, ValueError on an unknown severity name). Runs check_files once and
+    # prints each lint message as JSON on stdout.
     parser = argparse.ArgumentParser(
         description="Flake8 wrapper linter.",
         fromfile_prefix_chars="@",
