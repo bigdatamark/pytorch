@@ -3,6 +3,10 @@
 
 # ruff: noqa
 # flake8: noqa
+# [MODULE DOC] Dynamo-patched copy of CPython 3.13 test_descr: tests for descriptors, the class
+# and type model (operators, metaclasses, slots, properties, MRO, super, pickling), run under the
+# CPythonTestCase harness. Importing defines the test classes and imports optional helpers
+# (_testcapi, xxsubtype) falling back to None; run_tests is invoked only when run as a script.
 
 # Test copied from
 # https://raw.githubusercontent.com/python/cpython/refs/tags/v3.13.5/Lib/test/test_descr.py
@@ -47,8 +51,13 @@ except ImportError:
 
 
 class OperatorsTest(CPythonTestCase):
+    # [CLASS DOC] Test case checking that operators on built-in and user-defined types dispatch to
+    # the matching special methods; helper methods run an expression and its special-method form
+    # and compare results.
 
     def __init__(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: constructor. Arguments: *args, **kwargs. Stores the given values
+        # on the instance, and for test cases initializes the base CPythonTestCase.
         CPythonTestCase.__init__(self, *args, **kwargs)
         self.binops = {
             'add': '+',
@@ -97,6 +106,8 @@ class OperatorsTest(CPythonTestCase):
             self.unops[name] = expr
 
     def unop_test(self, a, res, expr="len(a)", meth="__len__"):
+        # [FUNCTION DOC] HELPER: unop_test of OperatorsTest. Arguments: a, res, expr, meth.
+        # Supporting routine for tests; returns a computed value or None.
         d = {'a': a}
         self.assertEqual(eval(expr, d), res)
         t = type(a)
@@ -113,6 +124,8 @@ class OperatorsTest(CPythonTestCase):
         self.assertEqual(bm(), res)
 
     def binop_test(self, a, b, res, expr="a+b", meth="__add__"):
+        # [FUNCTION DOC] HELPER: binop_test of OperatorsTest. Arguments: a, b, res, expr, meth.
+        # Supporting routine for tests; returns a computed value or None.
         d = {'a': a, 'b': b}
 
         self.assertEqual(eval(expr, d), res)
@@ -128,6 +141,8 @@ class OperatorsTest(CPythonTestCase):
         self.assertEqual(bm(b), res)
 
     def sliceop_test(self, a, b, c, res, expr="a[b:c]", meth="__getitem__"):
+        # [FUNCTION DOC] HELPER: sliceop_test of OperatorsTest. Arguments: a, b, c, res, expr,
+        # meth. Supporting routine for tests; returns a computed value or None.
         d = {'a': a, 'b': b, 'c': c}
         self.assertEqual(eval(expr, d), res)
         t = type(a)
@@ -142,6 +157,8 @@ class OperatorsTest(CPythonTestCase):
         self.assertEqual(bm(slice(b, c)), res)
 
     def setop_test(self, a, b, res, stmt="a+=b", meth="__iadd__"):
+        # [FUNCTION DOC] HELPER: setop_test of OperatorsTest. Arguments: a, b, res, stmt, meth.
+        # Supporting routine for tests; returns a computed value or None.
         d = {'a': deepcopy(a), 'b': b}
         exec(stmt, d)
         self.assertEqual(d['a'], res)
@@ -161,6 +178,8 @@ class OperatorsTest(CPythonTestCase):
         self.assertEqual(d['a'], res)
 
     def set2op_test(self, a, b, c, res, stmt="a[b]=c", meth="__setitem__"):
+        # [FUNCTION DOC] HELPER: set2op_test of OperatorsTest. Arguments: a, b, c, res, stmt,
+        # meth. Supporting routine for tests; returns a computed value or None.
         d = {'a': deepcopy(a), 'b': b, 'c': c}
         exec(stmt, d)
         self.assertEqual(d['a'], res)
@@ -180,6 +199,8 @@ class OperatorsTest(CPythonTestCase):
         self.assertEqual(d['a'], res)
 
     def setsliceop_test(self, a, b, c, d, res, stmt="a[b:c]=d", meth="__setitem__"):
+        # [FUNCTION DOC] HELPER: setsliceop_test of OperatorsTest. Arguments: a, b, c, d, res,
+        # stmt, meth. Supporting routine for tests; returns a computed value or None.
         dictionary = {'a': deepcopy(a), 'b': b, 'c': c, 'd': d}
         exec(stmt, dictionary)
         self.assertEqual(dictionary['a'], res)
@@ -199,6 +220,9 @@ class OperatorsTest(CPythonTestCase):
         self.assertEqual(dictionary['a'], res)
 
     def test_lists(self):
+        # [FUNCTION DOC] Test: checks lists behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # Testing list operations...
         # Asserts are within individual test methods
         self.binop_test([1], [2], [1,2], "a+b", "__add__")
@@ -216,6 +240,9 @@ class OperatorsTest(CPythonTestCase):
                         "__setitem__")
 
     def test_dicts(self):
+        # [FUNCTION DOC] Test: checks dicts behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # Testing dict operations...
         self.binop_test({1:2,3:4}, 1, 1, "b in a", "__contains__")
         self.binop_test({1:2,3:4}, 2, 0, "b in a", "__contains__")
@@ -246,6 +273,8 @@ class OperatorsTest(CPythonTestCase):
 
     # Tests for unary and binary operators
     def number_operators(self, a, b, skip=[]):
+        # [FUNCTION DOC] HELPER: number_operators of OperatorsTest. Arguments: a, b, skip.
+        # Supporting routine for tests; returns a computed value or None.
         dict = {'a': a, 'b': b}
 
         for name, expr in self.binops.items():
@@ -263,6 +292,9 @@ class OperatorsTest(CPythonTestCase):
                     self.unop_test(a, res, expr, name)
 
     def test_ints(self):
+        # [FUNCTION DOC] Test: checks ints behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # Testing int operations...
         self.number_operators(100, 3)
         # The following crashes in Python 2.2
@@ -270,7 +302,11 @@ class OperatorsTest(CPythonTestCase):
         self.assertEqual((0).__bool__(), 0)
         # This returns 'NotImplemented' in Python 2.2
         class C(int):
+            # [CLASS DOC] HELPER: local class C defined inside test_ints to exercise
+            # descriptor/class-model behavior under test.
             def __add__(self, other):
+                # [FUNCTION DOC] HELPER: special method __add__ of C. Arguments: other. Implements
+                # the protocol hook used by tests; returns the hook result.
                 return NotImplemented
         self.assertEqual(C(5), 5)
         try:
@@ -281,22 +317,34 @@ class OperatorsTest(CPythonTestCase):
             self.fail("NotImplemented should have caused TypeError")
 
     def test_floats(self):
+        # [FUNCTION DOC] Test: checks floats behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # Testing float operations...
         self.number_operators(100.0, 3.0)
 
     def test_complexes(self):
+        # [FUNCTION DOC] Test: checks complexes behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # Testing complex operations...
         self.number_operators(100.0j, 3.0j, skip=['lt', 'le', 'gt', 'ge',
                                                   'int', 'float',
                                                   'floordiv', 'divmod', 'mod'])
 
         class Number(complex):
+            # [CLASS DOC] HELPER: local class Number defined inside test_complexes to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = ['prec']
             def __new__(cls, *args, **kwds):
+                # [FUNCTION DOC] HELPER: special method __new__ of Number. Arguments: *args,
+                # **kwds. Implements the protocol hook used by tests; returns the hook result.
                 result = complex.__new__(cls, *args)
                 result.prec = kwds.get('prec', 12)
                 return result
             def __repr__(self):
+                # [FUNCTION DOC] HELPER: special method __repr__ of Number. Implements the
+                # protocol hook used by tests; returns the hook result.
                 prec = self.prec
                 if self.imag == 0.0:
                     return "%.*g" % (prec, self.real)
@@ -318,6 +366,9 @@ class OperatorsTest(CPythonTestCase):
         self.assertEqual(a.prec, 12)
 
     def test_explicit_reverse_methods(self):
+        # [FUNCTION DOC] Test: checks explicit reverse methods behavior. Fails with AssertionError
+        # (via unittest assertions) if the observed behavior differs from CPython semantics; no
+        # other side effects beyond temporary objects and classes.
         # see issue 9930
         self.assertEqual(complex.__radd__(3j, 4.0), complex(4.0, 3.0))
         self.assertEqual(float.__rsub__(3.0, 1), -2.0)
@@ -325,10 +376,15 @@ class OperatorsTest(CPythonTestCase):
     @support.impl_detail("the module 'xxsubtype' is internal")
     @unittest.skipIf(xxsubtype is None, "requires xxsubtype module")
     def test_spam_lists(self):
+        # [FUNCTION DOC] Test: checks spam lists behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # Testing spamlist operations...
         import copy, xxsubtype as spam
 
         def spamlist(l, memo=None):
+            # [FUNCTION DOC] HELPER: local function spamlist inside test_spam_lists. Arguments: l,
+            # memo. Returns its computed value or None; used by the enclosing test.
             import xxsubtype as spam
             return spam.spamlist(l)
 
@@ -357,6 +413,10 @@ class OperatorsTest(CPythonTestCase):
                              spamlist([1,5,6,4]), "a[b:c]=d", "__setitem__")
         # Test subclassing
         class C(spam.spamlist):
+            # [FUNCTION DOC] HELPER: foo of C. Supporting routine for tests; returns a computed
+            # value or None.
+            # [CLASS DOC] HELPER: local class C defined inside test_spam_lists to exercise
+            # descriptor/class-model behavior under test.
             def foo(self): return 1
         a = C()
         self.assertEqual(a, [])
@@ -370,9 +430,14 @@ class OperatorsTest(CPythonTestCase):
     @support.impl_detail("the module 'xxsubtype' is internal")
     @unittest.skipIf(xxsubtype is None, "requires xxsubtype module")
     def test_spam_dicts(self):
+        # [FUNCTION DOC] Test: checks spam dicts behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # Testing spamdict operations...
         import copy, xxsubtype as spam
         def spamdict(d, memo=None):
+            # [FUNCTION DOC] HELPER: local function spamdict inside test_spam_dicts. Arguments: d,
+            # memo. Returns its computed value or None; used by the enclosing test.
             import xxsubtype as spam
             sd = spam.spamdict()
             for k, v in list(d.items()):
@@ -408,6 +473,10 @@ class OperatorsTest(CPythonTestCase):
                    "a[b]=c", "__setitem__")
         # Test subclassing
         class C(spam.spamdict):
+            # [FUNCTION DOC] HELPER: foo of C. Supporting routine for tests; returns a computed
+            # value or None.
+            # [CLASS DOC] HELPER: local class C defined inside test_spam_dicts to exercise
+            # descriptor/class-model behavior under test.
             def foo(self): return 1
         a = C()
         self.assertEqual(list(a.items()), [])
@@ -419,12 +488,21 @@ class OperatorsTest(CPythonTestCase):
         self.assertEqual(a.getstate(), 100)
 
     def test_wrap_lenfunc_bad_cast(self):
+        # [FUNCTION DOC] Test: checks wrap lenfunc bad cast behavior. Fails with AssertionError
+        # (via unittest assertions) if the observed behavior differs from CPython semantics; no
+        # other side effects beyond temporary objects and classes.
         self.assertEqual(range(sys.maxsize).__len__(), sys.maxsize)
 
 
 class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
+    # [CLASS DOC] Test case for the Python class model: metaclasses, slots, properties,
+    # descriptors, MRO, super, attribute access, special methods and related edge cases; each test
+    # method asserts via unittest assertions.
 
     def test_python_dicts(self):
+        # [FUNCTION DOC] Test: checks python dicts behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing Python subclass of dict...
         self.assertTrue(issubclass(dict, dict))
         self.assertIsInstance({}, dict)
@@ -433,8 +511,13 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertIs(d.__class__, dict)
         self.assertIsInstance(d, dict)
         class C(dict):
+            # [CLASS DOC] HELPER: local class C defined inside test_python_dicts to exercise
+            # descriptor/class-model behavior under test.
             state = -1
             def __init__(self_local, *a, **kw):
+                # [FUNCTION DOC] HELPER: constructor. Arguments: self_local, *a, **kw. Stores the
+                # given values on the instance, and for test cases initializes the base
+                # CPythonTestCase.
                 if a:
                     self.assertEqual(len(a), 1)
                     self_local.state = a[0]
@@ -442,13 +525,21 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
                     for k, v in list(kw.items()):
                         self_local[v] = k
             def __getitem__(self, key):
+                # [FUNCTION DOC] HELPER: special method __getitem__ of C. Arguments: key.
+                # Implements the protocol hook used by tests; returns the hook result.
                 return self.get(key, 0)
             def __setitem__(self_local, key, value):
+                # [FUNCTION DOC] HELPER: special method __setitem__ of C. Arguments: self_local,
+                # key, value. Implements the protocol hook used by tests; returns the hook result.
                 self.assertIsInstance(key, int)
                 dict.__setitem__(self_local, key, value)
             def setstate(self, state):
+                # [FUNCTION DOC] HELPER: setstate of C. Arguments: state. Supporting routine for
+                # tests; returns a computed value or None.
                 self.state = state
             def getstate(self):
+                # [FUNCTION DOC] HELPER: getstate of C. Supporting routine for tests; returns a
+                # computed value or None.
                 return self.state
         self.assertTrue(issubclass(C, dict))
         a1 = C(12)
@@ -477,9 +568,16 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
                 self.assertEqual(a[i][j], i*j)
 
     def test_python_lists(self):
+        # [FUNCTION DOC] Test: checks python lists behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing Python subclass of list...
         class C(list):
+            # [CLASS DOC] HELPER: local class C defined inside test_python_lists to exercise
+            # descriptor/class-model behavior under test.
             def __getitem__(self, i):
+                # [FUNCTION DOC] HELPER: special method __getitem__ of C. Arguments: i. Implements
+                # the protocol hook used by tests; returns the hook result.
                 if isinstance(i, slice):
                     return i.start, i.stop
                 return list.__getitem__(self, i) + 100
@@ -491,46 +589,77 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(a[100:200], (100,200))
 
     def test_metaclass(self):
+        # [FUNCTION DOC] Test: checks metaclass behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # Testing metaclasses...
         class C(metaclass=type):
+            # [CLASS DOC] HELPER: local class C defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: constructor. Stores the given values on the instance, and
+                # for test cases initializes the base CPythonTestCase.
                 self.__state = 0
             def getstate(self):
+                # [FUNCTION DOC] HELPER: getstate of C. Supporting routine for tests; returns a
+                # computed value or None.
                 return self.__state
             def setstate(self, state):
+                # [FUNCTION DOC] HELPER: setstate of C. Arguments: state. Supporting routine for
+                # tests; returns a computed value or None.
                 self.__state = state
         a = C()
         self.assertEqual(a.getstate(), 0)
         a.setstate(10)
         self.assertEqual(a.getstate(), 10)
         class _metaclass(type):
+            # [FUNCTION DOC] HELPER: myself of _metaclass. Supporting routine for tests; returns a
+            # computed value or None.
+            # [CLASS DOC] HELPER: local class _metaclass defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             def myself(cls): return cls
         class D(metaclass=_metaclass):
+            # [CLASS DOC] HELPER: local class D defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             pass
         self.assertEqual(D.myself(), D)
         d = D()
         self.assertEqual(d.__class__, D)
         class M1(type):
+            # [CLASS DOC] HELPER: local class M1 defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             def __new__(cls, name, bases, dict):
+                # [FUNCTION DOC] HELPER: special method __new__ of M1. Arguments: name, bases,
+                # dict. Implements the protocol hook used by tests; returns the hook result.
                 dict['__spam__'] = 1
                 return type.__new__(cls, name, bases, dict)
         class C(metaclass=M1):
+            # [CLASS DOC] HELPER: local class C defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             pass
         self.assertEqual(C.__spam__, 1)
         c = C()
         self.assertEqual(c.__spam__, 1)
 
         class _instance(object):
+            # [CLASS DOC] HELPER: local class _instance defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             pass
         class M2(object):
             @staticmethod
+            # [CLASS DOC] HELPER: local class M2 defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             def __new__(cls, name, bases, dict):
+                # [FUNCTION DOC] HELPER: special method __new__ of M2. Arguments: name, bases,
+                # dict. Implements the protocol hook used by tests; returns the hook result.
                 self = object.__new__(cls)
                 self.name = name
                 self.bases = bases
                 self.dict = dict
                 return self
             def __call__(self):
+                # [FUNCTION DOC] HELPER: special method __call__ of M2. Implements the protocol
+                # hook used by tests; returns the hook result.
                 it = _instance()
                 # Early binding of methods
                 for key in self.dict:
@@ -539,7 +668,11 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
                     setattr(it, key, self.dict[key].__get__(it, self))
                 return it
         class C(metaclass=M2):
+            # [CLASS DOC] HELPER: local class C defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             def spam(self):
+                # [FUNCTION DOC] HELPER: spam of C. Supporting routine for tests; returns a
+                # computed value or None.
                 return 42
         self.assertEqual(C.name, 'C')
         self.assertEqual(C.bases, ())
@@ -550,9 +683,14 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         # More metaclass examples
 
         class autosuper(type):
+            # [CLASS DOC] HELPER: local class autosuper defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             # Automatically add __super to the class
             # This trick only works for dynamic classes
             def __new__(metaclass, name, bases, dict):
+                # [FUNCTION DOC] HELPER: special method __new__ of autosuper. Arguments:
+                # metaclass, name, bases, dict. Implements the protocol hook used by tests;
+                # returns the hook result.
                 cls = super(autosuper, metaclass).__new__(metaclass,
                                                         name, bases, dict)
                 # Name mangling for __super removes leading underscores
@@ -565,27 +703,52 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
                 setattr(cls, name, super(cls))
                 return cls
         class A(metaclass=autosuper):
+            # [CLASS DOC] HELPER: local class A defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             def meth(self):
+                # [FUNCTION DOC] HELPER: meth of A. Supporting routine for tests; returns a
+                # computed value or None.
                 return "A"
         class B(A):
+            # [CLASS DOC] HELPER: local class B defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             def meth(self):
+                # [FUNCTION DOC] HELPER: meth of B. Supporting routine for tests; returns a
+                # computed value or None.
                 return "B" + self.__super.meth()
         class C(A):
+            # [CLASS DOC] HELPER: local class C defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             def meth(self):
+                # [FUNCTION DOC] HELPER: meth of C. Supporting routine for tests; returns a
+                # computed value or None.
                 return "C" + self.__super.meth()
         class D(C, B):
+            # [CLASS DOC] HELPER: local class D defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             def meth(self):
+                # [FUNCTION DOC] HELPER: meth of D. Supporting routine for tests; returns a
+                # computed value or None.
                 return "D" + self.__super.meth()
         self.assertEqual(D().meth(), "DCBA")
         class E(B, C):
+            # [CLASS DOC] HELPER: local class E defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             def meth(self):
+                # [FUNCTION DOC] HELPER: meth of E. Supporting routine for tests; returns a
+                # computed value or None.
                 return "E" + self.__super.meth()
         self.assertEqual(E().meth(), "EBCA")
 
         class autoproperty(type):
+            # [CLASS DOC] HELPER: local class autoproperty defined inside test_metaclass to
+            # exercise descriptor/class-model behavior under test.
             # Automatically create property attributes when methods
             # named _get_x and/or _set_x are found
             def __new__(metaclass, name, bases, dict):
+                # [FUNCTION DOC] HELPER: special method __new__ of autoproperty. Arguments:
+                # metaclass, name, bases, dict. Implements the protocol hook used by tests;
+                # returns the hook result.
                 hits = {}
                 for key, val in dict.items():
                     if key.startswith("_get_"):
@@ -603,9 +766,15 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
                 return super(autoproperty, metaclass).__new__(metaclass,
                                                             name, bases, dict)
         class A(metaclass=autoproperty):
+            # [CLASS DOC] HELPER: local class A defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             def _get_x(self):
+                # [FUNCTION DOC] HELPER: _get_x of A. Supporting routine for tests; returns a
+                # computed value or None.
                 return -self.__x
             def _set_x(self, x):
+                # [FUNCTION DOC] HELPER: _set_x of A. Arguments: x. Supporting routine for tests;
+                # returns a computed value or None.
                 self.__x = -x
         a = A()
         self.assertNotHasAttr(a, "x")
@@ -614,34 +783,60 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(a._A__x, -12)
 
         class multimetaclass(autoproperty, autosuper):
+            # [CLASS DOC] HELPER: local class multimetaclass defined inside test_metaclass to
+            # exercise descriptor/class-model behavior under test.
             # Merge of multiple cooperating metaclasses
             pass
         class A(metaclass=multimetaclass):
+            # [CLASS DOC] HELPER: local class A defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             def _get_x(self):
+                # [FUNCTION DOC] HELPER: _get_x of A. Supporting routine for tests; returns a
+                # computed value or None.
                 return "A"
         class B(A):
+            # [CLASS DOC] HELPER: local class B defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             def _get_x(self):
+                # [FUNCTION DOC] HELPER: _get_x of B. Supporting routine for tests; returns a
+                # computed value or None.
                 return "B" + self.__super._get_x()
         class C(A):
+            # [CLASS DOC] HELPER: local class C defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             def _get_x(self):
+                # [FUNCTION DOC] HELPER: _get_x of C. Supporting routine for tests; returns a
+                # computed value or None.
                 return "C" + self.__super._get_x()
         class D(C, B):
+            # [CLASS DOC] HELPER: local class D defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             def _get_x(self):
+                # [FUNCTION DOC] HELPER: _get_x of D. Supporting routine for tests; returns a
+                # computed value or None.
                 return "D" + self.__super._get_x()
         self.assertEqual(D().x, "DCBA")
 
         # Make sure type(x) doesn't call x.__class__.__init__
         class T(type):
+            # [CLASS DOC] HELPER: local class T defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             counter = 0
             def __init__(self, *args):
+                # [FUNCTION DOC] HELPER: constructor. Arguments: *args. Stores the given values on
+                # the instance, and for test cases initializes the base CPythonTestCase.
                 T.counter += 1
         class C(metaclass=T):
+            # [CLASS DOC] HELPER: local class C defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             pass
         self.assertEqual(T.counter, 1)
         a = C()
         self.assertEqual(type(a), C)
         self.assertEqual(T.counter, 1)
 
+        # [CLASS DOC] HELPER: local class C defined inside test_metaclass to exercise
+        # descriptor/class-model behavior under test.
         class C(object): pass
         c = C()
         try: c()
@@ -651,17 +846,27 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
         # Testing code to find most derived baseclass
         class A(type):
+            # [CLASS DOC] HELPER: local class A defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             def __new__(*args, **kwargs):
+                # [FUNCTION DOC] HELPER: special method __new__ of A. Arguments: *args, **kwargs.
+                # Implements the protocol hook used by tests; returns the hook result.
                 return type.__new__(*args, **kwargs)
 
         class B(object):
+            # [CLASS DOC] HELPER: local class B defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             pass
 
         class C(object, metaclass=A):
+            # [CLASS DOC] HELPER: local class C defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             pass
 
         # The most derived metaclass of D is A rather than type.
         class D(B, C):
+            # [CLASS DOC] HELPER: local class D defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             pass
         self.assertIs(A, type(D))
 
@@ -669,36 +874,56 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         new_calls = []  # to check the order of __new__ calls
         class AMeta(type):
             @staticmethod
+            # [CLASS DOC] HELPER: local class AMeta defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             def __new__(mcls, name, bases, ns):
+                # [FUNCTION DOC] HELPER: special method __new__ of AMeta. Arguments: mcls, name,
+                # bases, ns. Implements the protocol hook used by tests; returns the hook result.
                 new_calls.append('AMeta')
                 return super().__new__(mcls, name, bases, ns)
             @classmethod
             def __prepare__(mcls, name, bases):
+                # [FUNCTION DOC] HELPER: special method __prepare__ of AMeta. Arguments: mcls,
+                # name, bases. Implements the protocol hook used by tests; returns the hook
+                # result.
                 return {}
 
         class BMeta(AMeta):
             @staticmethod
+            # [CLASS DOC] HELPER: local class BMeta defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             def __new__(mcls, name, bases, ns):
+                # [FUNCTION DOC] HELPER: special method __new__ of BMeta. Arguments: mcls, name,
+                # bases, ns. Implements the protocol hook used by tests; returns the hook result.
                 new_calls.append('BMeta')
                 return super().__new__(mcls, name, bases, ns)
             @classmethod
             def __prepare__(mcls, name, bases):
+                # [FUNCTION DOC] HELPER: special method __prepare__ of BMeta. Arguments: mcls,
+                # name, bases. Implements the protocol hook used by tests; returns the hook
+                # result.
                 ns = super().__prepare__(name, bases)
                 ns['BMeta_was_here'] = True
                 return ns
 
         class A(metaclass=AMeta):
+            # [CLASS DOC] HELPER: local class A defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             pass
         self.assertEqual(['AMeta'], new_calls)
         new_calls.clear()
 
         class B(metaclass=BMeta):
+            # [CLASS DOC] HELPER: local class B defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             pass
         # BMeta.__new__ calls AMeta.__new__ with super:
         self.assertEqual(['BMeta', 'AMeta'], new_calls)
         new_calls.clear()
 
         class C(A, B):
+            # [CLASS DOC] HELPER: local class C defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             pass
         # The most derived metaclass is BMeta:
         self.assertEqual(['BMeta', 'AMeta'], new_calls)
@@ -708,6 +933,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
         # The order of the bases shouldn't matter:
         class C2(B, A):
+            # [CLASS DOC] HELPER: local class C2 defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             pass
         self.assertEqual(['BMeta', 'AMeta'], new_calls)
         new_calls.clear()
@@ -715,12 +942,16 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
         # Check correct metaclass calculation when a metaclass is declared:
         class D(C, metaclass=type):
+            # [CLASS DOC] HELPER: local class D defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             pass
         self.assertEqual(['BMeta', 'AMeta'], new_calls)
         new_calls.clear()
         self.assertIn('BMeta_was_here', D.__dict__)
 
         class E(C, metaclass=AMeta):
+            # [CLASS DOC] HELPER: local class E defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             pass
         self.assertEqual(['BMeta', 'AMeta'], new_calls)
         new_calls.clear()
@@ -730,12 +961,20 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         # so there is no metaclass calculation.
         marker = object()
         def func(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: local function func inside test_metaclass. Arguments: *args,
+            # **kwargs. Returns its computed value or None; used by the enclosing test.
             return marker
         class X(metaclass=func):
+            # [CLASS DOC] HELPER: local class X defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             pass
         class Y(object, metaclass=func):
+            # [CLASS DOC] HELPER: local class Y defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             pass
         class Z(D, metaclass=func):
+            # [CLASS DOC] HELPER: local class Z defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             pass
         self.assertIs(marker, X)
         self.assertIs(marker, Y)
@@ -745,23 +984,41 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         # but not a descendant of type.
         prepare_calls = []  # to track __prepare__ calls
         class ANotMeta:
+            # [CLASS DOC] HELPER: local class ANotMeta defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             def __new__(mcls, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: special method __new__ of ANotMeta. Arguments: mcls,
+                # *args, **kwargs. Implements the protocol hook used by tests; returns the hook
+                # result.
                 new_calls.append('ANotMeta')
                 return super().__new__(mcls)
             @classmethod
             def __prepare__(mcls, name, bases):
+                # [FUNCTION DOC] HELPER: special method __prepare__ of ANotMeta. Arguments: mcls,
+                # name, bases. Implements the protocol hook used by tests; returns the hook
+                # result.
                 prepare_calls.append('ANotMeta')
                 return {}
         class BNotMeta(ANotMeta):
+            # [CLASS DOC] HELPER: local class BNotMeta defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             def __new__(mcls, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: special method __new__ of BNotMeta. Arguments: mcls,
+                # *args, **kwargs. Implements the protocol hook used by tests; returns the hook
+                # result.
                 new_calls.append('BNotMeta')
                 return super().__new__(mcls)
             @classmethod
             def __prepare__(mcls, name, bases):
+                # [FUNCTION DOC] HELPER: special method __prepare__ of BNotMeta. Arguments: mcls,
+                # name, bases. Implements the protocol hook used by tests; returns the hook
+                # result.
                 prepare_calls.append('BNotMeta')
                 return super().__prepare__(name, bases)
 
         class A(metaclass=ANotMeta):
+            # [CLASS DOC] HELPER: local class A defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             pass
         self.assertIs(ANotMeta, type(A))
         self.assertEqual(['ANotMeta'], prepare_calls)
@@ -770,6 +1027,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         new_calls.clear()
 
         class B(metaclass=BNotMeta):
+            # [CLASS DOC] HELPER: local class B defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             pass
         self.assertIs(BNotMeta, type(B))
         self.assertEqual(['BNotMeta', 'ANotMeta'], prepare_calls)
@@ -778,6 +1037,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         new_calls.clear()
 
         class C(A, B):
+            # [CLASS DOC] HELPER: local class C defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             pass
         self.assertIs(BNotMeta, type(C))
         self.assertEqual(['BNotMeta', 'ANotMeta'], new_calls)
@@ -786,6 +1047,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         prepare_calls.clear()
 
         class C2(B, A):
+            # [CLASS DOC] HELPER: local class C2 defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             pass
         self.assertIs(BNotMeta, type(C2))
         self.assertEqual(['BNotMeta', 'ANotMeta'], new_calls)
@@ -797,9 +1060,13 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         # BNotMeta is neither a subclass, nor a superclass of type
         with self.assertRaises(TypeError):
             class D(C, metaclass=type):
+                # [CLASS DOC] HELPER: local class D defined inside test_metaclass to exercise
+                # descriptor/class-model behavior under test.
                 pass
 
         class E(C, metaclass=ANotMeta):
+            # [CLASS DOC] HELPER: local class E defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             pass
         self.assertIs(BNotMeta, type(E))
         self.assertEqual(['BNotMeta', 'ANotMeta'], new_calls)
@@ -808,6 +1075,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         prepare_calls.clear()
 
         class F(object(), C):
+            # [CLASS DOC] HELPER: local class F defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             pass
         self.assertIs(BNotMeta, type(F))
         self.assertEqual(['BNotMeta', 'ANotMeta'], new_calls)
@@ -816,6 +1085,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         prepare_calls.clear()
 
         class F2(C, object()):
+            # [CLASS DOC] HELPER: local class F2 defined inside test_metaclass to exercise
+            # descriptor/class-model behavior under test.
             pass
         self.assertIs(BNotMeta, type(F2))
         self.assertEqual(['BNotMeta', 'ANotMeta'], new_calls)
@@ -827,25 +1098,42 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         # subclass, nor a superclass of int
         with self.assertRaises(TypeError):
             class X(C, int()):
+                # [CLASS DOC] HELPER: local class X defined inside test_metaclass to exercise
+                # descriptor/class-model behavior under test.
                 pass
         with self.assertRaises(TypeError):
             class X(int(), C):
+                # [CLASS DOC] HELPER: local class X defined inside test_metaclass to exercise
+                # descriptor/class-model behavior under test.
                 pass
 
     def test_module_subclasses(self):
+        # [FUNCTION DOC] Test: checks module subclasses behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing Python subclass of module...
         log = []
         MT = type(sys)
         class MM(MT):
+            # [CLASS DOC] HELPER: local class MM defined inside test_module_subclasses to exercise
+            # descriptor/class-model behavior under test.
             def __init__(self, name):
+                # [FUNCTION DOC] HELPER: constructor. Arguments: name. Stores the given values on
+                # the instance, and for test cases initializes the base CPythonTestCase.
                 MT.__init__(self, name)
             def __getattribute__(self, name):
+                # [FUNCTION DOC] HELPER: special method __getattribute__ of MM. Arguments: name.
+                # Implements the protocol hook used by tests; returns the hook result.
                 log.append(("getattr", name))
                 return MT.__getattribute__(self, name)
             def __setattr__(self, name, value):
+                # [FUNCTION DOC] HELPER: special method __setattr__ of MM. Arguments: name, value.
+                # Implements the protocol hook used by tests; returns the hook result.
                 log.append(("setattr", name, value))
                 MT.__setattr__(self, name, value)
             def __delattr__(self, name):
+                # [FUNCTION DOC] HELPER: special method __delattr__ of MM. Arguments: name.
+                # Implements the protocol hook used by tests; returns the hook result.
                 log.append(("delattr", name))
                 MT.__delattr__(self, name)
         a = MM("a")
@@ -859,6 +1147,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         # https://bugs.python.org/issue1174712
         try:
             class Module(types.ModuleType, str):
+                # [CLASS DOC] HELPER: local class Module defined inside test_module_subclasses to
+                # exercise descriptor/class-model behavior under test.
                 pass
         except TypeError:
             pass
@@ -868,27 +1158,46 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
         # Issue 34805: Verify that definition order is retained
         def random_name():
+            # [FUNCTION DOC] HELPER: local function random_name inside test_module_subclasses.
+            # Returns its computed value or None; used by the enclosing test.
             return ''.join(random.choices(string.ascii_letters, k=10))
         class A:
+            # [CLASS DOC] HELPER: local class A defined inside test_module_subclasses to exercise
+            # descriptor/class-model behavior under test.
             pass
         subclasses = [type(random_name(), (A,), {}) for i in range(100)]
         self.assertEqual(A.__subclasses__(), subclasses)
 
     def test_multiple_inheritance(self):
+        # [FUNCTION DOC] Test: checks multiple inheritance behavior. Fails with AssertionError
+        # (via unittest assertions) if the observed behavior differs from CPython semantics; no
+        # other side effects beyond temporary objects and classes.
         # Testing multiple inheritance...
         class C(object):
+            # [CLASS DOC] HELPER: local class C defined inside test_multiple_inheritance to
+            # exercise descriptor/class-model behavior under test.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: constructor. Stores the given values on the instance, and
+                # for test cases initializes the base CPythonTestCase.
                 self.__state = 0
             def getstate(self):
+                # [FUNCTION DOC] HELPER: getstate of C. Supporting routine for tests; returns a
+                # computed value or None.
                 return self.__state
             def setstate(self, state):
+                # [FUNCTION DOC] HELPER: setstate of C. Arguments: state. Supporting routine for
+                # tests; returns a computed value or None.
                 self.__state = state
         a = C()
         self.assertEqual(a.getstate(), 0)
         a.setstate(10)
         self.assertEqual(a.getstate(), 10)
         class D(dict, C):
+            # [CLASS DOC] HELPER: local class D defined inside test_multiple_inheritance to
+            # exercise descriptor/class-model behavior under test.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: constructor. Stores the given values on the instance, and
+                # for test cases initializes the base CPythonTestCase.
                 dict.__init__(self)
                 C.__init__(self)
         d = D()
@@ -903,12 +1212,22 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
         # SF bug #442833
         class Node(object):
+            # [CLASS DOC] HELPER: local class Node defined inside test_multiple_inheritance to
+            # exercise descriptor/class-model behavior under test.
             def __int__(self):
+                # [FUNCTION DOC] HELPER: special method __int__ of Node. Implements the protocol
+                # hook used by tests; returns the hook result.
                 return int(self.foo())
             def foo(self):
+                # [FUNCTION DOC] HELPER: foo of Node. Supporting routine for tests; returns a
+                # computed value or None.
                 return "23"
         class Frag(Node, list):
+            # [CLASS DOC] HELPER: local class Frag defined inside test_multiple_inheritance to
+            # exercise descriptor/class-model behavior under test.
             def foo(self):
+                # [FUNCTION DOC] HELPER: foo of Frag. Supporting routine for tests; returns a
+                # computed value or None.
                 return "42"
         self.assertEqual(Node().__int__(), 23)
         self.assertEqual(int(Node()), 23)
@@ -916,35 +1235,60 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(int(Frag()), 42)
 
     def test_diamond_inheritance(self):
+        # [FUNCTION DOC] Test: checks diamond inheritance behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing multiple inheritance special cases...
         class A(object):
+            # [FUNCTION DOC] HELPER: spam of A. Supporting routine for tests; returns a computed
+            # value or None.
+            # [CLASS DOC] HELPER: local class A defined inside test_diamond_inheritance to
+            # exercise descriptor/class-model behavior under test.
             def spam(self): return "A"
         self.assertEqual(A().spam(), "A")
         class B(A):
+            # [FUNCTION DOC] HELPER: boo of B. Supporting routine for tests; returns a computed
+            # value or None.
+            # [CLASS DOC] HELPER: local class B defined inside test_diamond_inheritance to
+            # exercise descriptor/class-model behavior under test.
             def boo(self): return "B"
+            # [FUNCTION DOC] HELPER: spam of B. Supporting routine for tests; returns a computed
+            # value or None.
             def spam(self): return "B"
         self.assertEqual(B().spam(), "B")
         self.assertEqual(B().boo(), "B")
         class C(A):
+            # [FUNCTION DOC] HELPER: boo of C. Supporting routine for tests; returns a computed
+            # value or None.
+            # [CLASS DOC] HELPER: local class C defined inside test_diamond_inheritance to
+            # exercise descriptor/class-model behavior under test.
             def boo(self): return "C"
         self.assertEqual(C().spam(), "A")
         self.assertEqual(C().boo(), "C")
+        # [CLASS DOC] HELPER: local class D defined inside test_diamond_inheritance to exercise
+        # descriptor/class-model behavior under test.
         class D(B, C): pass
         self.assertEqual(D().spam(), "B")
         self.assertEqual(D().boo(), "B")
         self.assertEqual(D.__mro__, (D, B, C, A, object))
+        # [CLASS DOC] HELPER: local class E defined inside test_diamond_inheritance to exercise
+        # descriptor/class-model behavior under test.
         class E(C, B): pass
         self.assertEqual(E().spam(), "B")
         self.assertEqual(E().boo(), "C")
         self.assertEqual(E.__mro__, (E, C, B, A, object))
         # MRO order disagreement
         try:
+            # [CLASS DOC] HELPER: local class F defined inside test_diamond_inheritance to
+            # exercise descriptor/class-model behavior under test.
             class F(D, E): pass
         except TypeError:
             pass
         else:
             self.fail("expected MRO order disagreement (F)")
         try:
+            # [CLASS DOC] HELPER: local class G defined inside test_diamond_inheritance to
+            # exercise descriptor/class-model behavior under test.
             class G(E, D): pass
         except TypeError:
             pass
@@ -953,26 +1297,60 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
     # see thread python-dev/2002-October/029035.html
     def test_ex5_from_c3_switch(self):
+        # [FUNCTION DOC] Test: checks ex5 from c3 switch behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing ex5 from C3 switch discussion...
+        # [CLASS DOC] HELPER: local class A defined inside test_ex5_from_c3_switch to exercise
+        # descriptor/class-model behavior under test.
         class A(object): pass
+        # [CLASS DOC] HELPER: local class B defined inside test_ex5_from_c3_switch to exercise
+        # descriptor/class-model behavior under test.
         class B(object): pass
+        # [CLASS DOC] HELPER: local class C defined inside test_ex5_from_c3_switch to exercise
+        # descriptor/class-model behavior under test.
         class C(object): pass
+        # [CLASS DOC] HELPER: local class X defined inside test_ex5_from_c3_switch to exercise
+        # descriptor/class-model behavior under test.
         class X(A): pass
+        # [CLASS DOC] HELPER: local class Y defined inside test_ex5_from_c3_switch to exercise
+        # descriptor/class-model behavior under test.
         class Y(A): pass
+        # [CLASS DOC] HELPER: local class Z defined inside test_ex5_from_c3_switch to exercise
+        # descriptor/class-model behavior under test.
         class Z(X,B,Y,C): pass
         self.assertEqual(Z.__mro__, (Z, X, B, Y, A, C, object))
 
     # see "A Monotonic Superclass Linearization for Dylan",
     # by Kim Barrett et al. (OOPSLA 1996)
     def test_monotonicity(self):
+        # [FUNCTION DOC] Test: checks monotonicity behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing MRO monotonicity...
+        # [CLASS DOC] HELPER: local class Boat defined inside test_monotonicity to exercise
+        # descriptor/class-model behavior under test.
         class Boat(object): pass
+        # [CLASS DOC] HELPER: local class DayBoat defined inside test_monotonicity to exercise
+        # descriptor/class-model behavior under test.
         class DayBoat(Boat): pass
+        # [CLASS DOC] HELPER: local class WheelBoat defined inside test_monotonicity to exercise
+        # descriptor/class-model behavior under test.
         class WheelBoat(Boat): pass
+        # [CLASS DOC] HELPER: local class EngineLess defined inside test_monotonicity to exercise
+        # descriptor/class-model behavior under test.
         class EngineLess(DayBoat): pass
+        # [CLASS DOC] HELPER: local class SmallMultihull defined inside test_monotonicity to
+        # exercise descriptor/class-model behavior under test.
         class SmallMultihull(DayBoat): pass
+        # [CLASS DOC] HELPER: local class PedalWheelBoat defined inside test_monotonicity to
+        # exercise descriptor/class-model behavior under test.
         class PedalWheelBoat(EngineLess,WheelBoat): pass
+        # [CLASS DOC] HELPER: local class SmallCatamaran defined inside test_monotonicity to
+        # exercise descriptor/class-model behavior under test.
         class SmallCatamaran(SmallMultihull): pass
+        # [CLASS DOC] HELPER: local class Pedalo defined inside test_monotonicity to exercise
+        # descriptor/class-model behavior under test.
         class Pedalo(PedalWheelBoat,SmallCatamaran): pass
 
         self.assertEqual(PedalWheelBoat.__mro__,
@@ -986,12 +1364,27 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
     # see "A Monotonic Superclass Linearization for Dylan",
     # by Kim Barrett et al. (OOPSLA 1996)
     def test_consistency_with_epg(self):
+        # [FUNCTION DOC] Test: checks consistency with epg behavior. Fails with AssertionError
+        # (via unittest assertions) if the observed behavior differs from CPython semantics; no
+        # other side effects beyond temporary objects and classes.
         # Testing consistency with EPG...
+        # [CLASS DOC] HELPER: local class Pane defined inside test_consistency_with_epg to
+        # exercise descriptor/class-model behavior under test.
         class Pane(object): pass
+        # [CLASS DOC] HELPER: local class ScrollingMixin defined inside test_consistency_with_epg
+        # to exercise descriptor/class-model behavior under test.
         class ScrollingMixin(object): pass
+        # [CLASS DOC] HELPER: local class EditingMixin defined inside test_consistency_with_epg to
+        # exercise descriptor/class-model behavior under test.
         class EditingMixin(object): pass
+        # [CLASS DOC] HELPER: local class ScrollablePane defined inside test_consistency_with_epg
+        # to exercise descriptor/class-model behavior under test.
         class ScrollablePane(Pane,ScrollingMixin): pass
+        # [CLASS DOC] HELPER: local class EditablePane defined inside test_consistency_with_epg to
+        # exercise descriptor/class-model behavior under test.
         class EditablePane(Pane,EditingMixin): pass
+        # [CLASS DOC] HELPER: local class EditableScrollablePane defined inside
+        # test_consistency_with_epg to exercise descriptor/class-model behavior under test.
         class EditableScrollablePane(ScrollablePane,EditablePane): pass
 
         self.assertEqual(EditableScrollablePane.__mro__,
@@ -999,11 +1392,17 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
                 ScrollingMixin, EditingMixin, object))
 
     def test_mro_disagreement(self):
+        # [FUNCTION DOC] Test: checks mro disagreement behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing error messages for MRO disagreement...
         mro_err_msg = ("Cannot create a consistent method resolution "
                        "order (MRO) for bases ")
 
         def raises(exc, expected, callable, *args):
+            # [FUNCTION DOC] HELPER: local function raises inside test_mro_disagreement.
+            # Arguments: exc, expected, callable, *args. Returns its computed value or None; used
+            # by the enclosing test.
             try:
                 callable(*args)
             except exc as msg:
@@ -1015,8 +1414,14 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             else:
                 self.fail("Expected %s" % exc)
 
+        # [CLASS DOC] HELPER: local class A defined inside test_mro_disagreement to exercise
+        # descriptor/class-model behavior under test.
         class A(object): pass
+        # [CLASS DOC] HELPER: local class B defined inside test_mro_disagreement to exercise
+        # descriptor/class-model behavior under test.
         class B(A): pass
+        # [CLASS DOC] HELPER: local class C defined inside test_mro_disagreement to exercise
+        # descriptor/class-model behavior under test.
         class C(object): pass
 
         # Test some very simple errors
@@ -1027,15 +1432,28 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         raises(TypeError, mro_err_msg,
                type, "X", (A, C, B), {})
         # Test a slightly more complex error
+        # [CLASS DOC] HELPER: local class GridLayout defined inside test_mro_disagreement to
+        # exercise descriptor/class-model behavior under test.
         class GridLayout(object): pass
+        # [CLASS DOC] HELPER: local class HorizontalGrid defined inside test_mro_disagreement to
+        # exercise descriptor/class-model behavior under test.
         class HorizontalGrid(GridLayout): pass
+        # [CLASS DOC] HELPER: local class VerticalGrid defined inside test_mro_disagreement to
+        # exercise descriptor/class-model behavior under test.
         class VerticalGrid(GridLayout): pass
+        # [CLASS DOC] HELPER: local class HVGrid defined inside test_mro_disagreement to exercise
+        # descriptor/class-model behavior under test.
         class HVGrid(HorizontalGrid, VerticalGrid): pass
+        # [CLASS DOC] HELPER: local class VHGrid defined inside test_mro_disagreement to exercise
+        # descriptor/class-model behavior under test.
         class VHGrid(VerticalGrid, HorizontalGrid): pass
         raises(TypeError, mro_err_msg,
                type, "ConfusedGrid", (HVGrid, VHGrid), {})
 
     def test_object_class(self):
+        # [FUNCTION DOC] Test: checks object class behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing object class...
         a = object()
         self.assertEqual(a.__class__, object)
@@ -1052,6 +1470,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertNotHasAttr(object(), "__dict__")
 
         class Cdict(object):
+            # [CLASS DOC] HELPER: local class Cdict defined inside test_object_class to exercise
+            # descriptor/class-model behavior under test.
             pass
         x = Cdict()
         self.assertEqual(x.__dict__, {})
@@ -1060,7 +1480,14 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(x.__dict__, {'foo': 1})
 
     def test_object_class_assignment_between_heaptypes_and_nonheaptypes(self):
+        # [FUNCTION DOC] Test: checks object class assignment between heaptypes and nonheaptypes
+        # behavior. Fails with AssertionError (via unittest assertions) if the observed behavior
+        # differs from CPython semantics; no other side effects beyond temporary objects and
+        # classes.
         class SubType(types.ModuleType):
+            # [CLASS DOC] HELPER: local class SubType defined inside
+            # test_object_class_assignment_between_heaptypes_and_nonheaptypes to exercise
+            # descriptor/class-model behavior under test.
             a = 1
 
         m = types.ModuleType("m")
@@ -1086,50 +1513,78 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         #   NoneType, bool
 
         class MyInt(int):
+            # [CLASS DOC] HELPER: local class MyInt defined inside
+            # test_object_class_assignment_between_heaptypes_and_nonheaptypes to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = ()
         with self.assertRaises(TypeError):
             (1).__class__ = MyInt
 
         class MyFloat(float):
+            # [CLASS DOC] HELPER: local class MyFloat defined inside
+            # test_object_class_assignment_between_heaptypes_and_nonheaptypes to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = ()
         with self.assertRaises(TypeError):
             (1.0).__class__ = MyFloat
 
         class MyComplex(complex):
+            # [CLASS DOC] HELPER: local class MyComplex defined inside
+            # test_object_class_assignment_between_heaptypes_and_nonheaptypes to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = ()
         with self.assertRaises(TypeError):
             (1 + 2j).__class__ = MyComplex
 
         class MyStr(str):
+            # [CLASS DOC] HELPER: local class MyStr defined inside
+            # test_object_class_assignment_between_heaptypes_and_nonheaptypes to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = ()
         with self.assertRaises(TypeError):
             "a".__class__ = MyStr
 
         class MyBytes(bytes):
+            # [CLASS DOC] HELPER: local class MyBytes defined inside
+            # test_object_class_assignment_between_heaptypes_and_nonheaptypes to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = ()
         with self.assertRaises(TypeError):
             b"a".__class__ = MyBytes
 
         class MyTuple(tuple):
+            # [CLASS DOC] HELPER: local class MyTuple defined inside
+            # test_object_class_assignment_between_heaptypes_and_nonheaptypes to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = ()
         with self.assertRaises(TypeError):
             ().__class__ = MyTuple
 
         class MyFrozenSet(frozenset):
+            # [CLASS DOC] HELPER: local class MyFrozenSet defined inside
+            # test_object_class_assignment_between_heaptypes_and_nonheaptypes to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = ()
         with self.assertRaises(TypeError):
             frozenset().__class__ = MyFrozenSet
 
     @unittest.expectedFailure
     def test_slots(self):
+        # [FUNCTION DOC] Test: checks slots behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # Testing __slots__...
         class C0(object):
+            # [CLASS DOC] HELPER: local class C0 defined inside test_slots to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = []
         x = C0()
         self.assertNotHasAttr(x, "__dict__")
         self.assertNotHasAttr(x, "foo")
 
         class C1(object):
+            # [CLASS DOC] HELPER: local class C1 defined inside test_slots to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = ['a']
         x = C1()
         self.assertNotHasAttr(x, "__dict__")
@@ -1142,6 +1597,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertNotHasAttr(x, "a")
 
         class C3(object):
+            # [CLASS DOC] HELPER: local class C3 defined inside test_slots to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = ['a', 'b', 'c']
         x = C3()
         self.assertNotHasAttr(x, "__dict__")
@@ -1156,11 +1613,18 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(x.c, 3)
 
         class C4(object):
+            # [CLASS DOC] HELPER: local class C4 defined inside test_slots to exercise
+            # descriptor/class-model behavior under test. Existing docstring says: Validate name
+            # mangling
             """Validate name mangling"""
             __slots__ = ['__a']
             def __init__(self, value):
+                # [FUNCTION DOC] HELPER: constructor. Arguments: value. Stores the given values on
+                # the instance, and for test cases initializes the base CPythonTestCase.
                 self.__a = value
             def get(self):
+                # [FUNCTION DOC] HELPER: get of C4. Supporting routine for tests; returns a
+                # computed value or None.
                 return self.__a
         x = C4(5)
         self.assertNotHasAttr(x, '__dict__')
@@ -1176,6 +1640,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         # Make sure slot names are proper identifiers
         try:
             class C(object):
+                # [CLASS DOC] HELPER: local class C defined inside test_slots to exercise
+                # descriptor/class-model behavior under test.
                 __slots__ = [None]
         except TypeError:
             pass
@@ -1183,6 +1649,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             self.fail("[None] slots not caught")
         try:
             class C(object):
+                # [CLASS DOC] HELPER: local class C defined inside test_slots to exercise
+                # descriptor/class-model behavior under test.
                 __slots__ = ["foo bar"]
         except TypeError:
             pass
@@ -1190,6 +1658,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             self.fail("['foo bar'] slots not caught")
         try:
             class C(object):
+                # [CLASS DOC] HELPER: local class C defined inside test_slots to exercise
+                # descriptor/class-model behavior under test.
                 __slots__ = ["foo\0bar"]
         except TypeError:
             pass
@@ -1197,6 +1667,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             self.fail("['foo\\0bar'] slots not caught")
         try:
             class C(object):
+                # [CLASS DOC] HELPER: local class C defined inside test_slots to exercise
+                # descriptor/class-model behavior under test.
                 __slots__ = ["1"]
         except TypeError:
             pass
@@ -1204,6 +1676,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             self.fail("['1'] slots not caught")
         try:
             class C(object):
+                # [CLASS DOC] HELPER: local class C defined inside test_slots to exercise
+                # descriptor/class-model behavior under test.
                 __slots__ = [""]
         except TypeError:
             pass
@@ -1211,10 +1685,14 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             self.fail("[''] slots not caught")
 
         class WithValidIdentifiers(object):
+            # [CLASS DOC] HELPER: local class WithValidIdentifiers defined inside test_slots to
+            # exercise descriptor/class-model behavior under test.
             __slots__ = ["a", "a_b", "_a", "A0123456789Z"]
 
         # Test a single string is not expanded as a sequence.
         class C(object):
+            # [CLASS DOC] HELPER: local class C defined inside test_slots to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = "abc"
         c = C()
         c.abc = 5
@@ -1223,6 +1701,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         # Test unicode slot names
         # Test a single unicode string is not expanded as a sequence.
         class C(object):
+            # [CLASS DOC] HELPER: local class C defined inside test_slots to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = "abc"
         c = C()
         c.abc = 5
@@ -1231,6 +1711,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         # _unicode_to_string used to modify slots in certain circumstances
         slots = ("foo", "bar")
         class C(object):
+            # [CLASS DOC] HELPER: local class C defined inside test_slots to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = slots
         x = C()
         x.foo = 5
@@ -1239,6 +1721,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         # this used to leak references
         try:
             class C(object):
+                # [CLASS DOC] HELPER: local class C defined inside test_slots to exercise
+                # descriptor/class-model behavior under test.
                 __slots__ = [chr(128)]
         except (TypeError, UnicodeEncodeError):
             pass
@@ -1247,12 +1731,20 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
         # Test leaks
         class Counted(object):
+            # [CLASS DOC] HELPER: local class Counted defined inside test_slots to exercise
+            # descriptor/class-model behavior under test.
             counter = 0    # counts the number of instances alive
             def __init__(self):
+                # [FUNCTION DOC] HELPER: constructor. Stores the given values on the instance, and
+                # for test cases initializes the base CPythonTestCase.
                 Counted.counter += 1
             def __del__(self):
+                # [FUNCTION DOC] HELPER: special method __del__ of Counted. Implements the
+                # protocol hook used by tests; returns the hook result.
                 Counted.counter -= 1
         class C(object):
+            # [CLASS DOC] HELPER: local class C defined inside test_slots to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = ['a', 'b', 'c']
         x = C()
         x.a = Counted()
@@ -1263,6 +1755,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         support.gc_collect()
         self.assertEqual(Counted.counter, 0)
         class D(C):
+            # [CLASS DOC] HELPER: local class D defined inside test_slots to exercise
+            # descriptor/class-model behavior under test.
             pass
         x = D()
         x.a = Counted()
@@ -1272,6 +1766,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         support.gc_collect()
         self.assertEqual(Counted.counter, 0)
         class E(D):
+            # [CLASS DOC] HELPER: local class E defined inside test_slots to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = ['e']
         x = E()
         x.a = Counted()
@@ -1284,6 +1780,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
         # Test cyclical leaks [SF bug 519621]
         class F(object):
+            # [CLASS DOC] HELPER: local class F defined inside test_slots to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = ['a', 'b']
         s = F()
         s.a = [Counted(), s]
@@ -1295,7 +1793,11 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         # Test lookup leaks [SF bug 572567]
         if hasattr(gc, 'get_objects'):
             class G(object):
+                # [CLASS DOC] HELPER: local class G defined inside test_slots to exercise
+                # descriptor/class-model behavior under test.
                 def __eq__(self, other):
+                    # [FUNCTION DOC] HELPER: special method __eq__ of G. Arguments: other.
+                    # Implements the protocol hook used by tests; returns the hook result.
                     return False
             g = G()
             orig_objects = len(gc.get_objects())
@@ -1305,11 +1807,17 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             self.assertEqual(orig_objects, new_objects)
 
         class H(object):
+            # [CLASS DOC] HELPER: local class H defined inside test_slots to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = ['a', 'b']
             def __init__(self):
+                # [FUNCTION DOC] HELPER: constructor. Stores the given values on the instance, and
+                # for test cases initializes the base CPythonTestCase.
                 self.a = 1
                 self.b = 2
             def __del__(self_):
+                # [FUNCTION DOC] HELPER: special method __del__ of H. Arguments: self_. Implements
+                # the protocol hook used by tests; returns the hook result.
                 self.assertEqual(self_.a, 1)
                 self.assertEqual(self_.b, 2)
         with support.captured_output('stderr') as s:
@@ -1318,28 +1826,41 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(s.getvalue(), '')
 
         class X(object):
+            # [CLASS DOC] HELPER: local class X defined inside test_slots to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = "a"
         with self.assertRaises(AttributeError):
             del X().a
 
         # Inherit from object on purpose to check some backwards compatibility paths
         class X(object):
+            # [CLASS DOC] HELPER: local class X defined inside test_slots to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = "a"
         with self.assertRaisesRegex(AttributeError, "'test.test_descr.ClassPropertiesAndMethods.test_slots.<locals>.X' object has no attribute 'a'"):
             X().a
 
         # Test string subclass in `__slots__`, see gh-98783
         class SubStr(str):
+            # [CLASS DOC] HELPER: local class SubStr defined inside test_slots to exercise
+            # descriptor/class-model behavior under test.
             pass
         class X(object):
+            # [CLASS DOC] HELPER: local class X defined inside test_slots to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = (SubStr('x'),)
         X().x = 1
         with self.assertRaisesRegex(AttributeError, "'X' object has no attribute 'a'"):
             X().a
 
     def test_slots_special(self):
+        # [FUNCTION DOC] Test: checks slots special behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing __dict__ and __weakref__ in __slots__...
         class D(object):
+            # [CLASS DOC] HELPER: local class D defined inside test_slots_special to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = ["__dict__"]
         a = D()
         self.assertHasAttr(a, "__dict__")
@@ -1348,6 +1869,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(a.__dict__, {"foo": 42})
 
         class W(object):
+            # [CLASS DOC] HELPER: local class W defined inside test_slots_special to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = ["__weakref__"]
         a = W()
         self.assertHasAttr(a, "__weakref__")
@@ -1360,6 +1883,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             self.fail("shouldn't be allowed to set a.foo")
 
         class C1(W, D):
+            # [CLASS DOC] HELPER: local class C1 defined inside test_slots_special to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = []
         a = C1()
         self.assertHasAttr(a, "__dict__")
@@ -1368,6 +1893,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(a.__dict__, {"foo": 42})
 
         class C2(D, W):
+            # [CLASS DOC] HELPER: local class C2 defined inside test_slots_special to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = []
         a = C2()
         self.assertHasAttr(a, "__dict__")
@@ -1376,18 +1903,34 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(a.__dict__, {"foo": 42})
 
     def test_slots_special2(self):
+        # [FUNCTION DOC] Test: checks slots special2 behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing __qualname__ and __classcell__ in __slots__
         class Meta(type):
+            # [CLASS DOC] HELPER: local class Meta defined inside test_slots_special2 to exercise
+            # descriptor/class-model behavior under test.
             def __new__(cls, name, bases, namespace, attr):
+                # [FUNCTION DOC] HELPER: special method __new__ of Meta. Arguments: name, bases,
+                # namespace, attr. Implements the protocol hook used by tests; returns the hook
+                # result.
                 self.assertIn(attr, namespace)
                 return super().__new__(cls, name, bases, namespace)
 
         class C1:
+            # [CLASS DOC] HELPER: local class C1 defined inside test_slots_special2 to exercise
+            # descriptor/class-model behavior under test.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: constructor. Stores the given values on the instance, and
+                # for test cases initializes the base CPythonTestCase.
                 self.b = 42
         class C2(C1, metaclass=Meta, attr="__classcell__"):
+            # [CLASS DOC] HELPER: local class C2 defined inside test_slots_special2 to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = ["__classcell__"]
             def __init__(self):
+                # [FUNCTION DOC] HELPER: constructor. Stores the given values on the instance, and
+                # for test cases initializes the base CPythonTestCase.
                 super().__init__()
         self.assertIsInstance(C2.__dict__["__classcell__"],
                               types.MemberDescriptorType)
@@ -1398,10 +1941,14 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(c.__classcell__, 42)
         with self.assertRaises(TypeError):
             class C3:
+                # [CLASS DOC] HELPER: local class C3 defined inside test_slots_special2 to
+                # exercise descriptor/class-model behavior under test.
                 __classcell__ = 42
                 __slots__ = ["__classcell__"]
 
         class Q1(metaclass=Meta, attr="__qualname__"):
+            # [CLASS DOC] HELPER: local class Q1 defined inside test_slots_special2 to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = ["__qualname__"]
         self.assertEqual(Q1.__qualname__, C1.__qualname__[:-2] + "Q1")
         self.assertIsInstance(Q1.__dict__["__qualname__"],
@@ -1412,17 +1959,26 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(q.__qualname__, "q")
         with self.assertRaises(TypeError):
             class Q2:
+                # [CLASS DOC] HELPER: local class Q2 defined inside test_slots_special2 to
+                # exercise descriptor/class-model behavior under test.
                 __qualname__ = object()
                 __slots__ = ["__qualname__"]
 
     def test_slots_descriptor(self):
+        # [FUNCTION DOC] Test: checks slots descriptor behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Issue2115: slot descriptors did not correctly check
         # the type of the given object
         import abc
         class MyABC(metaclass=abc.ABCMeta):
+            # [CLASS DOC] HELPER: local class MyABC defined inside test_slots_descriptor to
+            # exercise descriptor/class-model behavior under test.
             __slots__ = "a"
 
         class Unrelated(object):
+            # [CLASS DOC] HELPER: local class Unrelated defined inside test_slots_descriptor to
+            # exercise descriptor/class-model behavior under test.
             pass
         MyABC.register(Unrelated)
 
@@ -1433,12 +1989,21 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertRaises(TypeError, MyABC.a.__set__, u, 3)
 
     def test_dynamics(self):
+        # [FUNCTION DOC] Test: checks dynamics behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # Testing class attribute propagation...
         class D(object):
+            # [CLASS DOC] HELPER: local class D defined inside test_dynamics to exercise
+            # descriptor/class-model behavior under test.
             pass
         class E(D):
+            # [CLASS DOC] HELPER: local class E defined inside test_dynamics to exercise
+            # descriptor/class-model behavior under test.
             pass
         class F(D):
+            # [CLASS DOC] HELPER: local class F defined inside test_dynamics to exercise
+            # descriptor/class-model behavior under test.
             pass
         D.foo = 1
         self.assertEqual(D.foo, 1)
@@ -1447,6 +2012,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(F.foo, 1)
         # Test dynamic instances
         class C(object):
+            # [CLASS DOC] HELPER: local class C defined inside test_dynamics to exercise
+            # descriptor/class-model behavior under test.
             pass
         a = C()
         self.assertNotHasAttr(a, "foobar")
@@ -1461,6 +2028,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(a.foobar, 2)
         self.assertNotHasAttr(a, "spam")
         def mygetattr(self, name):
+            # [FUNCTION DOC] HELPER: local function mygetattr inside test_dynamics. Arguments:
+            # name. Returns its computed value or None; used by the enclosing test.
             if name == "spam":
                 return "spam"
             raise AttributeError
@@ -1469,6 +2038,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         a.new = 12
         self.assertEqual(a.new, 12)
         def mysetattr(self, name, value):
+            # [FUNCTION DOC] HELPER: local function mysetattr inside test_dynamics. Arguments:
+            # name, value. Returns its computed value or None; used by the enclosing test.
             if name == "spam":
                 raise AttributeError
             return object.__setattr__(self, name, value)
@@ -1478,6 +2049,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
         self.assertEqual(a.spam, "spam")
         class D(C):
+            # [CLASS DOC] HELPER: local class D defined inside test_dynamics to exercise
+            # descriptor/class-model behavior under test.
             pass
         d = D()
         d.foo = 1
@@ -1485,6 +2058,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
         # Test handling of int*seq and seq*int
         class I(int):
+            # [CLASS DOC] HELPER: local class I defined inside test_dynamics to exercise
+            # descriptor/class-model behavior under test.
             pass
         self.assertEqual("a"*I(2), "aa")
         self.assertEqual(I(2)*"a", "aa")
@@ -1494,15 +2069,24 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
         # Test comparison of classes with dynamic metaclasses
         class dynamicmetaclass(type):
+            # [CLASS DOC] HELPER: local class dynamicmetaclass defined inside test_dynamics to
+            # exercise descriptor/class-model behavior under test.
             pass
         class someclass(metaclass=dynamicmetaclass):
+            # [CLASS DOC] HELPER: local class someclass defined inside test_dynamics to exercise
+            # descriptor/class-model behavior under test.
             pass
         self.assertNotEqual(someclass, object)
 
     def test_errors(self):
+        # [FUNCTION DOC] Test: checks errors behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # Testing errors...
         try:
             class C(list, dict):
+                # [CLASS DOC] HELPER: local class C defined inside test_errors to exercise
+                # descriptor/class-model behavior under test.
                 pass
         except TypeError:
             pass
@@ -1511,16 +2095,22 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
         try:
             class C(object, None):
+                # [CLASS DOC] HELPER: local class C defined inside test_errors to exercise
+                # descriptor/class-model behavior under test.
                 pass
         except TypeError:
             pass
         else:
             self.fail("inheritance from non-type should be illegal")
         class Classic:
+            # [CLASS DOC] HELPER: local class Classic defined inside test_errors to exercise
+            # descriptor/class-model behavior under test.
             pass
 
         try:
             class C(type(len)):
+                # [CLASS DOC] HELPER: local class C defined inside test_errors to exercise
+                # descriptor/class-model behavior under test.
                 pass
         except TypeError:
             pass
@@ -1529,6 +2119,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
         try:
             class C(object):
+                # [CLASS DOC] HELPER: local class C defined inside test_errors to exercise
+                # descriptor/class-model behavior under test.
                 __slots__ = 1
         except TypeError:
             pass
@@ -1537,6 +2129,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
         try:
             class C(object):
+                # [CLASS DOC] HELPER: local class C defined inside test_errors to exercise
+                # descriptor/class-model behavior under test.
                 __slots__ = [1]
         except TypeError:
             pass
@@ -1544,15 +2138,25 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             self.fail("__slots__ = [1] should be illegal")
 
         class M1(type):
+            # [CLASS DOC] HELPER: local class M1 defined inside test_errors to exercise
+            # descriptor/class-model behavior under test.
             pass
         class M2(type):
+            # [CLASS DOC] HELPER: local class M2 defined inside test_errors to exercise
+            # descriptor/class-model behavior under test.
             pass
         class A1(object, metaclass=M1):
+            # [CLASS DOC] HELPER: local class A1 defined inside test_errors to exercise
+            # descriptor/class-model behavior under test.
             pass
         class A2(object, metaclass=M2):
+            # [CLASS DOC] HELPER: local class A2 defined inside test_errors to exercise
+            # descriptor/class-model behavior under test.
             pass
         try:
             class B(A1, A2):
+                # [CLASS DOC] HELPER: local class B defined inside test_errors to exercise
+                # descriptor/class-model behavior under test.
                 pass
         except TypeError:
             pass
@@ -1560,8 +2164,15 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             self.fail("finding the most derived metaclass should have failed")
 
     def test_classmethods(self):
+        # [FUNCTION DOC] Test: checks classmethods behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing class methods...
         class C(object):
+            # [FUNCTION DOC] HELPER: foo of C. Arguments: *a. Supporting routine for tests;
+            # returns a computed value or None.
+            # [CLASS DOC] HELPER: local class C defined inside test_classmethods to exercise
+            # descriptor/class-model behavior under test.
             def foo(*a): return a
             goo = classmethod(foo)
         c = C()
@@ -1569,6 +2180,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(c.goo(1), (C, 1))
         self.assertEqual(c.foo(1), (c, 1))
         class D(C):
+            # [CLASS DOC] HELPER: local class D defined inside test_classmethods to exercise
+            # descriptor/class-model behavior under test.
             pass
         d = D()
         self.assertEqual(D.goo(1), (D, 1))
@@ -1577,6 +2190,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(D.foo(d, 1), (d, 1))
         # Test for a specific crash (SF bug 528132)
         def f(cls, arg):
+            # [FUNCTION DOC] HELPER: local function f inside test_classmethods. Arguments: arg.
+            # Returns its computed value or None; used by the enclosing test.
             "f docstring"
             return (cls, arg)
         ff = classmethod(f)
@@ -1623,6 +2238,9 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
     @support.refcount_test
     def test_refleaks_in_classmethod___init__(self):
+        # [FUNCTION DOC] Test: checks refleaks in classmethod   init behavior. Fails with
+        # AssertionError (via unittest assertions) if the observed behavior differs from CPython
+        # semantics; no other side effects beyond temporary objects and classes.
         gettotalrefcount = support.get_attribute(sys, 'gettotalrefcount')
         cm = classmethod(None)
         refs_before = gettotalrefcount()
@@ -1633,6 +2251,9 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
     @support.impl_detail("the module 'xxsubtype' is internal")
     @unittest.skipIf(xxsubtype is None, "requires xxsubtype module")
     def test_classmethods_in_c(self):
+        # [FUNCTION DOC] Test: checks classmethods in c behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing C-based class methods...
         import xxsubtype as spam
         a = (1, 2, 3)
@@ -1650,6 +2271,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(x2, spam.spamlist)
         self.assertEqual(a2, a1)
         self.assertEqual(d2, d1)
+        # [CLASS DOC] HELPER: local class SubSpam defined inside test_classmethods_in_c to
+        # exercise descriptor/class-model behavior under test.
         class SubSpam(spam.spamlist): pass
         x2, a2, d2 = spam_cm(SubSpam, *a, **d)
         self.assertEqual(x2, SubSpam)
@@ -1682,8 +2305,15 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(str(cm.exception), expected_errmsg)
 
     def test_staticmethods(self):
+        # [FUNCTION DOC] Test: checks staticmethods behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing static methods...
         class C(object):
+            # [FUNCTION DOC] HELPER: foo of C. Arguments: *a. Supporting routine for tests;
+            # returns a computed value or None.
+            # [CLASS DOC] HELPER: local class C defined inside test_staticmethods to exercise
+            # descriptor/class-model behavior under test.
             def foo(*a): return a
             goo = staticmethod(foo)
         c = C()
@@ -1691,6 +2321,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(c.goo(1), (1,))
         self.assertEqual(c.foo(1), (c, 1,))
         class D(C):
+            # [CLASS DOC] HELPER: local class D defined inside test_staticmethods to exercise
+            # descriptor/class-model behavior under test.
             pass
         d = D()
         self.assertEqual(D.goo(1), (1,))
@@ -1707,6 +2339,9 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
     @support.refcount_test
     def test_refleaks_in_staticmethod___init__(self):
+        # [FUNCTION DOC] Test: checks refleaks in staticmethod   init behavior. Fails with
+        # AssertionError (via unittest assertions) if the observed behavior differs from CPython
+        # semantics; no other side effects beyond temporary objects and classes.
         gettotalrefcount = support.get_attribute(sys, 'gettotalrefcount')
         sm = staticmethod(None)
         refs_before = gettotalrefcount()
@@ -1717,6 +2352,9 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
     @support.impl_detail("the module 'xxsubtype' is internal")
     @unittest.skipIf(xxsubtype is None, "requires xxsubtype module")
     def test_staticmethods_in_c(self):
+        # [FUNCTION DOC] Test: checks staticmethods in c behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing C-based static methods...
         import xxsubtype as spam
         a = (1, 2, 3)
@@ -1731,8 +2369,15 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(d, d1)
 
     def test_classic(self):
+        # [FUNCTION DOC] Test: checks classic behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # Testing classic classes...
         class C:
+            # [FUNCTION DOC] HELPER: foo of C. Arguments: *a. Supporting routine for tests;
+            # returns a computed value or None.
+            # [CLASS DOC] HELPER: local class C defined inside test_classic to exercise
+            # descriptor/class-model behavior under test.
             def foo(*a): return a
             goo = classmethod(foo)
         c = C()
@@ -1740,6 +2385,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(c.goo(1), (C, 1))
         self.assertEqual(c.foo(1), (c, 1))
         class D(C):
+            # [CLASS DOC] HELPER: local class D defined inside test_classic to exercise
+            # descriptor/class-model behavior under test.
             pass
         d = D()
         self.assertEqual(D.goo(1), (D, 1))
@@ -1747,33 +2394,62 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(d.foo(1), (d, 1))
         self.assertEqual(D.foo(d, 1), (d, 1))
         class E: # *not* subclassing from C
+            # [CLASS DOC] HELPER: local class E defined inside test_classic to exercise
+            # descriptor/class-model behavior under test.
             foo = C.foo
         self.assertEqual(E().foo.__func__, C.foo) # i.e., unbound
         self.assertTrue(repr(C.foo.__get__(C())).startswith("<bound method "))
 
     def test_compattr(self):
+        # [FUNCTION DOC] Test: checks compattr behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # Testing computed attributes...
         class C(object):
+            # [CLASS DOC] HELPER: local class C defined inside test_compattr to exercise
+            # descriptor/class-model behavior under test.
             class computed_attribute(object):
+                # [CLASS DOC] HELPER: nested helper class computed_attribute inside class C used
+                # by tests.
                 def __init__(self, get, set=None, delete=None):
+                    # [FUNCTION DOC] HELPER: constructor. Arguments: get, set, delete. Stores the
+                    # given values on the instance, and for test cases initializes the base
+                    # CPythonTestCase.
                     self.__get = get
                     self.__set = set
                     self.__delete = delete
                 def __get__(self, obj, type=None):
+                    # [FUNCTION DOC] HELPER: special method __get__ of computed_attribute.
+                    # Arguments: obj, type. Implements the protocol hook used by tests; returns
+                    # the hook result.
                     return self.__get(obj)
                 def __set__(self, obj, value):
+                    # [FUNCTION DOC] HELPER: special method __set__ of computed_attribute.
+                    # Arguments: obj, value. Implements the protocol hook used by tests; returns
+                    # the hook result.
                     return self.__set(obj, value)
                 def __delete__(self, obj):
+                    # [FUNCTION DOC] HELPER: special method __delete__ of computed_attribute.
+                    # Arguments: obj. Implements the protocol hook used by tests; returns the hook
+                    # result.
                     return self.__delete(obj)
             def __init__(self):
+                # [FUNCTION DOC] HELPER: constructor. Stores the given values on the instance, and
+                # for test cases initializes the base CPythonTestCase.
                 self.__x = 0
             def __get_x(self):
+                # [FUNCTION DOC] HELPER: __get_x of C. Supporting routine for tests; returns a
+                # computed value or None.
                 x = self.__x
                 self.__x = x+1
                 return x
             def __set_x(self, x):
+                # [FUNCTION DOC] HELPER: __set_x of C. Arguments: x. Supporting routine for tests;
+                # returns a computed value or None.
                 self.__x = x
             def __delete_x(self):
+                # [FUNCTION DOC] HELPER: __delete_x of C. Supporting routine for tests; returns a
+                # computed value or None.
                 del self.__x
             x = computed_attribute(__get_x, __set_x, __delete_x)
         a = C()
@@ -1786,18 +2462,29 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertNotHasAttr(a, 'x')
 
     def test_newslots(self):
+        # [FUNCTION DOC] Test: checks newslots behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # Testing __new__ slot override...
         class C(list):
+            # [CLASS DOC] HELPER: local class C defined inside test_newslots to exercise
+            # descriptor/class-model behavior under test.
             def __new__(cls):
+                # [FUNCTION DOC] HELPER: special method __new__ of C. Implements the protocol hook
+                # used by tests; returns the hook result.
                 self = list.__new__(cls)
                 self.foo = 1
                 return self
             def __init__(self):
+                # [FUNCTION DOC] HELPER: constructor. Stores the given values on the instance, and
+                # for test cases initializes the base CPythonTestCase.
                 self.foo = self.foo + 2
         a = C()
         self.assertEqual(a.foo, 3)
         self.assertEqual(a.__class__, C)
         class D(C):
+            # [CLASS DOC] HELPER: local class D defined inside test_newslots to exercise
+            # descriptor/class-model behavior under test.
             pass
         b = D()
         self.assertEqual(b.foo, 3)
@@ -1805,19 +2492,31 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
     @unittest.expectedFailure
     def test_bad_new(self):
+        # [FUNCTION DOC] Test: checks bad new behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         self.assertRaises(TypeError, object.__new__)
         self.assertRaises(TypeError, object.__new__, '')
         self.assertRaises(TypeError, list.__new__, object)
         self.assertRaises(TypeError, object.__new__, list)
         class C(object):
+            # [CLASS DOC] HELPER: local class C defined inside test_bad_new to exercise
+            # descriptor/class-model behavior under test.
             __new__ = list.__new__
         self.assertRaises(TypeError, C)
         class C(list):
+            # [CLASS DOC] HELPER: local class C defined inside test_bad_new to exercise
+            # descriptor/class-model behavior under test.
             __new__ = object.__new__
         self.assertRaises(TypeError, C)
 
     def test_object_new(self):
+        # [FUNCTION DOC] Test: checks object new behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         class A(object):
+            # [CLASS DOC] HELPER: local class A defined inside test_object_new to exercise
+            # descriptor/class-model behavior under test.
             pass
         object.__new__(A)
         self.assertRaises(TypeError, object.__new__, A, 5)
@@ -1825,7 +2524,11 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertRaises(TypeError, object.__init__, A(), 5)
 
         class A(object):
+            # [CLASS DOC] HELPER: local class A defined inside test_object_new to exercise
+            # descriptor/class-model behavior under test.
             def __init__(self, foo):
+                # [FUNCTION DOC] HELPER: constructor. Arguments: foo. Stores the given values on
+                # the instance, and for test cases initializes the base CPythonTestCase.
                 self.foo = foo
         object.__new__(A)
         object.__new__(A, 5)
@@ -1833,7 +2536,11 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertRaises(TypeError, object.__init__, A(3), 5)
 
         class A(object):
+            # [CLASS DOC] HELPER: local class A defined inside test_object_new to exercise
+            # descriptor/class-model behavior under test.
             def __new__(cls, foo):
+                # [FUNCTION DOC] HELPER: special method __new__ of A. Arguments: foo. Implements
+                # the protocol hook used by tests; returns the hook result.
                 return object.__new__(cls)
         object.__new__(A)
         self.assertRaises(TypeError, object.__new__, A, 5)
@@ -1841,9 +2548,15 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         object.__init__(A(3), 5)
 
         class A(object):
+            # [CLASS DOC] HELPER: local class A defined inside test_object_new to exercise
+            # descriptor/class-model behavior under test.
             def __new__(cls, foo):
+                # [FUNCTION DOC] HELPER: special method __new__ of A. Arguments: foo. Implements
+                # the protocol hook used by tests; returns the hook result.
                 return object.__new__(cls)
             def __init__(self, foo):
+                # [FUNCTION DOC] HELPER: constructor. Arguments: foo. Stores the given values on
+                # the instance, and for test cases initializes the base CPythonTestCase.
                 self.foo = foo
         object.__new__(A)
         self.assertRaises(TypeError, object.__new__, A, 5)
@@ -1852,13 +2565,24 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
     @unittest.expectedFailure
     def test_restored_object_new(self):
+        # [FUNCTION DOC] Test: checks restored object new behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         class A(object):
+            # [CLASS DOC] HELPER: local class A defined inside test_restored_object_new to
+            # exercise descriptor/class-model behavior under test.
             def __new__(cls, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: special method __new__ of A. Arguments: *args, **kwargs.
+                # Implements the protocol hook used by tests; returns the hook result.
                 raise AssertionError
         self.assertRaises(AssertionError, A)
         class B(A):
+            # [CLASS DOC] HELPER: local class B defined inside test_restored_object_new to
+            # exercise descriptor/class-model behavior under test.
             __new__ = object.__new__
             def __init__(self, foo):
+                # [FUNCTION DOC] HELPER: constructor. Arguments: foo. Stores the given values on
+                # the instance, and for test cases initializes the base CPythonTestCase.
                 self.foo = foo
         with warnings.catch_warnings():
             warnings.simplefilter('error', DeprecationWarning)
@@ -1875,14 +2599,29 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(b.__class__, B)
 
     def test_altmro(self):
+        # [FUNCTION DOC] Test: checks altmro behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # Testing mro() and overriding it...
         class A(object):
+            # [FUNCTION DOC] HELPER: f of A. Supporting routine for tests; returns a computed
+            # value or None.
+            # [CLASS DOC] HELPER: local class A defined inside test_altmro to exercise
+            # descriptor/class-model behavior under test.
             def f(self): return "A"
         class B(A):
+            # [CLASS DOC] HELPER: local class B defined inside test_altmro to exercise
+            # descriptor/class-model behavior under test.
             pass
         class C(A):
+            # [FUNCTION DOC] HELPER: f of C. Supporting routine for tests; returns a computed
+            # value or None.
+            # [CLASS DOC] HELPER: local class C defined inside test_altmro to exercise
+            # descriptor/class-model behavior under test.
             def f(self): return "C"
         class D(B, C):
+            # [CLASS DOC] HELPER: local class D defined inside test_altmro to exercise
+            # descriptor/class-model behavior under test.
             pass
         self.assertEqual(A.mro(), [A, object])
         self.assertEqual(A.__mro__, (A, object))
@@ -1895,20 +2634,32 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(D().f(), "C")
 
         class PerverseMetaType(type):
+            # [CLASS DOC] HELPER: local class PerverseMetaType defined inside test_altmro to
+            # exercise descriptor/class-model behavior under test.
             def mro(cls):
+                # [FUNCTION DOC] HELPER: mro of PerverseMetaType. Supporting routine for tests;
+                # returns a computed value or None.
                 L = type.mro(cls)
                 L.reverse()
                 return L
         class X(D,B,C,A, metaclass=PerverseMetaType):
+            # [CLASS DOC] HELPER: local class X defined inside test_altmro to exercise
+            # descriptor/class-model behavior under test.
             pass
         self.assertEqual(X.__mro__, (object, A, C, B, D, X))
         self.assertEqual(X().f(), "A")
 
         try:
             class _metaclass(type):
+                # [CLASS DOC] HELPER: local class _metaclass defined inside test_altmro to
+                # exercise descriptor/class-model behavior under test.
                 def mro(self):
+                    # [FUNCTION DOC] HELPER: mro of _metaclass. Supporting routine for tests;
+                    # returns a computed value or None.
                     return [self, dict, object]
             class X(object, metaclass=_metaclass):
+                # [CLASS DOC] HELPER: local class X defined inside test_altmro to exercise
+                # descriptor/class-model behavior under test.
                 pass
             # In CPython, the class creation above already raises
             # TypeError, as a protection against the fact that
@@ -1925,9 +2676,15 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
         try:
             class _metaclass(type):
+                # [CLASS DOC] HELPER: local class _metaclass defined inside test_altmro to
+                # exercise descriptor/class-model behavior under test.
                 def mro(self):
+                    # [FUNCTION DOC] HELPER: mro of _metaclass. Supporting routine for tests;
+                    # returns a computed value or None.
                     return [1]
             class X(object, metaclass=_metaclass):
+                # [CLASS DOC] HELPER: local class X defined inside test_altmro to exercise
+                # descriptor/class-model behavior under test.
                 pass
         except TypeError:
             pass
@@ -1936,9 +2693,15 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
         try:
             class _metaclass(type):
+                # [CLASS DOC] HELPER: local class _metaclass defined inside test_altmro to
+                # exercise descriptor/class-model behavior under test.
                 def mro(self):
+                    # [FUNCTION DOC] HELPER: mro of _metaclass. Supporting routine for tests;
+                    # returns a computed value or None.
                     return 1
             class X(object, metaclass=_metaclass):
+                # [CLASS DOC] HELPER: local class X defined inside test_altmro to exercise
+                # descriptor/class-model behavior under test.
                 pass
         except TypeError:
             pass
@@ -1946,33 +2709,53 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             self.fail("non-sequence mro() return not caught")
 
     def test_overloading(self):
+        # [FUNCTION DOC] Test: checks overloading behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing operator overloading...
 
         class B(object):
+            # [CLASS DOC] HELPER: local class B defined inside test_overloading to exercise
+            # descriptor/class-model behavior under test. Existing docstring says: Intermediate
+            # class because object doesn't have a __setattr__
             "Intermediate class because object doesn't have a __setattr__"
 
         class C(B):
+            # [CLASS DOC] HELPER: local class C defined inside test_overloading to exercise
+            # descriptor/class-model behavior under test.
             def __getattr__(self, name):
+                # [FUNCTION DOC] HELPER: special method __getattr__ of C. Arguments: name.
+                # Implements the protocol hook used by tests; returns the hook result.
                 if name == "foo":
                     return ("getattr", name)
                 else:
                     raise AttributeError
             def __setattr__(self, name, value):
+                # [FUNCTION DOC] HELPER: special method __setattr__ of C. Arguments: name, value.
+                # Implements the protocol hook used by tests; returns the hook result.
                 if name == "foo":
                     self.setattr = (name, value)
                 else:
                     return B.__setattr__(self, name, value)
             def __delattr__(self, name):
+                # [FUNCTION DOC] HELPER: special method __delattr__ of C. Arguments: name.
+                # Implements the protocol hook used by tests; returns the hook result.
                 if name == "foo":
                     self.delattr = name
                 else:
                     return B.__delattr__(self, name)
 
             def __getitem__(self, key):
+                # [FUNCTION DOC] HELPER: special method __getitem__ of C. Arguments: key.
+                # Implements the protocol hook used by tests; returns the hook result.
                 return ("getitem", key)
             def __setitem__(self, key, value):
+                # [FUNCTION DOC] HELPER: special method __setitem__ of C. Arguments: key, value.
+                # Implements the protocol hook used by tests; returns the hook result.
                 self.setitem = (key, value)
             def __delitem__(self, key):
+                # [FUNCTION DOC] HELPER: special method __delitem__ of C. Arguments: key.
+                # Implements the protocol hook used by tests; returns the hook result.
                 self.delitem = key
 
         a = C()
@@ -1995,9 +2778,16 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(a.delitem, (slice(0, 10)))
 
     def test_load_attr_extended_arg(self):
+        # [FUNCTION DOC] Test: checks load attr extended arg behavior. Fails with AssertionError
+        # (via unittest assertions) if the observed behavior differs from CPython semantics; no
+        # other side effects beyond temporary objects and classes.
         # https://github.com/python/cpython/issues/91625
         class Numbers:
+            # [CLASS DOC] HELPER: local class Numbers defined inside test_load_attr_extended_arg
+            # to exercise descriptor/class-model behavior under test.
             def __getattr__(self, attr):
+                # [FUNCTION DOC] HELPER: special method __getattr__ of Numbers. Arguments: attr.
+                # Implements the protocol hook used by tests; returns the hook result.
                 return int(attr.lstrip("_"))
         attrs = ", ".join(f"Z._{n:03d}" for n in range(280))
         code = f"def number_attrs(Z):\n    return [ {attrs} ]"
@@ -2010,15 +2800,26 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             self.assertEqual(number_attrs(Numbers()), list(range(280)))
 
     def test_methods(self):
+        # [FUNCTION DOC] Test: checks methods behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # Testing methods...
         class C(object):
+            # [CLASS DOC] HELPER: local class C defined inside test_methods to exercise
+            # descriptor/class-model behavior under test.
             def __init__(self, x):
+                # [FUNCTION DOC] HELPER: constructor. Arguments: x. Stores the given values on the
+                # instance, and for test cases initializes the base CPythonTestCase.
                 self.x = x
             def foo(self):
+                # [FUNCTION DOC] HELPER: foo of C. Supporting routine for tests; returns a
+                # computed value or None.
                 return self.x
         c1 = C(1)
         self.assertEqual(c1.foo(), 1)
         class D(C):
+            # [CLASS DOC] HELPER: local class D defined inside test_methods to exercise
+            # descriptor/class-model behavior under test.
             boo = C.foo
             goo = c1.foo
         d2 = D(2)
@@ -2026,12 +2827,17 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(d2.boo(), 2)
         self.assertEqual(d2.goo(), 1)
         class E(object):
+            # [CLASS DOC] HELPER: local class E defined inside test_methods to exercise
+            # descriptor/class-model behavior under test.
             foo = C.foo
         self.assertEqual(E().foo.__func__, C.foo) # i.e., unbound
         self.assertTrue(repr(C.foo.__get__(C(1))).startswith("<bound method "))
 
     @support.impl_detail("testing error message from implementation")
     def test_methods_in_c(self):
+        # [FUNCTION DOC] Test: checks methods in c behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # This test checks error messages in builtin method descriptor.
         # It is allowed that other Python implementations use
         # different error messages.
@@ -2054,39 +2860,76 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(cm.exception.args[0], expected_errmsg)
 
     def test_special_method_lookup(self):
+        # [FUNCTION DOC] Test: checks special method lookup behavior. Fails with AssertionError
+        # (via unittest assertions) if the observed behavior differs from CPython semantics; no
+        # other side effects beyond temporary objects and classes.
         # The lookup of special methods bypasses __getattr__ and
         # __getattribute__, but they still can be descriptors.
 
         def run_context(manager):
+            # [FUNCTION DOC] HELPER: local function run_context inside test_special_method_lookup.
+            # Arguments: manager. Returns its computed value or None; used by the enclosing test.
             with manager:
                 pass
         def iden(self):
+            # [FUNCTION DOC] HELPER: local function iden inside test_special_method_lookup.
+            # Returns its computed value or None; used by the enclosing test.
             return self
         def hello(self):
+            # [FUNCTION DOC] HELPER: local function hello inside test_special_method_lookup.
+            # Returns its computed value or None; used by the enclosing test.
             return b"hello"
         def empty_seq(self):
+            # [FUNCTION DOC] HELPER: local function empty_seq inside test_special_method_lookup.
+            # Returns its computed value or None; used by the enclosing test.
             return []
         def zero(self):
+            # [FUNCTION DOC] HELPER: local function zero inside test_special_method_lookup.
+            # Returns its computed value or None; used by the enclosing test.
             return 0
         def complex_num(self):
+            # [FUNCTION DOC] HELPER: local function complex_num inside test_special_method_lookup.
+            # Returns its computed value or None; used by the enclosing test.
             return 1j
         def stop(self):
+            # [FUNCTION DOC] HELPER: local function stop inside test_special_method_lookup.
+            # Returns its computed value or None; used by the enclosing test.
             raise StopIteration
         def return_true(self, thing=None):
+            # [FUNCTION DOC] HELPER: local function return_true inside test_special_method_lookup.
+            # Arguments: thing. Returns its computed value or None; used by the enclosing test.
             return True
         def do_isinstance(obj):
+            # [FUNCTION DOC] HELPER: local function do_isinstance inside
+            # test_special_method_lookup. Arguments: obj. Returns its computed value or None; used
+            # by the enclosing test.
             return isinstance(int, obj)
         def do_issubclass(obj):
+            # [FUNCTION DOC] HELPER: local function do_issubclass inside
+            # test_special_method_lookup. Arguments: obj. Returns its computed value or None; used
+            # by the enclosing test.
             return issubclass(int, obj)
         def do_dict_missing(checker):
+            # [FUNCTION DOC] HELPER: local function do_dict_missing inside
+            # test_special_method_lookup. Arguments: checker. Returns its computed value or None;
+            # used by the enclosing test.
             class DictSub(checker.__class__, dict):
+                # [CLASS DOC] HELPER: local class DictSub defined inside do_dict_missing to
+                # exercise descriptor/class-model behavior under test.
                 pass
             self.assertEqual(DictSub()["hi"], 4)
         def some_number(self_, key):
+            # [FUNCTION DOC] HELPER: local function some_number inside test_special_method_lookup.
+            # Arguments: self_, key. Returns its computed value or None; used by the enclosing
+            # test.
             self.assertEqual(key, "hi")
             return 4
+        # [FUNCTION DOC] HELPER: local function swallow inside test_special_method_lookup.
+        # Arguments: *args. Returns its computed value or None; used by the enclosing test.
         def swallow(*args): pass
         def format_impl(self, spec):
+            # [FUNCTION DOC] HELPER: local function format_impl inside test_special_method_lookup.
+            # Arguments: spec. Returns its computed value or None; used by the enclosing test.
             return "hello"
 
         # It would be nice to have every special method tested here, but I'm
@@ -2115,26 +2958,46 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             ]
 
         class Checker(object):
+            # [CLASS DOC] HELPER: local class Checker defined inside test_special_method_lookup to
+            # exercise descriptor/class-model behavior under test.
             def __getattr__(self, attr, test=self):
+                # [FUNCTION DOC] HELPER: special method __getattr__ of Checker. Arguments: attr,
+                # test. Implements the protocol hook used by tests; returns the hook result.
                 test.fail("__getattr__ called with {0}".format(attr))
             def __getattribute__(self, attr, test=self):
+                # [FUNCTION DOC] HELPER: special method __getattribute__ of Checker. Arguments:
+                # attr, test. Implements the protocol hook used by tests; returns the hook result.
                 if attr not in ok:
                     test.fail("__getattribute__ called with {0}".format(attr))
                 return object.__getattribute__(self, attr)
         class SpecialDescr(object):
+            # [CLASS DOC] HELPER: local class SpecialDescr defined inside
+            # test_special_method_lookup to exercise descriptor/class-model behavior under test.
             def __init__(self, impl):
+                # [FUNCTION DOC] HELPER: constructor. Arguments: impl. Stores the given values on
+                # the instance, and for test cases initializes the base CPythonTestCase.
                 self.impl = impl
             def __get__(self, obj, owner):
+                # [FUNCTION DOC] HELPER: special method __get__ of SpecialDescr. Arguments: obj,
+                # owner. Implements the protocol hook used by tests; returns the hook result.
                 record.append(1)
                 return self.impl.__get__(obj, owner)
         class MyException(Exception):
+            # [CLASS DOC] HELPER: local class MyException defined inside
+            # test_special_method_lookup to exercise descriptor/class-model behavior under test.
             pass
         class ErrDescr(object):
+            # [CLASS DOC] HELPER: local class ErrDescr defined inside test_special_method_lookup
+            # to exercise descriptor/class-model behavior under test.
             def __get__(self, obj, owner):
+                # [FUNCTION DOC] HELPER: special method __get__ of ErrDescr. Arguments: obj,
+                # owner. Implements the protocol hook used by tests; returns the hook result.
                 raise MyException
 
         for name, runner, meth_impl, ok, env in specials:
             class X(Checker):
+                # [CLASS DOC] HELPER: local class X defined inside test_special_method_lookup to
+                # exercise descriptor/class-model behavior under test.
                 pass
             for attr, obj in env.items():
                 setattr(X, attr, obj)
@@ -2143,6 +3006,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
             record = []
             class X(Checker):
+                # [CLASS DOC] HELPER: local class X defined inside test_special_method_lookup to
+                # exercise descriptor/class-model behavior under test.
                 pass
             for attr, obj in env.items():
                 setattr(X, attr, obj)
@@ -2151,6 +3016,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             self.assertEqual(record, [1], name)
 
             class X(Checker):
+                # [CLASS DOC] HELPER: local class X defined inside test_special_method_lookup to
+                # exercise descriptor/class-model behavior under test.
                 pass
             for attr, obj in env.items():
                 setattr(X, attr, obj)
@@ -2158,12 +3025,19 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             self.assertRaises(MyException, runner, X())
 
     def test_specials(self):
+        # [FUNCTION DOC] Test: checks specials behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # Testing special operators...
         # Test operators like __hash__ for which a built-in default exists
 
         # Test the default behavior for static classes
         class C(object):
+            # [CLASS DOC] HELPER: local class C defined inside test_specials to exercise
+            # descriptor/class-model behavior under test.
             def __getitem__(self, i):
+                # [FUNCTION DOC] HELPER: special method __getitem__ of C. Arguments: i. Implements
+                # the protocol hook used by tests; returns the hook result.
                 if 0 <= i < 10: return i
                 raise IndexError
         c1 = C()
@@ -2186,7 +3060,11 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertNotIn(10, c1)
         # Test the default behavior for dynamic classes
         class D(object):
+            # [CLASS DOC] HELPER: local class D defined inside test_specials to exercise
+            # descriptor/class-model behavior under test.
             def __getitem__(self, i):
+                # [FUNCTION DOC] HELPER: special method __getitem__ of D. Arguments: i. Implements
+                # the protocol hook used by tests; returns the hook result.
                 if 0 <= i < 10: return i
                 raise IndexError
         d1 = D()
@@ -2209,29 +3087,55 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertNotIn(10, d1)
         # Test overridden behavior
         class Proxy(object):
+            # [CLASS DOC] HELPER: local class Proxy defined inside test_specials to exercise
+            # descriptor/class-model behavior under test.
             def __init__(self, x):
+                # [FUNCTION DOC] HELPER: constructor. Arguments: x. Stores the given values on the
+                # instance, and for test cases initializes the base CPythonTestCase.
                 self.x = x
             def __bool__(self):
+                # [FUNCTION DOC] HELPER: special method __bool__ of Proxy. Implements the protocol
+                # hook used by tests; returns the hook result.
                 return not not self.x
             def __hash__(self):
+                # [FUNCTION DOC] HELPER: special method __hash__ of Proxy. Implements the protocol
+                # hook used by tests; returns the hook result.
                 return hash(self.x)
             def __eq__(self, other):
+                # [FUNCTION DOC] HELPER: special method __eq__ of Proxy. Arguments: other.
+                # Implements the protocol hook used by tests; returns the hook result.
                 return self.x == other
             def __ne__(self, other):
+                # [FUNCTION DOC] HELPER: special method __ne__ of Proxy. Arguments: other.
+                # Implements the protocol hook used by tests; returns the hook result.
                 return self.x != other
             def __ge__(self, other):
+                # [FUNCTION DOC] HELPER: special method __ge__ of Proxy. Arguments: other.
+                # Implements the protocol hook used by tests; returns the hook result.
                 return self.x >= other
             def __gt__(self, other):
+                # [FUNCTION DOC] HELPER: special method __gt__ of Proxy. Arguments: other.
+                # Implements the protocol hook used by tests; returns the hook result.
                 return self.x > other
             def __le__(self, other):
+                # [FUNCTION DOC] HELPER: special method __le__ of Proxy. Arguments: other.
+                # Implements the protocol hook used by tests; returns the hook result.
                 return self.x <= other
             def __lt__(self, other):
+                # [FUNCTION DOC] HELPER: special method __lt__ of Proxy. Arguments: other.
+                # Implements the protocol hook used by tests; returns the hook result.
                 return self.x < other
             def __str__(self):
+                # [FUNCTION DOC] HELPER: special method __str__ of Proxy. Implements the protocol
+                # hook used by tests; returns the hook result.
                 return "Proxy:%s" % self.x
             def __repr__(self):
+                # [FUNCTION DOC] HELPER: special method __repr__ of Proxy. Implements the protocol
+                # hook used by tests; returns the hook result.
                 return "Proxy(%r)" % self.x
             def __contains__(self, value):
+                # [FUNCTION DOC] HELPER: special method __contains__ of Proxy. Arguments: value.
+                # Implements the protocol hook used by tests; returns the hook result.
                 return value in self.x
         p0 = Proxy(0)
         p1 = Proxy(1)
@@ -2256,9 +3160,14 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertNotIn(10, p10)
 
     def test_weakrefs(self):
+        # [FUNCTION DOC] Test: checks weakrefs behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # Testing weak references...
         import weakref
         class C(object):
+            # [CLASS DOC] HELPER: local class C defined inside test_weakrefs to exercise
+            # descriptor/class-model behavior under test.
             pass
         c = C()
         r = weakref.ref(c)
@@ -2268,6 +3177,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(r(), None)
         del r
         class NoWeak(object):
+            # [CLASS DOC] HELPER: local class NoWeak defined inside test_weakrefs to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = ['foo']
         no = NoWeak()
         try:
@@ -2277,6 +3188,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         else:
             self.fail("weakref.ref(no) should be illegal")
         class Weak(object):
+            # [CLASS DOC] HELPER: local class Weak defined inside test_weakrefs to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = ['foo', '__weakref__']
         yes = Weak()
         r = weakref.ref(yes)
@@ -2287,13 +3200,24 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         del r
 
     def test_properties(self):
+        # [FUNCTION DOC] Test: checks properties behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # Testing property...
         class C(object):
+            # [CLASS DOC] HELPER: local class C defined inside test_properties to exercise
+            # descriptor/class-model behavior under test.
             def getx(self):
+                # [FUNCTION DOC] HELPER: getx of C. Supporting routine for tests; returns a
+                # computed value or None.
                 return self.__x
             def setx(self, value):
+                # [FUNCTION DOC] HELPER: setx of C. Arguments: value. Supporting routine for
+                # tests; returns a computed value or None.
                 self.__x = value
             def delx(self):
+                # [FUNCTION DOC] HELPER: delx of C. Supporting routine for tests; returns a
+                # computed value or None.
                 del self.__x
             x = property(getx, setx, delx, doc="I'm the x property.")
         a = C()
@@ -2338,6 +3262,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(raw.__doc__, 42)
 
         class D(object):
+            # [CLASS DOC] HELPER: local class D defined inside test_properties to exercise
+            # descriptor/class-model behavior under test.
             __getitem__ = property(lambda s: 1/0)
 
         d = D()
@@ -2352,11 +3278,20 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
     @unittest.skipIf(sys.flags.optimize >= 2,
                      "Docstrings are omitted with -O2 and above")
     def test_properties_doc_attrib(self):
+        # [FUNCTION DOC] Test: checks properties doc attrib behavior. Fails with AssertionError
+        # (via unittest assertions) if the observed behavior differs from CPython semantics; no
+        # other side effects beyond temporary objects and classes.
         class E(object):
+            # [CLASS DOC] HELPER: local class E defined inside test_properties_doc_attrib to
+            # exercise descriptor/class-model behavior under test.
             def getter(self):
+                # [FUNCTION DOC] HELPER: getter of E. Supporting routine for tests; returns a
+                # computed value or None. Docstring: getter method
                 "getter method"
                 return 0
             def setter(self_, value):
+                # [FUNCTION DOC] HELPER: setter of E. Arguments: self_, value. Supporting routine
+                # for tests; returns a computed value or None. Docstring: setter method
                 "setter method"
                 pass
             prop = property(getter)
@@ -2366,6 +3301,9 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
     @support.cpython_only
     def test_testcapi_no_segfault(self):
+        # [FUNCTION DOC] Test: checks testcapi no segfault behavior. Fails with AssertionError
+        # (via unittest assertions) if the observed behavior differs from CPython semantics; no
+        # other side effects beyond temporary objects and classes.
         # this segfaulted in 2.5b2
         try:
             import _testcapi
@@ -2373,19 +3311,32 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             pass
         else:
             class X(object):
+                # [CLASS DOC] HELPER: local class X defined inside test_testcapi_no_segfault to
+                # exercise descriptor/class-model behavior under test.
                 p = property(_testcapi.test_with_docstring)
 
     def test_properties_plus(self):
+        # [FUNCTION DOC] Test: checks properties plus behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         class C(object):
+            # [CLASS DOC] HELPER: local class C defined inside test_properties_plus to exercise
+            # descriptor/class-model behavior under test.
             foo = property(doc="hello")
             @foo.getter
             def foo(self):
+                # [FUNCTION DOC] HELPER: foo of C. Supporting routine for tests; returns a
+                # computed value or None.
                 return self._foo
             @foo.setter
             def foo(self, value):
+                # [FUNCTION DOC] HELPER: foo of C. Arguments: value. Supporting routine for tests;
+                # returns a computed value or None.
                 self._foo = abs(value)
             @foo.deleter
             def foo(self):
+                # [FUNCTION DOC] HELPER: foo of C. Supporting routine for tests; returns a
+                # computed value or None.
                 del self._foo
         c = C()
         self.assertEqual(C.foo.__doc__, "hello")
@@ -2400,7 +3351,11 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
         class D(C):
             @C.foo.deleter
+            # [CLASS DOC] HELPER: local class D defined inside test_properties_plus to exercise
+            # descriptor/class-model behavior under test.
             def foo(self):
+                # [FUNCTION DOC] HELPER: foo of D. Supporting routine for tests; returns a
+                # computed value or None.
                 try:
                     del self._foo
                 except AttributeError:
@@ -2413,16 +3368,26 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
         class E(object):
             @property
+            # [CLASS DOC] HELPER: local class E defined inside test_properties_plus to exercise
+            # descriptor/class-model behavior under test.
             def foo(self):
+                # [FUNCTION DOC] HELPER: foo of E. Supporting routine for tests; returns a
+                # computed value or None.
                 return self._foo
             @foo.setter
             def foo(self, value):
+                # [FUNCTION DOC] HELPER: foo of E. Arguments: value. Supporting routine for tests;
+                # returns a computed value or None.
                 raise RuntimeError
             @foo.setter
             def foo(self, value):
+                # [FUNCTION DOC] HELPER: foo of E. Arguments: value. Supporting routine for tests;
+                # returns a computed value or None.
                 self._foo = abs(value)
             @foo.deleter
             def foo(self, value=None):
+                # [FUNCTION DOC] HELPER: foo of E. Arguments: value. Supporting routine for tests;
+                # returns a computed value or None.
                 del self._foo
 
         e = E()
@@ -2432,10 +3397,16 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
         class F(E):
             @E.foo.deleter
+            # [CLASS DOC] HELPER: local class F defined inside test_properties_plus to exercise
+            # descriptor/class-model behavior under test.
             def foo(self):
+                # [FUNCTION DOC] HELPER: foo of F. Supporting routine for tests; returns a
+                # computed value or None.
                 del self._foo
             @foo.setter
             def foo(self, value):
+                # [FUNCTION DOC] HELPER: foo of F. Arguments: value. Supporting routine for tests;
+                # returns a computed value or None.
                 self._foo = max(0, value)
         f = F()
         f.foo = -10
@@ -2443,6 +3414,9 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         del f.foo
 
     def test_dict_constructors(self):
+        # [FUNCTION DOC] Test: checks dict constructors behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing dict constructor ...
         d = dict()
         self.assertEqual(d, {})
@@ -2480,6 +3454,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             dict({}, {})
 
         class Mapping:
+            # [CLASS DOC] HELPER: local class Mapping defined inside test_dict_constructors to
+            # exercise descriptor/class-model behavior under test.
             # Lacks a .keys() method; will be added later.
             dict = {1:2, 3:4, 'a':1j}
 
@@ -2497,10 +3473,16 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
         # Init from sequence of iterable objects, each producing a 2-sequence.
         class AddressBookEntry:
+            # [CLASS DOC] HELPER: local class AddressBookEntry defined inside
+            # test_dict_constructors to exercise descriptor/class-model behavior under test.
             def __init__(self, first, last):
+                # [FUNCTION DOC] HELPER: constructor. Arguments: first, last. Stores the given
+                # values on the instance, and for test cases initializes the base CPythonTestCase.
                 self.first = first
                 self.last = last
             def __iter__(self):
+                # [FUNCTION DOC] HELPER: special method __iter__ of AddressBookEntry. Implements
+                # the protocol hook used by tests; returns the hook result.
                 return iter([self.first, self.last])
 
         d = dict([AddressBookEntry('Tim', 'Warsaw'),
@@ -2522,6 +3504,9 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
                 self.fail("no ValueError from dict(%r)" % bad)
 
     def test_dir(self):
+        # [FUNCTION DOC] Test: checks dir behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # Testing dir() ...
         junk = 12
         self.assertEqual(dir(), ['junk', 'self'])
@@ -2534,10 +3519,16 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         # Test dir on new-style classes.  Since these have object as a
         # base class, a lot more gets sucked in.
         def interesting(strings):
+            # [FUNCTION DOC] HELPER: local function interesting inside test_dir. Arguments:
+            # strings. Returns its computed value or None; used by the enclosing test.
             return [s for s in strings if not s.startswith('_')]
 
         class C(object):
+            # [CLASS DOC] HELPER: local class C defined inside test_dir to exercise
+            # descriptor/class-model behavior under test.
             Cdata = 1
+            # [FUNCTION DOC] HELPER: Cmethod of C. Supporting routine for tests; returns a
+            # computed value or None.
             def Cmethod(self): pass
 
         cstuff = ['Cdata', 'Cmethod']
@@ -2553,7 +3544,11 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         ## self.assertIn('__self__', dir(c.Cmethod))
 
         class A(C):
+            # [CLASS DOC] HELPER: local class A defined inside test_dir to exercise
+            # descriptor/class-model behavior under test.
             Adata = 1
+            # [FUNCTION DOC] HELPER: Amethod of A. Supporting routine for tests; returns a
+            # computed value or None.
             def Amethod(self): pass
 
         astuff = ['Adata', 'Amethod'] + cstuff
@@ -2568,6 +3563,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
         # Try a module subclass.
         class M(type(sys)):
+            # [CLASS DOC] HELPER: local class M defined inside test_dir to exercise
+            # descriptor/class-model behavior under test.
             pass
         minstance = M("m")
         minstance.b = 2
@@ -2578,7 +3575,11 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(names, ['a', 'b'])
 
         class M2(M):
+            # [CLASS DOC] HELPER: local class M2 defined inside test_dir to exercise
+            # descriptor/class-model behavior under test.
             def getdict(self):
+                # [FUNCTION DOC] HELPER: getdict of M2. Supporting routine for tests; returns a
+                # computed value or None.
                 return "Not a dict!"
             __dict__ = property(getdict)
 
@@ -2595,50 +3596,87 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
         # Nasty test case for proxied objects
         class Wrapper(object):
+            # [CLASS DOC] HELPER: local class Wrapper defined inside test_dir to exercise
+            # descriptor/class-model behavior under test.
             def __init__(self, obj):
+                # [FUNCTION DOC] HELPER: constructor. Arguments: obj. Stores the given values on
+                # the instance, and for test cases initializes the base CPythonTestCase.
                 self.__obj = obj
             def __repr__(self):
+                # [FUNCTION DOC] HELPER: special method __repr__ of Wrapper. Implements the
+                # protocol hook used by tests; returns the hook result.
                 return "Wrapper(%s)" % repr(self.__obj)
             def __getitem__(self, key):
+                # [FUNCTION DOC] HELPER: special method __getitem__ of Wrapper. Arguments: key.
+                # Implements the protocol hook used by tests; returns the hook result.
                 return Wrapper(self.__obj[key])
             def __len__(self):
+                # [FUNCTION DOC] HELPER: special method __len__ of Wrapper. Implements the
+                # protocol hook used by tests; returns the hook result.
                 return len(self.__obj)
             def __getattr__(self, name):
+                # [FUNCTION DOC] HELPER: special method __getattr__ of Wrapper. Arguments: name.
+                # Implements the protocol hook used by tests; returns the hook result.
                 return Wrapper(getattr(self.__obj, name))
 
         class C(object):
+            # [CLASS DOC] HELPER: local class C defined inside test_dir to exercise
+            # descriptor/class-model behavior under test.
             def __getclass(self):
+                # [FUNCTION DOC] HELPER: __getclass of C. Supporting routine for tests; returns a
+                # computed value or None.
                 return Wrapper(type(self))
             __class__ = property(__getclass)
 
         dir(C()) # This used to segfault
 
     def test_supers(self):
+        # [FUNCTION DOC] Test: checks supers behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # Testing super...
 
         class A(object):
+            # [CLASS DOC] HELPER: local class A defined inside test_supers to exercise
+            # descriptor/class-model behavior under test.
             def meth(self, a):
+                # [FUNCTION DOC] HELPER: meth of A. Arguments: a. Supporting routine for tests;
+                # returns a computed value or None.
                 return "A(%r)" % a
 
         self.assertEqual(A().meth(1), "A(1)")
 
         class B(A):
+            # [CLASS DOC] HELPER: local class B defined inside test_supers to exercise
+            # descriptor/class-model behavior under test.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: constructor. Stores the given values on the instance, and
+                # for test cases initializes the base CPythonTestCase.
                 self.__super = super(B, self)
             def meth(self, a):
+                # [FUNCTION DOC] HELPER: meth of B. Arguments: a. Supporting routine for tests;
+                # returns a computed value or None.
                 return "B(%r)" % a + self.__super.meth(a)
 
         self.assertEqual(B().meth(2), "B(2)A(2)")
 
         class C(A):
+            # [CLASS DOC] HELPER: local class C defined inside test_supers to exercise
+            # descriptor/class-model behavior under test.
             def meth(self, a):
+                # [FUNCTION DOC] HELPER: meth of C. Arguments: a. Supporting routine for tests;
+                # returns a computed value or None.
                 return "C(%r)" % a + self.__super.meth(a)
         C._C__super = super(C)
 
         self.assertEqual(C().meth(3), "C(3)A(3)")
 
         class D(C, B):
+            # [CLASS DOC] HELPER: local class D defined inside test_supers to exercise
+            # descriptor/class-model behavior under test.
             def meth(self, a):
+                # [FUNCTION DOC] HELPER: meth of D. Arguments: a. Supporting routine for tests;
+                # returns a computed value or None.
                 return "D(%r)" % a + super(D, self).meth(a)
 
         self.assertEqual(D().meth(4), "D(4)C(4)B(4)A(4)")
@@ -2646,17 +3684,29 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         # Test for subclassing super
 
         class mysuper(super):
+            # [CLASS DOC] HELPER: local class mysuper defined inside test_supers to exercise
+            # descriptor/class-model behavior under test.
             def __init__(self, *args):
+                # [FUNCTION DOC] HELPER: constructor. Arguments: *args. Stores the given values on
+                # the instance, and for test cases initializes the base CPythonTestCase.
                 return super(mysuper, self).__init__(*args)
 
         class E(D):
+            # [CLASS DOC] HELPER: local class E defined inside test_supers to exercise
+            # descriptor/class-model behavior under test.
             def meth(self, a):
+                # [FUNCTION DOC] HELPER: meth of E. Arguments: a. Supporting routine for tests;
+                # returns a computed value or None.
                 return "E(%r)" % a + mysuper(E, self).meth(a)
 
         self.assertEqual(E().meth(5), "E(5)D(5)C(5)B(5)A(5)")
 
         class F(E):
+            # [CLASS DOC] HELPER: local class F defined inside test_supers to exercise
+            # descriptor/class-model behavior under test.
             def meth(self, a):
+                # [FUNCTION DOC] HELPER: meth of F. Arguments: a. Supporting routine for tests;
+                # returns a computed value or None.
                 s = self.__super # == mysuper(F, self)
                 return "F(%r)[%s]" % (a, s.__class__.__name__) + s.meth(a)
         F._F__super = mysuper(F)
@@ -2697,10 +3747,18 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         # (new feature in Python 2.3)
 
         class DDbase(object):
+            # [FUNCTION DOC] HELPER: getx of DDbase. Supporting routine for tests; returns a
+            # computed value or None.
+            # [CLASS DOC] HELPER: local class DDbase defined inside test_supers to exercise
+            # descriptor/class-model behavior under test.
             def getx(self): return 42
             x = property(getx)
 
         class DDsub(DDbase):
+            # [FUNCTION DOC] HELPER: getx of DDsub. Supporting routine for tests; returns a
+            # computed value or None.
+            # [CLASS DOC] HELPER: local class DDsub defined inside test_supers to exercise
+            # descriptor/class-model behavior under test.
             def getx(self): return "hello"
             x = property(getx)
 
@@ -2712,11 +3770,18 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         # works (SF ID# 743627)
 
         class Base(object):
+            # [CLASS DOC] HELPER: local class Base defined inside test_supers to exercise
+            # descriptor/class-model behavior under test.
             aProp = property(lambda self: "foo")
 
         class Sub(Base):
             @classmethod
+            # [CLASS DOC] HELPER: local class Sub defined inside test_supers to exercise
+            # descriptor/class-model behavior under test.
             def test(klass):
+                # [FUNCTION DOC] Test: checks  behavior. Fails with AssertionError (via unittest
+                # assertions) if the observed behavior differs from CPython semantics; no other
+                # side effects beyond temporary objects and classes.
                 return super(Sub,klass).aProp
 
         self.assertEqual(Sub.test(), Base.aProp)
@@ -2726,12 +3791,21 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             super(Base, kw=1)
 
     def test_basic_inheritance(self):
+        # [FUNCTION DOC] Test: checks basic inheritance behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing inheritance from basic types...
 
         class hexint(int):
+            # [CLASS DOC] HELPER: local class hexint defined inside test_basic_inheritance to
+            # exercise descriptor/class-model behavior under test.
             def __repr__(self):
+                # [FUNCTION DOC] HELPER: special method __repr__ of hexint. Implements the
+                # protocol hook used by tests; returns the hook result.
                 return hex(self)
             def __add__(self, other):
+                # [FUNCTION DOC] HELPER: special method __add__ of hexint. Arguments: other.
+                # Implements the protocol hook used by tests; returns the hook result.
                 return hexint(int.__add__(self, other))
             # (Note that overriding __radd__ doesn't work,
             # because the int type gets first dibs.)
@@ -2749,10 +3823,16 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertIs((hexint(0) >> 12).__class__, int)
 
         class octlong(int):
+            # [CLASS DOC] HELPER: local class octlong defined inside test_basic_inheritance to
+            # exercise descriptor/class-model behavior under test.
             __slots__ = []
             def __str__(self):
+                # [FUNCTION DOC] HELPER: special method __str__ of octlong. Implements the
+                # protocol hook used by tests; returns the hook result.
                 return oct(self)
             def __add__(self, other):
+                # [FUNCTION DOC] HELPER: special method __add__ of octlong. Arguments: other.
+                # Implements the protocol hook used by tests; returns the hook result.
                 return self.__class__(super(octlong, self).__add__(other))
             __radd__ = __add__
         self.assertEqual(str(octlong(3) + 5), "0o10")
@@ -2784,6 +3864,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         # Because octlong overrides __add__, we can't check the absence of +0
         # optimizations using octlong.
         class longclone(int):
+            # [CLASS DOC] HELPER: local class longclone defined inside test_basic_inheritance to
+            # exercise descriptor/class-model behavior under test.
             pass
         a = longclone(1)
         self.assertIs((a + 0).__class__, int)
@@ -2795,10 +3877,16 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(int(a), -1)  # self.assertTrue PyNumber_Long() copies the sign bit
 
         class precfloat(float):
+            # [CLASS DOC] HELPER: local class precfloat defined inside test_basic_inheritance to
+            # exercise descriptor/class-model behavior under test.
             __slots__ = ['prec']
             def __init__(self, value=0.0, prec=12):
+                # [FUNCTION DOC] HELPER: constructor. Arguments: value, prec. Stores the given
+                # values on the instance, and for test cases initializes the base CPythonTestCase.
                 self.prec = int(prec)
             def __repr__(self):
+                # [FUNCTION DOC] HELPER: special method __repr__ of precfloat. Implements the
+                # protocol hook used by tests; returns the hook result.
                 return "%.*g" % (self.prec, self)
         self.assertEqual(repr(precfloat(1.1)), "1.1")
         a = precfloat(12345)
@@ -2809,7 +3897,11 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertIs((+a).__class__, float)
 
         class madcomplex(complex):
+            # [CLASS DOC] HELPER: local class madcomplex defined inside test_basic_inheritance to
+            # exercise descriptor/class-model behavior under test.
             def __repr__(self):
+                # [FUNCTION DOC] HELPER: special method __repr__ of madcomplex. Implements the
+                # protocol hook used by tests; returns the hook result.
                 return "%.17gj%+.17g" % (self.imag, self.real)
         a = madcomplex(-3, 4)
         self.assertEqual(repr(a), "4j-3")
@@ -2835,8 +3927,12 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(a / 1, base)
 
         class madtuple(tuple):
+            # [CLASS DOC] HELPER: local class madtuple defined inside test_basic_inheritance to
+            # exercise descriptor/class-model behavior under test.
             _rev = None
             def rev(self):
+                # [FUNCTION DOC] HELPER: rev of madtuple. Supporting routine for tests; returns a
+                # computed value or None.
                 if self._rev is not None:
                     return self._rev
                 L = list(self)
@@ -2870,8 +3966,12 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertIs(a[:].__class__, tuple)
 
         class madstring(str):
+            # [CLASS DOC] HELPER: local class madstring defined inside test_basic_inheritance to
+            # exercise descriptor/class-model behavior under test.
             _rev = None
             def rev(self):
+                # [FUNCTION DOC] HELPER: rev of madstring. Supporting routine for tests; returns a
+                # computed value or None.
                 if self._rev is not None:
                     return self._rev
                 L = list(self)
@@ -2934,8 +4034,12 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(s.lower(), base)
 
         class madunicode(str):
+            # [CLASS DOC] HELPER: local class madunicode defined inside test_basic_inheritance to
+            # exercise descriptor/class-model behavior under test.
             _rev = None
             def rev(self):
+                # [FUNCTION DOC] HELPER: rev of madunicode. Supporting routine for tests; returns
+                # a computed value or None.
                 if self._rev is not None:
                     return self._rev
                 L = list(self)
@@ -2993,6 +4097,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(u[0:0], "")
 
         class sublist(list):
+            # [CLASS DOC] HELPER: local class sublist defined inside test_basic_inheritance to
+            # exercise descriptor/class-model behavior under test.
             pass
         a = sublist(range(5))
         self.assertEqual(a, list(range(5)))
@@ -3058,6 +4164,9 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         ##     os_helper.unlink(os_helper.TESTFN)
 
     def test_keywords(self):
+        # [FUNCTION DOC] Test: checks keywords behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # Testing keyword args to basic type constructors ...
         with self.assertRaisesRegex(TypeError, 'keyword argument'):
             int(x=1)
@@ -3085,24 +4194,36 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
                             % constructor)
 
     def test_str_subclass_as_dict_key(self):
+        # [FUNCTION DOC] Test: checks str subclass as dict key behavior. Fails with AssertionError
+        # (via unittest assertions) if the observed behavior differs from CPython semantics; no
+        # other side effects beyond temporary objects and classes.
         # Testing a str subclass used as dict key ..
 
         class cistr(str):
+            # [CLASS DOC] HELPER: local class cistr defined inside test_str_subclass_as_dict_key
+            # to exercise descriptor/class-model behavior under test. Existing docstring says:
+            # Subclass of str that computes __eq__ case-insensitively.
             """Subclass of str that computes __eq__ case-insensitively.
 
             Also computes a hash code of the string in canonical form.
             """
 
             def __init__(self, value):
+                # [FUNCTION DOC] HELPER: constructor. Arguments: value. Stores the given values on
+                # the instance, and for test cases initializes the base CPythonTestCase.
                 self.canonical = value.lower()
                 self.hashcode = hash(self.canonical)
 
             def __eq__(self, other):
+                # [FUNCTION DOC] HELPER: special method __eq__ of cistr. Arguments: other.
+                # Implements the protocol hook used by tests; returns the hook result.
                 if not isinstance(other, cistr):
                     other = cistr(other)
                 return self.canonical == other.canonical
 
             def __hash__(self):
+                # [FUNCTION DOC] HELPER: special method __hash__ of cistr. Implements the protocol
+                # hook used by tests; returns the hook result.
                 return self.hashcode
 
         self.assertEqual(cistr('ABC'), 'abc')
@@ -3117,45 +4238,67 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(d.get(cistr('thrEE')), 3)
 
     def test_classic_comparisons(self):
+        # [FUNCTION DOC] Test: checks classic comparisons behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing classic comparisons...
         class classic:
+            # [CLASS DOC] HELPER: local class classic defined inside test_classic_comparisons to
+            # exercise descriptor/class-model behavior under test.
             pass
 
         for base in (classic, int, object):
             class C(base):
+                # [CLASS DOC] HELPER: local class C defined inside test_classic_comparisons to
+                # exercise descriptor/class-model behavior under test.
                 def __init__(self, value):
+                    # [FUNCTION DOC] HELPER: constructor. Arguments: value. Stores the given
+                    # values on the instance, and for test cases initializes the base
+                    # CPythonTestCase.
                     self.value = int(value)
                 def __eq__(self, other):
+                    # [FUNCTION DOC] HELPER: special method __eq__ of C. Arguments: other.
+                    # Implements the protocol hook used by tests; returns the hook result.
                     if isinstance(other, C):
                         return self.value == other.value
                     if isinstance(other, int) or isinstance(other, int):
                         return self.value == other
                     return NotImplemented
                 def __ne__(self, other):
+                    # [FUNCTION DOC] HELPER: special method __ne__ of C. Arguments: other.
+                    # Implements the protocol hook used by tests; returns the hook result.
                     if isinstance(other, C):
                         return self.value != other.value
                     if isinstance(other, int) or isinstance(other, int):
                         return self.value != other
                     return NotImplemented
                 def __lt__(self, other):
+                    # [FUNCTION DOC] HELPER: special method __lt__ of C. Arguments: other.
+                    # Implements the protocol hook used by tests; returns the hook result.
                     if isinstance(other, C):
                         return self.value < other.value
                     if isinstance(other, int) or isinstance(other, int):
                         return self.value < other
                     return NotImplemented
                 def __le__(self, other):
+                    # [FUNCTION DOC] HELPER: special method __le__ of C. Arguments: other.
+                    # Implements the protocol hook used by tests; returns the hook result.
                     if isinstance(other, C):
                         return self.value <= other.value
                     if isinstance(other, int) or isinstance(other, int):
                         return self.value <= other
                     return NotImplemented
                 def __gt__(self, other):
+                    # [FUNCTION DOC] HELPER: special method __gt__ of C. Arguments: other.
+                    # Implements the protocol hook used by tests; returns the hook result.
                     if isinstance(other, C):
                         return self.value > other.value
                     if isinstance(other, int) or isinstance(other, int):
                         return self.value > other
                     return NotImplemented
                 def __ge__(self, other):
+                    # [FUNCTION DOC] HELPER: special method __ge__ of C. Arguments: other.
+                    # Implements the protocol hook used by tests; returns the hook result.
                     if isinstance(other, C):
                         return self.value >= other.value
                     if isinstance(other, int) or isinstance(other, int):
@@ -3181,14 +4324,23 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
                                      "x=%d, y=%d" % (x, y))
 
     def test_rich_comparisons(self):
+        # [FUNCTION DOC] Test: checks rich comparisons behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing rich comparisons...
         class Z(complex):
+            # [CLASS DOC] HELPER: local class Z defined inside test_rich_comparisons to exercise
+            # descriptor/class-model behavior under test.
             pass
         z = Z(1)
         self.assertEqual(z, 1+0j)
         self.assertEqual(1+0j, z)
         class ZZ(complex):
+            # [CLASS DOC] HELPER: local class ZZ defined inside test_rich_comparisons to exercise
+            # descriptor/class-model behavior under test.
             def __eq__(self, other):
+                # [FUNCTION DOC] HELPER: special method __eq__ of ZZ. Arguments: other. Implements
+                # the protocol hook used by tests; returns the hook result.
                 try:
                     return abs(self - other) <= 1e-6
                 except:
@@ -3198,44 +4350,65 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(1+0j, zz)
 
         class classic:
+            # [CLASS DOC] HELPER: local class classic defined inside test_rich_comparisons to
+            # exercise descriptor/class-model behavior under test.
             pass
         for base in (classic, int, object, list):
             class C(base):
+                # [CLASS DOC] HELPER: local class C defined inside test_rich_comparisons to
+                # exercise descriptor/class-model behavior under test.
                 def __init__(self, value):
+                    # [FUNCTION DOC] HELPER: constructor. Arguments: value. Stores the given
+                    # values on the instance, and for test cases initializes the base
+                    # CPythonTestCase.
                     self.value = int(value)
                 def __cmp__(self_, other):
+                    # [FUNCTION DOC] HELPER: special method __cmp__ of C. Arguments: self_, other.
+                    # Implements the protocol hook used by tests; returns the hook result.
                     self.fail("shouldn't call __cmp__")
                 def __eq__(self, other):
+                    # [FUNCTION DOC] HELPER: special method __eq__ of C. Arguments: other.
+                    # Implements the protocol hook used by tests; returns the hook result.
                     if isinstance(other, C):
                         return self.value == other.value
                     if isinstance(other, int) or isinstance(other, int):
                         return self.value == other
                     return NotImplemented
                 def __ne__(self, other):
+                    # [FUNCTION DOC] HELPER: special method __ne__ of C. Arguments: other.
+                    # Implements the protocol hook used by tests; returns the hook result.
                     if isinstance(other, C):
                         return self.value != other.value
                     if isinstance(other, int) or isinstance(other, int):
                         return self.value != other
                     return NotImplemented
                 def __lt__(self, other):
+                    # [FUNCTION DOC] HELPER: special method __lt__ of C. Arguments: other.
+                    # Implements the protocol hook used by tests; returns the hook result.
                     if isinstance(other, C):
                         return self.value < other.value
                     if isinstance(other, int) or isinstance(other, int):
                         return self.value < other
                     return NotImplemented
                 def __le__(self, other):
+                    # [FUNCTION DOC] HELPER: special method __le__ of C. Arguments: other.
+                    # Implements the protocol hook used by tests; returns the hook result.
                     if isinstance(other, C):
                         return self.value <= other.value
                     if isinstance(other, int) or isinstance(other, int):
                         return self.value <= other
                     return NotImplemented
                 def __gt__(self, other):
+                    # [FUNCTION DOC] HELPER: special method __gt__ of C. Arguments: other.
+                    # Implements the protocol hook used by tests; returns the hook result.
                     if isinstance(other, C):
                         return self.value > other.value
                     if isinstance(other, int) or isinstance(other, int):
                         return self.value > other
                     return NotImplemented
                 def __ge__(self, other):
+                    # [FUNCTION DOC] HELPER: special method __ge__ of C. Arguments: other.
+                    # Implements the protocol hook used by tests; returns the hook result.
                     if isinstance(other, C):
                         return self.value >= other.value
                     if isinstance(other, int) or isinstance(other, int):
@@ -3260,33 +4433,58 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
                                          "x=%d, y=%d" % (x, y))
 
     def test_descrdoc(self):
+        # [FUNCTION DOC] Test: checks descrdoc behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # Testing descriptor doc strings...
         from _io import FileIO
         def check(descr, what):
+            # [FUNCTION DOC] HELPER: local function check inside test_descrdoc. Arguments: descr,
+            # what. Returns its computed value or None; used by the enclosing test.
             self.assertEqual(descr.__doc__, what)
         check(FileIO.closed, "True if the file is closed") # getset descriptor
         check(complex.real, "the real part of a complex number") # member descriptor
 
     def test_doc_descriptor(self):
+        # [FUNCTION DOC] Test: checks doc descriptor behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing __doc__ descriptor...
         # SF bug 542984
         class DocDescr(object):
+            # [CLASS DOC] HELPER: local class DocDescr defined inside test_doc_descriptor to
+            # exercise descriptor/class-model behavior under test.
             def __get__(self, object, otype):
+                # [FUNCTION DOC] HELPER: special method __get__ of DocDescr. Arguments: object,
+                # otype. Implements the protocol hook used by tests; returns the hook result.
                 if object:
                     object = object.__class__.__name__ + ' instance'
                 if otype:
                     otype = otype.__name__
                 return 'object=%s; type=%s' % (object, otype)
         class NewClass:
+            # [CLASS DOC] HELPER: local class NewClass defined inside test_doc_descriptor to
+            # exercise descriptor/class-model behavior under test.
             __doc__ = DocDescr()
         self.assertEqual(NewClass.__doc__, 'object=None; type=NewClass')
         self.assertEqual(NewClass().__doc__, 'object=NewClass instance; type=NewClass')
 
     def test_set_class(self):
+        # [FUNCTION DOC] Test: checks set class behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # Testing __class__ assignment...
+        # [CLASS DOC] HELPER: local class C defined inside test_set_class to exercise
+        # descriptor/class-model behavior under test.
         class C(object): pass
+        # [CLASS DOC] HELPER: local class D defined inside test_set_class to exercise
+        # descriptor/class-model behavior under test.
         class D(object): pass
+        # [CLASS DOC] HELPER: local class E defined inside test_set_class to exercise
+        # descriptor/class-model behavior under test.
         class E(object): pass
+        # [CLASS DOC] HELPER: local class F defined inside test_set_class to exercise
+        # descriptor/class-model behavior under test.
         class F(D, E): pass
         for cls in C, D, E, F:
             for cls2 in C, D, E, F:
@@ -3296,6 +4494,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
                 x.__class__ = cls
                 self.assertIs(x.__class__, cls)
         def cant(x, C):
+            # [FUNCTION DOC] HELPER: local function cant inside test_set_class. Arguments: x, C.
+            # Returns its computed value or None; used by the enclosing test.
             try:
                 x.__class__ = C
             except TypeError:
@@ -3314,6 +4514,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         cant(C(), object)
         cant(object(), list)
         cant(list(), object)
+        # [CLASS DOC] HELPER: local class Int defined inside test_set_class to exercise
+        # descriptor/class-model behavior under test.
         class Int(int): __slots__ = []
         cant(True, int)
         cant(2, bool)
@@ -3322,26 +4524,48 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         cant(o, type(None))
         del o
         class G(object):
+            # [CLASS DOC] HELPER: local class G defined inside test_set_class to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = ["a", "b"]
         class H(object):
+            # [CLASS DOC] HELPER: local class H defined inside test_set_class to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = ["b", "a"]
         class I(object):
+            # [CLASS DOC] HELPER: local class I defined inside test_set_class to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = ["a", "b"]
         class J(object):
+            # [CLASS DOC] HELPER: local class J defined inside test_set_class to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = ["c", "b"]
         class K(object):
+            # [CLASS DOC] HELPER: local class K defined inside test_set_class to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = ["a", "b", "d"]
         class L(H):
+            # [CLASS DOC] HELPER: local class L defined inside test_set_class to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = ["e"]
         class M(I):
+            # [CLASS DOC] HELPER: local class M defined inside test_set_class to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = ["e"]
         class N(J):
+            # [CLASS DOC] HELPER: local class N defined inside test_set_class to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = ["__weakref__"]
         class P(J):
+            # [CLASS DOC] HELPER: local class P defined inside test_set_class to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = ["__dict__"]
         class Q(J):
+            # [CLASS DOC] HELPER: local class Q defined inside test_set_class to exercise
+            # descriptor/class-model behavior under test.
             pass
         class R(J):
+            # [CLASS DOC] HELPER: local class R defined inside test_set_class to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = ["__dict__", "__weakref__"]
 
         for cls, cls2 in ((G, H), (G, I), (I, H), (Q, R), (R, Q)):
@@ -3364,20 +4588,33 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         # Issue5283: when __class__ changes in __del__, the wrong
         # type gets DECREF'd.
         class O(object):
+            # [CLASS DOC] HELPER: local class O defined inside test_set_class to exercise
+            # descriptor/class-model behavior under test.
             pass
         class A(object):
+            # [CLASS DOC] HELPER: local class A defined inside test_set_class to exercise
+            # descriptor/class-model behavior under test.
             def __del__(self):
+                # [FUNCTION DOC] HELPER: special method __del__ of A. Implements the protocol hook
+                # used by tests; returns the hook result.
                 self.__class__ = O
         l = [A() for x in range(100)]
         del l
 
     def test_set_dict(self):
+        # [FUNCTION DOC] Test: checks set dict behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # Testing __dict__ assignment...
+        # [CLASS DOC] HELPER: local class C defined inside test_set_dict to exercise
+        # descriptor/class-model behavior under test.
         class C(object): pass
         a = C()
         a.__dict__ = {'b': 1}
         self.assertEqual(a.b, 1)
         def cant(x, dict):
+            # [FUNCTION DOC] HELPER: local function cant inside test_set_dict. Arguments: x, dict.
+            # Returns its computed value or None; used by the enclosing test.
             try:
                 x.__dict__ = dict
             except (AttributeError, TypeError):
@@ -3390,8 +4627,12 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         del a.__dict__ # Deleting __dict__ is allowed
 
         class Base(object):
+            # [CLASS DOC] HELPER: local class Base defined inside test_set_dict to exercise
+            # descriptor/class-model behavior under test.
             pass
         def verify_dict_readonly(x):
+            # [FUNCTION DOC] HELPER: local function verify_dict_readonly inside test_set_dict.
+            # Arguments: x. Returns its computed value or None; used by the enclosing test.
             """
             x has to be an instance of a class inheriting from Base.
             """
@@ -3412,12 +4653,20 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
         # Classes don't allow __dict__ assignment and have readonly dicts
         class Meta1(type, Base):
+            # [CLASS DOC] HELPER: local class Meta1 defined inside test_set_dict to exercise
+            # descriptor/class-model behavior under test.
             pass
         class Meta2(Base, type):
+            # [CLASS DOC] HELPER: local class Meta2 defined inside test_set_dict to exercise
+            # descriptor/class-model behavior under test.
             pass
         class D(object, metaclass=Meta1):
+            # [CLASS DOC] HELPER: local class D defined inside test_set_dict to exercise
+            # descriptor/class-model behavior under test.
             pass
         class E(object, metaclass=Meta2):
+            # [CLASS DOC] HELPER: local class E defined inside test_set_dict to exercise
+            # descriptor/class-model behavior under test.
             pass
         for cls in C, D, E:
             verify_dict_readonly(cls)
@@ -3431,8 +4680,12 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
         # Modules also disallow __dict__ assignment
         class Module1(types.ModuleType, Base):
+            # [CLASS DOC] HELPER: local class Module1 defined inside test_set_dict to exercise
+            # descriptor/class-model behavior under test.
             pass
         class Module2(Base, types.ModuleType):
+            # [CLASS DOC] HELPER: local class Module2 defined inside test_set_dict to exercise
+            # descriptor/class-model behavior under test.
             pass
         for ModuleType in Module1, Module2:
             mod = ModuleType("spam")
@@ -3444,6 +4697,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         # be deleted; on CPython it is not the case, whereas on PyPy they
         # can, just like any other new-style instance's __dict__.)
         def can_delete_dict(e):
+            # [FUNCTION DOC] HELPER: local function can_delete_dict inside test_set_dict.
+            # Arguments: e. Returns its computed value or None; used by the enclosing test.
             try:
                 del e.__dict__
             except (TypeError, AttributeError):
@@ -3451,8 +4706,12 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             else:
                 return True
         class Exception1(Exception, Base):
+            # [CLASS DOC] HELPER: local class Exception1 defined inside test_set_dict to exercise
+            # descriptor/class-model behavior under test.
             pass
         class Exception2(Base, Exception):
+            # [CLASS DOC] HELPER: local class Exception2 defined inside test_set_dict to exercise
+            # descriptor/class-model behavior under test.
             pass
         for ExceptionType in Exception, Exception1, Exception2:
             e = ExceptionType()
@@ -3461,19 +4720,32 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             self.assertEqual(can_delete_dict(e), can_delete_dict(ValueError()))
 
     def test_binary_operator_override(self):
+        # [FUNCTION DOC] Test: checks binary operator override behavior. Fails with AssertionError
+        # (via unittest assertions) if the observed behavior differs from CPython semantics; no
+        # other side effects beyond temporary objects and classes.
         # Testing overrides of binary operations...
         class I(int):
+            # [CLASS DOC] HELPER: local class I defined inside test_binary_operator_override to
+            # exercise descriptor/class-model behavior under test.
             def __repr__(self):
+                # [FUNCTION DOC] HELPER: special method __repr__ of I. Implements the protocol
+                # hook used by tests; returns the hook result.
                 return "I(%r)" % int(self)
             def __add__(self, other):
+                # [FUNCTION DOC] HELPER: special method __add__ of I. Arguments: other. Implements
+                # the protocol hook used by tests; returns the hook result.
                 return I(int(self) + int(other))
             __radd__ = __add__
             def __pow__(self, other, mod=None):
+                # [FUNCTION DOC] HELPER: special method __pow__ of I. Arguments: other, mod.
+                # Implements the protocol hook used by tests; returns the hook result.
                 if mod is None:
                     return I(pow(int(self), int(other)))
                 else:
                     return I(pow(int(self), int(other), int(mod)))
             def __rpow__(self, other, mod=None):
+                # [FUNCTION DOC] HELPER: special method __rpow__ of I. Arguments: other, mod.
+                # Implements the protocol hook used by tests; returns the hook result.
                 if mod is None:
                     return I(pow(int(other), int(self), mod))
                 else:
@@ -3487,18 +4759,33 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(repr(I(2) ** 3), "I(8)")
         self.assertEqual(repr(pow(I(2), I(3), I(5))), "I(3)")
         class S(str):
+            # [CLASS DOC] HELPER: local class S defined inside test_binary_operator_override to
+            # exercise descriptor/class-model behavior under test.
             def __eq__(self, other):
+                # [FUNCTION DOC] HELPER: special method __eq__ of S. Arguments: other. Implements
+                # the protocol hook used by tests; returns the hook result.
                 return self.lower() == other.lower()
 
     def test_subclass_propagation(self):
+        # [FUNCTION DOC] Test: checks subclass propagation behavior. Fails with AssertionError
+        # (via unittest assertions) if the observed behavior differs from CPython semantics; no
+        # other side effects beyond temporary objects and classes.
         # Testing propagation of slot functions to subclasses...
         class A(object):
+            # [CLASS DOC] HELPER: local class A defined inside test_subclass_propagation to
+            # exercise descriptor/class-model behavior under test.
             pass
         class B(A):
+            # [CLASS DOC] HELPER: local class B defined inside test_subclass_propagation to
+            # exercise descriptor/class-model behavior under test.
             pass
         class C(A):
+            # [CLASS DOC] HELPER: local class C defined inside test_subclass_propagation to
+            # exercise descriptor/class-model behavior under test.
             pass
         class D(B, C):
+            # [CLASS DOC] HELPER: local class D defined inside test_subclass_propagation to
+            # exercise descriptor/class-model behavior under test.
             pass
         d = D()
         orig_hash = hash(d) # related to id(d) in platform-dependent ways
@@ -3531,6 +4818,9 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(d.foo, 42)
         self.assertEqual(d.bar, 42)
         def __getattribute__(self, name):
+            # [FUNCTION DOC] HELPER: local function __getattribute__ inside
+            # test_subclass_propagation. Arguments: name. Returns its computed value or None; used
+            # by the enclosing test.
             if name == "foo":
                 return 24
             return object.__getattribute__(self, name)
@@ -3538,6 +4828,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(d.foo, 24)
         self.assertEqual(d.bar, 42)
         def __getattr__(self, name):
+            # [FUNCTION DOC] HELPER: local function __getattr__ inside test_subclass_propagation.
+            # Arguments: name. Returns its computed value or None; used by the enclosing test.
             if name in ("spam", "foo", "bar"):
                 return "hello"
             raise AttributeError(name)
@@ -3560,20 +4852,29 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
         # Test a nasty bug in recurse_down_subclasses()
         class A(object):
+            # [CLASS DOC] HELPER: local class A defined inside test_subclass_propagation to
+            # exercise descriptor/class-model behavior under test.
             pass
         class B(A):
+            # [CLASS DOC] HELPER: local class B defined inside test_subclass_propagation to
+            # exercise descriptor/class-model behavior under test.
             pass
         del B
         support.gc_collect()
         A.__setitem__ = lambda *a: None # crash
 
     def test_buffer_inheritance(self):
+        # [FUNCTION DOC] Test: checks buffer inheritance behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing that buffer interface is inherited ...
 
         import binascii
         # SF bug [#470040] ParseTuple t# vs subclasses.
 
         class MyBytes(bytes):
+            # [CLASS DOC] HELPER: local class MyBytes defined inside test_buffer_inheritance to
+            # exercise descriptor/class-model behavior under test.
             pass
         base = b'abc'
         m = MyBytes(base)
@@ -3582,6 +4883,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(binascii.b2a_hex(m), binascii.b2a_hex(base))
 
         class MyInt(int):
+            # [CLASS DOC] HELPER: local class MyInt defined inside test_buffer_inheritance to
+            # exercise descriptor/class-model behavior under test.
             pass
         m = MyInt(42)
         try:
@@ -3591,13 +4894,22 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             pass
 
     def test_str_of_str_subclass(self):
+        # [FUNCTION DOC] Test: checks str of str subclass behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing __str__ defined in subclass of str ...
         import binascii
 
         class octetstring(str):
+            # [CLASS DOC] HELPER: local class octetstring defined inside test_str_of_str_subclass
+            # to exercise descriptor/class-model behavior under test.
             def __str__(self):
+                # [FUNCTION DOC] HELPER: special method __str__ of octetstring. Implements the
+                # protocol hook used by tests; returns the hook result.
                 return binascii.b2a_hex(self.encode('ascii')).decode("ascii")
             def __repr__(self):
+                # [FUNCTION DOC] HELPER: special method __repr__ of octetstring. Implements the
+                # protocol hook used by tests; returns the hook result.
                 return self + " repr"
 
         o = octetstring('A')
@@ -3611,17 +4923,31 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(o.__repr__(), 'A repr')
 
     def test_repr_with_module_str_subclass(self):
+        # [FUNCTION DOC] Test: checks repr with module str subclass behavior. Fails with
+        # AssertionError (via unittest assertions) if the observed behavior differs from CPython
+        # semantics; no other side effects beyond temporary objects and classes.
         # gh-98783
         class StrSub(str):
+            # [CLASS DOC] HELPER: local class StrSub defined inside
+            # test_repr_with_module_str_subclass to exercise descriptor/class-model behavior under
+            # test.
             pass
         class Some:
+            # [CLASS DOC] HELPER: local class Some defined inside
+            # test_repr_with_module_str_subclass to exercise descriptor/class-model behavior under
+            # test.
             pass
         Some.__module__ = StrSub('example')
         self.assertIsInstance(repr(Some), str)  # should not crash
         self.assertIsInstance(repr(Some()), str)  # should not crash
 
     def test_keyword_arguments(self):
+        # [FUNCTION DOC] Test: checks keyword arguments behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing keyword arguments to __init__, __call__...
+        # [FUNCTION DOC] HELPER: local function f inside test_keyword_arguments. Arguments: a.
+        # Returns its computed value or None; used by the enclosing test.
         def f(a): return a
         self.assertEqual(f.__call__(a=42), 42)
         ba = bytearray()
@@ -3630,8 +4956,13 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(ba, b'abc\xbd?')
 
     def test_recursive_call(self):
+        # [FUNCTION DOC] Test: checks recursive call behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing recursive __call__() by setting to instance of class...
         class A(object):
+            # [CLASS DOC] HELPER: local class A defined inside test_recursive_call to exercise
+            # descriptor/class-model behavior under test.
             pass
 
         A.__call__ = A()
@@ -3639,10 +4970,17 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             A()()
 
     def test_delete_hook(self):
+        # [FUNCTION DOC] Test: checks delete hook behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing __del__ hook...
         log = []
         class C(object):
+            # [CLASS DOC] HELPER: local class C defined inside test_delete_hook to exercise
+            # descriptor/class-model behavior under test.
             def __del__(self):
+                # [FUNCTION DOC] HELPER: special method __del__ of C. Implements the protocol hook
+                # used by tests; returns the hook result.
                 log.append(1)
         c = C()
         self.assertEqual(log, [])
@@ -3650,6 +4988,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         support.gc_collect()
         self.assertEqual(log, [1])
 
+        # [CLASS DOC] HELPER: local class D defined inside test_delete_hook to exercise
+        # descriptor/class-model behavior under test.
         class D(object): pass
         d = D()
         try: del d[0]
@@ -3657,9 +4997,14 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         else: self.fail("invalid del() didn't raise TypeError")
 
     def test_hash_inheritance(self):
+        # [FUNCTION DOC] Test: checks hash inheritance behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing hash of mutable subclasses...
 
         class mydict(dict):
+            # [CLASS DOC] HELPER: local class mydict defined inside test_hash_inheritance to
+            # exercise descriptor/class-model behavior under test.
             pass
         d = mydict()
         try:
@@ -3670,6 +5015,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             self.fail("hash() of dict subclass should fail")
 
         class mylist(list):
+            # [CLASS DOC] HELPER: local class mylist defined inside test_hash_inheritance to
+            # exercise descriptor/class-model behavior under test.
             pass
         d = mylist()
         try:
@@ -3680,6 +5027,9 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             self.fail("hash() of list subclass should fail")
 
     def test_str_operations(self):
+        # [FUNCTION DOC] Test: checks str operations behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         try: 'a' + 5
         except TypeError: pass
         else: self.fail("'' + 5 doesn't raise TypeError")
@@ -3726,8 +5076,13 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual('%c' % '5', '5')
 
     def test_deepcopy_recursive(self):
+        # [FUNCTION DOC] Test: checks deepcopy recursive behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing deepcopy of recursive objects...
         class Node:
+            # [CLASS DOC] HELPER: local class Node defined inside test_deepcopy_recursive to
+            # exercise descriptor/class-model behavior under test.
             pass
         a = Node()
         b = Node()
@@ -3736,6 +5091,9 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         z = deepcopy(a) # This blew up before
 
     def test_uninitialized_modules(self):
+        # [FUNCTION DOC] Test: checks uninitialized modules behavior. Fails with AssertionError
+        # (via unittest assertions) if the observed behavior differs from CPython semantics; no
+        # other side effects beyond temporary objects and classes.
         # Testing uninitialized module objects...
         from types import ModuleType as M
         m = M.__new__(M)
@@ -3748,14 +5106,25 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(m.__dict__, {"foo": 1})
 
     def test_funny_new(self):
+        # [FUNCTION DOC] Test: checks funny new behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # Testing __new__ returning something unexpected...
         class C(object):
+            # [CLASS DOC] HELPER: local class C defined inside test_funny_new to exercise
+            # descriptor/class-model behavior under test.
             def __new__(cls, arg):
+                # [FUNCTION DOC] HELPER: special method __new__ of C. Arguments: arg. Implements
+                # the protocol hook used by tests; returns the hook result.
                 if isinstance(arg, str): return [1, 2, 3]
                 elif isinstance(arg, int): return object.__new__(D)
                 else: return object.__new__(cls)
         class D(C):
+            # [CLASS DOC] HELPER: local class D defined inside test_funny_new to exercise
+            # descriptor/class-model behavior under test.
             def __init__(self, arg):
+                # [FUNCTION DOC] HELPER: constructor. Arguments: arg. Stores the given values on
+                # the instance, and for test cases initializes the base CPythonTestCase.
                 self.foo = arg
         self.assertEqual(C("1"), [1, 2, 3])
         self.assertEqual(D("1"), [1, 2, 3])
@@ -3770,27 +5139,46 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
         class C(object):
             @staticmethod
+            # [CLASS DOC] HELPER: local class C defined inside test_funny_new to exercise
+            # descriptor/class-model behavior under test.
             def __new__(*args):
+                # [FUNCTION DOC] HELPER: special method __new__ of C. Arguments: *args. Implements
+                # the protocol hook used by tests; returns the hook result.
                 return args
         self.assertEqual(C(1, 2), (C, 1, 2))
         class D(C):
+            # [CLASS DOC] HELPER: local class D defined inside test_funny_new to exercise
+            # descriptor/class-model behavior under test.
             pass
         self.assertEqual(D(1, 2), (D, 1, 2))
 
         class C(object):
             @classmethod
+            # [CLASS DOC] HELPER: local class C defined inside test_funny_new to exercise
+            # descriptor/class-model behavior under test.
             def __new__(*args):
+                # [FUNCTION DOC] HELPER: special method __new__ of C. Arguments: *args. Implements
+                # the protocol hook used by tests; returns the hook result.
                 return args
         self.assertEqual(C(1, 2), (C, C, 1, 2))
         class D(C):
+            # [CLASS DOC] HELPER: local class D defined inside test_funny_new to exercise
+            # descriptor/class-model behavior under test.
             pass
         self.assertEqual(D(1, 2), (D, D, 1, 2))
 
     def test_imul_bug(self):
+        # [FUNCTION DOC] Test: checks imul bug behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # Testing for __imul__ problems...
         # SF bug 544647
         class C(object):
+            # [CLASS DOC] HELPER: local class C defined inside test_imul_bug to exercise
+            # descriptor/class-model behavior under test.
             def __imul__(self, other):
+                # [FUNCTION DOC] HELPER: special method __imul__ of C. Arguments: other.
+                # Implements the protocol hook used by tests; returns the hook result.
                 return (self, other)
         x = C()
         y = x
@@ -3813,19 +5201,34 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(y, (x, "foo"))
 
     def test_copy_setstate(self):
+        # [FUNCTION DOC] Test: checks copy setstate behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing that copy.*copy() correctly uses __setstate__...
         import copy
         class C(object):
+            # [CLASS DOC] HELPER: local class C defined inside test_copy_setstate to exercise
+            # descriptor/class-model behavior under test.
             def __init__(self, foo=None):
+                # [FUNCTION DOC] HELPER: constructor. Arguments: foo. Stores the given values on
+                # the instance, and for test cases initializes the base CPythonTestCase.
                 self.foo = foo
                 self.__foo = foo
             def setfoo(self, foo=None):
+                # [FUNCTION DOC] HELPER: setfoo of C. Arguments: foo. Supporting routine for
+                # tests; returns a computed value or None.
                 self.foo = foo
             def getfoo(self):
+                # [FUNCTION DOC] HELPER: getfoo of C. Supporting routine for tests; returns a
+                # computed value or None.
                 return self.__foo
             def __getstate__(self):
+                # [FUNCTION DOC] HELPER: special method __getstate__ of C. Implements the protocol
+                # hook used by tests; returns the hook result.
                 return [self.foo]
             def __setstate__(self_, lst):
+                # [FUNCTION DOC] HELPER: special method __setstate__ of C. Arguments: self_, lst.
+                # Implements the protocol hook used by tests; returns the hook result.
                 self.assertEqual(len(lst), 1)
                 self_.__foo = self_.foo = lst[0]
         a = C(42)
@@ -3840,6 +5243,9 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(b.getfoo(), 24)
 
     def test_slices(self):
+        # [FUNCTION DOC] Test: checks slices behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # Testing cases with slices and overridden __getitem__ ...
 
         # Strings
@@ -3847,7 +5253,11 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual("hello"[slice(4)], "hell")
         self.assertEqual(str.__getitem__("hello", slice(4)), "hell")
         class S(str):
+            # [CLASS DOC] HELPER: local class S defined inside test_slices to exercise
+            # descriptor/class-model behavior under test.
             def __getitem__(self, x):
+                # [FUNCTION DOC] HELPER: special method __getitem__ of S. Arguments: x. Implements
+                # the protocol hook used by tests; returns the hook result.
                 return str.__getitem__(self, x)
         self.assertEqual(S("hello")[:4], "hell")
         self.assertEqual(S("hello")[slice(4)], "hell")
@@ -3857,7 +5267,11 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual((1,2,3)[slice(2)], (1,2))
         self.assertEqual(tuple.__getitem__((1,2,3), slice(2)), (1,2))
         class T(tuple):
+            # [CLASS DOC] HELPER: local class T defined inside test_slices to exercise
+            # descriptor/class-model behavior under test.
             def __getitem__(self, x):
+                # [FUNCTION DOC] HELPER: special method __getitem__ of T. Arguments: x. Implements
+                # the protocol hook used by tests; returns the hook result.
                 return tuple.__getitem__(self, x)
         self.assertEqual(T((1,2,3))[:2], (1,2))
         self.assertEqual(T((1,2,3))[slice(2)], (1,2))
@@ -3867,7 +5281,11 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual([1,2,3][slice(2)], [1,2])
         self.assertEqual(list.__getitem__([1,2,3], slice(2)), [1,2])
         class L(list):
+            # [CLASS DOC] HELPER: local class L defined inside test_slices to exercise
+            # descriptor/class-model behavior under test.
             def __getitem__(self, x):
+                # [FUNCTION DOC] HELPER: special method __getitem__ of L. Arguments: x. Implements
+                # the protocol hook used by tests; returns the hook result.
                 return list.__getitem__(self, x)
         self.assertEqual(L([1,2,3])[:2], [1,2])
         self.assertEqual(L([1,2,3])[slice(2)], [1,2])
@@ -3884,12 +5302,19 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(a, [2,3,1])
 
     def test_subtype_resurrection(self):
+        # [FUNCTION DOC] Test: checks subtype resurrection behavior. Fails with AssertionError
+        # (via unittest assertions) if the observed behavior differs from CPython semantics; no
+        # other side effects beyond temporary objects and classes.
         # Testing resurrection of new-style instance...
 
         class C(object):
+            # [CLASS DOC] HELPER: local class C defined inside test_subtype_resurrection to
+            # exercise descriptor/class-model behavior under test.
             container = []
 
             def __del__(self):
+                # [FUNCTION DOC] HELPER: special method __del__ of C. Implements the protocol hook
+                # used by tests; returns the hook result.
                 # resurrect the instance
                 C.container.append(self)
 
@@ -3909,11 +5334,18 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         del C.__del__
 
     def test_slots_trash(self):
+        # [FUNCTION DOC] Test: checks slots trash behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing slot trash...
         # Deallocating deeply nested slotted trash caused stack overflows
         class trash(object):
+            # [CLASS DOC] HELPER: local class trash defined inside test_slots_trash to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = ['x']
             def __init__(self, x):
+                # [FUNCTION DOC] HELPER: constructor. Arguments: x. Stores the given values on the
+                # instance, and for test cases initializes the base CPythonTestCase.
                 self.x = x
         o = None
         for i in range(50000):
@@ -3921,12 +5353,21 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         del o
 
     def test_slots_multiple_inheritance(self):
+        # [FUNCTION DOC] Test: checks slots multiple inheritance behavior. Fails with
+        # AssertionError (via unittest assertions) if the observed behavior differs from CPython
+        # semantics; no other side effects beyond temporary objects and classes.
         # SF bug 575229, multiple inheritance w/ slots dumps core
         class A(object):
+            # [CLASS DOC] HELPER: local class A defined inside test_slots_multiple_inheritance to
+            # exercise descriptor/class-model behavior under test.
             __slots__=()
         class B(object):
+            # [CLASS DOC] HELPER: local class B defined inside test_slots_multiple_inheritance to
+            # exercise descriptor/class-model behavior under test.
             pass
         class C(A,B) :
+            # [CLASS DOC] HELPER: local class C defined inside test_slots_multiple_inheritance to
+            # exercise descriptor/class-model behavior under test.
             __slots__=()
         if support.check_impl_detail():
             self.assertEqual(C.__basicsize__, B.__basicsize__)
@@ -3935,12 +5376,21 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         C().x = 2
 
     def test_rmul(self):
+        # [FUNCTION DOC] Test: checks rmul behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # Testing correct invocation of __rmul__...
         # SF patch 592646
         class C(object):
+            # [CLASS DOC] HELPER: local class C defined inside test_rmul to exercise
+            # descriptor/class-model behavior under test.
             def __mul__(self, other):
+                # [FUNCTION DOC] HELPER: special method __mul__ of C. Arguments: other. Implements
+                # the protocol hook used by tests; returns the hook result.
                 return "mul"
             def __rmul__(self, other):
+                # [FUNCTION DOC] HELPER: special method __rmul__ of C. Arguments: other.
+                # Implements the protocol hook used by tests; returns the hook result.
                 return "rmul"
         a = C()
         self.assertEqual(a*2, "mul")
@@ -3949,25 +5399,47 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(2.2*a, "rmul")
 
     def test_ipow(self):
+        # [FUNCTION DOC] Test: checks ipow behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # Testing correct invocation of __ipow__...
         # [SF bug 620179]
         class C(object):
+            # [CLASS DOC] HELPER: local class C defined inside test_ipow to exercise
+            # descriptor/class-model behavior under test.
             def __ipow__(self, other):
+                # [FUNCTION DOC] HELPER: special method __ipow__ of C. Arguments: other.
+                # Implements the protocol hook used by tests; returns the hook result.
                 pass
         a = C()
         a **= 2
 
     def test_ipow_returns_not_implemented(self):
+        # [FUNCTION DOC] Test: checks ipow returns not implemented behavior. Fails with
+        # AssertionError (via unittest assertions) if the observed behavior differs from CPython
+        # semantics; no other side effects beyond temporary objects and classes.
         class A:
+            # [CLASS DOC] HELPER: local class A defined inside test_ipow_returns_not_implemented
+            # to exercise descriptor/class-model behavior under test.
             def __ipow__(self, other):
+                # [FUNCTION DOC] HELPER: special method __ipow__ of A. Arguments: other.
+                # Implements the protocol hook used by tests; returns the hook result.
                 return NotImplemented
 
         class B(A):
+            # [CLASS DOC] HELPER: local class B defined inside test_ipow_returns_not_implemented
+            # to exercise descriptor/class-model behavior under test.
             def __rpow__(self, other):
+                # [FUNCTION DOC] HELPER: special method __rpow__ of B. Arguments: other.
+                # Implements the protocol hook used by tests; returns the hook result.
                 return 1
 
         class C(A):
+            # [CLASS DOC] HELPER: local class C defined inside test_ipow_returns_not_implemented
+            # to exercise descriptor/class-model behavior under test.
             def __pow__(self, other):
+                # [FUNCTION DOC] HELPER: special method __pow__ of C. Arguments: other. Implements
+                # the protocol hook used by tests; returns the hook result.
                 return 2
         a = A()
         b = B()
@@ -3980,8 +5452,15 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(c, 2)
 
     def test_no_ipow(self):
+        # [FUNCTION DOC] Test: checks no ipow behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         class B:
+            # [CLASS DOC] HELPER: local class B defined inside test_no_ipow to exercise
+            # descriptor/class-model behavior under test.
             def __rpow__(self, other):
+                # [FUNCTION DOC] HELPER: special method __rpow__ of B. Arguments: other.
+                # Implements the protocol hook used by tests; returns the hook result.
                 return 1
 
         a = object()
@@ -3990,6 +5469,9 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(a, 1)
 
     def test_ipow_exception_text(self):
+        # [FUNCTION DOC] Test: checks ipow exception text behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         x = None
         with self.assertRaises(TypeError) as cm:
             x **= 2
@@ -4000,22 +5482,37 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertIn('unsupported operand type(s) for **', str(cm.exception))
 
     def test_mutable_bases(self):
+        # [FUNCTION DOC] Test: checks mutable bases behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing mutable bases...
 
         # stuff that should work:
         class C(object):
+            # [CLASS DOC] HELPER: local class C defined inside test_mutable_bases to exercise
+            # descriptor/class-model behavior under test.
             pass
         class C2(object):
+            # [CLASS DOC] HELPER: local class C2 defined inside test_mutable_bases to exercise
+            # descriptor/class-model behavior under test.
             def __getattribute__(self, attr):
+                # [FUNCTION DOC] HELPER: special method __getattribute__ of C2. Arguments: attr.
+                # Implements the protocol hook used by tests; returns the hook result.
                 if attr == 'a':
                     return 2
                 else:
                     return super(C2, self).__getattribute__(attr)
             def meth(self):
+                # [FUNCTION DOC] HELPER: meth of C2. Supporting routine for tests; returns a
+                # computed value or None.
                 return 1
         class D(C):
+            # [CLASS DOC] HELPER: local class D defined inside test_mutable_bases to exercise
+            # descriptor/class-model behavior under test.
             pass
         class E(D):
+            # [CLASS DOC] HELPER: local class E defined inside test_mutable_bases to exercise
+            # descriptor/class-model behavior under test.
             pass
         d = D()
         e = E()
@@ -4065,6 +5562,9 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             self.fail("shouldn't be able to create inheritance cycles")
 
     def test_builtin_bases(self):
+        # [FUNCTION DOC] Test: checks builtin bases behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Make sure all the builtin types can have their base queried without
         # segfaulting. See issue #5787.
         builtin_types = [tp for tp in builtins.__dict__.values()
@@ -4079,12 +5579,18 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
                 self.assertEqual(len(tp.__bases__), num_bases, tp)
 
         class L(list):
+            # [CLASS DOC] HELPER: local class L defined inside test_builtin_bases to exercise
+            # descriptor/class-model behavior under test.
             pass
 
         class C(object):
+            # [CLASS DOC] HELPER: local class C defined inside test_builtin_bases to exercise
+            # descriptor/class-model behavior under test.
             pass
 
         class D(C):
+            # [CLASS DOC] HELPER: local class D defined inside test_builtin_bases to exercise
+            # descriptor/class-model behavior under test.
             pass
 
         try:
@@ -4109,25 +5615,42 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             self.fail("best_base calculation found wanting")
 
     def test_unsubclassable_types(self):
+        # [FUNCTION DOC] Test: checks unsubclassable types behavior. Fails with AssertionError
+        # (via unittest assertions) if the observed behavior differs from CPython semantics; no
+        # other side effects beyond temporary objects and classes.
         with self.assertRaises(TypeError):
             class X(type(None)):
+                # [CLASS DOC] HELPER: local class X defined inside test_unsubclassable_types to
+                # exercise descriptor/class-model behavior under test.
                 pass
         with self.assertRaises(TypeError):
             class X(object, type(None)):
+                # [CLASS DOC] HELPER: local class X defined inside test_unsubclassable_types to
+                # exercise descriptor/class-model behavior under test.
                 pass
         with self.assertRaises(TypeError):
             class X(type(None), object):
+                # [CLASS DOC] HELPER: local class X defined inside test_unsubclassable_types to
+                # exercise descriptor/class-model behavior under test.
                 pass
         class O(object):
+            # [CLASS DOC] HELPER: local class O defined inside test_unsubclassable_types to
+            # exercise descriptor/class-model behavior under test.
             pass
         with self.assertRaises(TypeError):
             class X(O, type(None)):
+                # [CLASS DOC] HELPER: local class X defined inside test_unsubclassable_types to
+                # exercise descriptor/class-model behavior under test.
                 pass
         with self.assertRaises(TypeError):
             class X(type(None), O):
+                # [CLASS DOC] HELPER: local class X defined inside test_unsubclassable_types to
+                # exercise descriptor/class-model behavior under test.
                 pass
 
         class X(object):
+            # [CLASS DOC] HELPER: local class X defined inside test_unsubclassable_types to
+            # exercise descriptor/class-model behavior under test.
             pass
         with self.assertRaises(TypeError):
             X.__bases__ = type(None),
@@ -4141,12 +5664,22 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             X.__bases__ = type(None), O
 
     def test_mutable_bases_with_failing_mro(self):
+        # [FUNCTION DOC] Test: checks mutable bases with failing mro behavior. Fails with
+        # AssertionError (via unittest assertions) if the observed behavior differs from CPython
+        # semantics; no other side effects beyond temporary objects and classes.
         # Testing mutable bases with failing mro...
         class WorkOnce(type):
+            # [CLASS DOC] HELPER: local class WorkOnce defined inside
+            # test_mutable_bases_with_failing_mro to exercise descriptor/class-model behavior
+            # under test.
             def __new__(self, name, bases, ns):
+                # [FUNCTION DOC] HELPER: special method __new__ of WorkOnce. Arguments: name,
+                # bases, ns. Implements the protocol hook used by tests; returns the hook result.
                 self.flag = 0
                 return super(WorkOnce, self).__new__(WorkOnce, name, bases, ns)
             def mro(self):
+                # [FUNCTION DOC] HELPER: mro of WorkOnce. Supporting routine for tests; returns a
+                # computed value or None.
                 if self.flag > 0:
                     raise RuntimeError("bozo")
                 else:
@@ -4154,7 +5687,12 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
                     return type.mro(self)
 
         class WorkAlways(type):
+            # [CLASS DOC] HELPER: local class WorkAlways defined inside
+            # test_mutable_bases_with_failing_mro to exercise descriptor/class-model behavior
+            # under test.
             def mro(self):
+                # [FUNCTION DOC] HELPER: mro of WorkAlways. Supporting routine for tests; returns
+                # a computed value or None.
                 # this is here to make sure that .mro()s aren't called
                 # with an exception set (which was possible at one point).
                 # An error message will be printed in a debug build.
@@ -4162,21 +5700,34 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
                 return type.mro(self)
 
         class C(object):
+            # [CLASS DOC] HELPER: local class C defined inside test_mutable_bases_with_failing_mro
+            # to exercise descriptor/class-model behavior under test.
             pass
 
         class C2(object):
+            # [CLASS DOC] HELPER: local class C2 defined inside
+            # test_mutable_bases_with_failing_mro to exercise descriptor/class-model behavior
+            # under test.
             pass
 
         class D(C):
+            # [CLASS DOC] HELPER: local class D defined inside test_mutable_bases_with_failing_mro
+            # to exercise descriptor/class-model behavior under test.
             pass
 
         class E(D):
+            # [CLASS DOC] HELPER: local class E defined inside test_mutable_bases_with_failing_mro
+            # to exercise descriptor/class-model behavior under test.
             pass
 
         class F(D, metaclass=WorkOnce):
+            # [CLASS DOC] HELPER: local class F defined inside test_mutable_bases_with_failing_mro
+            # to exercise descriptor/class-model behavior under test.
             pass
 
         class G(D, metaclass=WorkAlways):
+            # [CLASS DOC] HELPER: local class G defined inside test_mutable_bases_with_failing_mro
+            # to exercise descriptor/class-model behavior under test.
             pass
 
         # Immediate subclasses have their mro's adjusted in alphabetical
@@ -4195,20 +5746,38 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             self.fail("exception not propagated")
 
     def test_mutable_bases_catch_mro_conflict(self):
+        # [FUNCTION DOC] Test: checks mutable bases catch mro conflict behavior. Fails with
+        # AssertionError (via unittest assertions) if the observed behavior differs from CPython
+        # semantics; no other side effects beyond temporary objects and classes.
         # Testing mutable bases catch mro conflict...
         class A(object):
+            # [CLASS DOC] HELPER: local class A defined inside
+            # test_mutable_bases_catch_mro_conflict to exercise descriptor/class-model behavior
+            # under test.
             pass
 
         class B(object):
+            # [CLASS DOC] HELPER: local class B defined inside
+            # test_mutable_bases_catch_mro_conflict to exercise descriptor/class-model behavior
+            # under test.
             pass
 
         class C(A, B):
+            # [CLASS DOC] HELPER: local class C defined inside
+            # test_mutable_bases_catch_mro_conflict to exercise descriptor/class-model behavior
+            # under test.
             pass
 
         class D(A, B):
+            # [CLASS DOC] HELPER: local class D defined inside
+            # test_mutable_bases_catch_mro_conflict to exercise descriptor/class-model behavior
+            # under test.
             pass
 
         class E(C, D):
+            # [CLASS DOC] HELPER: local class E defined inside
+            # test_mutable_bases_catch_mro_conflict to exercise descriptor/class-model behavior
+            # under test.
             pass
 
         try:
@@ -4219,8 +5788,13 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             self.fail("didn't catch MRO conflict")
 
     def test_mutable_names(self):
+        # [FUNCTION DOC] Test: checks mutable names behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing mutable names...
         class C(object):
+            # [CLASS DOC] HELPER: local class C defined inside test_mutable_names to exercise
+            # descriptor/class-model behavior under test.
             pass
 
         # C.__module__ could be 'test_descr' or '__main__'
@@ -4233,20 +5807,32 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual((C.__module__, C.__name__), (mod, 'D.E'))
 
     def test_evil_type_name(self):
+        # [FUNCTION DOC] Test: checks evil type name behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # A badly placed Py_DECREF in type_set_name led to arbitrary code
         # execution while the type structure was not in a sane state, and a
         # possible segmentation fault as a result.  See bug #16447.
         class Nasty(str):
+            # [CLASS DOC] HELPER: local class Nasty defined inside test_evil_type_name to exercise
+            # descriptor/class-model behavior under test.
             def __del__(self):
+                # [FUNCTION DOC] HELPER: special method __del__ of Nasty. Implements the protocol
+                # hook used by tests; returns the hook result.
                 C.__name__ = "other"
 
         class C:
+            # [CLASS DOC] HELPER: local class C defined inside test_evil_type_name to exercise
+            # descriptor/class-model behavior under test.
             pass
 
         C.__name__ = Nasty("abc")
         C.__name__ = "normal"
 
     def test_subclass_right_op(self):
+        # [FUNCTION DOC] Test: checks subclass right op behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing correct dispatch of subclass overloading __r<op>__...
 
         # This code tests various cases where right-dispatch of a subclass
@@ -4255,9 +5841,15 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         # Case 1: subclass of int; this tests code in abstract.c::binary_op1()
 
         class B(int):
+            # [CLASS DOC] HELPER: local class B defined inside test_subclass_right_op to exercise
+            # descriptor/class-model behavior under test.
             def __floordiv__(self, other):
+                # [FUNCTION DOC] HELPER: special method __floordiv__ of B. Arguments: other.
+                # Implements the protocol hook used by tests; returns the hook result.
                 return "B.__floordiv__"
             def __rfloordiv__(self, other):
+                # [FUNCTION DOC] HELPER: special method __rfloordiv__ of B. Arguments: other.
+                # Implements the protocol hook used by tests; returns the hook result.
                 return "B.__rfloordiv__"
 
         self.assertEqual(B(1) // 1, "B.__floordiv__")
@@ -4266,9 +5858,15 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         # Case 2: subclass of object; this is just the baseline for case 3
 
         class C(object):
+            # [CLASS DOC] HELPER: local class C defined inside test_subclass_right_op to exercise
+            # descriptor/class-model behavior under test.
             def __floordiv__(self, other):
+                # [FUNCTION DOC] HELPER: special method __floordiv__ of C. Arguments: other.
+                # Implements the protocol hook used by tests; returns the hook result.
                 return "C.__floordiv__"
             def __rfloordiv__(self, other):
+                # [FUNCTION DOC] HELPER: special method __rfloordiv__ of C. Arguments: other.
+                # Implements the protocol hook used by tests; returns the hook result.
                 return "C.__rfloordiv__"
 
         self.assertEqual(C() // 1, "C.__floordiv__")
@@ -4277,9 +5875,15 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         # Case 3: subclass of new-style class; here it gets interesting
 
         class D(C):
+            # [CLASS DOC] HELPER: local class D defined inside test_subclass_right_op to exercise
+            # descriptor/class-model behavior under test.
             def __floordiv__(self, other):
+                # [FUNCTION DOC] HELPER: special method __floordiv__ of D. Arguments: other.
+                # Implements the protocol hook used by tests; returns the hook result.
                 return "D.__floordiv__"
             def __rfloordiv__(self, other):
+                # [FUNCTION DOC] HELPER: special method __rfloordiv__ of D. Arguments: other.
+                # Implements the protocol hook used by tests; returns the hook result.
                 return "D.__rfloordiv__"
 
         self.assertEqual(D() // C(), "D.__floordiv__")
@@ -4288,6 +5892,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         # Case 4: this didn't work right in 2.2.2 and 2.3a1
 
         class E(C):
+            # [CLASS DOC] HELPER: local class E defined inside test_subclass_right_op to exercise
+            # descriptor/class-model behavior under test.
             pass
 
         self.assertEqual(E.__rfloordiv__, C.__rfloordiv__)
@@ -4299,6 +5905,9 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
     @support.impl_detail("testing an internal kind of method object")
     def test_meth_class_get(self):
+        # [FUNCTION DOC] Test: checks meth class get behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing __get__ method of METH_CLASS C methods...
         # Full coverage of descrobject.c::classmethod_get()
 
@@ -4342,17 +5951,28 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             self.fail("shouldn't have allowed descr.__get__(None, int)")
 
     def test_isinst_isclass(self):
+        # [FUNCTION DOC] Test: checks isinst isclass behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing proxy isinstance() and isclass()...
         class Proxy(object):
+            # [CLASS DOC] HELPER: local class Proxy defined inside test_isinst_isclass to exercise
+            # descriptor/class-model behavior under test.
             def __init__(self, obj):
+                # [FUNCTION DOC] HELPER: constructor. Arguments: obj. Stores the given values on
+                # the instance, and for test cases initializes the base CPythonTestCase.
                 self.__obj = obj
             def __getattribute__(self, name):
+                # [FUNCTION DOC] HELPER: special method __getattribute__ of Proxy. Arguments:
+                # name. Implements the protocol hook used by tests; returns the hook result.
                 if name.startswith("_Proxy__"):
                     return object.__getattribute__(self, name)
                 else:
                     return getattr(self.__obj, name)
         # Test with a classic class
         class C:
+            # [CLASS DOC] HELPER: local class C defined inside test_isinst_isclass to exercise
+            # descriptor/class-model behavior under test.
             pass
         a = C()
         pa = Proxy(a)
@@ -4360,6 +5980,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertIsInstance(pa, C) # Test
         # Test with a classic subclass
         class D(C):
+            # [CLASS DOC] HELPER: local class D defined inside test_isinst_isclass to exercise
+            # descriptor/class-model behavior under test.
             pass
         a = D()
         pa = Proxy(a)
@@ -4367,6 +5989,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertIsInstance(pa, C) # Test
         # Test with a new-style class
         class C(object):
+            # [CLASS DOC] HELPER: local class C defined inside test_isinst_isclass to exercise
+            # descriptor/class-model behavior under test.
             pass
         a = C()
         pa = Proxy(a)
@@ -4374,6 +5998,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertIsInstance(pa, C) # Test
         # Test with a new-style subclass
         class D(C):
+            # [CLASS DOC] HELPER: local class D defined inside test_isinst_isclass to exercise
+            # descriptor/class-model behavior under test.
             pass
         a = D()
         pa = Proxy(a)
@@ -4381,22 +6007,39 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertIsInstance(pa, C) # Test
 
     def test_proxy_super(self):
+        # [FUNCTION DOC] Test: checks proxy super behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing super() for a proxy object...
         class Proxy(object):
+            # [CLASS DOC] HELPER: local class Proxy defined inside test_proxy_super to exercise
+            # descriptor/class-model behavior under test.
             def __init__(self, obj):
+                # [FUNCTION DOC] HELPER: constructor. Arguments: obj. Stores the given values on
+                # the instance, and for test cases initializes the base CPythonTestCase.
                 self.__obj = obj
             def __getattribute__(self, name):
+                # [FUNCTION DOC] HELPER: special method __getattribute__ of Proxy. Arguments:
+                # name. Implements the protocol hook used by tests; returns the hook result.
                 if name.startswith("_Proxy__"):
                     return object.__getattribute__(self, name)
                 else:
                     return getattr(self.__obj, name)
 
         class B(object):
+            # [CLASS DOC] HELPER: local class B defined inside test_proxy_super to exercise
+            # descriptor/class-model behavior under test.
             def f(self):
+                # [FUNCTION DOC] HELPER: f of B. Supporting routine for tests; returns a computed
+                # value or None.
                 return "B.f"
 
         class C(B):
+            # [CLASS DOC] HELPER: local class C defined inside test_proxy_super to exercise
+            # descriptor/class-model behavior under test.
             def f(self):
+                # [FUNCTION DOC] HELPER: f of C. Supporting routine for tests; returns a computed
+                # value or None.
                 return super(C, self).f() + "->C.f"
 
         obj = C()
@@ -4404,6 +6047,9 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(C.__dict__["f"](p), "B.f->C.f")
 
     def test_carloverre(self):
+        # [FUNCTION DOC] Test: checks carloverre behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # Testing prohibition of Carlo Verre's hack...
         try:
             object.__setattr__(str, "foo", 42)
@@ -4419,14 +6065,25 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             self.fail("Carlo Verre __delattr__ succeeded!")
 
     def test_carloverre_multi_inherit_valid(self):
+        # [FUNCTION DOC] Test: checks carloverre multi inherit valid behavior. Fails with
+        # AssertionError (via unittest assertions) if the observed behavior differs from CPython
+        # semantics; no other side effects beyond temporary objects and classes.
         class A(type):
+            # [CLASS DOC] HELPER: local class A defined inside test_carloverre_multi_inherit_valid
+            # to exercise descriptor/class-model behavior under test.
             def __setattr__(cls, key, value):
+                # [FUNCTION DOC] HELPER: special method __setattr__ of A. Arguments: key, value.
+                # Implements the protocol hook used by tests; returns the hook result.
                 type.__setattr__(cls, key, value)
 
         class B:
+            # [CLASS DOC] HELPER: local class B defined inside test_carloverre_multi_inherit_valid
+            # to exercise descriptor/class-model behavior under test.
             pass
 
         class C(B, A):
+            # [CLASS DOC] HELPER: local class C defined inside test_carloverre_multi_inherit_valid
+            # to exercise descriptor/class-model behavior under test.
             pass
 
         obj = C('D', (object,), {})
@@ -4436,14 +6093,28 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             self.fail("setattr through direct base types should be legal")
 
     def test_carloverre_multi_inherit_invalid(self):
+        # [FUNCTION DOC] Test: checks carloverre multi inherit invalid behavior. Fails with
+        # AssertionError (via unittest assertions) if the observed behavior differs from CPython
+        # semantics; no other side effects beyond temporary objects and classes.
         class A(type):
+            # [CLASS DOC] HELPER: local class A defined inside
+            # test_carloverre_multi_inherit_invalid to exercise descriptor/class-model behavior
+            # under test.
             def __setattr__(cls, key, value):
+                # [FUNCTION DOC] HELPER: special method __setattr__ of A. Arguments: key, value.
+                # Implements the protocol hook used by tests; returns the hook result.
                 object.__setattr__(cls, key, value)  # this should fail!
 
         class B:
+            # [CLASS DOC] HELPER: local class B defined inside
+            # test_carloverre_multi_inherit_invalid to exercise descriptor/class-model behavior
+            # under test.
             pass
 
         class C(B, A):
+            # [CLASS DOC] HELPER: local class C defined inside
+            # test_carloverre_multi_inherit_invalid to exercise descriptor/class-model behavior
+            # under test.
             pass
 
         obj = C('D', (object,), {})
@@ -4455,18 +6126,29 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             self.fail("setattr through indirect base types should be rejected")
 
     def test_weakref_segfault(self):
+        # [FUNCTION DOC] Test: checks weakref segfault behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing weakref segfault...
         # SF 742911
         import weakref
 
         class Provoker:
+            # [CLASS DOC] HELPER: local class Provoker defined inside test_weakref_segfault to
+            # exercise descriptor/class-model behavior under test.
             def __init__(self, referrent):
+                # [FUNCTION DOC] HELPER: constructor. Arguments: referrent. Stores the given
+                # values on the instance, and for test cases initializes the base CPythonTestCase.
                 self.ref = weakref.ref(referrent)
 
             def __del__(self):
+                # [FUNCTION DOC] HELPER: special method __del__ of Provoker. Implements the
+                # protocol hook used by tests; returns the hook result.
                 x = self.ref()
 
         class Oops(object):
+            # [CLASS DOC] HELPER: local class Oops defined inside test_weakref_segfault to
+            # exercise descriptor/class-model behavior under test.
             pass
 
         o = Oops()
@@ -4475,6 +6157,9 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
     @support.requires_resource('cpu')
     def test_wrapper_segfault(self):
+        # [FUNCTION DOC] Test: checks wrapper segfault behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # SF 927248: deeply nested wrappers could cause stack overflow
         f = lambda:None
         for i in range(1000000):
@@ -4482,9 +6167,16 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         f = None
 
     def test_file_fault(self):
+        # [FUNCTION DOC] Test: checks file fault behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # Testing sys.stdout is changed in getattr...
         class StdoutGuard:
+            # [CLASS DOC] HELPER: local class StdoutGuard defined inside test_file_fault to
+            # exercise descriptor/class-model behavior under test.
             def __getattr__(self, attr):
+                # [FUNCTION DOC] HELPER: special method __getattr__ of StdoutGuard. Arguments:
+                # attr. Implements the protocol hook used by tests; returns the hook result.
                 sys.stdout = sys.__stdout__
                 raise RuntimeError(f"Premature access to sys.stdout.{attr}")
 
@@ -4497,6 +6189,9 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         "__build_class__ with closed over objects not supported",
     )
     def test_vicious_descriptor_nonsense(self):
+        # [FUNCTION DOC] Test: checks vicious descriptor nonsense behavior. Fails with
+        # AssertionError (via unittest assertions) if the observed behavior differs from CPython
+        # semantics; no other side effects beyond temporary objects and classes.
         # Testing vicious_descriptor_nonsense...
 
         # A potential segfault spotted by Thomas Wouters in mail to
@@ -4504,9 +6199,15 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         # Hudson just less than four months later...
 
         class Evil(object):
+            # [CLASS DOC] HELPER: local class Evil defined inside test_vicious_descriptor_nonsense
+            # to exercise descriptor/class-model behavior under test.
             def __hash__(self):
+                # [FUNCTION DOC] HELPER: special method __hash__ of Evil. Implements the protocol
+                # hook used by tests; returns the hook result.
                 return hash('attr')
             def __eq__(self, other):
+                # [FUNCTION DOC] HELPER: special method __eq__ of Evil. Arguments: other.
+                # Implements the protocol hook used by tests; returns the hook result.
                 try:
                     del C.attr
                 except AttributeError:
@@ -4515,10 +6216,17 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
                 return 0
 
         class Descr(object):
+            # [CLASS DOC] HELPER: local class Descr defined inside
+            # test_vicious_descriptor_nonsense to exercise descriptor/class-model behavior under
+            # test.
             def __get__(self, ob, type=None):
+                # [FUNCTION DOC] HELPER: special method __get__ of Descr. Arguments: ob, type.
+                # Implements the protocol hook used by tests; returns the hook result.
                 return 1
 
         class C(object):
+            # [CLASS DOC] HELPER: local class C defined inside test_vicious_descriptor_nonsense to
+            # exercise descriptor/class-model behavior under test.
             attr = Descr()
 
         c = C()
@@ -4530,9 +6238,16 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertNotHasAttr(c, 'attr')
 
     def test_init(self):
+        # [FUNCTION DOC] Test: checks init behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # SF 1155938
         class Foo(object):
+            # [CLASS DOC] HELPER: local class Foo defined inside test_init to exercise
+            # descriptor/class-model behavior under test.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: constructor. Stores the given values on the instance, and
+                # for test cases initializes the base CPythonTestCase.
                 return 10
         try:
             Foo()
@@ -4542,6 +6257,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             self.fail("did not test __init__() for None return")
 
     def assertNotOrderable(self, a, b):
+        # [FUNCTION DOC] HELPER: assertNotOrderable of ClassPropertiesAndMethods. Arguments: a, b.
+        # Supporting routine for tests; returns a computed value or None.
         with self.assertRaises(TypeError):
             a < b
         with self.assertRaises(TypeError):
@@ -4552,6 +6269,9 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             a >= b
 
     def test_method_wrapper(self):
+        # [FUNCTION DOC] Test: checks method wrapper behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing method-wrapper objects...
         # <type 'method-wrapper'> did not support any reflection before 2.5
         l = []
@@ -4570,6 +6290,9 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         hash(l.__add__)
 
     def test_builtin_function_or_method(self):
+        # [FUNCTION DOC] Test: checks builtin function or method behavior. Fails with
+        # AssertionError (via unittest assertions) if the observed behavior differs from CPython
+        # semantics; no other side effects beyond temporary objects and classes.
         # Not really belonging to test_descr, but introspection and
         # comparison on <type 'builtin_function_or_method'> seems not
         # to be tested elsewhere
@@ -4589,6 +6312,9 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         hash(l.append)
 
     def test_special_unbound_method_types(self):
+        # [FUNCTION DOC] Test: checks special unbound method types behavior. Fails with
+        # AssertionError (via unittest assertions) if the observed behavior differs from CPython
+        # semantics; no other side effects beyond temporary objects and classes.
         # Testing objects of <type 'wrapper_descriptor'>...
         self.assertTrue(list.__add__ == list.__add__)
         self.assertFalse(list.__add__ != list.__add__)
@@ -4608,13 +6334,20 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertIs(list.append.__objclass__, list)
 
     def test_not_implemented(self):
+        # [FUNCTION DOC] Test: checks not implemented behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing NotImplemented...
         # all binary methods should be able to return a NotImplemented
 
         def specialmethod(self, other):
+            # [FUNCTION DOC] HELPER: local function specialmethod inside test_not_implemented.
+            # Arguments: other. Returns its computed value or None; used by the enclosing test.
             return NotImplemented
 
         def check(expr, x, y):
+            # [FUNCTION DOC] HELPER: local function check inside test_not_implemented. Arguments:
+            # expr, x, y. Returns its computed value or None; used by the enclosing test.
             with (
                 self.subTest(expr=expr, x=x, y=y),
                 self.assertRaises(TypeError),
@@ -4670,12 +6403,19 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
                 check(iexpr, c, N2)
 
     def test_assign_slice(self):
+        # [FUNCTION DOC] Test: checks assign slice behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # ceval.c's assign_slice used to check for
         # tp->tp_as_sequence->sq_slice instead of
         # tp->tp_as_sequence->sq_ass_slice
 
         class C(object):
+            # [CLASS DOC] HELPER: local class C defined inside test_assign_slice to exercise
+            # descriptor/class-model behavior under test.
             def __setitem__(self, idx, value):
+                # [FUNCTION DOC] HELPER: special method __setitem__ of C. Arguments: idx, value.
+                # Implements the protocol hook used by tests; returns the hook result.
                 self.value = value
 
         c = C()
@@ -4683,18 +6423,29 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(c.value, 3)
 
     def test_set_and_no_get(self):
+        # [FUNCTION DOC] Test: checks set and no get behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # See
         # http://mail.python.org/pipermail/python-dev/2010-January/095637.html
         class Descr(object):
+            # [CLASS DOC] HELPER: local class Descr defined inside test_set_and_no_get to exercise
+            # descriptor/class-model behavior under test.
 
             def __init__(self, name):
+                # [FUNCTION DOC] HELPER: constructor. Arguments: name. Stores the given values on
+                # the instance, and for test cases initializes the base CPythonTestCase.
                 self.name = name
 
             def __set__(self, obj, value):
+                # [FUNCTION DOC] HELPER: special method __set__ of Descr. Arguments: obj, value.
+                # Implements the protocol hook used by tests; returns the hook result.
                 obj.__dict__[self.name] = value
         descr = Descr("a")
 
         class X(object):
+            # [CLASS DOC] HELPER: local class X defined inside test_set_and_no_get to exercise
+            # descriptor/class-model behavior under test.
             a = descr
 
         x = X()
@@ -4704,30 +6455,49 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
         # Also check type_getattro for correctness.
         class Meta(type):
+            # [CLASS DOC] HELPER: local class Meta defined inside test_set_and_no_get to exercise
+            # descriptor/class-model behavior under test.
             pass
         class X(metaclass=Meta):
+            # [CLASS DOC] HELPER: local class X defined inside test_set_and_no_get to exercise
+            # descriptor/class-model behavior under test.
             pass
         X.a = 42
         Meta.a = Descr("a")
         self.assertEqual(X.a, 42)
 
     def test_getattr_hooks(self):
+        # [FUNCTION DOC] Test: checks getattr hooks behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # issue 4230
 
         class Descriptor(object):
+            # [CLASS DOC] HELPER: local class Descriptor defined inside test_getattr_hooks to
+            # exercise descriptor/class-model behavior under test.
             counter = 0
             def __get__(self, obj, objtype=None):
+                # [FUNCTION DOC] HELPER: special method __get__ of Descriptor. Arguments: obj,
+                # objtype. Implements the protocol hook used by tests; returns the hook result.
                 def getter(name):
+                    # [FUNCTION DOC] HELPER: local function getter inside __get__. Arguments:
+                    # name. Returns its computed value or None; used by the enclosing test.
                     self.counter += 1
                     raise AttributeError(name)
                 return getter
 
         descr = Descriptor()
         class A(object):
+            # [CLASS DOC] HELPER: local class A defined inside test_getattr_hooks to exercise
+            # descriptor/class-model behavior under test.
             __getattribute__ = descr
         class B(object):
+            # [CLASS DOC] HELPER: local class B defined inside test_getattr_hooks to exercise
+            # descriptor/class-model behavior under test.
             __getattr__ = descr
         class C(object):
+            # [CLASS DOC] HELPER: local class C defined inside test_getattr_hooks to exercise
+            # descriptor/class-model behavior under test.
             __getattribute__ = descr
             __getattr__ = descr
 
@@ -4739,10 +6509,18 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(descr.counter, 4)
 
         class EvilGetattribute(object):
+            # [CLASS DOC] HELPER: local class EvilGetattribute defined inside test_getattr_hooks
+            # to exercise descriptor/class-model behavior under test.
             # This used to segfault
             def __getattr__(self, name):
+                # [FUNCTION DOC] HELPER: special method __getattr__ of EvilGetattribute.
+                # Arguments: name. Implements the protocol hook used by tests; returns the hook
+                # result.
                 raise AttributeError(name)
             def __getattribute__(self, name):
+                # [FUNCTION DOC] HELPER: special method __getattribute__ of EvilGetattribute.
+                # Arguments: name. Implements the protocol hook used by tests; returns the hook
+                # result.
                 del EvilGetattribute.__getattr__
                 for i in range(5):
                     gc.collect()
@@ -4751,27 +6529,44 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertRaises(AttributeError, getattr, EvilGetattribute(), "attr")
 
     def test_type___getattribute__(self):
+        # [FUNCTION DOC] Test: checks type   getattribute behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         self.assertRaises(TypeError, type.__getattribute__, list, type)
 
     def test_abstractmethods(self):
+        # [FUNCTION DOC] Test: checks abstractmethods behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # type pretends not to have __abstractmethods__.
         self.assertRaises(AttributeError, getattr, type, "__abstractmethods__")
         class meta(type):
+            # [CLASS DOC] HELPER: local class meta defined inside test_abstractmethods to exercise
+            # descriptor/class-model behavior under test.
             pass
         self.assertRaises(AttributeError, getattr, meta, "__abstractmethods__")
         class X(object):
+            # [CLASS DOC] HELPER: local class X defined inside test_abstractmethods to exercise
+            # descriptor/class-model behavior under test.
             pass
         with self.assertRaises(AttributeError):
             del X.__abstractmethods__
 
     def test_gh55664(self):
+        # [FUNCTION DOC] Test: checks gh55664 behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # gh-55664: issue a warning when the
         # __dict__ of a class contains non-string keys
         with self.assertWarnsRegex(RuntimeWarning, 'MyClass'):
             MyClass = type('MyClass', (), {1: 2})
 
         class meta(type):
+            # [CLASS DOC] HELPER: local class meta defined inside test_gh55664 to exercise
+            # descriptor/class-model behavior under test.
             def __new__(mcls, name, bases, ns):
+                # [FUNCTION DOC] HELPER: special method __new__ of meta. Arguments: mcls, name,
+                # bases, ns. Implements the protocol hook used by tests; returns the hook result.
                 ns[1] = 2
                 return super().__new__(mcls, name, bases, ns)
 
@@ -4779,7 +6574,12 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             MyClass = meta('MyClass', (), {})
 
     def test_proxy_call(self):
+        # [FUNCTION DOC] Test: checks proxy call behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         class FakeStr:
+            # [CLASS DOC] HELPER: local class FakeStr defined inside test_proxy_call to exercise
+            # descriptor/class-model behavior under test.
             __class__ = str
 
         fake_str = FakeStr()
@@ -4795,8 +6595,14 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             str.__add__(fake_str, "abc")
 
     def test_specialized_method_calls_check_types(self):
+        # [FUNCTION DOC] Test: checks specialized method calls check types behavior. Fails with
+        # AssertionError (via unittest assertions) if the observed behavior differs from CPython
+        # semantics; no other side effects beyond temporary objects and classes.
         # https://github.com/python/cpython/issues/92063
         class Thing:
+            # [CLASS DOC] HELPER: local class Thing defined inside
+            # test_specialized_method_calls_check_types to exercise descriptor/class-model
+            # behavior under test.
             pass
         thing = Thing()
         for i in range(20):
@@ -4822,9 +6628,14 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
                 deque.append(thing, thing)
 
     def test_repr_as_str(self):
+        # [FUNCTION DOC] Test: checks repr as str behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Issue #11603: crash or infinite loop when rebinding __str__ as
         # __repr__.
         class Foo:
+            # [CLASS DOC] HELPER: local class Foo defined inside test_repr_as_str to exercise
+            # descriptor/class-model behavior under test.
             pass
         Foo.__repr__ = Foo.__str__
         foo = Foo()
@@ -4832,7 +6643,12 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertRaises(RecursionError, repr, foo)
 
     def test_mixing_slot_wrappers(self):
+        # [FUNCTION DOC] Test: checks mixing slot wrappers behavior. Fails with AssertionError
+        # (via unittest assertions) if the observed behavior differs from CPython semantics; no
+        # other side effects beyond temporary objects and classes.
         class X(dict):
+            # [CLASS DOC] HELPER: local class X defined inside test_mixing_slot_wrappers to
+            # exercise descriptor/class-model behavior under test.
             __setattr__ = dict.__setitem__
             __neg__ = dict.copy
         x = X()
@@ -4841,9 +6657,14 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(x, -x)
 
     def test_wrong_class_slot_wrapper(self):
+        # [FUNCTION DOC] Test: checks wrong class slot wrapper behavior. Fails with AssertionError
+        # (via unittest assertions) if the observed behavior differs from CPython semantics; no
+        # other side effects beyond temporary objects and classes.
         # Check bpo-37619: a wrapper descriptor taken from the wrong class
         # should raise an exception instead of silently being ignored
         class A(int):
+            # [CLASS DOC] HELPER: local class A defined inside test_wrong_class_slot_wrapper to
+            # exercise descriptor/class-model behavior under test.
             __eq__ = str.__eq__
             __add__ = str.__add__
         a = A()
@@ -4853,15 +6674,26 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             a + a
 
     def test_slot_shadows_class_variable(self):
+        # [FUNCTION DOC] Test: checks slot shadows class variable behavior. Fails with
+        # AssertionError (via unittest assertions) if the observed behavior differs from CPython
+        # semantics; no other side effects beyond temporary objects and classes.
         with self.assertRaises(ValueError) as cm:
             class X:
+                # [CLASS DOC] HELPER: local class X defined inside
+                # test_slot_shadows_class_variable to exercise descriptor/class-model behavior
+                # under test.
                 __slots__ = ["foo"]
                 foo = None
         m = str(cm.exception)
         self.assertEqual("'foo' in __slots__ conflicts with class variable", m)
 
     def test_set_doc(self):
+        # [FUNCTION DOC] Test: checks set doc behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         class X:
+            # [CLASS DOC] HELPER: local class X defined inside test_set_doc to exercise
+            # descriptor/class-model behavior under test. Existing docstring says: elephant
             "elephant"
         X.__doc__ = "banana"
         self.assertEqual(X.__doc__, "banana")
@@ -4876,6 +6708,9 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(X.__doc__, "banana")
 
     def test_qualname(self):
+        # [FUNCTION DOC] Test: checks qualname behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         descriptors = [str.lower, complex.real, float.real, int.__add__]
         types = ['method', 'member', 'getset', 'wrapper']
 
@@ -4893,6 +6728,8 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(int.__add__.__qualname__, 'int.__add__')
 
         class X:
+            # [CLASS DOC] HELPER: local class X defined inside test_qualname to exercise
+            # descriptor/class-model behavior under test.
             pass
         with self.assertRaises(TypeError):
             del X.__qualname__
@@ -4903,12 +6740,18 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         global Y
 
         class Y:
+            # [CLASS DOC] HELPER: local class Y defined inside test_qualname to exercise
+            # descriptor/class-model behavior under test.
             class Inside:
+                # [CLASS DOC] HELPER: nested helper class Inside inside class Y used by tests.
                 pass
         self.assertEqual(Y.__qualname__, 'Y')
         self.assertEqual(Y.Inside.__qualname__, 'Y.Inside')
 
     def test_qualname_dict(self):
+        # [FUNCTION DOC] Test: checks qualname dict behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         ns = {'__qualname__': 'some.name'}
         tp = type('Foo', (), ns)
         self.assertEqual(tp.__qualname__, 'some.name')
@@ -4919,9 +6762,16 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertRaises(TypeError, type, 'Foo', (), ns)
 
     def test_cycle_through_dict(self):
+        # [FUNCTION DOC] Test: checks cycle through dict behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # See bug #1469629
         class X(dict):
+            # [CLASS DOC] HELPER: local class X defined inside test_cycle_through_dict to exercise
+            # descriptor/class-model behavior under test.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: constructor. Stores the given values on the instance, and
+                # for test cases initializes the base CPythonTestCase.
                 dict.__init__(self)
                 self.__dict__ = self
         x = X()
@@ -4934,20 +6784,41 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             self.assertIsNot(type(o), X)
 
     def test_object_new_and_init_with_parameters(self):
+        # [FUNCTION DOC] Test: checks object new and init with parameters behavior. Fails with
+        # AssertionError (via unittest assertions) if the observed behavior differs from CPython
+        # semantics; no other side effects beyond temporary objects and classes.
         # See issue #1683368
         class OverrideNeither:
+            # [CLASS DOC] HELPER: local class OverrideNeither defined inside
+            # test_object_new_and_init_with_parameters to exercise descriptor/class-model behavior
+            # under test.
             pass
 
         self.assertRaises(TypeError, OverrideNeither, 1)
         self.assertRaises(TypeError, OverrideNeither, kw=1)
 
         class OverrideNew:
+            # [CLASS DOC] HELPER: local class OverrideNew defined inside
+            # test_object_new_and_init_with_parameters to exercise descriptor/class-model behavior
+            # under test.
             def __new__(cls, foo, kw=0, *args, **kwds):
+                # [FUNCTION DOC] HELPER: special method __new__ of OverrideNew. Arguments: foo,
+                # kw, *args, **kwds. Implements the protocol hook used by tests; returns the hook
+                # result.
                 return object.__new__(cls, *args, **kwds)
         class OverrideInit:
+            # [CLASS DOC] HELPER: local class OverrideInit defined inside
+            # test_object_new_and_init_with_parameters to exercise descriptor/class-model behavior
+            # under test.
             def __init__(self, foo, kw=0, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: constructor. Arguments: foo, kw, *args, **kwargs. Stores
+                # the given values on the instance, and for test cases initializes the base
+                # CPythonTestCase.
                 return object.__init__(self, *args, **kwargs)
         class OverrideBoth(OverrideNew, OverrideInit):
+            # [CLASS DOC] HELPER: local class OverrideBoth defined inside
+            # test_object_new_and_init_with_parameters to exercise descriptor/class-model behavior
+            # under test.
             pass
 
         for case in OverrideNew, OverrideInit, OverrideBoth:
@@ -4957,28 +6828,54 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
             self.assertRaises(TypeError, case, 1, 2, foo=3)
 
     def test_subclassing_does_not_duplicate_dict_descriptors(self):
+        # [FUNCTION DOC] Test: checks subclassing does not duplicate dict descriptors behavior.
+        # Fails with AssertionError (via unittest assertions) if the observed behavior differs
+        # from CPython semantics; no other side effects beyond temporary objects and classes.
         class Base:
+            # [CLASS DOC] HELPER: local class Base defined inside
+            # test_subclassing_does_not_duplicate_dict_descriptors to exercise descriptor/class-
+            # model behavior under test.
             pass
         class Sub(Base):
+            # [CLASS DOC] HELPER: local class Sub defined inside
+            # test_subclassing_does_not_duplicate_dict_descriptors to exercise descriptor/class-
+            # model behavior under test.
             pass
         self.assertIn("__dict__", Base.__dict__)
         self.assertNotIn("__dict__", Sub.__dict__)
 
     def test_bound_method_repr(self):
+        # [FUNCTION DOC] Test: checks bound method repr behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         class Foo:
+            # [CLASS DOC] HELPER: local class Foo defined inside test_bound_method_repr to
+            # exercise descriptor/class-model behavior under test.
             def method(self):
+                # [FUNCTION DOC] HELPER: method of Foo. Supporting routine for tests; returns a
+                # computed value or None.
                 pass
         self.assertRegex(repr(Foo().method),
             r"<bound method .*Foo\.method of <.*Foo object at .*>>")
 
 
         class Base:
+            # [CLASS DOC] HELPER: local class Base defined inside test_bound_method_repr to
+            # exercise descriptor/class-model behavior under test.
             def method(self):
+                # [FUNCTION DOC] HELPER: method of Base. Supporting routine for tests; returns a
+                # computed value or None.
                 pass
         class Derived1(Base):
+            # [CLASS DOC] HELPER: local class Derived1 defined inside test_bound_method_repr to
+            # exercise descriptor/class-model behavior under test.
             pass
         class Derived2(Base):
+            # [CLASS DOC] HELPER: local class Derived2 defined inside test_bound_method_repr to
+            # exercise descriptor/class-model behavior under test.
             def method(self):
+                # [FUNCTION DOC] HELPER: method of Derived2. Supporting routine for tests; returns
+                # a computed value or None.
                 pass
         base = Base()
         derived1 = Derived1()
@@ -4995,7 +6892,11 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
         class Foo:
             @classmethod
+            # [CLASS DOC] HELPER: local class Foo defined inside test_bound_method_repr to
+            # exercise descriptor/class-model behavior under test.
             def method(cls):
+                # [FUNCTION DOC] HELPER: method of Foo. Supporting routine for tests; returns a
+                # computed value or None.
                 pass
         foo = Foo()
         self.assertRegex(repr(foo.method), # access via instance
@@ -5005,7 +6906,11 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
 
         class MyCallable:
+            # [CLASS DOC] HELPER: local class MyCallable defined inside test_bound_method_repr to
+            # exercise descriptor/class-model behavior under test.
             def __call__(self, arg):
+                # [FUNCTION DOC] HELPER: special method __call__ of MyCallable. Arguments: arg.
+                # Implements the protocol hook used by tests; returns the hook result.
                 pass
         func = MyCallable() # func has no __name__ or __qualname__ attributes
         instance = object()
@@ -5021,15 +6926,24 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
     @unittest.skipIf(_testcapi is None, 'need the _testcapi module')
     def test_bpo25750(self):
+        # [FUNCTION DOC] Test: checks bpo25750 behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # bpo-25750: calling a descriptor (implemented as built-in
         # function with METH_FASTCALL) should not crash CPython if the
         # descriptor deletes itself from the class.
         class Descr:
+            # [CLASS DOC] HELPER: local class Descr defined inside test_bpo25750 to exercise
+            # descriptor/class-model behavior under test.
             __get__ = _testcapi.bad_get
 
         class X:
+            # [CLASS DOC] HELPER: local class X defined inside test_bpo25750 to exercise
+            # descriptor/class-model behavior under test.
             descr = Descr()
             def __new__(cls):
+                # [FUNCTION DOC] HELPER: special method __new__ of X. Implements the protocol hook
+                # used by tests; returns the hook result.
                 cls.descr = None
                 # Create this large list to corrupt some unused memory
                 cls.lst = [2**i for i in range(10000)]
@@ -5037,15 +6951,22 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
     @support.suppress_immortalization()
     def test_remove_subclass(self):
+        # [FUNCTION DOC] Test: checks remove subclass behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # bpo-46417: when the last subclass of a type is deleted,
         # remove_subclass() clears the internal dictionary of subclasses:
         # set PyTypeObject.tp_subclasses to NULL. remove_subclass() is called
         # when a type is deallocated.
         class Parent:
+            # [CLASS DOC] HELPER: local class Parent defined inside test_remove_subclass to
+            # exercise descriptor/class-model behavior under test.
             pass
         self.assertEqual(Parent.__subclasses__(), [])
 
         class Child(Parent):
+            # [CLASS DOC] HELPER: local class Child defined inside test_remove_subclass to
+            # exercise descriptor/class-model behavior under test.
             pass
         self.assertEqual(Parent.__subclasses__(), [Child])
 
@@ -5054,13 +6975,22 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(Parent.__subclasses__(), [])
 
     def test_instance_method_get_behavior(self):
+        # [FUNCTION DOC] Test: checks instance method get behavior behavior. Fails with
+        # AssertionError (via unittest assertions) if the observed behavior differs from CPython
+        # semantics; no other side effects beyond temporary objects and classes.
         # test case for gh-113157
 
         class A:
+            # [CLASS DOC] HELPER: local class A defined inside test_instance_method_get_behavior
+            # to exercise descriptor/class-model behavior under test.
             def meth(self):
+                # [FUNCTION DOC] HELPER: meth of A. Supporting routine for tests; returns a
+                # computed value or None.
                 return self
 
         class B:
+            # [CLASS DOC] HELPER: local class B defined inside test_instance_method_get_behavior
+            # to exercise descriptor/class-model behavior under test.
             pass
 
         a = A()
@@ -5069,13 +6999,22 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         self.assertEqual(b.meth(), a)
 
     def test_attr_raise_through_property(self):
+        # [FUNCTION DOC] Test: checks attr raise through property behavior. Fails with
+        # AssertionError (via unittest assertions) if the observed behavior differs from CPython
+        # semantics; no other side effects beyond temporary objects and classes.
         # test case for gh-103272
         class A:
+            # [CLASS DOC] HELPER: local class A defined inside test_attr_raise_through_property to
+            # exercise descriptor/class-model behavior under test.
             def __getattr__(self, name):
+                # [FUNCTION DOC] HELPER: special method __getattr__ of A. Arguments: name.
+                # Implements the protocol hook used by tests; returns the hook result.
                 raise ValueError("FOO")
 
             @property
             def foo(self):
+                # [FUNCTION DOC] HELPER: foo of A. Supporting routine for tests; returns a
+                # computed value or None.
                 return self.__getattr__("asdf")
 
         with self.assertRaisesRegex(ValueError, "FOO"):
@@ -5084,11 +7023,17 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
         # test case for gh-103551
         class B:
             @property
+            # [CLASS DOC] HELPER: local class B defined inside test_attr_raise_through_property to
+            # exercise descriptor/class-model behavior under test.
             def __getattr__(self, name):
+                # [FUNCTION DOC] HELPER: special method __getattr__ of B. Arguments: name.
+                # Implements the protocol hook used by tests; returns the hook result.
                 raise ValueError("FOO")
 
             @property
             def foo(self):
+                # [FUNCTION DOC] HELPER: foo of B. Supporting routine for tests; returns a
+                # computed value or None.
                 raise NotImplementedError("BAR")
 
         with self.assertRaisesRegex(NotImplementedError, "BAR"):
@@ -5096,16 +7041,27 @@ class ClassPropertiesAndMethods(CPythonTestCase, ExtraAssertions):
 
 
 class DictProxyTests(CPythonTestCase):
+    # [CLASS DOC] Test case for mappingproxy behavior of class dictionaries, using a small fixture
+    # class created in setUp.
     def setUp(self):
+        # [FUNCTION DOC] HELPER: unittest fixture hook setUp; prepares or cleans state for each
+        # test of the class.
         super().setUp()
         class C(object):
+            # [CLASS DOC] HELPER: local class C defined inside setUp to exercise descriptor/class-
+            # model behavior under test.
             def meth(self):
+                # [FUNCTION DOC] HELPER: meth of C. Supporting routine for tests; returns a
+                # computed value or None.
                 pass
         self.C = C
 
     @unittest.skipIf(hasattr(sys, 'gettrace') and sys.gettrace(),
                         'trace function introduces __local__')
     def test_iter_keys(self):
+        # [FUNCTION DOC] Test: checks iter keys behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # Testing dict-proxy keys...
         it = self.C.__dict__.keys()
         self.assertNotIsInstance(it, list)
@@ -5119,6 +7075,9 @@ class DictProxyTests(CPythonTestCase):
     @unittest.skipIf(hasattr(sys, 'gettrace') and sys.gettrace(),
                         'trace function introduces __local__')
     def test_iter_values(self):
+        # [FUNCTION DOC] Test: checks iter values behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing dict-proxy values...
         it = self.C.__dict__.values()
         self.assertNotIsInstance(it, list)
@@ -5128,6 +7087,9 @@ class DictProxyTests(CPythonTestCase):
     @unittest.skipIf(hasattr(sys, 'gettrace') and sys.gettrace(),
                         'trace function introduces __local__')
     def test_iter_items(self):
+        # [FUNCTION DOC] Test: checks iter items behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # Testing dict-proxy iteritems...
         it = self.C.__dict__.items()
         self.assertNotIsInstance(it, list)
@@ -5139,17 +7101,29 @@ class DictProxyTests(CPythonTestCase):
                                 'meth'])
 
     def test_dict_type_with_metaclass(self):
+        # [FUNCTION DOC] Test: checks dict type with metaclass behavior. Fails with AssertionError
+        # (via unittest assertions) if the observed behavior differs from CPython semantics; no
+        # other side effects beyond temporary objects and classes.
         # Testing type of __dict__ when metaclass set...
         class B(object):
+            # [CLASS DOC] HELPER: local class B defined inside test_dict_type_with_metaclass to
+            # exercise descriptor/class-model behavior under test.
             pass
         class M(type):
+            # [CLASS DOC] HELPER: local class M defined inside test_dict_type_with_metaclass to
+            # exercise descriptor/class-model behavior under test.
             pass
         class C(metaclass=M):
+            # [CLASS DOC] HELPER: local class C defined inside test_dict_type_with_metaclass to
+            # exercise descriptor/class-model behavior under test.
             # In 2.3a1, C.__dict__ was a real dict rather than a dict proxy
             pass
         self.assertEqual(type(C.__dict__), type(B.__dict__))
 
     def test_repr(self):
+        # [FUNCTION DOC] Test: checks repr behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # Testing mappingproxy.__repr__.
         # We can't blindly compare with the repr of another dict as ordering
         # of keys and values is arbitrary and may differ.
@@ -5161,11 +7135,16 @@ class DictProxyTests(CPythonTestCase):
 
 
 class AAAPTypesLongInitTest(CPythonTestCase):
+    # [CLASS DOC] Test case checking that type initialization of a type with a long init chain
+    # works (run first in module order).
     # This is in its own TestCase so that it can be run before any other tests.
     # (Hence the 'AAA' in the test class name: to make it the first
     # item in a list sorted by name, like
     # unittest.TestLoader.getTestCaseNames() does.)
     def test_pytype_long_ready(self):
+        # [FUNCTION DOC] Test: checks pytype long ready behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Testing SF bug 551412 ...
 
         # This dumps core when SF bug 551412 isn't fixed --
@@ -5173,7 +7152,11 @@ class AAAPTypesLongInitTest(CPythonTestCase):
         # (That can't be helped -- as soon as PyType_Ready()
         # is called for PyLong_Type, the bug is gone.)
         class UserLong(object):
+            # [CLASS DOC] HELPER: local class UserLong defined inside test_pytype_long_ready to
+            # exercise descriptor/class-model behavior under test.
             def __pow__(self, *args):
+                # [FUNCTION DOC] HELPER: special method __pow__ of UserLong. Arguments: *args.
+                # Implements the protocol hook used by tests; returns the hook result.
                 pass
         try:
             pow(0, UserLong(), 0)
@@ -5190,22 +7173,36 @@ class MiscTests(CPythonTestCase):
         TEST_WITH_TORCHDYNAMO,
         "__build_class__ with closed over objects not supported",
     )
+    # [CLASS DOC] Test case with miscellaneous checks on type names and type objects.
     def test_type_lookup_mro_reference(self):
+        # [FUNCTION DOC] Test: checks type lookup mro reference behavior. Fails with
+        # AssertionError (via unittest assertions) if the observed behavior differs from CPython
+        # semantics; no other side effects beyond temporary objects and classes.
         # Issue #14199: _PyType_Lookup() has to keep a strong reference to
         # the type MRO because it may be modified during the lookup, if
         # __bases__ is set during the lookup for example.
         class MyKey(object):
+            # [CLASS DOC] HELPER: local class MyKey defined inside test_type_lookup_mro_reference
+            # to exercise descriptor/class-model behavior under test.
             def __hash__(self):
+                # [FUNCTION DOC] HELPER: special method __hash__ of MyKey. Implements the protocol
+                # hook used by tests; returns the hook result.
                 return hash('mykey')
 
             def __eq__(self, other):
+                # [FUNCTION DOC] HELPER: special method __eq__ of MyKey. Arguments: other.
+                # Implements the protocol hook used by tests; returns the hook result.
                 X.__bases__ = (Base2,)
 
         class Base(object):
+            # [CLASS DOC] HELPER: local class Base defined inside test_type_lookup_mro_reference
+            # to exercise descriptor/class-model behavior under test.
             mykey = 'from Base'
             mykey2 = 'from Base'
 
         class Base2(object):
+            # [CLASS DOC] HELPER: local class Base2 defined inside test_type_lookup_mro_reference
+            # to exercise descriptor/class-model behavior under test.
             mykey = 'from Base2'
             mykey2 = 'from Base2'
 
@@ -5223,9 +7220,14 @@ class MiscTests(CPythonTestCase):
 
 
 class PicklingTests(CPythonTestCase):
+    # [CLASS DOC] Test case for pickling and copying of objects across protocols:
+    # reduce/reduce_ex/getstate/newobj hooks, slots and copyreg interaction.
 
     def _check_reduce(self, proto, obj, args=(), kwargs={}, state=None,
                       listitems=None, dictitems=None):
+        # [FUNCTION DOC] HELPER: _check_reduce of PicklingTests. Arguments: proto, obj, args,
+        # kwargs, state, listitems, dictitems. Supporting routine for tests; returns a computed
+        # value or None.
         if proto >= 2:
             reduce_value = obj.__reduce_ex__(proto)
             if kwargs:
@@ -5255,13 +7257,20 @@ class PicklingTests(CPythonTestCase):
             self.assertEqual(obj.__reduce__(), reduce_value)
 
     def test_reduce(self):
+        # [FUNCTION DOC] Test: checks reduce behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         protocols = range(pickle.HIGHEST_PROTOCOL + 1)
         args = (-101, "spam")
         kwargs = {'bacon': -201, 'fish': -301}
         state = {'cheese': -401}
 
         class C1:
+            # [CLASS DOC] HELPER: local class C1 defined inside test_reduce to exercise
+            # descriptor/class-model behavior under test.
             def __getnewargs__(self):
+                # [FUNCTION DOC] HELPER: special method __getnewargs__ of C1. Implements the
+                # protocol hook used by tests; returns the hook result.
                 return args
         obj = C1()
         for proto in protocols:
@@ -5273,7 +7282,11 @@ class PicklingTests(CPythonTestCase):
             self._check_reduce(proto, obj, args, state=state)
 
         class C2:
+            # [CLASS DOC] HELPER: local class C2 defined inside test_reduce to exercise
+            # descriptor/class-model behavior under test.
             def __getnewargs__(self):
+                # [FUNCTION DOC] HELPER: special method __getnewargs__ of C2. Implements the
+                # protocol hook used by tests; returns the hook result.
                 return "bad args"
         obj = C2()
         for proto in protocols:
@@ -5282,7 +7295,11 @@ class PicklingTests(CPythonTestCase):
                     obj.__reduce_ex__(proto)
 
         class C3:
+            # [CLASS DOC] HELPER: local class C3 defined inside test_reduce to exercise
+            # descriptor/class-model behavior under test.
             def __getnewargs_ex__(self):
+                # [FUNCTION DOC] HELPER: special method __getnewargs_ex__ of C3. Implements the
+                # protocol hook used by tests; returns the hook result.
                 return (args, kwargs)
         obj = C3()
         for proto in protocols:
@@ -5290,16 +7307,32 @@ class PicklingTests(CPythonTestCase):
                 self._check_reduce(proto, obj, args, kwargs)
 
         class C4:
+            # [CLASS DOC] HELPER: local class C4 defined inside test_reduce to exercise
+            # descriptor/class-model behavior under test.
             def __getnewargs_ex__(self):
+                # [FUNCTION DOC] HELPER: special method __getnewargs_ex__ of C4. Implements the
+                # protocol hook used by tests; returns the hook result.
                 return (args, "bad dict")
         class C5:
+            # [CLASS DOC] HELPER: local class C5 defined inside test_reduce to exercise
+            # descriptor/class-model behavior under test.
             def __getnewargs_ex__(self):
+                # [FUNCTION DOC] HELPER: special method __getnewargs_ex__ of C5. Implements the
+                # protocol hook used by tests; returns the hook result.
                 return ("bad tuple", kwargs)
         class C6:
+            # [CLASS DOC] HELPER: local class C6 defined inside test_reduce to exercise
+            # descriptor/class-model behavior under test.
             def __getnewargs_ex__(self):
+                # [FUNCTION DOC] HELPER: special method __getnewargs_ex__ of C6. Implements the
+                # protocol hook used by tests; returns the hook result.
                 return ()
         class C7:
+            # [CLASS DOC] HELPER: local class C7 defined inside test_reduce to exercise
+            # descriptor/class-model behavior under test.
             def __getnewargs_ex__(self):
+                # [FUNCTION DOC] HELPER: special method __getnewargs_ex__ of C7. Implements the
+                # protocol hook used by tests; returns the hook result.
                 return "bad args"
         for proto in protocols:
             for cls in C4, C5, C6, C7:
@@ -5309,14 +7342,22 @@ class PicklingTests(CPythonTestCase):
                         obj.__reduce_ex__(proto)
 
         class C9:
+            # [CLASS DOC] HELPER: local class C9 defined inside test_reduce to exercise
+            # descriptor/class-model behavior under test.
             def __getnewargs_ex__(self):
+                # [FUNCTION DOC] HELPER: special method __getnewargs_ex__ of C9. Implements the
+                # protocol hook used by tests; returns the hook result.
                 return (args, {})
         obj = C9()
         for proto in protocols:
             self._check_reduce(proto, obj, args)
 
         class C10:
+            # [CLASS DOC] HELPER: local class C10 defined inside test_reduce to exercise
+            # descriptor/class-model behavior under test.
             def __getnewargs_ex__(self):
+                # [FUNCTION DOC] HELPER: special method __getnewargs_ex__ of C10. Implements the
+                # protocol hook used by tests; returns the hook result.
                 raise IndexError
         obj = C10()
         for proto in protocols:
@@ -5325,21 +7366,33 @@ class PicklingTests(CPythonTestCase):
                     obj.__reduce_ex__(proto)
 
         class C11:
+            # [CLASS DOC] HELPER: local class C11 defined inside test_reduce to exercise
+            # descriptor/class-model behavior under test.
             def __getstate__(self):
+                # [FUNCTION DOC] HELPER: special method __getstate__ of C11. Implements the
+                # protocol hook used by tests; returns the hook result.
                 return state
         obj = C11()
         for proto in protocols:
             self._check_reduce(proto, obj, state=state)
 
         class C12:
+            # [CLASS DOC] HELPER: local class C12 defined inside test_reduce to exercise
+            # descriptor/class-model behavior under test.
             def __getstate__(self):
+                # [FUNCTION DOC] HELPER: special method __getstate__ of C12. Implements the
+                # protocol hook used by tests; returns the hook result.
                 return "not dict"
         obj = C12()
         for proto in protocols:
             self._check_reduce(proto, obj, state="not dict")
 
         class C13:
+            # [CLASS DOC] HELPER: local class C13 defined inside test_reduce to exercise
+            # descriptor/class-model behavior under test.
             def __getstate__(self):
+                # [FUNCTION DOC] HELPER: special method __getstate__ of C13. Implements the
+                # protocol hook used by tests; returns the hook result.
                 raise IndexError
         obj = C13()
         for proto in protocols:
@@ -5350,8 +7403,12 @@ class PicklingTests(CPythonTestCase):
                     obj.__reduce__()
 
         class C14:
+            # [CLASS DOC] HELPER: local class C14 defined inside test_reduce to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = tuple(state)
             def __init__(self):
+                # [FUNCTION DOC] HELPER: constructor. Stores the given values on the instance, and
+                # for test cases initializes the base CPythonTestCase.
                 for name, value in state.items():
                     setattr(self, name, value)
 
@@ -5366,24 +7423,37 @@ class PicklingTests(CPythonTestCase):
                     obj.__reduce__()
 
         class C15(dict):
+            # [CLASS DOC] HELPER: local class C15 defined inside test_reduce to exercise
+            # descriptor/class-model behavior under test.
             pass
         obj = C15({"quebec": -601})
         for proto in protocols:
             self._check_reduce(proto, obj, dictitems=dict(obj))
 
         class C16(list):
+            # [CLASS DOC] HELPER: local class C16 defined inside test_reduce to exercise
+            # descriptor/class-model behavior under test.
             pass
         obj = C16(["yukon"])
         for proto in protocols:
             self._check_reduce(proto, obj, listitems=list(obj))
 
     def test_special_method_lookup(self):
+        # [FUNCTION DOC] Test: checks special method lookup behavior. Fails with AssertionError
+        # (via unittest assertions) if the observed behavior differs from CPython semantics; no
+        # other side effects beyond temporary objects and classes.
         protocols = range(pickle.HIGHEST_PROTOCOL + 1)
         class Picky:
+            # [CLASS DOC] HELPER: local class Picky defined inside test_special_method_lookup to
+            # exercise descriptor/class-model behavior under test.
             def __getstate__(self):
+                # [FUNCTION DOC] HELPER: special method __getstate__ of Picky. Implements the
+                # protocol hook used by tests; returns the hook result.
                 return {}
 
             def __getattr__(self, attr):
+                # [FUNCTION DOC] HELPER: special method __getattr__ of Picky. Arguments: attr.
+                # Implements the protocol hook used by tests; returns the hook result.
                 if attr in ("__getnewargs__", "__getnewargs_ex__"):
                     raise AssertionError(attr)
                 return None
@@ -5392,6 +7462,9 @@ class PicklingTests(CPythonTestCase):
             self._check_reduce(protocol, Picky(), state=state)
 
     def _assert_is_copy(self, obj, objcopy, msg=None):
+        # [FUNCTION DOC] HELPER: _assert_is_copy of PicklingTests. Arguments: obj, objcopy, msg.
+        # Supporting routine for tests; returns a computed value or None. Docstring: Utility
+        # method to verify if two objects are copies of each others.
         """Utility method to verify if two objects are copies of each others.
         """
         if msg is None:
@@ -5419,17 +7492,30 @@ class PicklingTests(CPythonTestCase):
 
     @staticmethod
     def _generate_pickle_copiers():
+        # [FUNCTION DOC] HELPER: _generate_pickle_copiers of PicklingTests. Supporting routine for
+        # tests; returns a computed value or None. Docstring: Utility method to generate the many
+        # possible pickle configurations.
         """Utility method to generate the many possible pickle configurations.
         """
         class PickleCopier:
+            # [CLASS DOC] HELPER: local class PickleCopier defined inside _generate_pickle_copiers
+            # to exercise descriptor/class-model behavior under test. Existing docstring says:
+            # This class copies object using pickle.
             "This class copies object using pickle."
             def __init__(self, proto, dumps, loads):
+                # [FUNCTION DOC] HELPER: constructor. Arguments: proto, dumps, loads. Stores the
+                # given values on the instance, and for test cases initializes the base
+                # CPythonTestCase.
                 self.proto = proto
                 self.dumps = dumps
                 self.loads = loads
             def copy(self, obj):
+                # [FUNCTION DOC] HELPER: copy of PickleCopier. Arguments: obj. Supporting routine
+                # for tests; returns a computed value or None.
                 return self.loads(self.dumps(obj, self.proto))
             def __repr__(self):
+                # [FUNCTION DOC] HELPER: special method __repr__ of PickleCopier. Implements the
+                # protocol hook used by tests; returns the hook result.
                 # We try to be as descriptive as possible here since this is
                 # the string which we will allow us to tell the pickle
                 # configuration we are using during debugging.
@@ -5443,26 +7529,38 @@ class PicklingTests(CPythonTestCase):
                                      {pickle.loads, pickle._loads}))
 
     def test_pickle_slots(self):
+        # [FUNCTION DOC] Test: checks pickle slots behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Tests pickling of classes with __slots__.
 
         # Pickling of classes with __slots__ but without __getstate__ should
         # fail (if using protocol 0 or 1)
         global C
         class C:
+            # [CLASS DOC] HELPER: local class C defined inside test_pickle_slots to exercise
+            # descriptor/class-model behavior under test.
             __slots__ = ['a']
         with self.assertRaises(TypeError):
             pickle.dumps(C(), 0)
 
         global D
         class D(C):
+            # [CLASS DOC] HELPER: local class D defined inside test_pickle_slots to exercise
+            # descriptor/class-model behavior under test.
             pass
         with self.assertRaises(TypeError):
             pickle.dumps(D(), 0)
 
         class C:
+            # [CLASS DOC] HELPER: local class C defined inside test_pickle_slots to exercise
+            # descriptor/class-model behavior under test. Existing docstring says: A class with
+            # __getstate__ and __setstate__ implemented.
             "A class with __getstate__ and __setstate__ implemented."
             __slots__ = ['a']
             def __getstate__(self):
+                # [FUNCTION DOC] HELPER: special method __getstate__ of C. Implements the protocol
+                # hook used by tests; returns the hook result.
                 state = getattr(self, '__dict__', {}).copy()
                 for cls in type(self).__mro__:
                     for slot in cls.__dict__.get('__slots__', ()):
@@ -5472,17 +7570,27 @@ class PicklingTests(CPythonTestCase):
                             pass
                 return state
             def __setstate__(self, state):
+                # [FUNCTION DOC] HELPER: special method __setstate__ of C. Arguments: state.
+                # Implements the protocol hook used by tests; returns the hook result.
                 for k, v in state.items():
                     setattr(self, k, v)
             def __repr__(self):
+                # [FUNCTION DOC] HELPER: special method __repr__ of C. Implements the protocol
+                # hook used by tests; returns the hook result.
                 return "%s()<%r>" % (type(self).__name__, self.__getstate__())
 
         class D(C):
+            # [CLASS DOC] HELPER: local class D defined inside test_pickle_slots to exercise
+            # descriptor/class-model behavior under test. Existing docstring says: A subclass of a
+            # class with slots.
             "A subclass of a class with slots."
             pass
 
         global E
         class E(C):
+            # [CLASS DOC] HELPER: local class E defined inside test_pickle_slots to exercise
+            # descriptor/class-model behavior under test. Existing docstring says: A subclass with
+            # an extra slot.
             "A subclass with an extra slot."
             __slots__ = ['b']
 
@@ -5510,46 +7618,72 @@ class PicklingTests(CPythonTestCase):
                 self._assert_is_copy(x, y)
 
     def test_reduce_copying(self):
+        # [FUNCTION DOC] Test: checks reduce copying behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Tests pickling and copying new-style classes and objects.
         global C1
         class C1:
+            # [CLASS DOC] HELPER: local class C1 defined inside test_reduce_copying to exercise
+            # descriptor/class-model behavior under test. Existing docstring says: The state of
+            # this class is copyable via its instance dict.
             "The state of this class is copyable via its instance dict."
             ARGS = (1, 2)
             NEED_DICT_COPYING = True
             def __init__(self, a, b):
+                # [FUNCTION DOC] HELPER: constructor. Arguments: a, b. Stores the given values on
+                # the instance, and for test cases initializes the base CPythonTestCase.
                 super().__init__()
                 self.a = a
                 self.b = b
             def __repr__(self):
+                # [FUNCTION DOC] HELPER: special method __repr__ of C1. Implements the protocol
+                # hook used by tests; returns the hook result.
                 return "C1(%r, %r)" % (self.a, self.b)
 
         global C2
         class C2(list):
+            # [CLASS DOC] HELPER: local class C2 defined inside test_reduce_copying to exercise
+            # descriptor/class-model behavior under test. Existing docstring says: A list subclass
+            # copyable via __getnewargs__.
             "A list subclass copyable via __getnewargs__."
             ARGS = (1, 2)
             NEED_DICT_COPYING = False
             def __new__(cls, a, b):
+                # [FUNCTION DOC] HELPER: special method __new__ of C2. Arguments: a, b. Implements
+                # the protocol hook used by tests; returns the hook result.
                 self = super().__new__(cls)
                 self.a = a
                 self.b = b
                 return self
             def __init__(self, *args):
+                # [FUNCTION DOC] HELPER: constructor. Arguments: *args. Stores the given values on
+                # the instance, and for test cases initializes the base CPythonTestCase.
                 super().__init__()
                 # This helps testing that __init__ is not called during the
                 # unpickling process, which would cause extra appends.
                 self.append("cheese")
             @classmethod
             def __getnewargs__(cls):
+                # [FUNCTION DOC] HELPER: special method __getnewargs__ of C2. Implements the
+                # protocol hook used by tests; returns the hook result.
                 return cls.ARGS
             def __repr__(self):
+                # [FUNCTION DOC] HELPER: special method __repr__ of C2. Implements the protocol
+                # hook used by tests; returns the hook result.
                 return "C2(%r, %r)<%r>" % (self.a, self.b, list(self))
 
         global C3
         class C3(list):
+            # [CLASS DOC] HELPER: local class C3 defined inside test_reduce_copying to exercise
+            # descriptor/class-model behavior under test. Existing docstring says: A list subclass
+            # copyable via __getstate__.
             "A list subclass copyable via __getstate__."
             ARGS = (1, 2)
             NEED_DICT_COPYING = False
             def __init__(self, a, b):
+                # [FUNCTION DOC] HELPER: constructor. Arguments: a, b. Stores the given values on
+                # the instance, and for test cases initializes the base CPythonTestCase.
                 self.a = a
                 self.b = b
                 # This helps testing that __init__ is not called during the
@@ -5557,45 +7691,69 @@ class PicklingTests(CPythonTestCase):
                 self.append("cheese")
             @classmethod
             def __getstate__(cls):
+                # [FUNCTION DOC] HELPER: special method __getstate__ of C3. Implements the
+                # protocol hook used by tests; returns the hook result.
                 return cls.ARGS
             def __setstate__(self, state):
+                # [FUNCTION DOC] HELPER: special method __setstate__ of C3. Arguments: state.
+                # Implements the protocol hook used by tests; returns the hook result.
                 a, b = state
                 self.a = a
                 self.b = b
             def __repr__(self):
+                # [FUNCTION DOC] HELPER: special method __repr__ of C3. Implements the protocol
+                # hook used by tests; returns the hook result.
                 return "C3(%r, %r)<%r>" % (self.a, self.b, list(self))
 
         global C4
         class C4(int):
+            # [CLASS DOC] HELPER: local class C4 defined inside test_reduce_copying to exercise
+            # descriptor/class-model behavior under test. Existing docstring says: An int subclass
+            # copyable via __getnewargs__.
             "An int subclass copyable via __getnewargs__."
             ARGS = ("hello", "world", 1)
             NEED_DICT_COPYING = False
             def __new__(cls, a, b, value):
+                # [FUNCTION DOC] HELPER: special method __new__ of C4. Arguments: a, b, value.
+                # Implements the protocol hook used by tests; returns the hook result.
                 self = super().__new__(cls, value)
                 self.a = a
                 self.b = b
                 return self
             @classmethod
             def __getnewargs__(cls):
+                # [FUNCTION DOC] HELPER: special method __getnewargs__ of C4. Implements the
+                # protocol hook used by tests; returns the hook result.
                 return cls.ARGS
             def __repr__(self):
+                # [FUNCTION DOC] HELPER: special method __repr__ of C4. Implements the protocol
+                # hook used by tests; returns the hook result.
                 return "C4(%r, %r)<%r>" % (self.a, self.b, int(self))
 
         global C5
         class C5(int):
+            # [CLASS DOC] HELPER: local class C5 defined inside test_reduce_copying to exercise
+            # descriptor/class-model behavior under test. Existing docstring says: An int subclass
+            # copyable via __getnewargs_ex__.
             "An int subclass copyable via __getnewargs_ex__."
             ARGS = (1, 2)
             KWARGS = {'value': 3}
             NEED_DICT_COPYING = False
             def __new__(cls, a, b, *, value=0):
+                # [FUNCTION DOC] HELPER: special method __new__ of C5. Arguments: a, b, value.
+                # Implements the protocol hook used by tests; returns the hook result.
                 self = super().__new__(cls, value)
                 self.a = a
                 self.b = b
                 return self
             @classmethod
             def __getnewargs_ex__(cls):
+                # [FUNCTION DOC] HELPER: special method __getnewargs_ex__ of C5. Implements the
+                # protocol hook used by tests; returns the hook result.
                 return (cls.ARGS, cls.KWARGS)
             def __repr__(self):
+                # [FUNCTION DOC] HELPER: special method __repr__ of C5. Implements the protocol
+                # hook used by tests; returns the hook result.
                 return "C5(%r, %r)<%r>" % (self.a, self.b, int(self))
 
         test_classes = (C1, C2, C3, C4, C5)
@@ -5634,12 +7792,21 @@ class PicklingTests(CPythonTestCase):
                     self._assert_is_copy(obj, objcopy2)
 
     def test_issue24097(self):
+        # [FUNCTION DOC] Test: checks issue24097 behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # Slot name is freed inside __getattr__ and is later used.
         class S(str):  # Not interned
+            # [CLASS DOC] HELPER: local class S defined inside test_issue24097 to exercise
+            # descriptor/class-model behavior under test.
             pass
         class A:
+            # [CLASS DOC] HELPER: local class A defined inside test_issue24097 to exercise
+            # descriptor/class-model behavior under test.
             __slotnames__ = [S('spam')]
             def __getattr__(self, attr):
+                # [FUNCTION DOC] HELPER: special method __getattr__ of A. Arguments: attr.
+                # Implements the protocol hook used by tests; returns the hook result.
                 if attr == 'spam':
                     A.__slotnames__[:] = [S('spam')]
                     return 42
@@ -5651,6 +7818,9 @@ class PicklingTests(CPythonTestCase):
         self.assertEqual(A().__reduce_ex__(2), expected)  # Shouldn't crash
 
     def test_object_reduce(self):
+        # [FUNCTION DOC] Test: checks object reduce behavior. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         # Issue #29914
         # __reduce__() takes no arguments
         object().__reduce__()
@@ -5667,11 +7837,20 @@ class PicklingTests(CPythonTestCase):
 class SharedKeyTests(CPythonTestCase):
 
     @support.cpython_only
+    # [CLASS DOC] Test case for key-sharing instance dictionaries: verifies instance dicts share
+    # keys and sizes behave as expected.
     def test_subclasses(self):
+        # [FUNCTION DOC] Test: checks subclasses behavior. Fails with AssertionError (via unittest
+        # assertions) if the observed behavior differs from CPython semantics; no other side
+        # effects beyond temporary objects and classes.
         # Verify that subclasses can share keys (per PEP 412)
         class A:
+            # [CLASS DOC] HELPER: local class A defined inside test_subclasses to exercise
+            # descriptor/class-model behavior under test.
             pass
         class B(A):
+            # [CLASS DOC] HELPER: local class B defined inside test_subclasses to exercise
+            # descriptor/class-model behavior under test.
             pass
 
         #Shrink keys by repeatedly creating instances
@@ -5691,18 +7870,29 @@ class SharedKeyTests(CPythonTestCase):
 
 
 class DebugHelperMeta(type):
+    # [CLASS DOC] HELPER: metaclass that wraps class creation, setting and deletion of attributes
+    # to debug type attribute caches. Existing docstring says: Sets default __doc__ and simplifies
+    # repr() output.
     """
     Sets default __doc__ and simplifies repr() output.
     """
     def __new__(mcls, name, bases, attrs):
+        # [FUNCTION DOC] HELPER: special method __new__ of DebugHelperMeta. Arguments: mcls, name,
+        # bases, attrs. Implements the protocol hook used by tests; returns the hook result.
         if attrs.get('__doc__') is None:
             attrs['__doc__'] = name  # helps when debugging with gdb
         return type.__new__(mcls, name, bases, attrs)
     def __repr__(cls):
+        # [FUNCTION DOC] HELPER: special method __repr__ of DebugHelperMeta. Implements the
+        # protocol hook used by tests; returns the hook result.
         return repr(cls.__name__)
 
 
 class MroTest(CPythonTestCase):
+    # [CLASS DOC] Test case for method resolution order handling: custom mro methods, invalid mro
+    # results, and mutation of bases. Existing docstring says: Regressions for some bugs revealed
+    # through mcsl.mro() customization (typeobject.c: mro_internal()) and cls.__bases__ assignment
+    # (typeobject.c: type_set_bases()).
     """
     Regressions for some bugs revealed through
     mcsl.mro() customization (typeobject.c: mro_internal()) and
@@ -5710,22 +7900,34 @@ class MroTest(CPythonTestCase):
     """
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: unittest fixture hook setUp; prepares or cleans state for each
+        # test of the class.
         super().setUp()
         self.step = 0
         self.ready = False
 
     def step_until(self, limit):
+        # [FUNCTION DOC] HELPER: step_until of MroTest. Arguments: limit. Supporting routine for
+        # tests; returns a computed value or None.
         ret = (self.step < limit)
         if ret:
             self.step += 1
         return ret
 
     def test_incomplete_set_bases_on_self(self):
+        # [FUNCTION DOC] Test: checks incomplete set bases on self behavior. Docstring:
+        # type_set_bases must be aware that type->tp_mro can be NULL. Fails with AssertionError
+        # (via unittest assertions) if the observed behavior differs from CPython semantics; no
+        # other side effects beyond temporary objects and classes.
         """
         type_set_bases must be aware that type->tp_mro can be NULL.
         """
         class M(DebugHelperMeta):
+            # [CLASS DOC] HELPER: local class M defined inside test_incomplete_set_bases_on_self
+            # to exercise descriptor/class-model behavior under test.
             def mro(cls):
+                # [FUNCTION DOC] HELPER: mro of M. Supporting routine for tests; returns a
+                # computed value or None.
                 if self.step_until(1):
                     assert cls.__mro__ is None
                     cls.__bases__ += ()
@@ -5733,14 +7935,24 @@ class MroTest(CPythonTestCase):
                 return type.mro(cls)
 
         class A(metaclass=M):
+            # [CLASS DOC] HELPER: local class A defined inside test_incomplete_set_bases_on_self
+            # to exercise descriptor/class-model behavior under test.
             pass
 
     def test_reent_set_bases_on_base(self):
+        # [FUNCTION DOC] Test: checks reent set bases on base behavior. Docstring: Deep reentrancy
+        # must not over-decref old_mro. Fails with AssertionError (via unittest assertions) if the
+        # observed behavior differs from CPython semantics; no other side effects beyond temporary
+        # objects and classes.
         """
         Deep reentrancy must not over-decref old_mro.
         """
         class M(DebugHelperMeta):
+            # [CLASS DOC] HELPER: local class M defined inside test_reent_set_bases_on_base to
+            # exercise descriptor/class-model behavior under test.
             def mro(cls):
+                # [FUNCTION DOC] HELPER: mro of M. Supporting routine for tests; returns a
+                # computed value or None.
                 if cls.__mro__ is not None and cls.__name__ == 'B':
                     # 4-5 steps are usually enough to make it crash somewhere
                     if self.step_until(10):
@@ -5749,17 +7961,29 @@ class MroTest(CPythonTestCase):
                 return type.mro(cls)
 
         class A(metaclass=M):
+            # [CLASS DOC] HELPER: local class A defined inside test_reent_set_bases_on_base to
+            # exercise descriptor/class-model behavior under test.
             pass
         class B(A):
+            # [CLASS DOC] HELPER: local class B defined inside test_reent_set_bases_on_base to
+            # exercise descriptor/class-model behavior under test.
             pass
         B.__bases__ += ()
 
     def test_reent_set_bases_on_direct_base(self):
+        # [FUNCTION DOC] Test: checks reent set bases on direct base behavior. Docstring: Similar
+        # to test_reent_set_bases_on_base, but may crash differently. Fails with AssertionError
+        # (via unittest assertions) if the observed behavior differs from CPython semantics; no
+        # other side effects beyond temporary objects and classes.
         """
         Similar to test_reent_set_bases_on_base, but may crash differently.
         """
         class M(DebugHelperMeta):
+            # [CLASS DOC] HELPER: local class M defined inside test_reent_set_bases_on_direct_base
+            # to exercise descriptor/class-model behavior under test.
             def mro(cls):
+                # [FUNCTION DOC] HELPER: mro of M. Supporting routine for tests; returns a
+                # computed value or None.
                 base = cls.__bases__[0]
                 if base is not object:
                     if self.step_until(5):
@@ -5768,13 +7992,25 @@ class MroTest(CPythonTestCase):
                 return type.mro(cls)
 
         class A(metaclass=M):
+            # [CLASS DOC] HELPER: local class A defined inside test_reent_set_bases_on_direct_base
+            # to exercise descriptor/class-model behavior under test.
             pass
         class B(A):
+            # [CLASS DOC] HELPER: local class B defined inside test_reent_set_bases_on_direct_base
+            # to exercise descriptor/class-model behavior under test.
             pass
         class C(B):
+            # [CLASS DOC] HELPER: local class C defined inside test_reent_set_bases_on_direct_base
+            # to exercise descriptor/class-model behavior under test.
             pass
 
     def test_reent_set_bases_tp_base_cycle(self):
+        # [FUNCTION DOC] Test: checks reent set bases tp base cycle behavior. Docstring:
+        # type_set_bases must check for an inheritance cycle not only through MRO of the type,
+        # which may be not yet updated in case of reentrance, but also through tp_base chain,
+        # which is assigned before diving into inner calls to mro(). Fails with AssertionError
+        # (via unittest assertions) if the observed behavior differs from CPython semantics; no
+        # other side effects beyond temporary objects and classes.
         """
         type_set_bases must check for an inheritance cycle not only through
         MRO of the type, which may be not yet updated in case of reentrance,
@@ -5791,7 +8027,11 @@ class MroTest(CPythonTestCase):
         would not be happy in that case, causing a stack overflow.
         """
         class M(DebugHelperMeta):
+            # [CLASS DOC] HELPER: local class M defined inside test_reent_set_bases_tp_base_cycle
+            # to exercise descriptor/class-model behavior under test.
             def mro(cls):
+                # [FUNCTION DOC] HELPER: mro of M. Supporting routine for tests; returns a
+                # computed value or None.
                 if self.ready:
                     if cls.__name__ == 'B1':
                         B2.__bases__ = (B1,)
@@ -5800,10 +8040,16 @@ class MroTest(CPythonTestCase):
                 return type.mro(cls)
 
         class A(metaclass=M):
+            # [CLASS DOC] HELPER: local class A defined inside test_reent_set_bases_tp_base_cycle
+            # to exercise descriptor/class-model behavior under test.
             pass
         class B1(A):
+            # [CLASS DOC] HELPER: local class B1 defined inside test_reent_set_bases_tp_base_cycle
+            # to exercise descriptor/class-model behavior under test.
             pass
         class B2(A):
+            # [CLASS DOC] HELPER: local class B2 defined inside test_reent_set_bases_tp_base_cycle
+            # to exercise descriptor/class-model behavior under test.
             pass
 
         self.ready = True
@@ -5811,6 +8057,13 @@ class MroTest(CPythonTestCase):
             B1.__bases__ += ()
 
     def test_tp_subclasses_cycle_in_update_slots(self):
+        # [FUNCTION DOC] Test: checks tp subclasses cycle in update slots behavior. Docstring:
+        # type_set_bases must check for reentrancy upon finishing its job by updating
+        # tp_subclasses of old/new bases of the type. Otherwise, an implicit inheritance cycle
+        # through tp_subclasses can break functions that recurse on elements of that field (like
+        # recurse_down_subclasses and mro_hierarchy) eventually leading to a stack overflow. Fails
+        # with AssertionError (via unittest assertions) if the observed behavior differs from
+        # CPython semantics; no other side effects beyond temporary objects and classes.
         """
         type_set_bases must check for reentrancy upon finishing its job
         by updating tp_subclasses of old/new bases of the type.
@@ -5820,19 +8073,36 @@ class MroTest(CPythonTestCase):
         leading to a stack overflow.
         """
         class M(DebugHelperMeta):
+            # [CLASS DOC] HELPER: local class M defined inside
+            # test_tp_subclasses_cycle_in_update_slots to exercise descriptor/class-model behavior
+            # under test.
             def mro(cls):
+                # [FUNCTION DOC] HELPER: mro of M. Supporting routine for tests; returns a
+                # computed value or None.
                 if self.ready and cls.__name__ == 'C':
                     self.ready = False
                     C.__bases__ = (B2,)
                 return type.mro(cls)
 
         class A(metaclass=M):
+            # [CLASS DOC] HELPER: local class A defined inside
+            # test_tp_subclasses_cycle_in_update_slots to exercise descriptor/class-model behavior
+            # under test.
             pass
         class B1(A):
+            # [CLASS DOC] HELPER: local class B1 defined inside
+            # test_tp_subclasses_cycle_in_update_slots to exercise descriptor/class-model behavior
+            # under test.
             pass
         class B2(A):
+            # [CLASS DOC] HELPER: local class B2 defined inside
+            # test_tp_subclasses_cycle_in_update_slots to exercise descriptor/class-model behavior
+            # under test.
             pass
         class C(A):
+            # [CLASS DOC] HELPER: local class C defined inside
+            # test_tp_subclasses_cycle_in_update_slots to exercise descriptor/class-model behavior
+            # under test.
             pass
 
         self.ready = True
@@ -5847,14 +8117,27 @@ class MroTest(CPythonTestCase):
         self.assertEqual(C.__subclasses__(), [B1])
 
     def test_tp_subclasses_cycle_error_return_path(self):
+        # [FUNCTION DOC] Test: checks tp subclasses cycle error return path behavior. Docstring:
+        # The same as test_tp_subclasses_cycle_in_update_slots, but tests a code path executed on
+        # error (goto bail). Fails with AssertionError (via unittest assertions) if the observed
+        # behavior differs from CPython semantics; no other side effects beyond temporary objects
+        # and classes.
         """
         The same as test_tp_subclasses_cycle_in_update_slots, but tests
         a code path executed on error (goto bail).
         """
         class E(Exception):
+            # [CLASS DOC] HELPER: local class E defined inside
+            # test_tp_subclasses_cycle_error_return_path to exercise descriptor/class-model
+            # behavior under test.
             pass
         class M(DebugHelperMeta):
+            # [CLASS DOC] HELPER: local class M defined inside
+            # test_tp_subclasses_cycle_error_return_path to exercise descriptor/class-model
+            # behavior under test.
             def mro(cls):
+                # [FUNCTION DOC] HELPER: mro of M. Supporting routine for tests; returns a
+                # computed value or None.
                 if self.ready and cls.__name__ == 'C':
                     if C.__bases__ == (B2,):
                         self.ready = False
@@ -5864,12 +8147,24 @@ class MroTest(CPythonTestCase):
                 return type.mro(cls)
 
         class A(metaclass=M):
+            # [CLASS DOC] HELPER: local class A defined inside
+            # test_tp_subclasses_cycle_error_return_path to exercise descriptor/class-model
+            # behavior under test.
             pass
         class B1(A):
+            # [CLASS DOC] HELPER: local class B1 defined inside
+            # test_tp_subclasses_cycle_error_return_path to exercise descriptor/class-model
+            # behavior under test.
             pass
         class B2(A):
+            # [CLASS DOC] HELPER: local class B2 defined inside
+            # test_tp_subclasses_cycle_error_return_path to exercise descriptor/class-model
+            # behavior under test.
             pass
         class C(A):
+            # [CLASS DOC] HELPER: local class C defined inside
+            # test_tp_subclasses_cycle_error_return_path to exercise descriptor/class-model
+            # behavior under test.
             pass
 
         self.ready = True
@@ -5881,30 +8176,52 @@ class MroTest(CPythonTestCase):
         self.assertEqual(C.__mro__, tuple(type.mro(C)))
 
     def test_incomplete_extend(self):
+        # [FUNCTION DOC] Test: checks incomplete extend behavior. Docstring: Extending an
+        # uninitialized type with type->tp_mro == NULL must throw a reasonable TypeError
+        # exception, instead of failing with PyErr_BadInternalCall. Fails with AssertionError (via
+        # unittest assertions) if the observed behavior differs from CPython semantics; no other
+        # side effects beyond temporary objects and classes.
         """
         Extending an uninitialized type with type->tp_mro == NULL must
         throw a reasonable TypeError exception, instead of failing
         with PyErr_BadInternalCall.
         """
         class M(DebugHelperMeta):
+            # [CLASS DOC] HELPER: local class M defined inside test_incomplete_extend to exercise
+            # descriptor/class-model behavior under test.
             def mro(cls):
+                # [FUNCTION DOC] HELPER: mro of M. Supporting routine for tests; returns a
+                # computed value or None.
                 if cls.__mro__ is None and cls.__name__ != 'X':
                     with self.assertRaises(TypeError):
                         class X(cls):
+                            # [CLASS DOC] HELPER: local class X defined inside mro to exercise
+                            # descriptor/class-model behavior under test.
                             pass
 
                 return type.mro(cls)
 
         class A(metaclass=M):
+            # [CLASS DOC] HELPER: local class A defined inside test_incomplete_extend to exercise
+            # descriptor/class-model behavior under test.
             pass
 
     def test_incomplete_super(self):
+        # [FUNCTION DOC] Test: checks incomplete super behavior. Docstring: Attribute lookup on a
+        # super object must be aware that its target type can be uninitialized (type->tp_mro ==
+        # NULL). Fails with AssertionError (via unittest assertions) if the observed behavior
+        # differs from CPython semantics; no other side effects beyond temporary objects and
+        # classes.
         """
         Attribute lookup on a super object must be aware that
         its target type can be uninitialized (type->tp_mro == NULL).
         """
         class M(DebugHelperMeta):
+            # [CLASS DOC] HELPER: local class M defined inside test_incomplete_super to exercise
+            # descriptor/class-model behavior under test.
             def mro(cls):
+                # [FUNCTION DOC] HELPER: mro of M. Supporting routine for tests; returns a
+                # computed value or None.
                 if cls.__mro__ is None:
                     with self.assertRaises(AttributeError):
                         super(cls, cls).xxx
@@ -5912,23 +8229,38 @@ class MroTest(CPythonTestCase):
                 return type.mro(cls)
 
         class A(metaclass=M):
+            # [CLASS DOC] HELPER: local class A defined inside test_incomplete_super to exercise
+            # descriptor/class-model behavior under test.
             pass
 
     def test_disappearing_custom_mro(self):
+        # [FUNCTION DOC] Test: checks disappearing custom mro behavior. Docstring: gh-92112: A
+        # custom mro() returning a result conflicting with __bases__ and deleting itself caused a
+        # double free. Fails with AssertionError (via unittest assertions) if the observed
+        # behavior differs from CPython semantics; no other side effects beyond temporary objects
+        # and classes.
         """
         gh-92112: A custom mro() returning a result conflicting with
         __bases__ and deleting itself caused a double free.
         """
         class B:
+            # [CLASS DOC] HELPER: local class B defined inside test_disappearing_custom_mro to
+            # exercise descriptor/class-model behavior under test.
             pass
 
         class M(DebugHelperMeta):
+            # [CLASS DOC] HELPER: local class M defined inside test_disappearing_custom_mro to
+            # exercise descriptor/class-model behavior under test.
             def mro(cls):
+                # [FUNCTION DOC] HELPER: mro of M. Supporting routine for tests; returns a
+                # computed value or None.
                 del M.mro
                 return (B,)
 
         with self.assertRaises(TypeError):
             class A(metaclass=M):
+                # [CLASS DOC] HELPER: local class A defined inside test_disappearing_custom_mro to
+                # exercise descriptor/class-model behavior under test.
                 pass
 
 
