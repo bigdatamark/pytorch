@@ -1,3 +1,6 @@
+# [MODULE DOC] Defines Parameter and Buffer tensor subclasses (with metaclasses making isinstance
+# work for custom tensors carrying a flag), the lazy placeholders UninitializedParameter and
+# UninitializedBuffer with their shared mixin, and is_lazy. No import-time side effects.
 from collections import OrderedDict
 from typing import Any
 
@@ -17,8 +20,12 @@ __all__ = [
 
 # Metaclass to combine _TensorMeta and the instance check override for Parameter.
 class _ParameterMeta(torch._C._TensorMeta):
+    # [CLASS DOC] HELPER: Metaclass of Parameter; extends the tensor metaclass so instance checks
+    # against Parameter also accept tensors flagged as parameters.
     # Make `isinstance(t, Parameter)` return True for custom tensor instances that have the _is_param flag.
     def __instancecheck__(self, instance) -> bool:
+        # [FUNCTION DOC] HELPER: For Parameter itself, return True if instance is a tensor with a
+        # true _is_param attribute; otherwise defer to the default check.
         if self is Parameter:
             if isinstance(instance, torch.Tensor) and getattr(
                 instance, "_is_param", False
@@ -28,6 +35,11 @@ class _ParameterMeta(torch._C._TensorMeta):
 
 
 class Parameter(torch.Tensor, metaclass=_ParameterMeta):
+    # [CLASS DOC] Tensor subclass marking a tensor as a module parameter so Module attribute
+    # assignment registers it. Plain tensors are wrapped via a subclass; custom tensor types are
+    # instead detached and flagged with _is_param, so isinstance still works through the
+    # metaclass. Defines deepcopy, repr, pickling (via rebuild helpers, hooks dropped) and
+    # disables __torch_function__ overriding.
     r"""A kind of Tensor that is to be considered a module parameter.
 
     Parameters are :class:`~torch.Tensor` subclasses, that have a
@@ -49,6 +61,10 @@ class Parameter(torch.Tensor, metaclass=_ParameterMeta):
     """
 
     def __new__(cls, data=None, requires_grad=True):
+        # [FUNCTION DOC] Build a Parameter from data (an empty tensor if None) with the given
+        # requires_grad. For a plain Tensor or Parameter, returns a subclass instance sharing the
+        # data. For other tensor types, detaches, sets requires_grad, flags the result as a
+        # parameter and returns it. Raises RuntimeError if detach changes the tensor type.
         if data is None:
             data = torch.empty(0)
         if type(data) is torch.Tensor or type(data) is Parameter:
@@ -72,6 +88,9 @@ class Parameter(torch.Tensor, metaclass=_ParameterMeta):
     # Note: the 3 methods below only apply to standard Tensor. Parameters of custom tensor types
     # are still considered that custom tensor type and these methods will not be called for them.
     def __deepcopy__(self, memo):
+        # [FUNCTION DOC] Return the memoized copy if present; otherwise create a new instance of
+        # the same type from a clone of the data (preserving memory format) and requires_grad,
+        # record it in memo and return it.
         if id(self) in memo:
             return memo[id(self)]
         else:
@@ -83,9 +102,13 @@ class Parameter(torch.Tensor, metaclass=_ParameterMeta):
 
     # pyrefly: ignore [bad-override]
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Return the tensor repr prefixed with a Parameter header line.
         return "Parameter containing:\n" + super().__repr__()
 
     def __reduce_ex__(self, proto):
+        # [FUNCTION DOC] Pickle support: return a rebuild function and arguments (data,
+        # requires_grad, an empty hooks mapping, plus extra instance state when present), so
+        # hooks are never serialized.
         state = torch._utils._get_obj_state(self)
 
         # See Note [Don't serialize hooks]
@@ -106,6 +129,9 @@ class Parameter(torch.Tensor, metaclass=_ParameterMeta):
 
 
 class UninitializedTensorMixin:
+    # [CLASS DOC] Mixin for lazy placeholder tensors (no real data yet). Only an allow-list of
+    # tensor functions works through __torch_function__; others raise ValueError. Subclasses
+    # define cls_to_become, the class the object turns into once materialize is called.
     _allowed_methods = [
         torch.Tensor.__hash__,
         torch.Tensor.size,
@@ -127,6 +153,9 @@ class UninitializedTensorMixin:
     ]
 
     def materialize(self, shape, device=None, dtype=None) -> None:
+        # [FUNCTION DOC] Replace the placeholder data with an uninitialized tensor of the given
+        # shape, on device and dtype (defaulting to the current ones), then switch the object's
+        # class to cls_to_become in place. Mutates self; returns nothing.
         r"""Create a Parameter or Tensor with the same properties of the uninitialized one.
 
         Given a shape, it materializes a parameter in the same device
@@ -150,6 +179,7 @@ class UninitializedTensorMixin:
 
     @property
     def shape(self):
+        # [FUNCTION DOC] Property that always raises RuntimeError: shape is unknown before init.
         raise RuntimeError(
             "Can't access the shape of an uninitialized parameter or buffer. "
             "This error usually happens in `load_state_dict` when trying to load "
@@ -158,6 +188,7 @@ class UninitializedTensorMixin:
         )
 
     def share_memory_(self):
+        # [FUNCTION DOC] Always raises RuntimeError: an uninitialized tensor cannot share memory.
         raise RuntimeError(
             "Can't share memory on an uninitialized parameter or buffer. "
             "Call `forward` to initialize the parameters before calling "
@@ -165,15 +196,21 @@ class UninitializedTensorMixin:
         )
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Return just the class name in angle brackets (no data is shown).
         return f"<{self.__class__.__name__}>"
 
     def __reduce_ex__(self, proto):
+        # [FUNCTION DOC] Pickle support: rebuild by calling the class with requires_grad only.
+        # KNOWN ISSUE: device, dtype and persistent are not preserved across pickling.
         # See Note [Don't serialize hooks]
         # pyrefly: ignore [missing-attribute]
         return (self.__class__, (self.requires_grad,))
 
     @classmethod
     def __torch_function__(cls, func, types, args=(), kwargs=None):
+        # [FUNCTION DOC] Torch-function hook: calls through to the parent implementation when func
+        # is in the allow-list or is a method-wrapper (property access); otherwise raises
+        # ValueError explaining that an uninitialized parameter was used before initialization.
         # method-wrapper is to detect access to Tensor properties that are
         # wrapped in descriptors
         if func in cls._allowed_methods or func.__class__.__name__ == "method-wrapper":
@@ -191,6 +228,7 @@ class UninitializedTensorMixin:
 
 
 def is_lazy(param: Any) -> bool:
+    # [FUNCTION DOC] Return True if param is an uninitialized parameter or buffer, else False.
     """
     Returns whether ``param`` is an ``UninitializedParameter`` or ``UninitializedBuffer``.
 
@@ -202,6 +240,8 @@ def is_lazy(param: Any) -> bool:
 
 # pyrefly: ignore [inconsistent-inheritance]
 class UninitializedParameter(UninitializedTensorMixin, Parameter):
+    # [CLASS DOC] Lazy Parameter placeholder holding an empty tensor; materialize turns it into
+    # a regular Parameter (cls_to_become). Created with requires_grad, device and dtype.
     r"""A parameter that is not initialized.
 
     Uninitialized Parameters are a special case of :class:`torch.nn.Parameter`
@@ -220,12 +260,16 @@ class UninitializedParameter(UninitializedTensorMixin, Parameter):
     cls_to_become = Parameter
 
     def __new__(cls, requires_grad=True, device=None, dtype=None) -> None:
+        # [FUNCTION DOC] Create an empty tensor on device/dtype and return it as an instance of
+        # this class with the given requires_grad (the None return annotation is inaccurate).
         factory_kwargs = {"device": device, "dtype": dtype}
         data = torch.empty(0, **factory_kwargs)
         # pyrefly: ignore [bad-return]
         return torch.Tensor._make_subclass(cls, data, requires_grad)
 
     def __deepcopy__(self, memo):
+        # [FUNCTION DOC] Return the memoized copy if present; otherwise create a new placeholder
+        # of the same type with the same requires_grad, device and dtype, memoize and return it.
         if id(self) in memo:
             return memo[id(self)]
         else:
@@ -236,8 +280,12 @@ class UninitializedParameter(UninitializedTensorMixin, Parameter):
 
 # Metaclass to combine _TensorMeta and the instance check override for Buffer.
 class _BufferMeta(torch._C._TensorMeta):
+    # [CLASS DOC] HELPER: Metaclass of Buffer; makes instance checks against Buffer also accept
+    # tensors flagged as buffers.
     # Make `isinstance(t, Buffer)` return True for custom tensor instances that have the _is_buffer flag.
     def __instancecheck__(self, instance) -> bool:
+        # [FUNCTION DOC] HELPER: For Buffer itself, return True if instance is a tensor with a
+        # true _is_buffer attribute; otherwise defer to the default check.
         if self is Buffer:
             if isinstance(instance, torch.Tensor) and getattr(
                 instance, "_is_buffer", False
@@ -247,6 +295,10 @@ class _BufferMeta(torch._C._TensorMeta):
 
 
 class Buffer(torch.Tensor, metaclass=_BufferMeta):
+    # [CLASS DOC] Tensor marker for module buffers (non-parameter state). Construction returns a
+    # detached tensor carrying persistent and _is_buffer attributes rather than a Buffer
+    # instance, and isinstance works through the metaclass. Module registers such tensors as
+    # buffers on attribute assignment.
     r"""A kind of Tensor that should not be considered a model
     parameter. For example, BatchNorm's ``running_mean`` is not a parameter, but is part of the module's state.
 
@@ -264,6 +316,9 @@ class Buffer(torch.Tensor, metaclass=_BufferMeta):
     """
 
     def __new__(cls, data=None, *, persistent=True):
+        # [FUNCTION DOC] Detach data (an empty tensor if None) keeping its requires_grad, set the
+        # persistent and _is_buffer attributes on the result and return it (a tensor of data's
+        # type, not an instance of Buffer).
         if data is None:
             data = torch.empty(0)
 
@@ -279,6 +334,8 @@ class Buffer(torch.Tensor, metaclass=_BufferMeta):
 
 
 class UninitializedBuffer(UninitializedTensorMixin, torch.Tensor):
+    # [CLASS DOC] Lazy buffer placeholder holding an empty tensor, flagged as a buffer with a
+    # persistent attribute; materialize turns it into a regular Tensor (cls_to_become).
     r"""A buffer that is not initialized.
 
     Uninitialized Buffer is a special case of :class:`torch.Tensor`
@@ -299,6 +356,9 @@ class UninitializedBuffer(UninitializedTensorMixin, torch.Tensor):
     def __new__(
         cls, requires_grad=False, device=None, dtype=None, persistent=True
     ) -> None:
+        # [FUNCTION DOC] Create an empty tensor on device/dtype, return it as an instance of this
+        # class with the given requires_grad, and set its persistent and _is_buffer attributes
+        # (the None return annotation is inaccurate).
         factory_kwargs = {"device": device, "dtype": dtype}
         data = torch.empty(0, **factory_kwargs)
         ret = torch.Tensor._make_subclass(cls, data, requires_grad)

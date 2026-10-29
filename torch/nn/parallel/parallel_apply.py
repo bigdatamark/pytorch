@@ -1,3 +1,6 @@
+# [MODULE DOC] Multi-threaded replica execution for DataParallel. Exports get_a_var (find a tensor
+# inside nested containers) and parallel_apply (run one module replica per device in threads and
+# collect outputs). No import-time side effects.
 import threading
 from collections.abc import Sequence
 from typing import Any, cast
@@ -14,6 +17,9 @@ __all__ = ["get_a_var", "parallel_apply"]
 def get_a_var(
     obj: torch.Tensor | list[Any] | tuple[Any, ...] | dict[Any, Any],
 ) -> torch.Tensor | None:
+    # [FUNCTION DOC] Return the first tensor found by depth-first search of obj, which may be a
+    # tensor or a nested list, tuple or dict (dicts are searched through their key/value pairs).
+    # Returns None if no tensor exists. No side effects.
     if isinstance(obj, torch.Tensor):
         return obj
 
@@ -34,6 +40,12 @@ def parallel_apply(
     kwargs_tup: Sequence[dict[str, Any]] | None = None,
     devices: Sequence[int | torch.device | None] | None = None,
 ) -> list[Any]:
+    # [FUNCTION DOC] Run each module on its matching input (and kwargs/device), one thread per
+    # replica when there is more than one module, and return the outputs in module order.
+    # Raises an AssertionError if the lengths of modules, inputs, kwargs_tup or devices differ, or
+    # if no accelerator is available. Devices are resolved to indices and each replica runs under
+    # its device, current stream and the caller's autocast setting; grad mode is copied into each
+    # thread. A replica failure is captured and re-raised in the caller after all threads join.
     r"""Apply each `module` in :attr:`modules` in parallel on each of :attr:`devices`.
 
     Args:
@@ -87,6 +99,11 @@ def parallel_apply(
         device: int | torch.device | None = None,
         stream: torch.Stream | None = None,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Thread body for one replica. Sets grad mode, resolves the device
+        # from the input's first tensor if none was given (storing an ExceptionWrapper if none is
+        # found), runs the module with positional inputs under device/stream/autocast, and stores
+        # the output, or an ExceptionWrapper on any exception, in the shared results mapping
+        # under the lock.
         torch.set_grad_enabled(grad_enabled)
         if device is None:
             t = get_a_var(input)

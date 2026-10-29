@@ -1,3 +1,6 @@
+# [MODULE DOC] Implements replicate, which creates per-device copies of a module tree for
+# DataParallel by broadcasting parameters and buffers and rewiring submodules, plus private
+# helpers for TorchScript detection and coalesced broadcasting. No import-time side effects.
 from collections import OrderedDict
 from collections.abc import Iterator, Sequence
 from typing import cast, TYPE_CHECKING, TypeVar
@@ -19,24 +22,28 @@ __all__ = ["replicate"]
 
 
 def _is_script_module(module: Module) -> TypeIs["ScriptModule"]:
+    # [FUNCTION DOC] HELPER: Return True if module is a TorchScript ScriptModule (lazy jit import).
     import torch.jit
 
     return isinstance(module, torch.jit.ScriptModule)
 
 
 def _is_script_method(module: object) -> TypeIs["ScriptMethod"]:
+    # [FUNCTION DOC] HELPER: Return True if module is a TorchScript ScriptMethod (lazy jit import).
     import torch.jit
 
     return isinstance(module, torch._C.ScriptMethod)
 
 
 def _init_script_module() -> "ScriptModule":
+    # [FUNCTION DOC] HELPER: Construct and return a new empty ScriptModule (lazy jit import).
     import torch.jit
 
     return torch.jit.ScriptModule()
 
 
 def _is_jit_enabled() -> "EnabledProxy":
+    # [FUNCTION DOC] HELPER: Return the jit enabled-state proxy object (truthy when jit is on).
     import torch.jit._state
 
     return torch.jit._state._enabled
@@ -50,8 +57,14 @@ def _is_jit_enabled() -> "EnabledProxy":
 # currently a module cannot be replicated properly if the descendants of
 # any ScriptModule contains python module (type 1 above)
 def _replicatable_module(module: Module, memo: set[Module] | None = None) -> bool:
+    # [FUNCTION DOC] HELPER: Return whether module can be replicated. Always True when jit is
+    # disabled. A ScriptModule is replicable only if all its descendants are also ScriptModules;
+    # a plain module is replicable if all its children are, recursively. The memo set collects
+    # visited modules (mutated in place) so shared children are checked once.
     # module.modules() contains module itself as the first element
     def descendant_modules(module: Module) -> Iterator[Module]:
+        # [FUNCTION DOC] HELPER: Return an iterator over all submodules of module, excluding
+        # module itself.
         gen = module.modules()
         next(gen)
         return gen
@@ -85,6 +98,11 @@ def _broadcast_coalesced_reshape(
     devices: Sequence[int | torch.device],
     detach: bool = False,
 ) -> list[list[torch.Tensor]]:
+    # [FUNCTION DOC] HELPER: Broadcast tensors to every device and return, per device, the list
+    # of copies in the input order (empty list for no tensors). With detach, uses coalesced
+    # broadcast without autograd and converts real-view copies of complex tensors back to complex
+    # (uninitialized parameters are skipped in the complex check). Without detach, uses the
+    # autograd Broadcast function so gradients flow back to the originals.
     from torch.nn.parallel._functions import Broadcast
 
     if len(tensors) == 0:
@@ -120,6 +138,13 @@ def replicate(
     devices: Sequence[int | torch.device],
     detach: bool = False,
 ) -> list[T]:
+    # [FUNCTION DOC] Create one replica of network per device and return the list of root
+    # replicas (empty if devices is empty). Parameters and buffers are broadcast to each device
+    # (buffers needing grad stay on the autograd path unless detach is set); each submodule is
+    # shallow-copied via its data-parallel replicate hook, children, parameters and buffers are
+    # re-linked to the per-device copies, and replica parameters are set as plain tensor
+    # attributes (non-leaf) while _former_parameters records them for DDP.
+    # Raises RuntimeError if a python module is a descendant of a ScriptModule.
     if not _replicatable_module(network):
         raise RuntimeError(
             "Cannot replicate network where python modules are children of ScriptModule"
