@@ -1,3 +1,9 @@
+# [MODULE DOC] Grab-bag of shared utilities for TorchInductor: GPU/device detection, benchmarking via the
+# profiler, sympy helpers (index flattening, alignment, ceil-div), dtype and shape conversion, FX graph
+# helpers, config-dependent feature predicates (autotuning, fusion, tensor-core and TMA support),
+# caching and subprocess helpers, and misc codegen support types (IndentedBuffer re-exports, GraphPartitionMap).
+# Import-time side effects: constructs module constants (alignment sizes, GPU kernel extensions, logger),
+# reads the TORCHINDUCTOR_XPU_KERNEL_FORMAT environment variable, and raises if ALIGN_BYTES is not a power of two.
 from __future__ import annotations
 
 import collections
@@ -112,6 +118,9 @@ T = TypeVar("T")
 # when get_gpu_type is imported from dynamo
 @functools.cache
 def get_gpu_type() -> str:
+    # [FUNCTION DOC] Return the name of the single available GPU backend among cuda, mps, xpu, mtia, defaulting to
+    # "cuda" when none is available. Cached. Raises AssertionError if more than one backend is available.
+    # Defined before the dynamo imports to avoid a circular import.
     avail_gpus = [x for x in GPU_TYPES if getattr(torch, x).is_available()]
     if not len(avail_gpus) <= 1:
         raise AssertionError(
@@ -199,11 +208,14 @@ if not ((ALIGN_BYTES & (ALIGN_BYTES - 1)) == 0 and ALIGN_BYTES >= 8):
 
 
 def _align(nbytes: int) -> int:
+    # [FUNCTION DOC] HELPER: Round a byte count up to the next multiple of ALIGN_BYTES using bit masking; returns an int.
     """Round up to the nearest multiple of ALIGN_BYTES"""
     return (nbytes + ALIGN_BYTES - 1) & -ALIGN_BYTES
 
 
 def _is_aligned(v: sympy.Expr) -> bool:
+    # [FUNCTION DOC] HELPER: Return True if the sympy expression is statically provable to be a multiple of ALIGN_BYTES.
+    # Sums and maxima are aligned if all their arguments are; an align() application or a gcd equal to ALIGN_BYTES also qualifies.
     """v can be statically proven to be a multiple of ALIGN_BYTES"""
     if isinstance(v, (sympy.Add, sympy.Max, Max)):
         return all(map(_is_aligned, v.args))
@@ -211,6 +223,8 @@ def _is_aligned(v: sympy.Expr) -> bool:
 
 
 class align(sympy.Function):
+    # [CLASS DOC] Symbolic sympy function (one integer argument, integer valued) that rounds its argument up to a
+    # multiple of ALIGN_BYTES. Concrete integers are evaluated eagerly; already-aligned expressions pass through.
     """Symbolically round up to the nearest multiple of ALIGN_BYTES"""
 
     nargs = (1,)
@@ -218,6 +232,8 @@ class align(sympy.Function):
 
     @classmethod
     def eval(cls, value: sympy.Expr) -> sympy.Expr | None:
+        # [FUNCTION DOC] Sympy evaluation hook. Returns the aligned integer for concrete integers, the value itself if it is
+        # provably aligned, and otherwise None so the symbolic align application stays unevaluated.
         if isinstance(value, (int, sympy.Integer)):
             return _align(int(value))
         if _is_aligned(value):
@@ -226,6 +242,9 @@ class align(sympy.Function):
 
 @dataclasses.dataclass(frozen=True)
 class GraphPartitionMap:
+    # [CLASS DOC] Frozen record describing one graph partition: its unique id, the mapping from partition input indices
+    # to graph input indices (None when not a graph input), the mapping from partition output indices to lists of graph
+    # output indices (several graph outputs may alias one partition output), and the names of constants it reads or writes.
     """
     Mapping from the partition info (e.g., input/output) to the graph info
     """
@@ -246,6 +265,10 @@ class GraphPartitionMap:
 
 
 def fp8_bench(fn: Callable[[], Any], warmup: int = 25, rep: int = 100) -> float:
+    # [FUNCTION DOC] Benchmark fn on CUDA by examining torch profiler events; returns mean time in milliseconds.
+    # Runs fn once, estimates runtime from five L2-cache-clearing runs to pick warmup/repeat counts, then times each
+    # repeat with CUDA events under the profiler. Subtracts the mean device time of profiled fused_abs_max kernels
+    # when present. Logs profiler tables at debug level. Requires CUDA; side effects: synchronizes the device and allocates a 256MB cache buffer.
     """
     Returns benchmark results by examining torch profiler events.
     This could be more accurate as it doesn't count CPU side overhead.
@@ -325,6 +348,9 @@ def do_bench_using_profiling(
     rep: int = 100,
     is_vetted_benchmarking: bool = False,
 ) -> float:
+    # [FUNCTION DOC] Public entry point for profiler-based device benchmarking. Lazily imports the benchmarking runtime
+    # (avoids CUDA initialization at import time), wraps the private implementation in the GPU benchmark lock and the
+    # benchmarking-distortion guard, and returns the time in milliseconds.
     # We did't use decorator may_distort_benchmarking_result directly since that
     # requires us to import torch._inductor.runtime.benchmarking into global scope.
     # Importing torch._inductor.runtime.benchmarking will cause cuda initialization
@@ -353,9 +379,14 @@ def _get_do_bench_profile_result(
     n_repeat: int,
     expected_device_type: DeviceType,
 ) -> float:
+    # [FUNCTION DOC] HELPER: Compute the average per-run device time in milliseconds from profiler data.
+    # Collects ids of all CPU events (and their descendants) belonging to the benchmark record_function events, then sums
+    # duration of kineto device events of the expected device type linked to those ids (skipping user annotations and
+    # context sync). Raises RuntimeError if the number of benchmark events differs from n_repeat or no device time was captured.
     benchmark_event_ids: OrderedSet[int] = OrderedSet()
 
     def collect_cpu_event_ids(event: Any) -> None:
+        # [FUNCTION DOC] HELPER: Recursively add the id of a CPU profiler event and all its CPU children to the enclosing benchmark_event_ids set.
         if event.device_type != DeviceType.CPU:
             return
 
@@ -410,6 +441,10 @@ def _do_bench_using_profiling(
     rep: int = 100,
     is_vetted_benchmarking: bool = False,
 ) -> float:
+    # [FUNCTION DOC] HELPER: Benchmark fn by profiling device events; returns mean device time per call in milliseconds.
+    # Unless vetted, first calls may_ban_benchmarking. Warms up, clears an L2-sized buffer before each timed call, wraps
+    # each call in a named record_function, and derives time via _get_do_bench_profile_result. Synchronizes the device and
+    # logs profiler output at debug level. Raises RuntimeError if profiler events are missing.
     """
     Returns benchmark results by examining torch profiler events.
     This could be more accurate as it doesn't count CPU side overhead.
@@ -487,6 +522,9 @@ def _do_bench_using_profiling(
 
 @functools.cache
 def has_torchvision_roi_align() -> bool:
+    # [FUNCTION DOC] Cached check whether torchvision roi_align is importable and registered under torch.ops.
+    # Returns False on ImportError or when the torchvision::nms operator does not exist; any other RuntimeError is
+    # re-raised as AssertionError.
     try:
         from torchvision.ops import roi_align
 
@@ -503,6 +541,8 @@ def has_torchvision_roi_align() -> bool:
 
 
 def decode_device(device: torch.device | None | str) -> torch.device:
+    # [FUNCTION DOC] Normalize a device spec into a torch.device. None yields the default device (device of a new
+    # tensor); strings are parsed; non-cpu/meta devices without an index get the current device index from the device interface.
     if device is None:
         return torch.tensor(0.0).device  # default device
     if isinstance(device, str):
@@ -514,10 +554,12 @@ def decode_device(device: torch.device | None | str) -> torch.device:
 
 
 def sympy_product(it: Iterable[sympy.Expr]) -> sympy.Expr:
+    # [FUNCTION DOC] Multiply an iterable of sympy expressions together, starting from one; returns a sympy expression.
     return functools.reduce(operator.mul, it, sympy.S.One)
 
 
 def sympy_dot(seq1: Sequence[sympy.Expr], seq2: Sequence[sympy.Expr]) -> sympy.Expr:
+    # [FUNCTION DOC] Sympy dot product of two equal-length sequences, returned expanded. Raises AssertionError on length mismatch.
     if not len(seq1) == len(seq2):
         raise AssertionError(
             f"Length mismatch: len(seq1)={len(seq1)}, len(seq2)={len(seq2)}"
@@ -529,6 +571,8 @@ def flatten_index(
     indices: Sequence[sympy.Expr],
     sizes: Sequence[sympy.Expr],
 ) -> sympy.Expr:
+    # [FUNCTION DOC] Row-major flatten of per-dimension indices into one flat sympy index using the given sizes.
+    # Raises AssertionError if the lengths differ.
     """Row-major flatten: per-dimension indices -> flat index."""
     if len(indices) != len(sizes):
         raise AssertionError(
@@ -545,6 +589,8 @@ def decompose_index(
     index: sympy.Expr,
     sizes: Sequence[sympy.Expr],
 ) -> list[sympy.Expr]:
+    # [FUNCTION DOC] Inverse of flatten_index: decompose a flat index into per-dimension indices (row-major), each a
+    # ModularIndexing of the index by the product of trailing sizes and the dimension size.
     """Row-major decomposition: flat index -> per-dimension indices."""
     return [
         ModularIndexing(index, sympy_product(sizes[i + 1 :]), size)
@@ -553,10 +599,13 @@ def decompose_index(
 
 
 def unique(it: Iterable[_T]) -> ValuesView[_T]:
+    # [FUNCTION DOC] Return the distinct objects of an iterable, de-duplicated by object identity (not equality), as a values view.
     return {id(x): x for x in it}.values()
 
 
 def ceildiv(number: int | sympy.Expr, denom: int | sympy.Expr) -> int | sympy.Expr:
+    # [FUNCTION DOC] Ceiling division. If either operand is a sympy expression returns a symbolic CeilDiv; otherwise both must be
+    # ints (AssertionError if not) and the runtime integer ceildiv is used.
     if isinstance(number, sympy.Expr) or isinstance(denom, sympy.Expr):
         return CeilDiv(sympy.sympify(number), sympy.sympify(denom))
     # TODO: There is a bug in a call to this function, to repro:
@@ -568,6 +617,9 @@ def ceildiv(number: int | sympy.Expr, denom: int | sympy.Expr) -> int | sympy.Ex
 
 
 def _type_of(key: torch.dtype | None) -> str:
+    # [FUNCTION DOC] HELPER: Map a torch dtype (or None, or an already-Triton type string) to a Triton pointer type string such as
+    # "*fp32". None maps to "*i8" (null pointer). Strings are returned unchanged. Raises KeyError for unsupported dtypes.
+    # Avoids depending on Triton at codegen time.
     # Use the function here to get rid of dependencies on the Triton during the codegen.
     # Refer to Triton implementation here:
     # https://github.com/triton-lang/triton/blob/98b5945d2aef679e00ebca8e07c35c3658ec76de/python/triton/runtime/jit.py#L238
@@ -610,6 +662,7 @@ def _type_of(key: torch.dtype | None) -> str:
 def convert_shape_to_inductor(
     lst: Iterable[int | torch.SymInt],
 ) -> list[sympy.Expr]:
+    # [FUNCTION DOC] Convert an iterable of ints or SymInts into a list of sympy expressions via sympify.
     """
     Gets the shape and stride of a tensor. For non-symbolic tensors, this is
     trivial. But for symbolic tensors, we need to map from SymIntNode into
@@ -619,6 +672,7 @@ def convert_shape_to_inductor(
 
 
 def convert_symint_to_expr(val: int | torch.SymInt) -> int | sympy.Expr:
+    # [FUNCTION DOC] Convert a SymInt to its underlying sympy expression, leaving plain ints unchanged (unlike sympify, which would wrap ints).
     """
     Convert SymInt to sympy.Expr, leave int as is.
 
@@ -631,6 +685,8 @@ def convert_symint_to_expr(val: int | torch.SymInt) -> int | sympy.Expr:
 
 
 def convert_to_symint(i: int | sympy.Expr) -> int | torch.SymInt:
+    # [FUNCTION DOC] Convert a single int or sympy expression to an int or SymInt. ints pass through, sympy Integers become ints,
+    # and other expressions become a SymInt created from the current graph's shape env (requires the V.graph virtualized context).
     """
     Like convert_shape_to_symint, but operates on a single expression.
     """
@@ -650,6 +706,7 @@ def convert_to_symint(i: int | sympy.Expr) -> int | torch.SymInt:
 def convert_shape_to_symint(
     lst: Iterable[int | sympy.Expr],
 ) -> list[int | torch.SymInt]:
+    # [FUNCTION DOC] Convert a list of Inductor shapes (ints or sympy expressions) into ints or SymInts, elementwise.
     """
     Takes a list of shapes from Inductor and converts them into symints (or just
     ints if all shapes are static).
@@ -658,6 +715,7 @@ def convert_shape_to_symint(
 
 
 def is_view(op: torch._ops.OpOverload) -> bool:
+    # [FUNCTION DOC] Return True if any argument of the op overload's schema carries alias info (i.e. the op may alias its inputs).
     """
     Does this op overload have aliasing
     """
@@ -668,6 +726,9 @@ def is_pointwise_use(
     use: Node,
     is_pointwise_fn: Callable[[torch._ops.OpOverload], bool] = lambda _: False,
 ) -> bool:
+    # [FUNCTION DOC] Recursively decide whether all uses of an FX node are pointwise. The use must be a call_function whose target
+    # is an OpOverload or getitem. Views and getitem recurse into their users; otherwise the op must carry the pointwise tag or satisfy
+    # the optional is_pointwise_fn predicate. Returns False for non-call_function or non-op targets.
     """
     Do all uses of this op have torch.Tag.pointwise or return True for optional `is_pointwise_fn`
 
@@ -691,10 +752,14 @@ def is_pointwise_use(
 def gen_gm_and_inputs(
     target: Any, args: list[Any], kwargs: dict[str, Any]
 ) -> tuple[GraphModule, list[torch.Tensor]]:
+    # [FUNCTION DOC] Build a one-node FX GraphModule that calls target with the given args and kwargs. Every tensor found in
+    # (args, kwargs) becomes a placeholder named arg1, arg2, ...; non-tensors are embedded as constants. If the target's schema has
+    # exactly one Tensor return, the output is wrapped in a one-tuple. Returns the module and the list of tensor inputs in placeholder order.
     g = torch.fx.Graph()
     graph_args: list[torch.Tensor] = []
 
     def add_tensor_arg(arg: torch.Tensor) -> Node:
+        # [FUNCTION DOC] HELPER: Record a tensor in graph_args and return a new FX placeholder node for it.
         graph_args.append(arg)
         return g.placeholder(f"arg{len(graph_args)}")
 
@@ -713,6 +778,7 @@ def gen_gm_and_inputs(
 
 
 def synchronize(device: str = "cuda") -> None:
+    # [FUNCTION DOC] Synchronize the given device type via its device interface; no-op for "cpu" or when the device is unavailable.
     if device == "cpu":
         return
     device_interface = get_interface_for_device(device)
@@ -726,6 +792,8 @@ def timed(
     times: int = 1,
     device: str = "cuda",
 ) -> float:
+    # [FUNCTION DOC] Time running model on example_inputs the given number of times; returns elapsed wall seconds.
+    # Synchronizes before and after each call, seeds the RNG with 1337 first, and raises AssertionError if the model result is None.
     synchronize(device)
     torch.manual_seed(1337)
     t0 = time.perf_counter()
@@ -747,6 +815,8 @@ def print_performance(
     baseline: float = 1.0,
     device: str = "cuda",
 ) -> float:
+    # [FUNCTION DOC] Time model repeatedly (repeat rounds of times calls), print the median per-call time divided by baseline with six decimals,
+    # and return the median per-call time as a float.
     timings = torch.tensor(
         [timed(model, example_inputs, times, device) for _ in range(repeat)]
     )
@@ -756,22 +826,27 @@ def print_performance(
 
 
 def precompute_method(obj: Any, method: str) -> None:
+    # [FUNCTION DOC] HELPER: Call a no-argument method once on obj and replace it on the instance with a function returning that cached result. Mutates obj.
     """Replace obj.method() with a new method that returns a precomputed constant."""
     result = getattr(obj, method)()
     setattr(obj, method, lambda: result)
 
 
 def precompute_methods(obj: Any, methods: list[str]) -> None:
+    # [FUNCTION DOC] HELPER: Apply precompute_method to each named method of obj.
     """Replace methods with new methods that returns a precomputed constants."""
     for method in methods:
         precompute_method(obj, method)
 
 
 def cmp(a: int, b: int) -> int:
+    # [FUNCTION DOC] HELPER: Three-way comparison returning 1, 0 or -1 for a greater than, equal to, or less than b.
     return int(a > b) - int(a < b)
 
 
 def pad_listlike(x: int | Sequence[int], size: int) -> Sequence[int]:
+    # [FUNCTION DOC] Expand a scalar int into a list repeated size times; a length-one sequence is repeated to size (keeping its
+    # container type); any other sequence is returned unchanged.
     if isinstance(x, int):
         return [x] * size
     if len(x) == 1:
@@ -781,10 +856,13 @@ def pad_listlike(x: int | Sequence[int], size: int) -> Sequence[int]:
 
 # Used to ensure that iterating over a set is deterministic
 def tuple_sorted(x: tuple[_T, ...]) -> list[_T]:
+    # [FUNCTION DOC] Return a list of the elements of a tuple sorted by name, for deterministic ordering. Elements are strings or
+    # scheduler nodes (sorted by get_name); other types raise AssertionError. Empty input returns an empty list.
     if len(x) == 0:
         return []
 
     def sort_func(elem: _T) -> str:
+        # [FUNCTION DOC] HELPER: Sort key: the string itself, or the name of a BaseSchedulerNode; raises AssertionError for other types.
         if isinstance(elem, str):
             return elem
 
@@ -803,6 +881,8 @@ FN_TYPE = Callable[Concatenate[Any, P], RV]
 
 
 class CachedMethod(Protocol, Generic[P, RV]):
+    # [CLASS DOC] Typing protocol describing a method wrapped by cache_on_self: it is callable like the original method and has a
+    # static clear_cache(instance) member that drops the cached value. Both members are one-line stubs.
     @staticmethod
     def clear_cache(cache: Any) -> None: ...
 
@@ -811,6 +891,9 @@ class CachedMethod(Protocol, Generic[P, RV]):
 
 # See https://github.com/python/mypy/issues/13222#issuecomment-1193073470 to understand the type signature
 def cache_on_self(fn: Callable[Concatenate[Any, P], RV]) -> CachedMethod[P, RV]:
+    # [FUNCTION DOC] Decorator that caches the result of a zero-argument method on the instance. The value is stored under a name-mangled
+    # attribute set with object.__setattr__ (works on frozen objects); the wrapper is built with exec for speed on hot paths. The returned
+    # wrapper gains a clear_cache attribute that deletes the cached attribute from an instance. Only self is passed, so methods with other args are unsupported.
     name = fn.__name__
     key = f"__{name}_cache"
 
@@ -832,6 +915,7 @@ def cache_on_self(fn: Callable[Concatenate[Any, P], RV]) -> CachedMethod[P, RV]:
     wrapper = functools.wraps(fn)(ctx[f"{name}_cache_on_self"])
 
     def clear_cache(self: Any) -> None:
+        # [FUNCTION DOC] HELPER: Delete the cached attribute from the instance if present.
         if hasattr(self, key):
             delattr(self, key)
 
@@ -842,6 +926,7 @@ def cache_on_self(fn: Callable[Concatenate[Any, P], RV]) -> CachedMethod[P, RV]:
 def cache_property_on_self(
     fn: Callable[Concatenate[Any, P], RV],
 ) -> CachedMethod[P, RV]:
+    # [FUNCTION DOC] Alias of cache_on_self for properties; differs only in its type signature.
     """
     Variant of cache_on_self for properties. The only difference is the type signature.
     """
@@ -852,11 +937,15 @@ def cache_property_on_self(
 def cache_on_self_and_args(
     class_name: str,
 ) -> Callable[[FN_TYPE[P, RV]], FN_TYPE[P, RV]]:
+    # [FUNCTION DOC] Decorator factory caching a method's result per instance keyed by its call arguments (args and sorted kwargs, which must
+    # be hashable). The key includes class_name and function name so super() calls do not collide. Returns a decorator whose wrapped
+    # function also exposes clear_cache to drop the per-instance cache.
     # include both class_name and fn_name in the key to support `super().fn(self, **args, **kwargs)` calls.
 
     def wrapper(
         fn: FN_TYPE[P, RV],
     ) -> FN_TYPE[P, RV]:
+        # [FUNCTION DOC] HELPER: Decorator body; builds the exec-generated caching wrapper for fn and attaches clear_cache.
         key = f"__{class_name}_{fn.__name__}_cache"
 
         # wrapper is likely on the hot path, compile a specialized version of it
@@ -886,6 +975,7 @@ def cache_on_self_and_args(
         inner = functools.wraps(fn)(ctx["inner"])
 
         def clear_cache(self: Any) -> None:
+            # [FUNCTION DOC] HELPER: Delete the per-instance argument cache attribute if present.
             if hasattr(self, key):
                 delattr(self, key)
 
@@ -898,6 +988,8 @@ def cache_on_self_and_args(
 def aggregate_origins(
     node_schedule: Sequence[BaseSchedulerNode] | ExternKernel,
 ) -> OrderedSet[Node]:
+    # [FUNCTION DOC] Collect the FX origin nodes behind a node schedule. For a list of scheduler nodes, returns the union of the origins of
+    # each node's underlying IR node (skipping nodes without one); for an ExternKernel returns its origins; otherwise an empty set.
     from . import ir
 
     if isinstance(node_schedule, list):
@@ -921,10 +1013,14 @@ def get_fused_kernel_name(
     node_schedule: Sequence[BaseSchedulerNode],
     descriptive_names: Literal[True, "torch", "original_aten", "inductor_node"],
 ) -> str:
+    # [FUNCTION DOC] Build a fused kernel name "fused_..." from the origins of the schedule. descriptive_names selects the source: original_aten
+    # (top-level aten op names), torch (source function names, with a backward suffix for backward nodes) or inductor_node (FX node names);
+    # anything else raises NotImplementedError. On Windows names over 50 chars are truncated and suffixed with an 8 char sha256 hash to stay under MAX_PATH.
     all_origins = aggregate_origins(node_schedule)
     if descriptive_names == "original_aten":
 
         def get_origin_meta_str(origin):
+            # [FUNCTION DOC] HELPER: Return the op name (overload packet name or higher-order-op name) of an origin's original_aten metadata, or empty string.
             original_aten = origin.meta["original_aten"]
             key = ""
             if isinstance(original_aten, torch._ops.OpOverload):
@@ -984,6 +1080,11 @@ def get_kernel_metadata(
     node_schedule: Sequence[BaseSchedulerNode] | ExternKernel,
     wrapper: PythonWrapperCodegen,
 ) -> tuple[str, str]:
+    # [FUNCTION DOC] Produce comment text describing a kernel. Returns (metadata, detailed_metadata): metadata is a one-line summary of source
+    # nodes and original ATen ops; detailed metadata lists the source-to-ATen mapping and, if all origins share one FX graph, a graph fragment with
+    # placeholder lines for deduplicated reads, formatted FX nodes (split per line on ROCm) and a return line of written buffers. Every line is
+    # prefixed with the wrapper's comment string. Origins are sorted topologically when from a single graph (cached on the graph object).
+    # Side effect: may set a private index-map attribute on the FX graph.
     """
     Retrieves metadata information for a kernel.
     Args:
@@ -1062,6 +1163,7 @@ def get_kernel_metadata(
             def get_buffer_info(
                 buffer: ir.TensorBox | ir.Buffer | ir.TorchBindObject, rw_name: str
             ) -> tuple[str, ir.Layout | None]:
+                # [FUNCTION DOC] HELPER: Return the display name (origin node name, else the given read/write name) and the layout (None if unavailable) of a buffer.
                 if isinstance(buffer, ir.TensorBox) and isinstance(
                     buffer.data, ir.StorageBox
                 ):
@@ -1080,9 +1182,12 @@ def get_kernel_metadata(
                 return name, layout
 
             def stringify_shape(shape: Iterable[int]) -> str:
+                # [FUNCTION DOC] HELPER: Render a shape as a bracketed comma-separated string.
                 return f"[{', '.join([str(x) for x in shape])}]"
 
             def stringfy_layout(layout: ir.Layout | None) -> str:
+                # [FUNCTION DOC] HELPER: Render a layout as a quoted string of dtype abbreviation, size, stride and device; empty string for None.
+                # Under compile-on-one-rank mode only the device type is shown so output is identical across ranks.
                 if layout is None:
                     return ""
                 shape_annotation = f"{stringify_shape(layout.size)}"
@@ -1155,6 +1260,8 @@ def dominated_nodes(
     initial_queue: Iterable[torch.fx.Node],
     skip_filter: Callable[[Any], bool] | None = None,
 ) -> OrderedSet[torch.fx.Node]:
+    # [FUNCTION DOC] Return the ordered set of FX nodes transitively dependent on (users of) the initial nodes, including the initial nodes.
+    # Users for which skip_filter returns True are not added or traversed.
     """Returns the set of nodes whose values depend on those within initial_queue"""
     initial_queue = list(initial_queue)
     dominated_set = OrderedSet(initial_queue)
@@ -1174,9 +1281,12 @@ def dominated_nodes(
 def gather_origins(
     args: Sequence[IRNode], kwargs: dict[str, IRNode]
 ) -> OrderedSet[torch.fx.Node]:
+    # [FUNCTION DOC] Gather FX origins of unrealized IR nodes found (after flattening containers) in args and kwargs. A node is unrealized if it is an IRNode,
+    # looking through TensorBox and StorageBox, that is not a computed buffer, inputs kernel, input buffer or template buffer.
     from . import ir
 
     def is_unrealized_node(n: IRNode) -> bool:
+        # [FUNCTION DOC] HELPER: Return True if the IR node (unwrapping TensorBox/StorageBox) is an IRNode that is not a realized buffer type.
         if isinstance(n, ir.TensorBox):
             return is_unrealized_node(n.data)
         if isinstance(n, ir.StorageBox):
@@ -1201,6 +1311,8 @@ def gather_origins(
 
 
 def sympy_str(expr: sympy.Expr) -> str:
+    # [FUNCTION DOC] Fast, lower-quality string form of a sympy expression, for debugging and keys but not final codegen.
+    # Handles sums, products, negation, and ModularIndexing/CleanDiv/FloorDiv/Identity calls with custom formatting.
     """
     Normal sympy str is very slow, this is a lot faster.  The result are
     somewhat worse, as it doesn't do as much simplification.  So don't
@@ -1208,11 +1320,13 @@ def sympy_str(expr: sympy.Expr) -> str:
     """
 
     def is_neg_lead(expr: sympy.Expr) -> bool:
+        # [FUNCTION DOC] HELPER: True for a two-argument product whose first factor is negative one.
         return (
             isinstance(expr, sympy.Mul) and len(expr.args) == 2 and expr.args[0] == -1
         )
 
     def sympy_str_add(expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Format a sum, special-casing a difference of two terms; non-sums delegate to the product formatter.
         if isinstance(expr, sympy.Add):
             # Special case 'a - b'. Note that 'a - b - c' will still appear as
             # 'a + -1 * b + -1 * c'.
@@ -1224,6 +1338,7 @@ def sympy_str(expr: sympy.Expr) -> str:
             return sympy_str_mul(expr)
 
     def sympy_str_mul(expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Format a product, special-casing negation; non-products delegate to the atom formatter.
         if isinstance(expr, sympy.Mul):
             if is_neg_lead(expr):
                 # Special case '-a'. Note that 'a * -b' will still appear as
@@ -1235,6 +1350,7 @@ def sympy_str(expr: sympy.Expr) -> str:
             return sympy_str_atom(expr)
 
     def sympy_str_atom(expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Format an atom: symbol name, parenthesized nested sum/product, function call form for index functions, else the default string.
         if isinstance(expr, sympy.Symbol):
             return expr.name
         elif isinstance(expr, (sympy.Add, sympy.Mul)):
@@ -1248,6 +1364,8 @@ def sympy_str(expr: sympy.Expr) -> str:
 
 
 def get_bounds_index_expr(index: sympy.Expr) -> ValueRanges[Any]:
+    # [FUNCTION DOC] Return value-range bounds for an index expression. When config.compute_all_bounds is on and the current interpreter FX node
+    # is not an index_expr, computes bounds with bound_sympy; otherwise returns unknown bounds. Reads the virtualized interpreter.
     from .virtualized import V
 
     # If this expression does not come from an FX node, we compute its bounds
@@ -1262,14 +1380,18 @@ def get_bounds_index_expr(index: sympy.Expr) -> ValueRanges[Any]:
 
 
 def prefix_is_reduction(prefix: str) -> bool:
+    # [FUNCTION DOC] True if the iteration variable prefix denotes a reduction (starts with "r").
     return prefix[0] == "r"
 
 
 def prefix_is_pointwise(prefix: str) -> bool:
+    # [FUNCTION DOC] True if the iteration variable prefix denotes a pointwise dimension (starts with x, y or z).
     return prefix[0] in ("x", "y", "z")
 
 
 def sympy_index_symbol_with_prefix(prefix: SymT, idx: int) -> sympy.Symbol:
+    # [FUNCTION DOC] Create an integer, non-negative sympy symbol for an index variable from a SymT prefix and index.
+    # Raises AssertionError if the prefix is SymT.SIZE (shape symbols are positive and allocated before Inductor).
     """
     Used to generate an integer-nonnegative symbol.
     """
@@ -1283,10 +1405,12 @@ def sympy_index_symbol_with_prefix(prefix: SymT, idx: int) -> sympy.Symbol:
 
 
 def generate_assert(check: bool) -> bool:
+    # [FUNCTION DOC] Decide whether to emit an index assertion: requires config.assert_indirect_indexing and either the check flag or config.debug_index_asserts.
     return (check or config.debug_index_asserts) and config.assert_indirect_indexing
 
 
 def sympy_index_symbol(name: str) -> sympy.Symbol:
+    # [FUNCTION DOC] Create an integer, non-negative sympy symbol with the given name. Raises AssertionError if the name starts with "s" (reserved for shape symbols).
     """
     Used to generate an integer-nonnegative symbol.
     """
@@ -1300,6 +1424,7 @@ def sympy_index_symbol(name: str) -> sympy.Symbol:
 
 
 def sympy_subs(expr: sympy.Expr, replacements: dict[sympy.Expr, Any]) -> sympy.Expr:
+    # [FUNCTION DOC] Substitute replacements into a sympy expression by delegating to the shared _sympy_subs helper (string replacements become symbols with matching assumptions).
     """
     When the passed replacement symbol v is a string, it is converted to a symbol with name v that
     have the same replaced expression integer and nonnegative properties.
@@ -1308,12 +1433,14 @@ def sympy_subs(expr: sympy.Expr, replacements: dict[sympy.Expr, Any]) -> sympy.E
 
 
 def is_symbolic(a: Any) -> TypeGuard[torch.SymInt | torch.Tensor]:
+    # [FUNCTION DOC] Type guard: True for a SymInt or a tensor with symbolic sizes or strides.
     return isinstance(a, torch.SymInt) or (
         isinstance(a, torch.Tensor) and a._has_symbolic_sizes_strides
     )
 
 
 def any_is_symbolic(*args: Any) -> bool:
+    # [FUNCTION DOC] True if any argument is symbolic (see is_symbolic).
     return any(is_symbolic(a) for a in args)
 
 
@@ -1351,6 +1478,7 @@ FORBIDDEN_CUDAGRAPH_OPS = frozenset(
 def get_first_incompatible_cudagraph_node(
     gm: torch.fx.GraphModule,
 ) -> torch.fx.Node | None:
+    # [FUNCTION DOC] Return the first node of the graph module that cannot run under CUDA graphs (as judged by is_cudagraph_unsafe_fx_node, or because its fake value has free unbacked symbols), or None if all nodes are compatible.
     from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
 
     for node in gm.graph.nodes:
@@ -1364,6 +1492,7 @@ def get_first_incompatible_cudagraph_node(
 
 
 def output_node(gm: torch.fx.GraphModule) -> Node:
+    # [FUNCTION DOC] Return the output node (last node) of an FX graph module. Raises AssertionError if the last node is not an output op.
     """Get the output node from an FX graph"""
     last_node = next(iter(reversed(gm.graph.nodes)))
     if last_node.op != "output":
@@ -1374,6 +1503,7 @@ def output_node(gm: torch.fx.GraphModule) -> Node:
 
 
 def get_all_devices(gm: torch.fx.GraphModule) -> OrderedSet[torch.device]:
+    # [FUNCTION DOC] Return the ordered set of devices of all tensor placeholder values and tensor outputs of the graph module, read from node meta "val".
     placeholder_nodes = gm.graph.find_nodes(op="placeholder")
     input_devices: OrderedSet[torch.device] = OrderedSet(
         node.meta["val"].device
@@ -1396,6 +1526,9 @@ import gc
 
 
 def unload_xpu_triton_pyds() -> None:
+    # [FUNCTION DOC] HELPER: Windows/XPU cleanup that releases loaded Triton launcher and spirv utility extension modules so the cache directory can be deleted.
+    # Removes compile_tasks modules from sys.modules (finalizing kernel run modules of CachingAutotuner results), drops the Triton driver's utils singleton, then runs garbage collection.
+    # Mutates sys.modules and Triton driver state.
     # unload __triton_launcher.pyd
     for module_name in list(sys.modules.keys()):
         if not module_name.startswith("torch._inductor.runtime.compile_tasks."):
@@ -1436,6 +1569,8 @@ _registered_caches: list[Any] = []
 
 
 def clear_on_fresh_cache(obj: Any) -> Any:
+    # [FUNCTION DOC] Register an object (typically an lru_cache function) so fresh_cache and clear_caches call its cache_clear. Returns the object, so it works as a decorator.
+    # Raises AttributeError if the object has no callable cache_clear.
     """
     Use this decorator to register any caches that should be cache_clear'd
     with fresh_cache().
@@ -1448,6 +1583,7 @@ def clear_on_fresh_cache(obj: Any) -> Any:
 
 
 def clear_caches() -> None:
+    # [FUNCTION DOC] Call cache_clear on every cache registered through clear_on_fresh_cache.
     """
     Clear all registered caches.
     """
@@ -1457,6 +1593,8 @@ def clear_caches() -> None:
 
 @contextlib.contextmanager
 def _set_env(key: str, value: str) -> Iterator[None]:
+    # [FUNCTION DOC] HELPER: Context manager that sets one environment variable for the duration of the block and restores (or removes) the previous value afterwards.
+    # Uses single-key lookups rather than copying the whole environment so it is safe against background threads modifying os.environ.
     """Thread-safe env var set/restore using atomic C-level lookups.
 
     We avoid mock.patch.dict(os.environ, ...) because it internally calls
@@ -1482,6 +1620,9 @@ def fresh_cache(
     dir: str | None = None,
     delete: bool = True,
 ) -> Iterator[None]:
+    # [FUNCTION DOC] Context manager giving a clean temporary Inductor cache directory. Clears registered caches, creates a temp dir (under dir if given), points TORCHINDUCTOR_CACHE_DIR
+    # and TRITON_CACHE_DIR (a "triton" subdirectory) at it, and yields. If cache_entries is a dict (must be empty, else AssertionError) it is filled after the body with the sizes of files in the Triton cache dir (excluding lock files).
+    # When delete is true the directory is removed on success (ignoring errors on Windows; warns on failure, and unloads XPU Triton modules on Windows). On exception the directory is kept, a warning is logged and the error re-raised. Caches are cleared again at exit.
     """
     Contextmanager that provides a clean tmp cachedir for pt2 caches.
 
@@ -1543,6 +1684,7 @@ fresh_inductor_cache = fresh_cache
 
 
 def argsort(seq: Sequence[Any], *, reverse: bool = False) -> list[int]:
+    # [FUNCTION DOC] Return the indices that would sort seq ascending (descending if reverse). Equal values keep a stable inner-before-outer ordering for ascending, matching stride-ordering conventions.
     getter = seq.__getitem__
     a_r = range(len(seq))
     # preserve original order for equal strides
@@ -1564,6 +1706,8 @@ def argsort_sym(
     *,
     reverse: bool = False,
 ) -> list[int]:
+    # [FUNCTION DOC] Symbolic argsort for layout heuristics only. Converts SymInts to sympy expressions and sorts with a custom comparator that evaluates comparisons via the shape env,
+    # falling back to optimization hints on data-dependent guards. Equal values keep the original-order convention of argsort. Callers must not use the result for correctness decisions. Returns the list of indices.
     """
     Return a symbolic sort order for optimization-only layout heuristics.
 
@@ -1572,6 +1716,7 @@ def argsort_sym(
     """
 
     def cmp(a: tuple[int, sympy.Expr], b: tuple[int, sympy.Expr]) -> int:
+        # [FUNCTION DOC] HELPER: Comparator on (index, expression) pairs returning -1, 1 or 0: compares values symbolically (hint fallback), and on ties prefers the earlier index as larger (reverse of index order).
         a_idx, a_val = a
         b_idx, b_val = b
 
@@ -1579,6 +1724,7 @@ def argsort_sym(
             expr: bool | torch.SymInt | sympy.Expr,
             fallback: Callable[[], bool],
         ) -> bool:
+            # [FUNCTION DOC] HELPER: Evaluate a boolean-like expression with the shape env; plain bools pass through, and a data-dependent guard error falls back to the supplied fallback callable.
             if isinstance(expr, bool):
                 return expr
             try:
@@ -1587,6 +1733,7 @@ def argsort_sym(
                 return fallback()
 
         def hint_lt(lhs: sympy.Expr, rhs: sympy.Expr) -> bool:
+            # [FUNCTION DOC] HELPER: Return whether the optimization hint of lhs is less than that of rhs.
             # Stride sorting is an optimization-only ordering decision.  Keep
             # semantic reasoning symbolic first, then fall back to explicit
             # optimization hints when unbacked comparisons are data-dependent.
@@ -1618,6 +1765,7 @@ def argsort_sym(
 
 @functools.lru_cache(8)
 def get_dtype_size(dtype: torch.dtype) -> int:
+    # [FUNCTION DOC] Return the element size in bytes of a dtype (cached). Hardcodes 8 for uint64 as a workaround for an overflow error when creating such a tensor; otherwise queries an empty tensor.
     # TODO: Investigate why uint64 tensor creation causes overflow error:
     # Workaround for RuntimeError in memory size calculation, but underlying cause unclear
     if dtype == torch.uint64:
@@ -1626,6 +1774,8 @@ def get_dtype_size(dtype: torch.dtype) -> int:
 
 
 class DualIndentedBuffer(IndentedBuffer):
+    # [CLASS DOC] IndentedBuffer that writes to two buffers at once: the base class buffer holds JIT output and the aot attribute (a separate IndentedBuffer) holds AOTI output.
+    # writeline, writelines, splice, indent, do_indent, do_unindent and clear affect both; the _jit and _aot variants write to only one side. Indentation levels are kept in sync on both buffers.
     """IndentedBuffer that simultaneously accumulates JIT and AOTI output.
 
     The base class (self._lines) holds JIT content. self.aot holds AOTI content.
@@ -1634,11 +1784,13 @@ class DualIndentedBuffer(IndentedBuffer):
     """
 
     def __init__(self, initial_indent: int = 0) -> None:
+        # [FUNCTION DOC] Initialize the JIT base buffer and create the parallel AOTI buffer with the same initial indent.
         super().__init__(initial_indent)
         self.aot = IndentedBuffer(initial_indent)
 
     @property
     def jit(self) -> IndentedBuffer:
+        # [FUNCTION DOC] Property returning self as the JIT-side buffer, for splicing into results. Not for writing: writes through self go to both buffers.
         """Read-only accessor for JIT buffer (for splicing into result).
 
         WARNING: Do NOT use jit for writing — writes would go to both buffers
@@ -1647,20 +1799,25 @@ class DualIndentedBuffer(IndentedBuffer):
         return self  # type: ignore[return-value]
 
     def writeline(self, line):  # type: ignore[override]
+        # [FUNCTION DOC] Write a line to both the JIT (base) buffer and the AOTI buffer.
         IndentedBuffer.writeline(self, line)
         self.aot.writeline(line)
 
     def writeline_jit(self, line) -> None:
+        # [FUNCTION DOC] Write a line to the JIT buffer only.
         IndentedBuffer.writeline(self, line)
 
     def writeline_aot(self, line) -> None:
+        # [FUNCTION DOC] Write a line to the AOTI buffer only.
         self.aot.writeline(line)
 
     def writelines(self, lines):  # type: ignore[override]
+        # [FUNCTION DOC] Write each line of an iterable to both buffers.
         for line in lines:
             self.writeline(line)
 
     def splice(self, other_code, strip: bool = False) -> None:  # type: ignore[override]
+        # [FUNCTION DOC] Splice other_code into both buffers independently. If other_code is itself a DualIndentedBuffer, each side takes the matching side of it; strip is forwarded.
         # Splice into each buffer independently. When other_code is itself a
         # DualIndentedBuffer, each side reads from the matching side.
         IndentedBuffer.splice(self, other_code, strip=strip)
@@ -1670,17 +1827,21 @@ class DualIndentedBuffer(IndentedBuffer):
         self.aot.splice(aot_other, strip=strip)
 
     def splice_jit(self, other_code, strip: bool = False) -> None:
+        # [FUNCTION DOC] Splice other_code into the JIT buffer only (other_code is used as is, even if dual).
         IndentedBuffer.splice(self, other_code, strip=strip)
 
     def splice_aot(self, other_code, strip: bool = False) -> None:
+        # [FUNCTION DOC] Splice into the AOTI buffer only; if other_code is a DualIndentedBuffer its AOTI side is used.
         aot_other = (
             other_code.aot if isinstance(other_code, DualIndentedBuffer) else other_code
         )
         self.aot.splice(aot_other, strip=strip)
 
     def indent(self, offset: int = 1):
+        # [FUNCTION DOC] Return a context manager that increases the indentation of both buffers by offset on entry and decreases it on exit (even on error).
         @contextlib.contextmanager
         def ctx():
+            # [FUNCTION DOC] HELPER: Context manager body adjusting the indent of the JIT and AOTI buffers.
             self._indent += offset
             self.aot._indent += offset
             try:
@@ -1692,19 +1853,23 @@ class DualIndentedBuffer(IndentedBuffer):
         return ctx()
 
     def do_indent(self, offset: int = 1) -> None:
+        # [FUNCTION DOC] Increase indentation of both buffers by offset.
         self._indent += offset
         self.aot._indent += offset
 
     def do_unindent(self, offset: int = 1) -> None:
+        # [FUNCTION DOC] Decrease indentation of both buffers by offset.
         self._indent -= offset
         self.aot._indent -= offset
 
     def clear(self) -> None:
+        # [FUNCTION DOC] Clear the contents of both the JIT and AOTI buffers.
         super().clear()
         self.aot.clear()
 
 
 class AotOnlyBuffer(IndentedBuffer):
+    # [CLASS DOC] IndentedBuffer for pure AOTI codegen: writeline_aot and splice_aot write to the buffer while writeline_jit and splice_jit are no-ops, giving call sites a uniform interface across JIT, AOTI and dual modes.
     """IndentedBuffer for pure-AOTI codegen.
 
     Mirror of the base class's pure-JIT defaults: writeline_aot/splice_aot
@@ -1714,19 +1879,24 @@ class AotOnlyBuffer(IndentedBuffer):
     """
 
     def writeline_jit(self, line) -> None:
+        # [FUNCTION DOC] No-op (JIT output is discarded in AOTI-only mode).
         pass
 
     def writeline_aot(self, line) -> None:
+        # [FUNCTION DOC] Write the line to this buffer.
         self.writeline(line)
 
     def splice_jit(self, other_code, strip: bool = False) -> None:
+        # [FUNCTION DOC] No-op (JIT splices are discarded in AOTI-only mode).
         pass
 
     def splice_aot(self, other_code, strip: bool = False) -> None:
+        # [FUNCTION DOC] Splice other_code into this buffer.
         self.splice(other_code, strip=strip)
 
 
 def make_codegen_buffer() -> IndentedBuffer:
+    # [FUNCTION DOC] Create the codegen buffer matching the current graph mode: DualIndentedBuffer in dual-wrapper mode, AotOnlyBuffer in AOT mode, otherwise a plain IndentedBuffer. Reads V.graph flags.
     """Construct the IndentedBuffer subclass matching the current codegen mode.
 
     Dual-wrapper mode -> DualIndentedBuffer (JIT and AOTI both active).
@@ -1743,10 +1913,14 @@ def make_codegen_buffer() -> IndentedBuffer:
 
 
 class FakeIndentedBuffer(IndentedBuffer):
+    # [CLASS DOC] HELPER: Sentinel IndentedBuffer whose attribute access (other than the class attribute) raises RuntimeError. Used by TritonTemplateKernel to prevent accidental writes to the body before a subgraph body is set explicitly.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Initialize the base IndentedBuffer.
         super().__init__()
 
     def __getattribute__(self, name: str) -> Any:
+        # [FUNCTION DOC] HELPER: Allow only access to the class attribute; every other attribute access raises RuntimeError naming the attribute.
+        # KNOWN ISSUE: the concatenated error message strings lack separating spaces, so words run together ("bufferis currently").
         if name == "__class__":  # Allow access to the class attribute
             return object.__getattribute__(self, name)
         raise RuntimeError(
@@ -1759,6 +1933,7 @@ class FakeIndentedBuffer(IndentedBuffer):
 
 @contextlib.contextmanager
 def restore_stdout_stderr() -> Iterator[None]:
+    # [FUNCTION DOC] Context manager that restores sys.stdout and sys.stderr to their values at entry when the block exits.
     initial_stdout, initial_stderr = sys.stdout, sys.stderr
     try:
         yield
@@ -1767,22 +1942,28 @@ def restore_stdout_stderr() -> Iterator[None]:
 
 
 class DelayReplaceLine(DeferredLineBase):
+    # [CLASS DOC] Deferred line that, when finally rendered, replaces key in the wrapped line with the string produced by value_fn at that later time. Attributes: key, value_fn.
     """At end of codegen call `line.replace(key, value_fn())`"""
 
     def __init__(self, key: str, value_fn: Callable[[], str], line: str):
+        # [FUNCTION DOC] Store the line (via the base class) plus the substring key to replace and the callable producing its replacement.
         super().__init__(line)
         self.key = key
         self.value_fn = value_fn
 
     def __call__(self) -> str:
+        # [FUNCTION DOC] Return the line with key replaced by the current value of value_fn.
         return self.line.replace(self.key, self.value_fn())
 
     def _new_line(self, line: str) -> DelayReplaceLine:
+        # [FUNCTION DOC] HELPER: Create a new DelayReplaceLine with the same key and value_fn on a different line text (used by deferred-line transformations).
         return DelayReplaceLine(self.key, self.value_fn, line)
 
 
 @functools.cache
 def is_big_gpu(index_or_device: int | torch.device = 0) -> bool:
+    # [FUNCTION DOC] Cached check whether a GPU is big enough for max-autotune GEMM. Accepts a device or an index of the default GPU type. On ROCm requires major arch of at least 9 and not 10 (raises AssertionError if unknown), logging a warning otherwise.
+    # Elsewhere requires at least 68 SMs (16 subslices on XPU), logging a warning with the counts if not. Returns bool.
     if isinstance(index_or_device, torch.device):
         device = index_or_device
     else:
@@ -1813,6 +1994,7 @@ def is_big_gpu(index_or_device: int | torch.device = 0) -> bool:
 
 @functools.lru_cache
 def get_max_num_sms() -> int:
+    # [FUNCTION DOC] Cached hardware multiprocessor count: XPU gpu subslice count if XPU is available, else the CUDA device's multi-processor count.
     if torch.xpu.is_available():
         return torch.xpu.get_device_properties().gpu_subslice_count
     return torch.cuda.get_device_properties("cuda").multi_processor_count
@@ -1820,6 +2002,7 @@ def get_max_num_sms() -> int:
 
 @functools.lru_cache
 def using_b200() -> bool:
+    # [FUNCTION DOC] Cached check that CUDA is available and the current device has compute capability major version 10 (B200); returns False without CUDA.
     """Returns true if the device is a NVIDIA B200, otherwise returns false."""
     if not torch.cuda.is_available():
         return False
@@ -1829,6 +2012,7 @@ def using_b200() -> bool:
 
 
 def is_nvidia_sm100_or_later() -> bool:
+    # [FUNCTION DOC] True on NVIDIA CUDA (not HIP) when the device capability is at least 10.0.
     """Return true for NVIDIA CUDA devices with compute capability SM100+."""
     return (
         torch.cuda.is_available()
@@ -1838,6 +2022,7 @@ def is_nvidia_sm100_or_later() -> bool:
 
 
 def get_num_sms() -> int:
+    # [FUNCTION DOC] Return the number of SMs to use: hardware count minus the experimental SM carveout when set (XPU returns the full count). TODO in code: should guard on the carveout global.
     """Handle experimental carveout if set otherwise return hardware SM count"""
     # TODO we need to properly guard on this global
     if torch.xpu.is_available():
@@ -1851,6 +2036,7 @@ def get_tma_workspace_arg(
     device: torch.device,
     num_programs: int | None = None,
 ) -> WorkspaceArg:
+    # [FUNCTION DOC] Build the WorkspaceArg for the device-side TMA descriptor workspace. Size is programs (default: get_num_sms) times descriptor count times the descriptor size; zero mode is off; a unique outer name is allocated.
     """Builds and returns a WorkspaceArg for the device side TMA workspace buffer."""
     from .codegen.common import WorkspaceArg, WorkspaceZeroMode
 
@@ -1877,6 +2063,7 @@ def get_default_kpack(block_k: int = 16) -> int:
 def _use_template_for_gpu(
     layout: Layout, allowed_layout_dtypes: list[torch.dtype]
 ) -> bool:
+    # [FUNCTION DOC] HELPER: True if the layout device is a GPU, its dtype is in the allowed list and the device is a big GPU; logs a debug message when the dtype is not allowed.
     if layout.dtype not in allowed_layout_dtypes:
         log.debug(
             "Not using template since dtype %s is not in allowed layout dtypes %s",
@@ -1891,18 +2078,21 @@ def _use_template_for_gpu(
 
 
 def _use_autotune_backend(backend: str) -> bool:
+    # [FUNCTION DOC] HELPER: True if the backend name appears (case-insensitive) in the comma-separated config.max_autotune_gemm_backends.
     return backend.upper() in [
         x.strip() for x in config.max_autotune_gemm_backends.upper().split(",")
     ]
 
 
 def _use_conv_autotune_backend(backend: str) -> bool:
+    # [FUNCTION DOC] HELPER: True if the backend name appears (case-insensitive) in config.max_autotune_conv_backends.
     return backend.upper() in [
         x.strip() for x in config.max_autotune_conv_backends.upper().split(",")
     ]
 
 
 def _use_conv_bwd_weight_autotune_backend(backend: str) -> bool:
+    # [FUNCTION DOC] HELPER: True if the backend name appears (case-insensitive) in config.max_autotune_conv_bwd_weight_backends.
     return backend.upper() in [
         x.strip()
         for x in config.max_autotune_conv_bwd_weight_backends.upper().split(",")
@@ -1910,6 +2100,7 @@ def _use_conv_bwd_weight_autotune_backend(backend: str) -> bool:
 
 
 def _use_conv_bwd_input_autotune_backend(backend: str) -> bool:
+    # [FUNCTION DOC] HELPER: True if the backend name appears (case-insensitive) in config.max_autotune_conv_bwd_input_backends.
     return backend.upper() in [
         x.strip()
         for x in config.max_autotune_conv_bwd_input_backends.upper().split(",")
@@ -1923,6 +2114,8 @@ def use_triton_template(
     enable_float8: bool = False,
     check_max_autotune: bool = True,
 ) -> bool:
+    # [FUNCTION DOC] Decide whether Triton GEMM templates may be used for a layout. Allowed dtypes are fp16, bf16, fp32, plus int32 and/or float8 when enabled. Needs a big GPU (or CPU with allowed dtype), max-autotune enabled (unless check_max_autotune is false),
+    # TRITON in the GEMM autotune backends, and the device supporting the TRITON_TEMPLATES backend feature.
     from .codegen.common import BackendFeature, has_backend_feature
 
     layout_dtypes = [torch.float16, torch.bfloat16, torch.float32]
@@ -1948,6 +2141,9 @@ def use_triton_template(
 def can_use_tma(
     *matrices: IRNode, output_layout: Layout | None = None, add_guards: bool = False
 ) -> bool:
+    # [FUNCTION DOC] Return True only if all given IR nodes (and optionally the output layout) satisfy the CUDA TMA constraints Triton needs: rank 1 to 5, supported dtype, 16-byte aligned base offset,
+    # exactly one stride-1 inner dim, aligned outer strides, inner size times itemsize a multiple of 16 bytes, and inner dim at least 32 for 1-byte dtypes. Requires Triton TMA device support.
+    # add_guards controls whether shape-env guards may be added when checking. Uses the virtualized graph's sizevars.
     """
     Return True iff *all* supplied tensors satisfy the CUDA TMA constraints
     that Triton relies on today.
@@ -1967,9 +2163,11 @@ def can_use_tma(
     from .virtualized import V
 
     def _aligned(expr_bytes: int | sympy.Expr) -> bool:
+        # [FUNCTION DOC] HELPER: True if a byte expression is statically known to be a multiple of TMA_ALIGNMENT.
         return V.graph.sizevars.statically_known_multiple_of(expr_bytes, TMA_ALIGNMENT)
 
     def _is_tma_compatible_layout(layout: Layout | None) -> bool:
+        # [FUNCTION DOC] HELPER: Check a layout (None counts as compatible): its offset must be 16-byte aligned and its sizes, strides and dtype TMA compatible.
         if layout is None:
             return True
         sizes = layout.size
@@ -1983,6 +2181,7 @@ def can_use_tma(
         return _is_tma_compatible(sizes, strides, dtype)
 
     def _is_tma_compatible_matrix(m: IRNode) -> bool:
+        # [FUNCTION DOC] HELPER: Check an IR node's sizes, strides and dtype for TMA compatibility.
         sizes = m.get_size()
         strides = m.get_stride()
         dtype = m.get_dtype()
@@ -2001,6 +2200,8 @@ def can_use_tma(
         strides: Sequence[_IntLike],
         dtype: torch.dtype,
     ) -> bool:
+        # [FUNCTION DOC] HELPER: Check TMA constraints for sizes, strides and dtype: rank 1 to 5, dtype in the TMA-supported set, exactly one stride-1 inner dimension, outer strides and inner byte width 16-byte aligned, and inner dim at least 32 for 1-byte dtypes.
+        # Sizes/strides are guarded to ints when add_guards is set, otherwise replaced by hints. Returns bool.
         rank = len(sizes)
         itemsize = dtype.itemsize
 
@@ -2054,6 +2255,7 @@ def can_use_tma(
         strides: Sequence[_IntLike],
         dtype: torch.dtype,
     ) -> bool:
+        # [FUNCTION DOC] HELPER: XPU variant of the TMA check: the last stride must be statically one (using hints) and every size hint must not exceed the uint32 maximum (Triton index type).
         # Make sure the last dimension is contiguous
         last_stride = strides[-1]
         last_stride_hint = V.graph.sizevars.replace_backed_symbols_with_hints(
@@ -2081,6 +2283,7 @@ def can_use_tma(
 def _descriptor_shape_fits_in_int32(
     sizes: Sequence[sympy.Expr], add_guards: bool = False
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Check that every dimension size is at most the int32 maximum. Concrete ints are compared directly; symbolic sizes are combined into one condition, which is guarded (guard_or_false) when add_guards is set, otherwise tested for static truth.
     int32_max = torch.iinfo(torch.int32).max
     conditions = []
     for size in sizes:
@@ -2106,6 +2309,8 @@ def _descriptor_shape_fits_in_int32(
 def use_triton_tma_template(
     *matrices: IRNode, output_layout: Layout, add_guards: bool = False
 ) -> bool:
+    # [FUNCTION DOC] Decide whether the persistent TMA matmul Triton template applies: requires config.triton.enable_persistent_tma_matmul, all inputs 2-D, descriptor shapes (and the output if TMA store is enabled) fitting int32.
+    # On HIP returns True without TMA checks (non-TMA persistent kernels are used); otherwise defers to can_use_tma on the inputs and optionally the output layout.
     if not config.triton.enable_persistent_tma_matmul:
         return False
     if not all(len(m.get_size()) == 2 for m in matrices):
@@ -2130,6 +2335,7 @@ def use_triton_tma_template(
 def use_triton_blackwell_tma_template(
     *matrices: IRNode, output_layout: Layout, add_guards: bool = False
 ) -> bool:
+    # [FUNCTION DOC] Decide whether the Blackwell TMA template applies: needs use_triton_tma_template to pass, host tensor-descriptor TMA support in Triton, and a datacenter Blackwell GPU architecture.
     if not use_triton_tma_template(
         *matrices, output_layout=output_layout, add_guards=add_guards
     ):
@@ -2148,11 +2354,13 @@ def use_triton_scaling_template(
     scale_option_b: ScalingType,
     scaling_types: list[ScalingType],
 ) -> bool:
+    # [FUNCTION DOC] True if both scaling options for operands A and B are in the allowed list of scaling types.
     return scale_option_a in scaling_types and scale_option_b in scaling_types
 
 
 @functools.lru_cache(maxsize=1)
 def ensure_cute_available() -> bool:
+    # [FUNCTION DOC] Cached check whether the CuTeDSL package ("cutlass") can be found. Returns False on ImportError. Call cache_clear after installing to retry.
     """Check if CuTeDSL is importable; cache the result for reuse.
 
     Call ensure_cute_available.cache_clear() after installing CuTeDSL
@@ -2166,6 +2374,7 @@ def ensure_cute_available() -> bool:
 
 @functools.lru_cache(maxsize=1)
 def ensure_nv_universal_gemm_available() -> bool:
+    # [FUNCTION DOC] Cached check whether cutlass.operators (NVIDIA Universal GEMM) can be found; returns False on ImportError or ValueError. When available it also registers the FP4 dtype mapping as a side effect.
     """Check if NVIDIA Universal GEMM (cutlass.operators) is importable; cache the result for reuse.
 
     Call ensure_nv_universal_gemm_available.cache_clear() after installing
@@ -2181,6 +2390,7 @@ def ensure_nv_universal_gemm_available() -> bool:
 
 
 def _ensure_fp4_dtype_registered():
+    # [FUNCTION DOC] HELPER: Safety net ensuring cutlass.operators maps torch float4_e2m1fn_x2 to the cutlass Float4E2M1FN type. Probes the mapping; if it raises KeyError/AttributeError, monkeypatches the dtype utility's conversion function with a wrapper handling that dtype. Mutates the cutlass module.
     """Ensure cutlass.operators maps torch.float4_e2m1fn_x2 -> cutlass.Float4E2M1FN.
 
     cutlass.operators natively supports this dtype, so this is normally a no-op.
@@ -2197,6 +2407,7 @@ def _ensure_fp4_dtype_registered():
         _orig = _dtype_utils.cutlass_type_from_torch_type
 
         def _patched(dtype):
+            # [FUNCTION DOC] HELPER: Replacement dtype converter returning Float4E2M1FN for the fp4 torch dtype and delegating to the original converter otherwise.
             if dtype == torch.float4_e2m1fn_x2:
                 return cutlass.Float4E2M1FN
             return _orig(dtype)
@@ -2206,6 +2417,7 @@ def _ensure_fp4_dtype_registered():
 
 @functools.lru_cache(maxsize=1)
 def ensure_nvmatmul_heuristics_available() -> bool:
+    # [FUNCTION DOC] Cached check whether the nvMatmulHeuristics package can be found; returns False on ImportError. Call cache_clear after installing to retry.
     """Check if nvMatmulHeuristics is importable; cache the result for reuse.
 
     nvMatmulHeuristics provides performance model-based kernel selection
@@ -2230,6 +2442,8 @@ def use_blackwell_cutedsl_grouped_mm(
     bias: Any | None,
     scale_result: Any | None,
 ) -> bool:
+    # [FUNCTION DOC] Decide whether the Blackwell CuTeDSL grouped matmul can be used. All must hold: CuTeDSL available and enabled as an autotune backend, GPU device on datacenter Blackwell, bf16 output layout on a big GPU, max-autotune enabled,
+    # A, B and the output TMA/16-byte alignment compatible, static (non-dynamic) shapes, A 2-D and B not 2-D, offsets provided, and no bias or scale. Returns bool.
     """
     Returns True if we can use the blackwell kernel for grouped mm.
     Required conditions:
@@ -2286,6 +2500,8 @@ def use_blackwell_cutedsl_grouped_mm(
 
 
 def use_cutlass_template(layout: Layout, m: int, n: int, k: int) -> bool:
+    # [FUNCTION DOC] Decide whether CUTLASS GEMM templates may be used. Requires a positive GEMM size hint at least config.cutlass.cutlass_backend_min_gemm_size, not ROCm, fp16/bf16/int32 output on a big GPU, max-autotune enabled and CUTLASS in the backend list.
+    # If all pass but the CUTLASS library cannot be imported, logs a warning and returns False.
     from .virtualized import V
 
     gemm_size = V.graph.sizevars.optimization_hint(m * n * k, fallback=-1)
@@ -2328,6 +2544,8 @@ def use_nv_universal_gemm_template(
     offs: IRNode | None = None,
     g: _IntLike | None = None,
 ) -> bool:
+    # [FUNCTION DOC] Decide whether the NVIDIA Universal GEMM template may be used. Requires CuTeDSL and cutlass.operators available, NVGEMM in autotune backends, not AOT compilation, a CUDA (non-HIP) device, max-autotune enabled,
+    # no free unbacked symbols in m, n, k (and g), and 16-byte aligned base pointers of the matrices and offsets. Returns bool.
     """
     Return True if we can use the NVIDIA Universal GEMM Template.
 
@@ -2391,6 +2609,7 @@ def use_nv_universal_gemm_template(
 
 
 def _use_cutlass_for_op(op_name: str) -> bool:
+    # [FUNCTION DOC] HELPER: True if config.cutlass.cutlass_enabled_ops is ALL or contains the op name (case-insensitive, comma-separated).
     """Check if CUTLASS should be used for the given operation."""
     enabled_ops = config.cutlass.cutlass_enabled_ops.upper()
     if enabled_ops == "ALL":
@@ -2405,6 +2624,7 @@ _IntLike: TypeAlias = int | sympy.Expr
 def use_decompose_k_choice(
     m: _IntLike, n: _IntLike, k: _IntLike, threshold_multiple: int = 1
 ) -> bool:
+    # [FUNCTION DOC] Cached check whether the decompose-K GEMM variant should be considered: K must be statically known to be at least the scaled threshold times both M and N, not AOT mode, not cpp wrapper, and config.triton.num_decompose_k_splits positive.
     from torch._inductor.virtualized import V
 
     decompose_k_threshold = config.triton.decompose_k_threshold * threshold_multiple
@@ -2424,6 +2644,7 @@ def use_decompose_k_choice(
 
 @functools.cache
 def use_contiguous(m: _IntLike, n: _IntLike, k: _IntLike) -> bool:
+    # [FUNCTION DOC] Cached check for the contiguous-subgraph transform (ROCm only): true on HIP when K is statically at least config.rocm.contiguous_threshold times both M and N, outside AOT and cpp-wrapper modes.
     """
     Check if we should use the contiguous subgraph transform.
     This transform makes the second matrix contiguous before the matmul.
@@ -2448,6 +2669,8 @@ def use_contiguous(m: _IntLike, n: _IntLike, k: _IntLike) -> bool:
 
 @functools.cache
 def get_k_splits(m: _IntLike, n: _IntLike, k: _IntLike) -> list[int]:
+    # [FUNCTION DOC] Cached computation of candidate split-K factors. For symbolic K returns the default list (16 to 256); if config limit is zero returns empty. Otherwise takes divisors of K between 2 and a max (from K//M and K//N, or 256 if M or N is symbolic),
+    # discarding those whose part size is under 128, and orders them as: part sizes that are powers of two, then multiples of 32, then the rest. EXHAUSTIVE search space returns all; otherwise truncated to the configured limit.
     # To limit compile time
     k_splits_limit = config.triton.num_decompose_k_splits
 
@@ -2505,11 +2728,13 @@ def get_k_splits(m: _IntLike, n: _IntLike, k: _IntLike) -> list[int]:
 
 @functools.cache
 def _rocm_native_device_arch_name(device: str) -> str:
+    # [FUNCTION DOC] HELPER: Cached ROCm gcnArchName string of the given CUDA/HIP device.
     return torch.cuda.get_device_properties(device).gcnArchName
 
 
 @functools.lru_cache
 def using_rocm_rdna3() -> bool:
+    # [FUNCTION DOC] Cached check that CUDA/HIP is available and device "cuda" has an architecture name starting with gfx11 (RDNA3).
     """Returns true if the device is based on RDNA3, otherwise returns false."""
     return torch.cuda.is_available() and _rocm_native_device_arch_name(
         "cuda"
@@ -2520,6 +2745,7 @@ def using_rocm_rdna3() -> bool:
 def try_import_ck_lib() -> tuple[
     str | None, Callable[[], list[Any]], Callable[[], list[Any]], type[Any]
 ]:
+    # [FUNCTION DOC] Cached import of the Composable Kernel (ck4inductor) library. Returns (package directory or None, gen_ops_library, gen_ops_preselected, CKGemmOperation). On ImportError returns None and stub generators returning empty lists plus a placeholder operation class.
     try:
         import ck4inductor  # type: ignore[import]
         from ck4inductor.universal_gemm.gen_instances import (  # type: ignore[import]
@@ -2534,12 +2760,15 @@ def try_import_ck_lib() -> tuple[
     except ImportError:
 
         def gen_ops_library() -> list[Any]:
+            # [FUNCTION DOC] HELPER: Fallback stub returning an empty list of CK operations.
             return []
 
         def gen_ops_preselected() -> list[Any]:
+            # [FUNCTION DOC] HELPER: Fallback stub returning an empty list of preselected CK operations.
             return []
 
         class CKGemmOperation:  # type: ignore[no-redef]
+            # [CLASS DOC] HELPER: Placeholder class standing in for the CK GEMM operation type when ck4inductor is not installed.
             pass
 
         package_dirname = None
@@ -2547,6 +2776,8 @@ def try_import_ck_lib() -> tuple[
 
 
 def use_ck_template(layout: Layout) -> bool:
+    # [FUNCTION DOC] Decide whether Composable Kernel templates may be used: needs max-autotune, ROCm, a cuda-type layout device, a requested (config.rocm.arch or native) arch intersecting config.rocm.ck_supported_arch,
+    # fp16/bf16/fp32 dtype, and an installed ck4inductor (otherwise warns to pip install it). Side effect: sets config.rocm.ck_dir to the package directory on success.
     # config knobs check 1
     if not (config.max_autotune or config.max_autotune_gemm):
         return False
@@ -2584,6 +2815,7 @@ def use_ck_template(layout: Layout) -> bool:
 
 
 def use_ck_gemm_template(layout: Layout, m: int, n: int, k: int) -> bool:
+    # [FUNCTION DOC] True if CK is a GEMM autotune backend, the CK template can be used for the layout, and the GEMM size hint (m times n times k) is positive.
     from .virtualized import V
 
     return (
@@ -2594,6 +2826,7 @@ def use_ck_gemm_template(layout: Layout, m: int, n: int, k: int) -> bool:
 
 
 def use_ck_tile_gemm_template(layout: Layout, m: int, n: int, k: int) -> bool:
+    # [FUNCTION DOC] True if CKTILE is a GEMM autotune backend, the CK template can be used for the layout, and the GEMM size hint is positive.
     from .virtualized import V
 
     return (
@@ -2604,10 +2837,12 @@ def use_ck_tile_gemm_template(layout: Layout, m: int, n: int, k: int) -> bool:
 
 
 def use_ck_conv_template(layout: Layout) -> bool:
+    # [FUNCTION DOC] True if CK is a convolution autotune backend and the CK template can be used for the layout.
     return _use_conv_autotune_backend("CK") and use_ck_template(layout)
 
 
 def _use_template_for_cpu(layout: Layout) -> bool:
+    # [FUNCTION DOC] HELPER: True if max-autotune (or its gemm variant) is enabled and the layout is on CPU.
     return (
         config.max_autotune or config.max_autotune_gemm
     ) and layout.device.type == "cpu"
@@ -2616,6 +2851,7 @@ def _use_template_for_cpu(layout: Layout) -> bool:
 def use_cpp_bmm_template(
     layout: Layout, mat1: ReinterpretView | Buffer, mat2: IRNode
 ) -> bool:
+    # [FUNCTION DOC] Decide whether the C++ batched-matmul template can be used for CPU. Evaluates the first operand's layout (raises AssertionError if it is not a Layout), allowing batch-wise contiguity of the 2-D matrices even if the whole tensor is not contiguous.
     from .ir import Layout
 
     if not isinstance(mat1.layout, Layout):
@@ -2648,6 +2884,8 @@ def use_cpp_gemm_template(
     is_woq_int4: bool = False,
     q_group_size: int | None = None,
 ) -> bool:
+    # [FUNCTION DOC] Decide whether the C++ GEMM template can be used for CPU. Requires CPU layout with max-autotune and CPP in autotune backends, config.cpp.weight_prepack, static n and k, and a micro-gemm implementation available for the input dtypes and thread count.
+    # Also requires output dtype among fp32/bf16/half/uint8/int8, mat1 with a unit last stride, and mat2 being a storage box that is a module buffer (unless require_constant_mat2 is false). mm_args may replace layout, mat1 and mat2 locally. is_woq_int4 and q_group_size describe int4 weight-only quantization.
     from . import ir
     from .codegen.cpp_micro_gemm import create_micro_gemm
     from .codegen.cpp_utils import get_gemm_template_output_and_compute_dtype
@@ -2691,6 +2929,7 @@ def use_cpp_gemm_template(
     )
 
     def is_last_dim_stride1(x: IRNode) -> bool:
+        # [FUNCTION DOC] HELPER: Freeze the node's layout and return whether its last stride is one.
         x.freeze_layout()
         return x.get_stride()[-1] == 1
 
@@ -2704,24 +2943,30 @@ def use_cpp_gemm_template(
 
 
 def use_aten_gemm_kernels() -> bool:
+    # [FUNCTION DOC] True when ATen GEMM kernels are allowed: either max-autotune is off, or ATEN is among the GEMM autotune backends.
     return not (
         config.max_autotune or config.max_autotune_gemm
     ) or _use_autotune_backend("ATEN")
 
 
 class DebugDirManager:
+    # [CLASS DOC] Context manager that redirects torch._dynamo.config.debug_dir_root to a unique temporary sibling directory (suffix with a per-instance id from a class counter) and removes that directory on exit, restoring the previous setting.
+    # Attributes: id, prev_debug_name, new_name. Used in tests to avoid polluting debug dirs.
     counter = itertools.count(0)
     prev_debug_name: str
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Assign a unique id from the shared class counter.
         self.id = next(DebugDirManager.counter)
 
     def __enter__(self) -> None:
+        # [FUNCTION DOC] Save the current debug dir root, set a new temporary root name derived from it and the instance id in the dynamo config.
         self.prev_debug_name = torch._dynamo.config.debug_dir_root
         self.new_name = f"{self.prev_debug_name}_tmp_{self.id}"
         torch._dynamo.config.debug_dir_root = self.new_name
 
     def __exit__(self, *args: object) -> None:
+        # [FUNCTION DOC] Delete the temporary debug directory tree (raises if it does not exist) and restore the previous debug dir root.
         shutil.rmtree(self.new_name)
         torch._dynamo.config.debug_dir_root = self.prev_debug_name
 
@@ -2731,11 +2976,13 @@ def run_and_get_code(
     *args: P.args,
     **kwargs: P.kwargs,
 ) -> tuple[_T, list[str]]:
+    # [FUNCTION DOC] Run fn under a patch of GraphLowering.save_output_code to capture generated source code. Resets dynamo before running. Returns (fn result, list of unique code strings in insertion order).
     from .graph import GraphLowering
 
     source_codes: OrderedSet[str] = OrderedSet()
 
     def save_output_code(code: str) -> None:
+        # [FUNCTION DOC] HELPER: Record generated code in the enclosing set.
         source_codes.add(code)
 
     with mock.patch.object(GraphLowering, "save_output_code", save_output_code):
@@ -2747,6 +2994,8 @@ def run_and_get_code(
 def run_and_get_kernels(
     fn: Callable[P, _T], *args: P.args, **kwargs: P.kwargs
 ) -> tuple[_T, list[str]]:
+    # [FUNCTION DOC] Run fn via run_and_get_code and extract kernel source strings from the generated code. Triple-quoted strings are extracted, or R"TRITON(...)TRITON" raw strings when the cpp wrapper uses lazy Triton compilation. A remove_quote keyword (popped from kwargs) strips the 3-char quote delimiters. Returns (result, kernels).
+    # KNOWN ISSUE: the remove_quote stripping runs inside the loop over code outputs on the accumulated list, so with multiple code outputs earlier kernels are stripped repeatedly.
     remove_quote = kwargs.pop("remove_quote", False)
     # pyrefly: ignore [bad-argument-type]
     result, source_codes = run_and_get_code(fn, *args, **kwargs)
@@ -2764,7 +3013,9 @@ def run_and_get_kernels(
 
 
 def run_fw_bw_and_get_code(fn: Callable[..., Any]) -> tuple[Any, list[str]]:
+    # [FUNCTION DOC] Run fn, then call backward on the sum of its result, capturing generated code for both; returns (result, code list) through run_and_get_code.
     def run_with_backward() -> Any:
+        # [FUNCTION DOC] HELPER: Call fn, run backward on the sum of the result and return the result.
         result = fn()
         result.sum().backward()
         return result
@@ -2773,22 +3024,28 @@ def run_fw_bw_and_get_code(fn: Callable[..., Any]) -> tuple[Any, list[str]]:
 
 
 def get_code(fn: Callable[P, _T], *args: P.args, **kwargs: P.kwargs) -> list[str]:
+    # [FUNCTION DOC] Get the Inductor-generated code for fn without compiling or running generated modules. Patches GraphLowering.compile_to_module to run codegen only (wrapper code, plus kernel code if present, is saved) and return a dummy module, and resets dynamo before calling fn. Returns the list of code strings.
     """Get the inductor-generated code, but skip any actual compilation or running."""
     from .graph import GraphLowering
 
     source_codes: list[str] = []
 
     def save_output_code(code: str) -> None:
+        # [FUNCTION DOC] HELPER: Append generated code to the enclosing list.
         source_codes.append(code)
 
     def patched_compile_to_module(self: GraphLowering) -> Any:
+        # [FUNCTION DOC] HELPER: Replacement for compile_to_module: runs codegen (cpp-wrapper variant if enabled), saves the generated wrapper and kernel code, and returns a no-op dummy module.
         class DummyModule:
+            # [CLASS DOC] HELPER: Empty stand-in for the compiled module whose call method does nothing.
             """This is empty to replace the generated triton module"""
 
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Do nothing.
                 pass
 
             def call(self, *args: Any, **kwargs: Any) -> None:
+                # [FUNCTION DOC] HELPER: Accept any arguments and do nothing.
                 # Don't do anything when called
                 pass
 
@@ -2816,6 +3073,7 @@ def get_code(fn: Callable[P, _T], *args: P.args, **kwargs: P.kwargs) -> list[str
 
 
 def get_triton_code(fn: Callable[P, _T], *args: P.args, **kwargs: P.kwargs) -> str:
+    # [FUNCTION DOC] Return the first generated code string for fn via get_code (no compilation). Raises AssertionError unless one or two outputs (backward may be compiled eagerly) were produced.
     # pyrefly: ignore [bad-argument-type]
     source_codes = get_code(fn, *args, **kwargs)
     # Can have two outputs if backwards was eagerly compiled
@@ -2829,6 +3087,7 @@ def get_triton_code(fn: Callable[P, _T], *args: P.args, **kwargs: P.kwargs) -> s
 def run_and_get_triton_code(
     fn: Callable[P, _T], *args: P.args, **kwargs: P.kwargs
 ) -> str:
+    # [FUNCTION DOC] Run fn and return its first generated code string. Raises AssertionError unless one or two code outputs (second for eagerly compiled backward) were produced.
     # pyrefly: ignore [bad-argument-type]
     _, source_codes = run_and_get_code(fn, *args, **kwargs)
     # Can have two outputs if backwards was eagerly compiled
@@ -2842,6 +3101,7 @@ def run_and_get_triton_code(
 def run_and_get_graph_lowering(
     fn: Callable[P, _T], *args: P.args, **kwargs: P.kwargs
 ) -> tuple[Any, list[GraphLowering]]:
+    # [FUNCTION DOC] Run fn while patching CompiledFxGraph initialization to record each GraphLowering passed in (third positional argument; AssertionError if wrong type). Returns (fn result, list of recorded GraphLowering objects).
     from torch._inductor.graph import GraphLowering
     from torch._inductor.output_code import CompiledFxGraph
 
@@ -2849,6 +3109,7 @@ def run_and_get_graph_lowering(
     graph_lowerings = []
 
     def fake_init(*args: Any, **kwargs: Any) -> None:
+        # [FUNCTION DOC] HELPER: Wrapper around the real CompiledFxGraph initializer that also records its GraphLowering argument.
         real_init(*args, **kwargs)
         graph = args[2]
         if not isinstance(graph, GraphLowering):
@@ -2865,6 +3126,7 @@ def run_and_get_graph_lowering(
 def override_lowering(
     aten_op: Callable[..., Any], override_fn: Callable[..., Any]
 ) -> Iterator[None]:
+    # [FUNCTION DOC] Context manager overriding the lowering for an aten op: the new lowering is override_fn partially applied with the original lowering as first argument. The original is restored on exit, even on error. Mutates the global lowerings table.
     """
     Override the lowering of aten_op with override_fn.
     The first argument of override_fn is the original lowering fn.
@@ -2882,6 +3144,7 @@ def override_lowering(
 def add_scheduler_init_hook(
     pre_fn: Callable[..., Any], post_fn: Callable[..., Any] | None = None
 ) -> Any:
+    # [FUNCTION DOC] Return a patch (not yet started) of Scheduler.__init__ with a wrapper that calls pre_fn(scheduler, nodes) before and post_fn (if given) after the original initializer. For unit tests; the caller must enter the returned patcher.
     """
     Add hook functions to be called at the beginning and end of Scheduler.__init__.
     Used for unit tests.
@@ -2891,6 +3154,7 @@ def add_scheduler_init_hook(
     orig_fn = Scheduler.__init__
 
     def wrapper(scheduler: Any, nodes: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Replacement Scheduler initializer calling the pre hook, the original initializer, then the optional post hook; returns the original's result.
         pre_fn(scheduler, nodes)
         out = orig_fn(scheduler, nodes)
         if post_fn:
@@ -2901,6 +3165,7 @@ def add_scheduler_init_hook(
 
 
 def developer_warning(msg: str) -> None:
+    # [FUNCTION DOC] Emit a message that matters to PyTorch developers: logged at warning level when config.developer_warnings is on (nightlies), otherwise at info level.
     """
     Warnings that will be actionable for PyTorch developers, but not
     end users.  Allows us to easily disable them in stable releases but
@@ -2913,6 +3178,7 @@ def developer_warning(msg: str) -> None:
 
 
 def get_benchmark_name() -> str | None:
+    # [FUNCTION DOC] Experimental: find the benchmark name from the command line, i.e. the argument after --only or the value of --only=. Returns None when absent or not found (e.g. ad hoc scripts). Reads sys.argv.
     """
     An experimental API used only when config.benchmark_kernel is true.
 
@@ -2946,14 +3212,17 @@ def get_benchmark_name() -> str | None:
 
 
 def is_ones(items: Sequence[Any]) -> bool:
+    # [FUNCTION DOC] True if every item equals 1.
     return all(x == 1 for x in items)
 
 
 def is_zeros(items: Sequence[Any]) -> bool:
+    # [FUNCTION DOC] True if every item equals 0.
     return all(x == 0 for x in items)
 
 
 def is_cpu_device(inputs: Sequence[torch.Tensor]) -> bool:
+    # [FUNCTION DOC] True if every tensor in the sequence (non-tensors ignored) is on the CPU device.
     return all(
         item.device == torch.device("cpu")
         for item in inputs
@@ -2962,6 +3231,7 @@ def is_cpu_device(inputs: Sequence[torch.Tensor]) -> bool:
 
 
 def get_sympy_Expr_dtype(val: sympy.Expr) -> torch.dtype:
+    # [FUNCTION DOC] Return int64 for integer-valued sympy expressions, else float64. Raises AssertionError if the input is not a sympy Expr.
     if not isinstance(val, sympy.Expr):
         raise AssertionError("only support sympy.Expr as input to get_sympy_Expr_dtype")
     if val.is_integer:  # type: ignore[attr-defined]
@@ -2972,6 +3242,7 @@ def get_sympy_Expr_dtype(val: sympy.Expr) -> torch.dtype:
 
 @contextlib.contextmanager
 def maybe_profile(should_profile: bool, *args: Any, **kwargs: Any) -> Iterator[Any]:
+    # [FUNCTION DOC] Context manager that wraps the body in a torch profiler (forwarding the extra arguments) and yields it when should_profile is true; otherwise yields None.
     if should_profile:
         with torch.profiler.profile(*args, **kwargs) as p:
             yield p
@@ -2980,6 +3251,7 @@ def maybe_profile(should_profile: bool, *args: Any, **kwargs: Any) -> Iterator[A
 
 
 def parallel_num_threads() -> int:
+    # [FUNCTION DOC] Number of CPU threads for C++ codegen: config.cpp.threads if at least 1, otherwise torch's default thread count.
     threads = config.cpp.threads
     if threads < 1:
         threads = torch.get_num_threads()
@@ -2988,6 +3260,7 @@ def parallel_num_threads() -> int:
 
 @functools.cache
 def get_backend_num_stages() -> int:
+    # [FUNCTION DOC] Cached default Triton pipeline stage count: the backend option num_stages if present, otherwise 2 on ROCm and 3 elsewhere.
     from .runtime.triton_helpers import get_backend_options
 
     options = get_backend_options()
@@ -2996,6 +3269,8 @@ def get_backend_num_stages() -> int:
 
 @functools.cache
 def get_device_tflops(dtype: torch.dtype) -> float:
+    # [FUNCTION DOC] Cached peak TFLOPS of the device for a dtype. Uses datasheet values first (tf32 setting chosen by backend config, with XPU using mkldnn); if unavailable, falls back to Triton's estimate (CUDA only; returns 0.0 with a warning when CUDA is unavailable).
+    # Raises AssertionError for dtypes other than fp16, bf16 and fp32 in the Triton path. Tensor core estimates are used for fp16/bf16 on SM80+ and for fp32 when tf32 is enabled, otherwise SIMD estimates; adapts to the Triton clock_rate API change.
     """
     We don't want to throw errors in this function. First check to see if the device is in device_info.py,
     then fall back to the inaccurate triton estimation.
@@ -3050,6 +3325,7 @@ def get_device_tflops(dtype: torch.dtype) -> float:
 
 @functools.cache
 def get_gpu_dram_gbps() -> float:
+    # [FUNCTION DOC] Cached DRAM bandwidth in GB/s: datasheet value if known, otherwise Triton's estimate.
     """
     We don't want to throw errors in this function. First check to see if the device is in device_info.py,
     then fall back to the inaccurate triton estimation.
@@ -3066,12 +3342,14 @@ def get_gpu_dram_gbps() -> float:
 
 
 def get_gpu_shared_memory() -> int:
+    # [FUNCTION DOC] Return the max shared memory per block of device 0 from the Triton driver (0 if missing).
     from triton.runtime import driver
 
     return driver.active.utils.get_device_properties(0).get("max_shared_mem", 0)
 
 
 def get_max_numwarps() -> int:
+    # [FUNCTION DOC] Maximum number of warps per block: max threads per block divided by warp size on the current CUDA device; returns 32 with a debug log when CUDA is unavailable. Raises AssertionError if max threads is unknown.
     if torch.cuda.is_available():
         device = torch.device("cuda", torch.cuda.current_device())
         props = DeviceProperties.create(device)
@@ -3086,10 +3364,12 @@ def get_max_numwarps() -> int:
 
 
 def is_welford_reduction(reduction_type: str) -> bool:
+    # [FUNCTION DOC] True if the reduction type name starts with "welford".
     return reduction_type.startswith("welford")
 
 
 def reduction_num_outputs(reduction_type: str) -> int:
+    # [FUNCTION DOC] Number of outputs for a reduction type: 3 for welford reductions, 2 for argmax/argmin with value and online softmax reduce, otherwise 1.
     if is_welford_reduction(reduction_type):
         return 3
     elif reduction_type in (
@@ -3103,18 +3383,22 @@ def reduction_num_outputs(reduction_type: str) -> int:
 
 
 def is_linux() -> bool:
+    # [FUNCTION DOC] True on Linux.
     return platform.system() == "Linux"
 
 
 def is_windows() -> bool:
+    # [FUNCTION DOC] True on Windows.
     return sys.platform == "win32"
 
 
 def has_free_symbols(itr: Iterable[Any]) -> bool:
+    # [FUNCTION DOC] True if any item is a sympy expression that is not a number.
     return any(isinstance(x, sympy.Expr) and not x.is_number for x in itr)
 
 
 def is_dynamic(*args: Any) -> bool:
+    # [FUNCTION DOC] True if any argument is an IR buffer-like node (tensor box, storage box, view, computed buffer, buffer) with symbolic size or stride. Non-IR arguments are ignored; other IRNode types raise TypeError.
     from . import ir
 
     for t in args:
@@ -3135,6 +3419,7 @@ def is_dynamic(*args: Any) -> bool:
 
 # Placeholder strings used in triton codegen.
 class Placeholder(enum.Enum):
+    # [CLASS DOC] Enum of placeholder strings used in Triton codegen: KERNEL_NAME stands for the actual kernel name prefix, and DESCRIPTIVE_NAME for a more informative name used when unique kernel names are off.
     # The placeholder for the actual name of a triton kernel.
     # e.g. for "def triton_" it would be "triton_"
     KERNEL_NAME = "KERNEL_NAME"
@@ -3147,6 +3432,8 @@ class Placeholder(enum.Enum):
 def pass_execution_and_save(
     func: Callable[..., Any], gm: GraphModule, inp: Sequence[Any], msg: str
 ) -> None:
+    # [FUNCTION DOC] Run an FX graph pass func on gm.graph with shape propagation first, observing it with GraphTransformObserver. Afterwards topologically sorts, lints and recompiles the graph. Writes before/after graph text to a temp file and logs its name, whether the graph changed (equal text means unchanged) and elapsed time.
+    # Mutates gm.
     from .pattern_matcher import stable_topological_sort
 
     with tempfile.NamedTemporaryFile(
@@ -3181,6 +3468,7 @@ def pass_execution_and_save(
 
 def is_multi_outputs_template(input_buf: Buffer | Operation | None) -> bool:
     """
+        # [FUNCTION DOC] True if the buffer is a TemplateBuffer that produces multiple outputs.
     Check if input buffer is a multi-outputs template buffer
     """
     from . import ir
@@ -3193,6 +3481,7 @@ def is_multi_outputs_template(input_buf: Buffer | Operation | None) -> bool:
 
 def is_output_of_multi_outputs_template(
     input_buf: Buffer | Operation | None,
+        # [FUNCTION DOC] True if the buffer is a MultiOutput with exactly one input that is a multi-outputs template buffer.
 ) -> bool:
     """
     Check if input buffer is a output of multi-outputs template buffer
@@ -3210,6 +3499,7 @@ def is_collective(
     node: Node | Operation | None,
     op: torch._ops.OperatorBase | None = None,
 ) -> bool:
+    # [FUNCTION DOC] True if node is a collective kernel (not a wait kernel), optionally matching a specific op overload, or a torchrec fallback kernel for all_to_all_single, all_gather_into_tensor or reduce_scatter_tensor. None gives False.
     if node is None:
         return False
 
@@ -3248,12 +3538,15 @@ def is_wait(node: IRNode | Operation | None) -> bool:
     from . import ir
 
     return type(node) is ir._WaitKernel
+        # [FUNCTION DOC] True if the node is exactly a wait kernel type.
 
 
 def contains_collective(
     snode: BaseSchedulerNode,
     filter_fn: Callable[[BaseSchedulerNode], bool] | None = None,
 ) -> bool:
+    # [FUNCTION DOC] True if the scheduler node contains a collective (optionally satisfying filter_fn); grouped nodes are searched recursively.
+    # KNOWN ISSUE: the recursive call for grouped nodes does not pass filter_fn, so the filter only applies to non-grouped nodes.
     from torch._inductor.scheduler import GroupedSchedulerNode
 
     if isinstance(snode, GroupedSchedulerNode):
@@ -3264,6 +3557,7 @@ def contains_collective(
 
 def contains_wait(snode: BaseSchedulerNode) -> bool:
     from torch._inductor.scheduler import GroupedSchedulerNode
+        # [FUNCTION DOC] True if the scheduler node, recursing into grouped nodes, is a wait kernel.
 
     if isinstance(snode, GroupedSchedulerNode):
         return any(contains_wait(x) for x in snode.snodes)
@@ -3275,6 +3569,7 @@ def is_fallback_op(
     node: Operation | None,
     op: torch._ops.OpOverload | Collection[torch._ops.OpOverload],
 ) -> bool:
+    # [FUNCTION DOC] True if node is a FallbackKernel whose op overload is one of the given op(s); a single op is treated as a one-element list.
     from . import ir
 
     if isinstance(op, torch._ops.OpOverload):
@@ -3285,6 +3580,7 @@ def is_fallback_op(
 def buf_name_to_fused_snode(
     buf_name: str, name_to_buf: dict[str, Any], name_to_fused_node: dict[str, Any]
 ) -> Any:
+    # [FUNCTION DOC] Map a buffer name to the fused scheduler node that defines it: look up the buffer, take its defining op name, then look up the fused node by that name.
     return name_to_fused_node[name_to_buf[buf_name].defining_op.get_name()]
 
 
@@ -3295,6 +3591,7 @@ def find_recursive_deps_of_node(
     name_to_fused_node: dict[str, BaseSchedulerNode],
     criteria_cb: Callable[[Any], bool] = lambda snode: False,
 ) -> None:
+    # [FUNCTION DOC] Depth-first collect, into collected_node_set, the scheduler node and all fused nodes it transitively depends on through unmet dependencies. Stops at nodes for which criteria_cb returns True (they are not added or traversed). Mutates the set.
     if criteria_cb(snode):
         return
     collected_node_set.add(snode)
@@ -3320,6 +3617,8 @@ def find_recursive_users_of_node(
     name_to_fused_node: dict[str, BaseSchedulerNode],
     criteria_cb: Callable[[Any], bool] = lambda snode: False,
 ) -> None:
+    # [FUNCTION DOC] Depth-first collect, into collected_node_set, the scheduler node and all fused nodes that transitively use its outputs. Skips OUTPUT pseudo-users and users not in the fused-node map; stops at nodes where criteria_cb is true.
+    # Raises AssertionError if a user has no node. Mutates the set.
     if criteria_cb(snode):
         return
     collected_node_set.add(snode)
@@ -3344,6 +3643,7 @@ def find_recursive_users_of_node(
 
 
 def num_fw_fixed_arguments(dynamo_gm_num_inputs: int, aot_fw_gm_num_inputs: int) -> int:
+    # [FUNCTION DOC] Number of AOT forward-graph inputs with fixed addresses (parameters and buffers): AOT input count minus dynamo input count minus two RNG seed/offset inputs when functionalize_rng_ops is set.
     "Computes the number of inputs to the aot fw graph which have fixed addresses (params and buffers)"
     num_rng_seed_offset_inputs = (
         2 if torch._functorch.config.functionalize_rng_ops else 0
@@ -3355,11 +3655,13 @@ def num_fw_fixed_arguments(dynamo_gm_num_inputs: int, aot_fw_gm_num_inputs: int)
 
 
 def count_tangents(fx_g: torch.fx.GraphModule) -> int:
+    # [FUNCTION DOC] Count the leading static (saved, non-tangent, non-RNG-state) placeholder inputs of a backward graph. Raises AssertionError if the static inputs are not a contiguous prefix of the placeholders.
     """
     Infers which inputs are static for a backwards graph
     """
 
     def is_saved_tensor(x: Node) -> bool:
+        # [FUNCTION DOC] HELPER: True if the placeholder is not a tangent or backward RNG seed/offset/state input (by name).
         return (
             "tangents" not in x.name
             and "bwd_seed" not in x.name
@@ -3383,6 +3685,7 @@ def count_tangents(fx_g: torch.fx.GraphModule) -> int:
 
 
 def get_static_bw_input_idxs(fx_g: torch.fx.GraphModule) -> list[int]:
+    # [FUNCTION DOC] Return the indices of leading placeholders of a backward graph whose names start with "primals_" (fixed-address inputs). Stops at the first non-placeholder node.
     """
     Returns indices of backward graph inputs that are always at fixed
     addresses: primals (parameters/buffers/user inputs saved for backward).
@@ -3400,13 +3703,16 @@ def get_static_bw_input_idxs(fx_g: torch.fx.GraphModule) -> list[int]:
 
 @dataclasses.dataclass
 class BoxedBool:
+    # [CLASS DOC] Mutable boolean wrapper (dataclass with a single value field) so a flag can be shared by reference and flipped later; truthiness reflects the value.
     value: bool
 
     def __bool__(self) -> bool:
+        # [FUNCTION DOC] Return the wrapped boolean value.
         return self.value
 
     @staticmethod
     def disable(obj: Any) -> BoxedBool | bool:
+        # [FUNCTION DOC] Static helper to turn a flag off: if obj is a BoxedBool its value is set to False in place and it is returned; anything else yields plain False.
         if isinstance(obj, BoxedBool):
             obj.value = False
             return obj
@@ -3415,6 +3721,7 @@ class BoxedBool:
 
 @contextlib.contextmanager
 def collect_defined_kernels(kernel_list: list[str]) -> Iterator[None]:
+    # [FUNCTION DOC] Context manager that patches PythonWrapperCodegen.define_kernel so every kernel code string defined during the block is appended to kernel_list before delegating to the original method.
     from .codegen.wrapper import PythonWrapperCodegen
 
     orig_define_kernel = PythonWrapperCodegen.define_kernel
@@ -3427,6 +3734,7 @@ def collect_defined_kernels(kernel_list: list[str]) -> Iterator[None]:
         gpu: bool = True,
         cpp_definition: str | None = None,
     ) -> Any:
+        # [FUNCTION DOC] HELPER: Replacement define_kernel that records the kernel code and calls the original implementation with the same arguments.
         kernel_list.append(kernel_code)
         return orig_define_kernel(
             self, kernel_name, kernel_code, metadata, gpu, cpp_definition
@@ -3437,14 +3745,17 @@ def collect_defined_kernels(kernel_list: list[str]) -> Iterator[None]:
 
 
 def get_cloned_parameter_buffer_name(name: str) -> str:
+    # [FUNCTION DOC] Return the name used for the cloned original of a parameter buffer: the name with the suffix "__original__".
     return name + "__original__"
 
 
 def is_gpu(device: str | None) -> bool:
     return device in GPU_TYPES
+        # [FUNCTION DOC] True if the device type string is one of the GPU types (cuda, mps, xpu, mtia).
 
 
 def is_rocm() -> bool:
+    # [FUNCTION DOC] True if running a ROCm/HIP build of PyTorch.
     """Check if we're running on ROCm/HIP platform."""
     return torch.version.hip is not None
 
@@ -3453,6 +3764,7 @@ def is_rocm() -> bool:
 def _triton_supported_fp8_dtypes(
     backend_name: str, arch: int | str, warp_size: int
 ) -> tuple[str, ...] | None:
+    # [FUNCTION DOC] HELPER: Cached query of the fp8 dtypes the Triton backend supports for a target (backend name, arch, warp size), obtained by parsing default backend options. Returns a tuple of Triton dtype names, or None if Triton is missing, the API differs or the option is absent.
     if not has_triton_package():
         return None
 
@@ -3480,6 +3792,8 @@ def is_triton_fp8_dtype_supported(
     triton_arch: int | str | None = None,
     warp_size: int | None = None,
 ) -> bool:
+    # [FUNCTION DOC] Whether Triton supports a torch dtype on a target. Non-fp8 dtypes always return True. When no backend is given, derives it from a CUDA device (hip with gcn arch, or cuda with compute capability and warp size); non-CUDA devices or unavailable CUDA assume support.
+    # Explicit triton_backend requires triton_arch (ValueError otherwise); warp size defaults to 64 on hip, 32 otherwise. Unknown support also yields True.
     if dtype not in (
         torch.float8_e4m3fn,
         torch.float8_e5m2,
@@ -3525,10 +3839,12 @@ def is_triton_fp8_dtype_supported(
 
 
 def device_need_guard(device: str) -> bool:
+    # [FUNCTION DOC] True if kernels on the device type need a device guard: GPU types except mps (which has no streams yet).
     return device != "mps" and is_gpu(device)  # TODO: MPS does not expose streams now
 
 
 def needs_fallback_due_to_atomic_add_limitations(dtype: torch.dtype) -> bool:
+    # [FUNCTION DOC] True if atomic add is not usable for the dtype and a fallback is needed: bfloat16 on CUDA before capability 9.0 or on XPU, and int64 or bool otherwise.
     if dtype == torch.bfloat16 and torch.cuda.is_available():
         return torch.cuda.get_device_capability() < (9, 0)
     elif dtype == torch.bfloat16 and torch.xpu.is_available():
@@ -3545,6 +3861,8 @@ def use_scatter_fallback(
     src_device_type: str,
     src_is_tensor: bool,
 ) -> bool:
+    # [FUNCTION DOC] Decide whether a scatter-style op must use the ATen fallback rather than Inductor lowering. Returns False for scatter_reduce with no reduction. Otherwise True if the reduction differs from the op's native one (add for scatter_, sum otherwise), a GPU tensor source needs atomic-add fallback,
+    # the CPU scatter_reduce sum fallback config applies, bool/int64 self dtype with matching reduction, or deterministic algorithms are enabled.
     if (
         op_overload.overloadpacket
         in (torch.ops.aten.scatter_reduce_, torch.ops.aten.scatter_reduce)
@@ -3577,6 +3895,7 @@ def use_scatter_fallback(
 
 
 def dump_node_schedule(node_schedule: Sequence[BaseSchedulerNode]) -> None:
+    # [FUNCTION DOC] Debug helper (usable from pdb) printing a node schedule: for each entry, whether reduction is enabled/disabled, or for scheduler nodes whether reduction or pointwise, the reduction hint, and read and write dependencies. Raises RuntimeError for unrecognized entry types and AssertionError for a reduction node lacking an IR node.
     """
     An API that can be used in pdb to dump a node_schedule.
     Right mainly dump the read/write dependencies but can add more as needed.
@@ -3613,6 +3932,7 @@ def dump_node_schedule(node_schedule: Sequence[BaseSchedulerNode]) -> None:
 
 
 def tensor_is_aligned(tensor: torch.Tensor) -> bool:
+    # [FUNCTION DOC] True if the tensor storage offset in bytes is statically known to be a multiple of GPU_ALIGN_BYTES; guards are not installed.
     # See Note: [Input Alignment handling in Inductor]
     # Right now, we don't try to guard on the alignment of the storage offset.
     # When this comment was written, non-symbolic storage_offsets are not guarded on
@@ -3627,6 +3947,7 @@ def tensor_is_aligned(tensor: torch.Tensor) -> bool:
 
 
 def should_assume_input_aligned(example_input: torch.Tensor) -> bool:
+    # [FUNCTION DOC] True for GPU tensors if config.assume_aligned_inputs is set or the tensor is aligned; False for non-GPU tensors.
     # See Note: [Input Alignment handling in Inductor]
 
     # right now, we only care about alignment for cuda tensors.
@@ -3636,6 +3957,7 @@ def should_assume_input_aligned(example_input: torch.Tensor) -> bool:
 
 
 def maybe_get_suppress_shape_guards_ctx() -> contextlib.AbstractContextManager[None]:
+    # [FUNCTION DOC] Return the shape env's guard-suppression context manager from the current tracing context when one with a shape env exists; otherwise a null context.
     # Try to get TracingContext.try_get().fake_mode.shape_env.suppress_guards()
     # If it's not available, return a nullcontext.
 
@@ -3654,6 +3976,7 @@ def maybe_get_suppress_shape_guards_ctx() -> contextlib.AbstractContextManager[N
 def run_and_get_cpp_code(
     fn: Callable[P, _T], *args: P.args, **kwargs: P.kwargs
 ) -> tuple[_T, str]:
+    # [FUNCTION DOC] Run fn with config.debug patched on and dynamo reset, capturing everything logged to the output_code logger at DEBUG level into a string. Returns (result, log text). The logger level and handler are restored after the call (not on exception).
     # We use the patch context manager instead of using it as a decorator.
     # In this way, we can ensure that the attribute is patched and unpatched correctly
     # even if this run_and_get_cpp_code function is called multiple times.
@@ -3677,6 +4000,7 @@ def run_and_get_cpp_code(
 
 
 def shape_env_from_inputs(inputs: Sequence[InputType]) -> ShapeEnv | None:
+    # [FUNCTION DOC] Find the ShapeEnv for the inputs: from the detected fake mode if any; otherwise from the first SymInt input or the first symbolic size/stride of a tensor input. Returns None if none is found.
     fake_mode = detect_fake_mode(inputs)
 
     # TODO(voz): It would be nice to enable this assert, but there are lots of tests that
@@ -3710,10 +4034,12 @@ def align_inputs_from_check_idxs(
     inputs_to_check: Sequence[int],
     mutated_input_idxs: OrderedSet[int],
 ) -> Callable[[list[InputType]], _T]:
+    # [FUNCTION DOC] Wrap a model so listed inputs are made aligned before the call. If there are no inputs to check, the model is returned unchanged. The wrapper clones misaligned inputs, calls the model, then copies results back into the original tensors for mutated inputs that were cloned.
     if len(inputs_to_check) == 0:
         return model
 
     def run(new_inputs: list[InputType]) -> Any:
+        # [FUNCTION DOC] HELPER: Wrapper executing the aligned-input call and reflecting mutations back to original tensors; returns the model output.
         old_tensors, new_tensors = copy_misaligned_inputs(
             new_inputs, inputs_to_check, mutated_input_idxs
         )
@@ -3730,6 +4056,7 @@ def align_inputs_from_check_idxs(
 
 
 def clone_preserve_strides(x: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] Clone a tensor while preserving its sizes and strides (including non-contiguous and overlapping layouts), by cloning the minimal covering 1-D span then restriding. Zero-element shapes use an empty span.
     if 0 in x.size():
         # Short-circuits if the shape has no elements
         needed_size = 0
@@ -3746,6 +4073,7 @@ def copy_misaligned_inputs(
     check_inputs_idxs: Sequence[int],
     return_pair_idxs: OrderedSet[int] | None = None,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    # [FUNCTION DOC] Clone tensors at the given indices of new_inputs whose data pointer is not ALIGNMENT-aligned, replacing them in place in the list (stride-preserving). Raises AssertionError for non-tensor entries. Returns (old tensors, new tensors) for cloned ones whose index is in return_pair_idxs.
     """
     Clones misaligned tensors which we inferred were aligned. Returns a tuple of [old_tensors], [new_tensors] for every
     cloned tensor which is in `return_pair_idxs`.
@@ -3774,6 +4102,7 @@ def remove_unaligned_input_idxs(
     inputs: Sequence[InputType],
     static_input_idxs: Sequence[int],
 ) -> Sequence[int]:
+    # [FUNCTION DOC] Return the static input indices whose inputs are tensors aligned to ALIGNMENT. If any are unaligned (or not tensors) a filtered list is returned, else the original sequence.
     """
     We require all inputs to be aligned, so introduce a copy for any
     that aren't.
@@ -3789,6 +4118,8 @@ def remove_unaligned_input_idxs(
 
 
 def expr_fits_within_32bit(e: sympy.Expr) -> bool:
+    # [FUNCTION DOC] Decide whether an index expression fits in int32 without installing guards. With config.assume_32bit_indexing it records a bound check and returns True. Otherwise True if statically provable at most int32 max; under AOT compilation False if an upper bound exists (below 1e20), else
+    # requires a guarding hint that is at most int32 max.
     """Check if an expression fits within 32-bit integer range.
 
     NOTE: This function intentionally does not install guards. Callers are
@@ -3836,6 +4167,7 @@ def expr_fits_within_32bit(e: sympy.Expr) -> bool:
 def set_tracing_context_output_strides(
     example_inputs: Sequence[Any], compiled_graph: CompiledFxGraph
 ) -> None:
+    # [FUNCTION DOC] If a tracing context with empty output_strides exists, fill it from the compiled graph: each stride tuple is converted to ints, deserialized or evaluated symbolic expressions via the inputs' shape env (None entries stay None). Raises AssertionError if output_strides is not empty or the compiled graph lacks strides.
     # Return the output strides to the caller via TracingContext
     context = torch._guards.TracingContext.try_get()
     if context is not None and context.output_strides is not None:
@@ -3855,6 +4187,7 @@ def set_tracing_context_output_strides(
                     fakify_first_call = ctx.fakify_first_call
 
                 def map_expr(e: Any) -> float | int | SymInt | SymFloat | SymBool:
+                    # [FUNCTION DOC] HELPER: Convert a serialized stride expression to a concrete or symbolic value: plain int without a shape env, deserialized when fakify_first_call, else evaluated.
                     if shape_env is None:
                         return int(e)
                     if fakify_first_call:
@@ -3867,6 +4200,7 @@ def set_tracing_context_output_strides(
 
 
 def should_use_remote_fx_graph_cache() -> bool:
+    # [FUNCTION DOC] Decide whether to use the remote FX graph cache: the explicit config value if set; otherwise only in fbcode, not in FB unit tests, with the remote cache module importable and its version at least the justknobs value.
     if config.fx_graph_remote_cache is not None:
         return config.fx_graph_remote_cache
     if not config.is_fbcode():
@@ -3886,6 +4220,7 @@ def should_use_remote_fx_graph_cache() -> bool:
 
 
 def normalize_name(name: str) -> str:
+    # [FUNCTION DOC] Replace every character that is not an ASCII letter, digit or underscore with an underscore.
     return re.sub(r"[^a-zA-Z0-9_]", "_", name)
 
 
@@ -3908,12 +4243,14 @@ _triton_type_re = re.compile(r"^.*[.]")
 
 
 def triton_type(dtype: torch.dtype) -> str:
+    # [FUNCTION DOC] Convert a torch dtype to the Triton type string ("tl." prefix), applying special-case mapping for bool and float8/float4 dtypes.
     """Convert torch.dtype to triton type"""
     triton_type_name = _triton_type_re.sub("tl.", str(dtype))
     return _triton_type_mapping.get(triton_type_name, triton_type_name)
 
 
 def triton_type_to_torch(dtype: str) -> torch.dtype:
+    # [FUNCTION DOC] Inverse of triton_type: map a Triton type string to a torch dtype, reversing special cases. Raises AssertionError if the resulting attribute is not a dtype, AttributeError for unknown names.
     adjusted_type = _torch_triton_mapping.get(dtype, dtype)
     type_name = adjusted_type.replace("tl.", "")
     out_dtype = getattr(torch, type_name)
@@ -3923,6 +4260,7 @@ def triton_type_to_torch(dtype: str) -> torch.dtype:
 
 
 def is_same_tensor(data: torch.Tensor, value: torch.Tensor) -> bool:
+    # [FUNCTION DOC] True if two non-mkldnn tensors share size, stride, dtype, device, storage pointer and storage offset (i.e. are the same view).
     return (
         not data.is_mkldnn  # type: ignore[bad-return]
         and data.size() == value.size()
@@ -3935,6 +4273,7 @@ def is_same_tensor(data: torch.Tensor, value: torch.Tensor) -> bool:
 
 
 def is_same_mkldnn_tensor(data: torch.Tensor, value: torch.Tensor) -> bool:
+    # [FUNCTION DOC] True if two mkldnn tensors have the same size, dtype, device and mkldnn data pointer.
     return (
         data.is_mkldnn
         and data.size() == value.size()
@@ -3946,6 +4285,7 @@ def is_same_mkldnn_tensor(data: torch.Tensor, value: torch.Tensor) -> bool:
 
 @functools.cache
 def boolean_ops() -> tuple[str, ...]:
+    # [FUNCTION DOC] Cached tuple of op names whose results are boolean (comparisons, logical ops, isinf, isnan, signbit and others).
     return (
         "isinf",
         "isnan",
@@ -3966,6 +4306,7 @@ def boolean_ops() -> tuple[str, ...]:
 
 @dataclasses.dataclass
 class OpDtypeRule:
+    # [CLASS DOC] Dtype propagation rule for an op: an elementwise type promotion kind and an optional fixed return dtype that overrides it.
     type_promotion_kind: ELEMENTWISE_TYPE_PROMOTION_KIND
     override_return_dtype: torch.dtype | None
 
@@ -3978,6 +4319,7 @@ def register_op_dtype_propagation_rules(
     type_promotion_kind: ELEMENTWISE_TYPE_PROMOTION_KIND,
     override_return_dtype: torch.dtype | None,
 ) -> None:
+    # [FUNCTION DOC] Register a dtype propagation rule for an op name in the global op_dtype_propagation_rules mapping (overwrites any existing rule).
     op_dtype_propagation_rules[name] = OpDtypeRule(
         type_promotion_kind, override_return_dtype
     )
@@ -3987,10 +4329,12 @@ op_requires_libdevice_fp64: OrderedSet[str] = OrderedSet()
 
 
 def register_op_requires_libdevice_fp64(name: str) -> None:
+    # [FUNCTION DOC] Record in the global set that an op name requires the libdevice fp64 implementation.
     op_requires_libdevice_fp64.add(name)
 
 
 def get_current_backend(device_type: str | None = None) -> str:
+    # [FUNCTION DOC] Return the backend name configured for a device type (default: the current graph device): cpu_backend for cpu, "mps" for mps, xpu_backend for xpu, tpu_backend for tpu, otherwise cuda_backend. Reads V.graph when the type is omitted.
     from torch._inductor.virtualized import V
 
     if not device_type:
@@ -4008,6 +4352,7 @@ def get_current_backend(device_type: str | None = None) -> str:
 
 
 def device_supports_fp64(device: torch.device | None) -> bool:
+    # [FUNCTION DOC] True unless the device is XPU without fp64 support (queried from device properties).
     """Check if the given device supports float64."""
     if device is not None and device.type == "xpu":
         return torch.xpu.get_device_properties(device).has_fp64
@@ -4015,6 +4360,7 @@ def device_supports_fp64(device: torch.device | None) -> bool:
 
 
 def upcast_compute_type(dtype: torch.dtype) -> torch.dtype:
+    # [FUNCTION DOC] Upcast float16 and bfloat16 to float32 when the Triton backend is current and config.triton.codegen_upcast_to_fp32 is set; otherwise return the dtype unchanged.
     """Maybe upcast [b]float16 to float32"""
     if (
         dtype in (torch.float16, torch.bfloat16)
@@ -4030,6 +4376,7 @@ ValType = TypeVar("ValType")
 
 
 class ScopedDict(MutableMapping[KeyType, ValType]):
+    # [CLASS DOC] Mutable mapping overlaying new items on top of a read-only original mapping. Attributes: original_dict (never modified) and new_items (writes). Lookups prefer new items; iteration yields original keys then new-only keys; length counts the union. Deletion is unsupported.
     """
     A dictionary-like object that allows for scoped updates. It maintains
     an original dictionary and a set of new items that can override
@@ -4038,26 +4385,32 @@ class ScopedDict(MutableMapping[KeyType, ValType]):
     """
 
     def __init__(self, original_dict: Mapping[KeyType, ValType]):
+        # [FUNCTION DOC] Store the original mapping and start with an empty overlay of new items.
         self.original_dict = original_dict
         self.new_items: dict[KeyType, ValType] = {}
 
     def __getitem__(self, key: KeyType) -> ValType:
+        # [FUNCTION DOC] Return the overlay value if present, else the original value (KeyError if neither).
         if key in self.new_items:
             return self.new_items[key]
         return self.original_dict[key]
 
     def __setitem__(self, key: KeyType, value: ValType) -> None:
+        # [FUNCTION DOC] Store the value in the overlay only; the original mapping is untouched.
         self.new_items[key] = value
 
     def __contains__(self, key: object) -> bool:
+        # [FUNCTION DOC] True if the key is in the overlay or the original mapping.
         return key in self.new_items or key in self.original_dict
 
     def get(self, key: KeyType, default: ValType | None = None) -> ValType | None:  # type: ignore[override]
+        # [FUNCTION DOC] Return the overlay value if present, else the original mapping's value or the default.
         if key in self.new_items:
             return self.new_items[key]
         return self.original_dict.get(key, default)
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] Number of distinct keys across the original and overlay.
         n = len(self.original_dict)
         for k in self.new_items:
             if k not in self.original_dict:
@@ -4065,21 +4418,26 @@ class ScopedDict(MutableMapping[KeyType, ValType]):
         return n
 
     def __iter__(self) -> Iterator[KeyType]:
+        # [FUNCTION DOC] Iterate over keys of the original mapping, then over overlay keys not in the original.
         yield from self.original_dict
         for k in self.new_items:
             if k not in self.original_dict:
                 yield k
 
     def __bool__(self) -> bool:
+        # [FUNCTION DOC] True if either the original mapping or the overlay is non-empty.
         return bool(self.original_dict or self.new_items)
 
     def __delitem__(self, key: KeyType) -> None:
+        # [FUNCTION DOC] Not supported: always raises NotImplementedError.
         raise NotImplementedError
 
 
 @dataclass_transform(frozen_default=True)
 def ir_dataclass(cls: type[Any] | None = None, /, *, frozen: bool = True) -> Any:
+    # [FUNCTION DOC] Decorator (usable with or without parentheses) turning a class into a keyword-only dataclass, frozen by default (frozen=False to allow mutation). Returns the decorator when called without a class, otherwise the transformed class.
     def wrap(cls: _T) -> _T:
+        # [FUNCTION DOC] HELPER: Apply the dataclass transformation (keyword-only, frozen as chosen) to a class.
         return dataclasses.dataclass(cls, kw_only=True, frozen=frozen)  # type: ignore[call-overload]
 
     if cls is None:
@@ -4088,6 +4446,7 @@ def ir_dataclass(cls: type[Any] | None = None, /, *, frozen: bool = True) -> Any
 
 
 def get_donated_idxs() -> list[int] | None:
+    # [FUNCTION DOC] Return the backward donated-buffer indices from the current tracing context's forward metadata, or None if there is no context or metadata.
     tracing_context = torch._guards.TracingContext.try_get()
     if tracing_context is not None and tracing_context.fw_metadata:
         return tracing_context.fw_metadata.bw_donated_idxs
@@ -4095,6 +4454,7 @@ def get_donated_idxs() -> list[int] | None:
 
 
 class TritonAttrsDescriptorVersion(enum.Enum):
+    # [CLASS DOC] Enum of Triton AttrsDescriptor API generations: no Triton, compiler-module descriptor (Triton 3.0), backends-module descriptor (3.2), a tuple-supporting variant (never detected), and plain dict (newer Triton).
     V0_NO_TRITON = 0
     V1_COMPILER = 1  # triton.compiler.compiler.AttrsDescriptor
     V2_BACKENDS = 2  # triton.backends.compiler.AttrsDescriptor
@@ -4106,6 +4466,7 @@ class TritonAttrsDescriptorVersion(enum.Enum):
 
 @functools.cache
 def get_triton_attrs_descriptor_version() -> TritonAttrsDescriptorVersion:
+    # [FUNCTION DOC] Cached detection of the installed Triton attrs descriptor API: V0 if Triton is absent, V2 if triton.backends.compiler has AttrsDescriptor, V1 if triton.compiler.compiler has it, else V4 (dict). V3 is never returned because it cannot be detected. Imports Triton modules.
     if importlib.util.find_spec("triton") is None:
         return TritonAttrsDescriptorVersion.V0_NO_TRITON
 
@@ -4131,10 +4492,12 @@ def get_triton_attrs_descriptor_version() -> TritonAttrsDescriptorVersion:
 
 
 def triton_version_uses_attrs_dict() -> bool:
+    # [FUNCTION DOC] True if the installed Triton uses the raw-dict attrs descriptor API (V4_DICT).
     return get_triton_attrs_descriptor_version() == TritonAttrsDescriptorVersion.V4_DICT
 
 
 def get_op_names(op: torch._ops.OperatorBase) -> tuple[str, str]:
+    # [FUNCTION DOC] Return (packet name, overload name) for an operator: the name from op.name(), and for an OpOverload the packet name joined with the overload name, otherwise the packet name again.
     op_overload_packet_name: str = op.name()
     op_overload_name = (
         f"{op_overload_packet_name}.{op._overloadname}"
@@ -4145,6 +4508,7 @@ def get_op_names(op: torch._ops.OperatorBase) -> tuple[str, str]:
 
 
 def _fx_node_is_input_dependent_cudagraph_unsafe(fx_node: torch.fx.Node) -> bool:
+    # [FUNCTION DOC] HELPER: Input-dependent cudagraph-unsafety check for an FX node. Only handles index_put variants (index_put, index_put_, _unsafe_index_put): returns True if any index tensor has dtype bool or uint8 (which triggers a nonzero during capture), using normalized kwargs and node meta values. Non-OpOverload targets and other ops return False.
     """
     Check if an FX node is cudagraph-unsafe based on its input arguments.
 
@@ -4181,6 +4545,7 @@ def _fx_node_is_input_dependent_cudagraph_unsafe(fx_node: torch.fx.Node) -> bool
 
 
 def is_cudagraph_unsafe_fx_node(fx_node: torch.fx.Node) -> bool:
+    # [FUNCTION DOC] True if an FX node cannot be captured in a CUDA graph: its target string is in FORBIDDEN_CUDAGRAPH_OPS, it has the cudagraph_unsafe tag, it is input-dependent unsafe, or any of its fake output values is a sparse tensor.
     """
     Check if an FX node is cudagraph-unsafe.
 
@@ -4218,6 +4583,7 @@ def is_cudagraph_unsafe_fx_node(fx_node: torch.fx.Node) -> bool:
 
 
 def is_cudagraph_unsafe_op(node: Operation) -> bool:
+    # [FUNCTION DOC] True if an Inductor IR operation is not cudagraphable: control flow nodes (Switch, WhileLoop) always; fallback or extern kernels whose originating FX node is cudagraph-unsafe; all other operations are considered safe.
     """
     Returns True if the node is an op that is not cudagraphable.
     This includes:
@@ -4244,6 +4610,7 @@ def is_cudagraph_unsafe_op(node: Operation) -> bool:
 
 
 def get_ld_library_path() -> str:
+    # [FUNCTION DOC] Return the LD_LIBRARY_PATH environment value (empty string if unset); in fbcode prepends the runtime lib directory from the par runtime path.
     path = os.environ.get("LD_LIBRARY_PATH", "")
     if config.is_fbcode():
         from libfb.py.parutil import get_runtime_path
@@ -4257,6 +4624,7 @@ def get_ld_library_path() -> str:
 
 
 def is_codegen_graph_partition_subgraph(wrapper: PythonWrapperCodegen) -> bool:
+    # [FUNCTION DOC] True if the wrapper is a SubgraphPythonWrapperCodegen with partition signatures set (i.e. generating a graph partition subgraph).
     from torch._inductor.codegen.wrapper import SubgraphPythonWrapperCodegen
 
     return (
@@ -4266,6 +4634,7 @@ def is_codegen_graph_partition_subgraph(wrapper: PythonWrapperCodegen) -> bool:
 
 
 def is_using_cudagraph_partition() -> bool:
+    # [FUNCTION DOC] True if graph partitioning is enabled and either cudagraphs are on in the Triton config or a customized partition wrapper is registered.
     return (
         torch._inductor.config.triton.cudagraphs
         or _unstable_customized_partition_wrapper.wrapper is not None
@@ -4273,6 +4642,7 @@ def is_using_cudagraph_partition() -> bool:
 
 
 def dtype_from_size(size: int) -> torch.dtype:
+    # [FUNCTION DOC] Pick int32 when the size is statically known to lie within the signed 32-bit range, otherwise int64 (uses the current graph's sizevars).
     from .virtualized import V
 
     if V.graph.sizevars.statically_known_lt(
@@ -4287,6 +4657,7 @@ SUPPORTED_MKLDNN_DEVICES = ("cpu", "xpu")
 
 
 def is_mkldnn_bf16_supported(device_type: str) -> bool:
+    # [FUNCTION DOC] True if MKL-DNN bfloat16 is supported: queried from mkldnn on cpu, always True for any xpu device string, False otherwise.
     """
     Returns True if the device supports MKL-DNN BF16.
     """
@@ -4299,6 +4670,7 @@ def is_mkldnn_bf16_supported(device_type: str) -> bool:
 
 
 def is_mkldnn_fp16_supported(device_type: str) -> bool:
+    # [FUNCTION DOC] True if MKL-DNN float16 is supported: queried from mkldnn on cpu, always True for any xpu device string, False otherwise.
     """
     Returns True if the device supports MKL-DNN FP16.
     """
@@ -4311,6 +4683,7 @@ def is_mkldnn_fp16_supported(device_type: str) -> bool:
 
 
 def tabulate_2d(elements: Sequence[Sequence[T]], headers: Sequence[T]) -> str:
+    # [FUNCTION DOC] Render a table as text: a header row, a separator line of dashes, and one line per row, with cells padded to the widest entry per column and separated by vertical bars. Raises AssertionError if a row's length differs from the headers.
     widths = [len(str(e)) for e in headers]
     for row in elements:
         if len(row) != len(headers):
@@ -4335,6 +4708,8 @@ def zip_dicts(
     d1_default: ValType | None = None,
     d2_default: ValType | None = None,
 ) -> Generator[tuple[KeyType, ValType | None, ValType | None], None, None]:
+    # [FUNCTION DOC] Generator over the union of keys of two mappings (first mapping's keys first), yielding (key, value1, value2).
+    # A missing value, or a value that is None, is replaced by the corresponding default.
     """
     Zip two dictionaries together, replacing missing keys with default values.
 
@@ -4365,6 +4740,8 @@ def zip_dicts(
 
 
 def maybe_aoti_standalone_config(config_patches: dict[str, Any]) -> dict[str, Any]:
+    # [FUNCTION DOC] Return a copy of config_patches adjusted for standalone AOTInductor. If aot_inductor_mode.compile_standalone is set (patches or global config), fills in cpp-only packaging, embedded kernel binaries, multi-arch kernels (non-ROCm), a default generated-file model name,
+    # and forces link_libtorch to the test config value and dynamic_linkage off (logging overrides). Raises RuntimeError if a required option is explicitly disabled, or if constants are packaged in the shared object for Windows cross compilation. The input dict is not modified.
     """
     Ensures the configuration is internally consistent for standalone AOTInductor.
 
@@ -4384,6 +4761,7 @@ def maybe_aoti_standalone_config(config_patches: dict[str, Any]) -> dict[str, An
     def patch_config(
         config_patches: dict[str, Any], config_name: str, config_value: Any
     ) -> None:
+        # [FUNCTION DOC] HELPER: Set a config patch to the desired value if unset (None); if explicitly falsy and different from the desired value, raises RuntimeError. Mutates the given dict.
         value = config_patches.get(config_name, getattr(config, config_name))
         if value is None:
             config_patches[config_name] = config_value
@@ -4395,6 +4773,7 @@ def maybe_aoti_standalone_config(config_patches: dict[str, Any]) -> dict[str, An
     def force_patch_config(
         config_patches: dict[str, Any], config_name: str, config_value: Any
     ) -> None:
+        # [FUNCTION DOC] HELPER: Unconditionally set a config patch to the desired value, logging a warning if the effective value differed. Mutates the given dict.
         value = config_patches.get(config_name, getattr(config, config_name))
         if value != config_value:
             log.warning(
@@ -4450,6 +4829,8 @@ def maybe_aoti_standalone_config(config_patches: dict[str, Any]) -> dict[str, An
 
 
 def determine_aoti_mmap_flags(consts_size: int) -> tuple[bool, bool]:
+    # [FUNCTION DOC] Decide AOTI weight storage. Returns (use_external_weights, use_mmap_weights). force_mmap_weights gives (False, True) (RuntimeError with the binary_blob format, or on Windows cross-compilation); binary_blob format gives (True, False); constants up to 2 GB give (False, False);
+    # larger constants use mmap unless in fbcode.
     """
     Decide whether we should mmap weights, and whether to store the weights with .so.
 
@@ -4491,6 +4872,7 @@ def determine_aoti_mmap_flags(consts_size: int) -> tuple[bool, bool]:
 
 
 def is_valid_aoti_model_name() -> bool:
+    # [FUNCTION DOC] Validate config.aot_inductor.model_name_for_generated_files: None or empty string are valid; otherwise it must be a string (ValueError) matching letters, digits and underscores not starting with a digit (ValueError). Returns True when valid.
     """
     Validates if a model name is suitable for use in code generation.
 
@@ -4518,6 +4900,7 @@ def is_valid_aoti_model_name() -> bool:
 
 
 def get_free_symbols(x: IterateExprs, unbacked_only: bool) -> OrderedSet[sympy.Symbol]:
+    # [FUNCTION DOC] Return the free symbols of the expressions, restricted to unbacked symbols when unbacked_only is true.
     if unbacked_only:
         return free_unbacked_symbols(x)
     else:
@@ -4525,6 +4908,7 @@ def get_free_symbols(x: IterateExprs, unbacked_only: bool) -> OrderedSet[sympy.S
 
 
 def python_subprocess_env() -> dict[str, str]:
+    # [FUNCTION DOC] Build an environment dict for launching Python subprocesses: a copy of os.environ with PYTHONPATH set to TORCH_CUSTOM_PYTHONPATH if present, else the torch package root plus the current sys.path. In fbcode also sets PYTHONHOME to the interpreter data path.
     """
     Get a base environment for running Python subprocesses.
     """
@@ -4556,6 +4940,7 @@ def python_subprocess_env() -> dict[str, str]:
 
 
 def apply_subprocess_env(extra_env: Mapping[str, str | None] | None) -> None:
+    # [FUNCTION DOC] Apply environment updates from a parent to this process: entries with a value set it, entries with None remove the variable. None input is a no-op. Mutates os.environ.
     """
     Apply environment updates sent from a parent process to a persistent worker.
     A None value means the variable is absent in the parent and should be
@@ -4573,6 +4958,7 @@ def apply_subprocess_env(extra_env: Mapping[str, str | None] | None) -> None:
 
 @contextlib.contextmanager
 def patch_subprocess_env(
+    # [FUNCTION DOC] Context manager that temporarily applies parent environment updates (see apply_subprocess_env) and afterwards restores the full original environment. No-op when the updates are None.
     extra_env: Mapping[str, str | None] | None,
 ) -> Iterator[None]:
     """
@@ -4593,6 +4979,7 @@ def patch_subprocess_env(
 
 @dataclasses.dataclass(frozen=True)
 class CUDAGraphWrapperMetadata:
+    # [CLASS DOC] Frozen metadata handed to a customized CUDA graph wrapper: the number of cudagraphable partitions and the index of the current partition.
     """
     Metadata for Customized CUDAGraphWrapper.
 
@@ -4615,6 +5002,8 @@ CUDAGraphWrapperType = Callable[
 
 # only incremented by user call of mark_step_begin
 class CUDAGraphWrapper:
+    # [CLASS DOC] Holder for the user-supplied customized partition wrapper callable (class attribute wrapper, default None); a module-level instance stores the global setting.
+    # KNOWN ISSUE: the comment preceding the class ("only incremented by user call of mark_step_begin") appears stale and unrelated to this class.
     wrapper: CUDAGraphWrapperType | None = None
 
 
@@ -4633,10 +5022,13 @@ _unstable_customized_partition_wrapper = CUDAGraphWrapper()
 
 
 def set_customized_partition_wrappers(wrapper: CUDAGraphWrapperType) -> None:
+    # [FUNCTION DOC] Register a user-defined wrapper (unstable API) applied to each generated graph partition function; stored globally and read when deciding whether partitioning is used.
     _unstable_customized_partition_wrapper.wrapper = wrapper
 
 
 def snode_args_kwargs(snode: BaseSchedulerNode) -> tuple[list[Any], dict[str, Any]]:
+    # [FUNCTION DOC] Reconstruct example call arguments for a scheduler node's extern kernel. Takes the kernel's args (unflattened for fallback kernels) and kwargs, fills defaults for missing args, removes kwargs duplicated by positional args, converts IR tensor nodes to empty real tensors of the same size, dtype and device (symbols replaced by hints),
+    # and returns (args, kwargs) with the original structure.
     node = cast("ExternKernel", snode.node)
     if isinstance(node, torch._inductor.ir.FallbackKernel):
         args, kwargs = node.unflatten_args(node.inputs, node.constant_args)
@@ -4656,6 +5048,7 @@ def snode_args_kwargs(snode: BaseSchedulerNode) -> tuple[list[Any], dict[str, An
     flat_args, flat_args_pytree_spec = pytree.tree_flatten((args, kwargs))
 
     def _is_tensor_ir(x) -> bool:  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] HELPER: True if x is an IR node other than generator or opaque object state.
         return isinstance(x, torch._inductor.ir.IRNode) and not isinstance(
             x,
             (torch._inductor.ir.GeneratorState, torch._inductor.ir.OpaqueObjectState),
@@ -4669,9 +5062,11 @@ def snode_args_kwargs(snode: BaseSchedulerNode) -> tuple[list[Any], dict[str, An
     ]
 
     def _tensor(size, dtype, device) -> torch.Tensor:  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] HELPER: Allocate an uninitialized tensor of the given size, dtype and device.
         return torch.empty(size, dtype=dtype, device=device)
 
     def to_real_tensor(e: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Replace a tensor by a fresh empty real tensor with the same size, dtype and device; other values pass through.
         if not isinstance(e, torch.Tensor):
             return e
         out = _tensor(e.size(), e.dtype, e.device)
@@ -4683,6 +5078,7 @@ def snode_args_kwargs(snode: BaseSchedulerNode) -> tuple[list[Any], dict[str, An
 
 
 def is_nonfreeable_buffers(dep: Dep) -> bool:
+    # [FUNCTION DOC] True if the dependency refers to a buffer that must not be freed: after removing the current graph name prefix, its name starts with primals_, arg, fwd_rng_state, bwd_rng_state or tangents.
     from .virtualized import V
 
     dep_name = dep.name
@@ -4697,6 +5093,7 @@ def is_nonfreeable_buffers(dep: Dep) -> bool:
 
 # Make sure to also include your jinja templates within torch_package_data in setup.py, or this function won't be able to find them
 def load_template(name: str, template_dir: Path) -> str:
+    # [FUNCTION DOC] Read the jinja template named "<name>.py.jinja" from template_dir as UTF-8 text. Raises ValueError naming the file if it is not valid UTF-8. Templates must be listed in the package data in setup.py.
     """Load a template file and return its content."""
     path = template_dir / f"{name}.py.jinja"
     try:
@@ -4710,6 +5107,8 @@ def load_template(name: str, template_dir: Path) -> str:
 
 
 def should_fallback_by_default(node: torch.fx.Node) -> bool:
+    # [FUNCTION DOC] Inductor lite mode: decide whether an FX node should fall back to eager. Raises AssertionError unless the target is an OpOverload or HigherOrderOperator. False when config.fallback_by_default is off or for _assert_scalar and lift_fresh_copy. Higher-order ops fall back only if in a small list (triton_kernel_wrapper_functional);
+    # other ops fall back when Inductor does not need to compile them.
     """Decide whether fallback for a node. This is only used in inductor lite mode."""
     target = node.target
 
@@ -4767,12 +5166,14 @@ COLLECTIVE_OPS = OrderedSet(
 
 
 def is_collective_op(op_name: str) -> bool:
+    # [FUNCTION DOC] True if the op name is in the set of known collective operation names (COLLECTIVE_OPS).
     """Check if an operation is a collective operation."""
     return op_name in COLLECTIVE_OPS
 
 
 @lru_cache
 def tlx_only_cuda_options() -> list[str]:
+    # [FUNCTION DOC] Cached list of extra CUDA options available only with fbtriton (TLX): returns the registry list if importable, else an empty list.
     try:
         # Succeeds only when fbtriton (a Triton fork) is installed
         from triton.language.extra.tlx.inductor.registry import tlx_only_cuda_options
@@ -4784,6 +5185,7 @@ def tlx_only_cuda_options() -> list[str]:
 
 
 def _round_up(x: int, y: int) -> int:
+    # [FUNCTION DOC] HELPER: Round x up to the nearest multiple of y using integer arithmetic.
     """Round x up to the nearest multiple of y."""
     return ((x + y - 1) // y) * y
 
@@ -4796,6 +5198,8 @@ def _infer_scale_swizzle_impl(
     scale_dtype: torch.dtype,
     eq_fn: Callable[[Any, Any], bool],
 ) -> tuple[Any | None, Any | None]:
+    # [FUNCTION DOC] HELPER: Core inference of (ScalingType, SwizzleType) from matrix size, scale size, scale element count and dtypes, using eq_fn for (possibly symbolic) equality. Checks in order: tensor-wise (one scale), row-wise, block-wise 1x128 / 128x1,
+    # block-wise 128x128, NVFP4 block-wise 1x16 (fp4 data with fp8 e4m3 scales; swizzled 32x4x4 on NVIDIA, none on XPU), and MXFP8 block-wise 1x32 (fp8 e8m0 scales; swizzled on NVIDIA, none on AMD/XPU). Returns (None, None) if nothing matches.
     """
     Core implementation for scale/swizzle inference.
     """
@@ -4883,6 +5287,7 @@ def _infer_scale_swizzle_impl(
 def infer_scale_swizzle(
     mat: torch.Tensor, scale: torch.Tensor
 ) -> tuple[Any | None, Any | None]:
+    # [FUNCTION DOC] Infer the scaling type and swizzle mode of a scale tensor relative to a matrix from their shapes and dtypes (concrete tensors). Returns (ScalingType, SwizzleType) or (None, None) if unrecognized.
     """
     Infer the scaling type and swizzle mode from matrix and scale tensor shapes/dtypes.
 
@@ -4915,6 +5320,7 @@ def infer_scale_swizzle_ir(
     scale: Buffer,
     transpose: bool = False,
 ) -> tuple[Any | None, Any | None]:
+    # [FUNCTION DOC] IR-node version of infer_scale_swizzle used during lowering: sizes are compared with the graph's static symbolic equality, the matrix size is swapped when transpose is set, and the scale element count is the product of its sizes. Returns (ScalingType, SwizzleType) or (None, None).
     """
     Infer the scaling type and swizzle mode for IR nodes (used during graph lowering).
 
@@ -4934,6 +5340,7 @@ def infer_scale_swizzle_ir(
     scale_numel = functools.reduce(operator.mul, scale_size, 1) if scale_size else 1
 
     def symbolic_eq(a: Any, b: Any) -> bool:
+        # [FUNCTION DOC] HELPER: Compare two sizes using static symbolic equality from the current graph's sizevars.
         """Compare values using symbolic equality when possible."""
         return V.graph.sizevars.statically_known_equals(a, b)
 
