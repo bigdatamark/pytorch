@@ -1,5 +1,12 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Unit tests for the DTensor sharding-strategy validation library in
+# torch.distributed.tensor._ops.strategy_validation. Covers placement parsing and normalization,
+# per-tensor placement enumeration, sample tensor extraction, validate_combination /
+# validate_aten_combination against ground truth (using fake process groups and
+# LocalTensorMode), partial-input construction, rule comparison statistics, compare_operator end
+# to end, running the library as a module, and OpInfo name lookup. No import-time side effects
+# besides imports; run_tests at main.
 
 """
 Tests for the strategy validation library.
@@ -39,13 +46,18 @@ from torch.testing._internal.common_utils import run_tests, TEST_WITH_SLOW, Test
 
 
 class TestPlacementUtilities(TestCase):
+    # [CLASS DOC] Tests for the small placement helpers: parse_placement
+    # and is_fully_replicated.
     """Test placement utility functions."""
 
     def test_parse_placement_replicate(self):
+        # [FUNCTION DOC] parse_placement of the string R yields a Replicate placement.
         p = parse_placement("R")
         self.assertIsInstance(p, Replicate)
 
     def test_parse_placement_shard(self):
+        # [FUNCTION DOC] parse_placement of S(0) and S(2) yields Shard placements with
+        # matching dim.
         p = parse_placement("S(0)")
         self.assertIsInstance(p, Shard)
         self.assertEqual(p.dim, 0)
@@ -55,6 +67,8 @@ class TestPlacementUtilities(TestCase):
         self.assertEqual(p.dim, 2)
 
     def test_parse_placement_partial(self):
+        # [FUNCTION DOC] parse_placement of P(sum) and P(max) yields Partial placements with
+        # that reduce_op.
         p = parse_placement("P(sum)")
         self.assertIsInstance(p, Partial)
         self.assertEqual(p.reduce_op, "sum")
@@ -64,6 +78,8 @@ class TestPlacementUtilities(TestCase):
         self.assertEqual(p.reduce_op, "max")
 
     def test_is_fully_replicated(self):
+        # [FUNCTION DOC] is_fully_replicated is true only when every placement in the tuple is
+        # Replicate; any Shard or Partial makes it false.
         self.assertTrue(is_fully_replicated((Replicate(),)))
         self.assertTrue(is_fully_replicated((Replicate(), Replicate())))
         self.assertFalse(is_fully_replicated((Shard(0),)))
@@ -72,9 +88,12 @@ class TestPlacementUtilities(TestCase):
 
 
 class TestPlacementNormalization(TestCase):
+    # [CLASS DOC] Tests for trivial-shard detection and normalization of placements, placement
+    # strings and combo keys, so rules differing only by sharding a size-1 dim dedupe.
     """Test placement normalization for trivial shard deduplication."""
 
     def test_is_trivial_shard_size_1(self):
+        # [FUNCTION DOC] is_trivial_shard is true for a Shard whose target dim has size 1.
         """Shard on size-1 dimension is trivial."""
         self.assertTrue(is_trivial_shard(Shard(0), (1, 4)))
         self.assertTrue(is_trivial_shard(Shard(1), (4, 1)))
@@ -82,19 +101,26 @@ class TestPlacementNormalization(TestCase):
         self.assertTrue(is_trivial_shard(Shard(2), (4, 4, 1)))
 
     def test_is_trivial_shard_normal_size(self):
+        # [FUNCTION DOC] is_trivial_shard is false for a Shard on a dim with size greater
+        # than 1.
         """Shard on non-size-1 dimension is not trivial."""
         self.assertFalse(is_trivial_shard(Shard(0), (4, 3)))
         self.assertFalse(is_trivial_shard(Shard(1), (4, 3)))
 
     def test_is_trivial_shard_replicate(self):
+        # [FUNCTION DOC] is_trivial_shard is false for Replicate even on a shape with a
+        # size-1 dim.
         """Replicate is not a trivial shard."""
         self.assertFalse(is_trivial_shard(Replicate(), (1, 4)))
 
     def test_is_trivial_shard_partial(self):
+        # [FUNCTION DOC] is_trivial_shard is false for Partial even on a shape with a
+        # size-1 dim.
         """Partial is not a trivial shard."""
         self.assertFalse(is_trivial_shard(Partial("sum"), (1, 4)))
 
     def test_normalize_placement_trivial_shard(self):
+        # [FUNCTION DOC] normalize_placement turns a Shard on a size-1 dim into Replicate.
         """Trivial shards should normalize to Replicate."""
         result = normalize_placement(Shard(0), (1, 4))
         self.assertIsInstance(result, Replicate)
@@ -103,23 +129,29 @@ class TestPlacementNormalization(TestCase):
         self.assertIsInstance(result, Replicate)
 
     def test_normalize_placement_normal_shard(self):
+        # [FUNCTION DOC] normalize_placement keeps a Shard on a non-size-1 dim unchanged
+        # (same dim).
         """Non-trivial shards should stay as Shard."""
         result = normalize_placement(Shard(0), (4, 3))
         self.assertIsInstance(result, Shard)
         self.assertEqual(result.dim, 0)
 
     def test_normalize_placement_replicate(self):
+        # [FUNCTION DOC] normalize_placement keeps Replicate as Replicate.
         """Replicate should stay as Replicate."""
         result = normalize_placement(Replicate(), (4, 3))
         self.assertIsInstance(result, Replicate)
 
     def test_normalize_placement_partial(self):
+        # [FUNCTION DOC] normalize_placement keeps Partial unchanged, including its reduce_op.
         """Partial should stay as Partial."""
         result = normalize_placement(Partial("sum"), (4, 3))
         self.assertIsInstance(result, Partial)
         self.assertEqual(result.reduce_op, "sum")
 
     def test_normalize_placement_str_trivial_shard(self):
+        # [FUNCTION DOC] normalize_placement_str maps a string for a trivial shard to the
+        # string R.
         """Trivial shard strings should normalize to 'R'."""
         result = normalize_placement_str("S(0)", (1, 4))
         self.assertEqual(result, "R")
@@ -128,11 +160,15 @@ class TestPlacementNormalization(TestCase):
         self.assertEqual(result, "R")
 
     def test_normalize_placement_str_normal_shard(self):
+        # [FUNCTION DOC] normalize_placement_str leaves a shard string on a non-trivial
+        # dim unchanged.
         """Non-trivial shard strings should stay unchanged."""
         result = normalize_placement_str("S(0)", (4, 3))
         self.assertEqual(result, "S(0)")
 
     def test_normalize_combo_key_trivial_output(self):
+        # [FUNCTION DOC] normalize_combo_key rewrites a shard in the output side to R when the
+        # output dim it shards has size 1, while the partial input stays as is.
         """Combo keys with trivial output shard should normalize output to R."""
         # P(max) -> S(0) on output [1,1,1] should become P(max) -> R
         combo = (("P(max)",), ("S(0)",))
@@ -143,6 +179,8 @@ class TestPlacementNormalization(TestCase):
         self.assertEqual(result, (("P(max)",), ("R",)))
 
     def test_normalize_combo_key_trivial_input(self):
+        # [FUNCTION DOC] normalize_combo_key rewrites a shard on a size-1 input dim to R for
+        # that input tensor, using the per-input shapes.
         """Combo keys with trivial input shard should normalize input to R."""
         # S(0),R -> R on input [1,4],[4,4] should become R,R -> R
         combo = (("S(0)", "R"), ("R",))
@@ -153,6 +191,8 @@ class TestPlacementNormalization(TestCase):
         self.assertEqual(result, (("R", "R"), ("R",)))
 
     def test_normalize_combo_key_all_trivial(self):
+        # [FUNCTION DOC] normalize_combo_key turns every shard into R when all tensors have only
+        # size-1 dims.
         """All-size-1 tensor should normalize all shards to R."""
         # S(0),S(1) -> S(2) on shape [1,1,1] should become R,R -> R
         combo = (("S(0)", "S(1)"), ("S(2)",))
@@ -163,6 +203,8 @@ class TestPlacementNormalization(TestCase):
         self.assertEqual(result, (("R", "R"), ("R",)))
 
     def test_normalize_combo_key_no_change(self):
+        # [FUNCTION DOC] normalize_combo_key returns an equal combo when no shard targets a
+        # size-1 dim.
         """Normal-sized tensors should not change."""
         combo = (("S(0)", "S(1)"), ("S(0)",))
         input_shapes = ((4, 3), (4, 3))
@@ -172,6 +214,8 @@ class TestPlacementNormalization(TestCase):
         self.assertEqual(result, combo)
 
     def test_normalize_combo_key_partial_unchanged(self):
+        # [FUNCTION DOC] normalize_combo_key never changes Partial placements, even with all
+        # size-1 shapes.
         """Partial placements should never be normalized."""
         combo = (("P(max)", "P(sum)"), ("P(max)",))
         input_shapes = ((1, 1), (1, 1))  # Even with all-size-1
@@ -181,6 +225,9 @@ class TestPlacementNormalization(TestCase):
         self.assertEqual(result, combo)  # Partials unchanged
 
     def test_normalize_deduplicates_equivalent_rules(self):
+        # [FUNCTION DOC] Builds the set of normalized keys for partial-max to shard(dim) on a
+        # squeeze-like shape plus the explicit R variant, and checks they collapse to a
+        # single rule.
         """
         Verify that normalization deduplicates equivalent rules.
 
@@ -212,9 +259,13 @@ class TestPlacementNormalization(TestCase):
 
 
 class TestInputPlacements(TestCase):
+    # [CLASS DOC] Tests the counts and kinds of placements produced for input and output tensors
+    # by get_1d_input_placements_for_tensor and get_1d_output_placements_for_tensor.
     """Test input/output placement generation."""
 
     def test_get_1d_input_placements(self):
+        # [FUNCTION DOC] Without partials a 2D tensor yields Replicate then one Shard per dim
+        # (3 total).
         t = torch.randn(4, 3)
         placements = get_1d_input_placements_for_tensor(t, include_partial=False)
         # Should have Replicate + 2 Shard (one per dim)
@@ -224,24 +275,32 @@ class TestInputPlacements(TestCase):
         self.assertIsInstance(placements[2], Shard)
 
     def test_get_1d_input_placements_with_partial(self):
+        # [FUNCTION DOC] With include_partial a 2D float tensor yields 7 placements (R, 2
+        # shards, 4 partials).
         t = torch.randn(4, 3)
         placements = get_1d_input_placements_for_tensor(t, include_partial=True)
         # Should have Replicate + 2 Shard + 4 Partial
         self.assertEqual(len(placements), 7)
 
     def test_get_1d_output_placements_float(self):
+        # [FUNCTION DOC] Output placements for a 2D float tensor number 7: R, 2 shards,
+        # 4 partials.
         t = torch.randn(4, 3)
         placements = get_1d_output_placements_for_tensor(t)
         # Should have Replicate + 2 Shard + 4 Partial
         self.assertEqual(len(placements), 7)
 
     def test_get_1d_output_placements_integer(self):
+        # [FUNCTION DOC] Output placements for a 2D integer tensor also number 7, so all partial
+        # kinds are included for integer dtypes.
         t = torch.randint(0, 10, (4, 3))
         placements = get_1d_output_placements_for_tensor(t)
         # Should have Replicate + 2 Shard + 4 Partial (all types)
         self.assertEqual(len(placements), 7)
 
     def test_get_1d_output_placements_scalar(self):
+        # [FUNCTION DOC] A 0-dim float tensor gets Replicate first plus the four partials sum,
+        # avg, min, max (5 total), with no shards.
         t = torch.tensor(1.0)
         placements = get_1d_output_placements_for_tensor(t)
         # Scalars should have Replicate + 4 Partial (sum, avg, min, max)
@@ -251,6 +310,8 @@ class TestInputPlacements(TestCase):
         self.assertEqual(partial_ops, {"sum", "avg", "min", "max"})
 
     def test_get_1d_output_placements_integer_scalar(self):
+        # [FUNCTION DOC] A 0-dim integer tensor gets Replicate plus the four partial kinds
+        # (5 total).
         t = torch.tensor(1)
         placements = get_1d_output_placements_for_tensor(t)
         # Integer scalars should have Replicate + 4 Partial (all types)
@@ -259,6 +320,8 @@ class TestInputPlacements(TestCase):
         self.assertEqual(partial_ops, {"sum", "avg", "min", "max"})
 
     def test_get_1d_input_placements_scalar_with_partial(self):
+        # [FUNCTION DOC] A 0-dim float tensor with include_partial gets Replicate plus the four
+        # partial kinds as input placements.
         t = torch.tensor(1.0)
         placements = get_1d_input_placements_for_tensor(t, include_partial=True)
         # Scalars should have Replicate + 4 Partial
@@ -267,6 +330,8 @@ class TestInputPlacements(TestCase):
         self.assertEqual(partial_ops, {"sum", "avg", "min", "max"})
 
     def test_get_1d_input_placements_boolean_no_partial(self):
+        # [FUNCTION DOC] A boolean tensor with include_partial=True gets no Partial
+        # input placements.
         t = torch.tensor(True)
         placements = get_1d_input_placements_for_tensor(t, include_partial=True)
         # Boolean tensors should have no Partial placements since Partial
@@ -275,6 +340,7 @@ class TestInputPlacements(TestCase):
         self.assertEqual(len(partial_placements), 0)
 
     def test_get_1d_output_placements_boolean_no_partial(self):
+        # [FUNCTION DOC] A boolean tensor gets no Partial output placements.
         t = torch.tensor(True)
         placements = get_1d_output_placements_for_tensor(t)
         # Boolean outputs should have no Partial placements
@@ -282,6 +348,8 @@ class TestInputPlacements(TestCase):
         self.assertEqual(len(partial_placements), 0)
 
     def test_get_1d_input_placements_boolean_2d(self):
+        # [FUNCTION DOC] A 2D boolean tensor gets only Replicate and two Shards (3),
+        # no Partials.
         t = torch.tensor([[True, False], [False, True]])
         placements = get_1d_input_placements_for_tensor(t, include_partial=True)
         # Boolean 2D: Replicate + 2 Shard, no Partial
@@ -291,15 +359,19 @@ class TestInputPlacements(TestCase):
 
 
 class TestExtractTensors(TestCase):
+    # [CLASS DOC] Tests extract_tensors_from_sample on SampleInput objects.
     """Test tensor extraction from samples."""
 
     def test_extract_single_input(self):
+        # [FUNCTION DOC] A sample with a single input tensor yields one entry whose name
+        # is tensor_0.
         sample = SampleInput(torch.randn(4, 3))
         tensors = extract_tensors_from_sample(sample)
         self.assertEqual(len(tensors), 1)
         self.assertEqual(tensors[0][0], "tensor_0")
 
     def test_extract_with_args(self):
+        # [FUNCTION DOC] A sample with one tensor in args yields two extracted tensors.
         sample = SampleInput(
             torch.randn(4, 3),
             args=(
@@ -312,27 +384,37 @@ class TestExtractTensors(TestCase):
         self.assertEqual(len(tensors), 2)
 
     def test_extract_with_kwargs(self):
+        # [FUNCTION DOC] A sample with one tensor in kwargs yields two extracted tensors.
         sample = SampleInput(torch.randn(4, 3), kwargs={"other": torch.randn(4, 3)})
         tensors = extract_tensors_from_sample(sample)
         self.assertEqual(len(tensors), 2)
 
 
 class TestValidateCombination(TestCase):
+    # [CLASS DOC] Tests validate_combination against ground-truth outputs on a 2-rank
+    # LocalTensorMode mesh. Class attribute world_size is 2; setUp/tearDown manage a fake
+    # process group.
     """Test the core validate_combination function."""
 
     world_size = 2
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Initializes a fake-backend default process group of size
+        # world_size if none is initialized yet.
         super().setUp()
         if not dist.is_initialized():
             dist.init_process_group("fake", rank=0, world_size=self.world_size)
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Destroys the default process group if one is initialized.
         super().tearDown()
         if dist.is_initialized():
             dist.destroy_process_group()
 
     def test_nan_output_valid_when_both_nan(self):
+        # [FUNCTION DOC] igamma with negative inputs gives an all-NaN ground truth; checks that
+        # the shard (0) plus replicate to shard(0) combo is judged valid because NaNs in
+        # matching places compare as equal.
         """Test that NaN outputs are considered valid when both ground truth and sharded match.
 
         igamma with negative inputs produces NaN. When sharding produces the same
@@ -362,6 +444,8 @@ class TestValidateCombination(TestCase):
         self.assertTrue(is_valid, lambda _m: f"{_m}\nNaN outputs should match: {msg}")
 
     def test_integer_output_includes_partial_sum(self):
+        # [FUNCTION DOC] For int32 and int64 outputs, checks the output placements include a
+        # Partial with reduce_op sum (needed for ops like bucketize).
         """
         P(sum) must be included in output placements for integer dtypes.
 
@@ -382,6 +466,10 @@ class TestValidateCombination(TestCase):
             )
 
     def test_exhaustive_binary_op_rules(self):
+        # [FUNCTION DOC] For add, mul, div and maximum on 8x4 random inputs, enumerates every
+        # non-fully-replicated input placement pair and every output placement, runs
+        # validate_combination, and asserts validity iff the combo appears in the hand-written
+        # valid-rule table. The avg and min partials are added only when TEST_WITH_SLOW is set.
         """
         Exhaustively test all placement combinations for binary ops.
 
@@ -391,6 +479,9 @@ class TestValidateCombination(TestCase):
         """
 
         def parse_rule(rule_str):
+            # [FUNCTION DOC] HELPER: Parses a rule string of inputs joined by commas, an arrow,
+            # and an output into a pair of (tuple of input placements, one-element tuple of
+            # output placement).
             """Parse 'S(0),S(0)->S(0)' into ((Shard(0), Shard(0)), Shard(0))."""
             inputs_str, output_str = rule_str.split("->")
             inputs = tuple(parse_placement(s.strip()) for s in inputs_str.split(","))
@@ -537,6 +628,9 @@ class TestValidateCombination(TestCase):
                                 )
 
     def test_add_alpha_negates_partial_max_to_min(self):
+        # [FUNCTION DOC] With add using alpha of -1, checks replicate plus partial-max is valid
+        # for partial-min output, invalid for partial-max output, and partial-max plus replicate
+        # is valid for partial-max output.
         """
         Test that add with alpha=-1 converts P(max) to P(min).
 
@@ -604,9 +698,13 @@ class TestValidateCombination(TestCase):
 
 
 class TestCreatePartialInput(TestCase):
+    # [CLASS DOC] Tests _create_partial_input and _checkerboard_mask, which build per-rank local
+    # values that reduce to the original tensor under a given Partial reduce_op.
     """Test the _create_partial_input helper."""
 
     def test_partial_sum_reduces_correctly(self):
+        # [FUNCTION DOC] For Partial sum with 2 ranks, the per-rank local tensors add up to
+        # the original.
         tensor = torch.randn(4, 3)
         local_tensor = _create_partial_input(tensor, Partial("sum"), world_size=2)
 
@@ -615,6 +713,8 @@ class TestCreatePartialInput(TestCase):
         self.assertTrue(torch.allclose(total, tensor))
 
     def test_partial_avg_reduces_correctly(self):
+        # [FUNCTION DOC] For Partial avg with 2 ranks, the mean of the per-rank tensors equals
+        # the original.
         tensor = torch.randn(4, 3)
         local_tensor = _create_partial_input(tensor, Partial("avg"), world_size=2)
 
@@ -624,6 +724,8 @@ class TestCreatePartialInput(TestCase):
         self.assertTrue(torch.allclose(avg, tensor))
 
     def test_partial_min_reduces_correctly(self):
+        # [FUNCTION DOC] For Partial min with 2 ranks, the elementwise min over ranks equals
+        # the original.
         tensor = torch.randn(4, 3)
         local_tensor = _create_partial_input(tensor, Partial("min"), world_size=2)
 
@@ -633,6 +735,8 @@ class TestCreatePartialInput(TestCase):
         self.assertTrue(torch.allclose(result, tensor))
 
     def test_partial_max_reduces_correctly(self):
+        # [FUNCTION DOC] For Partial max with 2 ranks, the elementwise max over ranks equals
+        # the original.
         tensor = torch.randn(4, 3)
         local_tensor = _create_partial_input(tensor, Partial("max"), world_size=2)
 
@@ -642,6 +746,8 @@ class TestCreatePartialInput(TestCase):
         self.assertTrue(torch.allclose(result, tensor))
 
     def test_tensor_idx_produces_different_sum_ratios(self):
+        # [FUNCTION DOC] Checks that tensor_idx 0 and 1 both still sum to the original but give
+        # different per-rank values, so two partial inputs do not share one split ratio.
         """
         Verify that different tensor_idx values produce different P(sum) ratios.
 
@@ -675,6 +781,8 @@ class TestCreatePartialInput(TestCase):
         )
 
     def test_tensor_idx_produces_different_max_patterns(self):
+        # [FUNCTION DOC] Checks that tensor_idx 0 and 1 for Partial max both reduce to the
+        # original tensor but yield different rank-0 local values (shifted offset patterns).
         """
         Verify that different tensor_idx values produce different P(max) offset patterns.
 
@@ -705,6 +813,8 @@ class TestCreatePartialInput(TestCase):
         )
 
     def test_checkerboard_mask_alternates_every_dim(self):
+        # [FUNCTION DOC] On a 4D tensor with an even-stride leading dim, checks the checkerboard
+        # mask takes different values for each adjacent pair of elements along dim 0.
         """
         The checkerboard mask must alternate along every dimension.
 
@@ -739,6 +849,9 @@ class TestCreatePartialInput(TestCase):
                         )
 
     def test_pmin_pmax_adaptive_offset_exceeds_range(self):
+        # [FUNCTION DOC] For Partial min and max on a tensor with large value range, checks the
+        # offset between rank 0 and rank 1 locals exceeds the value range and the two ranks
+        # disagree on the argmin position.
         """
         P(min)/P(max) offsets must exceed the tensor's value range.
 
@@ -772,6 +885,8 @@ class TestCreatePartialInput(TestCase):
 
 
 class TestPartialCombinationValidity(TestCase):
+    # [CLASS DOC] Tests that known-invalid partial combinations are rejected by
+    # validate_combination. world_size is 2; setUp/tearDown manage a fake process group.
     """
     Tests that verify invalid partial combinations are correctly detected.
 
@@ -782,16 +897,21 @@ class TestPartialCombinationValidity(TestCase):
     world_size = 2
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Initializes a fake-backend default process group of size
+        # world_size if none is initialized yet.
         super().setUp()
         if not dist.is_initialized():
             dist.init_process_group("fake", rank=0, world_size=self.world_size)
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Destroys the default process group if one is initialized.
         super().tearDown()
         if dist.is_initialized():
             dist.destroy_process_group()
 
     def test_abs_psum_psum_is_invalid(self):
+        # [FUNCTION DOC] abs with partial sum input and partial sum output must be judged
+        # invalid, since abs is non-linear and the inputs have mixed signs.
         """
         P(sum)->P(sum) is NOT valid for abs (or any non-linear elementwise op).
 
@@ -819,6 +939,8 @@ class TestPartialCombinationValidity(TestCase):
         )
 
     def test_abs_pavg_pavg_is_invalid(self):
+        # [FUNCTION DOC] abs with partial avg input and partial avg output must be
+        # judged invalid.
         """P(avg)->P(avg) is NOT valid for abs, same reasoning as P(sum)."""
         t = torch.tensor([1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0])
         sample = SampleInput(t)
@@ -839,6 +961,9 @@ class TestPartialCombinationValidity(TestCase):
         )
 
     def test_all_zero_output_false_positive(self):
+        # [FUNCTION DOC] With zeros_like and an all-zero ground truth, partial sum to partial
+        # sum is judged valid; documents this false positive, which compare_operator avoids by
+        # skipping all-zero samples.
         """
         All-zero ground truth makes every placement trivially validate.
 
@@ -881,6 +1006,9 @@ class TestPartialCombinationValidity(TestCase):
         )
 
     def test_argmin_rejects_pmax_input(self):
+        # [FUNCTION DOC] For argmin with dim 0 and keepdim on a 4D tensor, checks partial min
+        # and partial max inputs with replicate output are judged invalid because ranks disagree
+        # on indices.
         """
         P(max) -> R must be rejected for argmin.
 
@@ -923,21 +1051,30 @@ class TestPartialCombinationValidity(TestCase):
 
 
 class TestDecompStrategyPath(TestCase):
+    # [CLASS DOC] Tests the decomposition-based sharding strategy path used when an op has no
+    # registered strategy. world_size is 2; setUp/tearDown manage a fake process group.
     """Test that decomposition-based strategy propagation discovers rules."""
 
     world_size = 2
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Initializes a fake-backend default process group of size
+        # world_size if none is initialized yet.
         super().setUp()
         if not dist.is_initialized():
             dist.init_process_group("fake", rank=0, world_size=self.world_size)
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Destroys the default process group if one is initialized.
         super().tearDown()
         if dist.is_initialized():
             dist.destroy_process_group()
 
     def test_decomp_discovers_rules_for_softplus(self):
+        # [FUNCTION DOC] Skips if the decompositions module cannot be imported. Otherwise builds
+        # a DTensorSpec sharded on dim 0 for an 8x4 tensor, runs the decomp strategy propagator
+        # for aten.softplus, and checks that _extract_rules_from_op_strategy finds the
+        # elementwise shard(0) and shard(1) rules.
         """
         Exercise DecompShardingStrategy.propagate_strategy directly on a unary
         op (softplus) whose decomposition uses only registered ops.
@@ -985,6 +1122,11 @@ class TestDecompStrategyPath(TestCase):
         self.assertIn((("S(1)",), ("S(1)",)), rules)
 
     def test_compare_operator_uses_decomp_path(self):
+        # [FUNCTION DOC] Skips if the decompositions module is missing. Temporarily removes
+        # addcmul from the propagator's strategy and single-dim strategy registries and shrinks
+        # OpInfo sample sizes so they shard evenly, then runs compare_operator and asserts some
+        # true positives and no false positives. The finally block restores both registries and
+        # the sizes in opinfo core and common_methods_invocations.
         """
         compare_operator should find rules via the decomp path when an op is
         not registered in op_strategy_funcs or op_single_dim_strategy_funcs.
@@ -1051,9 +1193,15 @@ class TestDecompStrategyPath(TestCase):
 
 
 class TestQuerySingleDimStrategyKwargs(TestCase):
+    # [CLASS DOC] Tests that query_single_dim_strategy passes the call's kwargs on to
+    # strategy functions.
     """Test that query_single_dim_strategy forwards kwargs to strategy functions."""
 
     def test_kwargs_forwarded_to_strategy(self):
+        # [FUNCTION DOC] Replaces the registered single-dim strategy for aten.add.Tensor with
+        # one that returns a partial-min rule when alpha is negative, queries with alpha of -1,
+        # and checks the third rule's first entry is a Partial with reduce_op min. The original
+        # registration is restored (or removed if there was none) in a finally block.
         """
         A kwargs-aware strategy should receive the actual kwargs, not {}.
 
@@ -1074,6 +1222,10 @@ class TestQuerySingleDimStrategyKwargs(TestCase):
         # With alpha >= 0: R,P(max)->P(max) is valid
         # With alpha < 0:  R,P(max)->P(min) is valid (negation flips max to min)
         def alpha_aware_add_strategy(op, args_schema, kwargs_schema):
+            # [FUNCTION DOC] HELPER: Fake add strategy: always returns shard(0) and
+            # partial-sum rules, plus one more rule whose first entry is partial min when
+            # kwargs alpha is below zero, else partial max. Reads alpha from the kwargs
+            # mapping, defaulting to 1.
             alpha = kwargs_schema.get("alpha", 1)
             rules = [
                 [
@@ -1115,9 +1267,13 @@ class TestQuerySingleDimStrategyKwargs(TestCase):
 
 
 class TestCompareRules(TestCase):
+    # [CLASS DOC] Tests that _compare_rules records true positives per aten op
+    # in ComparisonStats.
     """Test _compare_rules populates per-op statistics correctly."""
 
     def test_true_positives_tracked_by_op(self):
+        # [FUNCTION DOC] Two matching rules give 2 true positives, counted under the
+        # aten.relu.default name, with no false positives or negatives.
         from torch.distributed.tensor._ops.strategy_validation import (
             _compare_rules,
             ComparisonStats,
@@ -1144,6 +1300,8 @@ class TestCompareRules(TestCase):
         self.assertEqual(len(stats.false_negatives), 0)
 
     def test_per_op_breakdown_multiple_aten_ops(self):
+        # [FUNCTION DOC] Compares multi-output rules for aten.max.dim and native_layer_norm in
+        # separate calls and checks the per-op true positive counts are 1 each, total 2.
         """Simulate an opinfo that dispatches to different aten variants per sample."""
         from torch.distributed.tensor._ops.strategy_validation import (
             _compare_rules,
@@ -1188,6 +1346,8 @@ class TestCompareRules(TestCase):
         )
 
     def test_false_positives_and_negatives_not_in_by_op(self):
+        # [FUNCTION DOC] With disjoint ground-truth and DTensor rules, checks zero true
+        # positives, an empty per-op mapping, and one false positive plus one false negative.
         """true_positives_by_op only tracks true positives, not FP/FN."""
         from torch.distributed.tensor._ops.strategy_validation import (
             _compare_rules,
@@ -1216,21 +1376,29 @@ class TestCompareRules(TestCase):
 
 
 class TestCompareOperatorEndToEnd(TestCase):
+    # [CLASS DOC] End-to-end smoke tests of compare_operator on real OpInfos with a fake process
+    # group. world_size is 2; setUp/tearDown manage the group.
     """End-to-end smoke test for compare_operator."""
 
     world_size = 2
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Initializes a fake-backend default process group of size
+        # world_size if none is initialized yet.
         super().setUp()
         if not dist.is_initialized():
             dist.init_process_group("fake", rank=0, world_size=self.world_size)
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Destroys the default process group if one is initialized.
         super().tearDown()
         if dist.is_initialized():
             dist.destroy_process_group()
 
     def _with_even_sizes(self, fn):
+        # [FUNCTION DOC] HELPER: Overrides the OpInfo size constants L, M, S, XS to 24, 12, 4, 2
+        # in opinfo core and common_methods_invocations, calls fn, returns its result, and
+        # restores the original sizes in a finally block.
         """Run fn with opinfo sizes overridden to be evenly divisible by world_size."""
         import torch.testing._internal.common_methods_invocations as common_ops
         from torch.testing._internal.opinfo import core as opinfo_core
@@ -1257,10 +1425,13 @@ class TestCompareOperatorEndToEnd(TestCase):
             ) = orig_sizes
 
     def test_compare_operator_add_no_incorrect(self):
+        # [FUNCTION DOC] compare_operator on add (CPU, float32, incorrect_only) should report
+        # true positives and no false positives.
         """compare_operator on add should find valid rules with no incorrect ones."""
         from torch.distributed.tensor._ops.strategy_validation import compare_operator
 
         def run():
+            # [FUNCTION DOC] HELPER: Runs compare_operator for add and asserts the statistics.
             stats = compare_operator(
                 "add",
                 device="cpu",
@@ -1274,10 +1445,13 @@ class TestCompareOperatorEndToEnd(TestCase):
         self._with_even_sizes(run)
 
     def test_compare_operator_split_multi_output(self):
+        # [FUNCTION DOC] compare_operator on the multi-output op split should run some samples
+        # and report no false positives.
         """compare_operator should handle multi-output ops like split."""
         from torch.distributed.tensor._ops.strategy_validation import compare_operator
 
         def run():
+            # [FUNCTION DOC] HELPER: Runs compare_operator for split and asserts the statistics.
             stats = compare_operator(
                 "split",
                 device="cpu",
@@ -1295,6 +1469,8 @@ class TestCompareOperatorEndToEnd(TestCase):
         self._with_even_sizes(run)
 
     def test_compare_operator_runtime_schema_ops(self):
+        # [FUNCTION DOC] For flip and roll (ops with non-tensor positional args), asserts
+        # compare_operator finds at least one true positive, in a subTest per op.
         """Ops with RuntimeSchemaInfo (non-tensor positional args) should find DTensor rules."""
         from torch.distributed.tensor._ops.strategy_validation import compare_operator
 
@@ -1303,6 +1479,8 @@ class TestCompareOperatorEndToEnd(TestCase):
             with self.subTest(op=op_name):
 
                 def run(name=op_name):
+                    # [FUNCTION DOC] HELPER: Runs compare_operator for the bound op name and
+                    # asserts true positives.
                     stats = compare_operator(
                         name,
                         device="cpu",
@@ -1321,21 +1499,29 @@ class TestCompareOperatorEndToEnd(TestCase):
 
 
 class TestAtenLevelValidation(TestCase):
+    # [CLASS DOC] Tests aten-level validation: validate_aten_combination and compare_operator
+    # with allow_composite. world_size is 2; setUp/tearDown manage a fake process group.
     """Tests for aten-level validation (validate_aten_combination + allow_composite mode)."""
 
     world_size = 2
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Initializes a fake-backend default process group of size
+        # world_size if none is initialized yet.
         super().setUp()
         if not dist.is_initialized():
             dist.init_process_group("fake", rank=0, world_size=self.world_size)
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Destroys the default process group if one is initialized.
         super().tearDown()
         if dist.is_initialized():
             dist.destroy_process_group()
 
     def _with_even_sizes(self, fn):
+        # [FUNCTION DOC] HELPER: Overrides the OpInfo size constants L, M, S, XS to 24, 12, 4, 2
+        # in opinfo core and common_methods_invocations, calls fn, returns its result, and
+        # restores the original sizes in a finally block.
         import torch.testing._internal.common_methods_invocations as common_ops
         from torch.testing._internal.opinfo import core as opinfo_core
 
@@ -1361,6 +1547,8 @@ class TestAtenLevelValidation(TestCase):
             ) = orig_sizes
 
     def test_validate_aten_combination_shard_add(self):
+        # [FUNCTION DOC] For aten.add.Tensor on length-8 inputs, shard(0),shard(0) to shard(0)
+        # validates as valid and the same inputs with replicate output validates as invalid.
         """S(0), S(0) -> S(0) valid; S(0), S(0) -> R invalid for aten.add."""
         a = torch.randn(8)
         b = torch.randn(8)
@@ -1392,10 +1580,15 @@ class TestAtenLevelValidation(TestCase):
             self.assertFalse(valid)
 
     def test_allow_composite_eliminates_non_1to1_skips(self):
+        # [FUNCTION DOC] Runs compare_operator for inner with and without allow_composite and
+        # checks the default run skips samples for non-1:1 aten mapping, the composite run skips
+        # none, and the composite run covers at least as many samples.
         """allow_composite mode should validate decomposed ops that default mode skips."""
         from torch.distributed.tensor._ops.strategy_validation import compare_operator
 
         def run():
+            # [FUNCTION DOC] HELPER: Runs both compare_operator calls for inner and asserts
+            # the results.
             default = compare_operator(
                 "inner",
                 device="cpu",
@@ -1425,9 +1618,13 @@ class TestAtenLevelValidation(TestCase):
 
 
 class TestMainModule(TestCase):
+    # [CLASS DOC] Tests running the strategy_validation module as a main program in
+    # a subprocess.
     """Test that strategy_validation can be run as a main module."""
 
     def _run_module(self, *extra_args):
+        # [FUNCTION DOC] HELPER: Runs the module with a fresh Python on cpu plus extra args,
+        # with a 120 second timeout, asserts exit code 0, and returns the captured stdout.
         import subprocess
         import sys
 
@@ -1453,87 +1650,117 @@ class TestMainModule(TestCase):
         return result.stdout
 
     def test_run_as_module_default(self):
+        # [FUNCTION DOC] Running with no extra arguments exits cleanly and stdout mentions add
+        # and Correct.
         """Running with no args should validate 'add' and exit cleanly."""
         stdout = self._run_module()
         self.assertIn("add", stdout)
         self.assertIn("Correct", stdout)
 
     def test_run_with_op_flag(self):
+        # [FUNCTION DOC] Running with op mul and incorrect-only exits cleanly and stdout
+        # mentions mul.
         """Running with --op mul --incorrect-only should work."""
         stdout = self._run_module("--op", "mul", "--incorrect-only")
         self.assertIn("mul", stdout)
 
 
 class TestOpInfoLookup(TestCase):
+    # [CLASS DOC] Tests get_opinfo_by_name, _find_opinfo_candidates and resolve_op_names.
     """Tests for get_opinfo_by_name, _find_opinfo_candidates, and resolve_op_names."""
 
     def test_get_opinfo_by_name_exact(self):
+        # [FUNCTION DOC] Looking up add returns a non-empty list whose items are all named add.
         results = get_opinfo_by_name("add")
         self.assertGreater(len(results), 0)
         for op in results:
             self.assertEqual(op.name, "add")
 
     def test_get_opinfo_by_name_qualified(self):
+        # [FUNCTION DOC] Looking up the qualified name nn.functional.relu returns matching
+        # OpInfos only.
         results = get_opinfo_by_name("nn.functional.relu")
         self.assertGreater(len(results), 0)
         for op in results:
             self.assertEqual(op.name, "nn.functional.relu")
 
     def test_get_opinfo_by_name_not_found_with_suggestions(self):
+        # [FUNCTION DOC] Looking up relu raises ValueError whose message has a did-you-mean hint
+        # naming nn.functional.relu.
         with self.assertRaises(ValueError) as ctx:
             get_opinfo_by_name("relu")
         self.assertIn("did you mean", str(ctx.exception))
         self.assertIn("nn.functional.relu", str(ctx.exception))
 
     def test_get_opinfo_by_name_not_found_no_suggestions(self):
+        # [FUNCTION DOC] Looking up an unknown name raises ValueError without a
+        # did-you-mean hint.
         with self.assertRaises(ValueError) as ctx:
             get_opinfo_by_name("this_op_does_not_exist_xyz")
         self.assertNotIn("did you mean", str(ctx.exception))
 
     def test_find_opinfo_candidates_aten_name(self):
+        # [FUNCTION DOC] _find_opinfo_candidates for relu includes nn.functional.relu
+        # (via aten_name).
         # relu OpInfo has aten_name="relu" explicitly set
         candidates = _find_opinfo_candidates("relu")
         self.assertIn("nn.functional.relu", candidates)
 
     def test_find_opinfo_candidates_suffix(self):
+        # [FUNCTION DOC] _find_opinfo_candidates for dropout includes nn.functional.dropout
+        # (suffix match).
         candidates = _find_opinfo_candidates("dropout")
         self.assertIn("nn.functional.dropout", candidates)
 
     def test_find_opinfo_candidates_no_match(self):
+        # [FUNCTION DOC] _find_opinfo_candidates returns an empty list for an unknown name.
         candidates = _find_opinfo_candidates("this_op_does_not_exist_xyz")
         self.assertEqual(candidates, [])
 
     def test_resolve_op_names_exact(self):
+        # [FUNCTION DOC] resolve_op_names on an exact name returns it as is.
         result = resolve_op_names(["add"])
         self.assertEqual(result, ["add"])
 
     def test_resolve_op_names_qualified(self):
+        # [FUNCTION DOC] resolve_op_names on a qualified name returns it as is.
         result = resolve_op_names(["nn.functional.relu"])
         self.assertEqual(result, ["nn.functional.relu"])
 
     def test_resolve_op_names_multiple(self):
+        # [FUNCTION DOC] resolve_op_names on several names returns them in order.
         result = resolve_op_names(["add", "mul"])
         self.assertEqual(result, ["add", "mul"])
 
     def test_resolve_op_names_deduplicates(self):
+        # [FUNCTION DOC] resolve_op_names removes duplicate names.
         result = resolve_op_names(["add", "add"])
         self.assertEqual(result, ["add"])
 
     def test_resolve_op_names_glob(self):
+        # [FUNCTION DOC] resolve_op_names expands a glob pattern to matching names.
         result = resolve_op_names(["nn.functional.relu*"])
         self.assertIn("nn.functional.relu", result)
 
     def test_resolve_op_names_glob_no_match(self):
+        # [FUNCTION DOC] resolve_op_names raises ValueError mentioning no OpInfo names match
+        # when a glob matches nothing.
         with self.assertRaises(ValueError) as ctx:
             resolve_op_names(["zzz_no_match_*"])
         self.assertIn("No OpInfo names match", str(ctx.exception))
 
     def test_resolve_op_names_unambiguous_shorthand(self):
+        # [FUNCTION DOC] resolve_op_names on the full qualified relu name includes it in
+        # the result.
+        # KNOWN ISSUE: the comment says relu shorthand but the call passes the full name.
         # "relu" should resolve unambiguously to "nn.functional.relu"
         result = resolve_op_names(["nn.functional.relu"])
         self.assertIn("nn.functional.relu", result)
 
     def test_resolve_op_names_ambiguous_shorthand(self):
+        # [FUNCTION DOC] If dropout has more than one candidate, resolve_op_names
+        # raises ValueError whose message says ambiguous; does nothing when there is
+        # only one candidate.
         # "dropout" matches nn.functional.dropout, nn.functional.dropout2d, etc.
         candidates = _find_opinfo_candidates("dropout")
         if len(candidates) > 1:
@@ -1542,6 +1769,7 @@ class TestOpInfoLookup(TestCase):
             self.assertIn("ambiguous", str(ctx.exception))
 
     def test_resolve_op_names_not_found(self):
+        # [FUNCTION DOC] resolve_op_names raises ValueError for an unknown name.
         with self.assertRaises(ValueError):
             resolve_op_names(["this_op_does_not_exist_xyz"])
 
