@@ -3,6 +3,13 @@
 
 # ruff: noqa
 # flake8: noqa
+# [MODULE DOC] CPython 3.13 test_sort ported to run under Dynamo's CPythonTestCase. Tests list
+# sort and sorted: stress sizes with stability, insane or raising comparison functions, key
+# functions, mutation of the list during a sort (must raise ValueError), reverse stability, and
+# the optimized comparison paths (latin strings, ints, floats, tuples, objects) against the
+# generic rich-compare result. Import time side effect: inserts RedirectImportFinder at the front
+# of the import meta path so selected "test." submodules import their standalone module instead.
+# Also keeps a module level error counter used by the check helper.
 
 # Test copied from
 # https://raw.githubusercontent.com/python/cpython/refs/tags/v3.13.5/Lib/test/test_sort.py
@@ -35,7 +42,14 @@ redirect_imports = (
 )
 
 class RedirectImportFinder(importlib.abc.MetaPathFinder):
+    # [CLASS DOC] HELPER: import finder placed first on the import meta path. For module names in
+    # redirect_imports it imports the same module without the "test." prefix, registers it in the
+    # module table under the original name, and returns its spec; every other name falls through.
     def find_spec(self, fullname, path, target=None):
+        # [FUNCTION DOC] HELPER: finder hook. Returns the spec of the stripped-prefix module and
+        # registers that module under fullname when fullname is in the redirect list; returns None
+        # when the standalone import fails or the name is not in the list. The path and target
+        # arguments are unused.
         # Check if the import is the problematic one
         if fullname in redirect_imports:
             try:
@@ -66,6 +80,12 @@ nerrors = 0
 
 
 def check(tag, expected, raw, compare=None):
+    # [FUNCTION DOC] HELPER: sorts the list raw in place (using a comparator wrapped as a key when
+    # compare is given) and checks the result against expected by length and by identity at each
+    # index. On mismatch it prints diagnostics and increments the module counter nerrors, then
+    # returns; it does not raise. The tag labels messages; verbose mode prints progress.
+    # KNOWN ISSUE: failures only bump nerrors and print; no caller asserts on nerrors, so a wrong
+    #     sort order does not fail the tests that use this helper.
     global nerrors
 
     if verbose:
@@ -98,7 +118,13 @@ def check(tag, expected, raw, compare=None):
             return
 
 class TestBase(__TestCase):
+    # [CLASS DOC] Test case for list.sort over a range of sizes. Stateless.
     def testStressfully(self):
+        # [FUNCTION DOC] Stress test: for sizes around powers of two plus 10, 100 and 1000, sorts
+        # identity, reversed, shuffled, comparator-reversed and random-comparator inputs, checks
+        # that a raising key function propagates RuntimeError, that an element whose comparison
+        # randomly raises leaves a valid permutation, and that sorting is stable. Uses the random
+        # module and the check helper.
         # Try a variety of sizes at and around powers of 2, and at powers of 10.
         sizes = [0]
         for power in range(1, 10):
@@ -107,12 +133,17 @@ class TestBase(__TestCase):
         sizes.extend([10, 100, 1000])
 
         class Complains(object):
+            # [CLASS DOC] HELPER: sortable wrapper whose less-than occasionally (about one in a
+            # thousand) raises RuntimeError while the class flag maybe_complain is set.
             maybe_complain = True
 
             def __init__(self, i):
+                # [FUNCTION DOC] HELPER: stores the integer index i.
                 self.i = i
 
             def __lt__(self, other):
+                # [FUNCTION DOC] HELPER: randomly raises RuntimeError when complaints are enabled;
+                # otherwise compares the stored integers.
                 if Complains.maybe_complain and random.random() < 0.001:
                     if verbose:
                         print("        complaining at", self, other)
@@ -120,17 +151,23 @@ class TestBase(__TestCase):
                 return self.i < other.i
 
             def __repr__(self):
+                # [FUNCTION DOC] HELPER: text form showing the stored integer.
                 return "Complains(%d)" % self.i
 
         class Stable(object):
+            # [CLASS DOC] HELPER: sortable object ordered only by key, remembering its original
+            # index so stability can be checked.
             def __init__(self, key, i):
+                # [FUNCTION DOC] HELPER: stores the key and original index.
                 self.key = key
                 self.index = i
 
             def __lt__(self, other):
+                # [FUNCTION DOC] HELPER: orders by key only, ignoring the index.
                 return self.key < other.key
 
             def __repr__(self):
+                # [FUNCTION DOC] HELPER: text form showing key and index.
                 return "Stable(%d, %d)" % (self.key, self.index)
 
         for n in sizes:
@@ -163,6 +200,7 @@ class TestBase(__TestCase):
 
             if len(x) >= 2:
                 def bad_key(x):
+                    # [FUNCTION DOC] HELPER: key function that always raises RuntimeError.
                     raise RuntimeError
                 s = x[:]
                 self.assertRaises(RuntimeError, s.sort, key=bad_key)
@@ -188,6 +226,9 @@ class TestBase(__TestCase):
 
     @slowTest
     def test_small_stability(self):
+        # [FUNCTION DOC] Slow test: for all lists of lengths up to 9 over 3 distinct values,
+        # checks that sorting by the first field only (a key) gives the same result as full sort,
+        # which forces stability by the tie-breaking index. Decorated as a slow test.
         from itertools import product
         from operator import itemgetter
 
@@ -211,18 +252,26 @@ class TestBase(__TestCase):
 #==============================================================================
 
 class TestBugs(__TestCase):
+    # [CLASS DOC] Test case for sort crashers: mutating a list while it is being sorted.
 
     @unittest.skipIf(
         TEST_WITH_TORCHDYNAMO,
         "__build_class__ with closed over objects not supported",
     )
     def test_bug453523(self):
+        # [FUNCTION DOC] Checks that an element comparison which mutates the list being sorted
+        # makes sort raise ValueError instead of crashing. Skipped under Dynamo (closed over
+        # class bodies).
         # bug 453523 -- list.sort() crasher.
         # If this fails, the most likely outcome is a core dump.
         # Mutations during a list sort should raise a ValueError.
 
         class C:
+            # [CLASS DOC] HELPER: element type whose less-than randomly pops from or appends to
+            # the global list L, then returns a random truth value.
             def __lt__(self, other):
+                # [FUNCTION DOC] HELPER: mutates list L (pop with probability 0.75, else append)
+                # and returns a random boolean.
                 if L and random.random() < 0.75:
                     L.pop()
                 else:
@@ -237,16 +286,22 @@ class TestBugs(__TestCase):
         "__build_class__ with closed over objects not supported",
     )
     def test_undetected_mutation(self):
+        # [FUNCTION DOC] Checks twenty times that comparators mutating the list under sort (append
+        # plus pop, then append plus clear) cause ValueError. Skipped under Dynamo.
         # Python 2.4a1 did not always detect mutation
         memorywaster = []
         for i in range(20):
             def mutating_cmp(x, y):
+                # [FUNCTION DOC] HELPER: comparator that appends and pops on L (net no change)
+                # then returns the three-way comparison of its arguments.
                 L.append(3)
                 L.pop()
                 return (x > y) - (x < y)
             L = [1,2]
             self.assertRaises(ValueError, L.sort, key=cmp_to_key(mutating_cmp))
             def mutating_cmp(x, y):
+                # [FUNCTION DOC] HELPER: comparator that appends to L then clears it, then returns
+                # the three-way comparison of its arguments.
                 L.append(3)
                 del L[:]
                 return (x > y) - (x < y)
@@ -256,22 +311,31 @@ class TestBugs(__TestCase):
 #==============================================================================
 
 class TestDecorateSortUndecorate(__TestCase):
+    # [CLASS DOC] Test case for sorting with key functions: decorate, sort, undecorate behavior.
 
     def test_decorated(self):
+        # [FUNCTION DOC] Sorts a word list by lowercase key and by a comparator, but makes no
+        # assertion about the results.
+        # KNOWN ISSUE: neither sorted list is compared with anything, so the test only checks that
+        #     the calls do not raise.
         data = 'The quick Brown fox Jumped over The lazy Dog'.split()
         copy = data[:]
         random.shuffle(data)
         data.sort(key=str.lower)
         def my_cmp(x, y):
+            # [FUNCTION DOC] HELPER: case-insensitive three-way comparator for strings.
             xlower, ylower = x.lower(), y.lower()
             return (xlower > ylower) - (xlower < ylower)
         copy.sort(key=cmp_to_key(my_cmp))
 
     def test_baddecorator(self):
+        # [FUNCTION DOC] Checks a key function taking two arguments raises TypeError.
         data = 'The quick Brown fox Jumped over The lazy Dog'.split()
         self.assertRaises(TypeError, data.sort, key=lambda x,y: 0)
 
     def test_stability(self):
+        # [FUNCTION DOC] Checks sorting on the first tuple field is stable: equals a full
+        # tuple sort.
         data = [(random.randrange(100), i) for i in range(200)]
         copy = data[:]
         data.sort(key=lambda t: t[0])   # sort on the random first field
@@ -279,6 +343,8 @@ class TestDecorateSortUndecorate(__TestCase):
         self.assertEqual(data, copy)    # should get the same result
 
     def test_key_with_exception(self):
+        # [FUNCTION DOC] Checks a key that raises ZeroDivisionError propagates and leaves the
+        # list unchanged.
         # Verify that the wrapper has been removed
         data = list(range(-2, 2))
         dup = data[:]
@@ -290,8 +356,12 @@ class TestDecorateSortUndecorate(__TestCase):
         "__build_class__ with closed over objects not supported",
     )
     def test_key_with_mutation(self):
+        # [FUNCTION DOC] Checks a key function that replaces the list contents during the sort
+        # makes sort raise ValueError. Skipped under Dynamo.
         data = list(range(10))
         def k(x):
+            # [FUNCTION DOC] HELPER: key function that empties and refills the shared list data,
+            # then returns its argument.
             del data[:]
             data[:] = range(20)
             return x
@@ -302,25 +372,38 @@ class TestDecorateSortUndecorate(__TestCase):
         "__build_class__ with closed over objects not supported",
     )
     def test_key_with_mutating_del(self):
+        # [FUNCTION DOC] Checks a key object whose destructor mutates the list makes sort raise
+        # ValueError. Skipped under Dynamo.
         data = list(range(10))
         class SortKiller(object):
+            # [CLASS DOC] HELPER: key type whose destructor empties and refills the sorted list
+            # and whose less-than orders by identity.
             def __init__(self, x):
+                # [FUNCTION DOC] HELPER: ignores its argument.
                 pass
             def __del__(self):
+                # [FUNCTION DOC] HELPER: destructor that clears and refills the shared list data.
                 del data[:]
                 data[:] = range(20)
             def __lt__(self, other):
+                # [FUNCTION DOC] HELPER: orders objects by identity value.
                 return id(self) < id(other)
         self.assertRaises(ValueError, data.sort, key=SortKiller)
 
     def test_key_with_mutating_del_and_exception(self):
+        # [FUNCTION DOC] Checks that when a key constructor raises RuntimeError while destructors
+        # mutate the list, the RuntimeError propagates out of sort.
         data = list(range(10))
         ## dup = data[:]
         class SortKiller(object):
+            # [CLASS DOC] HELPER: key type that raises RuntimeError for argument values above two
+            # and mutates the list in its destructor.
             def __init__(self, x):
+                # [FUNCTION DOC] HELPER: raises RuntimeError when x is greater than 2.
                 if x > 2:
                     raise RuntimeError
             def __del__(self):
+                # [FUNCTION DOC] HELPER: destructor that clears and refills the shared list data.
                 del data[:]
                 data[:] = list(range(20))
         self.assertRaises(RuntimeError, data.sort, key=SortKiller)
@@ -334,19 +417,25 @@ class TestDecorateSortUndecorate(__TestCase):
         ## date (this cost some brain cells to figure out...).
 
     def test_reverse(self):
+        # [FUNCTION DOC] Checks reverse sort of a shuffled 100 element list yields
+        # descending order.
         data = list(range(100))
         random.shuffle(data)
         data.sort(reverse=True)
         self.assertEqual(data, list(range(99,-1,-1)))
 
     def test_reverse_stability(self):
+        # [FUNCTION DOC] Checks reverse sort keeps equal elements in original order, comparing a
+        # reversed comparator, a plain reverse comparator, and a key based reverse sort.
         data = [(random.randrange(100), i) for i in range(200)]
         copy1 = data[:]
         copy2 = data[:]
         def my_cmp(x, y):
+            # [FUNCTION DOC] HELPER: three-way comparator on the first tuple field.
             x0, y0 = x[0], y[0]
             return (x0 > y0) - (x0 < y0)
         def my_cmp_reversed(x, y):
+            # [FUNCTION DOC] HELPER: reversed three-way comparator on the first tuple field.
             x0, y0 = x[0], y[0]
             return (y0 > x0) - (y0 < x0)
         data.sort(key=cmp_to_key(my_cmp), reverse=True)
@@ -357,6 +446,11 @@ class TestDecorateSortUndecorate(__TestCase):
 
 #==============================================================================
 def check_against_PyObject_RichCompareBool(self, L):
+    # [FUNCTION DOC] HELPER: with a test case self and a list L, shuffles L deterministically
+    # (seeded) and, for L, a list of one-tuples and a list of nested tuples, checks the fast
+    # sorted result is element for element identical to the reference built from sorting pairs
+    # with a constant first field (which uses generic rich comparison for the second field). Fails
+    # through assertIs.
     ## The idea here is to exploit the fact that unsafe_tuple_compare uses
     ## PyObject_RichCompareBool for the second elements of tuples. So we have,
     ## for (most) L, sorted(L) == [y[1] for y in sorted([(0,x) for x in L])]
@@ -385,7 +479,10 @@ def check_against_PyObject_RichCompareBool(self, L):
             #note: not assertEqual! We want to ensure *identical* behavior.
 
 class TestOptimizedCompares(__TestCase):
+    # [CLASS DOC] Test case for sort fast paths (type specific compares) versus generic compares.
     def test_safe_object_compare(self):
+        # [FUNCTION DOC] Checks sorting mixed types raises TypeError (plain, tuple, nested tuple)
+        # and mixed int and float lists sort consistently with the reference compare helper.
         heterogeneous_lists = [[0, 'foo'],
                                [0.0, 'foo'],
                                [('foo',), 'foo']]
@@ -402,20 +499,31 @@ class TestOptimizedCompares(__TestCase):
             check_against_PyObject_RichCompareBool(self, L)
 
     def test_unsafe_object_compare(self):
+        # [FUNCTION DOC] Checks fast object compare is not used wrongly: a comparison that changes
+        # an element's class mid sort leads to ValueError, comparators returning NotImplemented
+        # give TypeError, and several object lists (big int, strings, bytes, key wrapped) match
+        # the reference.
 
         # This test is by ppperry. It ensures that unsafe_object_compare is
         # verifying ms->key_richcompare == tp->richcompare before comparing.
 
         class WackyComparator(int):
+            # [CLASS DOC] HELPER: int subclass whose less-than turns the global element elem into
+            # WackyList2 before delegating to int comparison.
             def __lt__(self, other):
+                # [FUNCTION DOC] HELPER: changes the class of elem to WackyList2, then returns the
+                # int result.
                 elem.__class__ = WackyList2
                 return int.__lt__(self, other)
 
         class WackyList1(list):
+            # [CLASS DOC] HELPER: plain list subclass used as the initial element type.
             pass
 
         class WackyList2(list):
+            # [CLASS DOC] HELPER: list subclass whose less-than raises ValueError.
             def __lt__(self, other):
+                # [FUNCTION DOC] HELPER: always raises ValueError.
                 raise ValueError
 
         L = [WackyList1([WackyComparator(i), i]) for i in range(10)]
@@ -431,7 +539,10 @@ class TestOptimizedCompares(__TestCase):
         # The following test is also by ppperry. It ensures that
         # unsafe_object_compare handles Py_NotImplemented appropriately.
         class PointlessComparator:
+            # [CLASS DOC] HELPER: type whose less-than returns NotImplemented, so ordering
+            # is undefined.
             def __lt__(self, other):
+                # [FUNCTION DOC] HELPER: returns NotImplemented.
                 return NotImplemented
         L = [PointlessComparator(), PointlessComparator()]
         self.assertRaises(TypeError, L.sort)
@@ -447,18 +558,24 @@ class TestOptimizedCompares(__TestCase):
             check_against_PyObject_RichCompareBool(self, L)
 
     def test_unsafe_latin_compare(self):
+        # [FUNCTION DOC] Checks the latin string fast compare matches the reference on
+        # 100 strings.
         check_against_PyObject_RichCompareBool(self, [str(x) for
                                                       x in range(100)])
 
     def test_unsafe_long_compare(self):
+        # [FUNCTION DOC] Checks the int fast compare matches the reference on 100 integers.
         check_against_PyObject_RichCompareBool(self, [x for
                                                       x in range(100)])
 
     def test_unsafe_float_compare(self):
+        # [FUNCTION DOC] Checks the float fast compare matches the reference on 100 floats.
         check_against_PyObject_RichCompareBool(self, [float(x) for
                                                       x in range(100)])
 
     def test_unsafe_tuple_compare(self):
+        # [FUNCTION DOC] Checks tuple compare with NaN values matches the reference helper, as NaN
+        # breaks the rule that equal tuples compare consistently.
         # This test was suggested by Tim Peters. It verifies that the tuple
         # comparison respects the current tuple compare semantics, which do not
         # guarantee that x < x <=> (x,) < (x,)
@@ -471,11 +588,14 @@ class TestOptimizedCompares(__TestCase):
                                                       _ in range(100)])
 
     def test_not_all_tuples(self):
+        # [FUNCTION DOC] Checks sorting lists whose items are not all tuples or have mismatched
+        # element types raises TypeError.
         self.assertRaises(TypeError, [(1.0, 1.0), (False, "A"), 6].sort)
         self.assertRaises(TypeError, [('a', 1), (1, 'a')].sort)
         self.assertRaises(TypeError, [(1, 'a'), ('a', 1)].sort)
 
     def test_none_in_tuples(self):
+        # [FUNCTION DOC] Checks sorting tuples whose first field is None, ordered by later fields.
         expected = [(None, 1), (None, 2)]
         actual = sorted([(None, 2), (None, 1)])
         self.assertEqual(actual, expected)
