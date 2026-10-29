@@ -1,5 +1,11 @@
 # mypy: allow-untyped-decorators
 # mypy: allow-untyped-defs
+# [MODULE DOC] Helper library imported by generated Inductor Triton kernels and by the Triton launcher code.
+# Contains (a) host-side utilities for selecting the Triton driver and backend options, and (b) many @triton.jit
+# device functions: integer div/mod/pow, NaN-aware min/max (plain, strict and with index), online softmax combine,
+# Welford combine, Philox-based random helpers, bucketize binary search, decoupled-lookback scans, frexp, bitonic
+# sort with index, a grid barrier, and inline-asm pack/unpack helpers. Import-time side effects: defines a module
+# ContextVar controlling whether driver setup is skipped and a constexpr log2(e) constant.
 import math as pymath
 import warnings
 from collections.abc import Callable
@@ -27,6 +33,8 @@ _skip_gpu_driver_setup: ContextVar[bool] = ContextVar(
 
 @contextmanager
 def skip_gpu_driver_setup():
+    # [FUNCTION DOC] Context manager that makes set_driver_to_gpu a no-op inside its scope.
+    # Sets a ContextVar flag to true on entry and resets it to the prior value on exit (even on error); isolated per thread/context.
     # Scoped no-op for set_driver_to_gpu(). ContextVar keeps nested/thread-local
     # uses isolated.
     token = _skip_gpu_driver_setup.set(True)
@@ -37,6 +45,9 @@ def skip_gpu_driver_setup():
 
 
 def set_driver_to_cpu():
+    # [FUNCTION DOC] Make the Triton CPU backend the active driver.
+    # No-op if the CPU driver is already active. If no 'cpu' backend is registered, only emits a warning (kernels will not be executable).
+    # Side effect: mutates the global triton runtime driver.
     driver = triton.runtime.driver
     if backend := triton.backends.backends.get("cpu", None):
         if isinstance(driver.active, backend.driver):
@@ -51,6 +62,9 @@ def set_driver_to_cpu():
 
 
 def _is_backend_active(name, backend):
+    # [FUNCTION DOC] HELPER: Return whether the given Triton backend (by name) is usable.
+    # True if its driver reports active; otherwise for 'nvidia'/'amd' falls back to torch.cuda availability and the HIP/non-HIP build flag
+    # (works around Triton failing GPU detection in subprocess workers). False for other backends.
     if backend.driver.is_active():
         return True
     # Triton may fail to detect the GPU in subprocess workers when using
@@ -68,6 +82,9 @@ def _is_backend_active(name, backend):
 
 
 def set_driver_to_gpu():
+    # [FUNCTION DOC] Make a non-CPU Triton backend (first active one found) the active driver.
+    # Returns immediately if driver setup is currently skipped. Skips re-initialization if the matching driver is already active
+    # (including when wrapped in a lazy proxy). Raises RuntimeError if no active GPU backend exists. Side effect: mutates global driver.
     if _skip_gpu_driver_setup.get():
         return
 
@@ -89,12 +106,15 @@ def set_driver_to_gpu():
 
 
 def get_backend_options_for_target(target, options=None):
+    # [FUNCTION DOC] Parse backend options for a compile target.
+    # Args: target; options (optional mapping of overrides, copied). Returns the parsed backend options as a plain dict.
     options = {} if options is None else dict(options)
     backend = triton.compiler.compiler.make_backend(target)
     return backend.parse_options(options).__dict__
 
 
 def get_backend_options():
+    # [FUNCTION DOC] Return the parsed backend options for the currently active driver target.
     from triton.runtime import driver
 
     target = driver.active.get_current_target()
@@ -102,6 +122,7 @@ def get_backend_options():
 
 
 def _is_concrete_backend_option_value(value: Any) -> bool:
+    # [FUNCTION DOC] HELPER: Return False if the value is (or recursively contains, in sequences or dict keys/values) a tensor, symbolic int/float/bool or sympy expression; otherwise True.
     import sympy
 
     import torch
@@ -129,6 +150,10 @@ def _is_concrete_backend_option_value(value: Any) -> bool:
 
 
 def try_filter_backend_options_for_target(target, options, kernel_arg_names=()):
+    # [FUNCTION DOC] Select the entries of options that are valid Triton backend options for the target.
+    # Args: target; options mapping; kernel_arg_names (names that are legal kernel parameters).
+    # Returns a dict of the options recognized by the backend. Raises RuntimeError if an option is neither a backend option nor a kernel
+    # parameter, or if a retained backend option is not a concrete (non-symbolic, non-tensor) value.
     parsed_options = get_backend_options_for_target(target)
     kernel_arg_names = tuple(kernel_arg_names)
     filtered_options = {
@@ -158,17 +183,21 @@ def try_filter_backend_options_for_target(target, options, kernel_arg_names=()):
 
 
 def get_constexprs(kernel: JITFunction) -> list[int]:
+    # [FUNCTION DOC] Return the positional indices of the constexpr parameters of a JIT kernel.
     return [p.num for p in kernel.params if p.is_constexpr]
 
 
 @triton.jit
 def promote_to_tensor(x):
+    # [FUNCTION DOC] Device function: promote a scalar to a tensor by adding a one-element zero int1 tensor (tensors pass through).
     # Addition promotes to tensor for us
     return x + tl.zeros((1,), tl.int1)
 
 
 @triton.jit
 def fp8e4m3fn_to_float32(x):
+    # [FUNCTION DOC] Device function: decode float8 e4m3fn bit patterns (input 8-bit values) to float32.
+    # Handles sign, normals (exponent rebias), subnormals (exponent zero) and NaN (all exponent and mantissa bits set); there is no infinity.
     x_u32 = x.to(tl.uint32)
     sign = (x_u32 & 0x80) << 24
     exp = (x_u32 >> 3) & 0xF
@@ -188,6 +217,8 @@ def fp8e4m3fn_to_float32(x):
 
 @triton.jit
 def div_floor_integer(a, b):
+    # [FUNCTION DOC] Device function: integer floor division of a by b.
+    # Corrects the truncating quotient by one when the remainder is nonzero and operand signs differ.
     # NOTE: a // b is C division, but we want floor division
     # Based on c10::div_floor_integer
     quot = a // b
@@ -198,6 +229,7 @@ def div_floor_integer(a, b):
 
 @triton.jit
 def remainder_integer(a, b):
+    # [FUNCTION DOC] Device function: integer remainder with floor-division (Python) semantics; result takes the sign of the divisor.
     # NOTE: a % b matches C division, not floor division
     remainder = a % b
     return tl.where((remainder != 0) & ((a < 0) != (b < 0)), remainder + b, remainder)
@@ -205,6 +237,8 @@ def remainder_integer(a, b):
 
 @triton.jit
 def pow_integer(base, exponent):
+    # [FUNCTION DOC] Device function: exact integer power by repeated squaring over all bits of the exponent (treated as unsigned).
+    # Returns a tensor of base dtype; avoids floating-point pow rounding. Negative exponents are not meaningful.
     # Triton has no exact integer pow primitive; use repeated squaring for
     # nonnegative integer exponents so integral scalar pow does not round
     # through libdevice.pow before casting back to int.
@@ -222,31 +256,38 @@ def pow_integer(base, exponent):
 
 @triton.jit
 def is_floating(x):
+    # [FUNCTION DOC] Device function: return whether the input (promoted to tensor) has a floating-point dtype (compile-time).
     return promote_to_tensor(x).dtype.is_floating()
 
 
 @triton.jit
 def _prod_accumulate(a, b):
+    # [FUNCTION DOC] HELPER: Device function: binary combine for product reductions (multiply).
     return a * b
 
 
 @triton.jit
 def prod(input, axis):
+    # [FUNCTION DOC] Device function: product reduction of input along the given axis.
     return tl.reduce(input, axis, _prod_accumulate)
 
 
 @triton.jit
 def minimum(a, b):
+    # [FUNCTION DOC] Device function: elementwise minimum that propagates NaN.
     return tl.minimum(a, b, propagate_nan=tl.PropagateNan.ALL)
 
 
 @triton.jit
 def maximum(a, b):
+    # [FUNCTION DOC] Device function: elementwise maximum that propagates NaN.
     return tl.maximum(a, b, propagate_nan=tl.PropagateNan.ALL)
 
 
 @triton.jit
 def _minimum_reduce(a, b):
+    # [FUNCTION DOC] HELPER: Device function: NaN-propagating minimum combine for reductions; for floats, equal inputs return the second argument
+    # (so signed zeros resolve deterministically).
     value = minimum(a, b)
     if is_floating(a):
         value = tl.where(a == b, b, value)
@@ -255,6 +296,8 @@ def _minimum_reduce(a, b):
 
 @triton.jit
 def _maximum_reduce(a, b):
+    # [FUNCTION DOC] HELPER: Device function: NaN-propagating maximum combine for reductions; for floats, equal inputs return the second argument
+    # (so signed zeros resolve deterministically).
     value = maximum(a, b)
     if is_floating(a):
         value = tl.where(a == b, b, value)
@@ -263,36 +306,45 @@ def _maximum_reduce(a, b):
 
 @triton.jit
 def fmaximum(a, b):
+    # [FUNCTION DOC] Device function: elementwise maximum using Triton default NaN handling (does not force NaN propagation).
     return tl.maximum(a, b)
 
 
 @triton.jit
 def min2(a, dim):
+    # [FUNCTION DOC] Device function: NaN-propagating minimum reduction of a along dim.
     return tl.reduce(a, dim, minimum)
 
 
 @triton.jit
 def max2(a, dim):
+    # [FUNCTION DOC] Device function: NaN-propagating maximum reduction of a along dim.
     return tl.reduce(a, dim, maximum)
 
 
 @triton.jit
 def min2_strict(a, dim):
+    # [FUNCTION DOC] Device function: NaN-propagating minimum reduction along dim with signed-zero-aware combine.
     return tl.reduce(a, dim, _minimum_reduce)
 
 
 @triton.jit
 def max2_strict(a, dim):
+    # [FUNCTION DOC] Device function: NaN-propagating maximum reduction along dim with signed-zero-aware combine.
     return tl.reduce(a, dim, _maximum_reduce)
 
 
 @triton.jit
 def fmax2(a, dim):
+    # [FUNCTION DOC] Device function: maximum reduction along dim using the non-NaN-propagating maximum.
     return tl.reduce(a, dim, fmaximum)
 
 
 @triton.jit
 def minimum_with_index(a_value, a_index, b_value, b_index):
+    # [FUNCTION DOC] Device function: combine two (value, index) pairs keeping the smaller value.
+    # NaN is treated as smaller than any non-NaN value and equal to other NaNs; ties are broken by the lower index.
+    # Returns the selected (value, index) pair.
     mask = a_value < b_value
     equal = a_value == b_value
     if is_floating(a_value):
@@ -309,6 +361,9 @@ def minimum_with_index(a_value, a_index, b_value, b_index):
 
 @triton.jit
 def maximum_with_index(a_value, a_index, b_value, b_index):
+    # [FUNCTION DOC] Device function: combine two (value, index) pairs keeping the larger value.
+    # NaN is treated as larger than any non-NaN value and equal to other NaNs; ties go to the lower index.
+    # Returns the selected (value, index) pair.
     mask = a_value > b_value
     equal = a_value == b_value
     if is_floating(a_value):
@@ -325,16 +380,19 @@ def maximum_with_index(a_value, a_index, b_value, b_index):
 
 @triton.jit
 def min_with_index(value, index, dim):
+    # [FUNCTION DOC] Device function: reduce (value, index) along dim, returning the minimum value and its index (lowest index on ties).
     return tl.reduce((value, index), dim, minimum_with_index)
 
 
 @triton.jit
 def max_with_index(value, index, dim):
+    # [FUNCTION DOC] Device function: reduce (value, index) along dim, returning the maximum value and its index (lowest index on ties).
     return tl.reduce((value, index), dim, maximum_with_index)
 
 
 @triton.jit
 def exp(x, use_fast_math: tl.constexpr):
+    # [FUNCTION DOC] Device function: exponential; uses fast math exp when the constexpr flag is set, otherwise libdevice exp.
     if use_fast_math:
         return math.exp(x)
     else:
@@ -349,6 +407,9 @@ def online_softmax_reduce(
     use_fast_math: tl.constexpr,
     strict_signed_zero: tl.constexpr,
 ):
+    # [FUNCTION DOC] Device function: reduce partial (max, sum) softmax statistics along dim.
+    # Computes the max (optionally signed-zero strict), then sums each partial sum rescaled by exp of the difference to the max;
+    # -inf maxima contribute a zero shift to avoid NaN. Returns (max, sum).
     if strict_signed_zero:
         out_max = max2_strict(lhs_max, dim)
     else:
@@ -367,6 +428,9 @@ def online_softmax_combine(
     use_fast_math: tl.constexpr,
     strict_signed_zero: tl.constexpr,
 ):
+    # [FUNCTION DOC] Device function: online softmax combine of an accumulator (lhs max, sum) with a new block's max.
+    # Assumes the new block's sum is exactly 1, which saves registers and work. Rescales both sides by exp(max difference)
+    # (scale 1 when the new max is -inf). Returns (new max, new sum).
     """
     When we do combine, we assume lhs is the accumulator and rhs is the next
     block of data.
@@ -401,6 +465,8 @@ def online_softmax_combine_with_sum(
     use_fast_math: tl.constexpr,
     strict_signed_zero: tl.constexpr,
 ):
+    # [FUNCTION DOC] Device function: general online softmax combine of two (max, sum) pairs, rescaling each by exp(max difference)
+    # (scale 1 when the combined max is -inf). Returns (new max, new sum).
     if strict_signed_zero:
         out_max = _maximum_reduce(lhs_max, rhs_max)
     else:
@@ -419,6 +485,8 @@ def online_softmax_combine_with_sum(
 
 @triton.jit
 def welford_reduce(value, mean, m2, weight, first_iteration):
+    # [FUNCTION DOC] Device function: one Welford update step. On the first iteration the mean is the value, weight is 1 and m2 is zero;
+    # otherwise it updates mean, m2 and weight with the new value. Returns (mean, m2, weight).
     if first_iteration:
         new_weight = tl.full(weight.shape, 1, weight.dtype)
         new_mean = value
@@ -433,6 +501,8 @@ def welford_reduce(value, mean, m2, weight, first_iteration):
 
 @triton.jit
 def welford_combine(mean_1, m2_1, weight_1, mean_2, m2_2, weight_2):
+    # [FUNCTION DOC] Device function: merge two Welford partial states (mean, m2, weight).
+    # Guards against infinity minus infinity producing NaN and against zero total weight. Returns (mean, m2, weight).
     # Guard against inf - inf = NaN when both means are infinite and equal.
     # This occurs during FP16/BF16 LayerNorm when inputs overflow to inf.
     delta = tl.where(mean_1 == mean_2, 0.0, mean_2 - mean_1)
@@ -447,17 +517,22 @@ def welford_combine(mean_1, m2_1, weight_1, mean_2, m2_2, weight_2):
 
 @triton.jit
 def welford(mean, m2, weight, dim):
+    # [FUNCTION DOC] Device function: reduce Welford states (mean, m2, weight) along dim using welford_combine.
     return tl.reduce((mean, m2, weight), dim, welford_combine)
 
 
 @triton.jit
 def device_assert_then(cond, msg, r):
+    # [FUNCTION DOC] Device function: device-side assert on cond with message msg, then return r unchanged.
     tl.device_assert(cond, msg)
     return r
 
 
 @triton.jit
 def rand_eager_kernel(seed, offset_blocks, tid: tl.tensor, VEC: tl.constexpr):
+    # [FUNCTION DOC] Device function: eager-mode-compatible Philox random uniform generator.
+    # Args: seed; offset_blocks; tid (thread index tensor); VEC (constexpr vector width). Derives subsequence and block offset from tid,
+    # runs Philox to get four 32-bit values, selects the one for the lane, and returns a float32 in (0, 1].
     inv = 1.0 / 4294967296.0
     half = inv * 0.5
 
@@ -486,6 +561,8 @@ def rand_eager_kernel(seed, offset_blocks, tid: tl.tensor, VEC: tl.constexpr):
 
 @triton.jit
 def _random_4x_to_block(r0, r1, r2, r3):
+    # [FUNCTION DOC] HELPER: Device function: interleave four equal-size random tensors into one flat tensor 4x as large, ordered by logical offset
+    # so the stream does not depend on block size.
     # Pack lanes by logical offset so the random stream is independent of XBLOCK.
     size: tl.constexpr = r0.numel
     return tl.reshape(tl.join(tl.join(r0, r2), tl.join(r1, r3)), [size * 4])
@@ -493,6 +570,8 @@ def _random_4x_to_block(r0, r1, r2, r3):
 
 @triton.jit
 def rand4x(seed, offsets, BLOCK: tl.constexpr):
+    # [FUNCTION DOC] Device function: uniform random numbers for the given offsets using the 4-wide Philox generator when BLOCK is a multiple of 4;
+    # otherwise falls back to the plain rand. Seed is reduced to a scalar. Returns a tensor of BLOCK floats.
     offsets = offsets.to(tl.uint32)
     seed = tl.min(seed + offsets * 0, axis=0)
     if BLOCK >= 4 and BLOCK % 4 == 0:
@@ -505,6 +584,8 @@ def rand4x(seed, offsets, BLOCK: tl.constexpr):
 
 @triton.jit
 def randn4x(seed, offsets, BLOCK: tl.constexpr):
+    # [FUNCTION DOC] Device function: normal random numbers for the given offsets; 4-wide Philox path when BLOCK is a multiple of 4,
+    # otherwise the plain randn. Returns a tensor of BLOCK floats.
     offsets = offsets.to(tl.uint32)
     seed = tl.min(seed + offsets * 0, axis=0)
     if BLOCK >= 4 and BLOCK % 4 == 0:
@@ -517,6 +598,8 @@ def randn4x(seed, offsets, BLOCK: tl.constexpr):
 
 @triton.jit
 def randint64(seed, offset, low, high):
+    # [FUNCTION DOC] Device function: random int64 in [low, high). Combines two 32-bit random words into 64 bits and reduces modulo (high - low)
+    # (slight modulo bias). Returns int64 values.
     r0, r1, _r2, _r3 = tl.randint4x(seed, offset)
     r0 = r0.to(tl.uint64)
     r1 = r1.to(tl.uint64)
@@ -529,11 +612,13 @@ def randint64(seed, offset, low, high):
 
 @triton.jit
 def _any_combine(a, b):
+    # [FUNCTION DOC] HELPER: Device function: bitwise-or combine for the any reduction.
     return a | b
 
 
 @triton.jit
 def any(a, dim):
+    # [FUNCTION DOC] Device function: logical any (bitwise-or reduction) of a along dim.
     return tl.reduce(a, dim, _any_combine)
 
 
@@ -551,6 +636,10 @@ def bucketize_binary_search(
     SORTER_STRIDE: int,
     sorter_indices: tl.tensor,
 ):
+    # [FUNCTION DOC] Device function: vectorized binary search for bucketize / searchsorted.
+    # For each value, searches its set of boundaries (addressed via boundary_indices, size, stride, with an optional sorter for unsorted
+    # boundaries) and returns the insertion index in the indexing dtype. The right flag selects >= versus > comparison; NaN values
+    # sort after everything. Loads are masked to stay inside the boundaries tensor.
     """
     See [Note: Inductor bucketize op]
 
@@ -626,6 +715,7 @@ def pack_value_flag(
     DTYPE_VALUE_AS_UINT: tl.constexpr,
     DTYPE_PACK: tl.constexpr,
 ):
+    # [FUNCTION DOC] Device function: pack a value (bitcast to unsigned) and a flag into one wider unsigned integer; flag in low bits, value in high bits.
     # Workaround for triton bug, tensor.to doesn't unwrap constexpr values
     DTYPE_VALUE_AS_UINT = tl.core._unwrap_if_constexpr(DTYPE_VALUE_AS_UINT)
     bitwidth = DTYPE_VALUE_AS_UINT.primitive_bitwidth
@@ -639,6 +729,7 @@ def unpack_value(
     DTYPE_VALUE,
     DTYPE_VALUE_AS_UINT,
 ):
+    # [FUNCTION DOC] Device function: extract the value from a packed (value, flag) integer and bitcast it back to the value dtype.
     # Workaround for triton bug, tensor.to doesn't unwrap constexpr values
     DTYPE_VALUE = tl.core._unwrap_if_constexpr(DTYPE_VALUE)
     DTYPE_VALUE_AS_UINT = tl.core._unwrap_if_constexpr(DTYPE_VALUE_AS_UINT)
@@ -649,6 +740,7 @@ def unpack_value(
 
 @triton.jit
 def unpack_flag(pack, DTYPE_FLAG):
+    # [FUNCTION DOC] Device function: extract the flag from a packed (value, flag) integer.
     return pack.to(DTYPE_FLAG)
 
 
@@ -661,6 +753,11 @@ def exclusive_scan_decoupled_lookback(
     DTYPE_VALUE_AS_UINT: tl.constexpr,
     DTYPE_PACK: tl.constexpr,
 ):
+    # [FUNCTION DOC] Device function: single-pass decoupled-lookback exclusive scan across thread blocks for values of 32 bits or fewer.
+    # Each block publishes its packed value with flag 1 (partial), walks back over predecessors spinning until their flag is set,
+    # combining values until it sees an inclusive result (flag 2), then publishes its inclusive prefix with flag 2.
+    # Args: scratch_base pointer; block_value; index of block; combine_fn; packing dtypes. Returns the exclusive prefix (untouched for block 0).
+    # Side effects: atomic global-memory writes to scratch; relies on all earlier blocks making progress.
     """Compute exclusive scan of a scalar value between blocks
 
     Ref: https://research.nvidia.com/publication/2016-03_single-pass-parallel-prefix-scan-decoupled-look-back
@@ -726,6 +823,9 @@ def exclusive_scan_decoupled_lookback(
 
 @triton.jit
 def exclusive_scan_decoupled_lookback_64(scratch_base, block_value, index, combine_fn):
+    # [FUNCTION DOC] Device function: decoupled-lookback exclusive scan for 64-bit values using three 64-bit scratch slots per block
+    # (flag, partial value, inclusive value) with release/acquire atomics and barriers. Returns the exclusive prefix.
+    # KNOWN ISSUE: docstring mentions an init argument that does not exist in the signature.
     """Compute exclusive scan of a scalar value between blocks
 
     Ref: https://research.nvidia.com/publication/2016-03_single-pass-parallel-prefix-scan-decoupled-look-back
@@ -782,6 +882,7 @@ def exclusive_scan_decoupled_lookback_64(scratch_base, block_value, index, combi
 
 @triton.jit
 def frexp(x):
+    # [FUNCTION DOC] Device function: split x into (mantissa, exponent) like C frexp; zero, inf and NaN map to exponent 0 with mantissa 0 or x itself.
     # TODO(isuruf): use inline_asm_elementwise here
     zero = x == 0
     not_finite = libdevice.isinf(x).to(tl.int1) | libdevice.isnan(x).to(tl.int1)
@@ -804,6 +905,10 @@ def _compare_and_swap_with_index(
     stable: tl.constexpr,
     descending: tl.constexpr,
 ):
+    # [FUNCTION DOC] HELPER: Device function: one compare-and-swap stage of a bitonic network over a flattened power-of-two block with paired indices.
+    # Splits elements into left/right partners at the stride for step i, decides swap with NaN-greater-than-all ordering,
+    # index tie-break when stable, ordering of invalid (index >= rnumel) elements last, and a flip mask for direction.
+    # Swaps via bitwise xor on integer bitcasts. Returns (values, indices).
     n_outer: tl.constexpr = x.numel >> n_dims
     shape: tl.constexpr = [n_outer * 2**i, 2, 2 ** (n_dims - i - 1)]
 
@@ -893,6 +998,8 @@ def _bitonic_merge_with_index(
     stable: tl.constexpr,
     descending: tl.constexpr,
 ):
+    # [FUNCTION DOC] HELPER: Device function: one bitonic merge stage (stage rounds of compare-and-swap); alternates direction between sub-sequences
+    # when alternating is set. Returns (values, indices).
     n_outer: tl.constexpr = x.numel >> n_dims
     tl.static_assert(stage <= n_dims)
     # flip denotes whether to re-arrange sub-sequences of elements in ascending or
@@ -924,6 +1031,9 @@ def sort_with_index(
     stable: tl.constexpr = tl.constexpr(False),
     descending: tl.constexpr = tl.constexpr(False),
 ):
+    # [FUNCTION DOC] Device function: sort x along its minor dimension carrying idxs, using bitonic merge sort over a power-of-two block.
+    # Args: x; idxs; rnumel (valid element count or None); dim (must be minor dim); stable; descending. NaN sorts as largest.
+    # Fails at compile time if dim is not the last dimension. Returns (sorted values, permuted indices).
     x, idxs = tl.broadcast(x, idxs)
     # handle default dimension or check that it is the most minor dim
     _dim: tl.constexpr = len(x.shape) - 1 if dim is None else dim
@@ -949,6 +1059,8 @@ def sort_with_index(
 
 @triton.jit
 def select_one(x, mask, dim, keep_dims=False):
+    # [FUNCTION DOC] Device function: select the single element of x where mask is nonzero along dim, via a masked sum on the integer bitcast.
+    # Returns a value of x's dtype (assumes exactly one selected element per reduction).
     idtype = tl.core.get_int_dtype(x.dtype.primitive_bitwidth, signed=False)
     ix = x.to(idtype, bitcast=True)
     iy = tl.sum(ix * mask, dim, keep_dims=keep_dims)
@@ -957,6 +1069,9 @@ def select_one(x, mask, dim, keep_dims=False):
 
 @triton.jit
 def x_grid_barrier(sem):
+    # [FUNCTION DOC] Device function: grid-wide barrier across all programs sharing the same y/z program id.
+    # Uses a uint32 semaphore (zero or 0x80000000 initialized, unique per y/z id): program 0 adds a large offset, others add one,
+    # then spins with acquire atomics until the top bit flips. Side effects: atomics on sem and debug barriers.
     """
     Wait for all other thread blocks in grid sharing same y/z program_id
     to reach this barrier before returning.
@@ -989,6 +1104,8 @@ def x_grid_barrier(sem):
 
 
 def triton_builtin(f: Callable[..., _T]) -> Callable[..., _T]:
+    # [FUNCTION DOC] Decorator marking a function as a Triton builtin evaluated at compile time. Returns a wrapper that maps the semantic keyword to
+    # the builder keyword on Triton versions that need it (otherwise the function itself) and sets a marker attribute on it.
     """
     Decorator to mark a function as a Triton built-in function.  These functions
     are evaluated at compile time.
@@ -1003,6 +1120,7 @@ def triton_builtin(f: Callable[..., _T]) -> Callable[..., _T]:
         # support Triton before and after https://github.com/triton-lang/triton/pull/7054
         # and after https://github.com/triton-lang/triton/pull/7239
         def wrapper(*args, _semantic, **kwargs):
+            # [FUNCTION DOC] HELPER: Wrapper adapting the newer _semantic keyword to the _builder keyword expected by the wrapped function.
             kwargs["_builder"] = _semantic
             return f(*args, **kwargs)
     else:
@@ -1016,6 +1134,7 @@ def triton_builtin(f: Callable[..., _T]) -> Callable[..., _T]:
 def constexpr_next_power_of_2(
     n: tl.constexpr, *, _builder: object = None
 ) -> tl.constexpr:
+    # [FUNCTION DOC] Builtin: next power of two of a constexpr integer, returned as a constexpr. Raises AssertionError if n is not a constexpr.
     """
     A version triton.next_power_of_two that can be used within a kernel on constants.
     """
@@ -1026,6 +1145,7 @@ def constexpr_next_power_of_2(
 
 @triton_builtin
 def if_mask(mask: Any, val, *, _builder: object = None) -> tl.constexpr:
+    # [FUNCTION DOC] Builtin: returns constexpr None when mask is a constexpr None, otherwise returns val (avoids Triton error when 'other' is given without mask).
     """
     Work around triton compile error: `ValueError: `other` cannot be provided without `mask``
     A compile-time to check to return either `val` or `None` depending on the value of mask.
@@ -1037,6 +1157,7 @@ def if_mask(mask: Any, val, *, _builder: object = None) -> tl.constexpr:
 
 @triton.jit
 def inline_asm_pack(x, pack: tl.constexpr):
+    # [FUNCTION DOC] Device function: flatten x to 1D and pad with zeros (by repeated join) so the length is divisible by pack. Returns the 1D tensor.
     """Ravel to 1D and pad (via join with zeros) so numel is divisible by pack."""
     result = x.ravel()
     # Only pad when the block size is smaller than pack. When block >= pack
@@ -1051,6 +1172,7 @@ def inline_asm_pack(x, pack: tl.constexpr):
 
 @triton.jit
 def inline_asm_unpack(x, orig, pack: tl.constexpr):
+    # [FUNCTION DOC] Device function: inverse of inline_asm_pack; strips the padding and reshapes to the shape of orig. Returns the reshaped tensor.
     """Unpad and reshape back to orig's shape."""
     result = x
     n_pad: tl.constexpr = _log2(pack) - _log2(orig.numel)
