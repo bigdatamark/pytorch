@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Install-time script (macOS only, uses otool and install_name_tool) that makes
+# libtorch_cpu resolve the bundled libomp library through a loader-relative rpath instead of the
+# build machine's libomp location. Main contents: otool output parser and main. Run as a script
+# it exits with the status returned by main. No import-time side effects beyond a compiled regex.
 """Embed macOS OpenMP into the PyTorch wheel.
 
 Invoked at CMake install time. Rewrites libtorch_cpu's load command / rpath
@@ -26,6 +30,10 @@ _LOAD_RE = re.compile(r"(?:name|path) (.+) \(offset \d+\)")
 
 
 def parse_otool(binary: Path) -> tuple[list[str], list[str]]:
+    # [FUNCTION DOC] Runs otool on the binary to list its load commands and returns two lists:
+    # the run-path entries and the dynamic library load names. For each matching command the
+    # name or path is read from the line two after the command line. Raises CalledProcessError
+    # if otool fails.
     """Return (rpaths, load_libs) extracted from `otool -l`."""
     out = subprocess.check_output(["otool", "-l", str(binary)], text=True).splitlines()
     rpaths: list[str] = []
@@ -44,6 +52,13 @@ def parse_otool(binary: Path) -> tuple[list[str], list[str]]:
 
 
 def main() -> int:
+    # [FUNCTION DOC] Parses --libomp-path and --lib-dir, then edits libtorch_cpu in the lib dir
+    # in place with install_name_tool. Returns 0 without changes if libtorch_cpu or libomp is
+    # missing (message on stderr) or if libtorch_cpu does not link libomp. An absolute libomp
+    # load command is changed to the rpath form. A run-path pointing at the build libomp
+    # directory is deleted if a loader-relative one exists, else renamed to it; if none matches,
+    # the loader-relative run-path is added when absent. Raises CalledProcessError on tool
+    # failure; returns 0 on success.
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument(
         "--libomp-path",

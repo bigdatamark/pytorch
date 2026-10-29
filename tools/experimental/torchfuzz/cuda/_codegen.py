@@ -1,4 +1,9 @@
 # mypy: ignore-errors
+# [MODULE DOC] CUDA plugin templates for torchfuzz: FuzzTemplate subclasses (default, DTensor,
+# unbacked, stream and DTensor with random placements) that choose the supported operations,
+# dtypes and spec mix and override the code generation hooks to emit CUDA specific code (default
+# device, config flags, DTensor mesh setup, CUDA stream partitioning). Import-time side effects:
+# imports torch and the torchfuzz codegen, ops_fuzzer and tensor_fuzzer modules.
 """FuzzTemplate subclasses provided by the CUDA device plugin.
 
 These templates are returned by ``torchfuzz.cuda.register_codegen()`` and
@@ -19,7 +24,12 @@ from torchfuzz.tensor_fuzzer import ScalarSpec, TensorSpec
 
 
 class DefaultFuzzTemplate(FuzzTemplate):
+    # [CLASS DOC] Standard CUDA template: a broad set of arithmetic, shape, indexing, matrix,
+    # neural network, activation and normalization operations, tensors only, with the plain
+    # eager vs compiled check. Generated programs set the default device to cuda.
     def __init__(self):
+        # [FUNCTION DOC] Initializes the base template with the default operation name list and
+        # the eager vs full-graph dynamic compile check.
         from torchfuzz.cuda._checks import EagerVsFullGraphDynamicCompileCheck
 
         super().__init__(
@@ -77,6 +87,7 @@ class DefaultFuzzTemplate(FuzzTemplate):
         )
 
     def spec_distribution(self):
+        # [FUNCTION DOC] Returns a distribution allowing only tensors (probability 1, no scalars).
         """Default template: tensor-only (no scalars)."""
         return {
             "tensor_prob": 1.0,
@@ -86,22 +97,32 @@ class DefaultFuzzTemplate(FuzzTemplate):
         }
 
     def imports_codegen(self):
+        # [FUNCTION DOC] Returns the single import line for torch.
         return [
             "import torch",
         ]
 
     def flags_codegen(self):
+        # [FUNCTION DOC] Returns lines making cuda the default device and enabling dynamo
+        # capture of scalar outputs.
         return [
             "torch.set_default_device('cuda')",
             "torch._dynamo.config.capture_scalar_outputs = True",
         ]
 
     def epilogue_codegen(self):
+        # [FUNCTION DOC] Returns no epilogue lines.
         return []
 
 
 class DTensorFuzzTemplate(FuzzTemplate):
+    # [CLASS DOC] Template for distributed tensors: restricts operations to arithmetic and
+    # matrix products, tensors only, and emits a fake process group with a 2D cuda device mesh
+    # (world size 1024, shape 2 by 8) so every argument is a DTensor with replicated placements.
+    # Constants are wrapped as DTensors, and the process group is destroyed at the end.
     def __init__(self):
+        # [FUNCTION DOC] Initializes the base template with a small arithmetic and matrix
+        # operation list and the eager vs full-graph dynamic compile check.
         from torchfuzz.cuda._checks import EagerVsFullGraphDynamicCompileCheck
 
         super().__init__(
@@ -119,6 +140,8 @@ class DTensorFuzzTemplate(FuzzTemplate):
         )
 
     def supported_dtypes(self):
+        # [FUNCTION DOC] Returns the float, integer and bool dtypes allowed for DTensors (no
+        # complex types).
         """Return list of DTensor-compatible dtypes (no complex types)."""
         return [
             torch.float32,
@@ -133,6 +156,7 @@ class DTensorFuzzTemplate(FuzzTemplate):
         ]
 
     def spec_distribution(self):
+        # [FUNCTION DOC] Returns a distribution allowing only tensors (probability 1, no scalars).
         """DTensor template: tensor-only (no scalars)."""
         return {
             "tensor_prob": 1.0,
@@ -142,6 +166,8 @@ class DTensorFuzzTemplate(FuzzTemplate):
         }
 
     def imports_codegen(self):
+        # [FUNCTION DOC] Returns imports for torch, the placement types, the fake process group
+        # store and DTensor.
         return [
             "import torch",
             "from torch.distributed.tensor.placement_types import Replicate, Shard",
@@ -150,6 +176,8 @@ class DTensorFuzzTemplate(FuzzTemplate):
         ]
 
     def flags_codegen(self):
+        # [FUNCTION DOC] Returns config lines enabling dynamo scalar output and dynamic output
+        # shape capture and inductor precision-cast emulation.
         return [
             "torch._dynamo.config.capture_scalar_outputs = True",
             "torch._dynamo.config.capture_dynamic_output_shape_ops = True",
@@ -157,6 +185,11 @@ class DTensorFuzzTemplate(FuzzTemplate):
         ]
 
     def args_codegen(self, arg_operations, constant_operations=None):
+        # [FUNCTION DOC] Returns lines that set up a fake distributed process group and a 2D
+        # cuda mesh, define replicated placements, and create the sentinel plus one DTensor per
+        # argument (via a local cuda tensor wrapped as a DTensor). Scalars become zero-dim
+        # random tensors, integers use random values 1 to 9, bools come from random 0/1, floats
+        # are random normal and require grad. constant_operations is ignored.
         """Generate DTensor argument creation code with proper mesh setup."""
         code_lines = []
 
@@ -238,9 +271,13 @@ class DTensorFuzzTemplate(FuzzTemplate):
         return code_lines
 
     def epilogue_codegen(self):
+        # [FUNCTION DOC] Returns a line destroying the process group.
         return ["torch.distributed.destroy_process_group()"]
 
     def return_codegen(self, final_var_name: str) -> list[str]:
+        # [FUNCTION DOC] Returns the return statement lines: multiplies the final variable by the
+        # sentinel and, for complex results, takes the absolute value instead of the real part
+        # (the real part is incompatible with sharding).
         """DTensor return: avoid .real (incompatible with sharding); use .abs() for complex."""
         return [
             "    # Ensure gradient computation by multiplying with sentinel",
@@ -252,6 +289,8 @@ class DTensorFuzzTemplate(FuzzTemplate):
         ]
 
     def codegen_constant(self, output_name: str, tensor_creation_expr: str) -> str:
+        # [FUNCTION DOC] Returns two lines of code: create the local tensor on cuda from the
+        # expression, then wrap it as a DTensor with the mesh and placements.
         """DTensor constants live on cuda and are wrapped via DTensor.from_local."""
         return (
             f"{output_name}_local = {tensor_creation_expr}.to('cuda')\n"
@@ -260,7 +299,14 @@ class DTensorFuzzTemplate(FuzzTemplate):
 
 
 class UnbackedFuzzTemplate(FuzzTemplate):
+    # [CLASS DOC] Template for data-dependent (unbacked size) programs: adds operations whose
+    # output shape depends on values (item, nonzero, masked_select, unique), restricts dtypes to
+    # float32, float64, int32 and int64, and draws tensors and scalars evenly. Enables dynamic
+    # output shape capture in the generated program.
     def __init__(self):
+        # [FUNCTION DOC] Initializes the base template with the data-dependent operation list
+        # plus common arithmetic, shape, matrix, neural network and normalization operations,
+        # and the eager vs full-graph dynamic compile check.
         from torchfuzz.cuda._checks import EagerVsFullGraphDynamicCompileCheck
 
         super().__init__(
@@ -309,6 +355,8 @@ class UnbackedFuzzTemplate(FuzzTemplate):
         )
 
     def supported_dtypes(self):
+        # [FUNCTION DOC] Returns float32, float64, int32 and int64 (bool excluded because
+        # arithmetic fails on boolean tensors).
         """Return list of dtypes good for data-dependent operations."""
         # Focus on dtypes that work well with data-dependent ops and arithmetic
         # Exclude bool since arithmetic operations don't work with boolean tensors
@@ -320,6 +368,8 @@ class UnbackedFuzzTemplate(FuzzTemplate):
         ]
 
     def spec_distribution(self):
+        # [FUNCTION DOC] Returns a distribution with equal tensor and scalar probability, both
+        # allowed.
         """Unbacked template: 50% tensors, 50% scalars."""
         return {
             "tensor_prob": 0.5,
@@ -329,11 +379,14 @@ class UnbackedFuzzTemplate(FuzzTemplate):
         }
 
     def imports_codegen(self):
+        # [FUNCTION DOC] Returns the single import line for torch.
         return [
             "import torch",
         ]
 
     def flags_codegen(self):
+        # [FUNCTION DOC] Returns lines making cuda the default device and enabling dynamo
+        # capture of scalar outputs and dynamic output shapes.
         return [
             "torch.set_default_device('cuda')",
             "torch._dynamo.config.capture_scalar_outputs = True",
@@ -341,10 +394,14 @@ class UnbackedFuzzTemplate(FuzzTemplate):
         ]
 
     def epilogue_codegen(self):
+        # [FUNCTION DOC] Returns no epilogue lines.
         return []
 
 
 class StreamFuzzTemplate(DefaultFuzzTemplate):
+    # [CLASS DOC] Default template variant whose generated body is split over several CUDA
+    # streams with synchronization, checked with eager vs compiled including backward. State:
+    # the check attribute replaced with the backward check.
     """Template that wraps operations in random CUDA stream contexts.
 
     Reuses the same operator set as DefaultFuzzTemplate but partitions non-leaf
@@ -353,6 +410,8 @@ class StreamFuzzTemplate(DefaultFuzzTemplate):
     """
 
     def __init__(self):
+        # [FUNCTION DOC] Initializes the default template, then replaces its check with the
+        # eager vs compiled check that also runs backward.
         super().__init__()
         from torchfuzz.cuda._checks import (
             EagerVsFullGraphDynamicCompileWithBackwardCheck,
@@ -361,17 +420,23 @@ class StreamFuzzTemplate(DefaultFuzzTemplate):
         self.check = EagerVsFullGraphDynamicCompileWithBackwardCheck()
 
     def imports_codegen(self):
+        # [FUNCTION DOC] Returns the single import line for torch.
         return [
             "import torch",
         ]
 
     def flags_codegen(self):
+        # [FUNCTION DOC] Returns lines making cuda the default device and enabling dynamo
+        # capture of scalar outputs.
         return [
             "torch.set_default_device('cuda')",
             "torch._dynamo.config.capture_scalar_outputs = True",
         ]
 
     def args_codegen(self, arg_operations, constant_operations=None):
+        # [FUNCTION DOC] Returns the base argument creation lines plus, for every floating point
+        # tensor argument, a line re-marking it as requiring grad. constant_operations is passed
+        # through to the base implementation.
         """Generate args with requires_grad=True on float tensors.
 
         This ensures the backward pass traces through stream-wrapped operations,
@@ -392,6 +457,8 @@ class StreamFuzzTemplate(DefaultFuzzTemplate):
     def wrap_body(
         self, generated_code_lines: list[str], graph: OperationGraph
     ) -> list[str]:
+        # [FUNCTION DOC] Returns the body lines rewritten to use CUDA streams, by delegating to
+        # wrap_body_with_streams.
         return self.wrap_body_with_streams(generated_code_lines, graph)
 
     @staticmethod
@@ -399,6 +466,15 @@ class StreamFuzzTemplate(DefaultFuzzTemplate):
         generated_code_lines: list[str],
         graph: OperationGraph,
     ) -> list[str]:
+        # [FUNCTION DOC] Static. Rewrites indented body lines so non-leaf operations run on 2 or
+        # 3 randomly chosen streams. Groups lines per node by the variable assignment they start
+        # with, declares the streams first, keeps argument and constant nodes on the default
+        # stream, and wraps each other node in a stream context. Randomly chooses one sync mode
+        # for the whole body: stream waits, or events recorded on the producer stream and waited
+        # on by the consumer. Syncs once per distinct producer stream for cross-stream inputs, and
+        # finally makes the current stream wait for all streams. Returns the lines unchanged when
+        # there is no non-leaf node. Uses the global random state.
+        # KNOWN ISSUE: lines before the first node assignment are dropped from the output.
         """Wrap generated function body lines with CUDA stream contexts.
 
         Assigns each non-leaf operation to one of 2-3 random streams, wraps each
@@ -522,6 +598,9 @@ class StreamFuzzTemplate(DefaultFuzzTemplate):
 
 
 class DTensorFuzzPlacementsTemplate(DTensorFuzzTemplate):
+    # [CLASS DOC] DTensor template variant giving each argument and the sentinel a randomly
+    # chosen placement (replicate, shard on a dimension, or partial) for each of the two mesh
+    # dimensions. Constants are lifted to function parameters and created in the argument code.
     """DTensor template with randomized placements (Replicate, Shard, Partial).
 
     Extends DTensorFuzzTemplate to randomize placement strategies instead of
@@ -529,6 +608,8 @@ class DTensorFuzzPlacementsTemplate(DTensorFuzzTemplate):
     """
 
     def fuzz_spec_custom(self):
+        # [FUNCTION DOC] Returns a TensorSpec (never a scalar) with a random supported dtype, 1
+        # to 4 dimensions (weighted toward 2 and 3), each of size 2 to 32, and a valid stride.
         """Generate tensor specs with minimum 1 dimension for proper DTensor sharding."""
         from torchfuzz.tensor_fuzzer import fuzz_valid_stride
 
@@ -544,6 +625,8 @@ class DTensorFuzzPlacementsTemplate(DTensorFuzzTemplate):
         return TensorSpec(size=size, stride=stride, dtype=dtype)
 
     def imports_codegen(self):
+        # [FUNCTION DOC] Returns the parent imports with the placement import extended to include
+        # Partial, plus an import of the distributed tensor module under a short alias.
         """Add Partial to imports."""
         base_imports = super().imports_codegen()
         # Update the placement imports to include Partial
@@ -557,14 +640,20 @@ class DTensorFuzzPlacementsTemplate(DTensorFuzzTemplate):
         return base_imports
 
     def treat_constant_as_global(self) -> bool:
+        # [FUNCTION DOC] Returns true: constants become function parameters.
         """Constants are created outside the function and passed in as args."""
         return True
 
     def codegen_constant(self, output_name: str, tensor_creation_expr: str) -> str:
+        # [FUNCTION DOC] Returns only a comment line noting the constant is created globally; the
+        # tensor creation expression is ignored.
         """Constants are materialized in args_codegen for this template."""
         return f"# {output_name} is created globally"
 
     def _generate_random_placement(self, tensor_size):
+        # [FUNCTION DOC] HELPER: Returns source text of a two element placement tuple (one per
+        # mesh dimension), each randomly replicate, shard along a random tensor dimension (only
+        # if the tensor has dimensions) or partial. Uses the global random state.
         """Generate random placement tuple (Replicate, Shard, or Partial)."""
         placements = []
         for _ in range(2):  # 2D mesh
@@ -579,6 +668,11 @@ class DTensorFuzzPlacementsTemplate(DTensorFuzzTemplate):
         return f"({', '.join(placements)})"
 
     def args_codegen(self, arg_operations, constant_operations=None):
+        # [FUNCTION DOC] Returns lines that set up the fake process group and cuda mesh, create a
+        # sentinel and each tensor argument as distributed tensors with random placements (ints
+        # as ones times 5, bools as ones cast to bool, floats random normal requiring grad), and
+        # create each tensor constant filled with 1.0 with random placements. Scalar arguments
+        # are not handled and produce no line.
         """Generate args with randomized placements using dist_tensor API."""
 
         code_lines = []

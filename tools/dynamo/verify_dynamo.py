@@ -1,3 +1,7 @@
+# [MODULE DOC] Script that sanity-checks a Dynamo installation: verifies the Python, torch, CUDA
+# and ROCm versions (mostly as warnings) and runs small compile and backward checks for the
+# eager, aot_eager and inductor backends on cpu and cuda, exiting with status 1 on failure.
+# Run as a script it calls main. Defines minimum version constants. No import-time side effects.
 import os
 import re
 import subprocess
@@ -12,10 +16,15 @@ MIN_PYTHON_VERSION = (3, 10)
 
 
 class VerifyDynamoError(BaseException):
+    # [CLASS DOC] Exception raised when an environment check fails (missing CUDA or ROCm,
+    # unparseable tool output, unsupported Python). Derives from BaseException, so a generic
+    # exception handler does not catch it.
     pass
 
 
 def check_python():
+    # [FUNCTION DOC] Returns the interpreter version info; raises VerifyDynamoError if it is
+    # older than the minimum supported Python version.
     if sys.version_info < MIN_PYTHON_VERSION:
         raise VerifyDynamoError(
             f"Python version not supported: {sys.version_info} "
@@ -25,6 +34,7 @@ def check_python():
 
 
 def check_torch():
+    # [FUNCTION DOC] Imports torch (ImportError if unavailable) and returns its version string.
     import torch
 
     return torch.__version__
@@ -32,6 +42,10 @@ def check_torch():
 
 # based on torch/utils/cpp_extension.py
 def get_cuda_version():
+    # [FUNCTION DOC] Finds the system CUDA install, runs its nvcc compiler with the version
+    # flag and returns the parsed major.minor release as a TorchVersion. Raises
+    # VerifyDynamoError if CUDA is not found or the version is not in the output; running nvcc
+    # may raise subprocess errors.
     from torch.torch_version import TorchVersion
     from torch.utils import cpp_extension
 
@@ -54,6 +68,9 @@ def get_cuda_version():
 
 
 def get_rocm_version():
+    # [FUNCTION DOC] Finds the system ROCm install, runs hipcc with the version flag and
+    # returns the parsed major.minor HIP version as a TorchVersion. Raises VerifyDynamoError if
+    # ROCm is not found or the version is not in the output.
     from torch.torch_version import TorchVersion
     from torch.utils import cpp_extension
 
@@ -80,6 +97,11 @@ def get_rocm_version():
 
 
 def check_cuda():
+    # [FUNCTION DOC] Returns None when CUDA is unavailable or torch is a ROCm build. Otherwise
+    # compares the CUDA version torch was built with to the system one and to the minimum,
+    # emitting warnings (not errors) on mismatch or too old, and returns the system version.
+    # May raise VerifyDynamoError via get_cuda_version.
+    # KNOWN ISSUE: compares TorchVersion objects to a plain version string for the minimum.
     import torch
     from torch.torch_version import TorchVersion
 
@@ -113,6 +135,10 @@ def check_cuda():
 
 
 def check_rocm():
+    # [FUNCTION DOC] Returns None when no GPU is available or torch is not a ROCm build.
+    # Otherwise compares torch's ROCm major.minor to the system version and to the minimum,
+    # warning on mismatch or too old, and returns the system version. May raise
+    # VerifyDynamoError via get_rocm_version.
     import torch
     from torch.torch_version import TorchVersion
 
@@ -143,6 +169,11 @@ def check_rocm():
 
 
 def check_dynamo(backend, device, err_msg) -> None:
+    # [FUNCTION DOC] Runs a tiny forward and backward check with the given dynamo backend on
+    # the given device. Skips (printing a message) for cuda when CUDA or triton is unusable.
+    # Resets dynamo, compiles a function and a module computing x plus x with full-graph mode,
+    # runs both on random input, and compares outputs and gradients to expected values. On any
+    # exception writes the traceback and err_msg to stderr and exits the process with status 1.
     import torch
 
     if device == "cuda" and not torch.cuda.is_available():
@@ -167,10 +198,13 @@ def check_dynamo(backend, device, err_msg) -> None:
 
         @dynamo.optimize(backend, nopython=True)
         def fn(x):
+            # [FUNCTION DOC] HELPER: Test function returning the input added to itself.
             return x + x
 
         class Module(torch.nn.Module):
+            # [CLASS DOC] HELPER: Parameterless test module whose forward doubles its input.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input added to itself.
                 return x + x
 
         mod = Module()
@@ -205,6 +239,10 @@ _SANITY_CHECK_ARGS = (
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point: checks and prints the Python, torch, CUDA and ROCm versions,
+    # then runs check_dynamo for every backend/device pair in the sanity check table (warning
+    # when Python is 3.15 or newer), and prints a success line. A failing check exits the
+    # process.
     python_ver = check_python()
     torch_ver = check_torch()
     cuda_ver = check_cuda()

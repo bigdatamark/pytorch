@@ -1,3 +1,7 @@
+# [PACKAGE DOC] CUDA device plugin for torchfuzz (the default plugin). Exposes the two plugin
+# functions: register_codegen (template name to FuzzTemplate subclass mapping) and
+# get_device_info (device name cuda plus a runtime-environment hook that picks one random GPU
+# through the visible devices variable). Importing it imports the CUDA template classes.
 """CUDA device plugin for torchfuzz.
 
 This is the reference device plugin loaded by ``torchfuzz.codegen`` when
@@ -103,6 +107,8 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 
 def register_codegen() -> dict[str, type[FuzzTemplate]]:
+    # [FUNCTION DOC] Returns a mapping from template short name (default, dtensor,
+    # dtensor_placements, unbacked, streams) to the CUDA FuzzTemplate subclass implementing it.
     """Return the CUDA plugin's template registry."""
     return {
         "default": DefaultFuzzTemplate,
@@ -118,6 +124,12 @@ def _select_cuda_device(
     *,
     exclude_primary_device: bool = False,
 ) -> dict[str, str]:
+    # [FUNCTION DOC] HELPER: Returns a copy of the environment mapping in which the visible
+    # devices variable is narrowed to one randomly chosen GPU. Candidates come from that
+    # variable if set, otherwise all GPUs reported by torch (excluding GPU 0 when requested and
+    # more than one exists); if torch cannot be imported or no candidates exist, the copy is
+    # unchanged. Logs the selection. Does not mutate the input.
+    # KNOWN ISSUE: exclude_primary_device is ignored when the variable is already set.
     """Pick a random CUDA device and narrow CUDA_VISIBLE_DEVICES to it.
 
     Returns a new env mapping (does not mutate ``env``).
@@ -153,5 +165,7 @@ def _select_cuda_device(
 
 
 def get_device_info() -> DeviceInfo:
+    # [FUNCTION DOC] Returns the DeviceInfo for this plugin: device name cuda and the GPU
+    # selection function as the runtime environment hook.
     """Return the CUDA plugin's device metadata."""
     return DeviceInfo(device_name="cuda", select_runtime_env=_select_cuda_device)

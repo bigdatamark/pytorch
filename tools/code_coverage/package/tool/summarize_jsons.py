@@ -1,3 +1,9 @@
+# [MODULE DOC] Collects per-target llvm/gcov JSON coverage exports, merges them into module-level
+# covered/uncovered line maps and produces the final coverage reports.
+# Main contents: JSON loading with tolerance for error preamble lines, record filtering by
+# interested folders, merging, and the summarize_jsons entry point.
+# Import-time side effects: creates module-level mutable state (covered_lines, uncovered_lines,
+# tests_type) that is filled while parsing and is never reset.
 from __future__ import annotations
 
 import json
@@ -40,6 +46,11 @@ tests_type: TestStatusType = {"success": set(), "partial": set(), "fail": set()}
 def transform_file_name(
     file_path: str, interested_folders: list[str], platform: TestPlatform
 ) -> str:
+    # [FUNCTION DOC] Normalizes a source file path from a coverage record.
+    # Strips the per-CPU-capability suffixes (DEFAULT, AVX, AVX2) from the name. If a user
+    # interested folder occurs in the path, returns the path starting at that folder. Otherwise,
+    # on the OSS platform, strips the pytorch checkout folder prefix, raising an AssertionError
+    # if the path does not start with it. Returns the transformed path; no side effects.
     remove_patterns: set[str] = {".DEFAULT.cpp", ".AVX.cpp", ".AVX2.cpp"}
     for pattern in remove_patterns:
         file_path = file_path.replace(pattern, "")
@@ -62,6 +73,10 @@ def transform_file_name(
 def is_intrested_file(
     file_path: str, interested_folders: list[str], platform: TestPlatform
 ) -> bool:
+    # [FUNCTION DOC] Decides whether a file path should be included in the coverage report.
+    # Rejects paths containing cuda, generated aten, or build folder markers. On OSS, rejects
+    # paths outside the pytorch folder. If interested folders were given, accepts only paths
+    # containing one of them (as a folder with trailing slash); otherwise accepts everything.
     ignored_patterns = ["cuda", "aten/gen_aten", "aten/aten_", "build/"]
     if any(pattern in file_path for pattern in ignored_patterns):
         return False
@@ -85,6 +100,10 @@ def is_intrested_file(
 
 
 def get_json_obj(json_file: str) -> tuple[Any, int]:
+    # [FUNCTION DOC] Reads a coverage export file and returns the first line that parses as a
+    # JSON object together with a status code: 0 if no line failed to parse before it, 1 if
+    # some leading lines were unparseable (compiler noise) and were skipped, 2 with a None object
+    # if no line parsed. Only the first valid line is used. Reads the file; no other effects.
     """
     Sometimes at the start of file llvm/gcov will complains "fail to find coverage data",
     then we need to skip these lines
@@ -110,6 +129,11 @@ def get_json_obj(json_file: str) -> tuple[Any, int]:
 
 
 def parse_json(json_file: str, platform: TestPlatform) -> list[CoverageRecord]:
+    # [FUNCTION DOC] Loads one JSON export and converts it to coverage records.
+    # Records the file in the global tests_type map as success, partial or fail according to the
+    # read status, and prints a progress line. Raises RuntimeError if nothing could be loaded.
+    # Picks the llvm parser for clang and the gcov parser for gcc; returns an empty list if the
+    # compiler type is neither.
     print("start parse:", json_file)
     json_obj, read_status = get_json_obj(json_file)
     if read_status == 0:
@@ -137,6 +161,10 @@ def parse_json(json_file: str, platform: TestPlatform) -> list[CoverageRecord]:
 def parse_jsons(
     test_list: TestList, interested_folders: list[str], platform: TestPlatform
 ) -> None:
+    # [FUNCTION DOC] Walks the JSON output folder and parses every .json file found.
+    # With clang, files not related to the given test list are skipped; with gcc all are used.
+    # Files that fail to load are reported through print_error and skipped. Parsed records are
+    # merged into the module-level line maps via update_coverage. Returns nothing.
     g = os.walk(JSON_FOLDER_BASE_DIR)
 
     for path, _, file_list in g:
@@ -163,6 +191,10 @@ def update_coverage(
     interested_folders: list[str],
     platform: TestPlatform,
 ) -> None:
+    # [FUNCTION DOC] Merges coverage records into the global covered_lines and uncovered_lines
+    # maps. Records for files that are not of interest are dropped; remaining file paths are
+    # normalized with transform_file_name, and their covered/uncovered line sets are unioned
+    # into the maps (None ranges are ignored). Mutates module state; returns nothing.
     for item in coverage_records:
         # extract information for the record
         record = item.to_dict()
@@ -187,6 +219,10 @@ def update_coverage(
 
 
 def update_set() -> None:
+    # [FUNCTION DOC] For every file with covered lines, removes those lines from its uncovered
+    # set so a line covered by any target counts as covered. Mutates global state in place.
+    # KNOWN ISSUE: raises a KeyError if a file is in covered_lines but not in uncovered_lines
+    # (cannot happen when populated through update_coverage).
     for file_name in covered_lines:
         # difference_update
         uncovered_lines[file_name].difference_update(covered_lines[file_name])
@@ -198,6 +234,10 @@ def summarize_jsons(
     coverage_only: list[str],
     platform: TestPlatform,
 ) -> None:
+    # [FUNCTION DOC] Entry point of the summary stage. For gcc it only produces the html report.
+    # For clang it parses all JSON exports, reconciles covered vs uncovered lines, then writes
+    # the line-oriented and file-oriented reports using the test list, test status map,
+    # interested folders and coverage_only filter. Prints the elapsed time. Returns nothing.
     start_time = time.time()
     if detect_compiler_type(platform) == CompilerType.GCC:
         html_oriented_report()

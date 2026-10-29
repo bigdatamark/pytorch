@@ -1,3 +1,6 @@
+# [MODULE DOC] Initialization helpers for the code coverage tool: preparing the log and profile
+# folders, registering common command line arguments, and converting parsed arguments into the
+# stage Option flags. No import-time side effects.
 import argparse
 import os
 from typing import Any
@@ -14,11 +17,14 @@ from .utils import create_folder, get_raw_profiles_folder, remove_file
 
 
 def remove_files() -> None:
+    # [FUNCTION DOC] Deletes the previous run's log file if present.
     # remove log
     remove_file(os.path.join(LOG_DIR, "log.txt"))
 
 
 def create_folders() -> None:
+    # [FUNCTION DOC] Creates the profile, merged, json, raw profiles, summary and log folders
+    # (existing ones are kept).
     create_folder(
         PROFILE_DIR,
         MERGED_FOLDER_BASE_DIR,
@@ -30,6 +36,9 @@ def create_folders() -> None:
 
 
 def add_arguments_utils(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    # [FUNCTION DOC] Adds the shared flags to the parser: run, merge, export, summary (boolean
+    # stage switches), interest-only (list of folders restricting the report) and clean
+    # (delete generated files). Mutates and returns the same parser.
     parser.add_argument("--run", help="run the cpp test binaries", action="store_true")
     parser.add_argument(
         "--merge",
@@ -61,6 +70,7 @@ def add_arguments_utils(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
 
 
 def have_option(have_stage: bool, option: int) -> int:
+    # [FUNCTION DOC] HELPER: Returns the option value when have_stage is true, else zero.
     if have_stage:
         return option
     else:
@@ -68,6 +78,11 @@ def have_option(have_stage: bool, option: int) -> int:
 
 
 def get_options(args: Any) -> Option:
+    # [FUNCTION DOC] Builds an Option from parsed arguments, setting the need flag of each of
+    # build, run, merge, export and summary that is present and true in args. If none ended up
+    # set, enables every stage including pytest. Returns the Option instance.
+    # KNOWN ISSUE: the flags are set on the instance, while Option declares class-level
+    # defaults; the pytest flag is never set from args.
     option: Option = Option()
     if args.__contains__("build"):
         if args.build:

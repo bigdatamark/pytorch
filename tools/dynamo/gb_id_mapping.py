@@ -1,3 +1,8 @@
+# [MODULE DOC] Tool that scans dynamo source files for graph break reporting calls (calls to
+# unimplemented and unimplemented_with_warning, plus helper wrappers) using the ast module, and
+# builds the graph break registry JSON mapping sequential GB ids to graph break type, context,
+# explanation and hints. Also has registry load/save and random id helpers. Run as a script it
+# calls main (create subcommand). No import-time side effects.
 import argparse
 import ast
 import json
@@ -8,10 +13,14 @@ from typing import Any
 
 
 def get_source_segment(source: str, node: ast.AST) -> str | None:
+    # [FUNCTION DOC] HELPER: Thin wrapper returning the exact source text of an ast node, or
+    # None if position info is unavailable.
     return ast.get_source_segment(source, node)
 
 
 def load_registry(path: Path) -> dict[str, Any]:
+    # [FUNCTION DOC] Reads the registry JSON file at path into a mapping; returns an empty
+    # mapping if the file does not exist. Invalid JSON raises a decode error.
     if path.exists():
         with path.open() as f:
             return json.load(f)  # type: ignore[no-any-return]
@@ -19,11 +28,16 @@ def load_registry(path: Path) -> dict[str, Any]:
 
 
 def save_registry(reg: dict[str, Any], path: Path) -> None:
+    # [FUNCTION DOC] Writes the registry mapping to path as JSON indented by two spaces,
+    # overwriting the file.
     with path.open("w") as f:
         json.dump(reg, f, indent=2)
 
 
 def next_gb_id(reg: dict[str, Any]) -> str:
+    # [FUNCTION DOC] Returns an unused id of the form GB plus four digits. First tries up to 100
+    # random ids not among the registry keys, then falls back to the lowest free id. Raises
+    # RuntimeError if all 10000 ids are used. Not called by main in this file.
     """Generate a random unused GB ID from GB0000-GB9999 range."""
     used_ids = set(reg.keys())
     max_attempts = 100
@@ -44,6 +58,10 @@ def next_gb_id(reg: dict[str, Any]) -> str:
 
 
 def clean_string(s: Any) -> Any:
+    # [FUNCTION DOC] Normalizes source text of a string expression: for string input, strips
+    # f-string prefixes, merges adjacent literals, removes the surrounding quotes, joins lines
+    # with spaces and decodes escape sequences. Non-string input is returned unchanged.
+    # KNOWN ISSUE: the unicode_escape decoding can raise or mangle non-ASCII text.
     """
     Normalizes string literals by removing formatting artifacts and escape sequences.
     Handles f-strings, quotes, newlines, and other syntax elements for cleaner output.
@@ -65,6 +83,12 @@ def clean_string(s: Any) -> Any:
 
 
 def expand_hints(hints: list[str], dynamo_dir: str | None = None) -> list[str]:
+    # [FUNCTION DOC] Replaces hint strings that reference a shared hint list by the list's
+    # contents. Executes the graph_break_hints module source from dynamo_dir (default: the
+    # torch _dynamo folder of this repo) in a fresh namespace, collects its public upper-case
+    # list constants, and for each hint containing a starred reference to one of them extends
+    # the output with that list; other hints are kept as they are. Side effect: reads a file and
+    # executes its code. Raises OSError if the module file is missing.
     """
     Expands hint references to their actual values from graph_break_hints.
     Uses exec() to avoid import dependencies.
@@ -106,6 +130,10 @@ def expand_hints(hints: list[str], dynamo_dir: str | None = None) -> list[str]:
 def extract_info_from_value(
     source: str, value_node: ast.AST, substitutions: dict[str, str] | None = None
 ) -> Any:
+    # [FUNCTION DOC] Evaluates an ast value node to plain data. Constants give their value; an
+    # f-string gives its text with each substituted variable name (from the substitutions
+    # mapping) replaced by its value and other placeholders kept as braced source text; any
+    # other node gives its cleaned source text (via clean_string), or None if unavailable.
     substitutions = substitutions or {}
 
     if isinstance(value_node, ast.Constant):
@@ -135,6 +163,8 @@ def extract_info_from_value(
 def extract_info_from_keyword(
     source: str, kw: ast.keyword, substitutions: dict[str, str] | None = None
 ) -> Any:
+    # [FUNCTION DOC] Returns the evaluated value of a keyword argument node by delegating to
+    # extract_info_from_value on the keyword's value, with optional name substitutions.
     """
     Extracts and returns the value of a keyword argument from an AST node.
 
@@ -154,6 +184,10 @@ def extract_hint_list(
     substitutions: dict[str, str],
     dynamo_dir: str | None,
 ) -> list[str]:
+    # [FUNCTION DOC] Extracts the list of hint strings from the hints argument node. For a
+    # list literal, collects string items and expands starred references to the shared hint
+    # lists. For any other expression, evaluates it to text, collects quoted substrings and
+    # expands shared-list references; returns an empty list if it is not a string.
     if not isinstance(value_node, ast.List):
         hints = extract_info_from_value(source, value_node, substitutions)
         if not isinstance(hints, str):
@@ -183,6 +217,8 @@ def extract_hint_list(
 
 
 def extract_constant_str_arg(node: ast.Call, name: str, index: int) -> str | None:
+    # [FUNCTION DOC] Returns the string constant passed to a call as positional argument index
+    # or, failing that, as the keyword called name; None if neither is a string literal.
     if len(node.args) > index:
         arg = node.args[index]
         if isinstance(arg, ast.Constant):
@@ -200,6 +236,8 @@ def extract_constant_str_arg(node: ast.Call, name: str, index: int) -> str | Non
 
 
 def find_helper_unimplemented_call(helper: ast.FunctionDef) -> ast.Call | None:
+    # [FUNCTION DOC] Returns the first call inside the helper function body whose callee is the
+    # plain name unimplemented or _unimplemented, or None if there is none.
     for node in ast.walk(helper):
         if (
             isinstance(node, ast.Call)
@@ -217,6 +255,10 @@ def extract_call_info(
     substitutions: dict[str, str],
     dynamo_dir: str | None,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] Builds an info mapping (gb_type, context, explanation, hints) from the
+    # keyword arguments of an unimplemented call node. Hints are expanded to a list of strings;
+    # other fields are evaluated with the given name substitutions. Missing fields stay None
+    # (hints defaults to an empty list).
     info: dict[str, Any] = {
         "gb_type": None,
         "context": None,
@@ -238,6 +280,13 @@ def extract_call_info(
 def find_unimplemented_calls(
     path: str, dynamo_dir: str | None = None
 ) -> list[dict[str, Any]]:
+    # [FUNCTION DOC] Scans a Python file, or all Python files under a directory, for graph break
+    # reports and returns a list of info mappings (gb_type, context, explanation, hints).
+    # Direct calls to unimplemented or unimplemented_with_warning are extracted (calls without
+    # a gb_type are dropped), the definitions of those functions themselves are skipped, and
+    # calls to the unimplemented_direct_disable_call wrapper are resolved by substituting the
+    # api_name argument into the wrapper's inner call. Files with syntax errors print a message
+    # and are skipped. Reads files only.
     results = []
     path_obj = Path(path)
 
@@ -322,6 +371,11 @@ def find_unimplemented_calls(
 
 
 def create_registry(dynamo_dir: str, registry_path: str) -> None:
+    # [FUNCTION DOC] Builds the registry from scratch: finds all graph breaks under dynamo_dir,
+    # de-duplicates by gb_type (the last occurrence wins), sorts by gb_type and assigns
+    # sequential ids starting at GB0000. Each id maps to a one element list holding a mapping
+    # with Gb_type, Context, Explanation and Hints. Writes the JSON to registry_path
+    # (overwriting) with two space indentation.
     calls = find_unimplemented_calls(dynamo_dir)
     registry = {}
 
@@ -349,6 +403,12 @@ def create_registry(dynamo_dir: str, registry_path: str) -> None:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Command line entry point. Defaults the registry path to the registry JSON
+    # in the repo's torch _dynamo folder and the search folder to the imported torch._dynamo
+    # package (or the repo copy if torch cannot be imported). With the create subcommand it
+    # calls create_registry; otherwise prints help.
+    # KNOWN ISSUE: the registry-path option is defined on the main parser, so it must come
+    # before the create subcommand on the command line.
     repo_root = Path(__file__).resolve().parent.parent.parent
     registry_path = repo_root / "torch" / "_dynamo" / "graph_break_registry.json"
 

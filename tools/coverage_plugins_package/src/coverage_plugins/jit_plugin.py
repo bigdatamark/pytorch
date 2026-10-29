@@ -1,3 +1,8 @@
+# [MODULE DOC] coverage.py plug-in that marks JIT-compiled (torch.jit.script) functions and
+# methods as covered, by recording their source lines into a separate coverage data file.
+# Main contents: the module-level CoverageData store, JitPlugin and the coverage_init hook.
+# Import-time side effects: requires the coverage package and creates a CoverageData object
+# whose file name is based on the current time.
 """
 This coverage plug-in attempts to cover JIT'd functions and methods that were previously missed in code coverage. Any
 function and method that was passed through/decorated with torch.jit.script or torch.jit.script_method should now be
@@ -30,10 +35,16 @@ cov_data = CoverageData(basename=f".coverage.jit.{time()}")
 
 
 def is_not_builtin_class(obj: Any) -> bool:
+    # [FUNCTION DOC] Returns true if obj is a class whose type's module is not builtins.
+    # KNOWN ISSUE: the type of any class is its metaclass (usually type from builtins), so this
+    # is false for nearly all ordinary classes.
     return isclass(obj) and type(obj).__module__ != "builtins"
 
 
 class JitPlugin(CoveragePlugin):  # type: ignore[misc, no-any-unimported]
+    # [CLASS DOC] Coverage plugin that observes every traced frame through the dynamic context
+    # hook and, for frames of the JIT should_drop function, records the whole source range of
+    # the function being compiled as covered in the module-level CoverageData. Stateless.
     """
     dynamic_context is an overridden function that gives us access to every frame run during the coverage process. We
     look for when the function being run is `should_drop`, as all functions that get passed into `should_drop` will be
@@ -41,6 +52,10 @@ class JitPlugin(CoveragePlugin):  # type: ignore[misc, no-any-unimported]
     """
 
     def dynamic_context(self, frame: Any) -> None:
+        # [FUNCTION DOC] Called by coverage for each frame. If the frame runs should_drop, takes
+        # its fn local; for modules, methods, functions, code objects and non-builtin classes
+        # with a known source file, adds the line range of its source to cov_data. Objects whose
+        # source lines cannot be read (OSError) are skipped. Then defers to the base class.
         if frame.f_code.co_name == "should_drop":
             obj = frame.f_locals["fn"]
             # The many conditions in the if statement below are based on the accepted arguments to getsourcefile. Based
@@ -78,4 +93,6 @@ class JitPlugin(CoveragePlugin):  # type: ignore[misc, no-any-unimported]
 
 
 def coverage_init(reg: Any, options: Any) -> None:
+    # [FUNCTION DOC] Plugin entry point called by coverage: registers a JitPlugin instance as a
+    # dynamic context provider on reg. The options argument is unused.
     reg.add_dynamic_context(JitPlugin())

@@ -1,4 +1,11 @@
 # mypy: ignore-errors
+# [MODULE DOC] Code generation for torchfuzz: turns an operation graph into the text of a
+# runnable Python program. Contains DeviceInfo (device plugin metadata), FuzzTemplate (base class
+# whose hook methods customize imports, flags, args, body, return and epilogue code), a lazy
+# device plugin registry (initialize_codegen, get_template_names, make_template,
+# get_device_info), graph to code conversion, per-operation code generation and writing the
+# program to a temporary file. Import-time side effects: imports torch and torchfuzz modules;
+# the plugin itself is only loaded lazily.
 import hashlib
 import importlib
 import os
@@ -19,6 +26,9 @@ _DEFAULT_DEVICE_MODULE = "torchfuzz.cuda"
 
 @dataclass
 class DeviceInfo:
+    # [CLASS DOC] Dataclass describing a device plugin: device_name (label used in emitted
+    # tensor descriptors) and an optional select_runtime_env callback that returns the
+    # environment for the subprocess running generated programs (None means use as is).
     """Per-device metadata returned by a torchfuzz device plugin.
 
     Attributes:
@@ -46,11 +56,19 @@ class DeviceInfo:
 
 
 class FuzzTemplate:
+    # [CLASS DOC] Base class of fuzz program templates. Holds supported_ops (the operations
+    # the template allows) and check (a Check producing the final execution code). Provides the
+    # random spec distribution and dtype list, and overridable hooks that emit pieces of the
+    # generated program: imports, flags, seed, args, constants, body wrapping, return statement
+    # and epilogue. Device plugins subclass it; defaults are device-agnostic.
     def __init__(self, supported_ops, check):
+        # [FUNCTION DOC] Stores the supported operations and the check object.
         self.supported_ops = supported_ops
         self.check = check
 
     def supported_dtypes(self):
+        # [FUNCTION DOC] Returns the list of torch dtypes (float32, float64, float16, bfloat16,
+        # int8, int16, int32, int64, bool) the template may generate. Subclasses may override.
         """Return list of supported dtypes for this template."""
         return [
             torch.float32,
@@ -65,6 +83,9 @@ class FuzzTemplate:
         ]
 
     def spec_distribution(self):
+        # [FUNCTION DOC] Returns a mapping describing how random specs are drawn: probability
+        # of tensor vs scalar (default 0.8 and 0.2) and flags allowing tensors and scalars
+        # (both true by default). Subclasses override to change the mix.
         """
         Define the distribution for generating random Specs.
 
@@ -83,6 +104,10 @@ class FuzzTemplate:
         }
 
     def fuzz_spec_custom(self):
+        # [FUNCTION DOC] Draws a random Spec following spec_distribution: picks a random dtype
+        # from supported_dtypes, then a tensor or scalar spec (only one kind if the other is
+        # disallowed, otherwise tensor with the configured probability). Raises ValueError if
+        # neither kind is allowed. Uses the global random state.
         """
         Generate a random Spec based on this template's distribution preferences.
 
@@ -118,6 +143,8 @@ class FuzzTemplate:
                 return self._generate_scalar_spec(dtype)
 
     def _generate_tensor_spec(self, dtype):
+        # [FUNCTION DOC] HELPER: Builds a TensorSpec of the dtype with a randomly fuzzed size
+        # and a valid random stride for it.
         """Generate a TensorSpec with the given dtype."""
         from torchfuzz.tensor_fuzzer import (
             fuzz_tensor_size,
@@ -130,28 +157,39 @@ class FuzzTemplate:
         return TensorSpec(size=size, stride=stride, dtype=dtype)
 
     def _generate_scalar_spec(self, dtype):
+        # [FUNCTION DOC] HELPER: Builds a ScalarSpec of the given dtype.
         """Generate a ScalarSpec with the given dtype."""
         from torchfuzz.tensor_fuzzer import ScalarSpec
 
         return ScalarSpec(dtype=dtype)
 
     def imports_codegen(self):
+        # [FUNCTION DOC] Hook: returns extra import lines for the top of the generated file
+        # (default none).
         """Return import lines emitted at the top of the generated file."""
         return []
 
     def flags_codegen(self):
+        # [FUNCTION DOC] Hook: returns config/setup lines emitted after the imports (default
+        # none).
         """Return flag/setup lines emitted at the top of the generated file."""
         return []
 
     def setseed_codegen(self, seed: int):
+        # [FUNCTION DOC] Hook: returns the lines that seed torch's random generator with the
+        # given seed, followed by an empty line.
         """Return lines emitted to set the random seed."""
         return [f"torch.manual_seed({seed})", ""]
 
     def epilogue_codegen(self):
+        # [FUNCTION DOC] Hook: returns lines appended at the very end of the generated file
+        # (default none).
         """Return lines emitted at the very end of the generated file."""
         return []
 
     def treat_constant_as_global(self) -> bool:
+        # [FUNCTION DOC] Hook: returns whether constant operations are lifted into extra
+        # function parameters created outside the generated function. Default is false.
         """Whether ``constant`` ops should be lifted to function arguments.
 
         When True, ``constant`` ops are appended to ``constant_operations`` and
@@ -165,6 +203,8 @@ class FuzzTemplate:
     def wrap_body(
         self, generated_code_lines: list[str], graph: OperationGraph
     ) -> list[str]:
+        # [FUNCTION DOC] Hook: receives the indented body lines and the graph and returns the
+        # (possibly rewritten) body lines. Default returns the same list unchanged.
         """Optionally rewrite the per-node body lines.
 
         Default is a passthrough.  Used by ``StreamFuzzTemplate`` to partition
@@ -173,6 +213,9 @@ class FuzzTemplate:
         return generated_code_lines
 
     def return_codegen(self, final_var_name: str) -> list[str]:
+        # [FUNCTION DOC] Hook: returns the indented lines ending the generated function. Default
+        # multiplies the final variable by the sentinel (to force gradient flow), takes the real
+        # part if the result is complex, and returns it, followed by an empty line.
         """Return the lines that emit the ``return`` statement.
 
         Default uses ``.real`` to drop imaginary parts of complex outputs.
@@ -187,6 +230,8 @@ class FuzzTemplate:
         ]
 
     def codegen_constant(self, output_name: str, tensor_creation_expr: str) -> str:
+        # [FUNCTION DOC] Hook: returns one line of code assigning the tensor creation expression
+        # text to the output variable name. Default is a plain assignment.
         """Wrap a tensor-creation expression for use as a ``constant`` op.
 
         Default just assigns the expression to ``output_name``.  Templates that
@@ -196,6 +241,12 @@ class FuzzTemplate:
         return f"{output_name} = {tensor_creation_expr}"
 
     def args_codegen(self, arg_operations, constant_operations=None):
+        # [FUNCTION DOC] Hook: returns the lines that create the program inputs, given the list
+        # of (node id, spec) pairs for argument operations (constant_operations is ignored here).
+        # Emits a sentinel scalar tensor requiring grad, then per argument: scalars as random
+        # python ints (5 to 29), bools or floats; tensors as strided views over randomly filled
+        # storage sized to the largest reachable offset (ints in range 5 to 29, bools via random
+        # 0/1, others normal random). Uses sizes, strides and dtypes of the specs.
         """Generate argument creation code for default template.
 
         ``constant_operations`` is only consulted by templates that opt in via
@@ -301,6 +352,10 @@ _DEVICE_INFO: DeviceInfo | None = None
 
 
 def initialize_codegen() -> None:
+    # [FUNCTION DOC] Idempotently loads the device plugin module named by the
+    # TORCHFUZZ_DEVICE_MODULE environment variable (default torchfuzz.cuda) and stores its
+    # template registry and device info in module globals. Raises ImportError if the module
+    # cannot be imported. Side effect: sets global state.
     """Load the device plugin module and populate the template registry.
 
     Idempotent.  Called explicitly from ``fuzzer.py`` and lazily from
@@ -320,12 +375,18 @@ def initialize_codegen() -> None:
 
 
 def get_template_names() -> list[str]:
+    # [FUNCTION DOC] Initializes the plugin if needed and returns the registered template names.
     """Return the list of template names registered by the active plugin."""
     initialize_codegen()
     return list(_TEMPLATE_REGISTRY.keys())
 
 
 def make_template(name: str) -> FuzzTemplate:
+    # [FUNCTION DOC] Initializes the plugin if needed and returns a new instance, built with no
+    # arguments, of the template class registered under name. Raises KeyError listing available
+    # names if unknown.
+    # KNOWN ISSUE: the base FuzzTemplate constructor requires two arguments, so registered
+    # classes must define a no-argument constructor.
     """Instantiate the FuzzTemplate registered under ``name``."""
     initialize_codegen()
     if name not in _TEMPLATE_REGISTRY:
@@ -337,6 +398,7 @@ def make_template(name: str) -> FuzzTemplate:
 
 
 def get_device_info() -> DeviceInfo:
+    # [FUNCTION DOC] Initializes the plugin if needed and returns the active DeviceInfo.
     """Return the active plugin's :class:`DeviceInfo`."""
     initialize_codegen()
     return _DEVICE_INFO
@@ -347,6 +409,16 @@ def convert_graph_to_python_code(
     seed: int | None = None,
     template: str = "default",
 ) -> str:
+    # [FUNCTION DOC] Converts an operation graph into the source text of a Python program.
+    # Builds the template by name; if a seed is given, reseeds python and torch random state
+    # with the seed plus 1000. Walks nodes in topological order, producing variable names per
+    # node, tracking argument operations (and constants when the template lifts them), and
+    # generating each operation's code lines indented by four spaces. Then assembles imports,
+    # flags, optional seed lines, the function definition with its parameters plus sentinel, the
+    # wrapped body, the return code, argument creation code, the check's execution code and the
+    # epilogue. Raises ValueError for an empty graph, out-of-order dependencies or a missing
+    # root node. Returns the joined text.
+    # KNOWN ISSUE: the docstring does not describe the template argument.
     """
     Convert an operation graph to executable Python code using topological ordering.
 
@@ -520,6 +592,10 @@ def generate_simple_operation_code(
     op_name: str,
     output_spec,
 ) -> list:
+    # [FUNCTION DOC] Returns the code lines for one operation. Looks up the operator by name in
+    # the registry and asks it to generate code for the output variable, input variables and
+    # output spec, then appends a tensor descriptor comment to the last non-empty line. For an
+    # unknown operation returns a single comment line naming it.
     """
     Generate code lines for executing a single operation using class-based operators.
 
@@ -553,6 +629,10 @@ def generate_simple_operation_code(
 
 
 def create_program_file(python_code: str) -> str:
+    # [FUNCTION DOC] Writes the code text to a file in a fixed temporary folder, creating the
+    # folder if needed. The file name uses the first eight hex digits of the md5 hash of the
+    # code, so identical code maps to the same file. Overwrites an existing file and returns the
+    # path.
     """
     Create a temporary Python file from the generated code.
 

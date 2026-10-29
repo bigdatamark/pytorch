@@ -1,3 +1,6 @@
+# [MODULE DOC] Script that downloads the MNIST dataset archives from an S3 mirror (with retries
+# and a progress bar) and unzips them into a destination directory. Run as a script it calls
+# main. Defines the mirror list, retry settings and resource file names.
 import argparse
 import gzip
 import os
@@ -31,6 +34,9 @@ def report_download_progress(
     chunk_size: int,
     file_size: int,
 ) -> None:
+    # [FUNCTION DOC] Reporthook for urlretrieve: when the total size is known, writes a
+    # carriage-return progress bar of up to 64 characters and a percentage to stdout (no
+    # flush, no newline). Does nothing when the size is unknown (-1).
     if file_size != -1:
         percent = min(1, (chunk_number * chunk_size) / file_size)
         bar = "#" * int(64 * percent)
@@ -38,6 +44,10 @@ def report_download_progress(
 
 
 def download(destination_path: str, resource: str, quiet: bool) -> None:
+    # [FUNCTION DOC] Downloads one resource from the mirrors to destination_path unless the
+    # file already exists. Each mirror is tried up to RETRIES times with growing sleep between
+    # attempts; a partial file left by a failed attempt is deleted. Prints progress unless
+    # quiet. Returns on first success; raises RuntimeError if every attempt failed.
     if os.path.exists(destination_path):
         if not quiet:
             print(f"{destination_path} already exists, skipping ...")
@@ -66,6 +76,9 @@ def download(destination_path: str, resource: str, quiet: bool) -> None:
 
 
 def unzip(zipped_path: str, quiet: bool) -> None:
+    # [FUNCTION DOC] Decompresses a gzip file next to itself, naming the output by dropping the
+    # last extension. Skips if the output already exists. Reads the whole file into memory.
+    # Prints messages unless quiet.
     unzipped_path = os.path.splitext(zipped_path)[0]
     if os.path.exists(unzipped_path):
         if not quiet:
@@ -79,6 +92,10 @@ def unzip(zipped_path: str, quiet: bool) -> None:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point: parses the destination directory and quiet options, sets a
+    # global 60 second socket timeout, creates the destination directory if needed, then
+    # downloads and unzips each MNIST resource. A keyboard interrupt prints a message and
+    # ends normally; download errors propagate as RuntimeError.
     parser = argparse.ArgumentParser(
         description="Download the MNIST dataset from the internet"
     )

@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Command line tool that creates or force-removes git worktrees of the repository,
+# cloning every submodule (recursively) from the local checkout's object store instead of the
+# network. Main contents: git query helpers, recursive submodule cloning, the create and remove
+# subcommands and main. Running it as a script invokes main; no import-time side effects.
 """Create or remove git worktrees with submodules cloned locally.
 
 This avoids fetching submodules from remote, which is slow for large repos
@@ -19,6 +23,8 @@ from pathlib import Path
 
 
 def get_repo_root() -> Path:
+    # [FUNCTION DOC] Returns the top-level directory of the current git repository by running
+    # git. Raises CalledProcessError if not inside a repository.
     result = subprocess.run(
         ["git", "rev-parse", "--show-toplevel"],
         capture_output=True,
@@ -29,6 +35,9 @@ def get_repo_root() -> Path:
 
 
 def get_existing_worktrees(repo_root: Path) -> list[str]:
+    # [FUNCTION DOC] Returns the directory names (last path component only) of all worktrees
+    # that git lists for the repository, including the main one. Raises CalledProcessError if
+    # git fails.
     result = subprocess.run(
         ["git", "worktree", "list", "--porcelain"],
         capture_output=True,
@@ -44,6 +53,8 @@ def get_existing_worktrees(repo_root: Path) -> list[str]:
 
 
 def next_worktree_name(repo_root: Path) -> str:
+    # [FUNCTION DOC] Returns the first unused name of the form pytorch-worktree-N, counting
+    # from 1, that does not match an existing worktree directory name.
     existing = get_existing_worktrees(repo_root)
     n = 1
     while True:
@@ -54,6 +65,8 @@ def next_worktree_name(repo_root: Path) -> str:
 
 
 def parse_gitmodules(root: Path) -> list[dict[str, str]]:
+    # [FUNCTION DOC] Reads the gitmodules file under root and returns a list of mappings with
+    # the path and url of each declared submodule; empty list if the file does not exist.
     gitmodules = root / ".gitmodules"
     if not gitmodules.exists():
         return []
@@ -69,6 +82,8 @@ def parse_gitmodules(root: Path) -> list[dict[str, str]]:
 
 
 def get_submodule_commit(parent_repo: Path, submodule_path: str) -> str | None:
+    # [FUNCTION DOC] Returns the commit hash that the parent repository records at HEAD for the
+    # submodule path (third field of the tree listing), or None if git fails or no entry exists.
     """Get the commit hash a parent repo expects for a submodule."""
     result = subprocess.run(
         ["git", "ls-tree", "HEAD", submodule_path],
@@ -84,6 +99,9 @@ def get_submodule_commit(parent_repo: Path, submodule_path: str) -> str | None:
 
 
 def resolve_git_dir(submodule_worktree: Path) -> Path | None:
+    # [FUNCTION DOC] Returns the real git directory of a submodule checkout: the git entry
+    # itself if it is a directory, or the resolved target of a gitdir pointer file. Returns None
+    # if there is no git entry or the pointer target is missing or malformed.
     """Resolve the actual git object directory for a submodule.
 
     Submodules can have .git as either a directory (standalone clone) or a
@@ -112,6 +130,13 @@ def clone_submodule_recursive(
     url: str,
     depth: int = 0,
 ) -> None:
+    # [FUNCTION DOC] Clones one submodule from the source checkout's local git directory into
+    # the worktree, checks out the commit recorded by the source parent repo, resets origin to
+    # the real url, runs submodule init, then recurses into nested submodules found in the new
+    # clone. Skips (with a message) submodules not initialized in the source. depth only controls
+    # print indentation. Failures of nested clones are printed as warnings to stderr; a failure
+    # of the top-level git commands raises CalledProcessError. Side effects: removes an empty
+    # placeholder directory, runs git, prints progress.
     prefix = "  " * depth
     source_sub = source_root / submodule_path
     worktree_sub = worktree_root / submodule_path
@@ -185,6 +210,11 @@ def clone_submodule_recursive(
 
 
 def cmd_create(args: argparse.Namespace) -> None:
+    # [FUNCTION DOC] Implements the create subcommand: adds a git worktree for args.commit under
+    # args.parent_dir (default: parent of the repo root) named args.name (default: next free
+    # pytorch-worktree-N), then clones all submodules from the local checkout. A failure to
+    # clone a submodule prints a warning to stderr and continues; failure to add the worktree
+    # raises CalledProcessError.
     repo_root = get_repo_root()
     parent_dir = Path(args.parent_dir) if args.parent_dir else repo_root.parent
     name = args.name or next_worktree_name(repo_root)
@@ -215,6 +245,9 @@ def cmd_create(args: argparse.Namespace) -> None:
 
 
 def cmd_remove(args: argparse.Namespace) -> None:
+    # [FUNCTION DOC] Implements the remove subcommand: force-removes the worktree args.name
+    # located under args.parent_dir (default: parent of the repo root). Raises
+    # CalledProcessError if git fails.
     repo_root = get_repo_root()
     parent_dir = Path(args.parent_dir) if args.parent_dir else repo_root.parent
     worktree_path = parent_dir / args.name
@@ -229,6 +262,10 @@ def cmd_remove(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Command line entry point: parses the create and remove subcommands, and
+    # defaults to create with default options when no subcommand is given, then dispatches.
+    # KNOWN ISSUE: a bare worktree name as the first argument (as in the usage text) is not a
+    # valid subcommand and makes argparse exit with an error.
     parser = argparse.ArgumentParser(
         description="Create or remove git worktrees with locally-cloned submodules."
     )

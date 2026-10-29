@@ -1,3 +1,8 @@
+# [MODULE DOC] Shared constants and types for the code coverage tool: folder locations under
+# the tool's profile directory, plus enums and small classes for tests, options, platforms and
+# compilers.
+# Import-time side effects: reads the HOME environment variable (KeyError if unset) and computes
+# the folder paths.
 from __future__ import annotations
 
 import os
@@ -22,11 +27,15 @@ LOG_DIR = os.path.join(PROFILE_DIR, "log")
 
 # test type, DO NOT change the name, it should be consistent with [buck query --output-attribute] result
 class TestType(Enum):
+    # [CLASS DOC] Enumeration of test kinds; values match the buck query output attribute names
+    # (cxx_test for C++ tests, python_test for Python tests).
     CPP = "cxx_test"
     PY = "python_test"
 
 
 class Test:
+    # [CLASS DOC] Plain record describing one test target: its name, buck target pattern,
+    # test set label and TestType. Holds no behavior beyond storing the four attributes.
     name: str
     target_pattern: str
     test_set: str  # like __aten__
@@ -35,6 +44,7 @@ class Test:
     def __init__(
         self, name: str, target_pattern: str, test_set: str, test_type: TestType
     ) -> None:
+        # [FUNCTION DOC] HELPER: Stores the four constructor arguments as attributes.
         self.name = name
         self.target_pattern = target_pattern
         self.test_set = test_set
@@ -47,6 +57,9 @@ TestStatusType = dict[str, set[str]]
 
 # option
 class Option:
+    # [CLASS DOC] Holder of class-level boolean flags selecting which pipeline stages run
+    # (build, run, merge, export, summary, pytest). All default to False and are set globally
+    # on the class by the argument handling code; it is never instantiated.
     need_build: bool = False
     need_run: bool = False
     need_merge: bool = False
@@ -57,11 +70,14 @@ class Option:
 
 # test platform
 class TestPlatform(Enum):
+    # [CLASS DOC] Enumeration of supported platforms: fbcode (internal) and oss (open source).
     FBCODE = "fbcode"
     OSS = "oss"
 
 
 # compiler type
 class CompilerType(Enum):
+    # [CLASS DOC] Enumeration of compilers whose coverage output is understood: clang (llvm
+    # profile data) and gcc (gcov).
     CLANG = "clang"
     GCC = "gcc"
