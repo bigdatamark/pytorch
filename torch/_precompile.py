@@ -1,3 +1,13 @@
+# [MODULE DOC] Implementation of torch.compiler.precompile: ahead-of-time capture of a whole
+# computation (forward, loss, backward) with make_fx, lowering through AOTAutograd + Inductor (or an
+# eager inlined graph), and emission of a self-contained python_code string plus an
+# integrity-tagged cache; precompile.load rebuilds a callable from them. The module holds the
+# capture guards (constant tensors, control flow, unsupported ops, mark_unbacked handling), the
+# parameter/buffer interning and calling-convention metadata, code generation for the artifact
+# and the runtime driver checks (shape/dtype/device/layout/structure). The programming-model
+# contract is in the note that follows the docstring. Import-time side effects: creates a logger,
+# the cache format constants and an empty __all__ (public names are re-exported from
+# torch.compiler instead).
 """Ahead-of-time precompilation (``make_fx`` tracer by default; Dynamo planned).
 
     python_code, cache = torch.compiler.precompile(fn, model, *example_inputs)
@@ -267,6 +277,9 @@ _NO_MARKS: Mapping[int, Any] = MappingProxyType({})
 
 
 class PrecompileError(RuntimeError):
+    # [CLASS DOC] Error type for every precompile contract violation at capture, lowering, load or
+    # runtime (baked constants, unsupported ops, cache/code mismatch, shape/dtype/layout mismatch).
+    # Plain RuntimeError subclass with no extra state.
     """The error type raised by ``torch.compiler.precompile`` and its artifacts.
 
     Raised when capture, lowering, ``load``, or a runtime call violates the precompile
@@ -278,6 +291,8 @@ class PrecompileError(RuntimeError):
 
 
 def _dense_shape(t: object) -> tuple[int, ...] | None:
+    # [FUNCTION DOC] HELPER: returns the shape tuple of a plain dense tensor, or None for non-tensors
+    # and traceable wrapper subclasses.
     """Return the shape of a plain dense tensor, else ``None`` (non-tensor / subclass).
 
     Tensor subclasses (e.g. DTensor) go through AOTAutograd's flatten path, so their
@@ -290,6 +305,8 @@ def _dense_shape(t: object) -> tuple[int, ...] | None:
 
 
 def _dense_dtype(t: object) -> str | None:
+    # [FUNCTION DOC] HELPER: returns the dtype string of a plain dense tensor, or None for non-tensors
+    # and wrapper subclasses.
     """Return the dtype of a plain dense tensor as a string, else ``None``.
 
     Recorded as a string (e.g. ``"torch.float32"``) so it serializes into the artifact
@@ -303,6 +320,8 @@ def _dense_dtype(t: object) -> str | None:
 
 
 def _dense_device(t: object) -> str | None:
+    # [FUNCTION DOC] HELPER: returns the device string of a plain dense tensor, or None for
+    # non-tensors and wrapper subclasses.
     """Return the device (as a string) of a plain dense tensor, else ``None``.
 
     Recorded as a string so it serializes into the artifact metadata as a literal and
@@ -317,6 +336,8 @@ def _dense_device(t: object) -> str | None:
 def _resolved_get_attrs(
     gm: torch.fx.GraphModule,
 ) -> list[tuple[str, object]]:
+    # [FUNCTION DOC] HELPER: for every get_attr node of gm returns (target name, resolved attribute),
+    # walking dotted names with a None result for missing parts.
     """Return ``(target, attr)`` for every ``get_attr`` node, resolving dotted
     qualnames the same way for both capture guards below (missing attr -> None)."""
     resolved = []
@@ -339,6 +360,8 @@ def _resolved_get_attrs(
 # what it leaves behind rather than exposing its own dynamic-shape kwarg. A stable
 # dynamo-owned accessor is the eventual home; until then these names are load-bearing.
 def _has_unbacked_marks(args: tuple[object, ...]) -> bool:
+    # [FUNCTION DOC] HELPER: True if any tensor leaf in args carries a regular or strict
+    # mark_unbacked dimension marker.
     """True if any tensor reachable in ``args`` carries a mark_unbacked dim (backed or
     strict)."""
     return any(
@@ -352,6 +375,9 @@ def _has_unbacked_marks(args: tuple[object, ...]) -> bool:
 
 
 def _reject_unsupported_marks(user_flat: list[object]) -> None:
+    # [FUNCTION DOC] HELPER: raises PrecompileError for tensor leaves that carry marks precompile
+    # cannot honor: mark_unbacked on a tensor subclass, mark_dynamic (backed dynamic) dims, or
+    # a non-empty specialize_on. Returns None when every leaf is acceptable.
     """Reject mark options precompile cannot honor, loudly (invariant 3).
 
     precompile only honors mark_unbacked (backed unbacked dims) and mark_unbacked's
@@ -399,6 +425,9 @@ def _reject_unsupported_marks(user_flat: list[object]) -> None:
 
 
 def _read_unbacked_marks(user_flat: list[object]) -> list[dict[int, _MarkSpec]]:
+    # [FUNCTION DOC] HELPER: returns, per leaf of user_flat, a mapping from marked dim to
+    # (shape_id, min, max, hint_override) built from the private dynamo mark attributes (strict and
+    # non-strict unbacked indices unioned); empty mapping for non-tensors and unmarked tensors.
     """Read ``torch._dynamo.decorators.mark_unbacked`` marks off the user-input tensors.
 
     Dynamic shapes are opt-in via that decorator (the caller marks dims before calling
@@ -439,6 +468,8 @@ def _read_unbacked_marks(user_flat: list[object]) -> list[dict[int, _MarkSpec]]:
 
 
 def _read_input_bounds(marks: list[dict[int, _MarkSpec]]) -> list[_LeafBounds]:
+    # [FUNCTION DOC] HELPER: converts the per-leaf marks into runtime bounds: per leaf a mapping of
+    # dim to (min, max) for dims with at least one bound, or None if no marked dim is bounded.
     """Build the per-leaf runtime min/max bounds from the already-read mark_unbacked
     marks, aligned to ``user_flat`` (so ``marks`` is the output of _read_unbacked_marks).
 
@@ -460,6 +491,8 @@ def _read_input_bounds(marks: list[dict[int, _MarkSpec]]) -> list[_LeafBounds]:
 
 
 def _detect_memory_format(t: torch.Tensor) -> torch.memory_format:
+    # [FUNCTION DOC] HELPER: returns contiguous, channels_last or channels_last_3d, whichever t is
+    # contiguous in (checked in that order). Raises PrecompileError for any other layout.
     """Return the example leaf's memory format so a refaked marked input preserves it.
 
     A mark_unbacked dim refakes the leaf via torch.empty; defaulting to contiguous would
@@ -485,6 +518,11 @@ def _detect_memory_format(t: torch.Tensor) -> torch.memory_format:
 def _fakeify_with_unbacked(
     pb_flat: list[Tensor], user_flat: list[object], marks: list[dict[int, _MarkSpec]]
 ) -> tuple[list[object], FakeTensorMode]:
+    # [FUNCTION DOC] HELPER: builds fake inputs for capture under a new ShapeEnv/FakeTensorMode.
+    # Params/buffers and unmarked tensors get static fakes; marked dims get unbacked symints
+    # (one per shape_id, with min/max applied as checks and hint overrides recorded); marked leaves
+    # are recreated empty preserving dtype, device, memory format and requires_grad. Returns the
+    # flat fake list (params/buffers then user inputs) and the fake mode.
     """Fakeify the flat capture inputs for an unbacked dynamic-shape capture.
 
     Params/buffers and unmarked dims become static fakes; each mark_unbacked dim becomes
@@ -553,6 +591,8 @@ def _fakeify_with_unbacked(
 
 
 def _check_no_constant_tensors(gm: torch.fx.GraphModule) -> None:
+    # [FUNCTION DOC] HELPER: raises PrecompileError listing (target, shape, dtype) if the captured
+    # graph has any get_attr that resolves to a tensor (a baked constant). Enforces invariant 1.
     """Enforce invariant 1 of Note [precompile programming model]: everything live
     is an input.
 
@@ -582,6 +622,8 @@ def _check_no_constant_tensors(gm: torch.fx.GraphModule) -> None:
 
 
 def _assert_no_control_flow_subgraphs(gm: torch.fx.GraphModule) -> None:
+    # [FUNCTION DOC] HELPER: raises PrecompileError if any get_attr node resolves to a nested
+    # GraphModule (captured cond/while_loop style subgraph).
     """Reject captured control-flow HOP subgraphs (e.g. from ``torch.cond``).
 
     They appear as ``get_attr`` nodes pointing at nested ``GraphModule`` submodules.
@@ -608,6 +650,10 @@ def _intern_param_buffers(
 ) -> tuple[
     list[Tensor], list[str], list[str], list[tuple[_ModuleIndex, str, int]], int
 ]:
+    # [FUNCTION DOC] HELPER: flattens the parameters then buffers of the given modules into one list,
+    # deduplicating by tensor identity (tied weights collapse to one entry). Returns the flat tensor
+    # list, parameter names, buffer names, alias entries (module index, name, index into the flat
+    # list) and the number of parameters.
     """Lift each module's parameters then buffers to a flat list, interning by
     tensor identity so a tied weight becomes a single entry (one optimizer step,
     accumulated gradient -- not one per name).
@@ -627,10 +673,12 @@ def _intern_param_buffers(
     if len(mods) > 1:
 
         def _name(mi: _ModuleIndex, n: str) -> str:
+            # [FUNCTION DOC] HELPER: with several modules, qualifies name n by module index (m<i>.<n>).
             return f"m{mi}.{n}"
     else:
 
         def _name(mi: _ModuleIndex, n: str) -> str:
+            # [FUNCTION DOC] HELPER: with a single module, returns name n unchanged.
             return n
 
     unique: list[Tensor] = []
@@ -638,6 +686,9 @@ def _intern_param_buffers(
     alias_entries: list[tuple[_ModuleIndex, str, int]] = []
 
     def _intern(mi: _ModuleIndex, n: str, t: Tensor, names_out: list[str]) -> None:
+        # [FUNCTION DOC] HELPER: adds tensor t to the unique list the first time its identity is seen
+        # (recording its display name in names_out), and always appends an alias entry mapping
+        # (module index, name) to the unique index.
         uidx = id_to_uidx.get(id(t))
         if uidx is None:
             uidx = len(unique)
@@ -663,6 +714,15 @@ def _capture(
     args: tuple[object, ...],
     decompositions: dict | None = None,
 ) -> _Capture:
+    # [FUNCTION DOC] HELPER: traces fn on the given positional args with make_fx. nn.Module args
+    # have parameters/buffers lifted (interned) to explicit graph inputs via reparametrization; the
+    # other args are flattened as runtime inputs. Records example shapes/dtypes/devices of params,
+    # buffers and user inputs, reads mark_unbacked marks (symbolic tracing with unbacked symints
+    # when present, else real mode), harvests parameter gradients produced by a backward in fn as
+    # trailing outputs (only for params that received one), and temporarily clears and later restores
+    # the example tensors' grad fields. Raises PrecompileError for unsupported marks, buffers or inputs
+    # receiving gradients, guarding on a marked dim, baked constants, control flow subgraphs, or
+    # unsupported ops. Returns a _Capture with the graph module and all calling-convention metadata.
     """Trace the computation ``fn(*args)`` to an ATen graph.
 
     See Note [precompile programming model] for the contract. ``fn`` is the whole
@@ -783,6 +843,11 @@ def _capture(
     captured_grad_param_indices: list[int] = []
 
     def flat_fn(flat: list[object]) -> list[object]:
+        # [FUNCTION DOC] HELPER: the function traced by make_fx. Splits the flat input into
+        # params/buffers and runtime inputs, runs fn with modules reparametrized, collects the
+        # grads of params that received one, then returns the flattened result followed by those
+        # grads. Stores the output TreeSpec and grad param indices in the enclosing variables.
+        # Raises PrecompileError if a buffer or a user input received a gradient.
         nonlocal captured_out_spec, captured_grad_param_indices
         # The pb region is entirely interned params/buffers (Tensors); the user region
         # (flat[num_pb:]) is arbitrary pytree leaves.
@@ -909,6 +974,10 @@ def _capture(
 
 
 class _Capture:
+    # [CLASS DOC] HELPER: plain record returned by _capture. Holds the traced GraphModule, the flat
+    # example (possibly fake) args, module positions, positional arg count, interned param/buffer
+    # names with example shapes/dtypes/devices, input/output TreeSpecs, harvested grad param indices,
+    # per-user-input shapes/dtypes/devices/bounds and the fake mode (None for static capture).
     def __init__(
         self,
         gm: torch.fx.GraphModule,
@@ -932,6 +1001,7 @@ class _Capture:
         user_input_bounds: list[_LeafBounds],
         fake_mode: FakeTensorMode | None = None,
     ) -> None:
+        # [FUNCTION DOC] HELPER: stores every argument as an attribute of the same name; no validation.
         self.gm = gm
         self.flat_args = flat_args
         self.module_positions = module_positions
@@ -995,6 +1065,11 @@ _GENERATED_HEADER = """\
 
 
 def _build_metadata_section(compiled: PrecompiledModule) -> list[str]:
+    # [FUNCTION DOC] HELPER: returns the source lines of the calling-convention metadata section: torch
+    # and pytree imports plus top-level literal assignments for backend, module positions, arg count,
+    # param/buffer names, shapes, dtypes, devices, grad param indices, input/output TreeSpecs (the
+    # input spec is None when not serializable) and user input shapes/dtypes/devices/bounds. Raises
+    # PrecompileError if the module is not compiled yet or the output TreeSpec cannot be serialized.
     if compiled._out_spec is None or compiled._in_spec is None:
         raise PrecompileError("internal: cannot build metadata before _compile()")
     # OUT_SPEC is load-bearing: the driver rebuilds fn's output via tree_unflatten, so
@@ -1074,6 +1149,10 @@ def _build_metadata_section(compiled: PrecompiledModule) -> list[str]:
 
 
 def _parse_artifact_metadata(python_code: str) -> dict[str, object]:
+    # [FUNCTION DOC] HELPER: parses python_code with the ast module (no execution) and returns a
+    # mapping of the expected metadata constant names to their literal values taken from top-level
+    # assignments; other assignments are skipped with a debug log. Raises PrecompileError if the
+    # code is not valid Python or any expected constant is missing.
     """Read the calling-convention constants back out of ``python_code`` WITHOUT
     executing it (exec'ing the inlined Inductor output would JIT the kernels, the
     very work the cache exists to skip).
@@ -1144,6 +1223,9 @@ def _build_python_source(
     compiled: PrecompiledModule,
     graph_python: str,
 ) -> str:
+    # [FUNCTION DOC] HELPER: assembles the full inductor-backend python_code text: generated header,
+    # the composed graph source (graph_python), the metadata section and the driver source whose
+    # entry point is the inductor forward. Returns the joined string.
     parts = [_GENERATED_HEADER, ""]
     parts.append("# " + "=" * 70)
     parts.append("# 1. Compiled graph (AOTAutograd + Inductor): exposes ``call``")
@@ -1181,6 +1263,10 @@ _EAGER_GENERATED_HEADER = """\
 
 
 def _build_eager_python_source(compiled: PrecompiledModule) -> str:
+    # [FUNCTION DOC] HELPER: assembles the eager-backend python_code text: header, fx custom builtin
+    # imports, the captured graph code (forward renamed to a private graph function), a holder class
+    # with serialized in/out TreeSpecs, a call function returning a list of outputs, then metadata
+    # and driver sections. Raises PrecompileError if the graph module or its specs are missing.
     gm = compiled._gm
     # gm.code defines ``def forward(self, flat)`` that references fx_pytree / pytree
     # and self._in_spec / self._out_spec. Rename it so it does not collide with the
@@ -1233,6 +1319,10 @@ if __name__ == "__main__":
 
 
 def _emit_driver_source(forward_fn_name: str) -> str:
+    # [FUNCTION DOC] HELPER: returns the source text of the runtime driver for inlining into
+    # python_code: the source of the driver module's param/buffer extraction, failure and structure
+    # check helpers plus the chosen forward variant (renamed to forward), followed by the main
+    # guard block. Reads sources via inspect lazily, so it only needs source availability at capture time.
     """Emit the runtime driver as text for inlining into python_code.
 
     The driver lives as real, type-checked code in torch._precompile_driver; here we read
@@ -1259,6 +1349,8 @@ def _emit_driver_source(forward_fn_name: str) -> str:
 
 
 def _assert_supported(gm: torch.fx.GraphModule) -> None:
+    # [FUNCTION DOC] HELPER: scans the captured graph's ATen op call nodes and raises the
+    # PrecompileError from _unsupported for the first effectful op found (invariant 4). Returns None otherwise.
     """Enforce invariant 4 of Note [precompile programming model]: reject boundary
     effects the AOT backend's standalone composition does not handle. Detected
     directly from the captured graph -- no AOTAutograd coupling.
@@ -1285,6 +1377,9 @@ def _assert_supported(gm: torch.fx.GraphModule) -> None:
 
 
 def _unsupported(reason: str) -> PrecompileError:
+    # [FUNCTION DOC] HELPER: builds (does not raise) the PrecompileError for an unsupported
+    # computation, embedding reason and an explanation about effectful ops.
+    # KNOWN ISSUE: the message always blames an effectful op regardless of the reason passed in.
     return PrecompileError(
         f"precompile cannot compile this computation: {reason}. The graph contains an "
         "effectful op, which is not supported yet: its with_effects HOP is "
@@ -1294,6 +1389,10 @@ def _unsupported(reason: str) -> PrecompileError:
 
 
 class PrecompiledModule:
+    # [CLASS DOC] Internal holder for either a freshly captured computation (state filled by
+    # _compile: calling-convention metadata lists, graph module, composed graph source, cache
+    # artifact bytes) or a runnable rebuilt by load (only _loaded_forward set, via _from_loaded).
+    # Emits artifacts with to_python_code and to_cache_bytes; calling it only works on loaded objects.
     """Internal holder for a precompiled computation / a loaded runnable."""
 
     def __init__(
@@ -1304,6 +1403,9 @@ class PrecompiledModule:
         tracer: str = "make_fx",
         decompositions: dict | None = None,
     ) -> None:
+        # [FUNCTION DOC] Stores fn, backend, tracer and the optional decomposition table and
+        # initializes all capture-derived state (names, shapes, dtypes, devices, specs, graph, grad
+        # indices, input bounds, artifact bytes, loaded forward) to empty defaults. No validation here.
         # ``fn`` is the whole computation: an nn.Module, or a callable that closes
         # over the module(s) it uses (e.g. ``lambda x: model(x)``, or a training
         # step that computes a loss and torch.autograd.grad).
@@ -1360,6 +1462,8 @@ class PrecompiledModule:
         *,
         backend: str,
     ) -> PrecompiledModule:
+        # [FUNCTION DOC] HELPER: classmethod that creates an instance with default state for the given
+        # backend and stores the reconstructed forward callable as its loaded forward. Returns it.
         """Build a runnable from load()'s reconstructed forward.
 
         load() does not re-run capture/_compile, so reuse ``__init__`` for all the
@@ -1374,6 +1478,12 @@ class PrecompiledModule:
         return obj
 
     def _compile(self, args: tuple[object, ...]) -> None:
+        # [FUNCTION DOC] HELPER: captures fn on the example args and copies the capture's metadata
+        # onto self. For the eager backend it stops there; for inductor it lowers the graph via
+        # aot_autograd.compile_to_python with size asserts (and scalar asserts for dynamic capture)
+        # forced on, storing the graph source and cache bytes. Raises NotImplementedError for the
+        # dynamo tracer or unbacked marks with the eager backend, and PrecompileError when inductor
+        # cannot lower the graph (no compute, or mixed non-tensor outputs).
         # make_fx is the only implemented tracer; "dynamo" is a planned alternative
         # capture front-end. Reject it here (the single capture-dispatch point) before
         # running fn, so the failure is clear rather than a wrong default.
@@ -1476,6 +1586,8 @@ class PrecompiledModule:
             raise
 
     def __call__(self, *args: object) -> object:
+        # [FUNCTION DOC] HELPER: runs the loaded forward on args and returns its result. Raises
+        # PrecompileError if this object was not produced by load.
         # A PrecompiledModule is runnable only after load(); precompile() itself
         # returns (python_code, cache) rather than a runnable.
         if self._loaded_forward is None:
@@ -1486,6 +1598,9 @@ class PrecompiledModule:
         return self._loaded_forward(*args)
 
     def to_python_code(self) -> str:
+        # [FUNCTION DOC] Returns the executable python_code artifact text for a compiled object
+        # (eager: inlined captured graph; inductor: composed graph source). Raises PrecompileError if
+        # the object came from load or has not been compiled.
         """Return the self-contained, executable Python artifact as a string.
 
         It runs on its own, needing no cache (Note [precompile programming model],
@@ -1512,6 +1627,10 @@ class PrecompiledModule:
         return _build_python_source(self, self._graph_python)
 
     def to_cache_bytes(self, python_code: str | None = None) -> bytes:
+        # [FUNCTION DOC] Serializes (torch.save) the cache envelope: format tag, version, backend,
+        # sha256 code_hash of python_code (generated if not given) and the inductor artifact bytes
+        # (None for eager or uncacheable graphs). Returns the bytes. Raises PrecompileError for
+        # objects produced by load.
         """Return the binary cache as bytes -- an ACCELERATION, not required to run.
 
         ``python_code`` is the single source of truth for the calling convention, so the
@@ -1551,6 +1670,9 @@ class PrecompiledModule:
 
 
 def _make_inlined_forward(python_code: str) -> Callable[..., object]:
+    # [FUNCTION DOC] HELPER: logs a warning that untrusted code is about to run, then compiles and
+    # executes python_code in a fresh namespace and returns its forward function. Side effect: runs
+    # arbitrary code from python_code; errors it raises propagate. KeyError if no forward is defined.
     """Fallback: execute the self-contained python string (JITs kernels).
 
     ``python_code`` needs no cache -- the kernels (inductor) or graph (eager) are
@@ -1572,6 +1694,9 @@ def _make_inlined_forward(python_code: str) -> Callable[..., object]:
 
 
 class _PrecompileApi:
+    # [CLASS DOC] Stateless singleton class whose single instance is torch.compiler.precompile.
+    # Calling it captures and compiles a function (returning python_code and cache); its load method
+    # rebuilds a runnable; PrecompileError is exposed as a class attribute. Pickles as the global name.
     """Callable namespace implementing ``torch.compiler.precompile`` and ``.load``.
 
     A single instance is exposed as ``torch.compiler.precompile``; calling it precompiles a
@@ -1591,6 +1716,8 @@ class _PrecompileApi:
     PrecompileError = PrecompileError
 
     def __reduce__(self) -> str:
+        # [FUNCTION DOC] HELPER: pickle/deepcopy hook returning the global name so the singleton
+        # round-trips to the same object.
         # torch.compiler.precompile is a process-wide singleton; pickle/deepcopy must
         # round-trip to the SAME object (the instance carries no per-call state) rather
         # than fail to pickle a bound-method-bearing instance. Returning the qualified
@@ -1598,6 +1725,7 @@ class _PrecompileApi:
         return "precompile"
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Returns the fixed string naming the public API.
         return "torch.compiler.precompile"
 
     def __call__(
@@ -1608,6 +1736,13 @@ class _PrecompileApi:
         tracer: str = "make_fx",
         decompositions: dict | None = None,
     ) -> tuple[str, bytes]:
+        # [FUNCTION DOC] Public entry point: validates backend (inductor or eager) and tracer
+        # (make_fx or dynamo), builds a PrecompiledModule, captures and lowers it on the example inputs,
+        # then returns (python_code, cache bytes) with the cache hashed against that exact python_code.
+        # Raises ValueError for an unknown backend or tracer, NotImplementedError for dynamo, and
+        # PrecompileError for contract violations. Logs API usage once.
+        # KNOWN ISSUE: the docstring claims inductor lowering is serialized by an internal lock, but
+        # no lock is taken in this module.
         """Ahead-of-time precompile ``fn`` against ``example_inputs``.
 
         .. note::
@@ -1740,6 +1875,12 @@ class _PrecompileApi:
         return python_code, compiled.to_cache_bytes(python_code)
 
     def load(self, python_code: str, cache: bytes) -> Callable[..., object]:
+        # [FUNCTION DOC] Rebuilds a runnable from python_code and cache. Parses the metadata (no exec)
+        # to learn the backend, reads the cache envelope with weights_only loading (a bad or
+        # foreign-format envelope only logs a warning and skips acceleration), hard-fails with
+        # PrecompileError on backend or code_hash mismatch, primes inductor kernel caches from the
+        # artifact when present (failures only warn), then execs python_code and wraps its forward
+        # in a PrecompiledModule. Side effects: executes untrusted code and may populate compiler caches.
         """Reconstruct a runnable from ``(python_code, cache)`` from precompile.
 
         The driver runs from ``python_code`` -- the single source of truth for the whole
@@ -1856,6 +1997,8 @@ class _PrecompileApi:
         return PrecompiledModule._from_loaded(forward, backend=backend)
 
 
+# Import-time side effects below: creates the public singleton and patches names/docs/module
+# attributes of precompile, PrecompileError and load so they report torch.compiler as their home.
 precompile = _PrecompileApi()
 # ``torch.compiler.precompile`` is a callable instance, not a function, so give it the
 # name/doc introspection (Sphinx autosummary, help(), IDEs) expects to find on a
