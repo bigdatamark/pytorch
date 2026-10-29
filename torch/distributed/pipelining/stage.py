@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Pipeline-parallel stage runtime. Defines the per-stage state holder
+# (_PipelineStageBase), the manual-frontend PipelineStage that wraps a user submodule, receive
+# descriptors (_RecvInfo), shape/metadata inference and validation of inputs/outputs/gradients
+# (including DTensor reconstruction), P2P send/recv op construction, forward/backward/weight
+# step execution, and the build_stage helper. Also holds a weak-keyed cache of per-direction
+# P2P process groups. Import-time side effect: creates a module logger and that cache.
 # Copyright (c) Meta Platforms, Inc. and affiliates
 import logging
 import operator
@@ -60,6 +66,9 @@ logger = logging.getLogger(__name__)
 
 
 def _normalize_model_output_as_tuple(output: Any) -> tuple[Any]:
+    # [FUNCTION DOC] HELPER: Converts a stage model output into a tuple: a list becomes a
+    # tuple (export produces lists), a tuple is returned as is, anything else is wrapped in a
+    # one-element tuple so it lines up with act_send_info.
     """[Note: pipeline model output type]
 
     The output of the model passed to pipelining can be any type, controlled by the user.
@@ -93,6 +102,9 @@ def _normalize_model_output_as_tuple(output: Any) -> tuple[Any]:
 
 
 class _RecvInfo:
+    # [CLASS DOC] HELPER: Plain record describing one stage input: its name, the source stage
+    # index (None for root args), the receive buffer (None for root args or None gradients),
+    # optional tensor metadata, and an is_root_arg flag meaning no receive is needed.
     """Input tensor descriptor for a pipeline stage.
 
     Handles both received activations from a previous stage
@@ -109,6 +121,7 @@ class _RecvInfo:
         *,
         is_root_arg: bool = False,
     ):
+        # [FUNCTION DOC] Stores the given fields as attributes; no validation or side effects.
         # Name of this input
         self.input_name = input_name
         # Stage index of the source of this input (None for root args)
@@ -121,6 +134,8 @@ class _RecvInfo:
         self.is_root_arg = is_root_arg
 
     def __repr__(self):
+        # [FUNCTION DOC] Short debug string: root args show name only; others show source stage,
+        # buffer shape and the metadata type name.
         if self.is_root_arg:
             return f"_RecvInfo(input={self.input_name}, root_arg=True)"
         meta_type = type(self.tensor_meta).__name__ if self.tensor_meta else "None"
@@ -143,6 +158,10 @@ _PP_DIRECTION_GROUP_CACHE: "weakref.WeakKeyDictionary[dist.ProcessGroup, tuple[d
 def _build_p2p_direction_groups(
     group: dist.ProcessGroup | None,
 ) -> tuple[dist.ProcessGroup, dist.ProcessGroup]:
+    # [FUNCTION DOC] HELPER: Returns (downstream, upstream) communicators split from the given
+    # group (or the default group when None), cached per parent group in a weak-keyed cache so
+    # all stage chunks on a rank share them. Calls split_group twice, which is collective over
+    # the group; logs once. Raises AssertionError if a split result is not a ProcessGroup.
     """Create two communicators over the same ranks as ``group``, one per data-flow
     direction: ``downstream`` carries traffic flowing ``r -> r+1`` (forward
     activations) and ``upstream`` carries ``r -> r-1`` (backward gradients).
@@ -187,6 +206,11 @@ def _build_p2p_direction_groups(
 
 
 class _PipelineStageBase(ABC):
+    # [CLASS DOC] HELPER: Abstract base of a pipeline stage, shared by frontends. Holds the
+    # submodule, stage index/count, device, process groups (plus optional per-direction P2P
+    # groups), forward/backward caches per microbatch, receive/send descriptors, metadata, and
+    # the optional weight-gradient builder/runners. Subclasses implement forward/backward
+    # infrastructure preparation; this class builds P2P ops and runs forward/backward steps.
     """Base class for pipeline stages.
 
     Defines common methods used by ``_PipelineStage`` (tracing frontend)
@@ -202,6 +226,11 @@ class _PipelineStageBase(ABC):
         group: dist.ProcessGroup | None = None,
         dw_builder: Callable[[], Callable[..., None]] | None = None,
     ):
+        # [FUNCTION DOC] Initializes stage state. Raises ValueError if stage_index is not below
+        # num_stages, and RuntimeError if the group is larger than the stage count. Decides
+        # per-direction P2P from the config flag or torchcomms, which may create split process
+        # groups (collective). Computes group rank/size, a round-robin stage-to-rank map, empty
+        # caches, and enables per-chunk validation only at detailed distributed debug level.
         """
         Args:
             submodule: The module to be executed in this stage.
@@ -306,6 +335,7 @@ class _PipelineStageBase(ABC):
 
     @property
     def has_backward(self) -> bool:
+        # [FUNCTION DOC] Property getter: whether this stage runs a backward pass.
         """
         Returns true if this stage has a backward pass.
         """
@@ -313,10 +343,12 @@ class _PipelineStageBase(ABC):
 
     @has_backward.setter
     def has_backward(self, has_backward: bool):
+        # [FUNCTION DOC] Property setter: records whether this stage has a backward pass.
         self._has_backward = has_backward
 
     @property
     def is_first(self):
+        # [FUNCTION DOC] Property: true when stage_index is 0.
         """
         Returns true if this stage is the first stage in the pipeline.
         """
@@ -324,6 +356,7 @@ class _PipelineStageBase(ABC):
 
     @property
     def is_last(self):
+        # [FUNCTION DOC] Property: true when stage_index is the final stage.
         """
         Returns true if this stage is the last stage in the pipeline.
         """
@@ -335,6 +368,8 @@ class _PipelineStageBase(ABC):
         expected: tuple[TensorMeta | None, ...] | None,
         actual: tuple[torch.Tensor | None, ...],
     ) -> None:
+        # [FUNCTION DOC] HELPER: Checks actual tensors against expected metadata. Raises
+        # PipeliningMetadataError when expected is None or when validation finds a mismatch.
         """Validate actual tensors against expected metadata.
 
         Raises:
@@ -345,6 +380,8 @@ class _PipelineStageBase(ABC):
         validate_tensors_metadata(desc, expected, actual)
 
     def _check_chunk_id(self, chunk_id: int):
+        # [FUNCTION DOC] HELPER: Raises RuntimeError if chunks is not configured yet or if
+        # chunk_id is not below the chunk count. KNOWN ISSUE: negative ids are not rejected.
         if self.chunks is None:
             raise RuntimeError(
                 "Attempted to access chunk_id before chunks have been configured."
@@ -358,12 +395,16 @@ class _PipelineStageBase(ABC):
         self,
         args_recv_info: tuple,
     ) -> list[int | None]:
+        # [FUNCTION DOC] HELPER: Walks the nested receive infos and returns, per input, the
+        # source stage index to send its gradient to (None for root args). Logs at debug level.
         """
         Create a list of stage indices to send gradients to.
         """
         grad_send_info: list[int | None] = []
 
         def map_recv_to_send(a):
+            # [FUNCTION DOC] HELPER: Appends the source stage (or None for a root arg) to the
+            # enclosing list and returns the same value.
             # Note: we send gradients back to previous stage as long as in
             # forward it is a received input, regardless of whether it requires
             # grad. It is up to the previous stage to discard this gradient.
@@ -388,6 +429,9 @@ class _PipelineStageBase(ABC):
         kwargs: dict[str, Any] | None = None,
         has_backward: bool = False,
     ) -> _StageForwardMeta | None:
+        # [FUNCTION DOC] HELPER: Abstract hook. Subclasses set up forward receive/send
+        # descriptors for the microbatch count and example args/kwargs (or received metadata)
+        # and return the forward metadata, or None. Base raises NotImplementedError.
         raise NotImplementedError
 
     @abstractmethod
@@ -399,9 +443,14 @@ class _PipelineStageBase(ABC):
         received_grad_meta: _StageBackwardMeta | None = None,
         loss_kwargs: dict[str, Any] | None = None,
     ) -> _StageBackwardMeta | None:
+        # [FUNCTION DOC] HELPER: Abstract hook. Subclasses set up backward infrastructure
+        # (gradient receive/send info, loss function and target handling) and return backward
+        # metadata or None. Base raises NotImplementedError.
         raise NotImplementedError
 
     def _setup_backward_recv_info(self, num_microbatches: int):
+        # [FUNCTION DOC] HELPER: Records the chunk count and builds, for every microbatch, the
+        # gradient receive info from act_send_info into grad_recv_info.
         # TODO: this is needed for backward_maybe_with_nosync
         self.chunks = num_microbatches
 
@@ -418,9 +467,13 @@ class _PipelineStageBase(ABC):
         self,
         act_send_info: dict,
     ) -> tuple[_RecvInfo, ...]:
+        # [FUNCTION DOC] HELPER: Abstract hook returning gradient receive descriptors derived
+        # from the activation send info. Base raises NotImplementedError.
         raise NotImplementedError
 
     def _resolve_peer_global_rank(self, stage_idx: int) -> int:
+        # [FUNCTION DOC] HELPER: Maps a stage index to its group rank, then to a global rank in
+        # the stage's group (default group if none). Returns the global rank.
         """Map a pipeline stage index to the corresponding global rank for P2P communication."""
         peer_rank = self.stage_index_to_group_rank[stage_idx]
         return dist.get_global_rank(
@@ -433,6 +486,9 @@ class _PipelineStageBase(ABC):
         recv_infos: tuple[_RecvInfo, ...],
         group: dist.ProcessGroup | None,
     ) -> list[dist.P2POp]:
+        # [FUNCTION DOC] HELPER: Builds one irecv P2P op per receive info, using its buffer, the
+        # peer global rank of its source stage and the given group. Skips root args and None
+        # buffers. Raises AssertionError if a None buffer has metadata or a source is None.
         """
         Helper function shared by `get_fwd_recv_ops` and `get_bwd_recv_ops`.
         Returns a list of ops that correspond to the recv infos. ``group`` is the
@@ -472,6 +528,10 @@ class _PipelineStageBase(ABC):
     """
 
     def set_local_fwd_input(self, prev_stage_outputs: Any, mb_index: int) -> None:
+        # [FUNCTION DOC] For same-rank adjacent stages: normalizes the previous stage outputs to
+        # a tuple and stores each tensor (converted to a detached local tensor if DTensor) as the
+        # receive buffer for the microbatch. Raises AssertionError for non-tensor outputs or
+        # root-arg infos; zip is strict so a length mismatch raises ValueError.
         """Pass outputs from a same-rank stage as forward inputs (V-schedule).
 
         Detaches tensors and sets ``requires_grad`` so they serve as autograd
@@ -497,6 +557,9 @@ class _PipelineStageBase(ABC):
             info.buffer = to_local_if_dtensor(tensor, detach=True)
 
     def get_local_bwd_output(self, mb_index):
+        # [FUNCTION DOC] Removes and returns the cached input-gradient tuple of the microbatch.
+        # Raises AssertionError if the stage has no backward or is first; RuntimeError for a bad
+        # chunk id; KeyError if nothing is cached.
         """
         Returns the input grad tensors for this stage, which correspond to the stage inputs during forward.
         """
@@ -513,6 +576,10 @@ class _PipelineStageBase(ABC):
     def set_local_bwd_input(
         self, next_stage_bwd_outputs: tuple[torch.Tensor | None, ...], mb_index: int
     ) -> None:
+        # [FUNCTION DOC] Hands the next same-rank stage's input grads to this stage as its
+        # gradient receive buffers: None grads zero any existing buffer; tensors replace the
+        # buffer (local tensor if DTensor). Raises AssertionError for non-tuple input, no
+        # backward, last stage, non-tensor values or root-arg infos.
         """
         Moves 'grad input' tensors from the next stage to 'grad_output' on this stage, avoiding a copy or send/recv.
         Does not detach or set '_requires_grad'.
@@ -546,6 +613,8 @@ class _PipelineStageBase(ABC):
             info.buffer = to_local_if_dtensor(tensor)
 
     def get_fwd_recv_ops(self, fwd_chunk_id: int) -> list[dist.P2POp]:
+        # [FUNCTION DOC] Returns the receive ops for this stage's forward inputs of the chunk,
+        # on the downstream group.
         """
         Returns a list of ops that are needed to receive the input arguments
         for this stage.
@@ -555,6 +624,8 @@ class _PipelineStageBase(ABC):
         return self._get_recv_ops(recv_infos, self._downstream_group)
 
     def get_bwd_recv_ops(self, bwd_chunk_id: int) -> list[dist.P2POp]:
+        # [FUNCTION DOC] Returns receive ops for gradients of the chunk on the upstream group;
+        # empty when the stage has no backward or is the last stage.
         """
         Returns a list of ops that are needed to receive the gradients
         for this stage.
@@ -566,6 +637,9 @@ class _PipelineStageBase(ABC):
         return self._get_recv_ops(recv_infos, self._upstream_group)
 
     def get_fwd_send_ops(self, fwd_chunk_id: int) -> list[dist.P2POp]:
+        # [FUNCTION DOC] Builds isend ops for the cached forward outputs of the chunk: each
+        # output goes to every destination stage in act_send_info (None skipped), as a detached
+        # local tensor, on the downstream group. Logs each send at debug level.
         """
         Get the activation send ops for current stage's forward.
         Handles DTensor outputs by extracting local tensors.
@@ -600,6 +674,10 @@ class _PipelineStageBase(ABC):
         return ops
 
     def _get_grad_send_meta(self, input_idx: int) -> TensorMeta | None:
+        # [FUNCTION DOC] HELPER: Finds the metadata for the gradient sent for an input: uses the
+        # recorded input_grads entry if present, else derives it from the input metadata.
+        # Raises PipeliningMetadataError when neither is available. May return None when the
+        # recorded entry is None (no buffer was allocated).
         """Return gradient metadata for ``input_idx`` if a recv was allocated."""
         input_grads = self._stage_meta.input_grads
         if input_grads is not None and input_idx < len(input_grads):
@@ -617,6 +695,13 @@ class _PipelineStageBase(ABC):
         )
 
     def get_bwd_send_ops(self, bwd_chunk_id: int) -> list[dist.P2POp]:
+        # [FUNCTION DOC] Builds isend ops for the input gradients of a finished backward chunk,
+        # popping them from bwd_cache. Lazily creates grad_send_info. Tensor grads are sent as
+        # local tensors on the upstream group; None grads are replaced by zero tensors built
+        # from metadata. Returns empty if no backward or first stage. Raises
+        # PipeliningMetadataError for a grad with no destination or no metadata.
+        # KNOWN ISSUE: the zero-gradient send uses the plain group, not the upstream group, so
+        # with per-direction P2P it goes on a different communicator than other gradient sends.
         """
         Get the gradient send ops for current stage's backward.
         Handles DTensor gradients by extracting local tensors.
@@ -694,6 +779,9 @@ class _PipelineStageBase(ABC):
         return ops
 
     def clear_runtime_states(self) -> None:
+        # [FUNCTION DOC] Resets per-step state: clears forward cache and output chunks, and
+        # sets the grad of every non-root receive buffer to None so gradients do not accumulate
+        # across schedule steps.
         """
         Clear runtime states of the stage.
         """
@@ -717,11 +805,15 @@ class _PipelineStageBase(ABC):
         self,
         recv_infos: tuple[_RecvInfo, ...],
     ):
+        # [FUNCTION DOC] HELPER: Maps a nested structure of receive infos to the same structure
+        # of their buffers. Raises PipeliningMetadataError if any info is a root arg.
         """
         Map tensors from recv infos to a list.
         """
 
         def get_recv_tensor(info):
+            # [FUNCTION DOC] HELPER: Returns the info's buffer; raises PipeliningMetadataError
+            # for a root arg.
             if info.is_root_arg:
                 raise PipeliningMetadataError("Cannot get recv tensor from root arg")
             return info.buffer
@@ -732,6 +824,12 @@ class _PipelineStageBase(ABC):
         self,
         fwd_chunk_id: int,
     ):
+        # [FUNCTION DOC] HELPER: Turns the received buffers of a chunk into forward inputs.
+        # Each buffer is wrapped back into a DTensor (using cached mesh, placements and global
+        # shape/stride) when metadata says so, and gets requires_grad only if the metadata
+        # asked for it, the stage has backward and grad mode is on. A non-leaf activation
+        # triggers a warning and retain_grad. Returns a tuple. Raises PipeliningMetadataError
+        # for root args, missing buffer/metadata, or a DTensor buffer that already requires grad.
         """
         Retrieve the activations received for the current stage during forward.
         Reconstructs DTensors if the inputs were DTensors.
@@ -797,6 +895,10 @@ class _PipelineStageBase(ABC):
         self,
         bwd_chunk_id: int,
     ):
+        # [FUNCTION DOC] HELPER: Collects received output gradients of a chunk as a tuple:
+        # None for entries with no buffer, DTensors rebuilt from local buffers when metadata
+        # says so, plain buffers otherwise. Raises PipeliningMetadataError for non-_RecvInfo
+        # entries, root args, or buffer/metadata inconsistencies.
         """
         Retrieve the gradients received for the current stage during backward.
 
@@ -845,6 +947,9 @@ class _PipelineStageBase(ABC):
         return tuple(grads)
 
     def forward_maybe_with_nosync(self, *args, **kwargs):
+        # [FUNCTION DOC] Runs the submodule forward and returns its output; if it is wrapped in
+        # DistributedDataParallel, runs inside its no-sync context to skip per-microbatch
+        # gradient all-reduce.
         # If submod is wrapped with DDP, we use the `no_sync` context manager to
         # avoid gradient all-reduce per microbatch
         if isinstance(self.submod, DistributedDataParallel):
@@ -855,6 +960,8 @@ class _PipelineStageBase(ABC):
         return out_val
 
     def scale_grads(self, grad_scale_factor: int) -> None:
+        # [FUNCTION DOC] Divides in place every existing parameter gradient of the submodule by
+        # the factor (no-op when the factor is 1). Call once per step after all backwards.
         """Scale gradients model gradients by `grad_scale_factor`, which should be specified in coordination with the
         loss function used with pipelining.  For loss functions which perform 'mean' loss reduction, `grad_scale_factor`
         should be set to num_microbatches.  For loss functions that use `sum` reduction, `grad_scale_factor` should
@@ -876,6 +983,13 @@ class _PipelineStageBase(ABC):
         bwd_kwargs: dict,
         last_backward: bool = False,
     ) -> tuple[tuple[torch.Tensor | None, ...], list[dict[str, Any]] | None]:
+        # [FUNCTION DOC] Runs one backward of the given type (full, input or weight) using
+        # tensors in bwd_kwargs, adapting to data parallel wrappers. For DDP: on the last
+        # backward prepares the reducer and runs normally, otherwise runs in no-sync. For FSDP
+        # modules: disables last-backward, reshard and gradient sync flags before running.
+        # Otherwise runs directly. Returns (input grads, parameter groups or None).
+        # KNOWN ISSUE: the FSDP branch never re-enables sync/reshard on the last backward, and
+        # the replicate module imported at top is not handled despite the comments.
         """
         Whether using PP with FSDP, DDP, or replicate there are some runtime differences between the last backward step and the
         other steps.  Namely, we need to accumulate gradients on previous steps and reduce them on the last step, but
@@ -889,6 +1003,9 @@ class _PipelineStageBase(ABC):
             [],
             tuple[tuple[torch.Tensor | None, ...], list[dict[str, Any]] | None],
         ]:
+            # [FUNCTION DOC] HELPER: Returns a zero-argument callable that runs the requested
+            # backward kind (full, input, weight) and yields (grads, param groups or None).
+            # Raises RuntimeError for an unknown kind.
             if backward_type == "full":
                 return lambda: (
                     stage_backward(
@@ -953,6 +1070,11 @@ class _PipelineStageBase(ABC):
         kwargs: dict[str, Any] | None = None,
         save_forward_output: bool = True,
     ):
+        # [FUNCTION DOC] Runs forward for one microbatch. First stage uses the given args;
+        # others use received activations. Optionally validates inputs/outputs against
+        # metadata. Wraps any exception in RuntimeError with debug info. Caches the normalized
+        # output and flattened inputs for backward, appends the raw output to output_chunks on
+        # the last stage if save_forward_output, and returns the original (unnormalized) output.
         """
         Perform forward pass on the stage with one microbatch.
         `args` and `kwargs` are the inputs from *external* to this stage.
@@ -1033,6 +1155,12 @@ class _PipelineStageBase(ABC):
         full_backward: bool = True,
         last_backward=False,
     ):
+        # [FUNCTION DOC] Runs backward for one microbatch (no-op if the stage has no backward).
+        # Pops the cached forward state; the last stage uses the loss, others use received
+        # gradients. Full backward computes all grads (and runs the dw builder if present);
+        # otherwise only input grads are computed and weight work is deferred via dw_runner
+        # and backward_state. Stores input grads in bwd_cache and detaches last-stage outputs
+        # to free the graph. Raises AssertionError if input metadata is missing.
         """
         Perform backward pass on the module.
         This should only be called once per microbatch.
@@ -1155,6 +1283,10 @@ class _PipelineStageBase(ABC):
         logger.debug("%s Backwarded chunk %s", self.log_prefix, bwd_chunk_id)
 
     def backward_weight_one_chunk(self, bwd_chunk_id: int, last_backward=False):
+        # [FUNCTION DOC] Completes a deferred backward (weight gradients) for a microbatch.
+        # No-op without backward. Raises AssertionError if the chunk was not previously run
+        # with full_backward off. Uses the dw builder's runner if given; otherwise runs a
+        # weight backward from saved state (or a full backward on stage 0).
         # skip backward computation if backward is not enabled
         if not self.has_backward:
             return
@@ -1199,6 +1331,8 @@ class _PipelineStageBase(ABC):
                 )
 
     def _get_init_p2p_neighbors_ops(self) -> list[dist.P2POp]:
+        # [FUNCTION DOC] HELPER: Builds dummy one-element send/recv ops with the previous and
+        # next stage peers so that communicators get initialized eagerly.
         """
         Get the operations to initialize the p2p communicators between previous and next stages.
         This is done so by creating a dummy tensor and sending it to the next stage and receiving
@@ -1260,6 +1394,10 @@ class _PipelineStageBase(ABC):
         return ops
 
     def perform_reduce_grad(self, grad_scale_factor: int):
+        # [FUNCTION DOC] Final per-step gradient reduction action. For an FSDP/replicate module,
+        # re-enables last-backward, reshard and gradient sync flags, runs post-backward on all
+        # parameter groups of its state, and calls the root final callback to sync streams.
+        # Then scales gradients by the factor if it is not 1.
         """
         Called as a part of schedule IR.
         REDUCE_GRAD action is scheduled after all microbatches W, B actions.
@@ -1294,6 +1432,10 @@ class _PipelineStageBase(ABC):
 
 
 class _PipelineStage(_PipelineStageBase):
+    # [CLASS DOC] HELPER: Tracing frontend stage built from a split FX pipe. Uses the pipe
+    # graph to find its call_module node, maps submodule names to stage indices, and derives
+    # activation receive/send info and metadata from graph placeholder values. Plain tensors
+    # only; DTensor is rejected. Extra state: pipe_info, node, name, submod_to_stage_index.
     def __init__(
         self,
         stage_module: torch.nn.Module,
@@ -1302,6 +1444,10 @@ class _PipelineStage(_PipelineStageBase):
         device: torch.device,
         group: dist.ProcessGroup | None = None,
     ):
+        # [FUNCTION DOC] Initializes the base stage using the pipe's stage count, finds this
+        # stage's call_module node in the pipe graph, records its name and a name-to-index map,
+        # and moves the submodule to the device. Raises PipeliningMetadataError if the number
+        # of graph submodules differs from the stage count.
         """
         Create a pipeline stage given a stage_module to be wrapped by this stage
         and a `pipe_info` describing the stage relationship of the pipeline.
@@ -1351,6 +1497,8 @@ class _PipelineStage(_PipelineStageBase):
         self._move_submod_to_device()
 
     def _move_submod_to_device(self):
+        # [FUNCTION DOC] HELPER: Moves the submodule to the stage device unless any parameter is
+        # meta or fake (then only logs a debug message and leaves it).
         # Move submodule to indicated device if possible
         # Note: we cannot move meta module to real devices because meta tensors
         # do not support to() method. One needs to do an in-place tensor swap in
@@ -1370,6 +1518,10 @@ class _PipelineStage(_PipelineStageBase):
         kwargs: dict[str, Any] | None = None,
         has_backward: bool = False,
     ) -> _StageForwardMeta | None:
+        # [FUNCTION DOC] HELPER: Builds receive info for every microbatch from the graph, sets
+        # the stage input metadata (first stage: positional args only; others: non-root
+        # received activations), and creates activation send info and output metadata.
+        # Returns None. Raises AssertionError if the first stage args are not a tuple.
         """
         Prepare forward infrastructure for traced pipeline.
 
@@ -1426,6 +1578,9 @@ class _PipelineStage(_PipelineStageBase):
         received_grad_meta: _StageBackwardMeta | None = None,
         loss_kwargs: dict[str, Any] | None = None,
     ) -> _StageBackwardMeta | None:
+        # [FUNCTION DOC] HELPER: Derives input gradient metadata from input metadata and builds
+        # gradient receive info for all microbatches. Loss arguments are unused. Returns None.
+        # Raises PipeliningMetadataError if input metadata is missing.
         """
         Prepare backward infrastructure for traced pipeline.
         Derives input_grads metadata from inputs (plain tensors only).
@@ -1451,6 +1606,8 @@ class _PipelineStage(_PipelineStageBase):
         self,
         submod_name: str,
     ):
+        # [FUNCTION DOC] Returns the stage index for a submodule name; raises
+        # PipeliningMetadataError if the name is unknown.
         """
         Given a submodule name, return the stage index of the submodule.
         """
@@ -1462,6 +1619,12 @@ class _PipelineStage(_PipelineStageBase):
     def _create_act_recv_info(
         self,
     ):
+        # [FUNCTION DOC] HELPER: Pairs the submodule graph placeholders with the outer graph
+        # argument nodes and builds one _RecvInfo each; returns a tuple. Root placeholders
+        # become root args with traced metadata. Others find the producing stage (through
+        # getitem nodes), get metadata with requires_grad only for floating tensors when the
+        # stage has backward, and a freshly allocated buffer. Raises PipeliningMetadataError
+        # for DTensor values or a producer that is not a call_module node.
         """
         Create a tuple of `_RecvInfo` for inputs to the stage.
 
@@ -1475,6 +1638,9 @@ class _PipelineStage(_PipelineStageBase):
         """
 
         def create_recv_tensor(placeholder, arg_node):
+            # [FUNCTION DOC] HELPER: Builds the _RecvInfo for one placeholder/argument pair as
+            # described in the enclosing function. Raises PipeliningMetadataError on DTensor
+            # example values or non-module producers.
             example_value = placeholder.meta["val"]
 
             # Reject DTensors in traced frontend
@@ -1554,6 +1720,8 @@ class _PipelineStage(_PipelineStageBase):
         self,
         user: fx.Node,
     ) -> int | None:
+        # [FUNCTION DOC] Returns the stage index of a consumer node if it is a submodule call,
+        # otherwise None (outputs and backward helpers need no send).
         """
         Find the destination rank of a `user` node.
         If the `user` is not a submod, `None` may be returned.
@@ -1570,6 +1738,11 @@ class _PipelineStage(_PipelineStageBase):
             return None
 
     def _create_act_send_info(self):
+        # [FUNCTION DOC] HELPER: Returns a mapping from output index to the list of destination
+        # stage indices, from the users of this stage's node (getitem users define separate
+        # outputs). Also sets output metadata from the output node values with requires_grad
+        # for floating outputs when the stage has backward. Raises PipeliningMetadataError for
+        # DTensor outputs.
         """
         Create a dict of send info for activations and output metadata.
 
@@ -1624,6 +1797,8 @@ class _PipelineStage(_PipelineStageBase):
         return act_send_info
 
     def _get_output_node(self):
+        # [FUNCTION DOC] HELPER: Returns the single output node of the submodule graph; raises
+        # PipeliningMetadataError if there is not exactly one.
         output_nodes = [node for node in self.submod.graph.nodes if node.op == "output"]  # type: ignore[union-attr]
         if len(output_nodes) != 1:
             raise PipeliningMetadataError(
@@ -1633,6 +1808,11 @@ class _PipelineStage(_PipelineStageBase):
         return output_node
 
     def _create_grad_recv_info(self, act_send_info: dict) -> tuple[_RecvInfo, ...]:
+        # [FUNCTION DOC] HELPER: Builds gradient receive info per output. Outputs without
+        # destinations or not requiring grad get an empty record; others get a buffer from
+        # metadata mirroring the output and the single destination stage as source. Updates
+        # output_grads and input_grads metadata. Raises PipeliningMetadataError if output
+        # metadata is missing or an output has several destinations (skip connections).
         """
         Create a tuple of `_RecvInfo` for gradients.
         Reuses output metadata from _stage_meta.outputs (populated by _create_act_send_info).
@@ -1711,6 +1891,8 @@ def build_stage(
     device: torch.device,
     group: dist.ProcessGroup | None = None,
 ) -> _PipelineStage:
+    # [FUNCTION DOC] Public helper that constructs and returns a tracing-frontend stage from
+    # the module, index, pipe info, device and optional process group.
     """
     Create a pipeline stage given a stage_module to be wrapped by this stage
     and pipeline information.
@@ -1735,6 +1917,10 @@ def build_stage(
 
 
 class PipelineStage(_PipelineStageBase):
+    # [CLASS DOC] Public manual-frontend stage wrapping a user submodule. Supports static
+    # metadata (example input/output tensors given at construction) and dynamic inference
+    # from the first microbatch (shape exchange with neighbors, optional DTensor mesh lookup).
+    # Keeps stage metadata, receive/send descriptors, and P2P shape-inference helpers.
     """A pipeline stage for pipeline parallelism with sequential model partitioning.
 
     Supports both **static** and **dynamic** metadata inference:
@@ -1778,6 +1964,11 @@ class PipelineStage(_PipelineStageBase):
         dw_builder: Callable[[], Callable[..., None]] | None = None,
         get_mesh: GetMeshCallback | None = None,
     ):
+        # [FUNCTION DOC] Initializes the base stage, a mesh cache (with the optional mesh
+        # lookup callback), and inference bookkeeping fields. Normalizes user example
+        # tensors to tuples (validation errors propagate), records their metadata as the user
+        # metadata, caches device meshes from any DTensors, and when DTensors are present
+        # checks that inputs/outputs correspond to their gradients.
         super().__init__(submodule, stage_index, num_stages, device, group, dw_builder)
 
         self._mesh_cache = _MeshCache(get_mesh_cb=get_mesh)
@@ -1819,6 +2010,9 @@ class PipelineStage(_PipelineStageBase):
                 )
 
     def _recv_meta(self, src_stage: int) -> Any:
+        # [FUNCTION DOC] HELPER: Blocking receive of one pickled object from the source stage's
+        # rank on the stage group (batched). Returns the object; raises PipeliningMetadataError
+        # if the received list does not hold exactly one item.
         """Receive metadata object from a stage on a different rank via P2P."""
         objects: list[Any] = [None]
         dist.recv_object_list(
@@ -1835,6 +2029,8 @@ class PipelineStage(_PipelineStageBase):
         return objects[0]
 
     def _send_meta(self, meta: Any, dst_stage: int) -> None:
+        # [FUNCTION DOC] HELPER: Sends one pickled object to the destination stage's rank on
+        # the stage group (batched, blocking).
         """Send metadata object to a stage on a different rank via P2P."""
         dist.send_object_list(
             [meta],
@@ -1845,12 +2041,19 @@ class PipelineStage(_PipelineStageBase):
         )
 
     def _is_same_rank(self, other_stage: int) -> bool:
+        # [FUNCTION DOC] HELPER: True if the other stage maps to this stage's group rank.
         """Check if another stage is on the same rank as this stage."""
         return self.stage_index_to_group_rank[other_stage] == self.group_rank
 
     def _warmup_forward_vote(
         self, has_backward: bool, received_acc: torch.Tensor | None = None
     ) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Forward pass of the vote protocol. This stage votes 1 (static)
+        # or 0 (dynamic) via the inference-mode check on user metadata, multiplies it with the
+        # product from the previous stage (local value, or received over P2P on a different
+        # rank; the first stage starts the product), sends the product to the next stage if on a
+        # different rank, and returns it. Raises AssertionError if a same-rank predecessor gave
+        # no accumulated value.
         """Forward phase of the warm-up vote protocol (stage 0 → N−1).
 
         Each stage computes a vote (1 = STATIC, 0 = DYNAMIC) based on
@@ -1893,6 +2096,10 @@ class PipelineStage(_PipelineStageBase):
     def _warmup_backward_result(
         self, received_result: torch.Tensor | None = None
     ) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Backward pass of the vote protocol. The last stage (or one with
+        # a same-rank successor) uses the given result; otherwise receives it from the next
+        # stage over P2P. Forwards it to the previous stage if on a different rank. Returns the
+        # global vote result. Raises AssertionError if a required local result is missing.
         """Backward phase of the warm-up vote protocol (stage N−1 → 0).
 
         Propagates the final accumulated product (computed in the forward
@@ -1927,6 +2134,8 @@ class PipelineStage(_PipelineStageBase):
         module: torch.nn.Module,
         **kwargs: Any,
     ) -> torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor] | None:
+        # [FUNCTION DOC] HELPER: Calls the given module with the args and kwargs and returns
+        # its output (separate hook so tests or subclasses can override).
         """Compute outputs of the submodule."""
         return module(*args, **kwargs)
 
@@ -1936,6 +2145,8 @@ class PipelineStage(_PipelineStageBase):
         all_fwd_inputs: list[torch.Tensor],
         grad_outputs: list[torch.Tensor | None] | None = None,
     ) -> tuple[torch.Tensor | None, ...]:
+        # [FUNCTION DOC] HELPER: Computes gradients of the outputs with respect to the forward
+        # inputs through the backward helper, allowing unused inputs (gradient None).
         """Compute input gradients via :func:`_autograd_grad_for_inputs`."""
         return _autograd_grad_for_inputs(
             outputs,
@@ -1945,6 +2156,10 @@ class PipelineStage(_PipelineStageBase):
         )
 
     def _to_tensor(self, arg: torch.Tensor | TensorMeta) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Returns a fresh autograd leaf copy (detached, same
+        # requires_grad) for a real tensor, or materializes metadata as an empty tensor on the
+        # stage device (DTensor via mesh cache when metadata is DTensor metadata). Raises
+        # PipeliningMetadataError for other types.
         """Convert a tensor or metadata to a real tensor on ``self.device``.
 
         Real tensors are detached and re-set requires_grad to create a fresh
@@ -1965,6 +2180,9 @@ class PipelineStage(_PipelineStageBase):
             )
 
     def _ones_from_metadata(self, meta: TensorMeta) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Builds a tensor of ones from metadata on the stage device; for
+        # DTensor metadata the local ones are wrapped as a DTensor with the cached mesh and
+        # recorded placements and global shape/stride.
         """Create a ones tensor from metadata for backward inference grad_outputs."""
         local_ones = torch.ones(
             meta.shape,
@@ -1984,6 +2202,9 @@ class PipelineStage(_PipelineStageBase):
         return local_ones
 
     def _pre_metadata_inference_backup(self) -> None:
+        # [FUNCTION DOC] HELPER: In dynamic mode only, saves a clone of every submodule buffer
+        # (including duplicates) so inference runs can be undone later. Raises RuntimeError if
+        # a backup already exists.
         """Back up state that dynamic metadata inference must not publish.
 
         Dynamic metadata inference executes representative real forwards and
@@ -2009,6 +2230,13 @@ class PipelineStage(_PipelineStageBase):
         kwargs: dict[str, Any] | None = None,
         has_backward: bool = False,
     ) -> _StageForwardMeta | None:
+        # [FUNCTION DOC] HELPER: Runs a real forward on fresh leaf tensors to infer output
+        # metadata. Input metadata comes from real args (first stage), a metadata object passed
+        # in (same-rank predecessor), or one received over P2P; wrong kinds raise
+        # PipeliningMetadataError. Runs the module with grad enabled only if backward follows,
+        # stores outputs and inputs for later backward inference, and records output metadata.
+        # Returns the forward metadata for the next stage, or sends it over P2P and returns None
+        # when the successor is on another rank.
         """Run forward metadata inference (Stage 0 → N).
 
         Args:
@@ -2104,6 +2332,14 @@ class PipelineStage(_PipelineStageBase):
         received_grad_meta: _StageBackwardMeta | None = None,
         loss_kwargs: dict[str, Any] | None = None,
     ) -> _StageBackwardMeta | None:
+        # [FUNCTION DOC] HELPER: Infers gradient metadata by running a real backward on the
+        # tensors saved by forward inference (which must have run first, else
+        # PipeliningMetadataError). Last stage computes a loss from outputs and target; other
+        # stages obtain output-grad metadata from a same-rank object or P2P and use ones as
+        # grad outputs, skipping outputs that do not require grad (error if grad metadata is
+        # given for them). Records input-grad metadata (derived from the input if its grad is
+        # None and it requires grad). Returns it for the previous stage, or sends via P2P and
+        # returns None. Releases saved tensors early.
         """Run backward metadata inference (Stage N → 0).
 
         Args:
@@ -2233,6 +2469,9 @@ class PipelineStage(_PipelineStageBase):
             return None
 
     def _post_metadata_inference_cleanup(self) -> None:
+        # [FUNCTION DOC] HELPER: Undoes inference side effects: copies saved buffer values back
+        # (no grad) and drops the backup, clears stored inference tensors, and for each FSDP
+        # module reshards and clears parameter grads.
         """Restore state and clean up side effects from metadata inference.
 
         Buffer restore is intentionally delayed until after both forward and
@@ -2267,6 +2506,11 @@ class PipelineStage(_PipelineStageBase):
         received_grad_meta: "_StageBackwardMeta | None" = None,
         loss_kwargs: dict[str, Any] | None = None,
     ) -> "_StageBackwardMeta | None":
+        # [FUNCTION DOC] HELPER: Dynamic mode runs backward metadata inference and validates it
+        # against user metadata, returning the metadata for the previous same-rank stage. Static
+        # mode takes grad metadata from the user, deriving missing output/input grad metadata
+        # from outputs/inputs (PipeliningMetadataError if those are missing). Then builds
+        # gradient receive info. Returns the previous-stage metadata or None.
         """Run backward metadata inference and prepare backward infrastructure.
 
         Returns:
@@ -2315,6 +2559,8 @@ class PipelineStage(_PipelineStageBase):
         return grad_meta_result
 
     def _validate_inferred_metadata(self) -> None:
+        # [FUNCTION DOC] HELPER: Compares inferred inputs, outputs, input grads and output
+        # grads with the user-provided ones when both exist, warning (not raising) on mismatch.
         """Validate dynamically inferred metadata against user-provided metadata."""
         pairs = [
             (self._user_meta.inputs, self._stage_meta.inputs, "input"),
@@ -2342,6 +2588,11 @@ class PipelineStage(_PipelineStageBase):
         kwargs: dict[str, Any] | None = None,
         has_backward: bool = False,
     ) -> _StageForwardMeta | None:
+        # [FUNCTION DOC] HELPER: Prepares forward state. Raises PipeliningMetadataError if the
+        # inference mode has not been decided by the warm-up vote. Dynamic mode infers
+        # metadata with a real forward and validates it against user metadata; static mode
+        # copies user input/output metadata. Then builds receive and send info for all
+        # microbatches. Returns forward metadata for a same-rank next stage, else None.
         """Prepare the stage infrastructure for forward pass.
 
         Returns:
@@ -2377,6 +2628,11 @@ class PipelineStage(_PipelineStageBase):
     def _setup_forward_recv_info(
         self, num_microbatches: int, has_backward: bool
     ) -> None:
+        # [FUNCTION DOC] HELPER: Fills receive info per microbatch from input metadata: the
+        # first stage gets root-arg records without buffers; later stages get a freshly
+        # allocated buffer per input sourced from the previous stage. Raises
+        # PipeliningMetadataError if input metadata is missing. The has_backward argument is
+        # unused.
         """Setup receive info for forward pass."""
         if self._stage_meta.inputs is None:
             raise PipeliningMetadataError(
@@ -2408,6 +2664,9 @@ class PipelineStage(_PipelineStageBase):
                 )
 
     def _setup_forward_send_info(self) -> None:
+        # [FUNCTION DOC] HELPER: Sets act_send_info so every output index goes to the next stage
+        # (empty list for the last stage). Raises PipeliningMetadataError if output metadata is
+        # missing.
         """Setup send info for forward pass."""
         self.act_send_info: dict[int, list] = {}
         if self._stage_meta.outputs is None:
@@ -2421,6 +2680,11 @@ class PipelineStage(_PipelineStageBase):
         self,
         act_send_info: dict,
     ) -> tuple[_RecvInfo, ...]:
+        # [FUNCTION DOC] HELPER: Builds gradient receive info (empty tuple on the last stage).
+        # For each output, the source is the first destination stage and the buffer is allocated
+        # from output-grad metadata (None buffer when that metadata is None). Raises
+        # PipeliningMetadataError if output-grad metadata is missing or an output has no
+        # destination list.
         grad_recv_infos: list[_RecvInfo] = []
         if not self.is_last:
             # Ensure output_grads metadata is available

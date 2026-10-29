@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [PACKAGE DOC] Public entry point of torch.distributed.rpc (remote procedure calls, RRefs).
+# Defines is_available. When the C extension has RPC support it initializes it at import
+# (RuntimeError on failure), re-exports the C-level RPC primitives, the api functions,
+# BackendType and TensorPipe options, and defines init_rpc plus internal helpers that
+# validate arguments, start the backend agent and report debug info.
 import logging
 import os
 import threading
@@ -22,6 +27,7 @@ _init_counter_lock = threading.Lock()
 
 
 def is_available() -> bool:
+    # [FUNCTION DOC] Returns True if the torch C extension was built with RPC support.
     return hasattr(torch._C, "_rpc_init")
 
 
@@ -97,6 +103,14 @@ if is_available():
         world_size=None,
         rpc_backend_options=None,
     ):
+        # [FUNCTION DOC] Public API: sets up this process for RPC. Validates backend and options
+        # types (TypeError), infers the backend from the options if none is given (warning when
+        # it is not TensorPipe, TypeError if none matches), defaults to TensorPipe and default
+        # options. Creates a store (dynamic-group store when world_size is unset, else via
+        # rendezvous whose iterator is kept in a module global), applies the RPC timeout, wraps
+        # it in a uniquely prefixed PrefixStore using a locked global counter, initializes
+        # distributed autograd and the profiler node id, then starts the backend agent.
+        # Raises RuntimeError if RPC is already initialized.
         r"""
         Initializes RPC primitives such as the local RPC agent
         and distributed autograd, which immediately makes the current
@@ -210,6 +224,9 @@ if is_available():
         _init_rpc_backend(backend, store, name, rank, world_size, rpc_backend_options)
 
     def _validate_rpc_args(backend, store, name, rank, world_size, rpc_backend_options):
+        # [FUNCTION DOC] HELPER: Checks each argument against its expected type (backend type,
+        # store, str name, integral rank, integral or None world_size, options). Raises
+        # RuntimeError naming the first offending argument; returns nothing.
         type_mapping = {
             backend: backend_registry.BackendType,
             store: dist.Store,
@@ -233,6 +250,9 @@ if is_available():
         world_size=None,
         rpc_backend_options=None,
     ):
+        # [FUNCTION DOC] HELPER: Validates arguments, raises RuntimeError if an agent is already
+        # set, creates the agent through the backend registry and installs it as the process
+        # RPC state. Side effect: global RPC agent and states are set.
         _validate_rpc_args(backend, store, name, rank, world_size, rpc_backend_options)
 
         if _is_current_rpc_agent_set():
@@ -252,6 +272,8 @@ if is_available():
 
     @api._require_initialized
     def _get_debug_info():
+        # [FUNCTION DOC] HELPER: Requires RPC to be initialized. Returns a merged mapping of
+        # RRef context debug info, current agent debug info and distributed autograd debug info.
         info = _rref_context_get_debug_info()
         info.update(api._get_current_rpc_agent().get_debug_info())
         info.update(dist_autograd._get_debug_info())

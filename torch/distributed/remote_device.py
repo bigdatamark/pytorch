@@ -1,9 +1,14 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Defines _remote_device, a parsed, hashable description of a device on a
+# possibly remote worker (worker name or rank plus a torch.device). No import-time side effects.
 
 import torch
 
 
 class _remote_device:
+    # [CLASS DOC] HELPER: Immutable-by-convention value object parsed from a string or
+    # torch.device. Holds _worker_name, _rank (one of the two or neither) and _device
+    # (always a torch.device after construction). Supports equality, hashing and repr.
     """
     Represents a device on a remote worker.
 
@@ -22,6 +27,12 @@ class _remote_device:
     """
 
     def __init__(self, remote_device: str | torch.device):
+        # [FUNCTION DOC] Parses the input. A torch.device means local with no worker. A string
+        # is split on a slash: two parts are worker and device; one part is a local device if
+        # valid, else a worker name with cpu. Worker names of the form rank:N set the rank and
+        # clear the name. Raises ValueError on malformed strings, empty worker name, bad rank
+        # format or extra colons; TypeError for other input types; torch.device may raise on
+        # an invalid device string.
         PARSE_ERROR = (
             f"Could not parse remote_device: {remote_device}. The valid format is "
             "'<workername>/<device>' or 'rank:<rank>/<device>' or '<device>'"
@@ -70,6 +81,8 @@ class _remote_device:
 
     @staticmethod
     def _is_valid_local_device(device):
+        # [FUNCTION DOC] HELPER: Returns True if the argument can be turned into a torch.device,
+        # False if constructing it raises any exception.
         # Check for torch.device
         try:
             torch.device(device)
@@ -78,10 +91,12 @@ class _remote_device:
             return False
 
     def worker_name(self) -> str | None:
+        # [FUNCTION DOC] Returns the worker name, or None when absent (local or rank form).
         """Return the name of remote worker representing the remote device and ``None`` if no worker name is available."""
         return self._worker_name
 
     def rank(self) -> int | None:
+        # [FUNCTION DOC] Returns the integer rank, or None when not specified.
         """
         Returns the rank of remote worker representing the remote device.
         Returns ``None`` if no rank is available.
@@ -89,10 +104,14 @@ class _remote_device:
         return self._rank
 
     def device(self) -> torch.device:
+        # [FUNCTION DOC] Returns the torch.device on the remote worker.
         """Return the local device on the remote worker."""
         return self._device  # type: ignore[return-value]
 
     def __repr__(self):
+        # [FUNCTION DOC] Formats as worker/device, rank:N/device, or just the device. The
+        # branch for a missing device (name or rank only) is effectively unreachable since the
+        # device is always set in the constructor; with nothing set it raises RuntimeError.
         if self._device is not None:
             if self._worker_name is not None:
                 return f"{self._worker_name}/{self._device}"
@@ -109,6 +128,8 @@ class _remote_device:
                 raise RuntimeError("Invalid state!")
 
     def __eq__(self, other):
+        # [FUNCTION DOC] Equal when other is a _remote_device with the same worker name, device
+        # and rank.
         return isinstance(other, _remote_device) and (
             self._worker_name == other._worker_name
             and self._device == other._device
@@ -116,4 +137,5 @@ class _remote_device:
         )
 
     def __hash__(self):
+        # [FUNCTION DOC] Combines hashes of worker name, device and rank with bitwise xor.
         return hash(self._worker_name) ^ hash(self._device) ^ hash(self._rank)
