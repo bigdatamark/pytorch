@@ -1,5 +1,11 @@
 # Owner(s): ["module: higher order operators"]
 # flake8: noqa: E731
+# [MODULE DOC] Tests for the invoke_subgraph higher-order op and the nested_compile_region
+# decorator. Covers eager/AOT tracing, torch.compile with inductor and aot_eager backends,
+# graph-structure expectations, caching and dedup of repeated regions, mutation handling,
+# autograd, functionalization, export capture, and inductor pattern-matcher integration.
+# Import-time effects: defines the nested_compile_region alias and imports triton if a GPU
+# is available.
 
 import contextlib
 import enum
@@ -59,10 +65,15 @@ if HAS_GPU:
 
 
 def _aot_eager_with_runtime_epilogue():
+    # [FUNCTION DOC] HELPER: Build an aot_autograd backend that does not keep input mutations in
+    # the graph (so a runtime epilogue applies them), plus a list that the forward compiler
+    # fills with each compiled forward graph module. Returns the pair (backend, graph list).
     """Create a recording AOT eager backend with a runtime mutation epilogue."""
     fw_graphs = []
 
     def fw_compiler(gm, _):
+        # [FUNCTION DOC] HELPER: Forward compiler hook that records the graph module in the
+        # enclosing list and returns its forward callable unchanged.
         fw_graphs.append(gm)
         return gm.forward
 
@@ -73,11 +84,17 @@ def _aot_eager_with_runtime_epilogue():
 
 @skipIfTorchDynamo("Not a torch._dynamo test")
 class TestInvokeSubgraph(TestCase):
+    # [CLASS DOC] Eager and AOT-function tests of nested_compile_region without torch.compile.
+    # Skipped when the suite itself runs under dynamo.
     def test_simple(self):
+        # [FUNCTION DOC] A nested_compile_region-wrapped multiply called directly gives the same
+        # output and input gradients as the plain function.
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: Elementwise multiply of the two inputs.
             return torch.mul(x, y)
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Calls the region-wrapped version of the multiply.
             return nested_compile_region(gn)(x, y)
 
         x = torch.randn(8, requires_grad=True)
@@ -97,10 +114,15 @@ class TestInvokeSubgraph(TestCase):
         self.assertEqual(y.grad, y_clone.grad)
 
     def test_aot_function(self):
+        # [FUNCTION DOC] Same comparison as the eager test, but the wrapper function is
+        # traced with aot_function and a no-op compiler; checks outputs and gradients match
+        # the reference.
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: Elementwise multiply of the two inputs.
             return torch.mul(x, y)
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Calls the region-wrapped version of the multiply.
             return nested_compile_region(gn)(x, y)
 
         x = torch.randn(8, requires_grad=True)
@@ -121,15 +143,20 @@ class TestInvokeSubgraph(TestCase):
         self.assertEqual(y.grad, y_clone.grad)
 
     def test_multiple(self):
+        # [FUNCTION DOC] Two different regions (cos and sin) are composed, with cos used twice,
+        # and traced through aot_function; the output must equal the eager result.
         @nested_compile_region
         def cos(x):
+            # [FUNCTION DOC] HELPER: Region computing cosine.
             return torch.cos(x)
 
         @nested_compile_region
         def sin(x):
+            # [FUNCTION DOC] HELPER: Region computing sine.
             return torch.sin(x)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Applies cos, then sin, then cos again.
             a = cos(x)
             b = sin(a)
             return cos(b)
@@ -143,12 +170,22 @@ class TestInvokeSubgraph(TestCase):
 
     @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
     def test_duplicate_backward_variants_warn_and_trace(self):
+        # [FUNCTION DOC] With inlining of single-use subgraphs disabled, a region called twice
+        # in sequence produces two backward variants. Checks the compile emits a warning
+        # mentioning multiple backward graphs, yields one forward and one backward graph, and
+        # that a mocked structured-trace call logs exactly one duplicate-backward artifact whose
+        # payload has the expected variant suffix, variant count, and tangent shape and stride.
         @nested_compile_region
         def block(x):
+            # [FUNCTION DOC] HELPER: Region returning twice the sine of the input.
             return torch.sin(x) * 2.0
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that applies the region twice, concatenates with a tail
+            # tensor along dim 1, and returns the sum of squares.
             def forward(self, x, tail):
+                # [FUNCTION DOC] HELPER: Runs the region on x and then on its result,
+                # concatenates the result with tail, and returns the scalar sum of squares.
                 y0 = block(x)
                 y1 = block(y0)
                 z = torch.cat([y1, tail], dim=1)
@@ -208,6 +245,10 @@ class TestInvokeSubgraph(TestCase):
         self.assertEqual(tangent["stride"], [15, 5, 1])
 
     def test_make_fx_without_shape_env(self):
+        # [FUNCTION DOC] Traces the invoke_subgraph op with make_fx under a fake tensor
+        # mode that has no shape environment, and checks tracing succeeds and the generated
+        # code mentions invoke_subgraph (no deferred runtime assert insertion should need a
+        # shape env).
         """Test that make_fx with invoke_subgraph works without a ShapeEnv.
 
         When using FakeTensorMode without a ShapeEnv (shape_env=None),
@@ -219,9 +260,13 @@ class TestInvokeSubgraph(TestCase):
         from torch.fx.experimental.proxy_tensor import make_fx
 
         def subgraph_fn(x, y):
+            # [FUNCTION DOC] HELPER: Subgraph body returning a one-element tuple with x doubled
+            # plus y.
             return (x * 2 + y,)
 
         def outer_fn(x, y):
+            # [FUNCTION DOC] HELPER: Invokes the subgraph body through the invoke_subgraph op
+            # with a fixed identifier string.
             return invoke_subgraph(subgraph_fn, "test_subgraph", x, y)
 
         x = torch.randn(3, 3)
@@ -241,7 +286,12 @@ class TestInvokeSubgraph(TestCase):
 @skipIfTorchDynamo("Not a torch._dynamo test")
 @torch._dynamo.config.patch(canonicalize_output_graph_node_order=True)
 class TestInvokeSubgraphCompile(TestCase):
+    # [CLASS DOC] Tests of nested_compile_region under torch.compile. The class decorator
+    # patches dynamo config so output graph node order is canonicalized, and the class is
+    # skipped under dynamo.
     def count_unique_get_attr_nodes(self, gm, args, expected):
+        # [FUNCTION DOC] HELPER: Asserts that the graph module has exactly the expected number
+        # of distinct get_attr target names. The args parameter is unused.
         subgraph_attr_names = set()
         for node in gm.graph.nodes:
             if node.op == "get_attr":
@@ -249,11 +299,15 @@ class TestInvokeSubgraphCompile(TestCase):
         self.assertEqual(len(subgraph_attr_names), expected)
 
     def test_simple(self):
+        # [FUNCTION DOC] Compiles a function calling a region with the inductor backend (full
+        # graph) and checks outputs and gradients match eager.
         @nested_compile_region
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: Region multiplying its two inputs.
             return torch.mul(x, y)
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Calls the region.
             return gn(x, y)
 
         x = torch.randn(8, requires_grad=True)
@@ -273,18 +327,26 @@ class TestInvokeSubgraphCompile(TestCase):
         self.assertEqual(y.grad, y_clone.grad)
 
     def test_module_forward(self):
+        # [FUNCTION DOC] Region applied to a module forward method, called twice in one compiled
+        # function; outputs and gradients must match eager.
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with an integer constant attribute and a region-
+            # decorated forward.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Stores the integer constant 5 as an attribute.
                 super().__init__()
                 self.c = 5
 
             @nested_compile_region
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the sine of the product of inputs plus
+                # the constant.
                 return torch.mul(x, y).sin() + self.c
 
         mod = Mod()
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Sums two calls of the module.
             return mod(x, y) + mod(x, y)
 
         x = torch.randn(8, requires_grad=True)
@@ -304,20 +366,31 @@ class TestInvokeSubgraphCompile(TestCase):
         self.assertEqual(y.grad, y_clone.grad)
 
     def test_stack_trace(self):
+        # [FUNCTION DOC] Compiles with the aot_eager recording backend and, outside crossref
+        # mode, checks that each invoke_subgraph node's recorded stack trace (after
+        # stripping caret underline lines) ends at the user line calling the module, not at
+        # library internals.
         # Last frame in the stack trace on invoke_subgraph should point to
         # model code, not files in torch._higher_order_ops directory.
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a region-decorated forward and a
+            # constant attribute.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Stores the integer constant 5 as an attribute.
                 super().__init__()
                 self.c = 5
 
             @nested_compile_region
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the sine of the product of inputs plus
+                # the constant.
                 return torch.mul(x, y).sin() + self.c
 
         mod = Mod()
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Sums two calls of the module; the stack trace test looks
+            # for this line.
             return mod(x, y) + mod(x, y)
 
         x = torch.randn(8)
@@ -337,18 +410,27 @@ class TestInvokeSubgraphCompile(TestCase):
                 self.assertTrue(clean.endswith("return mod(x, y) + mod(x, y)\n"))
 
     def test_gen_schema(self):
+        # [FUNCTION DOC] Compiles a twice-called region with aot_eager and runs backward. Checks
+        # that one forward and one backward graph are produced and compares the printed schemas
+        # of the invoke_subgraph nodes in both graphs against inline expected strings.
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a region-decorated forward and a
+            # constant attribute.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Stores the integer constant 5 as an attribute.
                 super().__init__()
                 self.c = 5
 
             @nested_compile_region
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the sine of the product of inputs plus
+                # the constant.
                 return torch.mul(x, y).sin() + self.c
 
         mod = Mod()
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Sums two calls of the module.
             return mod(x, y) + mod(x, y)
 
         x = torch.randn(8, requires_grad=True)
@@ -386,14 +468,25 @@ class TestInvokeSubgraphCompile(TestCase):
         )
 
     def test_gen_schema_with_buffer_mutation(self):
+        # [FUNCTION DOC] Region that mutates a registered buffer in place, compiled under no-
+        # grad with the eager recording backend. Checks the graph passes the buffer as a
+        # subgraph input, the schema marks the first argument as mutated, the printed graph
+        # (skipped under crossref) matches the expected text, and output and final buffer value
+        # equal the eager reference.
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a constant and a buffer; its region forward adds
+            # one to the buffer in place and returns a value depending on it.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Stores a constant and registers a ones buffer of
+                # size 8.
                 super().__init__()
                 self.c = 5
                 self.register_buffer("buf", torch.ones(8, requires_grad=False))
 
             @nested_compile_region
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Mutates the buffer in place, then returns the sine of
+                # the product plus the constant plus the buffer.
                 self.buf.add_(1)
                 return torch.mul(x, y).sin() + self.c + self.buf
 
@@ -401,6 +494,7 @@ class TestInvokeSubgraphCompile(TestCase):
         mod = Mod()
 
         def fn(mod, x, y):
+            # [FUNCTION DOC] HELPER: Sums two calls of the module.
             return mod(x, y) + mod(x, y)
 
         x = torch.randn(8, requires_grad=True)
@@ -463,20 +557,31 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(mod.buf, mod_ref.buf)
 
     def test_auto_functionalize(self):
+        # [FUNCTION DOC] Region reading a buffer, compiled with aot_eager and backward run.
+        # Checks forward and backward graph counts, that results match eager, and that the
+        # printed partitioned forward and backward graphs match inline expected text (empty
+        # lines ignored).
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a constant, a buffer, and a region-decorated
+            # forward that multiplies by both.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Stores a constant and registers a ones buffer of
+                # size 8.
                 super().__init__()
                 self.c = 5
                 self.register_buffer("buf", torch.ones(8, requires_grad=False))
 
             @nested_compile_region
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the sine of the product times the constant
+                # times the buffer.
                 return torch.mul(x, y).sin() * self.c * self.buf
 
         mod_ref = Mod()
         mod = Mod()
 
         def fn(mod, x, y):
+            # [FUNCTION DOC] HELPER: Sums two calls of the module.
             return mod(x, y) + mod(x, y)
 
         x = torch.randn(8, requires_grad=True)
@@ -549,13 +654,21 @@ class GraphModule(torch.nn.Module):
         )
 
     def test_buffer_mutation_works_under_no_grad(self):
+        # [FUNCTION DOC] A region that mutates a buffer must compile and match eager under no-
+        # grad, under inference mode, and when inputs do not require grad. Each case uses a
+        # fresh module and compares both outputs and the final buffer value to a reference.
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a buffer that its region forward increments
+            # in place.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Registers a ones buffer of size 8.
                 super().__init__()
                 self.register_buffer("buf", torch.ones(8, requires_grad=False))
 
             @nested_compile_region
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Increments the buffer in place and returns sine of the
+                # product times the buffer.
                 self.buf.add_(1)
                 return torch.mul(x, y).sin() * self.buf
 
@@ -563,6 +676,7 @@ class GraphModule(torch.nn.Module):
         mod = Mod()
 
         def fn(mod, x, y):
+            # [FUNCTION DOC] HELPER: Sums two calls of the module.
             return mod(x, y) + mod(x, y)
 
         x = torch.randn(8, requires_grad=True)
@@ -592,19 +706,28 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(mod_ref.buf, mod.buf)
 
     def test_buffer_mutation_errors_under_training(self):
+        # [FUNCTION DOC] With inputs requiring grad, compiling a region that mutates a buffer
+        # must raise RuntimeError saying training with in-place input or buffer mutations is
+        # not supported.
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a buffer that its region forward increments
+            # in place.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Registers a ones buffer of size 8.
                 super().__init__()
                 self.register_buffer("buf", torch.ones(8, requires_grad=False))
 
             @nested_compile_region
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Increments the buffer in place and returns sine of the
+                # product times the buffer.
                 self.buf.add_(1)
                 return torch.mul(x, y).sin() * self.buf
 
         mod = Mod()
 
         def fn(mod, x, y):
+            # [FUNCTION DOC] HELPER: Sums two calls of the module.
             return mod(x, y) + mod(x, y)
 
         x = torch.randn(8, requires_grad=True)
@@ -616,11 +739,16 @@ class GraphModule(torch.nn.Module):
             torch.compile(fn, backend="inductor", fullgraph=True)(mod, x, y)
 
     def test_list(self):
+        # [FUNCTION DOC] Region returning a list of two tensors; the caller appends a third and
+        # sums them. Checks outputs and gradients against eager under inductor.
         @nested_compile_region
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: Region returning a list with product and sum of inputs.
             return [torch.mul(x, y), torch.add(x, y)]
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Appends the sine of x to the region result and sums all
+            # three entries.
             lst = gn(x, y)
             lst.append(torch.sin(x))
             return lst[0] + lst[1] + lst[2]
@@ -642,11 +770,16 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(y.grad, y_clone.grad)
 
     def test_tuple_of_tuple(self):
+        # [FUNCTION DOC] Region returning nested tuples; the caller adds the inner and outer
+        # items. Checks outputs and gradients against eager under inductor.
         @nested_compile_region
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: Region returning a tuple holding a one-tuple of the product
+            # and the sum.
             return ((torch.mul(x, y),), torch.add(x, y))
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Adds the nested product and the sum from the region result.
             tup = gn(x, y)
             return tup[0][0] + tup[1]
 
@@ -668,21 +801,32 @@ class GraphModule(torch.nn.Module):
 
     @unittest.skip("FunctionCtx ops is not cacheable right now")
     def test_differing_strides_for_grad_outs(self):
+        # [FUNCTION DOC] Skipped test. A custom autograd function inside a region has a backward
+        # that views the gradient, so a permuted output would break if gradients were not made
+        # contiguous; compiled with aot_eager and compared with eager.
         class CustomOp(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Autograd function with sine forward and a backward that
+            # reshapes the incoming gradient and returns its cosine.
             @staticmethod
             def forward(ctx, x):
+                # [FUNCTION DOC] HELPER: Returns the sine of the input.
                 return torch.sin(x)
 
             @staticmethod
             def backward(ctx, grad_out):
+                # [FUNCTION DOC] HELPER: Views the gradient as a 12 by 5 matrix, reshapes it to
+                # 3 by 4 by 5, and returns its cosine.
                 a = grad_out.view(12, 5)
                 return torch.cos(torch.reshape(a, (3, 4, 5)))
 
         @nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Region applying the custom autograd function.
             return CustomOp.apply(x)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Calls the region and permutes the output dims so
+            # strides change.
             a = gn(x)
             # Force stride changes so that backward view causes a failure if
             # contiguous not called.
@@ -706,13 +850,21 @@ class GraphModule(torch.nn.Module):
     @requires_cuda_and_triton
     @unittest.skipIf(not SM80OrLater, "Requires sm80 or later.")
     def test_sdpa(self):
+        # [FUNCTION DOC] Compiles scaled dot product attention (flash backend, causal) in a
+        # region with inductor on CUDA in bfloat16; requires CUDA, Triton and SM80 or later.
+        # Compares to eager, runs backward, then calls the compiled function again to
+        # exercise reuse.
         @nested_compile_region
         def gn(q, k, v):
+            # [FUNCTION DOC] HELPER: Region computing causal scaled dot product attention
+            # without a mask.
             return torch.nn.functional.scaled_dot_product_attention(
                 q, k, v, attn_mask=None, dropout_p=0.0, is_causal=True
             )
 
         def fn(q, k, v):
+            # [FUNCTION DOC] HELPER: Restricts SDPA to the flash attention backend and calls
+            # the region.
             with torch.nn.attention.sdpa_kernel(
                 [torch.nn.attention.SDPBackend.FLASH_ATTENTION]
             ):
@@ -738,12 +890,19 @@ class GraphModule(torch.nn.Module):
         res.sum().backward()
 
     def test_symint_from_fwd_to_bwd(self):
+        # [FUNCTION DOC] Region whose reshape depends on input shapes. The same compiled
+        # function is run with three different shape pairs (dynamic shapes), checking results
+        # against eager and running backward on the later two so symbolic sizes flow from
+        # forward to backward.
         @nested_compile_region
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: Sums x over dim 1, reshapes to the transposed shape of y,
+            # and matrix-multiplies with y.
             a = torch.sum(x, (1,), keepdim=True).view(y.shape[1], y.shape[0])
             return torch.matmul(a, y)
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Calls the region.
             return gn(x, y)
 
         opt_fn = torch.compile(fn, backend="inductor", fullgraph=True)
@@ -771,6 +930,11 @@ class GraphModule(torch.nn.Module):
     @inductor_config.patch("fx_graph_cache", False)
     @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
     def test_dropout_checks_joint_graph(self):
+        # [FUNCTION DOC] Region with dropout, compiled via inductor with the FX graph cache
+        # disabled and single-use inlining off. Checks (outside crossref) the printed
+        # inductor graph shows random seed ops in the dropout partition, i.e. joint-graph
+        # passes ran on the HOP graphs. Numeric results are not compared since RNG differs
+        # between eager and Triton.
         # `dropout` tests that joint graph passes (not just partitioner) is ran
         # on the hop graphs. Inductor rng functionalization happens in the joint
         # graph passes. Without running joint graph passes, we would get an
@@ -778,13 +942,17 @@ class GraphModule(torch.nn.Module):
         # replace_random.py
         @nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Region applying dropout with probability 0.5 to the sine of
+            # the input.
             return torch.nn.functional.dropout(torch.sin(x), p=0.5)
 
         @nested_compile_region
         def hn(x):
+            # [FUNCTION DOC] HELPER: Region computing sine.
             return torch.sin(x)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Adds the outputs of both regions.
             return gn(x) + hn(x)
 
         x = torch.randn(8, requires_grad=True)
@@ -839,12 +1007,18 @@ class GraphModule(torch.nn.Module):
     @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
     @inductor_config.patch("fx_graph_cache", False)
     def test_dropout_checks_joint_graph_inference(self):
+        # [FUNCTION DOC] Same dropout region compiled with inputs not requiring grad. Checks the
+        # inductor graph has the random seed ops inside the single repeated subgraph and matches
+        # the inline expected text (outside crossref).
         # Checks that joint graph results in inductor seeds for just the inference graph
         @nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Region applying dropout with probability 0.5 to the sine of
+            # the input.
             return torch.nn.functional.dropout(torch.sin(x), p=0.5)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Calls the region.
             return gn(x)
 
         backend = InductorAndRecordGraphs()
@@ -880,11 +1054,17 @@ class <lambda>(torch.nn.Module):
             )
 
     def test_dedupe(self):
+        # [FUNCTION DOC] Calls the same region twice. Checks results and gradients, that the
+        # dynamo, forward and backward graphs each hold a single subgraph module (via the
+        # get_attr counter), and that printed dynamo and forward graphs match expected text.
         @nested_compile_region
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: Region multiplying its inputs.
             return torch.mul(x, y)
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Applies the region to the inputs and then to the result
+            # with y.
             a = gn(x, y)
             return gn(a, y)
 
@@ -965,6 +1145,10 @@ class GraphModule(torch.nn.Module):
         )
 
     def test_no_raise_on_reparameterize_module(self):
+        # [FUNCTION DOC] A region calling functional_call on a linear module with explicit
+        # parameter and buffer dicts, with the dynamo allow_side_effects option on the HOP
+        # variable patched off. Must compile without error, match eager, and produce expected
+        # printed graphs where parameters are lifted as graph inputs.
         mod = torch.nn.Linear(10, 10)
         params = dict(mod.named_parameters())
         buffers = dict(mod.named_buffers())
@@ -975,11 +1159,14 @@ class GraphModule(torch.nn.Module):
 
         @nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Region calling the module functionally with the
+            # captured dicts.
             return torch.func.functional_call(
                 mod, parameter_and_buffer_dicts=params_and_buffers, args=(x,)
             )
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sums two calls of the region.
             return gn(x) + gn(x)
 
         x = torch.randn(10, 10)
@@ -1044,14 +1231,22 @@ class GraphModule(torch.nn.Module):
         )
 
     def test_raise_with_reparameterize_but_module_mutation(self):
+        # [FUNCTION DOC] Like the reparameterize test, but the module forward assigns a nonlocal
+        # variable (a side effect). With allow_side_effects patched off, compilation must raise
+        # RuntimeError mentioning the invoke_subgraph higher order operator.
         foo = 0
 
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Linear-layer module whose forward sets a captured outer
+            # variable to one before applying the layer.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the 10 by 10 linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(10, 10)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Sets the nonlocal flag to one (side effect) and applies
+                # the linear layer.
                 nonlocal foo
                 foo = 1
                 return self.linear(x)
@@ -1066,11 +1261,14 @@ class GraphModule(torch.nn.Module):
 
         @nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Region calling the module functionally with the
+            # captured dicts.
             return torch.func.functional_call(
                 mod, parameter_and_buffer_dicts=params_and_buffers, args=(x,)
             )
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sums two calls of the region.
             return gn(x) + gn(x)
 
         x = torch.randn(10, 10)
@@ -1088,14 +1286,19 @@ class GraphModule(torch.nn.Module):
 
     @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
     def test_dce(self):
+        # [FUNCTION DOC] Dead code elimination: an unused cosine inside the region must not
+        # appear in the AOT forward subgraph. Compiled without grad and matched against
+        # expected text.
         @nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Region returning the sine; also computes an unused cosine.
             x = torch.sin(x)
             # should be dce'd
             y = torch.cos(x)  # noqa: F841
             return x
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Calls the region.
             return gn(x)
 
         backend = AotEagerAndRecordGraphs()
@@ -1123,16 +1326,25 @@ class <lambda>(torch.nn.Module):
 
     @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
     def test_dce_recursive(self):
+        # [FUNCTION DOC] Region wrapping a non-reentrant checkpoint of a function with an unused
+        # cosine, result detached; compiled with the eager recording backend with the config
+        # option skipping forward side effects in backward. Outside crossref, compares the
+        # dynamo graph text with expected output (one invoke_subgraph whose body holds the
+        # checkpoint HOP and its nested body module).
         def fn1(x):
+            # [FUNCTION DOC] HELPER: Returns the sine of x; computes and discards the cosine.
             a = torch.sin(x)
             _ = torch.cos(x)  # unused intermediate
             return a
 
         @nested_compile_region
         def fn1_checkpoint(x):
+            # [FUNCTION DOC] HELPER: Region running the previous function under non-
+            # reentrant checkpoint.
             return torch.utils.checkpoint.checkpoint(fn1, x, use_reentrant=False)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Calls the checkpoint region and detaches the result.
             return fn1_checkpoint(x).detach()
 
         x = torch.randn(8, requires_grad=True)
@@ -1178,14 +1390,22 @@ class GraphModule(torch.nn.Module):
 
     @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
     def test_nonlocal_update(self):
+        # [FUNCTION DOC] A region reads a nonlocal counter whose value differs between two
+        # calls (2 then 3). Single-use inlining is off. Checks inductor results and gradients
+        # match eager, then with aot_eager that the dynamo graph has two separate subgraphs,
+        # one per constant.
         counter = 2
 
         @nested_compile_region
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: Region returning a one-tuple of product scaled by the
+            # nonlocal counter.
             nonlocal counter
             return (torch.mul(x, y) * counter,)
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Sets the counter to 2, calls the region, sets it to 3,
+            # calls again on the result, and returns the second output.
             nonlocal counter
             counter = 2
             a = gn(x, y)[0]
@@ -1245,16 +1465,23 @@ class GraphModule(torch.nn.Module):
             )
 
     def test_nonlocal_list_mutation_hidden(self):
+        # [FUNCTION DOC] A region appends a tensor to a list passed in from outside. Compiling
+        # with aot_eager must handle that hidden list mutation and extra outputs, giving the
+        # same outputs as eager for both the tensor result and the list item.
         """Test that nonlocal list mutation inside nested_compile_region is handled correctly."""
 
         @nested_compile_region
         def gn(x, z):
+            # [FUNCTION DOC] HELPER: Region that appends sin of x to the list and returns
+            # a tuple.
             o = torch.matmul(x, x) @ x
             out = x.sin()
             z.append(out)
             return torch.cos(torch.sin(o)), torch.sin(x)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Creates an empty list, calls the region, and returns the
+            # sum of first and last outputs plus the first list item.
             z = []
 
             outs = gn(x, z)
@@ -1275,13 +1502,18 @@ class GraphModule(torch.nn.Module):
     @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
     @inductor_config.patch("fx_graph_cache", False)
     def test_view_to_reshape(self):
+        # [FUNCTION DOC] Checks that a view call inside the region becomes a reshape in the
+        # inductor graph (checked against expected printed text outside crossref); FX graph
+        # cache off.
         @nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Region: sine, view to 1 by 8, sine.
             x = torch.sin(x)
             x = x.view(1, 8)
             return torch.sin(x)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Calls the region.
             return gn(x)
 
         x = torch.randn(8, requires_grad=False)
@@ -1315,14 +1547,19 @@ class <lambda>(torch.nn.Module):
             )
 
     def test_normalize_gm(self):
+        # [FUNCTION DOC] Region with an internal loop is called five times in a loop. Checks the
+        # normalized printed graph reuses a single subgraph name for all calls.
         @nested_compile_region
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: Region multiplying x by y five times in a loop.
             # Different graph give different names to intermediate nodes
             for _ in range(5):
                 x = x * y
             return x
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Applies the region five times, feeding output back
+            # as input.
             for _ in range(5):
                 x = gn(x, y)
             return x
@@ -1373,12 +1610,16 @@ class GraphModule(torch.nn.Module):
             )
 
     def test_input_mutation(self):
+        # [FUNCTION DOC] Region mutating its input in place (no grad). The compiled function
+        # result must equal the eager result on a cloned input.
         @nested_compile_region
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: Region adding one to x in place and returning the product.
             x.add_(1)
             return torch.mul(x, y)
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Calls the region.
             return gn(x, y)
 
         x = torch.randn(8, requires_grad=False)
@@ -1390,12 +1631,17 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(opt_fn(x, y), fn(x_clone, y))
 
     def test_input_mutation_mutiple_times(self):
+        # [FUNCTION DOC] Region mutating its input is called 17 times in a loop under no-grad.
+        # The output and the mutated input must match an eager run.
         @nested_compile_region
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: Region adding one to x in place and returning the product.
             x.add_(1)
             return torch.mul(x, y)
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Calls the region once then adds 16 more calls' results
+            # in place.
             z = gn(x, y)
             for _ in range(16):
                 z += gn(x, y)
@@ -1416,12 +1662,19 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(x_clone, x)
 
     def test_input_mutation_mutiple_times_fake_tensor_cache_hit(self):
+        # [FUNCTION DOC] Same as the repeated-mutation test but with fake propagation of the HOP
+        # replaced by a counting mock. Asserts fake propagation runs exactly twice (once in AOT
+        # metadata analysis, once in graph creation, whose cache keys differ), later calls hit
+        # the cache, and results and mutated input match eager.
         @nested_compile_region
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: Region adding one to x in place and returning the product.
             x.add_(1)
             return torch.mul(x, y)
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Calls the region once then adds 16 more calls' results
+            # in place.
             z = gn(x, y)
             for _ in range(16):
                 z += gn(x, y)
@@ -1437,6 +1690,9 @@ class GraphModule(torch.nn.Module):
         fake_prop_count = 0
 
         def _mock_invoke_subgraph(mode, subgraph, identifier, *operands):
+            # [FUNCTION DOC] HELPER: Replacement fake implementation of the invoke_subgraph op.
+            # Increments the enclosing call counter and returns a one-tuple holding a clone of
+            # the first operand.
             nonlocal fake_prop_count
             fake_prop_count += 1
             return (operands[0].clone(),)
@@ -1472,12 +1728,18 @@ class GraphModule(torch.nn.Module):
     @unittest.expectedFailure
     @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
     def test_input_mutation_inference_mode(self):
+        # [FUNCTION DOC] Expected-failure test: a region that mutates its input inside inference
+        # mode, whose input was created outside it, should raise RuntimeError about in-place
+        # update to an inference tensor outside inference mode when the compiled function runs.
         @nested_compile_region
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: Region adding one to x in place and returning the product.
             x.add_(1)
             return torch.mul(x, y)
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Computes cos, then calls the region on a second cos inside
+            # inference mode.
             z = torch.cos(x)
             with torch.inference_mode():
                 return gn(torch.cos(z), y)
@@ -1494,22 +1756,31 @@ class GraphModule(torch.nn.Module):
 
     @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
     def test_input_mutation_alias_annotated_custom_op(self):
+        # [FUNCTION DOC] Registers a temporary custom op in a scoped library whose second
+        # argument is annotated as mutated, and calls it inside a region that also mutates its
+        # input. Checks results and the mutated input against eager and that the AOT forward
+        # graph shows auto functionalization inside the subgraph (expected text compared).
         with torch.library._scoped_library("mylib", "FRAGMENT") as lib:
             lib.define("scale_into(Tensor x, Tensor! out, float scale) -> ()")
 
             def scale_into(x, out, scale):
+                # [FUNCTION DOC] HELPER: Custom op implementation: writes x scaled by scale
+                # into out.
                 out.copy_(x * scale)
 
             lib.impl("scale_into", scale_into, "CompositeExplicitAutograd")
 
             @nested_compile_region
             def gn(x, y):
+                # [FUNCTION DOC] HELPER: Region: allocates an output buffer like y, fills it via
+                # the custom op, adds it to x in place, and returns the product of x and y.
                 out = torch.empty_like(y)
                 torch.ops.mylib.scale_into(y, out, 2.0)
                 x.add_(out)
                 return torch.mul(x, y)
 
             def fn(x, y):
+                # [FUNCTION DOC] HELPER: Calls the region.
                 return gn(x, y)
 
             # x is mutated in place, so it cannot require grad (autograd leaf error).
@@ -1549,16 +1820,23 @@ class <lambda>(torch.nn.Module):
 
     @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
     def test_input_mutation_alias_annotated_custom_op_runtime_epilogue(self):
+        # [FUNCTION DOC] Like the previous test, but the region also mutates a third input and
+        # the backend keeps mutations out of the graph so a runtime epilogue applies them.
+        # Checks all three inputs match eager afterwards and the forward graph text matches.
         with torch.library._scoped_library("mylib", "FRAGMENT") as lib:
             lib.define("scale_into(Tensor x, Tensor! out, float scale) -> ()")
 
             def scale_into(x, out, scale):
+                # [FUNCTION DOC] HELPER: Custom op implementation: writes x scaled by scale
+                # into out.
                 out.copy_(x * scale)
 
             lib.impl("scale_into", scale_into, "CompositeExplicitAutograd")
 
             @nested_compile_region
             def gn(x, y, z):
+                # [FUNCTION DOC] HELPER: Region: uses the custom op to fill a buffer, adds it to
+                # x in place, subtracts y from z in place, and returns the product of x and z.
                 out = torch.empty_like(y)
                 torch.ops.mylib.scale_into(y, out, 2.0)
                 x.add_(out)
@@ -1566,6 +1844,7 @@ class <lambda>(torch.nn.Module):
                 return torch.mul(x, z)
 
             def fn(x, y, z):
+                # [FUNCTION DOC] HELPER: Calls the region.
                 return gn(x, y, z)
 
             backend, fw_graphs = _aot_eager_with_runtime_epilogue()
@@ -1607,13 +1886,20 @@ class <lambda>(torch.nn.Module):
     @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
     @torch._functorch.config.patch(unlift_effect_tokens=True)
     def test_input_mutation_with_effect_runtime_epilogue(self):
+        # [FUNCTION DOC] Region with a side-effecting print op plus an in-place input mutation,
+        # with effect tokens unlifted and the runtime-epilogue backend. Checks output and input
+        # match eager, and the forward graph text uses the functionalized subgraph, a
+        # with_effects call, no copy op, and no auto-functionalized invoke_subgraph wrapper.
         @nested_compile_region
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: Region: print effect op, add y into x in place, return
+            # the product.
             torch.ops.aten._print.default("effect")
             x.add_(y)
             return x * y
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Calls the region.
             return gn(x, y)
 
         backend, fw_graphs = _aot_eager_with_runtime_epilogue()
@@ -1635,12 +1921,18 @@ class <lambda>(torch.nn.Module):
 
     @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
     def test_repeated_input_mutation_view_runtime_epilogue(self):
+        # [FUNCTION DOC] Region mutating a slice view of its input is called twice on the same
+        # slice. Checks result and base tensor match eager, both calls share one
+        # functionalized subgraph, a slice scatter appears, and there is no copy op or auto-
+        # functionalized wrapper.
         @nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Region adding two to x in place and returning its sine.
             x.add_(2)
             return x.sin()
 
         def fn(base):
+            # [FUNCTION DOC] HELPER: Sums region calls on two identical slices of the base.
             return gn(base[1:5]) + gn(base[1:5])
 
         backend, fw_graphs = _aot_eager_with_runtime_epilogue()
@@ -1668,8 +1960,17 @@ class <lambda>(torch.nn.Module):
         )
 
     def test_input_mutation_boxed_subgraph(self):
+        # [FUNCTION DOC] Builds a symbolically traced module that mutates its first input,
+        # switches its graph to boxed calling convention, and checks that
+        # FunctionalCallableWithEpilogue runs it with a list of inputs, matching eager
+        # including the mutated input. Also checks FunctionalizeCtxWrapper under a
+        # functionalize API returns the output plus updated mutated input while leaving the
+        # original input untouched.
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that adds y to x in place and returns a one-tuple of
+            # the product.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Mutates x in place and returns the product in a tuple.
                 x.add_(y)
                 return (torch.mul(x, y),)
 
@@ -1697,13 +1998,18 @@ class <lambda>(torch.nn.Module):
         self.assertEqual(out, updated_x * y)
 
     def test_simple_module(self):
+        # [FUNCTION DOC] Region calling a linear module and a cosine, compiled by inductor with
+        # inputs not requiring grad (so joint graph outputs are None). Compares output; the
+        # backward calls and gradient comparison then run on non-grad tensors.
         mod = torch.nn.Linear(8, 8)
 
         @nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Region returning a cosine and the module output.
             return torch.cos(x), mod(x)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sums the two region outputs.
             out = gn(x)
             return out[0] + out[1]
 
@@ -1723,12 +2029,18 @@ class <lambda>(torch.nn.Module):
         self.assertEqual(x.grad, x_clone.grad)
 
     def test_fail_with_direct_invoke_subgraph(self):
+        # [FUNCTION DOC] Calling the invoke_subgraph function directly inside compiled
+        # code must raise the dynamo Unsupported error with a message about directly
+        # using invoke_subgraph.
         from torch._higher_order_ops import invoke_subgraph
 
         def gn(x):
+            # [FUNCTION DOC] HELPER: Plain function returning sine.
             return torch.sin(x)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Calls invoke_subgraph directly with the function, no
+            # identifier and a tuple of operands.
             return invoke_subgraph(gn, None, (x,))
 
         opt_fn = torch.compile(fn, backend="eager", fullgraph=True)
@@ -1740,11 +2052,15 @@ class <lambda>(torch.nn.Module):
             opt_fn(x)
 
     def test_input_output_aliasing(self):
+        # [FUNCTION DOC] A region that returns its input unchanged must raise the dynamo
+        # UncapturedHigherOrderOpError mentioning aliasing during higher order op tracing.
         @nested_compile_region
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: Region returning its input x and the product.
             return (x, torch.mul(x, y))
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Multiplies the two region outputs.
             outs = gn(x, y)
             return outs[0] * outs[1]
 
@@ -1760,11 +2076,15 @@ class <lambda>(torch.nn.Module):
             opt_fn(x, y)
 
     def test_input_input_aliasing(self):
+        # [FUNCTION DOC] Passing a tensor and a view of it as two region inputs must raise
+        # UncapturedHigherOrderOpError about aliasing during higher order op tracing.
         @nested_compile_region
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: Region multiplying its two inputs.
             return torch.mul(x, y)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Calls the region with x and a 1 by 8 view of x.
             return gn(x, x.view(1, 8))
 
         x = torch.randn(8, requires_grad=False)
@@ -1778,12 +2098,17 @@ class <lambda>(torch.nn.Module):
             opt_fn(x)
 
     def test_output_output_aliasing(self):
+        # [FUNCTION DOC] A region returning a tensor and a view of it must raise
+        # UncapturedHigherOrderOpError about aliasing during higher order op tracing.
         @nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Region returning cos(x) and a 1 by 8 view of the
+            # same tensor.
             z = torch.cos(x)
             return z, z.view(1, 8)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Calls the region.
             return gn(x)
 
         x = torch.randn(8, requires_grad=False)
@@ -1797,16 +2122,23 @@ class <lambda>(torch.nn.Module):
             opt_fn(x)
 
     def test_side_effect_with_aliased_intermediate(self):
+        # [FUNCTION DOC] A region stores a view of an intermediate in an outer list, and the
+        # caller uses it afterwards. Compilation must raise InternalTorchDynamoError whose
+        # message says the value aliases an input or output and tells the user to clone it.
         captured_views = []
 
         @nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Region: sine, view as 1 by 8, append the view to the outer
+            # list, return the sine of the view.
             original = torch.sin(x)
             view = original.view(1, 8)  # Aliases with original
             captured_views.append(view)
             return torch.sin(view)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Calls the region and adds the captured view if the list
+            # is non-empty.
             result = gn(x)
             if captured_views:
                 return result + captured_views[0]
@@ -1823,20 +2155,30 @@ class <lambda>(torch.nn.Module):
             opt_fn(x)
 
     def test_mod_attr_aliasing(self):
+        # [FUNCTION DOC] A region calls a module that mutates an attribute tensor in place.
+        # Compiles with inductor, then resets the attribute and checks the compiled result
+        # equals eager.
         class MutateParam(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a ones tensor attribute that its forward adds one
+            # to in place before multiplying the input with it.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the size 8 ones attribute.
                 super().__init__()
                 self.a = torch.ones(8)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Increments the attribute in place and returns input
+                # times it.
                 self.a.add_(1)
                 return torch.mul(x, self.a)
 
         @nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Region calling the module (defined later in the test body).
             return mod(x)
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Multiplies the region output with y.
             return gn(x) * y
 
         mod = MutateParam()
@@ -1851,12 +2193,17 @@ class <lambda>(torch.nn.Module):
         self.assertEqual(compiled_out, fn(x, y))
 
     def test_redundant_compile_region(self):
+        # [FUNCTION DOC] Applying the region decorator twice must behave like once: result
+        # matches eager and the printed dynamo graph holds a single shared subgraph used by
+        # two calls.
         @nested_compile_region
         @nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Doubly decorated region returning sine.
             return torch.sin(x)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sums two region calls.
             return gn(x) + gn(x)
 
         backend = AotEagerAndRecordGraphs()
@@ -1893,14 +2240,18 @@ class GraphModule(torch.nn.Module):
             )
 
     def test_kwargs_only(self):
+        # [FUNCTION DOC] Region with a keyword-only argument, called by keyword; compiled result
+        # with inductor must equal eager.
         @nested_compile_region
         def gn(x, *, y):
+            # [FUNCTION DOC] HELPER: Region multiplying x with the keyword-only y.
             return x * y
 
         x = torch.randn(8, requires_grad=False)
         y = torch.randn(8, requires_grad=False)
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Calls the region passing y by keyword.
             return gn(x, y=y)
 
         ref = fn(x, y)
@@ -1909,16 +2260,25 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(ref, res)
 
     def test_module_method(self):
+        # [FUNCTION DOC] Region applied to a module helper method (bound method) that calls a
+        # linear layer, used twice in forward. Checks results and that the printed dynamo graph
+        # lifts weight and bias as inputs and shares one subgraph.
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module holding a linear layer with a region-decorated
+            # helper method.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the 8 by 8 linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(8, 8)
 
             @nested_compile_region
             def helper(self, x):
+                # [FUNCTION DOC] HELPER: Region applying the linear layer.
                 return self.linear(x)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Combines input with the product of two helper calls
+                # plus input.
                 return x + self.helper(x) * self.helper(x) + x
 
         mod = Mod()
@@ -1960,19 +2320,29 @@ class GraphModule(torch.nn.Module):
             )
 
     def test_module(self):
+        # [FUNCTION DOC] A module wrapped as a region and stored as a submodule, called twice.
+        # Checks results match eager and the printed dynamo graph shares one subgraph.
         class SubMod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Stateless module computing sine.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Only runs base class initialization.
                 super().__init__()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the sine of the input.
                 return torch.sin(x)
 
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module holding a region-wrapped submodule and calling
+            # it twice.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the region-wrapped sine submodule.
                 super().__init__()
                 self.submod = nested_compile_region(SubMod())
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns x plus the product of two submodule calls
+                # plus x.
                 return x + self.submod(x) * self.submod(x) + x
 
         mod = Mod()
@@ -2013,6 +2383,9 @@ class GraphModule(torch.nn.Module):
 
     @requires_cuda_and_triton
     def test_return_none(self):
+        # [FUNCTION DOC] CUDA and Triton only. A region applying dropout with train set to false
+        # to a product with a grad-requiring weight is run via an assert-optimize inductor
+        # wrapper. Backward is run and the weight gradient cloned; passes if nothing raises.
         from torch.nn import functional as F
 
         weight = torch.ones(
@@ -2022,10 +2395,13 @@ class GraphModule(torch.nn.Module):
 
         @nested_compile_region
         def fn(x, train):
+            # [FUNCTION DOC] HELPER: Region: product with the outer weight, then dropout at 0.33
+            # with the given train flag.
             return F.dropout(x * weight, 0.33, train)
 
         @torch._dynamo.optimize_assert("inductor")
         def run(x, train=True):
+            # [FUNCTION DOC] HELPER: Compiled entry calling the region; train defaults to true.
             return fn(x, train)
 
         r1 = run(ones, train=False)
@@ -2034,11 +2410,16 @@ class GraphModule(torch.nn.Module):
 
     @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
     def test_return_none_from_fwd(self):
+        # [FUNCTION DOC] Region returning a None among its outputs. Checks inductor results and
+        # gradients match eager, then with aot_eager that one subgraph exists in the dynamo,
+        # forward and backward graphs and the printed graphs match expected text.
         @nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Region returning x doubled, None, and x tripled.
             return x * 2, None, x * 3
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Adds the first and third region outputs.
             ys = gn(x)
             return ys[0] + ys[2]
 
@@ -2139,11 +2520,15 @@ class GraphModule(torch.nn.Module):
             )
 
     def test_dynamic(self):
+        # [FUNCTION DOC] Region used twice with the batch dimension marked dynamic; inductor
+        # result must equal eager.
         @nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Region returning sine.
             return torch.sin(x)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sums two region calls.
             return gn(x) + gn(x)
 
         x = torch.randn(8, 8, requires_grad=True)
@@ -2155,15 +2540,22 @@ class GraphModule(torch.nn.Module):
 
     @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
     def test_grad_accumulation(self):
+        # [FUNCTION DOC] Region containing two linear layers whose difference is taken, plus a
+        # third layer outside. Checks the backward graph has exactly one add node at top level
+        # (the gradient accumulation for the outside layer) and exactly one inside the subgraph.
         mod1 = torch.nn.Linear(8, 8)
         mod2 = torch.nn.Linear(8, 8)
         mod3 = torch.nn.Linear(8, 8)
 
         @nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Region returning the difference of two linear
+            # layer outputs.
             return mod1(x) - mod2(x)
 
         def fn(c):
+            # [FUNCTION DOC] HELPER: Subtracts a third linear layer from the region output
+            # and doubles.
             d = gn(c) - mod3(c)
             return d * 2
 
@@ -2188,12 +2580,16 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(len(bw_add_nodes), 1)
 
     def test_complex(self):
+        # [FUNCTION DOC] Region on a complex64 tensor (case seen in Wan2.1); inductor result
+        # must equal eager.
         # Observed in Wan2.1
         @nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Region returning sine.
             return torch.sin(x)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sums two region calls.
             return gn(x) + gn(x)
 
         x = torch.randn(2, 2, dtype=torch.complex64)
@@ -2204,12 +2600,18 @@ class GraphModule(torch.nn.Module):
 
     @torch._dynamo.config.patch(capture_scalar_outputs=True)
     def test_pending_unbacked(self):
+        # [FUNCTION DOC] With scalar output capture enabled and a dynamic dim, a region calls
+        # item on an element, producing an unbacked symbol. Compiled with the eager backend
+        # (inductor fails to compile this); result must equal eager.
         @nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Region multiplying x by the scalar value of its
+            # first element.
             u = x[0].item()
             return x * u
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Calls the region.
             return gn(x)
 
         x = torch.randn(8)
@@ -2223,12 +2625,17 @@ class GraphModule(torch.nn.Module):
 
     @torch._dynamo.config.patch(capture_scalar_outputs=True)
     def test_unbacked1(self):
+        # [FUNCTION DOC] Region slices a tensor using a size obtained from item (unbacked
+        # symbol), compiled with the eager backend; result must equal eager.
         @nested_compile_region
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: Region: reads the scalar from x and returns a clone of that
+            # many leading elements of y.
             b = x.item()
             return y[:b].clone()
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Calls the region.
             return gn(x, y)
 
         x = torch.tensor(4)
@@ -2242,14 +2649,19 @@ class GraphModule(torch.nn.Module):
 
     @torch._dynamo.config.patch(capture_scalar_outputs=True)
     def test_unbacked2(self):
+        # [FUNCTION DOC] Like the previous test, but the region first asserts the unbacked size
+        # is within range using runtime checks; eager-backend result must equal eager.
         @nested_compile_region
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: Region: reads the scalar, checks it is nonnegative and
+            # below the length of y, and returns a clone of that many leading elements of y.
             b = x.item()
             torch._check(b >= 0)
             torch._check(b < y.shape[0])
             return y[:b].clone()
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Calls the region.
             return gn(x, y)
 
         x = torch.tensor(4)
@@ -2263,12 +2675,18 @@ class GraphModule(torch.nn.Module):
 
     @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
     def test_bwd_partitioning(self):
+        # [FUNCTION DOC] Region with a matmul and sine inside, then a sine outside; compiled
+        # with aot_eager. Checks values and gradients against eager and that the printed forward
+        # and backward graphs match expected text, showing the partitioner saves matmul output
+        # and transposed inputs and recomputes the cosine inside the backward subgraph.
         @nested_compile_region
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: Region: matmul then sine.
             z = torch.matmul(x, y)
             return torch.sin(z)
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Sine of the region output.
             return torch.sin(gn(x, y))
 
         backend = AotEagerAndRecordGraphs()
@@ -2347,11 +2765,16 @@ class GraphModule(torch.nn.Module):
             )
 
     def test_const_tensor(self):
+        # [FUNCTION DOC] Region that creates a constant tensor inside; compiled with aot_eager
+        # and compared with eager.
         @nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Region multiplying x by a newly created scalar float
+            # tensor 64.
             return torch.tensor(64, dtype=torch.float32) * x
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sums two region calls.
             return gn(x) + gn(x)
 
         x = torch.randn(64, requires_grad=True)
@@ -2364,21 +2787,32 @@ class GraphModule(torch.nn.Module):
 
     @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
     def test_ac(self):
+        # [FUNCTION DOC] Activation checkpointing inside regions. fn1 region is used twice and
+        # fn2 region once. Checks values and gradients, that dynamo, forward and backward
+        # graphs have two distinct subgraphs (the repeated one is deduplicated), and inductor
+        # matches too.
         def fn1(x):
+            # [FUNCTION DOC] HELPER: Returns cosine.
             return torch.cos(x)
 
         @nested_compile_region
         def fn1_checkpoint(x):
+            # [FUNCTION DOC] HELPER: Region running the cosine function under non-
+            # reentrant checkpoint.
             return torch.utils.checkpoint.checkpoint(fn1, x, use_reentrant=False)
 
         def fn2(x):
+            # [FUNCTION DOC] HELPER: Returns sine.
             return torch.sin(x)
 
         @nested_compile_region
         def fn2_checkpoint(x):
+            # [FUNCTION DOC] HELPER: Region running the sine function under non-
+            # reentrant checkpoint.
             return torch.utils.checkpoint.checkpoint(fn2, x, use_reentrant=False)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Adds fn1 region twice and fn2 region once.
             return (
                 fn1_checkpoint(x)
                 # repeat the same fn1_checkpoint to see that we dedupe
@@ -2414,14 +2848,22 @@ class GraphModule(torch.nn.Module):
 
     @torch._inductor.config.patch(fallback_random=True)
     def test_ac_rng(self):
+        # [FUNCTION DOC] Activation checkpointing of a dropout function inside a region
+        # used twice, with random fallback in inductor. With a fixed seed, compiled values
+        # and gradients must equal eager (aot_eager), and inductor output also matches the
+        # eager reference.
         def fn1(x):
+            # [FUNCTION DOC] HELPER: Cosine of dropout (probability 0.5) of x.
             return torch.cos(torch.nn.functional.dropout(x, p=0.5))
 
         @nested_compile_region
         def fn1_checkpoint(x):
+            # [FUNCTION DOC] HELPER: Region running the dropout function under non-
+            # reentrant checkpoint.
             return torch.utils.checkpoint.checkpoint(fn1, x, use_reentrant=False)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sums two region calls.
             return fn1_checkpoint(x) + fn1_checkpoint(x)
 
         x = torch.randn(8, requires_grad=True)
@@ -2451,16 +2893,24 @@ class GraphModule(torch.nn.Module):
 
     @requires_gpu
     def test_ac_rng_cudagraphs(self):
+        # [FUNCTION DOC] GPU test: checkpointed attention with dropout inside a region, compiled
+        # with inductor in reduce-overhead (cuda graphs) mode in bfloat16; runs backward and
+        # passes if nothing raises.
         def fn1(q, k, v):
+            # [FUNCTION DOC] HELPER: Scaled dot product attention with dropout 0.5, causal.
             return torch.nn.functional.scaled_dot_product_attention(
                 q, k, v, attn_mask=None, dropout_p=0.5, is_causal=True
             )
 
         @nested_compile_region
         def fn1_checkpoint(q, k, v):
+            # [FUNCTION DOC] HELPER: Region running the attention function under non-
+            # reentrant checkpoint.
             return torch.utils.checkpoint.checkpoint(fn1, q, k, v, use_reentrant=False)
 
         def fn(q, k, v):
+            # [FUNCTION DOC] HELPER: Sums the region on the inputs and on cos(q) with the same k
+            # and v.
             return fn1_checkpoint(q, k, v) + fn1_checkpoint(q.cos(), k, v)
 
         q = torch.randn(
@@ -2480,11 +2930,15 @@ class GraphModule(torch.nn.Module):
 
     @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
     def test_fake_tensor_checking(self):
+        # [FUNCTION DOC] The same region called on two differently shaped inputs must produce
+        # two separate subgraphs in the dynamo graph (checked against expected text).
         @nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Region returning sine.
             return torch.sin(x)
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Returns region outputs for x and y as a tuple.
             # x and y are different shapes, so we should use different graph
             return gn(x), gn(y)
 
@@ -2530,16 +2984,23 @@ class GraphModule(torch.nn.Module):
             )
 
     def test_return_size(self):
+        # [FUNCTION DOC] Region returning a tensor and the input shape, used twice. For both
+        # dynamic and static compilation, checks outputs match eager and gradients flow.
         def run(dynamic):
+            # [FUNCTION DOC] HELPER: Resets the compiler, then compiles and compares the
+            # scenario with the given dynamic flag.
             torch.compiler.reset()
 
             @nested_compile_region
             def gn(x):
+                # [FUNCTION DOC] HELPER: Region returning x plus one and the shape of x.
                 y = x + 1
                 z = x.shape
                 return y, z
 
             def fn(x):
+                # [FUNCTION DOC] HELPER: Calls the region twice, returns the sum of first
+                # outputs and the shape from the first call.
                 z0 = gn(x)
                 z1 = gn(x)
                 return z0[0] + z1[0], z0[1]
@@ -2562,15 +3023,21 @@ class GraphModule(torch.nn.Module):
 
     @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
     def test_different_symint(self):
+        # [FUNCTION DOC] The same region applied to a tensor and to a narrowed half of it
+        # (different symbolic sizes). First compiled with the default backend, then with the
+        # aot_eager recording backend, checking results match eager.
         """
         Tests check that the same subgraph called with different symints use different graphs
         """
 
         @nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Region returning sine.
             return torch.sin(x)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Applies the region, narrows dim 0 to half the size,
+            # applies again.
             a = gn(x)
             # Get first half of the tensor
             b = torch.narrow(a, 0, 0, a.size()[0] // 2)
@@ -2631,22 +3098,34 @@ class GraphModule(torch.nn.Module):
             )
 
     def test_autograd_function(self):
+        # [FUNCTION DOC] Region wrapping a custom autograd function, called twice. Checks
+        # results and gradients against eager under aot_eager, and (outside crossref) that the
+        # dynamo graph shares one subgraph that contains the autograd function apply op with
+        # forward and backward body modules.
         class CustomOp(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Autograd function saving its input; forward is sine, and
+            # backward returns the saved input times the cosine of the incoming gradient (not
+            # the true derivative, but consistent between eager and compiled runs).
             @staticmethod
             def forward(ctx, x):
+                # [FUNCTION DOC] HELPER: Saves x for backward and returns its sine.
                 ctx.save_for_backward(x)
                 return torch.sin(x)
 
             @staticmethod
             def backward(ctx, grad_out):
+                # [FUNCTION DOC] HELPER: Returns the saved input multiplied by the cosine
+                # of grad_out.
                 (x,) = ctx.saved_tensors
                 return x * torch.cos(grad_out)
 
         @nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Region applying the custom autograd function.
             return CustomOp.apply(x)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sums two region calls.
             return gn(x) + gn(x)
 
         backend = AotEagerAndRecordGraphs()
@@ -2713,6 +3192,10 @@ class GraphModule(torch.nn.Module):
 
     @requires_gpu
     def test_triton_kernel_native(self):
+        # [FUNCTION DOC] GPU test: a region launches the shared add Triton kernel into a zeroed
+        # buffer and returns its sine; the region is used twice. Checks the result against eager
+        # and the dynamo graph text (the note in the code says the two calls do not truly share
+        # one subgraph invocation because the constant args index changes).
         from torch.testing._internal.triton_utils import add_kernel
 
         def call_triton_add(
@@ -2723,9 +3206,16 @@ class GraphModule(torch.nn.Module):
             num=1,
             positional=False,
         ):
+            # [FUNCTION DOC] HELPER: Launches the add kernel on x and y writing into output,
+            # then returns output. The grid is a fixed tuple, a lambda over element count, or
+            # the nested grid function depending on grid_type (0, 1, other); block size is
+            # passed positionally or as a keyword depending on the positional flag.
             n_elements = output.numel()
 
             def grid_fn(meta):
+                # [FUNCTION DOC] HELPER: Grid function computing a one-element tuple, the
+                # ceiling division of the enclosing num argument by the block size taken from
+                # the metadata mapping.
                 return (triton.cdiv(num, meta["BLOCK_SIZE"]),)
 
             if grid_type == 0:
@@ -2744,11 +3234,15 @@ class GraphModule(torch.nn.Module):
 
         @nested_compile_region
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: Region: zeroed buffer like x, filled by the Triton add
+            # helper with a fixed grid, returns its sine.
             o = torch.zeros_like(x)
             call_triton_add(x, y, o, 0)
             return o.sin()
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Sine of both inputs, then the region applied twice
+            # chaining outputs.
             x = x.sin()
             y = y.sin()
             z = gn(x, y)
@@ -2803,11 +3297,16 @@ class GraphModule(torch.nn.Module):
 
     @torch._dynamo.config.patch(capture_dynamic_output_shape_ops=True)
     def test_unbacked_symbol(self):
+        # [FUNCTION DOC] Region whose output size depends on data (nonzero) with dynamic output
+        # shape capture enabled; compiled with aot_eager (inductor fails to lower this) and
+        # compared with eager.
         @nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Region returning the sine of the nonzero indices of x.
             return torch.sin(torch.nonzero(x))
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sums two region calls.
             return gn(x) + gn(x)
 
         x = torch.randn(64, 1, requires_grad=True)
@@ -2820,11 +3319,18 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(ref, res)
 
     def test_different_strides_in_backward(self):
+        # [FUNCTION DOC] Chain of region calls with a dynamic batch dimension and a sine between
+        # them. Checks compile (default backend) matches eager, then with aot_eager recording
+        # that values and gradients match and the forward and backward graphs match expected
+        # text, showing region calls reusing the same partitioned subgraph names.
         @nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Region returning cosine.
             return torch.cos(x)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Applies the region twice, sine, region twice more, and
+            # returns the sum of the sums of the last two region outputs.
             a = gn(x)
             a2 = gn(a)
             b = torch.sin(a2)
@@ -2943,12 +3449,17 @@ class GraphModule(torch.nn.Module):
             )
 
     def test_div(self):
+        # [FUNCTION DOC] Region computing an integer truncating division of constants and using
+        # it as a tensor shape; compiled result must equal eager.
         @nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Builds a ones tensor of shape 64 by the quotient and
+            # multiplies by the quotient and x.
             div = torch.div(1024, 256, rounding_mode="trunc")
             return div * torch.ones(64, div) * x
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Calls the region.
             return gn(x)
 
         x = torch.randn(64, 1, requires_grad=True)
@@ -2961,11 +3472,20 @@ class GraphModule(torch.nn.Module):
 
     @requires_gpu
     def test_preserves_strides(self):
+        # [FUNCTION DOC] GPU test that inductor preserves strides for region inputs. Installs a
+        # post-grad pass that rewrites permutes to force a channels-last layout through a
+        # temporary custom op, plus an add custom op whose meta returns a contiguous tensor.
+        # Checks compiled output equals eager and that the pass fired.
         class _CustomPass(PatternMatcherPass):
+            # [CLASS DOC] HELPER: Pattern matcher pass that applies its registered patterns to a
+            # graph when called.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Only runs the parent initializer.
                 super().__init__()
 
             def __call__(self, g: torch.fx.Graph):
+                # [FUNCTION DOC] HELPER: Applies the pass patterns to the graph g;
+                # returns nothing.
                 self.apply(g)
 
         g = _CustomPass()
@@ -2979,9 +3499,14 @@ class GraphModule(torch.nn.Module):
             pass_dict=g,
         )
         def _(match, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Pattern handler registered for permute calls. Flattens the
+            # match args, then replaces the match using an example function that applies permute
+            # followed by the force_channels_last custom op, and sets the enclosing called flag.
             flat_args, spec = pytree.tree_flatten((args, kwargs))
 
             def decomp(*flat_args):
+                # [FUNCTION DOC] HELPER: Unflattens the arguments, permutes, and passes the
+                # result through the force_channels_last custom op.
                 args, kwargs = pytree.tree_unflatten(flat_args, spec)
                 return torch.ops.mylib.force_channels_last(
                     torch.ops.aten.permute(*args, **kwargs)
@@ -3000,6 +3525,7 @@ class GraphModule(torch.nn.Module):
             )
 
             def impl2(x):
+                # [FUNCTION DOC] HELPER: Implementation returning a channels-last clone of x.
                 return x.clone(memory_format=torch.channels_last)
 
             lib.impl("force_channels_last", impl2, "CompositeExplicitAutograd")
@@ -3009,11 +3535,15 @@ class GraphModule(torch.nn.Module):
             )
 
             def impl(x, y):
+                # [FUNCTION DOC] HELPER: Implementation for the add custom op: clones y
+                # (contiguous strides) and adds the transpose of x on the last two dims.
                 out = y.clone()  # contiguous with strides (16, 4, 2, 1)
                 out.add_(x.transpose(-1, -2))
                 return out
 
             def meta(x, y):
+                # [FUNCTION DOC] HELPER: Meta implementation returning an empty contiguous
+                # tensor like y.
                 return torch.empty_like(y, memory_format=torch.contiguous_format)
 
             lib.impl("add_op", impl, "CompositeExplicitAutograd")
@@ -3021,9 +3551,12 @@ class GraphModule(torch.nn.Module):
 
             @nested_compile_region
             def gn(y, z):
+                # [FUNCTION DOC] HELPER: Region calling the add custom op.
                 return torch.ops.mylib.add_op.default(y, z)
 
             def f(x, other):
+                # [FUNCTION DOC] HELPER: Builds a transposed-contiguous-transposed y and a
+                # transposed sine z, and calls the region.
                 y = x.transpose(2, 3).contiguous().transpose(2, 3)
                 z = y.sin().transpose(2, 3)
                 return gn(y, z)
@@ -3037,16 +3570,25 @@ class GraphModule(torch.nn.Module):
 
     @requires_gpu
     def test_preserves_output_strides(self):
+        # [FUNCTION DOC] GPU test that the output strides of the region are preserved when a
+        # graph pass changes layouts. The add custom op implementation raises AssertionError if
+        # its input strides are not as expected. Compiled result must equal eager and the pass
+        # must fire.
         # Have a graph pass that changes strides for the output op of the
         # invoke_subgraph, and check if the output strides are preserved
         x = torch.randn(4, 4, 2, 2, device=GPU_TYPE)
         other = torch.randn(4, 4, 2, 2, device=GPU_TYPE)
 
         class _CustomPass(PatternMatcherPass):
+            # [CLASS DOC] HELPER: Pattern matcher pass that applies its registered patterns to a
+            # graph when called.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Only runs the parent initializer.
                 super().__init__()
 
             def __call__(self, g: torch.fx.Graph):
+                # [FUNCTION DOC] HELPER: Applies the pass patterns to the graph g;
+                # returns nothing.
                 self.apply(g)
 
         g = _CustomPass()
@@ -3057,9 +3599,14 @@ class GraphModule(torch.nn.Module):
             pass_dict=g,
         )
         def _(match, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Pattern handler registered for permute calls. Flattens the
+            # match args, then replaces the match using an example function that applies permute
+            # followed by the force_channels_last custom op, and sets the enclosing called flag.
             flat_args, spec = pytree.tree_flatten((args, kwargs))
 
             def decomp(*flat_args):
+                # [FUNCTION DOC] HELPER: Unflattens the arguments, permutes, and passes the
+                # result through the force_channels_last custom op.
                 args, kwargs = pytree.tree_unflatten(flat_args, spec)
                 return torch.ops.mylib.force_channels_last(
                     torch.ops.aten.permute(*args, **kwargs)
@@ -3078,6 +3625,7 @@ class GraphModule(torch.nn.Module):
             )
 
             def impl2(x):
+                # [FUNCTION DOC] HELPER: Implementation returning a channels-last clone of x.
                 return x.clone(memory_format=torch.channels_last)
 
             lib.impl("force_channels_last", impl2, "CompositeExplicitAutograd")
@@ -3087,6 +3635,9 @@ class GraphModule(torch.nn.Module):
             )
 
             def impl(x, y):
+                # [FUNCTION DOC] HELPER: Implementation for the add custom op. Raises
+                # AssertionError if the stride of x is not (16, 4, 1, 2) or of y not (16, 4, 2,
+                # 1); otherwise clones y and adds the transpose of x on the last two dims.
                 # Check that the input strides are preserved. This helps in
                 # testing that the HOP preserves the output strides.
                 if x.stride() != (16, 4, 1, 2):
@@ -3102,6 +3653,8 @@ class GraphModule(torch.nn.Module):
                 return out
 
             def meta(x, y):
+                # [FUNCTION DOC] HELPER: Meta implementation returning an empty contiguous
+                # tensor like y.
                 return torch.empty_like(y, memory_format=torch.contiguous_format)
 
             lib.impl("add_op", impl, "CompositeExplicitAutograd")
@@ -3109,11 +3662,16 @@ class GraphModule(torch.nn.Module):
 
             @nested_compile_region
             def gn(x, other):
+                # [FUNCTION DOC] HELPER: Region building y (transposed twice around a
+                # contiguous copy) and z (transposed sine of y), returning both. The other
+                # argument is unused.
                 y = x.transpose(2, 3).contiguous().transpose(2, 3)
                 z = y.sin().transpose(2, 3)
                 return y, z
 
             def f(x, other):
+                # [FUNCTION DOC] HELPER: Runs the region then applies the add custom op to its
+                # two outputs.
                 y, z = gn(x, other)
                 return torch.ops.mylib.add_op.default(y, z)
 
@@ -3125,18 +3683,26 @@ class GraphModule(torch.nn.Module):
                 self.assertTrue(called)
 
     def test_udf_output(self):
+        # [FUNCTION DOC] Region returning an instance of a user-defined class; outputs are
+        # flattened. Checks values and gradients under aot_eager and the dynamo graph text with
+        # one shared subgraph returning two tensors.
         class Foo:
+            # [CLASS DOC] HELPER: Plain holder class with two attributes a and b.
             def __init__(self, a, b):
+                # [FUNCTION DOC] HELPER: Stores the two arguments.
                 self.a = a
                 self.b = b
 
         @nested_compile_region
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: Region returning the holder of sine of x and cosine of y.
             a = torch.sin(x)
             b = torch.cos(y)
             return Foo(a, b)
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Calls the region twice (second on the first's a field) and
+            # adds the first b field and the second a field.
             foo1 = gn(x, y)
             foo2 = gn(foo1.a, y)
             return foo1.b + foo2.a  # + foo2.b
@@ -3190,18 +3756,27 @@ class GraphModule(torch.nn.Module):
             )
 
     def test_grad_accuracy_check(self):
+        # [FUNCTION DOC] Checks gradients when the region is called on a result of itself and
+        # the backward graph must be traced twice because tangent aliasing differs between
+        # calls. Compares values and gradients with eager and compares forward and backward
+        # graph text (blank lines normalized) to expected output.
         class Foo:
+            # [CLASS DOC] HELPER: Unused holder class with two attributes a and b.
             def __init__(self, a, b):
+                # [FUNCTION DOC] HELPER: Stores the two arguments.
                 self.a = a
                 self.b = b
 
         @nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Region returning the sine and cosine of x as a tuple.
             a = torch.sin(x)
             b = torch.cos(x)
             return (a, b)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Calls the region on x, then on the first output, and sums
+            # the second of the first and both of the second call.
             foo1 = gn(x)
             foo2 = gn(foo1[0])
             return foo1[1] + foo2[0] + foo2[1]
@@ -3297,18 +3872,27 @@ class GraphModule(torch.nn.Module):
         )
 
     def test_do_not_remove_used_output(self):
+        # [FUNCTION DOC] Nested regions: the outer region calls an inner region and returns all
+        # of its outputs, and the caller uses only some of the inner outputs directly. Exports
+        # via dynamo graph capture and checks the exported module matches eager (no output
+        # pruning mistakes).
         # Test that the ggn's outputs are not pruned.
 
         @nested_compile_region
         def ggn(x):
+            # [FUNCTION DOC] HELPER: Inner region returning max and argmax along dim 0.
             return torch.max(x, 0)
 
         @nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Outer region calling the inner one and returning its
+            # two results.
             a, b = ggn(x)
             return a, b
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Calls the inner region (keeping index) and the outer
+            # region; returns the index and both outer outputs.
             _, b = ggn(x)
             c, d = gn(x)
             return b, c, d
@@ -3323,18 +3907,26 @@ class GraphModule(torch.nn.Module):
 
     @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
     def test_remove_unused_output(self):
+        # [FUNCTION DOC] Same nested-region structure, but only the index outputs are used with
+        # single-use inlining off. After capture for export, the outer subgraph should return
+        # only the used output; matches eager and expected graph text outside crossref.
         # Test that the ggn's graph's output is pruned.
 
         @nested_compile_region
         def ggn(x):
+            # [FUNCTION DOC] HELPER: Inner region returning max and argmax along dim 0.
             return torch.max(x, 0)
 
         @nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Outer region calling the inner one and returning its
+            # two results.
             a, b = ggn(x)
             return a, b
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Calls the inner region and outer region and returns the
+            # two indices.
             _, b = ggn(x)
             _, d = gn(x)
             return b, d
@@ -3392,15 +3984,23 @@ class GraphModule(torch.nn.Module):
 
     @torch._dynamo.config.patch(trace_autograd_ops=True)
     def test_trace_autograd_ops_partitions_bw_invoke_subgraph(self):
+        # [FUNCTION DOC] With autograd op tracing enabled, a function that computes a gradient
+        # with the autograd API through a region called twice must give the same result as eager
+        # under aot_eager, and the forward graph text must show backward regions partitioned
+        # (expected text compared ignoring comments and blank lines).
         """
         Checks that the backward invoke_subgraphs have been partitioned.
         """
 
         @nested_compile_region
         def gn(x, w):
+            # [FUNCTION DOC] HELPER: Region computing a matrix product.
             return torch.matmul(x, w)
 
         def fn(x, w):
+            # [FUNCTION DOC] HELPER: Calls the region twice, sums the outputs, computes
+            # the gradient of the sum with respect to w, and returns the detached loss and
+            # the gradient.
             # Call gn twice so it doesn't get inlined as single-use
             out1 = gn(x, w)
             out2 = gn(x, w)
@@ -3471,14 +4071,21 @@ class <lambda>(torch.nn.Module):
         trace_autograd_ops=True, inline_single_use_invoke_subgraph=False
     )
     def test_trace_autograd_ops_with_activation_checkpointing(self):
+        # [FUNCTION DOC] With autograd op tracing and no single-use inlining, activation
+        # checkpoint bodies call a region inside; the function computes a gradient via the
+        # autograd API. Compiled with aot_eager; results must match eager.
         from torch.utils.checkpoint import checkpoint
 
         @nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Region computing x matrix-multiplied with itself.
             return torch.matmul(x, x)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Checkpoints the body twice, computes the gradient of the
+            # summed output with respect to x, and returns the detached loss and the gradient.
             def body(x):
+                # [FUNCTION DOC] HELPER: Checkpoint body: sine, region call, relu.
                 y = torch.sin(x)
                 z = gn(y)
                 return torch.relu(z)
@@ -3502,12 +4109,20 @@ _reuse_test_global = None
 
 @skipIfTorchDynamo("Not a torch._dynamo test")
 class TestInvokeSubgraphReuse(TestCase):
+    # [CLASS DOC] Tests that dynamo reuses an already traced subgraph for repeated calls of the
+    # same region instead of tracing again, by counting calls to the speculation function.
+    # Skipped under dynamo.
     @contextlib.contextmanager
     def _count_speculate_calls(self):
+        # [FUNCTION DOC] HELPER: Context manager patching the dynamo subgraph speculation
+        # function with a counting wrapper that forwards to the original. Yields a callable
+        # returning the current call count.
         count = 0
         orig = torch._dynamo.variables.higher_order_ops.speculate_subgraph_with_auto_output_flattening
 
         def _counting(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Counting wrapper: increments the enclosing count and
+            # forwards all arguments to the original function, returning its result.
             nonlocal count
             count += 1
             return orig(*args, **kwargs)
@@ -3520,11 +4135,15 @@ class TestInvokeSubgraphReuse(TestCase):
             yield lambda: count
 
     def test_subgraph_reuse_skips_tracing(self):
+        # [FUNCTION DOC] Calling one region three times with the same inputs compiles with
+        # exactly one speculation (trace) call.
         @nested_compile_region
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: Region multiplying its inputs.
             return torch.mul(x, y)
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Sums three region calls.
             a = gn(x, y)
             b = gn(x, y)
             c = gn(x, y)
@@ -3539,11 +4158,15 @@ class TestInvokeSubgraphReuse(TestCase):
         self.assertEqual(count(), 1)
 
     def test_subgraph_reuse_different_shapes(self):
+        # [FUNCTION DOC] Calling one region on inputs with different shapes needs two
+        # speculation calls; result must equal eager.
         @nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Region returning sine.
             return x.sin()
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Sums of the region applied to x and to y.
             a = gn(x)
             b = gn(y)
             return a.sum() + b.sum()
@@ -3559,18 +4182,24 @@ class TestInvokeSubgraphReuse(TestCase):
         self.assertEqual(res, fn(x, y))
 
     def test_subgraph_reuse_module(self):
+        # [FUNCTION DOC] Module forward region called twice with the same module: one
+        # speculation call; values and gradients must match eager.
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a constant and a region-decorated forward.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Stores the integer constant 5.
                 super().__init__()
                 self.c = 5
 
             @nested_compile_region
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the sine of the product plus the constant.
                 return torch.mul(x, y).sin() + self.c
 
         mod = Mod()
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Sums two module calls.
             return mod(x, y) + mod(x, y)
 
         x = torch.randn(8, requires_grad=True)
@@ -3595,19 +4224,27 @@ class TestInvokeSubgraphReuse(TestCase):
         self.assertEqual(y.grad, y_clone.grad)
 
     def test_subgraph_reuse_module_different_instances(self):
+        # [FUNCTION DOC] Two module instances of the same class with equal constants share a
+        # region trace: speculation runs once (source replacement), and values and gradients
+        # match eager under aot_eager.
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module storing a constructor-supplied constant used by its
+            # region-decorated forward.
             def __init__(self, c):
+                # [FUNCTION DOC] HELPER: Stores the constant c as an attribute.
                 super().__init__()
                 self.c = c
 
             @nested_compile_region
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the sine of the product plus the constant.
                 return torch.mul(x, y).sin() + self.c
 
         mod1 = Mod(5)
         mod2 = Mod(5)
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Sums the outputs of the two module instances.
             return mod1(x, y) + mod2(x, y)
 
         x = torch.randn(8, requires_grad=True)
@@ -3633,11 +4270,16 @@ class TestInvokeSubgraphReuse(TestCase):
         self.assertEqual(y.grad, y_clone.grad)
 
     def test_subgraph_reuse_tuple_output(self):
+        # [FUNCTION DOC] A region returning a tuple of two tensors, called twice with the same
+        # inputs: one speculation call; values and gradients (backward through the sums of all
+        # outputs) match eager.
         @nested_compile_region
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: Region returning sine of x and cosine of y.
             return torch.sin(x), torch.cos(y)
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Calls the region twice and adds the matching outputs.
             a1, a2 = gn(x, y)
             b1, b2 = gn(x, y)
             return a1 + b1, a2 + b2
@@ -3665,20 +4307,29 @@ class TestInvokeSubgraphReuse(TestCase):
         self.assertEqual(y.grad, y_clone.grad)
 
     def test_subgraph_reuse_mutated_attribute(self):
+        # [FUNCTION DOC] The module attribute read by the region is changed between two calls (5
+        # then 10). Reuse must be skipped: result equals fifteen times x as in eager, and
+        # speculation runs twice.
         """Reuse must be skipped when a captured attribute is mutated between calls."""
 
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with an integer attribute used by its region-
+            # decorated forward.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Sets the attribute to 5.
                 super().__init__()
                 self.c = 5
 
             @nested_compile_region
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns x scaled by the attribute.
                 return x * self.c
 
         mod = Mod()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Calls the module, sets the attribute to 10, calls again,
+            # and sums.
             a = mod(x)
             mod.c = 10
             b = mod(x)
@@ -3701,22 +4352,30 @@ class TestInvokeSubgraphReuse(TestCase):
         self.assertEqual(count(), 2)
 
     def test_subgraph_reuse_unrelated_attr_mutation(self):
+        # [FUNCTION DOC] An attribute not read by the region is mutated between calls; reuse
+        # must still happen (one speculation call) and the result equals ten times x.
         """Reuse should still fire when a different attribute is mutated."""
 
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with attributes c and d; its region forward reads
+            # only c.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Sets c to 5 and d to 100.
                 super().__init__()
                 self.c = 5
                 self.d = 100
 
             @nested_compile_region
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns x scaled by attribute c.
                 # Only reads self.c, never self.d
                 return x * self.c
 
         mod = Mod()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Calls the module, sets the unrelated attribute d, calls
+            # again, sums.
             a = mod(x)
             mod.d = 999  # unrelated attribute
             b = mod(x)
@@ -3735,6 +4394,10 @@ class TestInvokeSubgraphReuse(TestCase):
         self.assertEqual(count(), 1)
 
     def test_subgraph_reuse_same_class_attr_mutated(self):
+        # [FUNCTION DOC] Two instances of one class start with equal constants; the second
+        # instance's constant is mutated between the calls. Reuse via source replacement
+        # must be rejected: eager gives fifteen times x and compiled matches, with two
+        # speculation calls.
         """Reuse must be skipped when a captured attr changes between calls.
 
         submod1 and submod2 are instances of the same class with the same
@@ -3744,18 +4407,24 @@ class TestInvokeSubgraphReuse(TestCase):
         """
 
         class Block(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a constructor-supplied constant used by its
+            # region forward.
             def __init__(self, c):
+                # [FUNCTION DOC] HELPER: Stores the constant c.
                 super().__init__()
                 self.c = c
 
             @nested_compile_region
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns x scaled by the constant.
                 return x * self.c
 
         submod1 = Block(5)
         submod2 = Block(5)  # same initial .c as submod1
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Calls the first block, mutates the second block's constant
+            # to 10, calls the second block, and sums.
             a = submod1(x)  # traces with c=5
             submod2.c = 10  # mutate submod2.c
             b = submod2(x)  # must NOT reuse the c=5 subgraph
@@ -3774,6 +4443,9 @@ class TestInvokeSubgraphReuse(TestCase):
         self.assertEqual(count(), 2)
 
     def test_subgraph_reuse_pre_existing_attr_guard(self):
+        # [FUNCTION DOC] A condition on a module attribute installs a guard before the region
+        # trace snapshots guards. Reuse must still be rejected when a different module with a
+        # different constant is used: result equals 5x plus 10x and speculation runs twice.
         """Guards installed before the subgraph trace must still block incorrect reuse.
 
         If ``block.c`` is read in a conditional before the nested compile region,
@@ -3783,18 +4455,25 @@ class TestInvokeSubgraphReuse(TestCase):
         """
 
         class Block(torch.nn.Module):
+            # [CLASS DOC] HELPER: Plain module holding a constructor-supplied constant c.
             def __init__(self, c):
+                # [FUNCTION DOC] HELPER: Stores the constant c.
                 super().__init__()
                 self.c = c
 
         @nested_compile_region
         def apply_block(mod, x):
+            # [FUNCTION DOC] HELPER: Region taking a module and a tensor and returning x scaled
+            # by mod.c.
             return x * mod.c
 
         block1 = Block(5)
         block2 = Block(10)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: For each of two blocks, applies the region if the block's
+            # constant has the expected value (5 and 10), otherwise passes x through; returns
+            # the sum.
             # The conditional installs EQUALS_MATCH on block1.c *before*
             # the subgraph trace snapshots guards_before.
             if block1.c == 5:
@@ -3818,20 +4497,27 @@ class TestInvokeSubgraphReuse(TestCase):
         self.assertEqual(count(), 2)
 
     def test_subgraph_reuse_mutated_captured_variable(self):
+        # [FUNCTION DOC] A region reads a closure-captured object whose field is mutated between
+        # two calls. Reuse must be skipped: eager gives fifteen times x, compiled matches, and
+        # speculation runs twice.
         """Reuse must be skipped when a captured (non-input) variable is mutated."""
 
         class Config:
+            # [CLASS DOC] HELPER: Simple object holding a mutable field c.
             def __init__(self, c):
+                # [FUNCTION DOC] HELPER: Stores c.
                 self.c = c
 
         cfg = Config(5)
 
         @nested_compile_region
         def apply(x):
+            # [FUNCTION DOC] HELPER: Region returning x scaled by the captured config field c.
             # cfg is captured from closure, not an explicit input
             return x * cfg.c
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Calls the region, sets c to 10, calls again, and sums.
             a = apply(x)
             cfg.c = 10
             b = apply(x)
@@ -3850,6 +4536,10 @@ class TestInvokeSubgraphReuse(TestCase):
         self.assertEqual(count(), 2)
 
     def test_subgraph_reuse_synthetic_source(self):
+        # [FUNCTION DOC] Reuse with a hoisted opaque value (synthetic local source): a
+        # region applying a string-parameterized custom op twice must reuse the first trace
+        # (one speculation call) and match eager. Imports helpers from the opaque object v2
+        # test module.
         """Reuse must handle CustomClassObjectVariable with SyntheticLocalSource.
 
         Hoisted opaque value types get a SyntheticLocalSource that can't be
@@ -3860,9 +4550,12 @@ class TestInvokeSubgraphReuse(TestCase):
 
         @nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Region applying the string op to x with a hoisted
+            # string "double".
             return op_with_string(x, HoistedString("double"))
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sums two region calls.
             a = gn(x)
             b = gn(x)
             return a + b
@@ -3877,26 +4570,39 @@ class TestInvokeSubgraphReuse(TestCase):
         self.assertEqual(count(), 1)
 
     def test_subgraph_reuse_synthetic_source_different_args(self):
+        # [FUNCTION DOC] Three layers whose regions build hoisted string objects from a name
+        # attribute (double, square, double). Compiles with the eager recording backend; expects
+        # matching results, a single speculation call, one dynamo graph, and expected printed
+        # graph text with one shared subgraph taking separate synthetic inputs.
         """Reuse when hoisted opaque ctor args differ across submodules."""
         from test_opaque_obj_v2 import HoistedString, op_with_string
 
         class Layer(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a name attribute; its region forward applies the
+            # string op with a hoisted string built from the name.
             def __init__(self, name):
+                # [FUNCTION DOC] HELPER: Stores the name.
                 super().__init__()
                 self.name = name
 
             @nested_compile_region
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the string custom op with a hoisted string made
+                # from the name.
                 return op_with_string(x, HoistedString(self.name))
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Model chaining three Layer instances named double,
+            # square, double.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the three layers.
                 super().__init__()
                 self.layer0 = Layer("double")
                 self.layer1 = Layer("square")
                 self.layer2 = Layer("double")
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the three layers in sequence.
                 x = self.layer0(x)
                 x = self.layer1(x)
                 x = self.layer2(x)
@@ -3946,6 +4652,9 @@ class GraphModule(torch.nn.Module):
             )
 
     def test_subgraph_reuse_symint_arg(self):
+        # [FUNCTION DOC] With dynamic shapes, a symbolic size passed as an argument across two
+        # region calls must be matched by expression not identity: one speculation call. A
+        # second run with a different batch size must give the eager result.
         """A symint arg must match on its expression, not on object identity.
 
         Each tensor holds its own SymInt objects, so the same symbol threaded
@@ -3954,9 +4663,12 @@ class GraphModule(torch.nn.Module):
 
         @nested_compile_region
         def gn(x, n):
+            # [FUNCTION DOC] HELPER: Region multiplying x by the integer n.
             return x * n
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Calls the region with the first dim size, then with the
+            # result's size.
             a = gn(x, x.shape[0])
             b = gn(a, a.shape[0])
             return b
@@ -3975,6 +4687,9 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(fn(x2), compiled(x2))
 
     def test_subgraph_reuse_transposed_buffer_dynamic(self):
+        # [FUNCTION DOC] Layers whose region reads a transposed view of a buffer, compiled with
+        # dynamic shapes. Checks one speculation call, matching results, no recompile for a new
+        # batch size (one dynamo graph), and expected printed graph text.
         """Reuse must work when a region reads a transposed view of a buffer.
 
         `w.T` is desugared into an aten op traced into the subgraph, so the
@@ -3983,20 +4698,27 @@ class GraphModule(torch.nn.Module):
         """
 
         class Layer(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a square random buffer w whose region forward
+            # multiplies the input by w transposed.
             def __init__(self, d):
+                # [FUNCTION DOC] HELPER: Registers a random buffer of shape d by d.
                 super().__init__()
                 self.register_buffer("w", torch.randn(d, d))
 
             @nested_compile_region
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Matrix-multiplies x with the transposed buffer.
                 return torch.matmul(x, self.w.T)
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Container holding a module list of n Layer instances.
             def __init__(self, d, n):
+                # [FUNCTION DOC] HELPER: Builds n layers of width d.
                 super().__init__()
                 self.layers = torch.nn.ModuleList([Layer(d) for _ in range(n)])
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies each layer in order.
                 for layer in self.layers:
                     x = layer(x)
                 return x
@@ -4049,6 +4771,9 @@ class GraphModule(torch.nn.Module):
             )
 
     def test_subgraph_reuse_different_list_lengths(self):
+        # [FUNCTION DOC] Two region calls with list arguments of lengths two and three: the
+        # pytree structures differ so reuse is rejected and two speculation calls occur; outputs
+        # match eager.
         """Reuse must be skipped when list args have different lengths.
 
         The first call passes lists of length 2; the second passes lists of
@@ -4058,9 +4783,13 @@ class GraphModule(torch.nn.Module):
 
         @nested_compile_region
         def gn(xs, ys):
+            # [FUNCTION DOC] HELPER: Region adding corresponding list items and returning
+            # a list.
             return [a + b for a, b in zip(xs, ys)]
 
         def fn(xs1, ys1, xs2, ys2):
+            # [FUNCTION DOC] HELPER: Calls the region on two argument list pairs and returns
+            # both results.
             a = gn(xs1, ys1)
             b = gn(xs2, ys2)
             return a, b
@@ -4084,6 +4813,10 @@ class GraphModule(torch.nn.Module):
                 self.assertEqual(ri, ei)
 
     def _cleanup_pytree_registration(self, cls):
+        # [FUNCTION DOC] HELPER: Removes the given class from the pytree supported node,
+        # serialized type and constant node registries directly (the public deregister
+        # call fails for classes registered without a serialized type name). Missing
+        # entries are ignored.
         # _deregister_pytree_node raises KeyError for classes registered
         # without serialized_type_name (they share a sentinel key in
         # SERIALIZED_TYPE_TO_PYTHON_TYPE), so pop the registries directly
@@ -4093,6 +4826,9 @@ class GraphModule(torch.nn.Module):
         pytree.CONSTANT_NODES.discard(cls)
 
     def test_subgraph_reuse_dataclass_pytree_arg(self):
+        # [FUNCTION DOC] A registered pytree dataclass wrapping a tensor is the region argument,
+        # called four times in a loop: one speculation call and a result equal to eager. This
+        # guards fingerprint correctness. The dataclass registration is removed at cleanup.
         """Reuse must work for args that are registered pytree dataclasses.
 
         Fingerprinting such args goes through the pytree-flatten path of
@@ -4111,6 +4847,7 @@ class GraphModule(torch.nn.Module):
 
         @dataclasses.dataclass
         class RegionInput:
+            # [CLASS DOC] HELPER: Dataclass holding one tensor field named hidden.
             hidden: torch.Tensor
 
         pytree.register_pytree_node(
@@ -4122,9 +4859,12 @@ class GraphModule(torch.nn.Module):
 
         @nested_compile_region
         def gn(inp):
+            # [FUNCTION DOC] HELPER: Region returning the sine of the wrapped tensor.
             return inp.hidden.sin()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Wraps the running value in the dataclass and applies the
+            # region four times.
             out = x
             for _ in range(4):
                 out = gn(RegionInput(out))
@@ -4141,6 +4881,11 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(ref, res)
 
     def test_subgraph_reuse_pytree_avoids_retracing_tree_flatten(self):
+        # [FUNCTION DOC] Regression test for a compile-time blowup: the input fingerprinting
+        # must not inline the generic tree flatten function on each lookup. Patches the inlining
+        # helper of the invoke_subgraph variable module with a recorder; checks one speculation
+        # call, that the dataclass's own flatten function was inlined, and that the generic tree
+        # flatten was not.
         """Regression test for the #191809 compile-time blowup.
 
         build_input_fingerprint used to call
@@ -4156,10 +4901,13 @@ class GraphModule(torch.nn.Module):
         from torch._dynamo.variables import invoke_subgraph as invoke_subgraph_mod
 
         def flatten_fn(value):
+            # [FUNCTION DOC] HELPER: Pytree flatten function for the dataclass: returns the one-
+            # item child list and no context.
             return ([value.hidden], None)
 
         @dataclasses.dataclass
         class RegionInput:
+            # [CLASS DOC] HELPER: Dataclass holding one tensor field named hidden.
             hidden: torch.Tensor
 
         pytree.register_pytree_node(
@@ -4169,9 +4917,11 @@ class GraphModule(torch.nn.Module):
 
         @nested_compile_region
         def gn(inp):
+            # [FUNCTION DOC] HELPER: Region returning the sine of the wrapped tensor.
             return inp.hidden.sin()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Wraps the running value and applies the region eight times.
             out = x
             for _ in range(8):
                 out = gn(RegionInput(out))
@@ -4183,6 +4933,8 @@ class GraphModule(torch.nn.Module):
         inlined_fns = []
 
         def _tracking_make_inlined(tx, f):
+            # [FUNCTION DOC] HELPER: Recording wrapper for the inlining helper: appends the
+            # function to the enclosing list and forwards to the original helper.
             inlined_fns.append(f)
             return orig_make_inlined(tx, f)
 
@@ -4207,6 +4959,9 @@ class GraphModule(torch.nn.Module):
         self.assertNotIn(pytree.tree_flatten, inlined_fns)
 
     def test_subgraph_reuse_pytree_partial_flatten_fn(self):
+        # [FUNCTION DOC] The flatten function registered for the dataclass is a partial object
+        # rather than a plain function; compilation with full graph must not graph-break and the
+        # result must equal eager.
         """flatten_fn need not be a plain function -- e.g. functools.partial.
 
         _make_inlined only supports plain Python functions (it always wraps
@@ -4219,9 +4974,12 @@ class GraphModule(torch.nn.Module):
 
         @dataclasses.dataclass
         class RegionInput:
+            # [CLASS DOC] HELPER: Dataclass holding one tensor field named hidden.
             hidden: torch.Tensor
 
         def _flatten_impl(config_flag, value):
+            # [FUNCTION DOC] HELPER: Flatten implementation taking a flag first: returns the
+            # one-item child list and the flag as context.
             return ([value.hidden], config_flag)
 
         pytree.register_pytree_node(
@@ -4233,9 +4991,11 @@ class GraphModule(torch.nn.Module):
 
         @nested_compile_region
         def gn(inp):
+            # [FUNCTION DOC] HELPER: Region returning the cosine of the wrapped tensor.
             return inp.hidden.cos()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Wraps the running value and applies the region four times.
             out = x
             for _ in range(4):
                 out = gn(RegionInput(out))
@@ -4250,6 +5010,8 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(ref, res)
 
     def test_subgraph_reuse_namedtuple_arg(self):
+        # [FUNCTION DOC] A plain namedtuple argument must be fingerprinted as a pytree node
+        # (shared registry key normalization): one speculation call and the result equals eager.
         """Reuse must work for args that are plain namedtuples.
 
         All namedtuple types are implicitly registered as pytree nodes under
@@ -4265,9 +5027,12 @@ class GraphModule(torch.nn.Module):
 
         @nested_compile_region
         def gn(inp):
+            # [FUNCTION DOC] HELPER: Region returning the sine of the namedtuple field.
             return inp.hidden.sin()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Wraps the running value in the namedtuple and applies the
+            # region four times.
             out = x
             for _ in range(4):
                 out = gn(RegionInput(out))
@@ -4283,6 +5048,9 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(ref, res)
 
     def test_subgraph_reuse_two_distinct_namedtuple_types(self):
+        # [FUNCTION DOC] Two distinct namedtuple types with the same field name must not be
+        # treated as the same structure. Region called with the first type, the second type,
+        # then the first type again: exactly two speculation calls, results equal eager.
         """Two different namedtuple types must not be conflated by reuse.
 
         Both types normalize to the same registry key (collections.
@@ -4297,9 +5065,12 @@ class GraphModule(torch.nn.Module):
 
         @nested_compile_region
         def gn(inp):
+            # [FUNCTION DOC] HELPER: Region returning the sine of the namedtuple field.
             return inp.hidden.sin()
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Calls the region with each type and returns the
+            # three results.
             a = gn(Left(x))
             b = gn(Right(y))
             # A second Left(...) call should hit the cache from the first,
@@ -4322,6 +5093,9 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(ref, res)
 
     def test_subgraph_reuse_dataclass_pytree_kwarg(self):
+        # [FUNCTION DOC] A registered pytree dataclass passed as a keyword argument is
+        # fingerprinted through the pytree path: one speculation call and the result
+        # equals eager.
         """Reuse must work for pytree dataclasses passed as kwargs.
 
         build_input_fingerprint's fast path only applies when there are no
@@ -4333,6 +5107,7 @@ class GraphModule(torch.nn.Module):
 
         @dataclasses.dataclass
         class RegionInput:
+            # [CLASS DOC] HELPER: Dataclass holding one tensor field named hidden.
             hidden: torch.Tensor
 
         pytree.register_pytree_node(
@@ -4344,9 +5119,13 @@ class GraphModule(torch.nn.Module):
 
         @nested_compile_region
         def gn(*, inp):
+            # [FUNCTION DOC] HELPER: Region with a keyword-only argument returning the sine of
+            # the field.
             return inp.hidden.sin()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Wraps the running value and applies the region by keyword
+            # four times.
             out = x
             for _ in range(4):
                 out = gn(inp=RegionInput(out))
@@ -4362,6 +5141,9 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(ref, res)
 
     def test_subgraph_reuse_nested_pytree_arg(self):
+        # [FUNCTION DOC] Nested pytree argument (a mapping holding a tensor and a tuple of a
+        # tensor and a registered dataclass) across four calls: one speculation call and the
+        # result equals eager.
         """Reuse must work for multi-level nested pytree structures.
 
         Exercises the recursive `flatten(child)` call for a dict containing
@@ -4372,6 +5154,7 @@ class GraphModule(torch.nn.Module):
 
         @dataclasses.dataclass
         class Wrapper:
+            # [CLASS DOC] HELPER: Dataclass holding one tensor field named hidden.
             hidden: torch.Tensor
 
         pytree.register_pytree_node(
@@ -4383,10 +5166,14 @@ class GraphModule(torch.nn.Module):
 
         @nested_compile_region
         def gn(d):
+            # [FUNCTION DOC] HELPER: Region unpacking the mapping and returning sine of a plus
+            # cosine of the tuple's tensor plus relu of the wrapped tensor.
             b_tensor, wrapper = d["b"]
             return d["a"].sin() + b_tensor.cos() + wrapper.hidden.relu()
 
         def fn(x, y, z):
+            # [FUNCTION DOC] HELPER: Builds the nested argument from the running value and the
+            # two other tensors and applies the region four times.
             out = x
             for _ in range(4):
                 out = gn({"a": out, "b": (y, Wrapper(z))})
@@ -4402,6 +5189,9 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(ref, res)
 
     def test_subgraph_reuse_pytree_unsupported_leaf(self):
+        # [FUNCTION DOC] A region argument holding an object created during tracing (no source,
+        # no guards) cannot be fingerprinted, so reuse is disabled: speculation runs four times
+        # and the result still equals eager.
         """An arg containing an opaque/unregistered object must not crash.
 
         build_input_fingerprint's has_unknown flag is set instead, which
@@ -4412,15 +5202,21 @@ class GraphModule(torch.nn.Module):
         """
 
         class Opaque:
+            # [CLASS DOC] HELPER: Opaque plain object holding a value v.
             def __init__(self, v):
+                # [FUNCTION DOC] HELPER: Stores v.
                 self.v = v
 
         @nested_compile_region
         def gn(pair):
+            # [FUNCTION DOC] HELPER: Region unpacking the pair and returning the sine of
+            # the tensor.
             t, _opaque = pair
             return t.sin()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Pairs the running value with a new opaque object each of
+            # four iterations.
             out = x
             for _ in range(4):
                 out = gn((out, Opaque(1)))
@@ -4438,6 +5234,8 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(ref, res)
 
     def test_subgraph_reuse_pytree_sourceful_object_leaf(self):
+        # [FUNCTION DOC] An opaque object that comes from an input (has a source) is a reusable
+        # leaf: one speculation call and the result equals eager.
         """An opaque object with a source is a reusable leaf inside a pytree.
 
         classify_vt tags it InputTag.OBJECT and reuse safety comes from
@@ -4446,15 +5244,21 @@ class GraphModule(torch.nn.Module):
         """
 
         class Opaque:
+            # [CLASS DOC] HELPER: Opaque plain object holding a value v.
             def __init__(self, v):
+                # [FUNCTION DOC] HELPER: Stores v.
                 self.v = v
 
         @nested_compile_region
         def gn(pair):
+            # [FUNCTION DOC] HELPER: Region unpacking the pair and returning the sine of
+            # the tensor.
             t, _opaque = pair
             return t.sin()
 
         def fn(pair):
+            # [FUNCTION DOC] HELPER: Applies the region four times pairing the running value
+            # with the object from the input pair.
             out = pair[0]
             for _ in range(4):
                 out = gn((out, pair[1]))
@@ -4471,6 +5275,9 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(ref, res)
 
     def test_subgraph_reuse_pytree_registry_change_stays_correct(self):
+        # [FUNCTION DOC] After compiling with a registered dataclass, the pytree registration is
+        # removed and the already compiled function is called with a new input; results must
+        # still equal eager.
         """Correctness must hold even if the pytree registry changes
         between calls to an already-compiled function.
 
@@ -4488,6 +5295,7 @@ class GraphModule(torch.nn.Module):
 
         @dataclasses.dataclass
         class RegionInput:
+            # [CLASS DOC] HELPER: Dataclass holding one tensor field named hidden.
             hidden: torch.Tensor
 
         pytree.register_pytree_node(
@@ -4499,9 +5307,11 @@ class GraphModule(torch.nn.Module):
 
         @nested_compile_region
         def gn(inp):
+            # [FUNCTION DOC] HELPER: Region returning the sine of the wrapped tensor.
             return inp.hidden.sin()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Wraps the running value and applies the region four times.
             out = x
             for _ in range(4):
                 out = gn(RegionInput(out))
@@ -4523,6 +5333,8 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(ref2, compiled(x2))
 
     def test_subgraph_reuse_different_constants_retrace(self):
+        # [FUNCTION DOC] Calling a region with three different scalar constants requires three
+        # separate traces (three speculation calls) and the outputs equal eager.
         """Constant args with different values each require a fresh trace.
 
         Three calls with three distinct scalar constants → call_count == 3.
@@ -4530,9 +5342,12 @@ class GraphModule(torch.nn.Module):
 
         @nested_compile_region
         def gn(x, scale):
+            # [FUNCTION DOC] HELPER: Region multiplying x by the scale.
             return x * scale
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Calls the region with scale 1, 2, and 3 and returns the
+            # three results.
             a = gn(x, 1)
             b = gn(x, 2)
             c = gn(x, 3)
@@ -4550,25 +5365,40 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(count(), 3)
 
     def test_subgraph_reuse_tuple_destructure_with_intermediates(self):
+        # [FUNCTION DOC] Model of three layers whose region forward returns a hidden state and a
+        # new residual (tuple destructured by the caller, with intermediates). All layers see
+        # tensors with identical metadata after the embedding, so layers two and three reuse the
+        # first trace: one speculation call, and both outputs equal eager.
         class Layer(torch.nn.Module):
+            # [CLASS DOC] HELPER: Bias-free linear layer with a region-decorated forward
+            # returning the hidden state and half of it as a new residual.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the 8 by 8 bias-free linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(8, 8, bias=False)
 
             @nested_compile_region
             def forward(self, x, residual):
+                # [FUNCTION DOC] HELPER: Applies the linear layer, adds the residual, and
+                # returns the result together with half of it.
                 h = self.linear(x)
                 h = h + residual
                 new_residual = h * 0.5
                 return h, new_residual
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Model with an embedding linear layer followed by a list
+            # of layers.
             def __init__(self, num_layers):
+                # [FUNCTION DOC] HELPER: Creates the embedding layer and the requested number
+                # of layers.
                 super().__init__()
                 self.embed = torch.nn.Linear(8, 8, bias=False)
                 self.layers = torch.nn.ModuleList([Layer() for _ in range(num_layers)])
 
             def forward(self, x, residual):
+                # [FUNCTION DOC] HELPER: Embeds both inputs, then threads hidden state and
+                # residual through each layer; returns the final pair.
                 # embed gives x/residual requires_grad=True (same as layer outputs),
                 # so all layers see identical tensor metadata → single trace suffices.
                 x = self.embed(x)
@@ -4597,11 +5427,16 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(count(), 1)
 
     def test_subgraph_reuse_different_dynamic_symnodes(self):
+        # [FUNCTION DOC] With dynamic shapes, the same region receives two different symbolic
+        # sizes (dim 0 then dim 1 of the input) as arguments. They must be treated as distinct,
+        # so two speculation calls occur; outputs equal eager.
         @nested_compile_region
         def gn(x, n):
+            # [FUNCTION DOC] HELPER: Region multiplying x by n.
             return x * n
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Calls the region with each of the two dimension sizes.
             a = gn(x, x.shape[0])
             b = gn(x, x.shape[1])
             return a, b
@@ -4618,11 +5453,15 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(count(), 2)
 
     def test_subgraph_reuse_cache_multiple_entries(self):
+        # [FUNCTION DOC] Region called with shapes four, eight, four: the third call reuses the
+        # first cache entry, so two speculation calls; outputs equal eager.
         @nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Region returning sine.
             return x.sin()
 
         def fn(x4, x8, x4_again):
+            # [FUNCTION DOC] HELPER: Applies the region to each of the three inputs.
             a = gn(x4)
             b = gn(x8)
             c = gn(x4_again)
@@ -4643,11 +5482,15 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(count(), 2)
 
     def test_subgraph_reuse_kwargs(self):
+        # [FUNCTION DOC] Region with a keyword-only scale called twice with the same keyword
+        # value: one speculation call and the result equals eager.
         @nested_compile_region
         def gn(x, *, scale=1.0):
+            # [FUNCTION DOC] HELPER: Region scaling x by the keyword-only scale (default 1.0).
             return x * scale
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sums two calls with scale 2.0.
             a = gn(x, scale=2.0)
             b = gn(x, scale=2.0)
             return a + b
@@ -4662,13 +5505,18 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(count(), 1)
 
     def test_subgraph_reuse_max_entries_raises(self):
+        # [FUNCTION DOC] A region created with a maximum of two reuse entries is called with
+        # three distinct constants; compilation must raise RuntimeError saying the maximum reuse
+        # entries were exceeded.
         """Exceeding max_reuse_entries raises RuntimeError."""
 
         @nested_compile_region(max_reuse_entries=2)
         def gn(x, c):
+            # [FUNCTION DOC] HELPER: Region multiplying x by the constant c.
             return x * c
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sums the region called with constants 1, 2, and 3.
             # Three distinct constants exceed the limit of 2
             return gn(x, 1) + gn(x, 2) + gn(x, 3)
 
@@ -4677,19 +5525,27 @@ class GraphModule(torch.nn.Module):
             torch.compile(fn, backend="aot_eager", fullgraph=True)(x)
 
     def test_subgraph_reuse_enum_arg(self):
+        # [FUNCTION DOC] Enum arguments reuse like constants. For each of the two members
+        # the region is compiled afresh with one speculation call and eager-equal results.
+        # A function using both members in one trace needs two speculation calls (members
+        # not shared).
         """Enum members are UserDefinedObjectVariable but reuse like constants."""
 
         class Mode(enum.IntEnum):
+            # [CLASS DOC] HELPER: Integer enum with members ADD (1) and SUB (2).
             ADD = 1
             SUB = 2
 
         @nested_compile_region
         def gn(x, mode):
+            # [FUNCTION DOC] HELPER: Region returning the sine of x when mode is ADD, else
+            # the cosine.
             if mode == Mode.ADD:
                 return x.sin()
             return x.cos()
 
         def fn(x, mode):
+            # [FUNCTION DOC] HELPER: Sums two region calls with the same mode.
             return gn(x, mode) + gn(x, mode)
 
         x = torch.randn(8)
@@ -4702,6 +5558,7 @@ class GraphModule(torch.nn.Module):
 
         # Distinct enum members must not share a traced subgraph.
         def fn2(x):
+            # [FUNCTION DOC] HELPER: Sums the region called with ADD and with SUB.
             return gn(x, Mode.ADD) + gn(x, Mode.SUB)
 
         torch._dynamo.reset()
@@ -4711,6 +5568,10 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(count(), 2)
 
     def test_subgraph_reuse_constant_equal_but_different_type(self):
+        # [FUNCTION DOC] Constants that compare equal but differ in type (an integer enum member
+        # vs a plain int; a bool vs an int) must not share a trace because type checks inside
+        # the region differ. For two functions, each compiled afresh, two speculation calls
+        # occur and results equal eager.
         """Constants that compare equal but differ in type must not be reused.
 
         Mode.ADD == 1 and True == 1, yet an isinstance() check inside the
@@ -4718,14 +5579,18 @@ class GraphModule(torch.nn.Module):
         """
 
         class Mode(enum.IntEnum):
+            # [CLASS DOC] HELPER: Integer enum with one member ADD (1).
             ADD = 1
 
         @nested_compile_region
         def gn(x, c):
+            # [FUNCTION DOC] HELPER: Region: sine if the constant is an instance of the enum,
+            # else cosine.
             return x.sin() if isinstance(c, Mode) else x.cos()
 
         @nested_compile_region
         def hn(x, c):
+            # [FUNCTION DOC] HELPER: Region: sine if the constant is a bool, else cosine.
             return x.sin() if isinstance(c, bool) else x.cos()
 
         x = torch.randn(8)
@@ -4741,17 +5606,25 @@ class GraphModule(torch.nn.Module):
             self.assertEqual(count(), 2)
 
     def test_subgraph_reuse_user_defined_object_arg(self):
+        # [FUNCTION DOC] A sourceful user-defined object argument is reusable through guards on
+        # its source. One object called twice: one speculation call. Two objects with matching
+        # attribute metadata: one call. A second object whose tensor attribute has a different
+        # shape: two calls. Results equal eager in each case.
         """A sourceful user-defined object arg reuses via guards on its source."""
 
         class Batch:
+            # [CLASS DOC] HELPER: Plain holder with a delta attribute.
             def __init__(self, delta):
+                # [FUNCTION DOC] HELPER: Stores delta.
                 self.delta = delta
 
         @nested_compile_region
         def gn(x, batch):
+            # [FUNCTION DOC] HELPER: Region returning sine of x plus the object's delta.
             return x.sin() + batch.delta
 
         def fn(x, batch):
+            # [FUNCTION DOC] HELPER: Sums two region calls on the same object.
             return gn(x, batch) + gn(x, batch)
 
         x = torch.randn(8)
@@ -4764,6 +5637,7 @@ class GraphModule(torch.nn.Module):
         # Two distinct objects with matching attribute metadata: the guards on
         # b1's source are re-evaluated against b2's, so this is reusable.
         def fn3(x, b1, b2):
+            # [FUNCTION DOC] HELPER: Sums region calls on two different objects.
             return gn(x, b1) + gn(x, b2)
 
         torch._dynamo.reset()
@@ -4777,6 +5651,7 @@ class GraphModule(torch.nn.Module):
 
         # An attribute whose tensor metadata differs must not be reused.
         def fn2(x, b1, b2):
+            # [FUNCTION DOC] HELPER: Sums region calls on two different objects.
             return gn(x, b1) + gn(x, b2)
 
         torch._dynamo.reset()
@@ -4787,17 +5662,23 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(count(), 2)
 
     def test_subgraph_reuse_sourceless_object_not_eligible(self):
+        # [FUNCTION DOC] Objects built inside the compiled function have no guards, so reuse is
+        # not allowed: two speculation calls, and the result equals eager.
         """An object created during tracing has no guards, so it is not reused."""
 
         class Batch:
+            # [CLASS DOC] HELPER: Plain holder with a delta attribute.
             def __init__(self, delta):
+                # [FUNCTION DOC] HELPER: Stores delta.
                 self.delta = delta
 
         @nested_compile_region
         def gn(x, batch):
+            # [FUNCTION DOC] HELPER: Region returning sine of x plus the object's delta.
             return x.sin() + batch.delta
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sums two region calls on freshly built holders of cosine.
             return gn(x, Batch(x.cos())) + gn(x, Batch(x.cos()))
 
         x = torch.randn(8)
@@ -4807,18 +5688,26 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(count(), 2)
 
     def test_subgraph_reuse_rebound_global_read_via_side_effects(self):
+        # [FUNCTION DOC] A region reads a module global that the compiled function rebinds each
+        # loop iteration. Both calls must retrace (two speculation calls) and, outside crossref,
+        # the printed graph shows one shared subgraph with the tensor lifted as an input. The
+        # global is reset to None in a finally block.
         """A region reading a global that is rebound between calls must retrace."""
         global _reuse_test_global
 
         @dataclass
         class RegionInput:
+            # [CLASS DOC] HELPER: Dataclass holding one tensor field named hidden.
             hidden: torch.Tensor
 
         @nested_compile_region
         def gn():
+            # [FUNCTION DOC] HELPER: Region returning the global object's tensor plus one.
             return _reuse_test_global.hidden + 1
 
         def fn(hidden):
+            # [FUNCTION DOC] HELPER: Twice: rebinds the global to a new holder of hidden and
+            # calls the region, replacing hidden with the result; returns the final value.
             global _reuse_test_global
             for _ in range(2):
                 _reuse_test_global = RegionInput(hidden)
@@ -4869,6 +5758,10 @@ class GraphModule(torch.nn.Module):
             _reuse_test_global = None
 
     def test_subgraph_reuse_rebound_global_read_via_builder(self):
+        # [FUNCTION DOC] Variant where the global is first read through the variable builder
+        # before being rebound. The second call's cache lookup rejects the saved entry, so two
+        # speculation calls; the second call receives the new tensor correctly. Result equals
+        # eager; the global is reset in a finally block.
         """A rebound global whose first read predates the rebinding.
 
         Unlike test_subgraph_reuse_rebound_global_read_via_side_effects, the
@@ -4879,9 +5772,12 @@ class GraphModule(torch.nn.Module):
 
         @nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Region adding the module global to x.
             return x + _reuse_test_global
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Calls the region, rebinds the global to 100, calls again
+            # and sums.
             global _reuse_test_global
             a = gn(x)
             _reuse_test_global = torch.tensor(100)
@@ -4908,6 +5804,9 @@ class GraphModule(torch.nn.Module):
             _reuse_test_global = None
 
     def test_subgraph_reuse_global_written_once_before_loop(self):
+        # [FUNCTION DOC] A global assigned once at the start of the compiled function (before
+        # any region) still blocks reuse conservatively, so each of four calls retraces (four
+        # speculation calls); results are correct. The global is reset in a finally block.
         """Conservative: a global written once, before any region runs, blocks reuse.
 
         has_mutated_vars asks whether a source was ever mutated, not whether it
@@ -4920,14 +5819,19 @@ class GraphModule(torch.nn.Module):
         global _reuse_test_global
 
         class Ctx:
+            # [CLASS DOC] HELPER: Holder with a scale attribute.
             def __init__(self, scale):
+                # [FUNCTION DOC] HELPER: Stores the scale.
                 self.scale = scale
 
         @nested_compile_region
         def gn(w, x):
+            # [FUNCTION DOC] HELPER: Region returning x times w plus the global object's scale.
             return x * w + _reuse_test_global.scale
 
         def fn(x, ws):
+            # [FUNCTION DOC] HELPER: Sets the global holder, then applies the region over
+            # the weights.
             global _reuse_test_global
             _reuse_test_global = Ctx(2.0)
             for w in ws:
@@ -4946,21 +5850,29 @@ class GraphModule(torch.nn.Module):
             _reuse_test_global = None
 
     def test_subgraph_reuse_sourceless_module_not_eligible(self):
+        # [FUNCTION DOC] Modules built inside the compiled function carry no guards, so two
+        # modules with different constants require two traces; result equals eager.
         """Sourceless modules carry no guards, so differing attrs must retrace."""
 
         class Scale(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module scaling its input by a constructor constant.
             def __init__(self, c):
+                # [FUNCTION DOC] HELPER: Stores the constant c.
                 super().__init__()
                 self.c = c
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns x scaled by c.
                 return x * self.c
 
         @nested_compile_region
         def gn(mod, x):
+            # [FUNCTION DOC] HELPER: Region calling the given module on x.
             return mod(x)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sums the region on two newly built modules with scales 3
+            # and 5.
             return gn(Scale(3.0), x) + gn(Scale(5.0), x)
 
         x = torch.randn(8)
@@ -4970,21 +5882,28 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(count(), 2)
 
     def test_subgraph_reuse_module_different_instances_retrace(self):
+        # [FUNCTION DOC] Two instances with different constants (5 and 10) need separate traces:
+        # two speculation calls, and the result equals eager.
         """Different module instances with different weights require separate traces."""
 
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module scaling its input by a constructor constant via a
+            # region forward.
             def __init__(self, c):
+                # [FUNCTION DOC] HELPER: Stores the constant c.
                 super().__init__()
                 self.c = c
 
             @nested_compile_region
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns x scaled by c.
                 return x * self.c
 
         mod1 = Mod(5)
         mod2 = Mod(10)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sums the two module calls.
             return mod1(x) + mod2(x)
 
         x = torch.randn(8)
@@ -4998,6 +5917,10 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(count(), 2)
 
     def test_subgraph_reuse_monkeypatch_forward(self):
+        # [FUNCTION DOC] Two modules whose forward was monkeypatched with region-wrapped copies
+        # of the same code object (distinct function objects) must share a trace because the
+        # cache key is based on the code object: asserts the inner functions differ but share
+        # code, one speculation call, and eager-equal output.
         """Monkeypatching forward with nested_compile_region should reuse cache.
 
         When a user wraps a module's forward with nested_compile_region via
@@ -5008,14 +5931,20 @@ class GraphModule(torch.nn.Module):
         """
 
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module scaling its input by a constructor constant.
             def __init__(self, c):
+                # [FUNCTION DOC] HELPER: Stores the constant c.
                 super().__init__()
                 self.c = c
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns x scaled by c.
                 return x * self.c
 
         def apply_nested_compile_region(mod):
+            # [FUNCTION DOC] HELPER: Replaces the module instance forward with a region-wrapped
+            # bound version of a fresh copy of the class forward function (same code, new
+            # function object). Returns the module.
             # Grab the unbound function and create a fresh copy so that each
             # module instance gets a function with a *different* id() but the
             # *same* __code__ object, mimicking a monkeypatch/code-gen scenario.
@@ -5043,6 +5972,7 @@ class GraphModule(torch.nn.Module):
         self.assertIs(fn1.__code__, fn2.__code__)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sums the two module calls.
             return mod1(x) + mod2(x)
 
         x = torch.randn(8)
@@ -5057,20 +5987,30 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(count(), 1)
 
     def test_subgraph_reuse_module_apply(self):
+        # [FUNCTION DOC] Applying a wrapper to every layer via the module apply traversal
+        # wraps the class forward in a region once. Three equal layers need one speculation
+        # call and the output equals the unwrapped reference model. Note this modifies the
+        # class forward permanently.
         """Using module.apply to wrap transformer layers with nested_compile_region."""
 
         class Layer(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module scaling its input by a constructor constant.
             def __init__(self, c):
+                # [FUNCTION DOC] HELPER: Stores the constant c.
                 super().__init__()
                 self.c = c
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns x scaled by c.
                 return x * self.c
 
         model = torch.nn.Sequential(Layer(5), Layer(5), Layer(5))
         ref_model = torch.nn.Sequential(Layer(5), Layer(5), Layer(5))
 
         def wrap_layer(mod):
+            # [FUNCTION DOC] HELPER: Callback for module apply: if the module is a Layer whose
+            # class forward is not already marked as a compile region, replaces the class
+            # forward with the region-wrapped version (mutates the class). Returns nothing.
             if isinstance(mod, Layer):
                 fwd = type(mod).forward
                 if not hasattr(fwd, "__marked_compile_region_fn__"):
@@ -5089,14 +6029,20 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(count(), 1)
 
     def test_subgraph_reuse_class_level_wrap(self):
+        # [FUNCTION DOC] Class-level wrap of the layer forward with the region decorator: two
+        # instances with equal constants share a trace (one speculation call), and the output
+        # equals eager. Note this modifies the class forward permanently.
         """Wrapping cls.forward with nested_compile_region for named_modules pattern."""
 
         class Layer(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module scaling its input by a constructor constant.
             def __init__(self, c):
+                # [FUNCTION DOC] HELPER: Stores the constant c.
                 super().__init__()
                 self.c = c
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns x scaled by c.
                 return x * self.c
 
         # Wrap at the class level — the pattern a user would use after
@@ -5107,6 +6053,7 @@ class GraphModule(torch.nn.Module):
         mod2 = Layer(5)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sums the two module calls.
             return mod1(x) + mod2(x)
 
         x = torch.randn(8)
@@ -5119,14 +6066,19 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(count(), 1)
 
     def test_subgraph_reuse_module_instance_as_callable(self):
+        # [FUNCTION DOC] Module instances passed directly to the region wrapper and called: with
+        # equal constants they share one trace (one speculation call) and match eager.
         """Passing nn.Module instances directly to nested_compile_region."""
 
         class Layer(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module scaling its input by a constructor constant.
             def __init__(self, c):
+                # [FUNCTION DOC] HELPER: Stores the constant c.
                 super().__init__()
                 self.c = c
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns x scaled by c.
                 return x * self.c
 
         mod1 = Layer(5)
@@ -5136,6 +6088,7 @@ class GraphModule(torch.nn.Module):
         wrapped2 = nested_compile_region(mod2)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sums the two wrapped module calls.
             return wrapped1(x) + wrapped2(x)
 
         x = torch.randn(8)
@@ -5161,14 +6114,25 @@ class GraphModule(torch.nn.Module):
     params: f"{cls.__name__}{'Strict' if params['strict'] else 'Nonstrict'}",
 )
 class TestInvokeSubgraphExport(TestCase):
+    # [CLASS DOC] Export tests for regions, run twice via a parameterized class generator: once
+    # with the strict flag false and once true (class names get a Strict or Nonstrict suffix).
+    # Each test reads the strict flag from the class attribute. Skipped under dynamo.
     @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
     def test_simple_func(self):
+        # [FUNCTION DOC] Exports a module calling a region twice with inlining of single-use
+        # disabled. Checks the exported module output equals eager, that the graph module has
+        # two named modules (itself and one repeated subgraph), and the printed graph matches
+        # expected text.
         @nested_compile_region
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: Region multiplying the inputs.
             return torch.mul(x, y)
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module applying the region twice in sequence.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Applies the region to (x, y) and then to the result
+                # with y.
                 x = gn(x, y)
                 x = gn(x, y)
                 return x
@@ -5203,14 +6167,22 @@ class GraphModule(torch.nn.Module):
 
     @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
     def test_unbacked(self):
+        # [FUNCTION DOC] Exports a module calling a data-dependent region (item with a runtime
+        # check) ten times, runs decompositions, and checks the output matches eager and the
+        # graph module still has only two named modules.
         @nested_compile_region
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: Region reading the scalar from x, asserting it is below the
+            # length of y, and returning a clone of that many leading elements of y.
             b = x.item()
             torch._check(b < y.shape[0])
             return y[:b].clone()
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module collecting ten region results and concatenating them.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Calls the region ten times and concatenates
+                # the outputs.
                 res = []
                 for _ in range(10):
                     res.append(gn(x, y))
@@ -5227,13 +6199,21 @@ class GraphModule(torch.nn.Module):
 
     @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
     def test_pending_unbacked(self):
+        # [FUNCTION DOC] Exports a module whose region method reads an item from a dynamic-size
+        # input, called four times. Done once with a plain input and once with an input
+        # requiring grad; after decompositions each export must still have two named modules.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a region-decorated method called four times
+            # in forward.
             @nested_compile_region
             def gn(self, x):
+                # [FUNCTION DOC] HELPER: Region method multiplying x by its first element's
+                # scalar value.
                 u = x[0].item()
                 return x * u
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the region method four times.
                 for _ in range(4):
                     x = self.gn(x)
                 return x
@@ -5260,12 +6240,17 @@ class GraphModule(torch.nn.Module):
 
     @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
     def test_simple_method(self):
+        # [FUNCTION DOC] Exports a module whose region is a method called twice; output must
+        # match eager and the graph module must contain two named modules.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a region-decorated method called twice in forward.
             @nested_compile_region
             def gn(self, x, y):
+                # [FUNCTION DOC] HELPER: Region method multiplying the inputs.
                 return torch.mul(x, y)
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Applies the region method twice.
                 x = self.gn(x, y)
                 x = self.gn(x, y)
                 return x
@@ -5279,23 +6264,33 @@ class GraphModule(torch.nn.Module):
 
     @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
     def test_multiple_module(self):
+        # [FUNCTION DOC] Exports a model with ten instances of a module sharing one buffer
+        # tensor and a region forward. Output must match eager and the graph module must have
+        # two named modules (the instances share one subgraph).
         b = torch.randn(8)
 
         class N(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module registering the shared outer tensor as a buffer; its
+            # region forward returns x times y plus the buffer.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Registers the shared tensor as buffer buf.
                 super().__init__()
                 self.register_buffer("buf", b)
 
             @nested_compile_region
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns x times y plus the buffer.
                 return x * y + self.buf
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Container with a list of ten modules applied in sequence.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the ten-module list.
                 super().__init__()
                 self.mod_list = torch.nn.ModuleList(N() for _ in range(10))
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Threads x through each module with y.
                 for m in self.mod_list:
                     x = m(x, y)
                 return x
@@ -5309,6 +6304,14 @@ class GraphModule(torch.nn.Module):
 
     @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
     def test_nested_lifted_tensor_constants(self):
+        # [FUNCTION DOC] A region creating an inline tensor constant is replayed twice. After
+        # export and decomposition the constant appears as a persistent buffer scoped to the
+        # repeated subgraph. Checks the flat-input helper works before and after decomposition
+        # (last item is the input), that the buffer is in the signature but not in state_dict or
+        # constants, that named_buffers resolves it with the right shape and dtype, and that
+        # signature verification passes.
+        # KNOWN ISSUE: the second argument of the assertTrue over the buffer names is a lambda,
+        # not a message string, so a failure would show the function object as the message.
         # When the region captured by nested_compile_region closes over an
         # inline tensor constant and is replayed multiple times, export
         # promotes the subgraph to ``repeated_subgraph0``. After decomposing
@@ -5322,11 +6325,15 @@ class GraphModule(torch.nn.Module):
         # that shape.
         @nested_compile_region
         def block(x):
+            # [FUNCTION DOC] HELPER: Region creating a four-element constant tensor, returning x
+            # times it plus one.
             w = torch.tensor([1.0, 2.0, 3.0, 4.0])
             return x * w + 1.0
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module applying the region twice.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the region twice in sequence.
                 x = block(x)
                 x = block(x)
                 return x
@@ -5388,16 +6395,22 @@ class GraphModule(torch.nn.Module):
         _verify_exported_program_signature(ep)
 
     def test_invoke_subgraph_placeholder_forwards_kwargs(self):
+        # [FUNCTION DOC] Regression test: under non-strict export the region placeholder must
+        # forward keyword arguments. Exports a module calling the region with a keyword scale
+        # and checks the exported module output equals eager.
         # Under non-strict export (``torch.compiler.is_compiling()`` True but
         # not Dynamo) the placeholder goes through a small wrapper that must
         # forward both *args and **kwargs. Regression test for a path that
         # silently dropped kwargs.
         @nested_compile_region
         def gn(x, y, *, scale=1.0):
+            # [FUNCTION DOC] HELPER: Region returning x times y times the keyword-only scale.
             return x * y * scale
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module calling the region with scale 2.0.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Calls the region with a keyword scale.
                 return gn(x, y, scale=2.0)
 
         x = torch.randn(4)
@@ -5408,13 +6421,18 @@ class GraphModule(torch.nn.Module):
 
 
 class NegativeTesting(TestCase):
+    # [CLASS DOC] Tests of expected failures for regions (not skipped under dynamo).
     def test_graph_break(self):
+        # [FUNCTION DOC] A graph break inside a region with the eager backend (no full graph)
+        # must raise RuntimeError mentioning the invoke_subgraph higher order operator.
         @nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Region that forces a graph break and then returns cosine.
             torch._dynamo.graph_break()
             return torch.cos(x)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Calls the region.
             return gn(x)
 
         x = torch.randn(8, 8, requires_grad=True)
@@ -5428,7 +6446,12 @@ class NegativeTesting(TestCase):
 
 @skipIfTorchDynamo("Not a torch._dynamo test")
 class TestInlineInvokeSubgraph(TestCase):
+    # [CLASS DOC] Tests with the config flag that inlines all invoke_subgraph calls at trace
+    # time. Skipped under dynamo.
     def _assert_no_invoke_subgraph(self, fn, args):
+        # [FUNCTION DOC] HELPER: Compiles fn with the eager recording backend (full graph) on
+        # the given argument tuple, asserts at least one graph was captured and no graph
+        # contains an invoke_subgraph call node, and returns the result.
         """Compile fn and verify the backend receives no invoke_subgraph HOPs."""
         backend = EagerAndRecordGraphs()
         res = torch.compile(fn, backend=backend, fullgraph=True)(*args)
@@ -5443,11 +6466,15 @@ class TestInlineInvokeSubgraph(TestCase):
 
     @torch._dynamo.config.patch(inline_invoke_subgraph=True)
     def test_simple(self):
+        # [FUNCTION DOC] With inlining enabled, a region called twice leaves no invoke_subgraph
+        # nodes and the result equals eager.
         @nested_compile_region
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: Region multiplying inputs.
             return torch.mul(x, y)
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Sums two region calls.
             return gn(x, y) + gn(x, y)
 
         x = torch.randn(8)
@@ -5458,14 +6485,19 @@ class TestInlineInvokeSubgraph(TestCase):
 
     @torch._dynamo.config.patch(inline_invoke_subgraph=True)
     def test_module(self):
+        # [FUNCTION DOC] With inlining enabled, a module region forward called twice leaves no
+        # invoke_subgraph nodes and matches eager.
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose region forward returns sine plus cosine.
             @nested_compile_region
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns sine of x plus cosine of x.
                 return x.sin() + x.cos()
 
         mod = Mod()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sums two module calls.
             return mod(x) + mod(x)
 
         x = torch.randn(8)
@@ -5475,11 +6507,15 @@ class TestInlineInvokeSubgraph(TestCase):
 
     @torch._dynamo.config.patch(inline_invoke_subgraph=True)
     def test_backward(self):
+        # [FUNCTION DOC] With inlining enabled, compiles with inductor and checks values and
+        # gradients match eager.
         @nested_compile_region
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: Region returning the sine of the product.
             return torch.mul(x, y).sin()
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Calls the region.
             return gn(x, y)
 
         x = torch.randn(8, requires_grad=True)
@@ -5500,7 +6536,12 @@ class TestInlineInvokeSubgraph(TestCase):
 
 @skipIfTorchDynamo("Not a torch._dynamo test")
 class TestInlineSingleUseInvokeSubgraph(TestCase):
+    # [CLASS DOC] Tests that regions used only once are inlined while regions used multiple
+    # times remain as invoke_subgraph calls. Skipped under dynamo.
     def _assert_no_invoke_subgraph(self, fn, args):
+        # [FUNCTION DOC] HELPER: Compiles fn with the eager recording backend (full graph),
+        # asserts at least one graph exists and none contains an invoke_subgraph call node, and
+        # returns the result.
         backend = EagerAndRecordGraphs()
         res = torch.compile(fn, backend=backend, fullgraph=True)(*args)
         self.assertTrue(len(backend.graphs) > 0)
@@ -5513,6 +6554,9 @@ class TestInlineSingleUseInvokeSubgraph(TestCase):
         return res
 
     def _count_invoke_subgraph(self, fn, args):
+        # [FUNCTION DOC] HELPER: Compiles fn with the eager recording backend and returns the
+        # result together with the total count of invoke_subgraph call nodes over all
+        # captured graphs.
         backend = EagerAndRecordGraphs()
         res = torch.compile(fn, backend=backend, fullgraph=True)(*args)
         count = 0
@@ -5526,11 +6570,15 @@ class TestInlineSingleUseInvokeSubgraph(TestCase):
         return res, count
 
     def test_single_use_inlined(self):
+        # [FUNCTION DOC] A region used once is inlined (no invoke_subgraph nodes) and the result
+        # equals eager.
         @nested_compile_region
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: Region multiplying inputs.
             return torch.mul(x, y)
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Calls the region once.
             return gn(x, y)
 
         x = torch.randn(8)
@@ -5540,11 +6588,15 @@ class TestInlineSingleUseInvokeSubgraph(TestCase):
         self.assertEqual(ref, res)
 
     def test_multi_use_preserved(self):
+        # [FUNCTION DOC] A region used twice is preserved: two invoke_subgraph nodes and the
+        # result equals eager.
         @nested_compile_region
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: Region multiplying inputs.
             return torch.mul(x, y)
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Sums two region calls.
             return gn(x, y) + gn(x, y)
 
         x = torch.randn(8)
@@ -5555,15 +6607,22 @@ class TestInlineSingleUseInvokeSubgraph(TestCase):
         self.assertEqual(count, 2)
 
     def test_mixed_single_and_multi_use(self):
+        # [FUNCTION DOC] One region used twice and another used once: the compiled graph has
+        # two invoke_subgraph nodes (the shared one twice, the unique one inlined); result
+        # equals eager.
         @nested_compile_region
         def shared(x):
+            # [FUNCTION DOC] HELPER: Region returning sine (used twice).
             return x.sin()
 
         @nested_compile_region
         def unique(x):
+            # [FUNCTION DOC] HELPER: Region returning cosine (used once).
             return x.cos()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Applies the shared region twice, sums, then applies the
+            # unique region.
             a = shared(x) + shared(x)
             b = unique(a)
             return b
@@ -5586,11 +6645,18 @@ class TestInlineSingleUseInvokeSubgraph(TestCase):
         self.assertEqual(invoke_count, 2)
 
     def test_ac_shared_subgraph_not_inlined(self):
+        # [FUNCTION DOC] Two activation-checkpoint calls over the same region must keep
+        # invoke_subgraph: reference eager forward and backward, then compile with the eager
+        # recording backend and check the result equals eager and that exactly two
+        # invoke_subgraph call nodes exist across all graph modules of the captured graph (use
+        # counting is global).
         @nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Region returning sine.
             return torch.sin(x)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sums two checkpointed calls of the region.
             a = torch.utils.checkpoint.checkpoint(gn, x, use_reentrant=False)
             b = torch.utils.checkpoint.checkpoint(gn, x, use_reentrant=False)
             return a + b
@@ -5617,22 +6683,30 @@ class TestInlineSingleUseInvokeSubgraph(TestCase):
         self.assertEqual(invoke_count, 2)
 
     def test_inline_single_use_with_autograd_function(self):
+        # [FUNCTION DOC] A region wrapping a custom autograd function is used once (so inlined).
+        # Compiled with aot_eager: value, and gradient after backward, must match eager.
         class MyOp(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Autograd function with sine forward and a backward multiplying
+            # the incoming gradient by the cosine of the saved input.
             @staticmethod
             def forward(ctx, x):
+                # [FUNCTION DOC] HELPER: Saves x for backward and returns its sine.
                 ctx.save_for_backward(x)
                 return x.sin()
 
             @staticmethod
             def backward(ctx, grad_out):
+                # [FUNCTION DOC] HELPER: Returns grad_out times the cosine of the saved input.
                 (x,) = ctx.saved_tensors
                 return grad_out * x.cos()
 
         @nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Region applying the custom autograd function.
             return MyOp.apply(x)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Calls the region.
             return gn(x)
 
         x = torch.randn(4, 4, requires_grad=True)
@@ -5651,12 +6725,20 @@ class TestInlineSingleUseInvokeSubgraph(TestCase):
 
 @skipIfTorchDynamo("Not a torch._dynamo test")
 class TestInvokeSubgraphReuseHashFn(TestCase):
+    # [CLASS DOC] Tests of the reuse hash function option of the region decorator, which lets
+    # the user supply a function whose return value decides whether two calls can share a trace.
+    # Skipped under dynamo.
     @contextlib.contextmanager
     def _count_speculate_calls(self):
+        # [FUNCTION DOC] HELPER: Context manager patching the dynamo subgraph speculation
+        # function with a counting wrapper that forwards to the original. Yields a callable
+        # returning the current call count.
         count = 0
         orig = torch._dynamo.variables.higher_order_ops.speculate_subgraph_with_auto_output_flattening
 
         def _counting(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Counting wrapper: increments the enclosing count and
+            # forwards all arguments to the original function, returning its result.
             nonlocal count
             count += 1
             return orig(*args, **kwargs)
@@ -5669,27 +6751,38 @@ class TestInvokeSubgraphReuseHashFn(TestCase):
             yield lambda: count
 
     def test_reuse_hash_fn_module_distinct_hashes(self):
+        # [FUNCTION DOC] Hash function returns the layer id of a module argument. Four layers
+        # have distinct ids so four traces occur (four speculation calls); output equals eager.
         """nn.Module arg with hash fn returning different values per layer."""
 
         def hash_fn(mod, x):
+            # [FUNCTION DOC] HELPER: Hash function returning the module's layer_id attribute.
             return mod.layer_id
 
         @nested_compile_region(reuse_hash_fn=hash_fn)
         def layer_fn(mod, x):
+            # [FUNCTION DOC] HELPER: Region returning sine of x plus the module's weight.
             return x.sin() + mod.weight
 
         class Layer(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a layer_id attribute and a random parameter weight
+            # of size 8.
             def __init__(self, layer_id):
+                # [FUNCTION DOC] HELPER: Stores layer_id and creates the weight parameter.
                 super().__init__()
                 self.layer_id = layer_id
                 self.weight = torch.nn.Parameter(torch.randn(8))
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Model with a list of four Layer modules applied through
+            # the region.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates four layers with ids 0 to 3.
                 super().__init__()
                 self.layers = torch.nn.ModuleList([Layer(i) for i in range(4)])
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the region to each layer in turn.
                 for layer in self.layers:
                     x = layer_fn(layer, x)
                 return x
@@ -5706,26 +6799,36 @@ class TestInvokeSubgraphReuseHashFn(TestCase):
         self.assertEqual(ref, res)
 
     def test_reuse_hash_fn_module_same_hash(self):
+        # [FUNCTION DOC] Hash function returns a constant for all layers, so four layers share a
+        # single trace (one speculation call); output equals eager.
         """nn.Module arg with hash fn returning same value → single trace."""
 
         def hash_fn(mod, x):
+            # [FUNCTION DOC] HELPER: Hash function returning the constant zero.
             return 0
 
         @nested_compile_region(reuse_hash_fn=hash_fn)
         def layer_fn(mod, x):
+            # [FUNCTION DOC] HELPER: Region returning sine of x plus the module's weight.
             return x.sin() + mod.weight
 
         class Layer(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a random parameter weight of size 8.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the weight parameter.
                 super().__init__()
                 self.weight = torch.nn.Parameter(torch.randn(8))
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Model with a list of four Layer modules applied through
+            # the region.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates four layers.
                 super().__init__()
                 self.layers = torch.nn.ModuleList([Layer() for _ in range(4)])
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the region to each layer in turn.
                 for layer in self.layers:
                     x = layer_fn(layer, x)
                 return x
@@ -5742,16 +6845,21 @@ class TestInvokeSubgraphReuseHashFn(TestCase):
         self.assertEqual(ref, res)
 
     def test_reuse_hash_fn_tensor_shape(self):
+        # [FUNCTION DOC] Hash function returns the first dimension size. Inputs of size 4, 8, 8
+        # yield two traces (the second 8 reuses); output equals eager.
         """Hash fn that uses tensor shape to differentiate inputs."""
 
         def hash_fn(x):
+            # [FUNCTION DOC] HELPER: Hash function returning the size of dim 0.
             return x.shape[0]
 
         @nested_compile_region(reuse_hash_fn=hash_fn)
         def gn(x):
+            # [FUNCTION DOC] HELPER: Region returning sine.
             return x.sin()
 
         def fn(x4, x8a, x8b):
+            # [FUNCTION DOC] HELPER: Applies the region to each input and sums all the results.
             # x8a and x8b have the same shape → same hash → reuse
             a = gn(x4)
             b = gn(x8a)
@@ -5771,27 +6879,37 @@ class TestInvokeSubgraphReuseHashFn(TestCase):
         self.assertEqual(ref, res)
 
     def test_reuse_hash_fn_graph_break_raises(self):
+        # [FUNCTION DOC] A hash function that triggers a graph break must make compilation raise
+        # RuntimeError saying the hash function must be fully traceable.
         """reuse_hash_fn with a graph break raises a clear error."""
 
         def bad_hash_fn(mod, x):
+            # [FUNCTION DOC] HELPER: Hash function that forces a graph break then returns zero.
             torch._dynamo.graph_break()
             return 0
 
         @nested_compile_region(reuse_hash_fn=bad_hash_fn)
         def layer_fn(mod, x):
+            # [FUNCTION DOC] HELPER: Region returning sine of x plus the module's weight.
             return x.sin() + mod.weight
 
         class Layer(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a random parameter weight of size 8.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the weight parameter.
                 super().__init__()
                 self.weight = torch.nn.Parameter(torch.randn(8))
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Model with a list of two Layer modules applied through
+            # the region.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates two layers.
                 super().__init__()
                 self.layers = torch.nn.ModuleList([Layer(), Layer()])
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the region to each layer in turn.
                 for layer in self.layers:
                     x = layer_fn(layer, x)
                 return x
@@ -5804,29 +6922,43 @@ class TestInvokeSubgraphReuseHashFn(TestCase):
             torch.compile(mod, backend="aot_eager", fullgraph=True)(x)
 
     def test_reuse_hash_fn_if_cond_no_guard(self):
+        # [FUNCTION DOC] A condition on a module attribute inside the hash function must not
+        # leak guards. After a first compile, flipping the attribute on both layers and re-
+        # running must not trigger recompilation (frame count unchanged) and results still
+        # equal eager.
         """if-condition in hash fn should not install guards on the module."""
 
         def hash_fn(mod, x):
+            # [FUNCTION DOC] HELPER: Hash function returning one if the module's use_gelu flag
+            # is set, else zero.
             if mod.use_gelu:
                 return 1
             return 0
 
         @nested_compile_region(reuse_hash_fn=hash_fn)
         def layer_fn(mod, x):
+            # [FUNCTION DOC] HELPER: Region returning sine of x plus the module's weight.
             return x.sin() + mod.weight
 
         class Layer(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a use_gelu flag and a random parameter weight of
+            # size 8.
             def __init__(self, use_gelu):
+                # [FUNCTION DOC] HELPER: Stores the flag and creates the weight parameter.
                 super().__init__()
                 self.use_gelu = use_gelu
                 self.weight = torch.nn.Parameter(torch.randn(8))
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Model with two layers (flag true and false) applied through
+            # the region.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the two layers.
                 super().__init__()
                 self.layers = torch.nn.ModuleList([Layer(True), Layer(False)])
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the region to each layer in turn.
                 for layer in self.layers:
                     x = layer_fn(layer, x)
                 return x
@@ -5852,28 +6984,42 @@ class TestInvokeSubgraphReuseHashFn(TestCase):
         self.assertEqual(cnt.frame_count, frame_count_before)
 
     def test_reuse_hash_fn_side_effect_allowed(self):
+        # [FUNCTION DOC] A region that increments a module counter (a side effect) normally
+        # blocks reuse, but with a hash function the three layers still share a trace: one
+        # speculation call.
         """Side effects (attribute mutation) should not block reuse with reuse_hash_fn."""
 
         def hash_fn(mod, x):
+            # [FUNCTION DOC] HELPER: Hash function returning the constant zero.
             return 0
 
         @nested_compile_region(reuse_hash_fn=hash_fn)
         def layer_fn(mod, x):
+            # [FUNCTION DOC] HELPER: Region incrementing the module's call_count then returning
+            # sine of x plus the weight.
             mod.call_count += 1
             return x.sin() + mod.weight
 
         class Layer(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a call counter and a random parameter weight of
+            # size 8.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Sets the counter to zero and creates the
+                # weight parameter.
                 super().__init__()
                 self.call_count = 0
                 self.weight = torch.nn.Parameter(torch.randn(8))
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Model with a list of three Layer modules applied through
+            # the region.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates three layers.
                 super().__init__()
                 self.layers = torch.nn.ModuleList([Layer() for _ in range(3)])
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the region to each layer in turn.
                 for layer in self.layers:
                     x = layer_fn(layer, x)
                 return x
@@ -5889,16 +7035,23 @@ class TestInvokeSubgraphReuseHashFn(TestCase):
         self.assertEqual(count(), 1)
 
     def test_reuse_hash_fn_unsupported_output_raises(self):
+        # [FUNCTION DOC] A region returning nested tuples with a hash function is not eligible
+        # for reuse; compilation must raise RuntimeError saying the hash function was provided
+        # but the subgraph is not eligible.
         """Nested output (tuple of tuple of tensors) should raise with reuse_hash_fn."""
 
         def hash_fn(x):
+            # [FUNCTION DOC] HELPER: Hash function returning the constant zero.
             return 0
 
         @nested_compile_region(reuse_hash_fn=hash_fn)
         def gn(x):
+            # [FUNCTION DOC] HELPER: Region returning a one-tuple holding a tuple of sine
+            # and cosine.
             return ((x.sin(), x.cos()),)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Calls the region.
             return gn(x)
 
         x = torch.randn(8)
@@ -5911,11 +7064,17 @@ class TestInvokeSubgraphReuseHashFn(TestCase):
 @skipIfTorchDynamo("Not a torch._dynamo test")
 @unittest.skipIf(TEST_WITH_CROSSREF, "crossref does not support trace_autograd_ops")
 class TestInvokeSubgraphTrainStepCapture(TestCase):
+    # [CLASS DOC] Train-step capture tests with autograd op tracing enabled (backward called
+    # inside the compiled function). Skipped under dynamo and under crossref mode.
     @torch._dynamo.config.patch(
         trace_autograd_ops=True,
         inline_single_use_invoke_subgraph=False,
     )
     def test_mark_non_differentiable_propagation(self):
+        # [FUNCTION DOC] A region wrapping an autograd function that marks one output as non-
+        # differentiable must propagate that status to the outer op so the auxiliary output does
+        # not require grad. Runs a train step (loss backward and a chained backward) compiled
+        # with aot_eager and asserts the returned auxiliary tensor does not require grad.
         """invoke_subgraph wrapping an autograd.Function that calls
         mark_non_differentiable should propagate the non-differentiable
         status to the outer InvokeSubgraphAutogradOp.  Without this,
@@ -5925,8 +7084,13 @@ class TestInvokeSubgraphTrainStepCapture(TestCase):
         """
 
         class MyOp(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Autograd function returning sine and the max of its input; the
+            # max is marked non-differentiable; backward returns grad_out times the cosine of
+            # the saved input.
             @staticmethod
             def forward(ctx, x):
+                # [FUNCTION DOC] HELPER: Computes sine and max, marks the max non-
+                # differentiable, saves x, and returns both.
                 out = x.sin()
                 aux = x.max()
                 ctx.mark_non_differentiable(aux)
@@ -5935,20 +7099,30 @@ class TestInvokeSubgraphTrainStepCapture(TestCase):
 
             @staticmethod
             def backward(ctx, grad_out, grad_aux):
+                # [FUNCTION DOC] HELPER: Returns grad_out times cosine of the saved input
+                # (grad_aux ignored).
                 (x,) = ctx.saved_tensors
                 return grad_out * x.cos()
 
         @nested_compile_region()
         def nested_fn(x):
+            # [FUNCTION DOC] HELPER: Region applying the custom autograd function.
             return MyOp.apply(x)
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Model with two bias-free linear layers; forward runs a full
+            # train step inside the call.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates a 4 by 4 and a 4 by 1 bias-free linear layers.
                 super().__init__()
                 self.linear = torch.nn.Linear(4, 4, bias=False)
                 self.head = torch.nn.Linear(4, 1, bias=False)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the first layer and the region, detaches the
+                # region output, computes a loss through the head, runs backward on the loss,
+                # then backward on the region output with the detached gradient. Returns the
+                # detached loss and the auxiliary output.
                 y = self.linear(x)
                 z, aux = nested_fn(y)
                 z_det = z.detach().requires_grad_()
@@ -5969,6 +7143,10 @@ class TestInvokeSubgraphTrainStepCapture(TestCase):
         inline_single_use_invoke_subgraph=False,
     )
     def test_nested_region_config_propagated_to_backward(self):
+        # [FUNCTION DOC] With regional compile options set on the region and backward traced in
+        # the forward function, a recording forward compiler captures a single graph that must
+        # have two invoke_subgraph nodes (forward and backward), each with a nested region
+        # configuration entry in its custom metadata.
         """When joint tracing creates backward invoke_subgraph nodes,
         the nested_region_config should be propagated so the regional
         compiler can compile them.
@@ -5985,15 +7163,23 @@ class TestInvokeSubgraphTrainStepCapture(TestCase):
 
         @nested_compile_region(options=config)
         def nested_fn(x):
+            # [FUNCTION DOC] HELPER: Region returning the sine.
             return x.sin()
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Model with two bias-free linear layers; forward runs a full
+            # train step inside the call.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates a 4 by 4 and a 4 by 1 bias-free linear layers.
                 super().__init__()
                 self.linear = torch.nn.Linear(4, 4, bias=False)
                 self.head = torch.nn.Linear(4, 1, bias=False)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the first layer and the region, detaches the
+                # region output, computes a loss through the head, runs backward on the loss,
+                # then backward on the region output with the detached gradient. Returns the
+                # detached loss.
                 y = self.linear(x)
                 z = nested_fn(y)
                 z_det = z.detach().requires_grad_()
@@ -6005,6 +7191,8 @@ class TestInvokeSubgraphTrainStepCapture(TestCase):
         fw_graphs = []
 
         def recording_compiler(gm, example_inputs, **kwargs):
+            # [FUNCTION DOC] HELPER: Forward compiler that appends the graph module to the
+            # enclosing list and returns it unchanged.
             fw_graphs.append(gm)
             return gm
 
@@ -6035,6 +7223,10 @@ class TestInvokeSubgraphTrainStepCapture(TestCase):
         inline_single_use_invoke_subgraph=False,
     )
     def test_ac_invoke_subgraph_has_recomputed_blocks(self):
+        # [FUNCTION DOC] With regional compile options and an activation checkpoint around
+        # the region in a train step, the forward graph (compared to expected text, ignoring
+        # comments and empty lines) must contain a recomputed copy of the partitioned
+        # forward invoke_subgraph.
         """When activation checkpointing wraps invoke_subgraph in a
         train-step capture, the partitioned fw invoke_subgraph should be
         recomputed by the remat pass, producing _recomputed nodes.
@@ -6049,15 +7241,23 @@ class TestInvokeSubgraphTrainStepCapture(TestCase):
 
         @nested_compile_region(options=config)
         def nested_fn(x):
+            # [FUNCTION DOC] HELPER: Region returning the sine.
             return x.sin()
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Model with two bias-free linear layers; forward runs a full
+            # train step with a checkpointed region inside the call.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates a 4 by 4 and a 4 by 1 bias-free linear layers.
                 super().__init__()
                 self.linear = torch.nn.Linear(4, 4, bias=False)
                 self.head = torch.nn.Linear(4, 1, bias=False)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the first layer and the checkpointed region,
+                # detaches the output, computes a loss through the head, runs backward on the
+                # loss, then backward on the region output with the detached gradient. Returns
+                # the detached loss.
                 y = self.linear(x)
                 z = torch.utils.checkpoint.checkpoint(nested_fn, y, use_reentrant=False)
                 z_det = z.detach().requires_grad_()
