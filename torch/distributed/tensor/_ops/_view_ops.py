@@ -1,5 +1,12 @@
 # mypy: allow-untyped-defs
 # Copyright (c) Meta Platforms, Inc. and affiliates
+# [MODULE DOC] Dimension-mapping rules and sharding propagation for view-like DTensor ops.
+# Defines a small language of DimSpec classes (Singleton, InputDim, Broadcast, NewDim, Repeat, Flatten,
+# Split) describing how each output dim derives from input dims, builders of such maps for ops (reshape,
+# view, expand, flatten, movedim, repeat, tile, transpose, squeeze, unsqueeze, view_as_real, reductions),
+# and _ViewShardingPropagator, which maps input Shard/_StridedShard placements to output placements through a
+# map. It also registers strategies for the view ops with the DTensor sharding propagator at import time.
+# Symbolic sizes are handled through guard-free comparison helpers.
 import math
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
@@ -43,6 +50,8 @@ Shape = tuple[int, ...]
 
 
 def _explicit_unbacked_hint(value: object) -> int | None:
+    # [FUNCTION DOC] HELPER: Return an optimization hint for an unbacked symbolic int whose free unbacked symbols all have
+    # hint overrides in its shape env; None for non-symbolic values, missing shape env or any symbol lacking an override.
     from torch.fx.experimental.symbolic_shapes import (
         free_unbacked_symbols,
         optimization_hint,
@@ -62,12 +71,16 @@ def _explicit_unbacked_hint(value: object) -> int | None:
 
 
 def _split_factor_hint(value: object) -> int | None:
+    # [FUNCTION DOC] HELPER: Return the integer hint of a split factor: the value itself if a plain int, else the explicit unbacked hint (or None).
     if isinstance(value, int):
         return int(value)
     return _explicit_unbacked_hint(value)
 
 
 def _split_factor_matches(expected: object, actual: object) -> bool:
+    # [FUNCTION DOC] HELPER: Return True if two split factors are considered equal. False if expected is None. True when equality
+    # is provable; otherwise True if both have integer hints that agree, in which case a deferred symbolic equality
+    # assertion is recorded for the symbolic side. Side effect: registers deferred assertions.
     from torch.fx.experimental.symbolic_shapes import guard_or_false
 
     if expected is None:
@@ -90,6 +103,7 @@ def _split_factor_matches(expected: object, actual: object) -> bool:
 
 
 class ClaimedDim(NamedTuple):
+    # [CLASS DOC] HELPER: Named tuple holding an (input_dim, output_dim) pair claimed by a mesh dim's strided shard rewrite.
     """An (input_dim, output_dim) pair claimed by a mesh dim's _StridedShard rewrite."""
 
     input_dim: int
@@ -98,9 +112,13 @@ class ClaimedDim(NamedTuple):
 
 @dataclass
 class DimSpec:
+    # [CLASS DOC] Base class for rules describing how one output dimension is produced from input dimensions.
+    # Subclasses are InputDim, Singleton, Broadcast, NewDim, Repeat, Flatten and Split. inputs yields the child
+    # DimSpecs (none by default). A DimMap is a tuple of DimSpecs, one per output dim.
     """Specifies how an output dimension maps to an input dimension."""
 
     def inputs(self) -> Iterable["DimSpec"]:
+        # [FUNCTION DOC] Return the child DimSpecs this spec is built from; empty by default.
         return ()
 
 
@@ -110,16 +128,21 @@ DimMap = tuple[DimSpec, ...]
 
 @dataclass
 class Singleton(DimSpec):
+    # [CLASS DOC] Output dimension of size one that has no input counterpart.
     """Output dimension is a singleton."""
 
 
 @dataclass(eq=False)
 class InputDim(DimSpec):
+    # [CLASS DOC] Output dim equal to input dimension input_dim. Equality and hashing are by input_dim; comparing with
+    # a non-DimSpec raises TypeError to catch mix-ups between shard dims and input dims.
     """Output dimension maps directly to an input dimension."""
 
     input_dim: int
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] Compare by input_dim with another InputDim; return NotImplemented for other DimSpecs and raise
+        # TypeError for objects that are not DimSpecs.
         """Raises TypeError for non-DimSpec comparisons to catch accidental
         ``shard.dim == input_dim`` bugs where ``.input_dim`` was intended."""
         if isinstance(other, InputDim):
@@ -132,11 +155,13 @@ class InputDim(DimSpec):
         return NotImplemented
 
     def __hash__(self) -> int:
+        # [FUNCTION DOC] Return a hash based on the input dim.
         return hash((InputDim, self.input_dim))
 
 
 @dataclass
 class Broadcast(DimSpec):
+    # [CLASS DOC] Output dim obtained by broadcasting a singleton input dim spec (dim) to dim_size. Children: dim.
     """Output is the broadcast of a singleton input dimension."""
 
     dim: DimSpec
@@ -144,20 +169,24 @@ class Broadcast(DimSpec):
 
     @classmethod
     def new(cls, dim: DimSpec, dim_size: int) -> DimSpec:
+        # [FUNCTION DOC] Construct a Broadcast spec for dim to dim_size.
         return Broadcast(dim, dim_size)
 
     def inputs(self) -> Iterable[DimSpec]:
+        # [FUNCTION DOC] Return the single child spec being broadcast.
         return (self.dim,)
 
 
 @dataclass
 class NewDim(DimSpec):
+    # [CLASS DOC] Output dim newly created by the op, with given size and no input source.
     """This is a new dimension created by the op."""
 
     size: int
 
     @classmethod
     def new(cls, size: int) -> DimSpec:
+        # [FUNCTION DOC] Return a Singleton if the size is provably one, otherwise a NewDim of that size.
         from torch.fx.experimental.symbolic_shapes import guard_or_false
 
         return Singleton() if guard_or_false(size == 1) else NewDim(size)
@@ -165,6 +194,7 @@ class NewDim(DimSpec):
 
 @dataclass
 class Repeat(DimSpec):
+    # [CLASS DOC] Output dim formed by repeating input spec input_dim a number of times. Children: input_dim.
     """Output dimension is the input dimension repeated n-times."""
 
     input_dim: DimSpec
@@ -172,6 +202,8 @@ class Repeat(DimSpec):
 
     @classmethod
     def new(cls, dim: DimSpec, times: int) -> DimSpec:
+        # [FUNCTION DOC] Build a repeat spec: returns dim itself if times is provably one, a Broadcast if dim is a Singleton,
+        # otherwise a Repeat.
         from torch.fx.experimental.symbolic_shapes import guard_or_false
 
         if guard_or_false(times == 1):
@@ -183,17 +215,21 @@ class Repeat(DimSpec):
             return Repeat(dim, times)
 
     def inputs(self) -> Iterable[DimSpec]:
+        # [FUNCTION DOC] Return the single child spec being repeated.
         return (self.input_dim,)
 
 
 @dataclass
 class Flatten(DimSpec):
+    # [CLASS DOC] Output dim formed by flattening several input dim specs (input_dims), keeping the right-most adjacent
+    # elements adjacent. Children: input_dims.
     """Flatten a set of input dimensions, ensuring right-most adjacent elements remain adjacent in the output."""
 
     input_dims: Sequence[DimSpec]
 
     @classmethod
     def new(cls, dims: Sequence[DimSpec]) -> DimSpec:
+        # [FUNCTION DOC] Build a flatten spec: Singleton for no dims, the dim itself for one dim, otherwise a Flatten.
         if len(dims) == 0:
             # flattening a scalar leads to a singleton
             return Singleton()
@@ -204,11 +240,14 @@ class Flatten(DimSpec):
             return Flatten(dims)
 
     def inputs(self) -> Iterable[DimSpec]:
+        # [FUNCTION DOC] Return the child specs being flattened.
         return self.input_dims
 
 
 @dataclass
 class Split(DimSpec):
+    # [CLASS DOC] Output dim that is member split_id of a decomposition of input spec input_dim into group_shape sizes.
+    # The input spec may itself be a Flatten. Children: input_dim.
     """
     This dimension is a member of a decomposition of the input dim.
 
@@ -221,6 +260,10 @@ class Split(DimSpec):
 
     @classmethod
     def new(cls, dim: DimSpec, group_shape: tuple[int, ...], idx: int) -> DimSpec:
+        # [FUNCTION DOC] Build a split spec for member idx of a group of sizes group_shape. Returns the input dim for a one-element
+        # group and a Singleton if that member is provably size one. Otherwise drops provably-singleton members from the group and
+        # returns a Split with the adjusted shape and index. Raises an error if the group is empty or idx is nonzero for a
+        # single-element group.
         from torch.fx.experimental.symbolic_shapes import guard_or_false, guard_or_true
 
         if not len(group_shape) > 0:
@@ -247,16 +290,20 @@ class Split(DimSpec):
             return Split(dim, new_group_shape, new_idx)
 
     def inputs(self) -> Iterable[DimSpec]:
+        # [FUNCTION DOC] Return the single child spec being split.
         return (self.input_dim,)
 
 
 def dim_pad_left(ndim: int, min_dims: int) -> DimMap:
+    # [FUNCTION DOC] Return a dim map for ndim input dims left-padded with Singleton dims until at least min_dims output dims.
     return (Singleton(),) * max(0, min_dims - ndim) + tuple(
         InputDim(i) for i in range(ndim)
     )
 
 
 def dim_atleast_3d(ndim: int) -> DimMap:
+    # [FUNCTION DOC] Return a dim map for the atleast 3d op: pads 0-2 dim inputs with singletons (0d: three; 1d: front and back;
+    # 2d: trailing), and passes higher ranks through.
     if ndim == 0:
         return (Singleton(), Singleton(), Singleton())
     elif ndim == 1:
@@ -268,6 +315,9 @@ def dim_atleast_3d(ndim: int) -> DimMap:
 
 
 def expand(input_shape: Shape, shape: Shape) -> DimMap:
+    # [FUNCTION DOC] Build the dim map for expand/broadcast of input_shape to shape: left-pad with singletons, check that each
+    # dim is compatible (input size one, desired -1, or equal), and wrap with Broadcast where the size changes. Raises
+    # an error if shape has fewer dims or sizes are incompatible.
     """Implement broadcast on multiple dimensions."""
     from torch.fx.experimental.symbolic_shapes import guard_or_false
 
@@ -311,6 +361,8 @@ def expand(input_shape: Shape, shape: Shape) -> DimMap:
 
 
 def normalize_sizes(sizes: Shape | tuple[Shape]) -> Shape:
+    # [FUNCTION DOC] Normalize a sizes argument that may be either varargs ints or a single tuple, returning the shape tuple.
+    # Raises RuntimeError if neither form.
     if isinstance(sizes[0], (int, torch.SymInt)):
         return cast(Shape, sizes)
     elif len(sizes) == 1:
@@ -320,6 +372,8 @@ def normalize_sizes(sizes: Shape | tuple[Shape]) -> Shape:
 
 
 def dim_flatten(ndim: int, start_dim=0, end_dim=-1) -> DimMap:
+    # [FUNCTION DOC] Build the dim map for flatten from start_dim to end_dim (inclusive, negative end wraps); other dims pass
+    # through. Zero-dim input gives one Singleton; one-dim input passes through. start_dim is not normalized for negatives.
     if ndim == 0:
         return (Singleton(),)
     elif ndim == 1:
@@ -342,6 +396,8 @@ def dim_movedim(
     input: DimsType,
     destination: DimsType,
 ) -> DimMap:
+    # [FUNCTION DOC] Build the dim map for movedim: normalizes source and destination dims, places each source at its destination,
+    # and fills remaining slots with unused inputs in order. Raises an error on length mismatch, repeated dims or out-of-range dims.
     input = normalize_dims(input, ndim)
     destination = normalize_dims(destination, ndim)
 
@@ -374,6 +430,8 @@ def dim_movedim(
 
 
 def dim_repeat(ndim: int, sizes: Shape) -> DimMap:
+    # [FUNCTION DOC] Build the dim map for repeat: extra leading repeat sizes become repeated singletons, the rest repeat
+    # the matching input dims. Raises an error if there are fewer repeat sizes than input dims.
     sizes = normalize_sizes(sizes)
     if not len(sizes) >= ndim:
         raise AssertionError(
@@ -386,6 +444,8 @@ def dim_repeat(ndim: int, sizes: Shape) -> DimMap:
 
 
 def infer_size(total_size: int, sizes: Shape) -> Shape:
+    # [FUNCTION DOC] Resolve a single -1 entry in sizes using total_size, returning the concrete shape. Checks (raising on
+    # failure) that at most one dim is inferred, that the inferred size is integral, or that sizes multiply to total_size.
     """
     One dimension input to view may be "-1".
 
@@ -413,6 +473,10 @@ def infer_size(total_size: int, sizes: Shape) -> Shape:
 
 
 def view_groups(from_size: Shape, to_size: Shape) -> DimMap:
+    # [FUNCTION DOC] Decompose a reshape from from_size to to_size into a dim map with one entry per output dim.
+    # Walks both shapes in groups of equal element counts: forward, Flatten of several input dims, or Split of one
+    # (possibly flattened) input dim; singleton dims are handled by backtracking. Unresolvable symbolic cases fall back
+    # to one conservative group over the remaining dims. Raises on mismatched element counts or multiple -1.
     """
     Decompose a reshape operation into forwarding, flattening, or splitting dimensions for each output dimension.
 
@@ -552,12 +616,14 @@ def view_groups(from_size: Shape, to_size: Shape) -> DimMap:
 
 
 def dim_tile(ndim: int, dims: tuple[int, ...]) -> DimMap:
+    # [FUNCTION DOC] Build the dim map for tile: left-pad dims with ones to ndim, then behave like repeat.
     if len(dims) < ndim:
         dims = (1,) * (ndim - len(dims)) + dims
     return dim_repeat(ndim, dims)
 
 
 def dim_transpose(ndim: int, dim1: int, dim2: int) -> DimMap:
+    # [FUNCTION DOC] Build the dim map for transposing two dims (negative allowed): identity with those two swapped. Raises if out of range.
     dim1 = normalize_dim(dim1, ndim)
     dim2 = normalize_dim(dim2, ndim)
     if not dim1 < ndim:
@@ -572,6 +638,9 @@ def dim_transpose(ndim: int, dim1: int, dim2: int) -> DimMap:
 
 
 def dim_squeeze(shape: Shape, dim: DimsType | None = None) -> DimMap:
+    # [FUNCTION DOC] Build the dim map for squeeze on a local shape with optional dim(s) (None means all dims).
+    # Keeps every dim that is not targeted, or whose size is greater than one or not provably one; negative dims are normalized.
+    # The caller is expected to have already limited squeeze to globally-singleton dims.
     # Operates on local shape; sharding_prop rewrites squeeze ops to squeeze.dims
     # with only globally-singleton dims before this is called.
     from torch.fx.experimental.symbolic_shapes import guard_or_true
@@ -591,6 +660,7 @@ def dim_squeeze(shape: Shape, dim: DimsType | None = None) -> DimMap:
 
 
 def dim_unsqueeze(ndim: int, dim: int) -> DimMap:
+    # [FUNCTION DOC] Build the dim map for unsqueeze: identity map with a Singleton inserted at dim (negative counts from the end of the result).
     dims = tuple(InputDim(i) for i in range(ndim))
     if dim < 0:
         dim += ndim + 1
@@ -598,6 +668,8 @@ def dim_unsqueeze(ndim: int, dim: int) -> DimMap:
 
 
 def dim_view_as_real(shape: Shape) -> DimMap:
+    # [FUNCTION DOC] Build the dim map for view_as_real on a (complex) shape: all dims pass through except the last, which is
+    # split into the original last size and a new trailing dim of size two (two Split members of one input dim).
     ndim = len(shape)
     results: list[DimSpec] = [InputDim(i) for i in range(ndim - 1)]
     # each complex number is split into two real numbers,
@@ -608,6 +680,8 @@ def dim_view_as_real(shape: Shape) -> DimMap:
 
 
 def dim_reduction(ndim: int, dim_or_dims: DimsType | None, keepdim: bool) -> DimMap:
+    # [FUNCTION DOC] Build the fallback dim map for a reduction over dim_or_dims (None means all; negatives are normalized).
+    # Reduced dims become Singleton when keepdim is true and are dropped otherwise; others pass through as InputDim.
     """
     General fallback for reduction ops where Partial() does not apply.
 
@@ -658,6 +732,10 @@ def propagate_shape_and_sharding(
     mesh_sizes: Shape,
     strict_view: bool = False,
 ) -> tuple[Sequence[Placement], Sequence[Placement]]:
+    # [FUNCTION DOC] Propagate sharding through a view-like op given the input placements, global input shape, a dim map rule,
+    # mesh sizes and a strict_view flag. Returns (target input placements, output placements): input placements
+    # that cannot stay sharded become Replicate; outputs follow mapped dims (flatten may yield strided shards).
+    # Raises RuntimeError in strict mode if resharding would be required.
     """
     Determine input target sharding and output sharding based on
     given global tensor shape and input source sharding.
@@ -680,6 +758,10 @@ def propagate_shape_and_sharding(
 
 
 class _ViewShardingPropagator:
+    # [CLASS DOC] HELPER: Two-phase sharding propagator for view ops. State: input placements, global input shape, dim map rule,
+    # mesh sizes, strict flag, shard_allowed (input dim to per-mesh-dim bools), matched_strided_mesh_dims and
+    # strict_replicate_fallback. analyze (phase 1) decides which input shardings survive and maps input dims to output dims;
+    # rewrite_output_placements (phase 2) converts surviving placements to output placements mesh dim by mesh dim.
     """Two-phase sharding propagator for view ops.
 
     Phase 1 — ``analyze()``:
@@ -708,6 +790,8 @@ class _ViewShardingPropagator:
         mesh_sizes: Shape,
         strict_view: bool,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Store the inputs and initialize empty analysis state (shard_allowed, matched strided mesh dims,
+        # strict replicate fallback set); mesh_ndim is the number of mesh sizes.
         self.input_src_placements = input_src_placements
         self.global_input_shape = global_input_shape
         self.rule = rule
@@ -730,6 +814,10 @@ class _ViewShardingPropagator:
     def analyze(
         self,
     ) -> tuple[Sequence[Placement], dict[int, list[int]]]:
+        # [FUNCTION DOC] HELPER: Phase 1. Walk the rule, refine which input dims may stay sharded on which mesh dims, and build the
+        # mapping from input dim to output dims (flatten maps all sharded inputs to one output; splits append further outputs
+        # to their root input dim). Returns (input target placements, that mapping); unshardable shards become Replicate, or raise
+        # RuntimeError in strict mode unless a replicate fallback was recorded. Mutates shard_allowed.
         """Phase 1: walk the DimMap rule, return (input_tgt_placements, input_to_output_tensor_dims)."""
         input_dims_in_rule = self._input_dims_in_rule(self.rule)
 
@@ -823,6 +911,9 @@ class _ViewShardingPropagator:
         input_tgt_placements: Sequence[Placement],
         input_to_output_tensor_dims: dict[int, list[int]],
     ) -> list[Placement]:
+        # [FUNCTION DOC] HELPER: Phase 2. For each mesh dim in order, rewrite Shard and _StridedShard target placements into output
+        # placements using the dim mapping, tracking claimed (input dim, output dim) pairs and per-dim local shapes;
+        # other placements pass through. Returns the output placements list.
         """Phase 2: consume analyze() outputs, return final output placements."""
         # (input_dim, output_dim) pairs claimed by earlier mesh dims
         # (via _rewrite_strided_shard), to avoid double-assignment.
@@ -864,10 +955,12 @@ class _ViewShardingPropagator:
 
     @staticmethod
     def _input_dims_in_rule(rule: DimMap) -> set[int]:
+        # [FUNCTION DOC] HELPER: Return the set of all input dim indices appearing anywhere in the rule tree.
         """Walk the DimMap rule tree and return all input dim indices that appear in it."""
         seen: set[int] = set()
 
         def _walk(cmd: DimSpec) -> None:
+            # [FUNCTION DOC] HELPER: Recursively record input dims in this spec and its children into the enclosing set.
             if isinstance(cmd, InputDim):
                 seen.add(cmd.input_dim)
             for inp in cmd.inputs():
@@ -880,6 +973,8 @@ class _ViewShardingPropagator:
     def _find_plain_shard(
         self, input_dim: InputDim
     ) -> tuple[int | None, Shard | _StridedShard | None]:
+        # [FUNCTION DOC] HELPER: Find the first mesh dim with a plain Shard (not strided) on the given input dim.
+        # Returns (mesh dim, placement) or (None, None).
         """Find the mesh dim with a plain Shard on ``input_dim``.
 
         Only matches Shard, not _StridedShard.  Used by both _analyze_flatten
@@ -897,6 +992,9 @@ class _ViewShardingPropagator:
         cmd: Split,
         placements: Sequence[Placement],
     ) -> tuple[int | None, Shard | _StridedShard | None]:
+        # [FUNCTION DOC] HELPER: Find an unmatched mesh dim sharding current_dim for a split. Plain Shards match directly;
+        # a _StridedShard matches only if its split_factor equals the expected residual factor. Returns
+        # (mesh dim, placement) or (None, None).
         """Find the mesh dim and placement for an input dim in Split ops.
 
         Matches both Shard and _StridedShard:
@@ -925,6 +1023,9 @@ class _ViewShardingPropagator:
         return None, None
 
     def _analyze_flatten(self, cmd: Flatten) -> list[InputDim]:
+        # [FUNCTION DOC] HELPER: Update shard_allowed for a Flatten and return the sharded input dims (or the first input dim if none
+        # are sharded). Strict mode raises RuntimeError for uneven sharding on a non-last flattened dim; non-strict mode allows
+        # only the first dim and only if evenly divisible. Raises an error if a child is not an InputDim.
         """Fill self.shard_allowed for Flatten; return sharded input dims."""
         from torch.fx.experimental.symbolic_shapes import guard_or_true
 
@@ -975,6 +1076,10 @@ class _ViewShardingPropagator:
         return [cmd.input_dims[0]]
 
     def _analyze_split(self, cmd: Split) -> list[InputDim]:
+        # [FUNCTION DOC] HELPER: Update shard_allowed for a Split and return its input dim only for member zero (empty otherwise).
+        # Plain shards on non-first flattened dims are demoted with a replicate fallback. Member zero allows sharding on mesh dims
+        # dividing its size, raising in strict mode for plain shards that do not divide. Strided shards are matched to the member,
+        # recorded in matched_strided_mesh_dims, and allowed if divisible or last (strict raises for uneven non-last).
         """Fill self.shard_allowed for Split; return shardable input dims."""
         from torch.fx.experimental.symbolic_shapes import guard_or_false, guard_or_true
 
@@ -1061,6 +1166,8 @@ class _ViewShardingPropagator:
         return [in_dim] if cmd.split_id == 0 else []
 
     def _analyze_dim(self, cmd: DimSpec) -> list[InputDim]:
+        # [FUNCTION DOC] HELPER: Dispatch analysis by DimSpec kind: InputDim returns itself, Flatten and Split use their analyzers,
+        # Repeat forbids sharding on its input dims and returns nothing, others return nothing.
         """Dispatch one DimSpec: update self.shard_allowed, return input dim(s) to shard on."""
         if isinstance(cmd, InputDim):
             return [cmd]
@@ -1087,6 +1194,8 @@ class _ViewShardingPropagator:
         flatten_start: int,
         flatten_end: int,
     ) -> bool:
+        # [FUNCTION DOC] HELPER: Return True if no later mesh dim shards a tensor dim in the flatten range [flatten_start,
+        # flatten_end) at or above this mesh dim's tensor dim. Raises an error if the placement is not a shard.
         """Check if no later mesh dim shards a dim within the flatten range at or above this one.
 
         Uneven sharding on dim d breaks stride computation for all earlier dims
@@ -1115,6 +1224,8 @@ class _ViewShardingPropagator:
         mesh_dim: int,
         placements: Sequence[Placement],
     ) -> int | torch.SymInt | None:
+        # [FUNCTION DOC] HELPER: Compute the expected split factor of a split member: the product of earlier group sizes, divided by the
+        # mesh sizes of earlier mesh dims sharding the same input dim. Returns None if any division is not exact.
         """Compute the residual split factor for ``cmd`` after earlier mesh dims.
 
         Starts from ``math.prod(cmd.group_shape[:cmd.split_id])`` and divides
@@ -1139,6 +1250,9 @@ class _ViewShardingPropagator:
         p: _StridedShard,
         mesh_dim: int,
     ) -> int | None:
+        # [FUNCTION DOC] HELPER: Find an output dim among tgt_shard_dims where a strided shard can stay strided. Requires the input
+        # dim size to be divisible by mesh size times split factor, and the per-shard chunk (including trailing flattened dims)
+        # to be a multiple of the inner split size. Returns the first fitting dim or None.
         """Find an output dim where SS stays as SS.
 
         Returns the first output dim whose Split can accommodate the combined
@@ -1184,6 +1298,10 @@ class _ViewShardingPropagator:
         local_tensor_shapes: list[int],
         input_to_output_tensor_dims: dict[int, list[int]],
     ) -> tuple[Placement, list[int]]:
+        # [FUNCTION DOC] HELPER: Map a plain Shard on a mesh dim to an output placement. Picks an unclaimed output dim (the member-zero
+        # split when several), then: split or identity gives Shard on it; flatten gives Shard if the dim is first, else a
+        # _StridedShard with split factor from earlier local sizes. Raises on missing dims, symbolic factors without a hint, or
+        # uneven non-last flatten sharding. Returns (placement, local shapes with this mesh dim's division applied).
         """Given a plain Shard(dim=X) input placement on a specific mesh dim,
         determine what output placement it maps to after the view op.
 
@@ -1295,6 +1413,10 @@ class _ViewShardingPropagator:
         local_tensor_shapes: list[int],
         input_to_output_tensor_dims: dict[int, list[int]],
     ) -> tuple[Placement, list[int]]:
+        # [FUNCTION DOC] HELPER: Map a _StridedShard on a mesh dim to an output placement. First tries to resolve to a plain Shard on a
+        # split output dim whose expected split factor matches (claiming that dim pair); else keeps it strided on a dim that fits,
+        # falling back to the first unclaimed dim. Raises RuntimeError in strict mode on an unflatten mismatch and an error if no
+        # unclaimed dim exists. Returns (placement, local shapes with the division applied).
         """Rewrite _StridedShard placement to target the correct output dim.
 
         _StridedShard inputs arise from a prior flatten on a non-first dim
@@ -1369,6 +1491,10 @@ def register_op_strategy_map(
     schema_info: RuntimeSchemaInfo | None = None,
     strict_view: bool = False,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Register an op strategy for a view-like aten overload using the dim map for local_op_name. The registered
+    # strategy computes the dim map from the op's arguments, runs shape and sharding propagation for each input strategy, and builds
+    # output strategies with redistribute costs to the target input placement. strict_view makes resharding an error.
+    # Side effect: registers with the DTensor strategy registry; no return value.
     """
     Helper that registers strategies for view-like operators that follow a pattern:
       (1) define the way input dims are split/combined to form output dims (dim_maps)
@@ -1382,6 +1508,10 @@ def register_op_strategy_map(
 
     @register_op_strategy(aten_op_overload, schema_info=schema_info)
     def reshape_strategy(op_schema: OpSchema) -> StrategyType:
+        # [FUNCTION DOC] HELPER: Build the output strategy for the view-like op: for each input strategy, propagate sharding through
+        # the dim map and emit an OpSpec with target input spec, output spec and redistribute cost. Raises an error if the input shape
+        # is missing.
+        # KNOWN ISSUE: a FIXME notes the result can be wrong for placements like Shard(0) on two mesh dims.
         rules = dim_map(*op_schema.args_schema, **op_schema.kwargs_schema)
         input_strategy = cast(OpStrategy, op_schema.args_schema[0])
         mesh = op_schema.get_mesh_from_args(validate=False)
@@ -1500,6 +1630,9 @@ register_op_strategy_map(
 
 @register_single_dim_strategy(aten.view_as_complex.default)
 def view_as_complex_single_dim_strategy(op, args_schema, kwargs_schema):
+    # [FUNCTION DOC] Single-dim strategy for view_as_complex (real [..., 2] to complex [...]). Leading dims shard identically in
+    # input and output; the last dim cannot be sharded. Sum and avg partials pass through; max and min are invalid for
+    # complex numbers. Raises an error if the input is not tensor metadata. Returns the list of rules.
     # view_as_complex: float [..., 2] -> complex [...]
     # Dims 0..ndim-2 map 1:1; last dim (real/imag pair) is consumed.
     # P(max)/P(min) invalid: complex numbers have no total ordering.

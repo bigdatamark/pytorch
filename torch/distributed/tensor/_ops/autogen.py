@@ -1,4 +1,10 @@
 #  Copyright (c) Meta Platforms, Inc. and affiliates
+# [MODULE DOC] Automatic registration of single-dim sharding strategies for ATen op variants.
+# Given strategies registered manually for base ops, discovers related overloads (in-place,
+# out, functional, foreach) by inspecting op schemas and registers wrapper strategies that
+# reuse the base strategy. Main entry point: auto_register_op_variants, which mutates the
+# DTensor sharding propagator's registries. Import has no side effects; the rest are helpers
+# for schema inspection, variant discovery, and strategy wrapping.
 """Schema-discovered registration of single-dim strategy variants.
 
 Manual single-dim registrations target the semantic base op.
@@ -27,6 +33,7 @@ from torch.distributed.tensor.placement_types import Placement
 
 
 def _tensor_schema_count(schema_values: Sequence[Any]) -> int:
+    # [FUNCTION DOC] HELPER: Return the number of entries (arguments or returns) whose schema type mentions Tensor.
     """Count Tensor-valued entries in an ATen schema sequence.
 
     Variant discovery uses this to reject overloads with incompatible arity.
@@ -35,11 +42,13 @@ def _tensor_schema_count(schema_values: Sequence[Any]) -> int:
 
 
 def _schema_tensor_output_count(op: OpOverload) -> int:
+    # [FUNCTION DOC] HELPER: Return the number of Tensor-valued returns of the given overload's schema.
     """Count Tensor-valued returns for an ATen overload."""
     return _tensor_schema_count(op._schema.returns)
 
 
 def _is_write_arg(arg: Any) -> bool:
+    # [FUNCTION DOC] HELPER: Return True if the schema argument has alias info marking it as written (mutated).
     """Return whether a schema argument is mutated by the op.
 
     Schema alias info is the reliable way to identify explicit out args and
@@ -49,6 +58,7 @@ def _is_write_arg(arg: Any) -> bool:
 
 
 def _is_foreach_like_op_name(op_name: str) -> bool:
+    # [FUNCTION DOC] HELPER: Return True if the op name starts with a foreach, amp foreach or fused ATen prefix.
     """Return whether the op name uses foreach/fused naming conventions.
 
     These ops are already aggregate/list variants, so they should not be used
@@ -62,6 +72,9 @@ def _is_foreach_like_op_name(op_name: str) -> bool:
 def _schema_args_are_same(
     base_args: Sequence[Any], candidate_args: Sequence[Any]
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Return True if two schema argument lists match in length and, per position,
+    # in name, kwarg-only flag and normalized type. Used to ensure an out variant differs from the
+    # base op only in its output args.
     """Return whether two schema arg lists are identical for strategy reuse.
 
     Out variants require this stricter check so only the written output args are
@@ -78,11 +91,13 @@ def _schema_args_are_same(
 
 
 def _is_explicit_out_arg(arg: Any) -> bool:
+    # [FUNCTION DOC] HELPER: Return True if the schema argument carries a truthy is_out attribute (False if absent).
     """Return whether a schema argument is an explicit output argument."""
     return bool(getattr(arg, "is_out", False))
 
 
 def _schema_non_alias_tensor_output_indices(op: OpOverload) -> list[int]:
+    # [FUNCTION DOC] HELPER: Return the indices of Tensor returns that carry no alias info (real new outputs, not mutated-input aliases).
     """Return tensor return indices that are not aliases of mutable inputs."""
     indices: list[int] = []
     for idx, ret in enumerate(op._schema.returns):
@@ -92,6 +107,7 @@ def _schema_non_alias_tensor_output_indices(op: OpOverload) -> list[int]:
 
 
 def _schema_written_tensor_arg_count(op: OpOverload) -> int:
+    # [FUNCTION DOC] HELPER: Return the number of Tensor-typed arguments that the op writes (mutates).
     """Count Tensor-valued arguments written by an op."""
     return sum(
         1
@@ -101,6 +117,8 @@ def _schema_written_tensor_arg_count(op: OpOverload) -> int:
 
 
 def _functional_variant_tensor_output_count(base_op: OpOverload) -> int:
+    # [FUNCTION DOC] HELPER: Return the expected tensor output count of the functional variant of a mutable op:
+    # non-alias tensor returns plus one updated copy per written tensor argument.
     """Return expected tensor outputs for a functionalization variant.
 
     Mutable ops can have real tensor returns and/or alias returns for mutated
@@ -113,6 +131,7 @@ def _functional_variant_tensor_output_count(base_op: OpOverload) -> int:
 
 
 def _iter_packet_overloads(packet: Any | None) -> list[OpOverload]:
+    # [FUNCTION DOC] HELPER: Return the list of overloads in an overload packet, skipping names that fail lookup; empty list if packet is None.
     """Return overloads from an overload packet, skipping lookup misses."""
     if packet is None:
         return []
@@ -125,6 +144,8 @@ def _iter_packet_overloads(packet: Any | None) -> list[OpOverload]:
 
 
 def _count_tensor_meta_values(value: object) -> int:
+    # [FUNCTION DOC] HELPER: Count TensorMeta leaves in a value, recursing through lists and tuples.
+    # Returns 1 for a TensorMeta, the sum over items for a sequence, 0 for anything else.
     """Count TensorMeta leaves in a value that may contain nested tuples/lists.
 
     Strategy rule indices are based on tensor leaves, not raw schema argument
@@ -140,6 +161,9 @@ def _count_tensor_meta_values(value: object) -> int:
 def _clone_schema_info(
     schema_info: RuntimeSchemaInfo | None, *, needs_pytree: bool | None = None
 ) -> RuntimeSchemaInfo | None:
+    # [FUNCTION DOC] HELPER: Return a fresh copy of the runtime schema info (static_argnum, copied static_kwargkey list,
+    # needs_pytree), with needs_pytree overridden when the argument is not None. If the input is None, returns
+    # None, or a new info with only needs_pytree set when an override is given.
     """Copy schema cache metadata, optionally overriding pytree flattening.
 
     Auto-registered variants should inherit the base op cache behavior unless
@@ -164,6 +188,9 @@ def _clone_schema_info(
 def _clone_strategy_info(
     info: _SingleDimStrategyInfo, func: _SingleDimStrategyFunc
 ) -> _SingleDimStrategyInfo:
+    # [FUNCTION DOC] HELPER: Return a copy of the single-dim strategy info with func replaced, preserving the
+    # allow_unbacked_sharding and allow_uneven_sharding flags and a copied different_mesh_args list.
+    # KNOWN ISSUE: full_mesh_strategy_filter is not copied, so variants lose the base op's filter.
     """Copy strategy options while replacing the underlying strategy function.
 
     Variant wrappers must preserve base-op flags such as uneven sharding support.
@@ -181,6 +208,8 @@ def _clone_strategy_info(
 
 
 def _canonical_variant_base_name(op: OpOverload) -> tuple[str, str]:
+    # [FUNCTION DOC] HELPER: Return the (namespace, base name) of an overload with a trailing functional
+    # suffix removed, or with the trailing underscore removed when the op is mutable.
     """Return the namespace and base name shared by related ATen variants."""
     namespace, base_name = _op_namespace_and_base_name(op)
     if base_name.endswith("_functional"):
@@ -196,6 +225,9 @@ def _strip_output_args_for_base_call(
     args_schema: ArgsType,
     kwargs_schema: KwargsType,
 ) -> tuple[ArgsType, KwargsType]:
+    # [FUNCTION DOC] HELPER: Remove explicit out arguments from the positional args and kwargs of an out overload call.
+    # Walks the non-kwarg-only schema arguments in order, pairing them with positional values (stopping when
+    # values run out), and drops those whose name is in output_arg_names. Returns (args tuple, kwargs mapping).
     """Drop explicit out args before invoking the functional base strategy.
 
     Base strategy functions do not expect the extra writable tensors from the
@@ -222,6 +254,9 @@ def _strip_output_args_for_base_call(
 
 
 def _find_inplace_variant_overloads(base_op: OpOverload) -> list[OpOverload]:
+    # [FUNCTION DOC] HELPER: Find in-place overloads (name plus trailing underscore) matching base_op.
+    # Returns an empty list if base_op is mutable, foreach-like, or has explicit out args, or the packet is missing.
+    # A candidate must be mutable, have the same tensor output count and matching schema arguments.
     """Find an inplace overload that has the same tensor schema as base_op.
 
     Inplace variants can reuse the base strategy only when inputs and outputs
@@ -255,6 +290,10 @@ def _find_inplace_variant_overloads(base_op: OpOverload) -> list[OpOverload]:
 def _find_out_variant_overloads(
     base_op: OpOverload,
 ) -> list[tuple[OpOverload, tuple[str, ...]]]:
+    # [FUNCTION DOC] HELPER: Find out overloads of base_op in the same packet.
+    # Returns a list of (overload, output arg names). Returns empty for foreach-like ops, functional names,
+    # ops with explicit out args, or ops with no tensor outputs. A candidate must be mutable, have one Tensor
+    # explicit out arg per base output, and identical non-out arguments to the base schema.
     """Find an out overload and return its written output arg names.
 
     Out variants need extra strategy inputs for the provided output tensors.
@@ -302,6 +341,9 @@ def _find_out_variant_overloads(
 
 
 def _find_functional_variant_overloads(base_op: OpOverload) -> list[OpOverload]:
+    # [FUNCTION DOC] HELPER: Find non-mutable overloads in the packet named base name plus functional suffix.
+    # Applies only when base_op writes some argument and has no out args and is not foreach-like. A candidate
+    # must have matching arguments and the expected functional tensor output count.
     """Find the functional variant generated from a mutable base overload.
 
     Functional variants return updated copies of mutable inputs, so their extra
@@ -335,6 +377,9 @@ def _find_functional_variant_overloads(base_op: OpOverload) -> list[OpOverload]:
 
 
 def _find_foreach_variants(base_op: OpOverload) -> list[OpOverload]:
+    # [FUNCTION DOC] HELPER: Find non-out foreach overloads (foreach name, and its in-place form) whose resolved
+    # elementwise overload equals base_op. Only aten ops that are non-mutable, not foreach-like and that
+    # have tensor outputs qualify; otherwise returns an empty list.
     """Find elementwise foreach overloads that can reuse base_op's strategy.
 
     Foreach variants are registered in one pass because newly registered
@@ -367,6 +412,8 @@ def _find_foreach_variants(base_op: OpOverload) -> list[OpOverload]:
 def _make_same_schema_variant_strategy_fn(
     base_fn: _SingleDimStrategyFunc, base_op: OpOverload
 ) -> _SingleDimStrategyFunc:
+    # [FUNCTION DOC] HELPER: Return a strategy function that ignores the op it is called with and invokes base_fn
+    # with base_op, passing the schemas through unchanged.
     """Wrap base_fn so a same-schema variant uses base-op strategy logic.
 
     Passing base_op keeps op-sensitive strategy functions on their original
@@ -376,6 +423,7 @@ def _make_same_schema_variant_strategy_fn(
     def strategy(
         op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
     ) -> list[list[Placement | _ShardingPlaceholder]]:
+        # [FUNCTION DOC] HELPER: Delegate to the base strategy function using base_op instead of op.
         return base_fn(base_op, args_schema, kwargs_schema)
 
     return strategy
@@ -387,6 +435,9 @@ def _make_out_variant_strategy_fn(
     out_op: OpOverload,
     output_arg_names: tuple[str, ...],
 ) -> _SingleDimStrategyFunc:
+    # [FUNCTION DOC] HELPER: Return a strategy function for an out overload. It strips the out args, calls base_fn
+    # on the remaining args with base_op, then appends to each rule the placements for each out tensor,
+    # taken from the rule position of the matching output.
     """Wrap base_fn so out tensors appear as extra strategy inputs.
 
     DTensor dispatch cannot redistribute out kwargs, so generated rules must
@@ -403,6 +454,9 @@ def _make_out_variant_strategy_fn(
         arg_name: str,
         value: object,
     ) -> list[Placement | _ShardingPlaceholder]:
+        # [FUNCTION DOC] HELPER: Return the placements to append for one out argument: none if it holds no tensors;
+        # the first base-output placements if it is a tensor list and the only out arg; otherwise the
+        # single rule entry for that arg's output index.
         """Return placements to append for one explicit out argument."""
         tensor_count = _count_tensor_meta_values(value)
         if tensor_count == 0:
@@ -414,6 +468,8 @@ def _make_out_variant_strategy_fn(
     def strategy(
         op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
     ) -> list[list[Placement | _ShardingPlaceholder]]:
+        # [FUNCTION DOC] HELPER: Compute base rules from args with out args stripped, then extend each rule with
+        # out-argument placements gathered from positional and keyword values. Returns the new rule list.
         base_args, base_kwargs = _strip_output_args_for_base_call(
             out_op, output_arg_name_set, args_schema, kwargs_schema
         )
@@ -451,6 +507,9 @@ def _make_out_variant_strategy_fn(
 def _make_functional_variant_strategy_fn(
     base_fn: _SingleDimStrategyFunc, base_op: OpOverload
 ) -> _SingleDimStrategyFunc:
+    # [FUNCTION DOC] HELPER: Return a strategy function for a functional variant of a mutable op. Its outputs are the
+    # base non-alias outputs followed by updated copies of the mutated inputs, which take those inputs'
+    # placements; remaining input placements are kept.
     """Wrap mutable base_fn for functional variants with extra mutated outputs.
 
     The added functional outputs represent updated mutable inputs and therefore
@@ -465,6 +524,8 @@ def _make_functional_variant_strategy_fn(
     def _mutable_input_rule_indices(
         args_schema: ArgsType, kwargs_schema: KwargsType
     ) -> list[int]:
+        # [FUNCTION DOC] HELPER: Return rule positions (output count plus tensor input offset) of the tensor inputs written
+        # by the base op, walking schema arguments with positional or keyword values and counting tensor leaves.
         """Map mutable schema args to their positions in a base strategy rule."""
         mutable_indices: list[int] = []
         tensor_input_idx = 0
@@ -490,6 +551,8 @@ def _make_functional_variant_strategy_fn(
     def strategy(
         op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
     ) -> list[list[Placement | _ShardingPlaceholder]]:
+        # [FUNCTION DOC] HELPER: Run base_fn, then build each rule as non-alias output placements, mutated-input
+        # placements, and the original input placements. Returns the list of rules.
         mutable_input_indices = _mutable_input_rule_indices(args_schema, kwargs_schema)
         base_rules = base_fn(base_op, args_schema, kwargs_schema)
         rules: list[list[Placement | _ShardingPlaceholder]] = []
@@ -507,6 +570,10 @@ def _make_functional_variant_strategy_fn(
 
 
 def auto_register_op_variants() -> None:
+    # [FUNCTION DOC] Register variants for every strategy already in the DTensor sharding propagator registry.
+    # For each base op, discovers in-place, out, functional and foreach overloads and registers wrapped
+    # strategies (cloned strategy and schema info; foreach reuses the same info with pytree enabled).
+    # Skips ops already registered. Mutates the propagator registries; takes no args and returns None.
     """Register schema-discovered variants for existing single-dim strategies.
 
     This keeps manual registrations focused on the semantic base op while

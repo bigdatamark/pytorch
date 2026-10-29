@@ -1,4 +1,11 @@
 #  Copyright (c) Meta Platforms, Inc. and affiliates
+# [MODULE DOC] Single-dim sharding strategy infrastructure for DTensor.
+# A single-dim strategy describes, for one mesh dimension, which input placements produce which
+# output placements (rules are lists of outputs followed by inputs). This module defines the
+# placeholder and info types, expands placeholder rules into concrete Shard/StridedShard/Partial
+# rules, builds lookup tables and output specs, and (further below) searches over multi-dim
+# placements and expands single-dim rules to full-mesh op strategies, plus schema-matching helpers
+# used for foreach and variant registration. Import only defines names and a module logger.
 import functools
 import heapq
 import logging
@@ -41,10 +48,13 @@ logger = logging.getLogger(__name__)
 
 
 def _is_sharding(p: Placement) -> TypeIs[Shard | _StridedShard]:
+    # [FUNCTION DOC] HELPER: Type guard returning True if the placement is a Shard or _StridedShard.
     return isinstance(p, (Shard, _StridedShard))
 
 
 class _ShardingPlaceholder:
+    # [CLASS DOC] HELPER: Placeholder for a sharding placement whose tensor dim is known but whose other
+    # metadata (e.g. split factor of a strided shard) is filled in later. Holds only the dim attribute.
     """
     A placeholder for a sharding placement that has a specified tensor dim, but the other
     metadata (e.g. split factor if it's a StridedShard) will be filled in later.
@@ -53,9 +63,11 @@ class _ShardingPlaceholder:
     dim: int
 
     def __init__(self, dim: int):
+        # [FUNCTION DOC] HELPER: Store the tensor dim to be sharded.
         self.dim = dim
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: Return a string showing the placeholder and its dim.
         return f"_ShardingPlaceholder(dim={self.dim})"
 
 
@@ -81,6 +93,11 @@ _FullMeshStrategyFilter: TypeAlias = Callable[
 
 @dataclass
 class _SingleDimStrategyInfo:
+    # [CLASS DOC] Bundle of a single-dim strategy function with its options.
+    # Fields: func (the strategy function), allow_unbacked_sharding, allow_uneven_sharding (default False),
+    # full_mesh_strategy_filter (optional predicate over mesh, schema and specs), and different_mesh_args
+    # (arg positions that may live on another mesh and must then be Replicate). Instances are callable and
+    # delegate to func.
     func: _SingleDimStrategyFunc
     allow_unbacked_sharding: bool | None = field(default=None)
     allow_uneven_sharding: bool = field(default=False)
@@ -93,6 +110,7 @@ class _SingleDimStrategyInfo:
     # Delegate to func so this can be used interchangeably with a raw
     # _SingleDimStrategyFunc (e.g. in tests that call strategy functions directly).
     def __call__(self, *args, **kwargs):
+        # [FUNCTION DOC] Call the wrapped strategy function with the given arguments and return its result.
         return self.func(*args, **kwargs)
 
 
@@ -104,6 +122,10 @@ def _insert_single_dim_replication_strategy(
     num_input_tensors: int,
     output_tensor_meta: TensorMeta | Sequence[TensorMeta | None] | None = None,
 ) -> list[list[Placement | _ShardingPlaceholder | None]]:
+    # [FUNCTION DOC] HELPER: Ensure the rule list contains an all-Replicate rule, inserting one at the front if absent.
+    # A rule counts as all-Replicate if every entry is Replicate or None. The inserted rule has num_outputs plus
+    # num_input_tensors entries; output slots are None where output_tensor_meta (a sequence) has None, or
+    # where every existing rule has None. Mutates and returns the given list.
     """
     Inserts the [Replicate(), Replicate(), ...] strategy after asserting that such strategy does not yet exist.
     For ops with masked-off outputs (e.g. backward ops with output_mask), output positions
@@ -140,6 +162,11 @@ def _fill_single_dim_strategy_placeholders(
         list[Placement | _ShardingPlaceholder | None]
     ],
 ) -> list[list[Placement | None]]:
+    # [FUNCTION DOC] HELPER: Expand placeholder rules into concrete placements.
+    # Builds one shard constructor per kind of sharding found in the input placements (Shard, or
+    # _StridedShard per distinct split factor). Each rule containing placeholders yields one rule per
+    # constructor with each placeholder replaced by the built shard at its dim; None and concrete placements are
+    # kept; rules without placeholders are passed through. Raises an error if an entry is neither.
     """
     Replace any _ShardingPlaceholder with the specific Sharding types used by the inputs in op_schema.
     Supports implicit replication.
@@ -197,9 +224,13 @@ def _fill_single_dim_strategy_placeholders(
 
 
 def _get_unique_placements(op_schema: OpSchema) -> set[Placement]:
+    # [FUNCTION DOC] HELPER: Collect the set of all placements appearing on DTensorSpec or single-strategy inputs in
+    # args and kwargs, recursing into tuple strategies, lists and tuples. Raises an error if an OpStrategy has
+    # more than one strategy.
     unique_placements = set()
 
     def _update_placements(obj: Any):
+        # [FUNCTION DOC] HELPER: Recursively add the placements of obj to the enclosing set; ignores other types.
         if isinstance(obj, DTensorSpec):
             unique_placements.update(obj.placements)
         elif isinstance(obj, OpStrategy):
@@ -223,9 +254,12 @@ def _get_unique_placements(op_schema: OpSchema) -> set[Placement]:
 
 
 def _get_num_tensor_inputs(op_schema: OpSchema) -> int:
+    # [FUNCTION DOC] HELPER: Count tensor inputs across args and kwargs: one per OpStrategy, one per non-None child of a
+    # tuple strategy, and recursively over lists and tuples.
     num_inputs = 0
 
     def _count(obj: Any) -> int:
+        # [FUNCTION DOC] HELPER: Return the tensor input count of obj as described for the enclosing function.
         if isinstance(obj, OpStrategy):
             return 1
         elif isinstance(obj, TupleStrategy):
@@ -248,6 +282,10 @@ def _build_output_specs(
     num_outputs: int,
     output_metas: tuple[TensorMeta | None, ...],
 ) -> DTensorSpec | tuple[DTensorSpec | None, ...]:
+    # [FUNCTION DOC] HELPER: Build the output DTensorSpec (or tuple of specs) from per-mesh-dim placements, which are
+    # indexed by mesh dim then output. A tuple is returned for multiple outputs, a single spec for one.
+    # An output is None if all its placements are None or its meta is None. Raises an error if num_outputs is
+    # not positive, output_metas length differs, an output mixes None with real placements, or a single output is None.
     """Build output spec(s) by transposing per-mesh-dim placements to per-output.
 
     per_mesh_dim_placements is indexed [mesh_dim][output_idx]. output_metas must
@@ -262,6 +300,8 @@ def _build_output_specs(
         )
 
     def _spec_for_output(out_idx: int) -> DTensorSpec | None:
+        # [FUNCTION DOC] HELPER: Return the spec for one output index across mesh dims, or None for fully-None
+        # or masked-off outputs. Raises an error if None is mixed with placements.
         maybe_placements = tuple(out[out_idx] for out in per_mesh_dim_placements)
         # All mesh dims agreeing on None means the whole output has no
         # DTensorSpec, e.g. local scalar SDPA philox outputs.
@@ -287,6 +327,11 @@ def _build_output_specs(
 
 
 class _PreparedSingleDimStrategy:
+    # [CLASS DOC] HELPER: A single-dim strategy materialized for a specific op call.
+    # Evaluates the strategy function on the op schema metadata, validates rule length, ensures an
+    # all-Replicate rule, expands placeholders, and keeps: expanded_strategies, strategy_lookup (input
+    # placements to output placements), num_inputs, num_outputs, output_metas, allowed_sharding_per_input,
+    # allowed_partial_per_input, and option flags. try_propagate matches per-mesh-dim placements.
     """A single-dim strategy materialized for a specific op.
 
     Expands a strategy function's placeholder-based rules into concrete
@@ -326,6 +371,11 @@ class _PreparedSingleDimStrategy:
         output_tensor_meta: TensorMeta | Sequence[TensorMeta | None] | None,
         num_inputs: int | None = None,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Materialize the strategy for op_schema. Reads options from the info object (or defaults for a raw
+        # function), finds element_mesh from the first OpStrategy arg and raises ValueError if tensor args are on
+        # different meshes (except different_mesh_args), remaps those arg positions to strategy-only positions,
+        # calls the strategy function, raises AssertionError if rule length mismatches outputs plus inputs, and
+        # builds lookup tables and per-input allowed sharding and partial sets.
         # Note: circular import
         from torch.distributed.tensor.placement_types import Partial
 
@@ -478,6 +528,10 @@ class _PreparedSingleDimStrategy:
         input_placements: tuple[tuple[Placement, ...], ...],
         input_specs: list[DTensorSpec],
     ) -> OpStrategy | None:
+        # [FUNCTION DOC] HELPER: Match input placements against the rule table independently on every mesh dim.
+        # Returns None if any dim has no matching rule or an input would not be shardable (uneven sharding is tolerated
+        # only if allowed and the placements are unchanged). Otherwise returns an OpStrategy with one OpSpec holding
+        # the combined output specs, the input specs, and zero redistribute cost.
         """Try to match input placements against single-dim strategy rules on every mesh dim.
 
         Checks whether the given input placements independently match a rule in
@@ -536,6 +590,8 @@ class _PreparedSingleDimStrategy:
 
 
 def _has_default_value(arg: Any) -> bool:
+    # [FUNCTION DOC] HELPER: Return True if the schema argument can be omitted. Uses its has_default_value method
+    # when available, otherwise whether default_value is not None.
     """Return whether a schema argument can be omitted at runtime.
 
     Foreach schemas sometimes omit trailing scalar args that exist on the scalar
@@ -548,6 +604,8 @@ def _has_default_value(arg: Any) -> bool:
 
 
 def _normalize_schema_type(arg: Any, *, list_to_element: bool = False) -> str:
+    # [FUNCTION DOC] HELPER: Return the schema type string of the argument. With list_to_element, a list type string
+    # is reduced to its element type string.
     """Normalize schema type strings for direct and foreach element matching.
 
     In foreach matching, a `List[Tensor]` argument represents one per-element
@@ -567,6 +625,10 @@ def _schema_args_match(
     allow_base_trailing_defaults: bool = False,
     allow_kwonly_scalar_defaults: bool = False,
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Return True if the candidate schema args can reuse the base op strategy.
+    # Fails if the candidate has more args, or any pair differs in normalized type (candidate lists optionally
+    # treated as elements) or kwarg-only flag. Optional leniency: a kwarg-only numeric base arg with a default may be
+    # positional in the candidate; extra base args at the end are allowed if all have defaults.
     """Return whether candidate args can safely reuse the base op strategy.
 
     This is intentionally schema-based so auto-registration does not rely only
@@ -601,12 +663,14 @@ def _schema_args_match(
 
 
 def _op_namespace_and_base_name(op: OpOverload) -> tuple[str, str]:
+    # [FUNCTION DOC] HELPER: Return the (namespace, base name) of an op, with the overload suffix removed.
     """Split an overload into namespace and overload-agnostic base op name."""
     namespace, op_name = op.name().split("::", 1)
     return namespace, op_name.split(".", 1)[0]
 
 
 def _get_overload_packet(namespace: str, op_name: str) -> Any | None:
+    # [FUNCTION DOC] HELPER: Return the overload packet from the torch ops registry by namespace and name, or None if missing.
     """Look up torch.ops.<namespace>.<op_name> without raising on misses."""
     namespace_packet = getattr(torch.ops, namespace, None)
     if namespace_packet is None:
@@ -618,6 +682,7 @@ def _get_overload_packet(namespace: str, op_name: str) -> Any | None:
 
 
 def _get_packet_overload(packet: Any, overload_name: str) -> OpOverload | None:
+    # [FUNCTION DOC] HELPER: Return the named overload from an overload packet, or None if the packet does not list that name.
     """Look up one overload from an overload packet without raising on misses."""
     if overload_name not in packet.overloads():
         return None
@@ -625,6 +690,10 @@ def _get_packet_overload(packet: Any, overload_name: str) -> OpOverload | None:
 
 
 def _resolve_foreach_elementwise_overload(foreach_op: OpOverload) -> OpOverload | None:
+    # [FUNCTION DOC] HELPER: Map a foreach or amp-foreach aten overload to the matching non-mutable scalar overload for one element.
+    # Returns None for non-aten ops, other name prefixes, a missing base packet, or no match. Candidates (excluding out
+    # overloads) must match schema args with list types treated as elements and defaults/kwarg-only scalar leniency;
+    # the one with the fewest extra schema args (best exact match) is returned.
     """Map an elementwise foreach overload to the scalar op for one element.
 
     Single-dim strategy functions reason about one Tensor at a time; foreach
@@ -676,6 +745,12 @@ def _expand_single_dim_strategy_to_mesh(
     strategy_info: _SingleDimStrategyInfo,
     output_tensor_meta: TensorMeta | Sequence[TensorMeta | None] | None,
 ) -> _ExpandedSingleDimStrategyFunc:
+    # [FUNCTION DOC] Expand a single-dim strategy over all mesh dims into a strategy function for the op.
+    # Returns a function taking the op, args metadata and kwargs metadata and returning a StrategyType. For foreach or
+    # fused optimizer ops with tuple strategy args, the result builds one strategy per list element and wraps them in a
+    # tuple strategy. Otherwise it prepares the single-dim strategy and calls the full-mesh expansion (inplace detected
+    # from the op name), with an lru cache that falls back to uncached calls for unhashable inputs such as symbolic ints.
+    # Cost grows combinatorially with mesh dims.
     """
     Expands the single_mesh_dim impl across all mesh dims, and expands ShardingPlaceholder into all
     sharding types used by inputs.
@@ -696,9 +771,14 @@ def _expand_single_dim_strategy_to_mesh(
         op_schema: OpSchema,
         output_tensor_meta: TensorMeta | Sequence[TensorMeta | None] | None,
     ) -> Callable[[OpOverload, ArgsType, KwargsType], StrategyType]:
+        # [FUNCTION DOC] HELPER: Return a strategy function bound to op_schema and output_tensor_meta that prepares the
+        # single-dim strategy and expands it to the full mesh, forwarding option flags and different-mesh arg positions.
         def expanded_strategy(
             op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
         ) -> StrategyType:
+            # [FUNCTION DOC] HELPER: Build the prepared strategy, detect in-place by trailing underscore in the op base name, wrap
+            # the optional full-mesh filter, and return the expanded op strategy. The op, args and kwargs of the call are used
+            # only for the op name.
             prepared_strategy = _PreparedSingleDimStrategy(
                 strategy_info, op_schema, output_tensor_meta
             )
@@ -716,6 +796,8 @@ def _expand_single_dim_strategy_to_mesh(
                     input_specs: list[DTensorSpec],
                     output_specs: DTensorSpec | tuple[DTensorSpec | None, ...],
                 ) -> bool:
+                    # [FUNCTION DOC] HELPER: Call the prepared strategy's full-mesh filter with the element mesh and op schema. Raises
+                    # an error if the filter is unexpectedly missing.
                     if prepared_strategy.full_mesh_strategy_filter is None:
                         raise AssertionError
                     return prepared_strategy.full_mesh_strategy_filter(
@@ -746,6 +828,8 @@ def _expand_single_dim_strategy_to_mesh(
         op_schema: OpSchema,
         output_tensor_meta: TensorMeta | Sequence[TensorMeta | None] | None,
     ) -> Callable[[OpOverload, ArgsType, KwargsType], StrategyType]:
+        # [FUNCTION DOC] HELPER: Return the cached expanded strategy function, falling back to the uncached builder when
+        # arguments are unhashable (TypeError).
         # Try to use cache, but fall back to uncached version if hashing fails
         # (e.g., when TensorMeta contains SymInts from dynamic shapes)
         try:
@@ -759,6 +843,9 @@ def _expand_single_dim_strategy_to_mesh(
         output_tensor_meta: Sequence[TensorMeta] | None,
         index: int,
     ) -> tuple[OpSchema, TensorMeta | None]:
+        # [FUNCTION DOC] HELPER: Make a per-element schema for a foreach op: select the child at index in each tuple strategy of
+        # args and kwargs, pick the matching element output meta (None if absent), and resolve the scalar op (keeping the
+        # original op for fused ops). Returns (new OpSchema, output meta).
         """Translate foreach/fused op to per-element version of schema."""
         # select per-element inputs, outputs
         target_args, target_kwargs = tree_map_only(
@@ -787,6 +874,9 @@ def _expand_single_dim_strategy_to_mesh(
     def expanded_foreach_strategy(
         op: OpOverload, args_schema: ArgsType, kwargs_schema: KwargsType
     ) -> StrategyType:
+        # [FUNCTION DOC] HELPER: Expand a foreach strategy by building a strategy per list element and returning a tuple strategy.
+        # Uses the enclosing op_schema, ignoring the given args. Raises an error if tuple args have differing lengths or
+        # no tuple input exists.
         tensorlist_len: int | None = None
         for i, obj in enumerate(op_schema.args_schema):
             if isinstance(obj, TupleStrategy):
@@ -842,6 +932,11 @@ def register_single_dim_strategy(
     full_mesh_strategy_filter: _FullMeshStrategyFilter | None = None,
     different_mesh_args: list[int] | None = None,
 ) -> Callable[[_SingleDimStrategyFunc], _SingleDimStrategyFunc]:
+    # [FUNCTION DOC] Decorator factory registering a single-dim strategy function for one op or a list of ops.
+    # Args: op, schema_info, allow_unbacked_sharding, allow_uneven_sharding, full_mesh_strategy_filter,
+    # different_mesh_args (see _SingleDimStrategyInfo). The returned decorator wraps the function in strategy info,
+    # registers it with the DTensor sharding propagator (specializing the cache for memory_format args) and returns
+    # the original function. Rules list outputs then inputs and must omit the all-Replicate rule.
     """
     Registers a single_dim_strategy function for the given op.
 
@@ -885,6 +980,7 @@ def register_single_dim_strategy(
     # transform hook to _get_registration_wrapper, so that single-dim-strategy
     # concerns stay in this module and the shared registration util stays simple.
     def wrapper(impl):
+        # [FUNCTION DOC] HELPER: Decorator body: wrap impl in a strategy info, register it, and return impl unchanged.
         info = _SingleDimStrategyInfo(
             func=impl,
             allow_unbacked_sharding=allow_unbacked_sharding,
@@ -900,6 +996,9 @@ def register_single_dim_strategy(
 
 @dataclass(order=True)
 class _PQEntry:
+    # [CLASS DOC] HELPER: Priority queue entry for the Dijkstra placement search. Ordered only by cost then counter (FIFO
+    # tie-break). Other fields: placements (per-input tuples of the state), transitions (history for debugging),
+    # per_input_costs, and per_input_comm_bytes_gb.
     """Priority queue entry for the Dijkstra search in _dijkstra_expand_single_dim_strategy_to_mesh.
 
     Ordered by (cost, counter) for heap comparison. The counter breaks ties
@@ -927,6 +1026,10 @@ def _get_neighbor_placements(
     input_placements: tuple[Placement, ...],
     mesh_dim: int,
 ) -> list[Placement]:
+    # [FUNCTION DOC] HELPER: Return placements reachable in one step for one input on one mesh dim.
+    # Never changes a tensor dim already sharded by a mesh dim to the right. Replicate may go to allowed shards or partials;
+    # a shard may go to Replicate or another allowed shard; Partial may go to Replicate or allowed shards.
+    # Shard to Partial is deliberately excluded.
     """Return valid one-shot placement transitions for one input on one mesh dim.
 
     DTensor placements are applied left-to-right, so a tensor dim sharded on
@@ -991,6 +1094,12 @@ def _dijkstra_expand_single_dim_strategy_to_mesh(
     output_tensor_meta: TensorMeta | Sequence[TensorMeta | None] | None = None,
     _collect_all_matches: set[tuple[tuple[Placement, ...], ...]] | None = None,
 ) -> OpStrategy | None:
+    # [FUNCTION DOC] Find the lowest-cost input placements matching a single-dim strategy on every mesh dim, using a
+    # Dijkstra-style search over per-input placements. Returns an OpStrategy (with the transitions recorded) or None
+    # to signal fallback to full expansion: for tuple strategy args, tensor kwargs, strided shards, or symbolic shapes,
+    # or if the search is exhausted (logs a warning). Raises an error if there are no tensor inputs or a spec lacks
+    # metadata. If initial placements already match, returns immediately. _collect_all_matches is a testing hook that
+    # explores everything and records all matches, returning the first.
     """
     Find the lowest cost sharding for the given op_schema.
 
@@ -1114,6 +1223,9 @@ def _dijkstra_expand_single_dim_strategy_to_mesh(
         new_placement: Placement,
         source: _PQEntry,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Push a neighbor state, changing one input's placement on one mesh dim, onto the queue.
+        # Skipped if visited or if the net transition from the original placement or the single step has infinite cost.
+        # Updates per-input costs and communication bytes and extends the transition history. Mutates the queue.
         new_input_placements = [list(ps) for ps in source.placements]
         old_placement = new_input_placements[input_idx][mesh_dim]
         new_input_placements[input_idx][mesh_dim] = new_placement
