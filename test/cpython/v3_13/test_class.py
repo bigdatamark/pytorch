@@ -3,6 +3,12 @@
 
 # ruff: noqa
 # flake8: noqa
+# [MODULE DOC] Dynamo-patched copy of the CPython 3.13 test_class suite: checks that instances
+# of user classes dispatch operators and special methods (arithmetic, comparison, container,
+# attribute access, hash/str/repr, construction errors) to the expected dunder methods. A
+# synthetic AllTests class records each dunder call in the module-level list callLst.
+# Import side effects: builds AllTests via exec of generated method source, then deletes
+# the temporary names. Also defines inline-values tests, skipped under Dynamo.
 
 # Test copied from
 # https://raw.githubusercontent.com/python/cpython/refs/tags/v3.13.5/Lib/test/test_class.py
@@ -83,7 +89,12 @@ testmeths = [
 
 callLst = []
 def trackCall(f):
+    # [FUNCTION DOC] HELPER: decorator factory: wraps function f so each call appends a tuple
+    # of the function name and positional args to the global callLst, then calls f and returns
+    # its result. Keyword arguments are forwarded but not recorded.
     def track(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: wrapper created by trackCall; records (name, args) in callLst
+        # and delegates.
         callLst.append((f.__name__, args))
         return f(*args, **kwargs)
     return track
@@ -154,11 +165,19 @@ AllTests = type("AllTests", (object,), d)
 del d, statictests, method, method_template
 
 class ClassTests(CPythonTestCase):
+    # [CLASS DOC] Tests that operators and builtins invoke the matching dunder methods
+    # on AllTests. Each test clears callLst, triggers an operation, and compares the
+    # recorded calls.
     def setUp(self):
+        # [FUNCTION DOC] HELPER: calls the parent setUp, then empties the global callLst
+        # in place.
         super().setUp()
         callLst[:] = []
 
     def assertCallStack(self, expected_calls):
+        # [FUNCTION DOC] HELPER: fails the test unless a copy of callLst equals
+        # expected_calls; the failure message shows both the expected and actual call lists.
+        # The copy is taken first because the comparison itself could add entries to callLst.
         actualCallList = callLst[:]  # need to copy because the comparison below will add
                                      # additional calls to callLst
         if expected_calls != actualCallList:
@@ -166,10 +185,15 @@ class ClassTests(CPythonTestCase):
                       (expected_calls, actualCallList))
 
     def testInit(self):
+        # [FUNCTION DOC] Constructing AllTests must record exactly one call to __init__ with
+        # the new instance.
         foo = AllTests()
         self.assertCallStack([("__init__", (foo,))])
 
     def testBinaryOps(self):
+        # [FUNCTION DOC] For every binary operator (arithmetic, shift, bitwise, matmul,
+        # divmod, pow), checks the forward and reflected form dispatches to the matching
+        # dunder with args (testme, 1).
         testme = AllTests()
         # Binary operations
 
@@ -289,6 +313,10 @@ class ClassTests(CPythonTestCase):
         self.assertCallStack([("__rxor__", (testme, 1))])
 
     def testListAndDictOps(self):
+        # [FUNCTION DOC] Checks container protocol: membership test on a class without
+        # __contains__ raises TypeError; on AllTests, in/getitem/setitem/delitem (including
+        # slice and extended-slice keys) record the matching dunder calls with the expected
+        # key arguments.
         testme = AllTests()
 
         # List/dict operations
@@ -362,6 +390,9 @@ class ClassTests(CPythonTestCase):
                                                         24, 100)))])
 
     def testUnaryOps(self):
+        # [FUNCTION DOC] Checks unary neg/pos/abs and the conversions int, float, oct and hex
+        # dispatch to __neg__, __pos__, __abs__, __int__, __float__ and __index__ (oct and hex
+        # use __index__).
         testme = AllTests()
 
         callLst[:] = []
@@ -388,6 +419,9 @@ class ClassTests(CPythonTestCase):
 
 
     def testMisc(self):
+        # [FUNCTION DOC] Checks hash, repr, str and the comparison operators (including
+        # reflected forms, where 1 < testme calls __gt__) dispatch to the matching
+        # dunder methods.
         testme = AllTests()
 
         callLst[:] = []
@@ -436,18 +470,28 @@ class ClassTests(CPythonTestCase):
 
 
     def testGetSetAndDel(self):
+        # [FUNCTION DOC] Checks that attribute get/set/delete on a subclass defining
+        # __getattr__, __setattr__ and __delattr__ calls those hooks with the instance and
+        # attribute name.
         # Interfering tests
         class ExtraTests(AllTests):
+            # [CLASS DOC] HELPER: AllTests subclass whose attribute hooks return a fixed value
+            # or do nothing.
             @trackCall
             def __getattr__(self, *args):
+                # [FUNCTION DOC] HELPER: tracked __getattr__ hook; returns the constant
+                # string SomeVal.
                 return "SomeVal"
 
             @trackCall
             def __setattr__(self, *args):
+                # [FUNCTION DOC] HELPER: tracked __setattr__ hook; ignores the assignment
+                # (nothing is stored).
                 pass
 
             @trackCall
             def __delattr__(self, *args):
+                # [FUNCTION DOC] HELPER: tracked __delattr__ hook; does nothing.
                 pass
 
         testme = ExtraTests()
@@ -466,12 +510,18 @@ class ClassTests(CPythonTestCase):
         self.assertCallStack([('__delattr__', (testme, "cardinal"))])
 
     def testHasAttrString(self):
+        # [FUNCTION DOC] Imports _testlimitedcapi (skips if absent) and checks
+        # object_hasattrstring returns 1 for an existing attribute, 0 for a missing one, and
+        # leaves no pending exception.
         import sys
         from test.support import import_helper
         _testlimitedcapi = import_helper.import_module('_testlimitedcapi')
 
         class A:
+            # [CLASS DOC] HELPER: plain class whose instances get an attribute named attr set
+            # to 1.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: sets the attribute attr to 1.
                 self.attr = 1
 
         a = A()
@@ -480,10 +530,16 @@ class ClassTests(CPythonTestCase):
         self.assertIsNone(sys.exception())
 
     def testDel(self):
+        # [FUNCTION DOC] Checks that deleting the last reference to an instance runs __del__
+        # (after a forced garbage collection) by observing a message appended to a local list.
         x = []
 
         class DelTest:
+            # [CLASS DOC] HELPER: class whose __del__ appends a marker string to the
+            # enclosing list.
             def __del__(self):
+                # [FUNCTION DOC] HELPER: destructor hook; appends the marker string to the
+                # enclosing list x.
                 x.append("crab people, crab people")
         testme = DelTest()
         del testme
@@ -492,9 +548,16 @@ class ClassTests(CPythonTestCase):
         self.assertEqual(["crab people, crab people"], x)
 
     def testBadTypeReturned(self):
+        # [FUNCTION DOC] Checks that float, complex, str, repr, bytes, bin, oct, hex, bool
+        # and a helper that indexes a list all raise TypeError when the dunder method
+        # returns None.
         # return values of some method are type-checked
         class BadTypeClass:
+            # [CLASS DOC] HELPER: class whose conversion dunders all return None (an invalid
+            # result type).
             def __int__(self):
+                # [FUNCTION DOC] HELPER: returns None; aliased to the other conversion dunders
+                # of the class.
                 return None
             __float__ = __int__
             __complex__ = __int__
@@ -504,29 +567,41 @@ class ClassTests(CPythonTestCase):
             __bool__ = __int__
             __index__ = __int__
         def index(x):
+            # [FUNCTION DOC] HELPER: indexes an empty list with x, triggering __index__ on x;
+            # always fails or raises.
             return [][x]
 
         for f in [float, complex, str, repr, bytes, bin, oct, hex, bool, index]:
             self.assertRaises(TypeError, f, BadTypeClass())
 
     def testHashStuff(self):
+        # [FUNCTION DOC] Checks hash works on a plain class and raises TypeError for a class
+        # that defines __eq__ without __hash__.
         # Test correct errors from hash() on objects with comparisons but
         #  no __hash__
 
         class C0:
+            # [CLASS DOC] HELPER: plain class with default hashing.
             pass
 
         hash(C0()) # This should work; the next two should raise TypeError
 
         class C2:
+            # [CLASS DOC] HELPER: class defining only __eq__ (a one-line def), making its
+            # instances unhashable.
             def __eq__(self, other): return 1
 
         self.assertRaises(TypeError, hash, C2())
 
     def testPredefinedAttrs(self):
+        # [FUNCTION DOC] Checks that standard object dunder methods are callable on
+        # object, an object instance, a custom class and its instance; that many others
+        # (numeric, container, iterator, in-place) are absent; and that __call__ is not
+        # found on instances.
         o = object()
 
         class Custom:
+            # [CLASS DOC] HELPER: empty class used to probe inherited attributes.
             pass
 
         c = Custom()
@@ -575,9 +650,13 @@ class ClassTests(CPythonTestCase):
         self.assertFalse(hasattr(c, "__call__"))
 
     def testSFBug532646(self):
+        # [FUNCTION DOC] Regression test: a class whose __call__ attribute is an instance of
+        # itself must raise RecursionError when called instead of crashing.
         # Test for SF bug 532646
 
         class A:
+            # [CLASS DOC] HELPER: empty class; its __call__ is later set to an instance
+            # of itself.
             pass
         A.__call__ = A()
         a = A()
@@ -590,12 +669,19 @@ class ClassTests(CPythonTestCase):
             self.fail("Failed to raise RecursionError")
 
     def testForExceptionsRaisedInInstanceGetattr2(self):
+        # [FUNCTION DOC] Checks that AttributeError raised inside a property getter is
+        # not masked: via attribute access, via __eq__ comparison and via __init__
+        # during construction.
         # Tests for exceptions raised in instance_getattr2().
 
         def booh(self):
+            # [FUNCTION DOC] HELPER: property getter that always raises AttributeError with
+            # message booh.
             raise AttributeError("booh")
 
         class A:
+            # [CLASS DOC] HELPER: class exposing attribute a as a property whose
+            # getter raises.
             a = property(booh)
         try:
             A().a # Raised AttributeError: A instance has no attribute 'a'
@@ -604,10 +690,14 @@ class ClassTests(CPythonTestCase):
                 self.fail("attribute error for A().a got masked: %s" % x)
 
         class E:
+            # [CLASS DOC] HELPER: class whose __eq__ is a property whose getter
+            # raises AttributeError.
             __eq__ = property(booh)
         E() == E() # In debug mode, caused a C-level assert() to fail
 
         class I:
+            # [CLASS DOC] HELPER: class whose __init__ is a property whose getter
+            # raises AttributeError.
             __init__ = property(booh)
         try:
             # In debug mode, printed XXX undetected error and
@@ -619,6 +709,8 @@ class ClassTests(CPythonTestCase):
             self.fail("attribute error for I.__init__ got masked")
 
     def assertNotOrderable(self, a, b):
+        # [FUNCTION DOC] HELPER: asserts that all four ordering comparisons between a and b
+        # raise TypeError.
         with self.assertRaises(TypeError):
             a < b
         with self.assertRaises(TypeError):
@@ -629,19 +721,31 @@ class ClassTests(CPythonTestCase):
             a >= b
 
     def testHashComparisonOfMethods(self):
+        # [FUNCTION DOC] Checks equality, inequality, hashing and non-orderability of bound
+        # and unbound methods: bound methods compare by function and by the instance's __eq__,
+        # and hashing a bound method hashes its function plus the instance identity.
         # Test comparison and hash of methods
         class A:
+            # [CLASS DOC] HELPER: class with always-equal __eq__ and a __hash__ that
+            # raises TypeError.
             def __init__(self, x):
+                # [FUNCTION DOC] HELPER: stores the argument x on the instance.
                 self.x = x
             def f(self):
+                # [FUNCTION DOC] HELPER: no-op method used for method comparison.
                 pass
             def g(self):
+                # [FUNCTION DOC] HELPER: second no-op method used for method comparison.
                 pass
             def __eq__(self, other):
+                # [FUNCTION DOC] HELPER: equality hook; always returns True.
                 return True
             def __hash__(self):
+                # [FUNCTION DOC] HELPER: hash hook; always raises TypeError.
                 raise TypeError
         class B(A):
+            # [CLASS DOC] HELPER: empty subclass of A used to compare inherited
+            # unbound methods.
             pass
 
         a1 = A(1)
@@ -669,11 +773,16 @@ class ClassTests(CPythonTestCase):
         hash(a.f)
 
     def testSetattrWrapperNameIntern(self):
+        # [FUNCTION DOC] Regression test: setting a dunder attribute on a class via a non-
+        # interned name string must still install the operator (A() + 1 works); deleting it
+        # removes it again.
         # Issue #25794: __setattr__ should intern the attribute name
         class A:
+            # [CLASS DOC] HELPER: empty class receiving a dynamically assigned __add__.
             pass
 
         def add(self, other):
+            # [FUNCTION DOC] HELPER: replacement __add__; returns the string summa.
             return 'summa'
 
         name = str(b'__add__', 'ascii')  # shouldn't be optimized
@@ -689,14 +798,20 @@ class ClassTests(CPythonTestCase):
             A() + 1
 
     def testSetattrNonStringName(self):
+        # [FUNCTION DOC] Checks that setting a class attribute with a bytes (non-str) name
+        # raises TypeError.
         class A:
+            # [CLASS DOC] HELPER: empty class used as the target of the failing assignment.
             pass
 
         with self.assertRaises(TypeError):
             type.__setattr__(A, b'x', None)
 
     def testTypeAttributeAccessErrorMessages(self):
+        # [FUNCTION DOC] Checks the AttributeError message for reading or deleting a missing
+        # attribute on a class object.
         class A:
+            # [CLASS DOC] HELPER: empty class.
             pass
 
         error_msg = "type object 'A' has no attribute 'x'"
@@ -706,15 +821,24 @@ class ClassTests(CPythonTestCase):
             del A.x
 
     def testObjectAttributeAccessErrorMessages(self):
+        # [FUNCTION DOC] Checks AttributeError messages for missing, read-only and slot-
+        # restricted instance attributes (get, set and delete) on classes with and without
+        # __dict__ or slots.
         class A:
+            # [CLASS DOC] HELPER: empty class with a regular instance dict.
             pass
         class B:
+            # [CLASS DOC] HELPER: class with slots restricted to z and a class attribute y.
             y = 0
             __slots__ = ('z',)
         class C:
+            # [CLASS DOC] HELPER: slotted class whose __setattr__ maps assignments to z onto
+            # slot y.
             __slots__ = ("y",)
 
             def __setattr__(self, name, value) -> None:
+                # [FUNCTION DOC] HELPER: stores 1 in slot y when name is z, otherwise
+                # delegates to the parent.
                 if name == "z":
                     super().__setattr__("y", 1)
                 else:
@@ -755,10 +879,14 @@ class ClassTests(CPythonTestCase):
             del B().z
 
     def testConstructorErrorMessages(self):
+        # [FUNCTION DOC] Checks TypeError messages from constructing instances and calling
+        # __new__ or __init__ directly with extra arguments, for classes with no overrides,
+        # with both __init__ and __new__ overridden, and with only __init__ overridden.
         # bpo-31506: Improves the error message logic for object_new & object_init
 
         # Class without any method overrides
         class C:
+            # [CLASS DOC] HELPER: class without any method overrides.
             pass
 
         error_msg = r'C.__init__\(\) takes exactly one argument \(the instance to initialize\)'
@@ -780,9 +908,14 @@ class ClassTests(CPythonTestCase):
 
         # Class with both `__init__` & `__new__` method overridden
         class D:
+            # [CLASS DOC] HELPER: class overriding both __new__ and __init__, forwarding
+            # extra arguments.
             def __new__(cls, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: forwards all arguments to the parent __new__
+                # (returns nothing).
                 super().__new__(cls, *args, **kwargs)
             def __init__(self, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: forwards all arguments to the parent __init__.
                 super().__init__(*args, **kwargs)
 
         error_msg =  r'object.__new__\(\) takes exactly one argument \(the type to instantiate\)'
@@ -798,7 +931,9 @@ class ClassTests(CPythonTestCase):
 
         # Class that only overrides __init__
         class E:
+            # [CLASS DOC] HELPER: class overriding only __init__, forwarding extra arguments.
             def __init__(self, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: forwards all arguments to the parent __init__.
                 super().__init__(*args, **kwargs)
 
         error_msg = r'object.__init__\(\) takes exactly one argument \(the instance to initialize\)'
@@ -810,11 +945,19 @@ class ClassTests(CPythonTestCase):
             object.__init__(E(), 42)
 
     def testClassWithExtCall(self):
+        # [FUNCTION DOC] Checks class statements using keyword unpacking and many positional
+        # bases with a custom metaclass returning (bases, kwargs); verifies the bases tuple
+        # and kwargs mapping.
         class Meta(int):
+            # [CLASS DOC] HELPER: int-derived metaclass whose __new__ returns the bases and
+            # keyword arguments.
             def __init__(*args, **kwargs):
+                # [FUNCTION DOC] HELPER: no-op initializer.
                 pass
 
             def __new__(cls, name, bases, attrs, **kwargs):
+                # [FUNCTION DOC] HELPER: returns a tuple of the bases and the extra keyword
+                # arguments instead of a class.
                 return bases, kwargs
 
         d = {'metaclass': Meta}
@@ -827,14 +970,22 @@ class ClassTests(CPythonTestCase):
         self.assertEqual(A, (tuple(range(8)), {'foo': 'bar'}))
 
     def testClassCallRecursionLimit(self):
+        # [FUNCTION DOC] Checks that infinitely recursive construction raises RecursionError,
+        # both directly and when started one call level deeper through a helper.
         class C:
+            # [CLASS DOC] HELPER: class whose __init__ constructs another instance of
+            # itself forever.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: constructs a new instance of C, recursing
+                # until RecursionError.
                 self.c = C()
 
         with self.assertRaises(RecursionError):
             C()
 
         def add_one_level():
+            # [FUNCTION DOC] HELPER: calls the constructor once more from a deeper
+            # stack frame.
             #Each call to C() consumes 2 levels, so offset by 1.
             C()
 
@@ -842,16 +993,24 @@ class ClassTests(CPythonTestCase):
             add_one_level()
 
     def testMetaclassCallOptimization(self):
+        # [FUNCTION DOC] Checks that a metaclass __call__ override is invoked once per
+        # instantiation: constructs 100 instances and expects the counter to equal 100.
         calls = 0
 
         class TypeMetaclass(type):
+            # [CLASS DOC] HELPER: metaclass whose __call__ increments an enclosing counter
+            # and delegates.
             def __call__(cls, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: counts the call via a nonlocal counter, then
+                # delegates to type.__call__.
                 nonlocal calls
                 calls += 1
                 return type.__call__(cls, *args, **kwargs)
 
         class Type(metaclass=TypeMetaclass):
+            # [CLASS DOC] HELPER: class using TypeMetaclass; stores the constructor argument.
             def __init__(self, obj):
+                # [FUNCTION DOC] HELPER: stores obj on the instance as _obj.
                 self._obj = obj
 
         for i in range(100):
@@ -859,10 +1018,15 @@ class ClassTests(CPythonTestCase):
         self.assertEqual(calls, 100)
 
     def test_specialization_class_call_doesnt_crash(self):
+        # [FUNCTION DOC] Regression test (gh-123185): repeatedly calling a class constructor
+        # with a missing argument (raising TypeError each time) must not crash the
+        # specializing interpreter.
         # gh-123185
 
         class Foo:
+            # [CLASS DOC] HELPER: class whose __init__ requires one argument.
             def __init__(self, arg):
+                # [FUNCTION DOC] HELPER: accepts and ignores arg.
                 pass
 
         for _ in range(8):
@@ -880,12 +1044,15 @@ except ImportError:
 Py_TPFLAGS_MANAGED_DICT = (1 << 2)
 
 class Plain:
+    # [CLASS DOC] HELPER: empty class used by the inline-values tests.
     pass
 
 
 class WithAttrs:
+    # [CLASS DOC] HELPER: class setting four integer attributes a to d in __init__.
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: sets attributes a, b, c, d to 1, 2, 3, 4.
         self.a = 1
         self.b = 2
         self.c = 3
@@ -894,28 +1061,38 @@ class WithAttrs:
 
 @skipIfTorchDynamo("CPython only")
 class TestInlineValues(CPythonTestCase):
+    # [CLASS DOC] Tests of CPython inline (managed) instance-dict storage via
+    # has_inline_values from _testinternalcapi (None when unavailable). Skipped under Dynamo
+    # via skipIfTorchDynamo.
 
     def test_flags(self):
+        # [FUNCTION DOC] Checks Plain and WithAttrs have the managed-dict type flag set.
         self.assertEqual(Plain.__flags__ & Py_TPFLAGS_MANAGED_DICT, Py_TPFLAGS_MANAGED_DICT)
         self.assertEqual(WithAttrs.__flags__ & Py_TPFLAGS_MANAGED_DICT, Py_TPFLAGS_MANAGED_DICT)
 
     def test_has_inline_values(self):
+        # [FUNCTION DOC] Checks a fresh instance has inline values and loses them after its
+        # dict is deleted.
         c = Plain()
         self.assertTrue(has_inline_values(c))
         del c.__dict__
         self.assertFalse(has_inline_values(c))
 
     def test_instances(self):
+        # [FUNCTION DOC] Checks fresh instances of Plain and WithAttrs have inline values.
         self.assertTrue(has_inline_values(Plain()))
         self.assertTrue(has_inline_values(WithAttrs()))
 
     def test_inspect_dict(self):
+        # [FUNCTION DOC] Checks that merely reading an instance's dict keeps inline values.
         for cls in (Plain, WithAttrs):
             c = cls()
             c.__dict__
             self.assertTrue(has_inline_values(c))
 
     def test_update_dict(self):
+        # [FUNCTION DOC] Checks that updating an instance's dict with new keys keeps
+        # inline values.
         d = { "e": 5, "f": 6 }
         for cls in (Plain, WithAttrs):
             c = cls()
@@ -924,14 +1101,20 @@ class TestInlineValues(CPythonTestCase):
 
     @staticmethod
     def set_100(obj):
+        # [FUNCTION DOC] HELPER: static helper: sets 100 attributes named a0 to a99 on obj
+        # with values 0 to 99.
         for i in range(100):
             setattr(obj, f"a{i}", i)
 
     def check_100(self, obj):
+        # [FUNCTION DOC] HELPER: asserts obj has attributes a0 to a99 with values 0 to 99.
         for i in range(100):
             self.assertEqual(getattr(obj, f"a{i}"), i)
 
     def test_many_attributes(self):
+        # [FUNCTION DOC] Checks inline values are dropped once 100 attributes are added to an
+        # instance, the values stay readable, and a new instance of the same class again has
+        # inline values.
         class C: pass
         c = C()
         self.assertTrue(has_inline_values(c))
@@ -942,6 +1125,8 @@ class TestInlineValues(CPythonTestCase):
         self.assertTrue(has_inline_values(c))
 
     def test_many_attributes_with_dict(self):
+        # [FUNCTION DOC] Like the previous test but with the instance dict already
+        # materialized first.
         class C: pass
         c = C()
         d = c.__dict__
@@ -951,9 +1136,14 @@ class TestInlineValues(CPythonTestCase):
         self.check_100(c)
 
     def test_bug_117750(self):
+        # [FUNCTION DOC] Regression test for bug 117750 (abort on 3.13a6): clearing the dict
+        # inside __init__ then assigning a new attribute must not crash and the dict must hold
+        # the new item.
         "Aborted on 3.13a6"
         class C:
+            # [CLASS DOC] HELPER: class whose __init__ clears its own instance dict.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: clears the instance dict.
                 self.__dict__.clear()
 
         obj = C()
@@ -962,7 +1152,10 @@ class TestInlineValues(CPythonTestCase):
         self.assertEqual(obj.__dict__, {"foo":None})
 
     def test_store_attr_deleted_dict(self):
+        # [FUNCTION DOC] Checks that after deleting an instance dict, attribute assignment
+        # still works.
         class Foo:
+            # [CLASS DOC] HELPER: empty class.
             pass
 
         f = Foo()
@@ -971,6 +1164,9 @@ class TestInlineValues(CPythonTestCase):
         self.assertEqual(f.a, 3)
 
     def test_rematerialize_object_dict(self):
+        # [FUNCTION DOC] Regression test for gh-121860: re-materializing a deleted managed
+        # dict (via a str subclass attribute lookup or a __class__ change) must not crash;
+        # dict ends up empty.
         # gh-121860: rematerializing an object's managed dictionary after it
         # had been deleted caused a crash.
         class Foo: pass
@@ -989,14 +1185,21 @@ class TestInlineValues(CPythonTestCase):
         self.assertEqual(f.__dict__, {})
 
     def test_store_attr_type_cache(self):
+        # [FUNCTION DOC] Checks the type attribute cache stays consistent with the class dict
+        # when a destructor of the replaced value reads the attribute during reassignment.
         """Verifies that the type cache doesn't provide a value which  is
         inconsistent from the dict."""
         class X:
+            # [CLASS DOC] HELPER: class whose destructor reads C.a and asserts it matches the
+            # class dict.
             def __del__(inner_self):
+                # [FUNCTION DOC] HELPER: destructor; reads the attribute from C and checks it
+                # equals the dict entry.
                 v = C.a
                 self.assertEqual(v, C.__dict__['a'])
 
         class C:
+            # [CLASS DOC] HELPER: class holding an X instance in class attribute a.
             a = X()
 
         # prime the cache
@@ -1009,6 +1212,10 @@ class TestInlineValues(CPythonTestCase):
 
     @cpython_only
     def test_detach_materialized_dict_no_memory(self):
+        # [FUNCTION DOC] CPython-only: skipped without _testcapi. Runs a subprocess script
+        # that simulates an allocation failure while an object with a materialized dict is
+        # deleted, expecting an unraisable MemoryError and a surviving dict. Asserts exit code
+        # 0 and empty stdout and stderr.
         # Skip test if _testcapi is not available:
         import_helper.import_module('_testcapi')
 

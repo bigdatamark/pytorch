@@ -3,6 +3,13 @@
 
 # ruff: noqa
 # flake8: noqa
+# [MODULE DOC] Dynamo-patched copy of the CPython 3.13 test_cmath suite for complex math:
+# tests the cmath module constants, conversion protocol (__complex__/__float__), agreement
+# with math, table-driven special values from a shared test file, polar/rect/phase/abs,
+# classification predicates, signed-zero behavior, and cmath.isclose via IsCloseTests.
+# Import side effects: installs RedirectImportFinder at the front of sys.meta_path so test.*
+# imports of a few helper test modules resolve to top-level modules; defines shared constant
+# lists of complex zeros, infinities and NaNs.
 
 # Test copied from
 # https://raw.githubusercontent.com/python/cpython/refs/tags/v3.13.5/Lib/test/test_cmath.py
@@ -31,7 +38,15 @@ redirect_imports = (
 )
 
 class RedirectImportFinder(importlib.abc.MetaPathFinder):
+    # [CLASS DOC] HELPER: meta-path finder that redirects imports of selected stdlib test
+    # helper modules (listed in redirect_imports) to the same-named top-level modules without
+    # the test prefix.
     def find_spec(self, fullname, path, target=None):
+        # [FUNCTION DOC] HELPER: returns a module spec for a redirected name, else None. If
+        # fullname is in redirect_imports, imports the module with the test prefix removed,
+        # registers it in sys.modules under the original name (side effect), and returns its
+        # spec; an ImportError yields None. All other names yield None so normal finders
+        # handle them.
         # Check if the import is the problematic one
         if fullname in redirect_imports:
             try:
@@ -104,6 +119,10 @@ complex_nans = [complex(x, y) for x, y in [
         ]]
 
 class CMathTests(__TestCase):
+    # [CLASS DOC] Tests of the cmath functions. Class attribute test_functions lists every
+    # one-argument cmath function plus two lambdas fixing either argument of two-argument log.
+    # setUp opens the shared special-values file into test_values; helper assertions compare
+    # floats and complex numbers with sign-aware identity or ulp-scale tolerance.
     # list of all functions in cmath
     test_functions = [getattr(cmath, fname) for fname in [
             'acos', 'acosh', 'asin', 'asinh', 'atan', 'atanh',
@@ -114,13 +133,20 @@ class CMathTests(__TestCase):
     test_functions.append(lambda x : cmath.log(14.-27j, x))
 
     def setUp(self):
+        # [FUNCTION DOC] Calls the parent setUp, then opens the shared test data file (UTF-8)
+        # and keeps the handle in test_values. The handle is closed in tearDown.
         super().setUp()
         self.test_values = open(test_file, encoding="utf-8")
 
     def tearDown(self):
+        # [FUNCTION DOC] Closes the test_values file opened in setUp.
+        # KNOWN ISSUE: does not call the parent tearDown, so base-class cleanup is skipped.
         self.test_values.close()
 
     def assertFloatIdentical(self, x, y):
+        # [FUNCTION DOC] HELPER: fails unless floats x and y are identical: both NaN, or equal
+        # and, if zero, with the same sign. Fails with a message naming both values (and
+        # differing zero signs).
         """Fail unless floats x and y are identical, in the sense that:
         (1) both x and y are nans, or
         (2) both x and y are infinities, with the same sign, or
@@ -144,6 +170,9 @@ class CMathTests(__TestCase):
         self.fail(msg.format(x, y))
 
     def assertComplexesAreIdentical(self, x, y):
+        # [FUNCTION DOC] HELPER: fails unless the real parts and the imaginary parts of
+        # complex x and y are each identical per assertFloatIdentical, so zero signs
+        # must match.
         """Fail unless complex numbers x and y have equal values and signs.
 
         In particular, if x and y both have real (or imaginary) part
@@ -155,6 +184,11 @@ class CMathTests(__TestCase):
 
     def rAssertAlmostEqual(self, a, b, rel_err = 2e-15, abs_err = 5e-323,
                            msg=None):
+        # [FUNCTION DOC] HELPER: fails unless floats a and b are close. NaN a requires NaN b;
+        # infinite a requires equal b; two zeros must share a sign; otherwise passes if the
+        # absolute difference is within the larger of abs_err and rel_err times the magnitude
+        # of a. An overflow while computing the difference counts as a failure. Optional msg
+        # overrides the failure text.
         """Fail if the two floating-point numbers are not almost equal.
 
         Determine whether floating-point values a and b are equal to within
@@ -204,6 +238,8 @@ class CMathTests(__TestCase):
                   '{!r} and {!r} are not sufficiently close'.format(a, b))
 
     def test_constants(self):
+        # [FUNCTION DOC] Checks cmath.pi and cmath.e match the reference values to 9
+        # decimal places.
         e_expected = 2.71828182845904523536
         pi_expected = 3.14159265358979323846
         self.assertAlmostEqual(cmath.pi, pi_expected, places=9,
@@ -212,6 +248,8 @@ class CMathTests(__TestCase):
             msg="cmath.e is {}; should be {}".format(cmath.e, e_expected))
 
     def test_infinity_and_nan_constants(self):
+        # [FUNCTION DOC] Checks cmath.inf, infj, nan and nanj have the expected real and
+        # imaginary parts, positive signs, and the expected repr strings.
         self.assertEqual(cmath.inf.real, math.inf)
         self.assertEqual(cmath.inf.imag, 0.0)
         self.assertEqual(cmath.infj.real, 0.0)
@@ -234,6 +272,10 @@ class CMathTests(__TestCase):
         self.assertEqual(repr(cmath.nanj), "nanj")
 
     def test_user_object(self):
+        # [FUNCTION DOC] Checks every cmath function honors the __complex__ and __float__
+        # protocols for user objects: __complex__ results are used, float-only objects work,
+        # objects with only __int__ or __index__ raise TypeError, non-complex __complex__
+        # results raise TypeError, and exceptions raised in __complex__ propagate.
         # Test automatic calling of __complex__ and __float__ by cmath
         # functions
 
@@ -253,36 +295,53 @@ class CMathTests(__TestCase):
 
         # usual case: new-style class implementing __complex__
         class MyComplex:
+            # [CLASS DOC] HELPER: class whose __complex__ returns the value given
+            # at construction.
             def __init__(self, value):
+                # [FUNCTION DOC] HELPER: stores value on the instance.
                 self.value = value
             def __complex__(self):
+                # [FUNCTION DOC] HELPER: returns the stored value (may be a non-complex object
+                # in negative tests).
                 return self.value
 
         # classes for which __complex__ raises an exception
         class SomeException(Exception):
+            # [CLASS DOC] HELPER: exception type raised by MyComplexException.
             pass
         class MyComplexException:
+            # [CLASS DOC] HELPER: class whose __complex__ raises SomeException.
             def __complex__(self):
+                # [FUNCTION DOC] HELPER: always raises SomeException.
                 raise SomeException
 
         # some classes not providing __float__ or __complex__
         class NeitherComplexNorFloat(object):
+            # [CLASS DOC] HELPER: class providing neither __float__ nor __complex__.
             pass
         class Index:
+            # [CLASS DOC] HELPER: class providing only __int__ and __index__ (both one-line
+            # defs returning 2).
             def __int__(self): return 2
             def __index__(self): return 2
         class MyInt:
+            # [CLASS DOC] HELPER: class providing only __int__ (a one-line def returning 2).
             def __int__(self): return 2
 
         # other possible combinations of __float__ and __complex__
         # that should work
         class FloatAndComplex:
+            # [CLASS DOC] HELPER: class providing both __float__ and __complex__.
             def __float__(self):
+                # [FUNCTION DOC] HELPER: returns the enclosing float argument flt_arg.
                 return flt_arg
             def __complex__(self):
+                # [FUNCTION DOC] HELPER: returns the enclosing complex argument cx_arg.
                 return cx_arg
         class JustFloat:
+            # [CLASS DOC] HELPER: class providing only __float__.
             def __float__(self):
+                # [FUNCTION DOC] HELPER: returns the enclosing float argument flt_arg.
                 return flt_arg
 
         for f in self.test_functions:
@@ -304,6 +363,8 @@ class CMathTests(__TestCase):
             self.assertRaises(SomeException, f, MyComplexException())
 
     def test_input_type(self):
+        # [FUNCTION DOC] Checks ints and floats are accepted by all cmath functions (same
+        # result as the float conversion), while strings raise TypeError.
         # ints should be acceptable inputs to all cmath
         # functions, by virtue of providing a __float__ method
         for f in self.test_functions:
@@ -316,6 +377,9 @@ class CMathTests(__TestCase):
                 self.assertRaises(TypeError, f, arg)
 
     def test_cmath_matches_math(self):
+        # [FUNCTION DOC] Checks cmath functions on real arguments in each function's domain
+        # agree with the math module (within tolerance) and give zero imaginary part,
+        # including log with several bases.
         # check that corresponding cmath and math functions are equal
         # for floats in the appropriate range
 
@@ -365,6 +429,11 @@ class CMathTests(__TestCase):
 
     @requires_IEEE_754
     def test_specific_values(self):
+        # [FUNCTION DOC] Table-driven test: parses the shared special-values file and for each
+        # case calls the named cmath function (with wrappers for rect and polar), expecting
+        # ValueError or OverflowError when flagged, otherwise comparing real and imaginary
+        # parts within tolerance (looser absolute error for log and log10; sign-ignoring flags
+        # honored). Skips a case on old OS X releases.
         # Some tests need to be skipped on ancient OS X versions.
         # See issue #27953.
         SKIP_ON_TIGER = {'tan0064'}
@@ -378,11 +447,15 @@ class CMathTests(__TestCase):
                 pass
 
         def rect_complex(z):
+            # [FUNCTION DOC] HELPER: calls rect with the real and imaginary parts of z and
+            # returns its complex result.
             """Wrapped version of rect that accepts a complex number instead of
             two float arguments."""
             return cmath.rect(z.real, z.imag)
 
         def polar_complex(z):
+            # [FUNCTION DOC] HELPER: calls polar on z and returns the radius and angle packed
+            # into a complex number.
             """Wrapped version of polar that returns a complex number instead of
             two floats."""
             return complex(*polar(z))
@@ -451,7 +524,11 @@ class CMathTests(__TestCase):
                                         msg=error_message)
 
     def check_polar(self, func):
+        # [FUNCTION DOC] HELPER: checks a polar-like callable on zeros, units, axes,
+        # infinities and NaNs against expected (radius, angle) pairs using rAssertAlmostEqual.
         def check(arg, expected):
+            # [FUNCTION DOC] HELPER: applies func to arg and compares each element of the
+            # result with expected.
             got = func(arg)
             for e, g in zip(expected, got):
                 self.rAssertAlmostEqual(e, g)
@@ -479,13 +556,18 @@ class CMathTests(__TestCase):
         check(complex(nan, -inf), (inf, nan))
 
     def test_polar(self):
+        # [FUNCTION DOC] Runs the polar checks against cmath.polar.
         self.check_polar(polar)
 
     @cpython_only
     def test_polar_errno(self):
+        # [FUNCTION DOC] CPython-only: sets the C errno to 11 around polar calls and checks
+        # results are unchanged; errno is reset to zero afterwards. Requires _testcapi.
         # Issue #24489: check a previously set C errno doesn't disturb polar()
         _testcapi = import_helper.import_module('_testcapi')
         def polar_with_errno_set(z):
+            # [FUNCTION DOC] HELPER: sets C errno to 11, calls polar on z and returns its
+            # result, resetting errno to 0.
             _testcapi.set_errno(11)
             try:
                 return polar(z)
@@ -494,6 +576,8 @@ class CMathTests(__TestCase):
         self.check_polar(polar_with_errno_set)
 
     def test_phase(self):
+        # [FUNCTION DOC] Checks phase for ordinary values, signed zeros, infinities in all
+        # directions, and that any NaN component yields NaN.
         self.assertAlmostEqual(phase(0), 0.)
         self.assertAlmostEqual(phase(1.), 0.)
         self.assertAlmostEqual(phase(-1.), pi)
@@ -535,6 +619,8 @@ class CMathTests(__TestCase):
             self.assertTrue(math.isnan(phase(z)))
 
     def test_abs(self):
+        # [FUNCTION DOC] Checks abs of complex zeros is 0, of infinities is infinity, and
+        # mixed NaN/infinity cases.
         # zeros
         for z in complex_zeros:
             self.assertEqual(abs(z), 0.0)
@@ -561,15 +647,21 @@ class CMathTests(__TestCase):
 
     @requires_IEEE_754
     def test_abs_overflows(self):
+        # [FUNCTION DOC] Checks abs raises OverflowError when the magnitude is too large
+        # to represent.
         # result overflows
         self.assertRaises(OverflowError, abs, complex(1.4e308, 1.4e308))
 
     def assertCEqual(self, a, b):
+        # [FUNCTION DOC] HELPER: fails unless complex a matches the (real, imag) pair b within
+        # 1e-7 per component.
         eps = 1E-7
         if abs(a.real - b[0]) > eps or abs(a.imag - b[1]) > eps:
             self.fail((a ,b))
 
     def test_rect(self):
+        # [FUNCTION DOC] Checks rect at several radii and angles against known (real,
+        # imag) values.
         self.assertCEqual(rect(0, 0), (0, 0))
         self.assertCEqual(rect(1, 0), (1., 0))
         self.assertCEqual(rect(1, -pi), (-1., 0))
@@ -577,6 +669,8 @@ class CMathTests(__TestCase):
         self.assertCEqual(rect(1, -pi/2), (0, -1.))
 
     def test_isfinite(self):
+        # [FUNCTION DOC] Checks isfinite over all combinations of special real and imaginary
+        # parts matches the math isfinite of both parts.
         real_vals = [float('-inf'), -2.3, -0.0,
                      0.0, 2.3, float('inf'), float('nan')]
         for x in real_vals:
@@ -586,6 +680,8 @@ class CMathTests(__TestCase):
                                   math.isfinite(x) and math.isfinite(y))
 
     def test_isnan(self):
+        # [FUNCTION DOC] Checks isnan is false for finite and infinite numbers and true if any
+        # part is NaN.
         self.assertFalse(cmath.isnan(1))
         self.assertFalse(cmath.isnan(1j))
         self.assertFalse(cmath.isnan(INF))
@@ -597,6 +693,8 @@ class CMathTests(__TestCase):
         self.assertTrue(cmath.isnan(complex(INF, NAN)))
 
     def test_isinf(self):
+        # [FUNCTION DOC] Checks isinf is false for finite and NaN-only numbers and true if any
+        # part is infinite.
         self.assertFalse(cmath.isinf(1))
         self.assertFalse(cmath.isinf(1j))
         self.assertFalse(cmath.isinf(NAN))
@@ -609,6 +707,8 @@ class CMathTests(__TestCase):
 
     @requires_IEEE_754
     def testTanhSign(self):
+        # [FUNCTION DOC] Checks tanh of each complex zero preserves the signs of the
+        # zero parts.
         for z in complex_zeros:
             self.assertComplexesAreIdentical(cmath.tanh(z), z)
 
@@ -618,19 +718,27 @@ class CMathTests(__TestCase):
     # the sign of complex zeros.
     @requires_IEEE_754
     def testAtanSign(self):
+        # [FUNCTION DOC] Checks atan of each complex zero preserves signs; depends on a sign-
+        # aware log1p.
         for z in complex_zeros:
             self.assertComplexesAreIdentical(cmath.atan(z), z)
 
     @requires_IEEE_754
     def testAtanhSign(self):
+        # [FUNCTION DOC] Checks atanh of each complex zero preserves the signs of the
+        # zero parts.
         for z in complex_zeros:
             self.assertComplexesAreIdentical(cmath.atanh(z), z)
 
 
 class IsCloseTests(test_math.IsCloseTests):
+    # [CLASS DOC] isclose tests inherited from test_math.IsCloseTests, rebound to
+    # cmath.isclose and extended with complex-specific cases (tolerances, near-zero and
+    # special values).
     isclose = cmath.isclose
 
     def test_reject_complex_tolerances(self):
+        # [FUNCTION DOC] Checks complex-valued rel_tol or abs_tol arguments raise TypeError.
         with self.assertRaises(TypeError):
             self.isclose(1j, 1j, rel_tol=1j)
 
@@ -641,6 +749,8 @@ class IsCloseTests(test_math.IsCloseTests):
             self.isclose(1j, 1j, rel_tol=1j, abs_tol=1j)
 
     def test_complex_values(self):
+        # [FUNCTION DOC] Checks complex values close to 12 decimal places pass at 1e-12
+        # relative tolerance and fail at 1e-13.
         # test complex values that are close to within 12 decimal places
         complex_examples = [(1.0+1.0j, 1.000000000001+1.0j),
                             (1.0+1.0j, 1.0+1.000000000001j),
@@ -652,6 +762,8 @@ class IsCloseTests(test_math.IsCloseTests):
         self.assertAllNotClose(complex_examples, rel_tol=1e-13)
 
     def test_complex_near_zero(self):
+        # [FUNCTION DOC] Checks values near zero are close under abs_tol of 1.5e-3 but not
+        # 0.5e-3, plus two complex pairs against an absolute tolerance.
         # test values near zero that are near to within three decimal places
         near_zero_examples = [(0.001j, 0),
                               (0.001, 0),
@@ -668,6 +780,8 @@ class IsCloseTests(test_math.IsCloseTests):
         self.assertIsNotClose(0.001-0.001j, 0.001+0.001j, abs_tol=1e-03)
 
     def test_complex_special(self):
+        # [FUNCTION DOC] Checks infinity versus imaginary infinity, opposite infinities, and
+        # zero versus infinity are never close.
         self.assertIsNotClose(INF, INF*1j)
         self.assertIsNotClose(INF*1j, INF)
         self.assertIsNotClose(INF, -INF)
