@@ -1,3 +1,8 @@
+# [MODULE DOC] Partitions an FX GraphModule into submodules that fit on different accelerator devices.
+# Provides DAG / DAGNode records describing the partitions, a result tuple, helper functions that
+# manipulate Partition objects (parents, children, bfs level, device mapping, cycle check) and the
+# Partitioner class with several strategies: size based, sparse-nn, cost aware, Kernighan-Lin based and
+# ahead-of-time given. Uses split_module to produce the final module. No import-time side effects.
 import operator
 from collections import deque
 from typing import NamedTuple
@@ -20,6 +25,8 @@ from torch.fx.passes.split_module import split_module
 
 
 class DAGNode:
+    # [CLASS DOC] Record for one partition (submodule) in the result DAG: the call node of the submodule,
+    # its input nodes, its output nodes, the logical device ids it runs on and its size in bytes.
     """DAGNode class maintains useful information for a partition (submodule),
     and its input submodules and output submodules.
     """
@@ -32,6 +39,7 @@ class DAGNode:
         logical_device_ids: list[int],
         size_bytes: int,
     ) -> None:
+        # [FUNCTION DOC] Store the submodule node, input nodes, output nodes, logical device ids and size.
         self.submodule_node: Node = submodule_node
         self.input_nodes: list[Node] = input_nodes
         self.output_nodes: list[Node] = output_nodes
@@ -39,13 +47,16 @@ class DAGNode:
         self.size_bytes = size_bytes
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Return the string form of the submodule node.
         return str(self.submodule_node)
 
 
 class DAG:
+    # [CLASS DOC] Container of DAGNode records, kept in the order they were created.
     """DAG class contains all the DAG nodes"""
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Start with an empty node list.
         self.nodes: list[DAGNode] = []
 
     def create_node(
@@ -56,6 +67,7 @@ class DAG:
         logical_devices: list[int],
         size_bytes: int,
     ) -> None:
+        # [FUNCTION DOC] Build a DAGNode from the arguments and append it to the node list.
         node = DAGNode(
             submodule_node, input_nodes, output_nodes, logical_devices, size_bytes
         )
@@ -63,6 +75,8 @@ class DAG:
 
 
 class PartitionResult(NamedTuple):
+    # [CLASS DOC] Named tuple returned by partitioning: the DAG and the new graph module whose submodule
+    # call nodes are the partitions.
     """NamedTuple used for returning DAG and a new fx module"""
 
     dag: DAG
@@ -73,6 +87,7 @@ class PartitionResult(NamedTuple):
 
 
 def reset_partition_device(partitions: list[Partition]) -> None:
+    # [FUNCTION DOC] HELPER: Clear the logical device ids of every partition in place.
     for partition in partitions:
         partition.logical_device_ids = []
 
@@ -80,6 +95,9 @@ def reset_partition_device(partitions: list[Partition]) -> None:
 def combine_two_partitions(
     partition_0: Partition, partition_1: Partition, partitions: list[Partition]
 ) -> None:
+    # [FUNCTION DOC] HELPER: Merge two partitions of a list. Creates a new partition with the union of the
+    # nodes and recalculated memory size (no device ids copied), appends it, removes the two originals and
+    # reorganizes ids, parents and children. Mutates the list in place; returns nothing.
     """Given a list of partitions and its two partitions,
     combine these two partitions into a new one appending to the partitions
     and remove the previous two partitions from the list of partitions
@@ -95,6 +113,9 @@ def combine_two_partitions(
 
 
 def set_parents_and_children(partitions: list[Partition]) -> None:
+    # [FUNCTION DOC] HELPER: Recompute parent and child sets of all partitions. A partition is a parent of
+    # another when a node of it has a user in that other partition and the node is not also in it.
+    # Mutates the partitions; the sets are reset first.
     """Given a list of partitions, mark parents and children for each partition"""
     # Go through all nodes in a partition.
     # If a node's user is in other partition,
@@ -119,6 +140,7 @@ def set_parents_and_children(partitions: list[Partition]) -> None:
 
 
 def reorganize_partitions(partitions: list[Partition]) -> None:
+    # [FUNCTION DOC] HELPER: Renumber the partition ids by list position and recompute parents and children.
     """Given a list of partitions, reorganize partition id,
     its parents and its children for each partition
     """
@@ -130,6 +152,10 @@ def reorganize_partitions(partitions: list[Partition]) -> None:
 
 
 def get_bfs_level_partition(partitions: list[Partition]) -> None:
+    # [FUNCTION DOC] HELPER: Assign a breadth-first level to each partition, root partitions (no parents)
+    # being level zero and each next level made of the children of the previous one. Mutates bfs level.
+    # KNOWN ISSUE: the visited set is never used to skip partitions, so a partition reached again gets
+    # its level overwritten by the deeper one, and a dependency cycle would loop forever.
     """Given a list of partitions,
     mark the bfs level for each partition
     """
@@ -158,6 +184,7 @@ def get_bfs_level_partition(partitions: list[Partition]) -> None:
 
 
 def get_node_to_partition_mapping(partitions: list[Partition]) -> dict[Node, int]:
+    # [FUNCTION DOC] HELPER: Return a mapping from each node to the id of the partition containing it.
     """Given a list of partitions,return node to partition mapping"""
     node_to_partition: dict[Node, int] = {}
     for partition in partitions:
@@ -167,6 +194,7 @@ def get_node_to_partition_mapping(partitions: list[Partition]) -> dict[Node, int
 
 
 def get_logical_id_to_device(devices: list[Device]) -> dict[int, Device]:
+    # [FUNCTION DOC] HELPER: Return a mapping from logical device id to device object.
     """Get a mapping from device logical ID to Device object."""
     logical_id_to_device: dict[int, Device] = {}
     for d in devices:
@@ -177,6 +205,10 @@ def get_logical_id_to_device(devices: list[Device]) -> dict[int, Device]:
 def get_device_partition_stats(
     partitions: list[Partition], devices: list[Device]
 ) -> tuple[dict[Device, list[Partition]], dict[Device, int], list[Partition]]:
+    # [FUNCTION DOC] HELPER: Summarize device usage. Returns three things: a mapping from device to the
+    # partitions already placed on it, a mapping from device to remaining memory (available memory minus
+    # used memory of placed partitions) and the list of partitions with no device yet. Raises a lookup
+    # error for an unknown logical id. No mutation of the inputs.
     """Given a list of partitions and a list of devices, returns:
     1. A mapping from device to partitions on it;
     2. A mapping from device to its remaining memory size;
@@ -214,6 +246,10 @@ def get_device_partition_stats(
 def get_device_to_partitions_mapping(
     partitions: list[Partition], devices: list[Device]
 ) -> bool:
+    # [FUNCTION DOC] Place every partition lacking a device onto a device using the best-fit idea: devices
+    # are tried in order of increasing remaining memory and a partition goes to the first one that has more
+    # room than the extra memory it needs (shared nodes are counted once). Mutates the partitions' device
+    # ids. Returns True if all were placed, False as soon as one cannot be placed.
     """Given a list of partitions and a list of devices,
     map each partition into a device.
     """
@@ -221,6 +257,8 @@ def get_device_to_partitions_mapping(
     def calculate_extra_mem_bytes_needed_for(
         partition: Partition, partitions: list[Partition]
     ) -> int:
+        # [FUNCTION DOC] HELPER: Return the extra memory needed to add a partition to a device that already
+        # holds the given partitions, counting nodes shared with them only once.
         all_nodes: set[Node] = set()
         for p in partitions:
             all_nodes = all_nodes.union(p.nodes)
@@ -233,6 +271,8 @@ def get_device_to_partitions_mapping(
         return extra_size_needed
 
     def find_device_for(partition: Partition) -> bool:
+        # [FUNCTION DOC] HELPER: Try devices in the current order and put the partition on the first with
+        # enough room, updating the bookkeeping and the partition device ids. Returns whether it was placed.
         """Given a partition, find a logical device for the partition
         The algorithm is to put the partition on the device
         that has just enough mem left for that partition.
@@ -269,6 +309,8 @@ def get_device_to_partitions_mapping(
 
 
 def check_dependency(partition: Partition) -> bool:
+    # [FUNCTION DOC] HELPER: Return True if following child links from the partition (breadth first) leads
+    # back to itself, meaning a circular dependency, else False.
     """Given a partition,check if there is a circular dependency on
     this partition using bfs
     """
@@ -287,6 +329,10 @@ def check_dependency(partition: Partition) -> bool:
 
 
 class Partitioner:
+    # [CLASS DOC] Splits an FX module into partitions that fit the given devices. State: the list of
+    # partitions, the node to partition id mapping, the device list, and (set during partition_graph) the
+    # graph module and torch module. The main entry is partition_graph; each strategy method fills the
+    # partitions and node mapping.
     """A fx module may not fit into one device.
     Partitioner class helps partition one fx module into submodules (partitions),
     so that the submodules can be executed crossing different accelerators.
@@ -297,6 +343,7 @@ class Partitioner:
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Initialize empty partitions, node mapping and devices.
         self.partitions: list[Partition] = []
         self.node_to_partition: dict[Node, int] = {}
         self.devices: list[Device] = []
@@ -307,6 +354,14 @@ class Partitioner:
         torch_module: torch.nn.Module,
         partitioner_config: PartitionerConfig,
     ) -> PartitionResult:
+        # [FUNCTION DOC] Main entry. Stores the modules and devices, tags node sizes, picks a strategy (given
+        # mapping for ahead-of-time mode; a single partition if the module fits on the biggest device;
+        # otherwise the configured sparse-nn, cost-aware or Kernighan-Lin mode, defaulting to size based),
+        # optionally replicates onto idle devices, splits the module and builds the DAG. Returns the
+        # PartitionResult. Raises RuntimeError for no devices, no operations, insufficient total memory or
+        # unequal device memory in sparse-nn mode. Mutates graph node metadata and the partitioner state.
+        # KNOWN ISSUE: state is appended to, not reset, so calling it twice on one instance accumulates
+        # partitions from the earlier call.
         """Given the fx module, torch module and partitioner_config,
         find the partitions, do the partitions,
         and then return a DAG and a new fx module with submodule nodes (partitions)
@@ -386,6 +441,8 @@ class Partitioner:
     def find_single_partition(
         self, total_size_of_graph: int, logical_device_id: int = 0
     ) -> None:
+        # [FUNCTION DOC] Put all non-output nodes in one partition using the given total size and logical
+        # device id, and refresh the node to partition mapping.
         """Fit the whole fx module into one device"""
         partition_0 = self.create_partition()
         for node in self.graph_module.graph.nodes:
@@ -401,6 +458,10 @@ class Partitioner:
         return
 
     def size_based_partition(self) -> None:
+        # [FUNCTION DOC] Greedy memory-based partitioning described in the docstring: fill a device partition
+        # until full, open new partitions on unused devices, make single-node partitions when devices run out,
+        # then map partitions to devices. Raises RuntimeError if a node fits no device or no valid mapping is
+        # found. Mutates partitions and the node mapping.
         """This method is to partition the fx module based on memory size.
         It uses greedy approach. The result may not be the best.
         The basic idea is:
@@ -416,6 +477,10 @@ class Partitioner:
         """
 
         def find_device_based_on_size(node: Node) -> Device:
+            # [FUNCTION DOC] HELPER: Pick the first unused device with enough memory for the node and record it as
+            # occupied. Raises RuntimeError if none fits.
+            # KNOWN ISSUE: a caller also appends the returned device to the occupied list, so entries are
+            # duplicated; the failure check relies on a sentinel device with negative memory.
             """Given a node, this function is to find a logical device
             that could fit the node.
             """
@@ -495,6 +560,11 @@ class Partitioner:
         return
 
     def saturate_host(self) -> None:
+        # [FUNCTION DOC] Replicate partitions onto idle devices. Needs every partition to already have a device
+        # (AssertionError otherwise). Repeatedly, while idle devices remain, finds for every used device the
+        # smallest idle device with enough memory for its partitions; if all succeed it records the new
+        # devices and finally appends their ids to the partitions' device ids.
+        # KNOWN ISSUE: leftover debug code prints every partition's device ids to standard output.
         """Saturate host by assigning replicates to unused devices with enough memory.
         It uses a greedy approach to find a next available set of devices to place all split
         partitions: For each used device, it searches for an idle device with minimal memory
@@ -565,6 +635,8 @@ class Partitioner:
             print(p.logical_device_ids)
 
     def do_partition(self) -> GraphModule:
+        # [FUNCTION DOC] Split the graph module into submodules using the node to partition mapping and return
+        # the new module.
         """Return a new fx module with submodule nodes (partitions)."""
         module_with_submodules = split_module(
             self.graph_module,
@@ -574,6 +646,10 @@ class Partitioner:
         return module_with_submodules
 
     def dump_dag(self, module_with_submodules: GraphModule) -> DAG:
+        # [FUNCTION DOC] Build the DAG from the split module: for each submodule call node collect input nodes,
+        # output nodes (its users if several, else itself), device ids and size from the matching partition,
+        # whose id is parsed from the node name suffix. Skips placeholders, getattr and getitem nodes and
+        # stops at the output node.
         """Return the dag structure and the new fx module with submodules."""
         dag = DAG()
         for node in module_with_submodules.graph.nodes:
@@ -603,6 +679,7 @@ class Partitioner:
         return dag
 
     def create_partition(self) -> Partition:
+        # [FUNCTION DOC] Create a partition with the next id, append it to the partition list and return it.
         """Create a partition and append it to self.partitions."""
         partition_id = len(self.partitions)
         partition = Partition(partition_id)
@@ -610,12 +687,21 @@ class Partitioner:
         return partition
 
     def create_single_node_partition(self, node: Node) -> None:
+        # [FUNCTION DOC] Create a new partition holding only the given node.
         """Create a partition for a single node"""
         partition = self.create_partition()
         partition.add_node(node)
         return
 
     def sparse_nn_partition(self, available_mem_bytes: int) -> None:
+        # [FUNCTION DOC] Partition a sparse neural network where all devices have equal memory. Walks op nodes,
+        # starting a new partition when memory runs out or when crossing between embedding and non-embedding
+        # regions, merges small partitions within each kind, then assigns each embedding partition its own
+        # device and gives all non-embedding partitions the devices of the embedding partitions. Raises
+        # RuntimeError if a node is too large, devices are insufficient or the groups cannot share a device.
+        # Mutates partitions and the node mapping.
+        # KNOWN ISSUE: the too-large error adds a string to the node target, which fails if the target is
+        # not a string.
         """This method partition a sparse nn module.
         It is size based partition but different from size_based_partition,
         it only works when all the devices have same memory size (available_mem_bytes).
@@ -636,6 +722,8 @@ class Partitioner:
         def combine_partitions_based_on_size(
             partitions: list[Partition], available_mem_bytes: int
         ) -> None:
+            # [FUNCTION DOC] HELPER: Repeatedly merge the smallest partition with another of near bfs level and
+            # small enough combined size until no merge is possible. Mutates the lists and partitions.
             """Combining small partitions together to keep as less partitions as possible.
             Here is an example of the algorithm to do this:
             Assume some partitions, we first sort them based on partition used memory size.
@@ -664,6 +752,7 @@ class Partitioner:
             return
 
         def calculate_mem_bytes_needed(p1: Partition, p2: Partition) -> int:
+            # [FUNCTION DOC] HELPER: Return the memory bytes needed by the union of two partitions' nodes.
             """Given two partitions, calculate how many mem bytes
             are needed if two partitions are combined
             """
@@ -678,6 +767,9 @@ class Partitioner:
             available_mem_bytes: int,
             partitions: list[Partition],
         ) -> tuple[bool, list[Partition]]:
+            # [FUNCTION DOC] HELPER: Try to merge the smallest partition with the largest compatible one (bfs level
+            # difference at most one and combined size within the limit). Returns whether a merge happened and the
+            # updated list.
             """step 1 in combine_partition_based_on_size()"""
             find_combination = False
             smallest_partition = sorted_partitions.pop(0)
@@ -695,6 +787,9 @@ class Partitioner:
             return find_combination, partitions
 
         def reset_partition_in_sparse_nn(partition: Partition) -> Partition:
+            # [FUNCTION DOC] HELPER: File the current partition under embedding or non-embedding, create a new
+            # partition with the full device memory recorded as its left memory, and return it.
+            # KNOWN ISSUE: sets an attribute not declared on Partition (a type checker suppression marks it).
             """Finalize current partition and create a new one."""
             if in_embedding_region:
                 embedding_partitions.append(partition)
@@ -706,6 +801,7 @@ class Partitioner:
             return partition
 
         def finalize_partition(partition: Partition) -> None:
+            # [FUNCTION DOC] HELPER: File the current partition under embedding or non-embedding without a new one.
             """Finalize current partition without creating a new one."""
             if in_embedding_region:
                 embedding_partitions.append(partition)
@@ -713,6 +809,9 @@ class Partitioner:
                 non_embedding_partitions.append(partition)
 
         def is_embedding_node(node: Node) -> bool:
+            # [FUNCTION DOC] HELPER: Return True if a call_module node reaches a submodule whose string form
+            # contains the word Embedding. Raises RuntimeError for a missing attribute on the path.
+            # KNOWN ISSUE: the check also fires on any intermediate module along the path, not only the target.
             """Check if a node is an embedding node"""
             if node.op == "call_module":
                 submodule = self.graph_module
@@ -802,6 +901,10 @@ class Partitioner:
         transfer_rate_bytes_per_sec: float,
         node_to_latency_mapping: dict[Node, NodeLatency],
     ) -> None:
+        # [FUNCTION DOC] Cost-aware partitioning described in the docstring: begin with one partition per op
+        # node, then repeatedly combine the pair of partitions with the lowest resulting latency (if not worse
+        # than the current one) until no combination helps. Uses the given transfer rate and node latencies.
+        # Mutates partitions, device ids and the node mapping.
         """This method is to partition the fx module based on the cost.
         The cost is the total latency of running the whole fx module.
         In partitioner_utils.py, the cost model is built.
@@ -821,6 +924,11 @@ class Partitioner:
         def try_combining_partitions(
             p0_index: int, p1_index: int, partitions: list[Partition]
         ) -> float:
+            # [FUNCTION DOC] HELPER: Merge two partitions in a list copy if their bfs levels are close or they are
+            # directly connected, then return the resulting cost, or infinity if the merge is not allowed, creates
+            # a cycle or no device mapping exists.
+            # KNOWN ISSUE: the merge mutates shared partition objects (ids, parents, children) even though a
+            # list copy is passed, so callers must reorganize afterwards.
             """Given two partitions and a list of partitions, combine these two partitions
             and see what is the cost of the modified partition list
             """
@@ -862,6 +970,9 @@ class Partitioner:
             transfer_rate_bytes_per_sec: float,
             node_to_latency_mapping: dict[Node, NodeLatency],
         ) -> bool:
+            # [FUNCTION DOC] HELPER: Evaluate the current cost, try every partition pair, and merge the pair with
+            # the lowest cost not above the current one. Refreshes bfs levels and devices. Returns whether a pair
+            # was merged. A single partition returns False.
             """Given transfer rate between partitions and each node's latency,
             find two partitions to combine so the cost of the partitions can
             be reduced.
@@ -926,6 +1037,10 @@ class Partitioner:
         transfer_rate_bytes_per_sec: float,
         node_to_latency_mapping: dict[Node, NodeLatency],
     ) -> None:
+        # [FUNCTION DOC] Kernighan-Lin style refinement described in the docstring: start from the size based
+        # partition and compute its cost, then for each op node try swapping with every node of every other
+        # partition (or moving it alone) and apply the best cost reduction found. Uses the transfer rate and
+        # node latencies. Mutates partitions and device assignment.
         """This function is a cost aware partition based
         on Kernighan-Lin algorithm.
         First, the graph is partitioned using size_based_partition.
@@ -948,6 +1063,8 @@ class Partitioner:
         def swap_nodes(
             n0: Node | None, n1: Node | None, p0: Partition, p1: Partition
         ) -> None:
+            # [FUNCTION DOC] HELPER: Swap two nodes between two partitions; either may be None, meaning a plain
+            # move of the other node.
             # Either n0 or n1 could be None
             # That means we simply move the node
             # to another partition
@@ -966,6 +1083,9 @@ class Partitioner:
             node_to_latency_mapping: dict[Node, NodeLatency],
             transfer_rate_per_sec: float,
         ) -> float:
+            # [FUNCTION DOC] HELPER: Apply a swap, recompute structure, and if no cycle arises and devices fit,
+            # compute the cost; then undo the swap and restore devices. Returns the cost or infinity.
+            # KNOWN ISSUE: the transfer rate parameter is ignored; the outer transfer rate is used instead.
             cost = float("inf")
             swap_nodes(n0, n1, p0, p1)
             # Reorganize partitions after swapping
@@ -1002,6 +1122,10 @@ class Partitioner:
             node_to_latency_mapping: dict[Node, NodeLatency],
             transfer_rate_per_sec: float,
         ) -> tuple[float, list[Node]]:
+            # [FUNCTION DOC] HELPER: Try swapping one node of the first partition with each non-input node of the
+            # second (and None). Returns a cost and the node pair meant to be best.
+            # KNOWN ISSUE: the returned cost is that of the last swap tried, not the minimum cost that goes
+            # with the returned pair; it is also undefined if every candidate is skipped.
             """This function helps to swap one node from partition p0
             with all the nodes in another partition p1
             """
@@ -1080,6 +1204,9 @@ class Partitioner:
         node_to_partition_mapping: dict[Node, int],
         partition_to_logical_device_mapping: dict[int, list[int]],
     ) -> None:
+        # [FUNCTION DOC] Rebuild partitions from a given node to partition id mapping: create a partition per
+        # distinct id with logical devices from the given mapping, and add each node. Sets the node mapping.
+        # Raises a lookup error if an id has no device entry.
         """This function helps to rebuild the partitions given the nodes and its
         corresponding partition id
         """

@@ -1,3 +1,8 @@
+# [MODULE DOC] Resolves symbolic (sympy) shape expressions to concrete integer hints for a ShapeEnv.
+# Offers a strict guarding variant (backed symbols only, raises on unbacked ones) and a permissive
+# optimization variant (uses overrides, equality-based canonicalization, runtime-assert bounds and a
+# fallback value for unbacked symbols). Also holds two size limits that cap expensive sympy work.
+# Import-time side effects: creates a module logger only; ShapeEnv is imported for typing only.
 """
 Size hinting utilities for symbolic shape expressions.
 
@@ -38,12 +43,20 @@ if TYPE_CHECKING:
 
 
 def _sympy_subs(expr: sympy.Basic, replacements: dict[sympy.Expr, Any]) -> sympy.Basic:
+    # [FUNCTION DOC] HELPER: Substitute symbols in an expression using a mapping of replaced expressions
+    # to replacements, via the fast exact-match replace of sympy. A replacement given as a string becomes
+    # a new symbol of that name that inherits the integer and nonnegative assumptions of the replaced
+    # expression. Raises an error if a key is not a sympy expression. Returns the new expression; no
+    # mutation of the inputs.
     """
     When the passed replacement symbol v is a string, it is converted to a symbol with name v that
     have the same replaced expression integer and nonnegative properties.
     """
 
     def to_symbol(replaced: sympy.Expr, replacement: sympy.Expr | str) -> sympy.Symbol:
+        # [FUNCTION DOC] HELPER: Turn a replacement into a symbol when it is a string (copying the integer and
+        # nonnegative assumptions from the replaced expression), else return it unchanged. Raises an error if
+        # the replaced key is not a sympy expression.
         if not isinstance(replaced, sympy.Expr):
             raise AssertionError(
                 f"Expected sympy.Expr key, got {type(replaced)}: {replaced}"
@@ -66,6 +79,11 @@ def _sympy_subs(expr: sympy.Basic, replacements: dict[sympy.Expr, Any]) -> sympy
 def _maybe_realize_expr(
     expr: sympy.Basic, nan_fallback: int | None
 ) -> int | bool | None:
+    # [FUNCTION DOC] HELPER: Handle special sympy values for the hinting functions. Returns the boolean for
+    # sympy true/false, an integer when the expression converts to one, the largest machine integer for
+    # positive infinity, its negation for negative infinity, nan_fallback when the expression is or
+    # contains nan and a fallback was given, else None meaning no special handling applied. Raises
+    # ValueError if the expression contains the imaginary unit. No side effects.
     """
     Handle special sympy values in hinting APIs.
 
@@ -108,6 +126,11 @@ def _guarding_hint_or_throw_base(
     expr: sympy.Expr | sympy.Basic | int | bool,
     precomputed_replacements: dict[sympy.Expr, sympy.Symbol],
 ) -> int | bool:
+    # [FUNCTION DOC] Strict hint: evaluate an expression to a concrete int or bool using only the hints of
+    # backed symbols, for decisions that become guards. Applies the shape env replacements, expands the
+    # expression, substitutes precomputed sizes and backed hints, and returns the realized value.
+    # Raises the data-dependent error built by the shape env if unbacked symbols remain, and a
+    # RuntimeError for unexpected non-sympy input or an unrealizable result. Does not mutate state.
     """
     Return a concrete integer hint for an expression that is safe to use for guarding.
 
@@ -176,6 +199,11 @@ def _guarding_hint_or_throw_base(
 
 
 def _get_unbacked_replacements(shape_env: ShapeEnv) -> dict[sympy.Expr, sympy.Expr]:
+    # [FUNCTION DOC] HELPER: Build (and cache on the shape env) a mapping from unbacked expressions to a
+    # canonical equivalent expression. Builds an undirected equality graph from the equality deferred
+    # runtime asserts, groups equal expressions with a union-find structure and records each non-leader
+    # expression mapped to its leader. Side effects: sets the equality graph and unbacked replacements
+    # attributes on the shape env; returns the cached mapping on later calls.
     """Builds a mapping from unbacked expressions to canonical equivalents
     using a union-find algorithm over deferred runtime asserts.
     Used by optimization_hint to resolve unbacked symbols to consistent values."""
@@ -188,6 +216,10 @@ def _get_unbacked_replacements(shape_env: ShapeEnv) -> dict[sympy.Expr, sympy.Ex
         return shape_env._unbacked_replacements
 
     class CanonicalExprFinder:
+        # [CLASS DOC] HELPER: Disjoint-set (union-find) structure over the expressions of an equality graph.
+        # State: the graph, the ordered expression list, an index lookup, a leader array and set sizes. The
+        # graph is unioned at construction; find_expr returns the canonical expression of a group. The leader
+        # of each merged group is picked by choose_leader heuristics and always comes from the input graph.
         """
         A disjoint-set/union-find data structure that can return the
         "canonical" expression for a group of equivalent expressions.
@@ -197,6 +229,8 @@ def _get_unbacked_replacements(shape_env: ShapeEnv) -> dict[sympy.Expr, sympy.Ex
         """
 
         def __init__(self, eq_graph: dict[sympy.Expr, OrderedSet[sympy.Expr]]) -> None:
+            # [FUNCTION DOC] HELPER: Index the graph expressions, initialize every expression as its own leader
+            # with size one, then union all adjacent expressions of the graph.
             self.eq_graph = eq_graph
             self.expressions = list(eq_graph.keys())
             self.reverse_expressions = {
@@ -207,14 +241,19 @@ def _get_unbacked_replacements(shape_env: ShapeEnv) -> dict[sympy.Expr, sympy.Ex
             self._build_canonical_expr_mapping()
 
         def _build_canonical_expr_mapping(self) -> None:
+            # [FUNCTION DOC] HELPER: Union each expression with every neighbor listed in the equality graph.
             for expr, edges in self.eq_graph.items():
                 for adj in edges:
                     self.union_expr(expr, adj)
 
         def union_expr(self, a: sympy.Expr, b: sympy.Expr) -> bool:
+            # [FUNCTION DOC] HELPER: Union the groups of two expressions (looked up by index). Returns True if they
+            # were in different groups and got merged, False if already merged.
             return self.union(self.reverse_expressions[a], self.reverse_expressions[b])
 
         def union(self, a: int, b: int) -> bool:
+            # [FUNCTION DOC] HELPER: Union two expression indices. Finds both roots, picks a leader with
+            # choose_leader, points the other root at it and adds the sizes. Returns whether a merge happened.
             rootA = self.find(a)
             rootB = self.find(b)
             if rootA == rootB:
@@ -225,15 +264,21 @@ def _get_unbacked_replacements(shape_env: ShapeEnv) -> dict[sympy.Expr, sympy.Ex
             return True
 
         def find_expr(self, expr: sympy.Expr) -> sympy.Expr:
+            # [FUNCTION DOC] HELPER: Return the canonical (leader) expression of the group containing the given
+            # expression. Raises a lookup error if the expression is not in the graph.
             parent = self.find(self.reverse_expressions[expr])
             return self.expressions[parent]
 
         def find(self, x: int) -> int:
+            # [FUNCTION DOC] HELPER: Find the root index of an index, compressing the path as a side effect.
+            # Implemented recursively.
             if self.leader[x] != x:
                 self.leader[x] = self.find(self.leader[x])
             return self.leader[x]
 
         def choose_leader(self, a: int, b: int) -> tuple[int, int]:
+            # [FUNCTION DOC] HELPER: Choose which of two group roots becomes the leader. Returns the pair of
+            # leader then follower, decided by the heuristics listed in the docstring.
             """
             The leader will become the canonical expression.
             Returns a (leader, follower) tuple.
@@ -247,6 +292,9 @@ def _get_unbacked_replacements(shape_env: ShapeEnv) -> dict[sympy.Expr, sympy.Ex
             """
 
             def _choose(x: int, y: int) -> bool:
+                # [FUNCTION DOC] HELPER: Decide whether the first root should be leader. Prefers a root without free
+                # unbacked symbols, then the simpler expression when one contains the other, then more graph
+                # neighbors, then larger group size, then sympy structural comparison order. Returns a bool.
                 lhs, rhs = self.expressions[x], self.expressions[y]
 
                 any_unbacked_lhs = has_free_unbacked_symbols(lhs)
@@ -297,6 +345,14 @@ def _get_unbacked_replacements(shape_env: ShapeEnv) -> dict[sympy.Expr, sympy.Ex
 
 @lru_cache(maxsize=1024)
 def _sub_unbacked_exprs(shape_env: ShapeEnv, expr: sympy.Expr) -> sympy.Expr:
+    # [FUNCTION DOC] HELPER: Cached (per shape env and expression) substitution of unbacked expressions
+    # by their canonical equivalents so related unbacked quantities get consistent hints. Repeatedly
+    # applies the replacements (skipping costly full substitution when the symbol times replacement count
+    # is over the limit, and factoring while the free symbol count is under its limit) up to 30 rounds,
+    # logging a warning if the limit is hit, then substitutes backed hints and hint overrides.
+    # Returns the rewritten expression.
+    # KNOWN ISSUE: the cache is keyed on the shape env object and expression, so results go stale if
+    # the replacements or hints of the shape env change later, and the cache keeps shape envs alive.
     """Substitute unbacked expressions with canonical equivalents.
     Used by optimization_hint to maximize consistency when hinting unbacked symbols.
     """
@@ -347,6 +403,12 @@ def _sub_unbacked_exprs(shape_env: ShapeEnv, expr: sympy.Expr) -> sympy.Expr:
 def _hint_bounds_from_runtime_asserts(
     shape_env: ShapeEnv, s: sympy.Symbol
 ) -> tuple[int | None, int | None]:
+    # [FUNCTION DOC] HELPER: Derive concrete (lower, upper) integer bounds, either possibly None, for an
+    # unbacked symbol from the deferred runtime asserts keyed on it, after replacing backed symbols by
+    # their hints. Only relational asserts that reduce to a linear form in this one symbol with integer
+    # coefficients are used; others are skipped. Strict relations are tightened by one.
+    # Any exception during the scan is swallowed and whatever bounds were found are returned.
+    # KNOWN ISSUE: the broad exception handler silently hides real errors and may yield partial bounds.
     """Concrete ``(lower, upper)`` bounds for an unbacked symbol derived from the
     runtime asserts, with backed symbols replaced by their hint values.
 
@@ -411,6 +473,14 @@ def _optimization_hint_base(
     precomputed_replacements: dict[sympy.Expr, sympy.Symbol],
     fallback: int | None = None,
 ) -> int:
+    # [FUNCTION DOC] Permissive hint: return a concrete int for an expression for non-guarding uses such
+    # as optimization. Tries the shape env replacements, backed hints, user hint overrides, then
+    # canonicalizes remaining unbacked symbols and assigns each a per-symbol fallback (config default if
+    # fallback is None) clamped to the symbol range and runtime-assert bounds. Returns the realized int
+    # (the fallback when a division by zero occurs during substitution). Raises RuntimeError if the input
+    # is not a sympy expression or cannot be realized. Does not guard. Reads inductor config lazily.
+    # KNOWN ISSUE: a comment before the first backed substitution says backed symbols are replaced but
+    # the call there only realizes the expression; also the zero fallback branch cannot see None.
     """
     Return a concrete integer hint for an expression using heuristics.
 

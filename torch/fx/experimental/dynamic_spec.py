@@ -1,3 +1,9 @@
+# [MODULE DOC] Spec types describing which input dimensions and scalars are dynamic for compile and
+# export (currently unbacked shapes only). Provides IntVar and ShapeVar symbolic variables backed by a
+# private singleton spec ShapeEnv, per-kind specs (TensorSpec, ObjectSpec, DictSpec, SeqSpec),
+# ParamsSpec for function parameters, ShapesSpec (params plus assumptions), the dynamic_spec decorator
+# and an internal resolver of decorator versus call-site specs. STATIC is an alias of None. Import-time
+# side effects: creates a logger, an id counter holder and a lock; the spec ShapeEnv is built lazily.
 """Spec types for controlling what is dynamic in compiled/exported code.
 Currently only supports unbacked dynamic shapes.
 
@@ -69,6 +75,9 @@ _SPEC_SHAPE_ENV_LOCK = threading.Lock()
 
 
 def _get_spec_shape_env() -> ShapeEnv:
+    # [FUNCTION DOC] HELPER: Return the process-wide spec ShapeEnv, building it on first use under a lock
+    # (double-checked) so concurrent callers share one instance. The class is defined inside because
+    # importing symbolic shapes at module import time would be circular. Side effect: sets the global.
     """Lazily build the singleton spec ShapeEnv (thread-safe)."""
     global _SPEC_SHAPE_ENV
     if _SPEC_SHAPE_ENV is not None:
@@ -79,6 +88,9 @@ def _get_spec_shape_env() -> ShapeEnv:
         from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
         class _SpecShapeEnv(ShapeEnv):
+            # [CLASS DOC] HELPER: ShapeEnv subclass used only to build spec expressions. Blocks access to public
+            # attributes except an allowlist (needed by symbolic arithmetic and range lookups) by raising a type
+            # error; private names always pass, and all access is open while the base initializer runs.
             """Special ShapeEnv used only at spec-definition time.
 
             Attribute access is blocked by default via ``__getattribute__``;
@@ -111,12 +123,17 @@ def _get_spec_shape_env() -> ShapeEnv:
             )
 
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Initialize with access checks disabled during base-class setup, then enable
+                # the checks by setting the init-done flag.
                 # Allow everything during super().__init__.
                 object.__setattr__(self, "_init_done", False)
                 super().__init__()
                 object.__setattr__(self, "_init_done", True)
 
             def __getattribute__(self, name: str) -> Any:
+                # [FUNCTION DOC] HELPER: Attribute hook. Allows private names, any name before init is done and the
+                # allowlisted public names; otherwise raises TypeError explaining that only spec variables may be used
+                # at spec-definition time.
                 if name.startswith("_"):
                     return super().__getattribute__(name)
                 if not super().__getattribute__("_init_done"):
@@ -134,6 +151,10 @@ def _get_spec_shape_env() -> ShapeEnv:
 
 
 class IntVar(SymInt):
+    # [CLASS DOC] Symbolic integer marking a scalar (or tensor dimension) as dynamic. Subclass of SymInt
+    # attached to the spec ShapeEnv, so arithmetic and comparisons build derived symbolic values.
+    # State: name (default anon), a unique per-instance id, optional min and max bounds, optional
+    # optimization hint and the sympy symbol. Hashed by identity. Provides repr and a JSON-friendly dict.
     """Indicates that a scalar integer argument is dynamic (no implicit range).
 
     Unbacked dynamic shapes will represent the underlying value in the
@@ -174,6 +195,11 @@ class IntVar(SymInt):
         max: int | None = None,
         optimization_hint: int | None = None,
     ) -> None:
+        # [FUNCTION DOC] Create the variable: store name, bounds and hint, draw a fresh unique id, create a
+        # sympy symbol named with the name and id, wrap it in a symbolic node on the spec ShapeEnv with no
+        # hint, and register its value range (unbounded when min or max is None) in that env.
+        # Side effect: advances the class-wide id counter and mutates the spec ShapeEnv range table.
+        # KNOWN ISSUE: min and max are not checked against each other, so an empty range is accepted.
         import sympy
 
         from torch.fx.experimental.sym_node import _NO_HINT, SymNode
@@ -202,6 +228,8 @@ class IntVar(SymInt):
         )
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Return a string with class name, then name plus unique id, and any set min, max and
+        # optimization hint, so equal-named variables stay distinguishable.
         # Always include uid so two same-named (or anonymous) instances
         # are distinguishable in logs.
         parts = [f"{self.name}#{self._uid}"]
@@ -216,9 +244,13 @@ class IntVar(SymInt):
     # Hashable by identity — IntVars are unique per construction, and inheriting
     # SymInt.__hash__ would route through node hashing which we don't need here.
     def __hash__(self) -> int:  # type: ignore[override]
+        # [FUNCTION DOC] Hash by object identity, since each variable is unique per construction.
+        # KNOWN ISSUE: equality inherited from SymInt returns a symbolic bool, so hash and equality are not
+        # consistent in the usual sense.
         return id(self)
 
     def to_jsonable(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Return a plain dict with the type name, name, min, max and optimization hint.
         return {
             "type": type(self).__name__,
             "name": self.name,
@@ -229,6 +261,9 @@ class IntVar(SymInt):
 
 
 def _validate_spec_sym(v: Any, *, where: str) -> None:
+    # [FUNCTION DOC] HELPER: Check that a value, if it is a symbolic int or bool, was created on the spec
+    # ShapeEnv; other values pass silently. Raises TypeError naming the location when the symbolic value
+    # belongs to a different ShapeEnv.
     """If ``v`` is a SymInt or SymBool, validate it originates from the
     spec ShapeEnv.
     """
@@ -246,6 +281,7 @@ def _validate_spec_sym(v: Any, *, where: str) -> None:
 
 
 class ShapeVar(IntVar):
+    # [CLASS DOC] Dynamic dimension size variable. An IntVar whose minimum defaults to zero.
     """Indicates that a dimension size is dynamic and is >= 0.
 
     Subclass of `IntVar` with ``min=0`` by default.
@@ -265,6 +301,8 @@ class ShapeVar(IntVar):
         max: int | None = None,
         optimization_hint: int | None = None,
     ) -> None:
+        # [FUNCTION DOC] Create a size variable; raises ValueError if min is negative, then defers to the
+        # IntVar initializer with the same name, bounds and optimization hint.
         if min < 0:
             raise ValueError(
                 f"ShapeVar requires min >= 0 (a shape dim is non-negative); "
@@ -274,6 +312,9 @@ class ShapeVar(IntVar):
 
 
 class TensorSpec:
+    # [CLASS DOC] Per-dimension spec of one tensor. Holds an ordered list of dimension specs (variable,
+    # derived symbolic int, plain int or None for static) whose length is the tensor rank. Supports index,
+    # length and iteration, a readable multi-line repr and a JSON-friendly dict.
     """Per-dimension shape specification for a tensor.
 
     A list-like container of ``LeafIntSpec`` with length
@@ -288,6 +329,8 @@ class TensorSpec:
     """
 
     def __init__(self, dims: Sequence[LeafIntSpec]) -> None:
+        # [FUNCTION DOC] Validate every dimension entry (None, int or symbolic int, from the spec ShapeEnv) and
+        # store a copy as a list. Raises TypeError for other entry types or foreign symbolic values.
         for i, d in enumerate(dims):
             if d is not None and not isinstance(d, (int, SymInt)):
                 raise TypeError(
@@ -298,21 +341,28 @@ class TensorSpec:
         self._specs: list[LeafIntSpec] = list(dims)
 
     def __getitem__(self, index: int) -> LeafIntSpec:
+        # [FUNCTION DOC] Return the spec of the dimension at the given position.
         return self._specs[index]
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] Return the number of dimensions.
         return len(self._specs)
 
     def __iter__(self) -> Iterator[LeafIntSpec]:
+        # [FUNCTION DOC] Return an iterator over the dimension specs.
         return iter(self._specs)
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Return a multi-line string headed by a tensor label with one indented line per
+        # dimension showing its index and spec repr.
         lines = ["Tensor:"]
         for i, spec in enumerate(self._specs):
             lines.append(f"{_INDENT}{i}: {spec!r}")
         return "\n".join(lines)
 
     def to_jsonable(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Return a dict with type TensorSpec and the list of dimensions, each converted through
+        # its own JSON-friendly method when it has one, else kept as is.
         return {
             "type": "TensorSpec",
             "dims": [
@@ -323,6 +373,9 @@ class TensorSpec:
 
 
 class ObjectSpec:
+    # [CLASS DOC] Spec for the attributes of an arbitrary object: a mapping from attribute name to a nested
+    # spec (leaf, container or another object spec). Supports membership, iteration over names, length,
+    # items, a nested multi-line repr and a JSON-friendly dict.
     """Spec for any Python object's attributes.
 
     Constructor::
@@ -339,21 +392,28 @@ class ObjectSpec:
     """
 
     def __init__(self, fields: dict[str, IntermediateSpec] | None = None) -> None:
+        # [FUNCTION DOC] Store a copy of the given mapping of attribute names to specs (empty if none).
         self._fields: dict[str, IntermediateSpec] = dict(fields) if fields else {}
 
     def __contains__(self, name: object) -> bool:
+        # [FUNCTION DOC] Return whether the attribute name has a spec entry.
         return name in self._fields
 
     def __iter__(self) -> Iterator[str]:
+        # [FUNCTION DOC] Return an iterator over attribute names.
         return iter(self._fields)
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] Return the number of attribute entries.
         return len(self._fields)
 
     def items(self) -> Any:
+        # [FUNCTION DOC] Return a view of the (name, spec) pairs.
         return self._fields.items()
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Return a multi-line string with a header and one entry per attribute; multi-line child
+        # reprs are placed on following lines with extra indentation.
         lines = ["object_spec:"]
         for name, spec in self._fields.items():
             spec_repr = repr(spec)
@@ -366,6 +426,8 @@ class ObjectSpec:
         return "\n".join(lines)
 
     def to_jsonable(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Return a dict with type ObjectSpec and the fields, each converted through its own
+        # JSON-friendly method when available.
         return {
             "type": "ObjectSpec",
             "fields": {
@@ -376,6 +438,9 @@ class ObjectSpec:
 
 
 class DictSpec:
+    # [CLASS DOC] Spec for a dict value: a mapping from string or integer key to a nested spec. Validates
+    # key types at construction. Supports membership, key iteration, length, items, repr and a
+    # JSON-friendly dict.
     """Spec for a Python ``dict``-typed value.
 
     Constructor::
@@ -394,6 +459,8 @@ class DictSpec:
     def __init__(
         self, entries: dict[str | int, IntermediateSpec] | None = None
     ) -> None:
+        # [FUNCTION DOC] Store a copy of the entries (empty if none) and raise TypeError if any key is not a
+        # string or an integer.
         self._entries: dict[str | int, IntermediateSpec] = (
             dict(entries) if entries else {}
         )
@@ -404,18 +471,24 @@ class DictSpec:
                 )
 
     def __contains__(self, key: object) -> bool:
+        # [FUNCTION DOC] Return whether the key has a spec entry.
         return key in self._entries
 
     def __iter__(self) -> Iterator[str | int]:
+        # [FUNCTION DOC] Return an iterator over the keys.
         return iter(self._entries)
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] Return the number of entries.
         return len(self._entries)
 
     def items(self) -> Any:
+        # [FUNCTION DOC] Return a view of the (key, spec) pairs.
         return self._entries.items()
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Return a multi-line string with a header and one entry per key, nesting multi-line
+        # child reprs with extra indentation.
         lines = ["dict_spec:"]
         for key, spec in self._entries.items():
             spec_repr = repr(spec)
@@ -428,6 +501,10 @@ class DictSpec:
         return "\n".join(lines)
 
     def to_jsonable(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Return a dict with type DictSpec and entries keyed by the string form of each key,
+        # values converted through their own JSON-friendly method when available.
+        # KNOWN ISSUE: integer keys are turned into strings, so an int key and the same-looking string key
+        # collide and the original key type is lost.
         return {
             "type": "DictSpec",
             "entries": {
@@ -438,6 +515,8 @@ class DictSpec:
 
 
 class SeqSpec:
+    # [CLASS DOC] Spec for a list or tuple value, one nested spec per leading position. Positions beyond the
+    # spec length are static. Stores the entries as a list; supports length, repr and a JSON-friendly dict.
     """Spec for a Python ``list``- or ``tuple``-typed value.
 
     Per-position. The spec list may be shorter than the runtime sequence;
@@ -455,12 +534,16 @@ class SeqSpec:
     """
 
     def __init__(self, entries: Sequence[IntermediateSpec]) -> None:
+        # [FUNCTION DOC] Store the given sequence of entry specs as a new list.
         self._entries: list[IntermediateSpec] = list(entries)
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] Return the number of entry specs.
         return len(self._entries)
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Return a multi-line string with a header and one line per position, nesting
+        # multi-line child reprs with extra indentation.
         lines = ["seq_spec:"]
         for i, spec in enumerate(self._entries):
             spec_repr = repr(spec)
@@ -473,6 +556,8 @@ class SeqSpec:
         return "\n".join(lines)
 
     def to_jsonable(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Return a dict with type SeqSpec and the list of entries, each converted through its
+        # own JSON-friendly method when available.
         return {
             "type": "SeqSpec",
             "entries": [
@@ -510,6 +595,11 @@ ParamsSpecValue: TypeAlias = (
 
 
 class ParamsSpec:
+    # [CLASS DOC] Spec for the parameters of a callable. State: a mapping of named parameter to spec, an
+    # optional list of specs for variadic positional arguments, and an optional mapping of specs for
+    # variadic keyword arguments. Two reserved keys select the variadic slots. Anything not covered is
+    # static. Provides repr and a JSON-friendly dict.
+    # KNOWN ISSUE: the class docstring ends with a stray pair of asterisks after the last sentence.
     """Specification for the arguments of a compiled function.
 
     Describes the dynamic shape behavior for named arguments, ``*args``,
@@ -542,6 +632,10 @@ class ParamsSpec:
         self,
         params: dict[str, ParamsSpecValue] | None = None,
     ) -> None:
+        # [FUNCTION DOC] Build the three stores from an optional mapping. The varargs key needs a list and the
+        # varkw key needs a dict (ValueError otherwise); other keys starting with a star raise ValueError;
+        # all other keys become named entries. Every symbolic value is validated to come from the spec
+        # ShapeEnv (TypeError otherwise).
         self._named_args: dict[str, IntermediateSpec] = {}
         self._varargs: list[IntermediateSpec] | None = None
         self._varkw: dict[str, IntermediateSpec] | None = None
@@ -576,10 +670,15 @@ class ParamsSpec:
                 self._named_args[key] = cast(IntermediateSpec, value)
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Return a multi-line string listing named entries, then the variadic positional
+        # entries and the variadic keyword entries, each nested with indentation.
         def _indent_lines(text: str, prefix: str = _INDENT) -> str:
+            # [FUNCTION DOC] HELPER: Prefix every line of a text with the given indentation string.
             return "\n".join(prefix + line for line in text.splitlines())
 
         def _entry_repr(key: str, value: Any) -> str:
+            # [FUNCTION DOC] HELPER: Format one entry as key and value, placing a multi-line value on indented
+            # following lines.
             v_repr = repr(value)
             if "\n" in v_repr:
                 return f"{key}:\n{_indent_lines(v_repr)}"
@@ -597,6 +696,9 @@ class ParamsSpec:
         return "\n".join(lines)
 
     def to_jsonable(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Return a dict with type ParamsSpec and a params dict holding named entries plus the
+        # variadic positional list and variadic keyword mapping when present, each element converted through
+        # its JSON-friendly method when available.
         params: dict[str, Any] = {
             name: value.to_jsonable() if hasattr(value, "to_jsonable") else value
             for name, value in self._named_args.items()
@@ -618,6 +720,10 @@ class ParamsSpec:
 
 
 class ShapesSpec:
+    # [CLASS DOC] Top-level shape spec for a compile or export call. State: an optional ParamsSpec and a
+    # list of symbolic boolean assumptions built from spec variables, meant to be asserted at runtime via
+    # deferred runtime asserts. A reserved globals argument is not supported. Provides an assumptions
+    # property (a copy), repr and a JSON-friendly dict.
     """Top-level shape specification for a ``torch.compile`` call.
 
     ``params`` describes the arguments of the compiled callable — for a raw
@@ -663,6 +769,9 @@ class ShapesSpec:
         globals: Any = None,
         assumptions: Sequence[SymBool] | None = None,
     ) -> None:
+        # [FUNCTION DOC] Initialize empty state, reject any globals value with NotImplementedError, wrap a
+        # plain dict into a ParamsSpec (TypeError for types other than ParamsSpec, dict or None), and validate
+        # each assumption is a symbolic bool from the spec ShapeEnv (TypeError otherwise) before storing it.
         # Normalize attributes up front so partially-constructed instances
         # (e.g. when a later check raises) still have a stable shape.
         self._params: ParamsSpec | None = None
@@ -694,9 +803,11 @@ class ShapesSpec:
 
     @property
     def assumptions(self) -> list[SymBool]:
+        # [FUNCTION DOC] Property returning a new list copy of the assumptions.
         return list(self._assumptions)
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Return a multi-line string with the params and assumptions sections that are present.
         lines = ["shapes_spec:"]
         if self._params is not None:
             lines.append(f"{_INDENT}params:")
@@ -710,6 +821,8 @@ class ShapesSpec:
         return "\n".join(lines)
 
     def to_jsonable(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Return a dict with type ShapesSpec, the params in JSON-friendly form (or None) and the
+        # assumptions as repr strings.
         return {
             "type": "ShapesSpec",
             "params": None if self._params is None else self._params.to_jsonable(),
@@ -731,6 +844,8 @@ _SHAPES_SPEC_VS_DEFERRED_RUNTIME_ASSERTS_MSG = (
 def _coerce_to_shapes_spec(
     x: Any,
 ) -> ShapesSpec | None:
+    # [FUNCTION DOC] HELPER: Normalize a user value to a ShapesSpec or None. None stays None, a ShapesSpec
+    # is returned as is, and a dict or ParamsSpec is wrapped. Raises TypeError for anything else.
     """Normalize a user-supplied dynamic-spec value to ``ShapesSpec | None``.
 
     Accepts ``None``, an existing ``ShapesSpec``, a ``ParamsSpec``, or a plain
@@ -755,6 +870,10 @@ _DYNAMIC_SPEC_ATTR = "_dynamic_spec"
 
 
 def dynamic_spec(spec: Any) -> Any:
+    # [FUNCTION DOC] Decorator factory attaching a spec to a function or module forward method. Normalizes
+    # the argument now (TypeError if it is None or of an unsupported type) and returns a decorator that
+    # stores the resulting ShapesSpec on the function under a private attribute and returns the function.
+    # Compile, export and make_fx read it unless an explicit call-site spec is also given.
     """Attach a ``ShapesSpec`` to a function (or ``nn.Module.forward``).
 
     When :func:`torch.compile`, :func:`torch.export.export`, or
@@ -802,6 +921,9 @@ def dynamic_spec(spec: Any) -> Any:
         )
 
     def _decorator(fn: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Attach the resolved spec to the function as an attribute and return the
+        # function. Raises ValueError if a spec is already attached (stacking is disallowed).
+        # Side effect: mutates the decorated function.
         if hasattr(fn, _DYNAMIC_SPEC_ATTR):
             raise ValueError(
                 "@dynamic_spec(...) is already attached to "
@@ -819,6 +941,11 @@ def _resolve_dynamic_shapes(
     fn_or_module: Callable[..., Any] | torch.nn.Module,
     dynamic_shapes_kwarg: Any,
 ) -> Any:
+    # [FUNCTION DOC] HELPER: Decide the spec for a call. For a module the forward method is inspected. With
+    # no attached spec the call-site value is returned unchanged. If both an attached spec and a call-site
+    # value exist raises ValueError. Otherwise logs at info level and returns the attached spec.
+    # KNOWN ISSUE: the error text reads as if the decorator were the only thing attached ("Both ... is
+    # attached ... AND ...") but is otherwise accurate; grammar is off only.
     """Resolve the effective dynamic-shapes spec for a call site.
 
     Reads ``@dynamic_spec(...)`` metadata from ``fn_or_module`` (for an

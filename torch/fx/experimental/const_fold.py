@@ -1,3 +1,7 @@
+# [MODULE DOC] Constant folding for FX graph modules. Provides FoldedGraphModule (a graph module with
+# a separate constant subgraph executed once before first call), split_const_subgraphs which finds
+# nodes depending only on attributes and splits them out, plus helpers to inline a submodule and to
+# pick unique attribute names. No import-time side effects.
 import re
 import types
 from collections.abc import Callable
@@ -16,6 +20,11 @@ __all__ = [
 
 
 class FoldedGraphModule(torch.fx.GraphModule):
+    # [CLASS DOC] GraphModule carrying an optional constant subgraph module. State: the constant subgraph
+    # module, a flag whether folding has run, the attribute name under which folded values are stored and
+    # the device used for folded integer values. The first call runs the folding.
+    # KNOWN ISSUE: the docstring mentions const_output_names which does not exist; the code uses a
+    # single attribute name.
     """
     FoldedGraphModule is a GraphModule which also contains another
     `const_subgraph_module` representing a subgraph which has all const attr
@@ -33,6 +42,8 @@ class FoldedGraphModule(torch.fx.GraphModule):
         fx_const_folded_attrs_name: str | None = None,
         device_for_folded_attrs: str = "cuda",
     ) -> None:
+        # [FUNCTION DOC] Initialize the base graph module, build the constant subgraph module (None when no
+        # subgraph is given) and store the folding flag, attribute name and device.
         super().__init__(root, graph)
         self.const_subgraph_module = (
             None
@@ -44,11 +55,18 @@ class FoldedGraphModule(torch.fx.GraphModule):
         self.device_for_folded_attrs = device_for_folded_attrs
 
     def __call__(self, *args: object, **kwargs: object) -> Any:
+        # [FUNCTION DOC] Run folding on first use, then call the module with the positional arguments.
+        # KNOWN ISSUE: keyword arguments are accepted but silently dropped.
         if not self.has_folding_been_run:
             self.run_folding()
         return super().__call__(*args)
 
     def run_folding(self) -> None:
+        # [FUNCTION DOC] Execute the constant subgraph once and store its result as a parameter (or a list of
+        # parameters for a tuple result) on the module under the folded attribute name. Returns early with no
+        # effect if there is no subgraph or name. Raises AssertionError if already run. Side effects: sets the
+        # flag and a module attribute.
+        # KNOWN ISSUE: the early return leaves the flag unset, so it is retried on every call.
         # If there's no const subgraph module or attr output names to use, return
         # early as there is no const folding to perform.
         if (
@@ -67,6 +85,9 @@ class FoldedGraphModule(torch.fx.GraphModule):
         folded_attrs = self.const_subgraph_module()
 
         def _create_param(i: torch.Tensor | int) -> torch.nn.Parameter:
+            # [FUNCTION DOC] HELPER: Wrap a folded value as a Parameter: a tensor is detached and cloned and keeps
+            # its requires-grad flag; an int becomes a one-element tensor on the folded device without grad.
+            # KNOWN ISSUE: the integer path builds a default-float tensor, not an integer one.
             return torch.nn.Parameter(
                 i.detach().clone()
                 if not isinstance(i, int)
@@ -88,6 +109,12 @@ def _inline_module(
     run_dce: bool = True,
     is_impure_node: Callable[[torch.fx.Node], bool] | None = None,
 ) -> dict[torch.fx.Node, torch.fx.Node]:
+    # [FUNCTION DOC] HELPER: Inline the graph of the called submodule with the given name into the graph
+    # module in place of its call node. Placeholders map to the call arguments (by keyword name else
+    # position), other nodes are copied before the call, outputs replace the uses of the call (with tuple
+    # getitem users resolved and erased), the call node is removed and optionally dead code is
+    # eliminated. Returns the mapping from inlined nodes to new nodes. Raises AssertionError if the
+    # module is not a graph module or the call node is missing. Mutates the graph module.
     """
     Given `gm` and some graph module which is called with target name `inline_mod_name`,
     this helper will inline all of the nodes from that called graph module into `gm`.
@@ -115,6 +142,8 @@ def _inline_module(
     ph_count = 0
 
     def replacement_fn(node: torch.fx.Node) -> torch.fx.Node:
+        # [FUNCTION DOC] HELPER: Look up the new node for an old one and copy the metadata of the old one onto
+        # it, then return it.
         new_node = replacement_mapping[node]
         new_node.meta = node.meta.copy()
         return new_node
@@ -176,6 +205,10 @@ def _inline_module(
 
 
 def get_unique_attr_name_in_module(mod_traced: torch.fx.GraphModule, name: str) -> str:
+    # [FUNCTION DOC] Return an attribute name based on the given name that is not yet used on the module:
+    # illegal identifier characters become underscores, a leading digit gets an underscore prefix, and
+    # while taken, a numeric suffix is added or incremented.
+    # KNOWN ISSUE: an empty name causes an index error; the function does not guard for it.
     """
     Make sure the name is unique (in a module) and can represents an attr.
     """
@@ -201,6 +234,12 @@ def split_const_subgraphs(
     device_for_folded_attrs: str = "cpu",
     is_impure_node: Callable[[torch.fx.Node], bool] | None = None,
 ) -> FoldedGraphModule:
+    # [FUNCTION DOC] Fold constants: trace the module if needed, mark nodes whose inputs are all constant
+    # attribute tensors or other constant nodes (skipping impure nodes, symbolic fill values, user
+    # skipped nodes, modules with impure or skipped inner nodes), split them into a constant submodule,
+    # convert its placeholders to attribute reads, replace its call by a read of a placeholder attribute
+    # for the folded values, inline the rest and remove dead code. Returns a FoldedGraphModule, plain if
+    # nothing can be folded. Raises AssertionError on internal inconsistencies.
     """
     Looks through `module` for any nodes that have all constant attribute inputs
     and separates them out into their own constant subgraph, and returns a
@@ -229,6 +268,10 @@ def split_const_subgraphs(
         mod_traced = module
 
     def _subgraph_has_impure_ops(module: torch.fx.GraphModule) -> bool:
+        # [FUNCTION DOC] HELPER: Return True if a graph module contains an impure function call, looking into
+        # nested graph module submodules.
+        # KNOWN ISSUE: on reaching the first nested graph module call it returns the nested result at once,
+        # so later nodes (and impure ops after it) are never checked.
         """
         Return True if a GraphModule type subgraph contains any impure op, else False.
         """
@@ -252,6 +295,8 @@ def split_const_subgraphs(
         module: torch.fx.GraphModule,
         skip_fn: Callable[[torch.fx.Node], bool],
     ) -> bool:
+        # [FUNCTION DOC] HELPER: Return True if the skip predicate is true for any node other than
+        # placeholders and outputs, recursing into nested graph module submodules.
         """
         Return True if a GraphModule type subgraph contains any node that
         `skip_fn` says to skip, recursing into nested submodules.
@@ -345,6 +390,7 @@ def split_const_subgraphs(
     # Partition the module into two: submod_0 for constant folding subgraph, and
     # submod_1 for the rest.
     def mod_partition(node: torch.fx.Node) -> int:
+        # [FUNCTION DOC] HELPER: Partition callback: constant nodes go to partition zero, all others to one.
         return 0 if node in const_nodes else 1
 
     split = split_module(mod_traced, module, mod_partition)

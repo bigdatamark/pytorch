@@ -1,3 +1,7 @@
+# [MODULE DOC] Binds a user ShapesSpec / ParamsSpec to the actual call arguments of a function or
+# module, producing one leaf spec per flattened pytree input. Pure spec-to-argument logic (pytree,
+# signature inspection and the spec types); no sympy or ShapeEnv use. Shared by make_fx and by strict
+# and non-strict export. No import-time side effects beyond imports.
 """Bind a ``ShapesSpec``/``ParamsSpec`` to a callable's flat ``(args, kwargs)``.
 
 These helpers are pure spec->args binding (``pytree`` + ``inspect`` + the spec
@@ -35,6 +39,14 @@ def _walk_spec(
     arg_value: Any,
     where: str,
 ) -> list[LeafSpec]:
+    # [FUNCTION DOC] HELPER: Recursively pair a spec subtree with a runtime value and return the flat list
+    # of leaf specs, one per pytree leaf, in pytree flatten order (None means static). A missing spec
+    # makes the whole subtree static. Sequence, dict and object specs recurse (objects through the
+    # registered keyed-flatten function) and concatenate child lists; leaf specs are type-checked against
+    # the value (tensor spec needs a tensor, scalar spec needs an int). The where argument is a path
+    # string used only in messages. Raises ValueError on container type mismatches, extra sequence
+    # entries, unmatched dict keys or attributes, unregistered object types or missing keyed-flatten
+    # function, and AssertionError for an unknown leaf spec type. No mutation.
     """Return the flat leaf-spec list for ``arg_value`` (one entry per
     ``pytree.tree_flatten`` leaf, ``None`` = static), pairing each leaf with its
     ``user_spec`` counterpart.
@@ -171,6 +183,14 @@ def _bind_spec_to_args(
     kwargs: dict[str, Any] | None,
     shapes_spec: ShapesSpec,
 ) -> tuple[list[LeafSpec], list[Any], pytree.TreeSpec]:
+    # [FUNCTION DOC] HELPER: Bind a ShapesSpec to the real args and kwargs of a callable using its
+    # signature (the forward method for a module). Flattens args and kwargs once with pytree and returns
+    # the aligned leaf spec list (None = static), the flat argument list and the tree spec. With no
+    # parameter spec returns all static. Otherwise walks named positional arguments, extra variadic
+    # positional arguments, then keyword arguments (named or variadic keyword), looking up each spec by
+    # parameter name or position. Raises ValueError if a spec entry matches no passed argument, and
+    # AssertionError if the walked leaf count differs from the whole-tree flatten.
+    # KNOWN ISSUE: the unmatched-entry error text says export() though make_fx also uses this function.
     """Bind a user-provided ``ShapesSpec`` to the actual ``(args, kwargs)``
     by inspecting ``f``'s signature, producing:
       - an aligned leaf-spec list ordered to match
