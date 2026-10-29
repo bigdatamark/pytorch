@@ -1,3 +1,12 @@
+# [MODULE DOC] Inductor pattern matcher: search/replace over FX graphs. Defines a DAG of
+# PatternExpr node types (CallFunction, CallMethod, KeywordArg, Arg, ListOf, etc.), Match and
+# FailedMatch results, PatternMatcherPass (applies registered patterns to a graph),
+# replacement helpers (register_replacement, gen_register_replacement, register_graph_pattern,
+# register_lowering_pattern), tracing helpers (fwd_only, joint_fwd_bwd) and a pretty printer
+# that serializes patterns to python source for precompiled patterns.
+# Import-time side effects: reads env var TORCHINDUCTOR_PATTERN_MATCH_BACKEND (default
+# "inductor") into the module global backend, creates a logger, and builds the MULTIPLE
+# singleton sentinel plus a few global registries/caches.
 """
 # Inductor Pattern Matcher
 
@@ -100,10 +109,18 @@ _debug_nodes_env_value_cache: str | None = None
 
 
 def _should_debug_node(node_name: str) -> bool:
+    # [FUNCTION DOC] HELPER: Returns True if debug logging is enabled for the node with this
+    # name, based on env var TORCHINDUCTOR_PATTERN_MATCH_DEBUG ("all" enables every node, otherwise
+    # a comma separated list of node names; unset/empty disables). The parsed value is cached in
+    # module globals and re-parsed only when the env var value changes.
     def _get_debug_nodes() -> bool | OrderedSet[str]:
+        # [FUNCTION DOC] HELPER: Returns the cached parsed debug setting (bool or set of node
+        # names), refreshing the module-level cache if the env var changed.
         global _debug_nodes_cache, _debug_nodes_env_value_cache
 
         def parse_debug_env(env_value: str | None) -> bool | OrderedSet[str]:
+            # [FUNCTION DOC] HELPER: Parses the env string: empty -> False, "all" -> True,
+            # otherwise an ordered set of comma separated names.
             if not env_value:
                 return False
             if env_value == "all":
@@ -126,16 +143,21 @@ def _should_debug_node(node_name: str) -> bool:
 
 
 class SearchFn(Protocol):
+    # [CLASS DOC] Typing protocol for a pattern-search callable: any callable with a __name__
+    # that takes arbitrary arguments and returns anything (traced into a pattern graph).
     __name__: str
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any: ...
 
 
 class ReplaceFn(Protocol):
+    # [CLASS DOC] Typing protocol for a replacement callable (traced into a replacement graph).
     def __call__(self, *args: Any, **kwargs: Any) -> Any: ...
 
 
 class TraceFn(Protocol):
+    # [CLASS DOC] Typing protocol for a tracer: takes a search/replace function plus example
+    # arguments and returns a traced torch.fx.GraphModule.
     def __call__(
         self, fn: SearchFn | ReplaceFn, *args: Any, **kwargs: Any
     ) -> torch.fx.GraphModule: ...
@@ -148,7 +170,11 @@ FnsType = torch.fx.node.Target | str
 
 
 class Multiple:
+    # [CLASS DOC] HELPER: Type of the MULTIPLE sentinel meaning "any number of matched values".
+    # Must be a singleton.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Raises AssertionError if a MULTIPLE global already exists and
+        # this instance is not it, enforcing the singleton property.
         # Ensure we're really a singleton.
         if "MULTIPLE" in globals() and self is not MULTIPLE:
             raise AssertionError("Multiple is not a singleton")
@@ -161,6 +187,10 @@ MULTIPLE = Multiple()
 def _transfer_meta(
     new_meta: dict[str, Any], old_node: torch.fx.Node, pass_name: str = ""
 ) -> None:
+    # [FUNCTION DOC] HELPER: Copies metadata from a replaced node into new_meta (mutated in
+    # place): the torch.fx.proxy copy-meta fields, stack_trace, and val / tensor_meta only if
+    # missing. At provenance tracking level 1 also appends a REPLACE NodeSource entry to
+    # from_node naming pass_name.
     from torch.fx.traceback import NodeSource, NodeSourceAction
 
     # Transfer metadata after pattern matching occurs.
@@ -192,6 +222,9 @@ def _transfer_meta(
 
 
 def _common_custom_context(nodes: Sequence[torch.fx.Node]) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Returns the shared custom context (stream, mempool, mempool_device)
+    # of the nodes' meta "custom" entries, or an empty mapping if there are no nodes or they
+    # disagree. Only includes keys that are set (stream when non-default or explicitly present).
     if not nodes:
         return {}
 
@@ -221,6 +254,8 @@ def _common_custom_context(nodes: Sequence[torch.fx.Node]) -> dict[str, Any]:
 def _merge_custom_context(
     new_meta: dict[str, Any], custom_context: dict[str, Any]
 ) -> None:
+    # [FUNCTION DOC] HELPER: Merges custom_context into new_meta["custom"] in place, without
+    # overriding keys already present. No-op for an empty context.
     # Replacement nodes inherit user stream/mempool context only at explicit
     # graph transform hooks. Other transforms must preserve meta["custom"] or
     # avoid moving context-tagged values across boundaries.
@@ -232,6 +267,11 @@ def _merge_custom_context(
 
 
 class Match:
+    # [CLASS DOC] Result of a successful pattern match. Attributes: pattern (matched PatternExpr),
+    # args / kwargs (captured inputs for the handler), nodes (matched graph nodes),
+    # targets (map from call patterns to the actual node target), ctx (MatchContext) and
+    # replacement_graph (set once a replacement is built). Methods merge matches, bundle args,
+    # erase matched nodes and replace the match with a graph or traced function.
     """
     Represents a successfully matched pattern.
 
@@ -258,6 +298,8 @@ class Match:
         args: Sequence[Any] | None = None,
         kwargs: dict[str, Any] | None = None,
     ) -> None:
+        # [FUNCTION DOC] Creates a Match for pattern within ctx with copies of the given
+        # args (list) and kwargs (mapping); nodes, targets are empty and replacement_graph None.
         super().__init__()
         self.pattern = pattern
         # The input nodes that must be passed in to the result
@@ -272,9 +314,13 @@ class Match:
 
     @property
     def graph(self) -> torch.fx.Graph:
+        # [FUNCTION DOC] Property: the FX graph being matched (from the match context).
         return self.ctx.graph
 
     def extend(self, other: Match) -> None:
+        # [FUNCTION DOC] Merges another Match into this one in place: appends args and nodes,
+        # updates kwargs and targets. Raises FailedMatch if a kwarg name present in both has
+        # differing values.
         if self.kwargs:
             for key in OrderedSet(self.kwargs.keys()) & OrderedSet(other.kwargs.keys()):
                 if self.kwargs[key] != other.kwargs[key]:
@@ -285,31 +331,42 @@ class Match:
         self.targets.update(other.targets)
 
     def bundle(self) -> Match:
+        # [FUNCTION DOC] Replaces the args list with a single tuple of all args (or an empty
+        # list if none), mutating and returning self.
         # Wrap args in an extra list
         self.args = [tuple(self.args)] if self.args else []
         return self
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: Short debug string showing args and kwargs.
         return f"Match(..., {self.args}, {self.kwargs})"
 
     def erase_nodes(self) -> None:
+        # [FUNCTION DOC] Erases matched nodes from the graph in reverse order, skipping nodes
+        # already erased or that still have users. Mutates the graph.
         graph = self.graph
         for n in reversed(self.nodes):
             if not n._erased and not n.users:
                 graph.erase_node(n)
 
     def output_nodes(self) -> list[torch.fx.Node | None]:
+        # [FUNCTION DOC] Returns the graph node matched by each output pattern of the context
+        # (None for output slots that are None).
         return [
             (self.ctx.pattern_to_node[p] if p is not None else None)
             for p in self.ctx.outputs
         ]
 
     def output_node(self) -> torch.fx.Node:
+        # [FUNCTION DOC] Returns the first non-None output node of the match; raises
+        # StopIteration if there is none.
         return next(p for p in self.output_nodes() if p)
 
     def replace_with_graph(
         self, replacement_graph: torch.fx.Graph, args: Sequence[Any]
     ) -> list[torch.fx.Node]:
+        # [FUNCTION DOC] Replaces the matched subgraph with replacement_graph called on args,
+        # delegating to ReplacementPatternEntry.replace_with_graph. Returns the new nodes.
         return ReplacementPatternEntry.replace_with_graph(
             self, self.ctx.graph, replacement_graph, args
         )
@@ -321,6 +378,13 @@ class Match:
         trace_fn: TraceFn | None = None,
         run_functional_passes: bool = True,
     ) -> list[torch.fx.Node]:
+        # [FUNCTION DOC] Traces replacement_fn (default tracer: fwd_only) using example values
+        # taken from the meta (val or example_value) of args, then replaces the matched subgraph
+        # with the traced graph. Runs under the virtualized fake mode if one is set. Special
+        # case: for a single auto_functionalized node with eager_input_vals, traces twice (with
+        # eager vals, then with inductor vals) and copies eager_input_vals onto the second graph
+        # (raises AssertionError if node counts differ). For single-node matches, copies
+        # metadata onto replacement nodes. Returns the new nodes; mutates the graph.
         """Replace with a graph generated by tracing the replacement_fn.
 
         Args:
@@ -338,6 +402,8 @@ class Match:
         )
 
         def should_propagate_eager_input_vals(nodes: list[torch.fx.Node]) -> bool:
+            # [FUNCTION DOC] HELPER: True only when exactly one node matched, it has
+            # eager_input_vals metadata, and its target is auto_functionalized(_v2).
             if len(nodes) != 1:
                 return False
             node = nodes[0]
@@ -372,6 +438,7 @@ class Match:
                 match_args, match_kwargs = tuple(self.args), self.kwargs
 
                 def record(node: torch.fx.Node, val: Any) -> None:
+                    # [FUNCTION DOC] HELPER: Records val for node in node_to_val if node is an FX Node.
                     if isinstance(node, torch.fx.Node):
                         node_to_val[node] = val
 
@@ -417,6 +484,7 @@ class Match:
                 if fake_mode is not None:
 
                     def _convert_to_fake_mode(it):
+                        # [FUNCTION DOC] HELPER: Re-fakes a fake tensor under the detected fake_mode; other values pass through.
                         if is_fake_tensor(it) and fake_mode is not None:
                             return fake_mode.from_tensor(it)
                         return it
@@ -442,6 +510,9 @@ class Match:
 
 
 class FailedMatch(RuntimeError):
+    # [CLASS DOC] Falsy exception/result representing a failed match. Stores a lazy format
+    # string plus args/kwargs, formatted only in __str__ to avoid compile-time cost. Can be
+    # raised or returned.
     """
     Represents a unsuccessful match.
 
@@ -452,6 +523,8 @@ class FailedMatch(RuntimeError):
     format_string: str
 
     def __init__(self, format_string: str, *args: Any, **kwargs: Any) -> None:
+        # [FUNCTION DOC] Stores the format string and its args. Raises RuntimeError if the
+        # format string is longer than 200 chars (to force lazy message construction).
         self.format_string = format_string
         # We want to construct error messages lazily instead of eagerly, as
         # constructing them eagerly can significantly worsen compile times.
@@ -463,9 +536,11 @@ class FailedMatch(RuntimeError):
         self.kwargs = kwargs
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Lazily formats the message from format_string, args and kwargs.
         return self.format_string.format(*self.args, **self.kwargs)
 
     def __bool__(self) -> bool:
+        # [FUNCTION DOC] Always False so a FailedMatch is falsy in truth tests.
         return False
 
 
@@ -473,6 +548,7 @@ MatchResult = Match | FailedMatch
 
 
 def is_match(m: MatchResult) -> TypeIs[Match]:
+    # [FUNCTION DOC] Returns the truthiness of m (True for Match, False for FailedMatch); exists as a type narrowing helper.
     """
     TypeIs cannot act on `self`. Thus this function exists to let mypy
     recognize FailedMatch.__bool__ as a TypeIs.
@@ -481,6 +557,9 @@ def is_match(m: MatchResult) -> TypeIs[Match]:
 
 
 class MatchContext:
+    # [CLASS DOC] Mutable state shared during one match attempt: outputs (output patterns),
+    # pattern_to_node (map from each visited pattern to its matched node or None on failure),
+    # graph, and exclusive_node_set (nodes that must only be used inside the match).
     """
     Internal state needed while running PatternExpr._match().
     """
@@ -497,12 +576,19 @@ class MatchContext:
         *,
         graph: torch.fx.Graph,
     ) -> None:
+        # [FUNCTION DOC] Stores outputs and graph, copies the optional pattern_to_node mapping
+        # (empty if None) and starts with an empty exclusive_node_set.
         self.outputs = outputs
         self.pattern_to_node = {} if pattern_to_node is None else dict(pattern_to_node)
         self.graph = graph
         self.exclusive_node_set = []
 
     def match(self, pattern: PatternExpr, node: NodeOrConstant) -> MatchResult:
+        # [FUNCTION DOC] Matches pattern against node, memoizing in pattern_to_node. If the
+        # pattern was already visited: returns an empty Match when it mapped to the same node,
+        # else FailedMatch ("repeated pattern differs"). Otherwise calls pattern._match, records
+        # the node (None on failure) and returns the result. Raises AssertionError if the
+        # pattern got recorded during its own match.
         """wrapper to check reused nodes in patterns"""
         if pattern in self.pattern_to_node:
             if self.pattern_to_node[pattern] == node:
@@ -516,6 +602,8 @@ class MatchContext:
         return m
 
     def filter_multi_user_patterns(self) -> dict[PatternExpr, torch.fx.Node]:
+        # [FUNCTION DOC] Returns the subset of pattern_to_node for successfully matched patterns
+        # that report has_multiple_users().
         return {
             pattern: node
             for pattern, node in self.pattern_to_node.items()
@@ -524,6 +612,9 @@ class MatchContext:
 
 
 class PatternExpr(ABC):
+    # [CLASS DOC] Abstract base of all pattern DAG nodes. Subclasses implement _match(node, ctx)
+    # returning Match or FailedMatch; the base supplies a public match entry point, multi-user
+    # tracking, anchor-node discovery and structural equality for debugging.
     """
     Base class for types of patterns.
     """
@@ -532,24 +623,31 @@ class PatternExpr(ABC):
     def _match(self, node: torch.fx.Node, ctx: MatchContext) -> MatchResult: ...
 
     def match(self, node: torch.fx.Node) -> MatchResult:
+        # [FUNCTION DOC] Matches this pattern against node using a fresh MatchContext on the
+        # node's graph. Returns a Match, or the FailedMatch if one was raised.
         try:
             return MatchContext([self], graph=node.graph).match(self, node)
         except FailedMatch as e:
             return e
 
     def has_multiple_users(self) -> bool:
+        # [FUNCTION DOC] Whether this pattern is reused by several consumers; False by default.
         return False
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: Class name followed by empty parentheses.
         return self.__class__.__name__ + "()"
 
     def find_anchor_nodes(
         self, ctx: MatchContext, searched: OrderedSet[torch.fx.Node]
     ) -> Generator[torch.fx.Node | None, None, None]:
+        # [FUNCTION DOC] Generator yielding candidate anchor nodes for starting a search: here
+        # just the node already bound to this pattern in ctx, if any. Subclasses extend this.
         if self in ctx.pattern_to_node:
             yield ctx.pattern_to_node[self]
 
     def pattern_eq(self, other: Any) -> bool:
+        # [FUNCTION DOC] Structural comparison (debugging only): True if other is an instance of this class.
         """
         Compare two `PatternExpr`s and return true if they are the
         same. Note this is NOT matching a pattern - it is comparing the pattern
@@ -559,37 +657,48 @@ class PatternExpr(ABC):
 
 
 class Arg(PatternExpr):
+    # [CLASS DOC] Wildcard pattern that matches any node or constant and captures it as an
+    # input argument of the handler (args are collected in depth-first order).
     """
     Capture an arg which will become an input to the handler.  Args are
     passed in depth first order.
     """
 
     def _match(self, node: NodeOrConstant, ctx: MatchContext) -> MatchResult:
+        # [FUNCTION DOC] Always succeeds, returning a Match whose args list holds the node.
         return Match(ctx, self, args=[node])  # matches anything
 
 
 class Ignored(PatternExpr):
+    # [CLASS DOC] Wildcard pattern that matches anything but does not capture it as an argument.
     """
     Match an arg, but don't pass it to handler
     """
 
     def _match(self, node: NodeOrConstant, ctx: MatchContext) -> MatchResult:
+        # [FUNCTION DOC] Always succeeds with an empty Match.
         return Match(ctx, self)  # matches anything
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: Returns an asterisk.
         return "*"
 
     def pretty_print(self, pp: PatternPrettyPrinter) -> str:
+        # [FUNCTION DOC] HELPER: Source text for this pattern in generated pattern files; pp unused.
         return "Ignored()"
 
 
 def _get_fake_tensor_constant(value: torch.Tensor) -> torch.Tensor | None:
+    # [FUNCTION DOC] HELPER: For a fake tensor returns its tracked real constant (or None if none); other tensors are returned unchanged.
     if is_fake_tensor(value):
         return maybe_get_fake_constant(value)
     return value
 
 
 def _tensor_values_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
+    # [FUNCTION DOC] HELPER: Value equality of two tensors that treats NaN as equal to NaN
+    # (recursing on real and imaginary parts for complex dtypes, using an elementwise check for
+    # floating point). Returns a bool.
     if torch.equal(a, b):
         return True
     if a.dtype.is_complex:
@@ -602,6 +711,11 @@ def _tensor_values_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
 
 
 def _constant_values_equal(a: Any, b: Any) -> bool:
+    # [FUNCTION DOC] HELPER: Equality test for pattern constants. Tensors are equal only if
+    # both are tensors with same dtype, shape, device, layout, requires_grad, (strided) stride
+    # and offset, and equal values (compared on the real constants behind fake tensors; NaN
+    # equal NaN); missing constants or comparison errors give False. Non-tensors use ordinary
+    # equality, returning False if comparison raises or does not produce a bool.
     if isinstance(a, torch.Tensor) or isinstance(b, torch.Tensor):
         if not isinstance(a, torch.Tensor) or not isinstance(b, torch.Tensor):
             return False
@@ -635,6 +749,9 @@ def _constant_values_equal(a: Any, b: Any) -> bool:
 
 
 def _python_constant_repr(value: Any) -> str:
+    # [FUNCTION DOC] HELPER: Returns source text that reconstructs a constant. Handles NaN and
+    # infinities of floats, complex numbers, lists and tuples (recursively, single-element
+    # tuple gets a trailing comma); everything else uses the builtin repr.
     if isinstance(value, float):
         if math.isnan(value):
             return "float('nan')"
@@ -651,6 +768,10 @@ def _python_constant_repr(value: Any) -> str:
 
 
 def _tensor_constant_repr(value: torch.Tensor) -> str:
+    # [FUNCTION DOC] HELPER: Returns source text creating the tensor from its values, dtype and
+    # (if not cpu) device. Raises NotImplementedError for non-strided layouts, fake tensors
+    # without a real constant, tensors requiring grad, and non-contiguous or offset tensors.
+    # Copies data to cpu to read values (with fake mode disabled).
     if value.layout != torch.strided:
         raise NotImplementedError(
             f"NYI: serializing get_attr tensor with layout {value.layout}"
@@ -683,17 +804,22 @@ def _tensor_constant_repr(value: torch.Tensor) -> str:
 
 
 class GetAttr(PatternExpr):
+    # [CLASS DOC] Pattern matching a get_attr node by the value of the referenced attribute
+    # (not its module-local name). Attributes: value (constant to compare) and users (expected
+    # user count, or MULTIPLE).
     """
     Match a get_attr node by comparing the attribute value instead of the target
     name, which is local to the traced GraphModule.
     """
 
     def __init__(self, value: Any, users: Multiple | int = 1) -> None:
+        # [FUNCTION DOC] Stores the constant value and expected user count.
         super().__init__()
         self.value = value
         self.users = users
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: Debug string with value and, if not 1, the users count.
         if self.users is MULTIPLE:
             comma_users = ", MULTIPLE"
         elif self.users != 1:
@@ -703,9 +829,14 @@ class GetAttr(PatternExpr):
         return f"{self.__class__.__name__}({self.value!r}{comma_users})"
 
     def has_multiple_users(self) -> bool:
+        # [FUNCTION DOC] True if users is MULTIPLE or greater than one.
         return isinstance(self.users, Multiple) or self.users > 1
 
     def _match(self, node: NodeOrConstant, ctx: MatchContext) -> MatchResult:
+        # [FUNCTION DOC] Succeeds if node is a get_attr node (user count matching unless this
+        # pattern is an output or users is MULTIPLE), its graph has an owning module, its target
+        # is a string and the attribute fetched from the module equals self.value. Otherwise
+        # returns a FailedMatch describing the reason. The match records the node.
         if not isinstance(node, torch.fx.Node) or node.op != "get_attr":
             return FailedMatch("get_attr_mismatch: node={}, pattern={}", node, self)
         if (
@@ -726,6 +857,7 @@ class GetAttr(PatternExpr):
         return m
 
     def pretty_print(self, pp: PatternPrettyPrinter) -> str:
+        # [FUNCTION DOC] HELPER: Source text for this pattern: class name with the printed value and non-default users.
         args = [pp.pretty_print(self.value)]
         if self.users is MULTIPLE:
             args.append("MULTIPLE")
@@ -734,6 +866,7 @@ class GetAttr(PatternExpr):
         return f"{self.__class__.__name__}({', '.join(args)})"
 
     def pattern_eq(self, other: Any) -> bool:
+        # [FUNCTION DOC] Structural equality: same class, equal constant values and equal users.
         other = typing.cast(Self, other)
         return (
             super().pattern_eq(other)
@@ -743,26 +876,34 @@ class GetAttr(PatternExpr):
 
 
 class KeywordArg(PatternExpr):
+    # [CLASS DOC] Wildcard pattern capturing the matched node into the handler's keyword
+    # arguments under the given name; the same name matched twice must bind equal values.
     """
     Capture a kwarg which will become an input to the handler.
     """
 
     def __init__(self, name: str) -> None:
+        # [FUNCTION DOC] Stores the keyword name.
         super().__init__()
         self.name = name
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: Debug string with the name.
         return f"KeywordArg({self.name!r})"
 
     def _match(self, node: NodeOrConstant, ctx: MatchContext) -> MatchResult:
+        # [FUNCTION DOC] Always succeeds, binding the node to the keyword name.
         return Match(ctx, self, kwargs={self.name: node})  # matches anything
 
     def pattern_eq(self, other: Any) -> bool:
+        # [FUNCTION DOC] Structural equality: same class and same name.
         other = typing.cast(Self, other)  # super makes sure this is true
         return super().pattern_eq(other) and self.name == other.name
 
 
 class ExclusiveKeywordArg(PatternExpr):
+    # [CLASS DOC] Like KeywordArg but a given node may be bound by only one such pattern in a
+    # match (tracked in the context's exclusive_node_set).
     """
     Capture a kwarg which will become an input to the handler.
     """
@@ -770,13 +911,17 @@ class ExclusiveKeywordArg(PatternExpr):
     name: str
 
     def __init__(self, name: str) -> None:
+        # [FUNCTION DOC] Stores the keyword name.
         super().__init__()
         self.name = name
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: Debug string with the name.
         return f"ExclusiveKeywordArg({self.name!r})"
 
     def _match(self, node: NodeOrConstant, ctx: MatchContext) -> MatchResult:
+        # [FUNCTION DOC] Fails if the node is already in the context's exclusive set; otherwise
+        # adds it to that set (side effect on ctx) and binds it to the keyword name.
         if node in ctx.exclusive_node_set:
             return FailedMatch("exclusive arg appears twice")
 
@@ -784,11 +929,15 @@ class ExclusiveKeywordArg(PatternExpr):
         return Match(ctx, self, kwargs={self.name: node})  # matches anything
 
     def pattern_eq(self, other: Any) -> bool:
+        # [FUNCTION DOC] Structural equality: same class and same name.
         other = typing.cast(Self, other)  # super makes sure this is true
         return super().pattern_eq(other) and self.name == other.name
 
 
 class _TargetExpr(PatternExpr):
+    # [CLASS DOC] HELPER: Base for patterns that filter nodes by target. Attributes: fns (list
+    # of allowed targets, with overloads of any OpOverloadPacket appended), fns_set (same as an
+    # ordered set) and users (expected user count or MULTIPLE). Subclasses define the op kind.
     """
     Base class for filtering match by node.target
     """
@@ -799,6 +948,8 @@ class _TargetExpr(PatternExpr):
     def __init__(
         self, fns: FnsType | Sequence[FnsType], users: Multiple | int = 1
     ) -> None:
+        # [FUNCTION DOC] Normalizes fns to a list (a single callable or string is wrapped),
+        # expands operator packets into their overloads, and stores fns, fns_set and users.
         super().__init__()
         fns = [fns] if callable(fns) or isinstance(fns, str) else list(fns)
         for fn in fns:
@@ -814,6 +965,9 @@ class _TargetExpr(PatternExpr):
     def op(self) -> str: ...
 
     def fns_repr(self) -> str:
+        # [FUNCTION DOC] HELPER: Short text naming the targets: for multiple fns the first
+        # followed by an ellipsis; a torch or operator module function gets a module prefix;
+        # an OpOverload uses its string form; otherwise the bare name.
         first_repr = self.fns[0]
         if not isinstance(first_repr, str):
             first_repr = first_repr.__name__
@@ -830,6 +984,9 @@ class _TargetExpr(PatternExpr):
             return first_repr
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: Debug string with targets and non-default users.
+        # KNOWN ISSUE: when users is a number other than 1 the users text has a stray closing
+        # parenthesis, so the output has unbalanced parentheses.
         if self.users is MULTIPLE:
             comma_users = ", MULTIPLE"
         elif self.users != 1:
@@ -839,14 +996,18 @@ class _TargetExpr(PatternExpr):
         return f"{self.__class__.__name__}({self.fns_repr()}{comma_users})"
 
     def has_multiple_users(self) -> bool:
+        # [FUNCTION DOC] True if users is MULTIPLE or greater than one.
         return isinstance(self.users, Multiple) or self.users > 1
 
     def find_anchor_nodes(
         self, ctx: MatchContext, searched: OrderedSet[torch.fx.Node]
     ) -> Generator[torch.fx.Node | None, None, None]:
+        # [FUNCTION DOC] Not implemented in this base class; always raises NotImplementedError.
         raise NotImplementedError
 
     def _match_fns(self, node: torch.fx.Node) -> bool:
+        # [FUNCTION DOC] HELPER: True if node is an FX node whose op equals this pattern's op
+        # and whose extracted target is in fns_set.
         return (
             isinstance(node, torch.fx.Node)
             and node.op == self.op
@@ -854,6 +1015,8 @@ class _TargetExpr(PatternExpr):
         )
 
     def _match_users(self, node: torch.fx.Node, ctx: MatchContext) -> bool:
+        # [FUNCTION DOC] HELPER: True if this pattern is an output of the context, users is
+        # MULTIPLE, or the node's number of users equals the expected count.
         return (
             self in ctx.outputs
             or self.users is MULTIPLE
@@ -861,6 +1024,7 @@ class _TargetExpr(PatternExpr):
         )
 
     def pattern_eq(self, other: Any) -> bool:
+        # [FUNCTION DOC] Structural equality: same class, op, fns list and users.
         other = typing.cast(Self, other)  # super makes sure this is true
         return (
             super().pattern_eq(other)
@@ -874,6 +1038,10 @@ _SimpleSpec = tuple[Any, ...]
 
 
 class _TargetArgsExpr(_TargetExpr):
+    # [CLASS DOC] Base for patterns matching a node by target plus args and kwargs. Each
+    # argument may be a nested PatternExpr or a constant. Args are flattened (simple or via
+    # pytree when containers are present) into flat_args_kwargs (values, structure spec) for
+    # comparison with node arguments. Subclasses CallFunction/CallMethod/CallModule set op.
     """
     Base class for filtering match by node.{target,args,kwargs}
     """
@@ -885,6 +1053,9 @@ class _TargetArgsExpr(_TargetExpr):
         _users: int | Multiple = 1,
         **kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC] Stores targets, user count, args (tuple) and kwargs (mapping); chooses
+        # the pytree flatten when any argument is a dict, list or tuple, else the simple flatten;
+        # precomputes flat_args_kwargs.
         super().__init__(fns, _users)
         self.args = tuple(args)
         self.kwargs = dict(kwargs)
@@ -901,6 +1072,8 @@ class _TargetArgsExpr(_TargetExpr):
     def simple_flatten(
         args: Sequence[Any], kwargs: Mapping[Any, Any]
     ) -> tuple[Sequence[Any], _SimpleSpec | pytree.TreeSpec]:
+        # [FUNCTION DOC] HELPER: Flattens to the positional values followed by keyword values;
+        # the spec is the number of positional args plus the keyword names.
         values = (*args, *kwargs.values())
         spec = (len(args), *kwargs.keys())
         return values, spec
@@ -909,6 +1082,9 @@ class _TargetArgsExpr(_TargetExpr):
     def pytree_flatten(
         args: Sequence[Any], kwargs: Mapping[Any, Any]
     ) -> tuple[Sequence[Any], _SimpleSpec | pytree.TreeSpec]:
+        # [FUNCTION DOC] HELPER: Flattens (args, kwargs) with pytree after normalizing container
+        # types (immutable lists and lists become tuples, immutable dicts become dicts) so FX
+        # and pattern containers compare equal. Returns the flat leaves and the tree spec.
         type_mapping: dict[type, type] = {
             immutable_list: tuple,
             list: tuple,
@@ -916,6 +1092,7 @@ class _TargetArgsExpr(_TargetExpr):
         }
 
         def convert_type(x: Any) -> Any:
+            # [FUNCTION DOC] HELPER: Converts x via type_mapping (recursively over contents) if its exact type is mapped; else returns x.
             cls = type(x)
             convert_fn = type_mapping.get(cls)
             if convert_fn is not None:
@@ -935,6 +1112,7 @@ class _TargetArgsExpr(_TargetExpr):
         return flat, spec
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: Debug string: class name with targets, args, kwargs and non-default users.
         args = [
             self.fns_repr(),
             *map(repr, self.args),
@@ -947,6 +1125,8 @@ class _TargetArgsExpr(_TargetExpr):
         return f"{self.__class__.__name__}({', '.join(args)})"
 
     def pretty_print(self, pp: PatternPrettyPrinter) -> str:
+        # [FUNCTION DOC] HELPER: Source text of this pattern for generated files, printing
+        # nested args and kwargs through pp and adding _users when not the default.
         args = [
             self.fns_repr(),
             *(pp.pretty_print(x) for x in self.args),
@@ -961,6 +1141,13 @@ class _TargetArgsExpr(_TargetExpr):
         return f"{self.__class__.__name__}({joiner_str.join(args)})"
 
     def _match(self, node: torch.fx.Node, ctx: MatchContext) -> MatchResult:
+        # [FUNCTION DOC] Matches node against target, user count, and arguments. Requires same
+        # number of positional args; if the node has fewer kwargs than the pattern, normalizes
+        # the call via the target's signature to fill defaults (raises AssertionError if the
+        # target is not callable); keeps only kwargs named by the pattern. Flattens node args and
+        # compares structure; child PatternExprs are matched through ctx and merged, constants
+        # must equal and not be nodes. On success records the node and target. Returns the
+        # first FailedMatch encountered otherwise.
         if not self._match_fns(node) or len(node.args) != len(self.args):
             return FailedMatch("function_mismatch: node={}, pattern={}", node, self)
 
@@ -1021,6 +1208,9 @@ class _TargetArgsExpr(_TargetExpr):
     def find_anchor_nodes(
         self, ctx: MatchContext, searched: OrderedSet[torch.fx.Node]
     ) -> Generator[torch.fx.Node | None, None, None]:
+        # [FUNCTION DOC] Generator for multi-output matching: yields the node already bound to
+        # this pattern if any; otherwise walks child patterns' anchors and yields unsearched
+        # users of those anchor nodes whose op/target match, marking them as searched.
         """
         This is used when we are matching a pattern with multiple outputs.
         There is a partial match (stored in ctx) and we want to walk
@@ -1044,6 +1234,8 @@ class _TargetArgsExpr(_TargetExpr):
                                 searched.add(node)
 
     def pattern_eq(self, other: Any) -> bool:
+        # [FUNCTION DOC] Structural equality: base checks, same flatten spec, and pairwise equal
+        # flattened values (using pattern_eq for sub-patterns).
         other = typing.cast(Self, other)  # super makes sure this is true
         return (
             super().pattern_eq(other)
@@ -1056,6 +1248,7 @@ class _TargetArgsExpr(_TargetExpr):
 
 
 class CallFunction(_TargetArgsExpr):
+    # [CLASS DOC] Pattern for call_function nodes (op is call_function).
     """
     Matches a call_function node in the FX graphs: `fns[i](*args, **kwargs)`
     """
@@ -1064,6 +1257,7 @@ class CallFunction(_TargetArgsExpr):
 
 
 class CallMethod(_TargetArgsExpr):
+    # [CLASS DOC] Pattern for call_method nodes (op is call_method).
     """
     Matches a call_method node in the FX graphs: `fns[i].method(*args, **kwargs)`
     """
@@ -1072,6 +1266,7 @@ class CallMethod(_TargetArgsExpr):
 
 
 class CallModule(_TargetArgsExpr):
+    # [CLASS DOC] Pattern for call_module nodes (op is call_module).
     """
     Matches a call_module node in the FX graphs: `module(*args, **kwargs)`
     """
@@ -1080,11 +1275,15 @@ class CallModule(_TargetArgsExpr):
 
 
 class _TargetExprVarArgs(_TargetExpr):
+    # [CLASS DOC] HELPER: Base for patterns matching by target and user count only, capturing
+    # all of the node's args and kwargs as handler inputs. Subclasses set the op.
     """
     Matches a call_function node with any arguments which are passed into the pattern
     """
 
     def _match(self, node: torch.fx.Node, ctx: MatchContext) -> MatchResult:
+        # [FUNCTION DOC] Fails on target or user-count mismatch; otherwise returns a Match
+        # holding the node, its target, and all its args and kwargs.
         if not self._match_fns(node):
             return FailedMatch("function_mismatch")
 
@@ -1100,23 +1299,30 @@ class _TargetExprVarArgs(_TargetExpr):
 
 
 class CallFunctionVarArgs(_TargetExprVarArgs):
+    # [CLASS DOC] Variable-argument pattern for call_function nodes.
     op = "call_function"
 
 
 class CallMethodVarArgs(_TargetExprVarArgs):
+    # [CLASS DOC] Variable-argument pattern for call_method nodes.
     op = "call_method"
 
 
 class CallModuleVarArgs(_TargetExprVarArgs):
+    # [CLASS DOC] Variable-argument pattern for call_module nodes.
     op = "call_module"
 
 
 class ListOf(PatternExpr):
+    # [CLASS DOC] Pattern matching a list/tuple of nodes where every element matches the inner
+    # pattern (or, if partial, at least one does). Attributes: pattern and partial.
     """
     Matches a repeated pattern
     """
 
     def __init__(self, pattern: PatternExpr, partial: bool = False) -> None:
+        # [FUNCTION DOC] Stores the element pattern and the partial flag. Raises AssertionError
+        # if pattern is not a PatternExpr.
         super().__init__()
         if not isinstance(pattern, PatternExpr):
             raise AssertionError(f"expected PatternExpr, got {type(pattern)}")
@@ -1124,9 +1330,15 @@ class ListOf(PatternExpr):
         self.partial = partial
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: Debug string with the inner pattern.
         return f"{self.__class__.__name__}({self.pattern})"
 
     def _match(self, node: list[torch.fx.Node], ctx: MatchContext) -> MatchResult:  # type: ignore[override]
+        # [FUNCTION DOC] Expects a non-empty list or tuple of nodes, else FailedMatch. Matches
+        # the inner pattern against each element in a child context that carries over only
+        # multi-user pattern bindings (so shared nodes are not revisited). Non-matching elements
+        # fail the whole match unless partial (then skipped); at least one element must match.
+        # Each element's match args are bundled into a tuple; the final result is bundled too.
         if not isinstance(node, (list, tuple)) or len(node) == 0:
             return FailedMatch("non_list")
         m = Match(ctx, self)
@@ -1151,6 +1363,7 @@ class ListOf(PatternExpr):
         return m.bundle()
 
     def pattern_eq(self, other: Any) -> bool:
+        # [FUNCTION DOC] Structural equality: same class, equal inner pattern, same partial flag.
         other = typing.cast(Self, other)  # super makes sure this is true
         return (
             super().pattern_eq(other)
@@ -1160,9 +1373,14 @@ class ListOf(PatternExpr):
 
 
 class MultiOutputPattern(PatternExpr):
+    # [CLASS DOC] Pattern with several output expressions (entries may be None placeholders).
+    # The first output is the anchor and must be a _TargetExpr; the others are matched by
+    # searching from nodes already matched. Attributes: outputs and op (copied from the first).
     outputs: list[PatternExpr | None]
 
     def __init__(self, outputs: Sequence[PatternExpr | None]) -> None:
+        # [FUNCTION DOC] Stores outputs and the first output's op. Raises AssertionError if the
+        # first output is not a _TargetExpr or any entry is neither None nor a PatternExpr.
         super().__init__()
         if not isinstance(outputs[0], _TargetExpr):
             raise AssertionError(f"expected _TargetExpr, got {type(outputs[0])}")
@@ -1173,14 +1391,17 @@ class MultiOutputPattern(PatternExpr):
 
     @property
     def fns(self) -> Callable[..., Any] | str | Sequence[Any]:
+        # [FUNCTION DOC] Property: the target functions of the first (anchor) output.
         # This cast is checked above in __init__()
         output = typing.cast(_TargetExpr, self.outputs[0])
         return output.fns
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: Debug string listing outputs.
         return f"{self.__class__.__name__}({self.outputs})"
 
     def pretty_print(self, pp: PatternPrettyPrinter) -> str:
+        # [FUNCTION DOC] HELPER: Source text: the outputs printed through pp, one per line, in a list.
         args = [pp.pretty_print(x) for x in self.outputs]
         joiner_str = f",\n{'  '}"
         str_out = f"{self.__class__.__name__}([{joiner_str.join(args)}"
@@ -1188,6 +1409,8 @@ class MultiOutputPattern(PatternExpr):
         return str_out
 
     def _match(self, node: torch.fx.Node, ctx: MatchContext) -> MatchResult:
+        # [FUNCTION DOC] Matches the first output against node, then each remaining non-None
+        # output via _match_from_anchors, merging all matches. Returns the first failure.
         output = typing.cast(_TargetExpr, self.outputs[0])
         m = ctx.match(output, node)
         if not is_match(m):
@@ -1206,6 +1429,10 @@ class MultiOutputPattern(PatternExpr):
     def _match_from_anchors(
         self, pattern: PatternExpr, ctx: MatchContext
     ) -> MatchResult:
+        # [FUNCTION DOC] HELPER: Tries to match a secondary output pattern by iterating candidate
+        # anchor nodes (users of already matched nodes). Returns the first successful Match; after
+        # each failed attempt restores the context's pattern_to_node to its prior state. If no
+        # candidate matches returns the last FailedMatch ("no anchor found" if none tried).
         prior = dict(ctx.pattern_to_node)
         m: MatchResult = FailedMatch("no anchor found")
         for node in pattern.find_anchor_nodes(ctx, OrderedSet()):
@@ -1217,12 +1444,16 @@ class MultiOutputPattern(PatternExpr):
         return m
 
     def match(self, node: torch.fx.Node) -> MatchResult:
+        # [FUNCTION DOC] Matches starting at node using a context that knows this pattern's
+        # full outputs list (so the output nodes can be recovered). Returns the Match or the
+        # raised FailedMatch.
         try:
             return MatchContext(self.outputs, graph=node.graph).match(self, node)
         except FailedMatch as e:
             return e
 
     def pattern_eq(self, other: Any) -> bool:
+        # [FUNCTION DOC] Structural equality: same class, same number of outputs and pairwise equal outputs.
         other = typing.cast(Self, other)  # super makes sure this is true
         return (
             super().pattern_eq(other)
@@ -1235,20 +1466,29 @@ class MultiOutputPattern(PatternExpr):
 
 
 class RepeatedExpr(PatternExpr):
+    # [CLASS DOC] Pattern requiring the inner target pattern to match the given node and also
+    # every sibling anchor node found from it (e.g. all getitem users of a split/unbind), each
+    # matched independently. Attributes: inner_pattern and op (copied from it).
     """
     Checks for a repeated pattern. Useful for repeated operations after a node such as `split` or `unbind`
     """
 
     def __init__(self, inner_pattern: _TargetExpr) -> None:
+        # [FUNCTION DOC] Stores the inner pattern and its op.
         super().__init__()
         self.inner_pattern = inner_pattern
         self.op = inner_pattern.op
 
     @property
     def fns(self) -> Sequence[FnsType]:
+        # [FUNCTION DOC] Property: the target functions of the inner pattern.
         return self.inner_pattern.fns
 
     def _match(self, node: torch.fx.Node, ctx: MatchContext) -> MatchResult:
+        # [FUNCTION DOC] Matches the inner pattern on node, drops its binding from the context,
+        # then for each anchor node discovered from the inner pattern (excluding node itself)
+        # matches the inner pattern in a fresh context and merges the result. Returns the first
+        # failure, else the combined Match.
         m = ctx.match(self.inner_pattern, node)
         if not is_match(m):
             return m
@@ -1268,6 +1508,7 @@ class RepeatedExpr(PatternExpr):
         return m
 
     def pattern_eq(self, other: Any) -> bool:
+        # [FUNCTION DOC] Structural equality: same class and equal inner patterns.
         other = typing.cast(Self, other)  # super makes sure this is true
         return super().pattern_eq(other) and self.inner_pattern.pattern_eq(
             other.inner_pattern
@@ -1275,6 +1516,10 @@ class RepeatedExpr(PatternExpr):
 
 
 class PatternPrettyPrinter:
+    # [CLASS DOC] Serializes pattern DAGs to executable python source. Each distinct call
+    # pattern is memoized as a named assignment (unique names from an FX namespace) so shared
+    # sub-patterns are written once. State: namespace, memoized_objs_names, memoized_objs_pp.
+    # Mainly used and tested for fused-attention patterns.
     """
     Serializes Patterns to executable python.
     XXX: currently only used and tested for fuse attention patterns. May not cover
@@ -1282,6 +1527,7 @@ class PatternPrettyPrinter:
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Creates an empty name allocator and empty memo tables.
         self.namespace = torch.fx.graph._Namespace()
         self.memoized_objs_names: dict[PatternExpr, str] = {}
         self.memoized_objs_pp: dict[PatternExpr, str] = {}
@@ -1289,6 +1535,10 @@ class PatternPrettyPrinter:
     @staticmethod
     @functools.cache
     def run(obj: PatternExpr, output_name: str = "output") -> str:
+        # [FUNCTION DOC] Static, cached by arguments. Serializes obj with a fresh printer into
+        # python source lines: one assignment per memoized sub-pattern in discovery order, then
+        # an assignment of the full expression to output_name. Raises AssertionError if obj has
+        # no pretty_print method.
         """
         Serializes obj to python code with obj written out to `output_name`
         """
@@ -1308,6 +1558,9 @@ class PatternPrettyPrinter:
         return "\n".join(output)
 
     def pretty_print(self, obj: Any) -> str:
+        # [FUNCTION DOC] Returns source text for obj: call patterns become (memoized) variable
+        # names, tensors become tensor-construction text (may raise NotImplementedError), objects
+        # with their own pretty_print delegate to it, and anything else uses repr.
         if isinstance(obj, _TargetArgsExpr):
             if memoized_name := self.memoized_objs_names.get(obj):
                 return memoized_name
@@ -1321,6 +1574,9 @@ class PatternPrettyPrinter:
         return repr(obj)
 
     def memoize(self, obj: _TargetArgsExpr) -> str:
+        # [FUNCTION DOC] Serializes obj, allocates a unique variable name derived from its
+        # target (namespace prefixes stripped), records name and source text in the memo tables
+        # (side effect) and returns the name.
         obj_str = obj.pretty_print(self)
         obj_name = obj.fns_repr()
         for prefix in ("aten.", "torch.", "prims."):
@@ -1333,6 +1589,7 @@ class PatternPrettyPrinter:
 
 
 class _PassDictsType(Protocol):
+    # [CLASS DOC] HELPER: Typing protocol for pass registries: indexed by (op, target) pair, yields a list of PatternEntry.
     def __getitem__(
         self, k: tuple[str, torch.fx.node.Target]
     ) -> list[PatternEntry]: ...
@@ -1340,10 +1597,13 @@ class _PassDictsType(Protocol):
 
 @dataclasses.dataclass
 class PatternEntry:
+    # [CLASS DOC] Base dataclass of a registered rewrite: a pattern plus an extra_check
+    # predicate run on a Match before applying. Subclasses implement apply to rewrite the graph.
     pattern: PatternExpr
     extra_check: Callable[[Match], bool]
 
     def apply(self, match: Match, graph: torch.fx.Graph, node: torch.fx.Node) -> None:
+        # [FUNCTION DOC] Abstract: rewrites the graph for a match; the base raises NotImplementedError.
         raise NotImplementedError
 
     def register(
@@ -1352,6 +1612,10 @@ class PatternEntry:
         target: torch.fx.node.Target | None = None,
         prepend: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Adds this entry to the pass registry (or each registry in a sequence)
+        # under the key (pattern op, target), at the front if prepend else the end. With no
+        # target, registers once per target function of the pattern. Raises AssertionError if
+        # the pattern lacks fns or op. Mutates the registries.
         if target is None:
             if not hasattr(self.pattern, "fns"):
                 raise AssertionError("pattern has no fns attribute")
@@ -1372,9 +1636,15 @@ class PatternEntry:
 
 @dataclasses.dataclass
 class LoweringPatternEntry(PatternEntry):
+    # [CLASS DOC] Entry whose handler is inserted as a call_function node (to be lowered later)
+    # that replaces the matched output node, with the match args and kwargs as inputs.
     handler: Callable[..., Any]
 
     def apply(self, match: Match, graph: torch.fx.Graph, node: torch.fx.Node) -> None:
+        # [FUNCTION DOC] Inserts before node a call to the handler (bound to the match) with
+        # the match args and kwargs, copies metadata from node, redirects all uses of node to
+        # it, then erases the matched nodes. Raises AssertionError if node is not the last
+        # matched node.
         handler = functools.wraps(self.handler)(functools.partial(self.handler, match))
         with graph.inserting_before(node):
             replacement = graph.call_function(handler, tuple(match.args), match.kwargs)
@@ -1387,6 +1657,7 @@ class LoweringPatternEntry(PatternEntry):
 
 @dataclasses.dataclass
 class GraphPatternEntry(PatternEntry):
+    # [CLASS DOC] Entry whose handler is a function that edits the FX graph directly.
     """
     A pattern that runs a function on the FX graph
     """
@@ -1394,12 +1665,17 @@ class GraphPatternEntry(PatternEntry):
     handler: Callable[..., Any]
 
     def apply(self, match: Match, graph: torch.fx.Graph, node: torch.fx.Node) -> None:
+        # [FUNCTION DOC] Calls handler(match, *args, **kwargs) with the graph insertion point set before node.
         with graph.inserting_before(node):
             self.handler(match, *match.args, **match.kwargs)
 
 
 @dataclasses.dataclass
 class ReplacementPatternEntry(PatternEntry):
+    # [CLASS DOC] Entry that replaces the matched subgraph with a pre-traced replacement graph
+    # (stored on the Match). Fields: normalize_args (maps match args/kwargs to the replacement's
+    # input list) and pattern_name (optional id for telemetry). Provides the shared static
+    # splice routine replace_with_graph.
     """
     The replacement pattern for the graph
     """
@@ -1415,6 +1691,15 @@ class ReplacementPatternEntry(PatternEntry):
         args: Sequence[torch.fx.Node],
         pass_name: str | None = None,
     ) -> list[torch.fx.Node]:
+        # [FUNCTION DOC] Static. Copies replacement_graph (a GraphModule; AssertionError
+        # otherwise) into graph just before the earliest matched output node, with args as its
+        # inputs: call_function nodes are re-created with metadata transferred, stream/mempool
+        # context merged and eager_input_vals kept; get_attr nodes must refer to graph modules
+        # (else NotImplementedError) and are registered on the owning module; other ops raise
+        # NotImplementedError. Then rewires uses of each matched output to the new nodes (a
+        # packed multi-result is unpacked through its getitem users), propagates recompute,
+        # ac_graph_id and custom tags backward from the replaced node, erases matched nodes and
+        # dead pure replacement nodes. Returns the added nodes that survive.
         """
         Inserts the replacement graph into the toplevel graph at the match
         """
@@ -1423,11 +1708,21 @@ class ReplacementPatternEntry(PatternEntry):
         custom_context = _common_custom_context(match.nodes)
 
         class Replacer(torch.fx.Interpreter):
+            # [CLASS DOC] HELPER: FX Interpreter that, instead of executing, re-emits each
+            # call_function node of the replacement graph into the target graph and registers
+            # sub-graph get_attr nodes; call_method/call_module/get_attr handlers are disabled.
             call_method = None  # type: ignore[assignment]
             call_module = None  # type: ignore[assignment]
             get_attr = None  # type: ignore[assignment]
 
             def run_node(self, node: torch.fx.Node) -> Any:
+                # [FUNCTION DOC] HELPER: Placeholders and outputs use default behavior. For a
+                # call_function node creates the equivalent node in the outer graph with the
+                # already-mapped args, records it, transfers metadata and returns it (AssertionError
+                # if target not callable). For get_attr nodes fetches the sub graph module,
+                # reuses its name in the owning module or registers it under a unique name, and
+                # adds a get_attr node (NotImplementedError if it is not a GraphModule).
+                # Other ops raise NotImplementedError.
                 if node.op in ("placeholder", "output"):
                     return super().run_node(node)
                 target = node.target
@@ -1509,6 +1804,8 @@ class ReplacementPatternEntry(PatternEntry):
             tag_value: str,
             input_stops: OrderedSet[torch.fx.Node],
         ) -> None:
+            # [FUNCTION DOC] HELPER: Walks backward through input nodes starting at node
+            # (stopping at input_stops) and sets meta[tag_name] to tag_value on each visited node.
             queue = [node]
             visited = OrderedSet[torch.fx.Node]()
 
@@ -1533,6 +1830,8 @@ class ReplacementPatternEntry(PatternEntry):
                 replacement = [replacement]
 
             def maybe_getitem(node: torch.fx.Node) -> Any:
+                # [FUNCTION DOC] HELPER: If node is an operator getitem call returns its index
+                # argument (AssertionError if it does not have 2 args); otherwise None.
                 if node.op != "call_function":
                     return None
                 if node.target != operator.getitem:
@@ -1545,7 +1844,14 @@ class ReplacementPatternEntry(PatternEntry):
                 old: torch.fx.Node | None,
                 new: torch.fx.Node | Sequence[torch.fx.Node] | None,
             ) -> None:
+                # [FUNCTION DOC] HELPER: Redirects uses of old to new. old None requires new
+                # None. new None replaces uses with None. A single node gets metadata and
+                # propagated tags and takes over all uses outside the replacement nodes. A list of
+                # nodes replaces getitem users of old by indexing into the list (recursively), and
+                # direct uses by the list. Erases old when it has no users left (always in the list
+                # case). Raises AssertionError on a bad old/new combination.
                 def filter_nodes_in_newly_added_nodes(node: torch.fx.Node) -> bool:
+                    # [FUNCTION DOC] HELPER: Callback that is True for nodes not created by the replacement.
                     # Do not replace the use of a node if it is being used by
                     # nodes in the replaced graph
                     return node not in added_replacement_nodes
@@ -1652,6 +1958,9 @@ class ReplacementPatternEntry(PatternEntry):
         return [node for node in added_replacement_nodes if not node._erased]
 
     def apply(self, match: Match, graph: torch.fx.Graph, node: torch.fx.Node) -> None:
+        # [FUNCTION DOC] Splices match.replacement_graph (AssertionError if unset) into graph,
+        # using normalize_args on the match args/kwargs as inputs and the pattern name for
+        # provenance. Mutates the graph; node is unused.
         if match.replacement_graph is None:
             raise AssertionError("match.replacement_graph is None")
         self.replace_with_graph(
@@ -1664,10 +1973,12 @@ class ReplacementPatternEntry(PatternEntry):
 
 
 def _return_true(match: Match) -> bool:
+    # [FUNCTION DOC] HELPER: Default extra_check that accepts every match.
     return True
 
 
 def log_trace_failure(search_fn: Callable[..., Any], e: RuntimeError) -> None:
+    # [FUNCTION DOC] Logs at info level that the replacement pattern named by search_fn failed to apply (shape mismatch while tracing) with the error.
     log.info(
         "Replacement pattern %s failed to apply due to shape mismatch: %s",
         search_fn.__name__,
@@ -1677,6 +1988,9 @@ def log_trace_failure(search_fn: Callable[..., Any], e: RuntimeError) -> None:
 
 @dataclasses.dataclass(frozen=True)
 class _TraceArgInfo:
+    # [CLASS DOC] HELPER: Frozen record describing how pattern function arguments were flattened for tracing:
+    # argnames (original names), flat_argnames (all unique leaf names), arg_specs (pytree spec
+    # per argument) and arg_flat_names (leaf names per argument).
     argnames: list[str]
     flat_argnames: list[str]
     arg_specs: dict[str, Any]
@@ -1684,6 +1998,8 @@ class _TraceArgInfo:
 
 
 def _unique_argname(name: str, used_names: OrderedSet[str]) -> str:
+    # [FUNCTION DOC] HELPER: Returns name if unused, else name with the smallest numeric suffix
+    # that is unused; adds the result to used_names (mutation).
     if name not in used_names:
         used_names.add(name)
         return name
@@ -1701,6 +2017,8 @@ def _trace_args_for_initial_trace(
     example_inputs: Sequence[Any],
     scalar_workaround: dict[str, float | int],
 ) -> list[Any]:
+    # [FUNCTION DOC] HELPER: Builds the argument list for the initial trace in argnames order:
+    # names in scalar_workaround take that scalar, others consume example_inputs in order.
     trace_args = []
     input_idx = 0
     for argname in argnames:
@@ -1713,6 +2031,9 @@ def _trace_args_for_initial_trace(
 
 
 def _trace_arg_info(argnames: Sequence[str], args: Sequence[Any]) -> _TraceArgInfo:
+    # [FUNCTION DOC] HELPER: Flattens each argument with pytree and assigns unique leaf names
+    # (the argument name for a single leaf, name plus index for several, none for zero leaves).
+    # Returns a _TraceArgInfo with names, specs and per-argument leaf names.
     flat_argnames: list[str] = []
     arg_specs: dict[str, Any] = {}
     arg_flat_names: dict[str, list[str]] = {}
@@ -1746,6 +2067,10 @@ def _unflatten_match_kwargs(
     arg_info: _TraceArgInfo,
     defaults: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Rebuilds structured arguments from flat match kwargs: for each
+    # original argument gathers its leaf kwargs and unflattens them with the saved spec. If no
+    # leaves were found and a default exists, uses the default; if only some leaves are
+    # missing raises RuntimeError. Remaining unconsumed kwargs are passed through. Returns a new mapping.
     kwargs = dict(kwargs)
     result: dict[str, Any] = {}
 
@@ -1778,6 +2103,7 @@ def _unflatten_match_kwargs(
 
 
 def _get_match_node_value(node: torch.fx.Node) -> Any:
+    # [FUNCTION DOC] HELPER: Returns the node's meta val if present, else its example_value (KeyError if neither).
     if "val" in node.meta:
         return node.meta["val"]
     return node.meta["example_value"]
@@ -1789,6 +2115,12 @@ def check_and_add_duplicate_pattern(
     seen_patterns: dict[str, list[str | None]],
     skip_duplicates: bool = False,
 ) -> bool:
+    # [FUNCTION DOC] Detects duplicate registrations. The pattern's serialized source is the
+    # key in seen_patterns; its value lists string forms of match graphs seen for that key
+    # (None entry when no graph). A new key is recorded (relies on seen_patterns being a
+    # defaultdict) and returns False. A repeat with the same graph (or no graph) returns True
+    # if skip_duplicates, else raises via torch._check; a repeat with a different graph is
+    # recorded and returns False.
     """
     Check if a pattern is a duplicate. Because we ignore certain types in searching, but not
     in matching, use the graph to distinguish equivalent search patterns.
@@ -1839,6 +2171,17 @@ def register_replacement(
     pattern_name: str | None = None,
     get_decomp_fn: Callable[..., dict[Any, Callable[..., Any]]] = select_decomp_table,
 ) -> bool:
+    # [FUNCTION DOC] Registers a search/replace rule built by tracing search_fn and replace_fn.
+    # Bound methods are wrapped; raises TypeError if example_inputs is not a list or tuple.
+    # Builds the pattern from search_fn (or uses search_fn_pattern), skips registration
+    # (returns False) for a joint_fwd_bwd trace under inference mode or for a skipped duplicate
+    # (duplicates otherwise raise), then registers a ReplacementPatternEntry in pass_dicts.
+    # Its check function re-traces search_fn with the real (fake-mode) shapes of the matched
+    # nodes, re-matches, runs extra_check, and on success traces replace_fn into the match's
+    # replacement graph and restores structured kwargs. normalize_args flattens the structured
+    # kwargs (and tangents_N extras) into the replacement input list. Side effects: mutates pass
+    # registries; tracing runs with rng functionalization disabled.
+    # KNOWN ISSUE: annotated to return bool, but on success it returns the registered PatternExpr.
     """
     Create a replacement rule based on example functions that get traced
     to create patterns.  This supports both training and inference when
@@ -1876,6 +2219,13 @@ def register_replacement(
     )
 
     def check_fn(match: Match) -> bool:
+        # [FUNCTION DOC] HELPER: extra_check for the entry. Rebuilds example args from the
+        # matched nodes' values, refreshing tensors as fresh strided fake tensors (collecting
+        # distinct symbolic sizes; integer tensors that require grad make the check fail),
+        # traces search_fn (or uses the pre-traced pattern; trace RuntimeErrors are logged and
+        # fail the check), re-matches the output node, then runs extra_check. On success sets
+        # match.replacement_graph (traced replace_fn) and match.kwargs and returns True; else False.
+        # Raises AssertionError if no fake mode is found among the args or the output node is None.
         """
         Often shapes get burned into the pattern, so our initial match ran with
         `ignore_types=(int, ...)`.
@@ -1902,6 +2252,10 @@ def register_replacement(
             requires_grad_values = iter(pytree.tree_leaves(requires_grad))
 
             def refresh_arg(arg: Any) -> Any:
+                # [FUNCTION DOC] HELPER: Non-tensors pass through. Tensors become new empty
+                # strided tensors with the same size, stride, dtype, device and requires_grad
+                # (flag consumed in order from requires_grad leaves); symbolic ints seen are added
+                # to sym_args. Integer tensors flagged as requiring grad set invalid_args and are kept.
                 nonlocal invalid_args
                 grad = next(requires_grad_values)
                 if not isinstance(arg, torch.Tensor):
@@ -1946,6 +2300,7 @@ def register_replacement(
                     # sizes will get re-traced and added to the graph.
 
                     def search_fn_new(*args_new: Any, **_: Any) -> Any:
+                        # [FUNCTION DOC] HELPER: Calls search_fn with only the trailing real args, dropping the leading symbolic size inputs.
                         return search_fn(*args_new[len(args_new) - len(args) :])
 
                     try:
@@ -2033,6 +2388,10 @@ def register_replacement(
             return False
 
     def normalize_args(**kwargs: Any) -> list[Any]:
+        # [FUNCTION DOC] HELPER: Converts match kwargs to the positional input list for the
+        # replacement graph: unflattens if needed, flattens each original argument into leaves
+        # in argument order, then appends tangents_1, tangents_2, ... values. Raises
+        # AssertionError if kwargs are left over.
         # Flat kwargs come from the initial match; structured kwargs are restored
         # after check_fn accepts the match.
         if not all(name in kwargs for name in argnames_static):
@@ -2102,7 +2461,14 @@ def _serialize_pattern(
     trace_fn: TraceFn,
     scalar_workaround: dict[str, float | int] | None,
 ) -> PatternExpr:
+    # [FUNCTION DOC] HELPER: Generates the pattern for search_fn and appends its serialized
+    # python source (assigned to unique_name) to a file named after the function in the
+    # serialized patterns directory. First write per function in this process truncates the
+    # file and writes a header with imports; later ones append. Raises RuntimeError if the
+    # directory is missing. Returns the generated PatternExpr. Side effects: file I/O and
+    # updates of the module-level _serialized_patterns set.
     def get_file_template() -> str:
+        # [FUNCTION DOC] HELPER: Builds the generated-file header: auto-generated notice, imports, aten/prims aliases, and an import of every PatternExpr/_TargetExpr subclass defined in this module.
         auto_generated_msg = textwrap.dedent(
             """\
             # This is an auto-generated file. Please do not modify it by hand.
@@ -2181,6 +2547,9 @@ SERIALIZED_PATTERN_PATH = Path(__file__).parent / "fx_passes" / "serialized_patt
 # to date.
 @dataclasses.dataclass
 class _PrecompiledPattern:
+    # [CLASS DOC] HELPER: Record of a registered precompiled pattern (search function, example
+    # inputs, tracer, scalar workaround and the loaded pattern), kept so tests can verify the
+    # serialized patterns are up to date.
     search_fn: SearchFn
     example_inputs: Sequence[Any]
     trace_fn: TraceFn
@@ -2204,6 +2573,13 @@ def gen_register_replacement(
     skip_duplicates: bool = False,
     get_decomp_fn: Callable[..., dict[Any, Callable[..., Any]]] = select_decomp_table,
 ) -> None:
+    # [FUNCTION DOC] Like register_replacement but uses a precompiled pattern. If env var
+    # PYTORCH_GEN_PATTERNS is set, generates and writes the serialized pattern; otherwise imports
+    # the serialized module named after search_fn and fetches the attribute unique_name (logs a
+    # warning if missing, then the attribute lookup raises AttributeError). Clears stored
+    # constants on fake tensor example inputs to avoid leaks, records the pattern in the
+    # module-level known list, and registers the replacement with the pre-traced pattern.
+    # Returns None.
     # Make sure the example_inputs is materialized.
     example_inputs = tuple(example_inputs)
 
@@ -2260,6 +2636,9 @@ def gen_pattern_and_search_gm(
     exclusive_arg_names: Sequence[str] = (),
     get_decomp_fn: Callable[..., dict[Any, Callable[..., Any]]] = select_decomp_table,
 ) -> tuple[PatternExpr, torch.fx.GraphModule]:
+    # [FUNCTION DOC] Traces search_fn with example_inputs (scalar workaround names substituted)
+    # and converts the traced graph into a pattern, ignoring int, float, list, device and dtype
+    # constants. Returns the pattern and the traced GraphModule. Runs with rng functionalization disabled.
     argnames = [*inspect.signature(search_fn).parameters.keys()]
 
     scalar_workaround = scalar_workaround or {}
@@ -2288,6 +2667,7 @@ def gen_pattern(
     scalar_workaround: dict[str, float | int] | None = None,
     exclusive_arg_names: Sequence[str] = (),
 ) -> PatternExpr:
+    # [FUNCTION DOC] Returns only the pattern produced by gen_pattern_and_search_gm.
     return gen_pattern_and_search_gm(
         search_fn, example_inputs, trace_fn, scalar_workaround, exclusive_arg_names
     )[0]
@@ -2303,6 +2683,10 @@ def register_lowering_pattern(
     output_metadata_is_input: int | str | None = None,
     output_metadata_fn: Callable[..., Any] | None = None,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    # [FUNCTION DOC] Returns a decorator that registers the decorated handler as a
+    # LoweringPatternEntry for pattern in pass_dict (front if prepend). The handler is tagged
+    # with attributes marking it as an inductor lowering function and carrying the output
+    # metadata options (ignore input storage, is-input index/name, metadata function).
     """
     Register an aten to inductor IR replacement pattern.  The decorated
     function is saved and then called at lowering time allowing direct
@@ -2310,6 +2694,7 @@ def register_lowering_pattern(
     """
 
     def decorator(handler: Callable[..., Any]) -> Callable[..., Any]:
+        # [FUNCTION DOC] HELPER: Registers handler and tags it with lowering attributes; raises AssertionError if handler is not callable. Returns handler.
         if not callable(handler):
             raise AssertionError(f"expected callable handler, got {handler}")
         LoweringPatternEntry(
@@ -2335,12 +2720,15 @@ def register_graph_pattern(
     pass_dict: _PassDictsType,
     prepend: bool = False,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    # [FUNCTION DOC] Returns a decorator that registers the decorated handler as a
+    # GraphPatternEntry for pattern in pass_dict (front if prepend), with extra_check as filter.
     """
     Register a pattern that runs a function on the FX graph, allowing
     custom transformation code.
     """
 
     def decorator(handler: Callable[..., Any]) -> Callable[..., Any]:
+        # [FUNCTION DOC] HELPER: Registers handler; raises AssertionError if not callable. Returns handler unchanged.
         if not callable(handler):
             raise AssertionError(f"expected callable handler, got {handler}")
         GraphPatternEntry(
@@ -2352,6 +2740,7 @@ def register_graph_pattern(
 
 
 def is_start_of_fx_graph(graph: torch.fx.Graph, node: torch.fx.Node) -> bool:
+    # [FUNCTION DOC] True if node is the first node of graph.
     # first node in the graph
     return node is next(iter(graph.nodes))
 
@@ -2362,6 +2751,7 @@ _mutation_op_re = re.compile(r"(?<!_)(_$|_[.]|(\b|_)(set|enter|exit|seed)(\b|_))
 
 
 def fixme_incorrect_inductor_schema_op(op: torch._ops.OpOverload) -> bool:
+    # [FUNCTION DOC] HELPER: True for the known inductor ops whose schema wrongly says non-mutating (currently resize_storage_bytes_ default); False for all other ops.
     if op.namespace != "inductor":
         return False
 
@@ -2371,6 +2761,12 @@ def fixme_incorrect_inductor_schema_op(op: torch._ops.OpOverload) -> bool:
 
 
 def is_mutation_op(node: torch.fx.Node) -> bool:
+    # [FUNCTION DOC] Heuristically decides whether node mutates its inputs. Operator overloads
+    # use their schema's mutable flag (except known wrong-schema inductor ops, which fall
+    # through to the name check); AutoFunctionalized targets are not mutations. Otherwise
+    # call_function names and call_method names are tested against a regex for trailing
+    # underscore or set/enter/exit/seed words; finally a non-None out keyword means mutation.
+    # Raises AssertionError for a non-callable function target or non-string method target.
     if isinstance(
         node.target, torch._ops.OpOverload
     ) and not fixme_incorrect_inductor_schema_op(node.target):
@@ -2393,6 +2789,8 @@ def is_mutation_op(node: torch.fx.Node) -> bool:
 
 
 def same_mutation_regions(a: torch.fx.Node, b: torch.fx.Node) -> bool:
+    # [FUNCTION DOC] True if both nodes carry the same mutation_region_id metadata. Raises
+    # AssertionError if either node lacks that metadata.
     if "mutation_region_id" not in a.meta:
         raise AssertionError("mutation_region_id missing from a.meta")
     if "mutation_region_id" not in b.meta:
@@ -2401,6 +2799,10 @@ def same_mutation_regions(a: torch.fx.Node, b: torch.fx.Node) -> bool:
 
 
 def get_mutation_region_id(graph: torch.fx.Graph, node: torch.fx.Node) -> int:
+    # [FUNCTION DOC] Returns node's mutation region id, computing lazily. Walks backward to the
+    # nearest node that already has an id (or the graph start, id 0), then walks forward to
+    # node, incrementing the id at each mutation op and storing the id in each visited node's
+    # meta (side effect). Returns the id for node.
     n = node
     while "mutation_region_id" not in n.meta and not is_start_of_fx_graph(graph, n):
         n = n.prev
@@ -2414,10 +2816,13 @@ def get_mutation_region_id(graph: torch.fx.Graph, node: torch.fx.Node) -> int:
 
 
 def should_compute_mutation_region_ids(graph: torch.fx.Graph) -> bool:
+    # [FUNCTION DOC] True if the first node of graph has no mutation_region_id yet (ids not computed).
     return "mutation_region_id" not in next(iter(graph.nodes)).meta
 
 
 def compute_mutation_region_ids(graph: torch.fx.Graph) -> None:
+    # [FUNCTION DOC] Assigns every node a mutation_region_id in meta: starts at 0 and increases
+    # by one at each mutation op (the mutation node itself gets the new id). Mutates metadata.
     mutation_region_id = 0
     for nd in graph.nodes:
         if is_mutation_op(nd):
@@ -2427,6 +2832,9 @@ def compute_mutation_region_ids(graph: torch.fx.Graph) -> None:
 
 @dataclasses.dataclass(frozen=True)
 class _MutationRegionRefresh:
+    # [CLASS DOC] HELPER: Frozen snapshot taken before a rewrite: the node before the rewritten
+    # span (anchor), the node after it (stop), the region id at the anchor and the number of
+    # mutation ops inside the span; used to refresh region ids afterwards.
     anchor: torch.fx.Node
     stop: torch.fx.Node
     mutation_region_id: int
@@ -2435,10 +2843,12 @@ class _MutationRegionRefresh:
 
 @dataclasses.dataclass
 class _GraphMutationTracker:
+    # [CLASS DOC] HELPER: Records nodes created and whether a mutation node was erased while a graph handler ran.
     created_nodes: list[torch.fx.Node] = dataclasses.field(default_factory=list)
     erased_mutation_node: bool = False
 
     def changed_mutation_regions(self) -> bool:
+        # [FUNCTION DOC] HELPER: True if a mutation node was erased or any created node is a mutation op.
         return self.erased_mutation_node or _contains_mutation_op(self.created_nodes)
 
 
@@ -2447,6 +2857,10 @@ def _track_graph_mutation_ops(
     graph: torch.fx.Graph,
     custom_context: dict[str, Any] | None = None,
 ) -> Generator[_GraphMutationTracker, None, None]:
+    # [FUNCTION DOC] HELPER: Context manager yielding a tracker. While active, temporarily
+    # overrides the graph instance's create_node (records new nodes and merges custom_context
+    # into their meta) and erase_node (notes erased mutation ops). On exit restores the
+    # original per-instance attributes (or removes the overrides), even on error.
     custom_context = custom_context or {}
     tracker = _GraphMutationTracker()
     create_node = graph.create_node
@@ -2457,12 +2871,14 @@ def _track_graph_mutation_ops(
     erase_node_attr = graph_dict.get("erase_node", sentinel)
 
     def tracked_create_node(*args: Any, **kwargs: Any) -> torch.fx.Node:
+        # [FUNCTION DOC] HELPER: Creates a node via the original method, merges the custom context, records and returns it.
         created_node = create_node(*args, **kwargs)
         _merge_custom_context(created_node.meta, custom_context)
         tracker.created_nodes.append(created_node)
         return created_node
 
     def tracked_erase_node(to_erase: torch.fx.Node) -> Any:
+        # [FUNCTION DOC] HELPER: Flags the tracker if a live mutation node is being erased, then erases it via the original method.
         if not to_erase._erased and is_mutation_op(to_erase):
             tracker.erased_mutation_node = True
         return erase_node(to_erase)
@@ -2483,6 +2899,8 @@ def _track_graph_mutation_ops(
 
 
 def _count_mutation_ops_until(start: torch.fx.Node, stop: torch.fx.Node) -> int:
+    # [FUNCTION DOC] HELPER: Counts mutation ops walking forward from start up to (excluding)
+    # stop. Raises AssertionError if the graph root is reached first.
     mutation_count = 0
     nd = start
     while nd is not stop:
@@ -2495,12 +2913,16 @@ def _count_mutation_ops_until(start: torch.fx.Node, stop: torch.fx.Node) -> int:
 
 
 def _contains_mutation_op(nodes: Iterable[torch.fx.Node]) -> bool:
+    # [FUNCTION DOC] HELPER: True if any node is a mutation op.
     return any(is_mutation_op(nd) for nd in nodes)
 
 
 def _replacement_changes_mutation_regions(
     entry: ReplacementPatternEntry, match: Match
 ) -> bool:
+    # [FUNCTION DOC] HELPER: True if the matched nodes or the replacement graph's nodes contain a
+    # mutation op (so region ids need refreshing). Raises AssertionError if the match has no
+    # replacement graph. The entry argument is unused.
     if match.replacement_graph is None:
         raise AssertionError("match.replacement_graph must not be None")
     return _contains_mutation_op(match.nodes) or _contains_mutation_op(
@@ -2512,6 +2934,10 @@ def _mutation_region_refresh(
     graph: torch.fx.Graph,
     nodes: Sequence[torch.fx.Node],
 ) -> _MutationRegionRefresh:
+    # [FUNCTION DOC] HELPER: Captures a refresh record for rewriting the given nodes: anchor is
+    # the node before the earliest node and stop the node after the latest (with no nodes, the
+    # whole graph is covered). Stores the anchor's region id (0 at the root) and the count of
+    # mutation ops currently between anchor and stop. May lazily compute ids.
     if nodes:
         first_matched_node = min(nodes)
         last_matched_node = max(nodes)
@@ -2537,6 +2963,10 @@ def _refresh_mutation_region_ids(
     graph: torch.fx.Graph,
     refresh: _MutationRegionRefresh,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Recomputes mutation_region_id metadata after a rewrite. If the
+    # anchor or stop node was erased (or the root is hit) recomputes the whole graph. Otherwise
+    # renumbers nodes between anchor and stop, and if the number of mutation ops there changed
+    # from the snapshot, renumbers all later nodes to the end of the graph with shifted ids.
     if refresh.anchor._erased or refresh.stop._erased:
         compute_mutation_region_ids(graph)
         return
@@ -2565,11 +2995,14 @@ def _refresh_mutation_region_ids(
 
 
 def _wrap_bound_method(fn: Any, argnames: list[str]) -> Any:
+    # [FUNCTION DOC] HELPER: Returns a plain function forwarding to fn whose signature lists
+    # only argnames as positional-or-keyword parameters (hides self for tracing).
     """
     Wrap a bound method to remove 'self' from its signature for FX tracing.
     """
 
     def wrapper(*args: Any, **kwargs: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Forwards all arguments to the wrapped bound method.
         return fn(*args, **kwargs)
 
     params = [
@@ -2581,6 +3014,11 @@ def _wrap_bound_method(fn: Any, argnames: list[str]) -> Any:
 
 
 class PatternMatcherPass:
+    # [CLASS DOC] Registry and driver for a set of pattern rewrites over FX graphs. State:
+    # patterns (mapping from (op, target) to ordered list of PatternEntry), pass_name and
+    # subsystem (for observers/logging) and seen_patterns (duplicate-detection table from
+    # serialized pattern source to the graphs that produced it). Usable as the pass_dict
+    # target of register_* helpers via item access; apply() runs the rewrites.
     """
     Registry of patterns to match and replace in FX graphs.
     """
@@ -2590,6 +3028,7 @@ class PatternMatcherPass:
         pass_name: str | None = None,
         subsystem: str | None = None,
     ) -> None:
+        # [FUNCTION DOC] Creates empty pattern and seen-pattern tables and stores the optional pass name and subsystem.
         super().__init__()
         self.patterns: defaultdict[
             tuple[str, torch.fx.node.Target], list[PatternEntry]
@@ -2604,9 +3043,20 @@ class PatternMatcherPass:
         self.seen_patterns: dict[str, list[str | None]] = defaultdict(list)
 
     def __getitem__(self, item: tuple[str, torch.fx.node.Target]) -> list[PatternEntry]:
+        # [FUNCTION DOC] Returns (creating if absent) the entry list for the (op, target) key.
         return self.patterns[item]
 
     def apply(self, gm: torch.fx.GraphModule | torch.fx.Graph) -> int:
+        # [FUNCTION DOC] Runs all registered patterns over gm (GraphModule or Graph with an owning
+        # module; RuntimeError for other types). Returns 0 if nothing is registered. Computes
+        # mutation region ids if absent, collects candidate nodes by (op, target) and visits them
+        # in reverse graph order, skipping nodes with unsupported or cpu-input types. For each
+        # entry (stopping if the node is erased) tries a match; discards matches spanning more
+        # than one mutation region or more than one stream/mempool context; if extra_check
+        # passes (symbolic result evaluated as false when undecidable) applies the entry,
+        # refreshing mutation region ids when mutation ops are involved. Updates global counters
+        # (match count, nodes matched, and per-pattern counts when the debug env var is set) and
+        # logs matches for debug-selected nodes. Mutates the graph; returns the number of applied matches.
         """Apply all registered patterns to the graph, returning the number of matches."""
         if not self.patterns:
             return 0
@@ -2726,10 +3176,12 @@ class PatternMatcherPass:
         return count
 
     def clear(self) -> None:
+        # [FUNCTION DOC] Removes all registered patterns (seen_patterns is left untouched).
         self.patterns.clear()
 
 
 def _not_implemented(*args: Any, **kwargs: Any) -> NoReturn:
+    # [FUNCTION DOC] HELPER: Placeholder handler that always raises NotImplementedError.
     raise NotImplementedError
 
 
@@ -2740,6 +3192,13 @@ def fx_to_pattern(
     scalar_workaround: dict[str, float | int] | None = None,
     exclusive_arg_names: Sequence[str] = (),
 ) -> PatternExpr:
+    # [FUNCTION DOC] Converts a traced GraphModule (AssertionError for other types) into a
+    # PatternExpr by interpreting it: placeholders become keyword-arg patterns named from
+    # argnames (extra placeholders must be tangents), get_attr becomes GetAttr, call_function
+    # becomes CallFunction with constants of ignore_types replaced by Ignored and
+    # scalar_workaround values replaced by named keyword args. call_method and call_module are
+    # unsupported. Each pattern records its user count from the node. A multi-output result
+    # becomes a MultiOutputPattern. scalar_workaround values must be unique (AssertionError).
     """
     Convert an FX graph into a PatternExpr.  This is useful for simple
     patterns that can only match single functions and fixed-length lists.
@@ -2754,6 +3213,10 @@ def fx_to_pattern(
     def process_arg(
         x: T, ignore_types_override: Sequence[type[Any]] | None = None
     ) -> T | KeywordArg | Ignored:
+        # [FUNCTION DOC] HELPER: Maps a traced constant to a pattern element: a number equal to a
+        # scalar_workaround value becomes a keyword arg of that name; a value whose exact type is
+        # in the ignored types (override if given) becomes Ignored; a non-empty list consisting
+        # only of Ignored becomes a single Ignored; else unchanged.
         current_ignore_types = (
             ignore_types_override if ignore_types_override is not None else ignore_types
         )
@@ -2768,6 +3231,9 @@ def fx_to_pattern(
     argnum = itertools.count()
 
     class Converter(torch.fx.Interpreter):
+        # [CLASS DOC] HELPER: FX Interpreter that evaluates a graph into pattern objects instead
+        # of values; call_method and call_module raise NotImplementedError. Uses the enclosing
+        # argument counter, argnames and exclusive names.
         # pyrefly: ignore [bad-override]
         call_method = _not_implemented
         # pyrefly: ignore [bad-override]
@@ -2780,6 +3246,10 @@ def fx_to_pattern(
             args: Sequence[Any],
             kwargs: Mapping[str, Any],
         ) -> ExclusiveKeywordArg | KeywordArg:
+            # [FUNCTION DOC] HELPER: Returns a keyword-arg pattern for the next placeholder,
+            # named by position from argnames; placeholders beyond argnames must start with
+            # tangent (AssertionError otherwise) and use their own name; with no argnames the
+            # trailing numeric suffix is stripped. Exclusive names give ExclusiveKeywordArg.
             n = next(argnum)
             if n < len(argnames):
                 name = argnames[n]
@@ -2804,6 +3274,7 @@ def fx_to_pattern(
             args: Sequence[Any],
             kwargs: Mapping[str, Any],
         ) -> GetAttr:
+            # [FUNCTION DOC] HELPER: Returns a GetAttr pattern holding the attribute value fetched from the module; AssertionError if args or kwargs are given.
             if args or kwargs:
                 raise AssertionError(f"unexpected get_attr args: {args}, {kwargs}")
             return GetAttr(_get_attr(self.module, target))
@@ -2815,6 +3286,10 @@ def fx_to_pattern(
             args: Sequence[Any],
             kwargs: Mapping[str, Any],
         ) -> PatternExpr:
+            # [FUNCTION DOC] HELPER: Builds a CallFunction pattern for the target. Args and
+            # kwargs are mapped through process_arg (for getitem, integer constants are kept so
+            # indices still match); when list is an ignored type, list-valued args get the
+            # same treatment again at the top level.
             process_arg_fn = process_arg
             # Indexing is critical for matching getitem nodes, so we can't ignore int args here
             if target is operator.getitem:
@@ -2825,6 +3300,7 @@ def fx_to_pattern(
                         t for t in ignore_types if t is not int
                     ),
                 ) -> T | KeywordArg | Ignored:
+                    # [FUNCTION DOC] HELPER: process_arg with an ignore list that excludes int.
                     return process_arg(x, ignore_types_override)
 
                 process_arg_fn = process_arg_fn_impl
@@ -2837,6 +3313,9 @@ def fx_to_pattern(
             return CallFunction(target, *args, **kwargs)
 
         def run_node(self, n: torch.fx.Node) -> Any:
+            # [FUNCTION DOC] HELPER: Runs the node normally, then records the original node's
+            # user count on the resulting pattern (per element for tuple outputs, which must
+            # match the output node's argument collection in length; AssertionError otherwise).
             rv = super().run_node(n)
             if n.op == "output" and isinstance(rv, tuple):
                 args = n.args[0]
@@ -2867,6 +3346,10 @@ def fwd_only(
     run_functional_passes: bool = True,
     get_decomp_fn: Callable[..., Any] = select_decomp_table,
 ) -> torch.fx.GraphModule:
+    # [FUNCTION DOC] Traces fn on args (real tensors, no grad) into a GraphModule with
+    # make_fx under the python dispatcher, node metadata preserved and compile_on_one_rank
+    # disabled, using the decomposition table from get_decomp_fn. If run_functional_passes,
+    # removes no-op ops and dead code. Recompiles and returns the module.
     """Build a normalized inference graph, for use with fx_to_pattern"""
     from torch.compiler import config as compiler_config
 
@@ -2907,12 +3390,19 @@ def joint_fwd_bwd(
     *,
     get_decomp_fn: Callable[..., Any] = select_decomp_table,
 ) -> torch.fx.GraphModule:
+    # [FUNCTION DOC] Traces fn on args with AOT autograd and captures the joint forward+backward
+    # graph through a custom partition function (the compiled functions are discarded). Then
+    # removes no-op ops, applies the early joint-graph patterns, resets the codegen in/out
+    # specs, eliminates dead code, recompiles and returns the module. Raises AssertionError if
+    # no graph was captured. Gradients enabled; compile_on_one_rank disabled during tracing.
     """Build a normalized training graph, for use with fx_to_pattern"""
     gm: torch.fx.GraphModule | None = None
 
     def record_joint_graph(
         joint_graph: torch.fx.GraphModule, inputs: Sequence[Any], **kwargs: Any
     ) -> tuple[torch.fx.GraphModule, torch.fx.GraphModule]:
+        # [FUNCTION DOC] HELPER: Partition callback: stores a clone of the joint graph in the
+        # enclosing gm (AssertionError if already set) and then delegates to the default partitioner.
         nonlocal gm
         if gm:
             raise AssertionError("gm already set")
@@ -2952,12 +3442,17 @@ def joint_fwd_bwd(
 
 
 def _args(n: torch.fx.Node) -> list[torch.fx.node.Argument]:
+    # [FUNCTION DOC] HELPER: Returns all Node arguments (from args and kwargs, nested) of n as a flat list.
     args: list[torch.fx.node.Argument] = []
     torch.fx.map_arg((n.args, n.kwargs), args.append)
     return args
 
 
 def stable_topological_sort(graph: torch.fx.Graph) -> None:
+    # [FUNCTION DOC] Reorders graph nodes in place into a valid topological order while
+    # keeping the original order wherever possible: a node whose inputs are not yet placed
+    # waits on its last unplaced input, and is released after that input is placed. Raises
+    # AssertionError if not all nodes could be ordered (cycle).
     # Nodes are in exactly one of these three collections:
 
     # - Nodes in `pending` are waiting to be processed (in reverse order):
@@ -2995,6 +3490,11 @@ def stable_topological_sort(graph: torch.fx.Graph) -> None:
 
 
 def init_once_fakemode(fn: Callable[..., Any]) -> Callable[..., Any]:
+    # [FUNCTION DOC] Decorator for lazy pattern-initialization functions. Returns a cached
+    # wrapper (cache keyed on input_device and get_decomp_fn) that calls fn once per key,
+    # forwarding input_device / get_decomp_fn only if fn declares them, under fake tensor mode
+    # with real mode and tracing context disabled. Restores the backend counters afterwards so
+    # matches during tracing are not counted.
     """Wrapper around lazy init functions in fx_passes/"""
 
     _fn_params = inspect.signature(fn).parameters
@@ -3007,6 +3507,7 @@ def init_once_fakemode(fn: Callable[..., Any]) -> Callable[..., Any]:
             ..., dict[Any, Callable[..., Any]]
         ] = select_decomp_table,
     ) -> Any:
+        # [FUNCTION DOC] HELPER: Cached initializer; runs fn once per distinct arguments inside fake mode and returns its result.
         counters_ref = counters[backend].copy()
 
         kwargs: dict[str, Any] = {}
@@ -3027,17 +3528,24 @@ def init_once_fakemode(fn: Callable[..., Any]) -> Callable[..., Any]:
 
 
 def config_flag(name: str) -> Callable[[Match], Any]:
+    # [FUNCTION DOC] Returns an extra_check function that reads the inductor config attribute
+    # called name (at check time) and returns its value, gating a pass behind a flag.
     """Function for extra_check to put pass behind a flag"""
 
     def flag_check(match: Match) -> Any:
+        # [FUNCTION DOC] HELPER: Returns the current value of the config flag; match is unused.
         return getattr(config, name)
 
     return flag_check
 
 
 def clone_graph(input_graph: torch.fx.GraphModule) -> torch.fx.GraphModule:
+    # [FUNCTION DOC] Returns a copy of input_graph made by an FX Transformer, preserving node
+    # metadata and names.
     class CopyGraph(Transformer):
+        # [CLASS DOC] HELPER: Transformer that copies each node, carrying over metadata and node name.
         def run_node(self, old_node: torch.fx.Node) -> torch.fx.Node:
+            # [FUNCTION DOC] HELPER: Runs the node normally; for resulting proxies copies the old node's meta and assigns a fresh unique name based on the old name.
             new_node = super().run_node(old_node)
             if isinstance(new_node, torch.fx.Proxy):
                 new_node.node.meta.update(old_node.meta)
@@ -3057,6 +3565,8 @@ _seen_patterns: OrderedSet[str] = OrderedSet()
 def get_arg_value(
     node: torch.fx.Node, arg_number: int, kwarg_name: str | None = None
 ) -> Any:
+    # [FUNCTION DOC] Returns positional argument arg_number of node if present; else the keyword
+    # argument kwarg_name if given (None when absent), else None.
     if len(node.args) > arg_number:
         return node.args[arg_number]
     elif kwarg_name is None:
@@ -3066,6 +3576,7 @@ def get_arg_value(
 
 
 def filter_nodes(nodes: Iterable[torch.fx.Node], fn: Any) -> list[torch.fx.Node]:
+    # [FUNCTION DOC] Returns the nodes whose target equals fn (or, for an operator packet, any of its overloads), preserving order.
     fns = [fn]
     if isinstance(fn, torch._ops.OpOverloadPacket):
         fns.extend(fn.op_overloads())
@@ -3074,6 +3585,9 @@ def filter_nodes(nodes: Iterable[torch.fx.Node], fn: Any) -> list[torch.fx.Node]
 
 
 def extract_target(node: torch.fx.Node) -> torch.fx.node.Target:
+    # [FUNCTION DOC] Returns the matching key for a node: its target, except call_module nodes
+    # return the class of the referenced submodule (AssertionError if the target is not a string
+    # or the graph has no owning module).
     """For call_function and call_method, we directly use the target function;
     For call_module, the target is string, and we treat the module class
      as a function.
