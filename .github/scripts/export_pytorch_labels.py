@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Script that exports the sorted list of labels of a GitHub repository as JSON,
+# either to a local file (--output-file) or to the pytorch_labels.json object in the
+# ossci-metrics S3 bucket (needs AWS credentials in the environment). Used to snapshot labels
+# for the test ownership linter. Positional arguments are the org and repo names.
 """
 Test ownership was introduced in https://github.com/pytorch/pytorch/issues/66232.
 
@@ -18,6 +22,8 @@ from label_utils import gh_get_labels
 
 
 def parse_args() -> Any:
+    # [FUNCTION DOC] HELPER: Parses positional org and repo plus the optional output file path
+    # option and returns the namespace.
     from argparse import ArgumentParser
 
     parser = ArgumentParser("Export PR labels")
@@ -33,6 +39,10 @@ def parse_args() -> Any:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Fetches all label names of the repo, serializes them as a sorted, indented
+    # JSON list with a trailing newline, and writes them to the output file if given, otherwise
+    # uploads them to the S3 bucket object (importing boto3 lazily). Prints a progress line.
+    # Side effects: file write or S3 upload.
     args = parse_args()
     print(f"Exporting labels for {args.org}/{args.repo}")
     labels = json.dumps(sorted(gh_get_labels(args.org, args.repo)), indent=2) + "\n"

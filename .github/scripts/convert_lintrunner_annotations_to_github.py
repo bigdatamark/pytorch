@@ -1,3 +1,8 @@
+# [MODULE DOC] Filter script that reads lintrunner JSON messages (one per line) from standard
+# input and prints a JSON list of GitHub check annotations to standard output. Messages lacking
+# a path or line are skipped with a note on standard error. Paths are made relative to the git
+# root (found by running git at import time). All work runs at import time; there are no
+# functions. Every annotation gets the failure level.
 from __future__ import annotations
 
 import json
@@ -10,12 +15,17 @@ from typing import NamedTuple
 
 # From: https://docs.github.com/en/rest/reference/checks
 class GitHubAnnotationLevel(str, Enum):
+    # [CLASS DOC] String enum of the annotation severity levels accepted by the GitHub checks
+    # API: notice, warning and failure. Only failure is used by this script.
     NOTICE = "notice"
     WARNING = "warning"
     FAILURE = "failure"
 
 
 class GitHubAnnotation(NamedTuple):
+    # [CLASS DOC] Immutable record of one GitHub check annotation: file path, start and end line,
+    # optional start and end column, severity level, message, optional title and optional raw
+    # details. Converted to a dict for JSON output.
     path: str
     start_line: int
     end_line: int

@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 
+# [MODULE DOC] CI lint script that checks every pull-request-triggered workflow in
+# .github/workflows has a unique name, a concurrency group starting with the expected
+# pattern (workflow name plus PR number or sha plus a dispatch-dependent suffix), and
+# cancel-in-progress enabled. Problems are printed to standard error and the script exits with
+# status 1 if any group or name problem was found. Constants hold the expected group strings.
 import sys
 from pathlib import Path
 
@@ -23,6 +28,9 @@ EXPECTED_GROUP_CONCURRENT = (
 
 
 def should_check(filename: Path) -> bool:
+    # [FUNCTION DOC] HELPER: Loads a workflow yml file and returns true if its triggers contain
+    # a pull request trigger. The trigger key is looked up as on, falling back to the boolean
+    # key that YAML produces for the bare word on. Raises if the file cannot be read or parsed.
     with open(filename) as f:
         content = f.read()
 
@@ -32,6 +40,8 @@ def should_check(filename: Path) -> bool:
 
 
 if __name__ == "__main__":
+    # KNOWN ISSUE: a missing or false cancel-in-progress setting prints an error below but does
+    # not set the error flag, so it never causes a non-zero exit.
     errors_found = False
     files = [f for f in WORKFLOWS.glob("*.yml") if should_check(f)]
     names = set()

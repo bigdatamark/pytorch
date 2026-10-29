@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 
+# [MODULE DOC] Single source of truth for binary (wheel and libtorch) build matrices used by
+# generated CI workflows. Holds the supported CUDA, ROCm, XPU and aarch64 and s390x arch lists,
+# per-arch extra pip requirements, container image names, python versions, and the nightly
+# source matrix consumed by tools/nightly.py. Functions build the per-OS wheel and libtorch
+# matrices (lists of mappings with build names, arch and image fields) and validate that NCCL,
+# cuDNN and CUDA release tables agree across repo files. Import-time side effects: reads repo
+# files and raises an error if NCCL, cuDNN or runtime-versus-build tables are inconsistent.
+# Run as a script it writes nightly_source_matrix.json next to itself.
 """Generates a matrix to be utilized through github actions
 
 Will output a condensed version of the matrix if on a pull request that only
@@ -154,6 +162,10 @@ NIGHTLY_SOURCE_MATRIX.update(XPU_NIGHTLY_SOURCE_MATRIX)
 
 
 def get_nccl_wheel_version(arch_version: str) -> str:
+    # [FUNCTION DOC] Splits the extra install requirement string of the given CUDA version on
+    # semicolons and bars, finds the NCCL wheel requirement and returns its pinned version.
+    # Raises a lookup error for an unknown arch and a stop-iteration error if there is no NCCL
+    # requirement (for example for a non-CUDA arch).
     requirements = map(
         str.strip, re.split("[;|]", PYTORCH_EXTRA_INSTALL_REQUIREMENTS[arch_version])
     )
@@ -161,6 +173,9 @@ def get_nccl_wheel_version(arch_version: str) -> str:
 
 
 def read_nccl_pin(arch_version: str) -> str:
+    # [FUNCTION DOC] HELPER: Reads the NCCL release tag pinned for the CUDA version by
+    # delegating to the function of the same name in tools/optional_submodules. Side effect:
+    # appends the repo tools directory to the module search path on every call.
     import sys
 
     sys.path.append(str(REPO_ROOT / "tools"))
@@ -171,6 +186,9 @@ def read_nccl_pin(arch_version: str) -> str:
 
 
 def validate_nccl_dep_consistency(arch_version: str) -> None:
+    # [FUNCTION DOC] Checks that the repo NCCL pin tag for the CUDA version starts with the
+    # letter v plus the NCCL wheel version in the extra requirements. Raises RuntimeError on
+    # mismatch; returns nothing.
     nccl_release_tag = read_nccl_pin(arch_version)
     wheel_ver = get_nccl_wheel_version(arch_version)
     if not nccl_release_tag.startswith(f"v{wheel_ver}"):
@@ -181,6 +199,10 @@ def validate_nccl_dep_consistency(arch_version: str) -> None:
 
 
 def _parse_linux_cudnn_versions() -> dict[str, str]:
+    # [FUNCTION DOC] HELPER: Scans the docker install_cuda shell script line by line; each
+    # install function header named with digits (for example 126) sets the current CUDA version
+    # (12.6) and the first cuDNN version assignment after it is recorded. Returns a mapping
+    # from CUDA short version to cuDNN version string.
     """Return {cuda_short_version: cudnn_version} from install_cuda.sh."""
     text = (REPO_ROOT / ".ci" / "docker" / "common" / "install_cuda.sh").read_text()
     results: dict[str, str] = {}
@@ -202,6 +224,10 @@ def _parse_linux_cudnn_versions() -> dict[str, str]:
 
 
 def _parse_windows_cudnn_versions() -> dict[str, str]:
+    # [FUNCTION DOC] HELPER: Scans the Windows cuda_install batch file; each label for a CUDA
+    # version (digits, for example 126) sets the current version (12.6) and the first cuDNN
+    # folder assignment after it supplies the cuDNN version. Returns a mapping from CUDA short
+    # version to cuDNN version string.
     """Return {cuda_short_version: cudnn_version} from cuda_install.bat."""
     text = (
         REPO_ROOT / ".ci" / "pytorch" / "windows" / "internal" / "cuda_install.bat"
@@ -227,6 +253,9 @@ def _parse_windows_cudnn_versions() -> dict[str, str]:
 
 
 def validate_cudnn_version_consistency(arch_version: str) -> None:
+    # [FUNCTION DOC] Compares the Linux and Windows cuDNN versions for a CUDA version and raises
+    # RuntimeError if both are known and differ. If either platform has no entry, it returns
+    # silently.
     linux_versions = _parse_linux_cudnn_versions()
     windows_versions = _parse_windows_cudnn_versions()
     linux_ver = linux_versions.get(arch_version)
@@ -246,6 +275,9 @@ _RUNTIME_CUDA_INIT = REPO_ROOT / "torch" / "cuda" / "__init__.py"
 
 
 def _read_dict_constant(path: Path, name: str) -> dict[str, dict[str, set[int]]]:
+    # [FUNCTION DOC] HELPER: Parses a Python source file without importing it, finds the
+    # annotated assignment to the given name, and evaluates its literal value safely. Returns
+    # the resulting nested mapping. Raises RuntimeError if the name is not found.
     """Parse a top-level annotated `name: dict[...] = {...}` literal from a Python file."""
     tree = ast.parse(path.read_text())
     for node in ast.walk(tree):
@@ -260,6 +292,9 @@ def _read_dict_constant(path: Path, name: str) -> dict[str, dict[str, set[int]]]
 
 
 def validate_runtime_release_table_consistency() -> None:
+    # [FUNCTION DOC] Reads the runtime CUDA recommendation table from torch/cuda and the build
+    # arch list table from the manywheel build env setup script and raises RuntimeError, showing
+    # both, if they are not equal.
     """Ensure torch/cuda/__init__.py's recommendation table matches the build matrix.
 
     PYTORCH_RELEASES_CODE_CC (runtime) and TORCH_CUDA_ARCH_LIST_TABLE (build)
@@ -277,6 +312,8 @@ def validate_runtime_release_table_consistency() -> None:
 
 
 def arch_type(arch_version: str) -> str:
+    # [FUNCTION DOC] Classifies an arch string as cuda, rocm, xpu, cpu-aarch64, cpu-s390x or
+    # cuda-aarch64 by list membership; anything else (expected to be cpu) returns cpu.
     if arch_version in CUDA_ARCHES:
         return "cuda"
     elif arch_version in ROCM_ARCHES:
@@ -324,6 +361,9 @@ FULL_PYTHON_VERSIONS = [
 
 
 def translate_desired_cuda(gpu_arch_type: str, gpu_arch_version: str) -> str:
+    # [FUNCTION DOC] Maps arch type and version to the desired-cuda build string: cpu kinds give
+    # cpu, cuda gives cu plus the version without dots (aarch64 suffix removed for the aarch64
+    # kind), rocm gives rocm plus the version, xpu gives xpu. Unknown types return the version.
     return {
         "cpu": "cpu",
         "cpu-aarch64": "cpu",
@@ -336,6 +376,8 @@ def translate_desired_cuda(gpu_arch_type: str, gpu_arch_version: str) -> str:
 
 
 def list_without(in_list: list[str], without: list[str]) -> list[str]:
+    # [FUNCTION DOC] HELPER: Returns a new list of the items of in_list that are not in without,
+    # preserving order.
     return [item for item in in_list if item not in without]
 
 
@@ -345,6 +387,11 @@ def generate_libtorch_matrix(
     arches: list[str] | None = None,
     libtorch_variants: list[str] | None = None,
 ) -> list[dict[str, str]]:
+    # [FUNCTION DOC] Builds the libtorch build matrix for an OS: one entry per arch and variant
+    # (shared or static, with or without deps by default). Default arches are cpu, plus the
+    # CUDA versions with Windows installers on windows. Each entry has arch type and version,
+    # desired cuda string, release type, variant, empty container fields, package type libtorch
+    # and a build name with dots replaced by underscores. Returns the list.
     if arches is None:
         arches = ["cpu"]
         if os == "windows":
@@ -387,6 +434,16 @@ def generate_wheels_matrix(
     arches: list[str] | None = None,
     python_versions: list[str] | None = None,
 ) -> list[dict[str, str]]:
+    # [FUNCTION DOC] Builds the wheel build matrix for an OS: one entry per python version and
+    # arch. Package type is manywheel on linux variants, else wheel. Default arches depend on
+    # the OS (linux: cpu, CUDA, ROCm, XPU; windows: cpu, CUDA, XPU; linux-aarch64 and s390x:
+    # their own lists). Python 3.14 and 3.15 are skipped on OSes not yet enabled for them.
+    # Entries carry python version, arch type and version, desired cuda, container image and
+    # tag prefix, package type, build name (dots replaced by underscores) and extra pip install
+    # requirements (set for linux and aarch64 CUDA, rocm 7.14, xpu, and cpu on windows and macOS).
+    # KNOWN ISSUE: the CUDA branch uses a hardcoded version list and mixed and/or precedence;
+    # new CUDA versions must be added in both places. Cpu wheels on windows and macOS get the
+    # stable CUDA requirements, which looks odd for cpu builds.
     package_type = "wheel"
     if os == "linux" or os == "linux-aarch64" or os == "linux-s390x":
         # NOTE: We only build manywheel packages for x86_64 and aarch64 and s390x linux
@@ -517,6 +574,11 @@ def generate_libtorch_extraction_configs(
     os: str,
     wheel_configs: list[dict[str, str]],
 ) -> list[dict[str, str]]:
+    # [FUNCTION DOC] Derives libtorch extraction configs from wheel configs. Picks the wheel
+    # config of the preferred python (3.10, or 3.11 for windows-arm64) for each distinct arch
+    # type and version, skips XPU, and returns for each a config with the source wheel build
+    # name, a shared-with-deps release libtorch build name, arch (x86_64 or arm64), desired
+    # cuda and arch fields, and container image fields when the source has them.
     """Generate libtorch extraction configs from existing wheel build configs.
 
     For each unique arch variant in wheel_configs, find the py3.10 config

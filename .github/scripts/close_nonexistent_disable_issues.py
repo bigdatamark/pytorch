@@ -1,3 +1,10 @@
+# [MODULE DOC] CI maintenance script that closes "disabled test" GitHub issues whose test no
+# longer exists. It downloads the condensed disabled-tests JSON, fetches logs of recent
+# viable/strict test jobs from ClickHouse/S3, and checks each disabled test against those logs
+# and a 7-day test-run table. Tests found in neither are reported and (unless --dry-run) the
+# issue gets a closing comment and is closed via the GitHub REST API (needs GITHUB_TOKEN).
+# Import-time side effects: temporarily modifies sys.path to import tools.testing.clickhouse.
+# Run as a script; exits non-zero if any issue failed to close.
 import argparse
 import json
 import multiprocessing as mp
@@ -77,10 +84,15 @@ DISABLED_TESTS_JSON = (
 
 @retries_decorator()
 def query_db(query: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Runs a parametrized ClickHouse query and returns the result rows as
+    # a list of mappings. Retried on failure by the retries decorator; errors propagate after
+    # retries are exhausted.
     return query_clickhouse(query, params)
 
 
 def parse_args() -> Any:
+    # [FUNCTION DOC] HELPER: Parses command line arguments; only supports a --dry-run flag that
+    # makes the script list candidate tests without closing any issue. Returns the namespace.
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--dry-run",
@@ -91,6 +103,10 @@ def parse_args() -> Any:
 
 
 def download_log_worker(temp_dir: str, id: int, name: str) -> None:
+    # [FUNCTION DOC] HELPER: Pool worker that downloads the raw log of job id from the public S3
+    # bucket and writes it to a new file in temp_dir named after the job name (slashes replaced
+    # by underscores) and id. The file is opened in exclusive-create mode, so an existing file
+    # raises an error. Returns nothing; no HTTP status check is done on the download.
     url = f"https://ossci-raw-job-status.s3.amazonaws.com/log/{id}"
     data = requests.get(url).text
     with open(f"{temp_dir}/{name.replace('/', '_')} {id}.txt", "x") as f:
@@ -98,11 +114,18 @@ def download_log_worker(temp_dir: str, id: int, name: str) -> None:
 
 
 def printer(item: tuple[str, tuple[int, str, list[Any]]], extra: str) -> None:
+    # [FUNCTION DOC] HELPER: Prints one line for a disabled-test entry (test name mapped to
+    # issue number, issue link, extra data): the link, the test name in fixed-width columns,
+    # then the extra text such as the reason the test was or was not found.
     test, (_, link, _) = item
     print(f"{link:<55} {test:<120} {extra}")
 
 
 def close_issue(num: int) -> None:
+    # [FUNCTION DOC] Posts the standard closing comment on pytorch/pytorch issue num and then
+    # sets the issue state to closed, using the GITHUB_TOKEN environment variable for auth.
+    # Raises RuntimeError if the comment call does not return 201 or the close call does not
+    # return 200 (a missing token raises a key error). Side effect: mutates the GitHub issue.
     headers = {
         "Accept": "application/vnd.github.v3+json",
         "Authorization": f"token {os.environ['GITHUB_TOKEN']}",
@@ -126,6 +149,11 @@ def close_issue(num: int) -> None:
 def check_if_exists(
     item: tuple[str, tuple[int, str, list[str]]], all_logs: list[str]
 ) -> tuple[bool, str]:
+    # [FUNCTION DOC] Decides whether a disabled test still exists. Parses the test name into
+    # test function name and class name (last dotted component); if the format is wrong returns
+    # (False, "poorly formed"). Searches all log texts for the issue link or the class and test
+    # pair; if found returns (True, "found in logs"). Otherwise queries the DB for a recent run
+    # of the test: (True, "found in DB") or (False, "not found"). Performs a network query.
     test, (_, link, _) = item
     # Test names should look like `test_a (module.path.classname)`
     reg = re.match(r"(\S+) \((\S*)\)", test)
@@ -159,6 +187,9 @@ def check_if_exists(
 
 if __name__ == "__main__":
     args = parse_args()
+    # Entry point flow: load disabled tests, download logs of recent jobs with a process pool,
+    # sanity check the log count (must exceed 200 and equal job count, else error), classify each
+    # disabled test, print the ones to close, then close them unless dry run.
     disabled_tests_json = json.loads(requests.get(DISABLED_TESTS_JSON).text)
 
     all_logs = []

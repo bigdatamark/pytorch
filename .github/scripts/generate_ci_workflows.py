@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
 
+# [MODULE DOC] Generator for the binary build GitHub workflow files. Defines the configuration
+# dataclasses (ciflow labels, binary build workflow), the supported operating system names and
+# the per-platform workflow lists (linux, windows, windows arm64, macOS arm64, linux aarch64,
+# s390x), whose build matrices come from generate_binary_build_matrix. Running it as a script
+# deletes all existing generated workflow files and renders the Jinja templates in
+# .github/templates into workflows/generated-<env>-<branch>.yml. Import-time side effects:
+# computes the build matrices for all platforms.
 import json
 import os
 import sys
@@ -28,6 +35,11 @@ LABEL_CIFLOW_S390 = "ciflow/s390"
 
 @dataclass
 class CIFlowConfig:
+    # [CLASS DOC] Settings for which ciflow labels trigger a generated workflow: the canary-run
+    # flag, the set of label strings, whether the workflow is isolated from the default trunk
+    # or unstable groups, and whether it is unstable. After construction, non-isolated
+    # workflows without the periodic label get the trunk label (or the unstable label when
+    # unstable) added to the label set.
     # For use to enable workflows to run on pytorch/pytorch-canary
     run_on_canary: bool = False
     labels: set[str] = field(default_factory=set)
@@ -36,6 +48,9 @@ class CIFlowConfig:
     unstable: bool = False
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Dataclass hook. For a workflow that is not isolated and lacks
+        # the periodic label, mutates the label set to add the trunk label, or the unstable
+        # label if the unstable flag is set.
         if not self.isolated_workflow:
             if LABEL_CIFLOW_PERIODIC not in self.labels:
                 self.labels.add(
@@ -44,12 +59,20 @@ class CIFlowConfig:
 
 
 class Config(TypedDict):
+    # [CLASS DOC] HELPER: Typed mapping describing a test config with a shard count and a
+    # runner name. Not used elsewhere in this module.
     num_shards: int
     runner: str
 
 
 @dataclass
 class BinaryBuildWorkflow:
+    # [CLASS DOC] Description of one generated binary build workflow: target OS, list of build
+    # config mappings, package type, build environment name (derived from OS, package type and
+    # variant when empty), ciflow config, schedule marker, branch name used in the file name,
+    # macOS runner, libtorch variant and libtorch extraction configs, and owner labels (defaulted
+    # from the OS and the GPU arch types present). Its main method renders a Jinja template
+    # with all fields into a workflow file.
     os: str
     build_configs: list[dict[str, str]]
     package_type: str
@@ -70,6 +93,10 @@ class BinaryBuildWorkflow:
     owners: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Dataclass hook. If build_environment is empty, sets it to the
+        # non-empty parts of OS, the word binary, package type and variant joined by dashes. If
+        # no owners were given, sets the releng owner plus a macOS or Windows owner by OS, and
+        # rocm or xpu owners when those arch types appear in the build configs.
         if self.build_environment == "":
             self.build_environment = "-".join(
                 item
@@ -91,6 +118,13 @@ class BinaryBuildWorkflow:
                 self.owners.append("module: xpu")
 
     def generate_workflow_file(self, workflow_template: jinja2.Template) -> None:
+        # [FUNCTION DOC] Renders the template with all dataclass fields as variables and writes
+        # workflows/generated-<build environment>-<branches>.yml, preceded by an owner header
+        # line and a do-not-edit marker line, ensuring a trailing newline. Prints the output
+        # path. On render failure prints the template to standard error and re-raises. Overwrites
+        # an existing file.
+        # KNOWN ISSUE: the file is opened before rendering, so a render failure leaves a file
+        # with only the header; empty rendered content would raise an index error.
         output_file_path = (
             GITHUB_DIR
             / f"workflows/generated-{self.build_environment}-{self.branches}.yml"
@@ -115,6 +149,9 @@ class BinaryBuildWorkflow:
 
 
 class OperatingSystem:
+    # [CLASS DOC] Namespace of string constants naming the supported operating system and
+    # architecture keys (linux, windows, windows-arm64, macos, macos-arm64, linux-aarch64,
+    # linux-s390x). Not instantiated.
     LINUX = "linux"
     WINDOWS = "windows"
     WINDOWS_ARM64 = "windows-arm64"
@@ -253,6 +290,11 @@ S390X_BINARY_BUILD_WORKFLOWS = [
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point. Creates a Jinja environment with a custom variable start
+    # marker and strict undefined handling over the templates directory, pairs each platform
+    # workflow list with its template, deletes every existing generated workflow file (errors
+    # are printed and ignored), then renders each workflow. Side effects: deletes and writes
+    # files under .github/workflows.
     jinja_env = jinja2.Environment(
         variable_start_string="!{{",
         loader=jinja2.FileSystemLoader(str(GITHUB_DIR.joinpath("templates"))),

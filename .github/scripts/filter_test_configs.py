@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
 # ruff: noqa: LOG015
+# [MODULE DOC] CI step script that narrows a workflow's test matrix and emits GitHub Actions
+# outputs. It filters configs by test-config PR labels, manually selected configs and the
+# periodic schedule, removes configs listed in the published disabled-jobs JSON, marks ones in
+# the unstable-jobs JSON, derives flags (keep-going, verbose logs, is-unstable, re-enabled
+# issues and so on) from labels and the PR body, and refuses CI for PRs high in a ghstack.
+# Import-time side effect: configures logging at info level. Needs GITHUB_TOKEN to read PR
+# data. Results are written to the file named by GITHUB_OUTPUT (or workflow command output).
 from __future__ import annotations
 
 import json
@@ -53,11 +60,16 @@ EXCLUDED_BRANCHES = ["nightly"]
 
 
 class IssueType(Enum):
+    # [CLASS DOC] Kind of job-status issue: disabled (job or config is removed from the matrix)
+    # or unstable (job or config is kept but flagged). The values are also used as matrix keys.
     DISABLED = "disabled"
     UNSTABLE = "unstable"
 
 
 def parse_args() -> Any:
+    # [FUNCTION DOC] HELPER: Defines and parses the command line: required test matrix string,
+    # optional comma-separated selected configs, workflow name, job name, PR number, tag, event
+    # name, cron schedule and branch (default main). Returns the namespace.
     from argparse import ArgumentParser
 
     parser = ArgumentParser(
@@ -103,6 +115,10 @@ def parse_args() -> Any:
 
 @cache
 def get_pr_info(pr_number: int) -> dict[str, Any]:
+    # [FUNCTION DOC] Fetches the GitHub issue record of the PR (labels, body, ...) from the repo
+    # named by GITHUB_REPOSITORY (default pytorch/pytorch) using the GITHUB_TOKEN variable
+    # (a missing token raises a key error). Returns the JSON mapping, or an empty mapping with
+    # a warning if the download failed. Results are cached per PR number for the process.
     """
     Dynamically get PR information
     """
@@ -128,6 +144,8 @@ def get_pr_info(pr_number: int) -> dict[str, Any]:
 
 
 def get_labels(pr_number: int) -> set[str]:
+    # [FUNCTION DOC] Returns the set of non-empty label names currently on the PR, taken from
+    # the cached PR info. Returns an empty set if the info could not be fetched.
     """
     Dynamically get the latest list of labels from the pull request
     """
@@ -138,6 +156,8 @@ def get_labels(pr_number: int) -> set[str]:
 
 
 def filter_labels(labels: set[str], label_regex: Any) -> set[str]:
+    # [FUNCTION DOC] HELPER: Returns the subset of labels whose names match the given pattern
+    # at the start of the string.
     """
     Return the list of matching labels
     """
@@ -145,6 +165,10 @@ def filter_labels(labels: set[str], label_regex: Any) -> set[str]:
 
 
 def filter(test_matrix: dict[str, list[Any]], labels: set[str]) -> dict[str, list[Any]]:
+    # [FUNCTION DOC] Selects test configs by PR labels. Keeps entries of the include list whose
+    # config name has a matching label with the test-config prefix. If nothing was selected and
+    # the PR has no test-config label at all, returns the original matrix unchanged; otherwise
+    # returns a new matrix with only the selected entries (possibly empty). Logs the decision.
     """
     Select the list of test config to run from the test matrix. The logic works
     as follows:
@@ -186,6 +210,11 @@ def filter(test_matrix: dict[str, list[Any]], labels: set[str]) -> dict[str, lis
 def filter_selected_test_configs(
     test_matrix: dict[str, list[Any]], selected_test_configs: set[str]
 ) -> dict[str, list[Any]]:
+    # [FUNCTION DOC] For manual dispatch: if selected_test_configs is empty returns the matrix
+    # unchanged, otherwise returns a new matrix keeping only entries whose config name is in the
+    # set (entries without a config name are dropped).
+    # KNOWN ISSUE: main lowercases the selected names but config names are compared as is, so
+    # configs with upper-case letters can never be selected.
     """
     Keep only the selected configs if the list if not empty. Otherwise, keep all test configs.
     This filter is used when the workflow is dispatched manually.
@@ -208,6 +237,10 @@ def filter_selected_test_configs(
 def set_periodic_modes(
     test_matrix: dict[str, list[Any]], job_name: str | None
 ) -> dict[str, list[Any]]:
+    # [FUNCTION DOC] Builds a new matrix for scheduled runs: for each entry and each supported
+    # periodic mode whose condition accepts the job name and entry, appends a copy of the entry
+    # with the mode name set as a key whose value is the mode name. Entries matching no mode are
+    # dropped, so the result may be empty.
     """
     Apply all periodic modes when running under a schedule
     """
@@ -230,6 +263,8 @@ def set_periodic_modes(
 def mark_unstable_jobs(
     workflow: str, job_name: str, test_matrix: dict[str, list[Any]]
 ) -> dict[str, list[Any]]:
+    # [FUNCTION DOC] Applies the published unstable-jobs list to the matrix: matching entries
+    # get an unstable marker key. Thin wrapper over the shared job processing routine.
     """
     Check the list of unstable jobs and mark them accordingly. Note that if a job
     is unstable, all its dependents will also be marked accordingly
@@ -246,6 +281,9 @@ def mark_unstable_jobs(
 def remove_disabled_jobs(
     workflow: str, job_name: str, test_matrix: dict[str, list[Any]]
 ) -> dict[str, list[Any]]:
+    # [FUNCTION DOC] Applies the published disabled-jobs list to the matrix: matching entries
+    # (or the whole matrix, for a disabled job or platform) are removed. Thin wrapper over the
+    # shared job processing routine.
     """
     Check the list of disabled jobs, remove the current job and all its dependents
     if it exists in the list
@@ -264,6 +302,11 @@ def _filter_jobs(
     issue_type: IssueType,
     target_cfg: str | None = None,
 ) -> dict[str, list[Any]]:
+    # [FUNCTION DOC] HELPER: Applies one disabled or unstable record to the matrix. Disabled:
+    # returns a new matrix without entries whose config equals target_cfg, or an empty matrix if
+    # there is no target config. Unstable: returns copies of all entries, with the unstable
+    # marker set on the targeted config or on every entry if no target config. Any other issue
+    # type returns the input matrix unchanged.
     """
     An utility function used to actually apply the job filter
     """
@@ -305,6 +348,14 @@ def process_jobs(
     issue_type: IssueType,
     url: str,
 ) -> dict[str, list[Any]]:
+    # [FUNCTION DOC] Downloads the record list at url (mapping of job name to a six-field
+    # record: author, issue number, issue url, workflow, platform, job and config) and applies
+    # the records that match the current workflow and platform (build and test suffixes on the
+    # platform are ignored). A record with no job, a build job, or a test or build-and-test job
+    # applies to the whole matrix and returns immediately. A record naming a test job with a
+    # config applies to just that config and processing continues. Invalid names produce a
+    # warning. If job_name cannot be split into platform and job, warns and returns the matrix
+    # unchanged. Returns the possibly updated matrix. Network access via the download helper.
     """
     Both disabled and unstable jobs are in the following format:
 
@@ -441,6 +492,9 @@ def process_jobs(
 
 
 def download_json(url: str, headers: dict[str, str], num_retries: int = 3) -> Any:
+    # [FUNCTION DOC] Fetches url with the given headers (5 second timeout) and returns the
+    # parsed JSON. Retries up to num_retries times, warning on each failure; after all attempts
+    # fail returns an empty mapping instead of raising.
     for _ in range(num_retries):
         try:
             req = Request(url=url, headers=headers)
@@ -454,6 +508,9 @@ def download_json(url: str, headers: dict[str, str], num_retries: int = 3) -> An
 
 
 def set_output(name: str, val: Any) -> None:
+    # [FUNCTION DOC] Prints the output assignment and publishes it to GitHub Actions: appends a
+    # name=value line to the file named by GITHUB_OUTPUT when set, otherwise prints the legacy
+    # set-output workflow command. Side effect: file append or stdout.
     print(f"Setting output {name}={val}")
     if os.getenv("GITHUB_OUTPUT"):
         with open(str(os.getenv("GITHUB_OUTPUT")), "a") as env:
@@ -463,6 +520,10 @@ def set_output(name: str, val: Any) -> None:
 
 
 def parse_reenabled_issues(s: str | None) -> list[str]:
+    # [FUNCTION DOC] Finds issue numbers referenced by closing keywords (close, resolve, fix
+    # and their variants, case-insensitive, followed by a hash or an issue URL of the pytorch
+    # repo) in s and returns the numbers as strings in order. Returns an empty list for empty
+    # or missing input.
     # NB: When the PR body is empty, GitHub API returns a None value, which is
     # passed into this function
     if not s:
@@ -478,6 +539,10 @@ def parse_reenabled_issues(s: str | None) -> list[str]:
 
 
 def get_reenabled_issues(pr_body: str = "") -> list[str]:
+    # [FUNCTION DOC] Returns issue numbers closed by this change, from the PR body plus the
+    # messages of local commits not on the origin default branch (default branch from
+    # GIT_DEFAULT_BRANCH, else main), listed with a git command. A git failure only warns and
+    # contributes nothing.
     default_branch = f"origin/{os.environ.get('GIT_DEFAULT_BRANCH', 'main')}"
     try:
         commit_messages = subprocess.check_output(
@@ -490,6 +555,8 @@ def get_reenabled_issues(pr_body: str = "") -> list[str]:
 
 
 def check_for_setting(labels: set[str], body: str, setting: str) -> bool:
+    # [FUNCTION DOC] HELPER: True if setting is a PR label or appears in square brackets in the
+    # PR body.
     return setting in labels or f"[{setting}]" in body
 
 
@@ -506,6 +573,9 @@ GHSTACK_CURRENT_MARKER = "__->__"
 
 
 def get_ghstack_below_count(pr_body: str) -> int:
+    # [FUNCTION DOC] Counts how many stack entries follow the current-PR marker in a ghstack PR
+    # body, i.e. the PRs this one sits on top of. Returns 0 for an empty body, a body without
+    # the marker, or a marker not on a recognized stack-entry line.
     """
     Return the number of PRs the current PR sits on top of in its ghstack.
 
@@ -531,6 +601,11 @@ def perform_misc_tasks(
     branch: str | None = None,
     tag: str | None = None,
 ) -> None:
+    # [FUNCTION DOC] Emits the auxiliary workflow outputs: keep-going (true on the main branch,
+    # trunk or ciflow commit tags, or via label or body setting), verbose test logs, showlocals,
+    # no test timeout, no test selection, distributed target determination, is-unstable (job
+    # name contains unstable, or every matrix entry is marked unstable) and the comma-separated
+    # re-enabled issue numbers. Side effect: writes outputs; may run a git command.
     """
     In addition to apply the filter logic, the script also does the following
     misc tasks to set keep-going and is-unstable variables
@@ -581,6 +656,14 @@ def perform_misc_tasks(
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point. Loads the test matrix from the argument (an invalid or empty
+    # one sets the empty-matrix output and exits with status 0). Determines the PR from the PR
+    # number or from a ciflow tag, fetches labels and applies label filtering, then manual
+    # config selection, the periodic mode for the dedicated daily schedule, and disabled and
+    # unstable job processing (skipped for excluded branches or missing workflow or job name).
+    # Exits with status 1 if a PR without the trunk label sits on a ghstack of at least the
+    # threshold size. Finally emits misc outputs, the filtered matrix as JSON, an empty-matrix
+    # flag and the PR labels as JSON.
     args = parse_args()
     # Load the original test matrix set by the workflow. Its format, however,
     # doesn't follow the strict JSON format, so we load it using yaml here for

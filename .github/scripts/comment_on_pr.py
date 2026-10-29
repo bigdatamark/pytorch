@@ -1,3 +1,7 @@
+# [MODULE DOC] Script that posts a comment on a pull request saying that a merge-related job
+# (named by the action argument) was canceled or timed out, with a link to the CI run taken from
+# the GH_RUN_URL environment variable and to the pytorch-bot wiki. Uses the local git repo to
+# find the GitHub owner and project. Only acts when run as a script.
 import os
 from typing import Any
 
@@ -7,6 +11,8 @@ from trymerge_explainer import BOT_COMMANDS_WIKI
 
 
 def parse_args() -> Any:
+    # [FUNCTION DOC] HELPER: Parses two positional arguments, the integer PR number and the
+    # action name string, and returns the namespace.
     from argparse import ArgumentParser
 
     parser = ArgumentParser("Comment on a PR")
@@ -16,6 +22,9 @@ def parse_args() -> Any:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Builds the cancel/timeout message (job link only if GH_RUN_URL is set),
+    # posts it as a comment on the given PR in the owner and project of the local git remote,
+    # and prints the owner, project, PR number and message. Side effect: GitHub API call.
     args = parse_args()
     repo = GitRepo(get_git_repo_dir(), get_git_remote_name(), debug=True)
     org, project = repo.gh_owner_and_name()

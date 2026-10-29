@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Command line helper that prints one CI constant from generate_binary_build_matrix:
+# the stable CUDA version or the minimum supported python version. No import-time side effects.
 """Helper script - Return CI variables such as stable cuda, min python version, etc."""
 
 import argparse
@@ -6,6 +8,10 @@ import sys
 
 
 def main(args: list[str]) -> None:
+    # [FUNCTION DOC] Parses the argument list for the stable-CUDA or min-python flag and prints
+    # the stable CUDA version or the first (oldest) python version of the full list. If both
+    # flags are given only the CUDA one is printed; with neither, prints nothing. Imports the
+    # matrix module lazily.
     import generate_binary_build_matrix
 
     parser = argparse.ArgumentParser()

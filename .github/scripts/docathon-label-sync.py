@@ -1,3 +1,7 @@
+# [MODULE DOC] Script that copies labels from the issue a pull request mentions onto that PR,
+# but only when the issue carries the docathon label. Takes the PR number as the first command
+# line argument and uses GITHUB_TOKEN for authentication via PyGithub. No import-time work
+# besides imports; main runs when executed as a script.
 import os
 import re
 import sys
@@ -6,6 +10,12 @@ from github import Github
 
 
 def main() -> None:
+    # [FUNCTION DOC] Reads the PR number from the command line, fetches the PR body and finds
+    # the first issue reference in it (a hash followed by 1 to 6 digits). Returns silently if
+    # the body is empty, has no reference, or the issue lacks the docathon label. Otherwise
+    # adds to the PR every issue label not already on it, except the actionable label, and
+    # prints a status line. Side effect: modifies PR labels on GitHub.
+    # KNOWN ISSUE: the docathon label name is hardcoded to a specific year and must be updated.
     token = os.environ.get("GITHUB_TOKEN")
 
     repo_owner = "pytorch"
