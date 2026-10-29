@@ -1,5 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Multi-process (4 rank, needs 4 GPUs) benchmark-style test measuring DTensor op
+# dispatch overhead. Defines TimeCaptureMode, a TorchDispatchMode that times repeated op calls,
+# and DistOpDispatchOverHead, which logs sharding-propagation cache miss and hit times for a
+# DTensor add. Import-time side effect: configures logging at INFO level.
 
 import functools
 import logging
@@ -24,7 +28,13 @@ logging.basicConfig(level=logging.INFO)
 
 
 class TimeCaptureMode(TorchDispatchMode):
+    # [CLASS DOC] Dispatch mode that, for each intercepted op, runs it repeat_count times, timing
+    # each call, and records per op name a Timing tuple of (first call time, median time) in
+    # microseconds in op_to_time; time_list holds the raw per-call times of the latest op. The
+    # first call approximates cache miss dispatch and the median approximates cache hit.
     def __init__(self, repeat_count=10):
+        # [FUNCTION DOC] Stores repeat_count and initializes empty time_list and op_to_time
+        # state.
         # repeat each op call `repeat_count` times
         self.repeat_count = repeat_count
         # recorded time is scaled to micro seconds
@@ -32,10 +42,16 @@ class TimeCaptureMode(TorchDispatchMode):
         self.op_to_time = {}
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        # [FUNCTION DOC] Clears time_list, runs the op repeat_count times (nested wrapper below)
+        # with timing, appends a Timing(first, median) pair in microseconds under the op name in
+        # op_to_time and returns the result of the last call. Note the op is executed repeatedly,
+        # so side effects of the op repeat.
         self.time_list.clear()
 
         @functools.wraps(func)
         def repeated_func(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Calls the op repeat_count times, appends each elapsed
+            # perf_counter time in seconds to time_list, and returns the last result.
             result = None
             for _ in range(self.repeat_count):
                 start_time = time.perf_counter()
@@ -62,13 +78,22 @@ class TimeCaptureMode(TorchDispatchMode):
 
 
 class DistOpDispatchOverHead(DTensorTestBase):
+    # [CLASS DOC] Test case with world size 4 for measuring DTensor dispatch time of an add op.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] Returns the world size, 4.
         return 4
 
     @skip_if_lt_x_gpu(4)
     @with_comms
     def test_dtensor_add_op_dispatch_overhead(self):
+        # [FUNCTION DOC] Requires 4 GPUs and CUDA (skips otherwise). Distributes a random 512x512
+        # tensor Shard(0) over a CUDA mesh, runs the add under TimeCaptureMode after clearing the
+        # sharding propagation cache to measure cache-miss and cache-hit times, gathers them from
+        # all ranks, logs them on rank 0 and computes medians. The threshold assertions are
+        # commented out (flaky), so the test never fails on timing.
+        # KNOWN ISSUE: expected-time and threshold variables are unused (suppressed with noqa)
+        # because the assertions are disabled.
         if torch.cuda.is_available():
             device_props = torch.cuda.get_device_name(0)
             gpu_name = device_props
