@@ -6,6 +6,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+# [MODULE DOC] Test suite for AOT Autograd / aot_function / aot_module / aot_export APIs in
+# functorch. Covers make_fx tracing, mutation and aliasing handling, input/output metadata,
+# tensor subclasses, dynamic shapes, partitioners, autograd cache, saved-tensor hooks, and
+# OpInfo/ModuleInfo based sweeps. Import time: tries to import torchvision and networkx,
+# emitting a warning and setting a USE_* flag when missing; the module bottom runs the tests
+# through run_tests.
 import copy
 import gc
 import itertools
@@ -145,6 +151,10 @@ def amax_to_scale(
     float8_dtype: torch.dtype,
     round_scales_to_power_of_2: bool = False,
 ):
+    # [FUNCTION DOC] HELPER: Compute a float8 scaling factor from an absolute-max tensor.
+    # Converts amax to float64, clamps it to at least a tiny epsilon, divides the largest
+    # representable value of the given float8 dtype by it, and returns the result as float32.
+    # The round_scales_to_power_of_2 argument is accepted but ignored.
     amax = amax.to(torch.float64)
     res = torch.finfo(float8_dtype).max / torch.clamp(amax, min=1e-12)
     res = res.to(torch.float32)
@@ -154,6 +164,10 @@ def amax_to_scale(
 # Must be at module level to use fx.wrap
 @torch.fx.wrap
 def _pack_fp8_with_scale_wrap(x):
+    # [FUNCTION DOC] HELPER: fx-wrapped (opaque to tracing) packing hook for saved-tensor tests.
+    # Non floating point inputs are returned unchanged; otherwise computes a scale from the
+    # tensor's max absolute value, scales it in float32, casts to float8_e5m2 and returns a
+    # tuple of original dtype, scale and the float8 tensor.
     if not x.dtype.is_floating_point:
         return x
 
@@ -166,6 +180,9 @@ def _pack_fp8_with_scale_wrap(x):
 
 @torch.fx.wrap
 def _unpack_fp8_with_scale_wrap(x):
+    # [FUNCTION DOC] HELPER: fx-wrapped inverse of the scale-based packing hook. A plain tensor
+    # is returned unchanged; otherwise the packed tuple is unpacked, the float8 data is cast to
+    # float32, divided by the scale and cast back to the original dtype.
     if isinstance(x, torch.Tensor):
         return x
 
@@ -176,6 +193,11 @@ def _unpack_fp8_with_scale_wrap(x):
 
 @torch.fx.wrap
 def _pack_fp8_wrap(x):
+    # [FUNCTION DOC] HELPER: fx-wrapped packing hook that casts floating point tensors to
+    # float8_e5m2 and returns a tuple of original dtype and the cast tensor; other tensors
+    # pass through. When the input is a tensor subclass (compilation time) it raises
+    # AssertionError unless the saved-tensor hook context holds non-None forward graph,
+    # backward graph and node.
     if not x.dtype.is_floating_point:
         return x
 
@@ -195,6 +217,10 @@ def _pack_fp8_wrap(x):
 
 @torch.fx.wrap
 def _unpack_fp8_wrap(x):
+    # [FUNCTION DOC] HELPER: fx-wrapped inverse of the float8 packing hook. A plain tensor is
+    # returned unchanged; otherwise unpacks dtype and tensor and, if the stored tensor is a
+    # subclass, raises AssertionError unless the saved-tensor hook context has forward graph,
+    # backward graph and node set. Returns the tensor cast back to its dtype.
     if isinstance(x, torch.Tensor):
         return x
 
@@ -213,23 +239,37 @@ def _unpack_fp8_wrap(x):
 
 
 def pack_fp8(x):
+    # [FUNCTION DOC] HELPER: Pack hook entry point that delegates to the fx-wrapped float8
+    # packing function.
     return _pack_fp8_wrap(x)
 
 
 def unpack_fp8(packed):
+    # [FUNCTION DOC] HELPER: Unpack hook entry point that delegates to the fx-wrapped float8
+    # unpacking function.
     return _unpack_fp8_wrap(packed)
 
 
 def pack_fp8_with_scale(x):
+    # [FUNCTION DOC] HELPER: Pack hook entry point that delegates to the fx-wrapped scale-based
+    # float8 packing function.
     return _pack_fp8_with_scale_wrap(x)
 
 
 def unpack_fp8_with_scale(packed):
+    # [FUNCTION DOC] HELPER: Unpack hook entry point that delegates to the fx-wrapped
+    # scale-based float8 unpacking function.
     return _unpack_fp8_with_scale_wrap(packed)
 
 
 class AOTTestCase(TestCase):
+    # [CLASS DOC] Base TestCase for the AOT tests in this file; adds a metadata
+    # comparison assertion.
     def assertTensorMetadataEqual(self, actual, expected):
+        # [FUNCTION DOC] HELPER: Assert that two tensors have equal shape, strides and storage
+        # offset. If the expected tensor is a traceable wrapper subclass, also require the
+        # actual one to be one, require equal flattened attribute names, and recursively compare
+        # the metadata of each inner tensor attribute. Raises assertion failures on mismatch.
         self.assertEqual(tuple(actual.shape), tuple(expected.shape))
         self.assertEqual(actual.stride(), expected.stride())
         self.assertEqual(actual.storage_offset(), expected.storage_offset())
@@ -247,8 +287,13 @@ class AOTTestCase(TestCase):
 
 
 class TestPythonKey(AOTTestCase):
+    # [CLASS DOC] Tests that make_fx and nnc_jit (functorch python-key tracing) produce
+    # callables matching eager results, parameterized per device by instantiation.
     def test_make_fx(self, device):
+        # [FUNCTION DOC] Trace a sine function with make_fx and check the traced module matches
+        # eager on a fresh input.
         def f(x):
+            # [FUNCTION DOC] HELPER: Elementwise sine, the function being traced.
             return torch.sin(x)
 
         inp = torch.randn(3)
@@ -258,7 +303,10 @@ class TestPythonKey(AOTTestCase):
         self.assertEqual(fx_f(new_inp), f(new_inp))
 
     def test_make_fx_grad(self, device):
+        # [FUNCTION DOC] Trace the gradient of a sum-of-sine function with make_fx and check the
+        # traced result equals the grad function on new input.
         def f(x):
+            # [FUNCTION DOC] HELPER: Sum of sines, differentiated by the test.
             return torch.sin(x).sum()
 
         inp = torch.randn(3)
@@ -269,7 +317,10 @@ class TestPythonKey(AOTTestCase):
         self.assertEqual(fx_f(new_inp), f(new_inp))
 
     def test_scalar_device(self, device):
+        # [FUNCTION DOC] Trace an addition of a device tensor and a CPU scalar tensor with
+        # make_fx and check the traced module reproduces eager output.
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Add two inputs.
             return a + b
 
         inps = [torch.randn(3, device=device), torch.tensor(5)]
@@ -277,7 +328,10 @@ class TestPythonKey(AOTTestCase):
         self.assertEqual(fx_f(*inps), f(*inps))
 
     def test_make_fx_vmap(self, device):
+        # [FUNCTION DOC] Trace a vmapped sine function with make_fx and compare with the vmapped
+        # function on a new batch.
         def f(x):
+            # [FUNCTION DOC] HELPER: Elementwise sine mapped over a batch.
             return torch.sin(x)
 
         inp = torch.randn(5, 3)
@@ -287,7 +341,10 @@ class TestPythonKey(AOTTestCase):
         self.assertEqual(fx_f(new_inp), f(new_inp))
 
     def test_make_fx_jacrev(self, device):
+        # [FUNCTION DOC] Trace a double jacrev of a sin-sum function with make_fx and compare
+        # against the eager transform on new input.
         def f(x):
+            # [FUNCTION DOC] HELPER: Sum of sines whose second derivative is traced.
             return x.sin().sum()
 
         inp = torch.randn(3)
@@ -297,7 +354,10 @@ class TestPythonKey(AOTTestCase):
         self.assertEqual(fx_f(new_inp), f(new_inp))
 
     def test_make_fx_vjp(self, device):
+        # [FUNCTION DOC] Trace the vjp function returned by vjp of a sin-sum function with
+        # make_fx and compare outputs on a new cotangent.
         def f(x):
+            # [FUNCTION DOC] HELPER: Sum of sines used to build the vjp.
             return torch.sin(x).sum()
 
         primals = torch.randn(3)
@@ -308,9 +368,13 @@ class TestPythonKey(AOTTestCase):
         self.assertEqual(fx_f(new_cotangent, True, True), vjp_fn(new_cotangent))
 
     def test_make_fx_functionalize(self, device):
+        # [FUNCTION DOC] Check make_fx over a functionalized symbolic trace: the symbolic graph
+        # contains the in-place relu method, and after make_fx of the functionalized module the
+        # graph contains the aten relu op. Regression test for issue 84570.
         from functorch.experimental import functionalize
 
         def fn(a):
+            # [FUNCTION DOC] HELPER: Multiply by two then apply in-place relu.
             a = a * 2
             a.relu_()
             return a
@@ -329,10 +393,14 @@ class TestPythonKey(AOTTestCase):
         self.assertTrue(includes_aten_relu)
 
     def test_make_fx_no_decompose(self, device):
+        # [FUNCTION DOC] Skipped immediately (returns through skipTest citing a recursion
+        # error); the code after the skip is unreachable and would check that tanh_backward
+        # appears only without a decomposition table.
         # FIXME
         return self.skipTest("error: maximum recursion reached")
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Sum of tanh, unreachable body helper.
             return torch.tanh(x).sum()
 
         fx_f = make_fx(grad(f))(torch.randn(5))
@@ -345,7 +413,9 @@ class TestPythonKey(AOTTestCase):
         self.assertEqual(torch.ops.aten.tanh_backward in ops, False)
 
     def test_nnc_jit(self, device):
+        # [FUNCTION DOC] Check nnc_jit of a sine function matches eager on a vector input.
         def f(x):
+            # [FUNCTION DOC] HELPER: Elementwise sine.
             return torch.sin(x)
 
         jit_f = nnc_jit(f)
@@ -354,7 +424,9 @@ class TestPythonKey(AOTTestCase):
         self.assertEqual(jit_f(inp), f(inp))
 
     def test_nnc_scalar(self, device):
+        # [FUNCTION DOC] Check nnc_jit works on a zero-dimensional tensor input.
         def f(x):
+            # [FUNCTION DOC] HELPER: Elementwise sine.
             return torch.sin(x)
 
         jit_f = nnc_jit(f)
@@ -363,7 +435,9 @@ class TestPythonKey(AOTTestCase):
         self.assertEqual(jit_f(inp), f(inp))
 
     def test_nnc_pytrees(self, device):
+        # [FUNCTION DOC] Check nnc_jit handles a list of tensors as input and output.
         def f(x):
+            # [FUNCTION DOC] HELPER: Return a list holding the sine of the first element.
             return [torch.sin(x[0])]
 
         jit_f = nnc_jit(f)
@@ -372,7 +446,9 @@ class TestPythonKey(AOTTestCase):
         self.assertEqual(jit_f(inp), f(inp))
 
     def test_external_calls(self, device):
+        # [FUNCTION DOC] Check nnc_jit of a matrix-vector product (external call) matches eager.
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Matrix-vector product.
             return torch.mv(a, b)
 
         jit_f = nnc_jit(f)
@@ -380,7 +456,10 @@ class TestPythonKey(AOTTestCase):
         self.assertEqual(jit_f(*inp), f(*inp))
 
     def test_nnc_passthrough(self, device):
+        # [FUNCTION DOC] Check nnc_jit with outputs that pass through an input unchanged, and
+        # with a dict input that is mutated in place and returned; results must match eager.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Return the sum and the second input unchanged.
             return x + y, y
 
         inp = (torch.randn(3), torch.randn(3))
@@ -388,6 +467,8 @@ class TestPythonKey(AOTTestCase):
         self.assertEqual(jit_f(*inp), f(*inp))
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Double the entry with key a in the dict and return the dict
+            # (mutates the input).
             x["a"] = x["a"] * 2
             return x
 
@@ -397,9 +478,14 @@ class TestPythonKey(AOTTestCase):
 
     @unittest.skipIf(not USE_TORCHVISION, "test requires torchvision")
     def test_resnet18_backward_trace(self, device):
+        # [FUNCTION DOC] Skipped without torchvision. Despite the name no tracing happens: it
+        # runs a resnet18 backward inside a helper function and checks the parameter gradients
+        # equal those from a second plain backward on the same input.
         mod = torchvision.models.resnet18()
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Run the model, backpropagate the summed output and return
+            # all parameter gradients.
             out = mod(x)
             out.sum().backward()
             return [a.grad for a in mod.parameters()]
@@ -414,10 +500,14 @@ class TestPythonKey(AOTTestCase):
 
 
 def get_base(t):
+    # [FUNCTION DOC] HELPER: Return the base tensor of a view, or the tensor itself when it is
+    # not a view.
     return t._base if t._is_view() else t
 
 
 def is_in_base(t, maybe_tensors):
+    # [FUNCTION DOC] HELPER: Return True if the base of the first tensor is the base of any
+    # tensor in the given sequence (non-tensors ignored), otherwise False.
     t_base = get_base(t)
     for maybe_tensor in maybe_tensors:
         if isinstance(maybe_tensor, torch.Tensor):
@@ -427,13 +517,19 @@ def is_in_base(t, maybe_tensors):
 
 
 def skipIfDynamoInput(reason):
+    # [FUNCTION DOC] HELPER: Decorator factory for tests: when the test instance is a
+    # TestAOTAutogradWithDynamo, the wrapped test is skipped with a message including the
+    # reason; otherwise the test runs normally.
     """
     Skip TestAOTAutograd if running with dynamo input
     """
 
     def decorator(func):
+        # [FUNCTION DOC] HELPER: Wrap a test function with the dynamo-skipping wrapper.
         @wraps(func)
         def wrapper(self, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Skip the test with the stated reason under the dynamo
+            # variant, otherwise call the wrapped test (its return value is discarded).
             if isinstance(self, TestAOTAutogradWithDynamo):
                 self.skipTest(
                     f"Skipping {self._testMethodName} in TestAOTAutogradWithDynamo because {reason}"
@@ -447,6 +543,9 @@ def skipIfDynamoInput(reason):
 
 
 class TestAOTAutograd(AOTTestCase):
+    # [CLASS DOC] Main AOT autograd test class. Provides the verify_aot_autograd harness that
+    # compares eager and aot_function/aot_module results and gradients, then many tests of
+    # mutation, aliasing, views, subclasses and graph structure, some with expected graph text.
     def run_autograd(
         self,
         f: Callable,
@@ -455,6 +554,10 @@ class TestAOTAutograd(AOTTestCase):
         keep_input_mutations: bool,
         dynamic: bool,
     ):
+        # [FUNCTION DOC] HELPER: Compile f with aot_function (or aot_module when f is an
+        # nn.Module) using a forward compiler that stores the traced graph in the given
+        # one-element list, a no-op backward compiler, the given decompositions, input mutation
+        # retention flag and dynamic flag. Returns the compiled callable.
         """
         Runs aot_autograd with the specified settings on f.
         """
@@ -499,7 +602,19 @@ class TestAOTAutograd(AOTTestCase):
         # TODO: probably consolidate all tests to make inp a Callable.
         make_inputs_subclasses: bool = False,
     ):
+        # [FUNCTION DOC] HELPER: Core harness. For each setting of keep_input_mutations (only
+        # True when keep_inp_mutations is set, else both) it builds reference and test inputs
+        # (cloning, preserving duplicate inputs, making them non-leaves when test_mutation),
+        # compiles f, runs outputs and grads for both and checks equal values, grads,
+        # requires_grad, leaf-ness, view-of-input relationships, and optionally that outputs can
+        # be mutated. In the cache subclass it also reruns the compiled function. Returns the
+        # captured forward graph.
         def make_inputs(inp_):
+            # [FUNCTION DOC] HELPER: Build inputs for a run. If the argument is callable, call
+            # it for a pair of function inputs and graph inputs (under TwoTensorMode when
+            # subclass inputs requested). Otherwise clone tensors (detached, same requires_grad,
+            # reusing clones for duplicates) and, when test_mutation, make graph inputs by
+            # adding one so they are non-leaves. Returns the pair.
             # Some tests pass in a callable for inp, to generate the inputs
             # (useful if we want to generate complicated aliasing inputs)
             if isinstance(inp_, Callable):
@@ -544,6 +659,11 @@ class TestAOTAutograd(AOTTestCase):
             ref_inp,
             test_inp,
         ):
+            # [FUNCTION DOC] HELPER: Compare reference and compiled results: grads equal; for
+            # each output tensor compare requires_grad, leaf-ness, whether it aliases a graph
+            # input or another output, and values; when test_mutation also add and subtract 2 in
+            # place on both to verify autograd metadata. Finally compare requires_grad and
+            # values of all inputs.
             ref_out, ref_grad = ref_results
             test_out, test_grad = test_results
             self.assertEqual(ref_grad, test_grad)
@@ -610,8 +730,11 @@ class TestAOTAutograd(AOTTestCase):
         return fw_graph_cell[0]
 
     def test_non_tensor_and_none_inputs(self):
+        # [FUNCTION DOC] Check aot_autograd with non tensor and None inputs, with and
+        # without requires_grad.
         # int, None, Tensor
         def f(a, b, c):
+            # [FUNCTION DOC] HELPER: Return first times third argument.
             return a * c
 
         inp = [2, None, torch.ones(3, 3, dtype=torch.float32, requires_grad=True)]
@@ -620,7 +743,10 @@ class TestAOTAutograd(AOTTestCase):
         self.verify_aot_autograd(f, inp)
 
     def test_single_output(self):
+        # [FUNCTION DOC] Check a single output function with grad-requiring and
+        # non-requiring inputs.
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Add two inputs.
             return a + b
 
         inp = [torch.randn(3, 3, requires_grad=True), torch.randn(3, 3)]
@@ -629,7 +755,9 @@ class TestAOTAutograd(AOTTestCase):
         self.verify_aot_autograd(f, inp)
 
     def test_multi_output(self):
+        # [FUNCTION DOC] Check a function returning a tuple of two outputs.
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Return the sum and the difference.
             return a + b, a - b
 
         inp = [torch.randn(3, 3, requires_grad=True), torch.randn(3, 3)]
@@ -638,7 +766,9 @@ class TestAOTAutograd(AOTTestCase):
         self.verify_aot_autograd(f, inp)
 
     def test_multi_output_list(self):
+        # [FUNCTION DOC] Check a function returning a list of two outputs.
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Return a list with the sum and the difference.
             return [a + b, a - b]
 
         inp = [torch.randn(3, 3, requires_grad=True), torch.randn(3, 3)]
@@ -648,7 +778,11 @@ class TestAOTAutograd(AOTTestCase):
 
     # Test for bug occurring at the intersection of fake tensors & functionalization.
     def test_squeeze_mutation(self):
+        # [FUNCTION DOC] Test for a bug at the intersection of fake tensors and
+        # functionalization: mutating a squeezed clone, with dynamic shapes enabled.
         def f(a):
+            # [FUNCTION DOC] HELPER: Squeeze a clone of the input, add one in place, return
+            # input plus the result.
             b = a.clone().squeeze(-1)
             b.add_(1.0)
             return a + b
@@ -659,7 +793,11 @@ class TestAOTAutograd(AOTTestCase):
         self.verify_aot_autograd(f, inp, dynamic=True)
 
     def test_to_dense_strided_tensor(self):
+        # [FUNCTION DOC] Check to_dense on a strided tensor in several variants (masked_grad,
+        # dtype conversions) with dynamic shapes.
         def f(a):
+            # [FUNCTION DOC] HELPER: Return a tuple of to_dense results with default, masked
+            # grad, float32 and float64 options.
             return (
                 a.to_dense(),
                 a.to_dense(masked_grad=True),
@@ -671,29 +809,40 @@ class TestAOTAutograd(AOTTestCase):
         self.verify_aot_autograd(f, inp, dynamic=True)
 
     def test_complex_linear(self):
+        # [FUNCTION DOC] Regression test for issue 93424: aot_autograd on a complex64 linear
+        # layer module with a sum of absolute values output.
         # https://github.com/pytorch/pytorch/issues/93424
         inp = [torch.randn(1, 10, 10, dtype=torch.complex64)]
 
         class F(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a single complex64 Linear layer.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the module and its complex linear layer.
                 super().__init__()
                 self.linear = nn.Linear(10, 10, dtype=torch.complex64)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply the linear layer, sum and take absolute value.
                 return self.linear(x).sum().abs()
 
         self.verify_aot_autograd(F(), inp)
 
     def test_embedding_bag_view_dynamic(self):
+        # [FUNCTION DOC] Check an EmbeddingBag with sparse gradients and a view on its output,
+        # in static and dynamic modes. Verifies wrapping a storage-less sparse tensor in a
+        # functional wrapper works in backward.
         # Backwards pass tries to wrap a sparse tensor in a FunctionalTensorWrapper;
         # test that this works even though the sparse tensor has no storage.
 
         class F(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module holding a sparse EmbeddingBag.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the module and its embedding bag layer.
                 super().__init__()
                 self.emb = torch.nn.EmbeddingBag(100, 8, sparse=True)
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Embed indices with offsets and flatten the result.
                 return self.emb(x, y).view(-1)
 
         x = torch.arange(3)
@@ -702,7 +851,12 @@ class TestAOTAutograd(AOTTestCase):
         self.verify_aot_autograd(F(), [x, y], dynamic=True)
 
     def test_input_mutation_simple(self):
+        # [FUNCTION DOC] Check a simple input mutation (in-place multiply) with and without
+        # requires_grad, and assert the forward graph text: a clone, a multiply, another
+        # multiply, returning the mutated value plus output.
         def f(a):
+            # [FUNCTION DOC] HELPER: Multiply the input by two in place and return it
+            # times three.
             a.mul_(2)
             return a * 3
 
@@ -726,7 +880,11 @@ def forward(self, primals_1):
         )
 
     def test_input_mutation_set__input_mutation(self):
+        # [FUNCTION DOC] Check an input mutated through set_ under no_grad (with input mutations
+        # kept) for requires_grad and non-requiring inputs.
         def f(a):
+            # [FUNCTION DOC] HELPER: Under no_grad set the input's storage to an arange matrix,
+            # return input times that matrix.
             b = torch.arange(9, dtype=a.dtype).reshape(3, 3)
             with torch.no_grad():
                 a.set_(b)
@@ -738,7 +896,11 @@ def forward(self, primals_1):
         self.verify_aot_autograd(f, inp, test_mutation=True, keep_inp_mutations=True)
 
     def test_set__steals_view_chain(self):
+        # [FUNCTION DOC] Check set_ stealing the view chain of its source: the destination,
+        # after being set to a view slice, is mutated and multiplied, with input mutations kept.
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Set a scaled copy to a view slice of another scaled copy,
+            # mutate it in place, return the product with the slice.
             a_ = a.mul(2)
             b_ = b.mul(2)
             b_slice = b_[1].view(3, 3)
@@ -755,11 +917,17 @@ def forward(self, primals_1):
         self.verify_aot_autograd(f, inp, keep_inp_mutations=True)
 
     def _compile_autocast(self, device, *, forward_autocast):
+        # [FUNCTION DOC] HELPER: Define a custom library op with CompositeExplicitAutograd,
+        # and autocast kernels (CPU and CUDA) that add one, wrap it in an autograd Function
+        # and compile a function applying it with autocast disabled using the aot_eager
+        # backend. Runs with autocast enabled or not, returns the output and the gradient
+        # w.r.t. the input.
         with torch.library._scoped_library("mylib", "FRAGMENT") as m:
             m.define("foo(Tensor x) -> Tensor")
             m.impl("foo", torch.clone, "CompositeExplicitAutograd")
 
             def autocast(x):
+                # [FUNCTION DOC] HELPER: Autocast kernel for the custom op; adds one.
                 return x + 1
 
             m.impl("foo", autocast, "AutocastCPU")
@@ -768,17 +936,23 @@ def forward(self, primals_1):
             foo = torch.ops.mylib.foo.default
 
             class Foo(torch.autograd.Function):
+                # [CLASS DOC] HELPER: Autograd Function around the custom op whose backward
+                # multiplies grad by the op applied to the saved input.
                 @staticmethod
                 def forward(ctx, x):
+                    # [FUNCTION DOC] HELPER: Save the input and call the custom op.
                     ctx.save_for_backward(x)
                     return foo(x)
 
                 @staticmethod
                 def backward(ctx, grad):
+                    # [FUNCTION DOC] HELPER: Return grad times the op applied to the
+                    # saved input.
                     (x,) = ctx.saved_tensors
                     return grad * foo(x)
 
             def fn(x):
+                # [FUNCTION DOC] HELPER: Apply the Function with autocast disabled.
                 with torch.amp.autocast(device, enabled=False):
                     return Foo.apply(x)
 
@@ -797,6 +971,9 @@ def forward(self, primals_1):
 
     @torch._functorch.config.patch(backward_pass_autocast="same_as_forward")
     def test_backward_pass_autocast_on(self):
+        # [FUNCTION DOC] With backward autocast set same as forward, the autocast kernel (adds
+        # one) runs in backward as well: expects output zeros and gradient ones, on CPU and CUDA
+        # if available.
         devices = ["cpu"]
         if torch.cuda.is_available():
             devices.append("cuda")
@@ -807,6 +984,8 @@ def forward(self, primals_1):
 
     @torch._functorch.config.patch(backward_pass_autocast="off")
     def test_backward_pass_autocast_off(self):
+        # [FUNCTION DOC] With backward autocast off, expects output zeros and gradient zeros on
+        # available devices.
         devices = ["cpu"]
         if torch.cuda.is_available():
             devices.append("cuda")
@@ -817,6 +996,8 @@ def forward(self, primals_1):
 
     @torch._functorch.config.patch(backward_pass_autocast="off")
     def test_backward_pass_autocast_custom(self):
+        # [FUNCTION DOC] With a custom backward autocast list and no forward autocast, expects
+        # output zeros and gradient ones on available devices.
         devices = ["cpu"]
         if torch.cuda.is_available():
             devices.append("cuda")
@@ -832,7 +1013,11 @@ def forward(self, primals_1):
         "Test doesn't make sense with dynamo, which changes order of mutations"
     )
     def test_set__and_data_mutation_good(self):
+        # [FUNCTION DOC] Skipped under the dynamo variant. Checks set_ followed by data mutation
+        # of the source (allowed) with input mutations kept, and asserts the forward graph text.
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Under no_grad set a to b then double b in place; return a
+            # plus b.
             # The data mutation happens *after* the set_(). This is ok (see the graph below)
             with torch.no_grad():
                 a.set_(b)
@@ -875,7 +1060,12 @@ def forward(self, primals_1, primals_2):
     # https://github.com/pytorch/pytorch/pull/126113
     @xfailIfTorchDynamo
     def test_set__and_data_mutation_bad(self):
+        # [FUNCTION DOC] Expected-failure under dynamo. Setting an input to a new tensor and
+        # then mutating a view made before the set_ is banned; asserts a RuntimeError about
+        # mutating tensors with frozen storage.
         def f(a):
+            # [FUNCTION DOC] HELPER: Take a view, set the input to a fresh tensor, mutate the
+            # stale view under no_grad, return input plus tensor.
             a_view = a.view(-1)
             tmp = torch.ones(3, 3, requires_grad=True)
             # Now, any mutations on either tmp
@@ -899,7 +1089,11 @@ def forward(self, primals_1, primals_2):
         "Test doesn't make sense with dynamo, which changes order of mutations"
     )
     def test_set__not_allowed(self):
+        # [FUNCTION DOC] Skipped under the dynamo variant. Mutating an input after set_ is not
+        # supported; expects AssertionError mentioning other mutations that cannot be handled.
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Set a to b under no_grad, then multiply a in place, return
+            # a plus b.
             with torch.no_grad():
                 a.set_(b)
             # Mutating a will change a's grad_fn, which requires us to replay the mutation outside of the graph.
@@ -919,7 +1113,11 @@ def forward(self, primals_1, primals_2):
             )
 
     def test_input_mutation_set__nop(self):
+        # [FUNCTION DOC] Check two set_ calls that undo each other result in no input mutation;
+        # asserts the graph has no set_ ops and only one output.
         def f(a):
+            # [FUNCTION DOC] HELPER: Set the input to an arange and back to its alias under
+            # no_grad, return the sum with the reshaped arange.
             b = torch.arange(9, dtype=a.dtype)
             a_old = torch.ops.aten.alias.default(a)
             with torch.no_grad():
@@ -949,8 +1147,11 @@ def forward(self, primals_1):
         )
 
     def test_input_mutation_simple_with_none_and_nontensor(self):
+        # [FUNCTION DOC] Check aot_function with None and non-tensor arguments gives the same
+        # result as eager for inputs with and without requires_grad.
         # Tensor, None, int
         def f(a, b, c):
+            # [FUNCTION DOC] HELPER: Return first times third argument.
             return a * c
 
         f_compiled = aot_function(f, nop)
@@ -962,7 +1163,10 @@ def forward(self, primals_1):
 
     # https://github.com/pytorch/pytorch/issues/93363
     def test_mutates_input_noncontiguous(self):
+        # [FUNCTION DOC] Regression test for issue 93363: mutating a noncontiguous view input
+        # inside the compiled function must update the underlying base tensor like eager.
         def f(a):
+            # [FUNCTION DOC] HELPER: Add one in place to the input and return an empty tuple.
             a.add_(1)
             return ()
 
@@ -978,7 +1182,11 @@ def forward(self, primals_1):
         self.assertEqual(ref, test)
 
     def test_input_mutation_modifies_autograd_meta_of_aliases(self):
+        # [FUNCTION DOC] Check that an input mutation updates autograd metadata of aliases of
+        # the input (version counter and grad_fn class) and gradients match eager.
         def f(a):
+            # [FUNCTION DOC] HELPER: Multiply input by two in place and return detached input
+            # plus one.
             a.mul_(2)
             out = a + 1
             return out.detach()
@@ -1004,8 +1212,12 @@ def forward(self, primals_1):
         self.assertEqual(x_ref_view.grad, x_test_view.grad)
 
     def test_nested_subclasses(self):
+        # [FUNCTION DOC] Compile a sin-cos function with the aot_eager backend on a doubly
+        # nested TwoTensor input; checks the output is nested TwoTensor all the way down and
+        # that backward produces a nested TwoTensor gradient on the input.
         @torch.compile(backend="aot_eager")
         def f(x):
+            # [FUNCTION DOC] HELPER: Sine then cosine, compiled with the aot_eager backend.
             return x.sin().cos()
 
         a = torch.ones(4, requires_grad=True)
@@ -1030,8 +1242,12 @@ def forward(self, primals_1):
         self.assertTrue(isinstance(aaaa.grad.b, TwoTensor))
 
     def test_nested_subclasses_non_nested_grad(self):
+        # [FUNCTION DOC] Backward with a gradient subclass structure that differs from what was
+        # guessed at compile time (a flat TwoTensor input combined in eager with a nested
+        # tensor); expects RuntimeError saying the subclass metadata was guessed incorrectly.
         @torch.compile(backend="aot_eager")
         def f(x):
+            # [FUNCTION DOC] HELPER: Sine then cosine, compiled with the aot_eager backend.
             return x.sin().cos()
 
         a = torch.ones(4, requires_grad=True)
@@ -1055,7 +1271,12 @@ metadata incorrectly.
             new_out.sum().backward()
 
     def test_nested_subclasses_non_homogenous(self):
+        # [FUNCTION DOC] Compile a function over a ConstantExtraMetadataTensor wrapping a
+        # TwoTensor; checks output subclass structure, closeness to eager output, and that
+        # gradients keep the wrapper subclass structure and match eager.
         def f(x):
+            # [FUNCTION DOC] HELPER: Multiply the wrapper's constant attribute, its inner
+            # element and the sine-cosine of the input.
             x_elem = x.elem
             x_metadata = x.constant_attribute
             return x_metadata * x_elem * x.sin().cos()
@@ -1090,7 +1311,12 @@ metadata incorrectly.
         self.assertTrue(isinstance(custom_aa2.grad.b, ConstantExtraMetadataTensor))
 
     def test_subclasses_mixed(self):
+        # [FUNCTION DOC] Compile a function mixing a metadata wrapper input and a TwoTensor
+        # input; checks result matches eager and output is a TwoTensor whose parts are metadata
+        # wrapper tensors.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Build a TwoTensor from two products involving the constant
+            # attribute of x and the parts of y.
             x_metadata = x.constant_attribute
             out_a = x_metadata * x * y.a
             out_b = x * y.a * y.b
@@ -1121,11 +1347,21 @@ metadata incorrectly.
         self.assertTrue(isinstance(out.b, ConstantExtraMetadataTensor))
 
     def test_subclasses_mixed_mode(self):
+        # [FUNCTION DOC] Run a sine-cosine function under a dispatch mode that wraps outputs in
+        # a metadata subclass (unless already one); checks the compiled output is a wrapper
+        # around a TwoTensor, matches eager, and gradients keep that structure.
         def f(x):
+            # [FUNCTION DOC] HELPER: Sine then cosine.
             return x.sin().cos()
 
         class AddConstantMetadataMode(TorchDispatchMode):
+            # [CLASS DOC] HELPER: Dispatch mode that runs each op and, if the argument types do
+            # not include the metadata subclass, wraps the result in the subclass with constant
+            # attribute 5.
             def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                # [FUNCTION DOC] HELPER: Run the op; wrap the result in the metadata subclass
+                # with constant attribute 5 when that subclass is absent from the argument
+                # types; return the result.
                 out = func(*args, **(kwargs or {}))
                 if ConstantExtraMetadataTensor not in types:
                     out = ConstantExtraMetadataTensor(out)
@@ -1160,7 +1396,12 @@ metadata incorrectly.
 
     @unittest.skipIf(IS_WINDOWS, "Windows isn't supported for this case")
     def test_custom_tensor_metadata(self):
+        # [FUNCTION DOC] Not run on Windows. Compile a function on a doubly nested metadata
+        # wrapper tensor (different constants at each level) and check outputs match eager and
+        # gradients keep the nested wrapper structure.
         def f(x):
+            # [FUNCTION DOC] HELPER: Multiply the input by its element, the element's element
+            # and the element's constant attribute.
             x_elem = x.elem
             x_elem_elem = x_elem.elem
             x_elem_metadata = x_elem.constant_attribute
@@ -1189,7 +1430,12 @@ metadata incorrectly.
         )
 
     def test_nested_subclasses_complicated_inps(self):
+        # [FUNCTION DOC] Compile a function with nested TwoTensor inputs plus a plain tensor;
+        # check output structure, and that gradients of the nested inputs are nested TwoTensors
+        # matching eager values.
         def f(x, y, z):
+            # [FUNCTION DOC] HELPER: Mix of sum of nested tensors, sum of plain parts, and
+            # sine-cosine of the first input.
             temp = x + y
             temp_plain = x.a + y.b
             res = temp.sum() + temp_plain.sum()
@@ -1240,7 +1486,12 @@ metadata incorrectly.
 
     @unittest.skipIf(IS_WINDOWS, "Windows isn't supported for this case")
     def test_nested_subclasses_complicated_inps_mixed(self):
+        # [FUNCTION DOC] Not run on Windows. Compile a function combining a nested TwoTensor
+        # input with a doubly nested metadata wrapper input; checks output and both gradients
+        # match eager.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Product of the wrapper tensor, its element, its element's
+            # element and constant attribute, plus x.
             y_elem = y.elem
             y_elem_elem = y_elem.elem
             y_elem_metadata = y_elem.constant_attribute
@@ -1276,12 +1527,18 @@ metadata incorrectly.
         self.assertTrue(torch.allclose(custom_aa_compile.grad, custom_aa.grad))
 
     def test_composite_impl_compile(self):
+        # [FUNCTION DOC] Check aot_autograd on a module holding a Linear layer (composite op):
+        # asserts the forward graph in training mode (transpose and addmm, saving tensors for
+        # backward) and again under inference mode (no saved tensors).
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a single Linear layer.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the module and its linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(3, 3)
 
             def forward(self, a):
+                # [FUNCTION DOC] HELPER: Apply the linear layer.
                 return self.linear(a)
 
         inp = [torch.ones(3, 3, requires_grad=True)]
@@ -1309,8 +1566,12 @@ def forward(self, arg0_1, arg1_1, arg2_1):
             )
 
     def test_outputs_are_aliased(self):
+        # [FUNCTION DOC] Check outputs that alias each other (an output and a view of it) keep
+        # their aliasing after compilation: mutating one output affects the other the same way
+        # as in eager, with and without requires_grad.
         # Tensor, None, int
         def f(a):
+            # [FUNCTION DOC] HELPER: Return a product and a flattened view of it.
             b = a.mul(2)
             c = b.view(-1)
             return b, c
@@ -1330,7 +1591,10 @@ def forward(self, arg0_1, arg1_1, arg2_1):
             self.assertEqual(out_ref[1], out_test[1])
 
     def test_input_mutation_is_output(self):
+        # [FUNCTION DOC] Check an input mutation whose result is also returned; asserts the
+        # graph clones the input, multiplies, and returns the value twice.
         def f(a):
+            # [FUNCTION DOC] HELPER: Multiply the input by two in place and return it.
             a.mul_(2)
             return a
 
@@ -1348,12 +1612,16 @@ def forward(self, primals_1):
         )
 
     def test_input_mutation_multiple(self):
+        # [FUNCTION DOC] Check mutating two of three inputs; asserts the graph clones the
+        # mutated inputs and returns their updated values before the output.
         def f(a, b, c):
+            # [FUNCTION DOC] HELPER: Double a and c in place, return a plus b plus c.
             a.mul_(2)
             c.mul_(2)
             return a + b + c
 
         def create_inp(req_grad):
+            # [FUNCTION DOC] HELPER: Build three ones matrices with the requested requires_grad.
             return [
                 torch.ones(3, 3, requires_grad=req_grad),
                 torch.ones(3, 3, requires_grad=req_grad),
@@ -1377,7 +1645,10 @@ def forward(self, primals_1, primals_2, primals_3):
         )
 
     def test_input_mutation_return(self):
+        # [FUNCTION DOC] Check sin with an out argument writing into a second input, with input
+        # mutation kept; asserts a copy_ into the out argument.
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Compute sine of a into b and return the result.
             return torch.sin(a, out=b)
 
         inp = [torch.randn(3, 3), torch.ones(3, 3)]
@@ -1395,11 +1666,15 @@ def forward(self, arg0_1, arg1_1):
         )
 
     def test_input_mutation_metadata(self):
+        # [FUNCTION DOC] Check a metadata-only input mutation (in-place transpose) with both
+        # requires_grad settings.
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Transpose a in place and return the sum.
             a.transpose_(1, 0)
             return a + b
 
         def create_inp(req_grad):
+            # [FUNCTION DOC] HELPER: Build two ones matrices with the requested requires_grad.
             return [
                 torch.ones(3, 3, requires_grad=req_grad),
                 torch.ones(3, 3, requires_grad=req_grad),
@@ -1414,17 +1689,25 @@ def forward(self, arg0_1, arg1_1):
     def test_alias_of_intermediate_detach(
         self, backend, view_replay_for_aliased_outputs, dynamic_shapes
     ):
+        # [FUNCTION DOC] Parameterized over backend, view replay config and dynamic shapes.
+        # Compiles a function returning a detached transposed intermediate and the non-detached
+        # transposed view; checks values, requires_grad flags, that both outputs share storage
+        # and the second is a view, and that gradients match eager.
         with patch(
             "torch._functorch.config.view_replay_for_aliased_outputs",
             view_replay_for_aliased_outputs,
         ):
 
             def fn(x):
+                # [FUNCTION DOC] HELPER: Add one, transpose, return the detached view and
+                # the view.
                 x = x + 1
                 a = x.transpose(0, 1)
                 return a.detach(), a
 
             def inp_fn():
+                # [FUNCTION DOC] HELPER: Make a ones matrix requiring grad, marking both dims
+                # dynamic when dynamic shapes are enabled.
                 t = torch.ones(3, 3, requires_grad=True)
                 if dynamic_shapes:
                     torch._dynamo.mark_dynamic(t, 0)
@@ -1449,7 +1732,12 @@ def forward(self, arg0_1, arg1_1):
             self.assertEqual(x_ref.grad, x.grad)
 
     def test_input_mutation_storage_resize_up(self):
+        # [FUNCTION DOC] Check storage resize up on an input starting with empty storage
+        # followed by a copy into it; asserts the graph contains a resize op and a copy into
+        # the input.
         def f(a):
+            # [FUNCTION DOC] HELPER: Resize the input's storage to 32 bytes, fill it with ones
+            # under no_grad, return it plus one.
             torch.ops.inductor.resize_storage_bytes_(a, 32)
             # float32, 4 bytes per element, 32 bytes == 8 elements
             with torch.no_grad():
@@ -1488,7 +1776,11 @@ def forward(self, primals_1):
         )
 
     def test_input_mutation_storage_resize_down(self):
+        # [FUNCTION DOC] Check storage resize to zero of an input after use; asserts the graph
+        # has only the resize op, with no data mutation retained.
         def f(a):
+            # [FUNCTION DOC] HELPER: Take the sine, resize the input's storage to zero bytes,
+            # return the sine.
             out = a.sin()
             torch.ops.inductor.resize_storage_bytes_(a, 0)
             return out
@@ -1567,19 +1859,33 @@ def forward(self, primals_1):
         "using set_ unsafely and PT2 FSDP2 no longer uses set_ as used in this test",
     )
     def test_input_mutation_storage_resize_down_and_set_(self):
+        # [FUNCTION DOC] Always skipped (skip decorator with a true condition). Mimics FSDP:
+        # a custom autograd Function sets a dummy parameter to an all-gathered tensor, then
+        # the parameter's storage is resized to zero; asserts graph text with cat, sin,
+        # resize and set_.
         # Meant to mimic ppFSDP
         class TracableCreateParameter(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Autograd Function that sets the placeholder to the given
+            # tensor (raises AssertionError if that tensor requires grad); backward routes
+            # gradient to the placeholder.
             @staticmethod
             def forward(ctx, tensor, placeholder):
+                # [FUNCTION DOC] HELPER: Raise AssertionError if the tensor requires grad, else
+                # set the placeholder to it and return the placeholder.
                 if tensor.requires_grad:
                     raise AssertionError("Expected tensor to not require grad")
                 return placeholder.set_(tensor)
 
             @staticmethod
             def backward(ctx, grad):
+                # [FUNCTION DOC] HELPER: Return no gradient for the tensor and pass the gradient
+                # to the placeholder.
                 return None, grad  # grad flows to placeholder
 
         def f(dummy_param, param_shard):
+            # [FUNCTION DOC] HELPER: Concatenate the shard with itself under no_grad, apply the
+            # Function to the dummy param, take its sine, resize its storage to zero, return
+            # the sine.
             # simulate allgather
             with torch.no_grad():
                 allgather_param = torch.cat([param_shard, param_shard])
@@ -1628,7 +1934,11 @@ def forward(self, primals_1, primals_2):
         )
 
     def test_input_mutation_storage_resize_before_set_(self):
+        # [FUNCTION DOC] Check that resizing an input's storage to zero and then setting it to
+        # another tensor compiles and runs without error.
         def f(a):
+            # [FUNCTION DOC] HELPER: Under no_grad resize the input's storage to zero then set
+            # it to a new ones tensor.
             with torch.no_grad():
                 torch.ops.inductor.resize_storage_bytes_(a, 0)
                 a.set_(torch.ones(2))
@@ -1667,26 +1977,38 @@ def forward(self, primals_1, primals_2):
     #         out = compiled_f(inp)
 
     def test_input_output_aliase_custom_autograd_function(self):
+        # [FUNCTION DOC] Check an autograd Function that returns its input unchanged
+        # (input-output alias) works through aot_autograd.
         class Foo(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Autograd Function returning its input; backward halves
+            # the gradient.
             @staticmethod
             def forward(ctx, x):
+                # [FUNCTION DOC] HELPER: Return the input unchanged.
                 return x
 
             @staticmethod
             def backward(ctx, gx):
+                # [FUNCTION DOC] HELPER: Return half of the incoming gradient.
                 return gx * 0.5
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Apply the custom Function.
             return Foo.apply(x)
 
         inp = [torch.ones(2, 2, requires_grad=True)]
         self.verify_aot_autograd(f, inp, test_mutation=False)
 
     def test_input_mutation_requires_grad_detach(self):
+        # [FUNCTION DOC] Check mutation of an input through a detached view (does not take
+        # part in autograd) still compiles and matches eager, with and without making the
+        # input a non-leaf.
         # Here, "a" requires grad, and gets mutated, so we append a copy_() to the end of the graph.
         # Its mutation doesn't take part in autograd though, because we mutated a detach'd view.
         # Need to make sure that this copy_() doesn't error, and doesn't participate in autograd either.
         def f(a):
+            # [FUNCTION DOC] HELPER: Double a detached alias of the input in place and return
+            # the input plus three.
             a.detach().mul_(2)
             return a + 3
 
@@ -1698,7 +2020,11 @@ def forward(self, primals_1, primals_2):
         self.verify_aot_autograd(f, inp, test_mutation=True)
 
     def test_input_mutation_hidden_from_autograd_aliasing(self):
+        # [FUNCTION DOC] Check a mutation under no_grad through a view of the input is kept
+        # inside the graph; asserts the graph ends with a copy into the input.
         def f(a):
+            # [FUNCTION DOC] HELPER: Multiply a view of the input by two under no_grad and
+            # return the input plus one.
             a_alias = a.view(-1)
             with torch.no_grad():
                 a_alias.mul_(2)
@@ -1724,7 +2050,10 @@ def forward(self, primals_1):
         )
 
     def test_input_mutation_requires_grad_no_grad(self):
+        # [FUNCTION DOC] Check an input mutation under no_grad is kept inside the training graph
+        # (copy into input) even though the input requires grad.
         def f(a):
+            # [FUNCTION DOC] HELPER: Double the input under no_grad and return it plus three.
             with torch.no_grad():
                 a.mul_(2)
             return a + 3
@@ -1746,7 +2075,11 @@ def forward(self, primals_1):
         )
 
     def test_input_mutation_requires_grad_no_grad_inference_graph(self):
+        # [FUNCTION DOC] Same as the no_grad mutation test but the whole function body,
+        # including the returned value, runs under no_grad; asserts the same copy into
+        # the input.
         def f(a):
+            # [FUNCTION DOC] HELPER: Under no_grad double the input and return it plus three.
             with torch.no_grad():
                 a.mul_(2)
                 return a + 3
@@ -1768,10 +2101,14 @@ def forward(self, arg0_1):
         )
 
     def test_input_mutation_requires_grad_no_grad_detach_mixed(self):
+        # [FUNCTION DOC] Check an input mutated three ways (through a detached alias, normally,
+        # and under no_grad); only the normal mutation should take part in autograd.
         # Perform a mix of mutations on a:
         # 1 normal, 1 in no_grad, 1 on a detach'd tensor.
         # Only the first should participate in gradient computation.
         def f(a):
+            # [FUNCTION DOC] HELPER: Mutate the input via detached alias, normally, and under
+            # no_grad, then return it plus five.
             a.detach().mul_(2)
             a.mul_(3)
             with torch.no_grad():
@@ -1782,7 +2119,10 @@ def forward(self, arg0_1):
         self.verify_aot_autograd(f, inp, test_mutation=True)
 
     def test_input_mutation_metadata2(self):
+        # [FUNCTION DOC] Check a metadata mutation (transpose) followed by a data mutation of
+        # an input.
         def f(a):
+            # [FUNCTION DOC] HELPER: Transpose in place, double in place, return plus one.
             a.transpose_(1, 0)
             a.mul_(2)
             return a + 1
@@ -1793,7 +2133,12 @@ def forward(self, arg0_1):
         self.verify_aot_autograd(f, inp, test_mutation=True)
 
     def test_input_mutation_batchnorm(self):
+        # [FUNCTION DOC] Check batch norm with mutated running statistics under inductor-like
+        # decompositions (legit functional batch norm plus its backward); the mutated inputs are
+        # also saved for backward.
         def f(inpt, weight, bias, running_mean, running_var):
+            # [FUNCTION DOC] HELPER: Call the legit native batch norm in training mode with
+            # momentum 0.5.
             # This is additionally a good test, because the input tensors that we mutate
             # are *also* saved for backwards.
             # This tests that what we save for the backward is actually cloned inputs,
@@ -1803,6 +2148,8 @@ def forward(self, arg0_1):
             )
 
         def create_inp(req_grad):
+            # [FUNCTION DOC] HELPER: Build five inputs: a 4D activation, weight and bias with
+            # the requested requires_grad, and running mean and variance.
             return [
                 torch.ones(2, 5, 5, 5, requires_grad=req_grad),
                 torch.ones(5, requires_grad=req_grad),
@@ -1828,6 +2175,8 @@ def forward(self, arg0_1):
         )
 
     def test_batchnorm_inference(self):
+        # [FUNCTION DOC] Compile a BatchNorm2d module in eval mode under no_grad with input
+        # mutations kept and assert no copy_ appears in the forward graph.
         inp = [
             torch.ones(2, 5, 5, 5, requires_grad=True),
             torch.ones(5, requires_grad=True),
@@ -1855,7 +2204,10 @@ def forward(self, arg0_1):
         self.assertTrue("copy_" not in str(code))
 
     def test_input_output_view_simple(self):
+        # [FUNCTION DOC] Check an output that is a view of an input; asserts the compiled graph
+        # only contains the view op.
         def f(a):
+            # [FUNCTION DOC] HELPER: Return a flattened view of the input.
             return a.view(-1)
 
         inp = [torch.ones(2, 2, requires_grad=False).add(1)]
@@ -1872,12 +2224,17 @@ def forward(self, arg0_1):
         )
 
     def test_input_output_view_mutate_multiple(self):
+        # [FUNCTION DOC] Check inputs mutated while others are returned as views; asserts the
+        # graph returns the two mutated values then the view outputs.
         def f(a, b, c):
+            # [FUNCTION DOC] HELPER: Double a, triple c in place, return views of b and c.
             a.mul_(2)
             c.mul_(3)
             return b.view(2, 2), c.view(2, 2)
 
         def create_inp(req_grad):
+            # [FUNCTION DOC] HELPER: Build three non-leaf matrices with the
+            # requested requires_grad.
             return [
                 torch.ones(2, 2, requires_grad=req_grad).add(1),
                 torch.ones(2, 2, requires_grad=req_grad).add(1),
@@ -1904,12 +2261,19 @@ def forward(self, primals_1, primals_2, primals_3):
         )
 
     def test_input_output_view_metadata_mutate_multiple(self):
+        # [FUNCTION DOC] Check metadata mutation plus data mutation on different inputs with all
+        # outputs being views of inputs; only the data mutation of one input and a metadata
+        # mutation appear in graph outputs.
         def f(a, b, c):
+            # [FUNCTION DOC] HELPER: Triple b in place, transpose c in place, return views of
+            # all three inputs.
             b.mul_(3)
             c.t_()
             return a.view(2, 2), b.view(2, 2), c.view(2, 2)
 
         def create_inp(req_grad):
+            # [FUNCTION DOC] HELPER: Build three non-leaf matrices with the
+            # requested requires_grad.
             return [
                 torch.ones(2, 2, requires_grad=req_grad).add(1),
                 torch.ones(2, 2, requires_grad=req_grad).add(1),
@@ -1938,7 +2302,10 @@ def forward(self, primals_1, primals_2, primals_3):
         )
 
     def test_input_mutation_and_output_view(self):
+        # [FUNCTION DOC] Check a function that mutates its input and returns a view of it;
+        # asserts the graph returns the updated value and a view.
         def f(a):
+            # [FUNCTION DOC] HELPER: Add one in place and return a flattened view.
             a.add_(1)
             return a.view(-1)
 
@@ -1960,12 +2327,18 @@ def forward(self, primals_1):
         )
 
     def test_input_mutation_output_view_multiple(self):
+        # [FUNCTION DOC] Check a mix of metadata mutation (transpose), data mutation, a diagonal
+        # view output and plain outputs; asserts the resulting graph text.
         def f(a, b, c, d):
+            # [FUNCTION DOC] HELPER: Transpose b in place, add one to c in place, return d plus
+            # one, b's diagonal and a plus c.
             b.transpose_(1, 0)
             c.add_(1)
             return d + 1, b.diagonal(), a + c
 
         def create_inp(req_grad):
+            # [FUNCTION DOC] HELPER: Build four 2 by 2 non-leaf float inputs with the
+            # requested requires_grad.
             return [
                 torch.arange(4, requires_grad=req_grad, dtype=torch.float32)
                 .view(2, 2)
@@ -1994,7 +2367,10 @@ def forward(self, primals_1, primals_2, primals_3, primals_4):
         )
 
     def test_output_aliases_intermediate_single(self):
+        # [FUNCTION DOC] Check an output that is a view of an intermediate; asserts the compiled
+        # graph returns the view directly.
         def f(a):
+            # [FUNCTION DOC] HELPER: Multiply by three and return a flattened view.
             out = torch.mul(a, 3)
             return out.view(-1)
 
@@ -2014,7 +2390,12 @@ def forward(self, primals_1):
         )
 
     def test_output_aliases_input_multi_output_view_should_raise_autograd_error(self):
+        # [FUNCTION DOC] Check that returning multiple outputs from a multi-output view (unbind)
+        # of an input and then mutating them raises the same autograd RuntimeError as eager, in
+        # three scenarios (mutating an output, mutating the input then reading grad_fn, mutating
+        # a detached output).
         def f1(a):
+            # [FUNCTION DOC] HELPER: Return the list of unbound rows.
             return list(a.unbind(0))
 
         f1_compiled = aot_function(f1, nop)
@@ -2049,8 +2430,14 @@ def forward(self, primals_1):
             out_test2[0].grad_fn
 
     def test_output_aliases_input_multi_output_view(self):
+        # [FUNCTION DOC] Check outputs from a multi-output view: the backward nodes are the
+        # compiled function backward (aliasing hidden from autograd), and gradients match eager.
+        # A second function that also returns a plain view of the input falls back to
+        # regenerating aliases, so unbind backward nodes appear, mutations propagate, and
+        # gradients match.
         # All aliased outs are from multi-output views, so AOTAutograd will hide the aliasing from autograd.
         def f1(a):
+            # [FUNCTION DOC] HELPER: Return the list of unbound rows.
             return list(a.unbind(0))
 
         inp = torch.ones(3, 3, requires_grad=True)
@@ -2076,6 +2463,8 @@ def forward(self, primals_1):
         # AOTAutograd will not try to be smart here and hide the aliasing relationships from autograd.
         # Instead, it will perform its "output aliases input" logic, and regenerate all aliases.
         def f3(a):
+            # [FUNCTION DOC] HELPER: Return the unbound rows plus a view of the input with the
+            # same shape.
             return *list(a.unbind(0)), a.view(a.shape)
 
         inp = torch.ones(3, 3, requires_grad=True)
@@ -2100,8 +2489,15 @@ def forward(self, primals_1):
         self.assertEqual(inp_ref.grad, inp.grad)
 
     def test_output_aliases_intermediate_multi_output_view(self):
+        # [FUNCTION DOC] Check aliasing among outputs that are views of a graph intermediate.
+        # Four scenarios: all outputs from a multi-output view (aliasing hidden from autograd,
+        # backward nodes are the compiled function backward); the same plus the intermediate
+        # itself returned; the same plus a plain view of it; and a case with ordinary aliases
+        # mixed in that triggers the intermediate-base path. Each compares mutation and
+        # gradients with eager.
         # All aliased outs are from multi-output views, so AOTAutograd will hide the aliasing from autograd.
         def f1(a):
+            # [FUNCTION DOC] HELPER: Multiply by three and return the list of unbound rows.
             out = torch.mul(a, 3)
             return list(out.unbind(0))
 
@@ -2124,6 +2520,8 @@ def forward(self, primals_1):
 
         # All aliased outs but one are from multi-output views, so AOTAutograd will hide the aliasing from autograd.
         def f2(a):
+            # [FUNCTION DOC] HELPER: Multiply by three and return the unbound rows followed by
+            # the intermediate itself.
             out = torch.mul(a, 3)
             return *list(out.unbind(0)), out
 
@@ -2149,6 +2547,8 @@ def forward(self, primals_1):
 
         # All aliased outs but one are from multi-output views, so AOTAutograd will hide the aliasing from autograd.
         def f3(a):
+            # [FUNCTION DOC] HELPER: Multiply by three and return the unbound rows followed by a
+            # same-shape view of the intermediate.
             out = torch.mul(a, 3)
             return *list(out.unbind(0)), out.view(out.shape)
 
@@ -2181,6 +2581,8 @@ def forward(self, primals_1):
         # just do the graph partitioning defined in this doc instead though).
         # https://docs.google.com/document/d/1DlfFq8TKbuAn2zyJxLfoW-X1qkkm5PLdHFtySo03QAk/edit
         def f4(a):
+            # [FUNCTION DOC] HELPER: Multiply by three and return the unbound rows, the
+            # intermediate, and a same-shape view of it.
             out = torch.mul(a, 3)
             # also return the graph intermediate directly,
             # which will force AOTAutograd to do the "intermediate base" logic.
@@ -2209,7 +2611,11 @@ def forward(self, primals_1):
         self.assertEqual(inp_ref.grad, inp.grad)
 
     def test_output_aliases_intermediate_mutation_linear(self):
+        # [FUNCTION DOC] Check that mutating an output that is a flattened view of an
+        # intermediate works under inductor decompositions (unsafe view becomes view); mutated
+        # results must match eager.
         def f(x):
+            # [FUNCTION DOC] HELPER: Add one and return a flattened view.
             return (x + 1).view(-1)
 
         inp = [torch.ones(3, 3, requires_grad=True)]
@@ -2226,7 +2632,11 @@ def forward(self, primals_1):
         self.assertEqual(out_ref, out_test)
 
     def test_output_aliases_intermediate_no_grad(self):
+        # [FUNCTION DOC] Check an output aliasing an intermediate that does not require grad: no
+        # intermediate base is added as a graph output; asserts the graph text.
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Return a flattened view of a product and the second input
+            # plus one.
             out = torch.mul(a, 3)
             # First output is an alias of an intermediate that doesn't require grad
             return out.view(-1), b.add(1)
@@ -2249,10 +2659,15 @@ def forward(self, primals_1, primals_2):
         )
 
     def test_output_aliases_intermediate_no_grad_view(self):
+        # [FUNCTION DOC] Check a view of a differentiable intermediate created under no_grad: it
+        # keeps requires_grad like eager but is not a differentiable output; the other output
+        # participates in backward and gradients match eager.
         # View of a differentiable intermediate created under no_grad().
         # The view inherits requires_grad from the base but has no grad_fn,
         # so it should not be treated as a differentiable output.
         def f(a):
+            # [FUNCTION DOC] HELPER: Multiply by three, take a flattened view under no_grad,
+            # return the sum and that view.
             out = torch.mul(a, 3)
             with torch.no_grad():
                 out_view = out.view(-1)
@@ -2279,7 +2694,11 @@ def forward(self, primals_1, primals_2):
         self.assertEqual(ref_grad, test_grad)
 
     def test_output_aliases_intermediate_returned_multiple_times(self):
+        # [FUNCTION DOC] Check returning an intermediate, a view of it, and the intermediate
+        # again, for inputs with and without requires_grad.
         def f(a):
+            # [FUNCTION DOC] HELPER: Return the intermediate, a flattened view of it, and the
+            # intermediate again.
             out = torch.mul(a, 3)
             out_view = out.view(-1)
             return out, out_view, out
@@ -2290,7 +2709,10 @@ def forward(self, primals_1, primals_2):
         self.verify_aot_autograd(f, inp, test_mutation=True)
 
     def test_output_aliases_intermediate_multiple(self):
+        # [FUNCTION DOC] Check two views of the same intermediate returned; asserts the graph
+        # returns both views plus the intermediate as an extra output.
         def f(a):
+            # [FUNCTION DOC] HELPER: Return two flattened views of a product.
             out = torch.mul(a, 3)
             # AOTAutograd should manually generate these two output views in the epilogue.
             return out.view(-1), out.view(-1)
@@ -2310,7 +2732,10 @@ def forward(self, primals_1):
         )
 
     def test_output_aliases_intermediate_and_returned(self):
+        # [FUNCTION DOC] Check returning a view of an intermediate and the intermediate itself;
+        # asserts the graph returns the view and the intermediate.
         def f(a):
+            # [FUNCTION DOC] HELPER: Return a flattened view of a product and the product.
             out = torch.mul(a, 3)
             # AOTAutograd should manually generate the first output (a view of an intermediate)
             # but not the second (which is itself the intermediate for the first)
@@ -2330,7 +2755,10 @@ def forward(self, primals_1):
         )
 
     def test_output_aliases_intermediate_and_returned_flipped(self):
+        # [FUNCTION DOC] Same as the previous test with the output order flipped (intermediate
+        # first, then its view); asserts the graph text.
         def f(a):
+            # [FUNCTION DOC] HELPER: Return the product and a flattened view of it.
             out = torch.mul(a, 3)
             # AOTAutograd should manually generate the first output (a view of an intermediate)
             # but not the second (which is itself the intermediate for the first)
@@ -2350,7 +2778,11 @@ def forward(self, primals_1):
         )
 
     def test_output_aliases_intermediate_and_returned_different_grad(self):
+        # [FUNCTION DOC] Check outputs: a view of an intermediate, the intermediate, and a
+        # detached select of it; asserts the graph includes the view, select and detach.
         def f(a):
+            # [FUNCTION DOC] HELPER: Return a flattened view, the product and the detached
+            # first row.
             out = torch.mul(a, 3)
             # AOTAutograd should manually generate the first output (a view of an intermediate)
             # but not the second (which is itself the intermediate for the first)
@@ -2372,7 +2804,12 @@ def forward(self, primals_1):
         )
 
     def test_output_aliases_intermediate_inplace_view(self):
+        # [FUNCTION DOC] Defines a function with an in-place view op on an intermediate but runs
+        # no assertions (the verification call is commented out pending issue 90507), so
+        # effectively a no-op test.
         def f(a):
+            # [FUNCTION DOC] HELPER: Multiply by three, transpose in place and return;
+            # never called.
             out = torch.mul(a, 3)
             out.t_()
             return out
@@ -2382,7 +2819,12 @@ def forward(self, primals_1):
         # self.verify_aot_autograd(f, inp, test_mutation=True)
 
     def test_output_aliases_intermediate_inplace_view_with_detach(self):
+        # [FUNCTION DOC] Check an intermediate transposed in place and then detached in
+        # place: AOT autograd needs no alias handling; asserts the graph text with a
+        # transpose and an add.
         def f(a):
+            # [FUNCTION DOC] HELPER: Multiply by three, transpose in place, detach in place,
+            # return it and the input plus one.
             out = torch.mul(a, 3)
             out.t_()
             out.detach_()
@@ -2406,7 +2848,12 @@ def forward(self, primals_1):
         )
 
     def test_output_aliases_intermediate_inplace_view_and_view(self):
+        # [FUNCTION DOC] Defines a function with views taken before and after an in-place
+        # transpose of an intermediate but runs no assertions (verification commented out), so
+        # effectively a no-op test.
         def f(a):
+            # [FUNCTION DOC] HELPER: Return an unsqueezed view before the in-place transpose,
+            # the intermediate, and an unsqueezed view after; never called.
             out = torch.mul(a, 3)
             out_view = out.unsqueeze(0)
             out.t_()
@@ -2420,7 +2867,11 @@ def forward(self, primals_1):
         # self.verify_aot_autograd(f, inp, test_mutation=True)
 
     def test_output_aliases_intermediate_multiple_mixed(self):
+        # [FUNCTION DOC] Check outputs that are views of two different intermediates, one of
+        # them used twice; asserts the graph text including the extra intermediate output.
         def f(a):
+            # [FUNCTION DOC] HELPER: Return a flattened view of one product, a transposed second
+            # product and a transposed first product.
             out1 = torch.mul(a, 3)
             out2 = torch.mul(a, 4)
             # AOTAutograd should manually generate these two output views in the epilogue.
@@ -2443,17 +2894,24 @@ def forward(self, primals_1):
         )
 
     def test_output_all_alias_types(self):
+        # [FUNCTION DOC] Check all three kinds of alias metadata returned by the compiled
+        # forward (output views of inputs, of intermediates, and input metadata mutations);
+        # asserts the graph text.
         # There are 3 types of aliasing that require us to return metadata in the compiled fw:
         # (1) outputs that are views of inputs
         # (2) outputs that are views of intermediates
         # (3) inputs that get metadata mutations
         # test all 3 of them here
         def f(a):
+            # [FUNCTION DOC] HELPER: Transpose the input in place, double it, and return squeeze
+            # and transpose views of the result plus an unsqueezed view of the input.
             a.transpose_(1, 0)
             tmp = a.mul(2)
             return tmp.squeeze(), tmp.transpose(1, 0), a.unsqueeze(0)
 
         def inp_callable(req_grad):
+            # [FUNCTION DOC] HELPER: Build one ones tensor (cloned, with requested
+            # requires_grad) and return it as both function and graph inputs.
             x = torch.ones(1, 2, 4, requires_grad=req_grad).clone()
             return [(x,), (x,)]
 
@@ -2480,12 +2938,17 @@ def forward(self, primals_1):
 
     @parametrize("req_grad", [False, True])
     def test_subclass_metadata_mutation(self, req_grad):
+        # [FUNCTION DOC] Parameterized by requires_grad. Verify a metadata mutation (in-place
+        # transpose) followed by a data op with TwoTensor subclass inputs.
         def f(a):
+            # [FUNCTION DOC] HELPER: Transpose in place, double, return the transposed result.
             a.transpose_(1, 0)
             tmp = a.mul(2)
             return tmp.transpose(1, 0)
 
         def inp_callable(req_grad):
+            # [FUNCTION DOC] HELPER: Build one cloned ones tensor with the requested
+            # requires_grad and return it as both function and graph inputs.
             x = torch.ones(1, 2, 4, requires_grad=req_grad).clone()
             return [(x,), (x,)]
 
@@ -2497,7 +2960,11 @@ def forward(self, primals_1):
         )
 
     def test_subclass_metadata_mutation_aot_function_metadata(self):
+        # [FUNCTION DOC] Check aot_function with TwoTensor inputs created under TwoTensorMode
+        # and an in-place transpose: compiled outputs, mutated inputs and their
+        # shape/stride/offset metadata match eager.
         def f(a):
+            # [FUNCTION DOC] HELPER: Transpose in place, double, return the transposed result.
             a.transpose_(1, 0)
             tmp = a.mul(2)
             return tmp.transpose(1, 0)
@@ -2527,12 +2994,19 @@ def forward(self, primals_1):
     @parametrize("req_grad", [False, True])
     @skipIfDynamoInput("Dynamo fails to fakeify non-contiguous TwoTensor inputs")
     def test_subclass_metadata_mutation_noncontiguous_input(self, req_grad):
+        # [FUNCTION DOC] Parameterized by requires_grad; skipped under the dynamo variant.
+        # Same as the subclass metadata mutation test but the input is a non-contiguous
+        # slice; checked through the harness and again directly via aot_function including
+        # metadata equality.
         def f(a):
+            # [FUNCTION DOC] HELPER: Transpose in place, double, return the transposed result.
             a.transpose_(1, 0)
             tmp = a.mul(2)
             return tmp.transpose(1, 0)
 
         def inp_callable(req_grad):
+            # [FUNCTION DOC] HELPER: Build a cloned ones tensor, take a strided column slice,
+            # and return it as both function and graph inputs.
             x = torch.ones(2, 4, requires_grad=req_grad).clone()[:, ::2]
             return [(x,), (x,)]
 
@@ -2565,7 +3039,11 @@ def forward(self, primals_1):
         self.assertTensorMetadataEqual(test_out, ref_out)
 
     def test_input_data_and_metadata_mutation(self):
+        # [FUNCTION DOC] Check an input that gets both a metadata mutation (in-place transpose)
+        # and a data mutation of one row; asserts the graph text.
         def f(a):
+            # [FUNCTION DOC] HELPER: Transpose in place, double the first row in place, return a
+            # view with the same shape.
             a.t_()
             a[0].mul_(2)
             return a.view(a.shape)
@@ -2592,11 +3070,16 @@ def forward(self, primals_1):
         )
 
     def test_view_and_inplace_view(self):
+        # [FUNCTION DOC] Check a view of one input and an in-place metadata mutation of another;
+        # asserts the graph returns the transposed input plus views.
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Transpose a in place and return same-shape views of b
+            # and a.
             a.t_()
             return b.view(b.shape), a.view(a.shape)
 
         def create_inp(req_grad):
+            # [FUNCTION DOC] HELPER: Build two ones matrices with the requested requires_grad.
             return [
                 torch.ones(3, 3, requires_grad=req_grad),
                 torch.ones(3, 3, requires_grad=req_grad),
@@ -2615,7 +3098,10 @@ def forward(self, arg0_1, arg1_1):
         )
 
     def test_view_detach(self):
+        # [FUNCTION DOC] Check an output that is a detached alias created before an in-place
+        # multiply, together with the mutated input.
         def f(a):
+            # [FUNCTION DOC] HELPER: Detach the input, double the input in place, return both.
             tmp = a.detach()
             a.mul_(2)
             return a, tmp
@@ -2626,7 +3112,11 @@ def forward(self, arg0_1, arg1_1):
         self.verify_aot_autograd(f, inp, test_mutation=True)
 
     def test_input_inplace_requires_grad_true(self):
+        # [FUNCTION DOC] Check an input whose requires_grad is switched on in place inside the
+        # function; asserts the graph simply multiplies both inputs.
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Enable requires_grad on a in place and return products of
+            # both inputs.
             a.requires_grad_(True)
             return a.mul(3), b.mul(4)
 
@@ -2653,13 +3143,21 @@ def forward(self, primals_1, primals_2):
     # back to the original input.
     @skipIfDynamoInput("Dynamo removes runtime error")
     def test_input_data_and_metadata_mutation_aliases_other_input(self):
+        # [FUNCTION DOC] Skipped under the dynamo variant. Torture test where two aliased inputs
+        # get a data mutation and a metadata mutation; works for plain inputs, and with subclass
+        # inputs expects a RuntimeError about aliased inputs mutated in the graph.
         # a and b are aliased
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Double a in place, transpose b in place, return
+            # their product.
             a.mul_(2)
             b.t_()
             return a.mul(b)
 
         def inp_callable(req_grad):
+            # [FUNCTION DOC] HELPER: Build a base tensor and two identical row views of a
+            # non-leaf derived from it; returns the base as function input and the two views as
+            # graph inputs.
             base = torch.ones(2, 2, requires_grad=req_grad)
             # Note: in our test, the add() is important because we need the graph inputs to be non-leaves so we can mutate them.
             x = base.add(1)
@@ -2696,11 +3194,16 @@ def forward(self, primals_1, primals_2):
 
     # https://github.com/pytorch/pytorch/issues/106456
     def test_input_mutation_noncontiguous(self):
+        # [FUNCTION DOC] Regression test for issue 106456: mutating a non-contiguous view input,
+        # verified for plain and subclass inputs and both requires_grad settings.
         def f(a):
+            # [FUNCTION DOC] HELPER: Double the input in place and return it plus one.
             a.mul_(2)
             return a + 1
 
         def inp_callable(req_grad):
+            # [FUNCTION DOC] HELPER: Build a base tensor and a non-contiguous column view of a
+            # non-leaf derived from it; returns the base and the view.
             base = torch.ones(2, 2, requires_grad=req_grad)
             x = base.add(1)
             # create a non-contiguous view to pass as an input to the compiler
@@ -2727,20 +3230,29 @@ def forward(self, primals_1, primals_2):
         )
 
     def test_backward_mutation_data(self):
+        # [FUNCTION DOC] Check a custom autograd Function whose backward mutates a saved input;
+        # allowed when that buffer does not require grad, and also verified when both inputs
+        # require grad.
         class BwMutation(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Autograd Function that clones in forward and, in backward,
+            # doubles the saved input in place and returns a cloned gradient.
             @staticmethod
             def forward(ctx, x):
+                # [FUNCTION DOC] HELPER: Save the input for backward and return a clone.
                 ctx.save_for_backward(x)
                 return x.clone()
 
             @staticmethod
             def backward(ctx, grad_output):
+                # [FUNCTION DOC] HELPER: Double the saved input in place and return a clone of
+                # the gradient.
                 (x,) = ctx.saved_tensors
                 # bw mutation
                 x.mul_(2)
                 return grad_output.clone()
 
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Apply the mutating Function to b and multiply with a.
             out = BwMutation.apply(b)
             return a * out
 
@@ -2759,9 +3271,17 @@ def forward(self, primals_1, primals_2):
         self.verify_aot_autograd(f, inp_grad, test_mutation=True)
 
     def test_fw_bw_mutation_no_functionalization1(self):
+        # [FUNCTION DOC] Use compiled_function with functionalization disabled over a Function
+        # that mutates its input and an intermediate in forward and a saved tensor in backward.
+        # Checks outputs and gradient match eager, the forward graph has two mutation ops and
+        # the backward graph has one.
         class FwBwMutation(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Autograd Function with foreach in-place multiplications on its
+            # input, an intermediate, and the saved tensor in backward.
             @staticmethod
             def forward(ctx, a, b):
+                # [FUNCTION DOC] HELPER: Mutate b and an intermediate in place, save the
+                # intermediate, return its product with a.
                 # input mutation
                 torch._foreach_mul_([b], [2])
                 x = b + 1
@@ -2772,12 +3292,15 @@ def forward(self, primals_1, primals_2):
 
             @staticmethod
             def backward(ctx, grad_output):
+                # [FUNCTION DOC] HELPER: Mutate the saved tensor in place and return two
+                # products of the gradient with it.
                 (x,) = ctx.saved_tensors
                 # bw mutation
                 torch._foreach_mul_([x], [4])
                 return grad_output * x, grad_output * x
 
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Apply the Function, then in-place sine and clone.
             return FwBwMutation.apply(a, b).sin_().clone()
 
         inps = [
@@ -2793,10 +3316,14 @@ def forward(self, primals_1, primals_2):
         bw_graph = [None]
 
         def fw_compiler(gm, example_inputs):
+            # [FUNCTION DOC] HELPER: Forward compiler that stores the graph in a list cell and
+            # returns it unchanged.
             fw_graph[0] = gm
             return gm
 
         def bw_compiler(gm, example_inputs):
+            # [FUNCTION DOC] HELPER: Backward compiler that stores the graph in a list cell and
+            # returns it unchanged.
             bw_graph[0] = gm
             return gm
 
@@ -2846,9 +3373,17 @@ def forward(self, add, clone, tangents_1):
         )
 
     def test_fw_bw_mutation_no_functionalization2(self):
+        # [FUNCTION DOC] Like the previous test with a single-input Function: functionalization
+        # disabled; checks outputs and gradient match eager and asserts the forward graph has
+        # two mutations (the activation mutation is not moved to backward) and the backward
+        # graph has none.
         class FwBwMutation(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Autograd Function mutating its input and an intermediate in
+            # forward and the saved tensor in backward.
             @staticmethod
             def forward(ctx, x):
+                # [FUNCTION DOC] HELPER: Mutate the input and an intermediate in place, save the
+                # intermediate and return it.
                 # input mutation
                 torch._foreach_mul_([x], [2])
                 x = x + 1
@@ -2859,12 +3394,15 @@ def forward(self, add, clone, tangents_1):
 
             @staticmethod
             def backward(ctx, grad_output):
+                # [FUNCTION DOC] HELPER: Mutate the saved tensor in place and return the
+                # gradient times it.
                 (x,) = ctx.saved_tensors
                 # bw mutation
                 torch._foreach_mul_([x], [4])
                 return grad_output * x
 
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Apply the Function to b and multiply with a.
             out = FwBwMutation.apply(b)
             return out * a
 
@@ -2881,10 +3419,14 @@ def forward(self, add, clone, tangents_1):
         bw_graph = [None]
 
         def fw_compiler(gm, example_inputs):
+            # [FUNCTION DOC] HELPER: Forward compiler that stores the graph in a list cell and
+            # returns it unchanged.
             fw_graph[0] = gm
             return gm
 
         def bw_compiler(gm, example_inputs):
+            # [FUNCTION DOC] HELPER: Backward compiler that stores the graph in a list cell and
+            # returns it unchanged.
             bw_graph[0] = gm
             return gm
 
@@ -2957,17 +3499,24 @@ def forward(self, add, tangents_1):
     #         self.verify_aot_autograd(f, inp_no_grad, test_mutation=True)
 
     def test_backward_mutation_on_grad_out(self):
+        # [FUNCTION DOC] Check a Function whose backward mutates the incoming gradient; compiled
+        # gradients for both inputs must equal eager.
         class BwMutation(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Autograd Function cloning in forward and doubling the gradient
+            # in place before returning a clone in backward.
             @staticmethod
             def forward(ctx, x):
+                # [FUNCTION DOC] HELPER: Return a clone of the input.
                 return x.clone()
 
             @staticmethod
             def backward(ctx, grad_output):
+                # [FUNCTION DOC] HELPER: Double the gradient in place and return a clone.
                 grad_output.mul_(2)
                 return grad_output.clone()
 
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Multiply inputs then apply the mutating Function.
             tmp = a * b
             out = BwMutation.apply(tmp)
             return out
@@ -2990,19 +3539,30 @@ def forward(self, add, tangents_1):
         self.assertEqual(inp_grad[1].grad, inp_grad_ref[1].grad)
 
     def test_backward_mutation_forward_inputs(self):
+        # [FUNCTION DOC] Register a custom op whose backward zeroes a forward input and whose
+        # forward function also mutates another input. Checks forward mutations are applied in
+        # the compiled run, backward mutation is applied after backward, and outputs, inputs and
+        # grads match eager.
         @torch.library.custom_op("_test::_clone", mutates_args={})
         def f(x: torch.Tensor, x1: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Custom op implementation returning a clone of the
+            # first argument.
             return x.clone()
 
         def f_fake(x, x1):
+            # [FUNCTION DOC] HELPER: Fake implementation returning an empty tensor like
+            # the input.
             return torch.empty_like(x)
 
         def backward(ctx, grad):
+            # [FUNCTION DOC] HELPER: Backward rule: zero the stored second input under no_grad
+            # and return the doubled gradient and no gradient for the second input.
             with torch.no_grad():
                 ctx.x1.zero_()
             return grad * 2, None
 
         def setup_context(ctx, inputs, output):
+            # [FUNCTION DOC] HELPER: Store both inputs on the context.
             (x, x1) = inputs
             ctx.x = x
             ctx.x1 = x1
@@ -3011,6 +3571,8 @@ def forward(self, add, tangents_1):
         f.register_autograd(backward, setup_context=setup_context)
 
         def fn(x: torch.Tensor, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Multiply x2 by five in place and return the custom op
+            # output plus x2.
             x2.mul_(5)
             return torch.ops._test._clone(x, x1) + x2
 
@@ -3048,19 +3610,30 @@ def forward(self, add, tangents_1):
         self.assertEqual(ref_x2.grad, x2.grad)
 
     def test_backward_mutation_forward_inputs_create_graph(self):
+        # [FUNCTION DOC] Like the previous test but with a custom op registered under a
+        # different name, and double backward requested: computing gradients with create_graph
+        # on the compiled function must raise RuntimeError that input mutations with
+        # requires_grad in backward are unsupported.
         @torch.library.custom_op("_test::_clone_create_graph", mutates_args={})
         def f(x: torch.Tensor, x1: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Custom op implementation returning a clone of the
+            # first argument.
             return x.clone()
 
         def f_fake(x, x1):
+            # [FUNCTION DOC] HELPER: Fake implementation returning an empty tensor like
+            # the input.
             return torch.empty_like(x)
 
         def backward(ctx, grad):
+            # [FUNCTION DOC] HELPER: Backward rule: zero the stored second input under no_grad
+            # and return the doubled gradient and no gradient for the second input.
             with torch.no_grad():
                 ctx.x1.zero_()
             return grad * 2, None
 
         def setup_context(ctx, inputs, output):
+            # [FUNCTION DOC] HELPER: Store both inputs on the context.
             (x, x1) = inputs
             ctx.x = x
             ctx.x1 = x1
@@ -3069,6 +3642,7 @@ def forward(self, add, tangents_1):
         f.register_autograd(backward, setup_context=setup_context)
 
         def fn(x: torch.Tensor, x1: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Call the custom op on the two inputs.
             return torch.ops._test._clone_create_graph(x, x1)
 
         inp_x, inp_x1 = (
@@ -3092,13 +3666,21 @@ def forward(self, add, tangents_1):
 
     # Partially addresses https://github.com/pytorch/pytorch/issues/106457
     def test_input_mutation_false_aliasing(self):
+        # [FUNCTION DOC] Partially addresses issue 106457. Check that two views of one storage
+        # that do not actually overlap are treated as separate graph inputs (false aliasing
+        # detected) under many layouts: contiguous halves, interleaved columns and several
+        # strided layouts, and verify overlapping layouts take the synthetic base path.
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Triple a and double b in place and return the sum of their
+            # flattened clones.
             a.mul_(3)
             b.mul_(2)
             return a.clone().view(-1) + b.clone().view(-1)
 
         # No overlap, contiguous
         def inp_callable1(req_grad):
+            # [FUNCTION DOC] HELPER: Make two non-overlapping contiguous row-halves of a
+            # non-leaf and return the base and the two views.
             base = torch.ones(4, 4, requires_grad=req_grad)
             x = base.add(1)
             # create two views that share storage, but are actually non-overlapping
@@ -3144,6 +3726,8 @@ def forward(self, arg0_1, arg1_1):
 
         # No overlap, non-contiguous: first tensor ends before second tensor start
         def inp_callable2(req_grad):
+            # [FUNCTION DOC] HELPER: Make two strided views where the first ends before the
+            # second starts; returns the base and the views.
             base = torch.ones(256, requires_grad=req_grad)
             x = base.add(1)
             a = x.as_strided((4, 4), (8, 1), storage_offset=0)
@@ -3152,6 +3736,8 @@ def forward(self, arg0_1, arg1_1):
 
         # No overlap, non-contiguous: tensors are perfectly interleaved
         def inp_callable3(req_grad):
+            # [FUNCTION DOC] HELPER: Make two interleaved column-slice views; returns the base
+            # and the views.
             base = torch.ones(4, 4, requires_grad=req_grad)
             x = base.add(1)
             a = x[:, 0:2]
@@ -3160,6 +3746,8 @@ def forward(self, arg0_1, arg1_1):
 
         # No overlap, non-contiguous
         def inp_callable4(req_grad):
+            # [FUNCTION DOC] HELPER: Make two strided non-overlapping views at offsets 0 and 22;
+            # returns the base and the views.
             base = torch.ones(256, requires_grad=req_grad)
             x = base.add(1)
             a = x.as_strided((4, 4), (9, 1), storage_offset=0)
@@ -3168,6 +3756,8 @@ def forward(self, arg0_1, arg1_1):
 
         # No overlap, non-contiguous
         def inp_callable5(req_grad):
+            # [FUNCTION DOC] HELPER: Make two strided non-overlapping views at offsets 0 and 23;
+            # returns the base and the views.
             base = torch.ones(256, requires_grad=req_grad)
             x = base.add(1)
             a = x.as_strided((4, 4), (9, 1), storage_offset=0)
@@ -3176,6 +3766,8 @@ def forward(self, arg0_1, arg1_1):
 
         # No overlap, non-contiguous
         def inp_callable6(req_grad):
+            # [FUNCTION DOC] HELPER: Make a three-dimensional strided view ending at offset 195
+            # and a slice starting at 196 of equal length; returns the base and the views.
             base = torch.ones(256, requires_grad=req_grad)
             x = base.add(1)
             # a's last element is at offset 195 (24 total elements)
@@ -3186,6 +3778,8 @@ def forward(self, arg0_1, arg1_1):
 
         # overlap! non-contiguous
         def inp_callable_overlap1(req_grad):
+            # [FUNCTION DOC] HELPER: Make two strided views at offsets 0 and 24 that overlap;
+            # returns the base and the views.
             base = torch.ones(256, requires_grad=req_grad)
             x = base.add(1)
             a = x.as_strided((4, 4), (9, 1), storage_offset=0)
@@ -3194,6 +3788,8 @@ def forward(self, arg0_1, arg1_1):
 
         # overlap! non-contiguous
         def inp_callable_overlap2(req_grad):
+            # [FUNCTION DOC] HELPER: Make two strided views at offsets 0 and 25 that overlap;
+            # returns the base and the views.
             base = torch.ones(256, requires_grad=req_grad)
             x = base.add(1)
             a = x.as_strided((4, 4), (9, 1), storage_offset=0)
@@ -3202,6 +3798,9 @@ def forward(self, arg0_1, arg1_1):
 
         # overlap! non-contiguous
         def inp_callable_overlap3(req_grad):
+            # [FUNCTION DOC] HELPER: Make a three-dimensional strided view ending at offset 195
+            # and a slice starting at 195 of equal length so the two overlap; returns the base
+            # and the views.
             base = torch.ones(256, requires_grad=req_grad)
             x = base.add(1)
             # a's last element is at offset 195 (24 total elements)
@@ -3247,6 +3846,9 @@ def forward(self, arg0_1, arg1_1):
         self.assertTrue("as_strided_scatter" in str(fw_graph_overlap2.code))
 
     def _check_merge_view_inputs_error(self, fn, make_inputs, expected_error):
+        # [FUNCTION DOC] HELPER: Reset dynamo, compile the function with aot_eager on freshly
+        # made inputs and expect compilation to fail; fails the test if no error, otherwise
+        # compares the inner exception message with the expected inline text.
         """Compile fn with aot_eager, assert the error message from merge_view_inputs."""
         torch._dynamo.reset()
         try:
@@ -3256,8 +3858,14 @@ def forward(self, arg0_1, arg1_1):
             self.assertExpectedInline(str(e.inner_exception), expected_error)
 
     def test_merge_view_inputs_error_non_differentiable_views(self):
+        # [FUNCTION DOC] Training mode: two inputs share storage, one a differentiable view and
+        # one a set_ alias with no base, and the first is mutated; expects the error saying non
+        # differentiable view input mutations are unsupported because the inputs are not
+        # differentiable views of each other.
         # Training mode (requires_grad) reaches site-1 in merge_view_inputs.
         def make_inputs():
+            # [FUNCTION DOC] HELPER: Build a large grad-requiring tensor, a view of it, and an
+            # empty tensor set to its storage; return them with the set-alias first.
             big = torch.randn(10, requires_grad=True)
             a = big[0:5]  # _base = big
             b = torch.empty(5)
@@ -3265,6 +3873,7 @@ def forward(self, arg0_1, arg1_1):
             return [b, a]
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Double a in place and return a plus b.
             a.mul_(2)
             return a + b
 
@@ -3275,8 +3884,13 @@ def forward(self, arg0_1, arg1_1):
         )
 
     def test_merge_view_inputs_error_different_bases(self):
+        # [FUNCTION DOC] Inference mode: two views whose bases are different tensor objects over
+        # the same storage with a mutated input; expects the error about aliased inputs having
+        # different base tensors.
         # Inference mode (no requires_grad) skips site-1, reaching site-2.
         def make_inputs():
+            # [FUNCTION DOC] HELPER: Make two tensors sharing storage via set_ and return a
+            # half-size view of each.
             x = torch.randn(10)
             y = torch.randn(10)
             y.set_(x.untyped_storage(), 0, (10,), (1,))
@@ -3285,6 +3899,7 @@ def forward(self, arg0_1, arg1_1):
             return [v1, v2]
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Double a in place and return a plus b.
             a.mul_(2)
             return a + b
 
@@ -3295,8 +3910,12 @@ def forward(self, arg0_1, arg1_1):
         )
 
     def test_merge_view_inputs_error_mixed_base_states(self):
+        # [FUNCTION DOC] Inference mode: aliased inputs where one has a base and the other has
+        # none; expects the error about mixed autograd base states, naming both inputs.
         # Inference mode (no requires_grad) skips site-1, reaching site-3.
         def make_inputs():
+            # [FUNCTION DOC] HELPER: Make a view with a base and an empty tensor set to the same
+            # storage (no base); returns both.
             x = torch.randn(10)
             v1 = x[0:5]  # _base = x
             v2 = torch.empty(5)
@@ -3304,6 +3923,7 @@ def forward(self, arg0_1, arg1_1):
             return [v1, v2]
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Double a in place and return a plus b.
             a.mul_(2)
             return a + b
 
@@ -3315,6 +3935,9 @@ def forward(self, arg0_1, arg1_1):
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
     def test_mem_leak_from_save_for_bw(self):
+        # [FUNCTION DOC] CUDA only. Regression for issue 94990: tensors saved for backward are
+        # detached to avoid a reference cycle; after running the compiled forward the allocated
+        # CUDA memory must equal the amount before.
         # See a full diagnosis at this issue: https://github.com/pytorch/pytorch/issues/94990
         # Note [Detaching saved tensors in AOTAutograd]
         # This program creates a ref-cycle. Long term, we should fix this ref cycle
@@ -3324,6 +3947,8 @@ def forward(self, arg0_1, arg1_1):
         # This is completely wrong and would give wrong results if we were to do double backward.
         # Fortunately today, double backward is explicitly banned in AOTAutograd.
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Add input to itself, split into two column halves,
+            # unsqueeze the second and multiply by b; returns the second half and the product.
             add = a + a
             split = torch.functional.split(add, [4, 4], dim=1)
             getitem_2 = split[1]
@@ -3343,12 +3968,22 @@ def forward(self, arg0_1, arg1_1):
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
     def test_save_input_view_for_bw_does_not_leak_memory(self):
+        # [FUNCTION DOC] CUDA only. Checks that saving a view input for backward does not leak:
+        # records saved views and bases via hooks, verifies the saved view and base are the
+        # original input objects (not the output or its grad_fn), that memory is held while the
+        # output lives, and fully freed (all weak references dead) after deleting the output.
         def f(x):
+            # [FUNCTION DOC] HELPER: Sum of squares of the input.
             return (x * x).sum()
 
         f_compiled = aot_function(f, nop)
 
         def run_once(check_saved_view):
+            # [FUNCTION DOC] HELPER: Create a large grad-requiring base, a non-leaf scaled copy
+            # and a view of its first half, with weak references; run the compiled function on
+            # the view, optionally under saved-tensor hooks that record weak references to
+            # saved views and their bases. Returns the output, tensors, weak references and
+            # recorded lists.
             base = torch.randn(1024, 1024, device="cuda", requires_grad=True)
             non_leaf_base = base * 2
             input_view = non_leaf_base[:512]
@@ -3358,6 +3993,8 @@ def forward(self, arg0_1, arg1_1):
             saved_base_refs = []
 
             def pack_hook(t):
+                # [FUNCTION DOC] HELPER: Saved tensor pack hook that records weak references to
+                # a saved tensor and its base if it is a view, and returns the tensor unchanged.
                 if t._is_view():
                     saved_view_refs.append(weakref.ref(t))
                     saved_base_refs.append(weakref.ref(t._base))
@@ -3424,12 +4061,18 @@ def forward(self, arg0_1, arg1_1):
         self.assertIsNone(non_leaf_base_ref())
 
     def test_output_aliases_multiple_inputs_get_correct_one(self):
+        # [FUNCTION DOC] Check outputs that are views of two aliased inputs with different
+        # shapes each regenerate from the correct input; verified with and without subclass
+        # inputs and both requires_grad settings.
         # a and b are aliased, but have different shapes
         # The first output should view off the first input, the 2nd output should view off the 2nd input
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Return same-shape views of both inputs.
             return a.view(a.shape), b.view(b.shape)
 
         def inp_callable(req_grad):
+            # [FUNCTION DOC] HELPER: Make a base and two aliased non-leaf views (flattened and
+            # first row); return the base and the views.
             base = torch.ones(2, 2, requires_grad=req_grad)
             # Note: in our test, the add() is important because we need the graph inputs to be non-leaves so we can mutate them.
             x = base.mul(2)
@@ -3457,11 +4100,17 @@ def forward(self, arg0_1, arg1_1):
         )
 
     def test_input_mutation_aliases_other_input(self):
+        # [FUNCTION DOC] Check mutation of one of two aliased inputs: the graph takes a
+        # synthetic base, clones it, and regenerates views after the mutation; asserts the
+        # graph text.
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Add one to a in place and return a plus b.
             a.add_(1)
             return a + b
 
         def inp_callable(req_grad):
+            # [FUNCTION DOC] HELPER: Make a base and two identical row views of a non-leaf;
+            # return the base and the views.
             base = torch.ones(4, 2, requires_grad=req_grad)
             # Note: in our test, the add() is important because we need the graph inputs to be non-leaves so we can mutate them.
             x = base.add(1)
@@ -3494,11 +4143,16 @@ def forward(self, primals_1):
         )
 
     def test_input_mutation_aliases_other_input2(self):
+        # [FUNCTION DOC] Same as the previous test but one aliased input is the whole base
+        # itself; asserts the graph text.
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Add one to a in place and return a plus b.
             a.add_(1)
             return a + b
 
         def inp_callable(req_grad):
+            # [FUNCTION DOC] HELPER: Make a base, a row view and the whole non-leaf; return the
+            # base and the pair.
             base = torch.ones(2, 2, requires_grad=req_grad)
             x = base.add(1)
             inp1 = x[0]
@@ -3527,13 +4181,19 @@ def forward(self, primals_1):
         )
 
     def test_input_mutation_aliases_and_output_alias(self):
+        # [FUNCTION DOC] Check output that is a view of an aliased input that was updated by a
+        # mutation through the other alias; the view is generated from the updated base. Asserts
+        # the graph text.
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Add one to a in place and return a same-shape view of b.
             # Here, we need to take care:that because and b are aliased
             # since a and b are aliased, we generate a view off of "updated b"
             a.add_(1)
             return b.view(b.shape)
 
         def inp_callable(req_grad):
+            # [FUNCTION DOC] HELPER: Make a base and two flattened views of a non-leaf; return
+            # the base and the views.
             base = torch.ones(2, 2, requires_grad=req_grad)
             x = base.add(1)
             return [base], [x.view(-1), x.view(-1)]
@@ -3558,7 +4218,12 @@ def forward(self, primals_1):
         )
 
     def test_input_aliased_with_mutation_output_alias(self):
+        # [FUNCTION DOC] Check two aliased inputs with a mutation through one while a separate
+        # third input stays unaliased and an output views the mutated alias; asserts the graph
+        # (two compiled inputs instead of three).
         def f(a, b, c):
+            # [FUNCTION DOC] HELPER: Double c in place and return b plus one and a flattened
+            # view of c.
             # a and c alias
             c.mul_(2)
             # The main thing we're testing here is that
@@ -3568,6 +4233,8 @@ def forward(self, primals_1):
             return b.add(1), c.view(-1)
 
         def inp_callable(req_grad):
+            # [FUNCTION DOC] HELPER: Make two bases, derive non-leaf tensors, return the bases
+            # and the arguments (two aliased flat views and one separate tensor).
             base1 = torch.ones(2, 2, requires_grad=req_grad)
             base2 = torch.ones(2, 2, requires_grad=req_grad)
             x = base1.add(1)
@@ -3595,11 +4262,16 @@ def forward(self, primals_1, primals_2):
         )
 
     def test_input_aliased_with_mutation_nontensor_interleaved(self):
+        # [FUNCTION DOC] Check aliased tensor inputs with a non-tensor scalar argument
+        # interleaved between them.
         def f(a, scale, b):
+            # [FUNCTION DOC] HELPER: Double b in place and return a plus the scalar.
             b.mul_(2)
             return a + scale
 
         def inp_callable(req_grad):
+            # [FUNCTION DOC] HELPER: Make a base and arguments consisting of a flat view, the
+            # integer three and another flat view.
             base = torch.ones(2, 2, requires_grad=req_grad)
             x = base.add(1)
             return [base], [x.view(-1), 3, x.view(-1)]
@@ -3612,11 +4284,16 @@ def forward(self, primals_1, primals_2):
         )
 
     def test_input_aliased_with_mutation_multiple_nontensors(self):
+        # [FUNCTION DOC] Check aliased tensor inputs with several non-tensor arguments
+        # interleaved with a separate tensor.
         def f(a, scale, b, offset, c):
+            # [FUNCTION DOC] HELPER: Double c in place and return a plus scale plus offset.
             c.mul_(2)
             return a + scale + offset
 
         def inp_callable(req_grad):
+            # [FUNCTION DOC] HELPER: Make two bases and arguments of aliased flat views, scalars
+            # and a separate tensor.
             base = torch.ones(2, 2, requires_grad=req_grad)
             x = base.add(1)
             standalone = torch.ones(4, requires_grad=req_grad)
@@ -3631,7 +4308,11 @@ def forward(self, primals_1, primals_2):
         )
 
     def test_input_metadata_mutation_aliases(self):
+        # [FUNCTION DOC] Check two aliased inputs where one gets only a metadata mutation
+        # (transpose): no synthetic base is built and the graph keeps two inputs. Asserts
+        # graph text.
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Transpose a in place and return a plus b.
             # a and b alias, and we do a metadata mutation on a
             # Since we're not mutating data, then b isn't affected at all.
             # We expect aot autograd to not bother with constructing a synthetic base.
@@ -3639,6 +4320,7 @@ def forward(self, primals_1, primals_2):
             return a + b
 
         def inp_callable(req_grad):
+            # [FUNCTION DOC] HELPER: Make a base and two flat views of a non-leaf.
             base = torch.ones(2, 2, requires_grad=req_grad)
             x = base.add(1)
             return [base], [x.view(-1), x.view(-1)]
@@ -3660,13 +4342,20 @@ def forward(self, primals_1, primals_2):
         )
 
     def test_input_mutation_aliases_and_none_require_gradients(self):
+        # [FUNCTION DOC] Check aliased inputs that do not require grad (no base attribute) with
+        # mutation: plain inputs work; with subclass inputs expects RuntimeError that subclasses
+        # are unsupported; with requires_grad on the third input asserts the graph text with
+        # as_strided scatter.
         def f(a, b, c):
+            # [FUNCTION DOC] HELPER: Double a in place and return b plus one and c plus one.
             # a and b alias, but neither require gradients (so they don't have a _base)
             # aot autograd should construct the synthetic base from `torch.Tensor(a.storage())`
             a.mul_(2)
             return b + 1, c + 1
 
         def inp_callable(req_grad):
+            # [FUNCTION DOC] HELPER: Make a non-grad base, a separate input with the requested
+            # requires_grad, and two flat views of the derived tensor plus the separate input.
             base = torch.ones(2, 2)
             c_arg = torch.ones(2, 2, requires_grad=req_grad)
             x = base.add(1)
@@ -3704,17 +4393,25 @@ def forward(self, primals_1, primals_2):
 
     @skipIfDynamoInput("Fails with dynamo")
     def test_input_mutation_aliases_bases_out_of_order(self):
+        # [FUNCTION DOC] Skipped under the dynamo variant. Two pairs of aliased inputs where
+        # only one pair is mutated (data mutation plus metadata mutation); plain inputs work,
+        # subclass inputs raise RuntimeError about aliased mutated inputs, and the grad case
+        # asserts the three-input graph text.
         # This tests our calling convention: if b and d are aliased, then the outer calling convention
         # that we send to the compiled forward becomes:
         # (b_d_base, a, c)
         # Importantly, even though a and c alias in our test, neither inputs are mutated,
         # So we don't need to do the base construction / deconstruction
         def f(a, b, c, d):
+            # [FUNCTION DOC] HELPER: Add one to b in place, unsqueeze d in place, return the sum
+            # of a, c, d and a flattened view of b.
             b.add_(1)
             d.unsqueeze_(0)
             return a + c + d, b.view(-1)
 
         def inp_callable(req_grad):
+            # [FUNCTION DOC] HELPER: Make two bases and four flat views where a and c alias one
+            # base and b and d alias the other.
             base1 = torch.ones(2, 2, requires_grad=req_grad)
             base2 = torch.ones(2, 2, requires_grad=req_grad)
             x1 = base1.add(1)
@@ -3762,15 +4459,21 @@ def forward(self, primals_1, primals_2, primals_3):
         )
 
     def test_input_mutation_unsqueeze_view_of_base_input(self):
+        # [FUNCTION DOC] Regression test: one input is the base itself and another is an
+        # unsqueezed view of it; returning the base must be treated as an alias of an input in
+        # the synthetic base calling convention.
         # Regression test: when one input is the base tensor (._base is None)
         # and another is an unsqueeze view of it, returning the base as output
         # must be treated as alias_of_input (not is_input) in the synthetic
         # base calling convention.
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Add one to b in place and return a.
             b.add_(1)
             return a
 
         def inp_callable(req_grad):
+            # [FUNCTION DOC] HELPER: Make a base and arguments consisting of its non-leaf
+            # derived tensor and an unsqueezed view of it.
             base = torch.ones(4, requires_grad=req_grad)
             x = base.add(1)
             return [base], [x, x.unsqueeze(0)]
@@ -3784,11 +4487,17 @@ def forward(self, primals_1, primals_2, primals_3):
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
     def test_synthetic_base_base_attribute_is_none(self):
+        # [FUNCTION DOC] CUDA only. Aliased CUDA inputs (detached slices so no input has a
+        # base attribute) with a mutation, to check the synthetic base logic handles missing
+        # base attributes.
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Add one to a in place and return a plus b.
             a.add_(1)
             return a + b
 
         def inp_callable():
+            # [FUNCTION DOC] HELPER: Make a CUDA base and two detached row slices; returns the
+            # base and the slices (also creates an unused grad tensor).
             base = torch.ones(4, 4, device="cuda")
             # detach() so that none of the inputs have a ._base attribute.
             a = base[0].detach()
@@ -3799,12 +4508,17 @@ def forward(self, primals_1, primals_2, primals_3):
         self.verify_aot_autograd(f, inp_callable, test_mutation=True)
 
     def test_input_mutation_alias_everything(self):
+        # [FUNCTION DOC] Large combined test: an aliased and mutated input pair, a metadata
+        # mutation on another input, and outputs aliasing an intermediate and each other;
+        # asserts the graph text with synthetic base and a single real output.
         # Mondo test that tests a combination of:
         # input is mutated, that aliases another input (so we make a synthetic base)
         # an output is an alias of another output
         # an output is an alias of an intermediate
         # a and c are aliased
         def f(a, b, c):
+            # [FUNCTION DOC] HELPER: Double c in place, transpose b in place, form a sum of a
+            # and c, return a flattened view, a transposed b and an unsqueezed view.
             c.mul_(2)  # mutates c
             b.t_()  # metadata mutate b
             tmp = a + c
@@ -3816,6 +4530,8 @@ def forward(self, primals_1, primals_2, primals_3):
             return out1, out2, out3
 
         def inp_callable(req_grad):
+            # [FUNCTION DOC] HELPER: Make two bases and arguments where a and c are flat views
+            # of one non-leaf and b is the other non-leaf.
             base1 = torch.ones(2, 2, requires_grad=req_grad)
             base2 = torch.ones(2, 2, requires_grad=req_grad)
             # Note: in our test, the add() is important because we need the graph inputs to be non-leaves so we can mutate them.
@@ -3857,7 +4573,11 @@ def forward(self, primals_1, primals_2):
         )
 
     def test_dynamic_shape_output_not_in_bw_graph(self):
+        # [FUNCTION DOC] Check that when a compiled function returns a symbolic size as an
+        # output (dynamic shapes), the backward graph takes only one gradient input; asserts the
+        # graph text.
         def f(x):
+            # [FUNCTION DOC] HELPER: Return a list of the input plus one and its size.
             return [x + 1, x.shape[0]]
 
         inp = torch.ones(5, requires_grad=True)
@@ -3885,7 +4605,10 @@ def forward(self, tangents_1):
         )
 
     def test_no_grad_input_output(self):
+        # [FUNCTION DOC] Check functions with outputs from two inputs across all
+        # requires_grad combinations.
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Return cosines of both inputs and their product.
             return a.cos(), b.cos(), a * b
 
         inp_thunks = [
@@ -3897,7 +4620,10 @@ def forward(self, tangents_1):
             self.verify_aot_autograd(f, inps)
 
     def test_some_output_requires_grad_input_doesnt(self):
+        # [FUNCTION DOC] Check an output that is a view of an input with requires_grad turned on
+        # in place for a non-requiring input.
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Flatten a, enable requires_grad on the view and return it.
             a_view = a.view(-1)
             a_view.requires_grad_(True)
             return a_view
@@ -3906,7 +4632,10 @@ def forward(self, tangents_1):
         self.verify_aot_autograd(f, inp)
 
     def test_some_outputs_dont_require_grad_view(self):
+        # [FUNCTION DOC] Check returning a detached view of an input together with a
+        # differentiable input.
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Return a detached alias of a and b.
             return a.detach(), b
 
         inp = [
@@ -3916,7 +4645,10 @@ def forward(self, tangents_1):
         self.verify_aot_autograd(f, inp)
 
     def test_some_outputs_dont_require_grad_non_view(self):
+        # [FUNCTION DOC] Check returning a detached computed value together with a
+        # differentiable input.
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Return the detached result of a plus one and b.
             return a.add(1).detach(), b
 
         inp = [
@@ -3926,7 +4658,11 @@ def forward(self, tangents_1):
         self.verify_aot_autograd(f, inp)
 
     def test_inner_grad(self):
+        # [FUNCTION DOC] Check a function that internally calls autograd grad on a
+        # computed value.
         def foo(x):
+            # [FUNCTION DOC] HELPER: Exponentiate and return the gradient of the result w.r.t.
+            # the input.
             y = torch.exp(x)
             z = torch.autograd.grad(y, x)
             return z
@@ -3935,13 +4671,19 @@ def forward(self, tangents_1):
         self.verify_aot_autograd(foo, inps)
 
     def test_grad_context(self):
+        # [FUNCTION DOC] Check the compiler only runs for backward when grad mode matters: under
+        # disabled grad mode the second compiler (the graph size recorder) never runs; with grad
+        # enabled it is not run until backward, then records a graph larger than two nodes.
         def foo(x):
+            # [FUNCTION DOC] HELPER: Double the input.
             return x * 2
 
         inps = [torch.randn((), requires_grad=True)]
         graph_size = None
 
         def get_graph_size(fx_g, _):
+            # [FUNCTION DOC] HELPER: Compiler recording the node count of the graph in an
+            # enclosing variable and returning the graph unchanged.
             nonlocal graph_size
             graph_size = len(fx_g.graph.nodes)
             return fx_g
@@ -3959,19 +4701,25 @@ def forward(self, tangents_1):
             self.assertTrue(graph_size > 2)
 
     def test_output_dict(self):
+        # [FUNCTION DOC] Check functions returning dicts: same tensor under two keys, a dict
+        # mixing input and computation, and a dict input iterated and scaled.
         def f(x):
+            # [FUNCTION DOC] HELPER: Return a dict mapping two keys to the same input.
             return {"a": x, "b": x}
 
         inp = [torch.randn(3, 3, requires_grad=True)]
         self.verify_aot_autograd(f, inp)
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Return a dict with the first input and the sum of
+            # both inputs.
             return {"a": x, "b": y + x}
 
         inp = [torch.randn(3, requires_grad=True), torch.randn(3)]
         self.verify_aot_autograd(f, inp)
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Return a dict with each value of the input dict doubled.
             new_d = {}
             for k in x:
                 new_d[k] = x[k] * 2
@@ -3981,12 +4729,16 @@ def forward(self, tangents_1):
         b = torch.randn(3, requires_grad=True)
 
         def inp_callable():
+            # [FUNCTION DOC] HELPER: Build one dict of the two tensors and return it as both
+            # function and graph inputs.
             inps = [{"a": a, "b": b}]
             return inps, inps
 
         self.verify_aot_autograd(f, inp_callable)
 
     def test_module(self):
+        # [FUNCTION DOC] Check compiled_module on a Linear plus ReLU model with no-op compilers:
+        # output and parameter gradients match eager.
         mod = nn.Sequential(nn.Linear(32, 32), nn.ReLU())
         compiled_mod = compiled_module(mod, nop, nop)
         inp = torch.randn(32, 32)
@@ -3999,19 +4751,27 @@ def forward(self, tangents_1):
         self.assertEqual((out, grads), (ref_out, ref_grads))
 
     def test_batchnorm(self):
+        # [FUNCTION DOC] Check compiled_module on a BatchNorm2d with no-op compilers runs
+        # forward and backward without error.
         mod = compiled_module(nn.BatchNorm2d(4), nop, nop)
         x = torch.ones(1, 4, 2, 2)
         mod(x).sum().backward()
 
     def test_list_codegen(self):
+        # [FUNCTION DOC] Check a compiler that returns a boxed-call function (takes a single
+        # list of inputs) works for forward and backward of a three-input function.
         def list_nop(f, _):
+            # [FUNCTION DOC] HELPER: Compiler returning a wrapper flagged as a boxed call that
+            # unpacks the input list into the graph module call.
             def g(inps):
+                # [FUNCTION DOC] HELPER: Call the graph module with the unpacked input list.
                 return f(*inps)
 
             g._boxed_call = True
             return g
 
         def f(a, b, c):
+            # [FUNCTION DOC] HELPER: Product of sine of a, cosine of b and sine of c.
             return a.sin() * b.cos() * c.sin()
 
         f = aot_function(f, list_nop)
@@ -4020,12 +4780,18 @@ def forward(self, tangents_1):
 
     @patch("torch._functorch.aot_autograd.AOT_COUNTER", new_callable=itertools.count)
     def test_compilation_context(self, counter):
+        # [FUNCTION DOC] Check the AOT compilation context reported to compilers: records the
+        # context name and node count for each compile (forward, inference, backward), with the
+        # global counter patched to a fresh counter; asserts the recorded list.
         def f(x):
+            # [FUNCTION DOC] HELPER: Sine applied twice.
             return x.sin().sin()
 
         count = []
 
         def compiler(fx_g, _):
+            # [FUNCTION DOC] HELPER: Compiler that appends the current compilation context name
+            # and graph node count to a list and returns the graph.
             context = get_aot_compilation_context()
             count.append((context[0], len(fx_g.graph.nodes)))
             return fx_g
@@ -4041,14 +4807,21 @@ def forward(self, tangents_1):
         )
 
     def test_dupe_arg(self):
+        # [FUNCTION DOC] Check calling with the same tensor passed for two arguments (duplicate
+        # arguments) matches eager.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Add the two inputs.
             return x + y
 
         x = torch.randn(3, 3, requires_grad=True)
         self.verify_aot_autograd(f, [x, x])
 
     def test_dupe_arg_torture(self):
+        # [FUNCTION DOC] Check duplicate arguments where the function applies a metadata
+        # mutation to each (transpose and unsqueeze in place) and adds them.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Transpose x in place, unsqueeze y in place, return
+            # their sum.
             x.t_()
             y.unsqueeze_(0)
             return x + y
@@ -4058,7 +4831,12 @@ def forward(self, tangents_1):
 
     # See https://github.com/pytorch/pytorch/issues/100224
     def test_dupe_arg_returned_as_output(self):
+        # [FUNCTION DOC] Regression test for issue 100224: a duplicated argument that is
+        # mutated through one name and returned through the other; result and mutated input
+        # must match eager.
         def f(a, b, a_):
+            # [FUNCTION DOC] HELPER: Add one to the first element of a in place and return the
+            # third argument.
             a[0].add_(1)
             return a_
 
@@ -4077,12 +4855,20 @@ def forward(self, tangents_1):
     @patch("torch._functorch.aot_autograd.AOT_COUNTER", new_callable=itertools.count)
     @patch("torch._functorch.config.debug_assert", True)
     def test_invalid_dupe_left_bias(self, counter):
+        # [FUNCTION DOC] Patched counter and debug assert. Checks that when only the first of
+        # two duplicate arguments gets a metadata mutation, the deduplicating strategy is
+        # chosen; calling the module compiled for duplicates with distinct tensors raises
+        # AssertionError saying the duplicate assumption was violated at runtime.
         # This test checks that, just because only the first
         # argument did a metadata mutation, we still correctly
         # switch to strategy 2 (deduplicate)
         # See: https://github.com/pytorch/pytorch/pull/89896#discussion_r1036224447
         class F(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward transposes x in place and returns a tuple
+            # of the sum.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Transpose x in place and return a one-element tuple
+                # with x plus y.
                 x.t_()
                 return (x + y,)
 
@@ -4100,17 +4886,27 @@ def forward(self, tangents_1):
     @patch("torch._functorch.aot_autograd.AOT_COUNTER", new_callable=itertools.count)
     @patch("torch._functorch.config.debug_assert", True)
     def test_invalid_dupe(self, counter):
+        # [FUNCTION DOC] Run the invalid-duplicate check with real tensors.
         self._test_invalid_dupe(counter, fake=False)
 
     # See Note: Dynamo recompilation guarding invalid grad for why this test exists
     @patch("torch._functorch.aot_autograd.AOT_COUNTER", new_callable=itertools.count)
     @patch("torch._functorch.config.debug_assert", True)
     def test_invalid_dupe_fake(self, counter):
+        # [FUNCTION DOC] Run the invalid-duplicate check with fake tensors.
         self._test_invalid_dupe(counter, fake=True)
 
     def _test_invalid_dupe(self, counter, fake):
+        # [FUNCTION DOC] HELPER: Compile a module that unsqueezes both inputs in place with
+        # distinct inputs, run it with duplicates (allowed), recompile for duplicate inputs
+        # (real or fake tensors per the fake flag), run with duplicates, then confirm calling
+        # with distinct tensors raises AssertionError about the broken duplicate assumption.
         class F(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that unsqueezes both inputs in place and returns a
+            # tuple of their sum.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Unsqueeze both inputs in place and return a one-element
+                # tuple with their sum.
                 x.unsqueeze_(0)
                 y.unsqueeze_(0)
                 return (x + y,)
@@ -4156,17 +4952,25 @@ def forward(self, tangents_1):
     @patch("torch._functorch.aot_autograd.AOT_COUNTER", new_callable=itertools.count)
     @patch("torch._functorch.config.debug_assert", True)
     def test_invalid_requires_grad(self, counter):
+        # [FUNCTION DOC] Run the invalid-requires-grad check with real tensors.
         self._test_invalid_requires_grad(counter, fake=False)
 
     # See Note: Dynamo recompilation guarding invalid grad for why this test exists
     @patch("torch._functorch.aot_autograd.AOT_COUNTER", new_callable=itertools.count)
     @patch("torch._functorch.config.debug_assert", True)
     def test_invalid_requires_grad_fake(self, counter):
+        # [FUNCTION DOC] Run the invalid-requires-grad check with fake tensors.
         self._test_invalid_requires_grad(counter, fake=True)
 
     def _test_invalid_requires_grad(self, counter, fake):
+        # [FUNCTION DOC] HELPER: Compile a module for inputs that require grad, compare outputs
+        # and grads with eager also for a non-requiring second input, then compile for a
+        # non-requiring second input and confirm calling it with a grad-requiring input raises
+        # AssertionError about the requires-grad assumption.
         class F(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that returns a tuple with the sum of its inputs.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Return a one-element tuple with the sum of both inputs.
                 return (x + y,)
 
         x = torch.randn(3, 3, requires_grad=True)
@@ -4203,22 +5007,31 @@ def forward(self, tangents_1):
         )
 
     def test_custom_autograd(self):
+        # [FUNCTION DOC] Check a custom autograd Function whose backward adds one to the
+        # gradient works through the harness.
         class CustomFn(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Autograd Function cloning in forward with a backward adding
+            # one to the gradient.
             @staticmethod
             def forward(ctx, x):
+                # [FUNCTION DOC] HELPER: Return a clone of the input.
                 return x.clone()
 
             @staticmethod
             def backward(ctx, grad_output):
+                # [FUNCTION DOC] HELPER: Return the gradient plus one.
                 return grad_output + 1
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Apply the custom Function.
             return CustomFn.apply(x)
 
         self.verify_aot_autograd(f, [torch.randn(3)])
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
     def test_autocast_disable_guard(self):
+        # [FUNCTION DOC] CUDA only. Within the disable-autocast guard a CUDA matrix
+        # multiplication keeps dtype float32.
         with torch._C._DisableAutocast():
             x = torch.rand([4, 4]).cuda()
             y = x @ x
@@ -4226,7 +5039,11 @@ def forward(self, tangents_1):
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
     def test_nonidempotent_amp(self):
+        # [FUNCTION DOC] CUDA only. Check an einsum plus log softmax with float32 and float16
+        # inputs under autocast, without and with requires_grad, via the harness.
         def f(self_s_emb, add_3):
+            # [FUNCTION DOC] HELPER: Einsum of the two inputs, log softmax, returned as a
+            # one-element tuple.
             einsum_2 = torch.functional.einsum("ah,th->t", self_s_emb, add_3)
             log_softmax_2 = einsum_2.log_softmax(-1)
             return (log_softmax_2,)
@@ -4245,6 +5062,10 @@ def forward(self, tangents_1):
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
     @unittest.skipIf(not torch.backends.cudnn.is_available(), "CUDNN is unavailable")
     def test_batch_norm_amp(self):
+        # [FUNCTION DOC] CUDA and cudnn required. Traces a half precision batch norm with
+        # float32 parameters through make_fx using the cudnn batch norm decomposition
+        # (miopen on ROCm) and checks outputs are close to the direct call; raises
+        # AssertionError on mismatch.
         device = "cuda"
         input_dtype = torch.float16
         param_dtype = torch.float32
@@ -4257,6 +5078,8 @@ def forward(self, tangents_1):
         )
 
         def bn(x):
+            # [FUNCTION DOC] HELPER: Call the vendor batch norm kernel on x with the surrounding
+            # weight, bias and running stats in training mode.
             fn = (
                 torch.ops.aten.cudnn_batch_norm
                 if torch.version.hip is None
@@ -4288,6 +5111,9 @@ def forward(self, tangents_1):
                 raise AssertionError(f"Tensors not allclose: {a} vs {b}")
 
     def test_output_op_depending_on_symint(self):
+        # [FUNCTION DOC] End-to-end check that an expand whose size depends on a symbolic int
+        # compiles with dynamic shapes and the min cut partitioner (regression for a proxy
+        # association bug); output must match eager.
         """
         It won't be obvious from reading this test what it's testing for.  We should probably make it into a more
         focused unit test.
@@ -4299,6 +5125,7 @@ def forward(self, tangents_1):
         inp = torch.randn(5, requires_grad=True)
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Expand the input to its own shape.
             return x.expand(x.shape)
 
         # TODO(whc) make this work (test setup is wrong somehow)
@@ -4321,6 +5148,8 @@ def forward(self, tangents_1):
         self.assertEqual(out, f(inp))
 
     def test_inference_mode(self):
+        # [FUNCTION DOC] Check an aot_module of a Linear layer gives the same result as eager
+        # under inference mode.
         m = torch.nn.Linear(4, 4)
         inp = torch.randn(4, 4)
 
@@ -4332,6 +5161,9 @@ def forward(self, tangents_1):
         self.assertEqual(out_ref, out_test)
 
     def test_default_partitioner_saves_symints_not_tensors_for_bw(self):
+        # [FUNCTION DOC] Check the default partitioner saves symbolic sizes rather than the
+        # input tensor for backward (saving the input would fail because it is mutated through
+        # an alias); compares output and gradient with eager under dynamic shapes.
         """
         In this test, the important thing is that primals_1 is **only** needed in the backward
         in order to grab its sizes.
@@ -4345,6 +5177,8 @@ def forward(self, tangents_1):
         """
 
         def f(a):
+            # [FUNCTION DOC] HELPER: Take the first row, build a boolean mask of ones, fill the
+            # row with zero in place and return the result.
             b = a[0]
             c = torch.ones_like(b, dtype=torch.bool)
             d = b.masked_fill_(c, 0)
@@ -4365,14 +5199,21 @@ def forward(self, tangents_1):
         self.assertEqual(inp_ref.grad, inp_test.grad)
 
     def test_buffer_copied_in_graph(self):
+        # [FUNCTION DOC] Check a module with a mutated buffer and two parameters under
+        # aot_module with input mutations kept; asserts the forward graph includes a copy back
+        # into the buffer, and that outputs, parameter grads and input grads match eager.
         class MyModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a buffer, and two scalar parameters.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a zero buffer and two zero parameters.
                 super().__init__()
                 self.buf = torch.nn.Buffer(torch.zeros(1))
                 self.w1 = torch.nn.Parameter(torch.zeros(1))
                 self.w2 = torch.nn.Parameter(torch.zeros(1))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Add one to the buffer in place and return the sum of
+                # the product of parameters and input plus the buffer sum.
                 self.buf.add_(1)
                 return (self.w1 * x * self.w2).sum() + self.buf.sum()
 
@@ -4420,8 +5261,12 @@ def forward(self, primals_1, primals_2, primals_3, primals_4):
         self.assertEqual(inp_ref.grad, inp_test.grad)
 
     def test_buffer_copied_in_graph_with_different_shapes(self):
+        # [FUNCTION DOC] Same buffer mutation check with different shapes (matrix parameter and
+        # square buffer); asserts the graph and compares outputs and gradients with eager.
         class MyModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a ones buffer and a matrix parameter.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the buffer and the parameter.
                 super().__init__()
                 self.buf = torch.nn.Buffer(torch.ones(4, 4))
                 self.w = torch.nn.Parameter(
@@ -4429,6 +5274,8 @@ def forward(self, primals_1, primals_2, primals_3, primals_4):
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Add one to the buffer in place and return the sum of
+                # the matrix product plus the buffer sum.
                 self.buf.add_(1)
                 return (self.w @ x).sum() + self.buf.sum()
 
@@ -4475,12 +5322,18 @@ def forward(self, primals_1, primals_2, primals_3):
         self.assertEqual(inp_ref.grad, inp_test.grad)
 
     def test_buffer_batch_norm(self):
+        # [FUNCTION DOC] Check a BatchNorm1d module with input mutation kept: asserts forward
+        # graph (functional batch norm plus copies of the updated statistics and counter) and
+        # backward graph, and compares outputs and grads with eager.
         class MyModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module wrapping a BatchNorm1d layer.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the batch norm layer.
                 super().__init__()
                 self.m = torch.nn.BatchNorm1d(100)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply the batch norm layer.
                 return self.m(x)
 
         model_for_eager = MyModel()
@@ -4544,7 +5397,11 @@ def forward(self, primals_1, primals_6, getitem_1, getitem_2, getitem_3, getitem
         self.assertEqual(inp_ref.grad, inp_test.grad)
 
     def test_new_inp_requires_grad_now(self):
+        # [FUNCTION DOC] Check an in-place add on an input that does not require grad with a
+        # second input that does: forward graph clones instead of copying back; backward returns
+        # no gradient for the first and the incoming gradient for the second.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Add y to x in place and return x.
             return x.add_(y)
 
         fw_graph_cell = [None]
@@ -4595,14 +5452,21 @@ def forward(self, tangents_1):
         )
 
     def test_real_weights_in_symbolic_mode(self):
+        # [FUNCTION DOC] Check make_fx in symbolic mode with real weights allowed: traced and
+        # functionalized graphs match eager, have one placeholder (no parameter lifting), and
+        # tracing with non-fake inputs not allowed raises an error about converting tensors to
+        # fake tensors.
         from functorch.experimental import functionalize
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a Linear layer.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(5, 5)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply the linear layer.
                 x = self.linear(x)
                 return x
 
@@ -4646,12 +5510,20 @@ def forward(self, tangents_1):
             )
 
     def test_real_weights_in_symbolic_mode_with_inplace_ops(self):
+        # [FUNCTION DOC] Check tracing in symbolic mode with real weights where a buffer
+        # is mutated in place and resized; expects an error mentioning that metadata
+        # cannot be changed.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a ones buffer.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the buffer.
                 super().__init__()
                 self.buffer = torch.nn.Buffer(torch.ones(4, 5))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Add three to the buffer in place, resize the result,
+                # raise AssertionError if its shape differs from the buffer shape, return the
+                # sum of the input and the buffer.
                 y = self.buffer.add_(3)
                 y.resize_([20])
                 if y.shape != self.buffer.shape:
@@ -4667,11 +5539,19 @@ def forward(self, tangents_1):
             make_fx(m, tracing_mode="symbolic", _allow_non_fake_inputs=True)(inp)
 
     def _compile_and_erase_bases(self, *output_view_indices):
+        # [FUNCTION DOC] HELPER: Return a decorator that compiles a function with
+        # aot_function using a forward compiler that wraps the outputs at the given positions
+        # in a tensor subclass without base or view function, forcing view reconstruction
+        # without view replay.
         # Overrides _base and _view_func tensor attributes, so as to avoid the view-replay
         # execution path when reconstructing views.
         class NoViewReplayTensor(torch.Tensor):
+            # [CLASS DOC] HELPER: Wrapper tensor subclass reporting no base and no view
+            # function; dispatch simply forwards to the default behavior.
             @staticmethod
             def __new__(cls, tensor):
+                # [FUNCTION DOC] HELPER: Create a wrapper subclass instance matching the
+                # tensor's shape, strides, offset, device, layout, requires_grad and dtype.
                 kwargs = {
                     "strides": tensor.stride(),
                     "storage_offset": tensor.storage_offset(),
@@ -4684,13 +5564,17 @@ def forward(self, tangents_1):
 
             @property
             def _base(self):
+                # [FUNCTION DOC] HELPER: Always report no base.
                 return None
 
             @property
             def _view_func(self):
+                # [FUNCTION DOC] HELPER: Always report no view function.
                 return None
 
             def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                # [FUNCTION DOC] HELPER: Forward the operation to the default dispatch
+                # implementation with empty kwargs if none given.
                 if kwargs is None:
                     kwargs = {}
                 return super().__torch_dispatch__(func, types, args, kwargs)
@@ -4698,6 +5582,8 @@ def forward(self, tangents_1):
         # Wraps the outputs that are views of the FX graph 'g' with NoViewReplayTensor,
         # since they are the only ones that will get reconstructed.
         def wrapper(g, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Run the graph and wrap the outputs at the chosen positions
+            # in the no-view-replay subclass.
             outs = list(g(*args, **kwargs))
             for i in output_view_indices:
                 outs[i] = NoViewReplayTensor(outs[i])
@@ -4706,8 +5592,11 @@ def forward(self, tangents_1):
         return lambda f: aot_function(f, fw_compiler=lambda g, _: partial(wrapper, g))
 
     def test_output_aliases_input_view_meta_replay(self):
+        # [FUNCTION DOC] Check an output that is a view of an input, rebuilt without view
+        # replay, still gets a view backward node.
         @self._compile_and_erase_bases(0)
         def f(a):
+            # [FUNCTION DOC] HELPER: Return a flattened view of the input.
             return a.view(-1)
 
         inp = torch.ones(2, 2, requires_grad=True)
@@ -4719,8 +5608,12 @@ def forward(self, tangents_1):
         )
 
     def test_output_aliases_intermediate_view_meta_replay(self):
+        # [FUNCTION DOC] Check two outputs that are views of an intermediate, rebuilt without
+        # view replay, both have a view backward node.
         @self._compile_and_erase_bases(0, 1)
         def f(a):
+            # [FUNCTION DOC] HELPER: Clone the input and return two flattened views of
+            # the clone.
             b = a.clone()
             return b.view(-1), b.view(-1)
 
@@ -4738,8 +5631,11 @@ def forward(self, tangents_1):
         )
 
     def test_output_aliases_output_view_meta_replay(self):
+        # [FUNCTION DOC] Check an output that is a view of another output, rebuilt without view
+        # replay: storages are shared and the view has a view backward node.
         @self._compile_and_erase_bases(1)
         def f(a):
+            # [FUNCTION DOC] HELPER: Return an intermediate and a flattened view of it.
             b = a.add(10)
             return b, b.view(-1)
 
@@ -4754,6 +5650,9 @@ def forward(self, tangents_1):
 
     @patch("torch._dynamo.config.assume_static_by_default", False)
     def test_dynamic_output_aliases_input_view_meta_replay(self):
+        # [FUNCTION DOC] With dynamic shapes off by default patched to false and inductor
+        # backend: views with a symbolic size must be rebuilt through as_strided (first output)
+        # while a static view uses a view backward node.
         # - torch.compile: using it so we can have a SymInt in the FX graph.
         # - Compiling with inductor, so that tensor._base isn't tracked.
         #
@@ -4763,6 +5662,7 @@ def forward(self, tangents_1):
         #   - tensor._base will be None
         @torch.compile(backend="inductor")
         def f(a, sz):
+            # [FUNCTION DOC] HELPER: Return a view with the given size and a flattened view.
             return a.view(sz), a.view(-1)
 
         inp = torch.ones(2, 2, requires_grad=True)
@@ -4779,6 +5679,8 @@ def forward(self, tangents_1):
         )
 
     def test_duplicated_arguments_on_tensor_overlap(self):
+        # [FUNCTION DOC] Regression check that duplicated size arguments with overlapping tensor
+        # storages compile with dynamic shapes without error.
         # Test whether we correctly handle duplicated arguments when changing the
         # parameters, so that we take the base tensor as argument.
         #
@@ -4787,6 +5689,7 @@ def forward(self, tangents_1):
 
         @torch.compile(dynamic=True)
         def foo(t0, t1, s0, s1):
+            # [FUNCTION DOC] HELPER: Add each scalar to its tensor in place and return both.
             return t0.add_(s0), t1.add_(s1)
 
         tensor = torch.rand(10)
@@ -4794,15 +5697,21 @@ def forward(self, tangents_1):
 
     @parametrize("use_autograd", [False, True])
     def test_mark_outputs_dynamic(self, use_autograd: bool):
+        # [FUNCTION DOC] Parameterized by whether autograd is used. Resets counters and dynamo,
+        # compiles two aot_eager functions, then checks outputs of a static-shape call do not
+        # carry the propagated dynamic indices marker while outputs of a later call with new
+        # (dynamic) sizes do; two AOT compilations are counted each time.
         counters.clear()
         torch._dynamo.reset()
 
         @torch.compile(backend="aot_eager", fullgraph=True)
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Matrix product of the two inputs.
             return torch.matmul(x, y)
 
         @torch.compile(backend="aot_eager", fullgraph=True)
         def fn2(z):
+            # [FUNCTION DOC] HELPER: Double the input.
             return z * 2
 
         # 1. static
@@ -4827,18 +5736,28 @@ def forward(self, tangents_1):
         torch._dynamo.reset()
 
     def test_mark_activations_dynamic(self):
+        # [FUNCTION DOC] Checks activations saved for backward are marked dynamic only when the
+        # compile was dynamic: uses saved-tensor hooks whose pack and unpack check for the
+        # propagated dynamic marker; static first call expects no marker, a second call with new
+        # sizes expects the marker; one AOT compile each.
         counters.clear()
         torch._dynamo.reset()
 
         @torch.compile(backend="aot_eager", fullgraph=True)
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Chain of four matrix products with the second input.
             out = torch.matmul(x, y)
             out2 = torch.matmul(out, y)
             out3 = torch.matmul(out2, y)
             return torch.matmul(out3, y)
 
         def make_assert_pack(dynamic):
+            # [FUNCTION DOC] HELPER: Return a saved-tensor pack hook that raises AssertionError
+            # unless the presence of the dynamic marker on the activation equals the expected
+            # flag, and returns the activation.
             def pack(activation):
+                # [FUNCTION DOC] HELPER: Raise AssertionError unless the marker presence equals
+                # the expected flag; return the activation.
                 if hasattr(activation, "_dynamo_propagated_dynamic_indices") != dynamic:
                     raise AssertionError(
                         f"Expected hasattr(..., '_dynamo_propagated_dynamic_indices') to be {dynamic}"
@@ -4848,7 +5767,12 @@ def forward(self, tangents_1):
             return pack
 
         def make_assert_unpack(dynamic):
+            # [FUNCTION DOC] HELPER: Return a saved-tensor unpack hook that raises
+            # AssertionError unless the presence of the dynamic marker on the activation equals
+            # the expected flag, and returns the activation.
             def unpack(activation):
+                # [FUNCTION DOC] HELPER: Raise AssertionError unless the marker presence equals
+                # the expected flag; return the activation.
                 if hasattr(activation, "_dynamo_propagated_dynamic_indices") != dynamic:
                     raise AssertionError(
                         f"Expected hasattr(..., '_dynamo_propagated_dynamic_indices') to be {dynamic}"
@@ -4882,29 +5806,41 @@ def forward(self, tangents_1):
     @torch._functorch.config.patch(saved_tensors_hooks_filtering_mode="no_static")
     @torch._functorch.config.patch(recompute_views=True)
     def test_saved_tensors_hooks_mutations_raise(self):
+        # [FUNCTION DOC] CUDA only, with no_static hook filtering and view recomputation
+        # configs. Saved tensor hooks that mutate their input in place under compile with
+        # dynamic inputs must raise AssertionError that mutations in saved tensor hooks are not
+        # allowed (inner compiler exception is re-raised).
         ctx = torch.autograd.graph.saved_tensors_hooks
         device = "cuda"
 
         class SAF(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Autograd Function that returns its input and saves it, with a
+            # backward adding the saved input to the gradient.
             @staticmethod
             def forward(ctx, x):
+                # [FUNCTION DOC] HELPER: Save the input and return it.
                 ctx.save_for_backward(x)
                 return x
 
             @staticmethod
             def backward(ctx, gx):
+                # [FUNCTION DOC] HELPER: Return the gradient plus the saved input.
                 (saved_x,) = ctx.saved_tensors
                 return gx + saved_x
 
         def mutate(x):
+            # [FUNCTION DOC] HELPER: Double the tensor in place and return it.
             return x.mul_(2)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Double the input and apply the saving Function.
             x = 2 * x
             x = SAF.apply(x)
             return x
 
         def inp_fn():
+            # [FUNCTION DOC] HELPER: Make a CUDA ones matrix requiring grad with both dimensions
+            # marked dynamic.
             x = torch.ones(2, 3, device=device, requires_grad=True)
             torch._dynamo.mark_dynamic(x, 0)
             torch._dynamo.mark_dynamic(x, 1)
@@ -4922,6 +5858,9 @@ def forward(self, tangents_1):
                 raise e.inner_exception from e
 
     def test_mark_activations_dynamic_with_nested(self):
+        # [FUNCTION DOC] Like the activation marking test but with a jagged nested tensor input
+        # whose flattened tensors shift output offsets; checks hook-observed activations are
+        # unmarked for static sizes and marked for new dynamic sizes.
         # The flattened tensors of the nested tensor aren't
         # marked as activations, but they add some offset
         # to the fw_outs. This test ensures that we handle
@@ -4930,7 +5869,11 @@ def forward(self, tangents_1):
         torch._dynamo.reset()
 
         def make_assert_pack(dynamic):
+            # [FUNCTION DOC] HELPER: Return a saved-tensor pack hook that raises AssertionError
+            # unless presence of the dynamic marker equals the expected flag.
             def pack(activation):
+                # [FUNCTION DOC] HELPER: Raise AssertionError unless the marker presence equals
+                # the expected flag; return the activation.
                 if hasattr(activation, "_dynamo_propagated_dynamic_indices") != dynamic:
                     raise AssertionError(
                         f"Expected hasattr(..., '_dynamo_propagated_dynamic_indices') to be {dynamic}"
@@ -4940,7 +5883,11 @@ def forward(self, tangents_1):
             return pack
 
         def make_assert_unpack(dynamic):
+            # [FUNCTION DOC] HELPER: Return a saved-tensor unpack hook that raises
+            # AssertionError unless presence of the dynamic marker equals the expected flag.
             def unpack(activation):
+                # [FUNCTION DOC] HELPER: Raise AssertionError unless the marker presence equals
+                # the expected flag; return the activation.
                 if hasattr(activation, "_dynamo_propagated_dynamic_indices") != dynamic:
                     raise AssertionError(
                         f"Expected hasattr(..., '_dynamo_propagated_dynamic_indices') to be {dynamic}"
@@ -4952,6 +5899,7 @@ def forward(self, tangents_1):
         # 1. static
         @torch.compile(backend="aot_eager", fullgraph=True)
         def fn(x, y, nt):
+            # [FUNCTION DOC] HELPER: Sum of a matrix product plus a clone of the nested tensor.
             out = torch.matmul(x, y)
             return out.sum() + nt.clone()
 
@@ -4984,6 +5932,10 @@ def forward(self, tangents_1):
         torch._dynamo.reset()
 
     def test_compute_outer_size_and_stride_bug(self):
+        # [FUNCTION DOC] Builds a subclass creation metadata object bypassing its constructor,
+        # with two plain inner tensor entries, dynamic outer size (unknown) and partially
+        # unknown stride, then checks computing the outer size and stride from a packed list of
+        # tensors and symbolic ints returns size (4, 6) and stride (6, 1).
         import dataclasses
 
         from torch._functorch._aot_autograd.schemas import (
@@ -5025,8 +5977,11 @@ def forward(self, tangents_1):
         self.assertEqual(outer_stride, (6, 1))
 
     def test_subclass_dynamic_stride(self):
+        # [FUNCTION DOC] Compile a sine function over a TwoTensor with dynamic shapes on the
+        # aot_eager backend and check the output stride equals the input stride.
         @torch.compile(backend="aot_eager", dynamic=True)
         def f(x):
+            # [FUNCTION DOC] HELPER: Sine of the input.
             return x.sin()
 
         a = torch.randn(4, 6)
@@ -5036,6 +5991,9 @@ def forward(self, tangents_1):
         self.assertEqual(out.stride(), inp.stride())
 
     def _make_model_and_input(self, hidden=1024, vocab=4096, seq_len=128):
+        # [FUNCTION DOC] HELPER: Build a small bias-free multi-layer perceptron producing
+        # vocabulary logits on CUDA, a grad-requiring random input and random integer labels;
+        # returns all three.
         """Build a small model that produces non-scalar output (like an LM head)."""
         model = nn.Sequential(
             nn.Linear(hidden, hidden, bias=False),
@@ -5049,6 +6007,10 @@ def forward(self, tangents_1):
         return model, x, labels
 
     def _make_refcount_probe(self):
+        # [FUNCTION DOC] HELPER: Create an autograd Function that receives gradients in a boxed
+        # list, pops the gradient, keeps only a weak reference, deletes it, and records in a
+        # result dictionary whether the weak reference is dead (no extra references held).
+        # Returns the Function class and the dictionary.
         """Create a boxed-grads probe that checks the framework holds no extra refs.
 
         The probe uses boxed_grads_call=True so PyNode::apply moves grads
@@ -5061,14 +6023,20 @@ def forward(self, tangents_1):
         result_box = {}
 
         class RefcountProbe(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Autograd Function with boxed gradient calls that clones its
+            # input and records in the result dictionary whether the popped gradient was freed.
             boxed_grads_call = True
 
             @staticmethod
             def forward(ctx, pred):
+                # [FUNCTION DOC] HELPER: Return a clone of the prediction.
                 return pred.clone()
 
             @staticmethod
             def backward(ctx, grads):
+                # [FUNCTION DOC] HELPER: Pop the gradient from the list, clone it for return,
+                # weakly reference and delete the original, record whether the reference is
+                # dead, return the clone.
                 grad = grads.pop(0)
                 grad_for_return = grad.clone()
                 ref = weakref.ref(grad)
@@ -5079,6 +6047,8 @@ def forward(self, tangents_1):
         return RefcountProbe, result_box
 
     def _assert_no_extra_refs(self, result_box):
+        # [FUNCTION DOC] HELPER: Assert the result dictionary has the freed flag and that it is
+        # true, with a message that the framework holds extra references to the tangent.
         """Assert the framework holds no extra refs to the grad tensor."""
         self.assertIn("ref_dead", result_box)
         self.assertTrue(
@@ -5089,6 +6059,9 @@ def forward(self, tangents_1):
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
     def test_tangent_freed_compiled_model_and_loss(self):
+        # [FUNCTION DOC] CUDA only. Compiled model and compiled loss with a probe function
+        # between them; after backward checks the tangent passed to the model backward was freed
+        # by the boxed calling convention.
         """Scenario: compiled model + compiled loss (torchtitan simple_fsdp pattern).
 
         Mirrors torchtitan's simple_fsdp training loop:
@@ -5103,6 +6076,7 @@ def forward(self, tangents_1):
         compiled_model = torch.compile(model, backend="inductor")
 
         def loss_fn(pred, labels):
+            # [FUNCTION DOC] HELPER: Cross entropy of float-cast predictions and labels.
             return torch.nn.functional.cross_entropy(pred.float(), labels)
 
         compiled_loss = torch.compile(loss_fn, backend="inductor")
@@ -5118,6 +6092,8 @@ def forward(self, tangents_1):
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
     def test_tangent_freed_compiled_model_eager_loss(self):
+        # [FUNCTION DOC] CUDA only. Compiled model with an eager cross entropy loss; the tangent
+        # must be freed during backward.
         """Scenario: compiled model + eager loss (common training pattern).
 
         Similar to torchtitan but loss is not compiled. The tangent is
@@ -5136,6 +6112,8 @@ def forward(self, tangents_1):
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
     def test_tangent_user_provided_via_pop(self):
+        # [FUNCTION DOC] CUDA only. Compiled model and loss where the loss is held only in a
+        # list and popped when calling backward; the tangent must still be freed.
         """Scenario: user creates tangent but releases it before backward runs.
 
         The user wraps the tangent in a list and calls out.backward(l.pop()).
@@ -5145,6 +6123,7 @@ def forward(self, tangents_1):
         compiled_model = torch.compile(model, backend="inductor")
 
         def loss_fn(pred, labels):
+            # [FUNCTION DOC] HELPER: Cross entropy of float-cast predictions and labels.
             return torch.nn.functional.cross_entropy(pred.float(), labels)
 
         compiled_loss = torch.compile(loss_fn, backend="inductor")
@@ -5166,11 +6145,15 @@ def forward(self, tangents_1):
 
 
 def extract_graph(fx_g, _, graph_cell):
+    # [FUNCTION DOC] HELPER: Compiler that stores the graph into the first slot of a list cell
+    # and returns it unchanged.
     graph_cell[0] = fx_g
     return fx_g
 
 
 def get_ins_outs(fx_g):
+    # [FUNCTION DOC] HELPER: Collect the placeholder nodes and the output node arguments of a
+    # graph; returns a pair of the inputs (list) and outputs (tuple).
     ins = []
     outs = []
     for n in fx_g.graph.nodes:
@@ -5182,12 +6165,16 @@ def get_ins_outs(fx_g):
 
 
 def get_num_ins_outs(fx_g):
+    # [FUNCTION DOC] HELPER: Return the counts of graph inputs and outputs as a tuple.
     return tuple(len(i) for i in get_ins_outs(fx_g))
 
 
 def get_fw_bw_graph(
     f, inps, partitioner=min_cut_rematerialization_partition, dynamic=False
 ):
+    # [FUNCTION DOC] HELPER: Compile a function with aot_function using graph-capturing
+    # compilers, a given partitioner (default min cut), default decompositions and dynamic flag,
+    # run it on the inputs, backpropagate the sum, and return the forward and backward graphs.
     fw_graph_cell = [None]
     bw_graph_cell = [None]
     aot_function(
@@ -5202,22 +6189,36 @@ def get_fw_bw_graph(
 
 
 class TestMod(torch.nn.Module):
+    # [CLASS DOC] HELPER: Module with one parameter of two ones that calls the supplied function
+    # with that parameter and the module inputs.
     def __init__(self, fn):
+        # [FUNCTION DOC] HELPER: Store the function and create the two-element parameter.
         super().__init__()
         self.p = torch.nn.Parameter(torch.ones(2, requires_grad=True))
         self.fn = fn
 
     def forward(self, *args):
+        # [FUNCTION DOC] HELPER: Call the stored function with the parameter followed by
+        # the inputs.
         return self.fn(self.p, *args)
 
 
 class TestAOTExport(AOTTestCase):
+    # [CLASS DOC] Tests of aot_export_module and pre-dispatch export (functionalization graphs
+    # with expected code).
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Run the base setup then reset dynamo state.
         super().setUp()
         torch._dynamo.reset()
 
     def test_aot_export_ban_dropout_mut_pre_dispatch(self):
+        # [FUNCTION DOC] Check that exporting with pre_dispatch raises RuntimeError about frozen
+        # storage when mutating the output of a dropout op, that without pre-dispatch the
+        # mutation is recorded as a user input mutation with expected graph, and that
+        # aot_function with dynamic shapes yields the same graph.
         def fn(p, x):
+            # [FUNCTION DOC] HELPER: Apply dropout (evaluation mode) then add one in place and
+            # return the result in a tuple.
             y = torch.ops.aten.dropout.default(x, 0.1, train=False)
             y.add_(1)
             return (y,)
@@ -5264,7 +6265,11 @@ def forward(self, arg0_1, arg1_1):
         )
 
     def test_aot_export_predispatch_func_simple(self):
+        # [FUNCTION DOC] Check pre-dispatch export of a function with an in-place add under
+        # no_grad; asserts the graph includes the grad-mode toggles.
         def fn(p, x):
+            # [FUNCTION DOC] HELPER: Add two to the input, add two in place under no_grad,
+            # return input times two plus that.
             y = x + 2
             with torch.no_grad():
                 y.add_(2)
@@ -5289,7 +6294,12 @@ def forward(self, arg0_1, arg1_1):
         )
 
     def test_aot_export_predispatch_func_composite_implicit(self):
+        # [FUNCTION DOC] Check pre-dispatch export keeps a composite implicit matmul traced
+        # under enable_grad followed by an in-place add under no_grad; asserts graph text with
+        # grad-mode toggles.
         def fn(p, x):
+            # [FUNCTION DOC] HELPER: Matrix product under enable_grad, in-place add of two,
+            # return the sum of input sum and result sum.
             with torch.enable_grad():
                 y = x @ x
             y.add_(2)
@@ -5315,7 +6325,11 @@ def forward(self, arg0_1, arg1_1):
         )
 
     def test_aot_export_predispatch_composite_implicit_inplace(self):
+        # [FUNCTION DOC] Check pre-dispatch export of the in-place absolute op on a clone of the
+        # input becomes a clone and a non in-place abs.
         def fn(x, p):
+            # [FUNCTION DOC] HELPER: Apply the in-place absolute op to a clone of the
+            # first argument.
             return (torch.ops.aten.absolute_.default(x.clone()),)
 
         mod = TestMod(fn)
@@ -5332,12 +6346,17 @@ def forward(self, arg0_1, arg1_1):
         )
 
     def test_aot_export_predispatch_composite_implicit_linear(self):
+        # [FUNCTION DOC] Check pre-dispatch export keeps the linear op as a single
+        # composite operator.
         class MM(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module holding a Linear layer.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(2, 2)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply the linear layer in a tuple.
                 return (self.linear(x),)
 
         mod = MM()
@@ -5354,12 +6373,19 @@ def forward(self, arg0_1, arg1_1, arg2_1):
 
     @unittest.expectedFailure
     def test_aot_export_predispatch_outdtype(self):
+        # [FUNCTION DOC] Expected failure. Export with pre-dispatch of a module using the
+        # output-dtype higher-order op on an int8 matrix product after an in-place add; the
+        # expected graph text corresponds to a different program, so the assertion cannot match.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module holding an integer weight tensor.
             def __init__(self, weight):
+                # [FUNCTION DOC] HELPER: Store the weight.
                 super().__init__()
                 self.weight = weight
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Add two, add five in place, return the int32 output
+                # dtype matrix product with the weight.
                 y = x + 2
                 y.add_(5)
                 return (
@@ -5386,7 +6412,11 @@ def forward(self, arg0_1, arg1_1):
         )
 
     def test_aot_export_predispatch_func_view(self):
+        # [FUNCTION DOC] Check pre-dispatch export of an in-place add on a matrix product
+        # followed by a view; asserts graph text.
         def fn(p, x):
+            # [FUNCTION DOC] HELPER: Matrix product, in-place add of two, return the input sum
+            # plus the sum of a reshaped view.
             y = x @ x
             y.add_(2)
             return (x.sum() + y.view(1, 4).sum(),)
@@ -5409,12 +6439,19 @@ def forward(self, arg0_1, arg1_1):
         )
 
     def test_aot_export_predispatch_buffer_mutation_metadata(self):
+        # [FUNCTION DOC] Check pre-dispatch export with a buffer mutated in place: the buffer
+        # becomes an input and output of the graph; checks running the exported module twice
+        # matches eager and the signature records the buffer.
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a zero buffer mutated in place by forward.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the zero buffer.
                 super().__init__()
                 self.foo = torch.nn.Buffer(torch.zeros(2, 2))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Add four to the buffer in place and return the input
+                # sum plus the buffer sum.
                 self.foo.add_(4)
                 return (x.sum() + self.foo.sum(),)
 
@@ -5445,7 +6482,11 @@ def forward(self, arg0_1, arg1_1):
         self.assertTrue(graph_sig.inputs_to_buffers["arg0_1"] == "foo")
 
     def test_aot_export_predispatch_with_autograd_op(self):
+        # [FUNCTION DOC] Check pre-dispatch export of operations under enable_grad within a
+        # no_grad outer context; asserts grad-mode toggles in the exported graph.
         def foo(p, x):
+            # [FUNCTION DOC] HELPER: Under enable_grad compute two in-place adds and return
+            # cosine plus sine.
             with torch.enable_grad():
                 y = x + 5
                 y.add_(5)
@@ -5477,21 +6518,33 @@ def forward(self, arg0_1, arg1_1):
         not torchdynamo.is_dynamo_supported(), "TorchDynamo is not supported"
     )
     def test_aot_export_predispatch_with_cond_nested(self):
+        # [FUNCTION DOC] Not on Windows; requires dynamo support. Check pre-dispatch export of
+        # nested conditionals with in-place ops in branches; asserts the main graph and nested
+        # branch graph code.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with nested conditional branches.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Initialize the module.
                 super().__init__()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Conditional on the input sum, with nested functions for
+                # the branches, returns two shifted copies of the result.
                 def true_fn(x):
+                    # [FUNCTION DOC] HELPER: True branch: sine, in-place add, then a
+                    # nested conditional.
                     y = x.sin()
                     y.add_(5)
 
                     def true_true_fn(x):
+                        # [FUNCTION DOC] HELPER: Nested true branch: sine, in-place add of
+                        # seven, sine.
                         y = x.sin()
                         y.add_(7)
                         return y.sin()
 
                     def true_false_fn(x):
+                        # [FUNCTION DOC] HELPER: Nested false branch: cosine.
                         return x.cos()
 
                     return torch.cond(
@@ -5499,6 +6552,7 @@ def forward(self, arg0_1, arg1_1):
                     )
 
                 def false_fn(x):
+                    # [FUNCTION DOC] HELPER: False branch: cosine, in-place add of six, sine.
                     z = x.cos()
                     z.add_(6)
                     return z.sin()
@@ -5555,20 +6609,32 @@ def forward(self, arg0_1):
         not torchdynamo.is_dynamo_supported(), "TorchDynamo is not supported"
     )
     def test_aot_export_predispatch_map_1(self):
+        # [FUNCTION DOC] Not on Windows; requires dynamo support. Pre-dispatch export of a
+        # conditional whose branches include a map higher-order op with in-place work; asserts
+        # the readable normalized graph code.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with conditional branches that use map.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Initialize the module.
                 super().__init__()
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Conditional on the input sum choosing between two
+                # branch functions; returns two shifted copies.
                 def true_fn(x, r):
+                    # [FUNCTION DOC] HELPER: True branch: sine, in-place add, cosine plus the
+                    # sum of the second argument.
                     y = x.sin()
                     y.add_(5)
                     return y.cos() + r.sum()
 
                 def false_fn(x, r):
+                    # [FUNCTION DOC] HELPER: False branch: cosine plus two mapped sums.
                     z = x.cos()
 
                     def f(x, y):
+                        # [FUNCTION DOC] HELPER: Map body: cosine, in-place add of five, plus
+                        # the second argument.
                         a = x.cos()
                         a.add_(5)
                         return a + y
@@ -5663,14 +6729,23 @@ class <lambda>(torch.nn.Module):
         )
 
     def test_aot_export_predispatch_map_2(self):
+        # [FUNCTION DOC] Pre-dispatch export of a module that maps a function (with an
+        # in-place add inside the body) over a cosine; asserts the readable graph with a map
+        # body subgraph.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a map over a body function.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Initialize the module.
                 super().__init__()
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Take cosine, map a body over it with the second input,
+                # return the sum plus the cosine.
                 z = x.cos()
 
                 def f(x, y):
+                    # [FUNCTION DOC] HELPER: Map body: cosine, in-place add of five, plus the
+                    # second argument.
                     a = x.cos()
                     a.add_(5)
                     return a + y
@@ -5716,18 +6791,28 @@ class <lambda>(torch.nn.Module):
         not torchdynamo.is_dynamo_supported(), "TorchDynamo is not supported"
     )
     def test_aot_export_predispatch_with_cond(self):
+        # [FUNCTION DOC] Not on Windows; requires dynamo support. Pre-dispatch export of a
+        # conditional whose true branch calls linear with a random weight and in-place add;
+        # asserts main graph and true-branch graph code.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a conditional on the input sum.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Initialize the module.
                 super().__init__()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Conditional between two branch functions, returns two
+                # shifted copies of the result.
                 def true_fn(x):
+                    # [FUNCTION DOC] HELPER: True branch: sine, linear with a random weight,
+                    # in-place add of five, cosine.
                     y = x.sin()
                     z = torch.ops.aten.linear.default(y, torch.randn(2, 2))
                     z.add_(5)
                     return z.cos()
 
                 def false_fn(x):
+                    # [FUNCTION DOC] HELPER: False branch: cosine, in-place add of six, sine.
                     z = x.cos()
                     z.add_(6)
                     return z.sin()
@@ -5764,13 +6849,20 @@ def forward(self, arg0_1):
         )
 
     def test_aot_export_predispatch_conv_and_bn(self):
+        # [FUNCTION DOC] Check pre-dispatch export of a training mode conv followed by batch
+        # norm: batch norm statistics and counter are functionalized as inputs and outputs;
+        # asserts graph text.
         class ConvBatchnorm(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a convolution and a batch norm.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the convolution and batch norm layers.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(1, 3, 1, 1)
                 self.bn = torch.nn.BatchNorm2d(3)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply convolution then batch norm and return in
+                # a tuple.
                 x = self.conv(x)
                 x = self.bn(x)
                 return (x,)
@@ -5794,8 +6886,11 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1, arg5_1, arg6_1, arg7_1
         )
 
     def test_aot_export_predispatch_reshape(self):
+        # [FUNCTION DOC] Check pre-dispatch export turns reshape into a view op before a sum.
         class Reshape(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that reshapes its input to a square and sums it.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Reshape to four by four and return the sum in a tuple.
                 y = x.reshape(4, 4)
                 return (y.sum(),)
 
@@ -5813,8 +6908,12 @@ def forward(self, arg0_1):
         )
 
     def test_aot_export_predispatch_contiguous(self):
+        # [FUNCTION DOC] Check pre-dispatch export drops a contiguous call on an already
+        # contiguous input.
         class Cont(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that calls the contiguous op and sums.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply contiguous and return the sum in a tuple.
                 y = torch.ops.aten.contiguous.default(x)
                 return (y.sum(),)
 
@@ -5831,13 +6930,22 @@ def forward(self, arg0_1):
         )
 
     def test_aot_export_module_joint(self):
+        # [FUNCTION DOC] Check joint (forward and backward) export of a conv, batch norm and
+        # relu module with the loss index set: asserts the printed graph, signature fields
+        # (parameters, buffers, user inputs, mapping from inputs and gradients) and then the
+        # inference-only export graph with input mutation outputs.
         class ConvBatchnormRelu(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with convolution, batch norm and relu producing a loss
+            # and a detached output.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the convolution and batch norm layers.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(1, 3, 1, 1)
                 self.bn = torch.nn.BatchNorm2d(3)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply convolution, batch norm and relu; return the
+                # summed loss and the detached activation.
                 x = self.conv(x)
                 x = self.bn(x)
                 user_out = torch.nn.functional.relu(x)
@@ -5979,7 +7087,12 @@ class <lambda>(torch.nn.Module):
         # 9 outputs: 2 mutated buffers (from batchnorm), 2 user outputs and 4 gradients (since there were 4 parameters)
 
     def test_aot_export_simplified_basic(self):
+        # [FUNCTION DOC] Check aot_export_joint_simple forward-only export matches eager without
+        # calling convention changes, and that joint export partitioned with default partition
+        # gives forward outputs matching eager and backward gradients matching autograd.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Return the product of the inputs and the second input times
+            # its detached self.
             return x * y, y * y.detach()
 
         x = torch.randn(2, requires_grad=True)
@@ -6016,7 +7129,11 @@ class <lambda>(torch.nn.Module):
             self.assertEqual(g_ref, g_test)
 
     def test_aot_export_metadata_mutation_banned(self):
+        # [FUNCTION DOC] Check that exporting a function that transposes an input in place
+        # raises RuntimeError about a metadata mutation (only the first export call is reached).
         def fn(p, x):
+            # [FUNCTION DOC] HELPER: Transpose the input in place and return it doubled in
+            # a tuple.
             x.t_()
             return (x * 2,)
 
@@ -6030,12 +7147,18 @@ class <lambda>(torch.nn.Module):
             aot_export_module(mod, [inp], trace_joint=False)
 
     def test_aot_export_forward_mutation_no_buffer_mut(self):
+        # [FUNCTION DOC] Check export (forward only) of a module that mutates a user input in
+        # place but no buffer: the mutated user input is reported in the signature and returned.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a ones buffer.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the buffer.
                 super().__init__()
                 self.buffer1 = torch.nn.Buffer(torch.ones(6, 4))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Add four to the input in place and return the cosine
+                # sum plus the buffer sum.
                 x.add_(4)
                 return (x.cos().sum() + self.buffer1.sum(),)
 
@@ -6056,12 +7179,18 @@ def forward(self, arg0_1, arg1_1):
         self.assertEqual(sig.user_inputs_to_mutate, {"add": "arg1_1"})
 
     def test_aot_export_forward_mutation_multiple_mut(self):
+        # [FUNCTION DOC] Check export (forward only) with mutation of both a user input and a
+        # buffer: the signature reports both mutations.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a ones buffer.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the buffer.
                 super().__init__()
                 self.buffer1 = torch.nn.Buffer(torch.ones(6, 4))
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Add four to y in place, add five to the buffer in
+                # place, return a combined sum and the buffer sum.
                 y.add_(4)
                 self.buffer1.add_(5)
                 return (
@@ -6090,8 +7219,12 @@ def forward(self, arg0_1, arg1_1, arg2_1):
         self.assertEqual(sig.buffers_to_mutate, {"add_1": "buffer1"})
 
     def test_aot_export_input_mutation_on_input_requiring_grad_banned(self):
+        # [FUNCTION DOC] Check forward-only export of a module that adds in place to an input
+        # requiring grad; the graph returns the updated value twice.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that adds four in place to its input and returns it.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Add four in place and return the input in a tuple.
                 x.add_(4)
                 return (x,)
 
@@ -6108,7 +7241,12 @@ graph():
         )
 
     def test_aot_export_input_mutation_on_parameter_banned(self):
+        # [FUNCTION DOC] Check mutation of a parameter in exports: the simple joint export
+        # raises RuntimeError for forward only and for joint, while module export allows it and
+        # returns the mutated parameter.
         def fn(p, x):
+            # [FUNCTION DOC] HELPER: Double the parameter in place and return parameter
+            # plus input.
             p.mul_(2)
             return (p + x,)
 
@@ -6138,7 +7276,10 @@ graph():
         )
 
     def test_aot_export_synthetic_bases_banned(self):
+        # [FUNCTION DOC] Check that exporting with aliased inputs where one is mutated raises
+        # RuntimeError about aliased mutated inputs.
         def fn(p, x, y):
+            # [FUNCTION DOC] HELPER: Double x in place and return x plus y.
             x.mul_(2)
             return (x + y,)
 
@@ -6153,7 +7294,10 @@ graph():
             aot_export_module(mod, [inp, inp2], trace_joint=False)
 
     def test_aot_export_input_dupes_banned(self):
+        # [FUNCTION DOC] Check that exporting with the same tensor passed twice and one mutated
+        # raises RuntimeError about duplicated mutated inputs.
         def fn(p, x, y):
+            # [FUNCTION DOC] HELPER: Double x in place and return x plus y.
             x.mul_(2)
             return (x + y,)
 
@@ -6167,7 +7311,10 @@ graph():
             aot_export_module(mod, [inp, inp], trace_joint=False)
 
     def test_aot_export_multiple_outputs_require_grad_banned(self):
+        # [FUNCTION DOC] Check that joint export with a forward output requiring grad other than
+        # the loss raises RuntimeError.
         def fn(p, x):
+            # [FUNCTION DOC] HELPER: Return a product and its sum.
             out = p * x
             return out, out.sum()
 
@@ -6184,17 +7331,27 @@ graph():
         not torch._dynamo.is_dynamo_supported(), "Cond needs dynamo to run"
     )
     def test_aot_export_with_torch_cond(self):
+        # [FUNCTION DOC] Not on Windows; requires dynamo support. Export of a module with a
+        # conditional (no pre-dispatch); asserts the main graph and both branch graphs.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a conditional on the input sum.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Initialize the module.
                 super().__init__()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Conditional between two branch functions, returns two
+                # shifted copies of the result.
                 def true_fn(x):
+                    # [FUNCTION DOC] HELPER: True branch: temporary shift with in-place add,
+                    # returns the cosine of the input.
                     y = x + 4
                     y.add_(5)
                     return x.cos()
 
                 def false_fn(x):
+                    # [FUNCTION DOC] HELPER: False branch: temporary shift with in-place add,
+                    # returns the sine of the input.
                     y = x + 5
                     y.add_(6)
                     return x.sin()
@@ -6236,7 +7393,10 @@ def forward(self, arg0_1):
         )
 
     def test_aot_export_simplified_pytrees_banned(self):
+        # [FUNCTION DOC] Check that the simple joint export rejects pytree (list) inputs
+        # with RuntimeError.
         def fn(inps):
+            # [FUNCTION DOC] HELPER: Add the two elements of the input list in a tuple.
             return (inps[0] + inps[1],)
 
         inp1 = torch.randn(2)
@@ -6250,7 +7410,10 @@ def forward(self, arg0_1):
             aot_export_joint_simple(fn, [inps], trace_joint=True)
 
     def test_aot_export_functionalized_rng_banned(self):
+        # [FUNCTION DOC] Check that export under functionalized RNG ops raises RuntimeError that
+        # it is unsupported.
         def fn(p, x):
+            # [FUNCTION DOC] HELPER: Add parameter and input in a tuple.
             return (p + x,)
 
         mod = TestMod(fn)
@@ -6267,8 +7430,14 @@ def forward(self, arg0_1):
             aot_export_module(mod, [inp], trace_joint=False)
 
     def test_aot_export_unbacked_arg(self):
+        # [FUNCTION DOC] Check export with dynamic shapes of a module using a data dependent
+        # size from item; asserts the graph includes local scalar dense and a full op.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with no inputs creating a full tensor sized by an
+            # extracted scalar.
             def forward(self):
+                # [FUNCTION DOC] HELPER: Create a scalar, extract its Python value, return a
+                # zero tensor of that size in a tuple.
                 full = torch.full((), 11)
                 i0 = full.item()
                 return (torch.full((i0,), 0),)
@@ -6287,7 +7456,12 @@ def forward(self):
         )
 
     def test_aot_export_input_mutation(self):
+        # [FUNCTION DOC] Check _aot_export_function (joint with tangents) on a function that
+        # mutates a buffer-like input in place and multiplies it with a grad-requiring input,
+        # keeping input mutations; asserts the graph copies the update back into the buffer and
+        # returns output and gradient.
         def f(x, buf):
+            # [FUNCTION DOC] HELPER: Add one to the buffer in place and return buffer times x.
             buf.add_(1)
             return buf * x
 
@@ -6319,9 +7493,15 @@ def forward(self, primals, tangents):
 
 
 class TestPartitioning(AOTTestCase):
+    # [CLASS DOC] Tests of the partitioners (default and min cut rematerialization) and the
+    # graph and calling-convention invariants they must keep, using helper graph extractors.
     @unittest.skipIf(not USE_NETWORKX, "networkx not available")
     def test_recompute_partitioning(self):
+        # [FUNCTION DOC] Skipped without networkx. Compile a double sine plus input with the min
+        # cut rematerialization partition and identity compilers; outputs and gradients must be
+        # close to eager, otherwise AssertionError.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Sine of sine of a plus b.
             return torch.sin(torch.sin(a)) + b
 
         # Reference calculation
@@ -6335,6 +7515,7 @@ class TestPartitioning(AOTTestCase):
         res_b = ref_b.detach().clone().requires_grad_(True)
 
         def compile_fn(x, _):
+            # [FUNCTION DOC] HELPER: Identity compiler that returns the graph unchanged.
             return x
 
         compiled_fn = compiled_function(
@@ -6351,20 +7532,33 @@ class TestPartitioning(AOTTestCase):
 
     @unittest.skipIf(not USE_NETWORKX, "networkx not available")
     def test_partitioned_backward_nodes_are_backward_tagged(self):
+        # [FUNCTION DOC] Skipped without networkx. For the default partition and for a min cut
+        # partition forced to recompute sine and cosine nodes, checks every call or
+        # get-attribute node in the backward graph is tagged as backward in its metadata,
+        # including recomputed nodes that originated in the forward.
         from torch._functorch.partitioners import CheckpointPolicy
 
         def run(partition_fn):
+            # [FUNCTION DOC] HELPER: Compile a sin-cos-sum function with the given partition
+            # function, run forward and backward, capturing the backward graph; asserts a graph
+            # was captured and all its call or attribute nodes carry the backward tag; returns
+            # the graph.
             bw_gm = None
 
             def fw_compiler(gm, _):
+                # [FUNCTION DOC] HELPER: Forward compiler returning the graph forward as a
+                # boxed function.
                 return make_boxed_func(gm.forward)
 
             def bw_compiler(gm, _):
+                # [FUNCTION DOC] HELPER: Backward compiler that stores the graph in an enclosing
+                # variable and returns its forward as a boxed function.
                 nonlocal bw_gm
                 bw_gm = gm
                 return make_boxed_func(gm.forward)
 
             def fn(x):
+                # [FUNCTION DOC] HELPER: Sum of cosine of sine of the input.
                 y = torch.sin(x)
                 return torch.cos(y).sum()
 
@@ -6397,6 +7591,9 @@ class TestPartitioning(AOTTestCase):
         run(default_partition)
 
         def min_cut_with_forced_recompute(joint_gm, joint_inputs, **kwargs):
+            # [FUNCTION DOC] HELPER: Partition function that marks sine and cosine nodes of
+            # the joint graph as must-recompute, then delegates to the min cut
+            # rematerialization partition.
             for node in joint_gm.graph.nodes:
                 if node.op == "call_function" and node.target in {
                     torch.ops.aten.sin.default,
@@ -6426,10 +7623,15 @@ class TestPartitioning(AOTTestCase):
         )
 
     def test_meta_tensor_inplace_op(self):
+        # [FUNCTION DOC] Check that every non-output node in the forward graph of a Linear plus
+        # GELU module has tensor metadata recorded, even with in-place ops during tracing.
         # Following module results in inplace ops while tracing. The test checks
         # that the meta tensor information is stored for inplace ops.
         class MockModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a large linear layer's parameters that applies
+            # linear and GELU.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create random weight and bias parameters.
                 super().__init__()
                 self.weight = torch.nn.Parameter(
                     torch.randn(3072, 768, requires_grad=True)
@@ -6437,6 +7639,7 @@ class TestPartitioning(AOTTestCase):
                 self.bias = torch.nn.Parameter(torch.randn(3072, requires_grad=True))
 
             def forward(self, add_4):
+                # [FUNCTION DOC] HELPER: Apply linear then GELU.
                 linear_4 = torch.nn.functional.linear(
                     add_4, self.weight, bias=self.bias
                 )
@@ -6444,6 +7647,8 @@ class TestPartitioning(AOTTestCase):
                 return gelu
 
         def check_meta_tensor(fx_g, _):
+            # [FUNCTION DOC] HELPER: Forward compiler that raises AssertionError if any
+            # non-output node lacks tensor metadata; returns the graph.
             for node in fx_g.graph.nodes:
                 if node.op != "output":
                     if "tensor_meta" not in node.meta:
@@ -6461,9 +7666,13 @@ class TestPartitioning(AOTTestCase):
         aot_mod(*inputs)
 
     def test_default_partitioner_getitem(self):
+        # [FUNCTION DOC] Check the default partitioner with layer norm: forward has 3 inputs and
+        # 6 outputs, backward 6 inputs and 3 outputs.
         mod = nn.LayerNorm([10])
 
         def f(x, mod_weight, mod_bias):
+            # [FUNCTION DOC] HELPER: Layer norm of x over the last dimension with the given
+            # weight and bias.
             return torch.nn.functional.layer_norm(
                 x, [10], mod_weight, mod_bias, eps=1e-6
             )
@@ -6477,11 +7686,18 @@ class TestPartitioning(AOTTestCase):
         self.assertEqual(get_num_ins_outs(bw_graph), (6, 3))
 
     def test_extract_fwd_bwd_modules_omit_aot_autograd_runtime(self):
+        # [FUNCTION DOC] Check splitting a backward graph into input-gradient and
+        # weight-gradient graphs: partitions a matmul sum joint graph, renames tangent
+        # placeholders so they are not treated as tangents, extracts the first output subgraph,
+        # picks saved values, and builds two modules with the runtime omitted; checks no
+        # tangent placeholders remain and that the two modules together reproduce the full
+        # backward gradients.
         """Test splitting a backward graph into dI/dW subgraphs using
         omit_aot_autograd_runtime and ignore_must_be_in_fw_bw."""
         from torch._functorch.partitioners import is_sym_node
 
         def f(x, w):
+            # [FUNCTION DOC] HELPER: Sum of the matrix product in a tuple.
             return ((x @ w).sum(),)
 
         x = torch.randn(4, 4, requires_grad=True)
@@ -6546,6 +7762,7 @@ class TestPartitioning(AOTTestCase):
 
         # Verify graph structure
         def ph_names(gm):
+            # [FUNCTION DOC] HELPER: List of the placeholder node names of a graph module.
             return [n.name for n in gm.graph.find_nodes(op="placeholder")]
 
         self.assertFalse(any(n.startswith("tangent") for n in ph_names(di_mod)))
@@ -6564,7 +7781,11 @@ class TestPartitioning(AOTTestCase):
 
     @unittest.skipIf(not USE_NETWORKX, "networkx not available")
     def test_min_cut_partitioner_raise_getitems(self):
+        # [FUNCTION DOC] Skipped without networkx. Checks that min cut partitioning moves
+        # getitem nodes after split so that the backward graph matches the expected text.
         def f(x):
+            # [FUNCTION DOC] HELPER: Split into halves and add sine of the first to cosine of
+            # the second.
             y = torch.split(x, x.size(0) // 2, dim=0)
             a = y[0].sin()
             b = y[1].cos()
@@ -6590,19 +7811,29 @@ def forward(self, primals_1, tangents_1):
 
     @unittest.skipIf(not USE_NETWORKX, "networkx not available")
     def test_custom_partitioner_fn(self):
+        # [FUNCTION DOC] Skipped without networkx. A user-defined partitioner object (subclass
+        # of the custom partitioner base) is used by the helper; checks it was called and the
+        # forward and backward graph text.
         class MyCustomPartitionerFn(CustomPartitionerFn):
+            # [CLASS DOC] HELPER: Custom partitioner that records being called and delegates to
+            # the min cut rematerialization partition.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Initialize the base and clear the called flag.
                 super().__init__()
                 self.called = False
 
             def __call__(self, gm, joint_inputs, **kwargs):
+                # [FUNCTION DOC] HELPER: Set the called flag and return the min cut partition of
+                # the graph.
                 self.called = True
                 return min_cut_rematerialization_partition(gm, joint_inputs, **kwargs)
 
             def uuid(self):
+                # [FUNCTION DOC] HELPER: Return no identifier.
                 return None
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Cosine applied twice.
             return x.cos().cos()
 
         inp = [torch.randn((4, 4), requires_grad=True)]
@@ -6633,7 +7864,12 @@ def forward(self, primals_1, tangents_1):
 
     @unittest.skipIf(not USE_NETWORKX, "networkx not available")
     def test_min_cut_partitioner_save_shape(self):
+        # [FUNCTION DOC] Skipped without networkx. Check min cut partitioner saves symbolic
+        # sizes instead of larger tensors for a sum under dynamic shapes, and for a
+        # concatenation function with size manipulations saves only symbolic ints beyond the
+        # first output.
         def f(x):
+            # [FUNCTION DOC] HELPER: Sum over dimension one.
             s = x.sum(dim=1)
             return s
 
@@ -6655,6 +7891,8 @@ def forward(self, primals_1, tangents_1):
         ]
 
         def f(a, b, c):
+            # [FUNCTION DOC] HELPER: Concatenate an expanded a (sized from sizes of b and c)
+            # with b and c.
             # tried to test what happens if we save a size tuple in the graph;
             # turns out we never will due to how we trace, but this is probably
             # still a good test case for various size manipulations
@@ -6671,6 +7909,10 @@ def forward(self, primals_1, tangents_1):
         self.assertTrue(all(is_sym_node(n) for n in outs[1:]))
 
     def test_default_partitioner_output_tensor_shape_tensor(self):
+        # [FUNCTION DOC] Check the default partitioner with outputs that include a size
+        # (symbolic ints) and input views, under dynamic shapes: counts of graph inputs and
+        # outputs, which forward outputs are symbolic nodes, compiled output equality to eager,
+        # and that the size output is not returned as a size object.
         inp = [
             torch.randn(10, requires_grad=True),
             torch.randn((3, 10), requires_grad=True),
@@ -6679,6 +7921,8 @@ def forward(self, primals_1, tangents_1):
         ]
 
         def f(a, b, c, d):
+            # [FUNCTION DOC] HELPER: Build a concatenation with sizes of the inputs, two matrix
+            # products, and return the concatenation, a size, an input and the product.
             # Try to force symints intermixed with outputs in the function's returns
             sb = b.size()
             sc = c.size()
@@ -6737,6 +7981,8 @@ def forward(self, primals_1, tangents_1):
 
     @unittest.skipIf(not USE_NETWORKX, "networkx not available")
     def test_min_cut_partitioner_output_tensor_shape_tensor(self):
+        # [FUNCTION DOC] Skipped without networkx. Same as the previous test with the min cut
+        # partitioner; expected counts differ (12 forward outputs and 9 backward inputs).
         inp = [
             torch.randn(10, requires_grad=True),
             torch.randn((3, 10), requires_grad=True),
@@ -6745,6 +7991,8 @@ def forward(self, primals_1, tangents_1):
         ]
 
         def f(a, b, c, d):
+            # [FUNCTION DOC] HELPER: Build a concatenation with sizes of the inputs, two matrix
+            # products, and return the concatenation, a size, an input and the product.
             # Try to force symints intermixed with outputs in the function's returns
             sb = b.size()
             sc = c.size()
@@ -6792,7 +8040,11 @@ def forward(self, primals_1, tangents_1):
 
     @unittest.skipIf(not USE_NETWORKX, "networkx not available")
     def test_min_cut_partitioner(self):
+        # [FUNCTION DOC] Skipped without networkx. Check input and output counts of forward and
+        # backward graphs for a triple cosine and a sum-then-double-cosine function under the
+        # min cut partitioner.
         def f(x):
+            # [FUNCTION DOC] HELPER: Cosine applied three times.
             return x.cos().cos().cos()
 
         fw_graph, bw_graph = get_fw_bw_graph(f, [torch.randn(3, requires_grad=True)])
@@ -6800,6 +8052,7 @@ def forward(self, primals_1, tangents_1):
         self.assertEqual(get_num_ins_outs(bw_graph), (2, 1))
 
         def f(a, b, c, d):
+            # [FUNCTION DOC] HELPER: Sum four inputs then apply cosine twice.
             x = a + b + c + d
             return x.cos().cos()
 
@@ -6810,10 +8063,13 @@ def forward(self, primals_1, tangents_1):
         self.assertEqual(get_num_ins_outs(bw_graph), (2, 4))
 
     def test_contiguous(self):
+        # [FUNCTION DOC] Simulates a transpose followed by a view happening in the backward
+        # pass; computes a gradient through the compiled function and expects no error.
         # The test simulates the condition where transpose followed by view
         # happens in the backward pass.
         # https://discuss.pytorch.org/t/error-on-transpose-and-view/434
         def f(x):
+            # [FUNCTION DOC] HELPER: View as two by three and transpose.
             return x.view(2, 3).t()
 
         inp = torch.randn(6, requires_grad=True)
@@ -6821,7 +8077,10 @@ def forward(self, primals_1, tangents_1):
         torch.autograd.grad(out, inp, torch.randn(3, 2))
 
     def test_preserve_random(self):
+        # [FUNCTION DOC] Check random number generation (dropout) under aot_function with the
+        # same seed gives the same result as eager; raises AssertionError otherwise.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Dropout plus the input.
             return torch.nn.functional.dropout(x, 0.5) + x
 
         x = torch.randn(4)
@@ -6838,8 +8097,11 @@ def forward(self, primals_1, tangents_1):
 
     # https://github.com/pytorch/pytorch/issues/110666
     def test_generate_gives_inference_graph(self):
+        # [FUNCTION DOC] Regression for issue 110666: a function that multiplies under no_grad
+        # yields an inference graph even when the input requires grad.
         # We expect this to give an inference graph
         def generate(x):
+            # [FUNCTION DOC] HELPER: Square the input under no_grad.
             with torch.no_grad():
                 return torch.mul(x, x)
 
@@ -6856,6 +8118,8 @@ def forward(self, primals_1, tangents_1):
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
     @unittest.skipIf(not USE_TORCHVISION, "test requires torchvision")
     def test_autocast(self):
+        # [FUNCTION DOC] Requires CUDA and torchvision. Runs resnet18 through memory efficient
+        # fusion in training mode under autocast and backpropagates.
         mod = torchvision.models.resnet18().cuda()
         mod.train()
 
@@ -6868,6 +8132,10 @@ def forward(self, primals_1, tangents_1):
         res.sum().backward()
 
     def test_quantize_activation_duplicate_nodes(self):
+        # [FUNCTION DOC] Checks activation quantization graph passes handle duplicate output
+        # nodes: builds a forward graph with a node repeated in the outputs and runs the forward
+        # quantization pass, then verifies quantized outputs are named by position, share a
+        # scale node, and the backward pass handles matching placeholders.
         """Test both quantize_activation_fw and quantize_activation_bw handle duplicate nodes correctly"""
         import torch.fx as fx
         from torch._functorch.partitioners import (
@@ -7082,6 +8350,11 @@ def forward(self, primals_1, tangents_1):
 
     @unittest.skipIf(not USE_NETWORKX, "networkx not available")
     def test_min_cut_partitioner_unbounded_error_message(self):
+        # [FUNCTION DOC] Skipped without networkx. Tests the helper that finds a path of
+        # infinite capacity edges in a flow graph and returns it as a list of triples (from
+        # node, to node, reason). Checks a three-edge chain is found with its reasons, a finite
+        # capacity edge breaks the path (returns none), and a data dependency edge reason is
+        # included in a four-edge path.
         """Test that NetworkXUnbounded errors produce user-friendly error messages."""
         import math
 
@@ -7166,6 +8439,10 @@ def forward(self, primals_1, tangents_1):
 
     @unittest.skipIf(not USE_NETWORKX, "networkx not available")
     def test_min_cut_partitioner_getitem_of_banned_multi_output(self):
+        # [FUNCTION DOC] Skipped without networkx. Regression test that a getitem from a
+        # must-save multi-output node (variance and mean op) returned directly as a gradient
+        # output does not make the min cut flow problem unbounded; uses selective checkpointing
+        # and a custom Function under the aot_eager decomp partition backend.
         """Test that getitem from a banned multi-output node doesn't cause NetworkXUnbounded.
 
         Uses selective checkpoint to mark var_mean as MUST_SAVE (banning recomputation),
@@ -7183,14 +8460,21 @@ def forward(self, primals_1, tangents_1):
         )
 
         class GetitemAsGradOutput(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Autograd Function that computes variance and mean of a stack
+            # of the input, saves the mean, and in backward returns the saved mean directly as
+            # the gradient.
             @staticmethod
             def forward(ctx, x):
+                # [FUNCTION DOC] HELPER: Compute variance and mean over a stacked input, save
+                # the mean, return the variance.
                 var, mean = torch.var_mean(torch.stack([x, x]), dim=0)
                 ctx.save_for_backward(mean)
                 return var
 
             @staticmethod
             def backward(ctx, grad_var):
+                # [FUNCTION DOC] HELPER: Return the saved mean as the gradient, ignoring the
+                # incoming gradient.
                 return ctx.saved_tensors[0]
 
         context_fn = partial(
@@ -7200,6 +8484,8 @@ def forward(self, primals_1, tangents_1):
 
         @torch.compile(backend="aot_eager_decomp_partition", fullgraph=True)
         def fn(x):
+            # [FUNCTION DOC] HELPER: Run the custom Function under non-reentrant checkpointing
+            # with the selective context.
             return checkpoint(
                 GetitemAsGradOutput.apply,
                 x,
@@ -7212,6 +8498,10 @@ def forward(self, primals_1, tangents_1):
 
     @unittest.skipIf(not USE_NETWORKX, "networkx not available")
     def test_min_cut_partitioner_multi_output_must_save_budget(self):
+        # [FUNCTION DOC] Skipped without networkx. With a low fractional activation memory
+        # budget and a joint pass marking the top-k op as must-save, the min cut partition must
+        # not crash, must honor must-save (the op does not appear in the backward graph), and
+        # gradients must match eager.
         """MUST_SAVE on a multi-output (tuple) producer under a fractional
         activation_memory_budget must not crash and must be honored.
 
@@ -7228,10 +8518,14 @@ def forward(self, primals_1, tangents_1):
         producer = torch.ops.aten.topk.default
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Top-k of the sine of the input, return the sum of cosine of
+            # values times sine of float indices.
             vals, idx = torch.topk(x.sin(), k=4, dim=1)
             return (vals.cos() * idx.float().sin()).sum()
 
         def mark_producer_must_save(gm, joint_inputs):
+            # [FUNCTION DOC] HELPER: Joint custom pass marking nodes calling the top-k op as
+            # must-save; returns the graph module.
             for node in gm.graph.nodes:
                 if node.op == "call_function" and node.target is producer:
                     node.meta["recompute"] = CheckpointPolicy.MUST_SAVE
@@ -7240,6 +8534,8 @@ def forward(self, primals_1, tangents_1):
         bw_graph = {}
 
         def bw_compiler(gm, _):
+            # [FUNCTION DOC] HELPER: Backward compiler that stores the graph in a dictionary and
+            # returns it.
             bw_graph["gm"] = gm
             return gm
 
@@ -7266,7 +8562,12 @@ def forward(self, primals_1, tangents_1):
         self.assertNotIn("topk", bw_graph["gm"].code)
 
     def test_disable_functionalization_ignores_effect_token_metadata(self):
+        # [FUNCTION DOC] Check disabling functionalization with a function taking a list input
+        # and calling matrix inverse does not break on effect token metadata: output and
+        # gradient equal eager.
         def fn(args):
+            # [FUNCTION DOC] HELPER: Unpack the single element of the list and return its
+            # matrix inverse.
             (x,) = args
             return torch.linalg.inv(x)
 
@@ -7296,6 +8597,10 @@ def forward(self, primals_1, tangents_1):
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
     def test_force_save_effectful_ops(self):
+        # [FUNCTION DOC] CUDA only. Registers a custom op as ordered effectful, captures the
+        # inductor graph via a custom backend, applies the force-save pass for effectful ops,
+        # and checks the one effect node has all its getitem users (two) marked must-save; the
+        # effect registration is destroyed afterwards.
         """Test that effectful op outputs are saved, not recomputed.
 
         This test traces a function with a with_effects node and verifies
@@ -7310,10 +8615,13 @@ def forward(self, primals_1, tangents_1):
 
         @torch.library.custom_op("test::effectful_op", mutates_args=())
         def effectful_op(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Custom op that doubles its input.
             return x * 2
 
         @effectful_op.register_fake
         def _(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Fake implementation of the custom op returning an empty
+            # tensor like the input.
             return torch.empty_like(x)
 
         handle = _register_effectful_op(effectful_op, EffectType.ORDERED)
@@ -7322,12 +8630,16 @@ def forward(self, primals_1, tangents_1):
             gm = None
 
             def graph_capture_backend(graph_module, example_inputs):
+                # [FUNCTION DOC] HELPER: Backend that runs inductor compile with an inner
+                # compile wrapper recording the graph module in an enclosing variable.
                 """Custom backend that captures the graph before passing to inductor."""
                 nonlocal gm
 
                 from torch._inductor.compile_fx import compile_fx, compile_fx_inner
 
                 def log_and_compile(graph_module, example_inputs, **kwargs):
+                    # [FUNCTION DOC] HELPER: Record the graph module then delegate to the
+                    # inductor inner compile.
                     nonlocal gm
                     gm = graph_module
                     return compile_fx_inner(graph_module, example_inputs, **kwargs)
@@ -7338,6 +8650,8 @@ def forward(self, primals_1, tangents_1):
 
             @torch.compile(backend=graph_capture_backend)
             def fn(x, weight):
+                # [FUNCTION DOC] HELPER: Apply the effectful op to x and return the sum times
+                # the weight.
                 a = torch.ops.test.effectful_op(x)
                 return a.sum() * weight
 
@@ -7365,6 +8679,7 @@ def forward(self, primals_1, tangents_1):
             ]
 
             def is_must_save(node):
+                # [FUNCTION DOC] HELPER: True if the node's recompute policy equals must-save.
                 return node.meta.get("recompute") == CheckpointPolicy.MUST_SAVE
 
             must_save_count = sum(1 for n in getitem_nodes if is_must_save(n))
@@ -7383,6 +8698,9 @@ def forward(self, primals_1, tangents_1):
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
     def test_force_save_effectful_ops_nested_tuple(self):
+        # [FUNCTION DOC] CUDA only. Like the previous test with an effectful op returning two
+        # tensors: all three tensor getitems of the effect node (token excluded as per the
+        # count) are marked must-save after the pass.
         """Test that effectful ops returning tuples have all tensor outputs marked MUST_SAVE.
 
         This test creates a custom op that returns a tuple, registers it as effectful,
@@ -7397,10 +8715,14 @@ def forward(self, primals_1, tangents_1):
 
         @torch.library.custom_op("test::effectful_tuple_op", mutates_args=())
         def effectful_tuple_op(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            # [FUNCTION DOC] HELPER: Custom op returning a pair, the input doubled and the input
+            # plus one.
             return x * 2, x + 1
 
         @effectful_tuple_op.register_fake
         def _(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            # [FUNCTION DOC] HELPER: Fake implementation returning two empty tensors like
+            # the input.
             return torch.empty_like(x), torch.empty_like(x)
 
         handle = _register_effectful_op(effectful_tuple_op, EffectType.ORDERED)
@@ -7409,12 +8731,16 @@ def forward(self, primals_1, tangents_1):
             gm = None
 
             def graph_capture_backend(graph_module, example_inputs):
+                # [FUNCTION DOC] HELPER: Backend that runs inductor compile with an inner
+                # compile wrapper recording the graph module in an enclosing variable.
                 """Custom backend that captures the graph before passing to inductor."""
                 nonlocal gm
 
                 from torch._inductor.compile_fx import compile_fx, compile_fx_inner
 
                 def log_and_compile(graph_module, example_inputs, **kwargs):
+                    # [FUNCTION DOC] HELPER: Record the graph module then delegate to the
+                    # inductor inner compile.
                     nonlocal gm
                     gm = graph_module
                     return compile_fx_inner(graph_module, example_inputs, **kwargs)
@@ -7425,6 +8751,8 @@ def forward(self, primals_1, tangents_1):
 
             @torch.compile(backend=graph_capture_backend)
             def fn(x):
+                # [FUNCTION DOC] HELPER: Call the effectful tuple op and return the sum of
+                # both outputs.
                 a, b = torch.ops.test.effectful_tuple_op(x)
                 return a.sum() + b.sum()
 
@@ -7449,6 +8777,7 @@ def forward(self, primals_1, tangents_1):
             force_save_effectful_ops(gm)
 
             def is_must_save(node):
+                # [FUNCTION DOC] HELPER: True if the node's recompute policy equals must-save.
                 return node.meta.get("recompute") == CheckpointPolicy.MUST_SAVE
 
             tensor_getitem_count = 0
@@ -7474,6 +8803,10 @@ def forward(self, primals_1, tangents_1):
             handle.destroy()
 
     def test_static_input_indices_with_effect_tokens(self):
+        # [FUNCTION DOC] Check that static input indices in graph metadata are shifted by the
+        # number of effect tokens when tokens are prepended to arguments: builds empty metadata
+        # with one token and static indices one and two, runs the token handling function, and
+        # verifies arguments grew by the token count and indices were offset.
         """Test that static_input_indices are correctly offset when effect tokens are prepended."""
         from torch._functorch._aot_autograd.descriptors import PlainAOTInput
         from torch._functorch._aot_autograd.graph_capture_wrappers import (
@@ -7485,10 +8818,13 @@ def forward(self, primals_1, tangents_1):
 
         @torch.library.custom_op("test::effectful_static_idx_op", mutates_args=())
         def effectful_static_idx_op(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Custom op returning a clone of its input.
             return x.clone()
 
         @effectful_static_idx_op.register_fake
         def _(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Fake implementation returning an empty tensor like
+            # the input.
             return torch.empty_like(x)
 
         handle = _register_effectful_op(effectful_static_idx_op, EffectType.ORDERED)
@@ -7532,17 +8868,26 @@ def forward(self, primals_1, tangents_1):
             handle.destroy()
 
     def _make_effectful_op(self, name):
+        # [FUNCTION DOC] HELPER: Define a custom op with the given name in the test namespace
+        # that clones its input, register a fake implementation, and return the op.
         @torch.library.custom_op(f"test::{name}", mutates_args=())
         def op(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Custom op that clones its input (the op name is supplied by
+            # the helper).
             return x.clone()
 
         @op.register_fake
         def _(x):
+            # [FUNCTION DOC] HELPER: Fake implementation returning an empty tensor like
+            # the input.
             return torch.empty_like(x)
 
         return op
 
     def _make_wrapper_via_post_compile(self, compiled_fn, num_tokens):
+        # [FUNCTION DOC] HELPER: Wrap the compiled function using the effect token runtime
+        # wrapper with a mock metadata holding the given number of tokens and an empty config;
+        # returns the wrapped function.
         from torch._functorch._aot_autograd.runtime_wrappers import EffectTokensWrapper
 
         mock_meta = SimpleNamespace(tokens=dict.fromkeys(range(num_tokens)))
@@ -7552,6 +8897,9 @@ def forward(self, primals_1, tangents_1):
         )
 
     def test_effect_tokens_codegen_single(self):
+        # [FUNCTION DOC] Check the effect token wrapper source is generated exactly once for one
+        # effectful op (captured codegen) and that the function still returns the input; the
+        # source mentions none and slicing off the first output.
         from torch._higher_order_ops.effects import _register_effectful_op
         from torch._library.effects import EffectType
 
@@ -7562,6 +8910,7 @@ def forward(self, primals_1, tangents_1):
 
                 @torch.compile(backend="aot_eager")
                 def f(x):
+                    # [FUNCTION DOC] HELPER: Call the effectful op on x.
                     return torch.ops.test.codegen_single_effect(x)
 
                 x = torch.randn(4)
@@ -7580,10 +8929,13 @@ def forward(self, primals_1, tangents_1):
             handle.destroy()
 
     def test_effect_tokens_no_codegen_when_zero(self):
+        # [FUNCTION DOC] Check no wrapper codegen artifact is emitted when the function has no
+        # effect tokens.
         with capture_codegen_source("effect_tokens_wrapper") as captured:
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Double the input.
                 return x * 2
 
             x = torch.randn(4)
@@ -7597,6 +8949,8 @@ def forward(self, primals_1, tangents_1):
         )
 
     def test_effect_tokens_codegen_correctness(self):
+        # [FUNCTION DOC] Check correctness of the compiled function with an effectful op
+        # followed by an add.
         from torch._higher_order_ops.effects import _register_effectful_op
         from torch._library.effects import EffectType
 
@@ -7606,6 +8960,7 @@ def forward(self, primals_1, tangents_1):
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Apply the effectful op then add one.
                 y = torch.ops.test.codegen_correctness_effect(x)
                 return y + 1
 
@@ -7616,6 +8971,8 @@ def forward(self, primals_1, tangents_1):
             handle.destroy()
 
     def test_effect_tokens_codegen_with_mutation(self):
+        # [FUNCTION DOC] Check effect tokens with an input mutation: result is the original
+        # value and the input is incremented.
         from torch._higher_order_ops.effects import _register_effectful_op
         from torch._library.effects import EffectType
 
@@ -7625,6 +8982,8 @@ def forward(self, primals_1, tangents_1):
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Apply the effectful op, add one to the input in place,
+                # return the op result.
                 y = torch.ops.test.codegen_mutation_effect(x)
                 x.add_(1)
                 return y
@@ -7639,6 +8998,8 @@ def forward(self, primals_1, tangents_1):
             handle.destroy()
 
     def test_effect_tokens_codegen_multiple_outputs(self):
+        # [FUNCTION DOC] Check effect tokens with several outputs (op result, double
+        # and increment).
         from torch._higher_order_ops.effects import _register_effectful_op
         from torch._library.effects import EffectType
 
@@ -7648,6 +9009,8 @@ def forward(self, primals_1, tangents_1):
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Return the effectful op result, input doubled and input
+                # plus one.
                 y = torch.ops.test.codegen_multi_out_effect(x)
                 return y, x * 2, x + 1
 
@@ -7661,15 +9024,20 @@ def forward(self, primals_1, tangents_1):
             handle.destroy()
 
     def test_effect_tokens_codegen_training_path(self):
+        # [FUNCTION DOC] Check effect tokens on a training path with a registered autograd rule;
+        # a compiled function applying the effectful op and doubling; after forward and backward
+        # the output equals double the input and the gradient is two everywhere.
         from torch._higher_order_ops.effects import _register_effectful_op
         from torch._library.effects import EffectType
 
         op = self._make_effectful_op("codegen_training_effect")
 
         def setup_context(ctx, inputs, output):
+            # [FUNCTION DOC] HELPER: Autograd setup that does nothing.
             pass
 
         def backward(ctx, grad):
+            # [FUNCTION DOC] HELPER: Backward returning the gradient unchanged.
             return grad
 
         op.register_autograd(backward, setup_context=setup_context)
@@ -7678,6 +9046,7 @@ def forward(self, primals_1, tangents_1):
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Apply the effectful op and double the result.
                 y = torch.ops.test.codegen_training_effect(x)
                 return y * 2
 
@@ -7691,9 +9060,14 @@ def forward(self, primals_1, tangents_1):
             handle.destroy()
 
     def test_effect_tokens_codegen_multiple_tokens(self):
+        # [FUNCTION DOC] Unit test of the effect token wrapper with two tokens: the wrapper
+        # prepends two empty slots to the argument list, clears the caller's list, calls the
+        # wrapped function once, and returns the outputs with the first two removed.
         call_log = []
 
         def mock_compiled_fn(args):
+            # [FUNCTION DOC] HELPER: Mock compiled function that logs a copy of its argument
+            # list and returns a list of indices.
             call_log.append(list(args))
             return list(range(len(args)))
 
@@ -7707,7 +9081,10 @@ def forward(self, primals_1, tangents_1):
         self.assertEqual(list(result), [2, 3, 4])
 
     def test_effect_tokens_codegen_none_output(self):
+        # [FUNCTION DOC] Check the effect token wrapper returns none when the wrapped function
+        # returns none.
         def mock_compiled_fn(args):
+            # [FUNCTION DOC] HELPER: Mock compiled function that returns none.
             return None
 
         wrapper = self._make_wrapper_via_post_compile(mock_compiled_fn, num_tokens=2)
@@ -7720,6 +9097,9 @@ def forward(self, primals_1, tangents_1):
     def _make_rng_wrapper_via_post_compile(
         self, compiled_fn, *, return_new_outs=True, num_forward_returns=1
     ):
+        # [FUNCTION DOC] HELPER: Wrap a compiled function with the functionalized RNG runtime
+        # wrapper using mock metadata (RNG functionalized, one offset output) and the given
+        # return_new_outs flag and forward return count; returns the wrapped function.
         from torch._functorch._aot_autograd.runtime_wrappers import (
             FunctionalizedRngRuntimeWrapper,
         )
@@ -7736,11 +9116,15 @@ def forward(self, primals_1, tangents_1):
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
     def test_functionalized_rng_codegen_emitted(self):
+        # [FUNCTION DOC] CUDA only. With functionalized RNG ops, compiling a random function
+        # emits exactly one RNG wrapper codegen artifact that mentions getting the RNG state and
+        # setting the offset.
         with torch._functorch.config.patch(functionalize_rng_ops=True):
             with capture_codegen_source("functionalized_rng_wrapper") as captured:
 
                 @torch.compile(backend="aot_eager")
                 def f(x):
+                    # [FUNCTION DOC] HELPER: Add a random tensor like x to x.
                     return torch.rand_like(x) + x
 
                 x = torch.randn(4, device="cuda")
@@ -7756,10 +9140,13 @@ def forward(self, primals_1, tangents_1):
         self.assertIn("_set_offset_", source)
 
     def test_functionalized_rng_no_codegen(self):
+        # [FUNCTION DOC] Check no RNG wrapper codegen is emitted when RNG ops are
+        # not functionalized.
         with capture_codegen_source("functionalized_rng_wrapper") as captured:
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Double the input.
                 return x * 2
 
             f(torch.randn(4))
@@ -7771,6 +9158,8 @@ def forward(self, primals_1, tangents_1):
         )
 
     def test_functionalized_rng_no_codegen_returns_same_fn(self):
+        # [FUNCTION DOC] Check the RNG wrapper returns the original compiled function unchanged
+        # when metadata says RNG is not functionalized.
         from torch._functorch._aot_autograd.runtime_wrappers import (
             FunctionalizedRngRuntimeWrapper,
         )
@@ -7787,10 +9176,13 @@ def forward(self, primals_1, tangents_1):
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
     def test_functionalized_rng_codegen_correctness(self):
+        # [FUNCTION DOC] CUDA only. Functionalized RNG: a compiled random function returns
+        # uniform values in the unit interval with correct shape and device.
         with torch._functorch.config.patch(functionalize_rng_ops=True):
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Random tensor like the input.
                 return torch.rand_like(x)
 
             x = torch.randn(8, device="cuda")
@@ -7802,10 +9194,13 @@ def forward(self, primals_1, tangents_1):
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
     def test_functionalized_rng_codegen_multi_output(self):
+        # [FUNCTION DOC] CUDA only. Functionalized RNG with two outputs: the second equals
+        # double the input and the first has the right shape.
         with torch._functorch.config.patch(functionalize_rng_ops=True):
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Return input plus noise and input doubled.
                 noise = torch.rand_like(x)
                 return x + noise, x * 2
 
@@ -7817,10 +9212,13 @@ def forward(self, primals_1, tangents_1):
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
     def test_functionalized_rng_codegen_advances_state(self):
+        # [FUNCTION DOC] CUDA only. Functionalized RNG: successive calls advance the RNG state
+        # so the outputs differ.
         with torch._functorch.config.patch(functionalize_rng_ops=True):
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Random tensor like the input.
                 return torch.rand_like(x)
 
             x = torch.randn(100, device="cuda")
@@ -7834,11 +9232,14 @@ def forward(self, primals_1, tangents_1):
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
     def test_functionalized_rng_codegen_source_structure(self):
+        # [FUNCTION DOC] CUDA only. Checks the generated RNG wrapper source defines the wrapper
+        # function and uses extend and output slicing.
         with torch._functorch.config.patch(functionalize_rng_ops=True):
             with capture_codegen_source("functionalized_rng_wrapper") as captured:
 
                 @torch.compile(backend="aot_eager")
                 def f(x):
+                    # [FUNCTION DOC] HELPER: Random tensor like the input.
                     return torch.rand_like(x)
 
                 f(torch.randn(4, device="cuda"))
@@ -7850,15 +9251,23 @@ def forward(self, primals_1, tangents_1):
         self.assertIn("outs[", source)
 
     def test_functionalized_rng_codegen_unit_return_new_outs(self):
+        # [FUNCTION DOC] Unit test of the RNG wrapper with returning new outputs: mocks the CUDA
+        # RNG state helper so the wrapper gets a fake seed and offset, runs with two inputs, and
+        # checks the new offset output is passed to the offset setter and removed from the
+        # returned list.
         set_offset_log = []
 
         def mock_get_rng_state():
+            # [FUNCTION DOC] HELPER: Mock returning a fake seed and offset pair.
             return ("seed", "offset")
 
         def mock_set_offset(val):
+            # [FUNCTION DOC] HELPER: Mock offset setter that appends the value to a log list.
             set_offset_log.append(val)
 
         def mock_compiled_fn(args):
+            # [FUNCTION DOC] HELPER: Mock compiled function returning a labeled output for each
+            # input argument.
             return [f"out_{i}" for i in range(len(args))]
 
         from unittest.mock import patch as mock_patch
@@ -7882,15 +9291,21 @@ def forward(self, primals_1, tangents_1):
         self.assertEqual(result, ["out_0", "out_1", "out_3"])
 
     def test_functionalized_rng_codegen_unit_no_return_new_outs(self):
+        # [FUNCTION DOC] Same unit test with returning new outputs disabled: the offset output
+        # is still passed to the setter but all outputs are returned.
         set_offset_log = []
 
         def mock_get_rng_state():
+            # [FUNCTION DOC] HELPER: Mock returning a fake seed and offset pair.
             return ("seed", "offset")
 
         def mock_set_offset(val):
+            # [FUNCTION DOC] HELPER: Mock offset setter that appends the value to a log list.
             set_offset_log.append(val)
 
         def mock_compiled_fn(args):
+            # [FUNCTION DOC] HELPER: Mock compiled function returning a labeled output for each
+            # input argument.
             return [f"out_{i}" for i in range(len(args))]
 
         from unittest.mock import patch as mock_patch
@@ -7915,10 +9330,13 @@ def forward(self, primals_1, tangents_1):
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
     def test_functionalized_rng_codegen_training(self):
+        # [FUNCTION DOC] CUDA only. Functionalized RNG in training: forward and backward run and
+        # gradient has input shape.
         with torch._functorch.config.patch(functionalize_rng_ops=True):
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Random tensor like the input times the input.
                 return torch.rand_like(x) * x
 
             x = torch.randn(4, device="cuda", requires_grad=True)
@@ -7932,10 +9350,14 @@ def forward(self, primals_1, tangents_1):
     # --- Backward prologue codegen tests ---
 
     def test_backward_prologue_codegen_emitted(self):
+        # [FUNCTION DOC] Check that backward compilation emits exactly one backward prologue
+        # codegen artifact that defines the prologue function and refers to the functorch
+        # interpreter stack.
         with capture_codegen_source("backward_prologue") as captured:
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Double the input.
                 return x * 2
 
             x = torch.randn(4, requires_grad=True)
@@ -7948,10 +9370,12 @@ def forward(self, primals_1, tangents_1):
         self.assertIn("torch._C._functorch.peek_interpreter_stack()", source)
 
     def test_backward_prologue_no_codegen_for_inference(self):
+        # [FUNCTION DOC] Check no backward prologue codegen for inference-only compilation.
         with capture_codegen_source("backward_prologue") as captured:
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Double the input.
                 return x * 2
 
             f(torch.randn(4))
@@ -7959,10 +9383,14 @@ def forward(self, primals_1, tangents_1):
         self.assertEqual(len(captured), 0)
 
     def test_backward_prologue_baked_arity(self):
+        # [FUNCTION DOC] Check the generated prologue bakes in the expected number of backward
+        # arguments (three outputs).
         with capture_codegen_source("backward_prologue") as captured:
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Return input plus one, doubled input and input
+                # minus one.
                 return x + 1, x * 2, x - 1
 
             x = torch.randn(4, requires_grad=True)
@@ -7974,10 +9402,13 @@ def forward(self, primals_1, tangents_1):
         self.assertIn("if len(flat_args) != 3:", source)
 
     def test_backward_prologue_tangent_filtering(self):
+        # [FUNCTION DOC] Check the prologue filters tangents of outputs that are not
+        # differentiable (an aliased view output), so only the first gradient is used.
         with capture_codegen_source("backward_prologue") as captured:
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Return the doubled input and a flattened view of it.
                 return x * 2, x.view(-1)
 
             x = torch.randn(2, 3, requires_grad=True)
@@ -7989,8 +9420,11 @@ def forward(self, primals_1, tangents_1):
         self.assertIn("_bw_grads = [flat_args[0]]", source)
 
     def test_backward_prologue_correctness_multi_output(self):
+        # [FUNCTION DOC] Correctness of backward through two outputs with two inputs: gradients
+        # are the other input plus one.
         @torch.compile(backend="aot_eager")
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Return product and sum of the inputs.
             return x * y, x + y
 
         x = torch.randn(4, requires_grad=True)
@@ -8001,8 +9435,11 @@ def forward(self, primals_1, tangents_1):
         self.assertEqual(y.grad, x + 1)
 
     def test_backward_prologue_correctness_with_alias(self):
+        # [FUNCTION DOC] Correctness of backward when one output aliases the input: gradient of
+        # the first output is two everywhere.
         @torch.compile(backend="aot_eager")
         def f(x):
+            # [FUNCTION DOC] HELPER: Return the doubled input and a flattened view of the input.
             return x * 2, x.view(-1)
 
         x = torch.randn(2, 3, requires_grad=True)
@@ -8012,10 +9449,13 @@ def forward(self, primals_1, tangents_1):
 
     @xfailIfTorchDynamo
     def test_backward_prologue_correctness_with_mutation(self):
+        # [FUNCTION DOC] Expected failure under dynamo. Backward through aot_function with an
+        # input mutated in the forward: gradient of the other input is two.
         from functorch.compile import nop
         from torch._functorch.aot_autograd import aot_function
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Add one to x in place and return y doubled.
             x.add_(1)
             return y * 2
 
@@ -8027,6 +9467,9 @@ def forward(self, primals_1, tangents_1):
         self.assertEqual(y.grad, torch.full((4,), 2.0))
 
     def test_backward_prologue_no_deterministic_check_when_true(self):
+        # [FUNCTION DOC] Under deterministic algorithms mode, the generated backward
+        # prologue does not contain a check for deterministic mode; the previous setting is
+        # restored afterwards.
         prev = torch.are_deterministic_algorithms_enabled()
         try:
             torch.use_deterministic_algorithms(True)
@@ -8034,6 +9477,7 @@ def forward(self, primals_1, tangents_1):
 
                 @torch.compile(backend="aot_eager")
                 def f(x):
+                    # [FUNCTION DOC] HELPER: Double the input.
                     return x * 2
 
                 x = torch.randn(4, requires_grad=True)
@@ -8047,10 +9491,13 @@ def forward(self, primals_1, tangents_1):
         self.assertNotIn("are_deterministic_algorithms_enabled", source)
 
     def test_backward_prologue_elides_tokens_when_zero(self):
+        # [FUNCTION DOC] Check the generated prologue omits token handling when there are no
+        # effect tokens.
         with capture_codegen_source("backward_prologue") as captured:
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Double the input.
                 return x * 2
 
             x = torch.randn(4, requires_grad=True)
@@ -8061,10 +9508,13 @@ def forward(self, primals_1, tangents_1):
         self.assertNotIn("[None]", source)
 
     def test_backward_prologue_deterministic_check_when_false(self):
+        # [FUNCTION DOC] Check the generated prologue contains a deterministic algorithms check
+        # when the mode is off.
         with capture_codegen_source("backward_prologue") as captured:
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Double the input.
                 return x * 2
 
             x = torch.randn(4, requires_grad=True)
@@ -8075,9 +9525,12 @@ def forward(self, primals_1, tangents_1):
         self.assertIn("are_deterministic_algorithms_enabled", source)
 
     def test_backward_prologue_correctness_with_subclass(self):
+        # [FUNCTION DOC] Correctness of compiled backward with a TwoTensor subclass input
+        # against eager, comparing gradients of both components.
         from torch.testing._internal.two_tensor import TwoTensor
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Double the input.
             return x * 2
 
         a_ref = torch.randn(4, requires_grad=True)
@@ -8097,6 +9550,9 @@ def forward(self, primals_1, tangents_1):
         self.assertEqual(tt.grad.b, tt_ref.grad.b)
 
     def test_backward_prologue_includes_tokens_when_nonzero(self):
+        # [FUNCTION DOC] Check the backward prologue includes the token placeholder when the
+        # backward graph contains an effectful op: forward op with a registered autograd rule
+        # that calls another effectful op in backward.
         from torch._higher_order_ops.effects import _register_effectful_op
         from torch._library.effects import EffectType
 
@@ -8104,9 +9560,11 @@ def forward(self, primals_1, tangents_1):
         fwd_op = self._make_effectful_op("bw_prologue_token_fwd")
 
         def setup_context(ctx, inputs, output):
+            # [FUNCTION DOC] HELPER: Autograd setup that does nothing.
             pass
 
         def backward(ctx, grad):
+            # [FUNCTION DOC] HELPER: Backward calling the effectful backward op on the gradient.
             return torch.ops.test.bw_prologue_token_bwd(grad)
 
         fwd_op.register_autograd(backward, setup_context=setup_context)
@@ -8117,6 +9575,8 @@ def forward(self, primals_1, tangents_1):
 
                 @torch.compile(backend="aot_eager")
                 def f(x):
+                    # [FUNCTION DOC] HELPER: Apply the effectful forward op and double
+                    # the result.
                     return torch.ops.test.bw_prologue_token_fwd(x) * 2
 
                 x = torch.randn(4, requires_grad=True)
@@ -8131,20 +9591,28 @@ def forward(self, primals_1, tangents_1):
             h2.destroy()
 
     def test_backward_prologue_create_graph_mutation_codegen(self):
+        # [FUNCTION DOC] Check the backward prologue code asks for create_graph handling when a
+        # custom op's backward mutates a forward input; the op has a fake and autograd rule.
         @torch.library.custom_op("test::_bw_prologue_clone_mutate", mutates_args={})
         def clone_op(x: torch.Tensor, x1: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Custom op returning a clone of the first argument.
             return x.clone()
 
         @clone_op.register_fake
         def _(x, x1):
+            # [FUNCTION DOC] HELPER: Fake implementation returning an empty tensor like
+            # the input.
             return torch.empty_like(x)
 
         def backward(ctx, grad):
+            # [FUNCTION DOC] HELPER: Backward rule: zero the stored second input under no_grad
+            # and return the doubled gradient and no gradient for the second input.
             with torch.no_grad():
                 ctx.x1.zero_()
             return grad * 2, None
 
         def setup_context(ctx, inputs, output):
+            # [FUNCTION DOC] HELPER: Store the second input on the context.
             (x, x1) = inputs
             ctx.x1 = x1
 
@@ -8153,6 +9621,7 @@ def forward(self, primals_1, tangents_1):
         with capture_codegen_source("backward_prologue") as captured:
 
             def fn(x, x1):
+                # [FUNCTION DOC] HELPER: Call the custom op on both inputs.
                 return torch.ops.test._bw_prologue_clone_mutate(x, x1)
 
             x = torch.randn(3, requires_grad=True)
@@ -8166,26 +9635,35 @@ def forward(self, primals_1, tangents_1):
         self.assertIn("create_graph=True", source)
 
     def test_backward_prologue_create_graph_mutation_raises(self):
+        # [FUNCTION DOC] Check that double backward (create_graph) through a backward that
+        # mutates a forward input raises RuntimeError that such mutations are unsupported.
         @torch.library.custom_op("test::_bw_prologue_clone_mutate2", mutates_args={})
         def clone_op(x: torch.Tensor, x1: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Custom op returning a clone of the first argument.
             return x.clone()
 
         @clone_op.register_fake
         def _(x, x1):
+            # [FUNCTION DOC] HELPER: Fake implementation returning an empty tensor like
+            # the input.
             return torch.empty_like(x)
 
         def backward(ctx, grad):
+            # [FUNCTION DOC] HELPER: Backward rule: zero the stored second input under no_grad
+            # and return the doubled gradient and no gradient for the second input.
             with torch.no_grad():
                 ctx.x1.zero_()
             return grad * 2, None
 
         def setup_context(ctx, inputs, output):
+            # [FUNCTION DOC] HELPER: Store the second input on the context.
             (x, x1) = inputs
             ctx.x1 = x1
 
         clone_op.register_autograd(backward, setup_context=setup_context)
 
         def fn(x, x1):
+            # [FUNCTION DOC] HELPER: Call the custom op on both inputs.
             return torch.ops.test._bw_prologue_clone_mutate2(x, x1)
 
         x = torch.randn(3, requires_grad=True)
@@ -8202,11 +9680,14 @@ def forward(self, primals_1, tangents_1):
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
     def test_backward_prologue_rng_codegen(self):
+        # [FUNCTION DOC] CUDA only. With functionalized RNG, the generated backward prologue
+        # refers to the RNG state getter.
         with torch._functorch.config.patch(functionalize_rng_ops=True):
             with capture_codegen_source("backward_prologue") as captured:
 
                 @torch.compile(backend="aot_eager")
                 def f(x):
+                    # [FUNCTION DOC] HELPER: Random tensor like the input plus the input.
                     return torch.rand_like(x) + x
 
                 x = torch.randn(4, device="cuda", requires_grad=True)
@@ -8220,10 +9701,13 @@ def forward(self, primals_1, tangents_1):
     # --- CompiledFunction.forward codegen tests ---
 
     def test_compiled_forward_codegen_emitted(self):
+        # [FUNCTION DOC] Check that the generated compiled forward source is emitted once and
+        # handles tuple and list forward outputs.
         with capture_codegen_source("compiled_function_forward") as captured:
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Double the input.
                 return x * 2
 
             x = torch.randn(4, requires_grad=True)
@@ -8236,10 +9720,13 @@ def forward(self, primals_1, tangents_1):
         self.assertIn("elif not isinstance(fw_outs, list):", source)
 
     def test_compiled_forward_elides_backward_state(self):
+        # [FUNCTION DOC] Check the generated forward source omits backward state handling when
+        # not needed.
         with capture_codegen_source("compiled_function_forward") as captured:
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Double the input.
                 return x * 2
 
             x = torch.randn(4, requires_grad=True)
@@ -8250,10 +9737,13 @@ def forward(self, primals_1, tangents_1):
         self.assertNotIn("BackwardState", source)
 
     def test_compiled_forward_elides_amp(self):
+        # [FUNCTION DOC] Check the generated forward source omits the autocast disabling guard
+        # when autocast is inactive.
         with capture_codegen_source("compiled_function_forward") as captured:
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Double the input.
                 return x * 2
 
             x = torch.randn(4, requires_grad=True)
@@ -8264,10 +9754,13 @@ def forward(self, primals_1, tangents_1):
         self.assertNotIn("DisableAutocast", source)
 
     def test_compiled_forward_includes_amp_when_active(self):
+        # [FUNCTION DOC] Check the generated forward source includes the autocast disabling
+        # guard when compiled under CPU autocast.
         with capture_codegen_source("compiled_function_forward") as captured:
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Double the input.
                 return x * 2
 
             with torch.autocast("cpu"):
@@ -8279,10 +9772,12 @@ def forward(self, primals_1, tangents_1):
         self.assertIn("_DisableAutocast_", source)
 
     def test_compiled_forward_no_codegen_for_inference(self):
+        # [FUNCTION DOC] Check no forward codegen artifact for inference-only compilation.
         with capture_codegen_source("compiled_function_forward") as captured:
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Double the input.
                 return x * 2
 
             f(torch.randn(4))
@@ -8290,10 +9785,13 @@ def forward(self, primals_1, tangents_1):
         self.assertEqual(len(captured), 0)
 
     def test_compiled_forward_elides_rng_when_off(self):
+        # [FUNCTION DOC] Check the generated forward source omits RNG state advancing when no
+        # RNG states are needed.
         with capture_codegen_source("compiled_function_forward") as captured:
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Double the input.
                 return x * 2
 
             x = torch.randn(4, requires_grad=True)
@@ -8305,6 +9803,8 @@ def forward(self, primals_1, tangents_1):
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
     def test_compiled_forward_rng_codegen(self):
+        # [FUNCTION DOC] CUDA only. With checkpointed random ops (graph safe RNG states), the
+        # generated forward source includes the RNG advance call.
         # _rng_add_ is emitted when num_graphsafe_rng_states > 0, which
         # requires recomputable RNG ops (e.g. from activation checkpointing).
         from torch.utils.checkpoint import checkpoint
@@ -8312,10 +9812,12 @@ def forward(self, primals_1, tangents_1):
         with capture_codegen_source("compiled_function_forward") as captured:
 
             def gn(x):
+                # [FUNCTION DOC] HELPER: Random tensor like the input times the input.
                 return torch.rand_like(x) * x
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Apply non-reentrant checkpointing to the function.
                 return checkpoint(gn, x, use_reentrant=False)
 
             x = torch.randn(4, device="cuda", requires_grad=True)
@@ -8327,8 +9829,11 @@ def forward(self, primals_1, tangents_1):
         self.assertIn("_rng_add_(ctx, args)", source)
 
     def test_compiled_forward_correctness(self):
+        # [FUNCTION DOC] Correctness of compiled forward with two outputs: gradients are the
+        # other input plus one.
         @torch.compile(backend="aot_eager")
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Return product and sum of the inputs.
             return x * y, x + y
 
         x = torch.randn(4, requires_grad=True)
@@ -8341,10 +9846,13 @@ def forward(self, primals_1, tangents_1):
     # --- CompiledFunction.backward codegen tests ---
 
     def test_compiled_backward_codegen_emitted(self):
+        # [FUNCTION DOC] Check the backward codegen artifact is emitted once and defines the
+        # compiled backward function.
         with capture_codegen_source("compiled_function_backward") as captured:
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Double the input.
                 return x * 2
 
             x = torch.randn(4, requires_grad=True)
@@ -8355,10 +9863,12 @@ def forward(self, primals_1, tangents_1):
         self.assertIn("def _compiled_backward(", source)
 
     def test_compiled_backward_no_codegen_for_inference(self):
+        # [FUNCTION DOC] Check no backward codegen for inference-only compilation.
         with capture_codegen_source("compiled_function_backward") as captured:
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Double the input.
                 return x * 2
 
             f(torch.randn(4))
@@ -8366,10 +9876,12 @@ def forward(self, primals_1, tangents_1):
         self.assertEqual(len(captured), 0)
 
     def test_compiled_backward_elides_rng(self):
+        # [FUNCTION DOC] Check the generated backward source omits RNG advancing when unused.
         with capture_codegen_source("compiled_function_backward") as captured:
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Double the input.
                 return x * 2
 
             x = torch.randn(4, requires_grad=True)
@@ -8381,6 +9893,8 @@ def forward(self, primals_1, tangents_1):
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
     def test_compiled_backward_rng_codegen(self):
+        # [FUNCTION DOC] CUDA only. With checkpointed random ops, the generated backward source
+        # includes the RNG advance call.
         # _rng_add_ is emitted when num_graphsafe_rng_states > 0, which
         # requires recomputable RNG ops (e.g. from activation checkpointing),
         # not functionalize_rng_ops (a separate mechanism using seed/offset).
@@ -8389,10 +9903,12 @@ def forward(self, primals_1, tangents_1):
         with capture_codegen_source("compiled_function_backward") as captured:
 
             def gn(x):
+                # [FUNCTION DOC] HELPER: Random tensor like the input times the input.
                 return torch.rand_like(x) * x
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Apply non-reentrant checkpointing to the function.
                 return checkpoint(gn, x, use_reentrant=False)
 
             x = torch.randn(4, device="cuda", requires_grad=True)
@@ -8404,10 +9920,13 @@ def forward(self, primals_1, tangents_1):
         self.assertIn("_rng_add_(_ctx_", source)
 
     def test_compiled_backward_elides_vc_check(self):
+        # [FUNCTION DOC] Check the generated backward source omits the version counter check
+        # helper when not needed.
         with capture_codegen_source("compiled_function_backward") as captured:
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Double the input.
                 return x * 2
 
             x = torch.randn(4, requires_grad=True)
@@ -8418,8 +9937,11 @@ def forward(self, primals_1, tangents_1):
         self.assertNotIn("_tensors_no_vc_check", source)
 
     def test_compiled_backward_correctness(self):
+        # [FUNCTION DOC] Correctness of the compiled backward: gradients of x times y plus one
+        # are y and x.
         @torch.compile(backend="aot_eager")
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Product plus one.
             return x * y + 1
 
         x = torch.randn(4, requires_grad=True)
@@ -8430,23 +9952,33 @@ def forward(self, primals_1, tangents_1):
         self.assertEqual(y.grad, x)
 
     def test_compiled_backward_vc_check_codegen(self):
+        # [FUNCTION DOC] Check the version counter check helper appears in the generated
+        # backward source when a custom Function saves its output for backward, and that the
+        # gradient is twice the input.
         class VcCheckFn(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Autograd Function with functional style forward doubling the
+            # input; stores the output on the context in setup, and backward multiplies the
+            # gradient by it.
             @staticmethod
             def forward(x):
+                # [FUNCTION DOC] HELPER: Double the input.
                 return x * 2
 
             @staticmethod
             def setup_context(ctx, inputs, output):
+                # [FUNCTION DOC] HELPER: Store the output on the context.
                 ctx.out = output
 
             @staticmethod
             def backward(ctx, grad):
+                # [FUNCTION DOC] HELPER: Return the gradient times the stored output.
                 return grad * ctx.out
 
         with capture_codegen_source("compiled_function_backward") as captured:
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Apply the custom Function.
                 return VcCheckFn.apply(x)
 
             x = torch.randn(4, requires_grad=True)
@@ -8459,8 +9991,12 @@ def forward(self, primals_1, tangents_1):
         self.assertEqual(x.grad, 2 * x)
 
     def test_compiled_backward_double_backward(self):
+        # [FUNCTION DOC] Check double backward: create_graph gradient has the right value
+        # and a grad_fn, but backward through it raises RuntimeError that double backward
+        # is unsupported.
         @torch.compile(backend="aot_eager")
         def f(x):
+            # [FUNCTION DOC] HELPER: Square the input.
             return x * x
 
         x = torch.randn(4, requires_grad=True)
@@ -8475,8 +10011,10 @@ def forward(self, primals_1, tangents_1):
             grad_x.sum().backward()
 
     def test_compiled_backward_multiple_outputs(self):
+        # [FUNCTION DOC] Check backward through three outputs sums gradients correctly.
         @torch.compile(backend="aot_eager")
         def f(x):
+            # [FUNCTION DOC] HELPER: Return the input doubled, squared and plus one.
             return x * 2, x * x, x + 1
 
         x = torch.randn(4, requires_grad=True)
@@ -8486,10 +10024,13 @@ def forward(self, primals_1, tangents_1):
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
     def test_compiled_backward_rng_correctness(self):
+        # [FUNCTION DOC] CUDA only. With functionalized RNG, the gradient through random add is
+        # all ones.
         with torch._functorch.config.patch(functionalize_rng_ops=True):
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Random tensor like the input plus the input.
                 return torch.rand_like(x) + x
 
             x = torch.randn(4, device="cuda", requires_grad=True)
@@ -8498,8 +10039,11 @@ def forward(self, primals_1, tangents_1):
             self.assertEqual(x.grad, torch.ones_like(x))
 
     def test_compiled_backward_dynamic_shapes(self):
+        # [FUNCTION DOC] Check dynamic shape compilation across several input sizes gives
+        # correct gradients.
         @torch.compile(backend="aot_eager", dynamic=True)
         def f(x):
+            # [FUNCTION DOC] HELPER: Square the input.
             return x * x
 
         for n in [4, 8, 16]:
@@ -8508,6 +10052,9 @@ def forward(self, primals_1, tangents_1):
             self.assertEqual(x.grad, 2 * x)
 
     def test_compiled_backward_rejects_non_list_args(self):
+        # [FUNCTION DOC] Check the generated compiled backward function rejects arguments that
+        # are not a single mutable list: a tuple of one tensor and a tuple of two both raise
+        # AssertionError mentioning a single mutable list.
         from torch._functorch._aot_autograd.runtime_wrappers import (
             _codegen_compiled_backward,
         )
@@ -8517,6 +10064,7 @@ def forward(self, primals_1, tangents_1):
         )
 
         def noop(*a, **kw):
+            # [FUNCTION DOC] HELPER: Do nothing and return none.
             return None
 
         with self.assertRaisesRegex(AssertionError, "single mutable list"):
@@ -8543,10 +10091,13 @@ def forward(self, primals_1, tangents_1):
     # --- Backward epilogue codegen tests ---
 
     def test_backward_epilogue_codegen_emitted(self):
+        # [FUNCTION DOC] Check the backward epilogue codegen artifact is emitted once, defines
+        # the epilogue function and converts the output to a tuple.
         with capture_codegen_source("backward_epilogue") as captured:
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Double the input.
                 return x * 2
 
             x = torch.randn(4, requires_grad=True)
@@ -8558,10 +10109,12 @@ def forward(self, primals_1, tangents_1):
         self.assertIn("tuple(out)", source)
 
     def test_backward_epilogue_no_codegen_for_inference(self):
+        # [FUNCTION DOC] Check no backward epilogue codegen for inference-only compilation.
         with capture_codegen_source("backward_epilogue") as captured:
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Double the input.
                 return x * 2
 
             f(torch.randn(4))
@@ -8569,10 +10122,13 @@ def forward(self, primals_1, tangents_1):
         self.assertEqual(len(captured), 0)
 
     def test_backward_epilogue_elides_rng_when_off(self):
+        # [FUNCTION DOC] Check the generated epilogue omits setting the RNG offset when
+        # not needed.
         with capture_codegen_source("backward_epilogue") as captured:
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Double the input.
                 return x * 2
 
             x = torch.randn(4, requires_grad=True)
@@ -8583,10 +10139,13 @@ def forward(self, primals_1, tangents_1):
         self.assertNotIn("_set_offset_", source)
 
     def test_backward_epilogue_elides_tokens_when_zero(self):
+        # [FUNCTION DOC] Check the generated epilogue omits token stripping slices when no
+        # tokens exist.
         with capture_codegen_source("backward_epilogue") as captured:
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Double the input.
                 return x * 2
 
             x = torch.randn(4, requires_grad=True)
@@ -8597,8 +10156,10 @@ def forward(self, primals_1, tangents_1):
         self.assertNotIn("[:-", source)
 
     def test_backward_epilogue_correctness(self):
+        # [FUNCTION DOC] Correctness of the epilogue path: gradients of product plus one.
         @torch.compile(backend="aot_eager")
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Product plus one.
             return x * y + 1
 
         x = torch.randn(4, requires_grad=True)
@@ -8609,8 +10170,10 @@ def forward(self, primals_1, tangents_1):
         self.assertEqual(y.grad, x)
 
     def test_backward_epilogue_correctness_multi_output(self):
+        # [FUNCTION DOC] Correctness with two outputs: gradient is five everywhere.
         @torch.compile(backend="aot_eager")
         def f(x):
+            # [FUNCTION DOC] HELPER: Return the input times two and times three.
             return x * 2, x * 3
 
         x = torch.randn(4, requires_grad=True)
@@ -8619,9 +10182,12 @@ def forward(self, primals_1, tangents_1):
         self.assertEqual(x.grad, torch.full((4,), 5.0))
 
     def test_backward_epilogue_correctness_with_subclass(self):
+        # [FUNCTION DOC] Correctness of compiled backward with a TwoTensor subclass input
+        # compared against eager.
         from torch.testing._internal.two_tensor import TwoTensor
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Double the input.
             return x * 2
 
         a_ref = torch.randn(4, requires_grad=True)
@@ -8641,11 +10207,14 @@ def forward(self, primals_1, tangents_1):
         self.assertEqual(tt.grad.b, tt_ref.grad.b)
 
     def test_backward_epilogue_subclass_emits_wrap(self):
+        # [FUNCTION DOC] Check the epilogue codegen wraps gradients back into subclasses when
+        # the input is a TwoTensor.
         from torch.testing._internal.two_tensor import TwoTensor
 
         with capture_codegen_source("backward_epilogue") as captured:
 
             def f(x):
+                # [FUNCTION DOC] HELPER: Double the input.
                 return x * 2
 
             a = torch.randn(4, requires_grad=True)
@@ -8660,6 +10229,8 @@ def forward(self, primals_1, tangents_1):
         self.assertIn("_wrap_", source)
 
     def test_backward_epilogue_includes_tokens_when_nonzero(self):
+        # [FUNCTION DOC] Check the epilogue strips backward effect tokens (slicing off the end)
+        # when the backward graph has effectful ops.
         from torch._higher_order_ops.effects import _register_effectful_op
         from torch._library.effects import EffectType
 
@@ -8667,9 +10238,11 @@ def forward(self, primals_1, tangents_1):
         fwd_op = self._make_effectful_op("bw_epilogue_token_fwd")
 
         def setup_context(ctx, inputs, output):
+            # [FUNCTION DOC] HELPER: Autograd setup that does nothing.
             pass
 
         def backward(ctx, grad):
+            # [FUNCTION DOC] HELPER: Backward calling the effectful backward op on the gradient.
             return torch.ops.test.bw_epilogue_token_bwd(grad)
 
         fwd_op.register_autograd(backward, setup_context=setup_context)
@@ -8680,6 +10253,8 @@ def forward(self, primals_1, tangents_1):
 
                 @torch.compile(backend="aot_eager")
                 def f(x):
+                    # [FUNCTION DOC] HELPER: Apply the effectful forward op and double
+                    # the result.
                     return torch.ops.test.bw_epilogue_token_fwd(x) * 2
 
                 x = torch.randn(4, requires_grad=True)
@@ -8694,6 +10269,7 @@ def forward(self, primals_1, tangents_1):
             h2.destroy()
 
     def test_backward_epilogue_tokens_correctness(self):
+        # [FUNCTION DOC] Correctness with backward effect tokens: gradient is two.
         from torch._higher_order_ops.effects import _register_effectful_op
         from torch._library.effects import EffectType
 
@@ -8701,9 +10277,11 @@ def forward(self, primals_1, tangents_1):
         fwd_op = self._make_effectful_op("bw_epilogue_tok_corr_fwd")
 
         def setup_context(ctx, inputs, output):
+            # [FUNCTION DOC] HELPER: Autograd setup that does nothing.
             pass
 
         def backward(ctx, grad):
+            # [FUNCTION DOC] HELPER: Backward calling the effectful backward op on the gradient.
             return torch.ops.test.bw_epilogue_tok_corr_bwd(grad)
 
         fwd_op.register_autograd(backward, setup_context=setup_context)
@@ -8713,6 +10291,7 @@ def forward(self, primals_1, tangents_1):
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Apply the effectful forward op and double the result.
                 return torch.ops.test.bw_epilogue_tok_corr_fwd(x) * 2
 
             x = torch.randn(4, requires_grad=True)
@@ -8726,11 +10305,14 @@ def forward(self, primals_1, tangents_1):
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
     def test_backward_epilogue_rng_codegen(self):
+        # [FUNCTION DOC] CUDA only. With functionalized RNG the generated epilogue sets the
+        # RNG offset.
         with torch._functorch.config.patch(functionalize_rng_ops=True):
             with capture_codegen_source("backward_epilogue") as captured:
 
                 @torch.compile(backend="aot_eager")
                 def f(x):
+                    # [FUNCTION DOC] HELPER: Random tensor like the input plus the input.
                     return torch.rand_like(x) + x
 
                 x = torch.randn(4, device="cuda", requires_grad=True)
@@ -8743,7 +10325,10 @@ def forward(self, primals_1, tangents_1):
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
     def test_backward_epilogue_rng_correctness(self):
+        # [FUNCTION DOC] CUDA only. Gradient with functionalized RNG compiled matches eager
+        # gradient when the same seed is used.
         def f(x):
+            # [FUNCTION DOC] HELPER: Random tensor like the input plus double the input.
             return torch.rand_like(x) + x * 2
 
         x_ref = torch.randn(4, device="cuda", requires_grad=True)
@@ -8756,6 +10341,7 @@ def forward(self, primals_1, tangents_1):
 
             @torch.compile(backend="aot_eager")
             def f_compiled(x):
+                # [FUNCTION DOC] HELPER: Random tensor like the input plus double the input.
                 return torch.rand_like(x) + x * 2
 
             torch.manual_seed(42)
@@ -8765,8 +10351,11 @@ def forward(self, primals_1, tangents_1):
         self.assertEqual(x.grad, x_ref.grad)
 
     def test_backward_epilogue_create_graph(self):
+        # [FUNCTION DOC] Check double backward construction (create_graph) works in the epilogue
+        # path and gives twice the input.
         @torch.compile(backend="aot_eager")
         def f(x):
+            # [FUNCTION DOC] HELPER: Square the input.
             return x * x
 
         x = torch.randn(4, requires_grad=True)
@@ -8776,6 +10365,9 @@ def forward(self, primals_1, tangents_1):
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
     def test_backward_epilogue_tokens_and_rng_codegen(self):
+        # [FUNCTION DOC] CUDA only. Check the generated epilogue slices tokens before setting
+        # the RNG offset (token position precedes the offset position) when both tokens and
+        # functionalized RNG are present.
         from torch._higher_order_ops.effects import _register_effectful_op
         from torch._library.effects import EffectType
 
@@ -8783,9 +10375,11 @@ def forward(self, primals_1, tangents_1):
         fwd_op = self._make_effectful_op("bw_epi_tok_rng_fwd")
 
         def setup_context(ctx, inputs, output):
+            # [FUNCTION DOC] HELPER: Autograd setup that does nothing.
             pass
 
         def backward(ctx, grad):
+            # [FUNCTION DOC] HELPER: Backward calling the effectful backward op on the gradient.
             return torch.ops.test.bw_epi_tok_rng_bwd(grad)
 
         fwd_op.register_autograd(backward, setup_context=setup_context)
@@ -8797,6 +10391,8 @@ def forward(self, primals_1, tangents_1):
 
                     @torch.compile(backend="aot_eager")
                     def f(x):
+                        # [FUNCTION DOC] HELPER: Apply the effectful forward op, double, add a
+                        # random tensor like the input.
                         return torch.ops.test.bw_epi_tok_rng_fwd(
                             x
                         ) * 2 + torch.rand_like(x)
@@ -8817,6 +10413,8 @@ def forward(self, primals_1, tangents_1):
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
     def test_backward_epilogue_tokens_and_rng_correctness(self):
+        # [FUNCTION DOC] CUDA only. Correctness with both tokens and functionalized RNG:
+        # gradient is two on CUDA.
         from torch._higher_order_ops.effects import _register_effectful_op
         from torch._library.effects import EffectType
 
@@ -8824,9 +10422,11 @@ def forward(self, primals_1, tangents_1):
         fwd_op = self._make_effectful_op("bw_epi_tokrng_c_fwd")
 
         def setup_context(ctx, inputs, output):
+            # [FUNCTION DOC] HELPER: Autograd setup that does nothing.
             pass
 
         def backward(ctx, grad):
+            # [FUNCTION DOC] HELPER: Backward calling the effectful backward op on the gradient.
             return torch.ops.test.bw_epi_tokrng_c_bwd(grad)
 
         fwd_op.register_autograd(backward, setup_context=setup_context)
@@ -8837,6 +10437,8 @@ def forward(self, primals_1, tangents_1):
 
                 @torch.compile(backend="aot_eager")
                 def f(x):
+                    # [FUNCTION DOC] HELPER: Apply the effectful forward op, double, add a
+                    # random tensor like the input.
                     return torch.ops.test.bw_epi_tokrng_c_fwd(x) * 2 + torch.rand_like(
                         x
                     )
@@ -8850,6 +10452,8 @@ def forward(self, primals_1, tangents_1):
             h2.destroy()
 
     def test_backward_epilogue_subclass_and_tokens_codegen(self):
+        # [FUNCTION DOC] Check the epilogue codegen slices tokens and wraps subclasses when a
+        # TwoTensor input is combined with an effectful op.
         from torch._higher_order_ops.effects import _register_effectful_op
         from torch._library.effects import EffectType
         from torch.testing._internal.two_tensor import TwoTensor
@@ -8858,9 +10462,11 @@ def forward(self, primals_1, tangents_1):
         fwd_op = self._make_effectful_op("bw_epi_sub_tok_fwd")
 
         def setup_context(ctx, inputs, output):
+            # [FUNCTION DOC] HELPER: Autograd setup that does nothing.
             pass
 
         def backward(ctx, grad):
+            # [FUNCTION DOC] HELPER: Backward calling the effectful backward op on the gradient.
             return torch.ops.test.bw_epi_sub_tok_bwd(grad)
 
         fwd_op.register_autograd(backward, setup_context=setup_context)
@@ -8870,6 +10476,8 @@ def forward(self, primals_1, tangents_1):
             with capture_codegen_source("backward_epilogue") as captured:
 
                 def f(x):
+                    # [FUNCTION DOC] HELPER: Apply the effectful forward op and double
+                    # the result.
                     return torch.ops.test.bw_epi_sub_tok_fwd(x) * 2
 
                 a = torch.randn(4, requires_grad=True)
@@ -8891,6 +10499,8 @@ def forward(self, primals_1, tangents_1):
         "TwoTensor + effectful tokens backward interaction not yet supported"
     )
     def test_backward_epilogue_subclass_and_tokens_correctness(self):
+        # [FUNCTION DOC] Skipped (unsupported). TwoTensor with effect tokens in backward: both
+        # components should get gradient two.
         from torch._higher_order_ops.effects import _register_effectful_op
         from torch._library.effects import EffectType
         from torch.testing._internal.two_tensor import TwoTensor
@@ -8899,9 +10509,11 @@ def forward(self, primals_1, tangents_1):
         fwd_op = self._make_effectful_op("bw_epi_sub_tok_c_fwd")
 
         def setup_context(ctx, inputs, output):
+            # [FUNCTION DOC] HELPER: Autograd setup that does nothing.
             pass
 
         def backward(ctx, grad):
+            # [FUNCTION DOC] HELPER: Backward calling the effectful backward op on the gradient.
             return torch.ops.test.bw_epi_sub_tok_c_bwd(grad)
 
         fwd_op.register_autograd(backward, setup_context=setup_context)
@@ -8910,6 +10522,7 @@ def forward(self, primals_1, tangents_1):
         try:
 
             def f(x):
+                # [FUNCTION DOC] HELPER: Apply the effectful forward op and double the result.
                 return torch.ops.test.bw_epi_sub_tok_c_fwd(x) * 2
 
             a = torch.randn(4, requires_grad=True)
@@ -8926,6 +10539,8 @@ def forward(self, primals_1, tangents_1):
             h2.destroy()
 
     def test_backward_epilogue_multi_token_codegen(self):
+        # [FUNCTION DOC] Check the generated epilogue slices a single trailing token slot when
+        # two effectful ops each have effectful backwards.
         from torch._higher_order_ops.effects import _register_effectful_op
         from torch._library.effects import EffectType
 
@@ -8935,15 +10550,20 @@ def forward(self, primals_1, tangents_1):
         fwd_op2 = self._make_effectful_op("bw_epi_mt_fwd2")
 
         def setup_context1(ctx, inputs, output):
+            # [FUNCTION DOC] HELPER: Autograd setup for the first op that does nothing.
             pass
 
         def backward1(ctx, grad):
+            # [FUNCTION DOC] HELPER: Backward of the first op calling its effectful backward op.
             return torch.ops.test.bw_epi_mt_bwd1(grad)
 
         def setup_context2(ctx, inputs, output):
+            # [FUNCTION DOC] HELPER: Autograd setup for the second op that does nothing.
             pass
 
         def backward2(ctx, grad):
+            # [FUNCTION DOC] HELPER: Backward of the second op calling its effectful
+            # backward op.
             return torch.ops.test.bw_epi_mt_bwd2(grad)
 
         fwd_op1.register_autograd(backward1, setup_context=setup_context1)
@@ -8957,6 +10577,8 @@ def forward(self, primals_1, tangents_1):
 
                 @torch.compile(backend="aot_eager")
                 def f(x):
+                    # [FUNCTION DOC] HELPER: Apply the first effectful op, then the second,
+                    # and double.
                     y = torch.ops.test.bw_epi_mt_fwd1(x)
                     return torch.ops.test.bw_epi_mt_fwd2(y) * 2
 
@@ -8973,6 +10595,8 @@ def forward(self, primals_1, tangents_1):
             h4.destroy()
 
     def test_backward_epilogue_multi_token_correctness(self):
+        # [FUNCTION DOC] Correctness with two effectful ops in forward and backward: gradient
+        # is two.
         from torch._higher_order_ops.effects import _register_effectful_op
         from torch._library.effects import EffectType
 
@@ -8982,15 +10606,20 @@ def forward(self, primals_1, tangents_1):
         fwd_op2 = self._make_effectful_op("bw_epi_mtc_fwd2")
 
         def setup_context1(ctx, inputs, output):
+            # [FUNCTION DOC] HELPER: Autograd setup for the first op that does nothing.
             pass
 
         def backward1(ctx, grad):
+            # [FUNCTION DOC] HELPER: Backward of the first op calling its effectful backward op.
             return torch.ops.test.bw_epi_mtc_bwd1(grad)
 
         def setup_context2(ctx, inputs, output):
+            # [FUNCTION DOC] HELPER: Autograd setup for the second op that does nothing.
             pass
 
         def backward2(ctx, grad):
+            # [FUNCTION DOC] HELPER: Backward of the second op calling its effectful
+            # backward op.
             return torch.ops.test.bw_epi_mtc_bwd2(grad)
 
         fwd_op1.register_autograd(backward1, setup_context=setup_context1)
@@ -9003,6 +10632,8 @@ def forward(self, primals_1, tangents_1):
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Apply the first effectful op, then the second,
+                # and double.
                 y = torch.ops.test.bw_epi_mtc_fwd1(x)
                 return torch.ops.test.bw_epi_mtc_fwd2(y) * 2
 
@@ -9017,6 +10648,9 @@ def forward(self, primals_1, tangents_1):
             h4.destroy()
 
     def test_backward_epilogue_subclass_and_rng_codegen(self):
+        # [FUNCTION DOC] Call the backward epilogue code generator directly with mock metadata
+        # having functionalized RNG and no tokens; the artifact sets the offset, wraps with the
+        # given callable, and has no token slicing.
         from torch._functorch._aot_autograd.runtime_wrappers import (
             _codegen_backward_epilogue,
         )
@@ -9028,6 +10662,7 @@ def forward(self, primals_1, tangents_1):
         )
 
         def dummy_wrap(out):
+            # [FUNCTION DOC] HELPER: Identity wrapper returning its input.
             return out
 
         with capture_codegen_source("backward_epilogue") as captured:
@@ -9042,6 +10677,8 @@ def forward(self, primals_1, tangents_1):
         self.assertNotIn("[:-", source)
 
     def test_backward_epilogue_subclass_tokens_and_rng_codegen(self):
+        # [FUNCTION DOC] Call the epilogue code generator with two tokens and functionalized
+        # RNG: the source slices two tokens first, then sets the RNG offset, then wraps.
         from torch._functorch._aot_autograd.runtime_wrappers import (
             _codegen_backward_epilogue,
         )
@@ -9053,6 +10690,7 @@ def forward(self, primals_1, tangents_1):
         )
 
         def dummy_wrap(out):
+            # [FUNCTION DOC] HELPER: Identity wrapper returning its input.
             return out
 
         with capture_codegen_source("backward_epilogue") as captured:
@@ -9072,6 +10710,9 @@ def forward(self, primals_1, tangents_1):
         self.assertLess(rng_pos, wrap_pos)
 
     def test_backward_epilogue_subclass_fallback_codegen(self):
+        # [FUNCTION DOC] Call the epilogue code generator without a custom wrapper (none) and
+        # empty gradient metadata: the generated source calls the general subclass wrapping
+        # function rather than a custom wrapper.
         from torch._functorch._aot_autograd.runtime_wrappers import (
             _codegen_backward_epilogue,
         )
@@ -9091,6 +10732,8 @@ def forward(self, primals_1, tangents_1):
         self.assertNotIn("_wrap_(", source)
 
     def test_backward_epilogue_subclass_fallback_none_metas_raises(self):
+        # [FUNCTION DOC] Check the epilogue code generator raises AssertionError when the
+        # gradient input metadata is none and no custom wrapper is given.
         from torch._functorch._aot_autograd.runtime_wrappers import (
             _codegen_backward_epilogue,
         )
@@ -9105,6 +10748,9 @@ def forward(self, primals_1, tangents_1):
             _codegen_backward_epilogue(fw_metadata, subclass_meta, None)
 
     def test_backward_epilogue_make_subclass_override_codegen(self):
+        # [FUNCTION DOC] Call the epilogue code generator with a custom wrapper and empty
+        # gradient metadata: the source references the override as well as the general
+        # subclass wrapper.
         from torch._functorch._aot_autograd.runtime_wrappers import (
             _codegen_backward_epilogue,
         )
@@ -9116,6 +10762,7 @@ def forward(self, primals_1, tangents_1):
         subclass_meta = SimpleNamespace(grad_input_metas=[])
 
         def dummy_wrap(out):
+            # [FUNCTION DOC] HELPER: Identity wrapper returning its input.
             return out
 
         with capture_codegen_source("backward_epilogue") as captured:
@@ -9128,6 +10775,8 @@ def forward(self, primals_1, tangents_1):
         self.assertIn("_wrap_subclasses_(", source)
 
     def test_backward_epilogue_make_subclass_override_fast_path(self):
+        # [FUNCTION DOC] Call the generated epilogue with a fast wrapper and no override: the
+        # fast wrapper is called once with the output list and nothing else.
         from torch._functorch._aot_autograd.runtime_wrappers import (
             _codegen_backward_epilogue,
         )
@@ -9141,6 +10790,7 @@ def forward(self, primals_1, tangents_1):
         call_log = []
 
         def fast_wrap(out):
+            # [FUNCTION DOC] HELPER: Wrapper that logs a fast call and returns its input.
             call_log.append("fast")
             return out
 
@@ -9149,6 +10799,8 @@ def forward(self, primals_1, tangents_1):
         self.assertEqual(call_log, ["fast"])
 
     def test_backward_epilogue_make_subclass_override_slow_path(self):
+        # [FUNCTION DOC] Call the generated epilogue with an override function supplied: the
+        # override path is taken and the fast wrapper is never called.
         from torch._functorch._aot_autograd.runtime_wrappers import (
             _codegen_backward_epilogue,
         )
@@ -9162,10 +10814,13 @@ def forward(self, primals_1, tangents_1):
         call_log = []
 
         def fast_wrap(out):
+            # [FUNCTION DOC] HELPER: Wrapper that logs a fast call and returns its input.
             call_log.append("fast")
             return out
 
         def override(meta, is_runtime, args):
+            # [FUNCTION DOC] HELPER: Override function that logs an override call and returns
+            # the first argument.
             call_log.append("override")
             return args[0]
 
@@ -9174,6 +10829,8 @@ def forward(self, primals_1, tangents_1):
         self.assertNotIn("fast", call_log)
 
     def test_backward_epilogue_no_subclass_no_override_param(self):
+        # [FUNCTION DOC] Check the generated epilogue has no override parameter when there is no
+        # subclass metadata.
         from torch._functorch._aot_autograd.runtime_wrappers import (
             _codegen_backward_epilogue,
         )
@@ -9193,11 +10850,17 @@ def forward(self, primals_1, tangents_1):
     # --- Compiled autograd + backward epilogue integration tests ---
 
     def _run_with_compiled_autograd(self, fn, compiler_fn=None):
+        # [FUNCTION DOC] HELPER: Run the function with compiled autograd enabled and
+        # multithreading disabled after resetting dynamo; uses a default compiler that compiles
+        # the backward graph with aot_eager, full graph and dynamic shapes unless one is given.
+        # Returns the function result.
         from torch._dynamo import compiled_autograd
 
         if compiler_fn is None:
 
             def compiler_fn(gm):
+                # [FUNCTION DOC] HELPER: Default compiler for compiled autograd: compile the
+                # graph module with aot_eager.
                 return torch.compile(
                     gm, backend="aot_eager", fullgraph=True, dynamic=True
                 )
@@ -9210,11 +10873,16 @@ def forward(self, primals_1, tangents_1):
             return fn()
 
     def test_backward_epilogue_compiled_autograd_basic(self):
+        # [FUNCTION DOC] Check the backward result is the same under compiled autograd as
+        # without it for a simple compiled function.
         @torch.compile(backend="aot_eager")
         def f(x):
+            # [FUNCTION DOC] HELPER: Double the input.
             return x * 2
 
         def run():
+            # [FUNCTION DOC] HELPER: Run forward and backward on a fresh input and return
+            # its gradient.
             x = torch.randn(4, requires_grad=True)
             f(x).sum().backward()
             return x.grad
@@ -9225,11 +10893,15 @@ def forward(self, primals_1, tangents_1):
         self.assertEqual(actual, expected)
 
     def test_backward_epilogue_compiled_autograd_multi_output(self):
+        # [FUNCTION DOC] Same compiled autograd comparison for a function with two outputs.
         @torch.compile(backend="aot_eager")
         def f(x):
+            # [FUNCTION DOC] HELPER: Return the input doubled and tripled.
             return x * 2, x * 3
 
         def run():
+            # [FUNCTION DOC] HELPER: Run forward and backward on both outputs of a fresh input
+            # and return its gradient.
             x = torch.randn(4, requires_grad=True)
             a, b = f(x)
             (a.sum() + b.sum()).backward()
@@ -9241,14 +10913,19 @@ def forward(self, primals_1, tangents_1):
         self.assertEqual(actual, expected)
 
     def test_backward_epilogue_compiled_autograd_subclass(self):
+        # [FUNCTION DOC] Same compiled autograd comparison for a TwoTensor subclass input,
+        # comparing both component gradients.
         from torch.testing._internal.two_tensor import TwoTensor
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Double the input.
             return x * 2
 
         compiled_f = torch.compile(f, backend="aot_eager")
 
         def run():
+            # [FUNCTION DOC] HELPER: Run forward and backward on a TwoTensor and return the
+            # gradients of both components.
             a = torch.randn(4, requires_grad=True)
             b = torch.randn(4, requires_grad=True)
             tt = TwoTensor(a, b)
@@ -9266,12 +10943,16 @@ def forward(self, primals_1, tangents_1):
 
     @xfailIfTorchDynamo
     def test_synthetic_base_codegen_emitted(self):
+        # [FUNCTION DOC] Expected failure under dynamo. Aliased inputs with a mutation make
+        # aot_function emit the synthetic base wrapper codegen once, referring to the wrapper
+        # function and the bases.
         from functorch.compile import nop
         from torch._functorch.aot_autograd import aot_function
 
         with capture_codegen_source("synthetic_base_wrapper") as captured:
 
             def f(a, b):
+                # [FUNCTION DOC] HELPER: Double a in place and return a plus one.
                 a.mul_(2)
                 return a + 1
 
@@ -9286,10 +10967,13 @@ def forward(self, primals_1, tangents_1):
 
     @xfailIfTorchDynamo
     def test_synthetic_base_codegen_correctness(self):
+        # [FUNCTION DOC] Expected failure under dynamo. Correctness: after calling a function
+        # that doubles a in place on two overlapping views, a equals double its old value.
         from functorch.compile import nop
         from torch._functorch.aot_autograd import aot_function
 
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Double a in place and return a plus b.
             a.mul_(2)
             return a + b
 
@@ -9302,10 +10986,12 @@ def forward(self, primals_1, tangents_1):
         self.assertEqual(a, a_ref * 2)
 
     def test_synthetic_base_no_codegen_when_not_needed(self):
+        # [FUNCTION DOC] Check no synthetic base wrapper is generated for a simple function.
         with capture_codegen_source("synthetic_base_wrapper") as captured:
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Double the input.
                 return x * 2
 
             f(torch.randn(4))
@@ -9314,10 +11000,14 @@ def forward(self, primals_1, tangents_1):
 
     @xfailIfTorchDynamo
     def test_synthetic_base_codegen_metadata_mutation(self):
+        # [FUNCTION DOC] Expected failure under dynamo. With a data mutation on one view and a
+        # metadata mutation on an aliased view, the generated wrapper uses strided re-creation
+        # and a metadata mutation helper.
         from functorch.compile import nop
         from torch._functorch.aot_autograd import aot_function
 
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Double a in place, transpose b in place, return a plus one.
             a.mul_(2)
             b.t_()
             return a + 1
@@ -9337,6 +11027,8 @@ def forward(self, primals_1, tangents_1):
 
     @xfailIfTorchDynamo
     def test_synthetic_base_codegen_multiple_base_groups(self):
+        # [FUNCTION DOC] Expected failure under dynamo. Two groups of aliased views over two
+        # bases: the generated source allocates a list sized for two bases.
         from functorch.compile import nop
         from torch._functorch.aot_autograd import aot_function
 
@@ -9348,6 +11040,7 @@ def forward(self, primals_1, tangents_1):
         b2 = base2[2:]
 
         def f(a1, a2, b1, b2):
+            # [FUNCTION DOC] HELPER: Double a1, triple b1 in place, return the sum of all four.
             a1.mul_(2)
             b1.mul_(3)
             return a1 + a2 + b1 + b2
@@ -9362,6 +11055,8 @@ def forward(self, primals_1, tangents_1):
 
     @xfailIfTorchDynamo
     def test_synthetic_base_codegen_with_non_aliased_args(self):
+        # [FUNCTION DOC] Expected failure under dynamo. Aliased inputs plus an unaliased tensor:
+        # mutation of the first view is applied correctly.
         from functorch.compile import nop
         from torch._functorch.aot_autograd import aot_function
 
@@ -9371,6 +11066,7 @@ def forward(self, primals_1, tangents_1):
         c = torch.randn(6)
 
         def f(a, b, c):
+            # [FUNCTION DOC] HELPER: Double a in place and return the sum of the three.
             a.mul_(2)
             return a + b + c
 
@@ -9381,10 +11077,14 @@ def forward(self, primals_1, tangents_1):
 
     @xfailIfTorchDynamo
     def test_synthetic_base_codegen_base_is_none(self):
+        # [FUNCTION DOC] Expected failure under dynamo. Aliased inputs detached so neither has a
+        # base: generated source creates an empty tensor and uses set_; mutated view equals old
+        # value plus one.
         from functorch.compile import nop
         from torch._functorch.aot_autograd import aot_function
 
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Add one to a in place and return a plus b.
             a.add_(1)
             return a + b
 
@@ -9407,10 +11107,13 @@ def forward(self, primals_1, tangents_1):
 
     @xfailIfTorchDynamo
     def test_synthetic_base_codegen_metadata_mutation_correctness(self):
+        # [FUNCTION DOC] Expected failure under dynamo. Correctness of a data mutation plus
+        # metadata mutation on aliased views: a doubled and b's shape transposed.
         from functorch.compile import nop
         from torch._functorch.aot_autograd import aot_function
 
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Double a in place, transpose b in place, return a plus one.
             a.mul_(2)
             b.t_()
             return a + 1
@@ -9430,6 +11133,8 @@ def forward(self, primals_1, tangents_1):
 
     @xfailIfTorchDynamo
     def test_synthetic_base_codegen_multiple_groups_correctness(self):
+        # [FUNCTION DOC] Expected failure under dynamo. Correctness with two groups of aliased
+        # views: both mutated views updated.
         from functorch.compile import nop
         from torch._functorch.aot_autograd import aot_function
 
@@ -9441,6 +11146,7 @@ def forward(self, primals_1, tangents_1):
         b2 = base2[2:]
 
         def f(a1, a2, b1, b2):
+            # [FUNCTION DOC] HELPER: Double a1, triple b1 in place, return the sum of all four.
             a1.mul_(2)
             b1.mul_(3)
             return a1 + a2 + b1 + b2
@@ -9456,10 +11162,14 @@ def forward(self, primals_1, tangents_1):
 
     @xfailIfTorchDynamo
     def test_synthetic_base_codegen_all_aliased_no_others(self):
+        # [FUNCTION DOC] Expected failure under dynamo. When all inputs are aliased and none are
+        # other arguments, the generated source concatenates the bases with an empty list;
+        # mutated view is doubled.
         from functorch.compile import nop
         from torch._functorch.aot_autograd import aot_function
 
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Double a in place and return a plus b.
             a.mul_(2)
             return a + b
 
@@ -9480,10 +11190,13 @@ def forward(self, primals_1, tangents_1):
 
     @xfailIfTorchDynamo
     def test_synthetic_base_codegen_non_aliased_before_aliased(self):
+        # [FUNCTION DOC] Expected failure under dynamo. A non-aliased argument placed before two
+        # aliased views: mutation applied to the view and the other argument unchanged.
         from functorch.compile import nop
         from torch._functorch.aot_autograd import aot_function
 
         def f(c, a, b):
+            # [FUNCTION DOC] HELPER: Double a in place and return the sum of the three.
             a.mul_(2)
             return a + b + c
 
@@ -9514,6 +11227,11 @@ def forward(self, primals_1, tangents_1):
         ]
         | None = None,
     ) -> tuple[Callable[..., Any], pytree.TreeSpec, Any]:
+        # [FUNCTION DOC] HELPER: Run only the graph capture and compile stages for a
+        # one-argument function using hand-built configuration (no compilers set on the config,
+        # keep input mutations), fake mode, flattened function and the default partition with
+        # the given compilers. Returns the compiled function, the output tree spec and the
+        # configuration object as it was before stage two.
         from torch._functorch._aot_autograd.descriptors import PlainAOTInput
         from torch._functorch._aot_autograd.frontend_utils import (
             construct_fake_mode,
@@ -9570,17 +11288,26 @@ def forward(self, primals_1, tangents_1):
         return compiled_fn, out_spec, aot_config_before_stage2
 
     def test_aot_stage2_keeps_aot_config_immutable_for_lazy_backward(self):
+        # [FUNCTION DOC] Check that stage two compilation does not alter the frozen
+        # configuration (compilers and partition function stay none, assignment raises a frozen
+        # instance error) and that the backward compiler runs lazily only on the first backward;
+        # outputs and gradients match eager.
         import dataclasses
 
         bw_compile_calls = [0]
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Sum of sine of x times x.
             return (x.sin() * x).sum()
 
         def fw_compiler(gm, example_inputs):
+            # [FUNCTION DOC] HELPER: Forward compiler that returns the graph as a
+            # boxed function.
             return make_boxed_func(gm)
 
         def bw_compiler(gm, example_inputs):
+            # [FUNCTION DOC] HELPER: Backward compiler that counts calls and returns the graph
+            # as a boxed function.
             bw_compile_calls[0] += 1
             return make_boxed_func(gm)
 
@@ -9612,17 +11339,25 @@ def forward(self, primals_1, tangents_1):
         self.assertEqual(bw_compile_calls[0], 1)
 
     def test_aot_stage2_uses_explicit_inference_compiler(self):
+        # [FUNCTION DOC] Check stage two uses the explicit inference compiler for a no-grad
+        # function: forward compiler never called, inference compiler called once, result
+        # matches eager.
         fw_compile_calls = [0]
         inference_compile_calls = [0]
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Cosine of the input.
             return x.cos()
 
         def fw_compiler(gm, example_inputs):
+            # [FUNCTION DOC] HELPER: Forward compiler that counts calls and returns the graph as
+            # a boxed function.
             fw_compile_calls[0] += 1
             return make_boxed_func(gm)
 
         def inference_compiler(gm, example_inputs):
+            # [FUNCTION DOC] HELPER: Inference compiler that counts calls and returns the graph
+            # as a boxed function.
             inference_compile_calls[0] += 1
             return make_boxed_func(gm)
 
@@ -9643,6 +11378,10 @@ def forward(self, primals_1, tangents_1):
         self.assertIsNone(aot_config.inference_compiler)
 
     def test_collect_metadata_subclass_fw_outs_follow_input_mutation_type(self):
+        # [FUNCTION DOC] Check subclass forward output metadata with a TwoTensor input that is
+        # mutated in place: with input mutations kept the metadata has one subclass entry
+        # starting at flat index zero; with mutations out of graph there are two entries
+        # starting at 0 and 2 and the mutated input runtime index is recorded.
         from torch._functorch._aot_autograd.collect_metadata_analysis import (
             run_functionalized_fw_and_collect_metadata,
         )
@@ -9650,6 +11389,7 @@ def forward(self, primals_1, tangents_1):
         from torch._functorch._aot_autograd.schemas import SubclassCreationMeta
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Add one in place and return a list with the sine.
             x.add_(1)
             return [torch.sin(x)]
 
@@ -9708,6 +11448,10 @@ def forward(self, primals_1, tangents_1):
         )
 
     def test_collect_metadata_subclass_fw_outs_include_metadata_only_mutation(self):
+        # [FUNCTION DOC] Check subclass forward output metadata when a plain input has only a
+        # metadata mutation (transpose) and the function returns a TwoTensor: first entry is a
+        # plain tensor metadata at unwrapped index zero, second a subclass creation entry
+        # starting at flat index one.
         from torch._functorch._aot_autograd.collect_metadata_analysis import (
             run_functionalized_fw_and_collect_metadata,
         )
@@ -9718,6 +11462,8 @@ def forward(self, primals_1, tangents_1):
         )
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Transpose in place and return a list with a TwoTensor of
+            # sine and cosine.
             x.transpose_(0, 1)
             return [TwoTensor(torch.sin(x), torch.cos(x))]
 
@@ -9745,6 +11491,10 @@ def forward(self, primals_1, tangents_1):
         )
 
     def test_collect_metadata_subclass_fw_outs_include_intermediate_bases(self):
+        # [FUNCTION DOC] Check subclass forward output metadata with intermediate bases: a
+        # TwoTensor input yields two aliasing view outputs of one intermediate; one intermediate
+        # base is recorded and all three output entries are plain tensor metadata at indices
+        # zero, one, two.
         from torch._functorch._aot_autograd.collect_metadata_analysis import (
             run_functionalized_fw_and_collect_metadata,
         )
@@ -9752,6 +11502,8 @@ def forward(self, primals_1, tangents_1):
         from torch._functorch._aot_autograd.schemas import PlainTensorMeta
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Sum the two components and return two flattened views of
+            # the sum.
             y = x.a + x.b
             return [y.view(-1), y.view(-1)]
 
@@ -9787,11 +11539,18 @@ def forward(self, primals_1, tangents_1):
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
     def test_register_hook_in_checkpoint_accumulated_grad(self):
+        # [FUNCTION DOC] CUDA only. A hook registered on an intermediate inside a checkpointed
+        # region halves its gradient; compiled with aot_eager the input gradient equals the
+        # eager gradient.
         def body(y):
+            # [FUNCTION DOC] HELPER: Register a gradient-halving hook on the input and return
+            # a clone.
             y.register_hook(lambda grad: grad * 0.5)
             return y.clone()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Double the input, run the body with non-reentrant
+            # checkpointing, return the sum with the doubled input.
             y = x * 2
             z = torch.utils.checkpoint.checkpoint(body, y, use_reentrant=False)
             return z + y
@@ -9808,6 +11567,8 @@ def forward(self, primals_1, tangents_1):
         self.assertEqual(x2.grad, eager_grad)
 
     def test_size_of_void_returning_nodes(self):
+        # [FUNCTION DOC] Check the partitioner size helper returns zero for void-returning graph
+        # nodes (assert ops, range constraint) which have no value metadata, instead of raising.
         # Void-returning ops have no `val` metadata. _size_of must return 0
         # for them instead of raising RuntimeError.
         from torch._functorch.partitioners import _size_of
@@ -9824,6 +11585,9 @@ def forward(self, primals_1, tangents_1):
             self.assertEqual(_size_of(node), 0)
 
     def test_size_of_fake_script_object(self):
+        # [FUNCTION DOC] Check the partitioner size helper with a fake script object value: by
+        # default it raises RuntimeError saying the size cannot be computed; with the unsafe
+        # config enabled it treats it as zero size.
         import torch._functorch.config as functorch_config
         from torch._functorch.partitioners import _size_of
         from torch._library.fake_class_registry import FakeScriptObject
@@ -9849,6 +11613,12 @@ def forward(self, primals_1, tangents_1):
         subgraph_op=None,
         fwd_uses=None,
     ):
+        # [FUNCTION DOC] HELPER: Build a small test graph with a control dependency node over
+        # given dependencies. Dependencies are labeled forward (derived from a forward
+        # placeholder) or backward (derived from a backward placeholder); extra ordering
+        # dependencies, an optional operation inside the subgraph, and which dependency outputs
+        # the forward result uses can be given. Returns the graph, forward inputs, outputs,
+        # output descriptors and owning module.
         """Build a minimal control_deps test graph.
 
         Args:
@@ -9876,6 +11646,8 @@ def forward(self, primals_1, tangents_1):
         bw_in.meta = {"val": t}
 
         def _make_val(label):
+            # [FUNCTION DOC] HELPER: Create a sine node of the forward placeholder or a cosine
+            # node of the backward placeholder depending on the label and attach value metadata.
             if label == "fwd":
                 n = g.call_function(torch.ops.aten.sin.default, (fwd_in,))
             else:
@@ -9946,6 +11718,9 @@ def forward(self, primals_1, tangents_1):
         )
 
     def _extract_and_check(self, graph, inputs, outputs, descs):
+        # [FUNCTION DOC] HELPER: Extract a forward graph from the inputs and outputs while
+        # ignoring must-be-in-forward-backward tags, lint it, and return the new graph with the
+        # list of control dependency nodes and the list of getitem nodes.
         from torch._inductor.fx_passes.control_dependencies import (
             control_deps as cd_hop,
         )
@@ -9965,6 +11740,8 @@ def forward(self, primals_1, tangents_1):
         return new_graph, cd_nodes, gi_nodes
 
     def test_extract_graph_control_deps_mixed_validity(self):
+        # [FUNCTION DOC] Check extraction keeping only the forward dependency from mixed
+        # dependencies: one control node with one dependency and one getitem with index one.
         g, ins, outs, descs, _ = self._build_control_deps_graph(deps=["fwd", "bw"])
         _, cd_nodes, gi_nodes = self._extract_and_check(g, ins, outs, descs)
         self.assertEqual(len(cd_nodes), 1)
@@ -9973,11 +11750,15 @@ def forward(self, primals_1, tangents_1):
         self.assertEqual(gi_nodes[0].args[1], 1)
 
     def test_extract_graph_control_deps_all_invalid(self):
+        # [FUNCTION DOC] Check extraction when all dependencies are backward-only drops the
+        # control dependency node.
         g, ins, outs, descs, _ = self._build_control_deps_graph(deps=["bw"])
         _, cd_nodes, _ = self._extract_and_check(g, ins, outs, descs)
         self.assertEqual(len(cd_nodes), 0)
 
     def test_extract_graph_control_deps_getitem_index_remap(self):
+        # [FUNCTION DOC] Check getitem indices are remapped when the invalid dependency
+        # comes first.
         g, ins, outs, descs, _ = self._build_control_deps_graph(deps=["bw", "fwd"])
         _, cd_nodes, gi_nodes = self._extract_and_check(g, ins, outs, descs)
         self.assertEqual(len(cd_nodes), 1)
@@ -9985,6 +11766,8 @@ def forward(self, primals_1, tangents_1):
         self.assertEqual(gi_nodes[0].args[1], 1)
 
     def test_extract_graph_control_deps_additional_deps_filtered(self):
+        # [FUNCTION DOC] Check additional ordering dependencies of the wrong side are filtered,
+        # leaving one ordering dependency and one data dependency.
         g, ins, outs, descs, _ = self._build_control_deps_graph(
             deps=["fwd", "bw"], additional_deps=["fwd"]
         )
@@ -9994,6 +11777,8 @@ def forward(self, primals_1, tangents_1):
         self.assertEqual(len(cd_nodes[0].args) - 2, 1)
 
     def test_extract_graph_control_deps_preserves_subgraph_operation(self):
+        # [FUNCTION DOC] Check the operation inside the control dependency subgraph is preserved
+        # after extraction and the output indices of getitems are zero and one but not two.
         g, ins, outs, descs, mod = self._build_control_deps_graph(
             deps=["fwd", "bw"], subgraph_op=torch.ops.aten.abs.default
         )
@@ -10009,6 +11794,10 @@ def forward(self, primals_1, tangents_1):
         self.assertNotIn(2, gi_indices)
 
     def _build_backward_extract_graph(self, dep_labels, cd_tag, subgraph_op):
+        # [FUNCTION DOC] HELPER: Build a graph with a control dependency node over placeholders,
+        # a subgraph applying the given op, a partitioner tag on the node, and an output that
+        # uses only getitems for the placeholders labeled as backward inputs. Returns the graph,
+        # backward inputs, outputs, descriptors and the module.
         """Build a graph for testing backward extraction of control_deps.
 
         Args:
@@ -10083,6 +11872,9 @@ def forward(self, primals_1, tangents_1):
         return g, bw_inputs, [out], [DummyAOTOutput(0)], mod
 
     def test_backward_extract_eliminates_fwd_sync_fully_valid(self):
+        # [FUNCTION DOC] Check backward extraction removes a forward-tagged synchronization
+        # control dependency node entirely when all dependencies are backward inputs, leaving
+        # two placeholders.
         """All deps are backward inputs -- forward sync control_deps
         should be eliminated entirely, getitems resolve to deps."""
         from torch._functorch._aot_autograd.streams import _SYNC_OPS
@@ -10109,6 +11901,9 @@ def forward(self, primals_1, tangents_1):
         self.assertIsNotNone(out_node)
 
     def test_backward_extract_eliminates_fwd_sync_mixed_validity(self):
+        # [FUNCTION DOC] Check backward extraction removes a forward-tagged synchronization
+        # control dependency node when only some dependencies are backward inputs, leaving
+        # one placeholder.
         """Some deps are backward inputs, some are not -- forward sync
         control_deps eliminated, valid getitems resolve to deps."""
         from torch._functorch._aot_autograd.streams import _SYNC_OPS
@@ -10133,6 +11928,8 @@ def forward(self, primals_1, tangents_1):
         self.assertEqual(len(phs), 1)
 
     def test_backward_extract_preserves_bwd_sync_control_deps(self):
+        # [FUNCTION DOC] Check a backward-tagged synchronization control dependency node is
+        # preserved in extraction and its subgraph keeps one operation.
         """Backward-tagged sync control_deps must stay in the backward graph."""
         from torch._functorch._aot_autograd.streams import _SYNC_OPS
         from torch._inductor.fx_passes.control_dependencies import (
@@ -10162,10 +11959,15 @@ def forward(self, primals_1, tangents_1):
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
     def test_control_deps_mixed_fwd_bw_deps_e2e(self):
+        # [FUNCTION DOC] CUDA only. Compile with aot_eager a function using side streams, events
+        # and stream waits; forward and backward must not crash when the stream wait collects
+        # forward dependencies.
         """Forward compilation and backward must not crash when
         wait_stream's control_deps collects forward deps."""
 
         def fn(x, w):
+            # [FUNCTION DOC] HELPER: Run a matrix product on a side stream, record and wait on
+            # an event, return the product.
             s1 = torch.cuda.Stream()
             s1.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(s1):
@@ -10183,6 +11985,7 @@ def forward(self, primals_1, tangents_1):
 
 
 class TestAOTDispatch(AOTTestCase):
+    # [CLASS DOC] Tests of AOT dispatch with tensor subclass inputs and outputs (TwoTensor).
     # Tests to add cases for (non-exhaustive list, mostly for my notes):
     # - subclass / mode introduced in the middle of the compiled fn
     # - various input mutation / intermediate base tests
@@ -10191,7 +11994,11 @@ class TestAOTDispatch(AOTTestCase):
     # - guard tests (fw guards *and* bw guards)
     # - subclass test involving _indices_of_inps_to_detach
     def test_aminmax_out_dtype_mismatch_errors(self):
+        # [FUNCTION DOC] Check the aminmax op with out tensors of the wrong dtype raises
+        # RuntimeError in eager and TorchRuntimeError under compile with the same message.
         def f(inp, out_min, out_max):
+            # [FUNCTION DOC] HELPER: Call aminmax along the last dimension writing into two
+            # output tensors.
             return torch.aminmax(inp, dim=-1, out=(out_min, out_max))
 
         inp = torch.rand(10, 10)
@@ -10209,8 +12016,13 @@ class TestAOTDispatch(AOTTestCase):
             compiled_f(inp, out_min, out_max)
 
     def test_aot_dispatch_simple(self):
+        # [FUNCTION DOC] Check aot_function with one TwoTensor input and one plain input:
+        # outputs and gradients match eager and the forward graph does subclass ops twice
+        # for the subclass path and once for the plain path; the backward graph has four
+        # dense outputs.
         # a is a subclass, b is not
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Multiply a by six, divide b by two, return the sum.
             aa = torch.mul(a, 6)
             bb = torch.div(b, 2)
             return aa + bb
@@ -10287,8 +12099,11 @@ def forward(self, tangents_1, tangents_2):
         )
 
     def test_aot_dispatch_inference(self):
+        # [FUNCTION DOC] Inference variant of the previous test (no gradients): outputs of the
+        # subclass compiled function match eager.
         # a is a subclass, b is not
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Multiply a by six, divide b by two, return the sum.
             aa = torch.mul(a, 6)
             bb = torch.div(b, 2)
             return aa + bb
@@ -10317,8 +12132,12 @@ def forward(self, tangents_1, tangents_2):
         self.assertEqual(out_ref.b, out_test.b)
 
     def test_aot_dispatch_incorrect_backward(self):
+        # [FUNCTION DOC] Check that when the backward gradient for the second output is a
+        # subclass but was assumed plain at compile time, backward raises RuntimeError about
+        # guessing the subclass metadata incorrectly.
         # a is a subclass, b is not
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Return a divided subclass value and a plain doubled value.
             aa = torch.mul(a, 2)
             bb = torch.add(b, 3)
             out_subclass = torch.div(aa, bb)
@@ -10365,8 +12184,12 @@ metadata incorrectly.
             (out_test[0] + out_test[1]).sum().backward()
 
     def test_aot_dispatch_output_alias(self):
+        # [FUNCTION DOC] Check a function returning a view of a TwoTensor input together with
+        # a product of plain and subclass tensors: outputs and gradients (both TwoTensor)
+        # match eager.
         # a is a tensor, b is a TwoTensor
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Return a same-shape view of b and the product a times b.
             return b.view(b.shape), a * b
 
         b1_ref = torch.ones(3, 3, requires_grad=True)
@@ -10405,7 +12228,11 @@ metadata incorrectly.
         }
     )
     def test_aot_dispatch_input_mutation(self):
+        # [FUNCTION DOC] With the config for not guessing zero tangents for mutated input
+        # subclasses, check input mutations of a TwoTensor and a plain tensor are visible after
+        # the compiled call, metadata matches, and gradients match eager.
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Double a and triple b in place and return their sum.
             a.mul_(2)
             b.mul_(3)
             return a + b
@@ -10453,7 +12280,13 @@ metadata incorrectly.
         self.assertEqual(b_ref_base.grad.b, b_test_base.grad.b)
 
     def test_aot_dispatch_input_metadata_mutation(self):
+        # [FUNCTION DOC] Check metadata-only input mutations (in-place transpose on a plain
+        # tensor, unsqueeze on a TwoTensor) under aot_function: outputs match eager, mutated
+        # inputs and their metadata match, and gradients of both inputs are TwoTensor values
+        # equal to eager.
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Transpose a in place, unsqueeze b in place, return
+            # their sum.
             a.t_()
             b.unsqueeze_(0)
             return a + b
@@ -10508,7 +12341,12 @@ metadata incorrectly.
     # NB: Mixed data and metadata mutations still need tangent metadata support.
     @unittest.expectedFailure
     def test_aot_dispatch_input_data_and_metadata_mutation(self):
+        # [FUNCTION DOC] Expected failure. Mixed metadata and data mutations on plain and
+        # TwoTensor inputs still need tangent metadata support, so this test is known not
+        # to pass.
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Transpose a, unsqueeze b, then double a and triple b in
+            # place and return their sum.
             a.t_()
             b.unsqueeze_(0)
             a.mul_(2)
@@ -10565,7 +12403,13 @@ metadata incorrectly.
         }
     )
     def test_aot_dispatch_input_mutation_and_output_alias(self):
+        # [FUNCTION DOC] With the config disabling zero-tangent guessing for mutated subclass
+        # inputs: check data mutation of inputs together with an output that is a view of a
+        # mutated TwoTensor input; outputs, mutated inputs and gradients of the plain input
+        # match eager.
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Double a, triple b in place, return a view of b and the sum
+            # of both.
             a.mul_(2)
             b.mul_(3)
             return b.view(b.shape), a + b
@@ -10614,7 +12458,12 @@ metadata incorrectly.
         self.assertEqual(a_ref_base.grad.b, a_test_base.grad.b)
 
     def test_aot_dispatch_output_requires_grad_in_no_grad(self):
+        # [FUNCTION DOC] Check that outputs created with grad enabled inside a no_grad region
+        # keep requires_grad like eager for inputs both requiring and not requiring grad, and
+        # that gradients match when backward is run later.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return the sine of x and the cosine of x computed with
+            # grad enabled.
             out1 = x.sin()
             with torch.enable_grad():
                 out2 = x.cos()
@@ -10643,8 +12492,11 @@ metadata incorrectly.
                         raise AssertionError("ref_x.grad and x.grad not allclose")
 
     def test_aot_dispatch_output_requires_grad_in_no_grad_views(self):
+        # [FUNCTION DOC] Check view outputs keep requires_grad in no_grad mode: the inference
+        # compiler graph is used and requires_grad flags of both outputs equal eager.
         # view-type ops preserve requires_grad even in no_grad.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return a flattened view and the sine of the input.
             return x.view(-1), x.sin()
 
         inference_graph_cell = [None]
@@ -10669,7 +12521,17 @@ metadata incorrectly.
 
 
 class GradsNoForceContiguousContextManager(ContextDecorator):
+    # [CLASS DOC] Context manager and decorator that registers a temporary operator library with
+    # an effectful pass-through op whose backward calls another effectful op that records the
+    # memory format and stride of the gradient it receives. State: the library handle, a counter
+    # per memory format (channels last, contiguous) and a list of tangent strides. Used to check
+    # how gradient memory formats are predicted.
     def __enter__(self):
+        # [FUNCTION DOC] HELPER: Create the temporary library; define the two ops, register CPU,
+        # CUDA and meta implementations (the logging implementation counts the suggested memory
+        # format of its input and records its stride), register a backward that calls the
+        # logging op and returns a clone, mark both ops ordered effectful, reset counters;
+        # returns the manager itself.
         # noqa: SCOPED_LIBRARY
         self.lib = torch.library.Library("_test_aotdispatch_lib", "FRAGMENT")
         self.d = {
@@ -10682,17 +12544,23 @@ class GradsNoForceContiguousContextManager(ContextDecorator):
         self.lib.define("log_tangents_memory_format_log(Tensor x) -> Tensor")
 
         def log_tangents_memory_format_impl(a):
+            # [FUNCTION DOC] HELPER: Clone implementation of the op.
             return a.clone()
 
         def log_tangents_memory_format_meta(a):
+            # [FUNCTION DOC] HELPER: Meta implementation cloning the input.
             return a.clone()
 
         def log_tangents_memory_format_log_impl(x):
+            # [FUNCTION DOC] HELPER: Logging implementation: increment the counter for the
+            # suggested memory format of the input, append its strides to the list, return
+            # a clone.
             self.d[torch._prims_common.suggest_memory_format(x)] += 1
             self.tangent_strides.append(x.stride())
             return x.clone()
 
         def log_tangents_memory_format_log_meta(a):
+            # [FUNCTION DOC] HELPER: Meta implementation cloning the input.
             return a.clone()
 
         for backend in ["CPU", "CUDA"]:
@@ -10715,6 +12583,8 @@ class GradsNoForceContiguousContextManager(ContextDecorator):
         )
 
         def log_tangents_memory_format_bwd(ctx, grad):
+            # [FUNCTION DOC] HELPER: Backward of the op: call the logging op on the gradient and
+            # return a clone of it.
             torch.ops._test_aotdispatch_lib.log_tangents_memory_format_log(grad)
             return grad.clone()
 
@@ -10738,10 +12608,13 @@ class GradsNoForceContiguousContextManager(ContextDecorator):
         return self
 
     def __exit__(self, type, value, tb):
+        # [FUNCTION DOC] HELPER: Destroy the temporary library; never suppresses exceptions
+        # (returns false).
         self.lib._destroy()
         return False
 
     def reset_counters(self):
+        # [FUNCTION DOC] HELPER: Reset the per-format counters to zero.
         self.d = {
             torch.channels_last: 0,
             torch.contiguous_format: 0,
@@ -10749,13 +12622,21 @@ class GradsNoForceContiguousContextManager(ContextDecorator):
 
 
 class TestAOTModuleSimplified(AOTTestCase):
+    # [CLASS DOC] Tests of aot_module_simplified and the tangent handling in module compilation.
     def test_aot_module_simplified(self):
+        # [FUNCTION DOC] Compile a module with a linear layer through aot_module_simplified with
+        # no-op compilers; outputs and input gradients are compared with eager and
+        # AssertionError is raised if not close.
         class MockModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a linear layer from 20 to 30 features adding a
+            # second input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(20, 30)
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Return a one-element tuple of the linear output plus y.
                 return (self.linear(x) + y,)
 
         mod = MockModule()
@@ -10786,12 +12667,19 @@ class TestAOTModuleSimplified(AOTTestCase):
             )
 
     def test_aot_module_simplified_dynamic(self):
+        # [FUNCTION DOC] Same as the previous test with fake inputs under a symbolic shape
+        # environment; also asserts the recorded shape guards are two equalities for the
+        # static sizes.
         class MockModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a linear layer from 20 to 30 features adding a
+            # second input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(20, 30)
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Return a one-element tuple of the linear output plus y.
                 return (self.linear(x) + y,)
 
         mod = MockModule()
@@ -10833,8 +12721,15 @@ class TestAOTModuleSimplified(AOTTestCase):
 
     # https://github.com/pytorch/pytorch/issues/105327
     def test_lift_fresh_copy_in_graph(self):
+        # [FUNCTION DOC] Regression for issue 105327: a module building a constant tensor and
+        # passing it through lift fresh copy compiles with fake inputs and gives the same result
+        # as eager.
         class MyMod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module creating a constant tensor, copying via lift fresh copy
+            # and multiplying the input by it.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Multiply the input by a fresh copy of a constant
+                # tensor; returns a one-element tuple.
                 _tensor_constant0 = torch.tensor([1])
                 lift_fresh_copy = torch.ops.aten.lift_fresh_copy.default(
                     _tensor_constant0
@@ -10855,15 +12750,20 @@ class TestAOTModuleSimplified(AOTTestCase):
         self.assertEqual(out_ref[0].detach(), out_test[0].detach())
 
     def test_inference_python_dispatcher(self):
+        # [FUNCTION DOC] Check compiling a module with a bilinear upsample (extracted from a
+        # unet) with fake inputs that do not require grad works under the python dispatcher.
         # Extracted from unet
         class MockModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a bilinear upsample layer.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the upsample layer.
                 super().__init__()
                 self.upsample = torch.nn.Upsample(
                     scale_factor=2, mode="bilinear", align_corners=True
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply the upsample in a tuple.
                 return (self.upsample(x),)
 
         mod = MockModule()
@@ -10875,12 +12775,18 @@ class TestAOTModuleSimplified(AOTTestCase):
         aot_module_simplified(mod, fake_inputs, nop)
 
     def test_aot_module_simplified_preserves_stack_trace(self):
+        # [FUNCTION DOC] Check stack traces recorded when tracing a module with the fx tracer
+        # survive into the graphs given to forward and backward compilers: each call node must
+        # have a stack trace mentioning this test file (AssertionError otherwise).
         class MockModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module applying linear, add and relu.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(20, 30)
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Linear of x, plus y, then relu, returned in a tuple.
                 z = self.linear(x)
                 z = z + y
                 z = z.relu()
@@ -10901,6 +12807,8 @@ class TestAOTModuleSimplified(AOTTestCase):
                 )
 
         def assert_compiler(gm: torch.fx.GraphModule, _):
+            # [FUNCTION DOC] HELPER: Compiler asserting every non-placeholder, non-output node
+            # has a stack trace containing this test file; returns the graph forward.
             for node in gm.graph.nodes:
                 if node.op == "output" or node.op == "placeholder":
                     continue
@@ -10922,8 +12830,15 @@ class TestAOTModuleSimplified(AOTTestCase):
         res[0].sum().backward()
 
     def test_aot_joint_print_readable_marks_backward_stack_trace(self):
+        # [FUNCTION DOC] Check printing the joint graph marks backward nodes with a comment
+        # naming the forward node whose stack trace they come from: sets fake stack traces
+        # on a few nodes and uses FileCheck on the readable joint graph captured by a
+        # partition function.
         class MockModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module casting to float32 then summing the square.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Cast x to float32 and return the sum of squares in
+                # a tuple.
                 y = x.to(dtype=torch.float32)
                 return ((y * y).sum(),)
 
@@ -10941,11 +12856,14 @@ class TestAOTModuleSimplified(AOTTestCase):
                 )
 
         def compiler(gm: torch.fx.GraphModule, _):
+            # [FUNCTION DOC] HELPER: Compiler returning the graph forward as a boxed function.
             return make_boxed_func(gm.forward)
 
         joint_graph: str | None = None
 
         def partition_fn(gm: torch.fx.GraphModule, inputs, **kwargs):
+            # [FUNCTION DOC] HELPER: Partition function that saves the readable text of the
+            # joint graph in an enclosing variable and delegates to the default partition.
             nonlocal joint_graph
             joint_graph = gm.print_readable(print_output=False)
             return default_partition(gm, inputs, **kwargs)
@@ -10973,11 +12891,18 @@ class TestAOTModuleSimplified(AOTTestCase):
         ).run(joint_graph)
 
     def test_aot_module_simplified_preserves_stack_trace_from_mutation(self):
+        # [FUNCTION DOC] Check the stack trace of an input mutation copy node produced by
+        # tracing a module that mutates a view of the input is preserved for the copy op;
+        # compilers raise AssertionError if not.
         class MockModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module mutating a view of the input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Initialize the module.
                 super().__init__()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Double the first row of x in place and return x plus x
+                # in a tuple.
                 x_view = x[0]
                 x_view.mul_(2)
                 return (x + x,)
@@ -10995,6 +12920,9 @@ class TestAOTModuleSimplified(AOTTestCase):
                 raise AssertionError("Expected 'test_aotdispatch.py' in stack trace")
 
         def assert_compiler(gm: torch.fx.GraphModule, _):
+            # [FUNCTION DOC] HELPER: Compiler asserting a copy op exists and that every copy
+            # op node has a stack trace mentioning the mutation source line; returns the
+            # graph forward.
             if torch.ops.aten.copy_.default not in [x.target for x in gm.graph.nodes]:
                 raise AssertionError("Expected aten.copy_.default in graph nodes")
             for node in gm.graph.nodes:
@@ -11017,6 +12945,8 @@ class TestAOTModuleSimplified(AOTTestCase):
         )
 
     def test_aot_module_simplified_fake_tensor_gm_raises(self):
+        # [FUNCTION DOC] Check compiling a module that closes over a fake tensor raises
+        # AssertionError with the message about an unexpected fake tensor.
         fake_mode = torch._subclasses.fake_tensor.FakeTensorMode()
         real_x = torch.randn(4, requires_grad=True)
         fake_x = fake_mode.from_tensor(real_x)
@@ -11024,7 +12954,10 @@ class TestAOTModuleSimplified(AOTTestCase):
         fake_z = fake_mode.from_tensor(real_z)
 
         class MockModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module adding a captured fake tensor to its input.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Add a captured fake tensor to x (the captured tensor
+                # ends up as a constant in the traced graph).
                 # Accessing a free variable fake tensor will look like a
                 # constant to make_fx, and result in the tensor being traced
                 # into the graph, which is an error condition.  Make sure we
@@ -11035,11 +12968,14 @@ class TestAOTModuleSimplified(AOTTestCase):
             aot_module_simplified(MockModule(), (fake_x,), nop)
 
     def test_aot_test_subclasses_with_tensor_factories(self):
+        # [FUNCTION DOC] Check a subclass whose factory functions create tensors compiles with
+        # aot_eager and matches eager.
         from torch.testing._internal.common_subclass import SubclassWithTensorFactory
 
         inp = SubclassWithTensorFactory(torch.zeros(3, 5))
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Double the input.
             return 2 * x
 
         ref_out = fn(inp)
@@ -11054,14 +12990,23 @@ class TestAOTModuleSimplified(AOTTestCase):
     # The fix is predicting tangents memory format to be similar to outputs memory format.
     # And coerce runtime tangents to that traced memory format.
     def test_grads_no_force_contiguous_dense(self):
+        # [FUNCTION DOC] Check gradients are not forced contiguous for channels-last dense
+        # inputs: compiles a conv module with a logged op under inductor and verifies exactly
+        # one gradient seen in channels-last format and none contiguous.
         with GradsNoForceContiguousContextManager() as ctx:
 
             class M(torch.nn.Module):
+                # [CLASS DOC] HELPER: Module with a convolution, mutating the second input and
+                # returning conv output, its transpose, views of derived tensor and a doubled
+                # contiguous input.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Create the convolution layer.
                     super().__init__()
                     self.conv = torch.nn.Conv2d(3, 3, 3)
 
                 def forward(self, x, y, cont_inp):
+                    # [FUNCTION DOC] HELPER: Compute a derived tensor, double y in place, apply
+                    # the convolution and the logging op, return five outputs.
                     z = y + 3
                     y.mul_(2)
                     r = self.conv(x)
@@ -11079,6 +13024,8 @@ class TestAOTModuleSimplified(AOTTestCase):
             m.train()
 
             def dense_inps():
+                # [FUNCTION DOC] HELPER: Build two channels-last grad-requiring inputs and one
+                # contiguous input.
                 return (
                     torch.randn(2, 3, 5, 5, requires_grad=True).to(
                         memory_format=torch.channels_last
@@ -11102,14 +13049,21 @@ class TestAOTModuleSimplified(AOTTestCase):
             self.assertEqual(ctx.d[torch.contiguous_format], 0)
 
     def test_grads_no_force_contiguous_subclass(self):
+        # [FUNCTION DOC] Same check for a TwoTensor channels-last input: two gradients seen in
+        # channels-last format and none contiguous.
         with GradsNoForceContiguousContextManager() as ctx:
 
             class M(torch.nn.Module):
+                # [CLASS DOC] HELPER: Module with a convolution applying the logging op and
+                # returning the result and y plus one.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Create the convolution layer.
                     super().__init__()
                     self.conv = torch.nn.Conv2d(3, 3, 3)
 
                 def forward(self, x, y):
+                    # [FUNCTION DOC] HELPER: Apply the convolution and logging op, return it
+                    # with y plus one.
                     r = self.conv(x)
                     r = torch.ops._test_aotdispatch_lib.log_tangents_memory_format(r)
                     return r, y + 1
@@ -11119,6 +13073,8 @@ class TestAOTModuleSimplified(AOTTestCase):
             m.train()
 
             def inps_fn():
+                # [FUNCTION DOC] HELPER: Build a TwoTensor of channels-last grad-requiring
+                # tensors and a plain tensor.
                 return (
                     TwoTensor(
                         torch.randn(2, 3, 5, 5, requires_grad=True).to(
@@ -11145,14 +13101,20 @@ class TestAOTModuleSimplified(AOTTestCase):
             self.assertEqual(ctx.d[torch.contiguous_format], 0)
 
     def test_grads_no_force_contiguous_nested_subclass(self):
+        # [FUNCTION DOC] Same check for doubly nested TwoTensor input: four gradients seen in
+        # channels-last format and none contiguous.
         with GradsNoForceContiguousContextManager() as ctx:
 
             class M(torch.nn.Module):
+                # [CLASS DOC] HELPER: Module with a convolution followed by the logging op.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Create the convolution layer.
                     super().__init__()
                     self.conv = torch.nn.Conv2d(3, 3, 3)
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Apply the convolution and the logging op and return
+                    # the result.
                     r = self.conv(x)
                     r = torch.ops._test_aotdispatch_lib.log_tangents_memory_format(r)
                     return r
@@ -11162,6 +13124,8 @@ class TestAOTModuleSimplified(AOTTestCase):
             m.train()
 
             def inps_fn(x):
+                # [FUNCTION DOC] HELPER: Wrap four clones of a tensor in nested TwoTensor and
+                # return as a one-element tuple.
                 return (
                     TwoTensor(
                         TwoTensor(x.clone(), x.clone()), TwoTensor(x.clone(), x.clone())
@@ -11191,9 +13155,13 @@ class TestAOTModuleSimplified(AOTTestCase):
             self.assertEqual(ctx.d[torch.contiguous_format], 0)
 
     def test_grads_no_force_contiguous_nested_tensor_tangent(self):
+        # [FUNCTION DOC] Check gradient computation through a compiled clone of a jagged nested
+        # tensor works (setting attributes on nested tensor tangents must not fail with an
+        # attribute error).
         # NestedTensor setattr could fails with AttributeError for attr "_min_seqlen_tensor"
         # Adding test to verify that it is handled.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Clone the input.
             return x.clone()
 
         a = torch.randn(2, 3, requires_grad=True, dtype=torch.float64)
@@ -11206,7 +13174,11 @@ class TestAOTModuleSimplified(AOTTestCase):
         ga, gb, gc = torch.autograd.grad(out_buffer.sum(), (a, b, c))
 
     def test_wrong_guess_tangent_type(self):
+        # [FUNCTION DOC] Check backward still works when the tangent type guessed at compile
+        # time (TwoTensor from a TwoTensor input) is wrong by providing an explicit TwoTensor
+        # gradient to backward on both eager and compiled outputs.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Clone the input.
             return x.clone()
 
         ref_x = TwoTensor(
@@ -11237,7 +13209,11 @@ Expected a .* tangent but got a plain Tensor.""",
             y2.backward(gradient=torch.randn(2, 3))
 
     def test_tangent_type_coercion(self):
+        # [FUNCTION DOC] Check tangent type coercion in backward: a compiled clone of a
+        # TwoTensor accepts a gradient that is a different subclass (wrapper subclass) and is
+        # coerced, and a plain tensor input accepts a wrapper subclass gradient.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Clone the input.
             return x.clone()
 
         ref_y = fn(WrapperSubclass(torch.randn(2, 3, requires_grad=True)))
@@ -11264,13 +13240,20 @@ Expected a .* tangent but got a plain Tensor.""",
 
     @torch._inductor.config.patch({"freezing": True})
     def test_inductor_freezing_with_subclasses(self):
+        # [FUNCTION DOC] With inductor freezing enabled, compile a module holding a TwoTensor
+        # attribute and a plain tensor attribute under no_grad; expects no error.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module holding a TwoTensor and a plain tensor, adding both to
+            # a gathered input.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Create the TwoTensor and plain tensor attributes.
                 super().__init__()
                 self.w = TwoTensor(torch.randn(3, 4), torch.randn(3, 4))
                 self.wt = torch.randn(3, 4)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Select rows of x in a permuted order and add
+                # both attributes.
                 return (
                     x.index_select(
                         dim=0, index=torch.tensor([0, 2, 1], dtype=torch.int64)
@@ -11285,10 +13268,15 @@ Expected a .* tangent but got a plain Tensor.""",
             torch.compile(m, fullgraph=True)(inp)
 
     def test_rrelu(self):
+        # [FUNCTION DOC] Check the randomized leaky relu in training mode compiles with inductor
+        # in functional and in-place form without error.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Randomized relu in training mode.
             return torch.rrelu(x, training=True)
 
         def fn_(x):
+            # [FUNCTION DOC] HELPER: Randomized relu in place in training mode, return
+            # the input.
             torch.rrelu_(x, training=True)
             return x
 
@@ -11297,7 +13285,10 @@ Expected a .* tangent but got a plain Tensor.""",
         torch.compile(fn_, backend="inductor", fullgraph=True)(x)
 
     def test_layer_norm(self):
+        # [FUNCTION DOC] Check layer norm over the last dimension compiled with aot_eager
+        # exactly matches eager (zero tolerance).
         def fn(x):
+            # [FUNCTION DOC] HELPER: Layer norm over the last dimension of size eight.
             return F.layer_norm(x, normalized_shape=(8,))
 
         x = torch.randn(2, 4, 8)
@@ -11307,8 +13298,11 @@ Expected a .* tangent but got a plain Tensor.""",
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
     def test_rms_norm(self):
+        # [FUNCTION DOC] CUDA only. Check RMS norm over the last dimension compiled with
+        # aot_eager exactly matches eager (only the CUDA version fails to decompose).
         # Only CUDA rms norm fails to be decomposed
         def fn(x):
+            # [FUNCTION DOC] HELPER: RMS norm over the last dimension of size eight.
             return F.rms_norm(x, normalized_shape=(8,))
 
         x = torch.randn(2, 4, 8, device="cuda")
@@ -11317,8 +13311,14 @@ Expected a .* tangent but got a plain Tensor.""",
         self.assertEqual(eager, aot_eager, atol=0, rtol=0)
 
     def test_subclass_parameters(self):
+        # [FUNCTION DOC] Check modules with nested subclass parameters: after unwrapping
+        # subclass parameters, eager outputs and gradients are unchanged, and compiled outputs
+        # and gradients match.
         class _M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module holding a parameter that is a nested TwoTensor and adds
+            # it to the input.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Create the nested subclass parameter.
                 super().__init__()
                 self.p = torch.nn.Parameter(
                     TwoTensor(
@@ -11328,10 +13328,14 @@ Expected a .* tangent but got a plain Tensor.""",
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Add the parameter to the input.
                 return x + self.p
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a plain parameter, a TwoTensor parameter and a
+            # child module with a nested subclass parameter.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Create the parameters and the child module.
                 super().__init__()
                 self.p1 = torch.nn.Parameter(torch.ones(3, 4))
                 self.p2 = torch.nn.Parameter(
@@ -11343,6 +13347,8 @@ Expected a .* tangent but got a plain Tensor.""",
                 self._m = _M()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Sum of the child module output, the input, twice the
+                # plain parameter and the subclass parameter.
                 return self._m(x) + x + 2 * self.p1 + self.p2
 
         m = M()
@@ -11372,8 +13378,13 @@ Expected a .* tangent but got a plain Tensor.""",
         self.assertEqual(ref_x.grad, x.grad)
 
     def test_subclass_parameters_torture_case(self):
+        # [FUNCTION DOC] Like the previous test for a deeply nested subclass parameter, using
+        # only part of it in forward.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a plain parameter and a deeply nested
+            # TwoTensor parameter.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Create the plain and deeply nested parameters.
                 super().__init__()
                 self.p1 = torch.nn.Parameter(torch.ones(3, 4))
                 self.p2 = torch.nn.Parameter(
@@ -11390,6 +13401,8 @@ Expected a .* tangent but got a plain Tensor.""",
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Add the input, twice the plain parameter and the inner
+                # component of the first part of the subclass parameter.
                 return x + 2 * self.p1 + self.p2.a.b
 
         m = M()
@@ -11419,7 +13432,12 @@ Expected a .* tangent but got a plain Tensor.""",
         self.assertEqual(ref_x.grad, x.grad)
 
     def test_rrelu_with_noise_mutation(self):
+        # [FUNCTION DOC] Check randomized relu with a noise tensor in functional, mutating and
+        # in-place forms compiles with inductor (bfloat16, negative inputs), the noise output is
+        # updated (values below one) and backward works for the first two forms.
         def fn_functional(x):
+            # [FUNCTION DOC] HELPER: Call the functional noise variant and return the result and
+            # the noise output.
             noise = torch.ones_like(x)
             result, noise_out = torch.ops.aten.rrelu_with_noise_functional(
                 x, noise, 0.2, 0.8, True
@@ -11427,16 +13445,23 @@ Expected a .* tangent but got a plain Tensor.""",
             return result, noise_out
 
         def fn_mutation(x):
+            # [FUNCTION DOC] HELPER: Call the noise op that mutates the noise tensor and return
+            # the result and noise.
             noise = torch.ones_like(x)
             result = torch.ops.aten.rrelu_with_noise(x, noise, 0.2, 0.8, True)
             return result, noise
 
         def fn_inplace(x):
+            # [FUNCTION DOC] HELPER: Call the in-place noise variant on x and return x and
+            # the noise.
             noise = torch.ones_like(x, requires_grad=False)
             torch.ops.aten.rrelu_with_noise_(x, noise, 0.2, 0.8, True)
             return x, noise
 
         def _test_fn(fn, check_backward=True):
+            # [FUNCTION DOC] HELPER: Run the function eagerly and compiled, check eager noise is
+            # below one, optionally run backward on the compiled output, check compiled noise is
+            # below one.
             x = -torch.abs(torch.randn(4, 4, dtype=torch.bfloat16, requires_grad=True))
 
             ref_y, ref_noise = fn(x)
@@ -11457,7 +13482,12 @@ Expected a .* tangent but got a plain Tensor.""",
     @parametrize("case", ["sum_expand", "computed_view_expand"])
     @patch("torch._functorch.config.guess_tangent_strides_as_outputs", True)
     def test_backward_with_expanded_computed_output(self, case):
+        # [FUNCTION DOC] Parameterized by case. With tangent strides guessed as outputs, check
+        # an output that is an expand (of a sum or of a computed slice) has zero stride, strides
+        # and values match eager, and backward gradient matches.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return either the sum over rows expanded to the input shape
+            # or the sine of the first row expanded; raises AssertionError for an unknown case.
             if case == "sum_expand":
                 return x.sum(dim=0, keepdim=True).expand_as(x)
             elif case == "computed_view_expand":
@@ -11488,15 +13518,22 @@ Expected a .* tangent but got a plain Tensor.""",
     def test_noncontig_nonmemformat_tangents(
         self, dynamic_shapes, test_subclasses, device
     ):
+        # [FUNCTION DOC] CUDA required. Parameterized by dynamic shapes, subclass inputs and
+        # device. With tangent strides guessed as outputs, checks backward with tangents that
+        # are all ones, zero-strided (memory overlap) and non-dense strided, for plain or
+        # TwoTensor inputs; gradients match eager.
         B = 2
         T = 4
         E = 6
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Add one then transpose dims one and two.
             x = x + 1
             return x.transpose(1, 2)
 
         def _inp_dense():
+            # [FUNCTION DOC] HELPER: Make a random grad-requiring tensor, marking all dims
+            # dynamic when dynamic shapes are on.
             t = torch.randn(B, T, E, device=device, requires_grad=True)
             if dynamic_shapes:
                 for i in range(t.ndim):
@@ -11504,6 +13541,7 @@ Expected a .* tangent but got a plain Tensor.""",
             return t
 
         def _inp_sc():
+            # [FUNCTION DOC] HELPER: Make a TwoTensor of two such dense inputs.
             return TwoTensor(_inp_dense(), _inp_dense())
 
         _inp = _inp_dense if not test_subclasses else _inp_sc
@@ -11511,6 +13549,8 @@ Expected a .* tangent but got a plain Tensor.""",
         comp_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
 
         def _tg3(y):
+            # [FUNCTION DOC] HELPER: Make a random tensor twice the size, then view it with
+            # doubled strides to get a non-dense tangent with the shape of y.
             t = torch.randn(
                 2 * y.shape, dtype=y.dtype, layout=y.layout, device=y.device
             )
@@ -11553,22 +13593,31 @@ Expected a .* tangent but got a plain Tensor.""",
     @patch("torch._functorch.config.guess_tangent_strides_as_outputs", True)
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
     def test_flex_attn_noncontiguous_tangents(self):
+        # [FUNCTION DOC] CUDA only. With tangent strides guessed as outputs and the logging
+        # manager, flex attention output tangents through a logged op are received with the
+        # stride pattern of the transposed layout rather than forced contiguous; one stride
+        # tuple recorded.
         with GradsNoForceContiguousContextManager() as ctx:
             E = 16  # embedding dim
             H = 4  # number of heads
 
             @torch.compile(backend="aot_eager", fullgraph=True)
             def attn_fn(q, k, v):
+                # [FUNCTION DOC] HELPER: Compiled flex attention followed by the logging op.
                 y = flex_attention(query=q, key=k, value=v)
                 y = torch.ops._test_aotdispatch_lib.log_tangents_memory_format(y)
                 return y
 
             class M(torch.nn.Module):
+                # [CLASS DOC] HELPER: Self attention module with a combined linear projection.
                 def __init__(self):
+                    # [FUNCTION DOC] HELPER: Create the projection layer.
                     super().__init__()
                     self.c_attn = torch.nn.Linear(E, 3 * E)
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Project, split into q, k, v, reshape to heads and
+                    # transpose, run the attention helper, restore the layout and return.
                     B, T, E = x.size()
                     q, k, v = self.c_attn(x).split(E, dim=2)
                     k = k.view(B, T, H, E // H).transpose(1, 2)  # (B, nh, T, hs)
@@ -11584,6 +13633,7 @@ Expected a .* tangent but got a plain Tensor.""",
             T = 8
 
             def _inp():
+                # [FUNCTION DOC] HELPER: Make a random CUDA input requiring grad.
                 return torch.randn(B, T, E, requires_grad=True, device="cuda")
 
             x = _inp()
@@ -11602,6 +13652,10 @@ Expected a .* tangent but got a plain Tensor.""",
         pre_compile_fn=None,
         backend="aot_eager",
     ):
+        # [FUNCTION DOC] HELPER: Run a function with saved tensor hooks in eager for reference
+        # (all hooks as plain Python), then recompile with the same hooks (inline ones converted
+        # to graph form when requested) and compare output and input gradients with tolerance.
+        # Optional step before compile (for example clearing logs) and backend choice.
         ctx = torch.autograd.graph.saved_tensors_hooks
         torch._dynamo.reset()
         with ExitStack() as stack:
@@ -11612,6 +13666,8 @@ Expected a .* tangent but got a plain Tensor.""",
             ref_x = inp_fn()
 
             def _f(t):
+                # [FUNCTION DOC] HELPER: Detach and clone floating point tensors with
+                # requires_grad, return others unchanged.
                 if t.dtype.is_floating_point:
                     return t.detach().clone().requires_grad_()
 
@@ -11660,6 +13716,10 @@ Expected a .* tangent but got a plain Tensor.""",
     @unittest.skipIf(not SM80OrLater, "bfloat16, float8")
     @parametrize("saved_tensors_hooks_filtering_mode", ["donated", "no_static", "all"])
     def test_saved_tensors_hooks_base(self, saved_tensors_hooks_filtering_mode):
+        # [FUNCTION DOC] CUDA and SM80 required. Parameterized by hook filtering mode. Run
+        # several pack/unpack hook pairs (CPU offload, bfloat16, scaling, device and symbolic
+        # size, float8, float8 with scale, Python-only) against two functions saving tensors for
+        # backward including an integer tensor and a dynamic-size context.
         with patch(
             "torch._functorch.config.saved_tensors_hooks_filtering_mode",
             saved_tensors_hooks_filtering_mode,
@@ -11667,30 +13727,43 @@ Expected a .* tangent but got a plain Tensor.""",
             # y argument is expected to test saving of int tensor,
             # to check filtering functionality to not apply hooks for e.g. is_floating_point
             class SAF(torch.autograd.Function):
+                # [CLASS DOC] HELPER: Autograd Function saving two inputs and returning the
+                # first; backward adds both saved tensors to the gradient.
                 @staticmethod
                 def forward(ctx, x, y):
+                    # [FUNCTION DOC] HELPER: Save both inputs, return the first.
                     ctx.save_for_backward(x, y)
                     return x
 
                 @staticmethod
                 def backward(ctx, gx):
+                    # [FUNCTION DOC] HELPER: Add the saved tensors to the gradient; no gradient
+                    # for the second input.
                     (saved_x, saved_y) = ctx.saved_tensors
                     return gx + saved_x + saved_y, None
 
             class AF(torch.autograd.Function):
+                # [CLASS DOC] HELPER: Autograd Function saving its input and its second
+                # dimension size; backward adds saved input times the size.
                 @staticmethod
                 def forward(ctx, x):
+                    # [FUNCTION DOC] HELPER: Save the input and its size in dimension one;
+                    # return the input.
                     ctx.save_for_backward(x)
                     ctx.d1 = x.size(1)
                     return x
 
                 @staticmethod
                 def backward(ctx, gx):
+                    # [FUNCTION DOC] HELPER: Add the saved input times the stored size to
+                    # the gradient.
                     (saved_x,) = ctx.saved_tensors
                     d1 = ctx.d1
                     return gx + saved_x * d1
 
             def fn(x, y):
+                # [FUNCTION DOC] HELPER: Relu, add one, relu, double, then apply the
+                # saving Function.
                 x = x.relu()
                 x = x + 1
                 x = x.relu()
@@ -11699,6 +13772,8 @@ Expected a .* tangent but got a plain Tensor.""",
                 return x
 
             def simple_fn(x, y):
+                # [FUNCTION DOC] HELPER: Add one, transpose, relu, transpose, then apply the
+                # Function saving both inputs.
                 x = x + 1
                 x = x.t()
                 x = x.relu()
@@ -11709,6 +13784,8 @@ Expected a .* tangent but got a plain Tensor.""",
             device = torch.device("cuda:0")
 
             def inp_fn():
+                # [FUNCTION DOC] HELPER: Make a grad-requiring CUDA tensor with dynamic dims and
+                # an int64 zeros tensor.
                 x = torch.ones(2, 2, device=device, requires_grad=True)
                 torch._dynamo.mark_dynamic(x, 0)
                 torch._dynamo.mark_dynamic(x, 1)
@@ -11716,57 +13793,78 @@ Expected a .* tangent but got a plain Tensor.""",
                 return x, y
 
             def pack_dev_sym_cpu(x):
+                # [FUNCTION DOC] HELPER: Pack hook returning dtype, device, size in dimension
+                # one and a CPU copy.
                 return x.dtype, x.device, x.size(1), x.cpu()
 
             def unpack_dev_sym_cpu(packed):
+                # [FUNCTION DOC] HELPER: Unpack hook restoring device and dtype from the
+                # packed tuple.
                 dtype, device, dim1, x = packed
                 x = x.to(device=device)
                 return x.to(dtype)
 
             def pack_tensor(x):
+                # [FUNCTION DOC] HELPER: Pack hook returning device and a CPU copy.
                 return x.device, x.cpu()
 
             def unpack_tensor(packed):
+                # [FUNCTION DOC] HELPER: Unpack hook moving the CPU tensor back to its device.
                 device, t_cpu = packed
                 return t_cpu.to(device)
 
             def pack_bf16(x):
+                # [FUNCTION DOC] HELPER: Pack hook returning dtype and a bfloat16 copy.
                 return x.dtype, x.to(dtype=torch.bfloat16)
 
             def unpack_bf16(packed):
+                # [FUNCTION DOC] HELPER: Unpack hook converting the stored tensor back to
+                # its dtype.
                 dtype, x = packed
                 return x.to(dtype)
 
             def pack_mul2(x):
+                # [FUNCTION DOC] HELPER: Pack hook returning dtype and the tensor doubled.
                 return x.dtype, x * 2
 
             def unpack_mul2(x):
+                # [FUNCTION DOC] HELPER: Unpack hook halving the stored tensor and converting
+                # to dtype.
                 dtype, x = x
                 x = x / 2
                 return x.to(dtype)
 
             def pack_wrapper_sc(x):
+                # [FUNCTION DOC] HELPER: Pack hook wrapping in a wrapper subclass (unused:
+                # subclass tests are disabled).
                 return WrapperSubclass(x)
 
             def unpack_wrapper_sc(x):
+                # [FUNCTION DOC] HELPER: Unpack hook returning the wrapped tensor.
                 return x.a
 
             def pack_wrapper_two_tensor(x):
+                # [FUNCTION DOC] HELPER: Pack hook wrapping in a TwoTensor (unused).
                 return TwoTensor(x, x)
 
             def unpack_wrapper_two_tensor(x):
+                # [FUNCTION DOC] HELPER: Unpack hook adding the two components (unused).
                 return x.a + x.b
 
             def pack_mul2_eager(x):
+                # [FUNCTION DOC] HELPER: Plain eager pack hook doubling the tensor.
                 return x * 2
 
             def unpack_mul2_eager(x):
+                # [FUNCTION DOC] HELPER: Plain eager unpack hook halving the tensor.
                 return x / 2
 
             def pack_cpu(x):
+                # [FUNCTION DOC] HELPER: Pack hook moving the tensor to the CPU.
                 return x.to(device="cpu")
 
             def unpack_cpu(x):
+                # [FUNCTION DOC] HELPER: Unpack hook moving the tensor back to the test device.
                 return x.to(device=device)
 
             for test_fn in [simple_fn, fn]:
@@ -11810,17 +13908,24 @@ Expected a .* tangent but got a plain Tensor.""",
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
     @unittest.skipIf(not SM80OrLater, "bfloat16, float8")
     def test_saved_tensors_hooks_params(self):
+        # [FUNCTION DOC] CUDA and SM80 required. Check which saved tensors get hooks under each
+        # filtering mode: a module with parameters and a float64 input saved by a Function runs
+        # with a pack hook that logs shape and dtype through a custom op; donated mode skips
+        # parameters and the input, no-static mode keeps the input, all mode logs everything.
         with torch.library._scoped_library("_test_aotdispatch_lib", "FRAGMENT") as lib:
             logged_shapes = []
             logged_dtypes = []
             lib.define("log(Tensor x) -> Tensor")
 
             def log_impl(x):
+                # [FUNCTION DOC] HELPER: Log implementation recording shape and dtype and
+                # returning a clone.
                 logged_shapes.append(list(x.shape))
                 logged_dtypes.append(x.dtype)
                 return x.clone()
 
             def log_meta(x):
+                # [FUNCTION DOC] HELPER: Meta implementation returning a clone.
                 return x.clone()
 
             for backend in ["CPU", "CUDA"]:
@@ -11832,13 +13937,19 @@ Expected a .* tangent but got a plain Tensor.""",
             lib.impl("log", log_meta, "Meta")
 
             def pack_fp8_with_scale_and_log(x):
+                # [FUNCTION DOC] HELPER: Pack hook that logs through the custom op then packs
+                # with scale to float8.
                 torch.ops._test_aotdispatch_lib.log(x)
                 return _pack_fp8_with_scale_wrap(x)
 
             def unpack_fp8_with_scale_and_log(packed):
+                # [FUNCTION DOC] HELPER: Unpack hook delegating to the float8 scale
+                # unpacking function.
                 return _unpack_fp8_with_scale_wrap(packed)
 
             def m_inp_fn():
+                # [FUNCTION DOC] HELPER: Make a float64 grad-requiring CUDA input with dynamic
+                # dims, returned in a tuple.
                 x = torch.ones(
                     2, 2, 2, device=device, dtype=torch.float64, requires_grad=True
                 )
@@ -11847,24 +13958,32 @@ Expected a .* tangent but got a plain Tensor.""",
                 return (x,)
 
             class SAF0(torch.autograd.Function):
+                # [CLASS DOC] HELPER: Autograd Function saving the input; backward adds the
+                # saved input to the gradient.
                 @staticmethod
                 def forward(ctx, x):
+                    # [FUNCTION DOC] HELPER: Save the input and return it.
                     ctx.save_for_backward(x)
                     return x
 
                 @staticmethod
                 def backward(ctx, gx):
+                    # [FUNCTION DOC] HELPER: Add the saved input to the gradient.
                     (saved_x,) = ctx.saved_tensors
                     return gx + saved_x
 
             class M(torch.nn.Module):
+                # [CLASS DOC] HELPER: Module applying the Function, casting to float32 and two
+                # linear layers with relu.
                 def __init__(self):
+                    # [FUNCTION DOC] HELPER: Create two linear layers and relu.
                     super().__init__()
                     self.fc1 = nn.Linear(2, 2)
                     self.relu = nn.ReLU()
                     self.fc2 = nn.Linear(2, 2)
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Apply the Function, cast, linear, relu, linear.
                     x = SAF0.apply(x)
                     x = x.to(dtype=torch.float32)
                     x = self.fc1(x)
@@ -11873,6 +13992,7 @@ Expected a .* tangent but got a plain Tensor.""",
                     return x
 
             def _reset_logged():
+                # [FUNCTION DOC] HELPER: Clear the logged shapes and dtypes.
                 logged_shapes.clear()
                 logged_dtypes.clear()
 
@@ -11880,6 +14000,8 @@ Expected a .* tangent but got a plain Tensor.""",
             m = M().to(device=device)
 
             def _test_m():
+                # [FUNCTION DOC] HELPER: Run the pack hook comparison on the module with the
+                # float8 logging hooks, clearing logs before compile.
                 self._test_pack_hooks(
                     m,
                     m_inp_fn,
@@ -11934,46 +14056,68 @@ Expected a .* tangent but got a plain Tensor.""",
     @unittest.skipIf(not SM80OrLater, "bfloat16, float8")
     @torch._functorch.config.patch(saved_tensors_hooks_filtering_mode="all")
     def test_saved_tensors_hooks_recompile(self):
+        # [FUNCTION DOC] CUDA and SM80 required, with hook filtering for all tensors. Checks
+        # recompilation behavior when saved tensor hooks change between runs: with two different
+        # plain hook pairs there is one compiled frame in total, while with the same pairs in
+        # inline graph form there are three.
         ctx = torch.autograd.graph.saved_tensors_hooks
 
         def pack_bf16(x):
+            # [FUNCTION DOC] HELPER: Pack hook converting to bfloat16.
             return x.to(dtype=torch.bfloat16)
 
         def unpack_bf16(x):
+            # [FUNCTION DOC] HELPER: Unpack hook converting to float.
             return x.to(dtype=torch.float)
 
         def pack_mul2(x):
+            # [FUNCTION DOC] HELPER: Pack hook doubling the tensor.
             return x * 2
 
         def unpack_mul2(x):
+            # [FUNCTION DOC] HELPER: Unpack hook halving the tensor.
             return x / 2
 
         def _test(hooks, inline, expected_compile_count):
+            # [FUNCTION DOC] HELPER: Compile a function once without hooks, then with each of
+            # two hook pairs (inline graph form or plain), and assert the frame compile count
+            # equals the expected count.
             class SAF(torch.autograd.Function):
+                # [CLASS DOC] HELPER: Autograd Function saving the input; backward adds the
+                # saved input to the gradient.
                 @staticmethod
                 def forward(ctx, x):
+                    # [FUNCTION DOC] HELPER: Save the input and return it.
                     ctx.save_for_backward(x)
                     return x
 
                 @staticmethod
                 def backward(ctx, gx):
+                    # [FUNCTION DOC] HELPER: Add the saved input to the gradient.
                     (saved_x,) = ctx.saved_tensors
                     return gx + saved_x
 
             class AF(torch.autograd.Function):
+                # [CLASS DOC] HELPER: Autograd Function saving the input and its size; backward
+                # adds saved input times size.
                 @staticmethod
                 def forward(ctx, x):
+                    # [FUNCTION DOC] HELPER: Save the input and its size in dimension one;
+                    # return the input.
                     ctx.save_for_backward(x)
                     ctx.d1 = x.size(1)
                     return x
 
                 @staticmethod
                 def backward(ctx, gx):
+                    # [FUNCTION DOC] HELPER: Add the saved input times the stored size to
+                    # the gradient.
                     (saved_x,) = ctx.saved_tensors
                     d1 = ctx.d1
                     return gx + saved_x * d1
 
             def fn(x):
+                # [FUNCTION DOC] HELPER: Relu, add one, double, then apply the saving Function.
                 x = x.relu()
                 x = x + 1
                 x = 2 * x
@@ -11983,6 +14127,7 @@ Expected a .* tangent but got a plain Tensor.""",
             device = torch.device("cuda:0")
 
             def inp_fn():
+                # [FUNCTION DOC] HELPER: Make a grad-requiring CUDA tensor with dynamic dims.
                 x = torch.ones(2, 3, device=device, requires_grad=True)
                 torch._dynamo.mark_dynamic(x, 0)
                 torch._dynamo.mark_dynamic(x, 1)
@@ -11996,6 +14141,8 @@ Expected a .* tangent but got a plain Tensor.""",
             y.sum().backward()
 
             def _test_with_hooks(hooks):
+                # [FUNCTION DOC] HELPER: Enter the saved tensor hooks (inline graph form if
+                # requested), compile and run forward and backward.
                 with ExitStack() as stack:
                     pack, unpack = hooks
                     if inline:
@@ -12031,6 +14178,11 @@ Expected a .* tangent but got a plain Tensor.""",
     @torch._functorch.config.patch(donated_buffer=True)
     @torch._functorch.config.patch(saved_tensors_hooks_filtering_mode="no_static")
     def test_saved_tensors_hooks_donated_buffers(self):
+        # [FUNCTION DOC] With donated buffers on and no_static hook filtering: first, without
+        # hooks, compile a function returning its input and a relu of a Function output and
+        # check the log reports no donated backward buffers (the saved input is also a user
+        # output); second, with float8 pack and unpack hooks in graph form, check the log
+        # reports two donated backward buffers.
         pack_gm, unpack_gm = saved_tensors_hooks_to_gm(
             pack_fp8,
             unpack_fp8,
@@ -12040,17 +14192,23 @@ Expected a .* tangent but got a plain Tensor.""",
         logger_name = "torch._functorch._aot_autograd.graph_compile"
 
         class SAF(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Autograd Function saving the input; backward adds the saved
+            # input to the gradient.
             @staticmethod
             def forward(ctx, x):
+                # [FUNCTION DOC] HELPER: Save the input and return it.
                 ctx.save_for_backward(x)
                 return x
 
             @staticmethod
             def backward(ctx, gx):
+                # [FUNCTION DOC] HELPER: Add the saved input to the gradient.
                 (saved_x,) = ctx.saved_tensors
                 return gx + saved_x
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return the input and a relu of the output of the
+            # saving Function.
             x0 = x
             x = SAF.apply(x)
             return x0, torch.nn.functional.relu(x)
@@ -12191,6 +14349,11 @@ def _test_aot_autograd_helper(
     dynamic=False,
     disable_functionalization=False,
 ):
+    # [FUNCTION DOC] HELPER: Shared body of the OpInfo autograd tests. Skips if the op does not
+    # support autograd. For every sample input (with grad enabled) runs the aot autograd check
+    # on the op (data specialization checks except for the unpool ops, optionally dynamic shapes
+    # and disabled functionalization); a dynamic output shape error skips the test, and a data
+    # dependent guard error skips only for the getitem op and is re-raised otherwise.
     if not op.supports_autograd:
         self.skipTest("Op does not support autograd")
 
@@ -12238,6 +14401,12 @@ def _test_aot_autograd_helper(
 def _test_aot_autograd_module_helper(
     self, device, dtype, training, module_info, *, dynamic=False
 ):
+    # [FUNCTION DOC] HELPER: Shared body of the module autograd tests. For each module sample
+    # input with a forward input (skipping packed sequence inputs), builds the module in the
+    # given device, dtype and train mode, runs lazy modules once, defines a functional-call
+    # wrapper taking parameters, buffers and tensor arguments, compiles it with aot_function
+    # using no-op compilers and compares forward and backward results via the
+    # forwards-backwards helper.
     module_cls = module_info.module_cls
     module_inputs = module_info.module_inputs_func(
         module_info, device=device, dtype=dtype, requires_grad=True, training=training
@@ -12277,6 +14446,9 @@ def _test_aot_autograd_module_helper(
         args = [arg for arg in flat_args if isinstance(arg, torch.Tensor)]
 
         def f(params_buffers_args):
+            # [FUNCTION DOC] HELPER: Rebuild the flattened arguments by filling tensor slots
+            # in order, unflatten, and call the module functionally with the given parameters
+            # and buffers.
             named_params, named_buffers, args = params_buffers_args
             cur_flat_args = list(is_tensor_spec)
             args = iter(args)
@@ -12305,9 +14477,14 @@ def _test_aot_autograd_module_helper(
 
 
 class TestEagerFusionOpInfo(AOTTestCase):
+    # [CLASS DOC] OpInfo based tests running the exhaustive aot autograd check for each
+    # operator in the operator and higher-order-op databases, with float dtype, in plain,
+    # symbolic, and functionalization-disabled variants, and with known failures skipped
+    # through the failure dictionaries.
     @ops(op_db + hop_db, allowed_dtypes=(torch.float,))
     @skipOps(aot_autograd_failures)
     def test_aot_autograd_exhaustive(self, device, dtype, op):
+        # [FUNCTION DOC] Run the exhaustive aot autograd helper for the operator.
         _test_aot_autograd_helper(self, device, dtype, op)
 
     @ops(op_db + hop_db, allowed_dtypes=(torch.float,))
@@ -12316,6 +14493,8 @@ class TestEagerFusionOpInfo(AOTTestCase):
         aot_autograd_failures | symbolic_aot_autograd_failures,
     )
     def test_aot_autograd_symbolic_exhaustive(self, device, dtype, op):
+        # [FUNCTION DOC] Run the exhaustive helper for the operator with dynamic shapes (debug
+        # assertions on).
         _test_aot_autograd_helper(self, device, dtype, op, dynamic=True)
 
     @ops(op_db + hop_db, allowed_dtypes=(torch.float,))
@@ -12323,6 +14502,8 @@ class TestEagerFusionOpInfo(AOTTestCase):
         aot_autograd_failures,
     )
     def test_aot_autograd_disable_functionalization_exhaustive(self, device, dtype, op):
+        # [FUNCTION DOC] Run the exhaustive helper for the operator with
+        # functionalization disabled.
         _test_aot_autograd_helper(
             self, device, dtype, op, disable_functionalization=True
         )
@@ -12335,6 +14516,8 @@ class TestEagerFusionOpInfo(AOTTestCase):
     def test_aot_autograd_disable_functionalization_symbolic_exhaustive(
         self, device, dtype, op
     ):
+        # [FUNCTION DOC] Run the exhaustive helper for the operator with dynamic shapes and
+        # functionalization disabled (debug assertions on).
         _test_aot_autograd_helper(
             self,
             device,
@@ -12376,9 +14559,14 @@ symbolic_aot_autograd_module_failures = {
 
 
 class TestEagerFusionModuleInfo(AOTTestCase):
+    # [CLASS DOC] ModuleInfo based tests running the aot autograd check for each module in the
+    # module database with float dtype, static and dynamic shapes, with known failing modules
+    # marked as expected failures.
     @modules(module_db, allowed_dtypes=(torch.float,))
     @decorateForModules(unittest.expectedFailure, aot_autograd_module_failures)
     def test_aot_autograd_module_exhaustive(self, device, dtype, training, module_info):
+        # [FUNCTION DOC] Run the module autograd helper for the module in the given
+        # training mode.
         _test_aot_autograd_module_helper(self, device, dtype, training, module_info)
 
     @modules(module_db, allowed_dtypes=(torch.float,))
@@ -12389,6 +14577,7 @@ class TestEagerFusionModuleInfo(AOTTestCase):
     def test_aot_autograd_symbolic_module_exhaustive(
         self, device, dtype, training, module_info
     ):
+        # [FUNCTION DOC] Run the module autograd helper with dynamic shapes.
         _test_aot_autograd_module_helper(
             self, device, dtype, training, module_info, dynamic=True
         )
@@ -12412,17 +14601,24 @@ instantiate_device_type_tests(TestEagerFusionModuleInfo, globals(), only_for=onl
     ]
 )
 class TestAOTAutogradWithDynamo(TestAOTAutograd):
+    # [CLASS DOC] Runs every TestAOTAutograd test again, but first lowering the function through
+    # dynamo to get a graph module, then compiling it with aot_module_simplified; graph text
+    # assertions are disabled, and one test is expected to fail.
     """
     These are the same as TestAOTAutograd tests, but we run dynamo first to get a graph module.
     """
 
     def assertExpectedInline(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Override that ignores expected-text assertions because dynamo
+        # produces different graphs.
         # These will have different outputs because dynamo returns a different graph module
         # But we don't really care about that assertion when testing with dynamo,
         # only that the outputs match, etc.
         pass
 
     def make_compiler(self, graph_cell):
+        # [FUNCTION DOC] HELPER: Make a boxed compiler that stores the graph into the given
+        # list cell.
         return make_boxed_compiler(partial(extract_graph, graph_cell=graph_cell))
 
     # Compiler to passes to dynamo
@@ -12434,11 +14630,18 @@ class TestAOTAutogradWithDynamo(TestAOTAutograd):
         keep_input_mutations: bool,
         dynamic: bool,
     ):
+        # [FUNCTION DOC] HELPER: Override of the base compile helper: returns a function that
+        # resets dynamo and runs the function through the compile entry point with a backend
+        # that compiles the graph with aot_module_simplified (forward graph captured into the
+        # cell, backward compiler discarded); backend failures are re-raised as the underlying
+        # exception so assertion helpers work.
         """
         Runs dynamo and aot_autograd with the specified settings
         """
 
         def dynamo_compiler(gm, inputs, **kwargs):
+            # [FUNCTION DOC] HELPER: Backend that compiles the dynamo graph module with
+            # aot_module_simplified using the test's compilers and settings.
             result = aot_module_simplified(
                 gm,
                 inputs,
@@ -12451,6 +14654,8 @@ class TestAOTAutogradWithDynamo(TestAOTAutograd):
             return result
 
         def torch_compile_wrapper(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Reset dynamo, compile the function with the dynamo backend,
+            # call it, and re-raise the inner exception of a backend failure.
             torch._dynamo.reset()
             fn = torch.compile(f, backend=dynamo_compiler)
             try:
@@ -12463,12 +14668,17 @@ class TestAOTAutogradWithDynamo(TestAOTAutograd):
         return torch_compile_wrapper
 
     def test_inputs_overlapping_unsqueeze_with_mutation(self):
+        # [FUNCTION DOC] Check dynamic compilation of a function mutating two unsqueezed views
+        # of the same base matches eager.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Add one in place to both inputs and return the first.
             x.add_(1)
             y.add_(1)
             return x
 
         def run(f):
+            # [FUNCTION DOC] HELPER: Call the given function with two unsqueezed views of a
+            # ones base.
             base = torch.ones(10)
             inputs = [base.unsqueeze(0), base.unsqueeze(0)]
             return f(*inputs)
@@ -12481,12 +14691,17 @@ class TestAOTAutogradWithDynamo(TestAOTAutograd):
         self.assertEqual(out, optout)
 
     def test_inputs_overlapping_with_mutation_guard_base(self):
+        # [FUNCTION DOC] Check dynamic compilation of a function mutating two identical
+        # overlapping slices matches eager.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Add one in place to both inputs and return the first.
             x.add_(1)
             y.add_(1)
             return x
 
         def run(f):
+            # [FUNCTION DOC] HELPER: Call the given function with two identical slices of a
+            # ones base.
             base = torch.ones(10)
             inputs = [base[1:], base[1:]]
             return f(*inputs)
@@ -12499,7 +14714,10 @@ class TestAOTAutogradWithDynamo(TestAOTAutograd):
         self.assertEqual(out, optout)
 
     def test_lift_after_factory(self):
+        # [FUNCTION DOC] Check a lift op after a random integer factory under the same seed
+        # gives the same result compiled and eager.
         def f(low, high, size):
+            # [FUNCTION DOC] HELPER: Make a random integer tensor and apply the lift op.
             y = torch.randint(low=low, high=high, size=size)
             return torch.ops.aten.lift.default(y)
 
@@ -12511,23 +14729,34 @@ class TestAOTAutogradWithDynamo(TestAOTAutograd):
         self.assertEqual(out, opt_out)
 
     def test_mutations_in_bw_detached_from_tangent(self):
+        # [FUNCTION DOC] Check an in-place mutation in backward on a tensor that is not tied to
+        # the incoming gradient (a gradient-derived attachment is added) gives the same values
+        # after forward and after backward as eager.
         class AF(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Autograd Function keeping a tensor on the context; backward
+            # adds a one-valued gradient-shaped attachment to it in place.
             @staticmethod
             def forward(ctx, dummy, inplace_tensor):
+                # [FUNCTION DOC] HELPER: Keep the tensor on the context and return a clone of
+                # the dummy.
                 ctx.inplace_tensor = inplace_tensor
                 return dummy.clone()
 
             @staticmethod
             def backward(ctx, grad_output):
+                # [FUNCTION DOC] HELPER: Add ones shaped like the gradient to the kept tensor in
+                # place; return the gradient and no gradients for the others.
                 inplace_tensor = ctx.inplace_tensor
                 gradient_attachment = grad_output * 0 + 1
                 inplace_tensor.add_(1 * gradient_attachment)
                 return grad_output, None, None
 
         def fn(dummy, inplace_tensor):
+            # [FUNCTION DOC] HELPER: Apply the custom Function.
             return AF.apply(dummy, inplace_tensor)
 
         def _inps():
+            # [FUNCTION DOC] HELPER: Make a grad-requiring dummy and a plain zeros tensor.
             dummy = torch.zeros((2,), requires_grad=True)
             inplace_tensor = torch.zeros((2,), requires_grad=False)
             return dummy, inplace_tensor
@@ -12548,24 +14777,33 @@ class TestAOTAutogradWithDynamo(TestAOTAutograd):
         self.assertEqual(ref_inps_after_bw, inps_after_bw)
 
     def test_mutations_in_bw_requires_grad_input(self):
+        # [FUNCTION DOC] Check mutating a forward input that requires grad during backward does
+        # not trigger an in-place check error and results match eager.
         # Inplace mutation of a requires_grad=True forward input during the
         # backward pass should not trigger the check_inplace error
         class AF(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Autograd Function saving a tensor; backward doubles it
+            # in place.
             @staticmethod
             def forward(ctx, dummy, inplace_tensor):
+                # [FUNCTION DOC] HELPER: Save the tensor and return a clone of the dummy.
                 ctx.save_for_backward(inplace_tensor)
                 return dummy.clone()
 
             @staticmethod
             def backward(ctx, grad_output):
+                # [FUNCTION DOC] HELPER: Double the saved tensor in place; return the gradient
+                # and no gradient for the other input.
                 (inplace_tensor,) = ctx.saved_tensors
                 inplace_tensor.mul_(2.0)
                 return grad_output, None
 
         def fn(dummy, inplace_tensor):
+            # [FUNCTION DOC] HELPER: Apply the custom Function.
             return AF.apply(dummy, inplace_tensor)
 
         def _inps():
+            # [FUNCTION DOC] HELPER: Make a zeros dummy and a ones tensor, both requiring grad.
             dummy = torch.zeros((2,), requires_grad=True)
             # requires_grad=True is what triggered the bug
             inplace_tensor = torch.ones((2,), requires_grad=True)
@@ -12587,9 +14825,15 @@ class TestAOTAutogradWithDynamo(TestAOTAutograd):
         self.assertEqual(ref_inps_after_bw, inps_after_bw)
 
     def test_mutation_of_input_in_fw_and_bw(self):
+        # [FUNCTION DOC] Check mutations of an input in both forward and backward, for plain and
+        # TwoTensor inputs, are applied at the right times after compiled forward and backward.
         class AF(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Autograd Function that increments the kept tensor in place in
+            # both forward and backward.
             @staticmethod
             def forward(ctx, dummy, inplace_tensor):
+                # [FUNCTION DOC] HELPER: Increment the kept tensor in place, keep it, return a
+                # clone of the dummy.
                 inplace_tensor.add_(1)
 
                 ctx.inplace_tensor = inplace_tensor
@@ -12597,19 +14841,24 @@ class TestAOTAutogradWithDynamo(TestAOTAutograd):
 
             @staticmethod
             def backward(ctx, grad_output):
+                # [FUNCTION DOC] HELPER: Increment the kept tensor in place and return
+                # the gradient.
                 inplace_tensor = ctx.inplace_tensor
                 inplace_tensor.add_(1)
                 return grad_output, None, None
 
         def fn(dummy, inplace_tensor):
+            # [FUNCTION DOC] HELPER: Apply the custom Function.
             return AF.apply(dummy, inplace_tensor)
 
         def inps():
+            # [FUNCTION DOC] HELPER: Make a random grad-requiring dummy and a zeros tensor.
             dummy = torch.randn((2,), requires_grad=True)
             inplace_tensor = torch.zeros((2,), requires_grad=False)
             return dummy, inplace_tensor
 
         def sc_inps():
+            # [FUNCTION DOC] HELPER: Make the same inputs as TwoTensor subclass values.
             dummy = TwoTensor(
                 torch.randn((2,), requires_grad=True),
                 torch.randn((2,), requires_grad=True),
@@ -12635,17 +14884,23 @@ class TestAOTAutogradWithDynamo(TestAOTAutograd):
 
 
 class MockFXGraphCache:
+    # [CLASS DOC] HELPER: In-memory stand-in for the inductor graph cache keyed by graph hash;
+    # stores graph modules in a mapping and serves them back as cache output objects.
     """
     In memory version of FXGraphCache so we can isolate testing for FXGraphCache
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Create an empty cache mapping.
         self.cache = {}
 
     def save(self, key, gm):
+        # [FUNCTION DOC] HELPER: Store the graph module under the key.
         self.cache[key] = gm
 
     def load(self, gm, inputs):
+        # [FUNCTION DOC] HELPER: Compute the hash key of the graph and inputs, insert the graph
+        # if missing, and return the graph retrieved by key.
         key, _ = compiled_fx_graph_hash(gm, inputs, {}, [])
         if key not in self.cache:
             self.cache[key] = gm
@@ -12663,6 +14918,9 @@ class MockFXGraphCache:
         constants,
         evaluate_guards,
     ):
+        # [FUNCTION DOC] HELPER: Look up the key and wrap the graph as a boxed function inside a
+        # mock cache output object with key, empty debug lines and zero time taken; returns that
+        # (or none if missing) and an empty dictionary. Other arguments are ignored.
         gm = self.cache.get(key)
         if gm is not None:
             gm = make_boxed_func(gm)
@@ -12685,14 +14943,22 @@ FAILING_CACHE_TESTS = (
 
 @xfail_inherited_tests(FAILING_CACHE_TESTS)
 class TestAOTAutogradWithCache(TestAOTAutogradWithDynamo):
+    # [CLASS DOC] Runs the dynamo-based AOT autograd tests with an in-memory inductor graph
+    # cache and strict autograd cache mode (bypasses or misses fail); a few tests known to fail
+    # are marked expected failures.
     """
     In memory version of FXGraphCache so we can isolate testing for FXGraphCache
     """
 
     def make_compiler(self, fw_graph_cell):
+        # [FUNCTION DOC] HELPER: Make a compiler that loads the graph through the in-memory
+        # cache, records the original graph in the cell, wraps it as a serializable compiler for
+        # cache output.
         mock_inductor_cache = self.inductor_cache
 
         def compiler(gm, example_inputs):
+            # [FUNCTION DOC] HELPER: Load the graph through the mock cache, store the graph in
+            # the cell and return the cached result.
             nonlocal mock_inductor_cache, fw_graph_cell
             result = mock_inductor_cache.load(gm, example_inputs)
             fw_graph_cell[0] = gm
@@ -12709,6 +14975,7 @@ class TestAOTAutogradWithCache(TestAOTAutogradWithDynamo):
         keep_input_mutations: bool,
         dynamic: bool,
     ):
+        # [FUNCTION DOC] HELPER: Delegate to the parent implementation with the same arguments.
         return super().run_autograd(
             f,
             fw_graph_cell,
@@ -12737,6 +15004,10 @@ class TestAOTAutogradWithCache(TestAOTAutogradWithDynamo):
         # TODO: probably consolidate all tests to make inp a Callable.
         make_inputs_subclasses: bool = False,
     ):
+        # [FUNCTION DOC] HELPER: Override of the verification harness: with the autograd cache
+        # and strict mode on and the inductor graph cache enabled, creates a fresh in-memory
+        # cache, clears the autograd cache, patches graph cache loading to use the mock, and
+        # delegates to the parent harness.
         self.inductor_cache = MockFXGraphCache()
         AOTAutogradCache.clear()
         with patch(
@@ -12754,6 +15025,9 @@ class TestAOTAutogradWithCache(TestAOTAutogradWithDynamo):
             )
 
     def test_input_mutation_false_aliasing(self):
+        # [FUNCTION DOC] Disabled: skips immediately because the test fails in strict cache mode
+        # and cannot be marked expected failure (it causes undefined behavior in address
+        # sanitizer runs).
         # This test is disabled because it fails in strict cache mode
         # But also can't be xfailed because it causes undefined behavior for
         # ASAN
