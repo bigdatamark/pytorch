@@ -1,3 +1,7 @@
+# [MODULE DOC] Runtime support for lazily compiling and autotuning Triton kernels when the C++
+# wrapper is used without compile-time autotuning. Provides start_kernel_compile (begin async
+# compile), run_triton_kernel_with_autotune (wait, autotune, return TritonKernelCompileResult),
+# and helpers. No import-time side effects beyond creating the module logger.
 """
 Lazy Triton kernel compilation for C++ wrapper.
 
@@ -31,6 +35,9 @@ log = logging.getLogger(__name__)
 
 @dataclasses.dataclass
 class TritonKernelCompileResult:
+    # [CLASS DOC] Plain data record returned after lazy autotuning of a Triton kernel: binary path,
+    # mangled name, warps, shared memory, per-subkernel block size lists (x, y, z, r0), reduction
+    # split settings, optional precomputed grid config index and scratch sizes.
     cubin_path: str
     mangled_name: str
     num_warps: int
@@ -50,6 +57,8 @@ _async_compile: Any = None
 
 
 def _get_async_compile() -> Any:
+    # [FUNCTION DOC] HELPER: Returns the module-level AsyncCompile, creating it lazily on first
+    # call (side effect: sets the global).
     """Get or create the shared AsyncCompile instance."""
     global _async_compile
     if _async_compile is None:
@@ -60,6 +69,11 @@ def _get_async_compile() -> Any:
 
 
 def _wrap_tma_args(args: list[Any], kernel_fn: CachingAutotuner) -> list[Any]:
+    # [FUNCTION DOC] HELPER: Scans the kernel's triton signature (skipping constexpr entries when
+    # counting positions) for tensordesc entries and replaces the matching tensor args with
+    # TensorDescriptor objects built using the block shape parsed from the signature string.
+    # Returns the original list if no TMA args exist, else a new list. Raises an error for the
+    # experimental nvTmaDesc type or when an arg index is out of range.
     """Wrap tensor args with TMA descriptors where the signature requires them."""
     signature = kernel_fn.triton_meta.get("signature", {})
     sig_items = list(signature.items())
@@ -104,6 +118,11 @@ def _wrap_tma_args(args: list[Any], kernel_fn: CachingAutotuner) -> list[Any]:
 def start_kernel_compile(
     pending_kernels: dict[str, Any], kernel_name: str, kernel_source: str
 ) -> None:
+    # [FUNCTION DOC] Starts background compilation of one kernel at model init. Does nothing if the
+    # name is already in the pending mapping. Otherwise evaluates the kernel source text (an
+    # async_compile call expression) with the shared AsyncCompile, and stores the resulting
+    # future or autotuner in the pending mapping under the kernel name. Does not wait.
+    # Side effects: mutates pending_kernels, may create the global AsyncCompile, evaluates code.
     """
     This function is called from C++ at model initialization time for each kernel.
     It starts the compilation in a background process but does NOT wait for it.
@@ -130,6 +149,13 @@ def run_triton_kernel_with_autotune(
     stream: Any,
     args: list[Any],
 ) -> TritonKernelCompileResult:
+    # [FUNCTION DOC] Looks up the pending kernel by name (raises an error if missing or of an
+    # unexpected type), resolves a future to a CachingAutotuner, wraps TMA args, and runs it on
+    # the given stream to trigger autotuning. Then reads cubin path, mangled name, warps and
+    # shared memory from CudaKernelParamCache (raises an error if absent), derives per-kernel
+    # block sizes, split sizes and the precomputed grid index from the winning launcher config,
+    # and returns them as a TritonKernelCompileResult. Side effects: sets store_cubin in the
+    # kernel's inductor_meta, runs the kernel, emits a debug log.
     """
     Run a Triton kernel with full autotuning using actual tensor arguments.
     """
