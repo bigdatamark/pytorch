@@ -1,5 +1,11 @@
 # Owner(s): ["module: inductor"]
 from __future__ import annotations
+# [MODULE DOC] Tests for torch._inductor.cache: the Cache, AsyncCache, InMemoryCache and
+# OnDiskCache implementations, plus serialization of callable inductor configs to JSON. TestMixin
+# discovers every concrete Cache subclass in the cache module and builds random keys and values of
+# every type allowed by the Key and Value type variables; the parametrized tests run each cache
+# type against each compatible key and value type. Some tests write temporary files under the
+# system temp dir and set process environment variables.
 
 import json
 import pickle
@@ -28,12 +34,18 @@ if TYPE_CHECKING:
 
 
 class TestMixin:
+    # [CLASS DOC] HELPER: Mixin of static discovery helpers (cache classes and key/value types)
+    # and random data generators shared by the cache test cases. Holds no state.
     @staticmethod
     def abstract_cache_types() -> set[type[icache.Cache]]:
+        # [FUNCTION DOC] HELPER: Returns the set of abstract cache base classes (Cache and
+        # AsyncCache) that must be excluded from testing.
         return {icache.Cache, icache.AsyncCache}
 
     @staticmethod
     def cache_types() -> Sequence[type[icache.Cache]]:
+        # [FUNCTION DOC] HELPER: Scans the names in the cache module and returns every class that
+        # is a Cache subclass other than the abstract bases, in name order.
         cache_types: list[type[icache.Cache]] = []
 
         for obj_name in dir(icache):
@@ -50,6 +62,8 @@ class TestMixin:
 
     @staticmethod
     def async_cache_types() -> Sequence[type[icache.AsyncCache]]:
+        # [FUNCTION DOC] HELPER: Returns the discovered cache types that are AsyncCache
+        # subclasses.
         return [
             cache_type
             for cache_type in TestMixin.cache_types()
@@ -58,6 +72,8 @@ class TestMixin:
 
     @staticmethod
     def on_disk_cache_types() -> Sequence[type[icache.OnDiskCache]]:
+        # [FUNCTION DOC] HELPER: Returns the discovered cache types that are OnDiskCache
+        # subclasses.
         return [
             cache_type
             for cache_type in TestMixin.cache_types()
@@ -66,10 +82,14 @@ class TestMixin:
 
     @staticmethod
     def key_types() -> Sequence[type[icache.Key]]:
+        # [FUNCTION DOC] HELPER: Returns the list of types allowed for cache keys (the Key
+        # constraints).
         return [*icache.Key.__constraints__]
 
     @staticmethod
     def value_types() -> Sequence[type[icache.Value]]:
+        # [FUNCTION DOC] HELPER: Returns the list of types allowed for cache values (the Value
+        # constraints).
         return [*icache.Value.__constraints__]
 
     @staticmethod
@@ -78,6 +98,10 @@ class TestMixin:
         key_type: type[icache.Key],
         value_type: type[icache.Value],
     ) -> bool:
+        # [FUNCTION DOC] HELPER: Decides whether a cache class can be used with a key type and
+        # value type. The class must have exactly one generic base (else raises AssertionError);
+        # returns False if that base fixes a key or value type other than the requested one, and
+        # True when it uses the generic Key or Value placeholder or an equal type.
         if len(cache_type.__orig_bases__) != 1:
             raise AssertionError
         generic_base = cache_type.__orig_bases__[0]
@@ -93,6 +117,8 @@ class TestMixin:
         cache: icache.Cache[icache.Key, icache.Value],
         key_fn: Callable[[], icache.Key],
     ) -> icache.Key:
+        # [FUNCTION DOC] HELPER: Repeatedly calls the key factory until it yields a key for which
+        # the cache get returns None, and returns that key.
         while cache.get(key := key_fn()) is not None:
             continue
         return key
@@ -103,6 +129,8 @@ class TestMixin:
         key_fn: Callable[[], icache.Key],
         num: int,
     ) -> list[icache.Key]:
+        # [FUNCTION DOC] HELPER: Returns a list of num distinct keys, each absent from the cache,
+        # drawn from the key factory (duplicates are retried).
         keys = []
         while len(keys) < num:
             if (key := self.key_not_in(cache, key_fn)) not in keys:
@@ -110,6 +138,9 @@ class TestMixin:
         return keys
 
     def key(self: Self, key_type: type[icache.Key]) -> icache.Key:
+        # [FUNCTION DOC] HELPER: Generates a random key of the requested type: a string with an s
+        # prefix, an integer, or a tuple of one string and one integer. Raises NotImplementedError
+        # for other types.
         if key_type is str:
             return f"s{randint(0, 2**32)}"
         elif key_type is int:
@@ -122,6 +153,8 @@ class TestMixin:
     def values_unalike(
         self: Self, value_fn: Callable[[], icache.Value], num: int
     ) -> list[icache.Value]:
+        # [FUNCTION DOC] HELPER: Returns a list of num distinct values produced by the value
+        # factory.
         values = []
         while len(values) < num:
             if (value := value_fn()) not in values:
@@ -129,6 +162,9 @@ class TestMixin:
         return values
 
     def value(self: Self, value_type: type[icache.Value]) -> icache.Value:
+        # [FUNCTION DOC] HELPER: Generates a random value of the requested type: str, int, tuple,
+        # bytes (an encoded string), dict (mixed key types with nested values), or list (a string,
+        # an int and a dict). Raises NotImplementedError for other types.
         if value_type is str:
             return f"s{randint(0, 2**32)}"
         elif value_type is int:
@@ -150,6 +186,9 @@ class TestMixin:
             raise NotImplementedError
 
     def maybe_randomize_base_dir(self: Self, cache: icache.Cache) -> None:
+        # [FUNCTION DOC] HELPER: For an on-disk cache, moves its base directory into a subfolder
+        # named by the hash of the cache object so tests do not share files; other caches are left
+        # unchanged.
         # multi on disk caches might exist at any time, and the tests
         # assume they are isolated so we should randomize their base dir
         if isinstance(cache, icache.OnDiskCache):
@@ -158,6 +197,9 @@ class TestMixin:
 
 @instantiate_parametrized_tests
 class CacheTest(TestMixin, TestCase):
+    # [CLASS DOC] Parametrized tests of the synchronous get and insert API over all cache, key and
+    # value type combinations, including multi-threaded use. Each test skips (returns early)
+    # combinations the cache type does not support.
     @parametrize("cache_type", TestMixin.cache_types())
     @parametrize("key_type", TestMixin.key_types())
     @parametrize("value_type", TestMixin.value_types())
@@ -167,6 +209,8 @@ class CacheTest(TestMixin, TestCase):
         key_type: type[icache.Key],
         value_type: type[icache.Value],
     ) -> None:
+        # [FUNCTION DOC] Checks missing keys return None, inserts of two fresh keys return True,
+        # and get then returns the inserted values.
         # Checks that a cache returns None for missing keys, and after insertion,
         # returns the correct value for each key.
         if not self.cache_type_supports_key_and_value_types(
@@ -197,6 +241,8 @@ class CacheTest(TestMixin, TestCase):
         key_type: type[icache.Key],
         value_type: type[icache.Value],
     ) -> None:
+        # [FUNCTION DOC] Checks insert of a new key returns True, a second insert of the same key
+        # returns False, and the stored value stays the first one.
         # Verifies that inserting a new key succeeds, inserting the same key again fails,
         # and the value for the key remains the first inserted value.
         if not self.cache_type_supports_key_and_value_types(
@@ -225,6 +271,8 @@ class CacheTest(TestMixin, TestCase):
         key_type: type[icache.Key],
         value_type: type[icache.Value],
     ) -> None:
+        # [FUNCTION DOC] Inserts 100 key/value pairs sequentially, then reads all keys through a
+        # thread pool map and checks every value matches. Shuts the pool down at the end.
         # Ensures that concurrent reads (get) from the cache return the correct values
         # for all inserted keys, even under parallel access.
         if not self.cache_type_supports_key_and_value_types(
@@ -258,6 +306,9 @@ class CacheTest(TestMixin, TestCase):
         key_type: type[icache.Key],
         value_type: type[icache.Value],
     ) -> None:
+        # [FUNCTION DOC] Submits 100 inserts (50 distinct keys, each listed twice) through a
+        # thread pool and checks that exactly one insert per key succeeded, the stored value is
+        # that insert's value, and every key is present. Shuts the pool down at the end.
         # Ensures that concurrent inserts work as expected: only the first insert for each key
         # succeeds, and the cache contains the correct value for each key after all inserts.
         if not self.cache_type_supports_key_and_value_types(
@@ -300,6 +351,10 @@ class CacheTest(TestMixin, TestCase):
         value_type: type[icache.Value],
         get_first: bool,
     ) -> None:
+        # [FUNCTION DOC] Submits get and insert futures for 50 keys listed twice in an order set
+        # by get_first, then checks consistency: when a get saw a value and the matching insert
+        # succeeded, the value equals the inserted one; each key is recorded as inserted at most
+        # once, every key ends up inserted, and the final stored values match.
         # Tests a mix of concurrent get and insert operations, with the order of operations
         # varied by the get_first parameter, to ensure correctness under interleaved access.
         if not self.cache_type_supports_key_and_value_types(
@@ -349,6 +404,8 @@ class CacheTest(TestMixin, TestCase):
 
 @instantiate_parametrized_tests
 class AsyncCacheTest(TestMixin, TestCase):
+    # [CLASS DOC] Parametrized tests of the asynchronous get_async and insert_async API for every
+    # AsyncCache subclass, with each compatible key and value type.
     @parametrize("async_cache_type", TestMixin.async_cache_types())
     @parametrize("key_type", TestMixin.key_types())
     @parametrize("value_type", TestMixin.value_types())
@@ -358,6 +415,8 @@ class AsyncCacheTest(TestMixin, TestCase):
         key_type: type[icache.Key],
         value_type: type[icache.Value],
     ) -> None:
+        # [FUNCTION DOC] Checks that get_async futures return None for missing keys, insert_async
+        # futures resolve to True, and later get_async futures return the inserted values.
         # Verifies that asynchronous get and insert operations work as expected:
         # get_async returns None for missing keys, insert_async inserts values,
         # and get_async returns the correct value after insertion.
@@ -399,6 +458,9 @@ class AsyncCacheTest(TestMixin, TestCase):
         key_type: type[icache.Key],
         value_type: type[icache.Value],
     ) -> None:
+        # [FUNCTION DOC] Issues two insert_async calls for one key and checks exactly one succeeds
+        # (exclusive or of the results) and that a later get_async returns the successful insert's
+        # value.
         # Ensures that only one of two concurrent insert_async calls for the same key succeeds,
         # and the cache contains the value from the successful insert.
         if not self.cache_type_supports_key_and_value_types(
@@ -437,6 +499,8 @@ class AsyncCacheTest(TestMixin, TestCase):
         key_type: type[icache.Key],
         value_type: type[icache.Value],
     ) -> None:
+        # [FUNCTION DOC] Inserts 100 pairs synchronously, then fetches all keys with get_async
+        # through a thread pool map and checks each future resolves to the inserted value.
         # Ensures that concurrent asynchronous get operations return the correct values
         # for all inserted keys.
         if not self.cache_type_supports_key_and_value_types(
@@ -470,6 +534,11 @@ class AsyncCacheTest(TestMixin, TestCase):
         key_type: type[icache.Key],
         value_type: type[icache.Value],
     ) -> None:
+        # [FUNCTION DOC] Runs 100 insert_async calls (50 distinct keys, each twice) through a
+        # thread pool map. Checks exactly one insert per key succeeded, with the matching value in
+        # the cache, and that all keys were stored. KNOWN ISSUE: the final loop uses a truthiness
+        # assertion with the value as the failure message, so it does not compare the stored value
+        # with the expected one.
         # Ensures that concurrent asynchronous insert operations only allow the first insert
         # for each key to succeed, and the cache contains the correct value for each key.
         if not self.cache_type_supports_key_and_value_types(
@@ -516,6 +585,10 @@ class AsyncCacheTest(TestMixin, TestCase):
         value_type: type[icache.Value],
         get_first: bool,
     ) -> None:
+        # [FUNCTION DOC] Mixes get_async and insert_async futures for 50 keys listed twice, in an
+        # order set by get_first, and checks the same consistency conditions as the synchronous
+        # combo test: one successful insert per key, reads agreeing with the winning value, and
+        # correct final contents.
         # Tests a mix of concurrent asynchronous get and insert operations, with the order
         # of operations varied by the get_first parameter, to ensure correctness under
         # interleaved async access.
@@ -566,6 +639,9 @@ class AsyncCacheTest(TestMixin, TestCase):
 
 @instantiate_parametrized_tests
 class OtherTest(TestMixin, TestCase):
+    # [CLASS DOC] Tests of InMemoryCache loading from an environment variable or a pickled file,
+    # and of OnDiskCache key encoding and version invalidation. Environment variables set by these
+    # tests are not removed afterwards.
     @parametrize("key_type", TestMixin.key_types())
     @parametrize("value_type", TestMixin.value_types())
     @parametrize("with_whitespace", [True, False])
@@ -577,6 +653,10 @@ class OtherTest(TestMixin, TestCase):
         with_whitespace: bool,
         with_semicolon_suffix: bool,
     ) -> None:
+        # [FUNCTION DOC] Builds an environment variable of semicolon-separated entries, each the
+        # text form of a pickled key and value separated by a comma, with optional spaces and an
+        # optional trailing semicolon. Loads it with from_env_var and checks every key maps to its
+        # value.
         # Verifies that InMemoryCache.from_env_var correctly parses environment variables
         # with various whitespace and semicolon suffixes, and loads all key-value pairs.
         keys = self.keys_not_in(icache.InMemoryCache(), lambda: self.key(key_type), 3)
@@ -602,6 +682,8 @@ class OtherTest(TestMixin, TestCase):
     def test_in_memory_cache_from_env_var_missing_comma_separator(
         self: Self, key_type: type[icache.Key], value_type: type[icache.Value]
     ) -> None:
+        # [FUNCTION DOC] Builds entries where key and value text forms are joined with no comma
+        # and checks from_env_var raises CacheError. Sets a process environment variable.
         # Ensures that InMemoryCache.from_env_var raises CacheError if the environment
         # variable is missing the required comma separator between key and value.
         keys = self.keys_not_in(icache.InMemoryCache(), lambda: self.key(key_type), 3)
@@ -624,6 +706,8 @@ class OtherTest(TestMixin, TestCase):
     def test_in_memory_cache_from_env_var_bad_encoding(
         self: Self, key_type: type[icache.Key], value_type: type[icache.Value]
     ) -> None:
+        # [FUNCTION DOC] Builds entries with extra slash characters so the key and value are not
+        # valid literals and checks from_env_var raises CacheError.
         # Ensures that InMemoryCache.from_env_var raises CacheError if the key or value
         # encoding in the environment variable is invalid (not a valid Python literal).
         keys = self.keys_not_in(icache.InMemoryCache(), lambda: self.key(key_type), 3)
@@ -646,6 +730,8 @@ class OtherTest(TestMixin, TestCase):
     def test_in_memory_cache_from_env_var_not_un_pickle_able(
         self: Self, key_type: type[icache.Key], value_type: type[icache.Value]
     ) -> None:
+        # [FUNCTION DOC] Builds entries whose pickled bytes are reversed so they cannot be
+        # unpickled and checks from_env_var raises CacheError.
         # Ensures that InMemoryCache.from_env_var raises CacheError if the key or value
         # cannot be unpickled (e.g., due to data corruption).
         keys = self.keys_not_in(icache.InMemoryCache(), lambda: self.key(key_type), 3)
@@ -668,6 +754,10 @@ class OtherTest(TestMixin, TestCase):
     def test_in_memory_cache_from_env_var_duplicated_entries(
         self: Self, key_type: type[icache.Key], value_type: type[icache.Value]
     ) -> None:
+        # [FUNCTION DOC] First loads entries where each key and value pair is listed twice
+        # identically and checks the cache is built correctly. Then reuses the same environment
+        # variable with repeated keys paired with six different values and checks from_env_var
+        # raises CacheError.
         # Verifies that duplicate key-value pairs are allowed if the value is consistent,
         # but raises CacheError if the same key appears with different values.
 
@@ -713,6 +803,9 @@ class OtherTest(TestMixin, TestCase):
     def test_in_memory_cache_from_file_path(
         self: Self, key_type: type[icache.Key], value_type: type[icache.Value]
     ) -> None:
+        # [FUNCTION DOC] Writes a pickled dictionary of fresh entries (the internal mapping of an
+        # in-memory cache) to a file in the system temp dir, loads it with from_file_path and
+        # checks all values.
         # Checks that InMemoryCache.from_file_path correctly loads a cache from a file
         # containing a pickled dictionary of key-value pairs.
         keys = self.keys_not_in(icache.InMemoryCache(), lambda: self.key(key_type), 3)
@@ -737,6 +830,8 @@ class OtherTest(TestMixin, TestCase):
     def test_in_memory_cache_from_file_path_not_un_pickle_able(
         self: Self, key_type: type[icache.Key], value_type: type[icache.Value]
     ) -> None:
+        # [FUNCTION DOC] Writes the reversed pickle bytes of an in-memory cache mapping to a file
+        # in the temp dir and checks from_file_path raises CacheError.
         # Ensures that InMemoryCache.from_file_path raises CacheError if the file contents
         # cannot be unpickled (e.g., due to corruption).
         keys = self.keys_not_in(icache.InMemoryCache(), lambda: self.key(key_type), 3)
@@ -760,6 +855,8 @@ class OtherTest(TestMixin, TestCase):
             _ = icache.InMemoryCache.from_file_path(fpath)
 
     def test_in_memory_cache_from_file_path_not_dict(self: Self) -> None:
+        # [FUNCTION DOC] Writes a pickled list (not a dictionary) to a file in the temp dir and
+        # checks from_file_path raises CacheError.
         # This test verifies that InMemoryCache.from_file_path raises a CacheError
         # when the file does not contain a pickled dictionary. It writes a pickled
         # list to a temporary file, then attempts to load it as a cache. The cache
@@ -776,6 +873,8 @@ class OtherTest(TestMixin, TestCase):
     def test_on_disk_cache_fpath_from_key_un_pickle_able(
         self: Self, on_disk_cache_type: type[icache.OnDiskCache]
     ) -> None:
+        # [FUNCTION DOC] For each on-disk cache type, passes a function object, which cannot be
+        # pickled, to the key-to-path method and checks it raises CacheError.
         # This test checks that _fpath_from_key raises a CacheError when given a
         # key that cannot be pickled. It passes a lambda function (which is not
         # pickle-able) as the key. The cache uses pickling to serialize keys for
@@ -791,6 +890,10 @@ class OtherTest(TestMixin, TestCase):
     def test_on_disk_cache_version_bump(
         self: Self, on_disk_cache_type: type[icache.OnDiskCache]
     ) -> None:
+        # [FUNCTION DOC] For each on-disk cache type, inserts a key and reads it back, then
+        # patches the class version to one higher and checks the old entry reads as missing but
+        # can be re-inserted and read. After leaving the patch, the entry written under the new
+        # version is invalid again (reads as None) and can be inserted again.
         # This test ensures that cache entries are invalidated when the cache version
         # changes, and that new entries can be inserted and retrieved after a version bump.
         # It inserts a key-value pair, then simulates a version bump by patching the cache
@@ -819,7 +922,12 @@ class OtherTest(TestMixin, TestCase):
 
 
 class ConfigSerializationTest(TestCase):
+    # [CLASS DOC] Tests that inductor config snapshots for callable-valued config options can be
+    # (or fail to be) serialized to JSON.
     def test_callable_config_not_json_serializable_1(self):
+        # [FUNCTION DOC] With a lambda set for the all-gather bucket size determinator option,
+        # checks the portable config snapshot contains that option and that dumping it to JSON
+        # raises TypeError.
         # Repro: setting callable configs to a non-None value
         # save_config_portable() return a dict that is not JSON-serializable.
         with inductor_config.patch(
@@ -833,16 +941,24 @@ class ConfigSerializationTest(TestCase):
                 json.dumps(portable)
 
     def test_callable_config_not_json_serializable_2(self):
+        # [FUNCTION DOC] Defines two InductorChoices subclasses with distinct uuid values and
+        # checks that the portable config snapshot stores None when the choices class is unset,
+        # and the uuid string for each class otherwise, so both snapshots are JSON serializable
+        # and differ from each other.
         # save_config_portable calls the factory and then .uuid(),
         # producing a JSON-serializable value for the cache key.
         from torch._inductor.choices import InductorChoices
 
         class ChoicesA(InductorChoices):
+            # [CLASS DOC] HELPER: InductorChoices subclass whose uuid is a fixed string.
             def uuid(self):
+                # [FUNCTION DOC] HELPER: Returns the fixed string choices_a.
                 return "choices_a"
 
         class ChoicesB(InductorChoices):
+            # [CLASS DOC] HELPER: InductorChoices subclass whose uuid is a different fixed string.
             def uuid(self):
+                # [FUNCTION DOC] HELPER: Returns the fixed string choices_b.
                 return "choices_b"
 
         # None default stays as None in the config hash.
@@ -872,10 +988,13 @@ class ConfigSerializationTest(TestCase):
         self.assertNotEqual(json_a, json_b)
 
     def test_callable_config_without_uuid(self):
+        # [FUNCTION DOC] Sets the choices class option to a subclass that does not define uuid and
+        # checks that taking the portable config snapshot raises RuntimeError.
         from torch._inductor.choices import InductorChoices
 
         # A subclass without uuid() raises RuntimeError.
         class PlainChoices(InductorChoices):
+            # [CLASS DOC] HELPER: InductorChoices subclass without a uuid override.
             pass
 
         with inductor_config.patch(inductor_choices_class=PlainChoices):

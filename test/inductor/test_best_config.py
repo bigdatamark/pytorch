@@ -1,4 +1,7 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] GPU-only test checking that Inductor's per-kernel .best_config files record a
+# triton_cache_hash pointing at an existing Triton cache directory. Skips the whole module (exit 0
+# when run as a script) if triton is not importable; run_tests runs only on Linux with a GPU.
 
 import glob
 import json
@@ -24,14 +27,22 @@ from torch._inductor.test_case import run_tests, TestCase
 
 
 def trivial_kernel(x):
+    # [FUNCTION DOC] HELPER: Trivial pointwise function (sine plus cosine of the input) compiled
+    # by the test.
     return torch.sin(x) + torch.cos(x)
 
 
 class TestKernelBestConfig(TestCase):
+    # [CLASS DOC] Test case for autotune best-config files on the GPU device. Class setup records
+    # the original compile_threads and max_autotune config values and cache-dir environment
+    # variables; teardown restores them (environment variables are restored to the saved string,
+    # empty if unset).
     device_type = GPU_TYPE
 
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Saves the inductor config values and cache environment variables for
+        # later restore.
         # Save the original configuration and environment variables.
         cls.original_compile_threads = config.compile_threads
         cls.original_max_autotune = config.max_autotune
@@ -41,6 +52,8 @@ class TestKernelBestConfig(TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] Restores the saved environment variables and config values, then runs
+        # base teardown.
         # Restore the original configuration and environment variables.
         os.environ["TORCHINDUCTOR_CACHE_DIR"] = cls.original_inductor_env
         os.environ["TRITON_CACHE_DIR"] = cls.original_triton_env
@@ -49,6 +62,12 @@ class TestKernelBestConfig(TestCase):
         super().tearDownClass()
 
     def test_best_config_has_triton_cache_key(self):
+        # [FUNCTION DOC] Compiles the trivial kernel with max_autotune on and no compile threads,
+        # using a temporary directory as both inductor cache dir and (in a subfolder) Triton cache
+        # dir, and runs it on a GPU tensor. Asserts that at least one best_config file was written
+        # under the temp dir, that each parsed JSON file has a triton_cache_hash key, and that a
+        # directory of that name exists in the Triton cache dir. Mutates global config and
+        # environment (restored by class teardown).
         with tempfile.TemporaryDirectory() as tmpdir:
             os.environ["TORCHINDUCTOR_CACHE_DIR"] = tmpdir
             triton_cache_dir = os.path.join(tmpdir, "triton_cache")

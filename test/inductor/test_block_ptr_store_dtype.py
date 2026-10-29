@@ -1,4 +1,8 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Unit tests for the store dtype chosen when a block pointer store targets an inplace
+# buffer: the cast follows the dtype of the original input buffer rather than the graph dtype of
+# the intermediate. The tests use a local reimplementation of the resolution logic, not the real
+# codegen method, and check the string produced by triton_store_type.
 """
 Unit test for block_ptr store dtype resolution with inplace buffers.
 
@@ -21,6 +25,9 @@ from torch._inductor.test_case import run_tests, TestCase
 
 
 class TestBlockPtrStoreDtype(TestCase):
+    # [CLASS DOC] Test case for the store dtype resolution rule with plain, inplace, removed,
+    # same-dtype and chained inplace buffers. Holds no state; dtypes come from per-test
+    # dictionaries.
     """Test dtype resolution for block_ptr stores with inplace buffers.
 
     The logic under test (from codegen_block_ptr_store_line):
@@ -35,6 +42,11 @@ class TestBlockPtrStoreDtype(TestCase):
 
     @staticmethod
     def _resolve_store_dtype(name, inplace_buffers, get_dtype):
+        # [FUNCTION DOC] HELPER: Static copy of the resolution rule. Starts with the dtype of the
+        # named buffer from the supplied lookup; if the name is in the inplace mapping and the
+        # entry is not a RemovedArg, uses the lookup on the first other_names entry of the
+        # inplaced buffer instead. Returns the dtype. KNOWN ISSUE: it duplicates the production
+        # logic instead of calling it, so the tests cannot detect drift in the real codegen.
         """Reproduce the dtype resolution logic from codegen_block_ptr_store_line."""
         from torch._inductor.codegen.common import RemovedArg
 
@@ -46,6 +58,8 @@ class TestBlockPtrStoreDtype(TestCase):
         return store_dtype
 
     def test_non_inplace_uses_graph_dtype(self):
+        # [FUNCTION DOC] No inplace entries: the result is the graph dtype float32, rendered as
+        # tl.float32.
         """Non-inplace buffer: store dtype matches graph dtype."""
         dtypes = {"buf0": torch.float32}
         result = self._resolve_store_dtype("buf0", {}, lambda n: dtypes[n])
@@ -53,6 +67,9 @@ class TestBlockPtrStoreDtype(TestCase):
         self.assertEqual(triton_store_type(result), "tl.float32")
 
     def test_inplace_buffer_uses_input_dtype(self):
+        # [FUNCTION DOC] Inplace buffer whose first aliased name is a bfloat16 input while the
+        # graph dtype is float32: the result must be bfloat16 (rendered as tl.bfloat16), the dtype
+        # of the actual tensor.
         """Inplace buffer with dtype mismatch: store dtype matches the input
         buffer's dtype (the actual tensor), not the graph output dtype.
 
@@ -71,6 +88,8 @@ class TestBlockPtrStoreDtype(TestCase):
         self.assertEqual(triton_store_type(result), "tl.bfloat16")
 
     def test_removed_inplace_falls_back_to_graph_dtype(self):
+        # [FUNCTION DOC] The inplace entry is the REMOVED marker, so the graph dtype float32 is
+        # used.
         """Removed inplace buffer: falls back to graph dtype."""
         dtypes = {"buf0": torch.float32}
         inplace_buffers = {"buf0": REMOVED}
@@ -79,6 +98,8 @@ class TestBlockPtrStoreDtype(TestCase):
         self.assertEqual(triton_store_type(result), "tl.float32")
 
     def test_same_dtype_inplace_is_unchanged(self):
+        # [FUNCTION DOC] Inplace buffer where the buffer and its input are both bfloat16: result
+        # stays bfloat16.
         """Same-dtype inplace buffer: dtype is unchanged (both bf16)."""
         dtypes = {"buf0": torch.bfloat16, "primals_1": torch.bfloat16}
         inplace_buffers = {
@@ -89,6 +110,8 @@ class TestBlockPtrStoreDtype(TestCase):
         self.assertEqual(triton_store_type(result), "tl.bfloat16")
 
     def test_chained_inplace_uses_original_input_dtype(self):
+        # [FUNCTION DOC] Inplaced buffer with a chain of three names; the first name (a bfloat16
+        # input) wins over the float16 and float32 intermediates, so the result is bfloat16.
         """Chained inplace mutations: uses the original input buffer's dtype."""
         dtypes = {
             "buf0": torch.float32,

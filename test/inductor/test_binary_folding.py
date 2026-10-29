@@ -1,4 +1,10 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests that Inductor folds a trailing binary op (add, sub, mul, div with a scalar or
+# per-channel tensor) into a preceding convolution or linear layer, and folds batch norm into conv
+# under freezing. A template test class is copied by copy_tests into CPU and GPU test classes and
+# then deleted from the module namespace. Import-time side effects: appends the test directory to
+# sys.path, imports functorch and filelock, and imports helpers from the inductor freezing and
+# torchinductor tests.
 import functools
 import importlib
 import itertools
@@ -37,8 +43,15 @@ aten = torch.ops.aten
 
 
 class BinaryFoldingTemplate(TestCase):
+    # [CLASS DOC] Device-agnostic template (not run directly; deleted at module end) whose tests
+    # use self.device. Tests count successful folds via the inductor binary_folding counter.
     @skipCUDAIf(TEST_CUDNN, "CUDNN has accuracy issues for this test")
     def test_conv_binary_folding(self):
+        # [FUNCTION DOC] Skipped when cuDNN is enabled (accuracy issues). Defines a local checker
+        # and runs it for every combination of bias, Conv1d/2d/3d, add/sub/mul/div and scalar or
+        # tensor operand (all must fold), then for Conv2d with a rank-three broadcast operand
+        # (must not fold), a one-by-one operand (must fold) and a float64 operand (must not fold,
+        # with relaxed tolerances).
         @torch.no_grad()
         def test_conv_fusion(
             use_bias,
@@ -50,10 +63,22 @@ class BinaryFoldingTemplate(TestCase):
             rtol=None,
             atol=None,
         ):
+            # [FUNCTION DOC] HELPER: Builds a module of one conv plus a binary op (scalar 2.0 or a
+            # stored parameter tensor, shaped per output channel unless add_tensor is given),
+            # compiles it, and runs a random input (seeded, rank matching the conv type) through
+            # eager and compiled versions. Asserts the outputs match within rtol/atol and that the
+            # binary_folding counter is 1 if expect_success else 0. Resets dynamo and clears
+            # counters first. Runs without gradients.
             class ConvOp(nn.Module):
+                # [CLASS DOC] HELPER: Conv module of the given type followed by the chosen binary
+                # op. Reads use_bias, module, op, scalar and add_tensor from the enclosing
+                # function.
                 __constants__ = ["use_scalar"]
 
                 def __init__(self, in_channels, out_channels, device, **kwargs):
+                    # [FUNCTION DOC] HELPER: Creates the conv on the device, the scalar flag, the
+                    # op, and a Parameter holding add_tensor, or random values shaped to broadcast
+                    # along the channel dimension.
                     super().__init__()
                     self.conv = module(
                         in_channels, out_channels, bias=use_bias, **kwargs
@@ -69,6 +94,8 @@ class BinaryFoldingTemplate(TestCase):
                     self.op = op
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Applies the conv, then the op with the scalar 2.0 or
+                    # the tensor parameter.
                     x = self.conv(x)
                     if self.use_scalar:
                         return self.op(x, 2.0)
@@ -156,10 +183,21 @@ class BinaryFoldingTemplate(TestCase):
 
     @inductor_config.patch({"freezing": True})
     def test_conv_bn_folding(self):
+        # [FUNCTION DOC] Under the freezing config, checks that batch norm after Conv1d/2d/3d
+        # (with and without bias) is folded into the conv so the compiled graph contains no add,
+        # sub, mul or div aten ops, by running the local checker for every bias and module pair
+        # with expected success.
         @torch.no_grad()
         def test_conv_fusion(use_bias, module, expect_success):
+            # [FUNCTION DOC] HELPER: Compiles a conv followed by batch norm in eval mode with
+            # compile_fx using a custom inner compiler that counts binary aten ops in the graph it
+            # receives. Asserts outputs match (atol 2e-4, rtol 1e-5) and the count is zero if
+            # expect_success else greater than one.
             class ConvOp(nn.Module):
+                # [CLASS DOC] HELPER: Module holding a conv and a batch norm built from the given
+                # module pair.
                 def __init__(self, in_channels, out_channels, device, **kwargs):
+                    # [FUNCTION DOC] HELPER: Creates the conv and batch norm on the device.
                     super().__init__()
                     self.conv = module[0](
                         in_channels, out_channels, bias=use_bias, **kwargs
@@ -167,6 +205,7 @@ class BinaryFoldingTemplate(TestCase):
                     self.bn = module[1](out_channels).to(device)
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Applies the conv then the batch norm.
                     x = self.conv(x)
                     return self.bn(x)
 
@@ -181,6 +220,9 @@ class BinaryFoldingTemplate(TestCase):
             n_binary_ops = 0
 
             def my_inner_compile(gm, example_inputs, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: Inner compile wrapper: calls compile_fx_inner, adds the
+                # number of binary aten nodes in the graph to the enclosing counter, and returns
+                # the compiled result unchanged.
                 out = compile_fx_inner(gm, example_inputs, *args, **kwargs)
                 nonlocal n_binary_ops
                 binarry_ops = [n for n in gm.graph.nodes if n.target in aten_binary]
@@ -225,14 +267,27 @@ class BinaryFoldingTemplate(TestCase):
 
     @inductor_config.patch({"enable_linear_binary_folding": True})
     def test_linear_binary_folding(self):
+        # [FUNCTION DOC] With linear binary folding enabled, runs the local checker over bias, op,
+        # scalar and several add-tensor shapes (rank one, and rank two with leading one) with 2-D
+        # input, then also rank-three shapes of ones with 3-D input, all expected to fold; operands
+        # shaped four by thirty-two or four by one must not fold.
         @torch.no_grad()
         def test_linear_fusion(
             use_bias, op, scalar, add_tensor, expect_success, input_3d=False
         ):
+            # [FUNCTION DOC] HELPER: Compiles a linear layer followed by a binary op (scalar 2.0
+            # or a tensor parameter), compares against eager on a seeded random 2-D or 3-D input
+            # (atol 5e-5, rtol 5e-6) and asserts the binary_folding counter is 1 if expect_success
+            # else 0. Resets dynamo and counters first.
             class LinearOp(nn.Module):
+                # [CLASS DOC] HELPER: Linear layer followed by the chosen binary op, configured
+                # from the enclosing function arguments.
                 __constants__ = ["use_scalar"]
 
                 def __init__(self, in_channels, out_channels, device, **kwargs):
+                    # [FUNCTION DOC] HELPER: Creates the linear layer on the device, the scalar
+                    # flag, the op, and a Parameter from add_tensor or random values of the output
+                    # feature size.
                     super().__init__()
                     self.linear = nn.Linear(
                         in_channels, out_channels, bias=use_bias, **kwargs
@@ -249,6 +304,8 @@ class BinaryFoldingTemplate(TestCase):
                     self.op = op
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Applies the linear layer, then the op with scalar 2.0
+                    # or the tensor parameter.
                     x = self.linear(x)
                     if self.use_scalar:
                         return self.op(x, 2.0)
@@ -339,19 +396,29 @@ class BinaryFoldingTemplate(TestCase):
 if HAS_CPU and not torch.backends.mps.is_available():
 
     class FreezingCpuTests(TestCase):
+    # [CLASS DOC] CPU test class created only when CPU is available and MPS is not. Receives
+    # copies of the template tests (device cpu) and has one extra test of its own.
         common = check_model
         device = "cpu"
         autocast = torch.cpu.amp.autocast
 
         @torch.no_grad()
         def test_conv_binary_folding_rejects_dynamic_bias(self):
+        # [FUNCTION DOC] Compiles a conv with a runtime bias input followed by an add of a
+        # parameter with full graph capture, checks results equal eager, and checks no binary
+        # folding happened since the bias is not a constant.
             class ConvWithDynamicBias(nn.Module):
+            # [CLASS DOC] HELPER: Module with conv weight and an add operand parameter; bias is a
+            # forward input.
                 def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates random weight and add operand parameters.
                     super().__init__()
                     self.weight = nn.Parameter(torch.randn(4, 3, 3, 3))
                     self.other = nn.Parameter(torch.randn(1, 4, 1, 1))
 
                 def forward(self, x, bias):
+                # [FUNCTION DOC] HELPER: Calls the aten convolution with the given bias and then
+                # adds the parameter.
                     x = aten.convolution.default(
                         x,
                         self.weight,
@@ -380,6 +447,8 @@ if HAS_CPU and not torch.backends.mps.is_available():
 if HAS_GPU:
 
     class FreezingGpuTests(TestCase):
+    # [CLASS DOC] GPU test class created only when a GPU is available; receives copies of the
+    # template tests.
         common = check_model_gpu
         device = GPU_TYPE
         autocast = torch.amp.autocast(device_type=GPU_TYPE)

@@ -1,4 +1,7 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests for BlockPatternMatcher in torch._inductor.codegen.block_analysis: matching
+# affine, floor-div/modular and dynamic-shape index expressions, including ones wrapped in
+# Identity. Defines module-level sympy symbols x and y used as index variables.
 
 import sympy
 
@@ -22,8 +25,13 @@ x, y = sympy.symbols("x y")
 
 @instantiate_parametrized_tests
 class BlockAnalysisTest(TestCase):
+    # [CLASS DOC] Parametrized test case for block pattern matching. Class setup builds a dummy
+    # graph stored on the class, which tests install as the current graph handler when they need
+    # V.graph.
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Runs base class setup and stores a dummy GraphLowering in the class
+        # attribute graph.
         super().setUpClass()
 
         # Create a GraphLowering, so we can access V.graph.
@@ -38,6 +46,9 @@ class BlockAnalysisTest(TestCase):
         ],
     )
     def test_affine_identity(self, stride: int, symbol: sympy.Symbol, expr: sympy.Expr):
+        # [FUNCTION DOC] Checks that match_affine_block_expr on an expression containing Identity
+        # wrappers returns the expected integer stride for the given symbol (three parametrized
+        # cases).
         # Test that we can handle an identity expression in affine indexing.
         matched_stride = BlockPatternMatcher.match_affine_block_expr(expr, symbol)
         self.assertEqual(matched_stride, stride)
@@ -67,6 +78,10 @@ class BlockAnalysisTest(TestCase):
         symbol: sympy.Symbol,
         expr: sympy.Expr,
     ):
+        # [FUNCTION DOC] Computes the element count from the product of dims, runs
+        # match_mod_div_block_expr with the dummy graph active, and checks a match was found whose
+        # dimensions and strides equal the expected ones. The block index expressions of the
+        # result are not compared here.
         # Test that we can handle an identity expression in modular indexing.
         numel = int(torch.prod(torch.Tensor(dims)))
         num_dims = len(dims)
@@ -95,10 +110,19 @@ class BlockAnalysisTest(TestCase):
         expr: sympy.Expr,
         subexpr: sympy.Expr,
     ):
+        # [FUNCTION DOC] Checks that get_subexpr_involving_symbol returns just the additive part
+        # of the expression that involves the symbol, with Identity wrappers stripped (three
+        # parametrized cases).
         matched_subexpr = BlockPatternMatcher.get_subexpr_involving_symbol(expr, symbol)
         self.assertEqual(matched_subexpr, subexpr)
 
     def test_index_with_dynamic_shapes(self):
+        # [FUNCTION DOC] Builds an index from symbolic strides (using symbolic sizes) and a floor-
+        # div plus modular pair of block index expressions, matches it with the dummy graph
+        # active, and compares dims, strides and index expressions with the match result via
+        # statically_known_equals after removing precomputed replacements. Raises AssertionError
+        # if the compared items are not lists or tuples or not sympy expressions. KNOWN ISSUE: if
+        # no match is found the zip over None raises a TypeError.
         s0 = sympy.var("s0", integer=True)
         s1 = sympy.var("s1", integer=True)
 
