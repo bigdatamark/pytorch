@@ -1,5 +1,15 @@
 # mypy: allow-untyped-defs
 
+# [MODULE DOC] Test suite and helpers for combining DistributedDataParallel with distributed
+# autograd over RPC. A hybrid model with remote embedding and remote linear parts (living on one
+# remote worker) plus local linear layers is trained by several trainer workers coordinated by a
+# master, in modes with no DDP, DDP around the whole model, or DDP around one inner layer,
+# optionally with uneven inputs. Also compares distributed-autograd gradients against local
+# autograd gradients, including CUDA and RemoteModule variants. Import-time side effects: creates
+# a module logger with a console handler (debug level if the debug environment variable is set)
+# and a module-level threading condition used as a shutdown signal. Constants define world layout:
+# four trainers, one remote worker, one master.
+
 import contextlib
 import enum
 import logging
@@ -40,6 +50,8 @@ MASTER_RANK = REMOTE_WORKER_RANK + 1
 
 
 class DdpMode(enum.Enum):
+    # [CLASS DOC] Enumeration of how DDP is applied to the hybrid model: NONE (no DDP), OUTSIDE
+    # (wrap the whole top-level module), INSIDE (wrap only an inner layer).
     # Don't apply DDP
     NONE = enum.auto()
     # Apply DDP to the top level nn.Module
@@ -49,6 +61,10 @@ class DdpMode(enum.Enum):
 
 
 def init_logger():
+    # [FUNCTION DOC] HELPER: Builds the module logger with a console handler and a formatter
+    # including time, file, line, level, process and thread. Level is debug if the debug
+    # environment variable is present, else info. Disables propagation to parent loggers. Returns
+    # the logger.
     logger = logging.getLogger(__name__)
     level = logging.DEBUG if "debug" in os.environ else logging.INFO
     logger.setLevel(level)
@@ -68,6 +84,8 @@ gLogger = init_logger()
 
 
 class FeatureSet(NamedTuple):
+    # [CLASS DOC] Named tuple holding one batch: dense features, sparse (long index) features and
+    # per-example values (the sign weights used to form the loss).
     """A feature set has 2 types of features"""
 
     dense_features: torch.Tensor
@@ -76,21 +94,32 @@ class FeatureSet(NamedTuple):
 
 
 def _call_method(method, rref, *args, **kwargs):
+    # [FUNCTION DOC] HELPER: RPC target that applies the given method to the local value of an
+    # RRef (which must be owned by the current worker) with extra arguments, and returns the
+    # result.
     return method(rref.local_value(), *args, **kwargs)
 
 
 def _remote_method(method, rref, *args, **kwargs):
+    # [FUNCTION DOC] HELPER: Synchronously runs a method on the worker owning the RRef through a
+    # blocking RPC and returns its result.
     args_tup = tuple([method, rref] + list(args))
     return rpc.rpc_sync(rref.owner(), _call_method, args=args_tup, kwargs=kwargs)
 
 
 def _remote_method_async(method, rref, *args, **kwargs):
+    # [FUNCTION DOC] HELPER: Same as _remote_method but asynchronous: returns a future for the RPC
+    # result.
     args_tup = tuple([method, rref] + list(args))
     return rpc.rpc_async(rref.owner(), _call_method, args=args_tup, kwargs=kwargs)
 
 
 class RemoteEM(nn.Module):
+    # [CLASS DOC] Remote-side embedding model: wraps an EmbeddingBag initialized to constant 0.5
+    # weights. Constructed on the remote worker via an RRef.
     def __init__(self, num_embeddings: int, embedding_dim: int):
+        # [FUNCTION DOC] Logs and creates the embedding bag with the given number of embeddings
+        # and dimension, all weights 0.5.
         gLogger.info("Initing RemoteEM with %s %s", num_embeddings, embedding_dim)
         super().__init__()
         init_em = [0.5] * embedding_dim
@@ -101,12 +130,17 @@ class RemoteEM(nn.Module):
         )
 
     def forward(self, input: torch.Tensor):
+        # [FUNCTION DOC] Runs the embedding bag over the input with offsets that make each element
+        # its own bag, so the output has one row per input element. Returns the embedding tensor.
         gLogger.debug("Running RemoteEM.forward() on: %s", input)
         return self.em(input, offsets=torch.LongTensor(range(input.shape[0])))
 
 
 # Return a linear module with predefined parameters.
 def getLinear(d_in, d_out):
+    # [FUNCTION DOC] HELPER: Creates a bias-free linear layer whose weight is all ones except the
+    # first entry which is minus one, with grad enabled, giving deterministic parameters. Returns
+    # the layer.
     l = nn.Linear(d_in, d_out, bias=False)
     w = torch.ones((d_out, d_in))
     w[0][0] = -1
@@ -116,24 +150,35 @@ def getLinear(d_in, d_out):
 
 
 class RemoteNet(nn.Module):
+    # [CLASS DOC] Remote-side network: a deterministic linear layer followed by a ReLU.
+    # Constructed on the remote worker via an RRef.
     def __init__(self, d_in: int, d_out: int):
+        # [FUNCTION DOC] Logs and builds the linear layer (d_in to d_out) and the ReLU.
         gLogger.info("Initing RemoteNet with %s %s", d_in, d_out)
         super().__init__()
         self.fc = getLinear(d_in, d_out)
         self.relu = nn.ReLU()
 
     def forward(self, input: torch.Tensor):
+        # [FUNCTION DOC] Applies the linear layer and ReLU to the input and returns the result.
         gLogger.debug("Running RemoteNet.forward() on: %s", input)
         return self.relu(self.fc(input))
 
 
 class HybridModel(nn.Module):
+    # [CLASS DOC] Local model combining local linear layers with remote modules reached through
+    # RRefs. Attributes: the two RRefs, fc1 (dense features), fc2 (final layer, optionally wrapped
+    # in DDP), and tuples non_ddp_params and ddp_params listing parameters that are or are not
+    # synchronized by DDP.
     def __init__(
         self,
         remote_em_rref: rpc.RRef,
         remote_net_rref: rpc.RRef,
         process_group_for_ddp: dist.ProcessGroup = None,
     ):
+        # [FUNCTION DOC] Stores the RRefs and creates fc1 and fc2. By default all parameters are
+        # non-DDP. If a process group is given, fc2 is wrapped in DDP with it and its parameters
+        # move to the DDP parameter tuple. Logs the number of parameter groups.
         super().__init__()
         self.remote_em_rref = remote_em_rref
         self.remote_net_rref = remote_net_rref
@@ -160,6 +205,10 @@ class HybridModel(nn.Module):
         )
 
     def forward(self, input: FeatureSet):
+        # [FUNCTION DOC] Forward pass: remotely runs the embedding on the sparse features, checks
+        # the batch size matches the dense features (raises AssertionError if not), applies fc1 to
+        # the dense features, concatenates dense and sparse outputs, runs the remote network on
+        # that, then applies fc2. Returns the result.
         gLogger.debug("Running HybridModel.forward on %s", input)
         sparse = _remote_method(
             RemoteEM.forward, self.remote_em_rref, input.sparse_features
@@ -178,6 +227,10 @@ class HybridModel(nn.Module):
 
 
 class Trainer:
+    # [CLASS DOC] Per-trainer object created remotely on each trainer worker. Holds the rank, the
+    # DDP process group over trainer ranks (only when DDP is used), the HybridModel (wrapped in
+    # DDP in OUTSIDE mode), and the tuples of DDP and non-DDP parameters whose gradients are
+    # reported.
     def __init__(
         self,
         remote_em_rref: rpc.RRef,
@@ -185,6 +238,10 @@ class Trainer:
         ddp_mode: DdpMode,
         rank: int,
     ):
+        # [FUNCTION DOC] Creates the trainer process group when DDP is used (a collective call),
+        # builds the hybrid model (passing the group for INSIDE mode), and records the parameter
+        # tuples. In OUTSIDE mode all parameters count as DDP parameters and the whole module is
+        # wrapped in DDP. Logs the counts.
         self.rank = rank
         self.trainer_group = (
             dist.new_group(TRAINER_RANKS)
@@ -219,6 +276,8 @@ class Trainer:
         )
 
     def destroy_pg(self):
+        # [FUNCTION DOC] Destroys the trainer process group if one exists. Side effect on global
+        # distributed state.
         if self.trainer_group:
             dist.destroy_process_group(self.trainer_group)
 
@@ -228,6 +287,15 @@ class Trainer:
         trainer_has_less_inputs: bool,
         simulate_uneven_inputs: bool,
     ):
+        # [FUNCTION DOC] Runs distributed forward and backward for a batch. If simulating uneven
+        # inputs, splits the batch into microbatches of two and, for trainers flagged with less
+        # inputs, keeps only the first half. Runs each batch inside a distributed autograd context
+        # (under the DDP join context manager when uneven), computes a loss, runs distributed
+        # backward and fetches gradients. Returns a pair of tuples: gradients of DDP parameters
+        # and of non-DDP parameters from the last context.
+        # KNOWN ISSUE: the loss multiplies by the values of the whole mini batch rather than the
+        # current microbatch, relying on broadcasting; with microbatches it mixes shapes and does
+        # not use microbatch values.
         grads_dict = None
 
         if not simulate_uneven_inputs:
@@ -284,6 +352,10 @@ class Trainer:
 
 
 def get_training_examples():
+    # [FUNCTION DOC] Builds sixteen training examples where each example has a partner with
+    # identical features and opposite value, so gradients cancel under averaging, then splits them
+    # evenly among the trainers. Raises AssertionError if the count is not divisible by the
+    # trainer count. Returns a list of per-trainer feature sets.
     n = 16
     training_examples = FeatureSet(
         dense_features=torch.zeros((n, D_DENSE)),
@@ -326,25 +398,37 @@ shutdown_signal = threading.Condition()
 
 
 def set_shutdown_signal():
+    # [FUNCTION DOC] Notifies one waiter on the module shutdown condition; invoked via RPC to let
+    # workers exit.
     global shutdown_signal
     with shutdown_signal:
         shutdown_signal.notify()
 
 
 class DdpUnderDistAutogradTest(RpcAgentTestFixture):
+    # [CLASS DOC] Distributed test case with a master, a remote worker and trainers. The master
+    # creates remote modules and trainers, runs several training rounds over RPC and checks
+    # gradients, then sends shutdown signals; other ranks wait for the signal. Test methods cover
+    # no DDP, DDP outside, DDP outside with uneven inputs, and DDP inside.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] Returns the total number of processes (trainers, remote worker and
+        # master).
         return WORLD_SIZE
 
     def remote_worker_name(self) -> str:
+        # [FUNCTION DOC] Returns the RPC worker name of the remote worker.
         # The name has to be consistent with that in 'dist_init' decorator.
         return f"worker{REMOTE_WORKER_RANK}"
 
     def trainer_name(self, rank):
+        # [FUNCTION DOC] Returns the RPC worker name for the given trainer rank.
         # The name has to be consistent with that in 'dist_init' decorator.
         return f"worker{rank}"
 
     def _init_process_group(self):
+        # [FUNCTION DOC] HELPER: Initializes the default gloo process group from the file-based
+        # init method and this test's rank and world size, then waits on a barrier.
         dist.init_process_group(
             backend="gloo",
             init_method=INIT_METHOD_TEMPLATE.format(file_name=self.file_name),
@@ -354,6 +438,9 @@ class DdpUnderDistAutogradTest(RpcAgentTestFixture):
         dist.barrier()
 
     def _remote_worker_process(self, ddp_mode):
+        # [FUNCTION DOC] HELPER: Entry point for the remote worker rank: initializes the process
+        # group, joins the trainer group creation when DDP is used (the call must happen on every
+        # rank), blocks until the shutdown signal, then destroys the default group.
         gLogger.info("The remote worker is running.")
         self._init_process_group()
 
@@ -368,6 +455,9 @@ class DdpUnderDistAutogradTest(RpcAgentTestFixture):
         dist.destroy_process_group()
 
     def _trainer_process(self, rank: int):
+        # [FUNCTION DOC] HELPER: Entry point for a trainer rank: initializes the process group,
+        # blocks until the shutdown signal arrives, then destroys the default group. The trainer's
+        # work happens through RPC calls from the master.
         gLogger.info("Running the trainer #%s...", rank)
         gLogger.info(
             "Initing trainer process group by trainer #%s with ranks %s",
@@ -385,6 +475,9 @@ class DdpUnderDistAutogradTest(RpcAgentTestFixture):
         dist.destroy_process_group()
 
     def _master_process(self, ddp_mode: DdpMode, simulate_uneven_inputs: bool):
+        # [FUNCTION DOC] HELPER: Entry point for the master rank: initializes the process group,
+        # creates remote RRefs for the embedding and network on the remote worker, and runs the
+        # test body.
         gLogger.info("Running the master process...")
         self._init_process_group()
 
@@ -406,6 +499,12 @@ class DdpUnderDistAutogradTest(RpcAgentTestFixture):
         remote_em_rref: rpc.RRef,
         remote_net_rref: rpc.RRef,
     ):
+        # [FUNCTION DOC] Test body on the master. Creates a Trainer on every trainer worker, joins
+        # group creation if DDP is used, then for three rounds asynchronously trains one batch per
+        # trainer (half the trainers get fewer inputs when simulating uneven inputs) and checks
+        # gradients: DDP parameter gradients must be zero unless inputs are uneven, and non-DDP
+        # gradients must be non-zero. Finally destroys trainer groups and sends shutdown signals
+        # to trainers and the remote worker. Failed checks raise assertion errors.
         if simulate_uneven_inputs:
             gLogger.info(
                 "Running DDP + RPC test with simulating uneven inputs across trainers."
@@ -477,6 +576,8 @@ class DdpUnderDistAutogradTest(RpcAgentTestFixture):
         rpc.rpc_sync(self.remote_worker_name(), set_shutdown_signal, args=())
 
     def _do_test(self, ddp_mode, simulate_uneven_inputs=False):
+        # [FUNCTION DOC] HELPER: Dispatches by rank to the master, remote worker or trainer
+        # routine; raises RuntimeError for an unknown rank.
         if self.rank == MASTER_RANK:
             self._master_process(ddp_mode, simulate_uneven_inputs)
         elif self.rank == REMOTE_WORKER_RANK:
@@ -489,41 +590,59 @@ class DdpUnderDistAutogradTest(RpcAgentTestFixture):
     @requires_gloo()
     @dist_init
     def test_backward_no_ddp(self):
+        # [FUNCTION DOC] Test: distributed autograd with no DDP.
         self._do_test(DdpMode.NONE)
 
     @requires_gloo()
     @dist_init
     def test_backward_ddp_outside(self):
+        # [FUNCTION DOC] Test: distributed autograd with DDP wrapping the whole hybrid model.
         self._do_test(DdpMode.OUTSIDE)
 
     @requires_gloo()
     @dist_init
     def test_backward_ddp_outside_uneven_inputs(self):
+        # [FUNCTION DOC] Test: DDP wrapping the whole model with trainers given uneven numbers of
+        # inputs.
         self._do_test(DdpMode.OUTSIDE, simulate_uneven_inputs=True)
 
     @requires_gloo()
     @dist_init
     def test_backward_ddp_inside(self):
+        # [FUNCTION DOC] Test: distributed autograd with DDP wrapped around an inner layer.
         self._do_test(DdpMode.INSIDE)
 
 
 # Common utils for both CPU and CUDA test suites
 class CommonDdpComparisonTest(RpcAgentTestFixture):
+    # [CLASS DOC] Base class for DDP versus local autograd comparison tests; world size is the
+    # number of trainers.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] Returns the number of trainers as the world size.
         return NUM_TRAINERS
 
     def trainer_name(self, rank):
+        # [FUNCTION DOC] Returns the RPC worker name for the given rank.
         # The name has to be consistent with that in 'dist_init' decorator.
         return f"worker{rank}"
 
     @staticmethod
     def get_remote_grads(rref, context_id):
+        # [FUNCTION DOC] HELPER: Static RPC target: returns the gradient of the weight of the
+        # RRef's local module from the given distributed autograd context.
         return dist_autograd.get_gradients(context_id)[rref.local_value().weight]
 
 
 class DdpComparisonTest(CommonDdpComparisonTest):
+    # [CLASS DOC] CPU tests comparing gradients from distributed autograd with DDP against
+    # gradients from local autograd.
     def _run_test_ddp_comparision(self, simulate_uneven_inputs=False):
+        # [FUNCTION DOC] HELPER: Seeds by rank, initializes a gloo group on a separate file, wraps
+        # a small linear layer in DDP and, per input (even ranks get extra inputs when simulating
+        # uneven inputs, run under the DDP join context), computes gradients with distributed
+        # autograd and with local autograd and asserts they are equal for every parameter.
+        # Destroys the process group at the end.
         gLogger.info("Running trainer rank: %s", self.rank)
         # Each trainer uses a different random seed. Otherwise, they are going
         # to have exactly the same initial model parameters, input, and
@@ -584,17 +703,22 @@ class DdpComparisonTest(CommonDdpComparisonTest):
     @requires_gloo()
     @dist_init
     def test_ddp_comparison(self):
+        # [FUNCTION DOC] Test: DDP gradient comparison with even inputs.
         self._run_test_ddp_comparision()
 
     @requires_gloo()
     @dist_init
     def test_ddp_comparison_uneven_inputs(self):
+        # [FUNCTION DOC] Test: DDP gradient comparison with uneven inputs.
         # test with simulating uneven inputs in DDP
         self._run_test_ddp_comparision(simulate_uneven_inputs=True)
 
     @requires_gloo()
     @dist_init
     def test_ddp_dist_autograd_sparse_grads(self):
+        # [FUNCTION DOC] Test: with a sparse-gradient embedding bag under DDP, distributed
+        # autograd yields exactly one gradient entry equal to the local gradient. Initializes a
+        # process group (not destroyed here).
         # Each trainer uses a different random seed. Otherwise, they are going
         # to have exactly the same initial model parameters, input, and
         # therefore grads. That means the grads will be the same before and
@@ -628,6 +752,10 @@ class DdpComparisonTest(CommonDdpComparisonTest):
     @requires_gloo()
     @dist_init
     def test_ddp_dist_autograd_local_vs_remote(self):
+        # [FUNCTION DOC] Test: for remote device strings with and without an explicit cpu device,
+        # compares a remote linear module plus DDP local layer under distributed autograd against
+        # equivalent all-local autograd, checking local and remote gradients. Initializes a
+        # process group (not destroyed here).
         # Each trainer uses a different random seed. Otherwise, they are going
         # to have exactly the same initial model parameters, input, and
         # therefore grads. That means the grads will be the same before and
@@ -675,11 +803,17 @@ class DdpComparisonTest(CommonDdpComparisonTest):
 
 
 class CudaDdpComparisonTest(CommonDdpComparisonTest):
+    # [CLASS DOC] CUDA test comparing distributed autograd with RemoteModule and DDP layers
+    # against local autograd.
     @skip_if_lt_x_gpu(NUM_TRAINERS)
     @requires_nccl()
     @dist_init
     @skip_if_rocm_multiprocess
     def test_ddp_dist_autograd_local_vs_remote_gpu(self):
+        # [FUNCTION DOC] Test: chains remote CPU linear layers with DDP layers on this rank's GPU,
+        # runs local and distributed autograd, and checks gradients of all four layers match
+        # (remote ones fetched via RPC). Requires enough GPUs, NCCL and a non-ROCm platform.
+        # Process group uses gloo.
         # Each trainer uses a different random seed. Otherwise, they are going
         # to have exactly the same initial model parameters, input, and
         # therefore grads. That means the grads will be the same before and

@@ -2,6 +2,15 @@
 
 # Copyright (c) Meta Platforms, Inc. and affiliates
 
+# [MODULE DOC] Shared test infrastructure for DTensor and distributed tests: device and world-size
+# constants chosen from the available accelerators, small test models (MLP, a toy Transformer with
+# optional mixture-of-experts and tensor/expert parallel plans), test base classes for multi-
+# process, multi-thread, continuous and local-tensor (fake process group) modes, the with_comms
+# decorator, a converter that enumerates DTensor placements for an op's arguments, shard-order
+# redistribution wrappers, sharding-rule validators and an op-strategy context manager. Import-
+# time side effects: probes accelerators and sets the module constants DEVICE_TYPE, DEVICE_COUNT,
+# PG_BACKEND and NUM_DEVICES (at most four, fewer on ROCm or when few devices exist).
+
 import contextlib
 import copy
 import functools
@@ -96,21 +105,32 @@ T = TypeVar("T")
 
 # simple RMSNorm layer for testing
 class RMSNormPython(torch.nn.Module):
+    # [CLASS DOC] Simple RMS normalization layer: scales the input by the inverse root-mean-square
+    # over the last dimension and multiplies by a learned per-dimension weight (initialized to
+    # ones). Attributes: eps and weight.
     def __init__(self, dim: int, eps: float = 1e-6):
+        # [FUNCTION DOC] Stores eps and creates a ones-initialized weight parameter of size dim.
         super().__init__()
         self.eps = eps
         self.weight = torch.nn.Parameter(torch.ones(dim))
 
     def _norm(self, x):
+        # [FUNCTION DOC] HELPER: Returns the input divided by the root mean square of its last
+        # dimension plus eps.
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
+        # [FUNCTION DOC] Normalizes the input and multiplies by the weight; returns the result.
         output = self._norm(x)
         return output * self.weight
 
 
 class MLPModule(nn.Module):
+    # [CLASS DOC] Two-layer perceptron test model: linear 10 to 16, ReLU, linear 16 to 10, created
+    # on the given device with optional bias.
     def __init__(self, device, bias: bool = True):
+        # [FUNCTION DOC] Seeds the global random generator with 5 (side effect) so initialization
+        # is deterministic, then builds the two linear layers and the ReLU on the device.
         super().__init__()
         torch.manual_seed(5)
         self.net1 = nn.Linear(10, 16, bias=bias, device=device)
@@ -118,19 +138,25 @@ class MLPModule(nn.Module):
         self.net2 = nn.Linear(16, 10, bias=bias, device=device)
 
     def forward(self, x):
+        # [FUNCTION DOC] Applies the first linear layer, the ReLU and the second linear layer;
+        # returns the output.
         return self.net2(self.relu(self.net1(x)))
 
     def reset_parameters(self):
+        # [FUNCTION DOC] Re-initializes the parameters of both linear layers.
         self.net1.reset_parameters()
         self.net2.reset_parameters()
 
 
 class MLPStacked(nn.Module):
+    # [CLASS DOC] Stack of MLPModule layers held in a module list, applied in sequence.
     def __init__(self, device, n_layers: int = 2):
+        # [FUNCTION DOC] Creates n_layers MLPModule instances on the given device.
         super().__init__()
         self.layers = nn.ModuleList([MLPModule(device) for i in range(n_layers)])
 
     def forward(self, x):
+        # [FUNCTION DOC] Feeds the input through every layer in order and returns the result.
         for layer in self.layers:
             x = layer(x)
         return x
@@ -138,6 +164,10 @@ class MLPStacked(nn.Module):
 
 @dataclass
 class ModelArgs:
+    # [CLASS DOC] Dataclass of hyperparameters for the toy Transformer: layer count, vocabulary
+    # size, maximum sequence length, model dimension, head count, dropout probability, attention
+    # flag, weight tying, activation checkpointing and number of experts (zero means a dense feed-
+    # forward).
     n_layers: int = 2
     vocab_size: int = 8
     max_seq_len: int = 16
@@ -152,6 +182,9 @@ class ModelArgs:
 
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
+        # [FUNCTION DOC] Builds the four bias-free projections and dropout from the model args and
+        # stores head count, head dimension and flags. Raises AssertionError if the dimension is
+        # not divisible by the head count.
         super().__init__()
         if args.dim % args.n_heads != 0:
             raise AssertionError(
@@ -169,6 +202,12 @@ class Attention(nn.Module):
         self.wo = nn.Linear(args.dim, args.dim, bias=False)
 
     def forward(self, x):
+        # [FUNCTION DOC] Multi-head self-attention over a batch of sequences shaped batch,
+        # sequence, dim: projects to queries, keys and values, splits heads, runs scaled dot
+        # product attention (dropout only in training), merges heads, applies the output
+        # projection and residual dropout. Returns a tensor of the input shape.
+        # KNOWN ISSUE: the use_attn_mask flag is passed in the position of the causal flag of the
+        # attention call, so it enables causal masking rather than supplying a mask.
         bsz, seq_len, _ = x.size()
         queries, keys, values = self.wq(x), self.wk(x), self.wv(x)
         queries = queries.view(bsz, seq_len, self.n_heads, self.head_dim)
@@ -193,6 +232,8 @@ class Attention(nn.Module):
 
 class FeedForward(nn.Module):
     def __init__(self, dim, hidden_dim, dropout_p):
+        # [FUNCTION DOC] Builds a two-layer feed-forward block (linear, GELU, linear) with output
+        # dropout.
         super().__init__()
         self.w1 = nn.Linear(dim, hidden_dim)
         self.gelu = nn.GELU()
@@ -200,11 +241,16 @@ class FeedForward(nn.Module):
         self.resid_dropout = nn.Dropout(dropout_p)
 
     def forward(self, x):
+        # [FUNCTION DOC] Applies the first linear, GELU, second linear and dropout; returns the
+        # result.
         return self.resid_dropout(self.w2(self.gelu(self.w1(x))))
 
 
 class Experts(nn.Module):
     def __init__(self, dim: int, hidden_dim: int, num_experts: int):
+        # [FUNCTION DOC] Creates expert weight parameters of shape (num_experts, hidden_dim, dim)
+        # and (num_experts, dim, hidden_dim), initializes them with a normal distribution, and
+        # creates a GELU.
         super().__init__()
         self.num_experts = num_experts
         self.w1 = nn.Parameter(torch.empty(num_experts, hidden_dim, dim))
@@ -213,10 +259,15 @@ class Experts(nn.Module):
         self.gelu = nn.GELU()
 
     def reset_parameters(self):
+        # [FUNCTION DOC] Re-initializes both expert weights with a normal distribution of standard
+        # deviation 0.02.
         nn.init.normal_(self.w1, std=0.02)
         nn.init.normal_(self.w2, std=0.02)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] Runs every expert on all input tokens with batched matrix multiplies and
+        # sums the expert outputs. Uses the local shards if the weights are DTensors (the input is
+        # a plain tensor). Returns a tensor of tokens by dim.
         # Weights are DTensors (sharded by EP/TP) but x is a plain tensor
         # (dispatched by EP hooks), so extract local shards for bmm.
         if isinstance(self.w1, DTensor):
@@ -232,11 +283,14 @@ class Experts(nn.Module):
 
 class ExpertLayer(nn.Module):
     def __init__(self, num_experts: int, dim: int, hidden_dim: int):
+        # [FUNCTION DOC] Stores the expert count and creates the Experts module.
         super().__init__()
         self.num_experts = num_experts
         self.experts = Experts(dim=dim, hidden_dim=hidden_dim, num_experts=num_experts)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] Flattens batch and sequence, runs the experts, divides by the number of
+        # experts and restores the original shape; returns the result.
         bs, slen, dim = x.shape
         x_flat = x.view(-1, dim)
         expert_out = self.experts(x_flat)
@@ -245,6 +299,10 @@ class ExpertLayer(nn.Module):
 
 
 class TensorParallelForExpert(ParallelStyle):
+    # [CLASS DOC] Parallel style for tensor parallelism of an Experts module: shards the first
+    # weight along dim 1 and the second along dim 2. Optional input layouts (for sequence
+    # parallel) cause tokens to be gathered before compute; outputs are partial sums redistributed
+    # to the output layouts (default replicated).
     """TP for Experts: shard w1 colwise (Shard(1)), w2 rowwise (Shard(2)).
 
     For seq parallel, set input_layouts=Shard(0) and output_layouts=Shard(0)
@@ -252,11 +310,16 @@ class TensorParallelForExpert(ParallelStyle):
     """
 
     def __init__(self, *, input_layouts=None, output_layouts=None):
+        # [FUNCTION DOC] Stores the optional input layouts and the output layouts (replicated if
+        # not given).
         super().__init__()
         self.input_layouts = input_layouts
         self.output_layouts = output_layouts or Replicate()
 
     def _partition_fn(self, name, mod, device_mesh):
+        # [FUNCTION DOC] HELPER: Partition function: replaces the w1 and w2 parameters with
+        # DTensor parameters sharded on dim 1 and dim 2 respectively; other parameters are left
+        # alone.
         for pn, p in mod.named_parameters(recurse=False):
             if pn == "w1":
                 placement = [Shard(1)]
@@ -269,6 +332,9 @@ class TensorParallelForExpert(ParallelStyle):
             )
 
     def _input_fn(self, mod, inputs, device_mesh):
+        # [FUNCTION DOC] HELPER: Input hook: if input layouts were given, converts the first input
+        # into a DTensor with those layouts and redistributes it to replicated, returning its
+        # local tensor in a tuple; otherwise passes inputs through unchanged.
         if self.input_layouts is not None:
             x = inputs[0]
             x = (
@@ -280,6 +346,8 @@ class TensorParallelForExpert(ParallelStyle):
         return inputs
 
     def _output_fn(self, mod, outputs, device_mesh):
+        # [FUNCTION DOC] HELPER: Output hook: treats the local output as a partial sum over the
+        # mesh, redistributes it to the output layouts and returns the local tensor.
         return (
             DTensor.from_local(outputs, device_mesh, [Partial()])
             .redistribute(device_mesh, [self.output_layouts])
@@ -287,6 +355,8 @@ class TensorParallelForExpert(ParallelStyle):
         )
 
     def _apply(self, module, device_mesh):
+        # [FUNCTION DOC] HELPER: Applies the style to a module by distributing it with the
+        # partition, input and output hooks. Returns the module.
         return distribute_module(
             module,
             device_mesh,
@@ -297,6 +367,9 @@ class TensorParallelForExpert(ParallelStyle):
 
 
 class ExpertParallel(ParallelStyle):
+    # [CLASS DOC] Parallel style for expert parallelism: shards all expert parameters on dim 0
+    # (the expert dimension), all-gathers tokens before compute and reduce-scatters (sum) outputs
+    # afterwards.
     """Distributes experts across ranks with Shard(0) on the expert dimension.
 
     Dispatch: all-gather tokens so every rank sees all tokens.
@@ -304,6 +377,8 @@ class ExpertParallel(ParallelStyle):
     """
 
     def _partition_fn(self, name: str, mod: nn.Module, device_mesh: DeviceMesh) -> None:
+        # [FUNCTION DOC] HELPER: Partition function: replaces each direct parameter with a DTensor
+        # parameter sharded on dim 0.
         for param_name, param in mod.named_parameters(recurse=False):
             dist_param = nn.Parameter(distribute_tensor(param, device_mesh, [Shard(0)]))
             mod.register_parameter(param_name, dist_param)
@@ -311,6 +386,9 @@ class ExpertParallel(ParallelStyle):
     def _token_dispatch(
         self, mod: nn.Module, inputs: tuple, device_mesh: DeviceMesh
     ) -> tuple[torch.Tensor]:
+        # [FUNCTION DOC] HELPER: Input hook: all-gathers the single input tensor along dim 0
+        # across the mesh group with autograd support and waits for completion. Returns it in a
+        # tuple.
         (x,) = inputs
         x_gathered = all_gather_single_autograd(
             x,
@@ -323,6 +401,8 @@ class ExpertParallel(ParallelStyle):
     def _token_combine(
         self, mod: nn.Module, output: torch.Tensor, device_mesh: DeviceMesh
     ) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Output hook: reduce-scatters the output with sum along dim 0 over
+        # the mesh group (autograd-aware), waits for completion and returns the local result.
         result = reduce_scatter_single_autograd(
             output,
             "sum",
@@ -333,6 +413,8 @@ class ExpertParallel(ParallelStyle):
         return result
 
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
+        # [FUNCTION DOC] HELPER: Applies the style by distributing the module with the partition,
+        # dispatch and combine hooks; returns the module.
         return distribute_module(
             module,
             device_mesh,
@@ -343,6 +425,10 @@ class ExpertParallel(ParallelStyle):
 
 
 class ExpertParallelWithTP(ParallelStyle):
+    # [CLASS DOC] Combined expert and tensor parallel style applied to an ExpertLayer. Expert
+    # weights are sharded on a concatenated 2D (ep, tp) mesh. Forward order: expert-parallel
+    # dispatch, tensor-parallel input handling, compute, tensor-parallel reduction, expert-
+    # parallel combine. Attributes: ep_mesh, tp_mesh, ep_tp_mesh.
     """Combined EP + TP for experts.
 
     Applied to ExpertLayer. Distributes expert params on a 2D (ep, tp) mesh
@@ -356,12 +442,17 @@ class ExpertParallelWithTP(ParallelStyle):
         ep_mesh: DeviceMesh,
         tp_mesh: DeviceMesh,
     ):
+        # [FUNCTION DOC] Stores both meshes and builds the concatenated 2D mesh.
         super().__init__()
         self.ep_mesh = ep_mesh
         self.tp_mesh = tp_mesh
         self.ep_tp_mesh = DeviceMesh._concatenate([ep_mesh, tp_mesh])
 
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
+        # [FUNCTION DOC] HELPER: Applies the style: shards the experts' w1 on (0, 1) and w2 on (0,
+        # 2) placements over the 2D mesh, registers EP dispatch (all-gather) and combine (reduce-
+        # scatter) hooks on the outer layer, and TP input-gradient all-reduce and output-reduction
+        # hooks on the inner experts. Mutates the module and returns it.
         experts = module.experts  # type: ignore[attr-defined]
 
         # Partition expert weights on 2D (ep, tp) mesh
@@ -380,11 +471,15 @@ class ExpertParallelWithTP(ParallelStyle):
         ep_mesh = self.ep_mesh
 
         def ep_dispatch(mod, inputs):
+            # [FUNCTION DOC] HELPER: Pre-forward hook: all-gathers the input along dim 0 over the
+            # expert-parallel group and returns it in a tuple.
             (x,) = inputs
             x = all_gather_single_autograd(x, gather_dim=0, group=ep_mesh.get_group())
             return (torch.ops._c10d_functional.wait_tensor(x),)
 
         def ep_combine(mod, inputs, output):
+            # [FUNCTION DOC] HELPER: Forward hook: reduce-scatters the output with sum over the
+            # expert-parallel group and returns the result.
             out = reduce_scatter_single_autograd(
                 output, "sum", scatter_dim=0, group=ep_mesh.get_group()
             )
@@ -397,6 +492,9 @@ class ExpertParallelWithTP(ParallelStyle):
         tp_mesh = self.tp_mesh
 
         def tp_allreduce_input_grad(mod, inputs):
+            # [FUNCTION DOC] HELPER: Pre-forward hook: marks the input as replicated across the
+            # tensor-parallel mesh so its gradient is partial (summed) in backward; returns it in
+            # a tuple.
             (x,) = inputs
             return (
                 DTensor.from_local(x, tp_mesh, [Replicate()]).to_local(
@@ -407,6 +505,8 @@ class ExpertParallelWithTP(ParallelStyle):
         experts.register_forward_pre_hook(tp_allreduce_input_grad)
 
         def tp_reduce(mod, inputs, output):
+            # [FUNCTION DOC] HELPER: Forward hook: reduces the partial outputs across the tensor-
+            # parallel mesh to a replicated local tensor.
             return (
                 DTensor.from_local(output, tp_mesh, [Partial()])
                 .redistribute(tp_mesh, [Replicate()])
@@ -419,6 +519,9 @@ class ExpertParallelWithTP(ParallelStyle):
 
 class TransformerBlock(nn.Module):
     def __init__(self, args: ModelArgs):
+        # [FUNCTION DOC] Builds the attention norm and attention, the feed-forward norm, and
+        # either an expert layer (if experts are configured) or a dense feed-forward block,
+        # recording whether experts are used.
         super().__init__()
         self.attention_norm = nn.LayerNorm(args.dim)
         self.attention = Attention(args)
@@ -439,6 +542,8 @@ class TransformerBlock(nn.Module):
             )
 
     def forward(self, x):
+        # [FUNCTION DOC] Pre-norm residual block: adds attention of the normalized input, then
+        # adds the expert or feed-forward output of the normalized result; returns it.
         h = x + self.attention(self.attention_norm(x))
         if self.has_experts:
             out = h + self.expert_layer(self.ffn_norm(h))
@@ -450,7 +555,13 @@ class TransformerBlock(nn.Module):
 # A toy transformer model, partly inspired by the nanoGPT model:
 # https://github.com/karpathy/nanoGPT.
 class Transformer(nn.Module):
+    # [CLASS DOC] Toy decoder-style transformer: token and position embeddings, dropout, a list of
+    # TransformerBlock layers, final layer norm and an output projection (optionally tied to the
+    # token embedding). Provides a static parallelize helper that applies tensor and/or expert
+    # parallel plans.
     def __init__(self, args: ModelArgs):
+        # [FUNCTION DOC] Builds all submodules from the model args and optionally ties output and
+        # embedding weights. Raises AssertionError if vocab size or max sequence length is None.
         super().__init__()
         if args.vocab_size is None:
             raise AssertionError("Expected args.vocab_size to not be None")
@@ -471,6 +582,9 @@ class Transformer(nn.Module):
         self.checkpoint_activations = args.checkpoint_activations
 
     def forward(self, tokens):
+        # [FUNCTION DOC] Embeds tokens, adds position embeddings, applies dropout, runs the layers
+        # (with activation checkpointing when enabled), normalizes and projects to logits in
+        # float. Raises AssertionError if the sequence is longer than the maximum.
         _bsz, seq_len = tokens.size()
         if seq_len > self.max_seq_len:
             raise AssertionError(
@@ -498,6 +612,13 @@ class Transformer(nn.Module):
         local_output_for_attn: bool = False,
         ep_mesh: DeviceMesh | None = None,
     ) -> nn.Module:
+        # [FUNCTION DOC] Applies tensor parallel and/or expert parallel plans to a Transformer in
+        # place and returns it. Root embeddings and norm get row-wise or sequence-parallel plans,
+        # attention and feed-forward projections get column/row-wise plans, expert layers get TP,
+        # EP or EP plus TP styles, and the output layer is made column-wise (re-tying weights if
+        # configured). With local_output_for_attn the attention head count is divided by the
+        # tensor-parallel size. Raises AssertionError if the module is not a Transformer and
+        # ValueError if neither mesh is given.
         if not isinstance(module, Transformer):
             raise AssertionError(f"Requires Transformer but got {module}")
         if tp_mesh is None and ep_mesh is None:
@@ -620,6 +741,8 @@ class Transformer(nn.Module):
 
 
 def skip_unless_torch_gpu(method: T) -> T:
+    # [FUNCTION DOC] Decorator that skips a test unless at least NUM_DEVICES GPUs are available;
+    # returns the wrapped method.
     """
     Test decorator which skips the test unless there's a GPU available to torch.
 
@@ -633,14 +756,20 @@ def skip_unless_torch_gpu(method: T) -> T:
 
 
 class DTensorTestMixin:
+    # [CLASS DOC] Mixin of helpers shared by the multi-process and continuous DTensor test bases:
+    # device type selection, device mesh construction, per-rank seeding and op-versus-full-tensor
+    # equality checks. Expects the host to provide world_size, rank and assertion methods.
     """Shared test helpers for DTensorTestBase and DTensorContinuousTestBase."""
 
     @property
     def is_local_tensor_enabled(self) -> bool:
+        # [FUNCTION DOC] Reports whether local tensor mode is used; always False here.
         return False
 
     @property
     def device_type(self) -> str:
+        # [FUNCTION DOC] Returns cpu when no accelerator is present or fewer devices than the
+        # world size exist, otherwise the detected accelerator type.
         if (
             not (TEST_CUDA or TEST_XPU or TEST_HPU or TEST_PRIVATEUSE1)
             or DEVICE_COUNT < self.world_size
@@ -650,12 +779,19 @@ class DTensorTestMixin:
             return DEVICE_TYPE
 
     def build_device_mesh(self) -> DeviceMesh:
+        # [FUNCTION DOC] Builds a one-dimensional device mesh over the world size on the test
+        # device type.
         return init_device_mesh(self.device_type, (self.world_size,))
 
     def init_manual_seed_for_rank(self) -> None:
+        # [FUNCTION DOC] Seeds the global random generator with this rank.
         torch.manual_seed(self.rank)
 
     def _test_op_on_dtensor(self, op_call, *args, **kwargs) -> None:
+        # [FUNCTION DOC] HELPER: Checks that running an op on DTensor arguments, then taking full
+        # tensors, equals running the op on the full-tensor versions of the arguments. Flattens
+        # args, converts any DTensor to detached full tensors, compares outputs with assertEqual.
+        # Fails the test on mismatch.
         """
         Checks ``op_call(dtensor).full_tensor() == op_call(dtensor.full_tensor())``.
         Unlike _test_op where the DTensor sharding is generated by DTensorConverter,
@@ -682,6 +818,9 @@ class DTensorTestMixin:
 
     # pyre-ignore[2]:
     def _test_op(self, mesh: DeviceMesh, op_call, *args, **kwargs) -> None:
+        # [FUNCTION DOC] HELPER: For every placement combination generated by DTensorConverter for
+        # the args, runs the op and asserts the converter succeeded and the full tensor of the
+        # result equals the plain result.
         out = op_call(*args, **kwargs)
         dtc = DTensorConverter(mesh, args, kwargs)
         for d_args, d_kwargs in dtc:
@@ -691,17 +830,26 @@ class DTensorTestMixin:
             self.assertEqual(d_out.full_tensor(), out)
 
     def run_subtests(self, *args, **kwargs):
+        # [FUNCTION DOC] Runs the shared subtests helper with this test case and the given
+        # arguments; returns its result.
         return run_subtests(self, *args, **kwargs)
 
 
 class DTensorContinuousTestBase(DTensorTestMixin, MultiProcContinuousTest):
+    # [CLASS DOC] Base for continuous multi-process DTensor tests (processes persist across
+    # tests). Adds the DTensorTestMixin helpers and picks the backend for the default device type.
     @classmethod
     def backend_str(cls) -> str:
+        # [FUNCTION DOC] Returns the default backend name for the module device type.
         backend = dist.get_default_backend_for_device(DEVICE_TYPE)
         return backend
 
     @classmethod
     def _init_pg(cls, rank, world_size, rdvz_file):
+        # [FUNCTION DOC] HELPER: Process group setup for a worker process: if an accelerator
+        # exists, exits the process with the skip code when world size exceeds the device count,
+        # otherwise binds the rank's device; then calls the parent initialization. Side effects:
+        # sets the current device and may exit the process.
         # Set device before initializing process group to ensure
         # each rank is bound to the correct GPU. However, if world_size > device_count,
         # we skip the test.
@@ -716,18 +864,28 @@ class DTensorContinuousTestBase(DTensorTestMixin, MultiProcContinuousTest):
 
 
 class LocalDTensorContinuousTestBase(DTensorContinuousTestBase):
+    # [CLASS DOC] Variant of the continuous base that runs all ranks in a single process using
+    # local tensors and a fake process group; no real processes are spawned. The rank property
+    # returns a symbolic int that differs per simulated rank.
     @property
     def is_local_tensor_enabled(self) -> bool:
+        # [FUNCTION DOC] Reports that local tensor mode is enabled (True).
         return True
 
     def _handle_test_skip(self, msg: str) -> None:
+        # [FUNCTION DOC] HELPER: Skips the current test with the given message.
         self.skipTest(msg)
 
     def _get_local_tensor_mode(self):
+        # [FUNCTION DOC] HELPER: Returns a LocalTensorMode over all ranks of the world size.
         return LocalTensorMode(frozenset(range(self.world_size)))
 
     @classmethod
     def _ensure_processes_spawned(cls):
+        # [FUNCTION DOC] HELPER: Class-level setup that replaces process spawning: if not yet
+        # done, resolves a pending world size from NUM_DEVICES, initializes a fake process group
+        # on rank 0 with a fake store, and resets the process and queue lists. Idempotent. Side
+        # effect: initializes global distributed state.
         if cls._processes_spawned:
             return
         if cls.world_size == -2:
@@ -746,17 +904,23 @@ class LocalDTensorContinuousTestBase(DTensorContinuousTestBase):
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] Destroys the fake process group if it was created and marks processes as
+        # not spawned, then calls the base unittest class teardown.
         if cls._processes_spawned:
             dist.destroy_process_group()
             cls._processes_spawned = False
         unittest.TestCase.tearDownClass()
 
     def setUp(self):
+        # [FUNCTION DOC] Runs the unittest setup, ensures the fake group exists and disables
+        # autograd record function.
         unittest.TestCase.setUp(self)
         self.__class__._ensure_processes_spawned()
         torch.autograd._enable_record_function(False)
 
     def tearDown(self):
+        # [FUNCTION DOC] Clears the DTensor random number generator tracker, runs unittest
+        # teardown and re-enables autograd record function.
         from torch.distributed.tensor import _random as random
 
         random._rng_tracker = None
@@ -764,37 +928,54 @@ class LocalDTensorContinuousTestBase(DTensorContinuousTestBase):
         torch.autograd._enable_record_function(True)
 
     def __init__(self, method_name="runTest", methodName="runTest"):
+        # [FUNCTION DOC] Initializes the unittest case; accepts either method_name or methodName,
+        # the latter taking precedence when it is not the default.
         if methodName != "runTest":
             method_name = methodName
         unittest.TestCase.__init__(self, method_name)
 
     @property
     def rank(self):
+        # [FUNCTION DOC] Returns a symbolic int whose per-rank local values are the rank numbers.
         return torch.SymInt(LocalIntNode({r: r for r in range(self.world_size)}))
 
     @rank.setter
     def rank(self, rank):
+        # [FUNCTION DOC] Setter that ignores the assigned value.
         pass
 
     def build_device_mesh(self) -> DeviceMesh:
+        # [FUNCTION DOC] Builds the device mesh with local tensor mode temporarily disabled.
         with maybe_disable_local_tensor_mode():
             return super().build_device_mesh()
 
     def init_manual_seed_for_rank(self) -> None:
+        # [FUNCTION DOC] Seeds the global random generator with 0 for all simulated ranks.
         torch.manual_seed(0)
 
 
 class DTensorTestBase(DTensorTestMixin, MultiProcessTestCase):
+    # [CLASS DOC] Base class for multi-process DTensor tests. Each test runs in spawned worker
+    # processes (one per rank, world size NUM_DEVICES); provides process group init/teardown and
+    # the DTensorTestMixin helpers.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] Returns the number of ranks, NUM_DEVICES.
         return NUM_DEVICES
 
     @property
     def backend(self) -> str:
+        # [FUNCTION DOC] Returns the default backend name for this test's device type.
         backend = dist.get_default_backend_for_device(self.device_type)
         return backend
 
     def init_pg(self, eager_init, backend: str | None = None) -> None:
+        # [FUNCTION DOC] Initializes the default process group for this rank. Exits with the skip
+        # code if an accelerator backend is needed but fewer devices than ranks exist; raises
+        # RuntimeError for unsupported backend strings. For accelerator backends sets the current
+        # device to the rank and, with eager_init, passes a device id so the communicator forms
+        # immediately. Uses a file-based init method on the test file name. Side effect: global
+        # process group.
         if backend is None:
             backend = self.backend
 
@@ -843,6 +1024,9 @@ class DTensorTestBase(DTensorTestMixin, MultiProcessTestCase):
         )
 
     def destroy_pg(self, device_id: int | None = None) -> None:
+        # [FUNCTION DOC] Destroys the process group after a barrier. If no device id is given,
+        # uses the current CUDA device for cuda or the rank otherwise; on CPU uses a plain
+        # barrier, else a barrier on that device.
         # Wait for all ranks to reach here before starting shutdown.
         # FIXME dist.barrier deadlocks with multiple threads and NCCL: https://github.com/pytorch/pytorch/issues/95895
         # dist.all_reduce(torch.zeros((1,), device="cuda" if TEST_CUDA else "cpu"))
@@ -867,6 +1051,7 @@ class DTensorTestBase(DTensorTestMixin, MultiProcessTestCase):
         dist.destroy_process_group()
 
     def setUp(self) -> None:
+        # [FUNCTION DOC] Runs the base setup and spawns the worker processes.
         super().setUp()
         self._spawn_processes()
 
@@ -879,13 +1064,22 @@ def with_comms(
     eager_init: TestFunc | bool = False,
     backend: str | None = None,
 ) -> TestFunc:
+    # [FUNCTION DOC] Decorator factory for distributed tests. Used with or without arguments:
+    # given a function directly, returns a wrapped function; given eager_init and backend options,
+    # returns a decorator. The wrapper, if the test object has an init_pg method, initializes the
+    # process group, runs the test, destroys the group on success, and on exception destroys the
+    # process group directly and re-raises. Otherwise just runs the test.
     def decorator(func, eager_init: bool = False, backend: str | None = None):
+        # [FUNCTION DOC] HELPER: Builds the wrapper for a function with the given eager init and
+        # backend options.
         @wraps(func)  # pyre-ignore[6]
         def wrapper(
             self,
             *args: tuple[object],
             **kwargs: dict[str, Any],  # type: ignore[misc]
         ) -> None:
+            # [FUNCTION DOC] HELPER: Test wrapper: initializes comms if supported, runs the test,
+            # tears down comms (also on error). Returns None.
             # just passthrough if harness doesn't
             # support init_pg e.g., DTensorOpTestBase
             if not hasattr(self, "init_pg"):
@@ -912,18 +1106,27 @@ def with_comms(
 
 
 class DTensorOpTestBase(MultiThreadedTestCase):
+    # [CLASS DOC] Base class for multi-threaded DTensor op tests (one thread per rank, world size
+    # NUM_DEVICES). Temporarily replaces the sharding propagator's lock with a real lock during
+    # each test.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] Returns the number of ranks, NUM_DEVICES.
         return NUM_DEVICES
 
     @property
     def device_type(self) -> str:
+        # [FUNCTION DOC] Returns the module-level device type.
         return DEVICE_TYPE
 
     def build_device_mesh(self):
+        # [FUNCTION DOC] Builds a one-dimensional device mesh over the world size on the device
+        # type.
         return init_device_mesh(self.device_type, (self.world_size,))
 
     def setUp(self) -> None:
+        # [FUNCTION DOC] Runs base setup, saves the sharding propagator's fake mode lock, installs
+        # a real threading lock for thread safety (global side effect), and spawns threads.
         super().setUp()
         # Enable thread-safe lock for ShardingPropagator since we run
         # multi-threaded tests.
@@ -934,6 +1137,7 @@ class DTensorOpTestBase(MultiThreadedTestCase):
         self._spawn_threads()
 
     def tearDown(self) -> None:
+        # [FUNCTION DOC] Restores the saved sharding propagator lock and runs base teardown.
         # Restore the original (no-op) lock
         from torch.distributed.tensor._sharding_prop import ShardingPropagator
 
@@ -943,6 +1147,12 @@ class DTensorOpTestBase(MultiThreadedTestCase):
 
 # This is a class for converting args/kwargs of an op into distributed args/kwargs
 class DTensorConverter:
+    # [CLASS DOC] Iterator that converts the tensor arguments of an op call into DTensors,
+    # yielding one converted (args, kwargs) pair for each combination of sharding choices
+    # (replicate or even shard of each dimension). Attributes: hit and miss counters of converted
+    # and skipped tensors, the mesh, flattened args and kwargs with their tree specs, and the
+    # combination iterator. Use successful to check that something was converted and nothing
+    # skipped.
     def __init__(
         self,
         mesh: DeviceMesh,
@@ -950,6 +1160,8 @@ class DTensorConverter:
         kwargs: dict[str, object],
         replicate_only: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Flattens args and kwargs, and builds the cartesian product of per-tensor
+        # sharding choices (replicate only if requested). Initializes counters to zero.
         self.hit = 0
         self.miss = 0
         self.mesh = mesh
@@ -981,9 +1193,13 @@ class DTensorConverter:
         )
 
     def successful(self) -> bool:
+        # [FUNCTION DOC] Returns True if at least one tensor was converted and none was skipped.
         return self.hit > 0 and self.miss == 0
 
     def is_supported_tensor(self, t: torch.Tensor) -> bool:
+        # [FUNCTION DOC] Returns whether a tensor can be wrapped as a DTensor: False for sparse,
+        # mkldnn, quantized, nested, functional, negative or conjugate views, and lazy or meta
+        # device tensors.
         # TODO: dist tensor need to support quantized and sparse
         # tensors, quantized tensor might be relatively easy, but
         # sparse tensor have special layouts that we need to possibly
@@ -1007,6 +1223,9 @@ class DTensorConverter:
         )
 
     def gen_sharding_choices_for_arg(self, arg: torch.Tensor) -> Sequence[Placement]:
+        # [FUNCTION DOC] Returns the candidate placements for a tensor: replicate, plus shard on
+        # every dimension whose size is greater than one and divisible by the mesh size (none for
+        # bool tensors, which are treated as replicated). Only replicate if replicate_only is set.
         # If replicate_only is set, only use Replicate placement
         if self.replicate_only:
             return [Replicate()]
@@ -1030,9 +1249,13 @@ class DTensorConverter:
         return sharding_choices
 
     def __iter__(self) -> "DTensorConverter":
+        # [FUNCTION DOC] Returns the converter itself as the iterator.
         return self
 
     def __next__(self) -> tuple[tuple[object, ...], dict[str, object]]:
+        # [FUNCTION DOC] Takes the next sharding combination and returns converted args and kwargs
+        # rebuilt with their original structure; each tensor is distributed through
+        # to_dist_tensor. Raises StopIteration when combinations are exhausted.
         try:
             next_sharding_choices = next(self.sharding_combs)
             idx = 0
@@ -1071,6 +1294,11 @@ class DTensorConverter:
     def to_dist_tensor(
         self, t: torch.Tensor, mesh: DeviceMesh, placements: list[Placement]
     ) -> torch.Tensor:
+        # [FUNCTION DOC] Converts a tensor to a DTensor. Plain tensors, parameters and local
+        # tensors that are supported are distributed (scalars replicated on all mesh dims,
+        # parameters re-wrapped) and counted as hit; unsupported ones and other tensor-like
+        # subclasses are returned unchanged and counted as miss. Raises RuntimeError for non-
+        # tensor inputs.
         if type(t) is torch.Tensor or type(t) is nn.Parameter or type(t) is LocalTensor:
             if self.is_supported_tensor(t):
                 self.hit += 1
@@ -1100,21 +1328,30 @@ class DTensorConverter:
 
 
 class LocalDTensorOpTestBase(DTensorOpTestBase):
+    # [CLASS DOC] Op test base that runs all ranks in one thread using local tensors and a fake
+    # process group; thread spawning and process spawning are no-ops. The rank property returns a
+    # symbolic per-rank int.
     @property
     def is_local_tensor_enabled(self) -> bool:
+        # [FUNCTION DOC] Reports that local tensor mode is enabled (True).
         return True
 
     def _handle_test_skip(self, msg: str) -> None:
+        # [FUNCTION DOC] HELPER: Skips the current test with the given message.
         self.skipTest(msg)
 
     def _get_local_tensor_mode(self):
+        # [FUNCTION DOC] HELPER: Returns a LocalTensorMode over all ranks of the world size.
         return LocalTensorMode(frozenset(range(self.world_size)))
 
     def setUp(self) -> None:
+        # [FUNCTION DOC] Runs base setup and disables autograd record function.
         super().setUp()
         torch.autograd._enable_record_function(False)
 
     def tearDown(self) -> None:
+        # [FUNCTION DOC] Clears the DTensor random number generator tracker, runs base teardown
+        # and re-enables autograd record function.
         from torch.distributed.tensor import _random as random
 
         random._rng_tracker = None
@@ -1123,60 +1360,82 @@ class LocalDTensorOpTestBase(DTensorOpTestBase):
 
     @property
     def rank(self):
+        # [FUNCTION DOC] Returns a symbolic int whose per-rank local values are the rank numbers.
         return torch.SymInt(LocalIntNode({r: r for r in range(self.world_size)}))
 
     @rank.setter
     def rank(self, rank):
+        # [FUNCTION DOC] Setter that ignores the assigned value.
         pass
 
     def join_or_run(self, fn):
+        # [FUNCTION DOC] Wraps a zero-argument test function as a bound method of this test;
+        # returns it.
         @wraps(fn)
         def wrapper(self):
+            # [FUNCTION DOC] HELPER: Calls the wrapped function ignoring the instance.
             fn()
 
         return types.MethodType(wrapper, self)
 
     def build_device_mesh(self) -> DeviceMesh:
+        # [FUNCTION DOC] Builds the device mesh with local tensor mode temporarily disabled.
         with maybe_disable_local_tensor_mode():
             return super().build_device_mesh()
 
     def init_pg(self, eager_init, backend: str | None = None) -> None:
+        # [FUNCTION DOC] Initializes a fake process group with rank 0 and the world size and
+        # stores the default group (arguments eager_init and backend are ignored).
         dist.init_process_group("fake", rank=0, world_size=self.world_size)
         self._pg = dist.distributed_c10d._get_default_group()
 
     def destroy_pg(self, device_id: int | None = None) -> None:
+        # [FUNCTION DOC] Destroys the stored process group and clears the reference.
         dist.destroy_process_group(self._pg)
         self._pg = None
 
     def _spawn_processes(self) -> None:
+        # [FUNCTION DOC] No-op: no processes are spawned.
         pass
 
     def _spawn_threads(self) -> None:
+        # [FUNCTION DOC] No-op: no threads are spawned.
         pass
 
     def run_test(self, test_name: str, parent_pipe) -> None:
+        # [FUNCTION DOC] Runs the named test method directly in this process; the pipe is unused.
         getattr(self, test_name)()
 
     def init_manual_seed_for_rank(self) -> None:
+        # [FUNCTION DOC] Seeds the global random generator with 0 for all simulated ranks.
         torch.manual_seed(0)
 
 
 class LocalDTensorTestBase(DTensorTestBase):
+    # [CLASS DOC] Process-based DTensor test base run in local tensor mode: a single process with
+    # a fake process group simulates all ranks, with no process spawning. Rank is a symbolic per-
+    # rank int.
     @property
     def is_local_tensor_enabled(self) -> bool:
+        # [FUNCTION DOC] Reports that local tensor mode is enabled (True).
         return True
 
     def _handle_test_skip(self, msg: str) -> None:
+        # [FUNCTION DOC] HELPER: Skips the current test with the given message.
         self.skipTest(msg)
 
     def _get_local_tensor_mode(self):
+        # [FUNCTION DOC] HELPER: Returns a LocalTensorMode over all ranks of the world size.
         return LocalTensorMode(frozenset(range(self.world_size)))
 
     def setUp(self) -> None:
+        # [FUNCTION DOC] Runs base setup and disables autograd record function.
         super().setUp()
         torch.autograd._enable_record_function(False)
 
     def tearDown(self) -> None:
+        # [FUNCTION DOC] Clears the DTensor random number generator tracker, runs base teardown
+        # and re-enables autograd record function.
         from torch.distributed.tensor import _random as random
 
         random._rng_tracker = None
@@ -1185,44 +1444,60 @@ class LocalDTensorTestBase(DTensorTestBase):
 
     @property
     def rank(self):
+        # [FUNCTION DOC] Returns a symbolic int whose per-rank local values are the rank numbers.
         return torch.SymInt(LocalIntNode({r: r for r in range(self.world_size)}))
 
     @rank.setter
     def rank(self, rank):
+        # [FUNCTION DOC] Setter that ignores the assigned value.
         pass
 
     def join_or_run(self, fn):
+        # [FUNCTION DOC] Wraps a zero-argument test function as a bound method of this test;
+        # returns it.
         @wraps(fn)
         def wrapper(self):
+            # [FUNCTION DOC] HELPER: Calls the wrapped function ignoring the instance.
             fn()
 
         return types.MethodType(wrapper, self)
 
     def build_device_mesh(self) -> DeviceMesh:
+        # [FUNCTION DOC] Builds the device mesh with local tensor mode temporarily disabled.
         with maybe_disable_local_tensor_mode():
             return super().build_device_mesh()
 
     def init_pg(self, eager_init, backend: str | None = None) -> None:
+        # [FUNCTION DOC] Initializes a fake process group with rank 0 and the world size and
+        # stores the default group (arguments eager_init and backend are ignored).
         dist.init_process_group("fake", rank=0, world_size=self.world_size)
         self._pg = dist.distributed_c10d._get_default_group()
 
     def destroy_pg(self, device_id: int | None = None) -> None:
+        # [FUNCTION DOC] Destroys the stored process group and clears the reference.
         dist.destroy_process_group(self._pg)
         self._pg = None
 
     def _spawn_processes(self) -> None:
+        # [FUNCTION DOC] No-op: no processes are spawned.
         pass
 
     def run_test(self, test_name: str, parent_pipe) -> None:
+        # [FUNCTION DOC] Runs the named test method directly in this process; the pipe is unused.
         getattr(self, test_name)()
 
     def init_manual_seed_for_rank(self) -> None:
+        # [FUNCTION DOC] Seeds the global random generator with 0 for all simulated ranks.
         torch.manual_seed(0)
 
 
 def make_wrapped(fn, ctxs):
+    # [FUNCTION DOC] HELPER: Wraps a test function so that it resets dynamo, enters each given
+    # context (calling it with the test instance if it is callable, else using it directly) on an
+    # exit stack, runs the test, and always closes the stack. Returns the wrapper.
     @functools.wraps(fn)
     def wrapped(self):
+        # [FUNCTION DOC] HELPER: Wrapper body described above; returns the test function's result.
         torch._dynamo.reset()
         stack = contextlib.ExitStack()
         for ctx in ctxs:
@@ -1242,6 +1517,11 @@ def make_wrapped(fn, ctxs):
 def create_local_tensor_test_class(
     orig_cls, skipped_tests=None, base_class=LocalDTensorTestBase
 ):
+    # [FUNCTION DOC] Creates a subclass of a test class that runs its tests in local tensor mode.
+    # Copies the original class namespace; names in skipped_tests are replaced by functions that
+    # skip, test methods are wrapped to run inside a LocalTensorMode, and the new class (named
+    # with a WithLocalTensor suffix, deriving from base_class and the original bases) has its file
+    # attribute set to this module's. Returns the new class.
     if skipped_tests is None:
         skipped_tests = []
 
@@ -1269,19 +1549,27 @@ def create_local_tensor_test_class(
 
 @maybe_run_for_local_tensor
 def map_local_tensor_for_rank(tensor, rank, func):
+    # [FUNCTION DOC] Applies func to a tensor and a rank (run once per rank under local tensor
+    # mode via the decorator) and returns the result.
     return func(tensor, rank)
 
 
 @maybe_run_for_local_tensor
 def map_local_for_rank(rank, func):
+    # [FUNCTION DOC] Applies func to a rank (run once per rank under local tensor mode via the
+    # decorator) and returns the result.
     return func(rank)
 
 
 def reduce_local_int(val, func):
+    # [FUNCTION DOC] Applies func to the mapping of per-rank local integer values of a symbolic
+    # int and returns the result.
     return func(val.node._local_ints)
 
 
 def _convert_shard_order_dict_to_ShardOrder(shard_order):
+    # [FUNCTION DOC] HELPER: Converts a mapping from tensor dimension to mesh dimensions into a
+    # tuple of ShardOrderEntry objects, in mapping order.
     """Convert shard_order dict to ShardOrder"""
     return tuple(
         ShardOrderEntry(tensor_dim=tensor_dim, mesh_dims=tuple(mesh_dims))
@@ -1297,6 +1585,11 @@ def redistribute(
     shard_order,
     use_graph_based_transform=True,
 ):
+    # [FUNCTION DOC] Test-only redistribution that supports an explicit shard order, forward only.
+    # Derives placements from shard_order if placements is None, copies the DTensor spec with the
+    # new placements and shard order (empty if None) and returns the input unchanged if the spec
+    # is equal. Otherwise redistributes the local tensor between the specs, wraps it as a DTensor
+    # on the mesh, sets its spec and returns it.
     """
     wrapper function to support shard_order for redistribution
     This is a simpler version of Redistribute, only considers the forward.
@@ -1336,6 +1629,10 @@ def patched_distribute_tensor(
     use_graph_based_transform=True,
     src_data_rank: int | None = 0,
 ):
+    # [FUNCTION DOC] Test-only version of distribute_tensor supporting shard_order. Derives
+    # placements from shard_order if needed, distributes the tensor, disables strided shard as
+    # shard order in its spec and re-runs the spec post-init, then redistributes to the requested
+    # shard order. Returns the DTensor.
     """wrapper function to support shard_order for tensor distribution"""
     if placements is None:
         placements = shard_order_to_placement(shard_order, device_mesh)
@@ -1354,6 +1651,8 @@ def patched_distribute_tensor(
 
 # TODO(zpcore): remove once the native redistribute supports shard_order arg
 def make_full_tensor(dtensor_input):
+    # [FUNCTION DOC] Returns the full (replicated) local tensor of a DTensor by redistributing to
+    # replicated placements with an empty shard order.
     """wrapper function to support DTensor.full_tensor"""
     return redistribute(
         dtensor_input, dtensor_input.device_mesh, placements=None, shard_order=()
@@ -1361,6 +1660,9 @@ def make_full_tensor(dtensor_input):
 
 
 def shard_order_to_placement(shard_order, mesh):
+    # [FUNCTION DOC] Converts a shard order to a tuple of placements with one entry per mesh
+    # dimension: Shard of the tensor dimension for mesh dimensions listed, Replicate otherwise
+    # (all Replicate if shard_order is None).
     """convert shard_order to placement with only Replicate() and Shard()"""
     placements: list[Any] = [Replicate() for _ in range(mesh.ndim)]
     if shard_order is not None:
@@ -1373,10 +1675,18 @@ def shard_order_to_placement(shard_order, mesh):
 
 
 def generate_shard_orders(mesh, tensor_rank):
+    # [FUNCTION DOC] Generator over all possible shard orders of a tensor of the given rank on a
+    # mesh: for each permutation of mesh dimensions, each way to split it into consecutive non-
+    # empty segments, and each choice of tensor dimensions for the segments, yields a tuple of
+    # ShardOrderEntry objects. Raises AssertionError if internal counts disagree.
     # Generate all possible sharding placement of tensor with rank
     # `tensor_rank` over mesh.
     def _split_list(lst: list, N: int):
+        # [FUNCTION DOC] HELPER: Generator that yields every way of splitting a list into N
+        # consecutive non-empty parts.
         def compositions(n: int, k: int):
+            # [FUNCTION DOC] HELPER: Generator that yields lists of k positive integers summing to
+            # n.
             # yields lists of length k, positive ints summing to n
             for cuts in itertools.combinations(range(1, n), k - 1):
                 # add 0 and n as sentinels, then take consecutive differences
@@ -1416,6 +1726,11 @@ def generate_shard_orders(mesh, tensor_rank):
 def validate_sharding_rule_sample(
     op, full_args, full_kwargs, input_placements, output_placements, device_mesh
 ):
+    # [FUNCTION DOC] Checks one sharding rule sample: distributes the input tensors with the given
+    # per-tensor placements, runs the op on full arguments and on the local shards, wraps each
+    # local output with the given output placements, redistributes to replicated and compares with
+    # the reference (shape and allclose with NaN equality). Returns True if all outputs match,
+    # otherwise False.
     from torch.utils import _pytree as pytree
 
     # Extract tensors from args in order, pair with placements
@@ -1435,6 +1750,9 @@ def validate_sharding_rule_sample(
     dtensor_idx = 0
 
     def _to_local_shard(a):
+        # [FUNCTION DOC] HELPER: Replaces the next tensor argument with the local shard of the
+        # matching distributed tensor (tracking an index in the enclosing scope); non-tensor
+        # values are returned unchanged.
         nonlocal dtensor_idx
         if isinstance(a, torch.Tensor):
             local = dtensors[dtensor_idx].to_local()
@@ -1470,6 +1788,13 @@ def validate_sharding_rule_sample(
 def validate_sharding_rule_sample_backward(
     op, full_args, full_kwargs, input_placements, device_mesh
 ):
+    # [FUNCTION DOC] Verifies backward gradients for a sharding strategy. Returns None (skip) if
+    # there are no floating tensors, the op produces no differentiable output, the reference
+    # backward raises RuntimeError, or the DTensor path reports an unregistered strategy or mixed
+    # tensor and DTensor inputs; other exceptions propagate. Otherwise runs backward on the sum of
+    # outputs for plain and distributed clones and returns True if all gradients match in shape
+    # and values, False otherwise. Raises AssertionError if the placement count differs from the
+    # tensor count.
     """Verify backward gradient correctness for a sharding strategy.
 
     Returns None if the op is not differentiable or lacks backward DTensor
@@ -1488,6 +1813,8 @@ def validate_sharding_rule_sample_backward(
         return None
 
     def _clone_with_grad(tensors):
+        # [FUNCTION DOC] HELPER: Returns detached clones of the tensors, with grad enabled for
+        # floating-point ones.
         out = []
         for t in tensors:
             c = t.detach().clone()
@@ -1497,9 +1824,13 @@ def validate_sharding_rule_sample_backward(
         return out
 
     def _replace_tensors(args, kwargs, replacements):
+        # [FUNCTION DOC] HELPER: Returns args and kwargs with every tensor replaced, in order, by
+        # the replacement list entries.
         idx = 0
 
         def _replace(a):
+            # [FUNCTION DOC] HELPER: Replaces one tensor with the next replacement, advancing a
+            # counter in the enclosing scope; other values unchanged.
             nonlocal idx
             if isinstance(a, torch.Tensor):
                 r = replacements[idx]
@@ -1510,6 +1841,8 @@ def validate_sharding_rule_sample_backward(
         return pytree.tree_map(_replace, (args, kwargs))
 
     def _run_backward(output):
+        # [FUNCTION DOC] HELPER: Runs backward on the sum of the floating-point outputs that
+        # require grad. Returns False if there are none, else True.
         out_tensors = [
             t
             for t in pytree.tree_leaves(output)
@@ -1571,6 +1904,11 @@ def validate_sharding_rule_sample_backward(
 
 @contextlib.contextmanager
 def op_strategy_context(op_overload, strategy_func, schema_info=None):
+    # [FUNCTION DOC] Context manager that temporarily registers a sharding strategy function for
+    # an operator overload on the DTensor dispatcher's sharding propagator. Saves and removes any
+    # existing strategy and schema info, registers the new strategy, yields, then in a finally
+    # clause restores the original entries (or removes the new ones) and clears the sharding
+    # propagation cache. Yields None.
     """
     Context manager for setting and clearing op strategies.
     Args:

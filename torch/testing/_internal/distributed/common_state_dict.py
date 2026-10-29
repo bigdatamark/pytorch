@@ -2,6 +2,11 @@
 
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC] Shared test utilities for distributed state dict tests: a mixin that verifies model
+# and optimizer state dicts produced by distributed checkpoint APIs against reference (non-
+# distributed) ones, plus small embedding modules that exercise state dict hooks and fqn
+# modifiers. No import-time side effects beyond imports.
+
 import copy
 from itertools import chain
 from typing import Any
@@ -20,7 +25,14 @@ from torch.distributed.tensor import DTensor
 
 
 class VerifyStateDictMixin:
+    # [CLASS DOC] Mixin for unittest-style test cases (uses assertEqual, assertTrue and similar
+    # from the host class). Provides comparison helpers for model state dicts and optimizer state
+    # dicts, gathering sharded or DTensor values to full tensors before comparing. Stateless.
     def _compare_tensor(self, orig_tensor, dist_tensor, offload_to_cpu=False):
+        # [FUNCTION DOC] HELPER: Asserts that a reference tensor and a possibly distributed tensor
+        # are equal. A DTensor or ShardedTensor is first gathered to a full tensor; optionally
+        # both sides are moved to CPU. Fails if the result is not a plain tensor or values differ
+        # (allclose).
         if isinstance(dist_tensor, (DTensor, ShardedTensor)):
             dist_tensor = _gather_state_dict({"mykey": dist_tensor}).pop("mykey")
 
@@ -37,6 +49,11 @@ class VerifyStateDictMixin:
         options: StateDictOptions = StateDictOptions(),
         offload_to_cpu=False,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Verifies a distributed model state dict against a reference one.
+        # Unless frozen parameters are ignored, requires equal lengths and every key present with
+        # allclose-equal values; a mismatch is re-raised as AssertionError naming the key. When
+        # frozen parameters are ignored, a key missing from the distributed dict must belong to a
+        # parameter that does not require grad. Returns None.
         if not options.ignore_frozen_params:
             self.assertEqual(len(msd), len(dist_msd))
         for fqn, param in msd.items():
@@ -59,6 +76,15 @@ class VerifyStateDictMixin:
         osd: dict[str, Any],
         dist_osd: dict[str, Any],
     ) -> None:
+        # [FUNCTION DOC] HELPER: Verifies a distributed optimizer state dict against a reference
+        # one. Builds mappings between parameter ids and fully qualified names from the model and
+        # optimizer, then checks per-parameter state (counts and tensor values) and param groups.
+        # If the distributed dict has more param groups, they are temporarily merged into one for
+        # comparison, comparing params by sorted names and other keys by equality; the original
+        # groups are restored at the end. Mutates dist_osd temporarily. Returns None.
+        # KNOWN ISSUE: in the state loop the distributed state is looked up in the reference
+        # states mapping rather than in the distributed states mapping, so the reference state is
+        # compared with itself and values are never really checked.
         params = list(chain.from_iterable(g["params"] for g in optim.param_groups))
         param_pid_mapping = dict(zip(params, range(len(params)), strict=True))
         fqn_pid_mapping = {}
@@ -112,6 +138,11 @@ class VerifyStateDictMixin:
         new_optim: torch.optim.Optimizer,
         dist_osd: dict[str, Any],
     ) -> None:
+        # [FUNCTION DOC] HELPER: Verifies an optimizer state dict by round trip: gathers the
+        # distributed optimizer state dict to full values, loads it into new_optim through
+        # set_state_dict (with an empty model state dict), then asserts the reference optimizer
+        # state dict equals the new one. Uses looser tolerances on XPU devices. Mutates new_optim
+        # and the model's optimizer state. Returns None.
         new_dist_osd = _gather_state_dict(dist_osd)
         set_state_dict(
             model,
@@ -125,14 +156,23 @@ class VerifyStateDictMixin:
 
 
 class FusionEmbedding(nn.Module):
+    # [CLASS DOC] Test module that holds two embedding tables (base and fusion) as submodules,
+    # used as a model for state dict tests. No custom behavior.
     def __init__(self, vocab_size: int, fusion_vocab_size: int, embed_dim: int) -> None:
+        # [FUNCTION DOC] Creates the base embedding (vocab_size by embed_dim) and the fusion
+        # embedding (fusion_vocab_size by embed_dim).
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim)
         self.fusion_embedding = nn.Embedding(fusion_vocab_size, embed_dim)
 
 
 class FusionEmbeddingWithHook(nn.Module):
+    # [CLASS DOC] Same layout as FusionEmbedding, but registers a state dict hook and a load-
+    # state-dict pre hook that hide the extra embedding level so saved keys look like a single
+    # embedding with a weight entry (the pre-fusion key names).
     def __init__(self, vocab_size: int, fusion_vocab_size: int, embed_dim: int) -> None:
+        # [FUNCTION DOC] Creates the two embeddings and registers the state dict hook and the load
+        # pre hook (with module access).
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim)
         self.fusion_embedding = nn.Embedding(fusion_vocab_size, embed_dim)
@@ -142,6 +182,9 @@ class FusionEmbeddingWithHook(nn.Module):
         )
 
     def _state_dict_hook(self, destination, prefix, keep_vars):
+        # [FUNCTION DOC] HELPER: State dict hook. Renames the prefixed key for the embedding
+        # weight to the prefixed plain weight key in the destination mapping, in place. Raises
+        # KeyError if the original key is absent. Returns None.
         """Remove "embedding" from the original embedding in the state_dict
         name. This keeps the original state dict name for the embedding
         from before fusing with the FusionEmbedding.
@@ -152,6 +195,9 @@ class FusionEmbeddingWithHook(nn.Module):
         del destination[key]
 
     def _load_state_dict_hook(self, state_dict, prefix, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Load pre hook. If the state dict is non-empty, renames the
+        # prefixed plain weight key to the prefixed embedding weight key, in place (the inverse of
+        # the state dict hook). Raises KeyError if the key is missing. Returns None.
         """Apply extra "embedding" prefix to the state_dict key to
         account for the FusionEmbedding wrapping.
         """
@@ -163,10 +209,16 @@ class FusionEmbeddingWithHook(nn.Module):
 
 
 class FusionEmbeddingWithModifier(FusionEmbeddingWithHook):
+    # [CLASS DOC] FusionEmbeddingWithHook that also declares the key-to-module mapping used by
+    # distributed state dict code, so the renamed weight key can be mapped back to its true
+    # module.
     # _fqn_modifiers is a private function as a contract between DSD. When users change the state_dict
     # keys, they need to provide a mapping from the new key to the original key. This is used to ensure
     # consistency between the state_dict keys and fqn.
     def _fqn_modifiers(self) -> dict[str, str]:
+        # [FUNCTION DOC] HELPER: Returns a mapping from the modified state dict key (weight) to
+        # the original submodule name (embedding), as required by the distributed state dict
+        # contract.
         return {
             "weight": "embedding",
         }
