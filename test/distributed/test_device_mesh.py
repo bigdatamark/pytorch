@@ -1,5 +1,11 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests for DeviceMesh and init_device_mesh (creation, process group reuse, device
+# selection, slicing, flatten/unflatten/concatenate, backend overrides, torchcomms integration)
+# plus mesh collectives and the CuTe-style _FlatLayout/_MeshLayout algebra. Distributed cases
+# are run as multi-process DTensorTestBase tests; the layout tests are single-process.
+# Import-time side effects: computes the module globals device_type and device_count from
+# the current accelerator and sets _NCCL_AVAILABLE by trying to import the NCCL binding.
 import functools
 import os
 import unittest
@@ -57,6 +63,9 @@ except ImportError:
 
 
 def _set_env_var(addr="localhost", port="25364", world_size=1, rank=0, local_rank=-1):
+    # [FUNCTION DOC] HELPER: Sets MASTER_ADDR, MASTER_PORT, WORLD_SIZE and RANK in os.environ
+    # from the arguments (strings), and LOCAL_RANK only when local_rank is not -1. Mutates the
+    # process environment and does not clean it up.
     os.environ["MASTER_ADDR"] = addr
     os.environ["MASTER_PORT"] = port
     os.environ["WORLD_SIZE"] = f"{world_size}"
@@ -66,10 +75,17 @@ def _set_env_var(addr="localhost", port="25364", world_size=1, rank=0, local_ran
 
 
 def _with_torchcomm_env(func):
+    # [FUNCTION DOC] HELPER: Decorator for tests that need torchcomms. The returned wrapper sets
+    # TORCHCOMM_RANK, TORCHCOMM_SIZE and TORCHCOMM_STORE_PATH (from the test's rank, world_size
+    # and file_name) plus MASTER_ADDR/MASTER_PORT, runs the test, and in a finally block
+    # removes the three TORCHCOMM variables. MASTER_ADDR and MASTER_PORT are left set
+    # afterwards.
     """Sets TORCHCOMM env vars needed by torchcomms before init_pg runs."""
 
     @functools.wraps(func)
     def wrapper(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Wrapper that applies the torchcomms environment around the
+        # wrapped test method and returns its result.
         os.environ["TORCHCOMM_RANK"] = str(self.rank)
         os.environ["TORCHCOMM_SIZE"] = str(self.world_size)
         os.environ["TORCHCOMM_STORE_PATH"] = self.file_name
@@ -90,12 +106,19 @@ def _with_torchcomm_env(func):
 
 @unittest.skipIf(TEST_XPU or TEST_HPU, "XPU/HPU does not support gloo backend.")
 class DeviceMeshTestGlooBackend(DTensorTestBase):
+    # [CLASS DOC] Tests DeviceMesh behavior when the default process group uses the gloo
+    # backend. Skipped on XPU and HPU. Runs as a DTensorTestBase multi-process test.
     @property
     def backend(self):
+        # [FUNCTION DOC] HELPER: Test property that makes the base class initialize a gloo
+        # process group.
         return "gloo"
 
     @with_comms
     def test_device_mesh_reuse_default_group(self):
+        # [FUNCTION DOC] Checks that a 1D mesh over the whole world either reuses the default
+        # group (CPU-only case, groups equal) or, when CUDA is available, gets a distinct group
+        # of the same size.
         mesh = init_device_mesh(self.device_type, (self.world_size,))
         mesh_group = mesh.get_group()
         default_group = _get_default_group()
@@ -107,12 +130,18 @@ class DeviceMeshTestGlooBackend(DTensorTestBase):
 
 
 class DeviceMeshSetDeviceTest(DTensorTestBase):
+    # [CLASS DOC] Tests how DeviceMesh construction selects the accelerator device when the
+    # process group is not yet initialized. World size 4; each test needs at least 4 GPUs.
     @property
     def world_size(self):
+        # [FUNCTION DOC] HELPER: Test property giving the world size (4).
         return 4
 
     @skip_if_lt_x_gpu(4)
     def test_manual_set_device(self):
+        # [FUNCTION DOC] Sets the accelerator device to a rank-shifted index before building a
+        # DeviceMesh from env vars, and checks the mesh initializes the group but keeps that
+        # manually chosen device.
         mesh_tensor = torch.arange(4).reshape(2, 2)
         self.assertTrue(not is_initialized())
 
@@ -132,6 +161,8 @@ class DeviceMeshSetDeviceTest(DTensorTestBase):
 
     @skip_if_lt_x_gpu(4)
     def test_auto_set_device_from_local_rank(self):
+        # [FUNCTION DOC] Sets LOCAL_RANK to a rank-shifted value, builds a DeviceMesh, and
+        # checks the group gets initialized and the current device index equals LOCAL_RANK.
         mesh_tensor = torch.arange(4).reshape(2, 2)
         self.assertTrue(not is_initialized())
         # set the local rank to be different than the default world rank,
@@ -153,6 +184,9 @@ class DeviceMeshSetDeviceTest(DTensorTestBase):
 
     @skip_if_lt_x_gpu(4)
     def test_auto_set_device_from_heuristic(self):
+        # [FUNCTION DOC] With no device chosen and no LOCAL_RANK, builds a DeviceMesh and checks
+        # it warns about the unset default device, initializes the group, and selects the device
+        # equal to the rank.
         mesh_tensor = torch.arange(4).reshape(2, 2)
         self.assertTrue(not is_initialized())
 
@@ -172,12 +206,17 @@ class DeviceMeshSetDeviceTest(DTensorTestBase):
 
 
 class DeviceMeshTest(DTensorTestBase):
+    # [CLASS DOC] Tests for DeviceMesh construction, group access, local ranks, fake process
+    # groups, from_group and root-mesh lookup on a 4-rank world.
     @property
     def world_size(self):
+        # [FUNCTION DOC] HELPER: Test property giving the world size (4).
         return 4
 
     @skip_if_lt_x_gpu(4)
     def test_init_process_group(self):
+        # [FUNCTION DOC] Builds a 2x2 DeviceMesh with only env vars set and no prior init, and
+        # checks the default process group is initialized; then destroys the process group.
         mesh_tensor = torch.arange(4).reshape(2, 2)
         self.assertTrue(not is_initialized())
         _set_env_var(world_size=self.world_size, rank=self.rank)
@@ -187,6 +226,8 @@ class DeviceMeshTest(DTensorTestBase):
 
     @with_comms()
     def test_2d_mesh_non_eager_init_subgroup(self):
+        # [FUNCTION DOC] Checks that with lazy (non-eager) init the subgroups of a 2D mesh have
+        # no bound device id.
         mesh_shape = (2, self.world_size // 2)
         mesh_2d = init_device_mesh(self.device_type, mesh_shape)
 
@@ -197,6 +238,9 @@ class DeviceMeshTest(DTensorTestBase):
     # eager_init=True and eager_init=False scenarios.
     @with_comms(eager_init=True)
     def test_2d_mesh_eager_init_subgroup(self):
+        # [FUNCTION DOC] Checks that with eager init on nccl the subgroups of a 2D mesh already
+        # have a bound device id equal to the current CUDA device; other backends are not
+        # checked.
         mesh_shape = (2, self.world_size // 2)
         mesh_2d = init_device_mesh(self.device_type, mesh_shape)
 
@@ -209,6 +253,9 @@ class DeviceMeshTest(DTensorTestBase):
 
     @with_comms()
     def test_get_group_and_get_all_groups(self):
+        # [FUNCTION DOC] Checks that get_group by index equals get_group by name, that sliced 1D
+        # meshes return the same groups, and that get_all_groups returns both groups of a named
+        # 2D mesh.
         mesh_shape = (2, self.world_size // 2)
         mesh_2d = init_device_mesh(
             self.device_type, mesh_shape, mesh_dim_names=("dp", "tp")
@@ -230,6 +277,8 @@ class DeviceMeshTest(DTensorTestBase):
 
     @with_comms
     def test_get_local_rank_raises_exception(self):
+        # [FUNCTION DOC] Checks that get_local_rank without a mesh_dim on a 2D mesh raises
+        # RuntimeError saying mesh_dim must be specified when ndim is above 1.
         mesh_shape = (2, self.world_size // 2)
         mesh_2d = init_device_mesh(
             self.device_type, mesh_shape, mesh_dim_names=("dp", "tp")
@@ -243,6 +292,9 @@ class DeviceMeshTest(DTensorTestBase):
 
     @with_comms
     def test_get_local_rank(self):
+        # [FUNCTION DOC] Checks get_local_rank by name equals by index on a 2D mesh, equals the
+        # local rank of the sliced 1D meshes, and that a flattened dp/tp mesh reports the global
+        # rank.
         mesh_shape = (2, self.world_size // 2)
         mesh_2d = init_device_mesh(
             self.device_type, mesh_shape, mesh_dim_names=("dp", "tp")
@@ -261,6 +313,9 @@ class DeviceMeshTest(DTensorTestBase):
 
     @with_comms
     def test_device_mesh_2d(self):
+        # [FUNCTION DOC] Builds a 2x2 mesh from a tensor and checks each per-dimension group has
+        # size 2 and contains the global ranks expected for the current rank along that
+        # dimension.
         mesh_tensor = torch.arange(4).reshape(2, 2)
         # construct a device mesh for self.device_type
         mesh = DeviceMesh(self.device_type, mesh_tensor)
@@ -286,6 +341,9 @@ class DeviceMeshTest(DTensorTestBase):
 
     @with_comms
     def test_device_mesh_init_backend(self):
+        # [FUNCTION DOC] Builds a mesh with the backend initialization skipped and an explicit
+        # rank, and checks get_group raises RuntimeError (groups not initialized) while
+        # get_coordinate is still set.
         mesh = DeviceMesh(
             self.device_type, torch.arange(10), _init_backend=False, _rank=5
         )
@@ -298,6 +356,9 @@ class DeviceMeshTest(DTensorTestBase):
         self.assertEqual(mesh.get_coordinate(), [5])
 
     def test_fake_pg_device_mesh(self):
+        # [FUNCTION DOC] Initializes a fake process group (single rank, fake store), builds a
+        # mesh and checks an all-gather through the mesh yields a tensor whose first dim is
+        # world_size times larger.
         fake_store = FakeStore()
         init_process_group("fake", store=fake_store, rank=0, world_size=self.world_size)
         device_type = (
@@ -314,6 +375,9 @@ class DeviceMeshTest(DTensorTestBase):
         self.assertEqual(global_tensor.shape, (self.world_size * 2, 8))
 
     def test_fake_pg_device_mesh_cuda_on_cpu(self):
+        # [FUNCTION DOC] Checks init_device_mesh with device type cuda works over a fake process
+        # group even on CPU-only machines, with the expected ndim, size, dim names and fake
+        # backend object.
         """
         Test that DeviceMesh can be initialized with fake backend using 'cuda'
         device type even on CPU-only machines.
@@ -338,6 +402,9 @@ class DeviceMeshTest(DTensorTestBase):
 
     @with_comms
     def test_from_group_with_global_pg(self):
+        # [FUNCTION DOC] Checks DeviceMesh.from_group on a mesh's group, with and without an
+        # explicit mesh tensor, reproduces the reference mesh, its group names and its
+        # coordinates.
         # Simple test: check `from_group` from a mesh pg vs. directly
         # initializing via `init_device_mesh`
         ref_global_mesh = init_device_mesh(self.device_type, (self.world_size,))
@@ -360,6 +427,10 @@ class DeviceMeshTest(DTensorTestBase):
 
     @with_comms
     def test_from_group_with_invalid_mesh(self):
+        # [FUNCTION DOC] Checks from_group raises ValueError for a mesh whose shape does not
+        # match the group's ranks, and for a mesh whose ndim differs from the number of groups
+        # given.
+        # KNOWN ISSUE: the first call passes the module-level device_type, not self.device_type.
         global_pg = _get_default_group()
         global_pg_size = global_pg.size()
         if global_pg_size != 4:
@@ -381,6 +452,8 @@ class DeviceMeshTest(DTensorTestBase):
             )
 
     def test_raises_invalid_device_type(self):
+        # [FUNCTION DOC] Checks init_device_mesh raises RuntimeError when the device type string
+        # includes an index (for example a device type followed by a colon and 0).
         with self.assertRaisesRegex(
             RuntimeError,
             "Device type with index is not supported",
@@ -393,6 +466,9 @@ class DeviceMeshTest(DTensorTestBase):
 
     @with_comms
     def test_get_root_mesh_multiple_independent_meshes(self):
+        # [FUNCTION DOC] Regression test for issue 163330: with two independent 2D meshes,
+        # get_root_mesh of each sliced submesh returns its own parent mesh and not the other
+        # mesh.
         # regression test for issue #163330
         # when creating multiple independent device meshes and slicing them,
         # get_root_mesh should return the correct parent mesh for each submesh
@@ -422,12 +498,17 @@ class DeviceMeshTest(DTensorTestBase):
 
 
 class DeviceMeshTestNDim(DTensorTestBase):
+    # [CLASS DOC] Tests for DeviceMesh with three dimensions or more on 8 ranks: groups,
+    # hashing, local ranks and from_group.
     @property
     def world_size(self):
+        # [FUNCTION DOC] HELPER: Test property giving the world size (8).
         return 8
 
     @with_comms
     def test_device_mesh_nd(self):
+        # [FUNCTION DOC] Builds a 2x2x2 mesh and checks every per-dimension group has size 2 and
+        # holds the global ranks that share the other coordinates.
         # construct a device mesh for self.device_type
         mesh_tensor = torch.arange(8).reshape(2, 2, 2)
         mesh = DeviceMesh(self.device_type, mesh_tensor)
@@ -451,6 +532,8 @@ class DeviceMeshTestNDim(DTensorTestBase):
 
     @with_comms
     def test_device_mesh_hash(self):
+        # [FUNCTION DOC] Checks that equal mesh tensors give equal hashes while meshes of
+        # different shape differ.
         mesh_tensor_2d = torch.arange(8).reshape(4, 2)
         mesh = DeviceMesh(self.device_type, mesh_tensor_2d)
         mesh2 = DeviceMesh(self.device_type, mesh_tensor_2d)
@@ -462,6 +545,8 @@ class DeviceMeshTestNDim(DTensorTestBase):
 
     @with_comms
     def test_get_local_rank_3d(self):
+        # [FUNCTION DOC] Checks get_local_rank by name on a dp/pp/tp 2x2x2 mesh against the
+        # values computed from the global rank.
         """
         If we have a 3D mesh and we want to apply dp, pp, tp to it,
         mesh_dim_names = ["dp", "pp", "tp"], and the mesh tensor would be:
@@ -499,6 +584,9 @@ class DeviceMeshTestNDim(DTensorTestBase):
 
     @with_comms
     def test_device_mesh_parent_child_hash(self):
+        # [FUNCTION DOC] Checks equality and hashing: a slice of a 2D mesh differs (names and
+        # hash) from a standalone mesh over the same ranks, while two standalone meshes with the
+        # same ranks are equal in layout, rank map, names, thread id and hash.
         mesh_2d = init_device_mesh(
             self.device_type, (2, self.world_size // 2), mesh_dim_names=("DP", "TP")
         )
@@ -537,6 +625,9 @@ class DeviceMeshTestNDim(DTensorTestBase):
 
     @with_comms
     def test_from_group_with_mesh_shape_3d(self):
+        # [FUNCTION DOC] Checks from_group with two groups taken from a 3D mesh and a mesh
+        # tensor sliced at the local tp rank: group names, mesh tensors and sub-mesh groups
+        # match the reference.
         """Tests ``from_group`` when passing ``mesh_shape`` as 3D."""
         # Consider the following 3D scenario and we need to create the 2D HSDP mesh from it.
         # - (2, 2, 2) ("dp_replicate", "dp_shard", "tp") mesh
@@ -573,6 +664,9 @@ class DeviceMeshTestNDim(DTensorTestBase):
 
     @with_comms()
     def test_from_group_with_mesh_shape_2d(self):
+        # [FUNCTION DOC] Creates shard and replicate groups by hand for an 8-rank world, builds
+        # a 2D mesh with from_group, and checks groups, mesh and sub-meshes equal those of a
+        # reference mesh.
         """Tests ``from_group`` when passing ``mesh_shape`` as 2D."""
         # Consider the following scenario where the process group has been created,
         # but we need to create the 2D HSDP mesh from it later in the program.
@@ -626,12 +720,16 @@ class DeviceMeshTestNDim(DTensorTestBase):
 
 
 class InitDeviceMeshTest(DTensorTestBase):
+    # [CLASS DOC] Tests for init_device_mesh argument handling and backend_override on 8 ranks.
     @property
     def world_size(self):
+        # [FUNCTION DOC] HELPER: Test property giving the world size (8).
         return 8
 
     @with_comms
     def test_init_device_mesh(self):
+        # [FUNCTION DOC] Checks init_device_mesh equals a hand-built DeviceMesh and keeps the
+        # dim names.
         mesh_shape = (2, 4)
         mesh_dim_names = ("DP", "TP")
         ref_mesh = DeviceMesh(
@@ -649,6 +747,8 @@ class InitDeviceMeshTest(DTensorTestBase):
 
     @with_comms
     def test_raises_duplicate_mesh_dim_names(self):
+        # [FUNCTION DOC] Checks init_device_mesh raises RuntimeError when mesh_dim_names
+        # contains duplicates.
         with self.assertRaisesRegex(
             RuntimeError,
             "Each mesh_dim_name must be unique.",
@@ -661,6 +761,8 @@ class InitDeviceMeshTest(DTensorTestBase):
 
     @with_comms
     def test_raises_mesh_shape_mesh_dim_names_mismatch(self):
+        # [FUNCTION DOC] Checks init_device_mesh raises RuntimeError when the lengths of
+        # mesh_shape and mesh_dim_names differ.
         with self.assertRaisesRegex(
             RuntimeError,
             "mesh_shape and mesh_dim_names should have same length!",
@@ -672,6 +774,10 @@ class InitDeviceMeshTest(DTensorTestBase):
             )
 
     def _test_backend_override_argument_dict_with_idx_and_backend(self):
+        # [FUNCTION DOC] HELPER: Shared body for the lazy and eager backend_override tests.
+        # Builds a 3D mesh with an index-keyed override (fake, and fake with options) and checks
+        # backend names and options per dimension, then checks _flatten honors a
+        # backend_override given as a name or as a name with options.
         opts = FakeProcessGroup.Options()
         opts.fake_option = 42
 
@@ -683,6 +789,8 @@ class InitDeviceMeshTest(DTensorTestBase):
         )
 
         def get_opts(mesh: DeviceMesh, dim_idx: int) -> C10dBackend.Options:
+            # [FUNCTION DOC] HELPER: Returns the options object of the backend of the group at
+            # the given mesh dim.
             return (
                 mesh.get_group(dim_idx)
                 ._get_backend(torch.device(f"{self.device_type}:{self.rank}"))
@@ -710,14 +818,19 @@ class InitDeviceMeshTest(DTensorTestBase):
 
     @with_comms
     def test_backend_override_argument_dict_with_idx_and_backend_lazy(self):
+        # [FUNCTION DOC] Runs the shared backend_override check with lazy group initialization.
         self._test_backend_override_argument_dict_with_idx_and_backend()
 
     @with_comms(eager_init=True)
     def test_backend_override_argument_dict_with_idx_and_backend_eager(self):
+        # [FUNCTION DOC] Runs the shared backend_override check with eager group initialization.
         self._test_backend_override_argument_dict_with_idx_and_backend()
 
     @with_comms(backend="fake")
     def test_backend_override_argument_dict_with_name_and_options(self):
+        # [FUNCTION DOC] Uses the fake default backend and a backend_override keyed by dim name
+        # with only an options object; checks the option lands on that dim only, and on
+        # flattened meshes made with a backend_override of options.
         opts = FakeProcessGroup.Options()
         opts.fake_option = 42
 
@@ -729,6 +842,8 @@ class InitDeviceMeshTest(DTensorTestBase):
         )
 
         def get_opts(mesh: DeviceMesh, dim_idx: int) -> C10dBackend.Options:
+            # [FUNCTION DOC] HELPER: Returns the options object of the backend of the group at
+            # the given mesh dim.
             return (
                 mesh.get_group(dim_idx)
                 ._get_backend(torch.device(f"{self.device_type}:{self.rank}"))
@@ -747,6 +862,9 @@ class InitDeviceMeshTest(DTensorTestBase):
 
     @with_comms
     def test_backend_override_argument_errors(self):
+        # [FUNCTION DOC] Checks init_device_mesh raises RuntimeError for a backend_override that
+        # has both a name and an index for the same dim, an unknown dim name, or an invalid
+        # integer key.
         with self.assertRaisesRegex(
             RuntimeError,
             "Found redundant dim index 0 and name dp in backend_override",
@@ -782,12 +900,16 @@ class InitDeviceMeshTest(DTensorTestBase):
 
 
 class TestDeviceMeshGetItem(DTensorTestBase):
+    # [CLASS DOC] Tests DeviceMesh indexing (slicing by name) and flatten/unflatten/concatenate
+    # on 8 ranks.
     @property
     def world_size(self):
+        # [FUNCTION DOC] HELPER: Test property giving the world size (8).
         return 8
 
     @with_comms
     def test_raises_no_mesh_dim_found(self):
+        # [FUNCTION DOC] Checks slicing a mesh that has no dim names raises RuntimeError.
         with self.assertRaisesRegex(
             RuntimeError, "Cannot slice a DeviceMesh without mesh_dim_names!"
         ):
@@ -796,6 +918,7 @@ class TestDeviceMeshGetItem(DTensorTestBase):
 
     @with_comms
     def test_raises_invalid_mesh_dim_name(self):
+        # [FUNCTION DOC] Checks slicing with a name that is not a mesh dim name raises KeyError.
         child_mesh_dim_name = ("PP",)
         with self.assertRaisesRegex(KeyError, "Invalid mesh_dim_name"):
             mesh_dim_names = ("DP", "TP")
@@ -808,6 +931,8 @@ class TestDeviceMeshGetItem(DTensorTestBase):
 
     @with_comms
     def test_get_item_2d(self):
+        # [FUNCTION DOC] Checks slicing a 2D mesh by name gives the mesh tensor row for the
+        # current rank.
         mesh_shape = (2, 4)
         mesh_dim_names = ("DP", "TP")
         mesh_2d = init_device_mesh(
@@ -830,6 +955,8 @@ class TestDeviceMeshGetItem(DTensorTestBase):
 
     @with_comms
     def test_get_item_1d(self):
+        # [FUNCTION DOC] Checks slicing a 1D named mesh by its own name returns an equal mesh,
+        # and an unknown name raises KeyError.
         mesh = init_device_mesh(self.device_type, (8,), mesh_dim_names=("dp",))
         # Make sure slicing out 1D mesh from a 1D mesh works.
         dp_mesh = mesh["dp"]
@@ -840,6 +967,8 @@ class TestDeviceMeshGetItem(DTensorTestBase):
 
     @with_comms
     def test_get_item_3d(self):
+        # [FUNCTION DOC] Checks single-name and multi-name slices (list and tuple forms) of a 3D
+        # mesh, and re- slicing a 2D sub-mesh by one name, give the expected rank groups.
         mesh_shape = (2, 2, 2)
         mesh_dim_names = ("Replicate", "Shard", "TP")
         mesh_3d = init_device_mesh(
@@ -880,6 +1009,10 @@ class TestDeviceMeshGetItem(DTensorTestBase):
 
     @with_comms
     def test_cache_and_reuse_submesh_slice_result(self):
+        # [FUNCTION DOC] Checks the process group count in the world is unchanged after slicing
+        # the tp dim.
+        # KNOWN ISSUE: no dp slice is taken before the first count check, so the first assertion
+        # compares the count with itself and the cache-reuse of the dp slice is not tested.
         mesh = init_device_mesh(self.device_type, (2, 4), mesh_dim_names=("dp", "tp"))
 
         ref_pg_count = _world.group_count
@@ -895,6 +1028,8 @@ class TestDeviceMeshGetItem(DTensorTestBase):
 
     @with_comms
     def test_get_item_3d_noncontiguous_slicing(self):
+        # [FUNCTION DOC] Checks slicing dp and cp from a 3D mesh puts the later name innermost
+        # with the expected ranks, and that slicing names out of order raises KeyError.
         mesh_shape = (2, 2, 2)
         mesh_dim_names = ("dp", "pp", "cp")
         mesh_3d = init_device_mesh(
@@ -923,6 +1058,8 @@ class TestDeviceMeshGetItem(DTensorTestBase):
 
     @with_comms
     def test_flatten_mesh_1d(self):
+        # [FUNCTION DOC] Checks _flatten on a one-dimensional mesh runs without error (no
+        # assertions).
         mesh_shape = (4,)
         mesh_dim_names = ("default",)
         mesh_1d = init_device_mesh(
@@ -932,6 +1069,10 @@ class TestDeviceMeshGetItem(DTensorTestBase):
 
     @with_comms
     def test_flatten_mesh_3d(self):
+        # [FUNCTION DOC] Checks _flatten on a 3D mesh: error for an existing dim name,
+        # contiguous and non- contiguous flatten layouts and ranks, no new group on repeated
+        # flatten, ordering errors on slicing, custom flatten name, and error when a flatten
+        # name is reused.
         mesh_shape = (2, 2, 2)
         mesh_dim_names = ("dp", "cp", "tp")
         mesh_3d = init_device_mesh(
@@ -1006,6 +1147,9 @@ class TestDeviceMeshGetItem(DTensorTestBase):
 
     @with_comms(eager_init=True)
     def test_flatten_mesh_4d(self):
+        # [FUNCTION DOC] Eager-init test of flattening in a 4D mesh: flatten
+        # dp_replicate/dp_shard/cp, flatten further into dp, check shapes, and a degenerate
+        # all-ones mesh smaller than the world.
         mesh_shape = (2, 2, 2, 1)
         mesh_dim_names = ("dp_replicate", "dp_shard", "cp", "tp")
         mesh_4d = init_device_mesh(
@@ -1035,6 +1179,9 @@ class TestDeviceMeshGetItem(DTensorTestBase):
 
     @with_comms
     def test_unflatten_mesh_2d(self):
+        # [FUNCTION DOC] Checks _unflatten on a 2D mesh splits dim 0 into two named dims, keeps
+        # the tp group, and that the new dim names cannot be sliced from the original root mesh
+        # (KeyError).
         mesh_shape = (4, 2)
         mesh_dim_names = ("dp", "tp")
         mesh_2d = init_device_mesh(
@@ -1053,6 +1200,10 @@ class TestDeviceMeshGetItem(DTensorTestBase):
 
     @with_comms
     def test_unflatten_mesh_3d(self):
+        # [FUNCTION DOC] Checks _unflatten from a world mesh into several layouts, shares equal
+        # meshes between alternative splits, and nested unflatten. If NCCL is available, also
+        # checks per-dim backend_override (fake and nccl with timeouts) by timing collectives on
+        # the groups.
         # Test unflatten from a dummy world mesh, which is the case we need for Expert Parallelism(EP).
         global_mesh = init_device_mesh(
             self.device_type,
@@ -1106,6 +1257,8 @@ class TestDeviceMeshGetItem(DTensorTestBase):
 
     @with_comms
     def test_concatenate_2d(self):
+        # [FUNCTION DOC] Checks DeviceMesh._concatenate of the dp and tp 1D slices equals the 2D
+        # mesh and keeps the same groups.
         mesh_shape = (2, 4)
         mesh_dim_names = ("dp", "tp")
         mesh_2d = init_device_mesh(
@@ -1118,6 +1271,8 @@ class TestDeviceMeshGetItem(DTensorTestBase):
 
     @with_comms
     def test_concatenate_3d(self):
+        # [FUNCTION DOC] Checks _concatenate of 1D slices and of a 2D plus a 1D slice rebuilds
+        # the same 3D mesh.
         mesh_shape = (2, 2, 2)
         mesh_dim_names = ("pp", "dp", "tp")
         mesh_3d = init_device_mesh(
@@ -1134,6 +1289,8 @@ class TestDeviceMeshGetItem(DTensorTestBase):
 
     @with_comms
     def test_reconstruct_mesh_with_flatten_dim(self):
+        # [FUNCTION DOC] Checks that slicing with a previously flattened dim name (shard_cp or
+        # dp_cp) gives the expected mesh tensors and reuses the flattened mesh's group.
         mesh_3d = init_device_mesh(
             self.device_type, (2, 2, 2), mesh_dim_names=("replicate", "shard", "cp")
         )
@@ -1162,12 +1319,17 @@ class TestDeviceMeshGetItem(DTensorTestBase):
 
 
 class TestMeshEnv(DTensorTestBase):
+    # [CLASS DOC] Tests the root-mesh bookkeeping helpers (_mesh_resources and DeviceMesh
+    # private methods) on 8 ranks.
     @property
     def world_size(self):
+        # [FUNCTION DOC] HELPER: Test property giving the world size (8).
         return 8
 
     @with_comms
     def test_get_root_mesh(self):
+        # [FUNCTION DOC] Checks get_root_mesh (module helper and mesh method) returns the
+        # original 3D mesh for every 1D and 2D slice.
         mesh_3d = init_device_mesh(
             self.device_type,
             (2, 2, 2),
@@ -1196,6 +1358,8 @@ class TestMeshEnv(DTensorTestBase):
 
     @with_comms
     def test_get_root_mesh_dim_exist(self):
+        # [FUNCTION DOC] Checks _get_root_mesh_dim returns the dim index of a sliced mesh in the
+        # root mesh.
         mesh_shape = (2, self.world_size // 2)
         mesh_dim_names = ("DP", "TP")
         mesh_2d = init_device_mesh(
@@ -1207,6 +1371,7 @@ class TestMeshEnv(DTensorTestBase):
 
     @with_comms
     def test_get_root_mesh_dim_not_exist(self):
+        # [FUNCTION DOC] Checks _get_root_mesh_dim returns None for a root mesh.
         mesh_shape = (self.world_size,)
         mesh = init_device_mesh(self.device_type, mesh_shape)
 
@@ -1214,6 +1379,7 @@ class TestMeshEnv(DTensorTestBase):
 
     @with_comms
     def test_get_mesh_dim_by_name(self):
+        # [FUNCTION DOC] Checks _get_mesh_dim_by_name maps names to dim indices.
         mesh_shape = (2, self.world_size // 2)
         mesh_dim_names = ("DP", "TP")
         mesh_2d = init_device_mesh(
@@ -1225,6 +1391,8 @@ class TestMeshEnv(DTensorTestBase):
 
     @with_comms
     def test_get_all_submeshes(self):
+        # [FUNCTION DOC] Checks _get_all_submeshes on the replicate dim gives 4 meshes of 2
+        # ranks each.
         mesh_2d = init_device_mesh(
             self.device_type,
             (2, 4),
@@ -1238,6 +1406,8 @@ class TestMeshEnv(DTensorTestBase):
 
     @with_comms
     def test_mesh_slice_fake_tensor_mode(self):
+        # [FUNCTION DOC] Checks slicing by one name and by two names works under FakeTensorMode (no
+        # assertion).
         mesh_shape = (2, self.world_size // 2)
         mesh_dim_names = ("DP", "TP")
         mesh_2d = init_device_mesh(
@@ -1251,12 +1421,17 @@ class TestMeshEnv(DTensorTestBase):
 
 
 class DeviceMeshCollectiveTest(DTensorTestBase):
+    # [CLASS DOC] Tests mesh collectives (broadcast, scatter, all-gather, reduce-scatter) and
+    # torchcomms process group APIs on 8 ranks.
     @property
     def world_size(self):
+        # [FUNCTION DOC] HELPER: Test property giving the world size (8).
         return 8
 
     @with_comms
     def test_broadcast_1d(self):
+        # [FUNCTION DOC] Checks mesh_broadcast on a 1D mesh makes every rank hold rank 0's
+        # tensor in place.
         mesh = DeviceMesh(self.device_type, torch.arange(self.world_size))
         local_tensor = torch.ones(3, 3, device=self.device_type) * self.rank
         mesh_broadcast(local_tensor, mesh, mesh_dim=0)
@@ -1264,6 +1439,8 @@ class DeviceMeshCollectiveTest(DTensorTestBase):
 
     @with_comms
     def test_scatter_1d(self):
+        # [FUNCTION DOC] Checks mesh_scatter on a 1D mesh along each tensor dim, with padded
+        # contiguous chunks from Shard splitting, delivers each rank its own chunk.
         mesh = DeviceMesh(self.device_type, torch.arange(self.world_size))
         scatter_tensor_shape = [3, 3, 3]
         for scatter_dim in range(len(scatter_tensor_shape)):
@@ -1282,6 +1459,9 @@ class DeviceMeshCollectiveTest(DTensorTestBase):
 
     @with_comms
     def test_scatter_uneven(self):
+        # [FUNCTION DOC] Checks mesh_scatter with a tensor not divisible by world size: scatters
+        # padded chunks, removes padding, and compares with the chunk list (padding with empty
+        # tensors).
         device_mesh = DeviceMesh(self.device_type, list(range(self.world_size)))
         my_rank = device_mesh.get_rank()
         tensor_to_split = torch.randn(
@@ -1327,6 +1507,8 @@ class DeviceMeshCollectiveTest(DTensorTestBase):
 
     @with_comms
     def test_all_gather_uneven(self):
+        # [FUNCTION DOC] Checks all-gather of padded uneven shards, removing the padding per
+        # chunk, rebuilds the original tensor along every dim.
         device_mesh = DeviceMesh(self.device_type, list(range(self.world_size)))
         my_rank = device_mesh.get_rank()
         tensor_to_split = torch.ones(
@@ -1365,6 +1547,9 @@ class DeviceMeshCollectiveTest(DTensorTestBase):
 
     @with_comms
     def test_reduce_scatter_contiguous(self):
+        # [FUNCTION DOC] Checks a Partial to Shard(0) redistribution (reduce-scatter) gives
+        # equal results for a non-contiguous slice and its contiguous copy, with the expected
+        # shape and summed values.
         device_mesh = DeviceMesh(self.device_type, list(range(self.world_size)))
         my_rank = device_mesh.get_rank()
 
@@ -1407,6 +1592,8 @@ class DeviceMeshCollectiveTest(DTensorTestBase):
 
     @with_comms
     def test_reduce_scatter_uneven(self):
+        # [FUNCTION DOC] Checks reduce_scatter_single of padded uneven chunks, after removing
+        # padding, gives the expected sum of ranks and the same shapes as torch.chunk.
         device_mesh = DeviceMesh(self.device_type, list(range(self.world_size)))
         my_rank = device_mesh.get_rank()
         tensor_to_split = (
@@ -1469,6 +1656,8 @@ class DeviceMeshCollectiveTest(DTensorTestBase):
 
     @with_comms
     def test_broadcast_nd(self):
+        # [FUNCTION DOC] Checks mesh_broadcast along each dim of a 2x2x2 mesh yields the value
+        # of the first rank in that dim's group.
         mesh_tensor = torch.arange(8).reshape(2, 2, 2)
         mesh = DeviceMesh(self.device_type, mesh_tensor)
         local_tensor = torch.ones(3, 3, device=self.device_type) * self.rank
@@ -1487,6 +1676,8 @@ class DeviceMeshCollectiveTest(DTensorTestBase):
 
     @with_comms
     def test_scatter_nd(self):
+        # [FUNCTION DOC] Checks mesh_scatter along each dim of a 2x2x2 mesh delivers to each
+        # rank the tensor holding its own rank number.
         mesh_tensor = torch.arange(8).reshape(2, 2, 2)
         mesh = DeviceMesh(self.device_type, mesh_tensor)
 
@@ -1512,6 +1703,9 @@ class DeviceMeshCollectiveTest(DTensorTestBase):
     @_with_torchcomm_env
     @with_comms(backend="cpu:gloo,cuda:nccl")
     def test_pg_api_w_torchcomms(self) -> None:
+        # [FUNCTION DOC] Needs torchcomms (skipped otherwise). Creates a hybrid cpu gloo and
+        # cuda nccl group and checks all_reduce for CPU and device tensors, a no-op split, and a
+        # real split into two sub-groups, each dispatching by tensor device.
         ranks = list(range(self.world_size))
         pg = new_group(
             backend="cpu:gloo,cuda:nccl",
@@ -1566,6 +1760,9 @@ class DeviceMeshCollectiveTest(DTensorTestBase):
     @_with_torchcomm_env
     @with_comms(backend="nccl")
     def test_pg_api_w_torchcomms_nccl(self) -> None:
+        # [FUNCTION DOC] Needs torchcomms. With an nccl group, checks all_reduce, a no-op split,
+        # a split of the group by rank lists, and a direct split_group call whose comm is
+        # manually appended to the world's comm list for finalization.
         ranks = list(range(self.world_size))
         pg = new_group(
             backend="nccl",
@@ -1615,6 +1812,10 @@ class DeviceMeshCollectiveTest(DTensorTestBase):
     @_with_torchcomm_env
     @with_comms(eager_init=True, backend="cpu:gloo,cuda:nccl")
     def test_split_group_backend_filter_w_torchcomms(self) -> None:
+        # [FUNCTION DOC] Needs torchcomms and eager init. Splits a hybrid parent keeping only
+        # the cuda nccl backend and checks the stored backend config and all_reduce result;
+        # checks ValueError for a mismatched backend name and for a device type absent from the
+        # parent.
         # Hybrid parent (cpu:gloo + cuda:nccl); request only cuda:nccl in the
         # child via the `backend` arg. eager_init=True binds device_id=cuda so
         # nccl is the parent's default backend, satisfying the C++ check that
@@ -1649,6 +1850,8 @@ class DeviceMeshCollectiveTest(DTensorTestBase):
     @_with_torchcomm_env
     @with_comms(backend="cpu:gloo,cuda:nccl")
     def test_device_mesh_w_torchcomms(self) -> None:
+        # [FUNCTION DOC] Needs torchcomms. Builds a pp/dp/tp mesh, checks the dp local rank, an
+        # all_reduce over the pp group and over the flattened mesh group, against expected sums.
         mesh_shape = (2, 2, self.world_size // 4)
         mesh_3d = init_device_mesh(
             self.device_type,
@@ -1679,6 +1882,9 @@ class DeviceMeshCollectiveTest(DTensorTestBase):
     @_with_torchcomm_env
     @with_comms(backend="cpu:gloo,cuda:nccl")
     def test_fake_backend_pg_names_w_torchcomms(self) -> None:
+        # [FUNCTION DOC] Needs torchcomms. Unflattens a world mesh with one fake-backend dim and
+        # checks that the fake dim's group name is hash-based and not an all-digit integer
+        # string.
         """Fake-backend PG names must be hash-based when torchcomms is enabled.
 
         When torchcomms is enabled, split_group produces hash-based PG names
@@ -1706,7 +1912,10 @@ class DeviceMeshCollectiveTest(DTensorTestBase):
 
 
 class CuTeLayoutTest(TestCase):
+    # [CLASS DOC] Single-process tests of _FlatLayout and _MeshLayout: coalescing, flattening,
+    # complement, composition, orthogonality check and remapping onto rank tensors.
     def test_coalesce(self):
+        # [FUNCTION DOC] Checks _FlatLayout merges contiguous (size, stride) pairs into one pair.
         # ((3,2),(2,1)) -> (6,1)
         l = _FlatLayout((3, 2), (2, 1))
         self.assertEqual(list(l.sizes_and_strides), [(6, 1)])
@@ -1716,11 +1925,13 @@ class CuTeLayoutTest(TestCase):
         self.assertEqual(list(l.sizes_and_strides), [(24, 1)])
 
     def test_coalesce_non_coalescible(self):
+        # [FUNCTION DOC] Checks _FlatLayout keeps pairs separate when the stride does not match.
         # ((3,4),(2,1)) stays as-is (4 ≠ 2*1)
         l = _FlatLayout((3, 2), (4, 1))
         self.assertEqual(list(l.sizes_and_strides), [(3, 4), (2, 1)])
 
     def test_coalesce_singleton_dims(self):
+        # [FUNCTION DOC] Checks size-one dims are dropped when coalescing, up to an empty result.
         # Dimensions with size=1 are removed, even if it's all of them
         l = _FlatLayout((1, 3, 1, 5, 1), (0, 10, 17, 2, 1))
         self.assertEqual(list(l.sizes_and_strides), [(15, 2)])
@@ -1729,6 +1940,8 @@ class CuTeLayoutTest(TestCase):
         self.assertEqual(list(l.sizes_and_strides), [])
 
     def test_flatten(self):
+        # [FUNCTION DOC] Checks nested size and stride tuples are flattened and then coalesced
+        # when possible.
         l = _FlatLayout(((7, (5, 3)), 2), ((900, (36, 4)), 1))
         self.assertEqual(list(l.sizes_and_strides), [(7, 900), (5, 36), (3, 4), (2, 1)])
 
@@ -1736,11 +1949,15 @@ class CuTeLayoutTest(TestCase):
         self.assertEqual(list(l.sizes_and_strides), [(7 * 5 * 3 * 2, 1)])
 
     def test_optional_strides(self):
+        # [FUNCTION DOC] Checks omitting strides defaults to contiguous strides, which coalesce
+        # into one pair.
         l = _FlatLayout((7, 5, 3, 2))
         # Strides default to suffix_product, which means they're coalescible
         self.assertEqual(list(l.sizes_and_strides), [(7 * 5 * 3 * 2, 1)])
 
     def test_mismatch_sizes_strides(self):
+        # [FUNCTION DOC] Checks _FlatLayout raises ValueError when the sizes and strides
+        # structures differ.
         with self.assertRaisesRegex(ValueError, "sizes .* and strides .* don't match"):
             _FlatLayout(42, (1,))
 
@@ -1754,6 +1971,9 @@ class CuTeLayoutTest(TestCase):
             _FlatLayout((5, (3, 2)), ((5, 3), 2))
 
     def test_complement_n_group_layout(self):
+        # [FUNCTION DOC] Checks complement, all_ranks_from_zero and global_ranks for several
+        # layouts and world sizes (8 and 16), including a layout whose strides are not in
+        # decreasing order.
         # complement((4,2), 8) = (2,1); together form (8,1)
         pg_layout = _FlatLayout(
             (4,),
@@ -1871,6 +2091,8 @@ class CuTeLayoutTest(TestCase):
         )
 
     def test_composition(self):
+        # [FUNCTION DOC] Checks composition of a layout with another layout, including one that
+        # yields two layouts, and that an incompatible right layout raises AssertionError.
         # self = ((4,2), (2,1)), l = (2,1)  → self o l = (2,1)
         orig_l = _FlatLayout((4, 2), (2, 1))
         right_l = _MeshLayout.from_sizes_strides((2,), (1,))
@@ -1935,6 +2157,9 @@ class CuTeLayoutTest(TestCase):
             orig_l.composition(right_l)
 
     def test_check_orthogonal(self):
+        # [FUNCTION DOC] Checks check_orthogonal returns True for non-overlapping layouts
+        # (including nested and reordered ones) and False for overlapping or incomparable
+        # strides.
         """Test the check_orthogonal method for various layout configurations."""
         # Test 1: Valid layout - no overlap
         # sizes=(2,3), strides=(6,1) - stride 6 > span 3, so no overlap
@@ -1978,6 +2203,8 @@ class CuTeLayoutTest(TestCase):
         self.assertTrue(layout9.check_orthogonal())
 
     def test_remap_to_tensor(self):
+        # [FUNCTION DOC] Checks remap_to_tensor maps a layout over an original rank tensor to a
+        # tensor of actual ranks, for contiguous, shifted, column-major and uneven rank values.
         """Test the remap_to_tensor method for various scenarios."""
         # Test 1: Consecutive ranks, full world - should return logical groups directly
         original_mesh = torch.tensor([0, 1, 2, 3], dtype=torch.int)
@@ -2023,9 +2250,13 @@ class CuTeLayoutTest(TestCase):
 
 
 class ProcessGroupOpaqueTypeTest(TestCase):
+    # [CLASS DOC] Tests that the ProcessGroup members registered for the opaque type exist on
+    # the class.
     """Test that ProcessGroup opaque type members are registered and exist on the class."""
 
     def test_registered_members_exist_on_process_group(self):
+        # [FUNCTION DOC] Checks each registered member name has a member type registered for
+        # ProcessGroup and is an attribute of the ProcessGroup class.
         from torch._library.opaque_object import get_member_type
 
         # Every member registered in _register_process_group_opaque_type()
