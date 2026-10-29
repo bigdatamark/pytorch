@@ -1,4 +1,9 @@
 # Owner(s): ["oncall: distributed checkpointing"]
+# [MODULE DOC]
+# Single-process unit tests for QuantizedHuggingFaceStorageReader, which dequantizes
+# weights on load by multiplying with per-block inverse scales. Tests drive its private
+# _process_read_request with mocked safetensors files and planners: scale in the same or a
+# different file, and a sliced read that straddles quantization blocks.
 
 import tempfile
 from unittest.mock import MagicMock, patch
@@ -14,17 +19,29 @@ from torch.testing._internal.common_utils import run_tests, TestCase
 
 
 class TestQuantizedHfStorage(TestCase):
+    # [CLASS DOC] Test case holding a temporary directory (temp_dir, path) that serves as
+    # the checkpoint location for the reader under test; created per test, cleaned after.
     def setUp(self):
+        # [FUNCTION DOC] Runs the base setup and creates a temporary directory, storing the
+        # object as temp_dir and its path as path.
         super().setUp()
         """Set up common test fixtures."""
         self.temp_dir = tempfile.TemporaryDirectory()
         self.path = self.temp_dir.name
 
     def tearDown(self):
+        # [FUNCTION DOC] Deletes the temporary directory. KNOWN ISSUE: does not call the
+        # base class tearDown.
         """Clean up test fixtures."""
         self.temp_dir.cleanup()
 
     def test_dequantization(self):
+        # [FUNCTION DOC] Configures a reader (one thread) with a weight-to-scale mapping,
+        # file map and full shapes for two 4x4 weights (all ones scaled to 1s and 3s) whose
+        # inverse scales are 2.0 and 0.5. Case 1: weight and scale in one mocked file; the
+        # planner must commit a tensor of 2.0. Case 2: scale in another file, opened through
+        # a patched safetensors safe_open at the expected path; the committed tensor is 1.5
+        # and the scale is fetched by name exactly once.
         """Test quantized tensors with weights and scales in both same and different files."""
         reader = QuantizedHuggingFaceStorageReader(self.path, thread_count=1)
 
@@ -70,6 +87,9 @@ class TestQuantizedHfStorage(TestCase):
 
         # Mock get_slice to return different tensors based on tensor name
         def mock_get_slice(tensor_name):
+            # [FUNCTION DOC] HELPER: fake get_slice; returns a mock whose indexing yields the
+            # first or second quantized tensor depending on the weight name (any other name
+            # gives a mock with default indexing).
             mock_tensor = MagicMock()
             if tensor_name == weight1_fqn:
                 mock_tensor.__getitem__ = lambda _, _slice: quantized_tensor1
@@ -171,6 +191,10 @@ class TestQuantizedHfStorage(TestCase):
         torch.testing.assert_close(committed_tensor2, expected_result2)
 
     def test_dtensor_slice_dequantization_block_alignment(self):
+        # [FUNCTION DOC] Uses block size 4 on a full 8x8 weight with a 2x2 grid of inverse
+        # scales (1,2,3,4). Reads a 4x4 slice starting at row 2, column 1, so it crosses all
+        # four blocks, from a mocked file whose slice is all 2.0. Asserts the committed
+        # tensor is 2.0 times each covered block's scale, in the matching sub-regions.
         """Test DTensor slice dequantization with proper block alignment logic."""
         reader = QuantizedHuggingFaceStorageReader(
             self.path,

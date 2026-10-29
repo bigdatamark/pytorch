@@ -1,4 +1,11 @@
 # Owner(s): ["oncall: distributed checkpointing"]
+# [MODULE DOC]
+# Single-process unit tests for the HuggingFace safetensors checkpoint storage classes
+# HuggingFaceStorageWriter and HuggingFaceStorageReader: writing tensor data to
+# safetensors files (indexed and sharded naming), reading tensor data back, writing the
+# index metadata json, and reading metadata from safetensors files. The safetensors and
+# huggingface_hub packages are replaced with mocks by assigning into the module table;
+# the tests never restore those entries, so mocks leak to later tests in the process.
 
 import json
 import os
@@ -39,7 +46,13 @@ from torch.testing._internal.common_utils import run_tests, TestCase
 
 
 class TestHfStorage(TestCase):
+    # [CLASS DOC] Test case for the HuggingFace storage reader/writer using temporary
+    # directories, MagicMock stand-ins for safetensors, and hand-built plans and planners.
     def test_write_data_hf(self) -> None:
+        # [FUNCTION DOC] Mocks safetensors.torch save, builds a writer with an explicit
+        # mapping of tensor names to file indices (1 and 2), and calls write_data with a
+        # save plan of two tensors. Asserts the write results carry the tensor byte sizes
+        # and go to model-00001-of-00002 and model-00002-of-00002 safetensors files.
         mock_module = MagicMock()
         mock_module.save.return_value = b""
         sys.modules["safetensors.torch"] = mock_module
@@ -101,6 +114,9 @@ class TestHfStorage(TestCase):
             )
 
     def test_write_data_with_sharding(self) -> None:
+        # [FUNCTION DOC] Same as the write test but the writer uses distributed saving and
+        # the plan's storage data holds shard_index 1: asserts both tensors are written to
+        # the single file shard-00001-model-00001-of-00001.safetensors with byte sizes.
         mock_module = MagicMock()
         mock_module.save.return_value = b""
         sys.modules["safetensors.torch"] = mock_module
@@ -162,6 +178,11 @@ class TestHfStorage(TestCase):
             )
 
     def test_read_data_hf(self) -> None:
+        # [FUNCTION DOC] Mocks safetensors safe_open so get_slice returns a known tensor,
+        # writes a real safetensors-style file (header length, json header, raw bytes),
+        # registers its storage info on the reader, then runs read_data with a one-item load
+        # plan into a zero tensor. Asserts the target now equals the source tensor and that
+        # safe_open was called once with the file path and the pt framework.
         tensor_0 = torch.tensor([1.0, 2.0, 3.0, 4.0])
 
         mock_safe_open = MagicMock()
@@ -270,6 +291,10 @@ class TestHfStorage(TestCase):
             mock_context.__enter__.return_value.get_slice.assert_called_with("tensor_0")
 
     def test_write_metadata_hf(self) -> None:
+        # [FUNCTION DOC] Mocks huggingface_hub, calls the writer's finish with two write
+        # results (100 bytes each, same file), then reads the metadata index file from the
+        # temp directory and asserts it holds total_size 200 and a weight map from each
+        # tensor name to the file name.
         mock_module = MagicMock()
         sys.modules["huggingface_hub"] = mock_module
         with tempfile.TemporaryDirectory() as path:
@@ -322,6 +347,11 @@ class TestHfStorage(TestCase):
                 self.assertEqual(metadata, expected_metadata)
 
     def test_read_metadata_hf(self):
+        # [FUNCTION DOC] Mocks safetensors so a file exposes one tensor (shape 5x10, float32),
+        # creates an empty file, temporarily replaces the reader's file listing to return it,
+        # and calls read_metadata. Asserts safe_open was called once with that path, and that
+        # the state dict metadata (one chunk covering the full tensor) and the storage data
+        # (storage info with path, shape and dtype) match; the listing is restored afterward.
         mock_safe_open = MagicMock()
         mock_context = MagicMock()
 

@@ -1,4 +1,12 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC]
+# Tests for PGTransport, the process-group based checkpoint transport used to send and
+# receive state dicts between ranks, and its helpers _cast_tensor, _prepare_tensor and
+# _prepare_state_dict. Contains: multi-process ring exchange tests on CPU (gloo, 8 ranks)
+# and accelerators (2 ranks) over plain tensors, DTensor/mixed content and ShardedTensor;
+# single-process tests of the helpers; and mocked-process-group tests of send/recv call
+# counts. Import-time side effects: defines module-level device_type (current accelerator
+# type or cpu) and a logger.
 
 import logging
 import unittest
@@ -45,6 +53,11 @@ logger = logging.getLogger(__name__)
 def _create_sharded_tensor_state_dict(
     rank: int, world_size: int, device: torch.device
 ) -> dict:
+    # [FUNCTION DOC] HELPER: builds a state dict with two entries: "sharded_tensor", a
+    # ShardedTensor with a global 64x8 shape of which this rank holds one row block (64
+    # divided by world_size rows, values counting up from the block start), and
+    # "rank_scalar", a scalar tensor holding the rank. Tensors are created on the device.
+    # Assumes 64 divides evenly by world_size.
     """
     Create state_dict with ShardedTensor for deterministic testing.
     Args:
@@ -88,7 +101,11 @@ def _create_sharded_tensor_state_dict(
 
 
 class SimpleModel(nn.Module):
+    # [CLASS DOC] HELPER: two linear layers (10 -> 10) with a ReLU between, deterministic
+    # initialization via a seed; its state dict is the payload for transport tests.
     def __init__(self, seed: int = 42):
+        # [FUNCTION DOC] HELPER: seeds the global random generator with seed (side effect)
+        # and creates net1, relu and net2.
         super().__init__()
         # Set seed for deterministic initialization
         torch.manual_seed(seed)
@@ -97,12 +114,17 @@ class SimpleModel(nn.Module):
         self.net2 = nn.Linear(10, 10)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: net1, ReLU, then net2 applied to x; returns the output.
         return self.net2(self.relu(self.net1(x)))
 
 
 def ring_send_recv_checkpoint(
     transport: PGTransport, state_dict, rank, world_size, step=0
 ):
+    # [FUNCTION DOC] HELPER: ring exchange. Every rank sends state_dict to the next rank
+    # (wrapping around) and receives the previous rank's state dict, which it returns. Rank
+    # 0 sends first then receives; all other ranks receive first then send, which avoids
+    # deadlock on blocking transfers. The step argument is unused.
     """
     Use the transport to send to rank + 1 and receive from rank - 1.
     Each rank exchanges its own state_dict with the previous rank.
@@ -119,6 +141,10 @@ def ring_send_recv_checkpoint(
 
 
 def _test_pg_transport(self, device) -> None:
+    # [FUNCTION DOC] HELPER: shared test body (self is the test case). Builds a model on
+    # device, ring-exchanges its state dict through a PGTransport on the default group with
+    # a 10 second timeout, and asserts the received dict equals the sent one (all ranks
+    # use the same seed so states are identical).
     model = SimpleModel().to(device)
     transport = PGTransport(_get_default_group(), timedelta(seconds=10), device)
     original_state_dict = model.state_dict()
@@ -132,6 +158,10 @@ def _test_pg_transport(self, device) -> None:
 
 
 def _test_pg_transport_with_mixed_content(self, device) -> None:
+    # [FUNCTION DOC] HELPER: shared test body. Builds a state dict mixing plain tensors, a
+    # DTensor on a 1D device mesh, a string, a nested dict with a tensor and an integer, and
+    # a list of ints; ring-exchanges it with PGTransport and asserts equality with the sent
+    # dict.
     # Create a device mesh for DTensor
     device_mesh = init_device_mesh(device.type, (self.world_size,))
 
@@ -164,6 +194,11 @@ def _test_pg_transport_with_mixed_content(self, device) -> None:
 
 
 def _test_pg_transport_with_sharded_tensor(self, device) -> None:
+    # [FUNCTION DOC] HELPER: shared test body. Sets the current accelerator index for non-cpu
+    # devices, ring-exchanges the sharded tensor state dict, and checks that the received
+    # scalar equals the previous rank's value and the received local shard equals the
+    # previous rank's block. Expected values are on cpu because the transport returns cpu
+    # tensors when no state dict callback is given. Prints the dicts (debug output).
     if device.type != "cpu":
         torch.accelerator.set_device_index(device)
 
@@ -205,42 +240,55 @@ def _test_pg_transport_with_sharded_tensor(self, device) -> None:
 
 
 class PgTransportCPU(MultiProcContinuousTest):
+    # [CLASS DOC] Multi-process test case: 8 ranks, gloo backend, cpu device, 20 second
+    # timeout. Each test delegates to a shared ring-exchange test body.
     world_size = 8
     timeout: timedelta = timedelta(seconds=20)
 
     @classmethod
     def backend_str(cls) -> str | None:
+        # [FUNCTION DOC] Returns the process group backend name, always gloo.
         return "gloo"
 
     @classmethod
     def device_type(cls) -> str:
+        # [FUNCTION DOC] Returns the device type string, always cpu.
         return "cpu"
 
     @property
     def device(self) -> torch.device:
+        # [FUNCTION DOC] Returns the cpu torch device for the tests.
         return torch.device(self.device_type())
 
     def test_pg_transport(self) -> None:
+        # [FUNCTION DOC] Ring exchange of a model state dict on cpu; see shared test body.
         _test_pg_transport(self, self.device)
 
     def test_pg_transport_with_mixed_content(self) -> None:
+        # [FUNCTION DOC] Ring exchange of a state dict with DTensor and non-tensor content on cpu.
         _test_pg_transport_with_mixed_content(self, self.device)
 
     def test_pg_transport_with_sharded_tensor(self) -> None:
+        # [FUNCTION DOC] Ring exchange of a state dict containing a ShardedTensor on cpu.
         _test_pg_transport_with_sharded_tensor(self, self.device)
 
 
 @skip_but_pass_in_sandcastle_if(not at_least_x_gpu(2), "test requires 2+ accelerators")
 class PgTransportGPU(MultiProcContinuousTest):
+    # [CLASS DOC] Multi-process test case: 2 ranks on accelerators using the default backend
+    # for the accelerator, 20 second timeout. Skipped (but passing in sandcastle) when fewer
+    # than 2 accelerators exist. Each rank uses the device whose index equals its rank.
     world_size = 2
     timeout: timedelta = timedelta(seconds=20)
 
     @classmethod
     def backend_str(cls) -> str | None:
+        # [FUNCTION DOC] Returns the default distributed backend for the class's device type.
         return dist.get_default_backend_for_device(cls.device_type())
 
     @property
     def device(self) -> torch.device:
+        # [FUNCTION DOC] Returns the accelerator device indexed by this rank.
         return torch.device(f"{self.device_type()}:{self.rank}")
 
     @requires_accelerator_dist_backend()
@@ -248,6 +296,7 @@ class PgTransportGPU(MultiProcContinuousTest):
         not at_least_x_gpu(2), "test requires 2+ accelerators"
     )
     def test_pg_transport(self) -> None:
+        # [FUNCTION DOC] Ring exchange of a model state dict on accelerators.
         _test_pg_transport(self, self.device)
 
     @requires_accelerator_dist_backend()
@@ -255,6 +304,8 @@ class PgTransportGPU(MultiProcContinuousTest):
         not at_least_x_gpu(2), "test requires 2+ accelerators"
     )
     def test_pg_transport_with_mixed_content(self) -> None:
+        # [FUNCTION DOC] Ring exchange of a state dict with DTensor and non-tensor content on
+        # accelerators.
         _test_pg_transport_with_mixed_content(self, self.device)
 
     @requires_accelerator_dist_backend()
@@ -262,11 +313,17 @@ class PgTransportGPU(MultiProcContinuousTest):
         not at_least_x_gpu(2), "test requires 2+ accelerators"
     )
     def test_pg_transport_with_sharded_tensor(self) -> None:
+        # [FUNCTION DOC] Ring exchange of a state dict containing a ShardedTensor on
+        # accelerators.
         _test_pg_transport_with_sharded_tensor(self, self.device)
 
 
 class TestCastTensor(TestCase):
+    # [CLASS DOC] Single-process tests for _cast_tensor, which reinterprets a tensor's
+    # underlying storage as a flat tensor of another dtype without copying.
     def test_cast_tensor_different_dtypes(self):
+        # [FUNCTION DOC] For several source dtypes, casts to uint8 and asserts the result
+        # shares the same untyped storage object and has one element per storage byte.
         """Test casting tensors of different dtypes."""
         dtypes = [torch.float32, torch.float64, torch.int32, torch.int64, torch.bool]
 
@@ -281,6 +338,8 @@ class TestCastTensor(TestCase):
             self.assertEqual(casted.numel(), original.untyped_storage().nbytes())
 
     def test_cast_tensor_with_stride(self):
+        # [FUNCTION DOC] Casts a transposed (non-contiguous) tensor to uint8 and asserts the
+        # same storage is shared and the element count equals the storage byte size.
         """Test casting tensors with non-standard strides."""
         # Create a tensor with non-standard stride
         original = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=torch.float32)
@@ -295,6 +354,8 @@ class TestCastTensor(TestCase):
         self.assertEqual(casted.numel(), transposed.untyped_storage().nbytes())
 
     def test_cast_tensor_with_offset(self):
+        # [FUNCTION DOC] Casts a sliced tensor (nonzero storage offset) to uint8 and asserts
+        # the cast covers the whole underlying storage, not just the slice.
         """Test casting tensors with storage offset."""
         # Create a tensor with storage offset
         original = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0], dtype=torch.float32)
@@ -310,7 +371,12 @@ class TestCastTensor(TestCase):
 
 
 class TestPrepareTensor(TestCase):
+    # [CLASS DOC] Single-process tests for _prepare_tensor, which returns a uint8 view of
+    # a tensor's storage plus a _TensorMeta (shape, dtype, storage offset, stride, nbytes).
     def test_prepare_tensor_basic(self):
+        # [FUNCTION DOC] Prepares a small float tensor; asserts every metadata field matches
+        # the tensor (nbytes is the storage size) and the prepared tensor is uint8 with one
+        # element per storage byte.
         """Test basic tensor preparation."""
         tensor = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32)
         prepared_tensor, meta = _prepare_tensor(tensor)
@@ -327,6 +393,7 @@ class TestPrepareTensor(TestCase):
         self.assertEqual(prepared_tensor.numel(), tensor.untyped_storage().nbytes())
 
     def test_prepare_tensor_different_shapes(self):
+        # [FUNCTION DOC] Repeats the metadata checks for 1D, 2D and 3D random tensors.
         """Test preparing tensors with different shapes."""
         shapes = [(3,), (2, 3), (2, 3, 4)]
 
@@ -342,6 +409,8 @@ class TestPrepareTensor(TestCase):
             self.assertEqual(meta.nbytes, tensor.untyped_storage().nbytes())
 
     def test_prepare_tensor_with_stride(self):
+        # [FUNCTION DOC] Prepares a transposed tensor and asserts the metadata records its
+        # non-standard stride along with shape, dtype, offset and storage byte size.
         """Test preparing tensors with non-standard strides."""
         tensor = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=torch.float32)
         transposed = tensor.t()  # Transpose to get non-standard stride
@@ -357,7 +426,12 @@ class TestPrepareTensor(TestCase):
 
 
 class TestPrepareStateDict(TestCase):
+    # [CLASS DOC] Single-process tests for _prepare_state_dict, which flattens a state dict
+    # into a _StateDictMeta (tree spec, key paths, per-leaf metadata or raw non-tensor value)
+    # and a list of prepared tensors.
     def test_prepare_state_dict_basic(self):
+        # [FUNCTION DOC] Two-tensor dict on cpu: asserts two paths, two leaves, two prepared
+        # tensors, and that every leaf is a _TensorMeta.
         """Test basic state dict preparation."""
         state_dict = {"weight": torch.randn(3, 4), "bias": torch.randn(4)}
         device = torch.device("cpu")
@@ -374,6 +448,8 @@ class TestPrepareStateDict(TestCase):
             self.assertIsInstance(leaf, _TensorMeta)
 
     def test_prepare_state_dict_nested(self):
+        # [FUNCTION DOC] Two nested dicts of two tensors each: asserts four paths, four leaves
+        # and four prepared tensors, i.e. nesting is flattened.
         """Test preparing nested state dict."""
         state_dict = {
             "layer1": {"weight": torch.randn(3, 4), "bias": torch.randn(4)},
@@ -389,6 +465,9 @@ class TestPrepareStateDict(TestCase):
         self.assertEqual(len(tensors), 4)
 
     def test_prepare_state_dict_with_non_tensor_values(self):
+        # [FUNCTION DOC] Dict with two tensors, a nested config dict of two floats and an
+        # int: asserts leaves and paths have equal counts, only two tensors are prepared, and
+        # the three non-tensor values are kept as plain (non-_TensorMeta) leaves.
         """Test preparing state dict with non-tensor values."""
         state_dict = {
             "weight": torch.randn(3, 4),
@@ -413,7 +492,12 @@ class TestPrepareStateDict(TestCase):
 
 
 class TestPGTransportMocked(TestCase):
+    # [CLASS DOC] Single-process tests of PGTransport using a mock process group whose send
+    # and recv return a mock work handle. State: cpu device, 10 second timeout, pg, and
+    # mock_work (records wait calls).
     def setUp(self):
+        # [FUNCTION DOC] Creates the cpu device, mock process group, timeout and mock work
+        # handle; wires pg send and recv to return the work handle.
         super().setUp()
         self.device = torch.device("cpu")
         self.pg = MagicMock()
@@ -428,6 +512,9 @@ class TestPGTransportMocked(TestCase):
         self.pg.recv = MagicMock(return_value=self.mock_work)
 
     def test_send_checkpoint_basic(self):
+        # [FUNCTION DOC] Sends a two-tensor state dict to two destination ranks; asserts the
+        # process group send count and the work wait count both equal, per destination, one
+        # metadata length send, one metadata send and one send per tensor.
         """Test basic send_checkpoint functionality with mocked process group."""
         transport = PGTransport(self.pg, self.timeout, self.device)
         state_dict = {"weight": torch.randn(3, 4), "bias": torch.randn(4)}
@@ -444,6 +531,10 @@ class TestPGTransportMocked(TestCase):
         self.assertEqual(self.mock_work.wait.call_count, expected_calls)
 
     def test_recv_checkpoint_basic(self):
+        # [FUNCTION DOC] Patches pickle loading to return a prebuilt _StateDictMeta for a
+        # two-tensor dict, and makes the mock recv fill the single-element length buffer with
+        # 100. Calls recv_checkpoint from rank 0 and asserts at least two recv calls (length
+        # and metadata buffer) and at least two work waits.
         """Test basic recv_checkpoint functionality with mocked process group."""
         # Setup mock for pickle.loads to return a valid _StateDictMeta
         with patch("pickle.loads") as mock_loads:
@@ -474,6 +565,8 @@ class TestPGTransportMocked(TestCase):
 
             # Setup len_t and buf tensors for the mock recv
             def side_effect(tensor_list, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: fake recv; if the first buffer has one element
+                # (the length buffer) fills it with 100 in place; returns the mock work.
                 if tensor_list[0].numel() == 1:  # This is len_t
                     tensor_list[0].fill_(100)  # Some arbitrary length
                 return self.mock_work
@@ -493,6 +586,8 @@ class TestPGTransportMocked(TestCase):
             self.assertGreaterEqual(self.mock_work.wait.call_count, 2)
 
     def test_send_checkpoint_empty_state_dict(self):
+        # [FUNCTION DOC] Sends an empty state dict to one rank; asserts only the two metadata
+        # sends happen (length and metadata buffer), each waited on once.
         """Test send_checkpoint with empty state dict."""
         transport = PGTransport(self.pg, self.timeout, self.device)
         state_dict = {}
@@ -507,6 +602,9 @@ class TestPGTransportMocked(TestCase):
         self.assertEqual(self.mock_work.wait.call_count, 2)
 
     def test_send_checkpoint_with_non_tensor_values(self):
+        # [FUNCTION DOC] Sends a dict with one tensor and a nested non-tensor config to one
+        # rank; asserts three sends and three waits (two metadata, one tensor), i.e. non-tensor
+        # values travel inside the metadata only.
         """Test send_checkpoint with non-tensor values in state dict."""
         transport = PGTransport(self.pg, self.timeout, self.device)
         state_dict = {"weight": torch.randn(3, 4), "config": {"lr": 0.01}}
@@ -521,6 +619,9 @@ class TestPGTransportMocked(TestCase):
         self.assertEqual(self.mock_work.wait.call_count, 3)
 
     def test_recv_checkpoint_with_state_dict_callback(self):
+        # [FUNCTION DOC] Same mocked receive setup as the basic recv test, but the transport
+        # is built with a state dict callback returning destination tensors; asserts the
+        # callback is called exactly once during recv_checkpoint.
         """Test recv_checkpoint with state_dict callback."""
         # Setup mock for pickle.loads to return a valid _StateDictMeta
         with patch("pickle.loads") as mock_loads:
@@ -551,6 +652,8 @@ class TestPGTransportMocked(TestCase):
 
             # Setup len_t and buf tensors for the mock recv
             def side_effect(tensor_list, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: fake recv; if the first buffer has one element
+                # (the length buffer) fills it with 100 in place; returns the mock work.
                 if tensor_list[0].numel() == 1:  # This is len_t
                     tensor_list[0].fill_(100)  # Some arbitrary length
                 return self.mock_work
@@ -572,7 +675,11 @@ class TestPGTransportMocked(TestCase):
 
 
 class TestPGTransportEdgeCases(TestCase):
+    # [CLASS DOC] Single-process edge case tests of PGTransport with a mock process group;
+    # same fixture state as the mocked test case (device, pg, timeout, mock_work).
     def setUp(self):
+        # [FUNCTION DOC] Creates the cpu device, mock process group, timeout and mock work
+        # handle; wires pg send and recv to return the work handle.
         super().setUp()
         self.device = torch.device("cpu")
         self.pg = MagicMock()
@@ -588,6 +695,9 @@ class TestPGTransportEdgeCases(TestCase):
 
     @unittest.skipIf(not HAS_ACCELERATOR, "No accelerator")
     def test_send_checkpoint_with_cpu_tensors(self):
+        # [FUNCTION DOC] Only runs when an accelerator exists. Builds a transport targeting
+        # accelerator device 0 and sends a state dict of two cpu tensors; asserts at least four
+        # sends and four waits (two metadata, two tensors).
         """Test send_checkpoint with CPU tensors when device is accelerator."""
         device = torch.device(f"{device_type}:0")
 

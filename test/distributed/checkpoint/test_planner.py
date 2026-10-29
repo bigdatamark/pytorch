@@ -1,4 +1,12 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC]
+# Tests for the distributed checkpoint planners and plan helpers: default local/global save
+# plans, plan deduplication, save plan caching in SavePlanner class-level caches, load plans
+# including resharding across different world sizes, read item creation from chunk lists,
+# merging delta plans, global plan validation, strict/partial loading in DefaultLoadPlanner,
+# and a multi-process save/load of a CheckpointableTensor. Exits the whole process at import
+# if running under dev-asan (multiprocessing spawn is unsupported there). Provides the helper
+# create_sharded_tensor used to build one-dimensional ShardedTensors without real comms.
 
 import sys
 from unittest.mock import patch
@@ -73,6 +81,11 @@ if TEST_WITH_DEV_DBG_ASAN:
 
 
 def create_sharded_tensor(rank, world_size, shards_per_rank, shard_size=8):
+    # [FUNCTION DOC] HELPER: builds a 1D ShardedTensor of shards_per_rank times world_size
+    # shards, each shard_size elements, placed consecutively (shard i owned by rank i divided
+    # by shards_per_rank, on cpu). Only the shards owned by the given rank get real random
+    # local data; metadata describes all shards. Returns the ShardedTensor assembled from the
+    # local shards and global metadata (no communication performed).
     shards_metadata = []
     local_shards = []
     for idx in range(world_size * shards_per_rank):
@@ -103,17 +116,27 @@ def create_sharded_tensor(rank, world_size, shards_per_rank, shard_size=8):
 
 
 class TestCheckpointableTensorDistributed(DTensorTestBase):
+    # [CLASS DOC] Multi-process test case (4 ranks, cpu) for saving and loading plain tensors
+    # that carry checkpointable-tensor attributes (global shape and offsets, local offsets and
+    # sizes) through the default planners.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] Returns the number of test processes, fixed at 4.
         return 4
 
     @property
     def device_type(self) -> str:
+        # [FUNCTION DOC] Returns the device type for the test, always cpu.
         return "cpu"
 
     @with_comms
     @with_temp_dir
     def test_checkpointable_tensor_shard_save_load(self):
+        # [FUNCTION DOC] Each rank annotates a small float tensor as a shard of a global 1D
+        # tensor, saves it with dcp.save, and the checkpoint metadata is checked: one tensor
+        # entry of full size with one chunk per rank. Then a meta-device target with the same
+        # annotations is loaded in place by dcp.load; asserts the result is a real cpu tensor
+        # with the expected shape attributes and values equal to what was saved.
         shard_size = 4
         rank = dist.get_rank()
         start = rank * shard_size
@@ -166,8 +189,16 @@ class TestCheckpointableTensorDistributed(DTensorTestBase):
 
 
 class TestSavePlan(TestCase):
+    # [CLASS DOC] Single-process tests of save and load planning for a state dict containing
+    # a tensor, a Python list and a ShardedTensor; process group state is faked per rank.
+    # Caching tests mutate SavePlanner class-level caches and clean them up at the end.
     @with_fake_comms(rank=1, world_size=4)
     def test_local_plan(self):
+        # [FUNCTION DOC] With rank 1 of 4, builds the default local save plan for the
+        # state dict. Non-coordinator plan has three items; checks the tensor item (tensor
+        # write type, size, properties, full chunk) and the sharded tensor item (shard type,
+        # offset 8, chunk size 8). The coordinator plan also has three items and includes the
+        # tensor item and a byte stream item for the list with no tensor data.
         tensor = torch.rand(10)
         val = [1, 2, 3]
         st = create_sharded_tensor(rank=1, world_size=4, shards_per_rank=1)
@@ -216,6 +247,10 @@ class TestSavePlan(TestCase):
 
     @with_fake_comms(rank=1, world_size=4)
     def test_local_plan_with_caching(self):
+        # [FUNCTION DOC] Uses a save planner with plan caching. The first local plan stays
+        # pending (not in the class-level cache) until finish_plan promotes it; after that the
+        # cache holds an equal plan. A second create_local_plan returns an empty plan marked
+        # unusable with no planner or storage data. Removes the cache entries it created.
         tensor = torch.rand(10)
         val = [1, 2, 3]
         st = create_sharded_tensor(rank=1, world_size=4, shards_per_rank=1)
@@ -248,7 +283,15 @@ class TestSavePlan(TestCase):
         SavePlanner._cached_final_save_plan.pop(key, None)
 
     def test_global_plan(self):
+        # [FUNCTION DOC] Builds local save plans for four simulated ranks, dedups them and
+        # creates the default global plan. Asserts each item keeps its type and tensor data,
+        # the global metadata has an entry (bytes or tensor kind) for each item, tensor
+        # metadata matches size and properties, and the index hint set by the global plan
+        # points to the matching chunk.
         def create_data(rank):
+            # [FUNCTION DOC] HELPER: under a faked process group for the rank (world size 4),
+            # builds a state dict (tensor, list, sharded tensor) and returns its default local
+            # save plan; rank 0 acts as coordinator.
             with with_dist(rank=rank, world_size=4):
                 tensor = torch.rand(10)
                 val = [1, 2, 3]
@@ -285,7 +328,12 @@ class TestSavePlan(TestCase):
                     )
 
     def test_dedup_plans(self):
+        # [FUNCTION DOC] Dedups the four ranks' local plans; asserts the plan count is
+        # unchanged, each deduped plan differs from its original, and has fewer items
+        # (replicated items are kept on one rank only).
         def create_data(rank):
+            # [FUNCTION DOC] HELPER: returns the default local save plan for a simulated rank
+            # of 4 (tensor, list, sharded tensor); rank 0 is coordinator.
             with with_dist(rank=rank, world_size=4):
                 tensor = torch.rand(10)
                 val = [1, 2, 3]
@@ -305,7 +353,18 @@ class TestSavePlan(TestCase):
             self.assertTrue(len(new_plan.items) < len(old_plan.items))
 
     def test_global_plan_with_caching(self):
+        # [FUNCTION DOC] Exercises global plan caching across three iterations with a caching
+        # planner. Iteration one caches the global plan, the input plans and the metadata.
+        # Iteration two with identical plans returns plans that are empty and unusable, with
+        # the same metadata. Iteration three with a changed (larger) tensor returns a usable
+        # nonempty plan for rank 0 only, new metadata, and refreshed caches. Cleans up the
+        # class-level caches at the end.
+        # KNOWN ISSUE: the comment before the second iteration checks says the plans are
+        # "empty and usable" but the assertions require them to be unusable.
         def create_data(rank):
+            # [FUNCTION DOC] HELPER: with a faked group for the rank, sets up a caching save
+            # planner with the standard state dict (tensor of 10 elements) and returns its
+            # local plan; rank 0 is coordinator.
             with with_dist(rank=rank, world_size=4):
                 planner = DefaultSavePlanner(enable_plan_caching=True)
                 tensor = torch.rand(10)
@@ -350,6 +409,8 @@ class TestSavePlan(TestCase):
 
         # Third iteration with changed plans
         def create_data_v2(rank):
+            # [FUNCTION DOC] HELPER: same as create_data but the tensor has 20 elements, so
+            # the plan of the rank that holds the tensor differs from the earlier iterations.
             with with_dist(rank=rank, world_size=4):
                 planner = DefaultSavePlanner(enable_plan_caching=True)
                 tensor = torch.rand(20)
@@ -403,6 +464,9 @@ class TestSavePlan(TestCase):
         SavePlanner._cached_metadata.pop(key, None)
 
     def test_finish_plan_with_caching(self):
+        # [FUNCTION DOC] With a caching planner as coordinator, finish_plan on a real plan
+        # stores the result in the final-plan cache; a second finish_plan call given an
+        # empty unusable plan returns the cached finished plan. Removes cache entries after.
         planner = DefaultSavePlanner(enable_plan_caching=True)
         tensor = torch.rand(10)
         val = [1, 2, 3]
@@ -429,7 +493,14 @@ class TestSavePlan(TestCase):
         SavePlanner._cached_final_save_plan.pop(key, None)
 
     def test_caching_after_validation_failure(self):
+        # [FUNCTION DOC] Regression test: when global plan validation reports errors (patched
+        # to return one message), create_global_plan raises ValueError and must leave the
+        # all-plans, global-plan, metadata and save-plan caches without the planner's key. A
+        # second save with the same planner then succeeds (no KeyError) and fills the caches.
+        # Cleans up the class-level caches at the end.
         def create_data(rank):
+            # [FUNCTION DOC] HELPER: with a faked group for the rank, sets up a caching save
+            # planner and returns its local plan; rank 0 is coordinator.
             with with_dist(rank=rank, world_size=4):
                 planner = DefaultSavePlanner(enable_plan_caching=True)
                 tensor = torch.rand(10)
@@ -485,7 +556,13 @@ class TestSavePlan(TestCase):
         SavePlanner._cached_metadata.pop(key, None)
 
     def test_local_load_plan(self):
+        # [FUNCTION DOC] Creates default local metadata from rank 1's state dict and a local
+        # load plan against it. Asserts three read items: the sharded tensor and the tensor
+        # each copy from the identical storage index into the same destination with offset 0
+        # and full length, and the list becomes a byte stream item.
         def create_state_dict(rank):
+            # [FUNCTION DOC] HELPER: returns the standard state dict (tensor, list, sharded
+            # tensor) built under a faked group for the rank with world size 4.
             with with_dist(rank=rank, world_size=4):
                 tensor = torch.rand(10)
                 val = [1, 2, 3]
@@ -523,7 +600,13 @@ class TestSavePlan(TestCase):
         self.assertEqual(bytes_item.dest_index, MetadataIndex("value"))
 
     def test_load_with_resharding(self):
+        # [FUNCTION DOC] Resharding of a 128 element sharded tensor. Going from 8 ranks to 4,
+        # rank 1's destination shard needs two read items, one from each of two source shards
+        # with lengths 16. Going from 4 ranks to 8, rank 1 needs one read item that takes the
+        # upper half (offset 16, length 16) of a single source shard.
         def create_state_dict(rank, world_size):
+            # [FUNCTION DOC] HELPER: returns a state dict with a 1D sharded tensor of 128
+            # elements split evenly across world_size ranks, built under a faked group.
             with with_dist(rank=rank, world_size=world_size):
                 return {
                     "st": create_sharded_tensor(
@@ -577,7 +660,13 @@ class TestSavePlan(TestCase):
         self.assertEqual(ri.lengths, torch.Size([16]))
 
     def test_load_with_world_size_diff_by_one(self):
+        # [FUNCTION DOC] Loads a 120 element sharded tensor saved with 4 ranks into the
+        # layout for 3 ranks (rank 1). Asserts two read items: one reading from the shard
+        # at 30 with source offset 10 and length 20 into destination offset 0, and one from
+        # the shard at 60 with source offset 0 and length 20 into destination offset 20.
         def create_state_dict(rank, world_size):
+            # [FUNCTION DOC] HELPER: returns a state dict with a 1D sharded tensor of 120
+            # elements split evenly across world_size ranks, built under a faked group.
             with with_dist(rank=rank, world_size=world_size):
                 return {
                     "st": create_sharded_tensor(
@@ -620,7 +709,13 @@ class TestSavePlan(TestCase):
 
 
 class TestPlannerHelpers(TestCase):
+    # [CLASS DOC] Single-process tests for functions in the planner helper module: read item
+    # creation from chunk lists, merging of delta plans, and save plan comparison.
     def test_create_read_item_from_chunks(self):
+        # [FUNCTION DOC] Saved tensor of 16 elements in two chunks of 8; the requested chunk
+        # is offset 4, size 7. Asserts two read items: elements 4..7 from the first chunk
+        # (source offset 4, length 4, destination offset 0) and elements 8..10 from the second
+        # (source offset 0, length 3, destination offset 4), both into the chunk at offset 4.
         tensor_md = TensorStorageMetadata(
             properties=TensorProperties.create_from_tensor(torch.empty([16])),
             size=torch.Size([16]),
@@ -651,7 +746,13 @@ class TestPlannerHelpers(TestCase):
         self.assertEqual(torch.Size([3]), read_items[1].lengths)
 
     def test_merge_delta_local_plans(self):
+        # [FUNCTION DOC] Merging cached per-rank plans with delta plans: where a delta plan is
+        # usable it replaces the cached plan for that rank; where it is an empty unusable plan
+        # the cached plan is kept. Covers both changed, only the first, only the second, and
+        # none changed. Plans are compared by item index, type and tensor data.
         def create_data(rank):
+            # [FUNCTION DOC] HELPER: returns the default local save plan of a simulated rank
+            # of 4 (tensor, list, sharded tensor); rank 0 is coordinator.
             with with_dist(rank=rank, world_size=4):
                 tensor = torch.rand(10)
                 val = [1, 2, 3]
@@ -660,6 +761,8 @@ class TestPlannerHelpers(TestCase):
                 return create_default_local_save_plan(state_dict, rank == 0)
 
         def _validate_plans(plan1: SavePlan, plan2: SavePlan):
+            # [FUNCTION DOC] HELPER: asserts two plans have the same item count and, item by
+            # item, equal index, type and tensor data.
             self.assertEqual(len(plan1.items), len(plan2.items))
             for item1, item2 in zip(plan1.items, plan2.items):
                 self.assertEqual(item1.index, item2.index)
@@ -697,7 +800,11 @@ class TestPlannerHelpers(TestCase):
         _validate_plans(cached_plans[1], merged_plans[1])
 
     def test_compare_save_plans(self):
+        # [FUNCTION DOC] Asserts the plan comparison helper reports plans from different
+        # ranks as not equal and each plan as equal to itself.
         def create_data(rank):
+            # [FUNCTION DOC] HELPER: returns the default local save plan of a simulated rank
+            # of 4 (tensor, list, sharded tensor); rank 0 is coordinator.
             with with_dist(rank=rank, world_size=4):
                 tensor = torch.rand(10)
                 val = [1, 2, 3]
@@ -713,7 +820,11 @@ class TestPlannerHelpers(TestCase):
 
 
 class TestValidateGlobalPlan(TestCase):
+    # [CLASS DOC] Single-process tests for _validate_global_plan, which returns a list of
+    # error messages (empty when the plan is valid) for the given plans and metadata.
     def _make_metadata(self, chunks, size):
+        # [FUNCTION DOC] HELPER: returns Metadata with a single float32 tensor entry named
+        # param, of the given size and chunk list.
         storage = TensorStorageMetadata(
             properties=TensorProperties(dtype=torch.float32),
             size=torch.Size(size),
@@ -722,6 +833,8 @@ class TestValidateGlobalPlan(TestCase):
         return Metadata(state_dict_metadata={"param": storage})
 
     def test_non_overlapping_chunks(self):
+        # [FUNCTION DOC] Four adjacent chunks of one element covering a size 4 tensor yield
+        # no validation errors.
         chunks = [
             ChunkStorageMetadata(offsets=torch.Size([i]), sizes=torch.Size([1]))
             for i in range(4)
@@ -730,6 +843,7 @@ class TestValidateGlobalPlan(TestCase):
         self.assertEqual(_validate_global_plan([SavePlan([])], metadata), [])
 
     def test_detect_overlapping_chunks(self):
+        # [FUNCTION DOC] Two chunks overlapping at index 1 produce at least one error.
         chunks = [
             ChunkStorageMetadata(offsets=torch.Size([0]), sizes=torch.Size([2])),
             ChunkStorageMetadata(offsets=torch.Size([1]), sizes=torch.Size([2])),
@@ -739,8 +853,13 @@ class TestValidateGlobalPlan(TestCase):
 
 
 class TestLoadPlanner(TestCase):
+    # [CLASS DOC] Single-process end-to-end tests of DefaultLoadPlanner behavior using
+    # dcp.save and dcp.load of small linear modules to a temporary directory.
     @with_temp_dir
     def test_strict(self):
+        # [FUNCTION DOC] Saves a linear module, then loads into a module with an extra
+        # parameter: succeeds when partial loading is allowed, and raises CheckpointException
+        # mentioning a missing key in the checkpoint when partial loading is disallowed.
         original_module = nn.Linear(2, 2)
         dcp.save(state_dict={"module": original_module}, checkpoint_id=self.temp_dir)
 
@@ -761,6 +880,8 @@ class TestLoadPlanner(TestCase):
 
     @with_temp_dir
     def test_load_different_sizes_throws(self):
+        # [FUNCTION DOC] Saves a 2x2 linear module and loads into a 3 input linear module;
+        # asserts CheckpointException with a size mismatch message.
         original_module = nn.Linear(2, 2)
         dcp.save(state_dict={"module": original_module}, checkpoint_id=self.temp_dir)
 
@@ -774,6 +895,8 @@ class TestLoadPlanner(TestCase):
 
     @with_temp_dir
     def test_version_key_in_planner_data(self):
+        # [FUNCTION DOC] Saves and loads a linear module with a default load planner and
+        # asserts the planner's checkpoint metadata version equals the current DCP version.
         original_module = nn.Linear(2, 2)
 
         dcp.save(state_dict={"module": original_module}, checkpoint_id=self.temp_dir)

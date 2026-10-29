@@ -1,4 +1,9 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC]
+# Multi-process tests for checkpointing models wrapped with FSDP hybrid sharding (HSDP):
+# save/load round trip on a 2D device mesh, and loading an HSDP checkpoint into a plain
+# FSDP (1D mesh) model. Defines two tiny models (even and uneven layer sizes) and a
+# module-level device_type string (current accelerator, else cpu). Requires 4+ GPUs.
 from copy import deepcopy
 
 import torch
@@ -34,7 +39,10 @@ device_type = acc.type if (acc := torch.accelerator.current_accelerator()) else 
 
 
 class SimpleModel(torch.nn.Module):
+    # [CLASS DOC] HELPER: three-linear-layer model (5 -> 8 -> 4 -> 12) whose sizes shard
+    # evenly; every layer is followed by ReLU in forward.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: creates net1, relu, net2, net3 layers.
         super().__init__()
         self.net1 = nn.Linear(5, 8)
         self.relu = nn.ReLU()
@@ -42,17 +50,22 @@ class SimpleModel(torch.nn.Module):
         self.net3 = nn.Linear(4, 12)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: applies net1, net2, net3, each followed by ReLU; returns result.
         x = F.relu(self.net1(x))
         x = F.relu(self.net2(x))
         x = F.relu(self.net3(x))
         return x
 
     def get_input(self):
+        # [FUNCTION DOC] HELPER: returns a random 4x5 tensor on the module-level device_type.
         return torch.rand(4, 5, device=device_type)
 
 
 class SimpleModelUneven(torch.nn.Module):
+    # [CLASS DOC] HELPER: four-linear-layer model (5 -> 10 -> 15 -> 30 -> 5) with layer sizes
+    # that do not divide evenly across ranks, to test uneven sharding.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: creates net1, relu, net2, net3, net4 layers.
         super().__init__()
         self.net1 = nn.Linear(5, 10)
         self.relu = nn.ReLU()
@@ -61,6 +74,7 @@ class SimpleModelUneven(torch.nn.Module):
         self.net4 = nn.Linear(30, 5)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: applies net1..net4, each followed by ReLU; returns result.
         x = F.relu(self.net1(x))
         x = F.relu(self.net2(x))
         x = F.relu(self.net3(x))
@@ -68,12 +82,18 @@ class SimpleModelUneven(torch.nn.Module):
         return x
 
     def get_input(self):
+        # [FUNCTION DOC] HELPER: returns a random 4x5 tensor on the module-level device_type.
         return torch.rand(4, 5, device=device_type)
 
 
 class TestHSDPCheckpoint(DTensorTestBase):
+    # [CLASS DOC] Multi-process test case for saving and loading HSDP/FSDP sharded state
+    # dicts with the file system storage and default planners. Tests are parametrized over
+    # even and uneven models.
     @property
     def backend(self):
+        # [FUNCTION DOC] Returns the process group backend string: gloo for cpu plus the
+        # default backend for the test device type, so checkpoint code can use cpu groups.
         curr_backend = dist.get_default_backend_for_device(self.device_type)
         return f"cpu:gloo,{self.device_type}:{curr_backend}"
 
@@ -82,6 +102,11 @@ class TestHSDPCheckpoint(DTensorTestBase):
     @with_temp_dir
     @parametrize("is_even_sharded_model", [True, False])
     def test_hsdp_checkpoint(self, is_even_sharded_model) -> None:
+        # [FUNCTION DOC] Builds an HYBRID_SHARD FSDP model on a (2, world_size/2) mesh, saves
+        # a deep copy of its sharded state dict with FileSystemWriter, then runs a backward
+        # pass and optimizer step so the live state differs (checked unequal, with same mesh
+        # and placements). Loads the checkpoint into the copy, loads that into the model and
+        # asserts local shards equal again. Arg selects the even or uneven model.
         CHECKPOINT_DIR = self.temp_dir
         simple_model = SimpleModel if is_even_sharded_model else SimpleModelUneven
 
@@ -140,6 +165,11 @@ class TestHSDPCheckpoint(DTensorTestBase):
     @with_temp_dir
     @parametrize("is_even_sharded_model", [True, False])
     def test_hsdp_fsdp_checkpoint_conversion(self, is_even_sharded_model) -> None:
+        # [FUNCTION DOC] Saves the sharded state dict of an HSDP model (2D mesh) via the
+        # deprecated save_state_dict, then loads it via load_state_dict into a separately
+        # initialized plain FSDP model on a 1D mesh. Before loading, asserts meshes and
+        # placements differ and fully replicated values differ; after loading, the replicated
+        # values match the HSDP ones (mesh and placements still differ).
         CHECKPOINT_DIR = self.temp_dir
         simple_model = SimpleModel if is_even_sharded_model else SimpleModelUneven
 
