@@ -1,3 +1,6 @@
+# [MODULE DOC] Test that a DTensor embedding lookup compiles with torch.compile using dynamic
+# shapes and fullgraph. Defines TestDynamic (GPU only), and at import time creates a LocalTensor
+# variant class with its tests skipped. Runs run_tests when executed as a script.
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
 
@@ -21,10 +24,17 @@ from torch.testing._internal.triton_utils import requires_gpu
 
 
 class TestDynamic(DTensorTestBase):
+    # [CLASS DOC] GPU test class for dynamic-shape compilation of DTensor ops, parametrized by
+    # the fake tensor cache setting.
     @requires_gpu
     @with_comms
     @parametrize("fake_tensor_cache_enabled", [False, True])
     def test_embedding(self, fake_tensor_cache_enabled):
+        # [FUNCTION DOC] Patches the dynamo fake_tensor_cache_enabled config to the given bool,
+        # distributes a large random replicated embedding weight (202048 x 256, requires grad) on
+        # the GPU mesh, and builds a replicated DTensor of int64 indices (2 x 512). Compiles a
+        # function doing a dtype cast and functional embedding with fullgraph and dynamic shapes
+        # and runs it once; the output is not checked, so the test only asserts no error.
         with patch.object(
             torch._dynamo.config, "fake_tensor_cache_enabled", fake_tensor_cache_enabled
         ):
@@ -46,6 +56,8 @@ class TestDynamic(DTensorTestBase):
             )
 
             def forward(input_batch_inputs_):
+                # [FUNCTION DOC] HELPER: Casts the closed-over DTensor weight to float32 and
+                # returns the embedding lookup of the given index DTensor in it.
                 to = weight.to(torch.float32)
                 emb = torch.nn.functional.embedding(input_batch_inputs_, to)
                 return emb

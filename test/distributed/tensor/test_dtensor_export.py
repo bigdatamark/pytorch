@@ -1,4 +1,10 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests for exporting DTensor models (tensor-parallel MLPs, einsum, flex attention,
+# data-dependent indexing, unbacked dims) to FX graphs via strict export plus AOT joint export,
+# dynamo graph capture for export, and aot_export_joint_with_descriptors. Defines small test
+# models, three export helper functions and a node counting helper. Import-time side effect:
+# registers BlockMask as a pytree node (with serialized type name). The test class needs CUDA and
+# runs on a fake 8-rank process group.
 
 import contextlib
 
@@ -36,23 +42,32 @@ from torch.utils._pytree import register_pytree_node
 
 
 class SimpleModel(torch.nn.Module):
+    # [CLASS DOC] HELPER: Two stacked MLPModule submodules (mlp_0, mlp_1) applied in sequence.
     def __init__(self, device):
+        # [FUNCTION DOC] HELPER: Creates the two MLP submodules on the given device.
         super().__init__()
         self.mlp_0 = MLPModule(device)
         self.mlp_1 = MLPModule(device)
 
     def forward(self, input):
+        # [FUNCTION DOC] HELPER: Returns the input passed through mlp_0 then mlp_1.
         return self.mlp_1(self.mlp_0(input))
 
 
 class EinsumModel(torch.nn.Module):
+    # [CLASS DOC] HELPER: Model doing one einsum on DTensors; records the placements of the
+    # einsum result and of the inputs y and z as attributes (a side effect on the module).
     """Simple model that uses einsum with DTensor inputs and returns DTensor."""
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Initializes the recorded placement attribute to None.
         super().__init__()
         self.placement = None
 
     def forward(self, x, y, z):
+        # [FUNCTION DOC] HELPER: Returns the einsum of x and y over the contraction pattern batch
+        # seq hidden by hidden dim. Stores the result placement, y placement and z placement in
+        # attributes of the module; z is otherwise unused. Needs DTensor inputs.
         result = torch.einsum("bsh,hd->bsd", x, y)
         self.placement = result.placements[0]
         self.placement_2 = y.placements[0]
@@ -61,31 +76,45 @@ class EinsumModel(torch.nn.Module):
 
 
 class SimpleModelDynamicShapes(torch.nn.Module):
+    # [CLASS DOC] HELPER: Two MLPs with a branch on the input batch size, so export under dynamic
+    # shapes must trace a guard on that size.
     def __init__(self, device):
+        # [FUNCTION DOC] HELPER: Creates the two MLP submodules on the given device.
         super().__init__()
         self.mlp_0 = MLPModule(device)
         self.mlp_1 = MLPModule(device)
 
     def forward(self, input):
+        # [FUNCTION DOC] HELPER: If the first dim of the input is greater than 4, returns mlp_0 of
+        # the sine of the input, else mlp_1 of the cosine of the input.
         if input.shape[0] > 4:
             return self.mlp_0(input.sin())
         return self.mlp_1(input.cos())
 
 
 class SimpleModelAnnotated(torch.nn.Module):
+    # [CLASS DOC] HELPER: Same as the two-MLP model but the mlp_0 call runs inside an FX
+    # annotation scope tagging nodes with a pp_stage value of 0.
     def __init__(self, device):
+        # [FUNCTION DOC] HELPER: Creates the two MLP submodules on the given device.
         super().__init__()
         self.mlp_0 = MLPModule(device)
         self.mlp_1 = MLPModule(device)
 
     def forward(self, input):
+        # [FUNCTION DOC] HELPER: Runs mlp_0 under the annotation pp_stage 0 and mlp_1 outside it;
+        # returns the final output.
         with fx_traceback.annotate({"pp_stage": 0}):
             x = self.mlp_0(input)
         return self.mlp_1(x)
 
 
 class FlexAttentionModel(torch.nn.Module):
+    # [CLASS DOC] HELPER: Attention block with linear q, k, v projections (16 to 128), flex
+    # attention with 8 heads of head dim 16, and an output projection back to 16.
     def __init__(self, device):
+        # [FUNCTION DOC] HELPER: Creates four linear layers on the device and stores the head
+        # count (8) and head dim (16).
         super().__init__()
         self.proj_q = torch.nn.Linear(16, 128, device=device)
         self.proj_k = torch.nn.Linear(16, 128, device=device)
@@ -95,6 +124,10 @@ class FlexAttentionModel(torch.nn.Module):
         self.head_dim = 16
 
     def forward(self, x, *, block_mask=None):
+        # [FUNCTION DOC] HELPER: Projects x (batch, seq, embed) to q, k, v, reshapes them to
+        # (batch, heads, seq, head_dim) using the local hidden size after tensor-parallel sharding,
+        # applies flex attention with the optional keyword block mask, restores the layout and
+        # returns the output projection.
         batch_size, seq_len, embed_dim = x.shape
         # Project to Q, K, V
         q = self.proj_q(x)
@@ -122,6 +155,12 @@ class FlexAttentionModel(torch.nn.Module):
 
 
 def strict_export_and_aot_export_joint_with_descriptors(model, args, kwargs=None):
+    # [FUNCTION DOC] HELPER: Strict-exports the model with torch.export under a config that
+    # installs free tensors and with aten-to-metadata assertions disabled, then runs the joint
+    # export helper on the exported program module and returns the joint graph module. Temporarily
+    # registers the DTensorSpec as a constant pytree type, always deregistered in a finally block.
+    # kwargs defaults to empty.
+    # KNOWN ISSUE: per the code comment the resulting joint graph lacks the backward region.
     if kwargs is None:
         kwargs = {}
     # needed for strict export; must be cleaned up to avoid polluting global state
@@ -141,6 +180,9 @@ def strict_export_and_aot_export_joint_with_descriptors(model, args, kwargs=None
 
 
 def graph_capture_and_aot_export_joint_with_descriptors_v2(model, args, kwargs=None):
+    # [FUNCTION DOC] HELPER: Captures the model with dynamo graph capture for export, called on
+    # args and kwargs, then runs the joint export helper under a tracing context that uses the
+    # fake mode stored in the captured graph metadata. Returns the joint graph module.
     if kwargs is None:
         kwargs = {}
     gm = dynamo_graph_capture_for_export(model)(*args, **kwargs)
@@ -150,6 +192,8 @@ def graph_capture_and_aot_export_joint_with_descriptors_v2(model, args, kwargs=N
 
 
 def aot_export_joint_with_descriptors_alone(model, args, kwargs=None):
+    # [FUNCTION DOC] HELPER: Calls aot_export_joint_with_descriptors for the model, args and
+    # kwargs (kwargs defaults to empty) inside an exit stack and returns the joint graph module.
     if kwargs is None:
         kwargs = {}
     with contextlib.ExitStack() as stack:
@@ -163,6 +207,7 @@ def aot_export_joint_with_descriptors_alone(model, args, kwargs=None):
 
 
 def _count_op(gm, target):
+    # [FUNCTION DOC] HELPER: Returns the number of graph nodes in gm whose target equals target.
     return sum(1 for node in gm.graph.nodes if node.target == target)
 
 
@@ -177,11 +222,16 @@ register_pytree_node(
 
 @requires_cuda
 class DTensorExportTest(TestCase):
+    # [CLASS DOC] CUDA-only export tests. setUp creates a fake-backend process group with 8
+    # ranks (rank 0); tearDown destroys it. Tests build device meshes on the cuda device type.
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Runs the base tearDown and destroys the process group.
         super().tearDown()
         dist.destroy_process_group()
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Runs the base setUp, sets world_size to 8, initializes a fake
+        # process group at rank 0 with a FakeStore, and sets device_type to cuda.
         super().setUp()
         self.world_size = 8
         store = FakeStore()
@@ -191,6 +241,15 @@ class DTensorExportTest(TestCase):
         self.device_type = "cuda"
 
     def _run_test(self, export_fn, test_annotation=False):
+        # [FUNCTION DOC] HELPER: Builds a 2x4 (dp, tp) mesh, creates the plain or annotated two-MLP
+        # model, applies column-wise and row-wise tensor parallelism on the tp sub-mesh, and
+        # calls export_fn on the model with one replicated (20, 10) DTensor input to get a joint
+        # graph, which is partitioned with min-cut rematerialization into forward and backward.
+        # With test_annotation, compares node names tagged and not tagged with the pp_stage
+        # annotation in the forward, backward and joint graphs with hard-coded expected lists.
+        # KNOWN ISSUE: the all_reduce count checks use the assertTrue method with the expected
+        # counts as its message argument, so they pass whenever the count is non-zero and do not
+        # compare against 3, 2 and 1.
         dp_degree = 2
         tp_degree = self.world_size // dp_degree
 
@@ -238,9 +297,13 @@ class DTensorExportTest(TestCase):
         if test_annotation:
 
             def has_tag(node):
+                # [FUNCTION DOC] HELPER: True if the node metadata has a custom entry equal to the
+                # pp_stage 0 annotation.
                 return "custom" in node.meta and node.meta["custom"] == {"pp_stage": 0}
 
             def marked_nodes(gm):
+                # [FUNCTION DOC] HELPER: Returns names of call_function nodes in gm that have
+                # the annotation tag.
                 return [
                     node.name
                     for node in gm.graph.nodes
@@ -248,6 +311,8 @@ class DTensorExportTest(TestCase):
                 ]
 
             def unmarked_nodes(gm):
+                # [FUNCTION DOC] HELPER: Returns names of call_function nodes in gm that lack
+                # the annotation tag.
                 return [
                     node.name
                     for node in gm.graph.nodes
@@ -356,14 +421,21 @@ class DTensorExportTest(TestCase):
         self,
         export_fn,
     ):
+        # [FUNCTION DOC] Runs the shared tensor-parallel export check with each parametrized
+        # export function (dynamo graph capture v2 and plain AOT joint export).
         self._run_test(export_fn)
 
     # aot_export_joint_with_descriptors on strict-exported exported_program.module()
     # is producing a joint graph with backward region missing
     def test_strict_export_parallelize_module_with_dtensor_input(self):
+        # [FUNCTION DOC] Runs the shared export check using strict export followed by AOT joint
+        # export.
         self._run_test(strict_export_and_aot_export_joint_with_descriptors)
 
     def test_annotate_aot_export_joint_with_descriptors_alone(self):
+        # [FUNCTION DOC] Runs the shared export check with the annotated model and plain AOT
+        # joint export, verifying the pp_stage annotations propagate to forward, backward and
+        # joint nodes.
         self._run_test(aot_export_joint_with_descriptors_alone, True)
 
     @parametrize(
@@ -376,6 +448,12 @@ class DTensorExportTest(TestCase):
         ],
     )
     def test_dynamic_shapes(self, export_fn_with_answer):
+        # [FUNCTION DOC] Exports the tensor-parallel dynamic-shape model on a replicated (20, 10)
+        # DTensor input whose dim 0 is marked dynamic (min 5, max 100). Collects the shapes of
+        # all fake tensor placeholders of the joint graph, raising an AssertionError if a
+        # placeholder lacks val metadata, and compares their string form with the expected
+        # answer (local shards of the eight parameters, then two entries with the symbolic
+        # batch size s64).
         export_fn, answer = export_fn_with_answer
         dp_degree = 2
         tp_degree = self.world_size // dp_degree
@@ -421,6 +499,9 @@ class DTensorExportTest(TestCase):
         ],
     )
     def test_einsum_dtensor_export(self, export_fn):
+        # [FUNCTION DOC] Builds a 4-rank mesh and three DTensors (sharded x, replicated y, partial
+        # z), runs the einsum model eagerly, exports it with dynamo graph capture, runs the
+        # captured graph on the same inputs and asserts the outputs are equal.
         """Test exporting a model with einsum that has DTensor inputs/outputs with side effects"""
         world_size = 4
         # Create device mesh
@@ -450,6 +531,12 @@ class DTensorExportTest(TestCase):
         ],
     )
     def test_flex_attention_dtensor_export(self, export_fn):
+        # [FUNCTION DOC] Applies tensor parallelism (column-wise q, k, v and row-wise output
+        # projection) to the flex attention model on an 8-rank mesh, creates a causal block mask,
+        # and exports with the given function with a replicated (4, 64, 16) DTensor input and the
+        # mask as keyword. Checks flex attention and its backward appear in the joint graph.
+        # KNOWN ISSUE: both count checks use the assertTrue method with 1 and 2 as the message
+        # argument, so they only verify the count is non-zero.
         device_mesh = init_device_mesh(self.device_type, mesh_shape=(self.world_size,))
         model = FlexAttentionModel(self.device_type)
 
@@ -499,8 +586,13 @@ class DTensorExportTest(TestCase):
         )
 
     def test_union_typed_annotation(self):
+        # [FUNCTION DOC] Exports a plain function with a union type annotation (tensor or DTensor)
+        # on its parameter, whose nested helper converts DTensors to local and returns the leaf
+        # plus one; asserts the graph output equals the eager result.
         def fn(leaf: torch.Tensor | DTensor):
             def nest_fn(leaf: torch.Tensor | DTensor):
+                # [FUNCTION DOC] HELPER: Returns the leaf, first converting a DTensor to its
+                # local tensor.
                 # def nest_fn(leaf: Union[torch.Tensor, DTensor]):  # this works
                 if isinstance(leaf, DTensor):
                     leaf = leaf.to_local()
@@ -514,10 +606,16 @@ class DTensorExportTest(TestCase):
         self.assertEqual(fn(z), gm(z)[0])
 
     def test_dtensor_data_dependent_index_and_slice(self):
+        # [FUNCTION DOC] Checks dynamo graph capture works with data-dependent operations on
+        # replicated DTensors: boolean mask indexing, and slicing by an item value of a
+        # clamped max with a runtime assert. The second graph printout is compared with an
+        # expected string.
         device_mesh = init_device_mesh(self.device_type, mesh_shape=(self.world_size,))
 
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward indexes the first input with the second.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns x indexed by y (a boolean mask).
                 return x[y]
 
         x = torch.randn(10)
@@ -527,7 +625,10 @@ class DTensorExportTest(TestCase):
         dynamo_graph_capture_for_export(Foo())(x_dt, y_dt)
 
         class Bar(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward slices its input by a data-dependent size.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Takes the item of the clamped (min 1) maximum of x,
+                # asserts it is at least 1, and returns x sliced on dim 0 up to that item.
                 val = torch.clamp(x.max(), min=1).item()
                 torch._check(val >= 1)
                 return x[:val]
@@ -550,12 +651,18 @@ graph():
         )
 
     def test_dtensor_mark_unbacked(self):
+        # [FUNCTION DOC] Marks both dims of two replicated (64, 64) DTensors on a 4x2 mesh as
+        # unbacked, captures a matmul module with dynamo graph capture, and asserts exactly two
+        # graph nodes carry unbacked bindings of four symbols each. Then runs the graph on a
+        # zero-size (0, 0) DTensor and asserts the result shape is (0, 0).
         device_mesh = init_device_mesh(
             self.device_type, mesh_shape=(self.world_size // 2, 2)
         )
 
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward is a matrix multiplication of two inputs.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the matrix product of x and y.
                 return x @ y
 
         x_dt = distribute_tensor(

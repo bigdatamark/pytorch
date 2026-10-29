@@ -1,5 +1,13 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] OpInfo-driven correctness tests for DTensor ops. For every op in the OpInfo
+# database it runs the op on plain tensors and on DTensors built from many sharding combinations
+# (via DTensorConverter) and compares results (and tries a backward). Test flavors: multi-threaded
+# ranks, LocalTensor mode with a fake process group, unbacked-symint fullgraph compile, single-dim
+# sharding strategy validation, and aot_eager compile smoke tests. Import-time side effects:
+# overwrites the OpInfo size constants L, M, S, XS in the common methods module (24, 12, 4, 2) so
+# shapes shard evenly across 4 ranks, defines the expected-failure and skip sets per flavor, and
+# instantiates device-type test classes for the cpu device only (DEVICE_TYPE is hard-coded to cpu).
 
 import copy
 import random
@@ -60,6 +68,10 @@ common_ops.XS = 2
 
 
 def repurpose_ops(op_db, base_test_name, derived_test_name):
+    # [FUNCTION DOC] Returns a deep copy of the OpInfo list in which every decorator whose
+    # cls_name equals base_test_name now has cls_name set to derived_test_name, so skip and
+    # xfail decorators registered for the base class also apply to a derived test class. The
+    # input list is not modified.
     """
     Copies op info database and for the decorators that applied to base test class updates
     them to apply to derived test class. The class update is required because decorators are applied
@@ -411,14 +423,21 @@ DEVICE_TYPE = "cpu"
 
 
 class TestDTensorOps(TestCase):
+    # [CLASS DOC] Shared base for the op test flavors, not collected itself (__test__ is False and
+    # is set True on subclasses). Provides sample iteration, the crossref comparison of DTensor
+    # versus plain results, and helpers; subclasses implement assertEqualOnRank. world_size is 4
+    # and the mesh is stored on the instance when a test runs.
     __test__ = False
 
     def __init_subclass__(cls, **kwargs):
+        # [FUNCTION DOC] HELPER: Runs normal subclass setup and marks each subclass as collectable
+        # by setting its test flag to True.
         super().__init_subclass__(**kwargs)
         cls.__test__ = True
 
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns the number of ranks, OP_DB_WORLD_SIZE (4).
         return OP_DB_WORLD_SIZE
 
     def iter_valid_samples(
@@ -429,6 +448,11 @@ class TestDTensorOps(TestCase):
         sample_filter=None,
         needs_deepcopy=False,
     ):
+        # [FUNCTION DOC] HELPER: Generator over the op's sample inputs for the module device
+        # type and the given dtype and requires_grad. Yields (args, kwargs) where args is a list
+        # of the sample input followed by its extra args. Samples rejected by sample_filter (called
+        # with args and kwargs) are skipped; with needs_deepcopy the args and kwargs are deep
+        # copied and samples that raise NotImplementedError when copied are skipped.
         """
         Iterate over valid samples for an op, yielding (args, kwargs) tuples.
 
@@ -460,9 +484,17 @@ class TestDTensorOps(TestCase):
     def run_opinfo_test(
         self, dtype, op, requires_grad=True, sample_filter=None, sample_lock=None
     ):
+        # [FUNCTION DOC] Creates a one-dimensional device mesh of world_size ranks (stored on the
+        # instance) and runs the DTensor crossref comparison of the op over all its samples
+        # through check_dtensor_func (errors propagate). With a sample_lock (multi-threaded
+        # ranks), the samples are materialized once under the lock with fixed seeds for torch,
+        # random and numpy (restoring the python and numpy RNG state afterwards), followed by a
+        # barrier, so that all ranks see identical non-tensor arguments.
         self.mesh = init_device_mesh(DEVICE_TYPE, (self.world_size,))
 
         def valid_samples():
+            # [FUNCTION DOC] HELPER: Returns the sample generator for the op with the outer
+            # dtype, requires_grad and sample filter.
             return self.iter_valid_samples(
                 op,
                 dtype,
@@ -471,6 +503,8 @@ class TestDTensorOps(TestCase):
             )
 
         def iter_samples():
+            # [FUNCTION DOC] HELPER: Generator of samples; without a lock it yields lazily, with
+            # the lock it yields from a list materialized under frozen, fixed RNG state.
             if sample_lock is None:
                 yield from valid_samples()
                 return
@@ -496,12 +530,17 @@ class TestDTensorOps(TestCase):
             yield from samples
 
         def test():
+            # [FUNCTION DOC] HELPER: Runs the crossref comparison for every sample.
             for args, kwargs in iter_samples():
                 self.run_dtensor_crossref(op.op, args, kwargs)
 
         self.check_dtensor_func(test, op)
 
     def assert_ref_dtensor_equal(self, dtensor_rs, rs):
+        # [FUNCTION DOC] HELPER: Flattens both results with pytree and asserts the same number of
+        # leaves. For each reference leaf that is a tensor, asserts (on rank 0 via
+        # assertEqualOnRank) that the DTensor-side leaf is a tensor with the same shape and
+        # requires_grad flag and equal values. Non-tensor reference leaves are ignored.
         flat_dtensor_rs = pytree.tree_leaves(dtensor_rs)
         flat_rs = pytree.tree_leaves(rs)
         self.assertEqual(len(flat_dtensor_rs), len(flat_rs))
@@ -526,12 +565,24 @@ class TestDTensorOps(TestCase):
             self.assertEqualOnRank(dtensor_r, r)
 
     def assertEqualOnRank(self, x, y, msg=None, *, rank=0) -> None:
+        # [FUNCTION DOC] HELPER: Abstract hook; subclasses must provide it. Raises
+        # NotImplementedError here.
         raise NotImplementedError
 
     def run_dtensor_crossref(self, func, args, kwargs):
+        # [FUNCTION DOC] Runs func on the plain args to get the reference result, then on every
+        # DTensor argument combination produced by DTensorConverter. Skips combinations whose
+        # result has an empty tensor, converts results to full tensors, tries a backward on the
+        # local part (any failure there is only printed on rank 0 for ops not in skip_bw), and
+        # asserts equality with the reference. Raises RuntimeError if args could not all be
+        # converted, and wraps any failure in a RuntimeError naming the op and arguments.
+        # Returns the reference result.
         to_dtensor = DTensorConverter(self.mesh, args, kwargs)
 
         def concat_res_if_necessary(func, res: object) -> object:
+            # [FUNCTION DOC] HELPER: For ops whose name contains split, concatenates the sequence
+            # result along dim (the third arg when three args are given, else 0) so a single
+            # tensor results; otherwise returns the result unchanged.
             # concat the result on corresponding dim for ops like
             # split, so that we can call backward on a single tensor
             if (resolve_name(func) is not None) and ("split" in resolve_name(func)):
@@ -546,6 +597,7 @@ class TestDTensorOps(TestCase):
         rs = concat_res_if_necessary(func, rs)
 
         def to_replicate(e: object) -> object:
+            # [FUNCTION DOC] HELPER: Returns the full tensor of a DTensor, else the value as is.
             return e.full_tensor() if isinstance(e, DTensor) else e
 
         # Suppress warnings, this doesn't matter for test_meta.py
@@ -607,6 +659,9 @@ class TestDTensorOps(TestCase):
         return rs
 
     def check_dtensor_func(self, test_func, opinfo, dry_run=False):
+        # [FUNCTION DOC] Calls test_func. If it raises, re-raises unless dry_run is set, in which
+        # case rank 0 prints an xfail entry for the op (with the variant name if present) to help
+        # regenerate the expected-failure list.
         try:
             test_func()
         except Exception:
@@ -619,6 +674,9 @@ class TestDTensorOps(TestCase):
                     print(f"xfail('{opinfo.name}'),")
 
     def run_one_hot(self):
+        # [FUNCTION DOC] HELPER: Finds the single OpInfo for one_hot (raises AssertionError if
+        # not exactly one) and runs the opinfo test with int64, no grad, skipping samples with
+        # num_classes of minus one.
         ops = [op for op in op_db if op.name == "nn.functional.one_hot"]
         if len(ops) != 1:
             raise AssertionError(f"Expected 1 op, got {len(ops)}")
@@ -632,6 +690,12 @@ class TestDTensorOps(TestCase):
         )
 
     def run_mean(self):
+        # [FUNCTION DOC] HELPER: Builds a 1-D mesh and a float (2w+1, 2w) arange tensor. For an
+        # evenly shardable case (sharded on dim 1, mean over dim 1) and an uneven case (sharded
+        # on dim 0, mean over dim 0) computes the DTensor mean under a debug mode, asserts the
+        # full tensor equals the plain mean, and asserts the debug log shows a partial-average to
+        # replicate redistribution for the even case and a shard-0 to replicate redistribution
+        # for the uneven case.
         self.mesh = init_device_mesh(DEVICE_TYPE, (self.world_size,))
 
         shape = [2 * self.world_size + 1, 2 * self.world_size]
@@ -662,6 +726,10 @@ class TestDTensorOps(TestCase):
                 self.assertTrue("S(0)->R" in debug_mode.debug_string())
 
     def test_embedding_error_msg(self):
+        # [FUNCTION DOC] Builds a (2, 2) dp/tp mesh, shards a weight on the tp sub-mesh and an
+        # index tensor on the full 2-D mesh, and asserts calling aten embedding on the two (mesh
+        # mismatch) raises a RuntimeError whose message starts with the expected sharding
+        # propagation failure text.
         self.mesh_2d = init_device_mesh(
             DEVICE_TYPE, (2, self.world_size // 2), mesh_dim_names=("dp", "tp")
         )
@@ -685,6 +753,8 @@ class TestDTensorOps(TestCase):
 
 
 class TestMultiThreadedDTensorOps(DTensorOpTestBase, TestDTensorOps):
+    # [CLASS DOC] Op tests running one thread per rank. Holds a repurposed op database and a
+    # class-wide lock used to materialize samples consistently across threads.
     _op_db = repurpose_ops(op_db, "TestDTensorOps", "TestMultiThreadedDTensorOps")
     _op_db_sample_lock = threading.Lock()
 
@@ -694,24 +764,34 @@ class TestMultiThreadedDTensorOps(DTensorOpTestBase, TestDTensorOps):
         dtensor_fails | dtensor_multi_threaded_fails | dtensor_fails_no_strategy,
     )
     def test_dtensor_op_db(self, dtype, op):
+        # [FUNCTION DOC] Per-op test for float: runs the opinfo test with the shared sample lock,
+        # skipping the multi-threaded, base and no-strategy failure sets.
         self.run_opinfo_test(dtype, op, sample_lock=self.__class__._op_db_sample_lock)
 
     def test_mean(self):
+        # [FUNCTION DOC] Runs the mean check.
         self.run_mean()
 
     def test_one_hot(self):
+        # [FUNCTION DOC] Runs the one_hot check.
         self.run_one_hot()
 
 
 class TestLocalDTensorOps(TestDTensorOps):
+    # [CLASS DOC] Op tests running all ranks in a single process with LocalTensor mode over a
+    # fake process group of world_size ranks.
     _op_db = repurpose_ops(op_db, "TestDTensorOps", "TestLocalDTensorOps")
 
     def setUp(self) -> None:
+        # [FUNCTION DOC] HELPER: Runs base setUp and initializes a fake process group (rank 0) and
+        # stores its default group.
         super().setUp()
         torch.distributed.init_process_group("fake", rank=0, world_size=self.world_size)
         self.fake_pg = torch.distributed.distributed_c10d._get_default_group()
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Runs base tearDown, clears the sharding propagation cache, and
+        # destroys the process group, ignoring an AssertionError if there is none.
         super().tearDown()
         # Clear sharding propagation cache to avoid stale mesh references
         # between tests that destroy and recreate process groups
@@ -729,20 +809,28 @@ class TestLocalDTensorOps(TestDTensorOps):
         dtensor_fails | dtensor_fails_no_strategy,
     )
     def test_dtensor_op_db(self, dtype, op):
+        # [FUNCTION DOC] Per-op test for float: runs the opinfo test, skipping the base and
+        # no-strategy failure sets.
         self.run_opinfo_test(dtype, op)
 
     def test_mean(self):
+        # [FUNCTION DOC] Runs the mean check inside local tensor mode for all ranks.
         with LocalTensorMode(frozenset(range(self.world_size))):
             self.run_mean()
 
     def test_one_hot(self):
+        # [FUNCTION DOC] Runs the one_hot check.
         self.run_one_hot()
 
     def run_opinfo_test(self, dtype, op, requires_grad=True, sample_filter=None):
+        # [FUNCTION DOC] HELPER: Runs the base opinfo test inside local tensor mode covering all
+        # ranks (no sample lock parameter).
         with LocalTensorMode(frozenset(range(self.world_size))):
             super().run_opinfo_test(dtype, op, requires_grad, sample_filter)
 
     def assertEqualOnRank(self, x, y, msg=None, *, rank=0):
+        # [FUNCTION DOC] HELPER: Plain equality assertion; the rank argument is ignored since a
+        # single process holds all ranks.
         self.assertEqual(x, y, msg)
 
 
@@ -866,6 +954,9 @@ ops_unbacked_dtensor_dde = {
 
 
 class TestUnbackedDTensorOps(TestDTensorOps):
+    # [CLASS DOC] Op tests with a fake process group that mark DTensor dims of size at least 2
+    # as unbacked and run the op under an eager-backend fullgraph compile to detect
+    # data-dependent errors. Only compilation is exercised; values are not compared.
     """
     Test suite for DTensor ops with unbacked symints.
 
@@ -876,10 +967,13 @@ class TestUnbackedDTensorOps(TestDTensorOps):
     _op_db = repurpose_ops(op_db, "TestDTensorOps", "TestUnbackedDTensorOps")
 
     def setUp(self) -> None:
+        # [FUNCTION DOC] HELPER: Runs base setUp and initializes a fake process group at rank 0.
         super().setUp()
         torch.distributed.init_process_group("fake", rank=0, world_size=self.world_size)
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Runs base tearDown, clears the sharding propagation cache, resets
+        # dynamo, and destroys the process group, ignoring an AssertionError.
         super().tearDown()
         from torch.distributed.tensor.debug import _clear_sharding_prop_cache
 
@@ -891,13 +985,18 @@ class TestUnbackedDTensorOps(TestDTensorOps):
             pass
 
     def assertEqualOnRank(self, x, y, msg=None, *, rank=0):
+        # [FUNCTION DOC] HELPER: Plain equality assertion; the rank argument is ignored.
         self.assertEqual(x, y, msg)
 
     def _has_valid_unbacked_dims(self, t: torch.Tensor) -> bool:
+        # [FUNCTION DOC] HELPER: True if the tensor has at least one dim and some dim of size at
+        # least 2 (so it can be marked unbacked).
         """Check if tensor has dimensions that can be marked as unbacked."""
         return t.ndim > 0 and any(s >= 2 for s in t.shape)
 
     def _sample_has_valid_unbacked_dims(self, args, kwargs) -> bool:
+        # [FUNCTION DOC] HELPER: Sample filter: True if any tensor in the flattened args and
+        # kwargs has a dim that can be marked unbacked.
         """Check if any tensor in args/kwargs has valid unbacked dimensions."""
         all_tensors = [
             x for x in tree_flatten((args, kwargs))[0] if isinstance(x, torch.Tensor)
@@ -905,12 +1004,21 @@ class TestUnbackedDTensorOps(TestDTensorOps):
         return any(self._has_valid_unbacked_dims(t) for t in all_tensors)
 
     def _mark_unbacked(self, t: torch.Tensor) -> None:
+        # [FUNCTION DOC] HELPER: Marks every dim of size at least 2 of the tensor as unbacked in
+        # dynamo (mutates dynamo markers on the tensor).
         """Mark all eligible dimensions of a tensor as unbacked."""
         for i in range(t.ndim):
             if t.shape[i] >= 2:
                 torch._dynamo.decorators.mark_unbacked(t, i)
 
     def run_dtensor_crossref(self, func, args, kwargs):
+        # [FUNCTION DOC] Override of the crossref: computes the plain reference result, then for
+        # each DTensor argument combination marks eligible dims of the DTensor arguments as
+        # unbacked, resets dynamo, and calls func through an eager-backend fullgraph compile.
+        # Any failure (or failed conversion) is re-raised as a RuntimeError naming the op and
+        # arguments. Returns the reference result.
+        # KNOWN ISSUE: the compiled output is never compared with the reference, and the local
+        # to_replicate helper is unused.
         """
         Override to add unbacked marking and fullgraph compilation.
 
@@ -921,6 +1029,8 @@ class TestUnbackedDTensorOps(TestDTensorOps):
         to_dtensor = DTensorConverter(self.mesh, args, kwargs)
 
         def concat_res_if_necessary(func, res: object) -> object:
+            # [FUNCTION DOC] HELPER: Concatenates the result of split-like ops along a dim (the
+            # third arg if three args, else 0); otherwise returns the result.
             if (resolve_name(func) is not None) and ("split" in resolve_name(func)):
                 dim = args[2] if len(args) == 3 else 0
                 return torch.cat(res, dim=dim)
@@ -931,6 +1041,8 @@ class TestUnbackedDTensorOps(TestDTensorOps):
         rs = concat_res_if_necessary(func, rs)
 
         def to_replicate(e: object) -> object:
+            # [FUNCTION DOC] HELPER: Returns the full tensor of a DTensor, else the value as is
+            # (unused in this override).
             return e.full_tensor() if isinstance(e, DTensor) else e
 
         with warnings.catch_warnings():
@@ -955,6 +1067,7 @@ class TestUnbackedDTensorOps(TestDTensorOps):
 
                     @torch.compile(backend="eager", fullgraph=True)
                     def compiled_func(*a, **kw):
+                        # [FUNCTION DOC] HELPER: Calls the op under test with the given arguments.
                         return func(*a, **kw)
 
                     compiled_func(*dtensor_args, **dtensor_kwargs)
@@ -975,6 +1088,8 @@ class TestUnbackedDTensorOps(TestDTensorOps):
         | ops_unbacked_skip,
     )
     def test_unbacked_dtensor_op_db(self, dtype, op):
+        # [FUNCTION DOC] Per-op test for float: runs the opinfo test without grad on samples that
+        # have markable dims, skipping the unbacked-specific, no-strategy and skip sets.
         # Filter to samples with valid unbacked dimensions
         self.run_opinfo_test(
             dtype,
@@ -985,11 +1100,17 @@ class TestUnbackedDTensorOps(TestDTensorOps):
 
 
 class TestSingleDimStrategies(DTensorOpTestBase):
+    # [CLASS DOC] Validates registered single-dim sharding strategies against real op results on
+    # a 2-rank multi-threaded mesh.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns the fixed world size, 2.
         return 2
 
     def _extract_aten_op_and_args(self, torch_op, args, kwargs):
+        # [FUNCTION DOC] HELPER: Runs torch_op on the DTensor args under a debug mode that stores
+        # the original args, skipping the test if the op raises. Returns the op, args and kwargs
+        # of the first recorded call whose op name contains aten; skips the test if none.
         with DebugMode(store_original_args=True) as debug_mode:
             try:
                 torch_op(*args, **kwargs)
@@ -1017,6 +1138,13 @@ class TestSingleDimStrategies(DTensorOpTestBase):
         },
     )
     def test_single_dim_strategy(self, dtype, op):
+        # [FUNCTION DOC] Takes the first sample of the op (skipping if sampling fails or is
+        # empty), replicates its tensors on a 2-rank mesh, finds the underlying aten call, and
+        # skips if it has no registered single-dim strategy. Enumerates the strategy's placement
+        # rules (placeholders turned into shards), skips ones with invalid shards (not a shard,
+        # scalar, out-of-range or empty or non-divisible dim), and asserts each remaining rule
+        # gives correct forward results on full tensors and, when a backward check applies, a
+        # correct backward. Seeds the RNG with 42.
         torch.manual_seed(42)
         mesh = init_device_mesh(DEVICE_TYPE, (self.world_size,))
         sharding_prop = DTensor._op_dispatcher.sharding_propagator
@@ -1054,6 +1182,8 @@ class TestSingleDimStrategies(DTensorOpTestBase):
         all_tensor_meta = []
 
         def _collect_tensor_meta(dt):
+            # [FUNCTION DOC] HELPER: Appends the DTensor's tensor meta to the outer list and
+            # returns it.
             meta = dt._spec.tensor_meta
             all_tensor_meta.append(meta)
             return meta
@@ -1078,6 +1208,9 @@ class TestSingleDimStrategies(DTensorOpTestBase):
 
             # skip strategies with invalid shards
             def is_invalid_shard(meta, p):
+                # [FUNCTION DOC] HELPER: True if placement p cannot be used to shard a tensor
+                # of this meta: not a shard, zero dims, dim out of range, empty dim, or dim size
+                # not divisible by the world size.
                 ndim = len(meta.shape)
                 if (
                     not isinstance(p, Shard)
@@ -1122,6 +1255,8 @@ class TestSingleDimStrategies(DTensorOpTestBase):
 
 
 class TestCompiledDTensorOps(TestDTensorOps):
+    # [CLASS DOC] Compile smoke tests: each op is compiled with fullgraph on the aot_eager
+    # backend on DTensor inputs under a fake process group; outputs are not compared.
     """
     Test DTensor ops compile successfully with aot_eager backend.
     Uses fake PG for speed - focuses on compilation, not output correctness.
@@ -1130,10 +1265,13 @@ class TestCompiledDTensorOps(TestDTensorOps):
     _op_db = repurpose_ops(op_db, "TestDTensorOps", "TestCompiledDTensorOps")
 
     def setUp(self) -> None:
+        # [FUNCTION DOC] HELPER: Runs base setUp and initializes a fake process group at rank 0.
         super().setUp()
         torch.distributed.init_process_group("fake", rank=0, world_size=self.world_size)
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Runs base tearDown, clears the sharding propagation cache, resets
+        # dynamo, and destroys the process group, ignoring an AssertionError.
         super().tearDown()
         from torch.distributed.tensor.debug import _clear_sharding_prop_cache
 
@@ -1145,10 +1283,16 @@ class TestCompiledDTensorOps(TestDTensorOps):
             pass
 
     def assertEqualOnRank(self, x, y, msg=None, *, rank=0):
+        # [FUNCTION DOC] HELPER: Does nothing, so output comparison is skipped.
         # Skip output comparison - we only care that compilation succeeds
         pass
 
     def run_dtensor_crossref(self, func, args, kwargs):
+        # [FUNCTION DOC] Override: for each fully converted DTensor argument combination, resets
+        # dynamo and compiles func with fullgraph on aot_eager, then calls it. A linear algebra
+        # error (or the lu_factor runtime error) from the compiled call is tolerated only if the
+        # eager call raises the same type and message; anything else is re-raised. Returns
+        # nothing.
         """
         Override to compile with aot_eager and verify compilation succeeds.
         Does not check output correctness.
@@ -1156,6 +1300,8 @@ class TestCompiledDTensorOps(TestDTensorOps):
         to_dtensor = DTensorConverter(self.mesh, args, kwargs)
 
         def is_accepted_linalg_error(exc):
+            # [FUNCTION DOC] HELPER: True if the exception is a linalg error or a runtime error
+            # whose message starts with the lu_factor prefix.
             return isinstance(exc, torch._C._LinAlgError) or (
                 # lu_factor intentionally raises a plain RuntimeError from
                 # _linalg_check_errors for singular factors.
@@ -1171,6 +1317,7 @@ class TestCompiledDTensorOps(TestDTensorOps):
 
             @torch.compile(backend="aot_eager", fullgraph=True)
             def compiled_func(*a, **kw):
+                # [FUNCTION DOC] HELPER: Calls the op under test with the given arguments.
                 return func(*a, **kw)
 
             try:
@@ -1204,6 +1351,9 @@ class TestCompiledDTensorOps(TestDTensorOps):
         - dtensor_numeric_only_fails,
     )
     def test_compiled_dtensor_op_db(self, dtype, op):
+        # [FUNCTION DOC] Per-op test for float: runs the opinfo test without grad, skipping the
+        # union of eager, no-strategy, threaded and compile failure sets minus the ops whose
+        # failure is numeric only.
         self.run_opinfo_test(dtype, op, requires_grad=False)
 
 

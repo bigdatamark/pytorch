@@ -1,4 +1,9 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests for DTensor embedding: column-wise and row-wise sharded torch.nn.Embedding
+# weights compared with a local embedding for output, gradient and communication counts, plus
+# regression tests for placement caching and gradient shapes. Import-time side effects: exits the
+# process with status 0 under dev-asan builds, binds funcol to the c10d_functional op namespace,
+# and creates a LocalTensor variant of the test class.
 
 import sys
 
@@ -31,8 +36,15 @@ funcol = torch.ops.c10d_functional
 
 
 class TestEmbeddingOp(DTensorTestBase):
+    # [CLASS DOC] Tests of embedding with sharded weights and replicated indices on the default
+    # test mesh; the shared helper runs the forward and backward comparison for each case.
     def _apply_sharding(self, embedding_mod, shard_dim, device_mesh):
+        # [FUNCTION DOC] HELPER: Shards every parameter of the module on dim shard_dim across the
+        # mesh through distribute_module and returns the converted module (parameters become
+        # DTensor parameters, replaced in place on the module).
         def shard_embedding_fn(name, module, device_mesh):
+            # [FUNCTION DOC] HELPER: Partition function for distribute_module: replaces each
+            # parameter of the module with a Parameter holding the DTensor sharded on shard_dim.
             for name, param in module.named_parameters():
                 dist_param = torch.nn.Parameter(
                     distribute_tensor(param, device_mesh, [Shard(shard_dim)])
@@ -54,6 +66,12 @@ class TestEmbeddingOp(DTensorTestBase):
         **kwargs,
     ):
         # Use same seed.
+        # [FUNCTION DOC] HELPER: Builds two embeddings with the same weights (extra keyword
+        # arguments such as padding_idx or max_norm go to the constructor), shards one, and feeds
+        # a replicated random index input of shape input_size. Asserts that forward and backward
+        # of the sharded one issue zero collectives, that the full output matches the local
+        # output, that the weight gradient (from a cross entropy loss against a random target)
+        # matches the local gradient, and that functional embedding on DTensors also matches.
         torch.manual_seed(0)
         local_embedding = torch.nn.Embedding(
             num_embeddings,
@@ -140,6 +158,8 @@ class TestEmbeddingOp(DTensorTestBase):
 
     @with_comms
     def test_sharded_embedding_colwise(self):
+        # [FUNCTION DOC] Runs the embedding comparison with the weight sharded on the embedding
+        # dim (column-wise) for several index ranks and sizes, including padding_idx cases.
         mesh = self.build_device_mesh()
         self._run_embedding_op_test(mesh, 1, [5, 4], 17, 12)
         self._run_embedding_op_test(mesh, 1, [6, 7, 6], 21, 11)
@@ -151,6 +171,8 @@ class TestEmbeddingOp(DTensorTestBase):
 
     @with_comms
     def test_sharded_embedding_colwise_max_norm_errors(self):
+        # [FUNCTION DOC] Asserts that column-wise sharded embedding with max_norm raises
+        # NotImplementedError saying embedding_renorm_ has no registered sharding strategy.
         mesh = self.build_device_mesh()
         with self.assertRaisesRegex(
             NotImplementedError,
@@ -162,6 +184,10 @@ class TestEmbeddingOp(DTensorTestBase):
 
     @with_comms
     def test_sharded_embedding_rowwise(self):
+        # [FUNCTION DOC] Runs the comparison with the weight sharded on the vocabulary dim
+        # (row-wise) including a padding_idx case. Then checks that the output of a row-wise
+        # sharded embedding has a mask-partial placement and that materializing it with
+        # full_tensor costs exactly one collective, an all-reduce.
         mesh = self.build_device_mesh()
         # test correctness
         self._run_embedding_op_test(mesh, 0, [5, 12], 16, 22)
@@ -187,6 +213,10 @@ class TestEmbeddingOp(DTensorTestBase):
 
     @with_comms
     def test_multiple_embeddings_rowwise(self):
+        # [FUNCTION DOC] Applies three row-wise sharded embeddings to the same replicated input.
+        # Two with the same shape must produce the identical (same object) mask-partial
+        # placement due to sharding propagation cache hits; a third with the same vocabulary size
+        # but a different embedding dim must produce a placement that is not equal.
         mesh = self.build_device_mesh()
 
         inp = torch.randint(0, 10, (4, 4), device=self.device_type)
@@ -230,6 +260,10 @@ class TestEmbeddingOp(DTensorTestBase):
 
     @with_comms
     def test_embedding_backward_different_num_embeddings(self):
+        # [FUNCTION DOC] Regression test: two column-sharded embeddings with 16 and 32 rows are
+        # run, summed into one loss and backpropagated; asserts each weight gradient keeps its
+        # own full shape (16, 12) and (32, 12), so the dense backward strategy cache must
+        # distinguish the number of weights.
         # Regression test: embedding_dense_backward op strategy must include
         # num_weights in its cache key. Without this, multiple embeddings with
         # different num_embeddings share a cached strategy, producing gradients

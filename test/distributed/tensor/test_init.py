@@ -1,3 +1,7 @@
+# [MODULE DOC] Tests for DTensor initialization and constructor APIs: in-place nn.init ops on a
+# DTensor (constant_, eye_) compared with plain tensors, and the factory functions ones, empty,
+# full, zeros, linspace and logspace with different placements, uneven sharding, 2-D meshes and
+# sub-meshes. Also creates a LocalTensor variant of the constructor tests at import time.
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
 
@@ -21,7 +25,12 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 
 
 class DTensorInitOpsTest(DTensorTestBase):
+    # [CLASS DOC] Tests applying torch.nn.init functions to a sharded or replicated DTensor.
     def _run_init_op(self, init_op, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Builds a random (8, 4) local tensor and a DTensor of it sharded
+        # on dim 0. Seeds the RNG with the rank, applies init_op with the extra arguments to a
+        # clone of the local tensor, reseeds, applies it to the DTensor, and asserts the DTensor's
+        # local shard equals the plain result.
         device_mesh = self.build_device_mesh()
         shard_spec = [Shard(0)]
         input_size = (8, 4)
@@ -36,11 +45,15 @@ class DTensorInitOpsTest(DTensorTestBase):
 
     @with_comms
     def test_init_ops(self):
+        # [FUNCTION DOC] Checks nn.init.constant_ with value 2.4 on a sharded DTensor matches the
+        # plain tensor result (random init tests live elsewhere).
         # NOTE: random init tests are moved to test_random_ops.py
         self._run_init_op(torch.nn.init.constant_, 2.4)
 
     @with_comms
     def test_eye_init(self):
+        # [FUNCTION DOC] Applies nn.init.eye_ in place to a replicated (8, 8) DTensor and asserts
+        # its local tensor equals the identity matrix.
         # Test nn.init.eye_() with DTensor (issue #173357)
         device_mesh = self.build_device_mesh()
         shard_spec = [Replicate()]
@@ -56,11 +69,22 @@ class DTensorInitOpsTest(DTensorTestBase):
 
 
 class DTensorConstructorTest(DTensorTestBase):
+    # [CLASS DOC] Tests the DTensor factory functions on a 1-D mesh of 4 ranks (and some 2-D and
+    # sub-mesh cases), comparing local shards with the corresponding plain torch results.
     @property
     def world_size(self):
+        # [FUNCTION DOC] HELPER: Returns the fixed world size, 4.
         return 4
 
     def _run_init_op(self, init_op, dist_init_op, eq_op, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Compares a distributed factory (dist_init_op) with its plain
+        # counterpart (init_op) using the comparison callable eq_op, passing extra arguments to
+        # both. On a 1-D mesh it tries placements Shard on dims 0, 1, 2 and Replicate. First with
+        # evenly divisible size (4, 8, 12): the local shard must match a plain tensor of the
+        # reduced size. Then with uneven size (5, 10, 15): for sharded placements each rank's
+        # local tensor must match its torch.chunk piece when the rank has one (checked per rank
+        # under local tensor mode); replicated must match the full tensor. Finally an empty
+        # shape replicated case is compared.
         # 1d mesh test
         device_mesh = self.build_device_mesh()
         placements_list = [[Shard(0)], [Shard(1)], [Shard(2)], [Replicate()]]
@@ -105,6 +129,9 @@ class DTensorConstructorTest(DTensorTestBase):
 
                 @maybe_run_for_local_tensor
                 def check_per_rank_chunk(rank, local_tensor):
+                    # [FUNCTION DOC] HELPER: If the rank has an expected chunk, applies eq_op
+                    # to that chunk and the given local tensor; ranks beyond the chunks are
+                    # skipped.
                     if rank < len(exp_tensor_list):
                         eq_op(exp_tensor_list[rank], local_tensor)
 
@@ -122,6 +149,8 @@ class DTensorConstructorTest(DTensorTestBase):
 
     @with_comms
     def test_ones(self):
+        # [FUNCTION DOC] Runs the shared comparison for ones versus the DTensor ones, requires_grad
+        # set, using assertEqual.
         self._run_init_op(
             torch.ones,
             torch.distributed.tensor.ones,
@@ -131,6 +160,8 @@ class DTensorConstructorTest(DTensorTestBase):
 
     @with_comms
     def test_empty(self):
+        # [FUNCTION DOC] Runs the shared comparison for empty versus the DTensor empty; since
+        # values are uninitialized, only shape, dtype and layout are compared.
         self._run_init_op(
             torch.empty,
             torch.distributed.tensor.empty,
@@ -142,6 +173,8 @@ class DTensorConstructorTest(DTensorTestBase):
 
     @with_comms
     def test_full(self):
+        # [FUNCTION DOC] Runs the shared comparison for full with fill value 123.4 versus the
+        # DTensor full, requires_grad set, using assertEqual.
         self._run_init_op(
             torch.full,
             torch.distributed.tensor.full,
@@ -152,6 +185,11 @@ class DTensorConstructorTest(DTensorTestBase):
 
     @with_comms
     def test_linspace(self):
+        # [FUNCTION DOC] For replicated and Shard(0) placements, checks the DTensor linspace
+        # against torch.linspace via full_tensor for: float64 with 8 steps, default dtype, a
+        # single step, zero steps (size 0 only), a descending range, and 0-dim DTensor start and
+        # end. Also asserts a RuntimeError about 0-dimensional start and end when start is a
+        # one-dimensional plain tensor.
         mesh = self.build_device_mesh()
         steps = 8
 
@@ -212,6 +250,9 @@ class DTensorConstructorTest(DTensorTestBase):
 
     @with_comms
     def test_logspace(self):
+        # [FUNCTION DOC] Same structure as the linspace test but for logspace: float64, a custom
+        # base of 2.0, one step, zero steps, descending range, 0-dim DTensor endpoints, and the
+        # RuntimeError for non-0-dim start, with both replicated and Shard(0) placements.
         mesh = self.build_device_mesh()
         steps = 8
 
@@ -274,6 +315,8 @@ class DTensorConstructorTest(DTensorTestBase):
 
     @with_comms
     def test_zeros(self):
+        # [FUNCTION DOC] Runs the shared comparison for zeros versus the DTensor zeros with
+        # requires_grad set, using assertEqual.
         self._run_init_op(
             torch.zeros,
             torch.distributed.tensor.zeros,
@@ -283,6 +326,10 @@ class DTensorConstructorTest(DTensorTestBase):
 
     @with_comms
     def test_zeros_full_mesh(self):
+        # [FUNCTION DOC] Checks local shard shapes and contents of zeros over the full 4-rank
+        # mesh: 1-D Shard(0) of (32, 3) gives (8, 3); uneven (31, 3) gives 8 rows on ranks up to 2
+        # and 7 on rank 3; on a 2x2 mesh Shard/Replicate gives (16, 4), Shard/Shard gives (16, 2),
+        # and uneven (31, 3) Shard/Shard gives per-rank shapes (16,2), (16,1), (15,2), (15,1).
         # construct a gpu device 1d mesh
         mesh = self.build_device_mesh()
         placements = [Shard(0)]
@@ -305,6 +352,8 @@ class DTensorConstructorTest(DTensorTestBase):
 
         @maybe_run_for_local_tensor
         def check_per_rank_tensors(rank, local_tensor):
+            # [FUNCTION DOC] HELPER: Asserts shape and zero contents of a local tensor: (8, 3) for
+            # ranks 0 to 2, otherwise (7, 3).
             if rank <= 2:
                 self.assertEqual(local_tensor.size(), torch.Size([8, 3]))
                 self.assertEqual(torch.zeros(8, 3), local_tensor)
@@ -353,6 +402,9 @@ class DTensorConstructorTest(DTensorTestBase):
 
     @with_comms
     def test_zeros_submesh(self):
+        # [FUNCTION DOC] Checks zeros on meshes that cover only some ranks: ranks {0, 3} (16, 3
+        # each), uneven ranks {0, 1, 3} (11, 11, 10 rows), and a 2-D mesh of ranks 0 and 3 with
+        # two shard dims. Ranks outside the mesh must hold an empty tensor of size 0.
         # default world_size is 4
         # construct a gpu device 1d mesh, with no sub pg initialized
         sub_mesh_list = [0, 3]

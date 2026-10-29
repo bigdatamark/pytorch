@@ -1,3 +1,7 @@
+# [MODULE DOC] Tests for miscellaneous DTensor ops on a 2-rank replicated mesh: slicing,
+# bernoulli, and cross entropy loss. Each compares output and gradient mean squared errors with
+# the plain tensor result against a 1e-6 bound over 10 iterations. Defines constants ITER_TIME and
+# LR (LR is unused) and a LocalTensor variant class that skips the bernoulli test.
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
 
@@ -18,13 +22,20 @@ LR = 0.001
 
 
 class DistOtherOpsTest(DTensorTestBase):
+    # [CLASS DOC] Tests of a few DTensor ops (slice, bernoulli, cross entropy) with replicated
+    # inputs on a world of 2 ranks, checking forward values and input gradients.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns the fixed world size, 2.
         # hard code world size to 2
         return 2
 
     @with_comms
     def test_slice(self):
+        # [FUNCTION DOC] For each iteration, slices columns 0 to 5 of a replicated (1024, 10)
+        # DTensor and of the same plain tensor, backpropagates a random small gradient through
+        # both, and asserts absolute and relative mean squared errors of the output and of the
+        # input gradient are at most 1e-6.
         device_mesh = self.build_device_mesh()
         shard_spec = [Replicate()]
 
@@ -76,6 +87,11 @@ class DistOtherOpsTest(DTensorTestBase):
 
     @with_comms
     def test_bernoulli(self):
+        # [FUNCTION DOC] Applies torch.bernoulli to a replicated (1024, 10) DTensor, backpropagates
+        # a random gradient, then exchanges the local output and gradient with the peer rank
+        # (the other of the two ranks) using batched send and receive, and asserts the squared
+        # errors between own and peer data are at most 1e-6, checking that the random draw is
+        # identical across replicas. Uses real point-to-point communication.
         rank = dist.get_rank()
         device_mesh = self.build_device_mesh()
         shard_spec = [Replicate()]
@@ -139,6 +155,10 @@ class DistOtherOpsTest(DTensorTestBase):
 
     @with_comms
     def test_nll(self):
+        # [FUNCTION DOC] Computes CrossEntropyLoss on a replicated (1024, 10) prediction DTensor
+        # and replicated class targets, and on plain tensors; after backward asserts absolute
+        # and relative mean squared errors of the loss and of the prediction gradient are at
+        # most 1e-6.
         device_mesh = self.build_device_mesh()
         shard_spec = [Replicate()]
 
