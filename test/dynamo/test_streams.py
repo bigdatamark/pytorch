@@ -1,4 +1,12 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests for torch.compile support of streams and events across Dynamo tracing,
+# AOT autograd stream passes and Inductor lowering. Covers: stream context managers (annotated
+# with stream indices in the captured graphs), stream and event creation and weakref handling,
+# event record/wait/synchronize ops, backward-pass stream handling with sync_dealloc and
+# record_stream, control_deps wrapping of synchronization nodes, errors for events recorded
+# after input mutation, and end-to-end compiled runs. Most tests need CUDA and compare against
+# inline expected graph text. Module level helpers normalize printed graphs. Running the file
+# as a script calls run_tests; importing has no side effects beyond imports.
 import gc
 import re
 import unittest
@@ -26,14 +34,23 @@ from torch.testing._internal.common_utils import (
 
 
 def remove_file_comment(gm_str: str) -> str:
+    # [FUNCTION DOC] HELPER: Return the input graph text with every fragment from the word
+    # File to the end of its line replaced by a bare newline (dropping stack-trace file
+    # comments), then with trailing whitespace removed by remove_trailing_space.
     return remove_trailing_space(re.sub(r"File.*\n", "\n", gm_str))
 
 
 def print_graph(graph: torch.fx.GraphModule) -> str:
+    # [FUNCTION DOC] HELPER: Render a GraphModule as readable text without printing it, then
+    # strip file comments with remove_file_comment. Returns the string used as the actual
+    # value in expected-graph assertions.
     return remove_file_comment(graph.print_readable(print_output=False))
 
 
 def strip_annotation_desc(gm_str: str) -> str:
+    # [FUNCTION DOC] HELPER: Keep only the Annotation comment with its braces in each line and
+    # drop whatever follows on that line. The regex does not cross newlines, so only the tail
+    # of the same line is removed. Returns the cleaned string.
     """Strip the stack-trace description off "# Annotation: {...}" lines.
 
     The description ("Backward of forward node:" vs "No stacktrace found for
@@ -44,25 +61,43 @@ def strip_annotation_desc(gm_str: str) -> str:
 
 
 class TestStreams(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Dynamo test case for stream and event support under torch.compile. Holds no
+    # state; each test builds its own functions, streams and events, extracts forward/backward
+    # graphs with extract_graph, and checks either graph text, graph structure (control_deps
+    # nodes, dependencies) or numerical agreement with eager. Many tests need CUDA and are
+    # skipped otherwise; the helper _assert_weakref_callback_fires and
+    # _assert_empty_sync_anchors_record are shared by several tests.
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] HELPER: Class-level setup that only defers to the
+        # parent TestCase setup.
         super().setUpClass()
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] HELPER: Class-level teardown that only defers to the parent
+        # TestCase teardown.
         super().tearDownClass()
 
     @requires_cuda
     def test_stream_weakref(self):
+        # [FUNCTION DOC] Checks that a torch.Stream object supports weak references: creates
+        # one and takes a weakref; passes if no exception is raised. Needs CUDA.
         s = torch.Stream()
         weakref.ref(s)
 
     @requires_cuda
     def test_event_weakref(self):
+        # [FUNCTION DOC] Checks that a torch.Event object supports weak references: creates
+        # one and takes a weakref; passes if no exception is raised. Needs CUDA.
         e = torch.Event()
         weakref.ref(e)
 
     def _assert_weakref_callback_fires(self, factory):
+        # [FUNCTION DOC] HELPER: Create an object from the given factory, attach a weakref
+        # whose callback records that it fired, delete the object and run garbage collection,
+        # then assert the callback fired exactly once. Finally drops the weakref. Used to
+        # verify that backend Stream/Event deallocation clears weak references.
         """Backend Stream/Event tp_dealloc overrides must call
         PyObject_ClearWeakRefs so that weakrefs to destroyed instances
         are properly cleared.  Without it, the weakref's wr_object is
@@ -87,16 +122,27 @@ class TestStreams(torch._dynamo.test_case.TestCase):
 
     @requires_cuda
     def test_cuda_stream_event_weakref_callback(self):
+        # [FUNCTION DOC] Runs the weakref callback check for torch.cuda.Stream and
+        # torch.cuda.Event. Needs CUDA.
         self._assert_weakref_callback_fires(torch.cuda.Stream)
         self._assert_weakref_callback_fires(torch.cuda.Event)
 
     @unittest.skipUnless(TEST_XPU, "xpu only")
     def test_xpu_stream_event_weakref_callback(self):
+        # [FUNCTION DOC] Runs the weakref callback check for torch.xpu.Stream and
+        # torch.xpu.Event. Skipped unless XPU is available.
         self._assert_weakref_callback_fires(torch.xpu.Stream)
         self._assert_weakref_callback_fires(torch.xpu.Event)
 
     @requires_cuda
     def test_dynamo_registry_no_dangling_weakref(self):
+        # [FUNCTION DOC] Regression test for a dangling weakref in the Dynamo external-
+        # object registry. Clears the registry, compiles with the eager backend a function
+        # that reads the raw handle of the current CUDA stream, runs it once, deletes the
+        # compiled function and collects garbage. Then asserts the registry has an entry for
+        # the current-stream index and that the weakref stored there resolves to None, i.e.
+        # it was cleared rather than left dangling. Needs CUDA. Side effect: resets global
+        # user object tracking.
         """Natural repro of the original UAF pattern.
 
         `torch.compile(fn, backend="eager")` with `fn` referencing
@@ -120,6 +166,8 @@ class TestStreams(torch._dynamo.test_case.TestCase):
         reset_user_object_tracking()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return the raw CUDA stream handle of the current stream;
+            # the argument is unused.
             return torch.cuda.current_stream().cuda_stream
 
         x = torch.zeros(1, device="cuda")
@@ -153,7 +201,14 @@ class TestStreams(torch._dynamo.test_case.TestCase):
 
     @requires_cuda
     def test_stream_enter_exit(self):
+        # [FUNCTION DOC] Traces a function that runs adds under two different stream contexts
+        # and uses both results. Asserts one forward graph was captured, that the compiled
+        # result equals eager, and that the printed graph equals the expected text where the
+        # adds are annotated with stream indices 1 and 2. Needs CUDA.
         def fn(x, y, s1, s2):
+            # [FUNCTION DOC] HELPER: Add the inputs inside the first stream context, add them
+            # again inside the second, then combine with a constant and the first result;
+            # returns the final tensor.
             with s1:
                 z1 = torch.add(x, y)
             with s2:
@@ -193,7 +248,13 @@ class <lambda>(torch.nn.Module):
     @requires_cuda
     @unittest.skip("Needs graph break support with annotation context")
     def test_stream_context_graph_break(self):
+        # [FUNCTION DOC] Placeholder for stream contexts spanning a graph break; always
+        # skipped because annotation contexts do not yet support graph breaks. The body would
+        # expect two forward graphs but both expected strings are empty. Needs CUDA.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Creates two local streams, computes under each, calls a
+            # Dynamo graph break inside the second stream context and then adds one more;
+            # returns the result.
             s2 = torch.Stream()
             s1 = torch.Stream()
             with s1:
@@ -221,7 +282,12 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_stream_input(self):
+        # [FUNCTION DOC] Compiles with fullgraph a function that takes a stream as an input
+        # and returns it alongside a computed tensor; asserts the compiled outputs equal eager
+        # outputs. Needs CUDA.
         def fn(x, y, s):
+            # [FUNCTION DOC] HELPER: Add the two tensors, add a constant and return that
+            # tensor together with the passed stream.
             z = torch.add(x, y)
             y = z + 2
             return y, s
@@ -234,7 +300,13 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_local_stream_return(self):
+        # [FUNCTION DOC] Compiles with fullgraph a function that creates a stream locally
+        # and returns it. Calls it twice and asserts the returned object is a torch.Stream
+        # and that the two calls return different streams (a new one is allocated per
+        # call). Needs CUDA.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Create a new stream, compute a tensor from the inputs and
+            # return the tensor with the stream.
             s = torch.Stream()
             z = torch.add(x, y)
             y = z + 2
@@ -251,10 +323,18 @@ class <lambda>(torch.nn.Module):
         self.assertNotEqual(s0, s1)
 
     def test_event_subclass_python_type(self):
+        # [FUNCTION DOC] Verifies that Dynamo keeps the Python subclass type of an Event
+        # input: compiles a function that tests whether its argument has the exact
+        # subclass type, calls it with an instance, and asserts the result is the ones
+        # tensor. Does not need a GPU.
         class MyEvent(torch.Event):
+            # [CLASS DOC] HELPER: Empty subclass of torch.Event used to check Python
+            # type preservation.
             pass
 
         def fn(e):
+            # [FUNCTION DOC] HELPER: Return a tensor of ones if the argument's exact type is
+            # the MyEvent subclass, otherwise a tensor of zeros.
             return torch.ones(2) if type(e) is MyEvent else torch.zeros(2)
 
         res = torch.compile(fn, backend="eager", fullgraph=True)(MyEvent())
@@ -262,7 +342,13 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_get_current_stream_return(self):
+        # [FUNCTION DOC] Compiles a function that enters an input stream and returns the
+        # accelerator current stream observed inside. Calls it twice and asserts both returned
+        # streams equal the input stream. Needs CUDA.
         def fn(x, s):
+            # [FUNCTION DOC] HELPER: Enter the stream given as the second argument, read
+            # the accelerator current stream inside the context and return the first
+            # argument with that stream.
             with s:
                 s0 = torch.accelerator.current_stream()
             return x, s0
@@ -277,10 +363,15 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_cuda_current_stream_attrs(self):
+        # [FUNCTION DOC] Verifies that attributes of the current CUDA stream (the raw stream
+        # handle) can be read in a fullgraph eager-backend compiled function and equal the
+        # eager value. Needs CUDA.
         """Verify that torch.cuda.current_stream() attributes are accessible
         under torch.compile and match eager behavior."""
 
         def fn_cuda_stream(x):
+            # [FUNCTION DOC] HELPER: Return the raw handle of the current CUDA stream; the
+            # tensor argument is unused.
             return torch.cuda.current_stream().cuda_stream
 
         x = torch.zeros(1, device="cuda")
@@ -289,10 +380,15 @@ class <lambda>(torch.nn.Module):
 
     @unittest.skipIf(not TEST_XPU, "XPU is not available")
     def test_xpu_current_stream_attrs(self):
+        # [FUNCTION DOC] XPU counterpart of the current stream attribute check: the compiled
+        # function returns the SYCL queue of the current XPU stream and must equal eager.
+        # Skipped when XPU is unavailable.
         """Verify that torch.xpu.current_stream() attributes are accessible
         under torch.compile and match eager behavior."""
 
         def fn_xpu_stream(x):
+            # [FUNCTION DOC] HELPER: Return the SYCL queue attribute of the current XPU
+            # stream; the tensor argument is unused.
             return torch.xpu.current_stream().sycl_queue
 
         x = torch.zeros(1, device="xpu")
@@ -301,10 +397,15 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_cuda_current_stream_with_entered_stream(self):
+        # [FUNCTION DOC] Verifies that inside a stream context entered on a user-created
+        # CUDA stream, the current stream handle read in compiled code equals the eager
+        # value. Needs CUDA.
         """Verify that torch.cuda.current_stream().cuda_stream returns the
         correct value when inside a stream context for a user-created stream."""
 
         def fn(x, s):
+            # [FUNCTION DOC] HELPER: Enter the given stream and return the raw handle of the
+            # current CUDA stream observed inside.
             with s:
                 return torch.cuda.current_stream().cuda_stream
 
@@ -315,10 +416,15 @@ class <lambda>(torch.nn.Module):
 
     @unittest.skipIf(not TEST_XPU, "XPU is not available")
     def test_xpu_current_stream_with_entered_stream(self):
+        # [FUNCTION DOC] XPU counterpart: inside a context on a user-created XPU stream, the
+        # compiled function returns the SYCL queue of the current stream and it must equal the
+        # eager value. Skipped when XPU is unavailable.
         """Verify that torch.xpu.current_stream().sycl_queue returns the
         correct value when inside a stream context for a user-created stream."""
 
         def fn(x, s):
+            # [FUNCTION DOC] HELPER: Enter the given stream and return the SYCL queue of the
+            # current XPU stream observed inside.
             with s:
                 return torch.xpu.current_stream().sycl_queue
 
@@ -329,7 +435,14 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_nested_stream_enter_exit(self):
+        # [FUNCTION DOC] Traces a function with nested stream contexts over three input
+        # streams, extracts the forward graph, and asserts one graph, equality with eager, and
+        # that the printed graph has the expected text with adds annotated by stream indices 2
+        # and 3 and a later add on stream 2. Needs CUDA.
         def fn(x, y, s0, s1, s2):
+            # [FUNCTION DOC] HELPER: Compute an add inside nested contexts of two streams,
+            # compute another add in a third stream and then combine inside a nested re-entry
+            # of the second stream; returns both results.
             with s1:
                 with s2:
                     z1 = torch.add(x, y)
@@ -375,15 +488,24 @@ class <lambda>(torch.nn.Module):
 
     @unittest.skip("Needs graph break support with annotation context")
     def test_stream_enter_exit_graph_break(self):
+        # [FUNCTION DOC] Placeholder test for stream enter/exit with graph breaks; always
+        # skipped, body does nothing.
         pass
 
     @unittest.skip("Needs graph break support with annotation context")
     def test_nested_stream_enter_exit_graph_break(self):
+        # [FUNCTION DOC] Placeholder test for nested stream enter/exit with graph breaks;
+        # always skipped, body does nothing.
         pass
 
     @requires_cuda
     def test_local_stream_enter_exit(self):
+        # [FUNCTION DOC] Like the basic enter/exit test but the two streams are created inside
+        # the traced function. Asserts a single forward graph, equality with eager and the
+        # expected printed graph with stream annotations. Needs CUDA.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Create two local streams, add the inputs under the first,
+            # add them under the second and combine; returns the result.
             s2 = torch.Stream()
             s1 = torch.Stream()
             with s1:
@@ -424,7 +546,13 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_local_stream_nested_enter_exit(self):
+        # [FUNCTION DOC] Like the nested enter/exit test but with streams created inside the
+        # traced function. Asserts a single forward graph, equality with eager and the
+        # expected printed graph with stream annotations. Needs CUDA.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Create three local streams, compute under nested
+            # contexts of two of them, compute under the third and re-enter the second;
+            # returns both results.
             s2 = torch.Stream()
             s1 = torch.Stream()
             s0 = torch.Stream()
@@ -467,10 +595,18 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_new_stream_api(self) -> None:
+        # [FUNCTION DOC] Exercises the new_stream API from Dynamo's stream variables inside a
+        # custom backend. The backend creates two stream indices, asserts they differ and that
+        # the external objects they refer to differ, then inserts a node that fetches an
+        # external object by index into the graph. Compiles a trivial function with this
+        # backend and runs it on a CUDA tensor. Needs CUDA.
         from torch._dynamo.graph_bytecode_inputs import get_external_object_by_index
         from torch._dynamo.variables.streams import new_stream
 
         def stream_generation_backend(gm, *args, **kwargs):  # type: ignore[no-untyped-def]
+            # [FUNCTION DOC] HELPER: Custom compile backend: allocates two new streams,
+            # asserts distinct indices and distinct objects, inserts a fetch-by-index graph
+            # node after the first node and returns the modified graph module.
             s0_ind = new_stream()
             s1_ind = new_stream()
             self.assertNotEqual(s0_ind, s1_ind)
@@ -486,12 +622,18 @@ class <lambda>(torch.nn.Module):
 
         @torch.compile(backend=stream_generation_backend)
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return the input plus one.
             return x + 1
 
         fn(torch.ones(2, 2, device="cuda:0"))
 
     @requires_cuda
     def test_current_stream_api(self) -> None:
+        # [FUNCTION DOC] Exercises the get_current_stream API inside a custom backend. The
+        # backend asks for the current stream index on the first CUDA device, asserts the
+        # referenced object equals the stream captured outside, and inserts two graph nodes:
+        # one fetching the object and one running an equality assertion at graph runtime.
+        # Compiles a trivial function and runs it on CUDA. Needs CUDA.
         from torch._dynamo.graph_bytecode_inputs import get_external_object_by_index
         from torch._dynamo.variables.streams import get_current_stream
 
@@ -499,6 +641,10 @@ class <lambda>(torch.nn.Module):
         s0 = None
 
         def stream_generation_backend(gm, *args, **kwargs):  # type: ignore[no-untyped-def]
+            # [FUNCTION DOC] HELPER: Custom compile backend that checks the current stream
+            # index resolves to the captured current stream, inserts the two verification
+            # nodes after the first node and returns the graph module.
+            # KNOWN ISSUE: the nonlocal declaration of s0 is never used for assignment.
             nonlocal s0
             s0_ind = get_current_stream(torch.device("cuda:0"))
             self.assertEqual(get_external_object_by_index(s0_ind), cur_stream)
@@ -517,13 +663,21 @@ class <lambda>(torch.nn.Module):
 
         @torch.compile(backend=stream_generation_backend)
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return the input plus one.
             return x + 1
 
         fn(torch.ones(2, 2, device="cuda:0"))
 
     @requires_cuda
     def test_stream_with_mutation(self):
+        # [FUNCTION DOC] Traces a function that mutates an input in place inside nested stream
+        # contexts and computes other values on separate streams. Asserts a single forward
+        # graph, equality with eager, and the expected printed graph including the epilogue
+        # copy back into the input on the first stream. Needs CUDA.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Create three local streams; mutate the first input with
+            # an in-place add in nested contexts, compute two derived tensors on another
+            # stream and re-enter a stream for a final add; returns two tensors.
             s2 = torch.Stream()
             s1 = torch.Stream()
             s0 = torch.Stream()
@@ -573,7 +727,14 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_stream_backward_simple(self) -> None:
+        # [FUNCTION DOC] Traces a function computing the same expression on two streams
+        # with inputs requiring grad. Checks the forward graph text, then runs backward on
+        # one output and checks the backward graph text (using the raw printer), which
+        # contains stream annotations, a control_deps record_event subgraph and a
+        # sync_dealloc op. Needs CUDA.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Create two streams and compute the same affine expression
+            # under each; returns both results.
             s2 = torch.Stream()
             s0 = torch.Stream()
             with s0:
@@ -654,7 +815,13 @@ class GraphModule(torch.nn.Module):
 
     @requires_cuda
     def test_stream_backward_sync(self) -> None:
+        # [FUNCTION DOC] Same function as the simple backward test but on CUDA tensors with
+        # explicit device synchronization around graph extraction. Checks the forward graph
+        # text, runs backward on one output and checks the backward graph text with several
+        # control_deps subgraphs for record, wait and record events. Needs CUDA.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Create two streams and compute the same affine expression
+            # under each; returns both results.
             s2 = torch.Stream()
             s0 = torch.Stream()
             with s0:
@@ -775,7 +942,12 @@ class GraphModule(torch.nn.Module):
 
     @requires_cuda
     def test_event_tracing(self):
+        # [FUNCTION DOC] Traces a function that creates an event, records it, mutates the
+        # input in place, and asserts the printed forward graph contains a record_event op
+        # before the add and copy. Needs CUDA.
         def fn(x) -> None:
+            # [FUNCTION DOC] HELPER: Create an event, record it, add one to the input in place
+            # and return the input.
             e = torch.Event()
             e.record()
             x.add_(1)
@@ -806,9 +978,15 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_recorded_cuda_events_append_runtime_objects(self):
+        # [FUNCTION DOC] Checks that compiling with the eager backend a function that records
+        # two timing CUDA events and appends them to an outer list leaves runtime Event
+        # objects in the list. Compares result with eager, asserts two torch.Event entries and
+        # a non-negative elapsed time between them. Needs CUDA.
         events = []
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Create two timing events, record one before and one after
+            # a matmul, append both to the enclosing list and return the matmul result.
             start_event = torch.cuda.Event(enable_timing=True)
             end_event = torch.cuda.Event(enable_timing=True)
 
@@ -837,6 +1015,10 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_run_opcheck_fork_join(self):
+        # [FUNCTION DOC] Runs the library opcheck on the fork_stream and join_stream ops for
+        # two sample index pairs after registering two streams in the Dynamo external-object
+        # tracking. In a finally clause restores the original current stream and resets the
+        # object tracking. Needs CUDA.
         from torch._dynamo.variables.streams import fork_stream, join_stream
         from torch.library import opcheck
 
@@ -859,6 +1041,9 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_run_opcheck_wait_record(self):
+        # [FUNCTION DOC] Runs opcheck on the wait_event and record_event ops for two sample
+        # argument pairs after registering two streams and two events in object tracking. A
+        # finally clause restores the original stream and resets tracking. Needs CUDA.
         from torch._dynamo.variables.streams import record_event, wait_event
         from torch.library import opcheck
 
@@ -883,6 +1068,9 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_run_opcheck_wait_record_stream(self):
+        # [FUNCTION DOC] Runs opcheck on the wait_stream op for two sample argument pairs
+        # after registering three streams in object tracking. A finally clause resets
+        # tracking. Needs CUDA.
         from torch._dynamo.variables.streams import wait_stream
         from torch.library import opcheck
 
@@ -903,11 +1091,19 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_record_stream_problem_basic(self):
+        # [FUNCTION DOC] Checks the record_stream problem when a tensor allocated on one
+        # stream is used on a second stream after an event wait. Extracts graphs, runs
+        # backward on one output and asserts the printed backward graph (with annotation
+        # descriptions stripped) matches the expected text, which includes a
+        # sync_dealloc op. Needs CUDA.
         # see https://docs.pytorch.org/docs/stable/generated/torch.Tensor.record_stream.html#torch.Tensor.record_stream
         # for what this tests/solves for
         # We expect there to be a sync_dealloc op added to the graph for y
         # synchronizing the first stream w/ the second stream after the second stream is finished
         def fn(x):
+            # [FUNCTION DOC] HELPER: Create an event, allocate a tensor on a first stream,
+            # record the event and multiply; on a second stream wait for the event and compute
+            # another product; returns both products.
             e = torch.Event()
             with torch.Stream(device="cuda:0"):
                 y = torch.ones(2, 2, device="cuda:0")
@@ -997,12 +1193,21 @@ class GraphModule(torch.nn.Module):
 
     @requires_cuda
     def test_record_stream_problem_interleaved(self):
+        # [FUNCTION DOC] Checks sync_dealloc and event handling when one tensor is allocated
+        # on the first stream and then used on three further streams chained with event record
+        # and wait. Extracts graphs, runs backward on one output and compares the annotation-
+        # stripped backward graph to the expected text with many record/wait control_deps
+        # subgraphs. Needs CUDA.
         # see https://docs.pytorch.org/docs/stable/generated/torch.Tensor.record_stream.html#torch.Tensor.record_stream
         # for what this tests/solves for
         # This will have interleaved computation where y is
         # first allocated on the first stream used on the second stream
         # used on the first stream again then finally used on the last stream
         def fn(x):
+            # [FUNCTION DOC] HELPER: Allocate a tensor on a first stream and chain
+            # computations over four streams, each waiting on and then re-recording one
+            # shared event, and finish with a wait on the default stream; returns three
+            # intermediate results.
             e = torch.Event()
             with torch.Stream(device="cuda:0"):
                 y = torch.ones(2, 2, device="cuda:0")
@@ -1254,7 +1459,13 @@ class GraphModule(torch.nn.Module):
 
     @requires_cuda
     def test_epilogue_copy_streams_inference(self):
+        # [FUNCTION DOC] Checks an in-place mutation of an input under a no_grad region on a
+        # user stream when the input requires grad. Runs backward on the output and asserts
+        # the printed forward graph has the add annotated with the stream followed by the
+        # epilogue copy into the input. Needs CUDA.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Inside a stream context and no_grad, add two to the input
+            # in place and return the input.
             with torch.Stream(device="cuda:0"):
                 with torch.no_grad():
                     x.add_(2)
@@ -1286,8 +1497,13 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_epilogue_copy_streams_external(self):
+        # [FUNCTION DOC] Verifies that mutating an input inside a user-specified stream
+        # context is rejected: extract_graph is expected to raise a RuntimeError saying
+        # mutations on inputs with user-specified streams are not yet supported. Needs CUDA.
         @torch.compile(backend="eager")
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compiled with the eager backend; multiplies the input in
+            # place by three inside a stream context and returns its sine.
             with torch.Stream(device="cuda:0"):
                 x.mul_(3)
             return x.sin()
@@ -1302,6 +1518,10 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_control_deps_wrapping_record_event(self) -> None:
+        # [FUNCTION DOC] Builds a two-stream graph with a record and a wait, then runs
+        # wrap_all_sync_nodes_with_control_deps manually. Asserts two control_deps nodes, that
+        # pass-through getitem nodes exist for the record node, and that the wait control_deps
+        # depends on the record control_deps node. Needs CUDA.
         """Test wrapping record_event with control_deps on a two-stream graph.
 
         The producer stream has work before the record_event, so control_deps
@@ -1309,6 +1529,8 @@ class <lambda>(torch.nn.Module):
         """
 
         def fn(x) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: On one stream compute two values and record an event; on
+            # another stream wait for the event and add three; returns the result.
             s1 = torch.Stream(device="cuda")
             s2 = torch.Stream(device="cuda")
             e = torch.Event()
@@ -1368,6 +1590,9 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_control_deps_wrapping_wait_event(self) -> None:
+        # [FUNCTION DOC] Builds a graph where the consumer stream has work before its event
+        # wait, applies the control_deps wrapping pass manually, and asserts two control_deps
+        # nodes (record and wait). Needs CUDA.
         """Test wrapping wait_event with control_deps on a two-stream graph.
 
         The consumer stream has the wait_event, and there should be same-stream
@@ -1375,6 +1600,9 @@ class <lambda>(torch.nn.Module):
         """
 
         def fn(x) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Record an event after an add on one stream; on another
+            # stream compute a product, wait on the event and multiply the two results;
+            # returns that value.
             s1 = torch.Stream(device="cuda")
             s2 = torch.Stream(device="cuda")
             e = torch.Event()
@@ -1417,6 +1645,10 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_control_deps_prevents_invalid_reordering(self) -> None:
+        # [FUNCTION DOC] Wraps sync nodes with control_deps, verifies the add comes after
+        # control_deps in node order and that lint passes, then moves the add node before the
+        # control_deps node and asserts the order is violated and that graph lint raises a
+        # RuntimeError. Needs CUDA.
         """
         Test that control_deps creates proper data dependencies that prevent invalid reordering.
 
@@ -1427,6 +1659,8 @@ class <lambda>(torch.nn.Module):
         """
 
         def fn(x) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Compute two values on one stream and record an event; on
+            # another stream wait on it and add three to the earlier result; returns that sum.
             s1 = torch.Stream(device="cuda")
             s2 = torch.Stream(device="cuda")
             e = torch.Event()
@@ -1494,6 +1728,11 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_cross_event_deps_multiple_events(self) -> None:
+        # [FUNCTION DOC] Stress test with two events across three streams. Captures the raw
+        # graph with the wrapping pass patched out, checks there are two record and two wait
+        # events whose event indices correspond, then wraps manually and asserts four
+        # control_deps nodes where each wait depends only on the record of its own event.
+        # Finishes with graph lint. Needs CUDA.
         """Stress test: multiple events across three streams.
 
         Verifies that each wait_event's control_deps node depends on exactly
@@ -1507,6 +1746,9 @@ class <lambda>(torch.nn.Module):
         """
 
         def fn(x) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: On one stream compute and record two events at different
+            # points; the second and third streams wait on one event each and multiply;
+            # returns the sum of all four values.
             s1 = torch.Stream(device="cuda")
             s2 = torch.Stream(device="cuda")
             s3 = torch.Stream(device="cuda")
@@ -1592,6 +1834,10 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_cross_event_deps_event_reuse(self) -> None:
+        # [FUNCTION DOC] Checks event reuse: an event recorded twice on one stream and then
+        # waited on from another stream. After wrapping, asserts three control_deps nodes
+        # and that the wait depends on the second record and not on the first. Ends with
+        # graph lint. Needs CUDA.
         """Test that reusing an event updates the cross-event dependency.
 
         When the same event is recorded twice with work in between, the wait
@@ -1600,6 +1846,9 @@ class <lambda>(torch.nn.Module):
         """
 
         def fn(x) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Record the same event twice around a
+            # multiplication on one stream, wait on it from another stream and add
+            # three; returns the combined value.
             s1 = torch.Stream(device="cuda")
             s2 = torch.Stream(device="cuda")
             e = torch.Event()
@@ -1650,6 +1899,10 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_same_stream_record_ordering(self) -> None:
+        # [FUNCTION DOC] Checks that consecutive records on one stream are chained: three
+        # events are recorded in a row after work on one stream. Asserts three control_deps
+        # nodes, each record depends on its immediate predecessor and the third does not
+        # depend on the first. Ends with graph lint. Needs CUDA.
         """Two record_events on one stream must be ordered relative to each other.
 
         The second record's per-stream work was reset by the first, so without
@@ -1661,6 +1914,8 @@ class <lambda>(torch.nn.Module):
         """
 
         def fn(x) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Create a stream and three events; add one under the
+            # stream then record the three events consecutively; returns the add result.
             s = torch.Stream(device="cuda")
             e1 = torch.Event()
             e2 = torch.Event()
@@ -1702,6 +1957,11 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_wait_stream_anchors_following_record(self) -> None:
+        # [FUNCTION DOC] Regression test: a record on a stream that has just waited on another
+        # via wait_stream must be chained to that wait instead of being left as a bare node.
+        # Asserts no bare record_event nodes remain, two record control_deps and one
+        # wait_stream control_deps exist, the wait depends on the first record and the second
+        # record depends on the wait. Ends with graph lint. Needs CUDA.
         """A record_event on the WAITING stream after a wait_stream must chain to
         the wait_stream (which runs on that stream), not float above it as a bare
         node. Regression: wait_stream's control_deps was keyed under the waited-on
@@ -1709,6 +1969,9 @@ class <lambda>(torch.nn.Module):
         """
 
         def fn(x) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Compute a matmul on the default stream, record an event,
+            # then on a side stream wait for the default stream and record another event, wait
+            # on it and return the matmul.
             default = torch.cuda.current_stream()
             side = torch.cuda.Stream()
             ready = torch.cuda.Event()
@@ -1756,7 +2019,14 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_cross_stream_event_rerecord_without_work(self) -> None:
+        # [FUNCTION DOC] Checks re-recording an event from a second stream without any work in
+        # between: asserts two record and one wait control_deps nodes, the second record
+        # depends on the first, the wait depends on the second record but not on the first.
+        # Ends with graph lint. Needs CUDA.
         def fn(x) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Record one event on a first stream after an add, record
+            # it again on a second stream with no work, wait for it on a third stream and
+            # add; returns the sum.
             s1 = torch.cuda.Stream()
             s2 = torch.cuda.Stream()
             s3 = torch.cuda.Stream()
@@ -1790,7 +2060,13 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_wait_stream_preserves_waited_on_work(self) -> None:
+        # [FUNCTION DOC] Checks that wait_stream retains the work of the stream waited on:
+        # after the pass, exactly one record control_deps node exists and it has a non-empty
+        # dependency tuple. Ends with graph lint. Needs CUDA.
         def fn(x) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Compute a matmul on the default stream, make a side
+            # stream wait on the default stream, record an event on the default stream and
+            # return the matmul.
             default = torch.cuda.current_stream()
             side = torch.cuda.Stream()
             a = x @ x
@@ -1813,7 +2089,13 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_leading_synchronize_stream_orders_following_work(self) -> None:
+        # [FUNCTION DOC] Checks that a leading synchronize on the current stream
+        # orders later work: asserts exactly one synchronize_stream control_deps node
+        # and that the following add consumes a value threaded through it. Ends with
+        # graph lint. Needs CUDA.
         def fn(x) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Synchronize the current stream and return
+            # the input plus one.
             torch.cuda.current_stream().synchronize()
             return x + 1
 
@@ -1835,6 +2117,10 @@ class <lambda>(torch.nn.Module):
         graph.lint()
 
     def test_full_barrier_forward_deps_respect_partition(self) -> None:
+        # [FUNCTION DOC] Builds a hand-made fx graph with a forward and a backward add and a
+        # full-barrier synchronize node, calls the helper that collects forward dependencies
+        # of sync nodes, and asserts the barrier depends only on the forward input (the
+        # backward-partition nodes are excluded).
         from torch._functorch._aot_autograd.streams import _collect_sync_forward_deps
 
         graph = torch.fx.Graph()
@@ -1856,6 +2142,10 @@ class <lambda>(torch.nn.Module):
         self.assertEqual(list(deps[barrier]), [fw_input])
 
     def test_backward_full_barrier_filters_forward_sync_deps(self) -> None:
+        # [FUNCTION DOC] Builds a small graph with one forward compute node, a forward record
+        # and a backward-tagged record, then calls the full-barrier dependency collector for
+        # the backward pass. Asserts the result is the forward compute node and the backward
+        # sync node, i.e. forward sync nodes are filtered out.
         from torch._functorch._aot_autograd.streams import _collect_full_barrier_deps
 
         graph = torch.fx.Graph()
@@ -1872,6 +2162,10 @@ class <lambda>(torch.nn.Module):
         self.assertEqual(deps, [fw_compute, bw_sync])
 
     def test_wait_stream_forward_deps_are_transitive(self) -> None:
+        # [FUNCTION DOC] Builds a graph where a wait_stream is followed by a producer on one
+        # stream and a consumer on another, and asserts that the collected wait dependencies
+        # for the wait node contain only the graph input, showing the dependencies are
+        # computed transitively through the consumer chain.
         from torch._functorch._aot_autograd.streams import (
             _collect_sync_forward_deps,
             set_stream,
@@ -1893,6 +2187,10 @@ class <lambda>(torch.nn.Module):
         self.assertEqual(list(wait_deps[wait]), [inp])
 
     def test_wait_stream_forward_deps_respect_partition(self) -> None:
+        # [FUNCTION DOC] Builds a graph with a forward wait_stream and a backward-tagged
+        # wait_stream, each with its own stream compute node, and asserts the collected wait
+        # dependencies map each wait to the placeholder of its own partition (forward input
+        # for the forward wait, backward input for the backward one).
         from torch._functorch._aot_autograd.streams import (
             _collect_sync_forward_deps,
             set_stream,
@@ -1922,6 +2220,10 @@ class <lambda>(torch.nn.Module):
     def _assert_empty_sync_anchors_record(
         self, sync_target: torch._ops.OpOverload, sync_args: tuple[int, ...]
     ) -> None:
+        # [FUNCTION DOC] HELPER: Shared check: builds a graph holding one sync node of the
+        # given op overload and arguments followed by a record_event with no compute between
+        # them, wraps sync nodes with control_deps, and asserts exactly one control_deps node
+        # whose dependencies include the first sync node. Then runs graph lint.
         from torch._functorch._aot_autograd.streams import (
             wrap_all_sync_nodes_with_control_deps,
         )
@@ -1942,26 +2244,37 @@ class <lambda>(torch.nn.Module):
         graph.lint()
 
     def test_empty_synchronize_stream_anchors_record(self) -> None:
+        # [FUNCTION DOC] Uses the shared anchor check with a synchronize_stream sync node
+        # followed by an empty record.
         self._assert_empty_sync_anchors_record(
             torch.ops.streams.synchronize_stream.default, (0,)
         )
 
     def test_empty_synchronize_device_anchors_record(self) -> None:
+        # [FUNCTION DOC] Uses the shared anchor check with a synchronize_device sync node (no
+        # arguments) followed by an empty record.
         self._assert_empty_sync_anchors_record(
             torch.ops.streams.synchronize_device.default, ()
         )
 
     def test_empty_wait_stream_anchors_record(self) -> None:
+        # [FUNCTION DOC] Uses the shared anchor check with a wait_stream sync node followed
+        # by an empty record.
         self._assert_empty_sync_anchors_record(
             torch.ops.streams.wait_stream.default, (1, 0)
         )
 
     def test_external_wait_event_anchors_record(self) -> None:
+        # [FUNCTION DOC] Uses the shared anchor check with a wait_event sync node (an
+        # externally recorded event) followed by an empty record.
         self._assert_empty_sync_anchors_record(
             torch.ops.streams.wait_event.default, (0, 1)
         )
 
     def test_external_wait_event_orders_following_work(self) -> None:
+        # [FUNCTION DOC] Builds a graph with an external wait_event followed by an add placed
+        # on the waiting stream, wraps sync nodes, and asserts one control_deps node and that
+        # the add consumes a value threaded through it. Ends with graph lint.
         from torch._functorch._aot_autograd.streams import (
             set_stream,
             wrap_all_sync_nodes_with_control_deps,
@@ -1987,11 +2300,17 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_captured_external_wait_event_orders_following_work(self) -> None:
+        # [FUNCTION DOC] End-to-end version of the external wait_event ordering check: records
+        # a CUDA event outside the traced function, waits on it from a user stream inside,
+        # adds one, and after extraction asserts one wait_event control_deps node and that the
+        # add consumes a value threaded through it. Ends with graph lint. Needs CUDA.
         event = torch.cuda.Event()
         stream = torch.cuda.Stream()
         event.record()
 
         def fn(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Enter the captured stream, wait on the captured external
+            # event and return the input plus one.
             with torch.cuda.stream(stream):
                 event.wait()
                 return x + 1
@@ -2009,6 +2328,10 @@ class <lambda>(torch.nn.Module):
         graph.lint()
 
     def test_external_wait_event_preserves_copy_destination(self) -> None:
+        # [FUNCTION DOC] Builds a graph with an external wait_event followed by an in-place
+        # copy on the waiting stream, wraps sync nodes, and asserts the copy destination is
+        # still the original placeholder while the copy source is threaded through the
+        # control_deps node. Ends with graph lint.
         from torch._functorch._aot_autograd.streams import (
             set_stream,
             wrap_all_sync_nodes_with_control_deps,
@@ -2035,11 +2358,16 @@ class <lambda>(torch.nn.Module):
         graph.lint()
 
     def test_empty_synchronize_event_anchors_record(self) -> None:
+        # [FUNCTION DOC] Uses the shared anchor check with a synchronize_event sync node
+        # followed by an empty record.
         self._assert_empty_sync_anchors_record(
             torch.ops.streams.synchronize_event.default, (0,)
         )
 
     def test_wait_stream_depends_on_prior_waiting_stream_work(self) -> None:
+        # [FUNCTION DOC] Builds a graph with prior work on a stream followed by a wait_stream
+        # on that stream, wraps sync nodes, and asserts one control_deps node whose
+        # dependencies include the prior work. Ends with graph lint.
         from torch._functorch._aot_autograd.streams import (
             set_stream,
             wrap_all_sync_nodes_with_control_deps,
@@ -2064,6 +2392,10 @@ class <lambda>(torch.nn.Module):
         graph.lint()
 
     def test_wait_stream_self_wait_orders_work_once(self) -> None:
+        # [FUNCTION DOC] Builds a graph with work on a stream, a wait_stream where a stream
+        # waits on itself, and later work on the same stream. Asserts the prior work appears
+        # once in the control_deps dependencies and the later work consumes a value threaded
+        # through the control_deps node. Ends with graph lint.
         from torch._functorch._aot_autograd.streams import (
             set_stream,
             wrap_all_sync_nodes_with_control_deps,
@@ -2094,6 +2426,11 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_epilogue_copy_stream_tracking(self):
+        # [FUNCTION DOC] Verifies the epilogue copy for an input mutated in backward is placed
+        # on the stream of the mutation. Uses a custom autograd function whose backward
+        # mutates a saved tensor on one stream and computes gradients on another. Checks the
+        # forward graph text, runs backward and checks the backward graph text where the copy
+        # back is annotated with the mutation stream. Needs CUDA.
         """
         Test that epilogue copies for mutated inputs use the correct stream.
         This verifies that ViewAndMutationMeta.mutated_inp_stream_indices is
@@ -2103,8 +2440,15 @@ class <lambda>(torch.nn.Module):
         """
 
         class BwMutationWithStream(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Custom autograd function creating two streams in
+            # forward (stored on the context): forward computes on the second stream and
+            # backward mutates the saved input on the first stream while computing
+            # gradients on the second.
             @staticmethod
             def forward(ctx, x, y):
+                # [FUNCTION DOC] HELPER: Save the input for backward, create and store
+                # two streams on the context, compute a scaled sum under the second
+                # stream and return it.
                 ctx.save_for_backward(x)
                 ctx.s1 = torch.Stream(device="cuda:0")
                 ctx.s2 = torch.Stream(device="cuda:0")
@@ -2115,6 +2459,9 @@ class <lambda>(torch.nn.Module):
 
             @staticmethod
             def backward(ctx, grad_output):
+                # [FUNCTION DOC] HELPER: Mutate the saved input in place under the first
+                # stream, compute gradients for both inputs under the second stream and return
+                # them with two None entries.
                 (x,) = ctx.saved_tensors
                 # Mutate saved tensor x on stream s1 in backward
                 with ctx.s1:
@@ -2126,6 +2473,8 @@ class <lambda>(torch.nn.Module):
                 return grad_x, grad_y, None, None
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Apply the custom autograd function to the inputs and
+            # return the result.
             result = BwMutationWithStream.apply(x, y)
             return result
 
@@ -2178,10 +2527,15 @@ class GraphModule(torch.nn.Module):
 
     @requires_cuda
     def test_inductor_lowering(self):
+        # [FUNCTION DOC] Compiles with the default backend a function that records an event
+        # while mutating its input, with Inductor implicit fallbacks disabled, and runs it.
+        # Passes if Inductor lowers the stream ops without needing fallbacks. Needs CUDA.
         with patch("torch._inductor.config.implicit_fallbacks", False):
 
             @torch.compile()  # noqa: UNSPECIFIED_BACKEND
             def fn(x):
+                # [FUNCTION DOC] HELPER: Create an event, update the input in place, record
+                # the event and return the input.
                 e = torch.Event()
                 x += x + 1
                 e.record()
@@ -2191,6 +2545,9 @@ class GraphModule(torch.nn.Module):
             fn(*inp)
 
     def test_is_marked_side_effectful(self):
+        # [FUNCTION DOC] Asserts that the fork, join, wait_event, record_event and
+        # synchronize_event stream ops are all registered in the fx set of side-
+        # effectful functions.
         self.assertIn(
             torch.ops.streams.fork.default, torch.fx.node._side_effectful_functions
         )
@@ -2212,6 +2569,10 @@ class GraphModule(torch.nn.Module):
 
     @requires_cuda
     def test_backward_sync_control_deps_e2e(self) -> None:
+        # [FUNCTION DOC] End-to-end check that a backward graph for a function with two
+        # streams contains control_deps nodes. Extracts graphs, runs backward on one
+        # output and asserts at least one backward graph with one or more control_deps
+        # nodes. Needs CUDA.
         """
         End-to-end test verifying that backward sync nodes are wrapped with control_deps.
 
@@ -2223,6 +2584,8 @@ class GraphModule(torch.nn.Module):
         from torch._inductor.fx_passes.control_dependencies import control_deps
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Create two streams and compute a different affine
+            # expression under each; returns both results.
             s0 = torch.Stream()
             s1 = torch.Stream()
             with s0:
@@ -2262,6 +2625,8 @@ class GraphModule(torch.nn.Module):
         )
 
     def test_sync_dealloc_has_fake_impl(self):
+        # [FUNCTION DOC] Verifies that the sync_dealloc op has a fake implementation by
+        # calling it on a fake tensor under a fake tensor mode; passes if no error is raised.
         """Test that sync_dealloc has a registered fake impl.
 
         Without a fake impl, Inductor's backward compilation crashes when the
@@ -2275,6 +2640,9 @@ class GraphModule(torch.nn.Module):
             torch.ops.streams.sync_dealloc.default(0, 1, t)
 
     def test_record_stream_has_fake_impl(self):
+        # [FUNCTION DOC] Verifies the record_stream op has a fake implementation with a
+        # matching signature by calling it on a fake tensor under a fake tensor mode; passes
+        # if no error is raised.
         """Test that record_stream's fake impl has the correct signature."""
         from torch._subclasses.fake_tensor import FakeTensorMode
 
@@ -2285,9 +2653,14 @@ class GraphModule(torch.nn.Module):
 
     @requires_cuda
     def test_record_stream(self):
+        # [FUNCTION DOC] Compiles with a recording backend a function that calls record_stream
+        # on its input with a new stream, and asserts one graph was captured containing a node
+        # targeting the record_stream op. Needs CUDA.
         backend = torch._dynamo.testing.EagerAndRecordGraphs()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Create a stream, call record_stream on the input with it
+            # and return the input.
             s = torch.Stream()
             x.record_stream(s)
             return x
@@ -2304,7 +2677,12 @@ class GraphModule(torch.nn.Module):
 
     @requires_cuda
     def test_event_record_after_input_mutation_errors(self):
+        # [FUNCTION DOC] Asserts that compiling a function which mutates an input in place and
+        # then records an event on the same stream and returns the event raises a RuntimeError
+        # saying an event was recorded on a stream. Needs CUDA.
         def fn(x):
+            # [FUNCTION DOC] HELPER: On a new stream mutate the input in place, record a new
+            # event and return the event.
             s = torch.Stream()
             e = torch.Event()
             with s:
@@ -2319,7 +2697,13 @@ class GraphModule(torch.nn.Module):
 
     @requires_cuda
     def test_event_record_after_input_mutation_stack_traces(self):
+        # [FUNCTION DOC] Same failing scenario as the previous error test but inspects the
+        # error message: it must name where the input mutation occurred and where the event
+        # was recorded, including the offending source lines. Fails the test if no error is
+        # raised. Needs CUDA.
         def fn(x):
+            # [FUNCTION DOC] HELPER: On a new stream mutate the input in place, record a new
+            # event and return the event.
             s = torch.Stream()
             e = torch.Event()
             with s:
@@ -2341,7 +2725,12 @@ class GraphModule(torch.nn.Module):
 
     @requires_cuda
     def test_event_record_after_input_mutation_record_event(self):
+        # [FUNCTION DOC] Checks the error also fires when the event is produced by the
+        # stream's own record-event method after an input mutation on that stream. Expects a
+        # RuntimeError about an event recorded on a stream. Needs CUDA.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Mutate the input in place under a new stream and return
+            # the event created from that stream.
             s = torch.Stream()
             with s:
                 x.add_(1)
@@ -2355,7 +2744,12 @@ class GraphModule(torch.nn.Module):
 
     @requires_cuda
     def test_event_record_after_input_mutation_through_view(self):
+        # [FUNCTION DOC] Checks the error also fires when the mutation is made through
+        # a view of the input. Expects a RuntimeError about an event recorded on a
+        # stream. Needs CUDA.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Take a flattened view of the input, mutate it in place on
+            # a new stream, record an event and return it.
             s = torch.Stream()
             e = torch.Event()
             v = x.view(-1)
@@ -2371,7 +2765,11 @@ class GraphModule(torch.nn.Module):
 
     @requires_cuda
     def test_event_record_after_input_mutation_input_event(self):
+        # [FUNCTION DOC] Checks the error also fires when the event is passed in as an input.
+        # Expects a RuntimeError about an event recorded on a stream. Needs CUDA.
         def fn(x, e):
+            # [FUNCTION DOC] HELPER: On a new stream mutate the first input in place, record
+            # the given event and return the first input.
             s = torch.Stream()
             with s:
                 x.add_(1)
@@ -2386,7 +2784,11 @@ class GraphModule(torch.nn.Module):
 
     @requires_cuda
     def test_event_record_before_input_mutation_no_error(self):
+        # [FUNCTION DOC] Checks no error is raised when the event is recorded before the input
+        # is mutated on the same stream. Compiles with fullgraph and runs. Needs CUDA.
         def fn(x):
+            # [FUNCTION DOC] HELPER: On a new stream record an event first, then mutate the
+            # input in place; returns the event.
             s = torch.Stream()
             e = torch.Event()
             with s:
@@ -2400,7 +2802,11 @@ class GraphModule(torch.nn.Module):
 
     @requires_cuda
     def test_event_record_on_different_stream_no_error(self):
+        # [FUNCTION DOC] Checks no error is raised when the input mutation and the event
+        # record happen on different streams. Compiles with fullgraph and runs. Needs CUDA.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Mutate the input in place on one stream and record an
+            # event on another; returns the event.
             s0 = torch.Stream()
             s1 = torch.Stream()
             e = torch.Event()
@@ -2416,7 +2822,14 @@ class GraphModule(torch.nn.Module):
 
     @requires_cuda
     def test_event_not_returned_no_error(self):
+        # [FUNCTION DOC] Despite the name, this test expects a RuntimeError about an event
+        # recorded on a stream even though the event is not returned (the function returns the
+        # input). Needs CUDA.
+        # KNOWN ISSUE: the test name says no error is expected but the body asserts that
+        # an error is raised.
         def fn(x):
+            # [FUNCTION DOC] HELPER: On a new stream mutate the input in place and record a
+            # new event, then return the input.
             s = torch.Stream()
             e = torch.Event()
             with s:
@@ -2436,6 +2849,9 @@ class GraphModule(torch.nn.Module):
     @requires_cuda
     @unittest.skip("https://github.com/pytorch/pytorch/issues/177771")
     def test_cuda_event_record_on_stream(self):
+        # [FUNCTION DOC] Intended to check that a torch.cuda.Event is accepted by Stream
+        # record_event at the C++ type check. Always skipped (tracked issue). Body creates a
+        # CUDA stream and event and records the event on the stream.
         """torch.cuda.Event should be accepted by torch.Stream.record_event (C++ type check)."""
         s = torch.Stream(device="cuda")
         e = torch.cuda.Event()
@@ -2444,7 +2860,13 @@ class GraphModule(torch.nn.Module):
 
     @requires_cuda
     def test_event_synchronize_tracing(self):
+        # [FUNCTION DOC] Traces a function that records an event, adds one to the input and
+        # synchronizes the event, and asserts the printed forward graph shows a
+        # record_event followed by an add and a control_deps node wrapping a
+        # synchronize_event subgraph. Needs CUDA.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Record a new event, add one to the input, synchronize the
+            # event and return the sum.
             e = torch.Event()
             e.record()
             x = x + 1
@@ -2485,10 +2907,15 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_event_synchronize_inductor_lowering(self):
+        # [FUNCTION DOC] Compiles with the default backend a function that records and
+        # synchronizes an event, with Inductor implicit fallbacks disabled, and runs it.
+        # Passes if lowering succeeds without fallbacks. Needs CUDA.
         with patch("torch._inductor.config.implicit_fallbacks", False):
 
             @torch.compile()  # noqa: UNSPECIFIED_BACKEND
             def fn(x):
+                # [FUNCTION DOC] HELPER: Create an event, add one to the input, record and
+                # synchronize the event and return the sum.
                 e = torch.Event()
                 x = x + 1
                 e.record()
@@ -2500,6 +2927,11 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_control_deps_wrapping_synchronize_event(self) -> None:
+        # [FUNCTION DOC] Checks that synchronize_event threads the values passed through
+        # record_event. Captures the raw graph, sets stream metadata on compute nodes, wraps
+        # sync nodes and asserts two control_deps nodes, that the synchronize depends on the
+        # record, that record getitem outputs are passed on through the synchronize, and that
+        # the later multiply consumes a getitem of the synchronize node. Needs CUDA.
         """Test that synchronize_event threads recorded ops' values through.
 
         After record_event wraps ops in control_deps and produces getitem
@@ -2508,6 +2940,8 @@ class <lambda>(torch.nn.Module):
         """
 
         def fn(x) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Add one to the input, record and synchronize a new event,
+            # then multiply the earlier value by two and return it.
             e = torch.Event()
             y = x + 1
             e.record()
@@ -2618,9 +3052,16 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_external_event_synchronize_threads_inputs(self) -> None:
+        # [FUNCTION DOC] Checks that for an externally recorded event, synchronize threads
+        # graph inputs. Captures the raw graph, erases the record_event node, sets stream
+        # metadata on compute nodes, wraps and recompiles, then asserts one control_deps
+        # node that includes the add in its dependencies and feeds the multiply. Ends with
+        # graph lint. Needs CUDA.
         """When the event was recorded externally, synchronize threads graph inputs through."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Add one to the input, record and synchronize a new event,
+            # then multiply the earlier value by two and return it.
             e = torch.Event()
             y = x + 1
             e.record()
@@ -2684,9 +3125,14 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_event_synchronize_control_deps_e2e(self):
+        # [FUNCTION DOC] End-to-end check with the default compile backend: compute, record,
+        # synchronize an event and then use the earlier result. Asserts the compiled result
+        # equals eager. Needs CUDA.
         """E2E: compute → record → synchronize → use result through torch.compile."""
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Add one to the input, record and synchronize a new event,
+            # then multiply the earlier value by two and return it.
             e = torch.Event()
             y = x + 1
             e.record()
@@ -2701,7 +3147,14 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_event_synchronize_e2e(self):
+        # [FUNCTION DOC] End-to-end check with the default compile backend of non-blocking
+        # copies to the CPU of ten half precision CUDA tensors, each followed by an event
+        # record, then synchronizing all events and concatenating. Asserts the compiled result
+        # equals eager. Needs CUDA.
         def f(a_list):
+            # [FUNCTION DOC] HELPER: For each tensor in the list copy it to the CPU without
+            # blocking and record a fresh event; afterwards synchronize every event and return
+            # the concatenation of the CPU copies.
             a_cpu_list = []
             a_to_cpu_event_list = []
             for a in a_list:
@@ -2726,9 +3179,14 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_event_record_wait_on_default_stream(self):
+        # [FUNCTION DOC] End-to-end check that recording and waiting on a CUDA event on the
+        # default stream compiles and matches eager. The event is created outside the
+        # function. Needs CUDA.
         e = torch.cuda.Event()
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Add one to the input, record and wait on the captured
+            # event and return the earlier value plus one.
             y = x + 1
             e.record()
             e.wait()
@@ -2742,12 +3200,18 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_record_stream_inductor_output_code(self) -> None:
+        # [FUNCTION DOC] Compiles with Inductor a function using record_stream between two
+        # computations and uses the generated wrapper code to check that the record_stream
+        # call appears after a kernel run and before the return. Also asserts the numeric
+        # result. Needs CUDA.
         """Verify record_stream is ordered between the producing kernel and the
         consuming kernel in inductor-generated wrapper code."""
         from torch._inductor.utils import run_and_get_code
         from torch.testing import FileCheck
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Create a stream, add one to the input, call record_stream
+            # with the stream on the result and multiply by two.
             s = torch.Stream(device="cuda")
             y = x + 1
             y.record_stream(s)
@@ -2767,7 +3231,13 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_del_multi_stream_sync_dealloc(self):
+        # [FUNCTION DOC] Checks that deleting a tensor variable that was also used on another
+        # stream (synchronized by an event) produces sync_dealloc and record_event ops in the
+        # graph, and that the compiled result equals eager. Needs CUDA.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Compute an add on the default stream, add the inputs on
+            # a second stream and record an event, wait on it, delete the first input and
+            # return both results.
             s = torch.Stream()
             e = torch.Event()
             z0 = x + 1
@@ -2794,7 +3264,11 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_del_same_stream_no_sync_dealloc(self):
+        # [FUNCTION DOC] Checks that deleting a tensor whose uses are all on the same stream
+        # does not generate a sync_dealloc op, while results equal eager. Needs CUDA.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Inside a stream context add the inputs, delete the first
+            # input and record an event; wait on it outside and return the sum.
             s = torch.Stream()
             e = torch.Event()
             with s:
@@ -2819,7 +3293,11 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_del_single_stream_no_sync_dealloc(self):
+        # [FUNCTION DOC] Checks that deleting a tensor in code with a single stream does not
+        # generate a sync_dealloc op, while results equal eager. Needs CUDA.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Add the inputs, delete the first input
+            # and return the sum.
             z = torch.add(x, y)
             del x
             return z
@@ -2839,10 +3317,18 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_del_attr_multi_stream_sync_dealloc(self):
+        # [FUNCTION DOC] Checks that deleting an attribute holding a tensor also yields
+        # sync_dealloc and record_event ops when the tensor was used on a second stream, and
+        # that results equal eager. Needs CUDA.
         class Holder:
+            # [CLASS DOC] HELPER: Empty plain object used as a mutable attribute
+            # container for a tensor.
             pass
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Store the first input as an attribute of a holder object,
+            # use it on a second stream with an event record, wait, delete the attribute and
+            # return both results.
             s = torch.Stream()
             e = torch.Event()
             h = Holder()
@@ -2871,7 +3357,12 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_del_subscr_multi_stream_sync_dealloc(self):
+        # [FUNCTION DOC] Checks that deleting a dictionary entry holding a tensor also yields
+        # sync_dealloc and record_event ops when the tensor was used on a second stream, and
+        # that results equal eager. Needs CUDA.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Store the first input in a dictionary, use it on a second
+            # stream with an event record, wait, delete the entry and return both results.
             s = torch.Stream()
             e = torch.Event()
             d = {"t": x}
@@ -2899,7 +3390,13 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_stream_pointer_extraction_edge_cases(self):
+        # [FUNCTION DOC] Verifies raw stream handles of different streams are extracted
+        # correctly by Inductor-compiled code, including inside another stream context and for
+        # the default stream. Asserts the handles of two user streams differ and are large,
+        # and compiled outputs match the eager handles. Needs CUDA.
         def get_ptrs(stream_a, stream_b, default_stream):
+            # [FUNCTION DOC] HELPER: Return a tuple of the raw handles of the
+            # three given streams.
             return (
                 stream_a.cuda_stream,
                 stream_b.cuda_stream,
@@ -2924,6 +3421,11 @@ class <lambda>(torch.nn.Module):
         self.assertEqual(actual_default, default_s.cuda_stream)
 
     def test_expand_dict_returning_deps_triton_kernel(self) -> None:
+        # [FUNCTION DOC] Tests the expand-dict-returning-deps pass helper on a hand-built
+        # graph where a triton kernel wrapper returns a dictionary, followed by a record_event
+        # sync and a getitem user. Asserts the dictionary node is replaced by a per-key
+        # getitem node placed before the sync, the old getitem is erased and the add now
+        # consumes the new node.
         """Triton kernel dicts must not be passed through control_deps.
 
         triton_kernel_wrapper_functional returns a dict.  If the dict node is
