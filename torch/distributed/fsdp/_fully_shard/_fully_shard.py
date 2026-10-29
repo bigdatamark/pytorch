@@ -1,5 +1,12 @@
 # mypy: allow-untyped-decorators
 # mypy: allow-untyped-defs
+# [MODULE DOC] Public entry point of FSDP2: the fully_shard function (applies fully sharded data
+# parallelism to a module or list of modules in place), the FSDPModule mixin class mixed into the
+# wrapped module's class that exposes runtime controls (reshard, unshard, prefetch lists,
+# gradient-sync flags, mixed-precision and communication overrides), UnshardHandle for async
+# unshard, register_fsdp_forward_method, and helpers for the class mapping and comm-context
+# sharing. Import time: defines a module-level cache mapping original classes to FSDP classes and
+# a global flag controlling FSDPModule construction; no other side effects.
 
 from __future__ import annotations
 
@@ -56,6 +63,8 @@ cls_to_fsdp_cls: dict[type, type] = {}
 
 
 def get_cls_to_fsdp_cls() -> dict[type, type]:
+    # [FUNCTION DOC] Returns the module-level mapping from original module classes to their
+    # dynamically created FSDP subclasses (the live dict, not a copy).
     return cls_to_fsdp_cls
 
 
@@ -106,6 +115,13 @@ def fully_shard(
     ignored_params: set[nn.Parameter] | None = None,
     dp_mesh_dims: DataParallelMeshDims | None = None,
 ):
+    # [FUNCTION DOC] Applies FSDP in place to one module or a list of modules (grouped into one
+    # communication group) and returns the same argument. Validates the module, builds or accepts
+    # a mesh, derives mesh info, device and post-forward (reshard) mesh info, collects managed
+    # modules/params/buffers (skipping ignored params), initializes the FSDPState and its param
+    # group, flags managed modules for Dynamo, and swaps each module's class to an FSDP subclass.
+    # Raises NotImplementedError for an integer reshard_after_forward with an SPMD mesh. The
+    # contract decorator attaches the state, accessible through the state accessor.
     """
     Apply fully sharded data parallelism (FSDP) to ``module``, where FSDP
     shards module parameters, gradients, and optimizer states across data
@@ -297,6 +313,8 @@ def fully_shard(
 
 
 def _unimplemented_deepcopy(*args: Any, **kwargs: Any) -> NoReturn:
+    # [FUNCTION DOC] HELPER: Installed as the deepcopy method of FSDP modules; always raises
+    # AssertionError telling the user to serialize via state dict instead.
     raise AssertionError(
         "FSDP does not support deepcopy. Please use state dict for serialization."
     )
@@ -307,6 +325,8 @@ _enable_fsdp_module_new_init: bool = True
 
 @contextmanager
 def disable_fsdp_module_new_init() -> Iterator[None]:
+    # [FUNCTION DOC] Context manager that temporarily turns off the automatic constructor call in
+    # FSDPModule creation (global flag), restoring the previous value on exit even on error.
     global _enable_fsdp_module_new_init
     prev, _enable_fsdp_module_new_init = _enable_fsdp_module_new_init, False
     try:
@@ -316,12 +336,20 @@ def disable_fsdp_module_new_init() -> Iterator[None]:
 
 
 class FSDPModule:
+    # [CLASS DOC] Mixin placed first in the MRO of the dynamically created FSDP subclass of each
+    # wrapped module (so the module's class becomes FSDP<Orig>). Provides the user-facing runtime
+    # API: reshard/unshard, per-iteration reset, gradient sync and reshard flags, prefetch lists,
+    # mixed-precision and communication overrides, and internal state lookup. It holds no state
+    # itself; all state lives in the FSDPState attached to the module.
     # Index in MRO where the original class is found.
     # For FSDP: [FSDP<Orig>, FSDPModule, Orig, ...] -> index 2
     # Subclasses like ReplicateModule override this.
     _orig_cls_mro_index: int = 2
 
     def __new__(cls, *args, **kwargs):
+        # [FUNCTION DOC] Builds an instance of the original (pre-FSDP) class found in the MRO
+        # instead of the FSDP class, calling its constructor only when the global new-init flag is
+        # enabled. Returns the original-class instance.
         """
         Override ``__new__`` to remove the FSDP class and directly construct
         the original class for cases like indexing into a container module.
@@ -333,6 +361,8 @@ class FSDPModule:
         return self
 
     def reshard(self) -> None:
+        # [FUNCTION DOC] Reshards every param group of this module's state (non-recursive), freeing
+        # unsharded parameters and re-registering the sharded ones.
         """
         Reshards the module's parameters, freeing the unsharded parameters if
         they are allocated and registering the sharded parameters to the
@@ -343,6 +373,9 @@ class FSDPModule:
             fsdp_param_group.reshard()
 
     def unshard(self, async_op: bool = False) -> UnshardHandle | None:
+        # [FUNCTION DOC] Lazily inits and all-gathers each of this module's param groups
+        # (non-recursive, honoring the mixed precision policy). With async_op True returns a handle
+        # to wait on later; otherwise waits immediately and returns None.
         """
         Unshards the module's parameters by allocating memory and all-gathering
         the parameters. This method is *not* recursive. The unshard follows the
@@ -374,6 +407,9 @@ class FSDPModule:
 
     @_dynamo_disable
     def reset_iter_state(self) -> None:
+        # [FUNCTION DOC] Recovery API after an exception in forward or backward. Delegates to the
+        # state's iteration reset, which raises RuntimeError on a non-root module. Discards
+        # in-flight gradients.
         """
         Resets FSDP's per-iteration state after an exception aborted a
         forward or backward mid-flight. The supported recovery workflow is:
@@ -401,6 +437,8 @@ class FSDPModule:
         state._reset_iter_state()
 
     def set_is_last_backward(self, is_last_backward: bool) -> None:
+        # [FUNCTION DOC] Sets the shared flag saying whether the next backward is the last one
+        # (which finalizes gradient reduction and clears prefetch bookkeeping).
         """
         Sets whether the next backward is the last one. On the last backward,
         FSDP waits on pending gradient reduction and clears internal data
@@ -413,6 +451,9 @@ class FSDPModule:
     def set_requires_gradient_sync(
         self, requires_gradient_sync: bool, *, recurse: bool = True
     ) -> None:
+        # [FUNCTION DOC] Enables or disables gradient reduction (reduce-scatter and all-reduce) on
+        # all param groups of this module, and of FSDP submodules when recurse is true. Used for
+        # gradient accumulation without communication.
         """
         Sets if the module should sync gradients. This can be used to implement
         gradient accumulation *without communication*. For HSDP, this controls
@@ -437,6 +478,8 @@ class FSDPModule:
     def set_requires_all_reduce(
         self, requires_all_reduce: bool, *, recurse: bool = True
     ) -> None:
+        # [FUNCTION DOC] Enables or disables only the HSDP all-reduce of gradients on the param
+        # groups of this module (and FSDP submodules if recurse), leaving reduce-scatter alone.
         """
         Sets if the module should all-reduce gradients. This can be used to
         implement gradient accumulation with only reduce-scatter but not
@@ -453,6 +496,10 @@ class FSDPModule:
     def set_reshard_after_forward(
         self, reshard_after_forward: bool, recurse: bool = True
     ) -> None:
+        # [FUNCTION DOC] Overrides reshard-after-forward at runtime for this module (and FSDP
+        # submodules if recurse). Raises ValueError for a non-bool value. Marks the state as no
+        # longer auto-resharding and recomputes each group's post-forward mesh info; asserts each
+        # group has a sharding mesh.
         """
         Sets if the module should reshard parameters after forward. This can be
         used to change the ``reshard_after_forward`` FSDP arg at runtime. For
@@ -490,6 +537,9 @@ class FSDPModule:
     def set_reshard_after_backward(
         self, reshard_after_backward: bool, *, recurse: bool = True
     ) -> None:
+        # [FUNCTION DOC] Sets whether param groups reshard after backward, for this module and (if
+        # recurse) FSDP submodules; disabling trades memory for fewer all-gathers when
+        # accumulating gradients.
         """
         Sets if the module should reshard parameters after backward. This can
         be used during gradient accumulation to trade off higher memory for
@@ -511,6 +561,9 @@ class FSDPModule:
                     fsdp_param_group.reshard_after_backward = reshard_after_backward
 
     def set_modules_to_forward_prefetch(self, modules: list[FSDPModule]) -> None:
+        # [FUNCTION DOC] Sets the list of FSDP modules whose all-gathers this module explicitly
+        # prefetches during forward (after its copy-out). Raises ValueError if any entry is not an
+        # FSDPModule. Replaces the state's forward prefetch list with the modules' states.
         """
         Sets the FSDP modules for which this FSDP module should explicitly
         prefetch all-gathers in forward. The prefetching runs after this
@@ -531,6 +584,9 @@ class FSDPModule:
         ]
 
     def set_modules_to_backward_prefetch(self, modules: list[FSDPModule]) -> None:
+        # [FUNCTION DOC] Sets the explicit list of FSDP modules whose all-gathers this module
+        # prefetches in backward, overriding default post-forward-order prefetching. Raises
+        # ValueError if any entry is not an FSDPModule.
         """
         Sets the FSDP modules for which this FSDP module should explicitly
         prefetch all-gathers in backward. This overrides the default backward
@@ -551,6 +607,8 @@ class FSDPModule:
         ]
 
     def set_custom_all_gather(self, comm: AllGather) -> None:
+        # [FUNCTION DOC] Installs a user-provided all-gather implementation on the module's param
+        # group. Raises ValueError if the module has more than one param group (per-param mesh).
         """
         Overrides the default ``all_gather`` communication behavior,
         to have better control over the communication and memory usage.
@@ -570,6 +628,8 @@ class FSDPModule:
             fsdp_param_group._all_gather_comm = comm
 
     def set_custom_reduce_scatter(self, comm: ReduceScatter) -> None:
+        # [FUNCTION DOC] Installs a user-provided reduce-scatter implementation on the module's
+        # param group. Raises ValueError if there is more than one param group.
         """
         Overrides the default ``reduce_scatter`` communication behavior,
         to have better control over the communication and memory usage.
@@ -594,6 +654,10 @@ class FSDPModule:
         *,
         stream: torch.cuda.Stream | None = None,
     ):
+        # [FUNCTION DOC] Registers a hook called with the reduced gradient (reduce-scatter output,
+        # or all-reduce output for native HSDP) on the module's param group. Raises ValueError if
+        # there are several param groups, or if a stream is given with native HSDP. An optional
+        # stream is stored for running the hook.
         """
         Args:
             hook (Callable[[torch.Tensor], None]): User-defined all-reduce hook
@@ -620,6 +684,8 @@ class FSDPModule:
                 fsdp_param_group._all_reduce_hook_stream = stream
 
     def set_post_optim_event(self, event: torch.Event) -> None:
+        # [FUNCTION DOC] Stores a user event in the shared state context for the root to make the
+        # all-gather streams wait on; it is consumed after one use, so set it every iteration.
         """
         Sets a post-optimizer-step event for the root FSDP module to wait the
         all-gather streams on.
@@ -640,10 +706,13 @@ class FSDPModule:
 
     @deprecated("Use `set_gradient_divide_factor` instead")
     def set_reduce_scatter_divide_factor(self, factor: float) -> None:
+        # [FUNCTION DOC] Deprecated alias that forwards to the gradient divide factor setter.
         """Use :py:meth:`set_gradient_divide_factor` instead"""
         self.set_gradient_divide_factor(factor)
 
     def set_gradient_divide_factor(self, factor: float) -> None:
+        # [FUNCTION DOC] Sets a custom gradient divide factor on every param group of this module
+        # (non-recursive), used during gradient reduction.
         """
         Sets a custom divide factor for the gradient reduction. This might use
         a custom reduce op using NCCL's PreMulSum, which allows multiplying by
@@ -657,6 +726,8 @@ class FSDPModule:
             fsdp_param_group.gradient_divide_factor = factor
 
     def set_force_sum_reduction_for_comms(self, enable: bool) -> None:
+        # [FUNCTION DOC] Sets on every param group whether collectives must use only sum
+        # reductions (with extra scaling steps if needed).
         """
         Sets whether to require the low-level collective communication
         primitives to exclusively use "sum"-type reductions, even if it comes
@@ -680,6 +751,8 @@ class FSDPModule:
     def set_reduce_scatter_unused_params(
         self, reduce_scatter_unused_params: bool, *, recurse: bool = True
     ) -> None:
+        # [FUNCTION DOC] Sets, on this module's param groups (and FSDP submodules if recurse),
+        # whether parameters without a gradient contribute zeros to reduction so ranks stay in step.
         """
         Sets whether to include zero gradients for parameters that did not
         receive a gradient in backward. This is needed when different ranks
@@ -707,6 +780,9 @@ class FSDPModule:
     def set_reduce_scatter_max_input_buffers(
         self, max_input_buffers: int, *, recurse: bool = True
     ) -> None:
+        # [FUNCTION DOC] Sets the cap on retained reduce-scatter input buffers on param groups of
+        # this module (and FSDP submodules if recurse). Raises TypeError for a non-int (bool
+        # rejected) and ValueError for a value below one. Larger caps trade memory for overlap.
         """
         Sets how many gradient reduce-scatter input buffers may be in flight at
         once -- the copy-in (``chunk_cat``) buffer cap-K (experimental).
@@ -758,6 +834,10 @@ class FSDPModule:
     def set_separate_reduce_scatter_group(
         self, enable: bool = True, *, recurse: bool = True
     ) -> None:
+        # [FUNCTION DOC] Turns on or off a dedicated reduce-scatter process group for each param
+        # group of this module (and FSDP submodules if recurse). Created groups are cached by shard
+        # ranks in a local mapping so meshes sharing ranks share one group. May create process
+        # groups, so call consistently across ranks.
         """
         Enables (or disables) running gradient reduce-scatter on its own process
         group so it can overlap with all-gather in the backward pass
@@ -794,6 +874,8 @@ class FSDPModule:
                     )
 
     def set_unshard_in_backward(self, unshard_in_backward: bool) -> None:
+        # [FUNCTION DOC] Sets on this module's param groups whether parameters are unsharded in
+        # backward; false is for groups whose params are not needed in backward (e.g. embeddings).
         """
         Sets whether the FSDP module's parameters need to be unsharded in
         backward. This can be used in expert cases when the user knows that all
@@ -805,6 +887,8 @@ class FSDPModule:
             fsdp_param_group.unshard_in_backward = unshard_in_backward
 
     def set_allocate_memory_from_process_group_for_comm(self, enable: bool) -> None:
+        # [FUNCTION DOC] Tells each param group to allocate collective staging buffers from the
+        # process group's own allocator when enabled; incompatible with custom collectives.
         """
         Sets whether the temporary staging buffers used to send and receive data
         over collective communications should be allocated using the custom
@@ -826,6 +910,9 @@ class FSDPModule:
             fsdp_param_group.set_allocate_memory_from_process_group(enable)
 
     def set_symm_mem_for_comm(self, backend: Literal["NCCL"] = "NCCL") -> None:
+        # [FUNCTION DOC] Selects the symmetric memory backend (only NCCL supported) used to allocate
+        # all-gather staging buffers, on each param group of this module; incompatible with custom
+        # collectives.
         """
         Sets the symmetric memory (``symm_mem``) backend for allocating the
         staging buffers used in all-gather collectives. This allows NCCL to use
@@ -860,6 +947,8 @@ class FSDPModule:
             fsdp_param_group.set_symm_mem(backend)
 
     def _set_unshard_async_op(self, async_op: bool):
+        # [FUNCTION DOC] HELPER: Sets on every param group of this module and all FSDP submodules
+        # whether pre-forward/pre-backward unshard runs asynchronously.
         """
         Sets whether to use ``async_op=True`` or ``False`` for the pre-forward
         and pre-backward unshard op. This defaults to ``False`` but can be set
@@ -879,11 +968,15 @@ class FSDPModule:
                     fsdp_param_group.unshard_async_op = async_op
 
     def _get_fsdp_state(self) -> FSDPState:
+        # [FUNCTION DOC] HELPER: Returns this module's FSDPState; raises AssertionError if none.
         if (state := _get_module_fsdp_state(cast(nn.Module, self))) is None:
             raise AssertionError(f"No FSDP state found on {self}")
         return state
 
     def _apply(self, *args: Any, **kwargs: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Override of the module apply (used by to/cuda etc.). Reshards
+        # first so sharded params are registered, calls the parent implementation, then resets
+        # each FSDP param's sharded parameter under no-grad. Returns the parent's result.
         # Reshard to ensure that sharded parameters are registered
         self.reshard()
         ret = super()._apply(*args, **kwargs)  # type: ignore[misc]
@@ -900,11 +993,14 @@ class FSDPModule:
 
 
 class UnshardHandle:
+    # [CLASS DOC] Public handle type returned by an asynchronous unshard; its wait method blocks
+    # the current stream until the unsharded parameters are usable. This base version is a no-op.
     """
     A handle to wait on a :meth:`FSDPModule.unshard` op.
     """
 
     def wait(self) -> None:
+        # [FUNCTION DOC] No-op wait in the base handle.
         """
         Waits on the unshard op. This ensures that the current stream can use
         the unsharded parameters, which are now registered to the module.
@@ -913,10 +1009,15 @@ class UnshardHandle:
 
 
 class _UnshardHandleImpl(UnshardHandle):
+    # [CLASS DOC] HELPER: Concrete handle holding the param groups with a pending unshard; the
+    # reference is dropped after the first wait.
     def __init__(self, fsdp_param_groups: list[FSDPParamGroup] | None):
+        # [FUNCTION DOC] HELPER: Stores the param groups to wait on (or None for nothing).
         self._fsdp_param_groups = fsdp_param_groups
 
     def wait(self):
+        # [FUNCTION DOC] HELPER: Waits for the unshard of each stored group, then clears the
+        # stored list so a second wait does nothing.
         if self._fsdp_param_groups is not None:
             for fsdp_param_group in self._fsdp_param_groups:
                 fsdp_param_group.wait_for_unshard()
@@ -925,6 +1026,9 @@ class _UnshardHandleImpl(UnshardHandle):
 
 
 def register_fsdp_forward_method(module: nn.Module, method_name: str) -> None:
+    # [FUNCTION DOC] Replaces the named method on an FSDPModule instance with a wrapper that runs
+    # the FSDP pre-forward logic before and post-forward logic after it. No-op for non-FSDP
+    # modules; raises ValueError if the module lacks that method. Mutates the instance.
     """
     Registers a method on ``module`` to be considered a forward method for
     FSDP.
@@ -949,6 +1053,8 @@ def register_fsdp_forward_method(module: nn.Module, method_name: str) -> None:
 
     @functools.wraps(orig_method)
     def wrapped_method(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Runs pre-forward on the arguments, calls the original method,
+        # then runs post-forward on its output and returns that.
         fsdp_state = self._get_fsdp_state()
         args, kwargs = fsdp_state._pre_forward(self, args, kwargs)
         out = orig_method(*args, **kwargs)
@@ -963,6 +1069,9 @@ def register_fsdp_forward_method(module: nn.Module, method_name: str) -> None:
 
 
 def share_comm_ctx(modules: list[FSDPModule]) -> None:
+    # [FUNCTION DOC] Makes all given FSDP root modules use the first module's communication
+    # context (streams) and points their param groups at it. No-op for an empty list; raises
+    # ValueError if any element is not an FSDPModule. Mutates the states.
     """
     Share cuda streams for multiple FSDPModules
 
@@ -991,6 +1100,7 @@ def share_comm_ctx(modules: list[FSDPModule]) -> None:
 
 
 def _assert_all_fsdp_modules(modules: Iterable[Any]) -> None:
+    # [FUNCTION DOC] HELPER: Raises ValueError naming the first item that is not an FSDPModule.
     for module in modules:
         if not isinstance(module, FSDPModule):
             raise ValueError(f"Expects FSDPModule but got {type(module)}: {module}")

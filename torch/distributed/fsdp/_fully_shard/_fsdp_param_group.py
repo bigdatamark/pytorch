@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] FSDP2 parameter group: FSDPParamGroup bundles the FSDPParams that are all-gathered
+# and reduce-scattered together and implements the unshard / reshard / pre- and post-forward /
+# pre- and post-backward logic, stream and event synchronization, state-dict hook registration and
+# validation. FSDPCommContext holds streams and collective bookkeeping shared across groups, and
+# small named tuples keep collective buffers and events alive. Import time: creates a logger and
+# type aliases, and, when spmd types are available, registers the post-backward autograd function
+# with that library; the module-level note string is documentation, not behavior.
 from __future__ import annotations
 
 import contextlib
@@ -71,9 +78,17 @@ reference to avoid holding onto memory after forward.
 
 
 class FSDPCommContext:
+    # [CLASS DOC] Communication state shared by all FSDP states/param groups under a root: the
+    # all-gather copy-in, all-gather, reduce-scatter and all-reduce streams, the pending
+    # all-gather / reduce-scatter states, last post-reduce events per stream, the reduce-scatter
+    # buffer cap and the post-forward order of groups. Streams exist only after lazy_init.
     """This has the communication state shared across FSDP states/parameter groups."""
 
     def lazy_init(self, device: torch.device):
+        # [FUNCTION DOC] Creates the device handle and high-priority copy-in, all-gather and
+        # reduce-scatter streams plus a default-priority all-reduce stream for the device, and
+        # initializes empty trackers: last post-reduce events, all-gather state, reduce-scatter
+        # states, buffer cap of one and post-forward order. Called once by the root.
         self.device_handle = _get_device_handle(device.type)
         # Setting the all-gather/reduce-scatter streams to be higher priority
         # can help avoid some issues where their copies in/out are delayed and
@@ -117,6 +132,9 @@ class FSDPCommContext:
     def get_all_gather_streams(
         self, async_op: bool, training_state: TrainingState
     ) -> tuple[torch.Stream, torch.Stream]:
+        # [FUNCTION DOC] Returns the (copy-in stream, all-gather stream) pair: the dedicated
+        # streams for synchronous unshard in FORWARD or PRE_BACKWARD (implicit prefetch), else the
+        # current stream twice.
         if not async_op and training_state in (
             TrainingState.FORWARD,
             TrainingState.PRE_BACKWARD,
@@ -129,16 +147,22 @@ class FSDPCommContext:
 
 # See [Note: Overlapping all-gather copy-in and all-gather]
 class AllGatherState(NamedTuple):
+    # [CLASS DOC] HELPER: Pairs a finished all-gather result (kept alive to hold its memory) with
+    # the copy-out event after which it may be freed.
     all_gather_result: AllGatherResult
     event: torch.Event | None  # all-gather copy-out
 
 
 class ReduceScatterState(NamedTuple):
+    # [CLASS DOC] HELPER: Pairs a reduce-scatter input buffer (kept alive until the collective
+    # completes) with the event marking completion.
     reduce_scatter_input: torch.Tensor
     event: torch.Event | None  # reduce-scatter event
 
 
 class AllReduceState(NamedTuple):
+    # [CLASS DOC] HELPER: Pairs the reduce-dtype all-reduce buffer with its completion event;
+    # holding the buffer prevents the caching allocator reusing it before the all-reduce ends.
     # Holding all_reduce_input (the reduce-dtype AR buffer) keeps the
     # caching allocator from reusing the block across layers. This is a
     # structural invariant, not bookkeeping: without it, the next layer's
@@ -149,6 +173,12 @@ class AllReduceState(NamedTuple):
 
 
 class FSDPParamGroup:
+    # [CLASS DOC] A set of FSDPParams (from one or more modules) that are all-gathered and
+    # reduce-scattered together. Holds the mesh infos, device, policies, per-group runtime flags
+    # (reduce_grads, all_reduce_grads, reshard_after_backward, unshard_in_backward, divide factor,
+    # etc.), custom collectives, the pending all-gather result and post-reduce events, and the
+    # group's training and sharded state. Drives the unshard/reshard cycle and gradient reduction;
+    # the comm context is shared with other groups after root lazy init.
     """This class represents a parameter group to communicate together."""
 
     _orig_dtype: torch.dtype | None
@@ -165,6 +195,10 @@ class FSDPParamGroup:
         mp_policy: MixedPrecisionPolicy,
         offload_policy: OffloadPolicy,
     ):
+        # [FUNCTION DOC] Builds an FSDPParam for every parameter (paired with its module info),
+        # records mesh infos, device, policies and initial IDLE/SHARDED states, and sets all
+        # runtime flags and event/hook slots to their defaults (reduction enabled, default
+        # collectives, no pending results).
         self.modules = modules  # permit ref cycle because 1:1 lifetime
         param_module_infos = _get_param_module_infos(params, modules)
 
@@ -272,6 +306,10 @@ class FSDPParamGroup:
 
     # Initialization #
     def _init_mp_dtypes(self) -> None:
+        # [FUNCTION DOC] HELPER: Initializes each param's dtype attributes from the mixed precision
+        # policy, then computes the group's single original dtype and reduce dtype (from trainable
+        # params, or floating-point params if none are trainable); None if not uniform. Raises
+        # AssertionError when trainable params have non-uniform original or reduce dtypes.
         for fsdp_param in self.fsdp_params:
             fsdp_param.init_dtype_attrs(self.mp_policy)
         trainable_params: list[FSDPParam] = [
@@ -304,6 +342,10 @@ class FSDPParamGroup:
         )
 
     def lazy_init(self):
+        # [FUNCTION DOC] Idempotent late initialization run before first use. Ensures the comm
+        # context has a device handle, resets sharded params and initializes extensions once (only
+        # when sharded), validates no meta params, CPU-offload params and buffer cap, then
+        # recomputes mixed precision dtypes and registers state-dict hooks.
         # Lazy init should be idempotent
         # Users may change or register parameters after construction time.
         # For example, DoRA (https://arxiv.org/abs/2402.09353) initializes linear magnitudes based on
@@ -324,6 +366,9 @@ class FSDPParamGroup:
         self._register_state_dict_hooks()
 
     def set_symm_mem(self, backend: Literal["NCCL"] = "NCCL") -> None:
+        # [FUNCTION DOC] Switches the group to symmetric-memory all-gather (and reduce-scatter when
+        # sum-only reduction is forced). Raises AssertionError if either collective was customized
+        # by the user.
         if not isinstance(self._all_gather_comm, (DefaultAllGather | SymmMemAllGather)):
             raise AssertionError(
                 "cannot call set_symm_mem() "
@@ -346,6 +391,8 @@ class FSDPParamGroup:
             )
 
     def set_allocate_memory_from_process_group(self, enable: bool) -> None:
+        # [FUNCTION DOC] Swaps the all-gather and reduce-scatter collectives between the default
+        # and process-group-allocating versions. Raises AssertionError if either was customized.
         """
         Whether to (try to) use the ProcessGroup's allocate_tensor method for
         the staging buffers for collective comms.
@@ -380,6 +427,11 @@ class FSDPParamGroup:
     # Runtime #
     @_disable_functorch_if_active
     def unshard(self, async_op: bool = False):
+        # [FUNCTION DOC] Starts the all-gather of the group's parameters. Returns early if a result
+        # is pending, params are already unsharded, or backward unshard is disabled. Waits streams
+        # on a pending reshard-after-forward event. With world size one it fabricates a trivial
+        # result; otherwise launches the multi-param all-gather on the copy-in/all-gather streams
+        # and stores the result for wait_for_unshard.
         if self._all_gather_result is not None:  # already called, pending wait
             return
         if self.is_unsharded:
@@ -425,6 +477,12 @@ class FSDPParamGroup:
 
     @_disable_functorch_if_active
     def wait_for_unshard(self):
+        # [FUNCTION DOC] Completes a pending unshard: does nothing if none is pending. In forward
+        # it first frees the previous all-gather result after its event. Then copies gathered data
+        # out into the unsharded params (or copies directly from the sharded input when world size
+        # is one), initializes unsharded params and switches the group to unsharded. Either defers
+        # the free of the result via the comm context (sync forward) or makes streams wait on the
+        # copy-out event, then clears the pending result.
         """
         1. In forward with implicit prefetching, to overlap the current copy-out
         with the next all-gather, we save a reference to the current all-gather
@@ -499,6 +557,8 @@ class FSDPParamGroup:
         self._all_gather_result = None  # free unless saved in `all_gather_state`
 
     def _wait_all_gather_streams_on_event(self, event: torch.Event | None):
+        # [FUNCTION DOC] HELPER: Makes the copy-in and all-gather streams wait on the event, each
+        # only if the stream exists (they do not before lazy init) and the event is not None.
         # Calling `unshard` before lazy init means streams are not initialized
         if hasattr(self.comm_ctx, "all_gather_copy_in_stream") and event is not None:
             self.comm_ctx.all_gather_copy_in_stream.wait_event(event)
@@ -507,6 +567,9 @@ class FSDPParamGroup:
 
     @_disable_functorch_if_active
     def reshard(self):
+        # [FUNCTION DOC] Frees unsharded parameters. After forward it does nothing if resharding
+        # is disabled; if a smaller post-forward mesh is used it reshards to that mesh and records
+        # an event to wait on at the next unshard; otherwise reshards fully to the sharded params.
         if self._training_state == TrainingState.FORWARD:
             if not self._reshard_after_forward:
                 return
@@ -519,6 +582,9 @@ class FSDPParamGroup:
         self._to_sharded()
 
     def _reset_iter_state(self) -> None:
+        # [FUNCTION DOC] HELPER: Recovery after a failed iteration. Makes the current stream wait
+        # on and drops any pending all-gather, post-reduce, all-reduce and reshard events/results,
+        # clears partial reduce output and post-forward indices, sets IDLE and reshards fully.
         # See FSDPState._reset_iter_state for semantics. Waits on any
         # in-flight collective events owned by this group, discards
         # accumulated grad-reduction state, and restores sharded params.
@@ -550,6 +616,10 @@ class FSDPParamGroup:
     def pre_forward(
         self, module: nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any]
     ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        # [FUNCTION DOC] Pre-forward for the group: sets FORWARD state, unshards and waits,
+        # restores SPMD types on unsharded params, and on first entry in the pass registers the
+        # post-backward hook on tensors in args/kwargs. Returns the (possibly modified) args and
+        # kwargs.
         logger.debug("%s", self._with_fqn("FSDP::pre_forward"))
         with record_function(self._with_fqn("FSDP::pre_forward")):
             # FORWARD at entry means another module in the grouped
@@ -568,6 +638,9 @@ class FSDPParamGroup:
             return args, kwargs
 
     def post_forward(self, module: nn.Module, input: Any, output: Any):
+        # [FUNCTION DOC] Post-forward: unless running inside backward (activation checkpoint
+        # recompute), reshards and records the group's position in post-forward order. Sets IDLE
+        # and returns the output unchanged.
         logger.debug("%s", self._with_fqn("FSDP::post_forward"))
         with (
             _spmd_no_typecheck(),
@@ -582,6 +655,8 @@ class FSDPParamGroup:
             return output
 
     def _record_post_forward(self) -> None:
+        # [FUNCTION DOC] HELPER: Appends this group to the shared post-forward order and remembers
+        # its index (one entry per forward call).
         # Since a group has one pre-backward unshard for each forward call
         # before the backward, we record each usage (with multiplicity)
         post_forward_index = len(self.comm_ctx.post_forward_order)
@@ -590,6 +665,9 @@ class FSDPParamGroup:
 
     @_dynamo_disable
     def pre_backward(self, default_prefetch: bool, *unused: Any):
+        # [FUNCTION DOC] Pre-backward: returns early if already PRE_BACKWARD; otherwise sets that
+        # state, unshards and waits for parameters, and, if default_prefetch is true, prefetches
+        # the next group's unshard in backward order.
         if self._training_state == TrainingState.PRE_BACKWARD:
             return
         logger.debug("%s", self._with_fqn("FSDP::pre_backward"))
@@ -605,6 +683,14 @@ class FSDPParamGroup:
 
     @_dynamo_disable
     def post_backward(self, *unused: Any):
+        # [FUNCTION DOC] Post-backward for the group; idempotent and safe if the group was unused.
+        # Accumulates unsharded grads, then either (reduction off) reshards and converts to
+        # accumulated grads, or collects grads (including zero grads for unused params when
+        # enabled), reshards, recycles old reduce-scatter input buffers up to the cap, and runs the
+        # fused reduce (reduce-scatter and optional all-reduce) on its streams, recording post-reduce
+        # events and reduce-scatter/all-reduce states. For partial grouped backward it also makes
+        # the current stream wait on the post-reduce event. Raises AssertionError on inconsistent
+        # hook-stream or missing-event configurations.
         with _spmd_no_typecheck():
             # This method should be idempotent and safe to call even when this
             # FSDP parameter group was not used in backward (should be a no-op)
@@ -787,6 +873,10 @@ class FSDPParamGroup:
                     )
 
     def finalize_backward(self):
+        # [FUNCTION DOC] End-of-backward cleanup: makes the current stream wait on all last
+        # post-reduce events, clears reduce tracking, synchronizes any gradient-offload events,
+        # and waits on and drops any unshard issued without a matching wait. Clears post-forward
+        # indices.
         for event in self.comm_ctx._last_post_reduce_events.values():
             self.device_handle.current_stream().wait_event(event)
         self.comm_ctx._last_post_reduce_events = dict()
@@ -808,6 +898,8 @@ class FSDPParamGroup:
         self._post_forward_indices.clear()
 
     def _wait_for_post_backward(self):
+        # [FUNCTION DOC] HELPER: Makes the current stream wait on this group's previous post-reduce
+        # and all-reduce events and clears them, before a new reduction reuses the buffers.
         if self._post_reduce_event is not None:
             self.device_handle.current_stream().wait_event(self._post_reduce_event)
             self._post_reduce_event = None
@@ -819,6 +911,10 @@ class FSDPParamGroup:
         self._all_reduce_state = None
 
     def _backward_prefetch(self) -> None:
+        # [FUNCTION DOC] HELPER: Default backward prefetch. Pops this group's latest post-forward
+        # index and prefetches the unshard of the group preceding it in post-forward order. With
+        # several groups per module, only the second-to-last group triggers, prefetching all
+        # groups of the previous distinct module. Does nothing if no indices remain.
         if self._training_state == TrainingState.PRE_BACKWARD:
             if not self._post_forward_indices:
                 # Can be cleared if running multiple `backward`s
@@ -859,6 +955,9 @@ class FSDPParamGroup:
     def _prefetch_unshard(
         target_fsdp_param_group: FSDPParamGroup, pass_type: str
     ) -> None:
+        # [FUNCTION DOC] HELPER: Static. Issues an unshard for the target group while temporarily
+        # setting its training state to match the pass type ("forward" or "backward"); uses the
+        # target's async setting. Raises ValueError for another pass type.
         if pass_type == "backward":
             training_state = TrainingState.PRE_BACKWARD
         elif pass_type == "forward":
@@ -875,18 +974,22 @@ class FSDPParamGroup:
 
     # Utilities #
     def _to_sharded(self):
+        # [FUNCTION DOC] HELPER: Converts all params to the sharded state unless already sharded.
         if not self.is_sharded:
             for fsdp_param in self.fsdp_params:
                 fsdp_param.to_sharded()
             self._sharded_state = ShardedState.SHARDED
 
     def _to_sharded_post_forward(self):
+        # [FUNCTION DOC] HELPER: Converts all params to the post-forward (smaller mesh) sharded
+        # state unless already there.
         if not self.is_sharded_post_forward:
             for fsdp_param in self.fsdp_params:
                 fsdp_param.to_sharded_post_forward()
             self._sharded_state = ShardedState.SHARDED_POST_FORWARD
 
     def _to_unsharded(self):
+        # [FUNCTION DOC] HELPER: Converts all params to the unsharded state unless already.
         if not self.is_unsharded:
             for fsdp_param in self.fsdp_params:
                 fsdp_param.to_unsharded()
@@ -894,18 +997,23 @@ class FSDPParamGroup:
 
     @property
     def is_sharded(self) -> bool:
+        # [FUNCTION DOC] True when the group is in the fully sharded state.
         return self._sharded_state == ShardedState.SHARDED
 
     @property
     def is_sharded_post_forward(self) -> bool:
+        # [FUNCTION DOC] True when the group is sharded over the post-forward (smaller) mesh.
         return self._sharded_state == ShardedState.SHARDED_POST_FORWARD
 
     @property
     def is_unsharded(self) -> bool:
+        # [FUNCTION DOC] True when the group's parameters are unsharded.
         return self._sharded_state == ShardedState.UNSHARDED
 
     @contextlib.contextmanager
     def use_training_state(self, training_state: TrainingState):
+        # [FUNCTION DOC] Context manager that temporarily sets the group's training state and
+        # restores the previous one on exit, even on error.
         old_training_state = self._training_state
         self._training_state = training_state
         try:
@@ -917,6 +1025,10 @@ class FSDPParamGroup:
     def _register_post_backward_hook(
         self, args: tuple[Any, ...], kwargs: dict[str, Any]
     ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        # [FUNCTION DOC] HELPER: When grad mode is on, collects grad-requiring tensors in args and
+        # kwargs (including inside dataclasses), passes them through the post-backward autograd
+        # function so backward triggers post_backward, and returns args/kwargs with the tensors
+        # replaced. Returns inputs unchanged if grad is off or there are no such tensors.
         if not torch.is_grad_enabled():
             return args, kwargs
 
@@ -933,6 +1045,9 @@ class FSDPParamGroup:
         return new_args, new_kwargs
 
     def _register_state_dict_hooks(self) -> None:
+        # [FUNCTION DOC] HELPER: Once per group, registers state-dict pre-save and pre-load hooks
+        # on every module owning an FSDP param so the group is resharded before saving or loading;
+        # stores the handles. Raises AssertionError if the save/load handle counts differ.
         num_pre_save_hooks = len(self._module_to_pre_save_state_dict_hook_handle)
         num_pre_load_hooks = len(self._module_to_pre_load_state_dict_hook_handle)
         if num_pre_save_hooks != num_pre_load_hooks:
@@ -946,6 +1061,7 @@ class FSDPParamGroup:
         }
 
         def to_sharded_hook(*args: Any, **kwargs: Any) -> None:
+            # [FUNCTION DOC] HELPER: State-dict hook body; reshards the group, ignoring arguments.
             self._to_sharded()
 
         for module in modules_with_fsdp_params:
@@ -959,10 +1075,14 @@ class FSDPParamGroup:
     # Properties #
     @property
     def _reshard_after_forward(self) -> bool:
+        # [FUNCTION DOC] HELPER: True when a post-forward mesh is set, meaning the group reshards
+        # after forward.
         return self.post_forward_mesh_info is not None
 
     @property
     def _use_post_forward_mesh(self) -> bool:
+        # [FUNCTION DOC] HELPER: True when resharding after forward targets a mesh different from
+        # the group's main mesh.
         return (
             self._reshard_after_forward
             and self.mesh_info != self.post_forward_mesh_info
@@ -970,10 +1090,15 @@ class FSDPParamGroup:
 
     @property
     def _is_hsdp(self) -> bool:
+        # [FUNCTION DOC] HELPER: True when the group uses a hybrid sharded (shard plus replicate)
+        # mesh.
         return isinstance(self.mesh_info, HSDPMeshInfo)
 
     @property
     def _all_gather_process_group(self) -> dist.ProcessGroup:
+        # [FUNCTION DOC] HELPER: Returns the shard process group used for all-gather, taken from
+        # the post-forward mesh when the group is in that state, else the main mesh. Raises
+        # AssertionError if the mesh is not a sharding mesh.
         mesh_info = (
             cast(FSDPMeshInfo, self.post_forward_mesh_info)
             if self.is_sharded_post_forward
@@ -987,6 +1112,8 @@ class FSDPParamGroup:
 
     @property
     def _reduce_scatter_process_group(self) -> dist.ProcessGroup:
+        # [FUNCTION DOC] HELPER: Returns the dedicated reduce-scatter group if one was enabled,
+        # else the shard group. Raises AssertionError if the mesh is not a sharding mesh.
         if not isinstance(self.mesh_info, FSDPMeshInfo):
             raise AssertionError(
                 f"Expected mesh_info to be FSDPMeshInfo, got {type(self.mesh_info)}"
@@ -1001,6 +1128,11 @@ class FSDPParamGroup:
     def _set_separate_reduce_scatter_group(
         self, enable: bool, new_groups: dict[tuple[int, ...], dist.ProcessGroup]
     ) -> None:
+        # [FUNCTION DOC] HELPER: Enables or disables a dedicated reduce-scatter process group on
+        # the mesh info. Disabling clears it. Enabling reuses a cached or existing group for the
+        # same shard ranks, else creates one with local synchronization and caches it in the
+        # passed mapping. Raises AssertionError for a non-sharding mesh or if the current rank is
+        # not in the new group. May perform collective group creation.
         # Give reduce-scatter its own process group (separate from the shared
         # all-gather/shard PG) so the two can overlap in backward, or reset to
         # the shared group. ``new_groups`` caches groups by shard ranks within
@@ -1039,6 +1171,8 @@ class FSDPParamGroup:
 
     @property
     def _all_reduce_process_group(self) -> dist.ProcessGroup:
+        # [FUNCTION DOC] HELPER: Returns the replicate process group used for HSDP all-reduce.
+        # Raises AssertionError if the mesh has no replicate dimension.
         if not isinstance(self.mesh_info, DDPMeshInfo):
             raise AssertionError(
                 f"Expected mesh_info to be DDPMeshInfo or HSDPMeshInfo, got {type(self.mesh_info)}"
@@ -1046,6 +1180,8 @@ class FSDPParamGroup:
         return self.mesh_info.replicate_process_group
 
     def _with_fqn(self, label: str) -> str:
+        # [FUNCTION DOC] HELPER: Appends the module FQN and, for multi-group modules on a sharding
+        # mesh, the shard mesh size to a profiler/log label and returns it.
         if self._module_fqn:
             label = f"{label} ({self._module_fqn})"
         if self._num_param_groups > 1 and isinstance(self.mesh_info, FSDPMeshInfo):
@@ -1053,9 +1189,12 @@ class FSDPParamGroup:
         return label
 
     def __repr__(self):
+        # [FUNCTION DOC] HELPER: Short string showing the group's module FQN.
         return f"FSDPParamGroup(fqn={self._module_fqn})"
 
     def _validate_no_meta_params(self):
+        # [FUNCTION DOC] HELPER: Raises RuntimeError listing any sharded params still on the meta
+        # device, with advice to materialize them.
         param_names_on_meta = [
             fsdp_param._param_fqn
             for fsdp_param in self.fsdp_params
@@ -1070,6 +1209,8 @@ class FSDPParamGroup:
             )
 
     def _validate_cpu_offload_params(self):
+        # [FUNCTION DOC] HELPER: With a CPU offload policy, raises RuntimeError listing sharded
+        # params that are not on CPU; no-op otherwise.
         if not isinstance(self.offload_policy, CPUOffloadPolicy):
             return
         fsdp_params_not_on_cpu = [
@@ -1086,6 +1227,8 @@ class FSDPParamGroup:
             )
 
     def _validate_reduce_scatter_max_input_buffers(self):
+        # [FUNCTION DOC] HELPER: Raises ValueError if the buffer cap exceeds one while the
+        # symmetric-memory reduce-scatter is in use (it cannot retain several buffers).
         # Reject max_input_buffers > 1 with the symmetric-memory reduce-scatter
         # comm: retaining >1 input buffers relies on the allocator handing out a
         # fresh buffer while prior ones are ref-held, but the symmetric-memory
@@ -1110,6 +1253,10 @@ class FSDPParamGroup:
 def _get_param_module_infos(
     params: list[nn.Parameter], modules: tuple[nn.Module, ...]
 ) -> list[ParamModuleInfo]:
+    # [FUNCTION DOC] HELPER: For each param, finds the owning submodule and attribute name by
+    # walking all submodules (keeping duplicates), recording extra modules/names for shared
+    # params. Returns infos in the order of params. Raises AssertionError if a param is not found
+    # in the module trees.
     """
     Shared parameter: lin1.weight = lin2.weight
     Shared module: mlp.lin1 = mlp.lin2
@@ -1139,21 +1286,27 @@ def _get_param_module_infos(
 
 
 class RegisterPostBackwardFunction(torch.autograd.Function):
+    # [CLASS DOC] Autograd function that is the identity on input tensors in forward and runs the
+    # param group's post_backward when gradients flow back through it. Supports vmap and jvp.
     generate_vmap_rule = True
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def forward(param_group: FSDPParamGroup, *inputs: torch.Tensor):
+        # [FUNCTION DOC] HELPER: Returns the input tensors unchanged; the group is only carried.
         # All tensors in `inputs` should require gradient
         return inputs
 
     @staticmethod
     def setup_context(ctx, inputs: tuple[Any, ...], output: Any) -> None:
+        # [FUNCTION DOC] HELPER: Saves the param group (first input) on the context.
         param_group, *_ = inputs
         ctx.param_group = param_group
 
     @staticmethod
     def backward(ctx, *grads: torch.Tensor):
+        # [FUNCTION DOC] HELPER: Runs the saved group's post_backward, then returns no gradient for
+        # the group plus the incoming gradients unchanged.
         ctx.param_group.post_backward()
         return (None,) + grads
 
@@ -1164,6 +1317,8 @@ class RegisterPostBackwardFunction(torch.autograd.Function):
         param_group_tangent: object,
         *grad_inputs: Unpack[_GradInputs],
     ) -> tuple[Unpack[_GradInputs]]:
+        # [FUNCTION DOC] HELPER: Forward-mode rule; drops the group tangent and returns the input
+        # tangents unchanged.
         # Drop the non-tensor param_group tangent. The output pre-backward hook
         # queues final post-backward after all primal/tangent paths finish.
         return grad_inputs
