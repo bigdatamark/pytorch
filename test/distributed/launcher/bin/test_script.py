@@ -7,12 +7,21 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+# [MODULE DOC] Worker script launched by the elastic launcher tests (test_run.py, launch_test.py).
+# Prints the torchelastic environment variables set by the agent, then either raises a
+# RuntimeError (when --fail is passed) or touches a file named after the global RANK inside
+# the directory given by --touch-file-dir so the test can verify which workers ran.
+# No import-time side effects; main() only runs when executed as a script.
+
 import argparse
 import os
 from pathlib import Path
 
 
 def parse_args():
+    # [FUNCTION DOC] HELPER: builds the command line parser and returns the parsed namespace.
+    # Options: --fail (boolean flag, default off) and --touch-file-dir / --touch_file_dir (string
+    # directory path). Reads sys.argv; argparse exits the process on invalid arguments.
     parser = argparse.ArgumentParser(description="test script")
 
     parser.add_argument(
@@ -33,6 +42,11 @@ def parse_args():
 
 
 def main():
+    # [FUNCTION DOC] Entry point of the worker. Parses arguments, then prints every variable in a
+    # fixed list of torchelastic variables (LOCAL_RANK, RANK, WORLD_SIZE, MASTER_ADDR, ...,
+    # TEST_SENTINEL_PARENT, TORCHELASTIC_ERROR_FILE). Raises KeyError if any is not set in the
+    # environment. With --fail it then raises RuntimeError; otherwise it creates an empty file
+    # named by the RANK variable in the touch-file directory (side effect on disk) and prints it.
     args = parse_args()
     env_vars = [
         "LOCAL_RANK",

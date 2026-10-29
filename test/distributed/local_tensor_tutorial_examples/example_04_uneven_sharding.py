@@ -1,6 +1,10 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC] Tutorial example 4: uneven shard sizes, covering a LocalTensor whose ranks hold
+# different row counts, per rank integers via LocalIntNode, and DTensor sharding of a size
+# not divisible by the world size. As a script it initializes a fake group of world size 3.
+
 """
 Example 4: Handling Uneven Sharding
 ====================================
@@ -21,6 +25,8 @@ from torch.distributed.tensor import distribute_tensor, init_device_mesh, Shard
 
 # [core_uneven_shards]
 def create_uneven_shards():
+    # [FUNCTION DOC] Builds a three rank LocalTensor whose shards have 1, 2 and 1 rows. Returns
+    # ((local_tensor, whether its first dimension is a symbolic int), mapping of rank to shape).
     """Create LocalTensor with different sizes per rank.
 
     Returns: ((local_tensor, is_symint), expected_shapes_dict)
@@ -43,6 +49,9 @@ def create_uneven_shards():
 
 # [core_local_int_node]
 def local_int_node_arithmetic():
+    # [FUNCTION DOC] Adds and multiplies two LocalIntNode values holding one integer per rank.
+    # Returns ((add mapping, mul mapping), (expected add mapping, expected mul mapping)) as plain
+    # dicts keyed by rank.
     """LocalIntNode for per-rank integer values.
 
     Returns: ((add_result, mul_result), (expected_add, expected_mul))
@@ -69,6 +78,9 @@ def local_int_node_arithmetic():
 
 # [core_dtensor_uneven]
 def dtensor_uneven_sharding(world_size: int = 3):
+    # [FUNCTION DOC] Shards a 10 row tensor on dim 0 over the mesh, which does not divide evenly,
+    # and collects each rank's local row count; also rebuilds the full tensor and compares.
+    # Returns ((rows_per_rank mapping, whether reconstruction matches), 10).
     """DTensor with unevenly divisible tensor dimension.
 
     Returns: ((rows_per_rank, matches), expected_total_rows)

@@ -6,6 +6,14 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
+# [MODULE DOC] Tests for the torchrun entry point torch.distributed.run (imported as launch).
+# Covers launching worker scripts from bin/ in python, bash (--no-python) and run-path modes,
+# nproc-per-node parsing (number, auto, gpu, xpu, invalid), PET_ environment variable
+# configuration, standalone and c10d elastic rendezvous, multiple agents, error propagation
+# from workers and the agent, rendezvous shutdown, is_torchelastic_launched, logs specs,
+# init_method handling, log capture with a line prefix, and the virtual-local-rank option.
+# Helper functions here wrap launching and process inspection; no import-time side effects.
+
 import io
 import multiprocessing as mp
 import os
@@ -41,14 +49,21 @@ from torch.testing._internal.common_utils import (
 
 
 def launch_in_proc(args):
+    # [FUNCTION DOC] HELPER: runs torchrun's main in the current process with the argument list.
     launch.main(args)
 
 
 def path(script):
+    # [FUNCTION DOC] HELPER: returns the absolute path of a script located next to this file.
     return os.path.join(os.path.dirname(__file__), script)
 
 
 def get_child_pids(pid):
+    # [FUNCTION DOC] HELPER: lists the direct child process ids of a process by running pgrep
+    # with the parent option through a shell, waiting for it, and parsing each non-empty output
+    # line as an integer. Returns a list of ints (empty if none).
+    # KNOWN ISSUE: waits for pgrep before reading its piped output, which could block on large
+    #   output; the loop variable also shadows the pid parameter.
     pgrep = subprocess.Popen(args=f"pgrep -P {pid}", shell=True, stdout=subprocess.PIPE)
     pgrep.wait()
     out = pgrep.stdout.read().decode("utf-8").rstrip().split("\n")
@@ -60,6 +75,10 @@ def get_child_pids(pid):
 
 
 def pid_exists(pid):
+    # [FUNCTION DOC] HELPER: probes a process with the null signal. Returns True if the signal
+    # call succeeds and False on any OS error.
+    # KNOWN ISSUE: a permission error (process exists but belongs to another user) is also an OS
+    #   error and is reported as not existing.
     try:
         os.kill(pid, 0)
         return True
@@ -68,11 +87,20 @@ def pid_exists(pid):
 
 
 class MockException(Exception):
+    # [CLASS DOC] HELPER: marker exception used as the side effect of a mocked agent run so tests
+    # can check the launcher re-raises the agent's original exception.
     pass
 
 
 class ElasticLaunchTest(TestCase):
+    # [CLASS DOC] End to end tests of torchrun (torch.distributed.run.main) that spawn real
+    # worker processes. State: test_dir is a per-test temporary directory into which the worker
+    # scripts write marker files named by global rank. Most tests are skipped under dev/dbg ASAN
+    # builds. Fixtures clear PET_ variables and set a sentinel environment variable.
     def setUp(self):
+        # [FUNCTION DOC] HELPER: creates test_dir, deletes every environment variable whose name
+        # starts with PET_ (torchrun's config prefix) and sets TEST_SENTINEL_PARENT to FOOBAR,
+        # which worker scripts assert is inherited.
         super().setUp()
         self.test_dir = tempfile.mkdtemp()
 
@@ -87,12 +115,17 @@ class ElasticLaunchTest(TestCase):
         os.environ["TEST_SENTINEL_PARENT"] = "FOOBAR"
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: recursively removes test_dir.
         shutil.rmtree(self.test_dir)
 
     def test_launch_user_script_python(self):
+        # [FUNCTION DOC] Runs the shared python script launch scenario (see the helper below).
         self._test_launch_user_script_python()
 
     def _test_launch_user_script_python(self):
+        # [FUNCTION DOC] HELPER: launches 4 python workers on one node with a random rdzv id,
+        # running bin/test_script.py, then asserts test_dir contains exactly one file per global
+        # rank 0..3.
         run_id = str(uuid.uuid4().int)
         nnodes = 1
         nproc_per_node = 4
@@ -115,6 +148,9 @@ class ElasticLaunchTest(TestCase):
         )
 
     def test_launch_user_script_python_caffe2_bc(self):
+        # [FUNCTION DOC] Backward compatibility launch using the older style flags: a free master
+        # port, --master-addr=localhost and --node-rank=0 instead of rendezvous options. Asserts
+        # all 4 workers ran (one marker file per rank).
         nnodes = 1
         nproc_per_node = 4
         world_size = nnodes * nproc_per_node
@@ -144,6 +180,9 @@ class ElasticLaunchTest(TestCase):
         TEST_WITH_DEV_DBG_ASAN, "test incompatible with dev/dbg asan"
     )
     def test_launch_user_script_bash(self):
+        # [FUNCTION DOC] Launches 4 workers of bin/test_script.sh with --no-python. First checks
+        # that combining --no-python with --module raises ValueError, then launches for real and
+        # asserts one marker file per rank exists.
         run_id = str(uuid.uuid4().int)
         nnodes = 1
         nproc_per_node = 4
@@ -175,6 +214,9 @@ class ElasticLaunchTest(TestCase):
         TEST_WITH_DEV_DBG_ASAN, "test incompatible with dev/dbg asan"
     )
     def test_launch_user_script_default_nproc(self):
+        # [FUNCTION DOC] Same as the bash launch test but omits nproc-per-node, so the default of
+        # a single process is used; checks the --no-python plus --module ValueError, then asserts
+        # only rank 0's marker file exists.
         run_id = str(uuid.uuid4().int)
         nnodes = 1
         world_size = 1
@@ -204,6 +246,11 @@ class ElasticLaunchTest(TestCase):
         TEST_WITH_DEV_DBG_ASAN, "test incompatible with dev/dbg asan"
     )
     def test_launch_with_env_vars(self):
+        # [FUNCTION DOC] Configures torchrun purely through PET_ environment variables (nnodes,
+        # nproc per node, rdzv id, monitor interval, start method, no python), setting PET_MODULE
+        # to 1 first and expecting ValueError, then to 0 and launching bin/test_script.sh.
+        # Asserts one marker file per rank. Side effect: mutates os.environ (cleared by setUp
+        # later).
         run_id = str(uuid.uuid4().int)
         nnodes = 1
         nproc_per_node = 4
@@ -233,6 +280,10 @@ class ElasticLaunchTest(TestCase):
         )
 
     def _test_nproc_launch_configuration(self, nproc_type, expected_number):
+        # [FUNCTION DOC] HELPER: launches bin/test_script.sh on one node with nproc-per-node set
+        # to the given string (for example auto, gpu, xpu or a number) and asserts marker files
+        # exist for exactly expected_number ranks. Invalid values propagate the launcher's
+        # ValueError.
         run_id = str(uuid.uuid4().int)
         nnodes = 1
 
@@ -261,6 +312,8 @@ class ElasticLaunchTest(TestCase):
     )
     @patch("torch.cuda.is_available", return_value=False)
     def test_nproc_launch_auto_configurations(self, _mock1):
+        # [FUNCTION DOC] With CUDA reported unavailable, nproc-per-node=auto must use one worker
+        # per CPU core (torch._utils.cpu_count).
         expected = torch._utils.cpu_count()
         self._test_nproc_launch_configuration("auto", expected)
 
@@ -268,12 +321,15 @@ class ElasticLaunchTest(TestCase):
         TEST_WITH_DEV_DBG_ASAN, "test incompatible with dev/dbg asan"
     )
     def test_nproc_launch_number_configurations(self):
+        # [FUNCTION DOC] An explicit nproc-per-node of 4 launches exactly 4 workers.
         self._test_nproc_launch_configuration("4", 4)
 
     @skip_but_pass_in_sandcastle_if(
         TEST_WITH_DEV_DBG_ASAN, "test incompatible with dev/dbg asan"
     )
     def test_nproc_launch_unknown_configurations(self):
+        # [FUNCTION DOC] An unrecognized nproc-per-node value must make the launcher raise
+        # ValueError.
         with self.assertRaises(ValueError):
             self._test_nproc_launch_configuration("unknown", 4)
 
@@ -288,6 +344,8 @@ class ElasticLaunchTest(TestCase):
     def test_nproc_gpu_launch_configurations(
         self, _mock1, _mock2, _mock3, _mock4, _mock5
     ):
+        # [FUNCTION DOC] With CUDA and the accelerator API mocked to report 3 gpu devices, both
+        # auto and gpu nproc-per-node settings must launch 3 workers. Mock arguments are unused.
         self._test_nproc_launch_configuration("auto", 3)
         self._test_nproc_launch_configuration("gpu", 3)
 
@@ -302,6 +360,8 @@ class ElasticLaunchTest(TestCase):
     def test_nproc_xpu_launch_configurations(
         self, _mock1, _mock2, _mock3, _mock4, _mock5
     ):
+        # [FUNCTION DOC] With the xpu and accelerator APIs mocked to report 3 devices, both auto
+        # and xpu nproc-per-node settings must launch 3 workers. Mock arguments are unused.
         self._test_nproc_launch_configuration("auto", 3)
         self._test_nproc_launch_configuration("xpu", 3)
 
@@ -309,6 +369,9 @@ class ElasticLaunchTest(TestCase):
         TEST_WITH_DEV_DBG_ASAN, "test incompatible with dev/dbg asan"
     )
     def test_launch_elastic(self):
+        # [FUNCTION DOC] Launches with an elastic range of 1 to 2 nodes over the c10d rendezvous
+        # on a free local port with short timeouts, but only one node joins; 4 workers run and
+        # the test asserts a marker file for each of ranks 0..3.
         run_id = str(uuid.uuid4().int)
         min_nodes = 1
         max_nodes = 2
@@ -340,6 +403,9 @@ class ElasticLaunchTest(TestCase):
         TEST_WITH_DEV_DBG_ASAN, "test incompatible with dev/dbg asan"
     )
     def test_launch_elastic_worker_raise_exception(self, record_mock):
+        # [FUNCTION DOC] Launches workers that fail (--fail) with zero restarts. Expects the
+        # launcher to raise ChildFailedError and the events record function to be called exactly
+        # once.
         """
         Asserts that when the worker program fails and lancher raieses exception
         to indicate that worker process failed
@@ -375,6 +441,8 @@ class ElasticLaunchTest(TestCase):
     )
     @mock.patch("torch.distributed.elastic.events.record")
     def test_launch_elastic_agent_raise_exception(self, record_mock, mock_agent_run):
+        # [FUNCTION DOC] Makes the local elastic agent's run raise MockException. Expects the
+        # launcher to re-raise that same exception and to record exactly one event.
         """
         Asserts that when the agent raises an exception
         the launcher re-raises the original exception
@@ -406,6 +474,8 @@ class ElasticLaunchTest(TestCase):
         TEST_WITH_DEV_DBG_ASAN, "test incompatible with dev/dbg asan"
     )
     def test_launch_standalone(self):
+        # [FUNCTION DOC] Launches 4 workers with --standalone (single node rendezvous set up by
+        # the launcher) and asserts one marker file per rank.
         nnodes = 1
         nproc_per_node = 4
         world_size = nnodes * nproc_per_node
@@ -430,6 +500,8 @@ class ElasticLaunchTest(TestCase):
         TEST_WITH_DEV_DBG_ASAN, "test incompatible with dev/dbg asan"
     )
     def test_launch_run_path(self):
+        # [FUNCTION DOC] Launches 4 workers with --run-path, which executes the script in the
+        # worker via runpy semantics, and asserts one marker file per rank.
         nnodes = 1
         nproc_per_node = 4
         world_size = nnodes * nproc_per_node
@@ -454,6 +526,10 @@ class ElasticLaunchTest(TestCase):
         TEST_WITH_DEV_DBG_ASAN, "test incompatible with dev/dbg asan"
     )
     def test_launch_elastic_multiple_agents(self):
+        # [FUNCTION DOC] Simulates two nodes: one extra process (multiprocessing) runs
+        # launch.main with the same c10d rendezvous arguments while the test process runs
+        # another. The helper process must exit with code 0, and marker files must exist for all
+        # 8 ranks.
         run_id = str(uuid.uuid4().int)
         min_nodes = 1
         max_nodes = 2
@@ -490,6 +566,8 @@ class ElasticLaunchTest(TestCase):
         )
 
     def test_min_max_nodes_parse(self):
+        # [FUNCTION DOC] Checks parse_min_max_nnodes: a single number gives equal min and max, a
+        # colon separated pair gives (min, max), and three parts raise RuntimeError.
         min_nodes, max_nodes = launch.parse_min_max_nnodes("1")
         self.assertEqual(min_nodes, max_nodes)
         self.assertEqual(1, min_nodes)
@@ -501,6 +579,9 @@ class ElasticLaunchTest(TestCase):
 
     @patch("torch.distributed.launcher.api.LocalElasticAgent")
     def test_launch_shutdown(self, agent_mock_cls):
+        # [FUNCTION DOC] With the agent class mocked to return a succeeded result and the
+        # rendezvous handler lookup mocked, asserts launch.main calls the handler's shutdown
+        # exactly once.
         nnodes = 1
         nproc_per_node = 4
         args = [
@@ -526,6 +607,8 @@ class ElasticLaunchTest(TestCase):
         TEST_WITH_DEV_DBG_ASAN, "test incompatible with dev/dbg asan"
     )
     def test_is_torchelastic_launched(self):
+        # [FUNCTION DOC] Launches bin/test_script_is_torchelastic_launched.py via torchrun with
+        # one worker and asserts the file it writes contains the text True.
         # launch test script with torchelastic and validate that
         # torch.distributed.is_torchelastic_launched() returns True
 
@@ -550,6 +633,9 @@ class ElasticLaunchTest(TestCase):
         TEST_WITH_DEV_DBG_ASAN, "test incompatible with dev/dbg asan"
     )
     def test_is_torchelastic_launched_with_logs_spec_defined(self, metadata_mock):
+        # [FUNCTION DOC] Same check as above but with --logs_specs=default, where the importlib
+        # metadata entry points lookup is mocked to return DefaultLogsSpecs. Removes any stale
+        # out file first and asserts the written text is True.
         # mock the entrypoint API to avoid version issues.
         entrypoints = MagicMock()
         metadata_mock.entry_points.return_value = entrypoints
@@ -586,6 +672,8 @@ class ElasticLaunchTest(TestCase):
         TEST_WITH_DEV_DBG_ASAN, "test incompatible with dev/dbg asan"
     )
     def test_logs_logs_spec_entrypoint_must_be_defined(self):
+        # [FUNCTION DOC] Passing a logs_specs name with no registered entry point must raise
+        # ValueError from launch.main.
         with self.assertRaises(ValueError):
             launch.main(
                 [
@@ -599,6 +687,8 @@ class ElasticLaunchTest(TestCase):
             )
 
     def test_is_not_torchelastic_launched(self):
+        # [FUNCTION DOC] Runs the same script directly in this interpreter via runpy (with argv
+        # patched) rather than torchrun, and asserts the file it writes contains False.
         # launch test script without torchelastic and validate that
         # torch.distributed.is_torchelastic_launched() returns False
 
@@ -624,6 +714,9 @@ class ElasticLaunchTest(TestCase):
         TEST_WITH_DEV_DBG_ASAN, "test incompatible with dev/dbg asan"
     )
     def test_init_method_tcp_with_torchelastic(self):
+        # [FUNCTION DOC] Launches 4 workers of bin/test_script_init_method.py with a tcp:// init
+        # method pointing at the master address and a free port. No assertions beyond completion
+        # without error.
         port = get_free_port()
         launch.main(
             [
@@ -643,6 +736,8 @@ class ElasticLaunchTest(TestCase):
         TEST_WITH_DEV_DBG_ASAN, "test incompatible with dev/dbg asan"
     )
     def test_init_method_env_with_torchelastic(self):
+        # [FUNCTION DOC] Same as the tcp init method test but with the env:// init method;
+        # success means launch.main returns without error.
         port = get_free_port()
         launch.main(
             [
@@ -659,6 +754,9 @@ class ElasticLaunchTest(TestCase):
         # nothing to validate, just make sure it runs
 
     def test_capture_logs_using_default_logs_specs(self):
+        # [FUNCTION DOC] Launches 4 bash workers with redirect and tee both set to 3 while the
+        # TORCHELASTIC_LOG_LINE_PREFIX_TEMPLATE is patched to a rank prefix, capturing stdout.
+        # Asserts the output contains the creating message prefixed by each rank's tag.
         run_id = str(uuid.uuid4().int)
         nnodes = 1
         nproc_per_node = 4
@@ -697,6 +795,10 @@ class ElasticLaunchTest(TestCase):
     @pytest.mark.multigpu
     @skip_if_rocm_ver_atleast_multiprocess([7, 14])
     def test_virtual_local_rank(self):
+        # [FUNCTION DOC] Requires CUDA and 2 GPUs. Launches script_deviceid.py on 2 workers with
+        # and without --virtual-local-rank, capturing the generated inductor code per rank.
+        # Without the flag the two ranks' code must differ (different device ids); with it the
+        # code must be identical. Also asserts code was captured for both ranks in both runs.
         """
         Test that virtual-local-rank ensures consistent device IDs across ranks.
         Without it, ranks may compile to different devices, leading to different code.
@@ -707,6 +809,9 @@ class ElasticLaunchTest(TestCase):
 
         # Helper function to run and capture output
         def run_test(use_virtual_local_rank):
+            # [FUNCTION DOC] HELPER: launches the 2 process job (optionally adding
+            # --virtual-local-rank), redirecting and teeing worker output, captures stdout and
+            # returns it as a string.
             args = [
                 f"--nnodes={nnodes}",
                 f"--nproc-per-node={nproc_per_node}",
@@ -729,6 +834,9 @@ class ElasticLaunchTest(TestCase):
             return captured_out.getvalue()
 
         def split_ranks(output):
+            # [FUNCTION DOC] HELPER: keeps only output lines containing cuda: and splits them
+            # into two lists by the default0 / default1 rank prefix, stripping the 11 character
+            # prefix. Returns the pair (rank 0 lines, rank 1 lines).
             default0 = []
             default1 = []
             for line in output.splitlines():

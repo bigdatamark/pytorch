@@ -1,6 +1,11 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC] Tutorial example 3: using DTensor on top of LocalTensorMode with a CPU device
+# mesh, covering distribution, matmul and a linear layer. Each function returns actual and
+# expected values. As a script it initializes a fake backend group of world size 4, runs the
+# cases and destroys the group.
+
 """
 Example 3: Working with DTensor
 ================================
@@ -26,6 +31,9 @@ from torch.distributed.tensor import (
 
 # [core_dtensor_distribute]
 def distribute_and_verify(world_size: int = 4):
+    # [FUNCTION DOC] Creates a 4x4 float tensor, distributes it over a 1D mesh once sharded on
+    # dim 0 and once replicated, and rebuilds both (full_tensor and local view, reconciled).
+    # Returns ((sharded_actual, replicated_actual), (tensor, tensor)).
     """Distribute a tensor and verify reconstruction.
 
     Returns: ((sharded_actual, replicated_actual), (sharded_expected, replicated_expected))
@@ -48,6 +56,8 @@ def distribute_and_verify(world_size: int = 4):
 
 # [core_dtensor_matmul]
 def dtensor_matmul(world_size: int = 4):
+    # [FUNCTION DOC] Multiplies a row-sharded 8x4 DTensor by a replicated 4x6 DTensor and returns
+    # (gathered and reconciled result, plain matmul of the original tensors). Uses random inputs.
     """Perform matrix multiplication with DTensors.
 
     Returns: (actual, expected)
@@ -74,6 +84,9 @@ def dtensor_matmul(world_size: int = 4):
 
 # [core_dtensor_nn_layer]
 def dtensor_linear_layer(world_size: int = 4):
+    # [FUNCTION DOC] Computes relu of x times w plus b with x sharded on the batch dim and w, b
+    # replicated (batch 16, in 8, out 4). Returns (gathered result, same computation on plain
+    # tensors). Inputs are random.
     """Simulate a distributed linear layer forward pass.
 
     Returns: (actual, expected)

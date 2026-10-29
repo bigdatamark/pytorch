@@ -2,6 +2,11 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
 
+# [PACKAGE DOC] Package of runnable LocalTensor tutorial examples plus their test suite.
+# Contains six example modules (basics, collectives, DTensor, uneven sharding, rank specific
+# computation, multi dimensional meshes), each exposing small functions that return an
+# (actual, expected) style tuple, and a test module that calls them. Exports nothing itself.
+
 """
 LocalTensor Tutorial Examples
 =============================

@@ -7,6 +7,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+# [MODULE DOC] Unit tests for torch.distributed.launcher.api.launch_agent focusing on the
+# TORCHELASTIC_SIGNALS_TO_HANDLE environment variable it exports. The elastic agent and the
+# rendezvous handler are mocked, so no processes are started.
+
 import os
 from unittest.mock import MagicMock, patch
 
@@ -15,7 +19,12 @@ from torch.testing._internal.common_utils import run_tests, TestCase
 
 
 class LauncherApiTest(TestCase):
+    # [CLASS DOC] Tests that launch_agent publishes the configured (or default) signal list in
+    # the environment. State: original_signals_env holds the variable's value before each test
+    # so it can be restored.
     def setUp(self):
+        # [FUNCTION DOC] HELPER: remembers the current TORCHELASTIC_SIGNALS_TO_HANDLE value
+        # (or None) in original_signals_env.
         super().setUp()
         # Save original environment variable if it exists
         self.original_signals_env = os.environ.get(
@@ -23,6 +32,8 @@ class LauncherApiTest(TestCase):
         )
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: restores TORCHELASTIC_SIGNALS_TO_HANDLE to the remembered
+        # value, or deletes it if it was previously unset.
         # Restore original environment variable
         if self.original_signals_env is not None:
             os.environ["TORCHELASTIC_SIGNALS_TO_HANDLE"] = self.original_signals_env
@@ -32,6 +43,9 @@ class LauncherApiTest(TestCase):
     @patch("torch.distributed.launcher.api.LocalElasticAgent")
     @patch("torch.distributed.launcher.api.rdzv_registry.get_rendezvous_handler")
     def test_launch_agent_sets_signals_env_var(self, mock_get_handler, mock_agent):
+        # [FUNCTION DOC] With the agent class and rendezvous handler patched (agent run returns
+        # a non-failed result), calls launch_agent with signals_to_handle set to
+        # SIGTERM,SIGUSR1,SIGUSR2 and asserts the environment variable holds that string.
         """Test that launch_agent sets the TORCHELASTIC_SIGNALS_TO_HANDLE environment variable."""
         # Setup
         config = LaunchConfig(
@@ -65,6 +79,8 @@ class LauncherApiTest(TestCase):
     @patch("torch.distributed.launcher.api.LocalElasticAgent")
     @patch("torch.distributed.launcher.api.rdzv_registry.get_rendezvous_handler")
     def test_launch_agent_default_signals(self, mock_get_handler, mock_agent):
+        # [FUNCTION DOC] Same mocking as the previous test but without signals_to_handle;
+        # asserts the variable is set to the default SIGTERM,SIGINT,SIGHUP,SIGQUIT.
         """Test that launch_agent uses the default signals if not specified."""
         # Setup
         config = LaunchConfig(

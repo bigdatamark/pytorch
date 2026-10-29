@@ -1,6 +1,11 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC] Tutorial example 5: computations that differ per rank, using rank_map,
+# tensor_map, mode.disable, maybe_disable_local_tensor_mode and the maybe_run_for_local_tensor
+# decorator. Each function returns actual and expected values; as a script it prints them.
+# No import-time side effects.
+
 """
 Example 5: Rank-Specific Computations
 ======================================
@@ -25,6 +30,9 @@ from torch.distributed._local_tensor import (
 
 # [core_rank_map]
 def use_rank_map(world_size: int = 4):
+    # [FUNCTION DOC] Uses rank_map inside LocalTensorMode to build a LocalTensor where each rank
+    # holds a 2x3 tensor filled with its rank number. Returns (mapping of rank to the first
+    # element, mapping of rank to its float rank).
     """Create LocalTensors with per-rank values using rank_map.
 
     Returns: (values_dict, expected_dict)
@@ -44,6 +52,9 @@ def use_rank_map(world_size: int = 4):
 
 # [core_tensor_map]
 def use_tensor_map(world_size: int = 4):
+    # [FUNCTION DOC] Builds per-rank tensors of value rank+1, then applies tensor_map with a
+    # function scaling each shard by rank+1. Returns (rank to first element, rank to the square
+    # of rank+1).
     """Transform each shard differently using tensor_map.
 
     Returns: (values_dict, expected_dict)
@@ -52,6 +63,7 @@ def use_tensor_map(world_size: int = 4):
         lt = rank_map(lambda rank: torch.ones(2, 2) * (rank + 1))
 
         def scale_by_rank(rank: int, tensor: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: returns the shard multiplied by rank plus one.
             return tensor * (rank + 1)
 
         scaled = tensor_map(lt, scale_by_rank)
@@ -69,6 +81,9 @@ def use_tensor_map(world_size: int = 4):
 
 # [core_disable_mode]
 def disable_mode_temporarily(world_size: int = 4):
+    # [FUNCTION DOC] Records the type name of a ones tensor created inside LocalTensorMode, then
+    # the type name of one created within mode.disable(). Returns ((inside, disabled),
+    # (LocalTensor, Tensor)).
     """Temporarily exit LocalTensorMode for regular tensor ops.
 
     Returns: ((inside_type, disabled_type), (expected_inside, expected_disabled))
@@ -89,12 +104,17 @@ def disable_mode_temporarily(world_size: int = 4):
 
 # [core_maybe_disable]
 def use_maybe_disable():
+    # [FUNCTION DOC] Shows maybe_disable_local_tensor_mode makes tensor creation yield a regular
+    # tensor both outside and inside LocalTensorMode (world size 4). Returns ((outside type name,
+    # inside type name), (Tensor, Tensor)).
     """Use maybe_disable_local_tensor_mode() for portable code.
 
     Returns: ((outside_type, inside_type), (expected_outside, expected_inside))
     """
 
     def create_tensor():
+        # [FUNCTION DOC] HELPER: creates a three element float tensor with local tensor mode
+        # disabled when active, so the result is a plain tensor.
         with maybe_disable_local_tensor_mode():
             return torch.tensor([1.0, 2.0, 3.0])
 
@@ -113,6 +133,9 @@ def use_maybe_disable():
 
 # [core_maybe_run_decorator]
 def use_maybe_run_decorator(world_size: int = 4):
+    # [FUNCTION DOC] Demonstrates the maybe_run_for_local_tensor decorator: a function taking the
+    # data and a rank is run once per rank on a LocalTensor of ranks, assembling per rank
+    # outputs. Splits 16 floats into 4 chunks. Returns (mapping rank to list, expected mapping).
     """Use @maybe_run_for_local_tensor for rank-specific computations.
 
     The decorator runs a function once per rank when inside LocalTensorMode,
@@ -123,6 +146,9 @@ def use_maybe_run_decorator(world_size: int = 4):
 
     @maybe_run_for_local_tensor
     def compute_rank_offset(data: torch.Tensor, rank: int) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: returns the slice of data for the given rank, of length a
+        # quarter of the first dimension (assumes exactly 4 ranks), starting at rank times that
+        # length.
         """Compute offset into data based on rank - non-SPMD behavior."""
         chunk_size = data.shape[0] // 4  # Assume 4 ranks
         start = rank * chunk_size

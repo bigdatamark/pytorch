@@ -1,6 +1,11 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC] Tutorial example 2: simulating collectives (all_reduce, broadcast, all_gather,
+# reduce_scatter) over a LocalTensor with three simulated ranks, using a supplied process
+# group. Each function returns actual and expected values. As a script it initializes a fake
+# backend group of world size 3, runs all cases and destroys the group.
+
 """
 Example 2: Simulating Collective Operations
 ============================================
@@ -20,6 +25,9 @@ from torch.distributed._local_tensor import LocalTensor, LocalTensorMode
 
 # [core_all_reduce]
 def all_reduce_sum(process_group):
+    # [FUNCTION DOC] Builds three rank shards of 2x2 floats, computes the expected elementwise
+    # sum, then inside LocalTensorMode all-reduces a LocalTensor of cloned shards with SUM on the
+    # given group and reconciles it. Returns (result, expected).
     """Simulate all_reduce with SUM across ranks.
 
     Returns: (result, expected)
@@ -45,6 +53,9 @@ def all_reduce_sum(process_group):
 
 # [core_broadcast]
 def broadcast_from_rank(process_group, src_rank: int = 0):
+    # [FUNCTION DOC] Broadcasts a three rank LocalTensor from src_rank on the given group and
+    # reconciles the outcome. Returns (result, expected) where expected is a clone of the source
+    # rank's original tensor.
     """Simulate broadcast from a source rank.
 
     Returns: (result, expected)
@@ -70,6 +81,9 @@ def broadcast_from_rank(process_group, src_rank: int = 0):
 
 # [core_all_gather]
 def all_gather_tensors(process_group):
+    # [FUNCTION DOC] All-gathers a three rank LocalTensor into a list of three zero-initialized
+    # LocalTensors and reconciles each. Returns (list of results, list of the original per-rank
+    # tensors).
     """Simulate all_gather to collect tensors from all ranks.
 
     Returns: (results_list, expected_list)
@@ -97,6 +111,9 @@ def all_gather_tensors(process_group):
 
 # [core_reduce_scatter]
 def reduce_scatter_tensors(process_group):
+    # [FUNCTION DOC] Reduce-scatters three rank 3x2 inputs into a LocalTensor output of shape 1x2
+    # per rank (single-tensor variant). Returns a mapping of rank to its output shard and the
+    # expected mapping, which is each rank's row slice of the elementwise sum of all inputs.
     """Simulate reduce_scatter: reduce then scatter results.
 
     Returns: (rank_outputs_dict, expected_dict)

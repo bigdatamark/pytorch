@@ -7,6 +7,11 @@
 # LICENSE file in the root directory of this source tree.
 
 
+# [MODULE DOC] Tests for the private torch.distributed.optim helpers that apply optimizers
+# during the backward pass (_apply_optimizer_in_backward, _get_in_backward_optimizers). Models
+# updated in backward are compared against reference models using ordinary optimizers.
+# No import-time side effects.
+
 import unittest
 from copy import deepcopy
 
@@ -22,6 +27,10 @@ from torch.distributed.optim import (
 
 
 def _validate_params(params_list, fn):
+    # [FUNCTION DOC] HELPER: takes the first parameter iterable as reference and applies the
+    # comparison function to each pair of corresponding parameters against every other iterable.
+    # KNOWN ISSUE: if the first item is a one-shot generator and more than two iterables are
+    #   given, it is exhausted after the first comparison, so later lists are not compared.
     ref_params = params_list[0]
     for param_list in params_list[1:]:
         for p1, p2 in zip(ref_params, param_list):
@@ -29,7 +38,12 @@ def _validate_params(params_list, fn):
 
 
 class ApplyOverlappedOptimizerTest(unittest.TestCase):
+    # [CLASS DOC] Tests comparing optimizer-in-backward models with equivalent models trained
+    # with regular optimizers, plus hook registration and optimizer lookup.
     def _run_training_loop_and_validate(self, inp, models, optimizers):
+        # [FUNCTION DOC] HELPER: for 6 iterations runs forward and backward of every model on
+        # inp, steps every given optimizer, checks all models' parameters match with assert_close
+        # (as a subtest per iteration), then zeroes gradients to None.
         for i in range(6):
             for model in models:
                 model(inp).sum().backward()
@@ -46,6 +60,10 @@ class ApplyOverlappedOptimizerTest(unittest.TestCase):
                 opt.zero_grad(set_to_none=True)
 
     def _test_apply_optimizer_in_backward(self, share_params) -> None:
+        # [FUNCTION DOC] HELPER: builds a two layer model (optionally tying both layers'
+        # weights), a reference copy trained with SGD (lr 1.0 for weights, 0.5 for biases) and a
+        # deep copy with the same optimizers applied in backward. Checks the initial parameters
+        # match, then trains both with the shared loop and checks they stay equal.
         weight_optimizer_kwargs = {"lr": 1.0}
         bias_optimizer_kwargs = {"lr": 0.5}
         model = nn.Sequential(nn.Linear(10, 10), nn.Linear(10, 10))
@@ -87,12 +105,17 @@ class ApplyOverlappedOptimizerTest(unittest.TestCase):
         )
 
     def test_apply_optimizer_in_backward(self) -> None:
+        # [FUNCTION DOC] Runs the shared scenario without shared parameters.
         self._test_apply_optimizer_in_backward(share_params=False)
 
     def test_apply_optimizer_in_backward_shared_params(self) -> None:
+        # [FUNCTION DOC] Runs the shared scenario with both layers sharing one weight.
         self._test_apply_optimizer_in_backward(share_params=True)
 
     def test_no_register_hook(self):
+        # [FUNCTION DOC] Applies SGD in backward to two copies of a model, one with the default
+        # hook and one with register_hook false. After one backward pass, asserts the hooked
+        # model's parameters changed from the initial ones and the unhooked model's did not.
         model_with_hook = nn.Sequential(nn.Linear(10, 10), nn.Linear(10, 10))
         initial_model = deepcopy(model_with_hook)
         model_no_hook = deepcopy(model_with_hook)
@@ -119,6 +142,8 @@ class ApplyOverlappedOptimizerTest(unittest.TestCase):
             torch.testing.assert_close(p1, p2)
 
     def test_multiple_optim_for_params(self) -> None:
+        # [FUNCTION DOC] Applies two SGD optimizers (lr 0.03 and 0.01) in backward to the same
+        # parameters and checks the result matches a model stepped with both regular optimizers.
         model = nn.Sequential(nn.Linear(10, 10), nn.Linear(10, 10))
         opt_0_kwargs = {"lr": 0.03}
         opt_1_kwargs = {"lr": 0.01}
@@ -142,9 +167,14 @@ class ApplyOverlappedOptimizerTest(unittest.TestCase):
         )
 
     def test_get_optimizers_in_backward(self):
+        # [FUNCTION DOC] Applies SGD in backward to a small model, then asserts the number of
+        # optimizers returned by _get_in_backward_optimizers equals the number of parameters and
+        # the set equals the optimizers stored on each parameter.
         # Create a simple test model
         class TestModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: two linear layer module (10 to 5 to 2) with no forward method.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates the linear1 and linear2 submodules.
                 super().__init__()
                 self.linear1 = torch.nn.Linear(10, 5)
                 self.linear2 = torch.nn.Linear(5, 2)

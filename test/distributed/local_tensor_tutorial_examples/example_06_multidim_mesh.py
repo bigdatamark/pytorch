@@ -1,6 +1,10 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC] Tutorial example 6: multi-dimensional device meshes under LocalTensorMode
+# (2D data/tensor parallel, hybrid parallel matmul, 3D mesh). Each function returns actual
+# and expected values. As a script it initializes a fake group of world size 24.
+
 """
 Example 6: Multi-Dimensional Meshes
 ====================================
@@ -26,6 +30,8 @@ from torch.distributed.tensor import (
 
 # [core_2d_mesh]
 def create_2d_mesh():
+    # [FUNCTION DOC] Creates a 4x2 CPU mesh named dp and tp over 8 simulated ranks. Returns
+    # ((mesh shape, mesh dim names, mesh size), ((4, 2), (dp, tp), 8)).
     """Create a 2D mesh for hybrid parallelism.
 
     Returns: ((shape, dim_names, total_size), (expected_shape, expected_names, expected_size))
@@ -48,6 +54,9 @@ def create_2d_mesh():
 
 # [core_hybrid_parallel]
 def hybrid_parallelism():
+    # [FUNCTION DOC] On a 4x2 mesh, shards a 16x8 matrix on rows over dp and replicates over tp,
+    # shards an 8x12 matrix on columns over tp and replicates over dp, multiplies them, and
+    # gathers the result. Returns (gathered result, plain matmul). Random inputs.
     """Combine data parallel and tensor parallel.
 
     Returns: (actual, expected)
@@ -77,6 +86,9 @@ def hybrid_parallelism():
 
 # [core_3d_mesh]
 def create_3d_mesh():
+    # [FUNCTION DOC] On a 2x3x4 mesh (pp, dp, tp; 24 ranks) distributes an 8x16x32 random tensor
+    # replicated over pp, sharded on dim 0 over dp and on dim 2 over tp, then gathers it. Returns
+    # (gathered result, original tensor).
     """Create a 3D mesh for DP + TP + PP.
 
     Returns: (actual, expected)
