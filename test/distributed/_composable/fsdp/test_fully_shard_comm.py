@@ -1,5 +1,14 @@
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC] Tests for FSDP2 (fully_shard) communication behavior. Contents: direct tests of
+# the foreach all-gather and foreach reduce-scatter collectives at world size 128 on threads;
+# communication-count tests using CommDebugMode (reshard_after_forward variants, manual reshard,
+# set_reshard_after_forward); gradient divide factor and reduce-scatter input buffer cap setters;
+# forward/backward prefetch ordering tests built on recorded unshard, reshard and post-backward
+# events; async unshard; allocation from the process group; symmetric memory; forced sum
+# reduction; and reduce op at world size 1. Import-time side effects: defines c10d_ops,
+# EventType, device_type and device_module from get_devtype().
+
 import copy
 import functools
 import itertools
@@ -95,15 +104,23 @@ device_module = torch.get_device_module(device_type)
 
 
 class TestFullyShardCollectiveOps(FSDPTestMultiThread):
+    # [CLASS DOC] Single-process multi-thread tests (128 simulated ranks) of the FSDP2 collective
+    # helpers: builds an FSDPParamGroup directly over a parameter list and checks the foreach
+    # all-gather (with copy-in and copy-out) and foreach reduce-scatter against references.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Fixed simulated world size of 128.
         return 128
 
     @property
     def device(self) -> torch.device:
+        # [FUNCTION DOC] HELPER: Returns device index 0 of the test device type.
         return torch.device(device_type.type, 0)
 
     def _get_param_sizes(self) -> list[torch.Size]:
+        # [FUNCTION DOC] HELPER: Returns a fixed list of 8 parameter shapes (mixed 1D and 2D,
+        # many not divisible by 128) used for the collective tests; sized for about 0.22 GB
+        # at world 128.
         # For world size 128, the fp32 all-gather and reduce-scatter testing
         # requires ~0.22 GB
         return [
@@ -118,6 +135,9 @@ class TestFullyShardCollectiveOps(FSDPTestMultiThread):
         ]
 
     def _init_params(self, param_sizes: list[torch.Size]) -> list[nn.Parameter]:
+        # [FUNCTION DOC] HELPER: Seeds the RNG with 42, creates a random parameter on the test
+        # device for each size and broadcasts each from rank 0 so all (thread) ranks hold
+        # identical values. Returns the list of nn.Parameter.
         torch.manual_seed(42)
         orig_params = [
             nn.Parameter(torch.randn(size, device=self.device)) for size in param_sizes
@@ -131,6 +151,10 @@ class TestFullyShardCollectiveOps(FSDPTestMultiThread):
     def _init_fsdp_param_group(
         self, params: list[nn.Parameter], reshard_after_forward: bool | int
     ):
+        # [FUNCTION DOC] HELPER: Wraps copies of params in an nn.ParameterList module, builds a
+        # one-dim shard mesh info over the default mesh and the post-forward mesh info for
+        # reshard_after_forward, and constructs an FSDPParamGroup (default mixed precision, no
+        # offload, no placement fn). Calls lazy_init and returns the group.
         module = nn.ParameterList([param.detach().clone() for param in params])
         mesh_info = FSDPMeshInfo(_init_default_fully_shard_mesh(), shard_mesh_dim=0)
         post_forward_mesh_info = _get_post_forward_mesh_info(
@@ -151,6 +175,10 @@ class TestFullyShardCollectiveOps(FSDPTestMultiThread):
 
     @skip_if_lt_x_gpu(1)
     def test_all_gather_fp32(self):
+        # [FUNCTION DOC] Runs the all-gather check over the product of sync/async, default-stream
+        # versus two separate streams (copy-in, all-gather), and reshard_after_forward True or 8.
+        # The int reshard case is only tested for sync and non-default streams to save time.
+        # Needs at least 1 GPU.
         param_sizes = self._get_param_sizes()
         default_stream = device_module.current_stream()
         stream1, stream2 = (
@@ -185,7 +213,20 @@ class TestFullyShardCollectiveOps(FSDPTestMultiThread):
         all_gather_copy_in_stream,
         all_gather_stream,
     ):
+        # [FUNCTION DOC] HELPER: Core all-gather check. Builds a param group from random
+        # parameters, asserts the sharded params are DTensors whose full tensor equals
+        # the originals, runs the foreach all-gather with copy-in, copy-out and the
+        # transition to unsharded state, and asserts the unsharded params are
+        # nn.Parameters equal to the originals. When reshard_after_forward is an int it
+        # also moves to the sharded-post-forward state and repeats the all-gather over
+        # the post-forward process group.
+        # KNOWN ISSUE: the nested all_gather helper calls the copy-out with the enclosing
+        # variable fsdp_params (bound later in this function) rather than the group passed in; it
+        # only works because both name the same group's parameters.
         def all_gather(fsdp_param_group: FSDPParamGroup, group: dist.ProcessGroup):
+            # [FUNCTION DOC] HELPER: Runs the foreach all-gather for the group's FSDP params over
+            # the given process group using the default all-gather, then the copy-out,
+            # initializes each unsharded param and moves the group to the unsharded state.
             all_gather_comm = DefaultAllGather()
             all_gather_result = foreach_all_gather(
                 fsdp_param_group.fsdp_params,
@@ -205,6 +246,8 @@ class TestFullyShardCollectiveOps(FSDPTestMultiThread):
         def check_all_gathered_params(
             orig_params: list[nn.Parameter], module: nn.Module
         ):
+            # [FUNCTION DOC] HELPER: Asserts each parameter of module is an nn.Parameter tensor
+            # equal to the corresponding original parameter cast to its dtype.
             for orig_param, param in zip(orig_params, module.parameters()):
                 self.assertIsInstance(param, torch.Tensor)
                 self.assertIsInstance(param, nn.Parameter)
@@ -242,6 +285,8 @@ class TestFullyShardCollectiveOps(FSDPTestMultiThread):
 
     @skip_if_lt_x_gpu(1)
     def test_reduce_scatter_fp32(self):
+        # [FUNCTION DOC] Runs the reduce-scatter check in float32 with both the default stream
+        # and a new stream as the reduce-scatter stream. Needs at least 1 GPU.
         param_sizes = self._get_param_sizes()
         default_stream = device_module.current_stream()
         stream = device_module.Stream()
@@ -254,6 +299,8 @@ class TestFullyShardCollectiveOps(FSDPTestMultiThread):
 
     @skip_if_lt_x_gpu(1)
     def test_reduce_scatter_fp16(self):
+        # [FUNCTION DOC] Same as the fp32 reduce-scatter test but reduces in float16. Needs at
+        # least 1 GPU.
         param_sizes = self._get_param_sizes()
         default_stream = torch.get_device_module(device_type).current_stream()
         stream = device_module.Stream()
@@ -270,6 +317,13 @@ class TestFullyShardCollectiveOps(FSDPTestMultiThread):
         reduce_scatter_stream,
         reduce_scatter_dtype: torch.dtype,
     ):
+        # [FUNCTION DOC] HELPER: Core reduce-scatter check. Builds a param group, initializes
+        # the comm context, does one unshard, wait and reshard to set up metadata, then runs
+        # the foreach reduce-scatter of gradients that equal each rank's index on the given
+        # stream in the given dtype (no all-reduce group). After syncing on the post-reduce
+        # event it computes a reference by dividing with the default factors, all-reducing
+        # and dividing, and asserts each sharded param grad is a DTensor whose full tensor
+        # equals the reference.
         # Set up the reference parameters and construct the FSDP group
         orig_params = self._init_params(param_sizes)
         fsdp_param_group = self._init_fsdp_param_group(orig_params, True)
@@ -339,12 +393,18 @@ class TestFullyShardCollectiveOps(FSDPTestMultiThread):
 
 
 class TestFullyShardCommunication(FSDPTest):
+    # [CLASS DOC] Multi-process tests that count collectives issued by FSDP2 on a transformer
+    # under different reshard_after_forward settings and check gradient divide factor and
+    # reduce-scatter buffer settings. world_size is min(4, device count).
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns min(4, device count for the test device type).
         return min(4, torch.get_device_module(device_type).device_count())
 
     @skip_if_lt_x_gpu(2)
     def test_fully_shard_communication_count(self):
+        # [FUNCTION DOC] Runs the communication count subtest for reshard_after_forward in True,
+        # False, 2 and None. Needs at least 2 GPUs.
         """
         Tests that FSDP issues the expected number of all-gathers and
         reduce-scatters during forward and backward.
@@ -358,6 +418,11 @@ class TestFullyShardCommunication(FSDPTest):
         self,
         reshard_after_forward: bool | int | None,
     ):
+        # [FUNCTION DOC] HELPER: Shards each TransformerBlock and the root of a Transformer with
+        # the given reshard_after_forward, then uses CommDebugMode to assert the forward has only
+        # all-gathers (blocks plus one). In backward it asserts all-gathers of blocks plus root
+        # when resharding is on, only blocks when None (root not resharded), and none when False,
+        # while reduce-scatters always equal blocks plus one.
         torch.manual_seed(42)
         model_args = ModelArgs()
         model = Transformer(model_args)
@@ -398,6 +463,10 @@ class TestFullyShardCommunication(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_manual_reshard_with_reshard_after_forward_false(self):
+        # [FUNCTION DOC] Shards all modules with reshard_after_forward False, checks forward does
+        # one all-gather per FSDP module, manually calls reshard on every FSDP module, and then
+        # checks backward re-all-gathers once per module and reduce-scatters once per module.
+        # Needs at least 2 GPUs.
         """
         Tests that we can manually call ``reshard`` on FSDP modules that were
         initialized with ``reshard_after_forward=False`` and still run unshard.
@@ -437,6 +506,9 @@ class TestFullyShardCommunication(FSDPTest):
     @skip_if_lt_x_gpu(2)
     @xfailIf(TEST_XPU)  # https://github.com/intel/torch-xpu-ops/issues/1571
     def test_set_reduce_scatter_divide_factor(self):
+        # [FUNCTION DOC] Runs the gradient divide factor parity subtests over divide factors
+        # (twice the world size and the world size) and mesh shapes (1D, 2D, and shard dim of 1)
+        # and then a mixed precision variant. xfail on XPU. Needs at least 2 GPUs.
         self.run_subtests(
             {
                 "divide_factor": [self.world_size * 2, self.world_size],
@@ -456,6 +528,10 @@ class TestFullyShardCommunication(FSDPTest):
     def _test_set_reduce_scatter_divide_factor(
         self, divide_factor: float, mesh_shape: tuple[int] | tuple[int, int]
     ):
+        # [FUNCTION DOC] HELPER: Compares an FSDP transformer using set_gradient_divide_factor on
+        # a mesh of the given shape to a reference whose gradients are scaled manually (by the
+        # divide factor for non-block params and by world size for block params) and all-reduced.
+        # Runs 10 AdamW steps asserting equal losses and sharded parity before zero_grad.
         torch.manual_seed(42)
         model_args = ModelArgs(dropout_p=0.0, weight_tying=False)
         model = Transformer(model_args)
@@ -502,6 +578,11 @@ class TestFullyShardCommunication(FSDPTest):
     def _test_set_reduce_scatter_divide_factor_mixed_prevision(
         self, divide_factor: float
     ):
+        # [FUNCTION DOC] HELPER: Same divide factor check with bfloat16 param dtype and float32
+        # reduce dtype on a three-layer MLP. The reference is a bfloat16 copy whose grads are
+        # cast to float32, scaled by the divide factor, all-reduced and moved to a float32
+        # reference that steps AdamW and copies the result back. Runs 10 steps asserting equal
+        # losses and sharded parity.
         torch.manual_seed(42)
         param_dtype = torch.bfloat16
         reduce_dtype = torch.float32
@@ -550,6 +631,9 @@ class TestFullyShardCommunication(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_set_reduce_scatter_max_input_buffers(self):
+        # [FUNCTION DOC] Runs the max-input-buffers parity subtest over 1D and 2D meshes, both
+        # reshard_after_forward values and caps of 1 and 2: the cap is a scheduling change only
+        # and must not change results. Needs at least 2 GPUs.
         """
         Tests that ``set_reduce_scatter_max_input_buffers`` is a pure
         scheduling change: changing the in-flight reduce-scatter copy-in buffer
@@ -573,6 +657,10 @@ class TestFullyShardCommunication(FSDPTest):
         reshard_after_forward: bool,
         max_input_buffers: int,
     ):
+        # [FUNCTION DOC] HELPER: Builds a reference and a copy transformer sharded with
+        # bfloat16 param and reduce dtypes. Calls set_reduce_scatter_max_input_buffers on the
+        # copy only, then runs 3 AdamW steps on both asserting equal losses and sharded
+        # parity (grads included).
         torch.manual_seed(42)
         model_args = ModelArgs(dropout_p=0.0, weight_tying=False)
         ref_model = Transformer(model_args)
@@ -620,6 +708,11 @@ class TestFullyShardCommunication(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_reduce_scatter_max_input_buffers_resolves_to_max(self):
+        # [FUNCTION DOC] Checks that mixed per-module reduce-scatter input buffer caps resolve to
+        # the maximum on the shared comm context. Sets cap 3 on one block (no recursion), runs a
+        # forward and backward to trigger lazy init, then asserts the comm context cap is 3, that
+        # block's param group keeps 3 and another block's group keeps the default of 1. Needs at
+        # least 2 GPUs.
         """
         Per-module reduce-scatter input-buffer caps share one pipeline (a single
         ``comm_ctx.reduce_scatter_states`` list), so mixed caps must resolve to
@@ -653,6 +746,9 @@ class TestFullyShardCommunication(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_set_reduce_scatter_max_input_buffers_validation(self):
+        # [FUNCTION DOC] Checks validation in set_reduce_scatter_max_input_buffers: 0 raises
+        # ValueError, a float and a bool raise TypeError, and a valid positive int is accepted.
+        # Needs at least 2 GPUs.
         model = fully_shard(nn.Linear(16, 16))
         # Non-positive -> ValueError
         with self.assertRaises(ValueError):
@@ -668,6 +764,8 @@ class TestFullyShardCommunication(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_set_reshard_after_forward(self):
+        # [FUNCTION DOC] Runs the set_reshard_after_forward communication count subtest over
+        # None, True and False with recurse on and off. Needs at least 2 GPUs.
         """
         Tests that FSDP issues the expected number of all-gathers and
         reduce-scatters during a train step when setting reshard_after_forward.
@@ -686,6 +784,11 @@ class TestFullyShardCommunication(FSDPTest):
         set_reshard_after_forward: bool | None,
         recurse: bool,
     ):
+        # [FUNCTION DOC] HELPER: Shards a transformer (with the opposite reshard_after_forward of
+        # the value to be set, or default when None), then calls set_reshard_after_forward on the
+        # root with the recurse flag. Using CommDebugMode asserts the forward has one all-gather
+        # per FSDP module and checks the backward all-gather count (blocks, blocks plus one, only
+        # the root, or none) for each case, and that reduce-scatters equal blocks plus one.
         torch.manual_seed(42)
         model_args = ModelArgs()
         model = Transformer(model_args).to(device_type)
@@ -744,12 +847,21 @@ class TestFullyShardCommunication(FSDPTest):
 
 
 class TestFullyShardPrefetch(FSDPTest):
+    # [CLASS DOC] Multi-process tests of FSDP2 forward and backward prefetching. Wraps unshard,
+    # reshard and post-backward to record events and compares against expected event orders.
+    # world_size is min(4, device count).
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns min(4, device count for the test device type).
         return min(4, torch.get_device_module(device_type).device_count())
 
     @skip_if_lt_x_gpu(2)
     def test_fully_shard_backward_prefetch(self):
+        # [FUNCTION DOC] Runs the backward prefetch subtests (single forward/backward, multiple
+        # forwards before one backward) over reshard_after_forward in True, False, 2, None and
+        # checkpoint implementation none, utils or composable, then the unused-in-backward case
+        # with True. Activation checkpointing must not change the expected FSDP event order.
+        # Needs at least 2 GPUs.
         # Activation checkpointing should not affect the expected FSDP events
         self.run_subtests(
             {
@@ -772,6 +884,12 @@ class TestFullyShardPrefetch(FSDPTest):
         reshard_after_forward: bool | int | None,
         checkpoint_impl: str | None,
     ):
+        # [FUNCTION DOC] HELPER: Builds a 3-layer transformer, records unshard and post-backward
+        # events via patches, and for 3 iterations asserts the forward events (root then each
+        # layer) and the backward events (root unshard unless reshard_after_forward is None,
+        # layer unshards moved one module early by explicit prefetch, post-backwards from last
+        # layer to root). With reshard_after_forward False it expects no backward unshard events.
+        # Steps the optimizer and alternates the zero_grad mode.
         n_layers = 3
         model, optim, inp = self._init_transformer(
             n_layers, reshard_after_forward, checkpoint_impl
@@ -829,6 +947,11 @@ class TestFullyShardPrefetch(FSDPTest):
     def _test_backward_prefetch_multi_forward(
         self, reshard_after_forward: bool | int, checkpoint_impl: str | None
     ):
+        # [FUNCTION DOC] HELPER: Records unshard and post-backward events for two forwards before
+        # one backward on a 3-layer transformer. Asserts the forward events (the second forward
+        # unshards again unless reshard_after_forward is False), then the backward events for the
+        # first backward pass (without the root post-backward, which waits for the final
+        # callback) followed by the repeated pattern ending with the root post-backward.
         n_layers = 3
         model, _, inp = self._init_transformer(
             n_layers, reshard_after_forward, checkpoint_impl
@@ -908,6 +1031,12 @@ class TestFullyShardPrefetch(FSDPTest):
     def _test_backward_prefetch_unused_in_backward(
         self, reshard_after_forward: bool | int | None
     ):
+        # [FUNCTION DOC] HELPER: Runs a model with a shared linear followed by a module splitting
+        # into two linears, running backward through one branch with retained graph and then the
+        # other with last-backward set. Each linear and the root are sharded with the given
+        # reshard_after_forward. Asserts the recorded forward events, then the backward events
+        # including a mistargeted prefetch of the unused branch (its post-backward is a no-op)
+        # and that its already-unsharded state avoids a second unshard in the next backward.
         """
         Test a model with a linear module then a split into two linear modules,
         where we run backward through one path first before the other, meaning
@@ -974,6 +1103,11 @@ class TestFullyShardPrefetch(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_set_modules_to_forward_prefetch(self):
+        # [FUNCTION DOC] Checks set_modules_to_forward_prefetch on a 4-layer checkpointed
+        # transformer (reshard_after_forward True). With each layer prefetching the next 1, then
+        # next 2 layers, records unshard and reshard events and asserts the expected forward
+        # order (prefetched unshards happen early and reshards later), and that backward follows
+        # the default backward prefetch order in both cases. Needs at least 2 GPUs.
         n_layers = 4
         reshard_after_forward = True
         checkpoint_impl = "utils"
@@ -982,6 +1116,8 @@ class TestFullyShardPrefetch(FSDPTest):
         )
 
         def set_forward_prefetch(model: Transformer, num_to_prefetch: int) -> None:
+            # [FUNCTION DOC] HELPER: For each layer that has at least num_to_prefetch layers
+            # after it, sets its forward prefetch list to the following num_to_prefetch layers.
             # Use model-specific knowledge to configure forward prefetching:
             # each transformer block (layer) prefetches for the next few
             for i, layer in enumerate(model.layers):
@@ -1069,6 +1205,11 @@ class TestFullyShardPrefetch(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_set_modules_to_backward_prefetch(self):
+        # [FUNCTION DOC] Checks set_modules_to_backward_prefetch on a 4-layer checkpointed
+        # transformer (reshard_after_forward True). Asserts the default forward event order, and
+        # for each layer prefetching the previous 1 and then previous 2 layers asserts the exact
+        # backward sequence of unshard, reshard and post-backward events (the one-layer case
+        # equals the default order). Needs at least 2 GPUs.
         n_layers = 4
         reshard_after_forward = True
         checkpoint_impl = "utils"
@@ -1077,6 +1218,8 @@ class TestFullyShardPrefetch(FSDPTest):
         )
 
         def set_backward_prefetch(model: Transformer, num_to_prefetch: int) -> None:
+            # [FUNCTION DOC] HELPER: For each layer with index at least num_to_prefetch, sets its
+            # backward prefetch list to the preceding num_to_prefetch layers, nearest first.
             # Use model-specific knowledge to configure backward prefetching:
             # each transformer block (layer) prefetches for the previous few
             for i, layer in enumerate(model.layers):
@@ -1171,6 +1314,14 @@ class TestFullyShardPrefetch(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_set_modules_to_backward_prefetch_inside_ac(self):
+        # [FUNCTION DOC] Checks explicit backward prefetch when activation checkpoint wrappers
+        # are used for blocks and feed-forwards, with fully_shard on embeddings, each
+        # feed-forward w1, each layer, norm and output together, and the root. Asserts the
+        # default backward event order first, then after configuring a DeepSeek-style prefetch
+        # (output prefetches the last layer; each layer prefetches the previous layer and that
+        # layer's w1; the first layer prefetches the embeddings) asserts the new unshard and
+        # reshard order including the checkpoint recompute unshard in FORWARD state. Needs at
+        # least 2 GPUs.
         n_layers = 3
         reshard_after_forward = True
         # use checkpoint wrapper instead of torch.utils
@@ -1203,6 +1354,10 @@ class TestFullyShardPrefetch(FSDPTest):
         )
 
         def set_backward_prefetch(model: Transformer) -> None:
+            # [FUNCTION DOC] HELPER: Asserts (raising AssertionError) that the model, its output
+            # and the relevant blocks, feed-forward w1 and embeddings are FSDP modules, then
+            # sets: output prefetches the last layer; each layer prefetches the previous layer
+            # and its feed-forward w1 (or the token embeddings for the first layer).
             # tell pyre model.set_modules_to_backward_prefetch is available
             if not isinstance(model, FSDPModule):
                 raise AssertionError(f"Expected FSDPModule, got {type(model)}")
@@ -1397,6 +1552,13 @@ class TestFullyShardPrefetch(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_fully_shard_multi_module_backward_prefetch(self):
+        # [FUNCTION DOC] Checks backward prefetch with multi-module FSDP groups on a 5-layer
+        # checkpointed transformer (layer 0 alone, layers 1-2 and 3-4 grouped, embeddings
+        # grouped, norm plus output grouped without reshard after forward). For 3 iterations
+        # asserts the forward unshard order, then runs backward and steps the optimizer.
+        # KNOWN ISSUE: the expected backward event list is built but never compared with the
+        # recorded events (the assertion is missing), so backward ordering is not actually
+        # checked. Needs at least 2 GPUs.
         n_layers = 5
         model_args = ModelArgs(
             n_layers=n_layers, checkpoint_activations=True, weight_tying=False
@@ -1480,13 +1642,26 @@ class TestFullyShardPrefetch(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_fully_shard_multi_module_unused_module(self):
+        # [FUNCTION DOC] Checks FSDP groups that include a module never run in forward. Two
+        # modules each have an unused Linear grouped with the used one, followed by a final
+        # Linear and root. For 3 iterations asserts the forward unshard events, then asserts the
+        # backward events: the incomplete groups are force-completed, their pre-backward
+        # unshards happen at backward start, only the last group's post-backward fires via
+        # autograd and the root and first group post-backwards fire in the final callback. Needs
+        # at least 2 GPUs.
         class ModuleWithUnusedLinear(nn.Module):
+            # [CLASS DOC] HELPER: Module with a Linear that forward never uses (unused_lin) and a
+            # 16 by 16 Linear (lin); forward applies lin then relu.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the unused 1 by 1 Linear and the used 16
+                # by 16 Linear.
                 super().__init__()
                 self.unused_lin = nn.Linear(1, 1)
                 self.lin = nn.Linear(16, 16)
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Returns relu of the used Linear applied to x;
+                # unused_lin is skipped.
                 return nn.functional.relu(self.lin(x))
 
         model = nn.Sequential(
@@ -1549,6 +1724,11 @@ class TestFullyShardPrefetch(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_backward_misprefetch(self):
+        # [FUNCTION DOC] Checks that a misprefetch (in_proj prefetching out_proj, which
+        # backward no longer needs) does not break correctness. Shards in_proj, out_proj and
+        # the root of an MLP, sets that backward prefetch, then for 3 steps compares losses
+        # against an unsharded reference whose gradients are averaged with an all-reduce. Needs
+        # at least 2 GPUs.
         torch.manual_seed(42)
         model = MLP(dim=16, device=device_type)
         ref_model = copy.deepcopy(model)
@@ -1584,6 +1764,10 @@ class TestFullyShardPrefetch(FSDPTest):
         reshard_after_forward: bool | int | None,
         checkpoint_impl: str | None,
     ):
+        # [FUNCTION DOC] HELPER: Builds a transformer with n_layers (using utils checkpointing
+        # when requested), optionally applies composable checkpoint to each block, and
+        # fully_shards each block and the root with the given reshard_after_forward. Returns the
+        # model, an Adam optimizer and a random integer token input of batch 2.
         model_args = ModelArgs(
             n_layers=n_layers, checkpoint_activations=(checkpoint_impl == "utils")
         )
@@ -1606,7 +1790,13 @@ class TestFullyShardPrefetch(FSDPTest):
     def _get_unshard_with_record(
         self, orig_unshard: Callable, events: list[EventType]
     ) -> Callable:
+        # [FUNCTION DOC] HELPER: Returns a replacement for FSDPParamGroup.unshard that appends an
+        # event of kind unshard, module fqn and training state to events when it is not a no-op
+        # (no pending all-gather result and not already unsharded), then calls the original.
         def unshard_with_record(self, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Recording wrapper for unshard; takes the param group as
+            # self. Skips recording for no-op calls and always delegates to the original,
+            # returning its result.
             nonlocal events
             if (
                 self._all_gather_result is None
@@ -1620,7 +1810,14 @@ class TestFullyShardPrefetch(FSDPTest):
     def _get_reshard_with_record(
         self, orig_reshard: Callable, events: list[EventType]
     ) -> Callable:
+        # [FUNCTION DOC] HELPER: Returns a replacement for FSDPParamGroup.reshard that
+        # records reshard events (module fqn and training state) into events and delegates
+        # to the original.
         def reshard_with_record(self, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Recording wrapper for reshard; takes the param group as
+            # self. During FORWARD with reshard_after_forward disabled it returns
+            # immediately without recording or resharding; otherwise records the event then
+            # delegates to the original.
             nonlocal events
             if (
                 self._training_state == TrainingState.FORWARD
@@ -1635,7 +1832,13 @@ class TestFullyShardPrefetch(FSDPTest):
     def _get_post_backward_with_record(
         self, orig_post_backward: Callable, events: list[EventType]
     ) -> Callable:
+        # [FUNCTION DOC] HELPER: Returns a replacement for FSDPParamGroup.post_backward that runs
+        # the original first and then records a post_backward event (module fqn and the training
+        # state after the call) into events.
         def post_backward_with_record(self, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Recording wrapper for post_backward; runs the
+            # original, records the resulting state (which should be POST_BACKWARD) and
+            # returns the original result.
             nonlocal events
             ret = orig_post_backward(self, *args, **kwargs)
             # Use training state after running post-backward to check that the
@@ -1647,20 +1850,38 @@ class TestFullyShardPrefetch(FSDPTest):
 
 
 class TestFullyShardUnshardMultiProcess(FSDPTest):
+    # [CLASS DOC] Multi-process test of the asynchronous unshard API of FSDP modules overlapped
+    # with non-differentiable async all-reduces. world_size is min(device count, 2).
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns min(device count for the test device type, 2).
         return min(torch.get_device_module(device_type).device_count(), 2)
 
     @skipIfTorchInductor(msg="https://github.com/pytorch/pytorch/issues/149349")
     @skip_if_lt_x_gpu(2)
     def test_unshard_async(self):
+        # [FUNCTION DOC] Checks that calling unshard with async_op on FSDP modules between
+        # launching async all-reduces gives the same training result as a replicated reference.
+        # Defines a model with three reduce modules (matmul, relu, async all-reduce on the mesh
+        # group) feeding three MLPs that wait on each work object; the FSDP model shards each MLP
+        # (no reshard after forward) and the container, then both models train 10 steps with Adam
+        # (implicit replication for the FSDP optimizer) and losses are asserted equal. Skipped
+        # under torch inductor (issue 149349). Needs at least 2 GPUs.
         class ReduceModule(nn.Module):
+            # [CLASS DOC] HELPER: Module with a random square weight whose forward applies relu
+            # of the matmul and launches an asynchronous all-reduce of the result on the mesh
+            # process group, returning both the tensor and the work handle.
             def __init__(self, dim: int, mesh: DeviceMesh):
+                # [FUNCTION DOC] HELPER: Stores the mesh and creates a dim by dim
+                # random weight parameter.
                 super().__init__()
                 self.mesh = mesh
                 self.weight = nn.Parameter(torch.randn(dim, dim))
 
             def forward(self, x: torch.Tensor):
+                # [FUNCTION DOC] HELPER: Returns relu of x times the weight and the handle of
+                # an async all-reduce on that result (the all-reduce is not differentiable and
+                # only exercises overlap).
                 y = F.relu(x @ self.weight)
                 # NOTE: This all-reduce is not differentiable and is included
                 # to exercise the overlap.
@@ -1668,13 +1889,19 @@ class TestFullyShardUnshardMultiProcess(FSDPTest):
                 return y, work
 
         class MLPs(nn.Module):
+            # [CLASS DOC] HELPER: Holds three MLPs (mlp1 to mlp3); forward waits for the
+            # matching work handle before applying each MLP to the matching input and returns
+            # the sum of the outputs.
             def __init__(self, dim: int):
+                # [FUNCTION DOC] HELPER: Creates three MLPs of the given dim.
                 super().__init__()
                 self.mlp1 = MLP(dim)
                 self.mlp2 = MLP(dim)
                 self.mlp3 = MLP(dim)
 
             def forward(self, ys: list[torch.Tensor], works: list[dist.Work]):
+                # [FUNCTION DOC] HELPER: Given three tensors and three work handles, waits for
+                # each handle, applies the matching MLP and returns the sum of the three results.
                 (y1, y2, y3), (work1, work2, work3) = ys, works
                 work1.wait()
                 z1 = self.mlp1(y1)
@@ -1685,7 +1912,12 @@ class TestFullyShardUnshardMultiProcess(FSDPTest):
                 return z1 + z2 + z3
 
         class ReduceModel(nn.Module):
+            # [CLASS DOC] HELPER: Model of three ReduceModules followed by MLPs; forward
+            # interleaves them so each FSDP MLP is asynchronously unshard-ed while later
+            # reduce modules run.
             def __init__(self, dim: int, mesh: DeviceMesh):
+                # [FUNCTION DOC] HELPER: Creates three reduce modules sharing the mesh and
+                # the MLPs container.
                 super().__init__()
                 self.reduce_module1 = ReduceModule(dim, mesh)
                 self.reduce_module2 = ReduceModule(dim, mesh)
@@ -1693,6 +1925,10 @@ class TestFullyShardUnshardMultiProcess(FSDPTest):
                 self.mlps = MLPs(dim)
 
             def forward(self, x: torch.Tensor):
+                # [FUNCTION DOC] HELPER: Runs each reduce module in turn; after each one, if
+                # the matching MLP is an FSDP module, starts its asynchronous unshard. Finally
+                # feeds the three outputs and work handles through the MLPs container and
+                # returns the result.
                 y1, work1 = self.reduce_module1(x)
                 if isinstance(self.mlps.mlp1, FSDPModule):
                     self.mlps.mlp1.unshard(async_op=True)
@@ -1731,11 +1967,16 @@ class TestFullyShardUnshardMultiProcess(FSDPTest):
 
 
 class TestFullyShardUnshardMultiThread(FSDPTestMultiThread):
+    # [CLASS DOC] Multi-thread tests (world size 2) of the unshard API edge cases.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: World size of 2.
         return 2
 
     def test_unshard_no_param_group(self):
+        # [FUNCTION DOC] Checks that unshard with async_op on a root module that manages no
+        # parameters of its own (only child FSDP modules) returns a handle that can be waited
+        # on without error.
         # Check that we can call `unshard()` on a module with no parameter
         # group / no managed parameters without erroring
         model = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4))
@@ -1746,6 +1987,9 @@ class TestFullyShardUnshardMultiThread(FSDPTestMultiThread):
         handle.wait()
 
     def test_unshard_without_lazy_init(self):
+        # [FUNCTION DOC] Checks that calling unshard before the first forward (so before lazy
+        # init) works: builds an MLP with parameters broadcast from rank 0, shards it, calls
+        # unshard and asserts the parameters equal an unsharded copy.
         torch.manual_seed(42)
         model = MLP(4)
         for param in model.parameters():
@@ -1758,6 +2002,10 @@ class TestFullyShardUnshardMultiThread(FSDPTestMultiThread):
 
 
 class TestFullyShardAllocFromPG(FSDPTest):
+    # [CLASS DOC] Multi-process tests that FSDP2 allocates communication buffers from the NCCL
+    # process group when requested, detected through NCCL debug logs written to a temporary
+    # directory. MEMORY_REGISTER_RE is the log line pattern for buffer registration, which may
+    # change with NCCL versions.
     # The messages might change when we move to a different NCCL version.
     # Please update this test if it starts failing.
     MEMORY_REGISTER_RE = (
@@ -1766,6 +2014,10 @@ class TestFullyShardAllocFromPG(FSDPTest):
 
     @classmethod
     def _run(cls, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Test runner hook executed per spawned process: creates a
+        # temporary directory for the NCCL log, sets NCCL_DEBUG, NCCL_DEBUG_SUBSYS and
+        # NCCL_DEBUG_FILE environment variables in this process (side effect on os.environ) and
+        # runs the parent implementation.
         cls.nccl_log_dir = tempfile.TemporaryDirectory()
         os.environ["NCCL_DEBUG"] = "INFO"
         os.environ["NCCL_DEBUG_SUBSYS"] = "INIT,ENV,REG"
@@ -1776,6 +2028,11 @@ class TestFullyShardAllocFromPG(FSDPTest):
     # The NCCL PG refuses to allocate tensors if multicast is unavailable, see
     # https://github.com/pytorch/pytorch/blob/503362d019b3782581492af7767945dbd75ca1c9/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp#L5634
     def test_fully_shard_alloc_from_pg(self):
+        # [FUNCTION DOC] Checks the allocate-memory-from-process-group option. Skips if multicast
+        # is not supported. Runs a forward and backward and asserts the NCCL log has no buffer
+        # registration line; then enables the option on all blocks and the root, runs again, and
+        # asserts a registration line now appears. The multicast check is inside the test to
+        # avoid initializing the symmetric memory allocator at import. Needs at least 2 GPUs.
         # Run this check inside test instead of using @requires_multicast_support().
         # The decorator would trigger an initialization of SymmMem allocator
         # when Python statically initializes classes in this file, causing
@@ -1820,6 +2077,9 @@ class TestFullyShardAllocFromPG(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_exception_when_used_together_with_comm_hooks(self):
+        # [FUNCTION DOC] Checks that enabling allocation from the process group is accepted, that
+        # a custom all-gather can still be set afterwards, and that enabling allocation after a
+        # custom comm is set raises AssertionError. Needs at least 2 GPUs.
         model = nn.Linear(16, 16)
         model = fully_shard(model)
         # ok
@@ -1843,12 +2103,19 @@ class TestFullyShardAllocFromPG(FSDPTest):
 @skipCUDAIf(TEST_WITH_ROCM, "requires NVIDIA GPUs")
 @skipCUDAIf(not SM90OrLater, "requires sm90+")
 class TestFullyShardSymmMem(MultiProcContinuousTest):
+    # [CLASS DOC] Continuous multi-process test (NCCL, NVIDIA GPUs with sm90 or later, p2p
+    # access, symmetric memory support) of FSDP2 using symmetric memory for communication.
+    # Process group options enable the zero-CTA policy for copy-engine collectives.
     @classmethod
     def backend_str(cls) -> str | None:
+        # [FUNCTION DOC] HELPER: Returns the backend name, nccl.
         return "nccl"
 
     @classmethod
     def opts(cls):
+        # [FUNCTION DOC] HELPER: Returns None when NCCL is unavailable; otherwise
+        # ProcessGroupNCCL options with the CTA policy set to zero so collectives
+        # use copy engines.
         if not dist.is_nccl_available():
             return None
         # Enable Zero-CTA policy for CE collectives
@@ -1858,10 +2125,15 @@ class TestFullyShardSymmMem(MultiProcContinuousTest):
 
     @property
     def device(self) -> torch.device:
+        # [FUNCTION DOC] HELPER: Returns the CUDA device of this rank.
         return torch.device("cuda", self.rank)
 
     @parametrize("sum_reduction", [True, False])
     def test_fully_shard_symm_mem(self, sum_reduction: bool):
+        # [FUNCTION DOC] Smoke test: builds a transformer of width 4096 on this rank's GPU,
+        # enables symmetric memory for communication and the forced-sum reduction flag (from the
+        # parameter) on each block and the root, runs one forward and backward, and synchronizes.
+        # Passes if no error is raised.
         torch.manual_seed(42 + self.rank)
         device = torch.device("cuda", self.rank)
         torch.cuda.set_device(device)
@@ -1883,6 +2155,7 @@ class TestFullyShardSymmMem(MultiProcContinuousTest):
         inp = torch.randint(0, model_args.vocab_size, (bs, seq_len), device=device)
 
         def run():
+            # [FUNCTION DOC] HELPER: Runs a forward and a backward on the sum of the loss.
             loss = model(inp)
             loss.sum().backward()
 
@@ -1894,6 +2167,10 @@ instantiate_parametrized_tests(TestFullyShardSymmMem)
 
 
 class TestFullyShardForceSumReduction(FSDPTest):
+    # [CLASS DOC] Multi-process tests that set_force_sum_reduction_for_comms makes reduce-scatter
+    # and all-reduce use the SUM op instead of AVG, detected by matching NCCL collective debug
+    # logs (the regex differs for ROCm with NCCL 2.27 or later). SUM_REDUCTION is 0 and
+    # AVG_REDUCTION is 4 per the NCCL enum.
     # The messages might change when we move to a different NCCL version.
     # Please update this test if it starts failing.
 
@@ -1914,6 +2191,10 @@ class TestFullyShardForceSumReduction(FSDPTest):
 
     @classmethod
     def _run(cls, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Test runner hook executed per spawned process: creates a
+        # temporary directory for the NCCL log, sets NCCL_DEBUG, NCCL_DEBUG_SUBSYS
+        # (collectives) and NCCL_DEBUG_FILE environment variables (side effect on os.environ)
+        # and runs the parent implementation.
         cls.nccl_log_dir = tempfile.TemporaryDirectory()
         os.environ["NCCL_DEBUG"] = "INFO"
         os.environ["NCCL_DEBUG_SUBSYS"] = "COLL"
@@ -1927,6 +2208,10 @@ class TestFullyShardForceSumReduction(FSDPTest):
         not TEST_CUDA, "This test verifies NCCL debug logs and is CUDA-specific"
     )
     def test_fully_shard_force_sum_reduce_scatter(self):
+        # [FUNCTION DOC] On plain FSDP, checks reduce-scatter initially uses AVG and not SUM in
+        # NCCL logs for a message of the first layer's per-rank element count, then after
+        # enabling forced sum reduction on all blocks and root the logs also contain SUM. CUDA
+        # only. Needs at least 2 GPUs.
         torch.manual_seed(42)
         model_args = ModelArgs()
         model = Transformer(model_args)
@@ -1983,6 +2268,9 @@ class TestFullyShardForceSumReduction(FSDPTest):
         not TEST_CUDA, "This test verifies NCCL debug logs and is CUDA-specific"
     )
     def test_fully_shard_force_sum_both_reductions(self):
+        # [FUNCTION DOC] On a 2D (ddp, fsdp) HSDP mesh, checks reduce-scatter and all-reduce both
+        # use AVG and not SUM at first, and after enabling forced sum reduction the logs also
+        # contain SUM for both collectives. CUDA only. Needs at least 4 GPUs.
         mesh = init_device_mesh(
             device_type.type, (2, self.world_size // 2), mesh_dim_names=("ddp", "fsdp")
         )
@@ -2047,11 +2335,18 @@ class TestFullyShardForceSumReduction(FSDPTest):
 
 
 class TestFullyShardReduceOpWorldSize1(FSDPTest):
+    # [CLASS DOC] Single-rank test that the gradient reduce op is SUM when the shard group
+    # has size 1.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: World size of 1.
         return 1
 
     def test_size1_reduceop(self):
+        # [FUNCTION DOC] With world size 1, trains a Linear with fully_shard (mesh of 1 rank, no
+        # reshard after forward) against a reference that all-reduces gradients with SUM,
+        # asserting equal losses and bias gradients for 3 steps. Then asserts the all-reduce op
+        # returned by the gradient divide factor helper for the shard group and float32 is SUM.
         from torch.distributed.distributed_c10d import ReduceOp
 
         model = nn.Linear(1024, 1025)

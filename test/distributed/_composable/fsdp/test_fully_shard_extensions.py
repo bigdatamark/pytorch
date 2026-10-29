@@ -1,5 +1,14 @@
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC] Tests for the FSDP2 (fully_shard) all-gather extension protocol, in which a
+# tensor subclass (or a plain tensor with monkey-patched methods) supplies fsdp_pre_all_gather
+# / fsdp_post_all_gather to control what is all-gathered and how the gathered result is turned
+# back into the unsharded parameter. Contents: pre/post hooks for TwoTensor (v1 and v2 pre
+# signatures), a wrapper subclass BFloat16AllGatherTensor that gathers in bfloat16, a shared
+# mixin, and a multi-process train-parity test plus multi-thread end-to-end, monkey-patch,
+# outer size/stride and HSDP mesh tests. Import-time side effect: defines module-level
+# device_type from get_devtype().
+
 import contextlib
 import copy
 import functools
@@ -32,6 +41,9 @@ device_type = torch.device(get_devtype())
 def two_tensor_fsdp_pre_all_gather_v1(
     self, mesh: DeviceMesh
 ) -> tuple[tuple[torch.Tensor, ...], Any]:
+    # [FUNCTION DOC] HELPER: Version 1 pre-all-gather hook for TwoTensor, installed as a method.
+    # Ignores the mesh and returns the two inner tensors a and b as the all-gather inputs with
+    # no metadata (None).
     all_gather_inputs = (self.a, self.b)
     metadata = None
     return all_gather_inputs, metadata
@@ -45,6 +57,9 @@ def two_tensor_fsdp_pre_all_gather_v2(
     module: nn.Module,
     mp_policy: MixedPrecisionPolicy,
 ) -> tuple[tuple[torch.Tensor, ...], Any]:
+    # [FUNCTION DOC] HELPER: Version 2 pre-all-gather hook for TwoTensor; accepts the extra outer
+    # size, outer stride, module and mixed precision policy arguments but ignores them. Returns
+    # the inner tensors a and b as all-gather inputs and None as metadata.
     all_gather_inputs = (self.a, self.b)
     metadata = None
     return all_gather_inputs, metadata
@@ -58,6 +73,12 @@ def two_tensor_fsdp_post_all_gather(
     *,
     out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]] | None:
+    # [FUNCTION DOC] HELPER: Post-all-gather hook for TwoTensor. Expects the two gathered tensors
+    # and None metadata (raises AssertionError otherwise). If out is given, it must be a
+    # TwoTensor: when the gathered dtype already equals param_dtype it checks that the gathered
+    # storages are the ones backing out.a and out.b, else it checks out's dtypes and copies the
+    # gathered data into them; returns None. Without out, builds a TwoTensor cast to param_dtype
+    # and returns it together with the gathered tensors as the ones to free.
     if metadata is not None:
         raise AssertionError(f"Expected metadata to be None, got {metadata}")
     a, b = all_gather_outputs
@@ -85,8 +106,15 @@ def two_tensor_fsdp_post_all_gather(
 
 
 class BFloat16AllGatherTensor(torch.Tensor):
+    # [CLASS DOC] HELPER: Wrapper tensor subclass around a single data tensor used to test the
+    # all-gather extension with a custom bfloat16 all-gather. Holds the wrapped tensor in _data
+    # and a flag _pad_in_pre_all_gather controlling whether uneven shards are padded before the
+    # gather. Every dispatched op unwraps to _data and rewraps tensor results with the same flag
+    # (mixed flags raise AssertionError).
     @staticmethod
     def __new__(cls, data: torch.Tensor, pad_in_pre_all_gather: bool = True):
+        # [FUNCTION DOC] HELPER: Creates the wrapper subclass with the same shape, stride,
+        # storage offset, dtype and device as data; the extra flag is only consumed in __init__.
         return torch.Tensor._make_wrapper_subclass(
             cls,
             data.shape,
@@ -97,6 +125,8 @@ class BFloat16AllGatherTensor(torch.Tensor):
         )
 
     def __init__(self, data: torch.Tensor, pad_in_pre_all_gather: bool = True):
+        # [FUNCTION DOC] HELPER: Stores the wrapped data tensor in _data and the padding
+        # flag in _pad_in_pre_all_gather.
         self._data = data
         self._pad_in_pre_all_gather = pad_in_pre_all_gather
 
@@ -108,6 +138,11 @@ class BFloat16AllGatherTensor(torch.Tensor):
         module: nn.Module,
         mp_policy: MixedPrecisionPolicy,
     ) -> tuple[tuple[torch.Tensor, ...], Any]:
+        # [FUNCTION DOC] Pre-all-gather extension hook. Requires a 1D mesh (AssertionError
+        # otherwise). If the outer size of dim 0 is not divisible by the mesh size and padding is
+        # enabled, returns a one-element tuple with a bfloat16 buffer of per-rank padded dim-0
+        # size holding the local data in its leading rows (rest uninitialized), else returns the
+        # local data cast to bfloat16 (not wrapped in a tuple). Metadata is always None.
         if mesh.ndim != 1:
             raise AssertionError(f"Expected mesh.ndim == 1, got {mesh.ndim}")
         mesh_size = mesh.size()
@@ -131,6 +166,11 @@ class BFloat16AllGatherTensor(torch.Tensor):
         *,
         out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]] | None:
+        # [FUNCTION DOC] Post-all-gather extension hook. Requires None metadata and a single
+        # bfloat16 gathered tensor (AssertionError otherwise). If out is given, copies the
+        # gathered tensor into it while preserving its version counter and returns None.
+        # Otherwise upcasts to param_dtype and returns that tensor along with (gathered, upcast)
+        # as tensors to free.
         if metadata is not None:
             raise AssertionError(f"Expected metadata to be None, got {metadata}")
         (tensor,) = all_gather_outputs
@@ -147,9 +187,15 @@ class BFloat16AllGatherTensor(torch.Tensor):
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args, kwargs):
+        # [FUNCTION DOC] Dispatch handler: unwraps every instance of this class in args and
+        # kwargs to its _data, runs the op, and wraps every tensor in the result back into this
+        # class using the padding flag seen on the inputs. Raises AssertionError if inputs
+        # disagree on the flag.
         pad_in_pre_all_gather = None
 
         def unwrap(x: cls):
+            # [FUNCTION DOC] HELPER: Returns the wrapped _data of x and records its padding flag
+            # in the enclosing scope; raises AssertionError if a previously seen flag differs.
             nonlocal pad_in_pre_all_gather
             if pad_in_pre_all_gather is None:
                 pad_in_pre_all_gather = x._pad_in_pre_all_gather
@@ -169,25 +215,39 @@ class BFloat16AllGatherTensor(torch.Tensor):
         )
 
     def __tensor_flatten__(self):
+        # [FUNCTION DOC] HELPER: Traceable-subclass flatten: reports the inner tensor attribute
+        # names (only _data) and no extra context.
         return ["_data"], None
 
     @staticmethod
     def __tensor_unflatten__(
         inner_tensors, outer_size: torch.Size, outer_stride: tuple[int, ...]
     ):
+        # [FUNCTION DOC] HELPER: Traceable-subclass unflatten: returns the inner _data tensor
+        # unwrapped (not a new subclass instance); the size and stride are ignored.
         return inner_tensors["_data"]
 
     def __repr__(self):
+        # [FUNCTION DOC] HELPER: String form: class name wrapping the repr of the data tensor.
         return f"{self.__class__.__name__}({self._data})"
 
 
 class TestFullyShardAllGatherExtensionsCommon:
+    # [CLASS DOC] HELPER: Mixin of shared test utilities for the all-gather extension tests;
+    # combined with a multi-process or multi-thread FSDP test base. Provides a world size of 2, a
+    # context manager that installs TwoTensor hooks, and a model builder.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Default world size of 2 (overridden by the multi-thread class).
         return 2
 
     @contextlib.contextmanager
     def _patch_two_tensor_fsdp_all_gather(self, pre_all_gather_version: int):
+        # [FUNCTION DOC] HELPER: Context manager that monkey-patches TwoTensor class-level
+        # fsdp_pre_all_gather (version 1 or 2 signature, per the argument) and
+        # fsdp_post_all_gather, then synchronizes ranks with a barrier. On exit it barriers again
+        # and, under a lock so only one thread does it, deletes the patched attributes. Side
+        # effect: mutates the global TwoTensor class.
         lock = threading.Lock()
         if pre_all_gather_version == 1:
             TwoTensor.fsdp_pre_all_gather = two_tensor_fsdp_pre_all_gather_v1
@@ -206,6 +266,10 @@ class TestFullyShardAllGatherExtensionsCommon:
                     delattr(TwoTensor, "fsdp_post_all_gather")
 
     def _init_two_tensor_mlp(self) -> nn.Module:
+        # [FUNCTION DOC] HELPER: Builds a sequential of three bias-free MLPs of width 8
+        # whose two linear weights are replaced by parameters wrapping a TwoTensor of the
+        # weight and a clone. Bias is disabled because the reference model's bias grad would
+        # become a TwoTensor.
         # Disable bias because the reference model will end up with a bias
         # gradient that is a `TwoTensor`, whereas the FSDP model does not
         model = nn.Sequential(*[MLP(8, bias=False) for _ in range(3)])
@@ -222,8 +286,13 @@ class TestFullyShardAllGatherExtensionsCommon:
 class TestFullyShardAllGatherExtensionsMultiProcess(
     TestFullyShardAllGatherExtensionsCommon, FSDPTest
 ):
+    # [CLASS DOC] Multi-process (needs 2 GPUs) train-parity test of the all-gather extension
+    # against an unsharded reference model.
     @skip_if_lt_x_gpu(2)
     def test_all_gather_extensions_train_parity(self):
+        # [FUNCTION DOC] Runs the train parity subtest with both reshard_after_forward values
+        # under the version 1 and then the version 2 TwoTensor pre-all-gather patch. Skipped with
+        # fewer than 2 GPUs.
         with self._patch_two_tensor_fsdp_all_gather(pre_all_gather_version=1):
             self.run_subtests(
                 {"reshard_after_forward": [True, False]},
@@ -236,6 +305,11 @@ class TestFullyShardAllGatherExtensionsMultiProcess(
             )
 
     def _test_all_gather_extensions_train_parity(self, reshard_after_forward: bool):
+        # [FUNCTION DOC] HELPER: Shards a reference copy of the TwoTensor MLP per layer and for
+        # the root with fully_shard, then runs 10 iterations of forward/backward on both. The
+        # reference gradients are manually all-reduced and averaged. Asserts equal losses and
+        # sharded parameter parity before and after each optimizer step (Adam), alternating the
+        # zero_grad set_to_none mode.
         torch.manual_seed(42)
         model = self._init_two_tensor_mlp()
         ref_model = copy.deepcopy(model).to(device_type)
@@ -271,16 +345,23 @@ class TestFullyShardAllGatherExtensionsMultiProcess(
 class TestFullyShardAllGatherExtensionsMultiThread(
     TestFullyShardAllGatherExtensionsCommon, FSDPTestMultiThread
 ):
+    # [CLASS DOC] Multi-thread (8 simulated ranks) tests of the all-gather extension: end to end
+    # with meta init, monkey-patched hooks, outer size/stride handling and HSDP meshes.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: World size of 8 for the multi-thread tests.
         return 8
 
     @property
     def device(self) -> torch.device:
+        # [FUNCTION DOC] HELPER: Device used for materializing the model, from
+        # the module-level device_type.
         return torch.device(device_type)
 
     @skip_if_lt_x_gpu(1)
     def test_all_gather_extensions_end_to_end(self):
+        # [FUNCTION DOC] Runs the end-to-end subtest for both reshard_after_forward values under
+        # the version 1 and version 2 TwoTensor pre-all-gather patches. Needs at least one GPU.
         with self._patch_two_tensor_fsdp_all_gather(pre_all_gather_version=1):
             self.run_subtests(
                 {"reshard_after_forward": [True, False]},
@@ -293,6 +374,9 @@ class TestFullyShardAllGatherExtensionsMultiThread(
             )
 
     def _test_all_gather_extensions_end_to_end(self, reshard_after_forward: bool):
+        # [FUNCTION DOC] HELPER: Builds the TwoTensor MLP on the meta device, shards it with a
+        # bfloat16 param dtype, materializes it with to_empty, initializes with truncated normal,
+        # and runs 3 forward/backward/Adam steps just to check that no error is raised.
         # Check that we can run the meta-device initialization flow
         with torch.device("meta"):
             model = self._init_two_tensor_mlp()
@@ -321,6 +405,10 @@ class TestFullyShardAllGatherExtensionsMultiThread(
 
     @skip_if_lt_x_gpu(1)
     def test_all_gather_extensions_monkey_patch(self):
+        # [FUNCTION DOC] Checks the extension works with plain tensors whose pre/post hooks are
+        # patched on as instance attributes after materialization (no subclass needed). The hooks
+        # gather in bfloat16 and upcast, and the test asserts the pre hook ran in this thread
+        # (thread-local flag). Runs 3 training steps after patching each weight's local tensor.
         tls = threading.local()
         tls.ran_pre_all_gather = False
 
@@ -334,6 +422,9 @@ class TestFullyShardAllGatherExtensionsMultiThread(
             module: nn.Module,
             mp_policy: MixedPrecisionPolicy,
         ) -> tuple[tuple[torch.Tensor, ...], Any]:
+            # [FUNCTION DOC] HELPER: Pre-all-gather hook that records in thread-local state
+            # that it ran and returns the tensor cast to bfloat16 as the sole all-gather input,
+            # with no metadata.
             nonlocal tls
             tls.ran_pre_all_gather = True
             return (self.to(torch.bfloat16),), None
@@ -347,6 +438,10 @@ class TestFullyShardAllGatherExtensionsMultiThread(
             *,
             out: torch.Tensor | None = None,
         ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]] | None:
+            # [FUNCTION DOC] HELPER: Post-all-gather hook (no grad). Requires None metadata and a
+            # bfloat16 gathered tensor (AssertionError otherwise). With out, copies into it
+            # preserving the version counter and returns None; otherwise returns the tensor
+            # upcast to param_dtype plus (gathered, upcast) as tensors to free.
             (tensor,) = all_gather_outputs
             if metadata is not None:
                 raise AssertionError(f"Expected metadata to be None, got {metadata}")
@@ -398,6 +493,11 @@ class TestFullyShardAllGatherExtensionsMultiThread(
 
     @skip_if_lt_x_gpu(1)
     def test_all_gather_extension_outer_size_stride(self):
+        # [FUNCTION DOC] Verifies the outer size and stride passed to the pre-all-gather hook
+        # are enough to pad uneven shards: wraps all weights of a dim-3 MLP in
+        # BFloat16AllGatherTensor, shards with reshard_after_forward False (workaround for
+        # issue 154836) and runs one forward/backward/fused AdamW step. Requires world size of
+        # at least 2.
         """
         NOTE: We cannot easily test the incorrect case where the user-defined
         ``fsdp_pre_all_gather`` does not correctly pad the local tensor because
@@ -427,6 +527,10 @@ class TestFullyShardAllGatherExtensionsMultiThread(
 
     @skip_if_lt_x_gpu(1)
     def test_all_gather_extension_hsdp_mesh(self):
+        # [FUNCTION DOC] Checks that with an HSDP 2D mesh (replicate size 2) the pre-all-gather
+        # hook receives only the 1D shard mesh. Patches identity hooks on every weight's local
+        # tensor, runs one forward and asserts the recorded mesh has ndim 1 and size equal to
+        # the shard size.
         tls = threading.local()
         replicate_size = 2
         shard_size = self.world_size // replicate_size
@@ -444,6 +548,9 @@ class TestFullyShardAllGatherExtensionsMultiThread(
             module: nn.Module,
             mp_policy: MixedPrecisionPolicy,
         ) -> tuple[tuple[torch.Tensor, ...], Any]:
+            # [FUNCTION DOC] HELPER: Pre-all-gather hook that records the received mesh in
+            # thread-local state and returns the tensor itself as the sole all-gather input,
+            # with no metadata.
             nonlocal tls
             tls.mesh = mesh
             return (self,), None
@@ -457,6 +564,9 @@ class TestFullyShardAllGatherExtensionsMultiThread(
             *,
             out: torch.Tensor | None = None,
         ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]] | None:
+            # [FUNCTION DOC] HELPER: Post-all-gather hook (no grad): returns None when out is
+            # given, else returns the single gathered tensor and a tuple containing it as
+            # tensors to free.
             (tensor,) = all_gather_outputs
             if out is not None:
                 return

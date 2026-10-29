@@ -1,5 +1,13 @@
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC] Tests for fully_shard and legacy FSDP interacting with torch.compile, dynamo and
+# compiled autograd. Contents: a small encoder module, tests that dynamo does not trace FSDP hook
+# code, compiled autograd graph breaks on FSDP backward hooks, a compiled optimizer step with
+# uneven shards, DTensor spec dtype under TP plus mixed precision, tracing of the
+# use_training_state context manager and the fsdp copy_ op, and recompiling per-layer under FSDP.
+# Most tests are skipped without a GPU backend (HAS_GPU). Import-time side effect: defines the
+# module-level device_type from get_devtype().
+
 
 import copy
 import unittest
@@ -31,7 +39,11 @@ device_type = torch.device(get_devtype())
 
 
 class Mod(torch.nn.Module):
+    # [CLASS DOC] HELPER: Small MLP-like model with an encoder of three Linear layers (784 to
+    # 1024, 1024 to 1024, 1024 to 4096) created directly on device_type.
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Builds the encoder sequential of three Linear
+        # layers on device_type.
         super().__init__()
 
         self.encoder = torch.nn.Sequential(
@@ -41,19 +53,30 @@ class Mod(torch.nn.Module):
         )
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Runs the input through the encoder and returns the result.
         return self.encoder(x)
 
 
 class TestFullyShardCompileCompute(FSDPTest):
+    # [CLASS DOC] Multi-process (GPU) tests that compile or trace modules wrapped by fully_shard
+    # and check dynamo, compiled autograd and inductor behavior with FSDP2 hooks and DTensors.
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @skip_if_lt_x_gpu(2)
     def test_disable_compiling_hooks(self):
+        # [FUNCTION DOC] Verifies dynamo never traces into the FSDP hook source file. Temporarily
+        # replaces the dynamo trace_rules check function with a wrapper that counts calls whose
+        # code object comes from _fsdp_state.py, compiles a fully_shard MLP, runs forward and
+        # backward, restores the original check (barriers around the swap) and asserts the count
+        # is 0. Needs GPU backend and at least 2 GPUs.
         """Verify that dynamo never traces into FSDP hooks in forward or backward."""
         torch._dynamo.reset()
         trace_rules_check_count = 0
         HOOKS_FILE_NAME = "torch/distributed/fsdp/_fully_shard/_fsdp_state.py"
 
         def patched_trace_rules_check(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Replacement for the dynamo trace_rules check: increments the
+            # enclosing counter when the first argument's code file name ends with the FSDP state
+            # hooks file, then delegates to the original check and returns its result.
             nonlocal trace_rules_check_count
             f_code = args[0]
             if hasattr(f_code, "co_filename") and f_code.co_filename.endswith(
@@ -77,6 +100,12 @@ class TestFullyShardCompileCompute(FSDPTest):
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @skip_if_lt_x_gpu(2)
     def test_compiled_autograd_fsdp2_backward(self):
+        # [FUNCTION DOC] Verifies compiled autograd works with FSDP2 backward and that FSDP hooks
+        # cause graph breaks. Runs an eager reference on a copy, then runs forward and backward
+        # on the fully_shard model under compiled autograd with a counting aot_eager backend.
+        # Asserts output equals the reference, exactly one compiled autograd capture and 2
+        # backend compilations (two graph breaks from disabled pre-backward and post-backward
+        # hooks). Needs GPU backend and at least 2 GPUs.
         """
         Verify that compiled autograd with FSDP2 backward does not crash and
         that FSDP hooks cause graph breaks (due to _dynamo_disable).
@@ -104,11 +133,15 @@ class TestFullyShardCompileCompute(FSDPTest):
         orig_aot_eager = torch._dynamo.lookup_backend("aot_eager")
 
         def counting_backend(gm, example_inputs):
+            # [FUNCTION DOC] HELPER: Backend wrapper that counts invocations in the enclosing
+            # counter and delegates compilation to the aot_eager backend.
             nonlocal backend_count
             backend_count += 1
             return orig_aot_eager(gm, example_inputs)
 
         def compiler_fn(gm):
+            # [FUNCTION DOC] HELPER: Compiler hook for compiled autograd: compiles the captured
+            # graph with torch.compile using the counting backend.
             return torch.compile(gm, backend=counting_backend)
 
         with compiled_autograd._enable(compiler_fn):
@@ -126,6 +159,11 @@ class TestFullyShardCompileCompute(FSDPTest):
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @skip_if_lt_x_gpu(2)
     def test_compile_optimizer_uneven_shard(self):
+        # [FUNCTION DOC] Regression test (issue 176667) for compiling the optimizer step on
+        # unevenly sharded parameters. Shards a Conv2d with 47 output channels (meta init then
+        # to_empty, bfloat16 params, float32 reduce, reshard_after_forward off), runs one eager
+        # training step with Adam, then a forward/backward followed by a torch.compile'd
+        # optimizer step; passes if nothing raises. Needs GPU backend and at least 2 GPUs.
         # Regression test for https://github.com/pytorch/pytorch/issues/176667
         # When a param dim is not divisible by world_size, FSDP2 creates
         # param._local_tensor as a narrow view of an N-D padded tensor, while
@@ -160,6 +198,12 @@ class TestFullyShardCompileCompute(FSDPTest):
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @skip_if_lt_x_gpu(4)
     def test_tp_mixed_precision_dtensor_spec_dtype(self):
+        # [FUNCTION DOC] Checks that the DTensor spec dtype of a TP plus FSDP weight matches the
+        # bfloat16 mixed precision param dtype, both eager and with the model compiled (eager
+        # backend). Skips when world size is odd. Builds a (dp, tp=2) mesh, applies row-wise TP
+        # to a one-layer module, fully_shards with a placement function that flips the shard dim,
+        # runs a forward, asserts the weight local tensor and spec tensor_meta dtype are
+        # bfloat16, then backward and barrier. Needs GPU backend and at least 4 GPUs.
         torch._dynamo.reset()
         if self.world_size % 2 != 0:
             self.skipTest(f"Expects even world size but got {self.world_size}")
@@ -178,14 +222,23 @@ class TestFullyShardCompileCompute(FSDPTest):
         )
 
         class RowwiseLinear(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with one bias-free projection Linear whose forward
+            # returns a clone of the projection output; used with row-wise tensor parallelism.
             def __init__(self, dim: int):
+                # [FUNCTION DOC] HELPER: Creates a single bias-free Linear projection of size
+                # dim on device_type.
                 super().__init__()
                 self.proj = nn.Linear(dim, dim, bias=False, device=device_type)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the projection and returns a clone
+                # of the result.
                 return self.proj(x).clone()
 
         def shard_placement_fn(param: nn.Parameter) -> Shard:
+            # [FUNCTION DOC] HELPER: Shard placement function: for a DTensor param returns a
+            # Shard on the dim mirrored from the first existing Shard placement (last dim index
+            # minus that dim); otherwise returns Shard(0).
             if isinstance(param, DTensor):
                 for placement in param.placements:
                     if isinstance(placement, Shard):
@@ -223,7 +276,14 @@ class TestFullyShardCompileCompute(FSDPTest):
 
 @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
 class TestFullyShardCompile(FSDPTest):
+    # [CLASS DOC] Tests (skipped without GPU backend) of tracing FSDP
+    # internals and legacy FSDP wrapping with dynamo and aot_eager.
     def test_dynamo_trace_use_training_state(self):
+        # [FUNCTION DOC] Checks that dynamo can trace the use_training_state context manager of
+        # an FSDPParamGroup. Builds a dummy param group with no parameters, runs a function that
+        # sets the state to IDLE, enters the context with FORWARD and returns x plus 1 only if
+        # the state is FORWARD. Asserts the state is restored to IDLE, the eager and
+        # fullgraph-compiled outputs match, and the compile used one frame, one op and one graph.
         torch._dynamo.reset()
         # Construct a dummy FSDPParamGroup, since we just want to test the `use_training_state` ctx manager.
         param_group = FSDPParamGroup(
@@ -238,6 +298,9 @@ class TestFullyShardCompile(FSDPTest):
         )
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Resets the param group training state to IDLE, enters the
+            # FORWARD training state context, and returns x plus 1 if the state is FORWARD inside
+            # it, else x.
             param_group._training_state = TrainingState.IDLE
             with param_group.use_training_state(TrainingState.FORWARD):
                 if param_group._training_state == TrainingState.FORWARD:
@@ -261,11 +324,20 @@ class TestFullyShardCompile(FSDPTest):
         self.assertEqual(len(cnt.graphs), 1)
 
     def test_trace_fsdp_copy_(self):
+        # [FUNCTION DOC] Checks the fsdp copy_ op can be traced by aot_eager. Registers a custom
+        # op add_one_out, defines a function that writes x plus 1 into a buffer view and then
+        # copies another view of that buffer into x with the fsdp copy_ op, and asserts the
+        # compiled run yields the same x as the eager run on a copy.
         @torch.library.custom_op("mylib::add_one_out", mutates_args={"out"})
         def add_one_out(x: torch.Tensor, out: torch.Tensor) -> None:
+            # [FUNCTION DOC] HELPER: Custom op body: writes x plus 1 into out in place (out is
+            # declared as mutated).
             torch.add(x, 1, out=out)
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Fills a zero buffer via the add_one_out op on one view,
+            # then copies a second view of the buffer into x via the fsdp copy_ op; mutates x
+            # and returns None.
             buf = torch.zeros(2)
             buf_view = buf.view(-1)
             torch.ops.mylib.add_one_out(x, out=buf_view)
@@ -279,6 +351,9 @@ class TestFullyShardCompile(FSDPTest):
         self.assertEqual(x, ref_x)
 
     def test_dynamo_recompiles_on_fsdp_layers(self):
+        # [FUNCTION DOC] Smoke test: wraps each Linear in the Mod encoder with torch.compile,
+        # wraps the whole module in legacy FSDP (FULL_SHARD, use_orig_params), and runs one
+        # forward; passes if nothing raises (no assertions).
         m = Mod()
         for name, child in m.encoder.named_children():
             if isinstance(child, torch.nn.Linear):
