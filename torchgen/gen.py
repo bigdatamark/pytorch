@@ -1,3 +1,11 @@
+# [MODULE DOC] Main driver of the ATen code generator. Parses native_functions.yaml and
+# tags.yaml into NativeFunction objects and per-dispatch-key BackendIndex tables, groups
+# them (structured groups, view groups), and renders C++ headers/sources (Operators,
+# Functions, TensorBody, Register<Key>.cpp, RegisterSchema, BackendSelect, functionalization
+# files, AOTI shims) plus Declarations.yaml through FileManager templates. Contains curried
+# callable dataclasses (ComputeXxx) mapping a NativeFunction to C++ text, the YAML helpers,
+# the gen_* orchestration functions, and the command line entry point main.
+# Import-time side effects: none beyond defining module-level caches for parsed YAML.
 from __future__ import annotations
 
 import argparse
@@ -133,7 +141,11 @@ T = TypeVar("T")
 # A custom loader for YAML to let us also keep track of line numbers
 # of each entry in the YAML file
 class LineLoader(YamlLoader):
+    # [CLASS DOC] YAML loader that records the 1-based source line of every mapping node
+    # under the key __line__, so errors can point at native_functions.yaml entries.
     def construct_mapping(self, node, deep=False):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] HELPER: Builds the mapping via the parent loader, then adds the entry
+        # __line__ holding the node start line plus one. Returns the augmented mapping.
         mapping = super().construct_mapping(node, deep=deep)  # type: ignore[no-untyped-call]
         # Add 1 so line numbering starts at 1
         mapping["__line__"] = node.start_mark.line + 1
@@ -153,6 +165,9 @@ def file_manager_from_dispatch_key(
     device_fms: dict[str, FileManager],
     default_fm: FileManager,
 ) -> FileManager:
+    # [FUNCTION DOC] HELPER: Picks the FileManager for a dispatch key. The first device in
+    # dispatch_device_map whose predicate accepts the key selects the entry of device_fms;
+    # if no device matches or it is absent from device_fms, default_fm is returned.
     fm = device_fms.get(
         next(
             (
@@ -174,6 +189,13 @@ def parse_native_yaml_struct(
     path: str = "<stdin>",
     skip_native_fns_gen: bool = False,
 ) -> ParsedYaml:
+    # [FUNCTION DOC] Converts the loaded YAML entries (a list of mappings with __line__) into
+    # a ParsedYaml of (native functions, defaultdict of BackendIndex per dispatch key).
+    # Each entry is parsed with NativeFunction.from_yaml (keys in ignore_keys skipped), then
+    # cross-function checks run. Unless skip_native_fns_gen, auto-generated functions are added.
+    # Raises AssertionError on malformed entries (non-list, non-dict, missing func or line).
+    # Unknown dispatch keys map to a placeholder Undefined index; device_guard is set only
+    # for cuda-like and xpu keys.
     if not isinstance(es, list):
         raise AssertionError(f"Expected 'es' to be a list, but got {type(es)}")
     rs: list[NativeFunction] = []
@@ -220,6 +242,10 @@ def parse_native_yaml_struct(
 
 
 def parse_tags_yaml_struct(es: object, path: str = "<stdin>") -> set[str]:
+    # [FUNCTION DOC] Validates the loaded tags.yaml entries and returns the set of tag names.
+    # Raises AssertionError if es is not a list, an entry lacks an integer __line__, or a tag
+    # has an empty description.
+    # KNOWN ISSUE: entries are not checked to be mappings before calling get on them.
     if not isinstance(es, list):
         raise AssertionError(f"Expected 'es' to be a list, but got {type(es)}")
     rs: set[str] = set()
@@ -241,6 +267,10 @@ def parse_tags_yaml_struct(es: object, path: str = "<stdin>") -> set[str]:
 
 @functools.cache
 def parse_tags_yaml(path: str) -> set[str]:
+    # [FUNCTION DOC] Reads and parses the tags yaml file at path with LineLoader and returns the
+    # set of valid tag names. Results are memoized both by functools.cache and by the module
+    # global tag cache (which main reads back later). Side effect: file read, cache update.
+    # KNOWN ISSUE: the two caches are redundant with each other.
     global _GLOBAL_PARSE_TAGS_YAML_CACHE
     if path not in _GLOBAL_PARSE_TAGS_YAML_CACHE:
         with open(path) as f:
@@ -258,6 +288,11 @@ def parse_native_yaml(
     skip_native_fns_gen: bool = False,
     loaded_yaml: object | None = None,
 ) -> ParsedYaml:
+    # [FUNCTION DOC] Parses native_functions.yaml (or the pre-loaded loaded_yaml when given)
+    # into a ParsedYaml, after loading valid tags from tags_yaml_path. The result is cached in
+    # a module global keyed by path only. Side effect: file reads, cache update.
+    # KNOWN ISSUE: the cache key ignores tags_yaml_path, ignore_keys, skip_native_fns_gen and
+    # loaded_yaml, so later calls with different options return the first result.
     global _GLOBAL_PARSE_NATIVE_YAML_CACHE
     if path not in _GLOBAL_PARSE_NATIVE_YAML_CACHE:
         valid_tags = parse_tags_yaml(tags_yaml_path)
@@ -283,6 +318,11 @@ def parse_native_yaml(
 # Some assertions are already performed during parsing, but those are only within a single NativeFunction.
 # Assertions here are meant to be performed across NativeFunctions.
 def error_check_native_functions(funcs: Sequence[NativeFunction]) -> None:
+    # [FUNCTION DOC] Cross-function validation run after parsing. Raises AssertionError if a
+    # structured_delegate target is missing or not structured, if an argument is named like a
+    # Python keyword (outside a small exclusion list), or if an inplace_view tagged op (other
+    # than resize_, resize_as_, set_) lacks a trailing underscore name or an out-of-place base op.
+    # KNOWN ISSUE: the keyword set and exclusion list are rebuilt on every loop iteration.
     func_map: dict[OperatorName, NativeFunction] = {}
     base_func_map: dict[BaseOperatorName, list[NativeFunction]] = defaultdict(list)
     for f in funcs:
@@ -347,6 +387,8 @@ def error_check_native_functions(funcs: Sequence[NativeFunction]) -> None:
 
 
 def cpp_string(s: str) -> str:
+    # [FUNCTION DOC] HELPER: Returns s as a quoted C++ string literal, escaping backslash,
+    # double quote, bell, backspace, form feed, newline, vertical tab and tab.
     """Convert a python string into a c++ string literal"""
     s = s.replace("\\", "\\\\")
     s = s.replace('"', '\\"')
@@ -373,6 +415,8 @@ def cpp_string(s: str) -> str:
 
 
 def static_dispatch_keys(backends: list[BackendIndex]) -> list[DispatchKey]:
+    # [FUNCTION DOC] HELPER: Returns the dispatch keys needing static dispatch headers: the
+    # backends' own keys followed by the four composite keys, or empty list if no backends.
     if len(backends) == 0:
         return []
     else:
@@ -387,6 +431,10 @@ def static_dispatch_keys(backends: list[BackendIndex]) -> list[DispatchKey]:
 def get_static_dispatch_backend(
     f: NativeFunction, backend_index: BackendIndex
 ) -> DispatchKey | None:
+    # [FUNCTION DOC] HELPER: Chooses the dispatch key a static call to f should target for the
+    # given backend: that backend if f has a kernel there or is structured-delegated, else
+    # the first matching composite key (explicit, non-functional, implicit, implicit nested),
+    # else None.
     if f.structured_delegate is not None or backend_index.has_kernel(f):
         # TODO: for ops with structured_delegate it should check the dispatch table of
         # the out variant instead. For now, these structured ops all have CPU/CUDA kernels
@@ -407,6 +455,10 @@ def get_static_dispatch_backend(
 def static_dispatch_ops_header(
     f: NativeFunction, backend_index: list[BackendIndex]
 ) -> str | None:
+    # [FUNCTION DOC] HELPER: Returns one include line per backend that has a static target for f
+    # (the per-op dispatch header), joined by newlines. Returns None if f registers its kernel
+    # manually.
+    # KNOWN ISSUE: the None check on backend_index contradicts its list type annotation.
     if backend_index is None or f.manual_kernel_registration:
         return None
 
@@ -421,6 +473,8 @@ def static_dispatch_ops_header(
 
 
 def static_dispatch_extra_headers(backends: list[BackendIndex]) -> list[str]:
+    # [FUNCTION DOC] HELPER: Returns include lines for the per-dispatch-key Functions headers
+    # of every static dispatch key.
     return [
         f"#include <ATen/{dispatch_key}Functions.h>"
         for dispatch_key in static_dispatch_keys(backends)
@@ -434,8 +488,14 @@ def translate_args(
     sig: CppSignature | DispatcherSignature,
     cpp_sig: CppSignature,
 ) -> str:
+    # [FUNCTION DOC] HELPER: Builds the comma separated argument expressions that adapt the
+    # arguments of sig to the parameters of cpp_sig using translate. Special case: if the
+    # target signature has a possibly-redundant memory_format binding, the source memory_format
+    # binding is retyped to match so the translation succeeds. Returns the expression text.
     # Adds SpecialArgName.possibly_redundant_memory_format NamedCType for memory_format bindings
     def add_spl_memory_format_binding(input_bindings: list[Binding]) -> list[Binding]:
+        # [FUNCTION DOC] HELPER: Returns a copy of the bindings where any binding named
+        # memory_format gets the special possibly-redundant memory format C type name.
         output_bindings: list[Binding] = []
         for binding in input_bindings:
             if binding.name == "memory_format":
@@ -471,6 +531,9 @@ def generate_static_dispatch_backend_call(
     backend_index: BackendIndex,
 ) -> str:
     cpp_sig = gen_static_dispatch_backend_call_signature(f)
+    # [FUNCTION DOC] HELPER: Returns C++ text for a return statement calling the kernel
+    # wrapper of f in the backend's lowercase dispatch key namespace, derived from the
+    # kernel's cpp namespace (or the default one) with the native suffix removed.
     name = cpp_sig.name()
     exprs = translate_args(sig, cpp_sig)
     backend_metadata = backend_index.get_kernel(f)
@@ -488,6 +551,10 @@ def generate_static_dispatch_fallback_call(
     f: NativeFunction,
     backend_indices: list[BackendIndex],
 ) -> str:
+    # [FUNCTION DOC] HELPER: Returns C++ text used when no single backend can be chosen
+    # statically: a call into the first applicable composite namespace (explicit, non-functional,
+    # implicit, implicit nested), or a TORCH_CHECK failure message naming the backends.
+    # Raises AssertionError if the required C++ signature is unavailable.
     cpp_sigs = CppSignatureGroup.from_native_function(
         f, method=False, fallback_binding=False
     )
@@ -518,6 +585,11 @@ def static_dispatch(
     f: NativeFunction,
     backend_indices: list[BackendIndex],
 ) -> str:
+    # [FUNCTION DOC] Returns C++ statements implementing static dispatch of f. Returns an empty
+    # string if there are no backends or kernel registration is manual. With exactly one
+    # backend holding a kernel, emits a direct call; with none, the fallback call; with several,
+    # emits a switch on the highest priority backend computed from tensor options and tensor
+    # arguments, one case per backend plus a default using the fallback.
     """
     For a given `NativeFunction`, find out the corresponding backend and dispatch to it. If more than one
     backends exist, fallback to static dispatch by determining dispatch key from inputs.
@@ -591,11 +663,17 @@ def static_dispatch(
 # selective build)
 @dataclass(frozen=True)
 class RegisterSchema:
+    # [CLASS DOC] Callable generating RegisterSchema.cpp definition lines. Holds the selective
+    # build selector and known_tags, a mutable mapping from tag set text to the index of an
+    # already emitted tags variable, so identical tag sets share one declaration.
     selector: SelectiveBuilder
     known_tags: dict[str, int] = field(default_factory=dict)
 
     @method_with_native_function
     def __call__(self, f: NativeFunction) -> str | None:
+        # [FUNCTION DOC] Returns the schema registration statement for f, or None if the selector
+        # rejects f. Functions with tags reuse or declare a tags vector (mutating known_tags);
+        # untagged ones get an empty tag list.
         if not self.selector.is_native_function_selected(f):
             return None
         tags = "{" + ", ".join(f"at::Tag::{tag}" for tag in sorted(f.tags)) + "}"
@@ -616,11 +694,18 @@ class RegisterSchema:
 # and (2) don't want to worry about method-only operators.
 @dataclass(frozen=True)
 class ComputeOperators:
+    # [CLASS DOC] Callable generating Operators.h declarations (target DECLARATION) or
+    # Operators.cpp definitions (target DEFINITION) of the at::_ops structs. Fields: the
+    # target, and the backend indices used for static dispatch (empty means dynamic dispatch).
     target: Literal[Target.DECLARATION, Target.DEFINITION]
     static_dispatch_backend_indices: list[BackendIndex]
 
     @method_with_native_function
     def __call__(self, f: NativeFunction) -> str:
+        # [FUNCTION DOC] For DECLARATION returns the operator struct text (schema alias, name,
+        # overload name, schema string, call and redispatch declarations). For DEFINITION returns
+        # the cached typed dispatcher handle plus definitions of call (using static dispatch if
+        # configured) and redispatch. Never returns None.
         sig = DispatcherSignature.from_schema(f.func)
         name = f.func.name.unambiguous_name()
 
@@ -709,8 +794,13 @@ static C10_NOINLINE c10::TypedOperatorHandle<{name}::schema> create_{name}_typed
 # and the scaffolding to call into the dispatcher from these functions.
 @dataclass(frozen=True)
 class ComputeFunction:
+    # [CLASS DOC] Stateless callable generating Functions.h content: inline free functions
+    # (and symint template variants) forwarding to the at::_ops entry points.
     @method_with_native_function
     def __call__(self, f: NativeFunction) -> str | None:
+        # [FUNCTION DOC] Returns inline function text for each C++ signature of f (plain and
+        # symint) when f has a function variant, plus a symint namespace template wrapper when f
+        # has symint arguments. Returns an empty string if neither applies.
         sig_group = CppSignatureGroup.from_native_function(
             f, method=False, fallback_binding=f.manual_cpp_binding
         )
@@ -757,11 +847,18 @@ namespace symint {{
 # public C++ API, and the scaffolding to call into the dispatcher from these functions.
 @dataclass(frozen=True)
 class ComputeTensorMethod:
+    # [CLASS DOC] Callable generating TensorBody.h content for method variants: const method
+    # declarations (target DECLARATION) or inline Tensor method definitions forwarding to
+    # at::_ops (target DEFINITION).
     target: Literal[Target.DECLARATION, Target.DEFINITION]
     static_dispatch_backend_indices: list[BackendIndex]
 
     @method_with_native_function
     def __call__(self, f: NativeFunction) -> str | None:
+        # [FUNCTION DOC] Returns None if f has no method variant. Otherwise returns declarations
+        # or definitions of the Tensor method signatures. Raises AssertionError if the method is an
+        # out function or has no self argument.
+        # KNOWN ISSUE: static_dispatch_backend_indices is stored but never used here.
         if Variant.method not in f.variants:
             return None
 
@@ -805,8 +902,12 @@ inline {sig.defn(prefix="Tensor::")} const {{
 # to the dispatcher's redispatch API.
 @dataclass(frozen=True)
 class ComputeRedispatchFunction:
+    # [CLASS DOC] Stateless callable generating RedispatchFunctions.h: inline functions that
+    # take a dispatch key set and call the operator's redispatch entry point.
     @method_with_native_function
     def __call__(self, f: NativeFunction) -> str | None:
+        # [FUNCTION DOC] Returns redispatch inline function text for each C++ function signature
+        # of f (always the function variant, never methods); the key set is the first argument.
         # We unconditionally generate function variants of the redispatch API.
         # This is mainly because we can namespace functions separately, but not methods,
         sig_group = CppSignatureGroup.from_native_function(
@@ -836,11 +937,19 @@ inline {sig.decl(is_redispatching_fn=True)} {{
 # one way or another, we should reevaluate if this is actually needed.
 @with_native_function
 def compute_aten_op(f: NativeFunction) -> str:
+    # [FUNCTION DOC] Returns the ATenOpList.cpp initializer entry pair of operator name and
+    # overload name for f.
     return f'{{"aten::{f.func.name.name}", "{f.func.name.overload_name}"}},'
 
 
 # Generates MetaFunctions.h
 def compute_meta_function_declaration(g: NativeFunctionsGroup) -> str | None:
+    # [FUNCTION DOC] Returns the MetaFunctions.h structured_<op> struct declaration for a
+    # structured group (None if not structured). It inherits from the declared structured
+    # base or the default MetaBase, declares meta with the meta arguments, and when
+    # precomputed values exist emits a templated precompute_out struct whose setters flip one
+    # boolean template flag each (static assertion enforces set-once) and meta returns the
+    # fully set instance type.
     if not g.structured:
         return None
     with native_function_manager(g.out):
@@ -965,6 +1074,8 @@ struct TORCH_API structured_{name} : public {parent_class} {{
 
 
 def needs_backend_select(f: NativeFunction, selector: SelectiveBuilder) -> bool:
+    # [FUNCTION DOC] HELPER: True if f needs a BackendSelect kernel: it takes tensor options,
+    # is not a _like or new_ function, and is selected by the selective build selector.
     name = str(f.func.name.name)
     if name.endswith("_like") or name.startswith("new_"):
         return False
@@ -978,6 +1089,9 @@ def needs_backend_select(f: NativeFunction, selector: SelectiveBuilder) -> bool:
 # be easily done automatically using templating.
 @dataclass(frozen=True)
 class ComputeBackendSelect:
+    # [CLASS DOC] Callable generating RegisterBackendSelect.cpp pieces: kernel definitions
+    # (target DEFINITION) or registration lines (target REGISTRATION) for operators that need
+    # the dispatch key computed from dtype, layout and device. Holds the target and selector.
     target: Literal[Target.DEFINITION, Target.REGISTRATION]
 
     # Selector object to determine which operators to generate
@@ -986,6 +1100,10 @@ class ComputeBackendSelect:
 
     @method_with_native_function
     def __call__(self, f: NativeFunction) -> str | None:
+        # [FUNCTION DOC] Returns None if f does not need BackendSelect. For DEFINITION returns an
+        # inline kernel computing a dispatch key set (from tensor options, merged with tensor
+        # arguments if any) and redispatching to the operator. For REGISTRATION returns the
+        # m.impl line. Raises AssertionError if the tensor argument presence is inconsistent.
         if not needs_backend_select(f, self.selector):
             return None
 
@@ -1052,11 +1170,16 @@ C10_ALWAYS_INLINE
 
 
 def format_yaml(data: object) -> str:
+    # [FUNCTION DOC] HELPER: Dumps data to YAML text without aliases, with ordered dict support
+    # and effectively unlimited line width for portability. Side effect: mutates the shared
+    # YamlDumper class (ignore_aliases and an OrderedDict representer) on every call.
     # Ignore alias in Dumper
     YamlDumper.ignore_aliases = lambda self, data: True  # type: ignore[assignment]
 
     # Support serializing OrderedDict
     def dict_representer(dumper: Any, data: Any) -> Any:
+        # [FUNCTION DOC] HELPER: YAML representer writing an OrderedDict as a plain mapping
+        # in its insertion order.
         return dumper.represent_dict(data.items())
 
     YamlDumper.add_representer(OrderedDict, dict_representer)  # type: ignore[no-untyped-call]
@@ -1071,6 +1194,8 @@ def format_yaml(data: object) -> str:
 # function detects those cases and converts them into native Python
 # objects.
 def pythonify_default(s: str) -> object:
+    # [FUNCTION DOC] HELPER: Converts a C++ default text to a native value: true and false to
+    # booleans, integers and floats parsed, anything else returned unchanged as a string.
     if s == "true":
         return True
     elif s == "false":
@@ -1095,6 +1220,9 @@ def pythonify_default(s: str) -> object:
 # TODO: Get rid of dynamic_type, after getting tools/autograd
 # to use the new codegen framework
 def dynamic_type(t: Type) -> str:
+    # [FUNCTION DOC] HELPER: Legacy Declarations.yaml dynamic type name. Optional types
+    # reduce to their element, a plain Tensor is at::Tensor, others use the C++ argument
+    # type with int (not symint) sizes.
     if isinstance(t, OptionalType):
         return dynamic_type(t.elem)
     # Note we don't use t.is_tensor_like() here because it would
@@ -1108,6 +1236,8 @@ def dynamic_type(t: Type) -> str:
 
 
 def compute_method_of_yaml(variants: set[Variant]) -> list[str]:
+    # [FUNCTION DOC] HELPER: Returns the method_of list, always starting with Type, then
+    # Tensor if a method variant exists, then namespace if a function variant exists.
     # This is written out explicitly to ensure that Tensor and
     # namespace are put into the list in the right order
     method_of = ["Type"]
@@ -1121,6 +1251,9 @@ def compute_method_of_yaml(variants: set[Variant]) -> list[str]:
 def compute_returns_yaml(
     f: NativeFunction,
 ) -> tuple[list[dict[str, str]], dict[str, str]]:
+    # [FUNCTION DOC] HELPER: Builds the returns entries of the YAML declaration (dynamic type,
+    # name, C++ type, optional field_name) and a mapping from out argument names to the
+    # corresponding return field names (only for out functions with named returns).
     # Note [name and field_name]
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~
     # To understand name_to_field_name, we must first talk about this
@@ -1193,6 +1326,11 @@ def compute_cpp_argument_yaml(
     out_arg_set: set[str],
     name_to_field_name: dict[str, str],
 ) -> object:
+    # [FUNCTION DOC] HELPER: Builds the YAML entry for one C++ API binding. Tensor options
+    # become a kwarg-only at::TensorOptions entry (with default if present); plain arguments
+    # delegate to compute_argument_yaml.
+    # KNOWN ISSUE: schema_order is accepted but unused; the function silently returns None
+    # for any other argument kind, and raises a bare AssertionError for a self argument.
     if isinstance(cpp_a.argument, TensorOptionsArguments):
         arg: dict[str, object] = {
             "annotation": None,
@@ -1225,6 +1363,10 @@ def compute_argument_yaml(
     out_arg_set: set[str],
     name_to_field_name: dict[str, str],
 ) -> object:
+    # [FUNCTION DOC] HELPER: Builds the YAML entry for one schema argument: annotation,
+    # dynamic type, nullability, name, legacy C++ type, default (converted by pythonify_default),
+    # kwarg_only and output/allocate/field_name flags, and a size for fixed size non-bool lists.
+    # KNOWN ISSUE: schema_order is accepted but unused.
     arg: dict[str, object] = {
         "annotation": str(a.annotation) if a.annotation else None,
         "dynamic_type": dynamic_type(a.type),
@@ -1255,6 +1397,10 @@ def compute_argument_yaml(
 
 @with_native_function
 def compute_declaration_yaml(f: NativeFunction) -> object:
+    # [FUNCTION DOC] Builds the legacy Declarations.yaml entry for f as an ordered mapping:
+    # names, schema string, public C++ arguments, schema-order arguments and C++ signature,
+    # method_of, returns, inplace and factory flags, device guard, and fixed legacy fields
+    # (mode native, with_gil and deprecated false). Uses int rather than symint types.
     returns, name_to_field_name = compute_returns_yaml(f)
 
     # These sets are used to conveniently test if an argument is a
@@ -1344,6 +1490,8 @@ def compute_declaration_yaml(f: NativeFunction) -> object:
 
 # See Note [Auto generated composite kernels]
 def has_autogenerated_composite_kernel(f: NativeFunction) -> bool:
+    # [FUNCTION DOC] HELPER: True if f is a structured (or structured-delegating) functional or
+    # inplace variant, whose composite kernel is generated automatically.
     return (f.structured or f.structured_delegate is not None) and (
         f.func.kind() == SchemaKind.functional or f.func.kind() == SchemaKind.inplace
     )
@@ -1353,6 +1501,11 @@ def has_autogenerated_composite_kernel(f: NativeFunction) -> bool:
 def compute_registration_declarations(
     f: NativeFunction, backend_indices: dict[DispatchKey, BackendIndex]
 ) -> str:
+    # [FUNCTION DOC] Returns one RegistrationDeclarations.h line: the dispatcher style
+    # declaration of f followed by a JSON comment with schema, a dispatch flag (true unless
+    # the only kernels are implicit composite ones) and a default flag (has a composite kernel
+    # or auto generated one).
+    # KNOWN ISSUE: the dispatch field's meaning is marked as unclear by a TODO in the code.
     name = dispatcher.name(f.func)
     returns_type = dispatcher.returns_type(f.func.returns).cpp_type()
     args = dispatcher.arguments(f.func)
@@ -1386,6 +1539,9 @@ def get_custom_build_selector(
     provided_op_registration_allowlist: list[str] | None,
     op_selection_yaml_path: str | None,
 ) -> SelectiveBuilder:
+    # [FUNCTION DOC] Builds the selective build selector. An allowlist yields a legacy allowlist
+    # selector, a yaml path yields one loaded from the file, neither yields a no-op selector.
+    # Raises AssertionError if both inputs are given.
     if (
         provided_op_registration_allowlist is not None
         and op_selection_yaml_path is not None
@@ -1416,9 +1572,14 @@ def get_custom_build_selector(
 def get_grouped_by_view_native_functions(
     native_functions: Sequence[NativeFunction],
 ) -> Sequence[NativeFunction | NativeFunctionsViewGroup]:
+    # [FUNCTION DOC] Groups functions sharing a view signature into NativeFunctionsViewGroup
+    # (view, optional inplace view, optional view_copy), leaving other functions standalone.
+    # Raises AssertionError on duplicate kinds for one signature.
     def maybe_create_view_group(
         d: dict[ViewSchemaKind | SchemaKind, NativeFunction],
     ) -> list[NativeFunction | NativeFunctionsViewGroup]:
+        # [FUNCTION DOC] HELPER: Turns one dictionary of functions per view signature into a view
+        # group (if it has an aliasing view; consumes those entries) plus the remaining functions.
         funcs: list[NativeFunction | NativeFunctionsViewGroup] = []
         if ViewSchemaKind.aliasing in d:
             view = d.pop(ViewSchemaKind.aliasing)
@@ -1467,9 +1628,14 @@ def get_grouped_by_view_native_functions(
 def get_grouped_native_functions(
     native_functions: Sequence[NativeFunction],
 ) -> Sequence[NativeFunction | NativeFunctionsGroup]:
+    # [FUNCTION DOC] Pre-groups functions by structure and converts each into a
+    # NativeFunctionsGroup where possible, else leaves them standalone.
     def flatten_pre_group(
         d: dict[SchemaKind, NativeFunction],
     ) -> Sequence[NativeFunction | NativeFunctionsGroup]:
+        # [FUNCTION DOC] HELPER: Returns a one element list with the group built from d, or the
+        # plain functions if no group forms. Raises AssertionError if a generated function ended
+        # up ungrouped.
         r = NativeFunctionsGroup.from_dict(d)
         if r is None:
             # Invariant: any NativeFunctions that are code-generated
@@ -1498,6 +1664,10 @@ def get_ns_grouped_kernels(
         [NativeFunctionsGroup | NativeFunction, BackendIndex], list[str]
     ] = dest.compute_native_function_declaration,
 ) -> dict[str, list[str]]:
+    # [FUNCTION DOC] HELPER: Collects kernel declarations from native_function_decl_gen for
+    # every function and backend, keyed by the kernel's C++ namespace (default namespace when
+    # the backend has no kernel). Raises AssertionError if one operator spans more than one
+    # namespace.
     ns_grouped_kernels: dict[str, list[str]] = defaultdict(list)
     for f in grouped_native_functions:
         native_function_namespaces = set()
@@ -1525,6 +1695,8 @@ def get_native_function_declarations_from_ns_grouped_kernels(
     *,
     ns_grouped_kernels: dict[str, list[str]],
 ) -> list[str]:
+    # [FUNCTION DOC] HELPER: Renders each namespace's kernel declarations, de-duplicated in
+    # order, wrapped by namespace prologue and epilogue lines. Returns all output lines.
     declarations: list[str] = []
     newline = "\n"
     for namespace, kernels in ns_grouped_kernels.items():
@@ -1555,6 +1727,8 @@ def get_native_function_declarations(
         [NativeFunctionsGroup | NativeFunction, BackendIndex], list[str]
     ] = dest.compute_native_function_declaration,
 ) -> list[str]:
+    # [FUNCTION DOC] Returns the NativeFunctions.h declaration lines for all grouped functions
+    # across backends, grouped by namespace.
     """
     Generate kernel declarations, in `NativeFunction(s).h`.
     :param grouped_native_functions: a sequence of `NativeFunction` or `NativeFunctionGroup`.
@@ -1576,6 +1750,8 @@ def get_native_function_declarations(
 def get_kernel_namespace(
     *, f: NativeFunction | NativeFunctionsGroup, backend_idx: BackendIndex
 ) -> str:
+    # [FUNCTION DOC] HELPER: Returns the C++ namespace of the kernel for f in the backend, or
+    # the default one if none. Raises AssertionError if a custom namespace does not end in native.
     backend_metadata = backend_idx.get_kernel(f)
     if backend_metadata and "::native" not in backend_metadata.cpp_namespace:
         func_name = (
@@ -1605,6 +1781,10 @@ def get_native_function_definitions(
     skip_dispatcher_op_registration: bool,
     gen_dispatch_helpers: bool,
 ) -> list[str]:
+    # [FUNCTION DOC] Returns the lines of the dispatch key's source definitions. For each
+    # kernel namespace it renders RegisterDispatchDefinitions from the namespaced and
+    # anonymous definitions and a TORCH_LIBRARY_IMPL registration block per op namespace
+    # (registrations omitted when skip_dispatcher_op_registration). Uses fm for templating.
     definitions: list[str] = []
     ns_definitions: dict[str, list[str]] = defaultdict(list)
     anonymous_definitions: dict[str, list[str]] = defaultdict(list)
@@ -1702,6 +1882,9 @@ def get_namespaced_declaration(
     rocm: bool,
     symint: bool,
 ) -> list[str]:
+    # [FUNCTION DOC] Returns declaration lines for the dispatch key's namespaced kernel wrappers
+    # (for example the CPUFunctions_inl.h contents), grouped by namespace with native replaced
+    # by the lowercase key and de-duplicated; empty namespaces are skipped.
     declarations: list[str] = []
     ns_grouped_kernels: dict[str, list[str]] = defaultdict(list)
     newline = "\n"
@@ -1746,6 +1929,8 @@ def get_native_function_schema_registrations(
     native_functions: Sequence[NativeFunction],
     schema_selector: SelectiveBuilder,
 ) -> tuple[list[str], str]:
+    # [FUNCTION DOC] Returns a pair: the aten namespace schema registration lines, and text of
+    # a TORCH_LIBRARY (or FRAGMENT for predefined namespaces) block for other namespaces.
     ns_native_functions: dict[str, list[NativeFunction]] = defaultdict(list)
     for native_function in native_functions:
         ns_native_functions[native_function.namespace].append(native_function)
@@ -1791,6 +1976,10 @@ def gen_aggregated_headers(
     dispatch_keys: Sequence[DispatchKey],
     rocm: bool,
 ) -> None:
+    # [FUNCTION DOC] Writes the aggregated (non per-operator) headers: NativeMetaFunctions.h,
+    # MethodOperators.h, Operators.h, Functions.h, NativeFunctions.h, and for each dispatch
+    # key in functions_keys the key's Functions.h and Functions_inl.h. Side effect: file writes
+    # through the file managers; returns nothing.
     # Buck doesn't support dynamic output files, so we aggregate all operator
     # headers into a single file
     cpu_fm.write(
@@ -1912,6 +2101,11 @@ def gen_per_operator_headers(
     dispatch_keys: Sequence[DispatchKey],
     rocm: bool,
 ) -> None:
+    # [FUNCTION DOC] Writes one set of headers per root operator name into ATen/ops (_ops,
+    # plain, _meta when structured, _native), per-key _dispatch headers when they have
+    # declarations, then the umbrella headers (Functions, Operators, NativeMetaFunctions,
+    # NativeFunctions, MethodOperators) that include them, and each key's Functions headers.
+    # Side effect: file writes only.
     # For CMake builds, split operator declarations into separate headers in
     # the ATen/ops folder to split up header dependencies
     functions_by_root_name: dict[str, list[NativeFunction]] = defaultdict(list)
@@ -2111,6 +2305,10 @@ def gen_headers(
     rocm: bool,
     per_operator_headers: bool,
 ) -> None:
+    # [FUNCTION DOC] Generates all headers. Delegates the operator headers to the per-operator
+    # or aggregated generator, then writes TensorBody.h, RedispatchFunctions.h,
+    # RegistrationDeclarations.h, VmapGeneratedPlumbing.h, aten_interned_strings.h and
+    # enum_tag.h (from valid_tags). Side effect: file writes only.
     if per_operator_headers:
         gen_per_operator_headers(
             native_functions=native_functions,
@@ -2188,6 +2386,9 @@ def gen_headers(
     )
 
     def gen_aten_interned_strings() -> dict[str, str]:
+        # [FUNCTION DOC] HELPER: Returns template values listing an interned-string macro entry for
+        # every operator base name and every argument name, sorted, excluding C++ alternative
+        # operator keywords (and, or, not, and similar).
         attrs: set[str] = set()  # All function argument names
         names = set()  # All ATen function names
         for func in native_functions:
@@ -2226,6 +2427,8 @@ def gen_headers(
     core_fm.write("aten_interned_strings.h", gen_aten_interned_strings)
 
     def gen_tags_enum() -> dict[str, str]:
+        # [FUNCTION DOC] HELPER: Returns template values with the sorted valid tags joined by
+        # comma and newline.
         return {"enum_of_valid_tags": (",\n".join(sorted(valid_tags)))}
 
     headeronly_fm.write("enum_tag.h", gen_tags_enum)
@@ -2255,6 +2458,13 @@ def gen_source_files(
     aoti_backends: set[DispatchKey | None],
     extend_aoti_c_shim: bool,
 ) -> None:
+    # [FUNCTION DOC] Generates the source files. For each dispatch key it writes the sharded
+    # Register<Key>.cpp (and Ufunc CPU, CPU kernel or CUDA files for structured ufunc ops;
+    # raises AssertionError for other ufunc keys). It then writes the AOTI shims, the
+    # BackendSelect, schema registration, Operators (sharded), Functions, TensorMethods,
+    # ATenOpList, functionalization (sharded), view inverse and view meta class files, and
+    # CompositeViewCopyKernels. CUDA include lines switch to HIP when rocm is set.
+    # Side effect: file writes only.
     extra_cuda_headers = """\
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/ATenCUDAGeneral.h>
@@ -2272,6 +2482,9 @@ def gen_source_files(
         if per_operator_headers:
 
             def operator_headers() -> list[str]:
+                # [FUNCTION DOC] HELPER: Returns sorted unique includes of the per-operator native
+                # (and where applicable function and dispatch) headers for groups having a kernel
+                # for the current dispatch key. Reads the enclosing loop variables.
                 headers = []
                 for g in grouped_native_functions:
                     is_registered = False
@@ -2314,6 +2527,8 @@ def gen_source_files(
         else:
 
             def operator_headers() -> list[str]:
+                # [FUNCTION DOC] HELPER: Returns the aggregated header includes needed by the
+                # current dispatch key's source file.
                 headers = ["#include <ATen/NativeFunctions.h>"]
                 if dispatch_key == DispatchKey.CompositeExplicitAutogradNonFunctional:
                     headers.append("#include <ATen/Functions.h>")
@@ -2359,6 +2574,8 @@ def gen_source_files(
         def register_dispatch_key_env_callable(
             gnf: NativeFunction | NativeFunctionsGroup,
         ) -> dict[str, list[str]]:
+            # [FUNCTION DOC] HELPER: Sharding callback returning the dispatch definitions of one
+            # function or group for the current dispatch key.
             return {
                 "dispatch_definitions": get_native_function_definitions(
                     fm=fm,  # noqa: F821
@@ -2445,6 +2662,8 @@ def gen_source_files(
 
     # BackendSelect is generated specially
     def gen_backend_select() -> dict[str, list[str]]:
+        # [FUNCTION DOC] HELPER: Returns template values for RegisterBackendSelect.cpp: op headers,
+        # kernel definitions and registrations for all functions needing BackendSelect.
         relevant_fns = [
             fn for fn in native_functions if needs_backend_select(fn, selector)
         ]
@@ -2491,6 +2710,7 @@ def gen_source_files(
     def key_func(
         fn: NativeFunction | NativeFunctionsGroup | NativeFunctionsViewGroup,
     ) -> str:
+        # [FUNCTION DOC] HELPER: Shard key of a function or group, its root operator name.
         return fn.root_name
 
     cpu_fm.write_sharded(
@@ -2533,6 +2753,8 @@ def gen_source_files(
     def gen_op_headers(
         g: NativeFunction | NativeFunctionsGroup | NativeFunctionsViewGroup,
     ) -> list[str]:
+        # [FUNCTION DOC] HELPER: Returns the native and ops include lines for every member of g
+        # (view and view_copy, or functional, out, inplace and mutable, or the single function).
         if isinstance(g, NativeFunctionsViewGroup):
             # view ops always get a functionalization kernel
             headers = [
@@ -2572,6 +2794,8 @@ def gen_source_files(
     def functionalization_env_callable(
         g: NativeFunction | NativeFunctionsGroup | NativeFunctionsViewGroup,
     ) -> dict[str, list[str]]:
+        # [FUNCTION DOC] HELPER: Template environment callback returning the op headers, kernel
+        # definitions and registrations of the functionalization pass for g.
         return {
             "ops_headers": gen_op_headers(g),
             "func_definitions": gen_functionalization_definition(
@@ -2733,6 +2957,8 @@ def gen_source_files(
 def gen_declarations_yaml(
     cpu_fm: FileManager, native_functions: Sequence[NativeFunction]
 ) -> None:
+    # [FUNCTION DOC] Writes Declarations.yaml containing the legacy declaration entry of every
+    # native function. Side effect: file write.
     cpu_fm.write(
         "Declarations.yaml",
         lambda: format_yaml([compute_declaration_yaml(f) for f in native_functions]),
@@ -2740,6 +2966,8 @@ def gen_declarations_yaml(
 
 
 def get_torchgen_root() -> Path:
+    # [FUNCTION DOC] Returns the resolved directory containing this package module, usable to
+    # locate native_functions.yaml when torchgen is used out of tree.
     """
     If you're depending on torchgen out-of-tree, you can use the root to figure
     out the path to native_functions.yaml
@@ -2748,6 +2976,15 @@ def get_torchgen_root() -> Path:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Command line entry point. Parses options (source and install dirs, rocm,
+    # mps, xpu, mtia, op selection, backend filters, static dispatch, which outputs to generate,
+    # AOTI shim flags), configures dispatch keys and ignored keys per device flags, parses and
+    # groups the YAML, creates output directories and FileManagers, then runs source, header
+    # and Declarations.yaml generation as requested, and optionally writes dependency files.
+    # Side effects: creates directories, writes generated files, mutates the global dispatch
+    # key list, may read the module YAML caches.
+    # KNOWN ISSUE: the help text of the force-schema-registration option lacks a space before
+    # those, and the extend-aoti-c-shim help text lacks separating spaces between sentences.
     parser = argparse.ArgumentParser(description="Generate ATen source files")
     parser.add_argument(
         "-s",
