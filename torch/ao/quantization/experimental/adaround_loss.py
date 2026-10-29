@@ -1,3 +1,5 @@
+# [MODULE DOC] Loss functions for Adaround: AdaptiveRoundingLoss combines a rounding regularizer and an MSE reconstruction loss.
+# Defines constants ADAROUND_ZETA (1.1) and ADAROUND_GAMMA (-0.1) used by the rectified sigmoid.
 import numpy as np
 
 import torch
@@ -9,6 +11,8 @@ ADAROUND_GAMMA: float = -0.1
 
 
 class AdaptiveRoundingLoss(torch.nn.Module):
+    # [CLASS DOC] torch Module computing the Adaround regularization and reconstruction terms (paper equations 24 and 25).
+    # State: max_iter, warm_start fraction, beta_range (start, end) annealed over iterations, and reg_param weight.
     """
     Adaptive Rounding Loss functions described in https://arxiv.org/pdf/2004.10568.pdf
     rounding regularization is eq [24]
@@ -22,6 +26,7 @@ class AdaptiveRoundingLoss(torch.nn.Module):
         beta_range: tuple[int, int] = (20, 2),
         reg_param: float = 0.001,
     ) -> None:
+        # [FUNCTION DOC] Store max_iter, warm_start, beta_range and reg_param on the module.
         super().__init__()
         self.max_iter = max_iter
         self.warm_start = warm_start
@@ -33,6 +38,10 @@ class AdaptiveRoundingLoss(torch.nn.Module):
         V: torch.Tensor,
         curr_iter: int,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] Compute the weighted rounding regularization for the rounding variable V at iteration curr_iter.
+        # Raises AssertionError if curr_iter is not less than max_iter. During the warm start fraction of iterations returns a zero tensor.
+        # After that, beta is annealed by a cosine schedule from the start to the end value, the rectified sigmoid of V is computed,
+        # and the result is the sum of one minus the absolute value of (2h-1) raised to beta, scaled by reg_param.
         """
         Major logics copied from official Adaround Implementation.
         Apply rounding regularization to the input tensor V.
@@ -71,6 +80,7 @@ class AdaptiveRoundingLoss(torch.nn.Module):
         soft_quantized_output: torch.Tensor,
         original_output: torch.Tensor,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] Return the mean squared error between the soft quantized output and the original output.
         """
         Compute the reconstruction loss between the soft quantized output and the original output.
         """
@@ -85,6 +95,9 @@ class AdaptiveRoundingLoss(torch.nn.Module):
         V: torch.Tensor,
         curr_iter: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC] Return the pair (regularization term, reconstruction term) for the given outputs, V and iteration.
+        # Note it does not sum them; the caller combines the two terms.
+        # KNOWN ISSUE: docstring mentions only the reconstruction formulation but a tuple of two terms is returned.
         """
         Compute the asymmetric reconstruction formulation as eq [25]
         """

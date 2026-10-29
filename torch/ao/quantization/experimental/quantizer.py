@@ -1,4 +1,6 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] APoT quantizer: class APoTQuantizer (quantize, dequantize, quant_dequant) and module-level wrappers quantize_APoT,
+# dequantize_APoT and quant_dequant_APoT that build a quantizer from qparams. Uses element-wise apply on CPU tensors via helpers in apot_utils.
 import numpy as np
 
 import torch
@@ -13,6 +15,8 @@ from torch.ao.quantization.experimental.apot_utils import (
 # class to store APoT quantizer and
 # implement quantize and dequantize
 class APoTQuantizer:
+    # [CLASS DOC] Holds APoT qparams (alpha, gamma, quantization_levels, level_indices) and converts tensors: quantize returns a TensorAPoT,
+    # dequantize converts a TensorAPoT back to float, quant_dequant rounds a float tensor to the nearest level. q_apot_alpha is unimplemented.
     alpha: torch.Tensor
     gamma: torch.Tensor
     quantization_levels: torch.Tensor
@@ -25,6 +29,7 @@ class APoTQuantizer:
         quantization_levels: torch.Tensor,
         level_indices: torch.Tensor,
     ) -> None:
+        # [FUNCTION DOC] Store the four qparam tensors on the instance.
         self.alpha = alpha
         self.gamma = gamma
         self.quantization_levels = quantization_levels
@@ -40,6 +45,9 @@ class APoTQuantizer:
     """
 
     def quantize(self, tensor2quantize: Tensor):
+        # [FUNCTION DOC] Quantize a float tensor to integer APoT representation. Applies float_to_apot element-wise (with the levels, indices and alpha)
+        # on a detached view, casts to int and wraps it with this quantizer in a TensorAPoT, which is returned.
+        # KNOWN ISSUE: detach shares memory and the element-wise apply is in place, so the input tensor's values are overwritten; CPU only.
         result = torch.tensor([])
 
         # map float_to_apot over tensor2quantize elements
@@ -68,6 +76,10 @@ class APoTQuantizer:
     """
 
     def dequantize(self, apot_tensor) -> Tensor:
+        # [FUNCTION DOC] Convert a TensorAPoT back to floating point. Flattens its data, maps each integer through apot_to_float using this
+        # quantizer's levels and indices (ValueError if an index is unknown), and returns a tensor reshaped to the original size.
+        # Side effect: prints the flattened data.
+        # KNOWN ISSUE: leftover debug print of the data on every call.
         orig_size = apot_tensor.data.size()
         apot_tensor_data = apot_tensor.data.flatten()
 
@@ -95,6 +107,8 @@ class APoTQuantizer:
     """
 
     def quant_dequant(self, tensor2quantize: Tensor) -> Tensor:
+        # [FUNCTION DOC] Return the input tensor with every element replaced by the nearest quantization level via quant_dequant_util, applied in place.
+        # KNOWN ISSUE: quant_dequant_util needs three arguments (x, levels, indices) but is called with two, so this raises TypeError; also mutates the input.
         levels_lst = list(self.quantization_levels)
 
         result = tensor2quantize.apply_(lambda x: quant_dequant_util(x, levels_lst))  # type: ignore[call-arg]
@@ -102,6 +116,7 @@ class APoTQuantizer:
         return result
 
     def q_apot_alpha(self) -> float:
+        # [FUNCTION DOC] Placeholder; always raises NotImplementedError.
         raise NotImplementedError
 
 
@@ -124,6 +139,7 @@ def quantize_APoT(
     quantization_levels: Tensor,
     level_indices: Tensor,
 ):
+    # [FUNCTION DOC] Convenience wrapper: build an APoTQuantizer from the given qparams and return its quantize result (a TensorAPoT) for tensor2quantize.
     quantizer = APoTQuantizer(
         alpha=alpha,
         gamma=gamma,
@@ -143,6 +159,7 @@ r""" Global method to create quantizer and call quantizer dequantize_APoT
 
 
 def dequantize_APoT(apot_tensor) -> Tensor:
+    # [FUNCTION DOC] Dequantize a TensorAPoT using the quantizer stored on it; returns the float tensor.
     quantizer = apot_tensor.quantizer
     result = quantizer.dequantize(apot_tensor)
     return result
@@ -167,6 +184,7 @@ def quant_dequant_APoT(
     quantization_levels: Tensor,
     level_indices: Tensor,
 ) -> Tensor:
+    # [FUNCTION DOC] Convenience wrapper: build an APoTQuantizer from the given qparams and return its quant_dequant result for tensor2quantize.
     quantizer = APoTQuantizer(
         alpha=alpha,
         gamma=gamma,

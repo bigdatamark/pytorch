@@ -1,3 +1,6 @@
+# [MODULE DOC] Backend configuration for PyTorch's native x86 quantized backend (currently aligned with FBGEMM).
+# Defines module-level DTypeConfig constants (quint8 weighted/default ops, fp16, dynamic int8/fp16, weight-only
+# quint8/quint4x2) and the public builder get_x86_backend_config. Import-time side effect: only constructs these constants.
 import torch
 
 from ._common_operator_config_utils import (
@@ -80,6 +83,10 @@ x86_weight_only_quint4x2_dtype_config = DTypeConfig(
 
 
 def get_x86_backend_config() -> BackendConfig:
+    # [FUNCTION DOC] Build and return the BackendConfig named "x86". Takes no arguments and mutates no global state.
+    # Selects dtype configs per op category (conv, linear incl. dynamic variants, binary, cat/default, fixed qparams,
+    # share qparams, tensor info, batch norm, RNN dynamic, embedding weight-only) and registers the pattern configs
+    # returned by the shared helpers in _common_operator_config_utils.
     """
     Return the `BackendConfig` for PyTorch's native x86 backend.
     """

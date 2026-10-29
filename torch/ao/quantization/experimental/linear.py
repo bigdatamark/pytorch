@@ -1,4 +1,6 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] LinearAPoT: a reference quantized linear module whose weight is APoT quantized and whose matrix
+# multiplication is emulated with bit shifts on uniformly quantized activations. Pure Python (slow, loop based); no import-time side effects.
 import numpy as np
 import numpy.typing as npt
 
@@ -9,6 +11,9 @@ from torch.ao.quantization.experimental.quantizer import quantize_APoT
 
 
 class LinearAPoT(WeightedQuantizedModule):
+    # [CLASS DOC] Quantized linear layer for APoT. State: b (total bits), k (bits per block), n (b divided by k), the qparams
+    # alpha, gamma, quantization_levels and level_indices computed by an APoTObserver on the weight, weight (integer APoT data
+    # of the quantized weight) and weight_transposed. Key methods: decompose_APoT, bitshift_mul, matmul, forward. from_reference is not implemented.
     r"""
     A quantized linear module with quantized tensor as inputs and outputs
     to support APoT quantization.
@@ -28,6 +33,9 @@ class LinearAPoT(WeightedQuantizedModule):
     """
 
     def __init__(self, weight2quantize: torch.Tensor, b: int, k: int):
+        # [FUNCTION DOC] Build the module from a float 2-D weight. Raises AssertionError if the weight is not 2-D or b is not divisible by k.
+        # Observes the weight with an APoTObserver (b, k), stores the unsigned qparams, quantizes the weight with quantize_APoT,
+        # and keeps the integer data plus its transpose. Side effect: runs the observer on the weight.
         if weight2quantize.dim() != 2:
             raise AssertionError(
                 f"weight2quantize must be a 2-D tensor, got dim={weight2quantize.dim()}"
@@ -63,6 +71,9 @@ class LinearAPoT(WeightedQuantizedModule):
         self.weight_transposed = torch.transpose(self.weight, 0, 1)
 
     def decompose_APoT(self, x):
+        # [FUNCTION DOC] Split a binary string (as produced by the builtin binary conversion) into a list of k-sized blocks:
+        # the two character prefix is dropped and the remaining digits are cut left to right in chunks of k (last chunk may be shorter).
+        # KNOWN ISSUE: a negative value's string has a minus sign before the prefix, which this does not handle.
         r"""
         Decompose binary representation of APoT values into list of k-sized blocks
         Args:
@@ -81,6 +92,9 @@ class LinearAPoT(WeightedQuantizedModule):
         return blocks
 
     def bitshift_mul(self, weight_val, r):
+        # [FUNCTION DOC] Multiply an integer activation r by an APoT weight given as a list of digit blocks, using shifts and additions.
+        # Blocks are processed from last to first with digits reversed inside each block; a running place counter increases per digit
+        # and r shifted left by the place is added for each digit equal to one. Returns the integer product.
         r"""
         Compute multiplication of weight_val * r using bitshifting
         method discussed in APoT paper: https://arxiv.org/pdf/1909.13144.pdf
@@ -112,6 +126,9 @@ class LinearAPoT(WeightedQuantizedModule):
         return product
 
     def matmul(self, decomposed_weight, activation):
+        # [FUNCTION DOC] Matrix product of an activation matrix with a 2-D object array of decomposed weights using triple nested loops.
+        # For each output cell it sums bitshift_mul over the inner dimension (activation entries are cast to int). Returns a float
+        # zeros-initialised tensor of shape (activation rows, weight columns), filled in place.
         r"""
         Perform matrix multiplication between decomposed_weight and
         activation by calling bitshift_mul function for each value
@@ -139,6 +156,8 @@ class LinearAPoT(WeightedQuantizedModule):
         return result
 
     def forward(self, activation: torch.Tensor) -> torch.FloatTensor:
+        # [FUNCTION DOC] Compute the layer output. Raises AssertionError if the activation is not 2-D. Converts every entry of the transposed
+        # weight to a binary string and decomposes it into blocks, then calls matmul and casts the result to float32. No bias is applied.
         r"""
         Multiply APoT quantized weight and uniformly quantized activation (dtype: quint8)
         with bitshifting instead of matrix multiplication.
@@ -176,4 +195,5 @@ class LinearAPoT(WeightedQuantizedModule):
         quantization_levels: torch.Tensor,
         level_indices: torch.Tensor,
     ):
+        # [FUNCTION DOC] Class method conversion from a reference quantized linear; not implemented and always raises NotImplementedError.
         raise NotImplementedError

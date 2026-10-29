@@ -1,4 +1,6 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Backend configuration for the TensorRT backend (experimental, API expected to change).
+# Exposes get_tensorrt_backend_config and get_tensorrt_backend_config_dict. No import-time side effects beyond imports.
 import torch
 
 from ._common_operator_config_utils import (
@@ -23,6 +25,11 @@ __all__ = [
 
 
 def get_tensorrt_backend_config() -> BackendConfig:
+    # [FUNCTION DOC] Build and return the BackendConfig named "tensorrt". Takes no arguments.
+    # Uses a single qint8 dtype config (weighted: input/output/weight qint8 with float bias; non-weighted: input/output qint8).
+    # Registers explicit pattern configs for addmm (different observer for output, with input indices for bias, input, weight)
+    # and cat (output shares observer with input), plus conv, linear, binary op, share-qparams and tensor-info op configs
+    # from the shared helpers.
     """
     Return the `BackendConfig` for the TensorRT backend.
     NOTE: Current api will change in the future, it's just to unblock experimentation for
@@ -92,6 +99,7 @@ def get_tensorrt_backend_config() -> BackendConfig:
 
 
 def get_tensorrt_backend_config_dict():
+    # [FUNCTION DOC] Return the TensorRT BackendConfig converted to its dictionary form via the to_dict method of the config.
     """
     Return the `BackendConfig` for the TensorRT backend in dictionary form.
     """

@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Mapping from sequences of module types to fuser methods used by eager and FX fusion. Defines fuser methods
+# (fuse_conv_bn, fuse_conv_bn_relu, fuse_linear_bn, fuse_convtranspose_bn), the default mapping _DEFAULT_OP_LIST_TO_FUSER_METHOD,
+# lookup functions get_fuser_method (flat tuples) and get_fuser_method_new (nested patterns with wildcard matching),
+# and helpers to reverse the argument order of fuser methods. Import-time side effect: builds the default mapping.
 import itertools
 from collections.abc import Callable
 from typing import Any
@@ -19,6 +23,10 @@ __all__ = [
 
 
 def fuse_conv_bn(is_qat, conv, bn):
+    # [FUNCTION DOC] Fuse a conv and batch norm. Args: is_qat flag, conv, bn. Raises AssertionError if training modes differ.
+    # In QAT mode also raises AssertionError if bn.num_features differs from conv out_channels, or bn is not affine or does not track running stats,
+    # and returns the matching ConvBn1d/2d/3d module (NotImplementedError for other conv types). In eval mode returns the result of the eval-time conv/bn fusion utility.
+    # KNOWN ISSUE: the docstring example calls it without the is_qat argument.
     r"""Return the fused conv and bn modules.
     Given the conv and bn modules, fuses them and returns the fused module
 
@@ -69,6 +77,9 @@ def fuse_conv_bn(is_qat, conv, bn):
 
 
 def fuse_conv_bn_relu(is_qat, conv, bn, relu):
+    # [FUNCTION DOC] Fuse a conv, batch norm and relu. Raises AssertionError if the three training modes differ.
+    # QAT mode: same bn checks as fuse_conv_bn, then returns the ConvBnReLU1d/2d/3d module for the conv type (NotImplementedError otherwise).
+    # Eval mode: folds bn into conv with the eval utility and returns ConvReLU1d/2d/3d of (fused conv, relu); NotImplementedError for unsupported conv types.
     r"""Return the fused conv and bn modules.
 
     Given the conv and bn modules, fuses them and returns the fused module
@@ -130,6 +141,8 @@ def fuse_conv_bn_relu(is_qat, conv, bn, relu):
 
 
 def fuse_linear_bn(is_qat, linear, bn):
+    # [FUNCTION DOC] Fuse a linear layer with batch norm. Raises AssertionError if training modes differ. QAT mode: checks num_features equals out_features,
+    # bn affine and tracking running stats (AssertionError otherwise) and returns LinearBn1d. Eval mode: returns the linear/bn fused by the eval utility.
     r"""Return the fused linear and bn modules.
     Given the linear and bn modules, fuses them and returns the fused module
 
@@ -170,6 +183,8 @@ def fuse_linear_bn(is_qat, linear, bn):
 
 
 def fuse_convtranspose_bn(is_qat, convt, bn):
+    # [FUNCTION DOC] Fuse a transposed conv with batch norm. Raises AssertionError if training modes differ; in QAT mode raises a plain Exception (not supported).
+    # In eval mode returns the eval-time fused conv with the transpose option set.
     r"""Return the fused ConvTranspose and bn modules.
     Given ConvTranspose and bn modules, fuses them and returns the fused module
 
@@ -199,6 +214,7 @@ def fuse_convtranspose_bn(is_qat, convt, bn):
 
 
 def _sequential_wrapper2(sequential):
+    # [FUNCTION DOC] HELPER: Given a two-module sequential class, return a fuser method taking (is_qat, m1, m2) that ignores is_qat and returns the sequential built from both modules.
     """Return a sequential wrapped that for is_qat and two modules.
     Given a sequential class for two modules, return a function that takes
     is_qat, and then two modules as argument, that ignores the is_qat flag
@@ -206,6 +222,7 @@ def _sequential_wrapper2(sequential):
     """
 
     def fuser_method(is_qat, m1, m2):
+        # [FUNCTION DOC] HELPER: Closure returned by the wrapper: build the captured sequential class from m1 and m2, ignoring is_qat.
         return sequential(m1, m2)
 
     return fuser_method
@@ -232,6 +249,9 @@ _DEFAULT_OP_LIST_TO_FUSER_METHOD: dict[tuple, nn.Sequential | Callable] = {
 
 
 def get_fuser_method(op_list, additional_fuser_method_mapping=None):
+    # [FUNCTION DOC] Look up the fuser method for a tuple of module types in the default mapping merged with an optional additional mapping
+    # (additional entries win). Raises AssertionError if no method is found.
+    # KNOWN ISSUE: the docstring says it returns None when missing, but the code raises AssertionError.
     """Get fuser method for the given list of module types.
 
     Get fuser method for the given list of module types,
@@ -249,14 +269,18 @@ def get_fuser_method(op_list, additional_fuser_method_mapping=None):
 
 
 def _reverse2(f):
+    # [FUNCTION DOC] HELPER: Wrap a 2-argument fuser method so its two module arguments are swapped (internal reversed pattern order).
     def reversed(is_qat, x, y):
+        # [FUNCTION DOC] HELPER: Call the wrapped fuser method with the two modules in swapped order.
         return f(is_qat, y, x)
 
     return reversed
 
 
 def _reverse3(f):
+    # [FUNCTION DOC] HELPER: Wrap a 3-argument fuser method for reversed nested patterns: the second module argument is a pair that is unpacked and the wrapped method is called with the modules in forward order.
     def reversed(is_qat, x, w):
+        # [FUNCTION DOC] HELPER: Unpack the pair into two modules and call the wrapped method with (is_qat, third, second, first) i.e. forward order.
         y, z = w
         return f(is_qat, z, y, x)
 
@@ -264,6 +288,8 @@ def _reverse3(f):
 
 
 def _get_valid_patterns(op_pattern):
+    # [FUNCTION DOC] HELPER: Expand an op pattern into all patterns obtainable by replacing any leaf with the MatchAllNode wildcard.
+    # Tuples/lists are expanded recursively and combined with a Cartesian product; a leaf gives a list of itself and MatchAllNode. Returns a list.
     """Return a list of valid patterns generated from the op_pattern.
 
     Returns a list of valid patterns generated from the op_pattern,
@@ -298,6 +324,9 @@ def get_fuser_method_new(
     op_pattern: Pattern,
     fuser_method_mapping: dict[Pattern, nn.Sequential | Callable],
 ):
+    # [FUNCTION DOC] Find the fuser method for a (possibly nested) pattern in the mapping, trying every wildcard-expanded variant of the pattern in order and returning the first match.
+    # Raises AssertionError if none matches.
+    # KNOWN ISSUE: the loop variable reuses the op_pattern name, so the error message shows the last variant tried rather than the original pattern.
     """Get fuser method.
 
     This will be made default after we deprecate the get_fuser_method

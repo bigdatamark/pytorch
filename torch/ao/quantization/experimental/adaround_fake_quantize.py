@@ -1,4 +1,6 @@
 # mypy: allow-untyped-decorators
+# [MODULE DOC] AdaroundFakeQuantizer: a FakeQuantize subclass implementing adaptive rounding (Adaround, arXiv 2004.10568)
+# for weights with symmetric quantization. Rounding is learned through a trainable parameter V passed through a rectified sigmoid.
 from __future__ import annotations
 
 from typing import Any
@@ -11,6 +13,10 @@ from torch.quantization.observer import MinMaxObserver
 
 
 class AdaroundFakeQuantizer(FakeQuantize):
+    # [CLASS DOC] Fake quantizer with learnable rounding offsets. State: scale and zero_point tensors (empty until the observer
+    # runs), V (trainable parameter of the same shape as the weight, initialised from the fractional part of the scaled weight),
+    # fixed stretch constants zeta and gamma, a sigmoid module, and use_soft_rounding (soft sigmoid vs hard binary rounding).
+    # Only symmetric qschemes are accepted. Observed qparams are copied into scale/zero_point; only V is meant to be trained.
     """
     This is a FakeQuantizer that enables an adaptive rounding fake quantizer.
     Adaround is a technique to adaptively round weights, derived from the paper https://arxiv.org/pdf/2004.10568.pdf
@@ -30,6 +36,10 @@ class AdaroundFakeQuantizer(FakeQuantize):
         ch_axis: int = 0,
         **observer_kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC] Construct the fake quantizer via the FakeQuantize base with a static (non-dynamic) observer.
+        # Args: observer class, qscheme (must be symmetric), quant_min/quant_max, ch_axis, extra observer kwargs.
+        # Raises AssertionError if quant_min exceeds quant_max or the qscheme is not symmetric.
+        # Creates empty scale/zero_point, an empty trainable V, constants zeta=1.1 and gamma=-0.1, and enables soft rounding.
         super().__init__(
             observer=observer,
             qscheme=qscheme,
@@ -63,10 +73,13 @@ class AdaroundFakeQuantizer(FakeQuantize):
 
     @torch.jit.export
     def calculate_qparams(self) -> tuple[torch.Tensor, torch.Tensor]:  # type: ignore[override]
+        # [FUNCTION DOC] Return the stored (scale, zero_point) tensors rather than querying the observer.
         return self.scale, self.zero_point
 
     @torch.jit.export
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] Return a string describing fake quant/observer flags, quant range, dtype, qscheme, ch_axis, scale, zero_point
+        # and the count of non-negative entries of V.
         return (
             f"fake_quant_enabled={self.fake_quant_enabled}, observer_enabled={self.observer_enabled}, "
             f"quant_min={self.activation_post_process.quant_min}, quant_max={self.activation_post_process.quant_max}, "
@@ -75,9 +88,12 @@ class AdaroundFakeQuantizer(FakeQuantize):
         )
 
     def enable_weight_fake_quant(self) -> None:
+        # [FUNCTION DOC] Turn on fake quantization by setting the first element of the fake_quant_enabled flag tensor to 1.
         self.fake_quant_enabled[0] = 1
 
     def get_rectified_sigmoid_func(self) -> torch.Tensor:
+        # [FUNCTION DOC] Return the rounding offset h(V): with soft rounding, the sigmoid of V stretched by zeta/gamma and clamped to [0, 1];
+        # otherwise a hard binary tensor that is 1 where V is non-negative and 0 elsewhere.
         if self.use_soft_rounding:
             return torch.clamp(
                 self.sigmoid(self.V) * (self.zeta - self.gamma) + self.gamma,
@@ -92,6 +108,11 @@ class AdaroundFakeQuantizer(FakeQuantize):
     def update_scale(
         self, X: torch.Tensor, _scale: torch.Tensor, _zero_point: torch.Tensor
     ) -> None:
+        # [FUNCTION DOC] Update scale/zero_point from newly observed values and re-initialise V.
+        # Args: X weight tensor, _scale and _zero_point from the observer. On first call both are moved to X's device;
+        # later the scale data is replaced and zero_point is set (zeros for symmetric) and unsqueezed along every non-channel dimension.
+        # Then V is set so the rectified sigmoid reproduces the fractional part of X divided by scale.
+        # Raises AssertionError if the fractional part is negative. Mutates scale, zero_point and V.
         if self.scale.numel() == 0:
             self.scale.data = _scale.to(X.device)
             self.zero_point = _zero_point.to(X.device)
@@ -114,6 +135,11 @@ class AdaroundFakeQuantizer(FakeQuantize):
         self.V.data = V_init
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] Forward pass. If the observer is enabled: observe a detached copy of X, fetch its qparams, move them to the
+        # stored devices, reshape per-channel qparams to broadcast, and call update_scale. If fake quant is enabled: compute the
+        # floor of X over scale plus zero_point, add the learned rounding offset, clamp to the quant range, then dequantize,
+        # so gradients flow to V; otherwise return X unchanged.
+        # KNOWN ISSUE: the local variable dims is computed (and a per-channel branch repeated) but never used.
         if self.observer_enabled[0] == 1:
             X_detached = X.detach()
             self.activation_post_process(X_detached)

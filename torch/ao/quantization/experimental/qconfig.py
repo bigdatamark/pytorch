@@ -1,3 +1,7 @@
+# [MODULE DOC] Predefined QConfig objects for experimental APoT quantization at 8 and 4 bits (b with k=2 per comment):
+# uniform, APoT-weight and APoT-activation combinations built from FakeQuantize and APoTFakeQuantize factories, plus the default
+# symmetric fake-quant factories they use. Import-time side effect: constructs these factory/QConfig objects.
+# KNOWN ISSUE: some configs pass a with_args bound method (e.g. uniform_qconfig_8bit weight) where others pass a factory instance, so calling the weight entry returns another factory rather than a module.
 import torch
 from torch.ao.quantization import MinMaxObserver
 from torch.ao.quantization.experimental.fake_quantize import APoTFakeQuantize

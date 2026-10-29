@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Adaround post-training weight rounding optimisation. Provides AdaptiveRoundingOptimizer, which learns per-weight
+# rounding decisions for Conv1d and Linear layers by minimising a reconstruction loss against floating point outputs.
+# Side effects at use time: prints progress, may move models to CUDA. No import-time side effects.
 import copy
 from collections.abc import Callable
 from typing import Any
@@ -15,6 +18,11 @@ from torch.utils.data import DataLoader, TensorDataset
 
 
 class AdaptiveRoundingOptimizer:
+# [CLASS DOC] Drives Adaround over a model. State: model (moved to CUDA, wrapped in DataParallel if several GPUs), q_model (deep copy
+# that receives rounded weights), user callback that runs the model on a data item, forward_hook_wrapper that builds hooks
+# capturing a layer's input/output, calibration data list, batch size (capped at data length), max_iter, the AdaptiveRoundingLoss,
+# and quantization settings (observer, dtype, quant_min/quant_max, qscheme, optional feed_forward_wrapper).
+# Main entry: run_adaround; per layer work happens in optimize_adaptive_rounding.
     def __init__(
         self,
         model: torch.nn.Module | torch.nn.DataParallel,
@@ -37,6 +45,9 @@ class AdaptiveRoundingOptimizer:
         batch_size: int = 256,
         feed_forward_wrapper: torch.nn.Module | None = None,
     ):
+        # [FUNCTION DOC] Store configuration. Moves the model to CUDA when available (DataParallel if more than one device),
+        # deep-copies it into q_model, records device, callback, hook wrapper and data, caps batch_size at the data length,
+        # and creates an AdaptiveRoundingLoss with a 0.2 warm start. Side effects: GPU transfer and a full model copy.
         if torch.cuda.is_available():
             self.model = model.cuda()
             if torch.cuda.device_count() > 1:
@@ -62,6 +73,9 @@ class AdaptiveRoundingOptimizer:
         self.feed_forward_wrapper = feed_forward_wrapper
 
     def run_adaround(self) -> torch.nn.Module:
+        # [FUNCTION DOC] Run Adaround on every Conv1d and Linear layer. Walks model and q_model modules in lockstep, disables in-place
+        # ReLU in both, collects (name, module, q_module) triples, prints their count, and optimises each layer in order.
+        # Returns the optimised q_model (unwrapped from DataParallel if needed). Mutates both models and prints progress.
         layer_list: list[tuple[str, torch.nn.Module, torch.nn.Module]] = []
         for (name, module), q_module in zip(
             self.model.named_modules(), self.q_model.modules()
@@ -95,6 +109,12 @@ class AdaptiveRoundingOptimizer:
     def get_data_inp_out(
         self, module: torch.nn.Module, q_module: torch.nn.Module, data: list[Any]
     ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
+        # [FUNCTION DOC] Collect calibration tensors for one layer. Registers forward hooks (made by forward_hook_wrapper) on the float and
+        # quantized modules, runs the callback on every data item for both models without gradients, and gathers per item the
+        # quantized-module input, the float output and the float input. Removes the hooks and returns (q_input, fp_out, fp_input) lists.
+        # The hook fetcher lists are read at fixed positions 0 and 1 (input, output), never cleared between items.
+        # Re-moves models to CUDA each call when available.
+        # KNOWN ISSUE: because the fetcher lists are never cleared, fixed indices only give per-item values if the hook wrapper overwrites them.
         fp_out: list[torch.Tensor] = []
         q_input: list[torch.Tensor] = []
         fp_input: list[torch.Tensor] = []
@@ -124,6 +144,9 @@ class AdaptiveRoundingOptimizer:
 
     @torch.no_grad()
     def feed_forward(self, x, weight, module):
+        # [FUNCTION DOC] Run the layer's operation without gradients with a supplied weight: conv1d (using the module's stride, padding,
+        # dilation, groups, no bias) for Conv1d, or linear (using the module's bias) for Linear. Raises NotImplementedError for other modules.
+        # KNOWN ISSUE: the Conv1d branch ignores the module bias while the Linear branch uses it.
         if isinstance(module, torch.nn.Conv1d):
             out = torch.nn.functional.conv1d(
                 x,
@@ -150,6 +173,8 @@ class AdaptiveRoundingOptimizer:
         q_inp: torch.Tensor,
         fp_out: torch.Tensor,
     ):
+        # [FUNCTION DOC] HELPER: Print the MSE between float output and the output obtained with hard (binary) rounding and with soft rounding
+        # of the quantizer, evaluated without gradients. Temporarily toggles use_soft_rounding on the quantizer and leaves it set to soft.
         with torch.no_grad():
             ada_quantizer.use_soft_rounding = False
             q_w_hard_round = ada_quantizer(q_module.weight)
@@ -169,6 +194,13 @@ class AdaptiveRoundingOptimizer:
         q_module: torch.nn.Module,
         activation: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> None:
+        # [FUNCTION DOC] Optimise rounding for one layer. Builds an AdaroundFakeQuantizer, runs the observer once on the quantized module's
+        # weight, then enables fake quant and trains only its V parameter with Adam. Gathers layer data, raises AssertionError if the float
+        # module's output on the saved input differs from the captured output (in-place activation detected), builds a shuffled DataLoader
+        # of (quantized input, float output), and loops until max_iter steps, adding regularization and reconstruction losses (prints
+        # every 30 epochs). Finally freezes V, writes the rounded weight back into q_module.weight and attaches the observer as weight_fake_quant.
+        # Raises NotImplementedError for layers other than Conv1d/Linear. The activation argument is unused.
+        # KNOWN ISSUE: the Conv1d check uses module while the Linear check uses q_module; the epoch count divides by len(out) // batch_size, which is zero (ZeroDivisionError) when fewer items than batch_size.
         ada_quantizer = AdaroundFakeQuantizer(
             dtype=self.dtype,
             observer=self.observer,

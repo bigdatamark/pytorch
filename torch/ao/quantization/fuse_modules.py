@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Eager mode module fusion API: fuse_modules and fuse_modules_qat fuse named submodules (conv/bn/relu, linear/bn/relu, etc.)
+# of a model into fused modules, replacing the remaining ones with identity modules. Also provides fuse_known_modules (default fuser function)
+# and helpers to get/set nested submodules by dotted name. Re-exports fuse_conv_bn, fuse_conv_bn_relu and get_fuser_method for backward compatibility.
 import copy
 
 import torch.nn as nn
@@ -21,6 +24,7 @@ __all__ = [
 
 # Generalization of getattr
 def _get_module(model, submodule_key):
+    # [FUNCTION DOC] HELPER: Return the nested submodule of model addressed by a dotted attribute path, by repeated attribute lookup (AttributeError if missing).
     tokens = submodule_key.split(".")
     cur_mod = model
     for s in tokens:
@@ -30,6 +34,7 @@ def _get_module(model, submodule_key):
 
 # Generalization of setattr
 def _set_module(model, submodule_key, module):
+    # [FUNCTION DOC] HELPER: Set the nested submodule addressed by a dotted path to the given module, by looking up the parent through the path prefix and assigning the last name. Mutates the model.
     tokens = submodule_key.split(".")
     sub_tokens = tokens[:-1]
     cur_mod = model
@@ -40,6 +45,11 @@ def _set_module(model, submodule_key, module):
 
 
 def fuse_known_modules(mod_list, is_qat, additional_fuser_method_mapping=None):
+    # [FUNCTION DOC] Fuse a list of modules into a list of the same length. Looks up the fuser method for the tuple of module types (honouring parametrizations)
+    # using the default mapping plus an optional additional mapping, and calls it with the is_qat flag and the modules. Raises NotImplementedError if no fuser method is found.
+    # Forward pre hooks of the first module and forward hooks of the last module are moved to the fused module and cleared on the originals (other hooks are lost).
+    # Returns a list whose first element is the fused module and the rest are Identity modules copying the first module's training mode.
+    # KNOWN ISSUE: get_fuser_method raises AssertionError when nothing is found, so the NotImplementedError branch is effectively unreachable.
     r"""Return a list of known fuse modules.
 
     Returns a list of modules that fuses the operations specified
@@ -86,6 +96,8 @@ def _fuse_modules_helper(
     fuser_func=fuse_known_modules,
     fuse_custom_config_dict=None,
 ):
+    # [FUNCTION DOC] HELPER: Fuse one list of module names in place. Reads the optional additional fuser method mapping from the custom config (default empty),
+    # resolves the modules, calls fuser_func with (modules, is_qat, additional mapping) and writes the returned modules back at the same names. Mutates the model.
     if fuse_custom_config_dict is None:
         fuse_custom_config_dict = {}
     additional_fuser_method_mapping = fuse_custom_config_dict.get(
@@ -109,6 +121,8 @@ def _fuse_modules(
     fuser_func=fuse_known_modules,
     fuse_custom_config_dict=None,
 ):
+    # [FUNCTION DOC] HELPER: Shared implementation of fuse_modules and fuse_modules_qat. Deep-copies the model unless inplace. If modules_to_fuse is a flat list of strings
+    # it is treated as one group, otherwise as a list of groups, each fused through the helper. Returns the model (copy or original).
     if not inplace:
         model = copy.deepcopy(model)
 
@@ -133,6 +147,9 @@ def fuse_modules(
     fuser_func=fuse_known_modules,
     fuse_custom_config_dict=None,
 ):
+    # [FUNCTION DOC] Public eval-mode entry point: fuse the given module name list(s) with is_qat disabled. Args: model, modules_to_fuse (list of names or list of lists),
+    # inplace flag (default copy), fuser_func, fuse_custom_config_dict. Returns the fused model.
+    # KNOWN ISSUE: the docstring says a new copy is created if inplace is true; the code copies when inplace is false. Its list of supported sequences also differs from fuse_known_modules.
     r"""Fuse a list of modules into a single module.
 
     Fuses only the following sequence of modules:
@@ -204,6 +221,7 @@ def fuse_modules_qat(
     fuser_func=fuse_known_modules,
     fuse_custom_config_dict=None,
 ):
+    # [FUNCTION DOC] Same as fuse_modules but with is_qat enabled, so the training-time (QAT) fused modules are produced. Returns the fused model.
     """QAT version for `fuse_modules`."""
     return _fuse_modules(
         model,

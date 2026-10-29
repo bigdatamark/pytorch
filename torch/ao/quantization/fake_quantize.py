@@ -1,5 +1,10 @@
 # mypy: allow-untyped-decorators
 # mypy: allow-untyped-defs
+# [MODULE DOC] Fake quantization modules for quantization aware training and calibration: the abstract FakeQuantizeBase,
+# FakeQuantize (observer driven quantize/dequantize simulation), FixedQParamsFakeQuantize, and FusedMovingAvgObsFakeQuantize
+# (single fused kernel), qscheme predicate helpers, module-level helper functions to enable/disable observers and fake quant
+# on a module (for use with Module.apply), and a set of default factory objects (default_fake_quant, default_weight_fake_quant,
+# per-channel, embedding, histogram, fused variants) created with with_args at import time. Import has no other side effects.
 """Implements modules  used to perform fake quantization."""
 
 import re
@@ -48,6 +53,7 @@ __all__ = [
 
 
 def _is_per_channel(qscheme: "torch.qscheme") -> bool:
+    # [FUNCTION DOC] HELPER: True if the qscheme is one of the per-channel schemes (symmetric, affine, affine with float qparams).
     return qscheme in [
         torch.per_channel_symmetric,
         torch.per_channel_affine,
@@ -56,18 +62,24 @@ def _is_per_channel(qscheme: "torch.qscheme") -> bool:
 
 
 def _is_per_tensor(qscheme: "torch.qscheme") -> bool:
+    # [FUNCTION DOC] HELPER: True if the qscheme is per-tensor symmetric or per-tensor affine.
     return qscheme in [torch.per_tensor_symmetric, torch.per_tensor_affine]
 
 
 def _is_symmetric_quant(qscheme: "torch.qscheme") -> bool:
+    # [FUNCTION DOC] HELPER: True if the qscheme is symmetric (per-tensor or per-channel).
     return qscheme in [torch.per_tensor_symmetric, torch.per_channel_symmetric]
 
 
 def _is_float_qparams(qscheme: "torch.qscheme") -> bool:
+    # [FUNCTION DOC] HELPER: True only for the per-channel affine scheme with float qparams.
     return qscheme == torch.per_channel_affine_float_qparams
 
 
 class FakeQuantizeBase(ABC, Module):
+    # [CLASS DOC] Abstract base for fake quantize modules (an ABC and a torch Module). Holds two uint8 one-element buffers,
+    # fake_quant_enabled and observer_enabled (buffers so DDP replicates them). Subclasses implement forward and calculate_qparams.
+    # Provides enable/disable helpers and a with_args class method that builds a partial constructor.
     r"""Base fake quantize module.
 
     Base fake quantize module
@@ -84,6 +96,7 @@ class FakeQuantizeBase(ABC, Module):
     observer_enabled: torch.Tensor
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Initialise the Module and register the buffers fake_quant_enabled and observer_enabled, both set to 1 (uint8 because NCCL lacks bool support).
         """Set fake_quant_enabled and observer_enabled."""
         super().__init__()
         # fake_quant_enabled and observer_enabled are buffers to support their
@@ -94,30 +107,38 @@ class FakeQuantizeBase(ABC, Module):
 
     @abstractmethod
     def forward(self, x):
+        # [FUNCTION DOC] Abstract forward; subclasses must implement. The base body does nothing.
         pass
 
     @abstractmethod
     def calculate_qparams(self, **kwargs):
+        # [FUNCTION DOC] Abstract method returning quantization parameters (scale, zero point); subclasses must implement. Base body does nothing.
         pass
 
     @torch.jit.export
     def enable_fake_quant(self, enabled: bool = True) -> None:
+        # [FUNCTION DOC] Set the fake quant flag buffer to 1 or 0 according to the enabled argument (default True). Mutates the buffer in place.
         self.fake_quant_enabled[0] = 1 if enabled else 0
 
     @torch.jit.export
     def disable_fake_quant(self):
+        # [FUNCTION DOC] Turn fake quantization off by calling enable_fake_quant with False.
         self.enable_fake_quant(False)
 
     @torch.jit.export
     def enable_observer(self, enabled: bool = True) -> None:
+        # [FUNCTION DOC] Set the observer flag buffer to 1 or 0 according to the enabled argument (default True). Mutates the buffer in place.
         self.observer_enabled[0] = 1 if enabled else 0
 
     @torch.jit.export
     def disable_observer(self):
+        # [FUNCTION DOC] Turn observation off by calling enable_observer with False.
         self.enable_observer(False)
 
     @classmethod
     def with_args(cls, **kwargs):
+        # [FUNCTION DOC] Class method returning a constructor factory with the given keyword arguments pre-bound (via _with_args).
+        # The returned factory's __module__ is set to torch.ao.quantization.fake_quantize for public/private API checks.
         fake_quant_constructor = _with_args(cls, **kwargs)
         # need to assign the correct module to fake_quantize
         # constructors to satisfy public v private requirements
@@ -126,6 +147,10 @@ class FakeQuantizeBase(ABC, Module):
 
 
 class FakeQuantize(FakeQuantizeBase):
+    # [CLASS DOC] Simulates quantize followed by dequantize at training time using an observer (activation_post_process) to compute scale
+    # and zero_point. State: buffers scale (shape 1, float) and zero_point (int, or float for float-qparams schemes), plus quant_min,
+    # quant_max, is_dynamic, dtype, qscheme, ch_axis (-1 if the observer has none) and is_per_channel copied from the observer.
+    # Observer and fake quant are independently switchable. Only per-tensor and per-channel schemes are supported.
     r"""Simulate the quantize and dequantize operations in training time.
 
     The output of this module is given by::
@@ -172,6 +197,9 @@ class FakeQuantize(FakeQuantizeBase):
         is_dynamic=False,
         **observer_kwargs,
     ):
+        # [FUNCTION DOC] Build the observer from the observer class (or partial) plus is_dynamic and optional quant_min/quant_max, then register scale and zero_point buffers.
+        # Raises AssertionError if quant_min exceeds quant_max, if either bound lies outside the integer range of the dtype
+        # (dtype from observer kwargs, or from a partially applied observer, default quint8), or if the qscheme is neither per-channel nor per-tensor.
         super().__init__()
         # Populate quant_min/quant_max to observer_kwargs if valid
         if quant_min is not None and quant_max is not None:
@@ -223,9 +251,13 @@ class FakeQuantize(FakeQuantizeBase):
 
     @torch.jit.export
     def calculate_qparams(self):  # type: ignore[override]
+        # [FUNCTION DOC] Return the (scale, zero_point) computed by the observer from its statistics.
         return self.activation_post_process.calculate_qparams()
 
     def forward(self, X):
+        # [FUNCTION DOC] Fake quantize X. If the observer is enabled: observe a detached X, compute qparams, move them to the buffers' devices,
+        # resize the scale/zero_point buffers if the shape changed, and copy the values in (mutating buffers). If fake quant is enabled:
+        # apply the per-channel or per-tensor fake quantize op using the observer's quant range. Returns the result (X unchanged if disabled).
         if self.observer_enabled[0] == 1:
             self.activation_post_process(X.detach())
             _scale, _zero_point = self.calculate_qparams()
@@ -261,6 +293,7 @@ class FakeQuantize(FakeQuantizeBase):
 
     @torch.jit.export
     def extra_repr(self):
+        # [FUNCTION DOC] Return a string describing the enabled flags, quant range, dtype, qscheme, ch_axis, scale and zero_point.
         return (
             f"fake_quant_enabled={self.fake_quant_enabled}, observer_enabled={self.observer_enabled}, "
             f"quant_min={self.activation_post_process.quant_min}, quant_max={self.activation_post_process.quant_max}, "
@@ -269,6 +302,7 @@ class FakeQuantize(FakeQuantizeBase):
         )
 
     def _save_to_state_dict(self, destination, prefix, keep_vars):
+        # [FUNCTION DOC] HELPER: Serialize like the parent and additionally store scale and zero_point explicitly under the prefixed keys (scalar-like values are not registered as plain buffers here).
         # We cannot currently register scalar values as buffers, so need to manually
         # specify serialization here.
         super()._save_to_state_dict(destination, prefix, keep_vars)
@@ -276,6 +310,9 @@ class FakeQuantize(FakeQuantizeBase):
         destination[prefix + "zero_point"] = self.zero_point
 
     def _load_from_state_dict(
+        # [FUNCTION DOC] HELPER: Load state, first resizing the scale and zero_point buffers to the saved shapes (they may start empty/different)
+        # so the parent loader can copy values. A missing key is added to missing_keys when strict. Under TorchScript the values are also copied directly.
+        # Raises AssertionError if the key name handling sees an unexpected name. Mutates buffers.
         self,
         state_dict,
         prefix,
@@ -329,6 +366,8 @@ class FakeQuantize(FakeQuantizeBase):
 
 
 class FixedQParamsFakeQuantize(FakeQuantize):
+    # [CLASS DOC] Fake quantize with fixed (non-learned) scale and zero_point taken from a FixedQParamsObserver. Only per-tensor schemes are allowed.
+    # Keeps the observer constructor in _observer_ctr; qparams never change after construction.
     """Simulate quantize and dequantize in training time.
 
     Simulate quantize and dequantize with fixed quantization
@@ -338,6 +377,8 @@ class FixedQParamsFakeQuantize(FakeQuantize):
 
     # TODO: rename observer to observer_ctr
     def __init__(self, observer):
+        # [FUNCTION DOC] Initialise via FakeQuantize with the given observer. Raises AssertionError if the built observer is not exactly a FixedQParamsObserver
+        # or if the qscheme is not per-tensor. Saves the observer constructor and takes scale and zero_point from the observer.
         super().__init__(observer=observer)
         if type(self.activation_post_process) is not FixedQParamsObserver:
             raise AssertionError(
@@ -355,10 +396,12 @@ class FixedQParamsFakeQuantize(FakeQuantize):
 
     @torch.jit.export
     def calculate_qparams(self):  # type: ignore[override]
+        # [FUNCTION DOC] Return the fixed (scale, zero_point) stored on this module.
         return self.scale, self.zero_point
 
     @torch.jit.export
     def extra_repr(self):
+        # [FUNCTION DOC] Return a string describing flags, scale, zero_point, dtype, quant range and qscheme.
         """Define a string representation of the object's attributes."""
         return (
             f"fake_quant_enabled={self.fake_quant_enabled}, observer_enabled={self.observer_enabled}, "
@@ -369,6 +412,8 @@ class FixedQParamsFakeQuantize(FakeQuantize):
 
 
 class FusedMovingAvgObsFakeQuantize(FakeQuantize):
+    # [CLASS DOC] FakeQuantize variant that observes (moving average min/max), computes qparams and fake quantizes in one fused op.
+    # Requires a MovingAverageMinMaxObserver or per-channel version. Flag buffers are long dtype. Stores is_symmetric_quant.
     r"""Define a fused module to observe the tensor.
 
     Fused module that is used to observe the input tensor (compute min/max), compute
@@ -393,6 +438,9 @@ class FusedMovingAvgObsFakeQuantize(FakeQuantize):
         quant_max: int = 255,
         **observer_kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC] Initialise via FakeQuantize (default quant range 0 to 255). Raises AssertionError if the observer is not a moving average min/max
+        # observer (per-tensor or per-channel). Re-registers fake_quant_enabled and observer_enabled as long buffers set to 1
+        # and records whether the qscheme is symmetric.
         super().__init__(observer, quant_min, quant_max, **observer_kwargs)
         if not isinstance(
             self.activation_post_process,
@@ -409,10 +457,12 @@ class FusedMovingAvgObsFakeQuantize(FakeQuantize):
 
     @torch.jit.export
     def calculate_qparams(self) -> tuple[torch.Tensor, torch.Tensor]:  # type: ignore[override]
+        # [FUNCTION DOC] Return (scale, zero_point) computed by the observer.
         return self.activation_post_process.calculate_qparams()
 
     @torch.jit.export
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] Return a string describing flags, scale, zero_point, dtype, quant range, qscheme and observer reduce_range.
         return (
             f"fake_quant_enabled={self.fake_quant_enabled}, observer_enabled={self.observer_enabled}, "
             f"scale={self.scale}, zero_point={self.zero_point}, dtype={self.dtype}, "
@@ -421,6 +471,8 @@ class FusedMovingAvgObsFakeQuantize(FakeQuantize):
         )
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] Call the fused moving-average observer + fake quant kernel with the flags, the observer's min/max buffers, scale, zero_point,
+        # averaging constant, quant range, channel axis and per-channel/symmetric options. Returns the fake quantized tensor and updates observer state in place inside the kernel.
         return torch.fused_moving_avg_obs_fake_quant(
             X,
             self.observer_enabled,
@@ -598,6 +650,7 @@ Fused version of `default_per_channel_weight_fake_quant`, with the 8-bit values 
 
 
 def _is_fake_quant_script_module(mod):
+    # [FUNCTION DOC] HELPER: True if mod is a TorchScript RecursiveScriptModule whose qualified name (with mangling suffix removed) is FakeQuantize or FusedMovingAvgObsFakeQuantize; False otherwise.
     """Return true if given mod is an instance of FakeQuantize script module."""
     if isinstance(mod, torch.jit.RecursiveScriptModule):
         # qualified name looks like '__torch__.torch.ao.quantization.fake_quantize.___torch_mangle_2.FakeQuantize'
@@ -612,6 +665,7 @@ def _is_fake_quant_script_module(mod):
 
 
 def disable_fake_quant(mod):
+    # [FUNCTION DOC] Disable fake quantization if mod is a FakeQuantizeBase or scripted fake quant module; otherwise do nothing. Intended for Module.apply.
     """Disable fake quantization for the module.
 
     Disable fake quantization for this module, if applicable. Example usage::
@@ -625,6 +679,7 @@ def disable_fake_quant(mod):
 
 
 def enable_fake_quant(mod):
+    # [FUNCTION DOC] Enable fake quantization if mod is a FakeQuantizeBase or scripted fake quant module; otherwise do nothing. Intended for Module.apply.
     """Enable fake quantization for the module.
 
     Enable fake quantization for this module, if applicable. Example usage::
@@ -638,6 +693,7 @@ def enable_fake_quant(mod):
 
 
 def disable_observer(mod):
+    # [FUNCTION DOC] Disable observation if mod is a FakeQuantizeBase or scripted fake quant module; otherwise do nothing. Intended for Module.apply.
     """Disable observation for this module.
 
     Disable observation for this module, if applicable. Example usage::
@@ -651,6 +707,7 @@ def disable_observer(mod):
 
 
 def enable_observer(mod):
+    # [FUNCTION DOC] Enable observation if mod is a FakeQuantizeBase or scripted fake quant module; otherwise do nothing. Intended for Module.apply.
     """Enable observation for this module.
 
     Enable observation for this module, if applicable. Example usage::

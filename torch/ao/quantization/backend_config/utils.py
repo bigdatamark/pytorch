@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Utility functions that derive lookup tables from a BackendConfig (pattern to dtype configs, QAT/fused
+# module classes, input type to index, reference module mapping, fuser methods, root node / extra input getters)
+# and helpers to render backend config entries in human readable form. Also converts user-facing forward-order
+# patterns and fuser methods to the internal reversed nested tuple format. No import-time side effects.
 from collections.abc import Callable
 from typing import Any
 
@@ -30,6 +34,7 @@ __all__ = [
 def get_pattern_to_dtype_configs(
     backend_config: BackendConfig,
 ) -> dict[Pattern, list[DTypeConfig]]:
+    # [FUNCTION DOC] Return a mapping from each pattern (internal complex format) in the backend config to its list of DTypeConfig objects.
     pattern_to_dtype_configs: dict[Pattern, list[DTypeConfig]] = {}
     for pattern, config in backend_config._pattern_complex_format_to_config.items():
         pattern_to_dtype_configs[pattern] = config.dtype_configs
@@ -37,6 +42,7 @@ def get_pattern_to_dtype_configs(
 
 
 def get_qat_module_classes(backend_config: BackendConfig) -> tuple[type, ...]:
+    # [FUNCTION DOC] Return a tuple of the distinct non-None qat_module classes found across the backend config's pattern configs (unordered, deduplicated).
     qat_module_classes = [
         config.qat_module
         for config in backend_config.configs
@@ -46,6 +52,7 @@ def get_qat_module_classes(backend_config: BackendConfig) -> tuple[type, ...]:
 
 
 def get_fused_module_classes(backend_config: BackendConfig) -> tuple[type, ...]:
+    # [FUNCTION DOC] Return a tuple of the distinct non-None fused_module classes found across the backend config's pattern configs (unordered, deduplicated).
     fused_module_classes = [
         config.fused_module
         for config in backend_config.configs
@@ -57,6 +64,7 @@ def get_fused_module_classes(backend_config: BackendConfig) -> tuple[type, ...]:
 def get_pattern_to_input_type_to_index(
     backend_config: BackendConfig,
 ) -> dict[Pattern, dict[str, int]]:
+    # [FUNCTION DOC] Return a mapping from each pattern (internal complex format) to its mapping of input type name to argument index.
     pattern_to_input_type_to_index: dict[Pattern, dict[str, int]] = {}
     for pattern, config in backend_config._pattern_complex_format_to_config.items():
         pattern_to_input_type_to_index[pattern] = config._input_type_to_index
@@ -66,6 +74,7 @@ def get_pattern_to_input_type_to_index(
 def get_root_module_to_quantized_reference_module(
     backend_config: BackendConfig,
 ) -> dict[type[torch.nn.Module], type[torch.nn.Module]]:
+    # [FUNCTION DOC] Return a mapping from root module class to its reference quantized module class, including only configs that define both.
     mapping: dict[type[torch.nn.Module], type[torch.nn.Module]] = {}
     for config in backend_config.configs:
         if (
@@ -79,6 +88,8 @@ def get_root_module_to_quantized_reference_module(
 def get_fuser_method_mapping(
     backend_config: BackendConfig,
 ) -> dict[Pattern, nn.Sequential | Callable]:
+    # [FUNCTION DOC] Return a mapping from pattern to fuser method for every config with a fuser method.
+    # Both pattern and fuser method are converted from forward order to the internal reversed nested tuple format.
     fuser_method_mapping: dict[Pattern, nn.Sequential | Callable] = {}
     for pattern, config in backend_config._pattern_complex_format_to_config.items():
         if config.fuser_method is not None:
@@ -93,6 +104,7 @@ def get_fuser_method_mapping(
 def get_module_to_qat_module(
     backend_config: BackendConfig,
 ) -> dict[Pattern, type[torch.nn.Module]]:
+    # [FUNCTION DOC] Return a mapping from pattern (internal complex format) to the QAT module class, for configs that define one.
     module_to_qat_module: dict[Pattern, type[torch.nn.Module]] = {}
     for pattern, config in backend_config._pattern_complex_format_to_config.items():
         if config.qat_module is not None:
@@ -103,6 +115,7 @@ def get_module_to_qat_module(
 def get_fusion_pattern_to_root_node_getter(
     backend_config: BackendConfig,
 ) -> dict[Pattern, Callable]:
+    # [FUNCTION DOC] Return a mapping from pattern (internal complex format) to its root node getter function, skipping configs without one.
     """Get a map from fusion pattern to a function that returns the root node
     from the fusion pattern, e.g. the most common one is::
 
@@ -124,6 +137,7 @@ def get_fusion_pattern_to_root_node_getter(
 def get_fusion_pattern_to_extra_inputs_getter(
     backend_config: BackendConfig,
 ) -> dict[Pattern, Callable]:
+    # [FUNCTION DOC] Return a mapping from pattern (internal complex format) to its extra inputs getter function, skipping configs without one.
     """Get a map from fusion pattern to a function that returns extra input nodes
     from the fusion pattern, in the order required by the root node. This is optional,
     if not specified, we will not copy over any extra inputs for the root node.
@@ -147,6 +161,9 @@ def get_fusion_pattern_to_extra_inputs_getter(
 
 
 def remove_boolean_dispatch_from_name(p) -> Any:
+    # [FUNCTION DOC] Replace functions whose repr comes from boolean dispatch (the fractional/max/adaptive max pool functionals in torch.nn.functional)
+    # with their hardcoded fully qualified name strings; any other input is returned unchanged.
+    # Raises AssertionError if the input is not one of those but its string form still mentions boolean dispatch.
     """
     Some ops have a default string representation such as
     '<function boolean_dispatch.<locals>.fn at 0x7ff1106bf280>',
@@ -177,6 +194,8 @@ def remove_boolean_dispatch_from_name(p) -> Any:
 
 
 def pattern_to_human_readable(p) -> Any:
+    # [FUNCTION DOC] Convert a pattern into a human readable form: tuples are processed recursively, strings are returned as is,
+    # and other items go through remove_boolean_dispatch_from_name. Returns the converted pattern; no mutation.
     if isinstance(p, tuple):
         # nested patterns, recurse
         return tuple(pattern_to_human_readable(inner_p) for inner_p in p)
@@ -191,6 +210,8 @@ def pattern_to_human_readable(p) -> Any:
 # TODO(future PR): move backend_config_dict to use dataclass and move this logic to
 # the corresponding __str__ function
 def entry_to_pretty_str(entry) -> str:
+    # [FUNCTION DOC] Render a backend config dictionary entry as a multi-line string. The pattern is printed first (human readable),
+    # then dtype_configs and num_tensor_args_to_observation_type with custom nested formatting, then all remaining fields in order.
     """
     Given a backend_config_dict entry, returns a string with the human readable
     representation of it.
@@ -238,6 +259,9 @@ def entry_to_pretty_str(entry) -> str:
 def _get_pattern_in_reversed_nested_tuple_format(
     config: BackendPatternConfig,
 ) -> Pattern:
+    # [FUNCTION DOC] HELPER: Return the config's pattern in the internal reversed nested tuple format.
+    # Uses the explicit complex-format pattern if set; otherwise raises ValueError if no pattern is given;
+    # non-tuple patterns are returned as is; 2-tuples are reversed and 3-tuples become (c, (b, a)); other lengths raise ValueError.
     """
     Return the pattern specified in the given config in the reversed nested tuple format
     used internally in the quantization pattern matching code.
@@ -292,6 +316,9 @@ def _get_pattern_in_reversed_nested_tuple_format(
 def _get_fuser_method_in_reversed_nested_tuple_format(
     config: BackendPatternConfig,
 ) -> Callable:
+    # [FUNCTION DOC] HELPER: Return the config's fuser method adapted to the reversed nested tuple pattern format.
+    # Raises AssertionError if no fuser method is set. If the complex-format pattern is set the method is returned unchanged;
+    # raises ValueError if the pattern is not a tuple or not of length 2 or 3; otherwise wraps it with _reverse2 or _reverse3.
     """
     Return the fuser method specified in the given config in the reversed nested
     tuple format used internally in the quantization pattern matching code.
