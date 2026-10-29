@@ -1,3 +1,5 @@
+# [PACKAGE DOC] Exports dynamically quantized modules: Linear, LSTM, GRU, LSTMCell, RNNCell, GRUCell,
+# and Conv/ConvTranspose 1d/2d/3d. Weights are quantized ahead of time; activations are quantized at run time.
 from .conv import (
     Conv1d,
     Conv2d,

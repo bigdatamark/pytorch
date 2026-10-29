@@ -1,3 +1,7 @@
+# [MODULE DOC] Quantizable (observable) LSTM modules. Re-implements LSTMCell and LSTM from basic
+# building blocks (Linear layers, FloatFunctional add/mul, activations) so that observers can be
+# attached to every intermediate tensor. Exports LSTMCell and LSTM; private _LSTMSingleLayer and
+# _LSTMLayer handle sequences and directions. Conversion is float -> observed only (via from_float).
 """
 We will recreate all the RNN modules as we require the modules to be decomposed
 into its building blocks to be able to observe.
@@ -16,6 +20,11 @@ __all__ = ["LSTMCell", "LSTM"]
 
 
 class LSTMCell(torch.nn.Module):
+    # [CLASS DOC] Quantizable LSTM cell built from input/hidden Linear gate projections, FloatFunctional
+    # add/mul ops and sigmoid/tanh activations. State: input_size, hidden_size, bias, split_gates,
+    # igates/hgates/gates (single fused module, or a mapping per gate input/forget/cell/output when
+    # split_gates is true), activation modules, functionals for cell math, and initial hidden/cell
+    # qparams and dtypes used when creating quantized zero state. Built via from_params or from_float.
     r"""A quantizable long short-term memory (LSTM) cell.
 
     For the description and the argument types, please, refer to :class:`~torch.nn.LSTMCell`
@@ -51,6 +60,11 @@ class LSTMCell(torch.nn.Module):
         *,
         split_gates=False,
     ) -> None:
+        # [FUNCTION DOC] Creates the gate projections: with split_gates false, one Linear of width 4*hidden for
+        # inputs and one for hidden state plus one FloatFunctional; otherwise four separate Linear layers
+        # and functionals per gate in mappings keyed input, forget, cell, output. Also creates the gate
+        # activations, the functionals for the cell/hidden update, and default initial state qparams
+        # (scale 1.0, zero point 0) and quint8 state dtypes.
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.input_size = input_dim
@@ -102,6 +116,11 @@ class LSTMCell(torch.nn.Module):
     def forward(
         self, x: Tensor, hidden: tuple[Tensor, Tensor] | None = None
     ) -> tuple[Tensor, Tensor]:
+        # [FUNCTION DOC] One time step. Takes input x and optional (hidden, cell) tuple; if missing or containing
+        # None, zero state is created via initialize_hidden. Computes the four gates (fused then chunked,
+        # or per-gate when split), applies activations, then new cell = forget*cell + input*cellgate and
+        # new hidden = output * tanh(new cell). Returns (hy, cy).
+        # # TODO in code: the final tanh is a plain function so its qparams cannot be configured.
         if hidden is None or hidden[0] is None or hidden[1] is None:
             hidden = self.initialize_hidden(x.shape[0], x.is_quantized)
         hx, cx = hidden
@@ -145,6 +164,8 @@ class LSTMCell(torch.nn.Module):
     def initialize_hidden(
         self, batch_size: int, is_quantized: bool = False
     ) -> tuple[Tensor, Tensor]:
+        # [FUNCTION DOC] Returns zero (hidden, cell) tensors of shape batch_size by hidden_size. When is_quantized is
+        # true, quantizes them per tensor using the stored initial qparams and state dtypes.
         h, c = (
             torch.zeros((batch_size, self.hidden_size)),
             torch.zeros((batch_size, self.hidden_size)),
@@ -161,10 +182,15 @@ class LSTMCell(torch.nn.Module):
         return h, c
 
     def _get_name(self):
+        # [FUNCTION DOC] HELPER: Returns the display name QuantizableLSTMCell.
         return "QuantizableLSTMCell"
 
     @classmethod
     def from_params(cls, wi, wh, bi=None, bh=None, split_gates=False):
+        # [FUNCTION DOC] Class method: builds a cell from weights wi, wh and optional biases bi, bh (both or neither;
+        # otherwise raises an assertion error). Sizes are read from the weight shapes. Wraps weights as
+        # Parameters on the gate Linear layers; with split_gates the weight/bias tensors are chunked into
+        # four along dim 0 and assigned to the per-gate layers. Returns the new cell.
         """Uses the weights and biases to create a new LSTM cell.
 
         Args:
@@ -203,6 +229,9 @@ class LSTMCell(torch.nn.Module):
 
     @classmethod
     def from_float(cls, other, use_precomputed_fake_quant=False, split_gates=False):
+        # [FUNCTION DOC] Class method: converts a float torch LSTMCell (must be exactly that type and carry a qconfig,
+        # else assertion error) into an observed cell using its weights and biases, and copies the qconfig
+        # onto the cell and its gate Linear layers. use_precomputed_fake_quant is unused.
         if type(other) is not cls._FLOAT_MODULE:
             raise AssertionError(
                 f"Expected module type {cls._FLOAT_MODULE}, got {type(other)}"
@@ -229,6 +258,8 @@ class LSTMCell(torch.nn.Module):
 
 
 class _LSTMSingleLayer(torch.nn.Module):
+    # [CLASS DOC] HELPER: One-directional LSTM layer: wraps a single LSTMCell and applies it over the time
+    # dimension (first dim) of the input.
     r"""A single one-directional LSTM layer.
 
     The difference between a layer and a cell is that the layer can process a
@@ -245,6 +276,7 @@ class _LSTMSingleLayer(torch.nn.Module):
         *,
         split_gates=False,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Creates the wrapped LSTMCell with the given sizes, bias and split_gates.
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.cell = LSTMCell(
@@ -252,6 +284,8 @@ class _LSTMSingleLayer(torch.nn.Module):
         )
 
     def forward(self, x: Tensor, hidden: tuple[Tensor, Tensor] | None = None):
+        # [FUNCTION DOC] HELPER: Iterates over the time steps of x (time-major), feeding the cell its previous state.
+        # Returns the stacked hidden outputs and the final (hidden, cell) state.
         result = []
         seq_len = x.shape[0]
         for i in range(seq_len):
@@ -262,6 +296,8 @@ class _LSTMSingleLayer(torch.nn.Module):
 
     @classmethod
     def from_params(cls, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Class method: builds an LSTMCell from the given params, creates a layer of matching
+        # sizes and replaces its cell with that cell.
         cell = LSTMCell.from_params(*args, **kwargs)
         layer = cls(
             cell.input_size, cell.hidden_size, cell.bias, split_gates=cell.split_gates
@@ -271,6 +307,8 @@ class _LSTMSingleLayer(torch.nn.Module):
 
 
 class _LSTMLayer(torch.nn.Module):
+    # [CLASS DOC] HELPER: One (optionally bidirectional) LSTM layer made of a forward _LSTMSingleLayer and, when
+    # bidirectional, a backward one. Holds batch_first and bidirectional flags.
     r"""A single bi-directional LSTM layer."""
 
     def __init__(
@@ -285,6 +323,7 @@ class _LSTMLayer(torch.nn.Module):
         *,
         split_gates=False,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Stores flags and creates the forward single layer, plus a backward one if bidirectional.
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.batch_first = batch_first
@@ -302,6 +341,11 @@ class _LSTMLayer(torch.nn.Module):
             )
 
     def forward(self, x: Tensor, hidden: tuple[Tensor, Tensor] | None = None):
+        # [FUNCTION DOC] HELPER: Runs the layer over x (transposed first if batch_first). Splits the optional
+        # (hidden, cell) state into forward/backward parts when bidirectional (index 0 forward, 1 backward).
+        # The backward pass runs on the time-reversed input and its output is flipped back, then outputs
+        # are concatenated on the feature dim; final states are stacked along a new first dim. Returns
+        # (output, (h, c)); output is transposed back in place when batch_first.
         if self.batch_first:
             x = x.transpose(0, 1)
         if hidden is None:
@@ -358,6 +402,10 @@ class _LSTMLayer(torch.nn.Module):
 
     @classmethod
     def from_float(cls, other, layer_idx=0, qconfig=None, **kwargs):
+        # [FUNCTION DOC] HELPER: Class method: builds a layer for index layer_idx from a float LSTM (or similar), reading
+        # sizes from kwargs or the module. Requires a qconfig on other or the qconfig argument (assertion
+        # error otherwise). Copies the per-layer weights/biases (and reverse ones if bidirectional) into
+        # single layers and sets the layer qconfig. There is no float equivalent of this class.
         r"""
         There is no FP equivalent of this class. This function is here just to
         mimic the behavior of the `prepare` within the `torch.ao.quantization`
@@ -409,6 +457,10 @@ class _LSTMLayer(torch.nn.Module):
 
 
 class LSTM(torch.nn.Module):
+    # [CLASS DOC] Quantizable multi-layer LSTM. State: sizes, num_layers, bias, batch_first, dropout (stored
+    # but ignored), bidirectional, and layers, a list of _LSTMLayer modules (internally always time-major).
+    # Created with training False (eval mode). Converted from a float torch LSTM by from_float, which
+    # runs observer preparation; weights are accessed per layer.
     r"""A quantizable long short-term memory (LSTM).
 
     For the description and the argument types, please, refer to :class:`~torch.nn.LSTM`
@@ -452,6 +504,9 @@ class LSTM(torch.nn.Module):
         *,
         split_gates: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Stores the configuration and creates num_layers _LSTMLayer modules (first takes input_size,
+        # the rest hidden_size). Sets training to False. Raises ValueError if dropout is not a non-bool
+        # number in [0, 1]. Warns that dropout is ignored when positive, and when num_layers is 1.
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.input_size = input_size
@@ -516,6 +571,10 @@ class LSTM(torch.nn.Module):
         self.layers = torch.nn.ModuleList(layers)
 
     def forward(self, x: Tensor, hidden: tuple[Tensor, Tensor] | None = None):
+        # [FUNCTION DOC] Runs all layers in sequence on x (shape time, batch, features; transposed if batch_first).
+        # Without hidden state, uses zeros (quantized if the input is quantized); a tensor pair state is
+        # reshaped into per-layer, per-direction pieces, otherwise a per-layer sequence is used as is.
+        # Returns (output, (h_n, c_n)) with layer and direction dims collapsed into the first dim.
         if self.batch_first:
             x = x.transpose(0, 1)
 
@@ -571,10 +630,16 @@ class LSTM(torch.nn.Module):
         return x, (hx_tensor, cx_tensor)
 
     def _get_name(self):
+        # [FUNCTION DOC] HELPER: Returns the display name QuantizableLSTM.
         return "QuantizableLSTM"
 
     @classmethod
     def from_float(cls, other, qconfig=None, split_gates=False):
+        # [FUNCTION DOC] Class method: converts a float torch LSTM into an observed quantizable LSTM with the same
+        # configuration, copying layer weights through _LSTMLayer.from_float. Requires a qconfig on other
+        # or passed in (assertion error otherwise) and correct type. Then prepares the module with QAT
+        # preparation if the float module is training, else eval-mode observer preparation, in place.
+        # Returns the prepared module.
         if not isinstance(other, cls._FLOAT_MODULE):
             raise AssertionError(
                 f"Expected module type {cls._FLOAT_MODULE}, got {type(other)}"
@@ -609,6 +674,8 @@ class LSTM(torch.nn.Module):
 
     @classmethod
     def from_observed(cls, other):
+        # [FUNCTION DOC] Always raises NotImplementedError: this class only supports float to observed conversion,
+        # so converting an observed module to quantized here is not supported.
         # The whole flow is float -> observed -> quantized
         # This class does float -> observed only
         raise NotImplementedError(

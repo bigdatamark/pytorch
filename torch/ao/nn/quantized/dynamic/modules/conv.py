@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Dynamically quantized convolution modules (Conv1d/2d/3d and ConvTranspose1d/2d/3d). Each
+# subclasses its static quantized counterpart, keeps packed quantized weights, and quantizes float
+# inputs at run time via the *_dynamic quantized ops. Constructors warn about poor numerical accuracy.
 r"""Dynamically quantized convolution modules."""
 
 import warnings
@@ -26,6 +29,8 @@ __all__ = [
 
 
 class Conv1d(nnq.Conv1d):
+    # [CLASS DOC] Dynamically quantized 1d convolution with float inputs and outputs; weights are
+    # packed/quantized and activations are quantized per call. Extends the static quantized Conv1d.
     r"""A dynamically quantized conv module with floating point tensors as inputs and outputs.
 
     For details on input arguments, parameters, and implementation see
@@ -67,6 +72,10 @@ class Conv1d(nnq.Conv1d):
         dtype=None,
         reduce_range=True,
     ):
+        # [FUNCTION DOC] Emits a warning that numerical accuracy is poor and use is not recommended, expands
+        # kernel_size, stride, padding, dilation to single-element tuples, then calls the parent constructor with
+        # device/dtype factory kwargs.
+        # String padding is kept as is. The reduce_range argument is accepted but ignored here.
         warnings.warn(
             f"The current implementation of the {self._get_name()} module has poor numerical accuracy and its use is not recommended",
             stacklevel=2,
@@ -92,9 +101,13 @@ class Conv1d(nnq.Conv1d):
         )
 
     def _get_name(self):
+        # [FUNCTION DOC] HELPER: Returns the display name DynamicQuantizedConv1d.
         return "DynamicQuantizedConv1d"
 
     def forward(self, input: Tensor, reduce_range: bool = True) -> Tensor:
+        # [FUNCTION DOC] Applies the conv1d_dynamic quantized op to a float input of shape (N, C, L) and returns
+        # the float output; reduce_range controls the activation quantization range. If padding_mode is not zeros, pads the input explicitly first.
+        # Raises ValueError if the input rank is wrong.
         # Temporarily using len(shape) instead of ndim due to JIT issue
         # https://github.com/pytorch/pytorch/issues/23890
         if len(input.shape) != 3:
@@ -109,6 +122,8 @@ class Conv1d(nnq.Conv1d):
 
 
 class Conv2d(nnq.Conv2d):
+    # [CLASS DOC] Dynamically quantized 2d convolution with float inputs and outputs; weights are
+    # packed/quantized and activations are quantized per call. Extends the static quantized Conv2d.
     r"""A dynamically quantized conv module with floating point tensors as inputs and outputs.
 
     For details on input arguments, parameters, and implementation see
@@ -154,6 +169,9 @@ class Conv2d(nnq.Conv2d):
         device=None,
         dtype=None,
     ):
+        # [FUNCTION DOC] Emits a warning that numerical accuracy is poor and use is not recommended, expands
+        # kernel_size, stride, padding, dilation to pair tuples, then calls the parent constructor with
+        # device/dtype factory kwargs.
         warnings.warn(
             f"The current implementation of the {self._get_name()} module "
             "has poor numerical accuracy and its use is not recommended",
@@ -179,9 +197,13 @@ class Conv2d(nnq.Conv2d):
         )
 
     def _get_name(self):
+        # [FUNCTION DOC] HELPER: Returns the display name DynamicQuantizedConv2d.
         return "DynamicQuantizedConv2d"
 
     def forward(self, input: Tensor, reduce_range: bool = True) -> Tensor:
+        # [FUNCTION DOC] Applies the conv2d_dynamic quantized op to a float input of shape (N, C, H, W) and returns
+        # the float output; reduce_range controls the activation quantization range. If padding_mode is not zeros, pads the input explicitly first.
+        # Raises ValueError if the input rank is wrong.
         # Temporarily using len(shape) instead of ndim due to JIT issue
         # https://github.com/pytorch/pytorch/issues/23890
         if len(input.shape) != 4:
@@ -195,6 +217,8 @@ class Conv2d(nnq.Conv2d):
 
 
 class Conv3d(nnq.Conv3d):
+    # [CLASS DOC] Dynamically quantized 3d convolution with float inputs and outputs; weights are
+    # packed/quantized and activations are quantized per call. Extends the static quantized Conv3d.
     r"""A dynamically quantized conv module with floating point tensors as inputs and outputs.
 
     For details on input arguments, parameters, and implementation see
@@ -240,6 +264,9 @@ class Conv3d(nnq.Conv3d):
         device=None,
         dtype=None,
     ):
+        # [FUNCTION DOC] Emits a warning that numerical accuracy is poor and use is not recommended, expands
+        # kernel_size, stride, padding, dilation to triple tuples, then calls the parent constructor with
+        # device/dtype factory kwargs.
         warnings.warn(
             f"The current implementation of the {self._get_name()} module has poor numerical accuracy and its use is not recommended",
             stacklevel=2,
@@ -267,9 +294,13 @@ class Conv3d(nnq.Conv3d):
         )
 
     def _get_name(self):
+        # [FUNCTION DOC] HELPER: Returns the display name DynamicQuantizedConv3d.
         return "DynamicQuantizedConv3d"
 
     def forward(self, input: Tensor, reduce_range: bool = True) -> Tensor:
+        # [FUNCTION DOC] Applies the conv3d_dynamic quantized op to a float input of shape (N, C, D, H, W) and returns
+        # the float output; reduce_range controls the activation quantization range. If padding_mode is not zeros, pads the input explicitly first.
+        # Raises ValueError if the input rank is wrong.
         # Temporarily using len(shape) instead of ndim due to JIT issue
         # https://github.com/pytorch/pytorch/issues/23890
         if len(input.shape) != 5:
@@ -283,6 +314,8 @@ class Conv3d(nnq.Conv3d):
 
 
 class ConvTranspose1d(nnq.ConvTranspose1d):
+    # [CLASS DOC] Dynamically quantized transposed 1d convolution with float inputs and outputs; weights are
+    # packed/quantized and activations are quantized per call. Extends the static quantized ConvTranspose1d.
     r"""A dynamically quantized transposed convolution module with floating point tensors as inputs and outputs.
 
     For details on input arguments, parameters, and implementation see
@@ -333,6 +366,8 @@ class ConvTranspose1d(nnq.ConvTranspose1d):
         device=None,
         dtype=None,
     ):
+        # [FUNCTION DOC] Emits a warning that numerical accuracy is poor and use is not recommended, then forwards
+        # all convolution arguments plus device/dtype factory kwargs to the parent constructor unchanged.
         warnings.warn(
             f"The current implementation of the {self._get_name()} module has poor numerical accuracy and its use is not recommended",
             stacklevel=2,
@@ -353,9 +388,13 @@ class ConvTranspose1d(nnq.ConvTranspose1d):
         )
 
     def _get_name(self):
+        # [FUNCTION DOC] HELPER: Returns the display name DynamicQuantizedConvTranspose1d.
         return "DynamicQuantizedConvTranspose1d"
 
     def forward(self, input: Tensor, reduce_range: bool = True) -> Tensor:
+        # [FUNCTION DOC] Applies the conv_transpose1d_dynamic quantized op to a float input of shape (N, C, L) and returns
+        # the float output; reduce_range controls the activation quantization range.
+        # Raises ValueError if the input rank is wrong.
         # Temporarily using len(shape) instead of ndim due to JIT issue
         # https://github.com/pytorch/pytorch/issues/23890
         if len(input.shape) != 3:
@@ -366,6 +405,8 @@ class ConvTranspose1d(nnq.ConvTranspose1d):
 
 
 class ConvTranspose2d(nnq.ConvTranspose2d):
+    # [CLASS DOC] Dynamically quantized transposed 2d convolution with float inputs and outputs; weights are
+    # packed/quantized and activations are quantized per call. Extends the static quantized ConvTranspose2d.
     r"""A dynamically quantized transposed convolution module with floating point tensors as inputs and outputs.
 
     For details on input arguments, parameters, and implementation see
@@ -416,6 +457,8 @@ class ConvTranspose2d(nnq.ConvTranspose2d):
         device=None,
         dtype=None,
     ):
+        # [FUNCTION DOC] Emits a warning that numerical accuracy is poor and use is not recommended, then forwards
+        # all convolution arguments plus device/dtype factory kwargs to the parent constructor unchanged.
         warnings.warn(
             f"The current implementation of the {self._get_name()} module has poor numerical accuracy and its use is not recommended",
             stacklevel=2,
@@ -436,9 +479,13 @@ class ConvTranspose2d(nnq.ConvTranspose2d):
         )
 
     def _get_name(self):
+        # [FUNCTION DOC] HELPER: Returns the display name DynamicQuantizedConvTranspose2d.
         return "DynamicQuantizedConvTranspose2d"
 
     def forward(self, input: Tensor, reduce_range: bool = True) -> Tensor:
+        # [FUNCTION DOC] Applies the conv_transpose2d_dynamic quantized op to a float input of shape (N, C, H, W) and returns
+        # the float output; reduce_range controls the activation quantization range.
+        # Raises ValueError if the input rank is wrong.
         # Temporarily using len(shape) instead of ndim due to JIT issue
         # https://github.com/pytorch/pytorch/issues/23890
         if len(input.shape) != 4:
@@ -449,6 +496,8 @@ class ConvTranspose2d(nnq.ConvTranspose2d):
 
 
 class ConvTranspose3d(nnq.ConvTranspose3d):
+    # [CLASS DOC] Dynamically quantized transposed 3d convolution with float inputs and outputs; weights are
+    # packed/quantized and activations are quantized per call. Extends the static quantized ConvTranspose3d.
     r"""A dynamically quantized transposed convolution module with floating point tensors as inputs and outputs.
 
     For details on input arguments, parameters, and implementation see
@@ -499,6 +548,8 @@ class ConvTranspose3d(nnq.ConvTranspose3d):
         device=None,
         dtype=None,
     ):
+        # [FUNCTION DOC] Emits a warning that numerical accuracy is poor and use is not recommended, then forwards
+        # all convolution arguments plus device/dtype factory kwargs to the parent constructor unchanged.
         warnings.warn(
             f"The current implementation of the {self._get_name()} module has poor numerical accuracy and its use is not recommended",
             stacklevel=2,
@@ -519,9 +570,13 @@ class ConvTranspose3d(nnq.ConvTranspose3d):
         )
 
     def _get_name(self):
+        # [FUNCTION DOC] HELPER: Returns the display name DynamicQuantizedConvTranspose3d.
         return "DynamicQuantizedConvTranspose3d"
 
     def forward(self, input: Tensor, reduce_range: bool = True) -> Tensor:
+        # [FUNCTION DOC] Applies the conv_transpose3d_dynamic quantized op to a float input of shape (N, C, T, H, W) and returns
+        # the float output; reduce_range controls the activation quantization range.
+        # Raises ValueError if the input rank is wrong.
         # Temporarily using len(shape) instead of ndim due to JIT issue
         # https://github.com/pytorch/pytorch/issues/23890
         if len(input.shape) != 5:

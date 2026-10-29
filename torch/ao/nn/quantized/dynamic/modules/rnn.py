@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Dynamically quantized recurrent modules: LSTM, GRU, RNNCell, LSTMCell, GRUCell and their bases
+# (RNNBase, RNNCellBase), plus helpers pack_weight_bias, PackedParameter and the deprecated
+# apply_permutation. Weights are packed (int8 or fp16) via quantized prepack ops; inputs stay float
+# and are quantized inside the dynamic ops. No import-time side effects beyond definitions.
 import numbers
 import warnings
 from typing_extensions import deprecated
@@ -26,6 +30,8 @@ __all__ = [
 
 
 def _apply_permutation(tensor: Tensor, permutation: Tensor, dim: int = 1) -> Tensor:
+    # [FUNCTION DOC] HELPER: Reorders tensor along dim (default 1) by selecting the indices in permutation; returns
+    # the new tensor.
     return tensor.index_select(dim, permutation)
 
 
@@ -34,10 +40,14 @@ def _apply_permutation(tensor: Tensor, permutation: Tensor, dim: int = 1) -> Ten
     category=FutureWarning,
 )
 def apply_permutation(tensor: Tensor, permutation: Tensor, dim: int = 1) -> Tensor:
+    # [FUNCTION DOC] Deprecated public wrapper (emits FutureWarning when called) that forwards to the private
+    # permutation helper and returns the reordered tensor.
     return _apply_permutation(tensor, permutation, dim)
 
 
 def pack_weight_bias(qweight, bias, dtype):
+    # [FUNCTION DOC] Packs a quantized weight and bias for linear use: for qint8 dtype uses the int8 prepack op,
+    # for any other dtype (float16) the fp16 prepack op. Returns the packed weight object.
     if dtype == torch.qint8:
         # for each layer, for each direction we need to quantize and pack
         # weights and pack parameters in this order:
@@ -57,11 +67,16 @@ def pack_weight_bias(qweight, bias, dtype):
 
 
 class PackedParameter(torch.nn.Module):
+    # [CLASS DOC] HELPER: Module wrapper holding one opaque packed cell-parameter object in attribute param,
+    # so it can be stored in a ModuleList and (de)serialized through the state dict under key param.
     def __init__(self, param):
+        # [FUNCTION DOC] HELPER: Stores the packed parameter object.
         super().__init__()
         self.param = param
 
     def _save_to_state_dict(self, destination, prefix, keep_vars):
+        # [FUNCTION DOC] HELPER: Calls the parent saver, then writes the packed param object into destination under
+        # prefix plus param.
         super()._save_to_state_dict(destination, prefix, keep_vars)
         destination[prefix + "param"] = self.param
 
@@ -75,6 +90,8 @@ class PackedParameter(torch.nn.Module):
         unexpected_keys,
         error_msgs,
     ):
+        # [FUNCTION DOC] HELPER: Takes the packed param from state_dict (prefix plus param; missing key raises a KeyError)
+        # and then calls the parent loader with strict forced off.
         self.param = state_dict[prefix + "param"]
         super()._load_from_state_dict(
             state_dict,
@@ -88,6 +105,11 @@ class PackedParameter(torch.nn.Module):
 
 
 class RNNBase(torch.nn.Module):
+    # [CLASS DOC] Shared base of dynamic quantized LSTM and GRU. State: mode, sizes, num_layers, bias,
+    # batch_first, dropout, bidirectional, weight dtype (qint8 or float16), version (class _version 2),
+    # training forced False, and _all_weight_values, a module list with one PackedParameter per
+    # layer and direction holding packed cell params. Provides input/hidden validation, weight
+    # setting/getting, and from_float conversion.
     _FLOAT_MODULE = nn.RNNBase
 
     _version = 2
@@ -104,6 +126,11 @@ class RNNBase(torch.nn.Module):
         bidirectional=False,
         dtype=torch.qint8,
     ):
+        # [FUNCTION DOC] Stores configuration and builds random placeholder packed weights for every layer and
+        # direction (gate size is 4*hidden for LSTM, 3*hidden for GRU; layers after the first take
+        # hidden*directions inputs). For qint8, quantizes weights with fixed scale 0.1 and zero point 0 and
+        # uses the dynamic cell-params maker; for float16 uses fp16 packing. Raises ValueError for bad
+        # dropout (not a non-bool number in [0, 1]) or unknown mode; warns if dropout > 0 with one layer.
         super().__init__()
 
         self.mode = mode
@@ -191,9 +218,12 @@ class RNNBase(torch.nn.Module):
         self._all_weight_values = torch.nn.ModuleList(_all_weight_values)
 
     def _get_name(self):
+        # [FUNCTION DOC] HELPER: Returns the display name DynamicQuantizedRNN.
         return "DynamicQuantizedRNN"
 
     def extra_repr(self):
+        # [FUNCTION DOC] HELPER: Builds the repr detail string from input_size and hidden_size, adding num_layers, bias,
+        # batch_first, dropout and bidirectional only when they differ from defaults.
         s = "{input_size}, {hidden_size}"
         if self.num_layers != 1:
             s += ", num_layers={num_layers}"
@@ -208,6 +238,8 @@ class RNNBase(torch.nn.Module):
         return s.format(**self.__dict__)
 
     def __repr__(self):
+        # [FUNCTION DOC] HELPER: Same as the standard module repr, but skips PackedParameter and ModuleList children so
+        # the packed weights are not printed.
         # We don't want to show `ModuleList` children, hence custom
         # `__repr__`. This is the same as nn.Module.__repr__, except the check
         # for the `PackedParameter` and `nn.ModuleList`.
@@ -238,6 +270,8 @@ class RNNBase(torch.nn.Module):
         return main_str
 
     def check_input(self, input: Tensor, batch_sizes: Optional[Tensor]) -> None:
+        # [FUNCTION DOC] Validates input rank (2 for packed input with batch_sizes, else 3) and that the last dim
+        # equals input_size. Raises RuntimeError on mismatch.
         expected_input_dim = 2 if batch_sizes is not None else 3
         if input.dim() != expected_input_dim:
             raise RuntimeError(
@@ -251,6 +285,8 @@ class RNNBase(torch.nn.Module):
     def get_expected_hidden_size(
         self, input: Tensor, batch_sizes: Optional[Tensor]
     ) -> tuple[int, int, int]:
+        # [FUNCTION DOC] Returns the expected hidden state shape (num_layers*directions, mini_batch, hidden_size);
+        # mini_batch comes from the first batch size when packed, else from the input per batch_first.
         if batch_sizes is not None:
             mini_batch = int(batch_sizes[0])
         else:
@@ -269,12 +305,15 @@ class RNNBase(torch.nn.Module):
         expected_hidden_size: tuple[int, int, int],
         msg: str = "Expected hidden size {}, got {}",
     ) -> None:
+        # [FUNCTION DOC] Raises RuntimeError, formatted with the message template, if hx size differs from the
+        # expected hidden size.
         if hx.size() != expected_hidden_size:
             raise RuntimeError(msg.format(expected_hidden_size, list(hx.size())))
 
     def check_forward_args(
         self, input: Tensor, hidden: Tensor, batch_sizes: Optional[Tensor]
     ) -> None:
+        # [FUNCTION DOC] Validates input and hidden state shapes for a forward call; raises RuntimeError on mismatch.
         self.check_input(input, batch_sizes)
         expected_hidden_size = self.get_expected_hidden_size(input, batch_sizes)
         self.check_hidden_size(
@@ -282,6 +321,7 @@ class RNNBase(torch.nn.Module):
         )
 
     def permute_hidden(self, hx: Tensor, permutation: Optional[Tensor]) -> Tensor:
+        # [FUNCTION DOC] Returns hx reordered along dim 1 by permutation, or hx unchanged if permutation is None.
         if permutation is None:
             return hx
         return _apply_permutation(hx, permutation)
@@ -296,6 +336,8 @@ class RNNBase(torch.nn.Module):
         unexpected_keys,
         error_msgs,
     ):
+        # [FUNCTION DOC] HELPER: Records the serialized version from local_metadata (None if absent) on self.version,
+        # then calls the parent loader with strict forced off.
         version = local_metadata.get("version", None)
         self.version = version
         super()._load_from_state_dict(
@@ -309,7 +351,11 @@ class RNNBase(torch.nn.Module):
         )
 
     def set_weight_bias(self, weight_bias_dict):
+        # [FUNCTION DOC] Rebuilds the packed parameters from a mapping keyed by names like weight_ih_l0 and
+        # bias_hh_l0_reverse (all layers/directions required, else KeyError). Packs per dtype of the
+        # weights (qint8 dynamic cell params, else fp16) and replaces the module list. Mutates self.
         def weight_bias_name(ihhh, layer, suffix):
+            # [FUNCTION DOC] HELPER: Returns the (weight, bias) key names for the ih or hh part of a layer with suffix.
             weight_name = f"weight_{ihhh}_l{layer}{suffix}"
             bias_name = f"bias_{ihhh}_l{layer}{suffix}"
             return weight_name, bias_name
@@ -353,6 +399,12 @@ class RNNBase(torch.nn.Module):
 
     @classmethod
     def from_float(cls, mod, use_precomputed_fake_quant=False):
+        # [FUNCTION DOC] Class method: converts a float nn.LSTM or nn.GRU (exact types, with qconfig and bias; else
+        # assertion error) to the dynamic quantized LSTM/GRU. Picks the weight observer from qconfig or the
+        # default dynamic qconfig, allows only qint8 and float16 (RuntimeError otherwise), creates the module,
+        # then observes, quantizes and packs each layer/direction weight (float16 just converts to float)
+        # and installs the packed params. Raises NotImplementedError for other modes.
+        # # KNOWN ISSUE: the unsupported-dtype error message mentions LSTM even when converting a GRU.
         if type(mod) not in {torch.nn.LSTM, torch.nn.GRU}:
             raise AssertionError(
                 "nn.quantized.dynamic.RNNBase.from_float only works for nn.LSTM and nn.GRU"
@@ -416,6 +468,8 @@ class RNNBase(torch.nn.Module):
                 suffix = "_reverse" if direction == 1 else ""
 
                 def retrieve_weight_bias(ihhh):
+                    # [FUNCTION DOC] HELPER: Fetches the weight and bias attributes of the float module for the current layer
+                    # and direction (ih or hh).
                     weight_name = f"weight_{ihhh}_l{layer}{suffix}"
                     bias_name = f"bias_{ihhh}_l{layer}{suffix}"
                     weight = getattr(mod, weight_name)
@@ -428,6 +482,7 @@ class RNNBase(torch.nn.Module):
                 if dtype == torch.qint8:
 
                     def quantize_and_pack(w, b):
+                        # [FUNCTION DOC] HELPER: Observes weight w with a fresh observer, quantizes it and packs it with bias b.
                         weight_observer = weight_observer_method()
                         weight_observer(w)
                         qweight = _quantize_weight(w.float(), weight_observer)
@@ -471,6 +526,9 @@ class RNNBase(torch.nn.Module):
         return qRNNBase
 
     def _weight_bias(self):
+        # [FUNCTION DOC] HELPER: Extracts unpacked tensors from the packed cell params and returns a mapping with weight
+        # and bias sections keyed by names like weight_ih_l0 (plus reverse suffix). Relies on the packed
+        # objects' serialized state layout.
         # Returns a dict of weights and biases
         weight_bias_dict: Dict[str, Dict] = {"weight": {}, "bias": {}}
         count = 0
@@ -503,13 +561,18 @@ class RNNBase(torch.nn.Module):
         return weight_bias_dict
 
     def get_weight(self):
+        # [FUNCTION DOC] Returns the mapping of weight names to tensors.
         return self._weight_bias()["weight"]
 
     def get_bias(self):
+        # [FUNCTION DOC] Returns the mapping of bias names to tensors.
         return self._weight_bias()["bias"]
 
 
 class LSTM(RNNBase):
+    # [CLASS DOC] Dynamic quantized LSTM (float inputs/outputs, packed int8 or fp16 weights) built on RNNBase
+    # with mode LSTM. Forward accepts a plain tensor or a PackedSequence and returns (output, (h_n, c_n));
+    # conversion from float or reference modules via from_float/from_reference.
     r"""
     A dynamic quantized LSTM module with floating point tensor as inputs and outputs.
     We adopt the same interface as `torch.nn.LSTM`, please see
@@ -530,9 +593,11 @@ class LSTM(RNNBase):
     __overloads__ = {"forward": ["forward_packed", "forward_tensor"]}
 
     def __init__(self, *args, **kwargs):
+        # [FUNCTION DOC] Forwards all arguments to the base class with mode LSTM.
         super().__init__("LSTM", *args, **kwargs)
 
     def _get_name(self):
+        # [FUNCTION DOC] HELPER: Returns the display name DynamicQuantizedLSTM.
         return "DynamicQuantizedLSTM"
 
     def forward_impl(
@@ -543,6 +608,9 @@ class LSTM(RNNBase):
         max_batch_size: int,
         sorted_indices: Optional[Tensor],
     ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
+        # [FUNCTION DOC] Core forward. Creates zero initial state if hx is None, else reorders it by sorted_indices.
+        # Validates args, collects packed params and calls the quantized lstm op (packed variant when
+        # batch_sizes is given). Returns the output and final hidden state.
         if hx is None:
             num_directions = 2 if self.bidirectional else 1
             zeros = torch.zeros(
@@ -598,6 +666,8 @@ class LSTM(RNNBase):
     def forward_tensor(
         self, input: Tensor, hx: Optional[tuple[Tensor, Tensor]] = None
     ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
+        # [FUNCTION DOC] Forward for a plain tensor input: derives batch size from batch_first, runs forward_impl and
+        # returns the output with the hidden state.
         batch_sizes = None
         max_batch_size = input.size(0) if self.batch_first else input.size(1)
         sorted_indices = None
@@ -613,6 +683,8 @@ class LSTM(RNNBase):
     def forward_packed(
         self, input: PackedSequence, hx: Optional[tuple[Tensor, Tensor]] = None
     ) -> tuple[PackedSequence, tuple[Tensor, Tensor]]:
+        # [FUNCTION DOC] Forward for a PackedSequence: unpacks the fields, runs forward_impl, rewraps the output as a
+        # PackedSequence and returns it with the hidden state reordered back via unsorted_indices.
         input_, batch_sizes, sorted_indices, unsorted_indices = input
         max_batch_size = int(batch_sizes[0])
 
@@ -629,6 +701,7 @@ class LSTM(RNNBase):
         hx: tuple[Tensor, Tensor],
         permutation: Optional[Tensor],
     ) -> tuple[Tensor, Tensor]:
+        # [FUNCTION DOC] Reorders both tensors of the (h, c) tuple by permutation; returns hx unchanged if None.
         if permutation is None:
             return hx
         return _apply_permutation(hx[0], permutation), _apply_permutation(
@@ -642,6 +715,7 @@ class LSTM(RNNBase):
         hidden: tuple[Tensor, Tensor],
         batch_sizes: Optional[Tensor],
     ) -> None:
+        # [FUNCTION DOC] Validates input and both hidden/cell tensors against the expected shape; raises RuntimeError.
         self.check_input(input, batch_sizes)
         expected_hidden_size = self.get_expected_hidden_size(input, batch_sizes)
 
@@ -654,6 +728,7 @@ class LSTM(RNNBase):
 
     @torch.jit.ignore
     def forward(self, input, hx=None):
+        # [FUNCTION DOC] Dispatches to forward_packed for PackedSequence input, otherwise forward_tensor.
         if isinstance(input, PackedSequence):
             return self.forward_packed(input, hx)
         else:
@@ -661,12 +736,16 @@ class LSTM(RNNBase):
 
     @classmethod
     def from_float(cls, mod, use_precomputed_fake_quant=False):
+        # [FUNCTION DOC] Class method: delegates to the base conversion from a float module.
         return super().from_float(
             mod, use_precomputed_fake_quant=use_precomputed_fake_quant
         )
 
     @classmethod
     def from_reference(cls, ref_mod):
+        # [FUNCTION DOC] Class method: builds a module from a reference quantized LSTM using its sizes and the dtype of
+        # weight_ih_l0, then installs its quantized weights and biases. Raises an assertion error if
+        # weight_ih_l0_dtype is absent.
         if not hasattr(ref_mod, "weight_ih_l0_dtype"):
             raise AssertionError(
                 "We are assuming weight_ih_l0 exists in LSTM, "
@@ -688,6 +767,9 @@ class LSTM(RNNBase):
 
 
 class GRU(RNNBase):
+    # [CLASS DOC] Dynamic quantized GRU (float inputs/outputs, packed int8 or fp16 weights) built on RNNBase
+    # with mode GRU. Forward accepts a plain tensor or a PackedSequence and returns (output, h_n);
+    # conversion from float or reference modules via from_float/from_reference.
     r"""Applies a multi-layer gated recurrent unit (GRU) RNN to an input sequence.
 
 
@@ -818,14 +900,17 @@ class GRU(RNNBase):
     __overloads__ = {"forward": ["forward_packed", "forward_tensor"]}
 
     def __init__(self, *args, **kwargs):
+        # [FUNCTION DOC] Forwards all arguments to the base class with mode GRU.
         super().__init__("GRU", *args, **kwargs)
 
     def _get_name(self):
+        # [FUNCTION DOC] HELPER: Returns the display name DynamicQuantizedGRU.
         return "DynamicQuantizedGRU"
 
     def check_forward_args(
         self, input: Tensor, hidden: Tensor, batch_sizes: Optional[Tensor]
     ) -> None:
+        # [FUNCTION DOC] Validates input and the hidden tensor against the expected shape; raises RuntimeError.
         self.check_input(input, batch_sizes)
         expected_hidden_size = self.get_expected_hidden_size(input, batch_sizes)
 
@@ -841,6 +926,9 @@ class GRU(RNNBase):
         max_batch_size: int,
         sorted_indices: Optional[Tensor],
     ) -> tuple[Tensor, Tensor]:
+        # [FUNCTION DOC] Core forward. Creates zero initial state if hx is None, else reorders it by sorted_indices.
+        # Validates args, collects packed params and calls the quantized gru op (packed variant when
+        # batch_sizes is given). Returns the output and final hidden state.
         if hx is None:
             num_directions = 2 if self.bidirectional else 1
             zeros = torch.zeros(
@@ -892,6 +980,8 @@ class GRU(RNNBase):
     def forward_tensor(
         self, input: Tensor, hx: Optional[Tensor] = None
     ) -> tuple[Tensor, Tensor]:
+        # [FUNCTION DOC] Forward for a plain tensor input: derives batch size from batch_first, runs forward_impl and
+        # returns the output with the hidden state.
         batch_sizes = None
         max_batch_size = input.size(0) if self.batch_first else input.size(1)
         sorted_indices = None
@@ -907,6 +997,8 @@ class GRU(RNNBase):
     def forward_packed(
         self, input: PackedSequence, hx: Optional[Tensor] = None
     ) -> tuple[PackedSequence, Tensor]:
+        # [FUNCTION DOC] Forward for a PackedSequence: unpacks the fields, runs forward_impl, rewraps the output as a
+        # PackedSequence and returns it with the hidden state reordered back via unsorted_indices.
         input_, batch_sizes, sorted_indices, unsorted_indices = input
         max_batch_size = int(batch_sizes[0])
         output_, hidden = self.forward_impl(
@@ -917,12 +1009,14 @@ class GRU(RNNBase):
         return output, self.permute_hidden(hidden, unsorted_indices)
 
     def permute_hidden(self, hx: Tensor, permutation: Optional[Tensor]) -> Tensor:
+        # [FUNCTION DOC] Returns hx reordered along dim 1 by permutation, or unchanged if permutation is None.
         if permutation is None:
             return hx
         return _apply_permutation(hx, permutation)
 
     @torch.jit.ignore
     def forward(self, input, hx=None):
+        # [FUNCTION DOC] Dispatches to forward_packed for PackedSequence input, otherwise forward_tensor.
         if isinstance(input, PackedSequence):
             return self.forward_packed(input, hx)
         else:
@@ -930,12 +1024,16 @@ class GRU(RNNBase):
 
     @classmethod
     def from_float(cls, mod, use_precomputed_fake_quant=False):
+        # [FUNCTION DOC] Class method: delegates to the base conversion from a float module.
         return super().from_float(
             mod, use_precomputed_fake_quant=use_precomputed_fake_quant
         )
 
     @classmethod
     def from_reference(cls, ref_mod):
+        # [FUNCTION DOC] Class method: builds a module from a reference quantized GRU using its sizes and the dtype of
+        # weight_ih_l0, then installs its quantized weights and biases. Raises an assertion error if
+        # weight_ih_l0_dtype is absent.
         if not hasattr(ref_mod, "weight_ih_l0_dtype"):
             raise AssertionError(
                 "We are assuming weight_ih_l0 exists in GRU, "
@@ -957,12 +1055,17 @@ class GRU(RNNBase):
 
 
 class RNNCellBase(torch.nn.Module):
+    # [CLASS DOC] Base of the dynamic quantized RNN/LSTM/GRU cells. State: input_size, hidden_size, bias,
+    # weight_dtype, float bias_ih/bias_hh (or None parameters), and packed weights _packed_weight_ih and
+    # _packed_weight_hh (stored and loaded through the state dict). num_chunks sets gate multiplicity.
     # _FLOAT_MODULE = nn.CellRNNBase
     __constants__ = ["input_size", "hidden_size", "bias"]
 
     def __init__(
         self, input_size, hidden_size, bias=True, num_chunks=4, dtype=torch.qint8
     ):
+        # [FUNCTION DOC] Creates random placeholder weights and biases (num_chunks*hidden rows), quantizes weights for
+        # qint8 (scale 1, zero point 0) and packs them with the int8 or fp16 prepack op.
         super().__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
@@ -1012,9 +1115,11 @@ class RNNCellBase(torch.nn.Module):
         self._packed_weight_hh = packed_weight_hh
 
     def _get_name(self):
+        # [FUNCTION DOC] HELPER: Returns the display name DynamicQuantizedRNNBase.
         return "DynamicQuantizedRNNBase"
 
     def extra_repr(self):
+        # [FUNCTION DOC] HELPER: Repr detail string with sizes, plus bias and nonlinearity when not default.
         s = "{input_size}, {hidden_size}"
         if "bias" in self.__dict__ and self.bias is not True:
             s += ", bias={bias}"
@@ -1023,6 +1128,7 @@ class RNNCellBase(torch.nn.Module):
         return s.format(**self.__dict__)
 
     def check_forward_input(self, input):
+        # [FUNCTION DOC] Raises RuntimeError if the input feature size differs from input_size.
         if input.size(1) != self.input_size:
             raise RuntimeError(
                 f"input has inconsistent input_size: got {input.size(1)}, expected {self.input_size}"
@@ -1031,6 +1137,8 @@ class RNNCellBase(torch.nn.Module):
     def check_forward_hidden(
         self, input: Tensor, hx: Tensor, hidden_label: str = ""
     ) -> None:
+        # [FUNCTION DOC] Raises RuntimeError if the hidden batch size differs from the input's or its feature size
+        # differs from hidden_size; hidden_label is added to the message.
         if input.size(0) != hx.size(0):
             raise RuntimeError(
                 f"Input batch size {input.size(0)} doesn't match hidden{hidden_label} batch size {hx.size(0)}"
@@ -1043,6 +1151,10 @@ class RNNCellBase(torch.nn.Module):
 
     @classmethod
     def from_float(cls, mod, use_precomputed_fake_quant=False):
+        # [FUNCTION DOC] Class method: converts a float LSTMCell, GRUCell or RNNCell (exact types, with qconfig and
+        # bias; else assertion error) into the matching dynamic cell. Observer from qconfig or default dynamic
+        # qconfig; only qint8 and float16 allowed (RuntimeError). Observes, quantizes and packs both weights.
+        # Raises NotImplementedError for other types.
         if type(mod) not in {torch.nn.LSTMCell, torch.nn.GRUCell, torch.nn.RNNCell}:
             raise AssertionError(
                 "nn.quantized.dynamic.RNNCellBase.from_float "
@@ -1096,6 +1208,7 @@ class RNNCellBase(torch.nn.Module):
             raise AssertionError("mod.bias must be True")
 
         def _observe_and_quantize_weight(weight):
+            # [FUNCTION DOC] HELPER: For qint8 observes and quantizes the weight; otherwise returns it as float.
             if dtype == torch.qint8:
                 weight_observer = weight_observer_method()
                 weight_observer(weight)
@@ -1114,6 +1227,8 @@ class RNNCellBase(torch.nn.Module):
 
     @classmethod
     def from_reference(cls, ref_mod):
+        # [FUNCTION DOC] Class method: builds a cell from a reference quantized cell (needs weight_ih_dtype, else
+        # assertion error), passing nonlinearity if present, then sets its quantized weights and biases.
         if not hasattr(ref_mod, "weight_ih_dtype"):
             raise AssertionError(
                 "We are assuming weight_ih exists in reference module, "
@@ -1148,6 +1263,8 @@ class RNNCellBase(torch.nn.Module):
         return qmod
 
     def _weight_bias(self):
+        # [FUNCTION DOC] HELPER: Unpacks the two packed weights and returns a mapping with weight and bias sections
+        # keyed weight_ih, weight_hh, bias_ih, bias_hh.
         # Returns a dict of weights and biases
         weight_bias_dict: Dict[str, Dict] = {"weight": {}, "bias": {}}
         w1, b1 = self._packed_weight_ih.__getstate__()[0]
@@ -1161,12 +1278,16 @@ class RNNCellBase(torch.nn.Module):
         return weight_bias_dict
 
     def get_weight(self):
+        # [FUNCTION DOC] Returns the mapping of weight names to tensors.
         return self._weight_bias()["weight"]
 
     def get_bias(self):
+        # [FUNCTION DOC] Returns the mapping of bias names to tensors.
         return self._weight_bias()["bias"]
 
     def set_weight_bias(self, weight_bias_dict):
+        # [FUNCTION DOC] Repacks both weights with their biases from a nested mapping (weight/bias sections keyed
+        # ih and hh) using weight_dtype; mutates the packed attributes.
         # TODO: these can be simplified to one level? e.g. using weight_ih as key
         # directly
         self._packed_weight_ih = pack_weight_bias(
@@ -1181,6 +1302,7 @@ class RNNCellBase(torch.nn.Module):
         )
 
     def _save_to_state_dict(self, destination, prefix, keep_vars):
+        # [FUNCTION DOC] HELPER: Calls the parent saver, then stores both packed weights in the destination.
         super()._save_to_state_dict(destination, prefix, keep_vars)
         destination[prefix + "_packed_weight_ih"] = self._packed_weight_ih
         destination[prefix + "_packed_weight_hh"] = self._packed_weight_hh
@@ -1195,6 +1317,8 @@ class RNNCellBase(torch.nn.Module):
         unexpected_keys,
         error_msgs,
     ):
+        # [FUNCTION DOC] HELPER: Pops both packed weights from state_dict (KeyError if missing) and calls the parent loader
+        # with strict forced off.
         self._packed_weight_ih = state_dict.pop(prefix + "_packed_weight_ih")
         self._packed_weight_hh = state_dict.pop(prefix + "_packed_weight_hh")
         super()._load_from_state_dict(
@@ -1209,6 +1333,7 @@ class RNNCellBase(torch.nn.Module):
 
 
 class RNNCell(RNNCellBase):
+    # [CLASS DOC] Dynamic quantized Elman RNN cell with tanh or relu nonlinearity; one gate chunk.
     r"""An Elman RNN cell with tanh or ReLU non-linearity.
     A dynamic quantized RNNCell module with floating point tensor as inputs and outputs.
     Weights are quantized to 8 bits. We adopt the same interface as `torch.nn.RNNCell`,
@@ -1231,13 +1356,17 @@ class RNNCell(RNNCellBase):
     def __init__(
         self, input_size, hidden_size, bias=True, nonlinearity="tanh", dtype=torch.qint8
     ):
+        # [FUNCTION DOC] Initializes the base with one chunk and stores the nonlinearity name.
         super().__init__(input_size, hidden_size, bias, num_chunks=1, dtype=dtype)
         self.nonlinearity = nonlinearity
 
     def _get_name(self):
+        # [FUNCTION DOC] HELPER: Returns the display name DynamicQuantizedRNNCell.
         return "DynamicQuantizedRNNCell"
 
     def forward(self, input: Tensor, hx: Optional[Tensor] = None) -> Tensor:
+        # [FUNCTION DOC] Validates input, uses zero hidden state if hx is None, validates it, and applies the dynamic
+        # quantized tanh or relu RNN cell op. Raises RuntimeError for any other nonlinearity. Returns new hidden.
         self.check_forward_input(input)
         if hx is None:
             hx = torch.zeros(
@@ -1269,12 +1398,14 @@ class RNNCell(RNNCellBase):
 
     @classmethod
     def from_float(cls, mod, use_precomputed_fake_quant=False):
+        # [FUNCTION DOC] Class method: delegates to the base cell conversion from a float module.
         return super().from_float(
             mod, use_precomputed_fake_quant=use_precomputed_fake_quant
         )
 
 
 class LSTMCell(RNNCellBase):
+    # [CLASS DOC] Dynamic quantized LSTM cell (four gate chunks); forward returns (hidden, cell).
     r"""A long short-term memory (LSTM) cell.
 
     A dynamic quantized LSTMCell module with floating point tensor as inputs and outputs.
@@ -1295,14 +1426,18 @@ class LSTMCell(RNNCellBase):
     """
 
     def __init__(self, *args, **kwargs):
+        # [FUNCTION DOC] Initializes the base class with four gate chunks, passing through other arguments.
         super().__init__(*args, num_chunks=4, **kwargs)  # type: ignore[misc]
 
     def _get_name(self):
+        # [FUNCTION DOC] HELPER: Returns the display name DynamicQuantizedLSTMCell.
         return "DynamicQuantizedLSTMCell"
 
     def forward(
         self, input: Tensor, hx: Optional[tuple[Tensor, Tensor]] = None
     ) -> tuple[Tensor, Tensor]:
+        # [FUNCTION DOC] Validates input, uses zero (h, c) if hx is None, validates both, and applies the dynamic
+        # quantized LSTM cell op. Returns the new (h, c).
         self.check_forward_input(input)
         if hx is None:
             zeros = torch.zeros(
@@ -1322,12 +1457,14 @@ class LSTMCell(RNNCellBase):
 
     @classmethod
     def from_float(cls, mod, use_precomputed_fake_quant=False):
+        # [FUNCTION DOC] Class method: delegates to the base cell conversion from a float module.
         return super().from_float(
             mod, use_precomputed_fake_quant=use_precomputed_fake_quant
         )
 
 
 class GRUCell(RNNCellBase):
+    # [CLASS DOC] Dynamic quantized GRU cell (three gate chunks).
     r"""A gated recurrent unit (GRU) cell
 
     A dynamic quantized GRUCell module with floating point tensor as inputs and outputs.
@@ -1347,12 +1484,16 @@ class GRUCell(RNNCellBase):
     """
 
     def __init__(self, input_size, hidden_size, bias=True, dtype=torch.qint8):
+        # [FUNCTION DOC] Initializes the base class with three gate chunks.
         super().__init__(input_size, hidden_size, bias, num_chunks=3, dtype=dtype)
 
     def _get_name(self):
+        # [FUNCTION DOC] HELPER: Returns the display name DynamicQuantizedGRUCell.
         return "DynamicQuantizedGRUCell"
 
     def forward(self, input: Tensor, hx: Optional[Tensor] = None) -> Tensor:
+        # [FUNCTION DOC] Validates input, uses zero hidden if hx is None, validates it, and applies the dynamic
+        # quantized GRU cell op. Returns the new hidden state.
         self.check_forward_input(input)
         if hx is None:
             hx = torch.zeros(
@@ -1370,6 +1511,7 @@ class GRUCell(RNNCellBase):
 
     @classmethod
     def from_float(cls, mod, use_precomputed_fake_quant=False):
+        # [FUNCTION DOC] Class method: delegates to the base cell conversion from a float module.
         return super().from_float(
             mod, use_precomputed_fake_quant=use_precomputed_fake_quant
         )

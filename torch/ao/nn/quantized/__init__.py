@@ -1,3 +1,6 @@
+# [PACKAGE DOC] Public namespace for statically quantized modules. Imports the functional
+# submodule and re-exports all quantized module classes (Linear, Conv*, norms, activations,
+# Embedding, LSTM, wrapper functionals such as QFunctional) via the modules package; __all__ lists the exports.
 from . import functional
 from .modules import *  # noqa: F403
 from .modules import MaxPool2d
