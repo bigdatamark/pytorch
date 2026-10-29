@@ -1,5 +1,13 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests for DTensor behavior on assorted aten ops:
+# contiguous/clone/copy_, in-place and out= variants, *_like and new_* factories,
+# stack/cat/split/unbind/slice, scatter/gather, index/index_put family (including
+# Partial inputs), bucketize, dtype casts (_to_copy), argmax and argmin, and
+# sharding-propagation cache-key behavior. Covers sharding/placement results and
+# numerics against plain tensors. Import time: registers two custom ops (testlib::
+# optional_clamp_op, testlib::modified_cat_op) and creates LocalTensor-based test
+# class variants.
 
 import itertools
 import unittest
@@ -39,9 +47,16 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 
 
 class DistTensorOpsTest(DTensorContinuousTestBase):
+    # [CLASS DOC] Multi-process (world_size 4) DTensor op tests on a 1-D mesh unless noted. Each
+    # test builds a mesh, runs an op on distributed tensors, and checks placements,
+    # communication counts (via CommDebugMode) and values versus the plain-tensor result. Also
+    # re-instantiated for LocalTensor mode via create_local_tensor_test_class below.
     world_size = 4
 
     def test_aten_contiguous(self):
+        # [FUNCTION DOC] Checks that the aten contiguous op, which dtensor_ops
+        # does not cover, gives the same full tensor for every sharding that
+        # _test_op generates for a random 16x32 input.
         # this op not covered by dtensor_ops
         mesh = self.build_device_mesh()
         self._test_op(
@@ -52,6 +67,12 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
 
     @with_comms
     def test_auto_registered_batch_norm_functional(self):
+        # [FUNCTION DOC] Verifies that aten._native_batch_norm_legit_functional
+        # gets a single-dim strategy auto-registered, then runs it with the input
+        # sharded on the channel dim and the weight, bias and running stats
+        # sharded on dim 0. Expects five outputs with the placements Shard(1)
+        # followed by four Shard(0), and each full tensor equal to the plain-
+        # tensor result.
         self.assertIn(
             torch.ops.aten._native_batch_norm_legit_functional.default,
             DTensor._op_dispatcher.sharding_propagator.op_single_dim_strategy_funcs,
@@ -103,6 +124,11 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
 
     @with_comms
     def test_auto_registered_explicit_out_variant(self):
+        # [FUNCTION DOC] Checks that an op whose out overload has an explicit out argument
+        # (max.dim_max, whose overload name does not contain 'out') still gets a single-dim
+        # strategy registered. Calls max with out=(values, indices) on Shard(0) DTensors;
+        # expects the very same output objects returned, keeping Shard(0) placements, with full
+        # tensors equal to the plain result.
         self.assertNotIn("out", torch.ops.aten.max.dim_max._schema.overload_name)
         self.assertTrue(
             any(
@@ -138,6 +164,8 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
         self.assertEqual(dindices.full_tensor(), expected_indices)
 
     def test_detach(self):
+        # [FUNCTION DOC] Checks that detach on a sharded DTensor returns a new
+        # object (not the input).
         device_mesh = self.build_device_mesh()
         shard_spec = [Shard(0)]
 
@@ -147,6 +175,9 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
         self.assertFalse(detached_mat is mat)
 
     def test_detach_inplace_inference_mode(self):
+        # [FUNCTION DOC] Under inference_mode, calls aten.detach_ on DTensors sharded or
+        # replicated and checks the input object itself is returned with unchanged placements,
+        # i.e. the op has a registered sharding strategy that propagates the input spec.
         # Under inference_mode, autograd does not intercept detach_, so the
         # call falls through to DTensor's dispatcher. Ensure aten.detach_ has a
         # registered sharding strategy and propagates the input spec.
@@ -159,6 +190,8 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
             self.assertEqual(out.placements, tuple(spec))
 
     def test_clone(self):
+        # [FUNCTION DOC] Clones a DTensor under Replicate and Shard(0); expects a distinct
+        # object whose local tensor equals the original local tensor.
         device_mesh = self.build_device_mesh()
         specs = [[Replicate()], [Shard(0)]]
         tensor_to_clone = torch.randn(12, 8, requires_grad=True)
@@ -169,6 +202,11 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
             self.assertEqual(cloned_mat.to_local(), mat.to_local())
 
     def test_copy_(self):
+        # [FUNCTION DOC] Exercises DTensor.copy_ across several cases on a 1-D mesh: same-shape
+        # replicate/shard pairs, broadcasting a smaller source, sources with incompatible
+        # shardings (redistribute needed), and Partial source/destination (sum default, then max
+        # and min), where the destination must keep its Partial placement and local data.
+        # Compares to plain copy_.
         device_mesh = DeviceMesh(self.device_type, list(range(self.world_size)))
 
         # basic test
@@ -237,6 +275,10 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
             self.assertEqual(dst_dtensor._local_tensor, dst_tensor)
 
     def test_contiguous(self):
+        # [FUNCTION DOC] Checks contiguity and strides of a Shard(0) DTensor:
+        # transpose makes it (and its local tensor) non-contiguous with the
+        # expected strides, contiguous() restores both, and a backward through the
+        # local tensor yields an all-ones gradient on the source tensor.
         device_mesh = self.build_device_mesh()
         tensor = torch.rand(3, 5, 6, requires_grad=True)
         sharding = [Shard(0)]
@@ -262,6 +304,9 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
         self.assertEqual(tensor.grad, torch.ones(3, 5, 6))
 
     def test_inplace_op(self):
+        # [FUNCTION DOC] Checks that in-place add_ and mul_ return the same DTensor object with
+        # correct local values, and that add_ with a Partial operand leaves the Shard(0)
+        # placement of the target unchanged.
         mesh = self.build_device_mesh()
         input_tensor = torch.randn((12, 3), device=self.device_type)
         dt_to_add = distribute_tensor(input_tensor, mesh, [Shard(0)])
@@ -288,6 +333,9 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
         self.assertTrue(res.placements == tuple(shard_spec))
 
     def test_op_out_variant(self):
+        # [FUNCTION DOC] Checks the out= variant of torch.add: the returned object is the out
+        # DTensor, values match, and an out tensor with Replicate placement keeps that placement
+        # even when the input is Shard(0).
         mesh = self.build_device_mesh()
         input_tensor = torch.randn((12, 3), device=self.device_type)
         sharded_dt_input = distribute_tensor(input_tensor, mesh, [Shard(0)])
@@ -308,6 +356,9 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
         self.assertEqual(replicate_out.to_local(), expected_dt.to_local())
 
     def test_eye_out_sharded_rejected(self):
+        # [FUNCTION DOC] Builds Shard(0) and Shard(1) DTensors of global size 8x8
+        # and checks that torch.eye with out= pointing at them raises RuntimeError
+        # mentioning 'no valid sharding strategy'.
         mesh = self.build_device_mesh()
         input_size = (8, 8)
 
@@ -327,6 +378,8 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
                 torch.eye(input_size[0], input_size[1], out=dtensor)
 
     def test_empty_like(self):
+        # [FUNCTION DOC] Checks empty_like on a Shard(0) DTensor gives a local tensor of the
+        # expected shape (values are not checked, only that sharding propagated).
         device_mesh = self.build_device_mesh()
         shard_spec = [Shard(0)]
 
@@ -337,11 +390,16 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
         self.assertEqual((4, 8), empty_like_dt.to_local().shape)
 
     def test_meta_init_partial(self):
+        # [FUNCTION DOC] Builds a module on the meta device with a scalar buffer replaced by a
+        # Partial DTensor, calls to_empty, and checks the buffer keeps its Partial placement.
         device_mesh = self.build_device_mesh()
         partial_spec = [Partial()]
 
         class ToyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Minimal module holding one scalar float buffer
+            # named scalar_buffer.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Registers the scalar buffer (value 0.0, float32).
                 super().__init__()
                 self.register_buffer(
                     "scalar_buffer", torch.tensor(0.0, dtype=torch.float32)
@@ -360,6 +418,8 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
         self.assertEqual(module.scalar_buffer.placements, (Partial(),))
 
     def test_fill_inplace(self):
+        # [FUNCTION DOC] Checks torch.fill_ on a Shard(0) DTensor fills the local data in place
+        # and returns an object with the same local values.
         device_mesh = self.build_device_mesh()
         shard_spec = [Shard(0)]
 
@@ -371,6 +431,8 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
         self.assertEqual(full_expected, dist_tensor.to_local())
 
     def test_full_like(self):
+        # [FUNCTION DOC] Checks torch.full_like on a Shard(0) DTensor yields local data of the
+        # same shape filled with 42.
         device_mesh = self.build_device_mesh()
         shard_spec = [Shard(0)]
 
@@ -381,6 +443,8 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
         self.assertEqual(full_expected, full_like_dt.to_local())
 
     def test_ones_like(self):
+        # [FUNCTION DOC] Checks torch.ones_like on a Shard(0) DTensor yields all-
+        # ones local data.
         device_mesh = self.build_device_mesh()
         shard_spec = [Shard(0)]
 
@@ -391,6 +455,8 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
         self.assertEqual(ones_expected, ones_like_dt.to_local())
 
     def test_ones_like_partial_sum(self):
+        # [FUNCTION DOC] Checks ones_like on a Partial DTensor: no communication occurs, the
+        # result is Replicate, and its full tensor is all ones (not scaled by world size).
         device_mesh = self.build_device_mesh()
         shard_spec = [Partial()]
 
@@ -408,6 +474,8 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
         self.assertEqual(ones_expected, ones_like_dt.full_tensor())
 
     def test_fill_inplace_partial_sum(self):
+        # [FUNCTION DOC] Checks in-place fill_ on a Partial(sum) DTensor keeps it Partial, so
+        # the reduced full tensor equals the fill value times world_size.
         device_mesh = self.build_device_mesh()
         shard_spec = [Partial()]
 
@@ -424,6 +492,8 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
         self.assertEqual(fill_expected, dist_tensor.full_tensor())
 
     def test_zeros_like_partial_sum(self):
+        # [FUNCTION DOC] Checks zeros_like on a Partial DTensor: no communication, Replicate
+        # result, full tensor all zeros.
         device_mesh = self.build_device_mesh()
         shard_spec = [Partial()]
 
@@ -441,6 +511,8 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
         self.assertEqual(zeros_expected, zeros_like_dt.full_tensor())
 
     def test_zero_inplace(self):
+        # [FUNCTION DOC] Checks torch.zero_ on a Shard(0) DTensor zeroes the local
+        # data in place.
         device_mesh = self.build_device_mesh()
         shard_spec = [Shard(0)]
 
@@ -452,6 +524,8 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
         self.assertEqual(zeros_expected, dist_tensor.to_local())
 
     def test_zeros_like(self):
+        # [FUNCTION DOC] Checks zeros_like with dtype bfloat16 on a float32 Shard(0) DTensor:
+        # result is bfloat16 zeros and the input dtype is unchanged.
         device_mesh = self.build_device_mesh()
         shard_spec = [Shard(0)]
 
@@ -466,6 +540,10 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
 
     @skip_if_lt_x_gpu(4)
     def test_stack(self):
+        # [FUNCTION DOC] Requires at least 4 GPUs. Stacks DTensors on a 2x2 mesh with
+        # Partial/Replicate inputs and expects Partial/Partial output with shape (2, 4, 8). On a
+        # 1-D mesh checks stacking Shard(1) inputs: dim 0 and dim 1 shift the shard to Shard(2),
+        # dim=-1 keeps Shard(1); full tensors are compared with plain stack.
         mesh_2d = DeviceMesh(
             self.device_type, torch.arange(self.world_size).reshape(2, 2)
         )
@@ -512,6 +590,9 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
         )
 
     def test_stack_cache(self):
+        # [FUNCTION DOC] Stacks a list of three Replicate DTensors, then stacks a second list of
+        # the same specs while patching ShardingPropagator._propagate_tensor_meta_non_cached to
+        # raise; passes only if the second call hits the sharding propagation cache.
         device_mesh = self.build_device_mesh()
 
         shape = (4, 8)
@@ -531,6 +612,8 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
             dtensor_list2.append(dt)
 
         def error(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Replacement that accepts any arguments and always raises
+            # AssertionError, used to prove the cached path is taken.
             raise AssertionError
 
         with unittest.mock.patch.object(
@@ -539,6 +622,9 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
             _ = torch.stack(dtensor_list2)
 
     def test_equal(self):
+        # [FUNCTION DOC] Checks DTensor.equal and is_same_size: equal sharded tensors are equal,
+        # a difference on only some ranks makes equal return False (result is all-reduced), and
+        # comparisons against a Replicate DTensor of different local shape behave as asserted.
         device_mesh = self.build_device_mesh()
         shard_spec = [Shard(0)]
 
@@ -580,6 +666,8 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
         self.assertFalse(input_tensor_2.is_same_size(dist_tensor_3))
 
     def test_is_pinned(self):
+        # [FUNCTION DOC] Checks is_pinned is False for a DTensor built from a
+        # CPU/regular local tensor.
         device_mesh = self.build_device_mesh()
         shard_spec = [Shard(0)]
 
@@ -587,6 +675,10 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
         self.assertFalse(dt.is_pinned())
 
     def _test_op(self, mesh, op_call, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Runs op_call on the plain arguments, then for
+        # every DTensor sharding combination produced by DTensorConverter over the
+        # same arguments asserts the conversion succeeded and the full tensor of
+        # the DTensor result equals the plain result.
         out = op_call(*args, **kwargs)
         dtc = DTensorConverter(mesh, args, kwargs)
         for d_args, d_kwargs in dtc:
@@ -595,6 +687,9 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
             self.assertEqual(d_out.full_tensor(), out)
 
     def test_new_full(self):
+        # [FUNCTION DOC] Checks new_full on Shard(0) and Replicate inputs: a different shape
+        # gives a Replicate result and the same shape keeps the input placement; neither
+        # communicates, and values are 42.
         device_mesh = self.build_device_mesh()
         comm_mode = CommDebugMode()
 
@@ -621,6 +716,10 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
             self.assertEqual(new_full_same_expected, new_full_same_dt.full_tensor())
 
     def test_new_empty_strided(self):
+        # [FUNCTION DOC] Checks new_empty_strided on a Shard(1) DTensor with no
+        # communication: same output shape keeps the sharding and local
+        # size/stride (even or uneven split), while a different output shape gives
+        # a Replicate result with the requested size and stride.
         device_mesh = self.build_device_mesh()
         comm_mode = CommDebugMode()
 
@@ -671,6 +770,11 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
         self.assertEqual(new_empty_strided_dt._local_tensor.stride(), (4, 1))
 
     def test_scatter(self):
+        # [FUNCTION DOC] Checks torch.scatter on DTensors against plain scatter. Case 1:
+        # everything Replicate, no communication, Replicate output, for tensor and scalar src.
+        # Case 2: input, index, src sharded on a non-scatter dim, no communication and output
+        # stays sharded. Case 3: src longer than index on the shard dim with replicated src,
+        # expects a Replicate output (sharded strategy not offered) with correct values.
         device_mesh = self.build_device_mesh()
         comm_mode = CommDebugMode()
 
@@ -751,6 +855,12 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
         self.assertEqual(output_dt.full_tensor(), global_output)
 
     def test_gather(self):
+        # [FUNCTION DOC] Checks torch.gather on DTensors with no communication:
+        # replicated input and index give Replicate output for each dim; input
+        # sharded on the gather dim with an index of size 1 there gives a
+        # _MaskPartial output; replicated input with index sharded on the gather
+        # dim gives output sharded on that dim. Values are compared with plain
+        # gather.
         device_mesh = self.build_device_mesh()
         comm_mode = CommDebugMode()
 
@@ -801,6 +911,10 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
     @unittest.skipIf(TEST_WITH_ROCM, "https://github.com/pytorch/pytorch/issues/175064")
     @serialTest()  # heavy combinatorial _test_op calls, serialize to avoid OOM
     def test_index(self):
+        # [FUNCTION DOC] Runs _test_op over many indexing forms (advanced indexing with one or
+        # two index tensors, index_select on dims 0 and 1, ellipsis, broadcast of index shapes)
+        # on a 1-D mesh. Skipped on ROCm; run serially because of the number of sharding
+        # combinations. Several 3-tensor variants are left commented out to avoid CI timeouts.
         meshes = [
             self.build_device_mesh(),  # 1D mesh
             # TODO(@azzolini): un-comment when DTensorConverter supports N-D mesh
@@ -915,6 +1029,9 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
             # )
 
     def test_index_put_scalar(self):
+        # [FUNCTION DOC] On a 2-D mesh with scalar indices on all dims and a scalar replicated
+        # value, tries all Shard(0)/Shard(1)/Replicate combinations for the input and expects a
+        # DTensor with (Replicate, Replicate) placements equal to plain index_put.
         device_mesh = init_device_mesh(self.device_type, (2, self.world_size // 2))
         global_input = torch.randn(2, 4, 8, device=self.device_type)
         global_index = [
@@ -938,6 +1055,9 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
                 self.assertEqual(output_dt.full_tensor(), ref)
 
     def test_index_put_tensor(self):
+        # [FUNCTION DOC] On a 2-D mesh, index_put with a scalar index on dim 0 and a tensor
+        # value, for accumulate True and False. Expects any Shard placements of the output to be
+        # on dims 1 or 2 and values equal to plain index_put.
         device_mesh = init_device_mesh(self.device_type, (2, self.world_size // 2))
         global_input = torch.randn(2, 4, 8, device=self.device_type)
         global_index = [
@@ -959,6 +1079,8 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
             self.assertEqual(output_dt.full_tensor(), ref)
 
     def test_index_put_requires_replicated_index(self):
+        # [FUNCTION DOC] Checks index_put accepts a Shard(0) index DTensor (it must be
+        # redistributed to Replicate internally) and matches the plain result.
         """Test that index_put correctly replicates sharded indices."""
         device_mesh = init_device_mesh(self.device_type, (self.world_size,))
         global_input = torch.randn(4, 8, device=self.device_type)
@@ -977,6 +1099,8 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
         self.assertEqual(output_dt.full_tensor(), ref)
 
     def test_index_put_no_shard_on_indexed_dim(self):
+        # [FUNCTION DOC] Shards the input on the indexed dim 0 and checks the index_put output
+        # is not sharded on dim 0 and matches the plain result.
         """Test that index_put output is not sharded on indexed dims."""
         device_mesh = init_device_mesh(self.device_type, (self.world_size,))
         global_input = torch.randn(4, 8, device=self.device_type)
@@ -999,6 +1123,9 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
         self.assertEqual(output_dt.full_tensor(), ref)
 
     def test_index_put_partial_numerics(self):
+        # [FUNCTION DOC] index_put with Partial(sum) input and value built from local shares
+        # divided by world size, for accumulate True and False. Expects a Partial output whose
+        # reduced value equals the plain result.
         """Test index_put with Partial placements produces correct numerics."""
         device_mesh = init_device_mesh(self.device_type, (self.world_size,))
         global_input = torch.randn(4, 8, device=self.device_type)
@@ -1023,6 +1150,8 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
             self.assertEqual(output_dt.full_tensor(), ref)
 
     def test_index_put_duplicated_indices(self):
+        # [FUNCTION DOC] index_put with a repeated index entry, input and value sharded on dim 1
+        # and a replicated index, for accumulate False and True, compared with the plain result.
         """Test index_put with duplicated indices for both accumulate modes."""
         device_mesh = init_device_mesh(self.device_type, (self.world_size,))
         global_input = torch.zeros(4, 8, device=self.device_type)
@@ -1054,6 +1183,9 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
         self.assertEqual(output_accum.full_tensor(), ref_accum)
 
     def test_index_put_broadcast_values(self):
+        # [FUNCTION DOC] index_put where the values tensor has a size-1 dim to
+        # broadcast, input sharded on the non-indexed dim 1 and values replicated;
+        # compares with the plain result.
         """Test index_put where values has size-1 broadcast dims."""
         device_mesh = init_device_mesh(self.device_type, (self.world_size,))
         # self shape (4, 8), index on dim 0 -> non-indexed dim is 1
@@ -1073,6 +1205,10 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
         self.assertEqual(output_dt.full_tensor(), ref)
 
     def _test_index_op_partial_propagation(self, op, reduce_op):
+        # [FUNCTION DOC] HELPER: For an index op taking (input, dim 1, index, source) such as
+        # index_copy or index_add, builds Partial(reduce_op) input and source (sum divides
+        # shares by world size; other ops copy the full value on each rank) with a replicated
+        # index, and checks the DTensor result full tensor equals the plain result.
         """Helper: verify Partial placement propagates correctly through an
         index op that decomposes to index_put."""
         device_mesh = init_device_mesh(self.device_type, (self.world_size,))
@@ -1105,10 +1241,14 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
 
     @parametrize("reduce_op", ["sum", "avg", "max", "min"])
     def test_index_copy_partial_propagation(self, reduce_op):
+        # [FUNCTION DOC] Parametrized by reduce_op (sum, avg, max, min); runs the partial
+        # propagation check for index_copy.
         self._test_index_op_partial_propagation(torch.index_copy, reduce_op)
 
     @parametrize("reduce_op", ["sum", "avg"])
     def test_index_add_partial_propagation(self, reduce_op):
+        # [FUNCTION DOC] Parametrized by reduce_op (sum, avg); runs the partial propagation
+        # check for index_add.
         self._test_index_op_partial_propagation(torch.index_add, reduce_op)
 
     @parametrize(
@@ -1116,6 +1256,10 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
         [torch.ops.aten.index_put, torch.index_copy, torch.index_add],
     )
     def test_index_ops_leading_none_dim_mapping(self, op):
+        # [FUNCTION DOC] Regression test, parametrized over aten index_put, index_copy,
+        # index_add: input sharded on dim 0 and source sharded on dim 1 with the index on dim 1
+        # (leading None index). The result must still match plain numerics, i.e. the strategy
+        # must not accept sharding the broadcast dim of the values.
         """Regression: index_put dim-mapping bug when indexed dim is not dim 0.
 
         When indices = (None, index), indexed_dims=[1] is contiguous so
@@ -1151,6 +1295,8 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
         self.assertEqual(output_dt.full_tensor(), ref)
 
     def test_index_fill(self):
+        # [FUNCTION DOC] Checks index_fill on a Shard(0) input with a replicated index along dim
+        # 1 returns a DTensor equal to the plain result.
         """Test index_fill with sharded input."""
         device_mesh = init_device_mesh(self.device_type, (self.world_size,))
         global_input = torch.randn(4, 8, device=self.device_type)
@@ -1169,6 +1315,9 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
 
     @parametrize("reduce_op", ["mean", "amax", "amin", "prod"])
     def test_index_reduce(self, reduce_op):
+        # [FUNCTION DOC] Parametrized by reduce_op (mean, amax, amin, prod);
+        # checks index_reduce on a Shard(0) input and Shard(0) source with
+        # replicated index matches the plain result.
         """Test index_reduce with sharded input."""
         device_mesh = init_device_mesh(self.device_type, (self.world_size,))
         global_input = torch.randn(4, 8, device=self.device_type)
@@ -1187,6 +1336,9 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
         self.assertEqual(output_dt.full_tensor(), ref)
 
     def test_index_put_none_indices(self):
+        # [FUNCTION DOC] Calls aten index_put with indices [idx, None, None]
+        # directly, sharding the input on non-indexed dims 1 and 2 with replicated
+        # index and values; compares with plain.
         """Test index_put with None entries in the indices list.
 
         None indices (meaning "select all along this dim") are only
@@ -1216,6 +1368,9 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
             self.assertEqual(output_dt.full_tensor(), ref)
 
     def test_index_put_inplace_none_indices(self):
+        # [FUNCTION DOC] Same as the previous test but for the in-place aten
+        # index_put_ with None index entries, input sharded on dim 1; checks the
+        # input DTensor is updated to the plain result.
         """Test in-place aten.index_put_ with None entries in the indices list.
 
         The in-place variant with None indices is generated by autograd
@@ -1238,6 +1393,9 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
         self.assertEqual(input_dt.full_tensor(), ref)
 
     def test_index_put_noncontiguous_indexed_dims(self):
+        # [FUNCTION DOC] aten index_put with non-contiguous indexed dims (indices idx0, None,
+        # idx2) on a 4-D input sharded on non-indexed dim 1 with replicated indices and values;
+        # compares with plain.
         """Test index_put with non-contiguous indexed dims (None gaps).
 
         For non-contiguous indexed dims like [idx, None, idx2], advanced
@@ -1268,6 +1426,9 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
         self.assertEqual(output_dt.full_tensor(), ref)
 
     def test_index_put_mid_dim_indexed(self):
+        # [FUNCTION DOC] aten index_put with the indexed dim (dim 2) in the
+        # middle; shards the input on each non-indexed dim (0, 1, 3) with
+        # replicated index and values and compares with plain.
         """Test index_put when indexed dims are in the middle of the tensor."""
         device_mesh = init_device_mesh(self.device_type, (self.world_size,))
         # self[16, 8, 4, 16]: index dim 2, non-indexed dims = [0, 1, 3]
@@ -1292,6 +1453,8 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
             self.assertEqual(output_dt.full_tensor(), ref)
 
     def test_where_type_promotion(self):
+        # [FUNCTION DOC] Checks torch.where with scalar branches (type promotion to int) on a
+        # mask from a Shard(0) or Replicate DTensor equals the plain result.
         mesh = self.build_device_mesh()  # 1D mesh
 
         specs = [[Shard(0)], [Replicate()]]
@@ -1303,6 +1466,10 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
             self.assertEqual(res.full_tensor(), ref)
 
     def test_dtensor_dtype_conversion(self):
+        # [FUNCTION DOC] Converts a bfloat16 Shard(0) DTensor to float and back
+        # with type_as, checking dtypes of the DTensor and local tensor. Clears
+        # the fast-path sharding prop cache first and expects 0 hits and 2 misses
+        # after the conversions, then 1 hit after repeating float().
         from torch.distributed.tensor.debug import (
             _clear_sharding_prop_cache,
             _get_fast_path_sharding_prop_cache_stats,
@@ -1340,6 +1507,10 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
         self.assertEqual(misses, 2)
 
     def test_single_dim_strategy_dtype_cache_key(self):
+        # [FUNCTION DOC] Registers a temporary single-dim strategy for aten._to_copy with schema
+        # info marking dtype as a static kwarg key (patching the propagator's dicts), then casts
+        # a DTensor to int32 and float64. Expects the strategy function to be called twice,
+        # showing dtype is part of the cache key.
         """Test that schema_info from single-dim strategy affects cache key.
 
         When @register_single_dim_strategy specifies static_kwargkey=["dtype"],
@@ -1358,6 +1529,10 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
         call_count = [0]
 
         def to_copy_single_dim_strategy(op, args_schema, kwargs_schema):
+            # [FUNCTION DOC] HELPER: Fake single-dim strategy for _to_copy: counts calls in
+            # call_count and returns, for each tensor dim, a strategy list pairing the same
+            # sharding placeholder for output and input. Raises AssertionError if the first arg
+            # is not TensorMeta.
             call_count[0] += 1
             self_meta = args_schema[0]
             if not isinstance(self_meta, TensorMeta):
@@ -1398,6 +1573,9 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
             self.assertEqual(call_count[0], 2)
 
     def test_slice(self):
+        # [FUNCTION DOC] Slices a Shard(1) DTensor with [:, 8:], expecting one collective in the
+        # forward and one in the backward (checked with CommDebugMode), and that the full output
+        # and the gradient equal the plain results.
         mesh = self.build_device_mesh()  # 1D mesh
         comm_mode = CommDebugMode()
 
@@ -1424,6 +1602,9 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
         self.assertEqual(sharded_dtensor.grad.full_tensor(), global_tensor.grad)
 
     def test_slice_full_size_on_sharded_dim(self):
+        # [FUNCTION DOC] Regression test for issue 170427: slices of a Shard(1) DTensor,
+        # including a full-size and beyond-size slice, which must work (they may use aten.alias)
+        # and match plain.
         """
         Test for the issue #170427 where slicing with a size that equals or
         exceeds the full dimension size should work correctly on sharded
@@ -1456,6 +1637,8 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
         self.assertEqual(result5.full_tensor(), global_tensor[:2, :])
 
     def test_split_on_partial(self):
+        # [FUNCTION DOC] Runs _test_split_on_partial over the product of reduce_op (sum, avg,
+        # min, max), split_size (2, 3, 4) and split_dim (0, 1) via run_subtests.
         self.run_subtests(
             {
                 "reduce_op": ["sum", "avg", "min", "max"],
@@ -1466,6 +1649,9 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
         )
 
     def _test_split_on_partial(self, reduce_op: str, split_size: int, split_dim: int):
+        # [FUNCTION DOC] HELPER: Seeds per-rank RNG, builds a Partial(reduce_op)
+        # DTensor from an 8x8 local tensor and runs _test_op_on_dtensor with
+        # torch.split with the given size and dim.
         self.init_manual_seed_for_rank()
         mesh = self.build_device_mesh()
 
@@ -1483,6 +1669,10 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
         )
 
     def test_unbind(self):
+        # [FUNCTION DOC] Unbinds a Shard(shard_dim) DTensor over each unbind dim.
+        # When the dims are equal it expects a RuntimeError containing 'Sharding
+        # propagation failed'; otherwise outputs are sharded on the shifted dim
+        # and each equals the plain unbind result.
         device_mesh = self.build_device_mesh()
         shard_dims = [0, 1]
         unbind_dims = [0, 1]
@@ -1513,6 +1703,9 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
 
     @with_comms
     def test_select_scatter(self):
+        # [FUNCTION DOC] select_scatter on DTensors for dims 0,1,2 with the input and source
+        # sharded on every dim other than the selected one; result matches plain and keeps the
+        # input shard dim.
         device_mesh = self.build_device_mesh()
         inp = torch.randn(8, 4, 6, device=self.device_type)
         # select_scatter(self, src, dim, index): insert src at self[:, :, index]
@@ -1534,6 +1727,8 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
 
     @with_comms
     def test_diagonal_scatter(self):
+        # [FUNCTION DOC] diagonal_scatter over dims 1 and 2 with input and source sharded on
+        # batch dim 0; result matches plain and stays Shard(0).
         device_mesh = self.build_device_mesh()
         inp = torch.randn(8, 4, 6, device=self.device_type)
 
@@ -1550,8 +1745,12 @@ class DistTensorOpsTest(DTensorContinuousTestBase):
 
 
 class DistBucketizeTest(LocalDTensorTestBase):
+    # [CLASS DOC] Tests of torch.bucketize on DTensors using LocalTensor mode (single process).
     @with_comms
     def test_bucketize_partial_input(self):
+        # [FUNCTION DOC] Checks Partial inputs to bucketize with replicated boundaries: sum and
+        # avg are redistributed to Replicate, while max and min stay Partial with the same
+        # reduce_op; values are compared with plain bucketize.
         # Bucketize is non-linear, so Partial("sum")/Partial("avg") inputs
         # must be converted to Replicate. But bucketize is monotone, so
         # Partial("max") and Partial("min") can propagate directly.
@@ -1603,6 +1802,8 @@ class DistBucketizeTest(LocalDTensorTestBase):
 
     @with_comms
     def test_bucketize_sharded_input(self):
+        # [FUNCTION DOC] Checks bucketize of a sharded input (dim 0 and 1) with replicated
+        # boundaries keeps the sharding on the output and matches plain.
         # Sharded inputs should propagate sharding to output normally.
         with LocalTensorMode(ranks=self.world_size):
             mesh = self.build_device_mesh()
@@ -1620,6 +1821,8 @@ class DistBucketizeTest(LocalDTensorTestBase):
 
     @with_comms
     def test_bucketize_sharded_boundaries(self):
+        # [FUNCTION DOC] Checks bucketize of a replicated input with Shard(0) boundaries gives
+        # the plain result.
         # When boundaries are sharded on dim 0, each rank counts how many of
         # its local boundary values each input exceeds. The sum across ranks
         # (Partial("sum")) gives the correct global bucket index.
@@ -1639,8 +1842,13 @@ class DistBucketizeTest(LocalDTensorTestBase):
 
 
 class DistToCopyTest(LocalDTensorTestBase):
+    # [CLASS DOC] Tests of the _to_copy cast on Partial DTensors using LocalTensor mode.
     @with_comms
     def test_to_copy_partial_reduces_for_nonlinear_cast(self):
+        # [FUNCTION DOC] For a table of (reduce_op, dtype, expected) casts of a Partial DTensor,
+        # checks the result stays Partial with the same reduce_op when the cast is safe (float
+        # to float for sum, monotonic int cast for max) and is Replicate otherwise (sum to int
+        # or bool, max to bool).
         # (reduce_op, target_dtype, expect_partial)
         cases = [
             ("sum", torch.int32, False),  # truncation breaks additivity
@@ -1670,6 +1878,8 @@ class DistToCopyTest(LocalDTensorTestBase):
 
 
 class DistArgMaxArgMinTest(DTensorContinuousTestBase):
+    # [CLASS DOC] Tests argmax and argmin on a 2x2 mesh with world size 4. Holds the sample 8x8
+    # int data, the ops under test and the list of placements pairs used.
     world_size = 4
     _ops = [torch.argmax, torch.argmin]
     sample = [
@@ -1692,6 +1902,8 @@ class DistArgMaxArgMinTest(DTensorContinuousTestBase):
 
     @skip_if_lt_x_gpu(4)
     def test_argmax_argmin_with_placements(self):
+        # [FUNCTION DOC] Requires 4 GPUs. For each placements pair (including Partial) and for
+        # argmax and argmin over dim 1, checks the DTensor full result equals the plain result.
         device_mesh = self.build_device_mesh()
         local_tensor = torch.tensor(self.sample, device=self.device_type)
         for placements in self.placements_tuples:
@@ -1703,6 +1915,9 @@ class DistArgMaxArgMinTest(DTensorContinuousTestBase):
                 self.assertEqual(full_dresult, local_result)
 
     def test_argmax_argmin_sharded_reduction_dim(self):
+        # [FUNCTION DOC] On a 1-D mesh with a Shard(0) tensor, checks argmax/argmin over the
+        # sharded dim 0 and over all elements match plain results (inputs are redistributed to
+        # Replicate, no Partial output).
         """Unlike max/min which use reduction_linear=True and produce
         Partial("max")/Partial("min") outputs, argmax/argmin return indices
         that can't be combined across shards with an element-wise max/min.
@@ -1718,6 +1933,7 @@ class DistArgMaxArgMinTest(DTensorContinuousTestBase):
             self.assertEqual(op(dtensor).full_tensor(), op(tensor))
 
     def build_device_mesh(self):
+        # [FUNCTION DOC] Returns a 2x2 device mesh, overriding the 1-D mesh default.
         return init_device_mesh(self.device_type, (2, 2))
 
 
@@ -1737,21 +1953,30 @@ DistTensorOpsTestWithLocalTensor = create_local_tensor_test_class(
 def optional_clamp_op(
     x: torch.Tensor, lo: torch.Tensor | None, hi: torch.Tensor | None
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Custom op testlib::optional_clamp_op; returns clamp of x with
+    # optional lo and hi tensor bounds.
     return torch.clamp(x, lo, hi)
 
 
 @optional_clamp_op.register_fake
 def _optional_clamp_op_fake(x, lo, hi):
+    # [FUNCTION DOC] HELPER: Fake (meta) kernel for optional_clamp_op; returns an
+    # empty tensor like x.
     return torch.empty_like(x)
 
 
 @torch.library.custom_op("testlib::modified_cat_op", mutates_args=())
 def modified_cat_op(a: list[torch.Tensor], b: list[torch.Tensor]) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Custom op testlib::modified_cat_op; concatenates list a along dim 0
+    # and ignores list b (b only exists to test caching of two list args).
     return torch.cat(a, dim=0)
 
 
 @modified_cat_op.register_fake
 def _modified_cat_op_fake(a, b):
+    # [FUNCTION DOC] HELPER: Fake kernel for modified_cat_op; returns an empty tensor whose rows
+    # are the sum of the first dims of list a and whose other dims, dtype and device come from
+    # the first tensor of a.
     total_rows = sum(t.shape[0] for t in a)
     return torch.empty(
         total_rows, *a[0].shape[1:], dtype=a[0].dtype, device=a[0].device
@@ -1759,7 +1984,12 @@ def _modified_cat_op_fake(a, b):
 
 
 class DistTensorCppPyTree(DTensorContinuousTestBase):
+    # [CLASS DOC] Tests the C++ fast-path sharding propagation cache with pytree-style (list and
+    # optional tensor) arguments, using hit/miss statistics from the debug module.
     def test_cpp_cat(self):
+        # [FUNCTION DOC] For three cat cases (Shard(1), Replicate with different sizes, Shard(0)
+        # on the cat dim giving Replicate), clears the cache, checks result placement and
+        # values, and that a second identical cat is a cache hit (hits equals 1).
         from torch.distributed.tensor.debug import (
             _clear_fast_path_sharding_prop_cache,
             _get_fast_path_sharding_prop_cache_stats,
@@ -1793,6 +2023,9 @@ class DistTensorCppPyTree(DTensorContinuousTestBase):
             )
 
     def test_foreach_mixed_dtensor_and_tensor(self):
+        # [FUNCTION DOC] Under implicit_replication, runs _foreach_add_ on a list of a DTensor
+        # and a regular tensor twice; checks both are updated, the first call is a cache miss
+        # and the second a hit.
         from torch.distributed.tensor.debug import (
             _clear_fast_path_sharding_prop_cache,
             _get_fast_path_sharding_prop_cache_stats,
@@ -1820,6 +2053,9 @@ class DistTensorCppPyTree(DTensorContinuousTestBase):
             self.assertEqual(hits, 1)
 
     def test_two_list_op_cache_collision(self):
+        # [FUNCTION DOC] Registers replicate_op_strategy for modified_cat_op with pytree-aware
+        # schema info, calls it with two different list-length combinations, and expects two
+        # misses and no hits (no cache collision) and an output shape of 8x8.
         from torch.distributed.tensor._op_schema import RuntimeSchemaInfo
         from torch.distributed.tensor._ops.utils import replicate_op_strategy
         from torch.distributed.tensor.debug import (
@@ -1847,6 +2083,9 @@ class DistTensorCppPyTree(DTensorContinuousTestBase):
             self.assertEqual(result.shape, torch.Size([8, 8]))
 
     def test_optional_tensor_cache_key(self):
+        # [FUNCTION DOC] Regression test: the cache key must distinguish None in different
+        # positions of optional tensor args. Calls optional_clamp_op with None in the last two
+        # positions and expects 0 hits and 2 misses.
         """Cache must distinguish op(t1, None, t2) from op(t1, t2, None).
 
         Uses a custom op with high static_argnum so that None args for
@@ -1880,6 +2119,9 @@ class DistTensorCppPyTree(DTensorContinuousTestBase):
             self.assertEqual(misses, 2)
 
     def test_optional_tensor_cache_key_python_slow_path(self):
+        # [FUNCTION DOC] Builds two OpSchema objects differing only in the position of a None
+        # arg, recomputes their comparison keys, and checks their hashes and equality differ
+        # (Python slow path).
         """Same as above but exercises the Python slow path via OpSchema directly.
 
         DTensor_OpSchema_recompute_comparison_key_impl must include None
@@ -1905,8 +2147,13 @@ class DistTensorCppPyTree(DTensorContinuousTestBase):
 
 
 class TestNewEmptyStridedUneven(DTensorTestBase):
+    # [CLASS DOC] Tests new_empty/new_empty_strided behavior and autograd on unevenly sharded
+    # DTensors, using the standard (not local-tensor) multi-process test base.
     @with_comms
     def test_backward_no_allgather(self):
+        # [FUNCTION DOC] Regression test for issue 107661: backward through to_local of an
+        # unevenly sharded Shard(1) DTensor causes no communication and gives a contiguous grad
+        # with the same placement and value 2.
         """Backward on unevenly-sharded DTensor should not allgather (issue #107661)."""
         mesh = self.build_device_mesh()
         placement = (Shard(1),)
@@ -1925,6 +2172,8 @@ class TestNewEmptyStridedUneven(DTensorTestBase):
 
     @with_comms
     def test_new_empty_propagates_partial(self):
+        # [FUNCTION DOC] Checks new_empty and new_empty_strided on a Partial DTensor keep the
+        # Partial placement, while new_ones gives Replicate (issue 180486).
         """new_empty/new_empty_strided on a Partial DTensor should inherit Partial.
 
         Uninitialized memory will be overwritten immediately, so the placement
@@ -1954,6 +2203,9 @@ class TestNewEmptyStridedUneven(DTensorTestBase):
 
     @with_comms
     def test_backward_partial_grad_with_transpose(self):
+        # [FUNCTION DOC] Regression test (issue 180486): a Replicate DTensor parameter used with
+        # to_local(grad_placements=Partial) and a transpose, so the gradient is non-contiguous;
+        # a post-accumulate-grad hook records the grad placements, which must all be Partial.
         """Backward preserves Partial placement when grad is non-contiguous (issue #180486).
 
         When a Replicate DTensor parameter is used with to_local(grad_placements=[Partial()]),
@@ -1964,17 +2216,27 @@ class TestNewEmptyStridedUneven(DTensorTestBase):
         mesh = self.build_device_mesh()
 
         class _Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with one 4x8x8 weight parameter that records the
+            # placements of its gradient in _grad_placement via a post-accumulate hook.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the random weight parameter and
+                # _grad_placement (None).
                 super().__init__()
                 self.weight = torch.nn.Parameter(torch.randn(4, 8, 8))
                 self._grad_placement = None
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: If the weight is a DTensor, converts it to local with
+                # Partial grad placements and registers a hook that stores the grad placements.
+                # Then transposes and makes contiguous, and returns the matrix product of x with
+                # the first slice.
                 w = self.weight
                 if isinstance(w, DTensor):
                     w = w.to_local(grad_placements=[Partial()])
 
                     def _capture(param, model=self):
+                        # [FUNCTION DOC] HELPER: Hook that stores the DTensor grad
+                        # placements on the model.
                         if param.grad is not None and isinstance(param.grad, DTensor):
                             model._grad_placement = param.grad.placements
 
@@ -2006,6 +2268,9 @@ class TestNewEmptyStridedUneven(DTensorTestBase):
 
     @with_comms
     def test_backward_channels_last(self):
+        # [FUNCTION DOC] Backward through to_local of an unevenly sharded
+        # channels-last Shard(2) DTensor: no communication, the grad keeps the
+        # placement, channels-last strides and value 2.
         """Backward preserves channels-last stride order for unevenly-sharded DTensor."""
         mesh = self.build_device_mesh()
         placement = (Shard(2),)
