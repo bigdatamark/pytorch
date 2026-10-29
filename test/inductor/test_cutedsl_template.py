@@ -1,4 +1,11 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests for the Inductor CuteDSL template backend (CuteDSLTemplate,
+# CuteDSLTemplateKernel, CuteDSLOpOverrides, CuteDSLScheduling and the modification
+# wrapper). Defines a CuteDSL elementwise-add template source string used by the end to
+# end tests. The cutlass import is optional: a flag records availability, the codegen
+# imports happen only when it is present, and the whole test class is skipped otherwise.
+# Most tests run on mock graph handlers and inspect generated code text; two end to end
+# tests need CUDA.
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -70,9 +77,20 @@ def {{kernel_name}}_jit(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor, strea
 
 @unittest.skipUnless(HAS_CUTLASS, "requires cutlass")
 class TestCuteDSLTemplate(TestCase):
+    # [CLASS DOC] Test case covering CuteDSL template kernels: import and define
+    # generation, template registry uniqueness, def_kernel and get_output hooks, subgraph
+    # lookup, index expression printing, scalar versus tensor SSA op lowering, load
+    # fragment reuse, fast math flags, CSE and scheduler fusion. Skipped entirely when
+    # cutlass cannot be imported. Holds no state.
     """Test cases for CuteDSL template functionality."""
 
     def test_vendored_dense_efc_kernel_configuration(self):
+        # [FUNCTION DOC] Builds the vendored dense GEMM EFC kernel for a one-CTA and a
+        # two-CTA configuration (tile M 128 with cluster M 1, and tile M 256 with cluster
+        # M 2, tile N 64 in both) using float32 accumulation, bfloat16 output and the
+        # identity epilogue converter. Asserts that arch is sm_100, the tiler and cluster
+        # shapes and CTA group match the inputs, output dtype is bfloat16 and threads per
+        # CTA is 224. Needs cutlass operators but no GPU.
         from cutlass.cute.nvgpu import tcgen05
         from cutlass.operators.providers.cutedsl.evt.converter import EFCConverter
 
@@ -100,6 +118,10 @@ class TestCuteDSLTemplate(TestCase):
             self.assertEqual(kernel.threads_per_cta, 224)
 
     def test_gen_imports(self):
+        # [FUNCTION DOC] Checks the import preamble produced by a CuteDSL kernel: it is a
+        # string containing the torch, cutlass, cute and from_dlpack imports, has exactly
+        # eight non-empty lines after stripping surrounding whitespace, and needs no graph
+        # handler.
         kernel = CuteDSLTemplateKernel(
             kernel_name="test_kernel",
             input_nodes=[],
@@ -118,6 +140,11 @@ class TestCuteDSLTemplate(TestCase):
         self.assertEqual(len(lines), 8)
 
     def test_render_includes_imports(self):
+        # [FUNCTION DOC] Renders a kernel using a mock template whose render returns a
+        # fixed source with a cute kernel decorator. Asserts the result is a PartialRender
+        # and that its code (ignoring leading whitespace) begins with the torch import,
+        # includes the cutlass, cute and from_dlpack imports, and still contains the
+        # original decorator text.
         template_source = """@cute.kernel
 def {{kernel_name}}_kernel():
     pass
@@ -152,6 +179,9 @@ def {{kernel_name}}_kernel():
         self.assertIn("@cute.kernel", rendered_code)
 
     def test_template_env_contains_hooks(self):
+        # [FUNCTION DOC] Verifies that the keyword arguments passed to the template render
+        # call contain the def_kernel hook (callable) and the kernel_name entry. Uses a
+        # local fake render that records its keyword arguments into a dict.
         kernel = CuteDSLTemplateKernel(
             kernel_name="test_kernel",
             input_nodes=[],
@@ -161,6 +191,9 @@ def {{kernel_name}}_kernel():
         captured_env = {}
 
         def mock_render(**kwargs):
+            # [FUNCTION DOC] HELPER: Fake template render that copies all keyword
+            # arguments into the enclosing captured_env mapping and returns the fixed
+            # string "rendered".
             captured_env.update(kwargs)
             return "rendered"
 
@@ -174,6 +207,10 @@ def {{kernel_name}}_kernel():
         self.assertTrue(callable(captured_env["def_kernel"]))
 
     def test_multiple_templates_unique_names(self):
+        # [FUNCTION DOC] Registering two CuteDSLTemplate objects under the same name must
+        # raise an AssertionError on the second. First removes any stale entry for the
+        # per-instance test name from the class-level registry (global state shared across
+        # tests).
         # Clean registry first
         test_name = f"unique_test_{id(self)}"
         if test_name in CuteDSLTemplate.all_templates:
@@ -191,6 +228,9 @@ def {{kernel_name}}_kernel():
             )
 
     def test_indented_buffer_usage(self):
+        # [FUNCTION DOC] Asserts that no non-empty line of the generated import preamble
+        # starts with a space, i.e. the indented buffer used for imports emits them at
+        # column zero.
         kernel = CuteDSLTemplateKernel(
             kernel_name="test_kernel",
             input_nodes=[],
@@ -209,6 +249,13 @@ def {{kernel_name}}_kernel():
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
     def test_cutedsl_add_e2e(self):
+        # [FUNCTION DOC] End to end test, skipped without CUDA. Registers a template from
+        # the add source and patches the lowering of the aten add op with a lowering that
+        # builds one template choice (256 threads per block) and returns its output node,
+        # falling back to the default lowering if building fails. Compiles an add function
+        # with the inductor backend on 128 by 4 float32 CUDA tensors, checks the generated
+        # code mentions cute and the THREADS_PER_BLOCK parameter, and checks the result
+        # matches the eager sum within tolerance.
         """End-to-end test with CuteDSL template including code generation verification."""
         from torch._inductor.ir import TensorBox
         from torch._inductor.lowering import lowerings
@@ -220,6 +267,10 @@ def {{kernel_name}}_kernel():
         )
 
         def cutedsl_add_lowering(a: TensorBox, b: TensorBox) -> TensorBox:
+            # [FUNCTION DOC] HELPER: Replacement lowering for tensor add. Appends one
+            # template choice with THREADS_PER_BLOCK 256; if appending reports an error or
+            # yields no choice, delegates to the registered default add lowering, else
+            # returns the choice's output node (no autotuning).
             choices = []
             error = template.maybe_append_choice(
                 choices,
@@ -238,6 +289,8 @@ def {{kernel_name}}_kernel():
         with patch.dict(lowerings, {torch.ops.aten.add.Tensor: cutedsl_add_lowering}):
             # Test function
             def test_add(x, y):
+                # [FUNCTION DOC] HELPER: Plain function adding its two tensor arguments;
+                # the function that is compiled.
                 return x + y
 
             device = "cuda"
@@ -263,6 +316,12 @@ def {{kernel_name}}_kernel():
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
     def test_cutedsl_add_e2e_autotune(self):
+        # [FUNCTION DOC] End to end autotune test, skipped without CUDA. Registers a
+        # template and patches the add lowering to create one choice for each of 128, 256
+        # and 512 threads per block (skipping variants that report an error), then selects
+        # among them with autotune_select_algorithm, falling back to the default lowering
+        # when there are no choices. Compiles and runs an add on 128 by 128 float32 CUDA
+        # tensors and checks the result against the eager sum.
         """E2E test with multiple CuteDSL template variants for autotuning."""
         from torch._inductor.ir import TensorBox
         from torch._inductor.lowering import lowerings
@@ -274,6 +333,9 @@ def {{kernel_name}}_kernel():
         )
 
         def cutedsl_add_lowering(a: TensorBox, b: TensorBox) -> TensorBox:
+            # [FUNCTION DOC] HELPER: Replacement add lowering that builds several thread
+            # count variants of the template, autotunes among them and returns the
+            # selected node; uses the default lowering if no variant could be built.
             choices = []
 
             # Add multiple variants with different thread counts for autotuning
@@ -305,6 +367,8 @@ def {{kernel_name}}_kernel():
         with patch.dict(lowerings, {torch.ops.aten.add.Tensor: cutedsl_add_lowering}):
             # Test function
             def test_add(x, y):
+                # [FUNCTION DOC] HELPER: Plain function adding its two tensor arguments;
+                # the function that is compiled.
                 return x + y
 
             device = "cuda"
@@ -320,6 +384,9 @@ def {{kernel_name}}_kernel():
             self.assertTrue(torch.allclose(result, expected, atol=1e-5))
 
     def test_gen_defines(self):
+        # [FUNCTION DOC] Checks gen_defines output: keyword parameters become one
+        # constexpr declaration line each, in argument order, for integers, booleans and
+        # floats, compared with an inline expected string.
         """Test that gen_defines correctly generates CuteDSL parameter definitions."""
         kernel = CuteDSLTemplateKernel(
             kernel_name="test_kernel",
@@ -352,6 +419,11 @@ SCALE_FACTOR: cutlass.Constexpr = 1.5
         )
 
     def test_template_aliasing(self):
+        # [FUNCTION DOC] Using mock buffers and a mock graph handler, creates a kernel
+        # with two inputs and one output, calls def_kernel with custom names, and checks
+        # the call returns the placeholder text and registers it in render_hooks. Invoking
+        # the registered hook must yield code that aliases each custom name to the
+        # corresponding argument name with an arg_ prefix.
         """Test that template variables are correctly aliased to function arguments."""
         from torch._inductor.ir import Buffer
 
@@ -385,6 +457,10 @@ SCALE_FACTOR: cutlass.Constexpr = 1.5
             self.assertIn("custom_b = arg_custom_b", generated_code)
 
     def test_get_output_hook(self):
+        # [FUNCTION DOC] Checks get_output: with a mock output buffer, it raises
+        # ValueError while the kernel has no registered output buffer; after the buffer
+        # name is mapped to an argument name in the kernel args, it returns that argument
+        # name.
         """Test the get_output() template hook."""
         from torch._inductor.ir import Buffer
 
@@ -408,6 +484,9 @@ SCALE_FACTOR: cutlass.Constexpr = 1.5
             self.assertEqual(result, "arg_buf_test_output")
 
     def test_modification_subgraph(self):
+        # [FUNCTION DOC] Checks subgraph lookup on a kernel built with two mock subgraphs:
+        # index 0 and 1 return the matching subgraph and an out of range index raises
+        # AssertionError.
         """Test the modification() method and subgraph processing."""
 
         from torch._inductor.ir import Buffer
@@ -436,6 +515,8 @@ SCALE_FACTOR: cutlass.Constexpr = 1.5
             kernel._get_subgraph(2)
 
     def test_kexpr_prints_modular_indexing(self):
+        # [FUNCTION DOC] Verifies that kexpr prints a ModularIndexing sympy expression
+        # with base 1 and modulus 2 as a parenthesized modulo of the symbol by 2.
         import sympy
 
         from torch.utils._sympy.functions import ModularIndexing
@@ -452,6 +533,9 @@ SCALE_FACTOR: cutlass.Constexpr = 1.5
             self.assertEqual(kernel.kexpr(expr), "(tmp1 % 2)")
 
     def test_index_expr_supports_modular_indexing(self):
+        # [FUNCTION DOC] Verifies that the CuteDSL index_expr override accepts
+        # ModularIndexing: it returns a CSEVariable with int64 dtype and the emitted
+        # kernel body contains the modulo expression.
         import sympy
 
         from torch._inductor.codegen.common import CSEVariable
@@ -478,6 +562,11 @@ SCALE_FACTOR: cutlass.Constexpr = 1.5
             self.assertIn("(tmp1 % 2)", kernel.body.getvalue())
 
     def test_index_expr_scalar_arithmetic_stays_scalar(self):
+        # [FUNCTION DOC] Checks that index_expr results combined with the neg and add
+        # overrides remain scalar: results are CSEVariable objects, the index_expr
+        # attribute tracks the symbolic expression (including the added constant), the
+        # body holds plain scalar assignments for the modulo, negation and addition, and
+        # the body has no TensorSSA construction, full_like, shape or dtype usage.
         import sympy
 
         from torch._inductor.codegen.common import CSEVariable
@@ -521,6 +610,10 @@ SCALE_FACTOR: cutlass.Constexpr = 1.5
             self.assertNotIn(".dtype", body)
 
     def test_index_expr_abs_and_where_stay_scalar(self):
+        # [FUNCTION DOC] Checks that abs, eq and where applied to a scalar index_expr
+        # value stay scalar: all results are CSEVariable objects, the body uses the mlir
+        # absi math call and a where call, and has no TensorSSA construction, full_like,
+        # shape or dtype usage.
         import sympy
 
         from torch._inductor.codegen.common import CSEVariable
@@ -559,6 +652,9 @@ SCALE_FACTOR: cutlass.Constexpr = 1.5
             self.assertNotIn(".dtype", body)
 
     def test_mod_does_not_attach_python_mod_index_expr(self):
+        # [FUNCTION DOC] Checks that applying the mod override to an index_expr of a plain
+        # symbol returns a value without an index_expr attribute (no symbolic expression
+        # is attached).
         import sympy
 
         from torch._inductor.codegen.cutedsl.cutedsl_op_overrides import (
@@ -581,6 +677,10 @@ SCALE_FACTOR: cutlass.Constexpr = 1.5
             self.assertIsNone(getattr(mod_result, "index_expr", None))
 
     def test_missing_vector_load_config_is_not_lane_uniform(self):
+        # [FUNCTION DOC] Checks the modification wrapper's index fragment analysis. With
+        # an empty vector load config it returns three values: not lane uniform, not
+        # vector, no extra info. With a vec size of 1 config that names the index, it
+        # returns lane uniform true, the other flags unchanged.
         import sympy
 
         from torch._inductor.codegen.cutedsl.cutedsl_kernel import (
@@ -618,6 +718,11 @@ SCALE_FACTOR: cutlass.Constexpr = 1.5
             )
 
     def test_neg_on_loaded_tensor_cse_uses_tensor_ssa(self):
+        # [FUNCTION DOC] With a mock float32 buffer in the graph handler, loads from it
+        # via the modification wrapper and applies the neg override. Asserts the loaded
+        # value is a CSEVariable of shape (1,), the body allocates a one element register
+        # tensor of float32, and the negation is emitted by building a TensorSSA from the
+        # negated operand with its shape and dtype.
         import sympy
 
         from torch._inductor.codegen.common import CSEVariable
@@ -651,6 +756,11 @@ SCALE_FACTOR: cutlass.Constexpr = 1.5
             self.assertIn("tmp2 = cute.TensorSSA(-tmp1, tmp1.shape, tmp1.dtype)", body)
 
     def test_repeated_captured_load_reuses_generated_fragments(self):
+        # [FUNCTION DOC] Loads from captured mock buffers with the modification wrapper.
+        # Loading the same buffer and index twice returns the identical variable, while a
+        # different index or different buffer returns a new one. The body must contain the
+        # register tensor allocation exactly three times, showing the repeated load
+        # generated no extra fragment.
         import sympy
 
         from torch._inductor.codegen.cutedsl.cutedsl_kernel import (
@@ -687,6 +797,13 @@ SCALE_FACTOR: cutlass.Constexpr = 1.5
         )
 
     def test_cutedsl_op_overrides(self):
+        # [FUNCTION DOC] Exercises many CuteDSLOpOverrides methods (arithmetic, unary and
+        # binary math, floor, logical xor) on two mock CSEVariable operands named tensor_a
+        # and tensor_b, with shape (32, 64) and float32 dtype, inside a mock graph and
+        # kernel handler. Each result must be a CSEVariable and the kernel body must
+        # contain the expected operator or cute math call text. Also checks the scalar-to-
+        # tensor helper wraps a scalar string in a full_like call and passes a tensor
+        # through unchanged.
         """Test the new CuteDSLOpOverrides class."""
         import torch
         from torch._inductor.codegen.common import CSEVariable
@@ -808,6 +925,10 @@ SCALE_FACTOR: cutlass.Constexpr = 1.5
         self.assertEqual(tensor_result, "tensor_a")
 
     def test_cutedsl_op_overrides_fast_math(self):
+        # [FUNCTION DOC] Runs a set of unary ops plus atan2 on mock operands with the fast
+        # math context manager enabled and disabled and compares generated bodies. With
+        # fast math on, every line that calls cute math (and at least one must exist)
+        # carries the fastmath flag; with it off the flag never appears.
         from torch._inductor.codegen.common import CSEVariable
         from torch._inductor.codegen.cutedsl.cutedsl_op_overrides import (
             CuteDSLOpOverrides,
@@ -828,6 +949,10 @@ SCALE_FACTOR: cutlass.Constexpr = 1.5
         mock_cse_b.shape = (32, 64)
 
         def generate(fast_math):
+            # [FUNCTION DOC] HELPER: Builds a fresh kernel, activates it as kernel handler
+            # together with the fast math setting, applies each listed unary op name and
+            # atan2 to the mock operands (checking each returns a CSEVariable), and
+            # returns the accumulated kernel body text.
             kernel = CuteDSLTemplateKernel(
                 kernel_name="test_fast_math",
                 input_nodes=[],
@@ -874,6 +999,9 @@ SCALE_FACTOR: cutlass.Constexpr = 1.5
         self.assertNotIn("fastmath=True", precise_body)
 
     def test_cse_integration(self):
+        # [FUNCTION DOC] Checks the kernel's CSE object: it is a CSE instance with name
+        # prefix tmp, and generating an expression through it into the body yields a
+        # variable whose name starts with tmp.
         """Test CSE (Common Subexpression Elimination) integration."""
         from torch._inductor.codegen.common import CSE
 
@@ -894,6 +1022,8 @@ SCALE_FACTOR: cutlass.Constexpr = 1.5
                 self.assertTrue(str(var).startswith("tmp"))
 
     def test_can_fuse_horizontal_returns_false(self):
+        # [FUNCTION DOC] Checks that CuteDSLScheduling, built with no scheduler, answers
+        # False to horizontal fusion for any pair of nodes.
         sched = CuteDSLScheduling(scheduler=None)
         self.assertIs(sched.can_fuse_horizontal(MagicMock(), MagicMock()), False)
 
