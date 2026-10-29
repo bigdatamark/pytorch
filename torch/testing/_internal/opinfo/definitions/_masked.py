@@ -1,5 +1,13 @@
 # mypy: ignore-errors
 
+# [MODULE DOC]
+# OpInfo database for the torch.masked operators (masked.sum, prod, amax, amin, mean, norm,
+# var, std, softmax, log_softmax, softmin, cumsum, cumprod, logaddexp, logsumexp, normalize
+# and similar). Provides sample-input generators (dense, sparse COO and sparse CSR variants),
+# a mask generator, a numpy reference wrapper for masked std/var, and the module-level list
+# op_db of OpInfo/ReductionOpInfo entries consumed by the generic operator tests.
+# Import-time side effects: builds op_db only; no global state is mutated.
+
 import unittest
 from collections.abc import Sequence
 from functools import partial
@@ -41,6 +49,13 @@ def sample_inputs_softmax_variant(
     use_zero_dimensions=True,
     **kwargs,
 ):
+    # [FUNCTION DOC] Generator-style helper (returns a generator expression) of SampleInput
+    # objects for softmax-like ops. Inputs are tensors of several shapes (including an empty
+    # one when use_zero_dimensions is true, and a 0-d one except on xla), each paired with a
+    # dim argument passed as positional args. With with_dtype, a dtype keyword (bfloat16 on
+    # mps, else float64) is passed. Takes op_info, device, dtype, requires_grad.
+    # KNOWN ISSUE: the incoming **kwargs argument is discarded because the name is rebound
+    # to the dtype keyword mapping (or None).
     make_arg = partial(
         make_tensor, device=device, dtype=dtype, requires_grad=requires_grad
     )
@@ -73,6 +88,11 @@ def sample_inputs_softmax_variant(
 
 
 def _generate_masked_op_mask(input_shape, device, **kwargs):
+    # [FUNCTION DOC] HELPER: Generator yielding candidate masks for an input of input_shape:
+    # first None (no mask), then a random bool mask of the full shape. For inputs with more
+    # than two dims it also yields masks broadcastable to the input: last, middle and first
+    # dim collapsed to size one, a mask with one fewer leading dim, and a 1-d mask matching
+    # the last dim. Masks never require gradients. Extra kwargs are ignored.
     make_arg = partial(
         make_tensor, dtype=torch.bool, device=device, requires_grad=False
     )
@@ -96,6 +116,11 @@ def _generate_masked_op_mask(input_shape, device, **kwargs):
 
 
 def sample_inputs_masked_reduction(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for masked reductions. Takes every
+    # sample from the generic reduction sample generator and crosses it with each mask from
+    # the mask generator, passing the mask as a keyword. Reads supports_multiple_dims from
+    # op_info and stores it in kwargs. For non-grad floating 2-d inputs with a full-shape
+    # mask it also yields variants whose diagonal is filled with inf, -inf and nan.
     """Sample inputs for masked reduction operators.
 
     Masked reduction operator is a reduction operator with trailing
@@ -139,6 +164,10 @@ def sample_inputs_masked_reduction(op_info, device, dtype, requires_grad, **kwar
 def sample_inputs_sparse_coo_masked_reduction(
     op_info, device, dtype, requires_grad, **kwargs
 ):
+    # [FUNCTION DOC] Generator of sparse COO sample inputs for masked reductions. Yields
+    # nothing unless op_info.supports_sparse. Converts the input and any mask of each dense
+    # masked-reduction sample to sparse COO. Samples without a mask are skipped for prod,
+    # amax and amin because their reduction identity is nonzero.
     """Sample inputs for masked reduction operators that support inputs
     with sparse coo layouts.
     """
@@ -173,6 +202,11 @@ def sample_inputs_sparse_coo_masked_reduction(
 def sample_inputs_sparse_csr_masked_reduction(
     op_info, device, dtype, requires_grad, **kwargs
 ):
+    # [FUNCTION DOC] Generator of sparse CSR sample inputs for masked reductions. Yields
+    # nothing unless op_info.supports_sparse_csr. Keeps only 2-d samples with keepdim set,
+    # converts input and mask to CSR, and skips unmasked samples for prod, amax, amin and
+    # mean. For each sample with dim equal to zero it also yields a copy with dim one so
+    # both inner and outer dimension implementations are covered.
     """Sample inputs for masked reduction operators that support inputs
     with sparse csr layouts.
     """
@@ -227,6 +261,9 @@ def sample_inputs_sparse_csr_masked_reduction(
 
 
 def sample_inputs_masked_norm(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for masked norm: for each norm order
+    # (2.0, 1, inf, -inf, 0) it takes every masked-reduction sample and prepends the order
+    # to the positional args, using a cloned input.
     """Sample inputs for masked norm."""
     for ord in [2.0, 1, float("inf"), float("-inf"), 0]:
         for sample_input in sample_inputs_masked_reduction(
@@ -246,6 +283,9 @@ def sample_inputs_masked_norm(op_info, device, dtype, requires_grad, **kwargs):
 def reference_masked_std_var(
     numpy_fn,
 ):
+    # [FUNCTION DOC] HELPER: Builds a numpy reference function for masked std/var from the
+    # given numpy function (such as std or var) by wrapping it with the generic numpy
+    # reduction reference. Returns the wrapper function.
     ref = reference_reduction_numpy(numpy_fn)
 
     # Translate unbiased or correction arguments into ddof
@@ -257,6 +297,9 @@ def reference_masked_std_var(
         correction=None,
         **kwargs,
     ):
+        # [FUNCTION DOC] HELPER: Reference call. Computes the delta degrees of freedom:
+        # default one, zero or one from unbiased if given, and correction overrides both.
+        # A sequence dim becomes a tuple. Returns the wrapped numpy reduction result.
         ddof = 1
         if unbiased is not None:
             ddof = 1 if unbiased else 0
@@ -272,11 +315,18 @@ def reference_masked_std_var(
 
 
 def sample_inputs_masked_std_var(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for masked std and var. Builds samples
+    # from the generic std/var generator crossed with masks (and inf/nan diagonal variants),
+    # skipping samples whose first positional arg is a bool. Then drops samples where the
+    # smallest count of unmasked elements along dim is at most correction plus one, since
+    # these would give nan. Correction defaults to the unbiased flag (true) as an integer.
     """Sample inputs for masked std/var."""
     kwargs["supports_multiple_dims"] = op_info.supports_multiple_dims
     from torch.testing._internal.common_methods_invocations import sample_inputs_std_var
 
     def masked_samples():
+        # [FUNCTION DOC] HELPER: Generator of std/var samples crossed with masks, same
+        # scheme as the masked reduction generator, minus samples with a bool first arg.
         for sample_input in sample_inputs_std_var(
             op_info, device, dtype, requires_grad, **kwargs
         ):
@@ -344,6 +394,10 @@ def sample_inputs_masked_std_var(op_info, device, dtype, requires_grad, **kwargs
 def sample_inputs_masked_softmax(
     op_info, device, dtype, requires_grad, with_dtype=False, **kwargs
 ):
+    # [FUNCTION DOC] Generator of SampleInput objects for masked softmax, log_softmax and
+    # softmin. Crosses every softmax-variant sample (optionally with a dtype keyword when
+    # with_dtype is set) with each generated mask, passing the mask as a keyword and a
+    # cloned input.
     """Sample inputs for masked softmax, log_softmax, and softmin.
 
     Masked normalization operator is a reduction operator with
@@ -366,6 +420,10 @@ def sample_inputs_masked_softmax(
 
 
 def sample_inputs_masked_cumops(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for masked cumsum and cumprod. Uses
+    # softmax-variant samples crossed with masks, but only real tensor masks (None is
+    # skipped). Removes any keepdim keyword and ensures dim is passed positionally, skipping
+    # samples with no dim at all.
     """Sample inputs for masked cumsum and cumprod."""
     for sample_input in sample_inputs_softmax_variant(
         op_info, device, dtype, requires_grad, **kwargs
@@ -397,6 +455,10 @@ def sample_inputs_masked_cumops(op_info, device, dtype, requires_grad, **kwargs)
 
 
 def sample_inputs_masked_logaddexp(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for masked logaddexp. For three shapes
+    # it pairs two random tensors with an input_mask and an other_mask given as keywords;
+    # the masks are drawn from two separately generated lists of the same length, paired
+    # position by position (strict zip, raises on length mismatch).
     """Sample inputs for masked logaddexp."""
     shapes = [(S,), (S, S), (S, M, S)]
     input_mask_lists = [
@@ -422,6 +484,10 @@ def sample_inputs_masked_logaddexp(op_info, device, dtype, requires_grad, **kwar
 
 
 def sample_inputs_masked_normalize(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for masked normalize: for each norm
+    # order (2.0, 1, inf, -inf, 0) and each softmax-variant sample without empty-dimension
+    # shapes, yields a cloned input with the order as first positional arg, followed by
+    # the sample's args and kwargs. No mask is generated here.
     """Sample inputs for masked normalize."""
     for ord in [2.0, 1, float("inf"), float("-inf"), 0]:
         for sample_input in sample_inputs_softmax_variant(

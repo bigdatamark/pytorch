@@ -1,5 +1,12 @@
 # mypy: ignore-errors
 
+# [MODULE DOC]
+# OpInfo database for the torch.fft operators (fft, ifft, rfft, fftn, hfft, fftshift and
+# related variants) plus their Python reference counterparts. Defines the
+# SpectralFuncPythonRefInfo class, error-input and sample-input generators, and the
+# module-level lists op_db and python_ref_db. Import-time side effect: tries to import
+# scipy.fft when scipy is available and records the result in has_scipy_fft.
+
 import unittest
 from functools import partial
 
@@ -40,6 +47,12 @@ if TEST_SCIPY:
 
 
 class SpectralFuncPythonRefInfo(SpectralFuncInfo):
+    # [CLASS DOC] OpInfo describing a Python reference implementation of a spectral (FFT)
+    # operator. It looks up the corresponding torch OpInfo by name and variant in op_db,
+    # stores both on the instance, and inherits that OpInfo's original constructor arguments,
+    # overridable by explicit keyword arguments.
+    # KNOWN ISSUE: the docstring below says "elementwise unary operation", which is a
+    # copy-paste leftover; this class is for spectral functions.
     """
     An OpInfo for a Python reference of an elementwise unary operation.
     """
@@ -53,6 +66,12 @@ class SpectralFuncPythonRefInfo(SpectralFuncInfo):
         torch_opinfo_variant="",
         **kwargs,
     ):  # additional kwargs override kwargs inherited from the torch opinfo
+        # [FUNCTION DOC] Constructor. Args: name of the reference callable, optional op
+        # (defaults to torch attribute by name), torch_opinfo_name and optional
+        # torch_opinfo_variant identifying the referenced OpInfo in the module-level op_db,
+        # and extra keyword overrides. Raises an AssertionError if the referenced entry is
+        # not a SpectralFuncInfo. Side effects: sets torch_opinfo_name and torch_opinfo
+        # attributes, then calls the parent constructor with merged inherited arguments.
         self.torch_opinfo_name = torch_opinfo_name
         self.torch_opinfo = _find_referenced_opinfo(
             torch_opinfo_name, torch_opinfo_variant, op_db=op_db
@@ -69,6 +88,9 @@ class SpectralFuncPythonRefInfo(SpectralFuncInfo):
 
 
 def error_inputs_fft(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator yielding one ErrorInput for one-dimensional FFT ops: a 0-d
+    # float32 tensor, expecting an IndexError saying dimension -1 was specified but the
+    # tensor has no dimensions.
     make_arg = partial(make_tensor, device=device, dtype=torch.float32)
     # Zero-dimensional tensor has no dimension to take FFT of
     yield ErrorInput(
@@ -79,6 +101,9 @@ def error_inputs_fft(op_info, device, **kwargs):
 
 
 def error_inputs_fftn(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator yielding one ErrorInput for n-dimensional FFT ops: a 0-d
+    # float32 tensor with dim given as a tuple containing zero, expecting an IndexError
+    # saying dimension 0 was specified but the tensor has no dimensions.
     make_arg = partial(make_tensor, device=device, dtype=torch.float32)
     # Specifying a dimension on a zero-dimensional tensor
     yield ErrorInput(
@@ -91,6 +116,10 @@ def error_inputs_fftn(op_info, device, **kwargs):
 def sample_inputs_fft_with_min(
     op_info, device, dtype, requires_grad=False, *, min_size, **kwargs
 ):
+    # [FUNCTION DOC] Generator of SampleInput objects: all samples from the generic spectral
+    # op generator, then (unless running on ROCm, where it is skipped due to a floating point
+    # exception) one extra random tensor of shape min_size, checking the invalid-number-of-
+    # data-points error is not too strict. min_size is required and keyword-only.
     yield from sample_inputs_spectral_ops(
         op_info, device, dtype, requires_grad, **kwargs
     )
@@ -105,7 +134,12 @@ def sample_inputs_fft_with_min(
 
 
 def sample_inputs_fftshift(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of five SampleInput objects for fftshift/ifftshift: 2-d and
+    # 1-d tensors, with no dim, an int dim, and tuple dims of one or two entries, including
+    # a 3-d tensor with dims zero and two.
     def mt(shape, **kwargs):
+        # [FUNCTION DOC] HELPER: Makes a random tensor of the given shape with the enclosing
+        # device, dtype and requires_grad; extra keyword args go to make_tensor.
         return make_tensor(
             shape, device=device, dtype=dtype, requires_grad=requires_grad, **kwargs
         )
