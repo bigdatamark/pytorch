@@ -2,6 +2,12 @@
 
 # To run:
 # python test/distributed/test_nvshmem.py
+# [MODULE DOC] Multi-process GPU tests for the NVSHMEM backend of symmetric memory.
+# Covers allocation and rendezvous, MemPool-backed tensors, remote tensor access, put/get
+# and signaling ops, all-to-all variants (fixed, variable, 2D, 2D with offsets),
+# dispatch-then-combine round trips (world group and subgroups), and tile reductions.
+# Defines skip decorators (NVSHMEM, NVLS, CUDA 13.2) and sets module-level device_type to
+# cuda; importing has no side effects beyond that. Runs via run_tests when executed.
 
 
 import os
@@ -28,6 +34,8 @@ from torch.testing._internal.common_utils import (
 
 # Decorator
 def requires_nvshmem():
+    # [FUNCTION DOC] HELPER: Returns a skip decorator (pass-in-sandcastle variant) that
+    # skips when the platform lacks symmetric memory support or NVSHMEM is unavailable.
     return skip_but_pass_in_sandcastle_if(
         not PLATFORM_SUPPORTS_SYMM_MEM or not symm_mem.is_nvshmem_available(),
         "test_nvshmem requires NVSHMEM with SymmMem platform support, skipping tests",
@@ -35,6 +43,10 @@ def requires_nvshmem():
 
 
 def has_nvls_support():
+    # [FUNCTION DOC] HELPER: Reports whether NVLink SHARP multicast is usable. Returns
+    # False if CUDA or NVSHMEM is unavailable, or if the NVSHMEM_DISABLE_NVLS environment
+    # variable equals 1. Otherwise sets the symmetric memory backend to NVSHMEM (global
+    # side effect) and returns whether the CUDA device 0 has multicast support.
     if not torch.cuda.is_available() or not symm_mem.is_nvshmem_available():
         return False
 
@@ -50,6 +62,8 @@ def has_nvls_support():
 
 
 def requires_nvls():
+    # [FUNCTION DOC] HELPER: Returns a skip decorator that skips when has_nvls_support is
+    # false. Note has_nvls_support runs at decoration time and may set the NVSHMEM backend.
     """Skip test if NVLS (NVLink SHARP) is not available."""
     return skip_but_pass_in_sandcastle_if(
         not has_nvls_support(),
@@ -58,6 +72,8 @@ def requires_nvls():
 
 
 def skip_if_cuda_13_2():
+    # [FUNCTION DOC] HELPER: Returns a skip decorator that skips when the torch CUDA
+    # version is exactly 13.2, where dispatch-combine tests hang or fail.
     """Skip dispatch-combine tests that hang/fail on CUDA 13.2 (B200/sm100).
 
     See https://github.com/pytorch/pytorch/issues/191201
@@ -77,7 +93,12 @@ device_module = torch.get_device_module(device_type)
 @requires_nvshmem()
 @requires_cuda_p2p_access()
 class NVSHMEMSymmetricMemoryTest(MultiProcContinuousTest):
+    # [CLASS DOC] Multi-process tests of NVSHMEM-backed symmetric memory basics: allocation,
+    # rendezvous, MemPool tensors, handle offsets, remote tensor access, put/get ops.
+    # Skipped unless NVSHMEM and CUDA P2P access are available. One process per rank.
     def _init_device(self) -> None:
+        # [FUNCTION DOC] HELPER: Sets the current CUDA device to this rank's device and
+        # selects NVSHMEM as the symmetric memory backend (global state change).
         # TODO: relieve this (seems to hang if without)
         device_module.set_device(self.device)
         # Set NVSHMEM as SymmMem backend
@@ -85,9 +106,12 @@ class NVSHMEMSymmetricMemoryTest(MultiProcContinuousTest):
 
     @property
     def device(self) -> torch.device:
+        # [FUNCTION DOC] HELPER: Property returning the CUDA device whose index is this rank.
         return torch.device(device_type, self.rank)
 
     def test_alloc(self) -> None:
+        # [FUNCTION DOC] Allocates a symmetric tensor and rendezvouses on the world group,
+        # both inside a nested function and at test level, checking neither raises.
         self._init_device()
 
         group_name = dist.group.WORLD.group_name
@@ -96,6 +120,7 @@ class NVSHMEMSymmetricMemoryTest(MultiProcContinuousTest):
         numel = 1024
 
         def foo():
+            # [FUNCTION DOC] HELPER: Allocates a symmetric tensor and rendezvouses on it.
             inp = symm_mem.empty(numel, dtype=dtype, device=self.device)
             symm_mem.rendezvous(inp, group=group_name)
 
@@ -105,6 +130,8 @@ class NVSHMEMSymmetricMemoryTest(MultiProcContinuousTest):
         symm_mem.rendezvous(out, group=group_name)
 
     def test_alloc_without_device_context(self) -> None:
+        # [FUNCTION DOC] Sets the NVSHMEM backend without calling set_device first, allocates
+        # a symmetric tensor on this rank's device, checks its device, and rendezvouses.
         # Set NVSHMEM as SymmMem backend
         symm_mem.set_backend("NVSHMEM")
         group_name = dist.group.WORLD.group_name
@@ -116,6 +143,9 @@ class NVSHMEMSymmetricMemoryTest(MultiProcContinuousTest):
         symm_mem.rendezvous(out, group=group_name)
 
     def test_mempool_tensor_factory(self) -> None:
+        # [FUNCTION DOC] Creates a tensor under a MemPool using the symmetric memory
+        # allocator (rank 0 holds arange, others zeros), rendezvouses, broadcasts from
+        # rank 0 with the NVSHMEM op, and checks every rank holds arange.
         """
         Test the effectiveness of MemPool on tensor factory ops.
         """
@@ -140,6 +170,10 @@ class NVSHMEMSymmetricMemoryTest(MultiProcContinuousTest):
         self.assertEqual(tensor, torch.arange(numel, dtype=dtype, device=self.device))
 
     def test_mempool_tensor_w_collective(self) -> None:
+        # [FUNCTION DOC] Creates a ones tensor under a symmetric-memory MemPool, rendezvouses,
+        # runs a regular all_reduce, and checks each element equals the world size.
+        # KNOWN ISSUE: the docstring is copied from the factory test and says "tensor
+        # factory ops" although this test exercises a collective.
         """
         Test the effectiveness of MemPool on tensor factory ops.
         """
@@ -162,6 +196,9 @@ class NVSHMEMSymmetricMemoryTest(MultiProcContinuousTest):
         )
 
     def test_mempool_compute_ops(self) -> None:
+        # [FUNCTION DOC] Computes an add and a matmul under a symmetric-memory MemPool so the
+        # result is a symmetric tensor, broadcasts it from rank 0 with the NVSHMEM op
+        # (without an explicit rendezvous), and checks it equals the rank-0 result.
         """
         Apply MemPool context to a compute op that creates input to collective.
         """
@@ -186,6 +223,9 @@ class NVSHMEMSymmetricMemoryTest(MultiProcContinuousTest):
         self.assertEqual(y, expected)
 
     def test_handle_offset(self) -> None:
+        # [FUNCTION DOC] Allocates two tensors consecutively in one MemPool and checks the
+        # rendezvous handles report offset 0 for the first and the first tensor's storage
+        # byte size for the second.
         """
         Test if handle offset is correctly set.
         """
@@ -207,6 +247,9 @@ class NVSHMEMSymmetricMemoryTest(MultiProcContinuousTest):
         self.assertEqual(hdl1.offset, x0.untyped_storage().nbytes())
 
     def test_get_remote_tensor(self) -> None:
+        # [FUNCTION DOC] Each rank gets a tensor view of the next rank's buffer through the
+        # handle, copies its own rank-filled data into it with a plain copy, barriers, and
+        # checks its own buffer holds the previous rank's id (modulo world size).
         """
         Get a remote tensor and use regular aten ops to write to it.
         """
@@ -235,6 +278,9 @@ class NVSHMEMSymmetricMemoryTest(MultiProcContinuousTest):
         self.assertEqual(y, expected)
 
     def test_get_remote_tensors(self) -> None:
+        # [FUNCTION DOC] Fills a symmetric tensor with the rank, fetches the per-peer remote
+        # tensors via the get_remote_tensors op, barriers, and checks the tensor from peer
+        # i holds the value i.
         """
         Get all remote tensors
         """
@@ -249,6 +295,8 @@ class NVSHMEMSymmetricMemoryTest(MultiProcContinuousTest):
             self.assertEqual(tensor, peer)
 
     def test_multicast_ptr(self) -> None:
+        # [FUNCTION DOC] Rendezvouses a symmetric tensor and checks the handle's multicast
+        # pointer is nonzero when NVLS is supported and zero otherwise.
         """
         Get the multicast pointer
         """
@@ -263,6 +311,9 @@ class NVSHMEMSymmetricMemoryTest(MultiProcContinuousTest):
             self.assertEqual(handle.multicast_ptr, 0)
 
     def test_nvshmem_put(self) -> None:
+        # [FUNCTION DOC] Rank 0 puts its tensor to rank 1 with a signal value 5 on the signal
+        # pad; rank 1 waits for that signal then checks its tensor equals zeros (rank 0's
+        # data, since each tensor is filled with its rank). Other ranks do nothing further.
         self._init_device()
         group_name = dist.group.WORLD.group_name
 
@@ -284,6 +335,8 @@ class NVSHMEMSymmetricMemoryTest(MultiProcContinuousTest):
             )
 
     def test_nvshmem_get(self) -> None:
+        # [FUNCTION DOC] Rank 0 gets rank 1's tensor (filled with ones) into its own with the
+        # NVSHMEM get op, barriers, and checks it equals ones; other ranks just barrier.
         self._init_device()
         group_name = dist.group.WORLD.group_name
 
@@ -308,6 +361,10 @@ class NVSHMEMSymmetricMemoryTest(MultiProcContinuousTest):
         TEST_WITH_ROCM, "nvshmem_get_out not yet implemented for ROCm"
     )
     def test_get(self) -> None:
+        # [FUNCTION DOC] Tests symm_mem.get (skipped on ROCm). Rank 0 gets a full buffer from
+        # peer 1, then a sub-region at an element offset, then fills a view of a larger
+        # destination leaving the rest untouched. Also checks ValueError for a
+        # non-contiguous destination, negative offset, offset past the buffer, bad peer.
         self._init_device()
         group_name = dist.group.WORLD.group_name
 
@@ -385,7 +442,12 @@ class NVSHMEMSymmetricMemoryTest(MultiProcContinuousTest):
 @requires_nvshmem()
 @requires_cuda_p2p_access()
 class NVSHMEMAll2AllTest(MultiProcContinuousTest):
+    # [CLASS DOC] Multi-process tests of the NVSHMEM all-to-all ops: fixed-size, variable
+    # (vdev), 2D expert-major (with major alignment), and 2D with input offsets.
+    # Skipped unless NVSHMEM and CUDA P2P access are available. One process per rank.
     def _init_device(self) -> None:
+        # [FUNCTION DOC] HELPER: Sets the current CUDA device to this rank's device and
+        # selects NVSHMEM as the symmetric memory backend (global state change).
         # TODO: relieve this (seems to hang if without)
         device_module.set_device(self.device)
         # Set NVSHMEM as SymmMem backend
@@ -393,9 +455,12 @@ class NVSHMEMAll2AllTest(MultiProcContinuousTest):
 
     @property
     def device(self) -> torch.device:
+        # [FUNCTION DOC] HELPER: Property returning the CUDA device whose index is this rank.
         return torch.device(device_type, self.rank)
 
     def test_nvshmem_all_to_all(self) -> None:
+        # [FUNCTION DOC] Each rank fills an input with its rank, runs the NVSHMEM all_to_all
+        # op, and checks the output has numel_per_peer elements from each rank in rank order.
         self._init_device()
 
         group_name = dist.group.WORLD.group_name
@@ -419,6 +484,10 @@ class NVSHMEMAll2AllTest(MultiProcContinuousTest):
         torch.testing.assert_close(out, expected)
 
     def test_all_to_all_vdev(self) -> None:
+        # [FUNCTION DOC] Uses random per-peer input splits, derives expected output splits
+        # via all_to_all_single, runs all_to_all_vdev on symmetric buffers sized for the worst
+        # case, and checks input splits unchanged, output splits, exclusive-scan output
+        # offsets, and received data against a regular all_to_all_single.
         self._init_device()
 
         group_name = dist.group.WORLD.group_name
@@ -480,6 +549,11 @@ class NVSHMEMAll2AllTest(MultiProcContinuousTest):
 
     @parametrize("align", [1, 8, 16])  # `major_align` of output
     def test_all_to_all_vdev_2d(self, align: int) -> None:
+        # [FUNCTION DOC] Parametrized by major_align. With 8 experts per rank and random
+        # splits, runs all_to_all_vdev_2d and checks input splits unchanged, output splits
+        # in expert-major order, offsets as an exclusive scan with each expert's total padded
+        # up to the alignment (minimum one block, padding absorbed by the last split), and
+        # each received chunk against a reference built from all_to_all_single.
         torch.manual_seed(42 + self.rank)
         self._init_device()
 
@@ -587,6 +661,10 @@ class NVSHMEMAll2AllTest(MultiProcContinuousTest):
             torch.testing.assert_close(received_chunk, chunk)
 
     def test_all_to_all_vdev_2d_offset(self) -> None:
+        # [FUNCTION DOC] Runs all_to_all_vdev_2d_offset with inputs laid out at padded fixed
+        # offsets. Checks input splits and offsets unchanged, output splits (from a
+        # transposed all_to_all_single), exclusive-scan output offsets, and the received data
+        # against a reference built by stripping padding and using dist.all_to_all.
         torch.manual_seed(42 + self.rank)
         self._init_device()
 
@@ -702,6 +780,11 @@ class NVSHMEMAll2AllTest(MultiProcContinuousTest):
 
 # Help function used by multiple tests
 def dispatch_then_combine(device, align: int, group) -> None:
+    # [FUNCTION DOC] HELPER: Shared body for dispatch-combine tests. On the given group,
+    # allocates symmetric buffers, shuffles random tokens with all_to_all_vdev_2d (major
+    # alignment align), then combines them back with all_to_all_vdev_2d_offset using the
+    # shuffle's splits/offsets. Asserts combined data, splits and exclusive-scan offsets
+    # equal the originals. Synchronizes CUDA and barriers on the group before and after.
     """
     Shuffle the tokens, then combine them, and check if the combined data is
     exactly the same as the original input data
@@ -786,7 +869,11 @@ def dispatch_then_combine(device, align: int, group) -> None:
 @requires_nvshmem()
 @requires_cuda_p2p_access()
 class DispatchCombineTest(MultiProcContinuousTest):
+    # [CLASS DOC] Multi-process test running dispatch-then-combine over the world group,
+    # parametrized by output alignment. Skipped without NVSHMEM/P2P or on CUDA 13.2.
     def _init_device(self) -> None:
+        # [FUNCTION DOC] HELPER: Sets the current CUDA device to this rank's device and
+        # selects NVSHMEM as the symmetric memory backend (global state change).
         # TODO: relieve this (seems to hang if without)
         device_module.set_device(self.device)
         # Set NVSHMEM as SymmMem backend
@@ -794,11 +881,14 @@ class DispatchCombineTest(MultiProcContinuousTest):
 
     @property
     def device(self) -> torch.device:
+        # [FUNCTION DOC] HELPER: Property returning the CUDA device whose index is this rank.
         return torch.device(device_type, self.rank)
 
     @skip_if_cuda_13_2()
     @parametrize("align", [1, 8, 16])  # `major_align` of output
     def test_dispatch_combine(self, align: int) -> None:
+        # [FUNCTION DOC] Seeds the RNG by rank, initializes the device, and runs the
+        # dispatch-then-combine round trip over the world group with the given alignment.
         """
         Test dispatch-and-combine over World group
         """
@@ -811,7 +901,11 @@ class DispatchCombineTest(MultiProcContinuousTest):
 @requires_nvshmem()
 @requires_cuda_p2p_access()
 class DispatchCombineInSubgroups(MultiProcContinuousTest):
+    # [CLASS DOC] Multi-process test running dispatch-then-combine concurrently on subgroups
+    # of a device mesh. Needs at least 4 GPUs; skipped on CUDA 13.2.
     def _init_device(self) -> None:
+        # [FUNCTION DOC] HELPER: Sets the current CUDA device to this rank's device and
+        # selects NVSHMEM as the symmetric memory backend (global state change).
         # TODO: relieve this (seems to hang if without)
         device_module.set_device(self.device)
         # Set NVSHMEM as SymmMem backend
@@ -819,11 +913,15 @@ class DispatchCombineInSubgroups(MultiProcContinuousTest):
 
     @property
     def device(self) -> torch.device:
+        # [FUNCTION DOC] HELPER: Property returning the CUDA device whose index is this rank.
         return torch.device(device_type, self.rank)
 
     @skip_if_cuda_13_2()
     @skip_if_lt_x_gpu(4)
     def test_dispatch_combine_subgroup(self) -> None:
+        # [FUNCTION DOC] Builds a 2 x (world/2) device mesh named dp and ep, takes the ep
+        # subgroup of this rank, and runs the dispatch-then-combine round trip on it with
+        # alignment 8.
         """
         Test dispatch-and-combine over concurrent subgroups
         """
@@ -843,7 +941,11 @@ class DispatchCombineInSubgroups(MultiProcContinuousTest):
 @requires_nvshmem()
 @requires_cuda_p2p_access()
 class NVSHMEMTileCommTest(MultiProcContinuousTest):
+    # [CLASS DOC] Multi-process tests of NVSHMEM tile reduction ops (single-root and
+    # multi-root), parametrized by tile size and dtype. Require NVLS support.
     def _init_device(self) -> None:
+        # [FUNCTION DOC] HELPER: Sets the current CUDA device to this rank's device and
+        # selects NVSHMEM as the symmetric memory backend (global state change).
         # TODO: relieve this (seems to hang if without)
         device_module.set_device(self.device)
         # Set NVSHMEM as SymmMem backend
@@ -851,12 +953,17 @@ class NVSHMEMTileCommTest(MultiProcContinuousTest):
 
     @property
     def device(self) -> torch.device:
+        # [FUNCTION DOC] HELPER: Property returning the CUDA device whose index is this rank.
         return torch.device(device_type, self.rank)
 
     @requires_nvls()
     @parametrize("tile_size", [32, 128, 512])
     @parametrize("dtype", [torch.float, torch.half, torch.bfloat16])
     def test_tile_reduce(self, tile_size: int, dtype: torch.dtype) -> None:
+        # [FUNCTION DOC] Fills a 1024 square symmetric input with the rank, reduces the
+        # square sub-tile at offset tile_size into the root's output tile (tile_reduce op, root 0),
+        # and checks the root's tile holds the sum of ranks and everything else is zero.
+        # Raises AssertionError if tile_size exceeds the full size.
         full_size = 1024
         if not (tile_size <= full_size):
             raise AssertionError(
@@ -898,6 +1005,11 @@ class NVSHMEMTileCommTest(MultiProcContinuousTest):
     def test_multi_root_tile_reduce(
         self, tile_size: int, root_ratio: int, dtype: torch.dtype
     ) -> None:
+        # [FUNCTION DOC] Splits a 2048 square symmetric input into a grid of tiles (two
+        # columns, world/2 rows), picks the first world/root_ratio ranks as active roots, and
+        # calls multi_root_tile_reduce so each root reduces its own tile. Checks active roots'
+        # tiles hold the sum of ranks and all else is zero. Raises AssertionError if the tile
+        # grid does not fit in the full size.
         full_size = 2048
         num_slices_col = 2  # number of tiles on column dimension
         num_slices_row = (
