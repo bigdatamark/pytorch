@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [PACKAGE DOC] Deprecated compatibility package for eager-mode quantization, migrated to
+# torch.ao.quantization. Star-imports the shim submodules (observers, fake quantize, qconfig,
+# quant types, mappings, quantize, quantize_jit, stubs, fuser mappings) and defines
+# default_eval_fn. The all-list names the public API; it also lists a few names that are
+# not actually imported here, such as WeightObserver and the ondevice dynamic jit helpers.
+# KNOWN ISSUE: the all-list contains names (WeightObserver, _convert_ondevice_dynamic_jit,
+# _quantize_ondevice_dynamic_jit, observer) that may not resolve, breaking star-imports.
 from .fake_quantize import *  # noqa: F403
 from .fuse_modules import fuse_modules
 from .fuser_method_mappings import *  # noqa: F403
@@ -12,6 +19,9 @@ from .stubs import *  # noqa: F403
 
 
 def default_eval_fn(model, calib_data):
+    # [FUNCTION DOC] Runs the model once on the input of every (data, target) pair in
+    # calib_data, discarding outputs and targets; used as a calibration pass.
+    # Raises whatever the iteration or the model call raises. Returns None.
     r"""
     Default evaluation function takes a torch.utils.data.Dataset or a list of
     input Tensors and run the model on the dataset

@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Public profiler API built on the autograd/Kineto profiler: the profile context
+# manager (with its low-level base class), the step schedule factory and action enum, the
+# tensorboard trace handler, supported_activities, and ExecutionTraceObserver for recording
+# PyTorch execution traces. Also contains an optional CUPTI-monitor backend selected through
+# the experimental custom profiler config. Import-time side effect: creates a module-level
+# set used to deduplicate one-time warnings.
 from __future__ import annotations
 
 import gzip
@@ -47,6 +53,8 @@ _WARNINGS_SHOWN = set()
 
 
 def _warn_once(msg, category=UserWarning, stacklevel=2):
+    # [FUNCTION DOC] HELPER: Emits the warning with the given category and stacklevel only
+    # the first time this exact message is seen, tracking messages in a module-level set.
     if msg not in _WARNINGS_SHOWN:
         _WARNINGS_SHOWN.add(msg)
         warn(msg, category=category, stacklevel=stacklevel)
@@ -55,6 +63,10 @@ def _warn_once(msg, category=UserWarning, stacklevel=2):
 def _parse_custom_profiler_config(
     experimental_config: _ExperimentalConfig | None,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Reads the custom_profiler_config string of the experimental
+    # config and returns it as a mapping. Returns an empty mapping when the config or string
+    # is missing/empty or parses to a non-mapping; if the string is not valid JSON it is
+    # treated as a bare backend name and returned as a mapping with a single backend entry.
     if experimental_config is None:
         return {}
     raw = getattr(experimental_config, "custom_profiler_config", None)
@@ -68,12 +80,17 @@ def _parse_custom_profiler_config(
 
 
 class _NumpyEncoder(json.JSONEncoder):
+    # [CLASS DOC] HELPER: JSON encoder subclass that serializes NumPy integers, floats and
+    # arrays as plain ints, floats and lists; defers to the standard encoder (which raises
+    # for unsupported types) for everything else or when NumPy is not installed.
     """
     Json encoder for numpy types (np.int, np.float, np.array etc.)
     Returns default encoder if numpy is not available
     """
 
     def default(self, obj):
+        # [FUNCTION DOC] HELPER: Converts a NumPy scalar or array to a JSON-serializable
+        # Python value; otherwise delegates to the base encoder, which raises TypeError.
         """Encode NumPy types to JSON"""
         try:
             import numpy as np
@@ -90,6 +107,8 @@ class _NumpyEncoder(json.JSONEncoder):
 
 
 def supported_activities():
+    # [FUNCTION DOC] Returns the set of ProfilerActivity values this build can trace, as
+    # reported by the autograd engine. Takes no arguments and has no side effects.
     """
     Returns a set of supported profiler tracing activities.
 
@@ -104,25 +123,34 @@ def supported_activities():
 
 
 class _ITraceObserver(ABC):
+    # [CLASS DOC] HELPER: Abstract interface for execution trace observers used by the
+    # profiler; implementations must provide start, stop and cleanup.
     """Abstract interface for a Trace observer.
     This satisfies 3 methods: start, stop and cleanup"""
 
     @abstractmethod
     def start(self):
+        # [FUNCTION DOC] HELPER: Abstract; begin observing.
         pass
 
     @abstractmethod
     def stop(self):
+        # [FUNCTION DOC] HELPER: Abstract; stop observing.
         pass
 
     @abstractmethod
     def cleanup(self):
+        # [FUNCTION DOC] HELPER: Abstract; release resources held by the observer.
         pass
 
 
 def _parse_activities(
     activities: Iterable[ProfilerActivity | dict[ProfilerActivity, list[str]]],
 ) -> tuple[set[ProfilerActivity], dict[ProfilerActivity, set[str]]]:
+    # [FUNCTION DOC] HELPER: Splits a mixed list of activities into a set of activity groups
+    # and a mapping from group to the set of named sub-types to collect (only for mapping
+    # items). Raises ValueError if a group appears more than once and TypeError for items
+    # that are neither an activity nor a mapping. Returns both containers.
     """Parse a mixed activities list into a set of activities and a filter dict.
 
     Each item is either a bare ``ProfilerActivity`` (collect all defaults) or a
@@ -148,6 +176,12 @@ def _parse_activities(
 
 
 class _KinetoProfile:
+    # [CLASS DOC] Low-level wrapper around the autograd profiler with Kineto enabled. Holds
+    # the configuration (activities and per-activity filters, shape/memory/stack/flops/module
+    # flags, experimental config, execution trace observer, accumulation and timeout
+    # options), the underlying autograd profiler once prepared, user metadata, and optional
+    # CUPTI-monitor state (observer, window id, async export flag). Lifecycle: prepare_trace,
+    # start_trace, stop_trace; then export or inspect results. Base class of profile.
     """Low-level profiler wrap the autograd profile
 
     Args:
@@ -221,6 +255,14 @@ class _KinetoProfile:
         custom_trace_id_callback: Callable[[], str] | None = None,
         post_processing_timeout_s: float | None = None,
     ) -> None:
+        # [FUNCTION DOC] Stores all options. Activities default to the supported set; given
+        # activities are parsed into groups plus filters (errors propagate). If trace_only is
+        # combined with stack recording, warns and uses a copy of the config with trace_only
+        # cleared. Picks use_device from the first present accelerator group (CUDA, XPU, MTIA,
+        # HPU, privateuse1). Parses the custom profiler config; for the cupti_monitor backend
+        # requires CPU activity (ValueError otherwise), reads the async-export flag, and arms
+        # graph-dependency / event-node recorders when configured. Raises ValueError if the
+        # async-export option is given without that backend.
         if activities is not None:
             self.activities, self.activity_filters = _parse_activities(activities)
         else:
@@ -319,13 +361,22 @@ class _KinetoProfile:
             )
 
     def start(self) -> None:
+        # [FUNCTION DOC] Prepares and then starts tracing in one call.
         self.prepare_trace()
         self.start_trace()
 
     def stop(self) -> None:
+        # [FUNCTION DOC] Stops tracing (alias for stop_trace).
         self.stop_trace()
 
     def prepare_trace(self) -> None:
+        # [FUNCTION DOC] Records whether inductor cudagraphs are enabled, warns once if a
+        # previous profiler exists and events are not accumulated, and creates a fresh
+        # autograd profiler from the stored options (unless accumulating across cycles). For
+        # the cupti_monitor backend also creates its observer (starting collection with the
+        # configured options) and publishes it as the active observer. Finally prepares the
+        # underlying trace. Side effects: global active-observer state.
+        # KNOWN ISSUE: sets a trace-window attribute that is never read or declared in init.
         if hasattr(torch, "_inductor"):
             import torch._inductor.config as inductor_config
 
@@ -402,6 +453,13 @@ class _KinetoProfile:
         self.profiler._prepare_trace()
 
     def start_trace(self) -> None:
+        # [FUNCTION DOC] Starts the execution trace observer if any, then the underlying
+        # trace (AssertionError if the profiler was never prepared) and opens the cupti window
+        # when that backend is active. Writes metadata flags for enabled options, distributed
+        # info when Kineto is available and a process group exists, and, with inductor
+        # cudagraphs on old CUDA or when not allowed, sets environment variables disabling
+        # CUPTI lazy re-init and teardown. Finally writes preset user metadata to the trace.
+        # Side effects: mutates the process environment and global trace metadata.
         if self.execution_trace_observer:
             self.execution_trace_observer.start()
         if self.profiler is None:
@@ -453,6 +511,10 @@ class _KinetoProfile:
                 self.add_metadata_json(k, v)
 
     def stop_trace(self) -> None:
+        # [FUNCTION DOC] Stops the execution trace observer if any, raises AssertionError if
+        # the profiler was never prepared, and for the cupti backend unpublishes the active
+        # observer and closes the trace window (keeping the observer for export). Then exits
+        # the underlying autograd profiler, finishing collection.
         if self.execution_trace_observer:
             self.execution_trace_observer.stop()
         if self.profiler is None:
@@ -467,6 +529,14 @@ class _KinetoProfile:
         self.profiler.__exit__(None, None, None)
 
     def export_chrome_trace(self, path: str, use_python_export: bool = False):
+        # [FUNCTION DOC] Writes the collected trace as Chrome JSON to path (gzipped when the
+        # path ends with .gz; optional Python-based exporter). Raises AssertionError if never
+        # prepared. For the cupti backend: if the observer or window is unavailable, warns
+        # once, cleans up and returns without writing; otherwise exports the CPU side to a
+        # temporary file and registers it with the observer, which merges and writes path
+        # (immediately when synchronous, later when async export is on). Includes user trace
+        # metadata.
+        # KNOWN ISSUE: the cupti branch leaves its temporary file undeleted (delete is off).
         """
         Exports the collected trace in Chrome JSON format. If kineto is enabled, only
         last cycle in schedule is exported.
@@ -523,6 +593,8 @@ class _KinetoProfile:
             self.profiler.export_chrome_trace(path, self._trace_metadata)
 
     def wait_for_exports(self) -> None:
+        # [FUNCTION DOC] For the cupti_monitor backend, blocks until the pending observer has
+        # written its exports, then drops the observer and window id. Otherwise does nothing.
         """Block until every deferred cupti_monitor export is written, then unregister.
         No-op unless the cupti_monitor backend is active. Call on the training thread when
         you need the file(s) on disk; the finalize force-flushes CUPTI (safe here)."""
@@ -532,6 +604,9 @@ class _KinetoProfile:
             self._monitor_window_id = None
 
     def take_pending_cupti_export(self) -> Any:
+        # [FUNCTION DOC] Hands the caller the current cupti observer (with its unwritten
+        # window) and clears this profiler's references so the export can be finished on a
+        # worker thread. Returns None for non-cupti backends or when none is pending.
         """Detach this cycle's cupti_monitor ProfilerObserver (with its unwritten window) so
         the deferred export can be finalized OFF the training thread (call
         ``obs.join(force=False)`` on a worker). None for non-cupti backends."""
@@ -543,6 +618,8 @@ class _KinetoProfile:
         return obs
 
     def export_stacks(self, path: str, metric: str = "self_cpu_time_total"):
+        # [FUNCTION DOC] Writes stack traces with the chosen time metric to the file at path
+        # via the underlying profiler. Raises AssertionError if never prepared.
         """Save stack traces to a file
 
         Args:
@@ -556,6 +633,9 @@ class _KinetoProfile:
     def toggle_collection_dynamic(
         self, enable: bool, activities: Iterable[ProfilerActivity]
     ) -> None:
+        # [FUNCTION DOC] Turns collection of the given activity groups on or off while a
+        # trace is running by forwarding to the underlying profiler; silently does nothing
+        # if no profiler exists yet.
         """Toggle collection of activities on/off at any point of collection. Currently supports toggling Torch Ops
         (CPU) and CUDA activity supported in Kineto
 
@@ -593,6 +673,9 @@ class _KinetoProfile:
         group_by_overload_name: bool = False,
         include_python_functions: bool = False,
     ):
+        # [FUNCTION DOC] Returns the aggregated event list from the underlying profiler,
+        # grouped by operator name and optionally input shape, stack depth and overload name;
+        # may include Python function events. Raises AssertionError if never prepared.
         """Averages events, grouping them by operator name and (optionally) input shapes, stack
         and overload name.
 
@@ -614,6 +697,9 @@ class _KinetoProfile:
         )
 
     def events(self):
+        # [FUNCTION DOC] Returns the unaggregated function events of the underlying profiler.
+        # Raises AssertionError if never prepared and RuntimeError when the experimental
+        # config has trace_only enabled (events are not parsed in that mode).
         """
         Return the list of unaggregated :class:`~torch.autograd.profiler_util.FunctionEvent`
         objects, for use in the trace callback or after profiling has finished.
@@ -628,6 +714,9 @@ class _KinetoProfile:
         return self.profiler.function_events
 
     def add_metadata(self, key: str, value: str) -> None:
+        # [FUNCTION DOC] Adds a string metadata entry to the trace: wraps the value in double
+        # quotes with embedded quotes escaped, records it in the local metadata mapping and
+        # sends it to the global trace metadata. Other special characters are not escaped.
         """
         Adds a user defined metadata with a string key and a string value
         into the trace file
@@ -637,6 +726,8 @@ class _KinetoProfile:
         torch.autograd._add_metadata_json(key, wrapped_value)
 
     def add_metadata_json(self, key: str, value: str) -> None:
+        # [FUNCTION DOC] Adds a metadata entry whose value is already valid JSON text, storing
+        # it locally and sending it to the global trace metadata unchanged.
         """
         Adds a user defined metadata with a string key and a valid json value
         into the trace file
@@ -645,6 +736,8 @@ class _KinetoProfile:
         torch.autograd._add_metadata_json(key, value)
 
     def preset_metadata_json(self, key: str, value: str) -> None:
+        # [FUNCTION DOC] Remembers a JSON-valued metadata entry to be written to the trace
+        # when tracing starts; use when the profiler is not running yet.
         """
         Preset a user defined metadata when the profiler is not started
         and added into the trace file later.
@@ -653,6 +746,9 @@ class _KinetoProfile:
         self.preset_metadata[key] = value
 
     def _get_distributed_info(self):
+        # [FUNCTION DOC] HELPER: Returns a mapping with backend, rank, world size, process
+        # group count and group configs (plus NCCL version for the nccl backend), or None if
+        # distributed is unavailable or not initialized.
         import torch.distributed as dist
 
         if not dist.is_available() or not dist.is_initialized():
@@ -673,6 +769,9 @@ class _KinetoProfile:
         return dist_info
 
     def _memory_profile(self) -> MemoryProfile:
+        # [FUNCTION DOC] HELPER: Builds a memory profile from the Kineto results. Raises
+        # ValueError naming any of record_shapes, profile_memory, with_stack that were not
+        # enabled, and AssertionError if there are no Kineto results.
         required = ("record_shapes", "profile_memory", "with_stack")
         missing = [f"{i}=True" for i in required if not getattr(self, i)]
         if missing:
@@ -690,6 +789,11 @@ class _KinetoProfile:
         category=FutureWarning,
     )
     def export_memory_timeline(self, path: str, device: str | None = None) -> None:
+        # [FUNCTION DOC] Deprecated (emits a FutureWarning). Builds a memory timeline from the
+        # profile and writes it for the device (default: the profiler's non-cuda device at
+        # index 0, else cuda:0 if available, else cpu). Output format follows the path suffix:
+        # html (embedded plot), raw json gz (raw events), other gz (gzipped JSON), else JSON.
+        # Stores the timeline on the instance. Raises as _memory_profile does.
         """Export memory event information from the profiler collected
         tree for a given device, and export a timeline plot. There are 3
         exportable files using ``export_memory_timeline``, each controlled by the
@@ -743,6 +847,9 @@ class _KinetoProfile:
 
 
 class ProfilerAction(Enum):
+    # [CLASS DOC] Enumeration of per-step profiler actions: NONE, WARMUP, RECORD,
+    # RECORD_AND_SAVE (end of cycle, triggers the trace callback) and DEVICE_STOPPED
+    # (internal only; set when device collection stops early, forbidden from schedules).
     """
     Profiler actions that can be taken at the specified intervals.
 
@@ -760,6 +867,8 @@ class ProfilerAction(Enum):
 
 
 def _unreachable_transition(prev: str, current: str) -> None:
+    # [FUNCTION DOC] HELPER: Always raises RuntimeError reporting an internal error for an
+    # impossible transition from prev to current action.
     raise RuntimeError(
         f"Profiler internal error: {prev} -> {current} should be unreachable"
     )
@@ -774,6 +883,14 @@ def schedule(
     skip_first: int = 0,
     skip_first_wait: int = 0,
 ) -> Callable:
+    # [FUNCTION DOC] Builds and returns a step-to-action function. Validates arguments first
+    # (AssertionError unless wait, warmup, repeat, skip_first are non-negative and active is
+    # positive) and warns if warmup is zero. The returned function maps a step number to
+    # NONE during the skipped steps and waiting, WARMUP during warmup, RECORD during active
+    # steps and RECORD_AND_SAVE on the last active step of each cycle; after repeat cycles
+    # (when repeat is positive) it returns NONE. skip_first_wait shifts the first cycle
+    # earlier by the wait length. The returned function raises AssertionError for negative
+    # steps.
     """
     Returns a callable that can be used as profiler ``schedule`` argument. The profiler will skip
     the first ``skip_first`` steps, then wait for ``wait`` steps, then do the warmup for the next ``warmup`` steps,
@@ -790,6 +907,9 @@ def schedule(
     """
 
     def schedule_fn(step: int) -> ProfilerAction:
+        # [FUNCTION DOC] HELPER: Pure mapping from a non-negative step number to the profiler
+        # action according to the enclosing schedule parameters; see schedule for the rules.
+        # Raises AssertionError for negative steps.
         if step < 0:
             raise AssertionError(f"Step must be non-negative. Got {step}.")
         if step < skip_first:
@@ -828,6 +948,7 @@ def schedule(
 
 
 def _default_schedule_fn(_: int) -> ProfilerAction:
+    # [FUNCTION DOC] HELPER: Default schedule; ignores the step and always returns RECORD.
     """
     Default profiler behavior - immediately starts recording the events,
     keeps doing it on every profiler step.
@@ -841,6 +962,11 @@ def tensorboard_trace_handler(
     use_gzip: bool = False,
     use_python_export: bool = False,
 ):
+    # [FUNCTION DOC] Returns a trace-ready callback that exports each finished trace into
+    # dir_name (created if missing, RuntimeError if it cannot be) with a unique file name
+    # built from the worker name (default host name and process id) and a nanosecond
+    # timestamp, optionally gzipped and optionally using the Python exporter. The callback
+    # takes the profiler object and returns None.
     """
     Outputs tracing files to directory of ``dir_name``, then that directory can be
     directly delivered to tensorboard as logdir.
@@ -851,6 +977,10 @@ def tensorboard_trace_handler(
     import time
 
     def handler_fn(prof) -> None:
+        # [FUNCTION DOC] HELPER: Ensures the output directory exists, fills in the default
+        # worker name once (remembered across calls), and exports the profiler's chrome trace
+        # to a new uniquely named file there. Raises RuntimeError if the directory cannot be
+        # created.
         nonlocal worker_name
         if not os.path.isdir(dir_name):
             try:
@@ -872,6 +1002,12 @@ def tensorboard_trace_handler(
 
 
 class profile(_KinetoProfile):
+    # [CLASS DOC] Public profiler context manager. Adds a step schedule, a trace-ready
+    # callback, a step counter, per-step record markers and an action state machine on top of
+    # the Kineto profile. State: schedule function, current action (possibly overridden to
+    # DEVICE_STOPPED), the raw previous schedule action, step number, and a table mapping
+    # (previous action, current action) to the list of operations to run. Entering starts
+    # profiling, step() advances the schedule, exiting stops and cleans up.
     """Profiler context manager.
 
     Args:
@@ -1039,6 +1175,14 @@ class profile(_KinetoProfile):
         custom_trace_id_callback: Callable[[], str] | None = None,
         post_processing_timeout_s: float | None = None,
     ) -> None:
+        # [FUNCTION DOC] Validates activities (AssertionError if the resulting set is empty),
+        # initializes the base class (using the given execution trace observer or one built
+        # from environment variables), picks the schedule (default records every step; markers
+        # per step only when a schedule is given), evaluates the schedule for step zero
+        # (ValueError if it returns DEVICE_STOPPED), and builds the transition table from
+        # (previous, current) action pairs to operation lists, including warnings for
+        # malformed schedules and recovery rules for early device stop. Finally initializes the
+        # global Kineto step counter. Side effect: global step-tracker state.
         if activities is not None:
             activities_set, _ = _parse_activities(activities)
         else:
@@ -1201,16 +1345,22 @@ class profile(_KinetoProfile):
         prof.KinetoStepTracker.init_step_count(PROFILER_STEP_NAME)
 
     def __enter__(self):
+        # [FUNCTION DOC] Starts profiling and returns the profiler itself.
         self.start()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        # [FUNCTION DOC] Stops profiling, erases the global step counter entry, and cleans up
+        # the execution trace observer if any. Does not suppress exceptions (returns None).
         self.stop()
         prof.KinetoStepTracker.erase_step_count(PROFILER_STEP_NAME)
         if self.execution_trace_observer:
             self.execution_trace_observer.cleanup()
 
     def start(self) -> None:
+        # [FUNCTION DOC] Runs the transition from the NONE action to the current action (which
+        # prepares and starts tracing as needed) and, when a schedule is in use, opens the
+        # record marker for the current step.
         self._transit_action(ProfilerAction.NONE, self.current_action)
         if self.record_steps:
             self.step_rec_fn = prof.record_function(
@@ -1219,6 +1369,10 @@ class profile(_KinetoProfile):
             self.step_rec_fn.__enter__()
 
     def stop(self) -> None:
+        # [FUNCTION DOC] Closes the open step marker, runs the exit transition for the current
+        # action (stopping the trace and invoking the trace-ready callback where applicable),
+        # then resets the current action to the raw schedule value so a later start works.
+        # Raises AssertionError if the stored raw action is DEVICE_STOPPED.
         if self.record_steps and self.step_rec_fn:
             self.step_rec_fn.__exit__(None, None, None)
             self.step_rec_fn = None
@@ -1234,6 +1388,13 @@ class profile(_KinetoProfile):
         self.current_action = self._prev_schedule_action
 
     def step(self) -> None:
+        # [FUNCTION DOC] Advances to the next step: closes the old step marker, evaluates the
+        # schedule for the new step (ValueError, with no state change, if it returns
+        # DEVICE_STOPPED), updates step number and actions, and applies the early device stop
+        # logic (warns and enters DEVICE_STOPPED when Kineto reports a stop during warmup or
+        # recording; leaves it at a cycle boundary). Then runs the transition operations for
+        # the old/new action pair, bumps the Kineto step counter when the daemon or forced hook
+        # is enabled, and opens a new step marker if a schedule is in use.
         """
         Signals the profiler that the next profiling step has started.
         """
@@ -1323,6 +1484,8 @@ class profile(_KinetoProfile):
             self.step_rec_fn.__enter__()
 
     def set_custom_trace_id_callback(self, callback) -> None:
+        # [FUNCTION DOC] Replaces the trace id generator callback, used when the next cycle
+        # prepares its trace.
         """
         Set the trace ID generator. Called at the start of each cycle, so updating
         it between cycles yields distinct IDs per cycle.
@@ -1330,6 +1493,8 @@ class profile(_KinetoProfile):
         self.custom_trace_id_callback = callback
 
     def get_trace_id(self):
+        # [FUNCTION DOC] Returns the trace id of the underlying profiler, or None if no
+        # profiler has been created yet.
         """
         Returns the current trace ID.
         """
@@ -1338,22 +1503,36 @@ class profile(_KinetoProfile):
         return self.profiler.trace_id
 
     def _trace_ready(self) -> None:
+        # [FUNCTION DOC] HELPER: Calls the user's trace-ready callback with this profiler, if
+        # one was provided.
         if self.on_trace_ready:
             self.on_trace_ready(self)
 
     def _transit_action(self, prev_action, current_action) -> None:
+        # [FUNCTION DOC] HELPER: Looks up the operation list for the (previous, current) action
+        # pair in the transition table and calls each operation in order; unknown pairs do
+        # nothing.
         action_list = self.action_map.get((prev_action, current_action))
         if action_list:
             for action in action_list:
                 action()
 
     def _stats(self) -> prof._ProfilerStats | None:
+        # [FUNCTION DOC] HELPER: Returns the underlying profiler's stats object, or None if
+        # no profiler exists yet.
         if self.profiler is None:
             return None
         return self.profiler._stats
 
 
 class ExecutionTraceObserver(_ITraceObserver):
+    # [CLASS DOC] Records a PyTorch Execution Trace to a file by registering a native
+    # observer with record-function callbacks. State: registered and running flags, the
+    # requested output path (optionally gzip), the actual observer path (a temp file when
+    # gzip), whether to gather extra resources (generated kernels), and the resources
+    # directory. Intended as one instance per process. Key methods: register_callback,
+    # start, stop, unregister_callback (finalizes outputs); cleanup and deletion also
+    # unregister.
     """Execution Trace Observer
 
     Each process can have a single ExecutionTraceObserver instance. The observer
@@ -1369,6 +1548,8 @@ class ExecutionTraceObserver(_ITraceObserver):
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Sets all state to defaults: unregistered, not running, no extra
+        # resource collection, empty resources directory and output paths.
         """
         Initializes the default states.
         """
@@ -1380,6 +1561,7 @@ class ExecutionTraceObserver(_ITraceObserver):
         self.output_file_path_observer: str = ""
 
     def __del__(self) -> None:
+        # [FUNCTION DOC] Finalizer; unregisters the callback so outputs are finalized.
         """
         Calls unregister_callback() to make sure to finalize outputs.
         """
@@ -1387,6 +1569,11 @@ class ExecutionTraceObserver(_ITraceObserver):
 
     @staticmethod
     def build_execution_trace_obs_from_env() -> ExecutionTraceObserver | None:
+        # [FUNCTION DOC] When the environment variable enabling execution traces equals 1,
+        # creates a temporary json output file (warns and returns None on failure), builds an
+        # observer registered to it, and enables extra resource collection if the second
+        # environment variable equals 1. Returns the observer, or None when not enabled.
+        # Side effects: creates a file that is not deleted, registers a native observer.
         """
         Returns an ExecutionTraceObserver instance if the environment variable
         ENABLE_PYTORCH_EXECUTION_TRACE is set to 1, otherwise returns None.
@@ -1418,6 +1605,9 @@ class ExecutionTraceObserver(_ITraceObserver):
         return None
 
     def set_extra_resource_collection(self, val) -> None:
+        # [FUNCTION DOC] Sets the flag controlling collection of extra resources; when true,
+        # eagerly creates the resources directory next to the output file (so register the
+        # callback first). Returns None.
         """
         Collects extra resources such as generated kernels, index tensor data, and any other
         metadata that is required to complete the Execution Trace content.
@@ -1431,12 +1621,19 @@ class ExecutionTraceObserver(_ITraceObserver):
         return
 
     def register_callback(self, output_file_path: str) -> Self:
+        # [FUNCTION DOC] If not yet registered, remembers the output path and registers the
+        # native observer writing to it; for a path ending in .gz it writes to a temporary
+        # uncompressed file instead (compressed on unregister). Repeated calls while
+        # registered change nothing. The registered flag is set from the native call result.
+        # Returns the observer itself.
         """
         Adds ET observer to record function callbacks. The data will be
         written to output_file_path.
         """
 
         def get_temp_uncompressed_file() -> str:
+            # [FUNCTION DOC] HELPER: Creates a persistent temporary json file and returns its
+            # path.
             with tempfile.NamedTemporaryFile("w+b", suffix=".json", delete=False) as fp:
                 return fp.name
 
@@ -1449,6 +1646,10 @@ class ExecutionTraceObserver(_ITraceObserver):
         return self
 
     def get_resources_dir(self, can_create=False) -> str | None:
+        # [FUNCTION DOC] Returns the resources directory path: None if extra resource
+        # collection is off, the cached path if already known, otherwise the directory derived
+        # from the output path (created only if can_create is true), or None if it does not
+        # exist and cannot be created. Caches a found path on the instance.
         """
         Generates the resources directory for the generated kernels,
         or index tensor data or any other metadata that is required
@@ -1478,6 +1679,10 @@ class ExecutionTraceObserver(_ITraceObserver):
     def get_resources_dir_for_et_path(
         trace_path, create_dir: bool = False
     ) -> str | None:
+        # [FUNCTION DOC] Computes the sibling resources directory for a trace file: same folder,
+        # file name stem plus a resources suffix. If missing, creates it when create_dir is
+        # true (warning and returning None on failure), else returns None. Returns the path
+        # when it exists or was created. Side effect: may create a directory.
         work_dir, file_name = os.path.split(trace_path)
         resource_dir = os.path.join(
             work_dir, os.path.splitext(file_name)[0] + "_resources"
@@ -1497,11 +1702,20 @@ class ExecutionTraceObserver(_ITraceObserver):
         return resource_dir
 
     def unregister_callback(self) -> None:
+        # [FUNCTION DOC] If registered: stops the observer, copies generated inductor kernel
+        # source files into the resources directory (failures only warn), removes the native
+        # observer, compresses the temporary file to the requested gzip output (deleting the
+        # temporary) when the output path ends with gz, and marks the observer unregistered.
+        # Does nothing when not registered. Side effects: file copies and writes, console
+        # print during compression.
         """
         Removes ET observer from record function callbacks.
         """
 
         def _save_triton_kernels() -> None:
+            # [FUNCTION DOC] HELPER: Copies the source file of every loaded inductor-generated
+            # module into the resources directory. Returns early (warning on error) if the
+            # directory is unavailable. Side effect: file copies.
             try:
                 resource_dir = self.get_resources_dir()
             except Exception as e:
@@ -1530,6 +1744,8 @@ class ExecutionTraceObserver(_ITraceObserver):
                 shutil.copyfile(kernel_file, dst)
 
         def _save_gz_file(uncompressed_file: str, output_file: str) -> None:
+            # [FUNCTION DOC] HELPER: Prints a progress message, gzip-compresses the input file
+            # into the output file, then deletes the input file.
             print(f"Execution Trace: compressing {uncompressed_file} to {output_file}")
             with open(uncompressed_file, "rb") as fin:
                 with gzip.open(output_file, "wb") as fout:
@@ -1552,18 +1768,22 @@ class ExecutionTraceObserver(_ITraceObserver):
 
     @property
     def is_registered(self):
+        # [FUNCTION DOC] Property; True if the native observer is currently registered.
         """
         Returns True if the execution trace observer is registered, otherwise False.
         """
         return self._registered
 
     def is_running(self):
+        # [FUNCTION DOC] Returns True if capture is currently enabled.
         """
         Returns True if the observer is running, otherwise False.
         """
         return self._execution_trace_running
 
     def start(self) -> None:
+        # [FUNCTION DOC] If registered and not already running, enables the native observer,
+        # marks it running, and records the process group configuration into the trace.
         """
         Starts to capture.
         """
@@ -1573,6 +1793,7 @@ class ExecutionTraceObserver(_ITraceObserver):
             self._record_pg_config()
 
     def stop(self) -> None:
+        # [FUNCTION DOC] If running, disables the native observer and marks it not running.
         """
         Stops to capture.
         """
@@ -1581,12 +1802,14 @@ class ExecutionTraceObserver(_ITraceObserver):
             self._execution_trace_running = False
 
     def cleanup(self) -> None:
+        # [FUNCTION DOC] Finalizes outputs by unregistering the callback.
         """
         Calls unregister_callback() to make sure to finalize outputs.
         """
         self.unregister_callback()
 
     def get_output_file_path(self) -> str | None:
+        # [FUNCTION DOC] Returns the requested output file path, or None if none was set.
         """
         Returns the output file name or None.
         """
@@ -1596,6 +1819,10 @@ class ExecutionTraceObserver(_ITraceObserver):
             return None
 
     def _record_pg_config(self) -> None:
+        # [FUNCTION DOC] HELPER: When registered and distributed is available and initialized,
+        # writes the process group configuration (as JSON) into the trace by entering a
+        # record-function scope named for process group initialization.
+        # KNOWN ISSUE: the record-function scope is entered but never exited here.
         # Records the PG config info to the trace as node:
         #  ## process_group:init ##
         if (

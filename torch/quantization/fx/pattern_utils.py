@@ -1,4 +1,8 @@
 # flake8: noqa: F401
+# [MODULE DOC] Backward-compatibility shim re-exporting FX fusion/quant pattern registration
+# helpers, default pattern getters and QuantizeHandler from torch.ao.quantization.fx.
+# Import-time side effect: sets the __module__ attribute of several re-exported functions
+# to the ao pattern_utils module name so they report their canonical location.
 r"""
 This file is in the process of migration to `torch/ao/quantization`, and
 is kept here for compatibility while the migration process is ongoing.

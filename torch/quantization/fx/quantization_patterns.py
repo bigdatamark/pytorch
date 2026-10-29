@@ -1,3 +1,9 @@
+# [MODULE DOC] Backward-compatibility shim re-exporting the QuantizeHandler classes from
+# torch.ao.quantization.fx.quantize_handler (the original quantization_patterns module).
+# Import-time side effect: overwrites the __module__ attribute of every re-exported handler
+# class to name this legacy module path (via its ao-style dotted name) for pickling and docs.
+# KNOWN ISSUE: the assigned module name (ao quantization_patterns) matches no existing ao
+# module (the classes live in ao quantize_handler), so module-based lookup may not resolve.
 r"""
 This file is in the process of migration to `torch/ao/quantization`, and
 is kept here for compatibility while the migration process is ongoing.

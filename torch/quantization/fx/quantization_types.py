@@ -1,4 +1,7 @@
 # flake8: noqa: F401
+# [MODULE DOC] Backward-compatibility shim with no logic; re-exports from the migrated
+# torch.ao.quantization location: Pattern and QuantizerCls type aliases.
+# Importing it only imports the ao module. Add new functionality to the ao module.
 r"""
 This file is in the process of migration to `torch/ao/quantization`, and
 is kept here for compatibility while the migration process is ongoing.

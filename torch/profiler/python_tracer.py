@@ -1,3 +1,6 @@
+# [MODULE DOC] HELPER: Utility for the profiler's Python tracer that computes the list of
+# filesystem path prefixes (site-packages, sys.path entries, user base and site dirs, and the
+# directory containing the torch package) used to shorten file paths in traces.
 import os
 import site
 import sys
@@ -6,6 +9,11 @@ import torch
 
 
 def _prefix_regex() -> list[str]:
+    # [FUNCTION DOC] HELPER: Collects site-packages, sys.path, user base/site dirs and the
+    # parent of the torch install dir, makes them absolute and unique, sorts them in reverse
+    # order, and returns each with a trailing path separator. Raises an error if any
+    # entry is not a string. Reads interpreter state only.
+    # KNOWN ISSUE: name says regex but returns plain path prefix strings.
     raw_paths = (
         site.getsitepackages()
         + sys.path

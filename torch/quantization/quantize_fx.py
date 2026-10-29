@@ -1,4 +1,7 @@
 # flake8: noqa: F401
+# [MODULE DOC] Backward-compatibility shim with no logic; re-exports from the migrated
+# torch.ao.quantization location: FX API (prepare_fx, convert_fx, fuse_fx, tracer helpers).
+# Importing it only imports the ao module. Add new functionality to the ao module.
 r"""
 This file is in the process of migration to `torch/ao/quantization`, and
 is kept here for compatibility while the migration process is ongoing.

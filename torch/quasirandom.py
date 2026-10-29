@@ -1,9 +1,18 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Defines SobolEngine, a generator of (optionally scrambled) Sobol low-discrepancy
+# quasi-random sequences backed by C++ ops, supporting up to 21201 dimensions. No import-time
+# side effects.
 
 import torch
 
 
 class SobolEngine:
+    # [CLASS DOC] Stateful generator of Sobol quasi-random points in the unit hypercube.
+    # State: dimension, scramble flag, seed, the direction-number matrix (sobolstate),
+    # a shift vector (zero, or random when scrambled), the running integer point (quasi),
+    # the cached first point, and the count of points generated so far. Invariants:
+    # 1 <= dimension <= MAXDIM; points are produced sequentially so draws depend on history.
+    # Key methods: draw, draw_base2, reset, fast_forward.
     r"""
     The :class:`torch.quasirandom.SobolEngine` is an engine for generating
     (scrambled) Sobol sequences. Sobol sequences are an example of low
@@ -48,6 +57,11 @@ class SobolEngine:
     MAXDIM = 21201
 
     def __init__(self, dimension, scramble=False, seed=None):
+        # [FUNCTION DOC] Validates dimension (raises ValueError outside 1..MAXDIM), stores
+        # settings, builds the CPU direction-number state via a C++ op, then sets the shift:
+        # zeros, or a random scramble (which also scrambles the state) when scramble is true.
+        # Initializes the running point from the shift, caches the first point scaled to
+        # [0,1), and sets the generated count to zero.
         if dimension > self.MAXDIM or dimension < 1:
             raise ValueError(
                 "Supported range of dimensionality "
@@ -80,6 +94,10 @@ class SobolEngine:
         out: torch.Tensor | None = None,
         dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] Returns the next n points as an (n, dimension) tensor of the given
+        # dtype (default: current default dtype), advancing the engine state and count.
+        # The very first point comes from the cached shift point; later points come from a
+        # C++ draw op. If out is given, it is resized, filled with the result and returned.
         r"""
         Function to draw a sequence of :attr:`n` points from a Sobol sequence.
         Note that the samples are dependent on the previous samples. The size
@@ -133,6 +151,9 @@ class SobolEngine:
         out: torch.Tensor | None = None,
         dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] Draws 2**m points via draw. Raises ValueError unless the total
+        # count after drawing (already generated plus 2**m) is a power of two, since only
+        # then do Sobol balance properties hold. Same out/dtype semantics as draw.
         r"""
         Function to draw a sequence of :attr:`2**m` points from a Sobol sequence.
         Note that the samples are dependent on the previous samples. The size
@@ -158,6 +179,8 @@ class SobolEngine:
         return self.draw(n=n, out=out, dtype=dtype)
 
     def reset(self):
+        # [FUNCTION DOC] Restores the running point to the shift and the generated count to
+        # zero, so drawing restarts the sequence. Returns the engine itself.
         r"""
         Function to reset the ``SobolEngine`` to base state.
         """
@@ -166,6 +189,9 @@ class SobolEngine:
         return self
 
     def fast_forward(self, n):
+        # [FUNCTION DOC] Advances the state by n points without producing them, using a C++
+        # in-place op (offset by one on the first call, since the first point is the shift),
+        # and increases the generated count by n. Returns the engine; n of zero is a no-op.
         r"""
         Function to fast-forward the state of the ``SobolEngine`` by
         :attr:`n` steps. This is equivalent to drawing :attr:`n` samples
@@ -188,6 +214,10 @@ class SobolEngine:
         return self
 
     def _scramble(self):
+        # [FUNCTION DOC] HELPER: Draws random bits (from a CPU generator seeded with the
+        # engine seed if given, else the global RNG) to form the per-dimension integer shift
+        # vector and random lower-triangular binary matrices, then applies the matrices to
+        # the direction-number state in place via a C++ op. Sets the shift attribute.
         g: torch.Generator | None = None
         if self.seed is not None:
             g = torch.Generator()
@@ -210,6 +240,8 @@ class SobolEngine:
         torch._sobol_engine_scramble_(self.sobolstate, ltm, self.dimension)
 
     def __repr__(self):
+        # [FUNCTION DOC] Returns a string like the class name with dimension, plus scramble
+        # and seed entries when they are set.
         fmt_string = [f"dimension={self.dimension}"]
         if self.scramble:
             fmt_string += ["scramble=True"]

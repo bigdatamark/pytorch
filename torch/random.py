@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Global random number generator controls: get/set the CPU RNG state, seed all
+# devices (CPU, CUDA, MPS, XPU, MTIA and any privateuse1 custom device), query the initial
+# seed, a fork_rng context manager that restores RNG state on exit, and a helper returning
+# the DataLoader thread-worker generator. Import-time side effect: binds the default CPU
+# generator imported from the C extension.
 import contextlib
 import warnings
 from collections.abc import Generator
@@ -25,6 +30,8 @@ from torch._C import default_generator
 
 
 def set_rng_state(new_state: torch.Tensor) -> None:
+    # [FUNCTION DOC] Sets the state of the default CPU generator from a byte tensor
+    # (as produced by get_rng_state). Only the CPU generator is affected. Returns None.
     r"""Sets the random number generator state.
 
     .. note:: This function only works for CPU. For CUDA, please use
@@ -37,6 +44,8 @@ def set_rng_state(new_state: torch.Tensor) -> None:
 
 
 def get_rng_state() -> torch.Tensor:
+    # [FUNCTION DOC] Returns the default CPU generator state as a byte tensor; other
+    # devices are not included.
     r"""Returns the random number generator state as a `torch.ByteTensor`.
 
     .. note:: The returned state is for the default generator on CPU only.
@@ -47,6 +56,9 @@ def get_rng_state() -> torch.Tensor:
 
 
 def manual_seed(seed) -> torch._C.Generator:
+    # [FUNCTION DOC] Public entry point that seeds every device RNG and the default CPU
+    # generator with the given integer seed (delegates to the implementation helper) and
+    # returns the default generator. Raises RuntimeError for out-of-range seeds.
     r"""Sets the seed for generating random numbers on all devices. Returns a
     `torch.Generator` object.
 
@@ -60,6 +72,10 @@ def manual_seed(seed) -> torch._C.Generator:
 
 
 def _manual_seed_impl(seed) -> torch._C.Generator:
+    # [FUNCTION DOC] HELPER: Converts seed to an integer, then seeds CUDA, MPS, XPU, MTIA
+    # and any custom device, each only if that backend is not in a bad forked subprocess
+    # state, and finally seeds and returns the default CPU generator. Imports each backend
+    # module lazily. Side effects: mutates all those global generators.
     seed = int(seed)
     import torch.cuda
 
@@ -87,6 +103,9 @@ def _manual_seed_impl(seed) -> torch._C.Generator:
 
 
 def seed() -> int:
+    # [FUNCTION DOC] Draws a non-deterministic seed from the default CPU generator (which
+    # reseeds itself with it), applies the same seed to the CUDA, MPS, XPU, MTIA and custom
+    # device generators unless in a bad fork state, and returns the 64-bit seed.
     r"""Sets the seed for generating random numbers to a non-deterministic
     random number on all devices. Returns a 64 bit number used to seed the RNG.
     """
@@ -117,6 +136,10 @@ def seed() -> int:
 
 
 def _seed_custom_device(seed) -> None:
+    # [FUNCTION DOC] HELPER: Seeds the registered privateuse1 backend module, if torch has
+    # one, by calling its manual_seed_all unless its bad-fork check reports true. If the
+    # module lacks either required function, emits a UserWarning explaining the seed has no
+    # effect. Does nothing if no such module exists. Returns None.
     r"""Sets the seed to generate random numbers for custom device.
 
     Args:
@@ -142,6 +165,7 @@ def _seed_custom_device(seed) -> None:
 
 
 def initial_seed() -> int:
+    # [FUNCTION DOC] Returns the initial seed of the default CPU generator as an integer.
     r"""Returns the initial seed for generating random numbers as a
     Python `long`.
 
@@ -161,6 +185,14 @@ def fork_rng(
     _devices_kw="devices",
     device_type=None,
 ) -> Generator:
+    # [FUNCTION DOC] Context manager that saves the CPU RNG state and that of the selected
+    # devices, runs the body, and restores all saved states on exit (even on error). Does
+    # nothing for a meta device type or when enabled is false. Device type defaults to the
+    # current accelerator, else cuda; devices default to all of that type and a one-time
+    # warning is emitted if more than one exists. Raises RuntimeError if no module is
+    # registered for the device type. _caller and _devices_kw only shape the warning text.
+    # KNOWN ISSUE: the warning text contains a literal placeholder for the lowercase
+    # CPU-only hint because that piece is not an f-string.
     """
     Forks the RNG, so that when you return, the RNG is reset
     to the state that it was previously in.
@@ -240,6 +272,10 @@ def fork_rng(
 
 
 def thread_safe_generator() -> torch.Generator | None:
+    # [FUNCTION DOC] Returns the torch generator of the current DataLoader worker when called
+    # inside a thread-based worker that has an RNG; otherwise (main process, process
+    # workers, no RNG) returns None so callers fall back to the global generator.
+    # Imports the data utilities lazily to avoid a circular import at torch startup.
     """Returns a thread-safe random number generator for use in DataLoader workers.
     This function provides a convenient way for transforms and user code to use
     thread-safe random number generation without manually checking worker context.

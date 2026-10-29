@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Internal profiler helpers: generic tree traversal (depth-first and
+# breadth-first), a first-match index search, a CUPTI/cudagraph workaround initializer, and
+# logic that maps recorded Chrome-trace events to FX node names and stack traces using marker
+# events and the FX metadata registry. Defines the TimelineEvent and ContextStackEntry
+# dataclasses. No import-time side effects beyond defining partial functions.
 import functools
 from collections import deque
 from dataclasses import dataclass
@@ -6,6 +11,11 @@ from typing import Any, Literal
 
 
 def _traverse(tree, next_fn, children_fn=lambda x: x.children, reverse: bool = False):
+    # [FUNCTION DOC] HELPER: Generator that walks a forest lazily. Seeds a double-ended
+    # queue with the roots, repeatedly takes the next node using next_fn (pop from the right
+    # gives depth-first, pop from the left gives breadth-first), yields it, then appends its
+    # children (from children_fn, default the children attribute). If reverse is true, roots
+    # and children are enqueued in reversed order so depth-first visits them in order.
     order = reversed if reverse else lambda x: x
     remaining = deque(order(tree))
     while remaining:
@@ -22,6 +32,9 @@ traverse_bfs = functools.partial(
 
 
 def index_of_first_match(seq, predicate, start=0, end=None):
+    # [FUNCTION DOC] Returns the index of the first element of seq in [start, end) for which
+    # predicate is true, or None if there is none. A missing or oversized end is clamped to
+    # the sequence length.
     if end is None or end >= len(seq):
         end = len(seq)
     for i in range(start, end):
@@ -35,6 +48,9 @@ def index_of_first_match(seq, predicate, start=0, end=None):
 # TODO(dberard) - deprecate / remove workaround for CUDA >= 12, when
 # we stop supporting older CUDA versions.
 def _init_for_cuda_graphs() -> None:
+    # [FUNCTION DOC] HELPER: Works around the cudagraphs plus CUPTI issue by entering and
+    # immediately leaving a legacy autograd profile context (importing it lazily), which
+    # initializes profiler state. Side effects: starts and stops the autograd profiler.
     from torch.autograd.profiler import profile
 
     with profile():
@@ -43,6 +59,10 @@ def _init_for_cuda_graphs() -> None:
 
 @dataclass
 class TimelineEvent:
+    # [CLASS DOC] HELPER: Dataclass record for one entry of the sorted event timeline:
+    # timestamp, event_type (start/end of an FX marker, or a regular event), optional
+    # marker_type (filename or node), identifier (file name or node index) and the raw
+    # trace event mapping it came from.
     """Represents an event in the profiler timeline."""
 
     timestamp: int
@@ -54,6 +74,9 @@ class TimelineEvent:
 
 @dataclass
 class ContextStackEntry:
+    # [CLASS DOC] HELPER: Dataclass record for an active scope on the context stack:
+    # kind (filename or node), identifier, associated FX metadata mapping (or None) and the
+    # optional thread id of the marker event that opened it.
     """Represents a context (filename or node) in the stack."""
 
     context_type: Literal["filename", "node"]
@@ -77,6 +100,14 @@ def map_recorded_events_to_aten_ops_with_stack_trace(traced_data):
     Returns:
         Dict mapping recorded event names to their aten operations with added stack traces
     """
+    # [FUNCTION DOC] Takes a parsed Chrome trace mapping and mutates it in place: builds a
+    # timeline of start/end markers (events named with hash prefix/suffix, holding a file
+    # name or node index) and regular events, sorts by timestamp, and replays it with a stack
+    # of active file/node scopes (matched by thread id, nodes looked up in the FX metadata
+    # registry). Each regular event inside a node scope gets stack_trace and node_name
+    # entries in its args. Events lacking ts or dur are skipped. Returns None.
+    # KNOWN ISSUE: docstring claims a returned dict, but nothing is returned; also a
+    # non-integer, non-.py marker leaves node_index unset or stale, causing an error or reuse.
     from torch.fx.traceback import _FX_METADATA_REGISTRY
 
     trace_events = traced_data.get("traceEvents", [])
@@ -85,6 +116,8 @@ def map_recorded_events_to_aten_ops_with_stack_trace(traced_data):
     event_timeline: list[TimelineEvent] = []
 
     def is_fx_marker_event(event):
+        # [FUNCTION DOC] HELPER: True if the event is a cpu_op whose name starts with the
+        # marker prefix and ends with the marker suffix.
         return (
             event.get("cat") == "cpu_op"
             and event.get("name", "").startswith("## ")
@@ -92,6 +125,9 @@ def map_recorded_events_to_aten_ops_with_stack_trace(traced_data):
         )
 
     def append_fx_marker_event(event_type, identifier, event):
+        # [FUNCTION DOC] HELPER: Appends a start entry (at ts) and an end entry (at ts plus
+        # dur) for the marker event to the enclosing timeline list. Argument event_type is
+        # actually the marker kind (filename or node).
         start_ts = event["ts"]
         end_ts = start_ts + event["dur"]
         event_timeline.append(

@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Helpers for preparing int8 / int4 quantized weights for CUTLASS-based mixed
+# dtype linear operations on CUDA: packing two int4 values per int8 byte, unpacking them,
+# and reordering/interleaving a weight matrix into the layout the CUTLASS kernel expects.
+# Pure tensor functions; no import-time side effects.
 import torch
 
 
@@ -6,6 +10,9 @@ import torch
 # value goes into lower order bits, and second int4 value into higher
 # order bits of resulting int8 value.
 def pack_int4_to_int8(weight):
+    # [FUNCTION DOC] Packs a 2D int8 tensor holding int4 values into a tensor with half as
+    # many columns: even-column values go to the low nibble, odd-column values to the high.
+    # Raises an error if the input is not 2D, has an odd column count, or is not int8.
     if weight.dim() != 2:
         raise AssertionError(f"weight must be 2D, got {weight.dim()}D")
     if weight.shape[1] % 2 != 0:
@@ -19,6 +26,9 @@ def pack_int4_to_int8(weight):
 # major order; lower 4 bits go into first int4 value goes, and upper 4
 # bits go into second int4 value.
 def unpack_int8_to_int4(weight):
+    # [FUNCTION DOC] Inverse of the packing helper: splits each byte of a 2D int8 tensor
+    # into its low nibble then its high nibble, giving twice as many columns. Nibbles are
+    # masked, not sign-extended. Raises an error if the input is not a 2D int8 tensor.
     if weight.dim() != 2:
         raise AssertionError(f"weight must be 2D, got {weight.dim()}D")
     if weight.dtype != torch.int8:
@@ -34,6 +44,12 @@ def unpack_int8_to_int4(weight):
 def quantized_weight_reorder_for_mixed_dtypes_linear_cutlass(
     weight, dtypeq, transpose=False
 ):
+    # [FUNCTION DOC] Converts a quantized weight (2D int8 CUDA tensor; dtypeq is int8 or
+    # quint4x2 for packed int4) into the permuted, interleaved, bias-shifted uint8 layout
+    # of the CUTLASS mixed-dtype GEMM. Transposes first unless transpose is true (then the
+    # input is taken as already transposed). Returns a new uint8 tensor; input is unchanged.
+    # Raises an error on wrong rank/dtype/device, or if the transposed row count is not a
+    # multiple of 32 (int4) or 64 (int8) or the column count is not a multiple of 64.
     if weight.dim() != 2:
         raise AssertionError(f"weight must be 2D, got {weight.dim()}D")
     if weight.dtype != torch.int8:

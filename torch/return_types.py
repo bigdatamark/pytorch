@@ -1,3 +1,8 @@
+# [MODULE DOC] Exposes the structseq return types of torch operations (for example the
+# named tuples returned by max or sort) taken from the C extension return types module.
+# Import-time side effects: copies every non-dunder attribute into this module's globals,
+# appends public names to the all-list and to all_return_types, and registers every
+# tuple-subclass class with the pytree registry so they flatten and unflatten as sequences.
 import inspect
 
 import torch
@@ -13,14 +18,21 @@ return_types = torch._C._return_types  # type: ignore[attr-defined]
 
 
 def pytree_register_structseq(cls):
+    # [FUNCTION DOC] Registers a structseq class with the pytree registry so instances
+    # flatten into a list of their elements (no context) and unflatten by calling the class
+    # on that list; keyed flattening uses sequence indices as keys. Mutates global pytree
+    # state; returns None.
     def structseq_flatten(structseq):
+        # [FUNCTION DOC] HELPER: Returns the elements as a list and no context.
         return list(structseq), None
 
     def structseq_flatten_with_keys(structseq):
+        # [FUNCTION DOC] HELPER: Like flatten, but pairs each element with a sequence key.
         values, context = structseq_flatten(structseq)
         return [(SequenceKey(i), v) for i, v in enumerate(values)], context
 
     def structseq_unflatten(values, context):
+        # [FUNCTION DOC] HELPER: Rebuilds the structseq class from the list of values.
         return cls(values)
 
     register_pytree_node(

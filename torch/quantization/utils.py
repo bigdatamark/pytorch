@@ -1,4 +1,7 @@
 # flake8: noqa: F401
+# [MODULE DOC] Backward-compatibility shim with no logic; re-exports from the migrated
+# torch.ao.quantization location: shared quantization utilities (dtype queries, qparams).
+# Importing it only imports the ao module. Add new functionality to the ao module.
 r"""
 Utils shared by different modes of quantization (eager/graph)
 
