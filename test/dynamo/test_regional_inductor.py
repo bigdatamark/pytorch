@@ -1,4 +1,11 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests for regional Inductor compilation of Dynamo graphs: parts of the
+# graph are marked either with an fx annotation for compile_with_inductor or by a
+# nested compile region, and only those parts are compiled by Inductor while the rest
+# stays in an eager AOT graph. Defines the backend factory aot_eager_regional_inductor
+# and three test classes: annotation-based and invoke_subgraph-based compilation,
+# RegionalOutputCode serialization, and region partitioning. Import time sets the
+# module level device_type to the current accelerator type or cpu.
 
 import copy
 import functools
@@ -62,7 +69,15 @@ if TYPE_CHECKING:
 def aot_eager_regional_inductor(
     serialize=False, on_invoke_subgraph=False, captured_gms=None, partitioner=None
 ):
+    # [FUNCTION DOC] HELPER: Build an AOT autograd backend whose forward and backward
+    # compilers are regional Inductor. With serialize set, each compiled result is
+    # pickled and reloaded under a fresh tracing context before use. With
+    # on_invoke_subgraph set, the invoke_subgraph flavor of regional Inductor is used;
+    # captured_gms, if given, receives a deep copy of every graph module compiled.
+    # partitioner, if given, is passed as the partition function. Returns the backend.
     def regional_inductor_fn(gm, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Optionally record a deep copy of the graph module, then
+        # run the invoke_subgraph or the annotation flavor of regional Inductor on it.
         if captured_gms is not None:
             captured_gms.append(copy.deepcopy(gm))
 
@@ -77,6 +92,11 @@ def aot_eager_regional_inductor(
     if serialize:
 
         def regional_inductor_pickle(gm, *example_args):
+            # [FUNCTION DOC] HELPER: Compile with regional Inductor under a forced autograd
+            # cache, pickle the result with GraphPickler, then unpickle it with the example
+            # inputs' fake mode inside a fresh tracing context and recompile the graph module
+            # (for a RegionalOutputCode, its inner one). Raises AssertionError if no fake mode
+            # is found and RuntimeError if the reloaded object is of an unexpected type.
             with torch._functorch.config.patch(force_autograd_cache=True):
                 result = regional_inductor_fn(gm, *example_args)
             serialized = GraphPickler.dumps(result)
@@ -113,9 +133,16 @@ def aot_eager_regional_inductor(
 @skipIfTorchDynamo("Not a suitable dynamo wrapped test")
 @instantiate_parametrized_tests
 class RegionalInductorTests(torch._inductor.test_case.TestCase):
+    # [CLASS DOC] Tests for annotation-based regional Inductor: code marked with the
+    # compile_with_inductor annotation is compiled by Inductor inside an AOT eager
+    # graph. Counts generated code objects and checks configs, errors and refcounts.
     @parametrize("serialize", [False, True])
     def test_simple(self, serialize):
+        # [FUNCTION DOC] Annotated mul and add are compiled by Inductor: with a backward
+        # pass there must be exactly two generated code objects (forward and backward).
+        # Parametrized on whether results are serialized.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Sine, an annotated multiply and add, then sine again.
             sin = torch.sin(x)
 
             with fx_traceback.annotate({"compile_with_inductor": 0}):
@@ -135,7 +162,10 @@ class RegionalInductorTests(torch._inductor.test_case.TestCase):
         self.assertEqual(len(codes), 2)
 
     def test_boxed_calling_convention(self):
+        # [FUNCTION DOC] Runs the annotated function with warnings recorded and asserts
+        # that none says the AOT compiler returned a function without boxed arguments.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Sine, an annotated multiply and add, then sine again.
             sin = torch.sin(x)
 
             with fx_traceback.annotate({"compile_with_inductor": 0}):
@@ -166,7 +196,10 @@ class RegionalInductorTests(torch._inductor.test_case.TestCase):
 
     @parametrize("serialize", [False, True])
     def test_repeated_blocks(self, serialize):
+        # [FUNCTION DOC] The annotated function is called twice in one module; expects four
+        # generated code objects (two regions in forward and two in backward).
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Sine, an annotated multiply and add, then sine again.
             sin = torch.sin(x)
 
             with fx_traceback.annotate({"compile_with_inductor": 0}):
@@ -176,10 +209,14 @@ class RegionalInductorTests(torch._inductor.test_case.TestCase):
             return torch.sin(add)
 
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward applies the enclosing function twice.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Only calls the base class constructor.
                 super().__init__()
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Applies the enclosing function to the inputs, then
+                # applies it again to that result and the second input.
                 a = fn(x, y)
                 return fn(a, y)
 
@@ -200,12 +237,18 @@ class RegionalInductorTests(torch._inductor.test_case.TestCase):
 
     @parametrize("serialize", [False, True])
     def test_invoke_subgraph(self, serialize):
+        # [FUNCTION DOC] An annotation placed around a call to a nested compile region must
+        # propagate to the region's graph nodes; expects two code objects (forward and
+        # backward).
         # Checks that get_attr nodes custom metadata is propagated
         @torch.compiler.nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Nested compile region computing sine.
             return torch.sin(x)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Add one, call the region
+            # under the annotation, apply sigmoid.
             x = x + 1
             with fx_traceback.annotate({"compile_with_inductor": 0}):
                 z = gn(x)
@@ -221,14 +264,20 @@ class RegionalInductorTests(torch._inductor.test_case.TestCase):
 
     @parametrize("serialize", [False, True])
     def test_invoke_subgraph_inner(self, serialize):
+        # [FUNCTION DOC] The annotation lives inside a nested compile region called twice;
+        # checks the search is recursive and the shared region body is compiled only once,
+        # giving two code objects (forward and backward).
         # Checks that the inductor regions are searched recursively.
 
         @torch.compiler.nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Nested compile region computing an annotated sine.
             with fx_traceback.annotate({"compile_with_inductor": 0}):
                 return torch.sin(x)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Alternates adding one
+            # and calling the region twice, then sigmoid.
             x = x + 1
             x = gn(x)
             x = x + 1
@@ -248,10 +297,16 @@ class RegionalInductorTests(torch._inductor.test_case.TestCase):
     @requires_gpu_and_triton
     @parametrize("serialize", [False, True])
     def test_flex_attention(self, serialize):
+        # [FUNCTION DOC] Annotated flex attention, with a score modifier that squares the
+        # score and a block mask, expects two code objects (flex forward, flex backward).
+        # Requires a GPU and Triton.
         def _squared(score, b, h, m, n):
+            # [FUNCTION DOC] HELPER: Score modification returning the score squared.
             return score * score
 
         def mask_mod(b, h, q, k):
+            # [FUNCTION DOC] HELPER: Mask modification that
+            # is always true for non-negative query index.
             return q >= 0
 
         a = 12
@@ -259,6 +314,7 @@ class RegionalInductorTests(torch._inductor.test_case.TestCase):
         block_mask = create_block_mask(mask_mod, None, None, a * b, a * b)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sine, annotated flex attention on the input, then cosine.
             x = torch.sin(x)
             with fx_traceback.annotate({"compile_with_inductor": 0}):
                 x = flex_attention(x, x, x, block_mask=block_mask, score_mod=_squared)
@@ -286,10 +342,17 @@ class RegionalInductorTests(torch._inductor.test_case.TestCase):
 
     @parametrize("serialize", [False, True])
     def test_max_autotune_no_cudagraphs(self, serialize):
+        # [FUNCTION DOC] The annotation carries Inductor config overrides (max autotune on,
+        # cudagraphs off). Temporarily replaces the standalone compile entry point with a
+        # checking wrapper that records options, requires the graph module to be donated
+        # and verifies the two configs while compiling; always restores the original.
+        # Expects two code objects and at least one recorded compile.
         """Test that max-autotune-no-cudagraphs options are properly applied via annotations."""
         import torch._inductor.config as inductor_config
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Sine, then multiply and
+            # add under the config annotation, then sine.
             sin = torch.sin(x)
 
             # Use annotation API to specify inductor configs
@@ -313,6 +376,9 @@ class RegionalInductorTests(torch._inductor.test_case.TestCase):
         captured_options = []
 
         def verify_options(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Record the options keyword, raise AssertionError if the
+            # donate flag is not true, max autotune is off or cudagraphs is on, then delegate
+            # to the original standalone compile.
             options = kwargs.get("options", {})
             captured_options.append(options)
 
@@ -349,10 +415,15 @@ class RegionalInductorTests(torch._inductor.test_case.TestCase):
             torch._inductor.standalone_compile = original_compile
 
     def test_annotation_inductor_configs(self):
+        # [FUNCTION DOC] Inductor configs given in the annotation are in effect while the
+        # region compiles. Replaces the standalone compile entry point with a recorder of
+        # the two config values, runs forward and backward, asserts compilation happened
+        # and every snapshot has max autotune on and cudagraphs off; restores the original.
         """Test that inductor_configs can be passed through annotation API."""
         import torch._inductor.config as inductor_config
 
         def fn_with_annotation_configs(x, y):
+            # [FUNCTION DOC] HELPER: Matrix multiply plus one under the config annotation.
             # New annotation format with inductor_configs
             with fx_traceback.annotate(
                 {
@@ -372,6 +443,8 @@ class RegionalInductorTests(torch._inductor.test_case.TestCase):
         original_compile = torch._inductor.standalone_compile
 
         def capture_config(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Append the current max autotune and cudagraph config values
+            # to the snapshot list, then delegate to the original standalone compile.
             config_snapshots.append(
                 {
                     "max_autotune": inductor_config.max_autotune,
@@ -405,9 +478,13 @@ class RegionalInductorTests(torch._inductor.test_case.TestCase):
             torch._inductor.standalone_compile = original_compile
 
     def test_invalid_inductor_config(self):
+        # [FUNCTION DOC] An unknown config key in the annotation must make compilation fail
+        # with the backend compiler failure error naming the invalid key.
         """Test that invalid inductor config keys are caught with a clear error."""
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Multiply plus one under
+            # an annotation holding an invalid config key.
             with fx_traceback.annotate(
                 {
                     "compile_with_inductor": {
@@ -433,8 +510,16 @@ class RegionalInductorTests(torch._inductor.test_case.TestCase):
     @requires_gpu_and_triton
     @parametrize("serialize", [False, True])
     def test_selective_ac_flex(self, serialize):
+        # [FUNCTION DOC] Annotated flex attention inside a selective activation checkpoint
+        # module that saves matrix multiplies; compiles with bfloat16 on the accelerator.
+        # Expects at least two code objects, since non-contiguous annotated nodes may be
+        # split into several regions. Requires a GPU and Triton.
         class FlexAttentionModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Attention module with query, key, value and output linear
+            # layers whose forward runs flex attention under the Inductor annotation.
             def __init__(self, hidden_size, num_heads):
+                # [FUNCTION DOC] HELPER: Store sizes, derive the
+                # head dimension, build four linear layers.
                 super().__init__()
                 self.hidden_size = hidden_size
                 self.num_heads = num_heads
@@ -449,6 +534,9 @@ class RegionalInductorTests(torch._inductor.test_case.TestCase):
                 self.out_proj = torch.nn.Linear(hidden_size, hidden_size)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Project to query,
+                # key and value, split heads, run annotated
+                # flex attention, merge heads back and apply the output projection.
                 batch_size, seq_len, _ = x.size()
 
                 # Project queries, keys, and values
@@ -502,13 +590,20 @@ class RegionalInductorTests(torch._inductor.test_case.TestCase):
 
         # Define a model that uses FlexAttention with selective activation checkpointing
         class SacModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Wraps the attention module and runs it under non-reentrant
+            # checkpointing with the given selective context function.
             def __init__(self, hidden_size, num_heads, context_fn):
+                # [FUNCTION DOC] HELPER: Build the attention
+                # submodule and keep the context function.
                 super().__init__()
                 self.flex_attn = FlexAttentionModule(hidden_size, num_heads)
                 self.context_fn = context_fn
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Run attention through
+                # checkpoint with the stored context function.
                 def flex_attn_fn(x):
+                    # [FUNCTION DOC] HELPER: Apply the attention module to the input.
                     return self.flex_attn(x)
 
                 output = checkpoint(
@@ -534,17 +629,26 @@ class RegionalInductorTests(torch._inductor.test_case.TestCase):
         self.assertGreaterEqual(len(codes), 2)
 
     def test_refcounts(self):
+        # [FUNCTION DOC] The backward compiler wrapper checks that the activation list is a
+        # list and that some entry has a reference count showing a single owner, so
+        # activations can be freed early. Backward gradient must equal three times the input.
         """Tests that activations can be cleared before the end of graph"""
 
         class RefcountCheckPassed(Exception):
+            # [CLASS DOC] HELPER: Unused exception type.
             pass
 
         def regional_inductor_with_refcounting(gm, *example_args):
+            # [FUNCTION DOC] HELPER: Compile with regional Inductor, require it to be boxed, and
+            # return a wrapper that asserts the argument list holds an entry with one owner
+            # before calling it. The wrapper is marked as boxed.
             fn = regional_inductor(gm, *example_args)
             if not fn._boxed_call:
                 raise AssertionError("Expected fn._boxed_call to be True")
 
             def run(args: Any) -> Any:
+                # [FUNCTION DOC] HELPER: Raise AssertionError if args is not a list; assert that
+                # some argument has a minimal reference count; call the compiled function.
                 if type(args) is not list:
                     raise AssertionError(f"Expected args to be list, got {type(args)}")
 
@@ -560,14 +664,18 @@ class RegionalInductorTests(torch._inductor.test_case.TestCase):
             return run
 
         class MyAutogradFunction(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Autograd function saving the doubled input for backward.
             @staticmethod
             def forward(ctx, x):  # tensor of 1s
+                # [FUNCTION DOC] HELPER: Doubles the input, saves it for backward and returns it.
                 act = x + x  # tensor of 2s
                 ctx.save_for_backward(act)
                 return act
 
             @staticmethod
             def backward(ctx, grad_output):  # tensor of 1s
+                # [FUNCTION DOC] HELPER: Returns the saved
+                # doubled value plus the incoming gradient.
                 saved_act = ctx.saved_tensors  # tensor of 2s
                 return saved_act[0] + grad_output  # tensor of 3s
 
@@ -579,6 +687,7 @@ class RegionalInductorTests(torch._inductor.test_case.TestCase):
             fullgraph=True,
         )
         def fn(x):
+            # [FUNCTION DOC] HELPER: Apply the custom autograd function under the annotation.
             with fx_traceback.annotate({"compile_with_inductor": 0}):
                 return MyAutogradFunction.apply(x)
 
@@ -592,17 +701,25 @@ class RegionalInductorTests(torch._inductor.test_case.TestCase):
 @torch._dynamo.config.patch("enable_invoke_subgraph_regional_compile", True)
 @instantiate_parametrized_tests
 class RegionalInductorInvokeSubgraphTests(torch._inductor.test_case.TestCase):
+    # [CLASS DOC] Tests for regional Inductor driven by nested compile regions rather
+    # than annotations (invoke_subgraph flavor). The class is skipped under Dynamo
+    # wrapping and runs with the invoke subgraph regional compile config enabled.
     @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
     def test_normal_inductor_hop_subgraph_uses_nested_post_grad_config(self):
+        # [FUNCTION DOC] Uses the plain Inductor backend with a region carrying its own
+        # post grad pre pass. The nested pass must see the sine op and no invoke_subgraph
+        # node, the outer pass the invoke_subgraph node and no sine; each runs once.
         outer_pass_targets = []
         inner_pass_targets = []
 
         def outer_pass(graph):
+            # [FUNCTION DOC] HELPER: Record the call_function targets of the outer graph.
             outer_pass_targets.append(
                 [node.target for node in graph.nodes if node.op == "call_function"]
             )
 
         def inner_pass(graph):
+            # [FUNCTION DOC] HELPER: Record the call_function targets of the region's graph.
             inner_pass_targets.append(
                 [node.target for node in graph.nodes if node.op == "call_function"]
             )
@@ -613,9 +730,11 @@ class RegionalInductorInvokeSubgraphTests(torch._inductor.test_case.TestCase):
 
         @torch.compiler.nested_compile_region(options=nested_config)
         def g(x):
+            # [FUNCTION DOC] HELPER: Nested compile region computing sine.
             return torch.sin(x)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Cosine, then the region, then add one.
             return g(torch.cos(x)) + 1
 
         opt_fn = torch.compile(fn, backend="inductor", fullgraph=True)
@@ -642,6 +761,10 @@ class RegionalInductorInvokeSubgraphTests(torch._inductor.test_case.TestCase):
 
     @staticmethod
     def _generated_fn_body(code, signature):
+        # [FUNCTION DOC] HELPER: Static method that slices one function body out of
+        # generated wrapper code. It finds the signature text, takes the signature line
+        # and all following lines indented deeper than it (blank lines kept) and returns
+        # them joined by newlines. Raises ValueError if the signature is not found.
         # Slice one function/method body out of generated wrapper code: the
         # signature line plus every following line indented deeper than it.
         start = code.index(signature)
@@ -658,6 +781,9 @@ class RegionalInductorInvokeSubgraphTests(torch._inductor.test_case.TestCase):
     @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
     @torch._inductor.config.patch(fx_graph_cache=False, fx_graph_remote_cache=False)
     def test_nested_region_inductor_config_multi_kernel_codegen(self):
+        # [FUNCTION DOC] A multi kernel Inductor config set only on the region changes the
+        # region's generated function and not the parent's. Disables graph caching. Needs
+        # GPU and Triton.
         # triton.multi_kernel set only on the region must change the region's
         # generated code, not the parent's. The region body is emitted as
         # `repeated_subgraph0` and the parent as `call`. fx_graph_cache is off to
@@ -668,9 +794,11 @@ class RegionalInductorInvokeSubgraphTests(torch._inductor.test_case.TestCase):
 
         @torch.compiler.nested_compile_region(options=nested_config)
         def g(x):
+            # [FUNCTION DOC] HELPER: Nested compile region applying softmax and adding one.
             return torch.softmax(x, dim=-1) + 1
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Softmax scaled by two, then the region.
             y = torch.softmax(x, dim=-1) * 2
             return g(y)
 
@@ -688,6 +816,8 @@ class RegionalInductorInvokeSubgraphTests(torch._inductor.test_case.TestCase):
     @requires_gpu_and_triton
     @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
     def test_nested_region_inductor_config_persistent_reduction_codegen(self):
+        # [FUNCTION DOC] Turning off persistent reductions only for the region makes it use
+        # looped reduction kernels while the parent keeps persistent ones. Needs GPU and Triton.
         # triton.persistent_reductions=False set only on the region forces its
         # reduction to be looped (triton_red_*) while the parent keeps its
         # persistent kernel (triton_per_*).
@@ -697,9 +827,11 @@ class RegionalInductorInvokeSubgraphTests(torch._inductor.test_case.TestCase):
 
         @torch.compiler.nested_compile_region(options=nested_config)
         def g(x):
+            # [FUNCTION DOC] HELPER: Nested compile region applying softmax and adding one.
             return torch.softmax(x, dim=-1) + 1
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Softmax scaled by two, then the region.
             y = torch.softmax(x, dim=-1) * 2
             return g(y)
 
@@ -718,6 +850,9 @@ class RegionalInductorInvokeSubgraphTests(torch._inductor.test_case.TestCase):
     @requires_gpu_and_triton
     @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
     def test_nested_region_separate_fw_bw_inductor_config(self):
+        # [FUNCTION DOC] Only the backward config disables persistent reductions: the
+        # forward code keeps persistent kernels, the backward
+        # uses looped ones. Needs GPU and Triton.
         # A region can compile its forward and backward under different inductor
         # configs. The forward keeps persistent reductions (default) while the
         # backward is forced to looped reductions via bw_inductor_config_patches.
@@ -727,9 +862,11 @@ class RegionalInductorInvokeSubgraphTests(torch._inductor.test_case.TestCase):
 
         @torch.compiler.nested_compile_region(options=nested_config)
         def g(x):
+            # [FUNCTION DOC] HELPER: Nested compile region applying softmax.
             return torch.softmax(x, dim=-1)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sum of three times the region's output.
             return (g(x) * 3).sum()
 
         opt_fn = torch.compile(fn, backend="inductor", fullgraph=True)
@@ -748,6 +885,9 @@ class RegionalInductorInvokeSubgraphTests(torch._inductor.test_case.TestCase):
     @requires_gpu_and_triton
     @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
     def test_nested_region_fw_bw_inductor_config_both_set(self):
+        # [FUNCTION DOC] Forward config forces persistent reductions and backward config
+        # forces looped ones; each direction's region code shows the matching kernel kind.
+        # Needs GPU and Triton.
         # Forward and backward set to different explicit configs: the forward
         # forces persistent reductions, the backward forces looped ones. Each
         # direction's own region is compiled under its own config.
@@ -758,9 +898,11 @@ class RegionalInductorInvokeSubgraphTests(torch._inductor.test_case.TestCase):
 
         @torch.compiler.nested_compile_region(options=nested_config)
         def g(x):
+            # [FUNCTION DOC] HELPER: Nested compile region applying softmax.
             return torch.softmax(x, dim=-1)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sum of three times the region's output.
             return (g(x) * 3).sum()
 
         opt_fn = torch.compile(fn, backend="inductor", fullgraph=True)
@@ -779,9 +921,14 @@ class RegionalInductorInvokeSubgraphTests(torch._inductor.test_case.TestCase):
         self.assertNotIn("triton_per_", bw_region)
 
     def test_custom_decomposition(self):
+        # [FUNCTION DOC] Custom decompositions rewrite adds inside the region into sine,
+        # while the add outside stays. Expects two code objects, two captured region graphs
+        # and exact expected text for the forward and backward region graphs.
         # Test that custom decompositions are applied to the subgraph.
 
         def my_add_decomp(a, b):
+            # [FUNCTION DOC] HELPER: Replacement decomposition
+            # returning the sine of the first operand.
             return a.sin()
 
         nested_config = get_invoke_subgraph_compile_options(
@@ -793,9 +940,12 @@ class RegionalInductorInvokeSubgraphTests(torch._inductor.test_case.TestCase):
 
         @torch.compiler.nested_compile_region(options=nested_config)
         def g(y):
+            # [FUNCTION DOC] HELPER: Nested compile region adding one.
             return y + 1
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Add one outside the
+            # region, call the region, double the result.
             y = x + 1  # this should still be add
             add = g(y)  # this should be decomposed to y.sin()
             return add * 2
@@ -843,15 +993,19 @@ def forward(self, tangents_0):
 
     @parametrize("serialize", [False])  # , True
     def test_simple(self, serialize):
+        # [FUNCTION DOC] Region with default options, wrapped by sine ops on both sides;
+        # expects two code objects and numerical equality with eager.
         nested_config = get_invoke_subgraph_compile_options()
 
         @torch.compiler.nested_compile_region(options=nested_config)
         def g(sin, y):
+            # [FUNCTION DOC] HELPER: Nested compile region multiplying and adding one.
             mul = sin * y
             add = mul + 1
             return add
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Sine, the region, sine.
             sin = torch.sin(x)
             add = g(sin, y)
             return torch.sin(add)
@@ -873,19 +1027,24 @@ def forward(self, tangents_0):
 
     @parametrize("serialize", [False])  # , True
     def test_two_graphs(self, serialize):
+        # [FUNCTION DOC] Two different regions compiled; expects four code objects (a
+        # forward and a backward each) and results equal to eager.
         nested_config = get_invoke_subgraph_compile_options()
 
         @torch.compiler.nested_compile_region(options=nested_config)
         def g1(sin, y):
+            # [FUNCTION DOC] HELPER: Region multiplying and adding one.
             mul = sin * y
             add = mul + 1
             return add
 
         @torch.compiler.nested_compile_region(options=nested_config)
         def g2(x):
+            # [FUNCTION DOC] HELPER: Region dividing by three.
             return x / 3
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Sine, then the first region, then the second region.
             sin = torch.sin(x)
             add = g1(sin, y)
             div = g2(add)
@@ -908,15 +1067,21 @@ def forward(self, tangents_0):
 
     @parametrize("serialize", [False])  # , True
     def test_unbacked_expr_input(self, serialize):
+        # [FUNCTION DOC] Regression test for an input whose size is an unbacked expression
+        # (a concatenation of an unbacked dimension input with itself) passed to a region;
+        # only checks the result equals eager.
         # https://github.com/pytorch/pytorch/issues/167012
 
         nested_config = get_invoke_subgraph_compile_options()
 
         @torch.compiler.nested_compile_region(options=nested_config)
         def gn(x):
+            # [FUNCTION DOC] HELPER: Region adding one.
             return x + 1
 
         def fn(c):
+            # [FUNCTION DOC] HELPER: Concatenate the input
+            # with itself along dim zero, then the region.
             d = torch.concat([c, c], dim=0)
             d = gn(d)
             return d
@@ -939,7 +1104,11 @@ def forward(self, tangents_0):
 
     @requires_gpu_and_triton
     def test_unbacked_expr_size_input(self):
+        # [FUNCTION DOC] Same unbacked input but with annotation based compilation on the
+        # accelerator; expects exactly one code object and
+        # result equal to eager. Needs GPU and Triton.
         def fn(c):
+            # [FUNCTION DOC] HELPER: Concatenate with itself and add one under the annotation.
             d = torch.concat([c, c], dim=0)
             with fx_traceback.annotate({"compile_with_inductor": 0}):
                 d = d + 1
@@ -960,24 +1129,34 @@ def forward(self, tangents_0):
 
     @parametrize("serialize", [False])
     def test_repeated_blocks(self, serialize):
+        # [FUNCTION DOC] Same region called twice via a module; Inductor compiles it only
+        # once per direction (two code objects). Checks exact text of the inner compiled
+        # graphs and of the outer forward and backward graphs, where both calls share one
+        # partitioned subgraph.
         nested_config = get_invoke_subgraph_compile_options()
 
         @torch.compiler.nested_compile_region(options=nested_config)
         def g(sin, y):
+            # [FUNCTION DOC] HELPER: Region multiplying and adding one.
             mul = sin * y
             add = mul + 1
             return add
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Sine, the region, sine.
             sin = torch.sin(x)
             add = g(sin, y)
             return torch.sin(add)
 
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward applies the enclosing function twice.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Only calls the base class constructor.
                 super().__init__()
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Applies the enclosing function, then applies it again to
+                # that result and the second input.
                 a = fn(x, y)
                 return fn(a, y)
 
@@ -1078,20 +1257,27 @@ def forward(self, primals_1, getitem_9, getitem_8, getitem, sin_1, getitem_11, g
 
     @parametrize("serialize", [False])  # , True
     def test_invoke_subgraph_inner(self, serialize):
+        # [FUNCTION DOC] Nested regions: the outer region without options calls an inner
+        # region with options. Inner is compiled recursively, once per direction; checks
+        # two code objects and the exact text of both captured graphs.
         # Checks that the inductor regions are searched recursively.
 
         nested_config = get_invoke_subgraph_compile_options()
 
         @torch.compiler.nested_compile_region(options=nested_config)
         def g(y):
+            # [FUNCTION DOC] HELPER: Inner region doubling its input.
             return y * 2
 
         @torch.compiler.nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Outer region calling the inner one and then sine.
             x = g(x)
             return torch.sin(x)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Alternates adding one and
+            # calling the outer region twice, then sigmoid.
             x = x + 1
             x = gn(x)
             x = x + 1
@@ -1139,10 +1325,16 @@ def forward(self, arg0_1, arg1_1):
     @requires_gpu_and_triton
     @parametrize("serialize", [False])  # , True
     def test_flex_attention(self, serialize):
+        # [FUNCTION DOC] Flex attention inside a region with core ATen decompositions.
+        # Expects two code objects, equality with eager and exact text of the captured
+        # forward and backward graphs. Needs GPU and Triton.
         def _squared(score, b, h, m, n):
+            # [FUNCTION DOC] HELPER: Score modification returning the score squared.
             return score * score
 
         def mask_mod(b, h, q, k):
+            # [FUNCTION DOC] HELPER: Mask modification that
+            # is always true for non-negative query index.
             return q >= 0
 
         a = 12
@@ -1156,10 +1348,13 @@ def forward(self, arg0_1, arg1_1):
 
         @torch.compiler.nested_compile_region(options=nested_config)
         def f_flex_attention(x, y, z, block_mask, score_mod):
+            # [FUNCTION DOC] HELPER: Region running flex attention
+            # with the given mask and score modifier.
             x = flex_attention(x, y, z, block_mask=block_mask, score_mod=score_mod)
             return x
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sine, the flex region, cosine.
             x = torch.sin(x)
             x = f_flex_attention(x, x, x, block_mask=block_mask, score_mod=_squared)
             return torch.cos(x)
@@ -1223,6 +1418,10 @@ def forward(self, primals_0, primals_1, primals_2, primals_3, primals_4, primals
 
     @parametrize("serialize", [False])  # , True
     def test_max_autotune_no_cudagraphs(self, serialize):
+        # [FUNCTION DOC] Config patches given when building region options (max autotune
+        # on, cudagraphs off) reach the Inductor inner compile call. Replaces the private
+        # inner compile function with a checking wrapper that records the patches and
+        # raises AssertionError on wrong config values; restores the original afterwards.
         """Test that max-autotune-no-cudagraphs options are properly applied inductor_config_patches."""
         import torch._inductor.config as inductor_config
 
@@ -1235,11 +1434,13 @@ def forward(self, primals_0, primals_1, primals_2, primals_3, primals_4, primals
 
         @torch.compiler.nested_compile_region(options=nested_config)
         def g(sin, y):
+            # [FUNCTION DOC] HELPER: Region multiplying and adding one.
             mul = sin * y
             add = mul + 1
             return add
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Sine, the region, sine.
             sin = torch.sin(x)
             add = g(sin, y)
             return torch.sin(add)
@@ -1249,6 +1450,8 @@ def forward(self, primals_0, primals_1, primals_2, primals_3, primals_4, primals
         captured_options = []
 
         def verify_options(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Record the config patches keyword, raise AssertionError if
+            # max autotune is off or cudagraphs is on, then delegate to the original function.
             options = kwargs.get("inductor_config_patches", {})
             captured_options.append(options)
 
@@ -1285,6 +1488,8 @@ def forward(self, primals_0, primals_1, primals_2, primals_3, primals_4, primals
             torch._inductor.compile_fx._compile_fx_inner = original_compile
 
     def test_invalid_inductor_config(self):
+        # [FUNCTION DOC] Building region options with an unknown config key raises
+        # ValueError naming the key.
         """Test that invalid inductor config keys are caught with a clear error."""
 
         with self.assertRaisesRegex(
@@ -1300,6 +1505,10 @@ def forward(self, primals_0, primals_1, primals_2, primals_3, primals_4, primals
     @requires_gpu_and_triton
     @parametrize("serialize", [False])  # , True
     def test_selective_ac_flex(self, serialize):
+        # [FUNCTION DOC] Selective activation checkpointing around a module whose flex
+        # attention is a region compiled with core ATen decompositions plus extra ones for
+        # arange and dtype conversion. Compares output with eager and expects two code
+        # objects. Needs GPU and Triton.
         # must decompose the following fallback ops in inductor
         # e.g. AssertionError: both a fallback and a decomp for same op: aten.zeros.default
         decomp_table = torch._decomp.core_aten_decompositions()
@@ -1315,11 +1524,16 @@ def forward(self, primals_0, primals_1, primals_2, primals_3, primals_4, primals
 
         @torch.compiler.nested_compile_region(options=nested_config)
         def f_flex_attention(x, y, z):
+            # [FUNCTION DOC] HELPER: Region running flex attention.
             x = flex_attention(x, y, z)
             return x
 
         class FlexAttentionModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Attention module with query, key, value and output linear
+            # layers whose forward calls the flex attention region.
             def __init__(self, hidden_size, num_heads):
+                # [FUNCTION DOC] HELPER: Store sizes, derive the
+                # head dimension, build four linear layers.
                 super().__init__()
                 self.hidden_size = hidden_size
                 self.num_heads = num_heads
@@ -1334,6 +1548,9 @@ def forward(self, primals_0, primals_1, primals_2, primals_3, primals_4, primals
                 self.out_proj = torch.nn.Linear(hidden_size, hidden_size)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Project to query,
+                # key and value, split heads, call the flex
+                # region, merge heads back and apply the output projection.
                 batch_size, seq_len, _ = x.size()
 
                 # Project queries, keys, and values
@@ -1386,13 +1603,20 @@ def forward(self, primals_0, primals_1, primals_2, primals_3, primals_4, primals
 
         # Define a model that uses FlexAttention with selective activation checkpointing
         class SacModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Wraps the attention module and runs it under non-reentrant
+            # checkpointing with the given selective context function.
             def __init__(self, hidden_size, num_heads, context_fn):
+                # [FUNCTION DOC] HELPER: Build the attention
+                # submodule and keep the context function.
                 super().__init__()
                 self.flex_attn = FlexAttentionModule(hidden_size, num_heads)
                 self.context_fn = context_fn
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Run attention through
+                # checkpoint with the stored context function.
                 def flex_attn_fn(x):
+                    # [FUNCTION DOC] HELPER: Apply the attention module to the input.
                     return self.flex_attn(x)
 
                 output = checkpoint(
@@ -1422,7 +1646,11 @@ def forward(self, primals_0, primals_1, primals_2, primals_3, primals_4, primals
 
     @parametrize("serialize", [False])  # True,
     def test_invoke_subgraph_regional_compile_decomposition(self, serialize):
+        # [FUNCTION DOC] A decomposition mapping sine to cosine applies only to the region
+        # that has options; the other region keeps sine. Expects two code objects and the
+        # result equal to sine plus cosine of the input.
         def my_sin_decomp(x):
+            # [FUNCTION DOC] HELPER: Replacement for sine returning cosine.
             return torch.cos(x)
 
         decompositions = {torch.ops.aten.sin.default: my_sin_decomp}
@@ -1432,13 +1660,16 @@ def forward(self, primals_0, primals_1, primals_2, primals_3, primals_4, primals
 
         @torch.compiler.nested_compile_region(options=nested_config)
         def gn_with_backend(x):
+            # [FUNCTION DOC] HELPER: Region with options computing sine.
             return torch.sin(x)
 
         @torch.compiler.nested_compile_region
         def gn_without_backend(x):
+            # [FUNCTION DOC] HELPER: Region without options computing sine.
             return torch.sin(x)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sum of both regions applied to the input.
             return gn_with_backend(x) + gn_without_backend(x)
 
         backend = aot_eager_regional_inductor(
@@ -1456,6 +1687,11 @@ def forward(self, primals_0, primals_1, primals_2, primals_3, primals_4, primals
     @torch._dynamo.config.patch("enable_invoke_subgraph_regional_compile", True)
     @parametrize("serialize", [False])  # True,
     def test_invoke_subgraph_regional_compile(self, serialize):
+        # [FUNCTION DOC] A custom partitioner wrapping the min cut partitioner is passed in
+        # the region options (by name when serialized, by callable otherwise). Expects two
+        # code objects, one partitioner call and equality with eager. Restores the partitioner
+        # function in a finally block. KNOWN ISSUE: when serialize is set it overwrites the
+        # default partition function and restores only the min cut one, not the default one.
         call_test_partitioner_ct = 0
         original_mincut_partitioner = (
             torch._functorch.partitioners.min_cut_rematerialization_partition
@@ -1464,6 +1700,9 @@ def forward(self, primals_0, primals_1, primals_2, primals_3, primals_4, primals
         def test_partitioner(
             *args, **kwargs
         ) -> tuple[torch.fx.GraphModule, torch.fx.GraphModule]:
+            # [FUNCTION DOC] HELPER: Count the call in the enclosing counter and delegate
+            # to the original min cut partitioner with the same arguments, returning
+            # its two graph modules.
             nonlocal call_test_partitioner_ct
             call_test_partitioner_ct += 1
             return original_mincut_partitioner(*args, **kwargs)
@@ -1487,13 +1726,16 @@ def forward(self, primals_0, primals_1, primals_2, primals_3, primals_4, primals
 
         @torch.compiler.nested_compile_region(options=nested_config)
         def gn_with_backend(x):
+            # [FUNCTION DOC] HELPER: Region with options computing sine.
             return torch.sin(x)
 
         @torch.compiler.nested_compile_region
         def gn_without_backend(x):
+            # [FUNCTION DOC] HELPER: Region without options computing cosine.
             return torch.cos(x)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sum of both regions applied to the input.
             return gn_with_backend(x) + gn_without_backend(x)
 
         backend = aot_eager_regional_inductor(
@@ -1517,6 +1759,9 @@ def forward(self, primals_0, primals_1, primals_2, primals_3, primals_4, primals
     @parametrize("serialize", [False])
     @torch._dynamo.config.patch("trace_autograd_ops", True)
     def test_multi_invocation_chunked_loss_with_backward(self, serialize):
+        # [FUNCTION DOC] One region is called for many chunks in a loop, the losses are
+        # summed and backward runs inside the compiled function. Checks loss and input
+        # gradient equal eager, exercising pairing of forward and backward calls by call id.
         # Single nested_compile_region invoked many times in a for-loop, summed,
         # then a single outer .backward(). Exercises pairing fw/bw HOPs by
         # call_id when there are multiple fw calls per region.
@@ -1524,9 +1769,12 @@ def forward(self, primals_0, primals_1, primals_2, primals_3, primals_4, primals
 
         @torch.compiler.nested_compile_region(options=nested_config)
         def chunk_loss(logits, targets):
+            # [FUNCTION DOC] HELPER: Mean squared difference between logits and targets.
             return (logits - targets).pow(2).mean()
 
         def fn(x, targets_chunks):
+            # [FUNCTION DOC] HELPER: Detach the input and require grad, sum the region over all
+            # chunks, run backward and return the detached loss and gradient.
             x_d = x.detach().requires_grad_()
             total = sum(chunk_loss(x_d, t) for t in targets_chunks)
             total.backward()
@@ -1551,6 +1799,9 @@ def forward(self, primals_0, primals_1, primals_2, primals_3, primals_4, primals
     @parametrize("serialize", [False])
     @torch._dynamo.config.patch("trace_autograd_ops", True)
     def test_two_regions_chunked_loss(self, serialize):
+        # [FUNCTION DOC] Two regions, attention applied three times and chunked loss, in one
+        # forward and backward. Their forward and backward call counts differ, so pairing by
+        # call id is needed; checks loss and gradient equal eager.
         # Two nested_compile_regions composed in one fwd+bwd: `attn` called per
         # layer, `chunk_loss` called per chunk. The fw and bw HOP counts per
         # region differ, so positional zip-pairing fails; call_id pairing works.
@@ -1558,13 +1809,18 @@ def forward(self, primals_0, primals_1, primals_2, primals_3, primals_4, primals
 
         @torch.compiler.nested_compile_region(options=nested_config)
         def attn(q, k):
+            # [FUNCTION DOC] HELPER: Region returning the row
+            # sums of the product, plus the first input.
             return (q * k).sum(dim=-1, keepdim=True) + q
 
         @torch.compiler.nested_compile_region(options=nested_config)
         def chunk_loss(logits, targets):
+            # [FUNCTION DOC] HELPER: Mean squared difference between logits and targets.
             return (logits - targets).pow(2).mean()
 
         def fn(x, y, targets_chunks):
+            # [FUNCTION DOC] HELPER: Apply attention three times, then sum chunk losses on a
+            # detached input, run backward and return the loss and gradient.
             for _ in range(3):
                 x = attn(x, y)
             x_d = x.detach().requires_grad_()
@@ -1591,6 +1847,9 @@ def forward(self, primals_0, primals_1, primals_2, primals_3, primals_4, primals
 
     @parametrize("serialize", [False])
     def test_one_fw_subgraph_multiple_bw_subgraphs(self, serialize):
+        # [FUNCTION DOC] One region called five times with a dynamic batch dimension, where
+        # tangent strides differ per position, giving several backward subgraphs for a
+        # single forward one. Checks value and gradient equal eager.
         # Same fw region called 5 times under dynamic batch dim. The tangents
         # flowing into each call have different strides depending on their
         # position in the fw graph, so AOTAutograd's lazy-bw cache produces
@@ -1601,9 +1860,12 @@ def forward(self, primals_0, primals_1, primals_2, primals_3, primals_4, primals
         # primals — gradients must match eager.
         @torch.compiler.nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Region computing cosine.
             return torch.cos(x)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Mix of region calls and
+            # sine, returning a sum of three reductions.
             a = gn(x)
             a2 = gn(a)
             b = torch.sin(a2)
@@ -1634,6 +1896,9 @@ def forward(self, primals_0, primals_1, primals_2, primals_3, primals_4, primals
 
     @parametrize("serialize", [False])
     def test_nested_compile_region_basic_nesting(self, serialize):
+        # [FUNCTION DOC] An outer region calls an inner region once. Only the outer is seen
+        # by the joint graph passes; the inner is handled recursively. Checks value and
+        # gradient equal eager.
         # Outer nested_compile_region calls inner nested_compile_region once.
         # `run_joint_graph_passes_on_hops` only sees the outer HOP at the joint
         # graph level; inner is inside outer's subgraph and is handled by
@@ -1641,13 +1906,16 @@ def forward(self, primals_0, primals_1, primals_2, primals_3, primals_4, primals
         # call_id pairing for the visible (outer) HOP must still hold.
         @torch.compiler.nested_compile_region
         def inner(x):
+            # [FUNCTION DOC] HELPER: Inner region doubling its input.
             return x * 2
 
         @torch.compiler.nested_compile_region
         def outer(x):
+            # [FUNCTION DOC] HELPER: Outer region calling the inner one and adding one.
             return inner(x) + 1
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sum of the outer region's output.
             return outer(x).sum()
 
         x = torch.randn(8, 4, requires_grad=True)
@@ -1670,19 +1938,27 @@ def forward(self, primals_0, primals_1, primals_2, primals_3, primals_4, primals
     @parametrize("serialize", [False])
     @torch._dynamo.config.patch("trace_autograd_ops", True)
     def test_nested_compile_region_multi_invocation(self, serialize):
+        # [FUNCTION DOC] Outer region calling an inner one is invoked for each of several
+        # targets in a loop with backward in the compiled function; checks loss and gradient
+        # equal eager.
         # Outer is called multiple times in a Python for-loop; each outer call
         # also invokes inner. Joint pass sees N outer fws and N outer bws (one
         # per call); call_id pairs them correctly. Inner HOPs are nested inside
         # each outer subgraph and not visible to the joint pass.
         @torch.compiler.nested_compile_region
         def inner(x, t):
+            # [FUNCTION DOC] HELPER: Inner region returning the squared difference.
             return (x - t).pow(2)
 
         @torch.compiler.nested_compile_region
         def outer(x, t):
+            # [FUNCTION DOC] HELPER: Outer region returning
+            # the mean of the inner region's output.
             return inner(x, t).mean()
 
         def fn(x, ts):
+            # [FUNCTION DOC] HELPER: Sum outer region over all targets on a detached input, run
+            # backward, return detached loss and gradient.
             x_d = x.detach().requires_grad_()
             total = sum(outer(x_d, t) for t in ts)
             total.backward()
@@ -1705,6 +1981,10 @@ def forward(self, primals_0, primals_1, primals_2, primals_3, primals_4, primals
         self.assertEqual(out_grad, ref_grad)
 
     def test_invoke_subgraph_functionalize_schema_cache(self):
+        # [FUNCTION DOC] Checks the cache of functionalization schemas for the invoke
+        # subgraph operator. Counts calls to schema generation with the cache on and with
+        # the cache entry getters and setters replaced by no-ops, and asserts fewer calls
+        # with the cache. Patched class attributes are restored in a finally block.
         from torch._guards import InvokeSubgraphCache
         from torch._higher_order_ops.invoke_subgraph import InvokeSubgraphHOP
 
@@ -1713,18 +1993,26 @@ def forward(self, primals_0, primals_1, primals_2, primals_3, primals_4, primals
         orig_add_schema = InvokeSubgraphCache.add_functionalize_schema_entry
 
         def run(disable_cache):
+            # [FUNCTION DOC] HELPER: Reset Dynamo, patch schema generation with a counting
+            # wrapper (and optionally disable the schema cache), compile a function calling a
+            # region four times with the aot eager backend and run backward ignoring user
+            # warnings. Returns the schema generation call count; always restores patches.
             gen_schema_calls = 0
 
             def counted_gen_schema(self, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: Increment the enclosing call
+                # counter, then call the original schema generator.
                 nonlocal gen_schema_calls
                 gen_schema_calls += 1
                 return orig_gen_schema(self, *args, **kwargs)
 
             @torch.compiler.nested_compile_region
             def gn(x):
+                # [FUNCTION DOC] HELPER: Region computing sine plus one.
                 return torch.sin(x) + 1
 
             def fn(x):
+                # [FUNCTION DOC] HELPER: Apply the region four times and sum.
                 out = x
                 for _ in range(4):
                     out = gn(out)
@@ -1757,17 +2045,25 @@ def forward(self, primals_0, primals_1, primals_2, primals_3, primals_4, primals
         self.assertLess(cached_calls, uncached_calls)
 
     def test_refcounts(self):
+        # [FUNCTION DOC] Same activation freeing check as the annotation variant, but with a
+        # region and the invoke subgraph flavor of regional Inductor as the backward wrapper.
+        # Backward gradient must equal three times the input.
         """Tests that activations can be cleared before the end of graph"""
 
         class RefcountCheckPassed(Exception):
+            # [CLASS DOC] HELPER: Unused exception type.
             pass
 
         def regional_inductor_with_refcounting(gm, *example_args):
+            # [FUNCTION DOC] HELPER: Compile with invoke subgraph regional Inductor, require it
+            # to be boxed, and return a boxed wrapper that checks for a single owner activation.
             fn = regional_inductor_invoke_subgraph(gm, *example_args)
             if not fn._boxed_call:
                 raise AssertionError("Expected fn._boxed_call to be True")
 
             def run(args: Any) -> Any:
+                # [FUNCTION DOC] HELPER: Raise AssertionError if args is not a list; assert that
+                # some argument has a minimal reference count; call the compiled function.
                 if type(args) is not list:
                     raise AssertionError(f"Expected args to be list, got {type(args)}")
 
@@ -1783,14 +2079,18 @@ def forward(self, primals_0, primals_1, primals_2, primals_3, primals_4, primals
             return run
 
         class MyAutogradFunction(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Autograd function saving the doubled input for backward.
             @staticmethod
             def forward(ctx, x):  # tensor of 1s
+                # [FUNCTION DOC] HELPER: Doubles the input, saves it for backward and returns it.
                 act = x + x  # tensor of 2s
                 ctx.save_for_backward(act)
                 return act
 
             @staticmethod
             def backward(ctx, grad_output):  # tensor of 1s
+                # [FUNCTION DOC] HELPER: Returns the saved
+                # doubled value plus the incoming gradient.
                 saved_act = ctx.saved_tensors  # tensor of 2s
                 return saved_act[0] + grad_output  # tensor of 3s
 
@@ -1798,6 +2098,7 @@ def forward(self, primals_0, primals_1, primals_2, primals_3, primals_4, primals
 
         @torch.compiler.nested_compile_region(options=nested_config)
         def autograd_apply(x):
+            # [FUNCTION DOC] HELPER: Region applying the custom autograd function.
             return MyAutogradFunction.apply(x)
 
         @torch.compile(
@@ -1808,6 +2109,7 @@ def forward(self, primals_0, primals_1, primals_2, primals_3, primals_4, primals
             fullgraph=True,
         )
         def fn(x):
+            # [FUNCTION DOC] HELPER: Call the region on the input.
             return autograd_apply(x)
 
         x = torch.ones(10, 10, requires_grad=True)
@@ -1818,6 +2120,10 @@ def forward(self, primals_0, primals_1, primals_2, primals_3, primals_4, primals
     @requires_gpu_and_triton
     @parametrize("serialize", [False])
     def test_comprehensive_padding_saved_tensor_stride(self, serialize):
+        # [FUNCTION DOC] Regression test: Inductor comprehensive padding must not change
+        # strides of saved region outputs, or the backward subgraph fails its stride
+        # assertion. Uses bfloat16 on the accelerator with an output feature count that
+        # gets padded, and compares output and both gradients with eager. Needs GPU and Triton.
         # When an op inside a nested_compile_region produces a tensor whose
         # natural stride exceeds padding_stride_threshold and is not
         # 128-byte aligned, Inductor's comprehensive_padding pads its runtime
@@ -1837,10 +2143,12 @@ def forward(self, primals_0, primals_1, primals_2, primals_3, primals_4, primals
 
         @torch.compiler.nested_compile_region(options=nested_config)
         def loss_region(x, w):
+            # [FUNCTION DOC] HELPER: Region: linear layer then sum of squared logits.
             logits = torch.nn.functional.linear(x, w)
             return (logits * logits).sum()
 
         def fn(x, w):
+            # [FUNCTION DOC] HELPER: Call the loss region on the inputs.
             return loss_region(x, w)
 
         x = torch.randn(
@@ -1875,6 +2183,9 @@ def forward(self, primals_0, primals_1, primals_2, primals_3, primals_4, primals
 
     @parametrize("serialize", [False])
     def test_joint_graph_passes_run_on_hop_subgraph(self, serialize):
+        # [FUNCTION DOC] Inductor joint graph passes must also run on the region's joint
+        # graph: the cross entropy backward must show an equality and where rewrite rather
+        # than a scatter. Checks exact text of captured forward and backward graphs.
         # Inductor's joint-graph passes (e.g. scatter_upon_const_tensor, which
         # rewrites full+scatter into eq+where to avoid materializing a sparse
         # buffer) must run on the HOP subgraph's joint graph, not just the
@@ -1888,11 +2199,13 @@ def forward(self, primals_0, primals_1, primals_2, primals_3, primals_4, primals
 
         @torch.compiler.nested_compile_region(options=nested_config)
         def loss_region(logits_f32, targets):
+            # [FUNCTION DOC] HELPER: Region computing unreduced cross entropy.
             return torch.nn.functional.cross_entropy(
                 logits_f32, targets, reduction="none"
             )
 
         def fn(logits, targets):
+            # [FUNCTION DOC] HELPER: Cast logits to float32, call the region and sum.
             return loss_region(logits.to(torch.float32), targets).sum()
 
         logits = torch.randn(8, 64, requires_grad=True)
@@ -1967,12 +2280,19 @@ def forward(self, primals_0, primals_1, amax, log, tangents_0):
 
 @skipIfTorchDynamo("Not a suitable dynamo wrapped test")
 class TestRegionalOutputCode(torch._inductor.test_case.TestCase):
+    # [CLASS DOC] Tests serialization of RegionalOutputCode and its use inside the
+    # bundled AOT autograd forward and backward containers.
     """Tests for RegionalOutputCode and BundledAOTAutogradResult."""
 
     def test_regional_output_code_serialization(self):
+        # [FUNCTION DOC] Traces an annotated function with make_fx on fake tensors, runs
+        # regional Inductor under a forced autograd cache, then serializes the output
+        # code (inner graph module cleared, serialized form set), deserializes with
+        # post compile and checks the graph module is restored and callable.
         """Test that RegionalOutputCode can be serialized and deserialized."""
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Sine, annotated multiply and add, sine.
             sin = torch.sin(x)
             with fx_traceback.annotate({"compile_with_inductor": 0}):
                 mul = sin * y
@@ -2026,9 +2346,13 @@ class TestRegionalOutputCode(torch._inductor.test_case.TestCase):
             self.assertIsNotNone(result)
 
     def test_regional_output_code_with_backward(self):
+        # [FUNCTION DOC] Builds forward output code from a traced annotated function, calls
+        # it, serializes it, restores it via post compile and calls it again; both calls
+        # must return something.
         """Test RegionalOutputCode with both forward and backward compilation."""
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Sine, annotated multiply and add, sine.
             sin = torch.sin(x)
             with fx_traceback.annotate({"compile_with_inductor": 0}):
                 mul = sin * y
@@ -2078,9 +2402,13 @@ class TestRegionalOutputCode(torch._inductor.test_case.TestCase):
             self.assertIsNotNone(result2)
 
     def test_regional_compiled_forward_backward(self):
+        # [FUNCTION DOC] Wraps a RegionalOutputCode in a bundled compiled forward. Presave
+        # must give a serialized copy with no graph module, load must keep it
+        # undeserialized, and post compile must produce a deserialized graph module.
         """Test BundledCompiledForward and BundledCompiledBackward with RegionalOutputCode."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Annotated sine times two.
             with fx_traceback.annotate({"compile_with_inductor": 0}):
                 return torch.sin(x) * 2
 
@@ -2124,6 +2452,9 @@ class TestRegionalOutputCode(torch._inductor.test_case.TestCase):
 
 
 class RegionalInductorPartitionTests(torch._inductor.test_case.TestCase):
+    # [CLASS DOC] Tests for the region scooper partitioning of annotated nodes. Nodes
+    # with the same region id are merged as far as cycles allow; nodes with different
+    # region ids are never merged. Graphs are built by hand with the fx graph API.
     """Tests for _RegionScooper partitioning behavior.
 
     Uses CapabilityBasedPartitioner per region ID. Nodes with the same region ID
@@ -2132,6 +2463,9 @@ class RegionalInductorPartitionTests(torch._inductor.test_case.TestCase):
     """
 
     def _make_tag_node(self, g, inp, scalar, tagged):
+        # [FUNCTION DOC] HELPER: Append a scalar multiply node on the input to the graph,
+        # mark it with the compile_with_inductor custom meta when tagged, give it a fake
+        # value of ten elements, and return the node.
         node = g.call_function(torch.ops.aten.mul.Scalar, (inp, scalar))
         if tagged:
             node.meta["custom"] = {"compile_with_inductor": True}
@@ -2139,6 +2473,9 @@ class RegionalInductorPartitionTests(torch._inductor.test_case.TestCase):
         return node
 
     def _scoop_and_count(self, gm):
+        # [FUNCTION DOC] HELPER: Run the region scooper on the graph module (with node meta
+        # preservation off) and return how many call_module nodes have a target starting
+        # with the marked inductor submodule prefix.
         from torch.fx.passes.regional_inductor import _RegionScooper
 
         with torch.fx.traceback.preserve_node_meta(enable=False):
@@ -2151,6 +2488,8 @@ class RegionalInductorPartitionTests(torch._inductor.test_case.TestCase):
         )
 
     def _build_chain(self, tags):
+        # [FUNCTION DOC] HELPER: Build a graph module with one placeholder followed by a
+        # linear chain of tagged or untagged multiply nodes, given by a list of flags.
         """Build a linear chain: x -> op0 -> op1 -> ... -> output"""
         g = torch.fx.Graph()
         current = g.placeholder("x")
@@ -2160,6 +2499,8 @@ class RegionalInductorPartitionTests(torch._inductor.test_case.TestCase):
         return torch.fx.GraphModule(torch.nn.Module(), g)
 
     def test_linear_chain_partitioning(self):
+        # [FUNCTION DOC] Checks the partition count for several tag patterns in a chain:
+        # each contiguous run of tagged nodes becomes its own partition, none if untagged.
         """Contiguous runs of tagged nodes form separate partitions."""
         cases = [
             # (tags, expected_partitions)
@@ -2175,6 +2516,8 @@ class RegionalInductorPartitionTests(torch._inductor.test_case.TestCase):
                 self.assertEqual(self._scoop_and_count(gm), expected)
 
     def test_parallel_branches_not_fused(self):
+        # [FUNCTION DOC] Two adjacent independent tagged
+        # branches combined by an add give one partition.
         """Two adjacent independent tagged branches form 1 partition."""
         g = torch.fx.Graph()
         x = g.placeholder("x")
@@ -2187,6 +2530,8 @@ class RegionalInductorPartitionTests(torch._inductor.test_case.TestCase):
         self.assertEqual(self._scoop_and_count(gm), 1)
 
     def test_parallel_branches_with_gap_same_region(self):
+        # [FUNCTION DOC] Two independent tagged branches with an untagged node between them
+        # and the same region id give one partition.
         """Two independent tagged nodes separated by an untagged node but
         sharing the same region ID are fused into 1 partition (no cycle).
         """
@@ -2203,6 +2548,8 @@ class RegionalInductorPartitionTests(torch._inductor.test_case.TestCase):
         self.assertEqual(self._scoop_and_count(gm), 1)
 
     def test_parallel_branches_with_gap_different_regions(self):
+        # [FUNCTION DOC] Two independent tagged nodes with different region ids give two
+        # partitions even with an untagged node between them.
         """Two independent tagged nodes with different region IDs produce
         2 separate partitions regardless of graph topology.
         """
@@ -2221,6 +2568,8 @@ class RegionalInductorPartitionTests(torch._inductor.test_case.TestCase):
         self.assertEqual(self._scoop_and_count(gm), 2)
 
     def test_dependent_partitions_merged_across_gap(self):
+        # [FUNCTION DOC] Two tagged nodes with the same region, one consuming the other,
+        # with an untagged node between them give one partition.
         """Two tagged nodes (same region) separated by an untagged node and
         connected by a data dependency are merged into 1 partition.
         """
@@ -2236,6 +2585,8 @@ class RegionalInductorPartitionTests(torch._inductor.test_case.TestCase):
         self.assertEqual(self._scoop_and_count(gm), 1)
 
     def test_different_annotations_not_merged(self):
+        # [FUNCTION DOC] Tagged nodes with different region ids stay separate (two
+        # partitions) even though one consumes the other.
         """Two tagged nodes with different region IDs are NOT merged,
         even if connected by a data dependency.
         """
@@ -2252,6 +2603,8 @@ class RegionalInductorPartitionTests(torch._inductor.test_case.TestCase):
         self.assertEqual(self._scoop_and_count(gm), 2)
 
     def test_chained_merges_across_multiple_gaps(self):
+        # [FUNCTION DOC] Three tagged nodes of the same region chained by data dependencies
+        # across untagged gaps merge into one partition.
         """Multiple tagged nodes (same region) with chained data dependencies
         across untagged gaps are all merged into 1 partition.
         """
