@@ -1,8 +1,17 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Pure-PyTorch conversions for 2:4 semi-structured sparsity: dense to compressed
+# values plus reordered metadata in the CUTLASS layout and back, the metadata reordering offset
+# computation, a greedy 4x4 tile pruner, and a compressed swizzled bitmask builder.
+# No import-time side effects beyond importing torch.
 import torch
 
 
 def _calculate_meta_reordering_scatter_offsets(m, meta_ncols, meta_dtype, device):
+    # [FUNCTION DOC] HELPER: Compute flat offsets mapping each element of an m by meta_ncols
+    # metadata matrix to its position in the CUTLASS reordered (interleaved column-major)
+    # metadata layout. Row grouping and interweave depend on the metadata element size
+    # (2 bytes vs 4 bytes); neighboring 2x2 entries are then swizzled. Returns a flat
+    # integer index tensor on the given device. Pure computation, no side effects.
     """
     This is PyTorch implementation of main part of reorder_meta()
     function, from tools/util/include/cutlass/util/host_reorder.h file
@@ -45,6 +54,13 @@ def _calculate_meta_reordering_scatter_offsets(m, meta_ncols, meta_dtype, device
 
 
 def sparse_semi_structured_from_dense_cutlass(dense):
+    # [FUNCTION DOC] Compress a 2D dense matrix (int8, half, bfloat16 or float) that follows
+    # 2:4 (1:2 for float) sparsity into kept values of half the width plus packed 4-bit
+    # index metadata, reordered for CUTLASS. Per group of four (two for float) it picks two
+    # kept positions via a boolean encoding of the nonzero pattern; groups with too few or too
+    # many nonzeros get fixed fallback encodings, so no pattern validation is done.
+    # Raises RuntimeError for non-2D input, unsupported dtype, or row/column counts that are
+    # not divisible by the required multiples. Returns a (sparse, metadata) pair.
     """
     This function converts dense matrix into sparse semi-structured
     representation, producing "compressed" matrix, in the layout used by
@@ -180,6 +196,12 @@ def sparse_semi_structured_from_dense_cutlass(dense):
 
 
 def sparse_semi_structured_to_dense_cutlass(sparse, meta_reordered):
+    # [FUNCTION DOC] Inverse of the compression: rebuild the dense matrix (twice as many
+    # columns) from compressed values and CUTLASS-reordered metadata. Undoes the metadata
+    # reordering, unpacks 2-bit position indices, and scatters values into a zero tensor
+    # (float values are moved as pairs of half elements). Raises RuntimeError if either input
+    # is not 2D, devices differ, meta dtype is not int16/int32, or the shapes are inconsistent.
+    # Returns a dense tensor of shape (m, 2k).
     """
     This function performs reverse of the function above - it
     reconstructs dense matrix from a pair of "compressed" matrix, given
@@ -285,6 +307,10 @@ def sparse_semi_structured_to_dense_cutlass(sparse, meta_reordered):
 
 
 def _sparse_semi_structured_tile(dense):
+    # [FUNCTION DOC] HELPER: Reference pruning to a 2:4 pattern in 4x4 tiles. For each tile,
+    # keeps the largest entries greedily (stable descending sort) while allowing at most two
+    # kept per tile row and per tile column; the rest are zeroed. Mutates the input in place
+    # through tile views and returns that same tensor. Slow Python loops over all tiles.
     """
     This function computes a 2:4 sparse tile by greedily taking the largest values.
 
@@ -296,6 +322,9 @@ def _sparse_semi_structured_tile(dense):
     """
 
     def greedy_prune_tile(tile):
+        # [FUNCTION DOC] HELPER: Zero, in place, every entry of one 4x4 tile that would exceed
+        # two kept values in its row or column, visiting entries from largest to smallest.
+        # Returns nothing.
         num_kept_row = [0, 0, 0, 0]
         num_kept_col = [0, 0, 0, 0]
 
@@ -315,6 +344,12 @@ def _sparse_semi_structured_tile(dense):
 
 
 def _compute_compressed_swizzled_bitmask(dense):
+    # [FUNCTION DOC] HELPER: Build the compressed swizzled bitmask of a dense 2D tensor: the
+    # nonzero pattern is split into 8x8 blocks of four 4x4 tiles, and each 4x4 tile becomes
+    # two 8-bit integers (least significant bit first) computed by a matmul with powers of two.
+    # Returns a uint8 tensor. Expects both dimensions to be multiples of 8.
+    # KNOWN ISSUE: the powers-of-two tensor is created on the hardcoded device "cuda"
+    # rather than the input device, so a non-CUDA or different-GPU input would mismatch.
     """
     Calculates the compressed swizzled bitmask from a dense tensor
     """

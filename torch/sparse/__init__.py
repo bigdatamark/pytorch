@@ -1,4 +1,12 @@
 # mypy: allow-untyped-defs
+# [PACKAGE DOC] Public torch.sparse namespace for sparse tensor operations.
+# Exports sparse matrix products (addmm, mm, sampled_addmm), reductions and softmax variants
+# (sum, softmax, log_softmax), spsolve and spdiags, all bound from C++ via the _sparse module
+# with docstrings attached at import time, plus the check_sparse_tensor_invariants switch,
+# the as_sparse_gradcheck decorator, and the semi-structured (2:4) sparsity tensor classes
+# re-exported from the semi_structured submodule.
+# KNOWN ISSUE: __all__ lists "solve", which is not defined here (the function is named spsolve);
+# sampled_addmm, spsolve and spdiags are defined but missing from __all__.
 # The Tensor classes are added to this module by python_tensor.cpp
 # A workaround to support both TorchScript and MyPy:
 from typing import Any, TYPE_CHECKING
@@ -215,6 +223,10 @@ Examples::
 
 
 def sum(input: Tensor, dim: DimOrDims = None, dtype: DType | None = None) -> Tensor:
+    # [FUNCTION DOC] Sum a sparse tensor over the given dimension(s), or over all dimensions
+    # when dim is None. Optional dtype casts the result type. Dispatches to the internal
+    # sparse sum operator with or without dim and dtype. Returns a sparse tensor when only
+    # some sparse dims are reduced, else a dense tensor. No side effects.
     r"""Return the sum of each row of the given sparse tensor.
 
     Returns the sum of each row of the sparse tensor :attr:`input` in the given
@@ -452,6 +464,12 @@ Specifying a positive offset::
 
 
 class check_sparse_tensor_invariants:
+    # [CLASS DOC] Controls the process-wide flag that makes sparse tensor constructors validate
+    # their invariants. Usable as a static toggle (is_enabled/enable/disable), as a context
+    # manager that sets the flag on entry and restores the previous value on exit, or as a
+    # decorator that wraps a callable in a fresh instance. State: the requested flag value
+    # (state) and the saved previous value (saved_state, None unless the context is active).
+    # A single instance cannot be entered twice while active.
     """A tool to control checking sparse tensor invariants.
 
     The following options exists to manage sparse tensor invariants
@@ -497,6 +515,8 @@ class check_sparse_tensor_invariants:
 
     @staticmethod
     def is_enabled():
+        # [FUNCTION DOC] Return whether global sparse invariant checking is currently on.
+        # Reads the flag from the C++ runtime; no side effects.
         r"""Return True if the sparse tensor invariants checking is enabled.
 
         .. note::
@@ -509,6 +529,8 @@ class check_sparse_tensor_invariants:
 
     @staticmethod
     def enable():
+        # [FUNCTION DOC] Turn on global sparse invariant checking in the C++ runtime.
+        # Side effect: mutates global state; returns nothing.
         r"""Enable sparse tensor invariants checking in sparse tensor constructors.
 
         .. note::
@@ -529,6 +551,8 @@ class check_sparse_tensor_invariants:
 
     @staticmethod
     def disable():
+        # [FUNCTION DOC] Turn off global sparse invariant checking in the C++ runtime.
+        # Side effect: mutates global state; returns nothing.
         r"""Disable sparse tensor invariants checking in sparse tensor constructors.
 
         See :func:`torch.sparse.check_sparse_tensor_invariants.enable` for more information.
@@ -537,10 +561,14 @@ class check_sparse_tensor_invariants:
 
     # context manager support
     def __init__(self, enable=True):
+        # [FUNCTION DOC] Record the flag value to apply when used as a context manager or
+        # decorator (default True) and clear the saved state. Does not touch the global flag.
         self.state = enable
         self.saved_state: bool | None = None
 
     def __enter__(self):
+        # [FUNCTION DOC] Save the current global flag and set it to the requested value.
+        # Raises RuntimeError if this instance is already active. Returns nothing.
         if self.saved_state is not None:
             raise RuntimeError(
                 "This context manager instance is already activated."
@@ -550,6 +578,8 @@ class check_sparse_tensor_invariants:
         torch._C._set_check_sparse_tensor_invariants(self.state)
 
     def __exit__(self, type, value, traceback):
+        # [FUNCTION DOC] Restore the global flag saved on entry and reset saved state to None.
+        # Raises AssertionError if the context was never entered. Does not suppress exceptions.
         if self.saved_state is None:
             raise AssertionError("saved_state should not be None on exit")
         torch._C._set_check_sparse_tensor_invariants(self.saved_state)
@@ -557,7 +587,11 @@ class check_sparse_tensor_invariants:
 
     # decorator support
     def __call__(self, mth):
+        # [FUNCTION DOC] Decorator support: return a wrapper around mth that runs it inside a
+        # new context manager of the same class with the same requested flag value.
         def test_mth(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Wrapper that calls the decorated function under a fresh
+            # invariant-checking context and returns its result.
             with type(self)(self.state):
                 return mth(*args, **kwargs)
 
@@ -565,6 +599,11 @@ class check_sparse_tensor_invariants:
 
 
 def as_sparse_gradcheck(gradcheck):
+    # [FUNCTION DOC] Decorator factory: wrap a gradcheck function so inputs and outputs may be
+    # sparse tensors. Returns a new function that converts differentiable sparse inputs into
+    # strided components (indices metadata plus a values tensor), calls the original gradcheck
+    # on a wrapper that rebuilds sparse inputs and densifies sparse differentiable outputs,
+    # and returns the gradcheck result. The optional masked keyword is consumed by the wrapper.
     """Decorate function, to extend gradcheck for sparse tensors.
 
     Decorator for torch.autograd.gradcheck or its functools.partial
@@ -590,6 +629,10 @@ def as_sparse_gradcheck(gradcheck):
     """
 
     def gradcheck_with_sparse_support(func, inputs, **kwargs):
+        # [FUNCTION DOC] Run the wrapped gradcheck on func with sparse-aware inputs. Pops the
+        # masked keyword (default False; when False, unspecified elements are treated as
+        # explicit zeros), converts inputs to a strided representation, and forwards the other
+        # keyword arguments. Returns whatever the wrapped gradcheck returns.
         """
         Create gradcheck with support for sparse tensors.
 
@@ -613,6 +656,10 @@ def as_sparse_gradcheck(gradcheck):
         STRIDED_REPRESENTATION = "__STRIDED_REPRESENTATION__"
 
         def convert_to_strided_representation(args):
+            # [FUNCTION DOC] HELPER: Flatten a sequence of arguments into a tuple. Each sparse
+            # tensor requiring grad becomes a marker string, a mapping describing layout,
+            # shape and index tensors, and its values tensor (set to require grad). Other
+            # arguments pass through. A non-sequence argument is treated as a single item.
             """Convert differentiable non-strided tensors to a representation containing differentiable strided tensors."""
             if not isinstance(args, (list, tuple)):
                 args = (args,)
@@ -678,6 +725,10 @@ def as_sparse_gradcheck(gradcheck):
             return tuple(new_args)
 
         def restore_from_strided_representation(args):
+            # [FUNCTION DOC] HELPER: Inverse of the conversion. Scans the argument list and
+            # replaces each marker plus mapping plus values triple with a rebuilt COO or
+            # compressed sparse tensor. Raises NotImplementedError for an unsupported layout
+            # (the block layouts are handled as compressed). Returns a tuple.
             """Restore non-strided differentiable tensors from their strided representations."""
             new_args = []
             args = list(args)
@@ -708,6 +759,10 @@ def as_sparse_gradcheck(gradcheck):
             return tuple(new_args)
 
         def func_wrapper(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Function handed to the real gradcheck. Restores sparse
+            # inputs, calls the user function, densifies any sparse outputs that require grad
+            # (honoring the masked setting), and returns a tuple or single value matching
+            # the structure of the original output.
             restored_args = restore_from_strided_representation(args)
 
             # convert differentiable output sparse tensors to strided
