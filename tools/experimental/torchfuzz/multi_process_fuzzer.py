@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Library for running the torchfuzz driver script across many seeds in worker
+# processes. Provides a result record, an ignore-pattern table for known failures, a per-seed
+# subprocess runner that also parses per-operator statistics from the child's output, a
+# multi-process runner for a seed range, a run-until-first-failure loop, and output/summary
+# printing helpers. Import-time side effect: tries to import tqdm; if missing, installs a
+# minimal stand-in whose write method just prints.
 """
 Multi-process fuzzer library that uses worker processes to execute fuzzer.py with different seeds.
 """
@@ -21,14 +27,22 @@ except ImportError:
 
     # Create a mock tqdm class for type safety
     class MockTqdm:
+        # [CLASS DOC] HELPER: Minimal stand-in for tqdm used when the package is missing; only
+        # offers a static write method so message printing code works either way.
         @staticmethod
         def write(msg, file=None):
+            # [FUNCTION DOC] HELPER: Prints the message to the given stream (default stdout)
+            # and flushes.
             print(msg, file=file, flush=True)
 
     tqdm = MockTqdm()
 
 
 def persist_print(msg):
+    # [FUNCTION DOC] Prints a message to standard error in a way that does not corrupt a tqdm
+    # progress bar (uses tqdm write when available, else a flushed print). If the output pipe is
+    # broken, appends the message to a crash log file under a torchfuzz folder in the temp
+    # directory (creating it) instead of raising.
     """Print messages that persist with tqdm progress bars."""
     try:
         if HAS_TQDM and hasattr(tqdm, "write"):
@@ -56,6 +70,9 @@ IGNORE_PATTERNS: list[re.Pattern] = [
 
 @dataclass
 class FuzzerResult:
+    # [CLASS DOC] Record of one seed run: the seed, success flag (child exit status zero), the
+    # combined captured output text, duration in seconds, index of the matched ignore pattern
+    # (-1 if none), and a mapping of operator name to usage count parsed from the child output.
     seed: int
     success: bool
     output: str
@@ -65,6 +82,8 @@ class FuzzerResult:
 
 
 def is_ignored_output(output: str) -> int:
+    # [FUNCTION DOC] Searches the output text against each known-failure pattern in order and
+    # returns the index of the first match, or -1 if none match. Pure.
     """
     Check if the output matches any ignore pattern.
 
@@ -86,6 +105,15 @@ def run_fuzzer_with_seed(
     supported_ops: str | None = None,
     generate_only: str | None = None,
 ) -> FuzzerResult:
+    # [FUNCTION DOC] Runs the driver script in a child interpreter for one seed (single-seed
+    # mode with the template, plus optional supported-ops and generate-only options) with a
+    # 300 second timeout. Success means exit status zero. The returned output combines labelled
+    # standard output, standard error and the return code; the operation statistics section
+    # printed by the child is parsed into a name-to-count mapping; if the output matches an
+    # ignore pattern it is prefixed with an ignored marker and the pattern index recorded.
+    # Timeouts and other exceptions are converted into failed results rather than raised.
+    # KNOWN ISSUE: the script is launched by relative file name, so the current working
+    # directory must be the folder containing it or every run fails.
     """
     Run fuzzer.py with a specific seed.
 
@@ -188,6 +216,9 @@ def run_fuzzer_with_seed(
 
 
 def print_output_lines(output: str, write_func):
+    # [FUNCTION DOC] HELPER: Passes each non-blank line of the output, indented by three spaces,
+    # to the write callable; if the callable is a bound method of an object that has a write
+    # method (like a progress bar), then also writes a trailing blank line.
     """Helper to print non-empty lines of output using the provided write_func."""
     for line in output.split("\n"):
         if line.strip():
@@ -207,6 +238,9 @@ def handle_result_output(
     verbose: bool,
     write_func,
 ):
+    # [FUNCTION DOC] HELPER: Writes a one-line header (label, seed, duration, ignored marker)
+    # through write_func, then prints the output lines if the output is non-blank, the label
+    # starts with the failure mark, or verbose is set.
     """Unified handler for result output, reducing code repetition."""
     ignored_text = " [IGNORED]" if ignored else ""
     write_func(f"{label} - Seed {seed} (duration: {duration:.2f}s){ignored_text}")
@@ -223,6 +257,16 @@ def run_multi_process_fuzzer(
     supported_ops: str | None = None,
     generate_only: str | None = None,
 ) -> None:
+    # [FUNCTION DOC] Runs the driver for a contiguous seed range using a process pool (None
+    # means the pool default size). Submits all seeds, then collects results in seed order while
+    # updating a progress bar (or plain lines without tqdm) and printing failures (always),
+    # ignored results and successes (verbose only). Tracks success, failure (excluding ignored),
+    # and ignored counts plus per-pattern counts; a pool error counts as a failure. Finally
+    # prints a summary (percentages, time, throughput, seed lists, ignore statistics) and the
+    # aggregated operation distribution. On keyboard interrupt prints a partial summary and
+    # exits with status 130. Does not exit non-zero when seeds fail.
+    # KNOWN ISSUE: the final summary divides by the number of results, so an empty range would
+    # raise a division error; the pool-error path does not count towards ignored totals.
     """
     Run the multi-process fuzzer.
 
@@ -285,6 +329,7 @@ def run_multi_process_fuzzer(
                 )
 
                 def write_func(msg):
+                    # [FUNCTION DOC] HELPER: Writes a message above the progress bar.
                     # pyrefly: ignore [missing-attribute]
                     pbar.write(msg)
             else:
@@ -483,6 +528,9 @@ def run_multi_process_fuzzer(
 
 
 def _print_operation_distribution(results: list[FuzzerResult]) -> None:
+    # [FUNCTION DOC] HELPER: Sums operator usage counts over successful results only, then
+    # prints the total and each operator's count and percentage sorted by descending count; or a
+    # note that no statistics were collected. Output goes through persist_print.
     """Helper function to print operation distribution statistics."""
     total_operation_stats = defaultdict(int)
     total_operations = 0
@@ -520,6 +568,13 @@ def run_until_failure(
     template: str = "default",
     supported_ops: str | None = None,
 ) -> None:
+    # [FUNCTION DOC] Picks a random starting seed and repeatedly runs batches of 100 consecutive
+    # seeds in a fresh process pool until a seed fails without matching an ignore pattern. On
+    # such a failure it closes the progress bar, prints a report (seed, durations, counts,
+    # output, reproduction command) and exits with status 1. Ignored results count separately.
+    # On keyboard interrupt prints a summary and exits with status 130. Never returns normally.
+    # KNOWN ISSUE: the generate-only option is not supported here, and the printed
+    # reproduction command omits the supported-ops option.
     """
     Run the multi-process fuzzer with a random starting seed, iterating until a failure is found.
 
@@ -580,6 +635,7 @@ def run_until_failure(
                     pbar.set_postfix_str(f"{total_successful}/{total_ignored}")
 
                     def write_func(msg):
+                        # [FUNCTION DOC] HELPER: Writes a message above the progress bar.
                         # pyrefly: ignore [missing-attribute]
                         pbar.write(msg)
                 else:

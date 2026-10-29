@@ -1,3 +1,8 @@
+# [PACKAGE DOC] Operator library of torchfuzz. Each operator class knows which output specs it
+# can produce, what input specs it needs, and how to emit one line of generated Python code.
+# This package re-exports the operator classes (leaf, pointwise, scalar, layout, matmul,
+# nn-functional) plus the registry helpers for lookup, registration and weight configuration,
+# all listed in the export list. Importing it only imports the submodules.
 """Torchfuzz operators module."""
 
 from torchfuzz.operators.arg import ArgOperator

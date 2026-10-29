@@ -1,4 +1,8 @@
 # pyre-strict
+# [MODULE DOC] Comparison operators for torchfuzz: a shared base for binary tensor comparisons
+# that output bool tensors, eleven concrete comparison operators, and WhereOperator for the
+# three-argument select form of torch.where. Also holds dtype tuples and a helper drawing random
+# scalar literals. No import-time side effects.
 """Comparison ops + torch.where (3-arg select form only).
 
 11 binary comparison operators (eq, ne, lt, le, gt, ge, greater,
@@ -60,6 +64,11 @@ _WHERE_SUPPORTED_DTYPES: tuple[torch.dtype, ...] = (
 
 
 def _random_scalar_for_dtype(dtype: torch.dtype) -> object:
+    # [FUNCTION DOC] HELPER: Draws a random Python scalar suitable for the dtype using the
+    # global random module. Bool gives a random truth value; floating dtypes give negative
+    # infinity (10 percent), infinity (5 percent), else a value in -10..10 rounded to four
+    # decimals; signed ints give -100..100; unsigned ints give 0..100.
+    # Raises ValueError for any other dtype.
     """Random Python scalar literal for torch.where's scalar form.
 
     NOTE: This helper handles ONLY the dtypes in _WHERE_SUPPORTED_DTYPES.
@@ -87,6 +96,9 @@ def _random_scalar_for_dtype(dtype: torch.dtype) -> object:
 
 
 class ComparisonOperatorBase(Operator):
+    # [CLASS DOC] Base for binary comparison operators (eq, lt, ...). Output must be a bool
+    # tensor; the two inputs get independently chosen numeric dtypes (so type promotion is
+    # exercised). The operator name doubles as the torch function path. Stateless.
     """Two-tensor numeric -> bool comparison.
 
     Both inputs share a single, randomly-chosen numeric dtype picked
@@ -96,12 +108,19 @@ class ComparisonOperatorBase(Operator):
 
     @property
     def torch_op_name(self) -> str:
+        # [FUNCTION DOC] Property; returns the operator name, which is the torch function path.
         return self.name
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] True only for a TensorSpec with bool dtype.
         return isinstance(output_spec, TensorSpec) and output_spec.dtype == torch.bool
 
     def fuzz_inputs_specs(self, output_spec: Spec) -> list[Spec]:
+        # [FUNCTION DOC] Returns two input specs with the output's size and stride, each with a
+        # dtype picked at random from the numeric dtype list (floats, ints, unsigned ints, bool).
+        # With probability 0.3 one random operand gets a smaller contiguous broadcast shape; with
+        # the next 0.2 the second operand becomes a scalar spec (the first is always a tensor).
+        # Uses the global random module. Raises AssertionError for a non-tensor output spec.
         if not isinstance(output_spec, TensorSpec):
             raise AssertionError(f"expected TensorSpec, got {type(output_spec)}")
         dtype_a = random.choice(_NUMERIC_INPUT_DTYPES)
@@ -139,6 +158,8 @@ class ComparisonOperatorBase(Operator):
         input_names: list[str],
         output_spec: Spec,
     ) -> str:
+        # [FUNCTION DOC] Returns one line assigning the torch comparison function applied to the
+        # first two input names to output_name. output_spec is unused.
         return (
             f"{output_name} = {self.torch_op_name}({input_names[0]}, {input_names[1]})"
         )
@@ -150,57 +171,79 @@ class ComparisonOperatorBase(Operator):
 
 
 class EqOperator(ComparisonOperatorBase):
+    # [CLASS DOC] Elementwise equality comparison (torch.eq).
     def __init__(self) -> None:
+        # [FUNCTION DOC] Registers the operator under the name torch.eq.
         super().__init__("torch.eq")
 
 
 class NeOperator(ComparisonOperatorBase):
+    # [CLASS DOC] Elementwise inequality comparison (torch.ne).
     def __init__(self) -> None:
+        # [FUNCTION DOC] Registers the operator under the name torch.ne.
         super().__init__("torch.ne")
 
 
 class LtOperator(ComparisonOperatorBase):
+    # [CLASS DOC] Elementwise less-than comparison (torch.lt).
     def __init__(self) -> None:
+        # [FUNCTION DOC] Registers the operator under the name torch.lt.
         super().__init__("torch.lt")
 
 
 class LeOperator(ComparisonOperatorBase):
+    # [CLASS DOC] Elementwise less-or-equal comparison (torch.le).
     def __init__(self) -> None:
+        # [FUNCTION DOC] Registers the operator under the name torch.le.
         super().__init__("torch.le")
 
 
 class GtOperator(ComparisonOperatorBase):
+    # [CLASS DOC] Elementwise greater-than comparison (torch.gt).
     def __init__(self) -> None:
+        # [FUNCTION DOC] Registers the operator under the name torch.gt.
         super().__init__("torch.gt")
 
 
 class GeOperator(ComparisonOperatorBase):
+    # [CLASS DOC] Elementwise greater-or-equal comparison (torch.ge).
     def __init__(self) -> None:
+        # [FUNCTION DOC] Registers the operator under the name torch.ge.
         super().__init__("torch.ge")
 
 
 class GreaterOperator(ComparisonOperatorBase):
+    # [CLASS DOC] Alias-named greater-than comparison (torch.greater).
     def __init__(self) -> None:
+        # [FUNCTION DOC] Registers the operator under the name torch.greater.
         super().__init__("torch.greater")
 
 
 class GreaterEqualOperator(ComparisonOperatorBase):
+    # [CLASS DOC] Alias-named greater-or-equal comparison (torch.greater_equal).
     def __init__(self) -> None:
+        # [FUNCTION DOC] Registers the operator under the name torch.greater_equal.
         super().__init__("torch.greater_equal")
 
 
 class LessOperator(ComparisonOperatorBase):
+    # [CLASS DOC] Alias-named less-than comparison (torch.less).
     def __init__(self) -> None:
+        # [FUNCTION DOC] Registers the operator under the name torch.less.
         super().__init__("torch.less")
 
 
 class LessEqualOperator(ComparisonOperatorBase):
+    # [CLASS DOC] Alias-named less-or-equal comparison (torch.less_equal).
     def __init__(self) -> None:
+        # [FUNCTION DOC] Registers the operator under the name torch.less_equal.
         super().__init__("torch.less_equal")
 
 
 class NotEqualOperator(ComparisonOperatorBase):
+    # [CLASS DOC] Alias-named inequality comparison (torch.not_equal).
     def __init__(self) -> None:
+        # [FUNCTION DOC] Registers the operator under the name torch.not_equal.
         super().__init__("torch.not_equal")
 
 
@@ -210,6 +253,11 @@ class NotEqualOperator(ComparisonOperatorBase):
 
 
 class WhereOperator(Operator):
+    # [CLASS DOC] Operator for the three-argument torch.where. Output may be a tensor of any
+    # dtype in the supported list. State: _form (which of the three variants was sampled: both
+    # branches tensors, scalar first branch, scalar second branch) and _scalar_value (the
+    # literal for the scalar variants). Both are set by fuzz_inputs_specs and consumed and reset
+    # by codegen, so the two calls must be paired in order for each operator use.
     """torch.where(cond, input, other) -- 3-arg elementwise select.
 
     Three forms sampled uniformly at random per call:
@@ -233,21 +281,31 @@ class WhereOperator(Operator):
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Registers the operator under the name torch.where and clears the
+        # stashed form and scalar value.
         super().__init__("torch.where")
         self._form: str | None = None
         self._scalar_value: object | None = None
 
     @property
     def torch_op_name(self) -> str:
+        # [FUNCTION DOC] Property; returns the operator name, which is the torch function path.
         return self.name
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] True only for a TensorSpec whose dtype is in the supported where dtypes.
         return (
             isinstance(output_spec, TensorSpec)
             and output_spec.dtype in _WHERE_SUPPORTED_DTYPES
         )
 
     def fuzz_inputs_specs(self, output_spec: Spec) -> list[Spec]:
+        # [FUNCTION DOC] Randomly picks the variant and a scalar literal, storing both on the
+        # operator (side effect, used by codegen). Returns a bool condition spec (with
+        # probability 0.3 shrunk to a contiguous broadcast shape) followed by one body spec
+        # (scalar variants) or two body specs (tensor variant; with probability 0.3 one of them is
+        # shrunk to a broadcast shape). Body specs match the output size, stride and dtype.
+        # Raises AssertionError for a non-tensor output spec.
         if not isinstance(output_spec, TensorSpec):
             raise AssertionError(f"expected TensorSpec, got {type(output_spec)}")
         self._form = random.choice(("A", "B", "C"))
@@ -290,6 +348,12 @@ class WhereOperator(Operator):
         input_names: list[str],
         output_spec: Spec,
     ) -> str:
+        # [FUNCTION DOC] Returns one line calling torch.where on the condition input and either
+        # two tensor inputs, or the stashed scalar literal wrapped in a tensor of the output
+        # dtype in the first or second branch position. Afterwards clears the stashed form and
+        # scalar value. Raises AssertionError for a non-tensor output spec.
+        # KNOWN ISSUE: if codegen runs without a preceding fuzz_inputs_specs call the form is
+        # None and the last (second-branch scalar) variant is silently emitted with a None literal.
         if not isinstance(output_spec, TensorSpec):
             raise AssertionError(f"expected TensorSpec, got {type(output_spec)}")
         scalar_val = self._scalar_value

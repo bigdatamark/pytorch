@@ -1,4 +1,11 @@
 # mypy: ignore-errors
+# [MODULE DOC] Command-line entry point of torchfuzz. Provides fuzz_and_execute, which builds a
+# random target spec, an operation graph, generated Python program text, and runs or saves it,
+# plus helpers for parsing the supported-ops option and generate-only path patterns, and a main
+# function with the argument parser dispatching to single-seed, multi-process and
+# stop-at-first-failure modes (the latter two live in multi_process_fuzzer). Import-time side
+# effect: inserts the parent directory of this file at the front of the module search path if
+# absent, so the torchfuzz package can be imported.
 import logging
 import multiprocessing as mp
 import os
@@ -26,6 +33,11 @@ from torchfuzz.visualize_graph import visualize_operation_graph
 
 
 def _parse_supported_ops_with_weights(spec: str) -> tuple[list[str], dict[str, float]]:
+    # [FUNCTION DOC] HELPER: Parses the comma-separated supported-ops option. Each entry is a
+    # fully-qualified op name optionally followed by an equals sign and a numeric weight.
+    # Blank entries are skipped; an entry whose weight is not a number is dropped entirely.
+    # Returns the ordered list of names and a mapping from name to weight (only for entries with
+    # a weight). An empty spec gives an empty list and mapping. Pure.
     """Parse --supported-ops string.
 
     Format: comma-separated fully-qualified torch ops, each optionally with =weight.
@@ -57,6 +69,11 @@ def _parse_supported_ops_with_weights(spec: str) -> tuple[list[str], dict[str, f
 def _resolve_generate_only_path(
     pattern: str, seed: int, *, require_marker: bool = False
 ) -> str:
+    # [FUNCTION DOC] HELPER: Turns a generate-only file pattern into a concrete path. The single
+    # contiguous run of question marks is replaced by the seed number, left-padded with zeros to
+    # the run length. A pattern without any question mark is returned unchanged, unless
+    # require_marker is set. Raises ValueError if the question marks form more than one run or
+    # if require_marker is set and none exist. Pure.
     """Resolve a --generate-only file pattern for a given seed.
 
     A contiguous run of '?' characters is replaced by the seed, left-padded with
@@ -86,6 +103,22 @@ def fuzz_and_execute(
     op_weights: dict[str, float] | None = None,
     generate_only: str | None = None,
 ) -> None:
+    # [FUNCTION DOC] Runs one complete fuzz iteration. Picks a seed if none is given (and a
+    # depth from 2 to 4 using a seed-derived generator; an explicit depth is raised to at least
+    # 1), seeds the python and torch generators, generates a target spec for the template,
+    # optionally applies per-operator weights, builds the operation graph (restricted to
+    # supported_ops when given), prints per-operator usage counts after the OPERATION_STATS
+    # header, and converts the graph to program text. With generate_only the text is written to
+    # the resolved path (directories created) and the function returns without running it.
+    # Otherwise the program is written to a file and executed via the program runner. Unless
+    # log_at_faluire is set, a success record is written under the temp directory; on any
+    # exception a failure record is written, the traceback printed, and the process exits with
+    # status 1. Side effects: global RNG seeding, stdout, files, process exit.
+    # KNOWN ISSUE: the docstring says depth 1-10 and an inline comment says 3-12, but the code
+    # picks 2-4 and applies no upper clamp. The nested log helper tests operation_stack, which
+    # is never assigned anywhere, so the operation-stack file and graph visualization are
+    # never produced. The parameter name log_at_faluire is misspelled, and in log-at-failure
+    # mode nothing is logged for successes by design.
     """
     Generate a fuzzed operation stack, convert it to Python code, and execute it.
 
@@ -123,6 +156,11 @@ def fuzz_and_execute(
     target_spec = None
 
     def log(success: bool) -> None:
+        # [FUNCTION DOC] HELPER: Writes a per-iteration record folder under the system temp dir
+        # named from the seed, a millisecond timestamp and success or failed, containing a
+        # summary text file (seed, depth, success flag, target spec, operation count when known).
+        # When an operation stack exists it also writes the stack listing and renders the
+        # operation graph visualization into that folder. Reads enclosing-scope variables.
         import os
         import time
 
@@ -276,6 +314,18 @@ def fuzz_and_execute(
 
 
 def main():
+    # [FUNCTION DOC] Command-line driver. Initializes the codegen/device plugin, builds the
+    # argument parser (seed, depth, template, supported ops, multi-process range and count,
+    # worker count, verbosity, stop-at-first-failure, generate-only pattern, legacy single flag,
+    # log level), configures logging, and validates generate-only usage (not allowed with
+    # stop-at-first-failure; needs a question mark in multi-seed mode). Then dispatches: a seed
+    # or the single flag runs fuzz_and_execute with parsed ops and weights; stop-at-first-failure
+    # calls run_until_failure; start/count runs run_multi_process_fuzzer (both must be given,
+    # count at least 1, workers default to 75 percent of CPUs capped at 16); otherwise prints
+    # help and examples. Invalid options print an error and exit with status 1.
+    # KNOWN ISSUE: in multi-process modes the supported-ops string is passed unparsed, and inline
+    # weights are only honored in single-seed mode; the max-depth option is also ignored by
+    # the multi-process modes.
     import argparse
 
     # Initialize the device plugin once up front so argparse choices reflect the

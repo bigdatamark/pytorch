@@ -1,3 +1,6 @@
+# [MODULE DOC] Defines ConstantOperator, the leaf operator that emits literal constants
+# (scalars or filled tensors) into generated programs, using seeded fuzzing helpers.
+# No import-time side effects.
 """Constant operator implementation."""
 
 from torchfuzz.operators.base import Operator
@@ -11,9 +14,15 @@ from torchfuzz.tensor_fuzzer import (
 
 
 class ConstantOperator(Operator):
+    # [CLASS DOC] Leaf operator (registry name "constant") producing any spec with no inputs.
+    # State: template, an optional fuzz template used to wrap tensor constants for the target
+    # device; None until set_template is called. Constant values are deterministic per
+    # variable name because the fuzz seed is derived from a hash of the name.
     """Operator for generating constants."""
 
     def __init__(self):
+        # [FUNCTION DOC] Initializes the base operator with the name "constant" and sets the
+        # template attribute to None.
         super().__init__("constant")
         # Active FuzzTemplate instance (set via set_template) used to delegate
         # device-specific tensor wrapping in codegen.  None until set_template
@@ -22,10 +31,13 @@ class ConstantOperator(Operator):
 
     @property
     def torch_op_name(self) -> str | None:
+        # [FUNCTION DOC] Property; always None because constants are not torch operations.
         """Constant is not a torch operation, it generates constant values."""
         return None
 
     def set_template(self, template):
+        # [FUNCTION DOC] Stores the active fuzz template so codegen can delegate device-specific
+        # wrapping of tensor constants to it. Mutates operator state; returns nothing.
         """Set the active :class:`FuzzTemplate` instance for codegen.
 
         ``ops_fuzzer._get_template_filtered_operators`` calls this with the
@@ -36,16 +48,28 @@ class ConstantOperator(Operator):
         self.template = template
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Always returns true; a constant can be any scalar or tensor spec.
         """Constant can produce any type of output."""
         return True
 
     def fuzz_inputs_specs(self, output_spec: Spec) -> list[Spec]:
+        # [FUNCTION DOC] Returns an empty list: constants take no inputs.
         """Constant requires no inputs for fuzzing."""
         return []
 
     def codegen(
         self, output_name: str, input_names: list[str], output_spec: Spec
     ) -> str:
+        # [FUNCTION DOC] Returns source text defining output_name as a constant. The seed is an
+        # MD5-derived number of the name (deterministic across processes). Scalar specs: one
+        # fuzzed scalar value embedded as a literal (complex values via a complex constructor).
+        # Tensor specs: a fuzzed tensor is built only to pick a fill value (its first element;
+        # integer values clamped to the range 0..3; empty tensors use 1 or True), and the
+        # emitted line is a full-tensor creation of the spec size and dtype, passed through the
+        # template's constant wrapper when a template is set. Other spec types yield a comment
+        # line. Input names are unused.
+        # KNOWN ISSUE: the tensor stride is ignored (always contiguous), and only the first
+        # element is used so the constant is uniform; unsigned ints are not clamped.
         """Generate code for constant creation."""
         # Create constant by calling fuzzing functions during codegen with deterministic seed
         # Use a deterministic hash based on the variable name to ensure reproducibility across processes
