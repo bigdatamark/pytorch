@@ -1,4 +1,13 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Post-processes a profiler result into a memory profile: it classifies every tensor
+# storage version (input, parameter, optimizer state, activation, gradient, temporary,
+# autograd detail) and builds a timeline of allocation events. Main contents: Category
+# and Action enums, TensorKey identifiers, SchemaMatcher (operator schema lookup), OpTree,
+# SizeMap, DataFlowGraph/DataFlowNode (tensor version data flow), MemoryProfile
+# (categorization and timeline) and MemoryProfileTimeline (export to JSON or HTML plot).
+# Import-time side effects: creates the module logger, color/index lookup tables and
+# type aliases; no I/O.
 from __future__ import annotations
 
 import collections
@@ -35,6 +44,9 @@ log = logging.getLogger(__name__)
 
 
 class Category(enum.Enum):
+    # [CLASS DOC] Enumeration of the kinds of memory a tensor can be classified as: input,
+    # temporary, activation, gradient, autograd detail, parameter and optimizer state.
+    # Unclassified tensors are represented by None elsewhere, not by a member.
     INPUT = enum.auto()
     TEMPORARY = enum.auto()
     ACTIVATION = enum.auto()
@@ -59,6 +71,9 @@ _CATEGORY_TO_INDEX = {c: i for i, c in enumerate(_CATEGORY_TO_COLORS)}
 
 
 class Action(enum.Enum):
+    # [CLASS DOC] Enumeration of memory timeline event kinds: preexisting (live before
+    # profiling began), create, increment version (in-place mutation) and destroy. The
+    # numeric value is used as a tie-break when sorting events and as the exported index.
     PREEXISTING = enum.auto()
     CREATE = enum.auto()
     INCREMENT_VERSION = enum.auto()
@@ -70,11 +85,15 @@ _ACTION_TO_INDEX = {i: i.value for i in Action}
 
 @dataclasses.dataclass(eq=True, unsafe_hash=False, frozen=True)
 class Key:
+    # [CLASS DOC] Frozen dataclass identifying a memory object by device only. Used for
+    # allocations that have no tensor identity; TensorKey extends it with tensor ids.
     device: torch.device
 
 
 @dataclasses.dataclass
 class _Storage:
+    # [CLASS DOC] HELPER: Pair of a storage data pointer and an allocation id. Equality and
+    # hashing use only the allocation id, so the pointer is informational (debugging).
     """Bundle storage pointer and id.
 
     All profiling logic should use `allocation_id`, however it is useful to
@@ -85,17 +104,26 @@ class _Storage:
     allocation_id: int
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: Debug string with the right-aligned hex pointer and the
+        # allocation id in parentheses.
         return f"{hex(self.ptr):>18} ({self.allocation_id})"
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] HELPER: True only if other is also a storage record with the same
+        # allocation id (pointer ignored).
         return isinstance(other, _Storage) and self.allocation_id == other.allocation_id
 
     def __hash__(self) -> int:
+        # [FUNCTION DOC] HELPER: Hash of the allocation id, consistent with equality.
         return hash(self.allocation_id)
 
 
 @dataclasses.dataclass(eq=True, unsafe_hash=True, frozen=True)
 class TensorKey(Key):
+    # [CLASS DOC] Frozen, hashable identifier of a concrete tensor storage: device (from
+    # Key), the logical tensor id and a _Storage record. Orderable by (id, allocation id,
+    # device type, device index). Built via from_allocation or from_tensor, which return
+    # None when any of the id, pointer or allocation id is missing.
     """Hashable identifier for a storage which has been assigned an ID.
 
     A detailed description of Tensor IDs and why they are needed is given in
@@ -109,9 +137,11 @@ class TensorKey(Key):
     storage: _Storage
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Debug string with the tensor id, storage repr and device.
         return f"id={self.id}: {repr(self.storage):<24} ({self.device})"
 
     def __lt__(self, other: TensorKey) -> bool:
+        # [FUNCTION DOC] Ordering by the sortable tuple, enabling deterministic sorting.
         return self._as_sortable < other._as_sortable
 
     @staticmethod
@@ -121,6 +151,8 @@ class TensorKey(Key):
         allocation_id: int | None,
         device: torch.device,
     ) -> TensorKey | None:
+        # [FUNCTION DOC] HELPER: Builds a TensorKey from tensor id, storage pointer,
+        # allocation id and device. Returns None if any of the first three is None.
         if (
             tensor_id is not None
             and storage_ptr is not None
@@ -131,22 +163,35 @@ class TensorKey(Key):
 
     @classmethod
     def from_allocation(cls, alloc: _ExtraFields_Allocation) -> TensorKey | None:
+        # [FUNCTION DOC] Builds a key from an allocation event's id, pointer, allocation id
+        # and device; None when the event lacks a tensor identity.
         return cls._make(alloc.id, alloc.ptr, alloc.allocation_id, alloc.device)
 
     @classmethod
     def from_tensor(cls, t: _TensorMetadata | None) -> TensorKey | None:
+        # [FUNCTION DOC] Builds a key from recorded tensor metadata; None when the metadata
+        # is None or lacks a tensor identity.
         if t is not None:
             return cls._make(t.id, t.storage_data_ptr, t.allocation_id, t.device)
         return None
 
     @property
     def _as_sortable(self) -> tuple[int, int, str, int]:
+        # [FUNCTION DOC] HELPER: Tuple of tensor id, allocation id, device type and device
+        # index used for ordering.
+        # KNOWN ISSUE: device index can be None (for example cpu), so comparing two keys
+        # that tie on the earlier fields but have mixed None and integer indices would fail.
         return self.id, self.storage.allocation_id, self.device.type, self.device.index
 
 
 def _extract_parameters_and_gradients(
     node: _ProfilerEvent,
 ) -> Iterator[tuple[TensorKey | None, TensorKey | None]]:
+    # [FUNCTION DOC] HELPER: Generator yielding (parameter key, gradient key) pairs found in
+    # one profiler event. For a backward AccumulateGrad op whose first child is a detach or
+    # in-place add with a tensor input, yields (None, gradient). For a Python call event
+    # with a module or optimizer, yields a pair per parameter and its grad as recorded.
+    # Raises AssertionError if both module and optimizer are set. Pure.
     children = node.children
 
     # AccumulateGrad is used in the Autograd engine to handle gradient updates.
@@ -188,6 +233,7 @@ def _extract_parameters_and_gradients(
 
 
 def extract_parameters(node: _ProfilerEvent) -> Iterator[TensorKey]:
+    # [FUNCTION DOC] Generator yielding the non-None parameter keys found in an event.
     for p, _p_grad in _extract_parameters_and_gradients(node):
         if p is not None:
             yield p
@@ -196,12 +242,16 @@ def extract_parameters(node: _ProfilerEvent) -> Iterator[TensorKey]:
 def extract_gradients(
     node: _ProfilerEvent,
 ) -> Iterator[tuple[TensorKey | None, TensorKey]]:
+    # [FUNCTION DOC] Generator yielding (parameter key or None, gradient key) pairs for an
+    # event, skipping pairs whose gradient is None.
     for p, p_grad in _extract_parameters_and_gradients(node):
         if p_grad is not None:
             yield p, p_grad
 
 
 def get_scopes(event: _ProfilerEvent | None) -> tuple[RecordScope, ...]:
+    # [FUNCTION DOC] Walks from an event up through its parents and returns the record
+    # scopes of every torch op encountered, innermost first. Empty for None. Pure.
     scopes = []
     while event:
         if event.typed[0] == _EventType.TorchOp:
@@ -211,6 +261,10 @@ def get_scopes(event: _ProfilerEvent | None) -> tuple[RecordScope, ...]:
 
 
 class SchemaMatcher:
+    # [CLASS DOC] Stateless helper (class methods only) that recovers operator schemas for
+    # profiled ops. Looks up all registered overloads by name and keeps those whose argument
+    # count and types are compatible with the recorded inputs, then derives which inputs may
+    # be mutated. Key methods: inputs_are_mutable, match_schemas, lookup_schemas.
     """Lookup operator schema based on profiled name.
 
     When profiling we record the operator's name but not the schema. However
@@ -225,6 +279,10 @@ class SchemaMatcher:
 
     @classmethod
     def inputs_are_mutable(cls, t: _ExtraFields_TorchOp) -> tuple[bool | None, ...]:
+        # [FUNCTION DOC] For a torch op event, returns one entry per input: true if any
+        # matching schema overload marks that argument as written, false otherwise. If no
+        # schema matches, returns None for every input (unknown, treated as mutable by
+        # callers). Pure.
         """Determine which inputs may have mutated based on function schema.
 
         Note that we don't need to resolve down to a single schema to perform
@@ -244,6 +302,10 @@ class SchemaMatcher:
 
     @classmethod
     def match_schemas(cls, t: _ExtraFields_TorchOp) -> tuple[FunctionSchema, ...]:
+        # [FUNCTION DOC] Returns every registered schema for the op name whose argument count
+        # equals the number of recorded inputs and whose argument types are compatible with
+        # them (tensors converted to keys, tensor lists to lists of keys). Empty if the
+        # name has no schemas. Pure apart from the schema registry lookup.
         signature = tuple(
             # Tensor
             TensorKey.from_tensor(i)
@@ -259,6 +321,8 @@ class SchemaMatcher:
         )
 
         def matches(schema) -> bool:
+            # [FUNCTION DOC] HELPER: True if the schema has the same number of arguments as
+            # the observed signature and every observed value matches its argument type.
             return len(schema.arguments) == len(signature) and all(
                 cls._types_match(observed, schema_arg.type)
                 for observed, schema_arg in zip(
@@ -270,6 +334,11 @@ class SchemaMatcher:
 
     @classmethod
     def _types_match(cls, observed, schema_type) -> bool:
+        # [FUNCTION DOC] HELPER: Decides whether an observed profiled value is compatible with
+        # a schema argument type. Optional accepts none or a match of the inner type; any-type
+        # accepts all; tensor-list types need a list of tensor keys; scalar/tensor/none types
+        # map to the corresponding Python types. Types the profiler does not record match
+        # only if the observed value is None. Pure.
         if isinstance(schema_type, torch._C.OptionalType):
             schema_type = schema_type.getElementType()
             return observed is None or cls._types_match(observed, schema_type)
@@ -304,6 +373,9 @@ class SchemaMatcher:
 
     @staticmethod
     def lookup_schemas(name: str) -> tuple[FunctionSchema, ...] | None:
+        # [FUNCTION DOC] Looks up all registered schemas for an operator name. Returns None
+        # if the name has no namespace separator or the lookup raises a runtime error (such
+        # as for record_function annotations); otherwise a tuple of schemas. Not cached.
         # TODO(robieta):
         #   _jit_get_schemas_for_operator is quite expensive. (~100us / call)
         #   Consider adding `functools.lru_cache` if that becomes an issue.
@@ -325,20 +397,37 @@ class SchemaMatcher:
 
 
 class OpTree:
+    # [CLASS DOC] Wrapper over a profiler result's event tree. Holds the root events and a
+    # tuple of all events sorted by start time. Provides depth-first traversal and the
+    # sorted view.
     def __init__(self, result: _ProfilerResult) -> None:
+        # [FUNCTION DOC] Fetches the experimental event tree roots from the profiler result
+        # and precomputes all nodes sorted by start time (nanoseconds).
         self._root_nodes = result.experimental_event_tree()
         self._sorted_nodes = tuple(sorted(self.dfs(), key=lambda x: x.start_time_ns))
 
     def dfs(self, *args, **kwargs) -> Iterator[_ProfilerEvent]:
+        # [FUNCTION DOC] Generator doing a depth-first traversal over the root events via the
+        # shared traversal utility; extra arguments (such as a children function) are
+        # forwarded unchanged.
         yield from _utils.traverse_dfs(self._root_nodes, *args, **kwargs)
 
     @property
     def sorted_nodes(self) -> tuple[_ProfilerEvent, ...]:
+        # [FUNCTION DOC] Property returning all events ordered by start time.
         return self._sorted_nodes
 
 
 class SizeMap:
+    # [CLASS DOC] Mapping from TensorKey to the size in bytes of its storage. Built once from
+    # an OpTree: sizes inferred from tensor metadata of op inputs, module/optimizer
+    # parameters, grads and optimizer state, then overridden by sizes seen in allocation
+    # events. Lookup by key raises KeyError for unknown keys.
     def __init__(self, op_tree: OpTree) -> None:
+        # [FUNCTION DOC] Walks events in start order, recording sizes from torch op tensor
+        # inputs and from Python call module/optimizer tensors (error if both are set), then
+        # records allocation sizes (absolute value) which take precedence. Logs a warning
+        # when the same storage is seen with different allocation sizes.
         self._values: dict[TensorKey, int] = {}
 
         for node in op_tree.sorted_nodes:
@@ -387,6 +476,10 @@ class SizeMap:
         self._values.update(allocations)
 
     def _update_values(self, t: _TensorMetadata | None) -> None:
+        # [FUNCTION DOC] HELPER: For a strided tensor with an identity, computes the extent in
+        # elements (largest size times stride product over dimensions, scalars as one) times
+        # element size, and stores the maximum seen for its key. Ignores None, sparse or
+        # unidentified tensors. Raises AssertionError on a negative byte count.
         key = TensorKey.from_tensor(t)
         if key is not None and t is not None and t.layout == torch.strided:
             # Scalars are represented as zero dim Tensors
@@ -401,6 +494,8 @@ class SizeMap:
 
     @staticmethod
     def _flat_tensor_inputs(op: _ExtraFields_TorchOp) -> Iterator[_TensorMetadata]:
+        # [FUNCTION DOC] HELPER: Generator yielding each tensor input of an op, flattening
+        # tensor-list inputs; non-tensor inputs are skipped.
         for i in op.inputs:
             if isinstance(i, _TensorMetadata):
                 yield i
@@ -408,25 +503,39 @@ class SizeMap:
                 yield from i
 
     def __getitem__(self, key: TensorKey):
+        # [FUNCTION DOC] Returns the size in bytes for the key; raises KeyError if unknown.
         return self._values[key]
 
 
 @dataclasses.dataclass()
 class DataFlowEdge:
+    # [CLASS DOC] Describes how one data flow node touches one tensor: the tensor version it
+    # reads (None means the node allocates it) and whether it mutates it (None means the
+    # node deletes it, true means in-place mutation, false means read only).
     input_version: int | None = None
     mutated: bool | None = False
 
     @property
     def is_allocation(self) -> bool:
+        # [FUNCTION DOC] True when there is no input version, i.e. the node creates it.
         return self.input_version is None
 
     @property
     def is_deletion(self) -> bool:
+        # [FUNCTION DOC] True when the mutated marker is None, i.e. the node frees it.
         return self.mutated is None
 
 
 class DataFlowNode:
+    # [CLASS DOC] One node of the tensor data flow graph, wrapping a top-level profiler
+    # event. State: the event, the owning graph and a mapping from TensorKey to
+    # DataFlowEdge. Exposes the inputs (read versions), outputs (versions produced) and
+    # intermediates (allocated and freed within the node), plus the start time.
     def __init__(self, event: _ProfilerEvent, graph: DataFlowGraph) -> None:
+        # [FUNCTION DOC] Computes the node's edges from its event subtree, bumps the graph's
+        # version of every tensor mutated in place, then checks that each output version
+        # equals the graph's current version. Raises AssertionError on mismatch. Mutates the
+        # graph's version table.
         self._event = event
         self._graph = graph
         self._edges: dict[TensorKey, DataFlowEdge] = self._determine_edges()
@@ -441,6 +550,13 @@ class DataFlowNode:
             raise AssertionError(f"version mismatch: {versions}, {self._edges}")
 
     def _determine_edges(self) -> dict[TensorKey, DataFlowEdge]:
+        # [FUNCTION DOC] HELPER: Builds the tensor-to-edge mapping from the event subtree.
+        # Step one: for each torch op, matches schemas to find which tensor inputs are
+        # mutable (mutated if any schema says so or it is ambiguous) and records the
+        # current graph version. Step two: allocation events with negative size mark
+        # deletions (raises AssertionError on a double delete). Step three: positive-size
+        # allocations clear the input version (creation). Returns edges sorted by key,
+        # omitting entries without a key.
         subtree = tuple(_utils.traverse_dfs([self._event]))
 
         # Start by populating edges from op inputs and outputs.
@@ -494,6 +610,8 @@ class DataFlowNode:
 
     @property
     def inputs(self) -> dict[TensorKey, tuple[bool, int]]:
+        # [FUNCTION DOC] Mapping from each pre-existing tensor the node reads to a pair of
+        # (was mutated, version read). Excludes tensors the node allocates.
         return {
             # MyPy can't see through `is_allocation` to know that
             # `v.input_version` is not None.
@@ -504,6 +622,9 @@ class DataFlowNode:
 
     @property
     def outputs(self) -> dict[TensorKey, int]:
+        # [FUNCTION DOC] Mapping from each tensor the node produces to the version produced:
+        # zero for newly allocated tensors (not deleted in the node), input version plus one
+        # for mutated tensors.
         return {
             k: 0 if v.input_version is None else v.input_version + 1
             for k, v in self._edges.items()
@@ -512,17 +633,26 @@ class DataFlowNode:
 
     @property
     def intermediates(self) -> tuple[TensorKey, ...]:
+        # [FUNCTION DOC] Tensors both allocated and deleted within this node (temporaries).
         return tuple(
             k for k, v in self._edges.items() if v.is_allocation and v.is_deletion
         )
 
     @property
     def start_time(self) -> int:
+        # [FUNCTION DOC] Start time of the wrapped event in nanoseconds.
         return self._event.start_time_ns
 
 
 class DataFlowGraph:
+    # [CLASS DOC] Time-ordered graph of tensor reads, writes, allocations and frees. State:
+    # the op tree, the leaf events chosen as nodes, a table of the active version of each
+    # tensor key (None once deleted) and the sorted DataFlowNode list. Invariant checked by
+    # validate: each (tensor, version) is created once and versions are consistent.
     def __init__(self, op_tree: OpTree) -> None:
+        # [FUNCTION DOC] Extracts leaf events, builds a node per event (which updates the
+        # version table), sorts nodes by start time and validates the graph. Raises
+        # AssertionError if validation fails.
         self._op_tree = op_tree
         self._leaf_events = self._extract_leaf_events(op_tree)
         self._active_version: dict[TensorKey, int | None] = {}
@@ -532,9 +662,14 @@ class DataFlowGraph:
 
     @property
     def flow_nodes(self) -> tuple[DataFlowNode, ...]:
+        # [FUNCTION DOC] Snapshot tuple of the nodes in start-time order.
         return tuple(self._flow_nodes)
 
     def validate(self) -> None:
+        # [FUNCTION DOC] Checks consistency. First, no (tensor, version) output is produced
+        # by two nodes. Second, walking nodes in order, every input version equals the
+        # latest version produced so far (default zero) and output versions never decrease.
+        # Raises AssertionError with details on any violation. No mutation of the graph.
         # Check that each (Tensor, version) pair has a unique creation node
         outputs: set[tuple[TensorKey, int]] = set()
         for node in self.flow_nodes:
@@ -566,10 +701,15 @@ class DataFlowGraph:
 
     @property
     def leaf_events(self) -> tuple[_ProfilerEvent, ...]:
+        # [FUNCTION DOC] The events selected as graph nodes, sorted by start time.
         return self._leaf_events
 
     @staticmethod
     def _extract_leaf_events(op_tree: OpTree) -> tuple[_ProfilerEvent, ...]:
+        # [FUNCTION DOC] HELPER: Traverses the op tree top-down, stopping descent at the
+        # first event that is a backward-scope torch op, a torch op matching a known schema,
+        # or an allocation event. Those events are collected and returned sorted by start
+        # time. Pure with respect to the tree.
         """Partially traverse the op tree and extract top level ops.
 
         Consider the following code:
@@ -604,12 +744,17 @@ class DataFlowGraph:
         leaf_events: list[_ProfilerEvent] = []
 
         def leaf_op(e: _ProfilerEvent) -> bool:
+            # [FUNCTION DOC] HELPER: True for torch op events in backward scope or whose
+            # recorded inputs match at least one operator schema.
             return e.typed[0] == _EventType.TorchOp and (
                 e.typed[1].scope == RecordScope.BACKWARD_FUNCTION
                 or bool(SchemaMatcher.match_schemas(e.typed[1]))
             )
 
         def children_fn(e: _ProfilerEvent):
+            # [FUNCTION DOC] HELPER: Traversal callback. Leaf ops and allocations are
+            # appended to the enclosing list and not descended into (empty children);
+            # other events return their children.
             if leaf_op(e) or e.tag == _EventType.Allocation:
                 leaf_events.append(e)
                 return []
@@ -622,18 +767,27 @@ class DataFlowGraph:
         return tuple(sorted(leaf_events, key=lambda x: x.start_time_ns))
 
     def lookup(self, key: TensorKey) -> int:
+        # [FUNCTION DOC] Returns the active version of a tensor key, initializing it to zero
+        # if unseen. Raises AssertionError if the key was deleted. Side effect: inserts the
+        # default entry.
         version = self._active_version.setdefault(key, 0)
         if version is None:
             raise AssertionError(f"version for key {key} is None")
         return version
 
     def bump(self, key: TensorKey) -> None:
+        # [FUNCTION DOC] Increments the active version of a key. Raises AssertionError if the
+        # key has no recorded version or was deleted.
         prior_version = self._active_version.get(key, None)
         if prior_version is None:
             raise AssertionError(f"prior_version for key {key} is None")
         self._active_version[key] = prior_version + 1
 
     def delete(self, key: TensorKey) -> None:
+        # [FUNCTION DOC] Marks a key deleted by setting its version to None. Raises
+        # AssertionError if already deleted.
+        # KNOWN ISSUE: nothing in this module calls delete; deletions are tracked through
+        # edges only, so the deleted state is never recorded in the version table.
         if self._active_version.setdefault(key, 0) is None:
             raise AssertionError(f"cannot delete key {key}, already deleted")
         self._active_version[key] = None
@@ -641,6 +795,9 @@ class DataFlowGraph:
 
 @dataclasses.dataclass
 class CategoryElement:
+    # [CLASS DOC] Category assignments for one logical tensor id, at three precedence levels:
+    # by id (all storages and versions), by key (one storage) and by version (one storage
+    # and version). Also keeps the set of keys assigned by id, for tests and timeline lookup.
     by_id: Category | None = None
     by_key: dict[TensorKey, Category] = dataclasses.field(default_factory=dict)
     by_version: dict[TensorAndID, Category] = dataclasses.field(default_factory=dict)
@@ -652,26 +809,39 @@ class CategoryElement:
 
 @dataclasses.dataclass
 class CategoryDict:
+    # [CLASS DOC] Store of category assignments, a default-creating mapping from tensor id to
+    # CategoryElement. Setters assign at id, key or version granularity; get resolves with
+    # precedence id, then key, then version.
     _values: collections.defaultdict[int, CategoryElement] = dataclasses.field(
         default_factory=lambda: collections.defaultdict(CategoryElement)
     )
 
     def set_by_id(self, key: TensorKey, category: Category) -> None:
+        # [FUNCTION DOC] Assigns a category to every storage and version of the key's tensor
+        # id (overwriting) and remembers the key in the id key set.
         self._values[key.id].by_id = category
         self._values[key.id]._by_id_keyset.add(key)
 
     def set_by_key(self, key: TensorKey, category: Category) -> None:
+        # [FUNCTION DOC] Assigns (overwriting) a category to all versions of one storage key.
         self._values[key.id].by_key[key] = category
 
     def set_by_version(self, key: TensorKey, version: int, category: Category) -> None:
+        # [FUNCTION DOC] Assigns (overwriting) a category to one version of one storage key.
         self._values[key.id].by_version[(key, version)] = category
 
     def setdefault_by_version(
         self, key: TensorKey, version: int, category: Category
     ) -> None:
+        # [FUNCTION DOC] Assigns a category to one version of a storage key only if that
+        # version has no assignment yet.
         self._values[key.id].by_version.setdefault((key, version), category)
 
     def get(self, key: Key, version: int) -> Category | None:
+        # [FUNCTION DOC] Returns the category for a key and version, or None. Plain Key
+        # objects (no tensor identity) always give None. Otherwise the first available of the
+        # by-id, by-key and by-version assignments is returned. Side effect: the lookup
+        # creates an empty element for an unseen tensor id.
         if isinstance(key, Key) and not isinstance(key, TensorKey):
             return None
         element = self._values[key.id]
@@ -683,7 +853,14 @@ class CategoryDict:
 
 
 class MemoryProfile:
+    # [CLASS DOC] Memory analysis of a profiler result. On construction builds the op tree,
+    # data flow graph, size map and category store, then runs the categorization passes in
+    # a fixed order: gradients and temporaries, parameters from the Python tracer, inputs,
+    # parameters from data flow, activations, optimizer state and autograd detail. The
+    # timeline property yields the sorted memory events. Constructed once per result.
     def __init__(self, result: _ProfilerResult) -> None:
+        # [FUNCTION DOC] Builds all analysis structures from the profiler result and runs the
+        # categorization passes in order. May raise AssertionError from graph validation.
         self._op_tree = OpTree(result)
         self._data_flow_graph = DataFlowGraph(self._op_tree)
         self._size_map = SizeMap(self._op_tree)
@@ -699,6 +876,13 @@ class MemoryProfile:
 
     @property
     def timeline(self) -> tuple[tuple[int, Action, KeyAndID, int], ...]:
+        # [FUNCTION DOC] Property computing the memory event timeline, recomputed on each
+        # access. Each item is (time ns, action, (key, version), size in bytes). Allocation
+        # events without a tensor identity yield create, increment-version (pointer reused
+        # while live) or destroy items keyed by device, plus a preexisting item for frees
+        # of unseen pointers. Identified tensors yield preexisting items (versions zero not
+        # allocated in the trace), and per data flow edge create, increment-version and
+        # destroy items. Sorted by time then action value; preexisting uses time minus one.
         output: list[tuple[int, Action, KeyAndID, int]] = []
         allocation_times: dict[tuple[TensorKey, bool], int] = {}
         live_unknown: dict[tuple[int, torch.device], Literal[True]] = {}
@@ -767,9 +951,13 @@ class MemoryProfile:
         return tuple(output)
 
     def _is_gradient(self, *args, **kwargs) -> bool:
+        # [FUNCTION DOC] HELPER: True if the category lookup (key, version) is gradient.
         return self._categories.get(*args, **kwargs) == Category.GRADIENT
 
     def _category_snapshot(self) -> dict[TensorAndID, Category | None]:
+        # [FUNCTION DOC] HELPER: Collects every (key, version) seen as a node input, output,
+        # intermediate (version zero) or id-assigned key, and returns a sorted mapping to the
+        # current category (None if unassigned).
         all_tensor_versions: set[TensorAndID] = set()
 
         for node in self._data_flow_graph.flow_nodes:
@@ -786,6 +974,10 @@ class MemoryProfile:
         }
 
     def _any_version_depends_on_gradient(self) -> set[int]:
+        # [FUNCTION DOC] HELPER: Fixed-point computation returning tensor ids that depend on a
+        # gradient. Repeatedly scans nodes; if any input is a gradient, parameter or already
+        # dependent id, the ids of all of the node's inputs and outputs join the set. Stops when a
+        # full pass adds nothing. Pure.
         """Extract IDs of Tensors which depend or will depend on a gradient.
 
         Note that this weakened definition of "depends" requires us to loop
@@ -822,6 +1014,9 @@ class MemoryProfile:
                 return depends_on_gradient
 
     def _set_gradients_and_temporaries(self) -> None:
+        # [FUNCTION DOC] HELPER: Categorization pass. Marks gradient tensors (found by the
+        # Python tracer or accumulate-grad ops) by id as gradient, and each node's
+        # intermediates by key as temporary. Mutates the category store.
         """Mark Tensors which are unambiguous and simple to reason about."""
 
         # Gradients are straightforward to detect. We directly check the
@@ -839,12 +1034,18 @@ class MemoryProfile:
                 self._categories.set_by_key(i, Category.TEMPORARY)
 
     def _set_parameters_using_python_tracer(self) -> None:
+        # [FUNCTION DOC] HELPER: Categorization pass. Marks every parameter reported by module
+        # or optimizer Python call events as parameter, by id. Mutates the category store.
         for event in self._op_tree.dfs():
             for p in extract_parameters(event):
                 if p is not None:
                     self._categories.set_by_id(p, Category.PARAMETER)
 
     def _set_inputs(self) -> None:
+        # [FUNCTION DOC] HELPER: Categorization pass for model inputs. Finds tensor versions
+        # that contribute to a gradient or parameter (reverse scan), drops outputs created
+        # in backward scope, and marks the remaining candidates whose tensor id does not
+        # depend on a gradient as input (only where no category is set yet).
         """Mark inputs based on which Tensors are updated using gradients.
 
         The process for differentiating between inputs and activations is more
@@ -896,6 +1097,10 @@ class MemoryProfile:
                 self._categories.setdefault_by_version(key, version, Category.INPUT)
 
     def _set_parameters_using_data_flow(self) -> None:
+        # [FUNCTION DOC] HELPER: Fallback parameter detection. Candidates are tensors read in
+        # forward-pass nodes that depend on inputs but are not derived from them; they must
+        # also feed into a gradient and depend on a gradient. Matching ids are marked as
+        # parameter. Mutates the category store.
         """Deduce which Tensors are parameters.
 
         Consider the following code for the step of SGD with momentum
@@ -970,6 +1175,9 @@ class MemoryProfile:
                 self._categories.set_by_id(key, Category.PARAMETER)
 
     def _set_activations(self) -> None:
+        # [FUNCTION DOC] HELPER: Categorization pass. For each forward-scope node whose inputs
+        # include an input or activation and are otherwise only parameters or temporaries,
+        # marks its outputs as activation (by version, without overriding existing).
         """Flood the graph to identify activations."""
 
         required = {Category.INPUT, Category.ACTIVATION}
@@ -989,6 +1197,8 @@ class MemoryProfile:
                     self._categories.setdefault_by_version(*i, Category.ACTIVATION)
 
     def _set_optimizer_state(self) -> None:
+        # [FUNCTION DOC] HELPER: Categorization pass. Marks every state tensor reported by
+        # optimizer Python call events as optimizer state, by id.
         for event in self._op_tree.dfs():
             if event.typed[0] == _EventType.PyCall and event.typed[1].optimizer:
                 parameters = event.typed[1].optimizer.parameters
@@ -1000,6 +1210,9 @@ class MemoryProfile:
                         self._categories.set_by_id(key, Category.OPTIMIZER_STATE)
 
     def _set_autograd_detail(self) -> None:
+        # [FUNCTION DOC] HELPER: Categorization pass. For nodes in backward scope, marks each
+        # output version as autograd detail if it is the first version or its prior version
+        # is unclassified or already autograd detail (without overriding existing).
         prior = {None, Category.AUTOGRAD_DETAIL}
         for node in self._data_flow_graph.flow_nodes:
             if RecordScope.BACKWARD_FUNCTION in get_scopes(node._event):
@@ -1011,7 +1224,11 @@ class MemoryProfile:
 
 
 class MemoryProfileTimeline:
+    # [CLASS DOC] Presentation layer over a MemoryProfile. Holds the profile's event timeline
+    # and category store, coalesces events into per-category size series for one device,
+    # and exports them as JSON (aggregated or raw) or as an HTML page with an embedded plot.
     def __init__(self, memory_profile) -> None:
+        # [FUNCTION DOC] Captures the timeline and category store from the given profile.
         """The minimum representation of the memory profile timeline
         includes the memory timeline and categories. The timeline
         consists of [timestamp, action, (TensorKey, version), numbytes]
@@ -1023,6 +1240,12 @@ class MemoryProfileTimeline:
         self.categories = memory_profile._categories
 
     def _coalesce_timeline(self, device_str):
+        # [FUNCTION DOC] HELPER: Converts the timeline into stepwise memory totals for one
+        # device. Returns (times in microseconds, sizes) where each size row has a leading
+        # zero column then one column per category (last for unclassified). Events on other
+        # devices are skipped; same-time events share a row; increment-version moves bytes
+        # between categories. Preexisting times (minus one) are replaced by the smallest
+        # positive time seen. Raises ValueError on an unknown action.
         """Convert the memory timeline and categories into a memory plot
         consisting of timestamps and their respective sizes by category
         for a given device.
@@ -1035,6 +1258,8 @@ class MemoryProfileTimeline:
         sizes: list[list[int]] = []
 
         def update(key, version, delta) -> None:
+            # [FUNCTION DOC] HELPER: Adds delta bytes to the newest size row in the column of
+            # the category of (key, version); non-tensor keys count as unclassified.
             category = (
                 self.categories.get(key, version)
                 if isinstance(key, TensorKey)
@@ -1083,6 +1308,9 @@ class MemoryProfileTimeline:
         return times, sizes
 
     def export_memory_timeline(self, path, device_str) -> None:
+        # [FUNCTION DOC] Writes the coalesced timeline (times, sizes by category) for a device
+        # to a JSON file at the path, overwriting it. Raises on I/O errors or an unknown
+        # action.
         """Saves the memory timeline as [times, sizes by category]
         as a JSON formatted file to the given path for the given
         device."""
@@ -1094,6 +1322,10 @@ class MemoryProfileTimeline:
             json.dump([times, sizes], f)
 
     def export_memory_timeline_raw(self, path, device_str) -> None:
+        # [FUNCTION DOC] Writes raw events for a device to a JSON file as lists of (time,
+        # action index, signed byte count, category index). Increment-version emits two
+        # entries (remove from old category, add to new); destroy uses negative bytes.
+        # Raises ValueError on an unknown action and I/O errors on write. Overwrites the file.
         """Saves the memory timeline as raw memory event tuples in the
         form of (timestamp, action, numbytes, category)
         as a JSON formatted file to the given path for the given
@@ -1102,6 +1334,8 @@ class MemoryProfileTimeline:
         raw_events: list[tuple[int, int, int, int]] = []
 
         def get_category_index(key, version):
+            # [FUNCTION DOC] HELPER: Returns the index of the category of (key, version), using
+            # the unclassified index for non-tensor keys or unassigned tensors.
             category = (
                 self.categories.get(key, version)
                 if isinstance(key, TensorKey)
@@ -1166,6 +1400,13 @@ class MemoryProfileTimeline:
     def export_memory_timeline_html(
         self, path, device_str, figsize=(20, 12), title=None
     ) -> None:
+        # [FUNCTION DOC] Renders a stacked-area memory plot (GiB over milliseconds, one band
+        # per category) for a device and writes an HTML file embedding it as a base64 PNG.
+        # The title includes peak allocated and reserved CUDA memory for the device. If
+        # matplotlib is missing, prints a message and returns without writing. Raises
+        # AssertionError if image encoding is empty. Side effects: queries CUDA memory stats,
+        # creates a matplotlib figure and writes the file.
+        # KNOWN ISSUE: the matplotlib figure is never closed, so repeated calls leak figures.
         """Exports the memory timeline as an HTML file which contains
         the memory timeline plot embedded as a PNG file."""
         # Check if user has matplotlib installed, return gracefully if not.

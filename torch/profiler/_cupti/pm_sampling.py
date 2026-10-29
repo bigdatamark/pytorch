@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Continuous GPU performance-monitor (PM) sampling through cupti-python, running next to the
+# activity monitor. Contains the per-device singleton PmSampler, its consumer record and
+# handle classes, and helpers that query CUPTI (chip name, counter-data size, supported
+# metrics, disable, profiler deinitialize). Import-time side effects: imports numpy, cupti
+# and torch (fails if cupti is missing) and creates the module logger; no GPU work happens
+# until a sampler is used.
 """CUPTI PM-sampling: continuous GPU performance-monitor sampling (SM-active %, DRAM-throughput
 %) that runs concurrently with the activity monitor.
 
@@ -52,6 +59,9 @@ _DEFAULT_LOOKBACK_WINDOW_NS = 10_000 * 1_000_000
 def _counter_data_size(
     pm_sampling_object: int, metrics: list[str], max_samples: int
 ) -> int:
+    # [FUNCTION DOC] HELPER: Asks CUPTI how many bytes the host counter-data image needs for
+    # the given PM sampling object, metric names and maximum sample count. Returns that size
+    # as an integer. Errors from CUPTI propagate. No other side effects.
     _, metric_names_ptr = _metrics_to_c_array(metrics)
     p = _cupti.PmSampling_GetCounterDataSize_Params()
     p.struct_size = _cupti.PM_SAMPLING_GET_COUNTER_DATA_SIZE_PARAMS_STRUCT_SIZE
@@ -65,6 +75,8 @@ def _counter_data_size(
 
 @functools.cache
 def _device_chip_name(device: int) -> str:
+    # [FUNCTION DOC] HELPER: Returns the CUPTI chip name string for a device index. Result is
+    # cached per device for the process lifetime. CUPTI errors propagate.
     p = _cupti.Device_GetChipName_Params()
     p.struct_size = _cupti.DEVICE_GET_CHIP_NAME_PARAMS_STRUCT_SIZE
     p.device_index = device
@@ -73,6 +85,8 @@ def _device_chip_name(device: int) -> str:
 
 
 def _pm_sampling_disable(pm_sampling_object: int) -> None:
+    # [FUNCTION DOC] HELPER: Disables the CUPTI PM sampling object identified by the given
+    # handle, releasing its per-device session. Returns nothing; CUPTI errors propagate.
     p = _cupti.PmSampling_Disable_Params()
     p.struct_size = _cupti.PM_SAMPLING_DISABLE_PARAMS_STRUCT_SIZE
     p.p_pm_sampling_object = pm_sampling_object
@@ -80,6 +94,9 @@ def _pm_sampling_disable(pm_sampling_object: int) -> None:
 
 
 def _profiler_deinitialize() -> None:
+    # [FUNCTION DOC] HELPER: Deinitializes the process-global CUPTI profiler. CUPTI does not
+    # refcount this, so it must be called exactly once, after the last collector is released.
+    # Errors from CUPTI propagate.
     p = _cupti.Profiler_DeInitialize_Params()
     p.struct_size = _cupti.PROFILER_DEINITIALIZE_PARAMS_STRUCT_SIZE
     _cupti.profiler_deinitialize(p.ptr)
@@ -87,6 +104,12 @@ def _profiler_deinitialize() -> None:
 
 @functools.cache
 def supported_metrics(*, with_sub_metrics: bool = False) -> frozenset[str]:
+    # [FUNCTION DOC] Returns the set of PM-sampling metric names the current CUDA device's chip
+    # reports. Walks counter, ratio and throughput metric types on a temporary profiler host;
+    # with_sub_metrics expands each base metric into its sub-metrics, otherwise base names
+    # only. On any failure it logs a warning and returns an empty set. Result is cached per
+    # argument value (not per device), so it reflects the device current at first call.
+    # The host is always deinitialized after enumeration.
     try:
         chip_name = _device_chip_name(torch.cuda.current_device())
         host = _profiler_host.ProfilerHost(chip_name, _cupti.ProfilerType.PM_SAMPLING)
@@ -114,17 +137,25 @@ def supported_metrics(*, with_sub_metrics: bool = False) -> frozenset[str]:
 
 
 class _Consumer:
+    # [CLASS DOC] HELPER: Internal record of one registered consumer: the ordered list of
+    # metric names it wants and a cursor holding the newest start timestamp already returned
+    # to it (minus one means nothing delivered yet). Uses slots; the sampler owns these.
     """Internal per-consumer state held by the sampler: the metrics it wants and its cursor (the last
     start_ns returned to it). The caller gets a :class:`_Handle`, not this."""
 
     __slots__ = ("metrics", "cursor")
 
     def __init__(self, metrics: list[str]) -> None:
+        # [FUNCTION DOC] HELPER: Stores the metric list and starts the cursor at minus one.
         self.metrics = metrics
         self.cursor = -1  # last start_ns returned; -1 = nothing yet
 
 
 class _Handle:
+    # [CLASS DOC] Public-facing handle returned by add_consumer. Holds a reference to the
+    # owning PmSampler and the consumer record. Methods: poll (pull new samples), detach
+    # (unregister) and a finalizer that detaches on garbage collection, swallowing errors.
+    # The sampler never references the handle, so dropping it makes it collectable.
     """The caller's handle to a registered consumer: :meth:`poll` for its samples, :meth:`detach` to
     unregister. Dropping the handle also detaches (a GC safety net), but prefer :meth:`detach` for
     deterministic teardown -- detaching the last consumer releases the GPU-clock lock and the CUPTI
@@ -134,10 +165,15 @@ class _Handle:
     __slots__ = ("_sampler", "_consumer")
 
     def __init__(self, sampler: PmSampler, consumer: _Consumer) -> None:
+        # [FUNCTION DOC] HELPER: Records the sampler and consumer this handle refers to.
         self._sampler = sampler
         self._consumer = consumer
 
     def poll(self) -> dict[str, Any] | None:
+        # [FUNCTION DOC] Delegates to the sampler: drains the hardware ring and returns this
+        # consumer's new samples as a mapping with start_ns, device_id and one array per
+        # requested metric, or None when sampling is off, the consumer is detached, or there
+        # is nothing newer than its cursor. Advances the cursor; may release retained data.
         """Drain the HW ring and return this consumer's samples newer than its cursor, sliced to its
         metrics, as a frame (``start_ns`` / ``device_id`` / one column per metric) -- or None if
         none. Poll on your own cadence, but before the KEEP_LATEST ring fills (span = max_samples *
@@ -146,11 +182,16 @@ class _Handle:
         return self._sampler._poll_consumer(self._consumer)
 
     def detach(self) -> None:
+        # [FUNCTION DOC] Unregisters this consumer from the sampler (no-op if already
+        # detached). The session is reconfigured or torn down when the metric union changes
+        # or becomes empty. Returns nothing.
         """Unregister; the session disables once the last consumer detaches. :meth:`poll` first for a
         final frame -- detaching returns nothing."""
         self._sampler._detach(self._consumer)
 
     def __del__(self) -> None:
+        # [FUNCTION DOC] HELPER: Garbage-collection safety net; detaches the consumer and
+        # silently ignores any error (including during interpreter shutdown).
         try:
             self.detach()
         except Exception:
@@ -158,6 +199,14 @@ class _Handle:
 
 
 class PmSampler:
+    # [CLASS DOC] Per-device singleton owning one CUPTI PM sampling session. Class state:
+    # the instance registry and its lock, a count of live collectors (_active) used to
+    # deinitialize the global profiler once, and process-wide interval/look-back settings
+    # plus a configured flag. Instance state: device index, snapshot of the settings, max
+    # sample count, consumer list, union metric names, the active collector (or none), and
+    # retained timestamp/value arrays for samples not yet consumed by all consumers, guarded
+    # by a reentrant lock. Key methods: configure, get_config, add_consumer; the rest are
+    # internal (start, teardown, pull from hardware, garbage collect retained samples).
     """The single PM-sampling session on one CUDA device -- a per-device singleton
     (``PmSampler(device)`` returns the one instance, default the current device). Only one PM session
     per device is possible, so all users of a device share this one object. The process-global CUPTI
@@ -191,6 +240,10 @@ class PmSampler:
         sampling_interval_ms: float | None = None,
         lookback_window_ms: float | None = None,
     ) -> None:
+        # [FUNCTION DOC] Sets the process-wide sampling interval and look-back window, both
+        # given in milliseconds (unset keeps the current value) and stored in nanoseconds.
+        # First call wins: if already configured (or a sampler was created) it only logs a
+        # warning and changes nothing. Marks the class as configured. Returns nothing.
         """Set the process-wide PM-sampling interval and look-back window (milliseconds).
         First-come-first-serve: locked once a call lands OR the first sampler is instantiated
         (whichever comes first) -- a live per-device session can't be resized -- so a later
@@ -210,6 +263,8 @@ class PmSampler:
 
     @classmethod
     def get_config(cls) -> dict[str, int | bool]:
+        # [FUNCTION DOC] Returns a mapping with the current process-wide sampling interval
+        # and look-back window in nanoseconds plus the configured flag. Read-only.
         """The process-wide PM-sampling config a new device session will snapshot: the
         sampling interval and look-back window (nanoseconds), and whether configure() has
         pinned it (first-come-first-serve)."""
@@ -220,6 +275,9 @@ class PmSampler:
         }
 
     def __new__(cls, device: int | None = None) -> Self:
+        # [FUNCTION DOC] Returns the singleton sampler for a device index (default: current
+        # CUDA device), creating and initializing it under the registry lock on first use.
+        # Side effect: creation locks the process-wide configuration.
         if device is None:
             device = torch.cuda.current_device()
         with cls._instances_lock:
@@ -231,6 +289,10 @@ class PmSampler:
             return inst
 
     def _init(self, device: int) -> None:
+        # [FUNCTION DOC] HELPER: Initializes a new singleton: snapshots the class-wide
+        # interval and look-back, marks configuration as locked, derives the maximum sample
+        # count (look-back divided by interval, at least one), and creates empty consumer,
+        # metric, collector and retained-sample state plus the instance lock.
         self._device = device
         # Snapshot the process-wide config at creation and lock it: a live session can't be
         # resized, so from here configure() is a no-op (first-come-first-serve). Runs under
@@ -251,6 +313,10 @@ class PmSampler:
         self._lock = threading.RLock()
 
     def add_consumer(self, metrics: Iterable[str]) -> _Handle:
+        # [FUNCTION DOC] Registers a consumer for the given metric names and returns its
+        # handle. Raises ValueError if the metric set is empty or the union with existing
+        # consumers needs more than one hardware pass. Side effects: appends the consumer and
+        # rebuilds the sampling session when the union of metrics changed.
         """Register a consumer for ``metrics`` and return its handle (``handle.poll()`` /
         ``handle.detach()``; dropping the handle also detaches). Raises ValueError if ``metrics`` is
         empty or the resulting union can't be collected in one PM pass."""
@@ -265,6 +331,9 @@ class PmSampler:
         return _Handle(self, consumer)
 
     def _detach(self, consumer: _Consumer) -> None:
+        # [FUNCTION DOC] HELPER: Removes a consumer if registered (otherwise no-op),
+        # reconfigures the session for the reduced metric union (tearing down if none remain)
+        # and garbage collects retained samples that the leaver was pinning.
         with self._lock:
             if consumer not in self._consumers:
                 return
@@ -274,6 +343,8 @@ class PmSampler:
 
     @staticmethod
     def _union_of(consumers: list[_Consumer]) -> list[str]:
+        # [FUNCTION DOC] HELPER: Returns the de-duplicated metric names across the given
+        # consumers, preserving first-seen order. Pure function.
         seen: set[str] = set()
         union: list[str] = []
         for c in consumers:
@@ -284,6 +355,10 @@ class PmSampler:
         return union
 
     def _reconfigure(self) -> None:
+        # [FUNCTION DOC] HELPER: Brings the session in line with the consumers' metric union.
+        # No consumers: tears down. Union differs from the running set: tears down and
+        # restarts with the new metrics (in-place reconfigure is avoided as it crashes).
+        # Unchanged: does nothing. Caller holds the lock.
         desired = self._union_of(self._consumers)
         if not desired:
             self._teardown()
@@ -294,6 +369,12 @@ class PmSampler:
             self._start()
 
     def _poll_consumer(self, consumer: _Consumer) -> dict[str, Any] | None:
+        # [FUNCTION DOC] HELPER: Backs the handle poll. Under the lock, returns None if no
+        # collector is running or the consumer is unregistered. Otherwise drains the hardware
+        # ring, selects retained samples newer than the consumer's cursor and returns a
+        # mapping of start_ns, device_id and one array per consumer metric (None if no new
+        # samples). Advances the cursor to the newest returned timestamp, then garbage
+        # collects retained samples.
         # Implements _Handle.poll(): drain the HW ring, build `consumer`'s frame from the retained
         # samples newer than its cursor (sliced to its metrics) and advance its cursor, then GC.
         # Returns None if sampling is off, `consumer` isn't registered, or it has nothing new.
@@ -319,6 +400,11 @@ class PmSampler:
             return frame
 
     def _start(self) -> None:
+        # [FUNCTION DOC] HELPER: Starts a collector for the current metric union. No-op if
+        # already running or no metrics. Warns about unsupported metrics, enables a collector
+        # on this device, increments the live-collector count, then configures (interval
+        # trigger, keep-latest buffer sized from the counter-data size) and starts it. Any
+        # failure is logged as a warning (not raised); a configure/start failure tears down.
         if self._col is not None or not self._metric_names:
             return
         self._warn_unsupported()
@@ -347,6 +433,11 @@ class PmSampler:
             self._teardown()
 
     def _teardown(self) -> None:
+        # [FUNCTION DOC] HELPER: Stops and releases the collector, clears the metric names
+        # and retained samples. If a collector existed: stops it, detaches its finalizer and
+        # disables the PM sampling object (errors logged, not raised), decrements the live
+        # count and, if it reached zero, deinitializes the global CUPTI profiler once.
+        # Safe to call with no collector.
         col, self._col = self._col, None
         self._metric_names = []
         self._retained_ts = np.empty(0, dtype=np.int64)
@@ -372,6 +463,10 @@ class PmSampler:
                 logger.exception("PM sampling profiler deinit error")
 
     def _warn_unsupported(self) -> None:
+        # [FUNCTION DOC] HELPER: Logs a warning listing requested metrics whose base name (text
+        # before the first dot) is not reported by the chip. Silent if the supported set
+        # cannot be obtained or is empty. Note supported_metrics reflects the current device,
+        # which may differ from this sampler's device.
         try:
             supported = supported_metrics()
         except Exception:
@@ -387,6 +482,10 @@ class PmSampler:
             )
 
     def _check_single_pass(self, metrics: list[str]) -> None:
+        # [FUNCTION DOC] HELPER: Verifies the metrics fit in one hardware pass by building a
+        # config image on a temporary profiler host and counting passes. Raises ValueError
+        # when more than one pass is needed. If the pass count cannot be determined (any
+        # error) it silently returns, leaving enforcement to later configuration.
         try:
             host = _profiler_host.ProfilerHost(
                 _device_chip_name(self._device), _cupti.ProfilerType.PM_SAMPLING
@@ -408,6 +507,11 @@ class PmSampler:
             )
 
     def _pull_hw(self) -> None:
+        # [FUNCTION DOC] HELPER: Decodes samples from the hardware ring (up to the maximum
+        # sample count) and appends the valid ones to the retained arrays. Returns early with
+        # a logged warning/exception on decode errors or overflow, and when nothing was
+        # decoded. Drops samples with zero or int64-overflowing timestamps and those older
+        # than the look-back window relative to the newest. Mutates retained state.
         col = self._col
         if col is None:
             return
@@ -456,6 +560,9 @@ class PmSampler:
             self._retained_vals = vals
 
     def _gc(self) -> None:
+        # [FUNCTION DOC] HELPER: Discards retained samples at or below a watermark: the larger
+        # of the minimum consumer cursor and the newest timestamp minus the look-back window.
+        # No-op when nothing is retained or nothing would be dropped. Caller holds the lock.
         # Drop retained samples every consumer has passed (<= the min cursor) or that have aged past
         # the look-back window (so a consumer that stops polling can't pin the buffer). A lone,
         # caught-up consumer leaves nothing retained. Caller holds _lock.

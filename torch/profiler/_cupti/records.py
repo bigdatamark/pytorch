@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Declares which CUPTI activity fields the v2 monitor selects per activity kind. Builds, from
+# the generated field catalogs, the mappings: kind to selected fields, kind to field-id set,
+# kind to field-id-to-ctype, kind to string-field ids, kind to correlation-id field and kind
+# to graph-node-id field. Also defines the RecordLayouts type alias for captured layouts.
+# Import-time side effects: imports the cupti package (so import fails without it) and
+# computes all mappings eagerly; no I/O.
 """CUPTI user-defined-record (v2) field schema.
 
 In the v2 / user-defined-record path, observers select specific *fields* per activity
@@ -69,6 +76,9 @@ __all__ = [
 
 
 def _all_fields(catalog: type) -> tuple[Field, ...]:
+    # [FUNCTION DOC] HELPER: Collects every Field attribute defined on a generated catalog
+    # class and returns them as a tuple sorted by id (so the KIND field comes first).
+    # Args: catalog, the generated class. Returns: tuple of Field. No side effects.
     """Every :class:`Field` on a generated catalog class, in id order. ``sorted`` puts KIND
     (id 0) first, which CUPTI requires (``*_FIELD_KIND`` must lead at enable). Selecting all
     of them and letting the decoder drop fields whose captured size is not 1/2/4/8 yields

@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Offline validator for Chrome trace files written by the profiler. Defines the Violation
+# record, a loader for plain or gzip JSON traces, six rule functions (kernel launch
+# causality, stream-wait correlation id presence and ordering, stream-sync overlap, NCCL
+# metadata presence, backward sequence-number uniqueness), the ordered rule list and the
+# public validate_trace entry point. No import-time side effects beyond imports.
 """
 Validates Chrome traces emitted by ``torch.profiler`` against rules derived
 from production issues.
@@ -27,16 +33,24 @@ if TYPE_CHECKING:
 
 @dataclasses.dataclass
 class Violation:
+    # [CLASS DOC] Dataclass describing one failed rule: rule_name (the rule function that
+    # produced it) and a human-readable message. Its string form is rule name, a colon,
+    # then the message.
     """A single rule violation found in a trace."""
 
     rule_name: str
     message: str
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Returns the rule name and message joined as "name: message".
         return f"{self.rule_name}: {self.message}"
 
 
 def _load_events(path: str) -> list[dict]:
+    # [FUNCTION DOC] HELPER: Reads a trace file (gzip-decompressed if the path ends in .gz)
+    # as UTF-8 JSON. Accepts either a top-level list of events or an object with a trace
+    # events list (missing key gives empty). Returns only the entries that are mappings.
+    # Raises file or JSON decoding errors from the underlying calls.
     opener = gzip.open if path.endswith(".gz") else open
     with opener(path, "rt", encoding="utf-8") as fh:
         data = json.load(fh)
@@ -45,6 +59,10 @@ def _load_events(path: str) -> list[dict]:
 
 
 def _check_gpu_kernel_causality(events: list[dict]) -> list[Violation]:
+    # [FUNCTION DOC] HELPER: Rule. Among complete events with an External id, keeps the
+    # earliest cudaLaunchKernel runtime event and the earliest kernel event per id. For each
+    # id having both, reports a Violation if the kernel starts before the launch. Returns the
+    # violation list (empty if none). Pure; does not mutate events.
     """For each (cudaLaunchKernel, GPU kernel) pair matched by External id,
     the GPU kernel must start at or after its cudaLaunchKernel."""
     cpu_launches: dict[int, dict] = {}
@@ -91,6 +109,9 @@ def _check_gpu_kernel_causality(events: list[dict]) -> list[Violation]:
 
 
 def _check_stream_wait_corr_id_populated(events: list[dict]) -> list[Violation]:
+    # [FUNCTION DOC] HELPER: Rule. For complete events whose sync kind is Stream Wait Event or
+    # Event Sync, reports a Violation when the waited-on event-record correlation id is
+    # missing or negative. Returns the violation list. Pure.
     """Stream Wait Events and Event Synchronize must have
     wait_on_cuda_event_record_corr_id >= 0."""
     TARGET_KINDS = {"Stream Wait Event", "Event Sync"}
@@ -120,6 +141,10 @@ def _check_stream_wait_corr_id_populated(events: list[dict]) -> list[Violation]:
 
 
 def _check_stream_sync_overlap(events: list[dict]) -> list[Violation]:
+    # [FUNCTION DOC] HELPER: Rule. Collects Stream Sync events from the cuda_sync category and
+    # kernel events grouped by (device, stream). Reports a Violation for every kernel on the
+    # sync's stream that started before and ends after the sync start. Returns early with an
+    # empty list when there are no stream syncs. Pure.
     """For each Stream Synchronize on (device, stream), no kernel on that
     stream should still be running when the sync starts."""
     stream_syncs = []
@@ -184,6 +209,11 @@ _CUDA_EVENT_RECORD_NAMES = {
 
 
 def _check_stream_wait_corr_id_in_past(events: list[dict]) -> list[Violation]:
+    # [FUNCTION DOC] HELPER: Rule. Builds a map from id (both External id and correlation of
+    # event-record runtime or driver calls) to the earliest timestamp. Then for each Stream
+    # Wait Event with a non-negative referenced id, reports a Violation if no event record
+    # matches or if the record is later than the wait. Events with missing or negative ids
+    # are skipped (handled by another rule). Returns the violation list. Pure.
     """wait_on_cuda_event_record_corr_id must point to a cudaEventRecord
     with cudaEventRecord.ts <= stream_wait.ts."""
     event_record_ts: dict[int, float] = {}
@@ -251,6 +281,9 @@ _NCCL_REQUIRED_FIELDS = {
 
 
 def _check_nccl_metadata(events: list[dict]) -> list[Violation]:
+    # [FUNCTION DOC] HELPER: Rule. For complete events named record_param_comms, reports a
+    # Violation listing any required argument keys (collective name, dtype, in/out message
+    # element counts, group size) absent from the event args. Returns the violation list. Pure.
     """record_param_comms events must carry: Collective name, dtype,
     In msg nelems, Out msg nelems, Group size."""
     violations = []
@@ -273,6 +306,12 @@ def _check_nccl_metadata(events: list[dict]) -> list[Violation]:
 
 
 def _check_backward_seq_id_uniqueness(events: list[dict]) -> list[Violation]:
+    # [FUNCTION DOC] HELPER: Rule. Groups autograd engine evaluate-function events by sequence
+    # number (from the Sequence number arg, else seq_num), recording distinct backward op
+    # names (text after the first colon). Reports a Violation for each sequence number shared
+    # by more than one distinct op. Returns the violation list. Pure.
+    # KNOWN ISSUE: a Sequence number of zero is falsy, so the lookup falls through to the
+    # alternate key and zero-valued sequence numbers are usually skipped.
     """Per Sequence number, at most one distinct backward op name."""
     seq_to_ops: dict[int, list[str]] = defaultdict(list)
     for ev in events:
@@ -316,6 +355,9 @@ _RULES: list[Callable[[list[dict]], list[Violation]]] = [
 
 
 def validate_trace(trace_path: str) -> tuple[bool, list[Violation]]:
+    # [FUNCTION DOC] Loads the trace at the given path and runs every rule in the ordered rule
+    # list over its events. Returns a pair: a boolean that is true when no violations were
+    # found, and the concatenated violation list. Raises file or JSON errors from loading.
     """
     Run all validation rules against a Chrome trace JSON file.
 

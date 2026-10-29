@@ -1,4 +1,13 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Chrome-trace observer for the CUPTI activity monitor. Declares which CUPTI fields the
+# profiler selects per activity kind (GPU work, runtime/driver/overhead, external
+# correlation, optional sync, event and environment kinds), defines ProfilerObserver, which
+# buffers decoded records as named numpy column frames, joins annotations, metadata and
+# graph information, buckets frames into trace windows and writes merged gzip traces, and
+# holds per-kind column builder functions plus a table mapping kind to builder. Import-time
+# side effects: imports numpy, cupti and torch (needs cupti installed) and creates an empty
+# symbol demangle cache.
 """Chrome-trace observer for the CUPTI activity multiplexer: accumulates the monitor's
 decoded records + trace metadata into the window dict monitor_trace splices into a Kineto
 trace. Collection, annotation join, and window management live here."""
@@ -45,6 +54,8 @@ if TYPE_CHECKING:
 
 
 def _current_thread_resource_tuple() -> tuple[int, int, int]:
+    # [FUNCTION DOC] HELPER: Returns the calling thread's identity for lane naming: process
+    # id, the Python thread ident truncated to a signed 32-bit value, and the OS thread id.
     # (pid, opaque 32-bit thread id, system thread id) for trace lane naming.
     opaque_tid = ctypes.c_int32(threading.get_ident() & 0xFFFFFFFF).value
     return (os.getpid(), opaque_tid, threading.get_native_id())
@@ -54,6 +65,8 @@ _DEMANGLE_CACHE: dict[str, str] = {}
 
 
 def _demangle_symbol(name: str) -> str:
+    # [FUNCTION DOC] HELPER: Returns the demangled form of a C++ symbol name using the torch
+    # native demangler, memoized in a module-level cache that grows without bound.
     cached = _DEMANGLE_CACHE.get(name)
     if cached is None:
         cached = _DEMANGLE_CACHE[name] = torch._C._demangle(name)
@@ -240,6 +253,14 @@ ENVIRONMENT_FIELDS: dict[ActivityKind, set[Field]] = {
 
 
 class ProfilerObserver(WindowFinalizerMixin, CuptiMonitorObserver):
+    # [CLASS DOC] Monitor observer that turns CUPTI activity into Chrome-trace windows.
+    # State: a lock, timed frames (bucketed into windows by start time), untimed join frames
+    # and external metadata, a thread-resource map for lane naming, the open window start,
+    # pending windows keyed by id (start, annotations, thread map, cpu trace path, output
+    # path, built data), optional event-node recorder and PM sampling bookkeeping.
+    # Lifecycle: open_window, close_window, set_export, join. Records arrive on a worker
+    # thread (_on_activities); finalization runs on a poll thread and writing only on the
+    # foreground thread. If the monitor is unavailable the window methods mostly no-op.
     """Accumulates decoded records and exports them as chrome-trace windows. A window opens
     at trace start (:meth:`open_window`), closes at stop (:meth:`close_window`), and its
     merge + write is deferred until the records are naturally delivered -- no device sync on
@@ -257,6 +278,15 @@ class ProfilerObserver(WindowFinalizerMixin, CuptiMonitorObserver):
         enable_event_node_ids: bool = False,
         pftrace_compression_level: int = 1,
     ) -> None:
+        # [FUNCTION DOC] Builds the per-kind field selection (base profiler fields; event
+        # fields if cuda sync or event node ids are on; sync fields for cuda sync;
+        # environment fields for counters), configures the base observer with graph
+        # annotation resolution (and optional dependency recording), and if the monitor is
+        # available starts the observation window machinery (poller thread only when export
+        # is deferred) plus a graph-destroy hook for the event-node recorder. Optionally
+        # arms the event-node recorder and requests PM sampling for the given metrics (only
+        # active with metrics, CUDA available and monitor present). Args are feature flags,
+        # a metadata resolver mapping graph node id to a blob, and the pftrace gzip level.
         self._lock = threading.Lock()
         # gzip level for the native .pftrace encoder (0-9; 1 = fast, the default).
         self._pftrace_compression_level = pftrace_compression_level
@@ -348,11 +378,21 @@ class ProfilerObserver(WindowFinalizerMixin, CuptiMonitorObserver):
             self._monitor.request_pm_sampling(self.on_pm_samples, self._pm_metrics)
 
     def _boundary_clock_ns(self) -> int:
+        # [FUNCTION DOC] HELPER: Current time in nanoseconds converted to the same clock
+        # domain that decoded events use for their start times.
         # Stamp the boundary in the converted clock the events' start_ns use (convert_time
         # is monotonic, so the comparison stays order-equivalent).
         return self.convert_time(self.now_record_ns())
 
     def _on_activities(self, columns: dict[Any, dict[int, Any]]) -> None:
+        # [FUNCTION DOC] HELPER: Worker-thread callback receiving raw per-kind column maps
+        # (field id to array). Ignored when empty or when no window is open or pending.
+        # Otherwise, for each known kind, builds a named-column frame (skipping empty ones),
+        # attaches lane columns for graphed ops when a lane resolver exists and host
+        # function columns for graph host nodes, and sorts the frame into timed or
+        # untimed lists. Resolves user external ids for external-correlation frames, takes
+        # external metadata from the monitor, then appends everything to the buffers under
+        # the lock.
         # Worker thread: build a named-column frame per kind (convert/demangle/resolve while
         # the active-id chain is live) and accumulate -- but only while a window is open or
         # pending, else drop the columns no window will consume.
@@ -405,6 +445,11 @@ class ProfilerObserver(WindowFinalizerMixin, CuptiMonitorObserver):
                 self._ext_metadata.update(meta)
 
     def _resolve_user_external_ids(self, frame: dict[str, Any]) -> None:
+        # [FUNCTION DOC] HELPER: Rewrites the user external id column of an external
+        # correlation frame in place. For each external id, uses the monitor's active-id
+        # chain to find the innermost enclosing id that is a known annotation name; else
+        # keeps the raw id. No-op without a monitor or with no annotation names. Results
+        # are cached per distinct id within the call.
         """Override each EXTERNAL_CORRELATION row's ``user_external_id`` with the innermost
         ENCLOSING named-region id (via the monitor's live active-id chain), so a kernel
         nested below a named region gets that region's name. Defaults to the raw id."""
@@ -426,11 +471,15 @@ class ProfilerObserver(WindowFinalizerMixin, CuptiMonitorObserver):
         frame["user_external_id"] = np.asarray(resolved, dtype=np.int64)
 
     def push_annotation(self, name: str) -> int | None:
+        # [FUNCTION DOC] Records the calling thread for lane naming, then delegates to the
+        # base class push and returns its result (an annotation id or None).
         # Record the calling thread (for lane naming) on top of the base push.
         self._record_calling_thread()
         return super().push_annotation(name)
 
     def _record_calling_thread(self) -> None:
+        # [FUNCTION DOC] HELPER: Stores, under the lock, the mapping from the calling
+        # thread's opaque id to its OS thread id within its process entry.
         pid, opaque_tid, sys_tid = _current_thread_resource_tuple()
         with self._lock:
             self._thread_resource_map.setdefault(pid, {})[opaque_tid] = sys_tid
@@ -438,6 +487,11 @@ class ProfilerObserver(WindowFinalizerMixin, CuptiMonitorObserver):
     # --- async window API (the cupti_monitor profiler backend drives these) ----
 
     def on_pm_samples(self, frame: dict[str, Any]) -> None:
+        # [FUNCTION DOC] Monitor flush-thread hook receiving a PM sampling frame (start_ns,
+        # device_id and metric columns). Ignores empty frames. Under the lock, keeps only
+        # rows newer than the last delivered start time of their device, updates the
+        # per-device high-water marks, and appends the kept rows as a timed frame tagged
+        # pm_sampling so they bucket into windows like activity records.
         # Monitor flush-thread hook: enqueue the frame as a timed frame so each finalized window
         # slices its [start, boundary) samples (a frame spanning a boundary is split like any other
         # timed frame -- see _finalize_window). Keep only samples newer than the last per device:
@@ -460,6 +514,9 @@ class ProfilerObserver(WindowFinalizerMixin, CuptiMonitorObserver):
             self._timed_frames.append(("pm_sampling", kept))
 
     def open_window(self) -> None:
+        # [FUNCTION DOC] Starts a trace window: records the calling thread and stamps the
+        # window start with the current boundary clock; earlier records are excluded.
+        # Returns nothing.
         """Start a trace window; records before this are excluded (no prepare-phase leak)."""
         # Capture the starting thread so its RUNTIME/DRIVER records map to the OS tid
         # (matching its cpu_ops) -- else CUPTI's raw threadId lands them on a phantom lane.
@@ -468,6 +525,11 @@ class ProfilerObserver(WindowFinalizerMixin, CuptiMonitorObserver):
             self._open_start = self._boundary_clock_ns()
 
     def close_window(self) -> int | None:
+        # [FUNCTION DOC] Ends the open window. Returns None when the monitor is unavailable.
+        # Otherwise snapshots and resets annotation names, copies the thread map, marks a
+        # boundary to obtain a window id, and registers a pending window entry (start,
+        # annotations, thread map, no paths, nothing built yet). Start defaults to zero if
+        # no window was open. Returns the window id.
         """End the open window and queue it for deferred export; snapshots its annotations +
         thread map now. Pair with :meth:`set_export` for the paths. Returns the window id."""
         if not self.available:
@@ -497,6 +559,9 @@ class ProfilerObserver(WindowFinalizerMixin, CuptiMonitorObserver):
         cpu_trace_path: str | os.PathLike[str],
         output_path: str | os.PathLike[str],
     ) -> None:
+        # [FUNCTION DOC] Supplies the Kineto CPU trace path and output path for a closed
+        # window. Unknown window ids are ignored. The output path gets a gz suffix if
+        # missing. Then attempts to write the window immediately if it is already built.
         """Supply the captured Kineto CPU trace + output path for a closed window. The merged
         file is written once the window's records are covered (now, or by the poller)."""
         with self._lock:
@@ -511,6 +576,12 @@ class ProfilerObserver(WindowFinalizerMixin, CuptiMonitorObserver):
         self._maybe_write(window_id)
 
     def join(self, *, force: bool = True, timeout_s: float = 30.0) -> None:
+        # [FUNCTION DOC] Shuts the observer down. Releases PM sampling first so its tail lands
+        # in the buffers. If window machinery exists: with force, stops it with a
+        # synchronous flush; without force, waits up to timeout_s for pending boundaries to
+        # drain and falls back to a forced drain only if they remain. Then writes every
+        # still-pending window on the calling thread and closes the base observer.
+        # Intended to be idempotent.
         """Finalize + write every pending window, then unregister. Idempotent. ``force``
         (default) sync-flushes the tail, for use on the training thread. ``force=False`` (an
         off-thread finalize) must NOT flush, so it waits up to ``timeout_s`` for the poller to
@@ -542,11 +613,15 @@ class ProfilerObserver(WindowFinalizerMixin, CuptiMonitorObserver):
     # --- WindowFinalizerMixin hooks -------------------------------------------
 
     def _collect_delivered(self, *, sync: bool) -> None:
+        # [FUNCTION DOC] HELPER: Window finalizer hook. Records are built as they arrive, so
+        # this only flushes the monitor synchronously when sync is requested.
         # Events build in _on_activities as buffers arrive; only flush the tail at teardown.
         if sync and self._monitor is not None:
             self._monitor.flush(sync=True)
 
     def _window_watermark_ns(self) -> int:
+        # [FUNCTION DOC] HELPER: Window finalizer hook returning the largest start time among
+        # buffered timed frames (ignoring empty ones), or minus one if there are none.
         with self._lock:
             return max(
                 (
@@ -558,6 +633,14 @@ class ProfilerObserver(WindowFinalizerMixin, CuptiMonitorObserver):
             )
 
     def _finalize_window(self, window_id: int, boundary_ns: int) -> None:
+        # [FUNCTION DOC] HELPER: Poll-thread hook building the window data once all records
+        # up to boundary_ns are in hand. Under the lock, splits timed frames into rows in
+        # [start, boundary) (kept for the window) and rows at or after the boundary (kept
+        # buffered); rows before start are dropped. Takes all untimed join frames and
+        # external metadata. Outside the lock, concatenates by kind, attaches metadata and
+        # event-node ids, adds graph event-node spans, and resolves graph dependencies.
+        # Stores a built dict in the pending window (skipped if the window vanished).
+        # Writing is left to the foreground.
         # Poll thread: records are all in hand, so BUILD the trace-window dict (rows in
         # [start, boundary)) and drop them. Writing is foreground-only (set_export / join).
         with self._lock:
@@ -610,6 +693,11 @@ class ProfilerObserver(WindowFinalizerMixin, CuptiMonitorObserver):
             }
 
     def _maybe_write(self, window_id: int) -> None:
+        # [FUNCTION DOC] HELPER: If the window is built and has an output path, removes it
+        # from the pending table under the lock (so only one writer proceeds), merges the
+        # built data into the Kineto CPU trace writing the output file, and always tries to
+        # delete the CPU trace snapshot afterwards (ignoring OS errors). Otherwise does
+        # nothing. Errors from the merge propagate. Foreground thread only.
         # Write once the window is both built and has its paths; foreground-only. The
         # del-under-lock makes the writer single.
         with self._lock:
@@ -638,18 +726,27 @@ class ProfilerObserver(WindowFinalizerMixin, CuptiMonitorObserver):
 
 
 def _named_len(frame: dict[str, Any]) -> int:
+    # [FUNCTION DOC] HELPER: Row count of a column frame (length of its first column), or
+    # zero when it has no columns.
     for col in frame.values():
         return len(col)
     return 0
 
 
 def _slice_frame(frame: dict[str, Any], mask: Any) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Returns a new frame with every column filtered by the given
+    # boolean mask (or index selector). Does not modify the input.
     return {name: col[mask] for name, col in frame.items()}
 
 
 def _concat_frames_by_kind(
     frames: list[tuple[str, dict[str, Any]]],
 ) -> dict[str, dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Groups (kind, frame) pairs by kind and returns one frame per
+    # kind: a lone frame is passed through uncopied, several are concatenated column by
+    # column using the first frame's column names.
+    # KNOWN ISSUE: frames of one kind with differing column sets would raise a missing key
+    # error; the code assumes same-kind frames share columns.
     """Group same-kind frames and concatenate their columns (same-kind frames share a column
     set); a single frame is passed through without a copy."""
     grouped: dict[str, list[dict[str, Any]]] = {}
@@ -671,6 +768,11 @@ def _attach_metadata(
     external_metadata: dict[int, str],
     metadata_resolver: Any,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Adds an object column of metadata blobs to the kernel, memcpy
+    # and memset frames, in place. Per row, first tries the eager route (correlation id to
+    # external id to blob, restricted to external ids having a blob); on a hit stops, else
+    # tries the resolver by graph node id (nonzero only). Rows without a blob get None.
+    # No-op when there is no external metadata and no resolver.
     """Attach the per-collective blob as a ``metadata`` object column on the GPU-op kinds by
     two routes: eager ``correlation_id -> external_id -> blob`` and graph ``graph_node_id``
     via ``metadata_resolver``. Mutates ``columns`` in place; no-op when neither applies."""
@@ -716,6 +818,11 @@ def _attach_metadata(
 def _attach_event_node_ids(
     columns: dict[str, dict[str, Any]], recorder: Any, resolver: Any = None
 ) -> None:
+    # [FUNCTION DOC] HELPER: Resolves each CUDA event record to the graph event-record node
+    # it ran as. Collects (correlation id, graph node id) pairs from GPU-op frames and
+    # (correlation id, event sync id) rows from the event frame, asks the recorder module
+    # to match them, then adds graph node id (zero when unresolved) and annotation columns
+    # to the event frame in place. No-op without a recorder or event records.
     """Learn ``event_id -> graph_node_id`` from this window's launches and attach a
     ``graph_node_id`` + ``annotation`` column to the ``cuda_event`` frame. Passive: reads only
     records that already flow (never touches the events). Mutates ``columns`` in place; no-op
@@ -759,6 +866,12 @@ def _add_graph_event_node_spans(
     boundary_ns: int,
     lane_resolver: Any = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Adds a graph_event_node frame to columns built from event
+    # records resolved to a graph node whose device timestamp is within [start_ns,
+    # boundary_ns). Each row is a point span (start and end from the event frame) carrying
+    # device, context, stream, correlation, graph node and graph id (upper bits of the node
+    # id) and annotation; lane columns are attached if a lane resolver is given. No-op when
+    # the needed columns are missing or no row qualifies.
     """Derive a timed ``graph_event_node`` span frame from the resolved CUDA_EVENT records in
     this window, so graph event-record nodes render as (point) spans and become dependency-arrow
     endpoints. Keeps only rows resolved to a graph node (graph_node_id != 0) whose device
@@ -796,6 +909,10 @@ def _add_graph_event_node_spans(
 
 
 def _nearest_present_preds(resolver: Any, node: int, present: set[int]) -> list[int]:
+    # [FUNCTION DOC] HELPER: Returns the nearest predecessors of a graph node that are in the
+    # present set, by depth-first search over resolver-supplied predecessor lists, passing
+    # through absent nodes and stopping at present ones. Each node is visited once.
+    # Order of the result is unspecified. Pure.
     """Predecessors of ``node`` collapsed to the nearest ones that render as spans.
 
     Walks the recorded predecessor edges, stepping THROUGH nodes absent from ``present``
@@ -822,6 +939,9 @@ def _nearest_present_preds(resolver: Any, node: int, present: set[int]) -> list[
 def _window_graph_deps(
     resolver: Any, columns: dict[str, dict[str, Any]]
 ) -> dict[int, list[int]]:
+    # [FUNCTION DOC] HELPER: Builds a mapping from each nonzero graph node id present in the
+    # kernel, memcpy, memset, event-node and host-node frames to its nearest rendered
+    # predecessors, omitting nodes with none. Returns an empty mapping without a resolver.
     """Resolve the graph node->node dependency edges for the graph_node_ids present in this
     window, so the export can draw node->node arrows. Predecessors are collapsed through
     non-rendered nodes (see :func:`_nearest_present_preds`) so an arrow reaches the nearest node
@@ -849,6 +969,8 @@ def _window_graph_deps(
 
 
 def _demangle_column(names: Any) -> Any:
+    # [FUNCTION DOC] HELPER: Returns an object array with each symbol name demangled
+    # (through the cached demangler).
     out = np.empty(len(names), dtype=object)
     for i, raw in enumerate(names.tolist()):
         out[i] = _demangle_symbol(raw)
@@ -856,6 +978,8 @@ def _demangle_column(names: Any) -> Any:
 
 
 def _resolve_annotation_column(resolver, gnid: Any) -> Any:
+    # [FUNCTION DOC] HELPER: Returns an object array with the resolver result for each graph
+    # node id; all None (and no calls) when the resolver is None.
     """Per-row graph annotation as an object column. None resolver -> all-None column, no
     calls. The resolver is memoized per graph_node_id by the observer (see
     CuptiMonitorObserver._annotation_resolver), so distinct nodes resolve once for its
@@ -871,6 +995,9 @@ def _resolve_annotation_column(resolver, gnid: Any) -> Any:
 
 
 def _resolve_host_fn_columns(host_fns: dict[int, Any], frame: dict[str, Any]) -> Any:
+    # [FUNCTION DOC] HELPER: Looks up each row's graph node id in the host function map and
+    # returns a pair of columns: names (object array, None if unknown) and addresses
+    # (int64 array, zero if unknown).
     """Per-row (host_fn name, host_fn addr) for host-node rows, from the recorder's
     graph_node_id -> (name, addr) map (recorded at graph instantiate; host nodes carry no
     name in the CUPTI record). name is None and addr 0 for nodes not in the map."""
@@ -886,6 +1013,10 @@ def _resolve_host_fn_columns(host_fns: dict[int, Any], frame: dict[str, Any]) ->
 
 
 def _resolve_lane_columns(lane_resolver, frame: dict[str, Any]) -> Any:
+    # [FUNCTION DOC] HELPER: Returns a pair of columns (logical lane ids, lane names). Lane
+    # ids start as the stream ids; for rows with a nonzero graph node id whose resolver
+    # result is not None, both lane id and name come from the resolver. Other rows keep the
+    # stream id and a None name.
     """Per-row (logical_lane, lane_name) for graphed ops. Graphed rows (graph_node_id != 0)
     get the resolver's (lane, name), or keep their CUDA stream when it returns None; eager rows
     keep their CUDA stream and no name (the monitor names those "stream N"). The resolver is
@@ -907,6 +1038,9 @@ def _resolve_lane_columns(lane_resolver, frame: dict[str, Any]) -> Any:
 
 
 def _kernel_columns(cols, convert, resolver):
+    # [FUNCTION DOC] HELPER: Column builder for kernel records. Converts raw field arrays to
+    # a named frame: start, end and queued times via the clock converter, ids and launch
+    # configuration as int64, demangled kernel names and graph annotations via the resolver.
     gnid = cols[Kernel.GRAPH_NODE_ID.id].astype(np.int64)
     corr = cols[Kernel.CORRELATION_ID.id].astype(np.int64)
     return {
@@ -937,6 +1071,8 @@ def _kernel_columns(cols, convert, resolver):
 
 
 def _memcpy_columns(cols, convert, resolver):
+    # [FUNCTION DOC] HELPER: Column builder for memcpy records: converted times, ids, graph
+    # annotation, byte count, copy/source/destination kinds, flags and channel fields.
     gnid = cols[Memcpy.GRAPH_NODE_ID.id].astype(np.int64)
     corr = cols[Memcpy.CORRELATION_ID.id].astype(np.int64)
     return {
@@ -960,6 +1096,9 @@ def _memcpy_columns(cols, convert, resolver):
 
 
 def _memcpy2_columns(cols, convert, resolver):
+    # [FUNCTION DOC] HELPER: Column builder for peer-to-peer memcpy records. Produces the same
+    # columns as the plain memcpy builder (so frames merge under one kind) from the memcpy2
+    # field ids; source and destination device fields are not surfaced.
     # Peer-to-peer (MEMCPY2): same output columns as _memcpy_columns so the frames concatenate
     # under one "gpu_memcpy" kind; reads the MEMCPY2 field ids (src/dst device fields shift
     # correlation/graph ids). src/dst device aren't surfaced (the span on the issuing device's
@@ -987,6 +1126,8 @@ def _memcpy2_columns(cols, convert, resolver):
 
 
 def _memset_columns(cols, convert, resolver):
+    # [FUNCTION DOC] HELPER: Column builder for memset records: converted times, ids, graph
+    # annotation, byte count, fill value, memory kind, flags and channel fields.
     gnid = cols[Memset.GRAPH_NODE_ID.id].astype(np.int64)
     corr = cols[Memset.CORRELATION_ID.id].astype(np.int64)
     return {
@@ -1009,6 +1150,8 @@ def _memset_columns(cols, convert, resolver):
 
 
 def _graph_host_node_columns(cols, convert, resolver):
+    # [FUNCTION DOC] HELPER: Column builder for graph host node records: converted times, ids,
+    # graph annotation, and the process and thread ids of the host callback.
     gnid = cols[GraphHostNode.GRAPH_NODE_ID.id].astype(np.int64)
     return {
         "start_ns": convert(cols[GraphHostNode.START.id]),
@@ -1026,6 +1169,9 @@ def _graph_host_node_columns(cols, convert, resolver):
 
 
 def _api_columns(cols, convert, resolver):
+    # [FUNCTION DOC] HELPER: Column builder for runtime and driver API call records: callback
+    # id, converted start and end, process id, thread id and correlation id. The resolver
+    # argument is unused.
     del resolver
     return {
         "cbid": cols[Api.CBID.id].astype(np.int64),
@@ -1038,6 +1184,9 @@ def _api_columns(cols, convert, resolver):
 
 
 def _external_correlation_columns(cols, convert, resolver):
+    # [FUNCTION DOC] HELPER: Column builder for external correlation records: kind, external
+    # id, correlation id and a user external id column initialized to a copy of the external
+    # id (later overridden for named regions). No time conversion; other args unused.
     del convert, resolver
     external_id = cols[ExternalCorrelation.EXTERNAL_ID.id].astype(np.int64)
     return {
@@ -1051,6 +1200,9 @@ def _external_correlation_columns(cols, convert, resolver):
 
 
 def _overhead_columns(cols, convert, resolver):
+    # [FUNCTION DOC] HELPER: Column builder for CUPTI overhead records: converted start and
+    # end, correlation id, and a name column mapped from the overhead kind (falling back to
+    # a generic overhead name with the numeric kind). Resolver unused.
     del resolver
     kinds = cols[Overhead.OVERHEAD_KIND.id].astype(np.int64)
     names = np.empty(len(kinds), dtype=object)
@@ -1065,6 +1217,9 @@ def _overhead_columns(cols, convert, resolver):
 
 
 def _sync_columns(cols, convert, resolver):
+    # [FUNCTION DOC] HELPER: Column builder for synchronization records: sync type, converted
+    # start and end, context, stream, correlation, CUDA event id and event sync id.
+    # Resolver unused.
     del resolver
     return {
         "sync_type": cols[Sync.TYPE.id].astype(np.int64),
@@ -1079,6 +1234,9 @@ def _sync_columns(cols, convert, resolver):
 
 
 def _cuda_event_columns(cols, convert, resolver):
+    # [FUNCTION DOC] HELPER: Column builder for CUDA event records. Start and end are both the
+    # converted device timestamp (a point span). Also gives event sync id, correlation,
+    # device, context, stream and event id. Resolver unused.
     del resolver
     # start_ns is the event-record node's device timestamp (0 when device timestamps are off);
     # a point span (end == start). The frame stays a join input (is_timed=False); the timed
@@ -1097,6 +1255,9 @@ def _cuda_event_columns(cols, convert, resolver):
 
 
 def _environment_columns(cols, convert, resolver):
+    # [FUNCTION DOC] HELPER: Column builder for environment records: converted timestamp,
+    # device id, environment kind and the raw 64-bit data word (unsigned) which the trace
+    # merge splits per kind into counter tracks. Resolver unused.
     del resolver
     # DATA is the union's first 8 bytes (u64): the primary metric pair (e.g. POWER ->
     # power | powerLimit<<32, SPEED -> smClock | memoryClock<<32). Split by environment_kind
