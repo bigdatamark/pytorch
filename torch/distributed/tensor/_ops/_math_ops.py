@@ -1,4 +1,14 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# DTensor sharding strategies for reduction-like ops: sum/prod/max/min/mean,
+# all/any, argmax/argmin, norms, std/var, logsumexp, scans, sort/topk/median
+# family, softmax, nll_loss, layer/RMS/batch/group norm, pooling, upsampling,
+# grid sampling and linalg ops. Contains reduction placement helpers (including
+# the _NormPartial placement), op-to-reduce-name tables, and many strategy
+# functions returning lists of placement lists (output first, then inputs).
+# Import-time side effects: registers all strategies with the single-dim strategy
+# registry and installs the group-norm scalar-shape adjuster on the DTensor
+# sharding propagator (this imports DTensor at module bottom).
 # Copyright (c) Meta Platforms, Inc. and affiliates
 import math
 from collections.abc import Sequence
@@ -46,6 +56,7 @@ prims = torch.ops.prims
 
 
 class Reduction(Enum):
+    # [CLASS DOC] Enumeration of loss reduction modes: NONE (0), MEAN (1), SUM (2).
     NONE = 0
     MEAN = 1
     SUM = 2
@@ -53,6 +64,8 @@ class Reduction(Enum):
 
 @dataclass(frozen=True)
 class NormReduction:
+    # [CLASS DOC] Immutable marker describing a p-norm reduction; norm_type is the
+    # order p of the norm. Used as a reduction op descriptor instead of a string.
     norm_type: int | float
 
 
@@ -61,6 +74,10 @@ ReductionOpType = NormReduction | str
 
 @dataclass(frozen=True)
 class _NormPartial(Partial):
+    # [CLASS DOC] HELPER: Partial placement (sum reduce op) for p-norms. Local
+    # values are raised to the power p before the sum-reduction and the result is
+    # raised to 1/p afterwards. State: norm_type (default 2). Equality and hash
+    # depend on norm_type.
     """
     This placement is used for partial p-norm (p not in {inf, -inf, 0}).
 
@@ -77,12 +94,17 @@ class _NormPartial(Partial):
     norm_type: int | float = 2
 
     def __init__(self, norm_type: int | float = 2):
+        # [FUNCTION DOC] Initializes the base Partial with the sum reduce op and
+        # stores norm_type on the frozen instance by bypassing frozen assignment.
         super().__init__("sum")
         object.__setattr__(self, "norm_type", norm_type)
 
     def _partition_value(
         self, tensor: torch.Tensor, mesh: DeviceMesh, mesh_dim: int
     ) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Splits a replicated value into a per-rank partial
+        # by dividing it by the mesh dim size raised to 1/norm_type, so that the
+        # p-norm combination of all ranks recovers the original value.
         return tensor / math.pow(mesh.size(mesh_dim), 1 / self.norm_type)
 
     def _reduce_shard_value(
@@ -92,6 +114,10 @@ class _NormPartial(Partial):
         mesh_dim: int,
         shard_spec: Placement,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Reduce-scatter path: raises the tensor to the
+        # norm power, performs the base sum reduce-scatter along the given shard
+        # placement, then takes the root. Raises AssertionError if shard_spec is
+        # not a Shard.
         if not isinstance(shard_spec, Shard):
             raise AssertionError(f"Expected Shard, got {type(shard_spec)}")
         tensor = self._pre_reduce_transform(tensor)
@@ -101,32 +127,45 @@ class _NormPartial(Partial):
     def _reduce_value(
         self, tensor: torch.Tensor, mesh: DeviceMesh, mesh_dim: int
     ) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: All-reduce path: raises the tensor to the norm
+        # power, performs the base sum all-reduce over the mesh dim, then takes
+        # the root. Returns the reduced tensor.
         tensor = self._pre_reduce_transform(tensor)
         reduced_tensor = super()._reduce_value(tensor, mesh, mesh_dim)
         return self._post_reduce_transform(reduced_tensor)
 
     def _pre_reduce_transform(self, tensor: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Returns the tensor raised elementwise to norm_type.
         return tensor**self.norm_type
 
     def _post_reduce_transform(self, tensor: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Returns the tensor raised elementwise to 1/norm_type.
         return tensor ** (1.0 / self.norm_type)
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] HELPER: Equal only to another _NormPartial with the same norm_type.
         if not isinstance(other, _NormPartial):
             return False
         return self.norm_type == other.norm_type
 
     def __hash__(self) -> int:
+        # [FUNCTION DOC] HELPER: Hash derived from norm_type (offset by one).
         return 1 + hash(self.norm_type)
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: Returns the long textual form including norm_type.
         return f"_NormPartial({self.norm_type})"
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] HELPER: Returns the short textual form including norm_type.
         return f"_NormP({self.norm_type})"
 
 
 def _infer_reduction_dims(dims_arg: object, ndim: int) -> list[int] | None:
+    # [FUNCTION DOC] HELPER: Converts a reduction dims argument into a list of
+    # normalized non-negative dims. Returns None when dims_arg is None (meaning
+    # reduce all) or when the tensor is 0-d and dims_arg is one of the trivial
+    # forms zero, minus one, or empty.
     if dims_arg is None:
         return None
     dims = cast(list[int], as_list(dims_arg))
@@ -140,6 +179,10 @@ def _infer_reduction_dims(dims_arg: object, ndim: int) -> list[int] | None:
 def _infer_reduce_dims_map(
     reduction_dims: list[int], input_ndim: int, keep_dim=False
 ) -> list[int]:
+    # [FUNCTION DOC] HELPER: Builds a list with one entry per input dim giving the
+    # corresponding output dim index after the reduction, or minus one for dims
+    # that are collapsed (reduced and keep_dim false). Output indices are
+    # consecutive for surviving dims.
     reduction_dims_map = []
     new_dim_count = 0
     for input_dim in range(input_ndim):
@@ -157,6 +200,9 @@ def _infer_reduce_dims_map(
 def _replicate_dims_start_at(
     placements: Sequence[Placement], start_dim: int = 0
 ) -> tuple[Placement, ...]:
+    # [FUNCTION DOC] HELPER: Returns placements where every partial placement and
+    # every shard-like placement on a tensor dim >= start_dim becomes Replicate;
+    # all others are kept unchanged.
     new_placements: list[Placement] = []
     for p in placements:
         if p.is_partial() or (_is_shard_like(p) and p.dim >= start_dim):
@@ -172,6 +218,10 @@ def _replicate_dims_start_at(
 def _skip_dim(
     placements: tuple[Placement, ...], skipped_dim: int
 ) -> tuple[Placement, ...]:
+    # [FUNCTION DOC] HELPER: Renumbers shard dims after removing skipped_dim from
+    # the tensor: Shard and strided-shard placements on dims >= skipped_dim have
+    # their dim decreased by one (split factor preserved); others are unchanged.
+    # Precondition: no shard-like placement sits on skipped_dim itself.
     new_placements: list[Placement] = []
     for p in placements:
         if isinstance(p, _StridedShard) and p.dim >= skipped_dim:
@@ -186,6 +236,9 @@ def _skip_dim(
 def replicate_reduction_dims(
     placements: tuple[Placement, ...], reduction_dims: list[int]
 ) -> tuple[Placement, ...]:
+    # [FUNCTION DOC] Returns placements where every partial placement and every
+    # shard-like placement on one of reduction_dims becomes Replicate; other
+    # placements are kept. Used when the reduction is not linear.
     # replicate the reduction dims if not reduction_linear
     new_placements: list[Placement] = []
 
@@ -206,6 +259,12 @@ def map_placements_after_reduction(
     reduction_dims_map: list[int],
     reduction_op: ReductionOpType,
 ) -> tuple[Placement, ...]:
+    # [FUNCTION DOC] Maps input placements to output placements of a reduction.
+    # Replicate and Partial pass through. A shard-like placement on a reduced
+    # (or collapsed) dim becomes the partial placement for reduction_op; other
+    # shards are renumbered through reduction_dims_map (strided split factor
+    # kept). Raises AssertionError for a non shard-like, non replicate/partial
+    # placement.
     """
     Map each placement based on the output shape after reduction.
     """
@@ -237,6 +296,9 @@ def map_placements_after_reduction(
 
 
 def get_placement_from_reduction_op(reduction_op: ReductionOpType) -> Placement:
+    # [FUNCTION DOC] Returns the Partial placement matching a reduction op: a
+    # NormReduction of order 0 gives Partial sum, other norm orders give a
+    # _NormPartial, and a string op gives Partial with that reduce op.
     if isinstance(reduction_op, NormReduction):
         if reduction_op.norm_type == 0:
             # return P(sum) for easier reduction_linear handling.
@@ -252,6 +314,13 @@ def common_reduction_strategy(
     reduction_linear: bool = True,
     reduction_op: ReductionOpType = "sum",
 ) -> OpStrategy:
+    # [FUNCTION DOC] Builds an OpStrategy for a reduction from the input
+    # strategy. For each input option, decides if the reduction is linear (it is
+    # not for avg over unevenly shardable reduce dims, or when an input Partial
+    # has a different reduce op); if not linear, shard/partial placements on
+    # reduce dims are replicated first. Output placements come from
+    # map_placements_after_reduction; redistribute costs are computed per option.
+    # Returns the new OpStrategy.
     """
     reduction_linear means that the reduction `f` follows this rule:
         f([f(a), f(b)]) = f([a, b])
@@ -316,6 +385,13 @@ def _reduction_single_dim_strategy(
     reduction_op: ReductionOpType,
     extra_partial_rules: list[list[Placement | _ShardingPlaceholder]] | None = None,
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] HELPER: Builds single-dim placement lists [output, input]
+    # for a reduction. Non-reduced dims shard input and output (output dim
+    # shifted down by number of earlier reduced dims unless keep_dim). Reduced
+    # dims give a Partial output only if reduction_linear and op is not avg.
+    # Linear non-norm ops also get a partial-to-partial rule; extra_partial_rules
+    # are appended. reduction_dims None means all dims. Raises AssertionError if
+    # the first arg is not tensor metadata.
     """Build single-dim strategies for reduction ops.
 
     For non-reduction dims: shard input and output on that dim (with dim remapping).
@@ -447,6 +523,11 @@ def linear_reduction_single_dim_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Single-dim strategy for linear reductions (sum, prod, max,
+    # min, amax, amin, nansum and foreach max). Reads reduction dims (second arg)
+    # and keepdim (third arg) from args_schema, looks up the reduce op name for
+    # op, and delegates to _reduction_single_dim_strategy with a linear reduction.
+    # Raises AssertionError if the first arg is not tensor metadata.
     input_meta = args_schema[0]
     if not isinstance(input_meta, TensorMeta):
         raise AssertionError(f"Expected TensorMeta, got {type(input_meta)}")
@@ -472,6 +553,10 @@ def linear_reduction_single_dim_strategy(
 
 
 def _is_spec_evenly_sharded_on_dim(spec: DTensorSpec, dim: int) -> bool:
+    # [FUNCTION DOC] HELPER: Returns whether the size of tensor dim is provably
+    # divisible by the total number of shards on it (product of mesh sizes of all
+    # shard-like placements on that dim, times split factors for strided shards).
+    # Symbolic sizes that cannot be proven divisible count as false.
     shape = spec.shape
     dim = normalize_dim(dim, len(shape))
 
@@ -491,6 +576,9 @@ def _mean_full_mesh_strategy_filter(
     input_specs: list[DTensorSpec],
     output_specs: DTensorSpec | tuple[DTensorSpec | None, ...],
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Full-mesh filter for mean: returns true only if the
+    # materialized input spec is evenly sharded on every reduction dim (all dims
+    # when none given), so averaging local means is valid.
     """Reject mean strategies that would average uneven local means.
 
     mean uses Partial("avg") for shards on reduction dims. That is only correct
@@ -518,6 +606,11 @@ def mean_single_dim_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Single-dim strategy for mean. Non-reduced dims shard input
+    # and output (output dim shifted unless keepdim); reduced dims give an avg
+    # Partial output from a sharded input; also adds avg partial to avg partial.
+    # Uneven sharding is filtered later by the full-mesh filter. Raises
+    # AssertionError if the first arg is not tensor metadata.
     input_meta = args_schema[0]
     if not isinstance(input_meta, TensorMeta):
         raise AssertionError(f"Expected TensorMeta, got {type(input_meta)}")
@@ -555,6 +648,10 @@ def bool_reduction_single_dim_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Single-dim strategy for all/any: builds a non-linear
+    # reduction strategy so only non-reduced dims can be sharded. Reads dims and
+    # keepdim from args_schema. Raises AssertionError if the first arg is not
+    # tensor metadata.
     """all/any: only shard on non-reduction dims (no partial propagation)."""
     input_meta = args_schema[0]
     if not isinstance(input_meta, TensorMeta):
@@ -581,6 +678,10 @@ def _shard_non_reduction_dim(
     keep_dim: bool,
     n_outputs: int,
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] HELPER: Builds single-dim strategies where only non-reduced
+    # dims are sharded, with the output dim remapped (n_outputs identical output
+    # placements followed by the input placement). See docstring for args.
+    # Raises AssertionError if the first arg is not tensor metadata.
     """Shared logic for ops that shard on non-reduction dims with dim remapping.
 
     Used by dim-reduction ops returning (values, indices) and argmax/argmin.
@@ -625,6 +726,10 @@ def max_min_dim_single_dim_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Single-dim strategy for max.dim and min.dim (values and
+    # indices outputs). Reads the dim (second arg) and keepdim (third arg) and
+    # allows sharding only on non-reduced dims, because per-shard indices cannot
+    # be combined across ranks.
     dim = cast(int, args_schema[1])
     keep_dim = len(args_schema) > 2 and bool(args_schema[2])
     return _shard_non_reduction_dim(args_schema, dim, keep_dim, n_outputs=2)
@@ -633,6 +738,9 @@ def max_min_dim_single_dim_strategy(
 def _argmax_argmin_reduction_dims(
     args_schema: tuple[Any, ...], kwargs_schema: dict[str, Any], ndim: int
 ) -> list[int]:
+    # [FUNCTION DOC] HELPER: Returns the list of reduced dims for argmax/argmin,
+    # taking dim from keyword args first, else the second positional arg. A
+    # missing or None dim means all dims.
     if "dim" in kwargs_schema:
         dims_arg = kwargs_schema["dim"]
     elif len(args_schema) > 1:
@@ -649,6 +757,11 @@ def _argmax_argmin_full_mesh_strategy_filter(
     input_specs: list[DTensorSpec],
     _output_specs: DTensorSpec | tuple[DTensorSpec | None, ...],
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Full-mesh filter for argmax/argmin. Returns false if
+    # any input placement that is partial or shards a reduced dim would have to be
+    # retargeted to a non-replicate placement in the chosen input spec; true
+    # otherwise. Raises AssertionError if the first arg is not an OpStrategy or
+    # has no tensor meta.
     """
     Filter strategies to match the custom nonlinear-redux handler.
 
@@ -696,6 +809,11 @@ def argmax_argmin_single_dim_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Single-dim strategy for argmax/argmin: shard only on dims that
+    # are not reduced, with the output dim shifted unless keepdim. Returns an
+    # empty list (replicate only) when all dims are reduced. dim and keepdim may
+    # come from keyword or positional args. Raises AssertionError if the first
+    # arg is not tensor metadata.
     """argmax/argmin return indices only. Shard on non-reduction dims."""
     input_meta = args_schema[0]
     if not isinstance(input_meta, TensorMeta):
@@ -730,6 +848,10 @@ def _shard_except_dim_strategy(
     kwargs_schema: dict[str, Any],
     active_dim: int,
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] HELPER: For every dim except the normalized active_dim,
+    # returns a rule with n_placements identical sharding placeholders for that
+    # dim. The op and kwargs_schema arguments are unused. Raises AssertionError
+    # if the first arg is not tensor metadata.
     """Build single-dim strategies that shard on every dim except an active dim.
 
     Used by sort-like ops (sort, topk, cummax, cummin), scan ops (cumsum, cumprod,
@@ -774,6 +896,10 @@ def scan_single_dim_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Single-dim strategy for cumsum, cumprod and logcumsumexp:
+    # shard on any dim except the scan dim (same placement for input and output).
+    # For cumsum additionally allows sum-partial and avg-partial pass-through.
+    # Raises AssertionError if the dim argument is not an integer.
     dim = args_schema[1]
     if not isinstance(dim, int):
         raise AssertionError(f"Expected int, got {type(dim)}")
@@ -797,6 +923,8 @@ def global_median_single_dim_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Single-dim strategy for global median/nanmedian: returns no
+    # sharding rules, so only all-replicate is valid.
     """Global median reduces all dims — only Replicate is valid."""
     return []
 
@@ -811,6 +939,9 @@ def dim_reduction_with_indices_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Single-dim strategy for median.dim, nanmedian.dim and mode
+    # (values and indices outputs). Dim defaults to the last dim; keepdim is the
+    # third arg. Only non-reduced dims may be sharded.
     dim = cast(int, args_schema[1]) if len(args_schema) > 1 else -1
     keep_dim = len(args_schema) > 2 and bool(args_schema[2])
     return _shard_non_reduction_dim(args_schema, dim, keep_dim, n_outputs=2)
@@ -826,6 +957,9 @@ def kthvalue_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Single-dim strategy for kthvalue (values and indices
+    # outputs). Dim is the third arg (default last dim), keepdim the fourth. Only
+    # non-reduced dims may be sharded.
     dim = cast(int, args_schema[2]) if len(args_schema) > 2 else -1
     keep_dim = len(args_schema) > 3 and bool(args_schema[3])
     return _shard_non_reduction_dim(args_schema, dim, keep_dim, n_outputs=2)
@@ -841,6 +975,8 @@ def cummax_cummin_single_dim_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Single-dim strategy for cummax and cummin (two outputs plus
+    # one input): shard on any dim except the scan dim given by the second arg.
     dim = cast(int, args_schema[1])
     return _shard_except_dim_strategy(
         _SORT_LIKE_N_PLACEMENTS, op, args_schema, kwargs_schema, active_dim=dim
@@ -869,6 +1005,12 @@ def std_var_single_dim_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Single-dim strategy for std, var, var_mean and prims var.
+    # Builds a non-linear reduction strategy (shard only non-reduced dims), with
+    # keepdim taken from keyword args. If the op has several outputs or tensor
+    # keyword args (out variants), the output placement is repeated per output and
+    # keyword tensor placements are appended after the inputs. Raises
+    # AssertionError if the first arg is not tensor metadata.
     input_meta = args_schema[0]
     if not isinstance(input_meta, TensorMeta):
         raise AssertionError(f"Expected TensorMeta, got {type(input_meta)}")
@@ -907,6 +1049,10 @@ def std_var_single_dim_strategy(
 
 
 def _get_norm_reduction_op(norm_type: int | float | str) -> ReductionOpType:
+    # [FUNCTION DOC] HELPER: Maps a norm order to a reduction op: positive
+    # infinity gives max, negative infinity gives min, any other number gives a
+    # NormReduction. Raises AssertionError if the order is a non-numeric string
+    # other than the infinity names.
     """Get the reduction op for vector/foreach norm based on norm_type.
 
     For inf/-inf norms, returns simple reduction ops ("max", "min").
@@ -934,6 +1080,11 @@ def vector_norm_single_dim_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Single-dim strategy for vector norm (also registered for
+    # foreach norm). Reads order (default 2), dim and keepdim from args_schema and
+    # builds a linear reduction strategy using the norm-specific reduce op.
+    # Raises AssertionError if the first arg is not tensor metadata or the order
+    # is not int, float or str.
     """Vector norm: linear reduction with NormPartial.
 
     S(reduction_dim)->_NormPartial(ord) rules appear as false positives in
@@ -981,6 +1132,10 @@ def powsum_single_dim_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Single-dim strategy for the power-sum op (also registered for
+    # the foreach variant). Reads dim and keepdim from args_schema and builds a
+    # linear sum reduction strategy. Raises AssertionError if the first arg is not
+    # tensor metadata.
     """linalg__powsum: computes sum(|x|^ord), always reducible with Partial("sum")."""
     input_meta = args_schema[0]
     if not isinstance(input_meta, TensorMeta):
@@ -1032,6 +1187,8 @@ def linalg_replicate_single_dim_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Single-dim strategy for ops that only support replicated
+    # inputs (SVD, QR, eigh, diagonal and triangular ops): returns no rules.
     """Replicate-only ops: only the all-Replicate strategy is valid."""
     return []
 
@@ -1087,6 +1244,12 @@ def pooling_single_dim_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Single-dim strategy for avg, adaptive and max pooling ops.
+    # Every tensor output and tensor input shares one placement per rule: shard
+    # the batch dim 0 always; for average pooling also sum-partial and
+    # avg-partial; shard the channel dim 1 when the input is batched (rank at
+    # least spatial rank plus two). Raises AssertionError if the first arg is not
+    # tensor metadata.
     input_meta = args_schema[0]
     if not isinstance(input_meta, TensorMeta):
         raise AssertionError(f"Expected TensorMeta, got {type(input_meta)}")
@@ -1128,6 +1291,8 @@ def softmax_single_dim_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Single-dim strategy for softmax and log-softmax forward:
+    # shard on any dim except the softmax dim (second arg).
     softmax_dim = cast(int, args_schema[1])
     return _shard_except_dim_strategy(
         _SOFTMAX_FWD_N_PLACEMENTS,
@@ -1152,6 +1317,8 @@ def softmax_backward_single_dim_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Single-dim strategy for softmax and log-softmax backward
+    # (one output, two inputs): shard on any dim except the softmax dim (third arg).
     softmax_dim = cast(int, args_schema[2])
     return _shard_except_dim_strategy(
         _SOFTMAX_BWD_N_PLACEMENTS,
@@ -1171,6 +1338,12 @@ def nll_loss_forward_single_dim_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Single-dim strategy for nll_loss forward (output, total_weight;
+    # inputs input, target, optional weight). Shards every dim except the channel
+    # dim (dim 1, or 0 for 1-d input); target dim is remapped. Weight is always
+    # replicated. For reduction none the output follows the target and total
+    # weight is replicated; for sum both outputs are sum-partial. Mean reduction
+    # yields no sharding rules. Raises AssertionError on wrong arg count or types.
     if len(args_schema) != 5:
         raise AssertionError(f"Expected 5 args, got {len(args_schema)}")
 
@@ -1240,6 +1413,14 @@ def nll_loss_backward_single_dim_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Single-dim strategy for nll_loss backward (output grad_input;
+    # inputs grad_output, input, target, optional weight, total_weight). Shards
+    # every dim except the channel dim, remapping the target dim; weight is
+    # replicated. Reduction none: grad_output follows the target and total weight
+    # is replicated. Other reductions: grad_output is replicated, and for sum
+    # total weight may be replicated or sum-partial. For non-mean reductions an
+    # all-replicate rule with sum-partial total weight is also added. Raises
+    # AssertionError on wrong arg count or non-tensor metadata.
     if len(args_schema) != 7:
         raise AssertionError(f"Expected 7 args, got {len(args_schema)}")
     (
@@ -1339,6 +1520,10 @@ def layer_norm_single_dim_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Single-dim strategy for layer norm forward (outputs out, mean,
+    # rstd; inputs input, optional weight and bias). Shards any leading dim not
+    # covered by the normalized shape, identically for outputs and input; weight
+    # and bias, when present, are replicated.
     input_meta = args_schema[0]
     normalized_shape = args_schema[1]
     weight_meta = args_schema[2]
@@ -1373,6 +1558,9 @@ def rms_norm_single_dim_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Single-dim strategy for fused RMS norm (outputs out, rrms;
+    # inputs input, optional weight). Shards any leading dim not covered by the
+    # normalized shape; weight, when present, is replicated.
     input_meta = args_schema[0]
     normalized_shape = args_schema[1]
     weight_meta = args_schema[2]
@@ -1402,6 +1590,12 @@ def layer_norm_bwd_single_dim_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder | None]]:
+    # [FUNCTION DOC] Single-dim strategy for layer norm backward (outputs d_input,
+    # d_weight, d_bias; inputs grad_out, input, mean, rstd, optional weight and
+    # bias). For each leading non-normalized dim: d_input is sharded on that dim,
+    # d_weight and d_bias are sum-partial, and masked-off or absent outputs use
+    # no placement; grad_out, input, mean and rstd are sharded, weight and bias
+    # replicated.
     input_meta = args_schema[1]
     normalized_shape = args_schema[2]
     # mean = args_schema[3], rstd = args_schema[4]
@@ -1450,6 +1644,11 @@ def rms_norm_bwd_single_dim_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder | None]]:
+    # [FUNCTION DOC] Single-dim strategy for fused RMS norm backward (outputs
+    # d_input, d_weight; inputs grad_out, input, rstd, optional weight). For each
+    # leading non-normalized dim: d_input is sharded, d_weight is sum-partial
+    # (masked-off outputs get no placement), grad_out, input and rstd are sharded,
+    # and weight is replicated.
     input_meta = args_schema[1]
     normalized_shape = args_schema[2]
     # rstd = args_schema[3]
@@ -1489,6 +1688,8 @@ def topk_single_dim_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Single-dim strategy for topk (values and indices): shard on
+    # any dim except the topk dim (third arg, default last dim).
     topk_dim = cast(int, args_schema[2]) if len(args_schema) > 2 else -1
     return _shard_except_dim_strategy(
         _SORT_LIKE_N_PLACEMENTS, op, args_schema, kwargs_schema, active_dim=topk_dim
@@ -1505,6 +1706,8 @@ def sort_default_single_dim_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Single-dim strategy for sort (default overload): shard on any
+    # dim except the sort dim (second arg, default last dim).
     sort_dim = cast(int, args_schema[1]) if len(args_schema) > 1 else -1
     return _shard_except_dim_strategy(
         _SORT_LIKE_N_PLACEMENTS, op, args_schema, kwargs_schema, active_dim=sort_dim
@@ -1524,6 +1727,8 @@ def sort_stable_single_dim_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Single-dim strategy for stable sort: shard on any dim except
+    # the sort dim read from keyword args (default last dim).
     sort_dim = cast(int, kwargs_schema.get("dim", -1))
     return _shard_except_dim_strategy(
         _SORT_LIKE_N_PLACEMENTS, op, args_schema, kwargs_schema, active_dim=sort_dim
@@ -1540,6 +1745,10 @@ def histc_single_dim_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Single-dim strategy for histc: only when min and max are
+    # given (four args) may any input dim be sharded, producing a Partial output;
+    # otherwise returns no rules (replicate only). Raises AssertionError if the
+    # first arg is not tensor metadata.
     input_meta = args_schema[0]
     if not isinstance(input_meta, TensorMeta):
         raise AssertionError(f"Expected TensorMeta, got {type(input_meta)}")
@@ -1566,6 +1775,10 @@ def logsumexp_single_dim_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Single-dim strategy for logsumexp: reads reduction dims (second
+    # arg) and keepdim (keyword) and builds a non-linear reduction strategy, so only
+    # non-reduced dims may be sharded. Raises AssertionError if the first arg is
+    # not tensor metadata.
     input_meta = args_schema[0]
     if not isinstance(input_meta, TensorMeta):
         raise AssertionError(f"Expected TensorMeta, got {type(input_meta)}")
@@ -1620,6 +1833,8 @@ _LINALG_NUM_PLACEMENTS = {
 def _linalg_batch_dim_strategies(
     ndim: int, n_placements: int
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] HELPER: Returns one rule per batch dim (all dims except the
+    # last two), each with n_placements identical sharding placeholders.
     """Build single-dim strategies for linalg ops that operate on the last 1-2 dims.
 
     Returns sharding on each batch dim (all dims except the last 2), with all
@@ -1632,6 +1847,8 @@ def _linalg_batch_dim_strategies(
 
 
 def _get_ndim(tensor_meta: Any) -> int:
+    # [FUNCTION DOC] HELPER: Returns the rank of a tensor metadata object; raises
+    # AssertionError if the argument is not tensor metadata.
     if not isinstance(tensor_meta, TensorMeta):
         raise AssertionError(f"Expected TensorMeta, got {type(tensor_meta)}")
     return len(tensor_meta.shape)
@@ -1669,6 +1886,13 @@ def linalg_batch_dim_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Single-dim strategy for batched linalg ops (solves, LU, QR-like
+    # factorizations, det, inverse, eig, etc.). Shards every batch dim (all but the
+    # last two) with the same placement across all outputs and inputs, using the
+    # per-op placement count table. Adds partial rules for ops linear in one input
+    # (triangular solve, Cholesky solve, LU solve, LDL solve, ormqr, solve_ex).
+    # Raises AssertionError if the op is not in the table or arg 0 is not tensor
+    # metadata.
     ndim = _get_ndim(args_schema[0])
     if op not in _LINALG_NUM_PLACEMENTS:
         raise AssertionError(f"Expected op in _LINALG_NUM_PLACEMENTS, got {op}")
@@ -1720,6 +1944,9 @@ def linalg_pinv_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Single-dim strategy for pseudo-inverse: shard each batch dim
+    # (all but last two) for output and input; any present atol/rtol tensor kwargs
+    # are replicated.
     ndim = _get_ndim(args_schema[0])
     # Count optional tensor kwargs that are actually present
     extra_tensors = sum(
@@ -1749,6 +1976,8 @@ def linalg_cross_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Single-dim strategy for cross product: output and both inputs
+    # share a sharding on any dim except the cross dim (keyword dim, default last).
     ndim = _get_ndim(args_schema[0])
     cross_dim = kwargs_schema.get("dim", -1) % ndim
     strategies: list[list[Placement | _ShardingPlaceholder]] = []
@@ -1806,6 +2035,9 @@ def interp_upsample_1out_1in_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Single-dim strategy for upsample forward and backward ops
+    # (one output, one input): shard batch dim 0, shard channel dim 1, and allow
+    # sum-partial and avg-partial pass-through since upsampling is linear.
     # 1 output + 1 input = 2 placements; shard on batch (0) and channel (1)
     # Upsample is a linear transformation so Partial(sum/avg) is valid.
     return [
@@ -1829,6 +2061,9 @@ def interp_pool_1out_2in_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Single-dim strategy for max unpool and adaptive average pool
+    # backward (one output, two inputs): shard all three on batch dim 0, or all on
+    # channel dim 1.
     # 1 output + 2 inputs = 3 placements; shard on batch (0) and channel (1)
     return [
         [_ShardingPlaceholder(0)] * 3,
@@ -1845,6 +2080,10 @@ def pool_backward_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Single-dim strategy for max_pool2d backward (output plus
+    # grad_output, self, indices). Shards all on batch dim 0, and on channel dim 1
+    # for batched (4-d or more) input. Also allows sum and avg partial grad_output
+    # giving a matching partial output, with self and indices replicated.
     # max_pool2d_with_indices_backward(grad_output, self, ..., indices) -> grad_input
     # 1 output + 3 tensor inputs = 4 placements
     # Order: [output, grad_output, self, indices]
@@ -1873,6 +2112,9 @@ def grid_sampler_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Single-dim strategy for grid sampler forward (output, input,
+    # grid): shard all on batch dim 0, or sum/avg partial input to matching partial
+    # output with the grid replicated.
     # grid_sampler_{2,3}d(input[N,C,...], grid[N,...,{2,3}]) -> output[N,C,...]
     # grid has no channel dim, so only batch sharding applies to both inputs.
     # Linear in input: P(sum/avg) on input with replicated grid is valid.
@@ -1892,6 +2134,9 @@ def grid_sampler_backward_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder | None]]:
+    # [FUNCTION DOC] Single-dim strategy for grid sampler backward: one rule
+    # sharding everything on batch dim 0. The grad_input output has no placement
+    # when masked off by the output mask (arg 6); grad_grid is always sharded.
     # grid_sampler_{2,3}d_backward: 2 outputs (grad_input, grad_grid) + 3 inputs = 5 placements, batch-only
     # The native implementation only honors output_mask[0]; grad_grid is always computed.
     output_mask = args_schema[6]
@@ -1909,6 +2154,11 @@ def grid_sampler_backward_strategy(
 def _adjust_group_norm_scalars(
     input_specs: list[DTensorSpec], schema: OpSchema
 ) -> OpSchema:
+    # [FUNCTION DOC] HELPER: Scalar-shape adjuster for group norm. Computes the
+    # local shape of the sharded input and returns a new OpSchema whose N, C and
+    # HxW scalar args (located right after the tensor/None slots) are replaced by
+    # the local batch size, channel count and product of spatial sizes. Raises
+    # AssertionError if the input spec has no tensor meta.
     """Adjust N, C, HxW scalar args in native_group_norm to local values.
 
     native_group_norm(input, weight?, bias?, N, C, HxW, group, eps)
@@ -1972,6 +2222,10 @@ def batch_norm_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Single-dim strategy for batch norm forward. Returns one rule:
+    # output and input shard on channel dim 1; save_mean, save_invstd and all
+    # per-channel inputs shard on dim 0; the extra workspace output of the
+    # 4-output variant is replicated.
     # Batch norm normalizes per-channel (reduces over batch + spatial dims),
     # so channel-dim sharding is valid: each shard processes independent channels.
     # Unlike group_norm, batch_norm infers shapes from tensors (no scalar N/C/HxW).
@@ -1997,6 +2251,10 @@ def batch_norm_backward_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder | None]]:
+    # [FUNCTION DOC] Single-dim strategy for batch norm backward. Returns one rule:
+    # grad_input, grad_out and input shard on channel dim 1; grad_weight,
+    # grad_bias (None when masked off by arg 9) and the remaining per-channel
+    # tensors shard on dim 0.
     # Backward reduces over batch + spatial dims, orthogonal to the channel dim,
     # so channel sharding commutes with the op (same principle as forward).
     # Tensors are [N,C,*] -> Shard(1) or [C] -> Shard(0).
@@ -2022,6 +2280,9 @@ def group_norm_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC] Single-dim strategy for group norm. Returns one rule: the
+    # three outputs and the input shard on batch dim 0; weight and bias, when
+    # present, are replicated.
     # native_group_norm(input, weight?, bias?, N, C, HxW, group, eps) -> (out, mean, rstd)
     # Batch dim (0) is independent. The scalar N/C/HxW args are adjusted to local
     # values by _adjust_group_norm_scalars in the sharding propagation layer.
