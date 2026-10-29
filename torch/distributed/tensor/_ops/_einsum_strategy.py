@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Generates DTensor sharding strategies for einsum-style ops (matmul, bmm, etc).
+# Contains EinsumDims, which classifies the dim letters of an equation, and
+# gen_einsum_strategies, which enumerates placement combinations over a mesh.
+# No import-time side effects.
 import itertools
 from dataclasses import dataclass
 
@@ -14,6 +19,11 @@ from torch.distributed.tensor.placement_types import (
 
 @dataclass
 class EinsumDims:
+    # [CLASS DOC]
+    # Dataclass holding the dim letters of a (at most two input) einsum equation
+    # grouped by role: contracting (absent from output), batch (in all inputs
+    # and output), and lhs-only / rhs-only free dims (in output and one input).
+    # Built via the parse_equation and parse_dims classmethods.
     contracting_dims: list[str]
     batch_dims: list[str]
     lhs_out_only_dims: list[str]
@@ -21,6 +31,10 @@ class EinsumDims:
 
     @classmethod
     def parse_equation(cls, equation: str) -> tuple[list[str], str]:
+        # [FUNCTION DOC]
+        # Splits an equation of the form "ab,bc->ac" into the list of per-input
+        # dim strings and the single output dim string. Raises AssertionError if
+        # there are more than two inputs or not exactly one output. Pure function.
         # parse einop equation and extract arg specs
         """
         Parse the einsum equation str to input dim chars and output dim char
@@ -39,6 +53,12 @@ class EinsumDims:
 
     @classmethod
     def parse_dims(cls, input_dims: list[str], output_dim: str) -> "EinsumDims":
+        # [FUNCTION DOC]
+        # Classifies every distinct dim letter (visited in sorted order) as
+        # contracting (not in output), batch (in output and every input), or a
+        # free dim exclusive to the lhs or rhs input. Returns an EinsumDims.
+        # Raises AssertionError if a free dim appears with other than two inputs,
+        # and RuntimeError if a letter is in neither input (unreachable normally).
         """
         Parse the dims and extract the contracting, batch, and free dimensions
         for the left and right hand sides.
@@ -91,6 +111,14 @@ def gen_einsum_strategies(
     *,
     linearity: bool = False,
 ) -> OpStrategy:
+    # [FUNCTION DOC]
+    # Builds an OpStrategy for an einsum equation on a DeviceMesh. For one mesh
+    # dim the candidate placement lists (output first, then inputs) are: all
+    # Replicate, shard each batch dim, shard each contracting dim (output is
+    # Partial sum), shard each lhs/rhs free dim, and optionally all-Partial when
+    # linearity is True. The per-mesh-dim candidates are combined by cartesian
+    # product over mesh.ndim, each becoming an OpSpec of DTensorSpecs.
+    # Raises AssertionError via equation parsing for unsupported equations.
     """
     Generate a strategy list for the ops that follow einsum style notation.
 

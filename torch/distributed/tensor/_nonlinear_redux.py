@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Custom DTensor dispatch handlers for nonlinear reductions whose result cannot
+# be formed by combining partial results with a simple reduce: argmin, argmax
+# (argminmax_handler) and min/max with a dim argument (minmax_dim_handler). Each
+# computes a local reduction, converts local indices to global ones, all-gathers
+# values and indices across the sharded mesh dims, and picks the winner.
+# Module constant _ARGMINMAX_REDUCTION_OPS maps argmin/argmax to torch.min/max.
+# No import-time side effects other than building that mapping.
 import operator
 from functools import reduce
 from typing import cast
@@ -28,6 +36,10 @@ def _get_output_sharding(
     args: tuple[object, ...],
     kwargs: dict[str, object],
 ) -> OutputSharding:
+    # [FUNCTION DOC] HELPER: Unwraps args into an op info via the DTensor op
+    # dispatcher, runs sharding propagation on it (populating op_info), and
+    # returns the resulting OutputSharding. Raises AssertionError if propagation
+    # left output_sharding unset.
     """Get the output sharding for the given op."""
     op_info = dtensor.DTensor._op_dispatcher.unwrap_to_op_info(op_call, args, kwargs)
     dtensor.DTensor._op_dispatcher.sharding_propagator.propagate(op_info)
@@ -49,6 +61,12 @@ def _prep_arguments(
     int | None,
     bool,
 ]:
+    # [FUNCTION DOC] HELPER: Extracts the first arg as a DTensor (raises
+    # NotImplementedError otherwise), then dim and keepdim from positional args 1
+    # and 2, overridden by the dim/keepdim kwargs. Partial placements are
+    # redistributed to Replicate first (a collective). Returns the local tensor,
+    # global shape, device mesh, placements, dim (may be None) and keepdim.
+    # The op_call_repr argument is unused.
     """
     Prepare arguments for nonlinear reduction ops.
 
@@ -96,6 +114,10 @@ def _prep_arguments(
 def _get_expected_shape(
     local_tensor: torch.Tensor, dim: int | None, keepdim: bool
 ) -> torch.Size:
+    # [FUNCTION DOC] HELPER: Returns the output shape of reducing the local
+    # tensor over dim: for no dim, all-ones shape with keepdim else a scalar
+    # shape; with dim, that entry becomes 1 (keepdim) or is removed. Empty
+    # (scalar) shapes are left unchanged.
     """Compute the expected output shape after reduction."""
     input_shape = list(local_tensor.shape)
     if dim is None:
@@ -120,6 +142,10 @@ def _collect_shard_mesh_dims(
     placements: tuple[Placement, ...],
     dim: int | None,
 ) -> list[int]:
+    # [FUNCTION DOC] HELPER: Returns the mesh dims whose placement is a Shard on
+    # the reduction dim (negative dim normalized; any Shard counts when dim is
+    # None). Raises NotImplementedError naming op_call_repr if any placement is
+    # a _StridedShard.
     """Collect mesh dimensions that are sharded along the reduction dimension."""
     shard_mesh_dims: list[int] = []
     for mesh_dim, p in enumerate(placements):
@@ -138,6 +164,12 @@ def _convert_to_global_idxs(
     placements: tuple[Placement, ...],
     dim: int | None,
 ) -> tuple[int, torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Maps local indices to global indices using the
+    # local shape and global offset of this rank's shard. With a dim, the offset
+    # along dim is added and dim is the gather dim. With no dim (flat indices),
+    # each flat local index is decomposed into per-dim coordinates, offset, and
+    # recombined with global strides (avoiding unravel_index for SymInt support),
+    # and the gather dim is 0. Returns (gather_dim, global_indices).
     """Convert local indices to global indices."""
     local_shape, global_offset = compute_local_shape_and_global_offset(
         global_shape, device_mesh, placements
@@ -168,6 +200,10 @@ def _gather_tensors(
     device_mesh: "torch.distributed.device_mesh.DeviceMesh",
     shard_mesh_dims: list[int],
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] HELPER: For each sharded mesh dim in turn, all-gathers the
+    # reduced values and their global indices along gather_dim over that mesh
+    # dim's process group (collective communication). Returns the gathered
+    # values and gathered indices.
     """
     Gather the min or max of the tensors and their corresponding indices.
 
@@ -201,6 +237,14 @@ def argminmax_handler(
     args: tuple[object, ...],
     kwargs: dict[str, object],
 ) -> object:
+    # [FUNCTION DOC]
+    # Dispatch handler for argmin/argmax on a DTensor. Raises
+    # NotImplementedError for other ops. Computes local value and index
+    # reductions (scalars unsqueezed to 1-d when dim is None). If no mesh dim is
+    # sharded on the reduced dim, wraps the reshaped local index with the
+    # propagated output spec. Otherwise converts to global indices, all-gathers
+    # values and indices, finds the winning rank with the op itself, gathers the
+    # winning global index, and wraps it as a DTensor. Performs collectives.
     """
     Handler for aten.argmin.default and aten.argmax.default ops.
 
@@ -256,6 +300,13 @@ def minmax_dim_handler(
     args: tuple[object, ...],
     kwargs: dict[str, object],
 ) -> object:
+    # [FUNCTION DOC]
+    # Dispatch handler for min.dim/max.dim on a DTensor, returning a (values,
+    # indices) pair of DTensors. Raises AssertionError if dim is None. Computes
+    # local values and indices; if the reduced dim is not sharded, wraps the
+    # reshaped local results. Otherwise converts indices to global, all-gathers
+    # across the sharded mesh dims, re-applies the op to pick the winner, gathers
+    # the matching global indices, and wraps both. Performs collectives.
     """
     Handler for aten.min.dim and aten.max.dim ops.
 

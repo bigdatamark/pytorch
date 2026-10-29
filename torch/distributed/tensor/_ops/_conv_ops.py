@@ -1,4 +1,10 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
+# [MODULE DOC]
+# DTensor sharding rules for aten convolution and convolution_backward.
+# Registers legacy propagation rules (via register_prop_rule) and single-dim
+# strategies (via register_single_dim_strategy) at import time; the single-dim
+# strategies take precedence in propagation while the prop rules and custom
+# handlers in _tp_conv.py handle runtime dispatch.
 # implement matrix related ops for distributed tensor
 
 from typing import Any
@@ -31,6 +37,13 @@ aten = torch.ops.aten
 
 @register_prop_rule(aten.convolution.default)
 def convolution_rules(op_schema: OpSchema) -> OutputSharding:
+    # [FUNCTION DOC]
+    # Prop rule for aten.convolution. Reads input, weight, bias specs and the
+    # stride/padding/dilation lists from args_schema; computes the output shape
+    # (batch, out channels, spatial sizes via the standard conv formula) and a
+    # contiguous stride. The output reuses the input's dim_map, pending sums and
+    # dtype. Raises AssertionError if specs lack tensor_meta or the conv params
+    # are not lists.
     (
         input_spec,
         weight_spec,
@@ -94,6 +107,15 @@ def convolution_rules(op_schema: OpSchema) -> OutputSharding:
 
 @register_prop_rule(aten.convolution_backward.default)
 def convolution_backward_rules(op_schema: OpSchema) -> OutputSharding:
+    # [FUNCTION DOC]
+    # Prop rule for aten.convolution_backward. grad_input follows the input spec;
+    # grad_weight is a fully replicated 4-D spec with a pending sum on mesh dim 0
+    # and the weight's tensor meta; grad_bias (only if bias sizes are given) is a
+    # replicated 1-D spec with a pending sum on mesh dim 0. Returns an
+    # OutputSharding of the three specs. Raises AssertionError on bad arg types.
+    # KNOWN ISSUE: output_mask is ignored, and the spec list is not set to None
+    # for masked-out outputs (see the TODO below). The first assignment of
+    # input_spec is dead since it is overwritten by the tuple unpacking.
     input_spec = op_schema.args_schema[0]
     (
         grad_output_spec,
@@ -173,6 +195,10 @@ def _supports_last_dim_sharding(
     dilation: list[Any],
     transposed: bool,
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Returns True if the last (width) dim can be sharded:
+    # input and weight have equal rank of 3, 4 or 5, the conv is not transposed,
+    # and (checked symbolically with guard_or_false) the last padding is 0, last
+    # dilation is 1, and last stride equals the kernel size in that dim.
     ndim = len(input_meta.shape)
     return (
         ndim == len(weight_meta.shape)
@@ -190,6 +216,12 @@ def _convolution_full_mesh_strategy_filter(
     input_specs: list[DTensorSpec],
     _output_specs: DTensorSpec | tuple[DTensorSpec | None, ...],
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Filter over candidate full-mesh strategies for conv
+    # and conv_backward. Locates the input spec (index differs by op; raises
+    # AssertionError for other ops). Accepts when the input is not sharded on its
+    # last dim; rejects when the last dim is sharded over multiple mesh dims or by
+    # a non-plain (strided) Shard; otherwise accepts only if the last dim size is
+    # divisible by stride times that mesh dim's size (symbolic guard).
     if op_schema.op == aten.convolution.default:
         input_idx, stride_idx = 0, 3
     elif op_schema.op == aten.convolution_backward.default:
@@ -236,6 +268,12 @@ def convolution_single_dim_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder]]:
+    # [FUNCTION DOC]
+    # Single-dim strategy for aten.convolution. Returns placement rules over
+    # [output, input, weight, (bias if present)]: shard the batch dim of output
+    # and input with replicated weight/bias, plus (when the last dim is shardable
+    # per _supports_last_dim_sharding) shard the last dim of output and input.
+    # Raises AssertionError if input or weight metadata is not a TensorMeta.
     input_meta = args_schema[0]
     if not isinstance(input_meta, TensorMeta):
         raise AssertionError(f"Expected TensorMeta, got {type(input_meta)}")
@@ -281,6 +319,13 @@ def convolution_backward_single_dim_strategy(
     args_schema: tuple[Any, ...],
     kwargs_schema: dict[str, Any],
 ) -> list[list[Placement | _ShardingPlaceholder | None]]:
+    # [FUNCTION DOC]
+    # Single-dim strategy for aten.convolution_backward. Returns rules over
+    # [grad_input, grad_weight, grad_bias, grad_output, input, weight]: shard the
+    # batch dim of grad_input/grad_output/input, grad_weight (and grad_bias if
+    # bias sizes given, else None) as Partial sum, weight replicated; plus a
+    # last-dim sharded variant when _supports_last_dim_sharding holds. Raises
+    # AssertionError if input or weight metadata is not a TensorMeta.
     input_meta = args_schema[1]
     if not isinstance(input_meta, TensorMeta):
         raise AssertionError(f"Expected TensorMeta, got {type(input_meta)}")

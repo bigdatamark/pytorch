@@ -1,4 +1,10 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
+# [MODULE DOC]
+# Shared sharding-propagation rules for DTensor ops expressed in einsum
+# notation. Provides einop_rule (generic einsum-style propagation producing an
+# OutputSharding, either an output spec or a reshard suggestion) and
+# pointwise_rule (builds an einsum equation with broadcasting support and
+# delegates to einop_rule), plus small private helpers. No import-time side effects.
 import string
 from typing import cast
 
@@ -10,6 +16,8 @@ from torch.distributed.tensor._utils import compute_local_shape_and_global_offse
 
 
 def _replace_char_in_str(string: str, new_char: str, idx: int) -> str:
+    # [FUNCTION DOC] HELPER: Returns a copy of the string with the character at
+    # position idx replaced by new_char.
     return string[:idx] + new_char + string[idx + 1 :]
 
 
@@ -20,6 +28,12 @@ def _gen_reshard_suggestions(
     dim_to_sharding: dict[str, int],
     pending_sum: list[int],
 ) -> OutputSharding:
+    # [FUNCTION DOC] HELPER: Builds an OutputSharding with no output spec but a
+    # redistribute_schema. For each input, a new DTensorSpec is created on the
+    # same mesh from a dim map derived from dim_to_sharding (mesh dim per einsum
+    # letter), with pending_sum mesh dims as partial sums and the original
+    # tensor_meta. The resulting schema keeps the op and copies kwargs/rewrap
+    # info from op_schema via _inplace_rewrap_schema_suggestion.
     suggested_arg_specs: list[DTensorSpec] = []
     for input_dim, input_spec in zip(input_dims, input_specs):
         dim_map = [dim_to_sharding[dim] for dim in input_dim]
@@ -46,6 +60,19 @@ def einop_rule(
     linearity: bool = False,
     enforce_sharding: dict[str, int] | None = None,
 ) -> OutputSharding:
+    # [FUNCTION DOC]
+    # Propagates input DTensor shardings through an einsum-style equation (single
+    # output). Records the mesh dim sharding and size of each dim letter, merging
+    # across inputs (replicate merges into shard but flags a reshard; two
+    # different shardings raise RuntimeError). Flags a reshard when two letters
+    # land on the same mesh dim (keeping the one with largest local-size cost and
+    # replicating the others), when enforce_sharding disagrees, or when partial
+    # inputs are mixed. Partial inputs without linearity yield a reshard
+    # suggestion that removes pending sums; with linearity all inputs must be
+    # partial on the same mesh dims. Letters sharded but absent from the output
+    # become pending sums. Returns an OutputSharding holding either the output
+    # spec (built with tensor meta from the first input) or a reshard suggestion.
+    # Raises AssertionError for shape mismatches or missing tensor_meta.
     """
     Propagate the sharding of inputs to output for ops whose data moves according to einsum notation.
 
@@ -81,6 +108,10 @@ def einop_rule(
     needs_reshard = False
 
     def merge_sharding(dim: str, a: int, b: int) -> int:
+        # [FUNCTION DOC] HELPER: Merges two mesh-dim shardings (-1 means
+        # replicate) for one dim letter. Equal values are returned unchanged; a
+        # replicate merges to the sharded value and sets the enclosing
+        # needs_reshard flag; two different shards raise RuntimeError.
         # merge the sharding of inputs if it's able to merge, i.e. we can merge
         # replicate and shard to shard, but this will trigger an reshard operation
         if a != b:
@@ -230,6 +261,14 @@ def einop_rule(
 
 
 def pointwise_rule(op_schema: OpSchema, linearity: bool = False) -> OutputSharding:
+    # [FUNCTION DOC]
+    # Builds an einsum equation for a pointwise op from the input specs: dim
+    # letters are right-aligned to the highest rank (numpy broadcasting), and
+    # size-1 or missing dims get the special letter "1" so they are ignored for
+    # sharding; the output letter is "1" only if every input is singleton there.
+    # For inplace ops or out-variants, the output sharding is enforced to follow
+    # the first arg or the "out" kwarg. Delegates to einop_rule and returns its
+    # OutputSharding; linearity is passed through.
     """
     Propagate the sharding for pointwise operations.
 

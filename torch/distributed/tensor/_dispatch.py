@@ -1,4 +1,14 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
+# [MODULE DOC]
+# Python side of DTensor operator dispatch. Defines OpDispatcher (owner of the
+# ShardingPropagator, the set of random ops and the table of custom op handlers),
+# which handles sharding propagation fallbacks, local redistribution of args,
+# local computation (including RNG handling), unwrapping DTensor args to local
+# tensors and rewrapping results. The top-level entrypoint lives in C++; this
+# module handles its slow paths. Also holds custom handlers for as_strided,
+# is_same_size, is_pinned and the AMP found-inf reduction.
+# Import-time side effects: creates the module logger and wraps its setLevel so
+# changing the level re-initializes the C++ dispatch logger cache.
 import contextlib
 import logging
 import warnings
@@ -53,6 +63,9 @@ _orig_setLevel = logger.setLevel
 
 
 def _setLevel_and_reinit(level: int) -> None:
+    # [FUNCTION DOC] HELPER: Replacement for the logger's setLevel: sets the level
+    # with the original method and then resets the C++ DTensor dispatch logger
+    # so its cached debug-enabled flag stays correct.
     _orig_setLevel(level)
     torch._C._reinit_DTensor_dispatch_logger()
 
@@ -63,6 +76,10 @@ logger.setLevel = _setLevel_and_reinit  # type: ignore[method-assign]
 def _ignore_fresh_unbacked_symbols_for_dtensor_tracing(
     output_spec: object,
 ) -> contextlib.AbstractContextManager[None]:
+    # [FUNCTION DOC] HELPER: Returns a context manager. When tracing and an output
+    # spec exists, it is the symbolic-shapes context that ignores fresh unbacked
+    # symbols created while redistributing or computing the local result (they are
+    # not part of the returned DTensor contract); otherwise a no-op context.
     if not _are_we_tracing() or output_spec is None:
         return contextlib.nullcontext()
 
@@ -82,6 +99,11 @@ def _as_strided_permutation(
     size: Sequence[int],
     stride: Sequence[int],
 ) -> list[int] | None:
+    # [FUNCTION DOC] HELPER: Finds a permutation of the tensor dims whose layout
+    # equals the requested size and stride. Each requested (size, stride) pair
+    # must match exactly one unused base dim; returns the list of base dim indices,
+    # or None if ranks differ, a pair has no match, or matches are ambiguous
+    # (duplicate size/stride pairs).
     """Return dims such that ``tensor.permute(dims)`` has the requested layout.
 
     AOTAutograd regenerates an output that aliases an input by calling
@@ -116,6 +138,12 @@ def as_strided_handler(
     args: tuple[object, ...],
     kwargs: dict[str, object],
 ):
+    # [FUNCTION DOC]
+    # Custom handler for aten.as_strided on a DTensor. Fills schema defaults
+    # (AssertionError if kwargs remain). If storage_offset is None or equals the
+    # tensor's, then: identical size and stride returns an alias of the tensor;
+    # a size/stride that is a permutation of the tensor layout returns the
+    # permuted tensor. Otherwise raises RuntimeError (unsupported).
     args, kwargs = fill_defaults(op_call._schema, args, kwargs)
     if kwargs:
         raise AssertionError
@@ -134,6 +162,8 @@ def is_same_size_handler(
     args: tuple[object, ...],
     kwargs: dict[str, object],
 ) -> bool:
+    # [FUNCTION DOC] Custom handler for aten.is_same_size: compares the global
+    # shapes of the first two args and returns the boolean result.
     lhs = cast(torch.Tensor, args[0])
     rhs = cast(torch.Tensor, args[1])
     return lhs.shape == rhs.shape
@@ -144,6 +174,8 @@ def is_pinned_handler(
     args: tuple[object, ...],
     kwargs: dict[str, object],
 ) -> bool:
+    # [FUNCTION DOC] Custom handler for aten.is_pinned: returns whether the local
+    # tensor of the first (DTensor) arg is in pinned memory.
     tensor = cast(dtensor.DTensor, args[0])
     return tensor._local_tensor.is_pinned()
 
@@ -153,6 +185,13 @@ def found_inf_reduce_handler(
     args: tuple[object, ...],
     kwargs: dict[str, object],
 ) -> None:
+    # [FUNCTION DOC]
+    # Custom handler for the AMP foreach non-finite check and unscale (in place).
+    # Runs the op on the local tensors, which updates the local found_inf tensor
+    # (second arg, mutated in place). Then builds a DTensor view of that tensor
+    # whose placements are Replicate where the gradients are replicated and
+    # Partial max elsewhere, materializes it with full_tensor (a collective), and
+    # copies the globally reduced value back into the found_inf tensor. Returns None.
     op_info = dtensor.DTensor._op_dispatcher.unwrap_to_op_info(op_call, args, kwargs)
     local_tensor_args = pytree.tree_unflatten(
         cast(list[object], op_info.local_args),
@@ -193,6 +232,15 @@ def found_inf_reduce_handler(
 
 
 class OpDispatcher:
+    # [CLASS DOC]
+    # Per-process dispatcher that carries DTensor ops from interception to
+    # completion: unwraps DTensor args into an OpInfo, runs sharding propagation,
+    # redistributes local args if required, runs the local op (with RNG tracker
+    # handling for random ops) and rewraps outputs. State: sharding_propagator,
+    # _random_ops (ops needing RNG management; must match the C++ list) and
+    # _custom_op_handlers (op to handler mapping that bypasses generic dispatch).
+    # The main dispatch entrypoint is in C++, which calls back into the slow-path
+    # methods here.
     """
     Op dispatching class instance to handle args/kwargs pre-processing (un-wrapping), sharding
     propagation, redistribute local args, local compute, and post-processing (re-wrapping). It
@@ -207,6 +255,10 @@ class OpDispatcher:
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Creates the ShardingPropagator and the two lookup tables:
+        # the set of random aten ops and the mapping from special aten ops
+        # (is_same_size, is_pinned, convolution and backward, AMP found-inf,
+        # as_strided, argmin, argmax) to their custom handlers.
         self.sharding_propagator = ShardingPropagator()
         # NOTE: must stay in sync with is_random_op in
         # torch/csrc/autograd/python_variable.cpp
@@ -252,10 +304,14 @@ class OpDispatcher:
     # it as False by default.
     @property
     def _allow_implicit_replication(self) -> bool:
+        # [FUNCTION DOC] HELPER: Property getter reading the global C++ flag that
+        # lets plain tensors be treated as implicitly replicated.
         return torch._C._get_dtensor_allow_implicit_replication()
 
     @_allow_implicit_replication.setter
     def _allow_implicit_replication(self, value: bool) -> None:
+        # [FUNCTION DOC] HELPER: Property setter writing the global C++ flag (process
+        # wide state, unsafe to enable by default).
         return torch._C._set_dtensor_allow_implicit_replication(value)
 
     def _propagate_op_sharding_dispatch_slow_path(
@@ -282,6 +338,15 @@ class OpDispatcher:
         # don't have to throw an exception even in "fastpath".
         try_cache: bool,
     ) -> object:
+        # [FUNCTION DOC] HELPER: Called from C++ when its fast path cannot decide.
+        # Requires op_info.schema (AssertionError if None). Runs sharding
+        # propagation, using the cached version when try_cache is set and not
+        # tracing, else uncached, and returns the OutputSharding (without storing
+        # it on op_info); logs a debug line on a cache miss. On NotImplementedError,
+        # if the op has a CompositeImplicitAutograd kernel it is decomposed and the
+        # decomposed result returned (AssertionError if decomposition is not
+        # implemented); otherwise the error is re-raised. Any other error is
+        # re-raised as RuntimeError mentioning the schema.
         # NOTE: schema should always be populated when calling this function,
         # as it's only called from C++ after unwrap_to_op_info (create_schema=True).
         # See dispatchDTensorOp in python_variable.cpp line 1453-1460.
@@ -330,6 +395,19 @@ class OpDispatcher:
         args: tuple[object, ...],
         op_info: OpInfo,
     ) -> object:
+        # [FUNCTION DOC] HELPER: Executes the op locally after sharding propagation
+        # (called from C++). Requires op_info.output_sharding (AssertionError if
+        # None) and records output placements in the active debug mode. If this
+        # rank is in the mesh: redistributes local args when the propagation asks
+        # for it, rebuilds local args, and runs the op; random ops get a lazily
+        # created OffsetBasedRNGTracker and run inside the RNG distribute region
+        # (or via the traceable RNG higher-order op for CUDA without a user
+        # generator), popping any user generator kwarg. Non-participating ranks
+        # skip compute and instead get placeholder results: None for no output
+        # spec, empty (or zero-dim) tensors for tensor specs, a list of them for a
+        # spec sequence (NotImplementedError if any entry is None). Side effects:
+        # may set the global RNG tracker, collectives during redistribute, mutation
+        # of op_info local args/kwargs. Returns the local results.
         output_sharding = op_info.output_sharding
         if output_sharding is None:
             raise AssertionError("output sharding should not be None")
@@ -491,6 +569,10 @@ class OpDispatcher:
             else:
 
                 def default_tensor(spec: DTensorSpec) -> torch.Tensor:
+                    # [FUNCTION DOC] HELPER: Placeholder local result for a rank
+                    # outside the mesh: a zero-dim zeros tensor for scalar specs,
+                    # else an empty 1-d tensor, with the spec's dtype. Raises
+                    # RuntimeError if the spec has no tensor_meta.
                     if spec.tensor_meta is not None:
                         shape = spec.tensor_meta.shape
                         dtype = spec.tensor_meta.dtype
@@ -532,6 +614,16 @@ class OpDispatcher:
         is_inplace_op: bool,
         is_out_variant_op: bool,
     ) -> object:
+        # [FUNCTION DOC] HELPER: Finishes dispatch after local compute (called from
+        # the C++ fast path). Records output placements in debug mode. For ops with
+        # no output spec, aten.equal results are combined across ranks by an
+        # all-reduce with min (logical and) over a 0/1 tensor (collective). In-place
+        # ops return the first arg, updating its spec when placements changed (the
+        # tensor is returned with aliasing corrected); with no output spec returns
+        # None. Out variants set the spec on each out DTensor kwarg and return it
+        # (or a tuple). Otherwise (only equal is allowed, else AssertionError) wraps
+        # local results with the output spec, correcting aliasing for view ops on
+        # participating ranks.
         """
         Tail of main dispatching logic, called from C++ fast path.
         """
@@ -611,6 +703,14 @@ class OpDispatcher:
         suggested_input_schema: OpSchema,
         use_val_from_redistribute_schema: bool,
     ) -> None:
+        # [FUNCTION DOC] Static method: for each flattened arg, redistributes the
+        # local tensor from its current DTensorSpec to the suggested spec when they
+        # differ (collective communication, reported to debug mode and the explicit
+        # redistribution context); unchanged tensors are kept. Non-tensor args are
+        # kept, or taken from the suggested schema when
+        # use_val_from_redistribute_schema is set (extra suggested args beyond the
+        # originals are appended). Mutates op_info.local_args; kwargs are not
+        # resharded.
         debug_mode = get_active_debug_mode()
 
         # NOTE: it's very rare that we need to reshard kwargs so we intentionally skip it
@@ -677,6 +777,8 @@ class OpDispatcher:
         args: tuple[object, ...],
         kwargs: dict[str, object],
     ) -> OpInfo:
+        # [FUNCTION DOC] Converts a call into an OpInfo including a full OpSchema;
+        # thin wrapper over _unwrap_to_op_info_impl with create_schema True.
         return self._unwrap_to_op_info_impl(op_call, args, kwargs, True)
 
     def _unwrap_to_op_info_impl(
@@ -686,6 +788,15 @@ class OpDispatcher:
         kwargs: dict[str, object],
         create_schema: bool,
     ) -> OpInfo:
+        # [FUNCTION DOC] HELPER: Builds an OpInfo from a call. Looks up runtime
+        # schema info (regular, then single-dim strategy table) and decides whether
+        # to pytree-flatten args (op requires it or an arg is a list/tuple holding
+        # tensors). DTensor args contribute their local tensor and spec (the first
+        # one fixes the compute mesh); plain tensors become implicitly replicated
+        # specs when allowed (mesh found from args); other values pass through.
+        # Kwargs are treated the same way without flattening. Raises AssertionError
+        # if no mesh is found. Creates the OpSchema only when create_schema is
+        # True, otherwise schema is None. Returns the OpInfo.
         # get runtime schema info to determine whether to use pytree to flatten inputs
         runtime_schema_info = self.sharding_propagator.op_to_schema_info.get(
             op_call, None
@@ -699,6 +810,8 @@ class OpDispatcher:
 
         # Auto-detect needs_pytree if any arg is a list/tuple containing tensors
         def _contains_tensor(arg: object) -> bool:
+            # [FUNCTION DOC] HELPER: True if arg is a list or tuple containing at
+            # least one tensor.
             if isinstance(arg, (list, tuple)):
                 return any(isinstance(item, torch.Tensor) for item in arg)
             return False
@@ -792,6 +905,12 @@ class OpDispatcher:
 
     @staticmethod
     def wrap(res: object, spec: OutputSpecType) -> object:
+        # [FUNCTION DOC] Static method: wraps local results as DTensors. A tensor
+        # with a DTensorSpec becomes a DTensor keeping requires_grad (AssertionError
+        # if the spec is not a DTensorSpec); a tensor with no spec must be a scalar
+        # and is returned as is. Lists and tuples are wrapped element-wise against a
+        # list/tuple spec (AssertionError on mismatch), preserving the container
+        # type. Non-tensor values are returned unchanged.
         if isinstance(res, torch.Tensor):
             if spec is not None:
                 if not isinstance(spec, DTensorSpec):
@@ -827,6 +946,11 @@ class OpDispatcher:
         tensor_arg: torch.Tensor,
         compute_mesh: DeviceMesh,
     ) -> DTensorSpec:
+        # [FUNCTION DOC] HELPER: Makes a fully replicated DTensorSpec (with tensor
+        # meta from the tensor) on compute_mesh for a plain tensor arg. Allowed when
+        # the tensor has one element or implicit replication is enabled; otherwise
+        # raises RuntimeError (mixed Tensor and DTensor). Warns when a one-element
+        # tensor is not zero-dimensional.
         # util function to produce a replicate spec for a scalar tensor arg/kwarg
         if tensor_arg.numel() == 1 and tensor_arg.ndim == 1:
             warnings.warn(

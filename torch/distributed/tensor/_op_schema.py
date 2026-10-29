@@ -1,4 +1,13 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Core data structures describing DTensor operator schemas and sharding
+# strategies: OpSpec, StrategyType/OpStrategy/TupleStrategy, RuntimeSchemaInfo,
+# OpSchema, OutputSharding and OpInfo, plus type aliases (ArgsType, KwargsType,
+# PlacementList, OutputSpecType) and small helpers. They are consumed by sharding
+# propagation, strategy selection, redistribution planning and dispatch caching.
+# Import-time side effects: registers TupleStrategy as a pytree node (ignoring
+# the error if already registered); prefers the C++ pytree and falls back to
+# the Python pytree.
 """
 DTensor operator schema definitions and utilities.
 
@@ -68,6 +77,10 @@ OutputSpecType = DTensorSpec | Sequence[DTensorSpec | None] | None
 
 
 def _rebuild_tensor_from_dtensor_meta(arg) -> object:
+    # [FUNCTION DOC] HELPER: Creates an uninitialized strided tensor from the
+    # tensor_meta (shape, stride, dtype) of a DTensorSpec, on the mesh's device
+    # type. Raises AssertionError if tensor_meta is missing. Should be called
+    # under fake mode so no real memory is used.
     """
     This is used to propagate tensor metadata, must be under fake mode
     """
@@ -82,6 +95,10 @@ def _rebuild_tensor_from_dtensor_meta(arg) -> object:
 
 
 def _pretty_print_spec(spec: object) -> str:
+    # [FUNCTION DOC] HELPER: Formats a spec for display: None gives the text
+    # None, a DTensorSpec gives the concatenated placement strings, and a
+    # sequence gives a parenthesized comma-separated list of recursively formatted
+    # items. Raises RuntimeError for any other type.
     if spec is None:
         return "None"
     elif isinstance(spec, DTensorSpec):
@@ -94,6 +111,14 @@ def _pretty_print_spec(spec: object) -> str:
 
 @dataclass
 class OpSpec:
+    # [CLASS DOC]
+    # Dataclass for one acceptable sharding choice of an op: output_specs (a
+    # DTensorSpec, a tuple of optional DTensorSpecs, or None for non-tensor
+    # results), optional input_specs, and optional redistribute_cost (per tensor
+    # input, the cost of converting each producer strategy's output to the
+    # required input spec). All specs must share one DeviceMesh. Provides
+    # output_spec / mesh (cached), input_spec(index), string formatting, and
+    # hash/equality based on output_specs and input_specs only (cost ignored).
     """
     An OpSpec describes an acceptable sharding placements of an operation, with the
     specified DTensorSpecs for both the output and the inputs.
@@ -145,6 +170,9 @@ class OpSpec:
 
     @cached_property
     def output_spec(self) -> DTensorSpec:
+        # [FUNCTION DOC]
+        # Cached property returning output_specs when it is a single DTensorSpec;
+        # raises ValueError if it is a tuple or None.
         """
         This function requires that the strategy have exactly one DTensorSpec as the
         output spec. If the output_specs is a tuple, we throw an exception.
@@ -158,6 +186,11 @@ class OpSpec:
 
     @cached_property
     def mesh(self):
+        # [FUNCTION DOC]
+        # Cached property giving the DeviceMesh of this strategy: taken from the
+        # single output spec, else the first DTensorSpec in an output tuple, else
+        # the first non-None input spec. Raises ValueError for an unexpected
+        # output_specs type and AssertionError if no spec is available.
         if isinstance(self.output_specs, DTensorSpec):
             return self.output_specs.mesh
         elif isinstance(self.output_specs, tuple):
@@ -179,6 +212,9 @@ class OpSpec:
         )
 
     def input_spec(self, index: int = 0) -> DTensorSpec:
+        # [FUNCTION DOC]
+        # Returns the input DTensorSpec at the given index (default 0). Raises
+        # AssertionError if input_specs is None or the index is out of range.
         if self.input_specs is None:
             raise AssertionError("input_specs of OpSpec is None!")
         if len(self.input_specs) <= index:
@@ -189,6 +225,9 @@ class OpSpec:
         return self.input_specs[index]
 
     def __str__(self) -> str:
+        # [FUNCTION DOC]
+        # Human-readable text: input placements, an arrow, then output placements
+        # (the input part and arrow are omitted when input_specs is None).
         if self.input_specs is not None:
             input_specs_str = f"{_pretty_print_spec(self.input_specs)} -> "
         else:
@@ -197,6 +236,9 @@ class OpSpec:
         return f"{input_specs_str}{output_spec_str}"
 
     def __hash__(self) -> int:
+        # [FUNCTION DOC]
+        # Hash combining the hash of output_specs (None, single spec, or tuple)
+        # and of input_specs (0 if None or empty); redistribute_cost is excluded.
         if self.output_specs is None:
             output_hash = hash(None)
         elif isinstance(self.output_specs, DTensorSpec):
@@ -207,6 +249,9 @@ class OpSpec:
         return hash((output_hash, input_hash))
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC]
+        # Equal when other is an OpSpec with equal output_specs and input_specs
+        # (redistribute_cost is ignored).
         if not isinstance(other, OpSpec):
             return False
         return (
@@ -216,6 +261,10 @@ class OpSpec:
 
 
 class StrategyType:
+    # [CLASS DOC]
+    # Marker base class for op strategies; subclasses are OpStrategy (list of
+    # OpSpec choices for one tensor result) and TupleStrategy (independent child
+    # strategies). Has no state or methods.
     """
     Base class type for op strategy, We have two StrategyType:
         OpStrategy and TupleStrategy
@@ -223,6 +272,12 @@ class StrategyType:
 
 
 class OpStrategy(StrategyType):
+    # [CLASS DOC]
+    # A StrategyType holding the list of candidate OpSpec sharding strategies
+    # (attribute strategies) for an op producing a single tensor; all must share
+    # one DeviceMesh. Convenience properties (mesh, mesh_shape, ndim, shape,
+    # tensor_meta) read from the first strategy's output spec; hash and equality
+    # are based on the strategies list.
     """
     OpStrategy that consists of a list of sharding strategies associated with the op,
     where each strategy is an OpSpec that describes the acceptable input/output sharding.
@@ -231,10 +286,14 @@ class OpStrategy(StrategyType):
     """
 
     def __init__(self, strategies: list[OpSpec]) -> None:
+        # [FUNCTION DOC] Stores the list of OpSpec strategies (no copy).
         super().__init__()
         self.strategies: list[OpSpec] = strategies
 
     def __str__(self) -> str:
+        # [FUNCTION DOC]
+        # Text listing all strategies, suffixed with the mesh shape when it can be
+        # determined (AssertionError from mesh lookup is swallowed).
         strategy_list_str = ", ".join([str(strategy) for strategy in self.strategies])
         try:
             mesh_shape = self.mesh_shape
@@ -243,6 +302,9 @@ class OpStrategy(StrategyType):
         return f"OpStrategy[{strategy_list_str}] @ mesh: {mesh_shape}"
 
     def max_num_shards(self) -> int:
+        # [FUNCTION DOC]
+        # Returns the largest num_shards among the output specs of all strategies.
+        # Requires every strategy to have a single DTensorSpec output.
         """
         Returns the max number of shards across all OpSpecs
         """
@@ -250,35 +312,49 @@ class OpStrategy(StrategyType):
 
     @property
     def mesh(self):
+        # [FUNCTION DOC] Property: DeviceMesh of the first strategy.
         return self.strategies[0].mesh
 
     @property
     def mesh_shape(self):
+        # [FUNCTION DOC] Property: shape of the first strategy's DeviceMesh.
         return self.strategies[0].mesh.shape
 
     @property
     def ndim(self):
+        # [FUNCTION DOC] Property: tensor rank of the first strategy's output spec.
         return self.strategies[0].output_spec.ndim
 
     @property
     def shape(self):
+        # [FUNCTION DOC] Property: global tensor shape of the first strategy's output spec.
         return self.strategies[0].output_spec.shape
 
     @property
     def tensor_meta(self) -> TensorMeta:
+        # [FUNCTION DOC] Property: TensorMeta of the first strategy's output spec;
+        # raises AssertionError if it is missing.
         # TODO upstream this assert to DTensorSpec itself and fill any missing TensorMetas
         if self.strategies[0].output_spec.tensor_meta is None:
             raise AssertionError
         return self.strategies[0].output_spec.tensor_meta
 
     def __hash__(self) -> int:
+        # [FUNCTION DOC] Hash of the tuple of strategies.
         return hash(tuple(self.strategies))
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] Equal when other is an OpStrategy with equal strategies lists.
         return isinstance(other, OpStrategy) and self.strategies == other.strategies
 
 
 class TupleStrategy(StrategyType):
+    # [CLASS DOC]
+    # A StrategyType holding a sequence of child strategies (attribute children)
+    # for ops, such as foreach ops, whose tuple/list elements are sharded
+    # independently. Registered as a pytree node (flatten to children). Offers a
+    # deprecated alias property for children, child_mesh lookup, and hash/equality
+    # based on children.
     """
     TupleStrategy is a special case for operators that are fundamentally compound or batched such that some subset
     of the inputs and outputs are completely unrelated to some other subset.
@@ -298,6 +374,7 @@ class TupleStrategy(StrategyType):
         self,
         children: Sequence[StrategyType],
     ) -> None:
+        # [FUNCTION DOC] Stores the sequence of child strategies (no copy).
         super().__init__()
         self.children: Sequence[StrategyType] = children
 
@@ -307,27 +384,34 @@ class TupleStrategy(StrategyType):
         category=FutureWarning,
     )
     def childs(self) -> Sequence[StrategyType]:  # codespell:ignore childs
+        # [FUNCTION DOC] Deprecated property alias returning children; emits a
+        # FutureWarning on access.
         """
         Alias for children, to maintain backward compatibility.
         """
         return self.children
 
     def child_mesh(self, index: int) -> DeviceMesh:
+        # [FUNCTION DOC] Returns the DeviceMesh of the child at index; raises
+        # AssertionError if that child is not an OpStrategy.
         op_strategy = self.children[index]
         if not isinstance(op_strategy, OpStrategy):
             raise AssertionError
         return op_strategy.mesh
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Text of the form TupleStrategy(...) listing the children.
         child_strategies_str = ", ".join(
             [f"{str(strat)}" for idx, strat in enumerate(self.children)]
         )
         return f"TupleStrategy({child_strategies_str})"
 
     def __hash__(self) -> int:
+        # [FUNCTION DOC] Hash of the tuple of children.
         return hash(tuple(self.children))
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] Equal when other is a TupleStrategy with equal children.
         return isinstance(other, TupleStrategy) and self.children == other.children
 
 
@@ -344,6 +428,11 @@ except ValueError:
 
 @dataclass
 class RuntimeSchemaInfo:
+    # [CLASS DOC]
+    # Dataclass of per-op runtime hints: static_argnum (index from which args are
+    # hashed into the sharding cache key, default 100 meaning effectively none),
+    # static_kwargkey (kwarg names that affect sharding propagation), and
+    # needs_pytree (whether eager execution must flatten/unflatten args).
     """
     RuntimeSchemaInfo stores the operator schema related information for runtime (eager)
     execution. This is mainly used for two ways: 1. to generate hash for args to determine
@@ -365,6 +454,13 @@ class RuntimeSchemaInfo:
 
 @dataclass
 class OpSchema:
+    # [CLASS DOC]
+    # Read-only (by convention) dataclass describing one intercepted op call for
+    # sharding propagation: the op overload, args_schema and kwargs_schema (DTensor
+    # args replaced by DTensorSpec or OpStrategy, other args kept in order),
+    # optional RuntimeSchemaInfo, and a lazily computed comparison key used for
+    # hashing/equality and sharding cache lookup. Provides helpers to view spec
+    # args, detect inplace/out ops, rewrap suggestions, and compare schemas.
     """
     OpSchema is a data class that describes an operator input schemas, it includes
     DTensorSpecs/OpStrategies (instead of DTensor) and non-tensor args/kwargs (positional
@@ -392,6 +488,8 @@ class OpSchema:
 
     @property
     def args_spec(self) -> tuple[DTensorSpec, ...]:
+        # [FUNCTION DOC]
+        # Property returning the DTensorSpecs found among the positional args.
         """
         args_spec: Tuple[DTensorSpec, ...]: contains a clean list of args spec list
             with NO non-DTensor positional arguments (i.e. int/float/tuple, etc)
@@ -406,6 +504,9 @@ class OpSchema:
 
     @property
     def args_strategy(self) -> tuple[OpStrategy, ...]:
+        # [FUNCTION DOC] Property: the OpStrategy items among the positional args
+        # (flattened by pytree first when schema_info.needs_pytree), skipping
+        # non-strategy values.
         # filter out non-relevant values from args schema to get a clean OpStrategy list
         # separate with args_spec for the ease of type annotation
         # TODO: see if we should merge this with args_spec
@@ -418,6 +519,8 @@ class OpSchema:
 
     @property
     def kwargs_strategy(self) -> tuple[OpStrategy, ...]:
+        # [FUNCTION DOC] Property: the OpStrategy items among the kwargs values
+        # (pytree-flattened when schema_info.needs_pytree).
         # returns OpStrategy items from kwargs_schema.
         kwargs_vals = (
             tree_leaves(self.kwargs_schema)
@@ -428,6 +531,10 @@ class OpSchema:
 
     @property
     def args_meta(self) -> tuple[TensorMeta | Any, ...]:
+        # [FUNCTION DOC] Property: copy of args_schema with each OpStrategy replaced
+        # by its TensorMeta and each TupleStrategy by a tuple of converted children,
+        # recursing into lists and tuples (type preserved); other values unchanged.
+        # Used for single-dim strategy functions that must not see specs or meshes.
         # Used for calling single_dim strategy functions, which aren't allowed to see DTensorSpecs/Meshes
         # like args_spec, but has OpStrategy replaced with corresponding TensorMeta,
         # and TupleStrategy replaced with tuple of TensorMeta
@@ -437,6 +544,8 @@ class OpSchema:
         # args_meta: (TensorMeta1, (TensorMeta2, TensorMeta3), TensorMeta4)
 
         def convert_to_meta(item):
+            # [FUNCTION DOC] HELPER: Recursively replaces strategies with tensor
+            # metadata (see args_meta); other values are returned as is.
             if isinstance(item, OpStrategy):
                 return item.tensor_meta
             elif isinstance(item, TupleStrategy):
@@ -451,9 +560,13 @@ class OpSchema:
 
     @property
     def kwargs_meta(self) -> dict[str, object]:
+        # [FUNCTION DOC] Property: like args_meta but for kwargs_schema, returning a
+        # mapping from kwarg name to converted value.
         # like args_meta, but for kwargs
 
         def convert_to_meta(item):
+            # [FUNCTION DOC] HELPER: Recursively replaces strategies with tensor
+            # metadata (see args_meta); other values are returned as is.
             if isinstance(item, OpStrategy):
                 return item.tensor_meta
             elif isinstance(item, TupleStrategy):
@@ -469,6 +582,8 @@ class OpSchema:
         }
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Debug text showing the op, str of each positional arg
+        # schema, and the kwargs_schema.
         args_schema = ", ".join([str(arg_schema) for arg_schema in self.args_schema])
         return (
             f"OpSchema(op={self.op},"
@@ -477,6 +592,12 @@ class OpSchema:
         )
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Readable text: op name, formatted args (specs as-is,
+        # single-strategy OpStrategy via its output placements, others via str),
+        # and the mesh of the last mesh-bearing arg. Raises AssertionError if an
+        # OpStrategy arg has other than one strategy or a TupleStrategy's first
+        # child is not an OpStrategy.
+        # KNOWN ISSUE: the returned text has an unbalanced closing parenthesis.
         args_schema: list[str] = []
         device_mesh = None
 
@@ -501,9 +622,13 @@ class OpSchema:
         return f"{self.op}({', '.join(args_schema)}) on {device_mesh})"
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC] Dataclass hook delegating to the C++ post-init helper,
+        # which initializes derived state such as the comparison key.
         _DTensor_OpSchema_post_init(self)
 
     def arg_type_tensor_or_tensor_list_like(self, arg: object) -> bool:
+        # [FUNCTION DOC] True if arg is a DTensorSpec, or a list whose elements are
+        # all DTensorSpec or None; False otherwise.
         is_tensor = isinstance(arg, DTensorSpec)
         if is_tensor:
             return True
@@ -514,6 +639,8 @@ class OpSchema:
         return all(isinstance(e, DTensorSpec) or e is None for e in arg)
 
     def return_type_tuple_tensor_like(self) -> bool:
+        # [FUNCTION DOC] True if the op schema has more than one return and the
+        # first return is a Tensor.
         # all dispatch ops could only return Tuple[Tensor] or have None/ints/floats
         # in the tuple, but the first element must be a Tensor, so this check is enough
         return_types = self.op._schema.returns
@@ -522,6 +649,8 @@ class OpSchema:
         )
 
     def return_type_list_tensor_like(self) -> bool:
+        # [FUNCTION DOC] True if the op schema has exactly one return and it is a
+        # list type.
         # returns True if the return type is a List
         return_types = self.op._schema.returns
         return len(return_types) == 1 and isinstance(
@@ -529,6 +658,8 @@ class OpSchema:
         )
 
     def return_type_tensor(self) -> bool:
+        # [FUNCTION DOC] True if the op schema has at least one return and the
+        # first return is a Tensor.
         return_types = self.op._schema.returns
         # all dispatch ops only return Tensor or Tuple[Tensor] for tensor like
         # return types, so this check is enough for tensor like types
@@ -537,6 +668,12 @@ class OpSchema:
         )
 
     def get_mesh_from_args(self, validate: bool = True) -> DeviceMesh:
+        # [FUNCTION DOC] Finds the DeviceMesh from the first DTensorSpec or
+        # OpStrategy in args_schema, scanning into lists, tuples and
+        # TupleStrategy children. Raises ValueError if none is found. When
+        # validate is True, every later top-level spec/strategy arg must use the
+        # same mesh, else RuntimeError (cross-mesh op). Nested elements are not
+        # validated.
         """
         This util can be used to get a mesh from the OpSchema that contains multiple
         DTensors as arguments. When `validate` is True, it will try to validate that all the
@@ -580,26 +717,35 @@ class OpSchema:
         return mesh
 
     def is_inplace_op(self) -> bool:
+        # [FUNCTION DOC] Heuristic: True if the op schema name ends with an
+        # underscore.
         # simple analysis of function schema to determine
         # if this is an inplace variant, it might not
         # be entirely correct, but it's good enough for now.
         return self.op._schema.name[-1] == "_"
 
     def is_out_variant_op(self) -> bool:
+        # [FUNCTION DOC] True if any argument of the op schema is an out argument.
         # simple analysis of function schema to determine
         # if this is an out variant.
         return any(argument.is_out for argument in self.op._schema.arguments)
 
     def is_view_op(self) -> bool:
+        # [FUNCTION DOC] True if the op schema reports itself as a view op.
         return self.op._schema._is_view_op()
 
     def _recompute_comparison_key(self) -> None:
+        # [FUNCTION DOC] HELPER: Delegates to the C++ helper to rebuild the cached
+        # comparison key used for hashing and equality after args change.
         _DTensor_OpSchema_recompute_comparison_key(self)
 
     def __hash__(self) -> int:
+        # [FUNCTION DOC] Hash of the precomputed comparison key.
         return hash(self._comparison_key)
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] Equal when other is an OpSchema with the same op, the same
+        # number of positional args, and equal comparison keys.
         # early return checks
         if not isinstance(other, OpSchema):
             return False
@@ -613,6 +759,9 @@ class OpSchema:
         return self._comparison_key == other._comparison_key
 
     def gen_fake_args(self) -> ArgsType:
+        # [FUNCTION DOC] Returns args_schema with every DTensorSpec replaced by an
+        # empty strided tensor built from its tensor_meta (AssertionError if
+        # missing); intended for use under fake mode.
         """
         gen_fake_args: generate fake args for the operator, this is mainly used
             by sharding propagation rules to generate fake args for the operator
@@ -626,6 +775,7 @@ class OpSchema:
         )
 
     def gen_fake_kwargs(self) -> KwargsType:
+        # [FUNCTION DOC] Same as gen_fake_args but for kwargs_schema.
         """
         gen_fake_kwargs: generate fake kwargs for the operator, this is mainly used
             by sharding propagation rules to generate fake kwargs for the operator
@@ -639,6 +789,11 @@ class OpSchema:
         )
 
     def _inplace_rewrap_schema_suggestion(self, origin_schema: "OpSchema") -> None:
+        # [FUNCTION DOC] HELPER: Mutates this schema (whose args hold the suggested
+        # DTensorSpecs) so its args_schema follows the origin schema layout: each
+        # DTensorSpec position in the origin (pytree-flattened if needed) takes the
+        # next suggested spec in order and other args are copied. kwargs_schema is
+        # taken from the origin and the comparison key is recomputed.
         suggestion_args_spec = self.args_spec
         new_arg_schema: list[object] = []
         idx_of_args_spec = 0
@@ -662,6 +817,12 @@ class OpSchema:
 
 @dataclass
 class OutputSharding:
+    # [CLASS DOC]
+    # Result of sharding propagation: output_spec (DTensorSpec, sequence of
+    # optional specs, or None) on success, or a redistribute_schema describing the
+    # input specs to redistribute to first (with needs_redistribute and
+    # use_val_from_redistribute_schema flags). The mesh property derives the
+    # DeviceMesh from the output spec.
     """
     OutputSharding is a data class that is used by the sharding propagation,
     it could set the output_spec upon successful propagation. If needs_redistribute
@@ -683,6 +844,10 @@ class OutputSharding:
 
     @cached_property
     def mesh(self):
+        # [FUNCTION DOC] Cached property: mesh of the single output spec, or of the
+        # first element when output_spec is a tuple. Raises ValueError if the spec
+        # (or first tuple element) is not a DTensorSpec, including when None or a
+        # non-tuple sequence.
         if isinstance(self.output_spec, DTensorSpec):
             return self.output_spec.mesh
         elif isinstance(self.output_spec, tuple):
@@ -697,6 +862,11 @@ class OutputSharding:
 
 @dataclass
 class OpInfo:
+    # [CLASS DOC]
+    # Dataclass bundling runtime execution info for one DTensor op call:
+    # compute_mesh (first mesh among args), schema (OpSchema, None on the C++
+    # cached fast path), flat_args_schema, local_args, local_kwargs, optional
+    # args_tree_spec, and the output_sharding once propagation has run.
     """
     All Runtime Op execution info are packed here
     """
