@@ -1,5 +1,13 @@
 # mypy: allow-untyped-defs
 # mypy: disable-error-code=arg-type
+# [MODULE DOC] ONNX symbolic functions for opset 11 of the TorchScript exporter. Registers
+#   (through the opset-11 registration partial) converters from aten and prim ops to ONNX
+#   nodes: clamp family, hardtanh, relu6, select/gather/scatter, index_put/index/masked ops,
+#   cumsum, tensor-list (Sequence) ops such as append/insert/pop/cat/stack/split/unbind/len,
+#   sort/topk/unique, padding, arange, size/squeeze/unsqueeze, im2col, shifts, flatten,
+#   embedding_bag/renorm, chunk, normal, atleast_Nd and hstack/vstack. Many functions delegate
+#   to opset9 or opset10 versions. Import time: defines the registration partial; decorators
+#   add entries to the global symbolic registry.
 """This file exports ONNX ops for opset 11."""
 
 from __future__ import annotations
@@ -98,6 +106,9 @@ _onnx_symbolic = functools.partial(registration.onnx_symbolic, opset=11)
 @symbolic_helper.quantized_args(True)
 @symbolic_helper.parse_args("v", "f", "f")
 def hardtanh(g: jit_utils.GraphContext, self: _C.Value, min_val: float, max_val: float):
+    # [FUNCTION DOC] Symbolic for aten::hardtanh. Emits a Clip node with constant min and max
+    #   created in the input scalar type (float by default), adding casts when the opset needs
+    #   them (before opset 12 Clip requires floats). Returns the clipped value.
     scalar_type = _type_utils.JitScalarType.from_value(
         self, _type_utils.JitScalarType.FLOAT
     )
@@ -116,7 +127,13 @@ def hardtanh(g: jit_utils.GraphContext, self: _C.Value, min_val: float, max_val:
 
 @_onnx_symbolic("aten::clamp")
 def clamp(g: jit_utils.GraphContext, self, min, max):
+    # [FUNCTION DOC] Symbolic for aten::clamp. Casts non-none min and max to the input type
+    #   when it is known, then dispatches: only max set uses clamp_max, only min set uses
+    #   clamp_min, two scalars emit Clip, otherwise clamp_min followed by clamp_max (tensor
+    #   bounds). Returns the clamped value.
     def _cast_if_not_none(tensor, dtype):
+        # [FUNCTION DOC] HELPER: Casts a non-none tensor to the ONNX type of dtype; none
+        #   values are returned as is.
         if tensor is not None and not symbolic_helper._is_none(tensor):
             return g.op(
                 "Cast",
@@ -152,6 +169,9 @@ def clamp(g: jit_utils.GraphContext, self, min, max):
 @_onnx_symbolic("aten::clamp_min")
 @symbolic_helper.parse_args("v", "v")
 def clamp_min(g: jit_utils.GraphContext, self, min):
+    # [FUNCTION DOC] Symbolic for aten::clamp_min. Casts min to the input type; a scalar min
+    #   uses Clip with an unused max slot, a tensor min uses an elementwise Max. Returns the
+    #   result.
     min = g.op("Cast", min, to_i=_type_utils.JitScalarType.from_value(self).onnx_type())
     if symbolic_helper._get_tensor_rank(min) == 0:
         max = opset9.unused(g)
@@ -167,6 +187,9 @@ def clamp_min(g: jit_utils.GraphContext, self, min):
 @_onnx_symbolic("aten::clamp_max")
 @symbolic_helper.parse_args("v", "v")
 def clamp_max(g: jit_utils.GraphContext, self, max):
+    # [FUNCTION DOC] Symbolic for aten::clamp_max. Casts max to the input type; a scalar max
+    #   uses Clip with an unused min slot, a tensor max uses an elementwise Min. Returns the
+    #   result.
     max = g.op("Cast", max, to_i=_type_utils.JitScalarType.from_value(self).onnx_type())
     if symbolic_helper._get_tensor_rank(max) == 0:
         min = opset9.unused(g)
@@ -181,6 +204,8 @@ def clamp_max(g: jit_utils.GraphContext, self, max):
 
 @_onnx_symbolic("aten::relu6")
 def relu6(g: jit_utils.GraphContext, input):
+    # [FUNCTION DOC] Symbolic for aten::relu6. Implemented as clamp between constants 0 and 6
+    #   in the input scalar type (float if unknown).
     scalar_type = _type_utils.JitScalarType.from_value(
         input, _type_utils.JitScalarType.FLOAT
     )
@@ -200,6 +225,8 @@ def relu6(g: jit_utils.GraphContext, input):
 @symbolic_helper.quantized_args(True)
 @symbolic_helper.parse_args("v", "i", "v")
 def select(g: jit_utils.GraphContext, self, dim, index):
+    # [FUNCTION DOC] Symbolic for aten::select. Emits Gather along dim with the index; opset
+    #   11 Gather accepts negative indices so no adjustment is made.
     return g.op("Gather", self, index, axis_i=dim)
 
 
@@ -207,6 +234,14 @@ def select(g: jit_utils.GraphContext, self, dim, index):
 def index_put(
     g: jit_utils.GraphContext, self, indices_list_value, values, accumulate=False
 ):
+    # [FUNCTION DOC] Symbolic for aten::index_put. Unpacks the list of indices (empty list
+    #   returns values). Multiple indices are broadcast and concatenated into one ScatterND
+    #   index (boolean ones via NonZero). A single boolean index becomes masked_fill (scalar
+    #   values) or masked_scatter (otherwise, unsqueezing the mask to the input rank); a
+    #   single integer index is unsqueezed. Values are expanded/reshaped to the update shape
+    #   and cast to the input type. With accumulate, scatters onto zeros and adds to self;
+    #   else ScatterND onto self. Raises SymbolicValueError when accumulate is set and self
+    #   has no known scalar type.
     if symbolic_helper._is_packed_list(indices_list_value):
         indices_list = symbolic_helper._unpack_list(indices_list_value)
     else:
@@ -330,6 +365,8 @@ def index_put(
 @_onnx_symbolic("aten::pixel_shuffle")
 @symbolic_helper.parse_args("v", "i")
 def pixel_shuffle(g: jit_utils.GraphContext, self, upscale_factor):
+    # [FUNCTION DOC] Symbolic for aten::pixel_shuffle. Emits DepthToSpace in CRD mode with
+    #   blocksize upscale_factor; reports unimplemented if the known rank is not 4.
     rank = symbolic_helper._get_tensor_rank(self)
     if rank is not None and rank != 4:
         return symbolic_helper._unimplemented("pixel_shuffle", "only support 4d input")
@@ -365,6 +402,9 @@ def pixel_shuffle(g: jit_utils.GraphContext, self, upscale_factor):
     decorate=[symbolic_helper._apply_params("upsample_bicubic2d", 4, "cubic")],
 )
 def _interpolate(name: str, dim: int, interpolate_mode: str):
+    # [FUNCTION DOC] HELPER: Factory registered for the upsample_* ops (including bicubic).
+    #   Args: name, dim, interpolate_mode. Returns the symbolic function built by the shared
+    #   interpolate helper.
     return symbolic_helper._interpolate_helper(name, dim, interpolate_mode)
 
 
@@ -380,6 +420,9 @@ def __interpolate(
     recompute_scale_factor,
     antialias,
 ):
+    # [FUNCTION DOC] Symbolic for aten::__interpolate. Delegates to the shared helper with
+    #   size, scale_factor, mode, align_corners and recompute_scale_factor; antialias is
+    #   ignored.
     return symbolic_helper.__interpolate_helper(
         g, input, size, scale_factor, mode, align_corners, recompute_scale_factor
     )
@@ -389,6 +432,8 @@ def __interpolate(
 @symbolic_helper.quantized_args(True)
 @symbolic_helper.parse_args("v", "i", "v", "v")
 def gather(g: jit_utils.GraphContext, self, dim, index, sparse_grad=False):
+    # [FUNCTION DOC] Symbolic for aten::gather. Emits GatherElements along dim. Reports
+    #   unimplemented if sparse_grad is true.
     if symbolic_helper._maybe_get_const(sparse_grad, "i"):
         return symbolic_helper._unimplemented("gather", "sparse_grad == True")
     return g.op("GatherElements", self, index, axis_i=dim)
@@ -397,6 +442,9 @@ def gather(g: jit_utils.GraphContext, self, dim, index, sparse_grad=False):
 @_onnx_symbolic("aten::scatter")
 @symbolic_helper.parse_args("v", "i", "v", "v")
 def scatter(g: jit_utils.GraphContext, self, dim, index, src):
+    # [FUNCTION DOC] Symbolic for aten::scatter. With tensor src emits ScatterElements. With
+    #   scalar src, casts it to the type of self if different and expands it to the index
+    #   shape before ScatterElements. Returns the result.
     src_type = _type_utils.JitScalarType.from_value(src)
     src = symbolic_helper._maybe_get_scalar(src)
     if symbolic_helper._is_value(src):
@@ -418,6 +466,9 @@ def scatter(g: jit_utils.GraphContext, self, dim, index, src):
 @_onnx_symbolic("aten::cumsum")
 @symbolic_helper.parse_args("v", "i", "none")
 def cumsum(g: jit_utils.GraphContext, self, dim, dtype=None):
+    # [FUNCTION DOC] Symbolic for aten::cumsum. Optionally casts the input to the requested
+    #   dtype (when a non-constant-none dtype is given) and emits CumSum along the dim given
+    #   as a constant tensor. Returns the result.
     dim_tensor = g.op("Constant", value_t=torch.tensor(dim, dtype=torch.int))
     if dtype and dtype.node().kind() != "prim::Constant":
         parsed_dtype = symbolic_helper._get_const(dtype, "i", "dtype")
@@ -432,12 +483,17 @@ def cumsum(g: jit_utils.GraphContext, self, dim, dtype=None):
 
 @_onnx_symbolic("aten::masked_select")
 def masked_select(g: jit_utils.GraphContext, self, mask):
+    # [FUNCTION DOC] Symbolic for aten::masked_select. Expands the mask to the input shape,
+    #   takes its NonZero indices and emits GatherND. Returns a 1-D value.
     index = opset9.nonzero(g, opset9.expand_as(g, mask, self))
     return g.op("GatherND", self, index)
 
 
 @_onnx_symbolic("aten::masked_scatter")
 def masked_scatter(g: jit_utils.GraphContext, self, mask, source):
+    # [FUNCTION DOC] Symbolic for aten::masked_scatter. Computes NonZero indices of the
+    #   broadcast mask, flattens source and slices it to the number of selected positions
+    #   (source may be longer), then emits ScatterND. Returns the updated tensor.
     index = opset9.nonzero(g, opset9.expand_as(g, mask, self))
     # NOTE: source can have more elements than needed.
     # It could also have arbitrary shape.
@@ -455,6 +511,8 @@ def masked_scatter(g: jit_utils.GraphContext, self, mask, source):
 
 @_onnx_symbolic("aten::len")
 def _len(g: jit_utils.GraphContext, self):
+    # [FUNCTION DOC] Symbolic for aten::len. For tensor lists (or SplitToSequence outputs)
+    #   emits SequenceLength; otherwise returns the size of dimension 0 squeezed to a scalar.
     if (
         symbolic_helper._is_tensor_list(self)
         or self.node().kind() == "onnx::SplitToSequence"
@@ -466,6 +524,8 @@ def _len(g: jit_utils.GraphContext, self):
 
 @_onnx_symbolic("aten::__getitem_")
 def __getitem_(g: jit_utils.GraphContext, self, i):
+    # [FUNCTION DOC] Symbolic for aten::__getitem_. For tensor lists emits SequenceAt;
+    #   otherwise defers to the opset9 implementation (imported lazily).
     if symbolic_helper._is_tensor_list(self):
         # SequenceAt requires that the input be a List of Tensors
         return g.op("SequenceAt", self, i)
@@ -479,17 +539,24 @@ def __getitem_(g: jit_utils.GraphContext, self, i):
 
 @_onnx_symbolic("aten::_set_item")
 def _set_item(g: jit_utils.GraphContext, tensor_list, i, v):
+    # [FUNCTION DOC] Symbolic for aten::_set_item on a tensor list. Erases the element at i
+    #   and inserts v at i; returns the new sequence.
     tensor_list = g.op("SequenceErase", tensor_list, i)
     return g.op("SequenceInsert", tensor_list, v, i)
 
 
 @_onnx_symbolic("aten::append")
 def append(g: jit_utils.GraphContext, self, tensor):
+    # [FUNCTION DOC] Symbolic for aten::append. Emits SequenceInsert adding the tensor at the
+    #   end; returns the sequence.
     return g.op("SequenceInsert", self, tensor)
 
 
 @_onnx_symbolic("aten::add")
 def add(g: jit_utils.GraphContext, self, other, alpha=None):
+    # [FUNCTION DOC] Symbolic for aten::add. If self is a tensor list, other must be a
+    #   constant-built list; each of its tensors is appended with SequenceInsert (otherwise
+    #   reports unimplemented). Non-list inputs go to the opset9 add with alpha.
     if symbolic_helper._is_value(self) and symbolic_helper._is_tensor_list(self):
         tensor_list_node = other.node()
         if tensor_list_node.kind() != "prim::ListConstruct":
@@ -507,22 +574,32 @@ def add(g: jit_utils.GraphContext, self, other, alpha=None):
 
 @_onnx_symbolic("aten::insert")
 def insert(g: jit_utils.GraphContext, self, pos, tensor):
+    # [FUNCTION DOC] Symbolic for aten::insert. Emits SequenceInsert of tensor at position
+    #   pos; returns the sequence.
     return g.op("SequenceInsert", self, tensor, pos)
 
 
 @_onnx_symbolic("aten::pop")
 def pop(g: jit_utils.GraphContext, tensor_list, dim):
+    # [FUNCTION DOC] Symbolic for aten::pop. Emits SequenceErase at the given position and
+    #   returns the shortened sequence.
+    # KNOWN ISSUE: it returns the sequence without the element, not the popped element.
     return g.op("SequenceErase", tensor_list, dim)
 
 
 @_onnx_symbolic("aten::Delete")
 def Delete(g: jit_utils.GraphContext, tensor_list, dim):
+    # [FUNCTION DOC] Symbolic for aten::Delete. Emits SequenceErase of the element at the
+    #   given position and returns the sequence.
     return g.op("SequenceErase", tensor_list, dim)
 
 
 @_onnx_symbolic("aten::cat")
 @symbolic_helper.quantized_args(True)
 def cat(g: jit_utils.GraphContext, tensor_list, dim):
+    # [FUNCTION DOC] Symbolic for aten::cat. A packed list (constructed statically) uses the
+    #   opset9 concatenation; a dynamic sequence uses ConcatFromSequence along the constant
+    #   dim.
     if symbolic_helper._is_packed_list(tensor_list):
         return opset9.cat(g, tensor_list, dim)
     else:
@@ -532,6 +609,8 @@ def cat(g: jit_utils.GraphContext, tensor_list, dim):
 
 @_onnx_symbolic("aten::stack")
 def stack(g: jit_utils.GraphContext, tensor_list, dim):
+    # [FUNCTION DOC] Symbolic for aten::stack. A packed list uses opset9 stack; a dynamic
+    #   sequence uses ConcatFromSequence along the constant dim with a new axis.
     if symbolic_helper._is_packed_list(tensor_list):
         return opset9.stack(g, tensor_list, dim)
     else:
@@ -542,6 +621,10 @@ def stack(g: jit_utils.GraphContext, tensor_list, dim):
 @_onnx_symbolic("aten::_unique2")
 @symbolic_helper.parse_args("v", "i", "i", "i")
 def _unique2(g: jit_utils.GraphContext, self, sorted, return_inverse, return_counts):
+    # [FUNCTION DOC] Symbolic for aten::_unique2. Emits Unique with the sorted flag and
+    #   returns (unique values, inverse indices, counts).
+    # KNOWN ISSUE: return_inverse and return_counts are ignored; all three outputs are always
+    #   returned.
     u, _indices, inverse_indices, counts = g.op(
         "Unique", self, sorted_i=sorted, outputs=4
     )
@@ -553,6 +636,9 @@ def _unique2(g: jit_utils.GraphContext, self, sorted, return_inverse, return_cou
 def unique_dim(
     g: jit_utils.GraphContext, self, dim, sorted, return_inverse, return_counts
 ):
+    # [FUNCTION DOC] Symbolic for aten::unique_dim. Emits Unique along dim with the sorted
+    #   flag and returns (unique values, inverse indices, counts).
+    # KNOWN ISSUE: return_inverse and return_counts are ignored.
     u, _indices, inverse_indices, counts = g.op(
         "Unique", self, axis_i=dim, sorted_i=sorted, outputs=4
     )
@@ -562,6 +648,8 @@ def unique_dim(
 @_onnx_symbolic("aten::topk")
 @symbolic_helper.parse_args("v", "v", "i", "i", "i", "none")
 def topk(g: jit_utils.GraphContext, self, k, dim, largest, sorted, out=None):
+    # [FUNCTION DOC] Symbolic for aten::topk. Delegates to the shared topk helper with k, dim,
+    #   largest, sorted and optional out; returns (values, indices).
     return symbolic_helper._topk_helper(
         g, self, k, dim, largest=largest, sorted=sorted, out=out
     )
@@ -570,12 +658,16 @@ def topk(g: jit_utils.GraphContext, self, k, dim, largest, sorted, out=None):
 @_onnx_symbolic("aten::sort")
 @symbolic_helper.parse_args("v", "i", "i", "none")
 def sort(g: jit_utils.GraphContext, self, dim, descending, out=None):
+    # [FUNCTION DOC] Symbolic for aten::sort. Delegates to the shared sort helper; returns
+    #   (values, indices).
     return symbolic_helper._sort_helper(g, self, dim, descending=descending, out=out)
 
 
 @_onnx_symbolic("aten::argsort")
 @symbolic_helper.parse_args("v", "i", "i", "none")
 def argsort(g: jit_utils.GraphContext, self, dim, descending, out=None):
+    # [FUNCTION DOC] Symbolic for aten::argsort. Runs the shared sort helper and returns only
+    #   the indices.
     _, indices = symbolic_helper._sort_helper(
         g, self, dim, descending=descending, out=out
     )
@@ -585,6 +677,9 @@ def argsort(g: jit_utils.GraphContext, self, dim, descending, out=None):
 @_onnx_symbolic("aten::round")
 @symbolic_helper.parse_args("v", "i")
 def round(g: jit_utils.GraphContext, self, decimals=0):
+    # [FUNCTION DOC] Symbolic for aten::round. Non-floating inputs are returned unchanged.
+    #   With decimals zero emits Round; otherwise scales by ten to the decimals, rounds and
+    #   scales back.
     if not symbolic_helper._is_fp(self):
         return self
     if decimals == 0:
@@ -598,6 +693,8 @@ def round(g: jit_utils.GraphContext, self, decimals=0):
 
 @_onnx_symbolic("aten::remainder")
 def remainder(g: jit_utils.GraphContext, input, other):
+    # [FUNCTION DOC] Symbolic for aten::remainder. Floating operands use the opset9 version;
+    #   integer operands emit Mod with integer (sign of divisor) semantics.
     if symbolic_helper._is_fp(input) or symbolic_helper._is_fp(other):
         return opset9.remainder(g, input, other)
     return g.op("Mod", input, other, fmod_i=0)
@@ -606,6 +703,11 @@ def remainder(g: jit_utils.GraphContext, input, other):
 @_onnx_symbolic("aten::split")
 @symbolic_helper.parse_args("v", "v", "i", "i")
 def split(g: jit_utils.GraphContext, self, split_size_or_sizes, dim, _outputs=None):
+    # [FUNCTION DOC] Symbolic for aten::split. If split sizes are not static, emits
+    #   SplitToSequence; with a known output count and a packed list of that many sizes it
+    #   builds Slice nodes with running offsets, else extracts each output with SequenceAt.
+    #   Without a known output count returns the sequence. Static splits defer to opset9.
+    #   Returns a sequence or a list of values.
     if not symbolic_helper._is_split_static(split_size_or_sizes, _outputs):
         split_out = g.op("SplitToSequence", self, split_size_or_sizes, axis_i=dim)
         if _outputs is None:
@@ -644,12 +746,16 @@ def split(g: jit_utils.GraphContext, self, split_size_or_sizes, dim, _outputs=No
 @_onnx_symbolic("aten::split_with_sizes")
 @symbolic_helper.parse_args("v", "v", "i", "i")
 def split_with_sizes(g: jit_utils.GraphContext, self, split_sizes, dim, _outputs=None):
+    # [FUNCTION DOC] Symbolic for aten::split_with_sizes. Forwards to split with the given
+    #   sizes, dim and output count.
     return split(g, self, split_sizes, dim, _outputs)
 
 
 @_onnx_symbolic("aten::unbind")
 @symbolic_helper.parse_args("v", "i", "i")
 def unbind(g: jit_utils.GraphContext, self, dim=0, _outputs=None):
+    # [FUNCTION DOC] Symbolic for aten::unbind. Without a known output count emits
+    #   SplitToSequence with unit sizes and no kept dim; otherwise defers to opset9 unbind.
     if _outputs is None:
         return g.op(
             "SplitToSequence",
@@ -663,6 +769,10 @@ def unbind(g: jit_utils.GraphContext, self, dim=0, _outputs=None):
 
 
 def _prepare_onnx_paddings(g: jit_utils.GraphContext, input, pad):
+    # [FUNCTION DOC] HELPER: Converts PyTorch pad order (last dim first, begin/end pairs) into
+    #   the ONNX Pad order (all begins then all ends). Converts scalar lists to a tensor,
+    #   zero-extends to twice the input rank, casts to int64, reshapes to pairs, reverses via
+    #   opset10 flip, transposes and flattens. Returns the int64 paddings value.
     """Generate paddings in ONNX order based on pad in pytorch.
 
     Args:
@@ -721,6 +831,8 @@ def _prepare_onnx_paddings(g: jit_utils.GraphContext, input, pad):
 
 @_onnx_symbolic("aten::constant_pad_nd")
 def constant_pad_nd(g: jit_utils.GraphContext, input, padding, value=None):
+    # [FUNCTION DOC] Symbolic for aten::constant_pad_nd. Emits Pad in constant mode with the
+    #   converted paddings and a scalar fill value cast to the input type.
     mode = "constant"
     value = symbolic_helper._maybe_get_scalar(value)
     value = symbolic_helper._if_scalar_type_as(value, input)
@@ -732,6 +844,8 @@ def constant_pad_nd(g: jit_utils.GraphContext, input, padding, value=None):
 @_onnx_symbolic("aten::reflection_pad2d")
 @_onnx_symbolic("aten::reflection_pad3d")
 def reflection_pad(g: jit_utils.GraphContext, input, padding):
+    # [FUNCTION DOC] Symbolic for reflection_pad1d/2d/3d. Emits Pad in reflect mode with
+    #   converted paddings.
     mode = "reflect"
     paddings = _prepare_onnx_paddings(g, input, padding)
     return g.op("Pad", input, paddings, mode_s=mode)
@@ -741,6 +855,8 @@ def reflection_pad(g: jit_utils.GraphContext, input, padding):
 @_onnx_symbolic("aten::replication_pad2d")
 @_onnx_symbolic("aten::replication_pad3d")
 def replication_pad(g: jit_utils.GraphContext, input, padding):
+    # [FUNCTION DOC] Symbolic for replication_pad1d/2d/3d. Emits Pad in edge mode with
+    #   converted paddings.
     mode = "edge"
     paddings = _prepare_onnx_paddings(g, input, padding)
     return g.op("Pad", input, paddings, mode_s=mode)
@@ -754,6 +870,9 @@ def pad(
     mode: _C.Value,
     value: _C.Value,
 ):
+    # [FUNCTION DOC] Symbolic for aten::pad. Dispatches on the string mode: replicate,
+    #   reflect, constant, or circular (opset9 helper). Raises SymbolicValueError for any
+    #   other mode.
     mode = symbolic_helper._parse_arg(mode, "s")
     if mode == "replicate":
         return replication_pad(g, input, pad)
@@ -769,17 +888,27 @@ def pad(
 
 @_onnx_symbolic("aten::linalg_det")
 def linalg_det(g: jit_utils.GraphContext, self):
+    # [FUNCTION DOC] Symbolic for aten::linalg_det. Emits the Det node.
     return g.op("Det", self)
 
 
 @_onnx_symbolic("aten::logdet")
 def logdet(g: jit_utils.GraphContext, input):
+    # [FUNCTION DOC] Symbolic for aten::logdet. Computes log of the determinant using opset9
+    #   log and linalg_det.
+    # KNOWN ISSUE: computes the log of the raw determinant, so negative determinants produce
+    #   nan, matching logdet semantics only loosely.
     return opset9.log(g, linalg_det(g, input))
 
 
 @_onnx_symbolic("aten::arange")
 def arange(g: jit_utils.GraphContext, *args):
+    # [FUNCTION DOC] Symbolic for aten::arange. Chooses on the argument count: (start, end)
+    #   Python ints give an int64 Range; 2 or 5 args mean end only (optionally with dtype); 4
+    #   or 7 args mean start, end, step; 6 args mean start, end with dtype. Casts via the
+    #   shared arange helper and emits Range. Reports unimplemented for other counts.
     def _get_arange_dtype(dtype):
+        # [FUNCTION DOC] HELPER: Returns the constant integer dtype of the argument, or none.
         dtype = symbolic_helper._maybe_get_const(dtype, "i")
         return dtype
 
@@ -855,6 +984,8 @@ def arange(g: jit_utils.GraphContext, *args):
 @_onnx_symbolic("aten::_dim_arange")
 @symbolic_helper.parse_args("v", "i")
 def _dim_arange(g: jit_utils.GraphContext, like, dim):
+    # [FUNCTION DOC] HELPER: Symbolic for aten::_dim_arange. Takes the size of the given dim
+    #   of like via Shape and Gather and returns arange over it.
     like_shape = g.op("Shape", like)
     stop = g.op(
         "Gather", like_shape, g.op("Constant", value_t=torch.tensor(dim)), axis_i=0
@@ -865,6 +996,8 @@ def _dim_arange(g: jit_utils.GraphContext, like, dim):
 @_onnx_symbolic("aten::size")
 @symbolic_helper.quantized_args(True, quantize_output=False)
 def size(g: jit_utils.GraphContext, self, dim=None):
+    # [FUNCTION DOC] Symbolic for aten::size. Without dim returns the Shape; with dim uses the
+    #   shared size helper to gather that dimension.
     if dim is None:
         return g.op("Shape", self)
     return symbolic_helper._size_helper(g, self, dim)
@@ -872,6 +1005,11 @@ def size(g: jit_utils.GraphContext, self, dim=None):
 
 @_onnx_symbolic("aten::squeeze")
 def squeeze(g: jit_utils.GraphContext, self, dim=None):
+    # [FUNCTION DOC] Symbolic for aten::squeeze. No dim: emits Squeeze for all size-1 dims.
+    #   Non-constant dim: squeeze helper. If the dim size is unknown, builds an If subgraph
+    #   that squeezes when the size is one and otherwise passes the input through. For a
+    #   static size greater than one, warns and returns the input unchanged; otherwise
+    #   squeezes the (rank adjusted) dim.
     if dim is None:
         return g.op("Squeeze", self)
 
@@ -924,6 +1062,8 @@ def squeeze(g: jit_utils.GraphContext, self, dim=None):
 
 @_onnx_symbolic("aten::unsqueeze")
 def unsqueeze(g: jit_utils.GraphContext, self, dim):
+    # [FUNCTION DOC] Symbolic for aten::unsqueeze. Resolves a constant dim and emits unsqueeze
+    #   through the shared helper.
     if symbolic_helper._is_constant(dim):
         dim = symbolic_helper._get_const(dim, "i", "dim")
 
@@ -932,11 +1072,14 @@ def unsqueeze(g: jit_utils.GraphContext, self, dim):
 
 @_onnx_symbolic("aten::mm")
 def mm(g: jit_utils.GraphContext, self, other):
+    # [FUNCTION DOC] Symbolic for aten::mm. Emits Gemm with alpha one and beta zero (no bias).
     return g.op("Gemm", self, other, beta_f=0.0, alpha_f=1.0)
 
 
 @_onnx_symbolic("aten::index")
 def index(g: jit_utils.GraphContext, self, index):
+    # [FUNCTION DOC] Symbolic for aten::index. A single boolean or uint8 mask index is
+    #   converted with NonZero and GatherND; everything else defers to the opset9 index.
     if symbolic_helper._is_packed_list(index):
         indices = symbolic_helper._unpack_list(index)
     else:
@@ -957,6 +1100,8 @@ def index(g: jit_utils.GraphContext, self, index):
 
 @_onnx_symbolic("aten::index_fill")
 def index_fill(g: jit_utils.GraphContext, self, dim, index, value):
+    # [FUNCTION DOC] Symbolic for aten::index_fill. Expands index and the scalar value (cast
+    #   to the type of self) to the broadcast shape and applies scatter along dim.
     expanded_index_shape, expanded_index = symbolic_helper._index_fill_reshape_helper(
         g, self, dim, index
     )
@@ -968,6 +1113,8 @@ def index_fill(g: jit_utils.GraphContext, self, dim, index, value):
 
 @_onnx_symbolic("aten::index_copy")
 def index_copy(g: jit_utils.GraphContext, self, dim, index, source):
+    # [FUNCTION DOC] Symbolic for aten::index_copy. Expands the index to the broadcast shape
+    #   and applies scatter of source along dim.
     _expanded_index_shape, expanded_index = symbolic_helper._index_fill_reshape_helper(
         g, self, dim, index
     )
@@ -977,6 +1124,9 @@ def index_copy(g: jit_utils.GraphContext, self, dim, index, source):
 @_onnx_symbolic("aten::bitwise_right_shift")
 @_onnx_symbolic("aten::__rshift_")
 def __rshift_(g: jit_utils.GraphContext, self, other):
+    # [FUNCTION DOC] Symbolic for aten::__rshift_ and bitwise_right_shift. Casts other to the
+    #   type of self. uint8 uses BitShift to the right; other types defer to the opset9
+    #   version.
     # make sure to cast other to self's type
     # (when self is long, make sure that other is not float)
     if _type_utils.JitScalarType.from_value(
@@ -1001,6 +1151,9 @@ def __rshift_(g: jit_utils.GraphContext, self, other):
 @_onnx_symbolic("aten::bitwise_left_shift")
 @_onnx_symbolic("aten::__lshift_")
 def __lshift_(g: jit_utils.GraphContext, self, other):
+    # [FUNCTION DOC] Symbolic for aten::__lshift_ and bitwise_left_shift. Casts other to the
+    #   type of self. uint8 uses BitShift to the left; others compute self times two to the
+    #   power other (via float Pow, cast back to the type of self).
     # make sure to cast other to self's type
     # (when self is long, make sure that other is not float)
     if _type_utils.JitScalarType.from_value(
@@ -1035,6 +1188,10 @@ def __lshift_(g: jit_utils.GraphContext, self, other):
 def _get_im2col_indices_along_dim(
     g: jit_utils.GraphContext, input_d, kernel_size_d, dilation_d, padding_d, stride_d
 ):
+    # [FUNCTION DOC] HELPER: Computes im2col sliding-block indices along one spatial dim:
+    #   start positions via Range over the padded size minus the dilated kernel extent with
+    #   the stride, plus the dilated kernel offsets, broadcast to a 2-D index grid. Returns
+    #   the index value.
     # Input is always 4-D (N, C, H, W)
     # Calculate indices of sliding blocks along spatial dimension
     # Slide kernel over input each dim d:
@@ -1076,6 +1233,8 @@ def _get_im2col_indices_along_dim(
 
 
 def _get_im2col_padded_input(g: jit_utils.GraphContext, input, padding_h, padding_w):
+    # [FUNCTION DOC] HELPER: Pads a 4-D input with zeros by padding_h and padding_w on both
+    #   sides of the spatial dims using Pad. Returns the padded value.
     # Input is always 4-D tensor (N, C, H, W)
     # Padding tensor has the following format: (padding_h, padding_w)
     # Reshape the padding to follow ONNX format: (dim1_begin, dim2_begin,...,dim1_end, dim2_end,...)
@@ -1084,6 +1243,8 @@ def _get_im2col_padded_input(g: jit_utils.GraphContext, input, padding_h, paddin
 
 
 def _get_im2col_output_shape(g: jit_utils.GraphContext, input, kernel_h, kernel_w):
+    # [FUNCTION DOC] HELPER: Builds the im2col output shape value: batch, channels times
+    #   kernel area, and an inferred last dim. Returns it.
     batch_dim = size(g, input, g.op("Constant", value_t=torch.tensor(0)))
     channel_dim = size(g, input, g.op("Constant", value_t=torch.tensor(1)))
     channel_unfolded = g.op(
@@ -1102,6 +1263,10 @@ def _get_im2col_output_shape(g: jit_utils.GraphContext, input, kernel_h, kernel_
 @_onnx_symbolic("aten::im2col")
 @symbolic_helper.parse_args("v", "is", "is", "is", "is")
 def im2col(g: jit_utils.GraphContext, input, kernel_size, dilation, padding, stride):
+    # [FUNCTION DOC] Symbolic for aten::im2col (unfold) on 4-D input. Computes row and column
+    #   block indices, pads the input, gathers along rows and columns, transposes and reshapes
+    #   to batch x (channels * kernel area) x blocks. Args kernel_size, dilation, padding,
+    #   stride are int pairs.
     # Input is always 4-D tensor (N, C, H, W)
     # All other args are int[2]
 
@@ -1154,6 +1319,7 @@ def im2col(g: jit_utils.GraphContext, input, kernel_size, dilation, padding, str
 
 @_onnx_symbolic("aten::narrow")
 def narrow(g: jit_utils.GraphContext, input, dim, start, length):
+    # [FUNCTION DOC] Symbolic for aten::narrow. Slices dim from start to start plus length.
     end = g.op("Add", start, length)
     return symbolic_helper._slice_helper(g, input, axes=dim, starts=start, ends=end)
 
@@ -1162,6 +1328,9 @@ def narrow(g: jit_utils.GraphContext, input, dim, start, length):
 @symbolic_helper.quantized_args(True, False, False)
 @symbolic_helper.parse_args("v", "i", "i")
 def flatten(g: jit_utils.GraphContext, input, start_dim, end_dim):
+    # [FUNCTION DOC] Symbolic for aten::flatten. Rank one returns the input; cases yielding a
+    #   2-D result use ONNX Flatten; otherwise the rank must be known (reports unimplemented
+    #   if not), negative end_dim is normalized and the shared flatten helper is used.
     dim = symbolic_helper._get_tensor_rank(input)
     if dim == 1:
         return input
@@ -1195,6 +1364,8 @@ def linalg_vector_norm(
     keepdim: bool,
     dtype,
 ):
+    # [FUNCTION DOC] Symbolic for aten::linalg_vector_norm. Delegates to the shared helper
+    #   with ord, dim, keepdim and dtype.
     return symbolic_helper._linalg_vector_norm_helper(g, self, ord, dim, keepdim, dtype)
 
 
@@ -1212,6 +1383,8 @@ def embedding_bag(
     include_last_offset,
     padding_idx,
 ):
+    # [FUNCTION DOC] Symbolic for aten::embedding_bag. Delegates all arguments to the shared
+    #   embedding_bag helper (dynamic-shape capable, unlike opset 10) and returns its result.
     return symbolic_helper._embedding_bag_helper(
         g,
         embedding_matrix,
@@ -1229,6 +1402,10 @@ def embedding_bag(
 @_onnx_symbolic("aten::embedding_renorm")
 @symbolic_helper.parse_args("v", "v", "f", "f")
 def embedding_renorm(g: jit_utils.GraphContext, weight, indices, max_norm, norm_type):
+    # [FUNCTION DOC] Symbolic for aten::embedding_renorm. Gathers rows for the unique indices,
+    #   computes their L1 or L2 norms, rescales rows whose norm exceeds max_norm (adding a
+    #   small epsilon to avoid division by zero) and scatters them back into the weight with
+    #   ScatterND. Raises SymbolicValueError for norm types other than 1 or 2.
     unique_indices = g.op("Unique", indices)
     partial_weight = g.op("Gather", weight, unique_indices)
     norm_i = int(norm_type)
@@ -1267,6 +1444,9 @@ def embedding_renorm(g: jit_utils.GraphContext, weight, indices, max_norm, norm_
 
 @_onnx_symbolic("aten::chunk")
 def chunk(g: jit_utils.GraphContext, self, chunks, dim):
+    # [FUNCTION DOC] Symbolic for aten::chunk with dynamic chunks. Computes a chunk size as
+    #   the ceiling of dim size over chunks, builds a split vector of equal chunks plus the
+    #   remainder, and delegates to split.
     # Calculate chunk size for dynamic chunk
     dim_size = g.op("Gather", g.op("Shape", self), dim, axis_i=0)
     chunk_size_s = g.op(
@@ -1294,6 +1474,9 @@ def normal(
     device=None,
     pin_memory=None,
 ):
+    # [FUNCTION DOC] Symbolic for aten::normal. Optionally expands mean to sizes, then returns
+    #   std times RandomNormalLike(mean) plus mean. Generator, dtype, layout, device and
+    #   pin_memory are ignored.
     # If you can sample from a given distribution with mean 0 and variance 1, then you can easily sample from a
     # scale-location transformation of that distribution, which has mean mu and variance sigma's square. If x is a sample
     # from a mean 0 and variance 1 distribution then
@@ -1307,6 +1490,9 @@ def normal(
 
 @_onnx_symbolic("aten::atleast_1d")
 def atleast_1d(g: jit_utils.GraphContext, self: torch._C.Value):
+    # [FUNCTION DOC] Symbolic for aten::atleast_1d. For a packed list, reshapes each 0-D
+    #   tensor to 1-D and returns a SequenceConstruct; for a single tensor reshapes 0-D to
+    #   shape one. Higher ranks pass through.
     # NOTE: If it's 0D, reshape to 1D
 
     # NOTE: self could be a packed list or a tensor
@@ -1333,6 +1519,9 @@ def atleast_1d(g: jit_utils.GraphContext, self: torch._C.Value):
 
 @_onnx_symbolic("aten::atleast_2d")
 def atleast_2d(g: jit_utils.GraphContext, self: torch._C.Value):
+    # [FUNCTION DOC] Symbolic for aten::atleast_2d. 0-D inputs are reshaped to 1x1 and 1-D
+    #   inputs unsqueezed at the front; works on a packed list (returns a sequence) or a
+    #   tensor.
     # NOTE: If it's 0D, reshape to 2D
     #       If it's 1D, unsqueeze to 2D
 
@@ -1366,6 +1555,9 @@ def atleast_2d(g: jit_utils.GraphContext, self: torch._C.Value):
 
 @_onnx_symbolic("aten::atleast_3d")
 def atleast_3d(g: jit_utils.GraphContext, self: torch._C.Value):
+    # [FUNCTION DOC] Symbolic for aten::atleast_3d. 0-D inputs are reshaped to 1x1x1, 1-D
+    #   unsqueezed at front and back, 2-D unsqueezed at the back; works on a packed list
+    #   (returns a sequence) or a tensor.
     # NOTE: If it's 0D, reshape to 3D
     #       If it's 1D, unsqueeze to 3D
     #       If it's 2D, unsqueeze to 3D
@@ -1410,6 +1602,10 @@ def atleast_3d(g: jit_utils.GraphContext, self: torch._C.Value):
 
 @_onnx_symbolic("prim::ConstantChunk")
 def prim_constant_chunk(g: jit_utils.GraphContext, self, chunks, dim):
+    # [FUNCTION DOC] Symbolic for prim::ConstantChunk. Splits along dim into chunks of ceiling
+    #   size using a loop of Slice nodes with running end offsets. Returns a list of values.
+    # KNOWN ISSUE: the last slices may be empty or out of range when chunks do not divide
+    #   evenly, mirroring ONNX slice clamping rather than torch chunk's exact count.
     input_shape = g.op("Shape", self)
     axis = g.op("Constant", value_t=torch.tensor([dim], dtype=torch.long))
     input_shape_dim = g.op("Gather", input_shape, axis, axis_i=0)
@@ -1431,6 +1627,9 @@ def prim_constant_chunk(g: jit_utils.GraphContext, self, chunks, dim):
 
 @_onnx_symbolic("aten::hstack")
 def hstack(g: jit_utils.GraphContext, tensor_list: _C.Value):
+    # [FUNCTION DOC] Symbolic for aten::hstack. Applies atleast_1d, then uses an If on whether
+    #   the first tensor is 1-D: concatenates along axis 0 for 1-D, else axis 1, using
+    #   ConcatFromSequence. Returns the If output.
     tensor_list = atleast_1d(g, tensor_list)
     first_tensor = g.op(
         "SequenceAt",
@@ -1463,5 +1662,7 @@ def hstack(g: jit_utils.GraphContext, tensor_list: _C.Value):
 
 @_onnx_symbolic("aten::vstack")
 def vstack(g: jit_utils.GraphContext, tensor_list: _C.Value):
+    # [FUNCTION DOC] Symbolic for aten::vstack. Applies atleast_2d and concatenates along axis
+    #   0 with ConcatFromSequence.
     tensor_list = atleast_2d(g, tensor_list)
     return g.op("ConcatFromSequence", tensor_list, axis_i=0, new_axis_i=0)

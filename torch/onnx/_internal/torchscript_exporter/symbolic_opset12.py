@@ -1,5 +1,12 @@
 # mypy: allow-untyped-defs
 # mypy: disable-error-code=arg-type
+# [MODULE DOC] ONNX symbolic functions for opset 12 of the TorchScript exporter. Registers
+#   (via the opset-12 registration partial) converters for einsum/outer/tensordot, dropout and
+#   native_dropout, nll_loss variants, cross_entropy_loss, binary_cross_entropy_with_logits,
+#   celu, argmax/argmin, pow, ge/le and unfold, using ops new in opset 12 (Einsum,
+#   NegativeLogLikelihoodLoss, SoftmaxCrossEntropyLoss, Celu, GreaterOrEqual, LessOrEqual,
+#   Dropout with training flag). Import time: defines the registration partial; decorators add
+#   to the global symbolic registry.
 from __future__ import annotations
 
 import functools
@@ -47,6 +54,9 @@ _onnx_symbolic = functools.partial(registration.onnx_symbolic, opset=12)
 
 
 def _einsum_helper(g: jit_utils.GraphContext, equation, tensors):
+    # [FUNCTION DOC] HELPER: Emits an Einsum node over the tensors with the equation. Boolean
+    #   inputs are cast to int64 first (ONNX Einsum lacks bool) and the result cast back to
+    #   bool. Raises RuntimeError if the tensor list is empty.
     if not tensors:
         raise RuntimeError("Einsum inputs are empty.")
     # ONNX does not support bool for Einsum inputs.
@@ -67,6 +77,8 @@ def _einsum_helper(g: jit_utils.GraphContext, equation, tensors):
 @_onnx_symbolic("aten::einsum")
 @symbolic_helper.parse_args("s", "v", "is")
 def einsum(g: jit_utils.GraphContext, equation, tensor_list, path=None):
+    # [FUNCTION DOC] Symbolic for aten::einsum. Unpacks the tensor list and calls the einsum
+    #   helper with the equation; the optional path is ignored. Returns the result.
     tensors = symbolic_helper._unpack_list(tensor_list)
     return _einsum_helper(g, equation, tensors)
 
@@ -74,6 +86,8 @@ def einsum(g: jit_utils.GraphContext, equation, tensor_list, path=None):
 @_onnx_symbolic("aten::outer")
 @symbolic_helper.parse_args("v", "v")
 def outer(g: jit_utils.GraphContext, input, other):
+    # [FUNCTION DOC] Symbolic for aten::outer. Casts other to the type of input if they
+    #   differ, then computes the outer product via einsum with equation i,j->ij.
     # make sure to cast other to self's type
     if _type_utils.JitScalarType.from_value(
         other, _type_utils.JitScalarType.UNDEFINED
@@ -89,6 +103,10 @@ def outer(g: jit_utils.GraphContext, input, other):
 def _dropout_returns_masked_input_and_mask(
     g: jit_utils.GraphContext, input: torch._C.Value, p: float, train: bool
 ) -> tuple[torch._C.Value, torch._C.Value | None]:
+    # [FUNCTION DOC] HELPER: Shared dropout lowering. Checks the training mode against the
+    #   export mode (may warn or raise via the check helper). In eval mode returns (input,
+    #   None). In training mode emits Dropout with ratio p and a true training flag and
+    #   returns (output, mask).
     symbolic_helper.check_training_mode(train, "dropout")
     # In eval mode, dropout is non-op. That is, if the node's
     # train param is set to False, dropout just returns its inputs.
@@ -103,6 +121,8 @@ def _dropout_returns_masked_input_and_mask(
 @_onnx_symbolic("aten::dropout")
 @symbolic_helper.parse_args("v", "f", "b")
 def dropout(g: jit_utils.GraphContext, input, p, train):
+    # [FUNCTION DOC] Symbolic for aten::dropout. Returns only the dropout output (the input
+    #   itself when not training).
     masked, _ = _dropout_returns_masked_input_and_mask(g, input, p, train)
     return masked
 
@@ -110,11 +130,16 @@ def dropout(g: jit_utils.GraphContext, input, p, train):
 @_onnx_symbolic("aten::native_dropout")
 @symbolic_helper.parse_args("v", "f", "b")
 def native_dropout(g: jit_utils.GraphContext, input, p, train):
+    # [FUNCTION DOC] Symbolic for aten::native_dropout. Returns the pair (output, mask); mask
+    #   is None when not training.
     return _dropout_returns_masked_input_and_mask(g, input, p, train)
 
 
 @_onnx_symbolic("aten::nll_loss")
 def nll_loss(g: jit_utils.GraphContext, self, target, weight, reduction, ignore_index):
+    # [FUNCTION DOC] Symbolic for aten::nll_loss. Maps the integer reduction code (0 none, 1
+    #   mean, 2 sum) to a string and emits NegativeLogLikelihoodLoss with the explicit
+    #   ignore_index, passing weight only if it is not none. Returns the loss.
     # none reduction : onnx::Constant[value={0}]
     # mean reduction : onnx::Constant[value={1}]
     # sum reduction : onnx::Constant[value={2}]
@@ -150,6 +175,7 @@ def nll_loss(g: jit_utils.GraphContext, self, target, weight, reduction, ignore_
 def nll_loss2d(
     g: jit_utils.GraphContext, self, target, weight, reduction, ignore_index
 ):
+    # [FUNCTION DOC] Symbolic for aten::nll_loss2d. Forwards to nll_loss.
     return nll_loss(g, self, target, weight, reduction, ignore_index)
 
 
@@ -157,6 +183,7 @@ def nll_loss2d(
 def nll_loss_nd(
     g: jit_utils.GraphContext, self, target, weight, reduction, ignore_index
 ):
+    # [FUNCTION DOC] Symbolic for aten::nll_loss_nd. Forwards to nll_loss.
     return nll_loss(g, self, target, weight, reduction, ignore_index)
 
 
@@ -170,6 +197,9 @@ def cross_entropy_loss(
     ignore_index,
     label_smoothing,
 ):
+    # [FUNCTION DOC] Symbolic for aten::cross_entropy_loss. Maps the reduction code to a
+    #   string and emits SoftmaxCrossEntropyLoss with ignore_index, passing weight only if not
+    #   none. Raises SymbolicValueError if label_smoothing is positive. Returns the loss.
     # none reduction : onnx::Constant[value={0}]
     # mean reduction : onnx::Constant[value={1}]
     # sum reduction : onnx::Constant[value={2}]
@@ -212,6 +242,13 @@ def cross_entropy_loss(
 def binary_cross_entropy_with_logits(
     g: jit_utils.GraphContext, input, target, weight, pos_weight, reduction
 ):
+    # [FUNCTION DOC] Symbolic for aten::binary_cross_entropy_with_logits. Builds the loss from
+    #   sigmoid and log nodes: negative of target times log sigmoid (times pos_weight if
+    #   given) plus one minus target times log of one minus sigmoid, multiplied by weight if
+    #   given. Reduction none returns elementwise, mean uses ReduceMean, sum uses ReduceSum;
+    #   other values are reported unsupported.
+    # KNOWN ISSUE: the constant one is created as an int64 tensor and subtracted from float
+    #   values, which may yield mismatched operand types in the exported graph.
     p = g.op("Constant", value_t=torch.tensor([1]))
     sig_x = opset9.sigmoid(g, input)
     log_sig_x = opset9.log(g, sig_x)
@@ -254,6 +291,8 @@ def binary_cross_entropy_with_logits(
 
 @_onnx_symbolic("aten::celu")
 def celu(g: jit_utils.GraphContext, self, alpha):
+    # [FUNCTION DOC] Symbolic for aten::celu. Emits Celu with the constant alpha; double
+    #   inputs are cast to float and the result cast back to double.
     alpha = symbolic_helper._maybe_get_const(alpha, "f")
     # if the input is of type double cast it to float
     if (
@@ -275,6 +314,8 @@ def argmax(
     dim: torch._C.Value,
     keepdim: bool,
 ):
+    # [FUNCTION DOC] Symbolic for aten::argmax. Delegates to the shared argmin/argmax helper
+    #   with the ArgMax operator.
     return symbolic_helper._argmin_argmax_helper(g, input, dim, keepdim, "ArgMax")
 
 
@@ -286,27 +327,41 @@ def argmin(
     dim: torch._C.Value,
     keepdim: bool,
 ):
+    # [FUNCTION DOC] Symbolic for aten::argmin. Delegates to the shared argmin/argmax helper
+    #   with the ArgMin operator.
     return symbolic_helper._argmin_argmax_helper(g, input, dim, keepdim, "ArgMin")
 
 
 @_onnx_symbolic("aten::pow")
 def pow(g: jit_utils.GraphContext, self, exponent):
+    # [FUNCTION DOC] Symbolic for aten::pow. Emits the Pow node (opset 12 supports mixed
+    #   integer and float types).
     return g.op("Pow", self, exponent)
 
 
 @_onnx_symbolic("aten::ge")
 def ge(g: jit_utils.GraphContext, input, other):
+    # [FUNCTION DOC] Symbolic for aten::ge. Emits GreaterOrEqual.
     return g.op("GreaterOrEqual", input, other)
 
 
 @_onnx_symbolic("aten::le")
 def le(g: jit_utils.GraphContext, input, other):
+    # [FUNCTION DOC] Symbolic for aten::le. Emits LessOrEqual.
     return g.op("LessOrEqual", input, other)
 
 
 @_onnx_symbolic("aten::unfold")
 @symbolic_helper.parse_args("v", "i", "v", "v")
 def unfold(g: jit_utils.GraphContext, input, dimension, size, step):
+    # [FUNCTION DOC] Symbolic for aten::unfold. Constant size and step defer to opset9. With
+    #   dynamic size or step but a known dimension size, builds a Loop over window start/end
+    #   indices (from Range nodes), slices each window, transposes and unsqueezes it,
+    #   concatenates the results and permutes/squeezes the loop output. Reports unimplemented
+    #   if the dimension size is unknown. Raises AssertionError if the input rank is unknown.
+    # KNOWN ISSUE: the loop body slices along a hardcoded axis 2 and the output permutation
+    #   assumes exactly 5 dims, so it only works for 4-D inputs unfolded in a limited way; the
+    #   loop-carried condition input is unused.
     const_size = symbolic_helper._maybe_get_const(size, "i")
     const_step = symbolic_helper._maybe_get_const(step, "i")
     if not symbolic_helper._is_value(const_size) and not symbolic_helper._is_value(
@@ -386,6 +441,13 @@ def unfold(g: jit_utils.GraphContext, input, dimension, size, step):
 @_onnx_symbolic("aten::tensordot")
 @symbolic_helper.parse_args("v", "v", "is", "is", "v")
 def tensordot(g: jit_utils.GraphContext, input_a, input_b, dims_a, dims_b, out=None):
+    # [FUNCTION DOC] Symbolic for aten::tensordot. Normalizes negative dims, permutes input_a
+    #   to put free dims first and contracted dims last (input_b the reverse), reshapes both
+    #   to 2-D matrices, multiplies them with einsum ij,jk->ik and reshapes to the
+    #   concatenation of the free dim sizes. Raises SymbolicValueError for unknown input
+    #   ranks; out is reported unsupported.
+    # KNOWN ISSUE: the out check calls the unimplemented helper without returning; the first
+    #   reshape of output_a is recomputed from new_input_a and its result discarded.
     if out is not None:
         symbolic_helper._unimplemented(
             "Tensordot", "Out parameter is not supported for tensordot."
