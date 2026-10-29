@@ -1,4 +1,10 @@
 # Owner(s): ["module: sparse"]
+# [MODULE DOC]
+# Tests for the experimental structured pruners in torch.ao.pruning._experimental.pruner:
+# BaseStructuredSparsifier (via small test subclasses), SaliencyPruner, LSTMSaliencyPruner
+# and FPGMPruner. Covers prepare, mask updates, and prune() across Linear, Conv2d, pooling,
+# activation and LSTM model patterns from common_pruning. Device-generic test classes are
+# instantiated by the caller (test/test_ao_sparsity.py); running this file directly raises.
 import copy
 import random
 
@@ -38,12 +44,21 @@ from torch.testing._internal.common_utils import (
 
 
 class SimplePruner(BaseStructuredSparsifier):
+    # [CLASS DOC] HELPER: minimal concrete structured pruner that prunes exactly the second
+    # output channel (row 1) of every prepared weight; keeps no state of its own.
     def update_mask(self, module, tensor_name, **kwargs):
+        # [FUNCTION DOC] HELPER: sets the mask entry at index 1 of the module's weight
+        # parametrization to False, in place. Extra keyword arguments are ignored.
         getattr(module.parametrizations, tensor_name)[0].mask[1] = False
 
 
 class ImplementedPruner(BaseStructuredSparsifier):
+    # [CLASS DOC] HELPER: structured pruner that randomly masks out one third of the output
+    # channels of each prepared weight; keeps no state of its own.
     def update_mask(self, module, tensor_name, **kwargs):
+        # [FUNCTION DOC] HELPER: randomly samples one third (integer division) of the mask
+        # row indices and sets them to False in the weight parametrization, in place.
+        # Uses the global random module, so results are not seeded here.
         """Prunes 1/3 of the weight output channels, so resulting module has 33.3% pruning"""
         num_rows = len(module.parametrizations[tensor_name][0].mask)
         prune = random.sample(list(range(num_rows)), num_rows // 3)
@@ -51,12 +66,17 @@ class ImplementedPruner(BaseStructuredSparsifier):
 
 
 class BottomHalfLSTMPruner(BaseStructuredSparsifier):
+    # [CLASS DOC] HELPER: deterministic structured pruner for LSTM weights; masks the bottom
+    # half of each of the four gate blocks. Keeps no state of its own.
     """
     Pruner that will remove the bottom half of the rows.
     This is primarily meant for testing purposes
     """
 
     def update_mask(self, module, tensor_name, **kwargs):
+        # [FUNCTION DOC] HELPER: for the FakeStructuredSparsity parametrization of the named
+        # tensor, splits the mask into four equal gate chunks, sets the second half of each
+        # chunk to False, and writes the concatenated mask back into the original mask.
         for p in getattr(module.parametrizations, tensor_name):
             if isinstance(p, FakeStructuredSparsity):
                 mask = p.mask
@@ -69,8 +89,11 @@ class BottomHalfLSTMPruner(BaseStructuredSparsifier):
 
 
 class TestSaliencyPruner(TestCase):
+    # [CLASS DOC] Device-generic tests for SaliencyPruner and LSTMSaliencyPruner; stateless.
     @dtypes(torch.float)
     def test_saliency_pruner_update_mask(self, device, dtype):
+        # [FUNCTION DOC] Sets linear1 rows to constant values 1..4, prunes at sparsity 0.5,
+        # and asserts the two lowest-saliency rows are removed, leaving rows 3 and 4.
         """Test that we prune out the row with the lowest saliency (first row)"""
         model = SimpleLinear().to(device)
         with torch.no_grad():
@@ -101,6 +124,11 @@ class TestSaliencyPruner(TestCase):
 
     @dtypes(torch.float)
     def test_lstm_saliency_pruner_update_mask(self, device, dtype):
+        # [FUNCTION DOC] Installs hand-picked LSTM weights and biases, prunes half of the
+        # hidden units with LSTMSaliencyPruner, runs both models, and asserts the kept
+        # rows of weight_ih, weight_hh and both biases are the highest-saliency ones.
+        # Note the expected values are compared against the original model's parameters,
+        # which prune() has already modified.
         model = LSTMLinearModel(
             input_dim=2,
             hidden_dim=2,
@@ -166,9 +194,15 @@ class TestSaliencyPruner(TestCase):
 
 
 class TestBaseStructuredSparsifierCPU(TestCase):
+    # [CLASS DOC] CPU-only tests of structured pruning on LSTM models using
+    # BottomHalfLSTMPruner; tagged with the CPU hardware classification; stateless.
     hw_classification = HardwareClassification.CPU
 
     def test_prune_lstm_linear_multiple_layer(self):
+        # [FUNCTION DOC] Prunes a 2-layer LSTM followed by Linear, runs original and pruned
+        # models, then checks each parameter's rows are a subset of the expected ones.
+        # KNOWN ISSUE: expected_params is built from the original model itself, and the
+        # loop iterates that same model, so the subset check is trivially true.
         """
         Test fusion support for LSTM(multi-layer) -> Linear
         """
@@ -219,6 +253,9 @@ class TestBaseStructuredSparsifierCPU(TestCase):
             )
 
     def test_prune_lstm_linear_single_layer(self):
+        # [FUNCTION DOC] Prunes a 1-layer LSTM followed by Linear; asserts the pruned LSTM
+        # output equals the first half of the original output and the final Linear output
+        # keeps the same shape (its input columns were resized).
         """
         Test fusion support for LSTM (single-layer) -> Linear
         """
@@ -265,6 +302,10 @@ class TestBaseStructuredSparsifierCPU(TestCase):
             )
 
     def test_prune_lstm_layernorm_linear_multiple_layer(self):
+        # [FUNCTION DOC] Same as the multi-layer LSTM-Linear test but with the
+        # LSTM-LayerNorm-Linear model.
+        # KNOWN ISSUE: the expected_params comparison uses the original model against
+        # itself, so the subset check is trivially true.
         """
         Test fusion support for LSTM(multi-layer) -> Linear
         """
@@ -315,6 +356,10 @@ class TestBaseStructuredSparsifierCPU(TestCase):
             )
 
     def test_prune_lstm_layernorm_linear_single_layer(self):
+        # [FUNCTION DOC] Single-layer variant; checks pruned LSTM output equals the first
+        # half of the original and the final output shape is unchanged.
+        # KNOWN ISSUE: despite the name it builds LSTMLinearModel, not
+        # LSTMLayerNormLinearModel, so it duplicates the plain LSTM-Linear test.
         """
         Test fusion support for LSTM (single-layer) -> Linear
         """
@@ -362,9 +407,15 @@ class TestBaseStructuredSparsifierCPU(TestCase):
 
 
 class TestBaseStructuredSparsifierDevice(TestCase):
+    # [CLASS DOC] Device-generic tests of BaseStructuredSparsifier on Linear and Conv2d
+    # models (constructor, prepare, step, prune); tagged with the accelerator hardware
+    # classification. Private helper methods perform the per-device checks; stateless.
     hw_classification = HardwareClassification.ACCELERATOR
 
     def _check_pruner_prepared(self, model, pruner, device):
+        # [FUNCTION DOC] HELPER: for each pruner group asserts the module weight is on the
+        # device type, its fqn is in pruner.state, and the module is parametrized with a
+        # FakeStructuredSparsity as first weight parametrization.
         for config in pruner.groups:
             module = config["module"]
             if module.weight.device.type != device.type:
@@ -388,6 +439,8 @@ class TestBaseStructuredSparsifierDevice(TestCase):
                 )
 
     def _check_pruner_valid_before_step(self, model, pruner, device):
+        # [FUNCTION DOC] HELPER: for each group (module or tuple of modules) asserts the
+        # weight is on the device type and the weight mask has boolean dtype.
         for config in pruner.groups:
             modules = []
             if type(config["module"]) is tuple:
@@ -406,6 +459,9 @@ class TestBaseStructuredSparsifierDevice(TestCase):
                     )
 
     def _check_pruner_valid_after_step(self, model, pruner, mask, device):
+        # [FUNCTION DOC] HELPER: for each group module asserts device placement and that the
+        # count of nonzero mask entries equals the mask size minus the argument named mask
+        # (the expected number of pruned entries).
         for config in pruner.groups:
             modules = []
             if type(config["module"]) is tuple:
@@ -427,6 +483,9 @@ class TestBaseStructuredSparsifierDevice(TestCase):
                     )
 
     def _test_constructor_on_device(self, model, device):
+        # [FUNCTION DOC] HELPER: asserts the abstract BaseStructuredSparsifier cannot be
+        # built (TypeError about update_mask); prepares copies of the model on the device
+        # with no config (5 groups) and with one config entry (1 group carrying defaults).
         self.assertRaisesRegex(
             TypeError,
             "BaseStructuredSparsifier.*update_mask",
@@ -463,10 +522,13 @@ class TestBaseStructuredSparsifierDevice(TestCase):
             )
 
     def test_constructor(self, device):
+        # [FUNCTION DOC] Runs the constructor checks on SimpleLinear for the given device.
         model = SimpleLinear()
         self._test_constructor_on_device(model, torch.device(device))
 
     def _test_prepare_linear_on_device(self, model, device):
+        # [FUNCTION DOC] HELPER: prepares a copy of the model with SimplePruner, checks the
+        # prepared state, and asserts a forward pass on a 128x7 input gives shape (128, 10).
         model = copy.deepcopy(model).to(device)
         x = torch.ones(128, 7, device=device)
         pruner = SimplePruner(None)
@@ -476,6 +538,8 @@ class TestBaseStructuredSparsifierDevice(TestCase):
             raise AssertionError(f"Expected shape (128, 10), got {model(x).shape}")
 
     def test_prepare_linear(self, device):
+        # [FUNCTION DOC] Runs the prepare check over four Linear model variants (with and
+        # without bias, activation module and functional activation).
         models = [
             SimpleLinear(),
             LinearBias(),
@@ -486,6 +550,8 @@ class TestBaseStructuredSparsifierDevice(TestCase):
             self._test_prepare_linear_on_device(model, torch.device(device))
 
     def _test_prepare_conv2d_on_device(self, model, expected_shape, config, device):
+        # [FUNCTION DOC] HELPER: prepares the model with SimplePruner and the given config,
+        # checks prepared state, and asserts the output shape for a 1x1x28x28 input.
         x = torch.ones((1, 1, 28, 28), device=device)
         pruner = SimplePruner(None)
         pruner.prepare(model, config)
@@ -496,6 +562,8 @@ class TestBaseStructuredSparsifierDevice(TestCase):
             )
 
     def test_prepare_conv2d(self, device):
+        # [FUNCTION DOC] Runs the conv prepare check over five Conv2d model variants with
+        # their expected output shapes and no explicit config.
         models = [
             SimpleConv2d(),
             Conv2dBias(),
@@ -518,6 +586,8 @@ class TestBaseStructuredSparsifierDevice(TestCase):
             )
 
     def _test_step_linear_on_device(self, model, device):
+        # [FUNCTION DOC] HELPER: prepares with SimplePruner, enables mask updates, checks
+        # pre-step validity, steps, then checks exactly one mask entry was pruned.
         model = model.to(device)
         pruner = SimplePruner(None)
         pruner.prepare(model, None)
@@ -527,6 +597,7 @@ class TestBaseStructuredSparsifierDevice(TestCase):
         self._check_pruner_valid_after_step(model, pruner, 1, device)
 
     def test_step_linear(self, device):
+        # [FUNCTION DOC] Runs the step check over the four Linear model variants.
         models = [
             SimpleLinear(),
             LinearBias(),
@@ -537,6 +608,8 @@ class TestBaseStructuredSparsifierDevice(TestCase):
             self._test_step_linear_on_device(model, torch.device(device))
 
     def _test_step_conv2d_on_device(self, model, expected_shape, config, device):
+        # [FUNCTION DOC] HELPER: like the linear step check but for conv models; also
+        # asserts the (unpruned, masked) model output shape on a 1x1x28x28 input.
         model = model.to(device)
         x = torch.ones((1, 1, 28, 28), device=device)
         pruner = SimplePruner(None)
@@ -552,6 +625,8 @@ class TestBaseStructuredSparsifierDevice(TestCase):
 
     @skipIfTorchDynamo("TorchDynamo fails with unknown reason")
     def test_step_conv2d(self, device):
+        # [FUNCTION DOC] Runs the conv step check over five Conv2d variants with expected
+        # output shapes; skipped under TorchDynamo.
         models = [
             SimpleConv2d(),
             Conv2dBias(),
@@ -571,6 +646,8 @@ class TestBaseStructuredSparsifierDevice(TestCase):
             self._test_step_conv2d_on_device(model, shape, config, torch.device(device))
 
     def _check_pruner_pruned(self, model, pruner, device):
+        # [FUNCTION DOC] HELPER: asserts no group module still has parametrizations or a
+        # mask attribute after prune().
         for config in pruner.groups:
             module = config["module"]
             if hasattr(module, "parametrizations"):
@@ -583,6 +660,10 @@ class TestBaseStructuredSparsifierDevice(TestCase):
     def _test_linear_on_device(
         self, model, config, expected_shape, device, also_prune_bias
     ):
+        # [FUNCTION DOC] HELPER: runs ImplementedPruner (optionally pruning biases) on a
+        # Linear model: prepare, step, record the masked output, prune, then assert pruned
+        # output shape, that parametrizations are gone, that outputs are close when shapes
+        # match, and that the parameter count strictly decreased.
         model = model.to(device)
         model.eval()
         num_original_params = sum(p.numel() for p in model.parameters())
@@ -618,6 +699,8 @@ class TestBaseStructuredSparsifierDevice(TestCase):
                 )
 
     def test_prune_linear_linear(self, device):
+        # [FUNCTION DOC] Prunes chained Linear layers in SimpleLinear using three config
+        # subsets, with and without bias pruning, expecting output shape (128, 10).
         r"""test pruning linear-> linear modules"""
         configs, shapes = [], []
         configs.append(
@@ -657,6 +740,8 @@ class TestBaseStructuredSparsifierDevice(TestCase):
                 )
 
     def test_prune_linear_bias_linear(self, device):
+        # [FUNCTION DOC] Prunes LinearBias across bias/no-bias layer pairings (three config
+        # cases), with and without bias pruning, expecting output shape (128, 10).
         # linear(bias) -> linear(no bias)
         configs, shapes = [], []
         configs.append(
@@ -697,6 +782,8 @@ class TestBaseStructuredSparsifierDevice(TestCase):
                 )
 
     def test_prune_linear_activation_linear(self, device):
+        # [FUNCTION DOC] Prunes Linear-activation-Linear models, both module and functional
+        # activation variants, with and without bias pruning; output shape (128, 10).
         config = [
             {"tensor_fqn": "seq.0.weight"},
             {"tensor_fqn": "seq.2.weight"},
@@ -726,6 +813,10 @@ class TestBaseStructuredSparsifierDevice(TestCase):
     def _test_conv2d_on_device(
         self, model, config, x, expected_shape, device, also_prune_bias
     ):
+        # [FUNCTION DOC] HELPER: runs ImplementedPruner on a conv model: prepare, step,
+        # check the masked output shape, prune, then assert the pruned output shape,
+        # removed parametrizations, closeness within 1e-3 and a non-increasing parameter
+        # count (equal is allowed when padding blocks pruning).
         model = model.to(device)
         num_original_params = sum(p.numel() for p in model.parameters())
         model.eval()
@@ -764,6 +855,8 @@ class TestBaseStructuredSparsifierDevice(TestCase):
                 )
 
     def test_prune_conv2d_conv2d(self, device):
+        # [FUNCTION DOC] Prunes SimpleConv2d within and across sequential blocks, with and
+        # without bias pruning, expecting output shape (1, 52, 20, 20).
         configs, shapes = [], []
         # all within sequential blocks
         configs.append(
@@ -795,6 +888,8 @@ class TestBaseStructuredSparsifierDevice(TestCase):
                 )
 
     def test_prune_conv2d_bias_conv2d(self, device):
+        # [FUNCTION DOC] Prunes Conv2dBias across bias/no-bias layer pairings, with and
+        # without bias pruning, expecting output shape (1, 52, 18, 18).
         # Conv2d with Bias and no Activation
         configs, shapes = [], []
         # conv2d(bias) -> conv2d(bias)
@@ -839,6 +934,8 @@ class TestBaseStructuredSparsifierDevice(TestCase):
                 )
 
     def test_prune_conv2d_activation_conv2d(self, device):
+        # [FUNCTION DOC] Prunes Conv2dActivation across four bias/activation pairings, with
+        # and without bias pruning, expecting output shape (1, 52, 18, 18).
         # Conv2d with Activation and no Bias
         configs, shapes = [], []
 
@@ -889,6 +986,8 @@ class TestBaseStructuredSparsifierDevice(TestCase):
                 )
 
     def test_prune_conv2d_padding_conv2d(self, device):
+        # [FUNCTION DOC] Prunes Conv2dPadBias for five padded/unpadded layer pairings, with
+        # and without bias pruning, expecting output shape (1, 52, 24, 24).
         # Conv2d with Padded layers after Bias layers
         configs, shapes = [], []
 
@@ -943,6 +1042,8 @@ class TestBaseStructuredSparsifierDevice(TestCase):
                 )
 
     def test_prune_conv2d_pool_conv2d(self, device):
+        # [FUNCTION DOC] Prunes Conv2dPool (convs separated by pooling), with and without
+        # bias pruning, expecting output shape (1, 52, 3, 3).
         # Conv2d with Pooling layers
         config = [
             {"tensor_fqn": "seq.0.weight"},
@@ -965,6 +1066,9 @@ class TestBaseStructuredSparsifierDevice(TestCase):
 
     @skipIfTorchDynamo("TorchDynamo fails with unknown reason")
     def test_complex_conv2d(self, device):
+        # [FUNCTION DOC] Prunes Conv2d-Pool-Flatten-Linear models (functional and module
+        # flatten variants, with a skip-add) with and without bias pruning, expecting
+        # output shape (1, 13); skipped under TorchDynamo.
         """Test fusion for models that contain Conv2d & Linear modules.
         Currently supports: Conv2d-Pool2d-Flatten-Linear, Skip-add"""
         config = [
@@ -996,13 +1100,20 @@ class TestBaseStructuredSparsifierDevice(TestCase):
 
 
 class TestFPGMPruner(TestCase):
+    # [CLASS DOC] Tests FPGMPruner (filter pruning via geometric median) on a hand-weighted
+    # two-conv model; checks the pairwise-distance helper and mask/prune results.
     """
     Test case for the implementation of paper:
     `Filter Pruning via Geometric Median for Deep Convolutional Neural Networks Acceleration <https://arxiv.org/abs/1811.00250>`_.
     """
 
     class SimpleConvFPGM(nn.Module):
+        # [CLASS DOC] HELPER: two stacked bias-free 3x3 convs (1->3 and 3->4 channels) whose
+        # filters are filled with constant values (3.0, 2.0, 0.1 and 6.0, 7.0, 0.4, 0.5) so
+        # geometric-median pruning differs from norm-based pruning.
         def __init__(self) -> None:
+            # [FUNCTION DOC] HELPER: builds conv2d1 and conv2d2 and overwrites their
+            # weights in place with per-filter constants.
             super().__init__()
             self.conv2d1 = nn.Conv2d(
                 in_channels=1, out_channels=3, kernel_size=3, padding=1, bias=False
@@ -1030,12 +1141,15 @@ class TestFPGMPruner(TestCase):
             )
 
         def forward(self, x):
+            # [FUNCTION DOC] HELPER: applies conv2d1 then conv2d2 and returns the result.
             x = self.conv2d1(x)
             x = self.conv2d2(x)
             return x
 
     @onlyCPU
     def test_compute_distance(self, device):
+        # [FUNCTION DOC] CPU only. Asserts FPGMPruner's private distance computation for the
+        # first conv equals, per filter, the sum of L2 distances to all filters (from cdist).
         """Test the distance computation function"""
         model = TestFPGMPruner.SimpleConvFPGM().to(device)
         pruner = FPGMPruner(0.3)
@@ -1099,6 +1213,12 @@ class TestFPGMPruner(TestCase):
             raise AssertionError("Distance computation does not match expected")
 
     def _test_update_mask_on_single_layer(self, expected_conv1, device):
+        # [FUNCTION DOC] HELPER: prunes only conv2d1 at sparsity 0.3, asserts the least-norm
+        # filter is not the one masked, then after prune() asserts output shape
+        # (1, 4, 32, 32), conv2d1 weights match expected_conv1, and conv2d2 lost an input
+        # channel (shape (4, 2, 3, 3)).
+        # KNOWN ISSUE: the mask check compares an item to False with an identity test, which
+        # is only meaningful because item returns a Python bool.
         """Test that pruning is conducted based on the pair-wise distance measurement instead of absolute norm value"""
         # test pruning with one layer of conv2d
         model = TestFPGMPruner.SimpleConvFPGM().to(device)
@@ -1139,6 +1259,9 @@ class TestFPGMPruner(TestCase):
     def _test_update_mask_on_multiple_layer(
         self, expected_conv1, expected_conv2, device
     ):
+        # [FUNCTION DOC] HELPER: prunes conv2d1 (default level 0.3) and conv2d2 (level 0.5),
+        # then after prune() asserts output shape (1, 2, 32, 32) and that both conv weights
+        # match the expected shapes and values.
         # the second setting
         model = TestFPGMPruner.SimpleConvFPGM().to(device)
         x = torch.ones((1, 1, 32, 32), device=device)
@@ -1184,6 +1307,8 @@ class TestFPGMPruner(TestCase):
             raise AssertionError("conv2d2 weight does not match expected")
 
     def test_update_mask(self, device):
+        # [FUNCTION DOC] Builds expected pruned weights (filters 3.0 and 0.1 kept for conv1,
+        # 7.0 and 0.4 kept for conv2) and runs the single-layer and multi-layer checks.
         weights = torch.tensor([3.0, 0.1])
         expected_conv1 = torch.ones((2, 1, 3, 3)) * weights[:, None, None, None]
 

@@ -1,5 +1,12 @@
 # Owner(s): ["module: sparse"]
 
+# [MODULE DOC]
+# Tests for torch.ao.pruning sparsifiers: the abstract BaseSparsifier (exercised via the
+# ImplementedSparsifier test double), WeightNormSparsifier and NearlyDiagonalSparsifier.
+# Covers construction, prepare (parametrization and mask attachment), step, state_dict
+# round trips, convert, and squash_mask. No import-time side effects; running the file
+# directly raises an error pointing at test/test_ao_sparsity.py.
+
 import itertools
 import re
 
@@ -21,7 +28,12 @@ from torch.testing._internal.common_utils import raise_on_run_directly, TestCase
 
 
 class TestBaseSparsifier(TestCase):
+    # [CLASS DOC] Tests the generic BaseSparsifier behavior through ImplementedSparsifier
+    # on the SimpleLinear model; stateless, each test builds its own model and sparsifier.
     def test_constructor(self):
+        # [FUNCTION DOC] Asserts the abstract base cannot be instantiated, and that
+        # prepare works with no config (5 groups, one per linear layer) and with an
+        # explicit config (1 group carrying tensor_fqn and the default test value).
         # Cannot instantiate the abstract base
         self.assertRaises(TypeError, BaseSparsifier)
         # Can instantiate the model with no configs
@@ -48,6 +60,9 @@ class TestBaseSparsifier(TestCase):
             )
 
     def test_prepare_config(self):
+        # [FUNCTION DOC] Checks prepare only parametrizes the layers named in the config,
+        # that per-entry values override defaults, and that group module references
+        # point at the real submodules.
         model = SimpleLinear()
         sparsifier = ImplementedSparsifier(test=3)
         # Make sure there are no parametrizations before `prepare`
@@ -92,6 +107,8 @@ class TestBaseSparsifier(TestCase):
             raise AssertionError("model.linear2 should have parametrizations")
 
     def test_step(self):
+        # [FUNCTION DOC] With mask updates enabled, a step of the test sparsifier zeroes
+        # the first row of the linear1 weight mask; asserts that.
         model = SimpleLinear()
         sparsifier = ImplementedSparsifier(test=3)
         sparsifier.enable_mask_update = True
@@ -101,6 +118,10 @@ class TestBaseSparsifier(TestCase):
             raise AssertionError("Expected all mask values in first row to be 0")
 
     def test_state_dict(self):
+        # [FUNCTION DOC] Steps a sparsifier three times with a custom mask, saves its
+        # state_dict, checks the expected keys (state with step_count, groups), then loads
+        # it into a fresh sparsifier on a new model and asserts state, groups and
+        # parametrization attributes match.
         step_count = 3
         model0 = SimpleLinear()
         sparsifier0 = ImplementedSparsifier(test=3)
@@ -183,6 +204,8 @@ class TestBaseSparsifier(TestCase):
                         )
 
     def test_convert(self):
+        # [FUNCTION DOC] Converts the model out of place with a Linear to MockSparseLinear
+        # mapping and asserts only the prepared layer (linear1) is swapped.
         model = SimpleLinear()
         sparsifier = ImplementedSparsifier(test=3)
         sparsifier.prepare(model, [{"tensor_fqn": "linear1.weight"}])
@@ -204,6 +227,8 @@ class TestBaseSparsifier(TestCase):
             )
 
     def test_mask_squash(self):
+        # [FUNCTION DOC] After prepare, linear1 is parametrized with a mask; squash_mask
+        # removes the parametrization so no layer remains parametrized.
         model = SimpleLinear()
         sparsifier = ImplementedSparsifier(test=3)
         sparsifier.prepare(model, [{"tensor_fqn": "linear1.weight"}])
@@ -225,6 +250,9 @@ class TestBaseSparsifier(TestCase):
             )
 
     def test_mask_squash_with_params1(self):
+        # [FUNCTION DOC] squash_mask with only a per-layer keep mapping: linear1 keeps foo
+        # and bar, seq.0 keeps baz; asserts the kept values land in sparse_params and
+        # all others are absent.
         model = SimpleLinear()
         sparsifier = ImplementedSparsifier(foo=3, bar=2, baz=1)
         sparsifier.prepare(
@@ -261,6 +289,8 @@ class TestBaseSparsifier(TestCase):
             raise AssertionError("Expected linear1.sparse_params['baz'] to be None")
 
     def test_mask_squash_with_params2(self):
+        # [FUNCTION DOC] squash_mask with a global keep tuple (foo, bar): both layers get
+        # foo and bar in sparse_params and not baz.
         model = SimpleLinear()
         sparsifier = ImplementedSparsifier(foo=3, bar=2, baz=1)
         sparsifier.prepare(
@@ -297,6 +327,8 @@ class TestBaseSparsifier(TestCase):
             raise AssertionError("Expected linear1.sparse_params['baz'] to be None")
 
     def test_mask_squash_with_params3(self):
+        # [FUNCTION DOC] squash_mask with both a global keep tuple (foo, bar) and a per-layer
+        # entry adding baz for seq.0; asserts seq.0 keeps all three, linear1 only foo, bar.
         model = SimpleLinear()
         sparsifier = ImplementedSparsifier(foo=3, bar=2, baz=1)
         sparsifier.prepare(
@@ -338,7 +370,10 @@ class TestBaseSparsifier(TestCase):
 
 
 class TestWeightNormSparsifier(TestCase):
+    # [CLASS DOC] Tests WeightNormSparsifier on the SimpleLinear model; stateless.
     def test_constructor(self):
+        # [FUNCTION DOC] With no config, prepare creates a group per Linear layer; asserts
+        # each group module is a Linear with a known fqn (group order is unspecified).
         model = SimpleLinear()
         sparsifier = WeightNormSparsifier()
         sparsifier.prepare(model, config=None)
@@ -350,6 +385,9 @@ class TestWeightNormSparsifier(TestCase):
                 raise AssertionError(f"Unexpected module_fqn: {g['module_fqn']}")
 
     def test_step(self):
+        # [FUNCTION DOC] Mask starts fully dense; after a step with sparsity_level 0.5 the
+        # mask mean is about 0.5. Then runs 1000 steps with randomized weights and asserts
+        # the mask does not collapse to all zeros.
         model = SimpleLinear()
         sparsifier = WeightNormSparsifier(sparsity_level=0.5)
         sparsifier.prepare(model, config=[{"tensor_fqn": "linear1.weight"}])
@@ -384,6 +422,9 @@ class TestWeightNormSparsifier(TestCase):
                 raise AssertionError("Expected sparsity level to not collapse")
 
     def test_step_2_of_4(self):
+        # [FUNCTION DOC] With block shape (1, 4) and two zeros per block at full sparsity,
+        # asserts the mask is about 50 percent dense and every 4-element block has exactly
+        # two zeros and two non-zeros.
         model = SimpleLinear()
         sparsifier = WeightNormSparsifier(
             sparsity_level=1.0, sparse_block_shape=(1, 4), zeros_per_block=2
@@ -410,6 +451,8 @@ class TestWeightNormSparsifier(TestCase):
                     )
 
     def test_prepare(self):
+        # [FUNCTION DOC] After prepare, every group module has its weight parametrized
+        # with a FakeSparsity object that holds a mask attribute.
         model = SimpleLinear()
         sparsifier = WeightNormSparsifier()
         sparsifier.prepare(model, config=None)
@@ -427,6 +470,8 @@ class TestWeightNormSparsifier(TestCase):
                 )
 
     def test_mask_squash(self):
+        # [FUNCTION DOC] After squash_mask, no group module remains parametrized or keeps
+        # a mask attribute.
         model = SimpleLinear()
         sparsifier = WeightNormSparsifier()
         sparsifier.prepare(model, config=None)
@@ -441,6 +486,11 @@ class TestWeightNormSparsifier(TestCase):
                 raise AssertionError("Expected module to not have mask after squash")
 
     def test_sparsity_levels(self):
+        # [FUNCTION DOC] Builds one all-ones 12x12 Linear per combination of sparsity level
+        # (including out-of-range values, which are clamped to 0..1), block shape and
+        # zeros-per-block (skipping combinations with more zeros than block elements),
+        # runs prepare, step and squash_mask, then asserts each layer's fraction of zero
+        # weights equals the clamped level times zeros per block over block size.
         sparsity_levels = [-1.0, 0.0, 0.5, 1.0, 2.0]
         sparse_block_shapes = [(1, 1), (1, 4), (2, 2), (4, 1)]
         zeros_per_blocks = [0, 1, 2, 3, 4]
@@ -502,7 +552,10 @@ class TestWeightNormSparsifier(TestCase):
 
 
 class TestNearlyDiagonalSparsifier(TestCase):
+    # [CLASS DOC] Tests NearlyDiagonalSparsifier on the SimpleLinear model; stateless.
     def test_constructor(self):
+        # [FUNCTION DOC] With no config, prepare creates a group per Linear layer; asserts
+        # each group module is a Linear with a known fqn (group order is unspecified).
         model = SimpleLinear()
         sparsifier = NearlyDiagonalSparsifier(nearliness=1)
         sparsifier.prepare(model, config=None)
@@ -514,6 +567,9 @@ class TestNearlyDiagonalSparsifier(TestCase):
                 raise AssertionError(f"Unexpected module_fqn: {g['module_fqn']}")
 
     def test_step(self):
+        # [FUNCTION DOC] Mask starts dense; after a step with nearliness 1 the mask equals
+        # the identity matrix. Then runs 1000 steps with randomized weights and asserts the
+        # mask does not collapse to all zeros.
         model = SimpleLinear()
         sparsifier = NearlyDiagonalSparsifier(nearliness=1)
         sparsifier.prepare(model, config=[{"tensor_fqn": "linear1.weight"}])
@@ -551,6 +607,8 @@ class TestNearlyDiagonalSparsifier(TestCase):
                 raise AssertionError("Expected sparsity level to not collapse")
 
     def test_prepare(self):
+        # [FUNCTION DOC] After prepare, every group module has its weight parametrized
+        # with a FakeSparsity object that holds a mask attribute.
         model = SimpleLinear()
         sparsifier = NearlyDiagonalSparsifier(nearliness=1)
         sparsifier.prepare(model, config=None)
@@ -568,6 +626,8 @@ class TestNearlyDiagonalSparsifier(TestCase):
                 )
 
     def test_mask_squash(self):
+        # [FUNCTION DOC] After step and squash_mask, no group module is parametrized or has
+        # a mask attribute, and each weight only has non-zero entries on the diagonal.
         model = SimpleLinear()
         sparsifier = NearlyDiagonalSparsifier(nearliness=1)
         sparsifier.prepare(model, config=None)
@@ -587,6 +647,12 @@ class TestNearlyDiagonalSparsifier(TestCase):
                 raise AssertionError("Expected only diagonal elements to be present")
 
     def test_sparsity_levels(self):
+        # [FUNCTION DOC] For nearliness values from -1 to 99, adds an all-ones 32x32 Linear
+        # per value and prepares it with that nearliness. Even positive values, or values
+        # whose half reaches the matrix size, must make step raise ValueError; otherwise
+        # step and squash_mask run and the weights are checked via _verify_nearliness.
+        # KNOWN ISSUE: the sparsifier is built with nearliness 1 on every iteration and the
+        # model accumulates layers, so each prepare re-sees earlier layers only via config.
         nearliness_levels = list(range(-1, 100))
         model = nn.Sequential()
 
@@ -620,6 +686,9 @@ class TestNearlyDiagonalSparsifier(TestCase):
 
     # helper function to verify nearliness of a mask
     def _verify_nearliness(self, mask: torch.Tensor, nearliness: int):
+        # [FUNCTION DOC] HELPER: asserts a 2-D tensor is all zeros when nearliness is not
+        # positive; otherwise entries within nearliness // 2 of the diagonal must be 1 and
+        # all others 0. Raises AssertionError on mismatch.
         if nearliness <= 0:
             if not torch.all(mask == torch.zeros(mask.shape[0], mask.shape[1])):
                 raise AssertionError(
