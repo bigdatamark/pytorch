@@ -1,5 +1,13 @@
 # Owner(s): ["module: inductor"]
 
+# [MODULE DOC] Tests for the flex attention decoding path (query length 1 or small) in inductor,
+# including paged attention. Defines score modification functions, shape and stride configs, per-
+# device dtype tables, and a device-generic test class that compares compiled flex attention
+# against an eager float and a float64 golden reference using error-ratio checks. Import time
+# effects: on Windows CI the module exits or skips; the device list is chosen from CUDA, CPU and
+# XPU platform flags (XPU enables oneDNN tf32); the CPU tests are skipped when the compiler is
+# clang. The float32 matmul precision is set per module by setUpModule and restored in
+# tearDownModule. The test class is instantiated per device at the bottom.
 import functools
 import sys
 import unittest
@@ -61,6 +69,8 @@ _PRIOR_FP32_MATMUL_PRECISION: str | None = None
 
 
 def setUpModule():
+    # [FUNCTION DOC] HELPER: Module fixture. Saves the current float32 matmul precision in a
+    # module global, then sets it to highest on ROCm builds and to high otherwise.
     global _PRIOR_FP32_MATMUL_PRECISION
     _PRIOR_FP32_MATMUL_PRECISION = torch.get_float32_matmul_precision()
     if torch.version.hip:
@@ -70,6 +80,8 @@ def setUpModule():
 
 
 def tearDownModule():
+    # [FUNCTION DOC] HELPER: Module fixture. Restores the float32 matmul precision saved by
+    # setUpModule if one was saved, and clears the saved value.
     global _PRIOR_FP32_MATMUL_PRECISION
     if _PRIOR_FP32_MATMUL_PRECISION is not None:
         torch.set_float32_matmul_precision(_PRIOR_FP32_MATMUL_PRECISION)
@@ -121,11 +133,23 @@ if "CLANG" in torch_config_string.upper():
 
 # Keep the existing dtype-in-name suffixes while selecting dtype coverage per device.
 class parametrize_device_dtype(common_utils.parametrize):
+    # [CLASS DOC] HELPER: Parametrization decorator that expands a test over the dtype list of the
+    # device type it is instantiated for. It subclasses the common parametrize helper with the
+    # argument name dtype and no values; the attribute dtypes_attr names which field (all dtypes
+    # or the fast subset) of the per-device config table to read. Test names keep the usual dtype
+    # suffix.
     def __init__(self, dtypes_attr):
+        # [FUNCTION DOC] HELPER: Initialize the base parametrizer for the argument dtype with an
+        # empty value list and remember which config field name to read later.
         super().__init__("dtype", ())
         self.dtypes_attr = dtypes_attr
 
     def _parametrize_test(self, test, generic_cls, device_cls):
+        # [FUNCTION DOC] HELPER: Called per generic test class and device class. Looks up the
+        # dtype list for the device type in the device config table using the stored field name,
+        # then yields for each dtype a tuple of the test, a subtest name built from the index and
+        # dtype, a keyword mapping that sets dtype, and a function returning an empty decorator
+        # list.
         dtypes = getattr(device_configs[device_cls.device_type], self.dtypes_attr)
         for idx, dtype in enumerate(dtypes):
             values = [dtype]
@@ -134,18 +158,25 @@ class parametrize_device_dtype(common_utils.parametrize):
 
 
 def skip_on_cpu(test_func):
+    # [FUNCTION DOC] HELPER: Decorator that wraps a test so it is skipped on CPU with the message
+    # that CPU is unsupported. Returns the wrapped function.
     """Decorator to skip tests that are not supported on CPU."""
     decorated_func = skipCPUIf(True, "Not supported on CPU")(test_func)
     return decorated_func
 
 
 def skip_on_xpu(test_func):
+    # [FUNCTION DOC] HELPER: Decorator that wraps a test so it is skipped on Intel GPU with the
+    # message that it is unsupported. Returns the wrapped function.
     """Decorator to skip tests that are not supported on Intel GPU."""
     decorated_func = skipXPUIf(True, "Not supported on Intel GPU")(test_func)
     return decorated_func
 
 
 def create_attention(score_mod, block_mask, enable_gqa=False, kernel_options=None):
+    # [FUNCTION DOC] HELPER: Return a partial application of flex attention with the given score
+    # modification, block mask, grouped-query flag and kernel options already bound; callers
+    # supply query, key and value.
     return functools.partial(
         flex_attention,
         score_mod=score_mod,
@@ -156,6 +187,9 @@ def create_attention(score_mod, block_mask, enable_gqa=False, kernel_options=Non
 
 
 def create_block_mask_test(score_mod, query, key):
+    # [FUNCTION DOC] HELPER: Build a block mask with batch and head size one from the given mask
+    # function, using the query and key sequence lengths (second to last dimension) and the query
+    # device. Returns the block mask.
     block_mask = create_block_mask(
         score_mod, 1, 1, query.shape[-2], key.shape[-2], query.device
     )
@@ -173,17 +207,27 @@ def _causal(
     token_q: Tensor,
     token_kv: Tensor,
 ) -> Tensor:
+    # [FUNCTION DOC] HELPER: Causal score modification. Keeps the score where the query position
+    # is at least the key/value position, otherwise yields negative infinity. Batch and head are
+    # ignored.
     return torch.where(token_q >= token_kv, score, float("-inf"))
 
 
 def _generate_windowed(offset):
+    # [FUNCTION DOC] HELPER: Factory returning a sliding-window style score modification that
+    # treats the query position as shifted by the given offset.
     def _windowed(score, b, h, q, kv):
+        # [FUNCTION DOC] HELPER: Keeps the score where the query position plus the closed-over
+        # offset is at least the key/value position, otherwise negative infinity.
         return torch.where(q + offset >= kv, score, float("-inf"))
 
     return _windowed
 
 
 def _get_windowed_sdpa_mask(Mq, Mkv, offset, device):
+    # [FUNCTION DOC] HELPER: Build the dense boolean reference mask for the windowed score mod.
+    # Takes a lower-triangular all-true square matrix of size Mkv on the device and returns rows
+    # from offset up to offset plus Mq, giving shape Mq by Mkv.
     return torch.tril(torch.ones(Mkv, Mkv, dtype=torch.bool, device=device))[
         offset : offset + Mq
     ]
@@ -196,6 +240,8 @@ def _rel_bias(
     token_q: Tensor,
     token_kv: Tensor,
 ) -> Tensor:
+    # [FUNCTION DOC] HELPER: Relative position bias. Adds the difference of query and key/value
+    # positions to the score.
     return score + (token_q - token_kv)
 
 
@@ -206,10 +252,15 @@ def _rel_causal(
     token_q: Tensor,
     token_kv: Tensor,
 ) -> Tensor:
+    # [FUNCTION DOC] HELPER: Relative bias combined with causal masking. Where query position is
+    # at least key/value position the score plus the position difference is kept, otherwise
+    # negative infinity.
     return torch.where(token_q >= token_kv, score + (token_q - token_kv), float("-inf"))
 
 
 def _generate_alibi_bias(num_heads: int):
+    # [FUNCTION DOC] HELPER: Factory returning an ALiBi bias score modification for the given
+    # number of heads.
     def _alibi_bias(
         score: Tensor,
         batch: Tensor,
@@ -217,6 +268,9 @@ def _generate_alibi_bias(num_heads: int):
         token_q: Tensor,
         token_kv: Tensor,
     ) -> Tensor:
+        # [FUNCTION DOC] HELPER: Computes a per-head slope as two raised to the negative of (head
+        # index plus one) times eight divided by the head count, and adds the slope times the
+        # signed distance (key/value minus query) to the score.
         scale = torch.exp2(-((head + 1) * 8.0 / num_heads))
         return score + (token_kv - token_q) * scale
 
@@ -224,35 +278,50 @@ def _generate_alibi_bias(num_heads: int):
 
 
 def _inverse_causal(score, b, h, m, n):
+    # [FUNCTION DOC] HELPER: Inverse causal score modification. Keeps the score where the query
+    # position is at most the key/value position, otherwise negative infinity.
     return torch.where(m <= n, score, float("-inf"))
 
 
 def _times_two(score, b, h, m, n):
+    # [FUNCTION DOC] HELPER: Multiplies the score by two. The existing docstring notes the joint
+    # (forward and backward) graph is needed for correctness.
     """Joint graph needed for correctness"""
     return score * 2
 
 
 def _squared(score, b, h, m, n):
+    # [FUNCTION DOC] HELPER: Squares the score elementwise; exercises a joint graph where the
+    # backward needs the input.
     """Joint graph needed for correctness"""
     return score * score
 
 
 def _head_offset(dtype: torch.dtype, device: str):
+    # [FUNCTION DOC] HELPER: Factory for a score modification that captures a buffer. Creates a
+    # random vector with one entry per head, sized by the module-level query head count, on the
+    # given device and dtype, and returns a score modification closing over it.
     """Captured Buffer"""
     head_offset = torch.rand(Hq, device=device, dtype=dtype)
 
     def score_mod(score, b, h, m, n):
+        # [FUNCTION DOC] HELPER: Multiplies the score by the captured entry for the current head
+        # index.
         return score * head_offset[h]
 
     return score_mod
 
 
 def _trig(score, b, h, m, n):
+    # [FUNCTION DOC] HELPER: Returns sine of cosine of the score plus the tangent of the batch
+    # index; exercises a joint graph with several unary ops.
     """Joint graph needed for correctness"""
     return torch.sin(torch.cos(score)) + torch.tan(b)
 
 
 def _trig2(score, b, h, m, n):
+    # [FUNCTION DOC] HELPER: Branching joint graph. Computes cosine and sine of the score,
+    # multiplies them, and adds the tangent of the batch index.
     """Branching joint graph"""
     cos_score = torch.cos(score)
     sin_score = torch.sin(score)
@@ -304,18 +373,30 @@ test_block_size = [
 
 
 def input_strides_1(B, H, S, D):
+    # [FUNCTION DOC] HELPER: Stride config one for key/value inputs of shape batch, heads,
+    # sequence, dim. Returns a pair of strides for a fully contiguous layout and a storage offset
+    # of 997 elements.
     return ((H * S * D, S * D, D, 1), 997)  # offset
 
 
 def input_strides_2(B, H, S, D):
+    # [FUNCTION DOC] HELPER: Stride config two. Returns a pair of strides where the batch and
+    # sequence axes are interleaved (a transposed layout with a large stride on the sequence axis)
+    # and a storage offset of 499.
     return ((H * D, D, B * H * D, 1), 499)  # transposed dimensions
 
 
 def input_strides_3(B, H, S, D):
+    # [FUNCTION DOC] HELPER: Stride config three. Returns a pair of strides based on a head dim
+    # padded by one element, with batch and sequence strides arranged for an extra buffer, and a
+    # storage offset of 293.
     return ((S * (D + 1), B * S * (D + 1), (D + 1), 1), 293)  # additional buffer
 
 
 def input_strides_4(B, H, S, D):
+    # [FUNCTION DOC] HELPER: Stride config four. Returns a pair of strides with a unit stride on
+    # the batch axis, so batch overlaps with other axes (a shared dimension), and a storage offset
+    # of 97.
     return ((1, D, (B + 1) * (H + 1) * D, 1), 97)  # shared dimension
 
 
@@ -333,6 +414,9 @@ def query_key_value_clones(
     value: torch.Tensor,
     dtype: torch.dtype = None,
 ):
+    # [FUNCTION DOC] HELPER: Return detached clones of query, key and value cast to the given
+    # dtype (default: the query dtype). Each clone keeps the requires-grad flag of its source, so
+    # gradients can be compared against references.
     """Clones the query, key, and value tensors and moves them to the specified dtype."""
     if dtype is None:
         dtype = query.dtype
@@ -343,6 +427,10 @@ def query_key_value_clones(
 
 
 def batch_reserve(paged_attention: PagedAttention, target_seq_len: Tensor):
+    # [FUNCTION DOC] HELPER: Reserve page-table space in a paged attention object. Reads the batch
+    # size from the one-dimensional target length tensor and, for each batch index in order,
+    # reserves pages up to that batch entry target sequence length. Mutates the paged attention
+    # state.
     (B,) = target_seq_len.shape
     for b in range(B):
         paged_attention.reserve(
@@ -352,7 +440,16 @@ def batch_reserve(paged_attention: PagedAttention, target_seq_len: Tensor):
 
 
 class TestFlexDecoding(InductorTestCase):
+    # [CLASS DOC] Device-generic tests of flex attention decoding. Each test builds random inputs,
+    # runs flex attention eagerly in float64 (golden) and in the test dtype (reference), runs a
+    # compiled version, and requires the compiled error to be within a factor of the reference
+    # error. State: test_inference_only (set in setUp) is true on CPU, where gradients and log-
+    # sum-exp are not checked. Includes paged attention variants that run on a page-table-backed
+    # KV cache.
     def setUp(self):
+        # [FUNCTION DOC] Fixture. Calls the parent setUp, defaults inference-only mode to false,
+        # and on CPU skips the test when the compiler is clang (long compile times) and otherwise
+        # turns inference-only mode on.
         super().setUp()
         self.test_inference_only = False
         if self.device_type == "cpu":
@@ -370,6 +467,13 @@ class TestFlexDecoding(InductorTestCase):
         fudge_factor: float,
         tensor_name: str | None = None,
     ):
+        # [FUNCTION DOC] HELPER: Compare a compiled result against golden and reference results.
+        # Computes mean absolute error of compiled and reference outputs against golden. Fails if
+        # the compiled error has NaN while the reference has none. If the reference error is tiny
+        # (under 1e-4 of the mean golden magnitude) it prints a note and requires the golden
+        # result (cast to the compiled dtype) to match the compiled one within 0.2 absolute and
+        # relative tolerance. Otherwise fails when the compiled error exceeds the reference error
+        # times fudge_factor, with a message naming the tensor.
         compiled_error = (golden_out - compiled_out).abs().mean()
         ref_error = (golden_out - ref_out).abs().mean()
         if torch.isnan(compiled_error).any() and not torch.isnan(ref_error).any():
@@ -397,6 +501,9 @@ class TestFlexDecoding(InductorTestCase):
         ref_out: torch.Tensor,
         compiled_out: torch.Tensor,
     ):
+        # [FUNCTION DOC] HELPER: Check an output tensor. Under no-grad picks a fudge factor of 10
+        # for float32 and 1.1 for other dtypes (float32 is less accurate than golden due to online
+        # softmax), then runs the equality check labeled Out.
         dtype = ref_out.dtype
         with torch.no_grad():
             # Note, it seems like we really are less accurate than the float32
@@ -425,6 +532,14 @@ class TestFlexDecoding(InductorTestCase):
         device="cuda",
         kernel_options=None,
     ):
+        # [FUNCTION DOC] HELPER: Core eager-versus-compiled flex attention check. Raises an
+        # assertion error if neither score_mod nor block_mask is given or if query heads are not a
+        # multiple of key/value heads; on CPU, half precision is replaced by float32. Creates
+        # random query (batch Q_B, heads Q_H, length Q_S), key and value tensors that require grad
+        # unless inference-only, plus reference clones and float64 golden clones. Runs flex
+        # attention with grouped-query mode when head counts differ; in training mode it compares
+        # log-sum-exp as well as output, in inference mode only the output. The compiled function
+        # is built by torch.compile of the partial attention.
         if score_mod is None and block_mask is None:
             raise AssertionError("Must provide score_mod or block_mask")
         if Q_H % KV_H != 0:
@@ -496,6 +611,11 @@ class TestFlexDecoding(InductorTestCase):
         V_D: int = D,
         device="cuda",
     ):
+        # [FUNCTION DOC] HELPER: Compare a compiled arbitrary attention callable against a golden
+        # callable (default: the same callable). Creates gradient-free random tensors; note the
+        # query uses the key/value head count as its head dimension. Runs the golden callable on
+        # float64 clones and on same-dtype clones, the compiled callable on the originals, and
+        # checks the outputs. CPU half precision is promoted to float32.
         if not golden_call:
             golden_call = sdpa_call
 
@@ -545,6 +665,15 @@ class TestFlexDecoding(InductorTestCase):
         page_size: int = 128,
         device="cuda",
     ):
+        # [FUNCTION DOC] HELPER: Build a paged KV cache and converted mask/score mod for the given
+        # tensors. Raises an assertion error when block_mask is missing; CPU half becomes float32.
+        # Allocates zeroed key and value caches of batch one sized for (pages needed per sequence
+        # times a max batch of larger of query/kv batch plus three), creates a paged attention
+        # manager, reserves pages through four batch_reserve calls with fixed fractions of the KV
+        # length, then assigns the key/value data for each batch row at positions zero to KV
+        # length minus one. Converts the block mask and the score mod using a KV length tensor
+        # filled with the KV length. Returns the key cache, value cache, converted block mask and
+        # converted score mod.
         if block_mask is None:
             raise AssertionError("Must provide block_mask")
         if device == "cpu" and dtype is torch.float16:
@@ -628,6 +757,12 @@ class TestFlexDecoding(InductorTestCase):
         kernel_options: dict | None = None,
         device="cuda",
     ):
+        # [FUNCTION DOC] HELPER: Run compiled flex attention against the paged cache. CPU half
+        # becomes float32; if no block mask is given a no-op mask over the batch, one head, query
+        # length one and the module-level S keys is made. Calls preprocess_paged_attention with
+        # the mask block size as page size, compiles flex attention, and runs it on the cache with
+        # the converted mask and score mod (grouped-query when heads differ). Returns the output
+        # and the log-sum-exp; in inference-only mode the log-sum-exp is None.
         Q_B, Q_H, KV_H = q.shape[0], q.shape[1], k.shape[1]
         if device == "cpu" and dtype is torch.float16:
             dtype = torch.float32
@@ -688,6 +823,12 @@ class TestFlexDecoding(InductorTestCase):
         kernel_options: dict | None = None,
         device="cuda",
     ):
+        # [FUNCTION DOC] HELPER: Compare paged attention against eager flex attention. Raises an
+        # assertion error if query heads are not a multiple of key/value heads. Builds random
+        # gradient-free tensors, golden float64 and reference clones, defaults the block mask to
+        # no-op, computes eager golden and reference outputs with log-sum-exp, runs
+        # run_paged_attention (kernel options go only to this paged run), and checks the output
+        # and, when not inference-only, the log-sum-exp.
         if Q_H % KV_H != 0:
             raise AssertionError(
                 f"Expected Q_H % KV_H == 0, got {Q_H} % {KV_H} = {Q_H % KV_H}"
@@ -761,6 +902,11 @@ class TestFlexDecoding(InductorTestCase):
         V_D: int = D,
         device="cuda",
     ):
+        # [FUNCTION DOC] HELPER: Compare paged attention against scaled dot product attention with
+        # an explicit mask. The query head axis equals the key/value head count and the query
+        # length is multiplied by the group size, folding grouped query heads into the sequence.
+        # Golden and reference outputs come from SDPA with the given dense mask; the block mask
+        # comes from mask_mod or a no-op mask. Runs the paged path and checks the output only.
         if device == "cpu" and dtype is torch.float16:
             dtype = torch.float32
 
@@ -811,6 +957,9 @@ class TestFlexDecoding(InductorTestCase):
     @skip_on_cpu
     @parametrize_device_dtype("dtypes_fast")
     def test_bw_decoding_fails(self, device, dtype):
+        # [FUNCTION DOC] Expected-failure test (the Triton dot does not support embedding sizes
+        # under 16): compiled flex attention with head dim 4 and a tiny query length, followed by
+        # a backward pass. Skipped on CPU.
         make_kv = functools.partial(
             torch.randn,
             (2, 2, 128, 4),
@@ -831,6 +980,8 @@ class TestFlexDecoding(InductorTestCase):
 
         @torch.compile
         def sdpa_hop(q, k, v, score_mod, block_mask):
+            # [FUNCTION DOC] HELPER: Compiled wrapper that calls flex attention with the score
+            # mod; the block mask argument is accepted but not forwarded.
             return flex_attention(q, k, v, score_mod)
 
         output = sdpa_hop(q, k, v, _identity, block_mask)
@@ -845,6 +996,9 @@ class TestFlexDecoding(InductorTestCase):
     def test_builtin_score_mods(
         self, device, dtype: torch.dtype, score_mod: Callable, head_dims
     ):
+        # [FUNCTION DOC] Run every built-in score mod across the head configs and dtypes: asserts
+        # query heads are a multiple of key/value heads, then checks the regular path and the
+        # paged path. TF32 is disabled.
         Hq, Hkv = head_dims
         if Hq % Hkv != 0:
             raise AssertionError(
@@ -868,6 +1022,10 @@ class TestFlexDecoding(InductorTestCase):
         head_dims: tuple[int, int],
         page_size: int,
     ):
+        # [FUNCTION DOC] Check paged attention for different page sizes. Builds a causal mask
+        # shifted by a tensor offset of 192, makes a block mask with the page size as block size
+        # (query length one), and runs the paged comparison for the given score mod and head
+        # counts.
         Hq, Hkv = head_dims
         if Hq % Hkv != 0:
             raise AssertionError(
@@ -875,7 +1033,11 @@ class TestFlexDecoding(InductorTestCase):
             )
 
         def generate_causal_offset(offset: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Factory returning a causal mask function whose query index is
+            # shifted by the given offset tensor.
             def causal_offset_mask(b, h, q_idx, kv_idx):
+                # [FUNCTION DOC] HELPER: True where the offset plus the query index is at least
+                # the key/value index.
                 return (offset + q_idx) >= kv_idx
 
             return causal_offset_mask
@@ -910,6 +1072,8 @@ class TestFlexDecoding(InductorTestCase):
         score_mod: Callable,
         BLOCK_SIZE: int | tuple[int, int],
     ):
+        # [FUNCTION DOC] Check each built-in score mod with different block mask block sizes
+        # (single int or pair) using a no-op mask; only the non-paged path is run.
         block_mask = create_block_mask(
             noop_mask, B, 1, 1, S, BLOCK_SIZE=BLOCK_SIZE, device=device
         )
@@ -919,6 +1083,9 @@ class TestFlexDecoding(InductorTestCase):
     @skip_on_cpu
     @parametrize_device_dtype("dtypes_fast")
     def test_tma_decoding(self, device, dtype: torch.dtype):
+        # [FUNCTION DOC] Skipped unless Triton TMA is available and on CPU. Runs a small ALiBi
+        # case (four heads, head dim 16, key length 128, batch one) with the TMA kernel option
+        # enabled.
         n_heads, head_dim, seq_len = 4, 16, 128
 
         score_mod = _generate_alibi_bias(n_heads)
@@ -944,6 +1111,11 @@ class TestFlexDecoding(InductorTestCase):
     @common_utils.parametrize("v_s", test_input_strides)
     @common_utils.parametrize("head_dims", test_Hq_Hkv)
     def test_strided_inputs(self, device, dtype: torch.dtype, k_s, v_s, head_dims):
+        # [FUNCTION DOC] Check inputs with unusual key/value strides. Builds a flat storage, takes
+        # a query view with transposed batch axis, and views key and value with strided layouts
+        # from the two stride configs. Raises an assertion error if a layout would exceed storage
+        # or its last stride is not one. Compares compiled and eager flex attention with an ALiBi
+        # mod (tolerance 0.2), then compares the paged path to the eager result.
         Hq, Hkv = head_dims
         if Hq % Hkv != 0:
             raise AssertionError(
@@ -1014,6 +1186,9 @@ class TestFlexDecoding(InductorTestCase):
         batch_dims: tuple[int, int],
         score_mod: Callable,
     ):
+        # [FUNCTION DOC] Check broadcasting a single key/value batch over a larger query batch,
+        # with a no-op block mask. Asserts the query batch is above one and the key/value batch
+        # equals one, then runs the standard comparison.
         Hq, Hkv = head_dims
         if Hq % Hkv != 0:
             raise AssertionError(
@@ -1035,7 +1210,11 @@ class TestFlexDecoding(InductorTestCase):
     @supported_platform
     @parametrize_device_dtype("dtypes")
     def test_skip_odd_keys(self, device, dtype: torch.dtype):
+        # [FUNCTION DOC] Score mod that sets odd key/value positions to negative infinity; checked
+        # on both regular and paged paths.
         def score_mod(score, b, h, q, kv):
+            # [FUNCTION DOC] HELPER: Keeps the score at even key/value positions, otherwise
+            # negative infinity.
             return torch.where(kv % 2 == 0, score, float("-inf"))
 
         self.run_test(score_mod, dtype, device=device)
@@ -1044,13 +1223,21 @@ class TestFlexDecoding(InductorTestCase):
     @supported_platform
     @parametrize_device_dtype("dtypes")
     def test_function_composition(self, device, dtype: torch.dtype):
+        # [FUNCTION DOC] Check composing two score mods: add the position difference, then apply
+        # the inverse causal mask. Run on the regular and paged paths.
         def score_mod_1(score, b, h, m, n):
+            # [FUNCTION DOC] HELPER: Adds the query minus key/value position difference to the
+            # score.
             return score + (m - n)
 
         def score_mod_2(score, b, h, m, n):
+            # [FUNCTION DOC] HELPER: Inverse causal mask; keeps the score where query is at most
+            # key/value.
             return torch.where(m <= n, score, float("-inf"))
 
         def composed_score_mod(score, b, h, m, n):
+            # [FUNCTION DOC] HELPER: Applies the first score mod and then the second to the
+            # result.
             return score_mod_2(score_mod_1(score, b, h, m, n), b, h, m, n)
 
         self.run_test(composed_score_mod, dtype, device=device)
@@ -1059,9 +1246,12 @@ class TestFlexDecoding(InductorTestCase):
     @supported_platform
     @parametrize_device_dtype("dtypes")
     def test_captured_buffers(self, device, dtype: torch.dtype):
+        # [FUNCTION DOC] Check a score mod that reads a captured random per-head tensor, on
+        # regular and paged paths.
         head_offset = torch.rand(Hq, device=device, dtype=dtype)
 
         def score_mod(score, b, h, m, n):
+            # [FUNCTION DOC] HELPER: Adds the captured per-head value to the score.
             return score + head_offset[h]
 
         self.run_test(score_mod, dtype, device=device)
@@ -1070,12 +1260,16 @@ class TestFlexDecoding(InductorTestCase):
     @supported_platform
     @parametrize_device_dtype("dtypes")
     def test_captured_buffers_all_dims(self, device, dtype: torch.dtype):
+        # [FUNCTION DOC] Check captured buffers indexed by every argument (head, batch, key/value
+        # position, query position), on regular and paged paths.
         head_scale = torch.randn(Hq, device=device)
         batch_scale = torch.randn(B, device=device)
         kv_scale = torch.randn(S, device=device)
         q_scale = torch.randn(1, device=device)
 
         def all_bias(score, batch, head, token_q, token_kv):
+            # [FUNCTION DOC] HELPER: Adds the captured entries for key/value position, query
+            # position, head and batch to the score.
             score = score + kv_scale[token_kv]
             score = score + q_scale[token_q]
             score = score + head_scale[head]
@@ -1088,10 +1282,15 @@ class TestFlexDecoding(InductorTestCase):
     @supported_platform
     @parametrize_device_dtype("dtypes_fast")
     def test_seq_masking(self, device, dtype):
+        # [FUNCTION DOC] Check masking via a boolean segment tensor whose second half is true:
+        # scores are kept only when query and key/value are in the same segment. Regular and paged
+        # paths.
         seq_idx = torch.zeros(S, device=device, dtype=torch.bool)
         seq_idx[S // 2 :] = 1
 
         def seq_mask_mod(score, b, h, q, kv):
+            # [FUNCTION DOC] HELPER: Keeps the score where the captured segment flags of query and
+            # key/value are equal, otherwise negative infinity.
             return torch.where(seq_idx[q] == seq_idx[kv], score, float("-inf"))
 
         self.run_test(seq_mask_mod, dtype, device=device)
@@ -1099,10 +1298,15 @@ class TestFlexDecoding(InductorTestCase):
 
     @supported_platform
     def test_non_divisible_offset_mask(self, device):
+        # [FUNCTION DOC] Check a mask with a tensor offset when the key/value length (S minus 3)
+        # is not divisible by the block size. Builds a block mask and runs the regular comparison
+        # without score mod.
         KV_S = S - 3
         offset_tensor = torch.tensor(S // 2 - 3, device=device, dtype=torch.int32)
 
         def mask_mod(b, h, q, kv):
+            # [FUNCTION DOC] HELPER: True where the key/value index is at least the query index
+            # plus the captured offset tensor.
             return kv >= q + offset_tensor
 
         block_mask = create_block_mask(mask_mod, B, 1, 1, KV_S, device=device)
@@ -1110,14 +1314,20 @@ class TestFlexDecoding(InductorTestCase):
 
     @supported_platform
     def test_non_divisible_offset_mask_with_captured_buffer(self, device):
+        # [FUNCTION DOC] Same as the non-divisible offset mask test but also with a captured
+        # bfloat16 bias indexed by key/value position as score mod.
         KV_S = S - 3
         offset_kv = torch.randn(KV_S, device=device, dtype=torch.bfloat16)
         offset_tensor = torch.tensor(S // 2 - 3, device=device, dtype=torch.int32)
 
         def score_mod(score, b, h, q, kv):
+            # [FUNCTION DOC] HELPER: Adds the captured bias at the key/value position to the
+            # score.
             return score + offset_kv[kv]
 
         def mask_mod(b, h, q, kv):
+            # [FUNCTION DOC] HELPER: True where key/value index is at least query index plus the
+            # offset tensor.
             return kv >= q + offset_tensor
 
         block_mask = create_block_mask(mask_mod, B, 1, 1, KV_S, device=device)
@@ -1127,11 +1337,15 @@ class TestFlexDecoding(InductorTestCase):
 
     @supported_platform
     def test_non_divisible_multi_token_offset_mask(self, device):
+        # [FUNCTION DOC] Non-divisible key/value length with a query length of three and an offset
+        # mask, no score mod.
         KV_S = S - 3
         Q_S = 3
         offset_tensor = torch.tensor(S // 2 - 1, device=device, dtype=torch.int32)
 
         def mask_mod(b, h, q, kv):
+            # [FUNCTION DOC] HELPER: True where key/value index is at least query index plus the
+            # offset tensor.
             return kv >= q + offset_tensor
 
         block_mask = create_block_mask(mask_mod, B, 1, Q_S, KV_S, device=device)
@@ -1140,6 +1354,9 @@ class TestFlexDecoding(InductorTestCase):
     @supported_platform
     @skip_on_cpu
     def test_non_divisible_multi_token_offset_mask_with_captured_buffer(self, device):
+        # [FUNCTION DOC] Non-divisible key/value length, query length three, offset mask, and a
+        # score mod adding captured bfloat16 biases for key/value and query positions. Skipped on
+        # CPU.
         KV_S = S - 3
         Q_S = 3
         offset_kv = torch.randn(KV_S, device=device, dtype=torch.bfloat16)
@@ -1147,9 +1364,13 @@ class TestFlexDecoding(InductorTestCase):
         offset_tensor = torch.tensor(S // 2 - 3, device=device, dtype=torch.int32)
 
         def score_mod(score, b, h, q, kv):
+            # [FUNCTION DOC] HELPER: Adds captured biases indexed by key/value and query
+            # positions.
             return score + offset_kv[kv] + offset_q[q]
 
         def mask_mod(b, h, q, kv):
+            # [FUNCTION DOC] HELPER: True where key/value index is at least query index plus the
+            # offset tensor.
             return kv >= q + offset_tensor
 
         block_mask = create_block_mask(mask_mod, B, 1, Q_S, KV_S, device=device)
@@ -1164,9 +1385,13 @@ class TestFlexDecoding(InductorTestCase):
     @supported_platform
     @parametrize_device_dtype("dtypes_fast")
     def test_load_from_bias_seq_only(self, device, dtype):
+        # [FUNCTION DOC] Bias loaded with a two-dimensional table indexed by query and key/value
+        # position, checked on regular and paged paths.
         bias = torch.randn(1, S, device=device, dtype=dtype)
 
         def bias_mod(score, b, h, q, kv):
+            # [FUNCTION DOC] HELPER: Adds the table entry at the query and key/value positions to
+            # the score.
             return score + bias[q, kv]
 
         self.run_test(bias_mod, dtype, device=device)
@@ -1175,9 +1400,12 @@ class TestFlexDecoding(InductorTestCase):
     @supported_platform
     @parametrize_device_dtype("dtypes_fast")
     def test_load_from_bias_seq_batch(self, device, dtype):
+        # [FUNCTION DOC] Bias loaded from a table indexed by batch, query and key/value position,
+        # on regular and paged paths.
         bias = torch.randn(B, 1, S, device=device, dtype=dtype)
 
         def bias_mod(score, b, h, q, kv):
+            # [FUNCTION DOC] HELPER: Adds the table entry for batch, query and key/value position.
             return score + bias[b, q, kv]
 
         self.run_test(bias_mod, dtype, device=device)
@@ -1186,6 +1414,8 @@ class TestFlexDecoding(InductorTestCase):
     @supported_platform
     @parametrize_device_dtype("dtypes_fast")
     def test_load_from_bias_head_seq_batch(self, device, dtype):
+        # [FUNCTION DOC] Bias loaded from a four-dimensional table indexed by batch, head, query
+        # and key/value position, on regular and paged paths.
         bias = torch.randn(
             B,
             Hq,
@@ -1196,6 +1426,8 @@ class TestFlexDecoding(InductorTestCase):
         )
 
         def bias_mod(score, b, h, q, kv):
+            # [FUNCTION DOC] HELPER: Adds the table entry for batch, head, query and key/value
+            # position.
             return score + bias[b, h, q, kv]
 
         self.run_test(bias_mod, dtype, device=device)
@@ -1207,6 +1439,8 @@ class TestFlexDecoding(InductorTestCase):
     @common_utils.parametrize("head_dims", [(D, D // 2), (D // 2, D)])
     @with_tf32_off
     def test_non_equal_head_dims(self, device, dtype, score_mod, head_dims):
+        # [FUNCTION DOC] Check different query/key and value head dimensions (each way round) for
+        # every built-in score mod and dtype, on regular and paged paths. TF32 off.
         qk_d, v_d = head_dims
         self.run_test(
             score_mod, dtype, B, Hq, 1, qk_d, B, Hkv, S, V_D=v_d, device=device
@@ -1222,6 +1456,10 @@ class TestFlexDecoding(InductorTestCase):
     def test_head_dependent_mask_mod(
         self, device, dtype: torch.dtype, score_mod, head_dims
     ):
+        # [FUNCTION DOC] Check a mask that depends on head index. Asserts query heads are a
+        # multiple of key/value heads, builds a block mask over all heads from a causal mask that
+        # is also gated by a per-head boolean tensor, and runs the regular test with it. The paged
+        # run uses no block mask argument, so it does not use this mask.
         Hq, Hkv = head_dims
         if Hq % Hkv != 0:
             raise AssertionError(
@@ -1229,6 +1467,9 @@ class TestFlexDecoding(InductorTestCase):
             )
 
         def head_attention_mod(kv_head_num):
+            # [FUNCTION DOC] HELPER: Factory taking a head count. Builds a boolean tensor over
+            # that many heads that is false for head indices divisible by the count (only index
+            # zero) and true otherwise, and returns a mask function using it.
             head_type = torch.tensor(
                 [i % kv_head_num != 0 for i in range(kv_head_num)],
                 dtype=torch.bool,
@@ -1236,6 +1477,8 @@ class TestFlexDecoding(InductorTestCase):
             )
 
             def mask_mod(b, h, q_idx, kv_idx):
+                # [FUNCTION DOC] HELPER: Looks up the head flag for the head index and ANDs it
+                # with the causal condition.
                 bi_mask = head_type[h]
                 causal_mask = q_idx >= kv_idx
 
@@ -1255,10 +1498,17 @@ class TestFlexDecoding(InductorTestCase):
     @supported_platform
     @parametrize_device_dtype("dtypes_fast")
     def test_subgraph_respect_decompostion(self, device, dtype):
+        # [FUNCTION DOC] Check that score-mod subgraphs honor the decomposition table. Traces flex
+        # attention with a score mod using floor division, once with an empty decomposition table
+        # and once with the core ATen decompositions, and compares the generated subgraph code
+        # with expected text: undecomposed uses the floor divide op, decomposed uses division with
+        # floor rounding.
         from torch._decomp import core_aten_decompositions
         from torch.fx.experimental.proxy_tensor import make_fx
 
         def score_mod_func(score, b, h, q, kv):
+            # [FUNCTION DOC] HELPER: Subtracts the floor quotient of query position by one plus
+            # key/value position from the score.
             return score - q // (1 + kv)
 
         make_kv = functools.partial(
@@ -1306,7 +1556,9 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
     @supported_platform
     @parametrize_device_dtype("dtypes_fast")
     def test_silu_on_score(self, device, dtype):
+        # [FUNCTION DOC] Score mod applying SiLU to the score; regular and paged paths.
         def silu_score(score, b, h, q, kv):
+            # [FUNCTION DOC] HELPER: Returns the SiLU activation of the score.
             return torch.nn.functional.silu(score)
 
         self.run_test(silu_score, dtype, device=device)
@@ -1315,10 +1567,19 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
     @supported_platform
     @parametrize_device_dtype("dtypes_fast")
     def test_padded_dense_causal(self, device, dtype):
+        # [FUNCTION DOC] Wraps the causal score mod in a padded-dense wrapper and checks regular
+        # and paged paths.
+        # KNOWN ISSUE: the wrapper compares the score value itself with the per-batch length
+        #   instead of a position, so it is not a real padding mask; it is only a consistent
+        #   numerical test.
         seq_len = torch.arange(B, device=device, dtype=torch.int32) + 1
 
         def create_padded_dense_wrapper(orig_score_mod):
+            # [FUNCTION DOC] HELPER: Factory wrapping a score mod so that its result is kept where
+            # the score is at most the per-batch length and negative infinity elsewhere.
             def njt_score_mod(qk, b, h, q, kv):
+                # [FUNCTION DOC] HELPER: Applies the wrapped score mod, then selects between that
+                # result and negative infinity using the comparison against the captured length.
                 return torch.where(
                     qk <= seq_len[b], orig_score_mod(qk, b, h, q, kv), -float("inf")
                 )
@@ -1333,9 +1594,12 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
     @supported_platform
     @parametrize_device_dtype("dtypes_fast")
     def test_captured_scale(self, device, dtype):
+        # [FUNCTION DOC] Captured zero-dimensional int32 scale tensor added to the score; regular
+        # and paged paths.
         scale = torch.ones((), device=device, dtype=torch.int32)
 
         def score_mod_scale(qk, b, h, q, kv):
+            # [FUNCTION DOC] HELPER: Adds the captured scalar to the score.
             return qk + scale
 
         self.run_test(score_mod_scale, dtype, device=device)
@@ -1344,10 +1608,15 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
     @supported_platform
     @parametrize_device_dtype("dtypes_fast")
     def test_recompile_changed_score_mod(self, device, dtype):
+        # [FUNCTION DOC] Check behavior when a Python variable captured by the score mod changes
+        # between runs. Runs with the flag set (add scale), flips the flag to false (multiply by
+        # scale) and runs again on both paths.
         scale = torch.ones((), device=device, dtype=torch.int32)
         ADD = True
 
         def score_mod_scale(qk, b, h, q, kv):
+            # [FUNCTION DOC] HELPER: Adds or multiplies the score by the captured scalar depending
+            # on the enclosing flag value at call time.
             if ADD:
                 return qk + scale
             else:
@@ -1365,6 +1634,8 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
     @parametrize_device_dtype("dtypes_fast")
     @common_utils.serialTest()
     def test_non_pow_2_headdim(self, device, dtype, head_dim):
+        # [FUNCTION DOC] Decode path with non-power-of-two head dimensions (17, 24, 94, 121) using
+        # relative bias; query length defaults to one. Serial test.
         # Use Q_S=1 (decode path) by not passing Q_S parameter - it defaults to 1
         # This tests the flex_decode kernel with non-power-of-2 head dimensions
         self.run_test(
@@ -1384,15 +1655,21 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
     @expectedFailure  # If we capture a tensor then we can perform a reduction on it, and that shouldn't be allowed
     @parametrize_device_dtype("dtypes_fast")
     def test_captured_reduction(self, device, dtype):
+        # [FUNCTION DOC] Expected-failure test: a score mod performs a reduction over a captured
+        # tensor, which should not be allowed.
         scale = torch.randn((B, 8), device=device)
 
         def score_mod_scale(qk, b, h, q, kv):
+            # [FUNCTION DOC] HELPER: Adds the sum over the last dimension of the captured row for
+            # the batch index.
             return qk + scale[b].sum(dim=-1)
 
         self.run_test(score_mod_scale, dtype, device=device)
 
     @supported_platform
     def test_multiple_score_mod_calls(self, device):
+        # [FUNCTION DOC] Two chained flex attention calls with different score mods in one
+        # function; compiled output must match eager within 0.2 tolerance.
         query = torch.randn((1, 8, 4, 64), dtype=torch.float32, device=device)
         keys = [
             torch.randn((1, 8, 1024, 64), dtype=torch.float32, device=device)
@@ -1404,12 +1681,17 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
         ]
 
         def scoremod_1(qk, b, h, q, kv):
+            # [FUNCTION DOC] HELPER: Adds query minus key/value position to the score.
             return qk + (q - kv)
 
         def scoremod_2(qk, b, h, q, kv):
+            # [FUNCTION DOC] HELPER: Causal mod; keeps the score where query is at least key/value
+            # else negative infinity.
             return torch.where(q >= kv, qk, -float("inf"))
 
         def f(q, k1, k2, v1, v2):
+            # [FUNCTION DOC] HELPER: Runs the first attention with score mod one, feeds its output
+            # as query to a second attention with score mod two, and returns the result.
             q2 = flex_attention(q, k1, v1, score_mod=scoremod_1)
             return flex_attention(q2, k2, v2, score_mod=scoremod_2)
 
@@ -1420,6 +1702,9 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
 
     @supported_platform
     def test_multiple_score_mod_calls2(self, device):
+        # [FUNCTION DOC] Three chained flex attention calls (first through a partial, reusing
+        # score mod one at the end); compiled must match eager with mean absolute difference under
+        # 1e-2.
         query = torch.randn((1, 8, 4, 64), dtype=torch.float32, device=device)
         keys = [
             torch.randn((1, 8, 1024, 64), dtype=torch.float32, device=device)
@@ -1431,14 +1716,18 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
         ]
 
         def scoremod_1(qk, b, h, q, kv):
+            # [FUNCTION DOC] HELPER: Adds query minus key/value position to the score.
             return qk + (q - kv)
 
         def scoremod_2(qk, b, h, q, kv):
+            # [FUNCTION DOC] HELPER: Causal mod; negative infinity where query is below key/value.
             return torch.where(q >= kv, qk, -float("inf"))
 
         attention1 = functools.partial(flex_attention, score_mod=scoremod_1)
 
         def f(q, k1, k2, k3, v1, v2, v3):
+            # [FUNCTION DOC] HELPER: Chains three attentions, the first through a partial, passing
+            # each output as the next query.
             q2 = attention1(q, k1, v1)
             q3 = flex_attention(q2, k2, v2, score_mod=scoremod_2)
             return flex_attention(q3, k3, v3, score_mod=scoremod_1)
@@ -1449,6 +1738,8 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
 
     @supported_platform
     def test_multiple_score_mod_calls_paged_attention(self, device):
+        # [FUNCTION DOC] Two chained attention calls with a no-op block mask; compares eager with
+        # a compiled version that uses paged caches and converted masks/score mods built per call.
         query = torch.randn((1, 8, 4, 64), dtype=torch.float32, device=device)
         keys = [
             torch.randn((1, 8, 1024, 64), dtype=torch.float32, device=device)
@@ -1460,14 +1751,17 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
         ]
 
         def scoremod_1(qk, b, h, q, kv):
+            # [FUNCTION DOC] HELPER: Adds query minus key/value position to the score.
             return qk + (q - kv)
 
         def scoremod_2(qk, b, h, q, kv):
+            # [FUNCTION DOC] HELPER: Causal mod; negative infinity where query is below key/value.
             return torch.where(q >= kv, qk, -float("inf"))
 
         block_mask = create_block_mask(noop_mask, 1, 1, 4, 1024, device=device)
 
         def f(q, k1, k2, v1, v2):
+            # [FUNCTION DOC] HELPER: Eager chain of two attentions with the shared block mask.
             q2 = flex_attention(q, k1, v1, score_mod=scoremod_1, block_mask=block_mask)
             return flex_attention(
                 q2, k2, v2, score_mod=scoremod_2, block_mask=block_mask
@@ -1505,6 +1799,8 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
         )
 
         def paged_f(q, k1, k2, v1, v2):
+            # [FUNCTION DOC] HELPER: Paged chain of two attentions using converted score mods and
+            # block masks on the key/value caches.
             q2 = flex_attention(
                 q,
                 k1,
@@ -1530,6 +1826,9 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
 
     @supported_platform
     def test_multiple_score_mod_calls_paged_attention2(self, device):
+        # [FUNCTION DOC] Three chained attention calls with a no-op block mask; compares eager
+        # with a compiled paged version (converted per-call caches, masks and score mods) with 0.2
+        # tolerance.
         query = torch.randn((1, 8, 4, 64), dtype=torch.float32, device=device)
         keys = [
             torch.randn((1, 8, 1024, 64), dtype=torch.float32, device=device)
@@ -1541,9 +1840,11 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
         ]
 
         def scoremod_1(qk, b, h, q, kv):
+            # [FUNCTION DOC] HELPER: Adds query minus key/value position to the score.
             return qk + (q - kv)
 
         def scoremod_2(qk, b, h, q, kv):
+            # [FUNCTION DOC] HELPER: Causal mod; negative infinity where query is below key/value.
             return torch.where(q >= kv, qk, -float("inf"))
 
         block_mask = create_block_mask(noop_mask, 1, 1, 4, 1024, device=device)
@@ -1553,6 +1854,8 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
         )
 
         def f(q, k1, k2, k3, v1, v2, v3):
+            # [FUNCTION DOC] HELPER: Eager chain of three attentions with the shared block mask,
+            # the first through a partial.
             q2 = attention1(q, k1, v1)
             q3 = flex_attention(q2, k2, v2, score_mod=scoremod_2, block_mask=block_mask)
             return flex_attention(
@@ -1611,6 +1914,8 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
         )
 
         def paged_f(q, k1, k2, k3, v1, v2, v3):
+            # [FUNCTION DOC] HELPER: Paged chain of three attentions using converted score mods
+            # and masks.
             q2 = paged_attention1(q, k1, v1)
             q3 = flex_attention(
                 q2,
@@ -1638,6 +1943,9 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
     @supported_platform
     @parametrize_device_dtype("dtypes")
     def test_njt_causal(self, device, dtype):
+        # [FUNCTION DOC] Nested-jagged-tensor style causal mask: builds segment offsets and a per-
+        # position segment index and wraps the causal mod so positions are relative to their own
+        # segment. Checked on regular and paged paths.
         offsets = torch.tensor(
             [0, 1024, 1024 + 512, S], device=device, dtype=torch.int32
         )
@@ -1646,7 +1954,11 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
             seq_idx[offsets[idx] : offsets[idx + 1]] = idx
 
         def create_njt_wrapper(orig_score_mod, offsets, seq_idx):
+            # [FUNCTION DOC] HELPER: Factory returning a score mod that maps query and key/value
+            # positions to segment-relative positions before calling the wrapped mod.
             def njt_score_mod(qk, b, h, q, kv):
+                # [FUNCTION DOC] HELPER: Subtracts the segment start offset from the query and
+                # key/value positions and calls the original score mod with them.
                 q_nested = q - offsets[seq_idx[q]]
                 kv_nested = kv - offsets[seq_idx[kv]]
                 return orig_score_mod(qk, b, h, q_nested, kv_nested)
@@ -1661,6 +1973,9 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
     @supported_platform
     @skip_on_cpu
     def test_mixed_dtypes(self, device):
+        # [FUNCTION DOC] Mixed dtypes: query in high precision, key/value converted to a low
+        # precision type (FP8 if the platform supports it, else float16), compiled with the Triton
+        # decode backend. Only checks output shape and dtype equal the query. Skipped on CPU.
         dtype_high = torch.float16 if PLATFORM_SUPPORTS_FP8 else torch.float32
         dtype_low = e4m3_type if PLATFORM_SUPPORTS_FP8 else torch.float16
         query = torch.randn((1, 1, 8, 64), dtype=dtype_high, device=device)
@@ -1681,6 +1996,10 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
     @skip_on_cpu
     @unittest.skipUnless(PLATFORM_SUPPORTS_FP8, "FP8 is not supported on this platform")
     def test_mixed_dtypes_sqnr_per_tensor(self, device):
+        # [FUNCTION DOC] FP8 per-tensor quantization check. Scales key and value by their global
+        # maximum to FP8, dequantizes the key inside the score mod and the value after attention,
+        # and requires the signal-to-noise ratio against an unquantized bfloat16 reference above
+        # 10. Skipped on CPU or without FP8.
         query_ref = torch.testing.make_tensor(
             (1, 1, 8, 64), dtype=torch.bfloat16, device=device
         )
@@ -1698,6 +2017,8 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
         value_fp8 = (value_ref / value_scale).to(e4m3_type)
 
         def score_mod(score, b, h, m, n):
+            # [FUNCTION DOC] HELPER: Multiplies the score by the per-tensor key scale
+            # (dequantization).
             # Dequantize keys inside the attention score computation
             return score * key_scale
 
@@ -1719,6 +2040,9 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
     @skip_on_cpu
     @unittest.skipUnless(PLATFORM_SUPPORTS_FP8, "FP8 is not supported on this platform")
     def test_mixed_dtypes_sqnr_per_head(self, device):
+        # [FUNCTION DOC] FP8 quantization check with a scale per batch and head. Same structure as
+        # the per-tensor variant but with scales computed per batch and head and indexed in the
+        # score mod. Requires SNR above 10. Skipped on CPU or without FP8.
         query_ref = torch.testing.make_tensor(
             (1, 4, 8, 64), dtype=torch.bfloat16, device=device
         )
@@ -1741,6 +2065,8 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
         value_fp8 = (value_ref / value_scale_b).to(e4m3_type)
 
         def score_mod(score, b, h, m, n):
+            # [FUNCTION DOC] HELPER: Multiplies the score by the key scale for the current batch
+            # and head.
             # Dequantize keys inside the attention score computation
             return score * key_scale[b, h]
 
@@ -1761,6 +2087,8 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
     @supported_platform
     @skip_on_cpu
     def test_mixed_dtype_backwards(self, device):
+        # [FUNCTION DOC] Backward with mixed query/key/value dtypes must raise an inductor error
+        # stating the backward pass with mixed dtype is not supported. Skipped on CPU.
         dtype_high = torch.float16 if PLATFORM_SUPPORTS_FP8 else torch.float32
         dtype_low = e4m3_type if PLATFORM_SUPPORTS_FP8 else torch.float16
         q = torch.testing.make_tensor(
@@ -1800,7 +2128,11 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
     @parametrize_device_dtype("dtypes")
     @common_utils.parametrize("partition_size", [64, 128, 256, 1024])
     def test_flash_decoding_partition_size(self, device, dtype, partition_size):
+        # [FUNCTION DOC] Flash-decoding partition size option on CPU only (skipped on CUDA and
+        # XPU). Runs the paged comparison with a short key length and the partition size option
+        # set.
         def score_mod(score, b, h, m, n):
+            # [FUNCTION DOC] HELPER: Multiplies the score by two.
             return score * 2
 
         self.run_test_with_paged_attention(
@@ -1814,7 +2146,11 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
     @supported_platform
     @patch.object(torch._inductor.config, "max_autotune", True)
     def test_max_autotune(self, device):
+        # [FUNCTION DOC] With max_autotune enabled in the inductor config, runs the regular and
+        # paged paths with a simple score mod, plus a small bfloat16 paged case (head dim 16, one
+        # head).
         def score_mod(score, b, h, m, n):
+            # [FUNCTION DOC] HELPER: Multiplies the score by two.
             return score * 2
 
         self.run_test(score_mod, device=device)
@@ -1838,6 +2174,10 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
     @unittest.skipIf(not TEST_ON_CUDA or torch.version.hip, "requires CUDA")
     @largeTensorTest("16GB", inductor=True)
     def test_large_kv_decode_int64_pointer_math(self, device):
+        # [FUNCTION DOC] Skipped unconditionally (out of memory in CI). Checks 64-bit pointer math
+        # for a huge key/value length where the head-dim product exceeds the 32-bit range: only
+        # the last 128 positions are populated and unmasked, and the compiled decode output is
+        # compared with a float32 reference on that tail.
         H, D = 1, 128
         Q_S = 1
         dtype = torch.bfloat16
@@ -1852,6 +2192,7 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
         v[:, :, -tail:, :] = torch.randn(1, H, tail, D, device=device, dtype=dtype)
 
         def mask_mod(b, h, q_idx, kv_idx):
+            # [FUNCTION DOC] HELPER: True for key/value positions in the last tail positions.
             return kv_idx >= (KV_S - tail)
 
         block_mask = create_block_mask(mask_mod, 1, 1, Q_S, KV_S, device=device)
@@ -1874,12 +2215,16 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
     @supported_platform
     @patch.object(torch._inductor.config, "max_autotune", True)
     def test_max_autotune_with_captured(self, device):
+        # [FUNCTION DOC] With max_autotune on, a score mod using four captured vectors indexed by
+        # key/value, query, batch and head; regular and paged paths.
         head_scale = torch.randn(Hq, device=device)
         batch_scale = torch.randn(B, device=device)
         tok_scale = torch.randn(S, device=device)
         q_scale = torch.randn(1, device=device)
 
         def bias_mod(score, batch, head, token_q, token_kv):
+            # [FUNCTION DOC] HELPER: Adds captured biases for key/value position, query position,
+            # batch and head.
             score = score + tok_scale[token_kv]
             score = score + q_scale[token_q]
             score = score + batch_scale[batch]
@@ -1891,6 +2236,10 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
 
     @supported_platform
     def test_fully_masked_out_rows_0_check_gqa(self, device):
+        # [FUNCTION DOC] Fully masked-out rows (query index at or beyond half the length) with
+        # grouped-query attention and no NaNs. In training mode requires infinite-negative log-
+        # sum-exp in masked rows and zero query gradient there; in all modes requires zero output
+        # in masked rows.
         # Ensure fully masked out rows won't cause NaNs.
         query = torch.randn(
             (B, Hq, S, D),
@@ -1914,6 +2263,7 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
         M = S // 2
 
         def mask_mod(b, h, q, kv):
+            # [FUNCTION DOC] HELPER: True for query positions below half the sequence length.
             return q < M
 
         block_mask = create_block_mask(mask_mod, 1, 1, S, S, device=device)
@@ -1946,6 +2296,8 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
 
     @supported_platform
     def test_windowed_no_mask_vs_sdpa(self, device):
+        # [FUNCTION DOC] Windowed score mod (no block mask) against SDPA with an explicit dense
+        # window mask, query length 8 and 16 heads.
         score_mod = _generate_windowed(1000)
         attention = functools.partial(flex_attention, score_mod=score_mod)
 
@@ -1961,7 +2313,11 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
 
     @supported_platform
     def test_windowed_full_mask_vs_sdpa(self, device):
+        # [FUNCTION DOC] Windowed score mod plus an equivalent block mask against SDPA with the
+        # dense window mask.
         def mask_mod(b, h, q, kv):
+            # [FUNCTION DOC] HELPER: True where the query index plus 1000 is at least the
+            # key/value index.
             return q + 1000 >= kv
 
         score_mod = _generate_windowed(1000)
@@ -1982,7 +2338,11 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
 
     @supported_platform
     def test_windowed_partial_block_vs_sdpa(self, device):
+        # [FUNCTION DOC] Window expressed only as a block mask (no score mod) against SDPA with
+        # the dense window mask.
         def mask_mod(b, h, q, kv):
+            # [FUNCTION DOC] HELPER: True where the query index plus 1000 is at least the
+            # key/value index.
             return q + 1000 >= kv
 
         block_mask = create_block_mask(mask_mod, 1, 1, 8, S, device=device)
@@ -1999,6 +2359,7 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
 
     @supported_platform
     def test_windowed_no_mask_vs_sdpa_paged_attention(self, device):
+        # [FUNCTION DOC] Windowed score mod only, paged attention against SDPA with a dense mask.
         score_mod = _generate_windowed(1000)
 
         sdpa_mask = _get_windowed_sdpa_mask(8, S, 1000, device)
@@ -2009,7 +2370,11 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
 
     @supported_platform
     def test_windowed_full_mask_vs_sdpa_paged_attention(self, device):
+        # [FUNCTION DOC] Windowed score mod plus window mask function, paged attention against
+        # SDPA with the dense mask.
         def mask_mod(b, h, q, kv):
+            # [FUNCTION DOC] HELPER: True where the query index plus 1000 is at least the
+            # key/value index.
             return q + 1000 >= kv
 
         score_mod = _generate_windowed(1000)
@@ -2020,7 +2385,11 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
 
     @supported_platform
     def test_windowed_partial_block_vs_sdpa_paged_attention(self, device):
+        # [FUNCTION DOC] Window mask function only (no score mod), paged attention against SDPA
+        # with the dense mask.
         def mask_mod(b, h, q, kv):
+            # [FUNCTION DOC] HELPER: True where the query index plus 1000 is at least the
+            # key/value index.
             return q + 1000 >= kv
 
         sdpa_mask = _get_windowed_sdpa_mask(8, S, 1000, device)
@@ -2034,6 +2403,10 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
     @parametrize_device_dtype("dtypes")
     @common_utils.parametrize("score_mod", [_identity, _causal])
     def test_logsumexp_correctness(self, device, dtype, score_mod):
+        # [FUNCTION DOC] Log-sum-exp correctness for identity and causal mods. Compiles flex
+        # attention (default backend) and an aot_eager version run in float64 as reference;
+        # requires the reference log-sum-exp to be float64, the compiled one float32, and output
+        # and log-sum-exp to match within 0.02. Skipped on CPU.
         make_kv = functools.partial(
             torch.randn,
             (B, Hkv, S, D),
@@ -2052,10 +2425,13 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
 
         @torch.compile
         def sdpa_hop(q, k, v, score_mod):
+            # [FUNCTION DOC] HELPER: Compiled wrapper calling flex attention with log-sum-exp
+            # returned.
             return flex_attention(q, k, v, score_mod, return_lse=True)
 
         @torch.compile(backend="aot_eager")
         def eager_sdpa_hop(q, k, v, score_mod):
+            # [FUNCTION DOC] HELPER: Same wrapper compiled with the aot_eager backend.
             return flex_attention(q, k, v, score_mod, return_lse=True)
 
         ref_out, ref_lse = eager_sdpa_hop(
@@ -2086,6 +2462,9 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
     @supported_platform
     @skip_on_cpu
     def test_not_pw_of_two(self, device):
+        # [FUNCTION DOC] Smoke test: compiles flex attention with 12 query heads, 2 key/value
+        # heads, head dim 16 (grouped, not power-of-two head ratio) and only requires it to run.
+        # Skipped on CPU.
         query = torch.randn(1, 12, 1, 16, device=device)
         key = torch.randn(1, 2, 128, 16, device=device)
         value = torch.randn(1, 2, 128, 16, device=device)
@@ -2096,6 +2475,9 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
     @supported_platform
     @skip_on_cpu
     def test_logsumexp_only_return(self, device):
+        # [FUNCTION DOC] Compiles a function that uses only the log-sum-exp output of flex
+        # attention and checks the generated code still contains the flex attention kernel.
+        # Skipped on CPU.
         make_q = functools.partial(
             torch.randn,
             (B, Hkv, Hq // Hkv, D),
@@ -2115,6 +2497,8 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
 
         @torch.compile
         def func(q, k, v, score_mod):
+            # [FUNCTION DOC] HELPER: Returns twice the log-sum-exp from flex attention, discarding
+            # the output.
             _, lse = flex_attention(q, k, v, score_mod, return_lse=True)
             lse_2 = lse * 2
             return lse_2
@@ -2127,13 +2511,21 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
 
     @supported_platform
     def test_non_sparse_mulitple_block_size(self, device):
+        # [FUNCTION DOC] Non-sparse mask with a key/value length (65) not a multiple of the block
+        # size and a causal offset mask; runs regular and paged paths with float32 and head dim
+        # 16.
         def generate_causal_offset(offset: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Factory returning a causal mask function shifted by the
+            # offset tensor.
             def causal_offset_mask(b, h, q_idx, kv_idx):
+                # [FUNCTION DOC] HELPER: True where offset plus query index is at least the
+                # key/value index.
                 return (offset + q_idx) >= kv_idx
 
             return causal_offset_mask
 
         def noop(score, b, h, q_idx, kv_idx):
+            # [FUNCTION DOC] HELPER: Identity score mod, defined but not used in this test.
             return score
 
         mod = generate_causal_offset(
@@ -2172,6 +2564,9 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
 
     @supported_platform
     def test_do_not_trigger_dynamic_shapes_on_empty_block_mask(self, device):
+        # [FUNCTION DOC] Resets dynamo, then runs flex attention with growing key/value lengths
+        # and compares compiled with eager. Checks the successful frame counter: one after the
+        # first length, two afterwards, so dynamic shapes are triggered only once.
         torch._dynamo.reset()
         H = Hq
         q = torch.randn(B, H, 1, D, device=device)
@@ -2194,7 +2589,12 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
     @supported_platform
     @common_utils.parametrize("q_seq_len", [4, 8, 16, 23, 64])
     def test_multi_block_m(self, q_seq_len, device):
+        # [FUNCTION DOC] Multiple query-row blocks in the decode kernel: parametrized query
+        # lengths with a causal mask, block size 16, 32 query and 8 key/value heads, kernel block
+        # sizes 16; compiled must match eager within 5e-3.
         def mask_mod(b, h, q_idx, kv_idx):
+            # [FUNCTION DOC] HELPER: Causal mask; true where query index is at least key/value
+            # index.
             return q_idx >= kv_idx
 
         B, KV_SEQ_LEN, NUM_Q_HEAD, NUM_KV_HEAD, HEAD_DIM = 1, 128, 32, 8, 128
@@ -2233,7 +2633,12 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
     @supported_platform
     @parametrize_device_dtype("dtypes_fast")
     def test_larger_block_mask_bug(self, device, dtype):
+        # [FUNCTION DOC] Regression test for a block mask larger than needed: batch 2, shared
+        # head, length 2, causal mask, dynamic shapes off; compiled output must match eager within
+        # 5e-3.
         def mask_mod(b, h, q_idx, kv_idx):
+            # [FUNCTION DOC] HELPER: Causal mask; true where query index is at least key/value
+            # index.
             return q_idx >= kv_idx
 
         mask_2 = create_block_mask(
@@ -2263,10 +2668,17 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
     def test_decode_at_different_input_position(
         self, device, dtype: torch.dtype, score_mod: Callable
     ):
+        # [FUNCTION DOC] Decoding at different positions for several requests. Builds four
+        # requests with different prefill lengths, computes eager per-request references (golden
+        # float64 and reference), prefills a paged KV cache after reserving pages, then runs a
+        # compiled attention on the batch with the converted mask and score mod and checks with
+        # the error-ratio comparison.
         n_pages, page_size, max_batch_size, max_seq_len = 32, 64, 4, 512
         n_heads, head_dim = 4, 16
 
         def causal_mask(b, h, q, kv):
+            # [FUNCTION DOC] HELPER: Causal mask; true where query index is at least key/value
+            # index.
             return q >= kv
 
         block_mask = create_block_mask(
