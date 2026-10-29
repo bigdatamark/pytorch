@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [PACKAGE DOC]
+# Reference implementations of torch.special functions (Bessel functions, entr,
+# erfcx, expit, i0e/i1/i1e, log_ndtr, logit, ndtr, ndtri, softmax variants,
+# xlog1py, multigammaln, zeta), built from prims and other refs with type
+# promotion wrappers; many are registered as aten decompositions on import.
 import math
 from typing import Optional, Union
 
@@ -50,6 +55,7 @@ aten = torch._ops.ops.aten
     ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
 )
 def bessel_j0(a: TensorLikeType) -> TensorLikeType:
+    # [FUNCTION DOC] Elementwise Bessel function of the first kind, order 0, via prim; ints promote to float.
     return prims.bessel_j0(a)
 
 
@@ -57,6 +63,7 @@ def bessel_j0(a: TensorLikeType) -> TensorLikeType:
     ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
 )
 def bessel_j1(a: TensorLikeType) -> TensorLikeType:
+    # [FUNCTION DOC] Elementwise Bessel function of the first kind, order 1, via prim; ints promote to float.
     return prims.bessel_j1(a)
 
 
@@ -67,6 +74,8 @@ def bessel_j1(a: TensorLikeType) -> TensorLikeType:
     type_promotion_kind=utils.ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
 )
 def entr(a: TensorLikeType) -> TensorLikeType:
+    # [FUNCTION DOC] Elementwise entropy term: NaN stays NaN, negative x gives negative infinity,
+    # zero gives 0, positive gives minus x times log x.
     return torch.where(
         torch.isnan(a),
         a,
@@ -81,6 +90,7 @@ def entr(a: TensorLikeType) -> TensorLikeType:
     type_promotion_kind=utils.ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
 )
 def erfcx(a: TensorLikeType) -> TensorLikeType:
+    # [FUNCTION DOC] Elementwise scaled complementary error function via prim.
     return prims.erfcx(a)
 
 
@@ -92,6 +102,7 @@ expit = _make_alias(torch.sigmoid, "expit")
     ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
 )
 def i0e(a: TensorLikeType) -> TensorLikeType:
+    # [FUNCTION DOC] Elementwise exponentially scaled modified Bessel function, order 0, via prim.
     return prims.bessel_i0e(a)
 
 
@@ -99,6 +110,7 @@ def i0e(a: TensorLikeType) -> TensorLikeType:
     ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
 )
 def i1(a: TensorLikeType) -> TensorLikeType:
+    # [FUNCTION DOC] Elementwise modified Bessel function of the first kind, order 1, via prim.
     return prims.bessel_i1(a)
 
 
@@ -106,6 +118,7 @@ def i1(a: TensorLikeType) -> TensorLikeType:
     ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
 )
 def i1e(a: TensorLikeType) -> TensorLikeType:
+    # [FUNCTION DOC] Elementwise exponentially scaled modified Bessel function, order 1, via prim.
     return prims.bessel_i1e(a)
 
 
@@ -116,6 +129,8 @@ def i1e(a: TensorLikeType) -> TensorLikeType:
     type_promotion_kind=utils.ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
 )
 def log_ndtr(a: TensorLikeType) -> TensorLikeType:
+    # [FUNCTION DOC] Elementwise log of the standard normal CDF. Uses erfcx for inputs below 1
+    # (numerically stable for large negatives) and log1p of minus half erfc otherwise.
     # Note: M_SQRT1_2 is the value of 1 / sqrt(2)
     M_SQRT1_2 = 0.707106781186547524400844362104849039
     t = a * M_SQRT1_2
@@ -133,6 +148,9 @@ def log_ndtr(a: TensorLikeType) -> TensorLikeType:
     type_promotion_kind=utils.ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
 )
 def logit(self: TensorLikeType, eps: float | None = None) -> TensorLikeType:
+    # [FUNCTION DOC] Elementwise log of x/(1-x). If eps is given, input is first clamped to
+    # [eps, 1-eps]; if eps is None, eps is -1.0, which makes the clamp bounds -1 and 2
+    # (effectively unclamped for typical inputs).
     if eps is None:
         eps = -1.0
     lo = eps
@@ -148,6 +166,9 @@ def logit(self: TensorLikeType, eps: float | None = None) -> TensorLikeType:
     type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
 )
 def xlog1py(a: TensorLikeType | NumberType, b: TensorLikeType | NumberType):
+    # [FUNCTION DOC] Elementwise a times log1p(b), defined as 0 where a is 0, and NaN where b is NaN.
+    # At least one argument must be a tensor (error otherwise); a scalar partner is
+    # converted to a scalar tensor of the other's dtype and device.
     torch._check(
         isinstance(a, TensorLike) or isinstance(b, TensorLike),
         lambda: 'Expected either argument a or b to be a Tensor"',
@@ -177,6 +198,9 @@ def xlog1py(a: TensorLikeType | NumberType, b: TensorLikeType | NumberType):
     type_promotion_kind=utils.ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
 )
 def multigammaln(a: TensorLikeType, p: int) -> TensorLikeType:
+    # [FUNCTION DOC] Multivariate log-gamma of dimension p: sum of lgamma over a shifted by
+    # half-integer offsets plus the constant p(p-1)/4 times log pi. Does not validate
+    # that a exceeds the (p-1)/2 domain bound.
     c = 0.25 * p * (p - 1) * math.log(math.pi)
     b = 0.5 * torch.arange(start=(1 - p), end=1, step=1, dtype=a.dtype, device=a.device)
     return torch.sum(torch.lgamma(a.unsqueeze(-1) + b), dim=-1) + c
@@ -189,6 +213,7 @@ def multigammaln(a: TensorLikeType, p: int) -> TensorLikeType:
     type_promotion_kind=utils.ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
 )
 def ndtr(a: TensorLikeType) -> TensorLikeType:
+    # [FUNCTION DOC] Elementwise standard normal CDF: half of one plus erf(x / sqrt 2).
     # Note: M_SQRT1_2 is the value of 1 / sqrt(2)
     M_SQRT1_2 = 0.707106781186547524400844362104849039
     a_sqrt_2 = a * M_SQRT1_2
@@ -202,6 +227,7 @@ def ndtr(a: TensorLikeType) -> TensorLikeType:
     type_promotion_kind=utils.ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
 )
 def ndtri(a: TensorLikeType) -> TensorLikeType:
+    # [FUNCTION DOC] Elementwise inverse of the standard normal CDF via prim.
     return prims.ndtri(a)
 
 
@@ -212,6 +238,7 @@ def log_softmax(
     dim: int,
     dtype: torch.dtype | None = None,
 ) -> TensorLikeType:
+    # [FUNCTION DOC] Forwarding alias of torch.log_softmax over dim with optional dtype; no out argument.
     return torch.log_softmax(a=a, dim=dim, dtype=dtype)  # type: ignore[call-overload]
 
 
@@ -222,6 +249,7 @@ def softmax(
     dim: int,
     dtype: torch.dtype | None = None,
 ) -> TensorLikeType:
+    # [FUNCTION DOC] Forwarding alias of torch.softmax over dim with optional dtype; no out argument.
     return torch.softmax(a=a, dim=dim, dtype=dtype)  # type: ignore[call-overload]
 
 
@@ -229,6 +257,7 @@ def softmax(
     ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
 )
 def spherical_bessel_j0(a: TensorLikeType) -> TensorLikeType:
+    # [FUNCTION DOC] Elementwise spherical Bessel function of the first kind, order 0, via prim.
     return prims.spherical_bessel_j0(a)
 
 
@@ -237,4 +266,5 @@ def spherical_bessel_j0(a: TensorLikeType) -> TensorLikeType:
     type_promotion_kind=utils.ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
 )
 def zeta(a: TensorLikeType, b: TensorLikeType) -> TensorLikeType:
+    # [FUNCTION DOC] Elementwise Hurwitz zeta function of a and b via prim; binary op with int to float promotion.
     return prims.zeta(a, b)

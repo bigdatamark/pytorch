@@ -1,4 +1,8 @@
 # mypy: disallow-untyped-defs
+# [MODULE DOC]
+# Meta-only CLI-based function profiler using the strobeclient tool: StrobelightCLIFunctionProfiler,
+# its error type and a strobelight decorator. Import-time side effects: configures the module logger
+# (console handler, INFO level, no propagation).
 
 import functools
 import logging
@@ -30,12 +34,15 @@ _R = TypeVar("_R")
 
 
 class StrobelightCLIProfilerError(Exception):
+    # [CLASS DOC] Exception raised for any failure in starting, stopping or reading a strobelight profiling run.
     """
     Raised when an error happens during strobelight profiling
     """
 
 
 def _pid_namespace_link(pid: int | None = None) -> str:
+    # [FUNCTION DOC] HELPER: Returns the target of the proc pid namespace symlink (for example a pid bracket id string)
+    # for pid, defaulting to the current process. Raises OS errors if the link cannot be read.
     """Returns the link to the process's namespace, example: pid:[4026531836]"""
     PID_NAMESPACE_PATH = "/proc/{}/ns/pid"
     pid = pid or os.getpid()
@@ -43,6 +50,7 @@ def _pid_namespace_link(pid: int | None = None) -> str:
 
 
 def _pid_namespace(pid: int | None = None) -> int:
+    # [FUNCTION DOC] HELPER: Returns the integer pid namespace id parsed from the namespace link of pid (default current).
     """Returns the process's namespace id"""
     pid = pid or os.getpid()
     link = _pid_namespace_link(pid)
@@ -50,10 +58,17 @@ def _pid_namespace(pid: int | None = None) -> int:
 
 
 def _command_to_string(command: Sequence[str]) -> str:
+    # [FUNCTION DOC] HELPER: Joins a command argument sequence into one space-separated string for logging.
     return " ".join(command)
 
 
 class StrobelightCLIFunctionProfiler:
+    # [CLASS DOC] Meta-internal profiler that runs the strobeclient CLI around a Python function call and
+    # logs a strobelight result. State: configuration (stop_at_error, duration, sample interval, user name,
+    # timeouts, sample tags), current_run_id and profile_result of the latest run. A class-level lock allows
+    # only one profile at a time. Errors are swallowed (work function still runs) unless stop_at_error.
+    # KNOWN ISSUE: recorded_env_variables, stack_max_len and async_stack_max_len are accepted but unused;
+    # the two timeout settings are stored but never applied.
     """
     Note: this is a Meta only tool.
 
@@ -83,6 +98,7 @@ class StrobelightCLIFunctionProfiler:
         stack_max_len: int = 127,
         async_stack_max_len: int = 127,
     ):
+        # [FUNCTION DOC] Stores the profiling configuration and initializes current_run_id and profile_result to None.
         self.stop_at_error = stop_at_error
         self.max_profile_duration_sec = max_profile_duration_sec
         self.sample_each = sample_each
@@ -96,6 +112,9 @@ class StrobelightCLIFunctionProfiler:
         self.sample_tags = sample_tags
 
     def _run_async(self) -> None:
+        # [FUNCTION DOC] HELPER: Starts an asynchronous pyperf cycles profile of the current process via the strobeclient
+        # CLI (with sample interval, duration and optional sample tags) and stores the run id parsed from
+        # its stderr in current_run_id. Raises StrobelightCLIProfilerError on nonzero exit or unparseable output.
         processId = os.getpid()
         namespace = _pid_namespace(processId)
         command = [
@@ -137,6 +156,9 @@ class StrobelightCLIFunctionProfiler:
         )
 
     def _wait_for_running(self, counter: int = 0) -> None:
+        # [FUNCTION DOC] HELPER: Polls the run status via the CLI until RUNNING, sleeping 10 seconds and recursing while
+        # PREPARING. Raises StrobelightCLIProfilerError on CLI failure, unexpected status or output, or after
+        # more than 20 retries (counter is the recursion depth).
         if counter > 20:
             raise StrobelightCLIProfilerError(
                 "wait_for_running called more than 20 times"
@@ -167,6 +189,8 @@ class StrobelightCLIFunctionProfiler:
         raise StrobelightCLIProfilerError(f"unexpected output\n: {output} ")
 
     def _stop_run(self) -> None:
+        # [FUNCTION DOC] HELPER: Stops the current run via the CLI. Raises StrobelightCLIProfilerError if the command fails
+        # or its output does not report success.
         command = ["strobeclient", "stopRun", "--run-id", str(self.current_run_id)]
         logger.debug("running command: %s", _command_to_string(command))
         result = subprocess.run(command, capture_output=True)
@@ -190,6 +214,11 @@ class StrobelightCLIFunctionProfiler:
         raise StrobelightCLIProfilerError(f"unexpected output\n: {output} ")
 
     def _get_results(self) -> None:
+        # [FUNCTION DOC] HELPER: Fetches run status via the CLI; if still PROCESSING, sleeps 10 seconds and retries
+        # recursively. Raises on CLI failure or an unexpected status. Then collects summary lines (total
+        # samples, GraphProfiler, icicle view) into profile_result and logs them.
+        # KNOWN ISSUE: profile_result is extended with the characters of each matched string rather than whole
+        # lines, since a string is added to a list in place.
         command = ["strobeclient", "getRunStatus", "--run-id", str(self.current_run_id)]
         logger.debug("running command: %s", _command_to_string(command))
         result = subprocess.run(command, capture_output=True)
@@ -224,6 +253,8 @@ class StrobelightCLIFunctionProfiler:
         self,
         collect_results: bool,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Stops the run and optionally collects results; any exception is logged as a warning and
+        # not propagated.
         try:
             # call stop run
             self._stop_run()
@@ -240,6 +271,8 @@ class StrobelightCLIFunctionProfiler:
 
     # Return true if strobelight started and is running. Never throw.
     def _start_strobelight(self) -> bool:
+        # [FUNCTION DOC] HELPER: Starts a run and waits until it is running. Returns True on success; on any failure logs a
+        # warning, stops a partially started run, and returns False. Never raises.
         strobelight_started = False
         try:
             self._run_async()
@@ -258,6 +291,13 @@ class StrobelightCLIFunctionProfiler:
     def profile(
         self, work_function: Callable[_P, _R], *args: _P.args, **kwargs: _P.kwargs
     ) -> _R | None:
+        # [FUNCTION DOC] Runs work_function with the given arguments under strobelight and returns its result. Resets
+        # current_run_id/profile_result. Takes the class-wide lock without blocking. If profiler start fails,
+        # raises when stop_at_error else runs the function unprofiled. If the function raises, profiling is
+        # stopped without results, the lock released and the error re-raised. On success stops and collects
+        # results, logging the elapsed time.
+        # KNOWN ISSUE: if the lock is already held the function returns None without running work_function; the
+        # inner concurrent-run handling (raise or run anyway) is unreachable.
         self.current_run_id = None
         self.profile_result = None
 
@@ -306,14 +346,19 @@ class StrobelightCLIFunctionProfiler:
 def strobelight(
     profiler: StrobelightCLIFunctionProfiler | None = None, **kwargs: Any
 ) -> Callable[[Callable[_P, _R]], Callable[_P, _R | None]]:
+    # [FUNCTION DOC] Decorator factory: wraps a function so each call goes through the profile method of the given
+    # profiler, or of a new profiler built from kwargs when none is given. The decorated function returns the
+    # original result, or None if profiling was skipped.
     if not profiler:
         profiler = StrobelightCLIFunctionProfiler(**kwargs)
 
     def strobelight_inner(
         work_function: Callable[_P, _R],
     ) -> Callable[_P, _R | None]:
+        # [FUNCTION DOC] HELPER: Decorator applied to work_function; returns a wrapper preserving its metadata.
         @functools.wraps(work_function)
         def wrapper_function(*args: _P.args, **kwargs: _P.kwargs) -> _R | None:
+            # [FUNCTION DOC] HELPER: Calls the profiler's profile method on the wrapped function with the call arguments.
             # pyrefly: ignore [bad-argument-type]
             return profiler.profile(work_function, *args, **kwargs)
 

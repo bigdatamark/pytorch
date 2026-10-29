@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [PACKAGE DOC]
+# Reference implementations of torch.linalg operations built from prims and
+# other refs: cross, diagonal, vector_norm, matrix_norm, norm, svd, svdvals and
+# vecdot. Importing registers cross and vector_norm as aten decompositions.
 import math
 from functools import partial
 from typing import Optional, Union
@@ -38,6 +42,10 @@ __all__ = [
 
 
 def _check_norm_dtype(dtype: torch.dtype | None, x_dtype: torch.dtype, fn_name: str):
+    # [FUNCTION DOC] HELPER: Validates the optional dtype argument of the norm functions.
+    # Raises an error unless dtype is floating point or complex, has the same
+    # complexness as the input dtype, and is not narrower than the input dtype.
+    # Does nothing when dtype is None. fn_name is used in error messages.
     """
     Checks related to the dtype kwarg in `linalg.*norm` functions
     """
@@ -72,6 +80,10 @@ from torch._decomp.decompositions import pw_cast_for_opmath
 @out_wrapper()
 @pw_cast_for_opmath
 def cross(a: Tensor, b: Tensor, dim: int = -1):
+    # [FUNCTION DOC] Cross product of two 3-element-along-dim tensors (linalg.cross).
+    # Requires equal ndim and size 3 along dim in both inputs (errors otherwise),
+    # broadcasts them, canonicalizes dim, and computes the product from index_select
+    # of rotated components. Returns a tensor with the broadcast shape.
     torch._check(
         a.ndim == b.ndim,
         lambda: "linalg.cross: inputs must have the same number of dimensions.",
@@ -95,12 +107,19 @@ def diagonal(
     dim1: int = -2,
     dim2: int = -1,
 ) -> TensorLikeType:
+    # [FUNCTION DOC] Returns the diagonal view of input for the given offset and
+    # dimensions by delegating to torch.diagonal (linalg.diagonal semantics, with
+    # keyword-only arguments).
     return torch.diagonal(input, offset=offset, dim1=dim1, dim2=dim2)
 
 
 def _check_vector_norm_args(
     x: TensorLikeType, ord: float | int = 2, dim: DimsType | None = None
 ):
+    # [FUNCTION DOC] HELPER: Argument check for vector_norm. Returns immediately unless
+    # ord is negative or infinite; in those cases raises an error if the reduction
+    # would run over an empty tensor or over an empty dimension, since the norm has
+    # no identity element there. Uses symbolic-shape-aware logical or.
     from torch.fx.experimental.symbolic_shapes import sym_or
 
     if not (ord < 0.0 or ord == float("inf")):
@@ -137,6 +156,12 @@ def vector_norm(
     dtype: torch.dtype | None = None,
 ) -> Tensor:
     from torch.fx.experimental.symbolic_shapes import guard_or_false
+    # [FUNCTION DOC] Vector p-norm of x over dim (all elements if None), registered as
+    # the aten linalg_vector_norm decomposition. Validates dtype and empty-reduction
+    # cases, computes in the reduction computation dtype and returns the result in
+    # the result dtype (complex maps to float). Handles ord 0 (count nonzeros), +/-inf
+    # (max/min of abs), a fast path when the reduced size is 1, and the general
+    # sum-of-powers case. Raises an error for more than 64 dims in the fast path.
 
     check_fp_or_complex(x.dtype, "linalg.vector_norm")
 
@@ -194,6 +219,8 @@ def vector_norm(
 
 
 def _backshift_permutation(dim0, dim1, ndim):
+    # [FUNCTION DOC] HELPER: Returns a permutation list of range ndim that moves
+    # dim0 and dim1 to the last two positions, keeping other dims in order.
     # Auxiliary function for matrix_norm
     # Computes the permutation that moves the two given dimensions to the back
     ret = [i for i in range(ndim) if i != dim0 and i != dim1]
@@ -202,6 +229,7 @@ def _backshift_permutation(dim0, dim1, ndim):
 
 
 def _inverse_permutation(perm):
+    # [FUNCTION DOC] HELPER: Returns the inverse of the permutation list perm.
     # Given a permutation, returns its inverse. It's equivalent to argsort on an array
     return [i for i, j in sorted(enumerate(perm), key=operator.itemgetter(1))]
 
@@ -217,6 +245,12 @@ def matrix_norm(
     dtype: torch.dtype | None = None,
 ) -> TensorLikeType:
     # shape
+    # [FUNCTION DOC] Matrix norm of A over the two dims in dim (linalg.matrix_norm).
+    # Supports ord fro (vector 2-norm), nuc (sum of singular values), and numeric
+    # 2, -2 (largest/smallest singular value), 1, -1, inf, -inf (max/min of
+    # column/row abs sums). Validates matrix-ness, dim being two distinct dims,
+    # dtype and ord, raising errors otherwise. With keepdim the reduced dims stay
+    # size 1. Empty reduced dim with positive ord yields zeros.
     check_is_matrix(A, "linalg.matrix_norm")
     # dim
 
@@ -319,6 +353,11 @@ def norm(
 ) -> TensorLikeType:
     if dim is not None:
         if isinstance(dim, Dim):
+    # [FUNCTION DOC] General norm (linalg.norm). Dispatches to matrix_norm when ord is
+    # given and the reduction is over two dims (or a 2D input with no dim, using
+    # dims 0 and 1), otherwise to vector_norm with ord defaulting to 2. Raises an
+    # error if dim has length other than 1 or 2, or if ord is given without dim
+    # and the input is not 1D or 2D.
             dim = (dim,)  # type: ignore[assignment]
         torch._check(
             len(dim) in (1, 2),
@@ -345,12 +384,15 @@ def norm(
 # CompositeImplicitAutograd
 @out_wrapper("U", "S", "Vh", exact_dtype=True)
 def svd(A: TensorLikeType, full_matrices: bool = True) -> tuple[Tensor, Tensor, Tensor]:
+    # [FUNCTION DOC] Singular value decomposition; returns (U, S, Vh) via the svd prim,
+    # with full or reduced matrices per full_matrices.
     return prims.svd(A, full_matrices=full_matrices)
 
 
 # CompositeImplicitAutograd
 @out_wrapper(exact_dtype=True)
 def svdvals(A: TensorLikeType) -> Tensor:
+    # [FUNCTION DOC] Returns only the singular values of A (second output of reduced svd).
     return svd(A, full_matrices=False)[1]
 
 
@@ -361,5 +403,7 @@ def svdvals(A: TensorLikeType) -> Tensor:
     type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
 )
 def vecdot(x: Tensor, y: Tensor, dim: int = -1) -> Tensor:
+    # [FUNCTION DOC] Vector dot product along dim: sum of conjugate(x) times y.
+    # Requires a floating or complex dtype (error otherwise); inputs are type promoted.
     check_fp_or_complex(x.dtype, "linalg.vecdot")
     return (x.conj() * y).sum(dim=dim)

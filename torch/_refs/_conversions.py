@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Reference implementations of tensor data-type conversion methods (bfloat16,
+# bool, byte, cdouble, cfloat, chalf, char, double, float, half, int, long,
+# short) plus the complex and polar constructors. Deliberately kept out of
+# _refs/__init__ to avoid clashing with Python builtin type names.
+# Import-time side effects: builds the conversion functions and registers
+# complex and polar as decompositions of the matching aten operators.
 import torch
 import torch._prims_common as utils
 
@@ -38,9 +45,14 @@ __all__ = [
 
 
 def _make_conversion_method(name: str, dtype: torch.dtype):
+    # [FUNCTION DOC] HELPER: Factory returning a function named name that converts
+    # a tensor to the fixed dtype via the tensor to method, taking an optional
+    # memory_format (default preserve_format) and returning the converted tensor.
     def fn(
         self: TensorLikeType, memory_format: torch.memory_format = torch.preserve_format
     ) -> TensorLikeType:
+        # [FUNCTION DOC] HELPER: Converts self to the captured dtype with the given
+        # memory format; returns self unchanged if already that dtype.
         return self.to(dtype, memory_format=memory_format)  # type: ignore[call-overload]
 
     fn.__name__ = name
@@ -79,6 +91,11 @@ short = _make_conversion_method("short", torch.short)
 # exact_dtype is for compat with complex_check_dtype from core.
 @out_wrapper(exact_dtype=True)
 def complex(real: TensorLikeType, imag: TensorLikeType) -> TensorLikeType:
+    # [FUNCTION DOC] Builds a complex tensor from real and imaginary parts,
+    # broadcasting their shapes. Both inputs must be half, float or double and
+    # share the same dtype, otherwise an error is raised. The result has the
+    # corresponding complex dtype, and the real and imag parts are assigned in place
+    # into a freshly allocated tensor.
     allowed_dtypes = (torch.float32, torch.float64, torch.float16)
     torch._check(
         real.dtype in allowed_dtypes and imag.dtype in allowed_dtypes,
@@ -113,6 +130,9 @@ def complex(real: TensorLikeType, imag: TensorLikeType) -> TensorLikeType:
 # exact_dtype is for compat with complex_check_dtype from core.
 @out_wrapper(exact_dtype=True)
 def polar(abs: TensorLikeType, angle: TensorLikeType) -> TensorLikeType:
+    # [FUNCTION DOC] Builds a complex tensor from magnitude abs and phase angle:
+    # real part is abs times cosine of angle, imaginary part is abs times sine.
+    # Creates the result via the complex op, then overwrites its parts in place.
     result = torch.complex(abs, angle)
     result.real = abs * torch.cos(angle)
     result.imag = abs * torch.sin(angle)

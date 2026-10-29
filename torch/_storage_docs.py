@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Attaches documentation strings to methods of the C-level storage base class.
+# Import-time side effect: sets the docstring of StorageBase.from_file.
 """Adds docstrings to Storage functions"""
 
 import torch._C
@@ -9,6 +12,8 @@ storage_classes = ["StorageBase"]
 
 
 def add_docstr_all(method, docstr):
+    # [FUNCTION DOC] HELPER: For each class named in storage_classes, sets the
+    # docstring of the named method; classes lacking the method are silently skipped.
     for cls_name in storage_classes:
         cls = getattr(torch._C, cls_name)
         try:

@@ -1,5 +1,10 @@
 # mypy: allow-untyped-decorators
 # mypy: allow-untyped-defs
+# [PACKAGE DOC]
+# Reference implementations of torch.nn.functional ops (activations, dropout, normalization, losses,
+# pixel shuffle, pairwise distances) built from torch ops and prims with type promotion and out wrappers.
+# Exports the names in __all__; many are registered as aten decompositions at import, and the in-place
+# variants celu_, elu_, mish_, selu_, threshold_ are created at the end of the module.
 import math
 from collections.abc import Callable
 from functools import wraps
@@ -81,6 +86,8 @@ def _dropout_helper(
     self: TensorLikeType,
     val: float,
 ) -> TensorLikeType:
+    # [FUNCTION DOC] HELPER: Returns a boolean keep-mask shaped and strided like self: True where a uniform random
+    # float32 sample in [0, 1) is below val (the keep probability). Consumes random state.
     """
     Helper function for all dropout-type operators. During training,
     some of the elements of the input tensor are randomly masked.
@@ -106,6 +113,10 @@ def _dropout_helper(
 def alpha_dropout(
     self: TensorLikeType, p: float = 0.5, training: bool = False, inplace: bool = False
 ) -> TensorLikeType:
+    # [FUNCTION DOC] Alpha dropout (SELU-preserving). Returns self unchanged when not training or p is 0, zeros when p is 1;
+    # raises NotImplementedError for inplace and an error if p is outside [0, 1]. Otherwise keeps elements by a
+    # random mask, sets dropped ones to the SELU negative saturation value, and applies the affine correction
+    # that keeps mean and variance.
     if inplace:
         raise NotImplementedError
 
@@ -140,6 +151,8 @@ def alpha_dropout(
 
 
 def _inplace_wrapper(fn: Callable[_P, _T]) -> Callable[_P, _T]:
+    # [FUNCTION DOC] HELPER: Decorator giving an out-capable function an inplace keyword: inplace=True is rewritten to
+    # passing the first positional argument as out (error if out is also given). Default inplace is False.
     """
     Given a nn.functional non-linearity, implements its `inplace: bool` argument
     """
@@ -147,6 +160,8 @@ def _inplace_wrapper(fn: Callable[_P, _T]) -> Callable[_P, _T]:
     # nb. We use the name of the first argument used in the unary references
     @wraps(fn)
     def _fn(*args: _P.args, **kwargs: _P.kwargs) -> _T:
+        # [FUNCTION DOC] HELPER: Wrapper that defaults the inplace kwarg to False and, if it is True, forwards with out set to
+        # the first argument and inplace cleared; otherwise calls fn unchanged.
         a = args[0]
         if "inplace" not in kwargs:
             kwargs["inplace"] = False
@@ -177,6 +192,9 @@ def _inplace_wrapper(fn: Callable[_P, _T]) -> Callable[_P, _T]:
 def celu(
     a: TensorLikeType, alpha: NumberType | None = None, inplace: bool = False
 ) -> TensorLikeType:
+    # [FUNCTION DOC] CELU: x for positive x, otherwise alpha * expm1(x / alpha); alpha None means 1 (plain expm1).
+    # Raises NotImplementedError for inplace, an error if alpha is 0, and ValueError if alpha's Python type
+    # cannot be safely cast to the input dtype's type.
     """
     Reference implementation of torch.nn.functional.celu
     """
@@ -210,6 +228,9 @@ def celu(
 def dropout(
     a: TensorLikeType, p: float = 0.5, training: bool = True, inplace: bool = False
 ) -> TensorLikeType:
+    # [FUNCTION DOC] Standard dropout. Returns input unchanged if not training or p is 0, zeros if p is 1; otherwise
+    # multiplies by a random keep mask and rescales by 1/(1-p). Errors if p is outside [0, 1];
+    # NotImplementedError for inplace.
     if inplace:
         raise NotImplementedError
 
@@ -247,6 +268,9 @@ def elu(
     input_scale: NumberType = 1.0,
     inplace: bool = False,
 ) -> TensorLikeType:
+    # [FUNCTION DOC] ELU with scale and input_scale: scale*x for positive x, else alpha*scale*expm1(x*input_scale).
+    # Checks each scalar parameter can be safely cast to the input dtype's Python type; NotImplementedError
+    # for inplace.
     """
     Reference implementation of torch.nn.functional.elu
     """
@@ -279,6 +303,7 @@ def elu(
     type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
 )
 def relu(a: TensorLikeType, inplace: bool = False) -> TensorLikeType:
+    # Elementwise reference of the torch.nn.functional op of the same name; zero where x <= 0, else x. NotImplementedError for inplace.
     """
     Reference implementation of torch.nn.functional.relu
     """
@@ -296,6 +321,8 @@ def relu(a: TensorLikeType, inplace: bool = False) -> TensorLikeType:
     type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
 )
 def hardsigmoid(a: TensorLikeType, inplace: bool = False) -> TensorLikeType:
+    # Elementwise reference of the torch.nn.functional op of the same name; clamp(x/6 + 0.5, 0, 1). The inplace argument is ignored by the body (handled by the wrapper).
+    # KNOWN ISSUE: not exported in __all__ and not registered as a decomposition.
     """
     Reference implementation of torch.nn.functional.hardsigmoid
     """
@@ -305,6 +332,10 @@ def hardsigmoid(a: TensorLikeType, inplace: bool = False) -> TensorLikeType:
 @register_decomposition(aten.channel_shuffle)
 @out_wrapper()
 def channel_shuffle(input: TensorLikeType, groups: int) -> TensorLikeType:
+    # [FUNCTION DOC] Shuffles channels of an input with more than 2 dims in groups: reshape channel dim to (groups,
+    # channels per group), swap those two axes, flatten back. Errors if ndim <= 2, groups <= 0 or channels
+    # not divisible by groups. Returns a view of the input for empty tensors or (on cuda hint) groups 1 or
+    # equal to channels; otherwise a contiguous copy.
     """
     Reference implementation of :func:`torch.nn.functional.channel_shuffle`.
     """
@@ -347,6 +378,8 @@ def group_norm(
     bias: Tensor | None = None,
     eps: float = 1e-5,
 ) -> Tensor:
+    # [FUNCTION DOC] Group normalization via native_group_norm over input of shape (N, C, *); returns only the normalized
+    # output. Errors if ndim < 2 or channels are not divisible by num_groups; weight and bias are optional.
     """
     Reference implementation of :func:`torch.nn.functional.group_norm`.
     """
@@ -387,6 +420,7 @@ def layer_norm(
     bias: Tensor | None = None,
     eps: float = 1e-5,
 ) -> Tensor:
+    # [FUNCTION DOC] Layer normalization via native_layer_norm over normalized_shape; returns only the normalized output.
     """
     Reference implementation of :func:`torch.nn.functional.layer_norm`.
     """
@@ -403,6 +437,8 @@ def layer_norm(
 def leaky_relu(
     a: TensorLikeType, negative_slope: float = 0.01, inplace: bool = False
 ) -> TensorLikeType:
+    # Elementwise reference of the torch.nn.functional op of the same name; x where positive else x * negative_slope. ValueError if negative_slope's type cannot be safely
+    # cast to the input dtype's type; NotImplementedError for inplace.
     """
     Reference implementation of torch.nn.functional.leaky_relu
     """
@@ -425,6 +461,7 @@ def leaky_relu(
     type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
 )
 def mish(a: TensorLikeType, inplace: bool = False) -> TensorLikeType:
+    # Elementwise reference of the torch.nn.functional op of the same name; x * tanh(softplus(x)). NotImplementedError for inplace.
     """
     Reference implementation of torch.nn.functional.mish
     """
@@ -442,6 +479,8 @@ def mish(a: TensorLikeType, inplace: bool = False) -> TensorLikeType:
     type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
 )
 def selu(a: TensorLikeType, inplace: bool = False) -> TensorLikeType:
+    # Elementwise reference of the torch.nn.functional op of the same name; scale * (x if positive else alpha * expm1(x)) with the standard SELU constants. NotImplementedError for
+    # inplace.
     """
     Reference implementation of torch.nn.functional.selu
     """
@@ -464,6 +503,8 @@ def softmax(
     _stacklevel: int = 3,  # for compat when using TorchRefsMode(strict=True)
     dtype: torch.dtype | None = None,
 ) -> TensorLikeType:
+    # [FUNCTION DOC] Forwarding alias to torch.softmax over dim (no out argument). Raises an error if dim is None, since
+    # implicit dim is unsupported; _stacklevel is accepted only for compatibility.
     # The error is for compat with regular PyTorch, which has this behavior
     # deprecated.  For PrimTorch, it's fine to drop support for deprecated
     # behavior because it requires explicit opt in.  This error is to inform
@@ -479,6 +520,8 @@ def softmin(
     _stacklevel: int = 3,  # for compat when using TorchRefsMode(strict=True)
     dtype: torch.dtype | None = None,
 ) -> TensorLikeType:
+    # [FUNCTION DOC] Softmin computed as softmax of the negated input over dim. Raises an error if dim is None;
+    # _stacklevel is accepted only for compatibility.
     # The error is for compat with regular PyTorch, which has this behavior
     # deprecated.  For PrimTorch, it's fine to drop support for deprecated
     # behavior because it requires explicit opt in.  This error is to inform
@@ -501,6 +544,8 @@ def softplus(
     threshold: NumberType = 20,
     inplace: bool = False,
 ) -> TensorLikeType:
+    # [FUNCTION DOC] Softplus: log1p(exp(beta*x))/beta, reverting to x where beta*x exceeds threshold (beta None means 1).
+    # ValueError if beta's type cannot be safely cast to the input dtype's type; NotImplementedError for inplace.
     """
     Reference implementation of torch.nn.functional.softplus
     """
@@ -528,6 +573,7 @@ def softplus(
 @register_decomposition(aten.hardshrink)
 @out_wrapper()
 def hardshrink(a: TensorLikeType, lambd: float = 0.5):
+    # [FUNCTION DOC] Hard shrink: zero where abs(x) <= lambd, else x. Also registered for the Autograd key of the aten op.
     # Formula for reference,
     # hardshrink(x) = x if x > lambd
     #               = x if x < -lambd
@@ -539,6 +585,9 @@ def hardshrink(a: TensorLikeType, lambd: float = 0.5):
 @register_decomposition(aten.softshrink)
 @out_wrapper()
 def softshrink(a: TensorLikeType, lambd: float = 0.5):
+    # [FUNCTION DOC] Soft shrink: x - sign(x)*lambd where abs(x) > lambd, else zero (computed as x times 0 to propagate
+    # NaN). Errors if lambd is outside [0, dtype max]; lambd is converted to a scalar tensor for half dtypes.
+    # Also registered for the Autograd key of the aten op.
     # Formula for reference,
     # softshrink(x) = x - lambd if x > lambd
     #               = x + lambd if x < -lambd
@@ -557,6 +606,7 @@ def softshrink(a: TensorLikeType, lambd: float = 0.5):
 
 # Losses
 def _reduction_int_to_str(reduction: int) -> str:
+    # [FUNCTION DOC] HELPER: Maps the ATen integer reduction code to the string none, mean or sum; ValueError otherwise.
     from torch._decomp.decompositions import Reduction
 
     if reduction == Reduction.NONE.value:
@@ -570,6 +620,7 @@ def _reduction_int_to_str(reduction: int) -> str:
 
 
 def _apply_loss_reduction(loss: TensorLikeType, reduction: str) -> TensorLikeType:
+    # [FUNCTION DOC] HELPER: Applies sum, mean or no reduction (any other string) to loss.
     if reduction == "sum":
         return torch.sum(loss)
     elif reduction == "mean":
@@ -579,6 +630,7 @@ def _apply_loss_reduction(loss: TensorLikeType, reduction: str) -> TensorLikeTyp
 
 
 def _check_reduction_value(reduction: str):
+    # [FUNCTION DOC] HELPER: Raises ValueError unless reduction is mean, sum or none.
     if reduction not in ("mean", "sum", "none"):
         raise ValueError(f"{reduction} is not a valid value for reduction")
 
@@ -586,6 +638,8 @@ def _check_reduction_value(reduction: str):
 # This helper function maps deprecated arguments, "size_average" and "reduce"
 # to their corresponding "reduction" string argument
 def _get_string_reduction_arg(*, size_average: bool | None, reduce: bool | None) -> str:
+    # [FUNCTION DOC] HELPER: Maps deprecated size_average/reduce flags (None treated as True) to a reduction string:
+    # both true is mean, only reduce is sum, otherwise none.
     if size_average is None:
         size_average = True
     if reduce is None:
@@ -611,6 +665,8 @@ def l1_loss(
     reduce: bool | None = None,
     reduction: str = "mean",
 ) -> TensorLikeType:
+    # Elementwise reference of the torch.nn.functional op of the same name; mean/sum/none of abs(input - target). Deprecated size_average/reduce override reduction;
+    # ValueError for an invalid reduction.
     """
     Reference implementation of torch.nn.functional.l1_loss
     """
@@ -636,6 +692,8 @@ def smooth_l1_loss(
     reduction: str = "mean",
     beta: float = 1.0,
 ) -> TensorLikeType:
+    # Elementwise reference of the torch.nn.functional op of the same name; quadratic below beta and linear above, then reduced. Deprecated size_average/reduce override
+    # reduction; beta equal to 0 delegates to l1_loss; ValueError for an invalid reduction.
     """
     Reference implementation of torch.nn.functional.smooth_l1_loss
     """
@@ -665,6 +723,8 @@ def log_softmax(
     _stacklevel: int = 3,  # for compat when using TorchRefsMode(strict=True)
     dtype: torch.dtype | None = None,
 ) -> TensorLikeType:
+    # [FUNCTION DOC] Forwarding alias to torch.log_softmax over dim (no out argument). Raises an error if dim is None;
+    # _stacklevel is accepted only for compatibility.
     # The error is for compat with regular PyTorch, which has this behavior
     # deprecated.  For PrimTorch, it's fine to drop support for deprecated
     # behavior because it requires explicit opt in.  This error is to inform
@@ -681,6 +741,8 @@ def margin_ranking_loss(
     margin: float = 0.0,
     reduction: str = "mean",
 ) -> TensorLikeType:
+    # [FUNCTION DOC] Loss max(0, -target*(input1 - input2) + margin) with the requested reduction. Raises RuntimeError if the
+    # three inputs differ in ndim and ValueError for an invalid reduction.
     # loss_without_reduction = max(0, -target * (input1 - input2) + margin)
     if input1.ndim != input2.ndim or input1.ndim != target.ndim:
         raise RuntimeError(
@@ -703,6 +765,8 @@ def mse_loss(
     reduce: bool | None = None,
     reduction: str = "mean",
 ) -> TensorLikeType:
+    # [FUNCTION DOC] Mean squared error between input and target with the requested reduction. Deprecated
+    # size_average/reduce override reduction; ValueError for an invalid reduction.
     if size_average is not None or reduce is not None:
         # TODO: Raise exception instead of converting value.  This is only for
         # primTorch since it can drop support for deprecated arguments.
@@ -720,6 +784,9 @@ def hinge_embedding_loss(
     margin: float = 1.0,
     reduction: str = "mean",
 ) -> TensorLikeType:
+    # [FUNCTION DOC] Hinge embedding loss: input where target is 1, max(0, margin - input) where target is -1, with
+    # the requested reduction. ValueError for an invalid reduction. Elements with other target values contribute
+    # both terms.
     # loss_without_reduction = input if y == 1
     #                        = max(0, margin - input) if y == -1
     _check_reduction_value(reduction)
@@ -737,6 +804,11 @@ def _nll_loss_nd(
     reduction: str,
     ignore_index: int,
 ) -> TensorLikeType:
+    # [FUNCTION DOC] HELPER: Negative log likelihood for 1-D to 3-D inputs (classes on dim 1 for 2-D/3-D). Checks ndim and
+    # batch size agreement, builds per-sample weights (zero for ignore_index, optional class weight), gathers
+    # the negated target log-probabilities and reshapes to target shape. none returns per-element loss, sum its
+    # sum, mean the sum divided by total weight.
+    # KNOWN ISSUE: the class bounds check is disabled (kept as a bare string literal).
     torch._check(
         input.ndim > 0 and input.ndim <= 3,
         lambda: f"Expected input dimension to be either [1, 2, 3] but received {input.ndim}.",
@@ -824,6 +896,12 @@ def nll_loss(
     reduce: bool | None = None,
     reduction: str = "mean",
 ) -> TensorLikeType:
+    # [FUNCTION DOC] Negative log likelihood loss. Handles deprecated size_average/reduce, empty input/target (none gives
+    # zeros, sum gives an empty tensor, mean gives NaN), uses _nll_loss_nd for ndim up to 3, and for higher ndim
+    # flattens trailing dims to a 3-D problem (checking target shape matches input shape past the class dim),
+    # reshaping back for reduction none. Errors if input has no dims.
+    # KNOWN ISSUE: for empty inputs with sum reduction it returns an empty tensor rather than a zero scalar as the
+    # comment above claims.
     """
     Reference implementation of torch.nn.functional.nll_loss
     """
@@ -904,6 +982,8 @@ def huber_loss(
     reduction: str | int = "mean",
     delta: float = 1.0,
 ) -> TensorLikeType:
+    # Elementwise reference of the torch.nn.functional op of the same name; quadratic below delta and linear above, then reduced. reduction may be a string or ATen integer
+    # code. Errors if delta is not positive or reduction is invalid.
     """
     Reference implementation of torch.nn.functional.huber_loss
     """
@@ -926,6 +1006,7 @@ def huber_loss(
     type_promotion_kind=utils.ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
 )
 def tanhshrink(a: TensorLikeType) -> TensorLikeType:
+    # Elementwise reference of the torch.nn.functional op of the same name; x - tanh(x). Raises RuntimeError if the input is not a tensor.
     """
     Reference implementation of torch.nn.functional.tanhshrink
     """
@@ -949,6 +1030,7 @@ def threshold(
     value: bool | int | float,
     inplace: bool = False,
 ) -> TensorLikeType:
+    # Elementwise reference of the torch.nn.functional op of the same name; replaces elements <= threshold with value. NotImplementedError for inplace.
     """
     Reference implementation of torch.nn.functional.threshold
     """
@@ -973,6 +1055,8 @@ def triplet_margin_loss(
     reduce: bool | None = None,
     reduction: str = "mean",
 ) -> TensorLikeType:
+    # [FUNCTION DOC] Triplet margin loss using pairwise p-norm distance with eps. Deprecated size_average/reduce override
+    # reduction. Raises ValueError if margin is not positive; delegates to the distance-function helper.
     if size_average is not None or reduce is not None:
         # TODO: Raise exception instead of converting value.  This is only for
         # primTorch since it can drop support for deprecated arguments.
@@ -1008,6 +1092,9 @@ def _triplet_margin_with_distance_loss(
     swap: bool = False,
     reduction: str = "mean",
 ) -> TensorLikeType:
+    # [FUNCTION DOC] HELPER: Triplet loss max(0, margin + d(anchor, positive) - d(anchor, negative)) with optional distance
+    # swap (uses the smaller of the negative distances) and given reduction. distance_function defaults to
+    # pairwise_distance. Errors if the three inputs differ in ndim or reduction is invalid.
     _check_reduction_value(reduction)
 
     a_dim = anchor.ndim
@@ -1047,6 +1134,9 @@ def _hardtanh(
     *,
     check_bounds: bool,
 ) -> TensorLikeType:
+    # [FUNCTION DOC] HELPER: Clamp implementation for hardtanh. NotImplementedError for inplace or bool inputs; for integer
+    # inputs bounds are cast to int and negative bounds on uint8 raise RuntimeError; with check_bounds
+    # raises ValueError when min_val exceeds max_val.
     if inplace:
         raise NotImplementedError
     if utils.is_boolean_dtype(a.dtype):
@@ -1081,6 +1171,8 @@ def _aten_hardtanh(
     max_val: NumberType = 1,
     inplace: bool = False,
 ) -> TensorLikeType:
+    # [FUNCTION DOC] HELPER: Variant registered as the aten hardtanh decomposition; same as hardtanh but skips the min/max
+    # bounds check.
     return _hardtanh(
         a, min_val=min_val, max_val=max_val, inplace=inplace, check_bounds=False
     )
@@ -1099,6 +1191,7 @@ def hardtanh(
     max_val: NumberType = 1,
     inplace: bool = False,
 ) -> TensorLikeType:
+    # Elementwise reference of the torch.nn.functional op of the same name; clamp to [min_val, max_val], raising ValueError if min_val is greater than max_val.
     """
     Reference implementation of torch.nn.functional.hardtanh
     """
@@ -1115,6 +1208,8 @@ def hardtanh(
     type_promotion_kind=utils.ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
 )
 def gelu(a: TensorLikeType, approximate: str = "none") -> TensorLikeType:
+    # [FUNCTION DOC] GELU activation. approximate none uses the erf formula, tanh uses the tanh approximation; any other value
+    # raises RuntimeError, as does a non-tensor input.
     """
     Reference implementation of torch.nn.functional.gelu
     """
@@ -1153,6 +1248,9 @@ def poisson_nll_loss(
     reduce: bool | None = None,
     reduction: str = "mean",
 ) -> TensorLikeType:
+    # [FUNCTION DOC] Poisson negative log likelihood: exp(input) - target*input if log_input else input - target*log(input +
+    # eps), optionally plus the Stirling term (masked to zero where target <= 1) when full. Deprecated
+    # size_average/reduce override reduction; ValueError for an invalid reduction.
     """
     Reference implementation of torch.nn.functional.poisson_nll_loss
     """
@@ -1182,6 +1280,9 @@ def poisson_nll_loss(
     type_promotion_kind=utils.ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
 )
 def prelu(a: TensorLikeType, weight: TensorLikeType) -> TensorLikeType:
+    # [FUNCTION DOC] Parametric ReLU: a where positive else a*weight. weight must be a tensor with a single element or one value
+    # per channel (dim 1; channel size 1 for 1-D input) and 0-D or 1-D; errors otherwise or for a 0-D input
+    # with multiple weights. weight is broadcast over the input.
     """
     Reference implementation of torch.nn.functional.prelu
     """
@@ -1222,6 +1323,7 @@ def prelu(a: TensorLikeType, weight: TensorLikeType) -> TensorLikeType:
 @_inplace_wrapper
 @out_wrapper()
 def relu6(a: TensorLikeType, inplace: bool = False) -> TensorLikeType:
+    # [FUNCTION DOC] ReLU6 implemented as hardtanh clamp to [0, 6]. NotImplementedError for inplace.
     """
     Reference implementation of torch.nn.functional.relu6
     """
@@ -1241,6 +1343,8 @@ def relu6(a: TensorLikeType, inplace: bool = False) -> TensorLikeType:
     type_promotion_kind=utils.ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
 )
 def glu(a: TensorLikeType, dim: int = -1) -> TensorLikeType:
+    # [FUNCTION DOC] Gated linear unit: splits a in half along dim and returns first half times sigmoid of second half.
+    # Errors if that dimension's size is odd.
     dim = utils.canonicalize_dims(a.ndim, dim)
     torch._check(
         a.shape[dim] % 2 == 0,
@@ -1260,6 +1364,8 @@ def pairwise_distance(
     eps: NumberType = 1e-6,
     keepdim=False,
 ) -> TensorLikeType:
+    # [FUNCTION DOC] Pairwise p-norm distance along the last dim between x1 and x2, with eps added to the difference;
+    # keepdim retains the reduced dim.
     return torch.linalg.vector_norm(x1 - x2 + eps, ord=p, dim=-1, keepdim=keepdim)
 
 
@@ -1270,6 +1376,9 @@ def pairwise_distance(
     type_promotion_kind=utils.ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
 )
 def pdist(a: TensorLikeType, p: float = 2) -> TensorLikeType:
+    # [FUNCTION DOC] Condensed pairwise p-distances between rows of a 2-D tensor (upper triangle, row-major, excluding
+    # diagonal). Errors if a is not 2-D or p is negative. Uses a Gram matrix formulation when p is 2, otherwise a
+    # broadcast difference norm.
     torch._check(a.ndim == 2, lambda: f"pdist only supports 2D tensors, got: {a.ndim}D")
     torch._check(p >= 0, lambda: "pdist only supports non-negative p values")
     # For p == 2 we can use an efficient implementation, but other values of p
@@ -1287,6 +1396,9 @@ def pdist(a: TensorLikeType, p: float = 2) -> TensorLikeType:
 @register_decomposition(aten.pixel_shuffle)
 @out_wrapper()
 def pixel_shuffle(self: Tensor, upscale_factor: int):
+    # [FUNCTION DOC] Rearranges channels into spatial blocks: (..., C*r^2, H, W) to (..., C, H*r, W*r) via view, permute and
+    # reshape, returning a clone in the suggested memory format. Errors if fewer than 3 dims.
+    # KNOWN ISSUE: the error message formats the dim method object instead of calling it.
     torch._check(
         self.dim() >= 3,
         lambda: f"pixel_shuffle expects input to have at least 3 dimensions, but got input with {self.dim} dimension(s)",
@@ -1315,6 +1427,9 @@ def pixel_shuffle(self: Tensor, upscale_factor: int):
 @register_decomposition(aten.pixel_unshuffle)
 @out_wrapper()
 def pixel_unshuffle(self: Tensor, downscale_factor: int):
+    # [FUNCTION DOC] Inverse of pixel_shuffle: (..., C, H*r, W*r) to (..., C*r^2, H, W), returning a clone in the suggested
+    # memory format. Errors if fewer than 3 dims.
+    # KNOWN ISSUE: the error message formats the dim method object instead of calling it.
     torch._check(
         self.dim() >= 3,
         lambda: f"pixel_unshuffle expects input to have at least 3 dimensions, but got input with {self.dim} dimension(s)",

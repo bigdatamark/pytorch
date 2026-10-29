@@ -1,4 +1,8 @@
 # mypy: disallow-untyped-defs
+# [MODULE DOC]
+# Meta-only helper that profiles PyTorch 2 compile phases with strobelight: URL helpers and
+# StrobelightCompileTimeProfiler. Import-time side effects: configures the module logger (console handler,
+# INFO level) and reads COMPILE_STROBELIGHT_* environment variables into class attributes.
 
 import json
 import logging
@@ -26,6 +30,8 @@ logger.propagate = False
 
 
 def get_fburl(url: str) -> str:
+    # [FUNCTION DOC] Tries to shorten url with the fburl command line tool; returns the short URL on success, else the
+    # original URL (failures are logged as a warning, never raised).
     short_url = url
     # Attempt to shorten the URL
     try:
@@ -40,6 +46,8 @@ def get_fburl(url: str) -> str:
 
 
 def get_strobelight_url(identifier: str) -> str:
+    # [FUNCTION DOC] Builds a Meta-internal Scuba query URL (JSON drill state filtered on the sample tag identifier,
+    # last 30 days) for viewing the profile, then returns it shortened via get_fburl.
     scuba_json = {
         "aggregateList": [],
         "aggregation_field": "async_stack_complete",
@@ -80,6 +88,11 @@ def get_strobelight_url(identifier: str) -> str:
 
 
 class StrobelightCompileTimeProfiler:
+    # [CLASS DOC] Class-level (never instantiated) singleton that profiles PT2 compile phases with a strobelight
+    # profiler. State is held in class attributes: enabled flag, profiler object, unique identifier tag,
+    # current phase, recursion guard, success/failed/ignored counters, an optional frame id regex filter and
+    # sampling limits, all read from COMPILE_STROBELIGHT_* environment variables at import. Key methods:
+    # enable and profile_compile_time.
     success_profile_count: int = 0
     failed_profile_count: int = 0
     ignored_profile_runs: int = 0
@@ -110,12 +123,18 @@ class StrobelightCompileTimeProfiler:
 
     @classmethod
     def get_frame(cls) -> str:
+        # [FUNCTION DOC] Returns the current compile trace id as a string (from CompileContext).
         from torch._guards import CompileContext
 
         return (str)(CompileContext.current_trace_id())
 
     @classmethod
     def enable(cls, profiler_class: Any = StrobelightCLIFunctionProfiler) -> None:
+        # [FUNCTION DOC] Turns on compile-time profiling once. If already enabled, logs and returns. When using the default
+        # CLI profiler class and strobeclient is not on PATH, logs and returns without enabling. Otherwise sets
+        # enabled, generates the identifier, and builds the profiler from profiler_class using the sampling
+        # settings, a user name derived from environment, and the identifier as sample tags.
+        # KNOWN ISSUE: sample_tags is passed as a set while the CLI profiler annotates it as a list.
         if cls.enabled:
             logger.info("compile time strobelight profiling already enabled")
             return
@@ -150,6 +169,8 @@ class StrobelightCompileTimeProfiler:
 
     @classmethod
     def _cls_init(cls) -> None:
+        # [FUNCTION DOC] HELPER: Creates the unique identifier from the current timestamp, pid and hostname and logs it plus
+        # the URL for viewing the profile.
         cls.identifier = "{date}{pid}{hostname}".format(
             date=datetime.now().strftime("%Y-%m-%d-%H:%M:%S"),
             pid=os.getpid(),
@@ -164,6 +185,7 @@ class StrobelightCompileTimeProfiler:
 
     @classmethod
     def _log_stats(cls) -> None:
+        # [FUNCTION DOC] HELPER: Logs how many profiled compilations succeeded out of success plus failed counts.
         logger.info(
             "%s strobelight success runs out of %s non-recursive compilation events.",
             cls.success_profile_count,
@@ -175,7 +197,15 @@ class StrobelightCompileTimeProfiler:
     def profile_compile_time(
         cls, func: Any, phase_name: str, *args: Any, **kwargs: Any
     ) -> Any:
+        # [FUNCTION DOC] Runs func with the given arguments, profiling it when enabled. Returns func's result. If disabled,
+        # it simply calls func. If enabled but no profiler is set, logs an error and returns None without calling
+        # func. Recursive requests while a profile is active are counted as ignored and run unprofiled; frames not
+        # matching frame_id_filter run unprofiled. Otherwise sets the recursion guard and phase, profiles via the
+        # profiler, increments success or failure counters by whether a profile result exists, logs stats and
+        # clears the guard.
+        # KNOWN ISSUE: the guard is not cleared if the profiled call raises.
         def skip() -> Any:
+            # [FUNCTION DOC] HELPER: Calls the wrapped function directly without profiling.
             return func(*args, **kwargs)
 
         if not cls.enabled:

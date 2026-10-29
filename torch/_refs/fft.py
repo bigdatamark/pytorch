@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Reference implementations of torch.fft transforms (1-D, 2-D, N-D, real/Hermitian variants and
+# shift helpers) built on the fft_c2c, fft_r2c and fft_c2r prims, with dtype promotion,
+# size padding/trimming and normalization helpers. Import time: registers each public function as
+# a decomposition of the matching aten op.
 import math
 from collections.abc import Iterable, Sequence
 from typing import Literal, NamedTuple
@@ -43,6 +48,9 @@ aten = torch._ops.ops.aten
 def _apply_norm(
     x: TensorLikeType, norm: NormType, signal_numel: int, forward: bool
 ) -> TensorLikeType:
+    # [FUNCTION DOC] HELPER: Scales an unnormalized FFT result x. Raises an error for an invalid norm mode.
+    # ortho multiplies by 1/sqrt(signal_numel); otherwise multiplies by 1/signal_numel when
+    # (inverse transform with norm None/backward) or (forward transform with norm forward).
     """Apply normalization to the un-normalized FFT result"""
     torch._check(norm in _NORM_VALUES, lambda: f"Invalid normalization mode: {norm}")
 
@@ -58,6 +66,10 @@ def _apply_norm(
 def _promote_type_fft(
     dtype: torch.dtype, require_complex: bool, device: torch.device
 ) -> torch.dtype:
+    # [FUNCTION DOC] HELPER: Maps dtype to one supported by the FFT prims: complex kept; integral becomes the
+    # default float dtype; float32/float64 allowed, plus float16 on cuda/meta/xpu (bfloat16 is
+    # promoted to float32 there). Raises not-implemented for other dtypes. With require_complex,
+    # returns the matching complex dtype.
     """Helper to promote a dtype to one supported by the FFT primitives"""
     if dtype.is_complex:
         return dtype
@@ -94,6 +106,7 @@ def _promote_type_fft(
 def _maybe_promote_tensor_fft(
     t: TensorLikeType, require_complex: bool = False
 ) -> TensorLikeType:
+    # [FUNCTION DOC] HELPER: Converts tensor t to the dtype chosen by _promote_type_fft (no-op if unchanged).
     """Helper to promote a tensor to a dtype supported by the FFT primitives"""
     cur_type = t.dtype
     new_type = _promote_type_fft(cur_type, require_complex, t.device)
@@ -103,6 +116,9 @@ def _maybe_promote_tensor_fft(
 def _resize_fft_input(
     x: TensorLikeType, dims: tuple[int, ...], sizes: tuple[int, ...]
 ) -> TensorLikeType:
+    # [FUNCTION DOC] HELPER: Makes x have size sizes[i] along dims[i] by narrowing from index 0 (if larger) or
+    # zero padding at the end (if smaller); a size of -1 leaves the dim alone. Raises if dims
+    # and sizes differ in length. Returns x itself when no padding was needed and no narrowing occurred.
     """
     Fixes the shape of x such that x.size(dims[i]) == sizes[i],
     either by zero-padding, or by slicing x starting from 0.
@@ -138,6 +154,9 @@ def _fft_c2r(
     norm: NormType,
     forward: bool,
 ) -> TensorLikeType:
+    # [FUNCTION DOC] HELPER: Shared 1-D complex-to-real FFT for irfft/hfft. Promotes input to complex, computes
+    # output length n (default 2*(size-1)), errors if below 1, resizes input to n//2+1, conjugates
+    # when forward (hfft), runs the c2r prim and applies normalization.
     """Common code for performing any complex to real FFT (irfft or hfft)"""
     input = _maybe_promote_tensor_fft(input, require_complex=True)
     dims = (utils.canonicalize_dim(input.ndim, dim, wrap_scalar=False),)
@@ -166,6 +185,9 @@ def _fft_r2c(
     forward: bool,
     onesided: bool,
 ) -> TensorLikeType:
+    # [FUNCTION DOC] HELPER: Shared 1-D real-to-complex FFT for rfft/ihfft (and fft/ifft on real input). Errors on
+    # complex input or non-positive length, promotes dtype, resizes to n, runs the r2c prim
+    # (onesided or not), normalizes, and conjugates the result unless forward.
     """Common code for performing any real to complex FFT (rfft or ihfft)"""
     torch._check_type(
         not input.dtype.is_complex,
@@ -194,6 +216,8 @@ def _fft_c2c(
     norm: NormType,
     forward: bool,
 ) -> TensorLikeType:
+    # [FUNCTION DOC] HELPER: Shared 1-D complex-to-complex FFT for fft/ifft. Errors if input is not complex or
+    # the length is below 1; resizes to n, runs the c2c prim in the given direction, normalizes.
     """Common code for performing any complex to complex FFT (fft or ifft)"""
     torch._check(
         input.dtype.is_complex,
@@ -220,6 +244,8 @@ def fft(
     dim: int = -1,
     norm: NormType = None,
 ) -> TensorLikeType:
+    # [FUNCTION DOC] 1-D discrete Fourier transform along dim (decomposition of aten fft_fft). Complex input uses
+    # the c2c path; real input uses the non-onesided r2c path. n pads/trims the signal; norm picks scaling.
     if input.dtype.is_complex:
         return _fft_c2c("fft", input, n, dim, norm, forward=True)
     else:
@@ -234,6 +260,8 @@ def ifft(
     dim: int = -1,
     norm: NormType = None,
 ) -> TensorLikeType:
+    # [FUNCTION DOC] 1-D inverse discrete Fourier transform along dim; complex input uses c2c, real input uses
+    # the non-onesided r2c path with inverse direction. n pads/trims; norm picks scaling.
     if input.dtype.is_complex:
         return _fft_c2c("ifft", input, n, dim, norm, forward=False)
     else:
@@ -248,6 +276,7 @@ def rfft(
     dim: int = -1,
     norm: NormType = None,
 ) -> TensorLikeType:
+    # [FUNCTION DOC] 1-D FFT of real input returning only the non-redundant half spectrum (n//2+1 entries).
     return _fft_r2c("rfft", input, n, dim, norm, forward=True, onesided=True)
 
 
@@ -259,6 +288,7 @@ def irfft(
     dim: int = -1,
     norm: NormType = None,
 ) -> TensorLikeType:
+    # [FUNCTION DOC] 1-D inverse of rfft: complex half spectrum to real signal of length n (default 2*(size-1)).
     return _fft_c2r("irfft", input, n, dim, norm, forward=False)
 
 
@@ -270,6 +300,7 @@ def hfft(
     dim: int = -1,
     norm: NormType = None,
 ) -> TensorLikeType:
+    # [FUNCTION DOC] 1-D FFT of a Hermitian-symmetric half signal, returning a real spectrum (complex-to-real, forward).
     return _fft_c2r("hfft", input, n, dim, norm, forward=True)
 
 
@@ -281,10 +312,12 @@ def ihfft(
     dim: int = -1,
     norm: NormType = None,
 ) -> TensorLikeType:
+    # [FUNCTION DOC] 1-D inverse of hfft: real signal to the one-sided Hermitian half spectrum (real-to-complex, inverse).
     return _fft_r2c("ihfft", input, n, dim, norm, forward=False, onesided=True)
 
 
 class _ShapeAndDims(NamedTuple):
+    # [CLASS DOC] HELPER: Named tuple pairing canonical transform sizes (shape) with the matching dims.
     shape: tuple[int, ...]
     dims: tuple[int, ...]
 
@@ -292,6 +325,11 @@ class _ShapeAndDims(NamedTuple):
 def _canonicalize_fft_shape_and_dim_args(
     input: TensorLikeType, shape: ShapeType | None, dim: DimsType | None
 ) -> _ShapeAndDims:
+    # [FUNCTION DOC] HELPER: Resolves optional shape and dim into concrete tuples. dim is wrapped to non-negative
+    # and must be unique; if shape is given with no dim, dims are the last len(shape) dims; -1 in
+    # shape means the input size on that dim; with neither, all dims and sizes are used. Raises errors
+    # if dim/shape lengths differ, shape is longer than ndim, or any size is not positive.
+    # Returns a _ShapeAndDims.
     """Convert the shape and dim arguments into a canonical form where neither are optional"""
     input_dim = input.ndim
     input_sizes = input.shape
@@ -347,6 +385,7 @@ def _canonicalize_fft_shape_and_dim_args(
 
 
 def _prod(xs: Iterable[int]) -> int:
+    # [FUNCTION DOC] HELPER: Returns the product of an iterable of ints (1 if empty).
     """Compute product of a list"""
     prod = 1
     for x in xs:
@@ -362,6 +401,8 @@ def _fftn_c2c(
     norm: NormType,
     forward: bool,
 ) -> TensorLikeType:
+    # [FUNCTION DOC] HELPER: Shared n-D complex-to-complex FFT for fftn/ifftn. Errors if input is not complex;
+    # resizes to shape on dim, runs c2c prim, normalizes by the product of shape.
     """Common code for n-dimensional complex to complex FFTs (fftn or ifftn)"""
     torch._check(
         input.dtype.is_complex,
@@ -381,6 +422,8 @@ def fftn(
     dim: DimsType | None = None,
     norm: NormType = None,
 ) -> TensorLikeType:
+    # [FUNCTION DOC] N-D FFT over dim with optional sizes s (decomposition of aten fft_fftn). Promotes input to
+    # complex, canonicalizes args, then runs the forward c2c transform.
     (shape, dim) = _canonicalize_fft_shape_and_dim_args(input, s, dim)
     x = _maybe_promote_tensor_fft(input, require_complex=True)
     return _fftn_c2c("fftn", x, shape, dim, norm, forward=True)
@@ -394,6 +437,7 @@ def ifftn(
     dim: DimsType | None = None,
     norm: NormType = None,
 ) -> TensorLikeType:
+    # [FUNCTION DOC] N-D inverse FFT over dim with optional sizes s; promotes to complex and runs inverse c2c.
     (shape, dim) = _canonicalize_fft_shape_and_dim_args(input, s, dim)
     x = _maybe_promote_tensor_fft(input, require_complex=True)
     return _fftn_c2c("ifftn", x, shape, dim, norm, forward=False)
@@ -407,6 +451,8 @@ def rfftn(
     dim: DimsType | None = None,
     norm: NormType = None,
 ) -> TensorLikeType:
+    # [FUNCTION DOC] N-D FFT of real input over dim returning the one-sided spectrum (last dim halved). Raises an
+    # error for complex input.
     torch._check_type(
         not input.dtype.is_complex,
         lambda: f"rfftn expects a real-valued input tensor, but got {input.dtype}",
@@ -426,6 +472,8 @@ def ihfftn(
     dim: DimsType | None = None,
     norm: NormType = None,
 ) -> TensorLikeType:
+    # [FUNCTION DOC] N-D inverse of hfftn on real input: r2c on the last dim, then conjugate and inverse c2c over the
+    # remaining dims, with inverse normalization. Errors for complex input or when no axis is transformed.
     torch._check_type(
         not input.dtype.is_complex,
         lambda: f"ihfftn expects a real-valued input tensor, but got {input.dtype}",
@@ -447,6 +495,7 @@ def ihfftn(
 
 
 class _CanonicalizeC2rReturn(NamedTuple):
+    # [CLASS DOC] HELPER: Named tuple of canonical shape, dims and the output last_dim_size for c2r transforms.
     shape: tuple[int, ...]
     dim: tuple[int, ...]
     last_dim_size: int
@@ -458,6 +507,10 @@ def _canonicalize_fft_c2r_shape_and_dim_args(
     s: ShapeType | None,
     dim: DimsType | None,
 ) -> _CanonicalizeC2rReturn:
+    # [FUNCTION DOC] HELPER: Canonicalizes shape/dim for N-D complex-to-real transforms and computes last_dim_size
+    # (from s if given and not -1, else 2*(input size - 1) on the last transform dim). Errors if no axis
+    # is transformed or last_dim_size is below 1. Returns shape with last entry replaced by
+    # last_dim_size//2+1, the dims, and last_dim_size.
     """Canonicalize shape and dim arguments for n-dimensional c2r transforms,
     as well as calculating the last_dim_size which is shape[dim[-1]] for the output"""
     (shape, dim) = _canonicalize_fft_shape_and_dim_args(input, s, dim)
@@ -488,6 +541,8 @@ def irfftn(
     dim: DimsType | None = None,
     norm: NormType = None,
 ) -> TensorLikeType:
+    # [FUNCTION DOC] N-D inverse of rfftn: complex half spectrum to real output via the c2r prim over dim, with
+    # inverse normalization over the output sizes.
     shape, dim, last_dim_size = _canonicalize_fft_c2r_shape_and_dim_args(
         "irfftn", input, s, dim
     )
@@ -505,6 +560,8 @@ def hfftn(
     dim: DimsType | None = None,
     norm: NormType = None,
 ) -> TensorLikeType:
+    # [FUNCTION DOC] N-D FFT of a Hermitian half signal to a real spectrum: forward c2c over all but the last dim,
+    # forward normalization, physical conjugation, then c2r on the last dim.
     shape, dim, last_dim_size = _canonicalize_fft_c2r_shape_and_dim_args(
         "hfftn", input, s, dim
     )
@@ -526,6 +583,7 @@ def fft2(
     dim: DimsType | None = (-2, -1),
     norm: NormType = None,
 ) -> TensorLikeType:
+    # [FUNCTION DOC] 2-D FFT; calls fftn with default dim of the last two dims.
     return torch.fft.fftn(input, s=s, dim=dim, norm=norm)
 
 
@@ -537,6 +595,7 @@ def ifft2(
     dim: DimsType | None = (-2, -1),
     norm: NormType = None,
 ) -> TensorLikeType:
+    # [FUNCTION DOC] 2-D inverse FFT; calls ifftn with default dim of the last two dims.
     return torch.fft.ifftn(input, s=s, dim=dim, norm=norm)
 
 
@@ -548,6 +607,7 @@ def rfft2(
     dim: DimsType | None = (-2, -1),
     norm: NormType = None,
 ) -> TensorLikeType:
+    # [FUNCTION DOC] 2-D real FFT; calls rfftn with default dim of the last two dims.
     return torch.fft.rfftn(input, s=s, dim=dim, norm=norm)
 
 
@@ -559,6 +619,7 @@ def irfft2(
     dim: DimsType | None = (-2, -1),
     norm: NormType = None,
 ) -> TensorLikeType:
+    # [FUNCTION DOC] 2-D inverse real FFT; calls irfftn with default dim of the last two dims.
     return torch.fft.irfftn(input, s=s, dim=dim, norm=norm)
 
 
@@ -570,6 +631,7 @@ def hfft2(
     dim: DimsType | None = (-2, -1),
     norm: NormType = None,
 ) -> TensorLikeType:
+    # [FUNCTION DOC] 2-D Hermitian FFT; calls hfftn with default dim of the last two dims.
     return torch.fft.hfftn(input, s=s, dim=dim, norm=norm)
 
 
@@ -581,10 +643,12 @@ def ihfft2(
     dim: DimsType | None = (-2, -1),
     norm: NormType = None,
 ) -> TensorLikeType:
+    # [FUNCTION DOC] 2-D inverse Hermitian FFT; calls ihfftn with default dim of the last two dims.
     return torch.fft.ihfftn(input, s=s, dim=dim, norm=norm)
 
 
 def _default_alldims(dim: DimsType | None, x: TensorLikeType) -> list[int]:
+    # [FUNCTION DOC] HELPER: Converts an optional dim (None, int or sequence) to a list, defaulting to all dims of x.
     """Convert Optional[DimsType] to a simple list, defaulting to all dimensions"""
     if dim is None:
         return list(range(x.ndim))
@@ -596,6 +660,7 @@ def _default_alldims(dim: DimsType | None, x: TensorLikeType) -> list[int]:
 
 @register_decomposition(aten.fft_fftshift)
 def fftshift(input: TensorLikeType, dim: DimsType | None = None) -> TensorLikeType:
+    # [FUNCTION DOC] Rolls the zero-frequency component to the center: shifts each chosen dim (default all) by size//2.
     dims = _default_alldims(dim, input)
     shift = [input.shape[d] // 2 for d in dims]
     return torch.roll(input, shift, dims)
@@ -603,6 +668,7 @@ def fftshift(input: TensorLikeType, dim: DimsType | None = None) -> TensorLikeTy
 
 @register_decomposition(aten.fft_ifftshift)
 def ifftshift(input: TensorLikeType, dim: DimsType | None = None) -> TensorLikeType:
+    # [FUNCTION DOC] Inverse of fftshift: shifts each chosen dim (default all) by (size+1)//2.
     dims = _default_alldims(dim, input)
     shift = [(input.shape[d] + 1) // 2 for d in dims]
     return torch.roll(input, shift, dims)

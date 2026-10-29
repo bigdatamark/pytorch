@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Helpers for TorchScript to obtain and parse Python function source: source retrieval, indentation
+# normalization, SourceContext metadata and parse_def which yields the AST. No import-time side effects.
 import ast
 import functools
 import inspect
@@ -13,6 +16,9 @@ def get_source_lines_and_file(
     obj: Any,
     error_msg: str | None = None,
 ) -> tuple[list[str], int, str | None]:
+    # [FUNCTION DOC] Returns (source lines, starting line number, filename) for obj using inspect. Raises OSError
+    # with a TorchScript-specific message (plus optional error_msg) if source is unavailable.
+    # filename may be None if it could not be determined.
     """
     Wrapper around inspect.getsourcelines and inspect.getsourcefile.
 
@@ -36,6 +42,9 @@ def get_source_lines_and_file(
 
 
 def normalize_source_lines(sourcelines: list[str]) -> list[str]:
+    # [FUNCTION DOC] Re-indents a function's source lines so every line before and after the def line starts with
+    # the def line's leading whitespace (so comments or string continuations at lower indentation
+    # do not break parsing). Returns the lines unchanged if no def line exists (e.g. lambda).
     """
     This helper function accepts a list of source lines. It finds the
     indentation level of the function definition (`def`), then it indents
@@ -50,6 +59,7 @@ def normalize_source_lines(sourcelines: list[str]) -> list[str]:
     """
 
     def remove_prefix(text, prefix):
+        # [FUNCTION DOC] HELPER: Returns text with prefix removed if it starts with it, else text unchanged.
         return text[text.startswith(prefix) and len(prefix) :]
 
     # Find the line and line number containing the function definition
@@ -85,6 +95,8 @@ def normalize_source_lines(sourcelines: list[str]) -> list[str]:
 # Thin wrapper around SourceRangeFactory to store extra metadata
 # about the function-to-be-compiled.
 class SourceContext(SourceRangeFactory):
+    # [CLASS DOC] Thin wrapper over SourceRangeFactory that also stores uses_true_division, filename and
+    # funcname for the function being compiled by TorchScript.
     def __init__(
         self,
         source,
@@ -94,6 +106,8 @@ class SourceContext(SourceRangeFactory):
         uses_true_division=True,
         funcname=None,
     ):
+        # [FUNCTION DOC] Initializes the base factory with source, filename, file_lineno and leading_whitespace_len and
+        # records uses_true_division (default True), filename and funcname.
         super().__init__(source, filename, file_lineno, leading_whitespace_len)
         self.uses_true_division = uses_true_division
         self.filename = filename
@@ -102,14 +116,18 @@ class SourceContext(SourceRangeFactory):
 
 @functools.cache
 def make_source_context(*args):
+    # [FUNCTION DOC] Cached constructor: returns a SourceContext for the given positional arguments (memoized).
     return SourceContext(*args)
 
 
 def fake_range():
+    # [FUNCTION DOC] Returns a placeholder source range (empty source, no file) covering one character, for
+    # compiler-generated code.
     return SourceContext("", None, 0, 0).make_raw_range(0, 1)
 
 
 class ParsedDef(NamedTuple):
+    # [CLASS DOC] Named tuple result of parse_def: ast module, SourceContext, source text, filename, file_lineno.
     ast: ast.Module
     ctx: SourceContext
     source: str
@@ -118,6 +136,10 @@ class ParsedDef(NamedTuple):
 
 
 def parse_def(fn):
+    # [FUNCTION DOC] Parses the source of function fn into a ParsedDef. Gets and normalizes source lines, dedents,
+    # parses with ast, and raises RuntimeError unless the module holds exactly one function definition.
+    # Computes the dedent width as the leading whitespace length and builds a SourceContext named
+    # after fn.
     sourcelines, file_lineno, filename = get_source_lines_and_file(
         fn, ErrorReport.call_stack()
     )

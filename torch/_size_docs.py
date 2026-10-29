@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Attaches documentation strings to methods of the C-level torch.Size class.
+# Import-time side effect: sets the docstring of Size.numel.
 """Adds docstrings to torch.Size functions"""
 
 import torch._C
@@ -5,6 +8,8 @@ from torch._C import _add_docstr as add_docstr
 
 
 def add_docstr_all(method: str, docstr: str) -> None:
+    # [FUNCTION DOC] HELPER: Sets the docstring of the named torch.Size method;
+    # raises AttributeError if the method does not exist.
     add_docstr(getattr(torch._C.Size, method), docstr)
 
 
