@@ -1,3 +1,16 @@
+# [PACKAGE DOC]
+# Public torch.linalg namespace for linear algebra routines (decompositions, solvers,
+# norms, determinants, inverses, eigen and singular value problems, matrix functions).
+# The actual implementations are C++ builtins in torch._C._linalg; this module only
+# attaches documentation strings to them via _add_docstr and re-exports them under
+# friendly names (cross, cholesky, cholesky_ex, inv, inv_ex, det, slogdet, eig, eigvals,
+# eigh, eigvalsh, lstsq, matrix_power, matrix_rank, norm, vector_norm, matrix_norm,
+# matmul, diagonal, multi_dot, svd, svdvals, cond, pinv, matrix_exp, solve, solve_ex,
+# solve_triangular, lu, lu_factor, lu_factor_ex, lu_solve, ldl_factor, ldl_factor_ex,
+# ldl_solve, tensorinv, tensorsolve, qr, vander, vecdot, and others).
+# Also exposes LinAlgError (alias of the C++ linear algebra error type) and the
+# common_notes mapping of reusable note strings used when formatting docstrings.
+# Import-time side effect: mutates the __doc__ of the underlying builtin functions.
 from torch._C import (
     _add_docstr,
     _linalg,  # pyrefly: ignore [missing-module-attribute]
